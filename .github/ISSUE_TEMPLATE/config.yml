@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions & Discussions
+    url: https://github.com/Harry-kp/vortix/discussions
+    about: Ask questions and discuss ideas here instead of opening an issue

@@ -1,0 +1,39 @@
+[package]
+name = "vortix"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Professional TUI VPN Management Tool for WireGuard and OpenVPN"
+license = "MIT"
+keywords = ["vpn", "tui", "wireguard", "openvpn", "terminal"]
+categories = ["command-line-utilities", "network-programming"]
+repository = "https://github.com/Harry-kp/vortix"
+homepage = "https://github.com/Harry-kp/vortix"
+documentation = "https://docs.rs/vortix"
+readme = "README.md"
+authors = ["Harry KP <harrykp@users.noreply.github.com>"]
+exclude = ["assets/*", ".github/*", "target/*", "*.tar.gz"]
+
+[dependencies]
+# TUI Framework
+ratatui = "0.29"
+crossterm = "0.28"
+
+# Error Handling
+color-eyre = "0.6"
+
+# CLI Argument Parsing
+clap = { version = "4", features = ["derive"] }
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = 3
