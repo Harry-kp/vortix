@@ -16,7 +16,7 @@ exclude = ["assets/*", ".github/*", "target/*", "*.tar.gz"]
 
 [dependencies]
 # TUI Framework
-ratatui = "0.29"
+ratatui = "0.30"
 crossterm = "0.28"
 
 # Error Handling
