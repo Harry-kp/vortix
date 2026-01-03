@@ -10,7 +10,10 @@ ci = "github"
 # The installers to generate for each app
 installers = ["shell"]
 # Target platforms to build apps for (Rust target-triple syntax)
-# macOS only for now (Linux planned)
 targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
-# Generate and upload checksums
+# Checksums to generate for each App
 checksum = "sha256"
+# Path that installers should place binaries in
+install-path = "CARGO_HOME"
+# Whether to install an updater program
+install-updater = false
