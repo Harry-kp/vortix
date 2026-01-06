@@ -19,32 +19,40 @@ pub fn render_dashboard(frame: &mut Frame, app: &App, area: Rect) {
             ("G", "End"),
             ("Esc", "Close"),
         ];
-        render_hints(frame, area, &hints);
+        render_hints(frame, area, &hints, None);
         return;
     }
+
+    // Determine focused panel name for display
+    let panel_name = match &app.focused_panel {
+        crate::app::FocusedPanel::Sidebar => "Profiles",
+        crate::app::FocusedPanel::ConnectionDetails => "Details",
+        crate::app::FocusedPanel::Chart => "Chart",
+        crate::app::FocusedPanel::Security => "Security",
+        crate::app::FocusedPanel::Logs => "Logs",
+    };
 
     // Build essential global hints
     let mut hints = Vec::new();
 
     // Only show 1-9 hint if there are profiles
     if !app.profiles.is_empty() {
-        hints.push(("1-9", "Select"));
+        hints.push(("1-9", "Quick Connect"));
     }
 
     hints.extend_from_slice(&[
+        ("i", "Import"),
         ("d", "Disconnect"),
-        ("Tab", "Switch"),
+        ("Tab", "Switch Panel"),
         ("K", "Kill Switch"),
-        ("x", "Actions"),
-        ("b", "Bulk"),
+        ("x", "Menu"),
+        ("q", "Quit"),
     ]);
 
-    hints.push(("q", "Quit"));
-
-    render_hints(frame, area, &hints);
+    render_hints(frame, area, &hints, Some(panel_name));
 }
 
-fn render_hints(frame: &mut Frame, area: Rect, hints: &[(&str, &str)]) {
+fn render_hints(frame: &mut Frame, area: Rect, hints: &[(&str, &str)], panel_name: Option<&str>) {
     use ratatui::layout::{Constraint, Layout};
 
     let chunks = Layout::default()
@@ -55,13 +63,25 @@ fn render_hints(frame: &mut Frame, area: Rect, hints: &[(&str, &str)]) {
         ])
         .split(area);
 
-    // 1. Render hints on the left
+    // 1. Render hints on the left with optional panel indicator
     let mut hint_spans = Vec::new();
     let mut current_width = 0;
     let max_width = chunks[0].width as usize;
 
-    hint_spans.push(Span::raw(" "));
-    current_width += 1;
+    // Add panel indicator if provided
+    if let Some(panel) = panel_name {
+        let panel_indicator = format!("[{panel}] ");
+        hint_spans.push(Span::styled(
+            panel_indicator.clone(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        current_width += panel_indicator.len();
+    } else {
+        hint_spans.push(Span::raw(" "));
+        current_width += 1;
+    }
 
     for (i, (key, action)) in hints.iter().enumerate() {
         // Calculate item width: "key" + " " + "action" + " | " (separator)

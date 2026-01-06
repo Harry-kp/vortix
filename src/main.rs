@@ -16,6 +16,7 @@ mod cli;
 mod constants;
 mod core;
 mod event;
+mod logger;
 mod message;
 mod state;
 mod theme;

@@ -5,6 +5,29 @@
 
 use std::process::Command;
 
+/// Check if the current process is running as root (UID 0)
+///
+/// Uses the effective user ID from the OS instead of spawning an external command.
+/// This avoids silent failures if `id` is unavailable or fails.
+#[must_use]
+#[cfg(unix)]
+#[allow(unsafe_code)]
+pub fn is_root() -> bool {
+    // SAFETY: geteuid() is a simple syscall that returns the effective user ID.
+    // It has no side effects and always succeeds.
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// Check if the current process is running as root (UID 0)
+///
+/// On non-Unix platforms, this always returns `false` because there is no
+/// portable concept of a root user.
+#[must_use]
+#[cfg(not(unix))]
+pub fn is_root() -> bool {
+    false
+}
+
 /// Formats bytes per second into a human-readable string.
 ///
 /// # Arguments
@@ -29,6 +52,36 @@ pub fn format_bytes_speed(bytes: u64) -> String {
         format!("{:.1} KB/s", bytes as f64 / 1_000.0)
     } else {
         format!("{bytes} B/s")
+    }
+}
+
+/// Checks if an IP address belongs to a private network range (RFC1918).
+///
+/// # Arguments
+///
+/// * `ip` - The IP address to check
+///
+/// # Returns
+///
+/// `true` if the IP is in a private range (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
+pub fn is_private_ip(ip: &str) -> bool {
+    // Parse IP octets
+    let parts: Vec<&str> = ip.split('.').collect();
+    if parts.len() != 4 {
+        return false;
+    }
+
+    let octets: Result<Vec<u8>, _> = parts.iter().map(|p| p.parse::<u8>()).collect();
+    let Ok(octets) = octets else {
+        return false;
+    };
+
+    // Check private ranges
+    match octets[0] {
+        10 => true,                                    // 10.0.0.0/8
+        172 if (16..=31).contains(&octets[1]) => true, // 172.16.0.0/12
+        192 if octets[1] == 168 => true,               // 192.168.0.0/16
+        _ => false,
     }
 }
 
@@ -188,10 +241,14 @@ pub fn load_profile_metadata() -> Result<std::collections::HashMap<String, Profi
         .map_err(|e| format!("Failed to read metadata: {e}"))?;
 
     serde_json::from_str(&content).or_else(|e| {
-        eprintln!(
-            "Warning: Failed to parse {}: {}. Using defaults.",
-            crate::constants::METADATA_FILE_NAME,
-            e
+        crate::logger::log(
+            crate::logger::LogLevel::Warning,
+            "CONFIG",
+            format!(
+                "Failed to parse {}: {}. Using defaults.",
+                crate::constants::METADATA_FILE_NAME,
+                e
+            ),
         );
         Ok(std::collections::HashMap::new())
     })
@@ -339,5 +396,43 @@ mod tests {
         // Future or now
         let future = now + Duration::from_secs(10);
         assert_eq!(format_relative_time(future), "now");
+    }
+
+    #[test]
+    fn test_is_private_ip_class_a() {
+        assert!(is_private_ip("10.0.0.1"));
+        assert!(is_private_ip("10.255.255.255"));
+        assert!(is_private_ip("10.1.2.3"));
+    }
+
+    #[test]
+    fn test_is_private_ip_class_b() {
+        assert!(is_private_ip("172.16.0.1"));
+        assert!(is_private_ip("172.31.255.255"));
+        assert!(is_private_ip("172.20.10.5"));
+    }
+
+    #[test]
+    fn test_is_private_ip_class_c() {
+        assert!(is_private_ip("192.168.0.1"));
+        assert!(is_private_ip("192.168.255.255"));
+        assert!(is_private_ip("192.168.1.100"));
+    }
+
+    #[test]
+    fn test_is_private_ip_public() {
+        assert!(!is_private_ip("8.8.8.8"));
+        assert!(!is_private_ip("1.2.3.4"));
+        assert!(!is_private_ip("172.15.0.1")); // Just outside 172.16.0.0/12
+        assert!(!is_private_ip("172.32.0.1")); // Just outside 172.16.0.0/12
+        assert!(!is_private_ip("192.169.0.1")); // Not 192.168
+    }
+
+    #[test]
+    fn test_is_private_ip_invalid() {
+        assert!(!is_private_ip("999.999.999.999"));
+        assert!(!is_private_ip("not.an.ip.address"));
+        assert!(!is_private_ip("10.0.0"));
+        assert!(!is_private_ip(""));
     }
 }

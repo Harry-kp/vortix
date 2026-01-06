@@ -11,11 +11,10 @@ use std::path::Path;
 use std::sync::mpsc;
 use std::time::Instant;
 
-use nix::unistd::Uid;
-
 use crate::constants;
 use crate::core::scanner;
 use crate::core::telemetry::{self, TelemetryUpdate};
+use crate::logger::{self, LogLevel};
 use crate::message::{self, Message, ScrollMove, SelectionMove};
 use crate::utils;
 
@@ -70,7 +69,7 @@ pub struct App {
     pub public_ip: String,
     /// Real IP captured when disconnected (for comparison when connected)
     pub real_ip: Option<String>,
-    pub logs: Vec<String>,
+    /// Scroll position for logs panel (logs stored in logger module)
     pub logs_scroll: u16,
     pub logs_auto_scroll: bool,
 
@@ -131,7 +130,6 @@ impl App {
 
             public_ip: "Detecting...".to_string(),
             real_ip: None,
-            logs: Vec::new(),
             logs_scroll: 0,
             logs_auto_scroll: true,
 
@@ -148,7 +146,7 @@ impl App {
             panel_areas: HashMap::new(),
             toast: None,
             terminal_size: (0, 0),
-            is_root: Uid::effective().is_root(),
+            is_root: utils::is_root(),
             connection_drops: 0,
 
             // Kill switch - load from persisted state for crash recovery
@@ -216,21 +214,38 @@ impl App {
         app
     }
 
-    /// Add a log message with timestamp
+    /// Add a log message via centralized logger
     fn log(&mut self, message: &str) {
-        let timestamp = utils::format_local_time();
-        self.logs.push(format!("[{timestamp}] {message}"));
+        // Parse category and level from message prefix (e.g., "NET:", "SEC:", "STATUS:")
+        let (category, content, level) = if let Some(idx) = message.find(':') {
+            let cat = &message[..idx];
+            let msg = message[idx + 1..].trim();
 
-        // Truncate to last 100 lines
-        if self.logs.len() > 100 {
-            self.logs.drain(0..self.logs.len() - 100);
-        }
+            // Determine level based on content
+            let lvl = if msg.contains("Error") || msg.contains("Failed") || msg.contains("LEAK") {
+                LogLevel::Error
+            } else if msg.contains("⚠") || msg.contains("WARNING") || msg.contains("dropped") {
+                LogLevel::Warning
+            } else {
+                LogLevel::Info
+            };
 
+            (cat, msg, lvl)
+        } else {
+            ("APP", message, LogLevel::Info)
+        };
+
+        // Log via centralized logger
+        logger::log(level, category, content);
+
+        // Update scroll position based on logger entries
+        let log_count = logger::get_logs().len();
         if self.logs_auto_scroll {
-            self.logs_scroll = u16::try_from(self.logs.len().saturating_sub(1)).unwrap_or(u16::MAX);
+            self.logs_scroll = u16::try_from(log_count.saturating_sub(1)).unwrap_or(u16::MAX);
         }
 
         // Auto-save to log file
+        let timestamp = utils::format_local_time();
         Self::append_to_log_file(&format!("{timestamp} {message}"));
     }
 
@@ -340,7 +355,7 @@ impl App {
             FocusedPanel::Logs => {
                 // Scroll Logs
                 let max_scroll =
-                    u16::try_from(self.logs.len().saturating_sub(1)).unwrap_or(u16::MAX);
+                    u16::try_from(logger::get_logs().len().saturating_sub(1)).unwrap_or(u16::MAX);
                 if self.logs_scroll < max_scroll {
                     self.logs_scroll = self.logs_scroll.saturating_add(1);
                 }
@@ -557,8 +572,8 @@ impl App {
                         self.logs_scroll = self.logs_scroll.saturating_sub(1);
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        let max_scroll =
-                            u16::try_from(self.logs.len().saturating_sub(1)).unwrap_or(u16::MAX);
+                        let max_scroll = u16::try_from(logger::get_logs().len().saturating_sub(1))
+                            .unwrap_or(u16::MAX);
                         if self.logs_scroll < max_scroll {
                             self.logs_scroll = self.logs_scroll.saturating_add(1);
                         }
@@ -826,13 +841,17 @@ impl App {
             Message::Toast(msg, t_type) => self.show_toast(msg, t_type),
             Message::CopyIp => self.copy_ip_to_clipboard(),
             Message::ClearLogs => {
-                self.logs.clear();
+                logger::clear_logs();
                 self.logs_scroll = 0;
-                self.log("Logs cleared");
+                self.log("APP: Logs cleared");
             }
             Message::Telemetry(update) => {
                 match update {
                     TelemetryUpdate::PublicIp(ip) => {
+                        let is_connected =
+                            matches!(self.connection_state, ConnectionState::Connected { .. });
+                        let old_ip = self.public_ip.clone();
+
                         // Store as real_ip when disconnected (for security comparison)
                         if matches!(self.connection_state, ConnectionState::Disconnected) {
                             if self.real_ip.is_none() {
@@ -841,7 +860,23 @@ impl App {
                             self.real_ip = Some(ip.clone());
                         } else if self.public_ip != ip && self.public_ip != constants::MSG_FETCHING
                         {
-                            self.log(&format!("NET: Public IP changed to {ip}"));
+                            self.log(&format!("NET: ✓ Public IP changed from {old_ip} to {ip}"));
+                        } else if is_connected
+                            && self.public_ip == ip
+                            && self.public_ip != constants::MSG_FETCHING
+                        {
+                            // CRITICAL: IP hasn't changed despite being connected to VPN!
+                            self.log(&format!(
+                                "NET: ⚠ WARNING: Public IP unchanged ({ip}) while connected to VPN!"
+                            ));
+                            self.log("NET: → Possible issues: 1) VPN not routing traffic 2) Split-tunnel active 3) Kill switch blocking telemetry");
+
+                            // Log the real IP for comparison
+                            if let Some(ref real) = self.real_ip {
+                                if real == &ip {
+                                    self.log(&format!("NET: → LEAK DETECTED: Current IP ({ip}) matches pre-VPN IP ({real})"));
+                                }
+                            }
                         }
                         self.public_ip = ip;
                     }
@@ -868,12 +903,11 @@ impl App {
                     }
                     TelemetryUpdate::Dns(dns) => {
                         if self.dns_server != dns && self.dns_server != constants::MSG_NO_DATA {
-                            let leak_warn =
-                                if dns.starts_with("192.168.") || dns.starts_with("172.1") {
-                                    " ⚠ POSSIBLE LEAK"
-                                } else {
-                                    ""
-                                };
+                            let leak_warn = if utils::is_private_ip(&dns) {
+                                " ⚠ POSSIBLE LEAK"
+                            } else {
+                                ""
+                            };
                             self.log(&format!("SEC: DNS server: {dns}{leak_warn}"));
                         }
                         self.dns_server = dns;
@@ -888,7 +922,10 @@ impl App {
                         }
                         self.ipv6_leak = leak;
                     }
-                    TelemetryUpdate::Error(msg) => self.log(&msg),
+                    TelemetryUpdate::Log(level, msg) => {
+                        // Log through central logging system
+                        logger::log(level, "TELEMETRY", msg);
+                    }
                 }
             }
             Message::SyncSystemState(active) => {
@@ -1908,7 +1945,11 @@ impl App {
                                 imported += 1;
                             }
                             Err(e) => {
-                                eprintln!("   Failed to import {}: {}", path.display(), e);
+                                self.log(&format!(
+                                    "IMPORT: Failed to import {}: {}",
+                                    path.display(),
+                                    e
+                                ));
                                 failed += 1;
                             }
                         }
@@ -1954,7 +1995,7 @@ impl App {
                 }
             }
             Err(e) => {
-                eprintln!("❌ Error reading directory: {e}");
+                self.log(&format!("IMPORT: Error reading directory: {e}"));
                 self.show_toast(format!("Error reading directory: {e}"), ToastType::Error);
             }
         }

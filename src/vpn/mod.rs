@@ -1,5 +1,6 @@
 //! VPN profile import functionality
 
+use crate::logger::{self, LogLevel};
 use crate::state::{Protocol, VpnProfile};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -7,8 +8,19 @@ use std::path::{Path, PathBuf};
 
 /// Import a VPN profile from a file
 pub fn import_profile(path: &Path) -> Result<VpnProfile, String> {
+    logger::log(
+        LogLevel::Debug,
+        "IMPORT",
+        format!("Importing profile from: {}", path.display()),
+    );
+
     // Check file exists
     if !path.exists() {
+        logger::log(
+            LogLevel::Error,
+            "IMPORT",
+            format!("File not found: {}", path.display()),
+        );
         return Err(format!("File not found: {}", path.display()));
     }
 
@@ -22,11 +34,25 @@ pub fn import_profile(path: &Path) -> Result<VpnProfile, String> {
     let protocol = match extension.as_str() {
         "conf" => Protocol::WireGuard,
         "ovpn" => Protocol::OpenVPN,
-        _ => return Err(format!("Unsupported file type: .{extension}")),
+        _ => {
+            logger::log(
+                LogLevel::Error,
+                "IMPORT",
+                format!("Unsupported file type: .{extension}"),
+            );
+            return Err(format!("Unsupported file type: .{extension}"));
+        }
     };
 
     // Read and parse the file
-    let content = fs::read_to_string(path).map_err(|e| format!("Failed to read file: {e}"))?;
+    let content = fs::read_to_string(path).map_err(|e| {
+        logger::log(
+            LogLevel::Error,
+            "IMPORT",
+            format!("Failed to read file: {e}"),
+        );
+        format!("Failed to read file: {e}")
+    })?;
 
     // Extract profile info
     let (name, location) = match protocol {
@@ -48,7 +74,14 @@ pub fn import_profile(path: &Path) -> Result<VpnProfile, String> {
         .unwrap_or(&name)
         .to_string();
 
-    fs::copy(path, &dest_path).map_err(|e| format!("Failed to copy profile: {e}"))?;
+    fs::copy(path, &dest_path).map_err(|e| {
+        logger::log(
+            LogLevel::Error,
+            "IMPORT",
+            format!("Failed to copy profile: {e}"),
+        );
+        format!("Failed to copy profile: {e}")
+    })?;
 
     // Secure the file (chmod 600)
     let mut perms = fs::metadata(&dest_path)
@@ -57,6 +90,17 @@ pub fn import_profile(path: &Path) -> Result<VpnProfile, String> {
     perms.set_mode(0o600);
     fs::set_permissions(&dest_path, perms)
         .map_err(|e| format!("Failed to set permissions: {e}"))?;
+
+    logger::log(
+        LogLevel::Info,
+        "IMPORT",
+        format!(
+            "✓ Imported '{}' ({:?}) → {}",
+            name,
+            protocol,
+            dest_path.display()
+        ),
+    );
 
     Ok(VpnProfile {
         name,
@@ -132,21 +176,42 @@ fn parse_openvpn_config(content: &str, path: &Path) -> Result<(String, String), 
 }
 
 /// Derive location from profile name
+///
+/// IMPORTANT: This is a best-effort heuristic based on common naming patterns.
+/// It's NOT reliable for security decisions. The actual VPN server location
+/// should ideally be verified through:
+/// 1. Parsing the VPN config for embedded location metadata
+/// 2. `GeoIP` lookup of the endpoint IP address
+/// 3. User-provided manual override (recommended)
+///
+/// This function should be considered a "display hint" only, not ground truth.
 fn derive_location_from_name(name: &str) -> String {
     let name_lower = name.to_lowercase();
 
+    // Check for explicit location markers in common VPN filename formats
+    // Examples: "us-newyork-001.conf", "de-frankfurt.ovpn", "uk_london.conf"
+
+    // First try to extract from common VPN provider patterns:
+    // Format: <country>-<city>-<number>
+    // Format: <country>_<city>
+    // Format: <city>-<country>
+
     // Check longer/more specific patterns first to avoid false matches
-    // e.g., "frankfurt" should match Frankfurt, not "fr" -> France
+    // These are ONLY matched if they appear as distinct components
     let city_patterns = [
-        ("frankfurt", "Frankfurt"),
-        ("amsterdam", "Amsterdam"),
-        ("losangeles", "Los Angeles"),
-        ("los-angeles", "Los Angeles"),
-        ("newyork", "New York"),
-        ("new-york", "New York"),
-        ("tokyo", "Tokyo"),
-        ("london", "London"),
-        ("paris", "Paris"),
+        ("frankfurt", "Frankfurt, DE"),
+        ("amsterdam", "Amsterdam, NL"),
+        ("losangeles", "Los Angeles, US"),
+        ("los-angeles", "Los Angeles, US"),
+        ("newyork", "New York, US"),
+        ("new-york", "New York, US"),
+        ("tokyo", "Tokyo, JP"),
+        ("london", "London, GB"),
+        ("paris", "Paris, FR"),
+        ("singapore", "Singapore, SG"),
+        ("sydney", "Sydney, AU"),
+        ("toronto", "Toronto, CA"),
+        ("zurich", "Zurich, CH"),
     ];
 
     for (pattern, location) in city_patterns {
@@ -155,29 +220,72 @@ fn derive_location_from_name(name: &str) -> String {
         }
     }
 
-    // Then check country codes (shorter patterns)
+    // Check country codes ONLY at start or after delimiter to avoid false positives
+    // BAD: "business" contains "us" → marked as US
+    // GOOD: "us-server" starts with "us" → marked as US
     let country_patterns = [
-        ("nl", "NL"),
-        ("us", "US"),
-        ("uk", "GB"),
-        ("gb", "GB"),
-        ("de", "DE"),
-        ("fr", "FR"),
-        ("jp", "JP"),
-        ("ca", "CA"),
-        ("au", "AU"),
-        ("sg", "SG"),
-        ("ch", "CH"),
-        ("la", "Los Angeles"),
+        ("nl-", "Netherlands"),
+        ("us-", "United States"),
+        ("uk-", "United Kingdom"),
+        ("gb-", "United Kingdom"),
+        ("de-", "Germany"),
+        ("fr-", "France"),
+        ("jp-", "Japan"),
+        ("ca-", "Canada"),
+        ("au-", "Australia"),
+        ("sg-", "Singapore"),
+        ("ch-", "Switzerland"),
+        ("se-", "Sweden"),
+        ("es-", "Spain"),
+        ("it-", "Italy"),
     ];
 
     for (pattern, location) in country_patterns {
-        if name_lower.starts_with(pattern) || name_lower.contains(&format!("-{pattern}")) {
+        if name_lower.starts_with(pattern) {
             return location.to_string();
         }
     }
 
-    // Default
+    // Check for country codes at start (without dash) - more lenient
+    // But only match 2-letter codes at the very start
+    if name_lower.len() >= 2 {
+        let prefix = &name_lower[..2];
+        let rest = &name_lower[2..];
+
+        // Only match if followed by number, underscore, or end of string
+        // This avoids: "desktop" (de), "business" (us), "cache" (ca)
+        let valid_separator = rest.is_empty()
+            || rest.starts_with('_')
+            || rest.starts_with('-')
+            || rest.chars().next().is_some_and(|c| c.is_ascii_digit());
+
+        if valid_separator {
+            let country_codes = [
+                ("nl", "Netherlands"),
+                ("us", "United States"),
+                ("uk", "United Kingdom"),
+                ("gb", "United Kingdom"),
+                ("de", "Germany"),
+                ("fr", "France"),
+                ("jp", "Japan"),
+                ("ca", "Canada"),
+                ("au", "Australia"),
+                ("sg", "Singapore"),
+                ("ch", "Switzerland"),
+                ("se", "Sweden"),
+                ("es", "Spain"),
+                ("it", "Italy"),
+            ];
+
+            for (code, location) in country_codes {
+                if prefix == code {
+                    return location.to_string();
+                }
+            }
+        }
+    }
+
+    // Default: Cannot reliably determine location from filename
     "Unknown".to_string()
 }
 
@@ -188,11 +296,19 @@ pub fn get_profiles_dir() -> Result<PathBuf, String> {
 
 /// Load all profiles from the profiles directory
 pub fn load_profiles() -> Vec<VpnProfile> {
+    logger::log(LogLevel::Debug, "PROFILE", "Loading profiles from disk...");
+
     let Ok(profiles_dir) = get_profiles_dir() else {
+        logger::log(
+            LogLevel::Warning,
+            "PROFILE",
+            "Could not access profiles directory",
+        );
         return Vec::new();
     };
 
     let mut profiles = Vec::new();
+    let mut errors = 0;
 
     if let Ok(entries) = fs::read_dir(&profiles_dir) {
         for entry in entries.flatten() {
@@ -207,35 +323,75 @@ pub fn load_profiles() -> Vec<VpnProfile> {
                             _ => continue,
                         };
 
-                        if let Ok((name, location)) = result {
-                            // Enforce secure permissions (chmod 600) whenever loaded
-                            if let Ok(metadata) = fs::metadata(&path) {
-                                let mut perms = metadata.permissions();
-                                if perms.mode() & 0o777 != 0o600 {
-                                    perms.set_mode(0o600);
-                                    let _ = fs::set_permissions(&path, perms);
+                        match result {
+                            Ok((name, location)) => {
+                                // Enforce secure permissions (chmod 600) whenever loaded
+                                if let Ok(metadata) = fs::metadata(&path) {
+                                    let mut perms = metadata.permissions();
+                                    if perms.mode() & 0o777 != 0o600 {
+                                        perms.set_mode(0o600);
+                                        let _ = fs::set_permissions(&path, perms);
+                                        logger::log(
+                                            LogLevel::Debug,
+                                            "PROFILE",
+                                            format!("Fixed permissions for '{name}'"),
+                                        );
+                                    }
                                 }
+
+                                let protocol = if ext == "conf" {
+                                    Protocol::WireGuard
+                                } else {
+                                    Protocol::OpenVPN
+                                };
+
+                                profiles.push(VpnProfile {
+                                    name,
+                                    protocol,
+                                    location,
+                                    config_path: path.clone(),
+                                    last_used: None,
+                                });
                             }
-
-                            let protocol = if ext == "conf" {
-                                Protocol::WireGuard
-                            } else {
-                                Protocol::OpenVPN
-                            };
-
-                            profiles.push(VpnProfile {
-                                name,
-                                protocol,
-                                location,
-                                config_path: path.clone(),
-                                last_used: None,
-                            });
+                            Err(e) => {
+                                logger::log(
+                                    LogLevel::Warning,
+                                    "PROFILE",
+                                    format!("Skipped {}: {}", path.display(), e),
+                                );
+                                errors += 1;
+                            }
                         }
                     }
                 }
             }
         }
     }
+
+    let wg_count = profiles
+        .iter()
+        .filter(|p| matches!(p.protocol, Protocol::WireGuard))
+        .count();
+    let ovpn_count = profiles
+        .iter()
+        .filter(|p| matches!(p.protocol, Protocol::OpenVPN))
+        .count();
+
+    logger::log(
+        LogLevel::Info,
+        "PROFILE",
+        format!(
+            "Loaded {} profiles ({} WireGuard, {} OpenVPN{})",
+            profiles.len(),
+            wg_count,
+            ovpn_count,
+            if errors > 0 {
+                format!(", {errors} skipped")
+            } else {
+                String::new()
+            }
+        ),
+    );
 
     profiles
 }
@@ -246,39 +402,45 @@ mod tests {
 
     #[test]
     fn test_derive_location_us() {
-        assert_eq!(derive_location_from_name("us-east-1"), "US");
-        assert_eq!(derive_location_from_name("us-west"), "US");
-        assert_eq!(derive_location_from_name("vpn-us-01"), "US");
+        assert_eq!(derive_location_from_name("us-east-1"), "United States");
+        assert_eq!(derive_location_from_name("us-west"), "United States");
+        // This should NOT match "us" in "business" - improved logic
+        assert_eq!(derive_location_from_name("business-vpn"), "Unknown");
     }
 
     #[test]
     fn test_derive_location_eu() {
-        assert_eq!(derive_location_from_name("nl-01"), "NL");
-        assert_eq!(derive_location_from_name("de-berlin"), "DE");
-        assert_eq!(derive_location_from_name("uk-server"), "GB");
-        assert_eq!(derive_location_from_name("fr-01"), "FR");
+        assert_eq!(derive_location_from_name("nl-01"), "Netherlands");
+        assert_eq!(derive_location_from_name("de-berlin"), "Germany");
+        assert_eq!(derive_location_from_name("uk-server"), "United Kingdom");
+        assert_eq!(derive_location_from_name("fr-01"), "France");
+        // This should NOT match "de" in "desktop" - improved logic
+        assert_eq!(derive_location_from_name("desktop-server"), "Unknown");
     }
 
     #[test]
     fn test_derive_location_asia() {
-        assert_eq!(derive_location_from_name("jp-01"), "JP");
-        assert_eq!(derive_location_from_name("sg-01"), "SG");
-        assert_eq!(derive_location_from_name("tokyo-server"), "Tokyo");
+        assert_eq!(derive_location_from_name("jp-01"), "Japan");
+        assert_eq!(derive_location_from_name("sg-01"), "Singapore");
+        assert_eq!(derive_location_from_name("tokyo-server"), "Tokyo, JP");
     }
 
     #[test]
     fn test_derive_location_unknown() {
         assert_eq!(derive_location_from_name("my-vpn"), "Unknown");
         assert_eq!(derive_location_from_name("server-01"), "Unknown");
+        // Edge cases that should NOT be misidentified as country codes
+        assert_eq!(derive_location_from_name("usa-server"), "Unknown"); // does not contain exact "us-" token
+        assert_eq!(derive_location_from_name("cache-server"), "Unknown"); // does not contain exact "ca-" token
     }
 
     #[test]
     fn test_derive_location_cities() {
-        assert_eq!(derive_location_from_name("london-server"), "London");
-        assert_eq!(derive_location_from_name("paris-vpn"), "Paris");
-        assert_eq!(derive_location_from_name("amsterdam-01"), "Amsterdam");
-        assert_eq!(derive_location_from_name("frankfurt-dc"), "Frankfurt");
-        assert_eq!(derive_location_from_name("tokyo-primary"), "Tokyo");
+        assert_eq!(derive_location_from_name("london-server"), "London, GB");
+        assert_eq!(derive_location_from_name("paris-vpn"), "Paris, FR");
+        assert_eq!(derive_location_from_name("amsterdam-01"), "Amsterdam, NL");
+        assert_eq!(derive_location_from_name("frankfurt-dc"), "Frankfurt, DE");
+        assert_eq!(derive_location_from_name("tokyo-primary"), "Tokyo, JP");
     }
 
     #[test]

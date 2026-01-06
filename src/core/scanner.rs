@@ -124,30 +124,42 @@ fn check_wireguard_by_name(name: &str) -> Option<ActiveSession> {
         ..Default::default()
     };
 
-    // 1. Start Time (from PID file)
-    if pid_file.exists() {
-        session.started_at = std::fs::metadata(&pid_file)
-            .and_then(|m| m.created().or(m.modified()))
-            .ok();
-    }
-
-    // 1b. Attempt to find PID (wireguard-go or similar)
+    // 1. Attempt to find PID (wireguard-go or similar) - Do this FIRST
     if let Some(pid) = get_wireguard_pid(&interface_name) {
         session.pid = Some(pid);
-        // If we didn't get started_at from file, try from process
-        if session.started_at.is_none() {
-            if let Ok(output) = Command::new("ps")
-                .args(["-p", &pid.to_string(), "-o", "etime="])
-                .output()
-            {
-                let etime = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !etime.is_empty() {
-                    if let Some(duration) = parse_ps_etime(&etime) {
-                        session.started_at = SystemTime::now().checked_sub(duration);
-                    }
+
+        // Primary method: Get start time from process (works cross-platform)
+        if let Ok(output) = Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "etime="])
+            .output()
+        {
+            let etime = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !etime.is_empty() {
+                if let Some(duration) = parse_ps_etime(&etime) {
+                    session.started_at = SystemTime::now().checked_sub(duration);
                 }
             }
         }
+    }
+
+    // 2. Fallback: Try file metadata (only reliable on macOS)
+    // On Linux, created() returns Err, and modified() can be wrong if file was touched
+    #[cfg(target_os = "macos")]
+    if session.started_at.is_none() && pid_file.exists() {
+        session.started_at = std::fs::metadata(&pid_file)
+            .and_then(|m| m.created())  // Only use created() on macOS
+            .ok();
+    }
+
+    // Log if we couldn't determine start time (helps debug connection duration issues)
+    if session.started_at.is_none() {
+        crate::logger::log(
+            crate::logger::LogLevel::Debug,
+            "SCANNER",
+            format!(
+                "Could not determine start time for WireGuard interface '{interface_name}' (ps/metadata fallbacks failed)"
+            ),
+        );
     }
 
     // 2. Parse `wg show {interface_name}`
@@ -428,9 +440,27 @@ fn check_openvpn_by_pid(pid: u32, config_path: &Path) -> ActiveSession {
     session
 }
 
-/// Parse ps etime format: [[dd-]hh:]mm:ss
+/// Parse ps etime format: [[dd-]hh:]mm:ss or just ss for very short uptimes
+///
+/// Handles various formats:
+/// - "5" → 5 seconds (new processes)
+/// - "01:23" → 1 minute 23 seconds
+/// - "12:34:56" → 12 hours 34 minutes 56 seconds
+/// - "2-03:45:12" → 2 days 3 hours 45 minutes 12 seconds
 fn parse_ps_etime(etime: &str) -> Option<std::time::Duration> {
     use std::time::Duration;
+
+    let etime = etime.trim();
+
+    // Handle edge case: empty or invalid input
+    if etime.is_empty() || etime == "-" {
+        return None;
+    }
+
+    // Handle edge case: just seconds (no colon) for newly started processes
+    if !etime.contains(':') {
+        return etime.parse::<u64>().ok().map(Duration::from_secs);
+    }
 
     let parts: Vec<&str> = etime.split(':').collect();
     if parts.len() < 2 {
@@ -439,7 +469,7 @@ fn parse_ps_etime(etime: &str) -> Option<std::time::Duration> {
 
     let mut seconds = 0u64;
 
-    // Handle minutes and seconds (always present)
+    // Handle minutes and seconds (always present in MM:SS format)
     let secs: u64 = parts.last()?.parse().ok()?;
     let mins: u64 = parts[parts.len() - 2].parse().ok()?;
     seconds += secs + (mins * 60);
@@ -448,12 +478,12 @@ fn parse_ps_etime(etime: &str) -> Option<std::time::Duration> {
     if parts.len() >= 3 {
         let hour_part = parts[parts.len() - 3];
         if let Some(dash_idx) = hour_part.find('-') {
-            // Format: dd-hh
+            // Format: dd-hh:mm:ss
             let days: u64 = hour_part[..dash_idx].parse().ok()?;
             let hours: u64 = hour_part[dash_idx + 1..].parse().ok()?;
             seconds += (days * 86400) + (hours * 3600);
         } else {
-            // Format: hh
+            // Format: hh:mm:ss
             let hours: u64 = hour_part.parse().ok()?;
             seconds += hours * 3600;
         }
