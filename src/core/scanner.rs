@@ -151,6 +151,17 @@ fn check_wireguard_by_name(name: &str) -> Option<ActiveSession> {
             .ok();
     }
 
+    // Log if we couldn't determine start time (helps debug connection duration issues)
+    if session.started_at.is_none() {
+        crate::logger::log(
+            crate::logger::LogLevel::Debug,
+            "SCANNER",
+            format!(
+                "Could not determine start time for WireGuard interface '{interface_name}' (ps/metadata fallbacks failed)"
+            ),
+        );
+    }
+
     // 2. Parse `wg show {interface_name}`
     if let Ok(output) = Command::new("wg").args(["show", &interface_name]).output() {
         let out = String::from_utf8_lossy(&output.stdout);

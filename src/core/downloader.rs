@@ -76,8 +76,10 @@ pub fn download_profile(url: &str) -> Result<PathBuf, String> {
             format!("curl failed: {stderr}"),
         );
 
-        // Clean up partial download
-        let _ = std::fs::remove_file(&target_path);
+        // Clean up partial download if it exists
+        if target_path.exists() {
+            let _ = std::fs::remove_file(&target_path);
+        }
 
         // Parse curl error for user-friendly message
         if stderr.contains("Could not resolve host") {
@@ -158,6 +160,14 @@ pub fn download_profile(url: &str) -> Result<PathBuf, String> {
 }
 
 /// Extract filename from URL path
+///
+/// # Limitations
+///
+/// If no explicit `.conf` or `.ovpn` extension is found in the URL path,
+/// this function uses a heuristic: if "ovpn" appears anywhere in the URL,
+/// it defaults to `.ovpn`, otherwise `.conf`. This may incorrectly classify
+/// URLs like `https://example.com/openvpn/download` as needing `.ovpn` when
+/// the actual content might be `WireGuard`.
 fn extract_filename_from_url(url: &str) -> String {
     // Try to extract filename from URL path
     // e.g., "https://example.com/configs/us-east.conf" -> "us-east.conf"

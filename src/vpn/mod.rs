@@ -429,9 +429,9 @@ mod tests {
     fn test_derive_location_unknown() {
         assert_eq!(derive_location_from_name("my-vpn"), "Unknown");
         assert_eq!(derive_location_from_name("server-01"), "Unknown");
-        // Edge cases that should NOT be misidentified
-        assert_eq!(derive_location_from_name("usa-server"), "Unknown"); // "us" not at boundary
-        assert_eq!(derive_location_from_name("cache-server"), "Unknown"); // "ca" not at boundary
+        // Edge cases that should NOT be misidentified as country codes
+        assert_eq!(derive_location_from_name("usa-server"), "Unknown"); // does not contain exact "us-" token
+        assert_eq!(derive_location_from_name("cache-server"), "Unknown"); // does not contain exact "ca-" token
     }
 
     #[test]

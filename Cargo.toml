@@ -40,8 +40,12 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
+# System calls (for root detection)
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [lints.rust]
-unsafe_code = "deny"
+unsafe_code = "warn"
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }

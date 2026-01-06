@@ -1670,6 +1670,7 @@ dependencies = [
  "clap",
  "color-eyre",
  "crossterm 0.28.1",
+ "libc",
  "ratatui",
  "serde",
  "serde_json",

@@ -259,7 +259,14 @@ fn is_valid_ipv4(ip: &str) -> bool {
         return false;
     }
 
-    parts.iter().all(|part| part.parse::<u8>().is_ok())
+    // Verify each octet is a valid u8 (0-255) and doesn't have leading zeros
+    parts.iter().all(|part| {
+        // Reject empty parts or parts with leading zeros (except "0" itself)
+        if part.is_empty() || (part.len() > 1 && part.starts_with('0')) {
+            return false;
+        }
+        part.parse::<u8>().is_ok()
+    })
 }
 
 /// Try ipify.org API (IP only, very reliable) with retry
@@ -416,6 +423,11 @@ fn parse_ip_api_response(json: &str) -> Option<(String, Option<String>, Option<S
 
     let ip = response.ip?;
 
+    // Validate that the returned IP is a valid IPv4 address
+    if !is_valid_ipv4(&ip) {
+        return None;
+    }
+
     // Prefer "org" over "isp" as it's usually more specific (ipinfo.io uses "org")
     let isp = response.org.or(response.isp);
 
@@ -474,10 +486,9 @@ fn fetch_latency(tx: &Sender<TelemetryUpdate>) {
                                     if let Some(percent_str) = before_loss
                                         .split([',', ' '])
                                         .filter(|s| !s.is_empty())
-                                        .filter(|s| {
+                                        .rfind(|s| {
                                             s.chars().all(|c| c.is_ascii_digit() || c == '.')
                                         })
-                                        .next_back()
                                     {
                                         if let Ok(val) = percent_str.parse::<f32>() {
                                             packet_loss = val;

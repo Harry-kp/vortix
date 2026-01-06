@@ -6,14 +6,26 @@
 use std::process::Command;
 
 /// Check if the current process is running as root (UID 0)
+///
+/// Uses the effective user ID from the OS instead of spawning an external command.
+/// This avoids silent failures if `id` is unavailable or fails.
 #[must_use]
+#[cfg(unix)]
+#[allow(unsafe_code)]
 pub fn is_root() -> bool {
-    // Use `id -u` command which is portable across Unix systems
-    Command::new("id")
-        .arg("-u")
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "0")
-        .unwrap_or(false)
+    // SAFETY: geteuid() is a simple syscall that returns the effective user ID.
+    // It has no side effects and always succeeds.
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// Check if the current process is running as root (UID 0)
+///
+/// On non-Unix platforms, this always returns `false` because there is no
+/// portable concept of a root user.
+#[must_use]
+#[cfg(not(unix))]
+pub fn is_root() -> bool {
+    false
 }
 
 /// Formats bytes per second into a human-readable string.
