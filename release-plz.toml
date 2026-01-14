@@ -5,9 +5,9 @@ changelog_config = "cliff.toml"
 # PR settings
 pr_labels = ["release"]
 
-# Git settings  
-git_release_enable = true
-git_release_draft = false
+# Git settings
+# Disable GitHub release creation - cargo-dist handles this
+git_release_enable = false
 # Tag format: "v" prefix (matches cargo-dist trigger pattern)
 git_tag_name = "v{{ version }}"
 
