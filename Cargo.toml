@@ -28,7 +28,7 @@ exclude = [
 [dependencies]
 # TUI Framework
 ratatui = "0.30"
-crossterm = "0.28"
+crossterm = "0.29"
 
 # Error Handling
 color-eyre = "0.6"
