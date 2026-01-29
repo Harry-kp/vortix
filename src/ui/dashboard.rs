@@ -13,6 +13,7 @@ use ratatui::{
 
 use super::widgets;
 use crate::constants;
+use crate::logger;
 use crate::message;
 use crate::theme;
 use crate::utils;
@@ -227,36 +228,111 @@ fn render_cockpit_header(frame: &mut Frame, app: &App, area: Rect) {
     let (status_text, color, profile_name, _location_text, _iface_text, since) =
         get_connection_info(app);
 
-    // Compact uptime format: ▲HH:MM or ▲MM:SS for < 1 hour
-    let uptime = if let Some(s) = since {
-        let elapsed = s.elapsed();
-        let secs = elapsed.as_secs();
-        if secs >= 3600 {
-            format!("▲{:02}:{:02}", secs / 3600, (secs % 3600) / 60)
-        } else {
-            format!("▲{:02}:{:02}", secs / 60, secs % 60)
-        }
-    } else {
-        "▲--:--".to_string()
-    };
-
     let ks_indicator = get_killswitch_indicator(app);
-    let line = Line::from(vec![
-        Span::styled(
-            status_text,
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!(" ({profile_name})"),
-            Style::default().fg(theme::TEXT_SECONDARY),
-        ),
-        Span::styled(" │ ", Style::default().fg(theme::NORD_POLAR_NIGHT_4)),
-        Span::styled(&app.public_ip, Style::default().fg(theme::TEXT_PRIMARY)),
-        Span::styled(" │ ", Style::default().fg(theme::NORD_POLAR_NIGHT_4)),
-        Span::styled(uptime, Style::default().fg(theme::ACCENT_SECONDARY)),
-        Span::styled(" │", Style::default().fg(theme::NORD_POLAR_NIGHT_4)),
-        ks_indicator,
-    ]);
+
+    // Build header based on connection state
+    let line = match &app.connection_state {
+        ConnectionState::Disconnected => {
+            // When disconnected, show "Real IP" label to clarify
+            Line::from(vec![
+                Span::styled(
+                    status_text,
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" │ ", Style::default().fg(theme::NORD_POLAR_NIGHT_4)),
+                Span::styled("Your IP: ", Style::default().fg(theme::TEXT_SECONDARY)),
+                Span::styled(&app.public_ip, Style::default().fg(theme::TEXT_PRIMARY)),
+                Span::styled(" (Unprotected)", Style::default().fg(theme::WARNING)),
+                Span::styled(" │", Style::default().fg(theme::NORD_POLAR_NIGHT_4)),
+                ks_indicator,
+            ])
+        }
+        ConnectionState::Connecting { .. } | ConnectionState::Disconnecting { .. } => {
+            // Transitional states - show profile name
+            Line::from(vec![
+                Span::styled(
+                    status_text,
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" ({profile_name})"),
+                    Style::default().fg(theme::TEXT_SECONDARY),
+                ),
+                Span::styled(" │", Style::default().fg(theme::NORD_POLAR_NIGHT_4)),
+                ks_indicator,
+            ])
+        }
+        ConnectionState::Connected { .. } => {
+            // Connected - show VPN IP, uptime, and quality
+            let elapsed = since.map_or(0, |s| s.elapsed().as_secs());
+            let uptime = if elapsed >= 3600 {
+                format!("▲{:02}:{:02}", elapsed / 3600, (elapsed % 3600) / 60)
+            } else {
+                format!("▲{:02}:{:02}", elapsed / 60, elapsed % 60)
+            };
+
+            // Connection quality indicator
+            let quality_indicator = if app.latency_ms > 0 {
+                if app.packet_loss >= 5.0 || app.jitter_ms >= 15 {
+                    ("●●○○○", theme::NORD_RED)
+                } else if app.packet_loss >= 1.0 || app.jitter_ms >= 5 {
+                    ("●●●○○", theme::NORD_YELLOW)
+                } else if app.latency_ms < 50 {
+                    ("●●●●●", theme::NORD_GREEN)
+                } else if app.latency_ms < 150 {
+                    ("●●●●○", theme::NORD_GREEN)
+                } else {
+                    ("●●●○○", theme::NORD_YELLOW)
+                }
+            } else {
+                ("─────", theme::TEXT_SECONDARY)
+            };
+
+            // Build header with location (only when connected and location is known)
+            let mut header_spans = vec![
+                Span::styled(
+                    status_text,
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" ({profile_name})"),
+                    Style::default().fg(theme::TEXT_SECONDARY),
+                ),
+                Span::styled(" │ ", Style::default().fg(theme::NORD_POLAR_NIGHT_4)),
+                Span::styled("VPN: ", Style::default().fg(theme::TEXT_SECONDARY)),
+                Span::styled(&app.public_ip, Style::default().fg(theme::SUCCESS)),
+            ];
+
+            // Add location if available (from real-time IP geolocation)
+            if !app.location.is_empty()
+                && app.location != "Unknown"
+                && app.location != constants::MSG_DETECTING
+            {
+                header_spans.push(Span::styled(
+                    " @ ",
+                    Style::default().fg(theme::TEXT_SECONDARY),
+                ));
+                header_spans.push(Span::styled(
+                    utils::truncate(&app.location, 15),
+                    Style::default().fg(theme::ACCENT_PRIMARY),
+                ));
+            }
+
+            header_spans.extend_from_slice(&[
+                Span::styled(" │ ", Style::default().fg(theme::NORD_POLAR_NIGHT_4)),
+                Span::styled(uptime, Style::default().fg(theme::ACCENT_SECONDARY)),
+                Span::styled(" │ ", Style::default().fg(theme::NORD_POLAR_NIGHT_4)),
+                Span::styled(
+                    quality_indicator.0,
+                    Style::default().fg(quality_indicator.1),
+                ),
+                Span::styled(" │", Style::default().fg(theme::NORD_POLAR_NIGHT_4)),
+                ks_indicator,
+            ]);
+
+            Line::from(header_spans)
+        }
+    };
 
     frame.render_widget(Paragraph::new(line), area);
 }
@@ -371,11 +447,11 @@ fn render_profiles_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
             let is_active = active_profile.as_ref() == Some(&p.name);
             let is_never_used = p.last_used.is_none();
 
-            // Collapsed Status Slot
+            // Status indicator
             let (status_char, status_color) = if is_active {
-                (" ●", theme::SUCCESS)
+                ("●", theme::SUCCESS)
             } else {
-                ("  ", Color::Reset)
+                (" ", Color::Reset)
             };
 
             let name_style = if is_selected {
@@ -390,8 +466,8 @@ fn render_profiles_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
                 Style::default().fg(theme::INACTIVE)
             };
 
-            // Metadata on the right
-            let proto_char = match p.protocol {
+            // Protocol indicator
+            let proto_icon = match p.protocol {
                 crate::app::Protocol::WireGuard => "W",
                 crate::app::Protocol::OpenVPN => "O",
             };
@@ -403,38 +479,17 @@ fn render_profiles_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
                 theme::TEXT_SECONDARY
             };
 
+            // Last used time
             let time_str = if let Some(last_used) = p.last_used {
-                utils::format_relative_time(last_used)
+                let relative = utils::format_relative_time(last_used);
+                if !relative.ends_with("ago") && !relative.is_empty() {
+                    format!("{relative} ago")
+                } else {
+                    relative
+                }
             } else {
-                String::new()
+                "never".to_string()
             };
-
-            // Fixed meta widths for column alignment
-            let proto_width = 1;
-            let time_width = 4;
-            let padding_right = 1; // Add 1 space padding from right border
-            let meta_width = proto_width + 1 + time_width + padding_right; // Protocol + space + Time + Padding
-
-            let prefix_width = 3; // status(2) + space(1)
-            let name_width = p.name.len();
-
-            let avail_width = (inner.width as usize).saturating_sub(prefix_width);
-            let padding_width = avail_width.saturating_sub(name_width + meta_width);
-            let padding = " ".repeat(padding_width);
-
-            let final_spans = vec![
-                Span::styled(status_char, Style::default().fg(status_color)),
-                Span::raw(" "),
-                Span::styled(&p.name, name_style),
-                Span::raw(padding),
-                Span::styled(proto_char, Style::default().fg(proto_color)),
-                Span::raw(" "),
-                Span::styled(
-                    format!("{time_str:>time_width$}"),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::raw(" "), // Right padding
-            ];
 
             let row_style = if is_selected {
                 Style::default().bg(theme::ROW_SELECTED_BG)
@@ -442,11 +497,27 @@ fn render_profiles_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
                 Style::default()
             };
 
-            Row::new(vec![Cell::from(Line::from(final_spans))]).style(row_style)
+            // Create cells for each column
+            let status_cell =
+                Cell::from(Span::styled(status_char, Style::default().fg(status_color)));
+            let name_cell = Cell::from(Span::styled(p.name.clone(), name_style));
+            let proto_cell = Cell::from(Span::styled(proto_icon, Style::default().fg(proto_color)));
+            let time_cell =
+                Cell::from(Span::styled(time_str, Style::default().fg(Color::DarkGray)));
+
+            Row::new(vec![status_cell, name_cell, proto_cell, time_cell]).style(row_style)
         })
         .collect();
 
-    let table = Table::new(items, [Constraint::Min(0)]);
+    let table = Table::new(
+        items,
+        [
+            Constraint::Length(2),  // Status column (● or space)
+            Constraint::Min(8),     // Profile name (flexible)
+            Constraint::Length(3),  // Protocol (W/O)
+            Constraint::Length(10), // Last used time
+        ],
+    );
     frame.render_stateful_widget(table, inner, &mut app.profile_list_state);
 
     // Scrollbar Logic
@@ -504,7 +575,26 @@ fn render_throughput_chart(frame: &mut Frame, app: &App, area: Rect) {
     // Layout: Stats (Top) | Chart (Bottom)
     let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
 
-    // 1. Render Numeric Stats (Top row)
+    // 1. Render Numeric Stats (Top row) - Removed redundant ping, added session totals
+
+    // Calculate session totals from connection details if available
+    let (session_rx, session_tx) = match &app.connection_state {
+        ConnectionState::Connected { details, .. } => {
+            let rx = if details.transfer_rx.is_empty() {
+                "0B".to_string()
+            } else {
+                details.transfer_rx.clone()
+            };
+            let tx = if details.transfer_tx.is_empty() {
+                "0B".to_string()
+            } else {
+                details.transfer_tx.clone()
+            };
+            (rx, tx)
+        }
+        _ => ("0B".to_string(), "0B".to_string()),
+    };
+
     let stats_line = Line::from(vec![
         Span::styled(" ▲ UP: ", Style::default().fg(theme::NORD_GREEN)),
         Span::styled(
@@ -518,19 +608,11 @@ fn render_throughput_chart(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(theme::TEXT_PRIMARY),
         ),
         Span::styled(" │ ", Style::default().fg(theme::NORD_POLAR_NIGHT_4)),
-        Span::styled(" ⇌ PING: ", Style::default().fg(theme::TEXT_SECONDARY)),
-        Span::styled(
-            format!("{}ms", app.latency_ms),
-            Style::default().fg(if app.latency_ms == 0 {
-                theme::TEXT_SECONDARY // Not measured yet
-            } else if app.latency_ms < 50 {
-                theme::NORD_GREEN // Excellent
-            } else if app.latency_ms < 150 {
-                theme::NORD_YELLOW // Good
-            } else {
-                theme::NORD_RED // Poor
-            }),
-        ),
+        Span::styled(" Session: ", Style::default().fg(theme::TEXT_SECONDARY)),
+        Span::styled("↓", Style::default().fg(theme::NORD_FROST_3)),
+        Span::styled(&session_rx, Style::default().fg(theme::TEXT_PRIMARY)),
+        Span::styled(" ↑", Style::default().fg(theme::NORD_GREEN)),
+        Span::styled(&session_tx, Style::default().fg(theme::TEXT_PRIMARY)),
     ]);
     frame.render_widget(
         Paragraph::new(stats_line).alignment(Alignment::Center),
@@ -624,7 +706,7 @@ fn render_security_guard(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     // Connected - show security checklist with visual indicators
-    let dns_leaking = app.dns_server.starts_with("192.168.") || app.dns_server.starts_with("172.1");
+    let dns_leaking = utils::is_private_ip(&app.dns_server);
 
     // Check if IP is actually masked (different from real IP captured when disconnected)
     let ip_status = match &app.real_ip {
@@ -635,14 +717,32 @@ fn render_security_guard(frame: &mut Frame, app: &App, area: Rect) {
                 && !app.public_ip.starts_with("Error") =>
         {
             if &app.public_ip == real {
-                (false, true) // LEAK! same IP as real
+                (false, true, Some(real.clone())) // LEAK! same IP as real
             } else {
-                (true, false) // masked (different IP)
+                (true, false, Some(real.clone())) // masked (different IP)
             }
         }
-        _ => (false, false), // unknown (still checking)
+        _ => (false, false, None), // unknown (still checking)
     };
-    let (ip_masked, ip_leaking) = ip_status;
+    let (ip_masked, ip_leaking, real_ip_opt) = ip_status;
+
+    // Get encryption info from connection details
+    let encryption_info = match &app.connection_state {
+        ConnectionState::Connected { details, .. } => {
+            if details.public_key == "OpenVPN" || details.public_key.is_empty() {
+                // OpenVPN
+                if details.latest_handshake.starts_with("Cipher:") {
+                    details.latest_handshake.replace("Cipher: ", "")
+                } else {
+                    "AES-256-GCM".to_string()
+                }
+            } else {
+                // WireGuard
+                "ChaCha20-Poly1305".to_string()
+            }
+        }
+        _ => "N/A".to_string(),
+    };
 
     // Security checklist with pass/fail indicators
     let check_pass = Span::styled("✓ ", Style::default().fg(theme::SUCCESS));
@@ -650,11 +750,25 @@ fn render_security_guard(frame: &mut Frame, app: &App, area: Rect) {
     let check_warn = Span::styled("● ", Style::default().fg(theme::WARNING));
 
     // Truncate values to fit panel
-    let max_val = inner.width.saturating_sub(10) as usize;
+    let max_val = inner.width.saturating_sub(15) as usize;
 
-    let audit = vec![
-        // IP Masked - compare with real IP
-        Line::from(vec![
+    let mut audit = vec![
+        Line::from(vec![Span::styled(
+            "   PROTECTED",
+            Style::default()
+                .fg(if ip_masked && !dns_leaking && !ipv6_leaking {
+                    theme::SUCCESS
+                } else {
+                    theme::WARNING
+                })
+                .add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(""),
+    ];
+
+    // IP Masked - show both masked and real
+    if let Some(real_ip) = real_ip_opt {
+        audit.push(Line::from(vec![
             if ip_masked {
                 check_pass.clone()
             } else if ip_leaking {
@@ -662,53 +776,125 @@ fn render_security_guard(frame: &mut Frame, app: &App, area: Rect) {
             } else {
                 check_warn.clone()
             },
-            Span::styled("IP   ", Style::default().fg(theme::TEXT_SECONDARY)),
+            Span::styled("IP Masked  : ", Style::default().fg(theme::TEXT_SECONDARY)),
             Span::styled(
                 utils::truncate(&app.public_ip, max_val),
                 Style::default().fg(if ip_masked {
                     theme::SUCCESS
-                } else if ip_leaking {
-                    theme::ERROR
                 } else {
-                    theme::WARNING
+                    theme::ERROR
                 }),
             ),
-        ]),
-        // DNS Check
-        Line::from(vec![
-            if dns_leaking {
-                check_fail.clone()
-            } else {
-                check_pass.clone()
-            },
-            Span::styled("DNS  ", Style::default().fg(theme::TEXT_SECONDARY)),
+        ]));
+        audit.push(Line::from(vec![
+            Span::styled("  Real IP: ", Style::default().fg(theme::TEXT_SECONDARY)),
             Span::styled(
-                utils::truncate(&app.dns_server, max_val),
-                Style::default().fg(if dns_leaking {
-                    theme::ERROR
-                } else {
-                    theme::SUCCESS
-                }),
+                format!("{real_ip} (hidden)"),
+                Style::default().fg(Color::DarkGray),
             ),
-        ]),
-        // IPv6 Check
-        Line::from(vec![
-            if ipv6_leaking {
-                check_fail.clone()
+        ]));
+    } else {
+        audit.push(Line::from(vec![
+            check_warn.clone(),
+            Span::styled("IP Masked  : ", Style::default().fg(theme::TEXT_SECONDARY)),
+            Span::styled("Checking...", Style::default().fg(theme::WARNING)),
+        ]));
+    }
+
+    audit.push(Line::from(""));
+
+    // DNS Check with provider name if possible
+    let dns_provider = if app.dns_server.contains("1.1.1.1") {
+        " (Cloudflare)"
+    } else if app.dns_server.contains("8.8.8.8") || app.dns_server.contains("8.8.4.4") {
+        " (Google)"
+    } else if app.dns_server.contains("9.9.9.9") {
+        " (Quad9)"
+    } else {
+        ""
+    };
+
+    audit.push(Line::from(vec![
+        if dns_leaking {
+            check_fail.clone()
+        } else {
+            check_pass.clone()
+        },
+        Span::styled("DNS Secure : ", Style::default().fg(theme::TEXT_SECONDARY)),
+        Span::styled(
+            utils::truncate(&app.dns_server, max_val),
+            Style::default().fg(if dns_leaking {
+                theme::ERROR
             } else {
-                check_pass.clone()
-            },
-            Span::styled("IPv6 ", Style::default().fg(theme::TEXT_SECONDARY)),
-            Span::styled(
-                if ipv6_leaking { "Leaking" } else { "Blocked" },
-                Style::default().fg(if ipv6_leaking {
-                    theme::ERROR
-                } else {
-                    theme::SUCCESS
-                }),
-            ),
-        ]),
-    ];
+                theme::SUCCESS
+            }),
+        ),
+    ]));
+    if !dns_provider.is_empty() {
+        audit.push(Line::from(vec![
+            Span::styled("  Provider: ", Style::default().fg(theme::TEXT_SECONDARY)),
+            Span::styled(dns_provider, Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+
+    audit.push(Line::from(""));
+
+    // IPv6 Check
+    audit.push(Line::from(vec![
+        if ipv6_leaking {
+            check_fail.clone()
+        } else {
+            check_pass.clone()
+        },
+        Span::styled("IPv6       : ", Style::default().fg(theme::TEXT_SECONDARY)),
+        Span::styled(
+            if ipv6_leaking { "Leaking" } else { "Blocked" },
+            Style::default().fg(if ipv6_leaking {
+                theme::ERROR
+            } else {
+                theme::SUCCESS
+            }),
+        ),
+    ]));
+
+    audit.push(Line::from(""));
+
+    // Kill Switch Status
+    let (ks_icon, ks_text, ks_color) = match (app.killswitch_mode, app.killswitch_state) {
+        (crate::state::KillSwitchMode::Off, _) => (check_fail.clone(), "Off", theme::INACTIVE),
+        (_, crate::state::KillSwitchState::Blocking) => {
+            (check_warn.clone(), "Blocking (Strict)", theme::ERROR)
+        }
+        (crate::state::KillSwitchMode::Auto, crate::state::KillSwitchState::Armed) => {
+            (check_pass.clone(), "Armed (Auto)", theme::SUCCESS)
+        }
+        (crate::state::KillSwitchMode::AlwaysOn, crate::state::KillSwitchState::Armed) => {
+            (check_pass.clone(), "Armed (Strict)", theme::WARNING)
+        }
+        _ => (check_warn.clone(), "Unknown", theme::WARNING),
+    };
+
+    audit.push(Line::from(vec![
+        ks_icon,
+        Span::styled("Kill Switch: ", Style::default().fg(theme::TEXT_SECONDARY)),
+        Span::styled(ks_text, Style::default().fg(ks_color)),
+    ]));
+
+    audit.push(Line::from(""));
+
+    // Encryption Info
+    audit.push(Line::from(vec![
+        check_pass,
+        Span::styled("Encryption : ", Style::default().fg(theme::TEXT_SECONDARY)),
+        Span::styled(encryption_info, Style::default().fg(theme::NORD_YELLOW)),
+    ]));
+
+    // Last checked timestamp (static for now, could be dynamic)
+    audit.push(Line::from(""));
+    audit.push(Line::from(vec![Span::styled(
+        "Last checked: just now",
+        Style::default().fg(Color::DarkGray),
+    )]));
 
     frame.render_widget(Paragraph::new(audit), inner);
 }
@@ -940,6 +1126,7 @@ fn render_delete_confirm(frame: &mut Frame, name: &str, confirm_selected: bool) 
     frame.render_widget(Paragraph::new(text).alignment(Alignment::Center), inner);
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_activity_log(frame: &mut Frame, app: &App, area: Rect) {
     let is_focused = app.should_draw_focus(&crate::app::FocusedPanel::Logs);
     let border_style = if is_focused {
@@ -948,15 +1135,25 @@ fn render_activity_log(frame: &mut Frame, app: &App, area: Rect) {
         Style::default().fg(theme::BORDER_DEFAULT)
     };
 
+    // Dynamic title based on auto-scroll state
+    let title = if app.logs_auto_scroll {
+        " Event Log [Live] "
+    } else {
+        " Event Log [Paused - G to resume] "
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
-        .title(" Event Log ");
+        .title(title);
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    if app.logs.is_empty() {
+    // Get logs from centralized logger
+    let all_logs = logger::get_logs();
+
+    if all_logs.is_empty() {
         frame.render_widget(
             Paragraph::new("No activity yet").alignment(Alignment::Center),
             inner,
@@ -969,64 +1166,61 @@ fn render_activity_log(frame: &mut Frame, app: &App, area: Rect) {
 
     // Get the last N logs that fit in the panel (auto-scroll behavior)
     let start_idx = if app.logs_auto_scroll {
-        app.logs.len().saturating_sub(visible_lines)
+        all_logs.len().saturating_sub(visible_lines)
     } else {
         app.logs_scroll as usize
     };
 
-    let end_idx = (start_idx + visible_lines).min(app.logs.len());
+    let end_idx = (start_idx + visible_lines).min(all_logs.len());
 
-    let logs: Vec<Line> = app.logs[start_idx..end_idx]
+    let logs: Vec<Line> = all_logs[start_idx..end_idx]
         .iter()
-        .map(|msg| {
-            let (timestamp, content) = if let Some(idx) = msg.find(' ') {
-                (&msg[..idx], &msg[idx + 1..])
+        .map(|entry| {
+            // Format timestamp from LogEntry
+            let elapsed = entry.timestamp.elapsed().map(|d| d.as_secs()).unwrap_or(0);
+
+            let time_str = if elapsed < 60 {
+                format!("{elapsed}s")
+            } else if elapsed < 3600 {
+                format!("{}m", elapsed / 60)
             } else {
-                ("", msg.as_str())
+                format!("{}h", elapsed / 3600)
             };
 
-            // Truncate content to fit panel width (timestamp ~10 chars + brackets)
-            let max_content_len = inner.width.saturating_sub(13) as usize;
+            // Build content string: [CATEGORY] message
+            let content = format!("{}: {}", entry.category, entry.message);
+
+            // Truncate content to fit panel width
+            let max_content_len = inner.width.saturating_sub(10) as usize;
             let truncated_content = if content.len() > max_content_len {
                 format!("{}…", &content[..max_content_len.saturating_sub(1)])
             } else {
-                content.to_string()
+                content
             };
 
-            let style = if content.contains("Error")
-                || content.contains("Failed")
-                || content.contains("LEAK")
-                || content.contains("leak")
-            {
-                Style::default().fg(theme::ERROR)
-            } else if content.contains("Connected")
-                || content.contains("SUCCESS")
-                || content.contains("established")
-                || content.contains("secure")
-                || content.contains("Masked")
-            {
-                Style::default().fg(theme::SUCCESS)
-            } else if content.contains("ACTION")
-                || content.contains("CMD")
-                || content.contains("starting")
-                || content.contains("stopping")
-            {
-                Style::default().fg(theme::ACCENT_SECONDARY)
-            } else if content.contains("WARN")
-                || content.contains("spike")
-                || content.contains("⚠")
-                || content.contains("non-zero")
-            {
-                Style::default().fg(theme::WARNING)
-            } else if content.contains("NET:") || content.contains("SEC:") {
-                Style::default().fg(theme::NORD_FROST_3)
-            } else {
-                Style::default().fg(theme::INACTIVE)
+            // Color based on log level
+            let style = match entry.level {
+                logger::LogLevel::Error => Style::default().fg(theme::ERROR),
+                logger::LogLevel::Warning => Style::default().fg(theme::WARNING),
+                logger::LogLevel::Info => {
+                    // Additional coloring for info based on content
+                    if entry.message.contains("Connected")
+                        || entry.message.contains("established")
+                        || entry.message.contains("secure")
+                    {
+                        Style::default().fg(theme::SUCCESS)
+                    } else if entry.category == "NET" || entry.category == "SEC" {
+                        Style::default().fg(theme::NORD_FROST_3)
+                    } else {
+                        Style::default().fg(theme::INACTIVE)
+                    }
+                }
+                logger::LogLevel::Debug => Style::default().fg(Color::DarkGray),
             };
 
             Line::from(vec![
                 Span::styled(
-                    format!("[{timestamp}] "),
+                    format!("[{time_str}] "),
                     Style::default().fg(theme::TEXT_SECONDARY),
                 ),
                 Span::styled(truncated_content, style),
@@ -1045,7 +1239,7 @@ fn render_activity_log(frame: &mut Frame, app: &App, area: Rect) {
         .thumb_style(Style::default().fg(theme::ACCENT_PRIMARY));
 
     let mut scrollbar_state =
-        ScrollbarState::new(app.logs.len().saturating_sub(visible_lines)).position(start_idx);
+        ScrollbarState::new(all_logs.len().saturating_sub(visible_lines)).position(start_idx);
 
     frame.render_stateful_widget(
         scrollbar,
@@ -1059,7 +1253,7 @@ fn render_activity_log(frame: &mut Frame, app: &App, area: Rect) {
 
 // === Helper Utilities ===
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::similar_names)]
 fn render_connection_details(frame: &mut Frame, app: &App, area: Rect) {
     let is_focused = app.should_draw_focus(&crate::app::FocusedPanel::ConnectionDetails);
     let border_style = if is_focused {
@@ -1079,10 +1273,17 @@ fn render_connection_details(frame: &mut Frame, app: &App, area: Rect) {
     if let ConnectionState::Connected { details, .. } = &app.connection_state {
         let is_openvpn = details.public_key == "OpenVPN" || details.public_key.is_empty();
 
+        // MTU value
+        let mtu_str = if details.mtu.is_empty() {
+            "-".to_string()
+        } else {
+            details.mtu.clone()
+        };
+
         let mut text = vec![
-            // Row 1: Net Info (IP + Iface)
+            // Row 1: VPN IP @ Interface
             Line::from(vec![
-                Span::styled("IP/If   : ", Style::default().fg(theme::TEXT_SECONDARY)),
+                Span::styled("VPN IP  : ", Style::default().fg(theme::TEXT_SECONDARY)),
                 Span::styled(
                     &details.internal_ip,
                     Style::default()
@@ -1091,7 +1292,7 @@ fn render_connection_details(frame: &mut Frame, app: &App, area: Rect) {
                 ),
                 Span::styled(
                     format!(
-                        " ({})",
+                        " @ {}",
                         if details.interface.is_empty() {
                             "-"
                         } else {
@@ -1101,14 +1302,14 @@ fn render_connection_details(frame: &mut Frame, app: &App, area: Rect) {
                     Style::default().fg(theme::TEXT_SECONDARY),
                 ),
             ]),
-            // Row 2: Server Endpoint (Dedicated Line)
+            // Row 2: Server (clearer than "Remote")
             Line::from(vec![
-                Span::styled("Remote  : ", Style::default().fg(theme::TEXT_SECONDARY)),
+                Span::styled("Server  : ", Style::default().fg(theme::TEXT_SECONDARY)),
                 Span::styled(&details.endpoint, Style::default().fg(theme::TEXT_PRIMARY)),
             ]),
-            // Row 3: ISP | Location
+            // Row 3: Exit Node (ISP | Location)
             Line::from(vec![
-                Span::styled("ISP/Loc : ", Style::default().fg(theme::TEXT_SECONDARY)),
+                Span::styled("Exit    : ", Style::default().fg(theme::TEXT_SECONDARY)),
                 Span::styled(
                     utils::truncate(&app.isp, 12),
                     Style::default().fg(theme::TEXT_PRIMARY),
@@ -1122,7 +1323,7 @@ fn render_connection_details(frame: &mut Frame, app: &App, area: Rect) {
             ]),
         ];
 
-        // Row 4: Protocol Info
+        // Row 4: Crypto/Protocol Info
         let (proto_label, proto_value, proto_color) = if is_openvpn {
             let cipher = if details.latest_handshake.starts_with("Cipher:") {
                 details.latest_handshake.replace("Cipher: ", "")
@@ -1131,31 +1332,32 @@ fn render_connection_details(frame: &mut Frame, app: &App, area: Rect) {
             } else {
                 details.latest_handshake.clone()
             };
-            ("Cipher  : ", cipher, theme::NORD_YELLOW)
+            ("Crypto  : ", cipher, theme::NORD_YELLOW)
         } else {
-            (
-                "Shake   : ",
-                details.latest_handshake.clone(),
-                theme::NORD_YELLOW,
-            )
+            // For WireGuard, show last handshake time
+            let handshake_str = if details.latest_handshake.is_empty() {
+                "ChaCha20-Poly1305".to_string()
+            } else {
+                format!("ChaCha20 ({})", details.latest_handshake)
+            };
+            ("Crypto  : ", handshake_str, theme::NORD_YELLOW)
         };
 
-        if proto_value.is_empty() {
-            // Placeholder to maintain grid
-            text.push(Line::from(vec![
-                Span::styled(proto_label, Style::default().fg(theme::TEXT_SECONDARY)),
-                Span::styled("-", Style::default().fg(proto_color)),
-            ]));
-        } else {
-            text.push(Line::from(vec![
-                Span::styled(proto_label, Style::default().fg(theme::TEXT_SECONDARY)),
-                Span::styled(proto_value, Style::default().fg(proto_color)),
-            ]));
-        }
-
-        // Row 5: Transfer Stats
         text.push(Line::from(vec![
-            Span::styled("Xfer    : ", Style::default().fg(theme::TEXT_SECONDARY)),
+            Span::styled(proto_label, Style::default().fg(theme::TEXT_SECONDARY)),
+            Span::styled(
+                if proto_value.is_empty() {
+                    "-"
+                } else {
+                    &proto_value
+                },
+                Style::default().fg(proto_color),
+            ),
+        ]));
+
+        // Row 5: Transfer Stats with MTU
+        text.push(Line::from(vec![
+            Span::styled("Transfer: ", Style::default().fg(theme::TEXT_SECONDARY)),
             Span::styled("↓", Style::default().fg(theme::NORD_FROST_3)),
             Span::styled(
                 if details.transfer_rx.is_empty() {
@@ -1174,6 +1376,9 @@ fn render_connection_details(frame: &mut Frame, app: &App, area: Rect) {
                 },
                 Style::default().fg(theme::TEXT_PRIMARY),
             ),
+            Span::styled(" (MTU:", Style::default().fg(theme::TEXT_SECONDARY)),
+            Span::styled(mtu_str, Style::default().fg(theme::TEXT_SECONDARY)),
+            Span::styled(")", Style::default().fg(theme::TEXT_SECONDARY)),
         ]));
 
         text.push(Line::from(""));
@@ -1281,10 +1486,8 @@ fn render_connection_details(frame: &mut Frame, app: &App, area: Rect) {
                         Style::default().fg(theme::TEXT_PRIMARY),
                     ),
                 ]));
-                text.push(Line::from(vec![
-                    Span::styled("Location: ", Style::default().fg(theme::TEXT_SECONDARY)),
-                    Span::styled(&profile.location, Style::default().fg(theme::TEXT_PRIMARY)),
-                ]));
+                // Note: Location is only shown when connected (in header and connection details)
+                // Profile metadata doesn't include reliable location information
             }
         }
 

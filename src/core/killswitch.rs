@@ -11,6 +11,7 @@
 //! - Allow VPN server IP for reconnection
 //! - Allow all traffic on VPN interface
 
+use crate::logger::{self, LogLevel};
 use crate::state::{KillSwitchMode, KillSwitchState};
 use crate::utils;
 use std::fmt::Write as FmtWrite;
@@ -113,7 +114,24 @@ pass quick on {vpn_interface} all
 ///
 /// Returns error if not running as root or pf commands fail.
 pub fn enable_blocking(vpn_interface: &str, vpn_server_ip: Option<&str>) -> Result<()> {
-    if !nix::unistd::Uid::effective().is_root() {
+    logger::log(
+        LogLevel::Info,
+        "FIREWALL",
+        format!(
+            "Enabling kill switch on interface '{}'{}",
+            vpn_interface,
+            vpn_server_ip
+                .map(|ip| format!(", server: {ip}"))
+                .unwrap_or_default()
+        ),
+    );
+
+    if !crate::utils::is_root() {
+        logger::log(
+            LogLevel::Error,
+            "FIREWALL",
+            "Kill switch requires root privileges",
+        );
         return Err(KillSwitchError::NotRoot);
     }
 
@@ -121,14 +139,23 @@ pub fn enable_blocking(vpn_interface: &str, vpn_server_ip: Option<&str>) -> Resu
     let rules = generate_pf_rules(vpn_interface, vpn_server_ip);
     let mut file = fs::File::create(PF_CONF_PATH)?;
     file.write_all(rules.as_bytes())?;
+    logger::log(
+        LogLevel::Debug,
+        "FIREWALL",
+        format!("Wrote pf rules to {PF_CONF_PATH}"),
+    );
 
     // Load the rules
     let output = Command::new("pfctl").args(["-f", PF_CONF_PATH]).output()?;
 
     if !output.status.success() {
-        return Err(KillSwitchError::CommandFailed(
-            String::from_utf8_lossy(&output.stderr).to_string(),
-        ));
+        let err = String::from_utf8_lossy(&output.stderr).to_string();
+        logger::log(
+            LogLevel::Error,
+            "FIREWALL",
+            format!("pfctl -f failed: {err}"),
+        );
+        return Err(KillSwitchError::CommandFailed(err));
     }
 
     // Enable pf
@@ -139,10 +166,20 @@ pub fn enable_blocking(vpn_interface: &str, vpn_server_ip: Option<&str>) -> Resu
         let stderr = String::from_utf8_lossy(&output.stderr);
         // "pf enabled" or "pf already enabled" are both OK
         if !stderr.contains("enabled") {
+            logger::log(
+                LogLevel::Error,
+                "FIREWALL",
+                format!("pfctl -e failed: {stderr}"),
+            );
             return Err(KillSwitchError::CommandFailed(stderr.to_string()));
         }
     }
 
+    logger::log(
+        LogLevel::Info,
+        "FIREWALL",
+        "✓ Kill switch ACTIVE - blocking non-VPN traffic",
+    );
     Ok(())
 }
 
@@ -152,7 +189,14 @@ pub fn enable_blocking(vpn_interface: &str, vpn_server_ip: Option<&str>) -> Resu
 ///
 /// Returns error if not running as root or pf commands fail.
 pub fn disable_blocking() -> Result<()> {
-    if !nix::unistd::Uid::effective().is_root() {
+    logger::log(LogLevel::Info, "FIREWALL", "Disabling kill switch...");
+
+    if !crate::utils::is_root() {
+        logger::log(
+            LogLevel::Error,
+            "FIREWALL",
+            "Disabling kill switch requires root privileges",
+        );
         return Err(KillSwitchError::NotRoot);
     }
 
@@ -163,6 +207,11 @@ pub fn disable_blocking() -> Result<()> {
         let stderr = String::from_utf8_lossy(&output.stderr);
         // Ignore "pf not enabled" errors
         if !stderr.contains("not enabled") {
+            logger::log(
+                LogLevel::Error,
+                "FIREWALL",
+                format!("pfctl -F failed: {stderr}"),
+            );
             return Err(KillSwitchError::CommandFailed(stderr.to_string()));
         }
     }
@@ -173,6 +222,11 @@ pub fn disable_blocking() -> Result<()> {
     // Clean up temp file
     let _ = fs::remove_file(PF_CONF_PATH);
 
+    logger::log(
+        LogLevel::Info,
+        "FIREWALL",
+        "✓ Kill switch DISABLED - normal traffic restored",
+    );
     Ok(())
 }
 
@@ -194,8 +248,25 @@ pub struct PersistedState {
 #[must_use]
 pub fn load_state() -> Option<PersistedState> {
     let path = get_state_path()?;
-    let content = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&content).ok()
+    let content = fs::read_to_string(&path).ok()?;
+    match serde_json::from_str(&content) {
+        Ok(state) => {
+            logger::log(
+                LogLevel::Debug,
+                "FIREWALL",
+                format!("Loaded persisted state from {}", path.display()),
+            );
+            Some(state)
+        }
+        Err(e) => {
+            logger::log(
+                LogLevel::Warning,
+                "FIREWALL",
+                format!("Failed to parse persisted state: {e}"),
+            );
+            None
+        }
+    }
 }
 
 /// Save kill switch state to persistence file.
