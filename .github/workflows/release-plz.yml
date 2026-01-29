@@ -5,11 +5,14 @@ permissions:
   contents: write
 
 on:
-  # Manual trigger only - run when YOU decide
+  # Trigger on push to main - this handles both:
+  # 1. Creating release PR when new commits land
+  # 2. Publishing when release PR is merged
+  push:
+    branches:
+      - main
+  # Manual trigger for on-demand releases
   workflow_dispatch:
-  # Or uncomment for scheduled releases (e.g., weekly on Monday):
-  # schedule:
-  #   - cron: '0 9 * * 1'
 
 jobs:
   release-plz:

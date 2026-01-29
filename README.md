@@ -97,3 +97,7 @@ cargo build         # Build binary
 cargo test          # Run unit/integration tests
 cargo clippy        # Enforce code quality (Fail-fast via pre-commit)
 ```
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=Harry-kp/vortix&type=Date)](https://star-history.com/#Harry-kp/vortix&Date)

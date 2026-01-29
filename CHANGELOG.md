@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-01-14
+
+### Bug Fixes
+
+- Address Clippy and Copilot review comments
+
+### Miscellaneous
+
+- **deps:** Bump nix from 0.29.0 to 0.30.1 ([#7](https://github.com/Harry-kp/vortix/pull/7))
+- **deps:** Bump libc from 0.2.179 to 0.2.180 in the rust-minor group ([#9](https://github.com/Harry-kp/vortix/pull/9))
+
+### Refactor
+
+- Centralized logging, optimized deps, improved UI
+
+
+
 ## [0.1.0] - 2026-01-02
 
 ### Added
