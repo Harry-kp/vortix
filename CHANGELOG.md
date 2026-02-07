@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-02-07
+
+### Bug Fixes
+
+- Resolve clippy errors on Linux CI (Rust 1.93)
+
+### Documentation
+
+- Add star history graph to README
+- Add ROADMAP and GitHub Sponsors funding
+- Add downloads and stars badges to README
+- Add Terminal Trove feature mention
+- Fix roadmap links to point to feature requests
+- Add comparison table, CONTRIBUTING.md, and issue/PR templates
+- Add macOS, Rust, Sponsors, and PRs Welcome badges
+
+### Features
+
+- Add Linux platform support with cross-platform abstraction layer
+- Robust VPN state machine and strict config import validation
+- OpenVPN credential management and UX improvements
+
+### Miscellaneous
+
+- **deps:** Bump clap from 4.5.54 to 4.5.56 in the rust-minor group ([#23](https://github.com/Harry-kp/vortix/pull/23))
+
+
+
 ## [0.1.1] - 2026-01-14
 
 ### Bug Fixes
