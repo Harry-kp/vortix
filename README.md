@@ -85,6 +85,11 @@ sudo pacman -S wireguard-tools openvpn iptables iproute2
 cargo install vortix
 ```
 
+**Arch Linux ([extra repo](https://archlinux.org/packages/extra/x86_64/vortix/)):**
+```bash
+pacman -S vortix
+```
+
 **Quick install (Binary):**
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Harry-kp/vortix/releases/latest/download/vortix-installer.sh | sh
