@@ -146,6 +146,115 @@ Profiles are stored in `~/.config/vortix/profiles/` with `chmod 600`.
 | Default VPN iface | `utun0` | `wg0` |
 | Tested distros | macOS 12+ | Ubuntu, Fedora, Arch |
 
+## Configuration
+
+### Config directory
+
+By default, vortix stores profiles, auth credentials, and logs in `~/.config/vortix/`.
+
+Override via CLI flag or environment variable:
+
+```bash
+sudo vortix --config-dir /path/to/custom/dir
+# or
+export VORTIX_CONFIG_DIR=/path/to/custom/dir
+sudo vortix
+```
+
+Precedence: `--config-dir` flag > `VORTIX_CONFIG_DIR` env var > default path.
+
+When running with `sudo`, vortix automatically resolves the invoking user's home directory (via `SUDO_USER`), so config files live in *your* home, not `/root/`.
+
+### Directory structure
+
+```
+~/.config/vortix/
+├── profiles/                 VPN configuration files
+│   ├── work.conf             WireGuard profile
+│   └── office.ovpn           OpenVPN profile
+├── auth/                     Saved OpenVPN credentials
+│   └── office                Username + password for "office" profile
+├── run/                      OpenVPN runtime files (temporary)
+│   ├── office.pid            Daemon PID (source of truth for disconnect)
+│   └── office.log            Raw daemon output (monitors connect/failure)
+├── logs/                     Application logs (daily rotation)
+│   └── 2026-02-09.log        Same content as the TUI Logs panel
+├── config.toml               User settings (optional, see below)
+├── metadata.json             Profile metadata (last used, sort order)
+└── killswitch.state          Kill switch state for crash recovery
+```
+
+| Path | Permissions | Description |
+|------|:-----------:|-------------|
+| `profiles/` | `600` | Your `.conf` and `.ovpn` files. Added via `vortix import` or the TUI. |
+| `auth/` | `600` | Saved OpenVPN username/password pairs. One file per profile. |
+| `run/` | temporary | **OpenVPN only.** Created by the openvpn daemon (runs as root), cleaned up on disconnect. The `.pid` file identifies which daemon to kill; the `.log` file is polled for success/error markers. Readable by all users, only accessed during sudo sessions. WireGuard doesn't need this -- it uses kernel interfaces directly. |
+| `logs/` | user-owned | Vortix's own session log. Not the same as the raw OpenVPN output in `run/`. |
+| `config.toml` | user-owned | Optional. Only exists if you create it manually. |
+| `metadata.json` | auto | Internal bookkeeping. Do not edit manually. |
+| `killswitch.state` | auto | Automatically managed. Persists kill switch mode across crashes. |
+
+### Config file
+
+Create `~/.config/vortix/config.toml` to customize settings. All fields are optional -- missing fields use defaults:
+
+```toml
+# UI refresh rate in milliseconds (default: 1000)
+tick_rate = 1000
+
+# Telemetry polling interval in seconds (default: 30)
+telemetry_poll_rate = 30
+
+# HTTP API timeout in seconds (default: 5)
+api_timeout = 5
+
+# Ping timeout in seconds (default: 2)
+ping_timeout = 2
+
+# OpenVPN connection timeout in seconds (default: 20)
+connect_timeout = 20
+
+# Ping targets for latency measurement (tried in order)
+ping_targets = ["1.1.1.1", "8.8.8.8", "9.9.9.9", "208.67.222.222"]
+
+# IPv6 leak detection endpoints
+ipv6_check_apis = ["https://ipv6.icanhazip.com", "https://v6.ident.me", "https://api6.ipify.org"]
+
+# Primary IP/ISP API
+ip_api_primary = "https://ipinfo.io/json"
+
+# Fallback IP APIs
+ip_api_fallbacks = ["https://api.ipify.org", "https://icanhazip.com", "https://ifconfig.me/ip"]
+```
+
+## Troubleshooting
+
+**Profiles missing after upgrade (Linux)**
+
+If you previously ran vortix with `sudo` and profiles were stored in `/root/.config/vortix/`, the app will offer a one-time migration prompt. Accept it to move your data to `~/.config/vortix/` under your real user account.
+
+If you declined migration and want to keep using the old path:
+
+```bash
+sudo vortix --config-dir /root/.config/vortix
+```
+
+**Permission denied errors**
+
+If config files are owned by root, fix ownership:
+
+```bash
+sudo chown -R $(whoami) ~/.config/vortix/
+```
+
+**Custom config directory**
+
+Use `--config-dir` to point vortix to any directory:
+
+```bash
+sudo vortix --config-dir ~/my-vpn-config
+```
+
 ## Development
 
 ```bash
