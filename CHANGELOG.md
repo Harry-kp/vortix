@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-02-11
+
+### Bug Fixes
+
+- Prevent TUI freeze when no network connection is available
+- **ci:** Gate macOS-only symbols behind cfg to resolve Linux dead_code errors
+- Prevent UTF-8 panic when truncating log messages in TUI
+
+### Documentation
+
+- **readme:** Add installation for arch linux ([#27](https://github.com/Harry-kp/vortix/pull/27))
+- Add directory structure and configuration guide to README
+- Clarify file ownership and permissions in README
+- Update configuration reference with all configurable settings
+
+### Features
+
+- Configurable config directory with settings, migration, and sudo ownership
+- Harden VPN lifecycle, structured logging, and configurable settings
+- Startup dependency check with toast warning for missing tools
+
+
+
 ## [0.1.2] - 2026-02-07
 
 ### Bug Fixes
