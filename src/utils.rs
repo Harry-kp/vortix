@@ -374,16 +374,23 @@ pub fn truncate(s: &str, max_chars: usize) -> String {
 /// Uses libc `localtime_r` for zero-overhead local time formatting
 /// (called every tick, so avoiding a subprocess matters).
 pub fn format_local_time() -> String {
-    format_local_time_inner().unwrap_or_else(|| "00:00:00".to_string())
+    format_system_time_local(std::time::SystemTime::now())
+}
+
+/// Converts any `SystemTime` into a local `HH:MM:SS` string.
+///
+/// Used for both "right now" timestamps (via `format_local_time()`) and for
+/// formatting historical log entries in the TUI.
+#[must_use]
+pub fn format_system_time_local(time: std::time::SystemTime) -> String {
+    format_system_time_inner(time).unwrap_or_else(|| "00:00:00".to_string())
 }
 
 #[cfg(unix)]
 #[allow(unsafe_code)]
-fn format_local_time_inner() -> Option<String> {
-    use std::time::SystemTime;
-
-    let secs = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
+fn format_system_time_inner(time: std::time::SystemTime) -> Option<String> {
+    let secs = time
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
         .ok()?
         .as_secs();
 
@@ -405,8 +412,9 @@ fn format_local_time_inner() -> Option<String> {
 }
 
 #[cfg(not(unix))]
-fn format_local_time_inner() -> Option<String> {
-    // Non-Unix fallback: shell out to date
+fn format_system_time_inner(time: std::time::SystemTime) -> Option<String> {
+    // Non-Unix fallback: use current time via shell (ignoring the `time` param)
+    let _ = time;
     std::process::Command::new("date")
         .arg("+%H:%M:%S")
         .output()

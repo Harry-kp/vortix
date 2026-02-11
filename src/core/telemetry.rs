@@ -75,25 +75,16 @@ pub enum TelemetryUpdate {
 ///
 /// # Returns
 ///
-/// A receiver channel that yields [`TelemetryUpdate`] messages as they become available.
+/// A tuple of:
+/// - `Receiver<TelemetryUpdate>` — yields telemetry data as it arrives
+/// - `Sender<()>` — send on this to trigger an immediate refresh (e.g. after connect/disconnect)
 ///
 /// # Panics
 ///
 /// This function does not panic. All errors in background threads are silently handled.
-///
-/// # Example
-///
-/// ```ignore
-/// let rx = spawn_telemetry_worker();
-/// while let Ok(update) = rx.try_recv() {
-///     match update {
-///         TelemetryUpdate::PublicIp(ip) => println!("IP: {}", ip),
-///         // ...
-///     }
-/// }
-/// ```
-pub fn spawn_telemetry_worker(config: TelemetryConfig) -> Receiver<TelemetryUpdate> {
+pub fn spawn_telemetry_worker(config: TelemetryConfig) -> (Receiver<TelemetryUpdate>, Sender<()>) {
     let (tx, rx) = mpsc::channel();
+    let (nudge_tx, nudge_rx) = mpsc::channel::<()>();
     let config = std::sync::Arc::new(config);
 
     thread::spawn(move || loop {
@@ -101,10 +92,13 @@ pub fn spawn_telemetry_worker(config: TelemetryConfig) -> Receiver<TelemetryUpda
         fetch_latency(&tx, &config);
         fetch_security_info(&tx, &config);
 
-        thread::sleep(config.poll_rate);
+        // Wait for the poll interval, but wake up immediately if nudged.
+        // Drain any extra nudges that accumulated while we were fetching.
+        let _ = nudge_rx.recv_timeout(config.poll_rate);
+        while nudge_rx.try_recv().is_ok() {}
     });
 
-    rx
+    (rx, nudge_tx)
 }
 
 /// Fetches public IP address and ISP information with fallback APIs.
@@ -717,54 +711,8 @@ fn fetch_security_info(tx: &Sender<TelemetryUpdate>, cfg: &std::sync::Arc<Teleme
     });
 }
 
-/// Network traffic statistics tracker.
-///
-/// Tracks cumulative byte counts and calculates per-second throughput rates.
-#[derive(Default)]
-pub struct NetworkStats {
-    last_bytes_in: u64,
-    last_bytes_out: u64,
-}
-
-impl NetworkStats {
-    /// Updates network statistics by reading system interface data.
-    ///
-    /// Uses platform-specific implementations:
-    /// - macOS: `netstat -ib` with dynamic column detection
-    /// - Linux: `/proc/net/dev` parsing
-    ///
-    /// # Returns
-    ///
-    /// A tuple of (`bytes_down_per_second`, `bytes_up_per_second`).
-    pub fn update(&mut self) -> (u64, u64) {
-        let mut current_down = 0u64;
-        let mut current_up = 0u64;
-
-        let (total_bytes_in, total_bytes_out) = {
-            #[cfg(target_os = "macos")]
-            {
-                use crate::platform::NetworkStatsProvider;
-                crate::platform::macos::network::MacNetworkStats::get_total_bytes()
-            }
-            #[cfg(target_os = "linux")]
-            {
-                use crate::platform::NetworkStatsProvider;
-                crate::platform::linux::network::LinuxNetworkStats::get_total_bytes()
-            }
-        };
-
-        // Calculate rate (bytes per second since last tick)
-        // First call returns 0 as we're establishing baseline
-        if self.last_bytes_in > 0 {
-            current_down = total_bytes_in.saturating_sub(self.last_bytes_in);
-            current_up = total_bytes_out.saturating_sub(self.last_bytes_out);
-        }
-        self.last_bytes_in = total_bytes_in;
-        self.last_bytes_out = total_bytes_out;
-
-        (current_down, current_up)
-    }
-}
+// Network stats delta calculation is now handled directly in App::poll_network_stats()
+// using last_bytes_in / last_bytes_out fields on the App struct.
 
 #[cfg(test)]
 mod tests {
@@ -801,22 +749,6 @@ mod tests {
     fn test_extract_json_string_empty() {
         let json = r"{}";
         assert_eq!(extract_json_string(json, "ip"), None);
-    }
-
-    #[test]
-    fn test_network_stats_new() {
-        let stats = NetworkStats::default();
-        assert_eq!(stats.last_bytes_in, 0);
-        assert_eq!(stats.last_bytes_out, 0);
-    }
-
-    #[test]
-    fn test_network_stats_initial_update() {
-        let mut stats = NetworkStats::default();
-        let (down, up) = stats.update();
-        // First update should return 0 (no previous baseline)
-        assert_eq!(down, 0);
-        assert_eq!(up, 0);
     }
 
     #[test]
@@ -1010,6 +942,12 @@ Inter-|   Receive                                                |  Transmit
                 "https://fb1.example.com".to_string(),
                 "https://fb2.example.com".to_string(),
             ],
+            max_log_entries: 1000,
+            log_level: "info".to_string(),
+            log_rotation_size: 5 * 1024 * 1024,
+            log_retention_days: 7,
+            disconnect_timeout: 30,
+            openvpn_verbosity: "3".to_string(),
         };
 
         let tel_cfg = TelemetryConfig::from(&app_cfg);

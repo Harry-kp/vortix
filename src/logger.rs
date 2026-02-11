@@ -7,8 +7,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-/// Maximum number of log entries to keep in memory
-const MAX_LOG_ENTRIES: usize = 1000;
+use crate::constants;
 
 /// Log severity levels
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -58,18 +57,10 @@ pub struct LogEntry {
 
 #[allow(dead_code)]
 impl LogEntry {
-    /// Format the log entry for display
+    /// Format the log entry as a structured line:
+    /// `[HH:MM:SS] [LEVEL] CATEGORY: message`
     pub fn format(&self) -> String {
-        let elapsed = self.timestamp.elapsed().map(|d| d.as_secs()).unwrap_or(0);
-
-        let time_str = if elapsed < 60 {
-            format!("{elapsed}s")
-        } else if elapsed < 3600 {
-            format!("{}m", elapsed / 60)
-        } else {
-            format!("{}h", elapsed / 3600)
-        };
-
+        let time_str = crate::utils::format_system_time_local(self.timestamp);
         format!(
             "[{}] [{}] {}: {}",
             time_str,
@@ -83,14 +74,17 @@ impl LogEntry {
 /// Global logger instance
 pub struct Logger {
     entries: VecDeque<LogEntry>,
+    max_entries: usize,
     min_level: LogLevel,
 }
 
 impl Logger {
     fn new() -> Self {
+        let max = constants::DEFAULT_MAX_LOG_ENTRIES;
         Self {
-            entries: VecDeque::with_capacity(MAX_LOG_ENTRIES),
-            min_level: LogLevel::Debug, // Show all logs by default
+            entries: VecDeque::with_capacity(max),
+            max_entries: max,
+            min_level: LogLevel::Info, // Default: show Info and above
         }
     }
 
@@ -110,8 +104,8 @@ impl Logger {
 
         self.entries.push_back(entry);
 
-        // Keep only MAX_LOG_ENTRIES most recent entries
-        while self.entries.len() > MAX_LOG_ENTRIES {
+        // Keep only the configured maximum number of entries
+        while self.entries.len() > self.max_entries {
             self.entries.pop_front();
         }
     }
@@ -122,9 +116,16 @@ impl Logger {
     }
 
     /// Set minimum log level
-    #[allow(dead_code)]
     fn set_min_level(&mut self, level: LogLevel) {
         self.min_level = level;
+    }
+
+    /// Set maximum number of log entries
+    fn set_max_entries(&mut self, max: usize) {
+        self.max_entries = max;
+        while self.entries.len() > self.max_entries {
+            self.entries.pop_front();
+        }
     }
 
     /// Clear all log entries
@@ -156,11 +157,37 @@ pub fn get_logs() -> Vec<LogEntry> {
         .unwrap_or_default()
 }
 
-/// Set the minimum log level (for filtering)
+/// Configure the logger from user settings.
+///
+/// Call once at startup after loading `AppConfig`.
+/// - `log_level`: one of `"debug"`, `"info"`, `"warning"`, `"error"` (case-insensitive).
+/// - `max_entries`: maximum number of log entries to keep in memory.
+pub fn configure(log_level: &str, max_entries: usize) {
+    if let Ok(mut logger) = get_logger().lock() {
+        logger.set_min_level(parse_log_level(log_level));
+        logger.set_max_entries(max_entries);
+    }
+}
+
+/// Set the minimum log level (for filtering).
 #[allow(dead_code)]
 pub fn set_min_level(level: LogLevel) {
     if let Ok(mut logger) = get_logger().lock() {
         logger.set_min_level(level);
+    }
+}
+
+/// Parse a log level string (case-insensitive) into a `LogLevel`.
+///
+/// Falls back to `LogLevel::Info` for unrecognised values.
+#[must_use]
+pub fn parse_log_level(s: &str) -> LogLevel {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "debug" => LogLevel::Debug,
+        "warning" | "warn" => LogLevel::Warning,
+        "error" | "err" => LogLevel::Error,
+        // "info" and anything unrecognized → Info
+        _ => LogLevel::Info,
     }
 }
 
@@ -249,6 +276,6 @@ mod tests {
         }
 
         let logs = get_logs();
-        assert!(logs.len() <= MAX_LOG_ENTRIES);
+        assert!(logs.len() <= constants::DEFAULT_MAX_LOG_ENTRIES);
     }
 }

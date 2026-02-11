@@ -5,12 +5,14 @@ use crate::platform::InterfaceDetector;
 use std::path::PathBuf;
 use std::process::Command;
 
-/// Run a command with the standard system command timeout.
+/// Run a command and return its output.
+///
+/// No timeout — called from the scanner's background thread, cannot block the UI.
 fn cmd_output(cmd: &mut Command) -> Option<std::process::Output> {
-    crate::utils::run_with_timeout(
-        cmd,
-        std::time::Duration::from_secs(constants::CMD_TIMEOUT_SECS),
-    )
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .ok()
 }
 
 /// macOS interface detection using ifconfig and /var/run/wireguard/*.name files.

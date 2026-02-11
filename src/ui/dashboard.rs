@@ -1366,41 +1366,43 @@ fn render_activity_log(frame: &mut Frame, app: &App, area: Rect) {
     let logs: Vec<Line> = all_logs[start_idx..end_idx]
         .iter()
         .map(|entry| {
-            // Format timestamp from LogEntry
-            let elapsed = entry.timestamp.elapsed().map(|d| d.as_secs()).unwrap_or(0);
+            // Format: [HH:MM:SS] LEVEL  CATEGORY  message
+            let time_str = utils::format_system_time_local(entry.timestamp);
+            let level_tag = entry.level.prefix(); // "INFO ", "WARN ", "ERROR", "DEBUG"
 
-            let time_str = if elapsed < 60 {
-                format!("{elapsed}s")
-            } else if elapsed < 3600 {
-                format!("{}m", elapsed / 60)
+            // Fixed-width category for alignment
+            let cat = format!(
+                "{:<width$}",
+                entry.category,
+                width = constants::LOG_CATEGORY_WIDTH
+            );
+
+            // Build the message portion
+            let message = &entry.message;
+
+            // Truncate to fit available width after the structured prefix
+            let max_msg_len = (inner.width as usize).saturating_sub(constants::LOG_PREFIX_WIDTH);
+            let truncated_msg = if message.len() > max_msg_len {
+                format!("{}…", &message[..max_msg_len.saturating_sub(1)])
             } else {
-                format!("{}h", elapsed / 3600)
+                message.clone()
             };
 
-            // Build content string: [CATEGORY] message
-            let content = format!("{}: {}", entry.category, entry.message);
-
-            // Truncate content to fit panel width
-            let max_content_len = inner.width.saturating_sub(10) as usize;
-            let truncated_content = if content.len() > max_content_len {
-                format!("{}…", &content[..max_content_len.saturating_sub(1)])
-            } else {
-                content
+            // Level badge color
+            let level_style = match entry.level {
+                logger::LogLevel::Error => Style::default().fg(theme::ERROR),
+                logger::LogLevel::Warning => Style::default().fg(theme::WARNING),
+                logger::LogLevel::Info => Style::default().fg(theme::NORD_FROST_3),
+                logger::LogLevel::Debug => Style::default().fg(Color::DarkGray),
             };
 
-            // Color based on log level
-            let style = match entry.level {
+            // Message color (same level-based, with info sub-coloring)
+            let msg_style = match entry.level {
                 logger::LogLevel::Error => Style::default().fg(theme::ERROR),
                 logger::LogLevel::Warning => Style::default().fg(theme::WARNING),
                 logger::LogLevel::Info => {
-                    // Additional coloring for info based on content
-                    if entry.message.contains("Connected")
-                        || entry.message.contains("established")
-                        || entry.message.contains("secure")
-                    {
+                    if entry.message.contains("Connected") || entry.message.contains("secure") {
                         Style::default().fg(theme::SUCCESS)
-                    } else if entry.category == "NET" || entry.category == "SEC" {
-                        Style::default().fg(theme::NORD_FROST_3)
                     } else {
                         Style::default().fg(theme::INACTIVE)
                     }
@@ -1413,7 +1415,12 @@ fn render_activity_log(frame: &mut Frame, app: &App, area: Rect) {
                     format!("[{time_str}] "),
                     Style::default().fg(theme::TEXT_SECONDARY),
                 ),
-                Span::styled(truncated_content, style),
+                Span::styled(format!("{level_tag} "), level_style),
+                Span::styled(
+                    format!("{cat}  "),
+                    Style::default().fg(theme::NORD_POLAR_NIGHT_4),
+                ),
+                Span::styled(truncated_msg, msg_style),
             ])
         })
         .collect();

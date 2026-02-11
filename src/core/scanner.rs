@@ -8,13 +8,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
 
-/// Run a command with the standard system command timeout.
-/// Returns `None` if the command hangs or fails to start.
+/// Run a command and return its output.
+///
+/// No timeout — the scanner runs in a background thread so it cannot block the UI.
+/// Commands like `lsof` and `ifconfig` need to run to completion for reliable detection.
 fn cmd_output(cmd: &mut Command) -> Option<std::process::Output> {
-    crate::utils::run_with_timeout(
-        cmd,
-        std::time::Duration::from_secs(crate::constants::CMD_TIMEOUT_SECS),
-    )
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .ok()
 }
 
 /// Information about an active VPN session detected on the system.

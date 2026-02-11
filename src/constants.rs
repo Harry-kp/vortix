@@ -24,9 +24,14 @@ pub const DEFAULT_API_TIMEOUT: u64 = 5;
 pub const DEFAULT_PING_TIMEOUT: u64 = 2;
 /// Default maximum seconds to wait for `OpenVPN` log confirmation.
 pub const DEFAULT_CONNECT_TIMEOUT: u64 = 20;
-/// Maximum seconds to wait for a local system command (`ps`, `netstat`, etc.)
-/// before killing it. Prevents the TUI from freezing when commands hang.
-pub const CMD_TIMEOUT_SECS: u64 = 3;
+/// Maximum seconds to wait for a local system command (`ps`, `lsof`, `ifconfig`, etc.)
+/// before killing it. This is a safety net against hung processes — it does NOT affect
+/// UI responsiveness because all scanner/netstats commands run in background threads.
+/// Keep low enough that a full scanner pass (5-6 commands) completes well within
+/// `DEFAULT_CONNECT_TIMEOUT`. Most commands finish in <1s; `lsof` can take 2-4s.
+pub const CMD_TIMEOUT_SECS: u64 = 5;
+/// Default maximum seconds to wait for a VPN disconnect before force-killing.
+pub const DEFAULT_DISCONNECT_TIMEOUT: u64 = 30;
 
 // === Telemetry API Endpoint Defaults ===
 // Same principle: single source of truth, overridable via config.toml.
@@ -86,15 +91,52 @@ pub const IPTABLES_CHAIN_NAME: &str = "VORTIX_KILLSWITCH";
 #[cfg(target_os = "linux")]
 pub const NFT_TABLE_NAME: &str = "vortix_killswitch";
 
-// === Telemetry Internal Constants ===
+// === Logging Defaults ===
+// These are the compiled-in defaults. Users can override them via config.toml.
+
+/// Default maximum number of log entries kept in memory for the TUI event log.
+pub const DEFAULT_MAX_LOG_ENTRIES: usize = 1000;
+/// Default minimum log level shown in the event log (`"debug"`, `"info"`, `"warning"`, `"error"`).
+pub const DEFAULT_LOG_LEVEL: &str = "info";
+/// Default log file rotation size in bytes (5 MB).
+pub const DEFAULT_LOG_ROTATION_SIZE: u64 = 5 * 1024 * 1024;
+/// Default number of days to retain old log files.
+pub const DEFAULT_LOG_RETENTION_DAYS: u64 = 7;
+/// Run old-log cleanup every Nth write to avoid filesystem work on every append.
+pub const LOG_CLEANUP_INTERVAL: u32 = 100;
+
+// === Scanner & Telemetry Internal Constants ===
 // These are internal tuning values not exposed to user configuration.
 
+/// Interval (seconds) between progress log messages while waiting for a VPN tunnel.
+pub const SCANNER_LOG_INTERVAL_SECS: u64 = 5;
+/// Maximum allowed drift (seconds) between scanner-reported uptime and local clock
+/// before re-syncing the session start time.
+pub const SESSION_TIME_DRIFT_SECS: u64 = 5;
 /// Timeout for file downloads in seconds.
 pub const HTTP_TIMEOUT_SECS: u64 = 10;
 /// Delay between retry attempts in milliseconds.
 pub const RETRY_DELAY_MS: u64 = 500;
 /// Number of retry attempts per API/target.
 pub const RETRY_ATTEMPTS: u8 = 2;
+
+// === UI Layout & Tuning Constants ===
+
+/// Fixed-width column for the log category label (e.g. `STATUS`, `NET`, `SEC`).
+pub const LOG_CATEGORY_WIDTH: usize = 6;
+/// Total character width of the structured log prefix (`[HH:MM:SS] LEVEL  CAT   `).
+/// Used to calculate how much space is left for the message text.
+pub const LOG_PREFIX_WIDTH: usize = 25;
+/// Number of data points in the network throughput chart (1 point per tick).
+pub const NETWORK_HISTORY_SIZE: usize = 60;
+/// Lines from the bottom at which the log panel re-enables auto-scroll.
+pub const LOGS_AUTO_SCROLL_THRESHOLD: u16 = 5;
+/// Number of profiles to jump when pressing Page Up / Page Down.
+pub const PROFILE_LIST_PAGE_SIZE: usize = 10;
+/// Config viewer viewport height as a percentage of terminal height.
+pub const CONFIG_VIEWER_HEIGHT_PCT: u16 = 85;
+/// Lines of chrome (borders, title, etc.) to subtract from the config viewer viewport.
+pub const CONFIG_VIEWER_CHROME_LINES: u16 = 4;
 
 // === UI Messages ===
 
@@ -140,6 +182,16 @@ pub const OVPN_LOG_ERRORS: &[&str] = &[
 ];
 /// Polling interval for `OpenVPN` log file (milliseconds).
 pub const OVPN_LOG_POLL_MS: u64 = 500;
+/// Delay (ms) after `OpenVPN` fork before chowning pid/log files to the real user.
+pub const OVPN_CHOWN_DELAY_MS: u64 = 200;
+/// Seconds to wait before checking if the `OpenVPN` daemon is still alive.
+pub const OVPN_HEALTH_CHECK_DELAY_SECS: u64 = 2;
+/// Seconds to wait for the `OpenVPN` PID file to appear before declaring failure.
+pub const OVPN_PID_FILE_TIMEOUT_SECS: u64 = 3;
+/// Number of tail log lines to include in error messages when the daemon dies.
+pub const OVPN_ERROR_LOG_TAIL_LINES: usize = 5;
+/// Default `OpenVPN` `--verb` (verbosity) level passed to the daemon.
+pub const DEFAULT_OVPN_VERBOSITY: &str = "3";
 /// Subdirectory under the Vortix config dir for `OpenVPN` saved credentials.
 pub const OPENVPN_AUTH_DIR: &str = "auth";
 /// `OpenVPN` config directive that triggers interactive auth prompts.

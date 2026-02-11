@@ -61,6 +61,18 @@ pub struct AppConfig {
     pub ip_api_primary: String,
     /// Fallback API endpoints for IP lookup (tried in order).
     pub ip_api_fallbacks: Vec<String>,
+    /// Maximum number of log entries kept in the TUI event log.
+    pub max_log_entries: usize,
+    /// Minimum log level shown in the event log (`"debug"`, `"info"`, `"warning"`, `"error"`).
+    pub log_level: String,
+    /// Maximum log file size in bytes before rotation (default: 5 MB).
+    pub log_rotation_size: u64,
+    /// Number of days to retain old log files (default: 7).
+    pub log_retention_days: u64,
+    /// Maximum seconds to wait for a VPN disconnect before force-killing (default: 30).
+    pub disconnect_timeout: u64,
+    /// `OpenVPN` daemon verbosity level (`--verb`). Range 0–11 (default: 3).
+    pub openvpn_verbosity: String,
 }
 
 impl Default for AppConfig {
@@ -87,6 +99,12 @@ impl Default for AppConfig {
                 constants::DEFAULT_IP_API_FALLBACK_2.to_string(),
                 constants::DEFAULT_IP_API_FALLBACK_3.to_string(),
             ],
+            max_log_entries: constants::DEFAULT_MAX_LOG_ENTRIES,
+            log_level: constants::DEFAULT_LOG_LEVEL.to_string(),
+            log_rotation_size: constants::DEFAULT_LOG_ROTATION_SIZE,
+            log_retention_days: constants::DEFAULT_LOG_RETENTION_DAYS,
+            disconnect_timeout: constants::DEFAULT_DISCONNECT_TIMEOUT,
+            openvpn_verbosity: constants::DEFAULT_OVPN_VERBOSITY.to_string(),
         }
     }
 }

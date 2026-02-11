@@ -104,10 +104,20 @@ pub struct App {
 
     // === Async Communication ===
     telemetry_rx: Option<mpsc::Receiver<TelemetryUpdate>>,
+    /// Send `()` to wake the telemetry worker immediately (e.g. after connect/disconnect).
+    telemetry_nudge: Option<mpsc::Sender<()>>,
     cmd_tx: mpsc::Sender<Message>,
     cmd_rx: mpsc::Receiver<Message>,
-    /// Shared profile list for the background scanner thread.
-    shared_profiles: std::sync::Arc<std::sync::Mutex<Vec<VpnProfile>>>,
+
+    // --- Spawn-on-demand background work (no long-running threads) ---
+    /// Receiver for the latest scanner result. `Some` = scan in flight or result ready.
+    scanner_rx: Option<mpsc::Receiver<Vec<scanner::ActiveSession>>>,
+    /// Receiver for the latest raw network byte totals. `Some` = fetch in flight.
+    netstats_rx: Option<mpsc::Receiver<(u64, u64)>>,
+    /// Last total bytes-in reading (for delta calculation).
+    last_bytes_in: u64,
+    /// Last total bytes-out reading (for delta calculation).
+    last_bytes_out: u64,
 }
 
 impl App {
@@ -115,8 +125,11 @@ impl App {
     #[allow(clippy::too_many_lines)]
     pub fn new(config: crate::config::AppConfig, config_dir: std::path::PathBuf) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel::<Message>();
-        let down_history = (0..60).map(|i| (f64::from(i), 0.0)).collect();
-        let up_history = (0..60).map(|i| (f64::from(i), 0.0)).collect();
+        let history_size = constants::NETWORK_HISTORY_SIZE;
+        #[allow(clippy::cast_precision_loss)]
+        let down_history = (0..history_size).map(|i| (i as f64, 0.0)).collect();
+        #[allow(clippy::cast_precision_loss)]
+        let up_history = (0..history_size).map(|i| (i as f64, 0.0)).collect();
         let mut app = Self {
             should_quit: false,
 
@@ -165,9 +178,13 @@ impl App {
             killswitch_state: crate::state::KillSwitchState::default(),
 
             telemetry_rx: None,
+            telemetry_nudge: None,
             cmd_tx,
             cmd_rx,
-            shared_profiles: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            scanner_rx: None,
+            netstats_rx: None,
+            last_bytes_in: 0,
+            last_bytes_out: 0,
         };
 
         // Recover kill switch state from crash if persisted
@@ -189,12 +206,14 @@ impl App {
 
         app.load_metadata();
         app.sort_profiles();
-        app.sync_shared_profiles();
 
         // Select first profile if available
         if !app.profiles.is_empty() {
             app.profile_list_state.select(Some(0));
         }
+
+        // Apply user's logging preferences
+        logger::configure(&app.config.log_level, app.config.max_log_entries);
 
         // Initialize logs with boot sequence
         app.log(&format!(
@@ -214,38 +233,9 @@ impl App {
 
         // Start background telemetry worker
         let telemetry_config = telemetry::TelemetryConfig::from(&app.config);
-        app.telemetry_rx = Some(telemetry::spawn_telemetry_worker(telemetry_config));
-
-        // Start background scanner thread (replaces synchronous per-tick scanning)
-        {
-            let profiles = std::sync::Arc::clone(&app.shared_profiles);
-            let tx = app.cmd_tx.clone();
-            let tick = std::time::Duration::from_millis(app.config.tick_rate);
-            std::thread::spawn(move || loop {
-                let snap = profiles.lock().map(|p| p.clone()).unwrap_or_default();
-                let active = scanner::get_active_profiles(&snap);
-                if tx.send(Message::SyncSystemState(active)).is_err() {
-                    break; // Main thread dropped — exit
-                }
-                std::thread::sleep(tick);
-            });
-        }
-
-        // Start background network stats thread
-        {
-            let tx = app.cmd_tx.clone();
-            let tick = std::time::Duration::from_millis(app.config.tick_rate);
-            std::thread::spawn(move || {
-                let mut stats = telemetry::NetworkStats::default();
-                loop {
-                    let (down, up) = stats.update();
-                    if tx.send(Message::NetworkStatsUpdate(down, up)).is_err() {
-                        break;
-                    }
-                    std::thread::sleep(tick);
-                }
-            });
-        }
+        let (telem_rx, telem_nudge) = telemetry::spawn_telemetry_worker(telemetry_config);
+        app.telemetry_rx = Some(telem_rx);
+        app.telemetry_nudge = Some(telem_nudge);
 
         app.process_external(); // Flush any early messages
 
@@ -254,21 +244,21 @@ impl App {
 
     /// Add a log message via centralized logger
     fn log(&mut self, message: &str) {
-        // Parse category and level from message prefix (e.g., "NET:", "SEC:", "STATUS:")
+        // Parse "PREFIX: content" — the prefix determines both the category and the level.
         let (category, content, level) = if let Some(idx) = message.find(':') {
-            let cat = &message[..idx];
+            let prefix = message[..idx].trim();
             let msg = message[idx + 1..].trim();
 
-            // Determine level based on content
-            let lvl = if msg.contains("Error") || msg.contains("Failed") || msg.contains("LEAK") {
-                LogLevel::Error
-            } else if msg.contains("⚠") || msg.contains("WARNING") || msg.contains("dropped") {
-                LogLevel::Warning
-            } else {
-                LogLevel::Info
+            let lvl = match prefix {
+                // Errors
+                "ERR" | "CMD_ERR" => LogLevel::Error,
+                // Warnings
+                "WARN" => LogLevel::Warning,
+                // Everything else is informational (STATUS, ACTION, NET, SEC, AUTH, etc.)
+                _ => LogLevel::Info,
             };
 
-            (cat, msg, lvl)
+            (prefix, msg, lvl)
         } else {
             ("APP", message, LogLevel::Info)
         };
@@ -284,7 +274,13 @@ impl App {
 
         // Auto-save to log file
         let timestamp = utils::format_local_time();
-        Self::append_to_log_file(&format!("{timestamp} {message}"), &self.config_dir);
+        let level_tag = level.prefix();
+        Self::append_to_log_file(
+            &format!("{timestamp} [{level_tag}] {category}: {content}"),
+            &self.config_dir,
+            self.config.log_rotation_size,
+            self.config.log_retention_days,
+        );
     }
 
     /// Handle keyboard input
@@ -442,7 +438,9 @@ impl App {
                     self.logs_scroll = self.logs_scroll.saturating_add(1);
                 }
                 // Re-enable auto-scroll if near bottom
-                if self.logs_scroll >= max_scroll.saturating_sub(2) {
+                if self.logs_scroll
+                    >= max_scroll.saturating_sub(constants::LOGS_AUTO_SCROLL_THRESHOLD)
+                {
                     self.logs_auto_scroll = true;
                 }
             }
@@ -686,13 +684,13 @@ impl App {
             }
             KeyCode::PageUp => {
                 let current = self.profile_list_state.selected().unwrap_or(0);
-                let next = current.saturating_sub(10);
+                let next = current.saturating_sub(constants::PROFILE_LIST_PAGE_SIZE);
                 self.profile_list_state.select(Some(next));
             }
             KeyCode::PageDown => {
                 let current = self.profile_list_state.selected().unwrap_or(0);
                 let last = self.profiles.len().saturating_sub(1);
-                let next = (current + 10).min(last);
+                let next = (current + constants::PROFILE_LIST_PAGE_SIZE).min(last);
                 self.profile_list_state.select(Some(next));
             }
 
@@ -764,7 +762,9 @@ impl App {
                             self.logs_scroll = self.logs_scroll.saturating_add(1);
                         }
                         // Re-enable auto-scroll when reaching the end
-                        if self.logs_scroll >= max_scroll.saturating_sub(5) {
+                        if self.logs_scroll
+                            >= max_scroll.saturating_sub(constants::LOGS_AUTO_SCROLL_THRESHOLD)
+                        {
                             self.logs_auto_scroll = true;
                         }
                     }
@@ -1015,19 +1015,27 @@ impl App {
                 success,
                 error,
             } => {
-                if success {
+                // Guard: ignore stale results if we're no longer disconnecting this profile.
+                // This prevents a late-arriving DisconnectResult from clobbering a new
+                // Connecting state (e.g., rapid profile switching).
+                let still_disconnecting = matches!(
+                    &self.connection_state,
+                    ConnectionState::Disconnecting { profile: p, .. } if *p == profile
+                );
+                if !still_disconnecting {
+                    self.log(&format!(
+                        "INFO: Ignoring stale DisconnectResult for '{profile}' (state changed)"
+                    ));
+                    // Still clean up files — the disconnect thread likely did kill the process
+                    utils::cleanup_openvpn_run_files(&profile);
+                } else if success {
                     self.complete_disconnect(&profile);
                 } else {
                     let err_msg = error.unwrap_or_else(|| "unknown error".to_string());
-                    self.log(&format!(
-                        "CMD_ERR: Failed to disconnect '{profile}': {err_msg}"
-                    ));
+                    self.log(&format!("ERR: Failed to disconnect '{profile}': {err_msg}"));
                     // Clear pending -- don't auto-connect after a failed disconnect
                     self.pending_connect = None;
-                    // Revert to Disconnected so the scanner can re-detect if VPN is still running
-                    if matches!(self.connection_state, ConnectionState::Disconnecting { .. }) {
-                        self.connection_state = ConnectionState::Disconnected;
-                    }
+                    self.connection_state = ConnectionState::Disconnected;
                     self.show_toast(format!("Failed to disconnect: {err_msg}"), ToastType::Error);
                     self.sync_killswitch();
                 }
@@ -1048,18 +1056,47 @@ impl App {
                 );
                 if !still_connecting {
                     self.log(&format!(
-                        "CMD: Ignoring stale ConnectResult for '{profile}' \
-                         (state is no longer Connecting)"
+                        "INFO: Ignoring stale ConnectResult for '{profile}' (state changed)"
                     ));
                 } else if success {
-                    self.log(&format!("CMD: Successfully started VPN for '{profile}'"));
-                    // Keep state as Connecting -- the scanner will promote to Connected
-                    // once the interface appears.
+                    // The connect thread confirmed success (e.g. OpenVPN log says
+                    // "Initialization Sequence Completed"). Transition to Connected
+                    // immediately. The scanner will fill in interface details on the
+                    // next tick.
+                    let location = self
+                        .profiles
+                        .iter()
+                        .find(|p| p.name == profile)
+                        .map_or_else(|| "Unknown".to_string(), |p| p.location.clone());
+
+                    let now = Instant::now();
+                    self.connection_state = ConnectionState::Connected {
+                        profile: profile.clone(),
+                        server_location: location,
+                        since: now,
+                        latency_ms: 0,
+                        details: Box::new(DetailedConnectionInfo::default()),
+                    };
+                    self.session_start = Some(now);
+
+                    if let Some(p) = self.profiles.iter_mut().find(|p| p.name == profile) {
+                        p.last_used = Some(std::time::SystemTime::now());
+                    }
+                    self.save_metadata();
+
+                    self.log(&format!("STATUS: Connected to '{profile}'"));
+                    self.refresh_telemetry();
+
+                    // KILL SWITCH: Arm when VPN connects
+                    if self.killswitch_mode != crate::state::KillSwitchMode::Off {
+                        self.sync_killswitch();
+                        self.log("SEC: Kill switch armed");
+                    }
                 } else {
                     let err_msg = error.unwrap_or_else(|| "unknown error".to_string());
-                    self.log(&format!(
-                        "CMD_ERR: Failed to connect '{profile}': {err_msg}"
-                    ));
+                    self.log(&format!("ERR: Failed to connect '{profile}': {err_msg}"));
+                    // Kill any leftover process and clean up run files
+                    self.cleanup_vpn_resources(&profile);
                     self.connection_state = ConnectionState::Disconnected;
                     self.session_start = None;
                     self.show_toast(format!("Failed to connect: {err_msg}"), ToastType::Error);
@@ -1221,7 +1258,25 @@ impl App {
             }
 
             // System
-            Message::Quit => self.should_quit = true,
+            Message::Quit => {
+                // Clean up VPN resources before exiting so we don't leave
+                // dangling processes, PID files, or firewall rules behind.
+                match &self.connection_state {
+                    ConnectionState::Connected { profile, .. }
+                    | ConnectionState::Connecting { profile, .. }
+                    | ConnectionState::Disconnecting { profile, .. } => {
+                        let profile_name = profile.clone();
+                        self.cleanup_vpn_resources(&profile_name);
+                    }
+                    ConnectionState::Disconnected => {}
+                }
+                // Release kill switch so user's network isn't blocked after exit
+                if self.killswitch_state.is_blocking() {
+                    let _ = crate::core::killswitch::disable_blocking();
+                }
+                crate::core::killswitch::clear_state();
+                self.should_quit = true;
+            }
             Message::Log(msg) => self.log(&msg),
             Message::Toast(msg, t_type) => self.show_toast(msg, t_type),
             Message::CopyIp => self.copy_ip_to_clipboard(),
@@ -1245,21 +1300,20 @@ impl App {
                             self.real_ip = Some(ip.clone());
                         } else if self.public_ip != ip && self.public_ip != constants::MSG_FETCHING
                         {
-                            self.log(&format!("NET: ✓ Public IP changed from {old_ip} to {ip}"));
+                            self.log(&format!("NET: Public IP changed {old_ip} -> {ip}"));
                         } else if is_connected
                             && self.public_ip == ip
                             && self.public_ip != constants::MSG_FETCHING
                         {
                             // CRITICAL: IP hasn't changed despite being connected to VPN!
                             self.log(&format!(
-                                "NET: ⚠ WARNING: Public IP unchanged ({ip}) while connected to VPN!"
+                                "WARN: Public IP unchanged ({ip}) while connected — possible leak or split-tunnel"
                             ));
-                            self.log("NET: → Possible issues: 1) VPN not routing traffic 2) Split-tunnel active 3) Kill switch blocking telemetry");
 
                             // Log the real IP for comparison
                             if let Some(ref real) = self.real_ip {
                                 if real == &ip {
-                                    self.log(&format!("NET: → LEAK DETECTED: Current IP ({ip}) matches pre-VPN IP ({real})"));
+                                    self.log(&format!("ERR: IP leak detected — current IP ({ip}) matches pre-VPN IP ({real})"));
                                 }
                             }
                         }
@@ -1288,19 +1342,22 @@ impl App {
                     }
                     TelemetryUpdate::Dns(dns) => {
                         if self.dns_server != dns && self.dns_server != constants::MSG_NO_DATA {
-                            let leak_warn = if utils::is_private_ip(&dns) {
-                                " ⚠ POSSIBLE LEAK"
+                            if utils::is_private_ip(&dns) {
+                                self.log(&format!(
+                                    "WARN: DNS server {dns} is a private IP — possible DNS leak"
+                                ));
                             } else {
-                                ""
-                            };
-                            self.log(&format!("SEC: DNS server: {dns}{leak_warn}"));
+                                self.log(&format!("SEC: DNS server: {dns}"));
+                            }
                         }
                         self.dns_server = dns;
                     }
                     TelemetryUpdate::Ipv6Leak(leak) => {
                         if self.ipv6_leak != leak {
                             if leak {
-                                self.log("SEC: ⚠ IPv6 leak detected!");
+                                self.log(
+                                    "WARN: IPv6 leak detected — traffic may bypass VPN tunnel",
+                                );
                             } else {
                                 self.log("SEC: IPv6 secure (blocked)");
                             }
@@ -1327,18 +1384,20 @@ impl App {
                         // Interface disappeared -- confirm disconnection and drain pending
                         let profile_name = profile.clone();
                         self.complete_disconnect(&profile_name);
-                    } else if elapsed >= 30 {
-                        // Safety timeout: VPN teardown is taking too long
+                    } else if elapsed >= self.config.disconnect_timeout {
+                        // Safety timeout: VPN teardown is taking too long — force-kill and clean up
                         let profile_name = profile.clone();
                         self.log(&format!(
-                            "WARN: Disconnect timed out for '{profile_name}' after 30s"
+                            "WARN: Disconnect timed out for '{profile_name}' after {}s, forcing cleanup",
+                            self.config.disconnect_timeout
                         ));
-                        // Clear pending -- don't auto-connect when the previous VPN may still be running
+                        self.cleanup_vpn_resources(&profile_name);
+                        // Clear pending -- don't auto-connect when teardown was forced
                         self.pending_connect = None;
                         self.connection_state = ConnectionState::Disconnected;
                         self.session_start = None;
                         self.show_toast(
-                            "Disconnect timed out — VPN process may still be running".to_string(),
+                            "Disconnect timed out — forced cleanup".to_string(),
                             ToastType::Warning,
                         );
                         self.sync_killswitch();
@@ -1348,66 +1407,81 @@ impl App {
                     return;
                 }
 
-                // Debounce: Don't let scanner override Connecting back to Disconnected
+                // While Connecting, the scanner can only PROMOTE to Connected
+                // (never demote back to Disconnected). Only ConnectResult{success:false}
+                // or ConnectionTimeout can end the Connecting state.
                 if let ConnectionState::Connecting { started, profile } = &self.connection_state {
-                    if started.elapsed().as_secs() < 10 {
-                        let profile_name = profile.clone();
-                        if let Some(session) = active.iter().find(|s| s.name == profile_name) {
-                            let location = self
-                                .profiles
-                                .iter()
-                                .find(|p| p.name == profile_name)
-                                .map_or_else(|| "Unknown".to_string(), |p| p.location.clone());
+                    let profile_name = profile.clone();
+                    let elapsed = started.elapsed().as_secs();
+                    if let Some(session) = active.iter().find(|s| s.name == profile_name) {
+                        // Scanner found the tunnel — promote to Connected
+                        let location = self
+                            .profiles
+                            .iter()
+                            .find(|p| p.name == profile_name)
+                            .map_or_else(|| "Unknown".to_string(), |p| p.location.clone());
 
-                            let start_time = session
-                                .started_at
-                                .and_then(|real| {
-                                    std::time::SystemTime::now()
-                                        .duration_since(real)
-                                        .ok()
-                                        .and_then(|d| Instant::now().checked_sub(d))
-                                })
-                                .unwrap_or_else(Instant::now);
+                        let start_time = session
+                            .started_at
+                            .and_then(|real| {
+                                std::time::SystemTime::now()
+                                    .duration_since(real)
+                                    .ok()
+                                    .and_then(|d| Instant::now().checked_sub(d))
+                            })
+                            .unwrap_or_else(Instant::now);
 
-                            self.connection_state = ConnectionState::Connected {
-                                profile: profile_name.clone(),
-                                server_location: location,
-                                since: start_time,
-                                latency_ms: 0,
-                                details: Box::new(DetailedConnectionInfo {
-                                    interface: session.interface.clone(),
-                                    internal_ip: session.internal_ip.clone(),
-                                    endpoint: session.endpoint.clone(),
-                                    mtu: session.mtu.clone(),
-                                    public_key: session.public_key.clone(),
-                                    listen_port: session.listen_port.clone(),
-                                    transfer_rx: session.transfer_rx.clone(),
-                                    transfer_tx: session.transfer_tx.clone(),
-                                    latest_handshake: session.latest_handshake.clone(),
-                                    pid: session.pid,
-                                }),
-                            };
+                        self.connection_state = ConnectionState::Connected {
+                            profile: profile_name.clone(),
+                            server_location: location,
+                            since: start_time,
+                            latency_ms: 0,
+                            details: Box::new(DetailedConnectionInfo {
+                                interface: session.interface.clone(),
+                                internal_ip: session.internal_ip.clone(),
+                                endpoint: session.endpoint.clone(),
+                                mtu: session.mtu.clone(),
+                                public_key: session.public_key.clone(),
+                                listen_port: session.listen_port.clone(),
+                                transfer_rx: session.transfer_rx.clone(),
+                                transfer_tx: session.transfer_tx.clone(),
+                                latest_handshake: session.latest_handshake.clone(),
+                                pid: session.pid,
+                            }),
+                        };
 
-                            self.log(&format!(
-                                "STATUS: Connection established to '{profile_name}'"
-                            ));
+                        self.log(&format!(
+                            "STATUS: Connection established to '{profile_name}'"
+                        ));
 
-                            // KILL SWITCH: Arm when VPN connects
-                            if self.killswitch_mode != crate::state::KillSwitchMode::Off {
-                                self.sync_killswitch();
-                                self.log("SEC: Kill switch armed");
-                            }
-
-                            if let Some(profile) =
-                                self.profiles.iter_mut().find(|p| p.name == profile_name)
-                            {
-                                profile.last_used = Some(std::time::SystemTime::now());
-                            }
-                            self.save_metadata();
-                            self.session_start = Some(start_time);
+                        // KILL SWITCH: Arm when VPN connects
+                        if self.killswitch_mode != crate::state::KillSwitchMode::Off {
+                            self.sync_killswitch();
+                            self.log("SEC: Kill switch armed");
                         }
-                        return;
+
+                        if let Some(profile) =
+                            self.profiles.iter_mut().find(|p| p.name == profile_name)
+                        {
+                            profile.last_used = Some(std::time::SystemTime::now());
+                        }
+                        self.save_metadata();
+                        self.session_start = Some(start_time);
+                    } else {
+                        // Tunnel not detected yet — log periodically so the user
+                        // can see the scanner is still trying.
+                        if elapsed > 0 && elapsed % constants::SCANNER_LOG_INTERVAL_SECS == 0 {
+                            self.log(&format!(
+                                "NET: Scanner: no tunnel interface for '{profile_name}' yet ({elapsed}s elapsed, \
+                                 {} active session{})",
+                                active.len(),
+                                if active.len() == 1 { "" } else { "s" }
+                            ));
+                        }
                     }
+                    // Whether or not the tunnel was found, return early.
+                    // The scanner never demotes Connecting → Disconnected.
+                    return;
                 }
 
                 if let Some(session) = active.first() {
@@ -1429,7 +1503,9 @@ impl App {
                                     let calculated_start = Instant::now()
                                         .checked_sub(duration)
                                         .unwrap_or(Instant::now());
-                                    if since.elapsed().as_secs().abs_diff(duration.as_secs()) > 5 {
+                                    if since.elapsed().as_secs().abs_diff(duration.as_secs())
+                                        > constants::SESSION_TIME_DRIFT_SECS
+                                    {
                                         *since = calculated_start;
                                         self.session_start = Some(calculated_start);
                                     }
@@ -1523,7 +1599,7 @@ impl App {
                         if was_connected {
                             self.connection_drops += 1;
                             self.log(&format!(
-                                "STATUS: Connection dropped from '{}' (#{} this session)",
+                                "WARN: Connection dropped from '{}' (#{} this session)",
                                 profile_name, self.connection_drops
                             ));
 
@@ -1531,16 +1607,8 @@ impl App {
                             if self.killswitch_mode != crate::state::KillSwitchMode::Off
                                 && self.killswitch_state == crate::state::KillSwitchState::Armed
                             {
-                                // Mark as blocking first, so sync_killswitch knows what to do
                                 self.killswitch_state = crate::state::KillSwitchState::Blocking;
-
-                                // We keep the manual call here if we need specific interface/server_ip
-                                // but sync_killswitch normally handles DEFAULT_VPN_INTERFACE.
-                                // Actually, sync_killswitch is safer if it uses the interface that just dropped.
-                                // But if it just dropped, it's likely DEFAULT_VPN_INTERFACE.
-
                                 self.sync_killswitch();
-
                                 self.log("SEC: Kill switch ACTIVATED - blocking traffic");
                                 self.show_toast(
                                     "VPN dropped! Kill Switch blocking traffic".to_string(),
@@ -1557,26 +1625,38 @@ impl App {
                             ConnectionState::Connecting { .. }
                         ) {
                             self.log(&format!(
-                                "STATUS: Connection to '{profile_name}' failed or cancelled"
+                                "WARN: Connection to '{profile_name}' failed or was cancelled"
                             ));
                         }
+
+                        // Clean up any leftover run files (process is already gone)
+                        utils::cleanup_openvpn_run_files(&profile_name);
                     }
                     self.connection_state = ConnectionState::Disconnected;
                     self.session_start = None;
                 }
             }
             Message::ConnectionTimeout(profile_name) => {
+                // Kill lingering VPN process and clean up (handles both OpenVPN and WireGuard)
+                self.cleanup_vpn_resources(&profile_name);
+
                 self.connection_state = ConnectionState::Disconnected;
+                self.session_start = None;
+                self.pending_connect = None;
                 self.log(&format!("ERR: Connection timed out for '{profile_name}'"));
-            }
-            Message::NetworkStatsUpdate(down, up) => {
-                self.current_down = down;
-                self.current_up = up;
+                self.show_toast(
+                    format!("Connection timed out for '{profile_name}'"),
+                    ToastType::Warning,
+                );
+                self.sync_killswitch();
+                self.refresh_telemetry();
             }
             Message::Tick => {
                 // 1. Connection Timeout Safeguard
                 if let ConnectionState::Connecting { started, profile } = &self.connection_state {
-                    if started.elapsed() > std::time::Duration::from_secs(30) {
+                    if started.elapsed()
+                        > std::time::Duration::from_secs(constants::DEFAULT_CONNECT_TIMEOUT)
+                    {
                         let p = profile.clone();
                         self.handle_message(Message::ConnectionTimeout(p));
                     }
@@ -1590,15 +1670,22 @@ impl App {
                 // 3. Process telemetry and background results (non-blocking)
                 self.process_telemetry();
 
-                // 4. Update network stats history
-                for i in 0..59 {
+                // 4. Poll scanner (spawn-on-demand, non-blocking)
+                self.poll_scanner();
+
+                // 5. Poll network stats (spawn-on-demand, non-blocking)
+                self.poll_network_stats();
+
+                // 6. Update network stats history
+                let last = constants::NETWORK_HISTORY_SIZE - 1;
+                for i in 0..last {
                     self.down_history[i].1 = self.down_history[i + 1].1;
                     self.up_history[i].1 = self.up_history[i + 1].1;
                 }
                 #[allow(clippy::cast_precision_loss)]
                 {
-                    self.down_history[59].1 = self.current_down as f64;
-                    self.up_history[59].1 = self.current_up as f64;
+                    self.down_history[last].1 = self.current_down as f64;
+                    self.up_history[last].1 = self.current_up as f64;
                 }
             }
             Message::Resize(width, height) => {
@@ -1633,8 +1720,10 @@ impl App {
                 if let Ok(content) = std::fs::read_to_string(&profile.config_path) {
                     #[allow(clippy::cast_possible_truncation)]
                     let total_lines = content.lines().count() as u16;
-                    // Viewport height: 85% of terminal height - 4 (borders + path line + title bottom)
-                    let viewport_height = (self.terminal_size.1 * 85 / 100).saturating_sub(4);
+                    // Viewport height: percentage of terminal height minus chrome (borders, title, etc.)
+                    let viewport_height =
+                        (self.terminal_size.1 * constants::CONFIG_VIEWER_HEIGHT_PCT / 100)
+                            .saturating_sub(constants::CONFIG_VIEWER_CHROME_LINES);
                     return total_lines.saturating_sub(viewport_height);
                 }
             }
@@ -1710,7 +1799,6 @@ impl App {
 
         // Remove from profiles
         self.profiles.remove(idx);
-        self.sync_shared_profiles();
 
         // Try to delete from disk
         if config_path.exists() {
@@ -1785,6 +1873,16 @@ impl App {
                 ConnectionState::Connecting { .. } => {}
                 // If disconnecting, queue the connection for after disconnect completes
                 ConnectionState::Disconnecting { .. } => {
+                    if let Some(old) = self.pending_connect {
+                        if old != idx {
+                            if let Some(old_profile) = self.profiles.get(old) {
+                                self.log(&format!(
+                                    "ACTION: Switched queue from '{}' to '{target_name}'",
+                                    old_profile.name
+                                ));
+                            }
+                        }
+                    }
                     self.pending_connect = Some(idx);
                 }
                 // If connected...
@@ -1799,6 +1897,9 @@ impl App {
                     } else {
                         // Different profile -> Queue switch: disconnect first, connect after
                         self.pending_connect = Some(idx);
+                        self.log(&format!(
+                            "ACTION: Switching from '{current_name}' to '{target_name}'..."
+                        ));
                         self.disconnect();
                     }
                 }
@@ -1902,6 +2003,7 @@ impl App {
         self.log(&format!("ACTION: Connecting to '{name}' [{protocol}]..."));
 
         let connect_timeout_secs = self.config.connect_timeout;
+        let ovpn_verbosity = self.config.openvpn_verbosity.clone();
 
         // Execute command in background to prevent TUI freeze
         std::thread::spawn(move || match protocol {
@@ -1969,7 +2071,7 @@ impl App {
                     "--log".to_string(),
                     log_path.to_str().unwrap_or("").to_string(),
                     "--verb".to_string(),
-                    "3".to_string(),
+                    ovpn_verbosity,
                 ];
 
                 // If auth credentials exist, pass them via --auth-user-pass
@@ -2012,7 +2114,9 @@ impl App {
                 // Chown the run files so normal users can read PID/log status.
                 // OpenVPN creates them as root; we fix ownership after a brief
                 // delay to let the daemon write them.
-                std::thread::sleep(std::time::Duration::from_millis(200));
+                std::thread::sleep(std::time::Duration::from_millis(
+                    constants::OVPN_CHOWN_DELAY_MS,
+                ));
                 crate::config::fix_ownership(
                     pid_path.parent().unwrap_or(std::path::Path::new("/")),
                 );
@@ -2026,7 +2130,9 @@ impl App {
                     std::thread::sleep(poll_interval);
 
                     // Check if the daemon died (pid file gone or process not running)
-                    if start.elapsed() > std::time::Duration::from_secs(2) {
+                    if start.elapsed()
+                        > std::time::Duration::from_secs(constants::OVPN_HEALTH_CHECK_DELAY_SECS)
+                    {
                         if let Ok(content) = std::fs::read_to_string(&pid_path) {
                             if let Ok(pid) = content.trim().parse::<u32>() {
                                 // Check if process is still alive
@@ -2041,7 +2147,7 @@ impl App {
                                     let last_lines: String = log
                                         .lines()
                                         .rev()
-                                        .take(5)
+                                        .take(constants::OVPN_ERROR_LOG_TAIL_LINES)
                                         .collect::<Vec<_>>()
                                         .into_iter()
                                         .rev()
@@ -2057,8 +2163,10 @@ impl App {
                                     return;
                                 }
                             }
-                        } else if start.elapsed() > std::time::Duration::from_secs(3) {
-                            // No pid file after 3s -- daemon likely failed to start
+                        } else if start.elapsed()
+                            > std::time::Duration::from_secs(constants::OVPN_PID_FILE_TIMEOUT_SECS)
+                        {
+                            // No pid file — daemon likely failed to start
                             let log = std::fs::read_to_string(&log_path)
                                 .unwrap_or_else(|_| "No log output".to_string());
                             let _ = cmd_tx.send(Message::ConnectResult {
@@ -2183,13 +2291,44 @@ impl App {
         );
     }
 
+    /// Kill any running VPN process and remove run files for a profile.
+    ///
+    /// Handles both protocols:
+    /// - **`OpenVPN`**: sends SIGTERM to the daemon (via PID file) and removes pid/log files.
+    /// - **`WireGuard`**: runs `wg-quick down` to tear down the interface.
+    ///
+    /// Safe to call even if the process is already gone — all operations are best-effort.
+    fn cleanup_vpn_resources(&self, profile_name: &str) {
+        if let Some(profile) = self.profiles.iter().find(|p| p.name == profile_name) {
+            match profile.protocol {
+                Protocol::OpenVPN => {
+                    if let Some(pid) = utils::read_openvpn_pid(profile_name) {
+                        let _ = std::process::Command::new("kill")
+                            .arg(pid.to_string())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .output();
+                    }
+                    utils::cleanup_openvpn_run_files(profile_name);
+                }
+                Protocol::WireGuard => {
+                    let _ = std::process::Command::new("wg-quick")
+                        .args(["down", profile.config_path.to_str().unwrap_or("")])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .output();
+                }
+            }
+        }
+    }
+
     /// Finalize a disconnect: transition to `Disconnected`, sync kill switch,
     /// and drain `pending_connect` (auto-connect to the queued profile, if any).
+    ///
+    /// When switching profiles (`pending_connect` is set), the `Disconnected` state
+    /// is never visible — we go straight from `Disconnecting` to `Connecting`.
     fn complete_disconnect(&mut self, profile_name: &str) {
-        self.log(&format!("STATUS: Disconnected from '{profile_name}'"));
-        self.connection_state = ConnectionState::Disconnected;
         self.session_start = None;
-        self.sync_killswitch();
 
         // Clean up OpenVPN runtime files if this was an OpenVPN profile
         if self
@@ -2200,16 +2339,26 @@ impl App {
             crate::utils::cleanup_openvpn_run_files(profile_name);
         }
 
-        // Drain pending_connect: auto-connect to the queued profile
+        // Drain pending_connect: switch directly to the next profile
+        // without flashing the Disconnected state in the UI.
         if let Some(idx) = self.pending_connect.take() {
             if idx < self.profiles.len() {
                 let next_name = self.profiles[idx].name.clone();
                 self.log(&format!(
-                    "ACTION: Auto-connecting to queued profile '{next_name}'"
+                    "STATUS: Disconnected from '{profile_name}', connecting to '{next_name}'..."
                 ));
+                self.connection_state = ConnectionState::Disconnected;
+                self.sync_killswitch();
                 self.connect_profile(idx);
+                return;
             }
         }
+
+        // Normal disconnect (no pending switch)
+        self.log(&format!("STATUS: Disconnected from '{profile_name}'"));
+        self.connection_state = ConnectionState::Disconnected;
+        self.sync_killswitch();
+        self.refresh_telemetry();
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2500,7 +2649,12 @@ impl App {
     }
 
     /// Append log entry to file with automatic rotation
-    fn append_to_log_file(entry: &str, config_dir: &std::path::Path) {
+    fn append_to_log_file(
+        entry: &str,
+        config_dir: &std::path::Path,
+        rotation_size: u64,
+        retention_days: u64,
+    ) {
         static CLEANUP_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         use std::io::Write;
 
@@ -2521,10 +2675,9 @@ impl App {
 
         let log_file = log_dir.join(format!("vortix-{today}.log"));
 
-        // Check file size and rotate if > 5MB
+        // Rotate if the file exceeds the configured size
         if let Ok(metadata) = std::fs::metadata(&log_file) {
-            if metadata.len() > 5 * 1024 * 1024 {
-                // Rotate: rename to .1 and start fresh
+            if metadata.len() > rotation_size {
                 let rotated = log_dir.join(format!("vortix-{today}.1.log"));
                 let _ = std::fs::rename(&log_file, rotated);
             }
@@ -2543,20 +2696,20 @@ impl App {
             }
         }
 
-        // Clean up old logs (keep last 7 days) - run occasionally
+        // Clean up old logs periodically
         let count = CLEANUP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if count % 100 == 0 {
-            Self::cleanup_old_logs(&log_dir);
+        if count % constants::LOG_CLEANUP_INTERVAL == 0 {
+            Self::cleanup_old_logs(&log_dir, retention_days);
         }
     }
 
-    /// Remove log files older than 7 days
-    fn cleanup_old_logs(log_dir: &Path) {
+    /// Remove log files older than `retention_days` days.
+    fn cleanup_old_logs(log_dir: &Path, retention_days: u64) {
         use std::time::{Duration, SystemTime};
 
-        let seven_days = Duration::from_secs(7 * 24 * 60 * 60);
+        let max_age = Duration::from_secs(retention_days * 24 * 60 * 60);
         let cutoff = SystemTime::now()
-            .checked_sub(seven_days)
+            .checked_sub(max_age)
             .unwrap_or(SystemTime::UNIX_EPOCH);
 
         if let Ok(entries) = std::fs::read_dir(log_dir) {
@@ -2594,6 +2747,15 @@ impl App {
         }
     }
 
+    /// Wake the telemetry worker so it refreshes IP/ISP/latency immediately.
+    /// Called after connect, disconnect, or profile switch so the user never
+    /// sees stale data.
+    fn refresh_telemetry(&self) {
+        if let Some(nudge) = &self.telemetry_nudge {
+            let _ = nudge.send(());
+        }
+    }
+
     /// Process all pending external events (telemetry and background commands).
     /// Called by main loop to ensure background feedback appears immediately.
     pub fn process_external(&mut self) {
@@ -2606,11 +2768,104 @@ impl App {
         }
     }
 
-    /// Push the current profile list to the background scanner thread.
-    fn sync_shared_profiles(&self) {
-        if let Ok(mut shared) = self.shared_profiles.lock() {
-            shared.clone_from(&self.profiles);
+    /// Poll the scanner channel and kick off a new scan if idle.
+    ///
+    /// Pattern: spawn a short-lived thread per tick (only when the previous one
+    /// has finished). No long-running threads, no shared mutable state.
+    fn poll_scanner(&mut self) {
+        // 1. Try to collect a result from the previous scan
+        let mut result = None;
+        if let Some(rx) = &self.scanner_rx {
+            match rx.try_recv() {
+                Ok(active) => {
+                    result = Some(active);
+                    self.scanner_rx = None; // Mark: ready for next scan
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    // Previous scan still running — don't start another.
+                    // Log during Connecting so user knows scanner is still working.
+                    if let ConnectionState::Connecting { started, profile } = &self.connection_state
+                    {
+                        let elapsed = started.elapsed().as_secs();
+                        if elapsed > 0 && elapsed % constants::SCANNER_LOG_INTERVAL_SECS == 0 {
+                            logger::log(
+                                LogLevel::Info,
+                                "NET",
+                                format!(
+                                    "Scanner still running for '{profile}' ({elapsed}s elapsed)"
+                                ),
+                            );
+                        }
+                    }
+                    return;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // Thread died without sending — reset
+                    self.scanner_rx = None;
+                }
+            }
         }
+
+        // 2. Process the result if we got one
+        if let Some(active) = result {
+            self.handle_message(Message::SyncSystemState(active));
+        }
+
+        // 3. Kick off a new scan (scanner_rx is None here)
+        let profiles = self.profiles.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let active = scanner::get_active_profiles(&profiles);
+            let _ = tx.send(active);
+        });
+        self.scanner_rx = Some(rx);
+    }
+
+    /// Poll the network stats channel and kick off a new fetch if idle.
+    ///
+    /// The background thread just reads raw byte totals from the OS.
+    /// Delta calculation (bytes/sec) stays here in the App, keeping state local.
+    fn poll_network_stats(&mut self) {
+        // 1. Try to collect a result from the previous fetch
+        if let Some(rx) = &self.netstats_rx {
+            match rx.try_recv() {
+                Ok((total_in, total_out)) => {
+                    // Calculate rate (delta since last reading)
+                    if self.last_bytes_in > 0 {
+                        self.current_down = total_in.saturating_sub(self.last_bytes_in);
+                        self.current_up = total_out.saturating_sub(self.last_bytes_out);
+                    }
+                    self.last_bytes_in = total_in;
+                    self.last_bytes_out = total_out;
+                    self.netstats_rx = None; // Ready for next fetch
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    return; // Still running
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.netstats_rx = None;
+                }
+            }
+        }
+
+        // 2. Kick off a new fetch
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let totals = {
+                #[cfg(target_os = "macos")]
+                {
+                    use crate::platform::NetworkStatsProvider;
+                    crate::platform::macos::network::MacNetworkStats::get_total_bytes()
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    use crate::platform::NetworkStatsProvider;
+                    crate::platform::linux::network::LinuxNetworkStats::get_total_bytes()
+                }
+            };
+            let _ = tx.send(totals);
+        });
+        self.netstats_rx = Some(rx);
     }
 
     /// Called when terminal is resized
@@ -2664,7 +2919,6 @@ impl App {
             Ok(profile) => {
                 let name = profile.name.clone();
                 self.profiles.push(profile);
-                self.sync_shared_profiles();
 
                 self.show_toast(
                     format!("{}{}", constants::MSG_IMPORT_SUCCESS, name),
@@ -2704,7 +2958,7 @@ impl App {
                             }
                             Err(e) => {
                                 self.log(&format!(
-                                    "IMPORT: Failed to import {}: {}",
+                                    "ERR: Failed to import {}: {}",
                                     path.display(),
                                     e
                                 ));
@@ -2715,7 +2969,7 @@ impl App {
                 }
 
                 if imported > 0 {
-                    self.sync_shared_profiles();
+                    // Scanner will pick up new profiles on its next tick
                 }
 
                 // Show summary feedback
@@ -2739,7 +2993,7 @@ impl App {
                     self.show_toast(msg.clone(), t_type);
 
                     self.log(&format!(
-                        "IMPORT: Batch imported {imported} profiles from {}",
+                        "INFO: Batch imported {imported} profile(s) from {}",
                         dir_path.display()
                     ));
                 } else if failed > 0 {
@@ -2757,7 +3011,7 @@ impl App {
                 }
             }
             Err(e) => {
-                self.log(&format!("IMPORT: Error reading directory: {e}"));
+                self.log(&format!("ERR: Failed to read directory: {e}"));
                 self.show_toast(format!("Error reading directory: {e}"), ToastType::Error);
             }
         }
@@ -2821,9 +3075,13 @@ mod tests {
             killswitch_mode: crate::state::KillSwitchMode::Off,
             killswitch_state: crate::state::KillSwitchState::Disabled,
             telemetry_rx: None,
+            telemetry_nudge: None,
             cmd_tx,
             cmd_rx,
-            shared_profiles: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            scanner_rx: None,
+            netstats_rx: None,
+            last_bytes_in: 0,
+            last_bytes_out: 0,
         }
     }
 
@@ -3259,8 +3517,9 @@ mod tests {
     // ====================================================================
 
     #[test]
-    fn test_connect_result_success_keeps_connecting() {
+    fn test_connect_result_success_transitions_to_connected() {
         let mut app = test_app();
+        add_profiles(&mut app, &["test-vpn"]);
         set_connecting(&mut app, "test-vpn");
 
         app.handle_message(Message::ConnectResult {
@@ -3269,10 +3528,10 @@ mod tests {
             error: None,
         });
 
-        // Should still be Connecting -- scanner will promote to Connected
+        // Should transition directly to Connected
         assert!(
-            matches!(app.connection_state, ConnectionState::Connecting { .. }),
-            "Successful ConnectResult should keep Connecting state"
+            matches!(app.connection_state, ConnectionState::Connected { ref profile, .. } if profile == "test-vpn"),
+            "Successful ConnectResult should transition to Connected"
         );
     }
 

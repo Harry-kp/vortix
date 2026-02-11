@@ -15,4 +15,4 @@ pub mod telemetry;
 
 // Re-export commonly used items
 pub use scanner::{get_active_profiles, ActiveSession};
-pub use telemetry::{spawn_telemetry_worker, NetworkStats, TelemetryUpdate};
+pub use telemetry::{spawn_telemetry_worker, TelemetryUpdate};
