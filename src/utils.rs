@@ -32,6 +32,7 @@ pub fn is_root() -> bool {
 /// finish within `timeout`, the child process is killed and `None` is
 /// returned. This prevents the UI from freezing when system commands
 /// hang (e.g. `lsof` or `netstat` with no network).
+#[cfg(target_os = "macos")]
 pub fn run_with_timeout(
     cmd: &mut std::process::Command,
     timeout: std::time::Duration,

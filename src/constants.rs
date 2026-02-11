@@ -29,6 +29,7 @@ pub const DEFAULT_CONNECT_TIMEOUT: u64 = 20;
 /// UI responsiveness because all scanner/netstats commands run in background threads.
 /// Keep low enough that a full scanner pass (5-6 commands) completes well within
 /// `DEFAULT_CONNECT_TIMEOUT`. Most commands finish in <1s; `lsof` can take 2-4s.
+#[cfg(target_os = "macos")]
 pub const CMD_TIMEOUT_SECS: u64 = 5;
 /// Default maximum seconds to wait for a VPN disconnect before force-killing.
 pub const DEFAULT_DISCONNECT_TIMEOUT: u64 = 30;
