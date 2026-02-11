@@ -191,7 +191,7 @@ All files and directories are owned by your user account, even when vortix runs 
 | `profiles/` | `600` | Your `.conf` and `.ovpn` files. Added via `vortix import` or the TUI. |
 | `auth/` | `600` | Saved OpenVPN username/password pairs. One file per profile. |
 | `run/` | `644` | **OpenVPN only.** PID and log files created during a VPN session. The `.pid` file identifies which daemon to kill; the `.log` is polled for success/failure. Cleaned up on disconnect. WireGuard doesn't use this. |
-| `logs/` | `644` | Application session logs (daily rotation, max 5 MB). Not the raw OpenVPN output in `run/`. |
+| `logs/` | `644` | Application session logs (daily rotation, configurable size/retention). Not the raw OpenVPN output in `run/`. |
 | `config.toml` | `644` | Optional user settings. Only exists if you create it manually (see below). |
 | `metadata.json` | `644` | Internal bookkeeping (last used, sort order). Auto-managed. |
 | `killswitch.state` | `644` | Persists kill switch mode across crashes. Auto-managed. |
@@ -201,6 +201,8 @@ All files and directories are owned by your user account, even when vortix runs 
 Create `~/.config/vortix/config.toml` to customize settings. All fields are optional -- missing fields use defaults:
 
 ```toml
+# --- Timing ---
+
 # UI refresh rate in milliseconds (default: 1000)
 tick_rate = 1000
 
@@ -215,6 +217,30 @@ ping_timeout = 2
 
 # OpenVPN connection timeout in seconds (default: 20)
 connect_timeout = 20
+
+# Max seconds to wait for a VPN disconnect before force-killing (default: 30)
+disconnect_timeout = 30
+
+# --- Logging ---
+
+# Minimum log level shown in the TUI event log: "debug", "info", "warning", "error" (default: "info")
+log_level = "info"
+
+# Maximum log entries kept in the TUI event log (default: 1000)
+max_log_entries = 1000
+
+# Log file rotation size in bytes (default: 5242880 = 5 MB)
+log_rotation_size = 5242880
+
+# Days to retain old log files (default: 7)
+log_retention_days = 7
+
+# --- OpenVPN ---
+
+# OpenVPN daemon verbosity level, --verb flag, range 0-11 (default: "3")
+openvpn_verbosity = "3"
+
+# --- Telemetry endpoints ---
 
 # Ping targets for latency measurement (tried in order)
 ping_targets = ["1.1.1.1", "8.8.8.8", "9.9.9.9", "208.67.222.222"]
