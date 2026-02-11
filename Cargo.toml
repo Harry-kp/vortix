@@ -34,11 +34,15 @@ crossterm = "0.29"
 color-eyre = "0.6"
 
 # CLI Argument Parsing
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 
 # Serialization (for state persistence and API parsing)
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+
+# Configuration
+toml = "0.8"
+dirs = "6"
 
 # System calls (for root detection)
 [target.'cfg(unix)'.dependencies]

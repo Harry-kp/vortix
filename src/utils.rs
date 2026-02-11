@@ -26,6 +26,34 @@ pub fn is_root() -> bool {
     false
 }
 
+/// Create a directory (and parents) owned by the real user.
+///
+/// Under sudo, `create_dir_all` produces root-owned dirs.
+/// This wraps that call and hands ownership to the invoking user.
+///
+/// # Errors
+///
+/// Returns an error if directory creation fails.
+pub fn create_user_dir(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    crate::config::fix_ownership(path);
+    Ok(())
+}
+
+/// Write a file owned by the real user.
+///
+/// Under sudo, `fs::write` produces root-owned files.
+/// This wraps that call and hands ownership to the invoking user.
+///
+/// # Errors
+///
+/// Returns an error if the write fails.
+pub fn write_user_file(path: &std::path::Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+    std::fs::write(path, contents)?;
+    crate::config::fix_ownership(path);
+    Ok(())
+}
+
 /// Formats bytes per second into a human-readable string.
 ///
 /// # Arguments
@@ -85,24 +113,16 @@ pub fn is_private_ip(ip: &str) -> bool {
 
 /// Returns the application configuration directory path.
 ///
-/// Creates the directory at `~/.config/vortix` if it doesn't exist.
+/// Reads from the process-wide config dir set at startup via
+/// [`crate::config::set_config_dir`], ensuring `--config-dir` is respected
+/// everywhere. Falls back to default resolution if not yet set (e.g. tests).
 ///
 /// # Errors
 ///
 /// Returns an error if the home directory cannot be determined or
 /// if directory creation fails.
 pub fn get_app_config_dir() -> std::io::Result<std::path::PathBuf> {
-    let home = home_dir().ok_or(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        "Home directory not found",
-    ))?;
-    let path = home.join(".config").join(crate::constants::APP_NAME);
-
-    if !path.exists() {
-        std::fs::create_dir_all(&path)?;
-    }
-
-    Ok(path)
+    crate::config::get_config_dir()
 }
 
 /// Returns the VPN profiles directory path.
@@ -117,7 +137,7 @@ pub fn get_profiles_dir() -> std::io::Result<std::path::PathBuf> {
     let path = root.join(crate::constants::PROFILES_DIR_NAME);
 
     if !path.exists() {
-        std::fs::create_dir_all(&path)?;
+        create_user_dir(&path)?;
     }
 
     Ok(path)
@@ -138,7 +158,7 @@ pub fn get_openvpn_run_paths(
     let run_dir = root.join(crate::constants::OPENVPN_RUN_DIR);
 
     if !run_dir.exists() {
-        std::fs::create_dir_all(&run_dir)?;
+        create_user_dir(&run_dir)?;
     }
 
     // Sanitize profile name for use in filenames
@@ -186,7 +206,7 @@ pub fn get_openvpn_auth_path(profile_name: &str) -> std::io::Result<std::path::P
     let auth_dir = root.join(crate::constants::OPENVPN_AUTH_DIR);
 
     if !auth_dir.exists() {
-        std::fs::create_dir_all(&auth_dir)?;
+        create_user_dir(&auth_dir)?;
     }
 
     let safe_name: String = profile_name
@@ -219,7 +239,7 @@ pub fn write_openvpn_auth_file(
     use std::os::unix::fs::PermissionsExt;
 
     let auth_path = get_openvpn_auth_path(profile_name)?;
-    std::fs::write(&auth_path, format!("{username}\n{password}\n"))?;
+    write_user_file(&auth_path, format!("{username}\n{password}\n"))?;
 
     let mut perms = std::fs::metadata(&auth_path)?.permissions();
     perms.set_mode(0o600);
@@ -236,7 +256,7 @@ pub fn write_openvpn_auth_file(
     password: &str,
 ) -> std::io::Result<std::path::PathBuf> {
     let auth_path = get_openvpn_auth_path(profile_name)?;
-    std::fs::write(&auth_path, format!("{username}\n{password}\n"))?;
+    write_user_file(&auth_path, format!("{username}\n{password}\n"))?;
     Ok(auth_path)
 }
 
@@ -501,7 +521,7 @@ pub fn save_profile_metadata(
     let json = serde_json::to_string_pretty(data)
         .map_err(|e| format!("Failed to serialize metadata: {e}"))?;
 
-    std::fs::write(&metadata_path, json).map_err(|e| format!("Failed to write metadata: {e}"))?;
+    write_user_file(&metadata_path, json).map_err(|e| format!("Failed to write metadata: {e}"))?;
 
     Ok(())
 }
@@ -526,15 +546,17 @@ pub fn get_unique_path(dir: &std::path::Path, filename: &str) -> std::path::Path
         .map_or(filename, |s| s.to_str().unwrap_or(filename));
     let ext = path_obj.extension().map(|e| e.to_str().unwrap_or(""));
 
+    // Use underscores instead of parentheses to keep filenames valid as
+    // network interface names (wg-quick uses the filename as the interface).
     while path.exists() {
         let new_name = if let Some(e) = ext {
             if e.is_empty() {
-                format!("{stem}({counter})")
+                format!("{stem}_{counter}")
             } else {
-                format!("{stem}({counter}).{e}")
+                format!("{stem}_{counter}.{e}")
             }
         } else {
-            format!("{stem}({counter})")
+            format!("{stem}_{counter}")
         };
         path = dir.join(new_name);
         counter += 1;
@@ -694,12 +716,12 @@ mod tests {
         std::fs::write(dir.join("test.conf"), "existing").unwrap();
 
         let path = get_unique_path(&dir, "test.conf");
-        assert_eq!(path.file_name().unwrap(), "test(1).conf");
+        assert_eq!(path.file_name().unwrap(), "test_1.conf");
 
         // Create that too
-        std::fs::write(dir.join("test(1).conf"), "also existing").unwrap();
+        std::fs::write(dir.join("test_1.conf"), "also existing").unwrap();
         let path2 = get_unique_path(&dir, "test.conf");
-        assert_eq!(path2.file_name().unwrap(), "test(2).conf");
+        assert_eq!(path2.file_name().unwrap(), "test_2.conf");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

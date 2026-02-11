@@ -87,6 +87,10 @@ pub struct App {
     pub toast: Option<Toast>,
     pub terminal_size: (u16, u16),
     pub is_root: bool,
+    /// User-configurable application settings.
+    pub config: crate::config::AppConfig,
+    /// Resolved config directory path.
+    pub config_dir: std::path::PathBuf,
     /// Number of connection drops detected this session.
     pub connection_drops: u32,
     /// Profile index queued for auto-connect after current disconnect completes.
@@ -106,8 +110,8 @@ pub struct App {
 }
 
 impl App {
-    /// Create a new App instance with default state
-    pub fn new() -> Self {
+    /// Create a new App instance with the given configuration.
+    pub fn new(config: crate::config::AppConfig, config_dir: std::path::PathBuf) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel::<Message>();
         let down_history = (0..60).map(|i| (f64::from(i), 0.0)).collect();
         let up_history = (0..60).map(|i| (f64::from(i), 0.0)).collect();
@@ -149,6 +153,8 @@ impl App {
             toast: None,
             terminal_size: (0, 0),
             is_root: utils::is_root(),
+            config,
+            config_dir,
             connection_drops: 0,
             pending_connect: None,
 
@@ -196,8 +202,8 @@ impl App {
         app.log(constants::MSG_BACKEND_INIT);
 
         // Log auto-save location
-        if let Ok(config_dir) = utils::get_app_config_dir() {
-            let log_path = config_dir.join(constants::LOGS_DIR_NAME);
+        {
+            let log_path = app.config_dir.join(constants::LOGS_DIR_NAME);
             app.log(&format!("IO: Auto-logging to {}", log_path.display()));
         }
 
@@ -209,7 +215,8 @@ impl App {
         app.process_external(); // Flush messages
 
         // Start background telemetry worker
-        app.telemetry_rx = Some(telemetry::spawn_telemetry_worker());
+        let telemetry_config = telemetry::TelemetryConfig::from(&app.config);
+        app.telemetry_rx = Some(telemetry::spawn_telemetry_worker(telemetry_config));
 
         app
     }
@@ -246,7 +253,7 @@ impl App {
 
         // Auto-save to log file
         let timestamp = utils::format_local_time();
-        Self::append_to_log_file(&format!("{timestamp} {message}"));
+        Self::append_to_log_file(&format!("{timestamp} {message}"), &self.config_dir);
     }
 
     /// Handle keyboard input
@@ -1865,6 +1872,8 @@ impl App {
         };
         self.log(&format!("ACTION: Connecting to '{name}' [{protocol}]..."));
 
+        let connect_timeout_secs = self.config.connect_timeout;
+
         // Execute command in background to prevent TUI freeze
         std::thread::spawn(move || match protocol {
             Protocol::WireGuard => {
@@ -1971,8 +1980,16 @@ impl App {
                     Ok(_) => {} // Fork succeeded, daemon is running
                 }
 
+                // Chown the run files so normal users can read PID/log status.
+                // OpenVPN creates them as root; we fix ownership after a brief
+                // delay to let the daemon write them.
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                crate::config::fix_ownership(
+                    pid_path.parent().unwrap_or(std::path::Path::new("/")),
+                );
+
                 // Poll the log file for definitive success/failure from the daemon.
-                let timeout = std::time::Duration::from_secs(constants::OVPN_CONNECT_TIMEOUT_SECS);
+                let timeout = std::time::Duration::from_secs(connect_timeout_secs);
                 let poll_interval = std::time::Duration::from_millis(constants::OVPN_LOG_POLL_MS);
                 let start = std::time::Instant::now();
 
@@ -2063,8 +2080,7 @@ impl App {
                         });
                         let _ = cmd_tx.send(Message::Log(format!(
                             "WARN: OpenVPN log confirmation timed out for '{name}' \
-                             after {}s — scanner will confirm tunnel status",
-                            constants::OVPN_CONNECT_TIMEOUT_SECS
+                             after {connect_timeout_secs}s — scanner will confirm tunnel status"
                         )));
                         return;
                     }
@@ -2455,17 +2471,14 @@ impl App {
     }
 
     /// Append log entry to file with automatic rotation
-    fn append_to_log_file(entry: &str) {
+    fn append_to_log_file(entry: &str, config_dir: &std::path::Path) {
         static CLEANUP_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         use std::io::Write;
 
-        let log_dir = match utils::get_app_config_dir() {
-            Ok(config_dir) => config_dir.join(constants::LOGS_DIR_NAME),
-            Err(_) => return,
-        };
+        let log_dir = config_dir.join(constants::LOGS_DIR_NAME);
 
         // Create log directory if needed
-        if std::fs::create_dir_all(&log_dir).is_err() {
+        if crate::utils::create_user_dir(&log_dir).is_err() {
             return;
         }
 
@@ -2489,12 +2502,16 @@ impl App {
         }
 
         // Append to log file
+        let is_new_log = !log_file.exists();
         if let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&log_file)
         {
             let _ = writeln!(file, "{entry}");
+            if is_new_log {
+                crate::config::fix_ownership(&log_file);
+            }
         }
 
         // Clean up old logs (keep last 7 days) - run occasionally
@@ -2715,7 +2732,10 @@ impl App {
 
 impl Default for App {
     fn default() -> Self {
-        Self::new()
+        Self::new(
+            crate::config::AppConfig::default(),
+            std::env::temp_dir().join("vortix_default"),
+        )
     }
 }
 
@@ -2760,6 +2780,8 @@ mod tests {
             toast: None,
             terminal_size: (80, 24),
             is_root: false,
+            config: crate::config::AppConfig::default(),
+            config_dir: std::env::temp_dir().join("vortix_test"),
             connection_drops: 0,
             pending_connect: None,
             killswitch_mode: crate::state::KillSwitchMode::Off,

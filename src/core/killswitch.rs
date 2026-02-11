@@ -173,7 +173,7 @@ pub fn save_state(
 
     let content = serde_json::to_string_pretty(&persisted).map_err(io::Error::other)?;
 
-    fs::write(path, content)?;
+    crate::utils::write_user_file(&path, content)?;
     Ok(())
 }
 

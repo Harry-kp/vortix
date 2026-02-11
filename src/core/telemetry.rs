@@ -9,10 +9,44 @@
 
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
+use std::time::Duration;
 
 use crate::constants;
 use crate::logger::LogLevel;
 use serde::Deserialize;
+
+/// Configuration subset needed by the telemetry worker thread.
+#[derive(Debug, Clone)]
+pub struct TelemetryConfig {
+    /// Telemetry polling interval.
+    pub poll_rate: Duration,
+    /// HTTP API timeout in seconds.
+    pub api_timeout: u64,
+    /// Ping command timeout in seconds.
+    pub ping_timeout: u64,
+    /// Ping targets for latency measurement.
+    pub ping_targets: Vec<String>,
+    /// IPv6 leak detection endpoints.
+    pub ipv6_check_apis: Vec<String>,
+    /// Primary API endpoint for IP lookup.
+    pub ip_api_primary: String,
+    /// Fallback API endpoints for IP lookup.
+    pub ip_api_fallbacks: Vec<String>,
+}
+
+impl From<&crate::config::AppConfig> for TelemetryConfig {
+    fn from(config: &crate::config::AppConfig) -> Self {
+        Self {
+            poll_rate: Duration::from_secs(config.telemetry_poll_rate),
+            api_timeout: config.api_timeout,
+            ping_timeout: config.ping_timeout,
+            ping_targets: config.ping_targets.clone(),
+            ipv6_check_apis: config.ipv6_check_apis.clone(),
+            ip_api_primary: config.ip_api_primary.clone(),
+            ip_api_fallbacks: config.ip_api_fallbacks.clone(),
+        }
+    }
+}
 
 /// Telemetry update messages sent from background workers to the main application.
 #[derive(Debug, Clone)]
@@ -58,23 +92,25 @@ pub enum TelemetryUpdate {
 ///     }
 /// }
 /// ```
-pub fn spawn_telemetry_worker() -> Receiver<TelemetryUpdate> {
+pub fn spawn_telemetry_worker(config: TelemetryConfig) -> Receiver<TelemetryUpdate> {
     let (tx, rx) = mpsc::channel();
+    let config = std::sync::Arc::new(config);
 
     thread::spawn(move || loop {
-        fetch_ip_and_isp(&tx);
-        fetch_latency(&tx);
-        fetch_security_info(&tx);
+        fetch_ip_and_isp(&tx, &config);
+        fetch_latency(&tx, &config);
+        fetch_security_info(&tx, &config);
 
-        thread::sleep(constants::TELEMETRY_POLL_RATE);
+        thread::sleep(config.poll_rate);
     });
 
     rx
 }
 
 /// Fetches public IP address and ISP information with fallback APIs.
-fn fetch_ip_and_isp(tx: &Sender<TelemetryUpdate>) {
+fn fetch_ip_and_isp(tx: &Sender<TelemetryUpdate>, cfg: &std::sync::Arc<TelemetryConfig>) {
     let tx_clone = tx.clone();
+    let cfg = std::sync::Arc::clone(cfg);
     thread::spawn(move || {
         // Log start of fetch
         let _ = tx_clone.send(TelemetryUpdate::Log(
@@ -88,7 +124,7 @@ fn fetch_ip_and_isp(tx: &Sender<TelemetryUpdate>) {
             "Trying ipinfo.io (primary API with location data)...".to_string(),
         ));
 
-        if let Some((ip, isp, loc)) = try_ipinfo_api(&tx_clone) {
+        if let Some((ip, isp, loc)) = try_ipinfo_api(&tx_clone, &cfg) {
             let _ = tx_clone.send(TelemetryUpdate::Log(
                 LogLevel::Info,
                 format!(
@@ -119,7 +155,7 @@ fn fetch_ip_and_isp(tx: &Sender<TelemetryUpdate>) {
             "Trying ipify.org (fallback 1, IP only)...".to_string(),
         ));
 
-        if let Some(ip) = try_ipify_api(&tx_clone) {
+        if let Some(ip) = try_ipify_api(&tx_clone, &cfg) {
             let _ = tx_clone.send(TelemetryUpdate::Log(
                 LogLevel::Info,
                 format!("✓ ipify.org: IP={ip} (no ISP/location)"),
@@ -141,7 +177,7 @@ fn fetch_ip_and_isp(tx: &Sender<TelemetryUpdate>) {
             "Trying icanhazip.com (fallback 2)...".to_string(),
         ));
 
-        if let Some(ip) = try_icanhazip_api(&tx_clone) {
+        if let Some(ip) = try_icanhazip_api(&tx_clone, &cfg) {
             let _ = tx_clone.send(TelemetryUpdate::Log(
                 LogLevel::Info,
                 format!("✓ icanhazip.com: IP={ip}"),
@@ -158,7 +194,7 @@ fn fetch_ip_and_isp(tx: &Sender<TelemetryUpdate>) {
         ));
 
         // Fallback 3: ifconfig.me (IP only)
-        if let Some(ip) = try_ifconfig_api(&tx_clone) {
+        if let Some(ip) = try_ifconfig_api(&tx_clone, &cfg) {
             let _ = tx_clone.send(TelemetryUpdate::Log(
                 LogLevel::Info,
                 format!("✓ ifconfig.me: IP={ip}"),
@@ -182,12 +218,13 @@ fn fetch_ip_and_isp(tx: &Sender<TelemetryUpdate>) {
 /// Try ipinfo.io API (returns IP and optionally ISP + Location) with retry
 fn try_ipinfo_api(
     tx: &Sender<TelemetryUpdate>,
+    cfg: &TelemetryConfig,
 ) -> Option<(String, Option<String>, Option<String>)> {
-    let timeout = constants::API_TIMEOUT_SECS.to_string();
+    let timeout = cfg.api_timeout.to_string();
 
     for attempt in 0..constants::RETRY_ATTEMPTS {
         let output = std::process::Command::new("curl")
-            .args(["-s", "--max-time", &timeout, constants::IP_API_PRIMARY])
+            .args(["-s", "--max-time", &timeout, &cfg.ip_api_primary])
             .output();
 
         if let Err(e) = &output {
@@ -270,12 +307,16 @@ fn is_valid_ipv4(ip: &str) -> bool {
 }
 
 /// Try ipify.org API (IP only, very reliable) with retry
-fn try_ipify_api(tx: &Sender<TelemetryUpdate>) -> Option<String> {
-    let timeout = constants::API_TIMEOUT_SECS.to_string();
+fn try_ipify_api(tx: &Sender<TelemetryUpdate>, cfg: &TelemetryConfig) -> Option<String> {
+    let timeout = cfg.api_timeout.to_string();
+    let url = cfg
+        .ip_api_fallbacks
+        .first()
+        .map_or("https://api.ipify.org", String::as_str);
 
     for attempt in 0..constants::RETRY_ATTEMPTS {
         let output = std::process::Command::new("curl")
-            .args(["-s", "--max-time", &timeout, constants::IP_API_FALLBACK_1])
+            .args(["-s", "--max-time", &timeout, url])
             .output();
 
         if let Err(e) = &output {
@@ -325,12 +366,16 @@ fn try_ipify_api(tx: &Sender<TelemetryUpdate>) -> Option<String> {
 }
 
 /// Try icanhazip.com API (IP only) with retry
-fn try_icanhazip_api(tx: &Sender<TelemetryUpdate>) -> Option<String> {
-    let timeout = constants::API_TIMEOUT_SECS.to_string();
+fn try_icanhazip_api(tx: &Sender<TelemetryUpdate>, cfg: &TelemetryConfig) -> Option<String> {
+    let timeout = cfg.api_timeout.to_string();
+    let url = cfg
+        .ip_api_fallbacks
+        .get(1)
+        .map_or("https://icanhazip.com", String::as_str);
 
     for attempt in 0..constants::RETRY_ATTEMPTS {
         let output = std::process::Command::new("curl")
-            .args(["-s", "--max-time", &timeout, constants::IP_API_FALLBACK_2])
+            .args(["-s", "--max-time", &timeout, url])
             .output();
 
         if let Err(e) = &output {
@@ -358,12 +403,16 @@ fn try_icanhazip_api(tx: &Sender<TelemetryUpdate>) -> Option<String> {
 }
 
 /// Try ifconfig.me API (IP only) with retry
-fn try_ifconfig_api(tx: &Sender<TelemetryUpdate>) -> Option<String> {
-    let timeout = constants::API_TIMEOUT_SECS.to_string();
+fn try_ifconfig_api(tx: &Sender<TelemetryUpdate>, cfg: &TelemetryConfig) -> Option<String> {
+    let timeout = cfg.api_timeout.to_string();
+    let url = cfg
+        .ip_api_fallbacks
+        .get(2)
+        .map_or("https://ifconfig.me/ip", String::as_str);
 
     for attempt in 0..constants::RETRY_ATTEMPTS {
         let output = std::process::Command::new("curl")
-            .args(["-s", "--max-time", &timeout, constants::IP_API_FALLBACK_3])
+            .args(["-s", "--max-time", &timeout, url])
             .output();
 
         if let Err(e) = &output {
@@ -588,16 +637,17 @@ pub fn parse_ip_addr_output(output: &str) -> (String, String) {
 }
 
 /// Measures network latency, packet loss, and jitter by pinging reliable hosts.
-fn fetch_latency(tx: &Sender<TelemetryUpdate>) {
+fn fetch_latency(tx: &Sender<TelemetryUpdate>, cfg: &std::sync::Arc<TelemetryConfig>) {
     let tx_clone = tx.clone();
+    let cfg = std::sync::Arc::clone(cfg);
     thread::spawn(move || {
         // macOS ping -W takes milliseconds; Linux ping -W takes seconds
         #[cfg(target_os = "macos")]
-        let timeout = (u64::from(constants::PING_TIMEOUT_SECS) * 1000).to_string();
+        let timeout = (cfg.ping_timeout * 1000).to_string();
         #[cfg(not(target_os = "macos"))]
-        let timeout = constants::PING_TIMEOUT_SECS.to_string();
+        let timeout = cfg.ping_timeout.to_string();
 
-        for target in constants::PING_TARGETS {
+        for target in &cfg.ping_targets {
             for attempt in 0..constants::RETRY_ATTEMPTS {
                 if let Ok(output) = std::process::Command::new("ping")
                     .args(["-c", "10", "-i", "0.2", "-W", &timeout, target])
@@ -629,8 +679,9 @@ fn fetch_latency(tx: &Sender<TelemetryUpdate>) {
 }
 
 /// Fetches DNS configuration and checks for IPv6 leaks.
-fn fetch_security_info(tx: &Sender<TelemetryUpdate>) {
+fn fetch_security_info(tx: &Sender<TelemetryUpdate>, cfg: &std::sync::Arc<TelemetryConfig>) {
     let tx_clone = tx.clone();
+    let cfg = std::sync::Arc::clone(cfg);
     thread::spawn(move || {
         // Use platform-specific DNS resolution
         let dns = {
@@ -652,9 +703,10 @@ fn fetch_security_info(tx: &Sender<TelemetryUpdate>) {
 
         // Check for IPv6 connectivity with multiple endpoints (indicates potential leak when VPN active)
         let mut is_leaking = false;
-        for endpoint in constants::IPV6_CHECK_APIS {
+        let ipv6_timeout = cfg.api_timeout.to_string();
+        for endpoint in &cfg.ipv6_check_apis {
             let output6 = std::process::Command::new("curl")
-                .args(["-6", "-s", "--max-time", "2", endpoint])
+                .args(["-6", "-s", "--max-time", &ipv6_timeout, endpoint])
                 .output();
             if output6.map(|o| o.status.success()).unwrap_or(false) {
                 is_leaking = true;
@@ -939,5 +991,50 @@ Inter-|   Receive                                                |  Transmit
         assert!(parse_ip_api_response("not json").is_none());
         assert!(parse_ip_api_response("{}").is_none());
         assert!(parse_ip_api_response(r#"{"ip": "not_an_ip"}"#).is_none());
+    }
+
+    // === TelemetryConfig conversion ===
+
+    #[test]
+    fn test_telemetry_config_from_app_config() {
+        let app_cfg = crate::config::AppConfig {
+            tick_rate: 500, // not used by TelemetryConfig
+            telemetry_poll_rate: 45,
+            api_timeout: 8,
+            ping_timeout: 3,
+            connect_timeout: 30, // not used by TelemetryConfig
+            ping_targets: vec!["4.4.4.4".to_string()],
+            ipv6_check_apis: vec!["https://v6.example.com".to_string()],
+            ip_api_primary: "https://custom.api/json".to_string(),
+            ip_api_fallbacks: vec![
+                "https://fb1.example.com".to_string(),
+                "https://fb2.example.com".to_string(),
+            ],
+        };
+
+        let tel_cfg = TelemetryConfig::from(&app_cfg);
+
+        assert_eq!(tel_cfg.poll_rate, Duration::from_secs(45));
+        assert_eq!(tel_cfg.api_timeout, 8);
+        assert_eq!(tel_cfg.ping_timeout, 3);
+        assert_eq!(tel_cfg.ping_targets, vec!["4.4.4.4"]);
+        assert_eq!(tel_cfg.ipv6_check_apis, vec!["https://v6.example.com"]);
+        assert_eq!(tel_cfg.ip_api_primary, "https://custom.api/json");
+        assert_eq!(tel_cfg.ip_api_fallbacks.len(), 2);
+        assert_eq!(tel_cfg.ip_api_fallbacks[0], "https://fb1.example.com");
+        assert_eq!(tel_cfg.ip_api_fallbacks[1], "https://fb2.example.com");
+    }
+
+    #[test]
+    fn test_telemetry_config_from_defaults() {
+        let defaults = crate::config::AppConfig::default();
+        let tel_cfg = TelemetryConfig::from(&defaults);
+
+        assert_eq!(tel_cfg.poll_rate, Duration::from_secs(30));
+        assert_eq!(tel_cfg.api_timeout, 5);
+        assert_eq!(tel_cfg.ping_timeout, 2);
+        assert_eq!(tel_cfg.ping_targets.len(), 4);
+        assert_eq!(tel_cfg.ipv6_check_apis.len(), 3);
+        assert_eq!(tel_cfg.ip_api_fallbacks.len(), 3);
     }
 }

@@ -3,8 +3,6 @@
 //! This module defines all static configuration values used throughout Vortix,
 //! including timing intervals, API endpoints, file paths, and UI messages.
 
-use std::time::Duration;
-
 // === Application Metadata ===
 
 /// Application name and title (from Cargo.toml).
@@ -12,12 +10,47 @@ pub const APP_NAME: &str = env!("CARGO_PKG_NAME");
 /// Current application version (from Cargo.toml).
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-// === Timing Configuration ===
+// === Timing Defaults ===
+// These are the compiled-in defaults. Users can override them via config.toml.
+// AppConfig::default() references these so there is exactly one source of truth.
 
-/// UI refresh rate in milliseconds.
+/// Default UI refresh rate in milliseconds.
 pub const DEFAULT_TICK_RATE: u64 = 1000;
-/// Interval between telemetry API calls.
-pub const TELEMETRY_POLL_RATE: Duration = Duration::from_secs(30);
+/// Default interval between telemetry API calls (seconds).
+pub const DEFAULT_TELEMETRY_POLL_RATE: u64 = 30;
+/// Default timeout for HTTP API calls (seconds).
+pub const DEFAULT_API_TIMEOUT: u64 = 5;
+/// Default timeout for ping commands (seconds).
+pub const DEFAULT_PING_TIMEOUT: u64 = 2;
+/// Default maximum seconds to wait for `OpenVPN` log confirmation.
+pub const DEFAULT_CONNECT_TIMEOUT: u64 = 20;
+
+// === Telemetry API Endpoint Defaults ===
+// Same principle: single source of truth, overridable via config.toml.
+
+/// Default primary API endpoint for IP address and ISP lookup.
+pub const DEFAULT_IP_API_PRIMARY: &str = "https://ipinfo.io/json";
+/// Default fallback API 1: ipify.org (IP only, very reliable).
+pub const DEFAULT_IP_API_FALLBACK_1: &str = "https://api.ipify.org";
+/// Default fallback API 2: icanhazip.com (IP only).
+pub const DEFAULT_IP_API_FALLBACK_2: &str = "https://icanhazip.com";
+/// Default fallback API 3: ifconfig.me (IP only).
+pub const DEFAULT_IP_API_FALLBACK_3: &str = "https://ifconfig.me/ip";
+
+/// Default IPv6 leak detection endpoints (any success = leak).
+pub const DEFAULT_IPV6_CHECK_APIS: [&str; 3] = [
+    "https://ipv6.icanhazip.com",
+    "https://v6.ident.me",
+    "https://api6.ipify.org",
+];
+
+/// Default ping targets for latency measurement (tried in order).
+pub const DEFAULT_PING_TARGETS: [&str; 4] = [
+    "1.1.1.1",        // Cloudflare
+    "8.8.8.8",        // Google
+    "9.9.9.9",        // Quad9
+    "208.67.222.222", // OpenDNS
+];
 
 // === Path Configuration ===
 
@@ -50,38 +83,11 @@ pub const IPTABLES_CHAIN_NAME: &str = "VORTIX_KILLSWITCH";
 #[cfg(target_os = "linux")]
 pub const NFT_TABLE_NAME: &str = "vortix_killswitch";
 
-// === Telemetry API Endpoints ===
+// === Telemetry Internal Constants ===
+// These are internal tuning values not exposed to user configuration.
 
-/// Primary API endpoint for IP address and ISP lookup.
-pub const IP_API_PRIMARY: &str = "https://ipinfo.io/json";
-/// Fallback API 1: ipify.org (IP only, very reliable).
-pub const IP_API_FALLBACK_1: &str = "https://api.ipify.org";
-/// Fallback API 2: icanhazip.com (IP only).
-pub const IP_API_FALLBACK_2: &str = "https://icanhazip.com";
-/// Fallback API 3: ifconfig.me (IP only).
-pub const IP_API_FALLBACK_3: &str = "https://ifconfig.me/ip";
-
-/// IPv6 leak detection endpoints (any success = leak).
-pub const IPV6_CHECK_APIS: [&str; 3] = [
-    "https://ipv6.icanhazip.com",
-    "https://v6.ident.me",
-    "https://api6.ipify.org",
-];
-
-/// Ping targets for latency measurement (tried in order).
-pub const PING_TARGETS: [&str; 4] = [
-    "1.1.1.1",        // Cloudflare
-    "8.8.8.8",        // Google
-    "9.9.9.9",        // Quad9
-    "208.67.222.222", // OpenDNS
-];
-
-/// Timeout for HTTP API calls in seconds.
-pub const API_TIMEOUT_SECS: u8 = 5;
 /// Timeout for file downloads in seconds.
 pub const HTTP_TIMEOUT_SECS: u64 = 10;
-/// Timeout for ping commands in seconds.
-pub const PING_TIMEOUT_SECS: u8 = 2;
 /// Delay between retry attempts in milliseconds.
 pub const RETRY_DELAY_MS: u64 = 500;
 /// Number of retry attempts per API/target.
@@ -129,8 +135,6 @@ pub const OVPN_LOG_ERRORS: &[&str] = &[
     "ERROR:",
     "Exiting due to fatal error",
 ];
-/// Maximum seconds to wait for `OpenVPN` log confirmation before falling back to scanner.
-pub const OVPN_CONNECT_TIMEOUT_SECS: u64 = 20;
 /// Polling interval for `OpenVPN` log file (milliseconds).
 pub const OVPN_LOG_POLL_MS: u64 = 500;
 /// Subdirectory under the Vortix config dir for `OpenVPN` saved credentials.
