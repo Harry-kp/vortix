@@ -10,7 +10,11 @@ impl NetworkStatsProvider for MacNetworkStats {
         let mut total_in: u64 = 0;
         let mut total_out: u64 = 0;
 
-        if let Ok(output) = std::process::Command::new("netstat").args(["-ib"]).output() {
+        let timeout = std::time::Duration::from_secs(crate::constants::CMD_TIMEOUT_SECS);
+        if let Some(output) = crate::utils::run_with_timeout(
+            std::process::Command::new("netstat").args(["-ib"]),
+            timeout,
+        ) {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let mut lines = stdout.lines();
 

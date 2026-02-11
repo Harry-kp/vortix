@@ -8,6 +8,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
 
+/// Run a command with the standard system command timeout.
+/// Returns `None` if the command hangs or fails to start.
+fn cmd_output(cmd: &mut Command) -> Option<std::process::Output> {
+    crate::utils::run_with_timeout(
+        cmd,
+        std::time::Duration::from_secs(crate::constants::CMD_TIMEOUT_SECS),
+    )
+}
+
 /// Information about an active VPN session detected on the system.
 #[derive(Clone, Default, Debug)]
 pub struct ActiveSession {
@@ -79,10 +88,7 @@ pub fn get_active_profiles(profiles: &[VpnProfile]) -> Vec<ActiveSession> {
 fn get_all_openvpn_pids() -> std::collections::HashMap<String, u32> {
     let mut pids = std::collections::HashMap::new();
     // Use ps -ax -o pid,args to get PID and full command line
-    if let Ok(output) = Command::new("ps")
-        .args(["-ax", "-o", "pid,command"])
-        .output()
-    {
+    if let Some(output) = cmd_output(Command::new("ps").args(["-ax", "-o", "pid,command"])) {
         let stdout = String::from_utf8_lossy(&output.stdout);
         for line in stdout.lines().skip(1) {
             // Skip header
@@ -134,9 +140,8 @@ fn check_wireguard_by_name(name: &str) -> Option<ActiveSession> {
         session.pid = Some(pid);
 
         // Primary method: Get start time from process (works cross-platform)
-        if let Ok(output) = Command::new("ps")
-            .args(["-p", &pid.to_string(), "-o", "etime="])
-            .output()
+        if let Some(output) =
+            cmd_output(Command::new("ps").args(["-p", &pid.to_string(), "-o", "etime="]))
         {
             let etime = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !etime.is_empty() {
@@ -169,7 +174,7 @@ fn check_wireguard_by_name(name: &str) -> Option<ActiveSession> {
     }
 
     // 3. Parse `wg show {interface_name}` (works the same on both platforms)
-    if let Ok(output) = Command::new("wg").args(["show", &interface_name]).output() {
+    if let Some(output) = cmd_output(Command::new("wg").args(["show", &interface_name])) {
         let out = String::from_utf8_lossy(&output.stdout);
         for line in out.lines() {
             let line = line.trim();
@@ -225,9 +230,8 @@ fn check_openvpn_by_pid(pid: u32, config_path: &Path) -> Option<ActiveSession> {
     };
 
     // Get process elapsed time using ps etime format: [[dd-]hh:]mm:ss
-    if let Ok(output) = Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "etime="])
-        .output()
+    if let Some(output) =
+        cmd_output(Command::new("ps").args(["-p", &pid.to_string(), "-o", "etime="]))
     {
         let etime = String::from_utf8_lossy(&output.stdout);
         let etime = etime.trim();
@@ -244,9 +248,8 @@ fn check_openvpn_by_pid(pid: u32, config_path: &Path) -> Option<ActiveSession> {
 
     #[cfg(target_os = "macos")]
     {
-        if let Ok(output) = Command::new("lsof")
-            .args(["-n", "-P", "-p", &pid.to_string()])
-            .output()
+        if let Some(output) =
+            cmd_output(Command::new("lsof").args(["-n", "-P", "-p", &pid.to_string()]))
         {
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines() {
@@ -267,7 +270,7 @@ fn check_openvpn_by_pid(pid: u32, config_path: &Path) -> Option<ActiveSession> {
     // Method B: Scan for tun/tap interfaces and get IP/MTU
     #[cfg(target_os = "macos")]
     {
-        if let Ok(output) = Command::new("ifconfig").output() {
+        if let Some(output) = cmd_output(&mut Command::new("ifconfig")) {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let mut current_iface = String::new();
             let mut found_openvpn_iface = false;
@@ -304,12 +307,9 @@ fn check_openvpn_by_pid(pid: u32, config_path: &Path) -> Option<ActiveSession> {
                     if line.starts_with("inet ") {
                         let parts: Vec<&str> = line.split_whitespace().collect();
                         if parts.len() >= 2 {
-                            let wg_check = Command::new("wg")
-                                .args(["show", &current_iface])
-                                .stdout(std::process::Stdio::null())
-                                .stderr(std::process::Stdio::null())
-                                .status();
-                            if matches!(wg_check, Ok(s) if !s.success()) {
+                            let wg_check =
+                                cmd_output(Command::new("wg").args(["show", &current_iface]));
+                            if !matches!(wg_check, Some(o) if o.status.success()) {
                                 session.internal_ip = parts[1].to_string();
                                 session.mtu.clone_from(&iface_mtu);
                                 session.interface.clone_from(&current_iface);
@@ -325,7 +325,7 @@ fn check_openvpn_by_pid(pid: u32, config_path: &Path) -> Option<ActiveSession> {
     #[cfg(target_os = "linux")]
     {
         // On Linux, use `ip addr` to find tun/tap interfaces
-        if let Ok(output) = Command::new("ip").args(["addr"]).output() {
+        if let Some(output) = cmd_output(Command::new("ip").args(["addr"])) {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let mut current_iface = String::new();
             let mut found_tun = false;
@@ -340,12 +340,9 @@ fn check_openvpn_by_pid(pid: u32, config_path: &Path) -> Option<ActiveSession> {
 
                         if found_tun {
                             // Check it's not a WireGuard interface
-                            let wg_check = Command::new("wg")
-                                .args(["show", &current_iface])
-                                .stdout(std::process::Stdio::null())
-                                .stderr(std::process::Stdio::null())
-                                .status();
-                            if matches!(wg_check, Ok(s) if s.success()) {
+                            let wg_check =
+                                cmd_output(Command::new("wg").args(["show", &current_iface]));
+                            if matches!(wg_check, Some(o) if o.status.success()) {
                                 found_tun = false;
                                 continue;
                             }
@@ -395,9 +392,8 @@ fn check_openvpn_by_pid(pid: u32, config_path: &Path) -> Option<ActiveSession> {
     }
 
     // Try to get remote server from process arguments first
-    if let Ok(output) = Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "args="])
-        .output()
+    if let Some(output) =
+        cmd_output(Command::new("ps").args(["-p", &pid.to_string(), "-o", "args="]))
     {
         let args = String::from_utf8_lossy(&output.stdout);
         if let Some(remote_idx) = args.find("--remote") {

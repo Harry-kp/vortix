@@ -4,6 +4,14 @@ use crate::core::telemetry::parse_ip_addr_output;
 use crate::platform::InterfaceDetector;
 use std::process::Command;
 
+/// Run a command with the standard system command timeout.
+fn cmd_output(cmd: &mut Command) -> Option<std::process::Output> {
+    crate::utils::run_with_timeout(
+        cmd,
+        std::time::Duration::from_secs(crate::constants::CMD_TIMEOUT_SECS),
+    )
+}
+
 /// Linux interface detection using `ip addr`, `wg show`, and standard interface naming.
 pub struct LinuxInterface;
 
@@ -23,7 +31,7 @@ impl InterfaceDetector for LinuxInterface {
 
         // Fallback: try to find any active WireGuard interface via `wg show`
         // and match against the profile name
-        if let Ok(output) = Command::new("wg").arg("show").output() {
+        if let Some(output) = cmd_output(Command::new("wg").arg("show")) {
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines() {
                 if line.starts_with("interface: ") {
@@ -42,7 +50,7 @@ impl InterfaceDetector for LinuxInterface {
     fn get_wireguard_pid(interface: &str) -> Option<u32> {
         // On Linux, kernel WireGuard doesn't have a userspace process
         // For wireguard-go (userspace), search via ps
-        if let Ok(output) = Command::new("ps").args(["-eo", "pid,args"]).output() {
+        if let Some(output) = cmd_output(Command::new("ps").args(["-eo", "pid,args"])) {
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines() {
                 let line_lower = line.to_lowercase();
@@ -64,10 +72,7 @@ impl InterfaceDetector for LinuxInterface {
 
     fn get_interface_info(interface: &str) -> (String, String) {
         // Use `ip addr show {interface}` on Linux
-        if let Ok(output) = Command::new("ip")
-            .args(["addr", "show", interface])
-            .output()
-        {
+        if let Some(output) = cmd_output(Command::new("ip").args(["addr", "show", interface])) {
             let stdout = String::from_utf8_lossy(&output.stdout);
             return parse_ip_addr_output(&stdout);
         }
@@ -77,8 +82,6 @@ impl InterfaceDetector for LinuxInterface {
 }
 
 fn check_wg_interface_exists(name: &str) -> bool {
-    Command::new("wg")
-        .args(["show", name, "public-key"])
-        .output()
-        .is_ok_and(|o| o.status.success())
+    cmd_output(Command::new("wg").args(["show", name, "public-key"]))
+        .is_some_and(|o| o.status.success())
 }

@@ -650,7 +650,7 @@ fn fetch_latency(tx: &Sender<TelemetryUpdate>, cfg: &std::sync::Arc<TelemetryCon
         for target in &cfg.ping_targets {
             for attempt in 0..constants::RETRY_ATTEMPTS {
                 if let Ok(output) = std::process::Command::new("ping")
-                    .args(["-c", "10", "-i", "0.2", "-W", &timeout, target])
+                    .args(["-c", "3", "-i", "0.2", "-W", &timeout, target])
                     .output()
                 {
                     if output.status.success() {

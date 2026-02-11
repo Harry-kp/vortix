@@ -26,6 +26,39 @@ pub fn is_root() -> bool {
     false
 }
 
+/// Run a system command with a timeout.
+///
+/// Spawns the command and polls for completion. If the command doesn't
+/// finish within `timeout`, the child process is killed and `None` is
+/// returned. This prevents the UI from freezing when system commands
+/// hang (e.g. `lsof` or `netstat` with no network).
+pub fn run_with_timeout(
+    cmd: &mut std::process::Command,
+    timeout: std::time::Duration,
+) -> Option<std::process::Output> {
+    use std::process::Stdio;
+
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(_) => return None,
+        }
+    }
+}
+
 /// Create a directory (and parents) owned by the real user.
 ///
 /// Under sudo, `create_dir_all` produces root-owned dirs.

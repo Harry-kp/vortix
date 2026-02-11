@@ -106,11 +106,13 @@ pub struct App {
     telemetry_rx: Option<mpsc::Receiver<TelemetryUpdate>>,
     cmd_tx: mpsc::Sender<Message>,
     cmd_rx: mpsc::Receiver<Message>,
-    network_stats: telemetry::NetworkStats,
+    /// Shared profile list for the background scanner thread.
+    shared_profiles: std::sync::Arc<std::sync::Mutex<Vec<VpnProfile>>>,
 }
 
 impl App {
     /// Create a new App instance with the given configuration.
+    #[allow(clippy::too_many_lines)]
     pub fn new(config: crate::config::AppConfig, config_dir: std::path::PathBuf) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel::<Message>();
         let down_history = (0..60).map(|i| (f64::from(i), 0.0)).collect();
@@ -165,7 +167,7 @@ impl App {
             telemetry_rx: None,
             cmd_tx,
             cmd_rx,
-            network_stats: telemetry::NetworkStats::default(),
+            shared_profiles: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         };
 
         // Recover kill switch state from crash if persisted
@@ -187,6 +189,7 @@ impl App {
 
         app.load_metadata();
         app.sort_profiles();
+        app.sync_shared_profiles();
 
         // Select first profile if available
         if !app.profiles.is_empty() {
@@ -209,14 +212,42 @@ impl App {
 
         app.log("SUCCESS: System active. Press [x] for actions.");
 
-        // Initial Scanner Run (Immediate State)
-        let active = scanner::get_active_profiles(&app.profiles);
-        app.handle_message(Message::SyncSystemState(active));
-        app.process_external(); // Flush messages
-
         // Start background telemetry worker
         let telemetry_config = telemetry::TelemetryConfig::from(&app.config);
         app.telemetry_rx = Some(telemetry::spawn_telemetry_worker(telemetry_config));
+
+        // Start background scanner thread (replaces synchronous per-tick scanning)
+        {
+            let profiles = std::sync::Arc::clone(&app.shared_profiles);
+            let tx = app.cmd_tx.clone();
+            let tick = std::time::Duration::from_millis(app.config.tick_rate);
+            std::thread::spawn(move || loop {
+                let snap = profiles.lock().map(|p| p.clone()).unwrap_or_default();
+                let active = scanner::get_active_profiles(&snap);
+                if tx.send(Message::SyncSystemState(active)).is_err() {
+                    break; // Main thread dropped — exit
+                }
+                std::thread::sleep(tick);
+            });
+        }
+
+        // Start background network stats thread
+        {
+            let tx = app.cmd_tx.clone();
+            let tick = std::time::Duration::from_millis(app.config.tick_rate);
+            std::thread::spawn(move || {
+                let mut stats = telemetry::NetworkStats::default();
+                loop {
+                    let (down, up) = stats.update();
+                    if tx.send(Message::NetworkStatsUpdate(down, up)).is_err() {
+                        break;
+                    }
+                    std::thread::sleep(tick);
+                }
+            });
+        }
+
+        app.process_external(); // Flush any early messages
 
         app
     }
@@ -1538,6 +1569,10 @@ impl App {
                 self.connection_state = ConnectionState::Disconnected;
                 self.log(&format!("ERR: Connection timed out for '{profile_name}'"));
             }
+            Message::NetworkStatsUpdate(down, up) => {
+                self.current_down = down;
+                self.current_up = up;
+            }
             Message::Tick => {
                 // 1. Connection Timeout Safeguard
                 if let ConnectionState::Connecting { started, profile } = &self.connection_state {
@@ -1552,17 +1587,10 @@ impl App {
                         self.toast = None;
                     }
                 }
-                // 3. Trigger external syncs
-                let active = scanner::get_active_profiles(&self.profiles);
-                self.handle_message(Message::SyncSystemState(active));
-
-                // 4. Process telemetry via dispatch
+                // 3. Process telemetry and background results (non-blocking)
                 self.process_telemetry();
 
-                // 5. Update network stats
-                self.update_network_stats();
-
-                // 6. Update network stats history
+                // 4. Update network stats history
                 for i in 0..59 {
                     self.down_history[i].1 = self.down_history[i + 1].1;
                     self.up_history[i].1 = self.up_history[i + 1].1;
@@ -1682,6 +1710,7 @@ impl App {
 
         // Remove from profiles
         self.profiles.remove(idx);
+        self.sync_shared_profiles();
 
         // Try to delete from disk
         if config_path.exists() {
@@ -2577,11 +2606,11 @@ impl App {
         }
     }
 
-    /// Updates network throughput statistics from system interfaces.
-    fn update_network_stats(&mut self) {
-        let (down, up) = self.network_stats.update();
-        self.current_down = down;
-        self.current_up = up;
+    /// Push the current profile list to the background scanner thread.
+    fn sync_shared_profiles(&self) {
+        if let Ok(mut shared) = self.shared_profiles.lock() {
+            shared.clone_from(&self.profiles);
+        }
     }
 
     /// Called when terminal is resized
@@ -2635,6 +2664,7 @@ impl App {
             Ok(profile) => {
                 let name = profile.name.clone();
                 self.profiles.push(profile);
+                self.sync_shared_profiles();
 
                 self.show_toast(
                     format!("{}{}", constants::MSG_IMPORT_SUCCESS, name),
@@ -2682,6 +2712,10 @@ impl App {
                             }
                         }
                     }
+                }
+
+                if imported > 0 {
+                    self.sync_shared_profiles();
                 }
 
                 // Show summary feedback
@@ -2789,7 +2823,7 @@ mod tests {
             telemetry_rx: None,
             cmd_tx,
             cmd_rx,
-            network_stats: telemetry::NetworkStats::default(),
+            shared_profiles: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 

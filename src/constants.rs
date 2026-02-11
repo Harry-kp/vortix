@@ -24,6 +24,9 @@ pub const DEFAULT_API_TIMEOUT: u64 = 5;
 pub const DEFAULT_PING_TIMEOUT: u64 = 2;
 /// Default maximum seconds to wait for `OpenVPN` log confirmation.
 pub const DEFAULT_CONNECT_TIMEOUT: u64 = 20;
+/// Maximum seconds to wait for a local system command (`ps`, `netstat`, etc.)
+/// before killing it. Prevents the TUI from freezing when commands hang.
+pub const CMD_TIMEOUT_SECS: u64 = 3;
 
 // === Telemetry API Endpoint Defaults ===
 // Same principle: single source of truth, overridable via config.toml.

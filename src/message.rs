@@ -102,6 +102,8 @@ pub enum Message {
     Telemetry(TelemetryUpdate),
     /// Periodic system state synchronization (active profiles)
     SyncSystemState(Vec<ActiveSession>),
+    /// Background network stats update (bytes/sec down, bytes/sec up).
+    NetworkStatsUpdate(u64, u64),
     /// Periodic heartbeat tick
     Tick,
     /// Connection timeout detected
