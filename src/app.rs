@@ -231,6 +231,9 @@ impl App {
 
         app.log("SUCCESS: System active. Press [x] for actions.");
 
+        // Check for required system dependencies at startup
+        app.check_system_dependencies();
+
         // Start background telemetry worker
         let telemetry_config = telemetry::TelemetryConfig::from(&app.config);
         let (telem_rx, telem_nudge) = telemetry::spawn_telemetry_worker(telemetry_config);
@@ -1942,6 +1945,61 @@ impl App {
             }
         }
         missing
+    }
+
+    /// Check for system-wide dependencies at startup and warn the user.
+    fn check_system_dependencies(&mut self) {
+        let mut missing: Vec<&str> = Vec::new();
+
+        if std::process::Command::new("curl")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_err()
+        {
+            missing.push("curl");
+        }
+
+        if std::process::Command::new("openvpn")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_err()
+        {
+            missing.push("openvpn");
+        }
+
+        if std::process::Command::new("wg-quick")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_err()
+        {
+            missing.push("wg-quick");
+        }
+
+        if missing.is_empty() {
+            return;
+        }
+
+        for tool in &missing {
+            self.log(&format!(
+                "WARN: '{}' not found — run: {}",
+                tool,
+                crate::platform::install_hint(tool)
+            ));
+        }
+
+        self.show_toast(
+            format!(
+                "Missing tools: {}. Telemetry/VPN features may not work.",
+                missing.join(", ")
+            ),
+            ToastType::Warning,
+        );
     }
 
     /// Connect to a profile

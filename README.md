@@ -51,29 +51,31 @@ Existing options (`wg show`, NetworkManager, Tunnelblick) either lack real-time 
 
 - macOS 12+ (uses `ifconfig`, `netstat`, `wg`, `ps`, `pfctl`)
 - Rust 1.75+ (for building from source)
+- `curl` (for telemetry and IP detection; pre-installed on macOS)
 - WireGuard: `brew install wireguard-tools`
 - OpenVPN: `brew install openvpn`
 
 ### Linux
 
 - Linux kernel 3.10+ (kernel 5.6+ recommended for native WireGuard; older kernels require `wireguard-tools`)
+- `curl` (for telemetry and IP detection; **not pre-installed on minimal Ubuntu/Debian**)
 - `iproute2` (for `ip addr` interface detection; pre-installed on most distros)
 - `iptables` or `nftables` (for kill switch; prefers iptables when both are available)
 - Rust 1.75+ (for building from source)
 
 **Ubuntu/Debian:**
 ```bash
-sudo apt install wireguard-tools openvpn iptables iproute2
+sudo apt install curl wireguard-tools openvpn iptables iproute2
 ```
 
 **Fedora/RHEL:**
 ```bash
-sudo dnf install wireguard-tools openvpn iptables iproute
+sudo dnf install curl wireguard-tools openvpn iptables iproute
 ```
 
 **Arch Linux:**
 ```bash
-sudo pacman -S wireguard-tools openvpn iptables iproute2
+sudo pacman -S curl wireguard-tools openvpn iptables iproute2
 ```
 
 > **DNS detection** uses `resolvectl` (systemd-resolved) as the primary method, with `nmcli` (NetworkManager) and `/etc/resolv.conf` as fallbacks. Non-systemd distros (Alpine, Void, Gentoo OpenRC) will use the `/etc/resolv.conf` fallback automatically.
