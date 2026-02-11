@@ -184,15 +184,17 @@ When running with `sudo`, vortix automatically resolves the invoking user's home
 └── killswitch.state          Kill switch state for crash recovery
 ```
 
-| Path | Permissions | Description |
-|------|:-----------:|-------------|
+All files and directories are owned by your user account, even when vortix runs under `sudo`. You can read, modify, or delete anything here without elevated privileges.
+
+| Path | Mode | Description |
+|------|:----:|-------------|
 | `profiles/` | `600` | Your `.conf` and `.ovpn` files. Added via `vortix import` or the TUI. |
 | `auth/` | `600` | Saved OpenVPN username/password pairs. One file per profile. |
-| `run/` | temporary | **OpenVPN only.** Created by the openvpn daemon (runs as root), cleaned up on disconnect. The `.pid` file identifies which daemon to kill; the `.log` file is polled for success/error markers. Readable by all users, only accessed during sudo sessions. WireGuard doesn't need this -- it uses kernel interfaces directly. |
-| `logs/` | user-owned | Vortix's own session log. Not the same as the raw OpenVPN output in `run/`. |
-| `config.toml` | user-owned | Optional. Only exists if you create it manually. |
-| `metadata.json` | auto | Internal bookkeeping. Do not edit manually. |
-| `killswitch.state` | auto | Automatically managed. Persists kill switch mode across crashes. |
+| `run/` | `644` | **OpenVPN only.** PID and log files created during a VPN session. The `.pid` file identifies which daemon to kill; the `.log` is polled for success/failure. Cleaned up on disconnect. WireGuard doesn't use this. |
+| `logs/` | `644` | Application session logs (daily rotation, max 5 MB). Not the raw OpenVPN output in `run/`. |
+| `config.toml` | `644` | Optional user settings. Only exists if you create it manually (see below). |
+| `metadata.json` | `644` | Internal bookkeeping (last used, sort order). Auto-managed. |
+| `killswitch.state` | `644` | Persists kill switch mode across crashes. Auto-managed. |
 
 ### Config file
 
