@@ -74,4 +74,4 @@ inherits = "release"
 lto = "thin"
 
 [dev-dependencies]
-tempfile = "3.12"
+tempfile = "3.26"
