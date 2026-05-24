@@ -88,19 +88,51 @@ Today, Vortix is a macOS-first tool that happens to compile on Linux. v0.2.0 mak
 
 ---
 
-## v0.3.0 — "Set and Forget"
+## v0.3.0 — "Architectural Migration v1" ✅
 
-**The promise:** Vortix manages your VPN so you don't have to think about it.
+**The promise:** Vortix's internals are now ready for the next two years of feature work.
 
 **What changes for the user:**
 
-1. **Auto-connect on startup.** Configure a default profile, and Vortix connects the moment you open a terminal (or runs as a background daemon). For remote workers, this means their VPN is always on.
+1. **Existing CLI unchanged.** `vortix up`, `down`, `status`, `list`, `import`, `killswitch` — all preserved exactly. Profiles, killswitch state, and `.auth` files keep working unchanged.
 
-2. **Lifecycle hooks.** Run a script before connecting (check if on trusted network, update firewall rules) or after disconnecting (flush DNS, restart services). Vortix becomes composable with your existing workflow.
+2. **One new top-level subcommand:** `vortix secrets {set,get,delete}` for an optional OS-keyring-backed encrypted credential store (AES-256-GCM + argon2id fallback for headless installs). Existing `.auth` files still work; the store is opt-in.
 
-3. **Profile groups.** Your 20 profiles organized into collapsible sections: "Work", "Personal", "Testing". With `g` key assignment for instant group switching.
+3. **Session event journal.** Every run writes a JSONL event log to `${XDG_DATA_HOME}/vortix/sessions/` with 30-day retention. `vortix info` surfaces the current session's path; users tail it with shell tools.
 
-**What this unlocks:** The "I use it every day" users. The ones who put Vortix in their dotfiles, recommend it in blog posts, and contribute back to the project.
+4. **Versioned `--json` output.** Every structured envelope now carries `schema_version: 1`. Consumers detect breaking changes instead of finding them at runtime.
+
+**What this unlocks:**
+
+The internal architecture (Cargo workspace, capability ports, Tunnel trait, Engine FSM, layered config, secret store) is the foundation for the next plan series — daemon mode, lifecycle hooks, privilege separation, Windows, per-process socket audit. Each future feature plugs into existing seams instead of re-litigating architecture.
+
+See [`docs/v0.3.0-RELEASE-NOTES.md`](docs/v0.3.0-RELEASE-NOTES.md) for the full surface and [`docs/architecture-migration-v1.md`](docs/architecture-migration-v1.md) for the technical map.
+
+---
+
+## v0.4.0 — "Set and Forget"
+
+**The promise:** Vortix manages your VPN so you don't have to think about it. Built on the v0.3.0 architecture.
+
+**What changes for the user:**
+
+1. **Lifecycle hooks** ([plan 009](docs/plans/2026-05-24-009-feat-lifecycle-hooks-plan.md), issue [#36](https://github.com/Harry-kp/vortix/issues/36)). Run a script before connecting (check trusted network, update firewall rules) or after disconnecting (flush DNS, restart services). Composable with your existing workflow.
+
+2. **Auto-connect on startup / daemon mode** ([plan 010](docs/plans/2026-05-24-010-feat-ipc-engine-handle-remote-plan.md), issue [#16](https://github.com/Harry-kp/vortix/issues/16)). Configure a default profile and Vortix connects the moment you open a terminal — or runs as a background daemon. Builds on the new `EngineHandle::Remote` IPC layer.
+
+3. **CI integration tests against real `wg`/`openvpn`** ([plan 012](docs/plans/2026-05-24-012-feat-ci-integration-tests-plan.md), issue [#162](https://github.com/Harry-kp/vortix/issues/162)). Higher release confidence; fewer manual smoke runs per release.
+
+**What this unlocks:** The "I use it every day" users. The ones who put Vortix in their dotfiles.
+
+---
+
+## v0.5.0 — "Least Privilege"
+
+**The promise:** Vortix runs as your user; only the parts that actually need root do.
+
+1. **Privilege separation** ([plan 011](docs/plans/2026-05-24-011-feat-privilege-separation-plan.md), issue [#153](https://github.com/Harry-kp/vortix/issues/153)). Privileged daemon worker + unprivileged TUI/CLI frontend. `vortix status`, `vortix list` work without sudo; only `up`/`down`/`killswitch` route to the daemon. Auditable, principle-of-least-privilege.
+
+2. **Per-process socket audit** ([plan 013](docs/plans/2026-05-24-013-feat-socket-audit-port-plan.md), issues [#168](https://github.com/Harry-kp/vortix/issues/168) and [#166](https://github.com/Harry-kp/vortix/issues/166)). `vortix audit` answers "what's actually routing through the tunnel?" — leak-detection complement to the existing IPv6/DNS guards.
 
 ---
 
@@ -119,7 +151,7 @@ Today, Vortix is a macOS-first tool that happens to compile on Linux. v0.2.0 mak
 
 ## Release Philosophy
 
-- **Each release earns something.** v0.1.7 earns trust. v0.1.8 earns admiration. v0.2.0 earns reach. v0.3.0 earns loyalty. v1.0 earns revenue.
+- **Each release earns something.** v0.1.7 earns trust. v0.1.8 earns admiration. v0.2.0 earns reach. v0.3.0 earns *durability* (architecture that survives the next 1–2 years of feature work). v0.4.0 earns loyalty. v1.0 earns revenue.
 - **Bugs are table stakes.** Every release fixes bugs, but that's not the headline. The headline is what the user can now DO.
 - **Features ship with quality.** No feature lands without tests, without consistent UI, without documentation. A half-shipped feature is worse than no feature.
 
