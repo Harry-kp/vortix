@@ -112,6 +112,13 @@ pub struct App {
     /// Surfaced as a startup toast and as a banner inside the hooks
     /// overlay so the user knows which entries were skipped.
     pub hook_config_errors: Vec<String>,
+
+    /// Snapshot of `Settings::load().hooks` for the management
+    /// overlay (plan 017 U5/U6). Refreshed at startup, when the
+    /// Hooks overlay opens, and after a successful save. The running
+    /// registry (in main.rs) stays bound to what it loaded at start —
+    /// changes here only take effect on next vortix start.
+    pub registered_hooks: Vec<vortix_config::HookConfig>,
 }
 
 /// Cap on `recent_hook_events` retention. Roughly two hours of activity
@@ -169,6 +176,7 @@ impl App {
             show_hooks_overlay: false,
             registered_hooks_count: 0,
             hook_config_errors: Vec::new(),
+            registered_hooks: Vec::new(),
         };
 
         // Select first profile if available
@@ -327,6 +335,7 @@ impl App {
             show_hooks_overlay: false,
             registered_hooks_count: 0,
             hook_config_errors: Vec::new(),
+            registered_hooks: Vec::new(),
         }
     }
 }

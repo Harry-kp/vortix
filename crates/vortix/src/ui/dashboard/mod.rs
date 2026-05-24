@@ -297,6 +297,9 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
                 },
             );
         }
+        InputMode::HookEdit(state) => {
+            super::overlays::hook_edit::render(frame, state);
+        }
         InputMode::Normal => {}
     }
 

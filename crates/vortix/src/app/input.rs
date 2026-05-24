@@ -232,6 +232,7 @@ impl App {
                     }
                 }
             },
+            InputMode::HookEdit(_) => self.handle_hook_edit_keys(key),
             InputMode::Normal => self.handle_normal_keys(key),
         }
     }
@@ -319,6 +320,141 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Hook editor form key handler (plan 017 U5).
+    ///
+    /// Mutates `InputMode::HookEdit` in place. Tab/Shift-Tab cycle
+    /// focus through the field order; per-field input handles its
+    /// own keys (arrows, typing, etc.). Ctrl-S triggers save; Esc
+    /// cancels.
+    #[allow(clippy::too_many_lines)]
+    fn handle_hook_edit_keys(&mut self, key: KeyEvent) {
+        use crate::state::hook_edit::{EnvRow, HookEditField, EVENT_KINDS};
+        use crossterm::event::KeyModifiers;
+
+        // Pull a mutable reference to the boxed state. If we're not
+        // in HookEdit any more (race with another input), bail.
+        let InputMode::HookEdit(state) = &mut self.input_mode else {
+            return;
+        };
+
+        // Top-priority keys: Esc, Tab/BackTab, Ctrl-S.
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => {
+                self.handle_message(Message::CloseOverlay);
+                return;
+            }
+            (KeyCode::Char('s'), m) if m.contains(KeyModifiers::CONTROL) => {
+                self.handle_message(Message::HookEditSave);
+                return;
+            }
+            (KeyCode::Tab, _) => {
+                state.focused = next_focus(state.focused, state.env.len());
+                return;
+            }
+            (KeyCode::BackTab, _) => {
+                state.focused = prev_focus(state.focused, state.env.len());
+                return;
+            }
+            _ => {}
+        }
+
+        // Per-field dispatch.
+        match state.focused {
+            HookEditField::Event => match key.code {
+                KeyCode::Left => {
+                    if state.event_idx == 0 {
+                        state.event_idx = EVENT_KINDS.len() - 1;
+                    } else {
+                        state.event_idx -= 1;
+                    }
+                    state.dirty = true;
+                    state.validation_error = None;
+                }
+                KeyCode::Right => {
+                    state.event_idx = (state.event_idx + 1) % EVENT_KINDS.len();
+                    state.dirty = true;
+                    state.validation_error = None;
+                }
+                _ => {}
+            },
+            HookEditField::Name => {
+                Self::handle_text_field_input(key, &mut state.name, &mut state.name_cursor);
+                state.dirty = true;
+                state.validation_error = None;
+            }
+            HookEditField::Command => {
+                if state.command.input(key) {
+                    state.dirty = true;
+                    state.validation_error = None;
+                }
+            }
+            HookEditField::Timeout => {
+                // Accept digits + control keys; block other chars so
+                // the field stays numeric.
+                if let KeyCode::Char(c) = key.code {
+                    if !c.is_ascii_digit() {
+                        return;
+                    }
+                }
+                Self::handle_text_field_input(
+                    key,
+                    &mut state.timeout_input,
+                    &mut state.timeout_cursor,
+                );
+                state.dirty = true;
+                state.validation_error = None;
+            }
+            HookEditField::EnvKey(i) => {
+                if let Some(row) = state.env.get_mut(i) {
+                    if key.code == KeyCode::Delete && key.modifiers.is_empty() {
+                        // Shift-Del or plain Del on an env key removes
+                        // the whole row when both fields are empty.
+                        if row.key.is_empty() && row.value.is_empty() {
+                            state.env.remove(i);
+                            state.focused = HookEditField::EnvAdd;
+                            state.dirty = true;
+                            return;
+                        }
+                    }
+                    Self::handle_text_field_input(key, &mut row.key, &mut row.key_cursor);
+                    state.dirty = true;
+                    state.validation_error = None;
+                }
+            }
+            HookEditField::EnvValue(i) => {
+                if let Some(row) = state.env.get_mut(i) {
+                    Self::handle_text_field_input(key, &mut row.value, &mut row.value_cursor);
+                    state.dirty = true;
+                    state.validation_error = None;
+                }
+            }
+            HookEditField::EnvAdd => {
+                if matches!(key.code, KeyCode::Enter | KeyCode::Char(' ')) {
+                    state.env.push(EnvRow::default());
+                    state.focused = HookEditField::EnvKey(state.env.len() - 1);
+                    state.dirty = true;
+                }
+            }
+            HookEditField::Enabled => {
+                if matches!(key.code, KeyCode::Char(' ') | KeyCode::Enter) {
+                    state.enabled = !state.enabled;
+                    state.dirty = true;
+                    state.validation_error = None;
+                }
+            }
+            HookEditField::Save => {
+                if matches!(key.code, KeyCode::Enter | KeyCode::Char(' ')) {
+                    self.handle_message(Message::HookEditSave);
+                }
+            }
+            HookEditField::Cancel => {
+                if matches!(key.code, KeyCode::Enter | KeyCode::Char(' ')) {
+                    self.handle_message(Message::CloseOverlay);
+                }
+            }
         }
     }
 
@@ -741,5 +877,68 @@ impl App {
         if let Some(&first) = matches.first() {
             self.profile_list_state.select(Some(first));
         }
+    }
+}
+
+/// Order of focus traversal in the hook edit form (plan 017 U5).
+/// `Tab` moves down this list; `BackTab` moves up. Env rows are
+/// dynamically interleaved between `Timeout` and `EnvAdd`.
+fn next_focus(
+    current: crate::state::hook_edit::HookEditField,
+    env_len: usize,
+) -> crate::state::hook_edit::HookEditField {
+    use crate::state::hook_edit::HookEditField as F;
+    match current {
+        F::Event => F::Name,
+        F::Name => F::Command,
+        F::Command => F::Timeout,
+        F::Timeout => first_env_or_add(env_len),
+        F::EnvKey(i) => F::EnvValue(i),
+        F::EnvValue(i) => {
+            if i + 1 < env_len {
+                F::EnvKey(i + 1)
+            } else {
+                F::EnvAdd
+            }
+        }
+        F::EnvAdd => F::Enabled,
+        F::Enabled => F::Save,
+        F::Save => F::Cancel,
+        F::Cancel => F::Event,
+    }
+}
+
+fn prev_focus(
+    current: crate::state::hook_edit::HookEditField,
+    env_len: usize,
+) -> crate::state::hook_edit::HookEditField {
+    use crate::state::hook_edit::HookEditField as F;
+    match current {
+        F::Event => F::Cancel,
+        F::Name => F::Event,
+        F::Command => F::Name,
+        F::Timeout => F::Command,
+        F::EnvKey(0) => F::Timeout,
+        F::EnvKey(i) => F::EnvValue(i - 1),
+        F::EnvValue(i) => F::EnvKey(i),
+        F::EnvAdd => {
+            if env_len == 0 {
+                F::Timeout
+            } else {
+                F::EnvValue(env_len - 1)
+            }
+        }
+        F::Enabled => F::EnvAdd,
+        F::Save => F::Enabled,
+        F::Cancel => F::Save,
+    }
+}
+
+fn first_env_or_add(env_len: usize) -> crate::state::hook_edit::HookEditField {
+    use crate::state::hook_edit::HookEditField as F;
+    if env_len == 0 {
+        F::EnvAdd
+    } else {
+        F::EnvKey(0)
     }
 }

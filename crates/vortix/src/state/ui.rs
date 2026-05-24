@@ -96,6 +96,10 @@ pub enum InputMode {
         to_name: String,
         confirm_selected: bool,
     },
+    /// Plan 017 U5: lifecycle-hook editor (Add or Edit). Boxed so
+    /// the `InputMode` enum doesn't balloon to the size of the form
+    /// state on every variant.
+    HookEdit(Box<crate::state::hook_edit::HookEditState>),
     /// `OpenVPN` authentication credentials dialog.
     AuthPrompt {
         /// Index of the profile requiring auth.

@@ -32,7 +32,7 @@ use ratatui::Frame;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// A minimal multi-line text input.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextArea {
     lines: Vec<String>,
     /// Zero-based row index of the cursor.
