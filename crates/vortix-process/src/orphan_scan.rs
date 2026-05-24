@@ -64,7 +64,9 @@ fn parse_ps_output(stdout: &str) -> Vec<OrphanProcess> {
             continue;
         }
         let mut parts = line.splitn(2, char::is_whitespace);
-        let Some(pid_str) = parts.next() else { continue };
+        let Some(pid_str) = parts.next() else {
+            continue;
+        };
         let Some(comm_str) = parts.next() else {
             continue;
         };

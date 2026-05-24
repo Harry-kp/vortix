@@ -2347,6 +2347,7 @@ dependencies = [
  "vortix-core",
  "vortix-platform-linux",
  "vortix-platform-macos",
+ "vortix-platform-windows",
  "vortix-process",
  "vortix-protocol-openvpn",
  "vortix-protocol-wireguard",
@@ -2404,6 +2405,15 @@ name = "vortix-platform-macos"
 version = "0.0.0"
 dependencies = [
  "libc",
+ "tracing",
+ "vortix-core",
+ "vortix-process",
+]
+
+[[package]]
+name = "vortix-platform-windows"
+version = "0.0.0"
+dependencies = [
  "tracing",
  "vortix-core",
  "vortix-process",

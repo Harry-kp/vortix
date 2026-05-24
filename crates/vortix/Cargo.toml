@@ -77,6 +77,11 @@ vortix-platform-macos = { path = "../vortix-platform-macos" }
 [target.'cfg(target_os = "linux")'.dependencies]
 vortix-platform-linux = { path = "../vortix-platform-linux" }
 
+# Plan 008 U4 stub. Compiles on Windows but every port impl returns
+# "not supported" — proves the Platform aggregate admits a third OS.
+[target.'cfg(target_os = "windows")'.dependencies]
+vortix-platform-windows = { path = "../vortix-platform-windows" }
+
 # System calls (for root detection)
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
