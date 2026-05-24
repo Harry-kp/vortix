@@ -330,6 +330,7 @@ mod tests {
                 exit_code: 0,
             },
         );
+        // xtask:allow-protocol-leak: mock-runner test fixture, not a real wg-quick invocation
         let outcome = runner
             .run(
                 CommandSpec::oneshot("wg-quick", vec!["up".into(), "corp".into()])
@@ -349,6 +350,7 @@ mod tests {
             SpecMatcher::ExactProgram("wg-quick".into()),
             ScriptedOutcome::Failure("Address already in use".into()),
         );
+        // xtask:allow-protocol-leak: mock-runner test fixture, not a real wg-quick invocation
         let result = runner
             .run(CommandSpec::oneshot("wg-quick", vec!["up".into()]))
             .await;
@@ -362,6 +364,7 @@ mod tests {
             SpecMatcher::ExactProgram("openvpn".into()),
             ScriptedOutcome::Detached { pid: 12345 },
         );
+        // xtask:allow-protocol-leak: mock-runner test fixture, not a real openvpn invocation
         let handle = runner
             .spawn_detached(CommandSpec::detached("openvpn", vec!["--daemon".into()]))
             .await

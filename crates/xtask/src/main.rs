@@ -27,10 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Command::CheckSubprocess => check_subprocess(),
         Command::CheckPlatformLeak => check_platform_leak(),
-        Command::CheckProtocolLeak => {
-            eprintln!("xtask check-protocol-leak: stub — implemented by plan 004");
-            Ok(())
-        }
+        Command::CheckProtocolLeak => check_protocol_leak(),
     }
 }
 
@@ -221,6 +218,110 @@ fn is_platform_leak_allowlisted(path: &Path, workspace_root: &Path) -> bool {
         || rel_str.starts_with("crates/vortix/src/platform/")
         || rel_str == "crates/vortix/src/constants.rs"
         || rel_str.starts_with("crates/xtask/")
+}
+
+/// Scan the workspace for protocol-specific binary names appearing in
+/// `CommandSpec` invocations outside their protocol crates (plan 004 R13).
+///
+/// Allowlist:
+/// - `crates/vortix-protocol-wireguard/**` may invoke `wg-quick` and `wg`.
+/// - `crates/vortix-protocol-openvpn/**` may invoke `openvpn`.
+/// - `crates/xtask/**` references the patterns in error strings.
+/// - Lines annotated `// xtask:allow-protocol-leak: <reason>` are accepted
+///   (on the same line, the line above, or the line below — rustfmt may
+///   split trailing comments).
+///
+/// The lint targets `CommandSpec::oneshot("<name>"` and the equivalent
+/// `CommandSpec::detached("<name>"` patterns. Other uses of the name as a
+/// string (logging, error messages, documentation) are not flagged.
+fn check_protocol_leak() -> Result<(), Box<dyn std::error::Error>> {
+    let workspace_root = workspace_root()?;
+    let crates_dir = workspace_root.join("crates");
+
+    let mut violations = Vec::new();
+
+    let walker = ignore::WalkBuilder::new(&crates_dir)
+        .hidden(false)
+        .git_ignore(true)
+        .build();
+
+    for result in walker {
+        let Ok(entry) = result else { continue };
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let Some(rel_str) = path
+            .strip_prefix(&workspace_root)
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+        else {
+            continue;
+        };
+
+        let allowed_names: &[&str] = if rel_str.starts_with("crates/vortix-protocol-wireguard/") {
+            &["openvpn"]
+        } else if rel_str.starts_with("crates/vortix-protocol-openvpn/") {
+            &["wg", "wg-quick"]
+        } else if rel_str.starts_with("crates/xtask/") {
+            continue;
+        } else {
+            &["wg", "wg-quick", "openvpn"]
+        };
+
+        let Ok(content) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let lines: Vec<&str> = content.lines().collect();
+
+        for (idx, line) in lines.iter().enumerate() {
+            // Skip comment-only lines.
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            // Annotation may live on the same line, within the previous 3
+            // lines (rustfmt may break a chained `.run(...)` call across
+            // multiple lines), or on the next line.
+            let annotated = line.contains("// xtask:allow-protocol-leak")
+                || (1..=3).any(|n| {
+                    idx.checked_sub(n)
+                        .and_then(|i| lines.get(i))
+                        .is_some_and(|l| l.contains("// xtask:allow-protocol-leak"))
+                })
+                || lines
+                    .get(idx + 1)
+                    .is_some_and(|l| l.contains("// xtask:allow-protocol-leak"));
+            if annotated {
+                continue;
+            }
+
+            for name in allowed_names {
+                let needle1 = format!(r#"CommandSpec::oneshot("{name}""#);
+                let needle2 = format!(r#"CommandSpec::detached("{name}""#);
+                if line.contains(&needle1) || line.contains(&needle2) {
+                    violations.push(format!("{rel_str}:{}: {}", idx + 1, line.trim()));
+                    break;
+                }
+            }
+        }
+    }
+
+    if violations.is_empty() {
+        eprintln!("xtask check-protocol-leak: ok (crates/ scanned)");
+        Ok(())
+    } else {
+        eprintln!(
+            "xtask check-protocol-leak: {} violation(s) — protocol-specific binaries (`wg`, `wg-quick`, `openvpn`) must only be invoked from their protocol crate. Route via `crate::tunnel::tunnel_for(...)`; for legitimate exceptions, annotate with `// xtask:allow-protocol-leak: <reason>`.",
+            violations.len()
+        );
+        for v in &violations {
+            eprintln!("  {v}");
+        }
+        std::process::exit(1)
+    }
 }
 
 fn workspace_root() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {

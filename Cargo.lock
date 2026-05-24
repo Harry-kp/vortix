@@ -2017,6 +2017,8 @@ dependencies = [
  "vortix-platform-linux",
  "vortix-platform-macos",
  "vortix-process",
+ "vortix-protocol-openvpn",
+ "vortix-protocol-wireguard",
 ]
 
 [[package]]
@@ -2072,10 +2074,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "vortix-protocol-openvpn"
+version = "0.0.0"
+dependencies = [
+ "tracing",
+ "vortix-core",
+ "vortix-process",
+]
+
+[[package]]
 name = "vortix-protocol-wireguard"
 version = "0.0.0"
 dependencies = [
+ "tracing",
  "vortix-core",
+ "vortix-process",
 ]
 
 [[package]]
