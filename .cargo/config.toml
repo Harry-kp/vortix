@@ -1,0 +1,3 @@
+[alias]
+# Build chores live in crates/xtask/; invoke via `cargo xtask <subcommand>`.
+xtask = "run --package xtask --quiet --"

@@ -1,0 +1,13 @@
+[package]
+name = "vortix-platform-macos"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+vortix-core = { path = "../vortix-core" }
+
+[lints]
+workspace = true

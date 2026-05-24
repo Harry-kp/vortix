@@ -1,0 +1,18 @@
+[package]
+name = "vortix-process"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+vortix-core = { path = "../vortix-core" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+enum_dispatch = { workspace = true }
+thiserror = { workspace = true }
+libc = "0.2"
+
+[lints]
+workspace = true
