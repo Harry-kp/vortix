@@ -84,6 +84,30 @@ impl TunnelKind {
     }
 }
 
+// Implement the `Tunnel` trait by delegating to the inherent methods.
+// Plan 005's `Engine<T: Tunnel>` requires this so the binary can construct
+// `Engine<TunnelKind>` and drive the FSM with the existing dispatch.
+impl vortix_core::ports::tunnel::Tunnel for TunnelKind {
+    fn up(&mut self, profile: &Profile) -> Result<TunnelHandle, TunnelError> {
+        TunnelKind::up(self, profile)
+    }
+    fn down(&mut self, handle: TunnelHandle) -> Result<(), TunnelError> {
+        TunnelKind::down(self, handle)
+    }
+    fn status(&self, handle: &TunnelHandle) -> Result<TunnelStatus, TunnelError> {
+        TunnelKind::status(self, handle)
+    }
+    fn parse_profile(&self, raw: &[u8]) -> Result<Box<dyn ParsedProfile>, ParseError> {
+        TunnelKind::parse_profile(self, raw)
+    }
+    fn capabilities(&self) -> TunnelCapabilities {
+        TunnelKind::capabilities(self)
+    }
+    fn kind_tag(&self) -> TunnelKindTag {
+        TunnelKind::kind_tag(self)
+    }
+}
+
 /// THE single routing function: protocol → `TunnelKind`.
 ///
 /// Engine and CLI call this once per connect/disconnect and never branch on

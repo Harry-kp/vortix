@@ -56,6 +56,11 @@ pub struct App {
     /// The headless VPN engine — owns all VPN state and operations.
     pub engine: VpnEngine,
 
+    /// Optional plan-005 `EngineHandle`. Non-load-bearing today — the TUI
+    /// still mutates `self.engine` directly through `Deref`. Future plan
+    /// 005 U5/U6 units migrate consumers off `Deref` and onto this handle.
+    pub engine_handle: Option<vortix_core::engine::EngineHandle>,
+
     /// Flag indicating the application should exit.
     pub should_quit: bool,
 
@@ -114,6 +119,7 @@ impl App {
 
         let mut app = Self {
             engine,
+            engine_handle: None,
 
             should_quit: false,
 
@@ -250,12 +256,23 @@ impl App {
 }
 
 impl App {
+    /// Attach an `EngineHandle` to the app (plan 005 U5 incremental
+    /// adoption). The handle is not yet load-bearing — the TUI still
+    /// mutates `self.engine` through `Deref` — but future units swap UI
+    /// reads / commands over to it.
+    #[must_use]
+    pub fn with_engine_handle(mut self, handle: vortix_core::engine::EngineHandle) -> Self {
+        self.engine_handle = Some(handle);
+        self
+    }
+
     /// Lightweight constructor for testing.
     #[must_use]
     pub fn new_test() -> Self {
         let engine = VpnEngine::new_test();
         Self {
             engine,
+            engine_handle: None,
 
             should_quit: false,
 

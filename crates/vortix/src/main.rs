@@ -235,6 +235,35 @@ fn run_tui(
 ) -> Result<()> {
     let tick_rate = config.tick_rate;
     let mut app = App::new(config, config_dir);
+
+    // Attach an `EngineHandle` (plan 005 U5) so future units can migrate
+    // off `App::Deref<VpnEngine>`. The handle is constructed in the bundled
+    // tokio runtime so its actor can spawn. Failure to construct is
+    // non-fatal — the legacy engine path stays load-bearing.
+    if let Some(runtime) = vortix_process::global_runner().as_real() {
+        let _guard = runtime.runtime().handle().enter();
+        if let Some(journal) = vortix_core::journal::global_journal().cloned() {
+            use vortix_core::engine::{Engine, EngineHandle};
+            use vortix_core::profile::{Profile, ProfileId, ProtocolKind};
+
+            // The FSM is generic; here we don't actually pre-construct a
+            // tunnel — we hand it a default-Mock until plan 005 U6 wires
+            // commands to the engine_handle for real. The resolver translates
+            // the binary-side profile vocabulary on demand.
+            let resolver = |_id: &ProfileId| -> Option<Profile> {
+                // Real resolver lands when CLI/TUI migrate off Deref;
+                // until then any caller hitting the handle gets a
+                // ProfileGone failure, which is the right thing for a
+                // not-yet-wired path.
+                None
+            };
+            let _ = ProtocolKind::WireGuard; // suppress unused warning
+            let tunnel = vortix_core::ports::tunnel::mock::MockTunnel::new();
+            let engine = Engine::new(tunnel, resolver);
+            let handle = EngineHandle::local(engine, journal);
+            app = app.with_engine_handle(handle);
+        }
+    }
     let events = EventHandler::new(tick_rate);
     let size = terminal.size()?;
     app.on_resize(size.width, size.height);
