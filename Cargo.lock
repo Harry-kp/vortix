@@ -2382,7 +2382,6 @@ dependencies = [
  "thiserror 2.0.17",
  "time",
  "toml 1.1.2+spec-1.1.0",
- "toml_edit",
  "tracing",
  "vortix-core",
  "zeroize",

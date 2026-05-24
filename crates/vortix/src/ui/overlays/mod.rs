@@ -6,8 +6,6 @@ pub mod config_viewer;
 pub mod confirm_dialog;
 pub mod dependency_alert;
 pub mod help;
-pub mod hook_edit;
-pub mod hooks;
 pub mod import;
 pub mod permission_denied;
 pub mod rename;

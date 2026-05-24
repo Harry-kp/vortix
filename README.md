@@ -53,7 +53,7 @@ Existing options (`wg show`, NetworkManager, Tunnelblick) either lack real-time 
 - **Kill Switch** — Built-in firewall management for maximum security
 - **Encrypted credential store** *(new in v0.3.0)* — OS keyring (Keychain / Secret Service) with AES-256-GCM + argon2id encrypted-file fallback for headless installs
 - **Session event journal** *(new in v0.3.0)* — JSONL event log per session under `${XDG_DATA_HOME}/vortix/sessions/`, 30-day retention; useful for diagnostics and scripting
-- **Lifecycle hooks** *(new in v0.3.0)* — `[[hooks]]` in `settings.toml` runs shell commands on FSM transitions (pre/post connect/disconnect, connect_failed, reconnecting); manage them entirely from inside the TUI (press `H` to add/edit/toggle/delete — no file editing required); failures surface as toasts; the Lifecycle Hooks overlay shows the rolling fire history
+- **Lifecycle hooks** *(new in v0.3.0)* — `[[hooks]]` in `settings.toml` runs shell commands on FSM transitions (pre/post connect/disconnect, connect_failed, reconnecting); composable with your existing workflow
 - **Per-process socket audit** *(new in v0.3.0)* — `vortix audit` answers "is this traffic actually routing through the tunnel?" with per-PID socket inventory; Linux + macOS supported
 - **Versioned structured output** *(new in v0.3.0)* — every `--json` envelope carries `schema_version: 1` so consumers can detect breaking changes instead of finding them at runtime
 - **Interactive Import** — Easily add new profiles directly within the TUI

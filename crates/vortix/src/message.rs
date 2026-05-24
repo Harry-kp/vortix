@@ -9,20 +9,6 @@
 use crate::core::scanner::ActiveSession;
 use crate::core::telemetry::TelemetryUpdate;
 use crate::state::{FocusedPanel, ToastType};
-use vortix_core::engine::HookOutcomeRecord;
-
-/// One hook fire delivered to the TUI message loop (plan 016 U2).
-///
-/// Built by the journal-subscriber task in `main.rs` from
-/// `(name, runtime HookOutcome)` and pushed through `App.engine.cmd_tx`
-/// so the TUI sees it on the next tick. Carries the hook name, the
-/// lifecycle event kind that triggered it, and the serialized record.
-#[derive(Debug, Clone)]
-pub struct HookOutcomeReport {
-    pub hook_name: String,
-    pub event_kind: String,
-    pub record: HookOutcomeRecord,
-}
 
 /// All messages that can modify application state.
 ///
@@ -153,18 +139,6 @@ pub enum Message {
         /// Error message if the command failed
         error: Option<String>,
     },
-    /// A lifecycle hook fired with the given outcome (plan 016 U2).
-    /// Pushed from the journal-subscriber task in `main.rs`; consumed
-    /// by `update.rs` which appends it to `App.recent_hook_events` and
-    /// (when `Failed`/`TimedOut`/`Aborted`) emits a rate-limited toast.
-    HookFired(HookOutcomeReport),
-
-    /// Hook-config validation errors collected at startup (plan 016 U5).
-    /// One entry per malformed `[[hooks]]` table. Empty vec means clean
-    /// config; the variant is still dispatched so the receiver can clear
-    /// any stale validation state.
-    HookConfigErrors(Vec<String>),
-
     /// Terminal resize event
     Resize(u16, u16),
     /// Import profile from path
@@ -204,24 +178,6 @@ pub enum Message {
     OpenSearch,
     /// Open the help overlay
     OpenHelp,
-    /// Toggle the lifecycle-hooks overlay (plan 016 U4).
-    ToggleHooksOverlay,
-
-    // === Hook Management (plan 017) ===
-    /// Open the hook editor form in `AddingNew` mode.
-    HookAdd,
-    /// Open the hook editor form in `EditingExisting` mode for the
-    /// hook at the given index in `App.registered_hooks`.
-    HookEdit(usize),
-    /// Triggered by Ctrl-S / Enter on Save inside the form.
-    /// Validation + save pipeline land in U8.
-    HookEditSave,
-    /// Confirmed delete from the confirm dialog (U7).
-    HookDeleteConfirm(usize),
-    /// Request to delete — opens the confirm dialog (U7).
-    HookDeleteRequest(usize),
-    /// Flip `enabled` on the hook at the given index, write through (U7).
-    HookToggle(usize),
     /// Cycle the activity-log level filter (All → Errors → Warn → Info → All)
     CycleLogFilter,
 }
@@ -380,11 +336,6 @@ pub fn get_bulk_actions() -> Vec<ActionMenuItem> {
             message: Message::OpenHelp,
         },
         ActionMenuItem {
-            key: "H",
-            label: "Lifecycle Hooks",
-            message: Message::ToggleHooksOverlay,
-        },
-        ActionMenuItem {
             key: "l",
             label: "Next Panel",
             message: Message::NextPanel,
@@ -466,16 +417,7 @@ mod tests {
     #[test]
     fn test_bulk_actions_count() {
         let actions = get_bulk_actions();
-        assert_eq!(actions.len(), 11);
-    }
-
-    #[test]
-    fn test_bulk_actions_include_hooks_overlay() {
-        let actions = get_bulk_actions();
-        assert!(
-            actions.iter().any(|a| a.key == "H"),
-            "Plan 016 U4 bulk menu must surface the hooks overlay"
-        );
+        assert_eq!(actions.len(), 10);
     }
 
     #[test]

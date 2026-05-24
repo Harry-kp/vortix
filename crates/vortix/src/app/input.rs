@@ -91,33 +91,6 @@ impl App {
             return;
         }
 
-        // 4a. Global: Handle pending mtime-overwrite prompt (plan 017 U8).
-        if self.pending_hooks_overwrite.is_some() && self.input_mode == InputMode::Normal {
-            match key.code {
-                KeyCode::Char('y' | 'Y') => {
-                    if let Some(hooks) = self.pending_hooks_overwrite.take() {
-                        self.commit_hooks_overwrite(hooks);
-                    }
-                    return;
-                }
-                KeyCode::Char('n' | 'N') | KeyCode::Esc => {
-                    self.pending_hooks_overwrite = None;
-                    self.show_toast(
-                        "Hook save cancelled — settings.toml unchanged.".into(),
-                        crate::state::ToastType::Info,
-                    );
-                    return;
-                }
-                _ => {}
-            }
-        }
-
-        // 4b. Global: Handle Hooks overlay key dispatch (plan 017 U6/U7).
-        if self.show_hooks_overlay && self.input_mode == InputMode::Normal {
-            self.handle_hooks_overlay_keys(key);
-            return;
-        }
-
         // Handle based on Input Mode
         let input_mode = self.input_mode.clone();
         match input_mode {
@@ -228,22 +201,8 @@ impl App {
                 mut confirm_selected,
                 ..
             } => match handle_confirm_keys(key, &mut confirm_selected) {
-                // Plan 017 U7: a confirm fired while `pending_hook_delete`
-                // is set targets a hook, not a profile — dispatch
-                // accordingly. Confirm is consumed here regardless of
-                // outcome so the flag is cleared.
-                ConfirmAction::Confirmed => {
-                    if let Some(idx) = self.pending_hook_delete.take() {
-                        self.input_mode = InputMode::Normal;
-                        self.handle_message(Message::HookDeleteConfirm(idx));
-                    } else {
-                        self.handle_message(Message::ConfirmDelete);
-                    }
-                }
-                ConfirmAction::Cancelled => {
-                    self.pending_hook_delete = None;
-                    self.handle_message(Message::CloseOverlay);
-                }
+                ConfirmAction::Confirmed => self.handle_message(Message::ConfirmDelete),
+                ConfirmAction::Cancelled => self.handle_message(Message::CloseOverlay),
                 ConfirmAction::None => {
                     if let InputMode::ConfirmDelete {
                         confirm_selected: cs,
@@ -273,7 +232,6 @@ impl App {
                     }
                 }
             },
-            InputMode::HookEdit(_) => self.handle_hook_edit_keys(key),
             InputMode::Normal => self.handle_normal_keys(key),
         }
     }
@@ -361,184 +319,6 @@ impl App {
                 }
             }
             _ => {}
-        }
-    }
-
-    /// Hooks overlay key handler (plan 017 U6 + U7).
-    ///
-    /// Fires when the `Shift-H` overlay is open and `InputMode` is
-    /// `Normal`. j/k navigate the registered-hooks list; a/e/d/t
-    /// dispatch the CRUD operations; H/Esc closes.
-    fn handle_hooks_overlay_keys(&mut self, key: KeyEvent) {
-        let len = self.registered_hooks.len();
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('H') => {
-                self.handle_message(Message::ToggleHooksOverlay);
-            }
-            KeyCode::Char('j') | KeyCode::Down => {
-                if len > 0 && self.hooks_overlay_selected + 1 < len {
-                    self.hooks_overlay_selected += 1;
-                }
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                if self.hooks_overlay_selected > 0 {
-                    self.hooks_overlay_selected -= 1;
-                }
-            }
-            KeyCode::Char('a') => self.handle_message(Message::HookAdd),
-            KeyCode::Char('e') | KeyCode::Enter => {
-                if len > 0 {
-                    self.handle_message(Message::HookEdit(self.hooks_overlay_selected));
-                }
-            }
-            KeyCode::Char('d') | KeyCode::Delete => {
-                if len > 0 {
-                    self.handle_message(Message::HookDeleteRequest(
-                        self.hooks_overlay_selected,
-                    ));
-                }
-            }
-            KeyCode::Char('t') => {
-                if len > 0 {
-                    self.handle_message(Message::HookToggle(self.hooks_overlay_selected));
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Hook editor form key handler (plan 017 U5).
-    ///
-    /// Mutates `InputMode::HookEdit` in place. Tab/Shift-Tab cycle
-    /// focus through the field order; per-field input handles its
-    /// own keys (arrows, typing, etc.). Ctrl-S triggers save; Esc
-    /// cancels.
-    #[allow(clippy::too_many_lines)]
-    fn handle_hook_edit_keys(&mut self, key: KeyEvent) {
-        use crate::state::hook_edit::{EnvRow, HookEditField, EVENT_KINDS};
-        use crossterm::event::KeyModifiers;
-
-        // Pull a mutable reference to the boxed state. If we're not
-        // in HookEdit any more (race with another input), bail.
-        let InputMode::HookEdit(state) = &mut self.input_mode else {
-            return;
-        };
-
-        // Top-priority keys: Esc, Tab/BackTab, Ctrl-S.
-        match (key.code, key.modifiers) {
-            (KeyCode::Esc, _) => {
-                self.handle_message(Message::CloseOverlay);
-                return;
-            }
-            (KeyCode::Char('s'), m) if m.contains(KeyModifiers::CONTROL) => {
-                self.handle_message(Message::HookEditSave);
-                return;
-            }
-            (KeyCode::Tab, _) => {
-                state.focused = next_focus(state.focused, state.env.len());
-                return;
-            }
-            (KeyCode::BackTab, _) => {
-                state.focused = prev_focus(state.focused, state.env.len());
-                return;
-            }
-            _ => {}
-        }
-
-        // Per-field dispatch.
-        match state.focused {
-            HookEditField::Event => match key.code {
-                KeyCode::Left => {
-                    if state.event_idx == 0 {
-                        state.event_idx = EVENT_KINDS.len() - 1;
-                    } else {
-                        state.event_idx -= 1;
-                    }
-                    state.dirty = true;
-                    state.validation_error = None;
-                }
-                KeyCode::Right => {
-                    state.event_idx = (state.event_idx + 1) % EVENT_KINDS.len();
-                    state.dirty = true;
-                    state.validation_error = None;
-                }
-                _ => {}
-            },
-            HookEditField::Name => {
-                Self::handle_text_field_input(key, &mut state.name, &mut state.name_cursor);
-                state.dirty = true;
-                state.validation_error = None;
-            }
-            HookEditField::Command => {
-                if state.command.input(key) {
-                    state.dirty = true;
-                    state.validation_error = None;
-                }
-            }
-            HookEditField::Timeout => {
-                // Accept digits + control keys; block other chars so
-                // the field stays numeric.
-                if let KeyCode::Char(c) = key.code {
-                    if !c.is_ascii_digit() {
-                        return;
-                    }
-                }
-                Self::handle_text_field_input(
-                    key,
-                    &mut state.timeout_input,
-                    &mut state.timeout_cursor,
-                );
-                state.dirty = true;
-                state.validation_error = None;
-            }
-            HookEditField::EnvKey(i) => {
-                if let Some(row) = state.env.get_mut(i) {
-                    if key.code == KeyCode::Delete && key.modifiers.is_empty() {
-                        // Shift-Del or plain Del on an env key removes
-                        // the whole row when both fields are empty.
-                        if row.key.is_empty() && row.value.is_empty() {
-                            state.env.remove(i);
-                            state.focused = HookEditField::EnvAdd;
-                            state.dirty = true;
-                            return;
-                        }
-                    }
-                    Self::handle_text_field_input(key, &mut row.key, &mut row.key_cursor);
-                    state.dirty = true;
-                    state.validation_error = None;
-                }
-            }
-            HookEditField::EnvValue(i) => {
-                if let Some(row) = state.env.get_mut(i) {
-                    Self::handle_text_field_input(key, &mut row.value, &mut row.value_cursor);
-                    state.dirty = true;
-                    state.validation_error = None;
-                }
-            }
-            HookEditField::EnvAdd => {
-                if matches!(key.code, KeyCode::Enter | KeyCode::Char(' ')) {
-                    state.env.push(EnvRow::default());
-                    state.focused = HookEditField::EnvKey(state.env.len() - 1);
-                    state.dirty = true;
-                }
-            }
-            HookEditField::Enabled => {
-                if matches!(key.code, KeyCode::Char(' ') | KeyCode::Enter) {
-                    state.enabled = !state.enabled;
-                    state.dirty = true;
-                    state.validation_error = None;
-                }
-            }
-            HookEditField::Save => {
-                if matches!(key.code, KeyCode::Enter | KeyCode::Char(' ')) {
-                    self.handle_message(Message::HookEditSave);
-                }
-            }
-            HookEditField::Cancel => {
-                if matches!(key.code, KeyCode::Enter | KeyCode::Char(' ')) {
-                    self.handle_message(Message::CloseOverlay);
-                }
-            }
         }
     }
 
@@ -750,10 +530,6 @@ impl App {
 
             KeyCode::Char('K') => self.handle_message(Message::ToggleKillSwitch),
             KeyCode::Char('?') => self.handle_message(Message::OpenHelp),
-            // Plan 016 U4: capital H toggles the lifecycle-hooks
-            // overlay (lowercase h remains the vim-style previous-
-            // panel binding via handle_panel_keys).
-            KeyCode::Char('H') => self.handle_message(Message::ToggleHooksOverlay),
             KeyCode::Char('/') => self.handle_message(Message::OpenSearch),
 
             _ => self.handle_panel_keys(key),
@@ -961,68 +737,5 @@ impl App {
         if let Some(&first) = matches.first() {
             self.profile_list_state.select(Some(first));
         }
-    }
-}
-
-/// Order of focus traversal in the hook edit form (plan 017 U5).
-/// `Tab` moves down this list; `BackTab` moves up. Env rows are
-/// dynamically interleaved between `Timeout` and `EnvAdd`.
-fn next_focus(
-    current: crate::state::hook_edit::HookEditField,
-    env_len: usize,
-) -> crate::state::hook_edit::HookEditField {
-    use crate::state::hook_edit::HookEditField as F;
-    match current {
-        F::Event => F::Name,
-        F::Name => F::Command,
-        F::Command => F::Timeout,
-        F::Timeout => first_env_or_add(env_len),
-        F::EnvKey(i) => F::EnvValue(i),
-        F::EnvValue(i) => {
-            if i + 1 < env_len {
-                F::EnvKey(i + 1)
-            } else {
-                F::EnvAdd
-            }
-        }
-        F::EnvAdd => F::Enabled,
-        F::Enabled => F::Save,
-        F::Save => F::Cancel,
-        F::Cancel => F::Event,
-    }
-}
-
-fn prev_focus(
-    current: crate::state::hook_edit::HookEditField,
-    env_len: usize,
-) -> crate::state::hook_edit::HookEditField {
-    use crate::state::hook_edit::HookEditField as F;
-    match current {
-        F::Event => F::Cancel,
-        F::Name => F::Event,
-        F::Command => F::Name,
-        F::Timeout => F::Command,
-        F::EnvKey(0) => F::Timeout,
-        F::EnvKey(i) => F::EnvValue(i - 1),
-        F::EnvValue(i) => F::EnvKey(i),
-        F::EnvAdd => {
-            if env_len == 0 {
-                F::Timeout
-            } else {
-                F::EnvValue(env_len - 1)
-            }
-        }
-        F::Enabled => F::EnvAdd,
-        F::Save => F::Enabled,
-        F::Cancel => F::Save,
-    }
-}
-
-fn first_env_or_add(env_len: usize) -> crate::state::hook_edit::HookEditField {
-    use crate::state::hook_edit::HookEditField as F;
-    if env_len == 0 {
-        F::EnvAdd
-    } else {
-        F::EnvKey(0)
     }
 }

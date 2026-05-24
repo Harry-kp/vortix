@@ -297,18 +297,11 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
                 },
             );
         }
-        InputMode::HookEdit(state) => {
-            super::overlays::hook_edit::render(frame, state);
-        }
         InputMode::Normal => {}
     }
 
     if app.show_config {
         super::overlays::config_viewer::render(frame, app);
-    }
-
-    if app.show_hooks_overlay {
-        super::overlays::hooks::render(frame, app);
     }
 
     if app.show_action_menu || app.show_bulk_menu {

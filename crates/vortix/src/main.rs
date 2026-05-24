@@ -281,7 +281,6 @@ fn prompt_migration(old_dir: &std::path::Path, new_dir: &std::path::Path) -> std
 }
 
 /// Runs the main TUI event loop.
-#[allow(clippy::too_many_lines)] // run_tui carries the whole TUI bootstrap + journal-subscriber + hook-dispatch wiring
 fn run_tui(
     mut terminal: ratatui::DefaultTerminal,
     config: config::AppConfig,
@@ -335,121 +334,16 @@ fn run_tui(
             // Plan 005 U7: spawn a journal-subscriber task that reacts
             // to engine events. Today it nudges the legacy telemetry
             // worker on `TunnelUp` so connect → IP-refresh happens
-            // promptly, and dispatches lifecycle hooks (plan 015 phase A)
-            // when the user has any configured.
+            // promptly. Future units route more flows through here.
             if let Some(j) = vortix_core::journal::global_journal() {
                 let mut rx = j.subscribe();
                 let nudge = app.engine.telemetry_nudge.clone();
-                // Build the hook registry from settings; empty when
-                // the user has no [[hooks]] entries (zero overhead).
-                // Settings are loaded again here because run_tui doesn't
-                // currently receive them as a parameter; reloading is
-                // cheap (figment caches nothing destructive) and
-                // future refactors can thread Settings through.
-                let hooks_config = vortix_config::Settings::load()
-                    .ok()
-                    .map(|s| s.hooks)
-                    .unwrap_or_default();
-                // Plan 017 U6: seed app.registered_hooks so the
-                // overlay can render the list at first open.
-                app.registered_hooks.clone_from(&hooks_config);
-                // Plan 016 U5: collect malformed [[hooks]] entries so
-                // we can toast them rather than only writing to stderr
-                // (which is invisible inside the TUI).
-                let (registry, hook_config_errors) =
-                    vortix::hooks::build_registry_from_config_collecting(&hooks_config);
-                let hooks = std::sync::Arc::new(registry);
-                let hooks_for_task = hooks.clone();
-                // Plan 016 U2: capture the TUI's command channel + the
-                // journal handle so the task can both record outcomes
-                // and push them into the TUI message loop.
-                app.registered_hooks_count = hooks.len();
-                let cmd_tx = app.engine.cmd_sender();
-                if !hook_config_errors.is_empty() {
-                    let _ = cmd_tx
-                        .send(vortix::message::Message::HookConfigErrors(
-                            hook_config_errors,
-                        ));
-                }
-                let journal = j.clone();
                 tokio::spawn(async move {
-                    use vortix_core::engine::hooks::LifecycleEvent;
-                    use vortix_core::engine::{EngineEvent, HookOutcomeRecord};
+                    use vortix_core::engine::EngineEvent;
                     while let Ok(envelope) = rx.recv().await {
                         if matches!(envelope.event, EngineEvent::TunnelUp { .. }) {
                             if let Some(n) = &nudge {
                                 let _ = n.send(());
-                            }
-                        }
-                        // Dispatch lifecycle hooks (skip the
-                        // event-to-LifecycleEvent mapping entirely
-                        // when no hooks are registered to keep the
-                        // hot path branch-free).
-                        if hooks_for_task.is_empty() {
-                            continue;
-                        }
-                        let lifecycle = match &envelope.event {
-                            EngineEvent::TunnelUp {
-                                profile_id,
-                                protocol,
-                                interface_name,
-                                ..
-                            } => Some(LifecycleEvent::PostConnect {
-                                profile_id: profile_id.clone(),
-                                protocol: *protocol,
-                                interface_name: interface_name.clone(),
-                            }),
-                            EngineEvent::TunnelDown { profile_id, .. } => {
-                                Some(LifecycleEvent::PostDisconnect {
-                                    profile_id: profile_id.clone(),
-                                })
-                            }
-                            EngineEvent::ConnectAttemptStarted {
-                                profile_id,
-                                protocol,
-                                ..
-                            } => Some(LifecycleEvent::PreConnect {
-                                profile_id: profile_id.clone(),
-                                protocol: *protocol,
-                            }),
-                            EngineEvent::ConnectAttemptFailed {
-                                profile_id, reason, ..
-                            } => Some(LifecycleEvent::ConnectFailed {
-                                profile_id: profile_id.clone(),
-                                reason: format!("{reason:?}"),
-                            }),
-                            EngineEvent::RetryScheduled {
-                                profile_id,
-                                next_attempt,
-                                ..
-                            } => Some(LifecycleEvent::Reconnecting {
-                                profile_id: profile_id.clone(),
-                                attempt: *next_attempt,
-                            }),
-                            _ => None,
-                        };
-                        if let Some(le) = lifecycle {
-                            let event_kind = le.kind_str().to_string();
-                            let outcomes = hooks_for_task.dispatch(&le).await;
-                            for (name, outcome) in outcomes {
-                                let record: HookOutcomeRecord = (&outcome).into();
-                                // Append to journal first — the JSONL
-                                // is the durable record; TUI delivery
-                                // is the live signal.
-                                let _ = journal.append(EngineEvent::HookOutcome {
-                                    hook_name: name.clone(),
-                                    event_kind: event_kind.clone(),
-                                    record: record.clone(),
-                                });
-                                let _ = cmd_tx.send(
-                                    vortix::message::Message::HookFired(
-                                        vortix::message::HookOutcomeReport {
-                                            hook_name: name,
-                                            event_kind: event_kind.clone(),
-                                            record,
-                                        },
-                                    ),
-                                );
                             }
                         }
                     }
