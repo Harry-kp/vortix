@@ -54,7 +54,11 @@ pub fn handle_command(
             mode,
         ),
         Commands::Import { file } => handle_import(file, mode),
-        Commands::Show { profile, raw } => handle_show(profile, *raw, config, config_dir, mode),
+        Commands::Show {
+            profile,
+            raw,
+            inline_secrets,
+        } => handle_show(profile, *raw, *inline_secrets, config, config_dir, mode),
         Commands::Delete { profile, yes } => handle_delete(profile, *yes, config, config_dir, mode),
         Commands::Rename { old, new } => handle_rename(old, new, config, config_dir, mode),
         Commands::KillSwitch { mode: ks_mode } => {
@@ -76,156 +80,12 @@ pub fn handle_command(
             super::report::run(config_dir, config_source);
             0
         }
-        Commands::Export {
-            profile,
-            inline_secrets,
-        } => handle_export(config_dir, profile, *inline_secrets, mode),
-        Commands::Engine { op } => handle_engine(op, config_dir, mode),
-        Commands::Migrate => handle_migrate(config_dir, mode),
         Commands::Secrets { op } => handle_secrets(op, config_dir, mode),
-        Commands::Settings => handle_settings(mode),
-        Commands::Journal { op } => handle_journal(op, mode),
         Commands::Completions { shell } => {
             handle_completions(*shell);
             0
         }
     }
-}
-
-#[derive(Serialize)]
-struct MigrateData {
-    created: u32,
-    already_migrated: u32,
-    failed: u32,
-    ignored: u32,
-}
-
-/// Manage `SecretStore` entries (plan 006 U3 surfacing).
-///
-/// Resolves the layered store (keyring first, encrypted-file fallback)
-/// using `<config_dir>/secrets.enc` as the encrypted-file location.
-/// Drive the plan-005 `EngineHandle` from the CLI (plan 005 U6).
-///
-/// Spins up a tokio runtime on demand, builds an `EngineHandle` rooted at
-/// `<config_dir>`, then awaits one command/query/snapshot. Output goes to
-/// stdout (JSON in `--json` mode) so it can be consumed by scripts.
-#[allow(clippy::too_many_lines)]
-fn handle_engine(op: &crate::cli::args::EngineOp, config_dir: &Path, mode: OutputMode) -> i32 {
-    use crate::cli::args::EngineOp;
-    use crate::state::Protocol;
-    use crate::tunnel::{tunnel_for_with_secrets, TunnelKind};
-    use vortix_config::profile_store::{FsProfileStore, ProfileStore};
-    use vortix_core::engine::{Engine, EngineHandle, UserCommand};
-    use vortix_core::journal::{Journal, JournalConfig};
-    use vortix_core::profile::{ProfileId, ProtocolKind};
-    use vortix_protocol_wireguard::WgTunnel;
-
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            eprintln!("failed to build runtime: {e}");
-            return 1;
-        }
-    };
-
-    let profiles_dir = config_dir.join(constants::PROFILES_DIR_NAME);
-    let _runtime_guard = runtime.enter();
-    let journal = match Journal::open(JournalConfig {
-        disk: false, // CLI session — in-memory journal is enough
-        ..Default::default()
-    }) {
-        Ok(j) => j,
-        Err(e) => {
-            eprintln!("journal open failed: {e}");
-            return 1;
-        }
-    };
-
-    let resolver_dir = profiles_dir.clone();
-    let resolver = move |id: &ProfileId| FsProfileStore::new(resolver_dir.clone()).get(id).ok();
-
-    let factory_dir = config_dir.to_path_buf();
-    let factory = move |profile: &vortix_core::profile::Profile| {
-        let proto = match profile.protocol {
-            ProtocolKind::OpenVpn => Protocol::OpenVPN,
-            _ => Protocol::WireGuard,
-        };
-        tunnel_for_with_secrets(proto, &factory_dir, "3", 30)
-    };
-
-    let initial_tunnel = TunnelKind::WireGuard(WgTunnel::new());
-    let engine = Engine::new(initial_tunnel, resolver).with_tunnel_factory(factory);
-    let handle = runtime.block_on(async { EngineHandle::local(engine, journal) });
-
-    runtime.block_on(async {
-        match op {
-            EngineOp::Status => {
-                let snap = match handle.snapshot().await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("snapshot failed: {e}");
-                        return 1;
-                    }
-                };
-                match mode {
-                    OutputMode::Json => {
-                        print_success(mode, "engine status", &snap.state, vec![]);
-                    }
-                    _ => println!("{:?}", snap.state),
-                }
-                0
-            }
-            EngineOp::Connect { profile } => {
-                // Resolve via FsProfileStore so both display_name and
-                // profile_id forms work.
-                let store = FsProfileStore::new(profiles_dir.clone());
-                let Some(id) = store.list().ok().and_then(|list| {
-                    list.into_iter()
-                        .find(|s| {
-                            s.id.as_str() == profile || s.display_name.as_str() == profile.as_str()
-                        })
-                        .map(|s| s.id)
-                }) else {
-                    eprintln!("profile '{profile}' not found");
-                    return 1;
-                };
-                match handle
-                    .execute_command(UserCommand::Connect { profile_id: id })
-                    .await
-                {
-                    Ok(ack) => {
-                        if matches!(mode, OutputMode::Human) {
-                            println!("Connect dispatched ({} events emitted)", ack.events_emitted);
-                        }
-                        0
-                    }
-                    Err(e) => {
-                        eprintln!("connect failed: {e}");
-                        1
-                    }
-                }
-            }
-            EngineOp::Disconnect => match handle.execute_command(UserCommand::Disconnect).await {
-                Ok(ack) => {
-                    if matches!(mode, OutputMode::Human) {
-                        println!(
-                            "Disconnect dispatched ({} events emitted)",
-                            ack.events_emitted
-                        );
-                    }
-                    0
-                }
-                Err(e) => {
-                    eprintln!("disconnect failed: {e}");
-                    1
-                }
-            },
-        }
-    })
 }
 
 fn parse_secret_backend(s: Option<&String>) -> vortix_config::secret_store::SecretBackendTag {
@@ -316,188 +176,6 @@ fn handle_secrets(op: &crate::cli::args::SecretsOp, config_dir: &Path, mode: Out
     }
 }
 
-/// Explicit profile-sidecar migration (plan 006 U4). Same logic as the
-/// implicit startup pass; surfacing it here lets users see the stats.
-fn handle_migrate(config_dir: &Path, mode: OutputMode) -> i32 {
-    let profiles_dir = config_dir.join(constants::PROFILES_DIR_NAME);
-    let stats = match vortix_config::migrate_legacy_profiles(&profiles_dir) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("migration failed: {e}");
-            return 1;
-        }
-    };
-
-    let data = MigrateData {
-        created: stats.created,
-        already_migrated: stats.already_migrated,
-        failed: stats.failed,
-        ignored: stats.ignored,
-    };
-
-    match mode {
-        OutputMode::Json => {
-            print_success(mode, "migrate", &data, vec![]);
-            0
-        }
-        OutputMode::Quiet => 0,
-        OutputMode::Human => {
-            println!("Profile sidecar migration:");
-            println!("  Created:           {}", data.created);
-            println!("  Already migrated:  {}", data.already_migrated);
-            println!("  Ignored:           {}", data.ignored);
-            if data.failed > 0 {
-                println!("  Failed:            {}", data.failed);
-            }
-            0
-        }
-    }
-}
-
-/// Print the figment-resolved Settings stack (plan 006 U1).
-fn handle_settings(mode: OutputMode) -> i32 {
-    let settings = match vortix_config::Settings::load() {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("settings load failed: {e}");
-            return 1;
-        }
-    };
-
-    match mode {
-        OutputMode::Json => {
-            print_success(mode, "settings", &settings, vec![]);
-            0
-        }
-        OutputMode::Human | OutputMode::Quiet => match toml::to_string_pretty(&settings) {
-            Ok(t) => {
-                print!("{t}");
-                0
-            }
-            Err(e) => {
-                eprintln!("serialize failed: {e}");
-                1
-            }
-        },
-    }
-}
-
-/// Inspect the engine event journal.
-fn handle_journal(op: &crate::cli::args::JournalOp, _mode: OutputMode) -> i32 {
-    use crate::cli::args::JournalOp;
-
-    let Some(journal) = vortix_core::journal::global_journal() else {
-        eprintln!("journal not installed (no tokio runtime or `[journal] disk = false` not yet supported here)");
-        return 1;
-    };
-
-    match op {
-        JournalOp::Path => {
-            if let Some(path) = &journal.session_path {
-                println!("{}", path.display());
-                0
-            } else {
-                eprintln!("disk persistence disabled (`[journal] disk = false`)");
-                1
-            }
-        }
-        JournalOp::Tail { count } => {
-            let tail = journal.tail();
-            let start = tail.len().saturating_sub(*count);
-            for env in &tail[start..] {
-                if let Ok(line) = serde_json::to_string(env) {
-                    println!("{line}");
-                }
-            }
-            0
-        }
-    }
-}
-
-/// Read a profile's raw config bytes and stream them to stdout.
-///
-/// Today this is a thin wrapper over the existing profiles dir + on-disk
-/// `.conf` / `.ovpn` files. Once plan 006 U4 lands the sidecar migration
-/// and U5 the `SecretStore` integration, this respects `--inline-secrets`
-/// by materialising stored credentials into the output.
-fn handle_export(
-    config_dir: &Path,
-    profile_name: &str,
-    inline_secrets: bool,
-    mode: OutputMode,
-) -> i32 {
-    use std::io::Write;
-    use vortix_config::profile_store::{FsProfileStore, ProfileStore};
-    use vortix_core::profile::ProfileId;
-
-    let store = FsProfileStore::new(config_dir.join(constants::PROFILES_DIR_NAME));
-
-    // Profiles today are keyed by display_name on disk (no sidecars yet);
-    // try both the new id-based lookup and the legacy name-based path.
-    let resolved = store.list().ok().and_then(|list| {
-        list.into_iter()
-            .find(|p| p.id.as_str() == profile_name || p.display_name == profile_name)
-    });
-
-    let raw = if let Some(summary) = resolved {
-        match store.get(&summary.id) {
-            Ok(profile) => std::fs::read(&profile.config_path).ok(),
-            Err(_) => None,
-        }
-    } else {
-        // Legacy fallback: glob the profiles dir for a matching name.
-        legacy_profile_bytes(&config_dir.join(constants::PROFILES_DIR_NAME), profile_name)
-    };
-
-    let Some(bytes) = raw else {
-        use crate::cli::output::{CliError, ExitCode};
-        print_error_and_exit(
-            mode,
-            "export",
-            CliError {
-                code: "ProfileNotFound",
-                message: format!("profile '{profile_name}' not found"),
-                hint: Some("List available profiles with: vortix list".to_string()),
-            },
-            ExitCode::NotFound,
-        );
-    };
-
-    // --inline-secrets: plan 006 U5 — try to materialise SecretStore auth
-    // bytes into the exported payload as a trailing `# vortix-secret:<b64>`
-    // comment. Consumers (peer installs) can re-store these via
-    // `vortix secrets set creds/<profile>`. Best-effort: missing
-    // secret-store is a non-fatal warning.
-    let _ = ProfileId::new(profile_name); // touch import for future use
-    let mut payload = bytes;
-    if inline_secrets {
-        let secret_id = format!("creds/{profile_name}");
-        match try_export_secret(config_dir, &secret_id) {
-            Ok(Some(secret_bytes)) => {
-                use base64::Engine as _;
-                let b64 = base64::engine::general_purpose::STANDARD.encode(&secret_bytes);
-                payload.extend_from_slice(b"\n# vortix-secret:");
-                payload.extend_from_slice(b64.as_bytes());
-                payload.push(b'\n');
-                eprintln!(
-                    "# vortix: inlined secret '{secret_id}' as a trailing comment ({} bytes base64)",
-                    b64.len()
-                );
-            }
-            Ok(None) => {
-                eprintln!("# vortix: --inline-secrets: no secret stored at '{secret_id}'");
-            }
-            Err(e) => {
-                eprintln!("# vortix: --inline-secrets: secret store unavailable ({e})");
-            }
-        }
-    }
-
-    let _ = std::io::stdout().write_all(&payload);
-    let _ = mode;
-    0
-}
-
 /// Pull `id` from the configured `LayeredSecretStore`. Returns `Ok(None)`
 /// when the entry is missing; `Err` when the store itself is unavailable.
 fn try_export_secret(
@@ -522,16 +200,6 @@ fn try_export_secret(
         }
     }
     Ok(None)
-}
-
-fn legacy_profile_bytes(profiles_dir: &Path, profile_name: &str) -> Option<Vec<u8>> {
-    for ext in ["conf", "ovpn"] {
-        let candidate = profiles_dir.join(format!("{profile_name}.{ext}"));
-        if candidate.is_file() {
-            return std::fs::read(&candidate).ok();
-        }
-    }
-    None
 }
 
 // ── Connection ──────────────────────────────────────────────────────────
@@ -1489,6 +1157,7 @@ struct ShowData {
 fn handle_show(
     profile_name: &str,
     raw: bool,
+    inline_secrets: bool,
     config: &AppConfig,
     config_dir: &Path,
     mode: OutputMode,
@@ -1505,7 +1174,42 @@ fn handle_show(
 
     let raw_content = if raw {
         match std::fs::read_to_string(&profile.config_path) {
-            Ok(content) => Some(content),
+            Ok(mut content) => {
+                // --inline-secrets: previously the responsibility of `vortix
+                // export`. Folded into `show --raw` per the v0.3.0 CLI
+                // surface cleanup. Appends a `# vortix-secret:<base64>`
+                // trailing comment when a stored credential exists for the
+                // profile. Missing-store / missing-secret cases warn on
+                // stderr but don't fail the call.
+                if inline_secrets {
+                    let secret_id = format!("creds/{}", profile.name);
+                    match try_export_secret(config_dir, &secret_id) {
+                        Ok(Some(bytes)) => {
+                            use base64::Engine as _;
+                            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                            if !content.ends_with('\n') {
+                                content.push('\n');
+                            }
+                            content.push_str("# vortix-secret:");
+                            content.push_str(&b64);
+                            content.push('\n');
+                            eprintln!(
+                                "# vortix: inlined secret '{secret_id}' as a trailing comment ({} bytes base64)",
+                                b64.len()
+                            );
+                        }
+                        Ok(None) => {
+                            eprintln!(
+                                "# vortix: --inline-secrets: no secret stored at '{secret_id}'"
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("# vortix: --inline-secrets: secret store unavailable ({e})");
+                        }
+                    }
+                }
+                Some(content)
+            }
             Err(e) => {
                 print_error_and_exit(
                     mode,
@@ -1849,6 +1553,11 @@ struct InfoData {
     wireguard_count: u32,
     openvpn_count: u32,
     is_root: bool,
+    /// Path of the current session's JSONL journal file, or `None`
+    /// when disk persistence is disabled (`[journal] disk = false` in
+    /// settings.toml) or the journal isn't installed in this process.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    journal_session: Option<String>,
 }
 
 fn handle_info(config_dir: &Path, source: &str, mode: OutputMode) {
@@ -1863,6 +1572,12 @@ fn handle_info(config_dir: &Path, source: &str, mode: OutputMode) {
         "defaults"
     };
 
+    // Session-journal path (plan 005). Folded into `vortix info` as part
+    // of the v0.3.0 CLI surface cleanup — `vortix journal path` was
+    // dropped in favour of surfacing the path here.
+    let journal_session = vortix_core::journal::global_journal()
+        .and_then(|j| j.session_path.as_ref().map(|p| p.display().to_string()));
+
     let data = InfoData {
         version: env!("CARGO_PKG_VERSION").to_string(),
         config_dir: config_dir.to_string_lossy().to_string(),
@@ -1873,6 +1588,7 @@ fn handle_info(config_dir: &Path, source: &str, mode: OutputMode) {
         wireguard_count: wg_count,
         openvpn_count: ovpn_count,
         is_root: crate::utils::is_root(),
+        journal_session: journal_session.clone(),
     };
 
     match mode {
@@ -1887,6 +1603,10 @@ fn handle_info(config_dir: &Path, source: &str, mode: OutputMode) {
                 "  Logs at:     {}",
                 config_dir.join(constants::LOGS_DIR_NAME).display()
             );
+            match &journal_session {
+                Some(path) => println!("  Session journal: {path}"),
+                None => println!("  Session journal: (disk persistence disabled)"),
+            }
         }
         OutputMode::Json => print_success(
             mode,

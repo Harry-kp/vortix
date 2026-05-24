@@ -136,6 +136,39 @@ now carries every planned unit:
   now runs inside the tokio runtime context so the writer task spawn
   no longer panics on `vortix engine status` invocations.
 
+## CLI surface revised before ship
+
+A pre-ship re-audit (brainstorm:
+[`docs/brainstorms/2026-05-24-cli-surface-cleanup-requirements.md`](brainstorms/2026-05-24-cli-surface-cleanup-requirements.md))
+applied a stricter test to the six new subcommands introduced during
+plans 005 and 006: *does this earn a top-level slot in the CLI
+namespace?* Five didn't.
+
+**Removed before v0.3.0 ship:**
+
+- `vortix engine {status,connect,disconnect}` — pure duplicate of
+  `up`/`down`/`status`, never released, no installed base
+- `vortix journal {path,tail}` — folded; the session path now surfaces
+  via `vortix info` output, tailing happens via shell tools
+- `vortix settings` — dropped; the resolved figment stack is rare
+  diagnostic surface, users read their own `settings.toml`
+- `vortix migrate` — dropped; backfill runs at startup, re-trigger is
+  restart-vortix
+- `vortix export <p> [--inline-secrets]` — folded; the
+  `--inline-secrets` flag moved onto `vortix show <p> --raw`
+
+**Surviving new top-level subcommand:**
+
+- `vortix secrets {set,get,delete}` — earns its slot. Real new noun,
+  recurring user workflow.
+
+**Underlying architecture is unchanged.** `EngineHandle`, `Engine<T>`,
+`Connection` FSM, `Journal`, `EventEnvelope`, `Settings`,
+`migrate_legacy_profiles`, the secret-inlining writer — every line of
+code the removed subcommands exercised stays in place and is used
+internally (and by future plans 009–013). Only the user-facing CLI
+verbs were collapsed.
+
 ## CI gates currently enforced
 
 ```

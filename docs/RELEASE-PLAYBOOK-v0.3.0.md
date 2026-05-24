@@ -74,11 +74,11 @@ export XDG_CONFIG_HOME=$PWD/config XDG_DATA_HOME=$PWD/data
 mkdir -p $XDG_CONFIG_HOME/vortix/profiles
 echo "[Interface]" > $XDG_CONFIG_HOME/vortix/profiles/test.conf
 
-vortix migrate                          # expect: Created: 1
+# Startup auto-migration runs implicitly — log "Migrated 1 profile(s)…"
+vortix info                             # expect: 1 profile + Session journal path
 ls $XDG_CONFIG_HOME/vortix/profiles/    # expect: test.conf + test.meta.toml
-vortix settings                         # expect: TOML, journal.disk = true
-vortix engine status                    # expect: Disconnected { last_failure: None }
-vortix journal path                     # expect: path under sessions/
+vortix status --brief                   # expect: disconnected (no panic)
+vortix show test --raw --inline-secrets # expect: file contents (no stored secret note)
 
 # Env override
 VORTIX_SKIP_MIGRATION=1 vortix status   # expect: log line about skip
@@ -233,8 +233,8 @@ a 5–7 day soak across as many Linux distros as possible.
 
 ## What changed
 
-Engine FSM + session journal, encrypted secret store, six new CLI
-subcommands. Existing commands (`up`, `down`, `status`, `list`, `import`,
+Engine FSM (internal) + session journal, encrypted secret store. One
+new top-level subcommand (`vortix secrets`); existing CLI unchanged. Existing commands (`up`, `down`, `status`, `list`, `import`,
 `killswitch`, …) unchanged. Full details:
 
 - [Release notes](https://github.com/Harry-kp/vortix/blob/main/docs/v0.3.0-RELEASE-NOTES.md) — 60s read
@@ -260,11 +260,12 @@ cargo install vortix --version 0.3.0-rc.1
    ```sh
    bash <(curl -sL https://raw.githubusercontent.com/Harry-kp/vortix/main/scripts/smoke-v0.3.0.sh) 0.3.0-rc.1
    ```
-   Expect ~11 PASS, 0 FAIL, ≤1 SKIP.
+   Expect ~10 PASS, 0 FAIL, ≤1 SKIP.
 2. Connect to your usual VPN profile and confirm `up`, `status`, `down`
    work as on v0.2.x.
-3. Try the new commands: `vortix engine status`, `vortix journal path`,
-   `vortix settings`. None should panic.
+3. Try the new bits: `vortix info` should show a `Session journal:`
+   line, and `vortix secrets set creds/test` should accept a secret
+   from stdin without panicking.
 4. Skim the [FAQ](https://github.com/Harry-kp/vortix/blob/main/docs/v0.3.0-FAQ.md)
    — anything that surprises you is worth raising here.
 
@@ -453,7 +454,7 @@ which vortix                                        # confirm path
 bash scripts/smoke-v0.3.0.sh 0.3.0
 ```
 
-Expect **11 PASS, 0 FAIL, 1 SKIP**.
+Expect **10 PASS, 0 FAIL, 1 SKIP**.
 
 ---
 
@@ -537,7 +538,7 @@ Body:
 Vortix is a terminal UI for managing WireGuard and OpenVPN with live
 telemetry, killswitch, and IPv6/DNS leak detection. v0.3.0 just shipped
 after an architectural migration — Engine FSM, JSONL session journal,
-encrypted secret store, six new additive CLI subcommands.
+encrypted secret store, one new additive subcommand (`vortix secrets`).
 
 Background: I built this because the existing options (wg show,
 NetworkManager, Tunnelblick) either lacked real-time telemetry or
@@ -678,7 +679,7 @@ gh issue close 31 --comment "The new Engine FSM in v0.3.0 treats \`Connecting\` 
 ```sh
 gh issue comment 161 --body "v0.3.0 ships the FSM slot for this — \`Connected { health: HealthState }\` is in \`crates/vortix-core/src/engine/state.rs\`. Remaining work is wiring telemetry to populate \`health\` (handshake age, RX/TX deltas) from the existing \`NetworkStats\` capability. Good follow-up for v0.3.x."
 
-gh issue comment 171 --body "Data model now exists: \`\${XDG_DATA_HOME}/vortix/sessions/*.jsonl\` with 30-day/30-file retention. \`vortix journal tail\` surfaces it. Remaining work is a TUI view that reads multiple sessions. Tagging as good-first-issue post-v0.3.0."
+gh issue comment 171 --body "Data model now exists: \`\${XDG_DATA_HOME}/vortix/sessions/*.jsonl\` with 30-day/30-file retention. The path is surfaced via \`vortix info\`; users tail it with \`tail -f\` + \`jq\`. Remaining work is a TUI view that reads multiple sessions. Tagging as good-first-issue post-v0.3.0."
 
 gh issue comment 190 --body "DNS port abstraction now exists (\`vortix-core::ports::dns::DnsResolver\`). Adding a \`networkd\`/\`resolved\` backend means a new impl under \`crates/vortix-platform-linux/\`. Significantly easier to land post-v0.3.0 than before."
 
