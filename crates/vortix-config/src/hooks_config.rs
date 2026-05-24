@@ -68,6 +68,90 @@ impl HookConfig {
     }
 }
 
+/// Mutable view of the `[[hooks]]` array used by the TUI's hook
+/// management surface (plan 017 U3). A thin newtype over
+/// `Vec<HookConfig>` so the four CRUD ops carry a shared invariant
+/// home and aren't sprinkled across the binary crate as free
+/// functions on `Vec`.
+#[derive(Debug, Clone, Default)]
+pub struct HooksList(Vec<HookConfig>);
+
+impl HooksList {
+    /// Build from an existing `Vec<HookConfig>` (typically
+    /// `Settings::load().hooks`).
+    #[must_use]
+    pub fn new(hooks: Vec<HookConfig>) -> Self {
+        Self(hooks)
+    }
+
+    /// Borrow the underlying slice for read-only access (UI rendering,
+    /// passing to the writer).
+    #[must_use]
+    pub fn as_slice(&self) -> &[HookConfig] {
+        &self.0
+    }
+
+    /// Total entry count (including disabled).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// True when no entries.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Borrow one entry by index.
+    #[must_use]
+    pub fn get(&self, idx: usize) -> Option<&HookConfig> {
+        self.0.get(idx)
+    }
+
+    /// Append a new entry.
+    pub fn add(&mut self, cfg: HookConfig) {
+        self.0.push(cfg);
+    }
+
+    /// Replace the entry at `idx`. Returns the old entry on success,
+    /// `None` when `idx` is out of bounds (list unchanged).
+    pub fn replace(&mut self, idx: usize, cfg: HookConfig) -> Option<HookConfig> {
+        if idx >= self.0.len() {
+            return None;
+        }
+        Some(std::mem::replace(&mut self.0[idx], cfg))
+    }
+
+    /// Remove and return the entry at `idx`. `None` when out of
+    /// bounds (list unchanged).
+    pub fn remove(&mut self, idx: usize) -> Option<HookConfig> {
+        if idx >= self.0.len() {
+            return None;
+        }
+        Some(self.0.remove(idx))
+    }
+
+    /// Flip the `enabled` field for the entry at `idx`. `None`
+    /// (absent) → `Some(false)`; `Some(true)` → `Some(false)`;
+    /// `Some(false)` → `Some(true)`. Returns the new effective state
+    /// (`is_enabled()` after toggle) or `false` when out of bounds.
+    pub fn toggle(&mut self, idx: usize) -> bool {
+        let Some(entry) = self.0.get_mut(idx) else {
+            return false;
+        };
+        let new_state = !entry.is_enabled();
+        entry.enabled = Some(new_state);
+        new_state
+    }
+
+    /// Consume into the inner `Vec` (for the writer's slice).
+    #[must_use]
+    pub fn into_inner(self) -> Vec<HookConfig> {
+        self.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,6 +201,102 @@ mod tests {
     #[derive(Deserialize)]
     struct Wrapper {
         hooks: Vec<HookConfig>,
+    }
+
+    // Plan 017 U3 — HooksList mutation API.
+
+    fn cfg(event: &str, enabled: Option<bool>) -> HookConfig {
+        HookConfig {
+            event: event.into(),
+            command: vec!["true".into()],
+            timeout_secs: 5,
+            env: HashMap::new(),
+            enabled,
+        }
+    }
+
+    #[test]
+    fn add_appends_a_new_entry() {
+        let mut list = HooksList::default();
+        list.add(cfg("post_connect", None));
+        assert_eq!(list.len(), 1);
+        list.add(cfg("post_disconnect", None));
+        assert_eq!(list.len(), 2);
+        assert_eq!(list.get(0).unwrap().event, "post_connect");
+        assert_eq!(list.get(1).unwrap().event, "post_disconnect");
+    }
+
+    #[test]
+    fn replace_at_valid_index_returns_old_entry() {
+        let mut list = HooksList::new(vec![
+            cfg("post_connect", None),
+            cfg("post_disconnect", None),
+        ]);
+        let old = list.replace(0, cfg("connect_failed", Some(false))).unwrap();
+        assert_eq!(old.event, "post_connect");
+        assert_eq!(list.get(0).unwrap().event, "connect_failed");
+        assert_eq!(list.get(0).unwrap().enabled, Some(false));
+        assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn replace_out_of_bounds_returns_none_no_change() {
+        let mut list = HooksList::new(vec![cfg("post_connect", None)]);
+        let result = list.replace(99, cfg("connect_failed", None));
+        assert!(result.is_none());
+        assert_eq!(list.len(), 1);
+        assert_eq!(list.get(0).unwrap().event, "post_connect");
+    }
+
+    #[test]
+    fn remove_at_valid_index_shrinks_list() {
+        let mut list = HooksList::new(vec![
+            cfg("a", None),
+            cfg("b", None),
+            cfg("c", None),
+        ]);
+        let removed = list.remove(1).unwrap();
+        assert_eq!(removed.event, "b");
+        assert_eq!(list.len(), 2);
+        assert_eq!(list.get(0).unwrap().event, "a");
+        assert_eq!(list.get(1).unwrap().event, "c");
+    }
+
+    #[test]
+    fn remove_out_of_bounds_returns_none_no_change() {
+        let mut list = HooksList::new(vec![cfg("a", None)]);
+        let result = list.remove(99);
+        assert!(result.is_none());
+        assert_eq!(list.len(), 1);
+    }
+
+    #[test]
+    fn toggle_from_none_becomes_some_false_and_returns_false() {
+        let mut list = HooksList::new(vec![cfg("a", None)]);
+        let new_state = list.toggle(0);
+        assert!(!new_state);
+        assert_eq!(list.get(0).unwrap().enabled, Some(false));
+    }
+
+    #[test]
+    fn toggle_from_some_true_becomes_some_false() {
+        let mut list = HooksList::new(vec![cfg("a", Some(true))]);
+        assert!(!list.toggle(0));
+        assert_eq!(list.get(0).unwrap().enabled, Some(false));
+    }
+
+    #[test]
+    fn toggle_from_some_false_becomes_some_true_and_returns_true() {
+        let mut list = HooksList::new(vec![cfg("a", Some(false))]);
+        assert!(list.toggle(0));
+        assert_eq!(list.get(0).unwrap().enabled, Some(true));
+    }
+
+    #[test]
+    fn toggle_out_of_bounds_is_a_noop_returns_false() {
+        let mut list = HooksList::new(vec![cfg("a", Some(true))]);
+        assert!(!list.toggle(99));
+        assert_eq!(list.get(0).unwrap().enabled, Some(true));
     }
 
     // Plan 017 U1 — enabled field semantics.
