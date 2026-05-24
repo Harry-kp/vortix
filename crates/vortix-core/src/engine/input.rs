@@ -10,7 +10,9 @@ use crate::profile::ProfileId;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum UserCommand {
-    Connect { profile_id: ProfileId },
+    Connect {
+        profile_id: ProfileId,
+    },
     Disconnect,
     Reconnect,
     ForceDisconnect,
@@ -19,7 +21,10 @@ pub enum UserCommand {
     /// v0.3.0. `prompt_id` matches the value emitted on the prompt
     /// event so the FSM can correlate the answer with the right
     /// outstanding prompt.
-    UserAnswered { prompt_id: String, answer: String },
+    UserAnswered {
+        prompt_id: String,
+        answer: String,
+    },
 }
 
 /// Network link state (default gateway availability).

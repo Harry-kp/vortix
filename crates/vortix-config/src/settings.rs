@@ -320,7 +320,11 @@ disk = false
     fn explicit_schema_version_one_loads_cleanly() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("v1.toml");
-        fs::write(&path, "schema_version = 1\n[engine]\nretry_budget_secs = 90\n").unwrap();
+        fs::write(
+            &path,
+            "schema_version = 1\n[engine]\nretry_budget_secs = 90\n",
+        )
+        .unwrap();
         let s = Settings::load_from(None, Some(&path)).unwrap();
         assert_eq!(s.schema_version, 1);
         assert_eq!(s.engine.retry_budget_secs, 90);

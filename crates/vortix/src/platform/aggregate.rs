@@ -22,6 +22,8 @@ use vortix_core::ports::killswitch::{KillswitchError, Result as KsResult};
 use vortix_platform_linux as platform_impl;
 #[cfg(target_os = "macos")]
 use vortix_platform_macos as platform_impl;
+#[cfg(target_os = "windows")]
+use vortix_platform_windows as platform_impl;
 
 // ───────────────────────────────────────────────────────────────────────────
 // Mock state shells
@@ -138,6 +140,8 @@ pub enum KillswitchKind {
     Macos,
     #[cfg(target_os = "linux")]
     Linux,
+    #[cfg(target_os = "windows")]
+    Windows,
     Mock(MockKillswitch),
 }
 
@@ -164,6 +168,10 @@ impl KillswitchKind {
             Self::Linux => {
                 platform_impl::IptablesFirewall::enable_blocking(vpn_interface, vpn_server_ip)
             }
+            #[cfg(target_os = "windows")]
+            Self::Windows => {
+                platform_impl::WindowsFirewall::enable_blocking(vpn_interface, vpn_server_ip)
+            }
             Self::Mock(m) => m.enable_blocking(vpn_interface, vpn_server_ip),
         }
     }
@@ -184,6 +192,8 @@ impl KillswitchKind {
             Self::Macos => platform_impl::PfFirewall::disable_blocking(),
             #[cfg(target_os = "linux")]
             Self::Linux => platform_impl::IptablesFirewall::disable_blocking(),
+            #[cfg(target_os = "windows")]
+            Self::Windows => platform_impl::WindowsFirewall::disable_blocking(),
             Self::Mock(m) => m.disable_blocking(),
         }
     }
@@ -197,6 +207,8 @@ pub enum DnsResolverKind {
     Macos,
     #[cfg(target_os = "linux")]
     Linux,
+    #[cfg(target_os = "windows")]
+    Windows,
     Mock(MockDns),
 }
 
@@ -210,6 +222,8 @@ impl DnsResolverKind {
             Self::Macos => platform_impl::MacDns::get_dns_server(),
             #[cfg(target_os = "linux")]
             Self::Linux => platform_impl::LinuxDns::get_dns_server(),
+            #[cfg(target_os = "windows")]
+            Self::Windows => platform_impl::WindowsDns::get_dns_server(),
             Self::Mock(m) => m.dns.clone(),
         }
     }
@@ -223,6 +237,8 @@ pub enum InterfaceKind {
     Macos,
     #[cfg(target_os = "linux")]
     Linux,
+    #[cfg(target_os = "windows")]
+    Windows,
     Mock(MockInterface),
 }
 
@@ -236,6 +252,8 @@ impl InterfaceKind {
             Self::Macos => platform_impl::MacInterface::check_wireguard_interface(name),
             #[cfg(target_os = "linux")]
             Self::Linux => platform_impl::LinuxInterface::check_wireguard_interface(name),
+            #[cfg(target_os = "windows")]
+            Self::Windows => platform_impl::WindowsInterface::check_wireguard_interface(name),
             Self::Mock(m) => m.wg_present,
         }
     }
@@ -249,6 +267,8 @@ impl InterfaceKind {
             Self::Macos => platform_impl::MacInterface::resolve_wireguard_interface(name),
             #[cfg(target_os = "linux")]
             Self::Linux => platform_impl::LinuxInterface::resolve_wireguard_interface(name),
+            #[cfg(target_os = "windows")]
+            Self::Windows => platform_impl::WindowsInterface::resolve_wireguard_interface(name),
             Self::Mock(m) => {
                 if m.wg_present {
                     Some(name.to_string())
@@ -268,6 +288,8 @@ impl InterfaceKind {
             Self::Macos => platform_impl::MacInterface::get_wireguard_pid(interface),
             #[cfg(target_os = "linux")]
             Self::Linux => platform_impl::LinuxInterface::get_wireguard_pid(interface),
+            #[cfg(target_os = "windows")]
+            Self::Windows => platform_impl::WindowsInterface::get_wireguard_pid(interface),
             Self::Mock(_) => None,
         }
     }
@@ -281,6 +303,8 @@ impl InterfaceKind {
             Self::Macos => platform_impl::MacInterface::get_interface_info(interface),
             #[cfg(target_os = "linux")]
             Self::Linux => platform_impl::LinuxInterface::get_interface_info(interface),
+            #[cfg(target_os = "windows")]
+            Self::Windows => platform_impl::WindowsInterface::get_interface_info(interface),
             Self::Mock(_) => (String::new(), String::new()),
         }
     }
@@ -294,6 +318,8 @@ pub enum NetworkStatsKind {
     Macos,
     #[cfg(target_os = "linux")]
     Linux,
+    #[cfg(target_os = "windows")]
+    Windows,
     Mock(MockNetworkStats),
 }
 
@@ -307,6 +333,8 @@ impl NetworkStatsKind {
             Self::Macos => platform_impl::MacNetworkStats::get_total_bytes(),
             #[cfg(target_os = "linux")]
             Self::Linux => platform_impl::LinuxNetworkStats::get_total_bytes(),
+            #[cfg(target_os = "windows")]
+            Self::Windows => platform_impl::WindowsNetworkStats::get_total_bytes(),
             Self::Mock(m) => (m.bytes_in, m.bytes_out),
         }
     }
@@ -320,6 +348,8 @@ pub enum RouteTableKind {
     Macos,
     #[cfg(target_os = "linux")]
     Linux,
+    #[cfg(target_os = "windows")]
+    Windows,
     Mock(MockRouteTable),
 }
 
@@ -333,6 +363,8 @@ impl RouteTableKind {
             Self::Macos => platform_impl::MacRouteTable::default_gateway(),
             #[cfg(target_os = "linux")]
             Self::Linux => platform_impl::LinuxRouteTable::default_gateway(),
+            #[cfg(target_os = "windows")]
+            Self::Windows => platform_impl::WindowsRouteTable::default_gateway(),
             Self::Mock(m) => m.gateway.clone(),
         }
     }
@@ -382,6 +414,16 @@ impl Platform {
                 interface: InterfaceKind::Linux,
                 network_stats: NetworkStatsKind::Linux,
                 route_table: RouteTableKind::Linux,
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            Self {
+                killswitch: KillswitchKind::Windows,
+                dns: DnsResolverKind::Windows,
+                interface: InterfaceKind::Windows,
+                network_stats: NetworkStatsKind::Windows,
+                route_table: RouteTableKind::Windows,
             }
         }
     }
