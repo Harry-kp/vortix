@@ -33,6 +33,24 @@ pub const DEFAULT_RETENTION_COUNT: u32 = 30;
 pub const DEFAULT_BROADCAST_CAPACITY: usize = 1024;
 pub const DEFAULT_TAIL_BUFFER_CAPACITY: usize = 1000;
 
+// ───────────────────────────────────────────────────────────────────────────
+// Process-global journal — installed by `main.rs`, read by bug-report and
+// future EngineHandle integrations.
+// ───────────────────────────────────────────────────────────────────────────
+
+static GLOBAL_JOURNAL: std::sync::OnceLock<Journal> = std::sync::OnceLock::new();
+
+/// Install the process-wide journal. First call wins.
+pub fn set_global_journal(journal: Journal) {
+    let _ = GLOBAL_JOURNAL.set(journal);
+}
+
+/// Get the process-wide journal, if installed.
+#[must_use]
+pub fn global_journal() -> Option<&'static Journal> {
+    GLOBAL_JOURNAL.get()
+}
+
 /// Journal configuration knobs.
 #[derive(Debug, Clone)]
 pub struct JournalConfig {

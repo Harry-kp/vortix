@@ -72,6 +72,19 @@ impl CommandRunner {
         Self::Real(RealRunner::new())
     }
 
+    /// Borrow the production runner variant, if this enum is `Real`.
+    ///
+    /// Returns `None` for the `Mock` variant. Used by `main.rs` to grab the
+    /// bundled tokio runtime handle for spawning auxiliary tasks (plan 005
+    /// journal writer).
+    #[must_use]
+    pub fn as_real(&self) -> Option<&RealRunner> {
+        match self {
+            Self::Real(r) => Some(r),
+            Self::Mock(_) => None,
+        }
+    }
+
     /// Construct a mock runner that succeeds at every call.
     #[must_use]
     pub fn mock_default_success() -> Self {

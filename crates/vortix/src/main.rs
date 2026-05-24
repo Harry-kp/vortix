@@ -5,6 +5,7 @@ use event::{Event, EventHandler};
 use vortix::app::App;
 use vortix::{cli, config, constants, event, ui};
 
+#[allow(clippy::too_many_lines)] // main() carries the whole bootstrap sequence
 fn main() -> Result<()> {
     // Initialize error handling first — color_eyre::install() sets its own
     // panic hook, so we must call it before installing ours.
@@ -20,6 +21,41 @@ fn main() -> Result<()> {
     // consumers reach for `crate::platform::current_platform()` instead of
     // branching on `cfg(target_os)`.
     vortix::platform::set_global_platform(vortix::platform::Platform::detect_current());
+
+    // Settings (plan 006 U7) — figment-layered: defaults → user file →
+    // VORTIX_* env. CLI overrides currently bypass settings.
+    let settings = match vortix_config::Settings::load() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("warning: failed to load settings ({e}); using defaults");
+            vortix_config::Settings::default()
+        }
+    };
+
+    // Journal (plan 005 U8 prep) — open the per-session JSONL writer using
+    // the runner's own tokio runtime (writer task is spawn'd on it). We
+    // borrow the runtime via Handle so the Journal stays alive after main()
+    // exits to the TUI loop.
+    let runtime_handle = vortix_process::global_runner()
+        .as_real()
+        .map(|r| r.runtime().handle().clone());
+    if let Some(handle) = runtime_handle.clone() {
+        let _guard = handle.enter();
+        match vortix_core::journal::Journal::open(vortix_core::journal::JournalConfig {
+            disk: settings.journal.disk,
+            retention_days: settings.journal.retention_days,
+            retention_count: settings.journal.retention_count,
+            ..Default::default()
+        }) {
+            Ok(journal) => {
+                vortix_core::journal::set_global_journal(journal);
+            }
+            Err(e) => {
+                eprintln!("warning: failed to open journal ({e}); diagnostics will be limited");
+            }
+        }
+    }
+    let _ = runtime_handle; // suppress unused warning when no real runner installed
 
     // Now capture color_eyre's hook and wrap it with terminal restoration
     // and recovery instructions. Drop glue on App will still run to release

@@ -59,13 +59,15 @@ unicode-width = { workspace = true }
 open = { workspace = true }
 urlencoding = { workspace = true }
 
-# Workspace library deps (plan 002 + plan 003 + plan 004).
+# Workspace library deps (plans 002 + 003 + 004 + 005 + 006).
 vortix-core = { path = "../vortix-core" }
+vortix-config = { path = "../vortix-config" }
 vortix-process = { path = "../vortix-process" }
 vortix-protocol-openvpn = { path = "../vortix-protocol-openvpn" }
 vortix-protocol-wireguard = { path = "../vortix-protocol-wireguard" }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 # Per-OS platform adapters (empty stubs in plan 001; populated by plan 003).
 [target.'cfg(target_os = "macos")'.dependencies]
