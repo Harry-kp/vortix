@@ -58,8 +58,14 @@ documents that future PRs execute.
   around the sync FSM is fine for years. Making the FSM natively async
   buys nothing concrete.
 - **Publishing internal crates to crates.io.** `vortix-core`,
-  `vortix-config`, etc. stay `publish = false`. The binary `vortix` is
-  the public surface until an external consumer materializes.
+  `vortix-config`, etc. stay `publish = false`. **Permanent
+  architectural invariant** (not "until an external consumer
+  materializes"): the binary `vortix` is the only crates.io artifact
+  and `@harry-kp/vortix` is the only npm package, full stop. If a
+  future external consumer wants the API surface, they vendor it or
+  fork it. This decision is captured durably in
+  [`docs/architecture-migration-v1.md`](../architecture-migration-v1.md#distribution-posture-single-crate-single-npm)
+  so future plans don't re-litigate it.
 - **Lower-level features below the existing ports.** Things like
   alternative QUIC-based VPN protocols, raw socket manipulation, or
   custom kernel modules. The Tunnel port admits them when needed;

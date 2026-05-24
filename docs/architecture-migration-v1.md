@@ -136,6 +136,51 @@ now carries every planned unit:
   now runs inside the tokio runtime context so the writer task spawn
   no longer panics on `vortix engine status` invocations.
 
+## Distribution posture (single crate, single npm)
+
+**Permanent architectural invariant.** vortix ships exactly one
+crates.io artifact (`vortix`) and exactly one npm package
+(`@harry-kp/vortix`). Every other crate in this workspace is internal
+infrastructure and carries `publish = false` + `version = "0.0.0"`.
+This is not a "yet" — it's the final shape. The Cargo workspace exists
+for source-organisation and compile-time enforcement (module
+boundaries, port discipline, cycle prevention), not as a publishing
+vehicle.
+
+What this implies for future plans:
+
+- **No new crate at the workspace level may be `publish = true`.**
+  Plans 009–013 and any future plan must add new functionality inside
+  an existing internal crate or behind the binary's `vortix` surface.
+  Splitting `vortix-cli` and `vortix-tui` into separate libraries
+  (mentioned as deferred-in-principle in the workspace-split brainstorm)
+  is **not** a publish event; if it ever happens, those would also be
+  `publish = false`.
+- **No `vortix-core` "library" identity.** External consumers who want
+  the API surface vendor or fork. The internal crates are unstable by
+  design — every plan revises their public types without semver
+  ceremony.
+- **release-plz config stays single-package.** The `[[package]] name =
+  "vortix"` entry in `release-plz.toml` is load-bearing. Any future
+  change that attempts to add a second `[[package]]` entry is a
+  regression of this invariant.
+- **cargo-dist config stays single-binary.** `members =
+  ["cargo:crates/vortix"]` in `dist-workspace.toml` is load-bearing.
+  No second binary, no library publish.
+- **Enforcement at the Cargo level.** Cargo refuses
+  `cargo publish -p <internal-crate>` with "package has `publish = false`"
+  — verified by acceptance example AE3 in the workspace-split
+  brainstorm. This is the cheap-mistake guard.
+
+If a future need surfaces that would justify reconsidering, that's a
+new brainstorm with explicit weight given to:
+(a) the maintenance tax of versioning an internal crate independently,
+(b) the SemVer commitment a published library implies,
+(c) whether the proposed consumer can vendor the source instead.
+Until then, treat this as a hard invariant. Reviewers should reject
+any PR that adds `publish = true` to a non-binary crate without an
+accompanying brainstorm doc that explicitly revisits this section.
+
 ## CLI surface revised before ship
 
 A pre-ship re-audit (brainstorm:
