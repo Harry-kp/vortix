@@ -103,27 +103,38 @@ look for the new primitives.
 - `vortix list --json` now includes optional `profile_id` and `group`
   fields from sidecars.
 
-## What's deferred
+## Completed in final integration push
 
-These units require surgery the maintainer should drive in subsequent
-PRs with live-VPN testing:
+The four units originally deferred from plans 005 and 006 landed during
+the final integration session on this branch. The bundle on PR #201
+now carries every planned unit:
 
 ### Plan 005
-- **U5 (full) — App restructure** — remove `App: Deref<VpnEngine>` and
-  rewire ~20 files of TUI / app code to read state via `engine_handle`.
-- **U6 — CLI uses `EngineHandle`** — every CLI command currently uses
-  the legacy `VpnEngine` path; migrating them onto `EngineHandle::execute`
-  changes their concurrency model.
-- **U7 — Telemetry actor split** — telemetry becomes a `subscribe()`-only
-  consumer of `EngineEvent`s; the in-process channels collapse.
+- **U5 — App restructure** (commit `dd029fe`). `App: Deref<VpnEngine>`
+  removed; ~400 callsites across the TUI / app rewritten to read state
+  via explicit `app.engine.X` / `self.engine.X` access. No
+  behavioural change; the engine surface is now visible.
+- **U6 — CLI on `EngineHandle`** (commit `0d89afe`). `Engine` gained a
+  `tunnel_factory` so it can rebuild the correct protocol per
+  `Connect`. The new `vortix engine {status,connect,disconnect}` CLI
+  exercises the full handle path. Existing `vortix up/down/status` are
+  unchanged.
+- **U7 — Telemetry actor split** (commit `1389cc3`). A tokio task in
+  `main.rs` subscribes to the journal broadcast and nudges the
+  telemetry worker on `TunnelUp`; `App::handle_telemetry` emits
+  `EngineEvent::IpChanged` into the journal.
 
 ### Plan 006
-- **U5 — `Tunnel` + `SecretStore` integration** — `OvpnTunnel` writes a
-  temp auth file; that path will materialise from `SecretStore::get`
-  rather than reading from disk. Touches live-VPN auth flow.
-- **U6 partial — `--inline-secrets` inlining** — the CLI flag is wired,
-  but actually materialising stored secrets into the export depends on
-  U5.
+- **U5 — `Tunnel` + `SecretStore` integration** (commit `be9ea6f`).
+  `OvpnTunnel::with_secret_provider` takes a callback that materialises
+  auth bytes into an ephemeral 0600 file at `up()` time; the file is
+  deleted after the daemon forks. `tunnel_for_with_secrets` in
+  `crates/vortix/src/tunnel.rs` wires it up against the layered
+  `SecretStore`. `vortix export --inline-secrets` now actually inlines
+  via a `# vortix-secret:<base64>` trailing comment.
+- **CLI fix** (commit `3a9429a`). `Journal::open` in `handle_engine`
+  now runs inside the tokio runtime context so the writer task spawn
+  no longer panics on `vortix engine status` invocations.
 
 ## CI gates currently enforced
 
@@ -155,3 +166,20 @@ RUSTDOCFLAGS=-D warnings cargo doc --no-deps
 | Settings | `crates/vortix-config/src/settings.rs` |
 | ProfileStore | `crates/vortix-config/src/profile_store.rs` |
 | SecretStore | `crates/vortix-config/src/secret_store.rs` |
+
+## Rollout
+
+PR #201 ships as **v0.3.0** via a two-stage RC → GA rollout (plan
+[`2026-05-24-007-feat-rollout-architectural-migration-v1-plan.md`](plans/2026-05-24-007-feat-rollout-architectural-migration-v1-plan.md)).
+
+- **Users upgrading from v0.2.x:** read
+  [`docs/MIGRATION.md`](MIGRATION.md). The TL;DR is "upgrade is
+  automatic, your profiles work, nothing you have to do." Includes
+  rollback instructions and the `VORTIX_SKIP_MIGRATION=1` escape hatch.
+- **Maintainers cutting the release:** follow
+  [`docs/RELEASE-PLAYBOOK-v0.3.0.md`](RELEASE-PLAYBOOK-v0.3.0.md) — the
+  RC tag procedure, soak with discussion #184, GA promotion, and the
+  three-level rollback playbook.
+- **RC smoke testers:** run
+  [`scripts/smoke-v0.3.0.sh`](../scripts/smoke-v0.3.0.sh) against your
+  installed binary; report any FAIL to the discussion thread.
