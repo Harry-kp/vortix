@@ -3,7 +3,42 @@
 //! Private handler methods receive owned values destructured from the `Message` enum.
 #![allow(clippy::needless_pass_by_value)]
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// Minimum interval between failure toasts for the same hook (plan 016
+/// U3). Tight enough to surface a real failure quickly, loose enough
+/// that a reconnect storm doesn't drown the rest of the TUI.
+const HOOK_TOAST_RATE_LIMIT: Duration = Duration::from_secs(30);
+
+fn format_hook_toast(report: &crate::message::HookOutcomeReport) -> String {
+    use vortix_core::engine::HookOutcomeLabel;
+    let label = match report.record.outcome {
+        HookOutcomeLabel::Failed => "failed",
+        HookOutcomeLabel::TimedOut => "timed out",
+        HookOutcomeLabel::Aborted => "aborted",
+        HookOutcomeLabel::Success => "ok",
+        _ => "unknown",
+    };
+    // First non-empty stderr line keeps the toast informative without
+    // overflowing the toast width.
+    let detail = report
+        .record
+        .stderr
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("");
+    if detail.is_empty() {
+        format!(
+            "Hook '{}' {} on {}",
+            report.hook_name, label, report.event_kind
+        )
+    } else {
+        format!(
+            "Hook '{}' {} on {}: {}",
+            report.hook_name, label, report.event_kind, detail
+        )
+    }
+}
 
 use super::{
     App, ConnectionState, DetailedConnectionInfo, FocusedPanel, InputMode, Protocol, ToastType,
@@ -274,16 +309,53 @@ impl App {
         }
     }
 
-    /// Record a hook fire in the rolling history (plan 016 U2/U3).
+    /// Record a hook fire in the rolling history and surface a
+    /// rate-limited failure toast for non-Success outcomes (plan 016
+    /// U2 + U3).
     ///
-    /// U3 extends this to emit a rate-limited failure toast for
-    /// non-Success outcomes. For now the push is unconditional and the
-    /// `VecDeque` is FIFO-capped at [`super::HOOK_HISTORY_CAP`].
+    /// The `VecDeque` is FIFO-capped at [`super::HOOK_HISTORY_CAP`].
+    /// Failure toasts are rate-limited per hook name at
+    /// [`HOOK_TOAST_RATE_LIMIT`] so a tight reconnect loop with a
+    /// noisy hook can't spam the UI.
     fn handle_hook_fired(&mut self, report: crate::message::HookOutcomeReport) {
+        use vortix_core::engine::HookOutcomeLabel;
+
+        // History push first — the overlay (U4) reads this regardless
+        // of whether a toast was emitted.
         if self.recent_hook_events.len() >= super::HOOK_HISTORY_CAP {
             self.recent_hook_events.pop_back();
         }
+
+        // Decide before moving the report into the deque.
+        let should_toast = !matches!(report.record.outcome, HookOutcomeLabel::Success)
+            && self
+                .hook_toast_last_fired
+                .get(&report.hook_name)
+                .map_or(true, |t| t.elapsed() >= HOOK_TOAST_RATE_LIMIT);
+        let toast_payload = if should_toast {
+            Some((
+                report.hook_name.clone(),
+                format_hook_toast(&report),
+                match report.record.outcome {
+                    HookOutcomeLabel::Failed => super::ToastType::Error,
+                    HookOutcomeLabel::TimedOut | HookOutcomeLabel::Aborted => {
+                        super::ToastType::Warning
+                    }
+                    HookOutcomeLabel::Success => super::ToastType::Info, // unreachable
+                    _ => super::ToastType::Warning,
+                },
+            ))
+        } else {
+            None
+        };
+
         self.recent_hook_events.push_front(report);
+
+        if let Some((hook_name, message, toast_type)) = toast_payload {
+            self.hook_toast_last_fired
+                .insert(hook_name, Instant::now());
+            self.show_toast(message, toast_type);
+        }
     }
 
     /// Surface config-validation errors. Currently a no-op — U5 turns
