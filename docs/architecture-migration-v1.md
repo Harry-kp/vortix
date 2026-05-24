@@ -71,8 +71,13 @@ look for the new primitives.
   drives the TUI).
 - `impl Tunnel for TunnelKind` so the binary can instantiate
   `Engine<TunnelKind>` once the integration units finish.
-- `vortix bug-report` now attaches the current session's journal path +
-  the last 10 event kinds.
+- Live profile resolver — the engine handle reads sidecars via
+  `FsProfileStore` so any plan-005 consumer calling
+  `handle.execute(Connect{id})` sees the user's actual profiles.
+- `vortix bug-report` attaches the current session's journal path + the
+  last 10 event kinds.
+- New CLI: `vortix journal {path,tail [N]}` — surfaces the session
+  file + in-memory tail for debugging.
 
 ### Plan 006 — Config + secret stack
 - `vortix_config::Settings` — figment-layered (defaults → system file →
@@ -82,10 +87,21 @@ look for the new primitives.
   sidecar TOML metadata at `<profiles_dir>/<name>.meta.toml`.
 - `vortix_config::secret_store::SecretStore` + `LayeredSecretStore` —
   keyring-first with AES-256-GCM + argon2id encrypted-file fallback.
-- New CLI command: `vortix export <profile> [--inline-secrets]` reads
-  via `FsProfileStore` (falls back to legacy filename lookup).
-  `--inline-secrets` is reserved for plan 006 U5's `Tunnel` + secret-store
-  integration.
+- `vortix_config::migrate_legacy_profiles(profiles_dir)` — idempotent
+  one-shot backfill of `.meta.toml` sidecars for pre-migration
+  `.conf` / `.ovpn` files. Runs implicitly at every binary start.
+- `main.rs` calls `Settings::load()` (figment) and seeds the global
+  `Journal` from `[journal]`.
+- New CLI commands surfacing the stack:
+  - `vortix export <profile> [--inline-secrets]` — stream raw config to
+    stdout. `--inline-secrets` reserved for plan 006 U5.
+  - `vortix migrate` — explicit invocation of the sidecar migration with
+    stats output.
+  - `vortix settings` — print the resolved Settings stack as TOML
+    (or JSON via `--json`).
+  - `vortix secrets {set,get,delete} <id>` — manage SecretStore entries.
+- `vortix list --json` now includes optional `profile_id` and `group`
+  fields from sidecars.
 
 ## What's deferred
 
@@ -102,16 +118,12 @@ PRs with live-VPN testing:
   consumer of `EngineEvent`s; the in-process channels collapse.
 
 ### Plan 006
-- **U4 — Migration step** — backfill `.meta.toml` sidecars for users'
-  existing `.conf`/`.ovpn` files. Writes to the user's filesystem; needs
-  the maintainer to choose the right "first-launch sees sidecar-less
-  profiles" UX.
 - **U5 — `Tunnel` + `SecretStore` integration** — `OvpnTunnel` writes a
   temp auth file; that path will materialise from `SecretStore::get`
   rather than reading from disk. Touches live-VPN auth flow.
-- **U6 — `vortix profile export --inline-secrets`** — wire-up done; the
-  inlining itself waits on U5.
-- **U8 — Release notes** — when the bundle is ready to ship.
+- **U6 partial — `--inline-secrets` inlining** — the CLI flag is wired,
+  but actually materialising stored secrets into the export depends on
+  U5.
 
 ## CI gates currently enforced
 
