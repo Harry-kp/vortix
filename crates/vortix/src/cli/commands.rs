@@ -81,6 +81,7 @@ pub fn handle_command(
             inline_secrets,
         } => handle_export(config_dir, profile, *inline_secrets, mode),
         Commands::Migrate => handle_migrate(config_dir, mode),
+        Commands::Secrets { op } => handle_secrets(op, config_dir, mode),
         Commands::Settings => handle_settings(mode),
         Commands::Journal { op } => handle_journal(op, mode),
         Commands::Completions { shell } => {
@@ -96,6 +97,98 @@ struct MigrateData {
     already_migrated: u32,
     failed: u32,
     ignored: u32,
+}
+
+/// Manage `SecretStore` entries (plan 006 U3 surfacing).
+///
+/// Resolves the layered store (keyring first, encrypted-file fallback)
+/// using `<config_dir>/secrets.enc` as the encrypted-file location.
+fn parse_secret_backend(s: Option<&String>) -> vortix_config::secret_store::SecretBackendTag {
+    use vortix_config::secret_store::SecretBackendTag;
+    match s.map(String::as_str) {
+        Some("encrypted-file" | "file") => SecretBackendTag::EncryptedFile,
+        _ => SecretBackendTag::Keyring,
+    }
+}
+
+fn handle_secrets(op: &crate::cli::args::SecretsOp, config_dir: &Path, mode: OutputMode) -> i32 {
+    use crate::cli::args::SecretsOp;
+    use std::io::Read;
+    use vortix_config::secret_store::{
+        LayeredSecretStore, Secret, SecretRef, SecretStore, SecretStoreConfig,
+    };
+
+    let fallback_path = config_dir.join("secrets.enc");
+    let cfg = SecretStoreConfig {
+        fallback_path,
+        passphrase: None,
+        force_fallback: false,
+    };
+    let store = match LayeredSecretStore::new(cfg) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("secret store unavailable: {e}");
+            eprintln!("hint: set $VORTIX_PASSPHRASE or install a system keyring.");
+            return 1;
+        }
+    };
+
+    match op {
+        SecretsOp::Set { id } => {
+            let mut bytes = Vec::new();
+            if let Err(e) = std::io::stdin().read_to_end(&mut bytes) {
+                eprintln!("read stdin: {e}");
+                return 1;
+            }
+            if bytes.is_empty() {
+                eprintln!(
+                    "refusing to store an empty secret — pipe the value into stdin:\n  echo -n 'value' | vortix secrets set {id}"
+                );
+                return 1;
+            }
+            match store.set(id, Secret::new(bytes)) {
+                Ok(secret_ref) => {
+                    if matches!(mode, OutputMode::Human) {
+                        println!("Stored {} in {:?}", secret_ref.id, secret_ref.backend);
+                    }
+                    0
+                }
+                Err(e) => {
+                    eprintln!("set failed: {e}");
+                    1
+                }
+            }
+        }
+        SecretsOp::Get { id, backend } => {
+            let secret_ref = SecretRef::new(parse_secret_backend(backend.as_ref()), id.clone());
+            match store.get(&secret_ref) {
+                Ok(secret) => {
+                    use std::io::Write;
+                    let _ = std::io::stdout().write_all(secret.as_bytes());
+                    0
+                }
+                Err(e) => {
+                    eprintln!("get failed: {e}");
+                    1
+                }
+            }
+        }
+        SecretsOp::Delete { id, backend } => {
+            let secret_ref = SecretRef::new(parse_secret_backend(backend.as_ref()), id.clone());
+            match store.delete(&secret_ref) {
+                Ok(()) => {
+                    if matches!(mode, OutputMode::Human) {
+                        println!("Deleted {id}");
+                    }
+                    0
+                }
+                Err(e) => {
+                    eprintln!("delete failed: {e}");
+                    1
+                }
+            }
+        }
+    }
 }
 
 /// Explicit profile-sidecar migration (plan 006 U4). Same logic as the
