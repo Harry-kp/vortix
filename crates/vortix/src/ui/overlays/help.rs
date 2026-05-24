@@ -31,6 +31,28 @@ const HELP_TEXT: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     (
+        "Hooks Overlay (Shift-H)",
+        &[
+            ("j / ↓", "Next hook"),
+            ("k / ↑", "Previous hook"),
+            ("a", "Add new hook"),
+            ("e / Enter", "Edit selected hook"),
+            ("d / Del", "Delete selected hook (with confirm)"),
+            ("t", "Toggle enabled/disabled"),
+            ("H / Esc", "Close overlay"),
+        ],
+    ),
+    (
+        "Hook Editor Form",
+        &[
+            ("Tab / Sh-Tab", "Cycle fields"),
+            ("Ctrl-S", "Save"),
+            ("Esc", "Cancel"),
+            ("← / →", "Pick event kind"),
+            ("Space", "Toggle Enabled checkbox"),
+        ],
+    ),
+    (
         "Sidebar (Profiles)",
         &[
             ("j / ↓", "Next profile"),

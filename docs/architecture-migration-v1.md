@@ -192,6 +192,7 @@ plan docs remain the design records.
 |---|---|---|---|
 | A — Lifecycle hooks | 009 | ✅ shipped | `ee5b099` |
 | A.1 — TUI hook surface | 016 | ✅ shipped (toasts + overlay + config-validation) | — |
+| A.2 — TUI hook management | 017 | ✅ shipped (CRUD + comment-preserving writer) | — |
 | B — CI integration tests | 012 | ✅ shipped (Ubuntu only) | `1cbfa90` |
 | C — Socket audit port | 013 | ✅ shipped (Linux + macOS) | `82ba6a4` |
 | D — IPC layer / daemon | 010 | ✅ shipped (skeleton + wire contract); engine routing → v0.3.x | `a7796d1` |
