@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.1] - 2026-05-25
+
+### Changed
+
+- **Flattened to single crate.** Merged all 8 internal crates into the main `vortix` crate as modules. Enables `cargo install vortix` from crates.io. No functional changes.
+- Internal modules marked `#[doc(hidden)]` to keep public API surface clean.
+
 ## [0.3.0] - 2026-05-24
 
 ### Architecture

@@ -11,10 +11,8 @@ git_release_enable = false
 # Tag format: "v" prefix (matches cargo-dist trigger pattern)
 git_tag_name = "v{{ version }}"
 
-# Disable crates.io publish — workspace path-only deps can't be resolved
-# by cargo publish. cargo-dist handles distribution via GitHub Releases,
-# npm, and Homebrew.
-publish = false
+# Publish to crates.io (single-crate workspace, no path-only dep issues)
+publish = true
 
 [[package]]
 name = "vortix"
