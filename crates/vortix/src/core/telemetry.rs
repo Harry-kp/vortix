@@ -592,8 +592,8 @@ fn fetch_latency(tx: &Sender<TelemetryUpdate>, cfg: &std::sync::Arc<TelemetryCon
     let tx_clone = tx.clone();
     let cfg = std::sync::Arc::clone(cfg);
     thread::spawn(move || {
-        // macOS ping -W takes milliseconds; Linux ping -W takes seconds
-        #[cfg(target_os = "macos")]
+        // macOS ping -W takes milliseconds; Linux ping -W takes seconds.
+        #[cfg(target_os = "macos")] // xtask:allow-platform-cfg: ping -W unit differs by OS
         let timeout = (cfg.ping_timeout * 1000).to_string();
         #[cfg(not(target_os = "macos"))]
         let timeout = cfg.ping_timeout.to_string();

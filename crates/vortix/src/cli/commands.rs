@@ -154,6 +154,7 @@ fn handle_up(
                 }
                 // Check for resolvconf on Linux when DNS is configured
                 #[cfg(target_os = "linux")]
+                // xtask:allow-platform-cfg: resolvconf check is Linux-only DNS plumbing
                 {
                     let config_path = &profile.config_path;
                     if crate::utils::wireguard_config_has_dns(config_path)

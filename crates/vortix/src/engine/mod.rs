@@ -497,6 +497,7 @@ impl VpnEngine {
                 // a systemd-resolved system will exist but fail at runtime
                 // with "signature mismatch".
                 #[cfg(target_os = "linux")]
+                // xtask:allow-platform-cfg: resolvconf check is Linux-only DNS plumbing
                 if utils::wireguard_config_has_dns(config_path) && !utils::resolvconf_works() {
                     if utils::is_systemd_resolved() {
                         missing.push("resolvconf (systemd)".to_string());

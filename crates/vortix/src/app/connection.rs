@@ -83,6 +83,7 @@ impl App {
                 // a systemd-resolved system will exist but fail at runtime
                 // with "signature mismatch".
                 #[cfg(target_os = "linux")]
+                // xtask:allow-platform-cfg: resolvconf detection is Linux-only DNS plumbing
                 if utils::wireguard_config_has_dns(config_path) && !utils::resolvconf_works() {
                     // Point the user to the right package for their system.
                     if utils::is_systemd_resolved() {

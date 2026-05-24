@@ -203,6 +203,7 @@ fn install_method_from_path(exe: &str) -> &'static str {
 
 fn get_os_info() -> String {
     #[cfg(target_os = "macos")]
+    // xtask:allow-platform-cfg: bug-report OS info is intrinsically OS-specific
     {
         let version = cmd_stdout("sw_vers", &["-productVersion"]).unwrap_or_default();
         let kernel = cmd_stdout("uname", &["-r"]).unwrap_or_default();
@@ -214,6 +215,7 @@ fn get_os_info() -> String {
     }
 
     #[cfg(target_os = "linux")]
+    // xtask:allow-platform-cfg: bug-report OS info is intrinsically OS-specific
     {
         let distro = linux_distro_name().unwrap_or_else(|| "Linux".to_string());
         let kernel = cmd_stdout("uname", &["-r"]).unwrap_or_default();
@@ -225,7 +227,7 @@ fn get_os_info() -> String {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(target_os = "linux")] // xtask:allow-platform-cfg: distro name lives in /etc/os-release on Linux only
 fn linux_distro_name() -> Option<String> {
     let content = std::fs::read_to_string("/etc/os-release").ok()?;
     for line in content.lines() {
@@ -246,10 +248,11 @@ fn collect_tool_statuses() -> Vec<ToolStatus> {
         check_tool("openvpn", &["--version"]),
     ];
 
-    #[cfg(target_os = "macos")]
+    #[cfg(target_os = "macos")] // xtask:allow-platform-cfg: pfctl is the macOS killswitch tool
     tools.push(check_tool_exists("pfctl"));
 
     #[cfg(target_os = "linux")]
+    // xtask:allow-platform-cfg: iptables/nft are the Linux killswitch tools
     {
         tools.push(check_tool("iptables", &["--version"]));
         tools.push(check_tool("nft", &["--version"]));
@@ -284,7 +287,7 @@ fn check_tool(name: &'static str, version_args: &[&str]) -> ToolStatus {
 }
 
 /// Check if a tool exists (path only, no version — for tools like `pfctl`).
-#[cfg(target_os = "macos")]
+#[cfg(target_os = "macos")] // xtask:allow-platform-cfg: helper only used by the macOS pfctl branch above
 fn check_tool_exists(name: &'static str) -> ToolStatus {
     let path = cmd_stdout("which", &[name]);
     ToolStatus {
@@ -552,9 +555,11 @@ fn build_github_url(body: &str) -> String {
 
 fn copy_to_clipboard(text: &str) -> bool {
     #[cfg(target_os = "macos")]
+    // xtask:allow-platform-cfg: pbcopy is macOS-only; future Clipboard port
     let result = pipe_to_command("pbcopy", text);
 
     #[cfg(target_os = "linux")]
+    // xtask:allow-platform-cfg: wl-copy/xclip/xsel selection is Linux-only
     let result = if std::env::var("WAYLAND_DISPLAY").is_ok() {
         pipe_to_command("wl-copy", text)
             .or_else(|| pipe_to_command("xclip", text))

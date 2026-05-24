@@ -26,10 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     match cli.command {
         Command::CheckSubprocess => check_subprocess(),
-        Command::CheckPlatformLeak => {
-            eprintln!("xtask check-platform-leak: stub — implemented by plan 003");
-            Ok(())
-        }
+        Command::CheckPlatformLeak => check_platform_leak(),
         Command::CheckProtocolLeak => {
             eprintln!("xtask check-protocol-leak: stub — implemented by plan 004");
             Ok(())
@@ -127,6 +124,103 @@ fn is_allowlisted_file(path: &Path, workspace_root: &Path) -> bool {
     }
 
     false
+}
+
+/// Scan the workspace for naked `cfg(target_os = ...)` use outside platform
+/// boundaries (plan 003 R12).
+///
+/// Allowlist:
+/// - `crates/vortix-platform-{macos,linux,windows}/**` — platform crates.
+/// - `crates/vortix/src/platform/**` — binary-side platform aggregate.
+/// - `crates/vortix/src/constants.rs` — OS-specific compile-time constants.
+/// - `crates/xtask/src/main.rs` — this lint references the pattern.
+/// - Lines annotated with `// xtask:allow-platform-cfg: <reason>`.
+/// - Cargo.toml `target.'cfg(target_os = ...)'.dependencies` entries.
+fn check_platform_leak() -> Result<(), Box<dyn std::error::Error>> {
+    let workspace_root = workspace_root()?;
+    let crates_dir = workspace_root.join("crates");
+
+    let mut violations = Vec::new();
+
+    let walker = ignore::WalkBuilder::new(&crates_dir)
+        .hidden(false)
+        .git_ignore(true)
+        .build();
+
+    for result in walker {
+        let Ok(entry) = result else { continue };
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        // Only Rust source files participate in this lint.
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        if is_platform_leak_allowlisted(path, &workspace_root) {
+            continue;
+        }
+
+        let Ok(content) = std::fs::read_to_string(path) else {
+            continue;
+        };
+
+        let lines: Vec<&str> = content.lines().collect();
+        for (idx, line) in lines.iter().enumerate() {
+            if !line.contains("cfg(target_os") {
+                continue;
+            }
+            // Skip comment-only lines (the lint is about real cfg attributes,
+            // not prose mentioning the pattern).
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            // Annotations may live on the same line, on the previous line, or
+            // on the next line (rustfmt sometimes splits trailing comments
+            // off cfg attributes onto a fresh line).
+            let same = line.contains("// xtask:allow-platform-cfg");
+            let prev = idx
+                .checked_sub(1)
+                .and_then(|i| lines.get(i))
+                .is_some_and(|l| l.contains("// xtask:allow-platform-cfg"));
+            let next = lines
+                .get(idx + 1)
+                .is_some_and(|l| l.contains("// xtask:allow-platform-cfg"));
+            if same || prev || next {
+                continue;
+            }
+            violations.push(format!(
+                "{}:{}: {}",
+                path.strip_prefix(&workspace_root).unwrap_or(path).display(),
+                idx + 1,
+                line.trim()
+            ));
+        }
+    }
+
+    if violations.is_empty() {
+        eprintln!("xtask check-platform-leak: ok (crates/ scanned)");
+        Ok(())
+    } else {
+        eprintln!(
+            "xtask check-platform-leak: {} violation(s) — `cfg(target_os = ...)` must live in `vortix-platform-*` or `vortix::platform::*`. Route OS-specific calls through `crate::platform::current_platform()`; for genuine compile-time gates, annotate with `// xtask:allow-platform-cfg: <reason>`.",
+            violations.len()
+        );
+        for v in &violations {
+            eprintln!("  {v}");
+        }
+        std::process::exit(1)
+    }
+}
+
+fn is_platform_leak_allowlisted(path: &Path, workspace_root: &Path) -> bool {
+    let rel = path.strip_prefix(workspace_root).unwrap_or(path);
+    let rel_str = rel.to_string_lossy();
+
+    rel_str.starts_with("crates/vortix-platform-")
+        || rel_str.starts_with("crates/vortix/src/platform/")
+        || rel_str == "crates/vortix/src/constants.rs"
+        || rel_str.starts_with("crates/xtask/")
 }
 
 fn workspace_root() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {

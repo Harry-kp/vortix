@@ -180,6 +180,7 @@ impl App {
             return;
         }
         #[cfg(target_os = "macos")]
+        // xtask:allow-platform-cfg: pbcopy is macOS-only; future Clipboard port
         {
             use vortix_process::CommandSpec;
             if vortix_process::run_to_output(
@@ -192,6 +193,7 @@ impl App {
             }
         }
         #[cfg(target_os = "linux")]
+        // xtask:allow-platform-cfg: wl-copy/xclip/xsel selection is Linux-only; future Clipboard port
         {
             use vortix_process::CommandSpec;
             // Wayland-first: try wl-copy when $WAYLAND_DISPLAY is set,
