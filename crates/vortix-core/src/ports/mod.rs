@@ -5,5 +5,9 @@
 //! - `killswitch`, `dns`, `interface`, `network_stats`, `route_table` — capability ports (plan 003)
 //! - `tunnel` — `Tunnel` trait (plan 004)
 
+pub mod dns;
+pub mod interface;
 pub mod killswitch;
+pub mod network_stats;
 pub mod process;
+pub mod route_table;
