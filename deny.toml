@@ -1,5 +1,9 @@
 [advisories]
-ignore = []
+ignore = [
+    # rand 0.8 unsoundness with custom logger + rand::rng() reseeding.
+    # We don't use rand::rng() from a custom logger; safe to ignore until rand 0.9 upgrade.
+    "RUSTSEC-2026-0097",
+]
 
 [licenses]
 allow = [
