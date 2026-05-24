@@ -51,6 +51,9 @@ Existing options (`wg show`, NetworkManager, Tunnelblick) either lack real-time 
 - **Geo-Location** — Instant detection of your exit IP's city and country
 - **Leak detection** — Monitors for IPv6 leaks and DNS leaks in real-time
 - **Kill Switch** — Built-in firewall management for maximum security
+- **Encrypted credential store** *(new in v0.3.0)* — OS keyring (Keychain / Secret Service) with AES-256-GCM + argon2id encrypted-file fallback for headless installs
+- **Session event journal** *(new in v0.3.0)* — JSONL event log per session under `${XDG_DATA_HOME}/vortix/sessions/`, 30-day retention; useful for diagnostics and scripting
+- **Versioned structured output** *(new in v0.3.0)* — every `--json` envelope carries `schema_version: 1` so consumers can detect breaking changes instead of finding them at runtime
 - **Interactive Import** — Easily add new profiles directly within the TUI
 - **Config Viewer** — Inspect profile configurations directly within the TUI
 - **Keyboard-driven** — No mouse required
@@ -324,7 +327,9 @@ When running with `sudo`, vortix automatically resolves the invoking user's home
 ~/.config/vortix/
 ├── profiles/                 VPN configuration files
 │   ├── work.conf             WireGuard profile
-│   └── office.ovpn           OpenVPN profile
+│   ├── work.meta.toml        Sidecar metadata (new in v0.3.0; auto-generated)
+│   ├── office.ovpn           OpenVPN profile
+│   └── office.meta.toml      Sidecar metadata (new in v0.3.0; auto-generated)
 ├── auth/                     Saved OpenVPN credentials
 │   └── office                Username + password for "office" profile
 ├── run/                      OpenVPN runtime files (temporary)
@@ -333,19 +338,38 @@ When running with `sudo`, vortix automatically resolves the invoking user's home
 ├── logs/                     Application logs (daily rotation)
 │   └── 2026-02-09.log        Same content as the TUI Logs panel
 ├── config.toml               User settings (optional, see below)
+├── settings.toml             Figment-layered settings (optional, new in v0.3.0)
+├── secrets.enc               Encrypted secret store, fallback when no OS keyring (new in v0.3.0)
 ├── metadata.json             Profile metadata (last used, sort order)
 └── killswitch.state          Kill switch state for crash recovery
 ```
 
-All files and directories are owned by your user account, even when vortix runs under `sudo`. You can read, modify, or delete anything here without elevated privileges.
+Session event journals live in a separate XDG directory because they're observability data, not user config:
+
+```
+${XDG_DATA_HOME}/vortix/sessions/                   (new in v0.3.0)
+├── 2026-...-pid.jsonl        JSONL event log per session
+└── ...                       30-day / 30-file retention
+```
+
+Resolved paths by platform:
+
+- **Linux:** `~/.local/share/vortix/sessions/`
+- **macOS:** `~/Library/Application Support/vortix/sessions/`
+
+Find the current session's path with `vortix info`.
+
+All files and directories under the config dir are owned by your user account, even when vortix runs under `sudo`. You can read, modify, or delete anything here without elevated privileges.
 
 | Path | Mode | Description |
 |------|:----:|-------------|
-| `profiles/` | `600` | Your `.conf` and `.ovpn` files. Added via `vortix import` or the TUI. |
-| `auth/` | `600` | Saved OpenVPN username/password pairs. One file per profile. |
+| `profiles/` | `600` | Your `.conf` and `.ovpn` files plus the auto-generated `.meta.toml` sidecars (new in v0.3.0). Sidecars are idempotent — delete and they regenerate. |
+| `auth/` | `600` | Saved OpenVPN username/password pairs. One file per profile. Still honored in v0.3.0 — credentials can optionally move to the encrypted store via `vortix secrets set creds/<profile>`. |
 | `run/` | `644` | **OpenVPN only.** PID and log files created during a VPN session. The `.pid` file identifies which daemon to kill; the `.log` is polled for success/failure. Cleaned up on disconnect. WireGuard doesn't use this. |
 | `logs/` | `644` | Application session logs (daily rotation, configurable size/retention). Not the raw OpenVPN output in `run/`. |
-| `config.toml` | `644` | Optional user settings. Only exists if you create it manually (see below). |
+| `config.toml` | `644` | Optional user settings (legacy). Only exists if you create it manually (see below). |
+| `settings.toml` | `644` | Optional figment-layered settings (new in v0.3.0): defaults → system file → this user file → `VORTIX_*` env vars. Not auto-created. |
+| `secrets.enc` | `600` | Encrypted-file fallback for the SecretStore (new in v0.3.0). Only created if you use `vortix secrets set` without a working OS keyring. |
 | `metadata.json` | `644` | Internal bookkeeping (last used, sort order). Auto-managed. |
 | `killswitch.state` | `644` | Persists kill switch mode across crashes. Auto-managed. |
 
