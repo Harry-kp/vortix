@@ -47,12 +47,20 @@ pub const OVPN_ERROR_LOG_TAIL_LINES: usize = 5;
 /// Default `--verb` level.
 pub const DEFAULT_OVPN_VERBOSITY: &str = "3";
 
+/// Callback that materialises auth bytes from a `SecretStore` (plan 006 U5).
+///
+/// `Fn(profile_id) -> Option<Vec<u8>>`. When set on `OvpnTunnel`, `up()`
+/// asks the closure for the profile's auth bytes; on `Some`, writes them
+/// to an ephemeral file with mode 0600, points `openvpn --auth-user-pass`
+/// at it, and deletes the file after spawn.
+pub type SecretProvider = std::sync::Arc<dyn Fn(&str) -> Option<Vec<u8>> + Send + Sync>;
+
 /// `OpenVPN` tunnel implementation.
 ///
 /// Construct with the run-files directory (where the protocol writes
 /// `<profile>.pid` / `<profile>.log`) and optional auth directory. The engine
 /// passes resolved paths in based on the app config.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OvpnTunnel {
     /// Directory where `<safe_name>.pid` and `<safe_name>.log` are written.
     pub run_dir: PathBuf,
@@ -63,6 +71,21 @@ pub struct OvpnTunnel {
     pub verbosity: String,
     /// Overall connect timeout in seconds.
     pub connect_timeout_secs: u64,
+    /// Optional `SecretStore`-backed auth materialisation hook (plan 006 U5).
+    /// When set, takes precedence over the on-disk `auth_dir` lookup.
+    pub secret_provider: Option<SecretProvider>,
+}
+
+impl std::fmt::Debug for OvpnTunnel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OvpnTunnel")
+            .field("run_dir", &self.run_dir)
+            .field("auth_dir", &self.auth_dir)
+            .field("verbosity", &self.verbosity)
+            .field("connect_timeout_secs", &self.connect_timeout_secs)
+            .field("secret_provider", &self.secret_provider.is_some())
+            .finish()
+    }
 }
 
 impl Default for OvpnTunnel {
@@ -72,6 +95,7 @@ impl Default for OvpnTunnel {
             auth_dir: None,
             verbosity: DEFAULT_OVPN_VERBOSITY.to_string(),
             connect_timeout_secs: 30,
+            secret_provider: None,
         }
     }
 }
@@ -103,6 +127,16 @@ impl OvpnTunnel {
     #[must_use]
     pub fn with_connect_timeout(mut self, secs: u64) -> Self {
         self.connect_timeout_secs = secs;
+        self
+    }
+
+    /// Builder: install a `SecretStore`-backed auth-bytes provider
+    /// (plan 006 U5). When set, `up()` materialises an ephemeral auth
+    /// file from `provider(profile_id)` instead of reading from
+    /// `<auth_dir>/<safe_name>.auth`.
+    #[must_use]
+    pub fn with_secret_provider(mut self, provider: SecretProvider) -> Self {
+        self.secret_provider = Some(provider);
         self
     }
 
@@ -221,6 +255,36 @@ fn poll_log_until_ready(
     }
 }
 
+/// Write `bytes` to `path` with mode 0600 (Unix; best-effort on other OSes).
+/// Used by the SecretStore-backed auth flow (plan 006 U5).
+fn write_ephemeral_auth(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(bytes)?;
+        f.flush()?;
+    }
+    #[cfg(not(unix))]
+    {
+        let mut f = std::fs::File::create(path)?;
+        f.write_all(bytes)?;
+        f.flush()?;
+    }
+    Ok(())
+}
+
 fn tail_lines(content: &str, n: usize) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let start = lines.len().saturating_sub(n);
@@ -262,17 +326,50 @@ impl Tunnel for OvpnTunnel {
             self.verbosity.clone(),
         ];
 
-        if let Some(auth) = self.auth_path(&safe_name) {
-            if auth.exists() {
-                args.push("--auth-user-pass".to_string());
-                args.push(auth.to_string_lossy().into_owned());
+        // Plan 006 U5: SecretStore-backed auth takes precedence. When a
+        // secret_provider is installed and returns bytes for this profile,
+        // materialise them into an ephemeral 0600 file under `run_dir`,
+        // point `--auth-user-pass` at it, and remember the path for
+        // cleanup. Otherwise fall back to the legacy `<auth_dir>/<name>.auth`.
+        let ephemeral_auth = if let Some(provider) = &self.secret_provider {
+            if let Some(bytes) = provider(profile.id.as_str()) {
+                let path = self.run_dir.join(format!("{safe_name}.auth.ephemeral"));
+                let written = write_ephemeral_auth(&path, &bytes);
+                if let Err(e) = &written {
+                    tracing::warn!(
+                        target: "vortix::tunnel::openvpn",
+                        error = %e,
+                        "failed to materialise ephemeral auth file; falling back to auth_dir"
+                    );
+                }
+                written.ok().map(|()| path)
+            } else {
+                None
             }
+        } else {
+            None
+        };
+
+        let auth_to_use = ephemeral_auth
+            .clone()
+            .or_else(|| self.auth_path(&safe_name).filter(|p| p.exists()));
+        if let Some(auth) = auth_to_use {
+            args.push("--auth-user-pass".to_string());
+            args.push(auth.to_string_lossy().into_owned());
         }
 
-        let output = vortix_process::run_to_output(
+        let output_result = vortix_process::run_to_output(
             CommandSpec::oneshot("openvpn", args).privilege(PrivilegeReq::Root),
-        )
-        .map_err(|e| TunnelError::Subprocess(format!("openvpn: {e}")))?;
+        );
+
+        // Plan 006 U5: the daemon has forked + read the auth file by now.
+        // Remove the ephemeral copy before propagating the spawn result so
+        // the secret bytes don't linger on disk if the call fails.
+        if let Some(path) = &ephemeral_auth {
+            let _ = std::fs::remove_file(path);
+        }
+
+        let output = output_result.map_err(|e| TunnelError::Subprocess(format!("openvpn: {e}")))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();

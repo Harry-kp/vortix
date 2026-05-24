@@ -65,6 +65,7 @@ vortix-config = { path = "../vortix-config" }
 vortix-process = { path = "../vortix-process" }
 vortix-protocol-openvpn = { path = "../vortix-protocol-openvpn" }
 vortix-protocol-wireguard = { path = "../vortix-protocol-wireguard" }
+base64 = "0.22"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
