@@ -20,12 +20,12 @@ pub enum NetworkEvent {
 /// Returns the current default gateway IP, or `None` if unavailable.
 #[cfg(target_os = "macos")]
 fn get_default_gateway() -> Option<String> {
-    let output = std::process::Command::new("route")
-        .args(["get", "default"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
+    use vortix_process::CommandSpec;
+    let output = vortix_process::run_to_output(CommandSpec::oneshot(
+        "route",
+        vec!["get".into(), "default".into()],
+    ))
+    .ok()?;
 
     let text = String::from_utf8_lossy(&output.stdout);
     for line in text.lines() {
@@ -42,12 +42,12 @@ fn get_default_gateway() -> Option<String> {
 
 #[cfg(target_os = "linux")]
 fn get_default_gateway() -> Option<String> {
-    let output = std::process::Command::new("ip")
-        .args(["route", "show", "default"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
+    use vortix_process::CommandSpec;
+    let output = vortix_process::run_to_output(CommandSpec::oneshot(
+        "ip",
+        vec!["route".into(), "show".into(), "default".into()],
+    ))
+    .ok()?;
 
     let text = String::from_utf8_lossy(&output.stdout);
     // Format: "default via 192.168.1.1 dev wlan0 ..."

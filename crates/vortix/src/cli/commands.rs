@@ -1425,12 +1425,13 @@ fn handle_update(mode: OutputMode) {
         println!("Updating vortix...");
     }
 
-    let status = std::process::Command::new("cargo")
-        .args(["install", "vortix", "--force"])
-        .status();
+    let result = vortix_process::run_to_output(vortix_process::CommandSpec::oneshot(
+        "cargo",
+        vec!["install".into(), "vortix".into(), "--force".into()],
+    ));
 
-    match status {
-        Ok(s) if s.success() => match mode {
+    match result {
+        Ok(s) if s.status.success() => match mode {
             OutputMode::Human => {
                 println!("Updated successfully!");
                 println!("Verify: vortix --version");

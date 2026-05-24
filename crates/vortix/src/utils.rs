@@ -26,40 +26,6 @@ pub fn is_root() -> bool {
     false
 }
 
-/// Run a system command with a timeout.
-///
-/// Spawns the command and polls for completion. If the command doesn't
-/// finish within `timeout`, the child process is killed and `None` is
-/// returned. This prevents the UI from freezing when system commands
-/// hang (e.g. `lsof` or `netstat` with no network).
-#[cfg(target_os = "macos")]
-pub fn run_with_timeout(
-    cmd: &mut std::process::Command,
-    timeout: std::time::Duration,
-) -> Option<std::process::Output> {
-    use std::process::Stdio;
-
-    let mut child = cmd
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .ok()?;
-
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return child.wait_with_output().ok(),
-            Ok(None) if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
-            Err(_) => return None,
-        }
-    }
-}
-
 /// Create a directory (and parents) owned by the real user.
 ///
 /// Under sudo, `create_dir_all` produces root-owned dirs.
@@ -416,13 +382,12 @@ fn format_system_time_inner(time: std::time::SystemTime) -> Option<String> {
 
 #[cfg(not(unix))]
 fn format_system_time_inner(time: std::time::SystemTime) -> Option<String> {
-    // Non-Unix fallback: use current time via shell (ignoring the `time` param)
-    let _ = time;
-    std::process::Command::new("date")
-        .arg("+%H:%M:%S")
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    // Non-Unix fallback via the `time` crate (no subprocess shell-out).
+    use time::format_description::well_known::iso8601;
+    let odt = time::OffsetDateTime::from(time);
+    let format = time::format_description::parse("[hour]:[minute]:[second]").ok()?;
+    let _ = iso8601;
+    odt.format(&format).ok()
 }
 
 /// Formats a `SystemTime` into a compact relative time string (e.g., 1s, 2m, 3h, 4d).
@@ -612,12 +577,9 @@ pub fn get_unique_path(dir: &std::path::Path, filename: &str) -> std::path::Path
 }
 
 pub(crate) fn binary_exists(name: &str) -> bool {
-    std::process::Command::new("which")
-        .arg(name)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+    use vortix_process::CommandSpec;
+    vortix_process::run_to_output(CommandSpec::oneshot("which", vec![name.to_string()]))
+        .is_ok_and(|o| o.status.success())
 }
 
 /// Check whether `resolvconf` is installed and functional.
@@ -633,12 +595,9 @@ pub(crate) fn resolvconf_works() -> bool {
     }
     // Test with `--version` which works with both openresolv and systemd-resolvconf.
     // `resolvconf -l` (list) is not supported by systemd-resolvconf's shim.
-    std::process::Command::new("resolvconf")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+    use vortix_process::CommandSpec;
+    vortix_process::run_to_output(CommandSpec::oneshot("resolvconf", vec!["--version".into()]))
+        .is_ok_and(|o| o.status.success())
 }
 
 /// Detect whether `systemd-resolved` is managing DNS on this system.

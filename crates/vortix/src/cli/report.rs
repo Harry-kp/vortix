@@ -10,7 +10,7 @@
 use std::fmt::Write as _;
 use std::io::{self, Write};
 use std::path::Path;
-use std::process::Command;
+use vortix_process::CommandSpec;
 
 use crate::constants;
 
@@ -263,7 +263,8 @@ fn check_tool(name: &'static str, version_args: &[&str]) -> ToolStatus {
     let path = cmd_stdout("which", &[name]);
 
     // wg-quick --version exits non-zero on some systems; try to get version anyway
-    let version = match Command::new(name).args(version_args).output() {
+    let owned_args: Vec<String> = version_args.iter().map(|s| (*s).to_string()).collect();
+    let version = match vortix_process::run_to_output(CommandSpec::oneshot(name, owned_args)) {
         Ok(output) => {
             let raw = if output.stdout.is_empty() {
                 String::from_utf8_lossy(&output.stderr).to_string()
@@ -572,21 +573,11 @@ fn copy_to_clipboard(text: &str) -> bool {
 
 /// Pipe `text` to a command's stdin.
 fn pipe_to_command(cmd: &str, text: &str) -> Option<()> {
-    use std::process::Stdio;
-
-    let mut child = Command::new(cmd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(text.as_bytes()).ok()?;
-    }
-
-    let status = child.wait().ok()?;
-    status.success().then_some(())
+    let output = vortix_process::run_to_output(
+        CommandSpec::oneshot(cmd, vec![]).stdin(text.as_bytes().to_vec()),
+    )
+    .ok()?;
+    output.status.success().then_some(())
 }
 
 /// Fallback when clipboard is unavailable.
@@ -614,7 +605,8 @@ fn redact_home_prefix(path: &str) -> String {
 
 /// Run a command and return its stdout as a trimmed string.
 fn cmd_stdout(cmd: &str, args: &[&str]) -> Option<String> {
-    let output = Command::new(cmd).args(args).output().ok()?;
+    let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+    let output = vortix_process::run_to_output(CommandSpec::oneshot(cmd, owned)).ok()?;
     if output.status.success() {
         let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if s.is_empty() {

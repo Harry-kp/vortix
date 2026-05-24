@@ -1,10 +1,12 @@
 //! Production `CommandRunner` implementation backed by `tokio::process`.
 
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+use tokio::runtime::Runtime;
 use tracing::{debug, info, warn};
 use vortix_core::ports::process::{
     CommandOutcome, CommandRunner as Trait, CommandSpec, DetachedHandle, ExitStatusInfo, Kind,
@@ -12,13 +14,69 @@ use vortix_core::ports::process::{
 };
 
 /// Production runner. Constructed once at startup and held in the engine actor.
-#[derive(Debug, Clone, Default)]
-pub struct RealRunner;
+///
+/// Bundles a private `tokio` runtime so callers in synchronous code paths
+/// (the TUI loop, CLI commands) can drive async subprocess invocations via
+/// `runtime.block_on(...)`. Idea 3's `EngineHandle` PR makes this seam fully
+/// async; until then, the runtime here is the transitional shape that lets
+/// every subprocess flow through this one trait.
+#[derive(Debug, Clone)]
+pub struct RealRunner {
+    runtime: Arc<Runtime>,
+}
+
+impl Default for RealRunner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl RealRunner {
+    /// Construct a real runner with a fresh multi-threaded tokio runtime.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the runtime cannot be constructed — runtime build failure is
+    /// unrecoverable for a process whose subprocesses all flow through this
+    /// runner. Callers wanting graceful handling should use [`Self::try_new`].
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self::try_new().expect("tokio runtime should be constructible at startup")
+    }
+
+    /// Construct a real runner with a fresh multi-threaded tokio runtime,
+    /// returning the build error if construction fails.
+    pub fn try_new() -> std::io::Result<Self> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .thread_name("vortix-subprocess")
+            .build()?;
+        Ok(Self {
+            runtime: Arc::new(runtime),
+        })
+    }
+
+    /// Borrow the underlying runtime handle for callers that need to drive
+    /// other async work on the same runtime (e.g., spawning background
+    /// telemetry tasks once everything is async).
+    #[must_use]
+    pub fn runtime(&self) -> &Runtime {
+        &self.runtime
+    }
+
+    /// Synchronous wrapper around [`Trait::run`].
+    pub fn run_blocking(&self, spec: CommandSpec) -> Result<CommandOutcome, ProcessError> {
+        self.runtime.block_on(<Self as Trait>::run(self, spec))
+    }
+
+    /// Synchronous wrapper around [`Trait::spawn_detached`].
+    pub fn spawn_detached_blocking(
+        &self,
+        spec: CommandSpec,
+    ) -> Result<DetachedHandle, ProcessError> {
+        self.runtime
+            .block_on(<Self as Trait>::spawn_detached(self, spec))
     }
 
     fn check_privilege(spec: &CommandSpec) -> Result<(), ProcessError> {
@@ -32,6 +90,7 @@ impl RealRunner {
 }
 
 impl Trait for RealRunner {
+    #[allow(clippy::too_many_lines)]
     async fn run(&self, spec: CommandSpec) -> Result<CommandOutcome, ProcessError> {
         Self::check_privilege(&spec)?;
 
@@ -83,49 +142,49 @@ impl Trait for RealRunner {
         // Optionally write stdin.
         if let Some(stdin_bytes) = &spec.stdin_bytes {
             if let Some(mut stdin) = child.stdin.take() {
-                stdin.write_all(stdin_bytes).await.map_err(|e| {
-                    ProcessError::IoError {
+                stdin
+                    .write_all(stdin_bytes)
+                    .await
+                    .map_err(|e| ProcessError::IoError {
                         program: spec.program.clone(),
                         source: e,
-                    }
-                })?;
+                    })?;
                 drop(stdin);
             }
         }
 
         // Wait with optional timeout.
         let output = if let Some(timeout) = spec.timeout {
-            match tokio::time::timeout(timeout, child.wait_with_output()).await {
-                Ok(result) => result.map_err(|e| ProcessError::IoError {
+            let Ok(result) = tokio::time::timeout(timeout, child.wait_with_output()).await else {
+                warn!(
+                    target: "vortix::process",
+                    program = %spec.program,
+                    duration_ms = %timeout.as_millis(),
+                    "subprocess.timeout"
+                );
+                return Err(ProcessError::Timeout {
                     program: spec.program.clone(),
-                    source: e,
-                })?,
-                Err(_) => {
-                    warn!(
-                        target: "vortix::process",
-                        program = %spec.program,
-                        duration_ms = %timeout.as_millis(),
-                        "subprocess.timeout"
-                    );
-                    return Err(ProcessError::Timeout {
-                        program: spec.program.clone(),
-                        duration: timeout,
-                    });
-                }
-            }
-        } else {
-            child.wait_with_output().await.map_err(|e| {
-                ProcessError::IoError {
-                    program: spec.program.clone(),
-                    source: e,
-                }
+                    duration: timeout,
+                });
+            };
+            result.map_err(|e| ProcessError::IoError {
+                program: spec.program.clone(),
+                source: e,
             })?
+        } else {
+            child
+                .wait_with_output()
+                .await
+                .map_err(|e| ProcessError::IoError {
+                    program: spec.program.clone(),
+                    source: e,
+                })?
         };
 
         let duration = start.elapsed();
         let exit_status = ExitStatusInfo {
             code: output.status.code(),
-            signal: signal_from_status(&output.status),
+            signal: signal_from_status(output.status),
             success: output.status.success(),
         };
 
@@ -197,10 +256,7 @@ impl Trait for RealRunner {
 
         let pid = child.id().ok_or_else(|| ProcessError::IoError {
             program: spec.program.clone(),
-            source: std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "no pid available for spawned child",
-            ),
+            source: std::io::Error::other("no pid available for spawned child"),
         })?;
 
         // Drop the Child handle without awaiting — on Unix the kernel keeps the
@@ -228,13 +284,13 @@ fn is_root() -> bool {
 }
 
 #[cfg(unix)]
-fn signal_from_status(status: &std::process::ExitStatus) -> Option<i32> {
+fn signal_from_status(status: std::process::ExitStatus) -> Option<i32> {
     use std::os::unix::process::ExitStatusExt;
     status.signal()
 }
 
 #[cfg(not(unix))]
-fn signal_from_status(_status: &std::process::ExitStatus) -> Option<i32> {
+fn signal_from_status(_status: std::process::ExitStatus) -> Option<i32> {
     None
 }
 

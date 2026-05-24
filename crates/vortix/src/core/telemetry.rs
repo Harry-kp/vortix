@@ -11,6 +11,8 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
 
+use vortix_process::CommandSpec;
+
 use crate::constants;
 use crate::logger::LogLevel;
 use serde::Deserialize;
@@ -218,9 +220,15 @@ fn try_ipinfo_api(
     let timeout = cfg.api_timeout.to_string();
 
     for attempt in 0..constants::RETRY_ATTEMPTS {
-        let output = std::process::Command::new("curl")
-            .args(["-s", "--max-time", &timeout, &cfg.ip_api_primary])
-            .output();
+        let output = vortix_process::run_to_output(CommandSpec::oneshot(
+            "curl",
+            vec![
+                "-s".into(),
+                "--max-time".into(),
+                timeout.clone(),
+                cfg.ip_api_primary.clone(),
+            ],
+        ));
 
         if let Err(e) = &output {
             let _ = tx.send(TelemetryUpdate::Log(
@@ -310,9 +318,15 @@ fn try_ipify_api(tx: &Sender<TelemetryUpdate>, cfg: &TelemetryConfig) -> Option<
         .map_or("https://api.ipify.org", String::as_str);
 
     for attempt in 0..constants::RETRY_ATTEMPTS {
-        let output = std::process::Command::new("curl")
-            .args(["-s", "--max-time", &timeout, url])
-            .output();
+        let output = vortix_process::run_to_output(CommandSpec::oneshot(
+            "curl",
+            vec![
+                "-s".into(),
+                "--max-time".into(),
+                timeout.clone(),
+                url.into(),
+            ],
+        ));
 
         if let Err(e) = &output {
             let _ = tx.send(TelemetryUpdate::Log(
@@ -369,9 +383,15 @@ fn try_icanhazip_api(tx: &Sender<TelemetryUpdate>, cfg: &TelemetryConfig) -> Opt
         .map_or("https://icanhazip.com", String::as_str);
 
     for attempt in 0..constants::RETRY_ATTEMPTS {
-        let output = std::process::Command::new("curl")
-            .args(["-s", "--max-time", &timeout, url])
-            .output();
+        let output = vortix_process::run_to_output(CommandSpec::oneshot(
+            "curl",
+            vec![
+                "-s".into(),
+                "--max-time".into(),
+                timeout.clone(),
+                url.into(),
+            ],
+        ));
 
         if let Err(e) = &output {
             let _ = tx.send(TelemetryUpdate::Log(
@@ -406,9 +426,15 @@ fn try_ifconfig_api(tx: &Sender<TelemetryUpdate>, cfg: &TelemetryConfig) -> Opti
         .map_or("https://ifconfig.me/ip", String::as_str);
 
     for attempt in 0..constants::RETRY_ATTEMPTS {
-        let output = std::process::Command::new("curl")
-            .args(["-s", "--max-time", &timeout, url])
-            .output();
+        let output = vortix_process::run_to_output(CommandSpec::oneshot(
+            "curl",
+            vec![
+                "-s".into(),
+                "--max-time".into(),
+                timeout.clone(),
+                url.into(),
+            ],
+        ));
 
         if let Err(e) = &output {
             let _ = tx.send(TelemetryUpdate::Log(
@@ -647,10 +673,18 @@ fn fetch_latency(tx: &Sender<TelemetryUpdate>, cfg: &std::sync::Arc<TelemetryCon
 
         for target in &cfg.ping_targets {
             for attempt in 0..constants::RETRY_ATTEMPTS {
-                if let Ok(output) = std::process::Command::new("ping")
-                    .args(["-c", "3", "-i", "0.2", "-W", &timeout, target])
-                    .output()
-                {
+                if let Ok(output) = vortix_process::run_to_output(CommandSpec::oneshot(
+                    "ping",
+                    vec![
+                        "-c".into(),
+                        "3".into(),
+                        "-i".into(),
+                        "0.2".into(),
+                        "-W".into(),
+                        timeout.clone(),
+                        (*target).clone(),
+                    ],
+                )) {
                     if output.status.success() {
                         let stdout = String::from_utf8_lossy(&output.stdout);
                         let stats = parse_ping_output(&stdout);
@@ -703,9 +737,16 @@ fn fetch_security_info(tx: &Sender<TelemetryUpdate>, cfg: &std::sync::Arc<Teleme
         let mut is_leaking = false;
         let ipv6_timeout = cfg.api_timeout.to_string();
         for endpoint in &cfg.ipv6_check_apis {
-            let output6 = std::process::Command::new("curl")
-                .args(["-6", "-s", "--max-time", &ipv6_timeout, endpoint])
-                .output();
+            let output6 = vortix_process::run_to_output(CommandSpec::oneshot(
+                "curl",
+                vec![
+                    "-6".into(),
+                    "-s".into(),
+                    "--max-time".into(),
+                    ipv6_timeout.clone(),
+                    endpoint.clone(),
+                ],
+            ));
             if output6.map(|o| o.status.success()).unwrap_or(false) {
                 is_leaking = true;
                 break;

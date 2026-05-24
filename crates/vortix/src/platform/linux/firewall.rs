@@ -6,7 +6,7 @@ use crate::constants;
 use crate::core::killswitch::{KillSwitchError, Result};
 use crate::logger::{self, LogLevel};
 use crate::platform::Firewall;
-use std::process::Command;
+use vortix_process::{CommandSpec, PrivilegeReq};
 
 /// Alias for readability within this module.
 const CHAIN_NAME: &str = constants::IPTABLES_CHAIN_NAME;
@@ -35,17 +35,13 @@ impl IptablesFirewall {
 
     /// Check if iptables is available on the system.
     fn has_iptables() -> bool {
-        Command::new("iptables")
-            .arg("--version")
-            .output()
+        vortix_process::run_to_output(CommandSpec::oneshot("iptables", vec!["--version".into()]))
             .is_ok_and(|o| o.status.success())
     }
 
     /// Check if nftables (nft) is available on the system.
     fn has_nft() -> bool {
-        Command::new("nft")
-            .arg("--version")
-            .output()
+        vortix_process::run_to_output(CommandSpec::oneshot("nft", vec!["--version".into()]))
             .is_ok_and(|o| o.status.success())
     }
 
@@ -53,10 +49,11 @@ impl IptablesFirewall {
 
     /// Run an iptables command and return success.
     fn iptables(args: &[&str]) -> std::result::Result<(), String> {
-        let output = Command::new("iptables")
-            .args(args)
-            .output()
-            .map_err(|e| format!("Failed to run iptables: {e}"))?;
+        let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+        let output = vortix_process::run_to_output(
+            CommandSpec::oneshot("iptables", owned).privilege(PrivilegeReq::Root),
+        )
+        .map_err(|e| format!("Failed to run iptables: {e}"))?;
 
         if output.status.success() {
             Ok(())
@@ -133,10 +130,11 @@ impl IptablesFirewall {
 
     /// Run an nft command and return success.
     fn nft(args: &[&str]) -> std::result::Result<(), String> {
-        let output = Command::new("nft")
-            .args(args)
-            .output()
-            .map_err(|e| format!("Failed to run nft: {e}"))?;
+        let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+        let output = vortix_process::run_to_output(
+            CommandSpec::oneshot("nft", owned).privilege(PrivilegeReq::Root),
+        )
+        .map_err(|e| format!("Failed to run nft: {e}"))?;
 
         if output.status.success() {
             Ok(())
@@ -185,25 +183,14 @@ impl IptablesFirewall {
         let _ = Self::nft(&["delete", "table", "inet", NFT_TABLE]);
 
         // Apply the full ruleset atomically via stdin
-        let mut child = Command::new("nft")
-            .arg("-f")
-            .arg("-")
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| KillSwitchError::CommandFailed(format!("nft spawn: {e}")))?;
+        let output = vortix_process::run_to_output(
+            CommandSpec::oneshot("nft", vec!["-f".into(), "-".into()])
+                .privilege(PrivilegeReq::Root)
+                .stdin(ruleset.into_bytes()),
+        )
+        .map_err(|e| KillSwitchError::CommandFailed(format!("nft spawn: {e}")))?;
 
-        if let Some(mut stdin) = child.stdin.take() {
-            use std::io::Write;
-            stdin
-                .write_all(ruleset.as_bytes())
-                .map_err(|e| KillSwitchError::CommandFailed(format!("nft stdin: {e}")))?;
-        }
-
-        let status = child
-            .wait()
-            .map_err(|e| KillSwitchError::CommandFailed(format!("nft wait: {e}")))?;
-
-        if !status.success() {
+        if !output.status.success() {
             return Err(KillSwitchError::CommandFailed(
                 "nft failed to load ruleset".to_string(),
             ));

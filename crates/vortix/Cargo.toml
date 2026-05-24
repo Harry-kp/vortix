@@ -59,6 +59,11 @@ unicode-width = { workspace = true }
 open = { workspace = true }
 urlencoding = { workspace = true }
 
+# CommandRunner port (plan 002): all subprocess invocations flow through this crate.
+vortix-process = { path = "../vortix-process" }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
 # Per-OS platform adapters (empty stubs in plan 001; populated by plan 003).
 [target.'cfg(target_os = "macos")'.dependencies]
 vortix-platform-macos = { path = "../vortix-platform-macos" }
