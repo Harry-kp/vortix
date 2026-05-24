@@ -26,8 +26,8 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     // Peak detection for dynamic Y-axis scaling (calculate first for title)
-    let max_down = app.down_history.iter().copied().fold(0.0, f64::max);
-    let max_up = app.up_history.iter().copied().fold(0.0, f64::max);
+    let max_down = app.engine.down_history.iter().copied().fold(0.0, f64::max);
+    let max_up = app.engine.up_history.iter().copied().fold(0.0, f64::max);
     let peak = (max_down.max(max_up) * 1.2).max(1024.0 * 1024.0 * 0.5);
     let (scale_val, scale_unit) = if peak >= 1024.0 * 1024.0 * 1024.0 {
         (peak / 1024.0 / 1024.0 / 1024.0, "GB/s")
@@ -64,7 +64,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
 
     // Calculate session totals from connection details if available
-    let (session_rx, session_tx) = match &app.connection_state {
+    let (session_rx, session_tx) = match &app.engine.connection_state {
         ConnectionState::Connected { details, .. } => {
             let rx = if details.transfer_rx.is_empty() {
                 "0B".to_string()
@@ -84,13 +84,13 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     let stats_line = Line::from(vec![
         Span::styled(" ▲ UP: ", Style::default().fg(theme::NORD_GREEN)),
         Span::styled(
-            format!("{:<10}", utils::format_bytes_speed(app.current_up)),
+            format!("{:<10}", utils::format_bytes_speed(app.engine.current_up)),
             Style::default().fg(theme::TEXT_PRIMARY),
         ),
         Span::styled(" │ ", Style::default().fg(theme::NORD_POLAR_NIGHT_4)),
         Span::styled(" ▼ DOWN: ", Style::default().fg(theme::NORD_FROST_2)),
         Span::styled(
-            format!("{:<10}", utils::format_bytes_speed(app.current_down)),
+            format!("{:<10}", utils::format_bytes_speed(app.engine.current_down)),
             Style::default().fg(theme::TEXT_PRIMARY),
         ),
         Span::styled(" │ ", Style::default().fg(theme::NORD_POLAR_NIGHT_4)),
@@ -105,7 +105,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
         chunks[0],
     );
 
-    let hist_len = app.down_history.len();
+    let hist_len = app.engine.down_history.len();
     #[allow(clippy::cast_precision_loss)]
     let x_max = constants::NETWORK_HISTORY_SIZE as f64;
     let canvas = Canvas::default()
@@ -119,8 +119,8 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
                     let x1 = i as f64;
                     let x2 = (i + 1) as f64;
 
-                    let dy1 = app.down_history[i];
-                    let dy2 = app.down_history[i + 1];
+                    let dy1 = app.engine.down_history[i];
+                    let dy2 = app.engine.down_history[i + 1];
                     if dy1 > 0.0 || dy2 > 0.0 {
                         ctx.draw(&CanvasLine {
                             x1,
@@ -131,8 +131,8 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
                         });
                     }
 
-                    let uy1 = app.up_history[i];
-                    let uy2 = app.up_history[i + 1];
+                    let uy1 = app.engine.up_history[i];
+                    let uy2 = app.engine.up_history[i + 1];
                     if uy1 > 0.0 || uy2 > 0.0 {
                         ctx.draw(&CanvasLine {
                             x1,
@@ -164,8 +164,8 @@ fn render_back(frame: &mut Frame, app: &App, area: Rect, border_style: Style) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let current_down_str = utils::format_bytes_speed(app.current_down);
-    let current_up_str = utils::format_bytes_speed(app.current_up);
+    let current_down_str = utils::format_bytes_speed(app.engine.current_down);
+    let current_up_str = utils::format_bytes_speed(app.engine.current_up);
 
     let text = vec![
         Line::from(""),

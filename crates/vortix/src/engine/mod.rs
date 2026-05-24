@@ -6,7 +6,7 @@
 //! the CLI without pulling in any terminal rendering code.
 //!
 //! The TUI embeds `VpnEngine` inside `App` via `Deref`/`DerefMut`, so all
-//! existing field accesses (`self.profiles`, `app.connection_state`, …) resolve
+//! existing field accesses (`self.profiles`, `app.engine.connection_state`, …) resolve
 //! transparently through the engine.
 
 pub mod connection;

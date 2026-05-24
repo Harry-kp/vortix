@@ -20,7 +20,7 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
         Style::default().fg(theme::BORDER_DEFAULT)
     };
 
-    let sort_label = app.sort_order.label();
+    let sort_label = app.engine.sort_order.label();
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
@@ -29,7 +29,7 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    if app.profiles.is_empty() {
+    if app.engine.profiles.is_empty() {
         let empty_msg = vec![
             Line::from(""),
             Line::from(Span::styled(
@@ -55,7 +55,7 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    let (active_profile, active_color) = match &app.connection_state {
+    let (active_profile, active_color) = match &app.engine.connection_state {
         ConnectionState::Connected { profile, .. } => (Some(profile.clone()), theme::SUCCESS),
         ConnectionState::Connecting { profile, .. }
         | ConnectionState::Disconnecting { profile, .. } => (Some(profile.clone()), theme::WARNING),
@@ -66,6 +66,7 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let name_budget = (inner.width.saturating_sub(fixed_cols)) as usize;
 
     let items: Vec<Row> = app
+        .engine
         .profiles
         .iter()
         .enumerate()
@@ -141,7 +142,7 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
                 Style::default().fg(status_color),
             ));
             let state_badge = if is_active {
-                match &app.connection_state {
+                match &app.engine.connection_state {
                     ConnectionState::Connected { .. } => " ✓",
                     ConnectionState::Connecting { .. } => " …",
                     ConnectionState::Disconnecting { .. } => " ⏻",
@@ -184,9 +185,13 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
         .style(Style::default().fg(theme::NORD_POLAR_NIGHT_4))
         .thumb_style(Style::default().fg(theme::ACCENT_PRIMARY));
 
-    let mut scrollbar_state =
-        ScrollbarState::new(app.profiles.len().saturating_sub(inner.height as usize))
-            .position(app.profile_list_state.selected().unwrap_or(0));
+    let mut scrollbar_state = ScrollbarState::new(
+        app.engine
+            .profiles
+            .len()
+            .saturating_sub(inner.height as usize),
+    )
+    .position(app.profile_list_state.selected().unwrap_or(0));
 
     frame.render_stateful_widget(
         scrollbar,

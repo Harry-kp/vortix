@@ -43,9 +43,9 @@ impl App {
         let level_tag = level.prefix();
         Self::append_to_log_file(
             &format!("{timestamp} [{level_tag}] {category}: {content}"),
-            &self.config_dir,
-            self.config.log_rotation_size,
-            self.config.log_retention_days,
+            &self.engine.config_dir,
+            self.engine.config.log_rotation_size,
+            self.engine.config.log_retention_days,
         );
     }
 
@@ -78,7 +78,7 @@ impl App {
         match self.focused_panel {
             FocusedPanel::Sidebar => {
                 let current = self.profile_list_state.selected().unwrap_or(0);
-                let last = self.profiles.len().saturating_sub(1);
+                let last = self.engine.profiles.len().saturating_sub(1);
                 if current < last {
                     self.profile_list_state.select(Some(current + 1));
                 }
@@ -174,7 +174,7 @@ impl App {
 
     /// Copy public IP address to clipboard
     pub(crate) fn copy_ip_to_clipboard(&mut self) {
-        let ip_str = self.public_ip.clone();
+        let ip_str = self.engine.public_ip.clone();
         if ip_str.is_empty() || ip_str == constants::MSG_FETCHING || ip_str.starts_with("Error") {
             self.show_toast("No valid IP available yet".to_string(), ToastType::Error);
             return;
