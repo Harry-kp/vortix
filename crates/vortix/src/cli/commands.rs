@@ -80,8 +80,41 @@ pub fn handle_command(
             profile,
             inline_secrets,
         } => handle_export(config_dir, profile, *inline_secrets, mode),
+        Commands::Journal { op } => handle_journal(op, mode),
         Commands::Completions { shell } => {
             handle_completions(*shell);
+            0
+        }
+    }
+}
+
+/// Inspect the engine event journal.
+fn handle_journal(op: &crate::cli::args::JournalOp, _mode: OutputMode) -> i32 {
+    use crate::cli::args::JournalOp;
+
+    let Some(journal) = vortix_core::journal::global_journal() else {
+        eprintln!("journal not installed (no tokio runtime or `[journal] disk = false` not yet supported here)");
+        return 1;
+    };
+
+    match op {
+        JournalOp::Path => {
+            if let Some(path) = &journal.session_path {
+                println!("{}", path.display());
+                0
+            } else {
+                eprintln!("disk persistence disabled (`[journal] disk = false`)");
+                1
+            }
+        }
+        JournalOp::Tail { count } => {
+            let tail = journal.tail();
+            let start = tail.len().saturating_sub(*count);
+            for env in &tail[start..] {
+                if let Ok(line) = serde_json::to_string(env) {
+                    println!("{line}");
+                }
+            }
             0
         }
     }
