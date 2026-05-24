@@ -111,7 +111,9 @@ fn is_allowlisted_file(path: &Path, workspace_root: &Path) -> bool {
     let rel_str = rel.to_string_lossy();
 
     // Allow the runner impl itself.
-    if rel_str == "crates/vortix-process/src/real.rs" {
+    if rel_str == "crates/vortix-process/src/real.rs"
+        || rel_str == "crates/vortix/src/vortix_process/real.rs"
+    {
         return true;
     }
 
@@ -215,7 +217,9 @@ fn is_platform_leak_allowlisted(path: &Path, workspace_root: &Path) -> bool {
     let rel_str = rel.to_string_lossy();
 
     rel_str.starts_with("crates/vortix-platform-")
+        || rel_str.starts_with("crates/vortix/src/vortix_platform_")
         || rel_str.starts_with("crates/vortix/src/platform/")
+        || rel_str == "crates/vortix/src/lib.rs"
         || rel_str == "crates/vortix/src/constants.rs"
         || rel_str.starts_with("crates/xtask/")
 }
@@ -262,9 +266,13 @@ fn check_protocol_leak() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         };
 
-        let allowed_names: &[&str] = if rel_str.starts_with("crates/vortix-protocol-wireguard/") {
+        let allowed_names: &[&str] = if rel_str.starts_with("crates/vortix-protocol-wireguard/")
+            || rel_str.starts_with("crates/vortix/src/vortix_protocol_wireguard/")
+        {
             &["openvpn"]
-        } else if rel_str.starts_with("crates/vortix-protocol-openvpn/") {
+        } else if rel_str.starts_with("crates/vortix-protocol-openvpn/")
+            || rel_str.starts_with("crates/vortix/src/vortix_protocol_openvpn/")
+        {
             &["wg", "wg-quick"]
         } else if rel_str.starts_with("crates/xtask/") {
             continue;
