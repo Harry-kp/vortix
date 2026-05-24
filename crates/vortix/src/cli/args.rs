@@ -313,6 +313,28 @@ pub enum Commands {
         op: SecretsOp,
     },
 
+    /// Audit open sockets and which interface routes them (plan 015 phase C / plan 013)
+    ///
+    /// Per-process snapshot of open TCP/UDP sockets visible to the
+    /// calling user. Useful for answering "is this traffic actually
+    /// going through the VPN tunnel?" — the `--vpn-only` flag filters
+    /// to sockets bound to / routing via the active VPN interface.
+    ///
+    /// EXAMPLES:
+    ///     vortix audit                          Tabular snapshot
+    ///     vortix audit --json                   Structured JSON envelope
+    ///     vortix audit --pid 12345              Filter to one process
+    ///     vortix audit --vpn-only               Only sockets on the tunnel interface
+    Audit {
+        /// Filter results to a single PID.
+        #[arg(long)]
+        pid: Option<u32>,
+        /// Only show sockets routing via the active VPN interface
+        /// (requires an active connection; empty result otherwise).
+        #[arg(long)]
+        vpn_only: bool,
+    },
+
     /// Generate shell completions for vortix
     ///
     /// EXAMPLES:

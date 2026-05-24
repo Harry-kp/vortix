@@ -370,6 +370,49 @@ impl RouteTableKind {
     }
 }
 
+/// Scriptable mock for the `SocketAudit` port (plan 015 phase C).
+#[derive(Debug, Default, Clone)]
+pub struct MockSocketAudit {
+    pub canned: Vec<vortix_core::ports::socket_audit::SocketSnapshot>,
+}
+
+/// Static-dispatch carrier for the `SocketAudit` port (plan 015 phase C).
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum SocketAuditKind {
+    #[cfg(target_os = "macos")]
+    Macos,
+    #[cfg(target_os = "linux")]
+    Linux,
+    #[cfg(target_os = "windows")]
+    Windows,
+    Mock(MockSocketAudit),
+}
+
+impl SocketAuditKind {
+    /// Snapshot the current socket inventory.
+    ///
+    /// # Errors
+    ///
+    /// See `vortix_core::ports::socket_audit::SocketAuditError`.
+    pub fn snapshot(
+        &self,
+    ) -> vortix_core::ports::socket_audit::SocketAuditResult<
+        Vec<vortix_core::ports::socket_audit::SocketSnapshot>,
+    > {
+        use vortix_core::ports::socket_audit::SocketAudit;
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Macos => platform_impl::LsofSocketAudit::snapshot(),
+            #[cfg(target_os = "linux")]
+            Self::Linux => platform_impl::ProcSocketAudit::snapshot(),
+            #[cfg(target_os = "windows")]
+            Self::Windows => platform_impl::WindowsSocketAudit::snapshot(),
+            Self::Mock(m) => Ok(m.canned.clone()),
+        }
+    }
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // The aggregate
 // ───────────────────────────────────────────────────────────────────────────
@@ -386,6 +429,7 @@ pub struct Platform {
     pub interface: InterfaceKind,
     pub network_stats: NetworkStatsKind,
     pub route_table: RouteTableKind,
+    pub socket_audit: SocketAuditKind,
 }
 
 impl Platform {
@@ -404,6 +448,7 @@ impl Platform {
                 interface: InterfaceKind::Macos,
                 network_stats: NetworkStatsKind::Macos,
                 route_table: RouteTableKind::Macos,
+                socket_audit: SocketAuditKind::Macos,
             }
         }
         #[cfg(target_os = "linux")]
@@ -414,6 +459,7 @@ impl Platform {
                 interface: InterfaceKind::Linux,
                 network_stats: NetworkStatsKind::Linux,
                 route_table: RouteTableKind::Linux,
+                socket_audit: SocketAuditKind::Linux,
             }
         }
         #[cfg(target_os = "windows")]
@@ -424,6 +470,7 @@ impl Platform {
                 interface: InterfaceKind::Windows,
                 network_stats: NetworkStatsKind::Windows,
                 route_table: RouteTableKind::Windows,
+                socket_audit: SocketAuditKind::Windows,
             }
         }
     }
@@ -437,6 +484,7 @@ impl Platform {
             interface: InterfaceKind::Mock(MockInterface::default()),
             network_stats: NetworkStatsKind::Mock(MockNetworkStats::default()),
             route_table: RouteTableKind::Mock(MockRouteTable::default()),
+            socket_audit: SocketAuditKind::Mock(MockSocketAudit::default()),
         }
     }
 }

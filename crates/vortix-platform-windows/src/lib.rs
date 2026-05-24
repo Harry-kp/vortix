@@ -20,9 +20,11 @@ pub mod firewall;
 pub mod interface;
 pub mod network_stats;
 pub mod route_table;
+pub mod socket_audit;
 
 pub use dns::WindowsDns;
 pub use firewall::WindowsFirewall;
 pub use interface::WindowsInterface;
 pub use network_stats::WindowsNetworkStats;
 pub use route_table::WindowsRouteTable;
+pub use socket_audit::WindowsSocketAudit;

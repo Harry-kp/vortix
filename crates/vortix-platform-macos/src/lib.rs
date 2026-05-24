@@ -14,9 +14,11 @@ pub mod firewall;
 pub mod interface;
 pub mod network_stats;
 pub mod route_table;
+pub mod socket_audit;
 
 pub use dns::MacDns;
 pub use firewall::PfFirewall;
 pub use interface::MacInterface;
 pub use network_stats::MacNetworkStats;
 pub use route_table::MacRouteTable;
+pub use socket_audit::LsofSocketAudit;

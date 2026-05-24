@@ -11,4 +11,5 @@ pub mod killswitch;
 pub mod network_stats;
 pub mod process;
 pub mod route_table;
+pub mod socket_audit;
 pub mod tunnel;
