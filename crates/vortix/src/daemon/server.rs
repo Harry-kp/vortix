@@ -133,10 +133,6 @@ async fn dispatch(req: IpcRequest) -> IpcResponse {
             "engine wiring not yet connected in daemon — coming in v0.3.x".into(),
         )),
         IpcOp::Shutdown => Ok(IpcResult::ShuttingDown),
-        // IpcOp is #[non_exhaustive]; future variants surface as
-        // MalformedRequest at the wire level until the daemon learns
-        // about them.
-        _ => Err(IpcError::MalformedRequest("unknown op variant".into())),
     };
     IpcResponse { id: req.id, result }
 }
