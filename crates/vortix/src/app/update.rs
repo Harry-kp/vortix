@@ -585,6 +585,21 @@ impl App {
                 );
                 let old_ip = self.engine.public_ip.clone();
 
+                // Plan 005 U7: emit IpChanged into the journal so the
+                // bug-report and downstream subscribers see the trail.
+                // Only fires on actual changes, not initial detection.
+                if old_ip != ip
+                    && old_ip != constants::MSG_FETCHING
+                    && old_ip != constants::MSG_DETECTING
+                {
+                    if let Some(journal) = vortix_core::journal::global_journal() {
+                        let _ = journal.append(vortix_core::engine::EngineEvent::IpChanged {
+                            old: Some(old_ip.clone()),
+                            new: ip.clone(),
+                        });
+                    }
+                }
+
                 // Store as real_ip when disconnected (for security comparison)
                 if matches!(self.engine.connection_state, ConnectionState::Disconnected) {
                     if self.engine.real_ip.is_none() {

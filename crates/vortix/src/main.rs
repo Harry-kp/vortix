@@ -296,6 +296,25 @@ fn run_tui(
             let engine = Engine::new(initial_tunnel, resolver).with_tunnel_factory(factory);
             let handle = EngineHandle::local(engine, journal);
             app = app.with_engine_handle(handle);
+
+            // Plan 005 U7: spawn a journal-subscriber task that reacts
+            // to engine events. Today it nudges the legacy telemetry
+            // worker on `TunnelUp` so connect → IP-refresh happens
+            // promptly. Future units route more flows through here.
+            if let Some(j) = vortix_core::journal::global_journal() {
+                let mut rx = j.subscribe();
+                let nudge = app.engine.telemetry_nudge.clone();
+                tokio::spawn(async move {
+                    use vortix_core::engine::EngineEvent;
+                    while let Ok(envelope) = rx.recv().await {
+                        if matches!(envelope.event, EngineEvent::TunnelUp { .. }) {
+                            if let Some(n) = &nudge {
+                                let _ = n.send(());
+                            }
+                        }
+                    }
+                });
+            }
         }
     }
     let events = EventHandler::new(tick_rate);
