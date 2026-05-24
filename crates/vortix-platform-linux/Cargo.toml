@@ -8,6 +8,9 @@ publish = false
 
 [dependencies]
 vortix-core = { path = "../vortix-core" }
+vortix-process = { path = "../vortix-process" }
+tracing = { workspace = true }
+libc = "0.2"
 
 [lints]
 workspace = true

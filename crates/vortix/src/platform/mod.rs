@@ -1,11 +1,10 @@
-//! Platform abstraction layer for OS-specific functionality.
+//! Platform abstraction layer — thin re-exports.
 //!
-//! This module provides trait-based abstractions for platform-specific operations,
-//! with compile-time selection via `#[cfg]` conditional compilation.
-//!
-//! Supported platforms:
-//! - macOS: pf firewall, netstat -ib, ifconfig, scutil/networksetup
-//! - Linux: iptables/nftables, /proc/net/dev, ip addr, resolvectl
+//! Plan 003 moves capability-port traits and impls into `vortix-core::ports::*`
+//! and the `vortix-platform-{linux,macos}` crates. The submodules in this
+//! directory still host the remaining sync helpers (`DnsResolver`,
+//! `InterfaceDetector`, `NetworkStatsProvider`) until plan 003 U2 finishes
+//! the relocation.
 
 #[cfg(target_os = "linux")]
 pub mod linux;
@@ -15,24 +14,16 @@ pub mod macos;
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 compile_error!("Vortix currently only supports macOS and Linux");
 
-use crate::core::killswitch::Result as KsResult;
-
 // Re-export platform constants from the centralized constants module for convenience.
 pub use crate::constants::DEFAULT_VPN_INTERFACE;
 pub use crate::constants::KILLSWITCH_EMERGENCY_MSG;
 
-// === Platform Trait Definitions ===
+// `Killswitch` (was `Firewall`) lives in `vortix-core::ports::killswitch` per
+// plan 003 U1. Keep a thin alias here so existing call sites keep working
+// until U7 migrates them to `&Platform`.
+pub use vortix_core::ports::killswitch::Killswitch as Firewall;
 
-/// Firewall control for the kill switch.
-///
-/// Implementations block all non-VPN traffic when enabled.
-pub trait Firewall {
-    /// Enable kill switch by loading restrictive firewall rules.
-    fn enable_blocking(vpn_interface: &str, vpn_server_ip: Option<&str>) -> KsResult<()>;
-
-    /// Disable kill switch by flushing firewall rules.
-    fn disable_blocking() -> KsResult<()>;
-}
+// === Remaining informal traits (plan 003 U2 promotes these to ports) ===
 
 /// Network statistics collection.
 ///
