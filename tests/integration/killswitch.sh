@@ -19,8 +19,10 @@ ip netns exec vortix-test-a wg-quick up tests/integration/fixtures/wg-a.conf
 ip netns exec "$NS_B" target/release/vortix up integration
 ip netns exec "$NS_B" target/release/vortix killswitch always
 
-# Verify iptables sees DROP rules for non-tunnel traffic.
-ip netns exec "$NS_B" iptables -L OUTPUT -n | grep -q DROP
+# Verify iptables sees the VORTIX_KILLSWITCH chain with DROP rules.
+# The killswitch inserts a jump from OUTPUT to VORTIX_KILLSWITCH;
+# the actual DROP rule lives in the custom chain.
+ip netns exec "$NS_B" iptables -L VORTIX_KILLSWITCH -n | grep -q DROP
 
 # Verify outbound traffic to a non-tunnel destination is blocked.
 # Using 10.99.0.99 (within the veth subnet but not a peer) — if the
@@ -32,7 +34,7 @@ fi
 
 # Release + verify rules gone + traffic restored.
 ip netns exec "$NS_B" target/release/vortix release-killswitch
-if ip netns exec "$NS_B" iptables -L OUTPUT -n | grep -q DROP; then
+if ip netns exec "$NS_B" iptables -L VORTIX_KILLSWITCH -n 2>/dev/null | grep -q DROP; then
     echo "FAIL: DROP rules still present after release-killswitch"
     exit 1
 fi
