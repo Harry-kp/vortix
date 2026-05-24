@@ -1,0 +1,22 @@
+[Unit]
+Description=Vortix VPN engine daemon
+Documentation=https://github.com/Harry-kp/vortix
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/vortix daemon
+Restart=on-failure
+RestartSec=5
+# Phase E (plan 015) — daemon runs as root for privileged subprocess
+# work (wg-quick, openvpn, iptables). Frontend clients connect via
+# SO_PEERCRED-authenticated Unix socket. See SECURITY.md for the
+# v0.3.0 auth posture.
+User=root
+Group=root
+# Log to journald — `journalctl -u vortix-daemon` surfaces output.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
