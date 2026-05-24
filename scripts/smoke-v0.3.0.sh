@@ -97,13 +97,15 @@ else
 fi
 
 # ---- 4. engine status --json ----
-# The FSM serialises as a tagged enum: `{"Disconnected": {...}}`. We
-# accept either that shape or a future flat `{"state": "..."}` form.
+# Wrapped in the v0.3.0 CliResponse envelope: must have
+# `schema_version`, `ok: true`, and a Disconnected payload.
 if JSON_OUT="$("${VORTIX}" engine status --json 2>&1)"; then
-  if echo "${JSON_OUT}" | grep -q "Disconnected" && echo "${JSON_OUT}" | grep -q "{"; then
-    pass "vortix engine status --json returns parseable JSON"
+  if echo "${JSON_OUT}" | grep -q '"schema_version"' \
+     && echo "${JSON_OUT}" | grep -q '"ok": true' \
+     && echo "${JSON_OUT}" | grep -q "Disconnected"; then
+    pass "vortix engine status --json returns envelope with schema_version"
   else
-    fail "vortix engine status --json" "malformed output: ${JSON_OUT}"
+    fail "vortix engine status --json" "malformed envelope: ${JSON_OUT}"
   fi
 else
   fail "vortix engine status --json" "command exited non-zero"
