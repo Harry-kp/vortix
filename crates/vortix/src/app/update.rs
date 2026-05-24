@@ -371,11 +371,21 @@ impl App {
         }
     }
 
-    /// Surface config-validation errors. Currently a no-op — U5 turns
-    /// this into a startup toast and persisted overlay banner.
-    #[allow(clippy::needless_pass_by_value, clippy::unused_self)]
-    fn handle_hook_config_errors(&mut self, _errors: Vec<String>) {
-        // U5 wires this through `show_toast` + the Hooks overlay banner.
+    /// Surface hook-config validation errors via a startup toast +
+    /// persistent banner inside the Hooks overlay (plan 016 U5).
+    fn handle_hook_config_errors(&mut self, errors: Vec<String>) {
+        if errors.is_empty() {
+            self.hook_config_errors.clear();
+            return;
+        }
+        let count = errors.len();
+        let summary = if count == 1 {
+            "1 hook entry skipped — press H to see why".to_string()
+        } else {
+            format!("{count} hook entries skipped — press H to see why")
+        };
+        self.hook_config_errors = errors;
+        self.show_toast(summary, super::ToastType::Warning);
     }
 
     fn handle_manage_auth(&mut self) {
