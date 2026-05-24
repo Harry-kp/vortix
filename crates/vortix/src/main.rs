@@ -112,6 +112,25 @@ fn main() -> Result<()> {
     // Store the resolved config dir globally so all utility functions use it
     config::set_config_dir(config_dir.clone());
 
+    // Plan 006 U4: backfill profile sidecars for `.conf` / `.ovpn` files
+    // imported before the sidecar scheme existed. Idempotent — no-ops once
+    // every profile has a `.meta.toml`. Failures are logged + non-fatal.
+    let profiles_dir = config_dir.join(constants::PROFILES_DIR_NAME);
+    if let Ok(stats) = vortix_config::migrate_legacy_profiles(&profiles_dir) {
+        if stats.created > 0 {
+            eprintln!(
+                "Migrated {} profile(s) to the new sidecar scheme (plan 006 U4).",
+                stats.created
+            );
+        }
+        if stats.failed > 0 {
+            eprintln!(
+                "Warning: {} profile(s) failed to migrate; existing files untouched.",
+                stats.failed
+            );
+        }
+    }
+
     // Load config.toml (or use defaults)
     let app_config = match config::load_config(&config_dir) {
         Ok(cfg) => cfg,

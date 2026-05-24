@@ -26,6 +26,7 @@ argon2 = { workspace = true }
 zeroize = { workspace = true }
 base64 = "0.22"
 rand = "0.8"
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = { workspace = true }
