@@ -204,6 +204,8 @@ pub enum Message {
     OpenSearch,
     /// Open the help overlay
     OpenHelp,
+    /// Toggle the lifecycle-hooks overlay (plan 016 U4).
+    ToggleHooksOverlay,
     /// Cycle the activity-log level filter (All → Errors → Warn → Info → All)
     CycleLogFilter,
 }
@@ -362,6 +364,11 @@ pub fn get_bulk_actions() -> Vec<ActionMenuItem> {
             message: Message::OpenHelp,
         },
         ActionMenuItem {
+            key: "H",
+            label: "Lifecycle Hooks",
+            message: Message::ToggleHooksOverlay,
+        },
+        ActionMenuItem {
             key: "l",
             label: "Next Panel",
             message: Message::NextPanel,
@@ -443,7 +450,16 @@ mod tests {
     #[test]
     fn test_bulk_actions_count() {
         let actions = get_bulk_actions();
-        assert_eq!(actions.len(), 10);
+        assert_eq!(actions.len(), 11);
+    }
+
+    #[test]
+    fn test_bulk_actions_include_hooks_overlay() {
+        let actions = get_bulk_actions();
+        assert!(
+            actions.iter().any(|a| a.key == "H"),
+            "Plan 016 U4 bulk menu must surface the hooks overlay"
+        );
     }
 
     #[test]

@@ -194,6 +194,7 @@ impl App {
                 self.cached_config_content = None;
                 self.show_action_menu = false;
                 self.show_bulk_menu = false;
+                self.show_hooks_overlay = false;
                 self.input_mode = InputMode::Normal;
             }
             Message::OpenActionMenu => {
@@ -270,6 +271,18 @@ impl App {
             }
             Message::OpenHelp => {
                 self.input_mode = InputMode::Help { scroll: 0 };
+            }
+            Message::ToggleHooksOverlay => {
+                // Closes any other top-level overlay so the hooks
+                // view always opens clean.
+                if self.show_hooks_overlay {
+                    self.show_hooks_overlay = false;
+                } else {
+                    self.show_action_menu = false;
+                    self.show_bulk_menu = false;
+                    self.show_config = false;
+                    self.show_hooks_overlay = true;
+                }
             }
             Message::CycleLogFilter => self.handle_cycle_log_filter(),
 

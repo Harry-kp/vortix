@@ -304,6 +304,10 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
         super::overlays::config_viewer::render(frame, app);
     }
 
+    if app.show_hooks_overlay {
+        super::overlays::hooks::render(frame, app);
+    }
+
     if app.show_action_menu || app.show_bulk_menu {
         let (actions, title) = if app.show_bulk_menu {
             (message::get_bulk_actions(), " Bulk Actions ")
