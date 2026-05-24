@@ -189,7 +189,7 @@ fn default_config_dir() -> std::io::Result<PathBuf> {
     })?;
 
     // Respect XDG_CONFIG_HOME on Linux
-    #[cfg(target_os = "linux")]
+    #[cfg(target_os = "linux")] // xtask:allow-platform-cfg: XDG paths are a Linux-only convention
     if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
         let xdg_path = PathBuf::from(xdg);
         if xdg_path.is_absolute() {

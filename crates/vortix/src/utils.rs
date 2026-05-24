@@ -588,7 +588,7 @@ pub(crate) fn binary_exists(name: &str) -> bool {
 /// operate on the current system.  `openresolv` will fail with a
 /// "signature mismatch" error when `systemd-resolved` manages
 /// `/etc/resolv.conf`, so a simple `which resolvconf` is not enough.
-#[cfg(target_os = "linux")]
+#[cfg(target_os = "linux")] // xtask:allow-platform-cfg: resolvconf-shim probing is Linux-only DNS plumbing
 pub(crate) fn resolvconf_works() -> bool {
     if !binary_exists("resolvconf") {
         return false;
@@ -604,7 +604,7 @@ pub(crate) fn resolvconf_works() -> bool {
 ///
 /// Checks if `/etc/resolv.conf` is a symlink pointing into a
 /// `systemd`-owned path (e.g. `/run/systemd/resolve/`).
-#[cfg(target_os = "linux")]
+#[cfg(target_os = "linux")] // xtask:allow-platform-cfg: systemd-resolved detection is Linux-only
 pub(crate) fn is_systemd_resolved() -> bool {
     match std::fs::read_link("/etc/resolv.conf") {
         Ok(target) => {

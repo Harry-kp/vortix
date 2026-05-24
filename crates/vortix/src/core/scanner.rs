@@ -151,6 +151,7 @@ fn check_wireguard_by_name(name: &str) -> Option<ActiveSession> {
 
     // 2. Fallback: Try file metadata (only reliable on macOS)
     #[cfg(target_os = "macos")]
+    // xtask:allow-platform-cfg: WIREGUARD_RUN_DIR file metadata is a macOS-only fallback
     if session.started_at.is_none() {
         let pid_file =
             PathBuf::from(crate::constants::WIREGUARD_RUN_DIR).join(format!("{name}.name"));
@@ -242,6 +243,7 @@ fn check_openvpn_by_pid(pid: u32, config_path: &Path) -> Option<ActiveSession> {
     let mut detected_iface = String::new();
 
     #[cfg(target_os = "macos")]
+    // xtask:allow-platform-cfg: lsof-based OpenVPN tun-iface discovery is macOS-only; Interface port extension deferred
     {
         if let Some(output) = cmd_output("lsof", &["-n", "-P", "-p", &pid.to_string()]) {
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -262,6 +264,7 @@ fn check_openvpn_by_pid(pid: u32, config_path: &Path) -> Option<ActiveSession> {
 
     // Method B: Scan for tun/tap interfaces and get IP/MTU
     #[cfg(target_os = "macos")]
+    // xtask:allow-platform-cfg: ifconfig-based OpenVPN tun-iface discovery is macOS-only
     {
         if let Some(output) = cmd_output("ifconfig", &[]) {
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -315,6 +318,7 @@ fn check_openvpn_by_pid(pid: u32, config_path: &Path) -> Option<ActiveSession> {
     }
 
     #[cfg(target_os = "linux")]
+    // xtask:allow-platform-cfg: ip-addr-based OpenVPN tun-iface discovery is Linux-only
     {
         // On Linux, use `ip addr` to find tun/tap interfaces
         if let Some(output) = cmd_output("ip", &["addr"]) {
