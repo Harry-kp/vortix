@@ -113,7 +113,7 @@ struct MigrateData {
 fn handle_engine(op: &crate::cli::args::EngineOp, config_dir: &Path, mode: OutputMode) -> i32 {
     use crate::cli::args::EngineOp;
     use crate::state::Protocol;
-    use crate::tunnel::{tunnel_for, TunnelKind};
+    use crate::tunnel::{tunnel_for_with_secrets, TunnelKind};
     use vortix_config::profile_store::{FsProfileStore, ProfileStore};
     use vortix_core::engine::{Engine, EngineHandle, UserCommand};
     use vortix_core::journal::{Journal, JournalConfig};
@@ -153,7 +153,7 @@ fn handle_engine(op: &crate::cli::args::EngineOp, config_dir: &Path, mode: Outpu
             ProtocolKind::OpenVpn => Protocol::OpenVPN,
             _ => Protocol::WireGuard,
         };
-        tunnel_for(proto, &factory_dir, "3", 30)
+        tunnel_for_with_secrets(proto, &factory_dir, "3", 30)
     };
 
     let initial_tunnel = TunnelKind::WireGuard(WgTunnel::new());
@@ -469,19 +469,65 @@ fn handle_export(
         );
     };
 
-    // --inline-secrets currently has nothing to inline (plan 006 U5
-    // integration lands separately). Emit a header comment so consumers
-    // know the export is faithful to whatever's on disk.
+    // --inline-secrets: plan 006 U5 — try to materialise SecretStore auth
+    // bytes into the exported payload as a trailing `# vortix-secret:<b64>`
+    // comment. Consumers (peer installs) can re-store these via
+    // `vortix secrets set creds/<profile>`. Best-effort: missing
+    // secret-store is a non-fatal warning.
+    let _ = ProfileId::new(profile_name); // touch import for future use
+    let mut payload = bytes;
     if inline_secrets {
-        let _ = ProfileId::new(profile_name);
-        eprintln!(
-            "# vortix: --inline-secrets requested; no stored secrets to materialise yet (plan 006 U5)"
-        );
+        let secret_id = format!("creds/{profile_name}");
+        match try_export_secret(config_dir, &secret_id) {
+            Ok(Some(secret_bytes)) => {
+                use base64::Engine as _;
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&secret_bytes);
+                payload.extend_from_slice(b"\n# vortix-secret:");
+                payload.extend_from_slice(b64.as_bytes());
+                payload.push(b'\n');
+                eprintln!(
+                    "# vortix: inlined secret '{secret_id}' as a trailing comment ({} bytes base64)",
+                    b64.len()
+                );
+            }
+            Ok(None) => {
+                eprintln!("# vortix: --inline-secrets: no secret stored at '{secret_id}'");
+            }
+            Err(e) => {
+                eprintln!("# vortix: --inline-secrets: secret store unavailable ({e})");
+            }
+        }
     }
 
-    let _ = std::io::stdout().write_all(&bytes);
-    let _ = mode; // mode currently unused; export is human-or-binary stream
+    let _ = std::io::stdout().write_all(&payload);
+    let _ = mode;
     0
+}
+
+/// Pull `id` from the configured `LayeredSecretStore`. Returns `Ok(None)`
+/// when the entry is missing; `Err` when the store itself is unavailable.
+fn try_export_secret(
+    config_dir: &Path,
+    id: &str,
+) -> Result<Option<Vec<u8>>, vortix_config::secret_store::SecretStoreError> {
+    use vortix_config::secret_store::{
+        LayeredSecretStore, SecretBackendTag, SecretRef, SecretStore, SecretStoreConfig,
+    };
+    let store = LayeredSecretStore::new(SecretStoreConfig {
+        fallback_path: config_dir.join("secrets.enc"),
+        passphrase: None,
+        force_fallback: false,
+    })?;
+    // Try keyring first (the default backend); fall back to encrypted-file.
+    for backend in [SecretBackendTag::Keyring, SecretBackendTag::EncryptedFile] {
+        let r = SecretRef::new(backend, id);
+        match store.get(&r) {
+            Ok(s) => return Ok(Some(s.as_bytes().to_vec())),
+            Err(vortix_config::secret_store::SecretStoreError::NotFound(_)) => {}
+            Err(other) => return Err(other),
+        }
+    }
+    Ok(None)
 }
 
 fn legacy_profile_bytes(profiles_dir: &Path, profile_name: &str) -> Option<Vec<u8>> {

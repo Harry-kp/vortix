@@ -264,7 +264,7 @@ fn run_tui(
         let _guard = runtime.runtime().handle().enter();
         if let Some(journal) = vortix_core::journal::global_journal().cloned() {
             use vortix::state::Protocol;
-            use vortix::tunnel::{tunnel_for, TunnelKind};
+            use vortix::tunnel::{tunnel_for_with_secrets, TunnelKind};
             use vortix_config::profile_store::{FsProfileStore, ProfileStore};
             use vortix_core::engine::{Engine, EngineHandle};
             use vortix_core::profile::{ProfileId, ProtocolKind};
@@ -289,7 +289,7 @@ fn run_tui(
                     // Default to WireGuard for any future variants.
                     _ => Protocol::WireGuard,
                 };
-                tunnel_for(proto, &factory_config_dir, "3", 30)
+                tunnel_for_with_secrets(proto, &factory_config_dir, "3", 30)
             };
 
             let initial_tunnel = TunnelKind::WireGuard(WgTunnel::new());
