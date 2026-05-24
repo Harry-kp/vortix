@@ -33,7 +33,7 @@ if ip netns exec "$NS_B" ping -c 1 -W 1 10.99.0.99 2>/dev/null; then
 fi
 
 # Release + verify rules gone + traffic restored.
-ip netns exec "$NS_B" target/release/vortix release-killswitch
+ip netns exec "$NS_B" target/release/vortix release-kill-switch
 if ip netns exec "$NS_B" iptables -L VORTIX_KILLSWITCH -n 2>/dev/null | grep -q DROP; then
     echo "FAIL: DROP rules still present after release-killswitch"
     exit 1
