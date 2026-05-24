@@ -47,9 +47,17 @@ impl Default for EngineSettings {
 /// Profile lookup callback — see `Engine::new`.
 pub type ProfileResolver = Box<dyn Fn(&ProfileId) -> Option<Profile> + Send>;
 
+/// Optional factory that builds a fresh tunnel per `Connect` call.
+///
+/// Plan #006 U6: when set, the FSM swaps `self.tunnel = factory(&profile)`
+/// before invoking `tunnel.up()`. Lets a single `Engine<TunnelKind>` drive
+/// arbitrary protocols by picking the right variant from the profile.
+pub type TunnelFactory<T> = Box<dyn Fn(&Profile) -> T + Send>;
+
 pub struct Engine<T: Tunnel> {
     state: Connection,
     tunnel: T,
+    tunnel_factory: Option<TunnelFactory<T>>,
     settings: EngineSettings,
     /// Profile lookup callback — the FSM doesn't know about the binary's
     /// profile store, so the caller injects a closure. Returning `None`
@@ -67,6 +75,7 @@ impl<T: Tunnel> Engine<T> {
         Self {
             state: Connection::default(),
             tunnel,
+            tunnel_factory: None,
             settings: EngineSettings::default(),
             profile_resolver: Box::new(profile_resolver),
         }
@@ -76,6 +85,15 @@ impl<T: Tunnel> Engine<T> {
     #[must_use]
     pub fn with_settings(mut self, settings: EngineSettings) -> Self {
         self.settings = settings;
+        self
+    }
+
+    /// Install a per-Connect tunnel factory. When set, the FSM rebuilds
+    /// `self.tunnel = factory(&profile)` before each `Connect` so a single
+    /// `Engine<TunnelKind>` can drive multiple protocols.
+    #[must_use]
+    pub fn with_tunnel_factory(mut self, factory: impl Fn(&Profile) -> T + Send + 'static) -> Self {
+        self.tunnel_factory = Some(Box::new(factory));
         self
     }
 
@@ -137,6 +155,13 @@ impl<T: Tunnel> Engine<T> {
             protocol: profile.protocol,
             attempt: 1,
         });
+
+        // Plan 006 U6: rebuild the tunnel per profile when a factory is
+        // installed. Lets `Engine<TunnelKind>` route WG vs OVPN based on
+        // the profile's protocol rather than the fixed initial variant.
+        if let Some(factory) = &self.tunnel_factory {
+            self.tunnel = factory(&profile);
+        }
 
         // Invoke tunnel.up. Sync; blocks the caller. The actor wraps this in
         // a tokio task to keep the broader system responsive.

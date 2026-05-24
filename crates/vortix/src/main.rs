@@ -256,28 +256,44 @@ fn run_tui(
     let profiles_dir_for_resolver = config_dir.join(constants::PROFILES_DIR_NAME);
     let mut app = App::new(config, config_dir);
 
-    // Attach an `EngineHandle` (plan 005 U5) so future units can migrate
-    // off `App::Deref<VpnEngine>`. The handle is constructed in the bundled
-    // tokio runtime so its actor can spawn. Failure to construct is
-    // non-fatal — the legacy engine path stays load-bearing.
+    // Attach an `EngineHandle` (plan 005 U5/U6). The handle wraps the
+    // FSM and gets a per-profile tunnel factory so a single
+    // `Engine<TunnelKind>` drives both WG and OVPN. The actor spawns on
+    // the bundled tokio runtime. Failure is non-fatal.
     if let Some(runtime) = vortix_process::global_runner().as_real() {
         let _guard = runtime.runtime().handle().enter();
         if let Some(journal) = vortix_core::journal::global_journal().cloned() {
+            use vortix::state::Protocol;
+            use vortix::tunnel::{tunnel_for, TunnelKind};
             use vortix_config::profile_store::{FsProfileStore, ProfileStore};
             use vortix_core::engine::{Engine, EngineHandle};
-            use vortix_core::profile::ProfileId;
+            use vortix_core::profile::{ProfileId, ProtocolKind};
+            use vortix_protocol_wireguard::WgTunnel;
 
             // Live profile resolver — reads sidecars via FsProfileStore so
-            // any plan-005 consumer calling `handle.execute(Connect{id})`
-            // sees the user's actual profiles (post-migration).
+            // any consumer calling `handle.execute(Connect{id})` sees the
+            // user's actual profiles (post-migration).
             let resolver_dir = profiles_dir_for_resolver.clone();
             let resolver = move |id: &ProfileId| {
                 let store = FsProfileStore::new(resolver_dir.clone());
                 store.get(id).ok()
             };
 
-            let tunnel = vortix_core::ports::tunnel::mock::MockTunnel::new();
-            let engine = Engine::new(tunnel, resolver);
+            // Per-Connect tunnel factory — picks WG vs OVPN from the
+            // resolved profile's protocol. Plan 006 U6's wire-up.
+            let factory_config_dir = vortix::utils::get_app_config_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
+            let factory = move |profile: &vortix_core::profile::Profile| {
+                let proto = match profile.protocol {
+                    ProtocolKind::OpenVpn => Protocol::OpenVPN,
+                    // Default to WireGuard for any future variants.
+                    _ => Protocol::WireGuard,
+                };
+                tunnel_for(proto, &factory_config_dir, "3", 30)
+            };
+
+            let initial_tunnel = TunnelKind::WireGuard(WgTunnel::new());
+            let engine = Engine::new(initial_tunnel, resolver).with_tunnel_factory(factory);
             let handle = EngineHandle::local(engine, journal);
             app = app.with_engine_handle(handle);
         }

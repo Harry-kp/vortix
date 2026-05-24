@@ -80,6 +80,7 @@ pub fn handle_command(
             profile,
             inline_secrets,
         } => handle_export(config_dir, profile, *inline_secrets, mode),
+        Commands::Engine { op } => handle_engine(op, config_dir, mode),
         Commands::Migrate => handle_migrate(config_dir, mode),
         Commands::Secrets { op } => handle_secrets(op, config_dir, mode),
         Commands::Settings => handle_settings(mode),
@@ -103,6 +104,130 @@ struct MigrateData {
 ///
 /// Resolves the layered store (keyring first, encrypted-file fallback)
 /// using `<config_dir>/secrets.enc` as the encrypted-file location.
+/// Drive the plan-005 `EngineHandle` from the CLI (plan 005 U6).
+///
+/// Spins up a tokio runtime on demand, builds an `EngineHandle` rooted at
+/// `<config_dir>`, then awaits one command/query/snapshot. Output goes to
+/// stdout (JSON in `--json` mode) so it can be consumed by scripts.
+#[allow(clippy::too_many_lines)]
+fn handle_engine(op: &crate::cli::args::EngineOp, config_dir: &Path, mode: OutputMode) -> i32 {
+    use crate::cli::args::EngineOp;
+    use crate::state::Protocol;
+    use crate::tunnel::{tunnel_for, TunnelKind};
+    use vortix_config::profile_store::{FsProfileStore, ProfileStore};
+    use vortix_core::engine::{Engine, EngineHandle, UserCommand};
+    use vortix_core::journal::{Journal, JournalConfig};
+    use vortix_core::profile::{ProfileId, ProtocolKind};
+    use vortix_protocol_wireguard::WgTunnel;
+
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("failed to build runtime: {e}");
+            return 1;
+        }
+    };
+
+    let profiles_dir = config_dir.join(constants::PROFILES_DIR_NAME);
+    let journal = match Journal::open(JournalConfig {
+        disk: false, // CLI session — in-memory journal is enough
+        ..Default::default()
+    }) {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("journal open failed: {e}");
+            return 1;
+        }
+    };
+
+    let resolver_dir = profiles_dir.clone();
+    let resolver = move |id: &ProfileId| FsProfileStore::new(resolver_dir.clone()).get(id).ok();
+
+    let factory_dir = config_dir.to_path_buf();
+    let factory = move |profile: &vortix_core::profile::Profile| {
+        let proto = match profile.protocol {
+            ProtocolKind::OpenVpn => Protocol::OpenVPN,
+            _ => Protocol::WireGuard,
+        };
+        tunnel_for(proto, &factory_dir, "3", 30)
+    };
+
+    let initial_tunnel = TunnelKind::WireGuard(WgTunnel::new());
+    let engine = Engine::new(initial_tunnel, resolver).with_tunnel_factory(factory);
+    let handle = runtime.block_on(async { EngineHandle::local(engine, journal) });
+
+    runtime.block_on(async {
+        match op {
+            EngineOp::Status => {
+                let snap = match handle.snapshot().await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("snapshot failed: {e}");
+                        return 1;
+                    }
+                };
+                match mode {
+                    OutputMode::Json => match serde_json::to_string_pretty(&snap.state) {
+                        Ok(j) => println!("{j}"),
+                        Err(e) => eprintln!("serialize: {e}"),
+                    },
+                    _ => println!("{:?}", snap.state),
+                }
+                0
+            }
+            EngineOp::Connect { profile } => {
+                // Resolve via FsProfileStore so both display_name and
+                // profile_id forms work.
+                let store = FsProfileStore::new(profiles_dir.clone());
+                let Some(id) = store.list().ok().and_then(|list| {
+                    list.into_iter()
+                        .find(|s| {
+                            s.id.as_str() == profile || s.display_name.as_str() == profile.as_str()
+                        })
+                        .map(|s| s.id)
+                }) else {
+                    eprintln!("profile '{profile}' not found");
+                    return 1;
+                };
+                match handle
+                    .execute_command(UserCommand::Connect { profile_id: id })
+                    .await
+                {
+                    Ok(ack) => {
+                        if matches!(mode, OutputMode::Human) {
+                            println!("Connect dispatched ({} events emitted)", ack.events_emitted);
+                        }
+                        0
+                    }
+                    Err(e) => {
+                        eprintln!("connect failed: {e}");
+                        1
+                    }
+                }
+            }
+            EngineOp::Disconnect => match handle.execute_command(UserCommand::Disconnect).await {
+                Ok(ack) => {
+                    if matches!(mode, OutputMode::Human) {
+                        println!(
+                            "Disconnect dispatched ({} events emitted)",
+                            ack.events_emitted
+                        );
+                    }
+                    0
+                }
+                Err(e) => {
+                    eprintln!("disconnect failed: {e}");
+                    1
+                }
+            },
+        }
+    })
+}
+
 fn parse_secret_backend(s: Option<&String>) -> vortix_config::secret_store::SecretBackendTag {
     use vortix_config::secret_store::SecretBackendTag;
     match s.map(String::as_str) {
