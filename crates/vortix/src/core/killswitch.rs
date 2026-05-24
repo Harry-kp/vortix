@@ -10,9 +10,6 @@ use crate::utils;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-#[allow(unused_imports)]
-use vortix_core::ports::killswitch::Killswitch;
 
 // Re-export the canonical types so existing `crate::core::killswitch::*`
 // imports keep resolving.
@@ -23,7 +20,8 @@ pub type KillSwitchError = KillswitchError;
 
 /// Enable kill switch by loading restrictive firewall rules.
 ///
-/// Delegates to the platform-specific firewall implementation.
+/// Routes through the process-global `Platform` aggregate (plan 003 U7);
+/// the per-OS impl lives in `vortix-platform-{macos,linux}`.
 ///
 /// # Arguments
 ///
@@ -34,19 +32,9 @@ pub type KillSwitchError = KillswitchError;
 ///
 /// Returns error if not running as root or firewall commands fail.
 pub fn enable_blocking(vpn_interface: &str, vpn_server_ip: Option<&str>) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        vortix_platform_macos::PfFirewall::enable_blocking(vpn_interface, vpn_server_ip)
-    }
-    #[cfg(target_os = "linux")]
-    {
-        vortix_platform_linux::IptablesFirewall::enable_blocking(vpn_interface, vpn_server_ip)
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = (vpn_interface, vpn_server_ip);
-        compile_error!("kill switch is only supported on macOS and Linux")
-    }
+    crate::platform::current_platform()
+        .killswitch
+        .enable_blocking(vpn_interface, vpn_server_ip)
 }
 
 /// Disable kill switch by flushing firewall rules.
@@ -55,18 +43,9 @@ pub fn enable_blocking(vpn_interface: &str, vpn_server_ip: Option<&str>) -> Resu
 ///
 /// Returns error if not running as root or firewall commands fail.
 pub fn disable_blocking() -> Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        vortix_platform_macos::PfFirewall::disable_blocking()
-    }
-    #[cfg(target_os = "linux")]
-    {
-        vortix_platform_linux::IptablesFirewall::disable_blocking()
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        compile_error!("kill switch is only supported on macOS and Linux")
-    }
+    crate::platform::current_platform()
+        .killswitch
+        .disable_blocking()
 }
 
 /// Get the state file path.

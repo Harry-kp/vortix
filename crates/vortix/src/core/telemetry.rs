@@ -642,19 +642,8 @@ fn fetch_security_info(tx: &Sender<TelemetryUpdate>, cfg: &std::sync::Arc<Teleme
     let tx_clone = tx.clone();
     let cfg = std::sync::Arc::clone(cfg);
     thread::spawn(move || {
-        // Use platform-specific DNS resolution
-        let dns = {
-            #[cfg(target_os = "macos")]
-            {
-                use crate::platform::DnsResolver;
-                crate::platform::macos::dns::MacDns::get_dns_server()
-            }
-            #[cfg(target_os = "linux")]
-            {
-                use crate::platform::DnsResolver;
-                crate::platform::linux::dns::LinuxDns::get_dns_server()
-            }
-        };
+        // Route DNS lookup through the platform aggregate (plan 003 U7).
+        let dns = crate::platform::current_platform().dns.get_dns_server();
 
         if let Some(dns_server) = dns {
             let _ = tx_clone.send(TelemetryUpdate::Dns(dns_server));
