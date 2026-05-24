@@ -202,7 +202,7 @@ impl App {
 
         // Plan #004 U4: route once via TunnelKind, no protocol match arm.
         std::thread::spawn(move || {
-            use vortix_core::profile::{Profile, ProfileId, ProtocolKind};
+            use crate::vortix_core::profile::{Profile, ProfileId, ProtocolKind};
 
             let config_dir = crate::utils::get_app_config_dir()
                 .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
@@ -325,8 +325,8 @@ impl App {
     /// longer match-branches on protocol.
     pub(crate) fn cleanup_vpn_resources(&self, profile_name: &str) {
         if let Some(profile) = self.engine.profiles.iter().find(|p| p.name == profile_name) {
-            use vortix_core::ports::tunnel::{TunnelHandle, TunnelKindTag};
-            use vortix_core::profile::ProfileId;
+            use crate::vortix_core::ports::tunnel::{TunnelHandle, TunnelKindTag};
+            use crate::vortix_core::profile::ProfileId;
 
             let iface = match profile.protocol {
                 Protocol::WireGuard => profile.config_path.to_string_lossy().into_owned(),
@@ -482,8 +482,8 @@ impl App {
 
             // Plan #004 U4: route the disconnect through TunnelKind.
             std::thread::spawn(move || {
-                use vortix_core::ports::tunnel::{TunnelHandle, TunnelKindTag};
-                use vortix_core::profile::ProfileId;
+                use crate::vortix_core::ports::tunnel::{TunnelHandle, TunnelKindTag};
+                use crate::vortix_core::profile::ProfileId;
 
                 let iface = match protocol {
                     Protocol::WireGuard => config_path.to_string_lossy().into_owned(),
@@ -580,8 +580,8 @@ impl App {
             // SIGKILL was used (TODO plan #005: add a force flag to Tunnel
             // trait to escalate to SIGKILL where supported).
             std::thread::spawn(move || {
-                use vortix_core::ports::tunnel::{TunnelHandle, TunnelKindTag};
-                use vortix_core::profile::ProfileId;
+                use crate::vortix_core::ports::tunnel::{TunnelHandle, TunnelKindTag};
+                use crate::vortix_core::profile::ProfileId;
 
                 let iface = match protocol {
                     Protocol::WireGuard => config_path.to_string_lossy().into_owned(),

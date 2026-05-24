@@ -592,11 +592,12 @@ impl App {
                     && old_ip != constants::MSG_FETCHING
                     && old_ip != constants::MSG_DETECTING
                 {
-                    if let Some(journal) = vortix_core::journal::global_journal() {
-                        let _ = journal.append(vortix_core::engine::EngineEvent::IpChanged {
-                            old: Some(old_ip.clone()),
-                            new: ip.clone(),
-                        });
+                    if let Some(journal) = crate::vortix_core::journal::global_journal() {
+                        let _ =
+                            journal.append(crate::vortix_core::engine::EngineEvent::IpChanged {
+                                old: Some(old_ip.clone()),
+                                new: ip.clone(),
+                            });
                     }
                 }
 

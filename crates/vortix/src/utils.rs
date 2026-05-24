@@ -577,8 +577,8 @@ pub fn get_unique_path(dir: &std::path::Path, filename: &str) -> std::path::Path
 }
 
 pub(crate) fn binary_exists(name: &str) -> bool {
-    use vortix_process::CommandSpec;
-    vortix_process::run_to_output(CommandSpec::oneshot("which", vec![name.to_string()]))
+    use crate::vortix_process::CommandSpec;
+    crate::vortix_process::run_to_output(CommandSpec::oneshot("which", vec![name.to_string()]))
         .is_ok_and(|o| o.status.success())
 }
 
@@ -590,14 +590,17 @@ pub(crate) fn binary_exists(name: &str) -> bool {
 /// `/etc/resolv.conf`, so a simple `which resolvconf` is not enough.
 #[cfg(target_os = "linux")] // xtask:allow-platform-cfg: resolvconf-shim probing is Linux-only DNS plumbing
 pub(crate) fn resolvconf_works() -> bool {
-    use vortix_process::CommandSpec;
+    use crate::vortix_process::CommandSpec;
     if !binary_exists("resolvconf") {
         return false;
     }
     // Test with `--version` which works with both openresolv and systemd-resolvconf.
     // `resolvconf -l` (list) is not supported by systemd-resolvconf's shim.
-    vortix_process::run_to_output(CommandSpec::oneshot("resolvconf", vec!["--version".into()]))
-        .is_ok_and(|o| o.status.success())
+    crate::vortix_process::run_to_output(CommandSpec::oneshot(
+        "resolvconf",
+        vec!["--version".into()],
+    ))
+    .is_ok_and(|o| o.status.success())
 }
 
 /// Detect whether `systemd-resolved` is managing DNS on this system.

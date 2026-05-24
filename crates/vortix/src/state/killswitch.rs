@@ -4,4 +4,4 @@
 //! binary crate keep working without a full sweep. Plan 003 U4 removes the
 //! shim once consumers are updated.
 
-pub use vortix_core::state::killswitch::{KillSwitchMode, KillSwitchState};
+pub use crate::vortix_core::state::killswitch::{KillSwitchMode, KillSwitchState};

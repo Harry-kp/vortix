@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 // Re-export the canonical types so existing `crate::core::killswitch::*`
 // imports keep resolving.
-pub use vortix_core::ports::killswitch::{KillswitchError, Result};
+pub use crate::vortix_core::ports::killswitch::{KillswitchError, Result};
 
 // Backwards-compat alias — the old name is `KillSwitchError`.
 pub type KillSwitchError = KillswitchError;

@@ -59,30 +59,23 @@ unicode-width = { workspace = true }
 open = { workspace = true }
 urlencoding = { workspace = true }
 
-# Workspace library deps (plans 002 + 003 + 004 + 005 + 006).
-vortix-core = { path = "../vortix-core" }
-vortix-config = { path = "../vortix-config" }
-vortix-process = { path = "../vortix-process" }
-vortix-protocol-openvpn = { path = "../vortix-protocol-openvpn" }
-vortix-protocol-wireguard = { path = "../vortix-protocol-wireguard" }
+# Dependencies from merged internal crates
 base64 = "0.22"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "time"] }
+thiserror = { workspace = true }
+directories = { workspace = true }
+enum_dispatch = { workspace = true }
+figment = { workspace = true }
+keyring = { workspace = true }
+aes-gcm = { workspace = true }
+argon2 = { workspace = true }
+zeroize = { workspace = true }
+rand = "0.8"
+sha2 = "0.10"
 
-# Per-OS platform adapters (empty stubs in plan 001; populated by plan 003).
-[target.'cfg(target_os = "macos")'.dependencies]
-vortix-platform-macos = { path = "../vortix-platform-macos" }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-vortix-platform-linux = { path = "../vortix-platform-linux" }
-
-# Plan 008 U4 stub. Compiles on Windows but every port impl returns
-# "not supported" — proves the Platform aggregate admits a third OS.
-[target.'cfg(target_os = "windows")'.dependencies]
-vortix-platform-windows = { path = "../vortix-platform-windows" }
-
-# System calls (for root detection)
+# System calls (for root detection + platform crates)
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

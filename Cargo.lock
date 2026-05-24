@@ -2335,18 +2335,27 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 name = "vortix"
 version = "0.3.0"
 dependencies = [
+ "aes-gcm",
+ "argon2",
  "base64",
  "clap",
  "clap_complete",
  "color-eyre",
  "crossterm",
+ "directories",
  "dirs",
+ "enum_dispatch",
+ "figment",
+ "keyring",
  "libc",
  "open",
+ "rand",
  "ratatui",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
+ "thiserror 2.0.17",
  "time",
  "tokio",
  "toml 1.1.2+spec-1.1.0",
@@ -2354,110 +2363,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-width",
  "urlencoding",
- "vortix-config",
- "vortix-core",
- "vortix-platform-linux",
- "vortix-platform-macos",
- "vortix-platform-windows",
- "vortix-process",
- "vortix-protocol-openvpn",
- "vortix-protocol-wireguard",
-]
-
-[[package]]
-name = "vortix-config"
-version = "0.0.0"
-dependencies = [
- "aes-gcm",
- "argon2",
- "base64",
- "directories",
- "figment",
- "keyring",
- "rand",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror 2.0.17",
- "time",
- "toml 1.1.2+spec-1.1.0",
- "tracing",
- "vortix-core",
  "zeroize",
-]
-
-[[package]]
-name = "vortix-core"
-version = "0.0.0"
-dependencies = [
- "directories",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.17",
- "time",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "vortix-platform-linux"
-version = "0.0.0"
-dependencies = [
- "libc",
- "tracing",
- "vortix-core",
- "vortix-process",
-]
-
-[[package]]
-name = "vortix-platform-macos"
-version = "0.0.0"
-dependencies = [
- "libc",
- "tracing",
- "vortix-core",
- "vortix-process",
-]
-
-[[package]]
-name = "vortix-platform-windows"
-version = "0.0.0"
-dependencies = [
- "tracing",
- "vortix-core",
- "vortix-process",
-]
-
-[[package]]
-name = "vortix-process"
-version = "0.0.0"
-dependencies = [
- "enum_dispatch",
- "libc",
- "thiserror 2.0.17",
- "tokio",
- "tracing",
- "vortix-core",
-]
-
-[[package]]
-name = "vortix-protocol-openvpn"
-version = "0.0.0"
-dependencies = [
- "tracing",
- "vortix-core",
- "vortix-process",
-]
-
-[[package]]
-name = "vortix-protocol-wireguard"
-version = "0.0.0"
-dependencies = [
- "tracing",
- "vortix-core",
- "vortix-process",
 ]
 
 [[package]]

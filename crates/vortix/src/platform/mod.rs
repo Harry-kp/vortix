@@ -22,7 +22,7 @@ pub use aggregate::{
 //
 // Plan #003 originally threaded the Platform aggregate through every consumer.
 // We instead install a process-wide singleton, matching plan #002's
-// `vortix_process::global_runner()` pattern. `main.rs` initialises it once at
+// `crate::vortix_process::global_runner()` pattern. `main.rs` initialises it once at
 // startup; consumers reach for `current_platform()` instead of branching on
 // `cfg(target_os)`. Plan #005's async engine refactor swaps this back to
 // explicit dependency injection.
@@ -58,11 +58,11 @@ pub use crate::constants::KILLSWITCH_EMERGENCY_MSG;
 
 // Capability ports now live in `vortix-core::ports::*` (plan 003 U1/U2).
 // Keep the legacy trait names as aliases so existing call sites keep working.
-pub use vortix_core::ports::dns::DnsResolver;
-pub use vortix_core::ports::interface::Interface as InterfaceDetector;
-pub use vortix_core::ports::killswitch::Killswitch as Firewall;
-pub use vortix_core::ports::network_stats::NetworkStats as NetworkStatsProvider;
-pub use vortix_core::ports::route_table::RouteTable;
+pub use crate::vortix_core::ports::dns::DnsResolver;
+pub use crate::vortix_core::ports::interface::Interface as InterfaceDetector;
+pub use crate::vortix_core::ports::killswitch::Killswitch as Firewall;
+pub use crate::vortix_core::ports::network_stats::NetworkStats as NetworkStatsProvider;
+pub use crate::vortix_core::ports::route_table::RouteTable;
 
 /// Platform-appropriate install hint for a package.
 #[cfg(target_os = "macos")]

@@ -15,7 +15,7 @@ fn main() -> Result<()> {
     // toggles so production startup is silent; `RUST_LOG=vortix::process=info`
     // surfaces every subprocess invocation as a structured event.
     init_tracing();
-    vortix_process::set_global_runner(vortix_process::CommandRunner::real());
+    vortix::vortix_process::set_global_runner(vortix::vortix_process::CommandRunner::real());
 
     // Platform aggregate (plan 003 U7). Detect the OS variants once at startup;
     // consumers reach for `crate::platform::current_platform()` instead of
@@ -24,11 +24,11 @@ fn main() -> Result<()> {
 
     // Settings (plan 006 U7) — figment-layered: defaults → user file →
     // VORTIX_* env. CLI overrides currently bypass settings.
-    let settings = match vortix_config::Settings::load() {
+    let settings = match vortix::vortix_config::Settings::load() {
         Ok(s) => s,
         Err(e) => {
             eprintln!("warning: failed to load settings ({e}); using defaults");
-            vortix_config::Settings::default()
+            vortix::vortix_config::Settings::default()
         }
     };
 
@@ -36,19 +36,21 @@ fn main() -> Result<()> {
     // the runner's own tokio runtime (writer task is spawn'd on it). We
     // borrow the runtime via Handle so the Journal stays alive after main()
     // exits to the TUI loop.
-    let runtime_handle = vortix_process::global_runner()
+    let runtime_handle = vortix::vortix_process::global_runner()
         .as_real()
         .map(|r| r.runtime().handle().clone());
     if let Some(handle) = runtime_handle.clone() {
         let _guard = handle.enter();
-        match vortix_core::journal::Journal::open(vortix_core::journal::JournalConfig {
-            disk: settings.journal.disk,
-            retention_days: settings.journal.retention_days,
-            retention_count: settings.journal.retention_count,
-            ..Default::default()
-        }) {
+        match vortix::vortix_core::journal::Journal::open(
+            vortix::vortix_core::journal::JournalConfig {
+                disk: settings.journal.disk,
+                retention_days: settings.journal.retention_days,
+                retention_count: settings.journal.retention_count,
+                ..Default::default()
+            },
+        ) {
             Ok(journal) => {
-                vortix_core::journal::set_global_journal(journal);
+                vortix::vortix_core::journal::set_global_journal(journal);
             }
             Err(e) => {
                 eprintln!("warning: failed to open journal ({e}); diagnostics will be limited");
@@ -123,7 +125,7 @@ fn main() -> Result<()> {
     if std::env::var_os("VORTIX_SKIP_MIGRATION").is_some() {
         eprintln!("VORTIX_SKIP_MIGRATION set — skipping startup sidecar backfill.");
     } else {
-        match vortix_config::migrate_legacy_profiles(&profiles_dir) {
+        match vortix::vortix_config::migrate_legacy_profiles(&profiles_dir) {
             Ok(stats) => {
                 if stats.created > 0 {
                     eprintln!(
@@ -151,7 +153,7 @@ fn main() -> Result<()> {
     // `wireguard-go` daemon is probably still running. Warn so they
     // know to clean up (no auto-adopt — adoption arrives with the
     // plan 010 IPC layer).
-    let orphans = vortix_process::scan_orphans();
+    let orphans = vortix::vortix_process::scan_orphans();
     if !orphans.is_empty() {
         eprintln!(
             "Warning: detected {} possible orphan VPN process(es) from a previous session:",
@@ -294,15 +296,15 @@ fn run_tui(
     // FSM and gets a per-profile tunnel factory so a single
     // `Engine<TunnelKind>` drives both WG and OVPN. The actor spawns on
     // the bundled tokio runtime. Failure is non-fatal.
-    if let Some(runtime) = vortix_process::global_runner().as_real() {
+    if let Some(runtime) = vortix::vortix_process::global_runner().as_real() {
         let _guard = runtime.runtime().handle().enter();
-        if let Some(journal) = vortix_core::journal::global_journal().cloned() {
+        if let Some(journal) = vortix::vortix_core::journal::global_journal().cloned() {
             use vortix::state::Protocol;
             use vortix::tunnel::{tunnel_for_with_secrets, TunnelKind};
-            use vortix_config::profile_store::{FsProfileStore, ProfileStore};
-            use vortix_core::engine::{Engine, EngineHandle};
-            use vortix_core::profile::{ProfileId, ProtocolKind};
-            use vortix_protocol_wireguard::WgTunnel;
+            use vortix::vortix_config::profile_store::{FsProfileStore, ProfileStore};
+            use vortix::vortix_core::engine::{Engine, EngineHandle};
+            use vortix::vortix_core::profile::{ProfileId, ProtocolKind};
+            use vortix::vortix_protocol_wireguard::WgTunnel;
 
             // Live profile resolver — reads sidecars via FsProfileStore so
             // any consumer calling `handle.execute(Connect{id})` sees the
@@ -317,7 +319,7 @@ fn run_tui(
             // resolved profile's protocol. Plan 006 U6's wire-up.
             let factory_config_dir = vortix::utils::get_app_config_dir()
                 .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
-            let factory = move |profile: &vortix_core::profile::Profile| {
+            let factory = move |profile: &vortix::vortix_core::profile::Profile| {
                 let proto = match profile.protocol {
                     ProtocolKind::OpenVpn => Protocol::OpenVPN,
                     // Default to WireGuard for any future variants.
@@ -335,11 +337,11 @@ fn run_tui(
             // to engine events. Today it nudges the legacy telemetry
             // worker on `TunnelUp` so connect → IP-refresh happens
             // promptly. Future units route more flows through here.
-            if let Some(j) = vortix_core::journal::global_journal() {
+            if let Some(j) = vortix::vortix_core::journal::global_journal() {
                 let mut rx = j.subscribe();
                 let nudge = app.engine.telemetry_nudge.clone();
                 tokio::spawn(async move {
-                    use vortix_core::engine::EngineEvent;
+                    use vortix::vortix_core::engine::EngineEvent;
                     while let Ok(envelope) = rx.recv().await {
                         if matches!(envelope.event, EngineEvent::TunnelUp { .. }) {
                             if let Some(n) = &nudge {

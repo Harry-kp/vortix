@@ -90,8 +90,10 @@ pub fn handle_command(
     }
 }
 
-fn parse_secret_backend(s: Option<&String>) -> vortix_config::secret_store::SecretBackendTag {
-    use vortix_config::secret_store::SecretBackendTag;
+fn parse_secret_backend(
+    s: Option<&String>,
+) -> crate::vortix_config::secret_store::SecretBackendTag {
+    use crate::vortix_config::secret_store::SecretBackendTag;
     match s.map(String::as_str) {
         Some("encrypted-file" | "file") => SecretBackendTag::EncryptedFile,
         _ => SecretBackendTag::Keyring,
@@ -100,10 +102,10 @@ fn parse_secret_backend(s: Option<&String>) -> vortix_config::secret_store::Secr
 
 fn handle_secrets(op: &crate::cli::args::SecretsOp, config_dir: &Path, mode: OutputMode) -> i32 {
     use crate::cli::args::SecretsOp;
-    use std::io::Read;
-    use vortix_config::secret_store::{
+    use crate::vortix_config::secret_store::{
         LayeredSecretStore, Secret, SecretRef, SecretStore, SecretStoreConfig,
     };
+    use std::io::Read;
 
     let fallback_path = config_dir.join("secrets.enc");
     let cfg = SecretStoreConfig {
@@ -181,14 +183,14 @@ fn handle_secrets(op: &crate::cli::args::SecretsOp, config_dir: &Path, mode: Out
 /// `vortix audit` — per-process socket snapshot (plan 015 phase C / plan 013).
 #[derive(Serialize)]
 struct AuditData {
-    sockets: Vec<vortix_core::ports::socket_audit::SocketSnapshot>,
+    sockets: Vec<crate::vortix_core::ports::socket_audit::SocketSnapshot>,
 }
 
 fn handle_audit(pid_filter: Option<u32>, vpn_only: bool, mode: OutputMode) -> i32 {
     let platform = crate::platform::current_platform();
     let mut snapshots = match platform.socket_audit.snapshot() {
         Ok(s) => s,
-        Err(vortix_core::ports::socket_audit::SocketAuditError::Unsupported) => {
+        Err(crate::vortix_core::ports::socket_audit::SocketAuditError::Unsupported) => {
             print_error_and_exit(
                 mode,
                 "audit",
@@ -307,8 +309,8 @@ fn handle_daemon(socket_override: Option<std::path::PathBuf>, mode: OutputMode) 
 fn try_export_secret(
     config_dir: &Path,
     id: &str,
-) -> Result<Option<Vec<u8>>, vortix_config::secret_store::SecretStoreError> {
-    use vortix_config::secret_store::{
+) -> Result<Option<Vec<u8>>, crate::vortix_config::secret_store::SecretStoreError> {
+    use crate::vortix_config::secret_store::{
         LayeredSecretStore, SecretBackendTag, SecretRef, SecretStore, SecretStoreConfig,
     };
     let store = LayeredSecretStore::new(SecretStoreConfig {
@@ -321,7 +323,7 @@ fn try_export_secret(
         let r = SecretRef::new(backend, id);
         match store.get(&r) {
             Ok(s) => return Ok(Some(s.as_bytes().to_vec())),
-            Err(vortix_config::secret_store::SecretStoreError::NotFound(_)) => {}
+            Err(crate::vortix_config::secret_store::SecretStoreError::NotFound(_)) => {}
             Err(other) => return Err(other),
         }
     }
@@ -966,7 +968,7 @@ fn handle_list(
     // stable profile_id + group label (plan 006 U2/U4). The lookup is
     // O(N + M) which is fine for the typical handful of profiles.
     let sidecars_by_name: std::collections::HashMap<String, _> = {
-        use vortix_config::profile_store::{FsProfileStore, ProfileStore};
+        use crate::vortix_config::profile_store::{FsProfileStore, ProfileStore};
         let store = FsProfileStore::new(config_dir.join(constants::PROFILES_DIR_NAME));
         store
             .list()
@@ -1701,7 +1703,7 @@ fn handle_info(config_dir: &Path, source: &str, mode: OutputMode) {
     // Session-journal path (plan 005). Folded into `vortix info` as part
     // of the v0.3.0 CLI surface cleanup — `vortix journal path` was
     // dropped in favour of surfacing the path here.
-    let journal_session = vortix_core::journal::global_journal()
+    let journal_session = crate::vortix_core::journal::global_journal()
         .and_then(|j| j.session_path.as_ref().map(|p| p.display().to_string()));
 
     let data = InfoData {
@@ -1749,7 +1751,7 @@ fn handle_update(mode: OutputMode) {
         println!("Updating vortix...");
     }
 
-    let result = vortix_process::run_to_output(vortix_process::CommandSpec::oneshot(
+    let result = crate::vortix_process::run_to_output(crate::vortix_process::CommandSpec::oneshot(
         "cargo",
         vec!["install".into(), "vortix".into(), "--force".into()],
     ));

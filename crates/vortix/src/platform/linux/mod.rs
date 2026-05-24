@@ -4,4 +4,6 @@
 //! Submodule aliases here keep existing `crate::platform::linux::*` paths
 //! resolving until plan 003 U7 swaps consumers over to `&Platform`.
 
-pub use vortix_platform_linux::{dns, firewall, interface, network_stats as network, route_table};
+pub use crate::vortix_platform_linux::{
+    dns, firewall, interface, network_stats as network, route_table,
+};

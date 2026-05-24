@@ -4,9 +4,9 @@
 //! by scanning system interfaces and processes for `WireGuard` and `OpenVPN` sessions.
 
 use crate::app::{Protocol, VpnProfile};
+use crate::vortix_process::CommandSpec;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
-use vortix_process::CommandSpec;
 
 /// Run a command and return its output.
 ///
@@ -15,7 +15,7 @@ use vortix_process::CommandSpec;
 /// and run with no privilege requirement.
 fn cmd_output(program: &str, args: &[&str]) -> Option<std::process::Output> {
     let owned_args = args.iter().map(|s| (*s).to_string()).collect();
-    vortix_process::run_to_output(CommandSpec::oneshot(program, owned_args)).ok()
+    crate::vortix_process::run_to_output(CommandSpec::oneshot(program, owned_args)).ok()
 }
 
 /// Information about an active VPN session detected on the system.

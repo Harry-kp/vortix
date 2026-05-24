@@ -11,7 +11,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
 
-use vortix_process::CommandSpec;
+use crate::vortix_process::CommandSpec;
 
 use crate::constants;
 use crate::logger::LogLevel;
@@ -220,7 +220,7 @@ fn try_ipinfo_api(
     let timeout = cfg.api_timeout.to_string();
 
     for attempt in 0..constants::RETRY_ATTEMPTS {
-        let output = vortix_process::run_to_output(CommandSpec::oneshot(
+        let output = crate::vortix_process::run_to_output(CommandSpec::oneshot(
             "curl",
             vec![
                 "-s".into(),
@@ -318,7 +318,7 @@ fn try_ipify_api(tx: &Sender<TelemetryUpdate>, cfg: &TelemetryConfig) -> Option<
         .map_or("https://api.ipify.org", String::as_str);
 
     for attempt in 0..constants::RETRY_ATTEMPTS {
-        let output = vortix_process::run_to_output(CommandSpec::oneshot(
+        let output = crate::vortix_process::run_to_output(CommandSpec::oneshot(
             "curl",
             vec![
                 "-s".into(),
@@ -383,7 +383,7 @@ fn try_icanhazip_api(tx: &Sender<TelemetryUpdate>, cfg: &TelemetryConfig) -> Opt
         .map_or("https://icanhazip.com", String::as_str);
 
     for attempt in 0..constants::RETRY_ATTEMPTS {
-        let output = vortix_process::run_to_output(CommandSpec::oneshot(
+        let output = crate::vortix_process::run_to_output(CommandSpec::oneshot(
             "curl",
             vec![
                 "-s".into(),
@@ -426,7 +426,7 @@ fn try_ifconfig_api(tx: &Sender<TelemetryUpdate>, cfg: &TelemetryConfig) -> Opti
         .map_or("https://ifconfig.me/ip", String::as_str);
 
     for attempt in 0..constants::RETRY_ATTEMPTS {
-        let output = vortix_process::run_to_output(CommandSpec::oneshot(
+        let output = crate::vortix_process::run_to_output(CommandSpec::oneshot(
             "curl",
             vec![
                 "-s".into(),
@@ -600,7 +600,7 @@ fn fetch_latency(tx: &Sender<TelemetryUpdate>, cfg: &std::sync::Arc<TelemetryCon
 
         for target in &cfg.ping_targets {
             for attempt in 0..constants::RETRY_ATTEMPTS {
-                if let Ok(output) = vortix_process::run_to_output(CommandSpec::oneshot(
+                if let Ok(output) = crate::vortix_process::run_to_output(CommandSpec::oneshot(
                     "ping",
                     vec![
                         "-c".into(),
@@ -653,7 +653,7 @@ fn fetch_security_info(tx: &Sender<TelemetryUpdate>, cfg: &std::sync::Arc<Teleme
         let mut is_leaking = false;
         let ipv6_timeout = cfg.api_timeout.to_string();
         for endpoint in &cfg.ipv6_check_apis {
-            let output6 = vortix_process::run_to_output(CommandSpec::oneshot(
+            let output6 = crate::vortix_process::run_to_output(CommandSpec::oneshot(
                 "curl",
                 vec![
                     "-6".into(),

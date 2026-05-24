@@ -4,6 +4,21 @@
 //! It provides profile management and an intuitive dashboard interface.
 #![allow(clippy::missing_errors_doc, clippy::implicit_hasher)]
 
+// Internal library modules (formerly separate crates)
+pub mod vortix_config;
+pub mod vortix_core;
+pub mod vortix_process;
+pub mod vortix_protocol_openvpn;
+pub mod vortix_protocol_wireguard;
+
+#[cfg(target_os = "linux")]
+pub mod vortix_platform_linux;
+#[cfg(target_os = "macos")]
+pub mod vortix_platform_macos;
+#[cfg(target_os = "windows")]
+pub mod vortix_platform_windows;
+
+// Application modules
 pub mod app;
 pub mod cli;
 pub mod config;

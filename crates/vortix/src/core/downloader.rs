@@ -5,8 +5,8 @@
 use crate::constants;
 use crate::logger::{self, LogLevel};
 use crate::utils;
+use crate::vortix_process::CommandSpec;
 use std::path::PathBuf;
-use vortix_process::CommandSpec;
 
 /// Downloads a VPN profile from a given URL and saves it to the profiles directory.
 ///
@@ -44,7 +44,7 @@ pub fn download_profile(url: &str) -> Result<PathBuf, String> {
     // -S: Show errors even in silent mode
     // --max-time: Timeout
     // -o: Output file
-    let output = vortix_process::run_to_output(CommandSpec::oneshot(
+    let output = crate::vortix_process::run_to_output(CommandSpec::oneshot(
         "curl",
         vec![
             "-f".into(),

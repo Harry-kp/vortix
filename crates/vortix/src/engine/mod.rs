@@ -388,8 +388,8 @@ impl VpnEngine {
     ///
     /// Plan #004 U4: dispatch routes through the `TunnelKind` aggregate.
     pub fn cleanup_vpn_resources(&self, profile_name: &str) {
-        use vortix_core::ports::tunnel::{TunnelHandle, TunnelKindTag};
-        use vortix_core::profile::ProfileId;
+        use crate::vortix_core::ports::tunnel::{TunnelHandle, TunnelKindTag};
+        use crate::vortix_core::profile::ProfileId;
 
         if let Some(profile) = self.profiles.iter().find(|p| p.name == profile_name) {
             let iface = match profile.protocol {

@@ -247,8 +247,8 @@ impl VpnEngine {
         let _ = force; // SIGTERM vs SIGKILL handled inside OvpnTunnel::down today.
 
         std::thread::spawn(move || {
-            use vortix_core::ports::tunnel::{TunnelHandle, TunnelKindTag};
-            use vortix_core::profile::ProfileId;
+            use crate::vortix_core::ports::tunnel::{TunnelHandle, TunnelKindTag};
+            use crate::vortix_core::profile::ProfileId;
 
             let handle = TunnelHandle {
                 profile_id: ProfileId::new(&pn),
@@ -428,14 +428,14 @@ impl VpnEngine {
         ovpn_verbosity: &str,
         cmd_tx: &std::sync::mpsc::Sender<Message>,
     ) {
-        use vortix_core::profile::{ProfileId, ProtocolKind};
+        use crate::vortix_core::profile::{ProfileId, ProtocolKind};
 
         let name = name.to_string();
         let cmd_tx = cmd_tx.clone();
         let config_dir =
             crate::utils::get_app_config_dir().unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
 
-        let profile = vortix_core::profile::Profile::new(
+        let profile = crate::vortix_core::profile::Profile::new(
             ProfileId::new(&name),
             &name,
             match protocol {

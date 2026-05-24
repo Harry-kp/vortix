@@ -60,7 +60,7 @@ pub struct App {
     /// Optional plan-005 `EngineHandle`. Non-load-bearing today — the TUI
     /// still mutates `self.engine` directly through `Deref`. Future plan
     /// 005 U5/U6 units migrate consumers off `Deref` and onto this handle.
-    pub engine_handle: Option<vortix_core::engine::EngineHandle>,
+    pub engine_handle: Option<crate::vortix_core::engine::EngineHandle>,
 
     /// Flag indicating the application should exit.
     pub should_quit: bool,
@@ -252,7 +252,7 @@ impl App {
     /// mutates `self.engine` through `Deref` — but future units swap UI
     /// reads / commands over to it.
     #[must_use]
-    pub fn with_engine_handle(mut self, handle: vortix_core::engine::EngineHandle) -> Self {
+    pub fn with_engine_handle(mut self, handle: crate::vortix_core::engine::EngineHandle) -> Self {
         self.engine_handle = Some(handle);
         self
     }

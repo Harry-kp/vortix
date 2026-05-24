@@ -182,8 +182,8 @@ impl App {
         #[cfg(target_os = "macos")]
         // xtask:allow-platform-cfg: pbcopy is macOS-only; future Clipboard port
         {
-            use vortix_process::CommandSpec;
-            if vortix_process::run_to_output(
+            use crate::vortix_process::CommandSpec;
+            if crate::vortix_process::run_to_output(
                 CommandSpec::oneshot("pbcopy", vec![]).stdin(ip_str.as_bytes().to_vec()),
             )
             .is_ok()
@@ -195,7 +195,7 @@ impl App {
         #[cfg(target_os = "linux")]
         // xtask:allow-platform-cfg: wl-copy/xclip/xsel selection is Linux-only; future Clipboard port
         {
-            use vortix_process::CommandSpec;
+            use crate::vortix_process::CommandSpec;
             // Wayland-first: try wl-copy when $WAYLAND_DISPLAY is set,
             // then fall back to X11 tools (xclip, xsel).
             let is_wayland = std::env::var("WAYLAND_DISPLAY").is_ok();
@@ -214,7 +214,7 @@ impl App {
             };
             for (cmd, args) in tools {
                 let owned_args: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
-                if let Ok(o) = vortix_process::run_to_output(
+                if let Ok(o) = crate::vortix_process::run_to_output(
                     CommandSpec::oneshot(*cmd, owned_args).stdin(ip_str.as_bytes().to_vec()),
                 ) {
                     if o.status.success() {

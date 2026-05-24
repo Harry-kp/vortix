@@ -10,26 +10,26 @@
 
 use std::path::Path;
 
-use vortix_core::ports::tunnel::{
+use crate::vortix_core::ports::tunnel::{
     ParseError, ParsedProfile, Tunnel, TunnelCapabilities, TunnelError, TunnelHandle,
     TunnelKindTag, TunnelStatus,
 };
-use vortix_core::profile::{Profile, ProfileId, ProtocolKind};
-use vortix_protocol_openvpn::OvpnTunnel;
-use vortix_protocol_wireguard::WgTunnel;
+use crate::vortix_core::profile::{Profile, ProfileId, ProtocolKind};
+use crate::vortix_protocol_openvpn::OvpnTunnel;
+use crate::vortix_protocol_wireguard::WgTunnel;
 
 use crate::state::{Protocol, VpnProfile};
 
 /// Runtime-selectable carrier over the closed protocol set.
 ///
-/// Mock variant uses `vortix_core::ports::tunnel::mock::MockTunnel` so tests
+/// Mock variant uses `crate::vortix_core::ports::tunnel::mock::MockTunnel` so tests
 /// can substitute scripted behaviour without touching the real impls.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum TunnelKind {
     WireGuard(WgTunnel),
     OpenVpn(OvpnTunnel),
-    Mock(vortix_core::ports::tunnel::mock::MockTunnel),
+    Mock(crate::vortix_core::ports::tunnel::mock::MockTunnel),
 }
 
 impl TunnelKind {
@@ -87,7 +87,7 @@ impl TunnelKind {
 // Implement the `Tunnel` trait by delegating to the inherent methods.
 // Plan 005's `Engine<T: Tunnel>` requires this so the binary can construct
 // `Engine<TunnelKind>` and drive the FSM with the existing dispatch.
-impl vortix_core::ports::tunnel::Tunnel for TunnelKind {
+impl crate::vortix_core::ports::tunnel::Tunnel for TunnelKind {
     fn up(&mut self, profile: &Profile) -> Result<TunnelHandle, TunnelError> {
         TunnelKind::up(self, profile)
     }
@@ -123,9 +123,9 @@ pub fn tunnel_for_with_secrets(
     let mut kind = tunnel_for(protocol, config_dir, ovpn_verbosity, connect_timeout_secs);
     if let TunnelKind::OpenVpn(ref mut ovpn) = kind {
         let store_dir = config_dir.to_path_buf();
-        let provider: vortix_protocol_openvpn::SecretProvider =
+        let provider: crate::vortix_protocol_openvpn::SecretProvider =
             std::sync::Arc::new(move |profile_id: &str| {
-                use vortix_config::secret_store::{
+                use crate::vortix_config::secret_store::{
                     LayeredSecretStore, SecretBackendTag, SecretRef, SecretStore, SecretStoreConfig,
                 };
                 let store = LayeredSecretStore::new(SecretStoreConfig {
