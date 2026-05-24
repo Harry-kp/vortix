@@ -306,6 +306,23 @@ pub enum Commands {
         inline_secrets: bool,
     },
 
+    /// Interact with the plan-005 `EngineHandle` (diagnostic)
+    ///
+    /// Routes commands through the new FSM actor rather than the legacy
+    /// `VpnEngine` path. Useful for confirming the actor + journal +
+    /// tunnel-factory wiring works end-to-end. Live VPN behaviour still
+    /// flows through `vortix up` / `down` for now; this command exercises
+    /// the new path.
+    ///
+    /// EXAMPLES:
+    ///     vortix engine status         Snapshot the FSM state
+    ///     vortix engine connect corp   Execute Connect through the handle
+    ///     vortix engine disconnect     Execute Disconnect through the handle
+    Engine {
+        #[command(subcommand)]
+        op: EngineOp,
+    },
+
     /// Manage stored secrets (plan 006 U3)
     ///
     /// Lightweight wrapper over the `LayeredSecretStore` (OS keyring with
@@ -384,6 +401,20 @@ pub enum JournalOp {
         #[arg(default_value_t = 20)]
         count: usize,
     },
+}
+
+/// Subcommands for `vortix engine`.
+#[derive(clap::Subcommand, Debug, Clone)]
+pub enum EngineOp {
+    /// Snapshot the FSM state + journal tail.
+    Status,
+    /// Execute `Connect { profile }` through the handle.
+    Connect {
+        /// Profile id (sidecar `profile_id` or display name).
+        profile: String,
+    },
+    /// Execute `Disconnect` through the handle.
+    Disconnect,
 }
 
 /// Subcommands for `vortix secrets`.
