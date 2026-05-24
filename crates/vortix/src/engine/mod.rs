@@ -81,7 +81,7 @@ pub struct VpnEngine {
 
     // === Async Communication ===
     pub(crate) telemetry_rx: Option<mpsc::Receiver<TelemetryUpdate>>,
-    pub(crate) telemetry_nudge: Option<mpsc::Sender<()>>,
+    pub telemetry_nudge: Option<mpsc::Sender<()>>,
     pub(crate) cmd_tx: mpsc::Sender<Message>,
     pub(crate) cmd_rx: mpsc::Receiver<Message>,
     pub(crate) scanner_rx: Option<mpsc::Receiver<Vec<ActiveSession>>>,
