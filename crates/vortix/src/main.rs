@@ -146,6 +146,25 @@ fn main() -> Result<()> {
         }
     }
 
+    // Plan 008 U5: orphan-daemon scan. If a previous vortix crashed
+    // while a tunnel was up, the user's `wg-quick` / `openvpn` /
+    // `wireguard-go` daemon is probably still running. Warn so they
+    // know to clean up (no auto-adopt — adoption arrives with the
+    // plan 010 IPC layer).
+    let orphans = vortix_process::scan_orphans();
+    if !orphans.is_empty() {
+        eprintln!(
+            "Warning: detected {} possible orphan VPN process(es) from a previous session:",
+            orphans.len()
+        );
+        for o in &orphans {
+            eprintln!("  - pid {} ({})", o.pid, o.command);
+        }
+        eprintln!(
+            "  These may be leftovers from a previous vortix crash. Run `sudo kill <pid>` to clean up, or `sudo vortix down --force` to tear down via vortix."
+        );
+    }
+
     // Load config.toml (or use defaults)
     let app_config = match config::load_config(&config_dir) {
         Ok(cfg) => cfg,

@@ -9,9 +9,11 @@
 #![allow(clippy::missing_errors_doc)]
 
 pub mod mock;
+pub mod orphan_scan;
 pub mod real;
 
 pub use mock::MockRunner;
+pub use orphan_scan::{scan_orphans, OrphanProcess};
 pub use real::RealRunner;
 
 // Re-export the port types so callers don't have to depend on vortix-core directly
