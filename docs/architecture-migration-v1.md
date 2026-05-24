@@ -190,7 +190,7 @@ plan docs remain the design records.
 
 | Phase | Plan | Status | Commit |
 |---|---|---|---|
-| A — Lifecycle hooks | 009 | ✅ shipped | `ee5b099` |
+| A — Lifecycle hooks | 009 | ⏭ deferred to v0.3.x (rolled back from PR #201) | — |
 | B — CI integration tests | 012 | ✅ shipped (Ubuntu only) | `1cbfa90` |
 | C — Socket audit port | 013 | ✅ shipped (Linux + macOS) | `82ba6a4` |
 | D — IPC layer / daemon | 010 | ✅ shipped (skeleton + wire contract); engine routing → v0.3.x | `a7796d1` |

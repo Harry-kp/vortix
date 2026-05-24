@@ -2,7 +2,7 @@
 plan_id: 2026-05-24-015
 title: "feat: Execute deferred subsystems 009-013 in v0.3.0 bundle"
 type: feat
-status: completed
+status: completed-with-phase-a-rollback
 created: 2026-05-24
 target_branch: refactor/architectural-migration-v1
 target_pr: 201
@@ -16,6 +16,15 @@ related_plans:
 ---
 
 # feat: Execute deferred subsystems 009-013 in v0.3.0 bundle
+
+> **Phase A (Lifecycle hooks) rolled back from PR #201** — the
+> maintainer cancelled the hook surface after first hands-on use of
+> the management TUI shipped on top in plans 016/017/018. All hook
+> code (`vortix-core::engine::hooks`, `vortix-config::HookConfig`,
+> `vortix::hooks::ShellHook`, journal-subscriber wiring, plus the
+> entire TUI surface) reverted via the "Defer all hook work" commit.
+> Phases B (CI), C (audit), D (daemon), E (privilege docs) remain
+> shipped. Lifecycle hooks resume in v0.3.x with another UX iteration.
 
 ## Problem Frame
 
