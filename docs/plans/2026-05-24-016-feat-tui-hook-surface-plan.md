@@ -2,7 +2,7 @@
 plan_id: 2026-05-24-016
 title: "feat: TUI hook surface — failure toasts, Hooks overlay, config-validation toast"
 type: feat
-status: active
+status: completed
 created: 2026-05-24
 target_branch: refactor/architectural-migration-v1
 target_pr: 201
