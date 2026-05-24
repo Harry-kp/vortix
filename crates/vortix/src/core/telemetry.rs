@@ -583,82 +583,9 @@ pub fn parse_ping_output(output: &str) -> PingStats {
     stats
 }
 
-/// Parse `/proc/net/dev` output (Linux) to get total bytes in/out.
-#[allow(dead_code)]
-///
-/// Format: `iface: rx_bytes rx_packets rx_errs ... tx_bytes tx_packets tx_errs ...`
-/// Returns (`total_bytes_in`, `total_bytes_out`) excluding loopback.
-#[must_use]
-pub fn parse_proc_net_dev(content: &str) -> (u64, u64) {
-    let mut total_in: u64 = 0;
-    let mut total_out: u64 = 0;
-
-    for line in content.lines().skip(2) {
-        // Skip 2 header lines
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        // Split on ':' to get interface name and stats
-        let parts: Vec<&str> = line.splitn(2, ':').collect();
-        if parts.len() != 2 {
-            continue;
-        }
-
-        let iface = parts[0].trim();
-        // Skip loopback
-        if iface == "lo" {
-            continue;
-        }
-
-        let stats: Vec<&str> = parts[1].split_whitespace().collect();
-        // rx_bytes is index 0, tx_bytes is index 8
-        if stats.len() >= 10 {
-            if let Ok(rx) = stats[0].parse::<u64>() {
-                total_in += rx;
-            }
-            if let Ok(tx) = stats[8].parse::<u64>() {
-                total_out += tx;
-            }
-        }
-    }
-
-    (total_in, total_out)
-}
-
-/// Parse `ip addr show {iface}` output (Linux) to extract IP and MTU.
-#[allow(dead_code)]
-///
-/// Returns (`ip_address`, `mtu`).
-#[must_use]
-pub fn parse_ip_addr_output(output: &str) -> (String, String) {
-    let mut ip = String::new();
-    let mut mtu = String::new();
-
-    for line in output.lines() {
-        let trimmed = line.trim();
-        // MTU is on the first line: "4: wg0: <POINTOPOINT,NOARP,UP,LOWER_UP> mtu 1420 ..."
-        if trimmed.contains("mtu ") && mtu.is_empty() {
-            if let Some(mtu_idx) = trimmed.find("mtu ") {
-                let rest = &trimmed[mtu_idx + 4..];
-                if let Some(val) = rest.split_whitespace().next() {
-                    mtu = val.to_string();
-                }
-            }
-        }
-        // IP is on an "inet " line: "    inet 10.0.0.2/32 scope global wg0"
-        if trimmed.starts_with("inet ") && ip.is_empty() {
-            let parts: Vec<&str> = trimmed.split_whitespace().collect();
-            if parts.len() >= 2 {
-                // Strip CIDR notation if present
-                ip = parts[1].split('/').next().unwrap_or("").to_string();
-            }
-        }
-    }
-
-    (ip, mtu)
-}
+// Note: `parse_proc_net_dev` and `parse_ip_addr_output` moved to
+// `vortix-platform-linux::network_stats` and `vortix-platform-linux::interface`
+// respectively as part of plan 003 U2.
 
 /// Measures network latency, packet loss, and jitter by pinging reliable hosts.
 fn fetch_latency(tx: &Sender<TelemetryUpdate>, cfg: &std::sync::Arc<TelemetryConfig>) {
@@ -867,76 +794,9 @@ rtt min/avg/max/mdev = 1.234/5.678/9.012/3.456 ms";
         assert_eq!(stats, PingStats::default());
     }
 
-    // === /proc/net/dev parsing tests ===
-
-    #[test]
-    fn test_parse_proc_net_dev() {
-        let content = "\
-Inter-|   Receive                                                |  Transmit
- face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
-    lo: 1000       10    0    0    0     0          0         0     1000       10    0    0    0     0       0          0
-  eth0: 5000       50    0    0    0     0          0         0     3000       30    0    0    0     0       0          0
-  wg0:  2000       20    0    0    0     0          0         0     1500       15    0    0    0     0       0          0";
-
-        let (bytes_in, bytes_out) = parse_proc_net_dev(content);
-        // Should skip lo (1000/1000) and sum eth0 (5000/3000) + wg0 (2000/1500)
-        assert_eq!(bytes_in, 7000);
-        assert_eq!(bytes_out, 4500);
-    }
-
-    #[test]
-    fn test_parse_proc_net_dev_only_loopback() {
-        let content = "\
-Inter-|   Receive                                                |  Transmit
- face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
-    lo: 1000       10    0    0    0     0          0         0     1000       10    0    0    0     0       0          0";
-
-        let (bytes_in, bytes_out) = parse_proc_net_dev(content);
-        assert_eq!(bytes_in, 0);
-        assert_eq!(bytes_out, 0);
-    }
-
-    #[test]
-    fn test_parse_proc_net_dev_empty() {
-        let (bytes_in, bytes_out) = parse_proc_net_dev("");
-        assert_eq!(bytes_in, 0);
-        assert_eq!(bytes_out, 0);
-    }
-
-    // === ip addr output parsing tests ===
-
-    #[test]
-    fn test_parse_ip_addr_output_wireguard() {
-        let output = "\
-4: wg0: <POINTOPOINT,NOARP,UP,LOWER_UP> mtu 1420 qdisc noqueue state UNKNOWN group default qlen 1000
-    link/none
-    inet 10.0.0.2/32 scope global wg0
-       valid_lft forever preferred_lft forever";
-
-        let (ip, mtu) = parse_ip_addr_output(output);
-        assert_eq!(ip, "10.0.0.2");
-        assert_eq!(mtu, "1420");
-    }
-
-    #[test]
-    fn test_parse_ip_addr_output_tun() {
-        let output = "\
-5: tun0: <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UNKNOWN group default qlen 500
-    link/none
-    inet 10.8.0.6/24 brd 10.8.0.255 scope global tun0
-       valid_lft forever preferred_lft forever";
-
-        let (ip, mtu) = parse_ip_addr_output(output);
-        assert_eq!(ip, "10.8.0.6");
-        assert_eq!(mtu, "1500");
-    }
-
-    #[test]
-    fn test_parse_ip_addr_output_empty() {
-        let (ip, mtu) = parse_ip_addr_output("");
-        assert!(ip.is_empty());
-        assert!(mtu.is_empty());
-    }
+    // /proc/net/dev and `ip addr` parsing tests moved to
+    // `vortix-platform-linux::{network_stats, interface}` along with the
+    // parsers themselves (plan 003 U2).
 
     // === DNS parsing tests ===
 

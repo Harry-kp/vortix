@@ -1,8 +1,9 @@
 //! macOS DNS resolver using scutil and networksetup.
 
-use crate::constants;
-use crate::platform::DnsResolver;
+use vortix_core::ports::dns::DnsResolver;
 use vortix_process::CommandSpec;
+
+const RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
 
 /// macOS DNS resolution via scutil --dns, networksetup, and /etc/resolv.conf.
 pub struct MacDns;
@@ -18,7 +19,7 @@ impl DnsResolver for MacDns {
 
 /// Try to get DNS from /etc/resolv.conf
 fn try_get_dns_resolv_conf() -> Option<String> {
-    let content = std::fs::read_to_string(constants::RESOLV_CONF_PATH).ok()?;
+    let content = std::fs::read_to_string(RESOLV_CONF_PATH).ok()?;
     for line in content.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with("nameserver") {

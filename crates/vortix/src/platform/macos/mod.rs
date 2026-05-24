@@ -1,11 +1,7 @@
-//! macOS platform implementations.
+//! macOS platform implementations — thin re-exports.
 //!
-//! Uses pf (Packet Filter), netstat -ib, ifconfig, and scutil/networksetup.
+//! The actual impl code lives in `vortix-platform-macos` per plan 003 U1/U2.
+//! Submodule aliases here keep existing `crate::platform::macos::*` paths
+//! resolving until plan 003 U7 swaps consumers over to `&Platform`.
 
-pub mod dns;
-pub mod interface;
-pub mod network;
-
-// Killswitch firewall impl now lives in `vortix-platform-macos::firewall`
-// (plan 003 U1).
-pub use vortix_platform_macos::firewall;
+pub use vortix_platform_macos::{dns, firewall, interface, network_stats as network, route_table};

@@ -1,10 +1,9 @@
 //! Platform abstraction layer — thin re-exports.
 //!
 //! Plan 003 moves capability-port traits and impls into `vortix-core::ports::*`
-//! and the `vortix-platform-{linux,macos}` crates. The submodules in this
-//! directory still host the remaining sync helpers (`DnsResolver`,
-//! `InterfaceDetector`, `NetworkStatsProvider`) until plan 003 U2 finishes
-//! the relocation.
+//! and the `vortix-platform-{linux,macos}` crates. This module keeps the
+//! legacy trait/impl path aliases working until plan 003 U7 swaps consumers
+//! over to the `Platform` aggregate.
 
 #[cfg(target_os = "linux")]
 pub mod linux;
@@ -18,45 +17,13 @@ compile_error!("Vortix currently only supports macOS and Linux");
 pub use crate::constants::DEFAULT_VPN_INTERFACE;
 pub use crate::constants::KILLSWITCH_EMERGENCY_MSG;
 
-// `Killswitch` (was `Firewall`) lives in `vortix-core::ports::killswitch` per
-// plan 003 U1. Keep a thin alias here so existing call sites keep working
-// until U7 migrates them to `&Platform`.
+// Capability ports now live in `vortix-core::ports::*` (plan 003 U1/U2).
+// Keep the legacy trait names as aliases so existing call sites keep working.
+pub use vortix_core::ports::dns::DnsResolver;
+pub use vortix_core::ports::interface::Interface as InterfaceDetector;
 pub use vortix_core::ports::killswitch::Killswitch as Firewall;
-
-// === Remaining informal traits (plan 003 U2 promotes these to ports) ===
-
-/// Network statistics collection.
-///
-/// Implementations read per-interface byte counters to calculate throughput.
-pub trait NetworkStatsProvider {
-    /// Get total bytes (in, out) across all non-loopback interfaces.
-    fn get_total_bytes() -> (u64, u64);
-}
-
-/// VPN interface detection.
-///
-/// Implementations detect active `WireGuard` and `OpenVPN` interfaces.
-pub trait InterfaceDetector {
-    /// Check if a `WireGuard` interface exists by profile name.
-    fn check_wireguard_interface(name: &str) -> bool;
-
-    /// Get the real interface name for a `WireGuard` profile.
-    fn resolve_wireguard_interface(name: &str) -> Option<String>;
-
-    /// Get the PID of the `WireGuard` process managing an interface.
-    fn get_wireguard_pid(interface: &str) -> Option<u32>;
-
-    /// Get IP and MTU for an interface.
-    fn get_interface_info(interface: &str) -> (String, String);
-}
-
-/// DNS resolver information.
-///
-/// Implementations query the system for the active DNS server.
-pub trait DnsResolver {
-    /// Get the current system DNS server address.
-    fn get_dns_server() -> Option<String>;
-}
+pub use vortix_core::ports::network_stats::NetworkStats as NetworkStatsProvider;
+pub use vortix_core::ports::route_table::RouteTable;
 
 /// Platform-appropriate install hint for a package.
 #[cfg(target_os = "macos")]

@@ -1,9 +1,10 @@
 //! macOS VPN interface detection via ifconfig and /var/run/wireguard/.
 
-use crate::constants;
-use crate::platform::InterfaceDetector;
 use std::path::PathBuf;
+use vortix_core::ports::interface::Interface;
 use vortix_process::CommandSpec;
+
+const WIREGUARD_RUN_DIR: &str = "/var/run/wireguard";
 
 /// Run a command and return its output.
 ///
@@ -17,14 +18,14 @@ fn cmd_output(program: &str, args: &[&str]) -> Option<std::process::Output> {
 /// macOS interface detection using ifconfig and /var/run/wireguard/*.name files.
 pub struct MacInterface;
 
-impl InterfaceDetector for MacInterface {
+impl Interface for MacInterface {
     fn check_wireguard_interface(name: &str) -> bool {
-        let pid_file = PathBuf::from(constants::WIREGUARD_RUN_DIR).join(format!("{name}.name"));
+        let pid_file = PathBuf::from(WIREGUARD_RUN_DIR).join(format!("{name}.name"));
         pid_file.exists() || check_wg_interface_exists(name)
     }
 
     fn resolve_wireguard_interface(name: &str) -> Option<String> {
-        let pid_file = PathBuf::from(constants::WIREGUARD_RUN_DIR).join(format!("{name}.name"));
+        let pid_file = PathBuf::from(WIREGUARD_RUN_DIR).join(format!("{name}.name"));
         if pid_file.exists() {
             Some(
                 std::fs::read_to_string(&pid_file)
@@ -38,7 +39,7 @@ impl InterfaceDetector for MacInterface {
     }
 
     fn get_wireguard_pid(interface: &str) -> Option<u32> {
-        let sock_path = format!("{}/{interface}.sock", constants::WIREGUARD_RUN_DIR);
+        let sock_path = format!("{WIREGUARD_RUN_DIR}/{interface}.sock");
 
         // Use lsof to get the PID of the process holding the socket
         if let Some(output) = cmd_output("lsof", &["-t", &sock_path]) {
