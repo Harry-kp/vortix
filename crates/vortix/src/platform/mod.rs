@@ -5,10 +5,17 @@
 //! legacy trait/impl path aliases working until plan 003 U7 swaps consumers
 //! over to the `Platform` aggregate.
 
+pub mod aggregate;
+
 #[cfg(target_os = "linux")]
 pub mod linux;
 #[cfg(target_os = "macos")]
 pub mod macos;
+
+pub use aggregate::{
+    DnsResolverKind, InterfaceKind, KillswitchKind, MockDns, MockInterface, MockKillswitch,
+    MockNetworkStats, MockRouteTable, NetworkStatsKind, Platform, RouteTableKind,
+};
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 compile_error!("Vortix currently only supports macOS and Linux");
