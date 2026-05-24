@@ -306,6 +306,34 @@ pub enum Commands {
         inline_secrets: bool,
     },
 
+    /// Backfill profile sidecars (plan 006 U4)
+    ///
+    /// Walks the profiles directory and writes `.meta.toml` sidecars for
+    /// any `.conf` / `.ovpn` files that lack one. Idempotent — running it
+    /// twice is harmless. Sidecars include a stable `profile_id`, the
+    /// display name, the protocol, and an `imported_at` timestamp drawn
+    /// from the file's mtime.
+    ///
+    /// This also runs implicitly at every binary startup; this command is
+    /// useful when you want to surface the stats (`created`, `failed`,
+    /// `already_migrated`) explicitly.
+    ///
+    /// EXAMPLES:
+    ///     vortix migrate
+    ///     vortix migrate --json
+    Migrate,
+
+    /// Print the resolved Settings stack (plan 006 U1)
+    ///
+    /// Shows the merged result of defaults → system file → user file →
+    /// VORTIX_* env vars. Useful for verifying which layer set which
+    /// field.
+    ///
+    /// EXAMPLES:
+    ///     vortix settings           Human-readable TOML
+    ///     vortix settings --json    JSON object (good for piping into jq)
+    Settings,
+
     /// Inspect the engine event journal (plan 005)
     ///
     /// EXAMPLES:

@@ -80,11 +80,93 @@ pub fn handle_command(
             profile,
             inline_secrets,
         } => handle_export(config_dir, profile, *inline_secrets, mode),
+        Commands::Migrate => handle_migrate(config_dir, mode),
+        Commands::Settings => handle_settings(mode),
         Commands::Journal { op } => handle_journal(op, mode),
         Commands::Completions { shell } => {
             handle_completions(*shell);
             0
         }
+    }
+}
+
+#[derive(Serialize)]
+struct MigrateData {
+    created: u32,
+    already_migrated: u32,
+    failed: u32,
+    ignored: u32,
+}
+
+/// Explicit profile-sidecar migration (plan 006 U4). Same logic as the
+/// implicit startup pass; surfacing it here lets users see the stats.
+fn handle_migrate(config_dir: &Path, mode: OutputMode) -> i32 {
+    let profiles_dir = config_dir.join(constants::PROFILES_DIR_NAME);
+    let stats = match vortix_config::migrate_legacy_profiles(&profiles_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("migration failed: {e}");
+            return 1;
+        }
+    };
+
+    let data = MigrateData {
+        created: stats.created,
+        already_migrated: stats.already_migrated,
+        failed: stats.failed,
+        ignored: stats.ignored,
+    };
+
+    match mode {
+        OutputMode::Json => {
+            print_success(mode, "migrate", &data, vec![]);
+            0
+        }
+        OutputMode::Quiet => 0,
+        OutputMode::Human => {
+            println!("Profile sidecar migration:");
+            println!("  Created:           {}", data.created);
+            println!("  Already migrated:  {}", data.already_migrated);
+            println!("  Ignored:           {}", data.ignored);
+            if data.failed > 0 {
+                println!("  Failed:            {}", data.failed);
+            }
+            0
+        }
+    }
+}
+
+/// Print the figment-resolved Settings stack (plan 006 U1).
+fn handle_settings(mode: OutputMode) -> i32 {
+    let settings = match vortix_config::Settings::load() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("settings load failed: {e}");
+            return 1;
+        }
+    };
+
+    match mode {
+        OutputMode::Json => match serde_json::to_string_pretty(&settings) {
+            Ok(j) => {
+                println!("{j}");
+                0
+            }
+            Err(e) => {
+                eprintln!("serialize failed: {e}");
+                1
+            }
+        },
+        OutputMode::Human | OutputMode::Quiet => match toml::to_string_pretty(&settings) {
+            Ok(t) => {
+                print!("{t}");
+                0
+            }
+            Err(e) => {
+                eprintln!("serialize failed: {e}");
+                1
+            }
+        },
     }
 }
 
