@@ -306,6 +306,22 @@ pub enum Commands {
         inline_secrets: bool,
     },
 
+    /// Manage stored secrets (plan 006 U3)
+    ///
+    /// Lightweight wrapper over the `LayeredSecretStore` (OS keyring with
+    /// AES-256-GCM/argon2id encrypted-file fallback). Secrets stored
+    /// here will be consumed by future plan 006 U5 work (`Tunnel` +
+    /// `SecretStore` integration); for now they're stored but unused.
+    ///
+    /// EXAMPLES:
+    ///     echo -n 'my-password' | vortix secrets set creds/corp
+    ///     vortix secrets get creds/corp > /tmp/.creds      # restrict perms after
+    ///     vortix secrets delete creds/corp
+    Secrets {
+        #[command(subcommand)]
+        op: SecretsOp,
+    },
+
     /// Backfill profile sidecars (plan 006 U4)
     ///
     /// Walks the profiles directory and writes `.meta.toml` sidecars for
@@ -367,5 +383,32 @@ pub enum JournalOp {
         /// Number of events to print (default: 20).
         #[arg(default_value_t = 20)]
         count: usize,
+    },
+}
+
+/// Subcommands for `vortix secrets`.
+#[derive(clap::Subcommand, Debug, Clone)]
+pub enum SecretsOp {
+    /// Store a secret. Reads the raw bytes from stdin.
+    Set {
+        /// Logical secret id (e.g. `creds/corp`).
+        id: String,
+    },
+    /// Print a stored secret to stdout (no trailing newline).
+    Get {
+        /// Logical secret id to retrieve.
+        id: String,
+        /// Backend hint (`keyring` or `encrypted-file`). Defaults to
+        /// whatever the layered store picks at runtime.
+        #[arg(long)]
+        backend: Option<String>,
+    },
+    /// Delete a stored secret.
+    Delete {
+        /// Logical secret id to remove.
+        id: String,
+        /// Backend hint (`keyring` or `encrypted-file`).
+        #[arg(long)]
+        backend: Option<String>,
     },
 }
