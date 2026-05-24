@@ -253,6 +253,7 @@ fn run_tui(
     config_dir: std::path::PathBuf,
 ) -> Result<()> {
     let tick_rate = config.tick_rate;
+    let profiles_dir_for_resolver = config_dir.join(constants::PROFILES_DIR_NAME);
     let mut app = App::new(config, config_dir);
 
     // Attach an `EngineHandle` (plan 005 U5) so future units can migrate
@@ -262,21 +263,19 @@ fn run_tui(
     if let Some(runtime) = vortix_process::global_runner().as_real() {
         let _guard = runtime.runtime().handle().enter();
         if let Some(journal) = vortix_core::journal::global_journal().cloned() {
+            use vortix_config::profile_store::{FsProfileStore, ProfileStore};
             use vortix_core::engine::{Engine, EngineHandle};
-            use vortix_core::profile::{Profile, ProfileId, ProtocolKind};
+            use vortix_core::profile::ProfileId;
 
-            // The FSM is generic; here we don't actually pre-construct a
-            // tunnel — we hand it a default-Mock until plan 005 U6 wires
-            // commands to the engine_handle for real. The resolver translates
-            // the binary-side profile vocabulary on demand.
-            let resolver = |_id: &ProfileId| -> Option<Profile> {
-                // Real resolver lands when CLI/TUI migrate off Deref;
-                // until then any caller hitting the handle gets a
-                // ProfileGone failure, which is the right thing for a
-                // not-yet-wired path.
-                None
+            // Live profile resolver — reads sidecars via FsProfileStore so
+            // any plan-005 consumer calling `handle.execute(Connect{id})`
+            // sees the user's actual profiles (post-migration).
+            let resolver_dir = profiles_dir_for_resolver.clone();
+            let resolver = move |id: &ProfileId| {
+                let store = FsProfileStore::new(resolver_dir.clone());
+                store.get(id).ok()
             };
-            let _ = ProtocolKind::WireGuard; // suppress unused warning
+
             let tunnel = vortix_core::ports::tunnel::mock::MockTunnel::new();
             let engine = Engine::new(tunnel, resolver);
             let handle = EngineHandle::local(engine, journal);
