@@ -16,6 +16,7 @@ pub mod message;
 pub mod platform;
 pub mod state;
 pub mod theme;
+pub mod tunnel;
 pub mod ui;
 pub mod utils;
 pub mod vpn;

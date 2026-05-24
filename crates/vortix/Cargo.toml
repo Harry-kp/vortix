@@ -59,9 +59,11 @@ unicode-width = { workspace = true }
 open = { workspace = true }
 urlencoding = { workspace = true }
 
-# Workspace library deps (plan 002 + plan 003).
+# Workspace library deps (plan 002 + plan 003 + plan 004).
 vortix-core = { path = "../vortix-core" }
 vortix-process = { path = "../vortix-process" }
+vortix-protocol-openvpn = { path = "../vortix-protocol-openvpn" }
+vortix-protocol-wireguard = { path = "../vortix-protocol-wireguard" }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 

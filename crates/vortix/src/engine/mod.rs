@@ -385,31 +385,41 @@ impl VpnEngine {
     }
 
     /// Kill any running VPN process and remove run files for a profile.
+    ///
+    /// Plan #004 U4: dispatch routes through the `TunnelKind` aggregate.
     pub fn cleanup_vpn_resources(&self, profile_name: &str) {
-        use vortix_process::{CommandSpec, PrivilegeReq};
+        use vortix_core::ports::tunnel::{TunnelHandle, TunnelKindTag};
+        use vortix_core::profile::ProfileId;
+
         if let Some(profile) = self.profiles.iter().find(|p| p.name == profile_name) {
-            match profile.protocol {
+            let iface = match profile.protocol {
+                Protocol::WireGuard => profile.config_path.to_string_lossy().into_owned(),
                 Protocol::OpenVPN => {
-                    if let Some(pid) = utils::read_openvpn_pid(profile_name) {
-                        let _ = vortix_process::run_to_output(
-                            CommandSpec::oneshot("kill", vec![pid.to_string()])
-                                .privilege(PrivilegeReq::Root),
-                        );
-                    }
-                    utils::cleanup_openvpn_run_files(profile_name);
+                    format!("openvpn-{}", utils::sanitize_profile_name(profile_name))
                 }
-                Protocol::WireGuard => {
-                    let _ = vortix_process::run_to_output(
-                        CommandSpec::oneshot(
-                            "wg-quick",
-                            vec![
-                                "down".into(),
-                                profile.config_path.to_string_lossy().into_owned(),
-                            ],
-                        )
-                        .privilege(PrivilegeReq::Root),
-                    );
-                }
+            };
+            let pid = match profile.protocol {
+                Protocol::OpenVPN => utils::read_openvpn_pid(profile_name),
+                Protocol::WireGuard => None,
+            };
+            let handle = TunnelHandle {
+                profile_id: ProfileId::new(profile_name),
+                interface_name: iface,
+                pid,
+                started_at: std::time::SystemTime::now(),
+                kind: match profile.protocol {
+                    Protocol::WireGuard => TunnelKindTag::WireGuard,
+                    Protocol::OpenVPN => TunnelKindTag::OpenVpn,
+                },
+            };
+
+            let config_dir =
+                utils::get_app_config_dir().unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
+            let mut tunnel = crate::tunnel::tunnel_for(profile.protocol, &config_dir, "3", 30);
+            let _ = tunnel.down(handle);
+
+            if matches!(profile.protocol, Protocol::OpenVPN) {
+                utils::cleanup_openvpn_run_files(profile_name);
             }
         }
     }

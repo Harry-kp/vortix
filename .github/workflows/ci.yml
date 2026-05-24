@@ -183,6 +183,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo xtask check-platform-leak
 
+  check-protocol-leak:
+    name: Check Protocol Boundary (plan 004)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.91.0"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo xtask check-protocol-leak
+
   security:
     name: Security Audit
     runs-on: ubuntu-latest

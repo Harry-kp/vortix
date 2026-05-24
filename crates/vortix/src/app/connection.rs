@@ -2,10 +2,7 @@
 
 use std::time::Instant;
 
-use vortix_process::{CommandSpec, PrivilegeReq};
-
 use super::{App, ConnectionState, InputMode, Protocol, ToastType};
-use crate::constants;
 use crate::message::Message;
 use crate::utils;
 
@@ -202,231 +199,42 @@ impl App {
         let connect_timeout_secs = self.config.connect_timeout;
         let ovpn_verbosity = self.config.openvpn_verbosity.clone();
 
-        // Execute command in background to prevent TUI freeze
-        std::thread::spawn(move || match protocol {
-            Protocol::WireGuard => {
-                // wg-quick is a one-shot command: sets up interface and exits
-                match vortix_process::run_to_output(
-                    CommandSpec::oneshot(
-                        "wg-quick",
-                        vec!["up".into(), config_path.to_string_lossy().into_owned()],
-                    )
-                    .privilege(PrivilegeReq::Root),
-                ) {
-                    Ok(out) if out.status.success() => {
-                        let _ = cmd_tx.send(Message::ConnectResult {
-                            profile: name,
-                            success: true,
-                            error: None,
-                        });
-                    }
-                    Ok(out) => {
-                        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-                        let _ = cmd_tx.send(Message::ConnectResult {
-                            profile: name,
-                            success: false,
-                            error: Some(format!("WireGuard: {stderr}")),
-                        });
-                    }
-                    Err(e) => {
-                        let _ = cmd_tx.send(Message::ConnectResult {
-                            profile: name,
-                            success: false,
-                            error: Some(format!("Failed to execute wg-quick: {e}")),
-                        });
-                    }
+        // Plan #004 U4: route once via TunnelKind, no protocol match arm.
+        std::thread::spawn(move || {
+            use vortix_core::profile::{Profile, ProfileId, ProtocolKind};
+
+            let config_dir = crate::utils::get_app_config_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
+            let profile = Profile::new(
+                ProfileId::new(&name),
+                &name,
+                match protocol {
+                    Protocol::WireGuard => ProtocolKind::WireGuard,
+                    Protocol::OpenVPN => ProtocolKind::OpenVpn,
+                },
+                config_path,
+            );
+            let mut tunnel = crate::tunnel::tunnel_for(
+                protocol,
+                &config_dir,
+                &ovpn_verbosity,
+                connect_timeout_secs,
+            );
+
+            match tunnel.up(&profile) {
+                Ok(_handle) => {
+                    let _ = cmd_tx.send(Message::ConnectResult {
+                        profile: name,
+                        success: true,
+                        error: None,
+                    });
                 }
-            }
-            Protocol::OpenVPN => {
-                let run_paths = crate::utils::get_openvpn_run_paths(&name);
-                let (pid_path, log_path) = match run_paths {
-                    Ok(paths) => paths,
-                    Err(e) => {
-                        let _ = cmd_tx.send(Message::ConnectResult {
-                            profile: name,
-                            success: false,
-                            error: Some(format!("Failed to create run directory: {e}")),
-                        });
-                        return;
-                    }
-                };
-
-                // Clean up stale files from previous runs
-                let _ = std::fs::remove_file(&pid_path);
-                let _ = std::fs::remove_file(&log_path);
-
-                let safe_name = crate::utils::sanitize_profile_name(&name);
-
-                // Build openvpn args
-                let mut args = vec![
-                    "--config".to_string(),
-                    config_path.to_str().unwrap_or("").to_string(),
-                    "--daemon".to_string(),
-                    format!("vortix-{safe_name}"),
-                    "--writepid".to_string(),
-                    pid_path.to_str().unwrap_or("").to_string(),
-                    "--log".to_string(),
-                    log_path.to_str().unwrap_or("").to_string(),
-                    "--verb".to_string(),
-                    ovpn_verbosity,
-                ];
-
-                // If auth credentials exist, pass them via --auth-user-pass
-                if let Ok(auth_path) = crate::utils::get_openvpn_auth_path(&name) {
-                    if auth_path.exists() {
-                        args.push("--auth-user-pass".to_string());
-                        args.push(auth_path.to_str().unwrap_or("").to_string());
-                    }
-                }
-
-                let output = vortix_process::run_to_output(
-                    CommandSpec::oneshot("openvpn", args).privilege(PrivilegeReq::Root),
-                );
-
-                match output {
-                    Ok(out) if !out.status.success() => {
-                        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-                        let error_detail = if stderr.trim().is_empty() {
-                            // `--daemon --log` redirects all output away from stderr.
-                            // On pre-fork failures (missing certs, bad options) stderr
-                            // is empty — fall back to the log file for the real error.
-                            std::fs::read_to_string(&log_path)
-                                .ok()
-                                .filter(|s| !s.trim().is_empty())
-                                .map_or_else(
-                                    || "unknown error (no stderr or log output)".to_string(),
-                                    |log| {
-                                        log.lines()
-                                            .rev()
-                                            .take(constants::OVPN_ERROR_LOG_TAIL_LINES)
-                                            .collect::<Vec<_>>()
-                                            .into_iter()
-                                            .rev()
-                                            .collect::<Vec<_>>()
-                                            .join("\n")
-                                    },
-                                )
-                        } else {
-                            stderr.trim().to_string()
-                        };
-                        let _ = cmd_tx.send(Message::ConnectResult {
-                            profile: name,
-                            success: false,
-                            error: Some(format!("OpenVPN: {error_detail}")),
-                        });
-                        return;
-                    }
-                    Err(e) => {
-                        let _ = cmd_tx.send(Message::ConnectResult {
-                            profile: name,
-                            success: false,
-                            error: Some(format!("Failed to start OpenVPN: {e}")),
-                        });
-                        return;
-                    }
-                    Ok(_) => {} // Fork succeeded, daemon is running
-                }
-
-                // Chown the run files so normal users can read PID/log status.
-                std::thread::sleep(std::time::Duration::from_millis(
-                    constants::OVPN_CHOWN_DELAY_MS,
-                ));
-                crate::config::fix_ownership(
-                    pid_path.parent().unwrap_or(std::path::Path::new("/")),
-                );
-
-                // Poll the log file for definitive success/failure from the daemon.
-                let timeout = std::time::Duration::from_secs(connect_timeout_secs);
-                let poll_interval = std::time::Duration::from_millis(constants::OVPN_LOG_POLL_MS);
-                let start = std::time::Instant::now();
-
-                loop {
-                    std::thread::sleep(poll_interval);
-
-                    // Check if the daemon died (pid file gone or process not running)
-                    if start.elapsed()
-                        > std::time::Duration::from_secs(constants::OVPN_HEALTH_CHECK_DELAY_SECS)
-                    {
-                        if let Ok(content) = std::fs::read_to_string(&pid_path) {
-                            if let Ok(pid) = content.trim().parse::<u32>() {
-                                let alive = vortix_process::run_to_output(CommandSpec::oneshot(
-                                    "kill",
-                                    vec!["-0".into(), pid.to_string()],
-                                ))
-                                .is_ok_and(|o| o.status.success());
-                                if !alive {
-                                    let log =
-                                        std::fs::read_to_string(&log_path).unwrap_or_default();
-                                    let last_lines: String = log
-                                        .lines()
-                                        .rev()
-                                        .take(constants::OVPN_ERROR_LOG_TAIL_LINES)
-                                        .collect::<Vec<_>>()
-                                        .into_iter()
-                                        .rev()
-                                        .collect::<Vec<_>>()
-                                        .join("\n");
-                                    let _ = cmd_tx.send(Message::ConnectResult {
-                                        profile: name,
-                                        success: false,
-                                        error: Some(format!(
-                                            "OpenVPN daemon exited:\n{last_lines}"
-                                        )),
-                                    });
-                                    return;
-                                }
-                            }
-                        } else if start.elapsed()
-                            > std::time::Duration::from_secs(constants::OVPN_PID_FILE_TIMEOUT_SECS)
-                        {
-                            let log = std::fs::read_to_string(&log_path)
-                                .unwrap_or_else(|_| "No log output".to_string());
-                            let _ = cmd_tx.send(Message::ConnectResult {
-                                profile: name,
-                                success: false,
-                                error: Some(format!("OpenVPN: no PID file. Log:\n{log}")),
-                            });
-                            return;
-                        }
-                    }
-
-                    // Read the log file and check for markers
-                    if let Ok(log_content) = std::fs::read_to_string(&log_path) {
-                        if log_content.contains(constants::OVPN_LOG_SUCCESS) {
-                            let _ = cmd_tx.send(Message::ConnectResult {
-                                profile: name,
-                                success: true,
-                                error: None,
-                            });
-                            return;
-                        }
-
-                        for pattern in constants::OVPN_LOG_ERRORS {
-                            if log_content.contains(pattern) {
-                                let error_line = log_content
-                                    .lines()
-                                    .find(|l| l.contains(pattern))
-                                    .unwrap_or(pattern);
-                                let _ = cmd_tx.send(Message::ConnectResult {
-                                    profile: name,
-                                    success: false,
-                                    error: Some(format!("OpenVPN: {error_line}")),
-                                });
-                                return;
-                            }
-                        }
-                    }
-
-                    if start.elapsed() >= timeout {
-                        let _ = cmd_tx.send(Message::ConnectResult {
-                            profile: name.clone(),
-                            success: false,
-                            error: Some(format!(
-                                "Connection timed out after {connect_timeout_secs}s waiting for handshake"
-                            )),
-                        });
-                        return;
-                    }
+                Err(err) => {
+                    let _ = cmd_tx.send(Message::ConnectResult {
+                        profile: name,
+                        success: false,
+                        error: Some(format!("{protocol}: {err}")),
+                    });
                 }
             }
         });
@@ -504,30 +312,42 @@ impl App {
     }
 
     /// Kill any running VPN process and remove run files for a profile.
+    ///
+    /// Plan #004 U4: routes through the `TunnelKind` dispatch so this no
+    /// longer match-branches on protocol.
     pub(crate) fn cleanup_vpn_resources(&self, profile_name: &str) {
         if let Some(profile) = self.profiles.iter().find(|p| p.name == profile_name) {
-            match profile.protocol {
+            use vortix_core::ports::tunnel::{TunnelHandle, TunnelKindTag};
+            use vortix_core::profile::ProfileId;
+
+            let iface = match profile.protocol {
+                Protocol::WireGuard => profile.config_path.to_string_lossy().into_owned(),
                 Protocol::OpenVPN => {
-                    if let Some(pid) = utils::read_openvpn_pid(profile_name) {
-                        let _ = vortix_process::run_to_output(
-                            CommandSpec::oneshot("kill", vec![pid.to_string()])
-                                .privilege(PrivilegeReq::Root),
-                        );
-                    }
-                    utils::cleanup_openvpn_run_files(profile_name);
+                    format!("openvpn-{}", utils::sanitize_profile_name(profile_name))
                 }
-                Protocol::WireGuard => {
-                    let _ = vortix_process::run_to_output(
-                        CommandSpec::oneshot(
-                            "wg-quick",
-                            vec![
-                                "down".into(),
-                                profile.config_path.to_string_lossy().into_owned(),
-                            ],
-                        )
-                        .privilege(PrivilegeReq::Root),
-                    );
-                }
+            };
+            let pid = match profile.protocol {
+                Protocol::OpenVPN => utils::read_openvpn_pid(profile_name),
+                Protocol::WireGuard => None,
+            };
+            let handle = TunnelHandle {
+                profile_id: ProfileId::new(profile_name),
+                interface_name: iface,
+                pid,
+                started_at: std::time::SystemTime::now(),
+                kind: match profile.protocol {
+                    Protocol::WireGuard => TunnelKindTag::WireGuard,
+                    Protocol::OpenVPN => TunnelKindTag::OpenVpn,
+                },
+            };
+
+            let config_dir =
+                utils::get_app_config_dir().unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
+            let mut tunnel = crate::tunnel::tunnel_for(profile.protocol, &config_dir, "3", 30);
+            let _ = tunnel.down(handle);
+
+            if matches!(profile.protocol, Protocol::OpenVPN) {
+                utils::cleanup_openvpn_run_files(profile_name);
             }
         }
     }
@@ -649,37 +469,40 @@ impl App {
                 );
             }
 
+            // Plan #004 U4: route the disconnect through TunnelKind.
             std::thread::spawn(move || {
-                let output = match protocol {
-                    Protocol::WireGuard => vortix_process::run_to_output(
-                        CommandSpec::oneshot(
-                            "wg-quick",
-                            vec!["down".into(), config_path.to_string_lossy().into_owned()],
-                        )
-                        .privilege(PrivilegeReq::Root),
-                    ),
+                use vortix_core::ports::tunnel::{TunnelHandle, TunnelKindTag};
+                use vortix_core::profile::ProfileId;
+
+                let iface = match protocol {
+                    Protocol::WireGuard => config_path.to_string_lossy().into_owned(),
                     Protocol::OpenVPN => {
-                        let target_pid = crate::utils::read_openvpn_pid(&profile_name).or(pid);
-                        if let Some(p) = target_pid {
-                            vortix_process::run_to_output(
-                                CommandSpec::oneshot("kill", vec![p.to_string()])
-                                    .privilege(PrivilegeReq::Root),
-                            )
-                        } else {
-                            let safe = crate::utils::sanitize_profile_name(&profile_name);
-                            vortix_process::run_to_output(
-                                CommandSpec::oneshot(
-                                    "pkill",
-                                    vec!["-f".into(), format!("openvpn.*--daemon vortix-{safe}")],
-                                )
-                                .privilege(PrivilegeReq::Root),
-                            )
-                        }
+                        format!(
+                            "openvpn-{}",
+                            crate::utils::sanitize_profile_name(&profile_name)
+                        )
                     }
                 };
+                let pid_for_handle = match protocol {
+                    Protocol::OpenVPN => crate::utils::read_openvpn_pid(&profile_name).or(pid),
+                    Protocol::WireGuard => None,
+                };
+                let handle = TunnelHandle {
+                    profile_id: ProfileId::new(&profile_name),
+                    interface_name: iface,
+                    pid: pid_for_handle,
+                    started_at: std::time::SystemTime::now(),
+                    kind: match protocol {
+                        Protocol::WireGuard => TunnelKindTag::WireGuard,
+                        Protocol::OpenVPN => TunnelKindTag::OpenVpn,
+                    },
+                };
+                let config_dir = crate::utils::get_app_config_dir()
+                    .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
+                let mut tunnel = crate::tunnel::tunnel_for(protocol, &config_dir, "3", 30);
 
-                match output {
-                    Ok(out) if out.status.success() => {
+                match tunnel.down(handle) {
+                    Ok(()) => {
                         if matches!(protocol, Protocol::OpenVPN) {
                             crate::utils::cleanup_openvpn_run_files(&profile_name);
                         }
@@ -689,19 +512,11 @@ impl App {
                             error: None,
                         });
                     }
-                    Ok(out) => {
-                        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                    Err(err) => {
                         let _ = cmd_tx.send(Message::DisconnectResult {
                             profile: profile_name,
                             success: false,
-                            error: Some(format!("{protocol}: {stderr}")),
-                        });
-                    }
-                    Err(e) => {
-                        let _ = cmd_tx.send(Message::DisconnectResult {
-                            profile: profile_name,
-                            success: false,
-                            error: Some(format!("Failed to execute: {e}")),
+                            error: Some(format!("{protocol}: {err}")),
                         });
                     }
                 }
@@ -746,41 +561,42 @@ impl App {
                 profile: name.clone(),
             };
 
+            // Plan #004 U4: force-disconnect now routes through TunnelKind.
+            // The OvpnTunnel's down() path already escalates to pkill if the
+            // pid file is stale; treating the force-flag as equivalent to a
+            // regular down preserves the existing semantics on macOS where
+            // SIGKILL was used (TODO plan #005: add a force flag to Tunnel
+            // trait to escalate to SIGKILL where supported).
             std::thread::spawn(move || {
-                let output = match protocol {
-                    Protocol::WireGuard => vortix_process::run_to_output(
-                        CommandSpec::oneshot(
-                            "wg-quick",
-                            vec!["down".into(), config_path.to_string_lossy().into_owned()],
-                        )
-                        .privilege(PrivilegeReq::Root),
-                    ),
+                use vortix_core::ports::tunnel::{TunnelHandle, TunnelKindTag};
+                use vortix_core::profile::ProfileId;
+
+                let iface = match protocol {
+                    Protocol::WireGuard => config_path.to_string_lossy().into_owned(),
                     Protocol::OpenVPN => {
-                        let target_pid = crate::utils::read_openvpn_pid(&name);
-                        if let Some(p) = target_pid {
-                            vortix_process::run_to_output(
-                                CommandSpec::oneshot("kill", vec!["-9".into(), p.to_string()])
-                                    .privilege(PrivilegeReq::Root),
-                            )
-                        } else {
-                            let safe = crate::utils::sanitize_profile_name(&name);
-                            vortix_process::run_to_output(
-                                CommandSpec::oneshot(
-                                    "pkill",
-                                    vec![
-                                        "-9".into(),
-                                        "-f".into(),
-                                        format!("openvpn.*--daemon vortix-{safe}"),
-                                    ],
-                                )
-                                .privilege(PrivilegeReq::Root),
-                            )
-                        }
+                        format!("openvpn-{}", crate::utils::sanitize_profile_name(&name))
                     }
                 };
+                let pid_for_handle = match protocol {
+                    Protocol::OpenVPN => crate::utils::read_openvpn_pid(&name),
+                    Protocol::WireGuard => None,
+                };
+                let handle = TunnelHandle {
+                    profile_id: ProfileId::new(&name),
+                    interface_name: iface,
+                    pid: pid_for_handle,
+                    started_at: std::time::SystemTime::now(),
+                    kind: match protocol {
+                        Protocol::WireGuard => TunnelKindTag::WireGuard,
+                        Protocol::OpenVPN => TunnelKindTag::OpenVpn,
+                    },
+                };
+                let config_dir = crate::utils::get_app_config_dir()
+                    .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
+                let mut tunnel = crate::tunnel::tunnel_for(protocol, &config_dir, "3", 30);
 
-                match output {
-                    Ok(out) if out.status.success() => {
+                match tunnel.down(handle) {
+                    Ok(()) => {
                         if matches!(protocol, Protocol::OpenVPN) {
                             crate::utils::cleanup_openvpn_run_files(&name);
                         }
@@ -790,19 +606,11 @@ impl App {
                             error: None,
                         });
                     }
-                    Ok(out) => {
-                        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                    Err(err) => {
                         let _ = cmd_tx.send(Message::DisconnectResult {
                             profile: name,
                             success: false,
-                            error: Some(format!("Force {protocol}: {stderr}")),
-                        });
-                    }
-                    Err(e) => {
-                        let _ = cmd_tx.send(Message::DisconnectResult {
-                            profile: name,
-                            success: false,
-                            error: Some(format!("Force-kill failed: {e}")),
+                            error: Some(format!("Force {protocol}: {err}")),
                         });
                     }
                 }
