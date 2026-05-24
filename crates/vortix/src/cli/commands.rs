@@ -839,6 +839,13 @@ struct ProfileEntry {
     protocol: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_used: Option<String>,
+    /// Stable profile ID from the `.meta.toml` sidecar (plan 006 U2/U4).
+    /// `None` when the profile predates the migration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile_id: Option<String>,
+    /// Optional group label from the sidecar.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    group: Option<String>,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -903,24 +910,43 @@ fn handle_list(
         return 0;
     }
 
+    // Index sidecars by display_name so we can enrich each entry with the
+    // stable profile_id + group label (plan 006 U2/U4). The lookup is
+    // O(N + M) which is fine for the typical handful of profiles.
+    let sidecars_by_name: std::collections::HashMap<String, _> = {
+        use vortix_config::profile_store::{FsProfileStore, ProfileStore};
+        let store = FsProfileStore::new(config_dir.join(constants::PROFILES_DIR_NAME));
+        store
+            .list()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| (s.display_name.clone(), s))
+            .collect()
+    };
+
     let entries: Vec<ProfileEntry> = profiles
         .iter()
-        .map(|p| ProfileEntry {
-            name: p.name.clone(),
-            protocol: format!("{}", p.protocol),
-            last_used: p
-                .last_used
-                .map(|t| match t.duration_since(std::time::UNIX_EPOCH) {
-                    Ok(d) => {
-                        let secs = d.as_secs();
-                        let elapsed = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|n| n.as_secs().saturating_sub(secs))
-                            .unwrap_or(0);
-                        format_elapsed(elapsed)
-                    }
-                    Err(_) => "unknown".into(),
-                }),
+        .map(|p| {
+            let sidecar = sidecars_by_name.get(&p.name);
+            ProfileEntry {
+                name: p.name.clone(),
+                protocol: format!("{}", p.protocol),
+                last_used: p
+                    .last_used
+                    .map(|t| match t.duration_since(std::time::UNIX_EPOCH) {
+                        Ok(d) => {
+                            let secs = d.as_secs();
+                            let elapsed = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|n| n.as_secs().saturating_sub(secs))
+                                .unwrap_or(0);
+                            format_elapsed(elapsed)
+                        }
+                        Err(_) => "unknown".into(),
+                    }),
+                profile_id: sidecar.map(|s| s.id.as_str().to_string()),
+                group: sidecar.and_then(|s| s.group.clone()),
+            }
         })
         .collect();
 
