@@ -6,7 +6,7 @@ use crate::constants;
 use crate::logger::{self, LogLevel};
 use crate::utils;
 use std::path::PathBuf;
-use std::process::Command;
+use vortix_process::CommandSpec;
 
 /// Downloads a VPN profile from a given URL and saves it to the profiles directory.
 ///
@@ -44,29 +44,30 @@ pub fn download_profile(url: &str) -> Result<PathBuf, String> {
     // -S: Show errors even in silent mode
     // --max-time: Timeout
     // -o: Output file
-    let output = Command::new("curl")
-        .args([
-            "-f",
-            "-L",
-            "-s",
-            "-S",
-            "--max-time",
-            &constants::HTTP_TIMEOUT_SECS.to_string(),
-            "-A",
-            &format!("{}/{}", constants::APP_NAME, constants::APP_VERSION),
-            "-o",
-            target_path.to_str().unwrap_or(""),
-            url,
-        ])
-        .output()
-        .map_err(|e| {
-            logger::log(
-                LogLevel::Error,
-                "DOWNLOAD",
-                format!("Failed to execute curl: {e}"),
-            );
-            format!("{}: {e}", constants::ERR_HTTP_CLIENT_BUILD_FAILED)
-        })?;
+    let output = vortix_process::run_to_output(CommandSpec::oneshot(
+        "curl",
+        vec![
+            "-f".into(),
+            "-L".into(),
+            "-s".into(),
+            "-S".into(),
+            "--max-time".into(),
+            constants::HTTP_TIMEOUT_SECS.to_string(),
+            "-A".into(),
+            format!("{}/{}", constants::APP_NAME, constants::APP_VERSION),
+            "-o".into(),
+            target_path.to_string_lossy().into_owned(),
+            url.into(),
+        ],
+    ))
+    .map_err(|e| {
+        logger::log(
+            LogLevel::Error,
+            "DOWNLOAD",
+            format!("Failed to execute curl: {e}"),
+        );
+        format!("{}: {e}", constants::ERR_HTTP_CLIENT_BUILD_FAILED)
+    })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

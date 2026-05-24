@@ -6,6 +6,8 @@
 
 use std::time::{Duration, Instant};
 
+use vortix_process::{CommandSpec, PrivilegeReq};
+
 use crate::constants;
 use crate::core::scanner;
 use crate::message::Message;
@@ -235,20 +237,21 @@ impl VpnEngine {
 
         std::thread::spawn(move || {
             let output = match protocol {
-                Protocol::WireGuard => std::process::Command::new("wg-quick")
-                    .args(["down", config_path.to_str().unwrap_or("")])
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped())
-                    .output(),
+                Protocol::WireGuard => vortix_process::run_to_output(
+                    CommandSpec::oneshot(
+                        "wg-quick",
+                        vec!["down".into(), config_path.to_string_lossy().into_owned()],
+                    )
+                    .privilege(PrivilegeReq::Root),
+                ),
                 Protocol::OpenVPN => {
                     let target_pid = utils::read_openvpn_pid(&pn).or(pid);
                     let signal = if force { "-9" } else { "-15" };
                     let kill_result = if let Some(p) = target_pid {
-                        let result = std::process::Command::new("kill")
-                            .args([signal, &p.to_string()])
-                            .stdout(std::process::Stdio::piped())
-                            .stderr(std::process::Stdio::piped())
-                            .output();
+                        let result = vortix_process::run_to_output(
+                            CommandSpec::oneshot("kill", vec![signal.into(), p.to_string()])
+                                .privilege(PrivilegeReq::Root),
+                        );
 
                         // `kill` returns success when the signal is delivered, but
                         // the daemon may still be alive. Poll until it's gone.
@@ -257,10 +260,11 @@ impl VpnEngine {
                                 + Duration::from_secs(constants::OVPN_KILL_WAIT_SECS);
                             while Instant::now() < deadline {
                                 std::thread::sleep(Duration::from_millis(200));
-                                let alive = std::process::Command::new("kill")
-                                    .args(["-0", &p.to_string()])
-                                    .output()
-                                    .is_ok_and(|o| o.status.success());
+                                let alive = vortix_process::run_to_output(CommandSpec::oneshot(
+                                    "kill",
+                                    vec!["-0".into(), p.to_string()],
+                                ))
+                                .is_ok_and(|o| o.status.success());
                                 if !alive {
                                     break;
                                 }
@@ -269,11 +273,17 @@ impl VpnEngine {
                         result
                     } else {
                         let safe = utils::sanitize_profile_name(&pn);
-                        std::process::Command::new("pkill")
-                            .args([signal, "-f", &format!("openvpn.*--daemon vortix-{safe}")])
-                            .stdout(std::process::Stdio::piped())
-                            .stderr(std::process::Stdio::piped())
-                            .output()
+                        vortix_process::run_to_output(
+                            CommandSpec::oneshot(
+                                "pkill",
+                                vec![
+                                    signal.into(),
+                                    "-f".into(),
+                                    format!("openvpn.*--daemon vortix-{safe}"),
+                                ],
+                            )
+                            .privilege(PrivilegeReq::Root),
+                        )
                     };
                     kill_result
                 }
@@ -454,12 +464,10 @@ impl VpnEngine {
 
         match protocol {
             Protocol::WireGuard => {
-                match std::process::Command::new("wg-quick")
-                    .args(["up", &config_path_str])
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped())
-                    .output()
-                {
+                match vortix_process::run_to_output(
+                    CommandSpec::oneshot("wg-quick", vec!["up".into(), config_path_str.clone()])
+                        .privilege(PrivilegeReq::Root),
+                ) {
                     Ok(out) if out.status.success() => {
                         let _ = cmd_tx.send(Message::ConnectResult {
                             profile: name,
@@ -522,11 +530,9 @@ impl VpnEngine {
                     }
                 }
 
-                let output = std::process::Command::new("openvpn")
-                    .args(&args)
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped())
-                    .output();
+                let output = vortix_process::run_to_output(
+                    CommandSpec::oneshot("openvpn", args).privilege(PrivilegeReq::Root),
+                );
 
                 match output {
                     Ok(out) if !out.status.success() => {
@@ -586,10 +592,11 @@ impl VpnEngine {
                     {
                         if let Ok(content) = std::fs::read_to_string(&pid_path) {
                             if let Ok(pid) = content.trim().parse::<u32>() {
-                                let alive = std::process::Command::new("kill")
-                                    .args(["-0", &pid.to_string()])
-                                    .output()
-                                    .is_ok_and(|o| o.status.success());
+                                let alive = vortix_process::run_to_output(CommandSpec::oneshot(
+                                    "kill",
+                                    vec!["-0".into(), pid.to_string()],
+                                ))
+                                .is_ok_and(|o| o.status.success());
                                 if !alive {
                                     let log =
                                         std::fs::read_to_string(&log_path).unwrap_or_default();

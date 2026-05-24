@@ -8,7 +8,14 @@ use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io::Write as IoWrite;
 use std::os::unix::fs::OpenOptionsExt;
-use std::process::Command;
+use vortix_process::{CommandSpec, PrivilegeReq};
+
+fn pfctl(args: &[&str]) -> std::io::Result<std::process::Output> {
+    let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+    vortix_process::run_to_output(
+        CommandSpec::oneshot("pfctl", owned).privilege(PrivilegeReq::Root),
+    )
+}
 
 /// macOS pf-based firewall implementation.
 pub struct PfFirewall;
@@ -108,9 +115,7 @@ impl Firewall for PfFirewall {
             format!("Wrote pf rules to {}", constants::PF_CONF_PATH),
         );
 
-        let output = Command::new("pfctl")
-            .args(["-f", constants::PF_CONF_PATH])
-            .output()?;
+        let output = pfctl(&["-f", constants::PF_CONF_PATH])?;
         if !output.status.success() {
             let err = String::from_utf8_lossy(&output.stderr).to_string();
             logger::log(
@@ -121,7 +126,7 @@ impl Firewall for PfFirewall {
             return Err(KillSwitchError::CommandFailed(err));
         }
 
-        let output = Command::new("pfctl").args(["-e"]).output()?;
+        let output = pfctl(&["-e"])?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             if !stderr.contains("enabled") {
@@ -154,7 +159,7 @@ impl Firewall for PfFirewall {
             return Err(KillSwitchError::NotRoot);
         }
 
-        let output = Command::new("pfctl").args(["-F", "all"]).output()?;
+        let output = pfctl(&["-F", "all"])?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             if !stderr.contains("not enabled") {
@@ -167,7 +172,7 @@ impl Firewall for PfFirewall {
             }
         }
 
-        let _ = Command::new("pfctl").args(["-d"]).output()?;
+        let _ = pfctl(&["-d"])?;
         let _ = fs::remove_file(constants::PF_CONF_PATH);
         let _ = fs::remove_file(constants::PF_CONF_PATH_LEGACY);
 

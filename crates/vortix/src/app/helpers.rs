@@ -181,22 +181,19 @@ impl App {
         }
         #[cfg(target_os = "macos")]
         {
-            use std::io::Write;
-            if let Ok(mut child) = std::process::Command::new("pbcopy")
-                .stdin(std::process::Stdio::piped())
-                .spawn()
+            use vortix_process::CommandSpec;
+            if vortix_process::run_to_output(
+                CommandSpec::oneshot("pbcopy", vec![]).stdin(ip_str.as_bytes().to_vec()),
+            )
+            .is_ok()
             {
-                if let Some(mut stdin) = child.stdin.take() {
-                    let _ = stdin.write_all(ip_str.as_bytes());
-                }
-                let _ = child.wait();
                 self.show_toast(format!("Copied IP: {ip_str}"), ToastType::Success);
                 return;
             }
         }
         #[cfg(target_os = "linux")]
         {
-            use std::io::Write;
+            use vortix_process::CommandSpec;
             // Wayland-first: try wl-copy when $WAYLAND_DISPLAY is set,
             // then fall back to X11 tools (xclip, xsel).
             let is_wayland = std::env::var("WAYLAND_DISPLAY").is_ok();
@@ -214,15 +211,11 @@ impl App {
                 ]
             };
             for (cmd, args) in tools {
-                if let Ok(mut child) = std::process::Command::new(cmd)
-                    .args(*args)
-                    .stdin(std::process::Stdio::piped())
-                    .spawn()
-                {
-                    if let Some(mut stdin) = child.stdin.take() {
-                        let _ = stdin.write_all(ip_str.as_bytes());
-                    }
-                    if child.wait().is_ok_and(|s| s.success()) {
+                let owned_args: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+                if let Ok(o) = vortix_process::run_to_output(
+                    CommandSpec::oneshot(*cmd, owned_args).stdin(ip_str.as_bytes().to_vec()),
+                ) {
+                    if o.status.success() {
                         self.show_toast(format!("Copied IP: {ip_str}"), ToastType::Success);
                         return;
                     }

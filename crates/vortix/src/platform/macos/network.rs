@@ -1,6 +1,7 @@
 //! macOS network statistics via `netstat -ib`.
 
 use crate::platform::NetworkStatsProvider;
+use vortix_process::CommandSpec;
 
 /// macOS network stats using `netstat -ib`.
 pub struct MacNetworkStats;
@@ -11,9 +12,8 @@ impl NetworkStatsProvider for MacNetworkStats {
         let mut total_out: u64 = 0;
 
         let timeout = std::time::Duration::from_secs(crate::constants::CMD_TIMEOUT_SECS);
-        if let Some(output) = crate::utils::run_with_timeout(
-            std::process::Command::new("netstat").args(["-ib"]),
-            timeout,
+        if let Ok(output) = vortix_process::run_to_output(
+            CommandSpec::oneshot("netstat", vec!["-ib".into()]).timeout(timeout),
         ) {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let mut lines = stdout.lines();

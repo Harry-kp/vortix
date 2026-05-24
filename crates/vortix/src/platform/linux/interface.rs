@@ -2,16 +2,15 @@
 
 use crate::core::telemetry::parse_ip_addr_output;
 use crate::platform::InterfaceDetector;
-use std::process::Command;
+use vortix_process::CommandSpec;
 
 /// Run a command and return its output.
 ///
 /// No timeout — called from the scanner's background thread, cannot block the UI.
-fn cmd_output(cmd: &mut Command) -> Option<std::process::Output> {
-    cmd.stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .ok()
+/// All commands are read-only inspections that run unprivileged.
+fn cmd_output(program: &str, args: &[&str]) -> Option<std::process::Output> {
+    let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+    vortix_process::run_to_output(CommandSpec::oneshot(program, owned)).ok()
 }
 
 /// Linux interface detection using `ip addr`, `wg show`, and standard interface naming.
@@ -33,7 +32,7 @@ impl InterfaceDetector for LinuxInterface {
 
         // Fallback: try to find any active WireGuard interface via `wg show`
         // and match against the profile name
-        if let Some(output) = cmd_output(Command::new("wg").arg("show")) {
+        if let Some(output) = cmd_output("wg", &["show"]) {
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines() {
                 if line.starts_with("interface: ") {
@@ -52,7 +51,7 @@ impl InterfaceDetector for LinuxInterface {
     fn get_wireguard_pid(interface: &str) -> Option<u32> {
         // On Linux, kernel WireGuard doesn't have a userspace process
         // For wireguard-go (userspace), search via ps
-        if let Some(output) = cmd_output(Command::new("ps").args(["-eo", "pid,args"])) {
+        if let Some(output) = cmd_output("ps", &["-eo", "pid,args"]) {
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines() {
                 let line_lower = line.to_lowercase();
@@ -74,7 +73,7 @@ impl InterfaceDetector for LinuxInterface {
 
     fn get_interface_info(interface: &str) -> (String, String) {
         // Use `ip addr show {interface}` on Linux
-        if let Some(output) = cmd_output(Command::new("ip").args(["addr", "show", interface])) {
+        if let Some(output) = cmd_output("ip", &["addr", "show", interface]) {
             let stdout = String::from_utf8_lossy(&output.stdout);
             return parse_ip_addr_output(&stdout);
         }
@@ -84,6 +83,5 @@ impl InterfaceDetector for LinuxInterface {
 }
 
 fn check_wg_interface_exists(name: &str) -> bool {
-    cmd_output(Command::new("wg").args(["show", name, "public-key"]))
-        .is_some_and(|o| o.status.success())
+    cmd_output("wg", &["show", name, "public-key"]).is_some_and(|o| o.status.success())
 }

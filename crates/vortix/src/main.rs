@@ -10,6 +10,12 @@ fn main() -> Result<()> {
     // panic hook, so we must call it before installing ours.
     color_eyre::install()?;
 
+    // Subprocess runner + tracing (plan 002). Both live behind env-driven
+    // toggles so production startup is silent; `RUST_LOG=vortix::process=info`
+    // surfaces every subprocess invocation as a structured event.
+    init_tracing();
+    vortix_process::set_global_runner(vortix_process::CommandRunner::real());
+
     // Now capture color_eyre's hook and wrap it with terminal restoration
     // and recovery instructions. Drop glue on App will still run to release
     // kill switch rules and VPN processes.
@@ -227,6 +233,23 @@ fn run_tui(
     }
 
     Ok(())
+}
+
+/// Initialise tracing-subscriber with an env-filter layer.
+///
+/// Silent by default; `RUST_LOG=vortix::process=info` enables the structured
+/// subprocess events emitted by `RealRunner`. The TUI uses stderr for log
+/// output since stdout drives the alternate-screen terminal.
+fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("off"));
+    // Best-effort init: ignore the error from double-init in tests.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_target(true)
+        .compact()
+        .try_init();
 }
 
 fn init_terminal() -> Result<ratatui::DefaultTerminal> {

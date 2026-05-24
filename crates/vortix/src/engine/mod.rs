@@ -386,24 +386,29 @@ impl VpnEngine {
 
     /// Kill any running VPN process and remove run files for a profile.
     pub fn cleanup_vpn_resources(&self, profile_name: &str) {
+        use vortix_process::{CommandSpec, PrivilegeReq};
         if let Some(profile) = self.profiles.iter().find(|p| p.name == profile_name) {
             match profile.protocol {
                 Protocol::OpenVPN => {
                     if let Some(pid) = utils::read_openvpn_pid(profile_name) {
-                        let _ = std::process::Command::new("kill")
-                            .arg(pid.to_string())
-                            .stdout(std::process::Stdio::null())
-                            .stderr(std::process::Stdio::null())
-                            .output();
+                        let _ = vortix_process::run_to_output(
+                            CommandSpec::oneshot("kill", vec![pid.to_string()])
+                                .privilege(PrivilegeReq::Root),
+                        );
                     }
                     utils::cleanup_openvpn_run_files(profile_name);
                 }
                 Protocol::WireGuard => {
-                    let _ = std::process::Command::new("wg-quick")
-                        .args(["down", profile.config_path.to_str().unwrap_or("")])
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .output();
+                    let _ = vortix_process::run_to_output(
+                        CommandSpec::oneshot(
+                            "wg-quick",
+                            vec![
+                                "down".into(),
+                                profile.config_path.to_string_lossy().into_owned(),
+                            ],
+                        )
+                        .privilege(PrivilegeReq::Root),
+                    );
                 }
             }
         }

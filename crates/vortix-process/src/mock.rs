@@ -119,22 +119,34 @@ impl MockRunner {
     }
 
     /// Builder: append an expectation.
-    pub fn expect(&self, matcher: SpecMatcher, outcome: ScriptedOutcome) -> &Self {
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (only possible if a previous
+    /// expectation closure panicked while holding the lock — none do today).
+    pub fn expect(&self, matcher: SpecMatcher, outcome: ScriptedOutcome) {
         self.inner
             .lock()
             .unwrap()
             .expectations
             .push(Expectation { matcher, outcome });
-        self
     }
 
     /// Read the full invocation log.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn invocations(&self) -> Vec<RecordedInvocation> {
         self.inner.lock().unwrap().invocations.clone()
     }
 
     /// Assert no expectations remain unconsumed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if expectations remain — this is the intended failure mode.
     pub fn assert_no_remaining_expectations(&self) {
         let inner = self.inner.lock().unwrap();
         assert!(
@@ -142,6 +154,104 @@ impl MockRunner {
             "MockRunner has {} unconsumed expectations",
             inner.expectations.len(),
         );
+    }
+
+    /// Synchronous run — equivalent to `run` but doesn't require an async
+    /// runtime. The mock never awaits, so this is exact.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the call doesn't match a scripted expectation. This is the
+    /// intended failure mode for tests.
+    pub fn run_sync(&self, spec: CommandSpec) -> Result<CommandOutcome, ProcessError> {
+        let outcome = self.next_outcome(&spec).unwrap_or_else(|msg| {
+            panic!("{msg}");
+        });
+        Self::map_run_outcome(spec, outcome)
+    }
+
+    /// Synchronous `spawn_detached`.
+    ///
+    /// # Panics
+    ///
+    /// Panics on unmatched expectations (see [`Self::run_sync`]).
+    pub fn spawn_detached_sync(&self, spec: CommandSpec) -> Result<DetachedHandle, ProcessError> {
+        let outcome = self.next_outcome(&spec).unwrap_or_else(|msg| {
+            panic!("{msg}");
+        });
+        Self::map_detached_outcome(spec, outcome)
+    }
+
+    fn map_run_outcome(
+        spec: CommandSpec,
+        outcome: ScriptedOutcome,
+    ) -> Result<CommandOutcome, ProcessError> {
+        match outcome {
+            ScriptedOutcome::Success {
+                stdout,
+                stderr,
+                exit_code,
+            } => Ok(CommandOutcome {
+                stdout,
+                stderr,
+                exit_status: ExitStatusInfo {
+                    code: Some(exit_code),
+                    signal: None,
+                    success: exit_code == 0,
+                },
+                duration: Duration::from_millis(1),
+                started_at: SystemTime::now(),
+            }),
+            ScriptedOutcome::Failure(stderr) => Err(ProcessError::NonZeroExit {
+                program: spec.program,
+                code: Some(1),
+                stderr: stderr.into_bytes(),
+            }),
+            ScriptedOutcome::PrivilegeDenied => Err(ProcessError::PrivilegeDenied {
+                program: spec.program,
+            }),
+            ScriptedOutcome::ProgramNotFound => Err(ProcessError::ProgramNotFound {
+                program: spec.program,
+            }),
+            ScriptedOutcome::Timeout => Err(ProcessError::Timeout {
+                program: spec.program,
+                duration: spec.timeout.unwrap_or(Duration::from_secs(30)),
+            }),
+            ScriptedOutcome::Detached { .. } => {
+                panic!("ScriptedOutcome::Detached returned from run(); use spawn_detached")
+            }
+        }
+    }
+
+    fn map_detached_outcome(
+        spec: CommandSpec,
+        outcome: ScriptedOutcome,
+    ) -> Result<DetachedHandle, ProcessError> {
+        match outcome {
+            ScriptedOutcome::Detached { pid } => Ok(DetachedHandle {
+                pid,
+                spawned_at: SystemTime::now(),
+            }),
+            ScriptedOutcome::Success { .. } => Ok(DetachedHandle {
+                pid: 99999,
+                spawned_at: SystemTime::now(),
+            }),
+            ScriptedOutcome::Failure(stderr) => Err(ProcessError::NonZeroExit {
+                program: spec.program,
+                code: Some(1),
+                stderr: stderr.into_bytes(),
+            }),
+            ScriptedOutcome::PrivilegeDenied => Err(ProcessError::PrivilegeDenied {
+                program: spec.program,
+            }),
+            ScriptedOutcome::ProgramNotFound => Err(ProcessError::ProgramNotFound {
+                program: spec.program,
+            }),
+            ScriptedOutcome::Timeout => Err(ProcessError::Timeout {
+                program: spec.program,
+                duration: Duration::from_secs(30),
+            }),
+        }
     }
 
     fn next_outcome(&self, spec: &CommandSpec) -> Result<ScriptedOutcome, String> {
@@ -182,75 +292,11 @@ impl MockRunner {
 
 impl Trait for MockRunner {
     async fn run(&self, spec: CommandSpec) -> Result<CommandOutcome, ProcessError> {
-        let outcome = self.next_outcome(&spec).unwrap_or_else(|msg| {
-            panic!("{msg}");
-        });
-        match outcome {
-            ScriptedOutcome::Success {
-                stdout,
-                stderr,
-                exit_code,
-            } => Ok(CommandOutcome {
-                stdout,
-                stderr,
-                exit_status: ExitStatusInfo {
-                    code: Some(exit_code),
-                    signal: None,
-                    success: exit_code == 0,
-                },
-                duration: Duration::from_millis(1),
-                started_at: SystemTime::now(),
-            }),
-            ScriptedOutcome::Failure(stderr) => Err(ProcessError::NonZeroExit {
-                program: spec.program,
-                code: Some(1),
-                stderr: stderr.into_bytes(),
-            }),
-            ScriptedOutcome::PrivilegeDenied => Err(ProcessError::PrivilegeDenied {
-                program: spec.program,
-            }),
-            ScriptedOutcome::ProgramNotFound => Err(ProcessError::ProgramNotFound {
-                program: spec.program,
-            }),
-            ScriptedOutcome::Timeout => Err(ProcessError::Timeout {
-                program: spec.program,
-                duration: spec.timeout.unwrap_or(Duration::from_secs(30)),
-            }),
-            ScriptedOutcome::Detached { .. } => {
-                panic!("ScriptedOutcome::Detached returned from run(); use spawn_detached")
-            }
-        }
+        self.run_sync(spec)
     }
 
     async fn spawn_detached(&self, spec: CommandSpec) -> Result<DetachedHandle, ProcessError> {
-        let outcome = self.next_outcome(&spec).unwrap_or_else(|msg| {
-            panic!("{msg}");
-        });
-        match outcome {
-            ScriptedOutcome::Detached { pid } => Ok(DetachedHandle {
-                pid,
-                spawned_at: SystemTime::now(),
-            }),
-            ScriptedOutcome::Success { .. } => Ok(DetachedHandle {
-                pid: 99999,
-                spawned_at: SystemTime::now(),
-            }),
-            ScriptedOutcome::Failure(stderr) => Err(ProcessError::NonZeroExit {
-                program: spec.program,
-                code: Some(1),
-                stderr: stderr.into_bytes(),
-            }),
-            ScriptedOutcome::PrivilegeDenied => Err(ProcessError::PrivilegeDenied {
-                program: spec.program,
-            }),
-            ScriptedOutcome::ProgramNotFound => Err(ProcessError::ProgramNotFound {
-                program: spec.program,
-            }),
-            ScriptedOutcome::Timeout => Err(ProcessError::Timeout {
-                program: spec.program,
-                duration: Duration::from_secs(30),
-            }),
-        }
+        self.spawn_detached_sync(spec)
     }
 }
 

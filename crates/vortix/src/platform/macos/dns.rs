@@ -2,6 +2,7 @@
 
 use crate::constants;
 use crate::platform::DnsResolver;
+use vortix_process::CommandSpec;
 
 /// macOS DNS resolution via scutil --dns, networksetup, and /etc/resolv.conf.
 pub struct MacDns;
@@ -32,10 +33,8 @@ fn try_get_dns_resolv_conf() -> Option<String> {
 
 /// Try to get DNS from scutil (macOS)
 fn try_get_dns_scutil() -> Option<String> {
-    let output = std::process::Command::new("scutil")
-        .args(["--dns"])
-        .output()
-        .ok()?;
+    let output =
+        vortix_process::run_to_output(CommandSpec::oneshot("scutil", vec!["--dns".into()])).ok()?;
 
     if !output.status.success() {
         return None;
@@ -58,10 +57,11 @@ fn try_get_dns_scutil() -> Option<String> {
 
 /// Try to get DNS from networksetup (macOS)
 fn try_get_dns_networksetup() -> Option<String> {
-    let output = std::process::Command::new("networksetup")
-        .args(["-listallnetworkservices"])
-        .output()
-        .ok()?;
+    let output = vortix_process::run_to_output(CommandSpec::oneshot(
+        "networksetup",
+        vec!["-listallnetworkservices".into()],
+    ))
+    .ok()?;
 
     if !output.status.success() {
         return None;
@@ -70,10 +70,10 @@ fn try_get_dns_networksetup() -> Option<String> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     for service in ["Wi-Fi", "Ethernet", "USB 10/100/1000 LAN"] {
         if stdout.contains(service) {
-            if let Ok(dns_output) = std::process::Command::new("networksetup")
-                .args(["-getdnsservers", service])
-                .output()
-            {
+            if let Ok(dns_output) = vortix_process::run_to_output(CommandSpec::oneshot(
+                "networksetup",
+                vec!["-getdnsservers".into(), service.to_string()],
+            )) {
                 let dns_stdout = String::from_utf8_lossy(&dns_output.stdout);
                 let first_line = dns_stdout.lines().next().unwrap_or("").trim();
                 if !first_line.is_empty() && !first_line.contains("aren't") {

@@ -2,6 +2,8 @@
 
 use std::time::Instant;
 
+use vortix_process::{CommandSpec, PrivilegeReq};
+
 use super::{App, ConnectionState, InputMode, Protocol, ToastType};
 use crate::constants;
 use crate::message::Message;
@@ -203,12 +205,13 @@ impl App {
         std::thread::spawn(move || match protocol {
             Protocol::WireGuard => {
                 // wg-quick is a one-shot command: sets up interface and exits
-                match std::process::Command::new("wg-quick")
-                    .args(["up", config_path.to_str().unwrap_or("")])
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped())
-                    .output()
-                {
+                match vortix_process::run_to_output(
+                    CommandSpec::oneshot(
+                        "wg-quick",
+                        vec!["up".into(), config_path.to_string_lossy().into_owned()],
+                    )
+                    .privilege(PrivilegeReq::Root),
+                ) {
                     Ok(out) if out.status.success() => {
                         let _ = cmd_tx.send(Message::ConnectResult {
                             profile: name,
@@ -275,11 +278,9 @@ impl App {
                     }
                 }
 
-                let output = std::process::Command::new("openvpn")
-                    .args(&args)
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped())
-                    .output();
+                let output = vortix_process::run_to_output(
+                    CommandSpec::oneshot("openvpn", args).privilege(PrivilegeReq::Root),
+                );
 
                 match output {
                     Ok(out) if !out.status.success() => {
@@ -347,10 +348,11 @@ impl App {
                     {
                         if let Ok(content) = std::fs::read_to_string(&pid_path) {
                             if let Ok(pid) = content.trim().parse::<u32>() {
-                                let alive = std::process::Command::new("kill")
-                                    .args(["-0", &pid.to_string()])
-                                    .output()
-                                    .is_ok_and(|o| o.status.success());
+                                let alive = vortix_process::run_to_output(CommandSpec::oneshot(
+                                    "kill",
+                                    vec!["-0".into(), pid.to_string()],
+                                ))
+                                .is_ok_and(|o| o.status.success());
                                 if !alive {
                                     let log =
                                         std::fs::read_to_string(&log_path).unwrap_or_default();
@@ -506,20 +508,24 @@ impl App {
             match profile.protocol {
                 Protocol::OpenVPN => {
                     if let Some(pid) = utils::read_openvpn_pid(profile_name) {
-                        let _ = std::process::Command::new("kill")
-                            .arg(pid.to_string())
-                            .stdout(std::process::Stdio::null())
-                            .stderr(std::process::Stdio::null())
-                            .output();
+                        let _ = vortix_process::run_to_output(
+                            CommandSpec::oneshot("kill", vec![pid.to_string()])
+                                .privilege(PrivilegeReq::Root),
+                        );
                     }
                     utils::cleanup_openvpn_run_files(profile_name);
                 }
                 Protocol::WireGuard => {
-                    let _ = std::process::Command::new("wg-quick")
-                        .args(["down", profile.config_path.to_str().unwrap_or("")])
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .output();
+                    let _ = vortix_process::run_to_output(
+                        CommandSpec::oneshot(
+                            "wg-quick",
+                            vec![
+                                "down".into(),
+                                profile.config_path.to_string_lossy().into_owned(),
+                            ],
+                        )
+                        .privilege(PrivilegeReq::Root),
+                    );
                 }
             }
         }
@@ -644,26 +650,29 @@ impl App {
 
             std::thread::spawn(move || {
                 let output = match protocol {
-                    Protocol::WireGuard => std::process::Command::new("wg-quick")
-                        .args(["down", config_path.to_str().unwrap_or("")])
-                        .stdout(std::process::Stdio::piped())
-                        .stderr(std::process::Stdio::piped())
-                        .output(),
+                    Protocol::WireGuard => vortix_process::run_to_output(
+                        CommandSpec::oneshot(
+                            "wg-quick",
+                            vec!["down".into(), config_path.to_string_lossy().into_owned()],
+                        )
+                        .privilege(PrivilegeReq::Root),
+                    ),
                     Protocol::OpenVPN => {
                         let target_pid = crate::utils::read_openvpn_pid(&profile_name).or(pid);
                         if let Some(p) = target_pid {
-                            std::process::Command::new("kill")
-                                .arg(p.to_string())
-                                .stdout(std::process::Stdio::piped())
-                                .stderr(std::process::Stdio::piped())
-                                .output()
+                            vortix_process::run_to_output(
+                                CommandSpec::oneshot("kill", vec![p.to_string()])
+                                    .privilege(PrivilegeReq::Root),
+                            )
                         } else {
                             let safe = crate::utils::sanitize_profile_name(&profile_name);
-                            std::process::Command::new("pkill")
-                                .args(["-f", &format!("openvpn.*--daemon vortix-{safe}")])
-                                .stdout(std::process::Stdio::piped())
-                                .stderr(std::process::Stdio::piped())
-                                .output()
+                            vortix_process::run_to_output(
+                                CommandSpec::oneshot(
+                                    "pkill",
+                                    vec!["-f".into(), format!("openvpn.*--daemon vortix-{safe}")],
+                                )
+                                .privilege(PrivilegeReq::Root),
+                            )
                         }
                     }
                 };
@@ -738,26 +747,33 @@ impl App {
 
             std::thread::spawn(move || {
                 let output = match protocol {
-                    Protocol::WireGuard => std::process::Command::new("wg-quick")
-                        .args(["down", config_path.to_str().unwrap_or("")])
-                        .stdout(std::process::Stdio::piped())
-                        .stderr(std::process::Stdio::piped())
-                        .output(),
+                    Protocol::WireGuard => vortix_process::run_to_output(
+                        CommandSpec::oneshot(
+                            "wg-quick",
+                            vec!["down".into(), config_path.to_string_lossy().into_owned()],
+                        )
+                        .privilege(PrivilegeReq::Root),
+                    ),
                     Protocol::OpenVPN => {
                         let target_pid = crate::utils::read_openvpn_pid(&name);
                         if let Some(p) = target_pid {
-                            std::process::Command::new("kill")
-                                .args(["-9", &p.to_string()])
-                                .stdout(std::process::Stdio::piped())
-                                .stderr(std::process::Stdio::piped())
-                                .output()
+                            vortix_process::run_to_output(
+                                CommandSpec::oneshot("kill", vec!["-9".into(), p.to_string()])
+                                    .privilege(PrivilegeReq::Root),
+                            )
                         } else {
                             let safe = crate::utils::sanitize_profile_name(&name);
-                            std::process::Command::new("pkill")
-                                .args(["-9", "-f", &format!("openvpn.*--daemon vortix-{safe}")])
-                                .stdout(std::process::Stdio::piped())
-                                .stderr(std::process::Stdio::piped())
-                                .output()
+                            vortix_process::run_to_output(
+                                CommandSpec::oneshot(
+                                    "pkill",
+                                    vec![
+                                        "-9".into(),
+                                        "-f".into(),
+                                        format!("openvpn.*--daemon vortix-{safe}"),
+                                    ],
+                                )
+                                .privilege(PrivilegeReq::Root),
+                            )
                         }
                     }
                 };

@@ -2,7 +2,7 @@
 
 use crate::constants;
 use crate::platform::DnsResolver;
-use std::process::Command;
+use vortix_process::CommandSpec;
 
 /// Linux DNS resolution with fallback chain:
 /// 1. `resolvectl` (systemd-resolved)
@@ -20,7 +20,9 @@ impl DnsResolver for LinuxDns {
 
 /// Try to get DNS from resolvectl (systemd-resolved, most modern distros).
 fn try_get_dns_resolvectl() -> Option<String> {
-    let output = Command::new("resolvectl").args(["status"]).output().ok()?;
+    let output =
+        vortix_process::run_to_output(CommandSpec::oneshot("resolvectl", vec!["status".into()]))
+            .ok()?;
 
     if !output.status.success() {
         return None;
@@ -46,7 +48,11 @@ fn try_get_dns_resolvectl() -> Option<String> {
 
 /// Try to get DNS from `nmcli` (`NetworkManager` distros).
 fn try_get_dns_nmcli() -> Option<String> {
-    let output = Command::new("nmcli").args(["dev", "show"]).output().ok()?;
+    let output = vortix_process::run_to_output(CommandSpec::oneshot(
+        "nmcli",
+        vec!["dev".into(), "show".into()],
+    ))
+    .ok()?;
 
     if !output.status.success() {
         return None;
