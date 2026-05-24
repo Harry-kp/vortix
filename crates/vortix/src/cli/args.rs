@@ -313,6 +313,26 @@ pub enum Commands {
         op: SecretsOp,
     },
 
+    /// Run the vortix daemon (plan 015 phase D / plan 010)
+    ///
+    /// Hosts the engine FSM as a long-running process and accepts
+    /// client connections on a Unix domain socket. Set
+    /// `VORTIX_DAEMON_SOCKET=<path>` in your TUI/CLI shell to route
+    /// commands through the daemon instead of spawning a local engine.
+    ///
+    /// EXAMPLES:
+    ///     vortix daemon                          Default socket path
+    ///     vortix daemon --socket /tmp/vortix.sock Custom socket path
+    ///
+    /// Typically driven by systemd / launchd; see `examples/` for
+    /// reference unit files.
+    Daemon {
+        /// Override the default socket path. Default: `${XDG_RUNTIME_DIR}/vortix.sock`
+        /// (Linux), `${TMPDIR}/vortix.sock` (macOS), `/tmp/vortix.sock` (fallback).
+        #[arg(long)]
+        socket: Option<std::path::PathBuf>,
+    },
+
     /// Audit open sockets and which interface routes them (plan 015 phase C / plan 013)
     ///
     /// Per-process snapshot of open TCP/UDP sockets visible to the

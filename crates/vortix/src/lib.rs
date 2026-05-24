@@ -9,6 +9,7 @@ pub mod cli;
 pub mod config;
 pub mod constants;
 pub mod core;
+pub mod daemon;
 pub mod engine;
 pub mod event;
 pub mod hooks;

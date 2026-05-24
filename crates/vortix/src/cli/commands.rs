@@ -82,6 +82,7 @@ pub fn handle_command(
         }
         Commands::Secrets { op } => handle_secrets(op, config_dir, mode),
         Commands::Audit { pid, vpn_only } => handle_audit(*pid, *vpn_only, mode),
+        Commands::Daemon { socket } => handle_daemon(socket.clone(), mode),
         Commands::Completions { shell } => {
             handle_completions(*shell);
             0
@@ -251,6 +252,54 @@ fn handle_audit(pid_filter: Option<u32>, vpn_only: bool, mode: OutputMode) -> i3
         }
         OutputMode::Quiet => 0,
     }
+}
+
+/// `vortix daemon` — host the engine as a long-running IPC server
+/// (plan 015 phase D / plan 010).
+fn handle_daemon(socket_override: Option<std::path::PathBuf>, mode: OutputMode) -> i32 {
+    let socket_path = socket_override.unwrap_or_else(crate::daemon::default_socket_path);
+
+    let server = match crate::daemon::DaemonServer::bind(socket_path.clone()) {
+        Ok(s) => s,
+        Err(e) => {
+            print_error_and_exit(
+                mode,
+                "daemon",
+                CliError {
+                    code: "daemon_bind_failed",
+                    message: format!("Failed to bind daemon socket at {}: {e}", socket_path.display()),
+                    hint: Some(
+                        "Check parent directory exists and is writable. If a previous daemon left a stale socket, the bind path will be reused after the next start."
+                            .to_string(),
+                    ),
+                },
+                ExitCode::GeneralError,
+            );
+        }
+    };
+    eprintln!(
+        "vortix daemon: ready. Set VORTIX_DAEMON_SOCKET={} in your shell to route through the daemon.",
+        server.socket_path().display()
+    );
+
+    // Spin up the bundled runtime to drive the accept loop.
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("vortix daemon: failed to build runtime: {e}");
+            return 1;
+        }
+    };
+    runtime.block_on(async {
+        if let Err(e) = server.run().await {
+            eprintln!("vortix daemon: accept loop terminated: {e}");
+        }
+    });
+    0
 }
 
 /// Pull `id` from the configured `LayeredSecretStore`. Returns `Ok(None)`
