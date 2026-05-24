@@ -133,6 +133,7 @@ fn handle_engine(op: &crate::cli::args::EngineOp, config_dir: &Path, mode: Outpu
     };
 
     let profiles_dir = config_dir.join(constants::PROFILES_DIR_NAME);
+    let _runtime_guard = runtime.enter();
     let journal = match Journal::open(JournalConfig {
         disk: false, // CLI session — in-memory journal is enough
         ..Default::default()
