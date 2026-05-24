@@ -14,12 +14,14 @@
 #![allow(clippy::missing_errors_doc)]
 
 pub mod error;
+pub mod hooks_config;
 pub mod migration;
 pub mod profile_store;
 pub mod secret_store;
 pub mod settings;
 
 pub use error::ConfigError;
+pub use hooks_config::HookConfig;
 pub use migration::{migrate_legacy_profiles, MigrationStats};
 pub use profile_store::{ProfileStore, ProfileStoreError, ProfileSummary};
 pub use secret_store::{LayeredSecretStore, Secret, SecretRef, SecretStore, SecretStoreError};

@@ -11,6 +11,7 @@ pub mod constants;
 pub mod core;
 pub mod engine;
 pub mod event;
+pub mod hooks;
 pub mod logger;
 pub mod message;
 pub mod platform;

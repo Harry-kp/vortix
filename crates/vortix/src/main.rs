@@ -281,6 +281,7 @@ fn prompt_migration(old_dir: &std::path::Path, new_dir: &std::path::Path) -> std
 }
 
 /// Runs the main TUI event loop.
+#[allow(clippy::too_many_lines)] // run_tui carries the whole TUI bootstrap + journal-subscriber + hook-dispatch wiring
 fn run_tui(
     mut terminal: ratatui::DefaultTerminal,
     config: config::AppConfig,
@@ -334,16 +335,92 @@ fn run_tui(
             // Plan 005 U7: spawn a journal-subscriber task that reacts
             // to engine events. Today it nudges the legacy telemetry
             // worker on `TunnelUp` so connect → IP-refresh happens
-            // promptly. Future units route more flows through here.
+            // promptly, and dispatches lifecycle hooks (plan 015 phase A)
+            // when the user has any configured.
             if let Some(j) = vortix_core::journal::global_journal() {
                 let mut rx = j.subscribe();
                 let nudge = app.engine.telemetry_nudge.clone();
+                // Build the hook registry from settings; empty when
+                // the user has no [[hooks]] entries (zero overhead).
+                // Settings are loaded again here because run_tui doesn't
+                // currently receive them as a parameter; reloading is
+                // cheap (figment caches nothing destructive) and
+                // future refactors can thread Settings through.
+                let hooks_config = vortix_config::Settings::load()
+                    .ok()
+                    .map(|s| s.hooks)
+                    .unwrap_or_default();
+                let hooks =
+                    std::sync::Arc::new(vortix::hooks::build_registry_from_config(&hooks_config));
+                let hooks_for_task = hooks.clone();
                 tokio::spawn(async move {
+                    use vortix_core::engine::hooks::LifecycleEvent;
                     use vortix_core::engine::EngineEvent;
                     while let Ok(envelope) = rx.recv().await {
                         if matches!(envelope.event, EngineEvent::TunnelUp { .. }) {
                             if let Some(n) = &nudge {
                                 let _ = n.send(());
+                            }
+                        }
+                        // Dispatch lifecycle hooks (skip the
+                        // event-to-LifecycleEvent mapping entirely
+                        // when no hooks are registered to keep the
+                        // hot path branch-free).
+                        if hooks_for_task.is_empty() {
+                            continue;
+                        }
+                        let lifecycle = match &envelope.event {
+                            EngineEvent::TunnelUp {
+                                profile_id,
+                                protocol,
+                                interface_name,
+                                ..
+                            } => Some(LifecycleEvent::PostConnect {
+                                profile_id: profile_id.clone(),
+                                protocol: *protocol,
+                                interface_name: interface_name.clone(),
+                            }),
+                            EngineEvent::TunnelDown { profile_id, .. } => {
+                                Some(LifecycleEvent::PostDisconnect {
+                                    profile_id: profile_id.clone(),
+                                })
+                            }
+                            EngineEvent::ConnectAttemptStarted {
+                                profile_id,
+                                protocol,
+                                ..
+                            } => Some(LifecycleEvent::PreConnect {
+                                profile_id: profile_id.clone(),
+                                protocol: *protocol,
+                            }),
+                            EngineEvent::ConnectAttemptFailed {
+                                profile_id, reason, ..
+                            } => Some(LifecycleEvent::ConnectFailed {
+                                profile_id: profile_id.clone(),
+                                reason: format!("{reason:?}"),
+                            }),
+                            EngineEvent::RetryScheduled {
+                                profile_id,
+                                next_attempt,
+                                ..
+                            } => Some(LifecycleEvent::Reconnecting {
+                                profile_id: profile_id.clone(),
+                                attempt: *next_attempt,
+                            }),
+                            _ => None,
+                        };
+                        if let Some(le) = lifecycle {
+                            let outcomes = hooks_for_task.dispatch(&le).await;
+                            for (name, outcome) in outcomes {
+                                if !matches!(
+                                    outcome,
+                                    vortix_core::engine::hooks::HookOutcome::Success
+                                ) {
+                                    eprintln!(
+                                        "hook '{name}' on '{}' outcome: {outcome:?}",
+                                        le.kind_str()
+                                    );
+                                }
                             }
                         }
                     }
