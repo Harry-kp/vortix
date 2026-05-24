@@ -198,6 +198,11 @@ pub enum Commands {
     ///     vortix show work-vpn                  Parsed config with masked secrets
     ///     vortix show work-vpn --raw            Raw `.conf`/`.ovpn` file contents
     ///     vortix show work-vpn --json           Parsed config as JSON
+    ///     vortix show work-vpn --raw            Raw config to stdout
+    ///     vortix show work-vpn --raw --inline-secrets   Raw config with
+    ///         stored credentials appended as a `# vortix-secret:<b64>` trailing
+    ///         comment (intended for sharing with a teammate who needs the
+    ///         credentials inline)
     Show {
         /// Profile name
         #[arg(value_hint = ValueHint::Other)]
@@ -206,6 +211,12 @@ pub enum Commands {
         /// Show raw config file contents
         #[arg(long)]
         raw: bool,
+
+        /// When combined with `--raw`, append SecretStore-backed
+        /// credentials as a trailing `# vortix-secret:<base64>` comment.
+        /// No-op when no stored secret matches the profile.
+        #[arg(long, requires = "raw")]
+        inline_secrets: bool,
     },
 
     /// Delete a VPN profile
@@ -285,50 +296,13 @@ pub enum Commands {
     ///     vortix report
     Report,
 
-    /// Export a profile's raw config to stdout (plan 006 U6)
-    ///
-    /// Reads the profile from the configured profiles directory and prints
-    /// the raw `.conf` / `.ovpn` body. With `--inline-secrets`, any
-    /// SecretStore-backed credentials are materialised into the output
-    /// (today this is a no-op since no secrets are stored; the flag is
-    /// reserved for future plan 006 U5 integration).
-    ///
-    /// EXAMPLES:
-    ///     vortix export corp
-    ///     vortix export corp --inline-secrets > /tmp/corp-portable.conf
-    Export {
-        /// Profile name to export
-        #[arg(value_hint = ValueHint::Other)]
-        profile: String,
-
-        /// Materialise SecretStore-backed credentials into the output.
-        #[arg(long)]
-        inline_secrets: bool,
-    },
-
-    /// Interact with the plan-005 `EngineHandle` (diagnostic)
-    ///
-    /// Routes commands through the new FSM actor rather than the legacy
-    /// `VpnEngine` path. Useful for confirming the actor + journal +
-    /// tunnel-factory wiring works end-to-end. Live VPN behaviour still
-    /// flows through `vortix up` / `down` for now; this command exercises
-    /// the new path.
-    ///
-    /// EXAMPLES:
-    ///     vortix engine status         Snapshot the FSM state
-    ///     vortix engine connect corp   Execute Connect through the handle
-    ///     vortix engine disconnect     Execute Disconnect through the handle
-    Engine {
-        #[command(subcommand)]
-        op: EngineOp,
-    },
-
     /// Manage stored secrets (plan 006 U3)
     ///
     /// Lightweight wrapper over the `LayeredSecretStore` (OS keyring with
     /// AES-256-GCM/argon2id encrypted-file fallback). Secrets stored
-    /// here will be consumed by future plan 006 U5 work (`Tunnel` +
-    /// `SecretStore` integration); for now they're stored but unused.
+    /// under `creds/<profile>` are consumed by `OvpnTunnel::up` at
+    /// connect time; profiles without a stored secret keep using the
+    /// legacy `auth/<profile>.auth` file path unchanged.
     ///
     /// EXAMPLES:
     ///     echo -n 'my-password' | vortix secrets set creds/corp
@@ -337,45 +311,6 @@ pub enum Commands {
     Secrets {
         #[command(subcommand)]
         op: SecretsOp,
-    },
-
-    /// Backfill profile sidecars (plan 006 U4)
-    ///
-    /// Walks the profiles directory and writes `.meta.toml` sidecars for
-    /// any `.conf` / `.ovpn` files that lack one. Idempotent — running it
-    /// twice is harmless. Sidecars include a stable `profile_id`, the
-    /// display name, the protocol, and an `imported_at` timestamp drawn
-    /// from the file's mtime.
-    ///
-    /// This also runs implicitly at every binary startup; this command is
-    /// useful when you want to surface the stats (`created`, `failed`,
-    /// `already_migrated`) explicitly.
-    ///
-    /// EXAMPLES:
-    ///     vortix migrate
-    ///     vortix migrate --json
-    Migrate,
-
-    /// Print the resolved Settings stack (plan 006 U1)
-    ///
-    /// Shows the merged result of defaults → system file → user file →
-    /// VORTIX_* env vars. Useful for verifying which layer set which
-    /// field.
-    ///
-    /// EXAMPLES:
-    ///     vortix settings           Human-readable TOML
-    ///     vortix settings --json    JSON object (good for piping into jq)
-    Settings,
-
-    /// Inspect the engine event journal (plan 005)
-    ///
-    /// EXAMPLES:
-    ///     vortix journal path         Print the session JSONL file path
-    ///     vortix journal tail         Print the last 20 in-memory events
-    ///     vortix journal tail 50      Print the last 50
-    Journal {
-        #[command(subcommand)]
-        op: JournalOp,
     },
 
     /// Generate shell completions for vortix
@@ -388,33 +323,6 @@ pub enum Commands {
         /// Target shell: bash, zsh, fish, powershell
         shell: clap_complete::Shell,
     },
-}
-
-/// Subcommands for `vortix journal`.
-#[derive(clap::Subcommand, Debug, Clone)]
-pub enum JournalOp {
-    /// Print the path of the current session's JSONL journal file.
-    Path,
-    /// Print the last N events from the in-memory tail buffer.
-    Tail {
-        /// Number of events to print (default: 20).
-        #[arg(default_value_t = 20)]
-        count: usize,
-    },
-}
-
-/// Subcommands for `vortix engine`.
-#[derive(clap::Subcommand, Debug, Clone)]
-pub enum EngineOp {
-    /// Snapshot the FSM state + journal tail.
-    Status,
-    /// Execute `Connect { profile }` through the handle.
-    Connect {
-        /// Profile id (sidecar `profile_id` or display name).
-        profile: String,
-    },
-    /// Execute `Disconnect` through the handle.
-    Disconnect,
 }
 
 /// Subcommands for `vortix secrets`.

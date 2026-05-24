@@ -17,7 +17,7 @@
 
 Terminal UI for WireGuard and OpenVPN with real-time telemetry and leak guarding.
 
-> **New in v0.3.0 — architectural migration v1.** Engine FSM, session journal, encrypted secret store, six new CLI subcommands. Upgrade is automatic; existing profiles and commands work unchanged.
+> **New in v0.3.0 — architectural migration v1.** Engine FSM (internal), session journal, encrypted secret store. One new top-level subcommand (`vortix secrets`); existing CLI unchanged. Upgrade is automatic.
 >
 > - [Release notes](docs/v0.3.0-RELEASE-NOTES.md) — what changed (60s read)
 > - [Upgrade guide](docs/MIGRATION.md) — for v0.2.x users
@@ -232,39 +232,29 @@ vortix completions bash >> ~/.bashrc      # Shell completions
 vortix completions zsh > ~/.zfunc/_vortix
 ```
 
-**New in v0.3.0 — observability and config (additive):**
+**New in v0.3.0 — secrets store + profile-export flag (additive):**
 
 ```bash
-# Engine FSM — direct CLI access to the async engine handle
-vortix engine status            # Disconnected / Connecting / Connected{health} / ...
-vortix engine status --json
-vortix engine connect work-vpn  # Equivalent to `up`, drives the new FSM
-vortix engine disconnect
-
-# Event journal — JSONL session log with 30-day / 30-file retention
-vortix journal path             # Current session file
-vortix journal tail 50          # Last 50 events from the in-memory tail
-
-# Settings — figment-layered (defaults -> system -> user -> env)
-vortix settings                 # Print resolved stack as TOML
-vortix settings --json
-
-# Secret store — OS keyring with AES-256-GCM + argon2id fallback
+# Encrypted secret store — OS keyring (Keychain / Secret Service) with
+# AES-256-GCM + argon2id fallback. Opt-in; existing .auth files keep
+# working unchanged.
 echo -n 'user:pass' | vortix secrets set creds/work-vpn
 vortix secrets get creds/work-vpn
 vortix secrets delete creds/work-vpn
 
-# Profile sidecar backfill — idempotent; runs implicitly at startup
-vortix migrate                  # Manual trigger
-vortix migrate --json
-
-# Export — stream profile config, optionally inlining stored secrets
-vortix export work-vpn                   # Plain config to stdout
-vortix export work-vpn --inline-secrets  # Append `# vortix-secret:<b64>`
+# Share a profile with credentials inlined (for the recipient to
+# re-import). The output gets a trailing `# vortix-secret:<base64>`
+# comment that v0.3.x picks up on import.
+vortix show work-vpn --raw --inline-secrets > /tmp/work-with-creds.ovpn
 ```
 
+The Engine FSM, JSONL session journal, layered settings, and sidecar
+migration all live behind existing commands — the journal path
+surfaces in `vortix info` output, the migration runs at startup, and
+`settings.toml` works whether or not you ever create one.
+
 See [`docs/MIGRATION.md`](docs/MIGRATION.md) for the upgrade guide and
-opt-in details on the secret store / journal.
+opt-in details on the secret store and journal.
 
 **JSON output for AI agents / scripts:**
 ```bash

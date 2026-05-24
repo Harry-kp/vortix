@@ -9,14 +9,18 @@ to.
 
 - **Upgrade is automatic.** Existing `.conf` and `.ovpn` profiles keep
   working. No flags to change. `vortix up <profile>`, `down`, `status`,
-  `list`, and `import` behave exactly as before.
+  `list`, `import`, `show` all behave exactly as before.
 - **Two new optional features:** an encrypted secret store and a JSON
-  event journal. Both have safe defaults; you only opt into the encrypted
-  store explicitly.
-- **Six new additive CLI subcommands.** They surface observability and
-  config — they don't replace anything.
-- **One-line rollback** if you hit trouble: `cargo install vortix --version
-  0.2.2 --force`.
+  event journal. Both have safe defaults; you only opt into the
+  encrypted store explicitly.
+- **One new top-level subcommand:** `vortix secrets {set,get,delete}`
+  for the encrypted credential store. Everything else is internal
+  architecture.
+- **One new flag** on existing commands: `vortix show <p> --raw
+  --inline-secrets` appends a stored secret as a trailing comment for
+  sharing.
+- **One-line rollback** if you hit trouble: `cargo install vortix
+  --version 0.2.2 --force`.
 
 ---
 
@@ -39,17 +43,13 @@ Each sidecar carries a stable `profile_id` (SHA-256 of the name + first
 v0.2.x ignores `.meta.toml` files entirely, so rollback is safe.
 
 The migration is **idempotent** — it re-runs at every startup and only
-touches profiles that don't have a sidecar yet. You can also trigger it
-manually:
-
-```sh
-vortix migrate           # human output with counts
-vortix migrate --json    # JSON output for scripts
-```
+touches profiles that don't have a sidecar yet. There is no explicit
+`vortix migrate` command; if you need to re-trigger after fixing
+something (e.g., a permissions issue), just restart vortix.
 
 If migration ever fails (read-only profile dir, unusual perms, etc.),
-startup continues and the warning is logged to stderr. No panic, no data
-loss.
+startup continues and the warning is logged to stderr. No panic, no
+data loss.
 
 ### Override
 
@@ -99,16 +99,24 @@ prompt the first time).
 
 v0.3.0 writes a JSON-lines event journal at
 `${XDG_DATA_HOME}/vortix/sessions/<ISO>-<pid>.jsonl` for every run.
-Retention is 30 days / 30 files (whichever cap hits first). Each line is
-an `EngineEvent` record: connection state transitions, tunnel up/down,
-IP changes, telemetry samples, and so on.
+Retention is 30 days / 30 files (whichever cap hits first). Each line
+is an `EngineEvent` record: connection state transitions, tunnel
+up/down, IP changes, telemetry samples, and so on.
 
-```sh
-vortix journal path           # prints current session's file
-vortix journal tail 50        # last 50 events from in-memory tail
+Find the current session's path via `vortix info`:
+
+```
+  Session journal: /Users/you/Library/Application Support/vortix/sessions/2026-...-66210.jsonl
 ```
 
-If you don't want disk persistence, set in `~/.config/vortix/settings.toml`:
+Tail it with standard shell tools:
+
+```sh
+tail -f "$(vortix info --json | jq -r '.data.journal_session')" | jq '.event'
+```
+
+If you don't want disk persistence, set in
+`~/.config/vortix/settings.toml`:
 
 ```toml
 [journal]
@@ -123,13 +131,9 @@ unaffected); only the on-disk JSONL file is suppressed.
 A new `settings.toml` is read with figment-style layering: built-in
 defaults → `/etc/vortix/config.toml` (system) →
 `${XDG_CONFIG_HOME}/vortix/settings.toml` (user) → `VORTIX_*` env vars
-(highest precedence). You don't need to create the file. To see what's
-currently active:
-
-```sh
-vortix settings               # TOML, the resolved stack
-vortix settings --json        # JSON, same content
-```
+(highest precedence). You don't need to create the file; the
+out-of-the-box defaults match v0.2.x behavior. To see what you've
+configured, read your own `settings.toml`.
 
 ---
 
@@ -154,13 +158,13 @@ To share a profile with credentials inlined for one-shot use (be
 careful — this writes the password into the export):
 
 ```sh
-vortix export corp --inline-secrets > corp-with-creds.ovpn
+vortix show corp --raw --inline-secrets > corp-with-creds.ovpn
 # Recipient: cat corp-with-creds.ovpn | vortix import - && vortix up corp
 ```
 
 The inlined form appears as a `# vortix-secret:<base64>` trailing
-comment that v0.3.x picks up on import. v0.2.x silently ignores it as a
-comment, so the file is forward-compatible.
+comment that v0.3.x picks up on import. v0.2.x silently ignores it as
+a comment, so the file is forward-compatible.
 
 ---
 
@@ -168,16 +172,17 @@ comment, so the file is forward-compatible.
 
 Everything here is additive. Pre-v0.3.0 commands are unchanged.
 
-| Command | What it does | Replaces |
-|---|---|---|
-| `vortix engine {status,connect,disconnect}` | Direct CLI access to the new Engine FSM and its async handle | nothing — `up`/`down`/`status` still work |
-| `vortix journal {path,tail [N]}` | Session journal location + in-memory tail | new |
-| `vortix settings [--json]` | Print the resolved settings stack | new |
-| `vortix secrets {set,get,delete} <id>` | Manage the layered secret store | new |
-| `vortix migrate [--json]` | Manual trigger for the idempotent sidecar backfill | new (runs implicitly at startup) |
-| `vortix export <profile> [--inline-secrets]` | Stream a profile config to stdout, optionally inlining stored credentials | new |
+| Command | What it does |
+|---|---|
+| `vortix secrets {set,get,delete} <id>` | Manage the layered encrypted secret store (new top-level subcommand) |
+| `vortix show <profile> --raw --inline-secrets` | Streams the profile config with stored credentials appended as a `# vortix-secret:<base64>` comment (new flag on existing `show`) |
+| `vortix info` | Output now includes a `Session journal:` line pointing at the current session's JSONL file |
 
-All commands support `--json` where the output is structured.
+`vortix --json` envelopes now carry a top-level `schema_version: 1`
+field for forward-compatibility detection. Everything else is
+internal architecture — engine FSM, layered settings, sidecar
+migration logic — none of which you interact with through new CLI
+verbs.
 
 ---
 
