@@ -484,6 +484,102 @@ Do not announce v0.3.0 on Twitter, Hacker News, Reddit, or other
 amplifiers until **72 hours** post-GA with no reported issues. The
 first 72 hours are for catching regressions, not amplifying installs.
 
+### Broadcast templates — embargoed until 72h post-GA (plan 014 U6)
+
+When the embargo clears, paste from the templates below rather than
+composing under pressure. Tone is neutral ("ships", "is out") rather
+than hype ("biggest", "game-changing") because hype dates fast and
+hype around an architectural refactor lands wrong anyway.
+
+**Each template links to `docs/v0.3.0-RELEASE-NOTES.md` as the
+canonical "what changed?" source.** If a template's wording feels off
+for the moment, edit the venue copy — never the release notes — so
+the canonical source stays stable for late-arriving readers.
+
+#### Twitter / Bluesky (≤280 chars)
+
+```
+Vortix v0.3.0 is out — architectural migration v1.
+
+Engine FSM, session journal, encrypted secret store, six new CLI
+subcommands. Existing profiles & commands work unchanged.
+
+What's new → https://github.com/Harry-kp/vortix/blob/main/docs/v0.3.0-RELEASE-NOTES.md
+```
+
+Char count: ~265. Bluesky's 300-char limit is comfortable; Twitter at
+280 fits with the URL.
+
+#### Mastodon (500 chars)
+
+```
+Vortix v0.3.0 — architectural migration v1 shipped.
+
+Highlights:
+• Engine FSM + JSONL session journal
+• Encrypted secret store (keyring + AES fallback)
+• Six new CLI subcommands (engine, journal, settings, secrets,
+  migrate, export)
+• Existing profiles, commands, and killswitch all unchanged
+
+Terminal UI for WireGuard/OpenVPN with real-time telemetry, leak
+detection, and killswitch. ~15MB RAM, keyboard-driven.
+
+https://github.com/Harry-kp/vortix
+```
+
+#### Hacker News "Show HN"
+
+```
+Title: Show HN: Vortix v0.3.0 — TUI for WireGuard/OpenVPN with real-time telemetry
+
+Body:
+Vortix is a terminal UI for managing WireGuard and OpenVPN with live
+telemetry, killswitch, and IPv6/DNS leak detection. v0.3.0 just shipped
+after an architectural migration — Engine FSM, JSONL session journal,
+encrypted secret store, six new additive CLI subcommands.
+
+Background: I built this because the existing options (wg show,
+NetworkManager, Tunnelblick) either lacked real-time telemetry or
+required a GUI. Vortix runs at ~15MB RAM, sub-500ms startup, is fully
+keyboard-driven, and works over SSH.
+
+What's in 0.3.0:
+https://github.com/Harry-kp/vortix/blob/main/docs/v0.3.0-RELEASE-NOTES.md
+
+Source / install:
+https://github.com/Harry-kp/vortix
+```
+
+Title is 80 chars — under HN's limit. The "Show HN" prefix is the
+convention for tool releases.
+
+#### Reddit (r/selfhosted, r/linux, r/rust)
+
+Same content, different rhythm — 3–4 paragraphs rather than HN's
+single block. Use the HN body as the starting point, then split:
+
+- Paragraph 1: what Vortix is (one sentence) + what v0.3.0 ships
+- Paragraph 2: why it exists (the "Why Vortix" framing from the
+  README), what it's good at
+- Paragraph 3: install commands for the major channels, link to
+  v0.3.0 release notes
+- Subreddit-specific tag: `[Tool Release]` on r/selfhosted,
+  `[Project]` on r/rust, no tag on r/linux
+
+Don't post the same content to all three subreddits in the same hour —
+space them by a day or two. Reddit's cross-posting heuristics will
+shadow-ban otherwise.
+
+#### Anti-pattern: do NOT post
+
+- Anything before 72h post-GA with no reported issues
+- A hype thread without a link to the release notes
+- A long-form blog post — defer that until v0.3.x has stabilised
+  (likely after v0.3.1 patches)
+- Channels you don't personally maintain (Mastodon instances you
+  don't have an account on, Discord servers you're not a member of)
+
 ---
 
 ## Stage 7 — Rollback procedures
