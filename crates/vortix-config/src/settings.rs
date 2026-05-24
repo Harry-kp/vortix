@@ -33,10 +33,6 @@ pub struct Settings {
     pub engine: EngineSettings,
     pub journal: JournalSettings,
     pub ui: UiSettings,
-    /// Lifecycle hooks (plan 015 phase A). Empty by default; users
-    /// opt in by adding `[[hooks]]` entries. See `crates/vortix-config/src/hooks_config.rs`.
-    #[serde(default)]
-    pub hooks: Vec<crate::hooks_config::HookConfig>,
 }
 
 impl Default for Settings {
@@ -46,7 +42,6 @@ impl Default for Settings {
             engine: EngineSettings::default(),
             journal: JournalSettings::default(),
             ui: UiSettings::default(),
-            hooks: Vec::new(),
         }
     }
 }
@@ -366,7 +361,6 @@ disk = false
             engine,
             journal: JournalSettings::default(),
             ui: UiSettings::default(),
-            hooks: Vec::new(),
         };
         let migrated = migrate_settings(s).unwrap();
         assert_eq!(migrated.schema_version, SETTINGS_SCHEMA_VERSION);

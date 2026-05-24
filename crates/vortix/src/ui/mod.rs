@@ -3,7 +3,7 @@
 mod dashboard;
 mod helpers;
 mod overlays;
-pub(crate) mod widgets;
+mod widgets;
 
 use crate::app::App;
 use ratatui::Frame;

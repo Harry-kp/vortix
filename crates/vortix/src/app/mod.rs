@@ -34,8 +34,7 @@ mod tests;
 
 use ratatui::layout::Rect;
 use ratatui::widgets::TableState;
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::time::Instant;
+use std::collections::{HashMap, HashSet};
 
 use crate::constants;
 use crate::engine::VpnEngine;
@@ -89,71 +88,7 @@ pub struct App {
     pub panel_areas: HashMap<FocusedPanel, Rect>,
     pub toast: Option<Toast>,
     pub terminal_size: (u16, u16),
-
-    // === Lifecycle Hooks (plan 016) ===
-    /// Recent hook fires (most-recent-first), capped at
-    /// [`HOOK_HISTORY_CAP`]. Populated by `Message::HookFired`. Drives
-    /// the Hooks overlay (U4) and is the source of truth the toast
-    /// rate-limiter (U3) consults.
-    pub recent_hook_events: VecDeque<crate::message::HookOutcomeReport>,
-
-    /// Last time a toast was emitted per hook name, for the 30-second
-    /// per-hook rate limit in U3. Cleared at engine restart.
-    pub hook_toast_last_fired: HashMap<String, Instant>,
-
-    /// Whether the Hooks overlay is open (U4).
-    pub show_hooks_overlay: bool,
-
-    /// Cached count of registered hooks (set once at startup; surfaced
-    /// in the action menu and overlay header).
-    pub registered_hooks_count: usize,
-
-    /// Hook-config validation errors collected at startup (plan 016 U5).
-    /// Surfaced as a startup toast and as a banner inside the hooks
-    /// overlay so the user knows which entries were skipped.
-    pub hook_config_errors: Vec<String>,
-
-    /// Snapshot of `Settings::load().hooks` for the management
-    /// overlay (plan 017 U5/U6). Refreshed at startup, when the
-    /// Hooks overlay opens, and after a successful save. The running
-    /// registry (in main.rs) stays bound to what it loaded at start —
-    /// changes here only take effect on next vortix start.
-    pub registered_hooks: Vec<vortix_config::HookConfig>,
-
-    /// Selected row in the registered-hooks list inside the overlay
-    /// (plan 017 U6). j/k move; the U7 keybinds act on this index.
-    pub hooks_overlay_selected: usize,
-
-    /// Plan 017 U7: when set, the active `InputMode::ConfirmDelete`
-    /// is a hook deletion — confirming dispatches
-    /// `Message::HookDeleteConfirm` rather than the profile-delete
-    /// path. Cleared when the dialog closes either way.
-    pub pending_hook_delete: Option<usize>,
-
-    /// Plan 017 U8: stashed `Vec<HookConfig>` from a write that hit
-    /// the mtime-conflict guard. Pressing 'y' on the overwrite toast
-    /// flushes this through `write_hooks` (no mtime check).
-    pub pending_hooks_overwrite: Option<Vec<vortix_config::HookConfig>>,
 }
-
-/// Helper used by `handle_hook_delete_request` — derives the same
-/// display label the form/overlay use. Avoids dragging the form
-/// module into the update.rs path just for one helper.
-pub(crate) fn helpers_hook_name(cfg: &vortix_config::HookConfig) -> String {
-    if let Some(n) = cfg.env.get("VORTIX_HOOK_NAME") {
-        return n.clone();
-    }
-    cfg.command
-        .first()
-        .and_then(|s| s.rsplit('/').next())
-        .unwrap_or("hook")
-        .to_string()
-}
-
-/// Cap on `recent_hook_events` retention. Roughly two hours of activity
-/// at one fire every 2.5 minutes — plenty for the post-mortem case the
-/// overlay serves without unbounded growth.
-pub const HOOK_HISTORY_CAP: usize = 50;
 
 // Plan 005 U5: the previous `impl Deref<Target = VpnEngine>` was a porous
 // boundary — every TUI/app/CLI callsite could reach into VpnEngine without
@@ -200,15 +135,6 @@ impl App {
             panel_areas: HashMap::new(),
             toast: None,
             terminal_size: (0, 0),
-            recent_hook_events: VecDeque::with_capacity(HOOK_HISTORY_CAP),
-            hook_toast_last_fired: HashMap::new(),
-            show_hooks_overlay: false,
-            registered_hooks_count: 0,
-            hook_config_errors: Vec::new(),
-            registered_hooks: Vec::new(),
-            hooks_overlay_selected: 0,
-            pending_hook_delete: None,
-            pending_hooks_overwrite: None,
         };
 
         // Select first profile if available
@@ -362,15 +288,6 @@ impl App {
             panel_areas: HashMap::new(),
             toast: None,
             terminal_size: (80, 24),
-            recent_hook_events: VecDeque::with_capacity(HOOK_HISTORY_CAP),
-            hook_toast_last_fired: HashMap::new(),
-            show_hooks_overlay: false,
-            registered_hooks_count: 0,
-            hook_config_errors: Vec::new(),
-            registered_hooks: Vec::new(),
-            hooks_overlay_selected: 0,
-            pending_hook_delete: None,
-            pending_hooks_overwrite: None,
         }
     }
 }
