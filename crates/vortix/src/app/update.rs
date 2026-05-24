@@ -355,38 +355,158 @@ impl App {
         self.show_hooks_overlay = false;
     }
 
-    /// U8 wires this to the save pipeline. For now, validate the form
-    /// and surface inline errors; on a valid form, no-op (the write
-    /// path is U8's job).
+    /// Plan 017 U8: save pipeline for the hook editor form.
+    ///
+    /// Pipeline: validate → mtime check → write → reload registered
+    /// list → toast restart-apply. On validation failure leaves the
+    /// form open; on mtime conflict stashes pending hooks for the
+    /// overwrite prompt; on writer success closes the form.
     fn handle_hook_edit_save(&mut self) {
+        use crate::state::HookEditTarget;
         let crate::state::InputMode::HookEdit(state) = &mut self.input_mode else {
             return;
         };
-        if state.to_config().is_ok() {
-            // U8 will: stat mtime, call hooks_writer::write_hooks,
-            // update app.registered_hooks, toast restart-apply.
-            // For U5 we leave the form open and show a "save pipeline
-            // not wired" inline message so the user sees the form is
-            // functional even though persistence comes next unit.
-            state.validation_error =
-                Some("Save pipeline lands in U8 — close with Esc.".into());
+        let target = state.target;
+        let original_mtime = state.original_mtime;
+        let Ok(cfg) = state.to_config() else {
+            // validation_error already set inside to_config()
+            return;
+        };
+
+        // Build the new Vec<HookConfig> from app.registered_hooks +
+        // the mutation.
+        let mut list = vortix_config::HooksList::new(self.registered_hooks.clone());
+        match target {
+            HookEditTarget::AddingNew => list.add(cfg),
+            HookEditTarget::EditingExisting { index } => {
+                if list.replace(index, cfg).is_none() {
+                    // The list shrank under us — e.g. the hook was
+                    // deleted by something else after the form
+                    // opened. Pull cfg from to_config() one more
+                    // time and append so the user's edit isn't lost.
+                    if let crate::state::InputMode::HookEdit(s) = &mut self.input_mode {
+                        if let Ok(c2) = s.to_config() {
+                            list.add(c2);
+                        }
+                    }
+                }
+            }
         }
-        // On Err: validation_error already set inside to_config().
+
+        self.commit_hooks_write(list.into_inner(), original_mtime, true);
     }
 
-    #[allow(clippy::unused_self)]
-    fn handle_hook_delete_request(&mut self, _idx: usize) {
-        // U7 wires this to the confirm dialog.
+    /// Plan 017 U7: delete request opens the confirm dialog. Reuses
+    /// `InputMode::ConfirmDelete` to stay consistent with the
+    /// profile-delete confirm — same dialog rendering, different
+    /// confirm message dispatched on Yes (`HookDeleteConfirm`).
+    fn handle_hook_delete_request(&mut self, idx: usize) {
+        let name = self
+            .registered_hooks
+            .get(idx)
+            .map_or_else(|| "hook".to_string(), super::helpers_hook_name);
+        self.input_mode = crate::state::InputMode::ConfirmDelete {
+            index: idx,
+            name: format!("hook '{name}'"),
+            confirm_selected: false,
+        };
+        // Mark that this confirm targets a hook, not a profile —
+        // the input handler reads `pending_hook_delete` to decide
+        // which message to fire on Yes.
+        self.pending_hook_delete = Some(idx);
+        self.show_hooks_overlay = false;
     }
 
-    #[allow(clippy::unused_self)]
-    fn handle_hook_delete_confirm(&mut self, _idx: usize) {
-        // U8 wires this to the save pipeline.
+    /// Plan 017 U8: confirmed delete fires the save pipeline.
+    fn handle_hook_delete_confirm(&mut self, idx: usize) {
+        let mut list = vortix_config::HooksList::new(self.registered_hooks.clone());
+        if list.remove(idx).is_none() {
+            return;
+        }
+        let mtime = settings_toml_mtime(self);
+        self.commit_hooks_write(list.into_inner(), mtime, false);
     }
 
-    #[allow(clippy::unused_self)]
-    fn handle_hook_toggle(&mut self, _idx: usize) {
-        // U7/U8 wire this to HooksList::toggle + save pipeline.
+    /// Plan 017 U8: toggle is a one-shot mutation + write.
+    fn handle_hook_toggle(&mut self, idx: usize) {
+        let mut list = vortix_config::HooksList::new(self.registered_hooks.clone());
+        if !list.toggle(idx) && self.registered_hooks.get(idx).is_none() {
+            return;
+        }
+        let mtime = settings_toml_mtime(self);
+        self.commit_hooks_write(list.into_inner(), mtime, false);
+    }
+
+    /// Plan 017 U8: force-write after the mtime-overwrite prompt
+    /// confirms. Calls the unchecked writer because the user
+    /// explicitly said "overwrite".
+    pub(crate) fn commit_hooks_overwrite(
+        &mut self,
+        hooks: Vec<vortix_config::HookConfig>,
+    ) {
+        let path = self.engine.config_dir.join("settings.toml");
+        match vortix_config::write_hooks(&path, &hooks) {
+            Ok(()) => {
+                self.registered_hooks = hooks;
+                self.show_toast(
+                    "Hook saved (overwrote external edits). Restart vortix to apply.".into(),
+                    super::ToastType::Success,
+                );
+            }
+            Err(e) => {
+                self.show_toast(
+                    format!("Failed to save hook: {e}"),
+                    super::ToastType::Error,
+                );
+            }
+        }
+    }
+
+    /// Shared tail of every save path. Writes the hooks via the
+    /// mtime-checked writer, on success swaps `app.registered_hooks`
+    /// and shows the restart-apply toast. On `MtimeChanged`, opens
+    /// the overwrite-prompt input mode. `close_form` is true only
+    /// when the call came from the Add/Edit form (so we exit the
+    /// form on success).
+    fn commit_hooks_write(
+        &mut self,
+        new_hooks: Vec<vortix_config::HookConfig>,
+        original_mtime: Option<std::time::SystemTime>,
+        close_form: bool,
+    ) {
+        let path = self.engine.config_dir.join("settings.toml");
+        let result = if let Some(mtime) = original_mtime {
+            vortix_config::write_hooks_with_mtime_check(&path, mtime, &new_hooks)
+        } else {
+            vortix_config::write_hooks(&path, &new_hooks)
+        };
+
+        match result {
+            Ok(()) => {
+                self.registered_hooks = new_hooks;
+                if close_form {
+                    self.input_mode = crate::state::InputMode::Normal;
+                }
+                self.show_hooks_overlay = true;
+                self.show_toast(
+                    "Hook saved. Restart vortix for changes to take effect.".into(),
+                    super::ToastType::Success,
+                );
+            }
+            Err(vortix_config::HooksWriteError::MtimeChanged { .. }) => {
+                self.pending_hooks_overwrite = Some(new_hooks);
+                self.show_toast(
+                    "settings.toml changed externally — press 'y' to overwrite, 'n' to cancel.".into(),
+                    super::ToastType::Warning,
+                );
+            }
+            Err(e) => {
+                self.show_toast(
+                    format!("Failed to save hook: {e}"),
+                    super::ToastType::Error,
+                );
+            }
+        }
     }
 
     /// Record a hook fire in the rolling history and surface a

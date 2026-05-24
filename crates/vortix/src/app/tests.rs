@@ -54,6 +54,8 @@ fn test_app() -> App {
         hook_config_errors: Vec::new(),
         registered_hooks: Vec::new(),
         hooks_overlay_selected: 0,
+        pending_hook_delete: None,
+        pending_hooks_overwrite: None,
     }
 }
 
@@ -2194,6 +2196,122 @@ fn hook_timed_out_emits_warning_toast() {
         crate::state::ToastType::Warning
     ));
     assert!(toast.message.contains("timed out"));
+}
+
+// Plan 017 U7/U8 — save pipeline + delete confirm.
+
+fn hook_cfg(name: &str, enabled: Option<bool>) -> vortix_config::HookConfig {
+    let mut env = std::collections::HashMap::new();
+    env.insert("VORTIX_HOOK_NAME".into(), name.into());
+    vortix_config::HookConfig {
+        event: "post_connect".into(),
+        command: vec!["sh".into(), "-c".into(), "true".into()],
+        timeout_secs: 5,
+        env,
+        enabled,
+    }
+}
+
+#[test]
+fn hook_add_opens_form_in_adding_new_mode() {
+    let mut app = test_app();
+    app.handle_message(Message::HookAdd);
+    assert!(matches!(
+        app.input_mode,
+        crate::state::InputMode::HookEdit(_)
+    ));
+    if let crate::state::InputMode::HookEdit(state) = &app.input_mode {
+        assert!(matches!(
+            state.target,
+            crate::state::HookEditTarget::AddingNew
+        ));
+    }
+}
+
+#[test]
+fn hook_edit_loads_existing_entry_into_form() {
+    let mut app = test_app();
+    app.registered_hooks = vec![hook_cfg("alpha", None), hook_cfg("beta", Some(false))];
+    app.handle_message(Message::HookEdit(1));
+    if let crate::state::InputMode::HookEdit(state) = &app.input_mode {
+        assert!(matches!(
+            state.target,
+            crate::state::HookEditTarget::EditingExisting { index: 1 }
+        ));
+        assert_eq!(state.name, "beta");
+        assert!(!state.enabled);
+    } else {
+        panic!("expected HookEdit input mode");
+    }
+}
+
+#[test]
+fn hook_edit_on_invalid_index_is_a_noop() {
+    let mut app = test_app();
+    app.registered_hooks = vec![hook_cfg("alpha", None)];
+    app.handle_message(Message::HookEdit(99));
+    // input mode unchanged; no form opened.
+    assert!(matches!(app.input_mode, crate::state::InputMode::Normal));
+}
+
+#[test]
+fn hook_delete_request_opens_confirm_dialog_with_hook_name() {
+    let mut app = test_app();
+    app.registered_hooks = vec![hook_cfg("slack-notify", None)];
+    app.show_hooks_overlay = true;
+    app.handle_message(Message::HookDeleteRequest(0));
+    if let crate::state::InputMode::ConfirmDelete { name, .. } = &app.input_mode {
+        assert!(name.contains("slack-notify"), "got: {name}");
+    } else {
+        panic!("expected ConfirmDelete input mode");
+    }
+    assert_eq!(app.pending_hook_delete, Some(0));
+    // The overlay should close while the confirm dialog is up.
+    assert!(!app.show_hooks_overlay);
+}
+
+#[test]
+fn hook_toggle_writes_through_and_updates_registered_hooks() {
+    let mut app = test_app();
+    // Use a fresh per-test tempdir so we don't collide with other
+    // tests sharing the same process-id-derived path.
+    let dir = tempfile::tempdir().unwrap();
+    app.engine.config_dir = dir.path().to_path_buf();
+    app.registered_hooks = vec![hook_cfg("alpha", None)];
+    app.handle_message(Message::HookToggle(0));
+    assert_eq!(
+        app.registered_hooks[0].enabled,
+        Some(false),
+        "toast: {:?}",
+        app.toast.as_ref().map(|t| &t.message)
+    );
+    assert!(app.toast.is_some());
+    assert!(app.engine.config_dir.join("settings.toml").exists());
+}
+
+#[test]
+fn hook_toggle_out_of_bounds_is_a_noop() {
+    let mut app = test_app();
+    app.registered_hooks = vec![hook_cfg("alpha", None)];
+    app.handle_message(Message::HookToggle(99));
+    // No write attempted; original enabled state preserved.
+    assert_eq!(app.registered_hooks[0].enabled, None);
+}
+
+#[test]
+fn hook_delete_confirm_removes_entry_and_writes() {
+    let mut app = test_app();
+    let dir = tempfile::tempdir().unwrap();
+    app.engine.config_dir = dir.path().to_path_buf();
+    app.registered_hooks = vec![
+        hook_cfg("alpha", None),
+        hook_cfg("beta", None),
+        hook_cfg("gamma", None),
+    ];
+    app.handle_message(Message::HookDeleteConfirm(1));
+    assert_eq!(app.registered_hooks.len(), 2);
+    assert_eq!(app.registered_hooks[0].env.get("VORTIX_HOOK_NAME"), Some(&"alpha".into()));
+    assert_eq!(app.registered_hooks[1].env.get("VORTIX_HOOK_NAME"), Some(&"gamma".into()));
 }
 
 #[test]

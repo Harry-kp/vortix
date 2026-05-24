@@ -123,6 +123,31 @@ pub struct App {
     /// Selected row in the registered-hooks list inside the overlay
     /// (plan 017 U6). j/k move; the U7 keybinds act on this index.
     pub hooks_overlay_selected: usize,
+
+    /// Plan 017 U7: when set, the active `InputMode::ConfirmDelete`
+    /// is a hook deletion — confirming dispatches
+    /// `Message::HookDeleteConfirm` rather than the profile-delete
+    /// path. Cleared when the dialog closes either way.
+    pub pending_hook_delete: Option<usize>,
+
+    /// Plan 017 U8: stashed `Vec<HookConfig>` from a write that hit
+    /// the mtime-conflict guard. Pressing 'y' on the overwrite toast
+    /// flushes this through `write_hooks` (no mtime check).
+    pub pending_hooks_overwrite: Option<Vec<vortix_config::HookConfig>>,
+}
+
+/// Helper used by `handle_hook_delete_request` — derives the same
+/// display label the form/overlay use. Avoids dragging the form
+/// module into the update.rs path just for one helper.
+pub(crate) fn helpers_hook_name(cfg: &vortix_config::HookConfig) -> String {
+    if let Some(n) = cfg.env.get("VORTIX_HOOK_NAME") {
+        return n.clone();
+    }
+    cfg.command
+        .first()
+        .and_then(|s| s.rsplit('/').next())
+        .unwrap_or("hook")
+        .to_string()
 }
 
 /// Cap on `recent_hook_events` retention. Roughly two hours of activity
@@ -182,6 +207,8 @@ impl App {
             hook_config_errors: Vec::new(),
             registered_hooks: Vec::new(),
             hooks_overlay_selected: 0,
+            pending_hook_delete: None,
+            pending_hooks_overwrite: None,
         };
 
         // Select first profile if available
@@ -342,6 +369,8 @@ impl App {
             hook_config_errors: Vec::new(),
             registered_hooks: Vec::new(),
             hooks_overlay_selected: 0,
+            pending_hook_delete: None,
+            pending_hooks_overwrite: None,
         }
     }
 }

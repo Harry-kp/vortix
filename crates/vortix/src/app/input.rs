@@ -91,6 +91,27 @@ impl App {
             return;
         }
 
+        // 4a. Global: Handle pending mtime-overwrite prompt (plan 017 U8).
+        if self.pending_hooks_overwrite.is_some() && self.input_mode == InputMode::Normal {
+            match key.code {
+                KeyCode::Char('y' | 'Y') => {
+                    if let Some(hooks) = self.pending_hooks_overwrite.take() {
+                        self.commit_hooks_overwrite(hooks);
+                    }
+                    return;
+                }
+                KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+                    self.pending_hooks_overwrite = None;
+                    self.show_toast(
+                        "Hook save cancelled — settings.toml unchanged.".into(),
+                        crate::state::ToastType::Info,
+                    );
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         // 4b. Global: Handle Hooks overlay key dispatch (plan 017 U6/U7).
         if self.show_hooks_overlay && self.input_mode == InputMode::Normal {
             self.handle_hooks_overlay_keys(key);
@@ -207,8 +228,22 @@ impl App {
                 mut confirm_selected,
                 ..
             } => match handle_confirm_keys(key, &mut confirm_selected) {
-                ConfirmAction::Confirmed => self.handle_message(Message::ConfirmDelete),
-                ConfirmAction::Cancelled => self.handle_message(Message::CloseOverlay),
+                // Plan 017 U7: a confirm fired while `pending_hook_delete`
+                // is set targets a hook, not a profile — dispatch
+                // accordingly. Confirm is consumed here regardless of
+                // outcome so the flag is cleared.
+                ConfirmAction::Confirmed => {
+                    if let Some(idx) = self.pending_hook_delete.take() {
+                        self.input_mode = InputMode::Normal;
+                        self.handle_message(Message::HookDeleteConfirm(idx));
+                    } else {
+                        self.handle_message(Message::ConfirmDelete);
+                    }
+                }
+                ConfirmAction::Cancelled => {
+                    self.pending_hook_delete = None;
+                    self.handle_message(Message::CloseOverlay);
+                }
                 ConfirmAction::None => {
                     if let InputMode::ConfirmDelete {
                         confirm_selected: cs,
