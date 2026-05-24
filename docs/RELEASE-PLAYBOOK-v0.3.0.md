@@ -189,6 +189,34 @@ gh release view v0.3.0-rc.1
 Confirm: `isPrerelease: true`, six binary archives attached, shell
 installer (`vortix-installer.sh`) attached, checksums present.
 
+### RC GitHub Release body template (plan 014 U5)
+
+cargo-dist auto-generates a Release with a default body. Edit the
+body via the GH web UI or `gh release edit v0.3.0-rc.1 --notes "$(cat
+<<EOF ... EOF)"` and paste:
+
+````md
+Release candidate for **v0.3.0** — the architectural migration v1 ship.
+
+- **Soak period:** YYYY-MM-DD to YYYY-MM-DD (5–7 days)
+- **For testers:** install via any channel below, then run:
+  ```sh
+  bash <(curl -sL https://raw.githubusercontent.com/Harry-kp/vortix/main/scripts/smoke-v0.3.0.sh) 0.3.0-rc.1
+  ```
+  Report results on [discussion #184](https://github.com/Harry-kp/vortix/discussions/184).
+
+**What changed:** [v0.3.0 release notes](https://github.com/Harry-kp/vortix/blob/main/docs/v0.3.0-RELEASE-NOTES.md) (60s read)
+**Upgrade guide:** [docs/MIGRATION.md](https://github.com/Harry-kp/vortix/blob/main/docs/MIGRATION.md)
+**FAQ:** [docs/v0.3.0-FAQ.md](https://github.com/Harry-kp/vortix/blob/main/docs/v0.3.0-FAQ.md)
+
+**Roll back:** `cargo install vortix --version 0.2.2 --force`
+
+Target promote-to-GA date: **YYYY-MM-DD** (revised if blockers surface).
+````
+
+Only the YYYY-MM-DD placeholders need filling. Everything else is
+canonical.
+
 ---
 
 ## Stage 4 — Post to discussion #184 (RC soak)
@@ -199,13 +227,23 @@ Use this comment template in
 ````md
 # v0.3.0-rc.1 is available for testing
 
-Hi all — this release candidate carries the full architectural
-migration v1 bundle (6 plans, 28 commits). Before promoting to v0.3.0
-I'd like a 5–7 day soak across as many Linux distros as possible.
+Hi all — this release candidate carries the full architectural migration
+v1 bundle (six plans, 30+ commits). Before promoting to v0.3.0 I'd like
+a 5–7 day soak across as many Linux distros as possible.
+
+## What changed
+
+Engine FSM + session journal, encrypted secret store, six new CLI
+subcommands. Existing commands (`up`, `down`, `status`, `list`, `import`,
+`killswitch`, …) unchanged. Full details:
+
+- [Release notes](https://github.com/Harry-kp/vortix/blob/main/docs/v0.3.0-RELEASE-NOTES.md) — 60s read
+- [FAQ](https://github.com/Harry-kp/vortix/blob/main/docs/v0.3.0-FAQ.md) — common upgrade questions
+- [Upgrade guide](https://github.com/Harry-kp/vortix/blob/main/docs/MIGRATION.md)
 
 ## Install (pick one)
 
-Shell installer (works on any Linux):
+Shell installer (any Linux):
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/Harry-kp/vortix/releases/download/v0.3.0-rc.1/vortix-installer.sh | sh
@@ -220,19 +258,22 @@ cargo install vortix --version 0.3.0-rc.1
 
 1. Run the smoke script:
    ```sh
-   curl -sL https://raw.githubusercontent.com/Harry-kp/vortix/main/scripts/smoke-v0.3.0.sh | bash -s 0.3.0-rc.1
+   bash <(curl -sL https://raw.githubusercontent.com/Harry-kp/vortix/main/scripts/smoke-v0.3.0.sh) 0.3.0-rc.1
    ```
-2. Connect to your usual VPN profile and confirm `up`, `status`,
-   `down` work as on v0.2.x.
-3. Run `vortix engine status` (new) and confirm it reports
-   `Disconnected` cleanly.
-4. Skim `docs/MIGRATION.md` to see if anything surprises you.
+   Expect ~11 PASS, 0 FAIL, ≤1 SKIP.
+2. Connect to your usual VPN profile and confirm `up`, `status`, `down`
+   work as on v0.2.x.
+3. Try the new commands: `vortix engine status`, `vortix journal path`,
+   `vortix settings`. None should panic.
+4. Skim the [FAQ](https://github.com/Harry-kp/vortix/blob/main/docs/v0.3.0-FAQ.md)
+   — anything that surprises you is worth raising here.
 
 ## Reply on this thread if
 
 - Anything diverges from v0.2.x behavior
 - The startup migration logs anything other than success
 - A command panics
+- The smoke script reports any FAIL
 
 ## Roll back
 
@@ -241,7 +282,7 @@ cargo install vortix --version 0.2.2 --force
 ```
 
 Migration leftovers (`.meta.toml` sidecars, `secrets.enc`) are inert to
-v0.2.x — they don't need cleanup.
+v0.2.x — no cleanup needed.
 
 Targeted promotion to v0.3.0 GA: **YYYY-MM-DD** (update with concrete
 date 5–7 days out).
@@ -349,6 +390,30 @@ Merging triggers:
    jobs
 
 Watch all three workflows. Expected total wall-clock: ~25–40 minutes.
+
+### 5.3 GA GitHub Release body template (plan 014 U5)
+
+cargo-dist auto-generates a Release on the `v0.3.0` tag. Replace its
+body via `gh release edit v0.3.0 --notes "$(cat ...)"` or the web UI:
+
+````md
+**v0.3.0** ships the architectural migration v1 bundle — six
+coordinated plans, ~16k LOC. Every existing CLI command, profile, and
+killswitch state is preserved unchanged.
+
+- [What changed](https://github.com/Harry-kp/vortix/blob/main/docs/v0.3.0-RELEASE-NOTES.md) — 60s read
+- [Upgrade guide](https://github.com/Harry-kp/vortix/blob/main/docs/MIGRATION.md)
+- [FAQ](https://github.com/Harry-kp/vortix/blob/main/docs/v0.3.0-FAQ.md)
+
+Thanks to the RC testers in [discussion #184](https://github.com/Harry-kp/vortix/discussions/184)
+who soaked this for N days.
+
+**Install:** `cargo install vortix`, `brew install vortix`, or
+`npm install -g @harry-kp/vortix`.
+**Roll back if needed:** `cargo install vortix --version 0.2.2 --force`.
+````
+
+Only the soak-day-count placeholder (`N days`) needs filling.
 
 ### Post-publish verification
 
