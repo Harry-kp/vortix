@@ -12,4 +12,5 @@
 #![allow(clippy::missing_errors_doc, clippy::implicit_hasher)]
 
 pub mod ports;
+pub mod profile;
 pub mod state;
