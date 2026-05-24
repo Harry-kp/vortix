@@ -126,6 +126,16 @@ pub enum EngineEvent {
         profile_id: ProfileId,
         reason: DegradedReason,
     },
+    /// Plan 008 U2: the FSM needs the user to supply input to continue
+    /// (2FA code, passphrase, etc.). Reserved for issue #191; no
+    /// consumer wired in v0.3.0. The corresponding `UserCommand::UserAnswered`
+    /// references the same `prompt_id`.
+    UserPromptRequested {
+        profile_id: ProfileId,
+        prompt_id: String,
+        prompt_kind: crate::engine::state::PromptKind,
+        prompt_text: String,
+    },
 }
 
 /// Why a tunnel went down.
