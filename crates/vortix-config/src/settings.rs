@@ -11,13 +11,39 @@ use figment::Figment;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// Current schema version for `settings.toml` (plan 008 U3).
+///
+/// Bump when a settings field renames, removes, or changes type.
+/// Additive field additions do not require a bump.
+pub const SETTINGS_SCHEMA_VERSION: u32 = 1;
+
+fn default_schema_version() -> u32 {
+    SETTINGS_SCHEMA_VERSION
+}
+
 /// Top-level settings.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    /// Schema version of the user's `settings.toml`. When this differs
+    /// from [`SETTINGS_SCHEMA_VERSION`], [`migrate_settings`] is invoked
+    /// to upgrade. Files without an explicit field default to 1.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
     pub engine: EngineSettings,
     pub journal: JournalSettings,
     pub ui: UiSettings,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            schema_version: SETTINGS_SCHEMA_VERSION,
+            engine: EngineSettings::default(),
+            journal: JournalSettings::default(),
+            ui: UiSettings::default(),
+        }
+    }
 }
 
 /// Engine retry + reconnect knobs. Plan 005's FSM consumes these.
@@ -97,6 +123,37 @@ pub enum SettingsError {
     Io(#[from] std::io::Error),
     #[error("no usable config directory (XDG resolution failed)")]
     NoConfigDir,
+    #[error(
+        "settings schema version {found} is not supported by this build (max supported: {supported_max}). Upgrade vortix or migrate the file."
+    )]
+    UnsupportedSchema { found: u32, supported_max: u32 },
+}
+
+/// Migrate a parsed `Settings` from an older schema version to the
+/// current [`SETTINGS_SCHEMA_VERSION`] (plan 008 U3).
+///
+/// v0.3.0 only knows `schema_version` = 1; older or newer versions
+/// return `UnsupportedSchema`. Future versions will add upgrade arms
+/// here.
+///
+/// # Errors
+///
+/// Returns [`SettingsError::UnsupportedSchema`] when the input's
+/// `schema_version` is not handled by this build.
+pub fn migrate_settings(mut s: Settings) -> Result<Settings, SettingsError> {
+    match s.schema_version {
+        0 | 1 => {
+            // v0 ⇒ treat as v1 (older files didn't carry the field;
+            // serde default reads as 1 anyway, but cover the 0 case for
+            // explicit-zero writes).
+            s.schema_version = SETTINGS_SCHEMA_VERSION;
+            Ok(s)
+        }
+        found => Err(SettingsError::UnsupportedSchema {
+            found,
+            supported_max: SETTINGS_SCHEMA_VERSION,
+        }),
+    }
 }
 
 impl From<figment::Error> for SettingsError {
@@ -138,8 +195,11 @@ impl Settings {
             }
         }
         fig = fig.merge(Env::prefixed("VORTIX_").split("__"));
-        let s = fig.extract()?;
-        Ok(s)
+        let s: Self = fig.extract()?;
+        // Plan 008 U3: route through migrate_settings so an unsupported
+        // schema_version surfaces as a typed error instead of silently
+        // accepting unknown fields.
+        migrate_settings(s)
     }
 }
 
@@ -234,5 +294,72 @@ disk = false
         fs::write(&path, "[engine]\nretry_budget_secs = \"not a number\"\n").unwrap();
         let err = Settings::load_from(None, Some(&path)).unwrap_err();
         assert!(matches!(err, SettingsError::Figment(_)));
+    }
+
+    // Plan 008 U3 — schema_version + migration coverage.
+
+    #[test]
+    fn schema_version_defaults_to_one() {
+        let s = Settings::load_from(None, None).unwrap();
+        assert_eq!(s.schema_version, 1);
+    }
+
+    #[test]
+    fn missing_schema_version_in_file_defaults_to_one() {
+        // Pre-008 settings files don't carry schema_version; they
+        // should load as v1 via the serde default.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("legacy.toml");
+        fs::write(&path, "[engine]\nretry_budget_secs = 60\n").unwrap();
+        let s = Settings::load_from(None, Some(&path)).unwrap();
+        assert_eq!(s.schema_version, 1);
+        assert_eq!(s.engine.retry_budget_secs, 60);
+    }
+
+    #[test]
+    fn explicit_schema_version_one_loads_cleanly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("v1.toml");
+        fs::write(&path, "schema_version = 1\n[engine]\nretry_budget_secs = 90\n").unwrap();
+        let s = Settings::load_from(None, Some(&path)).unwrap();
+        assert_eq!(s.schema_version, 1);
+        assert_eq!(s.engine.retry_budget_secs, 90);
+    }
+
+    #[test]
+    fn unsupported_schema_version_returns_typed_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("v999.toml");
+        fs::write(&path, "schema_version = 999\n").unwrap();
+        let err = Settings::load_from(None, Some(&path)).unwrap_err();
+        match err {
+            SettingsError::UnsupportedSchema {
+                found,
+                supported_max,
+            } => {
+                assert_eq!(found, 999);
+                assert_eq!(supported_max, SETTINGS_SCHEMA_VERSION);
+            }
+            other => panic!("expected UnsupportedSchema, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn migrate_settings_normalises_zero_to_current() {
+        // schema_version = 0 (older serializer write) is accepted and
+        // normalised to the current version, preserving other fields.
+        let engine = EngineSettings {
+            retry_budget_secs: 42,
+            ..EngineSettings::default()
+        };
+        let s = Settings {
+            schema_version: 0,
+            engine,
+            journal: JournalSettings::default(),
+            ui: UiSettings::default(),
+        };
+        let migrated = migrate_settings(s).unwrap();
+        assert_eq!(migrated.schema_version, SETTINGS_SCHEMA_VERSION);
+        assert_eq!(migrated.engine.retry_budget_secs, 42);
     }
 }
