@@ -2119,6 +2119,80 @@ fn hook_fired_history_is_fifo_capped_at_cap() {
     assert_eq!(app.recent_hook_events.back().unwrap().hook_name, "h10");
 }
 
+fn make_failed_report(name: &str, stderr: &str) -> crate::message::HookOutcomeReport {
+    use vortix_core::engine::{HookOutcomeLabel, HookOutcomeRecord};
+    crate::message::HookOutcomeReport {
+        hook_name: name.into(),
+        event_kind: "post_connect".into(),
+        record: HookOutcomeRecord::new(HookOutcomeLabel::Failed, None, b"", stderr.as_bytes()),
+    }
+}
+
+#[test]
+fn hook_failure_emits_error_toast() {
+    let mut app = test_app();
+    app.handle_message(Message::HookFired(make_failed_report("slack-notify", "boom")));
+    let toast = app.toast.as_ref().expect("toast should be set");
+    assert!(toast.message.contains("slack-notify"));
+    assert!(toast.message.contains("boom"));
+    assert!(matches!(toast.toast_type, crate::state::ToastType::Error));
+}
+
+#[test]
+fn hook_success_does_not_emit_toast() {
+    let mut app = test_app();
+    app.handle_message(Message::HookFired(make_report("ok-hook")));
+    assert!(app.toast.is_none());
+}
+
+#[test]
+fn hook_failure_rate_limits_subsequent_toasts() {
+    let mut app = test_app();
+    // First failure emits a toast.
+    app.handle_message(Message::HookFired(make_failed_report("noisy", "first")));
+    let first_msg = app.toast.as_ref().unwrap().message.clone();
+    // Clear the toast manually so we can detect whether a second one
+    // would have replaced it.
+    app.toast = None;
+    // Second failure within the rate-limit window — should NOT emit.
+    app.handle_message(Message::HookFired(make_failed_report("noisy", "second")));
+    assert!(
+        app.toast.is_none(),
+        "rate-limit window should suppress a second toast"
+    );
+    // History still records every fire.
+    assert_eq!(app.recent_hook_events.len(), 2);
+    // Sanity: the first toast referenced this hook.
+    assert!(first_msg.contains("noisy"));
+}
+
+#[test]
+fn hook_failure_for_different_hooks_does_not_rate_limit_each_other() {
+    let mut app = test_app();
+    app.handle_message(Message::HookFired(make_failed_report("alpha", "x")));
+    app.toast = None;
+    app.handle_message(Message::HookFired(make_failed_report("beta", "y")));
+    let toast = app.toast.as_ref().expect("beta should toast independently");
+    assert!(toast.message.contains("beta"));
+}
+
+#[test]
+fn hook_timed_out_emits_warning_toast() {
+    use vortix_core::engine::{HookOutcomeLabel, HookOutcomeRecord};
+    let mut app = test_app();
+    app.handle_message(Message::HookFired(crate::message::HookOutcomeReport {
+        hook_name: "slow".into(),
+        event_kind: "post_connect".into(),
+        record: HookOutcomeRecord::new(HookOutcomeLabel::TimedOut, None, b"", b""),
+    }));
+    let toast = app.toast.as_ref().unwrap();
+    assert!(matches!(
+        toast.toast_type,
+        crate::state::ToastType::Warning
+    ));
+    assert!(toast.message.contains("timed out"));
+}
+
 #[test]
 fn hook_config_errors_handler_is_a_noop_until_u5() {
     let mut app = test_app();
