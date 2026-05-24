@@ -1,0 +1,77 @@
+[package]
+name = "vortix"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Terminal UI for WireGuard and OpenVPN with real-time telemetry and leak guarding"
+keywords = ["vpn", "tui", "wireguard", "openvpn", "terminal"]
+categories = ["command-line-utilities", "network-programming"]
+homepage = "https://docs.rs/vortix"
+documentation = "https://docs.rs/vortix"
+readme = "../../README.md"
+exclude = [
+    "../../assets/*",
+    "../../.github/*",
+    "../../target/*",
+    "../../scripts/*",
+    "../../*.tar.gz",
+    "../../cliff.toml",
+    "../../deny.toml",
+    "../../dist-workspace.toml",
+    "../../release-plz.toml",
+    "../../rustfmt.toml"
+]
+
+[[bin]]
+name = "vortix"
+path = "src/main.rs"
+
+[dependencies]
+# TUI Framework
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+
+# Date/time formatting (local-offset needed for OffsetDateTime::now_local)
+time = { workspace = true }
+
+# Error Handling
+color-eyre = { workspace = true }
+
+# CLI Argument Parsing
+clap = { workspace = true }
+clap_complete = { workspace = true }
+
+# Serialization (for state persistence and API parsing)
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Configuration
+toml = { workspace = true }
+dirs = { workspace = true }
+
+# Unicode display-width (for footer hint budgeting with multi-byte glyphs)
+unicode-width = { workspace = true }
+
+# Bug report (browser opening + URL encoding)
+open = { workspace = true }
+urlencoding = { workspace = true }
+
+# Per-OS platform adapters (empty stubs in plan 001; populated by plan 003).
+[target.'cfg(target_os = "macos")'.dependencies]
+vortix-platform-macos = { path = "../vortix-platform-macos" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+vortix-platform-linux = { path = "../vortix-platform-linux" }
+
+# System calls (for root detection)
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
