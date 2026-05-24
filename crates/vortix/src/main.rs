@@ -114,20 +114,35 @@ fn main() -> Result<()> {
 
     // Plan 006 U4: backfill profile sidecars for `.conf` / `.ovpn` files
     // imported before the sidecar scheme existed. Idempotent — no-ops once
-    // every profile has a `.meta.toml`. Failures are logged + non-fatal.
+    // every profile has a `.meta.toml`. Failures are logged + non-fatal:
+    // startup MUST never abort because of migration trouble.
+    //
+    // VORTIX_SKIP_MIGRATION=<anything> bypasses the startup backfill for
+    // users who need to disable it (see docs/MIGRATION.md).
     let profiles_dir = config_dir.join(constants::PROFILES_DIR_NAME);
-    if let Ok(stats) = vortix_config::migrate_legacy_profiles(&profiles_dir) {
-        if stats.created > 0 {
-            eprintln!(
-                "Migrated {} profile(s) to the new sidecar scheme (plan 006 U4).",
-                stats.created
-            );
-        }
-        if stats.failed > 0 {
-            eprintln!(
-                "Warning: {} profile(s) failed to migrate; existing files untouched.",
-                stats.failed
-            );
+    if std::env::var_os("VORTIX_SKIP_MIGRATION").is_some() {
+        eprintln!("VORTIX_SKIP_MIGRATION set — skipping startup sidecar backfill.");
+    } else {
+        match vortix_config::migrate_legacy_profiles(&profiles_dir) {
+            Ok(stats) => {
+                if stats.created > 0 {
+                    eprintln!(
+                        "Migrated {} profile(s) to the new sidecar scheme.",
+                        stats.created
+                    );
+                }
+                if stats.failed > 0 {
+                    eprintln!(
+                        "Warning: {} profile(s) failed to migrate; existing files untouched. Run `vortix migrate` to retry.",
+                        stats.failed
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "Warning: profile sidecar migration skipped — {e}. Startup continues; run `vortix migrate` once the issue is resolved."
+                );
+            }
         }
     }
 

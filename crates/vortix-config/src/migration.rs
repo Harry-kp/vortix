@@ -265,4 +265,106 @@ mod tests {
         let id_b = stable_profile_id(&b, "corp").unwrap();
         assert_ne!(id_a, id_b);
     }
+
+    // Pathology coverage (plan 007 U3): the rollout depends on
+    // `migrate_legacy_profiles` never panicking on a misshapen profile dir.
+    // These tests pin that behaviour explicitly so a future change can't
+    // silently regress it.
+
+    #[test]
+    fn malformed_sidecar_is_treated_as_already_migrated() {
+        // If a `.meta.toml` already exists next to a `.conf`, the function
+        // must not attempt to overwrite it — even if the existing sidecar
+        // is malformed. The repair path is `vortix migrate`, not implicit
+        // overwrite.
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("corp.conf"), b"[Interface]\n").unwrap();
+        fs::write(tmp.path().join("corp.meta.toml"), b"this is not toml { ]").unwrap();
+
+        let stats = migrate_legacy_profiles(tmp.path()).unwrap();
+        assert_eq!(stats.created, 0);
+        assert_eq!(stats.already_migrated, 1);
+
+        // Original sidecar is untouched.
+        let body = fs::read_to_string(tmp.path().join("corp.meta.toml")).unwrap();
+        assert_eq!(body, "this is not toml { ]");
+    }
+
+    #[test]
+    fn unreadable_profile_dir_returns_err_not_panic() {
+        // A directory path that points at an existing *file* (not a dir)
+        // surfaces an io::Error rather than panicking — main.rs's match
+        // logs it and continues startup.
+        let tmp = tempfile::tempdir().unwrap();
+        let file_masquerading_as_dir = tmp.path().join("not-a-dir");
+        fs::write(&file_masquerading_as_dir, b"just a file").unwrap();
+
+        let result = migrate_legacy_profiles(&file_masquerading_as_dir);
+        // Either Err (read_dir refuses) or Ok with zero stats (path
+        // existed but had no entries). Both are acceptable — the only
+        // unacceptable outcome is a panic, which would happen before this
+        // assertion runs.
+        if let Ok(stats) = result {
+            assert_eq!(stats.created, 0);
+        }
+        // Err is also acceptable — read_dir refuses on most platforms.
+    }
+
+    #[test]
+    fn nested_directories_inside_profiles_dir_are_ignored() {
+        // `read_dir` returns sub-directories too; we skip non-files instead
+        // of recursing or panicking.
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("subdir")).unwrap();
+        fs::write(tmp.path().join("subdir").join("buried.conf"), b"x").unwrap();
+        fs::write(tmp.path().join("surface.conf"), b"[Interface]\n").unwrap();
+
+        let stats = migrate_legacy_profiles(tmp.path()).unwrap();
+        // Only the top-level surface.conf gets a sidecar; subdir is skipped.
+        assert_eq!(stats.created, 1);
+        assert!(tmp.path().join("surface.meta.toml").exists());
+        assert!(!tmp.path().join("subdir.meta.toml").exists());
+    }
+
+    #[test]
+    fn extensionless_files_are_ignored_not_failed() {
+        // Files with no extension (e.g., README) increment `ignored`, not
+        // `failed`. This keeps the warning log clean for the common case
+        // of users dropping notes into the profiles dir.
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("README"), b"notes").unwrap();
+        fs::write(tmp.path().join("real.conf"), b"[Interface]\n").unwrap();
+
+        let stats = migrate_legacy_profiles(tmp.path()).unwrap();
+        assert_eq!(stats.created, 1);
+        assert_eq!(stats.ignored, 1);
+        assert_eq!(stats.failed, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_profile_dir_marks_failed_without_panic() {
+        // chmod 0500: readable, not writable. read_dir succeeds; the
+        // sidecar write fails. Per-file errors increment `failed` and
+        // continue.
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("corp.conf"), b"[Interface]\n").unwrap();
+
+        let mut perms = fs::metadata(tmp.path()).unwrap().permissions();
+        perms.set_mode(0o500);
+        fs::set_permissions(tmp.path(), perms).unwrap();
+
+        let stats = migrate_legacy_profiles(tmp.path()).unwrap();
+
+        // Restore writable perms so tempdir cleanup succeeds.
+        let mut perms = fs::metadata(tmp.path()).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(tmp.path(), perms).unwrap();
+
+        assert_eq!(stats.created, 0);
+        assert_eq!(stats.failed, 1);
+        // Original .conf is untouched (we never write to it).
+        assert!(tmp.path().join("corp.conf").exists());
+    }
 }
