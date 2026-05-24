@@ -484,6 +484,31 @@ fn format_issue_body(info: &ReportInfo, description: &str) -> String {
     let _ = writeln!(body, "Kill switch: {}", info.killswitch_state);
     let _ = writeln!(body, "```\n");
 
+    // Diagnostic Journal (plan 005 U8) — surface the JSONL session path
+    // and the in-memory tail so triagers can replay locally.
+    if let Some(journal) = vortix_core::journal::global_journal() {
+        let _ = writeln!(body, "## Diagnostic Journal\n");
+        let _ = writeln!(body, "```");
+        if let Some(path) = &journal.session_path {
+            let _ = writeln!(
+                body,
+                "Session file: {}",
+                redact_home_prefix(&path.display().to_string())
+            );
+        } else {
+            let _ = writeln!(body, "Session file: (disk persistence disabled)");
+        }
+        let tail = journal.tail();
+        let _ = writeln!(body, "Recent events: {}", tail.len());
+        for env in tail.iter().rev().take(10).rev() {
+            // Render the event as a compact one-liner for the bug report.
+            let kind = format!("{:?}", env.event);
+            let kind = kind.split('{').next().unwrap_or(&kind).trim();
+            let _ = writeln!(body, "  {kind}");
+        }
+        let _ = writeln!(body, "```\n");
+    }
+
     // Additional Context
     let _ = writeln!(body, "## Additional Context\n");
     let _ = writeln!(
