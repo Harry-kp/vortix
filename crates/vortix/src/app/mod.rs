@@ -9,9 +9,10 @@
 //! profiles, telemetry, kill switch, retry logic). The TUI-specific state
 //! (panels, overlays, animations, scroll positions) remains directly on `App`.
 //!
-//! `App` implements `Deref<Target = VpnEngine>` and `DerefMut`, so all existing
-//! code that accesses VPN fields (`self.profiles`, `app.connection_state`, …)
-//! resolves transparently through the engine.
+//! Plan #005 U5 removed `App: Deref<Target = VpnEngine>`. VPN-state
+//! accesses are now explicit via `self.engine.X` / `app.engine.X`. The
+//! optional `engine_handle` field carries the plan #005 `EngineHandle`
+//! for code paths that want to query/command through the FSM actor.
 //!
 //! ## Module structure
 //! - `input` — Keyboard and mouse event handling
@@ -89,20 +90,10 @@ pub struct App {
     pub terminal_size: (u16, u16),
 }
 
-// Allow transparent access to VpnEngine fields from App.
-// `self.profiles`, `app.connection_state`, etc. all resolve through the engine.
-impl std::ops::Deref for App {
-    type Target = VpnEngine;
-    fn deref(&self) -> &VpnEngine {
-        &self.engine
-    }
-}
-
-impl std::ops::DerefMut for App {
-    fn deref_mut(&mut self) -> &mut VpnEngine {
-        &mut self.engine
-    }
-}
+// Plan 005 U5: the previous `impl Deref<Target = VpnEngine>` was a porous
+// boundary — every TUI/app/CLI callsite could reach into VpnEngine without
+// the indirection being visible at the call site. Removed. Use
+// `app.engine` / `app.engine` explicitly from now on.
 
 impl App {
     /// Create a new App instance with the given configuration.
@@ -147,7 +138,7 @@ impl App {
         };
 
         // Select first profile if available
-        if !app.profiles.is_empty() {
+        if !app.engine.profiles.is_empty() {
             app.profile_list_state.select(Some(0));
         }
 

@@ -65,12 +65,12 @@ pub fn render_dashboard(frame: &mut Frame, app: &App, area: Rect) {
         }
     }
 
-    let disconnect_hint = match &app.connection_state {
+    let disconnect_hint = match &app.engine.connection_state {
         ConnectionState::Connecting { .. } => ("d", "Cancel"),
         ConnectionState::Disconnecting { .. } => ("d", "Force Kill"),
         ConnectionState::Connected { .. } => ("d", "Disconnect"),
         ConnectionState::Disconnected => {
-            if app.last_connected_profile.is_some() {
+            if app.engine.last_connected_profile.is_some() {
                 ("r", "Reconnect")
             } else {
                 ("", "")

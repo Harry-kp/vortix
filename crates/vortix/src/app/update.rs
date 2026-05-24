@@ -37,7 +37,7 @@ impl App {
             }
             Message::OpenConfig => {
                 if let Some(idx) = self.profile_list_state.selected() {
-                    if let Some(profile) = self.profiles.get(idx) {
+                    if let Some(profile) = self.engine.profiles.get(idx) {
                         self.cached_config_content = Some(
                             std::fs::read_to_string(&profile.config_path)
                                 .unwrap_or_else(|e| format!("Error reading config: {e}")),
@@ -62,14 +62,14 @@ impl App {
             }
             Message::ConfirmSwitch { idx } => {
                 self.input_mode = InputMode::Normal;
-                if let Some(profile) = self.profiles.get(idx) {
+                if let Some(profile) = self.engine.profiles.get(idx) {
                     self.log(&format!("ACTION: Switching to '{}'...", profile.name));
                 }
-                if matches!(self.connection_state, ConnectionState::Disconnected) {
-                    self.pending_connect = None;
+                if matches!(self.engine.connection_state, ConnectionState::Disconnected) {
+                    self.engine.pending_connect = None;
                     self.toggle_connection(idx);
                 } else {
-                    self.pending_connect = Some(idx);
+                    self.engine.pending_connect = Some(idx);
                     self.disconnect();
                 }
             }
@@ -78,14 +78,17 @@ impl App {
                 SelectionMove::Prev => self.profile_previous(),
                 SelectionMove::First => self.profile_list_state.select(Some(0)),
                 SelectionMove::Last => {
-                    let last = self.profiles.len().saturating_sub(1);
+                    let last = self.engine.profiles.len().saturating_sub(1);
                     self.profile_list_state.select(Some(last));
                 }
             },
 
             // Connection
             Message::Disconnect => {
-                if matches!(self.connection_state, ConnectionState::Disconnecting { .. }) {
+                if matches!(
+                    self.engine.connection_state,
+                    ConnectionState::Disconnecting { .. }
+                ) {
                     self.force_disconnect();
                 } else {
                     self.disconnect();
@@ -94,12 +97,12 @@ impl App {
             Message::Reconnect => self.reconnect(),
             Message::ConnectSelected => {
                 if let Some(idx) = self.profile_list_state.selected() {
-                    let target = self.profiles.get(idx).map(|p| p.name.clone());
-                    match (&self.connection_state, target) {
+                    let target = self.engine.profiles.get(idx).map(|p| p.name.clone());
+                    match (&self.engine.connection_state, target) {
                         (ConnectionState::Connected { profile, .. }, Some(name))
                             if *profile == name =>
                         {
-                            self.pending_connect = Some(idx);
+                            self.engine.pending_connect = Some(idx);
                             self.disconnect();
                         }
                         (_, Some(_)) => {
@@ -110,7 +113,7 @@ impl App {
                 }
             }
             Message::QuickConnect(idx) => {
-                if idx < self.profiles.len() {
+                if idx < self.engine.profiles.len() {
                     self.profile_list_state.select(Some(idx));
                     self.toggle_connection(idx);
                 }
@@ -205,17 +208,18 @@ impl App {
                 let selected_name = self
                     .profile_list_state
                     .selected()
-                    .and_then(|i| self.profiles.get(i))
+                    .and_then(|i| self.engine.profiles.get(i))
                     .map(|p| p.name.clone());
-                self.sort_order = self.sort_order.next();
+                self.engine.sort_order = self.engine.sort_order.next();
                 self.sort_profiles();
                 if let Some(name) = selected_name {
-                    if let Some(new_idx) = self.profiles.iter().position(|p| p.name == name) {
+                    if let Some(new_idx) = self.engine.profiles.iter().position(|p| p.name == name)
+                    {
                         self.profile_list_state.select(Some(new_idx));
                     }
                 }
                 self.show_toast(
-                    format!("Sorted: {}", self.sort_order.label()),
+                    format!("Sorted: {}", self.engine.sort_order.label()),
                     ToastType::Info,
                 );
             }
@@ -264,7 +268,7 @@ impl App {
 
     fn handle_manage_auth(&mut self) {
         if let Some(idx) = self.profile_list_state.selected() {
-            if let Some(profile) = self.profiles.get(idx) {
+            if let Some(profile) = self.engine.profiles.get(idx) {
                 if !matches!(profile.protocol, Protocol::OpenVPN) {
                     self.show_toast(
                         "Auth credentials only apply to OpenVPN profiles".to_string(),
@@ -299,7 +303,7 @@ impl App {
 
     fn handle_clear_auth(&mut self) {
         if let Some(idx) = self.profile_list_state.selected() {
-            if let Some(profile) = self.profiles.get(idx) {
+            if let Some(profile) = self.engine.profiles.get(idx) {
                 let is_openvpn = matches!(profile.protocol, Protocol::OpenVPN);
                 let has_auth = utils::openvpn_config_needs_auth(&profile.config_path);
                 let name = profile.name.clone();
@@ -333,7 +337,7 @@ impl App {
     fn handle_disconnect_result(&mut self, profile: String, success: bool, error: Option<String>) {
         // Guard: ignore stale results if we're no longer disconnecting this profile.
         let still_disconnecting = matches!(
-            &self.connection_state,
+            &self.engine.connection_state,
             ConnectionState::Disconnecting { profile: p, .. } if *p == profile
         );
         if !still_disconnecting {
@@ -360,7 +364,7 @@ impl App {
     fn handle_connect_result(&mut self, profile: String, success: bool, error: Option<String>) {
         // Ignore stale results if we're no longer in Connecting state for this profile.
         let still_connecting = matches!(
-            &self.connection_state,
+            &self.engine.connection_state,
             ConnectionState::Connecting { profile: p, .. } if *p == profile
         );
         if !still_connecting {
@@ -369,37 +373,38 @@ impl App {
             ));
         } else if success {
             // Reset retry and auto-reconnect state on success
-            self.retry_count = 0;
-            self.retry_profile_idx = None;
-            self.auto_reconnect_profile = None;
+            self.engine.retry_count = 0;
+            self.engine.retry_profile_idx = None;
+            self.engine.auto_reconnect_profile = None;
 
             let location = self
+                .engine
                 .profiles
                 .iter()
                 .find(|p| p.name == profile)
                 .map_or_else(|| "Unknown".to_string(), |p| p.location.clone());
 
             let now = Instant::now();
-            self.connection_state = ConnectionState::Connected {
+            self.engine.connection_state = ConnectionState::Connected {
                 profile: profile.clone(),
                 server_location: location,
                 since: now,
                 latency_ms: 0,
                 details: Box::new(DetailedConnectionInfo::default()),
             };
-            self.session_start = Some(now);
+            self.engine.session_start = Some(now);
 
-            if let Some(p) = self.profiles.iter_mut().find(|p| p.name == profile) {
+            if let Some(p) = self.engine.profiles.iter_mut().find(|p| p.name == profile) {
                 p.last_used = Some(std::time::SystemTime::now());
             }
             self.save_metadata();
 
-            self.last_connected_profile = Some(profile.clone());
+            self.engine.last_connected_profile = Some(profile.clone());
             self.log(&format!("STATUS: Connected to '{profile}'"));
             self.refresh_telemetry();
 
             // KILL SWITCH: Arm when VPN connects
-            if self.killswitch_mode != crate::state::KillSwitchMode::Off {
+            if self.engine.killswitch_mode != crate::state::KillSwitchMode::Off {
                 self.sync_killswitch();
                 self.log("SEC: Kill switch armed");
             }
@@ -409,21 +414,23 @@ impl App {
             self.cleanup_vpn_resources(&profile);
 
             // Attempt retry with exponential backoff if configured
-            let max_retries = self.config.connect_max_retries;
-            let profile_idx = self.profiles.iter().position(|p| p.name == profile);
+            let max_retries = self.engine.config.connect_max_retries;
+            let profile_idx = self.engine.profiles.iter().position(|p| p.name == profile);
 
             if let Some(idx) = profile_idx.filter(|_| {
-                max_retries > 0 && self.retry_count < max_retries && self.pending_connect.is_none()
+                max_retries > 0
+                    && self.engine.retry_count < max_retries
+                    && self.engine.pending_connect.is_none()
             }) {
-                self.retry_count += 1;
-                let attempt = self.retry_count;
-                self.retry_profile_idx = Some(idx);
+                self.engine.retry_count += 1;
+                let attempt = self.engine.retry_count;
+                self.engine.retry_profile_idx = Some(idx);
 
-                let base = self.config.connect_retry_base_delay_secs;
+                let base = self.engine.config.connect_retry_base_delay_secs;
                 let shift = (attempt - 1).min(63);
                 let delay_secs = base
                     .saturating_mul(1u64 << shift)
-                    .min(self.config.connect_retry_max_delay_secs);
+                    .min(self.engine.config.connect_retry_max_delay_secs);
 
                 self.log(&format!(
                     "RETRY: Attempt {attempt}/{max_retries} for '{profile}' in {delay_secs}s..."
@@ -433,22 +440,22 @@ impl App {
                     ToastType::Warning,
                 );
 
-                self.connection_state = ConnectionState::Disconnected;
-                self.session_start = None;
+                self.engine.connection_state = ConnectionState::Disconnected;
+                self.engine.session_start = None;
 
-                let cmd_tx = self.cmd_tx.clone();
+                let cmd_tx = self.engine.cmd_tx.clone();
                 std::thread::spawn(move || {
                     std::thread::sleep(std::time::Duration::from_secs(delay_secs));
                     let _ = cmd_tx.send(crate::message::Message::RetryConnect { idx, attempt });
                 });
             } else {
                 // No retry: final failure
-                self.retry_count = 0;
-                self.retry_profile_idx = None;
-                self.connection_state = ConnectionState::Disconnected;
-                self.session_start = None;
+                self.engine.retry_count = 0;
+                self.engine.retry_profile_idx = None;
+                self.engine.connection_state = ConnectionState::Disconnected;
+                self.engine.session_start = None;
                 self.show_toast(format!("Failed to connect: {err_msg}"), ToastType::Error);
-                self.pending_connect = None;
+                self.engine.pending_connect = None;
             }
         }
     }
@@ -466,6 +473,7 @@ impl App {
 
         // Get profile name for file path
         let profile_name = self
+            .engine
             .profiles
             .get(idx)
             .map(|p| p.name.clone())
@@ -507,7 +515,7 @@ impl App {
         use crate::state::KillSwitchMode;
 
         // Cycle to next mode
-        self.killswitch_mode = self.killswitch_mode.next();
+        self.engine.killswitch_mode = self.engine.killswitch_mode.next();
 
         // Sync state and firewall (may refuse Blocking if not root)
         self.sync_killswitch();
@@ -515,12 +523,12 @@ impl App {
         // If sync_killswitch refused Blocking because we're not root (only
         // possible in AlwaysOn mode when disconnected), preserve the root
         // warning toast instead of overwriting it with the mode toast.
-        let blocking_refused = matches!(self.killswitch_mode, KillSwitchMode::AlwaysOn)
-            && !self.is_root
-            && !self.killswitch_state.is_blocking();
+        let blocking_refused = matches!(self.engine.killswitch_mode, KillSwitchMode::AlwaysOn)
+            && !self.engine.is_root
+            && !self.engine.killswitch_state.is_blocking();
 
         if !blocking_refused {
-            match self.killswitch_mode {
+            match self.engine.killswitch_mode {
                 KillSwitchMode::Off => {
                     self.log("SEC: Kill switch DISABLED");
                     self.show_toast("Kill Switch OFF".to_string(), ToastType::Info);
@@ -544,8 +552,8 @@ impl App {
 
         // Save state for recovery
         let _ = crate::core::killswitch::save_state(
-            self.killswitch_mode,
-            self.killswitch_state,
+            self.engine.killswitch_mode,
+            self.engine.killswitch_state,
             None,
             None,
         );
@@ -560,8 +568,8 @@ impl App {
         //
         // Kill switch state is saved so the next launch can recover it.
         let _ = crate::core::killswitch::save_state(
-            self.killswitch_mode,
-            self.killswitch_state,
+            self.engine.killswitch_mode,
+            self.engine.killswitch_state,
             None,
             None,
         );
@@ -571,80 +579,86 @@ impl App {
     fn handle_telemetry(&mut self, update: TelemetryUpdate) {
         match update {
             TelemetryUpdate::PublicIp(ip) => {
-                let is_connected =
-                    matches!(self.connection_state, ConnectionState::Connected { .. });
-                let old_ip = self.public_ip.clone();
+                let is_connected = matches!(
+                    self.engine.connection_state,
+                    ConnectionState::Connected { .. }
+                );
+                let old_ip = self.engine.public_ip.clone();
 
                 // Store as real_ip when disconnected (for security comparison)
-                if matches!(self.connection_state, ConnectionState::Disconnected) {
-                    if self.real_ip.is_none() {
+                if matches!(self.engine.connection_state, ConnectionState::Disconnected) {
+                    if self.engine.real_ip.is_none() {
                         self.log(&format!("NET: Real IP detected: {ip}"));
                     }
-                    self.real_ip = Some(ip.clone());
-                } else if self.public_ip != ip && self.public_ip != constants::MSG_FETCHING {
-                    self.ip_unchanged_warned = false;
+                    self.engine.real_ip = Some(ip.clone());
+                } else if self.engine.public_ip != ip
+                    && self.engine.public_ip != constants::MSG_FETCHING
+                {
+                    self.engine.ip_unchanged_warned = false;
                     self.log(&format!("NET: Public IP changed {old_ip} -> {ip}"));
                 } else if is_connected
-                    && self.public_ip == ip
-                    && self.public_ip != constants::MSG_FETCHING
-                    && !self.ip_unchanged_warned
+                    && self.engine.public_ip == ip
+                    && self.engine.public_ip != constants::MSG_FETCHING
+                    && !self.engine.ip_unchanged_warned
                 {
-                    self.ip_unchanged_warned = true;
+                    self.engine.ip_unchanged_warned = true;
                     self.log(&format!(
                         "WARN: Public IP unchanged ({ip}) while connected — possible leak or split-tunnel"
                     ));
-                    if let Some(ref real) = self.real_ip {
+                    if let Some(ref real) = self.engine.real_ip {
                         if real == &ip {
                             self.log(&format!("ERR: IP leak detected — current IP ({ip}) matches pre-VPN IP ({real})"));
                         }
                     }
                 }
-                self.public_ip = ip;
-                self.last_security_check = Some(Instant::now());
+                self.engine.public_ip = ip;
+                self.engine.last_security_check = Some(Instant::now());
             }
-            TelemetryUpdate::Latency(ms) => self.latency_ms = ms,
+            TelemetryUpdate::Latency(ms) => self.engine.latency_ms = ms,
             TelemetryUpdate::PacketLoss(loss) => {
-                self.packet_loss = loss;
+                self.engine.packet_loss = loss;
                 self.log(&format!("NET: Packet loss: {loss:.1}%"));
             }
             TelemetryUpdate::Jitter(jitter) => {
-                self.jitter_ms = jitter;
+                self.engine.jitter_ms = jitter;
                 self.log(&format!("NET: Jitter: {jitter}ms"));
             }
             TelemetryUpdate::Location(loc) => {
-                if self.location != loc && self.location != constants::MSG_DETECTING {
+                if self.engine.location != loc && self.engine.location != constants::MSG_DETECTING {
                     self.log(&format!("NET: Location: {loc}"));
                 }
-                self.location = loc;
+                self.engine.location = loc;
             }
             TelemetryUpdate::Isp(isp) => {
-                if self.isp != isp && self.isp != constants::MSG_DETECTING {
+                if self.engine.isp != isp && self.engine.isp != constants::MSG_DETECTING {
                     self.log(&format!("NET: Exit node: {isp}"));
                 }
-                self.isp = isp;
+                self.engine.isp = isp;
             }
             TelemetryUpdate::Dns(dns) => {
-                if matches!(self.connection_state, ConnectionState::Disconnected) {
-                    if self.real_dns.is_none() {
+                if matches!(self.engine.connection_state, ConnectionState::Disconnected) {
+                    if self.engine.real_dns.is_none() {
                         self.log(&format!("NET: Pre-VPN DNS: {dns}"));
                     }
-                    self.real_dns = Some(dns.clone());
-                } else if self.dns_server != dns && self.dns_server != constants::MSG_NO_DATA {
+                    self.engine.real_dns = Some(dns.clone());
+                } else if self.engine.dns_server != dns
+                    && self.engine.dns_server != constants::MSG_NO_DATA
+                {
                     self.log(&format!("SEC: DNS server: {dns}"));
                 }
-                self.dns_server = dns;
-                self.last_security_check = Some(Instant::now());
+                self.engine.dns_server = dns;
+                self.engine.last_security_check = Some(Instant::now());
             }
             TelemetryUpdate::Ipv6Leak(leak) => {
-                if self.ipv6_leak != leak {
+                if self.engine.ipv6_leak != leak {
                     if leak {
                         self.log("WARN: IPv6 leak detected — traffic may bypass VPN tunnel");
                     } else {
                         self.log("SEC: IPv6 secure (blocked)");
                     }
                 }
-                self.ipv6_leak = leak;
-                self.last_security_check = Some(Instant::now());
+                self.engine.ipv6_leak = leak;
+                self.engine.last_security_check = Some(Instant::now());
             }
             TelemetryUpdate::Log(level, msg) => {
                 logger::log(level, "TELEMETRY", msg);
@@ -655,23 +669,23 @@ impl App {
     #[allow(clippy::too_many_lines)]
     fn handle_sync_system_state(&mut self, active: Vec<ActiveSession>) {
         // Guard: While Disconnecting, the scanner must NEVER override to Connected.
-        if let ConnectionState::Disconnecting { started, profile } = &self.connection_state {
+        if let ConnectionState::Disconnecting { started, profile } = &self.engine.connection_state {
             let elapsed = started.elapsed().as_secs();
             let interface_gone = !active.iter().any(|s| &s.name == profile);
 
             if interface_gone {
                 let profile_name = profile.clone();
                 self.complete_disconnect(&profile_name);
-            } else if elapsed >= self.config.disconnect_timeout {
+            } else if elapsed >= self.engine.config.disconnect_timeout {
                 let profile_name = profile.clone();
                 self.log(&format!(
                     "WARN: Disconnect timed out for '{profile_name}' after {}s, forcing cleanup",
-                    self.config.disconnect_timeout
+                    self.engine.config.disconnect_timeout
                 ));
                 self.cleanup_vpn_resources(&profile_name);
-                self.pending_connect = None;
-                self.connection_state = ConnectionState::Disconnected;
-                self.session_start = None;
+                self.engine.pending_connect = None;
+                self.engine.connection_state = ConnectionState::Disconnected;
+                self.engine.session_start = None;
                 self.show_toast(
                     "Disconnect timed out — forced cleanup".to_string(),
                     ToastType::Warning,
@@ -682,11 +696,12 @@ impl App {
         }
 
         // While Connecting, the scanner can only PROMOTE to Connected
-        if let ConnectionState::Connecting { started, profile } = &self.connection_state {
+        if let ConnectionState::Connecting { started, profile } = &self.engine.connection_state {
             let profile_name = profile.clone();
             let elapsed = started.elapsed().as_secs();
             if let Some(session) = active.iter().find(|s| s.name == profile_name) {
                 let location = self
+                    .engine
                     .profiles
                     .iter()
                     .find(|p| p.name == profile_name)
@@ -702,7 +717,7 @@ impl App {
                     })
                     .unwrap_or_else(Instant::now);
 
-                self.connection_state = ConnectionState::Connected {
+                self.engine.connection_state = ConnectionState::Connected {
                     profile: profile_name.clone(),
                     server_location: location,
                     since: start_time,
@@ -725,16 +740,21 @@ impl App {
                     "STATUS: Connection established to '{profile_name}'"
                 ));
 
-                if self.killswitch_mode != crate::state::KillSwitchMode::Off {
+                if self.engine.killswitch_mode != crate::state::KillSwitchMode::Off {
                     self.sync_killswitch();
                     self.log("SEC: Kill switch armed");
                 }
 
-                if let Some(profile) = self.profiles.iter_mut().find(|p| p.name == profile_name) {
+                if let Some(profile) = self
+                    .engine
+                    .profiles
+                    .iter_mut()
+                    .find(|p| p.name == profile_name)
+                {
                     profile.last_used = Some(std::time::SystemTime::now());
                 }
                 self.save_metadata();
-                self.session_start = Some(start_time);
+                self.engine.session_start = Some(start_time);
             } else if elapsed > 0 && elapsed % constants::SCANNER_LOG_INTERVAL_SECS == 0 {
                 self.log(&format!(
                     "NET: Scanner: no tunnel interface for '{profile_name}' yet ({elapsed}s elapsed, \
@@ -788,6 +808,7 @@ impl App {
             }
 
             let location = self
+                .engine
                 .profiles
                 .iter()
                 .find(|p| p.name == active_name)
@@ -802,10 +823,10 @@ impl App {
                     Instant::now()
                 }
             } else {
-                self.session_start.unwrap_or(Instant::now())
+                self.engine.session_start.unwrap_or(Instant::now())
             };
 
-            self.connection_state = ConnectionState::Connected {
+            self.engine.connection_state = ConnectionState::Connected {
                 profile: active_name.clone(),
                 server_location: location,
                 since: start_time,
@@ -824,7 +845,7 @@ impl App {
                 }),
             };
 
-            if self.session_start.is_none() {
+            if self.engine.session_start.is_none() {
                 self.log(&format!(
                     "STATUS: Connection established to '{active_name}'"
                 ));
@@ -833,9 +854,9 @@ impl App {
                 }
                 self.log("INFO: Waiting for telemetry...");
             }
-            self.session_start = Some(start_time);
-        } else if !matches!(self.connection_state, ConnectionState::Disconnected) {
-            let drop_info = match &self.connection_state {
+            self.engine.session_start = Some(start_time);
+        } else if !matches!(self.engine.connection_state, ConnectionState::Disconnected) {
+            let drop_info = match &self.engine.connection_state {
                 ConnectionState::Connected {
                     profile, details, ..
                 } => Some((
@@ -851,18 +872,26 @@ impl App {
             };
 
             if let Some((profile_name, _, _)) = drop_info {
-                let was_connected =
-                    matches!(self.connection_state, ConnectionState::Connected { .. });
+                let was_connected = matches!(
+                    self.engine.connection_state,
+                    ConnectionState::Connected { .. }
+                );
 
                 if was_connected {
-                    self.connection_drops += 1;
+                    self.engine.connection_drops += 1;
                     self.log(&format!(
                         "WARN: Connection dropped from '{}' (#{} this session)",
-                        profile_name, self.connection_drops
+                        profile_name, self.engine.connection_drops
                     ));
-                } else if matches!(self.connection_state, ConnectionState::Disconnecting { .. }) {
+                } else if matches!(
+                    self.engine.connection_state,
+                    ConnectionState::Disconnecting { .. }
+                ) {
                     self.log(&format!("STATUS: Disconnected from '{profile_name}'"));
-                } else if matches!(self.connection_state, ConnectionState::Connecting { .. }) {
+                } else if matches!(
+                    self.engine.connection_state,
+                    ConnectionState::Connecting { .. }
+                ) {
                     self.log(&format!(
                         "WARN: Connection to '{profile_name}' failed or was cancelled"
                     ));
@@ -872,15 +901,15 @@ impl App {
 
                 // Transition to Disconnected BEFORE syncing killswitch so that
                 // sync_killswitch sees the correct connection state.
-                self.connection_state = ConnectionState::Disconnected;
-                self.session_start = None;
+                self.engine.connection_state = ConnectionState::Disconnected;
+                self.engine.session_start = None;
 
                 // KILL SWITCH: Activate on unexpected VPN drop
                 if was_connected
-                    && self.killswitch_mode != crate::state::KillSwitchMode::Off
-                    && self.killswitch_state == crate::state::KillSwitchState::Armed
+                    && self.engine.killswitch_mode != crate::state::KillSwitchMode::Off
+                    && self.engine.killswitch_state == crate::state::KillSwitchState::Armed
                 {
-                    self.killswitch_state = crate::state::KillSwitchState::Blocking;
+                    self.engine.killswitch_state = crate::state::KillSwitchState::Blocking;
                     self.sync_killswitch();
                     self.log("SEC: Kill switch ACTIVATED - blocking traffic");
                     self.show_toast(
@@ -890,11 +919,16 @@ impl App {
                 }
 
                 // AUTO-RECONNECT: Queue reconnection for unexpected drops
-                if was_connected && self.config.auto_reconnect {
-                    if let Some(idx) = self.profiles.iter().position(|p| p.name == profile_name) {
-                        self.auto_reconnect_profile = Some(idx);
-                        let delay = self.config.auto_reconnect_delay_secs;
-                        let max = self.config.connect_max_retries;
+                if was_connected && self.engine.config.auto_reconnect {
+                    if let Some(idx) = self
+                        .engine
+                        .profiles
+                        .iter()
+                        .position(|p| p.name == profile_name)
+                    {
+                        self.engine.auto_reconnect_profile = Some(idx);
+                        let delay = self.engine.config.auto_reconnect_delay_secs;
+                        let max = self.engine.config.connect_max_retries;
                         self.log(&format!(
                             "NET: Auto-reconnect scheduled for '{profile_name}' in {delay}s (max {max} retries)"
                         ));
@@ -903,10 +937,10 @@ impl App {
                             ToastType::Warning,
                         );
 
-                        self.retry_count = 1;
-                        self.retry_profile_idx = Some(idx);
+                        self.engine.retry_count = 1;
+                        self.engine.retry_profile_idx = Some(idx);
 
-                        let cmd_tx = self.cmd_tx.clone();
+                        let cmd_tx = self.engine.cmd_tx.clone();
                         std::thread::spawn(move || {
                             std::thread::sleep(std::time::Duration::from_secs(delay));
                             let _ = cmd_tx
@@ -915,44 +949,44 @@ impl App {
                     }
                 }
             } else {
-                self.connection_state = ConnectionState::Disconnected;
-                self.session_start = None;
+                self.engine.connection_state = ConnectionState::Disconnected;
+                self.engine.session_start = None;
             }
         }
     }
 
     fn handle_retry_connect(&mut self, idx: usize, attempt: u32) {
         // Only proceed if retry state is still consistent
-        if self.retry_profile_idx != Some(idx) || self.retry_count != attempt {
+        if self.engine.retry_profile_idx != Some(idx) || self.engine.retry_count != attempt {
             self.log(&format!(
                 "INFO: Ignoring stale RetryConnect (attempt {attempt}, idx {idx})"
             ));
             return;
         }
         // Don't retry if user started a different action
-        if !matches!(self.connection_state, ConnectionState::Disconnected) {
+        if !matches!(self.engine.connection_state, ConnectionState::Disconnected) {
             self.log("INFO: Skipping retry — connection state changed");
-            self.retry_count = 0;
-            self.retry_profile_idx = None;
+            self.engine.retry_count = 0;
+            self.engine.retry_profile_idx = None;
             return;
         }
-        if let Some(profile) = self.profiles.get(idx) {
-            let max = self.config.connect_max_retries;
+        if let Some(profile) = self.engine.profiles.get(idx) {
+            let max = self.engine.config.connect_max_retries;
             self.log(&format!(
                 "RETRY: Attempting reconnect to '{}' ({attempt}/{max})",
                 profile.name
             ));
             self.connect_profile(idx);
         } else {
-            self.retry_count = 0;
-            self.retry_profile_idx = None;
+            self.engine.retry_count = 0;
+            self.engine.retry_profile_idx = None;
         }
     }
 
     fn handle_network_changed(&mut self) {
         self.log("NET: Network change detected (gateway changed)");
 
-        match &self.connection_state {
+        match &self.engine.connection_state {
             ConnectionState::Connected { profile, .. } => {
                 self.log(&format!(
                     "NET: VPN '{profile}' still connected — monitoring for disruption"
@@ -960,10 +994,10 @@ impl App {
             }
             ConnectionState::Disconnected => {
                 // If there's a pending auto-reconnect, trigger it now
-                if let Some(idx) = self.auto_reconnect_profile {
-                    if idx < self.profiles.len() && self.config.auto_reconnect {
-                        let name = self.profiles[idx].name.clone();
-                        let delay = self.config.auto_reconnect_delay_secs;
+                if let Some(idx) = self.engine.auto_reconnect_profile {
+                    if idx < self.engine.profiles.len() && self.engine.config.auto_reconnect {
+                        let name = self.engine.profiles[idx].name.clone();
+                        let delay = self.engine.config.auto_reconnect_delay_secs;
                         self.log(&format!(
                             "NET: Network available — auto-reconnecting to '{name}' in {delay}s"
                         ));
@@ -972,15 +1006,15 @@ impl App {
                             ToastType::Info,
                         );
 
-                        let cmd_tx = self.cmd_tx.clone();
+                        let cmd_tx = self.engine.cmd_tx.clone();
                         std::thread::spawn(move || {
                             std::thread::sleep(std::time::Duration::from_secs(delay));
                             let _ = cmd_tx
                                 .send(crate::message::Message::RetryConnect { idx, attempt: 1 });
                         });
 
-                        self.retry_count = 1;
-                        self.retry_profile_idx = Some(idx);
+                        self.engine.retry_count = 1;
+                        self.engine.retry_profile_idx = Some(idx);
                     }
                 }
             }
@@ -990,11 +1024,11 @@ impl App {
 
     fn handle_connection_timeout(&mut self, profile_name: String) {
         self.cleanup_vpn_resources(&profile_name);
-        self.connection_state = ConnectionState::Disconnected;
-        self.session_start = None;
-        self.pending_connect = None;
-        self.retry_count = 0;
-        self.retry_profile_idx = None;
+        self.engine.connection_state = ConnectionState::Disconnected;
+        self.engine.session_start = None;
+        self.engine.pending_connect = None;
+        self.engine.retry_count = 0;
+        self.engine.retry_profile_idx = None;
         self.log(&format!("ERR: Connection timed out for '{profile_name}'"));
         self.show_toast(
             format!("Connection timed out for '{profile_name}'"),
@@ -1006,8 +1040,10 @@ impl App {
 
     fn handle_tick(&mut self) {
         // 1. Connection Timeout Safeguard
-        if let ConnectionState::Connecting { started, profile } = &self.connection_state {
-            if started.elapsed() > std::time::Duration::from_secs(self.config.connect_timeout) {
+        if let ConnectionState::Connecting { started, profile } = &self.engine.connection_state {
+            if started.elapsed()
+                > std::time::Duration::from_secs(self.engine.config.connect_timeout)
+            {
                 let p = profile.clone();
                 self.handle_message(Message::ConnectionTimeout(p));
             }
@@ -1044,8 +1080,8 @@ impl App {
 
     fn handle_open_rename(&mut self) {
         if let Some(idx) = self.profile_list_state.selected() {
-            if let Some(profile) = self.profiles.get(idx) {
-                let active_profile = match &self.connection_state {
+            if let Some(profile) = self.engine.profiles.get(idx) {
+                let active_profile = match &self.engine.connection_state {
                     ConnectionState::Connected { profile: p, .. }
                     | ConnectionState::Connecting { profile: p, .. }
                     | ConnectionState::Disconnecting { profile: p, .. } => Some(p.as_str()),

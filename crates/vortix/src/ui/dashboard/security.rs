@@ -31,8 +31,8 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(block, area);
 
     // Security checks
-    let is_connected = !matches!(app.connection_state, ConnectionState::Disconnected);
-    let ipv6_leaking = app.ipv6_leak;
+    let is_connected = !matches!(app.engine.connection_state, ConnectionState::Disconnected);
+    let ipv6_leaking = app.engine.ipv6_leak;
 
     if !is_connected {
         // Disconnected state - show warning
@@ -60,20 +60,20 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
 
     // DNS leak: if current DNS matches the pre-VPN DNS, queries may not be tunneled.
     // A changed DNS (even private like 10.8.0.1) means the VPN pushed its own resolver.
-    let dns_leaking = match &app.real_dns {
-        Some(real_dns) => &app.dns_server == real_dns,
+    let dns_leaking = match &app.engine.real_dns {
+        Some(real_dns) => &app.engine.dns_server == real_dns,
         None => false, // can't determine yet, assume OK
     };
 
     // Check if IP is actually masked (different from real IP captured when disconnected)
-    let ip_status = match &app.real_ip {
+    let ip_status = match &app.engine.real_ip {
         Some(real)
-            if !app.public_ip.is_empty()
-                && app.public_ip != constants::MSG_DETECTING
-                && app.public_ip != constants::MSG_FETCHING
-                && !app.public_ip.starts_with("Error") =>
+            if !app.engine.public_ip.is_empty()
+                && app.engine.public_ip != constants::MSG_DETECTING
+                && app.engine.public_ip != constants::MSG_FETCHING
+                && !app.engine.public_ip.starts_with("Error") =>
         {
-            if &app.public_ip == real {
+            if &app.engine.public_ip == real {
                 (false, true, Some(real.clone())) // LEAK! same IP as real
             } else {
                 (true, false, Some(real.clone())) // masked (different IP)
@@ -84,7 +84,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     let (ip_masked, ip_leaking, real_ip_opt) = ip_status;
 
     // Get encryption info from connection details
-    let encryption_info = match &app.connection_state {
+    let encryption_info = match &app.engine.connection_state {
         ConnectionState::Connected { details, .. } => {
             if details.public_key == "OpenVPN" || details.public_key.is_empty() {
                 // OpenVPN
@@ -135,7 +135,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
             },
             Span::styled("IP Masked  : ", Style::default().fg(theme::TEXT_SECONDARY)),
             Span::styled(
-                utils::truncate(&app.public_ip, max_val),
+                utils::truncate(&app.engine.public_ip, max_val),
                 Style::default().fg(if ip_masked {
                     theme::SUCCESS
                 } else {
@@ -161,11 +161,12 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     audit.push(Line::from(""));
 
     // DNS Check with provider name if possible
-    let dns_provider = if app.dns_server.contains("1.1.1.1") {
+    let dns_provider = if app.engine.dns_server.contains("1.1.1.1") {
         " (Cloudflare)"
-    } else if app.dns_server.contains("8.8.8.8") || app.dns_server.contains("8.8.4.4") {
+    } else if app.engine.dns_server.contains("8.8.8.8") || app.engine.dns_server.contains("8.8.4.4")
+    {
         " (Google)"
-    } else if app.dns_server.contains("9.9.9.9") {
+    } else if app.engine.dns_server.contains("9.9.9.9") {
         " (Quad9)"
     } else {
         ""
@@ -179,7 +180,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
         },
         Span::styled("DNS Secure : ", Style::default().fg(theme::TEXT_SECONDARY)),
         Span::styled(
-            utils::truncate(&app.dns_server, max_val),
+            utils::truncate(&app.engine.dns_server, max_val),
             Style::default().fg(if dns_leaking {
                 theme::ERROR
             } else {
@@ -193,7 +194,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(dns_provider, Style::default().fg(Color::DarkGray)),
         ]));
     }
-    if let Some(real_dns) = &app.real_dns {
+    if let Some(real_dns) = &app.engine.real_dns {
         if dns_leaking {
             let real_dns_display = format!("{real_dns} (same!)");
             audit.push(Line::from(vec![
@@ -229,19 +230,20 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     audit.push(Line::from(""));
 
     // Kill Switch Status
-    let (ks_icon, ks_text, ks_color) = match (app.killswitch_mode, app.killswitch_state) {
-        (crate::state::KillSwitchMode::Off, _) => (check_fail.clone(), "Off", theme::INACTIVE),
-        (_, crate::state::KillSwitchState::Blocking) => {
-            (check_warn.clone(), "Blocking (Strict)", theme::ERROR)
-        }
-        (crate::state::KillSwitchMode::Auto, crate::state::KillSwitchState::Armed) => {
-            (check_pass.clone(), "Armed (Auto)", theme::SUCCESS)
-        }
-        (crate::state::KillSwitchMode::AlwaysOn, crate::state::KillSwitchState::Armed) => {
-            (check_pass.clone(), "Armed (Strict)", theme::WARNING)
-        }
-        _ => (check_warn.clone(), "Unknown", theme::WARNING),
-    };
+    let (ks_icon, ks_text, ks_color) =
+        match (app.engine.killswitch_mode, app.engine.killswitch_state) {
+            (crate::state::KillSwitchMode::Off, _) => (check_fail.clone(), "Off", theme::INACTIVE),
+            (_, crate::state::KillSwitchState::Blocking) => {
+                (check_warn.clone(), "Blocking (Strict)", theme::ERROR)
+            }
+            (crate::state::KillSwitchMode::Auto, crate::state::KillSwitchState::Armed) => {
+                (check_pass.clone(), "Armed (Auto)", theme::SUCCESS)
+            }
+            (crate::state::KillSwitchMode::AlwaysOn, crate::state::KillSwitchState::Armed) => {
+                (check_pass.clone(), "Armed (Strict)", theme::WARNING)
+            }
+            _ => (check_warn.clone(), "Unknown", theme::WARNING),
+        };
 
     audit.push(Line::from(vec![
         ks_icon,
@@ -258,7 +260,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(encryption_info, Style::default().fg(theme::NORD_YELLOW)),
     ]));
 
-    let last_checked_text = match app.last_security_check {
+    let last_checked_text = match app.engine.last_security_check {
         Some(t) => {
             let secs = t.elapsed().as_secs();
             if secs < 5 {
@@ -318,7 +320,7 @@ fn render_back(frame: &mut Frame, app: &App, area: Rect, border_style: Style) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let is_connected = !matches!(app.connection_state, ConnectionState::Disconnected);
+    let is_connected = !matches!(app.engine.connection_state, ConnectionState::Disconnected);
 
     let text = if is_connected {
         vec![
