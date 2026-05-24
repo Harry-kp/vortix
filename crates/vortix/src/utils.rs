@@ -590,12 +590,12 @@ pub(crate) fn binary_exists(name: &str) -> bool {
 /// `/etc/resolv.conf`, so a simple `which resolvconf` is not enough.
 #[cfg(target_os = "linux")] // xtask:allow-platform-cfg: resolvconf-shim probing is Linux-only DNS plumbing
 pub(crate) fn resolvconf_works() -> bool {
+    use vortix_process::CommandSpec;
     if !binary_exists("resolvconf") {
         return false;
     }
     // Test with `--version` which works with both openresolv and systemd-resolvconf.
     // `resolvconf -l` (list) is not supported by systemd-resolvconf's shim.
-    use vortix_process::CommandSpec;
     vortix_process::run_to_output(CommandSpec::oneshot("resolvconf", vec!["--version".into()]))
         .is_ok_and(|o| o.status.success())
 }
