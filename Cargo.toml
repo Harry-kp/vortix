@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+# Make root-level `cargo run`/`build`/`test` target the user-facing
+# binary by default. The internal crates still get built (transitively)
+# but tests + clippy only run against vortix unless `--workspace` is
+# passed explicitly. CI is responsible for `--workspace` to retain
+# full coverage; developers get ergonomic root commands.
+default-members = ["crates/vortix"]
 
 [workspace.package]
 version = "0.2.2"

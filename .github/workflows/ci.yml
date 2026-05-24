@@ -23,7 +23,7 @@ jobs:
         with:
           toolchain: "1.91.0"
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check
+      - run: cargo check --workspace --all-targets
 
   check-fedora:
     name: Check (fedora-41)
@@ -38,7 +38,7 @@ jobs:
         with:
           toolchain: "1.91.0"
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check
+      - run: cargo check --workspace --all-targets
 
   fmt:
     name: Format
@@ -65,7 +65,7 @@ jobs:
           toolchain: "1.91.0"
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets -- -D warnings
 
   clippy-fedora:
     name: Clippy (fedora-41)
@@ -81,7 +81,7 @@ jobs:
           toolchain: "1.91.0"
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
     name: Test (${{ matrix.os }})
@@ -102,7 +102,7 @@ jobs:
       - name: Install VPN tools (macOS)
         if: runner.os == 'macOS'
         run: brew install wireguard-tools openvpn
-      - run: cargo test
+      - run: cargo test --workspace
 
   test-fedora:
     name: Test (fedora-41)
@@ -125,7 +125,7 @@ jobs:
           cp -a "$HOME/.cargo" /home/tester/
           cp -a "$HOME/.rustup" /home/tester/
           chown -R tester:tester /home/tester/.cargo /home/tester/.rustup
-      - run: su - tester -c "cd \"$GITHUB_WORKSPACE\" && source \"\$HOME/.cargo/env\" && cargo test"
+      - run: su - tester -c "cd \"$GITHUB_WORKSPACE\" && source \"\$HOME/.cargo/env\" && cargo test --workspace"
 
   docs:
     name: Docs (${{ matrix.os }})
@@ -140,7 +140,7 @@ jobs:
         with:
           toolchain: "1.91.0"
       - uses: Swatinem/rust-cache@v2
-      - run: cargo doc --no-deps
+      - run: cargo doc --workspace --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
 
@@ -157,7 +157,7 @@ jobs:
         with:
           toolchain: "1.91.0"
       - uses: Swatinem/rust-cache@v2
-      - run: cargo doc --no-deps
+      - run: cargo doc --workspace --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
 
