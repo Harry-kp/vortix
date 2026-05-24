@@ -17,6 +17,8 @@
 
 Terminal UI for WireGuard and OpenVPN with real-time telemetry and leak guarding.
 
+> **Upgrading from v0.2.x?** Read [`docs/MIGRATION.md`](docs/MIGRATION.md) — it takes two minutes. The upgrade is automatic, your profiles work, and rollback is a single command.
+
 ![Vortix Demo](assets/demo.gif)
 
 ## Why Vortix?
@@ -225,6 +227,40 @@ vortix report                   # Generate bug report
 vortix completions bash >> ~/.bashrc      # Shell completions
 vortix completions zsh > ~/.zfunc/_vortix
 ```
+
+**New in v0.3.0 — observability and config (additive):**
+
+```bash
+# Engine FSM — direct CLI access to the async engine handle
+vortix engine status            # Disconnected / Connecting / Connected{health} / ...
+vortix engine status --json
+vortix engine connect work-vpn  # Equivalent to `up`, drives the new FSM
+vortix engine disconnect
+
+# Event journal — JSONL session log with 30-day / 30-file retention
+vortix journal path             # Current session file
+vortix journal tail 50          # Last 50 events from the in-memory tail
+
+# Settings — figment-layered (defaults -> system -> user -> env)
+vortix settings                 # Print resolved stack as TOML
+vortix settings --json
+
+# Secret store — OS keyring with AES-256-GCM + argon2id fallback
+echo -n 'user:pass' | vortix secrets set creds/work-vpn
+vortix secrets get creds/work-vpn
+vortix secrets delete creds/work-vpn
+
+# Profile sidecar backfill — idempotent; runs implicitly at startup
+vortix migrate                  # Manual trigger
+vortix migrate --json
+
+# Export — stream profile config, optionally inlining stored secrets
+vortix export work-vpn                   # Plain config to stdout
+vortix export work-vpn --inline-secrets  # Append `# vortix-secret:<b64>`
+```
+
+See [`docs/MIGRATION.md`](docs/MIGRATION.md) for the upgrade guide and
+opt-in details on the secret store / journal.
 
 **JSON output for AI agents / scripts:**
 ```bash
