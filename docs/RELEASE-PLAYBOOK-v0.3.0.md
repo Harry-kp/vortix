@@ -301,7 +301,39 @@ git pull origin main
 ```
 
 Open the release-plz PR you held in Stage 2. Confirm it still proposes
-`v0.3.0` and the CHANGELOG diff is unchanged. Merge it.
+`v0.3.0` and the CHANGELOG diff is unchanged.
+
+### 5.1 Inject CHANGELOG preamble before merge (plan 014 U4)
+
+Before merging the release-plz PR, edit its `CHANGELOG.md` diff to add
+a curated preamble between the `## [0.3.0] - YYYY-MM-DD` heading and
+the first `### Features` (or other group) block. The auto-generated
+per-commit bullets read like a developer changelog; a 5–6 line
+preamble frames the scale of the bundle for users skimming the file.
+
+Exact text to paste:
+
+```md
+> **Architectural migration v1.** This release lands six coordinated
+> plans: Cargo workspace split, `CommandRunner` port, capability ports
+> + `Platform` aggregate, `Tunnel` trait + per-protocol crates, Engine
+> FSM + JSONL session journal, and a layered Config / `ProfileStore` /
+> `SecretStore`. Existing CLI commands, profiles, and killswitch state
+> are preserved unchanged. See [v0.3.0 release notes](docs/v0.3.0-RELEASE-NOTES.md)
+> and [upgrade guide](docs/MIGRATION.md).
+```
+
+Commit the edit to the release-plz PR branch (via the GitHub web UI
+or a local `git commit --amend` if you've checked out the branch),
+then merge.
+
+**Note on future release-plz runs:** release-plz preserves manually-
+edited content between its structural markers (`## [version]`,
+`### group`) on subsequent regenerations. If a future run wipes the
+preamble, the canonical text above is the source — re-paste from
+there.
+
+### 5.2 Merge
 
 ```sh
 gh pr merge <release-plz-pr-number> --merge
