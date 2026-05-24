@@ -81,6 +81,7 @@ pub fn handle_command(
             0
         }
         Commands::Secrets { op } => handle_secrets(op, config_dir, mode),
+        Commands::Audit { pid, vpn_only } => handle_audit(*pid, *vpn_only, mode),
         Commands::Completions { shell } => {
             handle_completions(*shell);
             0
@@ -173,6 +174,82 @@ fn handle_secrets(op: &crate::cli::args::SecretsOp, config_dir: &Path, mode: Out
                 }
             }
         }
+    }
+}
+
+/// `vortix audit` — per-process socket snapshot (plan 015 phase C / plan 013).
+#[derive(Serialize)]
+struct AuditData {
+    sockets: Vec<vortix_core::ports::socket_audit::SocketSnapshot>,
+}
+
+fn handle_audit(pid_filter: Option<u32>, vpn_only: bool, mode: OutputMode) -> i32 {
+    let platform = crate::platform::current_platform();
+    let mut snapshots = match platform.socket_audit.snapshot() {
+        Ok(s) => s,
+        Err(vortix_core::ports::socket_audit::SocketAuditError::Unsupported) => {
+            print_error_and_exit(
+                mode,
+                "audit",
+                CliError {
+                    code: "platform_unsupported",
+                    message: "Socket audit is not available on this platform yet".to_string(),
+                    hint: Some(
+                        "Linux + macOS are supported in v0.3.0; Windows support is on the roadmap"
+                            .to_string(),
+                    ),
+                },
+                ExitCode::DependencyMissing,
+            );
+        }
+        Err(e) => {
+            print_error_and_exit(
+                mode,
+                "audit",
+                CliError {
+                    code: "audit_failed",
+                    message: format!("Socket audit failed: {e}"),
+                    hint: None,
+                },
+                ExitCode::GeneralError,
+            );
+        }
+    };
+
+    if let Some(pid) = pid_filter {
+        snapshots.retain(|s| s.pid == pid);
+    }
+    if vpn_only {
+        // Best-effort: filter to sockets whose `interface` field matches the
+        // active WireGuard interface (when resolvable). Today the
+        // Linux /proc impl doesn't populate `interface`, so this filter is a
+        // future-hardening hook — the doc warns users that v0.3.0 may show
+        // an empty result.
+        snapshots.retain(|s| s.interface.is_some());
+    }
+    snapshots.sort_by_key(|s| s.pid);
+
+    match mode {
+        OutputMode::Human => {
+            println!("PID    COMMAND          PROTO   LOCAL                            REMOTE                           IFACE");
+            for s in &snapshots {
+                println!(
+                    "{:<6} {:<16} {:<7} {:<32} {:<32} {}",
+                    s.pid,
+                    s.command,
+                    s.protocol,
+                    s.local,
+                    s.remote.map_or_else(|| "*".to_string(), |r| r.to_string()),
+                    s.interface.as_deref().unwrap_or("-")
+                );
+            }
+            0
+        }
+        OutputMode::Json => {
+            print_success(mode, "audit", &AuditData { sockets: snapshots }, vec![]);
+            0
+        }
+        OutputMode::Quiet => 0,
     }
 }
 
