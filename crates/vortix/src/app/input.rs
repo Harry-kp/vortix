@@ -91,6 +91,12 @@ impl App {
             return;
         }
 
+        // 4b. Global: Handle Hooks overlay key dispatch (plan 017 U6/U7).
+        if self.show_hooks_overlay && self.input_mode == InputMode::Normal {
+            self.handle_hooks_overlay_keys(key);
+            return;
+        }
+
         // Handle based on Input Mode
         let input_mode = self.input_mode.clone();
         match input_mode {
@@ -317,6 +323,49 @@ impl App {
                             }
                         }
                     }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Hooks overlay key handler (plan 017 U6 + U7).
+    ///
+    /// Fires when the `Shift-H` overlay is open and `InputMode` is
+    /// `Normal`. j/k navigate the registered-hooks list; a/e/d/t
+    /// dispatch the CRUD operations; H/Esc closes.
+    fn handle_hooks_overlay_keys(&mut self, key: KeyEvent) {
+        let len = self.registered_hooks.len();
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('H') => {
+                self.handle_message(Message::ToggleHooksOverlay);
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if len > 0 && self.hooks_overlay_selected + 1 < len {
+                    self.hooks_overlay_selected += 1;
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if self.hooks_overlay_selected > 0 {
+                    self.hooks_overlay_selected -= 1;
+                }
+            }
+            KeyCode::Char('a') => self.handle_message(Message::HookAdd),
+            KeyCode::Char('e') | KeyCode::Enter => {
+                if len > 0 {
+                    self.handle_message(Message::HookEdit(self.hooks_overlay_selected));
+                }
+            }
+            KeyCode::Char('d') | KeyCode::Delete => {
+                if len > 0 {
+                    self.handle_message(Message::HookDeleteRequest(
+                        self.hooks_overlay_selected,
+                    ));
+                }
+            }
+            KeyCode::Char('t') => {
+                if len > 0 {
+                    self.handle_message(Message::HookToggle(self.hooks_overlay_selected));
                 }
             }
             _ => {}

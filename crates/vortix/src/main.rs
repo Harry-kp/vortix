@@ -350,6 +350,9 @@ fn run_tui(
                     .ok()
                     .map(|s| s.hooks)
                     .unwrap_or_default();
+                // Plan 017 U6: seed app.registered_hooks so the
+                // overlay can render the list at first open.
+                app.registered_hooks.clone_from(&hooks_config);
                 // Plan 016 U5: collect malformed [[hooks]] entries so
                 // we can toast them rather than only writing to stderr
                 // (which is invisible inside the TUI).

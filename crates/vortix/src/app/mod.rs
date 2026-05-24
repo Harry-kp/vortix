@@ -119,6 +119,10 @@ pub struct App {
     /// registry (in main.rs) stays bound to what it loaded at start —
     /// changes here only take effect on next vortix start.
     pub registered_hooks: Vec<vortix_config::HookConfig>,
+
+    /// Selected row in the registered-hooks list inside the overlay
+    /// (plan 017 U6). j/k move; the U7 keybinds act on this index.
+    pub hooks_overlay_selected: usize,
 }
 
 /// Cap on `recent_hook_events` retention. Roughly two hours of activity
@@ -177,6 +181,7 @@ impl App {
             registered_hooks_count: 0,
             hook_config_errors: Vec::new(),
             registered_hooks: Vec::new(),
+            hooks_overlay_selected: 0,
         };
 
         // Select first profile if available
@@ -336,6 +341,7 @@ impl App {
             registered_hooks_count: 0,
             hook_config_errors: Vec::new(),
             registered_hooks: Vec::new(),
+            hooks_overlay_selected: 0,
         }
     }
 }
