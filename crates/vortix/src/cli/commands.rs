@@ -172,10 +172,9 @@ fn handle_engine(op: &crate::cli::args::EngineOp, config_dir: &Path, mode: Outpu
                     }
                 };
                 match mode {
-                    OutputMode::Json => match serde_json::to_string_pretty(&snap.state) {
-                        Ok(j) => println!("{j}"),
-                        Err(e) => eprintln!("serialize: {e}"),
-                    },
+                    OutputMode::Json => {
+                        print_success(mode, "engine status", &snap.state, vec![]);
+                    }
                     _ => println!("{:?}", snap.state),
                 }
                 0
@@ -366,16 +365,10 @@ fn handle_settings(mode: OutputMode) -> i32 {
     };
 
     match mode {
-        OutputMode::Json => match serde_json::to_string_pretty(&settings) {
-            Ok(j) => {
-                println!("{j}");
-                0
-            }
-            Err(e) => {
-                eprintln!("serialize failed: {e}");
-                1
-            }
-        },
+        OutputMode::Json => {
+            print_success(mode, "settings", &settings, vec![]);
+            0
+        }
         OutputMode::Human | OutputMode::Quiet => match toml::to_string_pretty(&settings) {
             Ok(t) => {
                 print!("{t}");
