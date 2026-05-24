@@ -12,5 +12,13 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
 
+# Plan 005 U3+: journal writer + broadcast + FSM actor.
+tokio = { workspace = true }
+tracing = { workspace = true }
+directories = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [lints]
 workspace = true
