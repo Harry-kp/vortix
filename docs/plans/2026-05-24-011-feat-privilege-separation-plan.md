@@ -2,7 +2,7 @@
 plan_id: 2026-05-24-011
 title: "feat: Privilege separation — root worker + unprivileged frontend"
 type: feat
-status: deferred
+status: completed
 created: 2026-05-24
 target_version: 0.5.0
 target_branch: TBD (post plan 010)
