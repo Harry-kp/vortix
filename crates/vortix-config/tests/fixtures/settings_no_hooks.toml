@@ -1,0 +1,3 @@
+# vortix settings — no hooks configured yet.
+log_level = "debug"
+max_log_entries = 500
