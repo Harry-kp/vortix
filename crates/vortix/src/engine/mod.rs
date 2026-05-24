@@ -316,6 +316,14 @@ impl VpnEngine {
         }
     }
 
+    /// Clone the command sender so external tasks (e.g. the journal
+    /// hook subscriber in `main.rs`, plan 016 U2) can push `Message`s
+    /// into the TUI update loop without touching the private field.
+    #[must_use]
+    pub fn cmd_sender(&self) -> mpsc::Sender<Message> {
+        self.cmd_tx.clone()
+    }
+
     /// Find a profile by name, returning its index.
     #[must_use]
     pub fn find_profile(&self, name: &str) -> Option<usize> {

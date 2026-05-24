@@ -47,6 +47,10 @@ fn test_app() -> App {
         panel_areas: std::collections::HashMap::new(),
         toast: None,
         terminal_size: (80, 24),
+        recent_hook_events: std::collections::VecDeque::with_capacity(50),
+        hook_toast_last_fired: std::collections::HashMap::new(),
+        show_hooks_overlay: false,
+        registered_hooks_count: 0,
     }
 }
 
@@ -2083,6 +2087,45 @@ fn effective_flipped_shows_target_after_midpoint() {
     assert!(app.effective_flipped(&FocusedPanel::Chart));
 }
 
+// Plan 016 U2 — hook fire pipeline.
+
+fn make_report(name: &str) -> crate::message::HookOutcomeReport {
+    use vortix_core::engine::{HookOutcomeLabel, HookOutcomeRecord};
+    crate::message::HookOutcomeReport {
+        hook_name: name.into(),
+        event_kind: "post_connect".into(),
+        record: HookOutcomeRecord::new(HookOutcomeLabel::Success, Some(0), b"", b""),
+    }
+}
+
+#[test]
+fn hook_fired_pushes_into_recent_history_newest_first() {
+    let mut app = test_app();
+    app.handle_message(Message::HookFired(make_report("alpha")));
+    app.handle_message(Message::HookFired(make_report("beta")));
+    assert_eq!(app.recent_hook_events.len(), 2);
+    assert_eq!(app.recent_hook_events[0].hook_name, "beta");
+    assert_eq!(app.recent_hook_events[1].hook_name, "alpha");
+}
+
+#[test]
+fn hook_fired_history_is_fifo_capped_at_cap() {
+    let mut app = test_app();
+    for i in 0..60 {
+        app.handle_message(Message::HookFired(make_report(&format!("h{i}"))));
+    }
+    assert_eq!(app.recent_hook_events.len(), super::HOOK_HISTORY_CAP);
+    assert_eq!(app.recent_hook_events.front().unwrap().hook_name, "h59");
+    assert_eq!(app.recent_hook_events.back().unwrap().hook_name, "h10");
+}
+
+#[test]
+fn hook_config_errors_handler_is_a_noop_until_u5() {
+    let mut app = test_app();
+    app.handle_message(Message::HookConfigErrors(vec!["bad".into()]));
+    assert!(app.toast.is_none());
+}
+
 #[test]
 fn disconnect_clears_animation() {
     let mut app = test_app();
@@ -2094,3 +2137,4 @@ fn disconnect_clears_animation() {
     app.complete_disconnect("p1");
     assert!(app.flip_animation.is_none());
 }
+

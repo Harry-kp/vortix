@@ -34,7 +34,8 @@ mod tests;
 
 use ratatui::layout::Rect;
 use ratatui::widgets::TableState;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::Instant;
 
 use crate::constants;
 use crate::engine::VpnEngine;
@@ -88,7 +89,30 @@ pub struct App {
     pub panel_areas: HashMap<FocusedPanel, Rect>,
     pub toast: Option<Toast>,
     pub terminal_size: (u16, u16),
+
+    // === Lifecycle Hooks (plan 016) ===
+    /// Recent hook fires (most-recent-first), capped at
+    /// [`HOOK_HISTORY_CAP`]. Populated by `Message::HookFired`. Drives
+    /// the Hooks overlay (U4) and is the source of truth the toast
+    /// rate-limiter (U3) consults.
+    pub recent_hook_events: VecDeque<crate::message::HookOutcomeReport>,
+
+    /// Last time a toast was emitted per hook name, for the 30-second
+    /// per-hook rate limit in U3. Cleared at engine restart.
+    pub hook_toast_last_fired: HashMap<String, Instant>,
+
+    /// Whether the Hooks overlay is open (U4).
+    pub show_hooks_overlay: bool,
+
+    /// Cached count of registered hooks (set once at startup; surfaced
+    /// in the action menu and overlay header).
+    pub registered_hooks_count: usize,
 }
+
+/// Cap on `recent_hook_events` retention. Roughly two hours of activity
+/// at one fire every 2.5 minutes — plenty for the post-mortem case the
+/// overlay serves without unbounded growth.
+pub const HOOK_HISTORY_CAP: usize = 50;
 
 // Plan 005 U5: the previous `impl Deref<Target = VpnEngine>` was a porous
 // boundary — every TUI/app/CLI callsite could reach into VpnEngine without
@@ -135,6 +159,10 @@ impl App {
             panel_areas: HashMap::new(),
             toast: None,
             terminal_size: (0, 0),
+            recent_hook_events: VecDeque::with_capacity(HOOK_HISTORY_CAP),
+            hook_toast_last_fired: HashMap::new(),
+            show_hooks_overlay: false,
+            registered_hooks_count: 0,
         };
 
         // Select first profile if available
@@ -288,6 +316,10 @@ impl App {
             panel_areas: HashMap::new(),
             toast: None,
             terminal_size: (80, 24),
+            recent_hook_events: VecDeque::with_capacity(HOOK_HISTORY_CAP),
+            hook_toast_last_fired: HashMap::new(),
+            show_hooks_overlay: false,
+            registered_hooks_count: 0,
         }
     }
 }

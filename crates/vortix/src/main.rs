@@ -353,9 +353,15 @@ fn run_tui(
                 let hooks =
                     std::sync::Arc::new(vortix::hooks::build_registry_from_config(&hooks_config));
                 let hooks_for_task = hooks.clone();
+                // Plan 016 U2: capture the TUI's command channel + the
+                // journal handle so the task can both record outcomes
+                // and push them into the TUI message loop.
+                app.registered_hooks_count = hooks.len();
+                let cmd_tx = app.engine.cmd_sender();
+                let journal = j.clone();
                 tokio::spawn(async move {
                     use vortix_core::engine::hooks::LifecycleEvent;
-                    use vortix_core::engine::EngineEvent;
+                    use vortix_core::engine::{EngineEvent, HookOutcomeRecord};
                     while let Ok(envelope) = rx.recv().await {
                         if matches!(envelope.event, EngineEvent::TunnelUp { .. }) {
                             if let Some(n) = &nudge {
@@ -410,17 +416,27 @@ fn run_tui(
                             _ => None,
                         };
                         if let Some(le) = lifecycle {
+                            let event_kind = le.kind_str().to_string();
                             let outcomes = hooks_for_task.dispatch(&le).await;
                             for (name, outcome) in outcomes {
-                                if !matches!(
-                                    outcome,
-                                    vortix_core::engine::hooks::HookOutcome::Success
-                                ) {
-                                    eprintln!(
-                                        "hook '{name}' on '{}' outcome: {outcome:?}",
-                                        le.kind_str()
-                                    );
-                                }
+                                let record: HookOutcomeRecord = (&outcome).into();
+                                // Append to journal first — the JSONL
+                                // is the durable record; TUI delivery
+                                // is the live signal.
+                                let _ = journal.append(EngineEvent::HookOutcome {
+                                    hook_name: name.clone(),
+                                    event_kind: event_kind.clone(),
+                                    record: record.clone(),
+                                });
+                                let _ = cmd_tx.send(
+                                    vortix::message::Message::HookFired(
+                                        vortix::message::HookOutcomeReport {
+                                            hook_name: name,
+                                            event_kind: event_kind.clone(),
+                                            record,
+                                        },
+                                    ),
+                                );
                             }
                         }
                     }
