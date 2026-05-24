@@ -41,6 +41,12 @@ pub fn build_registry_from_config_collecting(
     let mut registry = HookRegistry::new();
     let mut errors = Vec::new();
     for cfg in hooks {
+        // Plan 017 U1: skip disabled entries — they stay in the
+        // settings.toml model (so the TUI can render and toggle them)
+        // but never reach the running registry.
+        if !cfg.is_enabled() {
+            continue;
+        }
         match ShellHook::from_config(cfg) {
             Ok(hook) => registry.register(Box::new(hook) as Box<dyn Hook>),
             Err(e) => {
@@ -57,3 +63,43 @@ pub fn build_registry_from_config_collecting(
 /// Type-erased registry behind an `Arc` so the journal-subscriber task
 /// can hold a clone alongside other consumers.
 pub type SharedHookRegistry = Arc<HookRegistry>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn cfg(event: &str, enabled: Option<bool>) -> HookConfig {
+        HookConfig {
+            event: event.into(),
+            command: vec!["true".into()],
+            timeout_secs: 5,
+            env: HashMap::new(),
+            enabled,
+        }
+    }
+
+    #[test]
+    fn registry_skips_disabled_entries_but_keeps_enabled() {
+        let hooks = vec![
+            cfg("post_connect", None),         // enabled (default)
+            cfg("post_disconnect", Some(false)), // disabled — skipped
+            cfg("connect_failed", Some(true)), // enabled
+        ];
+        let (registry, errors) = build_registry_from_config_collecting(&hooks);
+        assert!(errors.is_empty(), "errors: {errors:?}");
+        assert_eq!(
+            registry.len(),
+            2,
+            "disabled entry should not reach the registry"
+        );
+    }
+
+    #[test]
+    fn registry_built_from_all_disabled_is_empty_no_errors() {
+        let hooks = vec![cfg("post_connect", Some(false))];
+        let (registry, errors) = build_registry_from_config_collecting(&hooks);
+        assert!(errors.is_empty());
+        assert_eq!(registry.len(), 0);
+    }
+}
