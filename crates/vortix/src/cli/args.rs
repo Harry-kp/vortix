@@ -306,6 +306,17 @@ pub enum Commands {
         inline_secrets: bool,
     },
 
+    /// Inspect the engine event journal (plan 005)
+    ///
+    /// EXAMPLES:
+    ///     vortix journal path         Print the session JSONL file path
+    ///     vortix journal tail         Print the last 20 in-memory events
+    ///     vortix journal tail 50      Print the last 50
+    Journal {
+        #[command(subcommand)]
+        op: JournalOp,
+    },
+
     /// Generate shell completions for vortix
     ///
     /// EXAMPLES:
@@ -315,5 +326,18 @@ pub enum Commands {
     Completions {
         /// Target shell: bash, zsh, fish, powershell
         shell: clap_complete::Shell,
+    },
+}
+
+/// Subcommands for `vortix journal`.
+#[derive(clap::Subcommand, Debug, Clone)]
+pub enum JournalOp {
+    /// Print the path of the current session's JSONL journal file.
+    Path,
+    /// Print the last N events from the in-memory tail buffer.
+    Tail {
+        /// Number of events to print (default: 20).
+        #[arg(default_value_t = 20)]
+        count: usize,
     },
 }
