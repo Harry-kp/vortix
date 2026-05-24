@@ -17,47 +17,11 @@ pub enum NetworkEvent {
     },
 }
 
-/// Returns the current default gateway IP, or `None` if unavailable.
-#[cfg(target_os = "macos")]
+/// Returns the current default gateway IP via the platform aggregate.
 fn get_default_gateway() -> Option<String> {
-    use vortix_process::CommandSpec;
-    let output = vortix_process::run_to_output(CommandSpec::oneshot(
-        "route",
-        vec!["get".into(), "default".into()],
-    ))
-    .ok()?;
-
-    let text = String::from_utf8_lossy(&output.stdout);
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if let Some(gw) = trimmed.strip_prefix("gateway:") {
-            let gw = gw.trim();
-            if !gw.is_empty() {
-                return Some(gw.to_string());
-            }
-        }
-    }
-    None
-}
-
-#[cfg(target_os = "linux")]
-fn get_default_gateway() -> Option<String> {
-    use vortix_process::CommandSpec;
-    let output = vortix_process::run_to_output(CommandSpec::oneshot(
-        "ip",
-        vec!["route".into(), "show".into(), "default".into()],
-    ))
-    .ok()?;
-
-    let text = String::from_utf8_lossy(&output.stdout);
-    // Format: "default via 192.168.1.1 dev wlan0 ..."
-    for line in text.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 3 && parts[0] == "default" && parts[1] == "via" {
-            return Some(parts[2].to_string());
-        }
-    }
-    None
+    crate::platform::current_platform()
+        .route_table
+        .default_gateway()
 }
 
 /// Spawns a background thread that monitors the default gateway.

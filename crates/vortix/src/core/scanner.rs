@@ -117,20 +117,17 @@ fn get_all_openvpn_pids() -> std::collections::HashMap<String, u32> {
 /// - macOS: /var/run/wireguard/*.name + ifconfig
 /// - Linux: ip addr + wg show
 fn check_wireguard_by_name(name: &str) -> Option<ActiveSession> {
-    use crate::platform::InterfaceDetector;
+    // Platform-dispatched interface check via the platform aggregate (plan 003 U7).
+    let platform = crate::platform::current_platform();
 
-    // Platform-dispatched interface check
-    #[cfg(target_os = "macos")]
-    type PlatformInterface = crate::platform::macos::interface::MacInterface;
-    #[cfg(target_os = "linux")]
-    type PlatformInterface = crate::platform::linux::interface::LinuxInterface;
-
-    if !PlatformInterface::check_wireguard_interface(name) {
+    if !platform.interface.check_wireguard_interface(name) {
         return None;
     }
 
-    let interface_name =
-        PlatformInterface::resolve_wireguard_interface(name).unwrap_or_else(|| name.to_string());
+    let interface_name = platform
+        .interface
+        .resolve_wireguard_interface(name)
+        .unwrap_or_else(|| name.to_string());
 
     let mut session = ActiveSession {
         interface: interface_name.clone(),
@@ -138,7 +135,7 @@ fn check_wireguard_by_name(name: &str) -> Option<ActiveSession> {
     };
 
     // 1. Attempt to find PID (wireguard-go or similar)
-    if let Some(pid) = PlatformInterface::get_wireguard_pid(&interface_name) {
+    if let Some(pid) = platform.interface.get_wireguard_pid(&interface_name) {
         session.pid = Some(pid);
 
         // Primary method: Get start time from process (works cross-platform)
@@ -201,7 +198,7 @@ fn check_wireguard_by_name(name: &str) -> Option<ActiveSession> {
     }
 
     // 4. Get IP and MTU using platform-specific interface info
-    let (ip, mtu) = PlatformInterface::get_interface_info(&interface_name);
+    let (ip, mtu) = platform.interface.get_interface_info(&interface_name);
     if !ip.is_empty() {
         session.internal_ip = ip;
     }

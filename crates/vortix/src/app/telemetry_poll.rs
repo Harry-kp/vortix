@@ -130,21 +130,12 @@ impl App {
             }
         }
 
-        // 2. Kick off a new fetch
+        // 2. Kick off a new fetch via the platform aggregate (plan 003 U7).
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let totals = {
-                #[cfg(target_os = "macos")]
-                {
-                    use crate::platform::NetworkStatsProvider;
-                    crate::platform::macos::network::MacNetworkStats::get_total_bytes()
-                }
-                #[cfg(target_os = "linux")]
-                {
-                    use crate::platform::NetworkStatsProvider;
-                    crate::platform::linux::network::LinuxNetworkStats::get_total_bytes()
-                }
-            };
+            let totals = crate::platform::current_platform()
+                .network_stats
+                .get_total_bytes();
             let _ = tx.send(totals);
         });
         self.netstats_rx = Some(rx);

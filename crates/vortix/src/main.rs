@@ -16,6 +16,11 @@ fn main() -> Result<()> {
     init_tracing();
     vortix_process::set_global_runner(vortix_process::CommandRunner::real());
 
+    // Platform aggregate (plan 003 U7). Detect the OS variants once at startup;
+    // consumers reach for `crate::platform::current_platform()` instead of
+    // branching on `cfg(target_os)`.
+    vortix::platform::set_global_platform(vortix::platform::Platform::detect_current());
+
     // Now capture color_eyre's hook and wrap it with terminal restoration
     // and recovery instructions. Drop glue on App will still run to release
     // kill switch rules and VPN processes.
