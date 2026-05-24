@@ -1,0 +1,54 @@
+# Plan 015 phase B / plan 012 — CI integration tests
+#
+# Drives the vortix binary against real wg-quick + openvpn + iptables in
+# a privileged Ubuntu Docker container with two network namespaces.
+# Ubuntu-only at this gate; macOS integration parity is deferred to a
+# follow-up plan because GitHub Actions' macOS runners don't easily
+# support netns / sandboxed wg-quick.
+
+name: Integration Tests
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    # Nightly so flake rate is observable.
+    - cron: "30 5 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  integration:
+    name: Integration / ubuntu-22.04
+    runs-on: ubuntu-latest
+    # Soft-gate the first 2 weeks of life so flake doesn't block merges
+    # while the harness stabilises. Promote to required-for-release once
+    # 10 consecutive runs on main are green.
+    continue-on-error: true
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build integration harness image
+        run: docker build -t vortix-integration tests/integration/
+
+      - name: Run integration tests
+        # --privileged: required for `ip netns` + iptables manipulation
+        # --network host: avoid docker0 interfering with the test netns
+        run: |
+          docker run --privileged --network host --rm \
+              -v "$PWD:/workspace" \
+              -w /workspace \
+              vortix-integration \
+              bash -c '
+                set -euo pipefail
+                cargo build --release -p vortix --locked
+                bash tests/integration/setup-netns.sh
+                bash tests/integration/wg_happy_path.sh
+                bash tests/integration/killswitch.sh
+                bash tests/integration/teardown-netns.sh
+              '
