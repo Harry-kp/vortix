@@ -1,0 +1,19 @@
+# vortix settings with multiple top-level sections interleaved.
+
+log_level = "info"
+
+[journal]
+# Plan 005: journal retention window.
+retention_days = 30
+max_files = 30
+
+[[hooks]]
+event = "post_connect"
+command = ["notify-send", "VPN up"]
+
+[engine]
+# Plan 005 U2: engine policy.
+retry_max_attempts = 3
+retry_backoff_secs = [1, 5, 30]
+
+# End-of-file comment.
