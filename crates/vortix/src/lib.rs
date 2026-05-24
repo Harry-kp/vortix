@@ -4,18 +4,27 @@
 //! It provides profile management and an intuitive dashboard interface.
 #![allow(clippy::missing_errors_doc, clippy::implicit_hasher)]
 
-// Internal library modules (formerly separate crates)
+// Internal library modules (formerly separate crates).
+// Hidden from public API docs — these are implementation details.
+#[doc(hidden)]
 pub mod vortix_config;
+#[doc(hidden)]
 pub mod vortix_core;
+#[doc(hidden)]
 pub mod vortix_process;
+#[doc(hidden)]
 pub mod vortix_protocol_openvpn;
+#[doc(hidden)]
 pub mod vortix_protocol_wireguard;
 
 #[cfg(target_os = "linux")]
+#[doc(hidden)]
 pub mod vortix_platform_linux;
 #[cfg(target_os = "macos")]
+#[doc(hidden)]
 pub mod vortix_platform_macos;
 #[cfg(target_os = "windows")]
+#[doc(hidden)]
 pub mod vortix_platform_windows;
 
 // Application modules
