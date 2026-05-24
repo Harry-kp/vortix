@@ -181,6 +181,30 @@ Until then, treat this as a hard invariant. Reviewers should reject
 any PR that adds `publish = true` to a non-binary crate without an
 accompanying brainstorm doc that explicitly revisits this section.
 
+## Deferred-subsystems bundle (plan 015, phases A–E)
+
+Per the maintainer's direction, plans 009–013 (originally documented
+as deferred multi-week subsystems) execute in PR #201 alongside the
+v0.3.0 migration. Plan 015 is the orchestration layer; per-subsystem
+plan docs remain the design records.
+
+| Phase | Plan | Status | Commit |
+|---|---|---|---|
+| A — Lifecycle hooks | 009 | ✅ shipped | `ee5b099` |
+| B — CI integration tests | 012 | ✅ shipped (Ubuntu only) | `1cbfa90` |
+| C — Socket audit port | 013 | ✅ shipped (Linux + macOS) | `82ba6a4` |
+| D — IPC layer / daemon | 010 | ✅ shipped (skeleton + wire contract); engine routing → v0.3.x | `a7796d1` |
+| E — Privilege separation | 011 | ✅ shipped (docs + threat model); enforcement → v0.3.x | `f8f97e9` |
+
+**Honest scope framing.** Each phase ships the architecture + happy-
+path implementation. Hardening corners (full daemon engine routing,
+`SO_PEERCRED` enforcement, macOS integration parity, OpenVPN
+integration test, OpenVPN-with-real-server cert fixtures) are
+documented as v0.3.x follow-ups in the relevant commit bodies +
+`SECURITY.md` + the per-phase plan docs. v0.3.0 ships valuable
+working code on every track; "complete" in the multi-quarter sense
+each plan was originally sized for grows in v0.3.x.
+
 ## CLI surface revised before ship
 
 A pre-ship re-audit (brainstorm:

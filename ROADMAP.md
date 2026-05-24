@@ -88,41 +88,61 @@ Today, Vortix is a macOS-first tool that happens to compile on Linux. v0.2.0 mak
 
 ---
 
-## v0.3.0 — "Architectural Migration v1" ✅
+## v0.3.0 — "Architectural Migration v1 + Deferred Subsystems Bundle" ✅
 
-**The promise:** Vortix's internals are now ready for the next two years of feature work.
+**The promise:** Vortix's internals are ready for the next two years of feature work, AND the deferred-subsystem bundle (lifecycle hooks, socket audit, CI integration tests, IPC daemon, privilege-separation docs) ships in the same release.
 
 **What changes for the user:**
 
 1. **Existing CLI unchanged.** `vortix up`, `down`, `status`, `list`, `import`, `killswitch` — all preserved exactly. Profiles, killswitch state, and `.auth` files keep working unchanged.
 
-2. **One new top-level subcommand:** `vortix secrets {set,get,delete}` for an optional OS-keyring-backed encrypted credential store (AES-256-GCM + argon2id fallback for headless installs). Existing `.auth` files still work; the store is opt-in.
+2. **Three new top-level subcommands:**
+   - `vortix secrets {set,get,delete}` — optional OS-keyring-backed encrypted credential store (AES-256-GCM + argon2id fallback for headless installs).
+   - `vortix audit [--pid N] [--vpn-only] [--json]` — per-process socket inventory; useful for answering "is this traffic actually routing through the VPN?" (issues [#168](https://github.com/Harry-kp/vortix/issues/168), [#166](https://github.com/Harry-kp/vortix/issues/166)).
+   - `vortix daemon [--socket PATH]` — long-running IPC server for `EngineHandle::Remote` (issue [#16](https://github.com/Harry-kp/vortix/issues/16)). Skeleton + wire-contract ships in v0.3.0; engine routing through the daemon lands in v0.3.x.
 
-3. **Session event journal.** Every run writes a JSONL event log to `${XDG_DATA_HOME}/vortix/sessions/` with 30-day retention. `vortix info` surfaces the current session's path; users tail it with shell tools.
+3. **Lifecycle hooks** ([plan 009](docs/plans/2026-05-24-009-feat-lifecycle-hooks-plan.md), issue [#36](https://github.com/Harry-kp/vortix/issues/36)). Run shell commands on FSM transitions (pre/post connect/disconnect, connect_failed, reconnecting). Configure via `[[hooks]]` in `settings.toml`. Empty by default, zero overhead.
 
-4. **Versioned `--json` output.** Every structured envelope now carries `schema_version: 1`. Consumers detect breaking changes instead of finding them at runtime.
+4. **Session event journal.** Every run writes a JSONL event log to `${XDG_DATA_HOME}/vortix/sessions/` with 30-day retention. `vortix info` surfaces the current session's path; users tail it with shell tools.
 
-**What this unlocks:**
+5. **CI integration tests** ([plan 012](docs/plans/2026-05-24-012-feat-ci-integration-tests-plan.md), issue [#162](https://github.com/Harry-kp/vortix/issues/162)). New `.github/workflows/integration-tests.yml` drives real `wg-quick` + `openvpn` + `iptables` in a privileged Docker container with network namespaces.
 
-The internal architecture (Cargo workspace, capability ports, Tunnel trait, Engine FSM, layered config, secret store) is the foundation for the next plan series — daemon mode, lifecycle hooks, privilege separation, Windows, per-process socket audit. Each future feature plugs into existing seams instead of re-litigating architecture.
+6. **Versioned `--json` output.** Every structured envelope carries `schema_version: 1`.
+
+**What lands as docs-only in v0.3.0 and grows in v0.3.x:**
+
+- Daemon engine routing (`vortix daemon` accepts clients + parses frames; engine wiring completes in v0.3.x)
+- `SO_PEERCRED` / `getpeereid` auth (architecture documented in [`SECURITY.md`](SECURITY.md), enforcement lands with engine routing)
+- Read-only ops bypass-daemon optimization
+- macOS CI integration parity (Ubuntu-only at v0.3.0; macOS deferred)
 
 See [`docs/v0.3.0-RELEASE-NOTES.md`](docs/v0.3.0-RELEASE-NOTES.md) for the full surface and [`docs/architecture-migration-v1.md`](docs/architecture-migration-v1.md) for the technical map.
 
 ---
 
+## v0.3.x — Hardening + Daemon Engine Wiring
+
+**The promise:** Finish what v0.3.0 set up.
+
+1. **Daemon engine wiring.** The `dispatch()` skeleton in `vortix daemon` returns `IpcError::Internal("engine wiring not yet connected")` for `Execute`/`Snapshot`/`Subscribe`. Connecting it requires sharing main.rs's tunnel-factory setup with the daemon — a clean refactor that lands as v0.3.1.
+
+2. **`SO_PEERCRED` / `getpeereid` enforcement.** The architecture is documented in `SECURITY.md`; the enforcement code lands alongside the engine routing.
+
+3. **Read-only-ops bypass.** `vortix status`, `vortix list`, `vortix audit` continue to work without a running daemon. Privileged ops auto-route through the daemon when present.
+
+4. **`OvpnTunnel` happy-path integration test.** The harness scaffolding from v0.3.0 ships with a WireGuard test + killswitch test; OpenVPN test fixtures (cert generation + stub server) land here.
+
+---
+
 ## v0.4.0 — "Set and Forget"
 
-**The promise:** Vortix manages your VPN so you don't have to think about it. Built on the v0.3.0 architecture.
+**The promise:** Vortix manages your VPN so you don't have to think about it. Now that the daemon routing is solid, daemon-mode comes online.
 
-**What changes for the user:**
+1. **Auto-connect on startup.** Configure a default profile; vortix connects the moment your shell opens. systemd / launchd one-liners shipped as examples in v0.3.0.
 
-1. **Lifecycle hooks** ([plan 009](docs/plans/2026-05-24-009-feat-lifecycle-hooks-plan.md), issue [#36](https://github.com/Harry-kp/vortix/issues/36)). Run a script before connecting (check trusted network, update firewall rules) or after disconnecting (flush DNS, restart services). Composable with your existing workflow.
+2. **Profile groups.** Your 20 profiles in collapsible sections — "Work", "Personal", "Testing". `g`-key assignment for instant switching.
 
-2. **Auto-connect on startup / daemon mode** ([plan 010](docs/plans/2026-05-24-010-feat-ipc-engine-handle-remote-plan.md), issue [#16](https://github.com/Harry-kp/vortix/issues/16)). Configure a default profile and Vortix connects the moment you open a terminal — or runs as a background daemon. Builds on the new `EngineHandle::Remote` IPC layer.
-
-3. **CI integration tests against real `wg`/`openvpn`** ([plan 012](docs/plans/2026-05-24-012-feat-ci-integration-tests-plan.md), issue [#162](https://github.com/Harry-kp/vortix/issues/162)). Higher release confidence; fewer manual smoke runs per release.
-
-**What this unlocks:** The "I use it every day" users. The ones who put Vortix in their dotfiles.
+3. **What's New overlay.** In-TUI update nudge that surfaces v0.4.0 highlights to users upgrading from v0.3.x (issue [#164](https://github.com/Harry-kp/vortix/issues/164)).
 
 ---
 
@@ -130,9 +150,11 @@ See [`docs/v0.3.0-RELEASE-NOTES.md`](docs/v0.3.0-RELEASE-NOTES.md) for the full 
 
 **The promise:** Vortix runs as your user; only the parts that actually need root do.
 
-1. **Privilege separation** ([plan 011](docs/plans/2026-05-24-011-feat-privilege-separation-plan.md), issue [#153](https://github.com/Harry-kp/vortix/issues/153)). Privileged daemon worker + unprivileged TUI/CLI frontend. `vortix status`, `vortix list` work without sudo; only `up`/`down`/`killswitch` route to the daemon. Auditable, principle-of-least-privilege.
+1. **Independent security audit** of the daemon auth model documented in `SECURITY.md`. v0.3.0 ships the posture; v0.5.0 should ship the audited version.
 
-2. **Per-process socket audit** ([plan 013](docs/plans/2026-05-24-013-feat-socket-audit-port-plan.md), issues [#168](https://github.com/Harry-kp/vortix/issues/168) and [#166](https://github.com/Harry-kp/vortix/issues/166)). `vortix audit` answers "what's actually routing through the tunnel?" — leak-detection complement to the existing IPv6/DNS guards.
+2. **Capability-token auth** as an alternative to `SO_PEERCRED`. Frontend sessions get a fresh token on first connect; subsequent ops carry it. Defends against the UID race documented in SECURITY.md.
+
+3. **seccomp filters** narrowing the daemon's syscall surface. AppArmor / SELinux reference profiles shipped under `examples/`.
 
 ---
 

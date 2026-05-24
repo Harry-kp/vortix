@@ -2,7 +2,7 @@
 plan_id: 2026-05-24-015
 title: "feat: Execute deferred subsystems 009-013 in v0.3.0 bundle"
 type: feat
-status: active
+status: completed
 created: 2026-05-24
 target_branch: refactor/architectural-migration-v1
 target_pr: 201

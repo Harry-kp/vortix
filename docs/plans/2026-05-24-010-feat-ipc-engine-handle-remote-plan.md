@@ -2,7 +2,7 @@
 plan_id: 2026-05-24-010
 title: "feat: IPC layer — EngineHandle::Remote (daemon mode foundation)"
 type: feat
-status: deferred
+status: completed
 created: 2026-05-24
 target_version: 0.4.0
 target_branch: TBD (post v0.3.0 GA)

@@ -53,6 +53,8 @@ Existing options (`wg show`, NetworkManager, Tunnelblick) either lack real-time 
 - **Kill Switch** — Built-in firewall management for maximum security
 - **Encrypted credential store** *(new in v0.3.0)* — OS keyring (Keychain / Secret Service) with AES-256-GCM + argon2id encrypted-file fallback for headless installs
 - **Session event journal** *(new in v0.3.0)* — JSONL event log per session under `${XDG_DATA_HOME}/vortix/sessions/`, 30-day retention; useful for diagnostics and scripting
+- **Lifecycle hooks** *(new in v0.3.0)* — `[[hooks]]` in `settings.toml` runs shell commands on FSM transitions (pre/post connect/disconnect, connect_failed, reconnecting); composable with your existing workflow
+- **Per-process socket audit** *(new in v0.3.0)* — `vortix audit` answers "is this traffic actually routing through the tunnel?" with per-PID socket inventory; Linux + macOS supported
 - **Versioned structured output** *(new in v0.3.0)* — every `--json` envelope carries `schema_version: 1` so consumers can detect breaking changes instead of finding them at runtime
 - **Interactive Import** — Easily add new profiles directly within the TUI
 - **Config Viewer** — Inspect profile configurations directly within the TUI
@@ -235,7 +237,7 @@ vortix completions bash >> ~/.bashrc      # Shell completions
 vortix completions zsh > ~/.zfunc/_vortix
 ```
 
-**New in v0.3.0 — secrets store + profile-export flag (additive):**
+**New in v0.3.0 — secrets store, socket audit, daemon skeleton, profile-export flag (additive):**
 
 ```bash
 # Encrypted secret store — OS keyring (Keychain / Secret Service) with
@@ -245,11 +247,29 @@ echo -n 'user:pass' | vortix secrets set creds/work-vpn
 vortix secrets get creds/work-vpn
 vortix secrets delete creds/work-vpn
 
+# Per-process socket audit — "is this traffic actually routing
+# through the tunnel?" Pull-based snapshots; Linux + macOS supported.
+vortix audit                                  # tabular
+vortix audit --json                           # structured envelope
+vortix audit --pid 12345                      # filter to one process
+vortix audit --vpn-only                       # only sockets on the tunnel
+
+# Daemon IPC skeleton — host the engine as a long-running process.
+# v0.3.0 ships the wire contract + socket binding; engine routing
+# through the daemon completes in v0.3.x.
+vortix daemon                                 # default socket path
+vortix daemon --socket /tmp/vortix.sock       # custom path
+
 # Share a profile with credentials inlined (for the recipient to
 # re-import). The output gets a trailing `# vortix-secret:<base64>`
 # comment that v0.3.x picks up on import.
 vortix show work-vpn --raw --inline-secrets > /tmp/work-with-creds.ovpn
 ```
+
+Lifecycle hooks land as a `settings.toml`-driven seam — add
+`[[hooks]]` entries to fire shell commands on FSM transitions
+(pre/post connect/disconnect, connect_failed, reconnecting). Empty by
+default, zero overhead.
 
 The Engine FSM, JSONL session journal, layered settings, and sidecar
 migration all live behind existing commands — the journal path
@@ -257,7 +277,7 @@ surfaces in `vortix info` output, the migration runs at startup, and
 `settings.toml` works whether or not you ever create one.
 
 See [`docs/MIGRATION.md`](docs/MIGRATION.md) for the upgrade guide and
-opt-in details on the secret store and journal.
+opt-in details on the secret store, journal, hooks, and daemon.
 
 **JSON output for AI agents / scripts:**
 ```bash

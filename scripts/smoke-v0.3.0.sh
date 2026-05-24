@@ -82,6 +82,18 @@ if echo "${HELP_OUT}" | grep -qw "secrets"; then
 else
   fail "vortix --help missing 'secrets' subcommand" "${HELP_OUT}"
 fi
+
+# Plan 015 phase C + D — two more new subcommands earn their slots.
+if echo "${HELP_OUT}" | grep -qw "audit"; then
+  pass "vortix --help lists 'audit' (plan 015 phase C)"
+else
+  fail "vortix --help missing 'audit' subcommand" "${HELP_OUT}"
+fi
+if echo "${HELP_OUT}" | grep -qw "daemon"; then
+  pass "vortix --help lists 'daemon' (plan 015 phase D)"
+else
+  fail "vortix --help missing 'daemon' subcommand" "${HELP_OUT}"
+fi
 REMOVED_SUBCMDS=""
 for sub in engine journal settings migrate export; do
   if echo "${HELP_OUT}" | grep -qE "^\s+${sub}\b"; then
