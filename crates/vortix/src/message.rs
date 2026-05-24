@@ -9,6 +9,20 @@
 use crate::core::scanner::ActiveSession;
 use crate::core::telemetry::TelemetryUpdate;
 use crate::state::{FocusedPanel, ToastType};
+use vortix_core::engine::HookOutcomeRecord;
+
+/// One hook fire delivered to the TUI message loop (plan 016 U2).
+///
+/// Built by the journal-subscriber task in `main.rs` from
+/// `(name, runtime HookOutcome)` and pushed through `App.engine.cmd_tx`
+/// so the TUI sees it on the next tick. Carries the hook name, the
+/// lifecycle event kind that triggered it, and the serialized record.
+#[derive(Debug, Clone)]
+pub struct HookOutcomeReport {
+    pub hook_name: String,
+    pub event_kind: String,
+    pub record: HookOutcomeRecord,
+}
 
 /// All messages that can modify application state.
 ///
@@ -139,6 +153,18 @@ pub enum Message {
         /// Error message if the command failed
         error: Option<String>,
     },
+    /// A lifecycle hook fired with the given outcome (plan 016 U2).
+    /// Pushed from the journal-subscriber task in `main.rs`; consumed
+    /// by `update.rs` which appends it to `App.recent_hook_events` and
+    /// (when `Failed`/`TimedOut`/`Aborted`) emits a rate-limited toast.
+    HookFired(HookOutcomeReport),
+
+    /// Hook-config validation errors collected at startup (plan 016 U5).
+    /// One entry per malformed `[[hooks]]` table. Empty vec means clean
+    /// config; the variant is still dispatched so the receiver can clear
+    /// any stale validation state.
+    HookConfigErrors(Vec<String>),
+
     /// Terminal resize event
     Resize(u16, u16),
     /// Import profile from path

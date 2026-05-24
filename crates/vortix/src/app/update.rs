@@ -263,7 +263,34 @@ impl App {
             Message::Resize(width, height) => {
                 self.terminal_size = (width, height);
             }
+
+            // Plan 016 U2: record the hook fire in the rolling history.
+            // Toast emission lives in U3.
+            Message::HookFired(report) => self.handle_hook_fired(report),
+
+            // Plan 016 U5: surface config validation errors via toast.
+            // Toast emission lives in U5.
+            Message::HookConfigErrors(errors) => self.handle_hook_config_errors(errors),
         }
+    }
+
+    /// Record a hook fire in the rolling history (plan 016 U2/U3).
+    ///
+    /// U3 extends this to emit a rate-limited failure toast for
+    /// non-Success outcomes. For now the push is unconditional and the
+    /// `VecDeque` is FIFO-capped at [`super::HOOK_HISTORY_CAP`].
+    fn handle_hook_fired(&mut self, report: crate::message::HookOutcomeReport) {
+        if self.recent_hook_events.len() >= super::HOOK_HISTORY_CAP {
+            self.recent_hook_events.pop_back();
+        }
+        self.recent_hook_events.push_front(report);
+    }
+
+    /// Surface config-validation errors. Currently a no-op — U5 turns
+    /// this into a startup toast and persisted overlay banner.
+    #[allow(clippy::needless_pass_by_value, clippy::unused_self)]
+    fn handle_hook_config_errors(&mut self, _errors: Vec<String>) {
+        // U5 wires this through `show_toast` + the Hooks overlay banner.
     }
 
     fn handle_manage_auth(&mut self) {
