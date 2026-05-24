@@ -14,6 +14,12 @@ pub enum UserCommand {
     Disconnect,
     Reconnect,
     ForceDisconnect,
+    /// Plan 008 U2: response to a mid-connect `UserPromptRequested`
+    /// event. Reserved for issue #191 (2FA); no consumer wired in
+    /// v0.3.0. `prompt_id` matches the value emitted on the prompt
+    /// event so the FSM can correlate the answer with the right
+    /// outstanding prompt.
+    UserAnswered { prompt_id: String, answer: String },
 }
 
 /// Network link state (default gateway availability).

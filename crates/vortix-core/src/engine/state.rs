@@ -85,7 +85,23 @@ pub struct DetailedConnectionInfo {
     pub pid: Option<u32>,
 }
 
-/// The five-variant connection state machine.
+/// What kind of user input the FSM is paused waiting for (plan 008 U2).
+///
+/// `#[non_exhaustive]` so adding e.g. `BiometricChallenge` later doesn't
+/// break consumers pattern-matching on this enum.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+#[serde(rename_all = "snake_case")]
+pub enum PromptKind {
+    /// One-time code from an authenticator app or SMS.
+    TwoFactorCode,
+    /// Password / passphrase for an encrypted credential file.
+    Passphrase,
+    /// Anything else; `label` is rendered verbatim to the user.
+    Generic { label: String },
+}
+
+/// The connection state machine (plan 005, extended in plan 008 U2).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum Connection {
@@ -120,6 +136,16 @@ pub enum Connection {
         profile_id: ProfileId,
         started_at: SystemTime,
     },
+    /// Mid-connect prompt waiting for the user to supply input
+    /// (2FA challenge, certificate passphrase, etc.). Plan 008 U2
+    /// reserves the slot for issue #191 (Interactive 2FA/MFA);
+    /// no consumer is wired in v0.3.0.
+    AwaitingUserInput {
+        profile_id: ProfileId,
+        prompt_id: String,
+        prompt_kind: PromptKind,
+        since: SystemTime,
+    },
 }
 
 impl Default for Connection {
@@ -137,7 +163,8 @@ impl Connection {
             Self::Connecting { profile_id, .. }
             | Self::Connected { profile_id, .. }
             | Self::Reconnecting { profile_id, .. }
-            | Self::Disconnecting { profile_id, .. } => Some(profile_id),
+            | Self::Disconnecting { profile_id, .. }
+            | Self::AwaitingUserInput { profile_id, .. } => Some(profile_id),
         }
     }
 
@@ -193,5 +220,48 @@ mod tests {
             retry_budget_remaining: Duration::from_secs(300),
         }
         .is_steady());
+    }
+
+    // Plan 008 U2 — AwaitingUserInput coverage.
+
+    #[test]
+    fn awaiting_user_input_carries_profile_id() {
+        let p = ProfileId::new("corp");
+        let s = Connection::AwaitingUserInput {
+            profile_id: p.clone(),
+            prompt_id: "2fa".into(),
+            prompt_kind: PromptKind::TwoFactorCode,
+            since: SystemTime::now(),
+        };
+        assert_eq!(s.profile_id(), Some(&p));
+    }
+
+    #[test]
+    fn awaiting_user_input_is_not_steady() {
+        // Like Connecting/Disconnecting, it's a transitional state.
+        let s = Connection::AwaitingUserInput {
+            profile_id: ProfileId::new("corp"),
+            prompt_id: "2fa".into(),
+            prompt_kind: PromptKind::TwoFactorCode,
+            since: SystemTime::now(),
+        };
+        assert!(!s.is_steady());
+        assert!(!s.is_connected());
+    }
+
+    #[test]
+    fn prompt_kind_roundtrips_through_json() {
+        let kinds = [
+            PromptKind::TwoFactorCode,
+            PromptKind::Passphrase,
+            PromptKind::Generic {
+                label: "Hardware token PIN".into(),
+            },
+        ];
+        for k in kinds {
+            let json = serde_json::to_string(&k).unwrap();
+            let back: PromptKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(k, back);
+        }
     }
 }
