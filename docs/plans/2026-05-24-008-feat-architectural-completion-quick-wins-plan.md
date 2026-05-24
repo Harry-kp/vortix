@@ -2,7 +2,7 @@
 plan_id: 2026-05-24-008
 title: "feat: Architectural completion — quick wins (Track A)"
 type: feat
-status: active
+status: completed
 created: 2026-05-24
 target_branch: refactor/architectural-migration-v1
 target_pr: 201
