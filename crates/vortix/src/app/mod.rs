@@ -107,6 +107,11 @@ pub struct App {
     /// Cached count of registered hooks (set once at startup; surfaced
     /// in the action menu and overlay header).
     pub registered_hooks_count: usize,
+
+    /// Hook-config validation errors collected at startup (plan 016 U5).
+    /// Surfaced as a startup toast and as a banner inside the hooks
+    /// overlay so the user knows which entries were skipped.
+    pub hook_config_errors: Vec<String>,
 }
 
 /// Cap on `recent_hook_events` retention. Roughly two hours of activity
@@ -163,6 +168,7 @@ impl App {
             hook_toast_last_fired: HashMap::new(),
             show_hooks_overlay: false,
             registered_hooks_count: 0,
+            hook_config_errors: Vec::new(),
         };
 
         // Select first profile if available
@@ -320,6 +326,7 @@ impl App {
             hook_toast_last_fired: HashMap::new(),
             show_hooks_overlay: false,
             registered_hooks_count: 0,
+            hook_config_errors: Vec::new(),
         }
     }
 }

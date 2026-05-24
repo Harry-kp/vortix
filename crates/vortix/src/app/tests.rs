@@ -51,6 +51,7 @@ fn test_app() -> App {
         hook_toast_last_fired: std::collections::HashMap::new(),
         show_hooks_overlay: false,
         registered_hooks_count: 0,
+        hook_config_errors: Vec::new(),
     }
 }
 
@@ -2221,10 +2222,33 @@ fn close_overlay_message_closes_hooks_overlay() {
 }
 
 #[test]
-fn hook_config_errors_handler_is_a_noop_until_u5() {
+fn hook_config_errors_surface_as_warning_toast_with_count() {
+    let mut app = test_app();
+    app.handle_message(Message::HookConfigErrors(vec![
+        "bad entry 1".into(),
+        "bad entry 2".into(),
+    ]));
+    let toast = app.toast.as_ref().expect("toast should be set");
+    assert!(matches!(toast.toast_type, crate::state::ToastType::Warning));
+    assert!(toast.message.contains("2 hook entries"));
+    assert_eq!(app.hook_config_errors.len(), 2);
+}
+
+#[test]
+fn hook_config_errors_single_entry_singularizes_message() {
     let mut app = test_app();
     app.handle_message(Message::HookConfigErrors(vec!["bad".into()]));
+    let toast = app.toast.as_ref().unwrap();
+    assert!(toast.message.contains("1 hook entry"));
+}
+
+#[test]
+fn hook_config_errors_empty_clears_state_no_toast() {
+    let mut app = test_app();
+    app.hook_config_errors = vec!["stale".into()];
+    app.handle_message(Message::HookConfigErrors(vec![]));
     assert!(app.toast.is_none());
+    assert!(app.hook_config_errors.is_empty());
 }
 
 #[test]

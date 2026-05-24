@@ -350,14 +350,24 @@ fn run_tui(
                     .ok()
                     .map(|s| s.hooks)
                     .unwrap_or_default();
-                let hooks =
-                    std::sync::Arc::new(vortix::hooks::build_registry_from_config(&hooks_config));
+                // Plan 016 U5: collect malformed [[hooks]] entries so
+                // we can toast them rather than only writing to stderr
+                // (which is invisible inside the TUI).
+                let (registry, hook_config_errors) =
+                    vortix::hooks::build_registry_from_config_collecting(&hooks_config);
+                let hooks = std::sync::Arc::new(registry);
                 let hooks_for_task = hooks.clone();
                 // Plan 016 U2: capture the TUI's command channel + the
                 // journal handle so the task can both record outcomes
                 // and push them into the TUI message loop.
                 app.registered_hooks_count = hooks.len();
                 let cmd_tx = app.engine.cmd_sender();
+                if !hook_config_errors.is_empty() {
+                    let _ = cmd_tx
+                        .send(vortix::message::Message::HookConfigErrors(
+                            hook_config_errors,
+                        ));
+                }
                 let journal = j.clone();
                 tokio::spawn(async move {
                     use vortix_core::engine::hooks::LifecycleEvent;

@@ -60,6 +60,26 @@ pub fn render(frame: &mut Frame, app: &App) {
     )));
     lines.push(Line::from(""));
 
+    if !app.hook_config_errors.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  Config issues:",
+            Style::default()
+                .fg(theme::WARNING)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for err in &app.hook_config_errors {
+            let budget = usize::from(width).saturating_sub(4).max(20);
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    truncate(err, budget),
+                    Style::default().fg(theme::WARNING),
+                ),
+            ]));
+        }
+        lines.push(Line::from(""));
+    }
+
     if app.recent_hook_events.is_empty() {
         lines.push(Line::from(Span::styled(
             "  No hook fires recorded yet.",
