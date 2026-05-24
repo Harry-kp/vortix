@@ -7,12 +7,14 @@
 //! - `killswitch`: Kill switch mode and state
 
 mod connection;
+pub mod hook_edit;
 mod killswitch;
 mod profile;
 mod ui;
 
 // Re-export all types for easy access
 pub use connection::{ConnectionState, DetailedConnectionInfo};
+pub use hook_edit::{EnvRow, HookEditField, HookEditState, HookEditTarget, EVENT_KINDS};
 pub use killswitch::{KillSwitchMode, KillSwitchState};
 pub use profile::{Protocol, VpnProfile};
 pub use ui::{

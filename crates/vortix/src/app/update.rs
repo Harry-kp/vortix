@@ -319,7 +319,74 @@ impl App {
             // Plan 016 U5: surface config validation errors via toast.
             // Toast emission lives in U5.
             Message::HookConfigErrors(errors) => self.handle_hook_config_errors(errors),
+
+            // Plan 017 U5/U7/U8: hook management. Real handlers land
+            // in U7 (open form / delete confirm / toggle) and U8
+            // (save pipeline).
+            Message::HookAdd => self.handle_hook_add(),
+            Message::HookEdit(idx) => self.handle_hook_edit(idx),
+            Message::HookEditSave => self.handle_hook_edit_save(),
+            Message::HookDeleteRequest(idx) => self.handle_hook_delete_request(idx),
+            Message::HookDeleteConfirm(idx) => self.handle_hook_delete_confirm(idx),
+            Message::HookToggle(idx) => self.handle_hook_toggle(idx),
         }
+    }
+
+    // === Plan 017 hook management handlers (stubs for U5; filled in U7/U8). ===
+
+    fn handle_hook_add(&mut self) {
+        use crate::state::hook_edit::HookEditState;
+        let mtime = settings_toml_mtime(self);
+        self.input_mode = crate::state::InputMode::HookEdit(Box::new(
+            HookEditState::new_add(mtime),
+        ));
+        self.show_hooks_overlay = false;
+    }
+
+    fn handle_hook_edit(&mut self, idx: usize) {
+        use crate::state::hook_edit::HookEditState;
+        let Some(cfg) = self.registered_hooks.get(idx).cloned() else {
+            return;
+        };
+        let mtime = settings_toml_mtime(self);
+        self.input_mode = crate::state::InputMode::HookEdit(Box::new(
+            HookEditState::new_edit(idx, &cfg, mtime),
+        ));
+        self.show_hooks_overlay = false;
+    }
+
+    /// U8 wires this to the save pipeline. For now, validate the form
+    /// and surface inline errors; on a valid form, no-op (the write
+    /// path is U8's job).
+    fn handle_hook_edit_save(&mut self) {
+        let crate::state::InputMode::HookEdit(state) = &mut self.input_mode else {
+            return;
+        };
+        if state.to_config().is_ok() {
+            // U8 will: stat mtime, call hooks_writer::write_hooks,
+            // update app.registered_hooks, toast restart-apply.
+            // For U5 we leave the form open and show a "save pipeline
+            // not wired" inline message so the user sees the form is
+            // functional even though persistence comes next unit.
+            state.validation_error =
+                Some("Save pipeline lands in U8 — close with Esc.".into());
+        }
+        // On Err: validation_error already set inside to_config().
+    }
+
+    #[allow(clippy::unused_self)]
+    fn handle_hook_delete_request(&mut self, _idx: usize) {
+        // U7 wires this to the confirm dialog.
+    }
+
+    #[allow(clippy::unused_self)]
+    fn handle_hook_delete_confirm(&mut self, _idx: usize) {
+        // U8 wires this to the save pipeline.
+    }
+
+    #[allow(clippy::unused_self)]
+    fn handle_hook_toggle(&mut self, _idx: usize) {
+        // U7/U8 wire this to HooksList::toggle + save pipeline.
     }
 
     /// Record a hook fire in the rolling history and surface a
@@ -1259,4 +1326,11 @@ impl App {
         self.logs_auto_scroll = true;
         self.show_toast(format!("Log filter: {label}"), ToastType::Info);
     }
+}
+
+/// Stat `settings.toml` for its mtime — captured when a form opens
+/// so the U8 save pipeline can detect external edits (plan 017 U5/U8).
+fn settings_toml_mtime(app: &App) -> Option<std::time::SystemTime> {
+    let path = app.engine.config_dir.join("settings.toml");
+    std::fs::metadata(&path).ok().and_then(|m| m.modified().ok())
 }

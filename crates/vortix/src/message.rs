@@ -206,6 +206,22 @@ pub enum Message {
     OpenHelp,
     /// Toggle the lifecycle-hooks overlay (plan 016 U4).
     ToggleHooksOverlay,
+
+    // === Hook Management (plan 017) ===
+    /// Open the hook editor form in `AddingNew` mode.
+    HookAdd,
+    /// Open the hook editor form in `EditingExisting` mode for the
+    /// hook at the given index in `App.registered_hooks`.
+    HookEdit(usize),
+    /// Triggered by Ctrl-S / Enter on Save inside the form.
+    /// Validation + save pipeline land in U8.
+    HookEditSave,
+    /// Confirmed delete from the confirm dialog (U7).
+    HookDeleteConfirm(usize),
+    /// Request to delete — opens the confirm dialog (U7).
+    HookDeleteRequest(usize),
+    /// Flip `enabled` on the hook at the given index, write through (U7).
+    HookToggle(usize),
     /// Cycle the activity-log level filter (All → Errors → Warn → Info → All)
     CycleLogFilter,
 }

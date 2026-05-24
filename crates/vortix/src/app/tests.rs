@@ -52,6 +52,7 @@ fn test_app() -> App {
         show_hooks_overlay: false,
         registered_hooks_count: 0,
         hook_config_errors: Vec::new(),
+        registered_hooks: Vec::new(),
     }
 }
 
