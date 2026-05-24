@@ -17,9 +17,10 @@ use vortix_core::engine::HookOutcomeLabel;
 use crate::app::App;
 use crate::theme;
 
-const OVERLAY_WIDTH: u16 = 78;
-const OVERLAY_MAX_HEIGHT: u16 = 24;
-const MAX_ROWS: usize = 18;
+const OVERLAY_WIDTH: u16 = 82;
+const OVERLAY_MAX_HEIGHT: u16 = 32;
+const MAX_ROWS: usize = 10;
+const MAX_REGISTERED_ROWS: usize = 12;
 
 #[allow(clippy::too_many_lines)]
 pub fn render(frame: &mut Frame, app: &App) {
@@ -41,23 +42,37 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     let mut lines: Vec<Line> = Vec::new();
 
-    // Header — how many are configured, where the config lives.
+    // Header — counts (active + disabled), then config errors banner.
+    let active_count = app.registered_hooks.iter().filter(|h| h.is_enabled()).count();
+    let disabled_count = app.registered_hooks.len() - active_count;
     lines.push(Line::from(vec![
         Span::styled(
-            "  Registered hooks: ",
+            "  Registered: ",
+            Style::default().fg(theme::TEXT_SECONDARY),
+        ),
+        Span::styled(
+            format!("{active_count} active"),
+            Style::default()
+                .fg(theme::SUCCESS)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" · {disabled_count} disabled"),
+            Style::default().fg(theme::TEXT_SECONDARY),
+        ),
+        Span::styled(
+            "    (running registry: ",
             Style::default().fg(theme::TEXT_SECONDARY),
         ),
         Span::styled(
             app.registered_hooks_count.to_string(),
-            Style::default()
-                .fg(theme::ACCENT_PRIMARY)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(theme::TEXT_SECONDARY),
+        ),
+        Span::styled(
+            " — restart vortix to apply changes)",
+            Style::default().fg(theme::TEXT_SECONDARY),
         ),
     ]));
-    lines.push(Line::from(Span::styled(
-        "  Configure via [[hooks]] in ~/.config/vortix/config.toml",
-        Style::default().fg(theme::TEXT_SECONDARY),
-    )));
     lines.push(Line::from(""));
 
     if !app.hook_config_errors.is_empty() {
@@ -79,6 +94,78 @@ pub fn render(frame: &mut Frame, app: &App) {
         }
         lines.push(Line::from(""));
     }
+
+    // Registered-hooks list (plan 017 U6).
+    lines.push(Line::from(Span::styled(
+        "  Registered hooks:",
+        Style::default()
+            .fg(theme::ACCENT_PRIMARY)
+            .add_modifier(Modifier::BOLD),
+    )));
+    if app.registered_hooks.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "    (none configured — press 'a' to add one)",
+            Style::default().fg(theme::TEXT_SECONDARY),
+        )));
+    } else {
+        let selected = app.hooks_overlay_selected.min(
+            app.registered_hooks.len().saturating_sub(1),
+        );
+        for (i, cfg) in app
+            .registered_hooks
+            .iter()
+            .enumerate()
+            .take(MAX_REGISTERED_ROWS)
+        {
+            let is_selected = i == selected;
+            let active = cfg.is_enabled();
+            let marker = if is_selected { "▶ " } else { "  " };
+            let status_marker = if active { "    " } else { "[off]" };
+            let cmd_preview = command_preview(&cfg.command);
+            let name = hook_label(cfg);
+            let row_style = if !active {
+                Style::default()
+                    .fg(theme::TEXT_SECONDARY)
+                    .add_modifier(Modifier::DIM)
+            } else if is_selected {
+                Style::default()
+                    .fg(theme::ACCENT_PRIMARY)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme::TEXT_PRIMARY)
+            };
+            let budget = usize::from(width).saturating_sub(40).max(20);
+            lines.push(Line::from(vec![
+                Span::styled(marker.to_string(), row_style),
+                Span::styled(
+                    format!("{status_marker} "),
+                    if active {
+                        Style::default().fg(theme::SUCCESS)
+                    } else {
+                        Style::default()
+                            .fg(theme::WARNING)
+                            .add_modifier(Modifier::BOLD)
+                    },
+                ),
+                Span::styled(format!("{:<14} ", truncate(&cfg.event, 13)), row_style),
+                Span::styled(format!("{:<16} ", truncate(&name, 15)), row_style),
+                Span::styled(
+                    truncate(&cmd_preview, budget),
+                    Style::default().fg(theme::TEXT_SECONDARY),
+                ),
+            ]));
+        }
+        if app.registered_hooks.len() > MAX_REGISTERED_ROWS {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "    … {} more (not shown)",
+                    app.registered_hooks.len() - MAX_REGISTERED_ROWS
+                ),
+                Style::default().fg(theme::TEXT_SECONDARY),
+            )));
+        }
+    }
+    lines.push(Line::from(""));
 
     if app.recent_hook_events.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -178,7 +265,7 @@ pub fn render(frame: &mut Frame, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ))
         .title_bottom(Span::styled(
-            " H or Esc to close ",
+            " j/k move · a add · e edit · d delete · t toggle · H/Esc close ",
             Style::default().fg(theme::KEY_HINT_DESC),
         ));
 
@@ -187,6 +274,31 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
     frame.render_widget(paragraph, inner);
+}
+
+/// Best-effort label for a registered hook — mirrors the form's
+/// `derive_name_from_cfg` logic (plan 017 U5): `VORTIX_HOOK_NAME` env
+/// var wins, otherwise `event:program-basename`.
+fn hook_label(cfg: &vortix_config::HookConfig) -> String {
+    if let Some(n) = cfg.env.get("VORTIX_HOOK_NAME") {
+        return n.clone();
+    }
+    let program = cfg
+        .command
+        .first()
+        .and_then(|s| s.rsplit('/').next())
+        .unwrap_or("hook");
+    program.to_string()
+}
+
+/// One-line shell preview for the command field. `sh -c X` patterns
+/// show the inner shell snippet (first line if multi-line); literal
+/// argv shows space-joined args.
+fn command_preview(argv: &[String]) -> String {
+    if argv.len() == 3 && (argv[0] == "sh" || argv[0] == "bash") && argv[1] == "-c" {
+        return argv[2].lines().next().unwrap_or("").to_string();
+    }
+    argv.join(" ")
 }
 
 fn truncate(s: &str, max: usize) -> String {
