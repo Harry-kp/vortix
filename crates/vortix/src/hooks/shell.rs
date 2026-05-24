@@ -196,6 +196,7 @@ mod tests {
             command: command.into_iter().map(String::from).collect(),
             timeout_secs: 5,
             env: HashMap::new(),
+            enabled: None,
         }
     }
 

@@ -47,6 +47,25 @@ pub struct HookConfig {
     /// PROTOCOL, EVENT, IP).
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Whether the hook is active. `None` means the field was absent
+    /// from `settings.toml` (treated as enabled at runtime). `Some(false)`
+    /// disables the hook — the entry stays in `Vec<HookConfig>` so the
+    /// TUI can render and toggle it, but the registry skips it.
+    ///
+    /// Plan 017: kept as `Option` (not `bool` with `#[serde(default)]`)
+    /// so the writer can omit the line for entries that never had it,
+    /// preserving hand-edited settings.toml round-trip exactly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
+impl HookConfig {
+    /// True when the hook should be registered. Maps `None` → true so
+    /// pre-plan-017 settings files behave as before.
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
 }
 
 #[cfg(test)]
@@ -98,6 +117,69 @@ mod tests {
     #[derive(Deserialize)]
     struct Wrapper {
         hooks: Vec<HookConfig>,
+    }
+
+    // Plan 017 U1 — enabled field semantics.
+
+    #[test]
+    fn enabled_absent_in_toml_parses_as_none_and_is_enabled() {
+        let toml_str = r#"
+            event = "post_connect"
+            command = ["echo", "hi"]
+        "#;
+        let cfg: HookConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.enabled.is_none());
+        assert!(cfg.is_enabled());
+    }
+
+    #[test]
+    fn enabled_true_parses_and_is_enabled() {
+        let toml_str = r#"
+            event = "post_connect"
+            command = ["echo", "hi"]
+            enabled = true
+        "#;
+        let cfg: HookConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.enabled, Some(true));
+        assert!(cfg.is_enabled());
+    }
+
+    #[test]
+    fn enabled_false_parses_and_skips_at_runtime() {
+        let toml_str = r#"
+            event = "post_connect"
+            command = ["echo", "hi"]
+            enabled = false
+        "#;
+        let cfg: HookConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.enabled, Some(false));
+        assert!(!cfg.is_enabled());
+    }
+
+    #[test]
+    fn enabled_none_does_not_serialize() {
+        let cfg = HookConfig {
+            event: "post_connect".into(),
+            command: vec!["echo".into(), "hi".into()],
+            timeout_secs: 5,
+            env: HashMap::new(),
+            enabled: None,
+        };
+        let out = toml::to_string(&cfg).unwrap();
+        assert!(!out.contains("enabled"), "serialized output: {out}");
+    }
+
+    #[test]
+    fn enabled_some_false_serializes_explicitly() {
+        let cfg = HookConfig {
+            event: "post_connect".into(),
+            command: vec!["echo".into(), "hi".into()],
+            timeout_secs: 5,
+            env: HashMap::new(),
+            enabled: Some(false),
+        };
+        let out = toml::to_string(&cfg).unwrap();
+        assert!(out.contains("enabled = false"), "serialized output: {out}");
     }
 
     #[test]
