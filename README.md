@@ -17,7 +17,11 @@
 
 Terminal UI for WireGuard and OpenVPN with real-time telemetry and leak guarding.
 
-> **Upgrading from v0.2.x?** Read [`docs/MIGRATION.md`](docs/MIGRATION.md) — it takes two minutes. The upgrade is automatic, your profiles work, and rollback is a single command.
+> **New in v0.3.0 — architectural migration v1.** Engine FSM, session journal, encrypted secret store, six new CLI subcommands. Upgrade is automatic; existing profiles and commands work unchanged.
+>
+> - [Release notes](docs/v0.3.0-RELEASE-NOTES.md) — what changed (60s read)
+> - [Upgrade guide](docs/MIGRATION.md) — for v0.2.x users
+> - [FAQ](docs/v0.3.0-FAQ.md) — common upgrade questions
 
 ![Vortix Demo](assets/demo.gif)
 
