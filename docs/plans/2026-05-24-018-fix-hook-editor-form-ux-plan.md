@@ -2,7 +2,7 @@
 plan_id: 2026-05-24-018
 title: "fix: hook editor form UX — bounded command box, compact event picker, fielded inputs"
 type: fix
-status: active
+status: completed
 created: 2026-05-24
 target_branch: refactor/architectural-migration-v1
 target_pr: 201
