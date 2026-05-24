@@ -59,7 +59,8 @@ unicode-width = { workspace = true }
 open = { workspace = true }
 urlencoding = { workspace = true }
 
-# CommandRunner port (plan 002): all subprocess invocations flow through this crate.
+# Workspace library deps (plan 002 + plan 003).
+vortix-core = { path = "../vortix-core" }
 vortix-process = { path = "../vortix-process" }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

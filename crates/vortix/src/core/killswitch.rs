@@ -1,60 +1,25 @@
-//! Kill switch firewall control module.
-//!
-//! Controls the system firewall to block non-VPN traffic when kill switch is active.
-//! Uses platform-specific implementations:
-//! - macOS: pf (Packet Filter) via pfctl
-//! - Linux: iptables with custom `VORTIX_KILLSWITCH` chain
-//!
-//! # Safety
-//!
-//! This module modifies system firewall rules and requires root privileges.
-//! Firewall rules are designed to:
-//! - Always allow loopback traffic
-//! - Always allow local network (RFC1918) traffic
-//! - Allow VPN server IP for reconnection
-//! - Allow all traffic on VPN interface
+//! Kill switch firewall control — relocated trait now lives in `vortix-core`
+//! (plan 003 U1). This module keeps the binary-crate-side state persistence
+//! and the platform dispatch shim until plan 003 U7 swaps callers over to
+//! the `Platform` aggregate.
 
 use crate::constants;
 use crate::logger::{self, LogLevel};
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-use crate::platform::Firewall;
 use crate::state::{KillSwitchMode, KillSwitchState};
 use crate::utils;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[allow(unused_imports)]
+use vortix_core::ports::killswitch::Killswitch;
 
-/// Result type for kill switch operations
-pub type Result<T> = std::result::Result<T, KillSwitchError>;
+// Re-export the canonical types so existing `crate::core::killswitch::*`
+// imports keep resolving.
+pub use vortix_core::ports::killswitch::{KillswitchError, Result};
 
-/// Errors that can occur during kill switch operations
-#[derive(Debug)]
-pub enum KillSwitchError {
-    /// Failed to execute firewall command
-    CommandFailed(String),
-    /// I/O error
-    Io(io::Error),
-    /// Not running as root
-    NotRoot,
-}
-
-impl std::fmt::Display for KillSwitchError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::CommandFailed(msg) => write!(f, "firewall command failed: {msg}"),
-            Self::Io(e) => write!(f, "I/O error: {e}"),
-            Self::NotRoot => write!(f, "kill switch requires root privileges"),
-        }
-    }
-}
-
-impl std::error::Error for KillSwitchError {}
-
-impl From<io::Error> for KillSwitchError {
-    fn from(e: io::Error) -> Self {
-        Self::Io(e)
-    }
-}
+// Backwards-compat alias — the old name is `KillSwitchError`.
+pub type KillSwitchError = KillswitchError;
 
 /// Enable kill switch by loading restrictive firewall rules.
 ///
@@ -71,14 +36,11 @@ impl From<io::Error> for KillSwitchError {
 pub fn enable_blocking(vpn_interface: &str, vpn_server_ip: Option<&str>) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
-        crate::platform::macos::firewall::PfFirewall::enable_blocking(vpn_interface, vpn_server_ip)
+        vortix_platform_macos::PfFirewall::enable_blocking(vpn_interface, vpn_server_ip)
     }
     #[cfg(target_os = "linux")]
     {
-        crate::platform::linux::firewall::IptablesFirewall::enable_blocking(
-            vpn_interface,
-            vpn_server_ip,
-        )
+        vortix_platform_linux::IptablesFirewall::enable_blocking(vpn_interface, vpn_server_ip)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
@@ -95,11 +57,11 @@ pub fn enable_blocking(vpn_interface: &str, vpn_server_ip: Option<&str>) -> Resu
 pub fn disable_blocking() -> Result<()> {
     #[cfg(target_os = "macos")]
     {
-        crate::platform::macos::firewall::PfFirewall::disable_blocking()
+        vortix_platform_macos::PfFirewall::disable_blocking()
     }
     #[cfg(target_os = "linux")]
     {
-        crate::platform::linux::firewall::IptablesFirewall::disable_blocking()
+        vortix_platform_linux::IptablesFirewall::disable_blocking()
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
@@ -149,6 +111,10 @@ pub fn load_state() -> Option<PersistedState> {
 }
 
 /// Save kill switch state to persistence file.
+///
+/// # Errors
+///
+/// Returns [`KillswitchError::Io`] when the file cannot be written.
 pub fn save_state(
     mode: KillSwitchMode,
     state: KillSwitchState,
@@ -187,8 +153,6 @@ pub fn clear_state() {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // pf rules tests are now in platform/macos/firewall.rs
 
     #[test]
     fn test_persisted_state_serialization() {

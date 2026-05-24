@@ -1,20 +1,32 @@
 //! macOS pf (Packet Filter) firewall implementation for kill switch.
 
-use crate::constants;
-use crate::core::killswitch::{KillSwitchError, Result};
-use crate::logger::{self, LogLevel};
-use crate::platform::Firewall;
 use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io::Write as IoWrite;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+use tracing::{debug, error, info};
+use vortix_core::ports::killswitch::{Killswitch, KillswitchError, Result};
 use vortix_process::{CommandSpec, PrivilegeReq};
+
+/// On-disk pf configuration written before each engage.
+const PF_CONF_PATH: &str = "/var/run/vortix/killswitch.conf";
+/// Legacy pf configuration path cleaned up after migration.
+const PF_CONF_PATH_LEGACY: &str = "/tmp/vortix_killswitch.conf";
 
 fn pfctl(args: &[&str]) -> std::io::Result<std::process::Output> {
     let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
     vortix_process::run_to_output(
         CommandSpec::oneshot("pfctl", owned).privilege(PrivilegeReq::Root),
     )
+}
+
+fn is_root() -> bool {
+    // SAFETY: `geteuid` is a thread-safe getter with no side effects.
+    #[allow(unsafe_code)]
+    unsafe {
+        libc::geteuid() == 0
+    }
 }
 
 /// macOS pf-based firewall implementation.
@@ -63,40 +75,27 @@ pass quick on {vpn_interface} all
     }
 }
 
-impl Firewall for PfFirewall {
+impl Killswitch for PfFirewall {
     fn enable_blocking(vpn_interface: &str, vpn_server_ip: Option<&str>) -> Result<()> {
-        logger::log(
-            LogLevel::Info,
-            "FIREWALL",
-            format!(
-                "Enabling kill switch on interface '{}'{}",
-                vpn_interface,
-                vpn_server_ip
-                    .map(|ip| format!(", server: {ip}"))
-                    .unwrap_or_default()
-            ),
+        info!(
+            target: "vortix::killswitch",
+            interface = %vpn_interface,
+            server = ?vpn_server_ip,
+            "killswitch.engage"
         );
 
-        if !crate::utils::is_root() {
-            logger::log(
-                LogLevel::Error,
-                "FIREWALL",
-                "Kill switch requires root privileges",
-            );
-            return Err(KillSwitchError::NotRoot);
+        if !is_root() {
+            error!(target: "vortix::killswitch", "kill switch requires root privileges");
+            return Err(KillswitchError::NotRoot);
         }
 
         let rules = Self::generate_pf_rules(vpn_interface, vpn_server_ip);
 
-        let conf_path = std::path::Path::new(constants::PF_CONF_PATH);
+        let conf_path = std::path::Path::new(PF_CONF_PATH);
         if let Some(parent) = conf_path.parent() {
             if !parent.exists() {
                 fs::create_dir_all(parent)?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
-                }
+                fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
             }
         }
 
@@ -105,82 +104,54 @@ impl Firewall for PfFirewall {
             .create(true)
             .truncate(true)
             .mode(0o600)
-            .open(constants::PF_CONF_PATH)?;
+            .open(PF_CONF_PATH)?;
         file.write_all(rules.as_bytes())?;
 
-        let _ = fs::remove_file(constants::PF_CONF_PATH_LEGACY);
-        logger::log(
-            LogLevel::Debug,
-            "FIREWALL",
-            format!("Wrote pf rules to {}", constants::PF_CONF_PATH),
-        );
+        let _ = fs::remove_file(PF_CONF_PATH_LEGACY);
+        debug!(target: "vortix::killswitch", path = %PF_CONF_PATH, "wrote pf rules");
 
-        let output = pfctl(&["-f", constants::PF_CONF_PATH])?;
+        let output = pfctl(&["-f", PF_CONF_PATH])?;
         if !output.status.success() {
             let err = String::from_utf8_lossy(&output.stderr).to_string();
-            logger::log(
-                LogLevel::Error,
-                "FIREWALL",
-                format!("pfctl -f failed: {err}"),
-            );
-            return Err(KillSwitchError::CommandFailed(err));
+            error!(target: "vortix::killswitch", stderr = %err, "pfctl -f failed");
+            return Err(KillswitchError::CommandFailed(err));
         }
 
         let output = pfctl(&["-e"])?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             if !stderr.contains("enabled") {
-                logger::log(
-                    LogLevel::Error,
-                    "FIREWALL",
-                    format!("pfctl -e failed: {stderr}"),
-                );
-                return Err(KillSwitchError::CommandFailed(stderr.to_string()));
+                error!(target: "vortix::killswitch", stderr = %stderr, "pfctl -e failed");
+                return Err(KillswitchError::CommandFailed(stderr.to_string()));
             }
         }
 
-        logger::log(
-            LogLevel::Info,
-            "FIREWALL",
-            "Kill switch ACTIVE - blocking non-VPN traffic",
-        );
+        info!(target: "vortix::killswitch", "kill switch ACTIVE — blocking non-VPN traffic");
         Ok(())
     }
 
     fn disable_blocking() -> Result<()> {
-        logger::log(LogLevel::Info, "FIREWALL", "Disabling kill switch...");
+        info!(target: "vortix::killswitch", "disabling kill switch");
 
-        if !crate::utils::is_root() {
-            logger::log(
-                LogLevel::Error,
-                "FIREWALL",
-                "Disabling kill switch requires root privileges",
-            );
-            return Err(KillSwitchError::NotRoot);
+        if !is_root() {
+            error!(target: "vortix::killswitch", "disabling kill switch requires root");
+            return Err(KillswitchError::NotRoot);
         }
 
         let output = pfctl(&["-F", "all"])?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             if !stderr.contains("not enabled") {
-                logger::log(
-                    LogLevel::Error,
-                    "FIREWALL",
-                    format!("pfctl -F failed: {stderr}"),
-                );
-                return Err(KillSwitchError::CommandFailed(stderr.to_string()));
+                error!(target: "vortix::killswitch", stderr = %stderr, "pfctl -F failed");
+                return Err(KillswitchError::CommandFailed(stderr.to_string()));
             }
         }
 
         let _ = pfctl(&["-d"])?;
-        let _ = fs::remove_file(constants::PF_CONF_PATH);
-        let _ = fs::remove_file(constants::PF_CONF_PATH_LEGACY);
+        let _ = fs::remove_file(PF_CONF_PATH);
+        let _ = fs::remove_file(PF_CONF_PATH_LEGACY);
 
-        logger::log(
-            LogLevel::Info,
-            "FIREWALL",
-            "Kill switch DISABLED - normal traffic restored",
-        );
+        info!(target: "vortix::killswitch", "kill switch DISABLED — normal traffic restored");
         Ok(())
     }
 }

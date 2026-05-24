@@ -2013,6 +2013,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-width",
  "urlencoding",
+ "vortix-core",
  "vortix-platform-linux",
  "vortix-platform-macos",
  "vortix-process",
@@ -2042,14 +2043,20 @@ dependencies = [
 name = "vortix-platform-linux"
 version = "0.0.0"
 dependencies = [
+ "libc",
+ "tracing",
  "vortix-core",
+ "vortix-process",
 ]
 
 [[package]]
 name = "vortix-platform-macos"
 version = "0.0.0"
 dependencies = [
+ "libc",
+ "tracing",
  "vortix-core",
+ "vortix-process",
 ]
 
 [[package]]

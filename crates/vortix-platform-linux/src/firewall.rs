@@ -2,15 +2,12 @@
 //!
 //! Prefers iptables when available, falls back to nftables (nft).
 
-use crate::constants;
-use crate::core::killswitch::{KillSwitchError, Result};
-use crate::logger::{self, LogLevel};
-use crate::platform::Firewall;
+use tracing::{debug, error, info};
+use vortix_core::ports::killswitch::{Killswitch, KillswitchError, Result};
 use vortix_process::{CommandSpec, PrivilegeReq};
 
-/// Alias for readability within this module.
-const CHAIN_NAME: &str = constants::IPTABLES_CHAIN_NAME;
-const NFT_TABLE: &str = constants::NFT_TABLE_NAME;
+const CHAIN_NAME: &str = "VORTIX_KILLSWITCH";
+const NFT_TABLE: &str = "vortix_killswitch";
 
 /// Detected firewall backend on this system.
 enum FirewallBackend {
@@ -33,13 +30,11 @@ impl IptablesFirewall {
         }
     }
 
-    /// Check if iptables is available on the system.
     fn has_iptables() -> bool {
         vortix_process::run_to_output(CommandSpec::oneshot("iptables", vec!["--version".into()]))
             .is_ok_and(|o| o.status.success())
     }
 
-    /// Check if nftables (nft) is available on the system.
     fn has_nft() -> bool {
         vortix_process::run_to_output(CommandSpec::oneshot("nft", vec!["--version".into()]))
             .is_ok_and(|o| o.status.success())
@@ -69,49 +64,49 @@ impl IptablesFirewall {
 
         // Flush existing rules in our chain
         Self::iptables(&["-F", CHAIN_NAME])
-            .map_err(|e| KillSwitchError::CommandFailed(format!("flush chain: {e}")))?;
+            .map_err(|e| KillswitchError::CommandFailed(format!("flush chain: {e}")))?;
 
         // Add rules to our chain
 
         // Allow loopback
         Self::iptables(&["-A", CHAIN_NAME, "-o", "lo", "-j", "ACCEPT"])
-            .map_err(|e| KillSwitchError::CommandFailed(format!("allow lo: {e}")))?;
+            .map_err(|e| KillswitchError::CommandFailed(format!("allow lo: {e}")))?;
 
         // Allow VPN interface
         Self::iptables(&["-A", CHAIN_NAME, "-o", vpn_interface, "-j", "ACCEPT"])
-            .map_err(|e| KillSwitchError::CommandFailed(format!("allow VPN iface: {e}")))?;
+            .map_err(|e| KillswitchError::CommandFailed(format!("allow VPN iface: {e}")))?;
 
         // Allow local network (RFC1918)
         for net in &["192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12"] {
             Self::iptables(&["-A", CHAIN_NAME, "-d", net, "-j", "ACCEPT"])
-                .map_err(|e| KillSwitchError::CommandFailed(format!("allow {net}: {e}")))?;
+                .map_err(|e| KillswitchError::CommandFailed(format!("allow {net}: {e}")))?;
         }
 
         // Allow DHCP
         Self::iptables(&[
             "-A", CHAIN_NAME, "-p", "udp", "--sport", "68", "--dport", "67", "-j", "ACCEPT",
         ])
-        .map_err(|e| KillSwitchError::CommandFailed(format!("allow DHCP: {e}")))?;
+        .map_err(|e| KillswitchError::CommandFailed(format!("allow DHCP: {e}")))?;
 
         // Allow VPN server IP if known (for reconnection)
         if let Some(ip) = vpn_server_ip {
             Self::iptables(&["-A", CHAIN_NAME, "-d", ip, "-p", "udp", "-j", "ACCEPT"]).map_err(
-                |e| KillSwitchError::CommandFailed(format!("allow VPN server udp: {e}")),
+                |e| KillswitchError::CommandFailed(format!("allow VPN server udp: {e}")),
             )?;
             Self::iptables(&["-A", CHAIN_NAME, "-d", ip, "-p", "tcp", "-j", "ACCEPT"]).map_err(
-                |e| KillSwitchError::CommandFailed(format!("allow VPN server tcp: {e}")),
+                |e| KillswitchError::CommandFailed(format!("allow VPN server tcp: {e}")),
             )?;
         }
 
         // Default: drop everything else
         Self::iptables(&["-A", CHAIN_NAME, "-j", "DROP"])
-            .map_err(|e| KillSwitchError::CommandFailed(format!("default drop: {e}")))?;
+            .map_err(|e| KillswitchError::CommandFailed(format!("default drop: {e}")))?;
 
         // Insert jump to our chain at the top of OUTPUT
         // First remove any existing jump (ignore error)
         let _ = Self::iptables(&["-D", "OUTPUT", "-j", CHAIN_NAME]);
         Self::iptables(&["-I", "OUTPUT", "1", "-j", CHAIN_NAME])
-            .map_err(|e| KillSwitchError::CommandFailed(format!("insert jump: {e}")))?;
+            .map_err(|e| KillswitchError::CommandFailed(format!("insert jump: {e}")))?;
 
         Ok(())
     }
@@ -128,7 +123,6 @@ impl IptablesFirewall {
 
     // ─── nftables backend ───────────────────────────────────────────────
 
-    /// Run an nft command and return success.
     fn nft(args: &[&str]) -> std::result::Result<(), String> {
         let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
         let output = vortix_process::run_to_output(
@@ -147,8 +141,6 @@ impl IptablesFirewall {
     fn setup_nftables(vpn_interface: &str, vpn_server_ip: Option<&str>) -> Result<()> {
         use std::fmt::Write;
 
-        // Build an atomic nft ruleset — applied in one shot so there's no
-        // window where traffic could leak between rule additions.
         let mut ruleset = format!(
             r#"table inet {NFT_TABLE} {{
   chain output {{
@@ -188,10 +180,10 @@ impl IptablesFirewall {
                 .privilege(PrivilegeReq::Root)
                 .stdin(ruleset.into_bytes()),
         )
-        .map_err(|e| KillSwitchError::CommandFailed(format!("nft spawn: {e}")))?;
+        .map_err(|e| KillswitchError::CommandFailed(format!("nft spawn: {e}")))?;
 
         if !output.status.success() {
-            return Err(KillSwitchError::CommandFailed(
+            return Err(KillswitchError::CommandFailed(
                 "nft failed to load ruleset".to_string(),
             ));
         }
@@ -201,79 +193,63 @@ impl IptablesFirewall {
 
     /// Remove the kill switch nftables table.
     fn teardown_nftables() {
-        // Deleting the table removes all chains and rules inside it
         let _ = Self::nft(&["delete", "table", "inet", NFT_TABLE]);
     }
 }
 
-impl Firewall for IptablesFirewall {
+fn is_root() -> bool {
+    // SAFETY: `geteuid` is a thread-safe getter with no side effects.
+    #[allow(unsafe_code)]
+    unsafe {
+        libc::geteuid() == 0
+    }
+}
+
+impl Killswitch for IptablesFirewall {
     fn enable_blocking(vpn_interface: &str, vpn_server_ip: Option<&str>) -> Result<()> {
-        logger::log(
-            LogLevel::Info,
-            "FIREWALL",
-            format!(
-                "Enabling kill switch on interface '{}'{}",
-                vpn_interface,
-                vpn_server_ip
-                    .map(|ip| format!(", server: {ip}"))
-                    .unwrap_or_default()
-            ),
+        info!(
+            target: "vortix::killswitch",
+            interface = %vpn_interface,
+            server = ?vpn_server_ip,
+            "killswitch.engage"
         );
 
-        if !crate::utils::is_root() {
-            logger::log(
-                LogLevel::Error,
-                "FIREWALL",
-                "Kill switch requires root privileges",
-            );
-            return Err(KillSwitchError::NotRoot);
+        if !is_root() {
+            error!(target: "vortix::killswitch", "kill switch requires root privileges");
+            return Err(KillswitchError::NotRoot);
         }
 
         match Self::detect_backend() {
             Some(FirewallBackend::Iptables) => {
-                logger::log(LogLevel::Debug, "FIREWALL", "Using iptables backend");
+                debug!(target: "vortix::killswitch", "using iptables backend");
                 Self::setup_iptables(vpn_interface, vpn_server_ip)?;
             }
             Some(FirewallBackend::Nftables) => {
-                logger::log(LogLevel::Debug, "FIREWALL", "Using nftables backend");
+                debug!(target: "vortix::killswitch", "using nftables backend");
                 Self::setup_nftables(vpn_interface, vpn_server_ip)?;
             }
             None => {
-                return Err(KillSwitchError::CommandFailed(
-                    "Neither iptables nor nft found on this system".to_string(),
-                ));
+                return Err(KillswitchError::NoBackendAvailable);
             }
         }
 
-        logger::log(
-            LogLevel::Info,
-            "FIREWALL",
-            "Kill switch ACTIVE - blocking non-VPN traffic",
-        );
+        info!(target: "vortix::killswitch", "kill switch ACTIVE — blocking non-VPN traffic");
         Ok(())
     }
 
     fn disable_blocking() -> Result<()> {
-        logger::log(LogLevel::Info, "FIREWALL", "Disabling kill switch...");
+        info!(target: "vortix::killswitch", "disabling kill switch");
 
-        if !crate::utils::is_root() {
-            logger::log(
-                LogLevel::Error,
-                "FIREWALL",
-                "Disabling kill switch requires root privileges",
-            );
-            return Err(KillSwitchError::NotRoot);
+        if !is_root() {
+            error!(target: "vortix::killswitch", "disabling kill switch requires root");
+            return Err(KillswitchError::NotRoot);
         }
 
         // Clean up both backends — safe to call on each even if not active
         Self::teardown_iptables();
         Self::teardown_nftables();
 
-        logger::log(
-            LogLevel::Info,
-            "FIREWALL",
-            "Kill switch DISABLED - normal traffic restored",
-        );
+        info!(target: "vortix::killswitch", "kill switch DISABLED — normal traffic restored");
         Ok(())
     }
 }
