@@ -1,0 +1,227 @@
+# Migrating to Vortix v0.3.0
+
+This release lands a large architectural refactor (six internal plans, 28
+commits). For users, the day-to-day surface barely changes. This document
+covers what's automatic, what's optional, and how to roll back if you need
+to.
+
+## TL;DR
+
+- **Upgrade is automatic.** Existing `.conf` and `.ovpn` profiles keep
+  working. No flags to change. `vortix up <profile>`, `down`, `status`,
+  `list`, and `import` behave exactly as before.
+- **Two new optional features:** an encrypted secret store and a JSON
+  event journal. Both have safe defaults; you only opt into the encrypted
+  store explicitly.
+- **Six new additive CLI subcommands.** They surface observability and
+  config — they don't replace anything.
+- **One-line rollback** if you hit trouble: `cargo install vortix --version
+  0.2.2 --force`.
+
+---
+
+## What auto-migrates
+
+The first time v0.3.0 runs, it walks `${XDG_CONFIG_HOME}/vortix/profiles/`
+and creates a sibling `.meta.toml` next to each existing `.conf` /
+`.ovpn`:
+
+```
+~/.config/vortix/profiles/
+├── corp.conf
+├── corp.meta.toml            ← new sidecar, generated automatically
+├── home.ovpn
+└── home.meta.toml            ← new sidecar
+```
+
+Each sidecar carries a stable `profile_id` (SHA-256 of the name + first
+4 KiB of the config), the original `display_name`, and the protocol.
+v0.2.x ignores `.meta.toml` files entirely, so rollback is safe.
+
+The migration is **idempotent** — it re-runs at every startup and only
+touches profiles that don't have a sidecar yet. You can also trigger it
+manually:
+
+```sh
+vortix migrate           # human output with counts
+vortix migrate --json    # JSON output for scripts
+```
+
+If migration ever fails (read-only profile dir, unusual perms, etc.),
+startup continues and the warning is logged to stderr. No panic, no data
+loss.
+
+### Override
+
+If you need to skip the startup backfill — typically while debugging a
+filesystem permission issue — set `VORTIX_SKIP_MIGRATION` in your
+environment:
+
+```sh
+export VORTIX_SKIP_MIGRATION=1
+vortix up corp
+```
+
+Unset it to restore the implicit migration.
+
+---
+
+## What needs manual opt-in
+
+### Encrypted secret store (opt-in)
+
+v0.3.0 adds `vortix secrets {set,get,delete}` backed by a layered store:
+the OS keyring first (Keychain on macOS, Secret Service on Linux), with
+an AES-256-GCM + argon2id encrypted file as fallback when no keyring is
+available.
+
+By default the store is empty and the rest of vortix doesn't touch it.
+Use it if you want to:
+
+- Keep OpenVPN auth credentials out of plain `.auth` files (see below)
+- Store a passphrase or token alongside a profile without inlining it
+  into the `.conf`
+
+Examples:
+
+```sh
+echo -n 'username:password' | vortix secrets set creds/corp
+vortix secrets get creds/corp        # echoes the value
+vortix secrets delete creds/corp
+```
+
+The encrypted-file fallback lives at `${XDG_CONFIG_HOME}/vortix/secrets.enc`.
+You don't need a passphrase if the keyring works — but on headless Linux
+without `libsecret`, the encrypted-file path needs one (the binary will
+prompt the first time).
+
+### Session event journal (default on, opt-out)
+
+v0.3.0 writes a JSON-lines event journal at
+`${XDG_DATA_HOME}/vortix/sessions/<ISO>-<pid>.jsonl` for every run.
+Retention is 30 days / 30 files (whichever cap hits first). Each line is
+an `EngineEvent` record: connection state transitions, tunnel up/down,
+IP changes, telemetry samples, and so on.
+
+```sh
+vortix journal path           # prints current session's file
+vortix journal tail 50        # last 50 events from in-memory tail
+```
+
+If you don't want disk persistence, set in `~/.config/vortix/settings.toml`:
+
+```toml
+[journal]
+disk = false
+```
+
+The broadcast bus still works (so the TUI's live event stream is
+unaffected); only the on-disk JSONL file is suppressed.
+
+### Layered settings (opt-in if you want overrides)
+
+A new `settings.toml` is read with figment-style layering: built-in
+defaults → `/etc/vortix/config.toml` (system) →
+`${XDG_CONFIG_HOME}/vortix/settings.toml` (user) → `VORTIX_*` env vars
+(highest precedence). You don't need to create the file. To see what's
+currently active:
+
+```sh
+vortix settings               # TOML, the resolved stack
+vortix settings --json        # JSON, same content
+```
+
+---
+
+## OpenVPN auth: nothing changes unless you want it to
+
+Existing `${XDG_CONFIG_HOME}/vortix/auth/<profile>.auth` files keep
+working exactly as before. The `OvpnTunnel` honors them on every
+`vortix up`.
+
+To optionally move credentials into the encrypted store:
+
+```sh
+echo -n 'username:password' | vortix secrets set creds/corp
+rm ~/.config/vortix/auth/corp.auth
+vortix up corp                # tunnel pulls from the secret store now
+```
+
+When both exist, the secret store takes precedence; the legacy `.auth`
+file is the fallback.
+
+To share a profile with credentials inlined for one-shot use (be
+careful — this writes the password into the export):
+
+```sh
+vortix export corp --inline-secrets > corp-with-creds.ovpn
+# Recipient: cat corp-with-creds.ovpn | vortix import - && vortix up corp
+```
+
+The inlined form appears as a `# vortix-secret:<base64>` trailing
+comment that v0.3.x picks up on import. v0.2.x silently ignores it as a
+comment, so the file is forward-compatible.
+
+---
+
+## New CLI surface at a glance
+
+Everything here is additive. Pre-v0.3.0 commands are unchanged.
+
+| Command | What it does | Replaces |
+|---|---|---|
+| `vortix engine {status,connect,disconnect}` | Direct CLI access to the new Engine FSM and its async handle | nothing — `up`/`down`/`status` still work |
+| `vortix journal {path,tail [N]}` | Session journal location + in-memory tail | new |
+| `vortix settings [--json]` | Print the resolved settings stack | new |
+| `vortix secrets {set,get,delete} <id>` | Manage the layered secret store | new |
+| `vortix migrate [--json]` | Manual trigger for the idempotent sidecar backfill | new (runs implicitly at startup) |
+| `vortix export <profile> [--inline-secrets]` | Stream a profile config to stdout, optionally inlining stored credentials | new |
+
+All commands support `--json` where the output is structured.
+
+---
+
+## Rollback
+
+If anything breaks, downgrade to v0.2.2:
+
+```sh
+# crates.io
+cargo install vortix --version 0.2.2 --force
+
+# Homebrew
+brew uninstall vortix && brew install vortix@0.2.2  # if pinned tap exists
+# (otherwise: brew install with explicit version via tap revision)
+
+# npm
+npm install -g @harry-kp/vortix@0.2.2
+```
+
+What rollback does to your data:
+
+- `.meta.toml` sidecars left behind are inert to v0.2.x — they're
+  ignored, not parsed. Leave them in place or delete them; either
+  works.
+- `secrets.enc` in `${XDG_CONFIG_HOME}/vortix/` is untouched by v0.2.x.
+  Either keep it for the next upgrade attempt or delete it.
+- `sessions/*.jsonl` under `${XDG_DATA_HOME}/vortix/` are pure
+  observability data; delete the directory if you want.
+- `settings.toml` is ignored by v0.2.x. Your old `config.toml` (if any)
+  is untouched.
+
+There's no data destructively rewritten by v0.3.0 — every change is
+read-then-write-new-file.
+
+---
+
+## Got stuck?
+
+Run `vortix bug-report` — v0.3.0 attaches the current session's
+journal path and the last 10 event kinds, so the report carries the
+state you'd otherwise need to recreate by hand. Paste the output into
+a new issue.
+
+Linux-specific issues are tracked in
+[discussion #184](https://github.com/Harry-kp/vortix/discussions/184).
+If you tested an RC build, drop a note in that thread before opening a
+fresh issue — odds are good a fellow tester already saw it.
