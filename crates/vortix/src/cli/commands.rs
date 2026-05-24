@@ -76,11 +76,89 @@ pub fn handle_command(
             super::report::run(config_dir, config_source);
             0
         }
+        Commands::Export {
+            profile,
+            inline_secrets,
+        } => handle_export(config_dir, profile, *inline_secrets, mode),
         Commands::Completions { shell } => {
             handle_completions(*shell);
             0
         }
     }
+}
+
+/// Read a profile's raw config bytes and stream them to stdout.
+///
+/// Today this is a thin wrapper over the existing profiles dir + on-disk
+/// `.conf` / `.ovpn` files. Once plan 006 U4 lands the sidecar migration
+/// and U5 the `SecretStore` integration, this respects `--inline-secrets`
+/// by materialising stored credentials into the output.
+fn handle_export(
+    config_dir: &Path,
+    profile_name: &str,
+    inline_secrets: bool,
+    mode: OutputMode,
+) -> i32 {
+    use std::io::Write;
+    use vortix_config::profile_store::{FsProfileStore, ProfileStore};
+    use vortix_core::profile::ProfileId;
+
+    let store = FsProfileStore::new(config_dir.join(constants::PROFILES_DIR_NAME));
+
+    // Profiles today are keyed by display_name on disk (no sidecars yet);
+    // try both the new id-based lookup and the legacy name-based path.
+    let resolved = store.list().ok().and_then(|list| {
+        list.into_iter()
+            .find(|p| p.id.as_str() == profile_name || p.display_name == profile_name)
+    });
+
+    let raw = if let Some(summary) = resolved {
+        match store.get(&summary.id) {
+            Ok(profile) => std::fs::read(&profile.config_path).ok(),
+            Err(_) => None,
+        }
+    } else {
+        // Legacy fallback: glob the profiles dir for a matching name.
+        legacy_profile_bytes(&config_dir.join(constants::PROFILES_DIR_NAME), profile_name)
+    };
+
+    let Some(bytes) = raw else {
+        use crate::cli::output::{CliError, ExitCode};
+        print_error_and_exit(
+            mode,
+            "export",
+            CliError {
+                code: "ProfileNotFound",
+                message: format!("profile '{profile_name}' not found"),
+                hint: Some("List available profiles with: vortix list".to_string()),
+            },
+            ExitCode::NotFound,
+        );
+    };
+
+    // --inline-secrets currently has nothing to inline (plan 006 U5
+    // integration lands separately). Emit a header comment so consumers
+    // know the export is faithful to whatever's on disk.
+    if inline_secrets {
+        let _ = ProfileId::new(profile_name);
+        eprintln!(
+            "# vortix: --inline-secrets requested; no stored secrets to materialise yet (plan 006 U5)"
+        );
+    }
+
+    let _ = std::io::stdout().write_all(&bytes);
+    let _ = mode; // mode currently unused; export is human-or-binary stream
+    0
+}
+
+fn legacy_profile_bytes(profiles_dir: &Path, profile_name: &str) -> Option<Vec<u8>> {
+    for ext in ["conf", "ovpn"] {
+        let candidate = profiles_dir.join(format!("{profile_name}.{ext}"));
+        if candidate.is_file() {
+            return std::fs::read(&candidate).ok();
+        }
+    }
+    None
 }
 
 // ── Connection ──────────────────────────────────────────────────────────

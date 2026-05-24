@@ -285,6 +285,27 @@ pub enum Commands {
     ///     vortix report
     Report,
 
+    /// Export a profile's raw config to stdout (plan 006 U6)
+    ///
+    /// Reads the profile from the configured profiles directory and prints
+    /// the raw `.conf` / `.ovpn` body. With `--inline-secrets`, any
+    /// SecretStore-backed credentials are materialised into the output
+    /// (today this is a no-op since no secrets are stored; the flag is
+    /// reserved for future plan 006 U5 integration).
+    ///
+    /// EXAMPLES:
+    ///     vortix export corp
+    ///     vortix export corp --inline-secrets > /tmp/corp-portable.conf
+    Export {
+        /// Profile name to export
+        #[arg(value_hint = ValueHint::Other)]
+        profile: String,
+
+        /// Materialise SecretStore-backed credentials into the output.
+        #[arg(long)]
+        inline_secrets: bool,
+    },
+
     /// Generate shell completions for vortix
     ///
     /// EXAMPLES:
