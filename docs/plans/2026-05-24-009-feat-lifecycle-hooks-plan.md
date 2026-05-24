@@ -2,7 +2,7 @@
 plan_id: 2026-05-24-009
 title: "feat: Lifecycle hooks (pre/post connect/disconnect)"
 type: feat
-status: completed
+status: deferred-to-v0.3.x
 created: 2026-05-24
 target_version: 0.4.0
 target_branch: TBD (post v0.3.0 GA)
