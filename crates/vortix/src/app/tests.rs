@@ -25,6 +25,7 @@ fn test_app() -> App {
     engine.config_dir = std::env::temp_dir().join(format!("vortix_test_{}", std::process::id()));
     App {
         engine,
+        engine_handle: None,
         should_quit: false,
         logs_scroll: 0,
         logs_auto_scroll: true,
