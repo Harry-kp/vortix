@@ -530,6 +530,10 @@ impl App {
 
             KeyCode::Char('K') => self.handle_message(Message::ToggleKillSwitch),
             KeyCode::Char('?') => self.handle_message(Message::OpenHelp),
+            // Plan 016 U4: capital H toggles the lifecycle-hooks
+            // overlay (lowercase h remains the vim-style previous-
+            // panel binding via handle_panel_keys).
+            KeyCode::Char('H') => self.handle_message(Message::ToggleHooksOverlay),
             KeyCode::Char('/') => self.handle_message(Message::OpenSearch),
 
             _ => self.handle_panel_keys(key),

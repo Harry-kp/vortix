@@ -26,6 +26,7 @@ const HELP_TEXT: &[(&str, &[(&str, &str)])] = &[
             ("b", "Bulk action menu"),
             ("/", "Search profiles"),
             ("?", "Toggle this help"),
+            ("H", "Lifecycle Hooks overlay"),
             ("q", "Quit"),
         ],
     ),

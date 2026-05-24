@@ -2194,6 +2194,33 @@ fn hook_timed_out_emits_warning_toast() {
 }
 
 #[test]
+fn toggle_hooks_overlay_flips_state() {
+    let mut app = test_app();
+    assert!(!app.show_hooks_overlay);
+    app.handle_message(Message::ToggleHooksOverlay);
+    assert!(app.show_hooks_overlay);
+    app.handle_message(Message::ToggleHooksOverlay);
+    assert!(!app.show_hooks_overlay);
+}
+
+#[test]
+fn toggle_hooks_overlay_closes_other_top_level_overlays() {
+    let mut app = test_app();
+    app.show_action_menu = true;
+    app.handle_message(Message::ToggleHooksOverlay);
+    assert!(app.show_hooks_overlay);
+    assert!(!app.show_action_menu);
+}
+
+#[test]
+fn close_overlay_message_closes_hooks_overlay() {
+    let mut app = test_app();
+    app.show_hooks_overlay = true;
+    app.handle_message(Message::CloseOverlay);
+    assert!(!app.show_hooks_overlay);
+}
+
+#[test]
 fn hook_config_errors_handler_is_a_noop_until_u5() {
     let mut app = test_app();
     app.handle_message(Message::HookConfigErrors(vec!["bad".into()]));
