@@ -72,7 +72,7 @@ keyring = { workspace = true }
 aes-gcm = { workspace = true }
 argon2 = { workspace = true }
 zeroize = { workspace = true }
-rand = "0.8"
+rand = "0.10"
 sha2 = "0.11"
 
 # System calls (for root detection + platform crates)
