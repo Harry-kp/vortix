@@ -44,7 +44,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 enum_dispatch = "0.3"
 
 # Secrets storage (per docs/plans/2026-05-24-006)
-keyring = { version = "3", default-features = true }
+keyring = { version = "4", default-features = true }
 aes-gcm = "0.10"
 argon2 = "0.5"
 zeroize = { version = "1", features = ["derive"] }
