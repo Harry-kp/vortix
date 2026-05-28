@@ -5,9 +5,11 @@ use std::fs;
 use std::io::Write as IoWrite;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-use crate::vortix_core::ports::killswitch::{Killswitch, KillswitchError, Result};
+use crate::vortix_core::ports::killswitch::{
+    ActiveTunnelInfo, Killswitch, KillswitchError, Result,
+};
 use crate::vortix_process::{CommandSpec, PrivilegeReq};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// On-disk pf configuration written before each engage.
 const PF_CONF_PATH: &str = "/var/run/vortix/killswitch.conf";
@@ -75,8 +77,8 @@ pass quick on {vpn_interface} all
     }
 }
 
-impl Killswitch for PfFirewall {
-    fn enable_blocking(vpn_interface: &str, vpn_server_ip: Option<&str>) -> Result<()> {
+impl PfFirewall {
+    fn enable_blocking_single(vpn_interface: &str, vpn_server_ip: Option<&str>) -> Result<()> {
         info!(
             target: "vortix::killswitch",
             interface = %vpn_interface,
@@ -128,6 +130,36 @@ impl Killswitch for PfFirewall {
 
         info!(target: "vortix::killswitch", "kill switch ACTIVE — blocking non-VPN traffic");
         Ok(())
+    }
+}
+
+impl Killswitch for PfFirewall {
+    /// Multi-tunnel killswitch stub — installs single-tunnel rules for
+    /// the *first* `ActiveTunnelInfo` and ignores the rest. Real
+    /// multi-interface pfctl ruleset synthesis lands in U10.
+    fn enable_blocking_multi(active: &[ActiveTunnelInfo]) -> Result<()> {
+        if !is_root() {
+            error!(target: "vortix::killswitch", "kill switch requires root privileges");
+            return Err(KillswitchError::NotRoot);
+        }
+
+        if active.is_empty() {
+            info!(target: "vortix::killswitch", "killswitch.engage active=0 — no per-tunnel rules");
+            return Ok(());
+        }
+
+        if active.len() > 1 {
+            warn!(
+                target: "vortix::killswitch",
+                tunnels = active.len(),
+                "multi-tunnel killswitch stubbed — only first tunnel's rules are installed (pending U10)"
+            );
+        }
+
+        let first = &active[0];
+        let server_ip_owned: Option<String> = first.server_ips.first().map(ToString::to_string);
+        let server_ip: Option<&str> = server_ip_owned.as_deref();
+        Self::enable_blocking_single(&first.interface, server_ip)
     }
 
     fn disable_blocking() -> Result<()> {
