@@ -1,8 +1,8 @@
 //! Daemon IPC server loop (plan 015 phase D U18 / plan 010).
 //!
-//! Single-client-at-a-time. Accept → read frame → dispatch → write
-//! response → loop until client disconnects. Multi-client support is
-//! follow-up scope.
+//! Single-client-at-a-time. Accept → peer-UID check → read frame →
+//! dispatch → write response → loop until client disconnects.
+//! Multi-client support is follow-up scope.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -14,11 +14,19 @@ use crate::vortix_core::ipc::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
-/// The daemon server. Holds the socket binding + the engine handle.
+/// The daemon server. Holds the socket binding, engine handle, and
+/// the effective UID captured at bind time for peer-UID enforcement.
 pub struct DaemonServer {
     socket_path: PathBuf,
     listener: UnixListener,
     engine_handle: Option<Arc<EngineHandle>>,
+    /// The effective UID of the daemon process at bind time. Every
+    /// accepted client is checked against this value via
+    /// `SO_PEERCRED` (Linux) / `getpeereid(2)` (macOS) and rejected
+    /// if they do not match. This is the security boundary that
+    /// prevents a local UID escalation from compromising the daemon
+    /// even when the socket file's mode 0600 has been bypassed.
+    daemon_uid: u32,
 }
 
 impl DaemonServer {
@@ -39,8 +47,9 @@ impl DaemonServer {
         let _ = std::fs::remove_file(&socket_path);
         let listener = UnixListener::bind(&socket_path)?;
         // Restrict access — only the daemon's owning UID should be
-        // able to connect at the filesystem level. Phase E adds
-        // SO_PEERCRED auth on top.
+        // able to connect at the filesystem level. SO_PEERCRED /
+        // getpeereid auth (below, on each accept) is the in-depth
+        // guard on top of this.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -48,10 +57,16 @@ impl DaemonServer {
             perms.set_mode(0o600);
             std::fs::set_permissions(&socket_path, perms)?;
         }
+        // SAFETY: `geteuid` is a vDSO-fast syscall on Linux and a
+        // trivial syscall on macOS. It cannot fail and has no
+        // pointer arguments.
+        #[allow(unsafe_code)]
+        let daemon_uid = unsafe { libc::geteuid() };
         Ok(Self {
             socket_path,
             listener,
             engine_handle: None,
+            daemon_uid,
         })
     }
 
@@ -71,6 +86,13 @@ impl DaemonServer {
         &self.socket_path
     }
 
+    /// The daemon's own effective UID, captured at bind time. Used
+    /// to authenticate connecting clients on each accept.
+    #[must_use]
+    pub fn daemon_uid(&self) -> u32 {
+        self.daemon_uid
+    }
+
     /// Accept loop. Returns when the listener is dropped or SIGTERM
     /// arrives (caller handles signal observation; this future
     /// terminates cleanly via `select!` from the caller).
@@ -81,11 +103,12 @@ impl DaemonServer {
                 "daemon started without an engine handle — Execute/Snapshot/Subscribe will return Internal errors"
             );
         }
+        let daemon_uid = self.daemon_uid;
         loop {
             match self.listener.accept().await {
                 Ok((stream, _addr)) => {
                     let handle = self.engine_handle.clone();
-                    if let Err(e) = handle_client(stream, handle).await {
+                    if let Err(e) = handle_client(stream, daemon_uid, handle).await {
                         eprintln!("vortix daemon: client session ended: {e}");
                     }
                 }
@@ -110,10 +133,55 @@ impl Drop for DaemonServer {
 
 /// Handle one client connection. Reads framed requests, dispatches
 /// them, writes framed responses. Returns when the client disconnects.
+///
+/// Before any dispatching, the peer's UID is checked against the
+/// daemon's own UID via `SO_PEERCRED` (Linux) / `getpeereid` (macOS).
+/// A mismatched peer receives a single `IpcError::Unauthorized` frame
+/// (best-effort) and the connection is closed.
 async fn handle_client(
     mut stream: UnixStream,
+    daemon_uid: u32,
     engine_handle: Option<Arc<EngineHandle>>,
 ) -> Result<(), DaemonError> {
+    // Peer-UID enforcement runs before any frame is read so an
+    // unauthorized client never gets the chance to drive dispatch.
+    match get_peer_uid(&stream) {
+        Ok(peer_uid) if peer_uid == daemon_uid => { /* authorized; fall through */ }
+        Ok(peer_uid) => {
+            tracing::warn!(
+                peer_uid,
+                daemon_uid,
+                "rejecting client with UID mismatch"
+            );
+            // Best-effort notify-and-close: write a single
+            // Unauthorized frame so the client surfaces a typed
+            // error rather than an opaque EOF.
+            let resp = IpcResponse {
+                id: 0,
+                result: Err(IpcError::Unauthorized),
+            };
+            if let Ok(frame) = encode_frame(&resp) {
+                let _ = stream.write_all(&frame).await;
+                let _ = stream.shutdown().await;
+            }
+            return Ok(());
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "peer-UID lookup failed; closing connection");
+            let resp = IpcResponse {
+                id: 0,
+                result: Err(IpcError::Internal(format!(
+                    "peer-UID lookup failed: {e}"
+                ))),
+            };
+            if let Ok(frame) = encode_frame(&resp) {
+                let _ = stream.write_all(&frame).await;
+                let _ = stream.shutdown().await;
+            }
+            return Ok(());
+        }
+    }
+
     let mut buf = Vec::with_capacity(4096);
     let mut read_pos = 0usize;
     loop {
@@ -144,6 +212,72 @@ async fn handle_client(
             buf.drain(..read_pos);
             read_pos = 0;
         }
+    }
+}
+
+/// Look up the peer UID on an accepted Unix-domain socket connection.
+///
+/// Linux uses `SO_PEERCRED` (returns `struct ucred` with pid/uid/gid).
+/// macOS uses `getpeereid(2)` (returns uid + gid directly). Both are
+/// syscall-level primitives with no portable abstraction in `std` or
+/// `tokio`, hence the platform cfg gating lives here rather than in a
+/// `vortix-platform-*` crate.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn get_peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
+    use std::os::unix::io::AsRawFd;
+    let fd = stream.as_raw_fd();
+
+    // xtask:allow-platform-cfg: SO_PEERCRED/getpeereid are syscall-level primitives, no abstraction layer available.
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: `getsockopt` writes at most `len` bytes into the
+        // pointer we provide. We zero-initialize a `ucred` (a POD
+        // struct of three integers) and pass its size; the kernel
+        // either fills it and returns 0, or returns -1 and sets
+        // errno without touching the buffer.
+        unsafe {
+            let mut cred: libc::ucred = std::mem::zeroed();
+            let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+            let rc = libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                std::ptr::addr_of_mut!(cred).cast::<libc::c_void>(),
+                &mut len,
+            );
+            if rc != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(cred.uid)
+        }
+    }
+
+    // xtask:allow-platform-cfg: SO_PEERCRED/getpeereid are syscall-level primitives, no abstraction layer available.
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: `getpeereid` writes exactly one `uid_t` and one
+        // `gid_t` into the two out-pointers we provide. We pass
+        // pointers to stack locals of the correct types.
+        unsafe {
+            let mut uid: libc::uid_t = 0;
+            let mut gid: libc::gid_t = 0;
+            let rc = libc::getpeereid(fd, &mut uid, &mut gid);
+            if rc != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(uid)
+        }
+    }
+
+    // xtask:allow-platform-cfg: SO_PEERCRED/getpeereid are syscall-level primitives, no abstraction layer available.
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = fd;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "peer-UID lookup not supported on this unix variant",
+        ))
     }
 }
 
@@ -218,12 +352,16 @@ impl From<std::io::Error> for DaemonError {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
+#[allow(unsafe_code)]
 mod tests {
     use super::*;
     use crate::vortix_core::engine::input::UserCommand;
     use crate::vortix_core::engine::state::Connection;
     use crate::vortix_core::profile::ProfileId;
+    use tokio::net::UnixStream as TokioUnixStream;
+
+    // ===== D1 dispatch tests =====
 
     #[tokio::test]
     async fn dispatch_execute_without_handle_returns_internal_error() {
@@ -312,5 +450,86 @@ mod tests {
         };
         let resp = dispatch(req, Some(&handle)).await;
         assert!(matches!(resp.result, Ok(IpcResult::Subscribed)));
+    }
+
+    // ===== D2 peer-UID enforcement tests =====
+
+    /// Helper: pick a unique temp socket path.
+    fn fresh_socket_path() -> PathBuf {
+        let mut p = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        p.push(format!("vortix-test-{}-{nanos}.sock", std::process::id()));
+        p
+    }
+
+    #[tokio::test]
+    async fn peer_uid_matches_daemon_uid_for_same_process() {
+        // Same-process connect: UID matches, dispatch fires normally.
+        let socket = fresh_socket_path();
+        let server = DaemonServer::bind(socket.clone()).expect("bind");
+        let daemon_uid = server.daemon_uid();
+        // SAFETY: trivial syscall, see DaemonServer::bind.
+        let process_uid = unsafe { libc::geteuid() };
+        assert_eq!(daemon_uid, process_uid, "daemon UID captured correctly");
+
+        let handle = tokio::spawn(server.run());
+
+        let mut client = loop {
+            match TokioUnixStream::connect(&socket).await {
+                Ok(s) => break s,
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            }
+        };
+
+        // Shutdown is the simplest op — dispatched regardless of engine handle.
+        let req = IpcRequest { id: 7, op: IpcOp::Shutdown };
+        let frame = encode_frame(&req).expect("encode");
+        client.write_all(&frame).await.expect("write");
+
+        let mut buf = vec![0u8; 4096];
+        let n = client.read(&mut buf).await.expect("read");
+        let (resp, _) = decode_frame::<IpcResponse>(&buf[..n])
+            .expect("decode ok")
+            .expect("complete frame");
+        assert_eq!(resp.id, 7);
+        assert!(matches!(resp.result, Ok(IpcResult::ShuttingDown)));
+
+        handle.abort();
+        let _ = std::fs::remove_file(&socket);
+    }
+
+    #[tokio::test]
+    async fn unauthorized_path_emits_unauthorized_frame_without_dispatch() {
+        // Force the rejection branch by passing a daemon_uid the
+        // peer can never match (u32::MAX is never a real UID).
+        let (server_end, mut client_end) = TokioUnixStream::pair().expect("socketpair");
+
+        let fake_daemon_uid = u32::MAX;
+        let server_task = tokio::spawn(async move {
+            handle_client(server_end, fake_daemon_uid, None).await
+        });
+
+        let mut buf = vec![0u8; 4096];
+        let n = client_end.read(&mut buf).await.expect("read");
+        let (resp, _) = decode_frame::<IpcResponse>(&buf[..n])
+            .expect("decode ok")
+            .expect("complete frame");
+        assert_eq!(resp.id, 0, "unauthorized frame uses id=0");
+        assert!(matches!(resp.result, Err(IpcError::Unauthorized)));
+
+        let outcome = server_task.await.expect("join");
+        assert!(outcome.is_ok());
+    }
+
+    #[tokio::test]
+    async fn get_peer_uid_returns_current_process_uid_on_socketpair() {
+        let (a, _b) = TokioUnixStream::pair().expect("socketpair");
+        let uid = get_peer_uid(&a).expect("peer uid lookup");
+        // SAFETY: trivial syscall, see DaemonServer::bind.
+        let me = unsafe { libc::geteuid() };
+        assert_eq!(uid, me);
     }
 }
