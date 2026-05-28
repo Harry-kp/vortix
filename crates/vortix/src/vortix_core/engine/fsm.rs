@@ -66,6 +66,13 @@ pub struct Engine<T: Tunnel> {
     /// triggers `EngineError::ProfileNotFound` semantics (today we just
     /// transition to `Disconnected { last_failure: ProfileGone }`).
     profile_resolver: ProfileResolver,
+    /// Queued-connect slot used by `TunnelRegistry` when a user requests
+    /// "connect B" while this FSM (A) is mid-`Disconnecting`. The registry
+    /// stashes B's `ProfileId` here; when the registry observes A reaching
+    /// `Disconnected`, it fires the queued connect and clears the slot.
+    /// Plan #001 (multi-connection) U5 §6.6 race row. `None` in single-tunnel
+    /// mode.
+    pending_after_disconnect: Option<ProfileId>,
 }
 
 impl<T: Tunnel> Engine<T> {
@@ -80,6 +87,7 @@ impl<T: Tunnel> Engine<T> {
             tunnel_factory: None,
             settings: EngineSettings::default(),
             profile_resolver: Box::new(profile_resolver),
+            pending_after_disconnect: None,
         }
     }
 
@@ -102,6 +110,28 @@ impl<T: Tunnel> Engine<T> {
     #[must_use]
     pub fn state(&self) -> &Connection {
         &self.state
+    }
+
+    /// Profile currently in scope (`None` only when `Disconnected`).
+    ///
+    /// Convenience accessor for `self.state().profile_id().cloned()` used by
+    /// `TunnelRegistry` when enumerating snapshots.
+    #[must_use]
+    pub fn profile_id(&self) -> Option<ProfileId> {
+        self.state.profile_id().cloned()
+    }
+
+    /// The `ProfileId` queued to be connected once this FSM reaches
+    /// `Disconnected`. See `pending_after_disconnect` field doc.
+    #[must_use]
+    pub fn pending_after_disconnect(&self) -> Option<&ProfileId> {
+        self.pending_after_disconnect.as_ref()
+    }
+
+    /// Stash a queued-connect target for the registry to fire once this FSM
+    /// finishes its current `Disconnecting` transition.
+    pub fn set_pending_after_disconnect(&mut self, profile_id: Option<ProfileId>) {
+        self.pending_after_disconnect = profile_id;
     }
 
     /// Drive one input through the FSM. Returns the events emitted during
