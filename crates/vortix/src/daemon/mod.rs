@@ -26,7 +26,67 @@ mod server;
 
 pub use server::DaemonServer;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// Build an `EngineHandle::Local` for hosting the FSM in-process.
+///
+/// Shared bootstrap path between `run_tui` (in-process engine for the TUI)
+/// and `vortix daemon` (engine hosted behind the IPC server). The caller
+/// MUST invoke this from within an active tokio runtime context — the
+/// handle spawns its actor task immediately.
+///
+/// Returns `None` when prerequisites are missing (no real runner installed,
+/// no global journal). Failure is non-fatal: both call sites already
+/// tolerate `engine_handle: Option<...>` and fall back to legacy in-process
+/// state.
+///
+/// `profiles_dir` is the directory containing per-profile sidecars
+/// (`<config_dir>/profiles`). It seeds the `FsProfileStore`-backed
+/// resolver.
+#[must_use]
+pub fn build_engine_handle(
+    profiles_dir: &Path,
+) -> Option<crate::vortix_core::engine::EngineHandle> {
+    use crate::state::Protocol;
+    use crate::tunnel::{tunnel_for_with_secrets, TunnelKind};
+    use crate::vortix_config::profile_store::{FsProfileStore, ProfileStore};
+    use crate::vortix_core::engine::{Engine, EngineHandle};
+    use crate::vortix_core::profile::{ProfileId, ProtocolKind};
+    use crate::vortix_protocol_wireguard::WgTunnel;
+
+    // Prerequisites: real subprocess runner + journal. Both are installed
+    // very early in `main.rs`; their absence means the bootstrap order
+    // was disturbed (e.g. a unit test harness skipping the runner) — bail
+    // out so callers fall back to legacy paths.
+    let _runner = crate::vortix_process::global_runner().as_real()?;
+    let journal = crate::vortix_core::journal::global_journal().cloned()?;
+
+    // Live profile resolver — reads sidecars via `FsProfileStore` so any
+    // consumer calling `handle.execute(Connect{id})` sees the user's
+    // actual profiles (post-migration).
+    let resolver_dir = profiles_dir.to_path_buf();
+    let resolver = move |id: &ProfileId| {
+        let store = FsProfileStore::new(resolver_dir.clone());
+        store.get(id).ok()
+    };
+
+    // Per-Connect tunnel factory — picks WG vs OVPN from the resolved
+    // profile's protocol. Plan 006 U6's wire-up.
+    let factory_config_dir =
+        crate::utils::get_app_config_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
+    let factory = move |profile: &crate::vortix_core::profile::Profile| {
+        let proto = match profile.protocol {
+            ProtocolKind::OpenVpn => Protocol::OpenVPN,
+            // Default to WireGuard for any future variants.
+            _ => Protocol::WireGuard,
+        };
+        tunnel_for_with_secrets(proto, &factory_config_dir, "3", 30)
+    };
+
+    let initial_tunnel = TunnelKind::WireGuard(WgTunnel::new());
+    let engine = Engine::new(initial_tunnel, resolver).with_tunnel_factory(factory);
+    Some(EngineHandle::local(engine, journal))
+}
 
 /// Default socket path. Linux uses `${XDG_RUNTIME_DIR}/vortix.sock`
 /// when set; otherwise falls back to `/tmp`. macOS uses `${TMPDIR}`.

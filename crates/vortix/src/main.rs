@@ -296,47 +296,20 @@ fn run_tui(
     // FSM and gets a per-profile tunnel factory so a single
     // `Engine<TunnelKind>` drives both WG and OVPN. The actor spawns on
     // the bundled tokio runtime. Failure is non-fatal.
+    //
+    // The construction itself lives in `daemon::build_engine_handle` so
+    // both the TUI bootstrap (here) and `vortix daemon` (`handle_daemon`)
+    // produce the same shape.
     if let Some(runtime) = vortix::vortix_process::global_runner().as_real() {
         let _guard = runtime.runtime().handle().enter();
-        if let Some(journal) = vortix::vortix_core::journal::global_journal().cloned() {
-            use vortix::state::Protocol;
-            use vortix::tunnel::{tunnel_for_with_secrets, TunnelKind};
-            use vortix::vortix_config::profile_store::{FsProfileStore, ProfileStore};
-            use vortix::vortix_core::engine::{Engine, EngineHandle};
-            use vortix::vortix_core::profile::{ProfileId, ProtocolKind};
-            use vortix::vortix_protocol_wireguard::WgTunnel;
-
-            // Live profile resolver — reads sidecars via FsProfileStore so
-            // any consumer calling `handle.execute(Connect{id})` sees the
-            // user's actual profiles (post-migration).
-            let resolver_dir = profiles_dir_for_resolver.clone();
-            let resolver = move |id: &ProfileId| {
-                let store = FsProfileStore::new(resolver_dir.clone());
-                store.get(id).ok()
-            };
-
-            // Per-Connect tunnel factory — picks WG vs OVPN from the
-            // resolved profile's protocol. Plan 006 U6's wire-up.
-            let factory_config_dir = vortix::utils::get_app_config_dir()
-                .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
-            let factory = move |profile: &vortix::vortix_core::profile::Profile| {
-                let proto = match profile.protocol {
-                    ProtocolKind::OpenVpn => Protocol::OpenVPN,
-                    // Default to WireGuard for any future variants.
-                    _ => Protocol::WireGuard,
-                };
-                tunnel_for_with_secrets(proto, &factory_config_dir, "3", 30)
-            };
-
-            let initial_tunnel = TunnelKind::WireGuard(WgTunnel::new());
-            let engine = Engine::new(initial_tunnel, resolver).with_tunnel_factory(factory);
-            let handle = EngineHandle::local(engine, journal);
+        if let Some(handle) = vortix::daemon::build_engine_handle(&profiles_dir_for_resolver) {
             app = app.with_engine_handle(handle);
 
             // Plan 005 U7: spawn a journal-subscriber task that reacts
             // to engine events. Today it nudges the legacy telemetry
             // worker on `TunnelUp` so connect → IP-refresh happens
             // promptly. Future units route more flows through here.
+            // TUI-only side-effect — the daemon path doesn't need it.
             if let Some(j) = vortix::vortix_core::journal::global_journal() {
                 let mut rx = j.subscribe();
                 let nudge = app.engine.telemetry_nudge.clone();
