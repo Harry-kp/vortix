@@ -17,6 +17,7 @@ pub mod ipc;
 pub mod journal;
 pub mod ports;
 pub mod profile;
+pub mod secret_file;
 pub mod state;
 
 pub use cidr::{claims_default_route_v4, claims_default_route_v6, Cidr};
