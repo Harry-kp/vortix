@@ -474,11 +474,15 @@ impl VpnEngine {
             }
         }
 
+        // Multi-connection U11: persist V2 with active_tunnels derived
+        // from the current single-connection state. U6/U7 will replace
+        // this with a `TunnelRegistry` snapshot read.
+        let active = build_active_tunnels(&self.connection_state);
+        let persisted_tunnels = crate::core::killswitch::persisted_from_active(&active);
         let _ = crate::core::killswitch::save_state(
             self.killswitch_mode,
             self.killswitch_state,
-            None,
-            None,
+            persisted_tunnels,
         );
     }
 
