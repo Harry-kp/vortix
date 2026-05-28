@@ -12,4 +12,11 @@ impl RouteTable for WindowsRouteTable {
     fn default_gateway() -> Option<String> {
         None
     }
+
+    fn default_route_interface() -> Option<String> {
+        // Plan #001 U4: Windows is out of scope for v1 multi-connection
+        // routing primitives. Real impl would call `Get-NetRoute` /
+        // `GetIpForwardTable2` and read `InterfaceAlias` / `InterfaceLuid`.
+        None
+    }
 }
