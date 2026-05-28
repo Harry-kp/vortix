@@ -18,7 +18,7 @@ use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
 use argon2::{Argon2, Params};
 use base64::Engine as _;
-use rand::RngExt;
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -320,9 +320,7 @@ impl EncryptedFileSecretStore {
             (salt, key, cache)
         } else {
             let mut salt = [0u8; 16];
-            // rand 0.10: `thread_rng` renamed to `rng`; `RngCore::fill_bytes`
-            // is now `Rng::fill` (slice-typed).
-            rand::rng().fill(&mut salt[..]);
+            rand::thread_rng().fill_bytes(&mut salt);
             let key = derive_key(passphrase, &salt)?;
             (salt, key, HashMap::new())
         };
@@ -338,11 +336,8 @@ impl EncryptedFileSecretStore {
         let plaintext =
             serde_json::to_vec(cache).map_err(|e| SecretStoreError::Serde(e.to_string()))?;
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&self.key));
-        // rand 0.10's RngCore is on a newer `rand_core` than aes-gcm 0.10
-        // depends on — `generate_nonce` can't accept &mut rand::rng()
-        // directly. Fill our own 12-byte nonce instead.
         let mut nonce_bytes = [0u8; 12];
-        rand::rng().fill(&mut nonce_bytes[..]);
+        rand::thread_rng().fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
         let ciphertext = cipher
             .encrypt(nonce, plaintext.as_ref())
