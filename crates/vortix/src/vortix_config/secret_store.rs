@@ -18,7 +18,13 @@ use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
 use argon2::{Argon2, Params};
 use base64::Engine as _;
-use rand::RngCore;
+// `rand 0.10` reorganised the crate root; `RngCore` no longer lives there and
+// the thread-local RNG was renamed `rand::thread_rng()` → `rand::rng()`. We
+// route through `aes_gcm::aead::OsRng` here because `aes_gcm 0.10`'s
+// `generate_nonce` is bound to `rand_core 0.6`'s `RngCore` (via `crypto_common`)
+// — `rand 0.10`'s `ThreadRng` exposes `rand_core 0.10`'s incompatible trait.
+use aes_gcm::aead::OsRng;
+use aes_gcm::aead::rand_core::RngCore;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -320,7 +326,7 @@ impl EncryptedFileSecretStore {
             (salt, key, cache)
         } else {
             let mut salt = [0u8; 16];
-            rand::thread_rng().fill_bytes(&mut salt);
+            OsRng.fill_bytes(&mut salt);
             let key = derive_key(passphrase, &salt)?;
             (salt, key, HashMap::new())
         };
