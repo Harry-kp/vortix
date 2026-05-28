@@ -223,25 +223,39 @@ pub fn get_openvpn_auth_path(profile_name: &str) -> std::io::Result<std::path::P
 
 /// Writes `OpenVPN` credentials to a file (username on line 1, password on line 2).
 ///
-/// The file is created with `chmod 600` (owner read/write only).
+/// The file is created with `chmod 600` (owner read/write only) in a single
+/// step via [`crate::vortix_core::secret_file::write_secret_file`], which
+/// uses `openat(2)` against a held parent-directory fd to close the
+/// parent-directory TOCTOU window. If the auth file already exists from a
+/// previous run, it is removed first so the credential rewrite succeeds.
 ///
 /// # Errors
 ///
-/// Returns an error if file write or permission setting fails.
+/// Returns an error if file write fails.
 #[cfg(unix)]
 pub fn write_openvpn_auth_file(
     profile_name: &str,
     username: &str,
     password: &str,
 ) -> std::io::Result<std::path::PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
+    use crate::vortix_core::secret_file::{SecretFileError, write_secret_file};
 
     let auth_path = get_openvpn_auth_path(profile_name)?;
-    write_user_file(&auth_path, format!("{username}\n{password}\n"))?;
 
-    let mut perms = std::fs::metadata(&auth_path)?.permissions();
-    perms.set_mode(0o600);
-    std::fs::set_permissions(&auth_path, perms)?;
+    // The credential-safe helper refuses to overwrite. Remove any stale
+    // file from a prior run so a credential rotation still lands. Ignore
+    // NotFound — the file simply doesn't exist yet on first use.
+    match std::fs::remove_file(&auth_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+
+    let body = format!("{username}\n{password}\n");
+    write_secret_file(&auth_path, body.as_bytes()).map_err(|e| match e {
+        SecretFileError::Io(io) => io,
+        other => std::io::Error::other(other.to_string()),
+    })?;
 
     Ok(auth_path)
 }
