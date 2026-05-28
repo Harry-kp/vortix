@@ -13,28 +13,30 @@ use std::path::PathBuf;
 
 // Re-export the canonical types so existing `crate::core::killswitch::*`
 // imports keep resolving.
-pub use crate::vortix_core::ports::killswitch::{KillswitchError, Result};
+pub use crate::vortix_core::ports::killswitch::{ActiveTunnelInfo, KillswitchError, Result};
 
 // Backwards-compat alias — the old name is `KillSwitchError`.
 pub type KillSwitchError = KillswitchError;
 
-/// Enable kill switch by loading restrictive firewall rules.
+/// Enable kill switch with a per-tunnel ruleset.
 ///
-/// Routes through the process-global `Platform` aggregate (plan 003 U7);
-/// the per-OS impl lives in `vortix-platform-{macos,linux}`.
+/// Routes through the process-global `Platform` aggregate. The per-OS
+/// impl lives in `vortix_platform_{macos,linux,windows}` and synthesises
+/// allow rules for every entry in `active` plus an RFC1918 base with
+/// secondary-declared CIDRs subtracted.
 ///
-/// # Arguments
-///
-/// * `vpn_interface` - The VPN tunnel interface (e.g., "utun3" on macOS, "wg0" on Linux)
-/// * `vpn_server_ip` - Optional VPN server IP to allow for reconnection
+/// Multi-connection plan U8 replaces the legacy single-tunnel
+/// `enable_blocking(interface, server_ip)` form with this slice-based
+/// API. Callers building from a single connection should construct a
+/// one-element slice; see [`ActiveTunnelInfo`].
 ///
 /// # Errors
 ///
 /// Returns error if not running as root or firewall commands fail.
-pub fn enable_blocking(vpn_interface: &str, vpn_server_ip: Option<&str>) -> Result<()> {
+pub fn enable_blocking_multi(active: &[ActiveTunnelInfo]) -> Result<()> {
     crate::platform::current_platform()
         .killswitch
-        .enable_blocking(vpn_interface, vpn_server_ip)
+        .enable_blocking_multi(active)
 }
 
 /// Disable kill switch by flushing firewall rules.

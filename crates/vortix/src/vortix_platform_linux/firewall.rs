@@ -2,9 +2,11 @@
 //!
 //! Prefers iptables when available, falls back to nftables (nft).
 
-use crate::vortix_core::ports::killswitch::{Killswitch, KillswitchError, Result};
+use crate::vortix_core::ports::killswitch::{
+    ActiveTunnelInfo, Killswitch, KillswitchError, Result,
+};
 use crate::vortix_process::{CommandSpec, PrivilegeReq};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 const CHAIN_NAME: &str = "VORTIX_KILLSWITCH";
 const NFT_TABLE: &str = "vortix_killswitch";
@@ -209,27 +211,51 @@ fn is_root() -> bool {
 }
 
 impl Killswitch for IptablesFirewall {
-    fn enable_blocking(vpn_interface: &str, vpn_server_ip: Option<&str>) -> Result<()> {
-        info!(
-            target: "vortix::killswitch",
-            interface = %vpn_interface,
-            server = ?vpn_server_ip,
-            "killswitch.engage"
-        );
-
+    /// Multi-tunnel killswitch stub — installs single-tunnel rules for
+    /// the *first* `ActiveTunnelInfo` and ignores the rest. Real
+    /// multi-interface ruleset synthesis lands in U9 (atomic
+    /// `iptables-restore`).
+    fn enable_blocking_multi(active: &[ActiveTunnelInfo]) -> Result<()> {
         if !is_root() {
             error!(target: "vortix::killswitch", "kill switch requires root privileges");
             return Err(KillswitchError::NotRoot);
         }
 
+        if active.is_empty() {
+            info!(target: "vortix::killswitch", "killswitch.engage active=0 — no per-tunnel rules");
+            // Nothing to install — the base block-all ruleset is U9 work.
+            // Return Ok so the engine can transition to Armed without
+            // failing the build.
+            return Ok(());
+        }
+
+        if active.len() > 1 {
+            warn!(
+                target: "vortix::killswitch",
+                tunnels = active.len(),
+                "multi-tunnel killswitch stubbed — only first tunnel's rules are installed (pending U9)"
+            );
+        }
+
+        let first = &active[0];
+        let server_ip_owned: Option<String> = first.server_ips.first().map(ToString::to_string);
+        let server_ip: Option<&str> = server_ip_owned.as_deref();
+
+        info!(
+            target: "vortix::killswitch",
+            interface = %first.interface,
+            server = ?server_ip,
+            "killswitch.engage"
+        );
+
         match Self::detect_backend() {
             Some(FirewallBackend::Iptables) => {
                 debug!(target: "vortix::killswitch", "using iptables backend");
-                Self::setup_iptables(vpn_interface, vpn_server_ip)?;
+                Self::setup_iptables(&first.interface, server_ip)?;
             }
             Some(FirewallBackend::Nftables) => {
                 debug!(target: "vortix::killswitch", "using nftables backend");
-                Self::setup_nftables(vpn_interface, vpn_server_ip)?;
+                Self::setup_nftables(&first.interface, server_ip)?;
             }
             None => {
                 return Err(KillswitchError::NoBackendAvailable);

@@ -16,7 +16,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::vortix_core::ports::killswitch::{KillswitchError, Result as KsResult};
+use crate::vortix_core::ports::killswitch::{
+    ActiveTunnelInfo, KillswitchError, Result as KsResult,
+};
 
 #[cfg(target_os = "linux")]
 use crate::vortix_platform_linux as platform_impl;
@@ -37,14 +39,17 @@ pub struct MockKillswitch {
 
 #[derive(Debug, Default)]
 struct MockKillswitchState {
-    /// Optional canned error returned by the next `enable_blocking` call.
+    /// Optional canned error returned by the next `enable_blocking_multi` call.
     pub fail_enable: Option<String>,
     /// Optional canned error returned by the next `disable_blocking` call.
     pub fail_disable: Option<String>,
-    /// Whether `enable_blocking` was called at least once.
+    /// Whether `enable_blocking_multi` was called at least once.
     pub enabled: bool,
     /// Whether `disable_blocking` was called at least once.
     pub disabled: bool,
+    /// Number of `ActiveTunnelInfo` entries in the most recent
+    /// `enable_blocking_multi` call.
+    pub last_active_count: usize,
 }
 
 impl MockKillswitch {
@@ -53,7 +58,7 @@ impl MockKillswitch {
         Self::default()
     }
 
-    /// Script `enable_blocking` to fail with the given message.
+    /// Script `enable_blocking_multi` to fail with the given message.
     ///
     /// # Panics
     ///
@@ -62,7 +67,7 @@ impl MockKillswitch {
         self.state.lock().unwrap().fail_enable = Some(msg.into());
     }
 
-    /// Returns whether `enable_blocking` was called at least once.
+    /// Returns whether `enable_blocking_multi` was called at least once.
     ///
     /// # Panics
     ///
@@ -82,12 +87,24 @@ impl MockKillswitch {
         self.state.lock().unwrap().disabled
     }
 
-    fn enable_blocking(&self, _iface: &str, _server: Option<&str>) -> KsResult<()> {
+    /// Returns the active-tunnel count from the most recent
+    /// `enable_blocking_multi` call, or zero if never called.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn last_active_count(&self) -> usize {
+        self.state.lock().unwrap().last_active_count
+    }
+
+    fn enable_blocking_multi(&self, active: &[ActiveTunnelInfo]) -> KsResult<()> {
         let mut s = self.state.lock().unwrap();
         if let Some(msg) = s.fail_enable.take() {
             return Err(KillswitchError::CommandFailed(msg));
         }
         s.enabled = true;
+        s.last_active_count = active.len();
         Ok(())
     }
 
@@ -146,7 +163,7 @@ pub enum KillswitchKind {
 }
 
 impl KillswitchKind {
-    /// Engage the kill switch.
+    /// Engage the kill switch with a per-tunnel ruleset.
     ///
     /// # Errors
     ///
@@ -155,24 +172,16 @@ impl KillswitchKind {
     /// # Panics
     ///
     /// The mock variant may panic if its internal mutex is poisoned.
-    pub fn enable_blocking(
-        &self,
-        vpn_interface: &str,
-        vpn_server_ip: Option<&str>,
-    ) -> KsResult<()> {
+    pub fn enable_blocking_multi(&self, active: &[ActiveTunnelInfo]) -> KsResult<()> {
         use crate::vortix_core::ports::killswitch::Killswitch;
         match self {
             #[cfg(target_os = "macos")]
-            Self::Macos => platform_impl::PfFirewall::enable_blocking(vpn_interface, vpn_server_ip),
+            Self::Macos => platform_impl::PfFirewall::enable_blocking_multi(active),
             #[cfg(target_os = "linux")]
-            Self::Linux => {
-                platform_impl::IptablesFirewall::enable_blocking(vpn_interface, vpn_server_ip)
-            }
+            Self::Linux => platform_impl::IptablesFirewall::enable_blocking_multi(active),
             #[cfg(target_os = "windows")]
-            Self::Windows => {
-                platform_impl::WindowsFirewall::enable_blocking(vpn_interface, vpn_server_ip)
-            }
-            Self::Mock(m) => m.enable_blocking(vpn_interface, vpn_server_ip),
+            Self::Windows => platform_impl::WindowsFirewall::enable_blocking_multi(active),
+            Self::Mock(m) => m.enable_blocking_multi(active),
         }
     }
 
@@ -508,10 +517,26 @@ mod tests {
         let mock = MockKillswitch::new();
         assert!(!mock.was_enabled());
         let ks = KillswitchKind::Mock(mock.clone());
-        ks.enable_blocking("wg0", Some("1.2.3.4")).unwrap();
+        let active = vec![ActiveTunnelInfo {
+            interface: "wg0".into(),
+            server_ips: vec!["1.2.3.4".parse().unwrap()],
+            declared_cidrs: Vec::new(),
+            is_primary: true,
+        }];
+        ks.enable_blocking_multi(&active).unwrap();
         assert!(mock.was_enabled());
+        assert_eq!(mock.last_active_count(), 1);
         ks.disable_blocking().unwrap();
         assert!(mock.was_disabled());
+    }
+
+    #[test]
+    fn mock_killswitch_records_empty_active_set() {
+        let mock = MockKillswitch::new();
+        let ks = KillswitchKind::Mock(mock.clone());
+        ks.enable_blocking_multi(&[]).unwrap();
+        assert!(mock.was_enabled());
+        assert_eq!(mock.last_active_count(), 0);
     }
 
     #[test]
@@ -519,7 +544,7 @@ mod tests {
         let mock = MockKillswitch::new();
         mock.fail_next_enable("simulated iptables error");
         let ks = KillswitchKind::Mock(mock);
-        let err = ks.enable_blocking("wg0", None).unwrap_err();
+        let err = ks.enable_blocking_multi(&[]).unwrap_err();
         assert!(matches!(err, KillswitchError::CommandFailed(_)));
     }
 

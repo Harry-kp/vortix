@@ -455,15 +455,8 @@ impl VpnEngine {
         if self.killswitch_state != old_state || self.killswitch_state == KillSwitchState::Blocking
         {
             if self.killswitch_state.is_blocking() {
-                let (interface, server_ip) = match &self.connection_state {
-                    ConnectionState::Connected { details, .. } => (
-                        details.interface.as_str(),
-                        Some(details.endpoint.split(':').next().unwrap_or("")),
-                    ),
-                    _ => (crate::platform::DEFAULT_VPN_INTERFACE, None),
-                };
-
-                if let Err(e) = crate::core::killswitch::enable_blocking(interface, server_ip) {
+                let active = build_active_tunnels(&self.connection_state);
+                if let Err(e) = crate::core::killswitch::enable_blocking_multi(&active) {
                     logger::log(
                         logger::LogLevel::Warning,
                         "SEC",
@@ -537,5 +530,37 @@ impl Drop for VpnEngine {
         //
         // Kill switch firewall rules also persist — the next launch recovers
         // them via `load_state()`.
+    }
+}
+
+/// Build the `ActiveTunnelInfo` slice consumed by the killswitch
+/// synthesiser from the current single-connection engine state.
+///
+/// Multi-connection plan U6/U7 will replace this with a snapshot read
+/// from `TunnelRegistry`. For now the only contributor is the currently
+/// connected tunnel (if any), treated as primary; declared CIDRs are
+/// empty until U6 plumbs them through `ConnectionState`.
+fn build_active_tunnels(
+    state: &ConnectionState,
+) -> Vec<crate::core::killswitch::ActiveTunnelInfo> {
+    use crate::core::killswitch::ActiveTunnelInfo;
+
+    match state {
+        ConnectionState::Connected { details, .. } => {
+            let server_ips = details
+                .endpoint
+                .split(':')
+                .next()
+                .and_then(|s| s.parse().ok())
+                .into_iter()
+                .collect();
+            vec![ActiveTunnelInfo {
+                interface: details.interface.clone(),
+                server_ips,
+                declared_cidrs: Vec::new(),
+                is_primary: true,
+            }]
+        }
+        _ => Vec::new(),
     }
 }

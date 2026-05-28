@@ -292,15 +292,8 @@ impl App {
             || self.engine.killswitch_state == KillSwitchState::Blocking
         {
             if self.engine.killswitch_state.is_blocking() {
-                let (interface, server_ip) = match &self.engine.connection_state {
-                    ConnectionState::Connected { details, .. } => (
-                        details.interface.as_str(),
-                        Some(details.endpoint.split(':').next().unwrap_or("")),
-                    ),
-                    _ => (crate::platform::DEFAULT_VPN_INTERFACE, None),
-                };
-
-                if let Err(e) = crate::core::killswitch::enable_blocking(interface, server_ip) {
+                let active = build_active_tunnels_from_state(&self.engine.connection_state);
+                if let Err(e) = crate::core::killswitch::enable_blocking_multi(&active) {
                     self.log(&format!("WARN: Failed to enable kill switch: {e}"));
                 }
             } else if old_state.is_blocking() {
@@ -655,5 +648,37 @@ impl App {
             }
             _ => {}
         }
+    }
+}
+
+/// Build the `ActiveTunnelInfo` slice that the killswitch synthesiser
+/// consumes from the current single-connection engine state.
+///
+/// Until U6/U7 wire `TunnelRegistry` into this path, only the currently
+/// connected tunnel (if any) contributes; everything else collapses to
+/// the empty slice. The single tunnel is always treated as primary —
+/// declared CIDRs are not yet plumbed through `ConnectionState`.
+fn build_active_tunnels_from_state(
+    state: &ConnectionState,
+) -> Vec<crate::core::killswitch::ActiveTunnelInfo> {
+    use crate::core::killswitch::ActiveTunnelInfo;
+
+    match state {
+        ConnectionState::Connected { details, .. } => {
+            let server_ips = details
+                .endpoint
+                .split(':')
+                .next()
+                .and_then(|s| s.parse().ok())
+                .into_iter()
+                .collect();
+            vec![ActiveTunnelInfo {
+                interface: details.interface.clone(),
+                server_ips,
+                declared_cidrs: Vec::new(),
+                is_primary: true,
+            }]
+        }
+        _ => Vec::new(),
     }
 }

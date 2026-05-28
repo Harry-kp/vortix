@@ -11,9 +11,14 @@
 
 #![allow(clippy::missing_errors_doc, clippy::implicit_hasher)]
 
+pub mod cidr;
+pub mod cidr_subtract;
 pub mod engine;
 pub mod ipc;
 pub mod journal;
 pub mod ports;
 pub mod profile;
 pub mod state;
+
+pub use cidr::{Cidr, claims_default_route_v4, claims_default_route_v6};
+pub use cidr_subtract::cidr_subtract;
