@@ -296,6 +296,23 @@ fn handle_daemon(socket_override: Option<std::path::PathBuf>, mode: OutputMode) 
             return 1;
         }
     };
+    // Build the `EngineHandle::Local` inside the daemon's runtime context
+    // (the actor task spawn lands on this runtime, not the runner's). The
+    // factory reads the resolved global config dir for profile sidecars.
+    let profiles_dir = crate::utils::get_app_config_dir().map_or_else(
+        |_| std::path::PathBuf::from("/tmp/vortix-profiles"),
+        |d| d.join(constants::PROFILES_DIR_NAME),
+    );
+    let server = runtime.block_on(async move {
+        if let Some(handle) = crate::daemon::build_engine_handle(&profiles_dir) {
+            server.with_engine_handle(handle)
+        } else {
+            eprintln!(
+                "vortix daemon: engine handle unavailable (journal or runner not installed) — Execute/Snapshot/Subscribe will return Internal errors"
+            );
+            server
+        }
+    });
     runtime.block_on(async {
         if let Err(e) = server.run().await {
             eprintln!("vortix daemon: accept loop terminated: {e}");
