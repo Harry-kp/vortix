@@ -74,6 +74,14 @@ pub struct OvpnTunnel {
     /// Optional `SecretStore`-backed auth materialisation hook (plan 006 U5).
     /// When set, takes precedence over the on-disk `auth_dir` lookup.
     pub secret_provider: Option<SecretProvider>,
+    /// True when this tunnel is being brought up as a secondary in a
+    /// multi-tunnel session (plan 001 U14). When true, `up()` appends
+    /// `--pull-filter ignore "dhcp-option DNS"` to the openvpn argv so the
+    /// server's pushed DNS does not clobber the primary's resolver. Defaults
+    /// to `false` — single-tunnel callers see unchanged behaviour. The
+    /// `TunnelRegistry` (plan 001 U5) sets this on the tunnel before invoking
+    /// `up()`; until U5 lands no production callsite flips this.
+    pub is_secondary: bool,
 }
 
 impl std::fmt::Debug for OvpnTunnel {
@@ -84,6 +92,7 @@ impl std::fmt::Debug for OvpnTunnel {
             .field("verbosity", &self.verbosity)
             .field("connect_timeout_secs", &self.connect_timeout_secs)
             .field("secret_provider", &self.secret_provider.is_some())
+            .field("is_secondary", &self.is_secondary)
             .finish()
     }
 }
@@ -96,6 +105,7 @@ impl Default for OvpnTunnel {
             verbosity: DEFAULT_OVPN_VERBOSITY.to_string(),
             connect_timeout_secs: 30,
             secret_provider: None,
+            is_secondary: false,
         }
     }
 }
@@ -137,6 +147,24 @@ impl OvpnTunnel {
     #[must_use]
     pub fn with_secret_provider(mut self, provider: SecretProvider) -> Self {
         self.secret_provider = Some(provider);
+        self
+    }
+
+    /// Builder: mark this tunnel as a secondary in a multi-tunnel session
+    /// (plan 001 U14). When set to `true`, `up()` appends
+    /// `--pull-filter ignore "dhcp-option DNS"` to the openvpn argv,
+    /// suppressing server-pushed DNS so the primary tunnel's resolver
+    /// stays authoritative.
+    ///
+    /// Defaults to `false`. The `TunnelRegistry` (plan 001 U5) toggles this
+    /// before calling `up()` once it lands; until then no production callsite
+    /// flips the flag and the existing single-tunnel argv is preserved.
+    ///
+    /// Requires `OpenVPN` >= 2.4 — version assertion lives in the app-level
+    /// dependency probe (see `App::check_dependencies`).
+    #[must_use]
+    pub fn with_secondary(mut self, is_secondary: bool) -> Self {
+        self.is_secondary = is_secondary;
         self
     }
 
@@ -285,6 +313,43 @@ fn write_ephemeral_auth(path: &std::path::Path, bytes: &[u8]) -> std::io::Result
     Ok(())
 }
 
+/// Build the openvpn daemon argv for a given profile. Pure helper extracted
+/// so the secondary-DNS-suppression branch (plan 001 U14) is unit-testable
+/// without spawning a subprocess. The caller appends `--auth-user-pass <path>`
+/// afterwards when an auth file is available.
+fn build_ovpn_args(
+    config_path: &std::path::Path,
+    safe_name: &str,
+    pid_path: &std::path::Path,
+    log_path: &std::path::Path,
+    verbosity: &str,
+    is_secondary: bool,
+) -> Vec<String> {
+    let mut args = vec![
+        "--config".to_string(),
+        config_path.to_string_lossy().into_owned(),
+        "--daemon".to_string(),
+        format!("vortix-{safe_name}"),
+        "--writepid".to_string(),
+        pid_path.to_string_lossy().into_owned(),
+        "--log".to_string(),
+        log_path.to_string_lossy().into_owned(),
+        "--verb".to_string(),
+        verbosity.to_string(),
+    ];
+
+    // Plan 001 U14: when this tunnel is a secondary, suppress server-pushed
+    // DNS so the primary's resolver stays authoritative. Requires OpenVPN
+    // >= 2.4 — gated upstream by `App::check_dependencies`.
+    if is_secondary {
+        args.push("--pull-filter".to_string());
+        args.push("ignore".to_string());
+        args.push("dhcp-option DNS".to_string());
+    }
+
+    args
+}
+
 fn tail_lines(content: &str, n: usize) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let start = lines.len().saturating_sub(n);
@@ -313,18 +378,21 @@ impl Tunnel for OvpnTunnel {
             "ovpn.up"
         );
 
-        let mut args = vec![
-            "--config".to_string(),
-            profile.config_path.to_string_lossy().into_owned(),
-            "--daemon".to_string(),
-            format!("vortix-{safe_name}"),
-            "--writepid".to_string(),
-            pid_path.to_string_lossy().into_owned(),
-            "--log".to_string(),
-            log_path.to_string_lossy().into_owned(),
-            "--verb".to_string(),
-            self.verbosity.clone(),
-        ];
+        let mut args = build_ovpn_args(
+            &profile.config_path,
+            &safe_name,
+            &pid_path,
+            &log_path,
+            &self.verbosity,
+            self.is_secondary,
+        );
+        if self.is_secondary {
+            debug!(
+                target: "vortix::tunnel::openvpn",
+                profile = %profile.id,
+                "ovpn.up: secondary tunnel, suppressing pushed DNS via --pull-filter"
+            );
+        }
 
         // Plan 006 U5: SecretStore-backed auth takes precedence. When a
         // secret_provider is installed and returns bytes for this profile,
@@ -504,5 +572,62 @@ mod tests {
     fn tail_lines_handles_short_input() {
         assert_eq!(tail_lines("a\nb\nc", 5), "a\nb\nc");
         assert_eq!(tail_lines("a\nb\nc\nd\ne", 2), "d\ne");
+    }
+
+    // Plan 001 U14: argv-building behaviour for primary vs. secondary tunnels.
+    // The argv builder is pure so we can assert against it without spawning a
+    // subprocess; the secondary branch must inject the `--pull-filter` triple
+    // and the primary branch must not.
+
+    #[test]
+    fn build_ovpn_args_primary_omits_pull_filter() {
+        let args = build_ovpn_args(
+            std::path::Path::new("/etc/vortix/corp.ovpn"),
+            "corp",
+            std::path::Path::new("/run/vortix/corp.pid"),
+            std::path::Path::new("/run/vortix/corp.log"),
+            "3",
+            false,
+        );
+        assert!(
+            !args.iter().any(|a| a == "--pull-filter"),
+            "primary argv must not contain --pull-filter; got: {args:?}"
+        );
+        assert!(args.contains(&"--config".to_string()));
+        assert!(args.contains(&"--daemon".to_string()));
+    }
+
+    #[test]
+    fn build_ovpn_args_secondary_injects_pull_filter() {
+        let args = build_ovpn_args(
+            std::path::Path::new("/etc/vortix/lab.ovpn"),
+            "lab",
+            std::path::Path::new("/run/vortix/lab.pid"),
+            std::path::Path::new("/run/vortix/lab.log"),
+            "3",
+            true,
+        );
+        // The three flag tokens must appear in order: `--pull-filter`,
+        // `ignore`, `dhcp-option DNS`.
+        let pf_idx = args
+            .iter()
+            .position(|a| a == "--pull-filter")
+            .expect("secondary argv must contain --pull-filter");
+        assert_eq!(args.get(pf_idx + 1).map(String::as_str), Some("ignore"));
+        assert_eq!(
+            args.get(pf_idx + 2).map(String::as_str),
+            Some("dhcp-option DNS")
+        );
+    }
+
+    #[test]
+    fn with_secondary_flips_field_and_default_is_false() {
+        let primary = OvpnTunnel::default();
+        assert!(!primary.is_secondary);
+        let secondary = OvpnTunnel::default().with_secondary(true);
+        assert!(secondary.is_secondary);
+        // Toggle back.
+        let toggled = secondary.with_secondary(false);
+        assert!(!toggled.is_secondary);
     }
 }
