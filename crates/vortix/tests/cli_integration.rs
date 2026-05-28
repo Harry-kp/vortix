@@ -251,6 +251,7 @@ fn cli_status_disconnected() {
             watch: false,
             interval: 2,
             brief: true,
+            no_daemon: true,
         },
         dir.path(),
         "test",

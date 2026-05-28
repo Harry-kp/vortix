@@ -38,7 +38,16 @@ pub fn handle_command(
             watch,
             interval,
             brief,
-        } => handle_status(*watch, *interval, *brief, config, config_dir, mode),
+            no_daemon,
+        } => handle_status(
+            *watch,
+            *interval,
+            *brief,
+            *no_daemon,
+            config,
+            config_dir,
+            mode,
+        ),
         Commands::List {
             sort,
             reverse,
@@ -686,19 +695,47 @@ struct StatusSecurity {
     killswitch_state: String,
 }
 
+#[allow(clippy::too_many_lines)]
 fn handle_status(
     watch: bool,
     interval: u64,
     brief: bool,
+    no_daemon: bool,
     config: &AppConfig,
     config_dir: &Path,
     mode: OutputMode,
 ) -> i32 {
-    let engine = VpnEngine::new_headless(config.clone(), config_dir.to_path_buf());
-    let snap = engine.scan_status();
-
     if watch {
+        // Watch always uses the direct scanner path — it polls in a
+        // tight loop and daemon round-trips would just add latency.
         return run_watch(interval, config, config_dir, mode);
+    }
+
+    // Read-only ops route through the daemon ONLY when its socket
+    // exists and is connectable. Otherwise fall back to direct disk +
+    // scanner reads (plan multi-connection D3: read-only ops bypass
+    // daemon when socket absent). The `--no-daemon` flag forces the
+    // bypass even when the daemon is up — useful for testing.
+    let daemon_socket = if no_daemon {
+        None
+    } else {
+        crate::daemon::daemon_socket_path_if_present()
+    };
+
+    let engine = VpnEngine::new_headless(config.clone(), config_dir.to_path_buf());
+    let mut snap = engine.scan_status();
+    // When the daemon socket is connectable, overlay its authoritative
+    // view of the FSM (which profile is connecting/connected, since
+    // when) onto the scanner-derived snapshot. The scanner still owns
+    // live counters and kill-switch state. On any daemon error we
+    // silently keep the scanner-only view — bypass-on-error keeps
+    // `vortix status` reliable during partial daemon rollout. Once
+    // U21 lands the schema_version=2 multi-tunnel payload, this
+    // branch will pull richer data from the daemon directly.
+    if let Some(socket) = daemon_socket {
+        if let Ok(state) = crate::daemon::client::snapshot(&socket) {
+            overlay_daemon_state(&mut snap, &state);
+        }
     }
 
     let is_connected = snap.connection_state == "connected";
@@ -793,6 +830,48 @@ fn handle_status(
         OutputMode::Quiet => {}
     }
     0
+}
+
+/// Merge an authoritative `Connection` from the daemon onto a
+/// scanner-derived `StatusSnapshot`. The daemon owns the FSM state
+/// (which profile is connecting/connected, since when, retry budget);
+/// the scanner owns the live counters (transfer bytes, kill-switch
+/// state). Today we overlay just the connection-state vocabulary so
+/// the daemon's view of "what's the active profile" beats whatever
+/// the scanner inferred from sockets — relevant when the daemon is
+/// driving a tunnel the local-engine scanner doesn't recognize.
+fn overlay_daemon_state(
+    snap: &mut crate::engine::connection::StatusSnapshot,
+    state: &crate::vortix_core::engine::state::Connection,
+) {
+    use crate::vortix_core::engine::state::Connection;
+    match state {
+        Connection::Disconnected { .. } => {
+            snap.connection_state = "disconnected".into();
+            snap.profile = None;
+            snap.protocol = None;
+            snap.uptime_secs = None;
+        }
+        Connection::Connecting { profile_id, .. }
+        | Connection::Reconnecting { profile_id, .. }
+        | Connection::AwaitingUserInput { profile_id, .. } => {
+            snap.connection_state = "connecting".into();
+            snap.profile = Some(profile_id.as_str().to_string());
+        }
+        Connection::Disconnecting { profile_id, .. } => {
+            snap.connection_state = "disconnecting".into();
+            snap.profile = Some(profile_id.as_str().to_string());
+        }
+        Connection::Connected {
+            profile_id, since, ..
+        } => {
+            snap.connection_state = "connected".into();
+            snap.profile = Some(profile_id.as_str().to_string());
+            if let Ok(elapsed) = std::time::SystemTime::now().duration_since(*since) {
+                snap.uptime_secs = Some(elapsed.as_secs());
+            }
+        }
+    }
 }
 
 fn run_watch(interval: u64, config: &AppConfig, config_dir: &Path, mode: OutputMode) -> i32 {
