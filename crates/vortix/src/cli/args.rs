@@ -143,6 +143,12 @@ pub enum Commands {
         /// One-line status summary
         #[arg(short, long)]
         brief: bool,
+
+        /// Always read state directly from disk + scanner, even if a
+        /// daemon socket is connectable. Useful for testing the
+        /// bypass path or working around a misbehaving daemon.
+        #[arg(long)]
+        no_daemon: bool,
     },
 
     /// List imported VPN profiles
