@@ -126,6 +126,8 @@ pub struct MockNetworkStats {
 #[derive(Debug, Default, Clone)]
 pub struct MockRouteTable {
     pub gateway: Option<String>,
+    /// Canned interface name for `default_route_interface()` (plan #001 U4).
+    pub interface: Option<String>,
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -368,6 +370,22 @@ impl RouteTableKind {
             Self::Mock(m) => m.gateway.clone(),
         }
     }
+
+    /// Name of the interface carrying the current default route, if any
+    /// (plan #001 U4).
+    #[must_use]
+    pub fn default_route_interface(&self) -> Option<String> {
+        use crate::vortix_core::ports::route_table::RouteTable;
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Macos => platform_impl::MacRouteTable::default_route_interface(),
+            #[cfg(target_os = "linux")]
+            Self::Linux => platform_impl::LinuxRouteTable::default_route_interface(),
+            #[cfg(target_os = "windows")]
+            Self::Windows => platform_impl::WindowsRouteTable::default_route_interface(),
+            Self::Mock(m) => m.interface.clone(),
+        }
+    }
 }
 
 /// Scriptable mock for the `SocketAudit` port (plan 015 phase C).
@@ -535,7 +553,23 @@ mod tests {
     fn mock_route_table_returns_canned_gateway() {
         let rt = RouteTableKind::Mock(MockRouteTable {
             gateway: Some("192.168.1.1".into()),
+            interface: None,
         });
         assert_eq!(rt.default_gateway(), Some("192.168.1.1".into()));
+    }
+
+    #[test]
+    fn mock_route_table_returns_canned_interface() {
+        let rt = RouteTableKind::Mock(MockRouteTable {
+            gateway: None,
+            interface: Some("utun3".into()),
+        });
+        assert_eq!(rt.default_route_interface(), Some("utun3".into()));
+    }
+
+    #[test]
+    fn mock_route_table_interface_defaults_to_none() {
+        let rt = RouteTableKind::Mock(MockRouteTable::default());
+        assert_eq!(rt.default_route_interface(), None);
     }
 }
