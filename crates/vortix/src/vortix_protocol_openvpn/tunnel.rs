@@ -481,17 +481,42 @@ impl Tunnel for OvpnTunnel {
         let safe_name = sanitize_profile_name(handle.profile_id.as_str());
 
         if let Some(pid) = handle.pid {
-            let output = crate::vortix_process::run_to_output(
-                CommandSpec::oneshot("kill", vec!["-15".into(), pid.to_string()])
-                    .privilege(PrivilegeReq::Root),
-            )
-            .map_err(|e| TunnelError::Subprocess(format!("kill openvpn pid: {e}")))?;
-            if !output.status.success() {
-                warn!(
-                    target: "vortix::tunnel::openvpn",
-                    pid = pid,
-                    "kill -15 returned non-zero; falling back to pkill"
-                );
+            // Plan 002 U2: direct PID signal via libc::kill instead of
+            // shelling to `/usr/bin/kill`. SIGTERM (15) gives the OVPN
+            // daemon a chance to clean up before pkill (below) fires the
+            // pattern-matched fallback.
+            //
+            // SAFETY: libc::kill is a thin syscall wrapper with no buffer
+            // or memory invariants. Returns 0 on success or -1 with errno
+            // set. We map non-zero to a warn() log, matching the prior
+            // shell-out's behavior (it also fell through to pkill).
+            //
+            // PID conversion: TunnelHandle stores pid as u32; libc::pid_t
+            // is i32 on every supported platform. Real PIDs never exceed
+            // i32::MAX (kernel caps are well below 2^31), but use
+            // try_from so any future overflow surfaces as an explicit
+            // error rather than silent wrap.
+            match libc::pid_t::try_from(pid) {
+                Ok(libc_pid) => {
+                    #[allow(unsafe_code)]
+                    let rc = unsafe { libc::kill(libc_pid, libc::SIGTERM) };
+                    if rc != 0 {
+                        let err = std::io::Error::last_os_error();
+                        warn!(
+                            target: "vortix::tunnel::openvpn",
+                            pid = pid,
+                            error = %err,
+                            "libc::kill(SIGTERM) returned non-zero; falling back to pkill"
+                        );
+                    }
+                }
+                Err(_) => {
+                    warn!(
+                        target: "vortix::tunnel::openvpn",
+                        pid = pid,
+                        "PID exceeds libc::pid_t range; cannot send SIGTERM directly, falling back to pkill"
+                    );
+                }
             }
         }
 
