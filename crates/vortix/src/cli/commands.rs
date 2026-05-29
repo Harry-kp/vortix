@@ -29,11 +29,26 @@ pub fn handle_command(
     mode: OutputMode,
 ) -> i32 {
     match command {
-        Commands::Up { profile, timeout } => {
-            handle_up(profile.as_deref(), *timeout, config, config_dir, mode)
+        Commands::Up {
+            profile,
+            timeout,
+            yes,
+        } => handle_up(profile.as_deref(), *timeout, *yes, config, config_dir, mode),
+        Commands::Down {
+            profile,
+            all,
+            force,
+        } => handle_down(
+            profile.as_deref(),
+            *all,
+            *force,
+            config,
+            config_dir,
+            mode,
+        ),
+        Commands::Reconnect { profile } => {
+            handle_reconnect(profile.as_deref(), config, config_dir, mode)
         }
-        Commands::Down { force } => handle_down(*force, config, config_dir, mode),
-        Commands::Reconnect => handle_reconnect(config, config_dir, mode),
         Commands::Status {
             watch,
             interval,
@@ -363,10 +378,19 @@ struct UpData {
 fn handle_up(
     profile: Option<&str>,
     timeout_secs: u64,
+    yes: bool,
     config: &AppConfig,
     config_dir: &Path,
     mode: OutputMode,
 ) -> i32 {
+    // `yes` bypasses the multi-tunnel conflict prompt that U7 lands on
+    // the connect-path overlay. The CLI today goes directly through
+    // `VpnEngine::connect_and_wait` (no conflict check there), so `yes`
+    // is a no-op in the current build — but the flag is wired so scripts
+    // can adopt it ahead of U7's overlay shipping. Once U7 wires the
+    // registry conflict-check into the CLI path, this flag will gate
+    // the bypass.
+    let _ = yes;
     let mut engine = VpnEngine::new_headless(config.clone(), config_dir.to_path_buf());
 
     let profile_name = if let Some(name) = profile {
@@ -536,17 +560,69 @@ fn handle_up(
 #[derive(Serialize)]
 struct DownData {
     state: String,
+    /// Profile names that this invocation disconnected. Empty when
+    /// nothing was active (idempotent success path).
+    disconnected: Vec<String>,
 }
 
-fn handle_down(force: bool, config: &AppConfig, config_dir: &Path, mode: OutputMode) -> i32 {
+/// Point `engine.connection_state` at a specific active session so
+/// [`VpnEngine::disconnect_and_wait`] tears down the right tunnel.
+///
+/// Multi-connection plan U20: the CLI down/reconnect grammar accepted a
+/// per-profile target. Until U6B/U7 route CLI calls through the
+/// `TunnelRegistry`, we still drive disconnects one profile at a time
+/// through the single-tunnel `VpnEngine`. Helper keeps the two call
+/// sites (`handle_down`, `handle_reconnect`) in sync.
+fn point_engine_at_session(
+    engine: &mut VpnEngine,
+    session: &crate::core::scanner::ActiveSession,
+) {
+    engine.connection_state = crate::state::ConnectionState::Connected {
+        profile: session.name.clone(),
+        server_location: String::new(),
+        since: std::time::Instant::now(),
+        latency_ms: 0,
+        details: Box::new(crate::state::DetailedConnectionInfo {
+            pid: session.pid,
+            interface: session.interface.clone(),
+            endpoint: session.endpoint.clone(),
+            ..Default::default()
+        }),
+    };
+}
+
+fn handle_down(
+    profile_filter: Option<&str>,
+    all: bool,
+    force: bool,
+    config: &AppConfig,
+    config_dir: &Path,
+    mode: OutputMode,
+) -> i32 {
+    let _ = all; // `--all` is the explicit form of the no-profile case (already the default).
     let mut engine = VpnEngine::new_headless(config.clone(), config_dir.to_path_buf());
 
-    // Discover active connections via scanner
-    let active = crate::core::scanner::get_active_profiles(&engine.profiles);
-    if active.is_empty() {
-        // Idempotent: already disconnected = success
+    // NotFound (exit 3) takes precedence over idempotence: a typo'd
+    // profile is a script error, not "already disconnected".
+    if let Some(name) = profile_filter {
+        if engine.find_profile(name).is_none() {
+            print_error_and_exit(mode, "down", err_not_found(name), ExitCode::NotFound);
+        }
+    }
+
+    // Discover every active tunnel, then filter to the requested target.
+    let mut targets: Vec<crate::core::scanner::ActiveSession> =
+        crate::core::scanner::get_active_profiles(&engine.profiles);
+    if let Some(name) = profile_filter {
+        targets.retain(|s| s.name == name);
+    }
+
+    if targets.is_empty() {
+        // Idempotent: already disconnected = success. Matches U20
+        // scenario "vortix down corp with corp not active → exit 0".
         let data = DownData {
             state: "disconnected".into(),
+            disconnected: Vec::new(),
         };
         match mode {
             OutputMode::Human => println!("Already disconnected"),
@@ -554,22 +630,6 @@ fn handle_down(force: bool, config: &AppConfig, config_dir: &Path, mode: OutputM
             OutputMode::Quiet => {}
         }
         return 0;
-    }
-
-    // Set engine state to Connected so disconnect_and_wait works
-    if let Some(session) = active.first() {
-        engine.connection_state = crate::state::ConnectionState::Connected {
-            profile: session.name.clone(),
-            server_location: String::new(),
-            since: std::time::Instant::now(),
-            latency_ms: 0,
-            details: Box::new(crate::state::DetailedConnectionInfo {
-                pid: session.pid,
-                interface: session.interface.clone(),
-                endpoint: session.endpoint.clone(),
-                ..Default::default()
-            }),
-        };
     }
 
     if !engine.is_root {
@@ -581,88 +641,141 @@ fn handle_down(force: bool, config: &AppConfig, config_dir: &Path, mode: OutputM
         );
     }
 
-    match engine.disconnect_and_wait(force, Duration::from_secs(20)) {
-        Ok(()) => {
-            let data = DownData {
-                state: "disconnected".into(),
-            };
-            match mode {
-                OutputMode::Human => println!("Disconnected"),
-                OutputMode::Json => print_success(
-                    mode,
-                    "down",
-                    &data,
-                    vec!["vortix status --json".into(), "vortix list --json".into()],
-                ),
-                OutputMode::Quiet => {}
-            }
-            0
-        }
-        Err(e) => {
-            print_error_and_exit(
-                mode,
-                "down",
-                CliError {
-                    code: "disconnect_failed",
-                    message: e,
-                    hint: if force {
-                        None
-                    } else {
-                        Some("Try: sudo vortix down --force".into())
-                    },
-                },
-                ExitCode::GeneralError,
-            );
+    // Tear down each active tunnel sequentially. The legacy
+    // single-tunnel `VpnEngine` only tracks one connection_state at a
+    // time, so we point it at one session, disconnect, then move on.
+    // Once U6B/U7 route the CLI through `TunnelRegistry::disconnect_all`,
+    // this loop collapses into a single registry call.
+    let mut disconnected: Vec<String> = Vec::new();
+    let mut last_error: Option<String> = None;
+    for session in &targets {
+        point_engine_at_session(&mut engine, session);
+        match engine.disconnect_and_wait(force, Duration::from_secs(20)) {
+            Ok(()) => disconnected.push(session.name.clone()),
+            Err(e) => last_error = Some(e),
         }
     }
+
+    if disconnected.is_empty() {
+        let msg = last_error.unwrap_or_else(|| "Disconnect failed".into());
+        print_error_and_exit(
+            mode,
+            "down",
+            CliError {
+                code: "disconnect_failed",
+                message: msg,
+                hint: if force {
+                    None
+                } else {
+                    Some("Try: sudo vortix down --force".into())
+                },
+            },
+            ExitCode::GeneralError,
+        );
+    }
+
+    let data = DownData {
+        state: "disconnected".into(),
+        disconnected: disconnected.clone(),
+    };
+    match mode {
+        OutputMode::Human => {
+            if disconnected.len() == 1 {
+                println!("Disconnected {}", disconnected[0]);
+            } else {
+                println!("Disconnected {} tunnels:", disconnected.len());
+                for name in &disconnected {
+                    println!("  - {name}");
+                }
+            }
+            if let Some(e) = &last_error {
+                eprintln!("warning: one or more tunnels did not disconnect cleanly: {e}");
+            }
+        }
+        OutputMode::Json => print_success(
+            mode,
+            "down",
+            &data,
+            vec!["vortix status --json".into(), "vortix list --json".into()],
+        ),
+        OutputMode::Quiet => {}
+    }
+    0
 }
 
-fn handle_reconnect(config: &AppConfig, config_dir: &Path, mode: OutputMode) -> i32 {
+fn handle_reconnect(
+    profile_filter: Option<&str>,
+    config: &AppConfig,
+    config_dir: &Path,
+    mode: OutputMode,
+) -> i32 {
     let mut engine = VpnEngine::new_headless(config.clone(), config_dir.to_path_buf());
     engine.load_metadata();
 
-    let last = engine
-        .profiles
-        .iter()
-        .filter(|p| p.last_used.is_some())
-        .max_by_key(|p| p.last_used)
-        .map(|p| p.name.clone());
-
-    match last {
-        Some(name) => {
-            // Disconnect first if needed
-            let active = crate::core::scanner::get_active_profiles(&engine.profiles);
-            if !active.is_empty() {
-                if let Some(session) = active.first() {
-                    engine.connection_state = crate::state::ConnectionState::Connected {
-                        profile: session.name.clone(),
-                        server_location: String::new(),
-                        since: std::time::Instant::now(),
-                        latency_ms: 0,
-                        details: Box::new(crate::state::DetailedConnectionInfo {
-                            pid: session.pid,
-                            interface: session.interface.clone(),
-                            ..Default::default()
-                        }),
-                    };
-                    let _ = engine.disconnect_and_wait(false, Duration::from_secs(15));
-                }
-            }
-            handle_up(Some(&name), 20, config, config_dir, mode)
-        }
-        None => {
-            print_error_and_exit(
-                mode,
-                "reconnect",
-                CliError {
-                    code: "no_profile",
-                    message: "No previously used profile found".into(),
-                    hint: Some("Connect to a profile first: sudo vortix up <PROFILE>".into()),
-                },
-                ExitCode::NotFound,
-            );
+    // Validate the requested profile exists in the catalog before we
+    // poke the system. NotFound (exit 3) > "no active" idempotency.
+    if let Some(name) = profile_filter {
+        if engine.find_profile(name).is_none() {
+            print_error_and_exit(mode, "reconnect", err_not_found(name), ExitCode::NotFound);
         }
     }
+
+    // Decide which profile(s) to cycle.
+    // - With a filter: just that one (must currently be Connected;
+    //   otherwise we fall back to a fresh `up` so the user gets the
+    //   "reconnect named profile" intent even if it's currently down).
+    // - Without: every currently-Connected tunnel. If none are
+    //   currently active, fall back to the last-used profile so the
+    //   single-tunnel `vortix reconnect` muscle memory still works.
+    let active = crate::core::scanner::get_active_profiles(&engine.profiles);
+
+    let to_cycle: Vec<String> = if let Some(name) = profile_filter {
+        vec![name.to_string()]
+    } else if !active.is_empty() {
+        active.iter().map(|s| s.name.clone()).collect()
+    } else {
+        // No active tunnels and no explicit target — fall back to
+        // last-used (preserves the single-tunnel behaviour).
+        match engine
+            .profiles
+            .iter()
+            .filter(|p| p.last_used.is_some())
+            .max_by_key(|p| p.last_used)
+            .map(|p| p.name.clone())
+        {
+            Some(name) => vec![name],
+            None => {
+                print_error_and_exit(
+                    mode,
+                    "reconnect",
+                    CliError {
+                        code: "no_profile",
+                        message: "No previously used profile found".into(),
+                        hint: Some(
+                            "Connect to a profile first: sudo vortix up <PROFILE>".into(),
+                        ),
+                    },
+                    ExitCode::NotFound,
+                );
+            }
+        }
+    };
+
+    // Cycle each profile: disconnect (if active) then connect. The CLI
+    // still drives the single-tunnel `VpnEngine` one profile at a time;
+    // a future unit routes this through `TunnelRegistry::reconnect`.
+    // Note that `handle_up` calls `print_error_and_exit` on failure, so
+    // a failing connect aborts the whole cycle — matching the
+    // single-tunnel reconnect semantics this command is preserving.
+    let mut last_exit: i32 = 0;
+    for name in &to_cycle {
+        if let Some(session) = active.iter().find(|s| &s.name == name) {
+            point_engine_at_session(&mut engine, session);
+            let _ = engine.disconnect_and_wait(false, Duration::from_secs(15));
+        }
+        last_exit = handle_up(Some(name), 20, false, config, config_dir, mode);
+    }
+    last_exit
 }
 
 // ── Status ──────────────────────────────────────────────────────────────
