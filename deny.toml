@@ -36,6 +36,13 @@ allow = [
     "Zlib",
     "Unicode-3.0",
     "Unicode-DFS-2016",
+    # CDLA-Permissive-2.0: a Linux Foundation permissive data-sharing
+    # license. Used by `webpki-roots` to redistribute the Mozilla CA
+    # trust bundle, which `reqwest`'s `rustls-tls` feature pulls in for
+    # TLS verification (plan 002 U9). The license is the data-flavored
+    # analog of MIT/Apache — modification + redistribution permitted,
+    # no warranty. Allowing it has the same risk profile as MIT.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
 

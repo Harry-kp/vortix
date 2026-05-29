@@ -217,48 +217,23 @@ fn try_ipinfo_api(
     tx: &Sender<TelemetryUpdate>,
     cfg: &TelemetryConfig,
 ) -> Option<(String, Option<String>, Option<String>)> {
-    let timeout = cfg.api_timeout.to_string();
+    let timeout = Duration::from_secs(cfg.api_timeout);
 
     for attempt in 0..constants::RETRY_ATTEMPTS {
-        let output = crate::vortix_process::run_to_output(CommandSpec::oneshot(
-            "curl",
-            vec![
-                "-s".into(),
-                "--max-time".into(),
-                timeout.clone(),
-                cfg.ip_api_primary.clone(),
-            ],
-        ));
-
-        if let Err(e) = &output {
-            let _ = tx.send(TelemetryUpdate::Log(
-                LogLevel::Error,
-                format!("ipinfo.io attempt {}: curl failed: {}", attempt + 1, e),
-            ));
-            if attempt == 0 {
-                thread::sleep(std::time::Duration::from_millis(constants::RETRY_DELAY_MS));
-            }
-            continue;
-        }
-
-        let output = output.ok()?;
-
-        if !output.status.success() {
+        let Some(text) = crate::core::telemetry_http::get_text(&cfg.ip_api_primary, timeout) else {
             let _ = tx.send(TelemetryUpdate::Log(
                 LogLevel::Debug,
                 format!(
-                    "ipinfo.io attempt {}: HTTP error {}",
-                    attempt + 1,
-                    output.status
+                    "ipinfo.io attempt {}: HTTP request failed (timeout / non-2xx / network)",
+                    attempt + 1
                 ),
             ));
             if attempt == 0 {
-                thread::sleep(std::time::Duration::from_millis(constants::RETRY_DELAY_MS));
+                thread::sleep(Duration::from_millis(constants::RETRY_DELAY_MS));
             }
             continue;
-        }
+        };
 
-        let text = String::from_utf8_lossy(&output.stdout);
         let _ = tx.send(TelemetryUpdate::Log(
             LogLevel::Debug,
             format!(
@@ -268,7 +243,6 @@ fn try_ipinfo_api(
             ),
         ));
 
-        // Use proper JSON deserialization instead of manual string parsing
         if let Some(result) = parse_ip_api_response(&text) {
             return Some(result);
         }
@@ -278,7 +252,7 @@ fn try_ipinfo_api(
         ));
 
         if attempt == 0 {
-            thread::sleep(std::time::Duration::from_millis(constants::RETRY_DELAY_MS));
+            thread::sleep(Duration::from_millis(constants::RETRY_DELAY_MS));
         }
     }
 
@@ -311,59 +285,38 @@ fn is_valid_ipv4(ip: &str) -> bool {
 
 /// Try ipify.org API (IP only, very reliable) with retry
 fn try_ipify_api(tx: &Sender<TelemetryUpdate>, cfg: &TelemetryConfig) -> Option<String> {
-    let timeout = cfg.api_timeout.to_string();
+    let timeout = Duration::from_secs(cfg.api_timeout);
     let url = cfg
         .ip_api_fallbacks
         .first()
         .map_or("https://api.ipify.org", String::as_str);
 
     for attempt in 0..constants::RETRY_ATTEMPTS {
-        let output = crate::vortix_process::run_to_output(CommandSpec::oneshot(
-            "curl",
-            vec![
-                "-s".into(),
-                "--max-time".into(),
-                timeout.clone(),
-                url.into(),
-            ],
-        ));
-
-        if let Err(e) = &output {
-            let _ = tx.send(TelemetryUpdate::Log(
-                LogLevel::Error,
-                format!("ipify.org attempt {}: curl failed: {}", attempt + 1, e),
-            ));
-            if attempt == 0 {
-                thread::sleep(std::time::Duration::from_millis(constants::RETRY_DELAY_MS));
+        match crate::core::telemetry_http::get_text(url, timeout) {
+            Some(body) => {
+                let ip = body.trim().to_string();
+                if !ip.is_empty() && is_valid_ipv4(&ip) {
+                    return Some(ip);
+                }
+                let _ = tx.send(TelemetryUpdate::Log(
+                    LogLevel::Warning,
+                    format!(
+                        "ipify.org attempt {}: invalid IP format: '{}'",
+                        attempt + 1,
+                        ip
+                    ),
+                ));
             }
-            continue;
-        }
-
-        let output = output.ok()?;
-
-        if output.status.success() {
-            let ip = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
-            if !ip.is_empty() && is_valid_ipv4(&ip) {
-                return Some(ip);
+            None => {
+                let _ = tx.send(TelemetryUpdate::Log(
+                    LogLevel::Debug,
+                    format!("ipify.org attempt {}: HTTP error", attempt + 1),
+                ));
             }
-            let _ = tx.send(TelemetryUpdate::Log(
-                LogLevel::Warning,
-                format!(
-                    "ipify.org attempt {}: invalid IP format: '{}'",
-                    attempt + 1,
-                    ip
-                ),
-            ));
-        } else {
-            let _ = tx.send(TelemetryUpdate::Log(
-                LogLevel::Debug,
-                format!("ipify.org attempt {}: HTTP error", attempt + 1),
-            ));
         }
 
         if attempt == 0 {
-            thread::sleep(std::time::Duration::from_millis(constants::RETRY_DELAY_MS));
+            thread::sleep(Duration::from_millis(constants::RETRY_DELAY_MS));
         }
     }
 
@@ -376,42 +329,27 @@ fn try_ipify_api(tx: &Sender<TelemetryUpdate>, cfg: &TelemetryConfig) -> Option<
 
 /// Try icanhazip.com API (IP only) with retry
 fn try_icanhazip_api(tx: &Sender<TelemetryUpdate>, cfg: &TelemetryConfig) -> Option<String> {
-    let timeout = cfg.api_timeout.to_string();
+    let timeout = Duration::from_secs(cfg.api_timeout);
     let url = cfg
         .ip_api_fallbacks
         .get(1)
         .map_or("https://icanhazip.com", String::as_str);
 
     for attempt in 0..constants::RETRY_ATTEMPTS {
-        let output = crate::vortix_process::run_to_output(CommandSpec::oneshot(
-            "curl",
-            vec![
-                "-s".into(),
-                "--max-time".into(),
-                timeout.clone(),
-                url.into(),
-            ],
-        ));
-
-        if let Err(e) = &output {
-            let _ = tx.send(TelemetryUpdate::Log(
-                LogLevel::Error,
-                format!("icanhazip.com: curl failed: {e}"),
-            ));
-            continue;
-        }
-
-        let output = output.ok()?;
-
-        if output.status.success() {
-            let ip = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if let Some(body) = crate::core::telemetry_http::get_text(url, timeout) {
+            let ip = body.trim().to_string();
             if !ip.is_empty() {
                 return Some(ip);
             }
+        } else {
+            let _ = tx.send(TelemetryUpdate::Log(
+                LogLevel::Error,
+                "icanhazip.com: HTTP request failed".to_string(),
+            ));
         }
 
         if attempt == 0 {
-            thread::sleep(std::time::Duration::from_millis(constants::RETRY_DELAY_MS));
+            thread::sleep(Duration::from_millis(constants::RETRY_DELAY_MS));
         }
     }
     None
@@ -419,42 +357,27 @@ fn try_icanhazip_api(tx: &Sender<TelemetryUpdate>, cfg: &TelemetryConfig) -> Opt
 
 /// Try ifconfig.me API (IP only) with retry
 fn try_ifconfig_api(tx: &Sender<TelemetryUpdate>, cfg: &TelemetryConfig) -> Option<String> {
-    let timeout = cfg.api_timeout.to_string();
+    let timeout = Duration::from_secs(cfg.api_timeout);
     let url = cfg
         .ip_api_fallbacks
         .get(2)
         .map_or("https://ifconfig.me/ip", String::as_str);
 
     for attempt in 0..constants::RETRY_ATTEMPTS {
-        let output = crate::vortix_process::run_to_output(CommandSpec::oneshot(
-            "curl",
-            vec![
-                "-s".into(),
-                "--max-time".into(),
-                timeout.clone(),
-                url.into(),
-            ],
-        ));
-
-        if let Err(e) = &output {
-            let _ = tx.send(TelemetryUpdate::Log(
-                LogLevel::Error,
-                format!("ifconfig.me: curl failed: {e}"),
-            ));
-            continue;
-        }
-
-        let output = output.ok()?;
-
-        if output.status.success() {
-            let ip = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if let Some(body) = crate::core::telemetry_http::get_text(url, timeout) {
+            let ip = body.trim().to_string();
             if !ip.is_empty() {
                 return Some(ip);
             }
+        } else {
+            let _ = tx.send(TelemetryUpdate::Log(
+                LogLevel::Error,
+                "ifconfig.me: HTTP request failed".to_string(),
+            ));
         }
 
         if attempt == 0 {
-            thread::sleep(std::time::Duration::from_millis(constants::RETRY_DELAY_MS));
+            thread::sleep(Duration::from_millis(constants::RETRY_DELAY_MS));
         }
     }
     None
@@ -651,19 +574,9 @@ fn fetch_security_info(tx: &Sender<TelemetryUpdate>, cfg: &std::sync::Arc<Teleme
 
         // Check for IPv6 connectivity with multiple endpoints (indicates potential leak when VPN active)
         let mut is_leaking = false;
-        let ipv6_timeout = cfg.api_timeout.to_string();
+        let ipv6_timeout = Duration::from_secs(cfg.api_timeout);
         for endpoint in &cfg.ipv6_check_apis {
-            let output6 = crate::vortix_process::run_to_output(CommandSpec::oneshot(
-                "curl",
-                vec![
-                    "-6".into(),
-                    "-s".into(),
-                    "--max-time".into(),
-                    ipv6_timeout.clone(),
-                    endpoint.clone(),
-                ],
-            ));
-            if output6.map(|o| o.status.success()).unwrap_or(false) {
+            if crate::core::telemetry_http::probe_ipv6(endpoint, ipv6_timeout) {
                 is_leaking = true;
                 break;
             }

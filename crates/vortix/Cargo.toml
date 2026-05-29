@@ -78,6 +78,12 @@ sha2 = "0.10"
 # `x11rb` / `zune-*` deps for clipboard image support we don't use;
 # disable defaults to keep binary lean.
 arboard = { version = "3.6.1", default-features = false }
+# Plan 002 U9: HTTP client for telemetry (replaces `curl` shell-outs).
+# `blocking` so we don't have to wire the existing std::thread::spawn
+# telemetry workers into the tokio runtime; `rustls-tls` to avoid pulling
+# OpenSSL into the binary; `json` for the IP-API responses. defaults are
+# the native-tls + hickory-dns stack we don't want.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
 
 # System calls (for root detection + platform crates)
 [target.'cfg(unix)'.dependencies]
