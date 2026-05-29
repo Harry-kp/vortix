@@ -648,8 +648,9 @@ mod tests {
             declared_cidrs: vec![],
             is_primary: true,
         };
-        let v4 = IptablesFirewall::generate_v4_ruleset(&[t.clone()]);
-        let v6 = IptablesFirewall::generate_v6_ruleset(&[t]).expect("v6 ruleset present");
+        let v4 = IptablesFirewall::generate_v4_ruleset(std::slice::from_ref(&t));
+        let v6 = IptablesFirewall::generate_v6_ruleset(std::slice::from_ref(&t))
+            .expect("v6 ruleset present");
         // v4 ruleset has the v4 server IP, not the v6 one.
         assert!(v4.contains("-A OUTPUT -d 1.2.3.4 -j ACCEPT"));
         assert!(!v4.contains("2001:db8"));

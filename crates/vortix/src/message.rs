@@ -97,7 +97,7 @@ pub enum Message {
     /// instead and this message is never sent.
     RequestDisconnectAll,
     /// Multi-connection plan #001 U19: user accepted the
-    /// [`InputMode::ConfirmDisconnectAll`] overlay; tear down every active
+    /// `InputMode::ConfirmDisconnectAll` overlay; tear down every active
     /// tunnel (registry-aware) plus the legacy single-tunnel state.
     ConfirmDisconnectAll,
     /// Multi-connection plan #001 U19: cycle Connection Details focus to
