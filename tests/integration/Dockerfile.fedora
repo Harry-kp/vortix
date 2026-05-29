@@ -1,0 +1,39 @@
+# vortix integration test harness — Fedora variant.
+#
+# Privileged Fedora container with wireguard-tools + openvpn + iproute +
+# native nftables preinstalled. Parallel to the Ubuntu image; the workflow
+# matrix runs both so we catch behavioral differences between iptables-nft
+# compat (Ubuntu's default) and native nft (Fedora's default).
+#
+# Why Fedora 41: matches the test-fedora cargo-test job's container image
+# in ci.yml — same kernel + libc baseline so behaviors observed here
+# correlate with what the unit-level Fedora job sees.
+
+FROM fedora:41
+
+ENV CARGO_TERM_COLOR=always
+
+# Layer 1: runtime + build tooling for vortix + the VPN binaries the
+# integration tests drive. Fedora package names differ from Ubuntu:
+#   - gcc gcc-c++ make pkgconf-pkg-config openssl-devel (was: build-essential pkg-config libssl-dev)
+#   - iproute (was: iproute2)
+#   - iputils (was: iputils-ping)
+#   - procps-ng (was: procps)
+RUN dnf install -y \
+        ca-certificates curl git \
+        gcc gcc-c++ make pkgconf-pkg-config openssl-devel \
+        wireguard-tools openvpn iproute iptables nftables \
+        iputils sudo procps-ng \
+    && dnf clean all
+
+# Layer 2: Rust toolchain. Pin matches the workspace MSRV badge.
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.91.0 \
+    && /root/.cargo/bin/rustup component add clippy rustfmt
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Workdir is mounted from the repo at runtime; tests bind-mount the source
+# tree into /workspace and run `cargo build` inside.
+WORKDIR /workspace
+
+# Default entrypoint is bash so the GH Actions step controls invocation.
+CMD ["/bin/bash"]

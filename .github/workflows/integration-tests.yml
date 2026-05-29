@@ -1,10 +1,12 @@
 # Plan 015 phase B / plan 012 — CI integration tests
 #
-# Drives the vortix binary against real wg-quick + openvpn + iptables in
-# a privileged Ubuntu Docker container with two network namespaces.
-# Ubuntu-only at this gate; macOS integration parity is deferred to a
-# follow-up plan because GitHub Actions' macOS runners don't easily
-# support netns / sandboxed wg-quick.
+# Drives the vortix binary against real wg-quick + openvpn + iptables /
+# nftables in privileged Docker containers with `ip netns` namespaces.
+# Matrix covers Ubuntu (iptables-nft compat) + Fedora (native nft) so
+# we catch behavioral differences between the two firewall backends.
+# macOS integration parity is deferred to a follow-up plan because
+# GitHub Actions' macOS runners don't easily support netns / sandboxed
+# wg-quick.
 
 name: Integration Tests
 
@@ -27,7 +29,19 @@ env:
 
 jobs:
   integration:
-    name: Integration / ubuntu-22.04
+    name: Integration / ${{ matrix.distro.label }}
+    strategy:
+      # Each distro is independent — if Ubuntu finds a real regression
+      # we still want to see Fedora's signal (and vice versa).
+      fail-fast: false
+      matrix:
+        distro:
+          - label: ubuntu-22.04
+            dockerfile: Dockerfile
+            image_tag: vortix-integration-ubuntu
+          - label: fedora-41
+            dockerfile: Dockerfile.fedora
+            image_tag: vortix-integration-fedora
     runs-on: ubuntu-latest
     # Hard-gated: a failed integration test fails the PR check.
     # Killswitch is Vortix's core product promise — regressions here
@@ -38,17 +52,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build integration harness image
-        run: docker build -t vortix-integration tests/integration/
+      - name: Build integration harness image (${{ matrix.distro.label }})
+        run: |
+          docker build \
+              -t ${{ matrix.distro.image_tag }} \
+              -f tests/integration/${{ matrix.distro.dockerfile }} \
+              tests/integration/
 
-      - name: Run integration tests
+      - name: Run integration tests (${{ matrix.distro.label }})
         # --privileged: required for `ip netns` + iptables manipulation
         # --network host: avoid docker0 interfering with the test netns
         run: |
           docker run --privileged --network host --rm \
               -v "$PWD:/workspace" \
               -w /workspace \
-              vortix-integration \
+              ${{ matrix.distro.image_tag }} \
               bash -c '
                 set -euo pipefail
                 cargo build --release -p vortix --locked
