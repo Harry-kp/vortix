@@ -75,8 +75,9 @@ pub enum PrimaryTunnelChangeReason {
 }
 
 /// Per-tunnel role derived from declared `AllowedIPs` + current primary.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Role {
     /// Owns the kernel default route. Carries the declared `AllowedIPs` for
     /// display / Security Guard scoping.
@@ -96,7 +97,7 @@ pub enum Role {
 }
 
 /// Read-only view of one FSM. UI panels read through these.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TunnelSnapshot {
     pub profile_id: ProfileId,
     pub state: Connection,
@@ -516,7 +517,9 @@ impl<T: Tunnel> TunnelRegistry<T> {
             .ok_or_else(|| RegistryError::ProfileNotFound(profile_id.clone()))?;
         let events = entry
             .engine
-            .handle(Input::UserCommand(UserCommand::Disconnect));
+            .handle(Input::UserCommand(UserCommand::Disconnect {
+                profile_id: Some(profile_id.clone()),
+            }));
 
         // Event-driven primary refresh. If we just took down the primary,
         // re-probe immediately and emit a structured log so U23's journal
@@ -582,7 +585,9 @@ impl<T: Tunnel> TunnelRegistry<T> {
             .ok_or_else(|| RegistryError::ProfileNotFound(profile_id.clone()))?;
         let events = entry
             .engine
-            .handle(Input::UserCommand(UserCommand::Reconnect));
+            .handle(Input::UserCommand(UserCommand::Reconnect {
+                profile_id: Some(profile_id.clone()),
+            }));
         self.refresh_primary_internal(events.iter());
         Ok(())
     }

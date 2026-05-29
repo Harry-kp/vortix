@@ -295,6 +295,15 @@ async fn dispatch(req: IpcRequest, engine_handle: Option<&EngineHandle>) -> IpcR
         },
         IpcOp::Snapshot => match engine_handle {
             Some(h) => match h.snapshot().await {
+                // v1-compat: populate `Snapshot { state }` with the
+                // primary's Connection (or Disconnected when no
+                // primary). New v2 callers should switch to
+                // `RegistrySnapshot` once they upgrade — see plan
+                // #001 U22. Today the EngineHandle exposes a single
+                // FSM (D1 wired the single-tunnel handle in the
+                // daemon); the registry-aware variant lands when a
+                // follow-up unit threads the registry into the
+                // daemon's accept loop.
                 Ok(snap) => Ok(IpcResult::Snapshot { state: snap.state }),
                 Err(e) => Err(IpcError::Internal(format!("snapshot error: {e}"))),
             },
@@ -527,5 +536,136 @@ mod tests {
         // SAFETY: trivial syscall, see DaemonServer::bind.
         let me = unsafe { libc::geteuid() };
         assert_eq!(uid, me);
+    }
+
+    // ===== U22 multi-tunnel command dispatch =====
+
+    #[tokio::test]
+    async fn dispatch_execute_disconnect_all_routes_through_engine_handle() {
+        let handle = EngineHandle::for_test();
+        // Connect first so disconnect has something to act on.
+        let connect_req = IpcRequest {
+            id: 10,
+            op: IpcOp::Execute(UserCommand::Connect {
+                profile_id: ProfileId::new("corp"),
+            }),
+        };
+        let _ = dispatch(connect_req, Some(&handle)).await;
+
+        let req = IpcRequest {
+            id: 11,
+            op: IpcOp::Execute(UserCommand::Disconnect { profile_id: None }),
+        };
+        let resp = dispatch(req, Some(&handle)).await;
+        assert_eq!(resp.id, 11);
+        assert!(matches!(resp.result, Ok(IpcResult::Accepted)));
+    }
+
+    #[tokio::test]
+    async fn dispatch_execute_disconnect_specific_routes_through_engine_handle() {
+        let handle = EngineHandle::for_test();
+        let req = IpcRequest {
+            id: 12,
+            op: IpcOp::Execute(UserCommand::Disconnect {
+                profile_id: Some(ProfileId::new("corp")),
+            }),
+        };
+        let resp = dispatch(req, Some(&handle)).await;
+        assert!(matches!(resp.result, Ok(IpcResult::Accepted)));
+    }
+
+    #[tokio::test]
+    async fn dispatch_execute_reconnect_all_routes_through_engine_handle() {
+        let handle = EngineHandle::for_test();
+        let req = IpcRequest {
+            id: 13,
+            op: IpcOp::Execute(UserCommand::Reconnect { profile_id: None }),
+        };
+        let resp = dispatch(req, Some(&handle)).await;
+        assert!(matches!(resp.result, Ok(IpcResult::Accepted)));
+    }
+
+    #[tokio::test]
+    async fn dispatch_execute_force_disconnect_specific_routes_through_engine_handle() {
+        let handle = EngineHandle::for_test();
+        let req = IpcRequest {
+            id: 14,
+            op: IpcOp::Execute(UserCommand::ForceDisconnect {
+                profile_id: Some(ProfileId::new("corp")),
+            }),
+        };
+        let resp = dispatch(req, Some(&handle)).await;
+        assert!(matches!(resp.result, Ok(IpcResult::Accepted)));
+    }
+
+    #[test]
+    fn v1_disconnect_unit_form_does_not_decode_against_v2_op() {
+        // A v1 client sending `{"kind":"execute","Execute":"Disconnect"}`
+        // (legacy unit-variant payload) must NOT silently mis-parse on
+        // the v2 server. Verify against IpcOp::Execute(UserCommand) end
+        // to end.
+        let v1_envelope = r#"{"kind":"execute","Execute":"Disconnect"}"#;
+        let parsed: Result<IpcOp, _> = serde_json::from_str(v1_envelope);
+        assert!(
+            parsed.is_err(),
+            "v1 unit-variant Disconnect should be rejected by v2 IpcOp decoder, got {parsed:?}"
+        );
+    }
+
+    #[test]
+    fn v2_disconnect_struct_form_round_trips_through_ipc_op() {
+        let op = IpcOp::Execute(UserCommand::Disconnect { profile_id: None });
+        let json = serde_json::to_string(&op).expect("serialize");
+        let back: IpcOp = serde_json::from_str(&json).expect("deserialize");
+        match back {
+            IpcOp::Execute(UserCommand::Disconnect { profile_id: None }) => {}
+            other => panic!("v2 Disconnect{{None}} round-trip mismatch: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ipc_error_conflict_round_trips() {
+        use crate::vortix_core::engine::registry::Conflict;
+        let err = IpcError::Conflict {
+            conflict: Conflict::DefaultRouteTakeover {
+                current: ProfileId::new("corp"),
+                new: ProfileId::new("home"),
+            },
+        };
+        let json = serde_json::to_string(&err).expect("serialize");
+        let back: IpcError = serde_json::from_str(&json).expect("deserialize");
+        match back {
+            IpcError::Conflict {
+                conflict: Conflict::DefaultRouteTakeover { current, new },
+            } => {
+                assert_eq!(current.as_str(), "corp");
+                assert_eq!(new.as_str(), "home");
+            }
+            other => panic!("expected Conflict round-trip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ipc_result_registry_snapshot_round_trips() {
+        use crate::vortix_core::state::KillSwitchState;
+        let r = IpcResult::RegistrySnapshot {
+            tunnels: vec![],
+            primary: None,
+            killswitch: KillSwitchState::Disabled,
+        };
+        let json = serde_json::to_string(&r).expect("serialize");
+        let back: IpcResult = serde_json::from_str(&json).expect("deserialize");
+        match back {
+            IpcResult::RegistrySnapshot {
+                tunnels,
+                primary,
+                killswitch,
+            } => {
+                assert!(tunnels.is_empty());
+                assert!(primary.is_none());
+                assert_eq!(killswitch, KillSwitchState::Disabled);
+            }
+            other => panic!("expected RegistrySnapshot, got {other:?}"),
+        }
     }
 }
