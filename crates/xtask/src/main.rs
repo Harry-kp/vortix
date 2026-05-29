@@ -20,6 +20,8 @@ enum Command {
     CheckPlatformLeak,
     /// Verify no protocol-specific subprocess names outside their protocol crates (plan 004).
     CheckProtocolLeak,
+    /// Verify no shell-outs to system binaries that plan 002 replaced.
+    CheckNoShellRegressions,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -28,6 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::CheckSubprocess => check_subprocess(),
         Command::CheckPlatformLeak => check_platform_leak(),
         Command::CheckProtocolLeak => check_protocol_leak(),
+        Command::CheckNoShellRegressions => check_no_shell_regressions(),
     }
 }
 
@@ -330,6 +333,133 @@ fn check_protocol_leak() -> Result<(), Box<dyn std::error::Error>> {
         }
         std::process::exit(1)
     }
+}
+
+/// System binaries that plan 002 replaced. Once a binary is on this
+/// list, any future code that `CommandSpec::oneshot("<name>", ...)`s
+/// it gets caught at build time — preventing the regression class
+/// the Fedora-without-`which` incident (PR #1 `fcf9508`) revealed.
+///
+/// The list deliberately covers tools removed in U1 (`which`), U2/U6
+/// (`kill`), U3 (`uname`, `sw_vers`), U4/U5/U6 (`ifconfig`, `ip`,
+/// `ps`), U7 (`netstat`, `lsof`, `scutil`), U8 (`pbcopy`, `xclip`,
+/// `wl-copy`), U9 (`curl`), and U10 (`ping`). It does NOT cover the
+/// irreducible product-behavior binaries (`wg-quick`, `wg`, `openvpn`,
+/// `iptables-restore`, `nft`, `pfctl`, `resolvconf`).
+const FORBIDDEN_SHELL_OUTS: &[&str] = &[
+    "curl",
+    "ping",
+    "which",
+    "pbcopy",
+    "xclip",
+    "wl-copy",
+    "xsel",
+    "ifconfig",
+    "ip",
+    "ps",
+    "netstat",
+    "lsof",
+    "scutil",
+    "networksetup",
+    "kill",
+    "pkill",
+    "uname",
+    "sw_vers",
+];
+
+/// Scan `crates/vortix/src/` for `CommandSpec::oneshot("<deprecated>"` —
+/// any literal program name on `FORBIDDEN_SHELL_OUTS` reappearing in
+/// a oneshot call fails the build.
+///
+/// Allowlist:
+/// - `crates/xtask/src/main.rs` — the lint references the pattern.
+/// - Lines annotated with `// xtask:allow-shell-regression: <reason>`
+///   (same/prev/next-line — same parser as the other boundary checks).
+fn check_no_shell_regressions() -> Result<(), Box<dyn std::error::Error>> {
+    let workspace_root = workspace_root()?;
+    let crates_dir = workspace_root.join("crates");
+
+    let mut violations = Vec::new();
+
+    let walker = ignore::WalkBuilder::new(&crates_dir)
+        .hidden(false)
+        .git_ignore(true)
+        .build();
+
+    for result in walker {
+        let Ok(entry) = result else { continue };
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        // Self-exclude: the lint mentions every forbidden name in its
+        // own source.
+        let rel = path.strip_prefix(&workspace_root).unwrap_or(path);
+        if rel.to_string_lossy() == "crates/xtask/src/main.rs" {
+            continue;
+        }
+
+        let Ok(content) = std::fs::read_to_string(path) else {
+            continue;
+        };
+
+        let lines: Vec<&str> = content.lines().collect();
+        for (idx, line) in lines.iter().enumerate() {
+            let Some(program) = find_forbidden_oneshot(line) else {
+                continue;
+            };
+            // Annotation parser mirrors check_platform_leak's: accept
+            // same/prev/next line. rustfmt sometimes splits trailing
+            // comments off the call site.
+            let marker = "// xtask:allow-shell-regression";
+            let same = line.contains(marker);
+            let prev = idx
+                .checked_sub(1)
+                .and_then(|i| lines.get(i))
+                .is_some_and(|l| l.contains(marker));
+            let next = lines.get(idx + 1).is_some_and(|l| l.contains(marker));
+            if same || prev || next {
+                continue;
+            }
+            violations.push(format!(
+                "{}:{}: CommandSpec::oneshot(\"{}\", ...)",
+                rel.display(),
+                idx + 1,
+                program
+            ));
+        }
+    }
+
+    if violations.is_empty() {
+        eprintln!("xtask check-no-shell-regressions: ok (crates/ scanned)");
+        Ok(())
+    } else {
+        eprintln!(
+            "xtask check-no-shell-regressions: {} violation(s) — plan 002 replaced these system-binary shell-outs with native Rust. Re-introducing them risks the Fedora-without-`which` regression class. For legitimate exceptions, annotate with `// xtask:allow-shell-regression: <reason>`.",
+            violations.len()
+        );
+        for v in &violations {
+            eprintln!("  {v}");
+        }
+        std::process::exit(1)
+    }
+}
+
+/// Does `line` contain a `CommandSpec::oneshot("<forbidden>"`? If so,
+/// return the forbidden program name. The match must be tight: we
+/// look for the literal substring `CommandSpec::oneshot("<name>"`
+/// (with quotes) so prose mentioning a tool name elsewhere on the
+/// line doesn't trip the lint.
+fn find_forbidden_oneshot(line: &str) -> Option<&'static str> {
+    let needle_prefix = "CommandSpec::oneshot(\"";
+    let start = line.find(needle_prefix)?;
+    let rest = &line[start + needle_prefix.len()..];
+    let end = rest.find('"')?;
+    let program = &rest[..end];
+    FORBIDDEN_SHELL_OUTS.iter().copied().find(|&p| p == program)
 }
 
 fn workspace_root() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
