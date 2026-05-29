@@ -15,10 +15,19 @@ ENV CARGO_TERM_COLOR=always
 
 # Layer 1: runtime + build tooling for vortix + the VPN binaries the
 # integration tests drive.
+#
+# Intentionally NOT installed (plan 002 removed vortix's shell-out to
+# them; integration test scripts don't use them either):
+#   - procps (provides `ps`) — U6 + U10 swapped to libc::proc_listpids
+#     and /proc/<pid>/cmdline.
+#   - which — U1 swapped to a direct $PATH walk.
+# `curl` and `iputils-ping` stay because this Dockerfile uses curl to
+# fetch the rustup installer and the integration scripts under
+# tests/integration/*.sh issue raw `ping` for assertions.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl git build-essential pkg-config libssl-dev \
         wireguard-tools openvpn iproute2 iptables nftables \
-        iputils-ping sudo procps \
+        iputils-ping sudo \
     && rm -rf /var/lib/apt/lists/*
 
 # Layer 2: Rust toolchain. Pin matches the workspace MSRV badge.

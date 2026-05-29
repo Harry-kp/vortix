@@ -18,12 +18,11 @@ ENV CARGO_TERM_COLOR=always
 #   - gcc gcc-c++ make pkgconf-pkg-config openssl-devel (was: build-essential pkg-config libssl-dev)
 #   - iproute (was: iproute2)
 #   - iputils (was: iputils-ping)
-#   - procps-ng (was: procps)
 RUN dnf install -y \
         ca-certificates curl git \
         gcc gcc-c++ make pkgconf-pkg-config openssl-devel \
         wireguard-tools openvpn iproute iptables nftables \
-        iputils sudo procps-ng \
+        iputils sudo \
     && dnf clean all
 # NOTE: deliberately NOT installing `which`. Fedora minimal containers
 # don't ship `which` by default — neither do many real-user Fedora
@@ -32,6 +31,10 @@ RUN dnf install -y \
 # present. If a future test step needs `which`, the right fix is to
 # stop shelling out to it (as we did with utils::binary_exists), not
 # to install it here.
+#
+# Also intentionally NOT installing `procps-ng` (`ps`): plan 002 U6 +
+# U10 replaced both `ps` call sites with libc::proc_listpids on macOS
+# and /proc/<pid>/cmdline on Linux. Test scripts don't use it either.
 
 # Layer 2: Rust toolchain. Pin matches the workspace MSRV badge.
 RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.91.0 \

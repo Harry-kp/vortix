@@ -73,14 +73,13 @@ If you use Vortix on Linux and hit a problem, please open an issue and include `
 
 | Dependency | macOS | Linux | Purpose |
 |------------|-------|-------|---------|
-| `curl` | Pre-installed | `apt install curl` | Telemetry and IP detection |
 | `openvpn` | `brew install openvpn` | `apt install openvpn` | OpenVPN sessions |
 | `wireguard-tools` | `brew install wireguard-tools` | `apt install wireguard-tools` | WireGuard sessions |
 | `resolvconf` / `systemd-resolved` | N/A (uses native DNS) | `systemd-resolvconf` or `openresolv` | WireGuard DNS management (optional, needed if DNS in config) |
 | `iptables` or `nftables` | N/A (uses `pfctl`) | Pre-installed | Kill switch |
-| `iproute2` | N/A (uses `ifconfig`) | Pre-installed | Interface detection |
 
 > Vortix checks for missing tools at startup and shows a warning toast with install instructions.
+> Interface inspection, network stats, DNS detection, HTTP telemetry, ICMP latency, and clipboard handoff now run in-process — no `curl`, `ping`, `which`, `ifconfig`, `ip addr`, `ps`, `netstat`, `lsof`, `scutil`, `pbcopy`, or `xclip` shell-out required.
 
 **DNS tools note:** If your WireGuard profile includes a `DNS =` directive, Vortix will automatically detect and warn about missing DNS tools. Install accordingly:
 - **Arch/Fedora (systemd-based):** `sudo pacman -S systemd-resolvconf` or `sudo dnf install systemd-resolved`
@@ -96,17 +95,17 @@ If you use Vortix on Linux and hit a problem, please open an issue and include `
 
 **Ubuntu/Debian:**
 ```bash
-sudo apt install curl wireguard-tools openvpn iptables iproute2 systemd-resolved
+sudo apt install wireguard-tools openvpn iptables systemd-resolved
 ```
 
 **Fedora/RHEL:**
 ```bash
-sudo dnf install curl wireguard-tools openvpn iptables iproute systemd-resolved
+sudo dnf install wireguard-tools openvpn iptables systemd-resolved
 ```
 
 **Arch Linux** (only needed for source builds — `pacman -S vortix` handles deps automatically):
 ```bash
-sudo pacman -S curl wireguard-tools openvpn iptables iproute2 systemd-resolvconf
+sudo pacman -S wireguard-tools openvpn iptables systemd-resolvconf
 ```
 
 > **DNS management:** Vortix uses `resolvconf` (via `systemd-resolvconf` or `openresolv`) to manage DNS when your WireGuard profile contains `DNS =`. On systemd distros (most modern Linux), this is automatic via systemd-resolved. Non-systemd distros (Alpine, Void, Gentoo OpenRC) will use `/etc/resolv.conf` editing as a fallback.
@@ -142,7 +141,7 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Harry-kp/vortix/release
 
 **Static binary (Linux):**
 
-Download the `x86_64-unknown-linux-musl` release from the [releases page](https://github.com/Harry-kp/vortix/releases). This is a statically linked binary (no glibc needed), but you still need the runtime dependencies above (curl, openvpn/wireguard-tools, etc.).
+Download the `x86_64-unknown-linux-musl` release from the [releases page](https://github.com/Harry-kp/vortix/releases). This is a statically linked binary (no glibc needed), but you still need the runtime dependencies above (openvpn/wireguard-tools and the kill-switch tools).
 
 **Nix (flakes):**
 ```bash
@@ -448,25 +447,25 @@ ip_api_fallbacks = ["https://api.ipify.org", "https://icanhazip.com", "https://i
 
 ## How It Works
 
-**Telemetry:** A background thread polls system network stats every second for throughput (macOS: `netstat -ib`, Linux: `/proc/net/dev`). Network quality (latency, jitter, loss) is calculated using multi-packet ICMP probes. Public IP, ISP, and Geo-location data are fetched via `ipinfo.io/json`.
+**Telemetry:** A background thread polls system network stats every second for throughput (macOS: `libc::getifaddrs` reading BSD `if_data`; Linux: `/proc/net/dev`). Network quality (latency, jitter, loss) is measured with a hand-rolled ICMP echo probe over an unprivileged `SOCK_DGRAM` socket (falls back to TCP-connect-to-443 when ICMP is restricted). Public IP, ISP, and geo-location data are fetched via `reqwest` over rustls-TLS — no `curl` shell-out.
 
 **Security (Kill Switch & Leak Detection):**
 - **Kill Switch:** Platform-native firewall integration. macOS uses PF (Packet Filter) via `pfctl`. Linux supports both `iptables` (with a dedicated `VORTIX_KILLSWITCH` chain) and `nftables` (with an atomic `vortix_killswitch` table) for clean teardown. Automatically blocks all non-VPN traffic when connection drops.
 - **IPv6 Leak:** Active monitoring via `api6.ipify.org`. Any IPv6 traffic detected while VPN is active triggers a leak warning.
-- **DNS Leak:** Monitors DNS configuration to ensure nameservers align with the secure tunnel (macOS: `scutil --dns` / `networksetup`, Linux: `resolvectl` / `nmcli` / `/etc/resolv.conf`).
+- **DNS Leak:** Monitors DNS configuration to ensure nameservers align with the secure tunnel (macOS: `SCDynamicStore` via the `system-configuration` crate; Linux: `resolvectl` / `nmcli` / `/etc/resolv.conf`).
 
 **WireGuard Integration:** macOS resolves interface names via `/var/run/wireguard/*.name`. Linux uses kernel WireGuard interfaces directly (`wg0`, `wg1`, etc.). Both platforms parse `wg show` for handshake timing, transfer stats, and endpoint metadata.
 
-**OpenVPN Integration:** Tracks session uptime and connection status via `ps` proc parsing. Interface detection uses `ifconfig` on macOS and `ip addr` on Linux.
+**OpenVPN Integration:** Tracks session uptime and connection status via the macOS/Linux process-listing APIs (`libc::proc_listpids` on macOS, `/proc/<pid>/cmdline` on Linux). Interface detection uses `libc::getifaddrs` on both.
 
 ### Platform Notes
 
 | Feature | macOS | Linux |
 |---------|-------|-------|
 | Kill switch | `pfctl` (PF) | `iptables` or `nftables` |
-| Network stats | `netstat -ib` | `/proc/net/dev` |
-| Interface detection | `ifconfig` + `/var/run/wireguard/` | `ip addr` + `wg show` |
-| DNS detection | `scutil --dns`, `networksetup` | `resolvectl`, `nmcli`, `/etc/resolv.conf` |
+| Network stats | `libc::getifaddrs` + `if_data` | `/proc/net/dev` |
+| Interface detection | `libc::getifaddrs` + `/var/run/wireguard/` | `libc::getifaddrs` + `/sys/class/net/` + `wg show` |
+| DNS detection | `SCDynamicStore` (SystemConfiguration framework) | `resolvectl`, `nmcli`, `/etc/resolv.conf` |
 | Default VPN iface | `utun0` | `wg0` |
 | Tested distros | macOS 12+ | Ubuntu, Fedora, Arch |
 

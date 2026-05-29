@@ -30,6 +30,7 @@ RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps
 cargo xtask check-subprocess
 cargo xtask check-platform-leak
 cargo xtask check-protocol-leak
+cargo xtask check-no-shell-regressions
 ```
 
 ## Common traps

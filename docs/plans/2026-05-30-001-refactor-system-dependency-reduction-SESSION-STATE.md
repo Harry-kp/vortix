@@ -1,11 +1,69 @@
 ---
 plan: docs/plans/2026-05-30-001-refactor-system-dependency-reduction-plan.md
 session_paused: 2026-05-30
-units_complete: [U1, U2, U3, U4, U5, U6, U8]
-units_remaining: [U7, U9, U10, U11, U12]
+session_resumed: 2026-05-30 (vortix-multi-2)
+units_complete: [U1, U2, U3, U4, U5, U6, U7, U8, U9, U10, U11, U12]
+units_remaining: []
 ---
 
-# Session state — system-dependency reduction plan, mid-execution pause
+# Session state — system-dependency reduction plan COMPLETE
+
+All 13 implementation units shipped on `feat/multi-connection`
+(PR #1). See the per-unit commit list under "What's shipped" for
+hashes. The original mid-execution pause notes below are preserved
+for historical context.
+
+## Resume-session epilogue (vortix-multi-2)
+
+- **U7** (Phase C: scutil/networksetup/netstat/lsof): shipped as
+  commit `4151ede`. system-configuration crate covers DNS; libc +
+  hand-rolled libproc FFI covers netstat-ib (`if_data.ifi_*bytes`)
+  and lsof (`proc_pidfdinfo(PROC_PIDFDSOCKETINFO)`). Compile-time
+  `size_of` asserts pinned every struct against the Apple SDK header
+  (24/136/24/80/120/528/768/792 bytes). The previous attempt's API
+  friction was real — solved by mirroring `<sys/proc_info.h>` exactly
+  rather than struggling with `CFPropertyList::downcast`'s `*const
+  c_void` conversion path.
+- **U9** (curl → reqwest): shipped as commit `0767e4e`. Single
+  `OnceLock<reqwest::blocking::Client>` with `Policy::none()` to match
+  curl's no-`-L` default; rustls-tls to avoid OpenSSL; test-first
+  parity coverage via a hand-rolled `std::net::TcpListener` mock
+  server (no new test deps).
+- **U10** (ping → socket2): shipped as commit `caf926a`. Unprivileged
+  `SOCK_DGRAM + IPPROTO_ICMPV4` (works on macOS and Linux with the
+  default `ping_group_range`). 8-byte ICMP packet + RFC 1071
+  checksum, hand-rolled. TCP-connect-to-port-443 fallback when the
+  ICMP socket can't be opened. No tokio integration needed — the
+  telemetry workers were already `std::thread::spawn`-based.
+- **U11** (xtask shell-regression guard): shipped as commit `6c45dec`.
+  `cargo xtask check-no-shell-regressions` enforces 18-name forbidden
+  list (`curl, ping, which, pbcopy, xclip, wl-copy, xsel, ifconfig,
+  ip, ps, netstat, lsof, scutil, networksetup, kill, pkill, uname,
+  sw_vers`) at PR time. Mirrors check-platform-leak's
+  same/prev/next-line annotation parser. Wired into `boundary.yml`.
+- **U12** (docs cleanup): shipped in this commit. README "Runtime
+  dependencies" table no longer lists `curl`. Architecture notes
+  describe the post-plan state (libc::getifaddrs, SCDynamicStore,
+  rustls-tls, libproc, etc.). `tests/integration/Dockerfile` and
+  `Dockerfile.fedora` drop `procps` / `procps-ng`. `docs/ci-parity.md`
+  documents the new `cargo xtask check-no-shell-regressions` step.
+
+## CI fixups along the way
+
+Two ancillary commits were needed:
+
+- `f7acc2b` `fix(ci): rustfmt + linux clippy regressions from U4/U6/U8`
+  — pre-existing rustfmt / clippy issues in 4 files that the prior
+  session's per-unit `-p vortix --lib` runs missed (ci-parity trap 1).
+- `f9cce78` + `e5b13e3` `fix(deny): scope cargo-deny scan to platforms
+  we ship` — the BSL-1.0 / CDLA-Permissive-2.0 license failures on
+  the Security Audit job came from Windows-only transitive deps that
+  cargo-deny was scanning regardless. Setting `[graph].targets` to the
+  six triples `dist-workspace.toml` ships drops the dead-weight code
+  from the audit scope without allow-listing licenses we never link.
+  Locked the deny.toml + dist-workspace.toml dependency in a comment.
+
+# Original mid-execution pause notes (historical)
 
 Picking this up in a future session. **PR #1 is the active branch** (`feat/multi-connection`) and contains all completed units below as separate commits. Do NOT branch off `main` — the plan was bundled into PR #1 at the user's direction; continue on the same branch.
 
