@@ -242,6 +242,24 @@ impl Journal {
     pub fn tail(&self) -> Vec<EventEnvelope> {
         self.tail.lock().unwrap().snapshot()
     }
+
+    /// Returns the per-session identifier — the `{ISO-timestamp}-{pid}` stem of
+    /// the session log filename. `None` when journal disk persistence is
+    /// disabled (no session file exists).
+    ///
+    /// Used by per-session scratch directories (e.g. `WireGuard` secondary
+    /// temp configs — plan #009 U13) so that crash-orphaned subdirs can be
+    /// distinguished from the live session purely by name: every process gets
+    /// a unique `{pid}` component, so a non-matching subdir is unambiguously
+    /// an orphan regardless of file age.
+    #[must_use]
+    pub fn session_id(&self) -> Option<String> {
+        self.session_path
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .and_then(|s| s.to_str())
+            .map(std::string::ToString::to_string)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
