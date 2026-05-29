@@ -1,10 +1,22 @@
 name: Test
 
 on:
+  # Doc-only PRs skip Test (the slowest job). Lint, Boundary, and
+  # Security still run on the same PR so the check list isn't empty.
+  # Cargo.toml / Cargo.lock changes (which COULD be hidden dep edits)
+  # are intentionally NOT in paths-ignore — they always trigger Test.
   push:
     branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "LICENSE"
+      - "CHANGELOG.md"
   pull_request:
     branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "LICENSE"
+      - "CHANGELOG.md"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
