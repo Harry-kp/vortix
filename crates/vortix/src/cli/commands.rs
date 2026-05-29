@@ -1,6 +1,6 @@
 //! CLI command handlers.
 //!
-//! Each handler operates headlessly via `VpnEngine` (no TUI), produces
+//! Each handler operates headlessly via `VpnRuntime` (no TUI), produces
 //! structured output via [`OutputMode`], and exits with semantic exit codes.
 
 use std::path::Path;
@@ -15,7 +15,7 @@ use crate::cli::output::{
 };
 use crate::config::AppConfig;
 use crate::constants;
-use crate::engine::VpnEngine;
+use crate::vpn_runtime::VpnRuntime;
 use crate::state::Protocol;
 
 /// Dispatch a CLI command. Returns `true` if handled (program should exit).
@@ -385,13 +385,13 @@ fn handle_up(
 ) -> i32 {
     // `yes` bypasses the multi-tunnel conflict prompt that U7 lands on
     // the connect-path overlay. The CLI today goes directly through
-    // `VpnEngine::connect_and_wait` (no conflict check there), so `yes`
+    // `VpnRuntime::connect_and_wait` (no conflict check there), so `yes`
     // is a no-op in the current build — but the flag is wired so scripts
     // can adopt it ahead of U7's overlay shipping. Once U7 wires the
     // registry conflict-check into the CLI path, this flag will gate
     // the bypass.
     let _ = yes;
-    let mut engine = VpnEngine::new_headless(config.clone(), config_dir.to_path_buf());
+    let mut engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
 
     let profile_name = if let Some(name) = profile {
         name.to_string()
@@ -566,23 +566,23 @@ struct DownData {
 }
 
 /// Point `engine.connection_state` at a specific active session so
-/// [`VpnEngine::disconnect_and_wait`] tears down the right tunnel.
+/// [`VpnRuntime::disconnect_and_wait`] tears down the right tunnel.
 ///
 /// Multi-connection plan U20: the CLI down/reconnect grammar accepted a
-/// per-profile target. Until U6B/U7 route CLI calls through the
+/// per-profile target. Until U7 routes CLI calls through the
 /// `TunnelRegistry`, we still drive disconnects one profile at a time
-/// through the single-tunnel `VpnEngine`. Helper keeps the two call
+/// through the single-tunnel `VpnRuntime`. Helper keeps the two call
 /// sites (`handle_down`, `handle_reconnect`) in sync.
 fn point_engine_at_session(
-    engine: &mut VpnEngine,
+    engine: &mut VpnRuntime,
     session: &crate::core::scanner::ActiveSession,
 ) {
-    engine.connection_state = crate::state::ConnectionState::Connected {
+    engine.connection_state = crate::vpn_runtime::ConnectionState::Connected {
         profile: session.name.clone(),
         server_location: String::new(),
         since: std::time::Instant::now(),
         latency_ms: 0,
-        details: Box::new(crate::state::DetailedConnectionInfo {
+        details: Box::new(crate::vpn_runtime::DetailedConnectionInfo {
             pid: session.pid,
             interface: session.interface.clone(),
             endpoint: session.endpoint.clone(),
@@ -600,7 +600,7 @@ fn handle_down(
     mode: OutputMode,
 ) -> i32 {
     let _ = all; // `--all` is the explicit form of the no-profile case (already the default).
-    let mut engine = VpnEngine::new_headless(config.clone(), config_dir.to_path_buf());
+    let mut engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
 
     // NotFound (exit 3) takes precedence over idempotence: a typo'd
     // profile is a script error, not "already disconnected".
@@ -709,7 +709,7 @@ fn handle_reconnect(
     config_dir: &Path,
     mode: OutputMode,
 ) -> i32 {
-    let mut engine = VpnEngine::new_headless(config.clone(), config_dir.to_path_buf());
+    let mut engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
     engine.load_metadata();
 
     // Validate the requested profile exists in the catalog before we
@@ -854,7 +854,7 @@ fn handle_status(
         crate::daemon::daemon_socket_path_if_present()
     };
 
-    let engine = VpnEngine::new_headless(config.clone(), config_dir.to_path_buf());
+    let engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
     let mut snap = engine.scan_status();
     // When the daemon socket is connectable, overlay its authoritative
     // view of the FSM (which profile is connecting/connected, since
@@ -992,7 +992,7 @@ fn handle_status(
 /// the scanner inferred from sockets — relevant when the daemon is
 /// driving a tunnel the local-engine scanner doesn't recognize.
 fn overlay_daemon_state(
-    snap: &mut crate::engine::connection::StatusSnapshot,
+    snap: &mut crate::vpn_runtime::connection::StatusSnapshot,
     state: &crate::vortix_core::engine::state::Connection,
 ) {
     use crate::vortix_core::engine::state::Connection;
@@ -1027,7 +1027,7 @@ fn overlay_daemon_state(
 
 fn run_watch(interval: u64, config: &AppConfig, config_dir: &Path, mode: OutputMode) -> i32 {
     loop {
-        let engine = VpnEngine::new_headless(config.clone(), config_dir.to_path_buf());
+        let engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
         let snap = engine.scan_status();
 
         match mode {
@@ -1142,7 +1142,7 @@ fn handle_list(
     config_dir: &Path,
     mode: OutputMode,
 ) -> i32 {
-    let mut engine = VpnEngine::new_headless(config.clone(), config_dir.to_path_buf());
+    let mut engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
     engine.load_metadata();
 
     // Sort
@@ -1520,7 +1520,7 @@ fn handle_show(
     config_dir: &Path,
     mode: OutputMode,
 ) -> i32 {
-    let engine = VpnEngine::new_headless(config.clone(), config_dir.to_path_buf());
+    let engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
     let Some(profile) = engine.profiles.iter().find(|p| p.name == profile_name) else {
         print_error_and_exit(
             mode,
@@ -1626,7 +1626,7 @@ fn handle_delete(
     config_dir: &Path,
     mode: OutputMode,
 ) -> i32 {
-    let mut engine = VpnEngine::new_headless(config.clone(), config_dir.to_path_buf());
+    let mut engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
 
     let Some(idx) = engine.find_profile(profile_name) else {
         print_error_and_exit(
@@ -1703,7 +1703,7 @@ fn handle_rename(
     config_dir: &Path,
     mode: OutputMode,
 ) -> i32 {
-    let mut engine = VpnEngine::new_headless(config.clone(), config_dir.to_path_buf());
+    let mut engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
 
     let Some(idx) = engine.find_profile(old) else {
         print_error_and_exit(mode, "rename", err_not_found(old), ExitCode::NotFound);
@@ -1818,7 +1818,7 @@ fn handle_killswitch(
     config_dir: &Path,
     output_mode: OutputMode,
 ) -> i32 {
-    let mut engine = VpnEngine::new_headless(config.clone(), config_dir.to_path_buf());
+    let mut engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
 
     if let Some(new_mode) = mode_arg {
         let ks_mode = match new_mode.to_lowercase().as_str() {

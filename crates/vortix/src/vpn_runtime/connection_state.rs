@@ -1,10 +1,31 @@
-//! VPN connection state types.
+//! Legacy single-tunnel `ConnectionState` enum (relocated from
+//! `crate::state::connection`).
+//!
+//! Multi-connection plan #001 U6 Stage B: the canonical source of truth
+//! for active tunnels is the [`crate::vortix_core::engine::TunnelRegistry`]
+//! that lives on [`crate::app::App`]. UI panels read snapshots from there.
+//!
+//! This enum still lives on [`crate::vpn_runtime::VpnRuntime`] because the
+//! legacy connect/disconnect/retry/scanner flow in `app/connection.rs`,
+//! `app/update.rs`, and the CLI's blocking connect/disconnect helpers in
+//! `vpn_runtime/connection.rs` still drive a single-tunnel state machine.
+//! Plan U7 rewires the connect path to drive the registry directly; once
+//! that lands the enum can be retired entirely.
+//!
+//! Visibility: re-exported from `crate::vpn_runtime` so the legacy flow can
+//! reach it, but **not** from `crate::state` — the latter no longer carries
+//! a `ConnectionState` type. Panels that previously imported
+//! `crate::state::ConnectionState` or `crate::app::ConnectionState` must
+//! migrate to `app.registry` snapshot reads.
 
 use std::time::Instant;
 
 /// Technical details parsed from the VPN interface.
 ///
-/// Contains network addresses, transfer statistics, and cryptographic information.
+/// Mirror of [`crate::vortix_core::engine::state::DetailedConnectionInfo`]
+/// kept for the legacy `ConnectionState` flow. Panels read the registry
+/// version through their tunnel snapshots; this one feeds the
+/// `connection_state` mirror on `VpnRuntime`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DetailedConnectionInfo {
     /// System interface name (e.g., utun3, wg0).
@@ -29,11 +50,11 @@ pub struct DetailedConnectionInfo {
     pub pid: Option<u32>,
 }
 
-/// VPN connection state machine.
+/// VPN connection state machine (legacy single-tunnel mirror).
 ///
-/// Represents the current state of the VPN connection.
-/// Scanner is the source of truth and will override Connecting/Disconnecting
-/// states based on actual system state.
+/// Plan #001 U7 will retire this in favour of the per-tunnel
+/// [`crate::vortix_core::engine::state::Connection`] FSM owned by
+/// [`crate::vortix_core::engine::TunnelRegistry`].
 #[derive(Clone, Debug, PartialEq, Default)]
 pub enum ConnectionState {
     /// No active VPN connection.
@@ -144,7 +165,6 @@ mod tests {
 
     #[test]
     fn test_state_transitions_are_valid() {
-        // Simulate: Disconnected -> Connecting -> Connected -> Disconnecting -> Disconnected
         let mut state = ConnectionState::Disconnected;
         assert!(matches!(state, ConnectionState::Disconnected));
 

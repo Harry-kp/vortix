@@ -8,10 +8,11 @@ use std::time::{Duration, Instant};
 
 use crate::core::scanner;
 use crate::message::Message;
-use crate::state::{ConnectionState, DetailedConnectionInfo, Protocol};
+use crate::state::Protocol;
+use super::{ConnectionState, DetailedConnectionInfo};
 use crate::utils;
 
-use super::VpnEngine;
+use super::VpnRuntime;
 
 /// Result of a CLI connect operation.
 #[derive(Debug)]
@@ -48,7 +49,7 @@ pub struct StatusSnapshot {
     pub isp: Option<String>,
 }
 
-impl VpnEngine {
+impl VpnRuntime {
     /// Validate preconditions for a connect and return profile metadata.
     fn validate_connect(
         &self,

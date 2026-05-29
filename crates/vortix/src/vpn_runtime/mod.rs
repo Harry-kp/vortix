@@ -1,15 +1,18 @@
-//! Headless VPN engine — owns all VPN state and operations.
+//! Headless VPN runtime — owns telemetry, profiles, config, and worker channels.
 //!
-//! `VpnEngine` holds connection lifecycle, profiles, telemetry data, kill switch
-//! state, retry logic, and background worker channels. It has **zero** ratatui
-//! dependencies, making it usable from both the TUI ([`crate::app::App`]) and
-//! the CLI without pulling in any terminal rendering code.
+//! `VpnRuntime` holds connection-state mirror (CLI-only — TUI consults
+//! `TunnelRegistry`), profiles, telemetry data, kill switch state, retry
+//! logic, and background worker channels. It has **zero** ratatui
+//! dependencies, making it usable from both the TUI ([`crate::app::App`])
+//! and the CLI without pulling in any terminal rendering code.
 //!
-//! The TUI embeds `VpnEngine` inside `App` via `Deref`/`DerefMut`, so all
-//! existing field accesses (`self.profiles`, `app.engine.connection_state`, …) resolve
-//! transparently through the engine.
+//! The TUI embeds `VpnRuntime` as `App.runtime` (no `Deref`); field
+//! accesses go through `self.runtime.X` or `app.runtime.X` explicitly.
 
 pub mod connection;
+pub mod connection_state;
+
+pub use connection_state::{ConnectionState, DetailedConnectionInfo};
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -23,17 +26,15 @@ use crate::core::scanner::ActiveSession;
 use crate::core::telemetry::{self, TelemetryUpdate};
 use crate::logger;
 use crate::message::Message;
-use crate::state::{
-    ConnectionState, KillSwitchMode, KillSwitchState, ProfileSortOrder, Protocol, VpnProfile,
-};
+use crate::state::{KillSwitchMode, KillSwitchState, ProfileSortOrder, Protocol, VpnProfile};
 use crate::utils;
 
 /// Core VPN engine — all VPN-related state, no UI dependencies.
 ///
-/// Created by [`VpnEngine::new`] for TUI use (spawns background workers) or
-/// [`VpnEngine::new_headless`] for CLI one-shot commands (no background threads).
+/// Created by [`VpnRuntime::new`] for TUI use (spawns background workers) or
+/// [`VpnRuntime::new_headless`] for CLI one-shot commands (no background threads).
 #[allow(clippy::struct_excessive_bools)]
-pub struct VpnEngine {
+pub struct VpnRuntime {
     // === VPN State ===
     pub connection_state: ConnectionState,
     pub profiles: Vec<VpnProfile>,
@@ -91,7 +92,7 @@ pub struct VpnEngine {
     pub(crate) last_bytes_out: u64,
 }
 
-impl VpnEngine {
+impl VpnRuntime {
     /// Create an engine with background workers (telemetry, scanner, network monitor).
     ///
     /// Use this constructor when the engine will be long-lived (TUI mode).
@@ -525,7 +526,7 @@ impl VpnEngine {
     }
 }
 
-impl Drop for VpnEngine {
+impl Drop for VpnRuntime {
     fn drop(&mut self) {
         // VPN connections are independent OS processes (wg-quick, openvpn) that
         // should survive UI process exit. Only explicit user actions (disconnect

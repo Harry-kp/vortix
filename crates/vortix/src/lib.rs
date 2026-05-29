@@ -34,7 +34,7 @@ pub mod config;
 pub mod constants;
 pub mod core;
 pub mod daemon;
-pub mod engine;
+pub mod vpn_runtime;
 pub mod event;
 pub mod logger;
 pub mod message;

@@ -43,7 +43,7 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
         Style::default().fg(theme::BORDER_DEFAULT)
     };
 
-    let sort_label = app.engine.sort_order.label();
+    let sort_label = app.runtime.sort_order.label();
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
@@ -56,7 +56,7 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let snapshots = app.registry.snapshot_all();
     let _primary = app.registry.primary(); // reserved for the primary marker in Stage B
 
-    if app.engine.profiles.is_empty() && snapshots.is_empty() {
+    if app.runtime.profiles.is_empty() && snapshots.is_empty() {
         let empty_msg = vec![
             Line::from(""),
             Line::from(Span::styled(
@@ -86,7 +86,7 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let name_budget = (inner.width.saturating_sub(fixed_cols)) as usize;
 
     let items: Vec<Row> = app
-        .engine
+        .runtime
         .profiles
         .iter()
         .enumerate()
@@ -200,7 +200,7 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
         .thumb_style(Style::default().fg(theme::ACCENT_PRIMARY));
 
     let mut scrollbar_state = ScrollbarState::new(
-        app.engine
+        app.runtime
             .profiles
             .len()
             .saturating_sub(inner.height as usize),
@@ -265,7 +265,7 @@ mod tests {
         let mut app = App::new_test();
         // Sanity: both sides are empty.
         assert_eq!(app.registry.tunnel_count(), 0);
-        assert!(app.engine.profiles.is_empty());
+        assert!(app.runtime.profiles.is_empty());
 
         let out = render_to_string(&mut app, 40, 10);
         assert!(
@@ -277,7 +277,7 @@ mod tests {
     #[test]
     fn n_profiles_render_n_rows() {
         let mut app = App::new_test();
-        app.engine.profiles = vec![
+        app.runtime.profiles = vec![
             make_profile("alpha"),
             make_profile("bravo"),
             make_profile("charlie"),

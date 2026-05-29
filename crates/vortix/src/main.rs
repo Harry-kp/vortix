@@ -357,7 +357,7 @@ fn run_tui(
             // TUI-only side-effect — the daemon path doesn't need it.
             if let Some(j) = vortix::vortix_core::journal::global_journal() {
                 let mut rx = j.subscribe();
-                let nudge = app.engine.telemetry_nudge.clone();
+                let nudge = app.runtime.telemetry_nudge.clone();
                 tokio::spawn(async move {
                     use vortix::vortix_core::engine::EngineEvent;
                     while let Ok(envelope) = rx.recv().await {

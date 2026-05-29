@@ -300,7 +300,7 @@ impl App {
                     self.handle_message(Message::FocusPanel(panel.clone()));
 
                     if matches!(panel, crate::app::FocusedPanel::Sidebar)
-                        && !self.engine.profiles.is_empty()
+                        && !self.runtime.profiles.is_empty()
                     {
                         if let Some(area) = self.panel_areas.get(&crate::app::FocusedPanel::Sidebar)
                         {
@@ -310,7 +310,7 @@ impl App {
                                 let row_in_view = (mouse.row - inner_y) as usize;
                                 let scroll_offset = self.profile_list_state.offset();
                                 let idx = scroll_offset + row_in_view;
-                                if idx < self.engine.profiles.len() {
+                                if idx < self.runtime.profiles.len() {
                                     self.profile_list_state.select(Some(idx));
                                 }
                             }
@@ -494,7 +494,7 @@ impl App {
             }
             KeyCode::PageDown => {
                 let current = self.profile_list_state.selected().unwrap_or(0);
-                let last = self.engine.profiles.len().saturating_sub(1);
+                let last = self.runtime.profiles.len().saturating_sub(1);
                 let next = (current + constants::PROFILE_LIST_PAGE_SIZE).min(last);
                 self.profile_list_state.select(Some(next));
             }
@@ -720,13 +720,13 @@ impl App {
 
     pub(crate) fn apply_search_filter(&mut self, query: &str) {
         if query.is_empty() {
-            self.search_match_count = self.engine.profiles.len();
+            self.search_match_count = self.runtime.profiles.len();
             self.profile_list_state.select(Some(0));
             return;
         }
         let lower = query.to_lowercase();
         let matches: Vec<usize> = self
-            .engine
+            .runtime
             .profiles
             .iter()
             .enumerate()
