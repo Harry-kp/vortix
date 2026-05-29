@@ -396,6 +396,59 @@ fn takeover_s_key_dispatches_legacy_switch_and_connect_path() {
 }
 
 #[test]
+fn switch_path_disconnect_completion_removes_old_profile_from_registry() {
+    use crate::vortix_core::profile::ProfileId;
+
+    // [S] flow regression: when the user presses [S] on the takeover
+    // overlay, the legacy disconnect-then-pending-connect path runs.
+    // `complete_disconnect` drains `pending_connect` and fires the
+    // new connect — but the OLD branch early-returned before
+    // calling `mirror_disconnect_into_registry`, leaving the old
+    // profile's entry in the registry. Result: sidebar dot stayed
+    // green and header still listed the disconnected tunnel.
+    let mut app = test_app();
+    add_profiles(&mut app, &["vpn-a", "vpn-b"]);
+
+    // Set up vpn-a fully connected, mirrored into the registry.
+    app.runtime.connection_state = ConnectionState::Connecting {
+        started: Instant::now(),
+        profile: "vpn-a".to_string(),
+    };
+    app.handle_message(Message::SyncSystemState(vec![fake_session("vpn-a")]));
+    assert_eq!(app.registry.tunnel_count(), 1, "setup precondition");
+
+    // User toggles vpn-b, accepts the takeover overlay via [S].
+    app.toggle_connection(1);
+    app.handle_key(key_char('s'));
+    assert_eq!(
+        app.runtime.pending_connect,
+        Some(1),
+        "setup precondition: pending switch queued"
+    );
+    assert!(
+        matches!(
+            app.runtime.connection_state,
+            ConnectionState::Disconnecting { .. }
+        ),
+        "setup precondition"
+    );
+
+    // Worker thread reports vpn-a's disconnect completed.
+    app.handle_message(Message::DisconnectResult {
+        profile: "vpn-a".to_string(),
+        success: true,
+        error: None,
+    });
+
+    // vpn-a must be gone from the registry — the [S] flow drained
+    // pending_connect AND removed the old entry.
+    assert!(
+        app.registry.snapshot(&ProfileId::new("vpn-a")).is_none(),
+        "vpn-a must be removed from registry after switch-path disconnect completes"
+    );
+}
+
+#[test]
 fn takeover_capital_s_also_dispatches_switch() {
     // Case-insensitive: [S] should work whether shift is held or not.
     let mut app = test_app();

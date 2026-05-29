@@ -624,6 +624,15 @@ impl App {
             crate::utils::cleanup_openvpn_run_files(profile_name);
         }
 
+        // Mirror the registry teardown BEFORE the pending-switch
+        // branch's early return. The [S] flow on the takeover overlay
+        // queues pending_connect; if we only mirrored in the
+        // no-pending branch (the legacy shape), the old profile's
+        // registry entry would leak across the switch — sidebar dot
+        // staying green and header continuing to list the
+        // disconnected tunnel even after logs reported success.
+        self.mirror_disconnect_into_registry(profile_name);
+
         // Drain pending_connect: switch directly to the next profile
         if let Some(idx) = self.runtime.pending_connect.take() {
             if idx < self.runtime.profiles.len() {
@@ -641,7 +650,6 @@ impl App {
         // Normal disconnect (no pending switch)
         self.log(&format!("STATUS: Disconnected from '{profile_name}'"));
         self.runtime.connection_state = ConnectionState::Disconnected;
-        self.mirror_disconnect_into_registry(profile_name);
         self.sync_killswitch();
         self.refresh_telemetry();
     }
