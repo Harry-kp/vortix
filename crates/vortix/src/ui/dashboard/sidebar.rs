@@ -1,4 +1,6 @@
-use crate::app::{App, ConnectionState};
+use crate::app::App;
+use crate::vortix_core::engine::state::Connection;
+use crate::vortix_core::engine::TunnelSnapshot;
 use crate::{theme, utils};
 use ratatui::{
     layout::{Alignment, Constraint, Rect},
@@ -10,6 +12,27 @@ use ratatui::{
     },
     Frame,
 };
+
+/// Active-tunnel marker derived from a registry snapshot for a given profile name.
+///
+/// Stage A of plan #001 U6 wires sidebar reads through `TunnelRegistry` for the
+/// "who is active" derivation while leaving the row list itself on
+/// `engine.profiles`. The mapping from `VpnProfile.name` to `ProfileId` is the
+/// profile name — see `cleanup_vpn_resources` for the existing convention.
+fn active_marker_for(snapshots: &[TunnelSnapshot], profile_name: &str) -> Option<(Color, &'static str)> {
+    let snap = snapshots
+        .iter()
+        .find(|s| s.profile_id.as_str() == profile_name)?;
+    let (color, badge) = match &snap.state {
+        Connection::Connected { .. } => (theme::SUCCESS, " ✓"),
+        Connection::Connecting { .. } => (theme::WARNING, " …"),
+        Connection::Reconnecting { .. } => (theme::WARNING, " ↻"),
+        Connection::Disconnecting { .. } => (theme::WARNING, " ⏻"),
+        Connection::AwaitingUserInput { .. } => (theme::WARNING, " ?"),
+        Connection::Disconnected { .. } => return None,
+    };
+    Some((color, badge))
+}
 
 #[allow(clippy::too_many_lines)]
 pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -29,7 +52,11 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    if app.engine.profiles.is_empty() {
+    // U6 Stage A: snapshots come from the registry; profile catalog still on engine.
+    let snapshots = app.registry.snapshot_all();
+    let _primary = app.registry.primary(); // reserved for the primary marker in Stage B
+
+    if app.engine.profiles.is_empty() && snapshots.is_empty() {
         let empty_msg = vec![
             Line::from(""),
             Line::from(Span::styled(
@@ -55,13 +82,6 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    let (active_profile, active_color) = match &app.engine.connection_state {
-        ConnectionState::Connected { profile, .. } => (Some(profile.clone()), theme::SUCCESS),
-        ConnectionState::Connecting { profile, .. }
-        | ConnectionState::Disconnecting { profile, .. } => (Some(profile.clone()), theme::WARNING),
-        ConnectionState::Disconnected => (None, Color::Reset),
-    };
-
     let fixed_cols: u16 = 2 + 4 + 10 + 3; // status + proto + time + gaps
     let name_budget = (inner.width.saturating_sub(fixed_cols)) as usize;
 
@@ -72,7 +92,10 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
         .enumerate()
         .map(|(idx, p)| {
             let is_selected = app.profile_list_state.selected() == Some(idx);
-            let is_active = active_profile.as_ref() == Some(&p.name);
+            let marker = active_marker_for(&snapshots, &p.name);
+            let is_active = marker.is_some();
+            let active_color = marker.map_or(Color::Reset, |(c, _)| c);
+            let active_badge = marker.map_or("", |(_, b)| b);
             let is_never_used = p.last_used.is_none();
 
             let (status_char, status_color) = if idx < 9 {
@@ -141,16 +164,7 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
                 status_char.clone(),
                 Style::default().fg(status_color),
             ));
-            let state_badge = if is_active {
-                match &app.engine.connection_state {
-                    ConnectionState::Connected { .. } => " ✓",
-                    ConnectionState::Connecting { .. } => " …",
-                    ConnectionState::Disconnecting { .. } => " ⏻",
-                    ConnectionState::Disconnected => "",
-                }
-            } else {
-                ""
-            };
+            let state_badge = if is_active { active_badge } else { "" };
             let badge_len = state_badge.chars().count();
             let display_name =
                 utils::truncate(&p.name, name_budget.saturating_sub(badge_len).max(3));
@@ -201,4 +215,92 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
         }),
         &mut scrollbar_state,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    //! Stage A smoke tests for plan #001 U6. Verify the sidebar renders the
+    //! "No profiles" empty state when both registry and engine profiles are
+    //! empty, and that N profiles produce N rendered rows. Full registry-
+    //! population tests land with Stage B once `App.engine` retires.
+    use super::*;
+    use crate::app::App;
+    use crate::state::{Protocol, VpnProfile};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use std::path::PathBuf;
+
+    fn make_profile(name: &str) -> VpnProfile {
+        VpnProfile {
+            name: name.to_string(),
+            protocol: Protocol::WireGuard,
+            location: String::new(),
+            config_path: PathBuf::from(format!("/tmp/{name}.conf")),
+            last_used: None,
+        }
+    }
+
+    fn render_to_string(app: &mut App, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                let area = Rect::new(0, 0, width, height);
+                render(frame, app, area);
+            })
+            .expect("draw");
+        let buf = terminal.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn empty_registry_and_empty_profiles_renders_no_profiles_empty_state() {
+        let mut app = App::new_test();
+        // Sanity: both sides are empty.
+        assert_eq!(app.registry.tunnel_count(), 0);
+        assert!(app.engine.profiles.is_empty());
+
+        let out = render_to_string(&mut app, 40, 10);
+        assert!(
+            out.contains("No profiles yet"),
+            "expected empty-state copy, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn n_profiles_render_n_rows() {
+        let mut app = App::new_test();
+        app.engine.profiles = vec![
+            make_profile("alpha"),
+            make_profile("bravo"),
+            make_profile("charlie"),
+        ];
+
+        let out = render_to_string(&mut app, 60, 10);
+        // Empty-state must not appear when there are profiles in the catalog.
+        assert!(
+            !out.contains("No profiles yet"),
+            "did not expect empty state, got:\n{out}"
+        );
+        // Each profile name should appear in the rendered output.
+        assert!(out.contains("alpha"), "alpha row missing:\n{out}");
+        assert!(out.contains("bravo"), "bravo row missing:\n{out}");
+        assert!(out.contains("charlie"), "charlie row missing:\n{out}");
+    }
+
+    #[test]
+    fn empty_registry_yields_no_active_marker_for_any_profile() {
+        // Stage A invariant: when the registry has no entries, every profile
+        // row is inactive — the engine's legacy `connection_state` is *not*
+        // consulted by the sidebar anymore.
+        let snapshots: Vec<TunnelSnapshot> = Vec::new();
+        assert!(active_marker_for(&snapshots, "anything").is_none());
+    }
 }

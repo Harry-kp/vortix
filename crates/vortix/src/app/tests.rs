@@ -26,6 +26,7 @@ fn test_app() -> App {
     App {
         engine,
         engine_handle: None,
+        registry: crate::vortix_core::engine::TunnelRegistry::new(),
         should_quit: false,
         logs_scroll: 0,
         logs_auto_scroll: true,
