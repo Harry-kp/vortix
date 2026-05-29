@@ -128,7 +128,7 @@ pub enum Input {
 
 #[cfg(test)]
 mod tests {
-    //! Plan #001 U22 — UserCommand wire-format round-trip + v1 wire-break
+    //! Plan #001 U22 — `UserCommand` wire-format round-trip + v1 wire-break
     //! verification.
 
     use super::*;

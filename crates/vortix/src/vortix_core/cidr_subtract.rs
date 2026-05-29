@@ -235,7 +235,7 @@ mod tests {
             .iter()
             .filter(|c| match c.addr {
                 IpAddr::V4(v4) => v4.octets()[0] == 192 && v4.octets()[1] == 168,
-                _ => false,
+                IpAddr::V6(_) => false,
             })
             .map(|c| 1u64 << (32 - c.prefix_len))
             .sum();
@@ -285,7 +285,7 @@ mod tests {
     #[test]
     fn range_to_cidrs_aligned_block_is_single() {
         let mut out = Vec::new();
-        range_to_cidrs(0x0A000000, 0x0AFFFFFF, &mut out);
+        range_to_cidrs(0x0A00_0000, 0x0AFF_FFFF, &mut out);
         assert_eq!(rendered(&out), vec!["10.0.0.0/8"]);
     }
 

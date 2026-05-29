@@ -651,7 +651,7 @@ mod tests {
 
     #[test]
     fn strip_full_names_when_budget_is_ample() {
-        let snaps = vec![connected("corp"), connected("lab"), connected("home")];
+        let snaps = [connected("corp"), connected("lab"), connected("home")];
         let visible: Vec<_> = snaps
             .iter()
             .filter_map(|s| strip_badge(&s.state).map(|(g, c)| (s, g, c)))
@@ -674,14 +674,14 @@ mod tests {
         // Budget tight enough that only ~2 fit.
         let spans = build_narrow_strip(&visible, 10).expect("some fit");
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.contains("+"), "expected overflow marker: {text}");
+        assert!(text.contains('+'), "expected overflow marker: {text}");
     }
 
     #[test]
     fn dotrow_keeps_primary_at_position_zero() {
         // Primary appears first in `visible` because the caller orders it
         // that way; verify the dot-row builder doesn't reorder.
-        let snaps = vec![
+        let snaps = [
             connected("primary"),
             connected("secondary1"),
             connected("secondary2"),

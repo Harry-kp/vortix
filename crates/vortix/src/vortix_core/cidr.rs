@@ -277,7 +277,7 @@ mod tests {
         // algorithm is a real union-aggregator, not a pattern-match.
         let blocks: Vec<Cidr> = (0u32..16)
             .map(|i| {
-                let octet = (i * 16) as u8;
+                let octet = u8::try_from(i * 16).expect("i ∈ 0..16 so i*16 ∈ 0..240");
                 format!("{octet}.0.0.0/4").parse().expect("valid")
             })
             .collect();

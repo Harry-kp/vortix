@@ -2111,7 +2111,7 @@ fn disconnect_clears_animation() {
 // U19 — Connect/disconnect flow + auto-promote banner
 // ====================================================================
 
-/// Helper: dispatch a KeyEvent matching the given char in `Normal` mode.
+/// Helper: dispatch a `KeyEvent` matching the given char in `Normal` mode.
 fn key_char(c: char) -> crossterm::event::KeyEvent {
     crossterm::event::KeyEvent::new(
         crossterm::event::KeyCode::Char(c),
@@ -2369,7 +2369,9 @@ fn u19_auto_promote_banner_dismisses_after_window() {
         from: crate::vortix_core::profile::ProfileId::new("corp"),
         to: crate::vortix_core::profile::ProfileId::new("home"),
         // Expired in the past — tick should clear it.
-        expires: Instant::now() - std::time::Duration::from_secs(1),
+        expires: Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("monotonic clock has at least 1s of headroom in tests"),
     };
     app.auto_promote_banner = Some(banner);
 
