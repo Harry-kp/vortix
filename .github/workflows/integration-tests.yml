@@ -9,8 +9,9 @@
 name: Integration Tests
 
 on:
-  pull_request:
-    branches: [main]
+  # PR trigger removed — the workflow is already `continue-on-error: true`
+  # so it never gated merge. Catching integration regressions nightly
+  # (and on main push) is enough; the PR row was pure visual noise.
   push:
     branches: [main]
   schedule:

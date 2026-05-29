@@ -14,26 +14,15 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check-subprocess:
-    name: Check Subprocess Boundary (plan 002)
+  boundary:
+    name: Boundary
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/rust-setup
-      - run: cargo xtask check-subprocess
-
-  check-platform-leak:
-    name: Check Platform Boundary (plan 003)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/rust-setup
-      - run: cargo xtask check-platform-leak
-
-  check-protocol-leak:
-    name: Check Protocol Boundary (plan 004)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/rust-setup
-      - run: cargo xtask check-protocol-leak
+      - name: Subprocess boundary (plan 002)
+        run: cargo xtask check-subprocess
+      - name: Platform boundary (plan 003)
+        run: cargo xtask check-platform-leak
+      - name: Protocol boundary (plan 004)
+        run: cargo xtask check-protocol-leak
