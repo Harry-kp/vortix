@@ -13,12 +13,14 @@
 use std::net::IpAddr;
 use std::str::FromStr;
 
+use serde::{Deserialize, Serialize};
+
 /// A parsed CIDR block: an IP address paired with a prefix length.
 ///
 /// The address is stored verbatim — callers may pass non-canonical inputs
 /// such as `10.0.0.5/8`; aggregation masks the host bits away before
 /// computing the numeric range, so the result is unaffected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Cidr {
     pub addr: IpAddr,
     pub prefix_len: u8,
