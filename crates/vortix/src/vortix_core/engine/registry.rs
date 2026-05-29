@@ -372,6 +372,112 @@ impl<T: Tunnel> TunnelRegistry<T> {
         }
     }
 
+    /// Bookkeeping API: register a `Connecting` entry — used by
+    /// `App::mirror_connecting_into_registry` when the legacy connect
+    /// path sets `ConnectionState = Connecting{...}` and spawns its
+    /// worker thread. Renderers see the `◐` badge until the connect
+    /// completes and `set_connected` replaces this entry.
+    #[allow(clippy::needless_pass_by_value)] // owned ProfileId stored in the HashMap key
+    pub fn set_connecting(
+        &mut self,
+        profile_id: ProfileId,
+        allowed_ips: Vec<Cidr>,
+        started_at: std::time::SystemTime,
+        attempt: u32,
+        retry_budget_remaining: std::time::Duration,
+        engine_factory: impl FnOnce() -> Engine<T>,
+    ) {
+        if let Some(entry) = self.fsms.get_mut(&profile_id) {
+            entry.engine.seed_connecting_state(
+                profile_id.clone(),
+                started_at,
+                attempt,
+                retry_budget_remaining,
+            );
+            entry.allowed_ips = allowed_ips;
+        } else {
+            let mut engine = engine_factory();
+            engine.seed_connecting_state(
+                profile_id.clone(),
+                started_at,
+                attempt,
+                retry_budget_remaining,
+            );
+            self.fsms.insert(
+                profile_id,
+                RegistryEntry {
+                    engine,
+                    allowed_ips,
+                },
+            );
+        }
+        // No primary recompute: a Connecting tunnel doesn't own the
+        // kernel default route yet.
+    }
+
+    /// Bookkeeping API: transition an existing entry to `Disconnecting`.
+    /// No-op when the profile isn't in the registry (you can't
+    /// disconnect a tunnel that never existed). Renderers see the
+    /// `◑` badge during the teardown window.
+    pub fn set_disconnecting(&mut self, profile_id: &ProfileId, started_at: std::time::SystemTime) {
+        if let Some(entry) = self.fsms.get_mut(profile_id) {
+            entry
+                .engine
+                .seed_disconnecting_state(profile_id.clone(), started_at);
+        }
+        // Re-derive primary: a Disconnecting tunnel may have held the
+        // default route, so its yield can flip primary.
+        let from = self.primary.clone();
+        self.recompute_primary();
+        if self.primary != from {
+            log_primary_change(
+                from.as_ref(),
+                self.primary.as_ref(),
+                PrimaryTunnelChangeReason::ExternalRouteChange,
+            );
+        }
+    }
+
+    /// Bookkeeping API: register or refresh a `Disconnected` entry that
+    /// carries a `FailureReason`. Renderers see the `✗` badge until
+    /// the user retries (which `set_connecting` replaces with a fresh
+    /// Connecting entry) or explicitly dismisses (`set_disconnected`
+    /// removes it).
+    #[allow(clippy::needless_pass_by_value)] // owned ProfileId stored in the HashMap key
+    pub fn set_failed(
+        &mut self,
+        profile_id: ProfileId,
+        allowed_ips: Vec<Cidr>,
+        failure: crate::vortix_core::engine::state::FailureReason,
+        engine_factory: impl FnOnce() -> Engine<T>,
+    ) {
+        if let Some(entry) = self.fsms.get_mut(&profile_id) {
+            entry.engine.seed_failed_state(failure);
+            entry.allowed_ips = allowed_ips;
+        } else {
+            let mut engine = engine_factory();
+            engine.seed_failed_state(failure);
+            self.fsms.insert(
+                profile_id,
+                RegistryEntry {
+                    engine,
+                    allowed_ips,
+                },
+            );
+        }
+        // Re-derive primary: the failed tunnel may have been primary
+        // just before the failure landed.
+        let from = self.primary.clone();
+        self.recompute_primary();
+        if self.primary != from {
+            log_primary_change(
+                from.as_ref(),
+                self.primary.as_ref(),
+                PrimaryTunnelChangeReason::ExternalRouteChange,
+            );
+        }
+    }
+
     // ──────────────────────────── Snapshots ────────────────────────────
 
     #[must_use]

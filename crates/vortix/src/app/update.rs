@@ -513,6 +513,12 @@ impl App {
         } else {
             let err_msg = error.unwrap_or_else(|| "unknown error".to_string());
             self.log(&format!("ERR: Failed to connect '{profile}': {err_msg}"));
+            // Plan A.3: mirror the failed attempt into the registry so
+            // sidebar renders the `✗` badge until the user retries
+            // (which the Connecting mirror will overwrite) or
+            // dismisses. Before this, failed connects left no trace
+            // in the registry and the sidebar reverted to blank.
+            self.mirror_failed_into_registry(&profile, &err_msg);
             self.cleanup_vpn_resources(&profile);
 
             // Attempt retry with exponential backoff if configured

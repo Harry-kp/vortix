@@ -176,6 +176,49 @@ impl<T: Tunnel> Engine<T> {
         self.state = Connection::Disconnected { last_failure: None };
     }
 
+    /// Bookkeeping-only: seed `Connection::Connecting` directly. Used by
+    /// [`TunnelRegistry::set_connecting`] when the legacy connect path
+    /// (`App::connect_profile_inner`) sets its single-tunnel
+    /// `ConnectionState = Connecting{...}` and we need the registry to
+    /// reflect the in-flight attempt so sidebar / header render the
+    /// `◐` badge during the connect window.
+    pub fn seed_connecting_state(
+        &mut self,
+        profile_id: ProfileId,
+        started_at: SystemTime,
+        attempt: u32,
+        retry_budget_remaining: Duration,
+    ) {
+        self.state = Connection::Connecting {
+            profile_id,
+            started_at,
+            attempt,
+            retry_budget_remaining,
+        };
+    }
+
+    /// Bookkeeping-only: seed `Connection::Disconnecting`. Used when the
+    /// legacy `disconnect()` flow kicks off and we want the sidebar
+    /// `◑` badge to show during the teardown window (between the user
+    /// pressing `d` and the worker thread's `DisconnectResult`
+    /// arriving).
+    pub fn seed_disconnecting_state(&mut self, profile_id: ProfileId, started_at: SystemTime) {
+        self.state = Connection::Disconnecting {
+            profile_id,
+            started_at,
+        };
+    }
+
+    /// Bookkeeping-only: seed `Connection::Disconnected` with a specific
+    /// failure reason. Used when the legacy `handle_connect_result`
+    /// failure branch fires and we want the sidebar `✗` badge to mark
+    /// the failed attempt until the user retries or dismisses.
+    pub fn seed_failed_state(&mut self, failure: crate::vortix_core::engine::state::FailureReason) {
+        self.state = Connection::Disconnected {
+            last_failure: Some(failure),
+        };
+    }
+
     /// Drive one input through the FSM. Returns the events emitted during
     /// the transition; the caller is expected to append them to the journal
     /// and broadcast.

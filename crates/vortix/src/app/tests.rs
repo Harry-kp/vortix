@@ -365,6 +365,125 @@ fn confirm_default_route_takeover_message_runs_multi_connect_path() {
 }
 
 #[test]
+fn mirror_connecting_makes_registry_hold_connecting_state() {
+    use crate::vortix_core::engine::state::Connection;
+    use crate::vortix_core::profile::ProfileId;
+
+    // Plan A.3: when `connect_profile_inner` sets legacy
+    // `ConnectionState = Connecting{...}`, the registry should also
+    // hold Connection::Connecting so the sidebar renders `◐` during
+    // the connect window. Pre-Path-A, the registry stayed empty
+    // until the worker thread's success reply.
+    let mut app = test_app();
+    add_profiles(&mut app, &["vpn-a"]);
+    app.runtime.connection_state = ConnectionState::Connecting {
+        started: Instant::now(),
+        profile: "vpn-a".to_string(),
+    };
+    app.mirror_connecting_into_registry("vpn-a");
+
+    let snap = app
+        .registry
+        .snapshot(&ProfileId::new("vpn-a"))
+        .expect("registry must hold the Connecting entry");
+    assert!(
+        matches!(snap.state, Connection::Connecting { .. }),
+        "expected Connection::Connecting, got {:?}",
+        snap.state
+    );
+}
+
+#[test]
+fn mirror_disconnecting_transitions_existing_connected_entry() {
+    use crate::vortix_core::engine::state::Connection;
+    use crate::vortix_core::profile::ProfileId;
+
+    // Plan A.3: when the legacy disconnect path sets state to
+    // Disconnecting, the registry's existing Connected entry
+    // should transition to Disconnecting (not vanish). Sidebar
+    // renders `◑` during the teardown window.
+    let mut app = test_app();
+    add_profiles(&mut app, &["vpn-a"]);
+    // Seed Connected first via the existing scanner promotion path.
+    app.runtime.connection_state = ConnectionState::Connecting {
+        started: Instant::now(),
+        profile: "vpn-a".to_string(),
+    };
+    app.handle_message(Message::SyncSystemState(vec![fake_session("vpn-a")]));
+    assert!(matches!(
+        app.registry
+            .snapshot(&ProfileId::new("vpn-a"))
+            .unwrap()
+            .state,
+        Connection::Connected { .. }
+    ));
+
+    // Now trigger Disconnecting mirror.
+    app.mirror_disconnecting_into_registry("vpn-a");
+
+    let snap = app
+        .registry
+        .snapshot(&ProfileId::new("vpn-a"))
+        .expect("registry entry must persist through Disconnecting");
+    assert!(
+        matches!(snap.state, Connection::Disconnecting { .. }),
+        "expected Connection::Disconnecting, got {:?}",
+        snap.state
+    );
+}
+
+#[test]
+fn mirror_disconnecting_no_op_when_registry_has_no_entry() {
+    // Disconnecting only makes sense for a tunnel that exists.
+    // Calling mirror_disconnecting on an unknown profile must not
+    // insert a phantom entry.
+    let mut app = test_app();
+    add_profiles(&mut app, &["vpn-a"]);
+    app.mirror_disconnecting_into_registry("vpn-a");
+    assert_eq!(
+        app.registry.tunnel_count(),
+        0,
+        "Disconnecting mirror must not insert when nothing existed"
+    );
+}
+
+#[test]
+fn mirror_failed_makes_registry_hold_disconnected_with_failure() {
+    use crate::vortix_core::engine::state::Connection;
+    use crate::vortix_core::profile::ProfileId;
+
+    // Plan A.3: when `handle_connect_result` failure branch fires,
+    // the registry should hold Disconnected{ last_failure: Some }
+    // so the sidebar renders `✗` until the user retries (which
+    // overwrites with Connecting) or explicitly clears.
+    let mut app = test_app();
+    add_profiles(&mut app, &["vpn-a"]);
+    app.runtime.connection_state = ConnectionState::Connecting {
+        started: Instant::now(),
+        profile: "vpn-a".to_string(),
+    };
+
+    // Worker thread reports failure.
+    app.handle_message(Message::ConnectResult {
+        profile: "vpn-a".to_string(),
+        success: false,
+        error: Some("handshake timeout".to_string()),
+    });
+
+    let snap = app
+        .registry
+        .snapshot(&ProfileId::new("vpn-a"))
+        .expect("registry must hold the failed entry");
+    let Connection::Disconnected { last_failure } = snap.state else {
+        panic!("expected Disconnected, got {:?}", snap.state);
+    };
+    assert!(
+        last_failure.is_some(),
+        "failure must be marked so sidebar renders the ✗ badge"
+    );
+}
+
+#[test]
 fn takeover_y_key_dispatches_switch_path() {
     // [Y]/Enter on the takeover overlay fires the legacy "switch
     // VPNs" path (disconnect current, then connect new). This is

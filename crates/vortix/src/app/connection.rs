@@ -426,6 +426,11 @@ impl App {
             started: Instant::now(),
             profile: name.clone(),
         };
+        // Plan A.3: mirror the Connecting transition into the registry
+        // so the sidebar/header render `◐` during the connect window.
+        // Without this, renderers stay blank between the keypress and
+        // the worker thread's success/failure reply.
+        self.mirror_connecting_into_registry(&name);
         self.log(&format!("ACTION: Connecting to '{name}' [{protocol}]..."));
 
         let connect_timeout_secs = self.runtime.config.connect_timeout;
@@ -746,6 +751,93 @@ impl App {
         self.registry.set_disconnected(&profile_id);
     }
 
+    /// Mirror a legacy-path Connecting transition into `self.registry`
+    /// so renderers show the `◐` badge during the connect window. Called
+    /// from `connect_profile_inner` right after setting
+    /// `connection_state = Connecting{...}` and spawning the worker
+    /// thread. Without this the sidebar/header stay blank for the
+    /// (sometimes seconds-long) gap until the worker reports back.
+    pub(crate) fn mirror_connecting_into_registry(&mut self, profile_name: &str) {
+        let Some(profile) = self
+            .runtime
+            .profiles
+            .iter()
+            .find(|p| p.name == profile_name)
+            .cloned()
+        else {
+            return;
+        };
+        let ConnectionState::Connecting { started, .. } = &self.runtime.connection_state else {
+            return;
+        };
+        let elapsed = started.elapsed();
+        let started_at = std::time::SystemTime::now()
+            .checked_sub(elapsed)
+            .unwrap_or_else(std::time::SystemTime::now);
+        let profile_id = ProfileId::new(&profile.name);
+        let allowed_ips = extract_allowed_ips(profile.protocol, &profile.config_path);
+        // Attempt counter: derived from runtime.retry_count (0-based)
+        // + 1 for the current attempt. Plan 005's retry-budget is
+        // tracked on the FSM itself; the legacy retry logic uses
+        // runtime.retry_count, so we synthesise an equivalent here.
+        let attempt = self.runtime.retry_count.saturating_add(1);
+        let retry_budget = std::time::Duration::from_secs(
+            crate::vortix_core::engine::state::DEFAULT_RETRY_BUDGET_SECS,
+        );
+        self.registry.set_connecting(
+            profile_id,
+            allowed_ips,
+            started_at,
+            attempt,
+            retry_budget,
+            placeholder_engine_for_profile(&profile),
+        );
+    }
+
+    /// Mirror a legacy-path Disconnecting transition into
+    /// `self.registry` so renderers show the `◑` badge during the
+    /// teardown window. Called when the legacy `disconnect()` enters
+    /// Disconnecting state. No-op when the registry doesn't already
+    /// have a Connected entry to transition — `set_disconnecting`
+    /// internally skips missing entries.
+    pub(crate) fn mirror_disconnecting_into_registry(&mut self, profile_name: &str) {
+        let profile_id = ProfileId::new(profile_name);
+        let started_at = std::time::SystemTime::now();
+        self.registry.set_disconnecting(&profile_id, started_at);
+    }
+
+    /// Mirror a failed-connect outcome into `self.registry` so
+    /// renderers show the `✗` badge until the user retries or
+    /// dismisses. Called from `handle_connect_result`'s failure
+    /// branch.
+    pub(crate) fn mirror_failed_into_registry(&mut self, profile_name: &str, error: &str) {
+        let Some(profile) = self
+            .runtime
+            .profiles
+            .iter()
+            .find(|p| p.name == profile_name)
+            .cloned()
+        else {
+            return;
+        };
+        let profile_id = ProfileId::new(&profile.name);
+        let allowed_ips = extract_allowed_ips(profile.protocol, &profile.config_path);
+        // Map the error string to a `FailureReason`. The legacy connect
+        // path stringifies the TunnelError before passing it back via
+        // Message::ConnectResult, so we can't recover the structured
+        // variant here. Use the generic `Other(msg)` carrier — when
+        // P5 retires the legacy mirror and the FSM drives directly,
+        // we'll get the typed reason back via the FSM's
+        // `handle_connect_failure` path.
+        let failure = crate::vortix_core::engine::state::FailureReason::Other(error.to_string());
+        self.registry.set_failed(
+            profile_id,
+            allowed_ips,
+            failure,
+            placeholder_engine_for_profile(&profile),
+        );
+    }
+
     #[allow(clippy::too_many_lines)]
     pub(crate) fn disconnect(&mut self) {
         self.runtime.retry_count = 0;
@@ -803,6 +895,12 @@ impl App {
                 started: Instant::now(),
                 profile: profile_name.clone(),
             };
+            // Plan A.3: mirror the Disconnecting transition so renderers
+            // show the `◑` badge during the teardown window. Before
+            // this, the only registry transition on disconnect was
+            // `set_disconnected` (which removes the entry entirely
+            // when complete_disconnect runs).
+            self.mirror_disconnecting_into_registry(&profile_name);
 
             // KILL SWITCH: Sync state after changing connection state
             self.sync_killswitch();
@@ -907,6 +1005,9 @@ impl App {
                 started: Instant::now(),
                 profile: name.clone(),
             };
+            // Plan A.3: mirror force-disconnect Disconnecting state
+            // for renderer parity with the regular disconnect path.
+            self.mirror_disconnecting_into_registry(&name);
 
             // Plan #004 U4: force-disconnect now routes through TunnelKind.
             // The OvpnTunnel's down() path already escalates to pkill if the
