@@ -1,0 +1,36 @@
+name: Boundary
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-subprocess:
+    name: Check Subprocess Boundary (plan 002)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./.github/actions/rust-setup
+      - run: cargo xtask check-subprocess
+
+  check-platform-leak:
+    name: Check Platform Boundary (plan 003)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./.github/actions/rust-setup
+      - run: cargo xtask check-platform-leak
+
+  check-protocol-leak:
+    name: Check Protocol Boundary (plan 004)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./.github/actions/rust-setup
+      - run: cargo xtask check-protocol-leak
