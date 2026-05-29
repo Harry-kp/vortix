@@ -520,18 +520,45 @@ impl Tunnel for OvpnTunnel {
             }
         }
 
-        // Fall back to pkill in case the pid was stale.
-        let _ = crate::vortix_process::run_to_output(
-            CommandSpec::oneshot(
-                "pkill",
-                vec![
-                    "-15".into(),
-                    "-f".into(),
-                    format!("openvpn.*--daemon vortix-{safe_name}"),
-                ],
-            )
-            .privilege(PrivilegeReq::Root),
-        );
+        // Plan 002 U6: fallback pattern-matched kill via process
+        // enumeration + libc::kill, replacing the prior `pkill -f` shell-out.
+        // Substring-match "openvpn" + "vortix-<safe_name>" against each
+        // PID's cmdline. Catches the daemon even when the captured PID
+        // is stale (process re-spawned, exec'd, etc.).
+        //
+        // Note: this imports from a platform module directly, which is
+        // a controlled cross-layer reach. The alternative — adding a
+        // `ProcessEnumerate` port to vortix_core — is heavier for one
+        // caller. Revisit if a second protocol module needs this.
+        let needle = format!("vortix-{safe_name}");
+
+        #[cfg(target_os = "linux")] // xtask:allow-platform-cfg: process enumeration is OS-specific (Linux /proc walk)
+        let stale_pids =
+            crate::vortix_platform_linux::interface::find_all_pids_with_cmdline_substring(&needle);
+        #[cfg(target_os = "macos")] // xtask:allow-platform-cfg: process enumeration is OS-specific (macOS proc_listpids)
+        let stale_pids =
+            crate::vortix_platform_macos::interface::find_all_pids_with_cmdline_substring(&needle);
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))] // xtask:allow-platform-cfg: Windows / other OS fallback (NG per origin)
+        let stale_pids: Vec<u32> = Vec::new();
+
+        for stale_pid in stale_pids {
+            if let Ok(libc_pid) = libc::pid_t::try_from(stale_pid) {
+                // SAFETY: thin syscall wrapper; see U2 for the full
+                // invariant analysis. Errors are best-effort warn-only —
+                // the prior `pkill` also ignored failures.
+                #[allow(unsafe_code)]
+                let rc = unsafe { libc::kill(libc_pid, libc::SIGTERM) };
+                if rc != 0 {
+                    let err = std::io::Error::last_os_error();
+                    debug!(
+                        target: "vortix::tunnel::openvpn",
+                        pid = stale_pid,
+                        error = %err,
+                        "libc::kill(SIGTERM) on stale-pattern-match PID failed"
+                    );
+                }
+            }
+        }
 
         // Cleanup run files.
         let _ = std::fs::remove_file(self.pid_path(&safe_name));

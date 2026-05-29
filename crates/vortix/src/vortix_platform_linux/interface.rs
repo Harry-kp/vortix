@@ -53,26 +53,11 @@ impl Interface for LinuxInterface {
     }
 
     fn get_wireguard_pid(interface: &str) -> Option<u32> {
-        // On Linux, kernel WireGuard doesn't have a userspace process
-        // For wireguard-go (userspace), search via ps
-        if let Some(output) = cmd_output("ps", &["-eo", "pid,args"]) {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                let line_lower = line.to_lowercase();
-                if line_lower.contains("wireguard")
-                    && line_lower.contains(&interface.to_lowercase())
-                {
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    if let Some(pid_str) = parts.first() {
-                        if let Ok(pid) = pid_str.parse::<u32>() {
-                            return Some(pid);
-                        }
-                    }
-                }
-            }
-        }
-
-        None
+        // Plan 002 U6: walk /proc directly instead of shelling to `ps`.
+        // Kernel WG has no userspace PID (returns None); wireguard-go has
+        // a process whose cmdline contains both "wireguard" and the
+        // interface name.
+        find_pid_with_cmdline_substrings(&["wireguard", interface])
     }
 
     fn get_interface_info(interface: &str) -> (String, String) {
@@ -87,6 +72,78 @@ impl Interface for LinuxInterface {
 
 fn check_wg_interface_exists(name: &str) -> bool {
     cmd_output("wg", &["show", name, "public-key"]).is_some_and(|o| o.status.success())
+}
+
+/// Walk `/proc/[pid]/cmdline` and return the first PID whose cmdline
+/// contains ALL of the given substring needles (case-insensitive).
+///
+/// Replaces the `ps -eo pid,args` shell-out used for finding userspace
+/// WireGuard processes (wireguard-go). Pure stdlib; no PATH dependency
+/// on procps.
+///
+/// Plan 002 U6.
+pub(crate) fn find_pid_with_cmdline_substrings(needles: &[&str]) -> Option<u32> {
+    let needles_lower: Vec<String> = needles.iter().map(|n| n.to_lowercase()).collect();
+
+    let entries = std::fs::read_dir("/proc").ok()?;
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        // Skip non-PID entries (those are numeric).
+        let Ok(pid) = name.parse::<u32>() else {
+            continue;
+        };
+        // cmdline is null-separated; replace with spaces for substring
+        // matching against the legacy `ps args` format.
+        let cmdline_path = format!("/proc/{pid}/cmdline");
+        let Ok(raw) = std::fs::read(&cmdline_path) else {
+            continue; // PID disappeared between readdir and read — fine
+        };
+        let cmdline = String::from_utf8_lossy(&raw)
+            .replace('\0', " ")
+            .to_lowercase();
+        if needles_lower.iter().all(|n| cmdline.contains(n)) {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+/// Walk `/proc/[pid]/cmdline` and return EVERY PID whose cmdline contains
+/// the given substring needle (case-insensitive).
+///
+/// Used by the OVPN tunnel teardown to replace `pkill -f`. Same /proc
+/// walk as the single-PID variant but collects all matches.
+///
+/// Plan 002 U6.
+pub(crate) fn find_all_pids_with_cmdline_substring(needle: &str) -> Vec<u32> {
+    let needle_lower = needle.to_lowercase();
+    let mut matches = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return matches;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        let Ok(pid) = name.parse::<u32>() else {
+            continue;
+        };
+        let cmdline_path = format!("/proc/{pid}/cmdline");
+        let Ok(raw) = std::fs::read(&cmdline_path) else {
+            continue;
+        };
+        let cmdline = String::from_utf8_lossy(&raw)
+            .replace('\0', " ")
+            .to_lowercase();
+        if cmdline.contains(&needle_lower) {
+            matches.push(pid);
+        }
+    }
+    matches
 }
 
 /// Read the IPv4 address assigned to `interface` from `libc::getifaddrs`.
