@@ -648,38 +648,37 @@ impl App {
 
     /// Mirror a legacy-path connect success into `self.registry` so the
     /// renderer-facing snapshots (header, sidebar, Connection Details,
-    /// Security Guard) match the live tunnel state. Today the connect
-    /// path drives `tunnel.up()` directly from a worker thread (see
-    /// `connect_profile_inner`); the registry is touched only for the
-    /// pre-up `detect_conflict` check. Plan 001 U6 Stage C / U7 will
-    /// eventually route the whole flow through `registry.connect`; this
-    /// mirror keeps the UI honest until then.
+    /// Security Guard) match the live tunnel state.
     ///
-    /// Implementation: register a fresh `Engine<TunnelKind>` backed by
-    /// a `MockTunnel` scripted with the **real** interface name + pid
-    /// from `runtime.connection_state.details` (which the scanner
-    /// populates with kernel-truthful values). `registry.connect_with_tunnel`
-    /// drives the FSM `Disconnected → Connecting → Connected` synchronously;
-    /// the mock returns the scripted handle without touching the kernel.
-    /// `force: true` skips the conflict check because the real connect
-    /// already passed it in `connect_profile_inner`.
+    /// Today the connect path drives `tunnel.up()` directly from a
+    /// worker thread (see `connect_profile_inner`); the registry is
+    /// touched only for the pre-up `detect_conflict` check. Plan 001
+    /// U7 will eventually route the whole flow through
+    /// `EngineHandle::Local`; until then, this mirror is how the
+    /// registry stays in sync with kernel state.
     ///
-    /// Why the real interface matters: `TunnelRegistry::recompute_primary`
-    /// matches `details.interface == kernel_default_route_interface` to
-    /// decide which tunnel is "primary". With a `mock0` placeholder the
-    /// match never hits, the tunnel reads as a non-primary
-    /// "Addressable secondary", telemetry routes around it
-    /// (`Latency: n/a (secondary tunnel)`), and `Server`/`PID` come
-    /// back empty — exactly the screenshot the user reported.
+    /// Implementation: copies the full `DetailedConnectionInfo` from
+    /// `runtime.connection_state.details` (kernel-truthful values
+    /// populated by the scanner — interface, pid, endpoint, mtu,
+    /// transfer counters, public key) into the registry via
+    /// [`TunnelRegistry::set_connected`]. No `Tunnel::up` invocation;
+    /// no synthetic handle. The placeholder `Engine<TunnelKind>` the
+    /// registry constructs is never driven — its inner tunnel field
+    /// is dead storage required only to satisfy the generic `T:
+    /// Tunnel` bound.
     ///
-    /// Idempotent + replace-on-change: every scanner tick that
-    /// updates `details.interface` (the kernel-true value lands a
-    /// tick or two after the worker thread's `ConnectResult`) calls
-    /// the mirror again. We compare the current registry snapshot to
-    /// the new details and short-circuit when nothing changed,
-    /// preventing per-tick FSM churn. When data differs (e.g., empty
-    /// → real interface name), we remove the stale entry and
-    /// re-connect with the latest values.
+    /// Why the rich details matter: renderers read these directly
+    /// from the registry snapshot. With the prior MockTunnel-based
+    /// shim, the FSM stored only `interface_name` + `pid` from the
+    /// synthetic `TunnelHandle` — every other field
+    /// (endpoint/mtu/etc.) defaulted to empty, so Connection Details
+    /// showed `Server: empty`, `Role: Addressable (-)`, `Latency:
+    /// n/a (secondary tunnel)`. With the bookkeeping API the entire
+    /// `DetailedConnectionInfo` flows through unchanged.
+    ///
+    /// Idempotent: scanner ticks every ~1s re-call this with the
+    /// latest details. `set_connected` updates the existing entry's
+    /// state in place — no FSM churn.
     pub(crate) fn mirror_connect_into_registry(&mut self, profile_name: &str) {
         let Some(profile) = self
             .runtime
@@ -690,81 +689,53 @@ impl App {
         else {
             return;
         };
-
-        let profile_id = ProfileId::new(&profile.name);
-
-        // Pull live kernel-reported values from the legacy state's
-        // details. When details are still default (e.g.,
-        // handle_connect_result fires before scanner ticks), iface is
-        // empty and we fall through to a placeholder entry — the
-        // next scanner tick replaces it.
-        let (iface, pid) = match &self.runtime.connection_state {
-            ConnectionState::Connected { details, .. } => (details.interface.clone(), details.pid),
-            _ => (String::new(), None),
+        let ConnectionState::Connected {
+            details: legacy_details,
+            since,
+            ..
+        } = &self.runtime.connection_state
+        else {
+            return;
         };
 
-        // Short-circuit when the registry already holds this same
-        // data: avoid per-tick disconnect/reconnect churn that would
-        // make renderers flicker.
-        if let Some(snap) = self.registry.snapshot(&profile_id) {
-            use crate::vortix_core::engine::state::Connection;
-            if let Connection::Connected {
-                details: registry_details,
-                ..
-            } = &snap.state
-            {
-                if registry_details.interface == iface && registry_details.pid == pid {
-                    return;
-                }
-            }
-        }
-
-        // Replace any stale entry so the new connect carries the
-        // refreshed handle through the FSM.
-        let _ = self.registry.disconnect(&profile_id);
-        let _ = self.registry.remove(&profile_id);
-
+        let profile_id = ProfileId::new(&profile.name);
         let allowed_ips = extract_allowed_ips(profile.protocol, &profile.config_path);
-        let mock = crate::vortix_core::ports::tunnel::mock::MockTunnel::new();
-        if !iface.is_empty() {
-            mock.script_up(
-                crate::vortix_core::ports::tunnel::mock::ScriptedTunnelOutcome::UpSuccess {
-                    interface_name: iface,
-                    pid,
-                },
-            );
-        }
-        let mock_kind = crate::tunnel::TunnelKind::Mock(mock);
 
-        let resolved_profile = profile_for_resolver(&profile);
-        let profile_resolver = move |_id: &ProfileId| Some(resolved_profile.clone());
+        // Copy the legacy DetailedConnectionInfo (which the scanner
+        // fills with kernel-truthful values) into the registry's
+        // vortix_core::engine::state::DetailedConnectionInfo (which
+        // renderers read).
+        let core_details = legacy_to_core_details(legacy_details);
 
-        if let Err(err) = self.registry.connect_with_tunnel(
+        // Convert the legacy `Instant` to `SystemTime` for the
+        // registry. We can't go directly — `Instant` is monotonic and
+        // doesn't expose its zero — so we anchor the conversion on
+        // "now" minus the elapsed-since-legacy-since duration.
+        let elapsed = since.elapsed();
+        let core_since = std::time::SystemTime::now()
+            .checked_sub(elapsed)
+            .unwrap_or_else(std::time::SystemTime::now);
+
+        self.registry.set_connected(
             profile_id,
             allowed_ips,
-            mock_kind,
-            profile_resolver,
-            /* force */ true,
-        ) {
-            self.log(&format!(
-                "WARN: registry mirror-connect failed for '{profile_name}': {err}"
-            ));
-        }
+            core_details,
+            core_since,
+            // Placeholder engine — never driven. The bookkeeping API
+            // seeds state directly via `Engine::seed_connected_state`
+            // immediately after construction; `tunnel.up()` is never
+            // called on this engine.
+            placeholder_engine_for_profile(&profile),
+        );
     }
 
-    /// Mirror a legacy-path disconnect into `self.registry`: drive the
-    /// FSM `Connected → Disconnecting → Disconnected` (mock `down()`
-    /// returns success immediately) and then remove the entry so the
-    /// registry's `tunnel_count` and `snapshot_all` reflect the
-    /// teardown. See [`Self::mirror_connect_into_registry`] for the
-    /// rationale behind this bookkeeping path.
+    /// Mirror a legacy-path disconnect into `self.registry`: seed the
+    /// registry's FSM to `Disconnected` (without running `Disconnecting`
+    /// or `tunnel.down()`) and remove the entry. Idempotent — a profile
+    /// the registry never had is a no-op.
     pub(crate) fn mirror_disconnect_into_registry(&mut self, profile_name: &str) {
         let profile_id = ProfileId::new(profile_name);
-        // Idempotent: if the registry doesn't know about this profile
-        // (mirror skipped, race condition, test setup) the disconnect
-        // call returns ProfileNotFound — ignore it.
-        let _ = self.registry.disconnect(&profile_id);
-        let _ = self.registry.remove(&profile_id);
+        self.registry.set_disconnected(&profile_id);
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1188,6 +1159,52 @@ fn profile_for_resolver(
         },
         profile.config_path.clone(),
     )
+}
+
+/// Copy the legacy `vpn_runtime::DetailedConnectionInfo` (populated by
+/// the scanner with kernel-truthful values) into the
+/// `vortix_core::engine::state::DetailedConnectionInfo` shape that
+/// `TunnelRegistry` stores. The two structs have identical field
+/// names + types; this is a straight field-for-field translation.
+fn legacy_to_core_details(
+    legacy: &crate::vpn_runtime::DetailedConnectionInfo,
+) -> crate::vortix_core::engine::state::DetailedConnectionInfo {
+    crate::vortix_core::engine::state::DetailedConnectionInfo {
+        interface: legacy.interface.clone(),
+        internal_ip: legacy.internal_ip.clone(),
+        endpoint: legacy.endpoint.clone(),
+        mtu: legacy.mtu.clone(),
+        public_key: legacy.public_key.clone(),
+        listen_port: legacy.listen_port.clone(),
+        transfer_rx: legacy.transfer_rx.clone(),
+        transfer_tx: legacy.transfer_tx.clone(),
+        latest_handshake: legacy.latest_handshake.clone(),
+        pid: legacy.pid,
+    }
+}
+
+/// Construct a placeholder `Engine<TunnelKind>` for the bookkeeping
+/// mirror path. The returned engine's tunnel field is dead storage —
+/// `TunnelRegistry::set_connected` seeds the FSM's state directly via
+/// `Engine::seed_connected_state` immediately after construction, so
+/// `Tunnel::up`/`down`/`status` are never invoked.
+///
+/// `TunnelKind::Mock(MockTunnel::new())` is used as the inert filler
+/// because `Engine<T>` requires `T: Tunnel` and we need *some* impl
+/// to satisfy the bound — not because the engine ever calls into it.
+/// When U7 lands and the connect path drives the registry directly,
+/// this whole helper becomes dead code.
+fn placeholder_engine_for_profile(
+    profile: &crate::state::VpnProfile,
+) -> impl FnOnce() -> crate::vortix_core::engine::Engine<crate::tunnel::TunnelKind> {
+    let resolved_profile = profile_for_resolver(profile);
+    let profile_resolver = move |_id: &ProfileId| Some(resolved_profile.clone());
+    move || {
+        let placeholder_tunnel = crate::tunnel::TunnelKind::Mock(
+            crate::vortix_core::ports::tunnel::mock::MockTunnel::new(),
+        );
+        crate::vortix_core::engine::Engine::new(placeholder_tunnel, profile_resolver)
+    }
 }
 
 /// Extract the `AllowedIPs` (`WireGuard`) or `route` directives (`OpenVPN`)

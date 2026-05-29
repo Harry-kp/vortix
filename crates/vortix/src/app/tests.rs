@@ -2674,6 +2674,61 @@ fn mirrored_registry_entry_uses_real_interface_not_mock0() {
 }
 
 #[test]
+fn mirrored_registry_entry_carries_full_rich_details_not_just_interface_and_pid() {
+    use crate::vortix_core::engine::state::Connection;
+    use crate::vortix_core::profile::ProfileId;
+
+    // The Connection Details panel reads `endpoint`, `internal_ip`,
+    // `mtu`, `transfer_rx`, `transfer_tx`, `public_key`,
+    // `listen_port`, `latest_handshake` directly from the registry
+    // snapshot's `DetailedConnectionInfo`. The earlier MockTunnel
+    // shim only carried `interface_name` + `pid` from the synthetic
+    // `TunnelHandle`; everything else came back empty, producing
+    // the user's `Server: empty`, `MTU: -`, `Crypto: AES-256-GCM`
+    // (defaulted), `Transfer: 0/0` screenshot.
+    //
+    // The bookkeeping `set_connected` API now copies the full
+    // legacy `DetailedConnectionInfo` straight into the registry.
+    // Assert every field round-trips.
+    let mut app = test_app();
+    add_profiles(&mut app, &["AWS_VPN"]);
+    app.runtime.connection_state = ConnectionState::Connecting {
+        started: Instant::now(),
+        profile: "AWS_VPN".to_string(),
+    };
+
+    let session = fake_session("AWS_VPN");
+    app.handle_message(Message::SyncSystemState(vec![session]));
+
+    let snap = app
+        .registry
+        .snapshot(&ProfileId::new("AWS_VPN"))
+        .expect("registry snapshot must exist");
+    let Connection::Connected { details, .. } = snap.state else {
+        panic!("expected Connected, got {:?}", snap.state);
+    };
+
+    assert_eq!(details.interface, "wg0");
+    assert_eq!(details.pid, Some(12345));
+    assert_eq!(
+        details.endpoint, "1.2.3.4:51820",
+        "Server column reads details.endpoint"
+    );
+    assert_eq!(
+        details.internal_ip, "10.0.0.2",
+        "VPN IP column reads details.internal_ip"
+    );
+    assert_eq!(details.mtu, "1420", "MTU column reads details.mtu");
+    assert_eq!(details.listen_port, "51820");
+    assert_eq!(
+        details.transfer_rx, "100 KiB",
+        "Transfer column reads details.transfer_rx/tx"
+    );
+    assert_eq!(details.transfer_tx, "50 KiB");
+    assert_eq!(details.latest_handshake, "5 seconds ago");
+}
+
+#[test]
 fn mirror_refresh_updates_registry_when_details_change() {
     use crate::vortix_core::engine::state::Connection;
     use crate::vortix_core::profile::ProfileId;

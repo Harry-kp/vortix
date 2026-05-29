@@ -288,6 +288,90 @@ impl<T: Tunnel> TunnelRegistry<T> {
         self.fsms.remove(profile_id).map(|e| e.engine)
     }
 
+    /// Bookkeeping API: register or refresh a `Connected` entry directly
+    /// from a populated `DetailedConnectionInfo` without driving
+    /// `Tunnel::up`. Used to mirror externally-driven kernel state
+    /// (e.g. a tunnel brought up via the legacy
+    /// `App::connect_profile_inner` spawned-thread path) into the
+    /// registry until plan 001 U7 routes the full connect flow through
+    /// `EngineHandle::Local`.
+    ///
+    /// Behavior:
+    /// - If an entry already exists for `profile_id`, its FSM is
+    ///   seeded into `Connected` with the supplied details
+    ///   ([`Engine::seed_connected_state`]) and its `allowed_ips` are
+    ///   refreshed (a profile edit may have changed them).
+    /// - If no entry exists, `engine_factory` is invoked to construct
+    ///   a fresh `Engine<T>` (the caller supplies a placeholder
+    ///   tunnel — it is never invoked because state is seeded
+    ///   directly). The new engine is seeded and inserted.
+    /// - `refresh_primary_internal` runs after seeding so the derived
+    ///   `primary` reflects the new entry.
+    ///
+    /// The supplied details should carry kernel-true values
+    /// (interface name, pid, endpoint, mtu, transfer counters, etc.)
+    /// — these flow directly into renderer-facing snapshots.
+    #[allow(clippy::needless_pass_by_value)] // owned ProfileId stored in the HashMap key
+    pub fn set_connected(
+        &mut self,
+        profile_id: ProfileId,
+        allowed_ips: Vec<Cidr>,
+        details: crate::vortix_core::engine::state::DetailedConnectionInfo,
+        since: std::time::SystemTime,
+        engine_factory: impl FnOnce() -> Engine<T>,
+    ) {
+        if let Some(entry) = self.fsms.get_mut(&profile_id) {
+            entry
+                .engine
+                .seed_connected_state(profile_id.clone(), details, since);
+            entry.allowed_ips = allowed_ips;
+        } else {
+            let mut engine = engine_factory();
+            engine.seed_connected_state(profile_id.clone(), details, since);
+            self.fsms.insert(
+                profile_id,
+                RegistryEntry {
+                    engine,
+                    allowed_ips,
+                },
+            );
+        }
+        // Inline refresh — `set_connected` doesn't produce engine
+        // events to inspect, so use the external-reason wrapper.
+        let from = self.primary.clone();
+        self.recompute_primary();
+        if self.primary != from {
+            log_primary_change(
+                from.as_ref(),
+                self.primary.as_ref(),
+                PrimaryTunnelChangeReason::ExternalRouteChange,
+            );
+        }
+    }
+
+    /// Bookkeeping API counterpart to [`Self::set_connected`]: seed
+    /// the FSM (if present) directly into `Disconnected` without
+    /// running `Disconnecting` or calling `Tunnel::down`, then drop
+    /// the entry. Idempotent — a missing profile is a no-op. Use
+    /// when the App's legacy disconnect path has already torn down
+    /// the kernel state and we just need the registry's
+    /// snapshot/primary derivation to follow.
+    pub fn set_disconnected(&mut self, profile_id: &ProfileId) {
+        if let Some(entry) = self.fsms.get_mut(profile_id) {
+            entry.engine.seed_disconnected_state();
+        }
+        self.fsms.remove(profile_id);
+        let from = self.primary.clone();
+        self.recompute_primary();
+        if self.primary != from {
+            log_primary_change(
+                from.as_ref(),
+                self.primary.as_ref(),
+                PrimaryTunnelChangeReason::ExternalRouteChange,
+            );
+        }
+    }
+
     // ──────────────────────────── Snapshots ────────────────────────────
 
     #[must_use]

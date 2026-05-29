@@ -134,6 +134,48 @@ impl<T: Tunnel> Engine<T> {
         self.pending_after_disconnect = profile_id;
     }
 
+    /// Bookkeeping-only: seed `Connection::Connected` directly from a
+    /// pre-populated `DetailedConnectionInfo` without driving
+    /// `Tunnel::up`. The supplied state replaces whatever the FSM
+    /// currently holds — no transition guards, no events emitted, no
+    /// tunnel invocation.
+    ///
+    /// This exists to mirror externally-driven kernel state (e.g. a
+    /// VPN brought up by the legacy `App::connect_profile_inner`
+    /// spawned-thread path, or an interface adopted from a prior
+    /// vortix session) into the registry until plan 001 U7 routes
+    /// the full connect flow through `EngineHandle::Local`. Once U7
+    /// lands, every Connected entry will arrive via
+    /// `handle(UserCommand::Connect)` and this seed API can be
+    /// retired.
+    ///
+    /// Use [`TunnelRegistry::set_connected`] from outside the FSM
+    /// rather than calling this directly — the registry call also
+    /// refreshes the derived `primary` after seeding.
+    pub fn seed_connected_state(
+        &mut self,
+        profile_id: ProfileId,
+        details: DetailedConnectionInfo,
+        since: SystemTime,
+    ) {
+        self.state = Connection::Connected {
+            profile_id,
+            since,
+            health: crate::vortix_core::engine::state::ConnectionHealth::default(),
+            details: Box::new(details),
+        };
+    }
+
+    /// Bookkeeping-only counterpart to [`Self::seed_connected_state`]:
+    /// drop straight back to `Disconnected { last_failure: None }`
+    /// without running the `Disconnecting` transition or invoking
+    /// `Tunnel::down`. Used by [`TunnelRegistry::set_disconnected`]
+    /// when the App's legacy disconnect path has already torn down
+    /// the kernel state.
+    pub fn seed_disconnected_state(&mut self) {
+        self.state = Connection::Disconnected { last_failure: None };
+    }
+
     /// Drive one input through the FSM. Returns the events emitted during
     /// the transition; the caller is expected to append them to the journal
     /// and broadcast.
