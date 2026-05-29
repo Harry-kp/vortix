@@ -238,7 +238,7 @@ pub fn write_openvpn_auth_file(
     username: &str,
     password: &str,
 ) -> std::io::Result<std::path::PathBuf> {
-    use crate::vortix_core::secret_file::{SecretFileError, write_secret_file};
+    use crate::vortix_core::secret_file::{write_secret_file, SecretFileError};
 
     let auth_path = get_openvpn_auth_path(profile_name)?;
 

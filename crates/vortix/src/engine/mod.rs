@@ -544,9 +544,7 @@ impl Drop for VpnEngine {
 /// from `TunnelRegistry`. For now the only contributor is the currently
 /// connected tunnel (if any), treated as primary; declared CIDRs are
 /// empty until U6 plumbs them through `ConnectionState`.
-fn build_active_tunnels(
-    state: &ConnectionState,
-) -> Vec<crate::core::killswitch::ActiveTunnelInfo> {
+fn build_active_tunnels(state: &ConnectionState) -> Vec<crate::core::killswitch::ActiveTunnelInfo> {
     use crate::core::killswitch::ActiveTunnelInfo;
 
     match state {

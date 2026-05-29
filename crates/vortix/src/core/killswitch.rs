@@ -352,9 +352,13 @@ mod tests {
     #[test]
     fn v1_file_deserializes_with_serde_defaults() {
         // V1 on-disk shape: no schema_version, no active_tunnels.
-        let json = r#"{"mode":"Auto","state":"Armed","vpn_interface":"utun3","vpn_server_ip":"1.2.3.4"}"#;
+        let json =
+            r#"{"mode":"Auto","state":"Armed","vpn_interface":"utun3","vpn_server_ip":"1.2.3.4"}"#;
         let mut state: PersistedState = serde_json::from_str(json).unwrap();
-        assert_eq!(state.schema_version, 1, "missing schema_version defaults to 1");
+        assert_eq!(
+            state.schema_version, 1,
+            "missing schema_version defaults to 1"
+        );
         assert_eq!(state.vpn_interface.as_deref(), Some("utun3"));
         assert!(state.active_tunnels.is_empty());
 
@@ -362,7 +366,10 @@ mod tests {
         assert_eq!(state.schema_version, PERSISTED_STATE_SCHEMA_V2);
         assert_eq!(state.active_tunnels.len(), 1);
         assert_eq!(state.active_tunnels[0].interface, "utun3");
-        assert_eq!(state.active_tunnels[0].server_ips, vec!["1.2.3.4".to_string()]);
+        assert_eq!(
+            state.active_tunnels[0].server_ips,
+            vec!["1.2.3.4".to_string()]
+        );
         assert!(state.active_tunnels[0].is_primary);
     }
 
@@ -393,7 +400,10 @@ mod tests {
         assert_eq!(state.active_tunnels.len(), 2);
         assert!(state.active_tunnels[0].is_primary);
         assert!(!state.active_tunnels[1].is_primary);
-        assert_eq!(state.active_tunnels[1].declared_cidrs, vec!["10.0.0.0/8".to_string()]);
+        assert_eq!(
+            state.active_tunnels[1].declared_cidrs,
+            vec!["10.0.0.0/8".to_string()]
+        );
     }
 
     #[test]

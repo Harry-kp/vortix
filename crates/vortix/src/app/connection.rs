@@ -104,6 +104,7 @@ pub(crate) fn probe_openvpn_version() -> OvpnVersionProbe {
 }
 
 fn probe_openvpn_version_uncached() -> OvpnVersionProbe {
+    // xtask:allow-protocol-leak: dependency-version probe runs before any tunnel exists; app-layer concern (R13)
     let version_output =
         vortix_process::run_to_output(CommandSpec::oneshot("openvpn", vec!["--version".into()]));
     if let Ok(out) = version_output {
@@ -122,6 +123,7 @@ fn probe_openvpn_version_uncached() -> OvpnVersionProbe {
 
     // Fallback: scan `--help` for `--pull-filter`. The flag has been listed
     // in --help since 2.4, so its presence is a serviceable proxy.
+    // xtask:allow-protocol-leak: dependency-feature probe runs before any tunnel exists; app-layer concern (R13)
     let help_output =
         vortix_process::run_to_output(CommandSpec::oneshot("openvpn", vec!["--help".into()]));
     if let Ok(out) = help_output {
@@ -847,14 +849,13 @@ pub(crate) fn build_active_tunnels_from_state(
     }
 }
 
-
 #[cfg(test)]
 mod ovpn_version_tests {
     //! Tests for plan 001 U14 — `OpenVPN` `--version` parsing and the 2.4+
     //! precondition assertion. The parse helper is pure so we can cover the
     //! happy path, the major-bump edge case, and the malformed-output
     //! fallback without spawning a subprocess.
-    use super::{OvpnVersion, parse_openvpn_version};
+    use super::{parse_openvpn_version, OvpnVersion};
 
     #[test]
     fn parses_standard_first_line() {
@@ -918,8 +919,7 @@ mod ovpn_version_tests {
     fn handles_vendor_prefix_via_token_scan() {
         // Vendor-patched builds sometimes prefix the banner — the parser
         // should still locate the `OpenVPN ` token.
-        let v =
-            parse_openvpn_version("vendor-patched OpenVPN 2.6.10 abc").expect("should parse");
+        let v = parse_openvpn_version("vendor-patched OpenVPN 2.6.10 abc").expect("should parse");
         assert_eq!(
             v,
             OvpnVersion {

@@ -121,8 +121,8 @@ pub fn write_secret_file(path: &Path, contents: &[u8]) -> Result<(), SecretFileE
 
     // 3. Build a C string for the basename. CString::new rejects interior
     //    NULs, which is the only way a Rust `OsStr` can be invalid here.
-    let c_name = CString::new(basename.as_encoded_bytes())
-        .map_err(|_| SecretFileError::InvalidFilename)?;
+    let c_name =
+        CString::new(basename.as_encoded_bytes()).map_err(|_| SecretFileError::InvalidFilename)?;
 
     // 4. openat(parent_fd, basename, O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW|O_CLOEXEC, 0o600).
     //    - O_CREAT|O_EXCL: refuses to overwrite (EEXIST) — no race vs an

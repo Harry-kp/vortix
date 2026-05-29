@@ -194,10 +194,7 @@ pub fn parse_wg_conf(text: &str) -> Result<WgParsedProfile, ParseError> {
                             if let Some(mark) = parsed {
                                 peer.fwmark = Some(mark);
                             } else {
-                                tracing::warn!(
-                                    value,
-                                    "ignoring malformed FwMark value in [Peer]"
-                                );
+                                tracing::warn!(value, "ignoring malformed FwMark value in [Peer]");
                             }
                         }
                     }
@@ -291,7 +288,10 @@ FwMark = 51820
         let peer = &p.peers[0];
         assert_eq!(peer.public_key, "BBBB");
         assert_eq!(peer.allowed_ips.len(), 2);
-        assert_eq!(peer.allowed_ips[0].addr, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)));
+        assert_eq!(
+            peer.allowed_ips[0].addr,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0))
+        );
         assert_eq!(peer.allowed_ips[0].prefix_len, 8);
         assert_eq!(
             peer.allowed_ips[1].addr,

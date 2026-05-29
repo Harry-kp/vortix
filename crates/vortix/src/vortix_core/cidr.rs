@@ -303,10 +303,7 @@ mod tests {
     fn v4_helper_ignores_v6_entries() {
         // Without the /1 pair the v4 union has a giant hole, so even a
         // matching IPv6 default route must not bleed into the v4 result.
-        assert!(!claims_default_route_v4(&[
-            v4("0.0.0.0/1"),
-            v6("::/0"),
-        ]));
+        assert!(!claims_default_route_v4(&[v4("0.0.0.0/1"), v6("::/0"),]));
         // And vice-versa: v6 helper ignores v4 entries.
         assert!(!claims_default_route_v6(&[v4("0.0.0.0/0")]));
     }

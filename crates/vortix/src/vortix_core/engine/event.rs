@@ -364,10 +364,11 @@ mod tests {
         let back: EngineEvent = serde_json::from_str(&json).unwrap();
         match back {
             EngineEvent::ConnectAttemptBlockedByConflict {
-                conflict: Conflict::RouteOverlap {
-                    with,
-                    overlapping_cidrs,
-                },
+                conflict:
+                    Conflict::RouteOverlap {
+                        with,
+                        overlapping_cidrs,
+                    },
                 profile_id,
             } => {
                 assert_eq!(with.as_str(), "corp");

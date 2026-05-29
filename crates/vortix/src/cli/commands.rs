@@ -40,13 +40,7 @@ pub fn handle_command(
             brief,
             no_daemon,
         } => handle_status(
-            *watch,
-            *interval,
-            *brief,
-            *no_daemon,
-            config,
-            config_dir,
-            mode,
+            *watch, *interval, *brief, *no_daemon, config, config_dir, mode,
         ),
         Commands::List {
             sort,

@@ -23,8 +23,8 @@ use base64::Engine as _;
 // route through `aes_gcm::aead::OsRng` here because `aes_gcm 0.10`'s
 // `generate_nonce` is bound to `rand_core 0.6`'s `RngCore` (via `crypto_common`)
 // — `rand 0.10`'s `ThreadRng` exposes `rand_core 0.10`'s incompatible trait.
-use aes_gcm::aead::OsRng;
 use aes_gcm::aead::rand_core::RngCore;
+use aes_gcm::aead::OsRng;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop};

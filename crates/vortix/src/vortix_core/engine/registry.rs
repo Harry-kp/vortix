@@ -114,10 +114,7 @@ pub enum Conflict {
     /// Two profiles both claim the kernel default route. The `current` holder
     /// may be either Connected (already on the route) or Connecting (claimed
     /// it but `tunnel.up` hasn't returned yet — the §7.3 in-flight rule).
-    DefaultRouteTakeover {
-        current: ProfileId,
-        new: ProfileId,
-    },
+    DefaultRouteTakeover { current: ProfileId, new: ProfileId },
     /// Non-default-route overlap. Reserved for the future v2 conflict surface
     /// (R10's "subnet overlap" requirement); not produced by the v1
     /// `detect_conflict` which only inspects the default route.
@@ -318,7 +315,11 @@ impl<T: Tunnel> TunnelRegistry<T> {
                 since,
                 health,
                 ..
-            } => (Some(details.interface.clone()), Some(*since), health.clone()),
+            } => (
+                Some(details.interface.clone()),
+                Some(*since),
+                health.clone(),
+            ),
             Connection::Connecting { started_at, .. }
             | Connection::Reconnecting { started_at, .. }
             | Connection::Disconnecting { started_at, .. } => {
@@ -363,9 +364,7 @@ impl<T: Tunnel> TunnelRegistry<T> {
             Connection::Disconnected { .. }
             | Connection::Disconnecting { .. }
             | Connection::Connecting { .. }
-            | Connection::Connected { .. } => {
-                self.derive_role_from_allowed_ips(profile_id, entry)
-            }
+            | Connection::Connected { .. } => self.derive_role_from_allowed_ips(profile_id, entry),
         }
     }
 
@@ -465,9 +464,7 @@ impl<T: Tunnel> TunnelRegistry<T> {
         {
             use crate::vortix_core::engine::state::FailureReason;
             return match reason {
-                FailureReason::ProfileGone(id) => {
-                    Err(RegistryError::ProfileNotFound(id.clone()))
-                }
+                FailureReason::ProfileGone(id) => Err(RegistryError::ProfileNotFound(id.clone())),
                 other => Err(RegistryError::TunnelFailure(format!("{other:?}"))),
             };
         }
@@ -751,8 +748,8 @@ impl<T: Tunnel> TunnelRegistry<T> {
         new_profile: &ProfileId,
         new_allowed_ips: &[Cidr],
     ) -> Option<Conflict> {
-        let new_claims_default = claims_default_route_v4(new_allowed_ips)
-            || claims_default_route_v6(new_allowed_ips);
+        let new_claims_default =
+            claims_default_route_v4(new_allowed_ips) || claims_default_route_v6(new_allowed_ips);
         if !new_claims_default {
             // Non-default-route profile; never conflicts (route-overlap
             // detection is R10 v2 territory, not v1).
@@ -964,23 +961,21 @@ mod tests {
 
     #[test]
     fn connect_two_disjoint_allowed_ips_both_connected_primary_owns_zero_slash_zero() {
-        let mut reg =
-            registry_with_iface(|| Some("utun7".into())); // first tunnel owns kernel route
+        let mut reg = registry_with_iface(|| Some("utun7".into())); // first tunnel owns kernel route
         connect_with_iface(&mut reg, "corp", "utun7", default_route_v4(), false).unwrap();
-        connect_with_iface(
-            &mut reg,
-            "lab",
-            "utun8",
-            vec![v4("10.0.0.0/8")],
-            false,
-        )
-        .unwrap();
+        connect_with_iface(&mut reg, "lab", "utun8", vec![v4("10.0.0.0/8")], false).unwrap();
 
         assert_eq!(reg.tunnel_count(), 2);
         assert_eq!(reg.primary(), Some(&ProfileId::new("corp")));
         let snaps = reg.snapshot_all();
-        let corp = snaps.iter().find(|s| s.profile_id.as_str() == "corp").unwrap();
-        let lab = snaps.iter().find(|s| s.profile_id.as_str() == "lab").unwrap();
+        let corp = snaps
+            .iter()
+            .find(|s| s.profile_id.as_str() == "corp")
+            .unwrap();
+        let lab = snaps
+            .iter()
+            .find(|s| s.profile_id.as_str() == "lab")
+            .unwrap();
         assert!(matches!(corp.role, Role::Primary { .. }));
         assert!(matches!(lab.role, Role::Addressable { .. }));
     }
@@ -1113,14 +1108,7 @@ mod tests {
         // the user's physical NIC owns it.
         let mut reg = registry_with_iface(|| Some("eth0".into()));
         connect_with_iface(&mut reg, "corp", "utun7", vec![v4("10.0.0.0/8")], false).unwrap();
-        connect_with_iface(
-            &mut reg,
-            "lab",
-            "utun8",
-            vec![v4("192.168.0.0/16")],
-            false,
-        )
-        .unwrap();
+        connect_with_iface(&mut reg, "lab", "utun8", vec![v4("192.168.0.0/16")], false).unwrap();
         connect_with_iface(&mut reg, "ops", "utun9", vec![v4("172.16.0.0/12")], false).unwrap();
 
         assert_eq!(reg.tunnel_count(), 3);
@@ -1152,22 +1140,8 @@ mod tests {
         let mut reg = registry_with_iface(move || iface_probe.lock().unwrap().clone());
 
         connect_with_iface(&mut reg, "corp", "utun7", default_route_v4(), false).unwrap();
-        connect_with_iface(
-            &mut reg,
-            "lab",
-            "utun8",
-            vec![v4("10.0.0.0/8")],
-            false,
-        )
-        .unwrap();
-        connect_with_iface(
-            &mut reg,
-            "ops",
-            "utun9",
-            vec![v4("172.16.0.0/12")],
-            false,
-        )
-        .unwrap();
+        connect_with_iface(&mut reg, "lab", "utun8", vec![v4("10.0.0.0/8")], false).unwrap();
+        connect_with_iface(&mut reg, "ops", "utun9", vec![v4("172.16.0.0/12")], false).unwrap();
 
         *iface.lock().unwrap() = None; // post-teardown kernel sees no Vortix default route
         reg.disconnect_all();

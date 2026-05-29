@@ -148,11 +148,7 @@ async fn handle_client(
     match get_peer_uid(&stream) {
         Ok(peer_uid) if peer_uid == daemon_uid => { /* authorized; fall through */ }
         Ok(peer_uid) => {
-            tracing::warn!(
-                peer_uid,
-                daemon_uid,
-                "rejecting client with UID mismatch"
-            );
+            tracing::warn!(peer_uid, daemon_uid, "rejecting client with UID mismatch");
             // Best-effort notify-and-close: write a single
             // Unauthorized frame so the client surfaces a typed
             // error rather than an opaque EOF.
@@ -170,9 +166,7 @@ async fn handle_client(
             tracing::warn!(error = %e, "peer-UID lookup failed; closing connection");
             let resp = IpcResponse {
                 id: 0,
-                result: Err(IpcError::Internal(format!(
-                    "peer-UID lookup failed: {e}"
-                ))),
+                result: Err(IpcError::Internal(format!("peer-UID lookup failed: {e}"))),
             };
             if let Ok(frame) = encode_frame(&resp) {
                 let _ = stream.write_all(&frame).await;
@@ -485,7 +479,10 @@ mod tests {
         };
 
         // Shutdown is the simplest op — dispatched regardless of engine handle.
-        let req = IpcRequest { id: 7, op: IpcOp::Shutdown };
+        let req = IpcRequest {
+            id: 7,
+            op: IpcOp::Shutdown,
+        };
         let frame = encode_frame(&req).expect("encode");
         client.write_all(&frame).await.expect("write");
 
@@ -508,9 +505,8 @@ mod tests {
         let (server_end, mut client_end) = TokioUnixStream::pair().expect("socketpair");
 
         let fake_daemon_uid = u32::MAX;
-        let server_task = tokio::spawn(async move {
-            handle_client(server_end, fake_daemon_uid, None).await
-        });
+        let server_task =
+            tokio::spawn(async move { handle_client(server_end, fake_daemon_uid, None).await });
 
         let mut buf = vec![0u8; 4096];
         let n = client_end.read(&mut buf).await.expect("read");

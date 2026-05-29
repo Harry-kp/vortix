@@ -221,10 +221,7 @@ mod tests {
     fn carve_out_subnet_from_larger_block() {
         // 192.168.0.0/16 minus 192.168.50.0/24 should canonicalize to the
         // minimal CIDR cover of 192.168.0.0/16 \ 192.168.50.0/24.
-        let out = cidr_subtract(
-            &rfc1918_base(),
-            &cidrs(&["10.0.0.0/8", "192.168.50.0/24"]),
-        );
+        let out = cidr_subtract(&rfc1918_base(), &cidrs(&["10.0.0.0/8", "192.168.50.0/24"]));
         let r = rendered(&out);
         // 10/8 is fully gone. 172.16/12 is intact. 192.168/16 is carved.
         assert!(!r.iter().any(|s| s.starts_with("10.")));
@@ -264,10 +261,7 @@ mod tests {
     fn overlapping_secondaries_dont_double_subtract() {
         // 10.0.0.0/8 and 10.5.0.0/16 — the second is contained in the
         // first. Result must be identical to subtracting just 10/8.
-        let out = cidr_subtract(
-            &rfc1918_base(),
-            &cidrs(&["10.0.0.0/8", "10.5.0.0/16"]),
-        );
+        let out = cidr_subtract(&rfc1918_base(), &cidrs(&["10.0.0.0/8", "10.5.0.0/16"]));
         assert_eq!(rendered(&out), vec!["172.16.0.0/12", "192.168.0.0/16"]);
     }
 

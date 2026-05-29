@@ -117,7 +117,11 @@ impl PfFirewall {
             .collect();
         let rfc1918 = cidr_subtract(&rfc1918_base(), &secondary_cidrs);
 
-        writeln!(rules, "# Allow local network (RFC1918, minus secondaries' claimed CIDRs)").unwrap();
+        writeln!(
+            rules,
+            "# Allow local network (RFC1918, minus secondaries' claimed CIDRs)"
+        )
+        .unwrap();
         for c in &rfc1918 {
             writeln!(rules, "pass out quick to {}", fmt_cidr(c)).unwrap();
         }
