@@ -78,17 +78,18 @@ sha2 = "0.10"
 # `x11rb` / `zune-*` deps for clipboard image support we don't use;
 # disable defaults to keep binary lean.
 arboard = { version = "3.6.1", default-features = false }
-# Plan 002 U9: HTTP client for telemetry (replaces `curl` shell-outs).
-# `blocking` so we don't have to wire the existing std::thread::spawn
-# telemetry workers into the tokio runtime; `rustls-tls` to avoid pulling
-# OpenSSL into the binary; `json` for the IP-API responses. defaults are
-# the native-tls + hickory-dns stack we don't want.
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
 # Plan 002 U10: raw socket for ICMP echo (replaces `ping` shell-out).
 # Thin libc wrapper; we hand-roll the 8-byte ICMP packet + RFC 792
 # checksum and fall back to TCP-connect-port-443 when the kernel
 # refuses unprivileged ICMP.
 socket2 = "0.5"
+# Plan 002 U9 (revised): blocking HTTP for telemetry (replaces `curl`).
+# Picked `ureq` over `reqwest::blocking` because we don't share vortix's
+# tokio runtime from the std::thread-based telemetry workers anyway —
+# `reqwest::blocking`'s embedded current_thread runtime would have been
+# overhead with no upside. `rustls` to avoid OpenSSL; `json` for typed
+# IP-API responses.
+ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
 
 # System calls (for root detection + platform crates)
 [target.'cfg(unix)'.dependencies]
