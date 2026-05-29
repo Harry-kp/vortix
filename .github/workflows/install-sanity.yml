@@ -2,8 +2,10 @@ name: Installation Sanity
 
 on:
   schedule:
-    # Daily at 06:00 UTC
-    - cron: "0 6 * * *"
+    # Weekly on Monday at 06:00 UTC — install paths don't break daily on
+    # a stable release line; weekly drift detection is enough. Same-day
+    # packaging breaks are caught by the `release` trigger below.
+    - cron: "0 6 * * 1"
   release:
     types: [published]
   workflow_dispatch:
@@ -16,242 +18,127 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  cargo-install:
-    name: cargo install (${{ matrix.os }})
+  install:
+    name: install (${{ matrix.method }}, ${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
+        method: [cargo-install, shell-installer, static-binary, homebrew, npm-install]
         os: [ubuntu-latest, macos-latest]
+        exclude:
+          # static-binary is the Linux-musl release artifact; no macOS variant.
+          - method: static-binary
+            os: macos-latest
     runs-on: ${{ matrix.os }}
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Checkout (for shell-installer + static-binary)
+        if: matrix.method == 'shell-installer' || matrix.method == 'static-binary'
+        uses: actions/checkout@v4
 
-      - name: Install from crates.io
+      - name: Setup Node (npm-install)
+        if: matrix.method == 'npm-install'
+        uses: actions/setup-node@v6
+        with:
+          node-version: '20.x'
+
+      - name: Install Homebrew (Linux only — macOS ships it)
+        if: matrix.method == 'homebrew' && runner.os == 'Linux'
+        run: |
+          /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+          echo "/home/linuxbrew/.linuxbrew/bin" >> "$GITHUB_PATH"
+
+      - name: Install via cargo install (crates.io)
+        if: matrix.method == 'cargo-install'
         run: cargo install vortix
 
-      - name: Get expected version from crates.io
-        id: expected
+      - name: Install via shell installer (latest release)
+        if: matrix.method == 'shell-installer'
         run: |
-          VERSION=$(curl -s -H "User-Agent: vortix-ci (https://github.com/Harry-kp/vortix)" https://crates.io/api/v1/crates/vortix | python3 -c "import sys,json; print(json.load(sys.stdin)['crate']['max_version'])")
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Harry-kp/vortix/releases/latest/download/vortix-installer.sh | sh
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      - name: Verify --version
-        run: |
-          OUTPUT=$(vortix --version)
-          echo "Got: $OUTPUT"
-          echo "$OUTPUT" | grep -q "${{ steps.expected.outputs.version }}"
-
-      - name: Verify --help
-        run: vortix --help
-
-      - name: "Verify sudo access (Linux: expect failure before symlink)"
-        if: runner.os == 'Linux'
-        run: |
-          if sudo vortix --version 2>/dev/null; then
-            echo "ERROR: sudo vortix should NOT work without symlink on Linux"
-            exit 1
-          fi
-          echo "Confirmed: sudo vortix fails without symlink (expected)"
-
-      - name: "Verify sudo access (Linux: create symlink and retry)"
-        if: runner.os == 'Linux'
-        run: |
-          sudo ln -s "$HOME/.cargo/bin/vortix" /usr/local/bin/vortix
-          OUTPUT=$(sudo vortix --version)
-          echo "After symlink: $OUTPUT"
-
-      - name: Verify sudo access (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          OUTPUT=$(sudo vortix --version)
-          echo "sudo vortix works on macOS: $OUTPUT"
-
-  shell-installer:
-    name: Shell installer (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Run shell installer
-        run: curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Harry-kp/vortix/releases/latest/download/vortix-installer.sh | sh
-
-      - name: Add cargo bin to PATH
-        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-
-      - name: Get expected version from latest release
-        id: expected
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          VERSION=$(gh release view --repo Harry-kp/vortix --json tagName -q '.tagName' | sed 's/^v//')
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
-      - name: Verify --version
-        run: |
-          OUTPUT=$(vortix --version)
-          echo "Got: $OUTPUT"
-          echo "$OUTPUT" | grep -q "${{ steps.expected.outputs.version }}"
-
-      - name: Verify --help (shell-installer)
-        run: vortix --help
-
-      - name: "Verify sudo access (Linux: expect failure before symlink)"
-        if: runner.os == 'Linux'
-        run: |
-          if sudo vortix --version 2>/dev/null; then
-            echo "ERROR: sudo vortix should NOT work without symlink on Linux"
-            exit 1
-          fi
-          echo "Confirmed: sudo vortix fails without symlink (expected)"
-
-      - name: "Verify sudo access (Linux: create symlink and retry)"
-        if: runner.os == 'Linux'
-        run: |
-          sudo ln -s "$HOME/.cargo/bin/vortix" /usr/local/bin/vortix
-          OUTPUT=$(sudo vortix --version)
-          echo "After symlink: $OUTPUT"
-
-      - name: Verify sudo access (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          OUTPUT=$(sudo vortix --version)
-          echo "sudo vortix works on macOS: $OUTPUT"
-
-  static-binary:
-    name: Static binary (Linux musl)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Get latest release tag
-        id: release
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Install static musl binary (Linux release artifact)
+        if: matrix.method == 'static-binary'
         run: |
           TAG=$(gh release view --repo Harry-kp/vortix --json tagName -q '.tagName')
-          VERSION="${TAG#v}"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
-      - name: Download and extract musl binary
-        run: |
-          curl -LO "https://github.com/Harry-kp/vortix/releases/download/${{ steps.release.outputs.tag }}/vortix-x86_64-unknown-linux-musl.tar.xz"
+          curl -LO "https://github.com/Harry-kp/vortix/releases/download/${TAG}/vortix-x86_64-unknown-linux-musl.tar.xz"
           tar -xf vortix-x86_64-unknown-linux-musl.tar.xz
           chmod +x vortix-x86_64-unknown-linux-musl/vortix
+          sudo cp vortix-x86_64-unknown-linux-musl/vortix /usr/local/bin/vortix
+
+      - name: Install from Homebrew tap
+        if: matrix.method == 'homebrew'
+        run: brew install Harry-kp/tap/vortix
+
+      - name: Install from npm
+        if: matrix.method == 'npm-install'
+        run: npm install -g @harry-kp/vortix
+
+      - name: Determine expected version
+        id: expected
+        run: |
+          if [ "$METHOD" = "cargo-install" ]; then
+            VERSION=$(curl -s -H "User-Agent: vortix-ci (https://github.com/Harry-kp/vortix)" https://crates.io/api/v1/crates/vortix | python3 -c "import sys,json; print(json.load(sys.stdin)['crate']['max_version'])")
+          else
+            VERSION=$(gh release view --repo Harry-kp/vortix --json tagName -q '.tagName' | sed 's/^v//')
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+        env:
+          METHOD: ${{ matrix.method }}
 
       - name: Verify --version
+        env:
+          EXPECTED: ${{ steps.expected.outputs.version }}
         run: |
-          OUTPUT=$(./vortix-x86_64-unknown-linux-musl/vortix --version)
+          OUTPUT=$(vortix --version)
           echo "Got: $OUTPUT"
-          echo "$OUTPUT" | grep -q "${{ steps.release.outputs.version }}"
+          echo "$OUTPUT" | grep -q "$EXPECTED"
 
       - name: Verify --help
-        run: ./vortix-x86_64-unknown-linux-musl/vortix --help
+        run: vortix --help
 
-      - name: Verify sudo access (copy to /usr/local/bin)
+      - name: "Verify sudo (Linux: cargo-install + shell-installer need symlink)"
+        if: runner.os == 'Linux' && (matrix.method == 'cargo-install' || matrix.method == 'shell-installer')
         run: |
-          sudo cp vortix-x86_64-unknown-linux-musl/vortix /usr/local/bin/vortix
+          if sudo vortix --version 2>/dev/null; then
+            echo "ERROR: sudo vortix should NOT work without symlink on Linux"
+            exit 1
+          fi
+          echo "Confirmed: sudo vortix fails without symlink (expected)"
+          sudo ln -s "$HOME/.cargo/bin/vortix" /usr/local/bin/vortix
           OUTPUT=$(sudo vortix --version)
-          echo "sudo vortix works: $OUTPUT"
+          echo "After symlink: $OUTPUT"
+
+      - name: "Verify sudo (Linux: static-binary already in /usr/local/bin)"
+        if: runner.os == 'Linux' && matrix.method == 'static-binary'
+        run: |
+          OUTPUT=$(sudo vortix --version)
+          echo "sudo vortix works (static-binary copied to /usr/local/bin): $OUTPUT"
+
+      - name: Verify sudo (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          OUTPUT=$(sudo vortix --version)
+          echo "sudo vortix works on macOS: $OUTPUT"
 
   arch-linux:
-    name: Arch Linux (pacman)
+    name: install (arch-linux)
     runs-on: ubuntu-latest
     container:
       image: archlinux:latest
     steps:
       - name: Install vortix from extra repo
-        run: |
-          pacman -Syu --noconfirm vortix
-
+        run: pacman -Syu --noconfirm vortix
       - name: Verify --version
         run: |
           OUTPUT=$(vortix --version)
-          echo "Got: $OUTPUT"
-          # Log version but don't assert -- Arch package may lag behind
           echo "Arch package version: $OUTPUT"
-
       - name: Verify --help
         run: vortix --help
-
       - name: Verify binary is in system PATH
         run: |
           LOCATION=$(command -v vortix)
           echo "Installed at: $LOCATION"
-          # pacman may install to /usr/bin or /usr/sbin
           echo "$LOCATION" | grep -qE "^/usr/(s?bin)/vortix$"
-
-  homebrew:
-    name: Homebrew (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, ubuntu-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - name: Install Homebrew (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-          echo "/home/linuxbrew/.linuxbrew/bin" >> "$GITHUB_PATH"
-
-      - name: Install vortix from tap
-        run: brew install Harry-kp/tap/vortix
-
-      - name: Get expected version from latest release
-        id: expected
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          VERSION=$(gh release view --repo Harry-kp/vortix --json tagName -q '.tagName' | sed 's/^v//')
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
-      - name: Verify --version
-        run: |
-          OUTPUT=$(vortix --version)
-          echo "Got: $OUTPUT"
-          echo "$OUTPUT" | grep -q "${{ steps.expected.outputs.version }}"
-
-      - name: Verify --help
-        run: vortix --help
-
-      - name: Verify binary is in Homebrew PATH
-        run: |
-          LOCATION=$(command -v vortix)
-          echo "Installed at: $LOCATION"
-
-  npm-install:
-    name: npm install (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/setup-node@v6
-        with:
-          node-version: '20.x'
-
-      - name: Install vortix from npm
-        run: npm install -g @harry-kp/vortix
-
-      - name: Get expected version from latest release
-        id: expected
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          VERSION=$(gh release view --repo Harry-kp/vortix --json tagName -q '.tagName' | sed 's/^v//')
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
-      - name: Verify --version
-        run: |
-          OUTPUT=$(vortix --version)
-          echo "Got: $OUTPUT"
-          echo "$OUTPUT" | grep -q "${{ steps.expected.outputs.version }}"
-
-      - name: Verify --help
-        run: vortix --help
