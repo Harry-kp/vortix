@@ -293,60 +293,40 @@ impl App {
         0
     }
 
-    /// Copy public IP address to clipboard
+    /// Copy public IP address to clipboard.
+    ///
+    /// Plan 002 U8: replaced platform-specific shell-outs (pbcopy on
+    /// macOS; xclip/wl-copy/xsel on Linux) with the `arboard` crate,
+    /// which auto-detects the platform clipboard backend. Users no
+    /// longer need any of those binaries installed.
     pub(crate) fn copy_ip_to_clipboard(&mut self) {
         let ip_str = self.runtime.public_ip.clone();
         if ip_str.is_empty() || ip_str == constants::MSG_FETCHING || ip_str.starts_with("Error") {
             self.show_toast("No valid IP available yet".to_string(), ToastType::Error);
             return;
         }
-        #[cfg(target_os = "macos")]
-        // xtask:allow-platform-cfg: pbcopy is macOS-only; future Clipboard port
-        {
-            use crate::vortix_process::CommandSpec;
-            if crate::vortix_process::run_to_output(
-                CommandSpec::oneshot("pbcopy", vec![]).stdin(ip_str.as_bytes().to_vec()),
-            )
-            .is_ok()
-            {
-                self.show_toast(format!("Copied IP: {ip_str}"), ToastType::Success);
-                return;
-            }
-        }
-        #[cfg(target_os = "linux")]
-        // xtask:allow-platform-cfg: wl-copy/xclip/xsel selection is Linux-only; future Clipboard port
-        {
-            use crate::vortix_process::CommandSpec;
-            // Wayland-first: try wl-copy when $WAYLAND_DISPLAY is set,
-            // then fall back to X11 tools (xclip, xsel).
-            let is_wayland = std::env::var("WAYLAND_DISPLAY").is_ok();
-            let tools: &[(&str, &[&str])] = if is_wayland {
-                &[
-                    ("wl-copy", &[]),
-                    ("xclip", &["-selection", "clipboard"]),
-                    ("xsel", &["--clipboard", "--input"]),
-                ]
-            } else {
-                &[
-                    ("xclip", &["-selection", "clipboard"]),
-                    ("xsel", &["--clipboard", "--input"]),
-                    ("wl-copy", &[]),
-                ]
-            };
-            for (cmd, args) in tools {
-                let owned_args: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
-                if let Ok(o) = crate::vortix_process::run_to_output(
-                    CommandSpec::oneshot(*cmd, owned_args).stdin(ip_str.as_bytes().to_vec()),
-                ) {
-                    if o.status.success() {
-                        self.show_toast(format!("Copied IP: {ip_str}"), ToastType::Success);
-                        return;
-                    }
+        match arboard::Clipboard::new() {
+            Ok(mut clipboard) => match clipboard.set_text(ip_str.clone()) {
+                Ok(()) => {
+                    self.show_toast(format!("Copied IP: {ip_str}"), ToastType::Success);
                 }
+                Err(e) => {
+                    self.show_toast(
+                        format!("Failed to copy to clipboard: {e}"),
+                        ToastType::Error,
+                    );
+                }
+            },
+            Err(e) => {
+                // Common in headless environments (CI, SSH without
+                // X-forwarding). Match the prior implementation's
+                // soft-fail behavior.
+                self.show_toast(
+                    format!("Clipboard unavailable: {e}"),
+                    ToastType::Error,
+                );
             }
         }
-        #[allow(unreachable_code)]
-        self.show_toast("Failed to copy to clipboard".to_string(), ToastType::Error);
     }
 
     /// Append log entry to file with automatic rotation

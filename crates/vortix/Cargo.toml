@@ -74,6 +74,10 @@ argon2 = { workspace = true }
 zeroize = { workspace = true }
 rand = "0.8"
 sha2 = "0.10"
+# Plan 002 U8: text-only clipboard. Image features pull in `image` /
+# `x11rb` / `zune-*` deps for clipboard image support we don't use;
+# disable defaults to keep binary lean.
+arboard = { version = "3.6.1", default-features = false }
 
 # System calls (for root detection + platform crates)
 [target.'cfg(unix)'.dependencies]
