@@ -6,6 +6,8 @@ Shipped in: v&lt;version&gt;
 
 Checks that automated tests cannot cover — real kernels, real subprocesses, real terminals, real adversaries.
 
+> Run the automated CI-parity check set from [`docs/ci-parity.md`](../ci-parity.md) first. This guide is only useful once those pass.
+
 ## Setup prerequisites
 
 - [ ] &lt;real WG profile / OVPN profile / dev machine / etc.&gt;

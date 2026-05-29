@@ -9,6 +9,10 @@ Use these guides:
 - **For release smoke tests** — pull in every guide for the units shipped that release
 - **When debugging** a regression — the checklist is also a map of the feature's observable surface
 
+## Run automated checks first
+
+Manual testing is for things automated checks **can't** cover. Before you start on a guide, make sure the full automated set passes locally. The canonical "what CI runs" command set lives in [`docs/ci-parity.md`](../ci-parity.md). If those don't pass, the manual run is wasted work — CI will block the merge anyway.
+
 ## Conventions
 
 - One file per feature / plan, named after the plan slug (e.g. `multi-connection.md` for plan `001-feat-multi-connection`)
