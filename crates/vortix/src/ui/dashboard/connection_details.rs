@@ -18,8 +18,8 @@ use ratatui::{
 /// Multi-connection plan U6 Stage B: looks up the snapshot for the
 /// currently-selected profile (focused via the sidebar's
 /// `profile_list_state`). Telemetry rows scope to the primary tunnel per
-/// H7 — when the focused profile is a secondary the panel renders
-/// "Latency: n/a (secondary tunnel)" instead of primary-scoped metrics.
+/// H7 — when the focused profile is a split-tunnel row the panel renders
+/// "Latency: n/a (split tunnel)" instead of primary-scoped metrics.
 #[allow(clippy::too_many_lines, clippy::similar_names)]
 pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     let is_focused = app.should_draw_focus(&crate::app::FocusedPanel::ConnectionDetails);
@@ -294,13 +294,14 @@ fn render_connected(
             ),
         ]));
     } else {
-        // H7: telemetry is primary-only. Secondaries explicitly say so.
+        // H7: telemetry is primary-only. Split-tunnel rows explicitly say so.
+        // Plain-English copy: "split tunnel" is the industry-standard term
+        // users meet in corporate VPN clients; "secondary tunnel" was
+        // plan-internal jargon (R-IDs / "primary vs secondary tunnel role")
+        // that didn't translate to a user audience.
         text.push(Line::from(vec![
             Span::styled("Latency: ", Style::default().fg(theme::TEXT_SECONDARY)),
-            Span::styled(
-                "n/a (secondary tunnel)",
-                Style::default().fg(theme::INACTIVE),
-            ),
+            Span::styled("n/a (split tunnel)", Style::default().fg(theme::INACTIVE)),
         ]));
     }
 
@@ -514,13 +515,24 @@ fn render_disconnected(frame: &mut Frame, app: &App, inner: Rect) {
     frame.render_widget(Paragraph::new(text), inner);
 }
 
-/// Format a [`Role`] as a single `Role: ...` line. Mirrors the variants
-/// catalogued in plan U17:
-/// * `Primary (<cidrs>)` — owns kernel default route
-/// * `Addressable (<cidrs>)` — declared specific CIDR(s)
-/// * `Addressable (multi)` — multiple disjoint CIDRs
-/// * `Addressable (0.0.0.0/0, suppressed)` — declares 0/0 but another
-///   tunnel currently holds the default route
+/// Format a [`Role`] as a single `Role: ...` line.
+///
+/// The internal `Role` enum keeps the plan U17 taxonomy
+/// (`Primary` / `Addressable` / `AddressableSuppressed` / `Reconnecting` /
+/// `AwaitingInput`) so xtask boundary checks + JSON output stay
+/// stable. User-facing copy uses the industry-standard plain-English
+/// "split tunnel" terminology — "Addressable" is academic jargon
+/// that doesn't communicate "routes only specific subnets" to most
+/// users.
+///
+/// Rendered shapes:
+/// * `Primary (<cidrs>)` — owns kernel default route; carries all
+///   internet traffic
+/// * `Split tunnel (<cidrs>)` — routes only the listed subnets;
+///   other traffic uses the underlay
+/// * `Split tunnel (0.0.0.0/0, yielded)` — declared a default route
+///   but another tunnel currently holds it; "yielded" is the plain-
+///   English equivalent of the prior "suppressed"
 /// * `Reconnecting via <last role>` — carries pre-drop role
 /// * `n/a (awaiting input)` — `AwaitingInput`
 fn role_line(role: &Role) -> Line<'static> {
@@ -530,14 +542,11 @@ fn role_line(role: &Role) -> Line<'static> {
             theme::NORD_GREEN,
         ),
         Role::Addressable { allowed_ips } => (
-            format!("Addressable ({})", format_role_cidrs(allowed_ips)),
+            format!("Split tunnel ({})", format_role_cidrs(allowed_ips)),
             theme::ACCENT_PRIMARY,
         ),
         Role::AddressableSuppressed { allowed_ips } => (
-            format!(
-                "Addressable ({}, suppressed)",
-                format_role_cidrs(allowed_ips)
-            ),
+            format!("Split tunnel ({}, yielded)", format_role_cidrs(allowed_ips)),
             theme::NORD_YELLOW,
         ),
         Role::Reconnecting { prior_role } => (
@@ -556,8 +565,8 @@ fn role_line(role: &Role) -> Line<'static> {
 fn role_kind_label(role: &Role) -> String {
     match role {
         Role::Primary { .. } => "Primary".to_string(),
-        Role::Addressable { .. } => "Addressable".to_string(),
-        Role::AddressableSuppressed { .. } => "Addressable (suppressed)".to_string(),
+        Role::Addressable { .. } => "Split tunnel".to_string(),
+        Role::AddressableSuppressed { .. } => "Split tunnel (yielded)".to_string(),
         Role::Reconnecting { .. } => "Reconnecting".to_string(),
         Role::AwaitingInput => "awaiting input".to_string(),
     }
@@ -872,7 +881,13 @@ mod tests {
             allowed_ips: vec![v4("10.0.0.0/8")],
         });
         let s: String = l.spans.iter().map(|sp| sp.content.as_ref()).collect();
-        assert!(s.contains("Addressable"));
+        // User-facing copy: industry-standard "split tunnel" instead
+        // of the plan-internal "Addressable" jargon.
+        assert!(
+            s.contains("Split tunnel"),
+            "missing 'Split tunnel' label: {s}"
+        );
+        assert!(!s.contains("Addressable"), "internal jargon leaked: {s}");
         assert!(s.contains("10.0.0.0/8"));
     }
 
@@ -891,7 +906,16 @@ mod tests {
             allowed_ips: vec![v4("0.0.0.0/0")],
         });
         let s: String = l.spans.iter().map(|sp| sp.content.as_ref()).collect();
-        assert!(s.contains("suppressed"), "missing suppressed marker: {s}");
+        // User-facing copy uses "yielded" (plain English) instead of
+        // the plan's "suppressed" jargon. Both convey "this tunnel
+        // declared a default route but another took it".
+        assert!(
+            s.contains("Split tunnel"),
+            "missing 'Split tunnel' label: {s}"
+        );
+        assert!(s.contains("yielded"), "missing 'yielded' marker: {s}");
+        assert!(!s.contains("Addressable"), "internal jargon leaked: {s}");
+        assert!(!s.contains("suppressed"), "internal jargon leaked: {s}");
         assert!(s.contains("0.0.0.0/0"), "missing CIDR: {s}");
     }
 
@@ -986,11 +1010,27 @@ mod tests {
             .insert(ProfileId::new("lab"), engine, vec![v4("10.0.0.0/8")]);
 
         let out = render_to_string(&mut app, 80, 20);
+        // User-facing copy: "Split tunnel" replaces "Addressable".
         assert!(
-            out.contains("Addressable"),
-            "Addressable role missing:\n{out}"
+            out.contains("Split tunnel"),
+            "Split tunnel role missing:\n{out}"
+        );
+        assert!(
+            !out.contains("Addressable"),
+            "internal jargon leaked to user-facing render:\n{out}"
         );
         assert!(out.contains("10.0.0.0/8"), "CIDR missing:\n{out}");
+        // Latency row on a split-tunnel profile must use plain-English
+        // "split tunnel" copy — the previous "secondary tunnel" wording
+        // wasn't a term users encounter outside the codebase.
+        assert!(
+            out.contains("n/a (split tunnel)"),
+            "Latency copy must be 'n/a (split tunnel)':\n{out}"
+        );
+        assert!(
+            !out.contains("secondary tunnel"),
+            "internal jargon leaked to user-facing render:\n{out}"
+        );
     }
 
     #[test]
