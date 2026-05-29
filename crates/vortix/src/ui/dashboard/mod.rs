@@ -275,38 +275,66 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
             //
             // The plain-English replacement explains the actual
             // outcome: both stay up, only the "active exit" changes.
-            let max = 24;
-            let from_t = utils::truncate(from, max);
-            let to_t = utils::truncate(to_name, max);
+            let max = 22;
+            let from_t1 = utils::truncate(from, max);
+            let from_t2 = utils::truncate(from, max);
+            let to_t1 = utils::truncate(to_name, max);
+            let to_t2 = utils::truncate(to_name, max);
+            let to_t3 = utils::truncate(to_name, max);
             confirm_dialog::render(
                 frame,
                 ConfirmDialogConfig {
-                    title: " Switch VPN exit? ",
+                    title: " Already connected ",
                     body: vec![
+                        Line::from(vec![
+                            Span::styled(to_t1, Style::default().fg(theme::SUCCESS)),
+                            Span::styled(
+                                " also wants to send all your",
+                                Style::default().fg(theme::TEXT_SECONDARY),
+                            ),
+                        ]),
                         Line::from(vec![Span::styled(
-                            "Both tunnels route all traffic.",
+                            "internet through it.",
                             Style::default().fg(theme::TEXT_SECONDARY),
                         )]),
+                        Line::from(""),
                         Line::from(vec![
-                            Span::styled("Make ", Style::default().fg(theme::TEXT_SECONDARY)),
-                            Span::styled(to_t, Style::default().fg(theme::SUCCESS)),
                             Span::styled(
-                                " the active exit?",
-                                Style::default().fg(theme::TEXT_SECONDARY),
+                                "[Y] Use ",
+                                Style::default()
+                                    .fg(theme::SUCCESS)
+                                    .add_modifier(ratatui::style::Modifier::BOLD),
                             ),
+                            Span::styled(to_t2, Style::default().fg(theme::SUCCESS)),
+                            Span::styled("; keep ", Style::default().fg(theme::TEXT_SECONDARY)),
+                            Span::styled(from_t1, Style::default().fg(theme::ACCENT_PRIMARY)),
+                            Span::styled(" too", Style::default().fg(theme::TEXT_SECONDARY)),
                         ]),
                         Line::from(vec![
-                            Span::styled(from_t, Style::default().fg(theme::ACCENT_PRIMARY)),
                             Span::styled(
-                                " stays connected as split tunnel.",
+                                "[S] Disconnect ",
+                                Style::default()
+                                    .fg(theme::WARNING)
+                                    .add_modifier(ratatui::style::Modifier::BOLD),
+                            ),
+                            Span::styled(from_t2, Style::default().fg(theme::ACCENT_PRIMARY)),
+                            Span::styled(
+                                " first, then ",
                                 Style::default().fg(theme::TEXT_SECONDARY),
                             ),
+                            Span::styled(to_t3, Style::default().fg(theme::SUCCESS)),
                         ]),
+                        Line::from(vec![Span::styled(
+                            "[N] Cancel",
+                            Style::default()
+                                .fg(theme::TEXT_SECONDARY)
+                                .add_modifier(ratatui::style::Modifier::BOLD),
+                        )]),
                     ],
                     border_color: theme::WARNING,
                     confirm_selected: *confirm_selected,
-                    width: 56,
-                    height: 8,
+                    width: 60,
+                    height: 11,
                 },
             );
         }

@@ -354,6 +354,65 @@ fn test_toggle_connected_different_profile_shows_confirm() {
 }
 
 #[test]
+fn takeover_s_key_dispatches_legacy_switch_and_connect_path() {
+    // Users who want the pre-multi-tunnel "switch VPNs" behavior
+    // (disconnect current, then connect new) press [S] on the
+    // takeover overlay. Distinct from [Y]es which keeps both
+    // connected.
+    let mut app = test_app();
+    add_profiles(&mut app, &["vpn-a", "vpn-b"]);
+    set_connected(&mut app, "vpn-a");
+
+    app.toggle_connection(1);
+    assert!(
+        matches!(
+            app.input_mode,
+            InputMode::ConfirmDefaultRouteTakeover { .. }
+        ),
+        "expected takeover overlay open"
+    );
+
+    // Send the [S] keypress.
+    app.handle_key(key_char('s'));
+
+    // Behavior contract: disconnect path fires. pending_connect
+    // queues vpn-b for after teardown; legacy state transitions to
+    // Disconnecting (single-tunnel "switch" semantics).
+    assert_eq!(
+        app.runtime.pending_connect,
+        Some(1),
+        "vpn-b should be queued for after-disconnect connect"
+    );
+    assert!(
+        matches!(
+            app.runtime.connection_state,
+            ConnectionState::Disconnecting { .. }
+        ),
+        "expected Disconnecting state, got {:?}",
+        app.runtime.connection_state
+    );
+    // Overlay closes after the keypress is handled.
+    assert!(matches!(app.input_mode, InputMode::Normal));
+}
+
+#[test]
+fn takeover_capital_s_also_dispatches_switch() {
+    // Case-insensitive: [S] should work whether shift is held or not.
+    let mut app = test_app();
+    add_profiles(&mut app, &["vpn-a", "vpn-b"]);
+    set_connected(&mut app, "vpn-a");
+    app.toggle_connection(1);
+
+    app.handle_key(key_char('S'));
+
+    assert_eq!(app.runtime.pending_connect, Some(1));
+    assert!(matches!(
+        app.runtime.connection_state,
+        ConnectionState::Disconnecting { .. }
+    ));
+}
+
+#[test]
 fn test_toggle_connected_same_profile_disconnects_without_pending() {
     let mut app = test_app();
     add_profiles(&mut app, &["vpn-a"]);

@@ -64,7 +64,7 @@ impl App {
                 self.input_mode = InputMode::Normal;
                 if let Some(profile) = self.runtime.profiles.get(idx) {
                     self.log(&format!(
-                        "ACTION: Default-route takeover confirmed; connecting '{}' as new exit",
+                        "ACTION: Switching active exit to '{}'; both tunnels stay connected",
                         profile.name
                     ));
                 }
@@ -79,6 +79,23 @@ impl App {
                 // connect with the `detect_conflict` gate bypassed.
                 self.runtime.pending_connect = None;
                 self.connect_profile_forced(idx);
+            }
+            Message::SwitchExclusiveAndConnect { idx } => {
+                // User chose the legacy "switch VPNs" path on the
+                // takeover overlay: disconnect the current tunnel,
+                // queue the new one to fire once teardown completes.
+                // This is the pre-multi-tunnel UX preserved as an
+                // opt-in `[S]` hotkey for users who don't want both
+                // VPNs active at once.
+                self.input_mode = InputMode::Normal;
+                if let Some(profile) = self.runtime.profiles.get(idx) {
+                    self.log(&format!(
+                        "ACTION: Disconnecting current tunnel before connecting '{}'",
+                        profile.name
+                    ));
+                }
+                self.runtime.pending_connect = Some(idx);
+                self.disconnect();
             }
             Message::ConfirmRouteOverlap { idx } => {
                 self.input_mode = InputMode::Normal;

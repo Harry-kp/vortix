@@ -217,34 +217,54 @@ impl App {
                 to_profile_id,
                 mut confirm_selected,
                 ..
-            } => match handle_confirm_keys(key, &mut confirm_selected) {
-                ConfirmAction::Confirmed => {
-                    // Resolve back to index for the existing message shape.
-                    // Index is preferred over ProfileId at the Message
-                    // boundary because the downstream `connect_profile_forced`
-                    // is indexed; future units can move this to ProfileId.
+            } => {
+                // Side hotkey: `[S]` / `[s]` fires the legacy
+                // single-tunnel "switch" path (disconnect old, then
+                // connect new). Distinct from `[Y]es` which keeps
+                // both tunnels active per plan SC3. Documented in the
+                // overlay body so users see all three choices.
+                if matches!(key.code, KeyCode::Char('s' | 'S')) {
                     let idx = self
                         .runtime
                         .profiles
                         .iter()
                         .position(|p| p.name == to_profile_id.as_str());
                     if let Some(i) = idx {
-                        self.handle_message(Message::ConfirmDefaultRouteTakeover { idx: i });
+                        self.handle_message(Message::SwitchExclusiveAndConnect { idx: i });
                     } else {
                         self.handle_message(Message::CloseOverlay);
                     }
+                    return;
                 }
-                ConfirmAction::Cancelled => self.handle_message(Message::CloseOverlay),
-                ConfirmAction::None => {
-                    if let InputMode::ConfirmDefaultRouteTakeover {
-                        confirm_selected: cs,
-                        ..
-                    } = &mut self.input_mode
-                    {
-                        *cs = confirm_selected;
+                match handle_confirm_keys(key, &mut confirm_selected) {
+                    ConfirmAction::Confirmed => {
+                        // Resolve back to index for the existing message shape.
+                        // Index is preferred over ProfileId at the Message
+                        // boundary because the downstream `connect_profile_forced`
+                        // is indexed; future units can move this to ProfileId.
+                        let idx = self
+                            .runtime
+                            .profiles
+                            .iter()
+                            .position(|p| p.name == to_profile_id.as_str());
+                        if let Some(i) = idx {
+                            self.handle_message(Message::ConfirmDefaultRouteTakeover { idx: i });
+                        } else {
+                            self.handle_message(Message::CloseOverlay);
+                        }
+                    }
+                    ConfirmAction::Cancelled => self.handle_message(Message::CloseOverlay),
+                    ConfirmAction::None => {
+                        if let InputMode::ConfirmDefaultRouteTakeover {
+                            confirm_selected: cs,
+                            ..
+                        } = &mut self.input_mode
+                        {
+                            *cs = confirm_selected;
+                        }
                     }
                 }
-            },
+            }
             InputMode::ConfirmRouteOverlap {
                 to_profile_id,
                 mut confirm_selected,

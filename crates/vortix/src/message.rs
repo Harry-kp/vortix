@@ -80,8 +80,14 @@ pub enum Message {
     ConfirmDelete,
     /// Confirm default-route takeover (multi-connection plan #001 U7 —
     /// formerly `ConfirmSwitch`). User accepted the overlay; retry the
-    /// connect with `force=true`.
+    /// connect with `force=true`. Both tunnels stay connected per
+    /// plan SC3 ("primary inverts").
     ConfirmDefaultRouteTakeover { idx: usize },
+    /// User chose the legacy single-tunnel "switch" path on the
+    /// default-route takeover overlay: disconnect the current tunnel
+    /// first, then connect the new one. Fired by the `[S]` hotkey on
+    /// the overlay (distinct from `[Y]es` which keeps both tunnels up).
+    SwitchExclusiveAndConnect { idx: usize },
     /// Confirm route-overlap (multi-connection plan #001 U7, R10). User
     /// accepted the AllowedIPs-overlap overlay; retry the connect with
     /// `force=true`.
