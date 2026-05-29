@@ -463,12 +463,16 @@ impl App {
             }
         }
 
-        // 4. Persist state
+        // 4. Persist state (multi-connection U11: V2 schema carries
+        // active_tunnels derived from the current connection so
+        // recovery on next launch can reconstruct the per-tunnel
+        // ruleset).
+        let active = build_active_tunnels_from_state(&self.engine.connection_state);
+        let persisted_tunnels = crate::core::killswitch::persisted_from_active(&active);
         let _ = crate::core::killswitch::save_state(
             self.engine.killswitch_mode,
             self.engine.killswitch_state,
-            None,
-            None,
+            persisted_tunnels,
         );
     }
 
@@ -818,7 +822,7 @@ impl App {
 /// connected tunnel (if any) contributes; everything else collapses to
 /// the empty slice. The single tunnel is always treated as primary —
 /// declared CIDRs are not yet plumbed through `ConnectionState`.
-fn build_active_tunnels_from_state(
+pub(crate) fn build_active_tunnels_from_state(
     state: &ConnectionState,
 ) -> Vec<crate::core::killswitch::ActiveTunnelInfo> {
     use crate::core::killswitch::ActiveTunnelInfo;

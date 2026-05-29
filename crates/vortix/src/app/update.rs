@@ -551,11 +551,13 @@ impl App {
         }
 
         // Save state for recovery
+        let active =
+            super::connection::build_active_tunnels_from_state(&self.engine.connection_state);
+        let persisted_tunnels = crate::core::killswitch::persisted_from_active(&active);
         let _ = crate::core::killswitch::save_state(
             self.engine.killswitch_mode,
             self.engine.killswitch_state,
-            None,
-            None,
+            persisted_tunnels,
         );
     }
 
@@ -567,11 +569,13 @@ impl App {
         // should tear them down.
         //
         // Kill switch state is saved so the next launch can recover it.
+        let active =
+            super::connection::build_active_tunnels_from_state(&self.engine.connection_state);
+        let persisted_tunnels = crate::core::killswitch::persisted_from_active(&active);
         let _ = crate::core::killswitch::save_state(
             self.engine.killswitch_mode,
             self.engine.killswitch_state,
-            None,
-            None,
+            persisted_tunnels,
         );
         self.should_quit = true;
     }

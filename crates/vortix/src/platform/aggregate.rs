@@ -502,6 +502,38 @@ impl Platform {
         }
     }
 
+    /// Live network-interface enumeration (plan multi-connection U11).
+    ///
+    /// Dispatches to the per-OS free function — Linux reads
+    /// `/sys/class/net/`, macOS parses `ifconfig -l`, Windows currently
+    /// returns an empty list (stub). Used by the killswitch
+    /// `PersistedState` V2 migration to drop phantom tunnel entries
+    /// whose interface no longer exists in the kernel.
+    ///
+    /// Returns an empty `Vec` when enumeration fails or the platform
+    /// has no implementation. Callers should treat an empty list as
+    /// "unknown" rather than "no interfaces present" — see
+    /// `core::killswitch::filter_phantom_tunnels`.
+    #[must_use]
+    pub fn available_network_interfaces(&self) -> Vec<String> {
+        #[cfg(target_os = "linux")]
+        {
+            platform_impl::interface_list::available_network_interfaces()
+        }
+        #[cfg(target_os = "macos")]
+        {
+            platform_impl::interface_list::available_network_interfaces()
+        }
+        #[cfg(target_os = "windows")]
+        {
+            platform_impl::interface_list::available_network_interfaces()
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        {
+            Vec::new()
+        }
+    }
+
     /// Construct an all-mock platform for unit tests.
     #[must_use]
     pub fn for_test() -> Self {
