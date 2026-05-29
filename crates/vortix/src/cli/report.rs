@@ -205,8 +205,8 @@ fn get_os_info() -> String {
     #[cfg(target_os = "macos")]
     // xtask:allow-platform-cfg: bug-report OS info is intrinsically OS-specific
     {
-        let version = cmd_stdout("sw_vers", &["-productVersion"]).unwrap_or_default();
-        let kernel = cmd_stdout("uname", &["-r"]).unwrap_or_default();
+        let version = macos_product_version().unwrap_or_default();
+        let kernel = uname_release().unwrap_or_default();
         if version.is_empty() {
             format!("macOS (Darwin {kernel})")
         } else {
@@ -218,13 +218,78 @@ fn get_os_info() -> String {
     // xtask:allow-platform-cfg: bug-report OS info is intrinsically OS-specific
     {
         let distro = linux_distro_name().unwrap_or_else(|| "Linux".to_string());
-        let kernel = cmd_stdout("uname", &["-r"]).unwrap_or_default();
+        let kernel = uname_release().unwrap_or_default();
         if kernel.is_empty() {
             distro
         } else {
             format!("{distro} (kernel {kernel})")
         }
     }
+}
+
+/// Read the `release` field from `libc::uname` — equivalent to `uname -r`.
+///
+/// Replaces the shell-out to `uname` in `get_os_info`. Pure libc; no
+/// PATH dependency; ~10× faster than spawning a subprocess.
+///
+/// Plan 002 U3.
+#[cfg(unix)] // xtask:allow-platform-cfg: utsname is a Unix concept
+fn uname_release() -> Option<String> {
+    // SAFETY: `libc::uname` writes a `utsname` struct's worth of bytes
+    // into the pointer we provide. We pass a zero-initialised stack
+    // buffer of exactly the right size; the kernel cannot write past
+    // it. Return value is 0 on success, -1 on failure.
+    #[allow(unsafe_code)]
+    unsafe {
+        let mut buf: libc::utsname = std::mem::zeroed();
+        if libc::uname(&mut buf) != 0 {
+            return None;
+        }
+        // `release` is a fixed-size C char array; convert to &str via
+        // CStr to honor null termination.
+        let release_ptr = buf.release.as_ptr();
+        let cstr = std::ffi::CStr::from_ptr(release_ptr);
+        cstr.to_str().ok().map(str::to_string)
+    }
+}
+
+/// Read `kern.osproductversion` via `sysctlbyname` — equivalent to
+/// `sw_vers -productVersion` on macOS (returns e.g. "14.5", "13.7.1").
+///
+/// Plan 002 U3.
+#[cfg(target_os = "macos")] // xtask:allow-platform-cfg: sw_vers replacement is intrinsically macOS-only
+fn macos_product_version() -> Option<String> {
+    use std::ffi::CString;
+    let key = CString::new("kern.osproductversion").ok()?;
+    // Preallocate enough buffer for any plausible version string.
+    // macOS product versions are at most "X.Y.Z" with single-digit
+    // components today; 64 bytes is comfortable headroom.
+    let mut buf = vec![0u8; 64];
+    let mut len = buf.len();
+
+    // SAFETY: `sysctlbyname(name, oldp, oldlenp, newp, newlen)`. We
+    // pass: name = CString-owned C-string; oldp = buf.as_mut_ptr() cast
+    // to *mut c_void; oldlenp = &mut len; newp = null (not setting);
+    // newlen = 0. The kernel writes at most `len` bytes into buf and
+    // updates len with the actual byte count written.
+    #[allow(unsafe_code)]
+    let rc = unsafe {
+        libc::sysctlbyname(
+            key.as_ptr(),
+            buf.as_mut_ptr().cast::<libc::c_void>(),
+            &raw mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    // `len` now holds the number of bytes written (including the
+    // trailing NUL). Trim to len-1 to drop the NUL before UTF-8 decode.
+    let written = len.saturating_sub(1);
+    buf.truncate(written);
+    String::from_utf8(buf).ok()
 }
 
 #[cfg(target_os = "linux")] // xtask:allow-platform-cfg: distro name lives in /etc/os-release on Linux only
@@ -637,22 +702,6 @@ fn redact_home_prefix(path: &str) -> String {
         }
     }
     path.to_string()
-}
-
-/// Run a command and return its stdout as a trimmed string.
-fn cmd_stdout(cmd: &str, args: &[&str]) -> Option<String> {
-    let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
-    let output = crate::vortix_process::run_to_output(CommandSpec::oneshot(cmd, owned)).ok()?;
-    if output.status.success() {
-        let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if s.is_empty() {
-            None
-        } else {
-            Some(s)
-        }
-    } else {
-        None
-    }
 }
 
 #[cfg(test)]
