@@ -9,12 +9,34 @@ use ratatui::{
     Frame,
 };
 
+/// Sigil legend rendered at the bottom of the panel.
+///
+/// Plan #001 U18: keep the meaning of the three primary sigils visible inline
+/// so users don't have to guess. `✗` (off / unprotected) is intentionally
+/// omitted from the legend — its meaning is conventional and the panel only
+/// pairs it with a self-explanatory headline (`Killswitch : Off`).
+const SIGIL_LEGEND: &str = "Legend: ✓ pass · ⚠ at risk · ─ not applicable";
+
 /// Render the Security Guard panel scoped to the primary tunnel.
 ///
 /// Multi-connection plan U6 Stage B: IP / DNS leak checks read from
 /// `app.registry.primary()` snapshot (the tunnel that owns the kernel
 /// default route). Secondaries don't carry IP/DNS leak posture — the
 /// primary's route table determines internet-bound exit posture per H7.
+///
+/// Plan #001 U18 layers in three behaviours:
+/// - **Primary-scoped headline:** the top banner is `PROTECTED` only when a
+///   primary exists and its IP/DNS checks pass; `PARTIAL` when active tunnels
+///   exist but none owns the default route (split-route only); `EXPOSED`
+///   when no tunnels at all.
+/// - **KS-mode-aware Killswitch line:** in the `PARTIAL` (no-primary) branch,
+///   render exactly one bullet that matches the active killswitch mode rather
+///   than three sub-bullets — the user reads a single sigil + headline to
+///   identify their protection posture.
+/// - **Honest IPv6 reporting:** the killswitch is v4-only on every supported
+///   platform today, so the IPv6 line always shows `⚠ Not enforced
+///   (v4-only killswitch)`. The previous `✓ Blocked` framing implied
+///   protection we do not actually deliver.
 #[allow(clippy::too_many_lines)]
 pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     let is_focused = app.should_draw_focus(&crate::app::FocusedPanel::Security);
@@ -41,32 +63,23 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
         .registry
         .primary()
         .and_then(|id| app.registry.snapshot(id));
-    let is_connected = matches!(
+    let primary_connected = matches!(
         primary_snap.as_ref().map(|s| &s.state),
         Some(Connection::Connected { .. })
     );
-    let ipv6_leaking = app.runtime.ipv6_leak;
+    let any_tunnels = app.registry.tunnel_count() > 0;
 
-    if !is_connected {
-        let audit = vec![
-            Line::from(vec![Span::styled(
-                " ⚠ EXPOSED ",
-                Style::default()
-                    .bg(theme::WARNING)
-                    .fg(Color::Black)
-                    .add_modifier(Modifier::BOLD),
-            )]),
-            Line::from(""),
-            Line::from(Span::styled(
-                "Your traffic is unencrypted.",
-                Style::default().fg(theme::TEXT_SECONDARY),
-            )),
-            Line::from(Span::styled(
-                "Connect to a VPN profile.",
-                Style::default().fg(theme::TEXT_SECONDARY),
-            )),
-        ];
-        frame.render_widget(Paragraph::new(audit), inner);
+    if !primary_connected {
+        // No primary means no default-route exit posture to attest to. If
+        // there are still active tunnels (split-route mode), surface PARTIAL
+        // with a KS-mode-aware Killswitch bullet so the user knows their
+        // baseline protection posture. Otherwise fall through to the
+        // existing EXPOSED copy.
+        if any_tunnels {
+            render_partial_no_primary(frame, app, inner);
+        } else {
+            render_exposed(frame, inner);
+        }
         return;
     }
 
@@ -111,15 +124,20 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
 
     let check_pass = Span::styled("✓ ", Style::default().fg(theme::SUCCESS));
     let check_fail = Span::styled("✗ ", Style::default().fg(theme::ERROR));
-    let check_warn = Span::styled("● ", Style::default().fg(theme::WARNING));
+    let check_warn = Span::styled("⚠ ", Style::default().fg(theme::WARNING));
 
     let max_val = inner.width.saturating_sub(15) as usize;
 
+    // Headline colour reflects only the checks the primary actually owns:
+    // IP masking and DNS routing. IPv6 is permanently reported as "at risk"
+    // (v4-only killswitch) and so cannot ever upgrade the headline — but
+    // also cannot drag a v4-clean exit down to PARTIAL, which would make the
+    // banner permanently misleading on every platform.
     let mut audit = vec![
         Line::from(vec![Span::styled(
             "   PROTECTED",
             Style::default()
-                .fg(if ip_masked && !dns_leaking && !ipv6_leaking {
+                .fg(if ip_masked && !dns_leaking {
                     theme::SUCCESS
                 } else {
                     theme::WARNING
@@ -213,20 +231,17 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
 
     audit.push(Line::from(""));
 
+    // IPv6 honest reporting (plan #001 U18): the killswitch is v4-only on
+    // every supported platform today. The previous `✓ Blocked` framing
+    // claimed protection the code does not implement. Report the gap
+    // verbatim so a v6 leak does not silently bypass the kill switch while
+    // the panel reassures the user everything is fine.
     audit.push(Line::from(vec![
-        if ipv6_leaking {
-            check_fail.clone()
-        } else {
-            check_pass.clone()
-        },
+        check_warn.clone(),
         Span::styled("IPv6       : ", Style::default().fg(theme::TEXT_SECONDARY)),
         Span::styled(
-            if ipv6_leaking { "Leaking" } else { "Blocked" },
-            Style::default().fg(if ipv6_leaking {
-                theme::ERROR
-            } else {
-                theme::SUCCESS
-            }),
+            "Not enforced (v4-only killswitch)",
+            Style::default().fg(theme::WARNING),
         ),
     ]));
 
@@ -280,11 +295,149 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
         Style::default().fg(Color::DarkGray),
     )]));
 
+    // Sigil legend (plan #001 U18). Rendered after `Last checked` so it sits
+    // at the visual bottom of the panel without competing with the headline
+    // for first-glance attention. The compaction loop below may drop it if
+    // the panel is short — that's intentional: legend is the lowest-priority
+    // line on a height-constrained viewport.
+    audit.push(Line::from(vec![Span::styled(
+        SIGIL_LEGEND,
+        Style::default().fg(Color::DarkGray),
+    )]));
+
     let available_height = inner.height as usize;
     if available_height > 0 && audit.len() > available_height {
         let mut compacted = Vec::with_capacity(available_height);
         let mut blank_budget = 2usize;
 
+        for line in audit {
+            let is_blank =
+                line.spans.is_empty() || line.spans.iter().all(|s| s.content.trim().is_empty());
+            if is_blank {
+                if blank_budget == 0 {
+                    continue;
+                }
+                blank_budget -= 1;
+            }
+            compacted.push(line);
+            if compacted.len() == available_height {
+                break;
+            }
+        }
+        audit = compacted;
+    }
+
+    frame.render_widget(Paragraph::new(audit), inner);
+}
+
+/// Existing "no tunnels at all" copy — extracted into a helper so the new
+/// `PARTIAL` branch can sit alongside it without nesting another two-level
+/// match inside the primary render path.
+fn render_exposed(frame: &mut Frame, inner: Rect) {
+    let audit = vec![
+        Line::from(vec![Span::styled(
+            " ⚠ EXPOSED ",
+            Style::default()
+                .bg(theme::WARNING)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Your traffic is unencrypted.",
+            Style::default().fg(theme::TEXT_SECONDARY),
+        )),
+        Line::from(Span::styled(
+            "Connect to a VPN profile.",
+            Style::default().fg(theme::TEXT_SECONDARY),
+        )),
+    ];
+    frame.render_widget(Paragraph::new(audit), inner);
+}
+
+/// `PARTIAL` (plan #001 U18) — active tunnels exist but no primary owns the
+/// default route (split-route only). The panel cannot speak to IP/DNS exit
+/// posture (there is no exit), so it limits itself to:
+///   1. A PARTIAL headline so the user does not misread the missing default
+///      route as full protection.
+///   2. A KS-mode-aware Killswitch bullet that names the active mode's
+///      protection posture in one line. Rendering all three mode bullets
+///      would force the user to identify their own mode from a sub-bulleted
+///      list — strictly worse UX.
+///   3. The honest IPv6 line (same as `PROTECTED`).
+///   4. The sigil legend.
+fn render_partial_no_primary(frame: &mut Frame, app: &App, inner: Rect) {
+    let check_pass = Span::styled("✓ ", Style::default().fg(theme::SUCCESS));
+    let check_fail = Span::styled("✗ ", Style::default().fg(theme::ERROR));
+    let check_warn = Span::styled("⚠ ", Style::default().fg(theme::WARNING));
+    let check_na = Span::styled("─ ", Style::default().fg(theme::INACTIVE));
+
+    let mut audit = vec![
+        Line::from(vec![Span::styled(
+            "   PARTIAL",
+            Style::default()
+                .fg(theme::WARNING)
+                .add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Active tunnels carry split routes only —",
+            Style::default().fg(theme::TEXT_SECONDARY),
+        )),
+        Line::from(Span::styled(
+            "internet-bound traffic still exits the LAN.",
+            Style::default().fg(theme::TEXT_SECONDARY),
+        )),
+        Line::from(""),
+    ];
+
+    // KS-mode-aware Killswitch line — render exactly the bullet for the
+    // active mode. The sigil encodes the protection level:
+    //   `✓` AlwaysOn  — actively blocking non-tunnel egress
+    //   `─` Auto      — standby, no default route to enforce on
+    //   `✗` Off       — disabled
+    let (ks_sigil, ks_text, ks_color) = match app.runtime.killswitch_mode {
+        crate::state::KillSwitchMode::AlwaysOn => (
+            check_pass.clone(),
+            "Armed (blocks all except active tunnel interfaces — secondaries still protected)",
+            theme::SUCCESS,
+        ),
+        crate::state::KillSwitchMode::Auto => (
+            check_na.clone(),
+            "Standby — no default route to enforce on",
+            theme::INACTIVE,
+        ),
+        crate::state::KillSwitchMode::Off => (check_fail.clone(), "Off", theme::ERROR),
+    };
+    audit.push(Line::from(vec![
+        ks_sigil,
+        Span::styled("Killswitch : ", Style::default().fg(theme::TEXT_SECONDARY)),
+        Span::styled(ks_text, Style::default().fg(ks_color)),
+    ]));
+
+    audit.push(Line::from(""));
+    audit.push(Line::from(vec![
+        check_warn,
+        Span::styled("IPv6       : ", Style::default().fg(theme::TEXT_SECONDARY)),
+        Span::styled(
+            "Not enforced (v4-only killswitch)",
+            Style::default().fg(theme::WARNING),
+        ),
+    ]));
+
+    audit.push(Line::from(""));
+    audit.push(Line::from(vec![Span::styled(
+        SIGIL_LEGEND,
+        Style::default().fg(Color::DarkGray),
+    )]));
+
+    // Same compaction approach as the PROTECTED branch — drop blank lines
+    // first, then truncate. Keeps the headline and KS line visible even
+    // when the panel is short.
+    let available_height = inner.height as usize;
+    if available_height > 0 && audit.len() > available_height {
+        let mut compacted = Vec::with_capacity(available_height);
+        let mut blank_budget = 2usize;
         for line in audit {
             let is_blank =
                 line.spans.is_empty() || line.spans.iter().all(|s| s.content.trim().is_empty());
@@ -383,4 +536,222 @@ fn render_back(frame: &mut Frame, app: &App, area: Rect, border_style: Style) {
     let mut text = text;
     text.truncate(max_lines);
     frame.render_widget(Paragraph::new(text), inner);
+}
+
+#[cfg(test)]
+mod tests {
+    //! Plan #001 U18 — Security Guard becomes primary-scoped, gains a
+    //! PARTIAL no-primary branch, reports IPv6 honestly, and grows a sigil
+    //! legend.
+    //!
+    //! These tests render the panel into a `TestBackend` buffer and assert
+    //! on the resulting text. Asserting on rendered glyphs (rather than
+    //! probing intermediate `Line` vectors) is what the user actually sees
+    //! and survives refactors of the line-construction code.
+    //!
+    //! The PROTECTED branch is intentionally not exercised here: driving an
+    //! FSM into `Connection::Connected` requires either the registry's
+    //! test-only `with_route_probe` constructor (private to that module) or
+    //! a real platform route probe (non-deterministic in unit tests). The
+    //! integration tests for the connect flow already cover the Connected
+    //! transition; this file scopes itself to the branches reachable from
+    //! `App::new_test()` plus direct registry insertion.
+    use super::*;
+    use crate::app::App;
+    use crate::state::KillSwitchMode;
+    use crate::vortix_core::engine::Engine;
+    use crate::vortix_core::profile::ProfileId;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    /// Insert a Disconnected FSM into the registry. `tunnel_count` goes
+    /// to 1 but `primary()` stays `None` (no route probe will match a
+    /// Disconnected FSM). Reproduces the PARTIAL no-primary branch
+    /// deterministically — without hitting platform probes or scripted
+    /// outcomes.
+    fn insert_idle_tunnel(app: &mut App, name: &str) {
+        let tunnel = crate::tunnel::TunnelKind::Mock(
+            crate::vortix_core::ports::tunnel::mock::MockTunnel::new(),
+        );
+        let engine = Engine::new(tunnel, |_| None);
+        app.registry.insert(ProfileId::new(name), engine, vec![]);
+    }
+
+    fn render_to_string(app: &App, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                let area = Rect::new(0, 0, width, height);
+                render(frame, app, area);
+            })
+            .expect("draw");
+        let buf = terminal.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn no_tunnels_renders_exposed() {
+        let app = App::new_test();
+        assert_eq!(app.registry.tunnel_count(), 0);
+        assert!(app.registry.primary().is_none());
+
+        let out = render_to_string(&app, 60, 20);
+        assert!(
+            out.contains("EXPOSED"),
+            "expected EXPOSED banner, got:\n{out}"
+        );
+        // Sigil legend is a PROTECTED/PARTIAL-only chrome — EXPOSED is the
+        // "do something" copy and should stay minimal.
+        assert!(
+            !out.contains("Legend:"),
+            "EXPOSED should not render the sigil legend; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn tunnels_present_but_no_primary_renders_partial() {
+        let mut app = App::new_test();
+        insert_idle_tunnel(&mut app, "alpha");
+        insert_idle_tunnel(&mut app, "bravo");
+        insert_idle_tunnel(&mut app, "charlie");
+
+        assert_eq!(app.registry.tunnel_count(), 3);
+        assert!(
+            app.registry.primary().is_none(),
+            "Disconnected FSMs must not be elected primary"
+        );
+
+        let out = render_to_string(&app, 70, 20);
+        assert!(
+            out.contains("PARTIAL"),
+            "expected PARTIAL banner when tunnels exist but no primary; got:\n{out}"
+        );
+        assert!(
+            !out.contains("EXPOSED"),
+            "PARTIAL must not fall back to EXPOSED copy; got:\n{out}"
+        );
+        assert!(
+            !out.contains("PROTECTED"),
+            "no primary means no PROTECTED claim; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn partial_renders_killswitch_bullet_for_active_mode_only() {
+        // Plan §U18: in PARTIAL, render exactly ONE Killswitch bullet —
+        // the one matching the active mode — not a sub-bulleted multi-mode
+        // block. This test verifies the chosen mode's headline appears and
+        // the other two modes' distinguishing copy does not.
+        let mut app = App::new_test();
+        insert_idle_tunnel(&mut app, "alpha");
+        app.runtime.killswitch_mode = KillSwitchMode::AlwaysOn;
+
+        let out = render_to_string(&app, 80, 20);
+        assert!(
+            out.contains("Armed"),
+            "AlwaysOn should surface 'Armed' headline; got:\n{out}"
+        );
+        assert!(
+            !out.contains("Standby"),
+            "AlwaysOn must not also render the Auto/Standby line; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn partial_killswitch_off_renders_off_bullet() {
+        let mut app = App::new_test();
+        insert_idle_tunnel(&mut app, "alpha");
+        app.runtime.killswitch_mode = KillSwitchMode::Off;
+
+        let out = render_to_string(&app, 80, 20);
+        assert!(
+            out.contains("Killswitch"),
+            "Killswitch line missing; got:\n{out}"
+        );
+        assert!(out.contains("Off"), "Off mode headline missing; got:\n{out}");
+        assert!(
+            !out.contains("Armed"),
+            "Off must not render the AlwaysOn 'Armed' headline; got:\n{out}"
+        );
+        assert!(
+            !out.contains("Standby"),
+            "Off must not render the Auto 'Standby' headline; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn partial_killswitch_auto_renders_standby_bullet() {
+        let mut app = App::new_test();
+        insert_idle_tunnel(&mut app, "alpha");
+        app.runtime.killswitch_mode = KillSwitchMode::Auto;
+
+        let out = render_to_string(&app, 80, 20);
+        assert!(
+            out.contains("Standby"),
+            "Auto mode should surface 'Standby'; got:\n{out}"
+        );
+        assert!(
+            !out.contains("Armed"),
+            "Auto must not render the AlwaysOn 'Armed' headline; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn partial_ipv6_line_reports_not_enforced() {
+        // IPv6 honesty (plan §U18): the killswitch is v4-only on every
+        // supported platform. The IPv6 line must report this gap even
+        // when no leak has been observed — claiming `✓ Blocked` would be
+        // a UX lie because the code does not actually block v6.
+        let mut app = App::new_test();
+        insert_idle_tunnel(&mut app, "alpha");
+        // Explicitly set ipv6_leak=false so any code path that "passes"
+        // the IPv6 check based on the leak probe would render "Blocked".
+        // The new code must ignore this and always report "Not enforced".
+        app.runtime.ipv6_leak = false;
+
+        let out = render_to_string(&app, 80, 25);
+        assert!(out.contains("IPv6"), "IPv6 line missing; got:\n{out}");
+        assert!(
+            out.contains("Not enforced"),
+            "IPv6 must always report v4-only honestly; got:\n{out}"
+        );
+        assert!(
+            !out.contains("Blocked"),
+            "IPv6 must not claim 'Blocked' protection it does not deliver; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn partial_renders_sigil_legend() {
+        let mut app = App::new_test();
+        insert_idle_tunnel(&mut app, "alpha");
+
+        let out = render_to_string(&app, 80, 25);
+        assert!(
+            out.contains("Legend"),
+            "sigil legend missing from PARTIAL panel; got:\n{out}"
+        );
+        // Each documented sigil must appear in the legend line.
+        assert!(out.contains("✓"), "legend missing ✓; got:\n{out}");
+        assert!(out.contains("⚠"), "legend missing ⚠; got:\n{out}");
+        assert!(out.contains("─"), "legend missing ─; got:\n{out}");
+    }
+
+    #[test]
+    fn sigil_legend_constant_matches_plan() {
+        // Anchors the canonical legend string against the plan so future
+        // edits to the constant trip a test rather than silently drift.
+        assert_eq!(
+            SIGIL_LEGEND,
+            "Legend: ✓ pass · ⚠ at risk · ─ not applicable"
+        );
+    }
 }
