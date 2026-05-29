@@ -2631,6 +2631,93 @@ fn scanner_drop_from_connected_clears_registry() {
 }
 
 #[test]
+fn mirrored_registry_entry_uses_real_interface_not_mock0() {
+    use crate::vortix_core::engine::state::Connection;
+    use crate::vortix_core::profile::ProfileId;
+
+    // Repro of the screenshot bug: header says `Tunnels: [●AWS_VPN]`
+    // (mirror worked) but Connection Details shows `VPN IP: @ mock0`,
+    // `Role: Addressable (-)`, `Latency: n/a (secondary tunnel)`.
+    // Root cause: the bookkeeping shim's `MockTunnel::up` returns
+    // `DefaultSuccess` which synthesizes interface = "mock0". The
+    // registry stores that fake interface; `recompute_primary`
+    // matches `details.interface == kernel_default_route` and never
+    // hits — so the tunnel reads as a non-primary "Addressable
+    // secondary" and telemetry routes around it.
+    //
+    // The mirror must take its interface + pid from the legacy
+    // `connection_state.details` (which the scanner populates with
+    // the real kernel-reported values).
+    let mut app = test_app();
+    add_profiles(&mut app, &["AWS_VPN"]);
+    app.runtime.connection_state = ConnectionState::Connecting {
+        started: Instant::now(),
+        profile: "AWS_VPN".to_string(),
+    };
+
+    // Scanner reports a session with the REAL interface name + pid.
+    let session = fake_session("AWS_VPN");
+    app.handle_message(Message::SyncSystemState(vec![session]));
+
+    let snap = app
+        .registry
+        .snapshot(&ProfileId::new("AWS_VPN"))
+        .expect("registry snapshot must exist");
+    let Connection::Connected { details, .. } = snap.state else {
+        panic!("expected Connected, got {:?}", snap.state);
+    };
+    assert_eq!(
+        details.interface, "wg0",
+        "registry must store the REAL interface name from the scanner session, not the MockTunnel's 'mock0' placeholder"
+    );
+    assert_eq!(details.pid, Some(12345), "registry must store the real pid");
+}
+
+#[test]
+fn mirror_refresh_updates_registry_when_details_change() {
+    use crate::vortix_core::engine::state::Connection;
+    use crate::vortix_core::profile::ProfileId;
+
+    // WireGuard timing: worker thread returns success FAST and
+    // ConnectResult arrives before the scanner ticks. The mirror
+    // in `handle_connect_result` fires with empty
+    // `details.interface` (default()). The scanner then sees the
+    // interface and patches `details.interface` in place on the
+    // existing-Connected state at update.rs:879+. The registry
+    // must also pick up the refresh — otherwise it's stuck on the
+    // empty/placeholder interface and `recompute_primary` never
+    // matches.
+    let mut app = test_app();
+    add_profiles(&mut app, &["wg-test"]);
+    app.runtime.connection_state = ConnectionState::Connecting {
+        started: Instant::now(),
+        profile: "wg-test".to_string(),
+    };
+    // Worker thread reports success first; details are empty.
+    app.handle_message(Message::ConnectResult {
+        profile: "wg-test".to_string(),
+        success: true,
+        error: None,
+    });
+    // Scanner then arrives with real session data — this hits the
+    // "update existing Connected" branch (update.rs:879+).
+    let session = fake_session("wg-test");
+    app.handle_message(Message::SyncSystemState(vec![session]));
+
+    let snap = app
+        .registry
+        .snapshot(&ProfileId::new("wg-test"))
+        .expect("registry snapshot must exist after refresh");
+    let Connection::Connected { details, .. } = snap.state else {
+        panic!("expected Connected, got {:?}", snap.state);
+    };
+    assert_eq!(
+        details.interface, "wg0",
+        "registry must refresh interface when scanner updates legacy details on an existing Connected entry"
+    );
+}
+
+#[test]
 fn disconnect_result_success_removes_from_registry() {
     use crate::vortix_core::profile::ProfileId;
 

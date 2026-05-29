@@ -656,11 +656,30 @@ impl App {
     /// mirror keeps the UI honest until then.
     ///
     /// Implementation: register a fresh `Engine<TunnelKind>` backed by
-    /// a `MockTunnel`. `registry.connect_with_tunnel` drives the FSM
-    /// `Disconnected → Connecting → Connected` synchronously; the mock
-    /// `up()` returns `DefaultSuccess` immediately, no kernel
-    /// interaction. `force: true` skips the conflict check because the
-    /// real connect already passed it in `connect_profile_inner`.
+    /// a `MockTunnel` scripted with the **real** interface name + pid
+    /// from `runtime.connection_state.details` (which the scanner
+    /// populates with kernel-truthful values). `registry.connect_with_tunnel`
+    /// drives the FSM `Disconnected → Connecting → Connected` synchronously;
+    /// the mock returns the scripted handle without touching the kernel.
+    /// `force: true` skips the conflict check because the real connect
+    /// already passed it in `connect_profile_inner`.
+    ///
+    /// Why the real interface matters: `TunnelRegistry::recompute_primary`
+    /// matches `details.interface == kernel_default_route_interface` to
+    /// decide which tunnel is "primary". With a `mock0` placeholder the
+    /// match never hits, the tunnel reads as a non-primary
+    /// "Addressable secondary", telemetry routes around it
+    /// (`Latency: n/a (secondary tunnel)`), and `Server`/`PID` come
+    /// back empty — exactly the screenshot the user reported.
+    ///
+    /// Idempotent + replace-on-change: every scanner tick that
+    /// updates `details.interface` (the kernel-true value lands a
+    /// tick or two after the worker thread's `ConnectResult`) calls
+    /// the mirror again. We compare the current registry snapshot to
+    /// the new details and short-circuit when nothing changed,
+    /// preventing per-tick FSM churn. When data differs (e.g., empty
+    /// → real interface name), we remove the stale entry and
+    /// re-connect with the latest values.
     pub(crate) fn mirror_connect_into_registry(&mut self, profile_name: &str) {
         let Some(profile) = self
             .runtime
@@ -673,10 +692,49 @@ impl App {
         };
 
         let profile_id = ProfileId::new(&profile.name);
+
+        // Pull live kernel-reported values from the legacy state's
+        // details. When details are still default (e.g.,
+        // handle_connect_result fires before scanner ticks), iface is
+        // empty and we fall through to a placeholder entry — the
+        // next scanner tick replaces it.
+        let (iface, pid) = match &self.runtime.connection_state {
+            ConnectionState::Connected { details, .. } => (details.interface.clone(), details.pid),
+            _ => (String::new(), None),
+        };
+
+        // Short-circuit when the registry already holds this same
+        // data: avoid per-tick disconnect/reconnect churn that would
+        // make renderers flicker.
+        if let Some(snap) = self.registry.snapshot(&profile_id) {
+            use crate::vortix_core::engine::state::Connection;
+            if let Connection::Connected {
+                details: registry_details,
+                ..
+            } = &snap.state
+            {
+                if registry_details.interface == iface && registry_details.pid == pid {
+                    return;
+                }
+            }
+        }
+
+        // Replace any stale entry so the new connect carries the
+        // refreshed handle through the FSM.
+        let _ = self.registry.disconnect(&profile_id);
+        let _ = self.registry.remove(&profile_id);
+
         let allowed_ips = extract_allowed_ips(profile.protocol, &profile.config_path);
-        let mock = crate::tunnel::TunnelKind::Mock(
-            crate::vortix_core::ports::tunnel::mock::MockTunnel::new(),
-        );
+        let mock = crate::vortix_core::ports::tunnel::mock::MockTunnel::new();
+        if !iface.is_empty() {
+            mock.script_up(
+                crate::vortix_core::ports::tunnel::mock::ScriptedTunnelOutcome::UpSuccess {
+                    interface_name: iface,
+                    pid,
+                },
+            );
+        }
+        let mock_kind = crate::tunnel::TunnelKind::Mock(mock);
 
         let resolved_profile = profile_for_resolver(&profile);
         let profile_resolver = move |_id: &ProfileId| Some(resolved_profile.clone());
@@ -684,7 +742,7 @@ impl App {
         if let Err(err) = self.registry.connect_with_tunnel(
             profile_id,
             allowed_ips,
-            mock,
+            mock_kind,
             profile_resolver,
             /* force */ true,
         ) {

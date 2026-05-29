@@ -916,6 +916,15 @@ impl App {
                     details.mtu.clone_from(&session.mtu);
                     details.listen_port.clone_from(&session.listen_port);
                     details.public_key.clone_from(&session.public_key);
+                    // Scanner refreshed kernel-reported details on an
+                    // existing Connected entry. The mirror skips when
+                    // registry already holds the same interface+pid;
+                    // when handle_connect_result fired first with an
+                    // empty interface, this is where the registry
+                    // picks up the real values so
+                    // `recompute_primary` can match the kernel
+                    // default route.
+                    self.mirror_connect_into_registry(&active_name);
                     return;
                 }
             }
