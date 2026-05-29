@@ -219,6 +219,64 @@ read-then-write-new-file.
 
 ---
 
+## V2 → V1 Downgrade (v0.4.x → v0.3.x)
+
+The multi-connection release ("V2", v0.4.0+) introduces a richer
+killswitch persisted-state shape, additional journal event variants,
+and a multi-tunnel `TunnelRegistry`. If you need to roll back to
+v0.3.x ("V1"), follow this procedure.
+
+1. **Revert the binary to v0.3.x.**
+
+   ```sh
+   # crates.io
+   cargo install vortix --version 0.3.1 --force
+
+   # Homebrew
+   brew uninstall vortix && brew install vortix@0.3.1
+
+   # npm
+   npm install -g @harry-kp/vortix@0.3.1
+   ```
+
+2. **Check whether V1 read-tolerance was backported.** If your
+   v0.3.x build received the backport from plan 015 (which makes V1
+   silently ignore the V2 killswitch state shape and re-arm fresh),
+   you are done — no manual cleanup is needed. The backport is
+   indicated by the presence of a `killswitch_state.compat = "v2-tolerant"`
+   marker line in `vortix --version` extended output.
+
+3. **Otherwise, remove the V2-only killswitch state file.** V2 persists
+   killswitch state in a new JSON shape that V1 cannot parse and will
+   refuse to load:
+
+   ```sh
+   rm ~/.config/vortix/killswitch-state.json
+   ```
+
+   Re-arm the killswitch on first run after downgrade:
+
+   ```sh
+   sudo vortix killswitch auto         # or "always", to taste
+   ```
+
+4. **Profile configs are unchanged.** No migration is needed for your
+   `.conf` or `.ovpn` files. The `.meta.toml` sidecars introduced in
+   v0.3.0 are V1-compatible and remain in place.
+
+5. **Journal JSONL is compatible.** V2 introduces new `EngineEvent`
+   variants (multi-tunnel state transitions, registry conflicts), but
+   the enum is `#[non_exhaustive]`-additive on the wire — V1 readers
+   skip unknown variants rather than erroring. You can keep your
+   `${XDG_DATA_HOME}/vortix/sessions/*.jsonl` files in place; they
+   stay readable by both V1 and V2 tooling.
+
+No data destructively rewritten by V2 — every change is
+read-then-write-new-file, so the worst-case rollback is "delete
+`killswitch-state.json` and re-arm."
+
+---
+
 ## Got stuck?
 
 Run `vortix bug-report` — v0.3.0 attaches the current session's
