@@ -83,6 +83,7 @@ pub enum Commands {
     ///     sudo vortix up work-vpn               Connect to 'work-vpn'
     ///     sudo vortix up work-vpn --json        Connect and get JSON result
     ///     sudo vortix up work-vpn --timeout 60  Connect with 60s timeout
+    ///     sudo vortix up work-vpn --yes         Bypass multi-tunnel conflict prompt
     ///     sudo vortix up                        Reconnect to last used profile
     #[command(visible_alias = "connect")]
     Up {
@@ -93,6 +94,12 @@ pub enum Commands {
         /// Connection timeout in seconds
         #[arg(long, default_value = "20", value_name = "SECS")]
         timeout: u64,
+
+        /// Bypass the multi-tunnel conflict gate (default-route takeover or
+        /// route overlap). Without this flag, conflicting connects exit
+        /// with code 4 (`StateConflict`) so scripted callers can branch.
+        #[arg(short, long)]
+        yes: bool,
     },
 
     /// Disconnect from VPN

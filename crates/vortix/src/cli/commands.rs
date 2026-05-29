@@ -29,9 +29,11 @@ pub fn handle_command(
     mode: OutputMode,
 ) -> i32 {
     match command {
-        Commands::Up { profile, timeout } => {
-            handle_up(profile.as_deref(), *timeout, config, config_dir, mode)
-        }
+        Commands::Up {
+            profile,
+            timeout,
+            yes,
+        } => handle_up(profile.as_deref(), *timeout, *yes, config, config_dir, mode),
         Commands::Down { force } => handle_down(*force, config, config_dir, mode),
         Commands::Reconnect => handle_reconnect(config, config_dir, mode),
         Commands::Status {
@@ -363,6 +365,7 @@ struct UpData {
 fn handle_up(
     profile: Option<&str>,
     timeout_secs: u64,
+    yes: bool,
     config: &AppConfig,
     config_dir: &Path,
     mode: OutputMode,
@@ -466,6 +469,50 @@ fn handle_up(
         }
     }
 
+    // Multi-connection plan #001 U7: route the CLI connect through the
+    // registry's conflict gate before invoking the legacy tunnel-up path.
+    // The CLI is headless and has no in-memory registry, so we build a
+    // transient one from the scanner's active-session snapshot and ask it
+    // whether the new profile's AllowedIPs collide with anything already
+    // up. `--yes` bypasses the gate for scripted callers.
+    if !yes {
+        if let Some(conflict) = detect_conflict_for_cli(&engine, &profile_name) {
+            let (code, message) = match &conflict {
+                crate::vortix_core::engine::Conflict::DefaultRouteTakeover {
+                    current,
+                    new: _,
+                } => (
+                    "state_conflict_default_route",
+                    format!(
+                        "Profile '{profile_name}' would take over the default route from '{current}'"
+                    ),
+                ),
+                crate::vortix_core::engine::Conflict::RouteOverlap {
+                    with,
+                    overlapping_cidrs,
+                } => (
+                    "state_conflict_route_overlap",
+                    format!(
+                        "Profile '{profile_name}' overlaps with '{with}' on {} CIDR(s)",
+                        overlapping_cidrs.len()
+                    ),
+                ),
+            };
+            print_error_and_exit(
+                mode,
+                "up",
+                CliError {
+                    code,
+                    message,
+                    hint: Some(format!(
+                        "Pass --yes to bypass the conflict gate: sudo vortix up {profile_name} --yes"
+                    )),
+                },
+                ExitCode::StateConflict,
+            );
+        }
+    }
+
     match engine.connect_and_wait(&profile_name, Duration::from_secs(timeout_secs)) {
         Ok(result) if result.success => {
             let data = UpData {
@@ -530,6 +577,113 @@ fn handle_up(
                 exit,
             );
         }
+    }
+}
+
+/// Detect a multi-tunnel conflict for the CLI's `up` path (plan #001 U7).
+///
+/// The CLI doesn't share an in-memory `TunnelRegistry` with the running
+/// session — active tunnels are discovered via `scanner::get_active_profiles`.
+/// We inspect each active session's parsed config for default-route claims
+/// or `AllowedIPs` overlaps with the target profile, returning the typed
+/// `Conflict` so the caller can surface the right hint.
+fn detect_conflict_for_cli(
+    engine: &VpnEngine,
+    target_name: &str,
+) -> Option<crate::vortix_core::engine::Conflict> {
+    use crate::app::connection::extract_allowed_ips;
+    use crate::vortix_core::cidr::{claims_default_route_v4, claims_default_route_v6};
+    use crate::vortix_core::engine::Conflict;
+    use crate::vortix_core::profile::ProfileId;
+
+    let target_profile = engine.profiles.iter().find(|p| p.name == target_name)?;
+    let target_allowed = extract_allowed_ips(target_profile.protocol, &target_profile.config_path);
+    let target_claims_default =
+        claims_default_route_v4(&target_allowed) || claims_default_route_v6(&target_allowed);
+
+    let active = crate::core::scanner::get_active_profiles(&engine.profiles);
+    for session in &active {
+        if session.name == target_name {
+            // Re-up of an already-up profile isn't a conflict — the
+            // legacy connect path is idempotent here.
+            continue;
+        }
+        let Some(active_profile) = engine.profiles.iter().find(|p| p.name == session.name) else {
+            continue;
+        };
+        let active_allowed =
+            extract_allowed_ips(active_profile.protocol, &active_profile.config_path);
+        let active_claims_default =
+            claims_default_route_v4(&active_allowed) || claims_default_route_v6(&active_allowed);
+
+        if target_claims_default && active_claims_default {
+            return Some(Conflict::DefaultRouteTakeover {
+                current: ProfileId::new(&session.name),
+                new: ProfileId::new(target_name),
+            });
+        }
+        let overlap = cidr_overlap(&target_allowed, &active_allowed);
+        if !overlap.is_empty() {
+            return Some(Conflict::RouteOverlap {
+                with: ProfileId::new(&session.name),
+                overlapping_cidrs: overlap,
+            });
+        }
+    }
+    None
+}
+
+/// Pairwise CIDR-intersection check used by the CLI conflict gate. Returns
+/// the CIDRs from `a` that intersect any CIDR in `b`. Intentionally
+/// O(a×b) — call sites have small `a`/`b` (typical `AllowedIPs` sets stay
+/// well under a dozen entries).
+fn cidr_overlap(
+    a: &[crate::vortix_core::cidr::Cidr],
+    b: &[crate::vortix_core::cidr::Cidr],
+) -> Vec<crate::vortix_core::cidr::Cidr> {
+    let mut out = Vec::new();
+    for x in a {
+        for y in b {
+            if cidr_intersects(x, y) {
+                out.push(*x);
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn cidr_intersects(
+    x: &crate::vortix_core::cidr::Cidr,
+    y: &crate::vortix_core::cidr::Cidr,
+) -> bool {
+    use std::net::IpAddr;
+    match (x.addr, y.addr) {
+        (IpAddr::V4(a), IpAddr::V4(b)) => {
+            let abits = u32::from(a);
+            let bbits = u32::from(b);
+            let amask = u32::MAX
+                .checked_shl(u32::from(32 - x.prefix_len))
+                .unwrap_or(0);
+            let bmask = u32::MAX
+                .checked_shl(u32::from(32 - y.prefix_len))
+                .unwrap_or(0);
+            let common = amask & bmask;
+            (abits & common) == (bbits & common)
+        }
+        (IpAddr::V6(a), IpAddr::V6(b)) => {
+            let abits = u128::from(a);
+            let bbits = u128::from(b);
+            let amask = u128::MAX
+                .checked_shl(u32::from(128 - x.prefix_len))
+                .unwrap_or(0);
+            let bmask = u128::MAX
+                .checked_shl(u32::from(128 - y.prefix_len))
+                .unwrap_or(0);
+            let common = amask & bmask;
+            (abits & common) == (bbits & common)
+        }
+        _ => false,
     }
 }
 
@@ -648,7 +802,10 @@ fn handle_reconnect(config: &AppConfig, config_dir: &Path, mode: OutputMode) -> 
                     let _ = engine.disconnect_and_wait(false, Duration::from_secs(15));
                 }
             }
-            handle_up(Some(&name), 20, config, config_dir, mode)
+            // Reconnect just forwards to handle_up; bypass the conflict
+            // gate because we already verified there's no other active
+            // tunnel above (we just took our own down). Plan #001 U7.
+            handle_up(Some(&name), 20, true, config, config_dir, mode)
         }
         None => {
             print_error_and_exit(

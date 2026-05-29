@@ -260,7 +260,7 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
         InputMode::Search { query, cursor } => {
             super::overlays::search::render(frame, app, query, *cursor, app.engine.profiles.len());
         }
-        InputMode::ConfirmSwitch {
+        InputMode::ConfirmDefaultRouteTakeover {
             from,
             to_name,
             confirm_selected,
@@ -272,7 +272,7 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
             confirm_dialog::render(
                 frame,
                 ConfirmDialogConfig {
-                    title: " Switch Profile ",
+                    title: " Default Route Takeover ",
                     body: vec![
                         Line::from(vec![
                             Span::styled(
@@ -293,6 +293,59 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
                     border_color: theme::WARNING,
                     confirm_selected: *confirm_selected,
                     width: 50,
+                    height: 7,
+                },
+            );
+        }
+        InputMode::ConfirmRouteOverlap {
+            with_profile_id,
+            overlapping_cidrs,
+            to_name,
+            confirm_selected,
+            ..
+        } => {
+            let max = 28;
+            let with_t = utils::truncate(with_profile_id.as_str(), max);
+            let to_t = utils::truncate(to_name, max);
+            // Display up to two overlapping CIDRs inline; the rest collapse
+            // into a "+N more" tail so a wide AllowedIPs set doesn't blow
+            // the dialog height.
+            let cidr_summary = if overlapping_cidrs.is_empty() {
+                String::from("(unknown)")
+            } else {
+                let mut parts: Vec<String> = overlapping_cidrs
+                    .iter()
+                    .take(2)
+                    .map(|c| format!("{}/{}", c.addr, c.prefix_len))
+                    .collect();
+                if overlapping_cidrs.len() > 2 {
+                    parts.push(format!("+{} more", overlapping_cidrs.len() - 2));
+                }
+                parts.join(", ")
+            };
+            confirm_dialog::render(
+                frame,
+                ConfirmDialogConfig {
+                    title: " Route Overlap ",
+                    body: vec![
+                        Line::from(vec![
+                            Span::styled("Connect ", Style::default().fg(theme::TEXT_SECONDARY)),
+                            Span::styled(to_t, Style::default().fg(theme::SUCCESS)),
+                            Span::styled(
+                                " — overlaps with ",
+                                Style::default().fg(theme::TEXT_SECONDARY),
+                            ),
+                            Span::styled(with_t, Style::default().fg(theme::ACCENT_PRIMARY)),
+                        ]),
+                        Line::from(vec![
+                            Span::styled("on ", Style::default().fg(theme::TEXT_SECONDARY)),
+                            Span::styled(cidr_summary, Style::default().fg(theme::WARNING)),
+                            Span::styled("?", Style::default().fg(theme::TEXT_SECONDARY)),
+                        ]),
+                    ],
+                    border_color: theme::WARNING,
+                    confirm_selected: *confirm_selected,
+                    width: 56,
                     height: 7,
                 },
             );

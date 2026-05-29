@@ -78,8 +78,14 @@ pub enum Message {
     OpenDelete(Option<usize>),
     /// Confirm deletion
     ConfirmDelete,
-    /// Confirm VPN profile switch
-    ConfirmSwitch { idx: usize },
+    /// Confirm default-route takeover (multi-connection plan #001 U7 —
+    /// formerly `ConfirmSwitch`). User accepted the overlay; retry the
+    /// connect with `force=true`.
+    ConfirmDefaultRouteTakeover { idx: usize },
+    /// Confirm route-overlap (multi-connection plan #001 U7, R10). User
+    /// accepted the AllowedIPs-overlap overlay; retry the connect with
+    /// `force=true`.
+    ConfirmRouteOverlap { idx: usize },
 
     // === Action Menu ===
     /// Open the action menu (Single actions)
