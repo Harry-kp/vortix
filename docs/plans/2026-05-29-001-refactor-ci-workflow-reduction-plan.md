@@ -1,9 +1,10 @@
 ---
 title: "refactor: CI workflow reduction & restructure"
 type: refactor
-status: active
+status: completed
 date: 2026-05-29
 origin: docs/brainstorms/2026-05-29-ci-workflow-reduction-requirements.md
+shipped_in: PR #1 (bundled with feat/multi-connection per user request)
 ---
 
 # refactor: CI workflow reduction & restructure
