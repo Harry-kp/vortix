@@ -1,13 +1,14 @@
 //! macOS VPN interface detection via `libc::getifaddrs` + `/var/run/wireguard` +
-//! `libc::proc_listpids`.
+//! `libc::proc_listpids` + hand-rolled libproc FFI.
 //!
-//! Plan 002 U5/U6: replaced `ifconfig <iface>` and `ps -ax -o pid,command`
-//! shell-outs with direct libc calls. `lsof -t <socket>` stays for U7's
-//! system-configuration-crate replacement.
+//! Plan 002 U5/U6/U7: replaced `ifconfig <iface>`, `ps -ax -o pid,command`,
+//! and `lsof -t <socket>` shell-outs with direct libc / libproc calls.
 
 use crate::vortix_core::ports::interface::Interface;
 use crate::vortix_process::CommandSpec;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use super::libproc_ffi::{self, SocketView};
 
 const WIREGUARD_RUN_DIR: &str = "/var/run/wireguard";
 
@@ -44,17 +45,13 @@ impl Interface for MacInterface {
     }
 
     fn get_wireguard_pid(interface: &str) -> Option<u32> {
-        let sock_path = format!("{WIREGUARD_RUN_DIR}/{interface}.sock");
+        let sock_path = PathBuf::from(WIREGUARD_RUN_DIR).join(format!("{interface}.sock"));
 
-        // Use lsof to get the PID of the process holding the socket.
-        // `lsof` is the macOS primary path; the libc::proc_pidfdinfo path
-        // is much more verbose and stays out of scope until U7's
-        // system-configuration crate work bundles all socket-audit calls.
-        if let Some(output) = cmd_output("lsof", &["-t", &sock_path]) {
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !stdout.is_empty() {
-                return stdout.parse::<u32>().ok();
-            }
+        // Plan 002 U7: primary path is libproc — walk every PID's socket
+        // FDs and match the bound unix-socket path against `sock_path`.
+        // Replaces the prior `lsof -t <sock_path>` shell-out.
+        if let Some(pid) = find_pid_holding_unix_socket(&sock_path) {
+            return Some(pid);
         }
 
         // Plan 002 U6: fallback search via libc::proc_listpids + proc_pidpath
@@ -247,9 +244,30 @@ fn pid_path_lower(pid: libc::pid_t) -> Option<String> {
         let Ok(buf_size_u32) = u32::try_from(path_buf.len()) else {
             return None;
         };
-        let len = libc::proc_pidpath(pid, path_buf.as_mut_ptr().cast::<libc::c_void>(), buf_size_u32);
+        let len = libc::proc_pidpath(
+            pid,
+            path_buf.as_mut_ptr().cast::<libc::c_void>(),
+            buf_size_u32,
+        );
         let len_usize = usize::try_from(len).ok().filter(|&n| n > 0)?;
         path_buf.truncate(len_usize);
     }
     String::from_utf8(path_buf).ok().map(|s| s.to_lowercase())
+}
+
+/// Plan 002 U7: find the PID with `sock_path` open as a unix domain
+/// socket. Walks every PID's socket FDs via `libproc_ffi::iter_all_sockets`
+/// and matches `unsi_addr.ua_sun.sun_path` (or `unsi_caddr.ua_sun.sun_path`)
+/// against the target. Replaces the prior `lsof -t <sock_path>`
+/// shell-out.
+fn find_pid_holding_unix_socket(sock_path: &Path) -> Option<u32> {
+    for (pid, _fd, view) in libproc_ffi::iter_all_sockets() {
+        let SocketView::Unix { path } = view else {
+            continue;
+        };
+        if path == sock_path {
+            return u32::try_from(pid).ok();
+        }
+    }
+    None
 }

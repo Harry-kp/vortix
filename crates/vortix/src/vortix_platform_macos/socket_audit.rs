@@ -1,131 +1,72 @@
-//! macOS `SocketAudit` impl (plan 015 phase C U12 / plan 013).
+//! macOS `SocketAudit` impl (plan 002 U7).
 //!
-//! Shells out to `lsof -i -P -n` and parses the human-friendly output.
-//! Without root, only sockets owned by the current user are visible;
-//! the contract returns `pid: 0` for foreign-user sockets where
-//! resolution fails.
+//! Walks every live PID's socket FDs via the hand-rolled `libproc_ffi`
+//! module (`proc_listpids` + `proc_pidinfo(PROC_PIDLISTFDS)` +
+//! `proc_pidfdinfo(PROC_PIDFDSOCKETINFO)`) and emits a `SocketSnapshot`
+//! for each IPv4/IPv6 TCP or UDP socket. Replaces the prior `lsof -i -P -n`
+//! shell-out + tabular parser.
 //!
-//! Why human-friendly format instead of `-F`: lsof's `-F` machine-
-//! parseable output is interleaved across processes and fds, which
-//! makes a streaming parser more complex without buying clarity. The
-//! human-friendly tabular output (with `-P -n` to suppress port-name +
-//! host-name resolution) is byte-stable enough across macOS versions.
+//! Without root, the kernel returns `ESRCH` (and we silently skip) for
+//! sockets owned by other users — matches the prior contract where
+//! `lsof` invocations as a non-privileged user only saw their own
+//! sockets.
 
 #![allow(clippy::must_use_candidate)]
 
-use std::net::SocketAddr;
-
 use crate::vortix_core::ports::socket_audit::{
-    SocketAudit, SocketAuditError, SocketAuditResult, SocketProtocol, SocketSnapshot,
+    SocketAudit, SocketAuditResult, SocketProtocol, SocketSnapshot,
 };
-use crate::vortix_process::{CommandSpec, PrivilegeReq};
+
+use super::libproc_ffi::{self, InetKind, SocketView};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LsofSocketAudit;
 
 impl SocketAudit for LsofSocketAudit {
     fn snapshot() -> SocketAuditResult<Vec<SocketSnapshot>> {
-        // `-i` IPv4+IPv6 only; `-P` suppress port-name resolution;
-        // `-n` suppress hostname resolution. Output is tabular.
-        let spec = CommandSpec::oneshot("lsof", vec!["-i".into(), "-P".into(), "-n".into()])
-            .privilege(PrivilegeReq::None);
-        let output = crate::vortix_process::run_to_output(spec)
-            .map_err(|e| SocketAuditError::CommandFailed(format!("lsof: {e}")))?;
-        if !output.status.success() {
-            return Err(SocketAuditError::CommandFailed(format!(
-                "lsof exited {}: {}",
-                output.status.code().unwrap_or(-1),
-                String::from_utf8_lossy(&output.stderr).trim()
-            )));
+        let mut out = Vec::new();
+        for (pid, _fd, view) in libproc_ffi::iter_all_sockets() {
+            let SocketView::Inet {
+                kind,
+                local,
+                remote,
+            } = view
+            else {
+                continue; // skip Unix domain sockets
+            };
+            let Ok(pid_u32) = u32::try_from(pid) else {
+                continue;
+            };
+            let command = libproc_ffi::pid_path(pid)
+                .as_deref()
+                .map(short_command_name)
+                .unwrap_or_default();
+            out.push(SocketSnapshot {
+                pid: pid_u32,
+                command,
+                local,
+                remote,
+                protocol: protocol_of(kind),
+                interface: None,
+            });
         }
-        let body = String::from_utf8_lossy(&output.stdout);
-        Ok(parse_lsof_output(&body))
+        Ok(out)
     }
 }
 
-/// Parse the output of `lsof -i -P -n`. Public for tests.
-///
-/// Format (first line is header):
-/// ```text
-/// COMMAND   PID  USER  FD TYPE DEVICE  SIZE/OFF NODE NAME
-/// curl    12345  alice 5u IPv4 0x...           0t0  TCP 127.0.0.1:54321->8.8.8.8:443 (ESTABLISHED)
-/// ```
-pub fn parse_lsof_output(body: &str) -> Vec<SocketSnapshot> {
-    let mut out = Vec::new();
-    for line in body.lines().skip(1) {
-        if let Some(snap) = parse_one_line(line) {
-            out.push(snap);
-        }
+fn protocol_of(kind: InetKind) -> SocketProtocol {
+    match kind {
+        InetKind::Tcp4 => SocketProtocol::Tcp,
+        InetKind::Udp4 => SocketProtocol::Udp,
+        InetKind::Tcp6 => SocketProtocol::Tcp6,
+        InetKind::Udp6 => SocketProtocol::Udp6,
     }
-    out
 }
 
-fn parse_one_line(line: &str) -> Option<SocketSnapshot> {
-    // Split on whitespace but keep the NAME column intact (it may
-    // contain spaces inside `(STATE)` markers).
-    let fields: Vec<&str> = line.split_whitespace().collect();
-    if fields.len() < 9 {
-        return None;
-    }
-    let command = fields[0].to_string();
-    let pid: u32 = fields[1].parse().ok()?;
-    let type_field = fields[4]; // IPv4 | IPv6
-    let node_field = fields[7]; // TCP | UDP
-    let name_field = fields[8..].join(" "); // local->remote (STATE) or local
-
-    let protocol = match (type_field, node_field) {
-        ("IPv4", "TCP") => SocketProtocol::Tcp,
-        ("IPv4", "UDP") => SocketProtocol::Udp,
-        ("IPv6", "TCP") => SocketProtocol::Tcp6,
-        ("IPv6", "UDP") => SocketProtocol::Udp6,
-        _ => return None,
-    };
-    // Strip trailing `(STATE)`.
-    let core: String = match name_field.split_once(" (") {
-        Some((before, _)) => before.to_string(),
-        None => name_field.clone(),
-    };
-    let (local_str, remote_opt) = match core.split_once("->") {
-        Some((l, r)) => (l.to_string(), Some(r.to_string())),
-        None => (core, None),
-    };
-    let local = parse_lsof_addr(&local_str)?;
-    let remote = remote_opt.and_then(|r| parse_lsof_addr(&r));
-
-    Some(SocketSnapshot {
-        pid,
-        command,
-        local,
-        remote,
-        protocol,
-        interface: None,
-    })
-}
-
-fn parse_lsof_addr(s: &str) -> Option<SocketAddr> {
-    // lsof renders v4 as `127.0.0.1:8080`, v6 as `[::1]:8080` or
-    // `[fe80::1%en0]:8080`. The `%en0` scope id breaks `SocketAddr`
-    // parsing on stable Rust — strip it.
-    let s = s.trim();
-    let cleaned = if let Some(start) = s.find('%') {
-        let end = s[start..].find([']', ':']).unwrap_or(s.len() - start);
-        let mut owned = String::with_capacity(s.len());
-        owned.push_str(&s[..start]);
-        owned.push_str(&s[start + end..]);
-        owned
-    } else {
-        s.to_string()
-    };
-    // lsof sometimes uses `*` for unspecified (e.g. `*:8080`); turn
-    // it into 0.0.0.0 / [::] so it parses.
-    if let Some(port) = cleaned.strip_prefix("*:") {
-        let port: u16 = port.parse().ok()?;
-        return Some(SocketAddr::new(
-            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-            port,
-        ));
-    }
-    cleaned.parse().ok()
+/// Extract the final path component of a binary path, matching the prior
+/// `lsof` COMMAND column (e.g. `/usr/bin/curl` → `curl`).
+fn short_command_name(path: &str) -> String {
+    path.rsplit('/').next().unwrap_or(path).to_string()
 }
 
 #[cfg(test)]
@@ -133,62 +74,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_output_returns_empty() {
-        let body = "COMMAND   PID  USER  FD TYPE DEVICE  SIZE/OFF NODE NAME\n";
-        assert!(parse_lsof_output(body).is_empty());
+    fn short_command_name_strips_path() {
+        assert_eq!(short_command_name("/usr/bin/curl"), "curl");
+        assert_eq!(short_command_name("nc"), "nc");
+        assert_eq!(short_command_name(""), "");
     }
 
     #[test]
-    fn listening_socket_no_remote() {
-        let body = "\
-COMMAND   PID  USER  FD TYPE DEVICE  SIZE/OFF NODE NAME
-nc      55555  alice 3u IPv4 0xABC          0t0  TCP *:8080 (LISTEN)
-";
-        let snaps = parse_lsof_output(body);
-        assert_eq!(snaps.len(), 1);
-        assert_eq!(snaps[0].pid, 55555);
-        assert_eq!(snaps[0].command, "nc");
-        assert_eq!(
-            snaps[0].local,
-            "0.0.0.0:8080".parse::<SocketAddr>().unwrap()
-        );
-        assert_eq!(snaps[0].remote, None);
-    }
-
-    #[test]
-    fn established_tcp_socket_with_remote() {
-        let body = "\
-COMMAND   PID  USER  FD TYPE DEVICE  SIZE/OFF NODE NAME
-curl    12345  alice 5u IPv4 0xABC          0t0  TCP 127.0.0.1:54321->8.8.8.8:443 (ESTABLISHED)
-";
-        let snaps = parse_lsof_output(body);
-        assert_eq!(snaps.len(), 1);
-        let s = &snaps[0];
-        assert_eq!(s.pid, 12345);
-        assert_eq!(s.local, "127.0.0.1:54321".parse::<SocketAddr>().unwrap());
-        assert_eq!(s.remote, Some("8.8.8.8:443".parse::<SocketAddr>().unwrap()));
-        assert_eq!(s.protocol, SocketProtocol::Tcp);
-    }
-
-    #[test]
-    fn ipv6_with_zone_id_strips_it() {
-        let body = "\
-COMMAND   PID  USER  FD TYPE DEVICE  SIZE/OFF NODE NAME
-proc    77777  alice 4u IPv6 0xABC          0t0  TCP [fe80::1%en0]:443->[fe80::2%en0]:54321 (ESTABLISHED)
-";
-        let snaps = parse_lsof_output(body);
-        assert_eq!(snaps.len(), 1);
-        assert_eq!(snaps[0].protocol, SocketProtocol::Tcp6);
-    }
-
-    #[test]
-    fn malformed_line_skipped_not_aborted() {
-        let body = "\
-COMMAND   PID  USER  FD TYPE DEVICE  SIZE/OFF NODE NAME
-GARBAGE
-curl    12345  alice 5u IPv4 0xABC          0t0  TCP 127.0.0.1:54321->8.8.8.8:443 (ESTABLISHED)
-";
-        let snaps = parse_lsof_output(body);
-        assert_eq!(snaps.len(), 1);
+    fn snapshot_returns_ok() {
+        // Smoke test: kernel-level FFI path completes without error on
+        // every macOS test runner. Empty Vec is acceptable on hermetic
+        // runners; non-empty when the cargo test runner has open
+        // sockets.
+        let result = LsofSocketAudit::snapshot();
+        assert!(result.is_ok(), "snapshot returned error: {result:?}");
     }
 }

@@ -83,6 +83,18 @@ arboard = { version = "3.6.1", default-features = false }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Plan 002 U7: macOS SystemConfiguration framework bindings for DNS
+# resolution (replaces `scutil --dns` and `networksetup -getdnsservers`
+# shell-outs). The crate covers the State:/Network/Global/DNS dynamic
+# store key directly; the netstat / lsof replacements use libc +
+# hand-rolled libproc FFI rather than this crate (not covered by it).
+[target.'cfg(target_os = "macos")'.dependencies]
+# `system-configuration` re-exports its own `core_foundation` (0.9.x); we
+# import `CFDictionary` / `CFArray` / `CFString` etc. through that re-export
+# rather than depending on `core-foundation` directly so the two versions
+# can't drift apart.
+system-configuration = "0.7"
+
 [dev-dependencies]
 tempfile = { workspace = true }
 
