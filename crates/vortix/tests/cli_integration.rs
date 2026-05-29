@@ -493,3 +493,133 @@ fn clap_global_flags_propagate() {
     assert!(args.quiet);
     assert!(args.verbose);
 }
+
+// ============================================================================
+// Multi-tunnel CLI grammar (plan 001 U20 — Down with profile/--all, Reconnect
+// with profile, Up --yes flag). Plan 002 U6-narrow.
+// ============================================================================
+
+#[test]
+fn clap_parses_down_with_profile_arg() {
+    use clap::Parser;
+    use vortix::cli::args::{Args, Commands};
+
+    let args = Args::try_parse_from(["vortix", "down", "corp"]).unwrap();
+    if let Some(Commands::Down {
+        profile,
+        all,
+        force,
+    }) = args.command
+    {
+        assert_eq!(profile.as_deref(), Some("corp"));
+        assert!(!all);
+        assert!(!force);
+    } else {
+        panic!("Expected Down command with profile");
+    }
+}
+
+#[test]
+fn clap_parses_down_all_flag() {
+    use clap::Parser;
+    use vortix::cli::args::{Args, Commands};
+
+    let args = Args::try_parse_from(["vortix", "down", "--all"]).unwrap();
+    if let Some(Commands::Down {
+        profile,
+        all,
+        force,
+    }) = args.command
+    {
+        assert!(profile.is_none());
+        assert!(all);
+        assert!(!force);
+    } else {
+        panic!("Expected Down command with --all");
+    }
+}
+
+#[test]
+fn clap_rejects_down_profile_with_all_flag() {
+    use clap::Parser;
+    use vortix::cli::args::Args;
+
+    // `profile` is `conflicts_with = "all"`; clap must reject the combination.
+    let result = Args::try_parse_from(["vortix", "down", "corp", "--all"]);
+    assert!(
+        result.is_err(),
+        "down corp --all should be rejected by clap conflicts_with"
+    );
+    let err = result.unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("cannot be used with") || msg.contains("conflict"),
+        "expected conflicts_with error, got: {msg}"
+    );
+}
+
+#[test]
+fn clap_parses_reconnect_with_profile_arg() {
+    use clap::Parser;
+    use vortix::cli::args::{Args, Commands};
+
+    let args = Args::try_parse_from(["vortix", "reconnect", "personal"]).unwrap();
+    if let Some(Commands::Reconnect { profile }) = args.command {
+        assert_eq!(profile.as_deref(), Some("personal"));
+    } else {
+        panic!("Expected Reconnect command with profile");
+    }
+}
+
+#[test]
+fn clap_parses_reconnect_no_args() {
+    use clap::Parser;
+    use vortix::cli::args::{Args, Commands};
+
+    let args = Args::try_parse_from(["vortix", "reconnect"]).unwrap();
+    if let Some(Commands::Reconnect { profile }) = args.command {
+        assert!(profile.is_none());
+    } else {
+        panic!("Expected Reconnect command");
+    }
+}
+
+#[test]
+fn clap_parses_up_yes_long_flag() {
+    use clap::Parser;
+    use vortix::cli::args::{Args, Commands};
+
+    let args = Args::try_parse_from(["vortix", "up", "corp", "--yes"]).unwrap();
+    if let Some(Commands::Up { profile, yes, .. }) = args.command {
+        assert_eq!(profile.as_deref(), Some("corp"));
+        assert!(yes);
+    } else {
+        panic!("Expected Up command with --yes");
+    }
+}
+
+#[test]
+fn clap_parses_up_yes_short_flag() {
+    use clap::Parser;
+    use vortix::cli::args::{Args, Commands};
+
+    let args = Args::try_parse_from(["vortix", "up", "corp", "-y"]).unwrap();
+    if let Some(Commands::Up { yes, .. }) = args.command {
+        assert!(yes, "-y short flag should set yes=true");
+    } else {
+        panic!("Expected Up command");
+    }
+}
+
+#[test]
+fn clap_parses_up_yes_defaults_false() {
+    use clap::Parser;
+    use vortix::cli::args::{Args, Commands};
+
+    let args = Args::try_parse_from(["vortix", "up", "corp"]).unwrap();
+    if let Some(Commands::Up { yes, .. }) = args.command {
+        assert!(!yes, "yes should default to false when --yes/-y absent");
+    } else {
+        panic!("Expected Up command");
+    }
+}
