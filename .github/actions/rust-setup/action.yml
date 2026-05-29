@@ -1,0 +1,22 @@
+name: 'Rust setup'
+description: 'Checkout repository, install pinned Rust toolchain, restore cargo cache. Used by lint/test/boundary/security workflows to DRY the repeated 3-step setup stanza.'
+
+inputs:
+  toolchain:
+    description: 'Rust toolchain version (must match rust-toolchain.toml; default mirrors current MSRV pin)'
+    required: false
+    default: '1.91.0'
+  components:
+    description: 'Comma-separated rust-toolchain components (e.g. "clippy" or "rustfmt"). Empty string installs no extras.'
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ inputs.toolchain }}
+        components: ${{ inputs.components }}
+    - uses: Swatinem/rust-cache@v2
