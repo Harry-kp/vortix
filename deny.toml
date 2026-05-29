@@ -4,10 +4,16 @@
 # `cfg(windows)`) still appear in `Cargo.lock` and get audited. Scoping
 # to our real targets keeps the audit honest — we only enforce license /
 # advisory rules against code that ends up in a vortix binary.
+#
+# These MUST stay in sync with `dist-workspace.toml`'s `[dist].targets`.
+# A new release target added there without a matching entry here would
+# silently drop musl-only / arch-only crates out of audit scope.
 [graph]
 targets = [
     { triple = "x86_64-unknown-linux-gnu" },
     { triple = "aarch64-unknown-linux-gnu" },
+    { triple = "x86_64-unknown-linux-musl" },
+    { triple = "aarch64-unknown-linux-musl" },
     { triple = "x86_64-apple-darwin" },
     { triple = "aarch64-apple-darwin" },
 ]
