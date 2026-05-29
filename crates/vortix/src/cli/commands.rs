@@ -558,12 +558,12 @@ fn handle_down(force: bool, config: &AppConfig, config_dir: &Path, mode: OutputM
 
     // Set engine state to Connected so disconnect_and_wait works
     if let Some(session) = active.first() {
-        engine.connection_state = crate::state::ConnectionState::Connected {
+        engine.connection_state = crate::vpn_runtime::ConnectionState::Connected {
             profile: session.name.clone(),
             server_location: String::new(),
             since: std::time::Instant::now(),
             latency_ms: 0,
-            details: Box::new(crate::state::DetailedConnectionInfo {
+            details: Box::new(crate::vpn_runtime::DetailedConnectionInfo {
                 pid: session.pid,
                 interface: session.interface.clone(),
                 endpoint: session.endpoint.clone(),
@@ -634,12 +634,12 @@ fn handle_reconnect(config: &AppConfig, config_dir: &Path, mode: OutputMode) -> 
             let active = crate::core::scanner::get_active_profiles(&engine.profiles);
             if !active.is_empty() {
                 if let Some(session) = active.first() {
-                    engine.connection_state = crate::state::ConnectionState::Connected {
+                    engine.connection_state = crate::vpn_runtime::ConnectionState::Connected {
                         profile: session.name.clone(),
                         server_location: String::new(),
                         since: std::time::Instant::now(),
                         latency_ms: 0,
-                        details: Box::new(crate::state::DetailedConnectionInfo {
+                        details: Box::new(crate::vpn_runtime::DetailedConnectionInfo {
                             pid: session.pid,
                             interface: session.interface.clone(),
                             ..Default::default()

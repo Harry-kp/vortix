@@ -10,6 +10,9 @@
 //! accesses go through `self.runtime.X` or `app.runtime.X` explicitly.
 
 pub mod connection;
+pub mod connection_state;
+
+pub use connection_state::{ConnectionState, DetailedConnectionInfo};
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -23,9 +26,7 @@ use crate::core::scanner::ActiveSession;
 use crate::core::telemetry::{self, TelemetryUpdate};
 use crate::logger;
 use crate::message::Message;
-use crate::state::{
-    ConnectionState, KillSwitchMode, KillSwitchState, ProfileSortOrder, Protocol, VpnProfile,
-};
+use crate::state::{KillSwitchMode, KillSwitchState, ProfileSortOrder, Protocol, VpnProfile};
 use crate::utils;
 
 /// Core VPN engine — all VPN-related state, no UI dependencies.

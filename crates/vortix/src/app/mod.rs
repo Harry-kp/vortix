@@ -45,9 +45,14 @@ use crate::vortix_core::engine::TunnelRegistry;
 
 // Re-export state types for convenient access
 pub use crate::state::{
-    AuthField, ConnectionState, DetailedConnectionInfo, FlipAnimation, FocusedPanel, InputMode,
-    ProfileSortOrder, Protocol, Toast, ToastType, VpnProfile, DISMISS_DURATION,
+    AuthField, FlipAnimation, FocusedPanel, InputMode, ProfileSortOrder, Protocol, Toast,
+    ToastType, VpnProfile, DISMISS_DURATION,
 };
+// The legacy single-tunnel `ConnectionState`/`DetailedConnectionInfo` enum
+// lives on `crate::vpn_runtime` after U6 Stage B; re-export through `app::`
+// so the existing `app/connection.rs` / `app/update.rs` code paths that
+// drive the legacy mirror still resolve `app::ConnectionState`.
+pub use crate::vpn_runtime::{ConnectionState, DetailedConnectionInfo};
 
 /// Main application state container.
 ///

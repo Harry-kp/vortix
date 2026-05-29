@@ -4,8 +4,8 @@
 //! command handlers without requiring root, VPN tools, or network access.
 
 use vortix::cli::output::{error_response, CliError, CliResponse, ExitCode, OutputMode};
-use vortix::vpn_runtime::VpnRuntime;
-use vortix::state::{ConnectionState, KillSwitchMode, KillSwitchState, Protocol, VpnProfile};
+use vortix::vpn_runtime::{ConnectionState, VpnRuntime};
+use vortix::state::{KillSwitchMode, KillSwitchState, Protocol, VpnProfile};
 
 // ============================================================================
 // VpnRuntime headless mode

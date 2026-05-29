@@ -1,4 +1,5 @@
-use crate::app::{App, ConnectionState};
+use crate::app::App;
+use crate::vortix_core::engine::state::Connection;
 use crate::{constants, theme, utils};
 use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
@@ -11,6 +12,13 @@ use ratatui::{
     Frame,
 };
 
+/// Render the Network Throughput chart, scoped to the primary tunnel.
+///
+/// Multi-connection plan U6 Stage B: session-transfer totals come from
+/// the primary tunnel's snapshot. Rate history (`down/up_history`) stays
+/// on `app.runtime` because it's measured from the host's network stats
+/// rather than per-tunnel — secondary tunnels add to the same byte
+/// counters per H7.
 #[allow(clippy::too_many_lines)]
 pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     let is_focused = app.should_draw_focus(&crate::app::FocusedPanel::Chart);
@@ -25,7 +33,6 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    // Peak detection for dynamic Y-axis scaling (calculate first for title)
     let max_down = app.runtime.down_history.iter().copied().fold(0.0, f64::max);
     let max_up = app.runtime.up_history.iter().copied().fold(0.0, f64::max);
     let peak = (max_down.max(max_up) * 1.2).max(1024.0 * 1024.0 * 0.5);
@@ -60,12 +67,15 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Layout: Stats+Legend (Top) | Chart (Bottom)
     let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
 
-    // Calculate session totals from connection details if available
-    let (session_rx, session_tx) = match &app.runtime.connection_state {
-        ConnectionState::Connected { details, .. } => {
+    // Session totals derived from the primary tunnel's snapshot.
+    let primary_snap = app
+        .registry
+        .primary()
+        .and_then(|id| app.registry.snapshot(id));
+    let (session_rx, session_tx) = match primary_snap.as_ref().map(|s| &s.state) {
+        Some(Connection::Connected { details, .. }) => {
             let rx = if details.transfer_rx.is_empty() {
                 "0B".to_string()
             } else {
