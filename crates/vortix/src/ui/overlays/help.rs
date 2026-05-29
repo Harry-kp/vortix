@@ -14,8 +14,10 @@ const HELP_TEXT: &[(&str, &[(&str, &str)])] = &[
         "Global",
         &[
             ("1-9", "Quick connect to profile N"),
-            ("d", "Disconnect / Cancel / Force Kill"),
+            ("d", "Disconnect focused tunnel / Cancel / Force Kill"),
+            ("D", "Disconnect ALL active tunnels (when N>1)"),
             ("r", "Reconnect"),
+            ("u", "Revert auto-promote (when banner is showing)"),
             ("i", "Import profile (file, dir, URL)"),
             ("K", "Cycle kill switch mode"),
             ("y", "Copy VPN IP to clipboard"),
@@ -37,13 +39,28 @@ const HELP_TEXT: &[(&str, &[(&str, &str)])] = &[
             ("g / Home", "First profile"),
             ("G / End", "Last profile"),
             ("PgUp/PgDn", "Page up / down"),
-            ("c / Enter", "Connect / disconnect"),
+            ("c / Enter", "Connect / disconnect focused row"),
             ("R", "Rename profile"),
             ("v", "View config"),
             ("s", "Cycle sort order"),
             ("a", "Manage auth (OpenVPN)"),
             ("A", "Clear saved auth"),
             ("Del", "Delete profile"),
+        ],
+    ),
+    (
+        "Connection Details",
+        &[
+            ("Tab", "Cycle focus across active tunnels"),
+            ("c", "Cancel in-flight connect"),
+        ],
+    ),
+    (
+        "Switch-VPN overlay",
+        &[
+            ("Y / Enter", "Switch — disconnect current, then connect new"),
+            ("B", "Connect both — new becomes active exit"),
+            ("N / Esc", "Cancel"),
         ],
     ),
     (
@@ -159,4 +176,89 @@ pub fn render(frame: &mut Frame, scroll: u16) {
         .wrap(Wrap { trim: false })
         .scroll((clamped_scroll, 0));
     frame.render_widget(paragraph, inner);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Flatten the help text into one big string so we can grep it.
+    fn flatten() -> String {
+        let mut out = String::new();
+        for (section, bindings) in HELP_TEXT {
+            out.push_str(section);
+            out.push('\n');
+            for (key, desc) in *bindings {
+                out.push_str(key);
+                out.push(' ');
+                out.push_str(desc);
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn multi_tunnel_keys_are_documented() {
+        // Regression: every keybinding plan 001 multi-tunnel added
+        // must be discoverable via `?`. Pre-fix the help only mentioned
+        // `c / Enter` for connect/disconnect; users had no way to learn
+        // about D (disconnect-all), Tab (focus cycle), c (cancel
+        // in-flight), u (revert auto-promote), or B (multi-connect on
+        // takeover overlay).
+        let help = flatten();
+
+        // `D` Shift+d for disconnect-all.
+        assert!(
+            help.contains("Disconnect ALL"),
+            "help must document Shift+D disconnect-all:\n{help}"
+        );
+
+        // `Tab` in Connection Details for focus cycling.
+        assert!(
+            help.contains("Cycle focus across active tunnels"),
+            "help must document Tab focus cycling:\n{help}"
+        );
+
+        // `c` in Connection Details for canceling in-flight connect.
+        assert!(
+            help.contains("Cancel in-flight connect"),
+            "help must document c cancel-in-flight:\n{help}"
+        );
+
+        // `u` for reverting auto-promote.
+        assert!(
+            help.contains("Revert auto-promote"),
+            "help must document u revert-auto-promote:\n{help}"
+        );
+
+        // Takeover overlay keys.
+        assert!(
+            help.contains("Switch — disconnect current"),
+            "help must document Y/Enter takeover-switch path:\n{help}"
+        );
+        assert!(
+            help.contains("Connect both"),
+            "help must document B multi-connect path:\n{help}"
+        );
+    }
+
+    #[test]
+    fn total_lines_invariant_holds() {
+        // The render path debug-asserts that the rendered line count
+        // matches `total_lines()`. Recompute the expected count from
+        // HELP_TEXT directly and verify the helper agrees — guards
+        // against off-by-one drift when sections are added/removed.
+        let expected: usize = HELP_TEXT
+            .iter()
+            .enumerate()
+            .map(|(idx, (_, bindings))| {
+                // Per-section: 1 header line + 1 blank below + N
+                // binding lines. Between-section blank applies for
+                // section_idx > 0.
+                bindings.len() + 2 + usize::from(idx > 0)
+            })
+            .sum();
+        assert_eq!(usize::from(total_lines()), expected);
+    }
 }
