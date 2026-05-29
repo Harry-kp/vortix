@@ -40,6 +40,8 @@ use crate::constants;
 use crate::engine::VpnEngine;
 use crate::logger;
 use crate::message::Message;
+use crate::tunnel::TunnelKind;
+use crate::vortix_core::engine::TunnelRegistry;
 
 // Re-export state types for convenient access
 pub use crate::state::{
@@ -61,6 +63,13 @@ pub struct App {
     /// still mutates `self.engine` directly through `Deref`. Future plan
     /// 005 U5/U6 units migrate consumers off `Deref` and onto this handle.
     pub engine_handle: Option<crate::vortix_core::engine::EngineHandle>,
+
+    /// Multi-connection plan #001 U6 Stage A: the `TunnelRegistry` lives
+    /// alongside `engine` during the additive migration. Sidebar reads
+    /// active-tunnel snapshots from here; other panels still consult
+    /// `engine`. Empty at construction — U6 Stage B and U7 will populate
+    /// it on connect.
+    pub registry: TunnelRegistry<TunnelKind>,
 
     /// Flag indicating the application should exit.
     pub should_quit: bool,
@@ -111,6 +120,7 @@ impl App {
         let mut app = Self {
             engine,
             engine_handle: None,
+            registry: TunnelRegistry::new(),
 
             should_quit: false,
 
@@ -264,6 +274,7 @@ impl App {
         Self {
             engine,
             engine_handle: None,
+            registry: TunnelRegistry::new(),
 
             should_quit: false,
 
