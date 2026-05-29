@@ -14,6 +14,10 @@ on:
   # Manual trigger for on-demand releases
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   release-plz:
     name: Release-plz
