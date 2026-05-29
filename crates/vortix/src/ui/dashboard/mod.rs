@@ -350,6 +350,43 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
                 },
             );
         }
+        InputMode::ConfirmDisconnectAll {
+            count,
+            confirm_selected,
+        } => {
+            // Multi-connection plan #001 U19: Shift+D from the sidebar
+            // with N>1 active tunnels opens this confirm dialog before
+            // tearing them all down.
+            confirm_dialog::render(
+                frame,
+                ConfirmDialogConfig {
+                    title: " Disconnect All ",
+                    body: vec![
+                        Line::from(""),
+                        Line::from(vec![
+                            Span::styled(
+                                "Disconnect all ",
+                                Style::default().fg(theme::TEXT_SECONDARY),
+                            ),
+                            Span::styled(
+                                count.to_string(),
+                                Style::default()
+                                    .fg(theme::WARNING)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(
+                                " tunnels?",
+                                Style::default().fg(theme::TEXT_SECONDARY),
+                            ),
+                        ]),
+                    ],
+                    border_color: theme::WARNING,
+                    confirm_selected: *confirm_selected,
+                    width: 50,
+                    height: 7,
+                },
+            );
+        }
         InputMode::Normal => {}
     }
 

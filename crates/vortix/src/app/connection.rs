@@ -155,6 +155,41 @@ impl App {
         self.runtime.retry_profile_idx = None;
         self.runtime.auto_reconnect_profile = None;
 
+        // Multi-connection plan #001 U19: registry-aware Enter routing for
+        // secondaries. If the focused row corresponds to a tunnel the
+        // registry already knows about, disconnect/cancel it via the
+        // registry path instead of falling through to the legacy single-
+        // tunnel state machine (which only tracks one active profile).
+        if let Some(target_profile) = self.runtime.profiles.get(idx) {
+            use crate::vortix_core::engine::state::Connection;
+            let target_id = ProfileId::new(&target_profile.name);
+            if let Some(snap) = self.registry.snapshot(&target_id) {
+                match snap.state {
+                    Connection::Connected { .. } => {
+                        // Uniform `(Connected, Enter_on_same)` arm — applies
+                        // to both primary and secondary rows per U19's
+                        // "no primary/secondary distinction" rule.
+                        self.disconnect_profile_by_idx(idx);
+                        return;
+                    }
+                    Connection::Connecting { .. } => {
+                        // `(Connecting, Enter_on_same)` is a no-op; the
+                        // user can press `c` on Connection Details to cancel.
+                        return;
+                    }
+                    Connection::Disconnected { .. }
+                    | Connection::Disconnecting { .. }
+                    | Connection::AwaitingUserInput { .. }
+                    | Connection::Reconnecting { .. } => {
+                        // Fall through to the existing single-tunnel state
+                        // machine: Disconnected → connect path; the other
+                        // in-flight states defer to legacy handling.
+                        // U19's primary scope is the Enter/d/D race-cases.
+                    }
+                }
+            }
+        }
+
         if let Some(target_profile) = self.runtime.profiles.get(idx) {
             let target_name = target_profile.name.clone();
             match &self.runtime.connection_state {
@@ -855,6 +890,129 @@ impl App {
                     confirm_selected: true,
                 };
             }
+        }
+    }
+
+    /// Disconnect a specific profile by sidebar index (multi-connection
+    /// plan #001 U19). Routes through the registry when an FSM entry
+    /// exists for that profile; otherwise falls back to the legacy
+    /// single-tunnel `disconnect()` when the index matches the active
+    /// connection. No-op when the profile is not currently active.
+    pub(crate) fn disconnect_profile_by_idx(&mut self, idx: usize) {
+        let Some(profile) = self.runtime.profiles.get(idx) else {
+            return;
+        };
+        let name = profile.name.clone();
+        let target_id = ProfileId::new(&name);
+
+        // Registry-first: drive the FSM through `Disconnect` when the
+        // tunnel is tracked there. Errors propagate to the activity log.
+        if self.registry.snapshot(&target_id).is_some() {
+            match self.registry.disconnect(&target_id) {
+                Ok(()) => {
+                    self.log(&format!(
+                        "ACTION: Disconnecting '{name}' via registry"
+                    ));
+                }
+                Err(err) => {
+                    self.log(&format!(
+                        "ERR: registry.disconnect('{name}') failed: {err}"
+                    ));
+                }
+            }
+            // The legacy single-tunnel state machine may also still hold
+            // this profile (U6 has not finished migrating the connect
+            // path). Mirror the disconnect into it so the sidebar /
+            // header reflect the change without waiting for the next
+            // scanner sync.
+            let still_active_in_legacy = matches!(
+                &self.runtime.connection_state,
+                crate::vpn_runtime::ConnectionState::Connected { profile: p, .. }
+                | crate::vpn_runtime::ConnectionState::Connecting { profile: p, .. }
+                if *p == name
+            );
+            if still_active_in_legacy {
+                self.disconnect();
+            }
+            return;
+        }
+
+        // Legacy path: profile is the only active tunnel tracked in
+        // `runtime.connection_state` — defer to the existing disconnect.
+        let is_legacy_match = matches!(
+            &self.runtime.connection_state,
+            crate::vpn_runtime::ConnectionState::Connected { profile: p, .. }
+            | crate::vpn_runtime::ConnectionState::Connecting { profile: p, .. }
+            if *p == name
+        );
+        if is_legacy_match {
+            self.disconnect();
+        }
+    }
+
+    /// Tear down every active tunnel (multi-connection plan #001 U19).
+    /// Used by Shift+`D` after the user confirms the
+    /// [`InputMode::ConfirmDisconnectAll`] dialog, and by the
+    /// `Message::Disconnect` global when only one tunnel exists.
+    pub(crate) fn disconnect_all_active(&mut self) {
+        // Snapshot ids first so we don't hold a borrow across mutation.
+        let ids = self.active_tunnel_ids();
+        let count = ids.len();
+        self.log(&format!("ACTION: Disconnecting all {count} active tunnel(s)..."));
+
+        // Disconnect via the registry path for any tracked FSMs.
+        for id in &ids {
+            if self.registry.snapshot(id).is_some() {
+                if let Err(err) = self.registry.disconnect(id) {
+                    self.log(&format!(
+                        "ERR: registry.disconnect('{}') failed: {err}",
+                        id.as_str()
+                    ));
+                }
+            }
+        }
+
+        // Mirror the disconnect into the legacy single-tunnel state if it
+        // is still active (U6 has not finished migrating the connect path).
+        if !matches!(
+            self.runtime.connection_state,
+            crate::vpn_runtime::ConnectionState::Disconnected
+        ) {
+            self.disconnect();
+        }
+    }
+
+    /// Cancel an in-flight connect (multi-connection plan #001 U19).
+    /// Currently delegates to the existing disconnect machinery — the
+    /// legacy `disconnect()` already handles the Connecting state
+    /// (extracting the in-flight profile and transitioning to
+    /// Disconnecting). Registry-aware cancellation lands when the
+    /// registry-driven connect path arrives in a later unit.
+    pub(crate) fn cancel_connect(&mut self, idx: usize) {
+        let Some(profile) = self.runtime.profiles.get(idx) else {
+            return;
+        };
+        let name = profile.name.clone();
+        self.log(&format!("ACTION: Cancelling in-flight connect for '{name}'"));
+
+        // Registry-first: if the FSM tracks this connect, drive a
+        // Disconnect through it.
+        let target_id = ProfileId::new(&name);
+        if self.registry.snapshot(&target_id).is_some() {
+            if let Err(err) = self.registry.disconnect(&target_id) {
+                self.log(&format!(
+                    "ERR: registry.disconnect('{name}') failed: {err}"
+                ));
+            }
+        }
+
+        // Legacy path: connecting state lives in `runtime.connection_state`.
+        let is_legacy_connecting = matches!(
+            &self.runtime.connection_state,
+            crate::vpn_runtime::ConnectionState::Connecting { profile: p, .. } if *p == name
+        );
+        if is_legacy_connecting {
+            self.disconnect();
         }
     }
 
