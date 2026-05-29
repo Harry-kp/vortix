@@ -2492,3 +2492,105 @@ fn u19_confirm_disconnect_all_overlay_n_key_cancels() {
         ConnectionState::Connected { .. }
     ));
 }
+
+// ====================================================================
+// Registry-mirror tests
+//
+// Regression: TUI panels (sidebar, header, Connection Details, Security
+// Guard) read from `app.registry` exclusively. The connect path
+// originally only mutated `runtime.connection_state` (the legacy
+// single-tunnel state), leaving the registry empty. Result: a
+// successfully-connected tunnel rendered as if nothing was connected.
+// These tests pin the bridge that mirrors connect/disconnect into the
+// registry so renderers see the active state.
+// ====================================================================
+
+#[test]
+fn connect_result_success_mirrors_into_registry() {
+    use crate::vortix_core::engine::state::Connection;
+    use crate::vortix_core::profile::ProfileId;
+
+    let mut app = test_app();
+    add_profiles(&mut app, &["mirror-test"]);
+    // Pre-spawn state: the connect path sets Connecting before
+    // dispatching the worker thread.
+    app.runtime.connection_state = ConnectionState::Connecting {
+        started: Instant::now(),
+        profile: "mirror-test".to_string(),
+    };
+
+    // Pre-condition: registry is empty even though the user just
+    // pressed `1` and the worker thread is running.
+    assert_eq!(app.registry.tunnel_count(), 0);
+
+    // Simulate the worker thread reporting success — exactly what
+    // happens after `tunnel.up()` returns Ok in
+    // `connect_profile_inner`'s spawned thread.
+    app.handle_message(Message::ConnectResult {
+        profile: "mirror-test".to_string(),
+        success: true,
+        error: None,
+    });
+
+    // Renderer-facing state: panels read these exact accessors.
+    let profile_id = ProfileId::new("mirror-test");
+    let snap = app
+        .registry
+        .snapshot(&profile_id)
+        .expect("renderer-facing registry snapshot must exist after a successful connect");
+    assert!(
+        matches!(snap.state, Connection::Connected { .. }),
+        "registry FSM must be in Connected state, got {:?}",
+        snap.state
+    );
+    assert_eq!(
+        app.registry.tunnel_count(),
+        1,
+        "header tunnel_count must reflect the live connection"
+    );
+}
+
+#[test]
+fn disconnect_result_success_removes_from_registry() {
+    use crate::vortix_core::profile::ProfileId;
+
+    let mut app = test_app();
+    add_profiles(&mut app, &["mirror-test"]);
+
+    // Get into Connected first via the same handler the bug fix wires.
+    app.runtime.connection_state = ConnectionState::Connecting {
+        started: Instant::now(),
+        profile: "mirror-test".to_string(),
+    };
+    app.handle_message(Message::ConnectResult {
+        profile: "mirror-test".to_string(),
+        success: true,
+        error: None,
+    });
+    assert_eq!(app.registry.tunnel_count(), 1, "setup precondition");
+
+    // Now disconnect: legacy path goes Connected -> Disconnecting ->
+    // (worker thread tears down kernel state) -> DisconnectResult ->
+    // complete_disconnect.
+    app.runtime.connection_state = ConnectionState::Disconnecting {
+        started: Instant::now(),
+        profile: "mirror-test".to_string(),
+    };
+    app.handle_message(Message::DisconnectResult {
+        profile: "mirror-test".to_string(),
+        success: true,
+        error: None,
+    });
+
+    assert_eq!(
+        app.registry.tunnel_count(),
+        0,
+        "registry must reflect that the tunnel is gone after disconnect"
+    );
+    assert!(
+        app.registry
+            .snapshot(&ProfileId::new("mirror-test"))
+            .is_none(),
+        "no leftover snapshot for the disconnected profile"
+    );
+}

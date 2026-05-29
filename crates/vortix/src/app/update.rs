@@ -468,6 +468,16 @@ impl App {
             };
             self.runtime.session_start = Some(now);
 
+            // Plan 001 U6/U7 bridge: panel rendering reads from
+            // `self.registry` exclusively (header, sidebar, Connection
+            // Details, Security Guard) but the connect path drives
+            // `tunnel.up()` directly in a worker thread without touching
+            // the registry. Mirror the success here so the UI sees the
+            // active tunnel. Without this call the user pressing `1`
+            // gets a successful kernel connect plus a TUI that looks
+            // identical to the disconnected state.
+            self.mirror_connect_into_registry(&profile);
+
             if let Some(p) = self.runtime.profiles.iter_mut().find(|p| p.name == profile) {
                 p.last_used = Some(std::time::SystemTime::now());
             }

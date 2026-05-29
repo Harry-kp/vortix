@@ -641,8 +641,72 @@ impl App {
         // Normal disconnect (no pending switch)
         self.log(&format!("STATUS: Disconnected from '{profile_name}'"));
         self.runtime.connection_state = ConnectionState::Disconnected;
+        self.mirror_disconnect_into_registry(profile_name);
         self.sync_killswitch();
         self.refresh_telemetry();
+    }
+
+    /// Mirror a legacy-path connect success into `self.registry` so the
+    /// renderer-facing snapshots (header, sidebar, Connection Details,
+    /// Security Guard) match the live tunnel state. Today the connect
+    /// path drives `tunnel.up()` directly from a worker thread (see
+    /// `connect_profile_inner`); the registry is touched only for the
+    /// pre-up `detect_conflict` check. Plan 001 U6 Stage C / U7 will
+    /// eventually route the whole flow through `registry.connect`; this
+    /// mirror keeps the UI honest until then.
+    ///
+    /// Implementation: register a fresh `Engine<TunnelKind>` backed by
+    /// a `MockTunnel`. `registry.connect_with_tunnel` drives the FSM
+    /// `Disconnected → Connecting → Connected` synchronously; the mock
+    /// `up()` returns `DefaultSuccess` immediately, no kernel
+    /// interaction. `force: true` skips the conflict check because the
+    /// real connect already passed it in `connect_profile_inner`.
+    pub(crate) fn mirror_connect_into_registry(&mut self, profile_name: &str) {
+        let Some(profile) = self
+            .runtime
+            .profiles
+            .iter()
+            .find(|p| p.name == profile_name)
+            .cloned()
+        else {
+            return;
+        };
+
+        let profile_id = ProfileId::new(&profile.name);
+        let allowed_ips = extract_allowed_ips(profile.protocol, &profile.config_path);
+        let mock = crate::tunnel::TunnelKind::Mock(
+            crate::vortix_core::ports::tunnel::mock::MockTunnel::new(),
+        );
+
+        let resolved_profile = profile_for_resolver(&profile);
+        let profile_resolver = move |_id: &ProfileId| Some(resolved_profile.clone());
+
+        if let Err(err) = self.registry.connect_with_tunnel(
+            profile_id,
+            allowed_ips,
+            mock,
+            profile_resolver,
+            /* force */ true,
+        ) {
+            self.log(&format!(
+                "WARN: registry mirror-connect failed for '{profile_name}': {err}"
+            ));
+        }
+    }
+
+    /// Mirror a legacy-path disconnect into `self.registry`: drive the
+    /// FSM `Connected → Disconnecting → Disconnected` (mock `down()`
+    /// returns success immediately) and then remove the entry so the
+    /// registry's `tunnel_count` and `snapshot_all` reflect the
+    /// teardown. See [`Self::mirror_connect_into_registry`] for the
+    /// rationale behind this bookkeeping path.
+    pub(crate) fn mirror_disconnect_into_registry(&mut self, profile_name: &str) {
+        let profile_id = ProfileId::new(profile_name);
+        // Idempotent: if the registry doesn't know about this profile
+        // (mirror skipped, race condition, test setup) the disconnect
+        // call returns ProfileNotFound — ignore it.
+        let _ = self.registry.disconnect(&profile_id);
+        let _ = self.registry.remove(&profile_id);
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1046,6 +1110,26 @@ impl App {
             _ => {}
         }
     }
+}
+
+/// Build the `Profile` that the registry's `profile_resolver` closure
+/// returns for the mirror-into-registry path. Mirrors the inline
+/// construction inside `connect_profile_inner`'s spawned thread so the
+/// two paths produce identical `Profile` values for the same
+/// `VpnProfile` row.
+fn profile_for_resolver(
+    profile: &crate::state::VpnProfile,
+) -> crate::vortix_core::profile::Profile {
+    use crate::vortix_core::profile::{Profile, ProfileId, ProtocolKind};
+    Profile::new(
+        ProfileId::new(&profile.name),
+        &profile.name,
+        match profile.protocol {
+            Protocol::WireGuard => ProtocolKind::WireGuard,
+            Protocol::OpenVPN => ProtocolKind::OpenVpn,
+        },
+        profile.config_path.clone(),
+    )
 }
 
 /// Extract the `AllowedIPs` (`WireGuard`) or `route` directives (`OpenVPN`)
