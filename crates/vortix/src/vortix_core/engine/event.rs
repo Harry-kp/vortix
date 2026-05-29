@@ -393,7 +393,7 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         assert_eq!(
             json,
-            r#"{"kind":"tunnel_up","profile_id":"corp","protocol":"wire_guard","interface_name":"wg0","pid":1234}"#
+            r#"{"kind":"tunnel_up","profile_id":"corp","protocol":"WireGuard","interface_name":"wg0","pid":1234}"#
         );
     }
 
