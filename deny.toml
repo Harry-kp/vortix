@@ -1,3 +1,17 @@
+# Restrict cargo-deny's scan to the platforms we actually ship binaries
+# for. Without this, target-conditional deps that we NEVER compile
+# (e.g. `clipboard-win` + `error-code` pulled by `arboard` only on
+# `cfg(windows)`) still appear in `Cargo.lock` and get audited. Scoping
+# to our real targets keeps the audit honest — we only enforce license /
+# advisory rules against code that ends up in a vortix binary.
+[graph]
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-unknown-linux-gnu" },
+    { triple = "x86_64-apple-darwin" },
+    { triple = "aarch64-apple-darwin" },
+]
+
 [advisories]
 ignore = [
     # rand 0.8 unsoundness with custom logger + rand::rng() reseeding.
