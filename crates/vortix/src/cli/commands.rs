@@ -10,8 +10,8 @@ use serde::Serialize;
 
 use crate::cli::args::Commands;
 use crate::cli::output::{
-    err_not_found, err_permission_denied, print_error_and_exit, print_success, CliError, ExitCode,
-    OutputMode,
+    err_not_found, err_permission_denied, print_error_and_exit, print_success, CliError,
+    ConnectionEntry, ExitCode, OutputMode,
 };
 use crate::config::AppConfig;
 use crate::constants;
@@ -673,23 +673,31 @@ fn handle_reconnect(config: &AppConfig, config_dir: &Path, mode: OutputMode) -> 
 
 // ── Status ──────────────────────────────────────────────────────────────
 
+/// `status` command JSON payload.
+///
+/// Shape is pinned by the v2 schema (see [`crate::cli::output`] module
+/// docs):
+///
+/// - `connections`: all currently active tunnels. Empty when nothing is
+///   connected. v2 readers should prefer this field.
+/// - `primary`: profile id of the primary tunnel, or `null` when no
+///   primary is elected (no active tunnels, or only secondaries).
+/// - `connection`: v1 back-compat. Set to the primary's [`ConnectionEntry`]
+///   when a primary exists, `null` otherwise. v0.3.x consumers reading
+///   `data.connection.{state,profile,protocol,uptime_secs}` continue to
+///   work in the primary-only case.
+///
+/// U22 will replace the transitional single-entry construction below
+/// with a registry-driven snapshot; U21's job is just to make the v2
+/// envelope shape available.
 #[derive(Serialize)]
 struct StatusData {
-    connection: StatusConnection,
+    connections: Vec<ConnectionEntry>,
+    primary: Option<String>,
+    connection: Option<ConnectionEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     network: Option<StatusNetwork>,
     security: StatusSecurity,
-}
-
-#[derive(Serialize)]
-struct StatusConnection {
-    state: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    profile: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    protocol: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    uptime_secs: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -757,13 +765,32 @@ fn handle_status(
 
     let is_connected = snap.connection_state == "connected";
 
-    let data = StatusData {
-        connection: StatusConnection {
+    // U21 transitional shape: the registry-driven multi-tunnel snapshot
+    // lands in U22. Until then, "primary" is the single active tunnel
+    // (when connected), and `connections` is a one-element vec mirroring
+    // it. When disconnected, `connections` is empty and `primary` /
+    // `connection` are both `null`.
+    let primary_entry = if is_connected {
+        Some(ConnectionEntry {
             state: snap.connection_state.clone(),
             profile: snap.profile.clone(),
             protocol: snap.protocol.clone(),
             uptime_secs: snap.uptime_secs,
-        },
+        })
+    } else {
+        None
+    };
+    let connections: Vec<ConnectionEntry> = primary_entry.iter().cloned().collect();
+    let primary: Option<String> = if is_connected {
+        snap.profile.clone()
+    } else {
+        None
+    };
+
+    let data = StatusData {
+        connections,
+        primary,
+        connection: primary_entry,
         network: if is_connected {
             Some(StatusNetwork {
                 server: snap.server.clone(),
