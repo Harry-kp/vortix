@@ -130,11 +130,7 @@ impl IptablesFirewall {
 
         // DHCP — must precede the per-tunnel rules so a DHCP renew on the
         // underlay isn't dropped.
-        writeln!(
-            rules,
-            "-A OUTPUT -p udp --sport 68 --dport 67 -j ACCEPT"
-        )
-        .unwrap();
+        writeln!(rules, "-A OUTPUT -p udp --sport 68 --dport 67 -j ACCEPT").unwrap();
 
         // Per-tunnel rules. Order preserved from caller — typically
         // primary first, then secondaries by attach order.
@@ -191,11 +187,7 @@ impl IptablesFirewall {
         // for reconnect). If a tunnel has only v6 server IPs we still
         // emit the interface allow so reconnect works.
         for tunnel in active {
-            let v6_ips: Vec<&IpAddr> = tunnel
-                .server_ips
-                .iter()
-                .filter(|ip| ip.is_ipv6())
-                .collect();
+            let v6_ips: Vec<&IpAddr> = tunnel.server_ips.iter().filter(|ip| ip.is_ipv6()).collect();
             if v6_ips.is_empty() {
                 continue;
             }
@@ -306,7 +298,8 @@ impl IptablesFirewall {
     /// behind.
     fn teardown_iptables() {
         // Reset OUTPUT policy and clear filter table via iptables-restore.
-        let reset = "*filter\n:INPUT ACCEPT [0:0]\n:FORWARD ACCEPT [0:0]\n:OUTPUT ACCEPT [0:0]\nCOMMIT\n";
+        let reset =
+            "*filter\n:INPUT ACCEPT [0:0]\n:FORWARD ACCEPT [0:0]\n:OUTPUT ACCEPT [0:0]\nCOMMIT\n";
         let _ = Self::iptables_restore_stdin(reset.as_bytes());
         let _ = Self::ip6tables_restore_stdin(reset.as_bytes());
 
@@ -605,7 +598,10 @@ mod tests {
         // occurrences of "wg5" — should appear exactly once on its own
         // interface allow line plus once in the "# Tunnel:" comment.
         let occurrences = rules.matches("wg5").count();
-        assert_eq!(occurrences, 2, "wg5 should appear exactly twice (comment + rule), got ruleset:\n{rules}");
+        assert_eq!(
+            occurrences, 2,
+            "wg5 should appear exactly twice (comment + rule), got ruleset:\n{rules}"
+        );
     }
 
     #[test]

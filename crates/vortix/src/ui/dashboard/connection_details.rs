@@ -346,8 +346,14 @@ fn render_transitional(frame: &mut Frame, app: &App, inner: Rect, snap: &TunnelS
     let mut text: Vec<Line> = Vec::new();
 
     let (headline, headline_color) = match &snap.state {
-        Connection::Connecting { attempt, .. } => (format!("Connecting (attempt {attempt})"), theme::NORD_YELLOW),
-        Connection::Reconnecting { attempt, .. } => (format!("Reconnecting (attempt {attempt})"), theme::NORD_YELLOW),
+        Connection::Connecting { attempt, .. } => (
+            format!("Connecting (attempt {attempt})"),
+            theme::NORD_YELLOW,
+        ),
+        Connection::Reconnecting { attempt, .. } => (
+            format!("Reconnecting (attempt {attempt})"),
+            theme::NORD_YELLOW,
+        ),
         Connection::Disconnecting { .. } => ("Disconnecting".to_string(), theme::TEXT_SECONDARY),
         Connection::AwaitingUserInput { .. } => ("Awaiting input".to_string(), theme::WARNING),
         // Unreachable in practice — render_transitional is only invoked for
@@ -357,7 +363,9 @@ fn render_transitional(frame: &mut Frame, app: &App, inner: Rect, snap: &TunnelS
 
     text.push(Line::from(Span::styled(
         headline,
-        Style::default().fg(headline_color).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(headline_color)
+            .add_modifier(Modifier::BOLD),
     )));
     text.push(Line::from(""));
 
@@ -794,12 +802,11 @@ mod tests {
             pid: Some(42),
         });
         let mut engine = Engine::new(TunnelKind::Mock(mock), resolver);
-        let _events =
-            engine.handle(crate::vortix_core::engine::input::Input::UserCommand(
-                crate::vortix_core::engine::input::UserCommand::Connect {
-                    profile_id: ProfileId::new(profile_name),
-                },
-            ));
+        let _events = engine.handle(crate::vortix_core::engine::input::Input::UserCommand(
+            crate::vortix_core::engine::input::UserCommand::Connect {
+                profile_id: ProfileId::new(profile_name),
+            },
+        ));
         engine
     }
 

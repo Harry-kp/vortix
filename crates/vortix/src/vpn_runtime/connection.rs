@@ -6,10 +6,10 @@
 
 use std::time::{Duration, Instant};
 
+use super::{ConnectionState, DetailedConnectionInfo};
 use crate::core::scanner;
 use crate::message::Message;
 use crate::state::Protocol;
-use super::{ConnectionState, DetailedConnectionInfo};
 use crate::utils;
 
 use super::VpnRuntime;

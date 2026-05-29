@@ -15,8 +15,8 @@ use crate::cli::output::{
 };
 use crate::config::AppConfig;
 use crate::constants;
-use crate::vpn_runtime::VpnRuntime;
 use crate::state::Protocol;
+use crate::vpn_runtime::VpnRuntime;
 
 /// Dispatch a CLI command. Returns `true` if handled (program should exit).
 #[must_use]
@@ -38,14 +38,7 @@ pub fn handle_command(
             profile,
             all,
             force,
-        } => handle_down(
-            profile.as_deref(),
-            *all,
-            *force,
-            config,
-            config_dir,
-            mode,
-        ),
+        } => handle_down(profile.as_deref(), *all, *force, config, config_dir, mode),
         Commands::Reconnect { profile } => {
             handle_reconnect(profile.as_deref(), config, config_dir, mode)
         }
@@ -674,10 +667,7 @@ fn cidr_overlap(
     out
 }
 
-fn cidr_intersects(
-    x: &crate::vortix_core::cidr::Cidr,
-    y: &crate::vortix_core::cidr::Cidr,
-) -> bool {
+fn cidr_intersects(x: &crate::vortix_core::cidr::Cidr, y: &crate::vortix_core::cidr::Cidr) -> bool {
     use std::net::IpAddr;
     match (x.addr, y.addr) {
         (IpAddr::V4(a), IpAddr::V4(b)) => {
@@ -724,10 +714,7 @@ struct DownData {
 /// `TunnelRegistry`, we still drive disconnects one profile at a time
 /// through the single-tunnel `VpnRuntime`. Helper keeps the two call
 /// sites (`handle_down`, `handle_reconnect`) in sync.
-fn point_engine_at_session(
-    engine: &mut VpnRuntime,
-    session: &crate::core::scanner::ActiveSession,
-) {
+fn point_engine_at_session(engine: &mut VpnRuntime, session: &crate::core::scanner::ActiveSession) {
     engine.connection_state = crate::vpn_runtime::ConnectionState::Connected {
         profile: session.name.clone(),
         server_location: String::new(),
@@ -902,9 +889,7 @@ fn handle_reconnect(
                     CliError {
                         code: "no_profile",
                         message: "No previously used profile found".into(),
-                        hint: Some(
-                            "Connect to a profile first: sudo vortix up <PROFILE>".into(),
-                        ),
+                        hint: Some("Connect to a profile first: sudo vortix up <PROFILE>".into()),
                     },
                     ExitCode::NotFound,
                 );

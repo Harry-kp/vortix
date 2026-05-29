@@ -100,7 +100,10 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(" │ ", Style::default().fg(theme::NORD_POLAR_NIGHT_4)),
         Span::styled(" ▼ DOWN: ", Style::default().fg(theme::NORD_FROST_2)),
         Span::styled(
-            format!("{:<10}", utils::format_bytes_speed(app.runtime.current_down)),
+            format!(
+                "{:<10}",
+                utils::format_bytes_speed(app.runtime.current_down)
+            ),
             Style::default().fg(theme::TEXT_PRIMARY),
         ),
         Span::styled(" │ ", Style::default().fg(theme::NORD_POLAR_NIGHT_4)),

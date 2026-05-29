@@ -116,15 +116,12 @@ impl App {
                     return;
                 }
                 // Resolve the current focus to find the next in stable order.
-                let current = self
-                    .connection_details_focus
-                    .clone()
-                    .or_else(|| {
-                        self.profile_list_state
-                            .selected()
-                            .and_then(|i| self.runtime.profiles.get(i))
-                            .map(|p| crate::vortix_core::profile::ProfileId::new(&p.name))
-                    });
+                let current = self.connection_details_focus.clone().or_else(|| {
+                    self.profile_list_state
+                        .selected()
+                        .and_then(|i| self.runtime.profiles.get(i))
+                        .map(|p| crate::vortix_core::profile::ProfileId::new(&p.name))
+                });
                 let pos = current
                     .as_ref()
                     .and_then(|c| ids.iter().position(|i| i == c));
@@ -721,7 +718,8 @@ impl App {
                 self.log(&format!("NET: Jitter: {jitter}ms"));
             }
             TelemetryUpdate::Location(loc) => {
-                if self.runtime.location != loc && self.runtime.location != constants::MSG_DETECTING {
+                if self.runtime.location != loc && self.runtime.location != constants::MSG_DETECTING
+                {
                     self.log(&format!("NET: Location: {loc}"));
                 }
                 self.runtime.location = loc;
@@ -766,7 +764,8 @@ impl App {
     #[allow(clippy::too_many_lines)]
     fn handle_sync_system_state(&mut self, active: Vec<ActiveSession>) {
         // Guard: While Disconnecting, the scanner must NEVER override to Connected.
-        if let ConnectionState::Disconnecting { started, profile } = &self.runtime.connection_state {
+        if let ConnectionState::Disconnecting { started, profile } = &self.runtime.connection_state
+        {
             let elapsed = started.elapsed().as_secs();
             let interface_gone = !active.iter().any(|s| &s.name == profile);
 

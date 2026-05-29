@@ -552,7 +552,12 @@ impl App {
     /// Plan #004 U4: routes through the `TunnelKind` dispatch so this no
     /// longer match-branches on protocol.
     pub(crate) fn cleanup_vpn_resources(&self, profile_name: &str) {
-        if let Some(profile) = self.runtime.profiles.iter().find(|p| p.name == profile_name) {
+        if let Some(profile) = self
+            .runtime
+            .profiles
+            .iter()
+            .find(|p| p.name == profile_name)
+        {
             use crate::vortix_core::ports::tunnel::{TunnelHandle, TunnelKindTag};
             use crate::vortix_core::profile::ProfileId;
 
@@ -765,12 +770,13 @@ impl App {
 
     /// Force-disconnect: escalates a stuck disconnect.
     pub(crate) fn force_disconnect(&mut self) {
-        let profile_name =
-            if let ConnectionState::Disconnecting { profile, .. } = &self.runtime.connection_state {
-                profile.clone()
-            } else {
-                return;
-            };
+        let profile_name = if let ConnectionState::Disconnecting { profile, .. } =
+            &self.runtime.connection_state
+        {
+            profile.clone()
+        } else {
+            return;
+        };
 
         self.runtime.scanner_rx = None; // discard stale scanner data
 
@@ -910,14 +916,10 @@ impl App {
         if self.registry.snapshot(&target_id).is_some() {
             match self.registry.disconnect(&target_id) {
                 Ok(()) => {
-                    self.log(&format!(
-                        "ACTION: Disconnecting '{name}' via registry"
-                    ));
+                    self.log(&format!("ACTION: Disconnecting '{name}' via registry"));
                 }
                 Err(err) => {
-                    self.log(&format!(
-                        "ERR: registry.disconnect('{name}') failed: {err}"
-                    ));
+                    self.log(&format!("ERR: registry.disconnect('{name}') failed: {err}"));
                 }
             }
             // The legacy single-tunnel state machine may also still hold
@@ -958,7 +960,9 @@ impl App {
         // Snapshot ids first so we don't hold a borrow across mutation.
         let ids = self.active_tunnel_ids();
         let count = ids.len();
-        self.log(&format!("ACTION: Disconnecting all {count} active tunnel(s)..."));
+        self.log(&format!(
+            "ACTION: Disconnecting all {count} active tunnel(s)..."
+        ));
 
         // Disconnect via the registry path for any tracked FSMs.
         for id in &ids {
@@ -993,16 +997,16 @@ impl App {
             return;
         };
         let name = profile.name.clone();
-        self.log(&format!("ACTION: Cancelling in-flight connect for '{name}'"));
+        self.log(&format!(
+            "ACTION: Cancelling in-flight connect for '{name}'"
+        ));
 
         // Registry-first: if the FSM tracks this connect, drive a
         // Disconnect through it.
         let target_id = ProfileId::new(&name);
         if self.registry.snapshot(&target_id).is_some() {
             if let Err(err) = self.registry.disconnect(&target_id) {
-                self.log(&format!(
-                    "ERR: registry.disconnect('{name}') failed: {err}"
-                ));
+                self.log(&format!("ERR: registry.disconnect('{name}') failed: {err}"));
             }
         }
 
@@ -1469,9 +1473,10 @@ route 10.0.0.0 255.255.255.0
         let path = write_tmp("u7_skip.conf", "[Interface]\nPrivateKey = a=\n");
         let app = App::new_test();
         let allowed = extract_allowed_ips(Protocol::WireGuard, &path);
-        let conflict = app
-            .registry
-            .detect_conflict(&crate::vortix_core::profile::ProfileId::new("any"), &allowed);
+        let conflict = app.registry.detect_conflict(
+            &crate::vortix_core::profile::ProfileId::new("any"),
+            &allowed,
+        );
         assert!(conflict.is_none());
         assert!(matches!(app.input_mode, InputMode::Normal));
     }

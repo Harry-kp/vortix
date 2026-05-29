@@ -124,7 +124,7 @@ fn write_secondary_temp_config_at(
     user_conf_path: &Path,
     stripped_body: &[u8],
 ) -> Result<PathBuf, TunnelError> {
-    use crate::vortix_core::secret_file::{SecretFileError, write_secret_file};
+    use crate::vortix_core::secret_file::{write_secret_file, SecretFileError};
 
     let basename = user_conf_path
         .file_name()
@@ -289,8 +289,7 @@ impl Tunnel for WgTunnel {
         // ensures we don't double-unlink across a retry.
         let temp_to_remove = self.temp_config_path.take();
 
-        let output =
-            output.map_err(|e| TunnelError::Subprocess(format!("wg-quick down: {e}")))?;
+        let output = output.map_err(|e| TunnelError::Subprocess(format!("wg-quick down: {e}")))?;
 
         if !output.status.success() {
             if let Some(p) = &temp_to_remove {
@@ -390,7 +389,8 @@ mod tests {
 
     #[test]
     fn strip_dns_is_case_insensitive() {
-        let body = "[Interface]\nPrivateKey = abc\ndns = 8.8.8.8\nDns=4.4.4.4\nAddress = 10.0.0.2/24\n";
+        let body =
+            "[Interface]\nPrivateKey = abc\ndns = 8.8.8.8\nDns=4.4.4.4\nAddress = 10.0.0.2/24\n";
         let out = strip_dns_directive(body);
         assert!(!out.to_lowercase().contains("dns ="));
         assert!(!out.to_lowercase().contains("dns="));
@@ -417,7 +417,8 @@ mod tests {
 
     #[test]
     fn strip_dns_no_op_when_directive_absent() {
-        let body = "[Interface]\nPrivateKey = abc\nAddress = 10.0.0.2/24\n\n[Peer]\nPublicKey = xyz\n";
+        let body =
+            "[Interface]\nPrivateKey = abc\nAddress = 10.0.0.2/24\n\n[Peer]\nPublicKey = xyz\n";
         assert_eq!(strip_dns_directive(body), body);
     }
 
@@ -477,8 +478,8 @@ mod tests {
         let body = std::fs::read_to_string(&user_conf).unwrap();
         let stripped = strip_dns_directive(&body);
 
-        let temp = write_secondary_temp_config_at(&session, &user_conf, stripped.as_bytes())
-            .unwrap();
+        let temp =
+            write_secondary_temp_config_at(&session, &user_conf, stripped.as_bytes()).unwrap();
         // Basename matches the original — wg-quick will derive interface
         // "corp" from this path, identical to the user's original.
         assert_eq!(temp.file_name().unwrap(), "corp.conf");

@@ -374,10 +374,7 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
                                     .fg(theme::WARNING)
                                     .add_modifier(Modifier::BOLD),
                             ),
-                            Span::styled(
-                                " tunnels?",
-                                Style::default().fg(theme::TEXT_SECONDARY),
-                            ),
+                            Span::styled(" tunnels?", Style::default().fg(theme::TEXT_SECONDARY)),
                         ]),
                     ],
                     border_color: theme::WARNING,

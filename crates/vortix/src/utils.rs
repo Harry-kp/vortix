@@ -205,9 +205,7 @@ pub fn get_tmp_config_dir(session_id: &str) -> std::io::Result<std::path::PathBu
 #[cfg(not(unix))]
 pub fn get_tmp_config_dir(session_id: &str) -> std::io::Result<std::path::PathBuf> {
     let root = get_app_config_dir()?;
-    let session_dir = root
-        .join(crate::constants::TMP_CONFIG_DIR)
-        .join(session_id);
+    let session_dir = root.join(crate::constants::TMP_CONFIG_DIR).join(session_id);
     if !session_dir.exists() {
         create_user_dir(&session_dir)?;
     }

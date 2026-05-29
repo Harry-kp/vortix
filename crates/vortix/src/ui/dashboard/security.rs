@@ -185,7 +185,8 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
 
     let dns_provider = if app.runtime.dns_server.contains("1.1.1.1") {
         " (Cloudflare)"
-    } else if app.runtime.dns_server.contains("8.8.8.8") || app.runtime.dns_server.contains("8.8.4.4")
+    } else if app.runtime.dns_server.contains("8.8.8.8")
+        || app.runtime.dns_server.contains("8.8.4.4")
     {
         " (Google)"
     } else if app.runtime.dns_server.contains("9.9.9.9") {
@@ -676,7 +677,10 @@ mod tests {
             out.contains("Killswitch"),
             "Killswitch line missing; got:\n{out}"
         );
-        assert!(out.contains("Off"), "Off mode headline missing; got:\n{out}");
+        assert!(
+            out.contains("Off"),
+            "Off mode headline missing; got:\n{out}"
+        );
         assert!(
             !out.contains("Armed"),
             "Off must not render the AlwaysOn 'Armed' headline; got:\n{out}"

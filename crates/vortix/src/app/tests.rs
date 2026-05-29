@@ -2206,7 +2206,10 @@ fn u19_disconnect_profile_idempotent_for_inactive_row() {
     app.handle_message(Message::DisconnectProfile { idx: 1 });
 
     assert!(
-        matches!(app.runtime.connection_state, ConnectionState::Connected { .. }),
+        matches!(
+            app.runtime.connection_state,
+            ConnectionState::Connected { .. }
+        ),
         "DisconnectProfile on inactive row must leave Connected state intact, got {:?}",
         app.runtime.connection_state,
     );
@@ -2328,8 +2331,7 @@ fn u19_profile_move_clears_connection_details_focus_override() {
     let mut app = test_app();
     add_profiles(&mut app, &["alpha", "beta"]);
     set_connected(&mut app, "alpha");
-    app.connection_details_focus =
-        Some(crate::vortix_core::profile::ProfileId::new("beta"));
+    app.connection_details_focus = Some(crate::vortix_core::profile::ProfileId::new("beta"));
     app.handle_message(Message::ProfileMove(crate::message::SelectionMove::Next));
     assert!(
         app.connection_details_focus.is_none(),

@@ -150,9 +150,7 @@ fn render_primary_line(
             Span::styled(" │", Style::default().fg(theme::NORD_POLAR_NIGHT_4)),
             ks_indicator,
         ]),
-        Connection::Connected {
-            details, since, ..
-        } => {
+        Connection::Connected { details, since, .. } => {
             let profile_name = primary_snap.profile_id.as_str();
 
             let elapsed = since.elapsed().map_or(0, |d| d.as_secs());
@@ -343,13 +341,19 @@ fn append_tunnels_strip(
     }
 
     // ── Tier 2: 1-char names + `+N` overflow tail.
-    if let Some(narrow) = build_narrow_strip(&visible, budget.saturating_sub(sep_w + "Tunnels: [".width() + "]".width())) {
+    if let Some(narrow) = build_narrow_strip(
+        &visible,
+        budget.saturating_sub(sep_w + "Tunnels: [".width() + "]".width()),
+    ) {
         push_strip(&mut line, /* label */ true, &narrow);
         return line;
     }
 
     // ── Tier 3: dot-row, no `Tunnels:` label.
-    if let Some(dots) = build_dotrow(&visible, budget.saturating_sub(sep_w + "[".width() + "]".width())) {
+    if let Some(dots) = build_dotrow(
+        &visible,
+        budget.saturating_sub(sep_w + "[".width() + "]".width()),
+    ) {
         push_strip(&mut line, /* label */ false, &dots);
         return line;
     }
@@ -420,7 +424,10 @@ fn build_narrow_strip(
         }
 
         if idx > 0 {
-            spans.push(Span::styled(" ", Style::default().fg(theme::TEXT_SECONDARY)));
+            spans.push(Span::styled(
+                " ",
+                Style::default().fg(theme::TEXT_SECONDARY),
+            ));
         }
         spans.push(Span::styled(
             (*badge).to_string(),
@@ -659,9 +666,7 @@ mod tests {
 
     #[test]
     fn narrow_strip_drops_overflow_with_plus_n() {
-        let snaps: Vec<TunnelSnapshot> = (0..5)
-            .map(|i| connected(&format!("tunnel{i}")))
-            .collect();
+        let snaps: Vec<TunnelSnapshot> = (0..5).map(|i| connected(&format!("tunnel{i}"))).collect();
         let visible: Vec<_> = snaps
             .iter()
             .filter_map(|s| strip_badge(&s.state).map(|(g, c)| (s, g, c)))
@@ -702,7 +707,11 @@ mod tests {
         let pid = ProfileId::new("a");
         let out = append_tunnels_strip(base.clone(), &snaps, Some(&pid), 5);
         // No new spans appended.
-        assert_eq!(out.spans.len(), base.spans.len(), "strip dropped at tiny widths");
+        assert_eq!(
+            out.spans.len(),
+            base.spans.len(),
+            "strip dropped at tiny widths"
+        );
     }
 
     #[test]

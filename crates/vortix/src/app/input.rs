@@ -534,9 +534,7 @@ impl App {
         // Connection Details cancels the in-flight connect. Routed before
         // the global `Ctrl+C` handler (Ctrl+C already short-circuited at
         // the top of handle_key) and the panel-specific keys.
-        if key.code == KeyCode::Char('c')
-            && self.focused_panel == FocusedPanel::ConnectionDetails
-        {
+        if key.code == KeyCode::Char('c') && self.focused_panel == FocusedPanel::ConnectionDetails {
             if let Some(idx) = self.connection_details_focused_idx() {
                 if self.is_profile_connecting(idx) {
                     self.handle_message(Message::CancelConnect { idx });

@@ -182,7 +182,12 @@ impl App {
             self.save_metadata();
             self.sort_profiles();
 
-            if let Some(new_idx) = self.runtime.profiles.iter().position(|p| p.name == new_name) {
+            if let Some(new_idx) = self
+                .runtime
+                .profiles
+                .iter()
+                .position(|p| p.name == new_name)
+            {
                 self.profile_list_state.select(Some(new_idx));
             }
 

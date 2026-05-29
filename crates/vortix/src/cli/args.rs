@@ -573,6 +573,9 @@ mod tests {
         };
         assert_eq!(profile.as_deref(), Some("corp"));
         assert_eq!(timeout, 20);
-        assert!(!yes, "yes must default to false to keep current scripts unaffected");
+        assert!(
+            !yes,
+            "yes must default to false to keep current scripts unaffected"
+        );
     }
 }

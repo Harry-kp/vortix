@@ -245,7 +245,8 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
             // Primary marker: shown only when there's enough room for both a
             // 2-char ` *` suffix AND a 3-char minimum name stub. Below that we
             // suppress the marker (header still carries it cross-surface).
-            let show_primary_marker = should_show_primary_marker(signal.is_primary, name_cell_width);
+            let show_primary_marker =
+                should_show_primary_marker(signal.is_primary, name_cell_width);
             let primary_reserve = if show_primary_marker { 2 } else { 0 };
             let name_budget = name_cell_width.saturating_sub(primary_reserve).max(1);
 

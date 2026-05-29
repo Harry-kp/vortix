@@ -37,11 +37,11 @@ use ratatui::widgets::TableState;
 use std::collections::{HashMap, HashSet};
 
 use crate::constants;
-use crate::vpn_runtime::VpnRuntime;
 use crate::logger;
 use crate::message::Message;
 use crate::tunnel::TunnelKind;
 use crate::vortix_core::engine::TunnelRegistry;
+use crate::vpn_runtime::VpnRuntime;
 
 // Re-export state types for convenient access
 pub use crate::state::{
