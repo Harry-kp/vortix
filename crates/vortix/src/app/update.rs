@@ -60,18 +60,37 @@ impl App {
                     self.confirm_delete(index);
                 }
             }
-            Message::ConfirmSwitch { idx } => {
+            Message::ConfirmDefaultRouteTakeover { idx } => {
                 self.input_mode = InputMode::Normal;
                 if let Some(profile) = self.runtime.profiles.get(idx) {
-                    self.log(&format!("ACTION: Switching to '{}'...", profile.name));
+                    self.log(&format!(
+                        "ACTION: Default-route takeover confirmed; switching to '{}'...",
+                        profile.name
+                    ));
                 }
                 if matches!(self.runtime.connection_state, ConnectionState::Disconnected) {
                     self.runtime.pending_connect = None;
-                    self.toggle_connection(idx);
+                    // Multi-connection plan #001 U7: conflict already
+                    // surfaced via the overlay; retry the connect with the
+                    // detect-conflict gate bypassed (force=true).
+                    self.connect_profile_forced(idx);
                 } else {
                     self.runtime.pending_connect = Some(idx);
                     self.disconnect();
                 }
+            }
+            Message::ConfirmRouteOverlap { idx } => {
+                self.input_mode = InputMode::Normal;
+                if let Some(profile) = self.runtime.profiles.get(idx) {
+                    self.log(&format!(
+                        "ACTION: Route-overlap confirmed; connecting '{}'...",
+                        profile.name
+                    ));
+                }
+                // Route-overlap does not require a disconnect (R10): both
+                // tunnels can stay up; the killswitch synthesiser handles
+                // CIDR subtraction. Connect directly with force=true.
+                self.connect_profile_forced(idx);
             }
             Message::ProfileMove(mv) => match mv {
                 SelectionMove::Next => self.profile_next(),

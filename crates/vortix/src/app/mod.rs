@@ -22,7 +22,7 @@
 //! - `telemetry_poll` — Background telemetry and scanner polling
 //! - `helpers` — Logging, scrolling, toast notifications, and utilities
 
-mod connection;
+pub(crate) mod connection;
 mod helpers;
 mod input;
 mod profile;

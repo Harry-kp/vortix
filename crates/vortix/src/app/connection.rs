@@ -6,6 +6,9 @@ use std::time::Instant;
 use super::{App, ConnectionState, InputMode, Protocol, ToastType};
 use crate::message::Message;
 use crate::utils;
+use crate::vortix_core::cidr::Cidr;
+use crate::vortix_core::engine::Conflict;
+use crate::vortix_core::profile::ProfileId;
 use crate::vortix_process::{self, CommandSpec};
 
 /// Semantic version of an installed `openvpn` binary, as reported by
@@ -179,9 +182,14 @@ impl App {
                         self.runtime.pending_connect = None;
                         self.disconnect();
                     } else {
-                        self.input_mode = InputMode::ConfirmSwitch {
+                        // Multi-connection plan #001 U7: in the single-tunnel
+                        // world this used to be "switch profile". With the
+                        // registry, switching while connected is a
+                        // default-route takeover by definition (the active
+                        // tunnel holds the route, the new one wants it).
+                        self.input_mode = InputMode::ConfirmDefaultRouteTakeover {
                             from: current_name.clone(),
-                            to_idx: idx,
+                            to_profile_id: ProfileId::new(&target_name),
                             to_name: target_name,
                             confirm_selected: true,
                         };
@@ -300,9 +308,22 @@ impl App {
         );
     }
 
-    /// Connect to a profile
-    #[allow(clippy::too_many_lines)]
+    /// Connect to a profile. Runs the multi-connection conflict check (plan
+    /// #001 U7) before the existing tunnel-up flow; on conflict, fires the
+    /// appropriate overlay and returns without touching the tunnel.
     pub(crate) fn connect_profile(&mut self, idx: usize) {
+        self.connect_profile_inner(idx, false);
+    }
+
+    /// Bypass the multi-connection conflict check and force the connect.
+    /// Called after the user accepts the [`InputMode::ConfirmDefaultRouteTakeover`]
+    /// or [`InputMode::ConfirmRouteOverlap`] overlay.
+    pub(crate) fn connect_profile_forced(&mut self, idx: usize) {
+        self.connect_profile_inner(idx, true);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn connect_profile_inner(&mut self, idx: usize, force: bool) {
         // Clone needed data to release borrow on self
         let (name, protocol, config_path, cmd_tx) =
             if let Some(profile) = self.runtime.profiles.get(idx) {
@@ -329,6 +350,19 @@ impl App {
                 action: format!("Manage {protocol}"),
             };
             return;
+        }
+
+        // Multi-connection plan #001 U7: route the connect path through
+        // `registry.detect_conflict` before the existing tunnel-up flow.
+        // When `force` is true (user just accepted the overlay), the gate
+        // is skipped and we fall through to the legacy path.
+        if !force {
+            let target_id = ProfileId::new(&name);
+            let allowed_ips = extract_allowed_ips(protocol, &config_path);
+            if let Some(conflict) = self.registry.detect_conflict(&target_id, &allowed_ips) {
+                self.fire_conflict_overlay(conflict, idx, name);
+                return;
+            }
         }
 
         // Check if OpenVPN config needs auth credentials
@@ -789,6 +823,41 @@ impl App {
         }
     }
 
+    /// Fire the appropriate confirm overlay for a registry-reported
+    /// conflict (plan #001 U7). Logs an ACTION line so the activity panel
+    /// reflects the blocked attempt.
+    fn fire_conflict_overlay(&mut self, conflict: Conflict, _idx: usize, target_name: String) {
+        match conflict {
+            Conflict::DefaultRouteTakeover { current, new } => {
+                self.log(&format!(
+                    "ACTION: Connect to '{target_name}' blocked by default-route takeover ('{current}' holds 0/0)"
+                ));
+                self.input_mode = InputMode::ConfirmDefaultRouteTakeover {
+                    from: current.as_str().to_string(),
+                    to_profile_id: new,
+                    to_name: target_name,
+                    confirm_selected: true,
+                };
+            }
+            Conflict::RouteOverlap {
+                with,
+                overlapping_cidrs,
+            } => {
+                self.log(&format!(
+                    "ACTION: Connect to '{target_name}' blocked by route-overlap with '{with}' ({} CIDR(s))",
+                    overlapping_cidrs.len()
+                ));
+                self.input_mode = InputMode::ConfirmRouteOverlap {
+                    with_profile_id: with,
+                    overlapping_cidrs,
+                    to_profile_id: ProfileId::new(&target_name),
+                    to_name: target_name,
+                    confirm_selected: true,
+                };
+            }
+        }
+    }
+
     /// Reconnect to VPN: queues the same profile for auto-connect after disconnect.
     pub(crate) fn reconnect(&mut self) {
         match &self.runtime.connection_state {
@@ -814,6 +883,117 @@ impl App {
             }
             _ => {}
         }
+    }
+}
+
+/// Extract the `AllowedIPs` (`WireGuard`) or `route` directives (`OpenVPN`)
+/// from a profile config file into the shared `vortix_core::cidr::Cidr`
+/// representation that `TunnelRegistry::detect_conflict` consumes.
+///
+/// Plan #001 U7: this is the App-side adapter that bridges the per-protocol
+/// parsers' route declarations into the registry's conflict-detection
+/// surface. Unparseable files return an empty list so the conflict gate
+/// degrades to "no conflict" (the existing tunnel-up path will still
+/// surface a parse failure if applicable).
+pub(crate) fn extract_allowed_ips(protocol: Protocol, config_path: &std::path::Path) -> Vec<Cidr> {
+    let Ok(text) = std::fs::read_to_string(config_path) else {
+        return Vec::new();
+    };
+    match protocol {
+        Protocol::WireGuard => extract_wg_allowed_ips(&text),
+        Protocol::OpenVPN => extract_ovpn_routes(&text),
+    }
+}
+
+/// Walk a `.conf` body and collect every `AllowedIPs` entry across all
+/// `[Peer]` sections as `vortix_core::cidr::Cidr`. The `WireGuard` parser
+/// uses its own local `Cidr` type; converting at the App boundary keeps
+/// the shared `vortix_core` types canonical for downstream consumers.
+fn extract_wg_allowed_ips(text: &str) -> Vec<Cidr> {
+    let Ok(parsed) = crate::vortix_protocol_wireguard::parser::parse_wg_conf(text) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for peer in &parsed.peers {
+        for c in &peer.allowed_ips {
+            // Both Cidr types share the same field shape (addr, prefix_len);
+            // `Cidr::new` re-validates the prefix bound.
+            if let Some(converted) = Cidr::new(c.addr, c.prefix_len) {
+                out.push(converted);
+            }
+        }
+    }
+    out
+}
+
+/// Best-effort extraction of `route` directives from an `.ovpn` file. Only
+/// canonical `route <ip> <netmask>` and `route-ipv6 <prefix>` forms are
+/// recognised; anything else is skipped silently (the registry's role in
+/// U7 is detection, not validation — the `OpenVPN` binary still owns parse
+/// errors). Returns an empty list when nothing parses.
+fn extract_ovpn_routes(text: &str) -> Vec<Cidr> {
+    use std::net::{IpAddr, Ipv4Addr};
+    let mut out = Vec::new();
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let Some(directive) = parts.next() else {
+            continue;
+        };
+        match directive {
+            "redirect-gateway" => {
+                // Push the full IPv4 default route on the client; the
+                // registry's `claims_default_route_v4` recognises 0/0.
+                if let Some(c) = Cidr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0) {
+                    out.push(c);
+                }
+            }
+            "route" => {
+                let Some(addr_s) = parts.next() else { continue };
+                let Ok(addr) = addr_s.parse::<Ipv4Addr>() else {
+                    continue;
+                };
+                let prefix = match parts.next() {
+                    Some(mask_s) => mask_s
+                        .parse::<Ipv4Addr>()
+                        .ok()
+                        .map_or(32, ipv4_netmask_to_prefix),
+                    None => 32,
+                };
+                if let Some(c) = Cidr::new(IpAddr::V4(addr), prefix) {
+                    out.push(c);
+                }
+            }
+            "route-ipv6" => {
+                let Some(cidr_s) = parts.next() else { continue };
+                if let Ok(c) = cidr_s.parse::<Cidr>() {
+                    out.push(c);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn ipv4_netmask_to_prefix(mask: std::net::Ipv4Addr) -> u8 {
+    let bits = u32::from(mask);
+    // count contiguous leading 1-bits; non-canonical masks degrade to /32
+    // (treated as "very specific") rather than poisoning the conflict gate.
+    if bits == 0 {
+        return 0;
+    }
+    let leading = bits.leading_ones();
+    // verify it's a contiguous prefix
+    let expected = u32::MAX.checked_shl(32 - leading).unwrap_or(0);
+    if bits == expected {
+        // `leading` is bounded by 32 (u32 bit width), so the cast is safe.
+        u8::try_from(leading).unwrap_or(32)
+    } else {
+        32
     }
 }
 
@@ -984,5 +1164,157 @@ mod ovpn_version_tests {
             patch: 0,
         };
         assert!(c > a);
+    }
+}
+
+#[cfg(test)]
+mod u7_conflict_tests {
+    //! Plan #001 U7 — App-side conflict-detection wiring.
+    //!
+    //! Coverage focuses on the App's role: extracting `AllowedIPs` from a
+    //! profile config and translating a `Conflict` variant into the right
+    //! `InputMode` overlay. The registry's `detect_conflict` itself is
+    //! tested in `vortix_core::engine::registry`.
+    use super::{extract_allowed_ips, extract_ovpn_routes, extract_wg_allowed_ips, Protocol};
+    use crate::vortix_core::cidr::claims_default_route_v4;
+    use std::io::Write;
+
+    fn write_tmp(name: &str, body: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join("vortix_u7_tests");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(name);
+        let mut f = std::fs::File::create(&path).expect("create tmp config");
+        f.write_all(body.as_bytes()).expect("write tmp config");
+        path
+    }
+
+    #[test]
+    fn wg_parser_extracts_default_route_v4() {
+        let body = "\
+[Interface]
+PrivateKey = aGVsbG8=
+Address = 10.0.0.2/32
+
+[Peer]
+PublicKey = d29ybGQ=
+AllowedIPs = 0.0.0.0/0
+Endpoint = 1.2.3.4:51820
+";
+        let cidrs = extract_wg_allowed_ips(body);
+        assert_eq!(cidrs.len(), 1);
+        assert_eq!(cidrs[0].prefix_len, 0);
+    }
+
+    #[test]
+    fn wg_parser_extracts_disjoint_subnet() {
+        let body = "\
+[Interface]
+PrivateKey = aGVsbG8=
+
+[Peer]
+PublicKey = d29ybGQ=
+AllowedIPs = 10.0.0.0/24, 192.168.5.0/24
+Endpoint = 1.2.3.4:51820
+";
+        let cidrs = extract_wg_allowed_ips(body);
+        assert_eq!(cidrs.len(), 2);
+        // Disjoint /24s — neither claims the default route.
+        assert!(!claims_default_route_v4(&cidrs));
+    }
+
+    #[test]
+    fn ovpn_redirect_gateway_yields_default_route() {
+        let body = "\
+client
+dev tun
+remote vpn.example.com 1194
+redirect-gateway def1
+";
+        let cidrs = extract_ovpn_routes(body);
+        assert!(!cidrs.is_empty());
+        assert!(claims_default_route_v4(&cidrs));
+    }
+
+    #[test]
+    fn ovpn_route_with_netmask_parses_to_prefix() {
+        let body = "\
+client
+dev tun
+route 10.0.0.0 255.255.255.0
+";
+        let cidrs = extract_ovpn_routes(body);
+        assert_eq!(cidrs.len(), 1);
+        assert_eq!(cidrs[0].prefix_len, 24);
+    }
+
+    #[test]
+    fn unreadable_path_returns_empty() {
+        let p = std::path::PathBuf::from("/nonexistent/vortix_u7/never.conf");
+        let cidrs = extract_allowed_ips(Protocol::WireGuard, &p);
+        assert!(cidrs.is_empty());
+    }
+
+    #[test]
+    fn fire_default_route_takeover_sets_overlay() {
+        use super::App;
+        use crate::vortix_core::engine::Conflict;
+        use crate::vortix_core::profile::ProfileId;
+
+        let mut app = App::new_test();
+        let conflict = Conflict::DefaultRouteTakeover {
+            current: ProfileId::new("home"),
+            new: ProfileId::new("corp"),
+        };
+        app.fire_conflict_overlay(conflict, 0, "corp".to_string());
+        assert!(matches!(
+            app.input_mode,
+            crate::state::InputMode::ConfirmDefaultRouteTakeover { ref from, .. }
+                if from == "home"
+        ));
+    }
+
+    #[test]
+    fn fire_route_overlap_sets_overlay() {
+        use super::App;
+        use crate::vortix_core::cidr::Cidr;
+        use crate::vortix_core::engine::Conflict;
+        use crate::vortix_core::profile::ProfileId;
+
+        let mut app = App::new_test();
+        let cidr: Cidr = "10.0.0.0/8".parse().unwrap();
+        let conflict = Conflict::RouteOverlap {
+            with: ProfileId::new("home"),
+            overlapping_cidrs: vec![cidr],
+        };
+        app.fire_conflict_overlay(conflict, 1, "corp".to_string());
+        match &app.input_mode {
+            crate::state::InputMode::ConfirmRouteOverlap {
+                with_profile_id,
+                overlapping_cidrs,
+                ..
+            } => {
+                assert_eq!(with_profile_id.as_str(), "home");
+                assert_eq!(overlapping_cidrs.len(), 1);
+            }
+            other => panic!("expected ConfirmRouteOverlap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn connect_with_empty_registry_skips_overlay() {
+        // Multi-connection plan #001 U7: until U6 Stage B populates the
+        // registry, detect_conflict against an empty registry always
+        // returns None — the connect path proceeds without firing the
+        // overlay. This locks in the "no false-positive" invariant.
+        use super::App;
+        use crate::state::InputMode;
+        let path = write_tmp("u7_skip.conf", "[Interface]\nPrivateKey = a=\n");
+        let app = App::new_test();
+        let allowed = extract_allowed_ips(Protocol::WireGuard, &path);
+        let conflict = app
+            .registry
+            .detect_conflict(&crate::vortix_core::profile::ProfileId::new("any"), &allowed);
+        assert!(conflict.is_none());
+        assert!(matches!(app.input_mode, InputMode::Normal));
     }
 }

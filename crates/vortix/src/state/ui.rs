@@ -1,6 +1,8 @@
 //! UI state types.
 
 use super::Protocol;
+use crate::vortix_core::cidr::Cidr;
+use crate::vortix_core::profile::ProfileId;
 use std::time::{Duration, Instant};
 
 /// Duration for toast notifications to remain visible.
@@ -89,11 +91,33 @@ pub enum InputMode {
         /// Cursor position in the query.
         cursor: usize,
     },
-    /// Confirmation dialog for switching VPN profile while connected.
-    ConfirmSwitch {
+    /// Confirmation dialog when connecting a new profile would take over the
+    /// default route from an already-active tunnel (multi-connection plan #001
+    /// U7 — formerly `ConfirmSwitch`). On confirm the connect path retries
+    /// with `force=true`, inverting the primary.
+    ConfirmDefaultRouteTakeover {
+        /// Name of the profile currently holding the default route (display only).
         from: String,
-        to_idx: usize,
+        /// Profile id of the new tunnel attempting the takeover.
+        to_profile_id: ProfileId,
+        /// Display name of the new tunnel.
         to_name: String,
+        /// "Yes" button currently selected?
+        confirm_selected: bool,
+    },
+    /// Confirmation dialog when a new profile's `AllowedIPs` overlap with an
+    /// already-active tunnel's `AllowedIPs` on a non-default-route CIDR (R10).
+    /// On confirm the connect path retries with `force=true`.
+    ConfirmRouteOverlap {
+        /// Profile id of the conflicting (already-active) tunnel.
+        with_profile_id: ProfileId,
+        /// The overlapping CIDRs reported by the registry's conflict detector.
+        overlapping_cidrs: Vec<Cidr>,
+        /// Profile id of the new tunnel attempting to connect.
+        to_profile_id: ProfileId,
+        /// Display name of the new tunnel.
+        to_name: String,
+        /// "Yes" button currently selected?
         confirm_selected: bool,
     },
     /// `OpenVPN` authentication credentials dialog.

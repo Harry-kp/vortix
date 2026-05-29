@@ -309,12 +309,16 @@ fn test_toggle_connected_different_profile_shows_confirm() {
     app.toggle_connection(1);
 
     assert!(
-        matches!(app.input_mode, InputMode::ConfirmSwitch { to_idx: 1, .. }),
-        "Expected ConfirmSwitch dialog, got {:?}",
+        matches!(
+            app.input_mode,
+            InputMode::ConfirmDefaultRouteTakeover { ref to_profile_id, .. }
+                if to_profile_id.as_str() == "vpn-b"
+        ),
+        "Expected ConfirmDefaultRouteTakeover dialog, got {:?}",
         app.input_mode
     );
 
-    app.handle_message(Message::ConfirmSwitch { idx: 1 });
+    app.handle_message(Message::ConfirmDefaultRouteTakeover { idx: 1 });
     assert_eq!(app.runtime.pending_connect, Some(1));
     assert!(
         matches!(
@@ -614,8 +618,12 @@ fn test_quick_connect_while_connected_shows_confirm() {
     app.handle_message(Message::QuickConnect(1));
 
     assert!(
-        matches!(app.input_mode, InputMode::ConfirmSwitch { to_idx: 1, .. }),
-        "Expected ConfirmSwitch dialog for QuickConnect, got {:?}",
+        matches!(
+            app.input_mode,
+            InputMode::ConfirmDefaultRouteTakeover { ref to_profile_id, .. }
+                if to_profile_id.as_str() == "vpn-b"
+        ),
+        "Expected ConfirmDefaultRouteTakeover dialog for QuickConnect, got {:?}",
         app.input_mode,
     );
 }
@@ -1260,7 +1268,7 @@ fn test_confirm_switch_when_already_disconnected_connects_directly() {
         ConnectionState::Disconnected
     ));
 
-    app.handle_message(Message::ConfirmSwitch { idx: 1 });
+    app.handle_message(Message::ConfirmDefaultRouteTakeover { idx: 1 });
 
     assert!(
         app.runtime.pending_connect.is_none(),
