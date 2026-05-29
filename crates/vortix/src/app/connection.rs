@@ -148,20 +148,20 @@ impl App {
     /// of starting connect while disconnect is still in-flight.
     pub(crate) fn toggle_connection(&mut self, idx: usize) {
         // Cancel any in-flight retry/auto-reconnect when user initiates a new action
-        self.engine.retry_count = 0;
-        self.engine.retry_profile_idx = None;
-        self.engine.auto_reconnect_profile = None;
+        self.runtime.retry_count = 0;
+        self.runtime.retry_profile_idx = None;
+        self.runtime.auto_reconnect_profile = None;
 
-        if let Some(target_profile) = self.engine.profiles.get(idx) {
+        if let Some(target_profile) = self.runtime.profiles.get(idx) {
             let target_name = target_profile.name.clone();
-            match &self.engine.connection_state {
+            match &self.runtime.connection_state {
                 // If connecting, ignore to prevent races
                 ConnectionState::Connecting { .. } => {}
                 // If disconnecting, queue the connection for after disconnect completes
                 ConnectionState::Disconnecting { .. } => {
-                    if let Some(old) = self.engine.pending_connect {
+                    if let Some(old) = self.runtime.pending_connect {
                         if old != idx {
-                            if let Some(old_profile) = self.engine.profiles.get(old) {
+                            if let Some(old_profile) = self.runtime.profiles.get(old) {
                                 self.log(&format!(
                                     "ACTION: Switched queue from '{}' to '{target_name}'",
                                     old_profile.name
@@ -169,14 +169,14 @@ impl App {
                             }
                         }
                     }
-                    self.engine.pending_connect = Some(idx);
+                    self.runtime.pending_connect = Some(idx);
                 }
                 ConnectionState::Connected {
                     profile: current_name,
                     ..
                 } => {
                     if *current_name == target_name {
-                        self.engine.pending_connect = None;
+                        self.runtime.pending_connect = None;
                         self.disconnect();
                     } else {
                         self.input_mode = InputMode::ConfirmSwitch {
@@ -305,12 +305,12 @@ impl App {
     pub(crate) fn connect_profile(&mut self, idx: usize) {
         // Clone needed data to release borrow on self
         let (name, protocol, config_path, cmd_tx) =
-            if let Some(profile) = self.engine.profiles.get(idx) {
+            if let Some(profile) = self.runtime.profiles.get(idx) {
                 (
                     profile.name.clone(),
                     profile.protocol,
                     profile.config_path.clone(),
-                    self.engine.cmd_tx.clone(),
+                    self.runtime.cmd_tx.clone(),
                 )
             } else {
                 return;
@@ -324,7 +324,7 @@ impl App {
         }
 
         // Check root second
-        if !self.engine.is_root {
+        if !self.runtime.is_root {
             self.input_mode = InputMode::PermissionDenied {
                 action: format!("Manage {protocol}"),
             };
@@ -353,14 +353,14 @@ impl App {
         }
 
         // Start connecting
-        self.engine.connection_state = ConnectionState::Connecting {
+        self.runtime.connection_state = ConnectionState::Connecting {
             started: Instant::now(),
             profile: name.clone(),
         };
         self.log(&format!("ACTION: Connecting to '{name}' [{protocol}]..."));
 
-        let connect_timeout_secs = self.engine.config.connect_timeout;
-        let ovpn_verbosity = self.engine.config.openvpn_verbosity.clone();
+        let connect_timeout_secs = self.runtime.config.connect_timeout;
+        let ovpn_verbosity = self.runtime.config.openvpn_verbosity.clone();
 
         // Plan #004 U4: route once via TunnelKind, no protocol match arm.
         std::thread::spawn(move || {
@@ -408,14 +408,14 @@ impl App {
     pub(crate) fn sync_killswitch(&mut self) {
         use crate::state::{KillSwitchMode, KillSwitchState};
 
-        let old_state = self.engine.killswitch_state;
+        let old_state = self.runtime.killswitch_state;
 
         // 1. Determine the target state
-        self.engine.killswitch_state = match self.engine.killswitch_mode {
+        self.runtime.killswitch_state = match self.runtime.killswitch_mode {
             KillSwitchMode::Off => KillSwitchState::Disabled,
             KillSwitchMode::Auto => {
                 if matches!(
-                    self.engine.connection_state,
+                    self.runtime.connection_state,
                     ConnectionState::Connected { .. }
                 ) {
                     KillSwitchState::Armed
@@ -427,7 +427,7 @@ impl App {
             }
             KillSwitchMode::AlwaysOn => {
                 if matches!(
-                    self.engine.connection_state,
+                    self.runtime.connection_state,
                     ConnectionState::Connected { .. }
                 ) {
                     KillSwitchState::Armed
@@ -440,8 +440,8 @@ impl App {
         // 2. Refuse Blocking state when not running as root — firewall rules
         //    require elevated privileges and the UI must not claim a security
         //    posture that isn't enforced.
-        if self.engine.killswitch_state.is_blocking() && !self.engine.is_root {
-            self.engine.killswitch_state = KillSwitchState::Armed;
+        if self.runtime.killswitch_state.is_blocking() && !self.runtime.is_root {
+            self.runtime.killswitch_state = KillSwitchState::Armed;
             self.show_toast(
                 "Kill switch requires root — run with sudo".to_string(),
                 ToastType::Warning,
@@ -450,11 +450,11 @@ impl App {
         }
 
         // 3. Sync physical firewall state if target state changed or if forcing sync
-        if self.engine.killswitch_state != old_state
-            || self.engine.killswitch_state == KillSwitchState::Blocking
+        if self.runtime.killswitch_state != old_state
+            || self.runtime.killswitch_state == KillSwitchState::Blocking
         {
-            if self.engine.killswitch_state.is_blocking() {
-                let active = build_active_tunnels_from_state(&self.engine.connection_state);
+            if self.runtime.killswitch_state.is_blocking() {
+                let active = build_active_tunnels_from_state(&self.runtime.connection_state);
                 if let Err(e) = crate::core::killswitch::enable_blocking_multi(&active) {
                     self.log(&format!("WARN: Failed to enable kill switch: {e}"));
                 }
@@ -469,11 +469,11 @@ impl App {
         // active_tunnels derived from the current connection so
         // recovery on next launch can reconstruct the per-tunnel
         // ruleset).
-        let active = build_active_tunnels_from_state(&self.engine.connection_state);
+        let active = build_active_tunnels_from_state(&self.runtime.connection_state);
         let persisted_tunnels = crate::core::killswitch::persisted_from_active(&active);
         let _ = crate::core::killswitch::save_state(
-            self.engine.killswitch_mode,
-            self.engine.killswitch_state,
+            self.runtime.killswitch_mode,
+            self.runtime.killswitch_state,
             persisted_tunnels,
         );
     }
@@ -483,7 +483,7 @@ impl App {
     /// Plan #004 U4: routes through the `TunnelKind` dispatch so this no
     /// longer match-branches on protocol.
     pub(crate) fn cleanup_vpn_resources(&self, profile_name: &str) {
-        if let Some(profile) = self.engine.profiles.iter().find(|p| p.name == profile_name) {
+        if let Some(profile) = self.runtime.profiles.iter().find(|p| p.name == profile_name) {
             use crate::vortix_core::ports::tunnel::{TunnelHandle, TunnelKindTag};
             use crate::vortix_core::profile::ProfileId;
 
@@ -522,27 +522,27 @@ impl App {
     /// Finalize a disconnect: transition to `Disconnected`, sync kill switch,
     /// and drain `pending_connect` (auto-connect to the queued profile, if any).
     pub(crate) fn complete_disconnect(&mut self, profile_name: &str) {
-        self.engine.session_start = None;
-        self.engine.scanner_rx = None; // discard stale scanner data pre-disconnect
+        self.runtime.session_start = None;
+        self.runtime.scanner_rx = None; // discard stale scanner data pre-disconnect
         self.panel_flipped.clear();
         self.flip_animation = None;
 
-        self.engine.public_ip = crate::constants::MSG_DETECTING.to_string();
-        self.engine.location = crate::constants::MSG_DETECTING.to_string();
-        self.engine.isp = crate::constants::MSG_DETECTING.to_string();
-        self.engine.dns_server = crate::constants::MSG_DETECTING.to_string();
-        self.engine.ipv6_leak = false;
-        self.engine.latency_ms = 0;
-        self.engine.packet_loss = 0.0;
-        self.engine.jitter_ms = 0;
-        self.engine.last_security_check = None;
-        self.engine.ip_unchanged_warned = false;
-        self.engine.current_down = 0;
-        self.engine.current_up = 0;
+        self.runtime.public_ip = crate::constants::MSG_DETECTING.to_string();
+        self.runtime.location = crate::constants::MSG_DETECTING.to_string();
+        self.runtime.isp = crate::constants::MSG_DETECTING.to_string();
+        self.runtime.dns_server = crate::constants::MSG_DETECTING.to_string();
+        self.runtime.ipv6_leak = false;
+        self.runtime.latency_ms = 0;
+        self.runtime.packet_loss = 0.0;
+        self.runtime.jitter_ms = 0;
+        self.runtime.last_security_check = None;
+        self.runtime.ip_unchanged_warned = false;
+        self.runtime.current_down = 0;
+        self.runtime.current_up = 0;
 
         // Clean up OpenVPN runtime files if this was an OpenVPN profile
         if self
-            .engine
+            .runtime
             .profiles
             .iter()
             .any(|p| p.name == profile_name && matches!(p.protocol, Protocol::OpenVPN))
@@ -551,13 +551,13 @@ impl App {
         }
 
         // Drain pending_connect: switch directly to the next profile
-        if let Some(idx) = self.engine.pending_connect.take() {
-            if idx < self.engine.profiles.len() {
-                let next_name = self.engine.profiles[idx].name.clone();
+        if let Some(idx) = self.runtime.pending_connect.take() {
+            if idx < self.runtime.profiles.len() {
+                let next_name = self.runtime.profiles[idx].name.clone();
                 self.log(&format!(
                     "STATUS: Disconnected from '{profile_name}', connecting to '{next_name}'..."
                 ));
-                self.engine.connection_state = ConnectionState::Disconnected;
+                self.runtime.connection_state = ConnectionState::Disconnected;
                 self.sync_killswitch();
                 self.connect_profile(idx);
                 return;
@@ -566,28 +566,28 @@ impl App {
 
         // Normal disconnect (no pending switch)
         self.log(&format!("STATUS: Disconnected from '{profile_name}'"));
-        self.engine.connection_state = ConnectionState::Disconnected;
+        self.runtime.connection_state = ConnectionState::Disconnected;
         self.sync_killswitch();
         self.refresh_telemetry();
     }
 
     #[allow(clippy::too_many_lines)]
     pub(crate) fn disconnect(&mut self) {
-        self.engine.retry_count = 0;
-        self.engine.retry_profile_idx = None;
-        self.engine.auto_reconnect_profile = None;
+        self.runtime.retry_count = 0;
+        self.runtime.retry_profile_idx = None;
+        self.runtime.auto_reconnect_profile = None;
         // Discard any in-flight scanner result captured before this disconnect;
         // stale data showing the interface "up" would otherwise re-promote to
         // Connected and trigger a spurious "VPN dropped" auto-reconnect.
-        self.engine.scanner_rx = None;
+        self.runtime.scanner_rx = None;
         // Extract connection info from Connected or Connecting state
-        let connection_info = match &self.engine.connection_state {
+        let connection_info = match &self.runtime.connection_state {
             ConnectionState::Connected {
                 profile: ref profile_name,
                 details,
                 ..
             } => self
-                .engine
+                .runtime
                 .profiles
                 .iter()
                 .find(|p| p.name == *profile_name)
@@ -597,14 +597,14 @@ impl App {
                         profile.protocol,
                         profile.config_path.clone(),
                         details.pid,
-                        self.engine.cmd_tx.clone(),
+                        self.runtime.cmd_tx.clone(),
                     )
                 }),
             ConnectionState::Connecting {
                 profile: ref profile_name,
                 ..
             } => self
-                .engine
+                .runtime
                 .profiles
                 .iter()
                 .find(|p| p.name == *profile_name)
@@ -614,7 +614,7 @@ impl App {
                         profile.protocol,
                         profile.config_path.clone(),
                         None, // no PID yet while connecting
-                        self.engine.cmd_tx.clone(),
+                        self.runtime.cmd_tx.clone(),
                     )
                 }),
             _ => None,
@@ -624,7 +624,7 @@ impl App {
             self.log(&format!("ACTION: Disconnecting from '{profile_name}'..."));
 
             // Set disconnecting state
-            self.engine.connection_state = ConnectionState::Disconnecting {
+            self.runtime.connection_state = ConnectionState::Disconnecting {
                 started: Instant::now(),
                 profile: profile_name.clone(),
             };
@@ -632,7 +632,7 @@ impl App {
             // KILL SWITCH: Sync state after changing connection state
             self.sync_killswitch();
 
-            if self.engine.killswitch_state.is_blocking() {
+            if self.runtime.killswitch_state.is_blocking() {
                 self.show_toast(
                     "Kill Switch blocking - Strict mode active".to_string(),
                     ToastType::Warning,
@@ -697,16 +697,16 @@ impl App {
     /// Force-disconnect: escalates a stuck disconnect.
     pub(crate) fn force_disconnect(&mut self) {
         let profile_name =
-            if let ConnectionState::Disconnecting { profile, .. } = &self.engine.connection_state {
+            if let ConnectionState::Disconnecting { profile, .. } = &self.runtime.connection_state {
                 profile.clone()
             } else {
                 return;
             };
 
-        self.engine.scanner_rx = None; // discard stale scanner data
+        self.runtime.scanner_rx = None; // discard stale scanner data
 
         let force_info = self
-            .engine
+            .runtime
             .profiles
             .iter()
             .find(|p| p.name == profile_name)
@@ -715,7 +715,7 @@ impl App {
                     profile.name.clone(),
                     profile.protocol,
                     profile.config_path.clone(),
-                    self.engine.cmd_tx.clone(),
+                    self.runtime.cmd_tx.clone(),
                 )
             });
 
@@ -727,7 +727,7 @@ impl App {
             );
 
             // Reset the Disconnecting timer so the 30s safety timeout starts fresh
-            self.engine.connection_state = ConnectionState::Disconnecting {
+            self.runtime.connection_state = ConnectionState::Disconnecting {
                 started: Instant::now(),
                 profile: name.clone(),
             };
@@ -791,22 +791,22 @@ impl App {
 
     /// Reconnect to VPN: queues the same profile for auto-connect after disconnect.
     pub(crate) fn reconnect(&mut self) {
-        match &self.engine.connection_state {
+        match &self.runtime.connection_state {
             ConnectionState::Connected { profile, .. } => {
                 let profile_name = profile.clone();
                 if let Some(idx) = self
-                    .engine
+                    .runtime
                     .profiles
                     .iter()
                     .position(|p| p.name == profile_name)
                 {
-                    self.engine.pending_connect = Some(idx);
+                    self.runtime.pending_connect = Some(idx);
                     self.disconnect();
                 }
             }
             ConnectionState::Disconnected => {
-                if let Some(ref last) = self.engine.last_connected_profile {
-                    if let Some(idx) = self.engine.profiles.iter().position(|p| p.name == *last) {
+                if let Some(ref last) = self.runtime.last_connected_profile {
+                    if let Some(idx) = self.runtime.profiles.iter().position(|p| p.name == *last) {
                         self.log(&format!("STATUS: Reconnecting to '{last}'"));
                         self.connect_profile(idx);
                     }

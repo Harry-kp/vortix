@@ -1,21 +1,21 @@
 //! CLI integration tests.
 //!
-//! These tests verify the CLI output layer, `VpnEngine` headless mode, and
+//! These tests verify the CLI output layer, `VpnRuntime` headless mode, and
 //! command handlers without requiring root, VPN tools, or network access.
 
 use vortix::cli::output::{error_response, CliError, CliResponse, ExitCode, OutputMode};
-use vortix::engine::VpnEngine;
+use vortix::vpn_runtime::VpnRuntime;
 use vortix::state::{ConnectionState, KillSwitchMode, KillSwitchState, Protocol, VpnProfile};
 
 // ============================================================================
-// VpnEngine headless mode
+// VpnRuntime headless mode
 // ============================================================================
 
 #[test]
 fn engine_new_headless_starts_disconnected() {
     let config = vortix::config::AppConfig::default();
     let dir = tempfile::tempdir().unwrap();
-    let engine = VpnEngine::new_headless(config, dir.path().to_path_buf());
+    let engine = VpnRuntime::new_headless(config, dir.path().to_path_buf());
     assert!(matches!(
         engine.connection_state,
         ConnectionState::Disconnected
@@ -25,7 +25,7 @@ fn engine_new_headless_starts_disconnected() {
 
 #[test]
 fn engine_new_test_has_empty_profiles() {
-    let engine = VpnEngine::new_test();
+    let engine = VpnRuntime::new_test();
     assert!(engine.profiles.is_empty());
     assert!(engine.session_start.is_none());
     assert_eq!(engine.killswitch_mode, KillSwitchMode::Off);
@@ -34,7 +34,7 @@ fn engine_new_test_has_empty_profiles() {
 
 #[test]
 fn engine_find_profile_by_name() {
-    let mut engine = VpnEngine::new_test();
+    let mut engine = VpnRuntime::new_test();
     engine.profiles.push(VpnProfile {
         name: "work-vpn".into(),
         protocol: Protocol::WireGuard,
@@ -57,7 +57,7 @@ fn engine_find_profile_by_name() {
 
 #[test]
 fn engine_sort_profiles_by_name() {
-    let mut engine = VpnEngine::new_test();
+    let mut engine = VpnRuntime::new_test();
     for name in &["charlie", "alpha", "bravo"] {
         engine.profiles.push(VpnProfile {
             name: (*name).into(),
@@ -81,7 +81,7 @@ fn engine_sort_profiles_by_name() {
 
 #[test]
 fn engine_sort_profiles_by_protocol() {
-    let mut engine = VpnEngine::new_test();
+    let mut engine = VpnRuntime::new_test();
     engine.profiles.push(VpnProfile {
         name: "ovpn-profile".into(),
         protocol: Protocol::OpenVPN,
@@ -107,14 +107,14 @@ fn engine_sort_profiles_by_protocol() {
 fn engine_check_dependencies_wireguard() {
     // Use a dummy config path — the resolvconf check only matters on Linux
     let dummy = std::path::Path::new("/dev/null");
-    let missing = VpnEngine::check_dependencies(Protocol::WireGuard, dummy);
+    let missing = VpnRuntime::check_dependencies(Protocol::WireGuard, dummy);
     // In test env, wg-quick/wg may or may not be available; just ensure no panic
     assert!(missing.len() <= 3); // wg-quick, wg, and possibly resolvconf on Linux
 }
 
 #[test]
 fn engine_scan_status_when_disconnected() {
-    let engine = VpnEngine::new_test();
+    let engine = VpnRuntime::new_test();
     let snap = engine.scan_status();
     assert_eq!(snap.connection_state, "disconnected");
     assert!(snap.profile.is_none());

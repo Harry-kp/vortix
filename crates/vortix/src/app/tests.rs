@@ -21,10 +21,10 @@ fn init_test_env() {
 /// Build a minimal `App` for unit testing (no filesystem / scanner / telemetry).
 fn test_app() -> App {
     init_test_env();
-    let mut engine = crate::engine::VpnEngine::new_test();
-    engine.config_dir = std::env::temp_dir().join(format!("vortix_test_{}", std::process::id()));
+    let mut runtime = crate::vpn_runtime::VpnRuntime::new_test();
+    runtime.config_dir = std::env::temp_dir().join(format!("vortix_test_{}", std::process::id()));
     App {
-        engine,
+        runtime,
         engine_handle: None,
         registry: crate::vortix_core::engine::TunnelRegistry::new(),
         should_quit: false,
@@ -53,8 +53,8 @@ fn test_app() -> App {
 
 /// Helper: put app into a Connected state for a given profile name.
 fn set_connected(app: &mut App, name: &str) {
-    app.engine.session_start = Some(Instant::now());
-    app.engine.connection_state = ConnectionState::Connected {
+    app.runtime.session_start = Some(Instant::now());
+    app.runtime.connection_state = ConnectionState::Connected {
         since: Instant::now(),
         profile: name.to_string(),
         server_location: "Test".to_string(),
@@ -69,7 +69,7 @@ fn set_connected(app: &mut App, name: &str) {
 
 /// Helper: put app into a Disconnecting state for a given profile name.
 fn set_disconnecting(app: &mut App, name: &str) {
-    app.engine.connection_state = ConnectionState::Disconnecting {
+    app.runtime.connection_state = ConnectionState::Disconnecting {
         started: Instant::now(),
         profile: name.to_string(),
     };
@@ -109,10 +109,10 @@ fn test_disconnect_result_success_transitions_to_disconnected() {
     });
 
     assert!(
-        matches!(app.engine.connection_state, ConnectionState::Disconnected),
+        matches!(app.runtime.connection_state, ConnectionState::Disconnected),
         "Expected Disconnected after successful DisconnectResult"
     );
-    assert!(app.engine.session_start.is_none());
+    assert!(app.runtime.session_start.is_none());
 }
 
 #[test]
@@ -128,7 +128,7 @@ fn test_disconnect_result_failure_stays_disconnecting() {
 
     assert!(
         matches!(
-            app.engine.connection_state,
+            app.runtime.connection_state,
             ConnectionState::Disconnecting { .. }
         ),
         "Should remain Disconnecting after failed disconnect (VPN may still be running)"
@@ -142,7 +142,7 @@ fn test_disconnect_result_failure_stays_disconnecting() {
 #[test]
 fn test_disconnect_result_success_from_non_disconnecting_state() {
     let mut app = test_app();
-    app.engine.connection_state = ConnectionState::Disconnected;
+    app.runtime.connection_state = ConnectionState::Disconnected;
 
     app.handle_message(Message::DisconnectResult {
         profile: "test-vpn".to_string(),
@@ -151,7 +151,7 @@ fn test_disconnect_result_success_from_non_disconnecting_state() {
     });
 
     assert!(matches!(
-        app.engine.connection_state,
+        app.runtime.connection_state,
         ConnectionState::Disconnected
     ));
 }
@@ -170,11 +170,11 @@ fn test_scanner_never_overrides_disconnecting_to_connected() {
 
     assert!(
         matches!(
-            app.engine.connection_state,
+            app.runtime.connection_state,
             ConnectionState::Disconnecting { .. }
         ),
         "Scanner must never override Disconnecting to Connected, got {:?}",
-        app.engine.connection_state
+        app.runtime.connection_state
     );
 }
 
@@ -186,16 +186,16 @@ fn test_scanner_confirms_disconnect_when_interface_gone() {
     app.handle_message(Message::SyncSystemState(vec![]));
 
     assert!(
-        matches!(app.engine.connection_state, ConnectionState::Disconnected),
+        matches!(app.runtime.connection_state, ConnectionState::Disconnected),
         "Scanner should confirm Disconnected when interface is gone"
     );
-    assert!(app.engine.session_start.is_none());
+    assert!(app.runtime.session_start.is_none());
 }
 
 #[test]
 fn test_scanner_safety_timeout_after_30s() {
     let mut app = test_app();
-    app.engine.connection_state = ConnectionState::Disconnecting {
+    app.runtime.connection_state = ConnectionState::Disconnecting {
         started: Instant::now()
             .checked_sub(std::time::Duration::from_secs(31))
             .unwrap(),
@@ -206,7 +206,7 @@ fn test_scanner_safety_timeout_after_30s() {
     app.handle_message(Message::SyncSystemState(sessions));
 
     assert!(
-        matches!(app.engine.connection_state, ConnectionState::Disconnected),
+        matches!(app.runtime.connection_state, ConnectionState::Disconnected),
         "Should time out to Disconnected after 30s"
     );
     let toast = app.toast.as_ref().expect("timeout should show toast");
@@ -223,7 +223,7 @@ fn test_scanner_disconnecting_does_not_affect_other_profiles() {
     app.handle_message(Message::SyncSystemState(sessions));
 
     assert!(
-        matches!(app.engine.connection_state, ConnectionState::Disconnected),
+        matches!(app.runtime.connection_state, ConnectionState::Disconnected),
         "Should detect our profile is gone even if other profiles are active"
     );
 }
@@ -239,7 +239,7 @@ fn test_d_while_disconnecting_escalates_to_force() {
     add_profiles(&mut app, &["test-vpn"]);
 
     let before =
-        if let ConnectionState::Disconnecting { started, .. } = &app.engine.connection_state {
+        if let ConnectionState::Disconnecting { started, .. } = &app.runtime.connection_state {
             *started
         } else {
             panic!("expected Disconnecting");
@@ -248,11 +248,11 @@ fn test_d_while_disconnecting_escalates_to_force() {
     app.handle_message(Message::Disconnect);
 
     assert!(matches!(
-        app.engine.connection_state,
+        app.runtime.connection_state,
         ConnectionState::Disconnecting { .. }
     ));
 
-    if let ConnectionState::Disconnecting { started, .. } = &app.engine.connection_state {
+    if let ConnectionState::Disconnecting { started, .. } = &app.runtime.connection_state {
         assert!(*started >= before);
     }
 
@@ -266,7 +266,7 @@ fn test_d_while_disconnected_is_noop() {
     let mut app = test_app();
     app.handle_message(Message::Disconnect);
     assert!(matches!(
-        app.engine.connection_state,
+        app.runtime.connection_state,
         ConnectionState::Disconnected
     ));
 }
@@ -277,7 +277,7 @@ fn test_d_while_disconnected_is_noop() {
 
 /// Helper: put app into a Connecting state for a given profile name.
 fn set_connecting(app: &mut App, name: &str) {
-    app.engine.connection_state = ConnectionState::Connecting {
+    app.runtime.connection_state = ConnectionState::Connecting {
         started: Instant::now(),
         profile: name.to_string(),
     };
@@ -286,7 +286,7 @@ fn set_connecting(app: &mut App, name: &str) {
 /// Helper: add test profiles to the app.
 fn add_profiles(app: &mut App, names: &[&str]) {
     for name in names {
-        app.engine.profiles.push(VpnProfile {
+        app.runtime.profiles.push(VpnProfile {
             name: (*name).to_string(),
             protocol: Protocol::WireGuard,
             config_path: std::path::PathBuf::from(format!("/tmp/{name}.conf")),
@@ -315,14 +315,14 @@ fn test_toggle_connected_different_profile_shows_confirm() {
     );
 
     app.handle_message(Message::ConfirmSwitch { idx: 1 });
-    assert_eq!(app.engine.pending_connect, Some(1));
+    assert_eq!(app.runtime.pending_connect, Some(1));
     assert!(
         matches!(
-            app.engine.connection_state,
+            app.runtime.connection_state,
             ConnectionState::Disconnecting { .. }
         ),
         "Expected Disconnecting after confirm, got {:?}",
-        app.engine.connection_state
+        app.runtime.connection_state
     );
 }
 
@@ -335,11 +335,11 @@ fn test_toggle_connected_same_profile_disconnects_without_pending() {
     app.toggle_connection(0);
 
     assert_eq!(
-        app.engine.pending_connect, None,
+        app.runtime.pending_connect, None,
         "Same-profile toggle should not set pending"
     );
     assert!(matches!(
-        app.engine.connection_state,
+        app.runtime.connection_state,
         ConnectionState::Disconnecting { .. }
     ));
 }
@@ -352,9 +352,9 @@ fn test_toggle_while_disconnecting_queues_pending() {
 
     app.toggle_connection(1);
 
-    assert_eq!(app.engine.pending_connect, Some(1));
+    assert_eq!(app.runtime.pending_connect, Some(1));
     assert!(matches!(
-        app.engine.connection_state,
+        app.runtime.connection_state,
         ConnectionState::Disconnecting { .. }
     ));
 }
@@ -368,10 +368,10 @@ fn test_toggle_while_connecting_is_rejected() {
     app.toggle_connection(1);
 
     assert!(matches!(
-        app.engine.connection_state,
+        app.runtime.connection_state,
         ConnectionState::Connecting { .. }
     ));
-    assert_eq!(app.engine.pending_connect, None);
+    assert_eq!(app.runtime.pending_connect, None);
 }
 
 #[test]
@@ -379,8 +379,8 @@ fn test_pending_connect_drained_on_disconnect_success() {
     let mut app = test_app();
     add_profiles(&mut app, &["vpn-a", "vpn-b"]);
     set_disconnecting(&mut app, "vpn-a");
-    app.engine.pending_connect = Some(1);
-    app.engine.is_root = true;
+    app.runtime.pending_connect = Some(1);
+    app.runtime.is_root = true;
 
     app.handle_message(Message::DisconnectResult {
         profile: "vpn-a".to_string(),
@@ -388,11 +388,11 @@ fn test_pending_connect_drained_on_disconnect_success() {
         error: None,
     });
 
-    assert_eq!(app.engine.pending_connect, None);
+    assert_eq!(app.runtime.pending_connect, None);
     assert!(
-        matches!(app.engine.connection_state, ConnectionState::Connecting { ref profile, .. } if profile == "vpn-b"),
+        matches!(app.runtime.connection_state, ConnectionState::Connecting { ref profile, .. } if profile == "vpn-b"),
         "Expected Connecting to vpn-b, got {:?}",
-        app.engine.connection_state
+        app.runtime.connection_state
     );
 }
 
@@ -401,14 +401,14 @@ fn test_pending_connect_drained_on_scanner_interface_gone() {
     let mut app = test_app();
     add_profiles(&mut app, &["vpn-a", "vpn-b"]);
     set_disconnecting(&mut app, "vpn-a");
-    app.engine.pending_connect = Some(1);
-    app.engine.is_root = true;
+    app.runtime.pending_connect = Some(1);
+    app.runtime.is_root = true;
 
     app.handle_message(Message::SyncSystemState(vec![]));
 
-    assert_eq!(app.engine.pending_connect, None);
+    assert_eq!(app.runtime.pending_connect, None);
     assert!(
-        matches!(app.engine.connection_state, ConnectionState::Connecting { ref profile, .. } if profile == "vpn-b"),
+        matches!(app.runtime.connection_state, ConnectionState::Connecting { ref profile, .. } if profile == "vpn-b"),
         "Expected auto-connect to vpn-b after scanner confirms disconnect"
     );
 }
@@ -418,7 +418,7 @@ fn test_pending_preserved_on_disconnect_failure() {
     let mut app = test_app();
     add_profiles(&mut app, &["vpn-a", "vpn-b"]);
     set_disconnecting(&mut app, "vpn-a");
-    app.engine.pending_connect = Some(1);
+    app.runtime.pending_connect = Some(1);
 
     app.handle_message(Message::DisconnectResult {
         profile: "vpn-a".to_string(),
@@ -427,10 +427,10 @@ fn test_pending_preserved_on_disconnect_failure() {
     });
 
     // pending_connect is preserved so it can fire after force-disconnect
-    assert_eq!(app.engine.pending_connect, Some(1));
+    assert_eq!(app.runtime.pending_connect, Some(1));
     assert!(
         matches!(
-            app.engine.connection_state,
+            app.runtime.connection_state,
             ConnectionState::Disconnecting { .. }
         ),
         "Should remain Disconnecting after failed disconnect"
@@ -441,20 +441,20 @@ fn test_pending_preserved_on_disconnect_failure() {
 fn test_pending_cleared_on_30s_timeout() {
     let mut app = test_app();
     add_profiles(&mut app, &["vpn-a", "vpn-b"]);
-    app.engine.connection_state = ConnectionState::Disconnecting {
+    app.runtime.connection_state = ConnectionState::Disconnecting {
         started: Instant::now()
             .checked_sub(std::time::Duration::from_secs(31))
             .unwrap(),
         profile: "vpn-a".to_string(),
     };
-    app.engine.pending_connect = Some(1);
+    app.runtime.pending_connect = Some(1);
 
     let sessions = vec![fake_session("vpn-a")];
     app.handle_message(Message::SyncSystemState(sessions));
 
-    assert_eq!(app.engine.pending_connect, None);
+    assert_eq!(app.runtime.pending_connect, None);
     assert!(matches!(
-        app.engine.connection_state,
+        app.runtime.connection_state,
         ConnectionState::Disconnected
     ));
 }
@@ -476,7 +476,7 @@ fn test_connect_result_success_transitions_to_connected() {
     });
 
     assert!(
-        matches!(app.engine.connection_state, ConnectionState::Connected { ref profile, .. } if profile == "test-vpn"),
+        matches!(app.runtime.connection_state, ConnectionState::Connected { ref profile, .. } if profile == "test-vpn"),
         "Successful ConnectResult should transition to Connected"
     );
 }
@@ -493,7 +493,7 @@ fn test_connect_result_failure_transitions_to_disconnected() {
     });
 
     assert!(
-        matches!(app.engine.connection_state, ConnectionState::Disconnected),
+        matches!(app.runtime.connection_state, ConnectionState::Disconnected),
         "Failed ConnectResult should transition to Disconnected"
     );
     let toast = app.toast.as_ref().expect("should show error toast");
@@ -505,7 +505,7 @@ fn test_connect_result_failure_transitions_to_disconnected() {
 fn test_connect_result_failure_clears_pending() {
     let mut app = test_app();
     set_connecting(&mut app, "test-vpn");
-    app.engine.pending_connect = Some(1);
+    app.runtime.pending_connect = Some(1);
 
     app.handle_message(Message::ConnectResult {
         profile: "test-vpn".to_string(),
@@ -514,7 +514,7 @@ fn test_connect_result_failure_clears_pending() {
     });
 
     assert_eq!(
-        app.engine.pending_connect, None,
+        app.runtime.pending_connect, None,
         "Connect failure should clear pending"
     );
 }
@@ -533,11 +533,11 @@ fn test_disconnect_from_connecting_state() {
 
     assert!(
         matches!(
-            app.engine.connection_state,
+            app.runtime.connection_state,
             ConnectionState::Disconnecting { .. }
         ),
         "disconnect() should work from Connecting state, got {:?}",
-        app.engine.connection_state
+        app.runtime.connection_state
     );
 }
 
@@ -551,7 +551,7 @@ fn test_d_key_from_connecting_state_disconnects() {
 
     assert!(
         matches!(
-            app.engine.connection_state,
+            app.runtime.connection_state,
             ConnectionState::Disconnecting { .. }
         ),
         "d key should cancel Connecting state"
@@ -570,10 +570,10 @@ fn test_reconnect_sets_pending_not_immediate_connect() {
 
     app.reconnect();
 
-    assert_eq!(app.engine.pending_connect, Some(0));
+    assert_eq!(app.runtime.pending_connect, Some(0));
     assert!(
         matches!(
-            app.engine.connection_state,
+            app.runtime.connection_state,
             ConnectionState::Disconnecting { .. }
         ),
         "Reconnect should disconnect first"
@@ -585,8 +585,8 @@ fn test_reconnect_auto_connects_after_disconnect_completes() {
     let mut app = test_app();
     add_profiles(&mut app, &["test-vpn"]);
     set_disconnecting(&mut app, "test-vpn");
-    app.engine.pending_connect = Some(0);
-    app.engine.is_root = true;
+    app.runtime.pending_connect = Some(0);
+    app.runtime.is_root = true;
 
     app.handle_message(Message::DisconnectResult {
         profile: "test-vpn".to_string(),
@@ -594,9 +594,9 @@ fn test_reconnect_auto_connects_after_disconnect_completes() {
         error: None,
     });
 
-    assert_eq!(app.engine.pending_connect, None);
+    assert_eq!(app.runtime.pending_connect, None);
     assert!(
-        matches!(app.engine.connection_state, ConnectionState::Connecting { ref profile, .. } if profile == "test-vpn"),
+        matches!(app.runtime.connection_state, ConnectionState::Connecting { ref profile, .. } if profile == "test-vpn"),
         "Reconnect should auto-connect after disconnect"
     );
 }
@@ -625,12 +625,12 @@ fn test_quick_connect_while_disconnecting_updates_pending() {
     let mut app = test_app();
     add_profiles(&mut app, &["vpn-a", "vpn-b", "vpn-c"]);
     set_disconnecting(&mut app, "vpn-a");
-    app.engine.pending_connect = Some(1);
+    app.runtime.pending_connect = Some(1);
 
     app.handle_message(Message::QuickConnect(2));
 
     assert_eq!(
-        app.engine.pending_connect,
+        app.runtime.pending_connect,
         Some(2),
         "Should update pending to new choice"
     );
@@ -640,18 +640,18 @@ fn test_quick_connect_while_disconnecting_updates_pending() {
 fn test_quick_connect_from_disconnected() {
     let mut app = test_app();
     add_profiles(&mut app, &["vpn-a"]);
-    app.engine.is_root = true;
+    app.runtime.is_root = true;
 
     app.handle_message(Message::QuickConnect(0));
 
     assert!(
         matches!(
-            app.engine.connection_state,
+            app.runtime.connection_state,
             ConnectionState::Connecting { .. }
         ),
         "QuickConnect from Disconnected should go to Connecting"
     );
-    assert_eq!(app.engine.pending_connect, None);
+    assert_eq!(app.runtime.pending_connect, None);
 }
 
 // ====================================================================
@@ -668,7 +668,7 @@ fn add_openvpn_profiles_with_auth(app: &mut App, names: &[&str], dir: &std::path
             "client\nremote example.com 1194\nauth-user-pass\ndev tun\nproto udp\n",
         )
         .unwrap();
-        app.engine.profiles.push(VpnProfile {
+        app.runtime.profiles.push(VpnProfile {
             name: (*name).to_string(),
             protocol: Protocol::OpenVPN,
             config_path,
@@ -688,7 +688,7 @@ fn add_openvpn_profiles_no_auth(app: &mut App, names: &[&str], dir: &std::path::
             "client\nremote example.com 1194\ndev tun\nproto udp\n<ca>\n</ca>\n",
         )
         .unwrap();
-        app.engine.profiles.push(VpnProfile {
+        app.runtime.profiles.push(VpnProfile {
             name: (*name).to_string(),
             protocol: Protocol::OpenVPN,
             config_path,
@@ -706,7 +706,7 @@ fn test_auth_prompt_shown_for_openvpn_with_auth_user_pass() {
         .tempdir()
         .unwrap();
     add_openvpn_profiles_with_auth(&mut app, &["auth-vpn"], tmp.path());
-    app.engine.is_root = true;
+    app.runtime.is_root = true;
 
     crate::utils::delete_openvpn_auth_file("auth-vpn");
 
@@ -717,7 +717,7 @@ fn test_auth_prompt_shown_for_openvpn_with_auth_user_pass() {
         "OpenVPN with auth-user-pass and no saved creds should show AuthPrompt"
     );
     assert!(
-        matches!(app.engine.connection_state, ConnectionState::Disconnected),
+        matches!(app.runtime.connection_state, ConnectionState::Disconnected),
         "Should not start connecting before credentials are provided"
     );
 }
@@ -730,7 +730,7 @@ fn test_auth_prompt_skipped_when_creds_saved() {
         .tempdir()
         .unwrap();
     add_openvpn_profiles_with_auth(&mut app, &["saved-vpn"], tmp.path());
-    app.engine.is_root = true;
+    app.runtime.is_root = true;
 
     let _ = crate::utils::write_openvpn_auth_file("saved-vpn", "user", "pass");
 
@@ -742,7 +742,7 @@ fn test_auth_prompt_skipped_when_creds_saved() {
     );
     assert!(
         matches!(
-            app.engine.connection_state,
+            app.runtime.connection_state,
             ConnectionState::Connecting { .. }
         ),
         "Should proceed to Connecting with saved credentials"
@@ -755,7 +755,7 @@ fn test_auth_prompt_skipped_when_creds_saved() {
 fn test_auth_prompt_skipped_for_wireguard() {
     let mut app = test_app();
     add_profiles(&mut app, &["wg-vpn"]);
-    app.engine.is_root = true;
+    app.runtime.is_root = true;
 
     app.connect_profile(0);
 
@@ -773,7 +773,7 @@ fn test_auth_prompt_skipped_for_openvpn_without_auth_directive() {
         .tempdir()
         .unwrap();
     add_openvpn_profiles_no_auth(&mut app, &["noauth-vpn"], tmp.path());
-    app.engine.is_root = true;
+    app.runtime.is_root = true;
 
     app.connect_profile(0);
 
@@ -783,7 +783,7 @@ fn test_auth_prompt_skipped_for_openvpn_without_auth_directive() {
     );
     assert!(
         matches!(
-            app.engine.connection_state,
+            app.runtime.connection_state,
             ConnectionState::Connecting { .. }
         ),
         "Should proceed to Connecting directly"
@@ -798,7 +798,7 @@ fn test_auth_submit_triggers_connect() {
         .tempdir()
         .unwrap();
     add_openvpn_profiles_with_auth(&mut app, &["submit-vpn"], tmp.path());
-    app.engine.is_root = true;
+    app.runtime.is_root = true;
 
     crate::utils::delete_openvpn_auth_file("submit-vpn");
 
@@ -813,7 +813,7 @@ fn test_auth_submit_triggers_connect() {
     assert_eq!(app.input_mode, InputMode::Normal);
     assert!(
         matches!(
-            app.engine.connection_state,
+            app.runtime.connection_state,
             ConnectionState::Connecting { .. }
         ),
         "AuthSubmit should trigger connect_profile"
@@ -836,7 +836,7 @@ fn test_auth_cancel_returns_to_normal() {
         .tempdir()
         .unwrap();
     add_openvpn_profiles_with_auth(&mut app, &["cancel-vpn"], tmp.path());
-    app.engine.is_root = true;
+    app.runtime.is_root = true;
 
     crate::utils::delete_openvpn_auth_file("cancel-vpn");
 
@@ -846,7 +846,7 @@ fn test_auth_cancel_returns_to_normal() {
     app.handle_message(Message::CloseOverlay);
     assert_eq!(app.input_mode, InputMode::Normal);
     assert!(
-        matches!(app.engine.connection_state, ConnectionState::Disconnected),
+        matches!(app.runtime.connection_state, ConnectionState::Disconnected),
         "Cancelling auth should keep Disconnected state"
     );
 }
@@ -923,13 +923,13 @@ fn test_auth_delete_profile_cleans_auth_file() {
 #[test]
 fn test_dns_leak_detected_when_dns_unchanged_after_vpn() {
     let mut app = test_app();
-    app.engine.real_dns = Some("192.168.1.1".to_string());
-    app.engine.dns_server = "192.168.1.1".to_string();
+    app.runtime.real_dns = Some("192.168.1.1".to_string());
+    app.runtime.dns_server = "192.168.1.1".to_string();
     set_connected(&mut app, "vpn-a");
 
     assert_eq!(
-        app.engine.dns_server,
-        app.engine.real_dns.as_ref().unwrap().as_str(),
+        app.runtime.dns_server,
+        app.runtime.real_dns.as_ref().unwrap().as_str(),
         "DNS unchanged = leak"
     );
 }
@@ -937,13 +937,13 @@ fn test_dns_leak_detected_when_dns_unchanged_after_vpn() {
 #[test]
 fn test_dns_not_leaking_when_vpn_pushed_new_dns() {
     let mut app = test_app();
-    app.engine.real_dns = Some("192.168.1.1".to_string());
-    app.engine.dns_server = "10.8.0.1".to_string();
+    app.runtime.real_dns = Some("192.168.1.1".to_string());
+    app.runtime.dns_server = "10.8.0.1".to_string();
     set_connected(&mut app, "vpn-a");
 
     assert_ne!(
-        app.engine.dns_server,
-        app.engine.real_dns.as_ref().unwrap().as_str(),
+        app.runtime.dns_server,
+        app.runtime.real_dns.as_ref().unwrap().as_str(),
         "Different DNS = not leaking"
     );
 }
@@ -952,13 +952,13 @@ fn test_dns_not_leaking_when_vpn_pushed_new_dns() {
 fn test_real_dns_captured_when_disconnected() {
     use crate::core::telemetry::TelemetryUpdate;
     let mut app = test_app();
-    assert!(app.engine.real_dns.is_none());
+    assert!(app.runtime.real_dns.is_none());
 
     app.handle_message(Message::Telemetry(TelemetryUpdate::Dns(
         "8.8.8.8".to_string(),
     )));
 
-    assert_eq!(app.engine.real_dns, Some("8.8.8.8".to_string()));
+    assert_eq!(app.runtime.real_dns, Some("8.8.8.8".to_string()));
 }
 
 // --- Phase 1: Last security check timestamp (#47) ---
@@ -967,37 +967,37 @@ fn test_real_dns_captured_when_disconnected() {
 fn test_last_security_check_updated_on_ip_telemetry() {
     use crate::core::telemetry::TelemetryUpdate;
     let mut app = test_app();
-    assert!(app.engine.last_security_check.is_none());
+    assert!(app.runtime.last_security_check.is_none());
 
     app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIp(
         "1.2.3.4".to_string(),
     )));
 
-    assert!(app.engine.last_security_check.is_some());
+    assert!(app.runtime.last_security_check.is_some());
 }
 
 #[test]
 fn test_last_security_check_updated_on_dns_telemetry() {
     use crate::core::telemetry::TelemetryUpdate;
     let mut app = test_app();
-    assert!(app.engine.last_security_check.is_none());
+    assert!(app.runtime.last_security_check.is_none());
 
     app.handle_message(Message::Telemetry(TelemetryUpdate::Dns(
         "1.1.1.1".to_string(),
     )));
 
-    assert!(app.engine.last_security_check.is_some());
+    assert!(app.runtime.last_security_check.is_some());
 }
 
 #[test]
 fn test_last_security_check_updated_on_ipv6_telemetry() {
     use crate::core::telemetry::TelemetryUpdate;
     let mut app = test_app();
-    assert!(app.engine.last_security_check.is_none());
+    assert!(app.runtime.last_security_check.is_none());
 
     app.handle_message(Message::Telemetry(TelemetryUpdate::Ipv6Leak(false)));
 
-    assert!(app.engine.last_security_check.is_some());
+    assert!(app.runtime.last_security_check.is_some());
 }
 
 // --- Phase 1: Reconnect from Disconnected (#49) ---
@@ -1006,13 +1006,13 @@ fn test_last_security_check_updated_on_ipv6_telemetry() {
 fn test_reconnect_from_disconnected_with_last_profile() {
     let mut app = test_app();
     add_profiles(&mut app, &["my-vpn"]);
-    app.engine.last_connected_profile = Some("my-vpn".to_string());
-    app.engine.is_root = true;
+    app.runtime.last_connected_profile = Some("my-vpn".to_string());
+    app.runtime.is_root = true;
 
     app.reconnect();
 
     assert!(
-        matches!(app.engine.connection_state, ConnectionState::Connecting { ref profile, .. } if profile == "my-vpn"),
+        matches!(app.runtime.connection_state, ConnectionState::Connecting { ref profile, .. } if profile == "my-vpn"),
         "Should initiate connection to last used profile"
     );
 }
@@ -1021,12 +1021,12 @@ fn test_reconnect_from_disconnected_with_last_profile() {
 fn test_reconnect_from_disconnected_without_last_profile_is_noop() {
     let mut app = test_app();
     add_profiles(&mut app, &["my-vpn"]);
-    assert!(app.engine.last_connected_profile.is_none());
+    assert!(app.runtime.last_connected_profile.is_none());
 
     app.reconnect();
 
     assert!(
-        matches!(app.engine.connection_state, ConnectionState::Disconnected),
+        matches!(app.runtime.connection_state, ConnectionState::Disconnected),
         "Should stay disconnected when no last_connected_profile"
     );
 }
@@ -1037,7 +1037,7 @@ fn test_reconnect_from_disconnected_without_last_profile_is_noop() {
 fn test_connection_timeout_shows_error_toast() {
     let mut app = test_app();
     add_profiles(&mut app, &["timeout-vpn"]);
-    app.engine.connection_state = ConnectionState::Connecting {
+    app.runtime.connection_state = ConnectionState::Connecting {
         started: Instant::now()
             .checked_sub(std::time::Duration::from_secs(60))
             .unwrap(),
@@ -1060,7 +1060,7 @@ fn test_connection_timeout_shows_error_toast() {
 fn test_last_connected_profile_set_on_connect_success() {
     let mut app = test_app();
     add_profiles(&mut app, &["success-vpn"]);
-    app.engine.connection_state = ConnectionState::Connecting {
+    app.runtime.connection_state = ConnectionState::Connecting {
         started: Instant::now(),
         profile: "success-vpn".to_string(),
     };
@@ -1072,7 +1072,7 @@ fn test_last_connected_profile_set_on_connect_success() {
     });
 
     assert_eq!(
-        app.engine.last_connected_profile,
+        app.runtime.last_connected_profile,
         Some("success-vpn".to_string()),
         "Should track last connected profile"
     );
@@ -1185,7 +1185,7 @@ fn test_open_config_caches_content_and_close_clears() {
 
     let tmp = tempfile::Builder::new().suffix(".conf").tempfile().unwrap();
     std::fs::write(tmp.path(), "[Interface]\nAddress = 10.0.0.1/24").unwrap();
-    app.engine.profiles.push(VpnProfile {
+    app.runtime.profiles.push(VpnProfile {
         name: "test-vpn".to_string(),
         protocol: Protocol::WireGuard,
         config_path: tmp.path().to_path_buf(),
@@ -1253,23 +1253,23 @@ fn test_confirm_switch_when_already_disconnected_connects_directly() {
     let mut app = test_app();
     add_profiles(&mut app, &["vpn-a", "vpn-b"]);
     app.profile_list_state.select(Some(0));
-    app.engine.is_root = true;
+    app.runtime.is_root = true;
 
     assert!(matches!(
-        app.engine.connection_state,
+        app.runtime.connection_state,
         ConnectionState::Disconnected
     ));
 
     app.handle_message(Message::ConfirmSwitch { idx: 1 });
 
     assert!(
-        app.engine.pending_connect.is_none(),
+        app.runtime.pending_connect.is_none(),
         "Should not set pending_connect when already disconnected"
     );
     assert!(
-        matches!(app.engine.connection_state, ConnectionState::Connecting { ref profile, .. } if profile == "vpn-b"),
+        matches!(app.runtime.connection_state, ConnectionState::Connecting { ref profile, .. } if profile == "vpn-b"),
         "Should connect directly when already disconnected, got {:?}",
-        app.engine.connection_state
+        app.runtime.connection_state
     );
 }
 
@@ -1281,21 +1281,21 @@ fn test_cycle_sort_order() {
     add_profiles(&mut app, &["charlie", "alpha", "bravo"]);
     app.profile_list_state.select(Some(0));
 
-    assert_eq!(app.engine.sort_order, ProfileSortOrder::NameAsc);
+    assert_eq!(app.runtime.sort_order, ProfileSortOrder::NameAsc);
 
     app.handle_message(Message::CycleSortOrder);
-    assert_eq!(app.engine.sort_order, ProfileSortOrder::NameDesc);
-    assert_eq!(app.engine.profiles[0].name, "charlie");
+    assert_eq!(app.runtime.sort_order, ProfileSortOrder::NameDesc);
+    assert_eq!(app.runtime.profiles[0].name, "charlie");
 
     app.handle_message(Message::CycleSortOrder);
-    assert_eq!(app.engine.sort_order, ProfileSortOrder::LastUsed);
+    assert_eq!(app.runtime.sort_order, ProfileSortOrder::LastUsed);
 
     app.handle_message(Message::CycleSortOrder);
-    assert_eq!(app.engine.sort_order, ProfileSortOrder::Protocol);
+    assert_eq!(app.runtime.sort_order, ProfileSortOrder::Protocol);
 
     app.handle_message(Message::CycleSortOrder);
-    assert_eq!(app.engine.sort_order, ProfileSortOrder::NameAsc);
-    assert_eq!(app.engine.profiles[0].name, "alpha");
+    assert_eq!(app.runtime.sort_order, ProfileSortOrder::NameAsc);
+    assert_eq!(app.runtime.profiles[0].name, "alpha");
 }
 
 #[test]
@@ -1304,14 +1304,14 @@ fn test_sort_preserves_selection() {
     add_profiles(&mut app, &["charlie", "alpha", "bravo"]);
     app.profile_list_state.select(Some(1)); // "alpha" (unsorted order)
 
-    let selected_name = app.engine.profiles[1].name.clone();
+    let selected_name = app.runtime.profiles[1].name.clone();
     assert_eq!(selected_name, "alpha");
 
     app.handle_message(Message::CycleSortOrder); // NameAsc -> NameDesc
 
     let new_idx = app.profile_list_state.selected().unwrap();
     assert_eq!(
-        app.engine.profiles[new_idx].name, "alpha",
+        app.runtime.profiles[new_idx].name, "alpha",
         "Selection should follow the profile after re-sort"
     );
 }
@@ -1632,7 +1632,7 @@ fn test_rename_updates_last_connected_profile() {
     let dir = tempfile::tempdir().unwrap();
     let conf_path = dir.path().join("old-name.conf");
     std::fs::write(&conf_path, "dummy").unwrap();
-    app.engine.profiles.push(VpnProfile {
+    app.runtime.profiles.push(VpnProfile {
         name: "old-name".to_string(),
         protocol: Protocol::WireGuard,
         config_path: conf_path,
@@ -1640,11 +1640,11 @@ fn test_rename_updates_last_connected_profile() {
         last_used: None,
     });
     app.profile_list_state.select(Some(0));
-    app.engine.last_connected_profile = Some("old-name".to_string());
+    app.runtime.last_connected_profile = Some("old-name".to_string());
 
     app.rename_profile(0, "new-name");
     assert_eq!(
-        app.engine.last_connected_profile.as_deref(),
+        app.runtime.last_connected_profile.as_deref(),
         Some("new-name"),
         "Rename should update last_connected_profile"
     );
@@ -1656,7 +1656,7 @@ fn test_rename_updates_connected_state() {
     let dir = tempfile::tempdir().unwrap();
     let conf_path = dir.path().join("active-vpn.conf");
     std::fs::write(&conf_path, "dummy").unwrap();
-    app.engine.profiles.push(VpnProfile {
+    app.runtime.profiles.push(VpnProfile {
         name: "active-vpn".to_string(),
         protocol: Protocol::WireGuard,
         config_path: conf_path,
@@ -1664,7 +1664,7 @@ fn test_rename_updates_connected_state() {
         last_used: None,
     });
     app.profile_list_state.select(Some(0));
-    app.engine.connection_state = ConnectionState::Connected {
+    app.runtime.connection_state = ConnectionState::Connected {
         profile: "active-vpn".to_string(),
         server_location: "Test".to_string(),
         since: Instant::now(),
@@ -1673,7 +1673,7 @@ fn test_rename_updates_connected_state() {
     };
 
     app.rename_profile(0, "renamed-vpn");
-    if let ConnectionState::Connected { profile, .. } = &app.engine.connection_state {
+    if let ConnectionState::Connected { profile, .. } = &app.runtime.connection_state {
         assert_eq!(
             profile, "renamed-vpn",
             "Rename should update connection_state profile name"
@@ -1687,26 +1687,26 @@ fn test_rename_updates_connected_state() {
 fn test_ip_unchanged_warning_fires_once() {
     use crate::core::telemetry::TelemetryUpdate;
     let mut app = test_app();
-    app.engine.connection_state = ConnectionState::Connected {
+    app.runtime.connection_state = ConnectionState::Connected {
         profile: "test".to_string(),
         server_location: "Test".to_string(),
         since: Instant::now(),
         latency_ms: 0,
         details: Box::new(DetailedConnectionInfo::default()),
     };
-    app.engine.public_ip = "1.2.3.4".to_string();
+    app.runtime.public_ip = "1.2.3.4".to_string();
 
     app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIp(
         "1.2.3.4".to_string(),
     )));
-    assert!(app.engine.ip_unchanged_warned, "First warning should fire");
+    assert!(app.runtime.ip_unchanged_warned, "First warning should fire");
 
-    let warned_before = app.engine.ip_unchanged_warned;
+    let warned_before = app.runtime.ip_unchanged_warned;
     app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIp(
         "1.2.3.4".to_string(),
     )));
     assert!(
-        warned_before && app.engine.ip_unchanged_warned,
+        warned_before && app.runtime.ip_unchanged_warned,
         "Second identical IP should not change the warning state"
     );
 }
@@ -1716,7 +1716,7 @@ fn test_cannot_delete_connecting_profile() {
     let mut app = test_app();
     add_profiles(&mut app, &["my-vpn"]);
     app.profile_list_state.select(Some(0));
-    app.engine.connection_state = ConnectionState::Connecting {
+    app.runtime.connection_state = ConnectionState::Connecting {
         profile: "my-vpn".to_string(),
         started: Instant::now(),
     };
@@ -1733,7 +1733,7 @@ fn test_cannot_delete_disconnecting_profile() {
     let mut app = test_app();
     add_profiles(&mut app, &["my-vpn"]);
     app.profile_list_state.select(Some(0));
-    app.engine.connection_state = ConnectionState::Disconnecting {
+    app.runtime.connection_state = ConnectionState::Disconnecting {
         profile: "my-vpn".to_string(),
         started: Instant::now(),
     };
@@ -1753,13 +1753,13 @@ fn test_connect_selected_targets_sidebar_selection() {
 
     // Verify ConnectSelected dispatches toggle_connection for the selected index.
     // Transition to Disconnecting first so toggle_connection queues pending_connect.
-    app.engine.connection_state = ConnectionState::Disconnecting {
+    app.runtime.connection_state = ConnectionState::Disconnecting {
         profile: "alpha".to_string(),
         started: Instant::now(),
     };
     app.handle_message(Message::ConnectSelected);
     assert_eq!(
-        app.engine.pending_connect,
+        app.runtime.pending_connect,
         Some(1),
         "ConnectSelected should queue the sidebar-selected profile (index 1)"
     );
@@ -1770,7 +1770,7 @@ fn test_connect_selected_reconnects_active_profile() {
     let mut app = test_app();
     add_profiles(&mut app, &["alpha", "beta"]);
     app.profile_list_state.select(Some(0));
-    app.engine.connection_state = ConnectionState::Connected {
+    app.runtime.connection_state = ConnectionState::Connected {
         profile: "alpha".to_string(),
         server_location: "Test".to_string(),
         since: Instant::now(),
@@ -1780,13 +1780,13 @@ fn test_connect_selected_reconnects_active_profile() {
 
     app.handle_message(Message::ConnectSelected);
     assert_eq!(
-        app.engine.pending_connect,
+        app.runtime.pending_connect,
         Some(0),
         "ConnectSelected on active profile should queue reconnect"
     );
     assert!(
         matches!(
-            app.engine.connection_state,
+            app.runtime.connection_state,
             ConnectionState::Disconnecting { .. }
         ),
         "Should start disconnecting for reconnect"
@@ -1804,7 +1804,7 @@ fn setup_rename_app() -> App {
 
 fn assert_rename_rejected(app: &App) {
     assert_eq!(
-        app.engine.profiles[0].name, "existing-vpn",
+        app.runtime.profiles[0].name, "existing-vpn",
         "name should be unchanged"
     );
     let toast_msg = app.toast.as_ref().map_or("", |t| t.message.as_str());

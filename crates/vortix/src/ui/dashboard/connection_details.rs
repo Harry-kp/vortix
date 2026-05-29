@@ -31,7 +31,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    if let ConnectionState::Connected { details, .. } = &app.engine.connection_state {
+    if let ConnectionState::Connected { details, .. } = &app.runtime.connection_state {
         let is_openvpn = details.public_key == "OpenVPN" || details.public_key.is_empty();
 
         // MTU value
@@ -77,12 +77,12 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
                 Line::from(vec![
                     Span::styled("Exit    : ", Style::default().fg(theme::TEXT_SECONDARY)),
                     Span::styled(
-                        utils::truncate(&app.engine.isp, isp_budget),
+                        utils::truncate(&app.runtime.isp, isp_budget),
                         Style::default().fg(theme::TEXT_PRIMARY),
                     ),
                     Span::styled(" (", Style::default().fg(theme::TEXT_SECONDARY)),
                     Span::styled(
-                        utils::truncate(&app.engine.location, loc_budget),
+                        utils::truncate(&app.runtime.location, loc_budget),
                         Style::default().fg(theme::TEXT_PRIMARY),
                     ),
                     Span::styled(")", Style::default().fg(theme::TEXT_SECONDARY)),
@@ -152,9 +152,9 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
 
         // Row 6: Quality Metrics (Unified high-density)
         let quality_status = match QualityLevel::from_metrics(
-            app.engine.latency_ms,
-            app.engine.packet_loss,
-            app.engine.jitter_ms,
+            app.runtime.latency_ms,
+            app.runtime.packet_loss,
+            app.runtime.jitter_ms,
         ) {
             QualityLevel::Unknown => ("UNKNOWN", theme::TEXT_SECONDARY),
             QualityLevel::Poor => ("POOR", theme::NORD_RED),
@@ -172,9 +172,9 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
             ),
         ]));
 
-        let latency_color = if app.engine.latency_ms < 50 {
+        let latency_color = if app.runtime.latency_ms < 50 {
             theme::NORD_GREEN
-        } else if app.engine.latency_ms < 150 {
+        } else if app.runtime.latency_ms < 150 {
             theme::NORD_YELLOW
         } else {
             theme::NORD_RED
@@ -185,14 +185,14 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(theme::TEXT_SECONDARY),
             ),
             Span::styled(
-                format!("{}ms", app.engine.latency_ms),
+                format!("{}ms", app.runtime.latency_ms),
                 Style::default().fg(latency_color),
             ),
         ]));
 
-        let jitter_color = if app.engine.jitter_ms < 5 {
+        let jitter_color = if app.runtime.jitter_ms < 5 {
             theme::NORD_GREEN
-        } else if app.engine.jitter_ms < 15 {
+        } else if app.runtime.jitter_ms < 15 {
             theme::NORD_YELLOW
         } else {
             theme::NORD_RED
@@ -203,7 +203,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(theme::TEXT_SECONDARY),
             ),
             Span::styled(
-                format!("±{}ms", app.engine.jitter_ms),
+                format!("±{}ms", app.runtime.jitter_ms),
                 Style::default().fg(jitter_color),
             ),
         ]));
@@ -214,8 +214,8 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(theme::TEXT_SECONDARY),
             ),
             Span::styled(
-                format!("{:.1}%", app.engine.packet_loss),
-                Style::default().fg(if app.engine.packet_loss < 1.0 {
+                format!("{:.1}%", app.runtime.packet_loss),
+                Style::default().fg(if app.runtime.packet_loss < 1.0 {
                     theme::NORD_GREEN
                 } else {
                     theme::NORD_RED
@@ -234,8 +234,8 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
             ),
             Span::styled(" | Drops ", Style::default().fg(theme::TEXT_SECONDARY)),
             Span::styled(
-                format!("{}", app.engine.connection_drops),
-                Style::default().fg(if app.engine.connection_drops > 0 {
+                format!("{}", app.runtime.connection_drops),
+                Style::default().fg(if app.runtime.connection_drops > 0 {
                     theme::NORD_RED
                 } else {
                     theme::TEXT_PRIMARY
@@ -259,7 +259,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
         ];
 
         if let Some(idx) = app.profile_list_state.selected() {
-            if let Some(profile) = app.engine.profiles.get(idx) {
+            if let Some(profile) = app.runtime.profiles.get(idx) {
                 text.push(Line::from(vec![
                     Span::styled("Profile : ", Style::default().fg(theme::TEXT_SECONDARY)),
                     Span::styled(&profile.name, Style::default().fg(theme::ACCENT_PRIMARY)),
@@ -294,28 +294,28 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
                 text.push(Line::from(""));
 
                 // Pre-VPN network info
-                if !app.engine.public_ip.is_empty() {
+                if !app.runtime.public_ip.is_empty() {
                     text.push(Line::from(vec![
                         Span::styled("Your IP : ", Style::default().fg(theme::TEXT_SECONDARY)),
-                        Span::styled(&app.engine.public_ip, Style::default().fg(theme::WARNING)),
+                        Span::styled(&app.runtime.public_ip, Style::default().fg(theme::WARNING)),
                     ]));
                 }
-                if !app.engine.isp.is_empty()
-                    && app.engine.isp != "Unknown"
-                    && app.engine.isp != constants::MSG_DETECTING
+                if !app.runtime.isp.is_empty()
+                    && app.runtime.isp != "Unknown"
+                    && app.runtime.isp != constants::MSG_DETECTING
                 {
                     text.push(Line::from(vec![
                         Span::styled("ISP     : ", Style::default().fg(theme::TEXT_SECONDARY)),
-                        Span::styled(&app.engine.isp, Style::default().fg(theme::TEXT_PRIMARY)),
+                        Span::styled(&app.runtime.isp, Style::default().fg(theme::TEXT_PRIMARY)),
                     ]));
                 }
-                if !app.engine.dns_server.is_empty()
-                    && app.engine.dns_server != constants::MSG_DETECTING
+                if !app.runtime.dns_server.is_empty()
+                    && app.runtime.dns_server != constants::MSG_DETECTING
                 {
                     text.push(Line::from(vec![
                         Span::styled("DNS     : ", Style::default().fg(theme::TEXT_SECONDARY)),
                         Span::styled(
-                            &app.engine.dns_server,
+                            &app.runtime.dns_server,
                             Style::default().fg(theme::TEXT_PRIMARY),
                         ),
                     ]));
@@ -349,9 +349,9 @@ fn render_back(frame: &mut Frame, app: &App, area: Rect, border_style: Style) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let latency_color = if app.engine.latency_ms < 50 {
+    let latency_color = if app.runtime.latency_ms < 50 {
         theme::NORD_GREEN
-    } else if app.engine.latency_ms < 150 {
+    } else if app.runtime.latency_ms < 150 {
         theme::NORD_YELLOW
     } else {
         theme::NORD_RED
@@ -368,21 +368,21 @@ fn render_back(frame: &mut Frame, app: &App, area: Rect, border_style: Style) {
         Line::from(vec![
             Span::styled("  Latency : ", Style::default().fg(theme::TEXT_SECONDARY)),
             Span::styled(
-                format!("{}ms", app.engine.latency_ms),
+                format!("{}ms", app.runtime.latency_ms),
                 Style::default().fg(latency_color),
             ),
         ]),
         Line::from(vec![
             Span::styled("  Jitter  : ", Style::default().fg(theme::TEXT_SECONDARY)),
             Span::styled(
-                format!("±{}ms", app.engine.jitter_ms),
+                format!("±{}ms", app.runtime.jitter_ms),
                 Style::default().fg(theme::TEXT_PRIMARY),
             ),
         ]),
         Line::from(vec![
             Span::styled("  Loss    : ", Style::default().fg(theme::TEXT_SECONDARY)),
             Span::styled(
-                format!("{:.1}%", app.engine.packet_loss),
+                format!("{:.1}%", app.runtime.packet_loss),
                 Style::default().fg(theme::TEXT_PRIMARY),
             ),
         ]),

@@ -21,7 +21,7 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     let (config_content, profile_name, config_path): (&str, String, PathBuf) =
         if let Some(idx) = app.profile_list_state.selected() {
-            if let Some(profile) = app.engine.profiles.get(idx) {
+            if let Some(profile) = app.runtime.profiles.get(idx) {
                 let content = app
                     .cached_config_content
                     .as_deref()

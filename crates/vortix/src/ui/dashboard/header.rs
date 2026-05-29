@@ -17,7 +17,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     let ks_indicator = get_killswitch_indicator(app);
 
     // Build header based on connection state
-    let line = match &app.engine.connection_state {
+    let line = match &app.runtime.connection_state {
         ConnectionState::Disconnected => {
             // When disconnected, show "Real IP" label to clarify
             Line::from(vec![
@@ -28,7 +28,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
                 Span::styled(" │ ", Style::default().fg(theme::NORD_POLAR_NIGHT_4)),
                 Span::styled("Your IP: ", Style::default().fg(theme::TEXT_SECONDARY)),
                 Span::styled(
-                    &app.engine.public_ip,
+                    &app.runtime.public_ip,
                     Style::default().fg(theme::TEXT_PRIMARY),
                 ),
                 Span::styled(" (Unprotected)", Style::default().fg(theme::WARNING)),
@@ -43,7 +43,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
             #[allow(clippy::cast_possible_truncation)]
             let spinner = spinner_frames[(elapsed as usize) % spinner_frames.len()];
             let action = if matches!(
-                app.engine.connection_state,
+                app.runtime.connection_state,
                 ConnectionState::Connecting { .. }
             ) {
                 "CONNECTING"
@@ -90,9 +90,9 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
             };
 
             let quality_indicator = match QualityLevel::from_metrics(
-                app.engine.latency_ms,
-                app.engine.packet_loss,
-                app.engine.jitter_ms,
+                app.runtime.latency_ms,
+                app.runtime.packet_loss,
+                app.runtime.jitter_ms,
             ) {
                 QualityLevel::Unknown => ("─────", theme::TEXT_SECONDARY),
                 QualityLevel::Poor => ("●●○○○", theme::NORD_RED),
@@ -101,7 +101,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
             };
 
             let proto_tag = app
-                .engine
+                .runtime
                 .profiles
                 .iter()
                 .find(|p| p.name == profile_name)
@@ -128,13 +128,13 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
                 Span::styled(proto_suffix, Style::default().fg(theme::NORD_FROST_2)),
                 Span::styled(" │ ", Style::default().fg(theme::NORD_POLAR_NIGHT_4)),
                 Span::styled("VPN: ", Style::default().fg(theme::TEXT_SECONDARY)),
-                Span::styled(&app.engine.public_ip, Style::default().fg(theme::SUCCESS)),
+                Span::styled(&app.runtime.public_ip, Style::default().fg(theme::SUCCESS)),
             ];
 
             // Add location if available (from real-time IP geolocation)
-            if !app.engine.location.is_empty()
-                && app.engine.location != "Unknown"
-                && app.engine.location != constants::MSG_DETECTING
+            if !app.runtime.location.is_empty()
+                && app.runtime.location != "Unknown"
+                && app.runtime.location != constants::MSG_DETECTING
             {
                 // Adaptive: use ~25% of terminal width for location, min 10
                 let loc_budget = (area.width as usize / 4).max(10);
@@ -143,7 +143,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
                     Style::default().fg(theme::TEXT_SECONDARY),
                 ));
                 header_spans.push(Span::styled(
-                    utils::truncate(&app.engine.location, loc_budget),
+                    utils::truncate(&app.runtime.location, loc_budget),
                     Style::default().fg(theme::ACCENT_PRIMARY),
                 ));
             }
@@ -177,7 +177,7 @@ fn get_connection_info(
     &str,
     Option<std::time::Instant>,
 ) {
-    match &app.engine.connection_state {
+    match &app.runtime.connection_state {
         ConnectionState::Disconnected => {
             ("○ DISCONNECTED", theme::ERROR, "None", "None", "-", None)
         }
@@ -201,7 +201,7 @@ fn get_connection_info(
             "● CONNECTED",
             theme::SUCCESS,
             profile,
-            &app.engine.location,
+            &app.runtime.location,
             &details.interface,
             Some(*since),
         ),
@@ -213,7 +213,7 @@ fn get_connection_info(
 fn get_killswitch_indicator(app: &App) -> Span<'static> {
     use crate::state::{KillSwitchMode, KillSwitchState};
 
-    match (app.engine.killswitch_mode, app.engine.killswitch_state) {
+    match (app.runtime.killswitch_mode, app.runtime.killswitch_state) {
         // Kill switch is OFF
         (KillSwitchMode::Off, _) | (_, KillSwitchState::Disabled) => {
             Span::styled(" KS:Off ", Style::default().fg(theme::INACTIVE))

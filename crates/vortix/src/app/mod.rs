@@ -5,12 +5,12 @@
 //!
 //! ## Architecture
 //!
-//! `App` embeds a [`VpnEngine`] that owns all VPN-related state (connection,
+//! `App` embeds a [`VpnRuntime`] that owns all VPN-related state (connection,
 //! profiles, telemetry, kill switch, retry logic). The TUI-specific state
 //! (panels, overlays, animations, scroll positions) remains directly on `App`.
 //!
-//! Plan #005 U5 removed `App: Deref<Target = VpnEngine>`. VPN-state
-//! accesses are now explicit via `self.engine.X` / `app.engine.X`. The
+//! Plan #005 U5 removed `App: Deref<Target = VpnRuntime>`. VPN-state
+//! accesses are now explicit via `self.runtime.X` / `app.runtime.X`. The
 //! optional `engine_handle` field carries the plan #005 `EngineHandle`
 //! for code paths that want to query/command through the FSM actor.
 //!
@@ -37,7 +37,7 @@ use ratatui::widgets::TableState;
 use std::collections::{HashMap, HashSet};
 
 use crate::constants;
-use crate::engine::VpnEngine;
+use crate::vpn_runtime::VpnRuntime;
 use crate::logger;
 use crate::message::Message;
 use crate::tunnel::TunnelKind;
@@ -51,24 +51,26 @@ pub use crate::state::{
 
 /// Main application state container.
 ///
-/// Holds the VPN engine (all VPN state) and TUI-specific state (panels,
-/// overlays, animations). Implements `Deref`/`DerefMut` to `VpnEngine` so
-/// that VPN field accesses are transparent.
+/// Holds the VPN runtime (telemetry, profiles, config, background workers)
+/// alongside the `TunnelRegistry` (active tunnel FSMs) and TUI-specific
+/// state (panels, overlays, animations). Reads explicitly route through
+/// `self.runtime.X` for telemetry/profiles and `self.registry` for
+/// active-tunnel snapshots.
 #[allow(clippy::struct_excessive_bools)]
 pub struct App {
-    /// The headless VPN engine — owns all VPN state and operations.
-    pub engine: VpnEngine,
+    /// The headless VPN runtime — telemetry, profile catalog, config,
+    /// background workers, kill-switch mode. Active tunnel FSMs live on
+    /// `self.registry` (plan #001 U6).
+    pub runtime: VpnRuntime,
 
-    /// Optional plan-005 `EngineHandle`. Non-load-bearing today — the TUI
-    /// still mutates `self.engine` directly through `Deref`. Future plan
-    /// 005 U5/U6 units migrate consumers off `Deref` and onto this handle.
+    /// Optional plan-005 `EngineHandle`. Non-load-bearing today — kept for
+    /// IPC / remote-control surfaces that drive a single tunnel through the
+    /// FSM actor. Multi-tunnel callers bypass this and use `self.registry`.
     pub engine_handle: Option<crate::vortix_core::engine::EngineHandle>,
 
-    /// Multi-connection plan #001 U6 Stage A: the `TunnelRegistry` lives
-    /// alongside `engine` during the additive migration. Sidebar reads
-    /// active-tunnel snapshots from here; other panels still consult
-    /// `engine`. Empty at construction — U6 Stage B and U7 will populate
-    /// it on connect.
+    /// Multi-connection plan #001: the `TunnelRegistry` owns active tunnel
+    /// FSMs. Panels read tunnel snapshots from here (sidebar, header,
+    /// `connection_details`, security, chart).
     pub registry: TunnelRegistry<TunnelKind>,
 
     /// Flag indicating the application should exit.
@@ -99,26 +101,27 @@ pub struct App {
     pub terminal_size: (u16, u16),
 }
 
-// Plan 005 U5: the previous `impl Deref<Target = VpnEngine>` was a porous
-// boundary — every TUI/app/CLI callsite could reach into VpnEngine without
-// the indirection being visible at the call site. Removed. Use
-// `app.engine` / `app.engine` explicitly from now on.
+// Plan 005 U5 removed the previous `impl Deref<Target = VpnRuntime>` — the
+// porous boundary let every TUI/app/CLI callsite reach into VpnRuntime
+// without the indirection being visible at the call site. Use
+// `app.runtime.X` for runtime fields and `app.registry` for active
+// tunnels explicitly.
 
 impl App {
     /// Create a new App instance with the given configuration.
     #[must_use]
     pub fn new(config: crate::config::AppConfig, config_dir: std::path::PathBuf) -> Self {
-        let mut engine = VpnEngine::new(config, config_dir);
+        let mut runtime = VpnRuntime::new(config, config_dir);
 
         // Load metadata and sort
-        engine.load_metadata();
-        engine.sort_profiles();
+        runtime.load_metadata();
+        runtime.sort_profiles();
 
         // Apply user's logging preferences
-        logger::configure(&engine.config.log_level, engine.config.max_log_entries);
+        logger::configure(&runtime.config.log_level, runtime.config.max_log_entries);
 
         let mut app = Self {
-            engine,
+            runtime,
             engine_handle: None,
             registry: TunnelRegistry::new(),
 
@@ -148,7 +151,7 @@ impl App {
         };
 
         // Select first profile if available
-        if !app.engine.profiles.is_empty() {
+        if !app.runtime.profiles.is_empty() {
             app.profile_list_state.select(Some(0));
         }
 
@@ -161,12 +164,12 @@ impl App {
         app.log(constants::MSG_BACKEND_INIT);
 
         {
-            let log_path = app.engine.config_dir.join(constants::LOGS_DIR_NAME);
+            let log_path = app.runtime.config_dir.join(constants::LOGS_DIR_NAME);
             app.log(&format!("IO: Auto-logging to {}", log_path.display()));
         }
 
         // Log kill switch recovery if it happened
-        if app.engine.killswitch_state == crate::state::KillSwitchState::Disabled {
+        if app.runtime.killswitch_state == crate::state::KillSwitchState::Disabled {
             // Check if we recovered from crash — the engine already handled this
         }
 
@@ -188,7 +191,7 @@ impl App {
     pub fn process_external(&mut self) {
         self.process_telemetry();
 
-        while let Ok(msg) = self.engine.cmd_rx.try_recv() {
+        while let Ok(msg) = self.runtime.cmd_rx.try_recv() {
             self.handle_message(msg);
         }
     }
@@ -270,9 +273,9 @@ impl App {
     /// Lightweight constructor for testing.
     #[must_use]
     pub fn new_test() -> Self {
-        let engine = VpnEngine::new_test();
+        let runtime = VpnRuntime::new_test();
         Self {
-            engine,
+            runtime,
             engine_handle: None,
             registry: TunnelRegistry::new(),
 
@@ -305,7 +308,7 @@ impl App {
 
 impl Drop for App {
     fn drop(&mut self) {
-        // VpnEngine's Drop handles kill switch cleanup and VPN process termination.
+        // VpnRuntime's Drop handles kill switch cleanup and VPN process termination.
         // Nothing additional needed here.
     }
 }

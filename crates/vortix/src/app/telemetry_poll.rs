@@ -13,7 +13,7 @@ impl App {
     /// Processes pending telemetry updates from the background worker.
     /// Called frequently to ensure logs appear immediately.
     pub(crate) fn process_telemetry(&mut self) {
-        let updates: Vec<_> = if let Some(rx) = &self.engine.telemetry_rx {
+        let updates: Vec<_> = if let Some(rx) = &self.runtime.telemetry_rx {
             rx.try_iter().collect()
         } else {
             return;
@@ -26,7 +26,7 @@ impl App {
 
     /// Wake the telemetry worker so it refreshes IP/ISP/latency immediately.
     pub(crate) fn refresh_telemetry(&self) {
-        if let Some(nudge) = &self.engine.telemetry_nudge {
+        if let Some(nudge) = &self.runtime.telemetry_nudge {
             let _ = nudge.send(());
         }
     }
@@ -38,16 +38,16 @@ impl App {
     pub(crate) fn poll_scanner(&mut self) {
         // 1. Try to collect a result from the previous scan
         let mut result = None;
-        if let Some(rx) = &self.engine.scanner_rx {
+        if let Some(rx) = &self.runtime.scanner_rx {
             match rx.try_recv() {
                 Ok(active) => {
                     result = Some(active);
-                    self.engine.scanner_rx = None; // Mark: ready for next scan
+                    self.runtime.scanner_rx = None; // Mark: ready for next scan
                 }
                 Err(mpsc::TryRecvError::Empty) => {
                     // Previous scan still running — don't start another.
                     if let ConnectionState::Connecting { started, profile } =
-                        &self.engine.connection_state
+                        &self.runtime.connection_state
                     {
                         let elapsed = started.elapsed().as_secs();
                         if elapsed > 0 && elapsed % constants::SCANNER_LOG_INTERVAL_SECS == 0 {
@@ -63,7 +63,7 @@ impl App {
                     return;
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    self.engine.scanner_rx = None;
+                    self.runtime.scanner_rx = None;
                 }
             }
         }
@@ -74,18 +74,18 @@ impl App {
         }
 
         // 3. Kick off a new scan (scanner_rx is None here)
-        let profiles = self.engine.profiles.clone();
+        let profiles = self.runtime.profiles.clone();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let active = scanner::get_active_profiles(&profiles);
             let _ = tx.send(active);
         });
-        self.engine.scanner_rx = Some(rx);
+        self.runtime.scanner_rx = Some(rx);
     }
 
     /// Poll the network monitor for gateway changes.
     pub(crate) fn poll_network_monitor(&mut self) {
-        let events: Vec<_> = if let Some(rx) = &self.engine.netmon_rx {
+        let events: Vec<_> = if let Some(rx) = &self.runtime.netmon_rx {
             rx.try_iter().collect()
         } else {
             return;
@@ -111,24 +111,24 @@ impl App {
     /// Delta calculation (bytes/sec) stays here in the App, keeping state local.
     pub(crate) fn poll_network_stats(&mut self) {
         // 1. Try to collect a result from the previous fetch
-        if let Some(rx) = &self.engine.netstats_rx {
+        if let Some(rx) = &self.runtime.netstats_rx {
             match rx.try_recv() {
                 Ok((total_in, total_out)) => {
-                    if self.engine.last_bytes_in > 0 {
-                        self.engine.current_down =
-                            total_in.saturating_sub(self.engine.last_bytes_in);
-                        self.engine.current_up =
-                            total_out.saturating_sub(self.engine.last_bytes_out);
+                    if self.runtime.last_bytes_in > 0 {
+                        self.runtime.current_down =
+                            total_in.saturating_sub(self.runtime.last_bytes_in);
+                        self.runtime.current_up =
+                            total_out.saturating_sub(self.runtime.last_bytes_out);
                     }
-                    self.engine.last_bytes_in = total_in;
-                    self.engine.last_bytes_out = total_out;
-                    self.engine.netstats_rx = None;
+                    self.runtime.last_bytes_in = total_in;
+                    self.runtime.last_bytes_out = total_out;
+                    self.runtime.netstats_rx = None;
                 }
                 Err(mpsc::TryRecvError::Empty) => {
                     return;
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    self.engine.netstats_rx = None;
+                    self.runtime.netstats_rx = None;
                 }
             }
         }
@@ -141,6 +141,6 @@ impl App {
                 .get_total_bytes();
             let _ = tx.send(totals);
         });
-        self.engine.netstats_rx = Some(rx);
+        self.runtime.netstats_rx = Some(rx);
     }
 }
