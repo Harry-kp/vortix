@@ -41,6 +41,8 @@
 use std::collections::HashMap;
 use std::time::SystemTime;
 
+use serde::{Deserialize, Serialize};
+
 use crate::vortix_core::cidr::{claims_default_route_v4, claims_default_route_v6, Cidr};
 use crate::vortix_core::engine::event::EngineEvent;
 use crate::vortix_core::engine::fsm::Engine;
@@ -105,8 +107,9 @@ pub struct TunnelSnapshot {
 }
 
 /// What kind of conflict `detect_conflict` found.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Conflict {
     /// Two profiles both claim the kernel default route. The `current` holder
     /// may be either Connected (already on the route) or Connecting (claimed

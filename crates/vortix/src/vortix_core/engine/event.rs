@@ -9,6 +9,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
+use crate::vortix_core::engine::registry::Conflict;
 use crate::vortix_core::engine::state::{ConnectionHealth, DegradedReason, FailureReason};
 use crate::vortix_core::profile::{ProfileId, ProtocolKind};
 
@@ -136,6 +137,52 @@ pub enum EngineEvent {
         prompt_kind: crate::vortix_core::engine::state::PromptKind,
         prompt_text: String,
     },
+    /// Multi-connection plan U23: the primary tunnel (the one holding the
+    /// kernel default route) changed. `from`/`to` are `None` when the
+    /// transition crosses the "no primary" boundary (initial connect or
+    /// last-primary disconnect). The wiring that emits this event from the
+    /// registry lands in U7/U6B; U23 only adds the variant.
+    PrimaryTunnelChanged {
+        from: Option<ProfileId>,
+        to: Option<ProfileId>,
+        via_interface: Option<String>,
+        reason: PrimaryChangeReason,
+    },
+    /// Multi-connection plan U23: a connect attempt was rejected by
+    /// `TunnelRegistry::connect` because a `Conflict` was detected and the
+    /// caller did not pass `force=true`. The UI uses this to render the
+    /// takeover overlay; CLI replay tooling uses it to summarise blocked
+    /// attempts.
+    ConnectAttemptBlockedByConflict {
+        conflict: Conflict,
+        profile_id: ProfileId,
+    },
+}
+
+/// Why the primary tunnel changed.
+///
+/// Distinct from `vortix_core::engine::registry::PrimaryTunnelChangeReason`
+/// (which is the internal, non-serde enum the registry uses for structured
+/// logging today). The journal-event variant is named per plan U23 — its
+/// `InitialConnect` value covers the "no primary → new primary" transition
+/// the registry expresses with `NewTunnelTookDefaultRoute`. Keeping them
+/// separate lets the journal vocabulary evolve without forcing every
+/// registry internal-state change to bump the journal schema, and vice
+/// versa. The U7/U6B wiring is responsible for mapping the registry's
+/// reason onto this enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+#[serde(rename_all = "snake_case")]
+pub enum PrimaryChangeReason {
+    /// A new connect succeeded and there was no prior primary (or the
+    /// transition crossed the "no primary → primary" boundary).
+    InitialConnect,
+    /// The prior primary disconnected; another tunnel already declaring
+    /// `0/0` was promoted by the kernel.
+    PriorPrimaryDisconnected,
+    /// An external route change (user ran `wg-quick down`, route flap, etc.)
+    /// observed by the Tick-bound safety net.
+    ExternalRouteChange,
 }
 
 /// Why a tunnel went down.
@@ -188,5 +235,179 @@ mod tests {
         let env = EventEnvelope::new(EngineEvent::NetworkLinkLost);
         let json = serde_json::to_string(&env).unwrap();
         assert!(json.contains(r#""kind":"network_link_lost""#));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // U23: PrimaryTunnelChanged + ConnectAttemptBlockedByConflict
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn primary_tunnel_changed_round_trips_through_json() {
+        let event = EngineEvent::PrimaryTunnelChanged {
+            from: Some(ProfileId::new("corp")),
+            to: Some(ProfileId::new("home")),
+            via_interface: Some("wg1".to_string()),
+            reason: PrimaryChangeReason::PriorPrimaryDisconnected,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        // Tag uses snake_case `kind` discriminator.
+        assert!(json.contains(r#""kind":"primary_tunnel_changed""#));
+        assert!(json.contains(r#""reason":"prior_primary_disconnected""#));
+        let back: EngineEvent = serde_json::from_str(&json).unwrap();
+        match back {
+            EngineEvent::PrimaryTunnelChanged {
+                from,
+                to,
+                via_interface,
+                reason,
+            } => {
+                assert_eq!(from.as_ref().map(ProfileId::as_str), Some("corp"));
+                assert_eq!(to.as_ref().map(ProfileId::as_str), Some("home"));
+                assert_eq!(via_interface.as_deref(), Some("wg1"));
+                assert_eq!(reason, PrimaryChangeReason::PriorPrimaryDisconnected);
+            }
+            _ => panic!("expected PrimaryTunnelChanged"),
+        }
+    }
+
+    #[test]
+    fn primary_tunnel_changed_with_no_prior_primary_round_trips() {
+        // Initial-connect: `from` is `None`.
+        let event = EngineEvent::PrimaryTunnelChanged {
+            from: None,
+            to: Some(ProfileId::new("corp")),
+            via_interface: None,
+            reason: PrimaryChangeReason::InitialConnect,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: EngineEvent = serde_json::from_str(&json).unwrap();
+        match back {
+            EngineEvent::PrimaryTunnelChanged {
+                from,
+                to,
+                via_interface,
+                reason,
+            } => {
+                assert!(from.is_none());
+                assert_eq!(to.as_ref().map(ProfileId::as_str), Some("corp"));
+                assert!(via_interface.is_none());
+                assert_eq!(reason, PrimaryChangeReason::InitialConnect);
+            }
+            _ => panic!("expected PrimaryTunnelChanged"),
+        }
+    }
+
+    #[test]
+    fn primary_change_reason_external_route_change_round_trips() {
+        let event = EngineEvent::PrimaryTunnelChanged {
+            from: Some(ProfileId::new("corp")),
+            to: None,
+            via_interface: None,
+            reason: PrimaryChangeReason::ExternalRouteChange,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""reason":"external_route_change""#));
+        let back: EngineEvent = serde_json::from_str(&json).unwrap();
+        if let EngineEvent::PrimaryTunnelChanged { reason, .. } = back {
+            assert_eq!(reason, PrimaryChangeReason::ExternalRouteChange);
+        } else {
+            panic!("expected PrimaryTunnelChanged");
+        }
+    }
+
+    #[test]
+    fn connect_attempt_blocked_by_conflict_round_trips_default_route_takeover() {
+        let event = EngineEvent::ConnectAttemptBlockedByConflict {
+            conflict: Conflict::DefaultRouteTakeover {
+                current: ProfileId::new("corp"),
+                new: ProfileId::new("home"),
+            },
+            profile_id: ProfileId::new("home"),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""kind":"connect_attempt_blocked_by_conflict""#));
+        assert!(json.contains(r#""kind":"default_route_takeover""#));
+        let back: EngineEvent = serde_json::from_str(&json).unwrap();
+        match back {
+            EngineEvent::ConnectAttemptBlockedByConflict {
+                conflict,
+                profile_id,
+            } => {
+                assert_eq!(profile_id.as_str(), "home");
+                match conflict {
+                    Conflict::DefaultRouteTakeover { current, new } => {
+                        assert_eq!(current.as_str(), "corp");
+                        assert_eq!(new.as_str(), "home");
+                    }
+                    _ => panic!("expected DefaultRouteTakeover"),
+                }
+            }
+            _ => panic!("expected ConnectAttemptBlockedByConflict"),
+        }
+    }
+
+    #[test]
+    fn connect_attempt_blocked_by_conflict_round_trips_route_overlap() {
+        use crate::vortix_core::cidr::Cidr;
+        use std::net::IpAddr;
+        use std::str::FromStr;
+
+        let cidr = Cidr::new(IpAddr::from_str("10.0.0.0").unwrap(), 8).unwrap();
+        let event = EngineEvent::ConnectAttemptBlockedByConflict {
+            conflict: Conflict::RouteOverlap {
+                with: ProfileId::new("corp"),
+                overlapping_cidrs: vec![cidr],
+            },
+            profile_id: ProfileId::new("home"),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: EngineEvent = serde_json::from_str(&json).unwrap();
+        match back {
+            EngineEvent::ConnectAttemptBlockedByConflict {
+                conflict: Conflict::RouteOverlap {
+                    with,
+                    overlapping_cidrs,
+                },
+                profile_id,
+            } => {
+                assert_eq!(with.as_str(), "corp");
+                assert_eq!(profile_id.as_str(), "home");
+                assert_eq!(overlapping_cidrs.len(), 1);
+                assert_eq!(overlapping_cidrs[0].prefix_len, 8);
+            }
+            _ => panic!("expected ConnectAttemptBlockedByConflict / RouteOverlap"),
+        }
+    }
+
+    #[test]
+    fn existing_tunnel_up_serialization_unchanged() {
+        // Regression guard: adding U23 variants must not alter the wire shape
+        // of any pre-existing variant. The serialized JSON for TunnelUp is
+        // pinned exactly.
+        let event = EngineEvent::TunnelUp {
+            profile_id: ProfileId::new("corp"),
+            protocol: ProtocolKind::WireGuard,
+            interface_name: "wg0".to_string(),
+            pid: Some(1234),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert_eq!(
+            json,
+            r#"{"kind":"tunnel_up","profile_id":"corp","protocol":"wire_guard","interface_name":"wg0","pid":1234}"#
+        );
+    }
+
+    #[test]
+    fn existing_network_link_lost_serialization_unchanged() {
+        let event = EngineEvent::NetworkLinkLost;
+        let json = serde_json::to_string(&event).unwrap();
+        assert_eq!(json, r#"{"kind":"network_link_lost"}"#);
+    }
+
+    #[test]
+    fn existing_journal_retention_applied_serialization_unchanged() {
+        let event = EngineEvent::JournalRetentionApplied { deleted: 7 };
+        let json = serde_json::to_string(&event).unwrap();
+        assert_eq!(json, r#"{"kind":"journal_retention_applied","deleted":7}"#);
     }
 }
