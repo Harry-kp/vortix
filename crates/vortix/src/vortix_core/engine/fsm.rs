@@ -157,8 +157,15 @@ impl<T: Tunnel> Engine<T> {
     fn handle_user_command(&mut self, cmd: UserCommand, events: &mut Vec<EngineEvent>) {
         match cmd {
             UserCommand::Connect { profile_id } => self.try_connect(profile_id, events),
-            UserCommand::Disconnect | UserCommand::ForceDisconnect => self.try_disconnect(events),
-            UserCommand::Reconnect => self.try_reconnect(events),
+            // The single FSM drives one tunnel. `profile_id` on the
+            // multi-tunnel variants is a registry-level routing key —
+            // by the time the command reaches a single FSM, the
+            // registry has already selected which FSM to drive. The
+            // FSM itself ignores the field.
+            UserCommand::Disconnect { .. } | UserCommand::ForceDisconnect { .. } => {
+                self.try_disconnect(events);
+            }
+            UserCommand::Reconnect { .. } => self.try_reconnect(events),
             // Plan 008 U2: slot reserved for the 2FA flow (issue #191).
             // No consumer wired in v0.3.0 — answer is dropped silently
             // because no `AwaitingUserInput` transition emits the

@@ -22,7 +22,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::vortix_core::engine::input::UserCommand;
+use crate::vortix_core::engine::registry::{Conflict, TunnelSnapshot};
 use crate::vortix_core::engine::state::Connection;
+use crate::vortix_core::profile::ProfileId;
+use crate::vortix_core::state::KillSwitchState;
 
 /// One operation a client can request from the daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,8 +69,20 @@ pub struct IpcResponse {
 pub enum IpcResult {
     /// `Execute` was accepted; the FSM is processing it.
     Accepted,
-    /// `Snapshot` payload.
+    /// `Snapshot` payload — **v1-compat** primary-only view. When the
+    /// registry has no primary, `state` is `Connection::Disconnected`.
+    /// Multi-tunnel-aware clients should prefer [`Self::RegistrySnapshot`].
     Snapshot { state: Connection },
+    /// Multi-tunnel snapshot (plan #001 U22). Carries the full set of
+    /// active tunnels plus the derived primary and global killswitch
+    /// state. New clients query this; v1 clients that only know
+    /// [`Self::Snapshot`] keep working through the back-compat
+    /// population the daemon does alongside.
+    RegistrySnapshot {
+        tunnels: Vec<TunnelSnapshot>,
+        primary: Option<ProfileId>,
+        killswitch: KillSwitchState,
+    },
     /// `Subscribe` acknowledged; subsequent frames are streamed events.
     Subscribed,
     /// `Shutdown` acknowledged; daemon will terminate after draining.
@@ -75,6 +90,10 @@ pub enum IpcResult {
 }
 
 /// Typed wire errors the daemon can return to the client.
+///
+/// External tagging (default serde repr) is preserved so the existing
+/// v1 client decoders that match `"Unauthorized"` and
+/// `"ShuttingDown"` as bare strings continue to round-trip.
 #[derive(Debug, Clone, Error, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum IpcError {
@@ -84,6 +103,18 @@ pub enum IpcError {
     MalformedRequest(String),
     #[error("daemon is shutting down")]
     ShuttingDown,
+    /// A connect attempt was blocked by a registry conflict. Carries
+    /// the typed `Conflict` so CLI thin-clients can map to
+    /// `ExitCode::StateConflict` (4) with the same hint text as the
+    /// direct-app path.
+    #[error("connect blocked by conflict: {conflict:?}")]
+    Conflict { conflict: Conflict },
+    /// A v1 client sent a wire shape this v2 daemon cannot parse
+    /// (e.g. `{"kind":"disconnect"}` instead of
+    /// `{"kind":"disconnect","profile_id":null}`). Distinct from
+    /// `MalformedRequest` so clients can suggest a binary upgrade.
+    #[error("unsupported wire format: {0}")]
+    UnsupportedWireFormat(String),
     #[error("internal daemon error: {0}")]
     Internal(String),
 }
