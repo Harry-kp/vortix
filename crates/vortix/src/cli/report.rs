@@ -263,7 +263,11 @@ fn collect_tool_statuses() -> Vec<ToolStatus> {
 
 /// Check if a tool exists on `$PATH` and try to get its version.
 fn check_tool(name: &'static str, version_args: &[&str]) -> ToolStatus {
-    let path = cmd_stdout("which", &[name]);
+    // Plan 002 U1: walk PATH directly instead of shelling to `which` —
+    // `which` itself is not preinstalled on every distro (e.g. Fedora
+    // minimal), and our own diagnostic surface shouldn't false-fail
+    // because of a missing diagnostic tool.
+    let path = crate::utils::find_binary_path(name).map(|p| p.to_string_lossy().into_owned());
 
     // wg-quick --version exits non-zero on some systems; try to get version anyway
     let owned_args: Vec<String> = version_args.iter().map(|s| (*s).to_string()).collect();
@@ -282,7 +286,7 @@ fn check_tool(name: &'static str, version_args: &[&str]) -> ToolStatus {
 
     ToolStatus {
         name,
-        path: path.map(|p| p.trim().to_string()),
+        path,
         version,
     }
 }
@@ -290,10 +294,11 @@ fn check_tool(name: &'static str, version_args: &[&str]) -> ToolStatus {
 /// Check if a tool exists (path only, no version — for tools like `pfctl`).
 #[cfg(target_os = "macos")] // xtask:allow-platform-cfg: helper only used by the macOS pfctl branch above
 fn check_tool_exists(name: &'static str) -> ToolStatus {
-    let path = cmd_stdout("which", &[name]);
+    // Plan 002 U1: same PATH-walking as `check_tool` — see comment above.
+    let path = crate::utils::find_binary_path(name).map(|p| p.to_string_lossy().into_owned());
     ToolStatus {
         name,
-        path: path.map(|p| p.trim().to_string()),
+        path,
         version: None,
     }
 }

@@ -698,6 +698,44 @@ pub(crate) fn binary_exists(name: &str) -> bool {
     false
 }
 
+/// Locate a named executable on `$PATH` and return the first matching path.
+///
+/// Same PATH-walking + exec-bit check as [`binary_exists`], but returns
+/// the actual path (`Some(PathBuf)`) instead of `bool`. Used by diagnostic
+/// output (`vortix doctor` / `vortix info`) that needs to print where a
+/// tool is installed.
+///
+/// Plan 002 U1: replaces the residual `cmd_stdout("which", ...)` shell-outs
+/// in `cli/report.rs` so vortix doesn't break on minimal-install systems
+/// where `which` itself isn't in the default package set (e.g. Fedora
+/// minimal containers).
+pub(crate) fn find_binary_path(name: &str) -> Option<std::path::PathBuf> {
+    use std::env;
+
+    let path = env::var("PATH").ok()?;
+
+    for dir in env::split_paths(&path) {
+        let candidate = dir.join(name);
+        if !candidate.is_file() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = candidate.metadata() {
+                if meta.permissions().mode() & 0o111 != 0 {
+                    return Some(candidate);
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 /// Check whether `resolvconf` is installed and functional.
 ///
 /// Returns `true` only when the `resolvconf` binary exists **and** can
@@ -797,6 +835,40 @@ mod tests {
     //   2. The function's behavior on PATH=unset is trivially
     //      `false` via the `let Ok(path) = env::var("PATH") else`
     //      guard — covered by inspection, not worth a racy test.
+
+    // ───── find_binary_path (plan 002 U1) ─────────────────────────────────
+
+    #[test]
+    fn find_binary_path_returns_existing_path_for_known_unix_binary() {
+        #[cfg(unix)]
+        {
+            let path = find_binary_path("sh").expect("`sh` should be locatable on every Unix CI runner");
+            assert!(path.is_file(), "returned path must exist on disk: {path:?}");
+            assert!(
+                path.ends_with("sh"),
+                "returned path's filename should be `sh`: {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn find_binary_path_returns_none_for_known_absent_binary() {
+        assert!(find_binary_path("vortix-nonexistent-xyz123").is_none());
+    }
+
+    #[test]
+    fn find_binary_path_and_binary_exists_agree() {
+        // Invariant: `binary_exists(x)` must equal `find_binary_path(x).is_some()`
+        // for every input. The two functions share PATH-walking logic; they
+        // should never disagree.
+        for name in ["sh", "vortix-nonexistent-xyz123", "cat", "another-fake"] {
+            assert_eq!(
+                binary_exists(name),
+                find_binary_path(name).is_some(),
+                "binary_exists and find_binary_path disagree on `{name}`"
+            );
+        }
+    }
 
     // ─────────────────────────────────────────────────────────────────────
 
