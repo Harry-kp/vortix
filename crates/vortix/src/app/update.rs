@@ -841,6 +841,13 @@ impl App {
                         pid: session.pid,
                     }),
                 };
+                // Scanner-driven promotion: the kernel interface
+                // appeared before the connect worker's ConnectResult
+                // arrived (common with OpenVPN). The worker's result
+                // will be marked stale by `handle_connect_result` so
+                // the registry mirror there never fires. Mirror here
+                // instead so renderers see the live tunnel.
+                self.mirror_connect_into_registry(&profile_name);
 
                 self.log(&format!(
                     "STATUS: Connection established to '{profile_name}'"
@@ -950,6 +957,11 @@ impl App {
                     pid: session.pid,
                 }),
             };
+            // Scanner-driven adoption: the kernel interface exists
+            // but we never went through Connecting (vortix restart,
+            // externally-started VPN). Same mirror requirement as the
+            // Connecting → Connected branch above.
+            self.mirror_connect_into_registry(&active_name);
 
             if self.runtime.session_start.is_none() {
                 self.log(&format!(
@@ -1009,6 +1021,11 @@ impl App {
                 // sync_killswitch sees the correct connection state.
                 self.runtime.connection_state = ConnectionState::Disconnected;
                 self.runtime.session_start = None;
+                // Scanner-driven drop: kernel interface disappeared
+                // out-of-band (user killed wg-quick, kernel module
+                // unloaded, connect failed silently). Renderer must
+                // stop showing the phantom tunnel.
+                self.mirror_disconnect_into_registry(&profile_name);
 
                 // KILL SWITCH: Activate on unexpected VPN drop
                 if was_connected

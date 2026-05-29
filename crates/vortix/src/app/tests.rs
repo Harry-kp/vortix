@@ -2551,6 +2551,86 @@ fn connect_result_success_mirrors_into_registry() {
 }
 
 #[test]
+fn scanner_promotion_from_connecting_to_connected_mirrors_into_registry() {
+    use crate::vortix_core::engine::state::Connection;
+    use crate::vortix_core::profile::ProfileId;
+
+    // Repro of the real-world bug: the connect-worker thread does
+    // `tunnel.up()` and the background scanner sees the kernel
+    // interface appear before the worker's ConnectResult lands. The
+    // scanner-promotion branch in handle_sync_system_state transitions
+    // Connecting → Connected; the worker's ConnectResult is then
+    // dropped as stale by handle_connect_result's `still_connecting`
+    // guard. Without a registry mirror at the scanner site, the
+    // renderer sees zero tunnels.
+    let mut app = test_app();
+    add_profiles(&mut app, &["AWS_VPN"]);
+    app.runtime.connection_state = ConnectionState::Connecting {
+        started: Instant::now(),
+        profile: "AWS_VPN".to_string(),
+    };
+
+    // Drive the scanner sync directly — what `handle_sync_system_state`
+    // does on every Tick when the scanner reports an `ActiveSession`.
+    app.handle_message(Message::SyncSystemState(vec![fake_session("AWS_VPN")]));
+
+    // Legacy state moved to Connected (this is what wrote
+    // "Connection established to 'AWS_VPN'" to the event log in the
+    // user's screenshot).
+    assert!(
+        matches!(
+            app.runtime.connection_state,
+            ConnectionState::Connected { ref profile, .. } if profile == "AWS_VPN"
+        ),
+        "scanner must promote Connecting → Connected"
+    );
+
+    // Renderer-facing state: registry must reflect the live tunnel.
+    let snap = app
+        .registry
+        .snapshot(&ProfileId::new("AWS_VPN"))
+        .expect("registry must have a snapshot for the scanner-promoted profile");
+    assert!(
+        matches!(snap.state, Connection::Connected { .. }),
+        "registry FSM must be Connected, got {:?}",
+        snap.state
+    );
+    assert_eq!(app.registry.tunnel_count(), 1);
+}
+
+#[test]
+fn scanner_drop_from_connected_clears_registry() {
+    use crate::vortix_core::profile::ProfileId;
+
+    // Mirror direction matters in reverse too: if the user kills the
+    // VPN process out-of-band (or the kernel interface goes away),
+    // the scanner detects the drop and transitions Connected →
+    // Disconnected. The registry must follow so renderers stop
+    // showing a phantom active tunnel.
+    let mut app = test_app();
+    add_profiles(&mut app, &["AWS_VPN"]);
+
+    // Set up the connected state through the scanner-promotion path
+    // so both legacy state AND registry are in sync.
+    app.runtime.connection_state = ConnectionState::Connecting {
+        started: Instant::now(),
+        profile: "AWS_VPN".to_string(),
+    };
+    app.handle_message(Message::SyncSystemState(vec![fake_session("AWS_VPN")]));
+    assert_eq!(app.registry.tunnel_count(), 1, "setup precondition");
+
+    // Scanner now reports no active sessions — the VPN went away.
+    app.handle_message(Message::SyncSystemState(vec![]));
+
+    assert_eq!(
+        app.registry.tunnel_count(),
+        0,
+        "registry must drop the entry when scanner reports tunnel gone"
+    );
+    assert!(app.registry.snapshot(&ProfileId::new("AWS_VPN")).is_none());
+}
+
+#[test]
 fn disconnect_result_success_removes_from_registry() {
     use crate::vortix_core::profile::ProfileId;
 
