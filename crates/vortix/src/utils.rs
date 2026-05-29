@@ -145,6 +145,75 @@ pub fn get_profiles_dir() -> std::io::Result<std::path::PathBuf> {
     Ok(path)
 }
 
+/// Returns the per-session temp config directory `${config_dir}/tmp/${session_id}/`.
+///
+/// Both the `tmp/` parent and the per-session subdir are forced to mode
+/// `0o700` — the default umask would yield `0o755`, allowing any local
+/// process to enumerate active session IDs by listing the parent. Used by
+/// `WireGuard` secondary connect-time DNS scoping (plan #009 U13): the
+/// secondary's rewritten `.conf` (with `DNS =` stripped) is written under
+/// this subdir so crashed disconnects leave isolated orphans that the
+/// startup sweep cleans by session-liveness check (subdir name ≠ current
+/// `session_id`).
+///
+/// The subdir name matches the journal's `session_id` (`{ISO}-{pid}`), so a
+/// new vortix process is guaranteed a fresh subdir name; the prior session's
+/// subdir is unambiguously an orphan regardless of age.
+///
+/// # Errors
+///
+/// Returns an error if the config directory cannot be resolved or if the
+/// per-session subdirectory cannot be created at the required mode.
+#[cfg(unix)]
+pub fn get_tmp_config_dir(session_id: &str) -> std::io::Result<std::path::PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    let root = get_app_config_dir()?;
+    let tmp_root = root.join(crate::constants::TMP_CONFIG_DIR);
+
+    // Create `tmp/` and the per-session subdir at 0o700 explicitly.
+    // `recursive(true)` is idempotent on existing dirs but does NOT re-chmod
+    // them, so on first creation we set the mode through DirBuilder; on
+    // existing dirs we leave the mode alone (the only writer is this
+    // process's prior call, which used the same mode).
+    if !tmp_root.exists() {
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(&tmp_root)?;
+        crate::config::fix_ownership(&tmp_root);
+    }
+
+    let session_dir = tmp_root.join(session_id);
+    if !session_dir.exists() {
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(&session_dir)?;
+        crate::config::fix_ownership(&session_dir);
+    }
+
+    Ok(session_dir)
+}
+
+/// Non-Unix fallback: no `chmod`, just `create_dir_all` via `create_user_dir`.
+///
+/// # Errors
+///
+/// Returns an error if the config directory cannot be resolved or directory
+/// creation fails.
+#[cfg(not(unix))]
+pub fn get_tmp_config_dir(session_id: &str) -> std::io::Result<std::path::PathBuf> {
+    let root = get_app_config_dir()?;
+    let session_dir = root
+        .join(crate::constants::TMP_CONFIG_DIR)
+        .join(session_id);
+    if !session_dir.exists() {
+        create_user_dir(&session_dir)?;
+    }
+    Ok(session_dir)
+}
+
 /// Returns the `OpenVPN` runtime directory path for a given profile.
 ///
 /// Creates `~/.config/vortix/run/` if it doesn't exist.
@@ -1073,5 +1142,42 @@ mod tests {
         )
         .unwrap();
         assert!(!wireguard_config_has_dns(&path));
+    }
+
+    // --- get_tmp_config_dir (U13) ---
+
+    #[cfg(unix)]
+    #[test]
+    fn test_get_tmp_config_dir_creates_session_subdir_at_0700() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // `set_temp_config_dir` writes via `set_config_dir`'s `OnceLock` —
+        // first writer wins across the whole test binary. Sibling tests are
+        // unaffected because each test passes a unique session_id; subdirs
+        // therefore can't collide even when they share a `tmp/` root.
+        let _tmp = set_temp_config_dir();
+        let sid = format!("session-{}-{}", std::process::id(), line!());
+        let session_dir = get_tmp_config_dir(&sid).unwrap();
+        assert!(session_dir.ends_with(format!("tmp/{sid}")));
+
+        let leaf_perms = std::fs::metadata(&session_dir).unwrap().permissions();
+        assert_eq!(leaf_perms.mode() & 0o777, 0o700);
+
+        // `tmp/` root is tightened to 0o700 — default umask would produce
+        // 0o755 and leak session IDs via readdir.
+        let tmp_root = session_dir.parent().unwrap();
+        let root_perms = std::fs::metadata(tmp_root).unwrap().permissions();
+        assert_eq!(root_perms.mode() & 0o777, 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_get_tmp_config_dir_is_idempotent() {
+        let _tmp = set_temp_config_dir();
+        let sid = format!("idempotent-{}-{}", std::process::id(), line!());
+        let a = get_tmp_config_dir(&sid).unwrap();
+        let b = get_tmp_config_dir(&sid).unwrap();
+        assert_eq!(a, b);
+        assert!(a.exists());
     }
 }

@@ -114,6 +114,20 @@ fn main() -> Result<()> {
     // Store the resolved config dir globally so all utility functions use it
     config::set_config_dir(config_dir.clone());
 
+    // Plan #009 U13: session-liveness sweep of `${config_dir}/tmp/`. Any
+    // per-session subdir whose name does not match the current journal
+    // `session_id` is, by construction, a crash orphan — every session has a
+    // unique `{ISO}-{pid}` ID. This is correct regardless of file age (a
+    // crashed session 30 seconds ago is still definitively orphaned because
+    // the pid differs from ours), so no time-based heuristic is used.
+    // Best-effort: failures are swallowed; the temp dir is rebuildable from
+    // the user's profiles on the next connect.
+    if let Some(j) = vortix::vortix_core::journal::global_journal() {
+        if let Some(sid) = j.session_id() {
+            sweep_orphan_temp_configs(&config_dir, &sid);
+        }
+    }
+
     // Plan 006 U4: backfill profile sidecars for `.conf` / `.ovpn` files
     // imported before the sidecar scheme existed. Idempotent — no-ops once
     // every profile has a `.meta.toml`. Failures are logged + non-fatal:
@@ -207,6 +221,37 @@ fn main() -> Result<()> {
     restore_terminal();
 
     result
+}
+
+/// Sweep crash-orphaned per-session subdirs under `${config_dir}/tmp/`
+/// (plan #009 U13).
+///
+/// Session IDs are `{ISO-timestamp}-{pid}` — guaranteed unique per process —
+/// so any subdir whose name does not match the *current* session's ID is an
+/// orphan from a previous (possibly crashed) run. This is session-liveness,
+/// not age-based: a crash 30 seconds ago still leaves a definitively-orphan
+/// directory, and an age threshold would incorrectly preserve it.
+///
+/// Best-effort: any I/O failure aborts the sweep for the failing entry but
+/// does not prevent startup. The temp dir is fully rebuildable from the
+/// user's profiles on the next secondary connect.
+fn sweep_orphan_temp_configs(config_dir: &std::path::Path, current_session_id: &str) {
+    let tmp_dir = config_dir.join(vortix::constants::TMP_CONFIG_DIR);
+    if !tmp_dir.exists() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(&tmp_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if name == current_session_id {
+            continue;
+        }
+        let _ = std::fs::remove_dir_all(entry.path());
+    }
 }
 
 /// Prompts the user to migrate data from an old config directory.

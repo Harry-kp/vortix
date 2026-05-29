@@ -1,5 +1,6 @@
 //! `WgTunnel` — `WireGuard` impl of the `Tunnel` port.
 
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::vortix_core::ports::tunnel::{
@@ -16,13 +17,162 @@ use crate::vortix_protocol_wireguard::parser::parse_wg_conf;
 ///
 /// Plan #004 v1 supports kernel `WireGuard` only — `wireguard-go`/`boringtun`
 /// user-space backends land with idea 5's daemon work.
+///
+/// `is_secondary` (default `false`) routes connect-time through the DNS-
+/// scoping path (plan #009 U13): the user's `.conf` is rewritten with
+/// `DNS = …` lines stripped, written under
+/// `${config_dir}/tmp/${session_id}/${basename}` at mode `0o600`, and
+/// `wg-quick up` is invoked against the rewritten copy. Primaries keep the
+/// existing fast path (no copy, original config used directly).
+///
+/// The `TunnelRegistry` (plan #009 U5) flips `is_secondary` via
+/// [`WgTunnel::with_secondary`] before calling `up()` once multi-connection
+/// wiring lands; until then no production callsite sets it and behaviour is
+/// identical to v0.3.x.
 #[derive(Debug, Default, Clone)]
-pub struct WgTunnel;
+pub struct WgTunnel {
+    /// True when this tunnel is a secondary in a multi-tunnel session. When
+    /// set, `up()` strips `DNS =` lines from the user's profile before
+    /// invoking `wg-quick up` — only the primary may own system DNS.
+    pub is_secondary: bool,
+    /// Path to the temp config written at `up()` time when `is_secondary` is
+    /// true. Stored so `down()` can unlink it and (if empty) its parent
+    /// session subdir. `None` for primaries and before `up()` succeeds.
+    temp_config_path: Option<PathBuf>,
+}
 
 impl WgTunnel {
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// Builder: mark this tunnel as a secondary in a multi-tunnel session
+    /// (plan #009 U13). When `true`, `up()` reads the user's `.conf`, strips
+    /// any `DNS = …` directive, and writes the result to a per-session temp
+    /// path at mode `0o600`; `wg-quick up` runs against that temp path. The
+    /// temp file's basename matches the original so wg-quick's
+    /// interface-from-basename derivation — and any `%i` substitution in
+    /// `PostUp`/`PreDown` hooks — stays equivalent to the user's original
+    /// profile.
+    ///
+    /// Defaults to `false`. No production callsite flips this until the
+    /// registry's primary-aware connect path lands.
+    #[must_use]
+    pub fn with_secondary(mut self, is_secondary: bool) -> Self {
+        self.is_secondary = is_secondary;
+        self
+    }
+
+    #[must_use]
+    pub fn is_secondary(&self) -> bool {
+        self.is_secondary
+    }
+}
+
+/// Strip `DNS = …` lines from a `WireGuard` `.conf` body. The directive name
+/// is matched case-insensitively (wg-quick keys are case-insensitive); the
+/// rest of the file — comments, blank lines, trailing whitespace — is
+/// preserved verbatim so `PrivateKey`, `Address`, hooks, and peers reach
+/// wg-quick unchanged.
+#[must_use]
+pub(crate) fn strip_dns_directive(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        // Match "DNS" (case-insensitive) followed (after optional
+        // whitespace) by '='. Anything else starting with "dns" (e.g. a
+        // comment that mentions DNS) is kept.
+        let is_dns = trimmed
+            .strip_prefix(|c: char| c == 'D' || c == 'd')
+            .and_then(|r| r.strip_prefix(|c: char| c == 'N' || c == 'n'))
+            .and_then(|r| r.strip_prefix(|c: char| c == 'S' || c == 's'))
+            .is_some_and(|r| r.trim_start().starts_with('='));
+        if !is_dns {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
+/// Resolve the current `session_id` from the global journal, or fall back to
+/// a pid-derived stable value when the journal is disabled (tests, or
+/// `[journal] disk = false`). The fallback is deterministic within a process
+/// so repeated calls within one run yield the same subdir.
+fn resolve_session_id() -> String {
+    crate::vortix_core::journal::global_journal()
+        .and_then(crate::vortix_core::journal::Journal::session_id)
+        .unwrap_or_else(|| format!("nojournal-{}", std::process::id()))
+}
+
+/// Inner helper: write the sanitized body to `${session_dir}/${basename}` at
+/// mode `0o600`. The basename is preserved verbatim so wg-quick's
+/// `interface = basename(filename)` derivation produces the same interface
+/// name as the user's original profile (relevant for `%i` substitution in
+/// `PostUp`/`PreDown` hooks).
+///
+/// If a stale leaf with the same basename exists in the session subdir (very
+/// fast disconnect-reconnect within one session), it is unlinked first —
+/// `write_secret_file` refuses to overwrite.
+///
+/// Separated from [`write_secondary_temp_config`] so tests can exercise the
+/// file-writing logic against a per-test tempdir without depending on the
+/// process-global `config_dir` set by `set_config_dir` (a `OnceLock` shared
+/// across the test binary).
+fn write_secondary_temp_config_at(
+    session_dir: &Path,
+    user_conf_path: &Path,
+    stripped_body: &[u8],
+) -> Result<PathBuf, TunnelError> {
+    use crate::vortix_core::secret_file::{SecretFileError, write_secret_file};
+
+    let basename = user_conf_path
+        .file_name()
+        .ok_or_else(|| TunnelError::Subprocess("WG config has no basename".into()))?;
+
+    let temp_path = session_dir.join(basename);
+
+    // Best-effort unlink of any stale leaf from a same-session reconnect.
+    // Ignore all errors — NotFound is the happy path and any other error is
+    // surfaced by the subsequent write_secret_file attempt.
+    let _ = std::fs::remove_file(&temp_path);
+
+    write_secret_file(&temp_path, stripped_body).map_err(|e| match e {
+        SecretFileError::Io(io) => {
+            TunnelError::Subprocess(format!("write secondary WG temp config: {io}"))
+        }
+        other => TunnelError::Subprocess(format!("write secondary WG temp config: {other}")),
+    })?;
+
+    Ok(temp_path)
+}
+
+/// Public wrapper used by `up()`: resolves the per-session tmp dir from the
+/// global journal `session_id`, then delegates to
+/// [`write_secondary_temp_config_at`].
+fn write_secondary_temp_config(
+    user_conf_path: &Path,
+    stripped_body: &[u8],
+) -> Result<PathBuf, TunnelError> {
+    let session_id = resolve_session_id();
+    let session_dir = crate::utils::get_tmp_config_dir(&session_id).map_err(|e| {
+        TunnelError::Subprocess(format!("failed to create per-session tmp dir: {e}"))
+    })?;
+    write_secondary_temp_config_at(&session_dir, user_conf_path, stripped_body)
+}
+
+/// Remove the per-session temp file written by [`write_secondary_temp_config`]
+/// and, if the per-session subdir is now empty, remove that too. Errors are
+/// swallowed: at disconnect time the tunnel is already down, so a residual
+/// temp file is harmless and the startup sweep will collect it on the next
+/// run.
+fn cleanup_secondary_temp_config(temp_path: &Path) {
+    let _ = std::fs::remove_file(temp_path);
+    if let Some(parent) = temp_path.parent() {
+        // `remove_dir` only succeeds when the dir is empty — exactly the
+        // condition we want. Other secondaries in the same session keep
+        // their own leaf and the dir survives.
+        let _ = std::fs::remove_dir(parent);
     }
 }
 
@@ -48,28 +198,64 @@ fn interface_from_path(path: &std::path::Path) -> String {
 
 impl Tunnel for WgTunnel {
     fn up(&mut self, profile: &Profile) -> Result<TunnelHandle, TunnelError> {
-        let path = profile.config_path.to_string_lossy().into_owned();
+        // Secondaries: read the user's `.conf`, strip `DNS = …`, write to a
+        // per-session temp file at mode 0o600, and `wg-quick up` against the
+        // temp path. The basename is preserved so `%i` substitution in any
+        // PostUp/PreDown hook still resolves to the user's original
+        // interface name.
+        let (effective_path, temp_path) = if self.is_secondary {
+            let user_body = std::fs::read_to_string(&profile.config_path).map_err(|e| {
+                TunnelError::Subprocess(format!(
+                    "read WG config {}: {e}",
+                    profile.config_path.display()
+                ))
+            })?;
+            let stripped = strip_dns_directive(&user_body);
+            let temp = write_secondary_temp_config(&profile.config_path, stripped.as_bytes())?;
+            (temp.clone(), Some(temp))
+        } else {
+            (profile.config_path.clone(), None)
+        };
+
+        let path_str = effective_path.to_string_lossy().into_owned();
         info!(
             target: "vortix::tunnel::wireguard",
             profile = %profile.id,
-            config = %path,
+            config = %path_str,
+            secondary = self.is_secondary,
             "wg.up"
         );
 
         let output = crate::vortix_process::run_to_output(
-            CommandSpec::oneshot("wg-quick", vec!["up".into(), path.clone()])
+            CommandSpec::oneshot("wg-quick", vec!["up".into(), path_str.clone()])
                 .privilege(PrivilegeReq::Root),
         )
-        .map_err(|e| TunnelError::Subprocess(format!("wg-quick up: {e}")))?;
+        .map_err(|e| {
+            // Subprocess invocation itself failed (not just non-zero exit).
+            // Clean up the temp file we wrote — the tunnel never came up so
+            // nobody else holds a reference to it.
+            if let Some(p) = &temp_path {
+                cleanup_secondary_temp_config(p);
+            }
+            TunnelError::Subprocess(format!("wg-quick up: {e}"))
+        })?;
 
         if !output.status.success() {
+            if let Some(p) = &temp_path {
+                cleanup_secondary_temp_config(p);
+            }
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             return Err(TunnelError::HandshakeFailed(format!("WireGuard: {stderr}")));
         }
 
+        // Stash the temp path on `self` so `down()` can unlink it. The
+        // interface name is still derived from the basename, which equals
+        // the temp file's basename (preserved by design).
+        self.temp_config_path = temp_path;
+
         Ok(TunnelHandle {
             profile_id: profile.id.clone(),
-            interface_name: interface_from_path(&profile.config_path),
+            interface_name: interface_from_path(&effective_path),
             pid: None,
             started_at: SystemTime::now(),
             kind: TunnelKindTag::WireGuard,
@@ -81,6 +267,7 @@ impl Tunnel for WgTunnel {
             target: "vortix::tunnel::wireguard",
             profile = %handle.profile_id,
             interface = %handle.interface_name,
+            secondary = self.is_secondary,
             "wg.down"
         );
 
@@ -94,12 +281,27 @@ impl Tunnel for WgTunnel {
                 vec!["down".into(), handle.interface_name.clone()],
             )
             .privilege(PrivilegeReq::Root),
-        )
-        .map_err(|e| TunnelError::Subprocess(format!("wg-quick down: {e}")))?;
+        );
+
+        // Always attempt to unlink the temp file, even when `wg-quick down`
+        // errors — leaving it behind would still be collected by the next
+        // startup sweep, but eager cleanup keeps the dir tidy. `take()`
+        // ensures we don't double-unlink across a retry.
+        let temp_to_remove = self.temp_config_path.take();
+
+        let output =
+            output.map_err(|e| TunnelError::Subprocess(format!("wg-quick down: {e}")))?;
 
         if !output.status.success() {
+            if let Some(p) = &temp_to_remove {
+                cleanup_secondary_temp_config(p);
+            }
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             return Err(TunnelError::Subprocess(format!("WireGuard down: {stderr}")));
+        }
+
+        if let Some(p) = &temp_to_remove {
+            cleanup_secondary_temp_config(p);
         }
 
         Ok(())
@@ -159,5 +361,270 @@ mod tests {
     fn interface_from_path_uses_stem() {
         let p = std::path::PathBuf::from("/etc/wireguard/corp.conf");
         assert_eq!(interface_from_path(&p), "corp");
+    }
+
+    // --- U13: DNS scoping for secondaries ---
+
+    #[test]
+    fn default_is_not_secondary() {
+        let t = WgTunnel::new();
+        assert!(!t.is_secondary());
+        assert!(t.temp_config_path.is_none());
+    }
+
+    #[test]
+    fn with_secondary_builder_flips_flag() {
+        let t = WgTunnel::new().with_secondary(true);
+        assert!(t.is_secondary());
+    }
+
+    #[test]
+    fn strip_dns_removes_directive_with_equals() {
+        let body = "[Interface]\nPrivateKey = abc\nAddress = 10.0.0.2/24\nDNS = 1.1.1.1\nMTU = 1420\n\n[Peer]\nPublicKey = xyz\n";
+        let out = strip_dns_directive(body);
+        assert!(!out.contains("DNS"));
+        assert!(out.contains("PrivateKey = abc"));
+        assert!(out.contains("MTU = 1420"));
+        assert!(out.contains("[Peer]"));
+    }
+
+    #[test]
+    fn strip_dns_is_case_insensitive() {
+        let body = "[Interface]\nPrivateKey = abc\ndns = 8.8.8.8\nDns=4.4.4.4\nAddress = 10.0.0.2/24\n";
+        let out = strip_dns_directive(body);
+        assert!(!out.to_lowercase().contains("dns ="));
+        assert!(!out.to_lowercase().contains("dns="));
+        assert!(out.contains("Address = 10.0.0.2/24"));
+    }
+
+    #[test]
+    fn strip_dns_tolerates_leading_whitespace() {
+        let body = "[Interface]\n  DNS  =  1.1.1.1, 8.8.8.8\nAddress = 10.0.0.2/24\n";
+        let out = strip_dns_directive(body);
+        assert!(!out.contains("1.1.1.1"));
+        assert!(out.contains("Address = 10.0.0.2/24"));
+    }
+
+    #[test]
+    fn strip_dns_preserves_non_directive_lines_starting_with_dns() {
+        // A comment that *mentions* DNS but doesn't have "DNS = ..." must
+        // survive — wg-quick only treats "DNS =" as the directive.
+        let body = "[Interface]\n# Custom DNS overrides below\nPrivateKey = abc\n";
+        let out = strip_dns_directive(body);
+        assert!(out.contains("# Custom DNS overrides below"));
+        assert!(out.contains("PrivateKey = abc"));
+    }
+
+    #[test]
+    fn strip_dns_no_op_when_directive_absent() {
+        let body = "[Interface]\nPrivateKey = abc\nAddress = 10.0.0.2/24\n\n[Peer]\nPublicKey = xyz\n";
+        assert_eq!(strip_dns_directive(body), body);
+    }
+
+    /// Per-test isolation: build a fresh session-style subdir at mode `0o700`
+    /// under a tempdir. Avoids touching the process-global `config_dir`
+    /// (`OnceLock` → first-write-wins → races across tests when set in each).
+    #[cfg(unix)]
+    fn fresh_session_dir() -> (tempfile::TempDir, std::path::PathBuf) {
+        use std::os::unix::fs::DirBuilderExt;
+
+        let root = tempfile::Builder::new()
+            .prefix("vortix_wg_tunnel_test_")
+            .tempdir()
+            .unwrap();
+        let session = root.path().join("tmp").join("sid-test");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(&session)
+            .unwrap();
+        (root, session)
+    }
+
+    #[cfg(not(unix))]
+    fn fresh_session_dir() -> (tempfile::TempDir, std::path::PathBuf) {
+        let root = tempfile::Builder::new()
+            .prefix("vortix_wg_tunnel_test_")
+            .tempdir()
+            .unwrap();
+        let session = root.path().join("tmp").join("sid-test");
+        std::fs::create_dir_all(&session).unwrap();
+        (root, session)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_session_dir_is_0700() {
+        // Sanity-check the test fixture mirrors the production permission
+        // contract (so the "verify 0o700" property below isn't tautological
+        // against a 0o755 default umask).
+        use std::os::unix::fs::PermissionsExt;
+        let (_root, session) = fresh_session_dir();
+        let perms = std::fs::metadata(&session).unwrap().permissions();
+        assert_eq!(perms.mode() & 0o777, 0o700);
+    }
+
+    #[test]
+    fn write_secondary_temp_config_strips_dns_and_preserves_basename() {
+        let (_root, session) = fresh_session_dir();
+        let scratch = tempfile::tempdir().unwrap();
+        let user_conf = scratch.path().join("corp.conf");
+        std::fs::write(
+            &user_conf,
+            "[Interface]\nPrivateKey = SECRET\nAddress = 10.0.0.2/24\nDNS = 1.1.1.1\n\n[Peer]\nPublicKey = PUBKEY\n",
+        )
+        .unwrap();
+        let body = std::fs::read_to_string(&user_conf).unwrap();
+        let stripped = strip_dns_directive(&body);
+
+        let temp = write_secondary_temp_config_at(&session, &user_conf, stripped.as_bytes())
+            .unwrap();
+        // Basename matches the original — wg-quick will derive interface
+        // "corp" from this path, identical to the user's original.
+        assert_eq!(temp.file_name().unwrap(), "corp.conf");
+
+        let written = std::fs::read_to_string(&temp).unwrap();
+        assert!(!written.contains("DNS"));
+        assert!(written.contains("PrivateKey = SECRET"));
+        assert!(written.contains("[Peer]"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secondary_temp_file_is_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_root, session) = fresh_session_dir();
+        let scratch = tempfile::tempdir().unwrap();
+        let user_conf = scratch.path().join("wg0.conf");
+        std::fs::write(
+            &user_conf,
+            "[Interface]\nPrivateKey = abc\nAddress = 10.0.0.2/24\n",
+        )
+        .unwrap();
+
+        let temp = write_secondary_temp_config_at(
+            &session,
+            &user_conf,
+            b"[Interface]\nPrivateKey = abc\n",
+        )
+        .unwrap();
+        let perms = std::fs::metadata(&temp).unwrap().permissions();
+        assert_eq!(perms.mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn write_secondary_overwrites_stale_same_session_leaf() {
+        let (_root, session) = fresh_session_dir();
+        let scratch = tempfile::tempdir().unwrap();
+        let user_conf = scratch.path().join("vpn.conf");
+        std::fs::write(&user_conf, "[Interface]\nPrivateKey = a\n").unwrap();
+
+        // First write — leaf does not exist yet.
+        let t1 = write_secondary_temp_config_at(&session, &user_conf, b"first").unwrap();
+        // Second write within same session — stale leaf is unlinked first
+        // (write_secret_file would otherwise refuse with FileExists).
+        let t2 = write_secondary_temp_config_at(&session, &user_conf, b"second").unwrap();
+        assert_eq!(t1, t2);
+        assert_eq!(std::fs::read_to_string(&t2).unwrap(), "second");
+    }
+
+    #[test]
+    fn cleanup_removes_leaf_and_empty_session_dir() {
+        let (_root, session) = fresh_session_dir();
+        let scratch = tempfile::tempdir().unwrap();
+        let user_conf = scratch.path().join("only.conf");
+        std::fs::write(&user_conf, "[Interface]\nPrivateKey = a\n").unwrap();
+
+        let temp = write_secondary_temp_config_at(&session, &user_conf, b"body").unwrap();
+        assert!(temp.exists());
+        assert!(session.exists());
+
+        cleanup_secondary_temp_config(&temp);
+        assert!(!temp.exists());
+        assert!(!session.exists(), "empty session dir should be removed");
+    }
+
+    #[test]
+    fn cleanup_keeps_session_dir_when_other_leaves_remain() {
+        let (_root, session) = fresh_session_dir();
+        let scratch = tempfile::tempdir().unwrap();
+        let conf_a = scratch.path().join("a.conf");
+        let conf_b = scratch.path().join("b.conf");
+        std::fs::write(&conf_a, "x").unwrap();
+        std::fs::write(&conf_b, "y").unwrap();
+
+        let temp_a = write_secondary_temp_config_at(&session, &conf_a, b"a-body").unwrap();
+        let temp_b = write_secondary_temp_config_at(&session, &conf_b, b"b-body").unwrap();
+        assert_eq!(session, temp_a.parent().unwrap());
+        assert_eq!(session, temp_b.parent().unwrap());
+
+        cleanup_secondary_temp_config(&temp_a);
+        assert!(!temp_a.exists());
+        assert!(temp_b.exists(), "sibling secondary's leaf must survive");
+        assert!(session.exists(), "session dir must survive while non-empty");
+
+        cleanup_secondary_temp_config(&temp_b);
+        assert!(!session.exists());
+    }
+
+    /// Mirror of the production helper at
+    /// `crates/vortix/src/main.rs::sweep_orphan_temp_configs` so we can
+    /// exercise it without invoking `main()`.
+    fn sweep_orphan_temp_configs(config_dir: &std::path::Path, current_session_id: &str) {
+        let tmp_dir = config_dir.join(crate::constants::TMP_CONFIG_DIR);
+        if !tmp_dir.exists() {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(&tmp_dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if name == current_session_id {
+                continue;
+            }
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+
+    #[test]
+    fn sweep_removes_prior_session_subdirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_dir = tmp.path();
+        let prior = config_dir.join("tmp").join("2025-01-01T000000Z-9999");
+        let current = config_dir.join("tmp").join("2026-05-28T120000Z-1234");
+        std::fs::create_dir_all(&prior).unwrap();
+        std::fs::create_dir_all(&current).unwrap();
+        std::fs::write(prior.join("corp.conf"), "stale").unwrap();
+        std::fs::write(current.join("vpn.conf"), "live").unwrap();
+
+        sweep_orphan_temp_configs(config_dir, "2026-05-28T120000Z-1234");
+
+        assert!(!prior.exists(), "orphan session subdir must be removed");
+        assert!(current.exists(), "current session subdir must survive");
+        assert!(current.join("vpn.conf").exists());
+    }
+
+    #[test]
+    fn sweep_is_noop_when_tmp_dir_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No tmp/ created. Sweep must not panic and must not create anything.
+        sweep_orphan_temp_configs(tmp.path(), "sid");
+        assert!(!tmp.path().join("tmp").exists());
+    }
+
+    #[test]
+    fn primary_skips_dns_stripping_at_struct_level() {
+        // We can't safely call `up()` here without owning the process-global
+        // runner, but the structural invariant is observable directly: a
+        // primary's `is_secondary` is false and its `temp_config_path`
+        // starts unset. The `up()` body's `if self.is_secondary { ... }`
+        // branch is the single source of truth for the temp-file path.
+        let t = WgTunnel::new();
+        assert!(!t.is_secondary());
+        assert!(t.temp_config_path.is_none());
     }
 }
