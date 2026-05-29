@@ -19,7 +19,8 @@ use ratatui::{
 /// currently-selected profile (focused via the sidebar's
 /// `profile_list_state`). Telemetry rows scope to the primary tunnel per
 /// H7 — when the focused profile is a split-tunnel row the panel renders
-/// "Latency: n/a (split tunnel)" instead of primary-scoped metrics.
+/// "Latency: n/a" + the explanatory follow-up line "only measured on
+/// the active exit" instead of primary-scoped metrics.
 #[allow(clippy::too_many_lines, clippy::similar_names)]
 pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     let is_focused = app.should_draw_focus(&crate::app::FocusedPanel::ConnectionDetails);
@@ -294,14 +295,24 @@ fn render_connected(
             ),
         ]));
     } else {
-        // H7: telemetry is primary-only. Split-tunnel rows explicitly say so.
-        // Plain-English copy: "split tunnel" is the industry-standard term
-        // users meet in corporate VPN clients; "secondary tunnel" was
-        // plan-internal jargon (R-IDs / "primary vs secondary tunnel role")
-        // that didn't translate to a user audience.
+        // H7: telemetry is primary-only. Surface BOTH the n/a and the
+        // *reason* — "split tunnel" alone is a label, not an
+        // explanation. The follow-up line spells out that latency is
+        // only measured on the active exit tunnel, so the user
+        // understands why this particular profile doesn't show a
+        // value and can pick the active-exit row to see real numbers.
         text.push(Line::from(vec![
             Span::styled("Latency: ", Style::default().fg(theme::TEXT_SECONDARY)),
-            Span::styled("n/a (split tunnel)", Style::default().fg(theme::INACTIVE)),
+            Span::styled("n/a", Style::default().fg(theme::INACTIVE)),
+        ]));
+        text.push(Line::from(vec![
+            Span::styled("         ", Style::default()),
+            Span::styled(
+                "only measured on the active exit",
+                Style::default()
+                    .fg(theme::TEXT_SECONDARY)
+                    .add_modifier(Modifier::DIM),
+            ),
         ]));
     }
 
@@ -527,9 +538,12 @@ fn render_disconnected(frame: &mut Frame, app: &App, inner: Rect) {
 ///
 /// Rendered shapes:
 /// * `Primary (<cidrs>)` — owns kernel default route; carries all
-///   internet traffic
+///   internet traffic. When `allowed_ips` is empty (e.g., `OpenVPN`
+///   profiles using `redirect-gateway` instead of explicit `route`
+///   directives), the CIDR suffix is omitted — just `Primary`.
 /// * `Split tunnel (<cidrs>)` — routes only the listed subnets;
-///   other traffic uses the underlay
+///   other traffic uses the underlay. Empty CIDR list -> bare
+///   `Split tunnel` rather than a confusing `Split tunnel (-)`.
 /// * `Split tunnel (0.0.0.0/0, yielded)` — declared a default route
 ///   but another tunnel currently holds it; "yielded" is the plain-
 ///   English equivalent of the prior "suppressed"
@@ -538,15 +552,27 @@ fn render_disconnected(frame: &mut Frame, app: &App, inner: Rect) {
 fn role_line(role: &Role) -> Line<'static> {
     let (value, color) = match role {
         Role::Primary { allowed_ips } => (
-            format!("Primary ({})", format_role_cidrs(allowed_ips)),
+            if allowed_ips.is_empty() {
+                "Primary".to_string()
+            } else {
+                format!("Primary ({})", format_role_cidrs(allowed_ips))
+            },
             theme::NORD_GREEN,
         ),
         Role::Addressable { allowed_ips } => (
-            format!("Split tunnel ({})", format_role_cidrs(allowed_ips)),
+            if allowed_ips.is_empty() {
+                "Split tunnel".to_string()
+            } else {
+                format!("Split tunnel ({})", format_role_cidrs(allowed_ips))
+            },
             theme::ACCENT_PRIMARY,
         ),
         Role::AddressableSuppressed { allowed_ips } => (
-            format!("Split tunnel ({}, yielded)", format_role_cidrs(allowed_ips)),
+            if allowed_ips.is_empty() {
+                "Split tunnel (yielded)".to_string()
+            } else {
+                format!("Split tunnel ({}, yielded)", format_role_cidrs(allowed_ips))
+            },
             theme::NORD_YELLOW,
         ),
         Role::Reconnecting { prior_role } => (
@@ -876,6 +902,37 @@ mod tests {
     }
 
     #[test]
+    fn role_line_primary_with_empty_allowed_ips_omits_parens() {
+        // OpenVPN `redirect-gateway` doesn't produce a `route` line,
+        // so `extract_allowed_ips` returns empty. Don't render
+        // `Primary (-)` — just `Primary`.
+        let l = role_line(&Role::Primary {
+            allowed_ips: vec![],
+        });
+        let s: String = l.spans.iter().map(|sp| sp.content.as_ref()).collect();
+        assert!(s.contains("Primary"), "missing Primary label: {s}");
+        assert!(
+            !s.contains("(-)"),
+            "empty CIDR list must not render as `(-)`: {s}"
+        );
+    }
+
+    #[test]
+    fn role_line_addressable_with_empty_allowed_ips_omits_parens() {
+        // Same concern on the Addressable side — `Split tunnel (-)`
+        // looks broken; render just `Split tunnel`.
+        let l = role_line(&Role::Addressable {
+            allowed_ips: vec![],
+        });
+        let s: String = l.spans.iter().map(|sp| sp.content.as_ref()).collect();
+        assert!(s.contains("Split tunnel"), "missing label: {s}");
+        assert!(
+            !s.contains("(-)"),
+            "empty CIDR list must not render as `(-)`: {s}"
+        );
+    }
+
+    #[test]
     fn role_line_addressable_secondary_single_cidr() {
         let l = role_line(&Role::Addressable {
             allowed_ips: vec![v4("10.0.0.0/8")],
@@ -1020,12 +1077,14 @@ mod tests {
             "internal jargon leaked to user-facing render:\n{out}"
         );
         assert!(out.contains("10.0.0.0/8"), "CIDR missing:\n{out}");
-        // Latency row on a split-tunnel profile must use plain-English
-        // "split tunnel" copy — the previous "secondary tunnel" wording
-        // wasn't a term users encounter outside the codebase.
+        // Latency on a non-exit tunnel must show n/a AND explain
+        // why (telemetry runs only on the active exit). The bare
+        // "n/a (split tunnel)" label without explanation forced users
+        // to ask "why?".
+        assert!(out.contains("n/a"), "Latency must show n/a:\n{out}");
         assert!(
-            out.contains("n/a (split tunnel)"),
-            "Latency copy must be 'n/a (split tunnel)':\n{out}"
+            out.contains("only measured on the active exit"),
+            "Latency must explain why it's n/a:\n{out}"
         );
         assert!(
             !out.contains("secondary tunnel"),
