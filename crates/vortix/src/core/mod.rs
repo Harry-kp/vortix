@@ -8,6 +8,7 @@
 #![allow(unused_imports)]
 
 pub mod downloader;
+pub mod icmp;
 pub mod importer;
 pub mod killswitch;
 pub mod network_monitor;

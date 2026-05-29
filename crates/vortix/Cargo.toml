@@ -84,6 +84,11 @@ arboard = { version = "3.6.1", default-features = false }
 # OpenSSL into the binary; `json` for the IP-API responses. defaults are
 # the native-tls + hickory-dns stack we don't want.
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
+# Plan 002 U10: raw socket for ICMP echo (replaces `ping` shell-out).
+# Thin libc wrapper; we hand-roll the 8-byte ICMP packet + RFC 792
+# checksum and fall back to TCP-connect-port-443 when the kernel
+# refuses unprivileged ICMP.
+socket2 = "0.5"
 
 # System calls (for root detection + platform crates)
 [target.'cfg(unix)'.dependencies]

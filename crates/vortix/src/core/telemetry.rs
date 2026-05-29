@@ -11,8 +11,6 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
 
-use crate::vortix_process::CommandSpec;
-
 use crate::constants;
 use crate::logger::LogLevel;
 use serde::Deserialize;
@@ -511,45 +509,38 @@ pub fn parse_ping_output(output: &str) -> PingStats {
 // respectively as part of plan 003 U2.
 
 /// Measures network latency, packet loss, and jitter by pinging reliable hosts.
+///
+/// Plan 002 U10: replaced the `ping -c 3 -i 0.2 -W <timeout>` shell-out
+/// with `core::icmp::measure_latency`. Same outputs (`latency_ms`,
+/// `packet_loss` %, `jitter_ms`); same retry-across-targets behavior;
+/// same `Latency(0) + PacketLoss(100) + Jitter(0)` final message when
+/// every target fails.
 fn fetch_latency(tx: &Sender<TelemetryUpdate>, cfg: &std::sync::Arc<TelemetryConfig>) {
+    // 3 probes, matching the prior `ping -c 3 -i 0.2` cadence.
+    const PROBES_PER_TARGET: u32 = 3;
+
     let tx_clone = tx.clone();
     let cfg = std::sync::Arc::clone(cfg);
     thread::spawn(move || {
-        // macOS ping -W takes milliseconds; Linux ping -W takes seconds.
-        #[cfg(target_os = "macos")] // xtask:allow-platform-cfg: ping -W unit differs by OS
-        let timeout = (cfg.ping_timeout * 1000).to_string();
-        #[cfg(not(target_os = "macos"))]
-        let timeout = cfg.ping_timeout.to_string();
+        let per_attempt_timeout = Duration::from_secs(cfg.ping_timeout);
 
         for target in &cfg.ping_targets {
             for attempt in 0..constants::RETRY_ATTEMPTS {
-                if let Ok(output) = crate::vortix_process::run_to_output(CommandSpec::oneshot(
-                    "ping",
-                    vec![
-                        "-c".into(),
-                        "3".into(),
-                        "-i".into(),
-                        "0.2".into(),
-                        "-W".into(),
-                        timeout.clone(),
-                        (*target).clone(),
-                    ],
-                )) {
-                    if output.status.success() {
-                        let stdout = String::from_utf8_lossy(&output.stdout);
-                        let stats = parse_ping_output(&stdout);
-
-                        if stats.latency_ms > 0 {
-                            let _ = tx_clone.send(TelemetryUpdate::Latency(stats.latency_ms));
-                            let _ = tx_clone.send(TelemetryUpdate::PacketLoss(stats.packet_loss));
-                            let _ = tx_clone.send(TelemetryUpdate::Jitter(stats.jitter_ms));
-                            return;
-                        }
+                if let Some(stats) = crate::core::icmp::measure_latency(
+                    target,
+                    PROBES_PER_TARGET,
+                    per_attempt_timeout,
+                ) {
+                    if stats.latency_ms > 0 {
+                        let _ = tx_clone.send(TelemetryUpdate::Latency(stats.latency_ms));
+                        let _ = tx_clone.send(TelemetryUpdate::PacketLoss(stats.packet_loss));
+                        let _ = tx_clone.send(TelemetryUpdate::Jitter(stats.jitter_ms));
+                        return;
                     }
                 }
 
                 if attempt == 0 {
-                    thread::sleep(std::time::Duration::from_millis(constants::RETRY_DELAY_MS));
+                    thread::sleep(Duration::from_millis(constants::RETRY_DELAY_MS));
                 }
             }
         }
