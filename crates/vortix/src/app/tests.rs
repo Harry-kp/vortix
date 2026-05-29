@@ -304,13 +304,14 @@ fn add_profiles(app: &mut App, names: &[&str]) {
 // ====================================================================
 
 #[test]
-fn test_toggle_connected_different_profile_shows_confirm() {
-    // Plan 001 SC3: confirming the takeover overlay does NOT
-    // disconnect the existing tunnel. Both tunnels stay connected;
-    // the new one becomes Connecting and (once its kernel
-    // interface comes up) will claim the default route. The prior
-    // primary then renders as `Split tunnel (0.0.0.0/0, yielded)`
-    // in the registry's role derivation.
+fn toggle_connected_different_profile_opens_takeover_overlay() {
+    // When the user toggles a different profile while already
+    // connected, the takeover overlay opens. The overlay offers
+    // three choices: [Y] Switch (legacy), [B] Connect both
+    // (multi-connect), [N] Cancel. This test just covers the
+    // overlay-opens branch; the keybinding-specific behaviors are
+    // covered by `takeover_y_key_dispatches_switch_path` and
+    // `takeover_b_key_dispatches_multi_connect_path`.
     let mut app = test_app();
     add_profiles(&mut app, &["vpn-a", "vpn-b"]);
     set_connected(&mut app, "vpn-a");
@@ -326,15 +327,26 @@ fn test_toggle_connected_different_profile_shows_confirm() {
         "Expected ConfirmDefaultRouteTakeover dialog, got {:?}",
         app.input_mode
     );
+}
+
+#[test]
+fn confirm_default_route_takeover_message_runs_multi_connect_path() {
+    // Message-handler-level test (not keybinding): when
+    // `Message::ConfirmDefaultRouteTakeover` fires directly, the
+    // multi-connect path runs — no pending_connect queue, no
+    // Disconnecting state. Plan 001 SC3 "primary inverts": both
+    // tunnels stay connected, the new one claims the default
+    // route. This message is what the overlay's [B] key produces;
+    // the keybinding test covers the input path.
+    let mut app = test_app();
+    add_profiles(&mut app, &["vpn-a", "vpn-b"]);
+    set_connected(&mut app, "vpn-a");
 
     app.handle_message(Message::ConfirmDefaultRouteTakeover { idx: 1 });
 
-    // Behavior contract: no `pending_connect` queue, no
-    // Disconnecting state. The connect-forced path fires directly
-    // for vpn-b.
     assert!(
         app.runtime.pending_connect.is_none(),
-        "Should not queue a pending connect — both tunnels stay up; got {:?}",
+        "multi-connect path must not queue a pending_connect; got {:?}",
         app.runtime.pending_connect
     );
     assert!(
@@ -342,23 +354,23 @@ fn test_toggle_connected_different_profile_shows_confirm() {
             app.runtime.connection_state,
             ConnectionState::Disconnecting { .. }
         ),
-        "Should NOT transition to Disconnecting — the existing tunnel stays connected; got {:?}",
+        "multi-connect path must not transition to Disconnecting; got {:?}",
         app.runtime.connection_state
     );
     // Note: `connection_state` is the legacy single-tunnel mirror —
     // it can only hold one profile at a time, so vpn-b's connect
     // necessarily overwrites vpn-a's slot. Once plan 001 P5 retires
     // this enum entirely, both tunnels' states will be visible via
-    // the registry exclusively. For now we just assert that the
-    // takeover didn't trigger the legacy disconnect path.
+    // the registry exclusively.
 }
 
 #[test]
-fn takeover_s_key_dispatches_legacy_switch_and_connect_path() {
-    // Users who want the pre-multi-tunnel "switch VPNs" behavior
-    // (disconnect current, then connect new) press [S] on the
-    // takeover overlay. Distinct from [Y]es which keeps both
-    // connected.
+fn takeover_y_key_dispatches_switch_path() {
+    // [Y]/Enter on the takeover overlay fires the legacy "switch
+    // VPNs" path (disconnect current, then connect new). This is
+    // the recommended default for users coming from the
+    // pre-multi-tunnel UX; the new "keep both" multi-connect path
+    // is opt-in via [B].
     let mut app = test_app();
     add_profiles(&mut app, &["vpn-a", "vpn-b"]);
     set_connected(&mut app, "vpn-a");
@@ -372,8 +384,11 @@ fn takeover_s_key_dispatches_legacy_switch_and_connect_path() {
         "expected takeover overlay open"
     );
 
-    // Send the [S] keypress.
-    app.handle_key(key_char('s'));
+    // Cursor defaults to [Y]es — press Enter to confirm.
+    {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    }
 
     // Behavior contract: disconnect path fires. pending_connect
     // queues vpn-b for after teardown; legacy state transitions to
@@ -396,13 +411,47 @@ fn takeover_s_key_dispatches_legacy_switch_and_connect_path() {
 }
 
 #[test]
+fn takeover_b_key_dispatches_multi_connect_path() {
+    // [B]/[b] on the takeover overlay fires the opt-in multi-connect
+    // path: both tunnels stay connected, the new one becomes the
+    // active exit, the prior primary becomes split-tunnel-yielded.
+    // No pending_connect queue; no Disconnecting state.
+    let mut app = test_app();
+    add_profiles(&mut app, &["vpn-a", "vpn-b"]);
+    set_connected(&mut app, "vpn-a");
+    // connect_profile_forced (the multi-connect path's downstream)
+    // checks `is_root`; without it we'd hit InputMode::PermissionDenied
+    // instead of Normal. The test cares about the behavioral path,
+    // not the privilege check.
+    app.runtime.is_root = true;
+    app.toggle_connection(1);
+
+    app.handle_key(key_char('b'));
+
+    // Behavior contract: NO disconnect of the existing tunnel.
+    assert!(
+        app.runtime.pending_connect.is_none(),
+        "multi-connect path must not queue a pending_connect"
+    );
+    assert!(
+        !matches!(
+            app.runtime.connection_state,
+            ConnectionState::Disconnecting { .. }
+        ),
+        "multi-connect path must not transition to Disconnecting; got {:?}",
+        app.runtime.connection_state
+    );
+    assert!(matches!(app.input_mode, InputMode::Normal));
+}
+
+#[test]
 fn switch_path_disconnect_completion_removes_old_profile_from_registry() {
     use crate::vortix_core::profile::ProfileId;
 
-    // [S] flow regression: when the user presses [S] on the takeover
-    // overlay, the legacy disconnect-then-pending-connect path runs.
+    // Switch-flow regression: pressing [Y]/Enter on the takeover
+    // overlay queues pending_connect + fires disconnect.
     // `complete_disconnect` drains `pending_connect` and fires the
-    // new connect — but the OLD branch early-returned before
+    // new connect — but the old branch early-returned before
     // calling `mirror_disconnect_into_registry`, leaving the old
     // profile's entry in the registry. Result: sidebar dot stayed
     // green and header still listed the disconnected tunnel.
@@ -417,9 +466,13 @@ fn switch_path_disconnect_completion_removes_old_profile_from_registry() {
     app.handle_message(Message::SyncSystemState(vec![fake_session("vpn-a")]));
     assert_eq!(app.registry.tunnel_count(), 1, "setup precondition");
 
-    // User toggles vpn-b, accepts the takeover overlay via [S].
+    // User toggles vpn-b, accepts the takeover overlay via Enter
+    // (default [Y]es selection — the recommended Switch path).
     app.toggle_connection(1);
-    app.handle_key(key_char('s'));
+    {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    }
     assert_eq!(
         app.runtime.pending_connect,
         Some(1),
@@ -440,7 +493,7 @@ fn switch_path_disconnect_completion_removes_old_profile_from_registry() {
         error: None,
     });
 
-    // vpn-a must be gone from the registry — the [S] flow drained
+    // vpn-a must be gone from the registry — the switch flow drained
     // pending_connect AND removed the old entry.
     assert!(
         app.registry.snapshot(&ProfileId::new("vpn-a")).is_none(),
@@ -449,17 +502,18 @@ fn switch_path_disconnect_completion_removes_old_profile_from_registry() {
 }
 
 #[test]
-fn takeover_capital_s_also_dispatches_switch() {
-    // Case-insensitive: [S] should work whether shift is held or not.
+fn takeover_capital_b_also_dispatches_multi_connect() {
+    // Case-insensitive: [B] should work whether shift is held or not.
     let mut app = test_app();
     add_profiles(&mut app, &["vpn-a", "vpn-b"]);
     set_connected(&mut app, "vpn-a");
+    app.runtime.is_root = true;
     app.toggle_connection(1);
 
-    app.handle_key(key_char('S'));
+    app.handle_key(key_char('B'));
 
-    assert_eq!(app.runtime.pending_connect, Some(1));
-    assert!(matches!(
+    assert!(app.runtime.pending_connect.is_none());
+    assert!(!matches!(
         app.runtime.connection_state,
         ConnectionState::Disconnecting { .. }
     ));

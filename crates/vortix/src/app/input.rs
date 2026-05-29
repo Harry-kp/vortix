@@ -218,19 +218,28 @@ impl App {
                 mut confirm_selected,
                 ..
             } => {
-                // Side hotkey: `[S]` / `[s]` fires the legacy
-                // single-tunnel "switch" path (disconnect old, then
-                // connect new). Distinct from `[Y]es` which keeps
-                // both tunnels active per plan SC3. Documented in the
-                // overlay body so users see all three choices.
-                if matches!(key.code, KeyCode::Char('s' | 'S')) {
+                // Key bindings on this overlay (plan 001's multi-tunnel
+                // feature is opt-in; the legacy "switch VPNs" UX stays
+                // the default so existing users aren't surprised):
+                //
+                //   [Y]/Enter  -> SwitchExclusiveAndConnect (legacy:
+                //                 disconnect current, then connect new)
+                //   [B]/[b]    -> ConfirmDefaultRouteTakeover (new:
+                //                 keep both connected, new becomes
+                //                 active exit, old becomes split
+                //                 tunnel)
+                //   [N]/Esc    -> Cancel
+                //
+                // The Y/N cursor still navigates the Yes/No buttons.
+                // [B] is a side hotkey for the multi-connect path.
+                if matches!(key.code, KeyCode::Char('b' | 'B')) {
                     let idx = self
                         .runtime
                         .profiles
                         .iter()
                         .position(|p| p.name == to_profile_id.as_str());
                     if let Some(i) = idx {
-                        self.handle_message(Message::SwitchExclusiveAndConnect { idx: i });
+                        self.handle_message(Message::ConfirmDefaultRouteTakeover { idx: i });
                     } else {
                         self.handle_message(Message::CloseOverlay);
                     }
@@ -238,17 +247,19 @@ impl App {
                 }
                 match handle_confirm_keys(key, &mut confirm_selected) {
                     ConfirmAction::Confirmed => {
-                        // Resolve back to index for the existing message shape.
-                        // Index is preferred over ProfileId at the Message
-                        // boundary because the downstream `connect_profile_forced`
-                        // is indexed; future units can move this to ProfileId.
+                        // [Y]es fires the legacy switch path. Index is
+                        // preferred over ProfileId at the Message
+                        // boundary because the downstream
+                        // `disconnect` + `pending_connect` flow is
+                        // indexed; future units can move this to
+                        // ProfileId.
                         let idx = self
                             .runtime
                             .profiles
                             .iter()
                             .position(|p| p.name == to_profile_id.as_str());
                         if let Some(i) = idx {
-                            self.handle_message(Message::ConfirmDefaultRouteTakeover { idx: i });
+                            self.handle_message(Message::SwitchExclusiveAndConnect { idx: i });
                         } else {
                             self.handle_message(Message::CloseOverlay);
                         }

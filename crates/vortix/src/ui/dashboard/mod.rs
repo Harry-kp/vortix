@@ -266,15 +266,20 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
             confirm_selected,
             ..
         } => {
-            // Copy rewrite: the previous title "Default Route
-            // Takeover" + body "Disconnect from X and connect to Y?"
-            // (a) used technical jargon and (b) was inaccurate —
-            // accepting this overlay does NOT disconnect; both
-            // tunnels stay connected, the new one just claims the
-            // kernel default route (plan 001 SC3 "primary inverts").
+            // Multi-connect is a NEW feature (plan 001) — most users
+            // running into this overlay want the familiar pre-existing
+            // "switch VPN" behavior (disconnect old, connect new). So
+            // [Y]/Enter is wired to Switch (the recommended/default
+            // action) and the new Connect-both path is gated behind
+            // an opt-in [B] hotkey. Y/N nav still works as expected;
+            // the cursor defaults to [Y]es.
             //
-            // The plain-English replacement explains the actual
-            // outcome: both stay up, only the "active exit" changes.
+            // The popup fires when both VPNs declare a default route
+            // (0.0.0.0/0) — only one can actually hold the kernel
+            // default route at a time. Either flavor of resolution
+            // (Switch or Both) acknowledges that constraint; Both
+            // keeps the demoted VPN connected as a split tunnel for
+            // failover or per-subnet routing.
             let max = 22;
             let from_t1 = utils::truncate(from, max);
             let from_t2 = utils::truncate(from, max);
@@ -289,40 +294,54 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
                         Line::from(vec![
                             Span::styled(to_t1, Style::default().fg(theme::SUCCESS)),
                             Span::styled(
-                                " also wants to send all your",
+                                " also wants to handle all",
                                 Style::default().fg(theme::TEXT_SECONDARY),
                             ),
                         ]),
                         Line::from(vec![Span::styled(
-                            "internet through it.",
+                            "your internet traffic.",
                             Style::default().fg(theme::TEXT_SECONDARY),
                         )]),
                         Line::from(""),
                         Line::from(vec![
                             Span::styled(
-                                "[Y] Use ",
+                                "[Y] Switch ",
                                 Style::default()
                                     .fg(theme::SUCCESS)
                                     .add_modifier(ratatui::style::Modifier::BOLD),
                             ),
-                            Span::styled(to_t2, Style::default().fg(theme::SUCCESS)),
-                            Span::styled("; keep ", Style::default().fg(theme::TEXT_SECONDARY)),
+                            Span::styled(
+                                "— disconnect ",
+                                Style::default().fg(theme::TEXT_SECONDARY),
+                            ),
                             Span::styled(from_t1, Style::default().fg(theme::ACCENT_PRIMARY)),
-                            Span::styled(" too", Style::default().fg(theme::TEXT_SECONDARY)),
+                            Span::styled(
+                                ", then connect ",
+                                Style::default().fg(theme::TEXT_SECONDARY),
+                            ),
+                            Span::styled(to_t2, Style::default().fg(theme::SUCCESS)),
                         ]),
                         Line::from(vec![
                             Span::styled(
-                                "[S] Disconnect ",
+                                "[B] Connect both ",
                                 Style::default()
-                                    .fg(theme::WARNING)
+                                    .fg(theme::ACCENT_PRIMARY)
                                     .add_modifier(ratatui::style::Modifier::BOLD),
                             ),
-                            Span::styled(from_t2, Style::default().fg(theme::ACCENT_PRIMARY)),
+                            Span::styled("— ", Style::default().fg(theme::TEXT_SECONDARY)),
+                            Span::styled(to_t3, Style::default().fg(theme::SUCCESS)),
                             Span::styled(
-                                " first, then ",
+                                " becomes active;",
                                 Style::default().fg(theme::TEXT_SECONDARY),
                             ),
-                            Span::styled(to_t3, Style::default().fg(theme::SUCCESS)),
+                        ]),
+                        Line::from(vec![
+                            Span::styled("    ", Style::default()),
+                            Span::styled(from_t2, Style::default().fg(theme::ACCENT_PRIMARY)),
+                            Span::styled(
+                                " stays connected as split tunnel",
+                                Style::default().fg(theme::TEXT_SECONDARY),
+                            ),
                         ]),
                         Line::from(vec![Span::styled(
                             "[N] Cancel",
@@ -333,8 +352,8 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
                     ],
                     border_color: theme::WARNING,
                     confirm_selected: *confirm_selected,
-                    width: 60,
-                    height: 11,
+                    width: 64,
+                    height: 12,
                 },
             );
         }
