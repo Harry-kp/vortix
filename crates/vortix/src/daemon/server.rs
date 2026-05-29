@@ -232,8 +232,9 @@ fn get_peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
         // errno without touching the buffer.
         unsafe {
             let mut cred: libc::ucred = std::mem::zeroed();
-            let mut len = libc::socklen_t::try_from(std::mem::size_of::<libc::ucred>())
-                .expect("ucred size fits in socklen_t (a small POD struct on every supported target)");
+            let mut len = libc::socklen_t::try_from(std::mem::size_of::<libc::ucred>()).expect(
+                "ucred size fits in socklen_t (a small POD struct on every supported target)",
+            );
             let rc = libc::getsockopt(
                 fd,
                 libc::SOL_SOCKET,
