@@ -657,10 +657,45 @@ pub fn get_unique_path(dir: &std::path::Path, filename: &str) -> std::path::Path
     path
 }
 
+/// Check whether a named executable exists somewhere on `PATH`.
+///
+/// Walks `$PATH` entries directly via `std::env::split_paths` and checks
+/// each for the binary — does NOT shell out to `which`. The earlier
+/// `which`-based implementation broke on Fedora minimal containers
+/// (and any other distro where the `which` binary itself is in a
+/// separate package), where it would falsely report system-installed
+/// binaries as missing. Catching this was the first regression the
+/// matrixed Fedora integration test surfaced.
+///
+/// On Unix, also requires the file to have an executable bit set; on
+/// other platforms, presence as a regular file is sufficient.
 pub(crate) fn binary_exists(name: &str) -> bool {
-    use crate::vortix_process::CommandSpec;
-    crate::vortix_process::run_to_output(CommandSpec::oneshot("which", vec![name.to_string()]))
-        .is_ok_and(|o| o.status.success())
+    use std::env;
+
+    let Ok(path) = env::var("PATH") else {
+        return false;
+    };
+
+    for dir in env::split_paths(&path) {
+        let candidate = dir.join(name);
+        if !candidate.is_file() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = candidate.metadata() {
+                if meta.permissions().mode() & 0o111 != 0 {
+                    return true;
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Check whether `resolvconf` is installed and functional.
@@ -728,6 +763,42 @@ pub(crate) fn wireguard_config_has_dns(config_path: &std::path::Path) -> bool {
 mod tests {
     use super::*;
     use std::time::{Duration, SystemTime};
+
+    // ───── binary_exists ─────────────────────────────────────────────────
+
+    #[test]
+    fn binary_exists_finds_a_known_present_unix_binary() {
+        // `sh` is part of POSIX and present on every Unix CI runner we
+        // support (macOS, Ubuntu, Fedora). On Windows the test simply
+        // asserts the function doesn't panic — non-Unix runners don't
+        // have a guaranteed binary at a known PATH location.
+        #[cfg(unix)]
+        assert!(
+            binary_exists("sh"),
+            "binary_exists should locate `sh` on Unix-like PATH"
+        );
+        #[cfg(not(unix))]
+        let _ = binary_exists("sh");
+    }
+
+    #[test]
+    fn binary_exists_returns_false_for_known_absent_binary() {
+        // Pick a name that almost certainly won't exist on any runner.
+        // If this ever flakes, the runner has a binary called
+        // `vortix-nonexistent-xyz123` and we have bigger problems.
+        assert!(!binary_exists("vortix-nonexistent-xyz123"));
+    }
+
+    // NOTE: Earlier draft had an "empty PATH" test that mutated
+    // env::PATH and restored it. Dropped because:
+    //   1. env::set_var / env::remove_var are unsafe in modern Rust
+    //      (process-wide global state; not thread-safe under cargo
+    //      test's parallel runner).
+    //   2. The function's behavior on PATH=unset is trivially
+    //      `false` via the `let Ok(path) = env::var("PATH") else`
+    //      guard — covered by inspection, not worth a racy test.
+
+    // ─────────────────────────────────────────────────────────────────────
 
     #[test]
     fn test_format_bytes_speed_bytes() {

@@ -11,10 +11,22 @@
 name: Integration Tests
 
 on:
+  # Doc-only changes skip Integration — these tests drive the real
+  # vortix binary against real wg-quick + iptables; markdown can't
+  # affect kernel behavior. Cron + workflow_dispatch are unaffected
+  # by paths-ignore so nightly runs continue regardless of PR shape.
   pull_request:
     branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "LICENSE"
+      - "CHANGELOG.md"
   push:
     branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "LICENSE"
+      - "CHANGELOG.md"
   schedule:
     # Nightly so flake rate is observable.
     - cron: "30 5 * * *"

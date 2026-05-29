@@ -1,10 +1,21 @@
 name: Lint
 
 on:
+  # Doc-only changes (markdown / LICENSE / CHANGELOG) skip Lint —
+  # rustdoc lints fire on Rust doc comments inside `.rs` files, never
+  # on `.md` files in docs/. Any non-doc change triggers normally.
   push:
     branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "LICENSE"
+      - "CHANGELOG.md"
   pull_request:
     branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "LICENSE"
+      - "CHANGELOG.md"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

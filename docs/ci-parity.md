@@ -1,6 +1,12 @@
 # CI parity — local verification commands
 
-Single source of truth for "what CI runs". Run this exact set before pushing to avoid the *"green locally, red in CI"* trap. Authoritative reference is `.github/workflows/ci.yml`; update both together.
+Single source of truth for "what CI runs". Run this exact set before pushing to avoid the *"green locally, red in CI"* trap. Authoritative reference is the workflow files under `.github/workflows/`; update both together.
+
+## Doc-only PR convention
+
+PRs that only touch `**/*.md`, `LICENSE`, or `CHANGELOG.md` skip every heavy CI workflow (`test.yml`, `lint.yml`, `boundary.yml`, `security.yml`, `integration-tests.yml`). The result: a doc-only PR shows no green check rows except `Release / plan` (cargo-dist-owned, fires on every PR). This is intentional — the saving is real CI minutes; the cost is that a reviewer sees an "empty" check list and has to trust the rule.
+
+If your PR mixes a doc change with anything else (any `.rs`, `Cargo.toml`, `Cargo.lock`, or workflow YAML touch), CI fires normally. The skip only triggers when EVERY changed file matches the doc patterns.
 
 ## The full set
 
