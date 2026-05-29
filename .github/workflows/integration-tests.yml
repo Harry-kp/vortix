@@ -9,9 +9,8 @@
 name: Integration Tests
 
 on:
-  # PR trigger removed — the workflow is already `continue-on-error: true`
-  # so it never gated merge. Catching integration regressions nightly
-  # (and on main push) is enough; the PR row was pure visual noise.
+  pull_request:
+    branches: [main]
   push:
     branches: [main]
   schedule:
@@ -30,10 +29,11 @@ jobs:
   integration:
     name: Integration / ubuntu-22.04
     runs-on: ubuntu-latest
-    # Soft-gate the first 2 weeks of life so flake doesn't block merges
-    # while the harness stabilises. Promote to required-for-release once
-    # 10 consecutive runs on main are green.
-    continue-on-error: true
+    # Hard-gated: a failed integration test fails the PR check.
+    # Killswitch is Vortix's core product promise — regressions here
+    # are silent betrayals of users who think they're protected.
+    # If a flake fires, the right move is to fix the flake, not to
+    # re-soft-gate.
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
