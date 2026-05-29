@@ -1,5 +1,5 @@
 name: 'Rust setup'
-description: 'Checkout repository, install pinned Rust toolchain, restore cargo cache. Used by lint/test/boundary/security workflows to DRY the repeated 3-step setup stanza.'
+description: 'Install pinned Rust toolchain + restore cargo cache. Callers MUST run actions/checkout@v4 BEFORE this action — a local composite action cannot be discovered on disk until the repo has been checked out.'
 
 inputs:
   toolchain:
@@ -14,7 +14,6 @@ inputs:
 runs:
   using: composite
   steps:
-    - uses: actions/checkout@v4
     - uses: dtolnay/rust-toolchain@master
       with:
         toolchain: ${{ inputs.toolchain }}

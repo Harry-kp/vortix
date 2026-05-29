@@ -18,6 +18,7 @@ jobs:
     name: Check Subprocess Boundary (plan 002)
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: ./.github/actions/rust-setup
       - run: cargo xtask check-subprocess
 
@@ -25,6 +26,7 @@ jobs:
     name: Check Platform Boundary (plan 003)
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: ./.github/actions/rust-setup
       - run: cargo xtask check-platform-leak
 
@@ -32,5 +34,6 @@ jobs:
     name: Check Protocol Boundary (plan 004)
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: ./.github/actions/rust-setup
       - run: cargo xtask check-protocol-leak
