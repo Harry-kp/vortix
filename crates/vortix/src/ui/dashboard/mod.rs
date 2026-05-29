@@ -266,34 +266,47 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
             confirm_selected,
             ..
         } => {
-            let max = 28;
+            // Copy rewrite: the previous title "Default Route
+            // Takeover" + body "Disconnect from X and connect to Y?"
+            // (a) used technical jargon and (b) was inaccurate —
+            // accepting this overlay does NOT disconnect; both
+            // tunnels stay connected, the new one just claims the
+            // kernel default route (plan 001 SC3 "primary inverts").
+            //
+            // The plain-English replacement explains the actual
+            // outcome: both stay up, only the "active exit" changes.
+            let max = 24;
             let from_t = utils::truncate(from, max);
             let to_t = utils::truncate(to_name, max);
             confirm_dialog::render(
                 frame,
                 ConfirmDialogConfig {
-                    title: " Default Route Takeover ",
+                    title: " Switch VPN exit? ",
                     body: vec![
+                        Line::from(vec![Span::styled(
+                            "Both tunnels route all traffic.",
+                            Style::default().fg(theme::TEXT_SECONDARY),
+                        )]),
                         Line::from(vec![
+                            Span::styled("Make ", Style::default().fg(theme::TEXT_SECONDARY)),
+                            Span::styled(to_t, Style::default().fg(theme::SUCCESS)),
                             Span::styled(
-                                "Disconnect from ",
+                                " the active exit?",
                                 Style::default().fg(theme::TEXT_SECONDARY),
                             ),
-                            Span::styled(from_t, Style::default().fg(theme::ACCENT_PRIMARY)),
                         ]),
                         Line::from(vec![
+                            Span::styled(from_t, Style::default().fg(theme::ACCENT_PRIMARY)),
                             Span::styled(
-                                "and connect to ",
+                                " stays connected as split tunnel.",
                                 Style::default().fg(theme::TEXT_SECONDARY),
                             ),
-                            Span::styled(to_t, Style::default().fg(theme::SUCCESS)),
-                            Span::styled("?", Style::default().fg(theme::TEXT_SECONDARY)),
                         ]),
                     ],
                     border_color: theme::WARNING,
                     confirm_selected: *confirm_selected,
-                    width: 50,
-                    height: 7,
+                    width: 56,
+                    height: 8,
                 },
             );
         }

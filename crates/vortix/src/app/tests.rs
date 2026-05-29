@@ -305,6 +305,12 @@ fn add_profiles(app: &mut App, names: &[&str]) {
 
 #[test]
 fn test_toggle_connected_different_profile_shows_confirm() {
+    // Plan 001 SC3: confirming the takeover overlay does NOT
+    // disconnect the existing tunnel. Both tunnels stay connected;
+    // the new one becomes Connecting and (once its kernel
+    // interface comes up) will claim the default route. The prior
+    // primary then renders as `Split tunnel (0.0.0.0/0, yielded)`
+    // in the registry's role derivation.
     let mut app = test_app();
     add_profiles(&mut app, &["vpn-a", "vpn-b"]);
     set_connected(&mut app, "vpn-a");
@@ -322,15 +328,29 @@ fn test_toggle_connected_different_profile_shows_confirm() {
     );
 
     app.handle_message(Message::ConfirmDefaultRouteTakeover { idx: 1 });
-    assert_eq!(app.runtime.pending_connect, Some(1));
+
+    // Behavior contract: no `pending_connect` queue, no
+    // Disconnecting state. The connect-forced path fires directly
+    // for vpn-b.
     assert!(
-        matches!(
+        app.runtime.pending_connect.is_none(),
+        "Should not queue a pending connect — both tunnels stay up; got {:?}",
+        app.runtime.pending_connect
+    );
+    assert!(
+        !matches!(
             app.runtime.connection_state,
             ConnectionState::Disconnecting { .. }
         ),
-        "Expected Disconnecting after confirm, got {:?}",
+        "Should NOT transition to Disconnecting — the existing tunnel stays connected; got {:?}",
         app.runtime.connection_state
     );
+    // Note: `connection_state` is the legacy single-tunnel mirror —
+    // it can only hold one profile at a time, so vpn-b's connect
+    // necessarily overwrites vpn-a's slot. Once plan 001 P5 retires
+    // this enum entirely, both tunnels' states will be visible via
+    // the registry exclusively. For now we just assert that the
+    // takeover didn't trigger the legacy disconnect path.
 }
 
 #[test]

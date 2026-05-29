@@ -64,20 +64,21 @@ impl App {
                 self.input_mode = InputMode::Normal;
                 if let Some(profile) = self.runtime.profiles.get(idx) {
                     self.log(&format!(
-                        "ACTION: Default-route takeover confirmed; switching to '{}'...",
+                        "ACTION: Default-route takeover confirmed; connecting '{}' as new exit",
                         profile.name
                     ));
                 }
-                if matches!(self.runtime.connection_state, ConnectionState::Disconnected) {
-                    self.runtime.pending_connect = None;
-                    // Multi-connection plan #001 U7: conflict already
-                    // surfaced via the overlay; retry the connect with the
-                    // detect-conflict gate bypassed (force=true).
-                    self.connect_profile_forced(idx);
-                } else {
-                    self.runtime.pending_connect = Some(idx);
-                    self.disconnect();
-                }
+                // Plan 001 SC3 ("primary inverts"): both tunnels stay
+                // connected; the new one claims the kernel default
+                // route and the prior primary becomes
+                // `Split tunnel (0.0.0.0/0, yielded)` in the registry's
+                // role derivation. Symmetric with
+                // `ConfirmRouteOverlap` below — neither path
+                // disconnects the existing tunnel. The conflict was
+                // already surfaced via the overlay, so retry the
+                // connect with the `detect_conflict` gate bypassed.
+                self.runtime.pending_connect = None;
+                self.connect_profile_forced(idx);
             }
             Message::ConfirmRouteOverlap { idx } => {
                 self.input_mode = InputMode::Normal;
