@@ -842,7 +842,8 @@ mod tests {
     fn find_binary_path_returns_existing_path_for_known_unix_binary() {
         #[cfg(unix)]
         {
-            let path = find_binary_path("sh").expect("`sh` should be locatable on every Unix CI runner");
+            let path =
+                find_binary_path("sh").expect("`sh` should be locatable on every Unix CI runner");
             assert!(path.is_file(), "returned path must exist on disk: {path:?}");
             assert!(
                 path.ends_with("sh"),

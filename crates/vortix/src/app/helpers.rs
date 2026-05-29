@@ -321,10 +321,7 @@ impl App {
                 // Common in headless environments (CI, SSH without
                 // X-forwarding). Match the prior implementation's
                 // soft-fail behavior.
-                self.show_toast(
-                    format!("Clipboard unavailable: {e}"),
-                    ToastType::Error,
-                );
+                self.show_toast(format!("Clipboard unavailable: {e}"), ToastType::Error);
             }
         }
     }

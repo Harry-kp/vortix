@@ -1,7 +1,7 @@
 //! Linux VPN interface detection via `libc::getifaddrs` + `/sys/class/net` + `wg show`.
 //!
 //! Plan 002 U4: replaced the `ip addr show <iface>` shell-out with a direct
-//! libc::getifaddrs walk for IPv4 address discovery and a `/sys/class/net/<iface>/mtu`
+//! `libc::getifaddrs` walk for IPv4 address discovery and a `/sys/class/net/<iface>/mtu`
 //! read for MTU. No more parsing of human-formatted `ip` output; no PATH dependency
 //! on iproute2 for read-only interface inspection.
 
@@ -78,7 +78,7 @@ fn check_wg_interface_exists(name: &str) -> bool {
 /// contains ALL of the given substring needles (case-insensitive).
 ///
 /// Replaces the `ps -eo pid,args` shell-out used for finding userspace
-/// WireGuard processes (wireguard-go). Pure stdlib; no PATH dependency
+/// `WireGuard` processes (wireguard-go). Pure stdlib; no PATH dependency
 /// on procps.
 ///
 /// Plan 002 U6.
@@ -148,7 +148,7 @@ pub(crate) fn find_all_pids_with_cmdline_substring(needle: &str) -> Vec<u32> {
 
 /// Read the IPv4 address assigned to `interface` from `libc::getifaddrs`.
 ///
-/// Returns the first AF_INET address encountered for the named interface,
+/// Returns the first `AF_INET` address encountered for the named interface,
 /// matching the prior parser's behavior (it picked the first `inet ` line
 /// out of `ip addr show` output). Returns `None` when the interface has
 /// no IPv4 address, doesn't exist, or `getifaddrs` itself fails.
@@ -172,13 +172,15 @@ fn get_interface_ipv4(interface: &str) -> Option<String> {
             let entry = &*current;
             if !entry.ifa_name.is_null() {
                 let name_cstr = std::ffi::CStr::from_ptr(entry.ifa_name);
-                if name_cstr.to_bytes() == interface.as_bytes()
-                    && !entry.ifa_addr.is_null()
-                {
+                if name_cstr.to_bytes() == interface.as_bytes() && !entry.ifa_addr.is_null() {
                     let addr = &*entry.ifa_addr;
                     if i32::from(addr.sa_family) == libc::AF_INET {
                         // Cast to sockaddr_in; extract the 4-byte network-
                         // order address; format as dotted-decimal.
+                        // sockaddr_in alignment (4) is stricter than sockaddr (2 on
+                        // Linux), but getifaddrs guarantees alignment when sa_family
+                        // is AF_INET. The cast is safe in this branch.
+                        #[allow(clippy::cast_ptr_alignment)]
                         let sin = entry.ifa_addr.cast::<libc::sockaddr_in>();
                         let bytes = (*sin).sin_addr.s_addr.to_ne_bytes();
                         result = Some(format!(

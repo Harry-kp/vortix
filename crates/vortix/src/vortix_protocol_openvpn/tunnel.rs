@@ -532,13 +532,16 @@ impl Tunnel for OvpnTunnel {
         // caller. Revisit if a second protocol module needs this.
         let needle = format!("vortix-{safe_name}");
 
-        #[cfg(target_os = "linux")] // xtask:allow-platform-cfg: process enumeration is OS-specific (Linux /proc walk)
+        #[cfg(target_os = "linux")]
+        // xtask:allow-platform-cfg: process enumeration is OS-specific (Linux /proc walk)
         let stale_pids =
             crate::vortix_platform_linux::interface::find_all_pids_with_cmdline_substring(&needle);
-        #[cfg(target_os = "macos")] // xtask:allow-platform-cfg: process enumeration is OS-specific (macOS proc_listpids)
+        #[cfg(target_os = "macos")]
+        // xtask:allow-platform-cfg: process enumeration is OS-specific (macOS proc_listpids)
         let stale_pids =
             crate::vortix_platform_macos::interface::find_all_pids_with_cmdline_substring(&needle);
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))] // xtask:allow-platform-cfg: Windows / other OS fallback (NG per origin)
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        // xtask:allow-platform-cfg: Windows / other OS fallback (NG per origin)
         let stale_pids: Vec<u32> = Vec::new();
 
         for stale_pid in stale_pids {
