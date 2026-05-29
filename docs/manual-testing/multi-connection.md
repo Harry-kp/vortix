@@ -6,6 +6,44 @@ Shipped in: v0.4.0 (pending)
 
 Automated tests cover FSM, parsers, CIDR math, JSON shapes, wire-format serde, and UI render-builders with hand-rolled snapshots. The list below is everything that can only be validated by a human running the binary against real kernels, real WG/OVPN daemons, and real terminals. Run on both macOS and Linux unless flagged otherwise.
 
+## Coverage map (Phase 1 automation status)
+
+Per-category map of what's automated vs still requires manual verification. Automated test paths are repo-relative. See [`docs/plans/2026-05-29-002-feat-behavioral-test-automation-plan.md`](../plans/2026-05-29-002-feat-behavioral-test-automation-plan.md) for the automation plan.
+
+| Category | Status | Where covered / why manual |
+|---|---|---|
+| Setup prerequisites | n/a | Environment config; not test material |
+| Single-tunnel regression | **automated (partial)** | `tests/integration/wg_happy_path.sh` covers connect/disconnect lifecycle; CLI behavior covered by `crates/vortix/tests/cli_integration.rs` (37 tests). Residual: real OVPN auth flow + telemetry chart manual |
+| Multi-tunnel happy paths | **manual** | Needs netns-multi-tunnel harness (Phase 1 plan U1+U2 — deferred) |
+| Conflict detection (registry) | **automated** | `crates/vortix/src/vortix_core/engine/registry.rs` — `conflict_when_existing_primary_holds_default_route`, `conflict_against_pending_default_route_claimant`, `split_slash_one_pair_*`, `slash_two_quartet_*`, `force_true_bypasses_*` |
+| CLI conflict path | **automated (partial)** | Registry-side covered above; CLI exit-code mapping needs `vortix up <conflict-profile>` integration test (Phase 1 U6 deferred to netns harness) |
+| Auto-promote banner (D-3) | **partial — feature gap** | Registry promotion logic covered (`disconnect_primary_promotes_secondary_with_zero_slash_zero`); event variant defined and serde-tested in `engine/event.rs`; **but the `PrimaryTunnelChanged` event is never emitted in production code** — wiring gap, not a test gap. The 10s banner UX is manual until wired |
+| Multi-tunnel disconnect flow | **manual** | TUI keybinding behavior (`d`/`D`/`Tab`/`c`/`u`); needs TUI snapshot harness (Phase 2 deferred) |
+| CLI down / reconnect grammar | **automated** | `crates/vortix/tests/cli_integration.rs` — `clap_parses_down_with_profile_arg`, `clap_parses_down_all_flag`, `clap_rejects_down_profile_with_all_flag`, `clap_parses_reconnect_with_profile_arg`, `clap_parses_reconnect_no_args`, `clap_parses_up_yes_*` (plan 002 U6-narrow) |
+| Killswitch v2 — real firewall | **automated (single-tunnel) / manual (multi)** | `tests/integration/killswitch.sh` covers single-tunnel default-DROP behavior. Multi-tunnel `iptables-restore` ruleset + atomicity probe needs Phase 1 U3 (deferred to netns harness) |
+| DNS scoping (R13) | **partial** | WG temp-config DNS-strip logic unit-tested in `crates/vortix/src/vortix_protocol_wireguard/tunnel.rs`. End-to-end `/etc/resolv.conf` assertion + OVPN `--pull-filter` needs Phase 1 U4+U5 (deferred to netns harness) |
+| fwmark warning (D-1) | **manual** | TUI rendering; predicate is unit-testable but the warning text is not. Phase 2 TUI snapshot harness |
+| Sidebar / header / Connection Details visual | **automated (render builders) / manual (visual fidelity)** | `crates/vortix/src/ui/dashboard/{sidebar,header,connection_details,security}.rs` — ratatui `TestBackend` snapshot tests cover render logic. Visual fidelity at user terminal widths + screen readers stays manual |
+| JSON v2 envelope (U21) | **automated** | `crates/vortix/tests/json_v2_envelope.rs` — 7 tests covering schema_version pinning, empty/single/multi/no-primary states, back-compat `data.connection` field, optional-field null serialization, serde round-trip (plan 002 U7) |
+| Daemon (D1-D3) + IPC | **automated (partial)** | `crates/vortix/src/daemon/server.rs` and `mod.rs` cover socket bind, frame round-trip, UID-gate logic. Adversarial cross-UID attempt + daemon-sweep tests are manual until netns harness (Phase 1 U10 deferred) |
+| PersistedState V2 migration (U11) | **automated** | `crates/vortix/src/core/killswitch.rs` — `v2_persisted_state_round_trips`, `v1_file_deserializes_with_serde_defaults`, `v1_with_no_interface_coerces_*`, `v2_file_with_schema_version_field_deserializes`, `persisted_state_corrupted_mode_fails`, `persisted_state_empty_json_fails`, `unknown_future_schema_falls_back_to_v1_coercion`, `v0_3_x_v1_reader_tolerates_v2_file` (8 tests) |
+| V2 → V1 downgrade | **manual** | Needs real v0.3.x binary install; release-time pre-ship check |
+| Failure modes / negative paths | **partial** | Bad config syntax + missing files covered in protocol-parser unit tests. Disk-full / OOM / network-drop mid-handshake = Phase 2 fault-injection layer |
+| Security spot-checks | **partial** | `write_secret_file` TOCTOU mitigation tested in `crates/vortix/src/vortix_core/secret_file.rs`; symlink attack + ps aux credential scan + real-file-mode assertions need netns harness (Phase 1 U10 deferred) |
+| Cross-platform parity | **manual** | Real consumer hardware (M-series MacBook, distro-specific Linux); inherently human. CI matrix (`Test (macos-latest)`, `Test (ubuntu-latest)`, `Test (fedora-41)`) catches 80%; long-tail stays manual |
+| Performance / scale | **manual / deferred** | N=10 tunnels TUI render budget; killswitch refresh latency. Phase 2 perf workflow |
+| Journal observability (U23) | **partial — feature gap** | Event variants defined and serde-tested in `engine/event.rs`. Production emission of `PrimaryTunnelChanged` / `ConnectAttemptBlockedByConflict` is **not yet wired** — same gap as auto-promote |
+
+**Status legend:**
+- **automated** = fully covered; no human verification needed pre-release
+- **automated (partial)** = primary path covered; some edge cases still manual
+- **partial** = unit-level covered; integration / behavioral end-to-end manual
+- **partial — feature gap** = test variants exist but production wiring is missing (separate fix needed)
+- **manual** = stays human; no automation feasible or value
+- **manual / deferred** = automatable but waiting for Phase 2/3 infrastructure
+
+**Phase 1 plan tracks the remaining gaps:** [`docs/plans/2026-05-29-002-feat-behavioral-test-automation-plan.md`](../plans/2026-05-29-002-feat-behavioral-test-automation-plan.md) — units U1-U5, U10, U12 add the netns multi-tunnel harness needed to convert the "manual" rows above into automated coverage.
+
 ## Setup prerequisites
 
 - [ ] Two real WireGuard profiles available (`corp` = 0.0.0.0/0, `lab` = 10.0.0.0/8 only)
