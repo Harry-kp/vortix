@@ -1,0 +1,80 @@
+# Manual Test Backlog
+
+Pre-release human-verification checks. Every row here is something that CI can't catch and a human has to confirm before shipping.
+
+**Convention:** Append rows when a new feature ships with a manual check. **Delete rows** when an automated test starts covering the check — never annotate "now automated"; the row goes away.
+
+| # | Check | Steps | Why manual |
+|---|---|---|---|
+| 1 | Two real WG profiles available for multi-tunnel testing | Have `corp` (0/0) and `lab` (10/8) configs ready | Environment setup; can't be automated |
+| 2 | Real OpenVPN profile with username+password auth (OVPN 2.4+) | Have `.ovpn` file with auth-user-pass directive | Environment setup |
+| 3 | OVPN 2.3.x binary available for version-rejection path | `apt install openvpn=2.3.*` or equivalent | Test fixture; requires installing old binary |
+| 4 | Second OS user account for daemon UID-gate adversarial test | `useradd vortix-adversary` | Test fixture; cross-UID setup |
+| 5 | Multi-tunnel routing: corp owns default, lab owns 10/8 | `vortix up corp; vortix up lab; ip route get 1.1.1.1` shows `dev wg-corp`; `ip route get 10.x.y.z` shows `dev wg-lab` | Multi-tunnel netns harness not built (plan 002 U1+U2) |
+| 6 | Multi-tunnel real-internet exit IP differs per tunnel | `curl https://api.ipify.org` via corp returns IP A; same via lab returns IP B (when lab is primary) | Requires real public IPs; netns can't fake this |
+| 7 | 3+ tunnels overflow ladder in header degrades cleanly | Connect 6 tunnels on a 60-col terminal; verify Tier 1 → Tier 2 → Tier 3 (dot-row) transitions; never wraps | TUI rendering; needs ratatui snapshot harness (Phase 2) |
+| 8 | Auto-promote banner fires + `[u]` reverts within 10s | `wg-quick down corp` externally; banner appears; press `[u]` within 10s; corp reconnects | Feature wiring gap — `PrimaryTunnelChanged` event not emitted in production yet |
+| 9 | Auto-promote banner auto-dismisses after 10s | Same as #8 but wait >10s; banner gone; `[u]` does nothing | Same as #8 |
+| 10 | No auto-promote when no eligible secondary | Only one tunnel up; disconnect it; no banner fires | Same as #8 |
+| 11 | Multi-tunnel disconnect via `d` key disconnects single tunnel | Connect 2 tunnels; focus secondary in sidebar; press `d`; only that one disconnects | TUI keybinding; needs snapshot harness |
+| 12 | `Shift+D` with N≥2 fires "Disconnect all N?" confirm dialog | Connect 3 tunnels; press `Shift+D`; verify dialog renders; Y disconnects all | Same as #11 |
+| 13 | `Tab` cycles Connection Details focus across active tunnels | 2 tunnels up; focus Connection Details; press `Tab`; focus advances; wraps at end | Same as #11 |
+| 14 | `c` cancels an in-flight Connecting state | Connect a slow tunnel; while Connecting (`◐`), focus Details + press `c`; sidebar clears | Same as #11 |
+| 15 | Multi-tunnel iptables ruleset has per-tunnel ACCEPT + RFC1918 carve | After `vortix up corp lab`: `sudo iptables-save` shows `-A OUTPUT -o wg-corp/wg-lab -j ACCEPT` + no `-d 10.0.0.0/8` (carved by lab's 10/8 declaration) | Multi-tunnel netns harness deferred (plan 002 U3) |
+| 16 | Atomicity probe: no traffic leak window during tunnel transition | While corp+lab up, run continuous `curl 10.99.0.99 --max-time 2` loop; externally kill corp; assert no BLOCKED → ACCEPT → BLOCKED gap | Same as #15 |
+| 17 | macOS pf ruleset has per-tunnel pass-out rules + RFC1918 carve | macOS only: `sudo pfctl -s rules` shows per-interface pass-outs + RFC1918 carve | Same as #15; macOS-only |
+| 18 | WG secondary's `DNS = ...` stripped from temp config | Connect corp (with `DNS=1.1.1.1`) + lab (with `DNS=8.8.8.8` as secondary). Verify `/etc/resolv.conf` has only 1.1.1.1; lab's temp WG config in `${TMPDIR}/vortix-*/` has no `DNS=` line | DNS-scoping netns harness deferred (plan 002 U4) |
+| 19 | OVPN secondary launched with `--pull-filter ignore "dhcp-option DNS"` | Connect WG primary; connect OVPN as secondary; `ps aux \| grep openvpn` shows the filter arg | OVPN netns harness deferred (plan 002 U5) |
+| 20 | OVPN 2.3.x as secondary is rejected with "OpenVPN 2.4+ required" | With OVPN 2.3 installed: connect any primary; attempt OVPN 2.3 as secondary; vortix refuses before connect attempt | Needs real OVPN 2.3 binary install |
+| 21 | fwmark hijack warning shows on Connection Details for WG without `FwMark` | Connect WG without `FwMark = ...` as secondary; Connection Details shows `⚠ Fwmark hijack risk...` line | TUI rendering |
+| 22 | fwmark warning DOES NOT show when secondary has `FwMark = 51820` | Same as #21 but with FwMark set; no warning line | TUI rendering |
+| 23 | fwmark warning DOES NOT show when single tunnel (not secondary) | Connect just the WG-without-FwMark profile alone; no warning | TUI rendering |
+| 24 | Sidebar empty-state renders correctly | Start vortix with no profiles imported; sidebar shows "No profiles" message | TUI rendering |
+| 25 | Sidebar scroll with 10+ profiles works | Import 15 profiles; `j`/`k` scroll the list; selection wraps at edges | TUI rendering |
+| 26 | Header degrades at 50 / 60 / 80 / 100 / 120 columns | Resize terminal to each width; header never wraps; tunnels strip uses the right Tier | TUI rendering at variable widths |
+| 27 | Sidebar truncates rows cleanly at 80x12 | Resize to 80x12; sidebar still renders without panic; rows truncated with ellipsis | TUI rendering |
+| 28 | `NO_COLOR=1` renders badges via Unicode shape only | `NO_COLOR=1 vortix`; status badges (`●` etc.) still distinguishable by shape, not just color | TUI rendering + accessibility |
+| 29 | VoiceOver / Orca announces sidebar rows | macOS VoiceOver or Linux Orca enabled; sidebar row text is announced; no purely-color signals required for comprehension | Screen-reader accessibility; no automation hook |
+| 30 | AwaitingUserInput hint renders on Connection Details | OVPN with 2FA prompt — Connection Details shows `⚠ Press [Enter] to provide 2FA code/passphrase/input` | TUI rendering |
+| 31 | Demoted ex-primary Role shows `Addressable (0.0.0.0/0, suppressed)` | Connect 2× 0/0 profiles; one takes over; the demoted one shows the suppressed role in Connection Details | TUI rendering |
+| 32 | Security Guard shows `EXPOSED` with 0 tunnels | No tunnels up; Security panel headline = `EXPOSED` | TUI rendering |
+| 33 | Security Guard shows `PARTIAL` with secondaries-only | Connect tunnels that don't claim 0/0; Security panel = `PARTIAL` + KS-mode-aware Killswitch bullet | TUI rendering |
+| 34 | Security Guard IPv6 line is honest about v4-only enforcement | Any state; IPv6 line reads `⚠ IPv6: Not enforced (v4-only killswitch)` | TUI rendering |
+| 35 | Daemon socket created at expected path with mode 0600 | `sudo vortix daemon &`; verify socket at `${XDG_RUNTIME_DIR}/vortix.sock` (Linux) or `${TMPDIR}/vortix.sock` (macOS); `ls -la` shows mode 0600 | Real-fs assertion; daemon test harness deferred |
+| 36 | Read-only CLI ops bypass daemon when socket absent | Stop daemon; run `vortix status`; falls back to direct scanner with exit 0 | Same as #35 |
+| 37 | Cross-UID adversarial: different non-root user can't talk to daemon | Run daemon as user A; as user B attempt `socat - UNIX-CONNECT:/path/to/vortix.sock`; daemon closes after first frame with UID-mismatch error | Needs two-user setup; deferred (plan 002 U10) |
+| 38 | Wire-format compatibility: v0.3.x client → v2 daemon socket fails cleanly | Old vortix binary on PATH; `vortix status --json` against running v2 daemon; structured error, not silent mis-parse | Needs real v0.3.x binary install |
+| 39 | SIGTERM to daemon cleans up socket; tunnels persist | `kill -TERM <daemon-pid>`; socket unlinks; active tunnels stay up; `wg show` confirms | Real-fs + signal handling; needs daemon test harness |
+| 40 | Daemon restart re-attaches to existing tunnels (no double-connect) | Start daemon; up a tunnel; SIGTERM; start new daemon; no second wg-quick fires; tunnel still up | Same as #39 |
+| 41 | V2 → V1 downgrade: v0.3.x reads V2 journal without erroring | Connect with current binary; revert to v0.3.x; `journalctl` replay tools skip unknown variants per `#[non_exhaustive]` | Needs real v0.3.x binary; release-time only |
+| 42 | V2 → V1 downgrade: clean shutdown + v0.3.x cold start works | Per `docs/MIGRATION.md` 5-step procedure; v0.3.x launches successfully | Same as #41 |
+| 43 | Network drop mid-handshake → FSM retries per budget | Use `tc qdisc add dev <iface> root netem loss 100%` mid-handshake; vortix retries; log entries readable | Fault injection deferred (Phase 2) |
+| 44 | OVPN auth fails with wrong password → `✗` + re-prompt available | Connect with wrong password; sidebar shows `✗`; auth overlay can re-open | Real OVPN server needed |
+| 45 | Profile deleted while connected → tunnel disconnects on next Tick | Active tunnel; delete profile file; within ~1s tunnel goes down + sidebar updates | Real-fs + state coherence; partial automation possible |
+| 46 | Out-of-disk during secret_file write → graceful error | `mount -o remount,size=1` or ramdisk to fill /tmp; attempt `vortix auth save`; error returned; no half-written auth file | Fault injection deferred (Phase 2) |
+| 47 | Profile config readable only by root, run as non-root → permission error | `chmod 0400 ~/.config/vortix/foo.conf`; `vortix up foo` as non-root; error surfaced; no path leak in stderr | Real-fs perms test; netns harness deferred |
+| 48 | Auth file has mode 0600 and is owned by invoking user (not root via sudo) | `sudo vortix up <ovpn-profile>`; enter password; `ls -la ~/.config/vortix/foo.auth` shows mode 0600 + user (not root) | Real-fs setup needed (plan 002 U10) |
+| 49 | Symlink attack on auth file is refused (O_NOFOLLOW) | Replace `~/.config/vortix/foo.auth` with symlink to `/etc/shadow`; `vortix up` triggers auth re-save; write refused; `/etc/shadow` unchanged | Real-fs + attacker setup needed |
+| 50 | `ps aux` does not leak OVPN credentials in command line | While OVPN running: `ps auxf \| grep openvpn \| grep <password>` returns 0 lines | Real-process scan; partial automation possible |
+| 51 | `/tmp/vortix-*/` temp WG configs are mode 0600 + unlinked on tunnel down | While WG connected: `ls -la ${TMPDIR}/vortix-*/`; mode 0600; after `vortix down`: directory gone | Real-fs assertion |
+| 52 | macOS Apple Silicon smoke: full multi-tunnel happy path | Run multi-tunnel scenarios on an M-series MacBook | Cross-platform: real consumer hardware |
+| 53 | macOS Intel smoke (if available) | Same as #52 on an Intel Mac | Cross-platform: real consumer hardware |
+| 54 | Linux iptables host smoke | Run on a host where `iptables` is the actual backend (not iptables-nft) | Cross-platform: requires distro-specific install |
+| 55 | Linux nftables host smoke | Run on a host where `nft` is the only backend | Cross-platform: requires distro-specific install |
+| 56 | Windows: vortix does not crash (NG features stubbed) | `vortix --version`; `vortix list`; no panic on profile import; multi-tunnel features may be stubbed | Cross-platform: Windows |
+| 57 | 10 active tunnels: TUI render budget under 16ms/frame | Connect 10 tunnels; observe TUI doesn't lag on `Tab` / sidebar nav | Perf benchmark cadence (Phase 2) |
+| 58 | Killswitch ruleset rewrite latency sub-100ms at N=5 | `sudo time pfctl -f -` / `iptables-restore` round-trip during a 5-tunnel transition | Perf benchmark cadence (Phase 2) |
+| 59 | 50 profiles loaded: sidebar scroll + search responsive | Synthesize 50 empty `.conf` files; verify no perceptible TUI lag | Perf benchmark cadence (Phase 2) |
+| 60 | Journal shows `PrimaryTunnelChanged` event after auto-promote | After auto-promote: `tail -f ~/.local/share/vortix/journal.jsonl \| jq '.event'` shows the event with correct `from`/`to`/`reason` | Feature wiring gap — event not emitted in production yet |
+| 61 | Journal shows `ConnectAttemptBlockedByConflict` on overlay-cancelled connect | Trigger conflict overlay; cancel it; journal entry appears | Same as #60 |
+
+## How to add a row
+
+1. Pick the next sequential `#`.
+2. Write the **Check** in one line — what you're verifying.
+3. Write **Steps** as the literal commands or actions to perform.
+4. Write **Why manual** as a short tag — match an existing tag when possible so reviewers can scan related rows together (`TUI rendering`, `Cross-platform: ...`, `Real-fs ...`, `Feature wiring gap`, `Perf benchmark cadence`, `Fault injection deferred`, etc.).
+
+## How to remove a row
+
+When an automated test now covers the check, delete the row. Don't annotate "now covered" — the row is the source of truth for "needs human attention." Mention the deletion in the test's commit message so the link survives in git history.
