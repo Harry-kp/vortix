@@ -86,6 +86,40 @@ pub enum Message {
     /// accepted the AllowedIPs-overlap overlay; retry the connect with
     /// `force=true`.
     ConfirmRouteOverlap { idx: usize },
+    /// Multi-connection plan #001 U19: disconnect one specific profile by
+    /// index (the `d` keybinding on a Connected sidebar row). Distinct from
+    /// the global `Disconnect` message which targets the legacy single-
+    /// tunnel active profile.
+    DisconnectProfile { idx: usize },
+    /// Multi-connection plan #001 U19: open the "Disconnect all N tunnels?"
+    /// confirmation dialog (the Shift+`D` keybinding when N>1). Fired from
+    /// the sidebar; with N≤1 the input layer dispatches `DisconnectProfile`
+    /// instead and this message is never sent.
+    RequestDisconnectAll,
+    /// Multi-connection plan #001 U19: user accepted the
+    /// [`InputMode::ConfirmDisconnectAll`] overlay; tear down every active
+    /// tunnel (registry-aware) plus the legacy single-tunnel state.
+    ConfirmDisconnectAll,
+    /// Multi-connection plan #001 U19: cycle Connection Details focus to
+    /// the next active tunnel (the `Tab` keybinding when Connection Details
+    /// is the focused panel and N>1 active tunnels exist). With N≤1 the
+    /// input layer falls through to the existing `NextPanel` behavior and
+    /// this message is never sent.
+    CycleConnectionDetailsFocus,
+    /// Multi-connection plan #001 U19: cancel an in-flight connect (the
+    /// `c` keybinding on a Connecting row's Connection Details). FSM
+    /// transitions Connecting → Disconnected and the sidebar row clears
+    /// the badge.
+    CancelConnect { idx: usize },
+    /// Multi-connection plan #001 U19 (D-3): user pressed `[u]` within the
+    /// 10s window while the auto-promote banner was visible; revert the
+    /// promotion by reconnecting the old primary and demoting the new one.
+    RevertAutoPromote,
+    /// Multi-connection plan #001 U19 (D-3): auto-promote banner window
+    /// elapsed (10s) without user action; dismiss the banner. After this,
+    /// the `[u]` shortcut is no longer wired and the user must manually
+    /// run `vortix up <old-primary>` to re-fire the takeover overlay.
+    DismissAutoPromoteBanner,
 
     // === Action Menu ===
     /// Open the action menu (Single actions)

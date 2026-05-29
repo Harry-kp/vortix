@@ -273,6 +273,22 @@ impl App {
                     }
                 }
             },
+            InputMode::ConfirmDisconnectAll {
+                mut confirm_selected,
+                ..
+            } => match handle_confirm_keys(key, &mut confirm_selected) {
+                ConfirmAction::Confirmed => self.handle_message(Message::ConfirmDisconnectAll),
+                ConfirmAction::Cancelled => self.handle_message(Message::CloseOverlay),
+                ConfirmAction::None => {
+                    if let InputMode::ConfirmDisconnectAll {
+                        confirm_selected: cs,
+                        ..
+                    } = &mut self.input_mode
+                    {
+                        *cs = confirm_selected;
+                    }
+                }
+            },
             InputMode::Normal => self.handle_normal_keys(key),
         }
     }
@@ -490,7 +506,45 @@ impl App {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn handle_normal_keys(&mut self, key: KeyEvent) {
+        // Multi-connection plan #001 U19 (D-3): when the auto-promote banner
+        // is visible, `[u]` reverts the promotion. Routed before the global
+        // key match so it can shadow any future `u` binding without
+        // surprising the user.
+        if key.code == KeyCode::Char('u') && self.auto_promote_banner.is_some() {
+            self.handle_message(Message::RevertAutoPromote);
+            return;
+        }
+
+        // Multi-connection plan #001 U19: Tab while focused on the
+        // Connection Details panel with N>1 active tunnels cycles focus
+        // across active tunnels instead of advancing to the next UI panel.
+        // With N≤1 we fall through to the existing NextPanel behavior.
+        if matches!(key.code, KeyCode::Tab)
+            && self.focused_panel == FocusedPanel::ConnectionDetails
+            && self.zoomed_panel.is_none()
+            && self.active_tunnel_count() > 1
+        {
+            self.handle_message(Message::CycleConnectionDetailsFocus);
+            return;
+        }
+
+        // Multi-connection plan #001 U19: `c` on a Connecting row's
+        // Connection Details cancels the in-flight connect. Routed before
+        // the global `Ctrl+C` handler (Ctrl+C already short-circuited at
+        // the top of handle_key) and the panel-specific keys.
+        if key.code == KeyCode::Char('c')
+            && self.focused_panel == FocusedPanel::ConnectionDetails
+        {
+            if let Some(idx) = self.connection_details_focused_idx() {
+                if self.is_profile_connecting(idx) {
+                    self.handle_message(Message::CancelConnect { idx });
+                    return;
+                }
+            }
+        }
+
         match key.code {
             // Global Toggles
             KeyCode::Tab | KeyCode::Char('l') => {
@@ -550,7 +604,40 @@ impl App {
             KeyCode::Char('7') => self.handle_message(Message::QuickConnect(6)),
             KeyCode::Char('8') => self.handle_message(Message::QuickConnect(7)),
             KeyCode::Char('9') => self.handle_message(Message::QuickConnect(8)),
-            KeyCode::Char('d') => self.handle_message(Message::Disconnect),
+            // Multi-connection plan #001 U19: `d` on a Connected sidebar
+            // row disconnects that one tunnel; from any other panel `d`
+            // preserves the legacy global Disconnect path (the primary or
+            // sole active tunnel goes down).
+            KeyCode::Char('d') => {
+                if self.focused_panel == FocusedPanel::Sidebar {
+                    if let Some(idx) = self.profile_list_state.selected() {
+                        if self.is_profile_connected(idx) {
+                            self.handle_message(Message::DisconnectProfile { idx });
+                            return;
+                        }
+                    }
+                }
+                self.handle_message(Message::Disconnect);
+            }
+            // Multi-connection plan #001 U19: Shift+`D` on the sidebar
+            // opens the "Disconnect all N tunnels?" confirm when N>1; with
+            // N≤1 it acts identically to plain `d` (backwards-compatible).
+            KeyCode::Char('D') => {
+                if self.focused_panel == FocusedPanel::Sidebar {
+                    let n = self.active_tunnel_count();
+                    if n > 1 {
+                        self.handle_message(Message::RequestDisconnectAll);
+                        return;
+                    }
+                    if let Some(idx) = self.profile_list_state.selected() {
+                        if self.is_profile_connected(idx) {
+                            self.handle_message(Message::DisconnectProfile { idx });
+                            return;
+                        }
+                    }
+                }
+                self.handle_message(Message::Disconnect);
+            }
             KeyCode::Char('r') => {
                 if self.focused_panel == FocusedPanel::Sidebar {
                     self.handle_message(Message::ConnectSelected);

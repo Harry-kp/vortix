@@ -92,15 +92,73 @@ impl App {
                 // CIDR subtraction. Connect directly with force=true.
                 self.connect_profile_forced(idx);
             }
-            Message::ProfileMove(mv) => match mv {
-                SelectionMove::Next => self.profile_next(),
-                SelectionMove::Prev => self.profile_previous(),
-                SelectionMove::First => self.profile_list_state.select(Some(0)),
-                SelectionMove::Last => {
-                    let last = self.runtime.profiles.len().saturating_sub(1);
-                    self.profile_list_state.select(Some(last));
+            Message::DisconnectProfile { idx } => self.disconnect_profile_by_idx(idx),
+            Message::RequestDisconnectAll => {
+                let count = self.active_tunnel_count();
+                if count > 1 {
+                    self.input_mode = InputMode::ConfirmDisconnectAll {
+                        count,
+                        confirm_selected: true,
+                    };
+                } else {
+                    // N≤1 is identical-to-`d` semantics; close any overlay
+                    // and fall through to the legacy global disconnect.
+                    self.disconnect_all_active();
                 }
-            },
+            }
+            Message::ConfirmDisconnectAll => {
+                self.input_mode = InputMode::Normal;
+                self.disconnect_all_active();
+            }
+            Message::CycleConnectionDetailsFocus => {
+                let ids = self.active_tunnel_ids();
+                if ids.len() < 2 {
+                    return;
+                }
+                // Resolve the current focus to find the next in stable order.
+                let current = self
+                    .connection_details_focus
+                    .clone()
+                    .or_else(|| {
+                        self.profile_list_state
+                            .selected()
+                            .and_then(|i| self.runtime.profiles.get(i))
+                            .map(|p| crate::vortix_core::profile::ProfileId::new(&p.name))
+                    });
+                let pos = current
+                    .as_ref()
+                    .and_then(|c| ids.iter().position(|i| i == c));
+                let next_idx = match pos {
+                    Some(p) => (p + 1) % ids.len(),
+                    None => 0,
+                };
+                let next = ids[next_idx].clone();
+                self.log(&format!(
+                    "ACTION: Connection Details focus → '{}'",
+                    next.as_str()
+                ));
+                self.connection_details_focus = Some(next);
+            }
+            Message::CancelConnect { idx } => self.cancel_connect(idx),
+            Message::RevertAutoPromote => self.handle_revert_auto_promote(),
+            Message::DismissAutoPromoteBanner => {
+                self.auto_promote_banner = None;
+            }
+            Message::ProfileMove(mv) => {
+                // Multi-connection plan #001 U19: any sidebar movement
+                // clears the Tab-driven Connection Details focus override
+                // so the panel stays coherent with the visible row.
+                self.connection_details_focus = None;
+                match mv {
+                    SelectionMove::Next => self.profile_next(),
+                    SelectionMove::Prev => self.profile_previous(),
+                    SelectionMove::First => self.profile_list_state.select(Some(0)),
+                    SelectionMove::Last => {
+                        let last = self.runtime.profiles.len().saturating_sub(1);
+                        self.profile_list_state.select(Some(last));
+                    }
+                }
+            }
 
             // Connection
             Message::Disconnect => {
@@ -1087,6 +1145,14 @@ impl App {
                 self.handle_message(Message::ConnectionTimeout(p));
             }
         }
+        // 1b. Multi-connection plan #001 U19 (D-3): detect primary-tunnel
+        //     transitions and fire / expire the auto-promote banner.
+        self.detect_primary_change_for_banner();
+        if let Some(banner) = &self.auto_promote_banner {
+            if banner.is_expired() {
+                self.auto_promote_banner = None;
+            }
+        }
         // 2. Expire toast
         if let Some(toast) = &self.toast {
             if toast.is_expired() {
@@ -1141,6 +1207,93 @@ impl App {
                     };
                 }
             }
+        }
+    }
+
+    /// Multi-connection plan #001 U19 (D-3): poll the registry's current
+    /// primary against `last_known_primary` and fire the auto-promote
+    /// banner toast on a `Some(old) -> Some(new)` transition triggered by
+    /// a prior-primary disconnect. We approximate the
+    /// `PrimaryChangeReason::PriorPrimaryDisconnected` heuristic by
+    /// checking that the previous primary's snapshot is now Disconnected
+    /// (or absent from the registry entirely) — that catches the user-
+    /// initiated disconnect case the plan targets and avoids firing on
+    /// `InitialConnect` (no prior primary) or `ExternalRouteChange`
+    /// (previous primary still up, route flapped).
+    fn detect_primary_change_for_banner(&mut self) {
+        use crate::vortix_core::engine::state::Connection;
+        let current = self.registry.primary().cloned();
+        if current == self.last_known_primary {
+            return;
+        }
+        let previous = self.last_known_primary.clone();
+        self.last_known_primary.clone_from(&current);
+
+        // Only fire on Some(old) -> Some(new); no-primary transitions and
+        // initial-connect transitions are silent.
+        let (Some(old), Some(new)) = (previous, current) else {
+            return;
+        };
+        if old == new {
+            return;
+        }
+
+        // Heuristic: the prior primary should have just disconnected
+        // (snapshot is Disconnected or gone). When the prior primary is
+        // still active this is an `ExternalRouteChange`-shaped transition
+        // and the banner is not appropriate.
+        let prior_active = self
+            .registry
+            .snapshot(&old)
+            .is_some_and(|s| !matches!(s.state, Connection::Disconnected { .. }));
+        if prior_active {
+            return;
+        }
+
+        let banner_msg = format!(
+            "Promoted '{}' to primary because '{}' disconnected — [u] to revert ({}s)",
+            new.as_str(),
+            old.as_str(),
+            crate::state::AUTO_PROMOTE_REVERT_WINDOW_SECS,
+        );
+        self.log(&format!("STATUS: {banner_msg}"));
+        self.auto_promote_banner = Some(crate::state::AutoPromoteBanner::new(old, new));
+        // Surface the message through the existing toast channel so users
+        // see it even if the banner widget hasn't rendered yet (U17 owns
+        // banner painting; U19 wires the data flow).
+        self.show_toast(banner_msg, ToastType::Warning);
+    }
+
+    /// Multi-connection plan #001 U19 (D-3): revert an auto-promotion.
+    /// Reconnects the old primary (re-fires the takeover overlay because
+    /// the new primary now holds the default route) and clears the
+    /// banner. The actual demotion of the new tunnel is the user's
+    /// implicit choice when they confirm the takeover overlay.
+    fn handle_revert_auto_promote(&mut self) {
+        let Some(banner) = self.auto_promote_banner.take() else {
+            return;
+        };
+        let old_name = banner.from.as_str().to_string();
+        let new_name = banner.to.as_str().to_string();
+        self.log(&format!(
+            "ACTION: Reverting auto-promotion — reconnecting '{old_name}' (demoting '{new_name}' if eligible)"
+        ));
+
+        // Find the old primary by name; route it through the existing
+        // connect path so the conflict gate fires (the new primary holds
+        // 0/0 now, so ConfirmDefaultRouteTakeover is the expected overlay).
+        if let Some(idx) = self
+            .runtime
+            .profiles
+            .iter()
+            .position(|p| p.name == old_name)
+        {
+            self.connect_profile(idx);
+        } else {
+            self.show_toast(
+                format!("Cannot revert — profile '{old_name}' not found"),
+                ToastType::Error,
+            );
         }
     }
 

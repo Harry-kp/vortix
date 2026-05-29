@@ -9,6 +9,20 @@ use std::time::{Duration, Instant};
 pub const DISMISS_DURATION: Duration = Duration::from_secs(4);
 pub const HELP_OVERLAY_MAX_HEIGHT: u16 = 38;
 
+/// Window (in seconds) during which the user can press `[u]` to revert an
+/// automatic primary promotion. After this window elapses the banner
+/// auto-dismisses and the `[u]` shortcut is no longer available — manual
+/// revert via `vortix up <old-primary>` (fires the
+/// [`InputMode::ConfirmDefaultRouteTakeover`] overlay) remains available
+/// indefinitely.
+///
+/// Multi-connection plan #001 U19 (D-3): 10s chosen as a defensible default
+/// for a novel banner the user has never seen, with a novel `[u]` shortcut
+/// not in today's keymap. 5s is too short to read+parse+decide+act on first
+/// encounter; conventional actionable-banner UX defaults sit in the 8-10s
+/// range (Android undo banners 5-8s, Gmail undo-send 5-30s configurable).
+pub const AUTO_PROMOTE_REVERT_WINDOW_SECS: u64 = 10;
+
 /// Currently focused UI panel for keyboard navigation.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub enum FocusedPanel {
@@ -117,6 +131,17 @@ pub enum InputMode {
         to_profile_id: ProfileId,
         /// Display name of the new tunnel.
         to_name: String,
+        /// "Yes" button currently selected?
+        confirm_selected: bool,
+    },
+    /// Confirmation dialog for "Disconnect all N tunnels?" (multi-connection
+    /// plan #001 U19). Fired by Shift+`D` from the sidebar when more than one
+    /// active tunnel exists; with N≤1 the shortcut acts identically to plain
+    /// `d` and this overlay is skipped (backwards-compatible single-tunnel
+    /// behavior).
+    ConfirmDisconnectAll {
+        /// Number of currently active tunnels (for display).
+        count: usize,
         /// "Yes" button currently selected?
         confirm_selected: bool,
     },
@@ -292,6 +317,37 @@ impl QualityLevel {
 
 impl Toast {
     /// Check if the toast notification has expired
+    #[must_use]
+    pub fn is_expired(&self) -> bool {
+        Instant::now() > self.expires
+    }
+}
+
+/// Auto-promote banner shown when the registry promotes a new primary
+/// because the previous primary disconnected (multi-connection plan #001
+/// U19, D-3). While visible, the `[u]` shortcut reverts the promotion:
+/// reconnect the old primary, demote the new one if eligible. The banner
+/// auto-dismisses after [`AUTO_PROMOTE_REVERT_WINDOW_SECS`] seconds.
+#[derive(Clone, Debug)]
+pub struct AutoPromoteBanner {
+    /// Profile id of the previously-primary tunnel (now disconnected).
+    pub from: ProfileId,
+    /// Profile id of the newly-promoted primary.
+    pub to: ProfileId,
+    /// When the banner should auto-dismiss.
+    pub expires: Instant,
+}
+
+impl AutoPromoteBanner {
+    #[must_use]
+    pub fn new(from: ProfileId, to: ProfileId) -> Self {
+        Self {
+            from,
+            to,
+            expires: Instant::now() + Duration::from_secs(AUTO_PROMOTE_REVERT_WINDOW_SECS),
+        }
+    }
+
     #[must_use]
     pub fn is_expired(&self) -> bool {
         Instant::now() > self.expires

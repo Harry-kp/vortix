@@ -49,6 +49,127 @@ impl App {
         );
     }
 
+    /// Count active tunnels for keybinding decisions (multi-connection plan
+    /// #001 U19). "Active" means the FSM is not `Disconnected` — that
+    /// includes `Connecting`, `Connected`, `Disconnecting`,
+    /// `AwaitingUserInput`, and any other in-flight states.
+    ///
+    /// When the registry is empty (the U6/U7 wiring hasn't populated it for
+    /// the current single-tunnel session) we fall back to inspecting the
+    /// legacy `runtime.connection_state` — that yields 0 when Disconnected
+    /// and 1 in any other in-flight state, preserving the existing
+    /// single-tunnel `D` semantics without the confirm dialog.
+    #[must_use]
+    pub(crate) fn active_tunnel_count(&self) -> usize {
+        use crate::vortix_core::engine::state::Connection;
+        use crate::vpn_runtime::ConnectionState;
+        let mut count = 0usize;
+        for snap in self.registry.snapshot_all() {
+            if !matches!(snap.state, Connection::Disconnected { .. }) {
+                count += 1;
+            }
+        }
+        if count > 0 {
+            return count;
+        }
+        // Legacy fallback: the App still drives single-tunnel state through
+        // `runtime.connection_state` until U6 stage C wires connect/disconnect
+        // through `registry.connect`/`registry.disconnect`.
+        match self.runtime.connection_state {
+            ConnectionState::Disconnected => 0,
+            ConnectionState::Connecting { .. }
+            | ConnectionState::Connected { .. }
+            | ConnectionState::Disconnecting { .. } => 1,
+        }
+    }
+
+    /// Return the list of `ProfileId`s for currently-active tunnels in a
+    /// stable order. Used by the `Tab` focus-cycle in Connection Details.
+    /// Falls back to a single-element vec when the registry is empty but
+    /// the legacy `connection_state` is non-disconnected.
+    pub(crate) fn active_tunnel_ids(&self) -> Vec<crate::vortix_core::profile::ProfileId> {
+        use crate::vortix_core::engine::state::Connection;
+        use crate::vortix_core::profile::ProfileId;
+        use crate::vpn_runtime::ConnectionState;
+        let mut out: Vec<_> = self
+            .registry
+            .snapshot_all()
+            .into_iter()
+            .filter(|s| !matches!(s.state, Connection::Disconnected { .. }))
+            .map(|s| s.profile_id)
+            .collect();
+        out.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        if !out.is_empty() {
+            return out;
+        }
+        match &self.runtime.connection_state {
+            ConnectionState::Disconnected => Vec::new(),
+            ConnectionState::Connecting { profile, .. }
+            | ConnectionState::Connected { profile, .. }
+            | ConnectionState::Disconnecting { profile, .. } => {
+                vec![ProfileId::new(profile)]
+            }
+        }
+    }
+
+    /// Whether the profile at `idx` is currently in a Connected state. Used
+    /// by the `d` / `Enter` keybindings to decide between connect and
+    /// disconnect routing (multi-connection plan #001 U19).
+    #[must_use]
+    pub(crate) fn is_profile_connected(&self, idx: usize) -> bool {
+        use crate::vortix_core::engine::state::Connection;
+        use crate::vortix_core::profile::ProfileId;
+        let Some(profile) = self.runtime.profiles.get(idx) else {
+            return false;
+        };
+        if let Some(snap) = self.registry.snapshot(&ProfileId::new(&profile.name)) {
+            return matches!(snap.state, Connection::Connected { .. });
+        }
+        // Legacy fallback.
+        matches!(
+            &self.runtime.connection_state,
+            crate::vpn_runtime::ConnectionState::Connected { profile: p, .. } if *p == profile.name
+        )
+    }
+
+    /// Whether the profile at `idx` is currently Connecting (in-flight).
+    /// Used by the `c` cancel keybinding (multi-connection plan #001 U19).
+    #[must_use]
+    pub(crate) fn is_profile_connecting(&self, idx: usize) -> bool {
+        use crate::vortix_core::engine::state::Connection;
+        use crate::vortix_core::profile::ProfileId;
+        let Some(profile) = self.runtime.profiles.get(idx) else {
+            return false;
+        };
+        if let Some(snap) = self.registry.snapshot(&ProfileId::new(&profile.name)) {
+            return matches!(snap.state, Connection::Connecting { .. });
+        }
+        matches!(
+            &self.runtime.connection_state,
+            crate::vpn_runtime::ConnectionState::Connecting { profile: p, .. } if *p == profile.name
+        )
+    }
+
+    /// Resolve the profile index that the Connection Details panel is
+    /// currently focused on. Prefers the explicit
+    /// `connection_details_focus` override (set by `Tab` cycling) over the
+    /// sidebar selection. Returns `None` when neither resolves to a known
+    /// profile. Multi-connection plan #001 U19.
+    #[must_use]
+    pub(crate) fn connection_details_focused_idx(&self) -> Option<usize> {
+        if let Some(forced) = &self.connection_details_focus {
+            if let Some(idx) = self
+                .runtime
+                .profiles
+                .iter()
+                .position(|p| p.name == forced.as_str())
+            {
+                return Some(idx);
+            }
+        }
+        self.profile_list_state.selected()
+    }
+
     /// Show a toast notification and log it
     pub(crate) fn show_toast(&mut self, message: String, toast_type: ToastType) {
         let level_prefix = match toast_type {

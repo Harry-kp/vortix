@@ -45,8 +45,8 @@ use crate::vortix_core::engine::TunnelRegistry;
 
 // Re-export state types for convenient access
 pub use crate::state::{
-    AuthField, FlipAnimation, FocusedPanel, InputMode, ProfileSortOrder, Protocol, Toast,
-    ToastType, VpnProfile, DISMISS_DURATION,
+    AuthField, AutoPromoteBanner, FlipAnimation, FocusedPanel, InputMode, ProfileSortOrder,
+    Protocol, Toast, ToastType, VpnProfile, AUTO_PROMOTE_REVERT_WINDOW_SECS, DISMISS_DURATION,
 };
 // The legacy single-tunnel `ConnectionState`/`DetailedConnectionInfo` enum
 // lives on `crate::vpn_runtime` after U6 Stage B; re-export through `app::`
@@ -104,6 +104,26 @@ pub struct App {
     pub panel_areas: HashMap<FocusedPanel, Rect>,
     pub toast: Option<Toast>,
     pub terminal_size: (u16, u16),
+
+    /// Multi-connection plan #001 U19: tracks the last primary observed by
+    /// the App's tick loop so we can detect `Some(old) -> Some(new)` primary
+    /// transitions triggered by `PriorPrimaryDisconnected` and fire the
+    /// auto-promote banner. `None` initially and after the last primary
+    /// disconnects (no-primary state).
+    pub last_known_primary: Option<crate::vortix_core::profile::ProfileId>,
+
+    /// Multi-connection plan #001 U19 (D-3): active auto-promote banner.
+    /// When `Some`, the `[u]` keybinding reverts the promotion. Cleared by
+    /// the tick loop after [`AUTO_PROMOTE_REVERT_WINDOW_SECS`] elapses or
+    /// by an explicit user dismissal.
+    pub auto_promote_banner: Option<AutoPromoteBanner>,
+
+    /// Multi-connection plan #001 U19: which active tunnel the Connection
+    /// Details panel is currently focused on, when the user has explicitly
+    /// cycled focus via `Tab`. `None` means the panel falls back to the
+    /// sidebar selection (existing behavior). Cleared on any sidebar
+    /// selection change so the panel stays coherent with the visible row.
+    pub connection_details_focus: Option<crate::vortix_core::profile::ProfileId>,
 }
 
 // Plan 005 U5 removed the previous `impl Deref<Target = VpnRuntime>` — the
@@ -153,6 +173,9 @@ impl App {
             panel_areas: HashMap::new(),
             toast: None,
             terminal_size: (0, 0),
+            last_known_primary: None,
+            auto_promote_banner: None,
+            connection_details_focus: None,
         };
 
         // Select first profile if available
@@ -307,6 +330,9 @@ impl App {
             panel_areas: HashMap::new(),
             toast: None,
             terminal_size: (80, 24),
+            last_known_primary: None,
+            auto_promote_banner: None,
+            connection_details_focus: None,
         }
     }
 }
