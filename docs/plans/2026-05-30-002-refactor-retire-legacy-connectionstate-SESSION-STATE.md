@@ -1,10 +1,77 @@
 ---
 plan: docs/plans/2026-05-30-002-refactor-retire-legacy-connectionstate-plan.md
-status: not_started
+status: in_progress
 created: 2026-05-30
+last_updated: 2026-05-30
 branch: feat/multi-connection
 branch_head_at_plan_time: 90b62e8
+branch_head_at_last_checkpoint: b321abe
 ---
+
+## Progress (last checkpoint: 2026-05-30, commit `b321abe`)
+
+| Stage | Status | Commit |
+|---|---|---|
+| P5a — renderer/helper cleanup | DONE | `6b6ec76` — `refactor(app): drop legacy ConnectionState fallback reads (P5a)` |
+| P5b U-P5b-1 — per-profile retry/auto-reconnect | DONE | `b321abe` — `refactor(retry): per-profile retry/auto-reconnect state` |
+| P5b U-P5b-2 — per-profile scanner loop | PENDING | — |
+| P5b U-P5b-3 — migrate write sites | PENDING | — |
+| P5c — CLI scope narrowing | DEFERRED → fold into P5d | — |
+| P5d — delete field + file + mirror helpers | PENDING | — |
+
+Also landed in-session (not P5):
+- `6392a9d` — `ux(dashboard): pad panel borders for breathing room` (uncommitted at session start)
+
+### P5c divergence (worth re-reading before resuming)
+
+The plan's D-5 order (P5a → P5c → P5b → P5d) was changed mid-session.
+Doing P5c before P5b would have required `vpn_runtime` to depend on
+`cli` because the CLI's blocking helpers in `vpn_runtime/connection.rs`
+write to the same `VpnRuntime.connection_state` field App uses. Per
+D-5's stated rationale ("narrowing scope for P5b"), this turned out
+not to apply — the TUI scanner (P5b U-P5b-2) and the CLI blocking
+path are separate execution paths, so P5b doesn't need P5c to be done
+first. P5c is now folded into P5d: after P5b removes App-side reads
+and writes, the legacy enum has only one user (the CLI's blocking
+helpers in `vpn_runtime/connection.rs` and `cli/commands.rs`). At that
+point P5d relocates it to `cli/state.rs` as a CLI-private type as it
+deletes the App-side field.
+
+### Decisions confirmed with the user (2026-05-30)
+
+- **D-2 auto-reconnect default:** per-profile (each Connected profile
+  registers its own auto-reconnect; only the dropped one reconnects).
+  Implemented in `b321abe`.
+- **D-4 scanner adoption policy:** auto-adopt (mirrors current legacy
+  behavior). To be applied in U-P5b-2.
+
+### Resume here
+
+Next subunit: **U-P5b-2 — per-profile scanner loop.** Rewrite
+`handle_sync_system_state` in `crates/vortix/src/app/update.rs:799+`
+(~310 lines) to iterate every registry snapshot instead of
+dispatching on the single legacy state. Per-profile match against
+`Vec<ActiveSession>`:
+
+- Connecting + matched session → set_connected (promotion)
+- Connected + matched session → refresh details
+- Connected/Connecting/Disconnecting + NO matched session → drop
+  detected → set_disconnected, optionally enter retry via the new
+  retry_state HashMap (now in place from U-P5b-1)
+- Session present + profile in catalog but not in registry → auto-adopt
+  (per D-4 confirmed) — set_connected
+
+Until U-P5b-3, keep mirroring into the legacy state for sites that
+still read it (e.g., the CLI helpers in `vpn_runtime/connection.rs`,
+the rename mutation in `app/profile.rs`, the kill-switch sync in
+`vpn_runtime/mod.rs::sync_killswitch`).
+
+Per-profile retry primitives are now available:
+- `runtime.retry_state.insert(profile_id, RetryState { attempt, profile_idx, auto_reconnect })`
+- `runtime.retry_state.remove(&profile_id)`
+- `runtime.retry_state.get(&profile_id)`
+- `Message::RetryConnect { idx, attempt }` (unchanged signature)
+
 
 # Session state — P5: retire legacy `ConnectionState`
 
