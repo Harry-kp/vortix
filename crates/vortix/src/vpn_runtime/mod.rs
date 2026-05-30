@@ -488,11 +488,15 @@ impl VpnRuntime {
                 }
             }
             KillSwitchMode::AlwaysOn => {
-                if is_connected {
-                    KillSwitchState::Armed
-                } else {
-                    KillSwitchState::Blocking
-                }
+                // AlwaysOn = firewall stays engaged regardless of
+                // connection state. The default-DROP OUTPUT policy
+                // plus the per-tunnel ACCEPT rules in
+                // `enable_blocking_multi` mean that traffic exits only
+                // through the active VPN interface(s); when a tunnel
+                // drops the policy stays in place so no leaks occur in
+                // the gap before reconnection. This is the canonical
+                // Linux killswitch shape (tests/integration/killswitch.sh).
+                KillSwitchState::Blocking
             }
         };
 
