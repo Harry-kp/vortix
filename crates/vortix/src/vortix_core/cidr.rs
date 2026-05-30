@@ -50,6 +50,59 @@ impl Cidr {
     pub fn is_v6(&self) -> bool {
         matches!(self.addr, IpAddr::V6(_))
     }
+
+    /// Whether this CIDR block intersects (shares any addresses with)
+    /// `other`. Two blocks intersect when their common-prefix bits
+    /// match — every address in the smaller block is contained in the
+    /// larger, or they alias exactly. Cross-family blocks (v4 ↔ v6)
+    /// never intersect.
+    ///
+    /// Used by the CLI's `up` conflict gate to detect non-default
+    /// route overlap; available to the registry when R10 v2 grows
+    /// route-overlap detection.
+    #[must_use]
+    pub fn intersects(&self, other: &Cidr) -> bool {
+        match (self.addr, other.addr) {
+            (IpAddr::V4(a), IpAddr::V4(b)) => {
+                let abits = u32::from(a);
+                let bbits = u32::from(b);
+                let amask = u32::MAX
+                    .checked_shl(u32::from(32 - self.prefix_len))
+                    .unwrap_or(0);
+                let bmask = u32::MAX
+                    .checked_shl(u32::from(32 - other.prefix_len))
+                    .unwrap_or(0);
+                let common = amask & bmask;
+                (abits & common) == (bbits & common)
+            }
+            (IpAddr::V6(a), IpAddr::V6(b)) => {
+                let abits = u128::from(a);
+                let bbits = u128::from(b);
+                let amask = u128::MAX
+                    .checked_shl(u32::from(128 - self.prefix_len))
+                    .unwrap_or(0);
+                let bmask = u128::MAX
+                    .checked_shl(u32::from(128 - other.prefix_len))
+                    .unwrap_or(0);
+                let common = amask & bmask;
+                (abits & common) == (bbits & common)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Return the CIDRs from `a` that intersect any CIDR in `b`. O(|a|·|b|);
+/// `AllowedIPs` sets are typically tiny so the quadratic shape is fine.
+#[must_use]
+pub fn overlapping_cidrs(a: &[Cidr], b: &[Cidr]) -> Vec<Cidr> {
+    let mut out = Vec::new();
+    for x in a {
+        if b.iter().any(|y| x.intersects(y)) {
+            out.push(*x);
+        }
+    }
+    out
 }
 
 /// Parses CIDR strings like `"10.0.0.0/8"` or `"::/0"`. Missing prefix is

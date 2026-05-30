@@ -15,7 +15,6 @@ use crate::cli::output::{
 };
 use crate::config::AppConfig;
 use crate::constants;
-use crate::state::Protocol;
 use crate::vpn_runtime::VpnRuntime;
 
 /// Dispatch a CLI command. Returns `true` if handled (program should exit).
@@ -422,50 +421,22 @@ fn handle_up(
         );
     }
 
-    // Check dependencies before attempting connection (same check as TUI)
+    // Check dependencies before attempting connection. Routes through
+    // `VpnRuntime::check_dependencies` so the TUI and CLI refuse the
+    // same dep set — including the OpenVPN 2.4+ probe that the
+    // legacy inline CLI check used to skip (R13 / plan 001 U14).
     engine.load_metadata();
     if let Some(profile) = engine.profiles.iter().find(|p| p.name == profile_name) {
-        let protocol = profile.protocol;
-        let mut missing = Vec::new();
-
-        match protocol {
-            Protocol::WireGuard => {
-                if !crate::utils::binary_exists("wg-quick") {
-                    missing.push("wg-quick".to_string());
-                }
-                if !crate::utils::binary_exists("wg") {
-                    missing.push("wireguard-tools".to_string());
-                }
-                // Check for resolvconf on Linux when DNS is configured
-                #[cfg(target_os = "linux")]
-                // xtask:allow-platform-cfg: resolvconf check is Linux-only DNS plumbing
-                {
-                    let config_path = &profile.config_path;
-                    if crate::utils::wireguard_config_has_dns(config_path)
-                        && !crate::utils::resolvconf_works()
-                    {
-                        if crate::utils::is_systemd_resolved() {
-                            missing.push("resolvconf (systemd)".to_string());
-                        } else {
-                            missing.push("resolvconf".to_string());
-                        }
-                    }
-                }
-            }
-            Protocol::OpenVPN => {
-                if !crate::utils::binary_exists("openvpn") {
-                    missing.push("openvpn".to_string());
-                }
-            }
-        }
-
+        let missing = crate::vpn_runtime::VpnRuntime::check_dependencies(
+            profile.protocol,
+            &profile.config_path,
+        );
         if !missing.is_empty() {
             let hint = missing
                 .iter()
                 .map(|tool| crate::platform::install_hint(tool))
                 .collect::<Vec<_>>()
                 .join("\n");
-
             print_error_and_exit(
                 mode,
                 "up",
@@ -597,16 +568,22 @@ fn handle_up(
 /// Detect a multi-tunnel conflict for the CLI's `up` path (plan #001 U7).
 ///
 /// The CLI doesn't share an in-memory `TunnelRegistry` with the running
-/// session — active tunnels are discovered via `scanner::get_active_profiles`.
-/// We inspect each active session's parsed config for default-route claims
-/// or `AllowedIPs` overlaps with the target profile, returning the typed
-/// `Conflict` so the caller can surface the right hint.
+/// session — active tunnels are discovered via
+/// `scanner::get_active_profiles`. We inspect each active session's parsed
+/// config and use the **shared** `vortix_core::cidr` and
+/// `claims_default_route_*` helpers (same logic the TUI's
+/// `TunnelRegistry::detect_conflict` uses) so the two surfaces refuse the
+/// same set of takeovers. The route-overlap branch is a CLI-only
+/// superset until R10 v2 brings route-overlap detection into the
+/// registry.
 fn detect_conflict_for_cli(
     engine: &VpnRuntime,
     target_name: &str,
 ) -> Option<crate::vortix_core::engine::Conflict> {
     use crate::app::connection::extract_allowed_ips;
-    use crate::vortix_core::cidr::{claims_default_route_v4, claims_default_route_v6};
+    use crate::vortix_core::cidr::{
+        claims_default_route_v4, claims_default_route_v6, overlapping_cidrs,
+    };
     use crate::vortix_core::engine::Conflict;
     use crate::vortix_core::profile::ProfileId;
 
@@ -619,7 +596,7 @@ fn detect_conflict_for_cli(
     for session in &active {
         if session.name == target_name {
             // Re-up of an already-up profile isn't a conflict — the
-            // legacy connect path is idempotent here.
+            // connect path is idempotent here.
             continue;
         }
         let Some(active_profile) = engine.profiles.iter().find(|p| p.name == session.name) else {
@@ -636,7 +613,7 @@ fn detect_conflict_for_cli(
                 new: ProfileId::new(target_name),
             });
         }
-        let overlap = cidr_overlap(&target_allowed, &active_allowed);
+        let overlap = overlapping_cidrs(&target_allowed, &active_allowed);
         if !overlap.is_empty() {
             return Some(Conflict::RouteOverlap {
                 with: ProfileId::new(&session.name),
@@ -645,57 +622,6 @@ fn detect_conflict_for_cli(
         }
     }
     None
-}
-
-/// Pairwise CIDR-intersection check used by the CLI conflict gate. Returns
-/// the CIDRs from `a` that intersect any CIDR in `b`. Intentionally
-/// O(a×b) — call sites have small `a`/`b` (typical `AllowedIPs` sets stay
-/// well under a dozen entries).
-fn cidr_overlap(
-    a: &[crate::vortix_core::cidr::Cidr],
-    b: &[crate::vortix_core::cidr::Cidr],
-) -> Vec<crate::vortix_core::cidr::Cidr> {
-    let mut out = Vec::new();
-    for x in a {
-        for y in b {
-            if cidr_intersects(x, y) {
-                out.push(*x);
-                break;
-            }
-        }
-    }
-    out
-}
-
-fn cidr_intersects(x: &crate::vortix_core::cidr::Cidr, y: &crate::vortix_core::cidr::Cidr) -> bool {
-    use std::net::IpAddr;
-    match (x.addr, y.addr) {
-        (IpAddr::V4(a), IpAddr::V4(b)) => {
-            let abits = u32::from(a);
-            let bbits = u32::from(b);
-            let amask = u32::MAX
-                .checked_shl(u32::from(32 - x.prefix_len))
-                .unwrap_or(0);
-            let bmask = u32::MAX
-                .checked_shl(u32::from(32 - y.prefix_len))
-                .unwrap_or(0);
-            let common = amask & bmask;
-            (abits & common) == (bbits & common)
-        }
-        (IpAddr::V6(a), IpAddr::V6(b)) => {
-            let abits = u128::from(a);
-            let bbits = u128::from(b);
-            let amask = u128::MAX
-                .checked_shl(u32::from(128 - x.prefix_len))
-                .unwrap_or(0);
-            let bmask = u128::MAX
-                .checked_shl(u32::from(128 - y.prefix_len))
-                .unwrap_or(0);
-            let common = amask & bmask;
-            (abits & common) == (bbits & common)
-        }
-        _ => false,
-    }
 }
 
 #[derive(Serialize)]
@@ -1966,27 +1892,7 @@ fn handle_killswitch(
         }
 
         engine.killswitch_mode = ks_mode;
-        // CLI's headless engine has no registry — derive the active
-        // tunnel slice from the scanner. The `killswitch` command
-        // toggles the mode only; preserved-blocking-from-previous-run
-        // behavior is restored at engine construction.
-        let active_sessions = crate::core::scanner::get_active_profiles(&engine.profiles);
-        let is_connected = !active_sessions.is_empty();
-        let active_tunnels: Vec<crate::core::killswitch::ActiveTunnelInfo> = active_sessions
-            .iter()
-            .map(|s| crate::core::killswitch::ActiveTunnelInfo {
-                interface: s.interface.clone(),
-                server_ips: s
-                    .endpoint
-                    .split(':')
-                    .next()
-                    .and_then(|h| h.parse().ok())
-                    .into_iter()
-                    .collect(),
-                declared_cidrs: Vec::new(),
-                is_primary: true,
-            })
-            .collect();
+        let (is_connected, active_tunnels) = engine.killswitch_view_from_scanner();
         engine.sync_killswitch(is_connected, &active_tunnels);
     }
 

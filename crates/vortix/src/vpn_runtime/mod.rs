@@ -11,6 +11,7 @@
 
 pub mod connection;
 pub mod connection_state;
+pub mod openvpn;
 
 pub use connection_state::{ConnectionState, DetailedConnectionInfo};
 
@@ -420,13 +421,54 @@ impl VpnRuntime {
         }
     }
 
+    /// Build the `(is_connected, active_tunnels)` pair from the
+    /// scanner's view of the kernel — every kernel-visible tunnel
+    /// contributes one entry, regardless of which surface (TUI or
+    /// CLI) initiated it. CLI-side callers feed this into
+    /// `sync_killswitch` so the persisted slice always reflects every
+    /// active tunnel, not just the one the current CLI invocation
+    /// touched.
+    ///
+    /// Marks every entry as `is_primary: true` because the headless
+    /// CLI has no registry-derived primary; the killswitch's
+    /// firewall rules treat each Connected interface as a tunnel
+    /// that must allow its server IP and DNS through. The TUI
+    /// computes a multi-tunnel slice (`App::active_tunnels_for_killswitch`)
+    /// with proper primary marking from registry state.
+    #[must_use]
+    pub fn killswitch_view_from_scanner(
+        &self,
+    ) -> (bool, Vec<crate::core::killswitch::ActiveTunnelInfo>) {
+        let sessions = crate::core::scanner::get_active_profiles(&self.profiles);
+        let is_connected = !sessions.is_empty();
+        let active_tunnels = sessions
+            .iter()
+            .map(|s| crate::core::killswitch::ActiveTunnelInfo {
+                interface: s.interface.clone(),
+                server_ips: s
+                    .endpoint
+                    .split(':')
+                    .next()
+                    .and_then(|h| h.parse().ok())
+                    .into_iter()
+                    .collect(),
+                declared_cidrs: Vec::new(),
+                is_primary: true,
+            })
+            .collect();
+        (is_connected, active_tunnels)
+    }
+
     /// Synchronizes the kill switch state with the current mode and
     /// connection status.
     ///
     /// Plan P5d: callers compute `is_connected` and `active_tunnels`
     /// from their own state. App-side callers derive both from
-    /// `app.registry`; CLI-side callers build them from local
-    /// `ConnectionState` via `build_active_tunnels_from_legacy`.
+    /// `app.registry`; CLI-side callers use
+    /// [`Self::killswitch_view_from_scanner`] so every CLI lifecycle
+    /// helper persists the full multi-tunnel slice, not a synthesised
+    /// single-tunnel view that would clobber the on-disk state when
+    /// another tunnel is still up.
     pub fn sync_killswitch(
         &mut self,
         is_connected: bool,
@@ -488,6 +530,11 @@ impl VpnRuntime {
     }
 
     /// Check if required binaries are available for a given protocol.
+    ///
+    /// Shared between TUI and CLI so both surfaces refuse the same
+    /// missing-dep set (and run the same `OpenVPN` 2.4+ probe — older
+    /// builds silently drop `--pull-filter`, breaking multi-tunnel DNS
+    /// scoping per plan 001 U14 / R13).
     #[must_use]
     pub fn check_dependencies(protocol: Protocol, config_path: &std::path::Path) -> Vec<String> {
         let mut missing = Vec::new();
@@ -517,7 +564,32 @@ impl VpnRuntime {
                 let _ = config_path; // suppress unused warning on non-Linux
             }
             Protocol::OpenVPN => {
-                if !utils::binary_exists("openvpn") {
+                if utils::binary_exists("openvpn") {
+                    // Assert OpenVPN ≥ 2.4 so `--pull-filter` (multi-tunnel
+                    // DNS scoping) is available. Older builds silently
+                    // ignore the flag and leak pushed DNS into the primary
+                    // tunnel's resolver. Unparseable probe = fail-open with
+                    // a tracing warning so vendor-patched or sandboxed
+                    // environments aren't blocked.
+                    use openvpn::OvpnVersionProbe;
+                    match openvpn::probe_openvpn_version() {
+                        OvpnVersionProbe::Parsed(v) if v.supports_multi_tunnel_dns() => {}
+                        OvpnVersionProbe::Parsed(v) => {
+                            missing.push(format!(
+                                "openvpn 2.4+ required for multi-tunnel DNS scoping (found {v})"
+                            ));
+                        }
+                        OvpnVersionProbe::HelpFallbackOk => {}
+                        OvpnVersionProbe::Unparseable => {
+                            tracing::warn!(
+                                target: "vortix::vpn_runtime",
+                                "openvpn version could not be determined; \
+                                 multi-tunnel DNS scoping may not work if the \
+                                 installed binary is older than 2.4"
+                            );
+                        }
+                    }
+                } else {
                     missing.push("openvpn".to_string());
                 }
             }
@@ -535,36 +607,5 @@ impl Drop for VpnRuntime {
         //
         // Kill switch firewall rules also persist — the next launch recovers
         // them via `load_state()`.
-    }
-}
-
-/// Build the `ActiveTunnelInfo` slice consumed by the killswitch
-/// synthesiser from a legacy `ConnectionState::Connected` value.
-///
-/// CLI-only helper after P5d — the CLI's blocking helpers carry their
-/// own local `ConnectionState`. App-side callers compute the slice
-/// from registry snapshots via `App::active_tunnels_for_killswitch`.
-pub(crate) fn build_active_tunnels_from_legacy(
-    state: &ConnectionState,
-) -> Vec<crate::core::killswitch::ActiveTunnelInfo> {
-    use crate::core::killswitch::ActiveTunnelInfo;
-
-    match state {
-        ConnectionState::Connected { details, .. } => {
-            let server_ips = details
-                .endpoint
-                .split(':')
-                .next()
-                .and_then(|s| s.parse().ok())
-                .into_iter()
-                .collect();
-            vec![ActiveTunnelInfo {
-                interface: details.interface.clone(),
-                server_ips,
-                declared_cidrs: Vec::new(),
-                is_primary: true,
-            }]
-        }
-        _ => Vec::new(),
     }
 }

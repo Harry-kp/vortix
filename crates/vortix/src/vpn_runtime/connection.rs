@@ -6,7 +6,6 @@
 
 use std::time::{Duration, Instant};
 
-use super::{ConnectionState, DetailedConnectionInfo};
 use crate::core::scanner;
 use crate::message::Message;
 use crate::state::Protocol;
@@ -141,21 +140,13 @@ impl VpnRuntime {
                         }
                         self.save_metadata();
 
-                        // Synthesise a single-tunnel Connected view to
-                        // build the killswitch active-tunnel slice.
-                        let local_state = ConnectionState::Connected {
-                            profile: profile.clone(),
-                            server_location: self
-                                .profiles
-                                .iter()
-                                .find(|p| p.name == profile)
-                                .map_or_else(|| "Unknown".into(), |p| p.location.clone()),
-                            since: Instant::now(),
-                            latency_ms: 0,
-                            details: Box::new(DetailedConnectionInfo::default()),
-                        };
-                        let active = super::build_active_tunnels_from_legacy(&local_state);
-                        self.sync_killswitch(true, &active);
+                        // Build the killswitch active-tunnel slice from
+                        // the scanner so we persist EVERY active tunnel,
+                        // not just this CLI invocation's. Without this
+                        // the on-disk killswitch slice would drop any
+                        // tunnel a concurrent TUI session was tracking.
+                        let (is_connected, active) = self.killswitch_view_from_scanner();
+                        self.sync_killswitch(is_connected, &active);
                     } else {
                         self.cleanup_vpn_resources(&profile);
                     }
@@ -273,10 +264,15 @@ impl VpnRuntime {
             match self.cmd_rx.recv_timeout(Duration::from_millis(500)) {
                 Ok(Message::DisconnectResult { success, error, .. }) => {
                     self.session_start = None;
-                    // No legacy field after P5d; pass an empty
-                    // active-tunnels slice so the kill switch knows
-                    // nothing is active.
-                    self.sync_killswitch(false, &[]);
+                    // Re-read the scanner instead of assuming this CLI
+                    // disconnect was the only active tunnel — other
+                    // tunnels (started by a concurrent TUI session, or
+                    // earlier CLI invocations) must keep their
+                    // killswitch firewall rules. Without this read the
+                    // persisted slice would be empty even when B is
+                    // still up alongside the A we just took down.
+                    let (is_connected, active) = self.killswitch_view_from_scanner();
+                    self.sync_killswitch(is_connected, &active);
 
                     if success {
                         return Ok(());
