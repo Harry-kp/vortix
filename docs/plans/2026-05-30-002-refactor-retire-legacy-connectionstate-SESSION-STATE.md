@@ -14,10 +14,10 @@ branch_head_at_last_checkpoint: b321abe
 |---|---|---|
 | P5a — renderer/helper cleanup | DONE | `6b6ec76` — `refactor(app): drop legacy ConnectionState fallback reads (P5a)` |
 | P5b U-P5b-1 — per-profile retry/auto-reconnect | DONE | `b321abe` — `refactor(retry): per-profile retry/auto-reconnect state` |
-| P5b U-P5b-2 — per-profile scanner loop | PENDING | — |
-| P5b U-P5b-3 — migrate write sites | PENDING | — |
+| P5b U-P5b-2 — per-profile scanner loop + auto-adopt | DONE | `a12256c` — `refactor(scanner): per-profile registry loop with auto-adopt` |
+| P5b U-P5b-3 — migrate App reads/writes off legacy field | PENDING | — |
 | P5c — CLI scope narrowing | DEFERRED → fold into P5d | — |
-| P5d — delete field + file + mirror helpers | PENDING | — |
+| P5d — delete field + file + mirror helpers + CLI refactor | PENDING | — |
 
 Also landed in-session (not P5):
 - `6392a9d` — `ux(dashboard): pad panel borders for breathing room` (uncommitted at session start)
@@ -45,31 +45,87 @@ deletes the App-side field.
 - **D-4 scanner adoption policy:** auto-adopt (mirrors current legacy
   behavior). To be applied in U-P5b-2.
 
-### Resume here
+### Resume here (2026-05-30, after `a12256c`)
 
-Next subunit: **U-P5b-2 — per-profile scanner loop.** Rewrite
-`handle_sync_system_state` in `crates/vortix/src/app/update.rs:799+`
-(~310 lines) to iterate every registry snapshot instead of
-dispatching on the single legacy state. Per-profile match against
-`Vec<ActiveSession>`:
+What remains: **U-P5b-3 + P5d** — these are tightly entangled and
+will land as one big commit (or a tight sequence) when picked up.
 
-- Connecting + matched session → set_connected (promotion)
-- Connected + matched session → refresh details
-- Connected/Connecting/Disconnecting + NO matched session → drop
-  detected → set_disconnected, optionally enter retry via the new
-  retry_state HashMap (now in place from U-P5b-1)
-- Session present + profile in catalog but not in registry → auto-adopt
-  (per D-4 confirmed) — set_connected
+The behavior goal of P5 (multi-tunnel-correct scanner, per-profile
+retry, registry-driven renderers) is **already achieved** by the
+commits above. What's left is the structural cleanup of removing
+the legacy `connection_state` field entirely. The field is still
+maintained correctly today — handlers write to it, mirror helpers
+propagate to the registry, and the per-profile scanner updates it
+for the matching profile.
 
-Until U-P5b-3, keep mirroring into the legacy state for sites that
-still read it (e.g., the CLI helpers in `vpn_runtime/connection.rs`,
-the rename mutation in `app/profile.rs`, the kill-switch sync in
-`vpn_runtime/mod.rs::sync_killswitch`).
+### U-P5b-3 + P5d work (entangled, ~50 sites)
 
-Per-profile retry primitives are now available:
-- `runtime.retry_state.insert(profile_id, RetryState { attempt, profile_idx, auto_reconnect })`
-- `runtime.retry_state.remove(&profile_id)`
-- `runtime.retry_state.get(&profile_id)`
+**Reads to migrate (~30 sites):** every `&self.runtime.connection_state`
+read in `crates/vortix/src/app/{update.rs,connection.rs}` becomes a
+registry query. Common patterns:
+- `matches!(connection_state, Disconnected)` → `self.active_tunnel_count() == 0`
+- `if let Connecting { profile, .. } = ...` → iterate
+  `registry.snapshot_all()` for the profile in Connecting state
+- `&self.runtime.connection_state` passed to
+  `build_active_tunnels_from_state` → rewrite the builder to read
+  from `registry.snapshot_all()` directly
+
+**Writes to delete (~10 sites):** every `runtime.connection_state = X`
+in App code. The `mirror_*_into_registry` helpers already do the
+registry side; the legacy assignments are redundant once reads no
+longer consult them.
+
+**Mirror helpers to delete:** `App::mirror_{connect,disconnect,
+connecting,disconnecting,failed}_into_registry`. After write-site
+migration these have no callers from production code; test helpers
+need to update too (call `registry.set_*` directly or use a thin
+test-only adapter).
+
+**CLI refactor (vpn_runtime/connection.rs):** the CLI's blocking
+helpers (`connect_and_wait`, `disconnect_and_wait`, `scan_status`)
+read `self.connection_state`. Two clean options:
+1. Make them local-state-based: each invocation builds + returns a
+   `ConnectResult`/`DownData` from local variables; no shared field
+   on `VpnRuntime`. `disconnect_and_wait` needs a profile-name arg
+   so it doesn't need to discover the "current" profile.
+2. Add a `TunnelRegistry` field to `VpnRuntime` and drive the CLI
+   through it. Bigger refactor but symmetric with the TUI.
+
+Either path lets `VpnRuntime` shed its `connection_state` field.
+
+**Type relocation (D-3 + folded P5c):** after the App side stops
+using `ConnectionState`/`DetailedConnectionInfo`, the only remaining
+users are the CLI's blocking helpers (vpn_runtime/connection.rs,
+cli/commands.rs). Move the type to `crates/vortix/src/cli/state.rs`
+and have the CLI helpers import from there. Delete
+`crates/vortix/src/vpn_runtime/connection_state.rs`.
+
+**Test plumbing:** the test helpers in `app/tests.rs` and
+`tests/integration.rs` (`set_connected`, `set_connecting`,
+`set_disconnecting`) call the `mirror_*_into_registry` family. After
+P5d deletes those, the helpers call `registry.set_*` directly with
+the same engine-factory pattern used in the existing mirror
+implementations (see `placeholder_engine_for_profile` and
+`extract_allowed_ips` in `app/connection.rs`).
+
+### Primitives ready for resume
+
+These exist on the branch and don't need to be rebuilt:
+
+- `Engine::seed_{connected, disconnected, connecting, disconnecting, failed}_state`
+  (crates/vortix/src/vortix_core/engine/fsm.rs)
+- `TunnelRegistry::set_{connected, disconnected, connecting, disconnecting, failed}`
+  (crates/vortix/src/vortix_core/engine/registry.rs)
+- `App::mirror_*_into_registry` (still callable from tests; to be
+  deleted in P5d)
+- `App::refresh_registry_from_session` (new in U-P5b-2 — pushes
+  session details to registry without consulting legacy state)
+- `App::primary_state()` (not yet — add as part of U-P5b-3 reads
+  migration)
+- `App::is_profile_active`, `is_profile_connected`, `is_profile_connecting`,
+  `active_tunnel_count`, `active_tunnel_ids` (registry-only after P5a)
+- `runtime.retry_state: HashMap<ProfileId, RetryState>` (per-profile
+  retry from U-P5b-1)
 - `Message::RetryConnect { idx, attempt }` (unchanged signature)
 
 
