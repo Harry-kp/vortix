@@ -637,133 +637,20 @@ impl App {
     }
 
     #[allow(clippy::too_many_lines)]
+    /// Global single-tunnel disconnect — finds the profile from the
+    /// derived legacy view (registry primary) and delegates to
+    /// [`disconnect_specific`] for the real teardown. Used by the
+    /// `d` key on non-sidebar panels and the legacy `Message::Disconnect`
+    /// path.
     pub(crate) fn disconnect(&mut self) {
-        // Cancel retry / auto-reconnect for the profile this global
-        // disconnect targets (read from the derived legacy view).
-        // Other profiles' retry state stays intact (P5b U-P5b-1).
-        let legacy = self.legacy_state();
-        let target_for_retry_clear = match &legacy {
+        let target = match self.legacy_state() {
             ConnectionState::Connected { profile, .. }
             | ConnectionState::Connecting { profile, .. }
-            | ConnectionState::Disconnecting { profile, .. } => Some(profile.clone()),
+            | ConnectionState::Disconnecting { profile, .. } => Some(profile),
             ConnectionState::Disconnected => None,
         };
-        if let Some(name) = &target_for_retry_clear {
-            self.runtime.retry_state.remove(&ProfileId::new(name));
-        }
-        // Discard any in-flight scanner result captured before this disconnect;
-        // stale data showing the interface "up" would otherwise re-promote to
-        // Connected and trigger a spurious "VPN dropped" auto-reconnect.
-        self.runtime.scanner_rx = None;
-        // Extract connection info from the derived legacy view.
-        let connection_info = match &legacy {
-            ConnectionState::Connected {
-                profile: ref profile_name,
-                details,
-                ..
-            } => self
-                .runtime
-                .profiles
-                .iter()
-                .find(|p| p.name == *profile_name)
-                .map(|profile| {
-                    (
-                        profile.name.clone(),
-                        profile.protocol,
-                        profile.config_path.clone(),
-                        details.pid,
-                        self.runtime.cmd_tx.clone(),
-                    )
-                }),
-            ConnectionState::Connecting {
-                profile: ref profile_name,
-                ..
-            } => self
-                .runtime
-                .profiles
-                .iter()
-                .find(|p| p.name == *profile_name)
-                .map(|profile| {
-                    (
-                        profile.name.clone(),
-                        profile.protocol,
-                        profile.config_path.clone(),
-                        None, // no PID yet while connecting
-                        self.runtime.cmd_tx.clone(),
-                    )
-                }),
-            _ => None,
-        };
-
-        if let Some((profile_name, protocol, config_path, pid, cmd_tx)) = connection_info {
-            self.log(&format!("ACTION: Disconnecting from '{profile_name}'..."));
-
-            // Mirror the Disconnecting transition into the registry so
-            // renderers show the `◑` badge during the teardown window.
-            self.mirror_disconnecting_into_registry(&profile_name);
-
-            // KILL SWITCH: Sync state after changing connection state
-            self.sync_killswitch();
-
-            if self.runtime.killswitch_state.is_blocking() {
-                self.show_toast(
-                    "Kill Switch blocking - Strict mode active".to_string(),
-                    ToastType::Warning,
-                );
-            }
-
-            // Plan #004 U4: route the disconnect through TunnelKind.
-            std::thread::spawn(move || {
-                use crate::vortix_core::ports::tunnel::{TunnelHandle, TunnelKindTag};
-                use crate::vortix_core::profile::ProfileId;
-
-                let iface = match protocol {
-                    Protocol::WireGuard => config_path.to_string_lossy().into_owned(),
-                    Protocol::OpenVPN => {
-                        format!(
-                            "openvpn-{}",
-                            crate::utils::sanitize_profile_name(&profile_name)
-                        )
-                    }
-                };
-                let pid_for_handle = match protocol {
-                    Protocol::OpenVPN => crate::utils::read_openvpn_pid(&profile_name).or(pid),
-                    Protocol::WireGuard => None,
-                };
-                let handle = TunnelHandle {
-                    profile_id: ProfileId::new(&profile_name),
-                    interface_name: iface,
-                    pid: pid_for_handle,
-                    started_at: std::time::SystemTime::now(),
-                    kind: match protocol {
-                        Protocol::WireGuard => TunnelKindTag::WireGuard,
-                        Protocol::OpenVPN => TunnelKindTag::OpenVpn,
-                    },
-                };
-                let config_dir = crate::utils::get_app_config_dir()
-                    .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
-                let mut tunnel = crate::tunnel::tunnel_for(protocol, &config_dir, "3", 30);
-
-                match tunnel.down(handle) {
-                    Ok(()) => {
-                        if matches!(protocol, Protocol::OpenVPN) {
-                            crate::utils::cleanup_openvpn_run_files(&profile_name);
-                        }
-                        let _ = cmd_tx.send(Message::DisconnectResult {
-                            profile: profile_name,
-                            success: true,
-                            error: None,
-                        });
-                    }
-                    Err(err) => {
-                        let _ = cmd_tx.send(Message::DisconnectResult {
-                            profile: profile_name,
-                            success: false,
-                            error: Some(format!("{protocol}: {err}")),
-                        });
-                    }
-                }
-            });
+        if let Some(name) = target {
+            self.disconnect_specific(&name);
         }
     }
 
@@ -897,74 +784,164 @@ impl App {
     }
 
     /// Disconnect a specific profile by sidebar index (multi-connection
-    /// plan #001 U19). Routes through the registry when an FSM entry
-    /// exists for that profile; otherwise falls back to the legacy
-    /// single-tunnel `disconnect()` when the index matches the active
-    /// connection. No-op when the profile is not currently active.
+    /// plan #001 U19). Drives the real per-protocol teardown via
+    /// [`disconnect_specific`] — that's what actually kills the
+    /// wg-quick / openvpn process. The registry's own `disconnect`
+    /// would only drive the placeholder `MockTunnel` and leave the
+    /// kernel interface running. No-op when the profile isn't in
+    /// the catalog or isn't currently active.
     pub(crate) fn disconnect_profile_by_idx(&mut self, idx: usize) {
         let Some(profile) = self.runtime.profiles.get(idx) else {
             return;
         };
         let name = profile.name.clone();
-        let target_id = ProfileId::new(&name);
-
-        // Registry-first: drive the FSM through `Disconnect` when the
-        // tunnel is tracked there. Errors propagate to the activity log.
-        if self.registry.snapshot(&target_id).is_some() {
-            match self.registry.disconnect(&target_id) {
-                Ok(()) => {
-                    self.log(&format!("ACTION: Disconnecting '{name}' via registry"));
-                }
-                Err(err) => {
-                    self.log(&format!("ERR: registry.disconnect('{name}') failed: {err}"));
-                }
-            }
-            // If this same profile is also the registry's primary,
-            // drive the global disconnect so the sidebar/header reflect
-            // the transition immediately (without waiting for scanner).
-            if self.legacy_matches(&name) {
-                self.disconnect();
-            }
+        if !self.is_profile_active(&name) {
             return;
         }
-
-        // Profile isn't tracked in the registry but the derived legacy
-        // view holds it — fall through to the global disconnect.
-        if self.legacy_matches(&name) {
-            self.disconnect();
-        }
+        self.disconnect_specific(&name);
     }
 
     /// Tear down every active tunnel (multi-connection plan #001 U19).
     /// Used by Shift+`D` after the user confirms the
     /// [`InputMode::ConfirmDisconnectAll`] dialog, and by the
     /// `Message::Disconnect` global when only one tunnel exists.
+    ///
+    /// Critically: the per-tunnel teardown spawns a real
+    /// `tunnel.down()` thread for each active profile via
+    /// `disconnect_specific`. Calling only `registry.disconnect()`
+    /// drives the placeholder `MockTunnel` (from
+    /// `mirror_connect_into_registry`) which removes the registry
+    /// entry but does NOT kill the real wg-quick / openvpn process —
+    /// that's what an earlier version of this method did and it left
+    /// every secondary tunnel's kernel interface running while the
+    /// sidebar lied that they were down.
     pub(crate) fn disconnect_all_active(&mut self) {
-        // Snapshot ids first so we don't hold a borrow across mutation.
-        let ids = self.active_tunnel_ids();
-        let count = ids.len();
+        // Snapshot the active profile names first so we don't hold
+        // any borrows across mutation. We need profile NAMES (not
+        // just ids) because the per-tunnel disconnect needs the
+        // profile/protocol/config_path to drive the real teardown.
+        let names: Vec<String> = self
+            .active_tunnel_ids()
+            .into_iter()
+            .map(|id| id.as_str().to_string())
+            .collect();
+        let count = names.len();
         self.log(&format!(
             "ACTION: Disconnecting all {count} active tunnel(s)..."
         ));
 
-        // Disconnect via the registry path for any tracked FSMs.
-        for id in &ids {
-            if self.registry.snapshot(id).is_some() {
-                if let Err(err) = self.registry.disconnect(id) {
-                    self.log(&format!(
-                        "ERR: registry.disconnect('{}') failed: {err}",
-                        id.as_str()
-                    ));
-                }
-            }
+        for name in &names {
+            self.disconnect_specific(name);
+        }
+    }
+
+    /// Disconnect a single named profile via the real protocol
+    /// teardown (`tunnel.down()` in a spawned thread). Mirrors the
+    /// Disconnecting transition into the registry, clears that
+    /// profile's retry state, and syncs the kill switch.
+    ///
+    /// Used by [`disconnect_all_active`], [`disconnect_profile_by_idx`]
+    /// (for non-primary tunnels), and [`disconnect`] (which derives
+    /// the target from `legacy_state` and then delegates here).
+    /// No-op when the named profile isn't in the catalog.
+    fn disconnect_specific(&mut self, profile_name: &str) {
+        use crate::vortix_core::engine::state::Connection;
+
+        // Clear this profile's retry / auto-reconnect entry (per-
+        // profile, not global).
+        let profile_id = ProfileId::new(profile_name);
+        self.runtime.retry_state.remove(&profile_id);
+        // Discard any in-flight scanner result so stale data doesn't
+        // re-promote this profile back to Connected after teardown.
+        self.runtime.scanner_rx = None;
+
+        let Some(profile) = self
+            .runtime
+            .profiles
+            .iter()
+            .find(|p| p.name == profile_name)
+            .cloned()
+        else {
+            return;
+        };
+        let protocol = profile.protocol;
+        let config_path = profile.config_path.clone();
+        let cmd_tx = self.runtime.cmd_tx.clone();
+
+        // Recover the OpenVPN PID from the registry's snapshot (the
+        // scanner refresh populates it). Falls through to None for
+        // WireGuard or when the registry has no Connected entry.
+        let pid = self
+            .registry
+            .snapshot(&profile_id)
+            .and_then(|snap| match snap.state {
+                Connection::Connected { details, .. } => details.pid,
+                _ => None,
+            });
+
+        self.log(&format!("ACTION: Disconnecting from '{profile_name}'..."));
+
+        // Mirror the Disconnecting transition into the registry so
+        // renderers show the `◑` badge during the teardown window.
+        self.mirror_disconnecting_into_registry(profile_name);
+
+        // Sync kill switch (multi-tunnel-aware via the registry).
+        self.sync_killswitch();
+        if self.runtime.killswitch_state.is_blocking() {
+            self.show_toast(
+                "Kill Switch blocking - Strict mode active".to_string(),
+                ToastType::Warning,
+            );
         }
 
-        // Also trigger the global disconnect path if the derived
-        // legacy view still has an active profile — covers the
-        // single-tunnel slot that wasn't drained by the per-id loop.
-        if self.active_tunnel_count() > 0 {
-            self.disconnect();
-        }
+        let pn = profile_name.to_string();
+        std::thread::spawn(move || {
+            use crate::vortix_core::ports::tunnel::{TunnelHandle, TunnelKindTag};
+
+            let iface = match protocol {
+                Protocol::WireGuard => config_path.to_string_lossy().into_owned(),
+                Protocol::OpenVPN => {
+                    format!("openvpn-{}", crate::utils::sanitize_profile_name(&pn))
+                }
+            };
+            let pid_for_handle = match protocol {
+                Protocol::OpenVPN => crate::utils::read_openvpn_pid(&pn).or(pid),
+                Protocol::WireGuard => None,
+            };
+            let handle = TunnelHandle {
+                profile_id: ProfileId::new(&pn),
+                interface_name: iface,
+                pid: pid_for_handle,
+                started_at: std::time::SystemTime::now(),
+                kind: match protocol {
+                    Protocol::WireGuard => TunnelKindTag::WireGuard,
+                    Protocol::OpenVPN => TunnelKindTag::OpenVpn,
+                },
+            };
+            let config_dir = crate::utils::get_app_config_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
+            let mut tunnel = crate::tunnel::tunnel_for(protocol, &config_dir, "3", 30);
+
+            match tunnel.down(handle) {
+                Ok(()) => {
+                    if matches!(protocol, Protocol::OpenVPN) {
+                        crate::utils::cleanup_openvpn_run_files(&pn);
+                    }
+                    let _ = cmd_tx.send(Message::DisconnectResult {
+                        profile: pn,
+                        success: true,
+                        error: None,
+                    });
+                }
+                Err(err) => {
+                    let _ = cmd_tx.send(Message::DisconnectResult {
+                        profile: pn,
+                        success: false,
+                        error: Some(format!("{protocol}: {err}")),
+                    });
+                }
+            }
+        });
     }
 
     /// Cancel an in-flight connect (multi-connection plan #001 U19).
