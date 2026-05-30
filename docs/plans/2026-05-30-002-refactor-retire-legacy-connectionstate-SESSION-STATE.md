@@ -1,11 +1,11 @@
 ---
 plan: docs/plans/2026-05-30-002-refactor-retire-legacy-connectionstate-plan.md
-status: in_progress
+status: completed
 created: 2026-05-30
 last_updated: 2026-05-30
 branch: feat/multi-connection
 branch_head_at_plan_time: 90b62e8
-branch_head_at_last_checkpoint: b321abe
+branch_head_at_completion: 09040ca
 ---
 
 ## Progress (last checkpoint: 2026-05-30, commit `b321abe`)
@@ -15,9 +15,8 @@ branch_head_at_last_checkpoint: b321abe
 | P5a — renderer/helper cleanup | DONE | `6b6ec76` — `refactor(app): drop legacy ConnectionState fallback reads (P5a)` |
 | P5b U-P5b-1 — per-profile retry/auto-reconnect | DONE | `b321abe` — `refactor(retry): per-profile retry/auto-reconnect state` |
 | P5b U-P5b-2 — per-profile scanner loop + auto-adopt | DONE | `a12256c` — `refactor(scanner): per-profile registry loop with auto-adopt` |
-| P5b U-P5b-3 — migrate App reads/writes off legacy field | PENDING | — |
-| P5c — CLI scope narrowing | DEFERRED → fold into P5d | — |
-| P5d — delete field + file + mirror helpers + CLI refactor | PENDING | — |
+| P5b U-P5b-3 + P5d — delete legacy field + CLI refactor | DONE | `09040ca` — `refactor: retire legacy connection_state field` |
+| P5c — CLI scope narrowing | FOLDED into P5d | `09040ca` (CLI helpers take profile/details params; no field to relocate around) |
 
 Also landed in-session (not P5):
 - `6392a9d` — `ux(dashboard): pad panel borders for breathing room` (uncommitted at session start)
@@ -45,18 +44,13 @@ deletes the App-side field.
 - **D-4 scanner adoption policy:** auto-adopt (mirrors current legacy
   behavior). To be applied in U-P5b-2.
 
-### Resume here (2026-05-30, after `a12256c`)
+### Status: P5 complete (2026-05-30, `09040ca`)
 
-What remains: **U-P5b-3 + P5d** — these are tightly entangled and
-will land as one big commit (or a tight sequence) when picked up.
-
-The behavior goal of P5 (multi-tunnel-correct scanner, per-profile
-retry, registry-driven renderers) is **already achieved** by the
-commits above. What's left is the structural cleanup of removing
-the legacy `connection_state` field entirely. The field is still
-maintained correctly today — handlers write to it, mirror helpers
-propagate to the registry, and the per-profile scanner updates it
-for the matching profile.
+All P5 stages are landed. The legacy `connection_state` field on
+`VpnRuntime` has been deleted. The App layer's single source of
+truth for active VPN state is now `TunnelRegistry`. The CLI's
+blocking helpers carry their own local `ConnectionState` view (one
+process, one tunnel) without sharing state.
 
 ### U-P5b-3 + P5d work (entangled, ~50 sites)
 
