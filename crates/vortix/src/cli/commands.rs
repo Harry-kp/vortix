@@ -706,29 +706,6 @@ struct DownData {
     disconnected: Vec<String>,
 }
 
-/// Point `engine.connection_state` at a specific active session so
-/// [`VpnRuntime::disconnect_and_wait`] tears down the right tunnel.
-///
-/// Multi-connection plan U20: the CLI down/reconnect grammar accepted a
-/// per-profile target. Until U7 routes CLI calls through the
-/// `TunnelRegistry`, we still drive disconnects one profile at a time
-/// through the single-tunnel `VpnRuntime`. Helper keeps the two call
-/// sites (`handle_down`, `handle_reconnect`) in sync.
-fn point_engine_at_session(engine: &mut VpnRuntime, session: &crate::core::scanner::ActiveSession) {
-    engine.connection_state = crate::vpn_runtime::ConnectionState::Connected {
-        profile: session.name.clone(),
-        server_location: String::new(),
-        since: std::time::Instant::now(),
-        latency_ms: 0,
-        details: Box::new(crate::vpn_runtime::DetailedConnectionInfo {
-            pid: session.pid,
-            interface: session.interface.clone(),
-            endpoint: session.endpoint.clone(),
-            ..Default::default()
-        }),
-    };
-}
-
 fn handle_down(
     profile_filter: Option<&str>,
     all: bool,
@@ -787,8 +764,8 @@ fn handle_down(
     let mut disconnected: Vec<String> = Vec::new();
     let mut last_error: Option<String> = None;
     for session in &targets {
-        point_engine_at_session(&mut engine, session);
-        match engine.disconnect_and_wait(force, Duration::from_secs(20)) {
+        match engine.disconnect_and_wait(&session.name, session.pid, force, Duration::from_secs(20))
+        {
             Ok(()) => disconnected.push(session.name.clone()),
             Err(e) => last_error = Some(e),
         }
@@ -906,8 +883,12 @@ fn handle_reconnect(
     let mut last_exit: i32 = 0;
     for name in &to_cycle {
         if let Some(session) = active.iter().find(|s| &s.name == name) {
-            point_engine_at_session(&mut engine, session);
-            let _ = engine.disconnect_and_wait(false, Duration::from_secs(15));
+            let _ = engine.disconnect_and_wait(
+                &session.name,
+                session.pid,
+                false,
+                Duration::from_secs(15),
+            );
         }
         last_exit = handle_up(Some(name), 20, false, config, config_dir, mode);
     }
@@ -1985,7 +1966,28 @@ fn handle_killswitch(
         }
 
         engine.killswitch_mode = ks_mode;
-        engine.sync_killswitch();
+        // CLI's headless engine has no registry — derive the active
+        // tunnel slice from the scanner. The `killswitch` command
+        // toggles the mode only; preserved-blocking-from-previous-run
+        // behavior is restored at engine construction.
+        let active_sessions = crate::core::scanner::get_active_profiles(&engine.profiles);
+        let is_connected = !active_sessions.is_empty();
+        let active_tunnels: Vec<crate::core::killswitch::ActiveTunnelInfo> = active_sessions
+            .iter()
+            .map(|s| crate::core::killswitch::ActiveTunnelInfo {
+                interface: s.interface.clone(),
+                server_ips: s
+                    .endpoint
+                    .split(':')
+                    .next()
+                    .and_then(|h| h.parse().ok())
+                    .into_iter()
+                    .collect(),
+                declared_cidrs: Vec::new(),
+                is_primary: true,
+            })
+            .collect();
+        engine.sync_killswitch(is_connected, &active_tunnels);
     }
 
     let data = KsData {

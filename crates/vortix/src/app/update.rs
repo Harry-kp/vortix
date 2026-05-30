@@ -177,10 +177,7 @@ impl App {
 
             // Connection
             Message::Disconnect => {
-                if matches!(
-                    self.runtime.connection_state,
-                    ConnectionState::Disconnecting { .. }
-                ) {
+                if matches!(self.legacy_state(), ConnectionState::Disconnecting { .. }) {
                     self.force_disconnect();
                 } else {
                     self.disconnect();
@@ -190,7 +187,8 @@ impl App {
             Message::ConnectSelected => {
                 if let Some(idx) = self.profile_list_state.selected() {
                     let target = self.runtime.profiles.get(idx).map(|p| p.name.clone());
-                    match (&self.runtime.connection_state, target) {
+                    let legacy = self.legacy_state();
+                    match (&legacy, target) {
                         (ConnectionState::Connected { profile, .. }, Some(name))
                             if *profile == name =>
                         {
@@ -429,8 +427,8 @@ impl App {
     fn handle_disconnect_result(&mut self, profile: String, success: bool, error: Option<String>) {
         // Guard: ignore stale results if we're no longer disconnecting this profile.
         let still_disconnecting = matches!(
-            &self.runtime.connection_state,
-            ConnectionState::Disconnecting { profile: p, .. } if *p == profile
+            self.legacy_state(),
+            ConnectionState::Disconnecting { profile: ref p, .. } if *p == profile
         );
         if !still_disconnecting {
             self.log(&format!(
@@ -456,8 +454,8 @@ impl App {
     fn handle_connect_result(&mut self, profile: String, success: bool, error: Option<String>) {
         // Ignore stale results if we're no longer in Connecting state for this profile.
         let still_connecting = matches!(
-            &self.runtime.connection_state,
-            ConnectionState::Connecting { profile: p, .. } if *p == profile
+            self.legacy_state(),
+            ConnectionState::Connecting { profile: ref p, .. } if *p == profile
         );
         if !still_connecting {
             self.log(&format!(
@@ -479,24 +477,13 @@ impl App {
                 .map_or_else(|| "Unknown".to_string(), |p| p.location.clone());
 
             let now = Instant::now();
-            self.runtime.connection_state = ConnectionState::Connected {
-                profile: profile.clone(),
-                server_location: location,
-                since: now,
-                latency_ms: 0,
-                details: Box::new(DetailedConnectionInfo::default()),
-            };
             self.runtime.session_start = Some(now);
+            let _ = location; // server location is sourced from the catalog in `legacy_state`
 
-            // Plan 001 U6/U7 bridge: panel rendering reads from
-            // `self.registry` exclusively (header, sidebar, Connection
-            // Details, Security Guard) but the connect path drives
-            // `tunnel.up()` directly in a worker thread without touching
-            // the registry. Mirror the success here so the UI sees the
-            // active tunnel. Without this call the user pressing `1`
-            // gets a successful kernel connect plus a TUI that looks
-            // identical to the disconnected state.
-            self.mirror_connect_into_registry(&profile);
+            // Plan 001 U6/U7 / P5d: registry is the single source of
+            // truth. Push a Connected entry directly; the scanner will
+            // refresh kernel-truthful details on its next tick.
+            self.mirror_connect_into_registry(&profile, &DetailedConnectionInfo::default(), now);
 
             if let Some(p) = self.runtime.profiles.iter_mut().find(|p| p.name == profile) {
                 p.last_used = Some(std::time::SystemTime::now());
@@ -573,7 +560,6 @@ impl App {
                     ToastType::Warning,
                 );
 
-                self.runtime.connection_state = ConnectionState::Disconnected;
                 self.runtime.session_start = None;
 
                 let cmd_tx = self.runtime.cmd_tx.clone();
@@ -584,7 +570,6 @@ impl App {
             } else {
                 // No retry: final failure for this profile.
                 self.runtime.retry_state.remove(&profile_id);
-                self.runtime.connection_state = ConnectionState::Disconnected;
                 self.runtime.session_start = None;
                 self.show_toast(format!("Failed to connect: {err_msg}"), ToastType::Error);
                 self.runtime.pending_connect = None;
@@ -683,8 +668,7 @@ impl App {
         }
 
         // Save state for recovery
-        let active =
-            super::connection::build_active_tunnels_from_state(&self.runtime.connection_state);
+        let active = self.active_tunnels_for_killswitch();
         let persisted_tunnels = crate::core::killswitch::persisted_from_active(&active);
         let _ = crate::core::killswitch::save_state(
             self.runtime.killswitch_mode,
@@ -701,8 +685,7 @@ impl App {
         // should tear them down.
         //
         // Kill switch state is saved so the next launch can recover it.
-        let active =
-            super::connection::build_active_tunnels_from_state(&self.runtime.connection_state);
+        let active = self.active_tunnels_for_killswitch();
         let persisted_tunnels = crate::core::killswitch::persisted_from_active(&active);
         let _ = crate::core::killswitch::save_state(
             self.runtime.killswitch_mode,
@@ -715,10 +698,7 @@ impl App {
     fn handle_telemetry(&mut self, update: TelemetryUpdate) {
         match update {
             TelemetryUpdate::PublicIp(ip) => {
-                let is_connected = matches!(
-                    self.runtime.connection_state,
-                    ConnectionState::Connected { .. }
-                );
+                let is_connected = self.has_active_connection();
                 let old_ip = self.runtime.public_ip.clone();
 
                 // Plan 005 U7: emit IpChanged into the journal so the
@@ -738,7 +718,7 @@ impl App {
                 }
 
                 // Store as real_ip when disconnected (for security comparison)
-                if matches!(self.runtime.connection_state, ConnectionState::Disconnected) {
+                if !is_connected {
                     if self.runtime.real_ip.is_none() {
                         self.log(&format!("NET: Real IP detected: {ip}"));
                     }
@@ -789,7 +769,7 @@ impl App {
                 self.runtime.isp = isp;
             }
             TelemetryUpdate::Dns(dns) => {
-                if matches!(self.runtime.connection_state, ConnectionState::Disconnected) {
+                if !self.has_active_connection() {
                     if self.runtime.real_dns.is_none() {
                         self.log(&format!("NET: Pre-VPN DNS: {dns}"));
                     }
@@ -939,7 +919,6 @@ impl App {
         self.cleanup_vpn_resources(profile_name);
         self.runtime.pending_connect = None;
         if self.legacy_matches(profile_name) {
-            self.runtime.connection_state = ConnectionState::Disconnected;
             self.runtime.session_start = None;
         }
         self.mirror_disconnect_into_registry(profile_name);
@@ -955,13 +934,6 @@ impl App {
     /// legacy `Connecting` → `Connected` branch including kill-switch
     /// arm, `last_used` update, and metadata save.
     fn scanner_promote_to_connected(&mut self, profile_name: &str, session: &ActiveSession) {
-        let location = self
-            .runtime
-            .profiles
-            .iter()
-            .find(|p| p.name == profile_name)
-            .map_or_else(|| "Unknown".to_string(), |p| p.location.clone());
-
         let start_time = session
             .started_at
             .and_then(|real| {
@@ -972,32 +944,15 @@ impl App {
             })
             .unwrap_or_else(Instant::now);
 
-        let new_legacy = ConnectionState::Connected {
-            profile: profile_name.to_string(),
-            server_location: location,
-            since: start_time,
-            latency_ms: 0,
-            details: Box::new(DetailedConnectionInfo {
-                interface: session.interface.clone(),
-                internal_ip: session.internal_ip.clone(),
-                endpoint: session.endpoint.clone(),
-                mtu: session.mtu.clone(),
-                public_key: session.public_key.clone(),
-                listen_port: session.listen_port.clone(),
-                transfer_rx: session.transfer_rx.clone(),
-                transfer_tx: session.transfer_tx.clone(),
-                latest_handshake: session.latest_handshake.clone(),
-                pid: session.pid,
-            }),
-        };
-        let claim_legacy_slot = self.legacy_matches(profile_name) || self.legacy_is_disconnected();
-        if claim_legacy_slot {
-            self.runtime.connection_state = new_legacy;
+        // Track session_start for telemetry uptime when this profile
+        // is what the App considers primary (registry's primary, or
+        // any in-flight tunnel when none is primary yet).
+        if self.legacy_matches(profile_name) || self.legacy_is_disconnected() {
             self.runtime.session_start = Some(start_time);
         }
-        // Mirror regardless of which legacy slot is claimed — registry
-        // is the multi-tunnel source of truth.
-        self.mirror_connect_into_registry(profile_name);
+        // Push to registry directly from session details (single
+        // source of truth post-P5d).
+        self.refresh_registry_from_session(profile_name, session);
 
         self.log(&format!(
             "STATUS: Connection established to '{profile_name}'"
@@ -1024,51 +979,28 @@ impl App {
     /// and updates the registry; updates the legacy state only if it
     /// already tracks this profile.
     fn scanner_refresh_connected(&mut self, profile_name: &str, session: &ActiveSession) {
-        let real_start = session.started_at;
-        if let ConnectionState::Connected {
-            profile,
-            details,
-            since,
-            ..
-        } = &mut self.runtime.connection_state
-        {
-            if profile == profile_name {
-                if let Some(real) = real_start {
-                    if let Ok(duration) = std::time::SystemTime::now().duration_since(real) {
-                        let calculated_start = Instant::now()
-                            .checked_sub(duration)
-                            .unwrap_or(Instant::now());
-                        if since.elapsed().as_secs().abs_diff(duration.as_secs())
-                            > constants::SESSION_TIME_DRIFT_SECS
-                        {
-                            *since = calculated_start;
-                            self.runtime.session_start = Some(calculated_start);
-                        }
+        // Drift correction for session_start when this profile is the
+        // primary (or sole) active tunnel. Other multi-tunnel cases
+        // don't affect session_start since that's a single-slot field.
+        if self.legacy_matches(profile_name) {
+            if let Some(real) = session.started_at {
+                if let Ok(duration) = std::time::SystemTime::now().duration_since(real) {
+                    let calculated_start = Instant::now()
+                        .checked_sub(duration)
+                        .unwrap_or(Instant::now());
+                    let drift = self
+                        .runtime
+                        .session_start
+                        .map_or(0u64, |s| s.elapsed().as_secs().abs_diff(duration.as_secs()));
+                    if drift > constants::SESSION_TIME_DRIFT_SECS {
+                        self.runtime.session_start = Some(calculated_start);
                     }
                 }
-
-                details.interface.clone_from(&session.interface);
-                details.transfer_rx.clone_from(&session.transfer_rx);
-                details.transfer_tx.clone_from(&session.transfer_tx);
-                details
-                    .latest_handshake
-                    .clone_from(&session.latest_handshake);
-                details.internal_ip.clone_from(&session.internal_ip);
-                details.endpoint.clone_from(&session.endpoint);
-                details.mtu.clone_from(&session.mtu);
-                details.listen_port.clone_from(&session.listen_port);
-                details.public_key.clone_from(&session.public_key);
             }
         }
-        // Push to registry. mirror_connect_into_registry is idempotent
-        // and reads details from legacy state; if legacy doesn't match
-        // this profile (secondary tunnel case), we build a registry
-        // update directly from the session details below.
-        if self.legacy_matches(profile_name) {
-            self.mirror_connect_into_registry(profile_name);
-        } else {
-            self.refresh_registry_from_session(profile_name, session);
-        }
+        // Push kernel-truthful details to the registry — single source
+        // of truth after P5d.
+        self.refresh_registry_from_session(profile_name, session);
     }
 
     /// Scanner helper (P5b U-P5b-2): handle drop detection for a
@@ -1098,9 +1030,7 @@ impl App {
 
         utils::cleanup_openvpn_run_files(profile_name);
 
-        // Update legacy state only if this profile holds the slot.
         if self.legacy_matches(profile_name) {
-            self.runtime.connection_state = ConnectionState::Disconnected;
             self.runtime.session_start = None;
         }
         self.mirror_disconnect_into_registry(profile_name);
@@ -1167,12 +1097,6 @@ impl App {
     /// or vortix restarted while a tunnel was already up.
     fn scanner_adopt_session(&mut self, session: &ActiveSession) {
         let profile_name = session.name.clone();
-        let location = self
-            .runtime
-            .profiles
-            .iter()
-            .find(|p| p.name == profile_name)
-            .map_or_else(|| "Unknown".to_string(), |p| p.location.clone());
 
         let start_time = if let Some(real) = session.started_at {
             if let Ok(duration) = std::time::SystemTime::now().duration_since(real) {
@@ -1186,33 +1110,13 @@ impl App {
             self.runtime.session_start.unwrap_or(Instant::now())
         };
 
-        let new_legacy = ConnectionState::Connected {
-            profile: profile_name.clone(),
-            server_location: location,
-            since: start_time,
-            latency_ms: 0,
-            details: Box::new(DetailedConnectionInfo {
-                interface: session.interface.clone(),
-                internal_ip: session.internal_ip.clone(),
-                endpoint: session.endpoint.clone(),
-                mtu: session.mtu.clone(),
-                public_key: session.public_key.clone(),
-                listen_port: session.listen_port.clone(),
-                transfer_rx: session.transfer_rx.clone(),
-                transfer_tx: session.transfer_tx.clone(),
-                latest_handshake: session.latest_handshake.clone(),
-                pid: session.pid,
-            }),
-        };
-        // Claim the legacy slot if it's free (Disconnected) or if it
-        // already references this profile in a transitional state
-        // (Connecting/Disconnecting) — promoting that profile to
-        // Connected in the legacy field is the natural continuation.
-        let claim_legacy_slot = self.legacy_is_disconnected()
+        // First-tunnel adoption (Disconnected slot or this profile
+        // already in flight) updates session_start + logs the
+        // establishment; secondary tunnels just register silently.
+        let claim_primary_slot = self.legacy_is_disconnected()
             || self.legacy_matches_connecting(&profile_name)
             || self.legacy_matches_disconnecting(&profile_name);
-        if claim_legacy_slot {
-            self.runtime.connection_state = new_legacy;
+        if claim_primary_slot {
             if self.runtime.session_start.is_none() {
                 self.log(&format!(
                     "STATUS: Connection established to '{profile_name}'"
@@ -1223,19 +1127,20 @@ impl App {
                 self.log("INFO: Waiting for telemetry...");
             }
             self.runtime.session_start = Some(start_time);
-            self.mirror_connect_into_registry(&profile_name);
         } else {
             self.log(&format!(
                 "INFO: Adopting externally-started tunnel '{profile_name}' as a secondary"
             ));
-            self.refresh_registry_from_session(&profile_name, session);
         }
+        self.refresh_registry_from_session(&profile_name, session);
     }
 
-    /// Whether the legacy `runtime.connection_state` field refers to
-    /// the given profile in any non-Disconnected variant.
-    fn legacy_matches(&self, profile_name: &str) -> bool {
-        match &self.runtime.connection_state {
+    /// Whether the derived single-tunnel view refers to the given
+    /// profile in any non-Disconnected variant. Post-P5d this reads
+    /// the registry primary (or first non-Disconnected entry) instead
+    /// of a stored field.
+    pub(crate) fn legacy_matches(&self, profile_name: &str) -> bool {
+        match self.legacy_state() {
             ConnectionState::Connected { profile, .. }
             | ConnectionState::Connecting { profile, .. }
             | ConnectionState::Disconnecting { profile, .. } => profile == profile_name,
@@ -1243,22 +1148,22 @@ impl App {
         }
     }
 
-    fn legacy_matches_connecting(&self, profile_name: &str) -> bool {
+    pub(crate) fn legacy_matches_connecting(&self, profile_name: &str) -> bool {
         matches!(
-            &self.runtime.connection_state,
+            self.legacy_state(),
             ConnectionState::Connecting { profile, .. } if profile == profile_name
         )
     }
 
-    fn legacy_matches_disconnecting(&self, profile_name: &str) -> bool {
+    pub(crate) fn legacy_matches_disconnecting(&self, profile_name: &str) -> bool {
         matches!(
-            &self.runtime.connection_state,
+            self.legacy_state(),
             ConnectionState::Disconnecting { profile, .. } if profile == profile_name
         )
     }
 
-    fn legacy_is_disconnected(&self) -> bool {
-        matches!(self.runtime.connection_state, ConnectionState::Disconnected)
+    pub(crate) fn legacy_is_disconnected(&self) -> bool {
+        matches!(self.legacy_state(), ConnectionState::Disconnected)
     }
 
     fn handle_retry_connect(&mut self, idx: usize, attempt: u32) {
@@ -1283,8 +1188,8 @@ impl App {
             ));
             return;
         }
-        // Don't retry if user started a different action
-        if !matches!(self.runtime.connection_state, ConnectionState::Disconnected) {
+        // Don't retry if a tunnel is now in-flight on any profile.
+        if self.active_tunnel_count() > 0 {
             self.log("INFO: Skipping retry — connection state changed");
             if let Some(pid) = &profile_id_for_idx {
                 self.runtime.retry_state.remove(pid);
@@ -1306,7 +1211,8 @@ impl App {
     fn handle_network_changed(&mut self) {
         self.log("NET: Network change detected (gateway changed)");
 
-        match &self.runtime.connection_state {
+        let legacy = self.legacy_state();
+        match &legacy {
             ConnectionState::Connected { profile, .. } => {
                 self.log(&format!(
                     "NET: VPN '{profile}' still connected — monitoring for disruption"
@@ -1367,12 +1273,13 @@ impl App {
 
     fn handle_connection_timeout(&mut self, profile_name: String) {
         self.cleanup_vpn_resources(&profile_name);
-        self.runtime.connection_state = ConnectionState::Disconnected;
+        let profile_id = crate::vortix_core::profile::ProfileId::new(&profile_name);
         self.runtime.session_start = None;
         self.runtime.pending_connect = None;
-        self.runtime
-            .retry_state
-            .remove(&crate::vortix_core::profile::ProfileId::new(&profile_name));
+        self.runtime.retry_state.remove(&profile_id);
+        // Drop the in-flight registry entry so the renderers stop
+        // showing the phantom Connecting state.
+        self.registry.set_disconnected(&profile_id);
         self.log(&format!("ERR: Connection timed out for '{profile_name}'"));
         self.show_toast(
             format!("Connection timed out for '{profile_name}'"),
@@ -1384,12 +1291,11 @@ impl App {
 
     fn handle_tick(&mut self) {
         // 1. Connection Timeout Safeguard
-        if let ConnectionState::Connecting { started, profile } = &self.runtime.connection_state {
+        if let ConnectionState::Connecting { started, profile } = self.legacy_state() {
             if started.elapsed()
                 > std::time::Duration::from_secs(self.runtime.config.connect_timeout)
             {
-                let p = profile.clone();
-                self.handle_message(Message::ConnectionTimeout(p));
+                self.handle_message(Message::ConnectionTimeout(profile));
             }
         }
         // 1b. Multi-connection plan #001 U19 (D-3): detect primary-tunnel
@@ -1433,23 +1339,17 @@ impl App {
     fn handle_open_rename(&mut self) {
         if let Some(idx) = self.profile_list_state.selected() {
             if let Some(profile) = self.runtime.profiles.get(idx) {
-                let active_profile = match &self.runtime.connection_state {
-                    ConnectionState::Connected { profile: p, .. }
-                    | ConnectionState::Connecting { profile: p, .. }
-                    | ConnectionState::Disconnecting { profile: p, .. } => Some(p.as_str()),
-                    ConnectionState::Disconnected => None,
-                };
-                if active_profile == Some(&profile.name) {
+                let profile_name = profile.name.clone();
+                if self.is_profile_active(&profile_name) {
                     self.show_toast(
                         "Cannot rename an active profile — disconnect first".to_string(),
                         ToastType::Warning,
                     );
                 } else {
-                    let name = profile.name.clone();
-                    let char_len = name.chars().count();
+                    let char_len = profile_name.chars().count();
                     self.input_mode = InputMode::Rename {
                         index: idx,
-                        new_name: name,
+                        new_name: profile_name,
                         cursor: char_len,
                     };
                 }

@@ -5,7 +5,7 @@
 
 use vortix::cli::output::{error_response, CliError, CliResponse, ExitCode, OutputMode};
 use vortix::state::{KillSwitchMode, KillSwitchState, Protocol, VpnProfile};
-use vortix::vpn_runtime::{ConnectionState, VpnRuntime};
+use vortix::vpn_runtime::VpnRuntime;
 
 // ============================================================================
 // VpnRuntime headless mode
@@ -13,14 +13,15 @@ use vortix::vpn_runtime::{ConnectionState, VpnRuntime};
 
 #[test]
 fn engine_new_headless_starts_disconnected() {
+    // P5d: the legacy `connection_state` field was retired; a fresh
+    // headless engine carries no active tunnels — verified via the
+    // scanner-driven `scan_status` snapshot below.
     let config = vortix::config::AppConfig::default();
     let dir = tempfile::tempdir().unwrap();
     let engine = VpnRuntime::new_headless(config, dir.path().to_path_buf());
-    assert!(matches!(
-        engine.connection_state,
-        ConnectionState::Disconnected
-    ));
     assert!(!engine.is_root); // tests run unprivileged
+    let snap = engine.scan_status();
+    assert_eq!(snap.connection_state, "disconnected");
 }
 
 #[test]

@@ -61,26 +61,16 @@ fn test_app() -> App {
 /// the same via `mirror_connect_into_registry` on every successful
 /// connect.
 fn set_connected(app: &mut App, name: &str) {
-    // mirror_connect_into_registry no-ops when the profile isn't in
-    // the catalog; auto-add so test helpers leave a fully-populated
-    // registry entry regardless of whether the caller invoked
-    // `add_profiles` first.
     if !app.runtime.profiles.iter().any(|p| p.name == name) {
         add_profiles(app, &[name]);
     }
     app.runtime.session_start = Some(Instant::now());
-    app.runtime.connection_state = ConnectionState::Connected {
-        since: Instant::now(),
-        profile: name.to_string(),
-        server_location: "Test".to_string(),
-        latency_ms: 10,
-        details: Box::new(DetailedConnectionInfo {
-            interface: "wg0".to_string(),
-            pid: Some(12345),
-            ..Default::default()
-        }),
+    let details = DetailedConnectionInfo {
+        interface: "wg0".to_string(),
+        pid: Some(12345),
+        ..Default::default()
     };
-    app.mirror_connect_into_registry(name);
+    app.mirror_connect_into_registry(name, &details, Instant::now());
 }
 
 /// Helper: put app into a Disconnecting state for a given profile name.
@@ -97,10 +87,6 @@ fn set_disconnecting(app: &mut App, name: &str) {
     if app.registry.snapshot(&ProfileId::new(name)).is_none() {
         set_connected(app, name);
     }
-    app.runtime.connection_state = ConnectionState::Disconnecting {
-        started: Instant::now(),
-        profile: name.to_string(),
-    };
     app.mirror_disconnecting_into_registry(name);
 }
 
@@ -138,7 +124,7 @@ fn test_disconnect_result_success_transitions_to_disconnected() {
     });
 
     assert!(
-        matches!(app.runtime.connection_state, ConnectionState::Disconnected),
+        matches!(app.legacy_state(), ConnectionState::Disconnected),
         "Expected Disconnected after successful DisconnectResult"
     );
     assert!(app.runtime.session_start.is_none());
@@ -156,10 +142,7 @@ fn test_disconnect_result_failure_stays_disconnecting() {
     });
 
     assert!(
-        matches!(
-            app.runtime.connection_state,
-            ConnectionState::Disconnecting { .. }
-        ),
+        matches!(app.legacy_state(), ConnectionState::Disconnecting { .. }),
         "Should remain Disconnecting after failed disconnect (VPN may still be running)"
     );
     let toast = app.toast.as_ref().expect("toast should be set");
@@ -171,7 +154,7 @@ fn test_disconnect_result_failure_stays_disconnecting() {
 #[test]
 fn test_disconnect_result_success_from_non_disconnecting_state() {
     let mut app = test_app();
-    app.runtime.connection_state = ConnectionState::Disconnected;
+    // Disconnected = empty registry; nothing to set up explicitly.
 
     app.handle_message(Message::DisconnectResult {
         profile: "test-vpn".to_string(),
@@ -179,10 +162,7 @@ fn test_disconnect_result_success_from_non_disconnecting_state() {
         error: None,
     });
 
-    assert!(matches!(
-        app.runtime.connection_state,
-        ConnectionState::Disconnected
-    ));
+    assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
 }
 
 // ====================================================================
@@ -198,12 +178,9 @@ fn test_scanner_never_overrides_disconnecting_to_connected() {
     app.handle_message(Message::SyncSystemState(sessions));
 
     assert!(
-        matches!(
-            app.runtime.connection_state,
-            ConnectionState::Disconnecting { .. }
-        ),
+        matches!(app.legacy_state(), ConnectionState::Disconnecting { .. }),
         "Scanner must never override Disconnecting to Connected, got {:?}",
-        app.runtime.connection_state
+        app.legacy_state()
     );
 }
 
@@ -215,7 +192,7 @@ fn test_scanner_confirms_disconnect_when_interface_gone() {
     app.handle_message(Message::SyncSystemState(vec![]));
 
     assert!(
-        matches!(app.runtime.connection_state, ConnectionState::Disconnected),
+        matches!(app.legacy_state(), ConnectionState::Disconnected),
         "Scanner should confirm Disconnected when interface is gone"
     );
     assert!(app.runtime.session_start.is_none());
@@ -226,17 +203,10 @@ fn test_scanner_safety_timeout_after_30s() {
     use crate::vortix_core::profile::ProfileId;
 
     let mut app = test_app();
-    // Seed both legacy + registry with a Disconnecting entry whose
-    // started_at is 31s in the past. The registry's set_disconnecting
-    // is a no-op without a prior Connected entry, so set_connected
-    // first; then transition with the back-dated SystemTime.
+    // Seed the registry with a Disconnecting entry whose started_at
+    // is 31s in the past. set_disconnecting is a no-op without a
+    // prior Connected entry, so set_connected first.
     set_connected(&mut app, "test-vpn");
-    app.runtime.connection_state = ConnectionState::Disconnecting {
-        started: Instant::now()
-            .checked_sub(std::time::Duration::from_secs(31))
-            .unwrap(),
-        profile: "test-vpn".to_string(),
-    };
     let past = std::time::SystemTime::now() - std::time::Duration::from_secs(31);
     app.registry
         .set_disconnecting(&ProfileId::new("test-vpn"), past);
@@ -245,7 +215,7 @@ fn test_scanner_safety_timeout_after_30s() {
     app.handle_message(Message::SyncSystemState(sessions));
 
     assert!(
-        matches!(app.runtime.connection_state, ConnectionState::Disconnected),
+        matches!(app.legacy_state(), ConnectionState::Disconnected),
         "Should time out to Disconnected after 30s"
     );
     let toast = app.toast.as_ref().expect("timeout should show toast");
@@ -262,7 +232,7 @@ fn test_scanner_disconnecting_does_not_affect_other_profiles() {
     app.handle_message(Message::SyncSystemState(sessions));
 
     assert!(
-        matches!(app.runtime.connection_state, ConnectionState::Disconnected),
+        matches!(app.legacy_state(), ConnectionState::Disconnected),
         "Should detect our profile is gone even if other profiles are active"
     );
 }
@@ -277,21 +247,20 @@ fn test_d_while_disconnecting_escalates_to_force() {
     set_disconnecting(&mut app, "test-vpn");
     add_profiles(&mut app, &["test-vpn"]);
 
-    let before =
-        if let ConnectionState::Disconnecting { started, .. } = &app.runtime.connection_state {
-            *started
-        } else {
-            panic!("expected Disconnecting");
-        };
+    let before = if let ConnectionState::Disconnecting { started, .. } = &app.legacy_state() {
+        *started
+    } else {
+        panic!("expected Disconnecting");
+    };
 
     app.handle_message(Message::Disconnect);
 
     assert!(matches!(
-        app.runtime.connection_state,
+        app.legacy_state(),
         ConnectionState::Disconnecting { .. }
     ));
 
-    if let ConnectionState::Disconnecting { started, .. } = &app.runtime.connection_state {
+    if let ConnectionState::Disconnecting { started, .. } = &app.legacy_state() {
         assert!(*started >= before);
     }
 
@@ -304,10 +273,7 @@ fn test_d_while_disconnecting_escalates_to_force() {
 fn test_d_while_disconnected_is_noop() {
     let mut app = test_app();
     app.handle_message(Message::Disconnect);
-    assert!(matches!(
-        app.runtime.connection_state,
-        ConnectionState::Disconnected
-    ));
+    assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
 }
 
 // ====================================================================
@@ -324,10 +290,6 @@ fn set_connecting(app: &mut App, name: &str) {
     if !app.runtime.profiles.iter().any(|p| p.name == name) {
         add_profiles(app, &[name]);
     }
-    app.runtime.connection_state = ConnectionState::Connecting {
-        started: Instant::now(),
-        profile: name.to_string(),
-    };
     app.mirror_connecting_into_registry(name);
 }
 
@@ -395,12 +357,9 @@ fn confirm_default_route_takeover_message_runs_multi_connect_path() {
         app.runtime.pending_connect
     );
     assert!(
-        !matches!(
-            app.runtime.connection_state,
-            ConnectionState::Disconnecting { .. }
-        ),
+        !matches!(app.legacy_state(), ConnectionState::Disconnecting { .. }),
         "multi-connect path must not transition to Disconnecting; got {:?}",
-        app.runtime.connection_state
+        app.legacy_state()
     );
     // Note: `connection_state` is the legacy single-tunnel mirror —
     // it can only hold one profile at a time, so vpn-b's connect
@@ -421,10 +380,7 @@ fn mirror_connecting_makes_registry_hold_connecting_state() {
     // until the worker thread's success reply.
     let mut app = test_app();
     add_profiles(&mut app, &["vpn-a"]);
-    app.runtime.connection_state = ConnectionState::Connecting {
-        started: Instant::now(),
-        profile: "vpn-a".to_string(),
-    };
+    set_connecting(&mut app, "vpn-a");
     app.mirror_connecting_into_registry("vpn-a");
 
     let snap = app
@@ -450,10 +406,7 @@ fn mirror_disconnecting_transitions_existing_connected_entry() {
     let mut app = test_app();
     add_profiles(&mut app, &["vpn-a"]);
     // Seed Connected first via the existing scanner promotion path.
-    app.runtime.connection_state = ConnectionState::Connecting {
-        started: Instant::now(),
-        profile: "vpn-a".to_string(),
-    };
+    set_connecting(&mut app, "vpn-a");
     app.handle_message(Message::SyncSystemState(vec![fake_session("vpn-a")]));
     assert!(matches!(
         app.registry
@@ -503,10 +456,7 @@ fn mirror_failed_makes_registry_hold_disconnected_with_failure() {
     // overwrites with Connecting) or explicitly clears.
     let mut app = test_app();
     add_profiles(&mut app, &["vpn-a"]);
-    app.runtime.connection_state = ConnectionState::Connecting {
-        started: Instant::now(),
-        profile: "vpn-a".to_string(),
-    };
+    set_connecting(&mut app, "vpn-a");
 
     // Worker thread reports failure.
     app.handle_message(Message::ConnectResult {
@@ -563,12 +513,9 @@ fn takeover_y_key_dispatches_switch_path() {
         "vpn-b should be queued for after-disconnect connect"
     );
     assert!(
-        matches!(
-            app.runtime.connection_state,
-            ConnectionState::Disconnecting { .. }
-        ),
+        matches!(app.legacy_state(), ConnectionState::Disconnecting { .. }),
         "expected Disconnecting state, got {:?}",
-        app.runtime.connection_state
+        app.legacy_state()
     );
     // Overlay closes after the keypress is handled.
     assert!(matches!(app.input_mode, InputMode::Normal));
@@ -598,12 +545,9 @@ fn takeover_b_key_dispatches_multi_connect_path() {
         "multi-connect path must not queue a pending_connect"
     );
     assert!(
-        !matches!(
-            app.runtime.connection_state,
-            ConnectionState::Disconnecting { .. }
-        ),
+        !matches!(app.legacy_state(), ConnectionState::Disconnecting { .. }),
         "multi-connect path must not transition to Disconnecting; got {:?}",
-        app.runtime.connection_state
+        app.legacy_state()
     );
     assert!(matches!(app.input_mode, InputMode::Normal));
 }
@@ -623,10 +567,7 @@ fn switch_path_disconnect_completion_removes_old_profile_from_registry() {
     add_profiles(&mut app, &["vpn-a", "vpn-b"]);
 
     // Set up vpn-a fully connected, mirrored into the registry.
-    app.runtime.connection_state = ConnectionState::Connecting {
-        started: Instant::now(),
-        profile: "vpn-a".to_string(),
-    };
+    set_connecting(&mut app, "vpn-a");
     app.handle_message(Message::SyncSystemState(vec![fake_session("vpn-a")]));
     assert_eq!(app.registry.tunnel_count(), 1, "setup precondition");
 
@@ -643,10 +584,7 @@ fn switch_path_disconnect_completion_removes_old_profile_from_registry() {
         "setup precondition: pending switch queued"
     );
     assert!(
-        matches!(
-            app.runtime.connection_state,
-            ConnectionState::Disconnecting { .. }
-        ),
+        matches!(app.legacy_state(), ConnectionState::Disconnecting { .. }),
         "setup precondition"
     );
 
@@ -678,7 +616,7 @@ fn takeover_capital_b_also_dispatches_multi_connect() {
 
     assert!(app.runtime.pending_connect.is_none());
     assert!(!matches!(
-        app.runtime.connection_state,
+        app.legacy_state(),
         ConnectionState::Disconnecting { .. }
     ));
 }
@@ -695,9 +633,11 @@ fn test_toggle_connected_same_profile_disconnects_without_pending() {
         app.runtime.pending_connect, None,
         "Same-profile toggle should not set pending"
     );
-    assert!(matches!(
-        app.runtime.connection_state,
-        ConnectionState::Disconnecting { .. }
+    // P5d: registry.disconnect drives the FSM through the placeholder
+    // MockTunnel synchronously, so the tunnel ends Disconnected.
+    assert!(!matches!(
+        app.legacy_state(),
+        ConnectionState::Connected { .. }
     ));
 }
 
@@ -711,7 +651,7 @@ fn test_toggle_while_disconnecting_queues_pending() {
 
     assert_eq!(app.runtime.pending_connect, Some(1));
     assert!(matches!(
-        app.runtime.connection_state,
+        app.legacy_state(),
         ConnectionState::Disconnecting { .. }
     ));
 }
@@ -725,7 +665,7 @@ fn test_toggle_while_connecting_is_rejected() {
     app.toggle_connection(1);
 
     assert!(matches!(
-        app.runtime.connection_state,
+        app.legacy_state(),
         ConnectionState::Connecting { .. }
     ));
     assert_eq!(app.runtime.pending_connect, None);
@@ -747,9 +687,9 @@ fn test_pending_connect_drained_on_disconnect_success() {
 
     assert_eq!(app.runtime.pending_connect, None);
     assert!(
-        matches!(app.runtime.connection_state, ConnectionState::Connecting { ref profile, .. } if profile == "vpn-b"),
+        matches!(app.legacy_state(), ConnectionState::Connecting { ref profile, .. } if profile == "vpn-b"),
         "Expected Connecting to vpn-b, got {:?}",
-        app.runtime.connection_state
+        app.legacy_state()
     );
 }
 
@@ -765,7 +705,7 @@ fn test_pending_connect_drained_on_scanner_interface_gone() {
 
     assert_eq!(app.runtime.pending_connect, None);
     assert!(
-        matches!(app.runtime.connection_state, ConnectionState::Connecting { ref profile, .. } if profile == "vpn-b"),
+        matches!(app.legacy_state(), ConnectionState::Connecting { ref profile, .. } if profile == "vpn-b"),
         "Expected auto-connect to vpn-b after scanner confirms disconnect"
     );
 }
@@ -786,10 +726,7 @@ fn test_pending_preserved_on_disconnect_failure() {
     // pending_connect is preserved so it can fire after force-disconnect
     assert_eq!(app.runtime.pending_connect, Some(1));
     assert!(
-        matches!(
-            app.runtime.connection_state,
-            ConnectionState::Disconnecting { .. }
-        ),
+        matches!(app.legacy_state(), ConnectionState::Disconnecting { .. }),
         "Should remain Disconnecting after failed disconnect"
     );
 }
@@ -803,12 +740,6 @@ fn test_pending_cleared_on_30s_timeout() {
     // Seed Connected then back-date the Disconnecting transition by
     // 31s so the scanner's per-profile timeout branch fires.
     set_connected(&mut app, "vpn-a");
-    app.runtime.connection_state = ConnectionState::Disconnecting {
-        started: Instant::now()
-            .checked_sub(std::time::Duration::from_secs(31))
-            .unwrap(),
-        profile: "vpn-a".to_string(),
-    };
     let past = std::time::SystemTime::now() - std::time::Duration::from_secs(31);
     app.registry
         .set_disconnecting(&ProfileId::new("vpn-a"), past);
@@ -818,10 +749,7 @@ fn test_pending_cleared_on_30s_timeout() {
     app.handle_message(Message::SyncSystemState(sessions));
 
     assert_eq!(app.runtime.pending_connect, None);
-    assert!(matches!(
-        app.runtime.connection_state,
-        ConnectionState::Disconnected
-    ));
+    assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
 }
 
 // ====================================================================
@@ -841,7 +769,7 @@ fn test_connect_result_success_transitions_to_connected() {
     });
 
     assert!(
-        matches!(app.runtime.connection_state, ConnectionState::Connected { ref profile, .. } if profile == "test-vpn"),
+        matches!(app.legacy_state(), ConnectionState::Connected { ref profile, .. } if profile == "test-vpn"),
         "Successful ConnectResult should transition to Connected"
     );
 }
@@ -862,7 +790,7 @@ fn test_connect_result_failure_transitions_to_disconnected() {
     });
 
     assert!(
-        matches!(app.runtime.connection_state, ConnectionState::Disconnected),
+        matches!(app.legacy_state(), ConnectionState::Disconnected),
         "Failed ConnectResult should transition to Disconnected"
     );
     let toast = app.toast.as_ref().expect("should show error toast");
@@ -901,12 +829,9 @@ fn test_disconnect_from_connecting_state() {
     app.disconnect();
 
     assert!(
-        matches!(
-            app.runtime.connection_state,
-            ConnectionState::Disconnecting { .. }
-        ),
+        matches!(app.legacy_state(), ConnectionState::Disconnecting { .. }),
         "disconnect() should work from Connecting state, got {:?}",
-        app.runtime.connection_state
+        app.legacy_state()
     );
 }
 
@@ -919,10 +844,7 @@ fn test_d_key_from_connecting_state_disconnects() {
     app.handle_message(Message::Disconnect);
 
     assert!(
-        matches!(
-            app.runtime.connection_state,
-            ConnectionState::Disconnecting { .. }
-        ),
+        matches!(app.legacy_state(), ConnectionState::Disconnecting { .. }),
         "d key should cancel Connecting state"
     );
 }
@@ -941,10 +863,7 @@ fn test_reconnect_sets_pending_not_immediate_connect() {
 
     assert_eq!(app.runtime.pending_connect, Some(0));
     assert!(
-        matches!(
-            app.runtime.connection_state,
-            ConnectionState::Disconnecting { .. }
-        ),
+        matches!(app.legacy_state(), ConnectionState::Disconnecting { .. }),
         "Reconnect should disconnect first"
     );
 }
@@ -965,7 +884,7 @@ fn test_reconnect_auto_connects_after_disconnect_completes() {
 
     assert_eq!(app.runtime.pending_connect, None);
     assert!(
-        matches!(app.runtime.connection_state, ConnectionState::Connecting { ref profile, .. } if profile == "test-vpn"),
+        matches!(app.legacy_state(), ConnectionState::Connecting { ref profile, .. } if profile == "test-vpn"),
         "Reconnect should auto-connect after disconnect"
     );
 }
@@ -1018,10 +937,7 @@ fn test_quick_connect_from_disconnected() {
     app.handle_message(Message::QuickConnect(0));
 
     assert!(
-        matches!(
-            app.runtime.connection_state,
-            ConnectionState::Connecting { .. }
-        ),
+        matches!(app.legacy_state(), ConnectionState::Connecting { .. }),
         "QuickConnect from Disconnected should go to Connecting"
     );
     assert_eq!(app.runtime.pending_connect, None);
@@ -1090,7 +1006,7 @@ fn test_auth_prompt_shown_for_openvpn_with_auth_user_pass() {
         "OpenVPN with auth-user-pass and no saved creds should show AuthPrompt"
     );
     assert!(
-        matches!(app.runtime.connection_state, ConnectionState::Disconnected),
+        matches!(app.legacy_state(), ConnectionState::Disconnected),
         "Should not start connecting before credentials are provided"
     );
 }
@@ -1114,10 +1030,7 @@ fn test_auth_prompt_skipped_when_creds_saved() {
         "Should not show AuthPrompt when creds are already saved"
     );
     assert!(
-        matches!(
-            app.runtime.connection_state,
-            ConnectionState::Connecting { .. }
-        ),
+        matches!(app.legacy_state(), ConnectionState::Connecting { .. }),
         "Should proceed to Connecting with saved credentials"
     );
 
@@ -1155,10 +1068,7 @@ fn test_auth_prompt_skipped_for_openvpn_without_auth_directive() {
         "OpenVPN without auth-user-pass should not show AuthPrompt"
     );
     assert!(
-        matches!(
-            app.runtime.connection_state,
-            ConnectionState::Connecting { .. }
-        ),
+        matches!(app.legacy_state(), ConnectionState::Connecting { .. }),
         "Should proceed to Connecting directly"
     );
 }
@@ -1185,10 +1095,7 @@ fn test_auth_submit_triggers_connect() {
 
     assert_eq!(app.input_mode, InputMode::Normal);
     assert!(
-        matches!(
-            app.runtime.connection_state,
-            ConnectionState::Connecting { .. }
-        ),
+        matches!(app.legacy_state(), ConnectionState::Connecting { .. }),
         "AuthSubmit should trigger connect_profile"
     );
 
@@ -1219,7 +1126,7 @@ fn test_auth_cancel_returns_to_normal() {
     app.handle_message(Message::CloseOverlay);
     assert_eq!(app.input_mode, InputMode::Normal);
     assert!(
-        matches!(app.runtime.connection_state, ConnectionState::Disconnected),
+        matches!(app.legacy_state(), ConnectionState::Disconnected),
         "Cancelling auth should keep Disconnected state"
     );
 }
@@ -1385,7 +1292,7 @@ fn test_reconnect_from_disconnected_with_last_profile() {
     app.reconnect();
 
     assert!(
-        matches!(app.runtime.connection_state, ConnectionState::Connecting { ref profile, .. } if profile == "my-vpn"),
+        matches!(app.legacy_state(), ConnectionState::Connecting { ref profile, .. } if profile == "my-vpn"),
         "Should initiate connection to last used profile"
     );
 }
@@ -1399,7 +1306,7 @@ fn test_reconnect_from_disconnected_without_last_profile_is_noop() {
     app.reconnect();
 
     assert!(
-        matches!(app.runtime.connection_state, ConnectionState::Disconnected),
+        matches!(app.legacy_state(), ConnectionState::Disconnected),
         "Should stay disconnected when no last_connected_profile"
     );
 }
@@ -1410,12 +1317,7 @@ fn test_reconnect_from_disconnected_without_last_profile_is_noop() {
 fn test_connection_timeout_shows_error_toast() {
     let mut app = test_app();
     add_profiles(&mut app, &["timeout-vpn"]);
-    app.runtime.connection_state = ConnectionState::Connecting {
-        started: Instant::now()
-            .checked_sub(std::time::Duration::from_secs(60))
-            .unwrap(),
-        profile: "timeout-vpn".to_string(),
-    };
+    set_connecting(&mut app, "timeout-vpn");
 
     app.handle_message(Message::ConnectionTimeout("timeout-vpn".to_string()));
 
@@ -1433,10 +1335,7 @@ fn test_connection_timeout_shows_error_toast() {
 fn test_last_connected_profile_set_on_connect_success() {
     let mut app = test_app();
     add_profiles(&mut app, &["success-vpn"]);
-    app.runtime.connection_state = ConnectionState::Connecting {
-        started: Instant::now(),
-        profile: "success-vpn".to_string(),
-    };
+    set_connecting(&mut app, "success-vpn");
 
     app.handle_message(Message::ConnectResult {
         profile: "success-vpn".to_string(),
@@ -1628,10 +1527,7 @@ fn test_confirm_switch_when_already_disconnected_connects_directly() {
     app.profile_list_state.select(Some(0));
     app.runtime.is_root = true;
 
-    assert!(matches!(
-        app.runtime.connection_state,
-        ConnectionState::Disconnected
-    ));
+    assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
 
     app.handle_message(Message::ConfirmDefaultRouteTakeover { idx: 1 });
 
@@ -1640,9 +1536,9 @@ fn test_confirm_switch_when_already_disconnected_connects_directly() {
         "Should not set pending_connect when already disconnected"
     );
     assert!(
-        matches!(app.runtime.connection_state, ConnectionState::Connecting { ref profile, .. } if profile == "vpn-b"),
+        matches!(app.legacy_state(), ConnectionState::Connecting { ref profile, .. } if profile == "vpn-b"),
         "Should connect directly when already disconnected, got {:?}",
-        app.runtime.connection_state
+        app.legacy_state()
     );
 }
 
@@ -2024,7 +1920,12 @@ fn test_rename_updates_last_connected_profile() {
 }
 
 #[test]
-fn test_rename_updates_connected_state() {
+fn test_rename_on_active_profile_is_refused_at_overlay() {
+    // Post-P5d the legacy connection_state field is gone, and the
+    // rename path no longer mutates an in-flight state. Active
+    // profiles are blocked at the overlay-open step
+    // (`handle_open_rename` consults `is_profile_active`); the test
+    // here exercises that guard.
     let mut app = test_app();
     let dir = tempfile::tempdir().unwrap();
     let conf_path = dir.path().join("active-vpn.conf");
@@ -2037,36 +1938,20 @@ fn test_rename_updates_connected_state() {
         last_used: None,
     });
     app.profile_list_state.select(Some(0));
-    app.runtime.connection_state = ConnectionState::Connected {
-        profile: "active-vpn".to_string(),
-        server_location: "Test".to_string(),
-        since: Instant::now(),
-        latency_ms: 0,
-        details: Box::new(DetailedConnectionInfo::default()),
-    };
+    set_connected(&mut app, "active-vpn");
 
-    app.rename_profile(0, "renamed-vpn");
-    if let ConnectionState::Connected { profile, .. } = &app.runtime.connection_state {
-        assert_eq!(
-            profile, "renamed-vpn",
-            "Rename should update connection_state profile name"
-        );
-    } else {
-        panic!("Should still be connected");
-    }
+    app.handle_message(Message::OpenRename);
+    assert!(
+        !matches!(app.input_mode, InputMode::Rename { .. }),
+        "Rename overlay must refuse to open for an active profile"
+    );
 }
 
 #[test]
 fn test_ip_unchanged_warning_fires_once() {
     use crate::core::telemetry::TelemetryUpdate;
     let mut app = test_app();
-    app.runtime.connection_state = ConnectionState::Connected {
-        profile: "test".to_string(),
-        server_location: "Test".to_string(),
-        since: Instant::now(),
-        latency_ms: 0,
-        details: Box::new(DetailedConnectionInfo::default()),
-    };
+    set_connected(&mut app, "test");
     app.runtime.public_ip = "1.2.3.4".to_string();
 
     app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIp(
@@ -2123,11 +2008,8 @@ fn test_connect_selected_targets_sidebar_selection() {
     app.profile_list_state.select(Some(1));
 
     // Verify ConnectSelected dispatches toggle_connection for the selected index.
-    // Transition to Disconnecting first so toggle_connection queues pending_connect.
-    app.runtime.connection_state = ConnectionState::Disconnecting {
-        profile: "alpha".to_string(),
-        started: Instant::now(),
-    };
+    // Seed Disconnecting on alpha so toggle_connection queues pending_connect.
+    set_disconnecting(&mut app, "alpha");
     app.handle_message(Message::ConnectSelected);
     assert_eq!(
         app.runtime.pending_connect,
@@ -2141,13 +2023,7 @@ fn test_connect_selected_reconnects_active_profile() {
     let mut app = test_app();
     add_profiles(&mut app, &["alpha", "beta"]);
     app.profile_list_state.select(Some(0));
-    app.runtime.connection_state = ConnectionState::Connected {
-        profile: "alpha".to_string(),
-        server_location: "Test".to_string(),
-        since: Instant::now(),
-        latency_ms: 0,
-        details: Box::new(DetailedConnectionInfo::default()),
-    };
+    set_connected(&mut app, "alpha");
 
     app.handle_message(Message::ConnectSelected);
     assert_eq!(
@@ -2156,10 +2032,7 @@ fn test_connect_selected_reconnects_active_profile() {
         "ConnectSelected on active profile should queue reconnect"
     );
     assert!(
-        matches!(
-            app.runtime.connection_state,
-            ConnectionState::Disconnecting { .. }
-        ),
+        matches!(app.legacy_state(), ConnectionState::Disconnecting { .. }),
         "Should start disconnecting for reconnect"
     );
 }
@@ -2519,22 +2392,24 @@ fn u19_enter_on_connected_primary_routes_to_disconnect() {
 
     app.handle_message(Message::ToggleConnect(Some(0)));
 
-    // The legacy single-tunnel disconnect transitions to Disconnecting.
+    // P5d: registry.disconnect drives the FSM synchronously through
+    // the placeholder MockTunnel which returns Ok immediately, so the
+    // tunnel transitions Connected → Disconnecting → Disconnected in
+    // one synchronous call. The user-visible expectation is "no
+    // longer active" — both Disconnecting and Disconnected satisfy that.
     assert!(
-        matches!(
-            app.runtime.connection_state,
-            ConnectionState::Disconnecting { .. }
-        ),
-        "expected Disconnecting after Enter on Connected, got {:?}",
-        app.runtime.connection_state
+        !matches!(app.legacy_state(), ConnectionState::Connected { .. }),
+        "expected tunnel torn down after Enter on Connected, got {:?}",
+        app.legacy_state()
     );
 }
 
 #[test]
 fn u19_disconnect_profile_message_disconnects_legacy_match() {
-    // `DisconnectProfile { idx }` on the legacy primary's row drives the
-    // existing single-tunnel disconnect (registry is empty in this test
-    // environment, so the fallback path fires).
+    // `DisconnectProfile { idx }` on the active row drives the
+    // registry disconnect path. With the placeholder MockTunnel that
+    // returns Ok synchronously, the tunnel ends in Disconnected
+    // immediately rather than lingering in Disconnecting.
     let mut app = test_app();
     add_profiles(&mut app, &["p1"]);
     set_connected(&mut app, "p1");
@@ -2542,12 +2417,9 @@ fn u19_disconnect_profile_message_disconnects_legacy_match() {
     app.handle_message(Message::DisconnectProfile { idx: 0 });
 
     assert!(
-        matches!(
-            app.runtime.connection_state,
-            ConnectionState::Disconnecting { .. }
-        ),
-        "expected legacy disconnect to fire, got {:?}",
-        app.runtime.connection_state
+        !matches!(app.legacy_state(), ConnectionState::Connected { .. }),
+        "expected the tunnel torn down, got {:?}",
+        app.legacy_state()
     );
 }
 
@@ -2566,12 +2438,9 @@ fn u19_disconnect_profile_idempotent_for_inactive_row() {
     app.handle_message(Message::DisconnectProfile { idx: 1 });
 
     assert!(
-        matches!(
-            app.runtime.connection_state,
-            ConnectionState::Connected { .. }
-        ),
+        matches!(app.legacy_state(), ConnectionState::Connected { .. }),
         "DisconnectProfile on inactive row must leave Connected state intact, got {:?}",
-        app.runtime.connection_state,
+        app.legacy_state(),
     );
 }
 
@@ -2661,12 +2530,12 @@ fn u19_confirm_disconnect_all_closes_overlay() {
     app.handle_message(Message::ConfirmDisconnectAll);
 
     assert!(matches!(app.input_mode, InputMode::Normal));
+    // P5d: MockTunnel returns Ok synchronously, so the tunnel is torn
+    // down to Disconnected immediately rather than lingering in
+    // Disconnecting.
     assert!(
-        matches!(
-            app.runtime.connection_state,
-            ConnectionState::Disconnecting { .. }
-        ),
-        "confirm-disconnect-all must drive disconnect on the active legacy tunnel"
+        !matches!(app.legacy_state(), ConnectionState::Connected { .. }),
+        "confirm-disconnect-all must tear down the active tunnel"
     );
 }
 
@@ -2702,23 +2571,19 @@ fn u19_profile_move_clears_connection_details_focus_override() {
 #[test]
 fn u19_cancel_connect_message_drives_disconnect_on_legacy_connecting() {
     // `c` on a Connecting row's Connection Details cancels the in-flight
-    // connect. The legacy fallback transitions Connecting → Disconnecting.
+    // connect. Post-P5d the registry's FSM tears down through the
+    // MockTunnel synchronously; the tunnel ends up in a non-Connecting
+    // state (Disconnecting briefly, then Disconnected once down() returns).
     let mut app = test_app();
     add_profiles(&mut app, &["p1"]);
-    app.runtime.connection_state = ConnectionState::Connecting {
-        started: Instant::now(),
-        profile: "p1".to_string(),
-    };
+    set_connecting(&mut app, "p1");
 
     app.handle_message(Message::CancelConnect { idx: 0 });
 
     assert!(
-        matches!(
-            app.runtime.connection_state,
-            ConnectionState::Disconnecting { .. }
-        ),
-        "CancelConnect must drive Connecting → Disconnecting on legacy state, got {:?}",
-        app.runtime.connection_state
+        !matches!(app.legacy_state(), ConnectionState::Connecting { .. }),
+        "CancelConnect must move tunnel out of Connecting, got {:?}",
+        app.legacy_state()
     );
 }
 
@@ -2783,7 +2648,7 @@ fn u19_u_keybinding_is_inert_when_no_banner() {
     // routing (which today has no `u` binding) — no state change.
     let mut app = test_app();
     add_profiles(&mut app, &["p1"]);
-    let initial_state = matches!(app.runtime.connection_state, ConnectionState::Disconnected);
+    let initial_state = matches!(app.legacy_state(), ConnectionState::Disconnected);
 
     app.handle_key(key_char('u'));
 
@@ -2850,7 +2715,7 @@ fn u19_confirm_disconnect_all_overlay_n_key_cancels() {
     assert!(matches!(app.input_mode, InputMode::Normal));
     // Connection state untouched.
     assert!(matches!(
-        app.runtime.connection_state,
+        app.legacy_state(),
         ConnectionState::Connected { .. }
     ));
 }
@@ -2874,16 +2739,12 @@ fn connect_result_success_mirrors_into_registry() {
 
     let mut app = test_app();
     add_profiles(&mut app, &["mirror-test"]);
-    // Pre-spawn state: the connect path sets Connecting before
-    // dispatching the worker thread.
-    app.runtime.connection_state = ConnectionState::Connecting {
-        started: Instant::now(),
-        profile: "mirror-test".to_string(),
-    };
-
-    // Pre-condition: registry is empty even though the user just
-    // pressed `1` and the worker thread is running.
-    assert_eq!(app.registry.tunnel_count(), 0);
+    // Pre-spawn state: set_connecting now mirrors the Connecting
+    // transition into the registry directly (P5d removed the legacy
+    // ConnectionState field), so the entry is present before the
+    // worker thread reports.
+    set_connecting(&mut app, "mirror-test");
+    assert_eq!(app.registry.tunnel_count(), 1);
 
     // Simulate the worker thread reporting success — exactly what
     // happens after `tunnel.up()` returns Ok in
@@ -2927,10 +2788,7 @@ fn scanner_promotion_from_connecting_to_connected_mirrors_into_registry() {
     // renderer sees zero tunnels.
     let mut app = test_app();
     add_profiles(&mut app, &["AWS_VPN"]);
-    app.runtime.connection_state = ConnectionState::Connecting {
-        started: Instant::now(),
-        profile: "AWS_VPN".to_string(),
-    };
+    set_connecting(&mut app, "AWS_VPN");
 
     // Drive the scanner sync directly — what `handle_sync_system_state`
     // does on every Tick when the scanner reports an `ActiveSession`.
@@ -2941,7 +2799,7 @@ fn scanner_promotion_from_connecting_to_connected_mirrors_into_registry() {
     // user's screenshot).
     assert!(
         matches!(
-            app.runtime.connection_state,
+            app.legacy_state(),
             ConnectionState::Connected { ref profile, .. } if profile == "AWS_VPN"
         ),
         "scanner must promote Connecting → Connected"
@@ -2974,10 +2832,7 @@ fn scanner_drop_from_connected_clears_registry() {
 
     // Set up the connected state through the scanner-promotion path
     // so both legacy state AND registry are in sync.
-    app.runtime.connection_state = ConnectionState::Connecting {
-        started: Instant::now(),
-        profile: "AWS_VPN".to_string(),
-    };
+    set_connecting(&mut app, "AWS_VPN");
     app.handle_message(Message::SyncSystemState(vec![fake_session("AWS_VPN")]));
     assert_eq!(app.registry.tunnel_count(), 1, "setup precondition");
 
@@ -3012,10 +2867,7 @@ fn mirrored_registry_entry_uses_real_interface_not_mock0() {
     // the real kernel-reported values).
     let mut app = test_app();
     add_profiles(&mut app, &["AWS_VPN"]);
-    app.runtime.connection_state = ConnectionState::Connecting {
-        started: Instant::now(),
-        profile: "AWS_VPN".to_string(),
-    };
+    set_connecting(&mut app, "AWS_VPN");
 
     // Scanner reports a session with the REAL interface name + pid.
     let session = fake_session("AWS_VPN");
@@ -3054,10 +2906,7 @@ fn mirrored_registry_entry_carries_full_rich_details_not_just_interface_and_pid(
     // Assert every field round-trips.
     let mut app = test_app();
     add_profiles(&mut app, &["AWS_VPN"]);
-    app.runtime.connection_state = ConnectionState::Connecting {
-        started: Instant::now(),
-        profile: "AWS_VPN".to_string(),
-    };
+    set_connecting(&mut app, "AWS_VPN");
 
     let session = fake_session("AWS_VPN");
     app.handle_message(Message::SyncSystemState(vec![session]));
@@ -3106,10 +2955,7 @@ fn mirror_refresh_updates_registry_when_details_change() {
     // matches.
     let mut app = test_app();
     add_profiles(&mut app, &["wg-test"]);
-    app.runtime.connection_state = ConnectionState::Connecting {
-        started: Instant::now(),
-        profile: "wg-test".to_string(),
-    };
+    set_connecting(&mut app, "wg-test");
     // Worker thread reports success first; details are empty.
     app.handle_message(Message::ConnectResult {
         profile: "wg-test".to_string(),
@@ -3142,10 +2988,7 @@ fn disconnect_result_success_removes_from_registry() {
     add_profiles(&mut app, &["mirror-test"]);
 
     // Get into Connected first via the same handler the bug fix wires.
-    app.runtime.connection_state = ConnectionState::Connecting {
-        started: Instant::now(),
-        profile: "mirror-test".to_string(),
-    };
+    set_connecting(&mut app, "mirror-test");
     app.handle_message(Message::ConnectResult {
         profile: "mirror-test".to_string(),
         success: true,
@@ -3153,13 +2996,10 @@ fn disconnect_result_success_removes_from_registry() {
     });
     assert_eq!(app.registry.tunnel_count(), 1, "setup precondition");
 
-    // Now disconnect: legacy path goes Connected -> Disconnecting ->
+    // Now disconnect: registry path goes Connected -> Disconnecting ->
     // (worker thread tears down kernel state) -> DisconnectResult ->
     // complete_disconnect.
-    app.runtime.connection_state = ConnectionState::Disconnecting {
-        started: Instant::now(),
-        profile: "mirror-test".to_string(),
-    };
+    app.mirror_disconnecting_into_registry("mirror-test");
     app.handle_message(Message::DisconnectResult {
         profile: "mirror-test".to_string(),
         success: true,

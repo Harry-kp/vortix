@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use super::{App, ConnectionState, InputMode, Protocol, ToastType};
+use super::{App, InputMode, Protocol, ToastType};
 use crate::constants;
 use crate::utils;
 
@@ -154,11 +154,12 @@ impl App {
                 self.runtime.last_connected_profile = Some(new_name.to_string());
             }
 
-            if let ConnectionState::Connected { profile, .. } = &mut self.runtime.connection_state {
-                if *profile == old_name {
-                    *profile = new_name.to_string();
-                }
-            }
+            // Profile renames during active tunnels are blocked at the
+            // overlay open path (`is_profile_active` guard); no
+            // legacy-state mutation needed here post-P5d. The registry
+            // keys by ProfileId derived from name; an active rename
+            // would require re-keying that entry, but rename of an
+            // active profile is refused upstream.
 
             if matches!(self.runtime.profiles[idx].protocol, Protocol::OpenVPN) {
                 if let Some(auth) = utils::read_openvpn_saved_auth(&old_name) {

@@ -55,50 +55,30 @@ fn add_wg_profiles(app: &mut App, names: &[&str]) {
 }
 
 fn set_connected(app: &mut App, name: &str) {
-    // mirror_connect_into_registry no-ops without a catalog entry;
-    // auto-add so the helper leaves the registry fully populated
-    // regardless of whether the caller invoked add_wg_profiles first.
     if !app.runtime.profiles.iter().any(|p| p.name == name) {
         add_wg_profiles(app, &[name]);
     }
     app.runtime.session_start = Some(Instant::now());
-    app.runtime.connection_state = ConnectionState::Connected {
-        since: Instant::now(),
-        profile: name.to_string(),
-        server_location: "Test".to_string(),
-        latency_ms: 10,
-        details: Box::new(DetailedConnectionInfo {
-            interface: "wg0".to_string(),
-            pid: Some(12345),
-            ..Default::default()
-        }),
+    let details = DetailedConnectionInfo {
+        interface: "wg0".to_string(),
+        pid: Some(12345),
+        ..Default::default()
     };
-    app.mirror_connect_into_registry(name);
+    app.mirror_connect_into_registry(name, &details, Instant::now());
 }
 
 fn set_connecting(app: &mut App, name: &str) {
     if !app.runtime.profiles.iter().any(|p| p.name == name) {
         add_wg_profiles(app, &[name]);
     }
-    app.runtime.connection_state = ConnectionState::Connecting {
-        started: Instant::now(),
-        profile: name.to_string(),
-    };
     app.mirror_connecting_into_registry(name);
 }
 
 fn set_disconnecting(app: &mut App, name: &str) {
     use vortix::vortix_core::profile::ProfileId;
-    // Production semantics: Disconnecting comes after Connected. The
-    // registry's set_disconnecting is a no-op without a prior
-    // Connected entry, so seed Connected first when missing.
     if app.registry.snapshot(&ProfileId::new(name)).is_none() {
         set_connected(app, name);
     }
-    app.runtime.connection_state = ConnectionState::Disconnecting {
-        started: Instant::now(),
-        profile: name.to_string(),
-    };
     app.mirror_disconnecting_into_registry(name);
 }
 
@@ -134,10 +114,7 @@ mod connection_state_machine {
         // Simulate connect_profile setting state (avoids spawning real wg-quick)
         set_connecting(&mut app, "vpn-a");
         assert!(
-            matches!(
-                app.runtime.connection_state,
-                ConnectionState::Connecting { .. }
-            ),
+            matches!(app.legacy_state(), ConnectionState::Connecting { .. }),
             "Disconnected -> Connecting on connect"
         );
     }
@@ -154,7 +131,7 @@ mod connection_state_machine {
             error: None,
         });
         assert!(matches!(
-            app.runtime.connection_state,
+            app.legacy_state(),
             ConnectionState::Connected { .. }
         ));
     }
@@ -169,10 +146,7 @@ mod connection_state_machine {
             success: false,
             error: Some("refused".to_string()),
         });
-        assert!(matches!(
-            app.runtime.connection_state,
-            ConnectionState::Disconnected
-        ));
+        assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
     }
 
     #[test]
@@ -183,7 +157,7 @@ mod connection_state_machine {
 
         app.handle_message(Message::SyncSystemState(vec![fake_session("vpn-a")]));
         assert!(matches!(
-            app.runtime.connection_state,
+            app.legacy_state(),
             ConnectionState::Connected { .. }
         ));
     }
@@ -195,10 +169,7 @@ mod connection_state_machine {
 
         app.handle_message(Message::SyncSystemState(vec![]));
         assert!(
-            matches!(
-                app.runtime.connection_state,
-                ConnectionState::Connecting { .. }
-            ),
+            matches!(app.legacy_state(), ConnectionState::Connecting { .. }),
             "Scanner must never demote Connecting -> Disconnected"
         );
     }
@@ -211,7 +182,7 @@ mod connection_state_machine {
 
         app.handle_message(Message::Disconnect);
         assert!(matches!(
-            app.runtime.connection_state,
+            app.legacy_state(),
             ConnectionState::Disconnecting { .. }
         ));
     }
@@ -226,10 +197,7 @@ mod connection_state_machine {
             success: true,
             error: None,
         });
-        assert!(matches!(
-            app.runtime.connection_state,
-            ConnectionState::Disconnected
-        ));
+        assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
     }
 
     #[test]
@@ -238,10 +206,7 @@ mod connection_state_machine {
         set_disconnecting(&mut app, "vpn-a");
 
         app.handle_message(Message::SyncSystemState(vec![]));
-        assert!(matches!(
-            app.runtime.connection_state,
-            ConnectionState::Disconnected
-        ));
+        assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
     }
 
     #[test]
@@ -249,25 +214,15 @@ mod connection_state_machine {
         use vortix::vortix_core::profile::ProfileId;
 
         let mut app = test_app();
-        // Seed both legacy + registry as Disconnecting with a 31s
-        // back-dated start so the per-profile scanner's timeout
-        // branch fires.
+        // Seed the registry as Disconnecting with a 31s back-dated
+        // start so the per-profile scanner's timeout branch fires.
         set_connected(&mut app, "vpn-a");
-        app.runtime.connection_state = ConnectionState::Disconnecting {
-            started: Instant::now()
-                .checked_sub(std::time::Duration::from_secs(31))
-                .unwrap(),
-            profile: "vpn-a".to_string(),
-        };
         let past = std::time::SystemTime::now() - std::time::Duration::from_secs(31);
         app.registry
             .set_disconnecting(&ProfileId::new("vpn-a"), past);
 
         app.handle_message(Message::SyncSystemState(vec![fake_session("vpn-a")]));
-        assert!(matches!(
-            app.runtime.connection_state,
-            ConnectionState::Disconnected
-        ));
+        assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
     }
 
     #[test]
@@ -276,10 +231,7 @@ mod connection_state_machine {
         set_connecting(&mut app, "vpn-a");
 
         app.handle_message(Message::ConnectionTimeout("vpn-a".to_string()));
-        assert!(matches!(
-            app.runtime.connection_state,
-            ConnectionState::Disconnected
-        ));
+        assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
         assert!(app.runtime.pending_connect.is_none());
     }
 
@@ -289,27 +241,20 @@ mod connection_state_machine {
         set_connected(&mut app, "vpn-a");
 
         app.handle_message(Message::SyncSystemState(vec![]));
-        assert!(matches!(
-            app.runtime.connection_state,
-            ConnectionState::Disconnected
-        ));
+        assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
         assert_eq!(app.runtime.connection_drops, 1);
     }
 
     #[test]
     fn stale_connect_result_ignored() {
         let mut app = test_app();
-        app.runtime.connection_state = ConnectionState::Disconnected;
-
+        // No prior Connecting state — the ConnectResult should be ignored.
         app.handle_message(Message::ConnectResult {
             profile: "vpn-a".to_string(),
             success: true,
             error: None,
         });
-        assert!(matches!(
-            app.runtime.connection_state,
-            ConnectionState::Disconnected
-        ));
+        assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
     }
 
     #[test]
@@ -320,7 +265,7 @@ mod connection_state_machine {
         // Disconnected -> Connecting (simulate connect_profile)
         set_connecting(&mut app, "vpn-a");
         assert!(matches!(
-            app.runtime.connection_state,
+            app.legacy_state(),
             ConnectionState::Connecting { .. }
         ));
 
@@ -331,14 +276,14 @@ mod connection_state_machine {
             error: None,
         });
         assert!(matches!(
-            app.runtime.connection_state,
+            app.legacy_state(),
             ConnectionState::Connected { .. }
         ));
 
         // Connected -> Disconnecting
         app.handle_message(Message::Disconnect);
         assert!(matches!(
-            app.runtime.connection_state,
+            app.legacy_state(),
             ConnectionState::Disconnecting { .. }
         ));
 
@@ -348,10 +293,7 @@ mod connection_state_machine {
             success: true,
             error: None,
         });
-        assert!(matches!(
-            app.runtime.connection_state,
-            ConnectionState::Disconnected
-        ));
+        assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
     }
 
     #[test]
@@ -376,14 +318,14 @@ mod connection_state_machine {
         // If wg tools are available, state becomes Connecting to vpn-b.
         // If not, state becomes Disconnected with DependencyError mode.
         let switched = matches!(
-            app.runtime.connection_state,
+            app.legacy_state(),
             ConnectionState::Connecting { ref profile, .. } if profile == "vpn-b"
         );
         let dep_error = matches!(app.input_mode, InputMode::DependencyError { .. });
         assert!(
             switched || dep_error,
             "Should auto-connect to vpn-b or show dependency error, got {:?}",
-            app.runtime.connection_state
+            app.legacy_state()
         );
         assert_eq!(app.runtime.pending_connect, None);
     }
@@ -445,10 +387,7 @@ mod killswitch_lifecycle {
         // VPN drops
         app.handle_message(Message::SyncSystemState(vec![]));
 
-        assert!(matches!(
-            app.runtime.connection_state,
-            ConnectionState::Disconnected
-        ));
+        assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
         assert_eq!(app.runtime.killswitch_state, KillSwitchState::Blocking);
         assert_eq!(app.runtime.connection_drops, 1);
     }
@@ -874,10 +813,7 @@ mod message_routing {
         add_wg_profiles(&mut app, &["vpn-a"]);
 
         app.handle_message(Message::QuickConnect(99));
-        assert!(matches!(
-            app.runtime.connection_state,
-            ConnectionState::Disconnected
-        ));
+        assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
     }
 
     #[test]

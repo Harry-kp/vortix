@@ -196,7 +196,8 @@ impl App {
 
         if let Some(target_profile) = self.runtime.profiles.get(idx) {
             let target_name = target_profile.name.clone();
-            match &self.runtime.connection_state {
+            let legacy = self.legacy_state();
+            match &legacy {
                 // If connecting, ignore to prevent races
                 ConnectionState::Connecting { .. } => {}
                 // If disconnecting, queue the connection for after disconnect completes
@@ -425,16 +426,11 @@ impl App {
             // Saved creds exist -- they'll be picked up in the thread below
         }
 
-        // Start connecting
-        self.runtime.connection_state = ConnectionState::Connecting {
-            started: Instant::now(),
-            profile: name.clone(),
-        };
-        // Plan A.3: mirror the Connecting transition into the registry
-        // so the sidebar/header render `◐` during the connect window.
-        // Without this, renderers stay blank between the keypress and
-        // the worker thread's success/failure reply.
-        self.mirror_connecting_into_registry(&name);
+        // Start connecting — write directly to the registry (P5d: the
+        // legacy field is gone, the helper now also stamps the
+        // started_at + attempt counters from the retry HashMap).
+        let started_at = std::time::SystemTime::now();
+        self.mirror_connecting_into_registry_at(&name, started_at);
         self.log(&format!("ACTION: Connecting to '{name}' [{protocol}]..."));
 
         let connect_timeout_secs = self.runtime.config.connect_timeout;
@@ -481,79 +477,39 @@ impl App {
         });
     }
 
-    /// Synchronizes the kill switch state with the current mode and connection status.
-    /// This is the single source of truth for kill switch state transitions and firewall control.
+    /// Synchronizes the kill switch state with the current mode and
+    /// connection status.
+    ///
+    /// Plan P5d: reads "is anything Connected?" and the active-tunnel
+    /// slice from the registry instead of the (now-deleted) legacy
+    /// `runtime.connection_state` field, then defers to
+    /// `VpnRuntime::sync_killswitch` which carries the state-machine
+    /// transitions and firewall calls.
     pub(crate) fn sync_killswitch(&mut self) {
-        use crate::state::{KillSwitchMode, KillSwitchState};
+        use crate::state::KillSwitchState;
 
-        let old_state = self.runtime.killswitch_state;
-
-        // 1. Determine the target state
-        self.runtime.killswitch_state = match self.runtime.killswitch_mode {
-            KillSwitchMode::Off => KillSwitchState::Disabled,
-            KillSwitchMode::Auto => {
-                if matches!(
-                    self.runtime.connection_state,
-                    ConnectionState::Connected { .. }
-                ) {
-                    KillSwitchState::Armed
-                } else if old_state == KillSwitchState::Blocking {
-                    KillSwitchState::Blocking
-                } else {
-                    KillSwitchState::Armed
-                }
-            }
-            KillSwitchMode::AlwaysOn => {
-                if matches!(
-                    self.runtime.connection_state,
-                    ConnectionState::Connected { .. }
-                ) {
-                    KillSwitchState::Armed
-                } else {
-                    KillSwitchState::Blocking
-                }
-            }
-        };
-
-        // 2. Refuse Blocking state when not running as root — firewall rules
-        //    require elevated privileges and the UI must not claim a security
-        //    posture that isn't enforced.
-        if self.runtime.killswitch_state.is_blocking() && !self.runtime.is_root {
-            self.runtime.killswitch_state = KillSwitchState::Armed;
+        let is_connected = self.has_active_connection();
+        let active = self.active_tunnels_for_killswitch();
+        let pre_state = self.runtime.killswitch_state;
+        self.runtime.sync_killswitch(is_connected, &active);
+        // VpnRuntime::sync_killswitch silently downgrades a requested
+        // Blocking state to Armed when not running as root. Surface
+        // that to the user only when the downgrade actually happened
+        // here (the runtime helper can't show toasts).
+        if pre_state != KillSwitchState::Armed
+            && self.runtime.killswitch_state == KillSwitchState::Armed
+            && !self.runtime.is_root
+            && matches!(
+                self.runtime.killswitch_mode,
+                crate::state::KillSwitchMode::AlwaysOn
+            )
+        {
             self.show_toast(
                 "Kill switch requires root — run with sudo".to_string(),
                 ToastType::Warning,
             );
             self.log("WARN: Kill switch blocked — not running as root");
         }
-
-        // 3. Sync physical firewall state if target state changed or if forcing sync
-        if self.runtime.killswitch_state != old_state
-            || self.runtime.killswitch_state == KillSwitchState::Blocking
-        {
-            if self.runtime.killswitch_state.is_blocking() {
-                let active = build_active_tunnels_from_state(&self.runtime.connection_state);
-                if let Err(e) = crate::core::killswitch::enable_blocking_multi(&active) {
-                    self.log(&format!("WARN: Failed to enable kill switch: {e}"));
-                }
-            } else if old_state.is_blocking() {
-                if let Err(e) = crate::core::killswitch::disable_blocking() {
-                    self.log(&format!("WARN: Failed to release kill switch: {e}"));
-                }
-            }
-        }
-
-        // 4. Persist state (multi-connection U11: V2 schema carries
-        // active_tunnels derived from the current connection so
-        // recovery on next launch can reconstruct the per-tunnel
-        // ruleset).
-        let active = build_active_tunnels_from_state(&self.runtime.connection_state);
-        let persisted_tunnels = crate::core::killswitch::persisted_from_active(&active);
-        let _ = crate::core::killswitch::save_state(
-            self.runtime.killswitch_mode,
-            self.runtime.killswitch_state,
-            persisted_tunnels,
-        );
     }
 
     /// Kill any running VPN process and remove run files for a profile.
@@ -649,7 +605,6 @@ impl App {
                 self.log(&format!(
                     "STATUS: Disconnected from '{profile_name}', connecting to '{next_name}'..."
                 ));
-                self.runtime.connection_state = ConnectionState::Disconnected;
                 self.sync_killswitch();
                 self.connect_profile(idx);
                 return;
@@ -658,7 +613,6 @@ impl App {
 
         // Normal disconnect (no pending switch)
         self.log(&format!("STATUS: Disconnected from '{profile_name}'"));
-        self.runtime.connection_state = ConnectionState::Disconnected;
         self.sync_killswitch();
         self.refresh_telemetry();
     }
@@ -697,7 +651,12 @@ impl App {
     /// Idempotent: scanner ticks every ~1s re-call this with the
     /// latest details. `set_connected` updates the existing entry's
     /// state in place — no FSM churn.
-    pub fn mirror_connect_into_registry(&mut self, profile_name: &str) {
+    pub fn mirror_connect_into_registry(
+        &mut self,
+        profile_name: &str,
+        details: &crate::vpn_runtime::DetailedConnectionInfo,
+        since: Instant,
+    ) {
         let Some(profile) = self
             .runtime
             .profiles
@@ -707,28 +666,9 @@ impl App {
         else {
             return;
         };
-        let ConnectionState::Connected {
-            details: legacy_details,
-            since,
-            ..
-        } = &self.runtime.connection_state
-        else {
-            return;
-        };
-
         let profile_id = ProfileId::new(&profile.name);
         let allowed_ips = extract_allowed_ips(profile.protocol, &profile.config_path);
-
-        // Copy the legacy DetailedConnectionInfo (which the scanner
-        // fills with kernel-truthful values) into the registry's
-        // vortix_core::engine::state::DetailedConnectionInfo (which
-        // renderers read).
-        let core_details = legacy_to_core_details(legacy_details);
-
-        // Convert the legacy `Instant` to `SystemTime` for the
-        // registry. We can't go directly — `Instant` is monotonic and
-        // doesn't expose its zero — so we anchor the conversion on
-        // "now" minus the elapsed-since-legacy-since duration.
+        let core_details = legacy_to_core_details(details);
         let elapsed = since.elapsed();
         let core_since = std::time::SystemTime::now()
             .checked_sub(elapsed)
@@ -739,10 +679,6 @@ impl App {
             allowed_ips,
             core_details,
             core_since,
-            // Placeholder engine — never driven. The bookkeeping API
-            // seeds state directly via `Engine::seed_connected_state`
-            // immediately after construction; `tunnel.up()` is never
-            // called on this engine.
             placeholder_engine_for_profile(&profile),
         );
     }
@@ -815,7 +751,11 @@ impl App {
     /// `connection_state = Connecting{...}` and spawning the worker
     /// thread. Without this the sidebar/header stay blank for the
     /// (sometimes seconds-long) gap until the worker reports back.
-    pub fn mirror_connecting_into_registry(&mut self, profile_name: &str) {
+    pub fn mirror_connecting_into_registry_at(
+        &mut self,
+        profile_name: &str,
+        started_at: std::time::SystemTime,
+    ) {
         let Some(profile) = self
             .runtime
             .profiles
@@ -825,21 +765,8 @@ impl App {
         else {
             return;
         };
-        let ConnectionState::Connecting { started, .. } = &self.runtime.connection_state else {
-            return;
-        };
-        let elapsed = started.elapsed();
-        let started_at = std::time::SystemTime::now()
-            .checked_sub(elapsed)
-            .unwrap_or_else(std::time::SystemTime::now);
         let profile_id = ProfileId::new(&profile.name);
         let allowed_ips = extract_allowed_ips(profile.protocol, &profile.config_path);
-        // Attempt counter: derived from runtime.retry_state[profile_id].
-        // The retry entry's `attempt` field is the 1-based count for
-        // this profile's current sequence (per P5b U-P5b-1); if no
-        // entry exists, this is a fresh first attempt. Plan 005's
-        // retry-budget is tracked on the FSM itself; the legacy retry
-        // bookkeeping carries the equivalent here.
         let attempt = self
             .runtime
             .retry_state
@@ -856,6 +783,12 @@ impl App {
             retry_budget,
             placeholder_engine_for_profile(&profile),
         );
+    }
+
+    /// Convenience wrapper: anchor `started_at` to "now". Used by
+    /// callsites that don't have a pre-computed start time.
+    pub fn mirror_connecting_into_registry(&mut self, profile_name: &str) {
+        self.mirror_connecting_into_registry_at(profile_name, std::time::SystemTime::now());
     }
 
     /// Mirror a legacy-path Disconnecting transition into
@@ -905,9 +838,10 @@ impl App {
     #[allow(clippy::too_many_lines)]
     pub(crate) fn disconnect(&mut self) {
         // Cancel retry / auto-reconnect for the profile this global
-        // disconnect targets (read from legacy connection_state below).
+        // disconnect targets (read from the derived legacy view).
         // Other profiles' retry state stays intact (P5b U-P5b-1).
-        let target_for_retry_clear = match &self.runtime.connection_state {
+        let legacy = self.legacy_state();
+        let target_for_retry_clear = match &legacy {
             ConnectionState::Connected { profile, .. }
             | ConnectionState::Connecting { profile, .. }
             | ConnectionState::Disconnecting { profile, .. } => Some(profile.clone()),
@@ -920,8 +854,8 @@ impl App {
         // stale data showing the interface "up" would otherwise re-promote to
         // Connected and trigger a spurious "VPN dropped" auto-reconnect.
         self.runtime.scanner_rx = None;
-        // Extract connection info from Connected or Connecting state
-        let connection_info = match &self.runtime.connection_state {
+        // Extract connection info from the derived legacy view.
+        let connection_info = match &legacy {
             ConnectionState::Connected {
                 profile: ref profile_name,
                 details,
@@ -963,16 +897,8 @@ impl App {
         if let Some((profile_name, protocol, config_path, pid, cmd_tx)) = connection_info {
             self.log(&format!("ACTION: Disconnecting from '{profile_name}'..."));
 
-            // Set disconnecting state
-            self.runtime.connection_state = ConnectionState::Disconnecting {
-                started: Instant::now(),
-                profile: profile_name.clone(),
-            };
-            // Plan A.3: mirror the Disconnecting transition so renderers
-            // show the `◑` badge during the teardown window. Before
-            // this, the only registry transition on disconnect was
-            // `set_disconnected` (which removes the entry entirely
-            // when complete_disconnect runs).
+            // Mirror the Disconnecting transition into the registry so
+            // renderers show the `◑` badge during the teardown window.
             self.mirror_disconnecting_into_registry(&profile_name);
 
             // KILL SWITCH: Sync state after changing connection state
@@ -1042,11 +968,11 @@ impl App {
 
     /// Force-disconnect: escalates a stuck disconnect.
     pub(crate) fn force_disconnect(&mut self) {
-        let profile_name = if let ConnectionState::Disconnecting { profile, .. } =
-            &self.runtime.connection_state
-        {
-            profile.clone()
-        } else {
+        let ConnectionState::Disconnecting {
+            profile: profile_name,
+            ..
+        } = self.legacy_state()
+        else {
             return;
         };
 
@@ -1073,13 +999,8 @@ impl App {
                 ToastType::Warning,
             );
 
-            // Reset the Disconnecting timer so the 30s safety timeout starts fresh
-            self.runtime.connection_state = ConnectionState::Disconnecting {
-                started: Instant::now(),
-                profile: name.clone(),
-            };
-            // Plan A.3: mirror force-disconnect Disconnecting state
-            // for renderer parity with the regular disconnect path.
+            // Reset the Disconnecting timer (registry-side) so the 30s
+            // safety timeout starts fresh on this force-disconnect tick.
             self.mirror_disconnecting_into_registry(&name);
 
             // Plan #004 U4: force-disconnect now routes through TunnelKind.
@@ -1197,32 +1118,18 @@ impl App {
                     self.log(&format!("ERR: registry.disconnect('{name}') failed: {err}"));
                 }
             }
-            // The legacy single-tunnel state machine may also still hold
-            // this profile (U6 has not finished migrating the connect
-            // path). Mirror the disconnect into it so the sidebar /
-            // header reflect the change without waiting for the next
-            // scanner sync.
-            let still_active_in_legacy = matches!(
-                &self.runtime.connection_state,
-                crate::vpn_runtime::ConnectionState::Connected { profile: p, .. }
-                | crate::vpn_runtime::ConnectionState::Connecting { profile: p, .. }
-                if *p == name
-            );
-            if still_active_in_legacy {
+            // If this same profile is also the registry's primary,
+            // drive the global disconnect so the sidebar/header reflect
+            // the transition immediately (without waiting for scanner).
+            if self.legacy_matches(&name) {
                 self.disconnect();
             }
             return;
         }
 
-        // Legacy path: profile is the only active tunnel tracked in
-        // `runtime.connection_state` — defer to the existing disconnect.
-        let is_legacy_match = matches!(
-            &self.runtime.connection_state,
-            crate::vpn_runtime::ConnectionState::Connected { profile: p, .. }
-            | crate::vpn_runtime::ConnectionState::Connecting { profile: p, .. }
-            if *p == name
-        );
-        if is_legacy_match {
+        // Profile isn't tracked in the registry but the derived legacy
+        // view holds it — fall through to the global disconnect.
+        if self.legacy_matches(&name) {
             self.disconnect();
         }
     }
@@ -1251,12 +1158,10 @@ impl App {
             }
         }
 
-        // Mirror the disconnect into the legacy single-tunnel state if it
-        // is still active (U6 has not finished migrating the connect path).
-        if !matches!(
-            self.runtime.connection_state,
-            crate::vpn_runtime::ConnectionState::Disconnected
-        ) {
+        // Also trigger the global disconnect path if the derived
+        // legacy view still has an active profile — covers the
+        // single-tunnel slot that wasn't drained by the per-id loop.
+        if self.active_tunnel_count() > 0 {
             self.disconnect();
         }
     }
@@ -1285,19 +1190,18 @@ impl App {
             }
         }
 
-        // Legacy path: connecting state lives in `runtime.connection_state`.
-        let is_legacy_connecting = matches!(
-            &self.runtime.connection_state,
-            crate::vpn_runtime::ConnectionState::Connecting { profile: p, .. } if *p == name
-        );
-        if is_legacy_connecting {
+        // Derived legacy view: if this profile is still in Connecting
+        // there, drive the global disconnect (covers the path where
+        // the registry didn't have an entry but the legacy slot did).
+        if self.legacy_matches_connecting(&name) {
             self.disconnect();
         }
     }
 
     /// Reconnect to VPN: queues the same profile for auto-connect after disconnect.
     pub(crate) fn reconnect(&mut self) {
-        match &self.runtime.connection_state {
+        let legacy = self.legacy_state();
+        match &legacy {
             ConnectionState::Connected { profile, .. } => {
                 let profile_name = profile.clone();
                 if let Some(idx) = self
@@ -1497,38 +1401,6 @@ fn ipv4_netmask_to_prefix(mask: std::net::Ipv4Addr) -> u8 {
         u8::try_from(leading).unwrap_or(32)
     } else {
         32
-    }
-}
-
-/// Build the `ActiveTunnelInfo` slice that the killswitch synthesiser
-/// consumes from the current single-connection engine state.
-///
-/// Until U6/U7 wire `TunnelRegistry` into this path, only the currently
-/// connected tunnel (if any) contributes; everything else collapses to
-/// the empty slice. The single tunnel is always treated as primary —
-/// declared CIDRs are not yet plumbed through `ConnectionState`.
-pub(crate) fn build_active_tunnels_from_state(
-    state: &ConnectionState,
-) -> Vec<crate::core::killswitch::ActiveTunnelInfo> {
-    use crate::core::killswitch::ActiveTunnelInfo;
-
-    match state {
-        ConnectionState::Connected { details, .. } => {
-            let server_ips = details
-                .endpoint
-                .split(':')
-                .next()
-                .and_then(|s| s.parse().ok())
-                .into_iter()
-                .collect();
-            vec![ActiveTunnelInfo {
-                interface: details.interface.clone(),
-                server_ips,
-                declared_cidrs: Vec::new(),
-                is_primary: true,
-            }]
-        }
-        _ => Vec::new(),
     }
 }
 

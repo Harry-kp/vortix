@@ -39,7 +39,6 @@ use crate::vortix_core::profile::ProfileId;
 #[allow(clippy::struct_excessive_bools)]
 pub struct VpnRuntime {
     // === VPN State ===
-    pub connection_state: ConnectionState,
     pub profiles: Vec<VpnProfile>,
     pub session_start: Option<Instant>,
 
@@ -107,7 +106,6 @@ impl VpnRuntime {
         let history_size = constants::NETWORK_HISTORY_SIZE;
 
         let mut engine = Self {
-            connection_state: ConnectionState::Disconnected,
             profiles: Vec::new(),
             session_start: None,
 
@@ -185,7 +183,6 @@ impl VpnRuntime {
         let history_size = constants::NETWORK_HISTORY_SIZE;
 
         let mut engine = Self {
-            connection_state: ConnectionState::Disconnected,
             profiles: Vec::new(),
             session_start: None,
 
@@ -255,7 +252,6 @@ impl VpnRuntime {
         let (cmd_tx, cmd_rx) = mpsc::channel::<Message>();
         let history_size = constants::NETWORK_HISTORY_SIZE;
         Self {
-            connection_state: ConnectionState::Disconnected,
             profiles: Vec::new(),
             session_start: None,
             down_history: VecDeque::from(vec![0.0; history_size]),
@@ -424,14 +420,24 @@ impl VpnRuntime {
         }
     }
 
-    /// Synchronizes the kill switch state with the current mode and connection status.
-    pub fn sync_killswitch(&mut self) {
+    /// Synchronizes the kill switch state with the current mode and
+    /// connection status.
+    ///
+    /// Plan P5d: callers compute `is_connected` and `active_tunnels`
+    /// from their own state. App-side callers derive both from
+    /// `app.registry`; CLI-side callers build them from local
+    /// `ConnectionState` via `build_active_tunnels_from_legacy`.
+    pub fn sync_killswitch(
+        &mut self,
+        is_connected: bool,
+        active_tunnels: &[crate::core::killswitch::ActiveTunnelInfo],
+    ) {
         let old_state = self.killswitch_state;
 
         self.killswitch_state = match self.killswitch_mode {
             KillSwitchMode::Off => KillSwitchState::Disabled,
             KillSwitchMode::Auto => {
-                if matches!(self.connection_state, ConnectionState::Connected { .. }) {
+                if is_connected {
                     KillSwitchState::Armed
                 } else if old_state == KillSwitchState::Blocking {
                     KillSwitchState::Blocking
@@ -440,7 +446,7 @@ impl VpnRuntime {
                 }
             }
             KillSwitchMode::AlwaysOn => {
-                if matches!(self.connection_state, ConnectionState::Connected { .. }) {
+                if is_connected {
                     KillSwitchState::Armed
                 } else {
                     KillSwitchState::Blocking
@@ -455,8 +461,7 @@ impl VpnRuntime {
         if self.killswitch_state != old_state || self.killswitch_state == KillSwitchState::Blocking
         {
             if self.killswitch_state.is_blocking() {
-                let active = build_active_tunnels(&self.connection_state);
-                if let Err(e) = crate::core::killswitch::enable_blocking_multi(&active) {
+                if let Err(e) = crate::core::killswitch::enable_blocking_multi(active_tunnels) {
                     logger::log(
                         logger::LogLevel::Warning,
                         "SEC",
@@ -474,11 +479,7 @@ impl VpnRuntime {
             }
         }
 
-        // Multi-connection U11: persist V2 with active_tunnels derived
-        // from the current single-connection state. U6/U7 will replace
-        // this with a `TunnelRegistry` snapshot read.
-        let active = build_active_tunnels(&self.connection_state);
-        let persisted_tunnels = crate::core::killswitch::persisted_from_active(&active);
+        let persisted_tunnels = crate::core::killswitch::persisted_from_active(active_tunnels);
         let _ = crate::core::killswitch::save_state(
             self.killswitch_mode,
             self.killswitch_state,
@@ -538,13 +539,14 @@ impl Drop for VpnRuntime {
 }
 
 /// Build the `ActiveTunnelInfo` slice consumed by the killswitch
-/// synthesiser from the current single-connection engine state.
+/// synthesiser from a legacy `ConnectionState::Connected` value.
 ///
-/// Multi-connection plan U6/U7 will replace this with a snapshot read
-/// from `TunnelRegistry`. For now the only contributor is the currently
-/// connected tunnel (if any), treated as primary; declared CIDRs are
-/// empty until U6 plumbs them through `ConnectionState`.
-fn build_active_tunnels(state: &ConnectionState) -> Vec<crate::core::killswitch::ActiveTunnelInfo> {
+/// CLI-only helper after P5d — the CLI's blocking helpers carry their
+/// own local `ConnectionState`. App-side callers compute the slice
+/// from registry snapshots via `App::active_tunnels_for_killswitch`.
+pub(crate) fn build_active_tunnels_from_legacy(
+    state: &ConnectionState,
+) -> Vec<crate::core::killswitch::ActiveTunnelInfo> {
     use crate::core::killswitch::ActiveTunnelInfo;
 
     match state {

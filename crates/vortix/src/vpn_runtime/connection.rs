@@ -97,6 +97,10 @@ impl VpnRuntime {
     }
 
     /// Blocking connect for CLI — waits until connected or timeout.
+    ///
+    /// Plan P5d: the legacy `connection_state` field on `VpnRuntime` is
+    /// gone; this helper synthesises a local Connected view on success
+    /// purely to derive the active-tunnel slice for the kill switch.
     pub fn connect_and_wait(
         &mut self,
         profile_name: &str,
@@ -120,11 +124,6 @@ impl VpnRuntime {
             );
         });
 
-        self.connection_state = ConnectionState::Connecting {
-            started: Instant::now(),
-            profile: name.clone(),
-        };
-
         let deadline = Instant::now() + timeout + Duration::from_secs(5);
         loop {
             match self.cmd_rx.recv_timeout(Duration::from_millis(500)) {
@@ -134,7 +133,17 @@ impl VpnRuntime {
                     error,
                 }) => {
                     if success {
-                        self.connection_state = ConnectionState::Connected {
+                        self.session_start = Some(Instant::now());
+                        self.last_connected_profile = Some(profile.clone());
+
+                        if let Some(p) = self.profiles.iter_mut().find(|p| p.name == name) {
+                            p.last_used = Some(std::time::SystemTime::now());
+                        }
+                        self.save_metadata();
+
+                        // Synthesise a single-tunnel Connected view to
+                        // build the killswitch active-tunnel slice.
+                        let local_state = ConnectionState::Connected {
                             profile: profile.clone(),
                             server_location: self
                                 .profiles
@@ -145,16 +154,9 @@ impl VpnRuntime {
                             latency_ms: 0,
                             details: Box::new(DetailedConnectionInfo::default()),
                         };
-                        self.session_start = Some(Instant::now());
-                        self.last_connected_profile = Some(profile.clone());
-
-                        if let Some(p) = self.profiles.iter_mut().find(|p| p.name == name) {
-                            p.last_used = Some(std::time::SystemTime::now());
-                        }
-                        self.save_metadata();
-                        self.sync_killswitch();
+                        let active = super::build_active_tunnels_from_legacy(&local_state);
+                        self.sync_killswitch(true, &active);
                     } else {
-                        self.connection_state = ConnectionState::Disconnected;
                         self.cleanup_vpn_resources(&profile);
                     }
 
@@ -169,7 +171,6 @@ impl VpnRuntime {
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     if Instant::now() >= deadline {
                         self.cleanup_vpn_resources(&name);
-                        self.connection_state = ConnectionState::Disconnected;
                         return Ok(ConnectResult {
                             profile: name,
                             protocol,
@@ -188,50 +189,29 @@ impl VpnRuntime {
     }
 
     /// Blocking disconnect for CLI.
+    ///
+    /// Plan P5d: callers pass `profile_name` (and optional `pid` from
+    /// the scanner's `ActiveSession`) explicitly. The legacy
+    /// `connection_state` field on `VpnRuntime` is gone; this helper
+    /// no longer discovers the in-flight profile from shared state.
     #[allow(clippy::too_many_lines)]
-    pub fn disconnect_and_wait(&mut self, force: bool, timeout: Duration) -> Result<(), String> {
-        let (profile_name, protocol, config_path, pid) = match &self.connection_state {
-            ConnectionState::Connected {
-                profile, details, ..
-            } => {
-                let p = self.profiles.iter().find(|p| p.name == *profile);
-                if let Some(prof) = p {
-                    (
-                        profile.clone(),
-                        prof.protocol,
-                        prof.config_path.clone(),
-                        details.pid,
-                    )
-                } else {
-                    return Err(format!("Profile '{profile}' not found in loaded profiles"));
-                }
-            }
-            ConnectionState::Disconnected => return Ok(()), // Idempotent
-            ConnectionState::Connecting { profile, .. } => {
-                let p = self.profiles.iter().find(|p| p.name == *profile);
-                if let Some(prof) = p {
-                    (
-                        profile.clone(),
-                        prof.protocol,
-                        prof.config_path.clone(),
-                        None,
-                    )
-                } else {
-                    return Err("Cannot disconnect: profile not found".into());
-                }
-            }
-            ConnectionState::Disconnecting { .. } => {
-                return Err("Already disconnecting".into());
-            }
-        };
+    pub fn disconnect_and_wait(
+        &mut self,
+        profile_name: &str,
+        pid: Option<u32>,
+        force: bool,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let profile_name = profile_name.to_string();
+        let prof = self
+            .profiles
+            .iter()
+            .find(|p| p.name == profile_name)
+            .ok_or_else(|| format!("Profile '{profile_name}' not found in loaded profiles"))?;
+        let (protocol, config_path) = (prof.protocol, prof.config_path.clone());
 
         let cmd_tx = self.cmd_tx.clone();
         let pn = profile_name.clone();
-
-        self.connection_state = ConnectionState::Disconnecting {
-            started: Instant::now(),
-            profile: profile_name.clone(),
-        };
 
         // Plan #004 U4: a single Tunnel::down call replaces the previous
         // ~80-line per-protocol match arm. The interface name carried on the
@@ -292,9 +272,11 @@ impl VpnRuntime {
         loop {
             match self.cmd_rx.recv_timeout(Duration::from_millis(500)) {
                 Ok(Message::DisconnectResult { success, error, .. }) => {
-                    self.connection_state = ConnectionState::Disconnected;
                     self.session_start = None;
-                    self.sync_killswitch();
+                    // No legacy field after P5d; pass an empty
+                    // active-tunnels slice so the kill switch knows
+                    // nothing is active.
+                    self.sync_killswitch(false, &[]);
 
                     if success {
                         return Ok(());
@@ -305,7 +287,6 @@ impl VpnRuntime {
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     if Instant::now() >= deadline {
                         self.cleanup_vpn_resources(&profile_name);
-                        self.connection_state = ConnectionState::Disconnected;
                         self.session_start = None;
                         return Err("Disconnect timed out".into());
                     }
