@@ -1165,6 +1165,10 @@ fn days_to_ymd(days: i64) -> (i64, u32, u32) {
 struct ProfileEntry {
     name: String,
     protocol: String,
+    /// Multi-tunnel-aware: `true` when the scanner sees a kernel
+    /// interface for this profile. Set per-entry from the scanner's
+    /// full session list — not just `active.first()`.
+    connected: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_used: Option<String>,
     /// Stable profile ID from the `.meta.toml` sidecar (plan 006 U2/U4).
@@ -1252,6 +1256,17 @@ fn handle_list(
             .collect()
     };
 
+    // Multi-tunnel: every kernel-visible session counts. Build a
+    // HashSet keyed on profile name so per-entry membership lookup
+    // is O(1) and every active profile gets its dot, not just the
+    // first one (the pre-fix `active.first()` was single-tunnel-era
+    // legacy that hid concurrent tunnels from `vortix list`).
+    let active_names: std::collections::HashSet<String> =
+        crate::core::scanner::get_active_profiles(&engine.profiles)
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+
     let entries: Vec<ProfileEntry> = profiles
         .iter()
         .map(|p| {
@@ -1259,6 +1274,7 @@ fn handle_list(
             ProfileEntry {
                 name: p.name.clone(),
                 protocol: format!("{}", p.protocol),
+                connected: active_names.contains(&p.name),
                 last_used: p
                     .last_used
                     .map(|t| match t.duration_since(std::time::UNIX_EPOCH) {
@@ -1277,10 +1293,6 @@ fn handle_list(
             }
         })
         .collect();
-
-    // Discover which profile is currently active
-    let active = crate::core::scanner::get_active_profiles(&engine.profiles);
-    let active_name = active.first().map(|s| s.name.as_str());
 
     match mode {
         OutputMode::Human => {
@@ -1305,11 +1317,7 @@ fn handle_list(
                 width_p = max_proto,
             );
             for entry in &entries {
-                let marker = if active_name == Some(entry.name.as_str()) {
-                    "●"
-                } else {
-                    " "
-                };
+                let marker = if entry.connected { "●" } else { " " };
                 let last = entry.last_used.as_deref().unwrap_or("never");
                 println!(
                     "{marker} {:<width_n$}  {:<width_p$}  {last}",
