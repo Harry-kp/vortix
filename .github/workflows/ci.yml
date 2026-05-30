@@ -18,7 +18,7 @@ jobs:
         os: [macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.91.0"
@@ -33,7 +33,7 @@ jobs:
     steps:
       - name: Bootstrap Fedora container
         run: dnf install -y ca-certificates curl gcc gcc-c++ git make pkgconf-pkg-config which
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.91.0"
@@ -44,7 +44,7 @@ jobs:
     name: Format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.91.0"
@@ -59,7 +59,7 @@ jobs:
         os: [macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.91.0"
@@ -75,7 +75,7 @@ jobs:
     steps:
       - name: Bootstrap Fedora container
         run: dnf install -y ca-certificates curl gcc gcc-c++ git make pkgconf-pkg-config which
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.91.0"
@@ -91,7 +91,7 @@ jobs:
         os: [macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.91.0"
@@ -114,7 +114,7 @@ jobs:
         run: |
           dnf install -y ca-certificates curl gcc gcc-c++ git make nftables openvpn pkgconf-pkg-config shadow-utils which wireguard-tools
           useradd -m tester
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.91.0"
@@ -135,7 +135,7 @@ jobs:
         os: [macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.91.0"
@@ -152,7 +152,7 @@ jobs:
     steps:
       - name: Bootstrap Fedora container
         run: dnf install -y ca-certificates curl gcc gcc-c++ git make pkgconf-pkg-config which
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.91.0"
@@ -165,7 +165,7 @@ jobs:
     name: Check Subprocess Boundary (plan 002)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.91.0"
@@ -176,7 +176,7 @@ jobs:
     name: Check Platform Boundary (plan 003)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.91.0"
@@ -187,7 +187,7 @@ jobs:
     name: Check Protocol Boundary (plan 004)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.91.0"
@@ -198,5 +198,5 @@ jobs:
     name: Security Audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: EmbarkStudios/cargo-deny-action@v2
