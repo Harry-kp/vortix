@@ -249,27 +249,48 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
 
     audit.push(Line::from(""));
 
-    let (ks_icon, ks_text, ks_color) =
-        match (app.runtime.killswitch_mode, app.runtime.killswitch_state) {
-            (crate::state::KillSwitchMode::Off, _) => (check_fail.clone(), "Off", theme::INACTIVE),
-            // AlwaysOn always resolves to Blocking (firewall stays engaged
-            // whether VPN is up or down) — caught here before the generic
-            // (_, Blocking) arm so the headline reads "Blocking (Strict)"
-            // with the strict-mode color cue rather than the generic
-            // post-drop "Blocking (Strict)".
-            (_, crate::state::KillSwitchState::Blocking) => {
-                (check_warn.clone(), "Blocking (Strict)", theme::ERROR)
-            }
-            (crate::state::KillSwitchMode::Auto, crate::state::KillSwitchState::Armed) => {
-                (check_pass.clone(), "Armed (Auto)", theme::SUCCESS)
-            }
-            _ => (check_warn.clone(), "Unknown", theme::WARNING),
-        };
+    // Mode label uses the plain-English UI naming from
+    // `KillSwitchMode::display_name` — the variant names (`Off` /
+    // `Auto` / `AlwaysOn`) are kept stable for CLI/JSON; only the
+    // human-facing copy uses friendlier strings. See the module docs
+    // on `vortix_core::state::killswitch` for the mapping.
+    let mode = app.runtime.killswitch_mode;
+    let state = app.runtime.killswitch_state;
+    let mode_label = mode.display_name();
+    let (ks_icon, ks_color, status_phrase) = match (mode, state) {
+        (crate::state::KillSwitchMode::Off, _) => {
+            (check_fail.clone(), theme::INACTIVE, "off — not protecting")
+        }
+        // AlwaysOn is Blocking by design (steady state) — green/pass,
+        // not an alarm.
+        (crate::state::KillSwitchMode::AlwaysOn, _) => (
+            check_pass.clone(),
+            theme::SUCCESS,
+            "firewall engaged — only VPN traffic permitted",
+        ),
+        // Auto in the Blocking state means VPN dropped and the
+        // firewall engaged in response — this IS an alarm.
+        (crate::state::KillSwitchMode::Auto, crate::state::KillSwitchState::Blocking) => (
+            check_warn.clone(),
+            theme::ERROR,
+            "VPN dropped — firewall engaged; reconnect or `release-killswitch` to recover",
+        ),
+        (crate::state::KillSwitchMode::Auto, crate::state::KillSwitchState::Armed) => (
+            check_pass.clone(),
+            theme::SUCCESS,
+            "watching — will engage if the VPN drops",
+        ),
+        _ => (check_warn.clone(), theme::WARNING, "unknown state"),
+    };
 
     audit.push(Line::from(vec![
         ks_icon,
         Span::styled("Kill Switch: ", Style::default().fg(theme::TEXT_SECONDARY)),
-        Span::styled(ks_text, Style::default().fg(ks_color)),
+        Span::styled(mode_label, Style::default().fg(ks_color)),
+        Span::styled(
+            format!(" — {status_phrase}"),
+            Style::default().fg(theme::TEXT_SECONDARY),
+        ),
     ]));
 
     audit.push(Line::from(""));
@@ -396,23 +417,18 @@ fn render_partial_no_primary(frame: &mut Frame, app: &App, inner: Rect) {
     ];
 
     // KS-mode-aware Killswitch line — render exactly the bullet for the
-    // active mode. The sigil encodes the protection level:
-    //   `✓` AlwaysOn  — actively blocking non-tunnel egress
-    //   `─` Auto      — standby, no default route to enforce on
-    //   `✗` Off       — disabled
-    let (ks_sigil, ks_text, ks_color) = match app.runtime.killswitch_mode {
-        crate::state::KillSwitchMode::AlwaysOn => (
-            check_pass.clone(),
-            "Blocking (default-DROP egress; active tunnel interfaces allow-listed)",
-            theme::SUCCESS,
-        ),
-        crate::state::KillSwitchMode::Auto => (
-            check_na.clone(),
-            "Standby — no default route to enforce on",
-            theme::INACTIVE,
-        ),
-        crate::state::KillSwitchMode::Off => (check_fail.clone(), "Off", theme::ERROR),
+    // active mode. The user-facing label uses
+    // `KillSwitchMode::display_name`; the long-form copy reads as plain
+    // English ("what does this mode do?"). The enum variant names
+    // (Off / Auto / AlwaysOn) stay stable for CLI/JSON — see
+    // `vortix_core::state::killswitch` module docs.
+    let mode = app.runtime.killswitch_mode;
+    let (ks_sigil, ks_color) = match mode {
+        crate::state::KillSwitchMode::AlwaysOn => (check_pass.clone(), theme::SUCCESS),
+        crate::state::KillSwitchMode::Auto => (check_na.clone(), theme::INACTIVE),
+        crate::state::KillSwitchMode::Off => (check_fail.clone(), theme::ERROR),
     };
+    let ks_text = format!("{} — {}", mode.display_name(), mode.one_liner());
     audit.push(Line::from(vec![
         ks_sigil,
         Span::styled("Killswitch : ", Style::default().fg(theme::TEXT_SECONDARY)),
@@ -652,21 +668,22 @@ mod tests {
     #[test]
     fn partial_renders_killswitch_bullet_for_active_mode_only() {
         // Plan §U18: in PARTIAL, render exactly ONE Killswitch bullet —
-        // the one matching the active mode — not a sub-bulleted multi-mode
-        // block. This test verifies the chosen mode's headline appears and
-        // the other two modes' distinguishing copy does not.
+        // the one matching the active mode — not a sub-bulleted
+        // multi-mode block. Verifies the chosen mode's friendly label
+        // (`VPN-only`, per `KillSwitchMode::display_name`) appears and
+        // that the other modes' distinguishing copy does not.
         let mut app = App::new_test();
         insert_idle_tunnel(&mut app, "alpha");
         app.runtime.killswitch_mode = KillSwitchMode::AlwaysOn;
 
         let out = render_to_string(&app, 80, 20);
         assert!(
-            out.contains("Blocking"),
-            "AlwaysOn should surface 'Blocking' headline; got:\n{out}"
+            out.contains("VPN-only"),
+            "AlwaysOn should surface the 'VPN-only' label; got:\n{out}"
         );
         assert!(
-            !out.contains("Standby"),
-            "AlwaysOn must not also render the Auto/Standby line; got:\n{out}"
+            !out.contains("Block on drop"),
+            "AlwaysOn must not render the Auto 'Block on drop' line; got:\n{out}"
         );
     }
 
@@ -686,29 +703,29 @@ mod tests {
             "Off mode headline missing; got:\n{out}"
         );
         assert!(
-            !out.contains("Armed"),
-            "Off must not render the AlwaysOn 'Armed' headline; got:\n{out}"
+            !out.contains("VPN-only"),
+            "Off must not render the AlwaysOn 'VPN-only' label; got:\n{out}"
         );
         assert!(
-            !out.contains("Standby"),
-            "Off must not render the Auto 'Standby' headline; got:\n{out}"
+            !out.contains("Block on drop"),
+            "Off must not render the Auto 'Block on drop' label; got:\n{out}"
         );
     }
 
     #[test]
-    fn partial_killswitch_auto_renders_standby_bullet() {
+    fn partial_killswitch_auto_renders_block_on_drop_bullet() {
         let mut app = App::new_test();
         insert_idle_tunnel(&mut app, "alpha");
         app.runtime.killswitch_mode = KillSwitchMode::Auto;
 
         let out = render_to_string(&app, 80, 20);
         assert!(
-            out.contains("Standby"),
-            "Auto mode should surface 'Standby'; got:\n{out}"
+            out.contains("Block on drop"),
+            "Auto mode should surface the 'Block on drop' label; got:\n{out}"
         );
         assert!(
-            !out.contains("Armed"),
-            "Auto must not render the AlwaysOn 'Armed' headline; got:\n{out}"
+            !out.contains("VPN-only"),
+            "Auto must not render the AlwaysOn 'VPN-only' label; got:\n{out}"
         );
     }
 

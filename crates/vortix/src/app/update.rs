@@ -645,22 +645,35 @@ impl App {
             && !self.runtime.killswitch_state.is_blocking();
 
         if !blocking_refused {
-            match self.runtime.killswitch_mode {
+            // Toast / log strings use the user-facing UI labels
+            // (`KillSwitchMode::display_name`). Log lines keep the
+            // enum variant name in parens so on-disk logs stay
+            // greppable against the stable contract — see the
+            // `vortix_core::state::killswitch` module docs.
+            let mode = self.runtime.killswitch_mode;
+            let label = mode.display_name();
+            let one_liner = mode.one_liner();
+            match mode {
                 KillSwitchMode::Off => {
-                    self.log("SEC: Kill switch DISABLED");
-                    self.show_toast("Kill Switch OFF".to_string(), ToastType::Info);
+                    self.log(&format!("SEC: Kill switch → {label} (Off): {one_liner}"));
+                    self.show_toast(
+                        format!("Kill Switch: {label} — {one_liner}"),
+                        ToastType::Info,
+                    );
                 }
                 KillSwitchMode::Auto => {
-                    self.log("SEC: Kill switch mode set to AUTO");
+                    self.log(&format!("SEC: Kill switch → {label} (Auto): {one_liner}"));
                     self.show_toast(
-                        "Kill Switch ON - will block if VPN drops".to_string(),
+                        format!("Kill Switch: {label} — {one_liner}"),
                         ToastType::Success,
                     );
                 }
                 KillSwitchMode::AlwaysOn => {
-                    self.log("SEC: Kill switch mode set to STRICT (AlwaysOn)");
+                    self.log(&format!(
+                        "SEC: Kill switch → {label} (AlwaysOn): {one_liner}"
+                    ));
                     self.show_toast(
-                        "Kill Switch STRICT - blocks until VPN connects".to_string(),
+                        format!("Kill Switch: {label} — {one_liner}"),
                         ToastType::Warning,
                     );
                 }

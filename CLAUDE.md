@@ -55,6 +55,20 @@ There is **no** `connection_state` field on `VpnRuntime`. Don't add one. Multi-t
 - **Auto** — armed while a VPN is up; engages default-DROP egress only on an unexpected drop.
 - **AlwaysOn** — firewall stays engaged whether VPN is up or down. The default-DROP OUTPUT policy + per-tunnel ACCEPT rules (in `core::killswitch::enable_blocking_multi`) keep traffic from leaking in the gap between a drop and reconnection. State always resolves to `Blocking`, never `Armed`.
 
+### Enum variants vs UI labels (don't get confused)
+
+The enum variants `Off` / `Auto` / `AlwaysOn` are the **stable contract** — they appear in code matches, log lines, the CLI grammar (`vortix killswitch off|auto|always`), the JSON envelope (`{"mode": "..."}`), and `killswitch.toml`. **Never rename them.**
+
+User-facing rendering uses friendlier labels via the helpers on `vortix_core::state::killswitch` (`KillSwitchMode::display_name`, `KillSwitchMode::one_liner`, `KillSwitchMode::behavior_lines`, `KillSwitchState::display_status`):
+
+| Enum         | UI label          | Plain English                                          |
+|--------------|-------------------|--------------------------------------------------------|
+| `Off`        | `Off`             | All traffic flows; real IP exposed if VPN drops.       |
+| `Auto`       | `Block on drop`   | Watch the VPN; block if it drops unexpectedly.         |
+| `AlwaysOn`   | `VPN-only`        | Only VPN traffic permitted. No internet without a VPN. |
+
+If you're touching killswitch rendering, route through those helpers — don't hardcode "Auto" or "Strict" in display strings. The header bar uses short abbreviations (`KS:Off` / `KS:Watch` / `KS:VPN-only` / `KS:DROPPED`); the Security Guard panel uses `display_name` + a status phrase; the CLI's human output uses `display_name` + `behavior_lines`. The module docs on `vortix_core/state/killswitch.rs` list the canonical mapping table.
+
 ## Planning artifacts
 
 - `docs/brainstorms/<date>-<slug>-requirements.md` — what to build (origin doc)

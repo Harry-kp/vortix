@@ -527,12 +527,18 @@ fn push_strip(line: &mut Line<'static>, with_label: bool, inner: &[Span<'static>
     ));
 }
 
-/// Get kill switch indicator for the header bar.
+/// Kill switch indicator for the header bar.
 ///
-/// Labels: KS:Off, KS:Auto (armed/standby), KS:BLOCK (Blocking).
-/// `AlwaysOn` always resolves to `Blocking` and renders as `KS:BLOCK`;
-/// the historical `KS:Strict` label is unreachable after the
-/// `AlwaysOn` semantic fix.
+/// Header labels (kept short for the top strip):
+/// - `KS:Off` — no firewall rules (mode `Off`)
+/// - `KS:Watch` — `Auto` + `Armed`; watching the VPN (green / healthy)
+/// - `KS:VPN-only` — `AlwaysOn` + `Blocking`; steady state (green / working as configured, NOT an alarm)
+/// - `KS:DROPPED` — `Auto` + `Blocking`; VPN actually dropped, firewall engaged (red / alarm)
+///
+/// The variant names `Off` / `Auto` / `AlwaysOn` are the stable
+/// CLI/JSON contract — never renamed. The labels here are the UI
+/// vocabulary; see `vortix_core::state::killswitch` module docs for
+/// the mapping convention.
 fn get_killswitch_indicator(app: &App) -> Span<'static> {
     use crate::state::{KillSwitchMode, KillSwitchState};
 
@@ -540,20 +546,22 @@ fn get_killswitch_indicator(app: &App) -> Span<'static> {
         (KillSwitchMode::Off, _) | (_, KillSwitchState::Disabled) => {
             Span::styled(" KS:Off ", Style::default().fg(theme::INACTIVE))
         }
+        // AlwaysOn + Blocking is the steady state for VPN-only mode —
+        // green/by-design, not an alarm. Caught before the generic
+        // `(_, Blocking)` arm so it doesn't get the red alarm treatment.
+        (KillSwitchMode::AlwaysOn, _) => {
+            Span::styled(" KS:VPN-only ", Style::default().fg(theme::SUCCESS))
+        }
+        // Auto + Blocking means the VPN actually dropped and the
+        // firewall engaged in response — that IS the alarm condition.
         (_, KillSwitchState::Blocking) => Span::styled(
-            " KS:BLOCK ",
+            " KS:DROPPED ",
             Style::default()
                 .fg(theme::ERROR)
                 .add_modifier(Modifier::BOLD),
         ),
         (KillSwitchMode::Auto, KillSwitchState::Armed) => {
-            Span::styled(" KS:Auto ", Style::default().fg(theme::SUCCESS))
-        }
-        // Unreachable post the AlwaysOn semantic fix (AlwaysOn → Blocking
-        // always). Kept for match exhaustiveness; a future enum addition
-        // would force a real case here.
-        (KillSwitchMode::AlwaysOn, KillSwitchState::Armed) => {
-            Span::styled(" KS:BLOCK ", Style::default().fg(theme::ERROR))
+            Span::styled(" KS:Watch ", Style::default().fg(theme::SUCCESS))
         }
     }
 }

@@ -1897,6 +1897,12 @@ fn handle_killswitch(
         engine.sync_killswitch(is_connected, &active_tunnels);
     }
 
+    // JSON shape uses the stable enum-derived contract
+    // (`off` / `auto` / `alwayson` / `disabled` / `armed` / `blocking`)
+    // so machine consumers can rely on it. Human output uses the
+    // friendly UI labels from `KillSwitchMode::display_name` /
+    // `KillSwitchState::display_status` — see the module docs on
+    // `vortix_core::state::killswitch` for the mapping convention.
     let data = KsData {
         mode: format!("{:?}", engine.killswitch_mode).to_lowercase(),
         state: format!("{:?}", engine.killswitch_state).to_lowercase(),
@@ -1904,7 +1910,37 @@ fn handle_killswitch(
 
     match output_mode {
         OutputMode::Human => {
-            println!("Kill Switch: {} ({})", data.mode, data.state);
+            let mode = engine.killswitch_mode;
+            let (up, down) = mode.behavior_lines();
+            println!(
+                "Kill Switch: {} ({}) — currently {}",
+                mode.display_name(),
+                data.mode,
+                engine.killswitch_state.display_status()
+            );
+            println!("  {up}");
+            println!("  {down}");
+            println!();
+            println!("Other modes:");
+            for other in [
+                crate::state::KillSwitchMode::Off,
+                crate::state::KillSwitchMode::Auto,
+                crate::state::KillSwitchMode::AlwaysOn,
+            ] {
+                if other == mode {
+                    continue;
+                }
+                let cli_verb = match other {
+                    crate::state::KillSwitchMode::Off => "off",
+                    crate::state::KillSwitchMode::Auto => "auto",
+                    crate::state::KillSwitchMode::AlwaysOn => "always",
+                };
+                println!(
+                    "  vortix killswitch {cli_verb:<7}  {} — {}",
+                    other.display_name(),
+                    other.one_liner()
+                );
+            }
         }
         OutputMode::Json => print_success(output_mode, "killswitch", &data, vec![]),
         OutputMode::Quiet => {}
