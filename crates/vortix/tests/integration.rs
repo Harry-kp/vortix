@@ -55,6 +55,12 @@ fn add_wg_profiles(app: &mut App, names: &[&str]) {
 }
 
 fn set_connected(app: &mut App, name: &str) {
+    // mirror_connect_into_registry no-ops without a catalog entry;
+    // auto-add so the helper leaves the registry fully populated
+    // regardless of whether the caller invoked add_wg_profiles first.
+    if !app.runtime.profiles.iter().any(|p| p.name == name) {
+        add_wg_profiles(app, &[name]);
+    }
     app.runtime.session_start = Some(Instant::now());
     app.runtime.connection_state = ConnectionState::Connected {
         since: Instant::now(),
@@ -67,13 +73,13 @@ fn set_connected(app: &mut App, name: &str) {
             ..Default::default()
         }),
     };
-    // Path A: mirror into the registry so post-P5a helpers
-    // (`is_profile_active`, `active_tunnel_count`, etc.) see this profile
-    // as active. Matches the production connect path.
     app.mirror_connect_into_registry(name);
 }
 
 fn set_connecting(app: &mut App, name: &str) {
+    if !app.runtime.profiles.iter().any(|p| p.name == name) {
+        add_wg_profiles(app, &[name]);
+    }
     app.runtime.connection_state = ConnectionState::Connecting {
         started: Instant::now(),
         profile: name.to_string(),
@@ -82,6 +88,13 @@ fn set_connecting(app: &mut App, name: &str) {
 }
 
 fn set_disconnecting(app: &mut App, name: &str) {
+    use vortix::vortix_core::profile::ProfileId;
+    // Production semantics: Disconnecting comes after Connected. The
+    // registry's set_disconnecting is a no-op without a prior
+    // Connected entry, so seed Connected first when missing.
+    if app.registry.snapshot(&ProfileId::new(name)).is_none() {
+        set_connected(app, name);
+    }
     app.runtime.connection_state = ConnectionState::Disconnecting {
         started: Instant::now(),
         profile: name.to_string(),
@@ -233,13 +246,22 @@ mod connection_state_machine {
 
     #[test]
     fn disconnecting_safety_timeout() {
+        use vortix::vortix_core::profile::ProfileId;
+
         let mut app = test_app();
+        // Seed both legacy + registry as Disconnecting with a 31s
+        // back-dated start so the per-profile scanner's timeout
+        // branch fires.
+        set_connected(&mut app, "vpn-a");
         app.runtime.connection_state = ConnectionState::Disconnecting {
             started: Instant::now()
                 .checked_sub(std::time::Duration::from_secs(31))
                 .unwrap(),
             profile: "vpn-a".to_string(),
         };
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(31);
+        app.registry
+            .set_disconnecting(&ProfileId::new("vpn-a"), past);
 
         app.handle_message(Message::SyncSystemState(vec![fake_session("vpn-a")]));
         assert!(matches!(

@@ -819,329 +819,446 @@ impl App {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
+    /// P5b U-P5b-2: per-profile scanner.
+    ///
+    /// Iterate every registry entry and reconcile against the scanner's
+    /// active sessions. Each profile is processed independently — a
+    /// drop on tunnel A no longer blocks observing the (also dropped)
+    /// tunnel B. Auto-adoption (D-4) registers externally-started VPNs
+    /// at the end of the pass.
+    ///
+    /// Legacy state writes: the per-profile helpers keep the legacy
+    /// `runtime.connection_state` field updated for the profile that
+    /// matches it (or any profile when the field is `Disconnected`).
+    /// Other tunnels' transitions are registry-only. P5d retires the
+    /// field entirely.
     fn handle_sync_system_state(&mut self, active: Vec<ActiveSession>) {
-        // Guard: While Disconnecting, the scanner must NEVER override to Connected.
-        if let ConnectionState::Disconnecting { started, profile } = &self.runtime.connection_state
-        {
-            let elapsed = started.elapsed().as_secs();
-            let interface_gone = !active.iter().any(|s| &s.name == profile);
+        use crate::vortix_core::engine::state::Connection;
+        use crate::vortix_core::profile::ProfileId;
+        use std::collections::HashSet;
+        use std::time::SystemTime;
 
-            if interface_gone {
-                let profile_name = profile.clone();
-                self.complete_disconnect(&profile_name);
-            } else if elapsed >= self.runtime.config.disconnect_timeout {
-                let profile_name = profile.clone();
-                self.log(&format!(
-                    "WARN: Disconnect timed out for '{profile_name}' after {}s, forcing cleanup",
-                    self.runtime.config.disconnect_timeout
-                ));
-                self.cleanup_vpn_resources(&profile_name);
-                self.runtime.pending_connect = None;
-                self.runtime.connection_state = ConnectionState::Disconnected;
-                self.runtime.session_start = None;
-                self.show_toast(
-                    "Disconnect timed out — forced cleanup".to_string(),
-                    ToastType::Warning,
-                );
-                self.sync_killswitch();
+        let snapshots = self.registry.snapshot_all();
+        let session_count = active.len();
+        let mut handled: HashSet<ProfileId> = HashSet::new();
+
+        for snap in &snapshots {
+            let profile_name = snap.profile_id.as_str().to_string();
+            handled.insert(snap.profile_id.clone());
+            let matching_session = active.iter().find(|s| s.name == profile_name);
+
+            match (&snap.state, matching_session) {
+                (Connection::Disconnecting { .. }, None) => {
+                    self.complete_disconnect(&profile_name);
+                }
+                (Connection::Disconnecting { started_at, .. }, Some(_)) => {
+                    let elapsed = SystemTime::now()
+                        .duration_since(*started_at)
+                        .unwrap_or_default()
+                        .as_secs();
+                    if elapsed >= self.runtime.config.disconnect_timeout {
+                        self.scanner_force_disconnect(&profile_name);
+                    }
+                }
+                (Connection::Connecting { started_at, .. }, Some(session)) => {
+                    self.scanner_promote_to_connected(&profile_name, session);
+                    let _ = started_at; // elapsed not needed on success path
+                }
+                (Connection::Connecting { started_at, .. }, None) => {
+                    let elapsed = SystemTime::now()
+                        .duration_since(*started_at)
+                        .unwrap_or_default()
+                        .as_secs();
+                    if elapsed > 0 && elapsed % constants::SCANNER_LOG_INTERVAL_SECS == 0 {
+                        self.log(&format!(
+                            "NET: Scanner: no tunnel interface for '{profile_name}' yet \
+                             ({elapsed}s elapsed, {} active session{})",
+                            session_count,
+                            if session_count == 1 { "" } else { "s" }
+                        ));
+                    }
+                }
+                (Connection::Connected { .. }, Some(session)) => {
+                    self.scanner_refresh_connected(&profile_name, session);
+                }
+                (
+                    Connection::Connected { .. }
+                    | Connection::Reconnecting { .. }
+                    | Connection::AwaitingUserInput { .. },
+                    None,
+                ) => {
+                    let was_connected = matches!(snap.state, Connection::Connected { .. });
+                    self.scanner_handle_drop(&profile_name, was_connected);
+                }
+                (Connection::Disconnected { .. }, _) => {
+                    // Historic marker (post-failure entry kept for the
+                    // ✗ badge). Scanner never auto-promotes these — the
+                    // user must retry or dismiss.
+                }
+                (
+                    Connection::Reconnecting { .. } | Connection::AwaitingUserInput { .. },
+                    Some(_),
+                ) => {
+                    // These FSM states aren't currently driven by the
+                    // App's connect flow (reserved for plan 008 U2
+                    // interactive prompts and FSM auto-reconnect). If
+                    // they ever materialize alongside an active
+                    // kernel session, treat as a refresh — the kernel
+                    // is the truth.
+                    if let Some(session) = matching_session {
+                        self.scanner_refresh_connected(&profile_name, session);
+                    }
+                }
             }
-            return;
         }
 
-        // While Connecting, the scanner can only PROMOTE to Connected
-        if let ConnectionState::Connecting { started, profile } = &self.runtime.connection_state {
-            let profile_name = profile.clone();
-            let elapsed = started.elapsed().as_secs();
-            if let Some(session) = active.iter().find(|s| s.name == profile_name) {
-                let location = self
-                    .runtime
-                    .profiles
-                    .iter()
-                    .find(|p| p.name == profile_name)
-                    .map_or_else(|| "Unknown".to_string(), |p| p.location.clone());
-
-                let start_time = session
-                    .started_at
-                    .and_then(|real| {
-                        std::time::SystemTime::now()
-                            .duration_since(real)
-                            .ok()
-                            .and_then(|d| Instant::now().checked_sub(d))
-                    })
-                    .unwrap_or_else(Instant::now);
-
-                self.runtime.connection_state = ConnectionState::Connected {
-                    profile: profile_name.clone(),
-                    server_location: location,
-                    since: start_time,
-                    latency_ms: 0,
-                    details: Box::new(DetailedConnectionInfo {
-                        interface: session.interface.clone(),
-                        internal_ip: session.internal_ip.clone(),
-                        endpoint: session.endpoint.clone(),
-                        mtu: session.mtu.clone(),
-                        public_key: session.public_key.clone(),
-                        listen_port: session.listen_port.clone(),
-                        transfer_rx: session.transfer_rx.clone(),
-                        transfer_tx: session.transfer_tx.clone(),
-                        latest_handshake: session.latest_handshake.clone(),
-                        pid: session.pid,
-                    }),
-                };
-                // Scanner-driven promotion: the kernel interface
-                // appeared before the connect worker's ConnectResult
-                // arrived (common with OpenVPN). The worker's result
-                // will be marked stale by `handle_connect_result` so
-                // the registry mirror there never fires. Mirror here
-                // instead so renderers see the live tunnel.
-                self.mirror_connect_into_registry(&profile_name);
-
-                self.log(&format!(
-                    "STATUS: Connection established to '{profile_name}'"
-                ));
-
-                if self.runtime.killswitch_mode != crate::state::KillSwitchMode::Off {
-                    self.sync_killswitch();
-                    self.log("SEC: Kill switch armed");
-                }
-
-                if let Some(profile) = self
-                    .runtime
-                    .profiles
-                    .iter_mut()
-                    .find(|p| p.name == profile_name)
-                {
-                    profile.last_used = Some(std::time::SystemTime::now());
-                }
-                self.save_metadata();
-                self.runtime.session_start = Some(start_time);
-            } else if elapsed > 0 && elapsed % constants::SCANNER_LOG_INTERVAL_SECS == 0 {
-                self.log(&format!(
-                    "NET: Scanner: no tunnel interface for '{profile_name}' yet ({elapsed}s elapsed, \
-                     {} active session{})",
-                    active.len(),
-                    if active.len() == 1 { "" } else { "s" }
-                ));
-            }
-            return;
-        }
-
-        if let Some(session) = active.first() {
-            let active_name = session.name.clone();
-            let real_start = session.started_at;
-
-            if let ConnectionState::Connected {
-                profile,
-                details,
-                since,
-                ..
-            } = &mut self.runtime.connection_state
+        // Auto-adopt (D-4): sessions not represented in the registry
+        // that match a catalog profile. Externally-started VPNs
+        // (`wg-quick up X` outside vortix) get registered here on the
+        // next scanner tick so the TUI shows them.
+        for session in &active {
+            let pid = ProfileId::new(&session.name);
+            if !handled.contains(&pid)
+                && self.runtime.profiles.iter().any(|p| p.name == session.name)
             {
-                if profile == &active_name {
-                    if let Some(real) = real_start {
-                        if let Ok(duration) = std::time::SystemTime::now().duration_since(real) {
-                            let calculated_start = Instant::now()
-                                .checked_sub(duration)
-                                .unwrap_or(Instant::now());
-                            if since.elapsed().as_secs().abs_diff(duration.as_secs())
-                                > constants::SESSION_TIME_DRIFT_SECS
-                            {
-                                *since = calculated_start;
-                                self.runtime.session_start = Some(calculated_start);
-                            }
+                self.scanner_adopt_session(session);
+            }
+        }
+    }
+
+    /// Scanner helper (P5b U-P5b-2): force-cleanup a profile stuck in
+    /// the Disconnecting state past `disconnect_timeout`. The kernel
+    /// interface is still up but the teardown isn't returning;
+    /// surface a forced-cleanup toast and drop the entry from the
+    /// registry. Mirrors the legacy timeout path.
+    fn scanner_force_disconnect(&mut self, profile_name: &str) {
+        self.log(&format!(
+            "WARN: Disconnect timed out for '{profile_name}' after {}s, forcing cleanup",
+            self.runtime.config.disconnect_timeout
+        ));
+        self.cleanup_vpn_resources(profile_name);
+        self.runtime.pending_connect = None;
+        if self.legacy_matches(profile_name) {
+            self.runtime.connection_state = ConnectionState::Disconnected;
+            self.runtime.session_start = None;
+        }
+        self.mirror_disconnect_into_registry(profile_name);
+        self.show_toast(
+            "Disconnect timed out — forced cleanup".to_string(),
+            ToastType::Warning,
+        );
+        self.sync_killswitch();
+    }
+
+    /// Scanner helper (P5b U-P5b-2): promote a `Connecting` profile to
+    /// `Connected` once the kernel interface appears. Mirrors the
+    /// legacy `Connecting` → `Connected` branch including kill-switch
+    /// arm, `last_used` update, and metadata save.
+    fn scanner_promote_to_connected(&mut self, profile_name: &str, session: &ActiveSession) {
+        let location = self
+            .runtime
+            .profiles
+            .iter()
+            .find(|p| p.name == profile_name)
+            .map_or_else(|| "Unknown".to_string(), |p| p.location.clone());
+
+        let start_time = session
+            .started_at
+            .and_then(|real| {
+                std::time::SystemTime::now()
+                    .duration_since(real)
+                    .ok()
+                    .and_then(|d| Instant::now().checked_sub(d))
+            })
+            .unwrap_or_else(Instant::now);
+
+        let new_legacy = ConnectionState::Connected {
+            profile: profile_name.to_string(),
+            server_location: location,
+            since: start_time,
+            latency_ms: 0,
+            details: Box::new(DetailedConnectionInfo {
+                interface: session.interface.clone(),
+                internal_ip: session.internal_ip.clone(),
+                endpoint: session.endpoint.clone(),
+                mtu: session.mtu.clone(),
+                public_key: session.public_key.clone(),
+                listen_port: session.listen_port.clone(),
+                transfer_rx: session.transfer_rx.clone(),
+                transfer_tx: session.transfer_tx.clone(),
+                latest_handshake: session.latest_handshake.clone(),
+                pid: session.pid,
+            }),
+        };
+        let claim_legacy_slot = self.legacy_matches(profile_name) || self.legacy_is_disconnected();
+        if claim_legacy_slot {
+            self.runtime.connection_state = new_legacy;
+            self.runtime.session_start = Some(start_time);
+        }
+        // Mirror regardless of which legacy slot is claimed — registry
+        // is the multi-tunnel source of truth.
+        self.mirror_connect_into_registry(profile_name);
+
+        self.log(&format!(
+            "STATUS: Connection established to '{profile_name}'"
+        ));
+
+        if self.runtime.killswitch_mode != crate::state::KillSwitchMode::Off {
+            self.sync_killswitch();
+            self.log("SEC: Kill switch armed");
+        }
+
+        if let Some(profile) = self
+            .runtime
+            .profiles
+            .iter_mut()
+            .find(|p| p.name == profile_name)
+        {
+            profile.last_used = Some(std::time::SystemTime::now());
+        }
+        self.save_metadata();
+    }
+
+    /// Scanner helper (P5b U-P5b-2): refresh kernel-reported details
+    /// on an existing Connected entry. Resyncs session-start drift
+    /// and updates the registry; updates the legacy state only if it
+    /// already tracks this profile.
+    fn scanner_refresh_connected(&mut self, profile_name: &str, session: &ActiveSession) {
+        let real_start = session.started_at;
+        if let ConnectionState::Connected {
+            profile,
+            details,
+            since,
+            ..
+        } = &mut self.runtime.connection_state
+        {
+            if profile == profile_name {
+                if let Some(real) = real_start {
+                    if let Ok(duration) = std::time::SystemTime::now().duration_since(real) {
+                        let calculated_start = Instant::now()
+                            .checked_sub(duration)
+                            .unwrap_or(Instant::now());
+                        if since.elapsed().as_secs().abs_diff(duration.as_secs())
+                            > constants::SESSION_TIME_DRIFT_SECS
+                        {
+                            *since = calculated_start;
+                            self.runtime.session_start = Some(calculated_start);
                         }
                     }
-
-                    details.interface.clone_from(&session.interface);
-                    details.transfer_rx.clone_from(&session.transfer_rx);
-                    details.transfer_tx.clone_from(&session.transfer_tx);
-                    details
-                        .latest_handshake
-                        .clone_from(&session.latest_handshake);
-                    details.internal_ip.clone_from(&session.internal_ip);
-                    details.endpoint.clone_from(&session.endpoint);
-                    details.mtu.clone_from(&session.mtu);
-                    details.listen_port.clone_from(&session.listen_port);
-                    details.public_key.clone_from(&session.public_key);
-                    // Scanner refreshed kernel-reported details on an
-                    // existing Connected entry. The mirror skips when
-                    // registry already holds the same interface+pid;
-                    // when handle_connect_result fired first with an
-                    // empty interface, this is where the registry
-                    // picks up the real values so
-                    // `recompute_primary` can match the kernel
-                    // default route.
-                    self.mirror_connect_into_registry(&active_name);
-                    return;
                 }
-            }
 
-            let location = self
+                details.interface.clone_from(&session.interface);
+                details.transfer_rx.clone_from(&session.transfer_rx);
+                details.transfer_tx.clone_from(&session.transfer_tx);
+                details
+                    .latest_handshake
+                    .clone_from(&session.latest_handshake);
+                details.internal_ip.clone_from(&session.internal_ip);
+                details.endpoint.clone_from(&session.endpoint);
+                details.mtu.clone_from(&session.mtu);
+                details.listen_port.clone_from(&session.listen_port);
+                details.public_key.clone_from(&session.public_key);
+            }
+        }
+        // Push to registry. mirror_connect_into_registry is idempotent
+        // and reads details from legacy state; if legacy doesn't match
+        // this profile (secondary tunnel case), we build a registry
+        // update directly from the session details below.
+        if self.legacy_matches(profile_name) {
+            self.mirror_connect_into_registry(profile_name);
+        } else {
+            self.refresh_registry_from_session(profile_name, session);
+        }
+    }
+
+    /// Scanner helper (P5b U-P5b-2): handle drop detection for a
+    /// profile that has a Connected/Connecting/Reconnecting/Awaiting
+    /// registry entry but no matching kernel session. Mirrors the
+    /// legacy drop path including `connection_drops` counter, kill
+    /// switch activation, and per-profile auto-reconnect scheduling.
+    fn scanner_handle_drop(&mut self, profile_name: &str, was_connected: bool) {
+        if was_connected {
+            self.runtime.connection_drops += 1;
+            self.log(&format!(
+                "WARN: Connection dropped from '{}' (#{} this session)",
+                profile_name, self.runtime.connection_drops
+            ));
+        } else if self.legacy_matches_disconnecting(profile_name) {
+            self.log(&format!("STATUS: Disconnected from '{profile_name}'"));
+        } else if self.legacy_matches_connecting(profile_name) {
+            self.log(&format!(
+                "WARN: Connection to '{profile_name}' failed or was cancelled"
+            ));
+        } else {
+            // No legacy match — log the secondary drop generically.
+            self.log(&format!(
+                "WARN: Secondary tunnel '{profile_name}' no longer present"
+            ));
+        }
+
+        utils::cleanup_openvpn_run_files(profile_name);
+
+        // Update legacy state only if this profile holds the slot.
+        if self.legacy_matches(profile_name) {
+            self.runtime.connection_state = ConnectionState::Disconnected;
+            self.runtime.session_start = None;
+        }
+        self.mirror_disconnect_into_registry(profile_name);
+
+        // KILL SWITCH: activate on unexpected drop of any Connected
+        // tunnel. Multi-tunnel: any tunnel dropping triggers the
+        // existing killswitch policy.
+        if was_connected
+            && self.runtime.killswitch_mode != crate::state::KillSwitchMode::Off
+            && self.runtime.killswitch_state == crate::state::KillSwitchState::Armed
+        {
+            self.runtime.killswitch_state = crate::state::KillSwitchState::Blocking;
+            self.sync_killswitch();
+            self.log("SEC: Kill switch ACTIVATED - blocking traffic");
+            self.show_toast(
+                "VPN dropped! Kill Switch blocking traffic".to_string(),
+                ToastType::Error,
+            );
+        }
+
+        // AUTO-RECONNECT: per-profile (P5b U-P5b-1 / D-2). Each dropped
+        // Connected tunnel schedules its own retry; multiple drops can
+        // recover concurrently.
+        if was_connected && self.runtime.config.auto_reconnect {
+            if let Some(idx) = self
                 .runtime
                 .profiles
                 .iter()
-                .find(|p| p.name == active_name)
-                .map_or_else(|| "Unknown".to_string(), |p| p.location.clone());
+                .position(|p| p.name == profile_name)
+            {
+                let delay = self.runtime.config.auto_reconnect_delay_secs;
+                let max = self.runtime.config.connect_max_retries;
+                self.log(&format!(
+                    "NET: Auto-reconnect scheduled for '{profile_name}' in {delay}s (max {max} retries)"
+                ));
+                self.show_toast(
+                    format!("VPN dropped — reconnecting in {delay}s"),
+                    ToastType::Warning,
+                );
 
-            let start_time = if let Some(real) = real_start {
-                if let Ok(duration) = std::time::SystemTime::now().duration_since(real) {
-                    Instant::now()
-                        .checked_sub(duration)
-                        .unwrap_or(Instant::now())
-                } else {
-                    Instant::now()
-                }
+                let profile_id = crate::vortix_core::profile::ProfileId::new(profile_name);
+                self.runtime.retry_state.insert(
+                    profile_id,
+                    crate::state::RetryState {
+                        attempt: 1,
+                        profile_idx: idx,
+                        auto_reconnect: true,
+                    },
+                );
+
+                let cmd_tx = self.runtime.cmd_tx.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(delay));
+                    let _ = cmd_tx.send(crate::message::Message::RetryConnect { idx, attempt: 1 });
+                });
+            }
+        }
+    }
+
+    /// Scanner helper (P5b U-P5b-2 / D-4): adopt an externally-started
+    /// VPN session into the registry. Triggered when scanner sees an
+    /// active session for a catalog profile not currently in the
+    /// registry — e.g., the user ran `wg-quick up X` outside vortix,
+    /// or vortix restarted while a tunnel was already up.
+    fn scanner_adopt_session(&mut self, session: &ActiveSession) {
+        let profile_name = session.name.clone();
+        let location = self
+            .runtime
+            .profiles
+            .iter()
+            .find(|p| p.name == profile_name)
+            .map_or_else(|| "Unknown".to_string(), |p| p.location.clone());
+
+        let start_time = if let Some(real) = session.started_at {
+            if let Ok(duration) = std::time::SystemTime::now().duration_since(real) {
+                Instant::now()
+                    .checked_sub(duration)
+                    .unwrap_or(Instant::now())
             } else {
-                self.runtime.session_start.unwrap_or(Instant::now())
-            };
+                Instant::now()
+            }
+        } else {
+            self.runtime.session_start.unwrap_or(Instant::now())
+        };
 
-            self.runtime.connection_state = ConnectionState::Connected {
-                profile: active_name.clone(),
-                server_location: location,
-                since: start_time,
-                latency_ms: 0,
-                details: Box::new(DetailedConnectionInfo {
-                    interface: session.interface.clone(),
-                    internal_ip: session.internal_ip.clone(),
-                    endpoint: session.endpoint.clone(),
-                    mtu: session.mtu.clone(),
-                    public_key: session.public_key.clone(),
-                    listen_port: session.listen_port.clone(),
-                    transfer_rx: session.transfer_rx.clone(),
-                    transfer_tx: session.transfer_tx.clone(),
-                    latest_handshake: session.latest_handshake.clone(),
-                    pid: session.pid,
-                }),
-            };
-            // Scanner-driven adoption: the kernel interface exists
-            // but we never went through Connecting (vortix restart,
-            // externally-started VPN). Same mirror requirement as the
-            // Connecting → Connected branch above.
-            self.mirror_connect_into_registry(&active_name);
-
+        let new_legacy = ConnectionState::Connected {
+            profile: profile_name.clone(),
+            server_location: location,
+            since: start_time,
+            latency_ms: 0,
+            details: Box::new(DetailedConnectionInfo {
+                interface: session.interface.clone(),
+                internal_ip: session.internal_ip.clone(),
+                endpoint: session.endpoint.clone(),
+                mtu: session.mtu.clone(),
+                public_key: session.public_key.clone(),
+                listen_port: session.listen_port.clone(),
+                transfer_rx: session.transfer_rx.clone(),
+                transfer_tx: session.transfer_tx.clone(),
+                latest_handshake: session.latest_handshake.clone(),
+                pid: session.pid,
+            }),
+        };
+        // Claim the legacy slot if it's free (Disconnected) or if it
+        // already references this profile in a transitional state
+        // (Connecting/Disconnecting) — promoting that profile to
+        // Connected in the legacy field is the natural continuation.
+        let claim_legacy_slot = self.legacy_is_disconnected()
+            || self.legacy_matches_connecting(&profile_name)
+            || self.legacy_matches_disconnecting(&profile_name);
+        if claim_legacy_slot {
+            self.runtime.connection_state = new_legacy;
             if self.runtime.session_start.is_none() {
                 self.log(&format!(
-                    "STATUS: Connection established to '{active_name}'"
+                    "STATUS: Connection established to '{profile_name}'"
                 ));
-                if real_start.is_some() {
+                if session.started_at.is_some() {
                     self.log("INFO: Synced uptime with system process.");
                 }
                 self.log("INFO: Waiting for telemetry...");
             }
             self.runtime.session_start = Some(start_time);
-        } else if !matches!(self.runtime.connection_state, ConnectionState::Disconnected) {
-            let drop_info = match &self.runtime.connection_state {
-                ConnectionState::Connected {
-                    profile, details, ..
-                } => Some((
-                    profile.clone(),
-                    details.interface.clone(),
-                    details.endpoint.split(':').next().unwrap_or("").to_string(),
-                )),
-                ConnectionState::Disconnecting { profile, .. }
-                | ConnectionState::Connecting { profile, .. } => {
-                    Some((profile.clone(), String::new(), String::new()))
-                }
-                ConnectionState::Disconnected => None,
-            };
-
-            if let Some((profile_name, _, _)) = drop_info {
-                let was_connected = matches!(
-                    self.runtime.connection_state,
-                    ConnectionState::Connected { .. }
-                );
-
-                if was_connected {
-                    self.runtime.connection_drops += 1;
-                    self.log(&format!(
-                        "WARN: Connection dropped from '{}' (#{} this session)",
-                        profile_name, self.runtime.connection_drops
-                    ));
-                } else if matches!(
-                    self.runtime.connection_state,
-                    ConnectionState::Disconnecting { .. }
-                ) {
-                    self.log(&format!("STATUS: Disconnected from '{profile_name}'"));
-                } else if matches!(
-                    self.runtime.connection_state,
-                    ConnectionState::Connecting { .. }
-                ) {
-                    self.log(&format!(
-                        "WARN: Connection to '{profile_name}' failed or was cancelled"
-                    ));
-                }
-
-                utils::cleanup_openvpn_run_files(&profile_name);
-
-                // Transition to Disconnected BEFORE syncing killswitch so that
-                // sync_killswitch sees the correct connection state.
-                self.runtime.connection_state = ConnectionState::Disconnected;
-                self.runtime.session_start = None;
-                // Scanner-driven drop: kernel interface disappeared
-                // out-of-band (user killed wg-quick, kernel module
-                // unloaded, connect failed silently). Renderer must
-                // stop showing the phantom tunnel.
-                self.mirror_disconnect_into_registry(&profile_name);
-
-                // KILL SWITCH: Activate on unexpected VPN drop
-                if was_connected
-                    && self.runtime.killswitch_mode != crate::state::KillSwitchMode::Off
-                    && self.runtime.killswitch_state == crate::state::KillSwitchState::Armed
-                {
-                    self.runtime.killswitch_state = crate::state::KillSwitchState::Blocking;
-                    self.sync_killswitch();
-                    self.log("SEC: Kill switch ACTIVATED - blocking traffic");
-                    self.show_toast(
-                        "VPN dropped! Kill Switch blocking traffic".to_string(),
-                        ToastType::Error,
-                    );
-                }
-
-                // AUTO-RECONNECT: Queue reconnection for unexpected drops.
-                // Per-profile (P5b U-P5b-1 / D-2): each Connected profile
-                // schedules its own auto-reconnect entry. A drop on A
-                // doesn't disturb B's retry; both can run concurrently.
-                if was_connected && self.runtime.config.auto_reconnect {
-                    if let Some(idx) = self
-                        .runtime
-                        .profiles
-                        .iter()
-                        .position(|p| p.name == profile_name)
-                    {
-                        let delay = self.runtime.config.auto_reconnect_delay_secs;
-                        let max = self.runtime.config.connect_max_retries;
-                        self.log(&format!(
-                            "NET: Auto-reconnect scheduled for '{profile_name}' in {delay}s (max {max} retries)"
-                        ));
-                        self.show_toast(
-                            format!("VPN dropped — reconnecting in {delay}s"),
-                            ToastType::Warning,
-                        );
-
-                        let profile_id = crate::vortix_core::profile::ProfileId::new(&profile_name);
-                        self.runtime.retry_state.insert(
-                            profile_id,
-                            crate::state::RetryState {
-                                attempt: 1,
-                                profile_idx: idx,
-                                auto_reconnect: true,
-                            },
-                        );
-
-                        let cmd_tx = self.runtime.cmd_tx.clone();
-                        std::thread::spawn(move || {
-                            std::thread::sleep(std::time::Duration::from_secs(delay));
-                            let _ = cmd_tx
-                                .send(crate::message::Message::RetryConnect { idx, attempt: 1 });
-                        });
-                    }
-                }
-            } else {
-                self.runtime.connection_state = ConnectionState::Disconnected;
-                self.runtime.session_start = None;
-            }
+            self.mirror_connect_into_registry(&profile_name);
+        } else {
+            self.log(&format!(
+                "INFO: Adopting externally-started tunnel '{profile_name}' as a secondary"
+            ));
+            self.refresh_registry_from_session(&profile_name, session);
         }
+    }
+
+    /// Whether the legacy `runtime.connection_state` field refers to
+    /// the given profile in any non-Disconnected variant.
+    fn legacy_matches(&self, profile_name: &str) -> bool {
+        match &self.runtime.connection_state {
+            ConnectionState::Connected { profile, .. }
+            | ConnectionState::Connecting { profile, .. }
+            | ConnectionState::Disconnecting { profile, .. } => profile == profile_name,
+            ConnectionState::Disconnected => false,
+        }
+    }
+
+    fn legacy_matches_connecting(&self, profile_name: &str) -> bool {
+        matches!(
+            &self.runtime.connection_state,
+            ConnectionState::Connecting { profile, .. } if profile == profile_name
+        )
+    }
+
+    fn legacy_matches_disconnecting(&self, profile_name: &str) -> bool {
+        matches!(
+            &self.runtime.connection_state,
+            ConnectionState::Disconnecting { profile, .. } if profile == profile_name
+        )
+    }
+
+    fn legacy_is_disconnected(&self) -> bool {
+        matches!(self.runtime.connection_state, ConnectionState::Disconnected)
     }
 
     fn handle_retry_connect(&mut self, idx: usize, attempt: u32) {

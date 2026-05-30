@@ -747,6 +747,59 @@ impl App {
         );
     }
 
+    /// Push fresh kernel-reported details for a profile into the
+    /// registry directly from a scanner `ActiveSession`, bypassing the
+    /// legacy `connection_state` field. Used by the per-profile
+    /// scanner (P5b U-P5b-2) for secondary tunnels and adoption paths
+    /// where the legacy slot is occupied by a different profile (or
+    /// no-op when this is the only path keeping the registry fresh).
+    ///
+    /// Idempotent on the registry side (`set_connected` upserts the
+    /// existing entry's state). When the profile isn't in the catalog
+    /// or the registry has no prior entry, behaves the same as a fresh
+    /// insertion via `set_connected`.
+    pub fn refresh_registry_from_session(
+        &mut self,
+        profile_name: &str,
+        session: &crate::core::scanner::ActiveSession,
+    ) {
+        let Some(profile) = self
+            .runtime
+            .profiles
+            .iter()
+            .find(|p| p.name == profile_name)
+            .cloned()
+        else {
+            return;
+        };
+        let profile_id = ProfileId::new(&profile.name);
+        let allowed_ips = extract_allowed_ips(profile.protocol, &profile.config_path);
+        let core_details = crate::vortix_core::engine::state::DetailedConnectionInfo {
+            interface: session.interface.clone(),
+            internal_ip: session.internal_ip.clone(),
+            endpoint: session.endpoint.clone(),
+            mtu: session.mtu.clone(),
+            public_key: session.public_key.clone(),
+            listen_port: session.listen_port.clone(),
+            transfer_rx: session.transfer_rx.clone(),
+            transfer_tx: session.transfer_tx.clone(),
+            latest_handshake: session.latest_handshake.clone(),
+            pid: session.pid,
+        };
+        // Anchor since on the session's real start when available;
+        // otherwise treat the tunnel as newly seen.
+        let since = session
+            .started_at
+            .unwrap_or_else(std::time::SystemTime::now);
+        self.registry.set_connected(
+            profile_id,
+            allowed_ips,
+            core_details,
+            since,
+            placeholder_engine_for_profile(&profile),
+        );
+    }
+
     /// Mirror a legacy-path disconnect into `self.registry`: seed the
     /// registry's FSM to `Disconnected` (without running `Disconnecting`
     /// or `tunnel.down()`) and remove the entry. Idempotent — a profile

@@ -61,6 +61,13 @@ fn test_app() -> App {
 /// the same via `mirror_connect_into_registry` on every successful
 /// connect.
 fn set_connected(app: &mut App, name: &str) {
+    // mirror_connect_into_registry no-ops when the profile isn't in
+    // the catalog; auto-add so test helpers leave a fully-populated
+    // registry entry regardless of whether the caller invoked
+    // `add_profiles` first.
+    if !app.runtime.profiles.iter().any(|p| p.name == name) {
+        add_profiles(app, &[name]);
+    }
     app.runtime.session_start = Some(Instant::now());
     app.runtime.connection_state = ConnectionState::Connected {
         since: Instant::now(),
@@ -78,12 +85,18 @@ fn set_connected(app: &mut App, name: &str) {
 
 /// Helper: put app into a Disconnecting state for a given profile name.
 ///
-/// Mirrors into the registry so post-P5a helpers see the in-flight
-/// state. `mirror_disconnecting_into_registry` is a no-op when the
-/// registry has no prior entry — tests that need a Disconnecting
-/// transition off a previously-Connected state should call
-/// `set_connected` first.
+/// Production semantics: a profile only reaches Disconnecting via
+/// Connected → user-initiated disconnect. The registry's
+/// `set_disconnecting` is a no-op without a prior Connected entry, so
+/// this helper seeds Connected first (if not already present) so the
+/// transition lands in both the legacy field and the registry. Tests
+/// can rely on this single call to leave the app in a fully
+/// consistent Disconnecting state.
 fn set_disconnecting(app: &mut App, name: &str) {
+    use crate::vortix_core::profile::ProfileId;
+    if app.registry.snapshot(&ProfileId::new(name)).is_none() {
+        set_connected(app, name);
+    }
     app.runtime.connection_state = ConnectionState::Disconnecting {
         started: Instant::now(),
         profile: name.to_string(),
@@ -210,13 +223,23 @@ fn test_scanner_confirms_disconnect_when_interface_gone() {
 
 #[test]
 fn test_scanner_safety_timeout_after_30s() {
+    use crate::vortix_core::profile::ProfileId;
+
     let mut app = test_app();
+    // Seed both legacy + registry with a Disconnecting entry whose
+    // started_at is 31s in the past. The registry's set_disconnecting
+    // is a no-op without a prior Connected entry, so set_connected
+    // first; then transition with the back-dated SystemTime.
+    set_connected(&mut app, "test-vpn");
     app.runtime.connection_state = ConnectionState::Disconnecting {
         started: Instant::now()
             .checked_sub(std::time::Duration::from_secs(31))
             .unwrap(),
         profile: "test-vpn".to_string(),
     };
+    let past = std::time::SystemTime::now() - std::time::Duration::from_secs(31);
+    app.registry
+        .set_disconnecting(&ProfileId::new("test-vpn"), past);
 
     let sessions = vec![fake_session("test-vpn")];
     app.handle_message(Message::SyncSystemState(sessions));
@@ -293,10 +316,14 @@ fn test_d_while_disconnected_is_noop() {
 
 /// Helper: put app into a Connecting state for a given profile name.
 ///
-/// Mirrors into the registry so post-P5a helpers see the in-flight
-/// state. Matches the production connect path (Path A) which mirrors
-/// every Connecting transition into the registry.
+/// Auto-adds the profile to the catalog if missing (mirror_* helpers
+/// require a catalog entry to register). Then sets the legacy field
+/// and mirrors the Connecting transition into the registry, matching
+/// the production Path A connect flow.
 fn set_connecting(app: &mut App, name: &str) {
+    if !app.runtime.profiles.iter().any(|p| p.name == name) {
+        add_profiles(app, &[name]);
+    }
     app.runtime.connection_state = ConnectionState::Connecting {
         started: Instant::now(),
         profile: name.to_string(),
@@ -769,14 +796,22 @@ fn test_pending_preserved_on_disconnect_failure() {
 
 #[test]
 fn test_pending_cleared_on_30s_timeout() {
+    use crate::vortix_core::profile::ProfileId;
+
     let mut app = test_app();
     add_profiles(&mut app, &["vpn-a", "vpn-b"]);
+    // Seed Connected then back-date the Disconnecting transition by
+    // 31s so the scanner's per-profile timeout branch fires.
+    set_connected(&mut app, "vpn-a");
     app.runtime.connection_state = ConnectionState::Disconnecting {
         started: Instant::now()
             .checked_sub(std::time::Duration::from_secs(31))
             .unwrap(),
         profile: "vpn-a".to_string(),
     };
+    let past = std::time::SystemTime::now() - std::time::Duration::from_secs(31);
+    app.registry
+        .set_disconnecting(&ProfileId::new("vpn-a"), past);
     app.runtime.pending_connect = Some(1);
 
     let sessions = vec![fake_session("vpn-a")];
@@ -814,6 +849,10 @@ fn test_connect_result_success_transitions_to_connected() {
 #[test]
 fn test_connect_result_failure_transitions_to_disconnected() {
     let mut app = test_app();
+    // Disable retry so failure short-circuits straight to the final
+    // "Failed to connect" toast instead of scheduling a retry — the
+    // behavior this test was originally written to exercise.
+    app.runtime.config.connect_max_retries = 0;
     set_connecting(&mut app, "test-vpn");
 
     app.handle_message(Message::ConnectResult {
