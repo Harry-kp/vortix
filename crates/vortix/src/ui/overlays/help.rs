@@ -83,6 +83,15 @@ const HELP_TEXT: &[(&str, &[(&str, &str)])] = &[
             ("Esc", "Close"),
         ],
     ),
+    (
+        "Security Guard sigils",
+        &[
+            ("✓", "OK — check passes"),
+            ("✗", "Alarm — leak or unprotected"),
+            ("⚠", "Warning — action recommended"),
+            ("─", "Not enforced on this platform"),
+        ],
+    ),
 ];
 
 #[must_use]

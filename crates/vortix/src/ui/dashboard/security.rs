@@ -1,4 +1,6 @@
 use crate::app::App;
+use crate::state::{KillSwitchMode, KillSwitchState};
+use crate::vortix_core::engine::registry::TunnelSnapshot;
 use crate::vortix_core::engine::state::Connection;
 use crate::{constants, theme, utils};
 use ratatui::{
@@ -9,34 +11,351 @@ use ratatui::{
     Frame,
 };
 
-/// Sigil legend rendered at the bottom of the panel.
-///
-/// Plan #001 U18: keep the meaning of the three primary sigils visible inline
-/// so users don't have to guess. `✗` (off / unprotected) is intentionally
-/// omitted from the legend — its meaning is conventional and the panel only
-/// pairs it with a self-explanatory headline (`Killswitch : Off`).
-const SIGIL_LEGEND: &str = "Legend: ✓ pass · ⚠ at risk · ─ not applicable";
+// ── Layout primitives ───────────────────────────────────────────────────────
+//
+// The panel reads like a form: each row is `<indent> <label> <value> <…> <sigil>`
+// with the sigil right-aligned in a fixed 3-cell column. Visual hierarchy
+// comes from `Sigil` variants (muted-by-default for OK rows, bright for
+// alarms) and from a single dim accent on the section words. Theme constants
+// only — no new colours. The polish principles apply uniformly to all three
+// render branches (`PROTECTED` / `PARTIAL` / `EXPOSED`) so the panel feels
+// the same regardless of posture.
 
-/// Render the Security Guard panel scoped to the primary tunnel.
+/// Width threshold below which section words drop and the panel renders as
+/// a flat list. Picked against the panel's actual budget at 80×24 — the
+/// Security panel gets ~40% of the dash row's width, which lands around
+/// 24 cells of inner content on a typical terminal.
+const SECTION_HEADER_MIN_INNER_WIDTH: u16 = 24;
+
+/// Total width of the label column: 10-char label slot + `: ` separator
+/// (2 chars). Mirrors `connection_details.rs`'s `<label>: <value>` style
+/// so the two side-by-side panels read with the same tabular rhythm.
+/// The block itself already adds 1 cell of horizontal padding.
+const LABEL_COLUMN_WIDTH: usize = 12;
+
+/// Total width of the right-pinned sigil column: 1-char sigil + 1-space pad.
+const SIGIL_COLUMN_WIDTH: usize = 2;
+
+/// Status sigil with its rendering rules.
 ///
-/// Multi-connection plan U6 Stage B: IP / DNS leak checks read from
-/// `app.registry.primary()` snapshot (the tunnel that owns the kernel
-/// default route). Secondaries don't carry IP/DNS leak posture — the
-/// primary's route table determines internet-bound exit posture per H7.
+/// - `OkMuted` — the row is fine; sigil sits in the right column in the
+///   theme's success colour, no bold modifier. Recedes visually.
+/// - `NotApplicable` — the row is reporting a dimension the current
+///   platform doesn't enforce (e.g. IPv6 on a v4-only killswitch). Greys
+///   out so it doesn't read as a fixable warning.
+/// - `AlarmWarn` / `AlarmError` — the row needs attention. Bold modifier
+///   pulls the eye; these are the only bolded sigils on screen in the
+///   all-OK state.
+#[derive(Clone, Copy)]
+enum Sigil {
+    OkMuted,
+    NotApplicable,
+    AlarmWarn,
+    AlarmError,
+}
+
+impl Sigil {
+    fn glyph(self) -> &'static str {
+        match self {
+            Self::OkMuted => "✓",
+            Self::NotApplicable => "─",
+            Self::AlarmWarn => "⚠",
+            Self::AlarmError => "✗",
+        }
+    }
+
+    fn style(self) -> Style {
+        let base = match self {
+            Self::OkMuted => Style::default().fg(theme::SUCCESS),
+            Self::NotApplicable => Style::default().fg(theme::INACTIVE),
+            Self::AlarmWarn => Style::default().fg(theme::WARNING),
+            Self::AlarmError => Style::default().fg(theme::ERROR),
+        };
+        if matches!(self, Self::AlarmWarn | Self::AlarmError) {
+            base.add_modifier(Modifier::BOLD)
+        } else {
+            base
+        }
+    }
+}
+
+// ── Cipher strength classification ──────────────────────────────────────────
+//
+// The Encryption row used to render the cipher name with the same green
+// `✓` regardless of whether the cipher was modern AEAD or 1990s broken
+// crypto (BF-CBC etc. still ship in legacy OpenVPN profiles). The
+// classification below turns the raw cipher string into a security-grade
+// verdict so the panel actually surfaces the strength, not just the name.
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CipherStrength {
+    /// Modern AEAD (ChaCha20-Poly1305, AES-GCM family). The right
+    /// default for any new VPN deployment.
+    Modern,
+    /// Non-AEAD but cryptographically strong (AES-256 in CBC/CTR mode,
+    /// AES-192). Acceptable but worth upgrading.
+    Strong,
+    /// Deprecated — still functional crypto but vulnerable to known
+    /// attacks (Sweet32 on 64-bit-block ciphers, 3DES brute-force window,
+    /// AES-128-CBC padding-oracle exposure in some protocols). Should be
+    /// replaced.
+    Deprecated,
+    /// Broken or null. Active compromise: BF-CBC (Sweet32 + small block),
+    /// DES / RC4 / RC2 / NULL / CAST5 / IDEA — the wire is effectively
+    /// plaintext to a motivated adversary.
+    Insecure,
+}
+
+impl CipherStrength {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Modern => "modern AEAD",
+            Self::Strong => "strong",
+            Self::Deprecated => "deprecated",
+            Self::Insecure => "INSECURE",
+        }
+    }
+
+    fn sigil(self) -> Sigil {
+        match self {
+            Self::Modern | Self::Strong => Sigil::OkMuted,
+            Self::Deprecated => Sigil::AlarmWarn,
+            Self::Insecure => Sigil::AlarmError,
+        }
+    }
+
+    fn value_color(self) -> Color {
+        match self {
+            Self::Modern | Self::Strong => theme::NORD_YELLOW,
+            Self::Deprecated => theme::WARNING,
+            Self::Insecure => theme::ERROR,
+        }
+    }
+
+    /// Sub-line copy shown under an alarming Encryption row. None for
+    /// `Modern` / `Strong` — those rows stay silent.
+    fn alarm_subline(self) -> Option<&'static str> {
+        match self {
+            Self::Insecure => Some("broken cipher — switch to AES-GCM or ChaCha20"),
+            Self::Deprecated => Some("upgrade to AES-GCM or ChaCha20-Poly1305"),
+            Self::Modern | Self::Strong => None,
+        }
+    }
+}
+
+/// Classify a cipher string into a security-grade verdict. Accepts the
+/// common `OpenVPN` / `WireGuard` cipher names (case-insensitive; tolerates
+/// whitespace and embedded protocol metadata).
+fn classify_cipher(cipher: &str) -> CipherStrength {
+    let c = cipher.to_uppercase();
+
+    // Order matters: check the BROKEN family first so a name like
+    // `DES-EDE3-CBC` doesn't slip through a generic `AES-` test below.
+
+    // Broken — wire is effectively plaintext.
+    // BF/Blowfish — Sweet32 (CVE-2016-2183).
+    if c.contains("BF-") || c.contains("BLOWFISH") {
+        return CipherStrength::Insecure;
+    }
+    // DES (single) — 56-bit key, brute-forceable.
+    if c == "DES" || c.contains("DES-CBC") && !c.contains("3DES") && !c.contains("DES-EDE") {
+        return CipherStrength::Insecure;
+    }
+    // RC4 / RC2 — broken stream ciphers (CVE-2015-2808).
+    if c.contains("RC4") || c.contains("RC2") {
+        return CipherStrength::Insecure;
+    }
+    // NULL cipher — no encryption.
+    if c.contains("NULL") {
+        return CipherStrength::Insecure;
+    }
+    // CAST5 / IDEA — small block, known attacks.
+    if c.contains("CAST5") || c.contains("IDEA") {
+        return CipherStrength::Insecure;
+    }
+
+    // Modern AEAD — preferred default.
+    if c.contains("CHACHA20-POLY1305")
+        || c.contains("XCHACHA20")
+        || c.contains("AES-256-GCM")
+        || c.contains("AES-192-GCM")
+        || c.contains("AES-128-GCM")
+    {
+        return CipherStrength::Modern;
+    }
+
+    // Deprecated — still secret today but plan to migrate.
+    // 3DES (DES-EDE3) — brute-force window narrowing; deprecated by NIST.
+    if c.contains("3DES") || c.contains("DES-EDE3") || c.contains("DES-EDE") {
+        return CipherStrength::Deprecated;
+    }
+    // AES-128 in CBC — Sweet32 + padding-oracle exposure depending on
+    // surrounding protocol. Still strong primitive but worth upgrading.
+    if c.contains("AES-128-CBC") {
+        return CipherStrength::Deprecated;
+    }
+
+    // Strong — AES-256 in CBC/CTR, AES-192 non-GCM. Acceptable.
+    if c.contains("AES-256-CBC") || c.contains("AES-256-CTR") || c.contains("AES-192") {
+        return CipherStrength::Strong;
+    }
+
+    // Anything we don't recognise — be cautious. Better to flag a
+    // false-positive deprecated label than to mark unknown crypto as
+    // Modern.
+    CipherStrength::Deprecated
+}
+
+/// Section word rendered above its rows. Uses the theme's primary accent in
+/// non-bold form so it reads as a structural marker, not an alarm. Mirrors
+/// how other dashboard panels (Sidebar, Connection Details) treat their
+/// section labels for cross-panel coherence.
+fn section_header(name: &'static str) -> Line<'static> {
+    Line::from(Span::styled(
+        name.to_string(),
+        Style::default().fg(theme::ACCENT_PRIMARY),
+    ))
+}
+
+/// Single row in the audit panel. Three columns visually: indent+label
+/// (fixed width), value (gets the remaining space), sigil (right-pinned).
 ///
-/// Plan #001 U18 layers in three behaviours:
-/// - **Primary-scoped headline:** the top banner is `PROTECTED` only when a
-///   primary exists and its IP/DNS checks pass; `PARTIAL` when active tunnels
-///   exist but none owns the default route (split-route only); `EXPOSED`
-///   when no tunnels at all.
-/// - **KS-mode-aware Killswitch line:** in the `PARTIAL` (no-primary) branch,
-///   render exactly one bullet that matches the active killswitch mode rather
-///   than three sub-bullets — the user reads a single sigil + headline to
-///   identify their protection posture.
-/// - **Honest IPv6 reporting:** the killswitch is v4-only on every supported
-///   platform today, so the IPv6 line always shows `⚠ Not enforced
-///   (v4-only killswitch)`. The previous `✓ Blocked` framing implied
-///   protection we do not actually deliver.
+/// `value_color` is the colour of the value text itself — usually
+/// `theme::TEXT_PRIMARY` for muted-OK rows or the sigil's colour for
+/// alarming rows.
+fn audit_row(
+    label: &str,
+    value: &str,
+    value_color: Color,
+    sigil: Sigil,
+    inner_width: usize,
+) -> Line<'static> {
+    let label_col = format!("{label:<10}: ");
+    debug_assert_eq!(label_col.chars().count(), LABEL_COLUMN_WIDTH);
+
+    let value_budget = inner_width
+        .saturating_sub(LABEL_COLUMN_WIDTH)
+        .saturating_sub(SIGIL_COLUMN_WIDTH);
+    let value_truncated = utils::truncate(value, value_budget);
+    let value_chars = value_truncated.chars().count();
+    let padding = " ".repeat(value_budget.saturating_sub(value_chars));
+
+    let sigil_col = format!("{} ", sigil.glyph());
+
+    Line::from(vec![
+        Span::styled(label_col, Style::default().fg(theme::TEXT_SECONDARY)),
+        Span::styled(value_truncated, Style::default().fg(value_color)),
+        Span::raw(padding),
+        Span::styled(sigil_col, sigil.style()),
+    ])
+}
+
+/// One-line human-readable explainer rendered under an alarming row.
+/// Aligned to the value column for visual continuity with its parent row.
+fn alarm_subline(text: &str, inner_width: usize) -> Line<'static> {
+    let indent = " ".repeat(LABEL_COLUMN_WIDTH);
+    let budget = inner_width.saturating_sub(LABEL_COLUMN_WIDTH);
+    let truncated = utils::truncate(text, budget);
+    Line::from(vec![
+        Span::raw(indent),
+        Span::styled(truncated, Style::default().fg(theme::TEXT_SECONDARY)),
+    ])
+}
+
+/// Footer line: `Updated Ns ago` / `Updated Nm ago` / pending placeholder.
+fn footer_line(secs: Option<u64>) -> Line<'static> {
+    let text = match secs {
+        Some(s) if s < 5 => "Updated just now".to_string(),
+        Some(s) if s < 60 => format!("Updated {s}s ago"),
+        Some(s) => format!("Updated {}m ago", s / 60),
+        None => "Updated pending…".to_string(),
+    };
+    Line::from(Span::styled(text, Style::default().fg(Color::DarkGray)))
+}
+
+// ── PanelState: the polished panel's read-only input ────────────────────────
+
+/// Compact data the layout builders read from. Lifting this off `App`
+/// makes the builders pure functions, which lets us unit-test the
+/// `PROTECTED` branch without driving the registry into
+/// `Connection::Connected` (currently requires private test helpers).
+#[derive(Clone)]
+struct PanelState {
+    inner_width: u16,
+    /// Always-true for `build_protected_audit`; always-false for
+    /// `build_exposed_audit`; data-dependent for `build_partial_audit`.
+    show_section_headers: bool,
+
+    // Identity
+    public_ip: String,
+    location: Option<String>,
+    ip_status: IpStatus,
+    dns_server: String,
+    dns_provider: Option<&'static str>,
+    dns_leaking: bool,
+    real_dns: Option<String>,
+
+    // Defense
+    killswitch_mode: KillSwitchMode,
+    killswitch_state: KillSwitchState,
+    encryption: String,
+
+    // Footer
+    last_check_secs: Option<u64>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IpStatus {
+    Masked,
+    Leaking,
+    Pending,
+}
+
+impl PanelState {
+    fn show_headers(&self) -> bool {
+        self.show_section_headers && self.inner_width >= SECTION_HEADER_MIN_INNER_WIDTH
+    }
+}
+
+// ── Render entry point ──────────────────────────────────────────────────────
+
+/// Top-level safety verdict — the answer to "how safe am I right now?".
+/// Rendered as a prominent banner at the top of the panel: bold + colour
+/// for `Protected` / `Partial`, bg-bar with black text for `Exposed`
+/// (the eye-catcher because no VPN is the genuine alarm).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    Protected,
+    Partial,
+    Exposed,
+}
+
+impl Verdict {
+    fn banner(self) -> Line<'static> {
+        match self {
+            Self::Protected => Line::from(Span::styled(
+                "  PROTECTED",
+                Style::default()
+                    .fg(theme::SUCCESS)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Self::Partial => Line::from(Span::styled(
+                "  PARTIAL",
+                Style::default()
+                    .fg(theme::WARNING)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Self::Exposed => Line::from(Span::styled(
+                " ⚠ EXPOSED ",
+                Style::default()
+                    .bg(theme::WARNING)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD),
+            )),
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     let is_focused = app.should_draw_focus(&crate::app::FocusedPanel::Security);
@@ -51,15 +370,6 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(border_style)
-        .padding(Padding::horizontal(1))
-        .title(" Security Guard ");
-
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
     let primary_snap = app
         .registry
         .primary()
@@ -70,25 +380,104 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     );
     let any_tunnels = app.registry.tunnel_count() > 0;
 
-    if !primary_connected {
-        // No primary means no default-route exit posture to attest to. If
-        // there are still active tunnels (split-route mode), surface PARTIAL
-        // with a KS-mode-aware Killswitch bullet so the user knows their
-        // baseline protection posture. Otherwise fall through to the
-        // existing EXPOSED copy.
-        if any_tunnels {
-            render_partial_no_primary(frame, app, inner);
-        } else {
-            render_exposed(frame, inner);
-        }
-        return;
-    }
-
-    let dns_leaking = match &app.runtime.real_dns {
-        Some(real_dns) => &app.runtime.dns_server == real_dns,
-        None => false,
+    let verdict = if primary_connected {
+        verdict_for_protected(app, primary_snap.as_ref())
+    } else if any_tunnels {
+        Verdict::Partial
+    } else {
+        Verdict::Exposed
     };
 
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .padding(Padding::horizontal(1))
+        .title(" Security Guard ");
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let body = match verdict {
+        Verdict::Protected => {
+            let state = collect_protected_state(app, primary_snap.as_ref(), inner.width);
+            build_protected_audit(&state)
+        }
+        Verdict::Partial => {
+            let state = collect_partial_state(app, inner.width);
+            build_partial_audit(&state)
+        }
+        Verdict::Exposed => build_exposed_audit(app, inner.width),
+    };
+
+    // Banner sits above body content with a single blank between for breath.
+    let mut audit = Vec::with_capacity(body.len() + 2);
+    audit.push(verdict.banner());
+    audit.push(Line::from(""));
+    audit.extend(body);
+
+    let final_audit = compact_to_fit(audit, inner.height as usize);
+    frame.render_widget(Paragraph::new(final_audit), inner);
+}
+
+/// Refines the headline verdict for the connected-primary case. Even with
+/// a primary up, the panel demotes to `Partial` when IP/DNS posture is
+/// degraded so the title doesn't claim full protection while a row is red.
+fn verdict_for_protected(app: &App, primary_snap: Option<&TunnelSnapshot>) -> Verdict {
+    let ip_leaking = matches!(&app.runtime.real_ip, Some(real) if &app.runtime.public_ip == real);
+    let dns_leaking =
+        matches!(&app.runtime.real_dns, Some(real) if &app.runtime.dns_server == real);
+    let ks_alarm = matches!(
+        (app.runtime.killswitch_mode, app.runtime.killswitch_state),
+        (
+            crate::state::KillSwitchMode::Auto,
+            crate::state::KillSwitchState::Blocking
+        ) | (crate::state::KillSwitchMode::Off, _)
+    );
+    // Insecure cipher = effective wire plaintext. Demote to Partial so
+    // the title doesn't claim full protection while crypto is broken.
+    let cipher_insecure = matches!(
+        classify_cipher(&derive_encryption(primary_snap)),
+        CipherStrength::Insecure
+    );
+
+    if ip_leaking || dns_leaking || ks_alarm || cipher_insecure {
+        Verdict::Partial
+    } else {
+        Verdict::Protected
+    }
+}
+
+/// Drop blank lines first, then truncate. Same shape as the prior
+/// implementation — preserves headline + status rows on tight terminals.
+/// In the new layout the audit list is sized to fit at 80×24, so this is
+/// the safety net for smaller-than-baseline windows, not the default path.
+fn compact_to_fit(audit: Vec<Line<'static>>, available_height: usize) -> Vec<Line<'static>> {
+    if available_height == 0 || audit.len() <= available_height {
+        return audit;
+    }
+    let mut compacted = Vec::with_capacity(available_height);
+    for line in audit {
+        let is_blank =
+            line.spans.is_empty() || line.spans.iter().all(|s| s.content.trim().is_empty());
+        if is_blank && compacted.len() + 1 == available_height {
+            // never let a blank be the last visible line
+            continue;
+        }
+        compacted.push(line);
+        if compacted.len() == available_height {
+            break;
+        }
+    }
+    compacted
+}
+
+// ── State collection ────────────────────────────────────────────────────────
+
+fn collect_protected_state(
+    app: &App,
+    primary_snap: Option<&TunnelSnapshot>,
+    inner_width: u16,
+) -> PanelState {
     let ip_status = match &app.runtime.real_ip {
         Some(real)
             if !app.runtime.public_ip.is_empty()
@@ -97,18 +486,93 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
                 && !app.runtime.public_ip.starts_with("Error") =>
         {
             if &app.runtime.public_ip == real {
-                (false, true, Some(real.clone()))
+                IpStatus::Leaking
             } else {
-                (true, false, Some(real.clone()))
+                IpStatus::Masked
             }
         }
-        _ => (false, false, None),
+        _ => IpStatus::Pending,
     };
-    let (ip_masked, ip_leaking, real_ip_opt) = ip_status;
 
-    // Encryption derived from the primary tunnel's details (`public_key`
-    // is empty for OpenVPN, populated for WireGuard).
-    let encryption_info = match primary_snap.as_ref().map(|s| &s.state) {
+    let dns_leaking = match &app.runtime.real_dns {
+        Some(real_dns) => &app.runtime.dns_server == real_dns,
+        None => false,
+    };
+
+    let dns_provider = dns_provider_label(&app.runtime.dns_server);
+
+    let encryption = derive_encryption(primary_snap);
+
+    let location = if app.runtime.location.is_empty()
+        || app.runtime.location == constants::MSG_DETECTING
+        || app.runtime.location == constants::MSG_FETCHING
+    {
+        None
+    } else {
+        Some(app.runtime.location.clone())
+    };
+
+    PanelState {
+        inner_width,
+        show_section_headers: true,
+        public_ip: app.runtime.public_ip.clone(),
+        location,
+        ip_status,
+        dns_server: app.runtime.dns_server.clone(),
+        dns_provider,
+        dns_leaking,
+        real_dns: app.runtime.real_dns.clone(),
+        killswitch_mode: app.runtime.killswitch_mode,
+        killswitch_state: app.runtime.killswitch_state,
+        encryption,
+        last_check_secs: app
+            .runtime
+            .last_security_check
+            .map(|t| t.elapsed().as_secs()),
+    }
+}
+
+fn collect_partial_state(app: &App, inner_width: u16) -> PanelState {
+    // Multi-tunnel PARTIAL: pick the first Connected tunnel as the
+    // representative cipher source. Ciphers are usually homogeneous in
+    // practice (all WG or all OpenVPN); if they diverge, surfacing the
+    // first one is still strictly more useful than `N/A`.
+    let encryption = app
+        .registry
+        .snapshot_all()
+        .iter()
+        .find(|s| matches!(s.state, Connection::Connected { .. }))
+        .map_or_else(|| "N/A".to_string(), |s| derive_encryption(Some(s)));
+
+    PanelState {
+        inner_width,
+        show_section_headers: true,
+        public_ip: app.runtime.public_ip.clone(),
+        location: None,
+        ip_status: IpStatus::Pending,
+        dns_server: app.runtime.dns_server.clone(),
+        dns_provider: dns_provider_label(&app.runtime.dns_server),
+        dns_leaking: false,
+        real_dns: None,
+        killswitch_mode: app.runtime.killswitch_mode,
+        killswitch_state: app.runtime.killswitch_state,
+        encryption,
+        last_check_secs: app
+            .runtime
+            .last_security_check
+            .map(|t| t.elapsed().as_secs()),
+    }
+}
+
+/// Pull the active cipher name out of the primary tunnel snapshot.
+/// `WireGuard` always uses `ChaCha20-Poly1305` by spec; `OpenVPN` reports
+/// its cipher in `details.latest_handshake` prefixed with `Cipher:` (an
+/// existing convention from the `OpenVPN` parser). Returns `"N/A"` when
+/// no primary is connected — callers should treat unrecognised strings
+/// the same as `classify_cipher` would (downgrades unknown to
+/// `Deprecated`).
+fn derive_encryption(primary_snap: Option<&TunnelSnapshot>) -> String {
+    match primary_snap.map(|s| &s.state) {
         Some(Connection::Connected { details, .. }) => {
             if details.public_key == "OpenVPN" || details.public_key.is_empty() {
                 if details.latest_handshake.starts_with("Cipher:") {
@@ -121,362 +585,286 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
             }
         }
         _ => "N/A".to_string(),
-    };
+    }
+}
 
-    let check_pass = Span::styled("✓ ", Style::default().fg(theme::SUCCESS));
-    let check_fail = Span::styled("✗ ", Style::default().fg(theme::ERROR));
-    let check_warn = Span::styled("⚠ ", Style::default().fg(theme::WARNING));
-
-    let max_val = inner.width.saturating_sub(15) as usize;
-
-    // Headline colour reflects only the checks the primary actually owns:
-    // IP masking and DNS routing. IPv6 is permanently reported as "at risk"
-    // (v4-only killswitch) and so cannot ever upgrade the headline — but
-    // also cannot drag a v4-clean exit down to PARTIAL, which would make the
-    // banner permanently misleading on every platform.
-    let mut audit = vec![
-        Line::from(vec![Span::styled(
-            "   PROTECTED",
-            Style::default()
-                .fg(if ip_masked && !dns_leaking {
-                    theme::SUCCESS
-                } else {
-                    theme::WARNING
-                })
-                .add_modifier(Modifier::BOLD),
-        )]),
-        Line::from(""),
-    ];
-
-    if let Some(real_ip) = real_ip_opt {
-        audit.push(Line::from(vec![
-            if ip_masked {
-                check_pass.clone()
-            } else if ip_leaking {
-                check_fail.clone()
-            } else {
-                check_warn.clone()
-            },
-            Span::styled("IP Masked  : ", Style::default().fg(theme::TEXT_SECONDARY)),
-            Span::styled(
-                utils::truncate(&app.runtime.public_ip, max_val),
-                Style::default().fg(if ip_masked {
-                    theme::SUCCESS
-                } else {
-                    theme::ERROR
-                }),
-            ),
-        ]));
-        audit.push(Line::from(vec![
-            Span::styled("  Real IP: ", Style::default().fg(theme::TEXT_SECONDARY)),
-            Span::styled(
-                format!("{real_ip} (hidden)"),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]));
+fn dns_provider_label(dns_server: &str) -> Option<&'static str> {
+    if dns_server.contains("1.1.1.1") {
+        Some("Cloudflare")
+    } else if dns_server.contains("8.8.8.8") || dns_server.contains("8.8.4.4") {
+        Some("Google")
+    } else if dns_server.contains("9.9.9.9") {
+        Some("Quad9")
     } else {
-        audit.push(Line::from(vec![
-            check_warn.clone(),
-            Span::styled("IP Masked  : ", Style::default().fg(theme::TEXT_SECONDARY)),
-            Span::styled("Checking...", Style::default().fg(theme::WARNING)),
-        ]));
+        None
+    }
+}
+
+// ── Builders (pure) ─────────────────────────────────────────────────────────
+
+fn build_protected_audit(s: &PanelState) -> Vec<Line<'static>> {
+    let mut lines = Vec::with_capacity(16);
+    let w = s.inner_width as usize;
+    let show_headers = s.show_headers();
+
+    if show_headers {
+        lines.push(section_header("Identity"));
     }
 
-    audit.push(Line::from(""));
+    // IP row
+    let ip_value = format_value_with_tag(&s.public_ip, s.location.as_deref());
+    let (ip_sigil, ip_value_color) = match s.ip_status {
+        IpStatus::Masked => (Sigil::OkMuted, theme::TEXT_PRIMARY),
+        IpStatus::Leaking => (Sigil::AlarmError, theme::ERROR),
+        IpStatus::Pending => (Sigil::NotApplicable, theme::WARNING),
+    };
+    lines.push(audit_row("IP", &ip_value, ip_value_color, ip_sigil, w));
+    if s.ip_status == IpStatus::Leaking {
+        lines.push(alarm_subline("real IP exposed", w));
+    }
 
-    let dns_provider = if app.runtime.dns_server.contains("1.1.1.1") {
-        " (Cloudflare)"
-    } else if app.runtime.dns_server.contains("8.8.8.8")
-        || app.runtime.dns_server.contains("8.8.4.4")
+    // DNS row
+    let dns_value = format_value_with_tag(&s.dns_server, s.dns_provider);
+    let (dns_sigil, dns_color) = if s.dns_leaking {
+        (Sigil::AlarmError, theme::ERROR)
+    } else {
+        (Sigil::OkMuted, theme::TEXT_PRIMARY)
+    };
+    lines.push(audit_row("DNS", &dns_value, dns_color, dns_sigil, w));
+    if s.dns_leaking {
+        let why = match &s.real_dns {
+            Some(_) => "leaking — matches pre-VPN resolver",
+            None => "leaking — see status",
+        };
+        lines.push(alarm_subline(why, w));
+    }
+
+    lines.push(Line::from(""));
+
+    if show_headers {
+        lines.push(section_header("Defense"));
+    }
+
+    // Killswitch row
+    let (ks_sigil, ks_color, ks_subline) =
+        killswitch_visuals(s.killswitch_mode, s.killswitch_state);
+    let ks_value = killswitch_value(s.killswitch_mode, s.killswitch_state);
+    lines.push(audit_row("Killswitch", &ks_value, ks_color, ks_sigil, w));
+    if let Some(why) = ks_subline {
+        lines.push(alarm_subline(why, w));
+    }
+
+    // Encryption row — annotates the cipher with its security grade.
+    // Modern AEAD / strong stay muted; deprecated / insecure pull the
+    // eye and get an alarm sub-line so the user knows what to do.
+    let cipher_strength = classify_cipher(&s.encryption);
+    let encryption_value = format!("{} · {}", s.encryption, cipher_strength.label());
+    lines.push(audit_row(
+        "Encryption",
+        &encryption_value,
+        cipher_strength.value_color(),
+        cipher_strength.sigil(),
+        w,
+    ));
+    if let Some(why) = cipher_strength.alarm_subline() {
+        lines.push(alarm_subline(why, w));
+    }
+
+    // IPv6 row — always `─` (v4-only killswitch on every supported platform)
+    lines.push(audit_row(
+        "IPv6",
+        "v4-only",
+        theme::INACTIVE,
+        Sigil::NotApplicable,
+        w,
+    ));
+
+    lines.push(Line::from(""));
+    lines.push(footer_line(s.last_check_secs));
+
+    lines
+}
+
+fn build_partial_audit(s: &PanelState) -> Vec<Line<'static>> {
+    let mut lines = Vec::with_capacity(12);
+    let w = s.inner_width as usize;
+    let show_headers = s.show_headers();
+
+    if show_headers {
+        lines.push(section_header("Identity"));
+    }
+
+    // No primary owns the default route → no exit posture to attest to.
+    // Show what the panel still knows about (DNS resolver) and flag IP as
+    // not-applicable, with one sub-line explaining the posture.
+    lines.push(audit_row(
+        "IP",
+        "split-route — no exit",
+        theme::INACTIVE,
+        Sigil::NotApplicable,
+        w,
+    ));
+
+    let dns_value = format_value_with_tag(&s.dns_server, s.dns_provider);
+    lines.push(audit_row(
+        "DNS",
+        &dns_value,
+        theme::TEXT_PRIMARY,
+        Sigil::OkMuted,
+        w,
+    ));
+
+    lines.push(Line::from(""));
+
+    if show_headers {
+        lines.push(section_header("Defense"));
+    }
+
+    let (ks_sigil, ks_color, ks_subline) =
+        killswitch_visuals(s.killswitch_mode, s.killswitch_state);
+    let ks_value = killswitch_value(s.killswitch_mode, s.killswitch_state);
+    lines.push(audit_row("Killswitch", &ks_value, ks_color, ks_sigil, w));
+    if let Some(why) = ks_subline {
+        lines.push(alarm_subline(why, w));
+    }
+
+    // Encryption row — sourced from a representative active tunnel.
+    // Only render when we have a real cipher (skip the `N/A` case where
+    // no tunnel was Connected at scan time — the Killswitch row already
+    // carries the relevant alarm in that situation).
+    if s.encryption != "N/A" {
+        let cipher_strength = classify_cipher(&s.encryption);
+        let encryption_value = format!("{} · {}", s.encryption, cipher_strength.label());
+        lines.push(audit_row(
+            "Encryption",
+            &encryption_value,
+            cipher_strength.value_color(),
+            cipher_strength.sigil(),
+            w,
+        ));
+        if let Some(why) = cipher_strength.alarm_subline() {
+            lines.push(alarm_subline(why, w));
+        }
+    }
+
+    lines.push(audit_row(
+        "IPv6",
+        "v4-only",
+        theme::INACTIVE,
+        Sigil::NotApplicable,
+        w,
+    ));
+
+    lines.push(Line::from(""));
+    lines.push(footer_line(s.last_check_secs));
+
+    lines
+}
+
+fn build_exposed_audit(app: &App, inner_width: u16) -> Vec<Line<'static>> {
+    let mut lines = Vec::with_capacity(10);
+    let w = inner_width as usize;
+
+    let real_ip = if app.runtime.public_ip.is_empty()
+        || app.runtime.public_ip == constants::MSG_DETECTING
+        || app.runtime.public_ip == constants::MSG_FETCHING
     {
-        " (Google)"
-    } else if app.runtime.dns_server.contains("9.9.9.9") {
-        " (Quad9)"
+        "checking…".to_string()
     } else {
-        ""
+        app.runtime.public_ip.clone()
     };
 
-    audit.push(Line::from(vec![
-        if dns_leaking {
-            check_fail.clone()
-        } else {
-            check_pass.clone()
+    lines.push(audit_row(
+        "IP",
+        &real_ip,
+        theme::WARNING,
+        Sigil::AlarmWarn,
+        w,
+    ));
+    lines.push(alarm_subline("no VPN — your real IP is visible", w));
+    lines.push(Line::from(""));
+
+    lines.push(audit_row(
+        "Killswitch",
+        killswitch_mode_label(app.runtime.killswitch_mode),
+        match app.runtime.killswitch_mode {
+            KillSwitchMode::Off => theme::ERROR,
+            _ => theme::TEXT_PRIMARY,
         },
-        Span::styled("DNS Secure : ", Style::default().fg(theme::TEXT_SECONDARY)),
-        Span::styled(
-            utils::truncate(&app.runtime.dns_server, max_val),
-            Style::default().fg(if dns_leaking {
-                theme::ERROR
-            } else {
-                theme::SUCCESS
-            }),
-        ),
-    ]));
-    if !dns_provider.is_empty() {
-        audit.push(Line::from(vec![
-            Span::styled("  Provider: ", Style::default().fg(theme::TEXT_SECONDARY)),
-            Span::styled(dns_provider, Style::default().fg(Color::DarkGray)),
-        ]));
+        match app.runtime.killswitch_mode {
+            KillSwitchMode::Off => Sigil::AlarmError,
+            _ => Sigil::OkMuted,
+        },
+        w,
+    ));
+    lines.push(audit_row(
+        "IPv6",
+        "v4-only",
+        theme::INACTIVE,
+        Sigil::NotApplicable,
+        w,
+    ));
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Connect to a profile to protect this traffic.",
+        Style::default().fg(theme::TEXT_SECONDARY),
+    )));
+
+    lines
+}
+
+// ── Killswitch row helpers ──────────────────────────────────────────────────
+
+fn killswitch_mode_label(mode: KillSwitchMode) -> &'static str {
+    mode.display_name()
+}
+
+fn killswitch_value(mode: KillSwitchMode, state: KillSwitchState) -> String {
+    // Auto + Blocking is the alarm state — value names the situation,
+    // not the mode label. The mode is implied by the rest of the panel.
+    if matches!(
+        (mode, state),
+        (KillSwitchMode::Auto, KillSwitchState::Blocking)
+    ) {
+        "VPN dropped".to_string()
+    } else {
+        mode.display_name().to_string()
     }
-    if let Some(real_dns) = &app.runtime.real_dns {
-        if dns_leaking {
-            let real_dns_display = format!("{real_dns} (same!)");
-            audit.push(Line::from(vec![
-                Span::styled("  Pre-VPN : ", Style::default().fg(theme::TEXT_SECONDARY)),
-                Span::styled(
-                    utils::truncate(&real_dns_display, max_val),
-                    Style::default().fg(theme::ERROR),
-                ),
-            ]));
-        }
-    }
+}
 
-    audit.push(Line::from(""));
-
-    // IPv6 honest reporting (plan #001 U18): the killswitch is v4-only on
-    // every supported platform today. The previous `✓ Blocked` framing
-    // claimed protection the code does not implement. Report the gap
-    // verbatim so a v6 leak does not silently bypass the kill switch while
-    // the panel reassures the user everything is fine.
-    audit.push(Line::from(vec![
-        check_warn.clone(),
-        Span::styled("IPv6       : ", Style::default().fg(theme::TEXT_SECONDARY)),
-        Span::styled(
-            "Not enforced (v4-only killswitch)",
-            Style::default().fg(theme::WARNING),
-        ),
-    ]));
-
-    audit.push(Line::from(""));
-
-    // Mode label uses the plain-English UI naming from
-    // `KillSwitchMode::display_name` — the variant names (`Off` /
-    // `Auto` / `AlwaysOn`) are kept stable for CLI/JSON; only the
-    // human-facing copy uses friendlier strings. See the module docs
-    // on `vortix_core::state::killswitch` for the mapping.
-    let mode = app.runtime.killswitch_mode;
-    let state = app.runtime.killswitch_state;
-    let mode_label = mode.display_name();
-    let (ks_icon, ks_color, status_phrase) = match (mode, state) {
-        (crate::state::KillSwitchMode::Off, _) => {
-            (check_fail.clone(), theme::INACTIVE, "off — not protecting")
-        }
-        // AlwaysOn is Blocking by design (steady state) — green/pass,
-        // not an alarm.
-        (crate::state::KillSwitchMode::AlwaysOn, _) => (
-            check_pass.clone(),
-            theme::SUCCESS,
-            "firewall engaged — only VPN traffic permitted",
-        ),
-        // Auto in the Blocking state means VPN dropped and the
-        // firewall engaged in response — this IS an alarm.
-        (crate::state::KillSwitchMode::Auto, crate::state::KillSwitchState::Blocking) => (
-            check_warn.clone(),
+/// Returns `(sigil, value_color, optional_subline)` for the Killswitch row.
+fn killswitch_visuals(
+    mode: KillSwitchMode,
+    state: KillSwitchState,
+) -> (Sigil, Color, Option<&'static str>) {
+    use KillSwitchMode::{AlwaysOn, Auto, Off};
+    use KillSwitchState::Blocking;
+    match (mode, state) {
+        (Off, _) => (
+            Sigil::AlarmError,
             theme::ERROR,
-            "VPN dropped — firewall engaged; reconnect or `release-killswitch` to recover",
+            Some("off — not protecting"),
         ),
-        (crate::state::KillSwitchMode::Auto, crate::state::KillSwitchState::Armed) => (
-            check_pass.clone(),
-            theme::SUCCESS,
-            "watching — will engage if the VPN drops",
+        (Auto, Blocking) => (
+            Sigil::AlarmWarn,
+            theme::WARNING,
+            Some("press r to reconnect"),
         ),
-        _ => (check_warn.clone(), theme::WARNING, "unknown state"),
-    };
-
-    audit.push(Line::from(vec![
-        ks_icon,
-        Span::styled("Kill Switch: ", Style::default().fg(theme::TEXT_SECONDARY)),
-        Span::styled(mode_label, Style::default().fg(ks_color)),
-        Span::styled(
-            format!(" — {status_phrase}"),
-            Style::default().fg(theme::TEXT_SECONDARY),
-        ),
-    ]));
-
-    audit.push(Line::from(""));
-
-    audit.push(Line::from(vec![
-        check_pass,
-        Span::styled("Encryption : ", Style::default().fg(theme::TEXT_SECONDARY)),
-        Span::styled(encryption_info, Style::default().fg(theme::NORD_YELLOW)),
-    ]));
-
-    let last_checked_text = match app.runtime.last_security_check {
-        Some(t) => {
-            let secs = t.elapsed().as_secs();
-            if secs < 5 {
-                "Last checked: just now".to_string()
-            } else if secs < 60 {
-                format!("Last checked: {secs}s ago")
-            } else {
-                format!("Last checked: {}m ago", secs / 60)
-            }
-        }
-        None => "Last checked: pending...".to_string(),
-    };
-    audit.push(Line::from(""));
-    audit.push(Line::from(vec![Span::styled(
-        last_checked_text,
-        Style::default().fg(Color::DarkGray),
-    )]));
-
-    // Sigil legend (plan #001 U18). Rendered after `Last checked` so it sits
-    // at the visual bottom of the panel without competing with the headline
-    // for first-glance attention. The compaction loop below may drop it if
-    // the panel is short — that's intentional: legend is the lowest-priority
-    // line on a height-constrained viewport.
-    audit.push(Line::from(vec![Span::styled(
-        SIGIL_LEGEND,
-        Style::default().fg(Color::DarkGray),
-    )]));
-
-    let available_height = inner.height as usize;
-    if available_height > 0 && audit.len() > available_height {
-        let mut compacted = Vec::with_capacity(available_height);
-        let mut blank_budget = 2usize;
-
-        for line in audit {
-            let is_blank =
-                line.spans.is_empty() || line.spans.iter().all(|s| s.content.trim().is_empty());
-            if is_blank {
-                if blank_budget == 0 {
-                    continue;
-                }
-                blank_budget -= 1;
-            }
-            compacted.push(line);
-            if compacted.len() == available_height {
-                break;
-            }
-        }
-        audit = compacted;
+        (AlwaysOn | Auto, _) => (Sigil::OkMuted, theme::TEXT_PRIMARY, None),
     }
-
-    frame.render_widget(Paragraph::new(audit), inner);
 }
 
-/// Existing "no tunnels at all" copy — extracted into a helper so the new
-/// `PARTIAL` branch can sit alongside it without nesting another two-level
-/// match inside the primary render path.
-fn render_exposed(frame: &mut Frame, inner: Rect) {
-    let audit = vec![
-        Line::from(vec![Span::styled(
-            " ⚠ EXPOSED ",
-            Style::default()
-                .bg(theme::WARNING)
-                .fg(Color::Black)
-                .add_modifier(Modifier::BOLD),
-        )]),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Your traffic is unencrypted.",
-            Style::default().fg(theme::TEXT_SECONDARY),
-        )),
-        Line::from(Span::styled(
-            "Connect to a VPN profile.",
-            Style::default().fg(theme::TEXT_SECONDARY),
-        )),
-    ];
-    frame.render_widget(Paragraph::new(audit), inner);
-}
-
-/// `PARTIAL` (plan #001 U18) — active tunnels exist but no primary owns the
-/// default route (split-route only). The panel cannot speak to IP/DNS exit
-/// posture (there is no exit), so it limits itself to:
-///   1. A PARTIAL headline so the user does not misread the missing default
-///      route as full protection.
-///   2. A KS-mode-aware Killswitch bullet that names the active mode's
-///      protection posture in one line. Rendering all three mode bullets
-///      would force the user to identify their own mode from a sub-bulleted
-///      list — strictly worse UX.
-///   3. The honest IPv6 line (same as `PROTECTED`).
-///   4. The sigil legend.
-fn render_partial_no_primary(frame: &mut Frame, app: &App, inner: Rect) {
-    let check_pass = Span::styled("✓ ", Style::default().fg(theme::SUCCESS));
-    let check_fail = Span::styled("✗ ", Style::default().fg(theme::ERROR));
-    let check_warn = Span::styled("⚠ ", Style::default().fg(theme::WARNING));
-    let check_na = Span::styled("─ ", Style::default().fg(theme::INACTIVE));
-
-    let mut audit = vec![
-        Line::from(vec![Span::styled(
-            "   PARTIAL",
-            Style::default()
-                .fg(theme::WARNING)
-                .add_modifier(Modifier::BOLD),
-        )]),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Active tunnels carry split routes only —",
-            Style::default().fg(theme::TEXT_SECONDARY),
-        )),
-        Line::from(Span::styled(
-            "internet-bound traffic still exits the LAN.",
-            Style::default().fg(theme::TEXT_SECONDARY),
-        )),
-        Line::from(""),
-    ];
-
-    // KS-mode-aware Killswitch line — render exactly the bullet for the
-    // active mode. The user-facing label uses
-    // `KillSwitchMode::display_name`; the long-form copy reads as plain
-    // English ("what does this mode do?"). The enum variant names
-    // (Off / Auto / AlwaysOn) stay stable for CLI/JSON — see
-    // `vortix_core::state::killswitch` module docs.
-    let mode = app.runtime.killswitch_mode;
-    let (ks_sigil, ks_color) = match mode {
-        crate::state::KillSwitchMode::AlwaysOn => (check_pass.clone(), theme::SUCCESS),
-        crate::state::KillSwitchMode::Auto => (check_na.clone(), theme::INACTIVE),
-        crate::state::KillSwitchMode::Off => (check_fail.clone(), theme::ERROR),
-    };
-    let ks_text = format!("{} — {}", mode.display_name(), mode.one_liner());
-    audit.push(Line::from(vec![
-        ks_sigil,
-        Span::styled("Killswitch : ", Style::default().fg(theme::TEXT_SECONDARY)),
-        Span::styled(ks_text, Style::default().fg(ks_color)),
-    ]));
-
-    audit.push(Line::from(""));
-    audit.push(Line::from(vec![
-        check_warn,
-        Span::styled("IPv6       : ", Style::default().fg(theme::TEXT_SECONDARY)),
-        Span::styled(
-            "Not enforced (v4-only killswitch)",
-            Style::default().fg(theme::WARNING),
-        ),
-    ]));
-
-    audit.push(Line::from(""));
-    audit.push(Line::from(vec![Span::styled(
-        SIGIL_LEGEND,
-        Style::default().fg(Color::DarkGray),
-    )]));
-
-    // Same compaction approach as the PROTECTED branch — drop blank lines
-    // first, then truncate. Keeps the headline and KS line visible even
-    // when the panel is short.
-    let available_height = inner.height as usize;
-    if available_height > 0 && audit.len() > available_height {
-        let mut compacted = Vec::with_capacity(available_height);
-        let mut blank_budget = 2usize;
-        for line in audit {
-            let is_blank =
-                line.spans.is_empty() || line.spans.iter().all(|s| s.content.trim().is_empty());
-            if is_blank {
-                if blank_budget == 0 {
-                    continue;
-                }
-                blank_budget -= 1;
-            }
-            compacted.push(line);
-            if compacted.len() == available_height {
-                break;
-            }
-        }
-        audit = compacted;
+/// `value · tag` when `tag` is present, otherwise just `value`. Used for
+/// inlining a provider name with a DNS server, or a country/city with an IP.
+fn format_value_with_tag(value: &str, tag: Option<&str>) -> String {
+    match tag {
+        Some(t) if !t.is_empty() => format!("{value} · {t}"),
+        _ => value.to_string(),
     }
-
-    frame.render_widget(Paragraph::new(audit), inner);
 }
+
+// ── Flip-side view (unchanged — placeholder for issue #168) ────────────────
 
 fn render_back(frame: &mut Frame, app: &App, area: Rect, border_style: Style) {
     let block = Block::default()
@@ -561,22 +949,12 @@ fn render_back(frame: &mut Frame, app: &App, area: Rect, border_style: Style) {
 
 #[cfg(test)]
 mod tests {
-    //! Plan #001 U18 — Security Guard becomes primary-scoped, gains a
-    //! PARTIAL no-primary branch, reports IPv6 honestly, and grows a sigil
-    //! legend.
-    //!
-    //! These tests render the panel into a `TestBackend` buffer and assert
-    //! on the resulting text. Asserting on rendered glyphs (rather than
-    //! probing intermediate `Line` vectors) is what the user actually sees
-    //! and survives refactors of the line-construction code.
-    //!
-    //! The PROTECTED branch is intentionally not exercised here: driving an
-    //! FSM into `Connection::Connected` requires either the registry's
-    //! test-only `with_route_probe` constructor (private to that module) or
-    //! a real platform route probe (non-deterministic in unit tests). The
-    //! integration tests for the connect flow already cover the Connected
-    //! transition; this file scopes itself to the branches reachable from
-    //! `App::new_test()` plus direct registry insertion.
+    //! The polish redesign keeps the existing `TestBackend`-based pattern
+    //! for `PARTIAL` and `EXPOSED` (the branches reachable from
+    //! `App::new_test()`) and adds pure-function tests against
+    //! `build_protected_audit` for the `PROTECTED` branch (which still
+    //! can't be driven into `Connection::Connected` without private
+    //! registry test helpers).
     use super::*;
     use crate::app::App;
     use crate::state::KillSwitchMode;
@@ -585,11 +963,6 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
-    /// Insert a Disconnected FSM into the registry. `tunnel_count` goes
-    /// to 1 but `primary()` stays `None` (no route probe will match a
-    /// Disconnected FSM). Reproduces the PARTIAL no-primary branch
-    /// deterministically — without hitting platform probes or scripted
-    /// outcomes.
     fn insert_idle_tunnel(app: &mut App, name: &str) {
         let tunnel = crate::tunnel::TunnelKind::Mock(
             crate::vortix_core::ports::tunnel::mock::MockTunnel::new(),
@@ -618,165 +991,532 @@ mod tests {
         out
     }
 
+    fn line_text(line: &Line<'static>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    fn baseline_protected_state(inner_width: u16) -> PanelState {
+        PanelState {
+            inner_width,
+            show_section_headers: true,
+            public_ip: "1.2.3.4".to_string(),
+            location: Some("US-East".to_string()),
+            ip_status: IpStatus::Masked,
+            dns_server: "1.1.1.1".to_string(),
+            dns_provider: Some("Cloudflare"),
+            dns_leaking: false,
+            real_dns: None,
+            killswitch_mode: KillSwitchMode::AlwaysOn,
+            killswitch_state: KillSwitchState::Blocking,
+            encryption: "ChaCha20-Poly1305".to_string(),
+            last_check_secs: Some(3),
+        }
+    }
+
+    // ── Cipher strength classification ────────────────────────────────────
+
     #[test]
-    fn no_tunnels_renders_exposed() {
+    fn classify_cipher_modern_aead() {
+        for name in [
+            "ChaCha20-Poly1305",
+            "chacha20-poly1305",
+            "AES-256-GCM",
+            "AES-128-GCM",
+            "AES-192-GCM",
+            "XChaCha20-Poly1305",
+        ] {
+            assert_eq!(
+                classify_cipher(name),
+                CipherStrength::Modern,
+                "{name} should be Modern"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_cipher_strong_non_aead() {
+        for name in ["AES-256-CBC", "AES-256-CTR", "AES-192-CBC"] {
+            assert_eq!(
+                classify_cipher(name),
+                CipherStrength::Strong,
+                "{name} should be Strong"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_cipher_deprecated() {
+        for name in ["3DES-CBC", "DES-EDE3-CBC", "AES-128-CBC"] {
+            assert_eq!(
+                classify_cipher(name),
+                CipherStrength::Deprecated,
+                "{name} should be Deprecated"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_cipher_insecure() {
+        for name in [
+            "BF-CBC",
+            "blowfish-cbc",
+            "DES-CBC",
+            "DES",
+            "RC4",
+            "RC2-CBC",
+            "NULL",
+            "CAST5-CBC",
+            "IDEA-CBC",
+        ] {
+            assert_eq!(
+                classify_cipher(name),
+                CipherStrength::Insecure,
+                "{name} should be Insecure"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_cipher_unknown_is_cautiously_deprecated() {
+        // Unknown ciphers must NOT be labelled Modern — that would
+        // green-light a string we've never seen.
+        assert_eq!(
+            classify_cipher("MysteryCipher-256"),
+            CipherStrength::Deprecated
+        );
+        assert_eq!(classify_cipher("N/A"), CipherStrength::Deprecated);
+    }
+
+    #[test]
+    fn classify_cipher_does_not_misread_3des_as_single_des() {
+        // Order-of-checks regression: `3DES-CBC` contains `DES-CBC` as a
+        // substring; the single-DES rule must skip it via the `!3DES`
+        // guard so it lands in Deprecated, not Insecure.
+        assert_eq!(classify_cipher("3DES-CBC"), CipherStrength::Deprecated);
+        assert_eq!(classify_cipher("DES-EDE3-CBC"), CipherStrength::Deprecated);
+    }
+
+    // ── Encryption row rendering driven by cipher strength ────────────────
+
+    #[test]
+    fn protected_encryption_modern_cipher_is_muted_with_strength_inline() {
+        let s = baseline_protected_state(48);
+        let lines = build_protected_audit(&s);
+        let enc_idx = lines
+            .iter()
+            .position(|l| line_text(l).starts_with("Encryption"))
+            .expect("Encryption row missing");
+        let text = line_text(&lines[enc_idx]);
+        assert!(
+            text.contains("modern AEAD"),
+            "modern cipher must surface strength label, got {text:?}"
+        );
+        let sigil = lines[enc_idx].spans.last().unwrap();
+        assert!(sigil.content.trim_end() == "✓");
+        assert!(!sigil.style.add_modifier.contains(Modifier::BOLD));
+        // No alarm sub-line follows a modern cipher.
+        let next_text = line_text(&lines[enc_idx + 1]);
+        assert!(
+            !next_text.contains("AES-GCM") && !next_text.contains("broken"),
+            "modern cipher must not have an alarm sub-line, got {next_text:?}"
+        );
+    }
+
+    #[test]
+    fn protected_encryption_insecure_cipher_alarms_with_subline() {
+        let mut s = baseline_protected_state(60);
+        s.encryption = "BF-CBC".to_string();
+        let lines = build_protected_audit(&s);
+        let enc_idx = lines
+            .iter()
+            .position(|l| line_text(l).starts_with("Encryption"))
+            .expect("Encryption row missing");
+        let text = line_text(&lines[enc_idx]);
+        assert!(
+            text.contains("INSECURE"),
+            "insecure cipher must say INSECURE, got {text:?}"
+        );
+        let sigil = lines[enc_idx].spans.last().unwrap();
+        assert!(sigil.content.trim_end() == "✗");
+        assert!(sigil.style.add_modifier.contains(Modifier::BOLD));
+        let sub_text = line_text(&lines[enc_idx + 1]);
+        assert!(
+            sub_text.contains("broken cipher"),
+            "alarm sub-line missing for insecure cipher, got {sub_text:?}"
+        );
+    }
+
+    #[test]
+    fn protected_encryption_deprecated_cipher_warns_with_subline() {
+        let mut s = baseline_protected_state(60);
+        s.encryption = "AES-128-CBC".to_string();
+        let lines = build_protected_audit(&s);
+        let enc_idx = lines
+            .iter()
+            .position(|l| line_text(l).starts_with("Encryption"))
+            .expect("Encryption row missing");
+        let text = line_text(&lines[enc_idx]);
+        assert!(text.contains("deprecated"), "got {text:?}");
+        let sigil = lines[enc_idx].spans.last().unwrap();
+        assert!(sigil.content.trim_end() == "⚠");
+        assert!(sigil.style.add_modifier.contains(Modifier::BOLD));
+        let sub_text = line_text(&lines[enc_idx + 1]);
+        assert!(
+            sub_text.contains("upgrade to AES-GCM"),
+            "deprecated cipher sub-line missing, got {sub_text:?}"
+        );
+    }
+
+    // ── PROTECTED branch (pure-function tests against build_protected_audit) ──
+
+    #[test]
+    fn protected_renders_section_words_and_no_loud_banner() {
+        // R3: section words `Identity` / `Defense` replace the bold
+        // `PROTECTED` headline.
+        let s = baseline_protected_state(34);
+        let lines = build_protected_audit(&s);
+        let all_text: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+
+        assert!(
+            all_text.contains("Identity"),
+            "section word `Identity` missing:\n{all_text}"
+        );
+        assert!(
+            all_text.contains("Defense"),
+            "section word `Defense` missing:\n{all_text}"
+        );
+        assert!(
+            !all_text.contains("PROTECTED"),
+            "loud `PROTECTED` banner must be removed:\n{all_text}"
+        );
+    }
+
+    #[test]
+    fn protected_sigils_render_in_right_column() {
+        // R2: every row ends in the right-pinned sigil column.
+        let s = baseline_protected_state(34);
+        let lines = build_protected_audit(&s);
+        let ip_line = lines
+            .iter()
+            .find(|l| line_text(l).contains("IP "))
+            .expect("IP row missing");
+        let dns_line = lines
+            .iter()
+            .find(|l| line_text(l).contains("DNS "))
+            .expect("DNS row missing");
+
+        for row in [ip_line, dns_line] {
+            let last_span = row.spans.last().expect("non-empty row");
+            assert!(
+                last_span.content.trim_end() == "✓",
+                "sigil must be last span on row (got {:?}):\n{row:?}",
+                last_span.content
+            );
+        }
+    }
+
+    #[test]
+    fn protected_all_ok_state_has_no_bold_modifiers() {
+        // R7: in the all-OK state every sigil renders muted (no BOLD).
+        let s = baseline_protected_state(34);
+        let lines = build_protected_audit(&s);
+        for line in &lines {
+            for span in &line.spans {
+                assert!(
+                    !span.style.add_modifier.contains(Modifier::BOLD),
+                    "all-OK state must not bold any span (offender: {:?})",
+                    span.content
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn protected_dns_leak_brightens_dns_sigil_and_adds_subline() {
+        // R7 + R15 (AE2): a leaking DNS row goes bright `✗ ` and gets
+        // exactly one sub-line below it. Other rows stay muted.
+        let mut s = baseline_protected_state(40);
+        s.dns_leaking = true;
+        s.real_dns = Some("1.1.1.1".to_string());
+        let lines = build_protected_audit(&s);
+
+        let dns_idx = lines
+            .iter()
+            .position(|l| line_text(l).starts_with("DNS"))
+            .expect("DNS row missing");
+        let dns_sigil = lines[dns_idx].spans.last().expect("non-empty DNS row");
+        assert!(
+            dns_sigil.content.trim_end() == "✗",
+            "leaking DNS sigil must be ✗ (got {:?})",
+            dns_sigil.content
+        );
+        assert!(
+            dns_sigil.style.add_modifier.contains(Modifier::BOLD),
+            "leaking DNS sigil must be BOLD"
+        );
+
+        let subline_text = line_text(&lines[dns_idx + 1]);
+        assert!(
+            subline_text.contains("leaking"),
+            "leaking DNS must render an alarm sub-line (got {subline_text:?})"
+        );
+
+        // IP row stays calm.
+        let ip_idx = lines
+            .iter()
+            .position(|l| line_text(l).starts_with("IP"))
+            .expect("IP row missing");
+        for span in &lines[ip_idx].spans {
+            assert!(
+                !span.style.add_modifier.contains(Modifier::BOLD),
+                "IP row must stay muted while DNS alarms: {:?}",
+                span.content
+            );
+        }
+    }
+
+    #[test]
+    fn protected_killswitch_auto_blocking_is_loud_with_subline() {
+        // R15 (AE3): Auto + Blocking is the alarm state — bright sigil
+        // and a "press r to reconnect" sub-line.
+        let mut s = baseline_protected_state(40);
+        s.killswitch_mode = KillSwitchMode::Auto;
+        s.killswitch_state = KillSwitchState::Blocking;
+        let lines = build_protected_audit(&s);
+
+        let ks_idx = lines
+            .iter()
+            .position(|l| line_text(l).starts_with("Killswitch"))
+            .expect("Killswitch row missing");
+        let ks_row_text = line_text(&lines[ks_idx]);
+        assert!(
+            ks_row_text.contains("VPN dropped"),
+            "Auto+Blocking value must say `VPN dropped`, got {ks_row_text:?}"
+        );
+        let ks_sigil = lines[ks_idx].spans.last().expect("non-empty row");
+        assert!(ks_sigil.content.trim_end() == "⚠");
+        assert!(ks_sigil.style.add_modifier.contains(Modifier::BOLD));
+
+        let sub_text = line_text(&lines[ks_idx + 1]);
+        assert!(
+            sub_text.contains("press r to reconnect"),
+            "alarm sub-line missing: {sub_text:?}"
+        );
+    }
+
+    #[test]
+    fn protected_ipv6_is_not_applicable_not_a_warning() {
+        // R10: IPv6 uses ─ (not ⚠) and value reads `v4-only`. The previous
+        // explainer string is removed.
+        let s = baseline_protected_state(34);
+        let lines = build_protected_audit(&s);
+        let ipv6 = lines
+            .iter()
+            .find(|l| line_text(l).starts_with("IPv6"))
+            .expect("IPv6 row missing");
+        let text = line_text(ipv6);
+        assert!(text.contains("v4-only"), "IPv6 value got {text:?}");
+        let sigil = ipv6.spans.last().expect("non-empty row");
+        assert!(
+            sigil.content.trim_end() == "─",
+            "IPv6 sigil must be ─, got {:?}",
+            sigil.content
+        );
+    }
+
+    #[test]
+    fn protected_dns_provider_inlines_without_subbullet() {
+        // R12: provider collapses inline as `1.1.1.1 · Cloudflare`.
+        // No `Provider:` sub-row.
+        let s = baseline_protected_state(40);
+        let lines = build_protected_audit(&s);
+        let all_text: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(
+            all_text.contains("1.1.1.1 · Cloudflare"),
+            "DNS provider must inline: {all_text}"
+        );
+        assert!(
+            !all_text.contains("Provider:"),
+            "no `Provider:` sub-bullet allowed: {all_text}"
+        );
+    }
+
+    #[test]
+    fn protected_real_ip_not_in_default_render() {
+        // R11: `Real IP: <ip> (hidden)` sub-bullet is removed from the
+        // default render. The masking sigil already attests masking is
+        // working.
+        let s = baseline_protected_state(40);
+        let lines = build_protected_audit(&s);
+        let all_text: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(
+            !all_text.contains("Real IP"),
+            "`Real IP` sub-bullet must be removed: {all_text}"
+        );
+        assert!(
+            !all_text.contains("(hidden)"),
+            "`(hidden)` marker must be removed: {all_text}"
+        );
+    }
+
+    #[test]
+    fn protected_long_ks_phrase_removed_in_default_render() {
+        // R9: long KS status phrase (the multi-clause "firewall engaged …
+        // only VPN traffic permitted") must not render in the default
+        // PROTECTED state. The mode label is enough; the phrase only
+        // surfaces as an alarm sub-line.
+        let s = baseline_protected_state(60);
+        let lines = build_protected_audit(&s);
+        let all_text: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(
+            !all_text.contains("only VPN traffic permitted"),
+            "long KS phrase must not render in default state: {all_text}"
+        );
+        assert!(
+            !all_text.contains("watching — will engage"),
+            "long KS phrase must not render in default state: {all_text}"
+        );
+    }
+
+    #[test]
+    fn protected_footer_says_updated_not_last_checked() {
+        // R18: `Updated 3s ago` (not `Last checked: 3s ago`).
+        let s = baseline_protected_state(34);
+        let lines = build_protected_audit(&s);
+        let footer_text = line_text(lines.last().expect("footer"));
+        assert!(
+            footer_text.contains("Updated"),
+            "footer must say `Updated`: {footer_text}"
+        );
+        assert!(
+            !footer_text.contains("Last checked"),
+            "old `Last checked` wording must be gone: {footer_text}"
+        );
+    }
+
+    #[test]
+    fn protected_section_headers_drop_below_width_threshold() {
+        // R16: section words drop at panel widths < threshold.
+        let mut s = baseline_protected_state(20);
+        s.show_section_headers = true;
+        let lines = build_protected_audit(&s);
+        let all_text: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(
+            !all_text.contains("Identity"),
+            "section words must drop at narrow widths: {all_text}"
+        );
+        assert!(
+            !all_text.contains("Defense"),
+            "section words must drop at narrow widths: {all_text}"
+        );
+        // Five content rows still render (IP / DNS / Killswitch / Encryption / IPv6).
+        for label in ["IP", "DNS", "Killswitch", "Encryption", "IPv6"] {
+            assert!(
+                all_text.contains(label),
+                "row `{label}` missing at narrow width:\n{all_text}"
+            );
+        }
+    }
+
+    #[test]
+    fn protected_no_legend_in_panel() {
+        // R13: sigil legend lives in the help overlay, never in the panel.
+        let s = baseline_protected_state(40);
+        let lines = build_protected_audit(&s);
+        let all_text: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(
+            !all_text.contains("Legend"),
+            "panel must not render sigil legend: {all_text}"
+        );
+    }
+
+    // ── PARTIAL branch (rendered) ───────────────────────────────────────────
+
+    #[test]
+    fn no_tunnels_renders_exposed_with_banner_and_polish() {
         let app = App::new_test();
         assert_eq!(app.registry.tunnel_count(), 0);
-        assert!(app.registry.primary().is_none());
 
         let out = render_to_string(&app, 60, 20);
+        // Loud EXPOSED banner is the eye-catcher when no VPN is up.
         assert!(
             out.contains("EXPOSED"),
-            "expected EXPOSED banner, got:\n{out}"
+            "EXPOSED banner must be present:\n{out}"
         );
-        // Sigil legend is a PROTECTED/PARTIAL-only chrome — EXPOSED is the
-        // "do something" copy and should stay minimal.
+        // IP row present + alarm sub-line.
+        assert!(out.contains("IP"), "IP row missing:\n{out}");
+        assert!(
+            out.contains("no VPN — your real IP is visible"),
+            "EXPOSED alarm sub-line missing:\n{out}"
+        );
+        // No legend inside the panel — lives in `?` overlay now.
         assert!(
             !out.contains("Legend:"),
-            "EXPOSED should not render the sigil legend; got:\n{out}"
+            "EXPOSED must not render the in-panel legend:\n{out}"
         );
     }
 
     #[test]
-    fn tunnels_present_but_no_primary_renders_partial() {
-        let mut app = App::new_test();
-        insert_idle_tunnel(&mut app, "alpha");
-        insert_idle_tunnel(&mut app, "bravo");
-        insert_idle_tunnel(&mut app, "charlie");
-
-        assert_eq!(app.registry.tunnel_count(), 3);
-        assert!(
-            app.registry.primary().is_none(),
-            "Disconnected FSMs must not be elected primary"
-        );
-
-        let out = render_to_string(&app, 70, 20);
-        assert!(
-            out.contains("PARTIAL"),
-            "expected PARTIAL banner when tunnels exist but no primary; got:\n{out}"
-        );
-        assert!(
-            !out.contains("EXPOSED"),
-            "PARTIAL must not fall back to EXPOSED copy; got:\n{out}"
-        );
-        assert!(
-            !out.contains("PROTECTED"),
-            "no primary means no PROTECTED claim; got:\n{out}"
-        );
-    }
-
-    #[test]
-    fn partial_renders_killswitch_bullet_for_active_mode_only() {
-        // Plan §U18: in PARTIAL, render exactly ONE Killswitch bullet —
-        // the one matching the active mode — not a sub-bulleted
-        // multi-mode block. Verifies the chosen mode's friendly label
-        // (`VPN-only`, per `KillSwitchMode::display_name`) appears and
-        // that the other modes' distinguishing copy does not.
+    fn partial_renders_banner_section_words_and_killswitch_row() {
+        // The PARTIAL banner sits at the top; below it the `Identity` /
+        // `Defense` section words and a single Killswitch row in the
+        // right-column layout.
         let mut app = App::new_test();
         insert_idle_tunnel(&mut app, "alpha");
         app.runtime.killswitch_mode = KillSwitchMode::AlwaysOn;
 
-        let out = render_to_string(&app, 80, 20);
-        assert!(
-            out.contains("VPN-only"),
-            "AlwaysOn should surface the 'VPN-only' label; got:\n{out}"
-        );
-        assert!(
-            !out.contains("Block on drop"),
-            "AlwaysOn must not render the Auto 'Block on drop' line; got:\n{out}"
-        );
+        let out = render_to_string(&app, 60, 20);
+        assert!(out.contains("PARTIAL"), "PARTIAL banner missing:\n{out}");
+        assert!(out.contains("Identity"), "PARTIAL panel:\n{out}");
+        assert!(out.contains("Defense"), "PARTIAL panel:\n{out}");
+        assert!(out.contains("Killswitch"), "PARTIAL panel:\n{out}");
+        assert!(out.contains("VPN-only"), "active mode label:\n{out}");
+        assert!(!out.contains("Legend:"), "no in-panel legend:\n{out}");
     }
 
     #[test]
-    fn partial_killswitch_off_renders_off_bullet() {
+    fn partial_killswitch_off_renders_off_with_alarm() {
         let mut app = App::new_test();
         insert_idle_tunnel(&mut app, "alpha");
         app.runtime.killswitch_mode = KillSwitchMode::Off;
 
-        let out = render_to_string(&app, 80, 20);
-        assert!(
-            out.contains("Killswitch"),
-            "Killswitch line missing; got:\n{out}"
-        );
+        let out = render_to_string(&app, 70, 20);
         assert!(
             out.contains("Off"),
-            "Off mode headline missing; got:\n{out}"
+            "Off mode value missing in PARTIAL:\n{out}"
         );
         assert!(
-            !out.contains("VPN-only"),
-            "Off must not render the AlwaysOn 'VPN-only' label; got:\n{out}"
-        );
-        assert!(
-            !out.contains("Block on drop"),
-            "Off must not render the Auto 'Block on drop' label; got:\n{out}"
+            out.contains("not protecting"),
+            "Off alarm sub-line missing:\n{out}"
         );
     }
 
     #[test]
-    fn partial_killswitch_auto_renders_block_on_drop_bullet() {
+    fn partial_killswitch_auto_renders_block_on_drop() {
         let mut app = App::new_test();
         insert_idle_tunnel(&mut app, "alpha");
         app.runtime.killswitch_mode = KillSwitchMode::Auto;
 
-        let out = render_to_string(&app, 80, 20);
+        let out = render_to_string(&app, 70, 20);
         assert!(
             out.contains("Block on drop"),
-            "Auto mode should surface the 'Block on drop' label; got:\n{out}"
-        );
-        assert!(
-            !out.contains("VPN-only"),
-            "Auto must not render the AlwaysOn 'VPN-only' label; got:\n{out}"
+            "Auto mode label missing:\n{out}"
         );
     }
 
     #[test]
-    fn partial_ipv6_line_reports_not_enforced() {
-        // IPv6 honesty (plan §U18): the killswitch is v4-only on every
-        // supported platform. The IPv6 line must report this gap even
-        // when no leak has been observed — claiming `✓ Blocked` would be
-        // a UX lie because the code does not actually block v6.
+    fn partial_ipv6_is_not_applicable() {
         let mut app = App::new_test();
         insert_idle_tunnel(&mut app, "alpha");
-        // Explicitly set ipv6_leak=false so any code path that "passes"
-        // the IPv6 check based on the leak probe would render "Blocked".
-        // The new code must ignore this and always report "Not enforced".
         app.runtime.ipv6_leak = false;
 
-        let out = render_to_string(&app, 80, 25);
-        assert!(out.contains("IPv6"), "IPv6 line missing; got:\n{out}");
+        let out = render_to_string(&app, 70, 20);
+        assert!(out.contains("v4-only"), "IPv6 value missing:\n{out}");
         assert!(
-            out.contains("Not enforced"),
-            "IPv6 must always report v4-only honestly; got:\n{out}"
+            !out.contains("Not enforced"),
+            "old IPv6 explainer must be gone:\n{out}"
         );
-        assert!(
-            !out.contains("Blocked"),
-            "IPv6 must not claim 'Blocked' protection it does not deliver; got:\n{out}"
-        );
-    }
-
-    #[test]
-    fn partial_renders_sigil_legend() {
-        let mut app = App::new_test();
-        insert_idle_tunnel(&mut app, "alpha");
-
-        let out = render_to_string(&app, 80, 25);
-        assert!(
-            out.contains("Legend"),
-            "sigil legend missing from PARTIAL panel; got:\n{out}"
-        );
-        // Each documented sigil must appear in the legend line.
-        assert!(out.contains("✓"), "legend missing ✓; got:\n{out}");
-        assert!(out.contains("⚠"), "legend missing ⚠; got:\n{out}");
-        assert!(out.contains("─"), "legend missing ─; got:\n{out}");
-    }
-
-    #[test]
-    fn sigil_legend_constant_matches_plan() {
-        // Anchors the canonical legend string against the plan so future
-        // edits to the constant trip a test rather than silently drift.
-        assert_eq!(
-            SIGIL_LEGEND,
-            "Legend: ✓ pass · ⚠ at risk · ─ not applicable"
-        );
+        // The `─` sigil renders in the right column for the IPv6 row.
+        assert!(out.contains("─"), "IPv6 ─ sigil missing:\n{out}");
     }
 }
