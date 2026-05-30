@@ -38,13 +38,7 @@ impl App {
     /// Request deletion of a profile (Safety Check)
     pub(crate) fn request_delete(&mut self, idx: usize) {
         if let Some(profile) = self.runtime.profiles.get(idx) {
-            let active_profile = match &self.runtime.connection_state {
-                ConnectionState::Connected { profile: p, .. }
-                | ConnectionState::Connecting { profile: p, .. }
-                | ConnectionState::Disconnecting { profile: p, .. } => Some(p.as_str()),
-                ConnectionState::Disconnected => None,
-            };
-            if active_profile == Some(&profile.name) {
+            if self.is_profile_active(&profile.name) {
                 self.show_toast(
                     "Cannot delete active profile — disconnect first".to_string(),
                     ToastType::Warning,
@@ -69,13 +63,7 @@ impl App {
 
         // Safety net: state may have changed since the confirm dialog opened
         if let Some(profile) = self.runtime.profiles.get(idx) {
-            let active_profile = match &self.runtime.connection_state {
-                ConnectionState::Connected { profile: p, .. }
-                | ConnectionState::Connecting { profile: p, .. }
-                | ConnectionState::Disconnecting { profile: p, .. } => Some(p.as_str()),
-                ConnectionState::Disconnected => None,
-            };
-            if active_profile == Some(&profile.name) {
+            if self.is_profile_active(&profile.name) {
                 self.show_toast(
                     "Cannot delete — profile became active".to_string(),
                     ToastType::Warning,

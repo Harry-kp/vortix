@@ -1,6 +1,7 @@
 //! Footer widget with context-aware keybinding hints
 
-use crate::app::{App, ConnectionState};
+use crate::app::App;
+use crate::vortix_core::engine::state::Connection;
 use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
@@ -65,11 +66,34 @@ pub fn render_dashboard(frame: &mut Frame, app: &App, area: Rect) {
         }
     }
 
-    let disconnect_hint = match &app.runtime.connection_state {
-        ConnectionState::Connecting { .. } => ("d", "Cancel"),
-        ConnectionState::Disconnecting { .. } => ("d", "Force Kill"),
-        ConnectionState::Connected { .. } => ("d", "Disconnect"),
-        ConnectionState::Disconnected => {
+    // Reflects what `d` will do against the most relevant tunnel. Priority:
+    // Disconnecting (already tearing down → Force Kill) > Connecting /
+    // Reconnecting / AwaitingUserInput (in-flight → Cancel) > Connected
+    // (steady → Disconnect). When no tunnel is active but a prior session
+    // exists, surface `r Reconnect`.
+    let active_state = app
+        .registry
+        .snapshot_all()
+        .into_iter()
+        .map(|s| s.state)
+        .filter(|st| !matches!(st, Connection::Disconnected { .. }))
+        .min_by_key(|st| match st {
+            Connection::Disconnecting { .. } => 0,
+            Connection::Connecting { .. }
+            | Connection::Reconnecting { .. }
+            | Connection::AwaitingUserInput { .. } => 1,
+            Connection::Connected { .. } => 2,
+            Connection::Disconnected { .. } => 3,
+        });
+    let disconnect_hint = match active_state {
+        Some(Connection::Disconnecting { .. }) => ("d", "Force Kill"),
+        Some(
+            Connection::Connecting { .. }
+            | Connection::Reconnecting { .. }
+            | Connection::AwaitingUserInput { .. },
+        ) => ("d", "Cancel"),
+        Some(Connection::Connected { .. }) => ("d", "Disconnect"),
+        _ => {
             if app.runtime.last_connected_profile.is_some() {
                 ("r", "Reconnect")
             } else {

@@ -1,13 +1,15 @@
 //! Background telemetry and scanner polling.
 
 use std::sync::mpsc;
+use std::time::SystemTime;
 
-use super::{App, ConnectionState};
+use super::App;
 use crate::constants;
 use crate::core::network_monitor::NetworkEvent;
 use crate::core::scanner;
 use crate::logger::LogLevel;
 use crate::message::Message;
+use crate::vortix_core::engine::state::Connection;
 
 impl App {
     /// Processes pending telemetry updates from the background worker.
@@ -46,16 +48,33 @@ impl App {
                 }
                 Err(mpsc::TryRecvError::Empty) => {
                     // Previous scan still running — don't start another.
-                    if let ConnectionState::Connecting { started, profile } =
-                        &self.runtime.connection_state
+                    // Log slow scanners against the in-flight tunnel (if any).
+                    // With multi-tunnel: pick the earliest-started Connecting
+                    // entry so the warning targets the tunnel users are
+                    // actually waiting on.
+                    if let Some((profile_id, started_at)) = self
+                        .registry
+                        .snapshot_all()
+                        .into_iter()
+                        .filter_map(|s| match s.state {
+                            Connection::Connecting { started_at, .. } => {
+                                Some((s.profile_id, started_at))
+                            }
+                            _ => None,
+                        })
+                        .min_by_key(|(_, started)| *started)
                     {
-                        let elapsed = started.elapsed().as_secs();
+                        let elapsed = SystemTime::now()
+                            .duration_since(started_at)
+                            .unwrap_or_default()
+                            .as_secs();
                         if elapsed > 0 && elapsed % constants::SCANNER_LOG_INTERVAL_SECS == 0 {
                             crate::logger::log(
                                 LogLevel::Info,
                                 "NET",
                                 format!(
-                                    "Scanner still running for '{profile}' ({elapsed}s elapsed)"
+                                    "Scanner still running for '{}' ({elapsed}s elapsed)",
+                                    profile_id.as_str()
                                 ),
                             );
                         }

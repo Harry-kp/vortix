@@ -674,7 +674,8 @@ impl App {
     /// `runtime.connection_state.details` (kernel-truthful values
     /// populated by the scanner — interface, pid, endpoint, mtu,
     /// transfer counters, public key) into the registry via
-    /// [`TunnelRegistry::set_connected`]. No `Tunnel::up` invocation;
+    /// [`TunnelRegistry::set_connected`](crate::vortix_core::engine::TunnelRegistry::set_connected).
+    /// No `Tunnel::up` invocation;
     /// no synthetic handle. The placeholder `Engine<TunnelKind>` the
     /// registry constructs is never driven — its inner tunnel field
     /// is dead storage required only to satisfy the generic `T:
@@ -692,7 +693,7 @@ impl App {
     /// Idempotent: scanner ticks every ~1s re-call this with the
     /// latest details. `set_connected` updates the existing entry's
     /// state in place — no FSM churn.
-    pub(crate) fn mirror_connect_into_registry(&mut self, profile_name: &str) {
+    pub fn mirror_connect_into_registry(&mut self, profile_name: &str) {
         let Some(profile) = self
             .runtime
             .profiles
@@ -746,7 +747,7 @@ impl App {
     /// registry's FSM to `Disconnected` (without running `Disconnecting`
     /// or `tunnel.down()`) and remove the entry. Idempotent — a profile
     /// the registry never had is a no-op.
-    pub(crate) fn mirror_disconnect_into_registry(&mut self, profile_name: &str) {
+    pub fn mirror_disconnect_into_registry(&mut self, profile_name: &str) {
         let profile_id = ProfileId::new(profile_name);
         self.registry.set_disconnected(&profile_id);
     }
@@ -757,7 +758,7 @@ impl App {
     /// `connection_state = Connecting{...}` and spawning the worker
     /// thread. Without this the sidebar/header stay blank for the
     /// (sometimes seconds-long) gap until the worker reports back.
-    pub(crate) fn mirror_connecting_into_registry(&mut self, profile_name: &str) {
+    pub fn mirror_connecting_into_registry(&mut self, profile_name: &str) {
         let Some(profile) = self
             .runtime
             .profiles
@@ -800,7 +801,7 @@ impl App {
     /// Disconnecting state. No-op when the registry doesn't already
     /// have a Connected entry to transition — `set_disconnecting`
     /// internally skips missing entries.
-    pub(crate) fn mirror_disconnecting_into_registry(&mut self, profile_name: &str) {
+    pub fn mirror_disconnecting_into_registry(&mut self, profile_name: &str) {
         let profile_id = ProfileId::new(profile_name);
         let started_at = std::time::SystemTime::now();
         self.registry.set_disconnecting(&profile_id, started_at);
@@ -810,7 +811,7 @@ impl App {
     /// renderers show the `✗` badge until the user retries or
     /// dismisses. Called from `handle_connect_result`'s failure
     /// branch.
-    pub(crate) fn mirror_failed_into_registry(&mut self, profile_name: &str, error: &str) {
+    pub fn mirror_failed_into_registry(&mut self, profile_name: &str, error: &str) {
         let Some(profile) = self
             .runtime
             .profiles

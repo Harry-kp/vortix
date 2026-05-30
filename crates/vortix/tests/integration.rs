@@ -67,6 +67,10 @@ fn set_connected(app: &mut App, name: &str) {
             ..Default::default()
         }),
     };
+    // Path A: mirror into the registry so post-P5a helpers
+    // (`is_profile_active`, `active_tunnel_count`, etc.) see this profile
+    // as active. Matches the production connect path.
+    app.mirror_connect_into_registry(name);
 }
 
 fn set_connecting(app: &mut App, name: &str) {
@@ -74,6 +78,7 @@ fn set_connecting(app: &mut App, name: &str) {
         started: Instant::now(),
         profile: name.to_string(),
     };
+    app.mirror_connecting_into_registry(name);
 }
 
 fn set_disconnecting(app: &mut App, name: &str) {
@@ -81,6 +86,7 @@ fn set_disconnecting(app: &mut App, name: &str) {
         started: Instant::now(),
         profile: name.to_string(),
     };
+    app.mirror_disconnecting_into_registry(name);
 }
 
 fn fake_session(name: &str) -> ActiveSession {

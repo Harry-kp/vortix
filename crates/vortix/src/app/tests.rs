@@ -55,6 +55,11 @@ fn test_app() -> App {
 }
 
 /// Helper: put app into a Connected state for a given profile name.
+///
+/// Mirrors into the registry so helpers/renderers (which read
+/// registry-only after P5a) see the active state. Production code does
+/// the same via `mirror_connect_into_registry` on every successful
+/// connect.
 fn set_connected(app: &mut App, name: &str) {
     app.runtime.session_start = Some(Instant::now());
     app.runtime.connection_state = ConnectionState::Connected {
@@ -68,14 +73,22 @@ fn set_connected(app: &mut App, name: &str) {
             ..Default::default()
         }),
     };
+    app.mirror_connect_into_registry(name);
 }
 
 /// Helper: put app into a Disconnecting state for a given profile name.
+///
+/// Mirrors into the registry so post-P5a helpers see the in-flight
+/// state. `mirror_disconnecting_into_registry` is a no-op when the
+/// registry has no prior entry — tests that need a Disconnecting
+/// transition off a previously-Connected state should call
+/// `set_connected` first.
 fn set_disconnecting(app: &mut App, name: &str) {
     app.runtime.connection_state = ConnectionState::Disconnecting {
         started: Instant::now(),
         profile: name.to_string(),
     };
+    app.mirror_disconnecting_into_registry(name);
 }
 
 /// Helper: create a fake `ActiveSession` for scanner results.
@@ -279,11 +292,16 @@ fn test_d_while_disconnected_is_noop() {
 // ====================================================================
 
 /// Helper: put app into a Connecting state for a given profile name.
+///
+/// Mirrors into the registry so post-P5a helpers see the in-flight
+/// state. Matches the production connect path (Path A) which mirrors
+/// every Connecting transition into the registry.
 fn set_connecting(app: &mut App, name: &str) {
     app.runtime.connection_state = ConnectionState::Connecting {
         started: Instant::now(),
         profile: name.to_string(),
     };
+    app.mirror_connecting_into_registry(name);
 }
 
 /// Helper: add test profiles to the app.
@@ -2032,10 +2050,7 @@ fn test_cannot_delete_connecting_profile() {
     let mut app = test_app();
     add_profiles(&mut app, &["my-vpn"]);
     app.profile_list_state.select(Some(0));
-    app.runtime.connection_state = ConnectionState::Connecting {
-        profile: "my-vpn".to_string(),
-        started: Instant::now(),
-    };
+    set_connecting(&mut app, "my-vpn");
 
     app.request_delete(0);
     assert!(
@@ -2049,10 +2064,11 @@ fn test_cannot_delete_disconnecting_profile() {
     let mut app = test_app();
     add_profiles(&mut app, &["my-vpn"]);
     app.profile_list_state.select(Some(0));
-    app.runtime.connection_state = ConnectionState::Disconnecting {
-        profile: "my-vpn".to_string(),
-        started: Instant::now(),
-    };
+    // Disconnecting transitions off Connected; the registry's
+    // set_disconnecting is a no-op without a prior Connected entry, so
+    // seed Connected first.
+    set_connected(&mut app, "my-vpn");
+    set_disconnecting(&mut app, "my-vpn");
 
     app.request_delete(0);
     assert!(
@@ -2737,9 +2753,11 @@ fn u19_u_keybinding_is_inert_when_no_banner() {
 }
 
 #[test]
-fn u19_active_tunnel_count_reports_legacy_connected() {
-    // The active_tunnel_count helper falls back to the legacy
-    // ConnectionState when the registry is empty.
+fn u19_active_tunnel_count_reflects_registry_after_connect() {
+    // Pre-P5a this exercised the legacy fallback when the registry
+    // was empty. Post-P5a the helper reads registry-only; `set_connected`
+    // mirrors into the registry (matching Path A's production path),
+    // so the count flips 0 -> 1.
     let mut app = test_app();
     add_profiles(&mut app, &["p1"]);
     assert_eq!(app.active_tunnel_count(), 0);

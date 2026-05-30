@@ -53,44 +53,20 @@ impl App {
     /// #001 U19). "Active" means the FSM is not `Disconnected` — that
     /// includes `Connecting`, `Connected`, `Disconnecting`,
     /// `AwaitingUserInput`, and any other in-flight states.
-    ///
-    /// When the registry is empty (the U6/U7 wiring hasn't populated it for
-    /// the current single-tunnel session) we fall back to inspecting the
-    /// legacy `runtime.connection_state` — that yields 0 when Disconnected
-    /// and 1 in any other in-flight state, preserving the existing
-    /// single-tunnel `D` semantics without the confirm dialog.
     #[must_use]
     pub(crate) fn active_tunnel_count(&self) -> usize {
         use crate::vortix_core::engine::state::Connection;
-        use crate::vpn_runtime::ConnectionState;
-        let mut count = 0usize;
-        for snap in self.registry.snapshot_all() {
-            if !matches!(snap.state, Connection::Disconnected { .. }) {
-                count += 1;
-            }
-        }
-        if count > 0 {
-            return count;
-        }
-        // Legacy fallback: the App still drives single-tunnel state through
-        // `runtime.connection_state` until U6 stage C wires connect/disconnect
-        // through `registry.connect`/`registry.disconnect`.
-        match self.runtime.connection_state {
-            ConnectionState::Disconnected => 0,
-            ConnectionState::Connecting { .. }
-            | ConnectionState::Connected { .. }
-            | ConnectionState::Disconnecting { .. } => 1,
-        }
+        self.registry
+            .snapshot_all()
+            .iter()
+            .filter(|s| !matches!(s.state, Connection::Disconnected { .. }))
+            .count()
     }
 
     /// Return the list of `ProfileId`s for currently-active tunnels in a
     /// stable order. Used by the `Tab` focus-cycle in Connection Details.
-    /// Falls back to a single-element vec when the registry is empty but
-    /// the legacy `connection_state` is non-disconnected.
     pub(crate) fn active_tunnel_ids(&self) -> Vec<crate::vortix_core::profile::ProfileId> {
         use crate::vortix_core::engine::state::Connection;
-        use crate::vortix_core::profile::ProfileId;
-        use crate::vpn_runtime::ConnectionState;
         let mut out: Vec<_> = self
             .registry
             .snapshot_all()
@@ -99,17 +75,7 @@ impl App {
             .map(|s| s.profile_id)
             .collect();
         out.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-        if !out.is_empty() {
-            return out;
-        }
-        match &self.runtime.connection_state {
-            ConnectionState::Disconnected => Vec::new(),
-            ConnectionState::Connecting { profile, .. }
-            | ConnectionState::Connected { profile, .. }
-            | ConnectionState::Disconnecting { profile, .. } => {
-                vec![ProfileId::new(profile)]
-            }
-        }
+        out
     }
 
     /// Whether the profile at `idx` is currently in a Connected state. Used
@@ -122,14 +88,23 @@ impl App {
         let Some(profile) = self.runtime.profiles.get(idx) else {
             return false;
         };
-        if let Some(snap) = self.registry.snapshot(&ProfileId::new(&profile.name)) {
-            return matches!(snap.state, Connection::Connected { .. });
-        }
-        // Legacy fallback.
-        matches!(
-            &self.runtime.connection_state,
-            crate::vpn_runtime::ConnectionState::Connected { profile: p, .. } if *p == profile.name
-        )
+        self.registry
+            .snapshot(&ProfileId::new(&profile.name))
+            .is_some_and(|snap| matches!(snap.state, Connection::Connected { .. }))
+    }
+
+    /// Whether the named profile is currently in any non-`Disconnected` state
+    /// (`Connecting` / `Connected` / `Disconnecting` / `Reconnecting` /
+    /// `AwaitingUserInput`). Used by deletion-safety checks where we need
+    /// to refuse to delete a profile that has an in-flight or active
+    /// tunnel.
+    #[must_use]
+    pub(crate) fn is_profile_active(&self, profile_name: &str) -> bool {
+        use crate::vortix_core::engine::state::Connection;
+        use crate::vortix_core::profile::ProfileId;
+        self.registry
+            .snapshot(&ProfileId::new(profile_name))
+            .is_some_and(|snap| !matches!(snap.state, Connection::Disconnected { .. }))
     }
 
     /// Whether the profile at `idx` is currently Connecting (in-flight).
@@ -141,13 +116,9 @@ impl App {
         let Some(profile) = self.runtime.profiles.get(idx) else {
             return false;
         };
-        if let Some(snap) = self.registry.snapshot(&ProfileId::new(&profile.name)) {
-            return matches!(snap.state, Connection::Connecting { .. });
-        }
-        matches!(
-            &self.runtime.connection_state,
-            crate::vpn_runtime::ConnectionState::Connecting { profile: p, .. } if *p == profile.name
-        )
+        self.registry
+            .snapshot(&ProfileId::new(&profile.name))
+            .is_some_and(|snap| matches!(snap.state, Connection::Connecting { .. }))
     }
 
     /// Resolve the profile index that the Connection Details panel is
