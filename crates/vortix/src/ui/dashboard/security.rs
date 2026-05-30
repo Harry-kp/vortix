@@ -5,7 +5,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Padding, Paragraph},
     Frame,
 };
 
@@ -54,6 +54,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
+        .padding(Padding::horizontal(1))
         .title(" Security Guard ");
 
     let inner = block.inner(area);
@@ -463,6 +464,7 @@ fn render_back(frame: &mut Frame, app: &App, area: Rect, border_style: Style) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
+        .padding(Padding::horizontal(1))
         .title(constants::TITLE_FLIP_CONNECTIONS_AUDIT)
         .title_bottom(
             Line::from(Span::styled(

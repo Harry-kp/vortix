@@ -59,8 +59,8 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
-        Block, Borders, Cell, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState,
-        Table,
+        Block, Borders, Cell, Padding, Paragraph, Row, Scrollbar, ScrollbarOrientation,
+        ScrollbarState, Table,
     },
     Frame,
 };
@@ -174,6 +174,7 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
+        .padding(Padding::horizontal(1))
         .title(format!(" Profiles [{sort_label}] "));
 
     let inner = block.inner(area);

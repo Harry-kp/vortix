@@ -9,7 +9,7 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Padding, Paragraph},
     Frame,
 };
 
@@ -38,6 +38,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
+        .padding(Padding::horizontal(1))
         .title(" Connection Details ");
 
     let inner = block.inner(area);
@@ -708,6 +709,7 @@ fn render_back(frame: &mut Frame, app: &App, area: Rect, border_style: Style) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
+        .padding(Padding::horizontal(1))
         .title(constants::TITLE_FLIP_QUALITY_TIMELINE)
         .title_bottom(
             Line::from(Span::styled(
