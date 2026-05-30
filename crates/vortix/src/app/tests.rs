@@ -50,7 +50,6 @@ fn test_app() -> App {
         terminal_size: (80, 24),
         last_known_primary: None,
         auto_promote_banner: None,
-        connection_details_focus: None,
     }
 }
 
@@ -2540,31 +2539,28 @@ fn u19_confirm_disconnect_all_closes_overlay() {
 }
 
 #[test]
-fn u19_tab_in_connection_details_cycles_focus_when_multi() {
-    // CycleConnectionDetailsFocus rotates the explicit focus across the
-    // active-tunnel list. With N≤1 the message is a no-op and the
-    // override remains unset.
+fn u19_connection_details_follows_sidebar_selection() {
+    // Tab is reserved for panel navigation; Connection Details panel
+    // always mirrors the sidebar selection (no separate focus override).
+    // Earlier multi-tunnel iteration tried Tab-in-Details to cycle
+    // across active tunnels — that hijacked global panel navigation,
+    // so the binding was removed. `connection_details_focused_idx`
+    // now always returns the sidebar's selected profile.
     let mut app = test_app();
     add_profiles(&mut app, &["alpha", "beta"]);
-    // With a single active legacy tunnel, the cycle is a no-op.
     set_connected(&mut app, "alpha");
-    app.handle_message(Message::CycleConnectionDetailsFocus);
-    assert!(
-        app.connection_details_focus.is_none(),
-        "with N≤1 the focus override must remain unset"
+    set_connected(&mut app, "beta");
+    app.profile_list_state.select(Some(1)); // beta
+    assert_eq!(
+        app.connection_details_focused_idx(),
+        Some(1),
+        "Connection Details should follow sidebar selection"
     );
-}
-
-#[test]
-fn u19_profile_move_clears_connection_details_focus_override() {
-    let mut app = test_app();
-    add_profiles(&mut app, &["alpha", "beta"]);
-    set_connected(&mut app, "alpha");
-    app.connection_details_focus = Some(crate::vortix_core::profile::ProfileId::new("beta"));
-    app.handle_message(Message::ProfileMove(crate::message::SelectionMove::Next));
-    assert!(
-        app.connection_details_focus.is_none(),
-        "sidebar movement must clear the focus override"
+    app.profile_list_state.select(Some(0)); // alpha
+    assert_eq!(
+        app.connection_details_focused_idx(),
+        Some(0),
+        "Switching sidebar selection should switch the Details focus"
     );
 }
 

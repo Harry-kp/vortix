@@ -51,8 +51,11 @@ const HELP_TEXT: &[(&str, &[(&str, &str)])] = &[
     (
         "Connection Details",
         &[
-            ("Tab", "Cycle focus across active tunnels"),
             ("c", "Cancel in-flight connect"),
+            (
+                "(switch tunnels)",
+                "Use the sidebar (j/k) — Details follows the selected profile",
+            ),
         ],
     ),
     (
@@ -200,12 +203,11 @@ mod tests {
 
     #[test]
     fn multi_tunnel_keys_are_documented() {
-        // Regression: every keybinding plan 001 multi-tunnel added
-        // must be discoverable via `?`. Pre-fix the help only mentioned
-        // `c / Enter` for connect/disconnect; users had no way to learn
-        // about D (disconnect-all), Tab (focus cycle), c (cancel
-        // in-flight), u (revert auto-promote), or B (multi-connect on
-        // takeover overlay).
+        // Regression: every multi-tunnel keybinding must be
+        // discoverable via `?`. Tab inside Connection Details was
+        // removed (it hijacked panel navigation — Tab is sacred for
+        // moving between panels). The help now points users at the
+        // sidebar j/k for switching which tunnel's details are shown.
         let help = flatten();
 
         // `D` Shift+d for disconnect-all.
@@ -214,10 +216,11 @@ mod tests {
             "help must document Shift+D disconnect-all:\n{help}"
         );
 
-        // `Tab` in Connection Details for focus cycling.
+        // Connection Details should point users at the sidebar for
+        // tunnel switching, since Tab is reserved for panel nav.
         assert!(
-            help.contains("Cycle focus across active tunnels"),
-            "help must document Tab focus cycling:\n{help}"
+            help.contains("Details follows the selected profile"),
+            "help must document that Connection Details follows sidebar selection:\n{help}"
         );
 
         // `c` in Connection Details for canceling in-flight connect.

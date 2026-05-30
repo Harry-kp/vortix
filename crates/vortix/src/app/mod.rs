@@ -117,13 +117,6 @@ pub struct App {
     /// the tick loop after [`AUTO_PROMOTE_REVERT_WINDOW_SECS`] elapses or
     /// by an explicit user dismissal.
     pub auto_promote_banner: Option<AutoPromoteBanner>,
-
-    /// Multi-connection plan #001 U19: which active tunnel the Connection
-    /// Details panel is currently focused on, when the user has explicitly
-    /// cycled focus via `Tab`. `None` means the panel falls back to the
-    /// sidebar selection (existing behavior). Cleared on any sidebar
-    /// selection change so the panel stays coherent with the visible row.
-    pub connection_details_focus: Option<crate::vortix_core::profile::ProfileId>,
 }
 
 // Plan 005 U5 removed the previous `impl Deref<Target = VpnRuntime>` — the
@@ -175,7 +168,6 @@ impl App {
             terminal_size: (0, 0),
             last_known_primary: None,
             auto_promote_banner: None,
-            connection_details_focus: None,
         };
 
         // Select first profile if available
@@ -332,7 +324,6 @@ impl App {
             terminal_size: (80, 24),
             last_known_primary: None,
             auto_promote_banner: None,
-            connection_details_focus: None,
         }
     }
 }

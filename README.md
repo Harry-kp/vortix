@@ -328,7 +328,7 @@ vortix status --watch --json
 
 | Key | Action |
 |-----|--------|
-| `Tab` | Cycle Focus (panels); in Connection Details, cycle across active tunnels |
+| `Tab` | Cycle Focus (panels). Connection Details mirrors the sidebar selection — switch tunnels by navigating the profile list. |
 | `1-9` | Connect to Quick-Slot 1-9 |
 | `Enter` | Connect / Toggle Profile |
 | `d` | Disconnect focused tunnel (sidebar row, or primary when no sidebar focus) |

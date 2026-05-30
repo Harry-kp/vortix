@@ -106,12 +106,6 @@ pub enum Message {
     /// `InputMode::ConfirmDisconnectAll` overlay; tear down every active
     /// tunnel (registry-aware) plus the legacy single-tunnel state.
     ConfirmDisconnectAll,
-    /// Multi-connection plan #001 U19: cycle Connection Details focus to
-    /// the next active tunnel (the `Tab` keybinding when Connection Details
-    /// is the focused panel and N>1 active tunnels exist). With N≤1 the
-    /// input layer falls through to the existing `NextPanel` behavior and
-    /// this message is never sent.
-    CycleConnectionDetailsFocus,
     /// Multi-connection plan #001 U19: cancel an in-flight connect (the
     /// `c` keybinding on a Connecting row's Connection Details). FSM
     /// transitions Connecting → Disconnected and the sidebar row clears

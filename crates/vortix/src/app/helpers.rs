@@ -251,22 +251,15 @@ impl App {
     }
 
     /// Resolve the profile index that the Connection Details panel is
-    /// currently focused on. Prefers the explicit
-    /// `connection_details_focus` override (set by `Tab` cycling) over the
-    /// sidebar selection. Returns `None` when neither resolves to a known
-    /// profile. Multi-connection plan #001 U19.
+    /// currently focused on. Always mirrors the sidebar selection —
+    /// the user picks which tunnel's details to view by navigating
+    /// the profile list (j/k on the sidebar). Earlier multi-tunnel
+    /// iteration added a Tab-in-Details binding to cycle across
+    /// active tunnels; that broke global panel navigation, so it was
+    /// removed and Connection Details went back to the simpler
+    /// "follow the sidebar" rule.
     #[must_use]
     pub(crate) fn connection_details_focused_idx(&self) -> Option<usize> {
-        if let Some(forced) = &self.connection_details_focus {
-            if let Some(idx) = self
-                .runtime
-                .profiles
-                .iter()
-                .position(|p| p.name == forced.as_str())
-            {
-                return Some(idx);
-            }
-        }
         self.profile_list_state.selected()
     }
 

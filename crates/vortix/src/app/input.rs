@@ -548,18 +548,14 @@ impl App {
             return;
         }
 
-        // Multi-connection plan #001 U19: Tab while focused on the
-        // Connection Details panel with N>1 active tunnels cycles focus
-        // across active tunnels instead of advancing to the next UI panel.
-        // With N≤1 we fall through to the existing NextPanel behavior.
-        if matches!(key.code, KeyCode::Tab)
-            && self.focused_panel == FocusedPanel::ConnectionDetails
-            && self.zoomed_panel.is_none()
-            && self.active_tunnel_count() > 1
-        {
-            self.handle_message(Message::CycleConnectionDetailsFocus);
-            return;
-        }
+        // Tab is reserved for panel navigation (always advances to the
+        // next UI panel). Connection Details mirrors the sidebar's
+        // current selection — switching which tunnel's details are
+        // shown happens via sidebar j/k navigation, not via a hidden
+        // Tab interception that swallowed panel-cycle behaviour when
+        // 2+ tunnels were active. (Earlier multi-tunnel iteration
+        // tried Tab-to-cycle-tunnels-in-Details; that broke panel
+        // navigation, so the binding was removed.)
 
         // Multi-connection plan #001 U19: `c` on a Connecting row's
         // Connection Details cancels the in-flight connect. Routed before

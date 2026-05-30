@@ -128,52 +128,20 @@ impl App {
                 self.input_mode = InputMode::Normal;
                 self.disconnect_all_active();
             }
-            Message::CycleConnectionDetailsFocus => {
-                let ids = self.active_tunnel_ids();
-                if ids.len() < 2 {
-                    return;
-                }
-                // Resolve the current focus to find the next in stable order.
-                let current = self.connection_details_focus.clone().or_else(|| {
-                    self.profile_list_state
-                        .selected()
-                        .and_then(|i| self.runtime.profiles.get(i))
-                        .map(|p| crate::vortix_core::profile::ProfileId::new(&p.name))
-                });
-                let pos = current
-                    .as_ref()
-                    .and_then(|c| ids.iter().position(|i| i == c));
-                let next_idx = match pos {
-                    Some(p) => (p + 1) % ids.len(),
-                    None => 0,
-                };
-                let next = ids[next_idx].clone();
-                self.log(&format!(
-                    "ACTION: Connection Details focus → '{}'",
-                    next.as_str()
-                ));
-                self.connection_details_focus = Some(next);
-            }
             Message::CancelConnect { idx } => self.cancel_connect(idx),
             Message::RevertAutoPromote => self.handle_revert_auto_promote(),
             Message::DismissAutoPromoteBanner => {
                 self.auto_promote_banner = None;
             }
-            Message::ProfileMove(mv) => {
-                // Multi-connection plan #001 U19: any sidebar movement
-                // clears the Tab-driven Connection Details focus override
-                // so the panel stays coherent with the visible row.
-                self.connection_details_focus = None;
-                match mv {
-                    SelectionMove::Next => self.profile_next(),
-                    SelectionMove::Prev => self.profile_previous(),
-                    SelectionMove::First => self.profile_list_state.select(Some(0)),
-                    SelectionMove::Last => {
-                        let last = self.runtime.profiles.len().saturating_sub(1);
-                        self.profile_list_state.select(Some(last));
-                    }
+            Message::ProfileMove(mv) => match mv {
+                SelectionMove::Next => self.profile_next(),
+                SelectionMove::Prev => self.profile_previous(),
+                SelectionMove::First => self.profile_list_state.select(Some(0)),
+                SelectionMove::Last => {
+                    let last = self.runtime.profiles.len().saturating_sub(1);
+                    self.profile_list_state.select(Some(last));
                 }
-            }
+            },
 
             // Connection
             Message::Disconnect => {
