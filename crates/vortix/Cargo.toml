@@ -12,7 +12,18 @@ categories = ["command-line-utilities", "network-programming"]
 homepage = "https://docs.rs/vortix"
 documentation = "https://docs.rs/vortix"
 readme = "../../README.md"
+# Keep the published crate small. README.md is the only doc shipped to
+# crates.io / docs.rs; everything else (CHANGELOG, CLAUDE.md, docs/,
+# manual-testing plans, planning artifacts) lives in the GitHub repo
+# only. `cargo package` already skips workspace-root files that aren't
+# explicitly referenced, so the workspace-level CHANGELOG / CLAUDE.md /
+# docs/ are out of the bundle automatically — the entries below cover
+# the per-crate CHANGELOG.md that release-plz generates and the
+# integration tests (not runnable by downstream consumers of the
+# binary; they only inflate the tarball).
 exclude = [
+    "CHANGELOG.md",
+    "tests/*",
     "../../assets/*",
     "../../.github/*",
     "../../target/*",
