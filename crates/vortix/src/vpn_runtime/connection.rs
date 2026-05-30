@@ -39,8 +39,17 @@ pub struct StatusSnapshot {
     pub quality: Option<String>,
     pub download_bytes: Option<String>,
     pub upload_bytes: Option<String>,
-    pub killswitch_mode: String,
-    pub killswitch_state: String,
+    /// Kill switch mode — the typed enum. Call sites format it via
+    /// [`crate::state::KillSwitchMode::display_name`] (prose for humans:
+    /// `Off` / `Block on drop` / `VPN-only`) or
+    /// [`crate::state::KillSwitchMode::cli_verb`] (slug for the CLI verb +
+    /// JSON envelope: `off` / `block-on-drop` / `vpn-only`). One
+    /// vocabulary, two casings, no duplicated string fields.
+    pub killswitch_mode: crate::state::KillSwitchMode,
+    /// Kill switch state — typed enum. See the helpers
+    /// [`crate::state::KillSwitchState::display_status`] (prose) and
+    /// [`crate::state::KillSwitchState::cli_verb`] (slug).
+    pub killswitch_state: crate::state::KillSwitchState,
     pub dns_leak: Option<bool>,
     pub ipv6_leak: Option<bool>,
     pub encryption: Option<String>,
@@ -387,8 +396,8 @@ impl VpnRuntime {
             quality: None,
             download_bytes: dl,
             upload_bytes: ul,
-            killswitch_mode: format!("{:?}", self.killswitch_mode).to_lowercase(),
-            killswitch_state: format!("{:?}", self.killswitch_state).to_lowercase(),
+            killswitch_mode: self.killswitch_mode,
+            killswitch_state: self.killswitch_state,
             dns_leak: None,
             ipv6_leak: None,
             encryption,

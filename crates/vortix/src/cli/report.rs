@@ -142,8 +142,12 @@ fn collect_report(config_dir: &Path, config_source: &str) -> ReportInfo {
     let profile_counts = super::commands::count_profiles(&profiles_dir);
 
     let ks_state = match crate::core::killswitch::load_state() {
-        Some(state) => format!("{:?} ({:?})", state.mode, state.state),
-        None => "off".to_string(),
+        Some(persisted) => format!(
+            "{} ({})",
+            persisted.mode.display_name(),
+            persisted.state.display_status()
+        ),
+        None => crate::state::KillSwitchMode::Off.display_name().to_string(),
     };
 
     let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((0, 0));

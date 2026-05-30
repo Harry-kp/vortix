@@ -257,7 +257,7 @@ v0.3.x ("V1"), follow this procedure.
    Re-arm the killswitch on first run after downgrade:
 
    ```sh
-   sudo vortix killswitch auto         # or "always", to taste
+   sudo vortix killswitch block-on-drop   # or "vpn-only", to taste
    ```
 
 4. **Profile configs are unchanged.** No migration is needed for your

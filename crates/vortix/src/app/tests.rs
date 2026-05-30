@@ -2539,6 +2539,144 @@ fn u19_confirm_disconnect_all_closes_overlay() {
 }
 
 #[test]
+fn shift_d_disconnect_all_processes_every_active_tunnel() {
+    // Regression for the Shift+D bug where only one of N active
+    // tunnels was actually torn down. The pre-fix path only called
+    // `registry.disconnect()` for each tunnel — which drove the
+    // placeholder MockTunnel (the bookkeeping shim
+    // `mirror_connect_into_registry` installs) and removed the
+    // registry entry, but never invoked the real
+    // `tunnel::tunnel_for(protocol).down(handle)` for the secondary.
+    // Result: kernel interface for the secondary stayed up, scanner
+    // re-adopted it on the next tick (D-4), sidebar lied about both
+    // being down. The fix routes through `disconnect_specific` for
+    // every tunnel, which spawns the real teardown thread AND
+    // mirrors Disconnecting into the registry.
+    //
+    // This test asserts the observable side-effects of
+    // `disconnect_all_active` happened for every profile: the
+    // Disconnecting transition was mirrored into the registry, and
+    // each profile's retry_state was cleared (these are the parts
+    // `disconnect_specific` runs synchronously before spawning the
+    // teardown thread). We can't observe the spawned tunnel.down()
+    // from a unit test, but we can verify the per-profile bookkeeping
+    // ran for ALL active tunnels — that's exactly what was broken.
+    use crate::vortix_core::engine::state::Connection;
+    use crate::vortix_core::profile::ProfileId;
+
+    let mut app = test_app();
+    add_profiles(&mut app, &["alpha", "beta"]);
+    set_connected(&mut app, "alpha");
+    set_connected(&mut app, "beta");
+    // Pre-condition: both profiles have retry_state entries we can
+    // later assert got cleared. (Imagine they had failed before and
+    // were in a retry sequence.)
+    for name in ["alpha", "beta"] {
+        app.runtime.retry_state.insert(
+            ProfileId::new(name),
+            crate::state::RetryState {
+                attempt: 1,
+                profile_idx: 0,
+                auto_reconnect: true,
+            },
+        );
+    }
+    assert_eq!(app.runtime.retry_state.len(), 2);
+    assert_eq!(app.active_tunnel_count(), 2);
+
+    app.disconnect_all_active();
+
+    // Every profile's retry entry was cleared (per-profile, not just
+    // the primary — that was the bug).
+    assert!(
+        app.runtime.retry_state.is_empty(),
+        "disconnect_all_active must clear retry_state for EVERY active \
+         profile, not just the primary; got: {:?}",
+        app.runtime.retry_state
+    );
+
+    // Every profile's registry entry is Disconnected (set_disconnecting
+    // on the MockTunnel-backed Engine drives the FSM all the way to
+    // Disconnected synchronously). The point isn't the final variant —
+    // the point is that EACH profile was touched.
+    for name in ["alpha", "beta"] {
+        let snap = app
+            .registry
+            .snapshot(&ProfileId::new(name))
+            .expect("registry entry must exist post disconnect");
+        assert!(
+            matches!(
+                snap.state,
+                Connection::Disconnected { .. } | Connection::Disconnecting { .. }
+            ),
+            "{name} should be Disconnecting/Disconnected after \
+             disconnect_all_active; got {:?}",
+            snap.state
+        );
+    }
+}
+
+#[test]
+fn shift_d_disconnect_profile_by_idx_works_for_secondary() {
+    // Companion to the test above. Pre-fix, `disconnect_profile_by_idx`
+    // called `registry.disconnect()` then conditionally fell through
+    // to `self.disconnect()` only if `legacy_matches(name)` — true
+    // only for the registry primary. For secondaries, the real
+    // teardown never fired. Fix routes through `disconnect_specific`
+    // for any active profile, primary or not.
+    use crate::vortix_core::engine::state::Connection;
+    use crate::vortix_core::profile::ProfileId;
+
+    let mut app = test_app();
+    add_profiles(&mut app, &["alpha", "beta"]);
+    set_connected(&mut app, "alpha");
+    set_connected(&mut app, "beta");
+    app.runtime.retry_state.insert(
+        ProfileId::new("beta"),
+        crate::state::RetryState {
+            attempt: 1,
+            profile_idx: 1,
+            auto_reconnect: true,
+        },
+    );
+
+    // Disconnect the secondary (idx 1, "beta") — not the legacy
+    // primary derived from registry.
+    app.disconnect_profile_by_idx(1);
+
+    // beta's retry state cleared.
+    assert!(
+        !app.runtime
+            .retry_state
+            .contains_key(&ProfileId::new("beta")),
+        "beta's retry_state must be cleared by disconnect_profile_by_idx"
+    );
+    // beta's registry entry transitioned out of Connected.
+    let beta_snap = app
+        .registry
+        .snapshot(&ProfileId::new("beta"))
+        .expect("beta entry must remain in registry");
+    assert!(
+        !matches!(beta_snap.state, Connection::Connected { .. }),
+        "beta should leave Connected after disconnect_profile_by_idx(1); \
+         got {:?}",
+        beta_snap.state
+    );
+    // alpha (the primary that we did NOT target) should NOT have been
+    // touched.
+    let alpha_snap = app
+        .registry
+        .snapshot(&ProfileId::new("alpha"))
+        .expect("alpha entry should remain");
+    assert!(
+        matches!(alpha_snap.state, Connection::Connected { .. }),
+        "alpha must stay Connected when we only disconnected beta; \
+         got {:?}",
+        alpha_snap.state
+    );
+}
+
+#[test]
 fn u19_connection_details_follows_sidebar_selection() {
     // Tab is reserved for panel navigation; Connection Details panel
     // always mirrors the sidebar selection (no separate focus override).

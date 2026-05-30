@@ -51,23 +51,17 @@ There is **no** `connection_state` field on `VpnRuntime`. Don't add one. Multi-t
 
 ## Kill switch semantics
 
-- **Off** — disabled, no firewall rules.
-- **Auto** — armed while a VPN is up; engages default-DROP egress only on an unexpected drop.
-- **AlwaysOn** — firewall stays engaged whether VPN is up or down. The default-DROP OUTPUT policy + per-tunnel ACCEPT rules (in `core::killswitch::enable_blocking_multi`) keep traffic from leaking in the gap between a drop and reconnection. State always resolves to `Blocking`, never `Armed`.
+One vocabulary, used identically on every surface — CLI input verb, CLI output, TUI panels, JSON envelope, log lines. Rust enum variants (`Off` / `Auto` / `AlwaysOn`) stay idiomatic for the language but never leak into output. The bridge between the enum and every user-visible string is the helper set on `vortix_core::state::killswitch` — `KillSwitchMode::display_name` (display), `cli_verb` / `from_cli_verb` (input parsing), `one_liner`, `behavior_lines`, and `KillSwitchState::display_status`.
 
-### Enum variants vs UI labels (don't get confused)
+| Rust enum    | Slug (CLI verb + display) | What it does                                                                                                                                                                                                  |
+|--------------|---------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `Off`        | **`off`**                 | No firewall rules. All traffic flows; real IP exposed if VPN drops.                                                                                                                                           |
+| `Auto`       | **`block-on-drop`**       | Armed while a VPN is up; engages default-DROP egress only on an unexpected drop.                                                                                                                              |
+| `AlwaysOn`   | **`vpn-only`**            | Firewall stays engaged whether VPN is up or down. Default-DROP OUTPUT policy + per-tunnel ACCEPT rules (`core::killswitch::enable_blocking_multi`) close the gap-between-drop-and-reconnect leak window. State always resolves to `Blocking`, never `Armed`. |
 
-The enum variants `Off` / `Auto` / `AlwaysOn` are the **stable contract** — they appear in code matches, log lines, the CLI grammar (`vortix killswitch off|auto|always`), the JSON envelope (`{"mode": "..."}`), and `killswitch.toml`. **Never rename them.**
+There are **no aliases**. `vortix killswitch auto` and `vortix killswitch always` are not accepted — the parser returns the "Use: off, block-on-drop, vpn-only" error. If you're touching killswitch I/O, route through the helpers; never hardcode a string.
 
-User-facing rendering uses friendlier labels via the helpers on `vortix_core::state::killswitch` (`KillSwitchMode::display_name`, `KillSwitchMode::one_liner`, `KillSwitchMode::behavior_lines`, `KillSwitchState::display_status`):
-
-| Enum         | UI label          | Plain English                                          |
-|--------------|-------------------|--------------------------------------------------------|
-| `Off`        | `Off`             | All traffic flows; real IP exposed if VPN drops.       |
-| `Auto`       | `Block on drop`   | Watch the VPN; block if it drops unexpectedly.         |
-| `AlwaysOn`   | `VPN-only`        | Only VPN traffic permitted. No internet without a VPN. |
-
-If you're touching killswitch rendering, route through those helpers — don't hardcode "Auto" or "Strict" in display strings. The header bar uses short abbreviations (`KS:Off` / `KS:Watch` / `KS:VPN-only` / `KS:DROPPED`); the Security Guard panel uses `display_name` + a status phrase; the CLI's human output uses `display_name` + `behavior_lines`. The module docs on `vortix_core/state/killswitch.rs` list the canonical mapping table.
+The header bar uses short abbreviations of the same labels (`KS:Off` / `KS:Watch` / `KS:VPN-only` / `KS:DROPPED`) because of the 80-col budget. The display-name labels (`Off` / `Block on drop` / `VPN-only`) are the long-form rendering of the same three slugs — just title-cased for prose. Slug everywhere, prose only in the long-form Security Guard / `vortix killswitch` output.
 
 ## Planning artifacts
 

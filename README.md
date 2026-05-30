@@ -22,10 +22,11 @@ Terminal UI for WireGuard and OpenVPN with real-time telemetry and leak guarding
 > rest are *addressable* on their declared `AllowedIPs`. Per-profile
 > retry and auto-reconnect. Scanner auto-adopts externally-started
 > tunnels. JSON status envelope bumps to `schema_version: 2` with
-> `data.connections[]` + `data.primary`. AlwaysOn kill switch now
-> keeps the firewall engaged whether the VPN is up or down (canonical
-> Linux killswitch shape — closes a gap-between-drop-and-reconnect
-> leak path). See the [CHANGELOG](https://github.com/Harry-kp/vortix/blob/main/CHANGELOG.md) for the full list.
+> `data.connections[]` + `data.primary`. Kill switch **VPN-only** mode
+> now keeps the firewall engaged whether the VPN is up or down
+> (canonical Linux killswitch shape — closes a
+> gap-between-drop-and-reconnect leak path). See the
+> [CHANGELOG](https://github.com/Harry-kp/vortix/blob/main/CHANGELOG.md) for the full list.
 >
 > **v0.3.0 migration** (Engine FSM, session journal, encrypted secret store):
 >
@@ -61,7 +62,7 @@ Existing options (`wg show`, NetworkManager, Tunnelblick) either lack real-time 
 - **Advanced Telemetry** — Real-time throughput, latency, **jitter**, and **packet loss**
 - **Geo-Location** — Instant detection of your exit IP's city and country
 - **Leak detection** — Monitors for IPv6 leaks and DNS leaks in real-time
-- **Kill Switch** — Platform-native firewall (PF on macOS; `iptables` or `nftables` on Linux). Multi-tunnel-aware: every active tunnel's interface is allow-listed. AlwaysOn mode keeps the firewall engaged whether the VPN is up or down — closes the gap-between-drop-and-reconnect leak window
+- **Kill Switch** — Platform-native firewall (PF on macOS; `iptables` or `nftables` on Linux). Three modes — **Off** (no firewall), **Block on drop** (engages only if the VPN drops unexpectedly), **VPN-only** (firewall stays engaged whether the VPN is up or down — closes the gap-between-drop-and-reconnect leak window). Multi-tunnel-aware: every active tunnel's interface is allow-listed
 - **Encrypted credential store** *(v0.3.0)* — OS keyring (Keychain / Secret Service) with AES-256-GCM + argon2id encrypted-file fallback for headless installs
 - **Session event journal** *(v0.3.0)* — JSONL event log per session under `${XDG_DATA_HOME}/vortix/sessions/`, 30-day retention; useful for diagnostics and scripting
 - **Per-process socket audit** *(v0.3.0)* — `vortix audit` answers "is this traffic actually routing through the tunnel?" with per-PID socket inventory; Linux + macOS supported
@@ -244,12 +245,15 @@ vortix rename old-vpn new-vpn   # Rename a profile
 
 **Security:**
 ```bash
-sudo vortix killswitch auto     # Block only on unexpected VPN drops
-sudo vortix killswitch always   # Default-DROP egress; firewall stays
-                                # engaged whether VPN is up or down.
-                                # Active tunnels' interfaces are
-                                # allow-listed automatically.
-vortix killswitch               # Show current mode
+# Kill switch — one label per mode, used in the TUI, JSON envelope,
+# CLI input, and CLI output alike.
+#   off             All traffic flows. Real IP exposed if VPN drops.
+#   block-on-drop   Block traffic only if the VPN drops unexpectedly.
+#   vpn-only        Only VPN traffic permitted. No internet without a VPN.
+sudo vortix killswitch off
+sudo vortix killswitch block-on-drop
+sudo vortix killswitch vpn-only
+vortix killswitch               # Show current mode + behaviour
 sudo vortix release-killswitch  # Emergency firewall release
 ```
 
@@ -482,7 +486,15 @@ ip_api_fallbacks = ["https://api.ipify.org", "https://icanhazip.com", "https://i
 **Telemetry:** A background thread polls system network stats every second for throughput (macOS: `libc::getifaddrs` reading BSD `if_data`; Linux: `/proc/net/dev`). Network quality (latency, jitter, loss) is measured with a hand-rolled ICMP echo probe over an unprivileged `SOCK_DGRAM` socket (falls back to TCP-connect-to-443 when ICMP is restricted). Public IP, ISP, and geo-location data are fetched via `ureq` over rustls-TLS — no `curl` shell-out, no tokio runtime overhead in the std::thread-based telemetry workers.
 
 **Security (Kill Switch & Leak Detection):**
-- **Kill Switch:** Platform-native firewall integration. macOS uses PF (Packet Filter) via `pfctl`. Linux supports `iptables` (default-DROP OUTPUT policy + explicit ACCEPT rules for loopback / RFC1918 / DHCP / each active tunnel's interface + server IPs, applied via `iptables-restore` for atomic switchover) and `nftables` (atomic `vortix_killswitch` table). Two modes: **Auto** engages the firewall only when an active VPN drops unexpectedly; **AlwaysOn** keeps the firewall engaged whether the VPN is up or down, so the gap between a drop and reconnect can never leak. Multi-tunnel-aware: every Connected tunnel contributes ACCEPT rules; the persisted state survives `vortix` restarts.
+- **Kill Switch:** Platform-native firewall integration. macOS uses PF (Packet Filter) via `pfctl`. Linux supports `iptables` (default-DROP OUTPUT policy + explicit ACCEPT rules for loopback / RFC1918 / DHCP / each active tunnel's interface + server IPs, applied via `iptables-restore` for atomic switchover) and `nftables` (atomic `vortix_killswitch` table). Three modes — one label per mode, identical across the TUI, `vortix status` / `vortix killswitch` human output, and the JSON envelope:
+
+  | Label / CLI verb      | Behavior                                                                                                                                                   |
+  | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+  | **`off`**             | All traffic flows; real IP exposed if VPN drops.                                                                                                           |
+  | **`block-on-drop`**   | Engage default-DROP egress *only* when an active VPN drops unexpectedly.                                                                                   |
+  | **`vpn-only`**        | Default-DROP egress stays engaged whether the VPN is up or down, so the gap between a drop and reconnect can never leak. Canonical Linux killswitch shape. |
+
+  The same three slugs are what you type (`vortix killswitch <slug>`) and what you read back (TUI, `vortix status`, JSON envelope). Multi-tunnel-aware: every Connected tunnel contributes ACCEPT rules; the persisted state survives `vortix` restarts.
 - **IPv6 Leak:** Active monitoring via `api6.ipify.org`. Any IPv6 traffic detected while VPN is active triggers a leak warning.
 - **DNS Leak:** Monitors DNS configuration to ensure nameservers align with the secure tunnel (macOS: `SCDynamicStore` via the `system-configuration` crate; Linux: `resolvectl` / `nmcli` / `/etc/resolv.conf`).
 

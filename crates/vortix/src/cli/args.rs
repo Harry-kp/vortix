@@ -312,25 +312,26 @@ pub enum Commands {
     ///
     /// Without a mode argument, shows the current mode and state.
     ///
-    /// Modes:
-    ///   off    — disabled; no firewall rules.
-    ///   auto   — armed while a VPN is up; engages default-DROP egress
-    ///            only when the VPN drops unexpectedly. Allows non-VPN
-    ///            traffic while disconnected.
-    ///   always — firewall stays engaged whether VPN is up or down.
-    ///            Default-DROP egress + ACCEPT rules for active
-    ///            tunnels' interfaces + their server IPs. The gap
-    ///            between a drop and reconnect can never leak.
+    /// Modes (same labels shown in the TUI and JSON envelope):
+    ///   off            — disabled; no firewall rules.
+    ///   block-on-drop  — armed while a VPN is up; engages default-DROP
+    ///                    egress only when the VPN drops unexpectedly.
+    ///                    Allows non-VPN traffic while disconnected.
+    ///   vpn-only       — firewall stays engaged whether VPN is up or
+    ///                    down. Default-DROP egress + ACCEPT rules for
+    ///                    active tunnels' interfaces + their server IPs.
+    ///                    The gap between a drop and reconnect can
+    ///                    never leak.
     ///
     /// EXAMPLES:
-    ///     vortix killswitch                     Show current mode
-    ///     sudo vortix killswitch auto           Set to auto
-    ///     sudo vortix killswitch always         Set to always-on
-    ///     sudo vortix killswitch off            Disable
-    ///     vortix killswitch --json              JSON with mode and state
+    ///     vortix killswitch                            Show current mode
+    ///     sudo vortix killswitch off                   Disable
+    ///     sudo vortix killswitch block-on-drop         Arm; block on unexpected drop
+    ///     sudo vortix killswitch vpn-only              Always engaged
+    ///     vortix killswitch --json                     JSON with mode and state
     #[command(name = "killswitch")]
     KillSwitch {
-        /// Target mode: off, auto, always (omit to show current)
+        /// Target mode: off, block-on-drop, vpn-only (omit to show current)
         mode: Option<String>,
     },
 

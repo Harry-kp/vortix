@@ -954,8 +954,8 @@ fn handle_status(
             None
         },
         security: StatusSecurity {
-            killswitch_mode: snap.killswitch_mode.clone(),
-            killswitch_state: snap.killswitch_state.clone(),
+            killswitch_mode: snap.killswitch_mode.cli_verb().to_string(),
+            killswitch_state: snap.killswitch_state.cli_verb().to_string(),
         },
     };
 
@@ -997,14 +997,16 @@ fn handle_status(
                 }
                 println!(
                     "  Kill Switch  {} ({})",
-                    snap.killswitch_mode, snap.killswitch_state
+                    snap.killswitch_mode.display_name(),
+                    snap.killswitch_state.display_status()
                 );
             } else {
                 println!("○ Disconnected");
                 println!();
                 println!(
                     "  Kill Switch  {} ({})",
-                    snap.killswitch_mode, snap.killswitch_state
+                    snap.killswitch_mode.display_name(),
+                    snap.killswitch_state.display_status()
                 );
             }
         }
@@ -1256,11 +1258,10 @@ fn handle_list(
             .collect()
     };
 
-    // Multi-tunnel: every kernel-visible session counts. Build a
-    // HashSet keyed on profile name so per-entry membership lookup
-    // is O(1) and every active profile gets its dot, not just the
-    // first one (the pre-fix `active.first()` was single-tunnel-era
-    // legacy that hid concurrent tunnels from `vortix list`).
+    // Multi-tunnel: every kernel-visible session counts. Built as a
+    // HashSet so per-entry membership lookup is O(1) and every
+    // active profile gets its dot — not just the first one (the
+    // pre-fix `active.first()` was single-tunnel-era legacy).
     let active_names: std::collections::HashSet<String> =
         crate::core::scanner::get_active_profiles(&engine.profiles)
             .into_iter()
@@ -1271,26 +1272,7 @@ fn handle_list(
         .iter()
         .map(|p| {
             let sidecar = sidecars_by_name.get(&p.name);
-            ProfileEntry {
-                name: p.name.clone(),
-                protocol: format!("{}", p.protocol),
-                connected: active_names.contains(&p.name),
-                last_used: p
-                    .last_used
-                    .map(|t| match t.duration_since(std::time::UNIX_EPOCH) {
-                        Ok(d) => {
-                            let secs = d.as_secs();
-                            let elapsed = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|n| n.as_secs().saturating_sub(secs))
-                                .unwrap_or(0);
-                            format_elapsed(elapsed)
-                        }
-                        Err(_) => "unknown".into(),
-                    }),
-                profile_id: sidecar.map(|s| s.id.as_str().to_string()),
-                group: sidecar.and_then(|s| s.group.clone()),
-            }
+            build_profile_entry(p, &active_names, sidecar)
         })
         .collect();
 
@@ -1355,6 +1337,136 @@ fn format_elapsed(secs: u64) -> String {
         return format!("{} hours ago", secs / 3600);
     }
     format!("{} days ago", secs / 86_400)
+}
+
+/// Build a single `ProfileEntry` for `handle_list`. Pulled out as a
+/// pure function so the multi-tunnel connected-flag behaviour can be
+/// regression-tested without filesystem / scanner setup.
+///
+/// `active_names` MUST contain every profile name the scanner sees as
+/// active (a `HashSet` of strings). The pre-fix code used
+/// `Option<&str>` from `active.first()` here, which silently lost
+/// every active tunnel after the first — that's the bug this test
+/// guards against.
+fn build_profile_entry(
+    profile: &crate::state::VpnProfile,
+    active_names: &std::collections::HashSet<String>,
+    sidecar: Option<&crate::vortix_config::profile_store::ProfileSummary>,
+) -> ProfileEntry {
+    ProfileEntry {
+        name: profile.name.clone(),
+        protocol: format!("{}", profile.protocol),
+        connected: active_names.contains(&profile.name),
+        last_used: profile
+            .last_used
+            .map(|t| match t.duration_since(std::time::UNIX_EPOCH) {
+                Ok(d) => {
+                    let secs = d.as_secs();
+                    let elapsed = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|n| n.as_secs().saturating_sub(secs))
+                        .unwrap_or(0);
+                    format_elapsed(elapsed)
+                }
+                Err(_) => "unknown".into(),
+            }),
+        profile_id: sidecar.map(|s| s.id.as_str().to_string()),
+        group: sidecar.and_then(|s| s.group.clone()),
+    }
+}
+
+#[cfg(test)]
+mod list_tests {
+    //! Regression tests for the `vortix list` connected-flag bug
+    //! (commit `d595e8d`). The pre-fix code used `active.first()` to
+    //! find "the" connected profile and tag exactly one row with a
+    //! dot. Multi-tunnel users saw the TUI sidebar correctly show
+    //! N tunnels connected but `vortix list` would mark only one.
+    //!
+    //! Tests run against `build_profile_entry` (pure, no IO) — the
+    //! actual `handle_list` is hard to unit-test because of the
+    //! sidecar filesystem read + scanner subprocess, but the policy
+    //! decision (per-row connected flag) lives in this helper.
+    use super::*;
+    use crate::state::{Protocol, VpnProfile};
+    use std::collections::HashSet;
+
+    fn profile(name: &str) -> VpnProfile {
+        VpnProfile {
+            name: name.to_string(),
+            protocol: Protocol::WireGuard,
+            config_path: std::path::PathBuf::from(format!("/tmp/{name}.conf")),
+            location: String::new(),
+            last_used: None,
+        }
+    }
+
+    #[test]
+    fn every_active_profile_gets_connected_true() {
+        // Two profiles active simultaneously (the user's bug report
+        // scenario: AWS_VPN + DATA_VPN both connected, but only
+        // AWS_VPN got the dot pre-fix).
+        let active: HashSet<String> = ["aws_vpn", "data_vpn"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let profiles = [profile("aws_vpn"), profile("data_vpn"), profile("idle_vpn")];
+
+        let entries: Vec<_> = profiles
+            .iter()
+            .map(|p| build_profile_entry(p, &active, None))
+            .collect();
+
+        // Both active profiles report connected=true. Pre-fix only
+        // one would have been true.
+        let connected_count = entries.iter().filter(|e| e.connected).count();
+        assert_eq!(
+            connected_count,
+            2,
+            "BOTH active profiles must report connected=true; got entries: {:?}",
+            entries
+                .iter()
+                .map(|e| (&e.name, e.connected))
+                .collect::<Vec<_>>()
+        );
+
+        // The idle profile reports connected=false.
+        let idle = entries.iter().find(|e| e.name == "idle_vpn").unwrap();
+        assert!(
+            !idle.connected,
+            "profile not in active set must report connected=false"
+        );
+    }
+
+    #[test]
+    fn no_active_profiles_yields_no_connected_flags() {
+        let active = HashSet::new();
+        let profiles = [profile("alpha"), profile("beta")];
+        let entries: Vec<_> = profiles
+            .iter()
+            .map(|p| build_profile_entry(p, &active, None))
+            .collect();
+        assert!(
+            entries.iter().all(|e| !e.connected),
+            "empty active set must mark every entry connected=false"
+        );
+    }
+
+    #[test]
+    fn connected_flag_is_always_serialized_for_machine_consumers() {
+        // The `connected` field must be present in JSON output even
+        // when false — otherwise machine consumers can't tell apart
+        // "absent → don't know" from "present → false → disconnected".
+        // Compile-time check via the struct definition: no
+        // `skip_serializing_if` on `connected`. Run-time check via
+        // serde round-trip.
+        let entry = build_profile_entry(&profile("alpha"), &HashSet::new(), None);
+        let json = serde_json::to_string(&entry).expect("serialize");
+        assert!(
+            json.contains("\"connected\":false"),
+            "connected=false must serialize explicitly; got: {json}"
+        );
+    }
 }
 
 fn handle_import(file: &str, mode: OutputMode) -> i32 {
@@ -1873,29 +1985,26 @@ fn handle_killswitch(
     let mut engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
 
     if let Some(new_mode) = mode_arg {
-        let ks_mode = match new_mode.to_lowercase().as_str() {
-            "off" => crate::state::KillSwitchMode::Off,
-            "auto" => crate::state::KillSwitchMode::Auto,
-            "always" | "always-on" => crate::state::KillSwitchMode::AlwaysOn,
-            other => {
-                print_error_and_exit(
-                    output_mode,
-                    "killswitch",
-                    CliError {
-                        code: "invalid_mode",
-                        message: format!("Unknown mode '{other}'. Use: off, auto, always"),
-                        hint: None,
-                    },
-                    ExitCode::GeneralError,
-                );
-            }
+        let Some(ks_mode) = crate::state::KillSwitchMode::from_cli_verb(new_mode) else {
+            print_error_and_exit(
+                output_mode,
+                "killswitch",
+                CliError {
+                    code: "invalid_mode",
+                    message: format!(
+                        "Unknown mode '{new_mode}'. Use: off, block-on-drop, vpn-only"
+                    ),
+                    hint: None,
+                },
+                ExitCode::GeneralError,
+            );
         };
 
         if !engine.is_root && ks_mode != crate::state::KillSwitchMode::Off {
             print_error_and_exit(
                 output_mode,
                 "killswitch",
-                err_permission_denied(&format!("vortix killswitch {new_mode}")),
+                err_permission_denied(&format!("vortix killswitch {}", ks_mode.cli_verb())),
                 ExitCode::PermissionDenied,
             );
         }
@@ -1905,15 +2014,13 @@ fn handle_killswitch(
         engine.sync_killswitch(is_connected, &active_tunnels);
     }
 
-    // JSON shape uses the stable enum-derived contract
-    // (`off` / `auto` / `alwayson` / `disabled` / `armed` / `blocking`)
-    // so machine consumers can rely on it. Human output uses the
-    // friendly UI labels from `KillSwitchMode::display_name` /
-    // `KillSwitchState::display_status` — see the module docs on
-    // `vortix_core::state::killswitch` for the mapping convention.
+    // JSON envelope carries the canonical slug — the same string
+    // users type as a CLI verb (`off` / `block-on-drop` / `vpn-only`).
+    // Human-facing rendering uses the title-cased prose form from
+    // `display_name`; the two are derived from one vocabulary.
     let data = KsData {
-        mode: format!("{:?}", engine.killswitch_mode).to_lowercase(),
-        state: format!("{:?}", engine.killswitch_state).to_lowercase(),
+        mode: engine.killswitch_mode.cli_verb().to_string(),
+        state: engine.killswitch_state.cli_verb().to_string(),
     };
 
     match output_mode {
@@ -1921,9 +2028,8 @@ fn handle_killswitch(
             let mode = engine.killswitch_mode;
             let (up, down) = mode.behavior_lines();
             println!(
-                "Kill Switch: {} ({}) — currently {}",
+                "Kill Switch: {} — currently {}",
                 mode.display_name(),
-                data.mode,
                 engine.killswitch_state.display_status()
             );
             println!("  {up}");
@@ -1938,13 +2044,9 @@ fn handle_killswitch(
                 if other == mode {
                     continue;
                 }
-                let cli_verb = match other {
-                    crate::state::KillSwitchMode::Off => "off",
-                    crate::state::KillSwitchMode::Auto => "auto",
-                    crate::state::KillSwitchMode::AlwaysOn => "always",
-                };
                 println!(
-                    "  vortix killswitch {cli_verb:<7}  {} — {}",
+                    "  vortix killswitch {:<14}  {} — {}",
+                    other.cli_verb(),
                     other.display_name(),
                     other.one_liner()
                 );

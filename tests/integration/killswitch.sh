@@ -28,7 +28,7 @@ export VORTIX_CONFIG_DIR="$(dirname "$PROFILE_DIR")"
 # Bring tunnel up + engage killswitch.
 ip netns exec vortix-test-a wg-quick up tests/integration/fixtures/wg-a.conf
 ip netns exec "$NS_B" target/release/vortix up integration
-ip netns exec "$NS_B" target/release/vortix killswitch always
+ip netns exec "$NS_B" target/release/vortix killswitch vpn-only
 
 # Structural assertion: OUTPUT chain default policy is DROP when engaged.
 # This is the "fail-fast on regression" check — a code change that

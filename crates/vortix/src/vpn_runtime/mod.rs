@@ -476,29 +476,12 @@ impl VpnRuntime {
     ) {
         let old_state = self.killswitch_state;
 
-        self.killswitch_state = match self.killswitch_mode {
-            KillSwitchMode::Off => KillSwitchState::Disabled,
-            KillSwitchMode::Auto => {
-                if is_connected {
-                    KillSwitchState::Armed
-                } else if old_state == KillSwitchState::Blocking {
-                    KillSwitchState::Blocking
-                } else {
-                    KillSwitchState::Armed
-                }
-            }
-            KillSwitchMode::AlwaysOn => {
-                // AlwaysOn = firewall stays engaged regardless of
-                // connection state. The default-DROP OUTPUT policy
-                // plus the per-tunnel ACCEPT rules in
-                // `enable_blocking_multi` mean that traffic exits only
-                // through the active VPN interface(s); when a tunnel
-                // drops the policy stays in place so no leaks occur in
-                // the gap before reconnection. This is the canonical
-                // Linux killswitch shape (tests/integration/killswitch.sh).
-                KillSwitchState::Blocking
-            }
-        };
+        // Pure mode → state decision lives on `KillSwitchMode` so it
+        // can be unit-tested without firewall side effects. AlwaysOn
+        // always resolves to Blocking — the firewall stays engaged
+        // whether the VPN is up or down (canonical Linux killswitch
+        // shape; see `tests/integration/killswitch.sh`).
+        self.killswitch_state = self.killswitch_mode.desired_state(old_state, is_connected);
 
         if self.killswitch_state.is_blocking() && !self.is_root {
             self.killswitch_state = KillSwitchState::Armed;

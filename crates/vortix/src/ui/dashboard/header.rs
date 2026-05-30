@@ -71,8 +71,8 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Build the `⚠ Real: <public_ip>` warning header used when the user has no
 /// active tunnels (or no primary). The killswitch indicator is appended so
-/// users can tell at a glance whether they're protected by KS:Strict even
-/// without a tunnel.
+/// users can tell at a glance whether they're protected by `KS:VPN-only`
+/// even without a tunnel.
 fn render_real_ip_line(app: &App, ks_indicator: Span<'static>) -> Line<'static> {
     Line::from(vec![
         Span::styled(
