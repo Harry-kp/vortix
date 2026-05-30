@@ -14,11 +14,13 @@
 
 mod killswitch;
 mod profile;
+mod retry;
 mod ui;
 
 // Re-export all types for easy access
 pub use killswitch::{KillSwitchMode, KillSwitchState};
 pub use profile::{Protocol, VpnProfile};
+pub use retry::RetryState;
 pub use ui::{
     help_max_scroll_for_terminal_height, AuthField, AutoPromoteBanner, FlipAnimation, FocusedPanel,
     InputMode, ProfileSortOrder, QualityLevel, Toast, ToastType, AUTO_PROMOTE_REVERT_WINDOW_SECS,

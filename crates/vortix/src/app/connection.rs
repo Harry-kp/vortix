@@ -150,10 +150,14 @@ impl App {
     /// after the current disconnect completes, avoiding the race condition
     /// of starting connect while disconnect is still in-flight.
     pub(crate) fn toggle_connection(&mut self, idx: usize) {
-        // Cancel any in-flight retry/auto-reconnect when user initiates a new action
-        self.runtime.retry_count = 0;
-        self.runtime.retry_profile_idx = None;
-        self.runtime.auto_reconnect_profile = None;
+        // Cancel this profile's retry / auto-reconnect when the user
+        // initiates a new action on it. Other profiles' retry state is
+        // independent (P5b U-P5b-1 per-profile retry).
+        if let Some(target_profile) = self.runtime.profiles.get(idx) {
+            self.runtime
+                .retry_state
+                .remove(&ProfileId::new(&target_profile.name));
+        }
 
         // Multi-connection plan #001 U19: registry-aware Enter routing for
         // secondaries. If the focused row corresponds to a tunnel the
@@ -777,11 +781,17 @@ impl App {
             .unwrap_or_else(std::time::SystemTime::now);
         let profile_id = ProfileId::new(&profile.name);
         let allowed_ips = extract_allowed_ips(profile.protocol, &profile.config_path);
-        // Attempt counter: derived from runtime.retry_count (0-based)
-        // + 1 for the current attempt. Plan 005's retry-budget is
-        // tracked on the FSM itself; the legacy retry logic uses
-        // runtime.retry_count, so we synthesise an equivalent here.
-        let attempt = self.runtime.retry_count.saturating_add(1);
+        // Attempt counter: derived from runtime.retry_state[profile_id].
+        // The retry entry's `attempt` field is the 1-based count for
+        // this profile's current sequence (per P5b U-P5b-1); if no
+        // entry exists, this is a fresh first attempt. Plan 005's
+        // retry-budget is tracked on the FSM itself; the legacy retry
+        // bookkeeping carries the equivalent here.
+        let attempt = self
+            .runtime
+            .retry_state
+            .get(&profile_id)
+            .map_or(1, |r| r.attempt);
         let retry_budget = std::time::Duration::from_secs(
             crate::vortix_core::engine::state::DEFAULT_RETRY_BUDGET_SECS,
         );
@@ -841,9 +851,18 @@ impl App {
 
     #[allow(clippy::too_many_lines)]
     pub(crate) fn disconnect(&mut self) {
-        self.runtime.retry_count = 0;
-        self.runtime.retry_profile_idx = None;
-        self.runtime.auto_reconnect_profile = None;
+        // Cancel retry / auto-reconnect for the profile this global
+        // disconnect targets (read from legacy connection_state below).
+        // Other profiles' retry state stays intact (P5b U-P5b-1).
+        let target_for_retry_clear = match &self.runtime.connection_state {
+            ConnectionState::Connected { profile, .. }
+            | ConnectionState::Connecting { profile, .. }
+            | ConnectionState::Disconnecting { profile, .. } => Some(profile.clone()),
+            ConnectionState::Disconnected => None,
+        };
+        if let Some(name) = &target_for_retry_clear {
+            self.runtime.retry_state.remove(&ProfileId::new(name));
+        }
         // Discard any in-flight scanner result captured before this disconnect;
         // stale data showing the interface "up" would otherwise re-promote to
         // Connected and trigger a spurious "VPN dropped" auto-reconnect.

@@ -14,7 +14,7 @@ pub mod connection_state;
 
 pub use connection_state::{ConnectionState, DetailedConnectionInfo};
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Instant;
@@ -26,8 +26,11 @@ use crate::core::scanner::ActiveSession;
 use crate::core::telemetry::{self, TelemetryUpdate};
 use crate::logger;
 use crate::message::Message;
-use crate::state::{KillSwitchMode, KillSwitchState, ProfileSortOrder, Protocol, VpnProfile};
+use crate::state::{
+    KillSwitchMode, KillSwitchState, ProfileSortOrder, Protocol, RetryState, VpnProfile,
+};
 use crate::utils;
+use crate::vortix_core::profile::ProfileId;
 
 /// Core VPN engine — all VPN-related state, no UI dependencies.
 ///
@@ -76,9 +79,11 @@ pub struct VpnRuntime {
     pub killswitch_state: KillSwitchState,
 
     // === Connection Retry & Auto-Reconnect ===
-    pub retry_count: u32,
-    pub retry_profile_idx: Option<usize>,
-    pub auto_reconnect_profile: Option<usize>,
+    /// Per-profile retry / auto-reconnect bookkeeping (plan P5b U-P5b-1).
+    /// Replaces the single-slot retry triple. Each profile retries
+    /// independently — a failed connect on A no longer blocks or
+    /// overwrites an in-flight retry on B.
+    pub retry_state: HashMap<ProfileId, RetryState>,
 
     // === Async Communication ===
     pub(crate) telemetry_rx: Option<mpsc::Receiver<TelemetryUpdate>>,
@@ -136,9 +141,7 @@ impl VpnRuntime {
             killswitch_mode: KillSwitchMode::default(),
             killswitch_state: KillSwitchState::default(),
 
-            retry_count: 0,
-            retry_profile_idx: None,
-            auto_reconnect_profile: None,
+            retry_state: HashMap::new(),
 
             telemetry_rx: None,
             telemetry_nudge: None,
@@ -216,9 +219,7 @@ impl VpnRuntime {
             killswitch_mode: KillSwitchMode::default(),
             killswitch_state: KillSwitchState::default(),
 
-            retry_count: 0,
-            retry_profile_idx: None,
-            auto_reconnect_profile: None,
+            retry_state: HashMap::new(),
 
             telemetry_rx: None,
             telemetry_nudge: None,
@@ -282,9 +283,7 @@ impl VpnRuntime {
             sort_order: ProfileSortOrder::default(),
             killswitch_mode: KillSwitchMode::Off,
             killswitch_state: KillSwitchState::Disabled,
-            retry_count: 0,
-            retry_profile_idx: None,
-            auto_reconnect_profile: None,
+            retry_state: HashMap::new(),
             telemetry_rx: None,
             telemetry_nudge: None,
             cmd_tx,

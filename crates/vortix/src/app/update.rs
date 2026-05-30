@@ -464,10 +464,12 @@ impl App {
                 "INFO: Ignoring stale ConnectResult for '{profile}' (state changed)"
             ));
         } else if success {
-            // Reset retry and auto-reconnect state on success
-            self.runtime.retry_count = 0;
-            self.runtime.retry_profile_idx = None;
-            self.runtime.auto_reconnect_profile = None;
+            // Reset this profile's retry / auto-reconnect bookkeeping on
+            // success. Other profiles' retry state is untouched (P5b
+            // U-P5b-1 per-profile retry).
+            self.runtime
+                .retry_state
+                .remove(&crate::vortix_core::profile::ProfileId::new(&profile));
 
             let location = self
                 .runtime
@@ -521,18 +523,41 @@ impl App {
             self.mirror_failed_into_registry(&profile, &err_msg);
             self.cleanup_vpn_resources(&profile);
 
-            // Attempt retry with exponential backoff if configured
+            // Attempt retry with exponential backoff if configured.
+            // Per-profile retry (P5b U-P5b-1): each profile's attempt
+            // counter lives in runtime.retry_state[profile_id], so a
+            // failed connect on A no longer blocks/overwrites a retry on
+            // B. The auto_reconnect flag is preserved across attempts so
+            // drop-recovery retries keep their identity through their
+            // retry budget.
             let max_retries = self.runtime.config.connect_max_retries;
+            let profile_id = crate::vortix_core::profile::ProfileId::new(&profile);
             let profile_idx = self.runtime.profiles.iter().position(|p| p.name == profile);
+            let current_attempt = self
+                .runtime
+                .retry_state
+                .get(&profile_id)
+                .map_or(0, |r| r.attempt);
+            let prior_auto = self
+                .runtime
+                .retry_state
+                .get(&profile_id)
+                .is_some_and(|r| r.auto_reconnect);
 
             if let Some(idx) = profile_idx.filter(|_| {
                 max_retries > 0
-                    && self.runtime.retry_count < max_retries
+                    && current_attempt < max_retries
                     && self.runtime.pending_connect.is_none()
             }) {
-                self.runtime.retry_count += 1;
-                let attempt = self.runtime.retry_count;
-                self.runtime.retry_profile_idx = Some(idx);
+                let attempt = current_attempt + 1;
+                self.runtime.retry_state.insert(
+                    profile_id.clone(),
+                    crate::state::RetryState {
+                        attempt,
+                        profile_idx: idx,
+                        auto_reconnect: prior_auto,
+                    },
+                );
 
                 let base = self.runtime.config.connect_retry_base_delay_secs;
                 let shift = (attempt - 1).min(63);
@@ -557,9 +582,8 @@ impl App {
                     let _ = cmd_tx.send(crate::message::Message::RetryConnect { idx, attempt });
                 });
             } else {
-                // No retry: final failure
-                self.runtime.retry_count = 0;
-                self.runtime.retry_profile_idx = None;
+                // No retry: final failure for this profile.
+                self.runtime.retry_state.remove(&profile_id);
                 self.runtime.connection_state = ConnectionState::Disconnected;
                 self.runtime.session_start = None;
                 self.show_toast(format!("Failed to connect: {err_msg}"), ToastType::Error);
@@ -1074,7 +1098,10 @@ impl App {
                     );
                 }
 
-                // AUTO-RECONNECT: Queue reconnection for unexpected drops
+                // AUTO-RECONNECT: Queue reconnection for unexpected drops.
+                // Per-profile (P5b U-P5b-1 / D-2): each Connected profile
+                // schedules its own auto-reconnect entry. A drop on A
+                // doesn't disturb B's retry; both can run concurrently.
                 if was_connected && self.runtime.config.auto_reconnect {
                     if let Some(idx) = self
                         .runtime
@@ -1082,7 +1109,6 @@ impl App {
                         .iter()
                         .position(|p| p.name == profile_name)
                     {
-                        self.runtime.auto_reconnect_profile = Some(idx);
                         let delay = self.runtime.config.auto_reconnect_delay_secs;
                         let max = self.runtime.config.connect_max_retries;
                         self.log(&format!(
@@ -1093,8 +1119,15 @@ impl App {
                             ToastType::Warning,
                         );
 
-                        self.runtime.retry_count = 1;
-                        self.runtime.retry_profile_idx = Some(idx);
+                        let profile_id = crate::vortix_core::profile::ProfileId::new(&profile_name);
+                        self.runtime.retry_state.insert(
+                            profile_id,
+                            crate::state::RetryState {
+                                attempt: 1,
+                                profile_idx: idx,
+                                auto_reconnect: true,
+                            },
+                        );
 
                         let cmd_tx = self.runtime.cmd_tx.clone();
                         std::thread::spawn(move || {
@@ -1112,8 +1145,22 @@ impl App {
     }
 
     fn handle_retry_connect(&mut self, idx: usize, attempt: u32) {
-        // Only proceed if retry state is still consistent
-        if self.runtime.retry_profile_idx != Some(idx) || self.runtime.retry_count != attempt {
+        // Per-profile retry (P5b U-P5b-1): stale check by profile_id.
+        // The message carries `idx` for backwards compatibility; we
+        // resolve it to the profile's id and verify the retry_state
+        // entry still matches before firing.
+        let profile_id_for_idx = self
+            .runtime
+            .profiles
+            .get(idx)
+            .map(|p| crate::vortix_core::profile::ProfileId::new(&p.name));
+
+        let entry_matches = profile_id_for_idx
+            .as_ref()
+            .and_then(|pid| self.runtime.retry_state.get(pid))
+            .is_some_and(|r| r.profile_idx == idx && r.attempt == attempt);
+
+        if !entry_matches {
             self.log(&format!(
                 "INFO: Ignoring stale RetryConnect (attempt {attempt}, idx {idx})"
             ));
@@ -1122,8 +1169,9 @@ impl App {
         // Don't retry if user started a different action
         if !matches!(self.runtime.connection_state, ConnectionState::Disconnected) {
             self.log("INFO: Skipping retry — connection state changed");
-            self.runtime.retry_count = 0;
-            self.runtime.retry_profile_idx = None;
+            if let Some(pid) = &profile_id_for_idx {
+                self.runtime.retry_state.remove(pid);
+            }
             return;
         }
         if let Some(profile) = self.runtime.profiles.get(idx) {
@@ -1133,9 +1181,8 @@ impl App {
                 profile.name
             ));
             self.connect_profile(idx);
-        } else {
-            self.runtime.retry_count = 0;
-            self.runtime.retry_profile_idx = None;
+        } else if let Some(pid) = &profile_id_for_idx {
+            self.runtime.retry_state.remove(pid);
         }
     }
 
@@ -1149,29 +1196,52 @@ impl App {
                 ));
             }
             ConnectionState::Disconnected => {
-                // If there's a pending auto-reconnect, trigger it now
-                if let Some(idx) = self.runtime.auto_reconnect_profile {
-                    if idx < self.runtime.profiles.len() && self.runtime.config.auto_reconnect {
-                        let name = self.runtime.profiles[idx].name.clone();
-                        let delay = self.runtime.config.auto_reconnect_delay_secs;
-                        self.log(&format!(
-                            "NET: Network available — auto-reconnecting to '{name}' in {delay}s"
-                        ));
-                        self.show_toast(
-                            format!("Network changed — reconnecting in {delay}s"),
-                            ToastType::Info,
-                        );
+                // Re-trigger any auto-reconnect entries now that the
+                // network is back. Per-profile (P5b U-P5b-1 / D-2):
+                // every profile with auto_reconnect=true gets its
+                // RetryConnect re-fired — disjoint tunnels can recover
+                // in parallel without contending for a single slot.
+                if !self.runtime.config.auto_reconnect {
+                    return;
+                }
+                let to_retry: Vec<(usize, String)> = self
+                    .runtime
+                    .retry_state
+                    .values()
+                    .filter(|r| r.auto_reconnect)
+                    .filter_map(|r| {
+                        self.runtime
+                            .profiles
+                            .get(r.profile_idx)
+                            .map(|p| (r.profile_idx, p.name.clone()))
+                    })
+                    .collect();
+                let delay = self.runtime.config.auto_reconnect_delay_secs;
+                for (idx, name) in to_retry {
+                    let pid = crate::vortix_core::profile::ProfileId::new(&name);
+                    self.log(&format!(
+                        "NET: Network available — auto-reconnecting to '{name}' in {delay}s"
+                    ));
+                    self.show_toast(
+                        format!("Network changed — reconnecting in {delay}s"),
+                        ToastType::Info,
+                    );
 
-                        let cmd_tx = self.runtime.cmd_tx.clone();
-                        std::thread::spawn(move || {
-                            std::thread::sleep(std::time::Duration::from_secs(delay));
-                            let _ = cmd_tx
-                                .send(crate::message::Message::RetryConnect { idx, attempt: 1 });
-                        });
+                    let cmd_tx = self.runtime.cmd_tx.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_secs(delay));
+                        let _ =
+                            cmd_tx.send(crate::message::Message::RetryConnect { idx, attempt: 1 });
+                    });
 
-                        self.runtime.retry_count = 1;
-                        self.runtime.retry_profile_idx = Some(idx);
-                    }
+                    self.runtime.retry_state.insert(
+                        pid,
+                        crate::state::RetryState {
+                            attempt: 1,
+                            profile_idx: idx,
+                            auto_reconnect: true,
+                        },
+                    );
                 }
             }
             _ => {}
@@ -1183,8 +1253,9 @@ impl App {
         self.runtime.connection_state = ConnectionState::Disconnected;
         self.runtime.session_start = None;
         self.runtime.pending_connect = None;
-        self.runtime.retry_count = 0;
-        self.runtime.retry_profile_idx = None;
+        self.runtime
+            .retry_state
+            .remove(&crate::vortix_core::profile::ProfileId::new(&profile_name));
         self.log(&format!("ERR: Connection timed out for '{profile_name}'"));
         self.show_toast(
             format!("Connection timed out for '{profile_name}'"),
