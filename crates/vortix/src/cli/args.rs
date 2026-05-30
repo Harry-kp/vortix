@@ -76,14 +76,21 @@ EXIT CODES:
 pub enum Commands {
     /// Connect to a VPN profile
     ///
-    /// Connects to the specified profile, or reconnects to the last used profile
-    /// if no name is given. Blocks until the connection is established or times out.
+    /// Connects to the specified profile, or reconnects to the last used
+    /// profile if no name is given. Blocks until the connection is
+    /// established or times out.
+    ///
+    /// MULTI-TUNNEL CONFLICT GATE: connecting a profile that claims the
+    /// kernel default route while another tunnel already holds it (or
+    /// whose `AllowedIPs` overlap an active tunnel's routes) exits with
+    /// code 4 (`StateConflict`). Pass `--yes` to bypass for scripted /
+    /// non-interactive callers.
     ///
     /// EXAMPLES:
     ///     sudo vortix up work-vpn               Connect to 'work-vpn'
     ///     sudo vortix up work-vpn --json        Connect and get JSON result
     ///     sudo vortix up work-vpn --timeout 60  Connect with 60s timeout
-    ///     sudo vortix up work-vpn --yes         Bypass multi-tunnel conflict prompt (scripts)
+    ///     sudo vortix up vpn-b --yes            Bypass conflict gate (scripts)
     ///     sudo vortix up                        Reconnect to last used profile
     #[command(visible_alias = "connect")]
     Up {
@@ -158,9 +165,20 @@ pub enum Commands {
     /// Displays the current VPN connection status, network statistics, and
     /// security posture. Use --watch for continuous monitoring.
     ///
+    /// JSON OUTPUT (v2 envelope, multi-tunnel aware):
+    ///     data.connections  array of every active tunnel (one entry
+    ///                       each for Connected / Connecting /
+    ///                       Disconnecting profiles)
+    ///     data.primary      profile name owning the kernel default
+    ///                       route, or null
+    ///     data.connection   back-compat single-tunnel object,
+    ///                       populated only when exactly one tunnel is
+    ///                       Connected (mirrors `data.connections[0]`);
+    ///                       null in any other case
+    ///
     /// EXAMPLES:
     ///     vortix status                          Human-readable status
-    ///     vortix status --json                   Full status as JSON
+    ///     vortix status --json                   Full v2 status envelope
     ///     vortix status --brief                  One-line summary
     ///     vortix status --watch                  Live updates every 2s
     ///     vortix status --watch --json           NDJSON stream for monitoring
@@ -293,8 +311,16 @@ pub enum Commands {
     /// Get or set the kill switch mode
     ///
     /// Without a mode argument, shows the current mode and state.
-    /// Modes: off (disabled), auto (arm on connect, block on drop),
-    /// always (block until VPN connects).
+    ///
+    /// Modes:
+    ///   off    — disabled; no firewall rules.
+    ///   auto   — armed while a VPN is up; engages default-DROP egress
+    ///            only when the VPN drops unexpectedly. Allows non-VPN
+    ///            traffic while disconnected.
+    ///   always — firewall stays engaged whether VPN is up or down.
+    ///            Default-DROP egress + ACCEPT rules for active
+    ///            tunnels' interfaces + their server IPs. The gap
+    ///            between a drop and reconnect can never leak.
     ///
     /// EXAMPLES:
     ///     vortix killswitch                     Show current mode

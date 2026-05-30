@@ -97,9 +97,11 @@ impl VpnRuntime {
 
     /// Blocking connect for CLI — waits until connected or timeout.
     ///
-    /// Plan P5d: the legacy `connection_state` field on `VpnRuntime` is
-    /// gone; this helper synthesises a local Connected view on success
-    /// purely to derive the active-tunnel slice for the kill switch.
+    /// The headless `VpnRuntime` carries no shared `connection_state`
+    /// field. On success this helper syncs the kill switch via the
+    /// scanner-derived `killswitch_view_from_scanner` so the persisted
+    /// active-tunnel slice reflects every kernel-visible tunnel (not
+    /// just the one this CLI call brought up).
     pub fn connect_and_wait(
         &mut self,
         profile_name: &str,
@@ -181,10 +183,12 @@ impl VpnRuntime {
 
     /// Blocking disconnect for CLI.
     ///
-    /// Plan P5d: callers pass `profile_name` (and optional `pid` from
-    /// the scanner's `ActiveSession`) explicitly. The legacy
-    /// `connection_state` field on `VpnRuntime` is gone; this helper
-    /// no longer discovers the in-flight profile from shared state.
+    /// Callers pass `profile_name` (and the optional `pid` from the
+    /// scanner's `ActiveSession`) explicitly — no shared
+    /// `connection_state` field for the helper to discover the
+    /// in-flight profile from. `vortix down` / `vortix reconnect` in
+    /// `cli/commands.rs` already iterate scanner sessions and call
+    /// this once per profile.
     #[allow(clippy::too_many_lines)]
     pub fn disconnect_and_wait(
         &mut self,

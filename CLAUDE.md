@@ -39,7 +39,21 @@ User's explicit guidance from session memory: density via signaling, not duplica
 
 ## Manual testing convention
 
-Automated tests cover FSM, parsers, CIDR math, JSON shapes, render builders. They cannot cover real kernels, real `wg-quick`/`openvpn` subprocesses, real terminals, real adversaries. Every feature with observable runtime behavior gets a manual test plan under [`docs/manual-testing/`](docs/manual-testing/) — see the README and `_template.md` there. New features add a new file and an entry in the index table.
+Automated tests cover FSM, parsers, CIDR math, JSON shapes, render builders. They cannot cover real kernels, real `wg-quick`/`openvpn` subprocesses, real terminals, real adversaries. Manual scenarios live in [`docs/manual-testing/backlog.md`](docs/manual-testing/backlog.md) — one table of rows ordered by risk. When you ship a feature with observable runtime behavior, add a row that names the scenario, the setup, and the pass/fail signal.
+
+## Multi-tunnel: registry is the truth
+
+The App layer's single source of truth for active VPN state is `App.registry: TunnelRegistry<TunnelKind>`. Every panel renderer (header, sidebar, Connection Details, Security Guard, footer) reads from `app.registry.snapshot_all` / `app.registry.snapshot(profile_id)` exclusively.
+
+The legacy `ConnectionState` enum still exists in `crates/vortix/src/vpn_runtime/connection_state.rs` and is re-exported from `vpn_runtime`, but only as: (a) the CLI's blocking helpers' local single-tunnel view (one process, one tunnel), and (b) the return type of `App::legacy_state()` — a derived view from the registry primary for the few residual single-tunnel-shaped reads (kill-switch sync, delete-safety, scanner dispatch).
+
+There is **no** `connection_state` field on `VpnRuntime`. Don't add one. Multi-tunnel-aware code reads registry snapshots; single-tunnel-shaped code calls `App::legacy_state()` and matches on the variant.
+
+## Kill switch semantics
+
+- **Off** — disabled, no firewall rules.
+- **Auto** — armed while a VPN is up; engages default-DROP egress only on an unexpected drop.
+- **AlwaysOn** — firewall stays engaged whether VPN is up or down. The default-DROP OUTPUT policy + per-tunnel ACCEPT rules (in `core::killswitch::enable_blocking_multi`) keep traffic from leaking in the gap between a drop and reconnection. State always resolves to `Blocking`, never `Armed`.
 
 ## Planning artifacts
 

@@ -528,7 +528,11 @@ fn push_strip(line: &mut Line<'static>, with_label: bool, inner: &[Span<'static>
 }
 
 /// Get kill switch indicator for the header bar.
-/// Self-explanatory labels: KS:Off, KS:Auto, KS:Strict, KS:BLOCK
+///
+/// Labels: KS:Off, KS:Auto (armed/standby), KS:BLOCK (Blocking).
+/// `AlwaysOn` always resolves to `Blocking` and renders as `KS:BLOCK`;
+/// the historical `KS:Strict` label is unreachable after the
+/// `AlwaysOn` semantic fix.
 fn get_killswitch_indicator(app: &App) -> Span<'static> {
     use crate::state::{KillSwitchMode, KillSwitchState};
 
@@ -545,8 +549,11 @@ fn get_killswitch_indicator(app: &App) -> Span<'static> {
         (KillSwitchMode::Auto, KillSwitchState::Armed) => {
             Span::styled(" KS:Auto ", Style::default().fg(theme::SUCCESS))
         }
+        // Unreachable post the AlwaysOn semantic fix (AlwaysOn → Blocking
+        // always). Kept for match exhaustiveness; a future enum addition
+        // would force a real case here.
         (KillSwitchMode::AlwaysOn, KillSwitchState::Armed) => {
-            Span::styled(" KS:Strict ", Style::default().fg(theme::WARNING))
+            Span::styled(" KS:BLOCK ", Style::default().fg(theme::ERROR))
         }
     }
 }

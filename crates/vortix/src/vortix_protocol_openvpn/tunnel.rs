@@ -160,8 +160,9 @@ impl OvpnTunnel {
     /// before calling `up()` once it lands; until then no production callsite
     /// flips the flag and the existing single-tunnel argv is preserved.
     ///
-    /// Requires `OpenVPN` >= 2.4 — version assertion lives in the app-level
-    /// dependency probe (see `App::check_dependencies`).
+    /// Requires `OpenVPN` >= 2.4 — version assertion lives in the
+    /// shared dependency probe at `VpnRuntime::check_dependencies`
+    /// (uses `vpn_runtime::openvpn::probe_openvpn_version`).
     #[must_use]
     pub fn with_secondary(mut self, is_secondary: bool) -> Self {
         self.is_secondary = is_secondary;
@@ -340,7 +341,7 @@ fn build_ovpn_args(
 
     // Plan 001 U14: when this tunnel is a secondary, suppress server-pushed
     // DNS so the primary's resolver stays authoritative. Requires OpenVPN
-    // >= 2.4 — gated upstream by `App::check_dependencies`.
+    // >= 2.4 — gated upstream by `VpnRuntime::check_dependencies`.
     if is_secondary {
         args.push("--pull-filter".to_string());
         args.push("ignore".to_string());

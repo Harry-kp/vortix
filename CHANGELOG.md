@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Multi-tunnel support via `TunnelRegistry`: multiple VPN profiles can be Connected concurrently. The tunnel that owns the kernel default route is the *primary*; secondaries are *addressable* (reachable on their declared `AllowedIPs` only).
+- Per-profile retry and auto-reconnect (`HashMap<ProfileId, RetryState>` replaces the single-slot retry triple). Concurrent failures on multiple profiles each get their own retry budget and exponential-backoff schedule instead of overwriting one another.
+- Per-profile scanner loop in `handle_sync_system_state`: every registry entry is reconciled against the scanner's active sessions independently — drop detection, refresh, and Connecting → Connected promotion all run per-tunnel.
+- Auto-adopt of externally-started VPNs: when the scanner sees an active session for a catalog profile that isn't in the registry (e.g., the user ran `wg-quick up X` outside vortix, or vortix restarted while a tunnel was already up), the tunnel is registered into the registry on the next scanner tick.
+- `vortix up X --yes` flag to bypass the multi-tunnel conflict gate (default-route takeover, route overlap) for scripted/non-interactive callers.
+- Multi-tunnel TUI keybindings: `D` (disconnect all with confirm when N > 1), `Tab` in Connection Details (cycle focus across active tunnels), `c` (cancel an in-flight `Connecting` profile from the Details panel), `B` (Both — connect both tunnels from the takeover overlay), `u` (revert auto-promote banner action).
+- JSON v2 status envelope with `data.connections[]` + `data.primary` for multi-tunnel introspection. The legacy `data.connection` field stays populated when exactly one tunnel is up (back-compat for v1 consumers).
+- Shared `VpnRuntime::check_dependencies` now runs the OpenVPN 2.4+ probe (`--pull-filter` baseline for multi-tunnel DNS scoping) — both TUI and CLI surfaces refuse the same dep set.
+- `Cidr::intersects` + `vortix_core::cidr::overlapping_cidrs` for CIDR-overlap detection shared between the CLI conflict gate and the registry's future R10 v2 route-overlap detection.
+
+### Changed
+
+- **Kill switch `AlwaysOn`** now keeps the firewall engaged regardless of connection state. Previously: `AlwaysOn + Connected → Armed` left no actual blocking in place; the gap between a VPN drop and reconnect could leak. New semantic: default-DROP OUTPUT policy + per-tunnel ACCEPT rules stay engaged whether VPN is up or not. This is the canonical Linux killswitch shape and the integration test (`tests/integration/killswitch.sh`) enforces it. Users with `Connected + AlwaysOn` previously saw "Armed (Strict)" with no enforcement; now they see "Blocking (Strict)" with the firewall actually enforced.
+- `vortix down` with no profile argument now disconnects EVERY active tunnel (previously single-tunnel only). `vortix down <profile>` keeps the per-tunnel disconnect.
+- `vortix reconnect` now cycles every currently-Connected tunnel (re-up via the registry path).
+- All TUI panels (Header, Sidebar, Connection Details, Security Guard, Logs) read their state from `app.registry` snapshots exclusively. Renderers no longer consult the legacy `connection_state` field — single source of truth for active VPN state.
+- CLI killswitch sync now persists every kernel-visible tunnel's `ActiveTunnelInfo` (via `VpnRuntime::killswitch_view_from_scanner`), so a CLI `vortix down A` no longer clobbers the persisted slice for a still-up B.
+
+### Fixed
+
+- Multi-tunnel kill switch: secondary tunnels' `AllowedIPs` are now allow-listed in the firewall, not just the primary's. Pre-multi-tunnel the killswitch could block valid secondary egress.
+- CLI's `vortix up X` now runs the OpenVPN 2.4+ probe that the TUI's connect path already ran; previously a user could connect with OpenVPN 2.3 and silently leak pushed DNS through the primary's resolver (the exact failure plan 001 R13 prevents).
+- CLI's `vortix down A` while another terminal's TUI was tracking A+B no longer clobbers the persisted killswitch state with an empty slice; the on-disk slice always reflects every kernel-visible tunnel.
+
+### Removed
+
+- Legacy `pub connection_state: ConnectionState` field on `VpnRuntime`. The App layer reads `app.registry`; the CLI's blocking helpers carry their own local state. The `ConnectionState` enum itself remains as a CLI-local shape and as the return type of `App::legacy_state()` (a derived view from registry primary, used by the few remaining single-tunnel readers).
+- `vortix down` no longer requires `point_engine_at_session` orchestration; `VpnRuntime::disconnect_and_wait` now takes `(profile_name, pid, force, timeout)` explicitly.
+
 ## [0.2.2] - 2026-04-23
 
 ### Miscellaneous

@@ -193,17 +193,30 @@ sudo vortix              # Launch TUI dashboard (default)
 
 Every subcommand supports `--json` for machine-readable output and `--quiet` for silent operation (exit code only).
 
-**Connection:**
+**Connection (multi-tunnel aware):**
 ```bash
 sudo vortix up work-vpn         # Connect to a profile
-sudo vortix down                # Disconnect (graceful)
+sudo vortix up vpn-b --yes      # Bypass the conflict gate (default-route
+                                # takeover / route overlap with another
+                                # active tunnel; non-interactive)
+sudo vortix down                # Disconnect every active tunnel
+sudo vortix down work-vpn       # Disconnect only the named profile
 sudo vortix down --force        # Force-disconnect (SIGKILL)
-sudo vortix reconnect           # Reconnect to last used profile
+sudo vortix reconnect           # Cycle every currently-Connected tunnel
 vortix status                   # Show connection state + telemetry
+vortix status --json            # v2 envelope: data.connections[] +
+                                # data.primary (back-compat data.connection
+                                # populated when exactly one tunnel is up)
 vortix status --brief           # One-line: "● Connected to work-vpn"
 vortix status --watch           # Live updates every 2s
 vortix status --watch --json    # NDJSON stream for monitoring
 ```
+
+Multiple tunnels can be active simultaneously. The tunnel that owns the
+kernel default route is the *primary*; secondaries are *addressable*
+(reachable on their declared `AllowedIPs` only). `vortix up B` while
+A is up triggers a conflict gate when both claim the default route or
+when their `AllowedIPs` overlap — pass `--yes` to bypass for scripts.
 
 **Profile Management:**
 ```bash
@@ -220,8 +233,11 @@ vortix rename old-vpn new-vpn   # Rename a profile
 
 **Security:**
 ```bash
-sudo vortix killswitch auto     # Set kill switch to auto mode
-sudo vortix killswitch always   # Always-on kill switch
+sudo vortix killswitch auto     # Block only on unexpected VPN drops
+sudo vortix killswitch always   # Default-DROP egress; firewall stays
+                                # engaged whether VPN is up or down.
+                                # Active tunnels' interfaces are
+                                # allow-listed automatically.
 vortix killswitch               # Show current mode
 sudo vortix release-killswitch  # Emergency firewall release
 ```
@@ -292,7 +308,7 @@ vortix status --watch --json
 | 1 | General error |
 | 2 | Permission denied (needs sudo) |
 | 3 | Not found (profile doesn't exist) |
-| 4 | State conflict (already connected) |
+| 4 | State conflict (already connected, default-route takeover, route overlap) |
 | 5 | Missing dependency |
 | 6 | Timeout |
 
@@ -300,11 +316,15 @@ vortix status --watch --json
 
 | Key | Action |
 |-----|--------|
-| `Tab` | Cycle Focus (All Panels) |
+| `Tab` | Cycle Focus (panels); in Connection Details, cycle across active tunnels |
 | `1-9` | Connect to Quick-Slot 1-9 |
 | `Enter` | Connect / Toggle Profile |
-| `d` | Disconnect Active Session |
-| `r` | Reconnect Active Session |
+| `d` | Disconnect focused tunnel (sidebar row, or primary when no sidebar focus) |
+| `D` | Disconnect ALL active tunnels (with confirm when N > 1) |
+| `c` | Cancel an in-flight `Connecting` profile from Connection Details |
+| `r` | Reconnect — cycle every Connected tunnel |
+| `B` | "Both" — from the takeover overlay, connect both tunnels (multi-tunnel) |
+| `u` | Revert auto-promote (undo a primary-switch banner action) |
 | `i` | Import Profile (Direct) |
 | `v` | View Profile Configuration |
 | `y` | Copy Public IP to Clipboard |
@@ -450,7 +470,7 @@ ip_api_fallbacks = ["https://api.ipify.org", "https://icanhazip.com", "https://i
 **Telemetry:** A background thread polls system network stats every second for throughput (macOS: `libc::getifaddrs` reading BSD `if_data`; Linux: `/proc/net/dev`). Network quality (latency, jitter, loss) is measured with a hand-rolled ICMP echo probe over an unprivileged `SOCK_DGRAM` socket (falls back to TCP-connect-to-443 when ICMP is restricted). Public IP, ISP, and geo-location data are fetched via `reqwest` over rustls-TLS — no `curl` shell-out.
 
 **Security (Kill Switch & Leak Detection):**
-- **Kill Switch:** Platform-native firewall integration. macOS uses PF (Packet Filter) via `pfctl`. Linux supports both `iptables` (with a dedicated `VORTIX_KILLSWITCH` chain) and `nftables` (with an atomic `vortix_killswitch` table) for clean teardown. Automatically blocks all non-VPN traffic when connection drops.
+- **Kill Switch:** Platform-native firewall integration. macOS uses PF (Packet Filter) via `pfctl`. Linux supports both `iptables` (with a dedicated `VORTIX_KILLSWITCH` chain) and `nftables` (with an atomic `vortix_killswitch` table) for clean teardown. Two modes: **Auto** engages the firewall only when an active VPN drops unexpectedly; **AlwaysOn** keeps the firewall engaged whether the VPN is up or down (default-DROP egress + active-tunnel ACCEPT rules), so the gap between a drop and reconnect can never leak.
 - **IPv6 Leak:** Active monitoring via `api6.ipify.org`. Any IPv6 traffic detected while VPN is active triggers a leak warning.
 - **DNS Leak:** Monitors DNS configuration to ensure nameservers align with the secure tunnel (macOS: `SCDynamicStore` via the `system-configuration` crate; Linux: `resolvectl` / `nmcli` / `/etc/resolv.conf`).
 

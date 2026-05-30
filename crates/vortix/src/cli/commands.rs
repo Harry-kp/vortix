@@ -682,11 +682,11 @@ fn handle_down(
         );
     }
 
-    // Tear down each active tunnel sequentially. The legacy
-    // single-tunnel `VpnEngine` only tracks one connection_state at a
-    // time, so we point it at one session, disconnect, then move on.
-    // Once U6B/U7 route the CLI through `TunnelRegistry::disconnect_all`,
-    // this loop collapses into a single registry call.
+    // Tear down each active tunnel sequentially. `disconnect_and_wait`
+    // takes the profile name + pid explicitly, so we iterate the
+    // scanner-discovered sessions and call it once per tunnel. A future
+    // unit that adds a registry to `VpnRuntime` could collapse this
+    // into a single `registry.disconnect_all` call.
     let mut disconnected: Vec<String> = Vec::new();
     let mut last_error: Option<String> = None;
     for session in &targets {
@@ -801,11 +801,12 @@ fn handle_reconnect(
     };
 
     // Cycle each profile: disconnect (if active) then connect. The CLI
-    // still drives the single-tunnel `VpnEngine` one profile at a time;
-    // a future unit routes this through `TunnelRegistry::reconnect`.
-    // Note that `handle_up` calls `print_error_and_exit` on failure, so
-    // a failing connect aborts the whole cycle — matching the
-    // single-tunnel reconnect semantics this command is preserving.
+    // walks the scanner-discovered sessions one tunnel at a time; a
+    // future unit could route through `TunnelRegistry::reconnect` once
+    // the headless engine carries a registry. `handle_up` calls
+    // `print_error_and_exit` on failure, so a failing connect aborts
+    // the whole cycle — matching the per-tunnel reconnect semantics
+    // this command preserves.
     let mut last_exit: i32 = 0;
     for name in &to_cycle {
         if let Some(session) = active.iter().find(|s| &s.name == name) {

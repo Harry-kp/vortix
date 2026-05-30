@@ -799,19 +799,18 @@ impl App {
         }
     }
 
-    /// P5b U-P5b-2: per-profile scanner.
+    /// Per-profile scanner — reconcile every registry entry against the
+    /// scanner's active sessions.
     ///
-    /// Iterate every registry entry and reconcile against the scanner's
-    /// active sessions. Each profile is processed independently — a
-    /// drop on tunnel A no longer blocks observing the (also dropped)
-    /// tunnel B. Auto-adoption (D-4) registers externally-started VPNs
-    /// at the end of the pass.
+    /// Each profile is processed independently: a drop on tunnel A no
+    /// longer blocks observing the (also dropped) tunnel B. Auto-adoption
+    /// (D-4) registers externally-started VPNs at the end of the pass.
     ///
-    /// Legacy state writes: the per-profile helpers keep the legacy
-    /// `runtime.connection_state` field updated for the profile that
-    /// matches it (or any profile when the field is `Disconnected`).
-    /// Other tunnels' transitions are registry-only. P5d retires the
-    /// field entirely.
+    /// The registry is the single source of truth — all transitions go
+    /// through `set_connected` / `set_disconnected` / `set_disconnecting`
+    /// / `set_failed` here. The few residual single-tunnel-shaped reads
+    /// (kill-switch sync, scanner-dispatch helpers) consult
+    /// [`App::legacy_state`], a derived view from the registry primary.
     fn handle_sync_system_state(&mut self, active: Vec<ActiveSession>) {
         use crate::vortix_core::engine::state::Connection;
         use crate::vortix_core::profile::ProfileId;

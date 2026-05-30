@@ -252,14 +252,16 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     let (ks_icon, ks_text, ks_color) =
         match (app.runtime.killswitch_mode, app.runtime.killswitch_state) {
             (crate::state::KillSwitchMode::Off, _) => (check_fail.clone(), "Off", theme::INACTIVE),
+            // AlwaysOn always resolves to Blocking (firewall stays engaged
+            // whether VPN is up or down) — caught here before the generic
+            // (_, Blocking) arm so the headline reads "Blocking (Strict)"
+            // with the strict-mode color cue rather than the generic
+            // post-drop "Blocking (Strict)".
             (_, crate::state::KillSwitchState::Blocking) => {
                 (check_warn.clone(), "Blocking (Strict)", theme::ERROR)
             }
             (crate::state::KillSwitchMode::Auto, crate::state::KillSwitchState::Armed) => {
                 (check_pass.clone(), "Armed (Auto)", theme::SUCCESS)
-            }
-            (crate::state::KillSwitchMode::AlwaysOn, crate::state::KillSwitchState::Armed) => {
-                (check_pass.clone(), "Armed (Strict)", theme::WARNING)
             }
             _ => (check_warn.clone(), "Unknown", theme::WARNING),
         };
@@ -401,7 +403,7 @@ fn render_partial_no_primary(frame: &mut Frame, app: &App, inner: Rect) {
     let (ks_sigil, ks_text, ks_color) = match app.runtime.killswitch_mode {
         crate::state::KillSwitchMode::AlwaysOn => (
             check_pass.clone(),
-            "Armed (blocks all except active tunnel interfaces — secondaries still protected)",
+            "Blocking (default-DROP egress; active tunnel interfaces allow-listed)",
             theme::SUCCESS,
         ),
         crate::state::KillSwitchMode::Auto => (
@@ -659,8 +661,8 @@ mod tests {
 
         let out = render_to_string(&app, 80, 20);
         assert!(
-            out.contains("Armed"),
-            "AlwaysOn should surface 'Armed' headline; got:\n{out}"
+            out.contains("Blocking"),
+            "AlwaysOn should surface 'Blocking' headline; got:\n{out}"
         );
         assert!(
             !out.contains("Standby"),

@@ -1,31 +1,41 @@
-//! Legacy single-tunnel `ConnectionState` enum (relocated from
-//! `crate::state::connection`).
+//! Single-tunnel `ConnectionState` enum — surviving as the CLI's local
+//! state shape and as the return type of `App::legacy_state()`.
 //!
-//! Multi-connection plan #001 U6 Stage B: the canonical source of truth
-//! for active tunnels is the [`crate::vortix_core::engine::TunnelRegistry`]
-//! that lives on [`crate::app::App`]. UI panels read snapshots from there.
+//! After plan P5d the canonical source of truth for active VPN state on
+//! the App side is the [`crate::vortix_core::engine::TunnelRegistry`] that
+//! lives on [`crate::app::App`]. The `connection_state` field on
+//! `VpnRuntime` is gone; every panel renderer reads `app.registry`
+//! snapshots directly.
 //!
-//! This enum still lives on [`crate::vpn_runtime::VpnRuntime`] because the
-//! legacy connect/disconnect/retry/scanner flow in `app/connection.rs`,
-//! `app/update.rs`, and the CLI's blocking connect/disconnect helpers in
-//! `vpn_runtime/connection.rs` still drive a single-tunnel state machine.
-//! Plan U7 rewires the connect path to drive the registry directly; once
-//! that lands the enum can be retired entirely.
+//! Two remaining users of this enum:
 //!
-//! Visibility: re-exported from `crate::vpn_runtime` so the legacy flow can
-//! reach it, but **not** from `crate::state` — the latter no longer carries
-//! a `ConnectionState` type. Panels that previously imported
-//! `crate::state::ConnectionState` or `crate::app::ConnectionState` must
-//! migrate to `app.registry` snapshot reads.
+//! 1. The CLI's blocking helpers in
+//!    [`crate::vpn_runtime::connection`] (`connect_and_wait`,
+//!    `disconnect_and_wait`) used to carry their own local
+//!    `ConnectionState` value during the lifetime of one CLI
+//!    invocation. They now derive the active-tunnel slice for the
+//!    kill switch directly from the scanner via
+//!    `VpnRuntime::killswitch_view_from_scanner` (every kernel-visible
+//!    tunnel contributes, not just the one this CLI call touched).
+//!
+//! 2. [`crate::app::App::legacy_state`] returns this enum as a derived
+//!    view of the registry primary so the few residual single-tunnel-
+//!    shaped reads (kill-switch sync, profile-delete safety,
+//!    scanner-dispatch helpers) keep working without a stored field.
+//!
+//! Visibility: still re-exported from [`crate::vpn_runtime`] for those
+//! two callers, but **not** from [`crate::state`] — panels never see it.
 
 use std::time::Instant;
 
 /// Technical details parsed from the VPN interface.
 ///
-/// Mirror of [`crate::vortix_core::engine::state::DetailedConnectionInfo`]
-/// kept for the legacy `ConnectionState` flow. Panels read the registry
-/// version through their tunnel snapshots; this one feeds the
-/// `connection_state` mirror on `VpnRuntime`.
+/// Companion to [`crate::vortix_core::engine::state::DetailedConnectionInfo`]
+/// — the registry's snapshot panels read; this one is the CLI-local
+/// shape carried by [`ConnectionState::Connected`] and the return type
+/// of [`crate::app::App::legacy_state`]. Both shapes have identical
+/// field names + types; `legacy_to_core_details` in `app/connection.rs`
+/// translates between them when populating the registry.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DetailedConnectionInfo {
     /// System interface name (e.g., utun3, wg0).
