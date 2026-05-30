@@ -1,8 +1,8 @@
 # Vortix
 
 [![CI](https://github.com/Harry-kp/vortix/actions/workflows/ci.yml/badge.svg)](https://github.com/Harry-kp/vortix/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/Harry-kp/vortix/blob/main/LICENSE)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/Harry-kp/vortix/blob/main/CONTRIBUTING.md)
 [![Crates.io](https://img.shields.io/crates/v/vortix.svg)](https://crates.io/crates/vortix)
 [![Crates.io Downloads](https://img.shields.io/crates/d/vortix.svg)](https://crates.io/crates/vortix)
 [![npm](https://img.shields.io/npm/v/@harry-kp/vortix?logo=npm)](https://www.npmjs.com/package/@harry-kp/vortix)
@@ -19,11 +19,11 @@ Terminal UI for WireGuard and OpenVPN with real-time telemetry and leak guarding
 
 > **New in v0.3.0 — architectural migration v1.** Engine FSM (internal), session journal, encrypted secret store. One new top-level subcommand (`vortix secrets`); existing CLI unchanged. Upgrade is automatic.
 >
-> - [Release notes](docs/v0.3.0-RELEASE-NOTES.md) — what changed (60s read)
-> - [Upgrade guide](docs/MIGRATION.md) — for v0.2.x users
-> - [FAQ](docs/v0.3.0-FAQ.md) — common upgrade questions
+> - [Release notes](https://github.com/Harry-kp/vortix/blob/main/docs/v0.3.0-RELEASE-NOTES.md) — what changed (60s read)
+> - [Upgrade guide](https://github.com/Harry-kp/vortix/blob/main/docs/MIGRATION.md) — for v0.2.x users
+> - [FAQ](https://github.com/Harry-kp/vortix/blob/main/docs/v0.3.0-FAQ.md) — common upgrade questions
 
-![Vortix Demo](assets/demo.gif)
+![Vortix Demo](https://raw.githubusercontent.com/Harry-kp/vortix/main/assets/demo.gif)
 
 ## Why Vortix?
 
@@ -285,7 +285,7 @@ migration all live behind existing commands — the journal path
 surfaces in `vortix info` output, the migration runs at startup, and
 `settings.toml` works whether or not you ever create one.
 
-See [`docs/MIGRATION.md`](docs/MIGRATION.md) for the upgrade guide and
+See [`docs/MIGRATION.md`](https://github.com/Harry-kp/vortix/blob/main/docs/MIGRATION.md) for the upgrade guide and
 opt-in details on the secret store, journal, and daemon.
 
 **JSON output for AI agents / scripts:**
