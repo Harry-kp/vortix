@@ -601,26 +601,42 @@ impl<T: Tunnel> TunnelRegistry<T> {
         profile_id: &ProfileId,
         entry: &RegistryEntry<T>,
     ) -> Role {
+        // Kernel ownership of the default route is the source of truth.
+        // For OpenVPN, `redirect-gateway` is server-pushed at runtime via
+        // `PUSH_REPLY` and never appears in the client `.ovpn` file, so
+        // `entry.allowed_ips` (parsed from the static config) is empty
+        // even when the tunnel is actually the primary. Before this
+        // check existed, those profiles always rendered as
+        // `Split tunnel` — strictly wrong when the kernel routing table
+        // says otherwise. Trusting the kernel here means WG profiles
+        // that DO declare `AllowedIPs = 0.0.0.0/0` AND OpenVPN profiles
+        // that got the default route pushed at runtime both render as
+        // `Primary` correctly.
+        if self.primary.as_ref() == Some(profile_id) {
+            return Role::Primary {
+                allowed_ips: entry.allowed_ips.clone(),
+            };
+        }
+
+        // Not the primary. Now the static AllowedIPs distinguish "I
+        // declared 0/0 but lost the election" (suppressed) from
+        // "I never wanted the default route" (genuine split-tunnel).
         let claims_default = entry.claims_default_route();
         if !claims_default {
             return Role::Addressable {
                 allowed_ips: entry.allowed_ips.clone(),
             };
         }
-        // Profile claims 0/0. Are we actually the primary?
-        if self.primary.as_ref() == Some(profile_id) {
-            Role::Primary {
-                allowed_ips: entry.allowed_ips.clone(),
-            }
-        } else if self.primary.is_some() {
+        if self.primary.is_some() {
             // Someone else owns the default route despite our claim.
             Role::AddressableSuppressed {
                 allowed_ips: entry.allowed_ips.clone(),
             }
         } else {
-            // No primary yet — could be us (mid-connect) or no one (split-only
-            // topology). Until `refresh_primary` runs after `tunnel.up`,
-            // surface as Addressable; the post-connect refresh promotes us.
+            // No primary yet — could be us (mid-connect) or no one
+            // (split-only topology). Until `refresh_primary` runs after
+            // `tunnel.up`, surface as Addressable; the post-connect
+            // refresh promotes us via the `self.primary` branch above.
             Role::Addressable {
                 allowed_ips: entry.allowed_ips.clone(),
             }
@@ -1563,6 +1579,47 @@ mod tests {
             reg.primary().map(ProfileId::as_str),
             Some("corp"),
             "stale cache must still feed primary election; otherwise scanner-lag flickers the UI"
+        );
+    }
+
+    /// `OpenVPN` regression: when the kernel routing table says this
+    /// profile owns the default route, the role must render as
+    /// `Primary` even if the declared `AllowedIPs` (parsed from the
+    /// client `.ovpn`) is empty. `redirect-gateway` is server-pushed at
+    /// runtime; vortix can't see it in the static config, so before
+    /// this fix every `OpenVPN` profile claimed Split-tunnel even when
+    /// it actually owned the default route.
+    #[test]
+    fn primary_role_promoted_from_kernel_truth_when_allowed_ips_empty() {
+        let mut reg: TunnelRegistry<MockTunnel> = TunnelRegistry::new();
+
+        // Connect ovpn-cert with EMPTY allowed_ips (this is what
+        // `extract_ovpn_routes` returns for an inline-cert `.ovpn` with
+        // no `route` directive — the `redirect-gateway` is only pushed
+        // from the server side).
+        connect_with_iface(&mut reg, "ovpn-cert", "utun9", vec![], false).unwrap();
+
+        // Scanner feeds the kernel-observed default-route interface.
+        reg.feed_default_route_interface(Some("utun9".to_string()));
+        reg.refresh_primary();
+
+        // Sanity: registry agrees ovpn-cert is the primary.
+        assert_eq!(
+            reg.primary().map(ProfileId::as_str),
+            Some("ovpn-cert"),
+            "kernel says utun9 owns default route → ovpn-cert is primary"
+        );
+
+        // Critical assertion: snapshot's role must surface as Primary,
+        // not Addressable. Pre-fix this returned Addressable because
+        // claims_default_route() short-circuited on empty allowed_ips.
+        let snap = reg
+            .snapshot(&ProfileId::new("ovpn-cert"))
+            .expect("snapshot for connected profile");
+        assert!(
+            matches!(snap.role, Role::Primary { .. }),
+            "ovpn-cert must render as Primary when kernel says it owns default route; got {:?}",
+            snap.role
         );
     }
 }

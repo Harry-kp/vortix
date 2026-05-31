@@ -176,6 +176,11 @@ write_files:
       PSK=$(wg genpsk)
 
       SERVER_IP=$(curl -s http://169.254.169.254/metadata/v1/interfaces/public/0/ipv4/address)
+      # Detect the actual egress interface — DO droplets sometimes ship
+      # with `ens3` rather than `eth0`, and hardcoding `eth0` makes the
+      # MASQUERADE rule fire on a non-existent interface → 100% packet
+      # loss for clients with no signal from the server side.
+      PUBLIC_IF=$(ip route show default | awk '/^default/ {print $5; exit}')
 
       # Server config
       cat > /etc/wireguard/wg0.conf <<EOF
@@ -183,8 +188,8 @@ write_files:
       PrivateKey = ${SERVER_PRIV}
       Address = 10.66.66.1/24
       ListenPort = 51820
-      PostUp = iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE; iptables -A FORWARD -i wg0 -j ACCEPT; iptables -A FORWARD -o wg0 -j ACCEPT
-      PostDown = iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE; iptables -D FORWARD -i wg0 -j ACCEPT; iptables -D FORWARD -o wg0 -j ACCEPT
+      PostUp = iptables -t nat -A POSTROUTING -o ${PUBLIC_IF} -j MASQUERADE; iptables -A FORWARD -i wg0 -j ACCEPT; iptables -A FORWARD -o wg0 -j ACCEPT
+      PostDown = iptables -t nat -D POSTROUTING -o ${PUBLIC_IF} -j MASQUERADE; iptables -D FORWARD -i wg0 -j ACCEPT; iptables -D FORWARD -o wg0 -j ACCEPT
 
       [Peer]
       PublicKey = ${CLIENT_PUB}
@@ -248,14 +253,16 @@ write_files:
       CLIENT_PUB=$(echo "$CLIENT_PRIV" | wg pubkey)
 
       SERVER_IP=$(curl -s http://169.254.169.254/metadata/v1/interfaces/public/0/ipv4/address)
+      # See `cloudinit_wg_full` for why we don't hardcode `eth0`.
+      PUBLIC_IF=$(ip route show default | awk '/^default/ {print $5; exit}')
 
       cat > /etc/wireguard/wg0.conf <<EOF
       [Interface]
       PrivateKey = ${SERVER_PRIV}
       Address = 10.8.0.1/24
       ListenPort = 51821
-      PostUp = iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE; iptables -A FORWARD -i wg0 -j ACCEPT
-      PostDown = iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE; iptables -D FORWARD -i wg0 -j ACCEPT
+      PostUp = iptables -t nat -A POSTROUTING -o ${PUBLIC_IF} -j MASQUERADE; iptables -A FORWARD -i wg0 -j ACCEPT
+      PostDown = iptables -t nat -D POSTROUTING -o ${PUBLIC_IF} -j MASQUERADE; iptables -D FORWARD -i wg0 -j ACCEPT
 
       [Peer]
       PublicKey = ${CLIENT_PUB}
@@ -310,6 +317,8 @@ write_files:
       PSK=$(wg genpsk)
 
       SERVER_IP=$(curl -s http://169.254.169.254/metadata/v1/interfaces/public/0/ipv4/address)
+      # See `cloudinit_wg_full` for why we don't hardcode `eth0`.
+      PUBLIC_IF=$(ip route show default | awk '/^default/ {print $5; exit}')
 
       cat > /etc/wireguard/wg0.conf <<EOF
       [Interface]
@@ -317,8 +326,8 @@ write_files:
       Address = 10.77.77.1/24
       ListenPort = 51822
       FwMark = 51820
-      PostUp = iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE; iptables -A FORWARD -i wg0 -j ACCEPT
-      PostDown = iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE; iptables -D FORWARD -i wg0 -j ACCEPT
+      PostUp = iptables -t nat -A POSTROUTING -o ${PUBLIC_IF} -j MASQUERADE; iptables -A FORWARD -i wg0 -j ACCEPT
+      PostDown = iptables -t nat -D POSTROUTING -o ${PUBLIC_IF} -j MASQUERADE; iptables -D FORWARD -i wg0 -j ACCEPT
 
       [Peer]
       PublicKey = ${CLIENT_PUB}
@@ -456,14 +465,36 @@ write_files:
       # Enable forwarding + NAT
       sysctl -w net.ipv4.ip_forward=1
       echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
-      iptables -t nat -A POSTROUTING -s 10.9.0.0/24 -o eth0 -j MASQUERADE
+      # Detect the actual egress interface — see cloudinit_wg_full for
+      # why hardcoding `eth0` is fatal on DO droplets that ship `ens3`.
+      PUBLIC_IF=$(ip route show default | awk '/^default/ {print $5; exit}')
+      iptables -t nat -A POSTROUTING -s 10.9.0.0/24 -o "$PUBLIC_IF" -j MASQUERADE
       iptables -A FORWARD -i tun0 -j ACCEPT
       iptables -A FORWARD -o tun0 -j ACCEPT
+
+      # Persist iptables so the rules survive a droplet reboot (without
+      # iptables-persistent they vanish on next boot and the tunnel
+      # silently stops forwarding).
+      DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent
+      netfilter-persistent save
 
       ufw allow 1194/udp
 
       systemctl enable openvpn@server
       systemctl start openvpn@server
+
+      # Diagnostic dump — `./scripts/test-infra.sh ssh ovpn-cert` +
+      # `cat /root/setup-diag.txt` is enough to verify forwarding is set
+      # up correctly without rooting around in iptables manually.
+      {
+        echo "PUBLIC_IF=$PUBLIC_IF"
+        echo "--- ip route show default"
+        ip route show default
+        echo "--- iptables -t nat -L POSTROUTING -v -n"
+        iptables -t nat -L POSTROUTING -v -n
+        echo "--- iptables -L FORWARD -v -n"
+        iptables -L FORWARD -v -n
+      } > /root/setup-diag.txt
       echo "READY" > /root/.vpn-ready
 
 runcmd:
@@ -593,13 +624,27 @@ write_files:
 
       sysctl -w net.ipv4.ip_forward=1
       echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
-      iptables -t nat -A POSTROUTING -s 10.10.0.0/24 -o eth0 -j MASQUERADE
+      # Detect actual egress interface (see cloudinit_wg_full).
+      PUBLIC_IF=$(ip route show default | awk '/^default/ {print $5; exit}')
+      iptables -t nat -A POSTROUTING -s 10.10.0.0/24 -o "$PUBLIC_IF" -j MASQUERADE
       iptables -A FORWARD -i tun0 -j ACCEPT
       iptables -A FORWARD -o tun0 -j ACCEPT
+      DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent
+      netfilter-persistent save
       ufw allow 1195/udp
 
       systemctl enable openvpn@server
       systemctl start openvpn@server
+
+      {
+        echo "PUBLIC_IF=$PUBLIC_IF"
+        echo "--- ip route show default"
+        ip route show default
+        echo "--- iptables -t nat -L POSTROUTING -v -n"
+        iptables -t nat -L POSTROUTING -v -n
+        echo "--- iptables -L FORWARD -v -n"
+        iptables -L FORWARD -v -n
+      } > /root/setup-diag.txt
       echo "READY" > /root/.vpn-ready
 
 runcmd:
@@ -743,13 +788,27 @@ write_files:
 
       sysctl -w net.ipv4.ip_forward=1
       echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
-      iptables -t nat -A POSTROUTING -s 10.11.0.0/24 -o eth0 -j MASQUERADE
+      # Detect actual egress interface (see cloudinit_wg_full).
+      PUBLIC_IF=$(ip route show default | awk '/^default/ {print $5; exit}')
+      iptables -t nat -A POSTROUTING -s 10.11.0.0/24 -o "$PUBLIC_IF" -j MASQUERADE
       iptables -A FORWARD -i tun0 -j ACCEPT
       iptables -A FORWARD -o tun0 -j ACCEPT
+      DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent
+      netfilter-persistent save
       ufw allow 1196/udp
 
       systemctl enable openvpn@server
       systemctl start openvpn@server
+
+      {
+        echo "PUBLIC_IF=$PUBLIC_IF"
+        echo "--- ip route show default"
+        ip route show default
+        echo "--- iptables -t nat -L POSTROUTING -v -n"
+        iptables -t nat -L POSTROUTING -v -n
+        echo "--- iptables -L FORWARD -v -n"
+        iptables -L FORWARD -v -n
+      } > /root/setup-diag.txt
       echo "READY" > /root/.vpn-ready
 
 runcmd:
