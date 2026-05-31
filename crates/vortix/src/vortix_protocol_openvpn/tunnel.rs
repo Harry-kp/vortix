@@ -427,8 +427,16 @@ impl Tunnel for OvpnTunnel {
             args.push(auth.to_string_lossy().into_owned());
         }
 
+        // `openvpn --daemon` forks and detaches — the grandchild inherits
+        // any piped stdout/stderr fds from the parent, so without
+        // `.daemonizes()` the runner's `wait_with_output()` would hang
+        // forever waiting for pipe EOF that never comes. The daemon writes
+        // diagnostics to `--log <log_path>` (read via `tail_lines` on the
+        // error path below), so dropping pipe capture costs no signal.
         let output_result = crate::vortix_process::run_to_output(
-            CommandSpec::oneshot("openvpn", args).privilege(PrivilegeReq::Root),
+            CommandSpec::oneshot("openvpn", args)
+                .privilege(PrivilegeReq::Root)
+                .daemonizes(),
         );
 
         // Plan 006 U5: the daemon has forked + read the auth file by now.

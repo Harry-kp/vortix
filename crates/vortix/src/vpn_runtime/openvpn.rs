@@ -9,6 +9,7 @@
 //! running the gate (TUI) and the other skipping it (CLI).
 
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use crate::vortix_process::{self, CommandSpec};
 
@@ -100,10 +101,21 @@ pub fn probe_openvpn_version() -> OvpnVersionProbe {
         .clone()
 }
 
+/// Upper bound on the version-probe subprocess. The probe runs on the UI
+/// thread (via `check_dependencies` on every connect attempt), so a slow or
+/// hung `openvpn --version` would freeze the TUI. 10 seconds is generous
+/// for a first-run launch (Gatekeeper / antivirus / Spotlight on macOS;
+/// cold cache on Linux) and short enough that the user notices a UX bug
+/// rather than concluding vortix is broken. On timeout we fall through to
+/// `Unparseable` (fail-open with a tracing warning) — same as if `openvpn`
+/// returned malformed output.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
 fn probe_openvpn_version_uncached() -> OvpnVersionProbe {
     // xtask:allow-protocol-leak: dependency-version probe runs before any tunnel exists; pre-flight gate (R13)
-    let version_output =
-        vortix_process::run_to_output(CommandSpec::oneshot("openvpn", vec!["--version".into()]));
+    let version_output = vortix_process::run_to_output(
+        CommandSpec::oneshot("openvpn", vec!["--version".into()]).timeout(PROBE_TIMEOUT),
+    );
     if let Ok(out) = version_output {
         let stdout = String::from_utf8_lossy(&out.stdout);
         if let Some(v) = parse_openvpn_version(&stdout) {
@@ -116,8 +128,9 @@ fn probe_openvpn_version_uncached() -> OvpnVersionProbe {
     }
 
     // xtask:allow-protocol-leak: dependency-feature probe runs before any tunnel exists; pre-flight gate (R13)
-    let help_output =
-        vortix_process::run_to_output(CommandSpec::oneshot("openvpn", vec!["--help".into()]));
+    let help_output = vortix_process::run_to_output(
+        CommandSpec::oneshot("openvpn", vec!["--help".into()]).timeout(PROBE_TIMEOUT),
+    );
     if let Ok(out) = help_output {
         let combined = format!(
             "{}{}",

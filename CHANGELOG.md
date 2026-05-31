@@ -38,6 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - CLI's `vortix up <name>` now refuses pre-2.4 OpenVPN before attempting to connect (matches what the TUI already did in v0.3.x; pre-fix the CLI would proceed and could leak pushed DNS through the primary's resolver).
+- OpenVPN connects no longer hang the TUI. Two bugs that interacted: (1) `openvpn --daemon` forks and detaches, but the daemonized grandchild inherited the parent's stdout/stderr pipes, so vortix's `wait_with_output()` would block forever waiting for a pipe-EOF that never came (the daemon was running fine in the background but vortix couldn't tell). (2) The `openvpn --version` dependency probe ran synchronously on the UI thread with no timeout, so a slow first-run probe (Gatekeeper / Spotlight / antivirus on macOS) froze the panel until it returned. Daemonizing subprocesses now route stdio to `/dev/null` and use `child.wait()` instead of `wait_with_output()`; the probe has a 10-second cap and falls through to a tracing warning on timeout.
 
 ### Removed
 

@@ -123,8 +123,19 @@ impl Trait for RealRunner {
         } else {
             Stdio::null()
         });
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
+        // Daemonizing subprocesses (e.g. `openvpn --daemon`) fork()+detach.
+        // The grandchild inherits the parent's pipe write-ends and may keep
+        // them open indefinitely, so `wait_with_output()` would block forever
+        // waiting for pipe EOF even after the parent exits cleanly. Route
+        // stdout/stderr to /dev/null instead — the caller is responsible for
+        // surfacing diagnostics via an alternate channel (e.g. `--log` file).
+        if spec.daemonizes {
+            cmd.stdout(Stdio::null());
+            cmd.stderr(Stdio::null());
+        } else {
+            cmd.stdout(Stdio::piped());
+            cmd.stderr(Stdio::piped());
+        }
 
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -153,39 +164,71 @@ impl Trait for RealRunner {
             }
         }
 
-        // Wait with optional timeout.
-        let output = if let Some(timeout) = spec.timeout {
-            let Ok(result) = tokio::time::timeout(timeout, child.wait_with_output()).await else {
-                warn!(
-                    target: "vortix::process",
-                    program = %spec.program,
-                    duration_ms = %timeout.as_millis(),
-                    "subprocess.timeout"
-                );
-                return Err(ProcessError::Timeout {
-                    program: spec.program.clone(),
-                    duration: timeout,
-                });
-            };
-            result.map_err(|e| ProcessError::IoError {
-                program: spec.program.clone(),
-                source: e,
-            })?
-        } else {
-            child
-                .wait_with_output()
-                .await
-                .map_err(|e| ProcessError::IoError {
+        // Wait with optional timeout. Daemonizing subprocesses take the
+        // `wait()`-only path (we routed their stdio to /dev/null above, so
+        // there are no pipes to drain); everything else uses
+        // `wait_with_output()` to capture stdout/stderr.
+        let (status, stdout, stderr) = if spec.daemonizes {
+            let status = if let Some(timeout) = spec.timeout {
+                let Ok(result) = tokio::time::timeout(timeout, child.wait()).await else {
+                    warn!(
+                        target: "vortix::process",
+                        program = %spec.program,
+                        duration_ms = %timeout.as_millis(),
+                        "subprocess.timeout"
+                    );
+                    return Err(ProcessError::Timeout {
+                        program: spec.program.clone(),
+                        duration: timeout,
+                    });
+                };
+                result.map_err(|e| ProcessError::IoError {
                     program: spec.program.clone(),
                     source: e,
                 })?
+            } else {
+                child.wait().await.map_err(|e| ProcessError::IoError {
+                    program: spec.program.clone(),
+                    source: e,
+                })?
+            };
+            (status, Vec::new(), Vec::new())
+        } else {
+            let output = if let Some(timeout) = spec.timeout {
+                let Ok(result) = tokio::time::timeout(timeout, child.wait_with_output()).await
+                else {
+                    warn!(
+                        target: "vortix::process",
+                        program = %spec.program,
+                        duration_ms = %timeout.as_millis(),
+                        "subprocess.timeout"
+                    );
+                    return Err(ProcessError::Timeout {
+                        program: spec.program.clone(),
+                        duration: timeout,
+                    });
+                };
+                result.map_err(|e| ProcessError::IoError {
+                    program: spec.program.clone(),
+                    source: e,
+                })?
+            } else {
+                child
+                    .wait_with_output()
+                    .await
+                    .map_err(|e| ProcessError::IoError {
+                        program: spec.program.clone(),
+                        source: e,
+                    })?
+            };
+            (output.status, output.stdout, output.stderr)
         };
 
         let duration = start.elapsed();
         let exit_status = ExitStatusInfo {
-            code: output.status.code(),
-            signal: signal_from_status(output.status),
-            success: output.status.success(),
+            code: status.code(),
+            signal: signal_from_status(status),
+            success: status.success(),
         };
 
         info!(
@@ -198,8 +241,8 @@ impl Trait for RealRunner {
         );
 
         Ok(CommandOutcome {
-            stdout: output.stdout,
-            stderr: output.stderr,
+            stdout,
+            stderr,
             exit_status,
             duration,
             started_at,

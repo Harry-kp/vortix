@@ -58,6 +58,21 @@ pub struct CommandSpec {
     /// Today vortix has no such callsite; the field is reserved for plan 006's
     /// SecretStore-aware Tunnel impls.
     pub redact_in_audit: Vec<usize>,
+    /// When `true`, the process will fork+detach (e.g. `openvpn --daemon`).
+    /// The runner takes two precautions:
+    ///
+    /// - stdout/stderr are routed to `Stdio::null()` instead of pipes, so
+    ///   the daemonized grandchild can't keep pipe write-ends alive after
+    ///   the parent exits.
+    /// - The runner uses `child.wait()` instead of `wait_with_output()`,
+    ///   returning as soon as the parent exits (typically right after the
+    ///   fork) — no waiting for pipe EOF.
+    ///
+    /// Without this flag, daemonizing subprocesses can hang
+    /// `wait_with_output` indefinitely because the inherited pipe never
+    /// EOFs. Callers using `daemonizes` are responsible for surfacing errors
+    /// via an alternate channel (e.g., the daemon's own `--log` file).
+    pub daemonizes: bool,
 }
 
 impl CommandSpec {
@@ -74,6 +89,7 @@ impl CommandSpec {
             requires_privilege: PrivilegeReq::None,
             kind: Kind::OneShot,
             redact_in_audit: Vec::new(),
+            daemonizes: false,
         }
     }
 
@@ -110,6 +126,17 @@ impl CommandSpec {
     #[must_use]
     pub fn redact_args(mut self, indices: impl IntoIterator<Item = usize>) -> Self {
         self.redact_in_audit = indices.into_iter().collect();
+        self
+    }
+
+    /// Builder: declare that this subprocess will fork+detach. Routes its
+    /// stdout/stderr to `/dev/null` and uses `child.wait()` instead of
+    /// `wait_with_output()`, so the runner returns as soon as the parent
+    /// exits — without blocking on pipe EOF from the daemonized grandchild.
+    /// See the `daemonizes` field doc for the full rationale.
+    #[must_use]
+    pub fn daemonizes(mut self) -> Self {
+        self.daemonizes = true;
         self
     }
 }
