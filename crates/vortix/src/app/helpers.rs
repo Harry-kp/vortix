@@ -372,18 +372,20 @@ impl App {
         None
     }
 
-    /// Get the maximum scroll position for the config viewer.
-    /// This accounts for viewport height so scrolling stops when last line is visible.
+    /// Maximum scroll position for the config viewer overlay.
+    ///
+    /// O(1): reads the line count cached in [`CachedConfigView`] (built
+    /// once when the user opened the viewer) instead of iterating
+    /// `content.lines()` on every keystroke. Aggressive `j`/`k` /
+    /// arrow-key spam used to wedge the TUI here because each call paid
+    /// the full file scan; now it's a struct-field read.
     pub(crate) fn get_config_max_scroll(&self) -> u16 {
-        if let Some(content) = &self.cached_config_content {
-            #[allow(clippy::cast_possible_truncation)]
-            let total_lines = content.lines().count() as u16;
-            let viewport_height = (self.terminal_size.1 * constants::CONFIG_VIEWER_HEIGHT_PCT
-                / 100)
-                .saturating_sub(constants::CONFIG_VIEWER_CHROME_LINES);
-            return total_lines.saturating_sub(viewport_height);
-        }
-        0
+        let Some(cached) = self.cached_config.as_ref() else {
+            return 0;
+        };
+        let viewport_height = (self.terminal_size.1 * constants::CONFIG_VIEWER_HEIGHT_PCT / 100)
+            .saturating_sub(constants::CONFIG_VIEWER_CHROME_LINES);
+        cached.total_lines.saturating_sub(viewport_height)
     }
 
     /// Copy public IP address to clipboard.

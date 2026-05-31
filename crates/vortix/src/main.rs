@@ -382,20 +382,22 @@ fn run_tui(
     while !app.should_quit {
         if app.has_active_animation() {
             while let Some(event) = events.try_next()? {
-                match event {
-                    Event::Key(key_event) => app.handle_key(key_event),
-                    Event::Mouse(mouse_event) => app.handle_mouse(mouse_event),
-                    Event::Tick => app.on_tick(),
-                    Event::Resize(w, h) => app.on_resize(w, h),
-                }
+                dispatch_event(&mut app, event);
             }
             app.advance_animation();
         } else {
-            match events.next()? {
-                Event::Key(key_event) => app.handle_key(key_event),
-                Event::Mouse(mouse_event) => app.handle_mouse(mouse_event),
-                Event::Tick => app.on_tick(),
-                Event::Resize(width, height) => app.on_resize(width, height),
+            // Block until at least one event lands (avoids busy-loop), then
+            // drain every event that has already queued up while the
+            // previous render frame was running. A fast trackpad or scroll
+            // wheel can emit 30+ events per second; without this drain,
+            // each event would trigger a full render even though only the
+            // final scroll position matters. Coalescing them into one
+            // render frame is the difference between smooth-scrolling and
+            // the TUI feeling wedged for tens of seconds while it grinds
+            // through a backlog the user already left behind.
+            dispatch_event(&mut app, events.next()?);
+            while let Some(event) = events.try_next()? {
+                dispatch_event(&mut app, event);
             }
         }
 
@@ -415,6 +417,26 @@ fn run_tui(
 /// Initialise tracing-subscriber with an env-filter layer.
 ///
 /// Silent by default; `RUST_LOG=vortix::process=info` enables the structured
+/// Dispatch a single event into the App. Extracted from the main loop
+/// so the loop body can call it once for the blocking-`next()` event
+/// and N more times for each event that's queued up behind it (the
+/// burst-coalescing path that turns rapid scroll-wheel events into a
+/// single render frame).
+///
+/// The `event` is taken by value because the caller is done with it
+/// after dispatch; clippy's `needless_pass_by_value` lint flags the
+/// non-consuming `match` but moving the variant payloads into the
+/// handlers is the right shape here.
+#[allow(clippy::needless_pass_by_value)]
+fn dispatch_event(app: &mut App, event: Event) {
+    match event {
+        Event::Key(key_event) => app.handle_key(key_event),
+        Event::Mouse(mouse_event) => app.handle_mouse(mouse_event),
+        Event::Tick => app.on_tick(),
+        Event::Resize(w, h) => app.on_resize(w, h),
+    }
+}
+
 /// subprocess events emitted by `RealRunner`. The TUI uses stderr for log
 /// output since stdout drives the alternate-screen terminal.
 fn init_tracing() {

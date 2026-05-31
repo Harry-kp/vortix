@@ -19,19 +19,18 @@ pub fn render(frame: &mut Frame, app: &App) {
     // Clear the background
     frame.render_widget(Clear, area);
 
-    let (config_content, profile_name, config_path): (&str, String, PathBuf) =
+    // Read directly from the cached view; if the user opened the viewer
+    // with no profile selected (or read failed in OpenConfig and stashed
+    // an error string), the cache holds the right body to display.
+    let (profile_name, config_path): (String, PathBuf) =
         if let Some(idx) = app.profile_list_state.selected() {
             if let Some(profile) = app.runtime.profiles.get(idx) {
-                let content = app
-                    .cached_config_content
-                    .as_deref()
-                    .unwrap_or("No config loaded");
-                (content, profile.name.clone(), profile.config_path.clone())
+                (profile.name.clone(), profile.config_path.clone())
             } else {
-                ("No profile selected", String::new(), PathBuf::new())
+                (String::new(), PathBuf::new())
             }
         } else {
-            ("No profile selected", String::new(), PathBuf::new())
+            (String::new(), PathBuf::new())
         };
 
     let title = if profile_name.is_empty() {
@@ -54,11 +53,15 @@ pub fn render(frame: &mut Frame, app: &App) {
     // Show the file path at the top
     let path_style = Style::default().fg(Color::DarkGray);
 
-    // Parse config and apply syntax highlighting
-    let lines: Vec<Line> = config_content.lines().map(highlight_config_line).collect();
-
-    // Create paragraph with scrolling
-    let total_lines = lines.len();
+    // Lines + count come straight from the cache built in `OpenConfig`.
+    // No file re-read, no per-line re-highlighting per frame.
+    let (lines, total_lines): (Vec<Line<'static>>, usize) = match app.cached_config.as_ref() {
+        Some(cached) => (
+            cached.highlighted_lines.clone(),
+            cached.highlighted_lines.len(),
+        ),
+        None => (vec![highlight_config_line("No config loaded")], 1),
+    };
     let paragraph = Paragraph::new(lines)
         .style(Style::default().fg(theme::TEXT_PRIMARY))
         .scroll((app.config_scroll, 0));
@@ -108,8 +111,13 @@ pub fn render(frame: &mut Frame, app: &App) {
     frame.render_stateful_widget(scrollbar, scroll_area, &mut scrollbar_state);
 }
 
-/// Apply syntax highlighting to config lines
-fn highlight_config_line(line: &str) -> Line<'static> {
+/// Apply syntax highlighting to config lines.
+///
+/// Exposed `pub(crate)` so the App's open-config handler can build a
+/// pre-highlighted cache of the entire file once, and the renderer just
+/// clones the cached Vec each frame instead of re-running this function
+/// (and its sub-allocations) for every visible line on every keystroke.
+pub(crate) fn highlight_config_line(line: &str) -> Line<'static> {
     let line = line.to_string();
     let trimmed = line.trim();
 

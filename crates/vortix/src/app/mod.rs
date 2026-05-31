@@ -33,7 +33,51 @@ mod update;
 mod tests;
 
 use ratatui::layout::Rect;
+use ratatui::text::Line;
 use ratatui::widgets::TableState;
+
+/// Pre-computed view of a profile config file for the `v` overlay.
+///
+/// Built once when the user opens the viewer; reused on every render and
+/// every scroll keystroke. Without this cache, two O(N) operations
+/// happen per keypress: `content.lines().count()` to compute scroll
+/// bounds (in `helpers.rs::get_config_max_scroll`), and a fresh
+/// `content.lines().map(highlight_config_line).collect()` per render
+/// frame. Aggressive scrolling spams keys faster than the main thread
+/// can re-process the full file, so the TUI wedges. With this cache,
+/// scroll-bound checks are O(1) and the renderer just clones a Vec.
+pub struct CachedConfigView {
+    /// Raw file contents. Stored for completeness (so external code
+    /// reading `app.cached_config` sees what's actually loaded). The
+    /// renderer reads from [`Self::highlighted_lines`] instead.
+    pub content: String,
+    /// Line count computed once at load time. `u16` matches the
+    /// `Paragraph::scroll((u16, u16))` API.
+    pub total_lines: u16,
+    /// Pre-parsed + syntax-highlighted lines, ready to feed to
+    /// `Paragraph::new`. Building this is the expensive part; cloning
+    /// the Vec for `Paragraph` consumption per frame is cheap.
+    pub highlighted_lines: Vec<Line<'static>>,
+}
+
+impl CachedConfigView {
+    /// Build a fresh view from raw file content. Pre-counts lines and
+    /// pre-highlights them so the open-config keypress pays the cost
+    /// once and every subsequent scroll/render frame is constant-time.
+    #[must_use]
+    pub fn from_content(content: String) -> Self {
+        let highlighted_lines: Vec<Line<'static>> = content
+            .lines()
+            .map(crate::ui::overlays::config_viewer::highlight_config_line)
+            .collect();
+        let total_lines = u16::try_from(highlighted_lines.len()).unwrap_or(u16::MAX);
+        Self {
+            content,
+            total_lines,
+            highlighted_lines,
+        }
+    }
+}
 use std::collections::{HashMap, HashSet};
 
 use crate::constants;
@@ -98,7 +142,12 @@ pub struct App {
     pub show_bulk_menu: bool,
     pub action_menu_state: ratatui::widgets::ListState,
     pub config_scroll: u16,
-    pub cached_config_content: Option<String>,
+    /// Cached state for the config-viewer overlay (opened with `v`).
+    /// Built once when the user opens the viewer; cleared when they
+    /// close it. Caching the highlighted `Vec<Line>` + the line count
+    /// turns aggressive scroll-spam from O(N²) (re-parse on every key)
+    /// into O(N) once + O(viewport) per frame.
+    pub cached_config: Option<CachedConfigView>,
     pub search_match_count: usize,
     pub profile_list_state: TableState,
     pub panel_areas: HashMap<FocusedPanel, Rect>,
@@ -160,7 +209,7 @@ impl App {
             show_bulk_menu: false,
             action_menu_state: ratatui::widgets::ListState::default(),
             config_scroll: 0,
-            cached_config_content: None,
+            cached_config: None,
             search_match_count: 0,
             profile_list_state: TableState::default(),
             panel_areas: HashMap::new(),
@@ -316,7 +365,7 @@ impl App {
             show_bulk_menu: false,
             action_menu_state: ratatui::widgets::ListState::default(),
             config_scroll: 0,
-            cached_config_content: None,
+            cached_config: None,
             search_match_count: 0,
             profile_list_state: TableState::default(),
             panel_areas: HashMap::new(),

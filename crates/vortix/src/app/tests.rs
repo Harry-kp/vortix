@@ -42,7 +42,7 @@ fn test_app() -> App {
         show_bulk_menu: false,
         action_menu_state: ratatui::widgets::ListState::default(),
         config_scroll: 0,
-        cached_config_content: None,
+        cached_config: None,
         search_match_count: 0,
         profile_list_state: ratatui::widgets::TableState::default(),
         panel_areas: std::collections::HashMap::new(),
@@ -1492,19 +1492,20 @@ fn test_open_config_caches_content_and_close_clears() {
     app.handle_message(Message::OpenConfig);
     assert!(app.show_config, "Config viewer should be open");
     assert!(
-        app.cached_config_content.is_some(),
+        app.cached_config.is_some(),
         "Config content should be cached"
     );
     assert!(app
-        .cached_config_content
+        .cached_config
         .as_ref()
         .unwrap()
+        .content
         .contains("[Interface]"));
 
     app.handle_message(Message::CloseOverlay);
     assert!(!app.show_config, "Config viewer should be closed");
     assert!(
-        app.cached_config_content.is_none(),
+        app.cached_config.is_none(),
         "Cached content should be cleared on close"
     );
 }
@@ -3255,4 +3256,52 @@ fn connect_result_success_accepted_when_scanner_already_promoted_to_connected() 
         ),
         "Connected state must survive the success-arrival handler"
     );
+}
+
+/// `CachedConfigView::from_content` pre-counts lines and pre-highlights
+/// every line so the scroll path doesn't have to re-iterate the file.
+/// Aggressive scrolling on a large inline-cert `.ovpn` used to wedge the
+/// TUI because both `get_config_max_scroll` and the renderer each did
+/// `content.lines().count()` / `.map(highlight).collect()` per keystroke.
+#[test]
+fn cached_config_view_precomputes_total_lines_and_highlighted_vec() {
+    use crate::app::CachedConfigView;
+
+    let content = "[Interface]\nAddress = 10.0.0.2/24\nPrivateKey = abc\n\n[Peer]\nPublicKey = def\nAllowedIPs = 0.0.0.0/0\n";
+    let view = CachedConfigView::from_content(content.to_string());
+
+    assert_eq!(view.total_lines, 7, "total_lines must be pre-computed");
+    assert_eq!(
+        view.highlighted_lines.len(),
+        7,
+        "highlighted_lines must have one entry per content line"
+    );
+    assert_eq!(view.content, content, "raw content preserved verbatim");
+}
+
+/// `get_config_max_scroll` must read from the cache, NOT iterate the
+/// content string. Regression guard for the O(N²)-on-keypress wedge.
+#[test]
+fn get_config_max_scroll_reads_from_cache() {
+    use crate::app::CachedConfigView;
+
+    let mut app = test_app();
+    // Synthesize a long enough content that max_scroll would diverge from
+    // zero even after subtracting the viewport height.
+    let mut content = String::new();
+    for i in 0..200 {
+        use std::fmt::Write;
+        let _ = writeln!(content, "line {i}");
+    }
+    app.terminal_size = (120, 40);
+    app.cached_config = Some(CachedConfigView::from_content(content));
+
+    let max = app.get_config_max_scroll();
+    assert!(
+        max > 0,
+        "200 lines must produce a positive max-scroll on a 40-row terminal"
+    );
+    // Calling again must be cheap — same value, no observable side effects
+    // (caching invariant; can't directly time but assert idempotency).
+    assert_eq!(app.get_config_max_scroll(), max);
 }

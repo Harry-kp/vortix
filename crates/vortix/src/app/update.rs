@@ -65,10 +65,13 @@ impl App {
             Message::OpenConfig => {
                 if let Some(idx) = self.profile_list_state.selected() {
                     if let Some(profile) = self.runtime.profiles.get(idx) {
-                        self.cached_config_content = Some(
-                            std::fs::read_to_string(&profile.config_path)
-                                .unwrap_or_else(|e| format!("Error reading config: {e}")),
-                        );
+                        let content = std::fs::read_to_string(&profile.config_path)
+                            .unwrap_or_else(|e| format!("Error reading config: {e}"));
+                        // Build the highlighted-lines + total-lines cache
+                        // once here; aggressive scrolling later reads from
+                        // this cache instead of re-parsing the file every
+                        // keystroke (see `CachedConfigView` doc).
+                        self.cached_config = Some(super::CachedConfigView::from_content(content));
                     }
                     self.show_config = true;
                     self.config_scroll = 0;
@@ -241,7 +244,7 @@ impl App {
             }
             Message::CloseOverlay => {
                 self.show_config = false;
-                self.cached_config_content = None;
+                self.cached_config = None;
                 self.show_action_menu = false;
                 self.show_bulk_menu = false;
                 self.input_mode = InputMode::Normal;

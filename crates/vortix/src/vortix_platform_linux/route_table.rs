@@ -1,18 +1,46 @@
 //! Linux routing-table inspection via `ip route`.
 
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::vortix_core::ports::route_table::RouteTable;
 use crate::vortix_process::CommandSpec;
 
 /// Upper bound on the `ip route show default` subprocess. Netlink is
-/// usually instant on Linux, but the query is invoked inline from
-/// `TunnelRegistry::recompute_primary` on the UI thread, so defending
-/// against pathological cases (heavy routing-policy rules, contention
-/// during a tunnel transition) matters. 1s is generous for any healthy
-/// query; on timeout we return `None` and the scanner's next tick
-/// will re-resolve.
+/// usually instant on Linux, but pathological cases (heavy
+/// routing-policy rules, contention during a tunnel transition) can
+/// stall the query. 1s is generous for any healthy run.
 const ROUTE_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Process-wide backoff for the route-default probe. See the macOS
+/// `route_table.rs` for the full rationale; same shape applies here so
+/// a broken Linux network state doesn't keep the scanner thread + the
+/// network-monitor thread both spinning on a doomed `ip route` call
+/// every couple of seconds.
+struct ProbeBackoff {
+    consecutive_fails: u32,
+    next_allowed: Instant,
+}
+
+fn backoff_state() -> &'static Mutex<ProbeBackoff> {
+    static STATE: OnceLock<Mutex<ProbeBackoff>> = OnceLock::new();
+    STATE.get_or_init(|| {
+        Mutex::new(ProbeBackoff {
+            consecutive_fails: 0,
+            next_allowed: Instant::now(),
+        })
+    })
+}
+
+fn cooldown_for_fails(fails: u32) -> Duration {
+    let secs = match fails {
+        0..=2 => 0,
+        3..=5 => 5,
+        6..=10 => 15,
+        _ => 60,
+    };
+    Duration::from_secs(secs)
+}
 
 /// Linux routing-table reader using `ip route show default`.
 pub struct LinuxRouteTable;
@@ -33,13 +61,41 @@ impl RouteTable for LinuxRouteTable {
 ///
 /// Returns `None` if the subprocess fails so callers can degrade gracefully.
 fn run_ip_route_show_default() -> Option<String> {
-    let output = crate::vortix_process::run_to_output(
+    {
+        let state = backoff_state()
+            .lock()
+            .expect("backoff state mutex poisoned");
+        if Instant::now() < state.next_allowed {
+            return None;
+        }
+    }
+
+    let result = crate::vortix_process::run_to_output(
         // xtask:allow-shell-regression: `ip route show default` is the canonical Linux routing-table inspection — no libc equivalent that returns the default-route dev without rolling our own netlink RTNETLINK parser. Pre-existing shell-out; this change only adds a timeout.
         CommandSpec::oneshot("ip", vec!["route".into(), "show".into(), "default".into()])
             .timeout(ROUTE_QUERY_TIMEOUT),
-    )
-    .ok()?;
-    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+    );
+
+    let mut state = backoff_state()
+        .lock()
+        .expect("backoff state mutex poisoned");
+    if let Ok(output) = result {
+        state.consecutive_fails = 0;
+        state.next_allowed = Instant::now();
+        return Some(String::from_utf8_lossy(&output.stdout).into_owned());
+    }
+    state.consecutive_fails = state.consecutive_fails.saturating_add(1);
+    let cooldown = cooldown_for_fails(state.consecutive_fails);
+    state.next_allowed = Instant::now() + cooldown;
+    if state.consecutive_fails == 1 || cooldown >= Duration::from_secs(5) {
+        tracing::warn!(
+            target: "vortix::vortix_platform_linux::route_table",
+            consecutive_fails = state.consecutive_fails,
+            cooldown_secs = cooldown.as_secs(),
+            "`ip route show default` probe failed; backing off to spare the tokio runtime"
+        );
+    }
+    None
 }
 
 /// Extract the gateway IP from `default via <ip> dev <name> ...` lines.

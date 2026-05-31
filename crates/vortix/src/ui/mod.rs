@@ -2,7 +2,10 @@
 
 mod dashboard;
 mod helpers;
-mod overlays;
+/// Overlays are reachable from the App layer because the open-config
+/// path pre-builds the cached `Vec<Line>` once (`CachedConfigView`)
+/// instead of letting the renderer re-parse on every frame.
+pub(crate) mod overlays;
 mod widgets;
 
 use crate::app::App;
