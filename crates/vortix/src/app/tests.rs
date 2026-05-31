@@ -94,6 +94,7 @@ fn fake_session(name: &str) -> ActiveSession {
     ActiveSession {
         name: name.to_string(),
         interface: "wg0".to_string(),
+        interface_authoritative: true,
         endpoint: "1.2.3.4:51820".to_string(),
         internal_ip: "10.0.0.2".to_string(),
         mtu: "1420".to_string(),
@@ -416,12 +417,11 @@ fn mirror_disconnecting_transitions_existing_connected_entry() {
     // renders `◑` during the teardown window.
     let mut app = test_app();
     add_profiles(&mut app, &["vpn-a"]);
-    // Seed Connected first via the existing scanner promotion path.
-    set_connecting(&mut app, "vpn-a");
-    app.handle_message(Message::SyncSystemState {
-        sessions: vec![fake_session("vpn-a")],
-        default_route_interface: None,
-    });
+    // Seed Connected via the authoritative protocol-layer path
+    // (mirror_connect_into_registry). Pre-U4 this test used scanner
+    // promotion (set_connecting + SyncSystemState); U4 removed that
+    // path entirely.
+    set_connected(&mut app, "vpn-a");
     assert!(matches!(
         app.registry
             .snapshot(&ProfileId::new("vpn-a"))
@@ -580,12 +580,10 @@ fn switch_path_disconnect_completion_removes_old_profile_from_registry() {
     let mut app = test_app();
     add_profiles(&mut app, &["vpn-a", "vpn-b"]);
 
-    // Set up vpn-a fully connected, mirrored into the registry.
-    set_connecting(&mut app, "vpn-a");
-    app.handle_message(Message::SyncSystemState {
-        sessions: vec![fake_session("vpn-a")],
-        default_route_interface: None,
-    });
+    // Set up vpn-a fully connected via the authoritative protocol-layer
+    // path. Pre-U4 this used scanner promotion (set_connecting +
+    // SyncSystemState); U4 removed that path.
+    set_connected(&mut app, "vpn-a");
     assert_eq!(app.registry.tunnel_count(), 1, "setup precondition");
 
     // User toggles vpn-b, accepts the takeover overlay via Enter
@@ -2937,47 +2935,46 @@ fn scanner_promotion_from_connecting_to_connected_mirrors_into_registry() {
     use crate::vortix_core::engine::state::Connection;
     use crate::vortix_core::profile::ProfileId;
 
-    // Repro of the real-world bug: the connect-worker thread does
-    // `tunnel.up()` and the background scanner sees the kernel
-    // interface appear before the worker's ConnectResult lands. The
-    // scanner-promotion branch in handle_sync_system_state transitions
-    // Connecting → Connected; the worker's ConnectResult is then
-    // dropped as stale by handle_connect_result's `still_connecting`
-    // guard. Without a registry mirror at the scanner site, the
-    // renderer sees zero tunnels.
+    // U4 contract: scanner cannot promote Connecting → Connected. Only
+    // the protocol layer's `Tunnel::up()` success result (via
+    // `Message::ConnectResult` → `mirror_connect_into_registry`) can
+    // complete that transition. The scanner observing a matching
+    // kernel session for a Connecting profile is informational only.
+    //
+    // Pre-U4 this test asserted scanner promotion happens; the dual
+    // write (scanner + protocol layer both writing the interface) was
+    // the source of bugs #3 and #12 in the origin requirements doc.
+    // Now we assert the opposite: a kernel-visible session for a
+    // Connecting profile must NOT auto-promote.
     let mut app = test_app();
     add_profiles(&mut app, &["AWS_VPN"]);
     set_connecting(&mut app, "AWS_VPN");
 
-    // Drive the scanner sync directly — what `handle_sync_system_state`
-    // does on every Tick when the scanner reports an `ActiveSession`.
+    // Drive the scanner sync — kernel reports the tunnel is up, but
+    // the protocol-layer success has not yet arrived.
     app.handle_message(Message::SyncSystemState {
         sessions: vec![fake_session("AWS_VPN")],
         default_route_interface: None,
     });
 
-    // Legacy state moved to Connected (this is what wrote
-    // "Connection established to 'AWS_VPN'" to the event log in the
-    // user's screenshot).
-    assert!(
-        matches!(
-            app.legacy_state(),
-            ConnectionState::Connected { ref profile, .. } if profile == "AWS_VPN"
-        ),
-        "scanner must promote Connecting → Connected"
-    );
-
-    // Renderer-facing state: registry must reflect the live tunnel.
+    // Registry must stay Connecting — scanner can't drive the
+    // transition. Legacy state mirrors this.
     let snap = app
         .registry
         .snapshot(&ProfileId::new("AWS_VPN"))
-        .expect("registry must have a snapshot for the scanner-promoted profile");
+        .expect("registry must have a snapshot for the in-flight profile");
     assert!(
-        matches!(snap.state, Connection::Connected { .. }),
-        "registry FSM must be Connected, got {:?}",
+        matches!(snap.state, Connection::Connecting { .. }),
+        "registry FSM must stay Connecting until the protocol layer reports success; got {:?}",
         snap.state
     );
-    assert_eq!(app.registry.tunnel_count(), 1);
+    assert!(
+        matches!(
+            app.legacy_state(),
+            ConnectionState::Connecting { ref profile, .. } if profile == "AWS_VPN"
+        ),
+        "legacy state mirrors registry — still Connecting"
+    );
 }
 
 #[test]
@@ -2992,13 +2989,9 @@ fn scanner_drop_from_connected_clears_registry() {
     let mut app = test_app();
     add_profiles(&mut app, &["AWS_VPN"]);
 
-    // Set up the connected state through the scanner-promotion path
-    // so both legacy state AND registry are in sync.
-    set_connecting(&mut app, "AWS_VPN");
-    app.handle_message(Message::SyncSystemState {
-        sessions: vec![fake_session("AWS_VPN")],
-        default_route_interface: None,
-    });
+    // Set up Connected via the authoritative path (post-U4 the
+    // scanner-promotion path is gone).
+    set_connected(&mut app, "AWS_VPN");
     assert_eq!(app.registry.tunnel_count(), 1, "setup precondition");
 
     // Scanner now reports no active sessions — the VPN went away.
@@ -3020,29 +3013,20 @@ fn mirrored_registry_entry_uses_real_interface_not_mock0() {
     use crate::vortix_core::engine::state::Connection;
     use crate::vortix_core::profile::ProfileId;
 
-    // Repro of the screenshot bug: header says `Tunnels: [●AWS_VPN]`
-    // (mirror worked) but Connection Details shows `VPN IP: @ mock0`,
-    // `Role: Addressable (-)`, `Latency: n/a (secondary tunnel)`.
-    // Root cause: the bookkeeping shim's `MockTunnel::up` returns
-    // `DefaultSuccess` which synthesizes interface = "mock0". The
-    // registry stores that fake interface; `recompute_primary`
-    // matches `details.interface == kernel_default_route` and never
-    // hits — so the tunnel reads as a non-primary "Addressable
-    // secondary" and telemetry routes around it.
+    // Under U4 the protocol layer's `Tunnel::up()` result is the sole
+    // writer of `details.interface`. The `set_connected` helper
+    // (line 62) calls `mirror_connect_into_registry` with details
+    // carrying the test's "wg0" interface — the registry must store
+    // exactly that, not a synthesized mock label.
     //
-    // The mirror must take its interface + pid from the legacy
-    // `connection_state.details` (which the scanner populates with
-    // the real kernel-reported values).
+    // Pre-U4 this test asserted scanner-promotion populated the real
+    // iface. Post-U4 the scanner can't promote at all, and the iface
+    // comes from the authoritative ConnectResult path instead. The
+    // contract being tested is the same — "registry stores the real
+    // iface, not a placeholder" — only the seam moved.
     let mut app = test_app();
     add_profiles(&mut app, &["AWS_VPN"]);
-    set_connecting(&mut app, "AWS_VPN");
-
-    // Scanner reports a session with the REAL interface name + pid.
-    let session = fake_session("AWS_VPN");
-    app.handle_message(Message::SyncSystemState {
-        sessions: vec![session],
-        default_route_interface: None,
-    });
+    set_connected(&mut app, "AWS_VPN");
 
     let snap = app
         .registry
@@ -3053,7 +3037,7 @@ fn mirrored_registry_entry_uses_real_interface_not_mock0() {
     };
     assert_eq!(
         details.interface, "wg0",
-        "registry must store the REAL interface name from the scanner session, not the MockTunnel's 'mock0' placeholder"
+        "registry must store the iface from the authoritative Tunnel::up path"
     );
     assert_eq!(details.pid, Some(12345), "registry must store the real pid");
 }
@@ -3075,9 +3059,18 @@ fn mirrored_registry_entry_carries_full_rich_details_not_just_interface_and_pid(
     // The bookkeeping `set_connected` API now copies the full
     // legacy `DetailedConnectionInfo` straight into the registry.
     // Assert every field round-trips.
+    // Under U4 the registry's authoritative writer is the protocol
+    // layer (via `mirror_connect_into_registry`); the scanner refresh
+    // updates METADATA fields only (endpoint, internal_ip, mtu,
+    // transfer counters, handshake) while leaving the iface alone.
+    //
+    // Setup: get Connected via the authoritative path with `set_connected`
+    // (which seeds wg0 + pid 12345 + empty metadata). Then deliver a
+    // scanner refresh — assert each metadata field flowed into the
+    // registry while the iface stayed put.
     let mut app = test_app();
     add_profiles(&mut app, &["AWS_VPN"]);
-    set_connecting(&mut app, "AWS_VPN");
+    set_connected(&mut app, "AWS_VPN");
 
     let session = fake_session("AWS_VPN");
     app.handle_message(Message::SyncSystemState {
@@ -3118,32 +3111,44 @@ fn mirror_refresh_updates_registry_when_details_change() {
     use crate::vortix_core::engine::state::Connection;
     use crate::vortix_core::profile::ProfileId;
 
-    // WireGuard timing: worker thread returns success FAST and
-    // ConnectResult arrives before the scanner ticks. The mirror
-    // in `handle_connect_result` fires with empty
-    // `details.interface` (default()). The scanner then sees the
-    // interface and patches `details.interface` in place on the
-    // existing-Connected state at update.rs:879+. The registry
-    // must also pick up the refresh — otherwise it's stuck on the
-    // empty/placeholder interface and `recompute_primary` never
-    // matches.
+    // U4 contract: scanner refresh updates metadata only — never the
+    // interface field. Once `Tunnel::up()` set the interface, it's
+    // immutable for the tunnel's lifetime.
+    //
+    // Pre-U4 this test asserted the opposite — scanner overwrites the
+    // empty placeholder iface with the real one. That dual-write
+    // pattern was exactly the source of bugs #3 / #12 in the
+    // multi-OpenVPN scenarios. Now we assert the inverse: a scanner
+    // refresh reporting a DIFFERENT iface than the protocol layer
+    // recorded must NOT modify the stored interface.
     let mut app = test_app();
     add_profiles(&mut app, &["wg-test"]);
-    set_connecting(&mut app, "wg-test");
-    // Worker thread reports success first; details are empty.
-    app.handle_message(Message::ConnectResult {
-        profile: "wg-test".to_string(),
-        success: true,
-        error: None,
-    });
-    // Scanner then arrives with real session data — this hits the
-    // "update existing Connected" branch (update.rs:879+).
-    let session = fake_session("wg-test");
+    set_connected(&mut app, "wg-test");
+
+    // Pre-condition: the entry's iface is "wg0" (set by `set_connected`
+    // via the mirror_connect path).
+    {
+        let snap = app
+            .registry
+            .snapshot(&ProfileId::new("wg-test"))
+            .expect("setup precondition");
+        let Connection::Connected { details, .. } = snap.state else {
+            panic!("expected Connected setup, got {:?}", snap.state);
+        };
+        assert_eq!(details.interface, "wg0", "setup precondition");
+    }
+
+    // Scanner reports the session with a DIFFERENT iface (simulates
+    // the macOS multi-OpenVPN ifconfig collision where Method B
+    // returns the wrong utun).
+    let mut session = fake_session("wg-test");
+    session.interface = "utun99-wrong-from-scanner".to_string();
     app.handle_message(Message::SyncSystemState {
         sessions: vec![session],
         default_route_interface: None,
     });
 
+    // Post-refresh: iface MUST still be the protocol-layer's "wg0".
     let snap = app
         .registry
         .snapshot(&ProfileId::new("wg-test"))
@@ -3153,8 +3158,11 @@ fn mirror_refresh_updates_registry_when_details_change() {
     };
     assert_eq!(
         details.interface, "wg0",
-        "registry must refresh interface when scanner updates legacy details on an existing Connected entry"
+        "scanner refresh must NOT overwrite the authoritative iface set by Tunnel::up — preserves the contract that prevents bugs #3 / #12"
     );
+    // Metadata fields DID update though — that's the legitimate
+    // metadata-only refresh path.
+    assert_eq!(details.endpoint, "1.2.3.4:51820");
 }
 
 #[test]
@@ -3196,25 +3204,25 @@ fn disconnect_result_success_removes_from_registry() {
     );
 }
 
-/// Race regression: the scanner can adopt the tunnel as `Connected` in
-/// the registry before the connect-worker thread's `ConnectResult` lands
-/// on the main thread (scanner ticks every ~1s; `poll_log_until_ready`
-/// takes ~1s). Before the fix, `handle_connect_result` saw
-/// `Connected{this profile}` and treated the arrival as stale — silently
-/// skipping the `last_connected_profile`, `STATUS: Connected` log line,
-/// and kill-switch sync. Now `Connected{this profile}` is treated as a
-/// legitimate "the success arrived; just record the bookkeeping" path,
-/// not a stale message.
+/// Connecting → Connected race-arrival regression (post-U4 shape).
+///
+/// Under U4 the scanner cannot promote Connecting → Connected, so the
+/// pre-U4 race (scanner adopts as Connected before `ConnectResult`
+/// arrives) is structurally impossible. The race that DOES still
+/// matter is the inverse: kernel session visible to the scanner
+/// while the protocol-layer connect is in flight — the registry must
+/// stay Connecting and the eventual `ConnectResult` must promote
+/// cleanly through `mirror_connect_into_registry`.
 #[test]
-fn connect_result_success_accepted_when_scanner_already_promoted_to_connected() {
+fn connect_result_success_arrives_after_scanner_observes_kernel_session() {
     use crate::vortix_core::profile::ProfileId;
 
     let mut app = test_app();
     add_profiles(&mut app, &["race-test"]);
 
-    // Simulate the race: connect-worker thread spawned, scanner sees
-    // the openvpn process and adopts the tunnel as Connected BEFORE
-    // the ConnectResult arrives.
+    // Connect kicks off; scanner sees the openvpn process and reports
+    // a matching ActiveSession while the protocol layer's success
+    // hasn't yet arrived.
     set_connecting(&mut app, "race-test");
     app.handle_message(Message::SyncSystemState {
         sessions: vec![fake_session("race-test")],
@@ -3223,38 +3231,35 @@ fn connect_result_success_accepted_when_scanner_already_promoted_to_connected() 
     assert!(
         matches!(
             app.legacy_state(),
-            ConnectionState::Connected { ref profile, .. } if profile == "race-test"
+            ConnectionState::Connecting { ref profile, .. } if profile == "race-test"
         ),
-        "scanner must promote Connecting -> Connected before the ConnectResult lands"
+        "registry must stay Connecting — scanner can't drive promotion under U4"
     );
 
-    // Now the connect-worker's ConnectResult arrives, late. Pre-fix
-    // this would be dropped as STALE because legacy_state is no longer
-    // Connecting. Post-fix it proceeds with success bookkeeping.
+    // Now the connect-worker's ConnectResult arrives — the authoritative
+    // success path. mirror_connect_into_registry runs the transition.
     app.handle_message(Message::ConnectResult {
         profile: "race-test".to_string(),
         success: true,
         error: None,
     });
 
-    // Bookkeeping that the stale-drop used to skip:
+    // Bookkeeping that the success handler is responsible for:
     assert_eq!(
         app.runtime.last_connected_profile.as_deref(),
         Some("race-test"),
-        "last_connected_profile must be set even when scanner beat the ConnectResult"
+        "last_connected_profile must be set by the success handler"
     );
-    // Registry still has the tunnel as Connected (no regression on the
-    // scanner-adopted entry).
     let snap = app
         .registry
         .snapshot(&ProfileId::new("race-test"))
-        .expect("registry must keep the scanner-adopted tunnel");
+        .expect("registry must contain the now-Connected tunnel");
     assert!(
         matches!(
             snap.state,
             crate::vortix_core::engine::state::Connection::Connected { .. }
         ),
-        "Connected state must survive the success-arrival handler"
+        "Connected state lands via the authoritative ConnectResult path"
     );
 }
 
@@ -3304,4 +3309,47 @@ fn get_config_max_scroll_reads_from_cache() {
     // Calling again must be cheap — same value, no observable side effects
     // (caching invariant; can't directly time but assert idempotency).
     assert_eq!(app.get_config_max_scroll(), max);
+}
+
+#[test]
+fn refresh_registry_preserves_authoritative_iface_across_scanner_ticks() {
+    // Regression for the multi-openvpn "primary jumps to the second
+    // (split) tunnel after Shift+B" bug. The macOS scanner's
+    // ifconfig-scan fallback can't distinguish per-PID iface and
+    // resolves both openvpn processes to the same utun token. If
+    // `refresh_registry_from_session` clobbers the authoritative iface
+    // recorded by `Tunnel::up()`, recompute_primary's HashMap iteration
+    // order picks an arbitrary tunnel and the asterisk/header drift to
+    // whichever tunnel happens to iterate first.
+    use crate::vortix_core::engine::state::Connection;
+    use crate::vortix_core::profile::ProfileId;
+
+    let mut app = App::new_test();
+    add_profiles(&mut app, &["ovpn-cert"]);
+
+    // Simulate Tunnel::up() landing the authoritative iface "utun8".
+    let details = DetailedConnectionInfo {
+        interface: "utun8".to_string(),
+        pid: Some(7155),
+        ..Default::default()
+    };
+    app.mirror_connect_into_registry("ovpn-cert", &details, Instant::now());
+
+    // Scanner tick reports the same profile but with a wrong iface
+    // (e.g. "utun3" — what Method B picks when another openvpn lower
+    // in the utun list owns its own inet). The preservation guard
+    // must NOT overwrite "utun8" with "utun3".
+    let mut session = fake_session("ovpn-cert");
+    session.interface = "utun3".to_string();
+    app.refresh_registry_from_session("ovpn-cert", &session);
+
+    let snap = app.registry.snapshot(&ProfileId::new("ovpn-cert")).expect("registry entry");
+    let iface = match snap.state {
+        Connection::Connected { details, .. } => details.interface.clone(),
+        other => panic!("expected Connected, got {other:?}"),
+    };
+    assert_eq!(
+        iface, "utun8",
+        "scanner must NOT overwrite authoritative iface set by Tunnel::up()"
+    );
 }

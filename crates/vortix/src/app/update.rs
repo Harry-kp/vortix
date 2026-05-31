@@ -882,9 +882,27 @@ impl App {
                         self.scanner_force_disconnect(&profile_name);
                     }
                 }
-                (Connection::Connecting { started_at, .. }, Some(session)) => {
-                    self.scanner_promote_to_connected(&profile_name, session);
-                    let _ = started_at; // elapsed not needed on success path
+                (Connection::Connecting { started_at, .. }, Some(_session)) => {
+                    // U4 contract: scanner cannot promote Connecting →
+                    // Connected. Only the protocol layer's `Tunnel::up()`
+                    // success result (delivered via
+                    // `Message::ConnectResult` → `mirror_connect_into_registry`)
+                    // can complete the transition. The scanner observing
+                    // a matching kernel session is informational only —
+                    // the connect is proceeding; the protocol layer
+                    // will report the authoritative iface shortly. The
+                    // existing `handle_connection_timeout` safety net
+                    // catches the genuinely-stuck case.
+                    let elapsed = SystemTime::now()
+                        .duration_since(*started_at)
+                        .unwrap_or_default()
+                        .as_secs();
+                    if elapsed > 0 && elapsed % constants::SCANNER_LOG_INTERVAL_SECS == 0 {
+                        self.log(&format!(
+                            "NET: Scanner: kernel tunnel visible for '{profile_name}' \
+                             ({elapsed}s elapsed) — awaiting protocol-layer success"
+                        ));
+                    }
                 }
                 (Connection::Connecting { started_at, .. }, None) => {
                     let elapsed = SystemTime::now()
@@ -971,50 +989,14 @@ impl App {
         self.sync_killswitch();
     }
 
-    /// Scanner helper (P5b U-P5b-2): promote a `Connecting` profile to
-    /// `Connected` once the kernel interface appears. Mirrors the
-    /// legacy `Connecting` → `Connected` branch including kill-switch
-    /// arm, `last_used` update, and metadata save.
-    fn scanner_promote_to_connected(&mut self, profile_name: &str, session: &ActiveSession) {
-        let start_time = session
-            .started_at
-            .and_then(|real| {
-                std::time::SystemTime::now()
-                    .duration_since(real)
-                    .ok()
-                    .and_then(|d| Instant::now().checked_sub(d))
-            })
-            .unwrap_or_else(Instant::now);
-
-        // Track session_start for telemetry uptime when this profile
-        // is what the App considers primary (registry's primary, or
-        // any in-flight tunnel when none is primary yet).
-        if self.legacy_matches(profile_name) || self.legacy_is_disconnected() {
-            self.runtime.session_start = Some(start_time);
-        }
-        // Push to registry directly from session details (single
-        // source of truth post-P5d).
-        self.refresh_registry_from_session(profile_name, session);
-
-        self.log(&format!(
-            "STATUS: Connection established to '{profile_name}'"
-        ));
-
-        if self.runtime.killswitch_mode != crate::state::KillSwitchMode::Off {
-            self.sync_killswitch();
-            self.log("SEC: Kill switch armed");
-        }
-
-        if let Some(profile) = self
-            .runtime
-            .profiles
-            .iter_mut()
-            .find(|p| p.name == profile_name)
-        {
-            profile.last_used = Some(std::time::SystemTime::now());
-        }
-        self.save_metadata();
-    }
+    // Removed in U4: `scanner_promote_to_connected`. The scanner can no
+    // longer drive the Connecting → Connected transition. Only the
+    // protocol layer's `Tunnel::up()` success result (via
+    // `Message::ConnectResult` → `mirror_connect_into_registry`) can.
+    // The (Connecting, Some(session)) arm in `handle_sync_system_state`
+    // now just logs the kernel-visible-but-not-yet-tracked state at
+    // SCANNER_LOG_INTERVAL_SECS cadence; the connect-timeout safety
+    // net in `handle_connection_timeout` catches genuinely-stuck cases.
 
     /// Scanner helper (P5b U-P5b-2): refresh kernel-reported details
     /// on an existing Connected entry. Resyncs session-start drift
@@ -1174,7 +1156,13 @@ impl App {
                 "INFO: Adopting externally-started tunnel '{profile_name}' as a secondary"
             ));
         }
-        self.refresh_registry_from_session(&profile_name, session);
+        // U4: adoption goes through the dedicated entry-creation path,
+        // NOT refresh_registry_from_session (which is metadata-only on
+        // existing Connected entries). The new entry's
+        // interface_authoritative flag is read from
+        // session.interface_authoritative (U5 wires the per-platform
+        // decision into the scanner; default is true).
+        self.adopt_registry_from_session(&profile_name, session);
     }
 
     /// Whether the derived single-tunnel view refers to the given

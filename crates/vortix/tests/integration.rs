@@ -86,6 +86,7 @@ fn fake_session(name: &str) -> ActiveSession {
     ActiveSession {
         name: name.to_string(),
         interface: "wg0".to_string(),
+        interface_authoritative: true,
         endpoint: "1.2.3.4:51820".to_string(),
         internal_ip: "10.0.0.2".to_string(),
         mtu: "1420".to_string(),
@@ -150,7 +151,14 @@ mod connection_state_machine {
     }
 
     #[test]
-    fn connecting_to_connected_via_scanner() {
+    fn scanner_does_not_promote_connecting_to_connected() {
+        // U4 contract: scanner cannot drive Connecting → Connected.
+        // Only the protocol layer's `Tunnel::up()` success result
+        // (delivered via `Message::ConnectResult`) can promote.
+        //
+        // Pre-U4 this test asserted the opposite (and was named
+        // `connecting_to_connected_via_scanner`). The dual write was
+        // the source of bugs #3 and #12 in the multi-OpenVPN scenarios.
         let mut app = test_app();
         add_wg_profiles(&mut app, &["vpn-a"]);
         set_connecting(&mut app, "vpn-a");
@@ -159,10 +167,10 @@ mod connection_state_machine {
             sessions: vec![fake_session("vpn-a")],
             default_route_interface: None,
         });
-        assert!(matches!(
-            app.legacy_state(),
-            ConnectionState::Connected { .. }
-        ));
+        assert!(
+            matches!(app.legacy_state(), ConnectionState::Connecting { .. }),
+            "scanner-visible session for a Connecting tunnel must NOT promote — only ConnectResult can"
+        );
     }
 
     #[test]

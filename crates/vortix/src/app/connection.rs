@@ -495,7 +495,22 @@ impl App {
     /// existing entry's state). When the profile isn't in the catalog
     /// or the registry has no prior entry, behaves the same as a fresh
     /// insertion via `set_connected`.
-    pub fn refresh_registry_from_session(
+    /// Register a brand-new Connected entry from a scanner-detected
+    /// session for a tunnel started outside vortix. This is the
+    /// adoption-side counterpart to `mirror_connect_into_registry`
+    /// (which handles vortix-started tunnels).
+    ///
+    /// U4 contract: this is the ONLY path other than
+    /// `mirror_connect_into_registry` that creates a Connected entry.
+    /// `refresh_registry_from_session` is strictly metadata-only on
+    /// existing Connected entries and will early-return when the entry
+    /// doesn't exist.
+    ///
+    /// The `interface_authoritative` flag is read from
+    /// `session.interface_authoritative` (set by the scanner's
+    /// platform-specific iface-detection method — see U5). Unauthoritative
+    /// adoptions are excluded from primary-election candidacy per R4.
+    pub fn adopt_registry_from_session(
         &mut self,
         profile_name: &str,
         session: &crate::core::scanner::ActiveSession,
@@ -511,44 +526,9 @@ impl App {
         };
         let profile_id = ProfileId::new(&profile.name);
         let allowed_ips = extract_allowed_ips(profile.protocol, &profile.config_path);
-        // Preserve the existing entry's interface name when set. Once
-        // `Tunnel::up()` (or a prior scanner adopt) populated it from
-        // an authoritative source — log scrape for OpenVPN, wg-quick
-        // for WireGuard — the iface name is stable for the tunnel's
-        // lifetime. The macOS scanner's ifconfig-scan fallback picks
-        // the FIRST utun with an `inet` line that isn't WG, which
-        // collides between two openvpn PIDs (both resolve to the
-        // lowest-numbered utun), so overwriting from session.interface
-        // would silently corrupt the registry's primary-election in
-        // any multi-openvpn topology.
-        let preserved_iface = self
-            .registry
-            .snapshot(&profile_id)
-            .and_then(|snap| {
-                let iface = snap.interface_name.unwrap_or_default();
-                if iface.is_empty() { None } else { Some(iface) }
-            })
-            .unwrap_or_else(|| session.interface.clone());
-        // Preserve the existing entry's authoritative flag. Scanner
-        // refresh must not flip the bit — only `Tunnel::up()`-driven
-        // writes (via `mirror_connect_into_registry`) or
-        // adoption-time decisions (via U5's scanner_adopt path) set
-        // it. For pre-U4 callers that lack a prior snapshot,
-        // default to true — refresh today only fires on existing
-        // Connected entries that themselves came from an
-        // authoritative source.
-        let preserved_authoritative = self
-            .registry
-            .snapshot(&profile_id)
-            .and_then(|snap| match snap.state {
-                crate::vortix_core::engine::state::Connection::Connected { details, .. } => {
-                    Some(details.interface_authoritative)
-                }
-                _ => None,
-            })
-            .unwrap_or(true);
         let core_details = crate::vortix_core::engine::state::DetailedConnectionInfo {
-            interface: preserved_iface,
+            interface: session.interface.clone(),
+            interface_authoritative: session.interface_authoritative,
             internal_ip: session.internal_ip.clone(),
             endpoint: session.endpoint.clone(),
             mtu: session.mtu.clone(),
@@ -558,10 +538,7 @@ impl App {
             transfer_tx: session.transfer_tx.clone(),
             latest_handshake: session.latest_handshake.clone(),
             pid: session.pid,
-            interface_authoritative: preserved_authoritative,
         };
-        // Anchor since on the session's real start when available;
-        // otherwise treat the tunnel as newly seen.
         let since = session
             .started_at
             .unwrap_or_else(std::time::SystemTime::now);
@@ -569,6 +546,74 @@ impl App {
             profile_id,
             allowed_ips,
             core_details,
+            since,
+            placeholder_engine_for_profile(&profile),
+        );
+    }
+
+    pub fn refresh_registry_from_session(
+        &mut self,
+        profile_name: &str,
+        session: &crate::core::scanner::ActiveSession,
+    ) {
+        // U4 contract: this function is metadata-only on existing
+        // Connected entries. The interface name and
+        // interface_authoritative flag are written exactly once — at
+        // connect-success by `mirror_connect_into_registry` (Tunnel::up
+        // path) or at adoption time by `scanner_adopt_session` — and
+        // are NEVER overwritten by a scanner refresh. The scanner's
+        // per-PID iface detection is unreliable enough on macOS
+        // multi-OpenVPN that allowing it to win would silently corrupt
+        // primary-election and per-tunnel killswitch ACCEPT rules.
+        //
+        // Therefore: if the entry doesn't exist OR isn't Connected,
+        // early-return. The scanner can't drive state transitions;
+        // that's the protocol layer's responsibility (or
+        // scanner_adopt_session for genuinely-external tunnels).
+        let Some(profile) = self
+            .runtime
+            .profiles
+            .iter()
+            .find(|p| p.name == profile_name)
+            .cloned()
+        else {
+            return;
+        };
+        let profile_id = ProfileId::new(&profile.name);
+
+        let Some(snap) = self.registry.snapshot(&profile_id) else {
+            return;
+        };
+        let crate::vortix_core::engine::state::Connection::Connected {
+            details: existing_details,
+            since,
+            ..
+        } = snap.state
+        else {
+            return;
+        };
+
+        let allowed_ips = extract_allowed_ips(profile.protocol, &profile.config_path);
+        // Interface and authoritativity carry over from the existing
+        // entry verbatim — scanner never touches them. Mutable
+        // metadata fields take the scanner's fresh observation.
+        let refreshed_details = crate::vortix_core::engine::state::DetailedConnectionInfo {
+            interface: existing_details.interface.clone(),
+            interface_authoritative: existing_details.interface_authoritative,
+            internal_ip: session.internal_ip.clone(),
+            endpoint: session.endpoint.clone(),
+            mtu: session.mtu.clone(),
+            public_key: session.public_key.clone(),
+            listen_port: session.listen_port.clone(),
+            transfer_rx: session.transfer_rx.clone(),
+            transfer_tx: session.transfer_tx.clone(),
+            latest_handshake: session.latest_handshake.clone(),
+            pid: session.pid,
+        };
+        self.registry.set_connected(
+            profile_id,
+            allowed_ips,
+            refreshed_details,
             since,
             placeholder_engine_for_profile(&profile),
         );

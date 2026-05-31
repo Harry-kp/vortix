@@ -19,7 +19,7 @@ fn cmd_output(program: &str, args: &[&str]) -> Option<std::process::Output> {
 }
 
 /// Information about an active VPN session detected on the system.
-#[derive(Clone, Default, Debug)]
+#[derive(Clone, Debug)]
 pub struct ActiveSession {
     /// Profile name associated with this session.
     pub name: String,
@@ -29,6 +29,22 @@ pub struct ActiveSession {
     pub started_at: Option<SystemTime>,
     /// System interface name (e.g., utun3, wg0, tun0).
     pub interface: String,
+    /// Whether `interface` came from a reliable per-tunnel source.
+    ///
+    /// `true` when the platform's per-PID iface detection is reliable
+    /// (Linux `/proc/PID/fd/*`, macOS `/var/run/wireguard/<name>.name`
+    /// for WG). `false` only when the scanner fell back to the macOS
+    /// ifconfig-scan heuristic (`check_openvpn_by_pid` Method B), which
+    /// collides across multiple `OpenVPN` PIDs and so cannot
+    /// truthfully identify which utun belongs to which process.
+    /// Consumed by `App::adopt_registry_from_session` (U5) to set the
+    /// new entry's `details.interface_authoritative` flag, which in
+    /// turn excludes unauthoritative adoptions from primary-election.
+    ///
+    /// Defaults to `true` — most platforms / protocols / paths are
+    /// reliable. The macOS `OpenVPN` Method-B fallback is the narrow
+    /// exception that opts out (U5 wires this).
+    pub interface_authoritative: bool,
     /// Internal VPN IP address assigned to this interface.
     pub internal_ip: String,
     /// Remote server endpoint address.
@@ -45,6 +61,26 @@ pub struct ActiveSession {
     pub transfer_tx: String,
     /// Time since last successful handshake.
     pub latest_handshake: String,
+}
+
+impl Default for ActiveSession {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            pid: None,
+            started_at: None,
+            interface: String::new(),
+            interface_authoritative: true,
+            internal_ip: String::new(),
+            endpoint: String::new(),
+            mtu: String::new(),
+            public_key: String::new(),
+            listen_port: String::new(),
+            transfer_rx: String::new(),
+            transfer_tx: String::new(),
+            latest_handshake: String::new(),
+        }
+    }
 }
 
 /// Combined result of a scanner sweep: active VPN sessions plus the
