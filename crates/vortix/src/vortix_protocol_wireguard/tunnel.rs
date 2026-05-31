@@ -9,7 +9,7 @@ use crate::vortix_core::ports::tunnel::{
 };
 use crate::vortix_core::profile::Profile;
 use crate::vortix_process::{CommandSpec, PrivilegeReq};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::vortix_protocol_wireguard::parser::parse_wg_conf;
 
@@ -189,6 +189,48 @@ impl ProtocolStatus for WgStatus {
     }
 }
 
+/// Decide the kernel-visible interface name for a `WireGuard` tunnel
+/// based on the config basename and the platform port's
+/// `resolve_wireguard_interface` result.
+///
+/// Platform behaviour:
+/// - **Linux / BSD**: `wg-quick` names the kernel interface after the
+///   config basename (the file passed to `wg-quick up`). The platform
+///   port's `resolve_wireguard_interface` returns `None`, and the
+///   basename is the correct value to store.
+/// - **macOS**: `wg-quick` creates a `utunN` kernel device via
+///   wireguard-go and writes the config-basename → `utunN` mapping to
+///   `/var/run/wireguard/<basename>.name`. The platform port returns
+///   `Some("utun7")` (or similar). The registry needs `utun7` stored
+///   to match `route -n get`'s output.
+///
+/// Falling back to the basename when the port returns `None` is the
+/// correct behaviour on Linux. On macOS, reaching the fallback path
+/// post-`wg-quick up` indicates the `.name` file is missing — an
+/// anomalous wg-quick install / permission state worth logging.
+///
+/// `profile_id` is plumbed through purely so the macOS-side warning
+/// can attribute the anomaly to a profile.
+fn resolve_kernel_iface(
+    basename: &str,
+    port_result: Option<String>,
+    profile_id: &crate::vortix_core::profile::ProfileId,
+) -> String {
+    if let Some(iface) = port_result {
+        return iface;
+    }
+    #[cfg(target_os = "macos")] // xtask:allow-platform-cfg: warn-only diagnostic for an anomalous wg-quick state on macOS
+    warn!(
+        target: "vortix::tunnel::wireguard",
+        profile = %profile_id,
+        basename = %basename,
+        "wg.up: resolve_wireguard_interface returned None on macOS; falling back to basename. \
+         Expected /var/run/wireguard/<basename>.name to exist post-`wg-quick up` — check wg-quick install / permissions."
+    );
+    let _ = profile_id;
+    basename.to_string()
+}
+
 fn interface_from_path(path: &std::path::Path) -> String {
     path.file_stem()
         .and_then(|s| s.to_str())
@@ -253,9 +295,18 @@ impl Tunnel for WgTunnel {
         // the temp file's basename (preserved by design).
         self.temp_config_path = temp_path;
 
+        let basename = interface_from_path(&effective_path);
+        let interface_name = resolve_kernel_iface(
+            &basename,
+            crate::platform::current_platform()
+                .interface
+                .resolve_wireguard_interface(&basename),
+            &profile.id,
+        );
+
         Ok(TunnelHandle {
             profile_id: profile.id.clone(),
-            interface_name: interface_from_path(&effective_path),
+            interface_name,
             pid: None,
             started_at: SystemTime::now(),
             kind: TunnelKindTag::WireGuard,
@@ -360,6 +411,40 @@ mod tests {
     fn interface_from_path_uses_stem() {
         let p = std::path::PathBuf::from("/etc/wireguard/corp.conf");
         assert_eq!(interface_from_path(&p), "corp");
+    }
+
+    // --- U2: resolve_kernel_iface contract ---
+
+    #[test]
+    fn resolve_kernel_iface_uses_port_result_when_present() {
+        // macOS-shape: platform port returns the underlying utun device.
+        // This is the value the registry must store to match `route get`'s
+        // output byte-for-byte.
+        let profile_id = crate::vortix_core::profile::ProfileId::new("corp");
+        let resolved = resolve_kernel_iface("corp", Some("utun7".to_string()), &profile_id);
+        assert_eq!(resolved, "utun7");
+    }
+
+    #[test]
+    fn resolve_kernel_iface_falls_back_to_basename_when_port_returns_none() {
+        // Linux-shape: platform port returns None because the kernel
+        // device name IS the config basename. The fallback is the
+        // correct value to store.
+        let profile_id = crate::vortix_core::profile::ProfileId::new("corp");
+        let resolved = resolve_kernel_iface("corp", None, &profile_id);
+        assert_eq!(resolved, "corp");
+    }
+
+    #[test]
+    fn resolve_kernel_iface_preserves_port_result_even_when_equal_to_basename() {
+        // Edge: Mock variant returns `Some(name)` for `wg_present=true`
+        // (the legacy default before U2 added the override). This MUST
+        // be preserved verbatim — the helper has no business stripping
+        // the port's answer just because it happens to equal the
+        // basename.
+        let profile_id = crate::vortix_core::profile::ProfileId::new("corp");
+        let resolved = resolve_kernel_iface("corp", Some("corp".to_string()), &profile_id);
+        assert_eq!(resolved, "corp");
     }
 
     // --- U13: DNS scoping for secondaries ---

@@ -130,6 +130,13 @@ pub struct MockDns {
 pub struct MockInterface {
     /// If true, `check_wireguard_interface` always returns true.
     pub wg_present: bool,
+    /// Override the value returned by `resolve_wireguard_interface`.
+    /// `Some("utun7")` simulates the macOS case where wg-quick maps
+    /// the config-basename to a kernel utun device that differs from
+    /// the basename. Falls back to `Some(name)` when `wg_present` is
+    /// true and this is `None` (the historical default), or `None`
+    /// otherwise.
+    pub wg_kernel_iface: Option<String>,
 }
 
 /// Scriptable mock for the `NetworkStats` port.
@@ -281,7 +288,9 @@ impl InterfaceKind {
             #[cfg(target_os = "windows")]
             Self::Windows => platform_impl::WindowsInterface::resolve_wireguard_interface(name),
             Self::Mock(m) => {
-                if m.wg_present {
+                if let Some(iface) = m.wg_kernel_iface.clone() {
+                    Some(iface)
+                } else if m.wg_present {
                     Some(name.to_string())
                 } else {
                     None
