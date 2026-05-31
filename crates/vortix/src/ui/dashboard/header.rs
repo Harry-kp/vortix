@@ -40,18 +40,26 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     let ks_indicator = get_killswitch_indicator(app);
 
     // ── 0-active branch: no tunnels in the registry → real IP exposed.
+    // Show the explicit `○ DISCONNECTED` title here — the user's
+    // mental model is "no VPN at all" and the title makes that
+    // unambiguous. The no-primary-but-tunnels-up branch below still
+    // uses the `⚠ Real:` form because saying DISCONNECTED there
+    // would be a lie (tunnels ARE up, just split-route only).
     if tunnel_count == 0 {
-        let line = render_real_ip_line(app, ks_indicator.clone());
+        let line = render_disconnected_line(app, ks_indicator.clone());
         frame.render_widget(Paragraph::new(line), area);
         return;
     }
 
-    // ── ≥1-active branch with no elected primary: still surface real IP +
-    // tunnels strip so the user can see what's connected even without a
-    // default-route owner.
+    // ── ≥1-active branch with no elected primary: tunnels are up but
+    // the kernel default route isn't theirs (split-only topology, or
+    // an externally-adopted unauthoritative tunnel). Surface the
+    // explicit `○ NO EXIT` title — different from DISCONNECTED
+    // (tunnels ARE up) and from CONNECTED (no exit owner). Tunnels
+    // strip still appends so the user sees what's connected.
     let Some(primary_snap) = primary_snap else {
         let snapshots = app.registry.snapshot_all();
-        let mut line = render_real_ip_line(app, ks_indicator.clone());
+        let mut line = render_no_exit_line(app, ks_indicator.clone());
         line = append_tunnels_strip(line, &snapshots, primary.as_ref(), area.width);
         frame.render_widget(Paragraph::new(line), area);
         return;
@@ -69,18 +77,48 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(line), area);
 }
 
-/// Build the `⚠ Real: <public_ip>` warning header used when the user has no
-/// active tunnels (or no primary). The killswitch indicator is appended so
-/// users can tell at a glance whether they're protected by `KS:VPN-only`
-/// even without a tunnel.
-fn render_real_ip_line(app: &App, ks_indicator: Span<'static>) -> Line<'static> {
+/// Build the `○ NO EXIT │ Real: <public_ip>` header used when ≥1
+/// tunnel is in the registry but the kernel default route isn't
+/// theirs (split-only topology, or an externally-adopted
+/// unauthoritative tunnel). Distinguishes from
+/// [`render_disconnected_line`] (genuine no-VPN) and from the
+/// CONNECTED primary line. Vocabulary matches Security Guard's
+/// "split-route — no exit" copy.
+fn render_no_exit_line(app: &App, ks_indicator: Span<'static>) -> Line<'static> {
     Line::from(vec![
         Span::styled(
-            "\u{26a0} Real: ",
+            "\u{25cb} NO EXIT",
             Style::default()
                 .fg(theme::WARNING)
                 .add_modifier(Modifier::BOLD),
         ),
+        Span::styled(" │ ", Style::default().fg(theme::NORD_POLAR_NIGHT_4)),
+        Span::styled("Real: ", Style::default().fg(theme::TEXT_SECONDARY)),
+        Span::styled(
+            app.runtime.public_ip.clone(),
+            Style::default().fg(theme::TEXT_PRIMARY),
+        ),
+        Span::styled(" │", Style::default().fg(theme::NORD_POLAR_NIGHT_4)),
+        ks_indicator,
+    ])
+}
+
+/// Build the `○ DISCONNECTED │ Real: <public_ip>` header used when the
+/// registry holds zero tunnels — a genuine no-VPN state. The explicit
+/// title was removed by the U16 redesign in favour of the `⚠ Real:`
+/// form alone; that conflated "no exit selected" with "no VPN at all"
+/// from the user's perspective, so the title is back. The killswitch
+/// indicator still appends.
+fn render_disconnected_line(app: &App, ks_indicator: Span<'static>) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            "\u{25cb} DISCONNECTED",
+            Style::default()
+                .fg(theme::ERROR)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" │ ", Style::default().fg(theme::NORD_POLAR_NIGHT_4)),
+        Span::styled("Real: ", Style::default().fg(theme::TEXT_SECONDARY)),
         Span::styled(
             app.runtime.public_ip.clone(),
             Style::default().fg(theme::TEXT_PRIMARY),
@@ -105,8 +143,10 @@ fn render_primary_line(
         Connection::Disconnected { .. } => {
             // count >= 1 with a primary snapshot but state==Disconnected
             // is a transient window (registry entry survives a brief
-            // disconnect for journal purposes). Use the warning form.
-            render_real_ip_line(app, ks_indicator)
+            // disconnect for journal purposes). Use the NO EXIT title —
+            // the registry has tunnels but the primary slot isn't
+            // serving as exit right now.
+            render_no_exit_line(app, ks_indicator)
         }
         Connection::Connecting { started_at, .. }
         | Connection::Disconnecting { started_at, .. }
@@ -637,21 +677,84 @@ mod tests {
     // ─────────── State 0: no tunnels → ⚠ Real ───────────
 
     #[test]
-    fn empty_registry_renders_real_ip_warning() {
+    fn empty_registry_renders_disconnected_title_and_real_ip() {
+        // 0-tunnel state surfaces the explicit `○ DISCONNECTED` title
+        // alongside the Real: IP. The title was removed by the U16
+        // header redesign and restored after user feedback — the
+        // warning glyph alone wasn't legible enough for the
+        // "no VPN at all" state.
         let mut app = App::new_test();
         app.runtime.public_ip = "203.0.113.7".to_string();
         let out = render_to_string(&app, 100, 1);
-        assert!(out.contains('\u{26a0}'), "expected ⚠ glyph, got:\n{out}");
+        assert!(
+            out.contains("DISCONNECTED"),
+            "expected DISCONNECTED title, got:\n{out}"
+        );
+        assert!(
+            out.contains('\u{25cb}'),
+            "expected ○ glyph next to DISCONNECTED, got:\n{out}"
+        );
         assert!(out.contains("Real:"), "expected 'Real:' label, got:\n{out}");
         assert!(
             out.contains("203.0.113.7"),
             "expected public IP, got:\n{out}"
+        );
+        // The ⚠ warning glyph belongs to the no-primary-but-tunnels-up
+        // branch; in the genuine 0-tunnel state we use ○ DISCONNECTED.
+        assert!(
+            !out.contains('\u{26a0}'),
+            "0-tunnel branch must not show the ⚠ glyph (that's the no-primary branch's signal):\n{out}"
         );
         // No tunnels strip when count == 0.
         assert!(
             !out.contains("Tunnels:"),
             "no strip expected with 0 tunnels, got:\n{out}"
         );
+    }
+
+    #[test]
+    fn no_exit_line_renders_title_and_real_ip() {
+        // The no-primary-but-tunnels-up branch surfaces a `○ NO EXIT`
+        // title that's distinct from both `○ DISCONNECTED` (genuine
+        // no-VPN) and the `● CONNECTED (name)` primary line. Vocabulary
+        // matches Security Guard's "split-route — no exit" copy.
+        use ratatui::style::Modifier;
+        let mut app = App::new_test();
+        app.runtime.public_ip = "198.51.100.42".to_string();
+        let ks = Span::raw(" KS:Off");
+
+        let line = render_no_exit_line(&app, ks);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("NO EXIT"), "expected NO EXIT title:\n{text}");
+        assert!(
+            text.contains('\u{25cb}'),
+            "expected ○ glyph next to NO EXIT (matches DISCONNECTED's glyph for visual consistency):\n{text}"
+        );
+        assert!(text.contains("Real:"), "expected 'Real:' label:\n{text}");
+        assert!(text.contains("198.51.100.42"), "expected public IP:\n{text}");
+
+        // The NO EXIT title uses WARNING styling, not ERROR — the
+        // situation is suboptimal but tunnels ARE up, unlike the
+        // genuine no-VPN state.
+        let title_span = &line.spans[0];
+        assert_eq!(title_span.style.fg, Some(theme::WARNING));
+        assert!(title_span.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn disconnected_and_no_exit_titles_use_different_colors() {
+        // Visual distinction: DISCONNECTED (no VPN at all) is ERROR red;
+        // NO EXIT (tunnels up, none owning default) is WARNING yellow.
+        // Same `○` glyph keeps the family resemblance ("not protected")
+        // but the color delta lets users distinguish at a glance.
+        let app = App::new_test();
+        let ks = Span::raw(" KS:Off");
+
+        let disc = render_disconnected_line(&app, ks.clone());
+        let no_exit = render_no_exit_line(&app, ks);
+
+        assert_eq!(disc.spans[0].style.fg, Some(theme::ERROR));
+        assert_eq!(no_exit.spans[0].style.fg, Some(theme::WARNING));
     }
 
     #[test]
