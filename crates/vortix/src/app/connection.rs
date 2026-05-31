@@ -260,11 +260,19 @@ impl App {
             );
 
             match tunnel.up(&profile) {
-                Ok(_handle) => {
+                Ok(handle) => {
+                    // Carry the authoritative iface + PID back to the
+                    // main thread. Pre-U4 these were re-detected by the
+                    // scanner; post-U4 the scanner is metadata-only,
+                    // so this message IS the only seed path into the
+                    // registry's `details.interface` field. R1 of the
+                    // state-authority contract.
                     let _ = cmd_tx.send(Message::ConnectResult {
                         profile: name,
                         success: true,
                         error: None,
+                        interface: Some(handle.interface_name),
+                        pid: handle.pid,
                     });
                 }
                 Err(err) => {
@@ -272,6 +280,8 @@ impl App {
                         profile: name,
                         success: false,
                         error: Some(format!("{protocol}: {err}")),
+                        interface: None,
+                        pid: None,
                     });
                 }
             }

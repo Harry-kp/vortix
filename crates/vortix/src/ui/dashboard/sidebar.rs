@@ -105,7 +105,6 @@ fn status_badge_for(snapshot: &TunnelSnapshot) -> Option<(&'static str, Style)> 
     }
 }
 
-
 /// Does this snapshot warrant a `!` risk annotation in the sidebar?
 ///
 /// Today: `Role::AddressableSuppressed` — declared 0/0 `AllowedIPs` but did not
@@ -545,7 +544,12 @@ mod tests {
         // ifconfig-scan fallback collides across PIDs), the row's
         // status badge must visually distinguish from a fully-tracked
         // Connected tunnel.
-        let mut snap = snap_connected("vpn1", Role::Addressable { allowed_ips: vec![] });
+        let mut snap = snap_connected(
+            "vpn1",
+            Role::Addressable {
+                allowed_ips: vec![],
+            },
+        );
         if let Connection::Connected {
             ref mut details, ..
         } = snap.state
@@ -573,7 +577,12 @@ mod tests {
         // Inverse check: a normal Connected tunnel (interface_authoritative
         // defaults to true) keeps the bright SUCCESS color and no DIM
         // modifier.
-        let snap = snap_connected("vpn1", Role::Primary { allowed_ips: vec![] });
+        let snap = snap_connected(
+            "vpn1",
+            Role::Primary {
+                allowed_ips: vec![],
+            },
+        );
         let (glyph, style) = status_badge_for(&snap).expect("connected → badge");
         assert_eq!(glyph, "●");
         assert!(!style.add_modifier.contains(Modifier::DIM));

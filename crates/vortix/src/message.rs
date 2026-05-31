@@ -177,6 +177,19 @@ pub enum Message {
         success: bool,
         /// Error message if the command failed
         error: Option<String>,
+        /// Kernel-visible interface name as returned by the protocol
+        /// layer's `Tunnel::up()` (`OpenVPN` log scrape, wg-quick output
+        /// resolved via platform port). `Some(_)` on success;
+        /// `None` on failure or when the protocol-layer result didn't
+        /// carry one. This field is the only path from the connect-
+        /// worker thread back to `mirror_connect_into_registry`, so it
+        /// IS the authoritative iface seed for the new registry entry.
+        /// See R1 of docs/brainstorms/2026-06-01-multi-tunnel-state-
+        /// authority-requirements.md.
+        interface: Option<String>,
+        /// Kernel PID from the protocol layer's `Tunnel::up()` result.
+        /// Same flow rationale as `interface`.
+        pid: Option<u32>,
     },
     /// Result from the background disconnect thread
     DisconnectResult {

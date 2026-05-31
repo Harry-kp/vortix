@@ -477,6 +477,8 @@ fn mirror_failed_makes_registry_hold_disconnected_with_failure() {
         profile: "vpn-a".to_string(),
         success: false,
         error: Some("handshake timeout".to_string()),
+        interface: None,
+        pid: None,
     });
 
     let snap = app
@@ -787,6 +789,8 @@ fn test_connect_result_success_transitions_to_connected() {
         profile: "test-vpn".to_string(),
         success: true,
         error: None,
+        interface: None,
+        pid: None,
     });
 
     assert!(
@@ -808,6 +812,8 @@ fn test_connect_result_failure_transitions_to_disconnected() {
         profile: "test-vpn".to_string(),
         success: false,
         error: Some("wg-quick: already exists".to_string()),
+        interface: None,
+        pid: None,
     });
 
     assert!(
@@ -829,6 +835,8 @@ fn test_connect_result_failure_clears_pending() {
         profile: "test-vpn".to_string(),
         success: false,
         error: Some("error".to_string()),
+        interface: None,
+        pid: None,
     });
 
     assert_eq!(
@@ -1362,6 +1370,8 @@ fn test_last_connected_profile_set_on_connect_success() {
         profile: "success-vpn".to_string(),
         success: true,
         error: None,
+        interface: None,
+        pid: None,
     });
 
     assert_eq!(
@@ -2910,6 +2920,8 @@ fn connect_result_success_mirrors_into_registry() {
         profile: "mirror-test".to_string(),
         success: true,
         error: None,
+        interface: None,
+        pid: None,
     });
 
     // Renderer-facing state: panels read these exact accessors.
@@ -3178,6 +3190,8 @@ fn disconnect_result_success_removes_from_registry() {
         profile: "mirror-test".to_string(),
         success: true,
         error: None,
+        interface: None,
+        pid: None,
     });
     assert_eq!(app.registry.tunnel_count(), 1, "setup precondition");
 
@@ -3242,6 +3256,8 @@ fn connect_result_success_arrives_after_scanner_observes_kernel_session() {
         profile: "race-test".to_string(),
         success: true,
         error: None,
+        interface: None,
+        pid: None,
     });
 
     // Bookkeeping that the success handler is responsible for:
@@ -3260,6 +3276,102 @@ fn connect_result_success_arrives_after_scanner_observes_kernel_session() {
             crate::vortix_core::engine::state::Connection::Connected { .. }
         ),
         "Connected state lands via the authoritative ConnectResult path"
+    );
+}
+
+/// `ConnectResult` success carries the authoritative iface + pid from the
+/// connect-worker thread (`Tunnel::up`'s return value) through to
+/// `mirror_connect_into_registry`. After U4 made the scanner metadata-only,
+/// this is the ONLY write path for `details.interface` on a vortix-
+/// initiated connect. If it stays empty, `recompute_primary` can't match
+/// against the kernel-iface cache → primary=None → Role=Addressable for
+/// what's actually a Primary tunnel.
+#[test]
+fn connect_result_success_seeds_authoritative_iface_into_registry() {
+    use crate::vortix_core::engine::state::Connection;
+    use crate::vortix_core::profile::ProfileId;
+
+    let mut app = test_app();
+    add_profiles(&mut app, &["ovpn-cert"]);
+    set_connecting(&mut app, "ovpn-cert");
+
+    // ConnectResult arrives with the authoritative iface from Tunnel::up.
+    app.handle_message(Message::ConnectResult {
+        profile: "ovpn-cert".to_string(),
+        success: true,
+        error: None,
+        interface: Some("utun8".to_string()),
+        pid: Some(7155),
+    });
+
+    let snap = app
+        .registry
+        .snapshot(&ProfileId::new("ovpn-cert"))
+        .expect("registry must have a snapshot for the connected profile");
+    let Connection::Connected { details, .. } = snap.state else {
+        panic!("expected Connected, got {:?}", snap.state);
+    };
+    assert_eq!(
+        details.interface, "utun8",
+        "ConnectResult must seed the registry entry's interface field — empty iface breaks primary-election"
+    );
+    assert_eq!(details.pid, Some(7155), "PID seeded same path");
+    assert!(
+        details.interface_authoritative,
+        "ConnectResult success path is authoritative by construction (came from Tunnel::up's log scrape)"
+    );
+}
+
+/// Multi-tunnel takeover regression: pressing Shift+B fires a second
+/// connect while the first profile is still primary. The
+/// `ConnectResult` for the second profile MUST NOT be dropped as
+/// stale by the handler. Pre-U4 the bug was hidden because the
+/// scanner would promote Connecting → Connected for the second
+/// profile shortly after; post-U4 the scanner is metadata-only, so
+/// a dropped `ConnectResult` leaves the second tunnel stuck in
+/// Connecting indefinitely. The stale-check must read the specific
+/// profile's registry state, not `legacy_state()` (which returns the
+/// primary's state).
+#[test]
+fn connect_result_for_secondary_profile_during_takeover_is_not_stale() {
+    use crate::vortix_core::engine::state::Connection;
+    use crate::vortix_core::profile::ProfileId;
+
+    let mut app = test_app();
+    add_profiles(&mut app, &["ovpn-cert", "vpn-secondary"]);
+
+    // Connect ovpn-cert first via the authoritative path. It becomes
+    // (notionally) the primary in the legacy view.
+    set_connected(&mut app, "ovpn-cert");
+
+    // User triggers takeover-Both: registry now has ovpn-cert
+    // (Connected) plus vpn-secondary (Connecting). The connect thread
+    // for vpn-secondary is in flight.
+    set_connecting(&mut app, "vpn-secondary");
+
+    // Connect thread for vpn-secondary reports success.
+    app.handle_message(Message::ConnectResult {
+        profile: "vpn-secondary".to_string(),
+        success: true,
+        error: None,
+        interface: Some("utun9".to_string()),
+        pid: Some(8888),
+    });
+
+    let snap = app
+        .registry
+        .snapshot(&ProfileId::new("vpn-secondary"))
+        .expect("vpn-secondary must be in the registry after a successful ConnectResult");
+    let Connection::Connected { details, .. } = snap.state else {
+        panic!(
+            "expected vpn-secondary Connected (NOT stuck in Connecting); got {:?}",
+            snap.state
+        );
+    };
+    assert_eq!(
+        details.interface, "utun9",
+        "the second profile's iface must seed into the registry from its ConnectResult — \
+         the stale check must not drop this message just because the legacy view points at ovpn-cert"
     );
 }
 
@@ -3343,7 +3455,10 @@ fn refresh_registry_preserves_authoritative_iface_across_scanner_ticks() {
     session.interface = "utun3".to_string();
     app.refresh_registry_from_session("ovpn-cert", &session);
 
-    let snap = app.registry.snapshot(&ProfileId::new("ovpn-cert")).expect("registry entry");
+    let snap = app
+        .registry
+        .snapshot(&ProfileId::new("ovpn-cert"))
+        .expect("registry entry");
     let iface = match snap.state {
         Connection::Connected { details, .. } => details.interface.clone(),
         other => panic!("expected Connected, got {other:?}"),

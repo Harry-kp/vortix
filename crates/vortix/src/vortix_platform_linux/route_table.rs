@@ -91,8 +91,11 @@ fn run_ip_route_show_default() -> Option<String> {
 
     let result = crate::vortix_process::run_to_output(
         // xtask:allow-shell-regression: `ip route get <ip>` is the canonical Linux routing-table inspection — no libc equivalent that returns the chosen egress dev without rolling our own netlink RTNETLINK parser.
-        CommandSpec::oneshot("ip", vec!["route".into(), "get".into(), ROUTE_PROBE_TARGET.into()])
-            .timeout(ROUTE_QUERY_TIMEOUT),
+        CommandSpec::oneshot(
+            "ip",
+            vec!["route".into(), "get".into(), ROUTE_PROBE_TARGET.into()],
+        )
+        .timeout(ROUTE_QUERY_TIMEOUT),
     );
 
     let mut state = backoff_state()

@@ -130,6 +130,8 @@ mod connection_state_machine {
             profile: "vpn-a".to_string(),
             success: true,
             error: None,
+            interface: None,
+            pid: None,
         });
         assert!(matches!(
             app.legacy_state(),
@@ -146,6 +148,8 @@ mod connection_state_machine {
             profile: "vpn-a".to_string(),
             success: false,
             error: Some("refused".to_string()),
+            interface: None,
+            pid: None,
         });
         assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
     }
@@ -276,6 +280,8 @@ mod connection_state_machine {
             profile: "vpn-a".to_string(),
             success: true,
             error: None,
+            interface: None,
+            pid: None,
         });
         assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
     }
@@ -297,6 +303,8 @@ mod connection_state_machine {
             profile: "vpn-a".to_string(),
             success: true,
             error: None,
+            interface: None,
+            pid: None,
         });
         assert!(matches!(
             app.legacy_state(),

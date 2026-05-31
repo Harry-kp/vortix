@@ -192,9 +192,7 @@ fn check_wireguard_by_name(name: &str) -> Option<ActiveSession> {
     // Linux but unauthoritative on macOS (where it indicates an
     // anomalous wg-quick install / permission state).
     let resolved = platform.interface.resolve_wireguard_interface(name);
-    let interface_name = resolved
-        .clone()
-        .unwrap_or_else(|| name.to_string());
+    let interface_name = resolved.clone().unwrap_or_else(|| name.to_string());
     // `iface_authoritative` is true when the port returned Some, OR
     // when we're on Linux (where the port always returns None and the
     // basename IS the kernel name). The narrow unauthoritative case is

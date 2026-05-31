@@ -141,6 +141,7 @@ impl VpnRuntime {
                     profile,
                     success,
                     error,
+                    ..
                 }) => {
                     if success {
                         self.session_start = Some(Instant::now());
@@ -440,11 +441,13 @@ impl VpnRuntime {
             crate::tunnel::tunnel_for(protocol, &config_dir, ovpn_verbosity, connect_timeout_secs);
 
         match tunnel.up(&profile) {
-            Ok(_handle) => {
+            Ok(handle) => {
                 let _ = cmd_tx.send(Message::ConnectResult {
                     profile: name,
                     success: true,
                     error: None,
+                    interface: Some(handle.interface_name),
+                    pid: handle.pid,
                 });
             }
             Err(err) => {
@@ -452,6 +455,8 @@ impl VpnRuntime {
                     profile: name,
                     success: false,
                     error: Some(format!("{protocol}: {err}")),
+                    interface: None,
+                    pid: None,
                 });
             }
         }

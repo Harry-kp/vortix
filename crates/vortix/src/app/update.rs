@@ -217,7 +217,9 @@ impl App {
                 profile,
                 success,
                 error,
-            } => self.handle_connect_result(profile, success, error),
+                interface,
+                pid,
+            } => self.handle_connect_result(profile, success, error, interface, pid),
 
             // UI Toggles
             Message::ToggleZoom => {
@@ -470,23 +472,37 @@ impl App {
         }
     }
 
-    fn handle_connect_result(&mut self, profile: String, success: bool, error: Option<String>) {
+    #[allow(clippy::too_many_lines)] // single linear sequence of stale-check, success bookkeeping, failure logging; splitting would obscure the flow
+    fn handle_connect_result(
+        &mut self,
+        profile: String,
+        success: bool,
+        error: Option<String>,
+        interface: Option<String>,
+        pid: Option<u32>,
+    ) {
         // Stale-arrival check. A `ConnectResult` is stale ONLY when the
         // user cancelled / changed context before the spawn thread's
-        // result arrived. The scanner can adopt the tunnel into the
-        // registry as `Connected` between `mirror_connecting_into_registry_at`
-        // and this handler firing (scanner runs every tick, openvpn comes
-        // up in ~13ms but the connect thread takes ~1s to confirm via
-        // `poll_log_until_ready`). When that happens, `legacy_state()`
-        // reads `Connected{this profile}` instead of `Connecting{this profile}`
-        // — that's not stale, it's the success we were going to record,
-        // just arrived via the scanner first. Treat both states as "the
-        // arrival is for this profile, proceed with success bookkeeping".
-        let still_relevant = matches!(
-            self.legacy_state(),
-            ConnectionState::Connecting { profile: ref p, .. } | ConnectionState::Connected { profile: ref p, .. }
-                if *p == profile
-        );
+        // result arrived. The check MUST read this specific profile's
+        // entry in the registry — not `legacy_state()`, which returns
+        // the primary's state. In multi-tunnel topologies (e.g., Shift+B
+        // takeover where a second connect runs while the first is still
+        // primary), `legacy_state()` still reports the original primary,
+        // and a name-equality check against the SECOND profile would
+        // wrongly mark the second connect's result as stale — leaving
+        // the tunnel stuck in Connecting forever post-U4 (the scanner
+        // can no longer promote on its own).
+        use crate::vortix_core::engine::state::Connection;
+        use crate::vortix_core::profile::ProfileId;
+        let still_relevant = self
+            .registry
+            .snapshot(&ProfileId::new(&profile))
+            .is_some_and(|snap| {
+                matches!(
+                    snap.state,
+                    Connection::Connecting { .. } | Connection::Connected { .. }
+                )
+            });
         if !still_relevant {
             self.log(&format!(
                 "INFO: Ignoring stale ConnectResult for '{profile}' (state changed)"
@@ -510,10 +526,22 @@ impl App {
             self.runtime.session_start = Some(now);
             let _ = location; // server location is sourced from the catalog in `legacy_state`
 
-            // Plan 001 U6/U7 / P5d: registry is the single source of
-            // truth. Push a Connected entry directly; the scanner will
-            // refresh kernel-truthful details on its next tick.
-            self.mirror_connect_into_registry(&profile, &DetailedConnectionInfo::default(), now);
+            // Push a Connected entry with the authoritative iface
+            // and PID returned by the protocol layer's `Tunnel::up()`
+            // result (carried through `Message::ConnectResult`). The
+            // scanner's metadata-only refreshes (U4) will then patch
+            // in transfer counts / MTU / endpoint on subsequent ticks
+            // without touching the iface. R1 of the state-authority
+            // contract: this is the ONE write path for iface; the
+            // scanner has no business overwriting it later.
+            let mut details_seed = DetailedConnectionInfo::default();
+            if let Some(iface) = interface {
+                details_seed.interface = iface;
+            }
+            if let Some(p) = pid {
+                details_seed.pid = Some(p);
+            }
+            self.mirror_connect_into_registry(&profile, &details_seed, now);
 
             if let Some(p) = self.runtime.profiles.iter_mut().find(|p| p.name == profile) {
                 p.last_used = Some(std::time::SystemTime::now());
