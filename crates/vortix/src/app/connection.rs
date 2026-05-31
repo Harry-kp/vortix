@@ -511,8 +511,44 @@ impl App {
         };
         let profile_id = ProfileId::new(&profile.name);
         let allowed_ips = extract_allowed_ips(profile.protocol, &profile.config_path);
+        // Preserve the existing entry's interface name when set. Once
+        // `Tunnel::up()` (or a prior scanner adopt) populated it from
+        // an authoritative source — log scrape for OpenVPN, wg-quick
+        // for WireGuard — the iface name is stable for the tunnel's
+        // lifetime. The macOS scanner's ifconfig-scan fallback picks
+        // the FIRST utun with an `inet` line that isn't WG, which
+        // collides between two openvpn PIDs (both resolve to the
+        // lowest-numbered utun), so overwriting from session.interface
+        // would silently corrupt the registry's primary-election in
+        // any multi-openvpn topology.
+        let preserved_iface = self
+            .registry
+            .snapshot(&profile_id)
+            .and_then(|snap| {
+                let iface = snap.interface_name.unwrap_or_default();
+                if iface.is_empty() { None } else { Some(iface) }
+            })
+            .unwrap_or_else(|| session.interface.clone());
+        // Preserve the existing entry's authoritative flag. Scanner
+        // refresh must not flip the bit — only `Tunnel::up()`-driven
+        // writes (via `mirror_connect_into_registry`) or
+        // adoption-time decisions (via U5's scanner_adopt path) set
+        // it. For pre-U4 callers that lack a prior snapshot,
+        // default to true — refresh today only fires on existing
+        // Connected entries that themselves came from an
+        // authoritative source.
+        let preserved_authoritative = self
+            .registry
+            .snapshot(&profile_id)
+            .and_then(|snap| match snap.state {
+                crate::vortix_core::engine::state::Connection::Connected { details, .. } => {
+                    Some(details.interface_authoritative)
+                }
+                _ => None,
+            })
+            .unwrap_or(true);
         let core_details = crate::vortix_core::engine::state::DetailedConnectionInfo {
-            interface: session.interface.clone(),
+            interface: preserved_iface,
             internal_ip: session.internal_ip.clone(),
             endpoint: session.endpoint.clone(),
             mtu: session.mtu.clone(),
@@ -522,6 +558,7 @@ impl App {
             transfer_tx: session.transfer_tx.clone(),
             latest_handshake: session.latest_handshake.clone(),
             pid: session.pid,
+            interface_authoritative: preserved_authoritative,
         };
         // Anchor since on the session's real start when available;
         // otherwise treat the tunnel as newly seen.
@@ -1044,6 +1081,11 @@ fn legacy_to_core_details(
         transfer_tx: legacy.transfer_tx.clone(),
         latest_handshake: legacy.latest_handshake.clone(),
         pid: legacy.pid,
+        // mirror_connect_into_registry funnels through this helper after
+        // `Tunnel::up()` succeeds. The interface is authoritative by
+        // construction — it's whatever the protocol layer (OpenVPN log
+        // scrape / wg-quick + platform port resolution) returned.
+        interface_authoritative: true,
     }
 }
 

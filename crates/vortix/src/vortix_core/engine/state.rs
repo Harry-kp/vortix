@@ -70,7 +70,7 @@ pub enum ConnectionHealth {
 /// Technical details parsed from the VPN interface (relocated from the
 /// binary-side `crates/vortix/src/state/connection.rs`; plan 007 prunes
 /// the duplicate).
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DetailedConnectionInfo {
     pub interface: String,
     pub internal_ip: String,
@@ -83,6 +83,46 @@ pub struct DetailedConnectionInfo {
     pub transfer_tx: String,
     pub latest_handshake: String,
     pub pid: Option<u32>,
+    /// Whether `interface` came from a reliable per-tunnel source.
+    ///
+    /// `true` when set by the protocol layer's `Tunnel::up()` result
+    /// (`OpenVPN` log scrape, wg-quick output resolved through the
+    /// platform port). `false` only when the scanner adopted an
+    /// externally-started tunnel on a platform where its per-PID
+    /// interface detection is unreliable (current state: macOS
+    /// multi-`OpenVPN`, where the ifconfig fallback collides across
+    /// PIDs). Tunnels with `false` are excluded from primary-election
+    /// candidacy in [`TunnelRegistry::recompute_primary`] and render
+    /// as `Role::Addressable` regardless of declared AllowedIPs,
+    /// because vortix cannot truthfully claim a routing status it
+    /// can't verify byte-for-byte against the kernel.
+    ///
+    /// Defaults to `true` — most tunnels are authoritative; the
+    /// adoption path is the narrow exception that must opt out.
+    #[serde(default = "default_interface_authoritative")]
+    pub interface_authoritative: bool,
+}
+
+fn default_interface_authoritative() -> bool {
+    true
+}
+
+impl Default for DetailedConnectionInfo {
+    fn default() -> Self {
+        Self {
+            interface: String::new(),
+            internal_ip: String::new(),
+            endpoint: String::new(),
+            mtu: String::new(),
+            public_key: String::new(),
+            listen_port: String::new(),
+            transfer_rx: String::new(),
+            transfer_tx: String::new(),
+            latest_handshake: String::new(),
+            pid: None,
+            interface_authoritative: true,
+        }
+    }
 }
 
 /// What kind of user input the FSM is paused waiting for (plan 008 U2).

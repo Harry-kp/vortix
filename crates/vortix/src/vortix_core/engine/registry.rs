@@ -618,6 +618,22 @@ impl<T: Tunnel> TunnelRegistry<T> {
             };
         }
 
+        // Unauthoritative entries (scanner-adopted external tunnels with
+        // unreliable per-PID iface detection — see `DetailedConnectionInfo::
+        // interface_authoritative`) render as `Addressable` regardless of
+        // declared AllowedIPs. Vortix can't verify the routing status
+        // byte-for-byte against the kernel, so claiming `AddressableSuppressed`
+        // (which implies "I claimed default but lost") would lie. `Addressable`
+        // is the honest fallback — "we see it as connected; we don't know its
+        // routing posture."
+        if let Connection::Connected { details, .. } = entry.engine.state() {
+            if !details.interface_authoritative {
+                return Role::Addressable {
+                    allowed_ips: entry.allowed_ips.clone(),
+                };
+            }
+        }
+
         // Not the primary. Now the static AllowedIPs distinguish "I
         // declared 0/0 but lost the election" (suppressed) from
         // "I never wanted the default route" (genuine split-tunnel).
@@ -892,7 +908,13 @@ impl<T: Tunnel> TunnelRegistry<T> {
         let mut found: Option<ProfileId> = None;
         for (pid, entry) in &self.fsms {
             if let Connection::Connected { details, .. } = entry.engine.state() {
-                if details.interface == iface {
+                // Only authoritative entries are eligible. Unauthoritative
+                // entries (scanner-adopted external tunnels with unreliable
+                // per-PID iface detection) carry an iface field we can't
+                // verify against the kernel; promoting one to primary would
+                // be a false claim. See `DetailedConnectionInfo::
+                // interface_authoritative` for the contract.
+                if details.interface_authoritative && details.interface == iface {
                     found = Some(pid.clone());
                     break;
                 }
@@ -1144,6 +1166,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::vortix_core::engine::state::DetailedConnectionInfo;
     use crate::vortix_core::ports::tunnel::mock::{MockTunnel, ScriptedTunnelOutcome};
     use crate::vortix_core::profile::{Profile, ProfileId, ProtocolKind};
 
@@ -1621,5 +1644,99 @@ mod tests {
             "ovpn-cert must render as Primary when kernel says it owns default route; got {:?}",
             snap.role
         );
+    }
+
+    // ─────────────── interface_authoritative contract (U3) ───────────────
+
+    /// Helper: seed an entry into the Connected state directly with a
+    /// custom `interface_authoritative` value, bypassing the FSM's
+    /// `Tunnel::up()` path (which always sets authoritative=true).
+    /// Used to exercise the "scanner-adopted unauthoritative entry"
+    /// branch of `recompute_primary` and `derive_role`.
+    fn seed_connected_unauthoritative(
+        reg: &mut TunnelRegistry<MockTunnel>,
+        name: &'static str,
+        iface: &str,
+        allowed_ips: Vec<Cidr>,
+    ) {
+        let details = DetailedConnectionInfo {
+            interface: iface.into(),
+            interface_authoritative: false,
+            ..Default::default()
+        };
+        reg.set_connected(
+            ProfileId::new(name),
+            allowed_ips,
+            details,
+            std::time::SystemTime::now(),
+            || Engine::new(MockTunnel::new(), resolver_for(name)),
+        );
+    }
+
+    #[test]
+    fn recompute_primary_skips_unauthoritative_even_when_iface_matches_kernel() {
+        // Setup: two Connected tunnels both claiming iface=utun8 against
+        // the kernel's reported egress utun8. One is authoritative
+        // (came via Tunnel::up), the other is not (scanner-adopted
+        // with unreliable per-PID detection on macOS multi-OpenVPN).
+        // recompute_primary MUST elect the authoritative one — promoting
+        // the other would be a false claim about routing.
+        let mut reg: TunnelRegistry<MockTunnel> = TunnelRegistry::new();
+
+        // F1: scanner-adopted, unauthoritative (false-positive iface
+        // collision from Method B fallback).
+        seed_connected_unauthoritative(&mut reg, "external", "utun8", default_route_v4());
+
+        // F2: came via Tunnel::up — authoritative.
+        connect_with_iface(&mut reg, "internal", "utun8", default_route_v4(), true).unwrap();
+
+        reg.feed_default_route_interface(Some("utun8".to_string()));
+        reg.refresh_primary();
+
+        assert_eq!(
+            reg.primary().map(ProfileId::as_str),
+            Some("internal"),
+            "primary must be the authoritative entry, not the unauthoritative one with the same iface"
+        );
+    }
+
+    #[test]
+    fn derive_role_returns_addressable_for_unauthoritative_regardless_of_allowed_ips() {
+        // Even when an unauthoritative entry's declared allowed_ips claim
+        // the full default route, the role must be Addressable — not
+        // Primary (it can't be — recompute_primary skips it) and not
+        // AddressableSuppressed (which would imply "we claimed default
+        // but lost," a routing claim vortix can't verify byte-for-byte
+        // against the kernel for an unauthoritative entry).
+        let mut reg: TunnelRegistry<MockTunnel> = TunnelRegistry::new();
+
+        // Authoritative primary owns the kernel default route.
+        connect_with_iface(&mut reg, "primary", "utun9", default_route_v4(), false).unwrap();
+        reg.feed_default_route_interface(Some("utun9".to_string()));
+        reg.refresh_primary();
+
+        // Unauthoritative entry that declares 0/0 — historically this
+        // would have rendered as AddressableSuppressed.
+        seed_connected_unauthoritative(&mut reg, "external", "utun7", default_route_v4());
+
+        let snap = reg
+            .snapshot(&ProfileId::new("external"))
+            .expect("snapshot for external profile");
+        assert!(
+            matches!(snap.role, Role::Addressable { .. }),
+            "unauthoritative entry must render as Addressable regardless of allowed_ips; got {:?}",
+            snap.role
+        );
+    }
+
+    #[test]
+    fn detailed_connection_info_default_sets_interface_authoritative_true() {
+        // Most tunnels are authoritative; the unauthoritative case is
+        // the narrow scanner-adoption exception. Default::default() must
+        // reflect the common path so test fixtures and struct-update
+        // patterns (`..Default::default()`) don't accidentally inject
+        // false negatives into the primary-election filter.
+        let d = DetailedConnectionInfo::default();
+        assert!(d.interface_authoritative);
     }
 }
