@@ -1,4 +1,22 @@
-//! macOS routing-table inspection via `route get default`.
+//! macOS routing-table inspection via `route -n get 8.8.8.8`.
+//!
+//! Why a specific target instead of `default`: `OpenVPN`'s standard
+//! `push "redirect-gateway def1"` does NOT replace the kernel's default
+//! route. Instead it inserts two more-specific /1 routes (0.0.0.0/1 and
+//! 128.0.0.0/1) that together cover all of IPv4 and out-prioritise the
+//! original default. `route get default` reports the kernel's default-
+//! route slot — which `def1` deliberately leaves on the original
+//! interface (`en0`) — even though actual internet-bound packets flow
+//! through `utun*`. Querying a public-internet target makes the kernel
+//! actually do the longest-prefix match it would do for a real packet,
+//! returning the interface that owns internet egress (the /1 routes win
+//! when the VPN is up; the default wins when it's not).
+//!
+//! Hardcoded target choice (8.8.8.8, Google DNS): any well-known public
+//! IP in 0.0.0.0/1 works. Users with a static-route exception for
+//! 8.8.8.8 specifically (DNS-leak-prevention setups) will see this
+//! probe return their physical interface even while the VPN is up; that
+//! case is rare enough to accept as a known limitation.
 
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -55,7 +73,11 @@ fn cooldown_for_fails(fails: u32) -> Duration {
     Duration::from_secs(secs)
 }
 
-/// macOS routing-table reader using `route get default`.
+/// Public-internet probe target. See module-level docs for why this is
+/// preferred over `route get default`.
+const ROUTE_PROBE_TARGET: &str = "8.8.8.8";
+
+/// macOS routing-table reader using `route -n get <target>`.
 pub struct MacRouteTable;
 
 impl RouteTable for MacRouteTable {
@@ -70,7 +92,8 @@ impl RouteTable for MacRouteTable {
     }
 }
 
-/// Run `route get default` and return its stdout as UTF-8 (lossy).
+/// Run `route -n get <ROUTE_PROBE_TARGET>` and return its stdout as
+/// UTF-8 (lossy).
 ///
 /// Returns `None` if the subprocess fails (binary missing, non-zero exit,
 /// I/O error) so callers can degrade gracefully without panicking.
@@ -90,8 +113,11 @@ fn run_route_get_default() -> Option<String> {
     }
 
     let result = crate::vortix_process::run_to_output(
-        CommandSpec::oneshot("route", vec!["get".into(), "default".into()])
-            .timeout(ROUTE_QUERY_TIMEOUT),
+        CommandSpec::oneshot(
+            "route",
+            vec!["-n".into(), "get".into(), ROUTE_PROBE_TARGET.into()],
+        )
+        .timeout(ROUTE_QUERY_TIMEOUT),
     );
 
     let mut state = backoff_state()
