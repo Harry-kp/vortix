@@ -71,7 +71,24 @@ use ratatui::{
 /// is fully disconnected with no failure — caller renders a blank cell.
 fn status_badge_for(snapshot: &TunnelSnapshot) -> Option<(&'static str, Style)> {
     match &snapshot.state {
-        Connection::Connected { .. } => Some(("●", Style::default().fg(theme::SUCCESS))),
+        Connection::Connected { details, .. } => {
+            // R4 of the state-authority contract: Connected entries whose
+            // interface name vortix couldn't reliably attribute to a PID
+            // (current case: externally-started OpenVPN on macOS where
+            // the scanner's ifconfig-scan fallback collides across
+            // PIDs) render with a muted/dim treatment. They ARE up;
+            // vortix just can't verify their routing posture.
+            if details.interface_authoritative {
+                Some(("●", Style::default().fg(theme::SUCCESS)))
+            } else {
+                Some((
+                    "●",
+                    Style::default()
+                        .fg(theme::INACTIVE)
+                        .add_modifier(Modifier::DIM),
+                ))
+            }
+        }
         Connection::Connecting { .. } => Some(("◐", Style::default().fg(theme::WARNING))),
         Connection::Reconnecting { .. } => Some((
             "↻",
@@ -87,6 +104,7 @@ fn status_badge_for(snapshot: &TunnelSnapshot) -> Option<(&'static str, Style)> 
         Connection::Disconnected { last_failure: None } => None,
     }
 }
+
 
 /// Does this snapshot warrant a `!` risk annotation in the sidebar?
 ///
@@ -517,6 +535,49 @@ mod tests {
         let snap = snap_connecting("vpn1");
         let (glyph, _) = status_badge_for(&snap).expect("connecting → badge");
         assert_eq!(glyph, "◐");
+    }
+
+    #[test]
+    fn unauthoritative_connected_badge_renders_dim_grey() {
+        // R4 of the state-authority contract: when a Connected tunnel's
+        // iface can't be reliably attributed to its PID (current case:
+        // externally-started OpenVPN on macOS where the scanner's
+        // ifconfig-scan fallback collides across PIDs), the row's
+        // status badge must visually distinguish from a fully-tracked
+        // Connected tunnel.
+        let mut snap = snap_connected("vpn1", Role::Addressable { allowed_ips: vec![] });
+        if let Connection::Connected {
+            ref mut details, ..
+        } = snap.state
+        {
+            details.interface_authoritative = false;
+        }
+        let (glyph, style) = status_badge_for(&snap).expect("connected → badge");
+        assert_eq!(glyph, "●", "still Connected — glyph stays a filled dot");
+        assert!(
+            style.add_modifier.contains(Modifier::DIM),
+            "unauthoritative Connected must dim to distinguish from fully-tracked Connected — got {style:?}"
+        );
+        // And the foreground color is INACTIVE rather than SUCCESS so
+        // monochrome / colorblind users still see the difference via
+        // value/lightness.
+        assert_eq!(
+            style.fg,
+            Some(theme::INACTIVE),
+            "unauthoritative Connected must use the inactive color"
+        );
+    }
+
+    #[test]
+    fn authoritative_connected_badge_renders_bright_green_no_dim() {
+        // Inverse check: a normal Connected tunnel (interface_authoritative
+        // defaults to true) keeps the bright SUCCESS color and no DIM
+        // modifier.
+        let snap = snap_connected("vpn1", Role::Primary { allowed_ips: vec![] });
+        let (glyph, style) = status_badge_for(&snap).expect("connected → badge");
+        assert_eq!(glyph, "●");
+        assert!(!style.add_modifier.contains(Modifier::DIM));
+        assert_eq!(style.fg, Some(theme::SUCCESS));
     }
 
     #[test]

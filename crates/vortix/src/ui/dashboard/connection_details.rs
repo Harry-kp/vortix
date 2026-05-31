@@ -120,6 +120,13 @@ fn render_connected(
         details.mtu.clone()
     };
 
+    let iface_display = if details.interface.is_empty() {
+        "-".to_string()
+    } else if details.interface_authoritative {
+        details.interface.clone()
+    } else {
+        format!("{} (external)", details.interface)
+    };
     let mut text = vec![
         Line::from(vec![
             Span::styled("VPN IP  : ", Style::default().fg(theme::TEXT_SECONDARY)),
@@ -130,15 +137,12 @@ fn render_connected(
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!(
-                    " @ {}",
-                    if details.interface.is_empty() {
-                        "-"
-                    } else {
-                        &details.interface
-                    }
-                ),
-                Style::default().fg(theme::TEXT_SECONDARY),
+                format!(" @ {iface_display}"),
+                Style::default().fg(if details.interface_authoritative {
+                    theme::TEXT_SECONDARY
+                } else {
+                    theme::INACTIVE
+                }),
             ),
         ]),
         Line::from(vec![
