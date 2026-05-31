@@ -403,7 +403,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
             build_protected_audit(&state)
         }
         Verdict::Partial => {
-            let state = collect_partial_state(app, inner.width);
+            let state = collect_partial_state(app, primary_snap.as_ref(), inner.width);
             build_partial_audit(&state)
         }
         Verdict::Exposed => build_exposed_audit(app, inner.width),
@@ -532,28 +532,80 @@ fn collect_protected_state(
     }
 }
 
-fn collect_partial_state(app: &App, inner_width: u16) -> PanelState {
-    // Multi-tunnel PARTIAL: pick the first Connected tunnel as the
-    // representative cipher source. Ciphers are usually homogeneous in
-    // practice (all WG or all OpenVPN); if they diverge, surfacing the
-    // first one is still strictly more useful than `N/A`.
-    let encryption = app
-        .registry
-        .snapshot_all()
-        .iter()
-        .find(|s| matches!(s.state, Connection::Connected { .. }))
-        .map_or_else(|| "N/A".to_string(), |s| derive_encryption(Some(s)));
+fn collect_partial_state(
+    app: &App,
+    primary_snap: Option<&TunnelSnapshot>,
+    inner_width: u16,
+) -> PanelState {
+    // Cipher source: prefer the primary (when verdict is Partial because
+    // of degraded defense), otherwise pick the first Connected tunnel
+    // from the registry (split-only topology). Ciphers are usually
+    // homogeneous in practice (all WG or all OpenVPN); if they diverge,
+    // surfacing the first one is still strictly more useful than `N/A`.
+    let snapshots = app.registry.snapshot_all();
+    let encryption = if let Some(snap) = primary_snap {
+        derive_encryption(Some(snap))
+    } else {
+        snapshots
+            .iter()
+            .find(|s| matches!(s.state, Connection::Connected { .. }))
+            .map_or_else(|| "N/A".to_string(), |s| derive_encryption(Some(s)))
+    };
+
+    // When a primary IS present (Partial fired from a degraded-defense
+    // signal — killswitch off, weak cipher, IP/DNS leak), the IP row
+    // should reflect the real exit IP, just like Protected does. Only
+    // when no primary owns the default route does "split-route — no
+    // exit" become the truthful rendering.
+    let has_primary = primary_snap.is_some();
+    let (public_ip, location, ip_status, dns_leaking, real_dns) = if has_primary {
+        let ip_status = match &app.runtime.real_ip {
+            Some(real)
+                if !app.runtime.public_ip.is_empty()
+                    && app.runtime.public_ip != constants::MSG_DETECTING
+                    && app.runtime.public_ip != constants::MSG_FETCHING
+                    && !app.runtime.public_ip.starts_with("Error") =>
+            {
+                if &app.runtime.public_ip == real {
+                    IpStatus::Leaking
+                } else {
+                    IpStatus::Masked
+                }
+            }
+            _ => IpStatus::Pending,
+        };
+        let dns_leaking = matches!(&app.runtime.real_dns, Some(r) if &app.runtime.dns_server == r);
+        let location = if app.runtime.location.is_empty()
+            || app.runtime.location == constants::MSG_DETECTING
+            || app.runtime.location == constants::MSG_FETCHING
+        {
+            None
+        } else {
+            Some(app.runtime.location.clone())
+        };
+        (
+            app.runtime.public_ip.clone(),
+            location,
+            ip_status,
+            dns_leaking,
+            app.runtime.real_dns.clone(),
+        )
+    } else {
+        // No primary — IP row will render "split-route — no exit"
+        // (the build_partial_audit branch keys off public_ip being empty).
+        (String::new(), None, IpStatus::Pending, false, None)
+    };
 
     PanelState {
         inner_width,
         show_section_headers: true,
-        public_ip: app.runtime.public_ip.clone(),
-        location: None,
-        ip_status: IpStatus::Pending,
+        public_ip,
+        location,
+        ip_status,
         dns_server: app.runtime.dns_server.clone(),
         dns_provider: dns_provider_label(&app.runtime.dns_server),
-        dns_leaking: false,
-        real_dns: None,
+        dns_leaking,
+        real_dns,
         killswitch_mode: app.runtime.killswitch_mode,
         killswitch_state: app.runtime.killswitch_state,
         encryption,
@@ -694,16 +746,32 @@ fn build_partial_audit(s: &PanelState) -> Vec<Line<'static>> {
         lines.push(section_header("Identity"));
     }
 
-    // No primary owns the default route → no exit posture to attest to.
-    // Show what the panel still knows about (DNS resolver) and flag IP as
-    // not-applicable, with one sub-line explaining the posture.
-    lines.push(audit_row(
-        "IP",
-        "split-route — no exit",
-        theme::INACTIVE,
-        Sigil::NotApplicable,
-        w,
-    ));
+    // IP row: when a primary owns the default route (Partial fired
+    // from a degraded-defense signal like killswitch=off), render the
+    // real exit IP the same way Protected does. When no primary owns
+    // the default route (split-only topology), flag IP as
+    // not-applicable. `public_ip` being empty is the in-band signal
+    // for the no-primary case (set by `collect_partial_state`).
+    if s.public_ip.is_empty() {
+        lines.push(audit_row(
+            "IP",
+            "split-route — no exit",
+            theme::INACTIVE,
+            Sigil::NotApplicable,
+            w,
+        ));
+    } else {
+        let ip_value = format_value_with_tag(&s.public_ip, s.location.as_deref());
+        let (ip_sigil, ip_value_color) = match s.ip_status {
+            IpStatus::Masked => (Sigil::OkMuted, theme::TEXT_PRIMARY),
+            IpStatus::Leaking => (Sigil::AlarmError, theme::ERROR),
+            IpStatus::Pending => (Sigil::NotApplicable, theme::WARNING),
+        };
+        lines.push(audit_row("IP", &ip_value, ip_value_color, ip_sigil, w));
+        if s.ip_status == IpStatus::Leaking {
+            lines.push(alarm_subline("real IP exposed", w));
+        }
+    }
 
     let dns_value = format_value_with_tag(&s.dns_server, s.dns_provider);
     lines.push(audit_row(
@@ -1501,6 +1569,52 @@ mod tests {
         assert!(
             out.contains("Block on drop"),
             "Auto mode label missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn partial_with_primary_renders_real_ip_not_split_route_noexit() {
+        // Regression for the "Role=Primary everywhere else but Security
+        // Guard says split-route — no exit" bug. When PARTIAL fires from
+        // a degraded-defense signal (e.g. killswitch=Off) but a primary
+        // tunnel IS up and owning the default route, the IP row must
+        // show the real exit IP, not the "no exit" placeholder.
+        let mut state = baseline_protected_state(60);
+        state.public_ip = "46.101.235.146".to_string();
+        state.location = Some("Frankfurt am Main, DE".to_string());
+        state.ip_status = IpStatus::Masked;
+        state.killswitch_mode = KillSwitchMode::Off;
+        state.killswitch_state = crate::state::KillSwitchState::Disabled;
+
+        let lines = build_partial_audit(&state);
+        let body: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+
+        assert!(
+            body.contains("46.101.235.146"),
+            "real exit IP missing in PARTIAL-with-primary IP row:\n{body}"
+        );
+        assert!(
+            !body.contains("split-route"),
+            "must not render `split-route — no exit` when a primary owns the route:\n{body}"
+        );
+    }
+
+    #[test]
+    fn partial_without_primary_keeps_split_route_no_exit_row() {
+        // Mirror of the above: with no primary (public_ip empty), the IP
+        // row remains the not-applicable placeholder so the panel
+        // doesn't lie about an exit posture that doesn't exist.
+        let mut state = baseline_protected_state(60);
+        state.public_ip = String::new();
+        state.location = None;
+        state.ip_status = IpStatus::Pending;
+
+        let lines = build_partial_audit(&state);
+        let body: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+
+        assert!(
+            body.contains("split-route"),
+            "split-only PARTIAL must still show split-route — no exit:\n{body}"
         );
     }
 
