@@ -745,15 +745,26 @@ pub(crate) fn find_binary_path(name: &str) -> Option<std::path::PathBuf> {
 #[cfg(target_os = "linux")] // xtask:allow-platform-cfg: resolvconf-shim probing is Linux-only DNS plumbing
 pub(crate) fn resolvconf_works() -> bool {
     use crate::vortix_process::CommandSpec;
+    use std::time::Duration;
     if !binary_exists("resolvconf") {
         return false;
     }
     // Test with `--version` which works with both openresolv and systemd-resolvconf.
     // `resolvconf -l` (list) is not supported by systemd-resolvconf's shim.
-    crate::vortix_process::run_to_output(CommandSpec::oneshot(
-        "resolvconf",
-        vec!["--version".into()],
-    ))
+    //
+    // The 10s cap mirrors the openvpn version-probe defense in
+    // `vpn_runtime/openvpn.rs`: this probe is called from
+    // `check_dependencies` on the UI thread during a connect press,
+    // so a hung subprocess (broken DNS plumbing, locked /etc/resolv.conf,
+    // an openresolv shim stuck on a syscall) would freeze the TUI until
+    // the user kills it. 10s is generous for any healthy probe; on
+    // timeout we return `false`, which routes the user to the existing
+    // "resolvconf not available" error path — strictly better than a
+    // wedged panel.
+    crate::vortix_process::run_to_output(
+        CommandSpec::oneshot("resolvconf", vec!["--version".into()])
+            .timeout(Duration::from_secs(10)),
+    )
     .is_ok_and(|o| o.status.success())
 }
 
