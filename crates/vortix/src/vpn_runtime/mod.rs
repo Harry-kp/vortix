@@ -23,7 +23,6 @@ use std::time::Instant;
 use crate::config::AppConfig;
 use crate::constants;
 use crate::core::network_monitor::NetworkEvent;
-use crate::core::scanner::ActiveSession;
 use crate::core::telemetry::{self, TelemetryUpdate};
 use crate::logger;
 use crate::message::Message;
@@ -90,7 +89,7 @@ pub struct VpnRuntime {
     pub telemetry_nudge: Option<mpsc::Sender<()>>,
     pub(crate) cmd_tx: mpsc::Sender<Message>,
     pub(crate) cmd_rx: mpsc::Receiver<Message>,
-    pub(crate) scanner_rx: Option<mpsc::Receiver<Vec<ActiveSession>>>,
+    pub(crate) scanner_rx: Option<mpsc::Receiver<crate::core::scanner::ScannerResult>>,
     pub(crate) netmon_rx: Option<mpsc::Receiver<NetworkEvent>>,
     pub(crate) netstats_rx: Option<mpsc::Receiver<(u64, u64)>>,
     pub(crate) last_bytes_in: u64,

@@ -1,7 +1,18 @@
 //! Linux routing-table inspection via `ip route`.
 
+use std::time::Duration;
+
 use crate::vortix_core::ports::route_table::RouteTable;
 use crate::vortix_process::CommandSpec;
+
+/// Upper bound on the `ip route show default` subprocess. Netlink is
+/// usually instant on Linux, but the query is invoked inline from
+/// `TunnelRegistry::recompute_primary` on the UI thread, so defending
+/// against pathological cases (heavy routing-policy rules, contention
+/// during a tunnel transition) matters. 1s is generous for any healthy
+/// query; on timeout we return `None` and the scanner's next tick
+/// will re-resolve.
+const ROUTE_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Linux routing-table reader using `ip route show default`.
 pub struct LinuxRouteTable;
@@ -22,10 +33,11 @@ impl RouteTable for LinuxRouteTable {
 ///
 /// Returns `None` if the subprocess fails so callers can degrade gracefully.
 fn run_ip_route_show_default() -> Option<String> {
-    let output = crate::vortix_process::run_to_output(CommandSpec::oneshot(
-        "ip",
-        vec!["route".into(), "show".into(), "default".into()],
-    ))
+    let output = crate::vortix_process::run_to_output(
+        // xtask:allow-shell-regression: `ip route show default` is the canonical Linux routing-table inspection — no libc equivalent that returns the default-route dev without rolling our own netlink RTNETLINK parser. Pre-existing shell-out; this change only adds a timeout.
+        CommandSpec::oneshot("ip", vec!["route".into(), "show".into(), "default".into()])
+            .timeout(ROUTE_QUERY_TIMEOUT),
+    )
     .ok()?;
     Some(String::from_utf8_lossy(&output.stdout).into_owned())
 }

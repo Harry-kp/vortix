@@ -187,6 +187,35 @@ impl<T: Tunnel> RegistryEntry<T> {
 // TunnelRegistry
 // ─────────────────────────────────────────────────────────────────────────
 
+/// Maximum age of a cached default-route-interface value before we
+/// treat it as suspect. The cache is fed externally by the App's
+/// scanner-result handler (which runs `route get default` in the
+/// scanner's background thread, so the UI thread never blocks on it).
+/// If the scanner thread stalls or never starts, an old value past this
+/// age is still served — better than the PROTECTED → PARTIAL flicker
+/// that would happen if we blanked the cache on every TTL expiry, and
+/// the registry has no better signal to fall back on. 500ms is short
+/// enough that genuine route-table changes propagate to the UI within
+/// one user blink; the scanner re-feeds the cache once per tick.
+const DEFAULT_ROUTE_CACHE_MAX_AGE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Cached default-route interface fed in by the App from the scanner's
+/// background thread. Wrapping the value + timestamp in one struct
+/// makes the "both set together OR both absent" invariant
+/// compile-time-enforced — the prior pair of loose `Option`s relied on
+/// every callsite preserving it manually.
+#[derive(Clone, Debug)]
+struct CachedRouteInterface {
+    /// The interface name. `None` is a legitimate "kernel reports no
+    /// default route" value (e.g. wifi off, VPN-only mode in an
+    /// unconfigured state) — distinct from "we haven't probed yet,"
+    /// which is represented by the outer `Option<CachedRouteInterface>`
+    /// being `None`.
+    iface: Option<String>,
+    /// When this value was fed in.
+    at: std::time::Instant,
+}
+
 pub struct TunnelRegistry<T: Tunnel> {
     fsms: HashMap<ProfileId, RegistryEntry<T>>,
     /// Derived: the `ProfileId` whose interface owns the kernel default route.
@@ -200,6 +229,12 @@ pub struct TunnelRegistry<T: Tunnel> {
     /// registry's struct shape doesn't leak the closure type.
     #[allow(clippy::type_complexity)]
     default_route_interface_probe: Option<Box<dyn Fn() -> Option<String> + Send>>,
+    /// Last route-interface value fed by the App's scanner-result
+    /// handler. `None` means never fed (registry just constructed,
+    /// or running in a test that never feeds). See
+    /// [`Self::feed_default_route_interface`] for the write side and
+    /// [`Self::default_route_interface_cached`] for the read side.
+    cached_route: Option<CachedRouteInterface>,
 }
 
 impl<T: Tunnel> Default for TunnelRegistry<T> {
@@ -217,6 +252,7 @@ impl<T: Tunnel> TunnelRegistry<T> {
             killswitch_mode: KillSwitchMode::default(),
             killswitch_state: KillSwitchState::default(),
             default_route_interface_probe: None,
+            cached_route: None,
         }
     }
 
@@ -234,6 +270,7 @@ impl<T: Tunnel> TunnelRegistry<T> {
             killswitch_mode: KillSwitchMode::default(),
             killswitch_state: KillSwitchState::default(),
             default_route_interface_probe: Some(Box::new(probe)),
+            cached_route: None,
         }
     }
 
@@ -831,7 +868,7 @@ impl<T: Tunnel> TunnelRegistry<T> {
     }
 
     fn recompute_primary(&mut self) {
-        let probed = self.probe_default_route_interface();
+        let probed = self.default_route_interface_cached();
         let Some(iface) = probed else {
             self.primary = None;
             return;
@@ -848,13 +885,54 @@ impl<T: Tunnel> TunnelRegistry<T> {
         self.primary = found;
     }
 
-    fn probe_default_route_interface(&self) -> Option<String> {
+    /// External cache feed: push the latest default-route interface
+    /// (probed by the App's scanner thread, never by the registry
+    /// itself). This is the ONLY production write path for the cache;
+    /// the registry must never shell out from its own methods because
+    /// they run synchronously on the UI thread.
+    ///
+    /// Idempotent and cheap — safe to call on every scanner tick.
+    pub fn feed_default_route_interface(&mut self, iface: Option<String>) {
+        self.cached_route = Some(CachedRouteInterface {
+            iface,
+            at: std::time::Instant::now(),
+        });
+    }
+
+    /// Return the best-known default-route interface from the cache
+    /// (production) or the injected probe closure (tests). NEVER
+    /// shells out — the production probe happens in
+    /// [`crate::core::scanner::gather_system_state`] on a background
+    /// thread, the result reaches us through
+    /// [`Self::feed_default_route_interface`].
+    fn default_route_interface_cached(&self) -> Option<String> {
+        // Test seam wins — fakes are presumed instant + side-effect-
+        // free, so tests can simulate route-table flapping without
+        // having to thread the cache update through.
         if let Some(probe) = &self.default_route_interface_probe {
             return probe();
         }
-        crate::platform::current_platform()
-            .route_table
-            .default_route_interface()
+        // Production: serve the cached value. If the App hasn't fed
+        // us yet, `cached_route` is `None` → primary stays unset for
+        // a fraction of a second after startup until the first scanner
+        // tick lands. This is the correct UI behaviour at startup
+        // anyway ("no primary known yet").
+        let cached = self.cached_route.as_ref()?;
+        // Surface a tracing warning when the scanner has fallen behind
+        // by more than the staleness budget. We still serve the value
+        // (returning `None` would blank the primary every tick and
+        // flicker the headline PROTECTED → PARTIAL when the scanner is
+        // slow), but ops investigating UX glitches via
+        // `RUST_LOG=vortix::vortix_core=warn` get a clear signal.
+        let age = cached.at.elapsed();
+        if age > DEFAULT_ROUTE_CACHE_MAX_AGE {
+            tracing::warn!(
+                target: "vortix::vortix_core::engine::registry",
+                age_ms = u64::try_from(age.as_millis()).unwrap_or(u64::MAX),
+                "default-route cache is stale; scanner thread may be falling behind"
+            );
+        }
+        cached.iface.clone()
     }
 
     // ──────────────────────────── Pending-after-disconnect ────────────────────────────
@@ -1047,6 +1125,7 @@ fn log_primary_change(
 mod tests {
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use super::*;
     use crate::vortix_core::ports::tunnel::mock::{MockTunnel, ScriptedTunnelOutcome};
@@ -1409,5 +1488,81 @@ mod tests {
         let snaps = reg.snapshot_all();
         let ids: Vec<&str> = snaps.iter().map(|s| s.profile_id.as_str()).collect();
         assert_eq!(ids, vec!["alpha", "mid", "zeta"]);
+    }
+
+    // ─────────────── External default-route cache feed ───────────────
+
+    /// The `feed_default_route_interface` write path is the production
+    /// route for getting kernel-reported state into the registry —
+    /// done from the App's scanner-result handler so the UI thread
+    /// never blocks on `route get default`. This test exercises the
+    /// write + the downstream read via `recompute_primary`.
+    #[test]
+    fn feed_default_route_interface_drives_primary_election() {
+        // Production-style registry — no test probe closure injected,
+        // so `default_route_interface_cached` falls through to the
+        // cache (which we feed below).
+        let mut reg: TunnelRegistry<MockTunnel> = TunnelRegistry::new();
+
+        // Seed a Connected tunnel on `utun7`.
+        connect_with_iface(&mut reg, "corp", "utun7", default_route_v4(), false).unwrap();
+
+        // Before any feed, the cache is empty → no primary even though
+        // a Connected tunnel exists. This is the correct "scanner
+        // hasn't told us anything yet" startup state.
+        assert!(
+            reg.primary().is_none(),
+            "primary must be unset before any cache feed"
+        );
+
+        // Feed the kernel's view: utun7 owns default route.
+        reg.feed_default_route_interface(Some("utun7".to_string()));
+        reg.refresh_primary();
+        assert_eq!(
+            reg.primary().map(ProfileId::as_str),
+            Some("corp"),
+            "primary should match the Connected tunnel whose interface owns default route"
+        );
+
+        // Kernel says route went away (e.g. WiFi off). Feed it through.
+        reg.feed_default_route_interface(None);
+        reg.refresh_primary();
+        assert!(
+            reg.primary().is_none(),
+            "primary must clear when kernel reports no default route"
+        );
+    }
+
+    /// The cached value should outlive `DEFAULT_ROUTE_CACHE_MAX_AGE` —
+    /// returning `None` past the TTL would blank the primary tunnel
+    /// every tick if the scanner falls behind, flickering the headline
+    /// PROTECTED → PARTIAL. Bound staleness via tracing observability,
+    /// not behaviour.
+    #[test]
+    fn cached_route_interface_serves_stale_values_to_avoid_ui_flicker() {
+        let mut reg: TunnelRegistry<MockTunnel> = TunnelRegistry::new();
+        connect_with_iface(&mut reg, "corp", "utun7", default_route_v4(), false).unwrap();
+
+        // Feed, then artificially backdate the timestamp by more than
+        // the staleness budget. `default_route_interface_cached` should
+        // still return the value (it only emits a tracing::warn).
+        reg.feed_default_route_interface(Some("utun7".to_string()));
+        // `checked_sub` keeps clippy happy on the unchecked-arithmetic
+        // lint; expect() is safe because we just took `Instant::now()`
+        // and subtract a small bounded duration from it.
+        let stale_at = std::time::Instant::now()
+            .checked_sub(DEFAULT_ROUTE_CACHE_MAX_AGE + Duration::from_secs(1))
+            .expect("Instant - small Duration must not underflow");
+        reg.cached_route = Some(CachedRouteInterface {
+            iface: Some("utun7".to_string()),
+            at: stale_at,
+        });
+
+        reg.refresh_primary();
+        assert_eq!(
+            reg.primary().map(ProfileId::as_str),
+            Some("corp"),
+            "stale cache must still feed primary election; otherwise scanner-lag flickers the UI"
+        );
     }
 }

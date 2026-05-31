@@ -146,8 +146,16 @@ pub enum Message {
     Quit,
     /// Background telemetry update
     Telemetry(TelemetryUpdate),
-    /// Periodic system state synchronization (active profiles)
-    SyncSystemState(Vec<ActiveSession>),
+    /// Periodic system state synchronization (active profiles +
+    /// default-route interface). The route iface is probed by the
+    /// scanner's background thread alongside the active-session work
+    /// so the main thread NEVER blocks on `route get default` /
+    /// `ip route show default` — the registry's primary-tunnel
+    /// election reads the cached value handed in here.
+    SyncSystemState {
+        sessions: Vec<ActiveSession>,
+        default_route_interface: Option<String>,
+    },
     /// Periodic heartbeat tick
     Tick,
     /// Connection timeout detected

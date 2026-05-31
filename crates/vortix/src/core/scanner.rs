@@ -47,6 +47,30 @@ pub struct ActiveSession {
     pub latest_handshake: String,
 }
 
+/// Combined result of a scanner sweep: active VPN sessions plus the
+/// kernel default-route interface (probed in the same background
+/// thread so the main thread doesn't pay the `route get default` cost).
+#[derive(Default, Debug)]
+pub struct ScannerResult {
+    pub sessions: Vec<ActiveSession>,
+    pub default_route_interface: Option<String>,
+}
+
+/// Gather both active VPN sessions and the kernel default-route
+/// interface in one shot. Designed to be called from the scanner's
+/// per-tick background thread. The default-route probe runs through
+/// the same subprocess machinery as the session probes, with the
+/// platform-specific 1s timeout in place (see `route_table.rs`).
+#[must_use]
+pub fn gather_system_state(profiles: &[VpnProfile]) -> ScannerResult {
+    ScannerResult {
+        sessions: get_active_profiles(profiles),
+        default_route_interface: crate::platform::current_platform()
+            .route_table
+            .default_route_interface(),
+    }
+}
+
 /// Scans the system for active VPN sessions matching known profiles.
 ///
 /// Iterates through provided profiles and checks if corresponding VPN
@@ -542,5 +566,24 @@ mod tests {
     fn test_parse_ps_etime_whitespace() {
         assert_eq!(parse_ps_etime("  01:23  "), Some(Duration::from_secs(83)));
         assert_eq!(parse_ps_etime("  5  "), Some(Duration::from_secs(5)));
+    }
+
+    /// `ScannerResult::default()` must produce a sentinel "nothing
+    /// observed yet" value — empty session list AND `None` route
+    /// interface. The registry's `feed_default_route_interface(None)`
+    /// is a legitimate "kernel reports no default route" signal, so
+    /// we need a way to distinguish "scanner ran and saw nothing"
+    /// from the initial pre-scan state. Default supplies the latter.
+    #[test]
+    fn scanner_result_default_is_empty() {
+        let result = ScannerResult::default();
+        assert!(
+            result.sessions.is_empty(),
+            "default ScannerResult must have no sessions"
+        );
+        assert!(
+            result.default_route_interface.is_none(),
+            "default ScannerResult must have no route interface"
+        );
     }
 }

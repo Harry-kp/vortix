@@ -241,3 +241,35 @@ pub trait CommandRunner: Send + Sync {
         spec: CommandSpec,
     ) -> impl std::future::Future<Output = Result<DetachedHandle, ProcessError>> + Send;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Default-constructed `oneshot` specs must not daemonize — that's
+    /// the opt-in flag for `openvpn --daemon` and similar fork+detach
+    /// subprocesses. Regression guard: an accidental flip would route
+    /// every subprocess to `Stdio::null()` and silently drop stderr.
+    #[test]
+    fn oneshot_does_not_daemonize_by_default() {
+        let spec = CommandSpec::oneshot("ls", vec!["-la".into()]);
+        assert!(!spec.daemonizes, "oneshot must default to non-daemonizing");
+    }
+
+    #[test]
+    fn detached_does_not_daemonize_by_default() {
+        let spec = CommandSpec::detached("ls", vec!["-la".into()]);
+        assert!(!spec.daemonizes, "detached spawn ≠ daemonize");
+    }
+
+    /// The `.daemonizes()` builder flips the flag. Honoured by
+    /// `RealRunner` to route stdio to `/dev/null` + use `child.wait()`
+    /// instead of `wait_with_output()` (see the field's docstring for
+    /// why this matters for `openvpn --daemon`).
+    #[test]
+    fn daemonizes_builder_sets_flag() {
+        // xtask:allow-protocol-leak: test fixture exercises the builder API; no subprocess spawned
+        let spec = CommandSpec::oneshot("openvpn", vec!["--daemon".into()]).daemonizes();
+        assert!(spec.daemonizes);
+    }
+}

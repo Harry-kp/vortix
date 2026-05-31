@@ -155,7 +155,10 @@ mod connection_state_machine {
         add_wg_profiles(&mut app, &["vpn-a"]);
         set_connecting(&mut app, "vpn-a");
 
-        app.handle_message(Message::SyncSystemState(vec![fake_session("vpn-a")]));
+        app.handle_message(Message::SyncSystemState {
+            sessions: vec![fake_session("vpn-a")],
+            default_route_interface: None,
+        });
         assert!(matches!(
             app.legacy_state(),
             ConnectionState::Connected { .. }
@@ -167,7 +170,10 @@ mod connection_state_machine {
         let mut app = test_app();
         set_connecting(&mut app, "vpn-a");
 
-        app.handle_message(Message::SyncSystemState(vec![]));
+        app.handle_message(Message::SyncSystemState {
+            sessions: vec![],
+            default_route_interface: None,
+        });
         assert!(
             matches!(app.legacy_state(), ConnectionState::Connecting { .. }),
             "Scanner must never demote Connecting -> Disconnected"
@@ -205,7 +211,10 @@ mod connection_state_machine {
         let mut app = test_app();
         set_disconnecting(&mut app, "vpn-a");
 
-        app.handle_message(Message::SyncSystemState(vec![]));
+        app.handle_message(Message::SyncSystemState {
+            sessions: vec![],
+            default_route_interface: None,
+        });
         assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
     }
 
@@ -221,7 +230,10 @@ mod connection_state_machine {
         app.registry
             .set_disconnecting(&ProfileId::new("vpn-a"), past);
 
-        app.handle_message(Message::SyncSystemState(vec![fake_session("vpn-a")]));
+        app.handle_message(Message::SyncSystemState {
+            sessions: vec![fake_session("vpn-a")],
+            default_route_interface: None,
+        });
         assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
     }
 
@@ -240,7 +252,10 @@ mod connection_state_machine {
         let mut app = test_app();
         set_connected(&mut app, "vpn-a");
 
-        app.handle_message(Message::SyncSystemState(vec![]));
+        app.handle_message(Message::SyncSystemState {
+            sessions: vec![],
+            default_route_interface: None,
+        });
         assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
         assert_eq!(app.runtime.connection_drops, 1);
     }
@@ -385,7 +400,10 @@ mod killswitch_lifecycle {
         set_connected(&mut app, "vpn-a");
 
         // VPN drops
-        app.handle_message(Message::SyncSystemState(vec![]));
+        app.handle_message(Message::SyncSystemState {
+            sessions: vec![],
+            default_route_interface: None,
+        });
 
         assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
         assert_eq!(app.runtime.killswitch_state, KillSwitchState::Blocking);
@@ -400,7 +418,10 @@ mod killswitch_lifecycle {
         set_connected(&mut app, "vpn-a");
 
         // VPN drops
-        app.handle_message(Message::SyncSystemState(vec![]));
+        app.handle_message(Message::SyncSystemState {
+            sessions: vec![],
+            default_route_interface: None,
+        });
 
         assert_eq!(app.runtime.killswitch_state, KillSwitchState::Disabled);
     }

@@ -88,16 +88,22 @@ impl App {
         }
 
         // 2. Process the result if we got one
-        if let Some(active) = result {
-            self.handle_message(Message::SyncSystemState(active));
+        if let Some(result) = result {
+            self.handle_message(Message::SyncSystemState {
+                sessions: result.sessions,
+                default_route_interface: result.default_route_interface,
+            });
         }
 
-        // 3. Kick off a new scan (scanner_rx is None here)
+        // 3. Kick off a new scan (scanner_rx is None here). The
+        // background thread probes BOTH active sessions AND the
+        // kernel default-route interface so the main thread never
+        // shells out to `route get default` / `ip route show default`.
         let profiles = self.runtime.profiles.clone();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let active = scanner::get_active_profiles(&profiles);
-            let _ = tx.send(active);
+            let snapshot = scanner::gather_system_state(&profiles);
+            let _ = tx.send(snapshot);
         });
         self.runtime.scanner_rx = Some(rx);
     }

@@ -3,7 +3,7 @@
 //! Private handler methods receive owned values destructured from the `Message` enum.
 #![allow(clippy::needless_pass_by_value)]
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::{
     App, ConnectionState, DetailedConnectionInfo, FocusedPanel, InputMode, Protocol, ToastType,
@@ -15,10 +15,37 @@ use crate::logger;
 use crate::message::{Message, ScrollMove, SelectionMove};
 use crate::utils;
 
+/// A `Message` handler taking longer than this is treated as a UI-thread
+/// stutter and surfaced via `tracing::warn`. Threshold is empirically the
+/// point at which keystrokes start to feel "queued" rather than instant
+/// — ~50ms is one render frame at 20fps. Production binaries log at this
+/// threshold via `RUST_LOG=vortix::app=warn`; the value is silent otherwise.
+const UI_HANDLER_SLOW_THRESHOLD: Duration = Duration::from_millis(50);
+
+/// Extract the variant name (without the payload) from a `Message` for
+/// observability. `format!("{msg:?}")` produces `"NextPanel"` for unit
+/// variants, `"ConnectResult { ... }"` for struct variants, etc. — we
+/// want just the name so `tracing` events are aggregatable.
+fn message_variant_label(msg: &Message) -> String {
+    let s = format!("{msg:?}");
+    s.split_once([' ', '(', '{'])
+        .map_or(s.clone(), |(prefix, _)| prefix.to_string())
+}
+
 impl App {
     /// Handle a message from the action menu or other sources
     #[allow(clippy::too_many_lines)]
     pub fn handle_message(&mut self, msg: crate::message::Message) {
+        // Slow-handler observability. The UI thread runs every
+        // `handle_message` synchronously, so anything that ties it up
+        // for more than ~50ms is likely to manifest as visible TUI
+        // stutter. We log via `tracing::warn` (silent by default;
+        // surface with `RUST_LOG=vortix::app=warn`) so production
+        // binaries don't spam stderr but operators investigating a
+        // performance complaint can turn on observability without a
+        // rebuild.
+        let started = std::time::Instant::now();
+        let variant_label = message_variant_label(&msg);
         match msg {
             // Navigation
             Message::NextPanel => self.next_panel(),
@@ -307,7 +334,19 @@ impl App {
                 self.log("APP: Logs cleared");
             }
             Message::Telemetry(update) => self.handle_telemetry(update),
-            Message::SyncSystemState(active) => self.handle_sync_system_state(active),
+            Message::SyncSystemState {
+                sessions,
+                default_route_interface,
+            } => {
+                // Pre-feed the scanner's route-iface probe into the
+                // registry's cache BEFORE processing sessions. Every
+                // downstream `set_connected` / `set_disconnected` calls
+                // `recompute_primary`, which now reads this cached value
+                // instead of shelling out from the main thread.
+                self.registry
+                    .feed_default_route_interface(default_route_interface);
+                self.handle_sync_system_state(sessions);
+            }
             Message::ConnectionTimeout(profile_name) => {
                 self.handle_connection_timeout(profile_name);
             }
@@ -321,6 +360,15 @@ impl App {
             Message::Resize(width, height) => {
                 self.terminal_size = (width, height);
             }
+        }
+        let elapsed = started.elapsed();
+        if elapsed > UI_HANDLER_SLOW_THRESHOLD {
+            tracing::warn!(
+                target: "vortix::app",
+                variant = variant_label,
+                elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+                "ui-handler slow: a Message handler blocked the UI thread for longer than the perceptible-stutter threshold"
+            );
         }
     }
 
@@ -420,12 +468,23 @@ impl App {
     }
 
     fn handle_connect_result(&mut self, profile: String, success: bool, error: Option<String>) {
-        // Ignore stale results if we're no longer in Connecting state for this profile.
-        let still_connecting = matches!(
+        // Stale-arrival check. A `ConnectResult` is stale ONLY when the
+        // user cancelled / changed context before the spawn thread's
+        // result arrived. The scanner can adopt the tunnel into the
+        // registry as `Connected` between `mirror_connecting_into_registry_at`
+        // and this handler firing (scanner runs every tick, openvpn comes
+        // up in ~13ms but the connect thread takes ~1s to confirm via
+        // `poll_log_until_ready`). When that happens, `legacy_state()`
+        // reads `Connected{this profile}` instead of `Connecting{this profile}`
+        // — that's not stale, it's the success we were going to record,
+        // just arrived via the scanner first. Treat both states as "the
+        // arrival is for this profile, proceed with success bookkeeping".
+        let still_relevant = matches!(
             self.legacy_state(),
-            ConnectionState::Connecting { profile: ref p, .. } if *p == profile
+            ConnectionState::Connecting { profile: ref p, .. } | ConnectionState::Connected { profile: ref p, .. }
+                if *p == profile
         );
-        if !still_connecting {
+        if !still_relevant {
             self.log(&format!(
                 "INFO: Ignoring stale ConnectResult for '{profile}' (state changed)"
             ));

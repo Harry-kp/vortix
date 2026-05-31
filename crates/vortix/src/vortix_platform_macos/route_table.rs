@@ -1,7 +1,22 @@
 //! macOS routing-table inspection via `route get default`.
 
+use std::time::Duration;
+
 use crate::vortix_core::ports::route_table::RouteTable;
 use crate::vortix_process::CommandSpec;
+
+/// Upper bound on the `route get default` subprocess. The query goes
+/// through the kernel's routing socket (`rtmsg`), which can take many
+/// seconds when the route table is mid-transition — e.g., right after a
+/// new VPN tunnel claims the default route. Called inline from
+/// `TunnelRegistry::recompute_primary` on the UI thread (via
+/// `set_connected` → success path of `handle_connect_result`), so an
+/// uncapped query freezes the TUI for the entire transition window
+/// (observed: 30s after an `OpenVPN` connect, exactly `rtmsg`'s retry
+/// timeout). With this cap, `route` is killed at 1s, we return [`None`],
+/// and the primary stays unset until the scanner's next tick — by which
+/// time the kernel has settled and the query returns instantly.
+const ROUTE_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// macOS routing-table reader using `route get default`.
 pub struct MacRouteTable;
@@ -23,10 +38,10 @@ impl RouteTable for MacRouteTable {
 /// Returns `None` if the subprocess fails (binary missing, non-zero exit,
 /// I/O error) so callers can degrade gracefully without panicking.
 fn run_route_get_default() -> Option<String> {
-    let output = crate::vortix_process::run_to_output(CommandSpec::oneshot(
-        "route",
-        vec!["get".into(), "default".into()],
-    ))
+    let output = crate::vortix_process::run_to_output(
+        CommandSpec::oneshot("route", vec!["get".into(), "default".into()])
+            .timeout(ROUTE_QUERY_TIMEOUT),
+    )
     .ok()?;
     Some(String::from_utf8_lossy(&output.stdout).into_owned())
 }

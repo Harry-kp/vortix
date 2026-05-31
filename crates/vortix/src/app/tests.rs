@@ -174,7 +174,10 @@ fn test_scanner_never_overrides_disconnecting_to_connected() {
     set_disconnecting(&mut app, "test-vpn");
 
     let sessions = vec![fake_session("test-vpn")];
-    app.handle_message(Message::SyncSystemState(sessions));
+    app.handle_message(Message::SyncSystemState {
+        sessions,
+        default_route_interface: None,
+    });
 
     assert!(
         matches!(app.legacy_state(), ConnectionState::Disconnecting { .. }),
@@ -188,7 +191,10 @@ fn test_scanner_confirms_disconnect_when_interface_gone() {
     let mut app = test_app();
     set_disconnecting(&mut app, "test-vpn");
 
-    app.handle_message(Message::SyncSystemState(vec![]));
+    app.handle_message(Message::SyncSystemState {
+        sessions: vec![],
+        default_route_interface: None,
+    });
 
     assert!(
         matches!(app.legacy_state(), ConnectionState::Disconnected),
@@ -211,7 +217,10 @@ fn test_scanner_safety_timeout_after_30s() {
         .set_disconnecting(&ProfileId::new("test-vpn"), past);
 
     let sessions = vec![fake_session("test-vpn")];
-    app.handle_message(Message::SyncSystemState(sessions));
+    app.handle_message(Message::SyncSystemState {
+        sessions,
+        default_route_interface: None,
+    });
 
     assert!(
         matches!(app.legacy_state(), ConnectionState::Disconnected),
@@ -228,7 +237,10 @@ fn test_scanner_disconnecting_does_not_affect_other_profiles() {
     set_disconnecting(&mut app, "vpn-a");
 
     let sessions = vec![fake_session("vpn-b")];
-    app.handle_message(Message::SyncSystemState(sessions));
+    app.handle_message(Message::SyncSystemState {
+        sessions,
+        default_route_interface: None,
+    });
 
     assert!(
         matches!(app.legacy_state(), ConnectionState::Disconnected),
@@ -406,7 +418,10 @@ fn mirror_disconnecting_transitions_existing_connected_entry() {
     add_profiles(&mut app, &["vpn-a"]);
     // Seed Connected first via the existing scanner promotion path.
     set_connecting(&mut app, "vpn-a");
-    app.handle_message(Message::SyncSystemState(vec![fake_session("vpn-a")]));
+    app.handle_message(Message::SyncSystemState {
+        sessions: vec![fake_session("vpn-a")],
+        default_route_interface: None,
+    });
     assert!(matches!(
         app.registry
             .snapshot(&ProfileId::new("vpn-a"))
@@ -567,7 +582,10 @@ fn switch_path_disconnect_completion_removes_old_profile_from_registry() {
 
     // Set up vpn-a fully connected, mirrored into the registry.
     set_connecting(&mut app, "vpn-a");
-    app.handle_message(Message::SyncSystemState(vec![fake_session("vpn-a")]));
+    app.handle_message(Message::SyncSystemState {
+        sessions: vec![fake_session("vpn-a")],
+        default_route_interface: None,
+    });
     assert_eq!(app.registry.tunnel_count(), 1, "setup precondition");
 
     // User toggles vpn-b, accepts the takeover overlay via Enter
@@ -700,7 +718,10 @@ fn test_pending_connect_drained_on_scanner_interface_gone() {
     app.runtime.pending_connect = Some(1);
     app.runtime.is_root = true;
 
-    app.handle_message(Message::SyncSystemState(vec![]));
+    app.handle_message(Message::SyncSystemState {
+        sessions: vec![],
+        default_route_interface: None,
+    });
 
     assert_eq!(app.runtime.pending_connect, None);
     assert!(
@@ -745,7 +766,10 @@ fn test_pending_cleared_on_30s_timeout() {
     app.runtime.pending_connect = Some(1);
 
     let sessions = vec![fake_session("vpn-a")];
-    app.handle_message(Message::SyncSystemState(sessions));
+    app.handle_message(Message::SyncSystemState {
+        sessions,
+        default_route_interface: None,
+    });
 
     assert_eq!(app.runtime.pending_connect, None);
     assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
@@ -2926,7 +2950,10 @@ fn scanner_promotion_from_connecting_to_connected_mirrors_into_registry() {
 
     // Drive the scanner sync directly — what `handle_sync_system_state`
     // does on every Tick when the scanner reports an `ActiveSession`.
-    app.handle_message(Message::SyncSystemState(vec![fake_session("AWS_VPN")]));
+    app.handle_message(Message::SyncSystemState {
+        sessions: vec![fake_session("AWS_VPN")],
+        default_route_interface: None,
+    });
 
     // Legacy state moved to Connected (this is what wrote
     // "Connection established to 'AWS_VPN'" to the event log in the
@@ -2967,11 +2994,17 @@ fn scanner_drop_from_connected_clears_registry() {
     // Set up the connected state through the scanner-promotion path
     // so both legacy state AND registry are in sync.
     set_connecting(&mut app, "AWS_VPN");
-    app.handle_message(Message::SyncSystemState(vec![fake_session("AWS_VPN")]));
+    app.handle_message(Message::SyncSystemState {
+        sessions: vec![fake_session("AWS_VPN")],
+        default_route_interface: None,
+    });
     assert_eq!(app.registry.tunnel_count(), 1, "setup precondition");
 
     // Scanner now reports no active sessions — the VPN went away.
-    app.handle_message(Message::SyncSystemState(vec![]));
+    app.handle_message(Message::SyncSystemState {
+        sessions: vec![],
+        default_route_interface: None,
+    });
 
     assert_eq!(
         app.registry.tunnel_count(),
@@ -3005,7 +3038,10 @@ fn mirrored_registry_entry_uses_real_interface_not_mock0() {
 
     // Scanner reports a session with the REAL interface name + pid.
     let session = fake_session("AWS_VPN");
-    app.handle_message(Message::SyncSystemState(vec![session]));
+    app.handle_message(Message::SyncSystemState {
+        sessions: vec![session],
+        default_route_interface: None,
+    });
 
     let snap = app
         .registry
@@ -3043,7 +3079,10 @@ fn mirrored_registry_entry_carries_full_rich_details_not_just_interface_and_pid(
     set_connecting(&mut app, "AWS_VPN");
 
     let session = fake_session("AWS_VPN");
-    app.handle_message(Message::SyncSystemState(vec![session]));
+    app.handle_message(Message::SyncSystemState {
+        sessions: vec![session],
+        default_route_interface: None,
+    });
 
     let snap = app
         .registry
@@ -3099,7 +3138,10 @@ fn mirror_refresh_updates_registry_when_details_change() {
     // Scanner then arrives with real session data — this hits the
     // "update existing Connected" branch (update.rs:879+).
     let session = fake_session("wg-test");
-    app.handle_message(Message::SyncSystemState(vec![session]));
+    app.handle_message(Message::SyncSystemState {
+        sessions: vec![session],
+        default_route_interface: None,
+    });
 
     let snap = app
         .registry
@@ -3150,5 +3192,67 @@ fn disconnect_result_success_removes_from_registry() {
             .snapshot(&ProfileId::new("mirror-test"))
             .is_none(),
         "no leftover snapshot for the disconnected profile"
+    );
+}
+
+/// Race regression: the scanner can adopt the tunnel as `Connected` in
+/// the registry before the connect-worker thread's `ConnectResult` lands
+/// on the main thread (scanner ticks every ~1s; `poll_log_until_ready`
+/// takes ~1s). Before the fix, `handle_connect_result` saw
+/// `Connected{this profile}` and treated the arrival as stale — silently
+/// skipping the `last_connected_profile`, `STATUS: Connected` log line,
+/// and kill-switch sync. Now `Connected{this profile}` is treated as a
+/// legitimate "the success arrived; just record the bookkeeping" path,
+/// not a stale message.
+#[test]
+fn connect_result_success_accepted_when_scanner_already_promoted_to_connected() {
+    use crate::vortix_core::profile::ProfileId;
+
+    let mut app = test_app();
+    add_profiles(&mut app, &["race-test"]);
+
+    // Simulate the race: connect-worker thread spawned, scanner sees
+    // the openvpn process and adopts the tunnel as Connected BEFORE
+    // the ConnectResult arrives.
+    set_connecting(&mut app, "race-test");
+    app.handle_message(Message::SyncSystemState {
+        sessions: vec![fake_session("race-test")],
+        default_route_interface: None,
+    });
+    assert!(
+        matches!(
+            app.legacy_state(),
+            ConnectionState::Connected { ref profile, .. } if profile == "race-test"
+        ),
+        "scanner must promote Connecting -> Connected before the ConnectResult lands"
+    );
+
+    // Now the connect-worker's ConnectResult arrives, late. Pre-fix
+    // this would be dropped as STALE because legacy_state is no longer
+    // Connecting. Post-fix it proceeds with success bookkeeping.
+    app.handle_message(Message::ConnectResult {
+        profile: "race-test".to_string(),
+        success: true,
+        error: None,
+    });
+
+    // Bookkeeping that the stale-drop used to skip:
+    assert_eq!(
+        app.runtime.last_connected_profile.as_deref(),
+        Some("race-test"),
+        "last_connected_profile must be set even when scanner beat the ConnectResult"
+    );
+    // Registry still has the tunnel as Connected (no regression on the
+    // scanner-adopted entry).
+    let snap = app
+        .registry
+        .snapshot(&ProfileId::new("race-test"))
+        .expect("registry must keep the scanner-adopted tunnel");
+    assert!(
+        matches!(
+            snap.state,
+            crate::vortix_core::engine::state::Connection::Connected { .. }
+        ),
+        "Connected state must survive the success-arrival handler"
     );
 }
