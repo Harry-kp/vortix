@@ -184,13 +184,26 @@ fn check_wireguard_by_name(name: &str) -> Option<ActiveSession> {
         return None;
     }
 
-    let interface_name = platform
-        .interface
-        .resolve_wireguard_interface(name)
+    // On macOS, `resolve_wireguard_interface` reads /var/run/wireguard/
+    // <name>.name and returns Some(utunN). On Linux, it returns None
+    // because the kernel device IS the config name — the fallback to
+    // `name.to_string()` is correct. The Some-branch (macOS happy
+    // path) is authoritative; the None fallback is authoritative on
+    // Linux but unauthoritative on macOS (where it indicates an
+    // anomalous wg-quick install / permission state).
+    let resolved = platform.interface.resolve_wireguard_interface(name);
+    let interface_name = resolved
+        .clone()
         .unwrap_or_else(|| name.to_string());
+    // `iface_authoritative` is true when the port returned Some, OR
+    // when we're on Linux (where the port always returns None and the
+    // basename IS the kernel name). The narrow unauthoritative case is
+    // macOS + None — the .name file was missing.
+    let iface_authoritative = resolved.is_some() || cfg!(target_os = "linux");
 
     let mut session = ActiveSession {
         interface: interface_name.clone(),
+        interface_authoritative: iface_authoritative,
         ..Default::default()
     };
 
@@ -301,6 +314,17 @@ fn check_openvpn_by_pid(pid: u32, config_path: &Path) -> Option<ActiveSession> {
     // 2. Find OpenVPN tun/tap interface
     // Method A: Use lsof to find the device file opened by the process (most reliable on macOS)
     let mut detected_iface = String::new();
+    // Tracks whether the interface name written into `session.interface`
+    // came from a per-PID-reliable source. Method A (lsof per PID)
+    // resolves the right utun for THIS process; Method B (ifconfig scan
+    // for "first utun with an inet that isn't WG") cannot distinguish
+    // between multiple OpenVPN PIDs and collides — both PIDs resolve
+    // to the lowest-numbered utun. The flag flows into
+    // `session.interface_authoritative` at session-return time so
+    // `App::adopt_registry_from_session` (U4) can mark the adopted
+    // entry ineligible for primary-election when the iface can't be
+    // trusted against the kernel.
+    let mut iface_authoritative = false;
 
     #[cfg(target_os = "macos")]
     // xtask:allow-platform-cfg: lsof-based OpenVPN tun-iface discovery is macOS-only; Interface port extension deferred
@@ -315,6 +339,10 @@ fn check_openvpn_by_pid(pid: u32, config_path: &Path) -> Option<ActiveSession> {
                         || dev_path.contains("tap")
                     {
                         detected_iface = dev_path.trim_start_matches("/dev/").to_string();
+                        // Method A succeeded — lsof showed THIS PID's
+                        // own /dev/utun fd, so the iface is reliably
+                        // attributable to this process.
+                        iface_authoritative = true;
                         break;
                     }
                 }
@@ -421,6 +449,10 @@ fn check_openvpn_by_pid(pid: u32, config_path: &Path) -> Option<ActiveSession> {
                             session.internal_ip =
                                 parts[1].split('/').next().unwrap_or("").to_string();
                             session.interface.clone_from(&current_iface);
+                            // Linux `ip addr` reliably attributes each
+                            // tun/tap device — no multi-PID collision
+                            // surface like the macOS Method B fallback.
+                            iface_authoritative = true;
                             break;
                         }
                     }
@@ -433,6 +465,17 @@ fn check_openvpn_by_pid(pid: u32, config_path: &Path) -> Option<ActiveSession> {
     if session.interface.is_empty() && !detected_iface.is_empty() {
         session.interface = detected_iface;
     }
+
+    // Record the iface-attribution-reliability decision on the session.
+    // The macOS Method-B fallback (first utun with `inet` that isn't WG)
+    // is the only branch above that leaves `iface_authoritative=false`:
+    // it cannot distinguish between concurrent OpenVPN processes, so
+    // when two are up, both `check_openvpn_by_pid` calls return the
+    // same utun — corrupting primary-election and per-tunnel killswitch
+    // ACCEPT rules if the registry takes that value as authoritative.
+    // R4 of the contract: adopted entries with unreliable iface are
+    // excluded from primary-election by the registry.
+    session.interface_authoritative = iface_authoritative;
 
     // No tun/tap interface means OpenVPN is running but NOT connected yet
     // (still negotiating TLS, authenticating, or has failed silently).
