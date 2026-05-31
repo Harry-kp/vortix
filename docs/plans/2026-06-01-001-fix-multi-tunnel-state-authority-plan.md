@@ -2,7 +2,7 @@
 date: 2026-06-01
 type: fix
 topic: multi-tunnel-state-authority
-status: active
+status: completed
 origin: docs/brainstorms/2026-06-01-multi-tunnel-state-authority-requirements.md
 ---
 
