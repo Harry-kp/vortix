@@ -211,11 +211,67 @@ fn sanitize_profile_name(name: &str) -> String {
 }
 
 #[allow(clippy::too_many_lines)]
+/// Anchor phrases `OpenVPN` writes to its log when it brings the kernel
+/// interface up. The device name immediately follows the anchor and is
+/// extracted as a single whitespace-delimited token.
+///
+/// Each entry is `(prefix, suffix)`:
+/// - `prefix` is what we split on; the device name is the first token after.
+/// - `suffix` is what must appear after the device name on the same line, or
+///   the empty string if the device name is the line's terminal token.
+///
+/// Pattern coverage:
+/// - macOS: `Opened utun device utun4` — utun kernel control device
+/// - Linux/BSD legacy: `TUN/TAP device tun0 opened` — works for `tap0` too
+/// - Linux modern (iproute2 path, `OpenVPN` >= 2.5): `net_iface_up: set wg-corp up`
+///
+/// The contract here is "trust the anchor phrase, not the device name."
+/// The anchor is `OpenVPN`'s log format (stable across releases); the
+/// device name is whatever the kernel reports — `utun4`, `tun0`, `tap0`,
+/// or a user-chosen name like `corp-vpn` (when the profile sets `dev`
+/// to a custom string on Linux). Hardcoding a `tun`/`utun` prefix would
+/// miss those cases.
+///
+/// Windows is not yet covered. The `OpenVPN`-Windows log format and the
+/// TAP-Windows / wintun adapter naming model are different enough
+/// (`Local Area Connection 3`, GUIDs) that this needs a separate
+/// extractor — track via `vortix_platform_windows` when Windows lands.
+const OVPN_IFACE_ANCHORS: &[(&str, &str)] = &[
+    ("Opened utun device ", ""),
+    ("TUN/TAP device ", " opened"),
+    ("net_iface_up: set ", " up"),
+];
+
+/// Parse the kernel-visible interface name from `OpenVPN`'s log output.
+///
+/// The returned name MUST equal the kernel-visible interface name; the
+/// registry's primary-election compares it byte-for-byte against
+/// `route get default` / `ip route show default` output. The legacy
+/// synthetic `openvpn-{name}` was the source of the "always Split tunnel"
+/// bug — see [`OVPN_IFACE_ANCHORS`] for the patterns we accept.
+pub(crate) fn parse_kernel_interface(log: &str) -> Option<String> {
+    for line in log.lines() {
+        for (prefix, suffix) in OVPN_IFACE_ANCHORS {
+            let Some((_, after_prefix)) = line.split_once(prefix) else {
+                continue;
+            };
+            let name = after_prefix.split_whitespace().next()?;
+            // `suffix.is_empty()` covers the "name is the terminal token"
+            // case (macOS). Otherwise the suffix must follow on the same
+            // line to confirm we matched the right log message.
+            if suffix.is_empty() || after_prefix[name.len()..].starts_with(suffix) {
+                return Some(name.to_string());
+            }
+        }
+    }
+    None
+}
+
 fn poll_log_until_ready(
     log_path: &std::path::Path,
     pid_path: &std::path::Path,
     timeout_secs: u64,
-) -> Result<u32, TunnelError> {
+) -> Result<(u32, Option<String>), TunnelError> {
     let timeout = Duration::from_secs(timeout_secs);
     let poll_interval = Duration::from_millis(OVPN_LOG_POLL_MS);
     let start = Instant::now();
@@ -261,7 +317,8 @@ fn poll_log_until_ready(
                             "OpenVPN initialised but PID file is missing".into(),
                         )
                     })?;
-                return Ok(pid);
+                let iface = parse_kernel_interface(&log_content);
+                return Ok((pid, iface));
             }
 
             for pattern in OVPN_LOG_ERRORS {
@@ -358,6 +415,7 @@ fn tail_lines(content: &str, n: usize) -> String {
 }
 
 impl Tunnel for OvpnTunnel {
+    #[allow(clippy::too_many_lines)] // single linear sequence of pid/log/auth setup + daemon spawn + log-poll; splitting would obscure the connect flow without simplifying it
     fn up(&mut self, profile: &Profile) -> Result<TunnelHandle, TunnelError> {
         let safe_name = sanitize_profile_name(&profile.display_name);
         let pid_path = self.pid_path(&safe_name);
@@ -468,11 +526,42 @@ impl Tunnel for OvpnTunnel {
         // then wait for the success marker in the log.
         thread::sleep(Duration::from_millis(OVPN_CHOWN_DELAY_MS));
         debug!(target: "vortix::tunnel::openvpn", "polling log for ready");
-        let pid = poll_log_until_ready(&log_path, &pid_path, self.connect_timeout_secs)?;
+        let (pid, kernel_iface) =
+            poll_log_until_ready(&log_path, &pid_path, self.connect_timeout_secs)?;
+
+        // The kernel interface name must come from the log scrape. The
+        // multi-tunnel state-authority contract (R1, R5 of
+        // docs/brainstorms/2026-06-01-multi-tunnel-state-authority-
+        // requirements.md) requires `details.interface` to be byte-
+        // comparable with `route get`'s output. A synthetic label like
+        // `openvpn-{safe_name}` would silently disable primary-election
+        // for this profile and silently break per-tunnel killswitch
+        // ACCEPT rules (firewall.rs reads details.interface to build
+        // PF/iptables rules — wrong iface = silent leak).
+        //
+        // If the log shows the success marker but no anchor phrase
+        // (e.g., `Opened utun device utunN` / `TUN/TAP device tunN
+        // opened` / `net_iface_up: set X up` — see OVPN_IFACE_ANCHORS),
+        // bail with a typed error so the FSM routes to
+        // `handle_connect_failure` (which then runs the orphan cleanup
+        // path against the still-running daemon via PID).
+        let Some(interface_name) = kernel_iface else {
+            warn!(
+                target: "vortix::tunnel::openvpn",
+                profile = %profile.id,
+                pid = pid,
+                "ovpn.up: success marker logged but kernel interface name not found in log; refusing to track this tunnel"
+            );
+            return Err(TunnelError::DaemonExited(format!(
+                "OpenVPN reported initialization success but no kernel interface was logged \
+                 (expected one of: `Opened utun device <name>`, `TUN/TAP device <name> opened`, \
+                 `net_iface_up: set <name> up`). Pid {pid} is being terminated."
+            )));
+        };
 
         Ok(TunnelHandle {
             profile_id: profile.id.clone(),
-            interface_name: format!("openvpn-{safe_name}"),
+            interface_name,
             pid: Some(pid),
             started_at: SystemTime::now(),
             kind: TunnelKindTag::OpenVpn,
@@ -636,6 +725,60 @@ mod tests {
     fn tail_lines_handles_short_input() {
         assert_eq!(tail_lines("a\nb\nc", 5), "a\nb\nc");
         assert_eq!(tail_lines("a\nb\nc\nd\ne", 2), "d\ne");
+    }
+
+    #[test]
+    fn parse_kernel_interface_extracts_macos_utun() {
+        let log = "Mon Jun 01 00:00:01 2026 OpenVPN 2.6.10 starting\n\
+                   Mon Jun 01 00:00:02 2026 Opened utun device utun4\n\
+                   Mon Jun 01 00:00:03 2026 Initialization Sequence Completed\n";
+        assert_eq!(parse_kernel_interface(log), Some("utun4".to_string()));
+    }
+
+    #[test]
+    fn parse_kernel_interface_extracts_linux_tun_legacy_format() {
+        let log = "Mon Jun 01 00:00:01 2026 OpenVPN 2.6.10 starting\n\
+                   Mon Jun 01 00:00:02 2026 TUN/TAP device tun0 opened\n\
+                   Mon Jun 01 00:00:03 2026 Initialization Sequence Completed\n";
+        assert_eq!(parse_kernel_interface(log), Some("tun0".to_string()));
+    }
+
+    #[test]
+    fn parse_kernel_interface_extracts_tap_device() {
+        // OpenVPN TAP (layer-2) mode produces `tap0`, not `tun0`.
+        let log = "TUN/TAP device tap0 opened\n";
+        assert_eq!(parse_kernel_interface(log), Some("tap0".to_string()));
+    }
+
+    #[test]
+    fn parse_kernel_interface_extracts_renamed_linux_device() {
+        // Linux profile with `dev mycorp` produces a kernel iface named
+        // `mycorp` — nothing to do with `tun`/`utun`. The pattern-based
+        // matcher catches this; the prior prefix-based one missed it.
+        let log = "net_iface_up: set mycorp up\n";
+        assert_eq!(parse_kernel_interface(log), Some("mycorp".to_string()));
+    }
+
+    #[test]
+    fn parse_kernel_interface_extracts_linux_modern_format() {
+        let log = "Mon Jun 01 net_iface_up: set tun3 up\n\
+                   Mon Jun 01 Initialization Sequence Completed\n";
+        assert_eq!(parse_kernel_interface(log), Some("tun3".to_string()));
+    }
+
+    #[test]
+    fn parse_kernel_interface_returns_none_for_empty_log() {
+        assert_eq!(parse_kernel_interface(""), None);
+        assert_eq!(parse_kernel_interface("no device reference here\n"), None);
+    }
+
+    #[test]
+    fn parse_kernel_interface_requires_anchor_suffix_when_present() {
+        // Bare "tun0" mention without the anchor suffix must NOT match
+        // — otherwise log noise like `setting MTU on tun0` would pick up
+        // names from non-up-event lines.
+        let log = "setting MTU on tun0\n";
+        assert_eq!(parse_kernel_interface(log), None);
     }
 
     // Plan 001 U14: argv-building behaviour for primary vs. secondary tunnels.

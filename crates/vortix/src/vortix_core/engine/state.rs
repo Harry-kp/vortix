@@ -93,7 +93,7 @@ pub struct DetailedConnectionInfo {
     /// multi-`OpenVPN`, where the ifconfig fallback collides across
     /// PIDs). Tunnels with `false` are excluded from primary-election
     /// candidacy in [`TunnelRegistry::recompute_primary`] and render
-    /// as `Role::Addressable` regardless of declared AllowedIPs,
+    /// as `Role::Addressable` regardless of declared `AllowedIPs`,
     /// because vortix cannot truthfully claim a routing status it
     /// can't verify byte-for-byte against the kernel.
     ///
