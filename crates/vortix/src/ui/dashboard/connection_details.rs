@@ -149,26 +149,35 @@ fn render_connected(
             Span::styled("Server  : ", Style::default().fg(theme::TEXT_SECONDARY)),
             Span::styled(&details.endpoint, Style::default().fg(theme::TEXT_PRIMARY)),
         ]),
-        {
-            let label_overhead = 10 + 2 + 1;
-            let available = (inner.width as usize).saturating_sub(label_overhead);
-            let isp_budget = (available * 60 / 100).min(available);
-            let loc_budget = available.saturating_sub(isp_budget);
-            Line::from(vec![
-                Span::styled("Exit    : ", Style::default().fg(theme::TEXT_SECONDARY)),
-                Span::styled(
-                    utils::truncate(&app.runtime.isp, isp_budget),
-                    Style::default().fg(theme::TEXT_PRIMARY),
-                ),
-                Span::styled(" (", Style::default().fg(theme::TEXT_SECONDARY)),
-                Span::styled(
-                    utils::truncate(&app.runtime.location, loc_budget),
-                    Style::default().fg(theme::TEXT_PRIMARY),
-                ),
-                Span::styled(")", Style::default().fg(theme::TEXT_SECONDARY)),
-            ])
-        },
     ];
+
+    // `Exit` reflects the ASN/location of the public IP returned by
+    // ipinfo.io, which only describes the egress path that the PRIMARY
+    // tunnel owns. For split tunnels (Addressable / AddressableSuppressed)
+    // the same row would either copy the primary's info (misleading —
+    // split-tunnel packets actually exit through the split's own server)
+    // or require per-CIDR telemetry vortix doesn't run. Surface the row
+    // only on the primary; the Server row above still names the
+    // tunnel's endpoint regardless.
+    if is_focused_primary {
+        let label_overhead = 10 + 2 + 1;
+        let available = (inner.width as usize).saturating_sub(label_overhead);
+        let isp_budget = (available * 60 / 100).min(available);
+        let loc_budget = available.saturating_sub(isp_budget);
+        text.push(Line::from(vec![
+            Span::styled("Exit    : ", Style::default().fg(theme::TEXT_SECONDARY)),
+            Span::styled(
+                utils::truncate(&app.runtime.isp, isp_budget),
+                Style::default().fg(theme::TEXT_PRIMARY),
+            ),
+            Span::styled(" (", Style::default().fg(theme::TEXT_SECONDARY)),
+            Span::styled(
+                utils::truncate(&app.runtime.location, loc_budget),
+                Style::default().fg(theme::TEXT_PRIMARY),
+            ),
+            Span::styled(")", Style::default().fg(theme::TEXT_SECONDARY)),
+        ]));
+    }
 
     let (proto_label, proto_value, proto_color) = if is_openvpn {
         let cipher = if details.latest_handshake.starts_with("Cipher:") {
@@ -1056,6 +1065,45 @@ mod tests {
         assert!(
             !out.contains("Not Connected"),
             "should not render disconnected for a Connected snapshot:\n{out}"
+        );
+    }
+
+    #[test]
+    fn exit_row_hidden_when_focused_tunnel_is_not_primary() {
+        // `app.runtime.isp` / `app.runtime.location` describe the
+        // egress that the PRIMARY tunnel owns (set by the ipinfo.io
+        // telemetry that goes out through whoever holds the kernel
+        // default route). Showing the same row on a split tunnel's
+        // Connection Details would either copy the primary's info
+        // (misleading) or imply per-tunnel telemetry vortix doesn't
+        // run. Hide the row when not focused on the primary.
+        let mut app = App::new_test();
+        let dir = TempDir::new().expect("tmpdir");
+        let cfg_path = dir.path().join("split.conf");
+        std::fs::write(&cfg_path, "[Interface]\n").unwrap();
+        app.runtime.profiles = vec![make_profile("split", cfg_path)];
+        app.profile_list_state.select(Some(0));
+
+        // Seed ISP + location values that WOULD render in the row.
+        app.runtime.isp = "AS14061 DigitalOcean, LLC".to_string();
+        app.runtime.location = "Frankfurt am Main, DE".to_string();
+
+        // Insert a Connected entry whose iface doesn't match any
+        // kernel-route value the test registry knows about, so
+        // is_focused_primary stays false.
+        let engine = connected_engine("split", "utun8");
+        app.registry
+            .insert(ProfileId::new("split"), engine, vec![v4("10.0.0.0/8")]);
+
+        let out = render_to_string(&mut app, 80, 20);
+        assert!(
+            !out.contains("Exit"),
+            "Exit row must not render for a non-primary tunnel — the value would be the primary's egress, not this tunnel's:\n{out}"
+        );
+        // The Server row stays — that one IS this tunnel's endpoint.
+        assert!(
+            out.contains("Server"),
+            "Server row must still render (it's tunnel-specific):\n{out}"
         );
     }
 
