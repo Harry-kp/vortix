@@ -176,9 +176,9 @@ write_files:
       PSK=$(wg genpsk)
 
       SERVER_IP=$(curl -s http://169.254.169.254/metadata/v1/interfaces/public/0/ipv4/address)
-      # Detect the actual egress interface — DO droplets sometimes ship
+      # Detect the actual egress interface -- DO droplets sometimes ship
       # with `ens3` rather than `eth0`, and hardcoding `eth0` makes the
-      # MASQUERADE rule fire on a non-existent interface → 100% packet
+      # MASQUERADE rule fire on a non-existent interface -> 100% packet
       # loss for clients with no signal from the server side.
       PUBLIC_IF=$(ip route show default | awk '/^default/ {print $5; exit}')
 
@@ -220,7 +220,6 @@ write_files:
       echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
 
       # Firewall
-      ufw allow 51820/udp
 
       # Start
       systemctl enable wg-quick@wg0
@@ -286,7 +285,6 @@ write_files:
 
       sysctl -w net.ipv4.ip_forward=1
       echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
-      ufw allow 51821/udp
       systemctl enable wg-quick@wg0
       systemctl start wg-quick@wg0
       echo "READY" > /root/.vpn-ready
@@ -354,7 +352,6 @@ write_files:
 
       sysctl -w net.ipv4.ip_forward=1
       echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
-      ufw allow 51822/udp
       systemctl enable wg-quick@wg0
       systemctl start wg-quick@wg0
       echo "READY" > /root/.vpn-ready
@@ -414,7 +411,6 @@ write_files:
       verb 3
       mssfix 1400
       tun-mtu 1400
-      fragment 1300
       push "mssfix 1400"
       push "tun-mtu 1400"
       status /var/log/openvpn-status.log
@@ -465,7 +461,7 @@ write_files:
       # Enable forwarding + NAT
       sysctl -w net.ipv4.ip_forward=1
       echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
-      # Detect the actual egress interface — see cloudinit_wg_full for
+      # Detect the actual egress interface -- see cloudinit_wg_full for
       # why hardcoding `eth0` is fatal on DO droplets that ship `ens3`.
       PUBLIC_IF=$(ip route show default | awk '/^default/ {print $5; exit}')
       iptables -t nat -A POSTROUTING -s 10.9.0.0/24 -o "$PUBLIC_IF" -j MASQUERADE
@@ -478,12 +474,11 @@ write_files:
       DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent
       netfilter-persistent save
 
-      ufw allow 1194/udp
 
       systemctl enable openvpn@server
       systemctl start openvpn@server
 
-      # Diagnostic dump — `./scripts/test-infra.sh ssh ovpn-cert` +
+      # Diagnostic dump: `./scripts/test-infra.sh ssh ovpn-cert` +
       # `cat /root/setup-diag.txt` is enough to verify forwarding is set
       # up correctly without rooting around in iptables manually.
       {
@@ -567,7 +562,6 @@ write_files:
       verb 3
       mssfix 1400
       tun-mtu 1400
-      fragment 1300
       push "mssfix 1400"
       push "tun-mtu 1400"
       status /var/log/openvpn-status.log
@@ -631,7 +625,6 @@ write_files:
       iptables -A FORWARD -o tun0 -j ACCEPT
       DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent
       netfilter-persistent save
-      ufw allow 1195/udp
 
       systemctl enable openvpn@server
       systemctl start openvpn@server
@@ -725,7 +718,6 @@ write_files:
       verb 3
       mssfix 1400
       tun-mtu 1400
-      fragment 1300
       push "mssfix 1400"
       push "tun-mtu 1400"
       status /var/log/openvpn-status.log
@@ -795,7 +787,6 @@ write_files:
       iptables -A FORWARD -o tun0 -j ACCEPT
       DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent
       netfilter-persistent save
-      ufw allow 1196/udp
 
       systemctl enable openvpn@server
       systemctl start openvpn@server
