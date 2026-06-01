@@ -79,6 +79,7 @@ impl CachedConfigView {
     }
 }
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use crate::constants;
 use crate::logger;
@@ -89,8 +90,8 @@ use crate::vpn_runtime::VpnRuntime;
 
 // Re-export state types for convenient access
 pub use crate::state::{
-    AuthField, AutoPromoteBanner, FlipAnimation, FocusedPanel, InputMode, ProfileSortOrder,
-    Protocol, Toast, ToastType, VpnProfile, AUTO_PROMOTE_REVERT_WINDOW_SECS, DISMISS_DURATION,
+    AuthField, FlipAnimation, FocusedPanel, InputMode, ProfileSortOrder,
+    Protocol, Toast, ToastType, VpnProfile, DISMISS_DURATION,
 };
 // The legacy single-tunnel `ConnectionState`/`DetailedConnectionInfo` enum
 // lives on `crate::vpn_runtime` after U6 Stage B; re-export through `app::`
@@ -161,23 +162,26 @@ pub struct App {
     /// disconnects (no-primary state).
     pub last_known_primary: Option<crate::vortix_core::profile::ProfileId>,
 
-    /// Most-recently-active primary, distinct from
-    /// [`Self::last_known_primary`] in that it SURVIVES None gaps in
-    /// the primary slot. Auto-promote-on-disconnect typically takes
-    /// two ticks: tick N observes `Some(old) -> None` (the disconnect
-    /// zeroed primary; new election hasn't happened yet); tick N+1
-    /// observes `None -> Some(new)` (scanner re-elected). The single-
-    /// step `Some(old) -> Some(new)` check on `last_known_primary`
-    /// would miss this — both ticks see one side as None. This field
-    /// remembers `old` across the None gap so the N+1 tick can fire
-    /// the banner with `old -> new`.
-    pub last_active_primary: Option<crate::vortix_core::profile::ProfileId>,
+    /// Snapshot of eligible auto-promote candidates captured at the
+    /// moment the active primary disconnected. When set, the next
+    /// `None → Some(new)` primary transition can verify that `new`
+    /// was an eligible candidate at disconnect-time — distinguishing
+    /// "yielded secondary just got promoted" (fire banner) from
+    /// "user disconnected everything and reconnected fresh" (don't).
+    ///
+    /// Set in `mirror_disconnect_into_registry` when the disconnected
+    /// profile was the active primary. Cleared on:
+    /// - A successful auto-promote detection (banner fires).
+    /// - A fresh user-initiated connect via `mirror_connect`.
+    /// - Stale entries (> `AUTO_PROMOTE_DETECTION_WINDOW_SECS`).
+    ///
+    /// Tuple: `(prior_primary, eligible_candidates, recorded_at)`.
+    pub auto_promote_candidate: Option<(
+        crate::vortix_core::profile::ProfileId,
+        Vec<crate::vortix_core::profile::ProfileId>,
+        Instant,
+    )>,
 
-    /// Multi-connection plan #001 U19 (D-3): active auto-promote banner.
-    /// When `Some`, the `[u]` keybinding reverts the promotion. Cleared by
-    /// the tick loop after [`AUTO_PROMOTE_REVERT_WINDOW_SECS`] elapses or
-    /// by an explicit user dismissal.
-    pub auto_promote_banner: Option<AutoPromoteBanner>,
 }
 
 // Plan 005 U5 removed the previous `impl Deref<Target = VpnRuntime>` — the
@@ -228,8 +232,7 @@ impl App {
             toast: None,
             terminal_size: (0, 0),
             last_known_primary: None,
-            last_active_primary: None,
-            auto_promote_banner: None,
+            auto_promote_candidate: None,
         };
 
         // Select first profile if available
@@ -385,8 +388,7 @@ impl App {
             toast: None,
             terminal_size: (80, 24),
             last_known_primary: None,
-            last_active_primary: None,
-            auto_promote_banner: None,
+            auto_promote_candidate: None,
         }
     }
 }

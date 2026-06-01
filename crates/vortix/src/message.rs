@@ -111,15 +111,6 @@ pub enum Message {
     /// transitions Connecting → Disconnected and the sidebar row clears
     /// the badge.
     CancelConnect { idx: usize },
-    /// Multi-connection plan #001 U19 (D-3): user pressed `[u]` within the
-    /// 10s window while the auto-promote banner was visible; revert the
-    /// promotion by reconnecting the old primary and demoting the new one.
-    RevertAutoPromote,
-    /// Multi-connection plan #001 U19 (D-3): auto-promote banner window
-    /// elapsed (10s) without user action; dismiss the banner. After this,
-    /// the `[u]` shortcut is no longer wired and the user must manually
-    /// run `vortix up <old-primary>` to re-fire the takeover overlay.
-    DismissAutoPromoteBanner,
 
     // === Action Menu ===
     /// Open the action menu (Single actions)

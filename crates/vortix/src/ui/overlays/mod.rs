@@ -2,7 +2,6 @@
 
 pub mod action_menu;
 pub mod auth;
-pub mod auto_promote_banner;
 pub mod config_viewer;
 pub mod confirm_dialog;
 pub mod dependency_alert;

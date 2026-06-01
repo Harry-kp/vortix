@@ -21,7 +21,15 @@ pub const HELP_OVERLAY_MAX_HEIGHT: u16 = 40;
 /// not in today's keymap. 5s is too short to read+parse+decide+act on first
 /// encounter; conventional actionable-banner UX defaults sit in the 8-10s
 /// range (Android undo banners 5-8s, Gmail undo-send 5-30s configurable).
-pub const AUTO_PROMOTE_REVERT_WINDOW_SECS: u64 = 10;
+/// Maximum age of `App::auto_promote_candidate` snapshot before it
+/// expires and stops being eligible to trigger the auto-promote
+/// toast. Bounds the case where a user disconnects everything, walks
+/// away, then connects a fresh tunnel — without expiry the stale
+/// candidate would fire a spurious "promoted X because Y
+/// disconnected" toast for a Y that disconnected long ago. 30s is
+/// comfortably longer than the scanner's worst-case latency (~2-3s)
+/// and shorter than any reasonable "I came back from a break" gap.
+pub const AUTO_PROMOTE_DETECTION_WINDOW_SECS: u64 = 30;
 
 /// Currently focused UI panel for keyboard navigation.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
@@ -385,36 +393,6 @@ impl Toast {
     }
 }
 
-/// Auto-promote banner shown when the registry promotes a new primary
-/// because the previous primary disconnected (multi-connection plan #001
-/// U19, D-3). While visible, the `[u]` shortcut reverts the promotion:
-/// reconnect the old primary, demote the new one if eligible. The banner
-/// auto-dismisses after [`AUTO_PROMOTE_REVERT_WINDOW_SECS`] seconds.
-#[derive(Clone, Debug)]
-pub struct AutoPromoteBanner {
-    /// Profile id of the previously-primary tunnel (now disconnected).
-    pub from: ProfileId,
-    /// Profile id of the newly-promoted primary.
-    pub to: ProfileId,
-    /// When the banner should auto-dismiss.
-    pub expires: Instant,
-}
-
-impl AutoPromoteBanner {
-    #[must_use]
-    pub fn new(from: ProfileId, to: ProfileId) -> Self {
-        Self {
-            from,
-            to,
-            expires: Instant::now() + Duration::from_secs(AUTO_PROMOTE_REVERT_WINDOW_SECS),
-        }
-    }
-
-    #[must_use]
-    pub fn is_expired(&self) -> bool {
-        Instant::now() > self.expires
-    }
-}
 
 #[cfg(test)]
 mod tests {

@@ -38,7 +38,6 @@ const HELP_TEXT: &[(&str, &[(&str, &str)])] = &[
             ("d", "Disconnect focused tunnel / Cancel / Force Kill"),
             ("D", "Disconnect ALL active tunnels (when N>1)"),
             ("r", "Reconnect"),
-            ("u", "Revert auto-promote (when banner is showing)"),
             ("i", "Import profile (file, dir, URL)"),
             ("K", "Cycle kill switch mode"),
             ("y", "Copy VPN IP to clipboard"),
@@ -148,7 +147,7 @@ const ROLE_GLOSSARY: &[(&str, &str)] = &[
     ),
     (
         "Split tunnel (yielded)",
-        "Wanted to be your exit (declared 0.0.0.0/0) but another tunnel won the race. 'Yielded' = stood down. Sits as a hot standby: if the active primary drops, this one auto-promotes (with a 10s banner offering [u] to revert). You see this after pressing Shift+B (Both) on the takeover overlay.",
+        "Wanted to be your exit (declared 0.0.0.0/0) but another tunnel won the race. 'Yielded' = stood down. Sits as a hot standby: if the active primary drops, the kernel re-routes through this tunnel and you'll see a toast naming the new active exit. You see this label after pressing Shift+B (Both) on the takeover overlay.",
     ),
     (
         "Split tunnel (multi, yielded)",
@@ -432,7 +431,7 @@ mod tests {
 
     #[test]
     fn multi_tunnel_keys_are_documented() {
-        // Smoke check that the U6 / U7 / U16 keys (Shift+D, [u], B on
+        // Smoke check that the multi-tunnel keys (Shift+D, B on
         // takeover, etc.) all surfaced in the keybindings section.
         use std::fmt::Write;
         let blob = HELP_TEXT.iter().flat_map(|(_, bindings)| bindings.iter()).fold(
@@ -443,7 +442,6 @@ mod tests {
             },
         );
         assert!(blob.contains("Disconnect ALL"));
-        assert!(blob.contains("auto-promote"));
         assert!(blob.contains("Connect both"));
     }
 

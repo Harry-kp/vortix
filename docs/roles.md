@@ -62,7 +62,7 @@ The Role line answers one question: **"if I open a new browser tab right now, wh
 - `Split tunnel (0.0.0.0/0, yielded)` — same; the 0/0 in parens is from the config.
 - `Split tunnel (multi, yielded)` — declares multiple subnets including 0/0; another tunnel won.
 
-**What if both routes worked?** They don't — the OS routes each packet via exactly one path. The yielded tunnel sits idle from a default-traffic perspective. If the active primary disconnects, the yielded one auto-promotes (with a banner) — that's what Shift+B's "keep both" gives you: a hot standby.
+**What if both routes worked?** They don't — the OS routes each packet via exactly one path. The yielded tunnel sits idle from a default-traffic perspective. If the active primary disconnects, the kernel re-routes through the yielded one and vortix surfaces a toast naming the new active exit — that's what Shift+B's "keep both" gives you: a hot standby.
 
 **Pet peeve note**: "yielded" is shorthand for "this VPN wanted to be primary but isn't right now." If you don't want it as a standby, just disconnect it.
 

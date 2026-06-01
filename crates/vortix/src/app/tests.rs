@@ -49,8 +49,7 @@ fn test_app() -> App {
         toast: None,
         terminal_size: (80, 24),
         last_known_primary: None,
-        last_active_primary: None,
-        auto_promote_banner: None,
+        auto_promote_candidate: None,
     }
 }
 
@@ -2757,74 +2756,6 @@ fn u19_cancel_connect_message_drives_disconnect_on_legacy_connecting() {
     );
 }
 
-#[test]
-fn u19_auto_promote_banner_dismisses_after_window() {
-    let mut app = test_app();
-    let banner = crate::state::AutoPromoteBanner {
-        from: crate::vortix_core::profile::ProfileId::new("corp"),
-        to: crate::vortix_core::profile::ProfileId::new("home"),
-        // Expired in the past — tick should clear it.
-        expires: Instant::now()
-            .checked_sub(std::time::Duration::from_secs(1))
-            .expect("monotonic clock has at least 1s of headroom in tests"),
-    };
-    app.auto_promote_banner = Some(banner);
-
-    app.handle_message(Message::Tick);
-
-    assert!(
-        app.auto_promote_banner.is_none(),
-        "expired banner must be cleared on tick"
-    );
-}
-
-#[test]
-fn u19_auto_promote_revert_clears_banner() {
-    let mut app = test_app();
-    add_profiles(&mut app, &["old-primary", "new-primary"]);
-    app.auto_promote_banner = Some(crate::state::AutoPromoteBanner::new(
-        crate::vortix_core::profile::ProfileId::new("old-primary"),
-        crate::vortix_core::profile::ProfileId::new("new-primary"),
-    ));
-
-    app.handle_message(Message::RevertAutoPromote);
-
-    assert!(
-        app.auto_promote_banner.is_none(),
-        "revert must clear the banner regardless of the reconnect outcome"
-    );
-}
-
-#[test]
-fn u19_u_keybinding_dispatches_revert_when_banner_visible() {
-    // Pressing `u` while the banner is visible dispatches the
-    // RevertAutoPromote message. We assert on the cleared banner as
-    // the observable side-effect.
-    let mut app = test_app();
-    add_profiles(&mut app, &["old-primary"]);
-    app.auto_promote_banner = Some(crate::state::AutoPromoteBanner::new(
-        crate::vortix_core::profile::ProfileId::new("old-primary"),
-        crate::vortix_core::profile::ProfileId::new("new-primary"),
-    ));
-
-    app.handle_key(key_char('u'));
-
-    assert!(app.auto_promote_banner.is_none());
-}
-
-#[test]
-fn u19_u_keybinding_is_inert_when_no_banner() {
-    // Without a visible banner, `u` falls through to the normal-key
-    // routing (which today has no `u` binding) — no state change.
-    let mut app = test_app();
-    add_profiles(&mut app, &["p1"]);
-    let initial_state = matches!(app.legacy_state(), ConnectionState::Disconnected);
-
-    app.handle_key(key_char('u'));
-
-    assert!(initial_state);
-    assert!(app.auto_promote_banner.is_none());
-}
 
 #[test]
 fn u19_active_tunnel_count_reflects_registry_after_connect() {
@@ -2839,113 +2770,22 @@ fn u19_active_tunnel_count_reflects_registry_after_connect() {
     assert_eq!(app.active_tunnel_count(), 1);
 }
 
-#[test]
-fn auto_promote_banner_fires_across_two_tick_some_none_some_transition() {
-    // Regression for the auto-promote-on-disconnect bug:
-    //
-    //   Tick N:   primary was Some(old); user disconnects old;
-    //             set_disconnected runs recompute_primary with stale
-    //             cache → primary becomes None. The tick observes
-    //             Some(old) → None.
-    //   Tick N+1: scanner ticks; cache updated; refresh_registry
-    //             elects the surviving 0/0 tunnel → primary becomes
-    //             Some(new). The tick observes None → Some(new).
-    //
-    // The naive `Some(old) → Some(new)` single-step check on
-    // `last_known_primary` misses both halves (each tick sees one
-    // side as None). The fix uses `last_active_primary` which
-    // survives the None gap.
-    use crate::vortix_core::engine::state::Connection;
-    use crate::vortix_core::profile::ProfileId;
-
-    let mut app = test_app();
-    add_profiles(&mut app, &["old-primary", "new-primary"]);
-
-    // Both tunnels are present in the registry. Seed initial primary
-    // tracking state: previously old-primary was the active primary.
-    app.last_known_primary = Some(ProfileId::new("old-primary"));
-    app.last_active_primary = Some(ProfileId::new("old-primary"));
-
-    // ─── Tick N: simulate "old-primary just disconnected, new-primary
-    //              not yet elected" — primary slot is None.
-    // (No registry entries → registry.primary() == None.)
-    app.handle_message(Message::Tick);
-    assert!(
-        app.auto_promote_banner.is_none(),
-        "Tick observing Some → None must not fire a banner (the new primary hasn't been elected yet)"
-    );
-    assert_eq!(
-        app.last_active_primary,
-        Some(ProfileId::new("old-primary")),
-        "last_active_primary must survive the None gap so tick N+1 has a `from` reference"
-    );
-
-    // ─── Tick N+1: scanner re-elected new-primary. Seed the registry.
-    // Inject a Connected entry for new-primary so registry.primary()
-    // resolves it. Need a kernel-iface probe override too — using
-    // mirror_connect_into_registry skips the probe and lets primary
-    // election happen via the test seam.
-    let details = DetailedConnectionInfo {
-        interface: "wg-utun".to_string(),
-        pid: Some(123),
-        ..Default::default()
-    };
-    app.mirror_connect_into_registry("new-primary", &details, Instant::now());
-    // Feed the cache so recompute_primary will match.
-    app.registry
-        .feed_default_route_interface(Some("wg-utun".to_string()));
-    app.registry.refresh_primary();
-    // Sanity check: registry primary IS now new-primary.
-    assert_eq!(
-        app.registry.primary().map(ProfileId::as_str),
-        Some("new-primary"),
-        "setup precondition"
-    );
-    // Pre-condition for old-primary being treated as disconnected:
-    // the registry has no entry for it (set_disconnected removed it).
-    assert!(app
-        .registry
-        .snapshot(&ProfileId::new("old-primary"))
-        .is_none());
-
-    app.handle_message(Message::Tick);
-
-    let banner = app
-        .auto_promote_banner
-        .as_ref()
-        .expect("banner MUST fire on the Some→Some-across-None auto-promote transition");
-    assert_eq!(
-        banner.from.as_str(),
-        "old-primary",
-        "banner names the prior active primary that disconnected"
-    );
-    assert_eq!(
-        banner.to.as_str(),
-        "new-primary",
-        "banner names the newly-elected primary"
-    );
-    // Toast surfaces the same message so users see it even if the
-    // banner widget hasn't rendered yet.
-    assert!(
-        app.toast.is_some(),
-        "auto-promote also surfaces via toast for visibility"
-    );
-    // Suppress unused warning on Connection (used by sibling tests
-    // that don't import it explicitly here).
-    let _ = std::marker::PhantomData::<Connection>;
-}
 
 #[test]
-fn u19_detect_primary_change_records_initial_primary_without_banner() {
-    // The first time a primary appears (None -> Some), no banner fires
-    // (that's `InitialConnect`-shaped, not `PriorPrimaryDisconnected`).
+fn detect_primary_change_records_initial_primary_without_toast() {
+    // The first time a primary appears (None -> Some), no toast fires
+    // (that's `InitialConnect`-shaped, not a promotion).
     let mut app = test_app();
-    // last_known_primary starts None; simulate the registry now reporting
-    // a primary by directly setting last_known_primary to None and
-    // running tick — without a registry primary set, current is None too
-    // and nothing changes.
     app.handle_message(Message::Tick);
-    assert!(app.auto_promote_banner.is_none());
+    assert!(
+        app.toast
+            .as_ref()
+            .map_or(true, |t| !t.message.contains("Promoted"))
+            && app
+                .toast
+                .as_ref()
+                .map_or(true, |t| !t.message.contains("active exit"))
+    );
     assert!(app.last_known_primary.is_none());
 }
 

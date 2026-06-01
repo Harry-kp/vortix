@@ -554,15 +554,6 @@ impl App {
 
     #[allow(clippy::too_many_lines)]
     fn handle_normal_keys(&mut self, key: KeyEvent) {
-        // Multi-connection plan #001 U19 (D-3): when the auto-promote banner
-        // is visible, `[u]` reverts the promotion. Routed before the global
-        // key match so it can shadow any future `u` binding without
-        // surprising the user.
-        if key.code == KeyCode::Char('u') && self.auto_promote_banner.is_some() {
-            self.handle_message(Message::RevertAutoPromote);
-            return;
-        }
-
         // Tab is reserved for panel navigation (always advances to the
         // next UI panel). Connection Details mirrors the sidebar's
         // current selection — switching which tunnel's details are

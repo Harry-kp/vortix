@@ -159,10 +159,6 @@ impl App {
                 self.disconnect_all_active();
             }
             Message::CancelConnect { idx } => self.cancel_connect(idx),
-            Message::RevertAutoPromote => self.handle_revert_auto_promote(),
-            Message::DismissAutoPromoteBanner => {
-                self.auto_promote_banner = None;
-            }
             Message::ProfileMove(mv) => match mv {
                 SelectionMove::Next => self.profile_next(),
                 SelectionMove::Prev => self.profile_previous(),
@@ -1359,14 +1355,11 @@ impl App {
                 self.handle_message(Message::ConnectionTimeout(profile));
             }
         }
-        // 1b. Multi-connection plan #001 U19 (D-3): detect primary-tunnel
-        //     transitions and fire / expire the auto-promote banner.
+        // Detect primary-tunnel transitions and fire the auto-promote
+        // toast. Toast-only notification (no central banner widget, no
+        // [u] revert hotkey — the user decides what action to take
+        // after being informed).
         self.detect_primary_change_for_banner();
-        if let Some(banner) = &self.auto_promote_banner {
-            if banner.is_expired() {
-                self.auto_promote_banner = None;
-            }
-        }
         // 2. Expire toast
         if let Some(toast) = &self.toast {
             if toast.is_expired() {
@@ -1429,99 +1422,85 @@ impl App {
     /// `InitialConnect` (no prior primary) or `ExternalRouteChange`
     /// (previous primary still up, route flapped).
     fn detect_primary_change_for_banner(&mut self) {
-        use crate::vortix_core::engine::state::Connection;
         let current = self.registry.primary().cloned();
+
+        // Expire stale auto-promote candidates regardless of primary
+        // transitions. Old candidates from minutes-ago disconnects
+        // would otherwise fire spurious banners on the next fresh
+        // connect that happens to be in their eligibility list.
+        if let Some((_, _, recorded_at)) = &self.auto_promote_candidate {
+            if recorded_at.elapsed().as_secs()
+                > crate::state::AUTO_PROMOTE_DETECTION_WINDOW_SECS
+            {
+                tracing::debug!(
+                    target: "vortix::app::auto_promote",
+                    "expiring stale auto-promote candidate snapshot"
+                );
+                self.auto_promote_candidate = None;
+            }
+        }
+
         if current == self.last_known_primary {
             return;
         }
+        let prev_known = self.last_known_primary.clone();
         self.last_known_primary.clone_from(&current);
+        tracing::debug!(
+            target: "vortix::app::auto_promote",
+            ?prev_known,
+            current = ?current,
+            "primary transition observed"
+        );
 
-        // Auto-promote-on-disconnect is structurally a TWO-TICK
-        // transition:
-        //   Tick N:    primary was Some(old); user disconnects old;
-        //              set_disconnected runs recompute_primary against
-        //              the still-stale cache → primary becomes None.
-        //              Observed: Some(old) → None.
-        //   Tick N+1:  scanner ticks; cache updated to the new kernel
-        //              egress; refresh_registry fires set_connected on
-        //              the surviving 0/0 tunnel → primary becomes
-        //              Some(new). Observed: None → Some(new).
+        // Fire auto-promote ONLY when:
+        // 1. Current primary transitioned to Some(new).
+        // 2. We have an unexpired candidate snapshot from a prior
+        //    disconnect of an active primary.
+        // 3. `new` is in the candidate eligibility list — i.e., it
+        //    was a Connected AddressableSuppressed tunnel at the
+        //    moment the prior primary disconnected.
         //
-        // A naive `Some(old) → Some(new)` check on `last_known_primary`
-        // would miss this — the intermediate None breaks the
-        // single-step pattern. `last_active_primary` survives the None
-        // gap by only updating when current is Some, so the N+1 tick
-        // can fire the banner with the right `old → new` pair.
-        if let Some(new) = current.as_ref() {
-            let prior = self.last_active_primary.replace(new.clone());
-            let Some(old) = prior else {
-                // No prior active primary → initial connect, silent.
-                return;
-            };
-            if old == *new {
-                return;
-            }
-            // Heuristic: the prior primary should have just disconnected
-            // (snapshot is Disconnected or gone). When the prior primary
-            // is still active this is an `ExternalRouteChange`-shaped
-            // transition (route flapped while both tunnels remain up)
-            // and the banner is not appropriate.
-            let prior_active = self
-                .registry
-                .snapshot(&old)
-                .is_some_and(|s| !matches!(s.state, Connection::Disconnected { .. }));
-            if prior_active {
-                return;
-            }
-
-            let banner_msg = format!(
-                "Promoted '{}' to primary because '{}' disconnected — [u] to revert ({}s)",
-                new.as_str(),
-                old.as_str(),
-                crate::state::AUTO_PROMOTE_REVERT_WINDOW_SECS,
-            );
-            self.log(&format!("STATUS: {banner_msg}"));
-            self.auto_promote_banner = Some(crate::state::AutoPromoteBanner::new(old, new.clone()));
-            // Surface the message through the existing toast channel so users
-            // see it even if the banner widget hasn't rendered yet (U17 owns
-            // banner painting; U19 wires the data flow).
-            self.show_toast(banner_msg, ToastType::Warning);
-        }
-        // current is None: keep `last_active_primary` as-is so the
-        // next Some transition can reference the old primary.
-    }
-
-    /// Multi-connection plan #001 U19 (D-3): revert an auto-promotion.
-    /// Reconnects the old primary (re-fires the takeover overlay because
-    /// the new primary now holds the default route) and clears the
-    /// banner. The actual demotion of the new tunnel is the user's
-    /// implicit choice when they confirm the takeover overlay.
-    fn handle_revert_auto_promote(&mut self) {
-        let Some(banner) = self.auto_promote_banner.take() else {
+        // This is the cleanest distinguisher between "secondary
+        // auto-promoted" and "user disconnected everything and
+        // reconnected fresh" — only candidates present in the
+        // registry at disconnect-time qualify; a fresh connect
+        // (via mirror_connect, which clears the candidate) does not.
+        let Some(new) = current else {
             return;
         };
-        let old_name = banner.from.as_str().to_string();
-        let new_name = banner.to.as_str().to_string();
-        self.log(&format!(
-            "ACTION: Reverting auto-promotion — reconnecting '{old_name}' (demoting '{new_name}' if eligible)"
-        ));
-
-        // Find the old primary by name; route it through the existing
-        // connect path so the conflict gate fires (the new primary holds
-        // 0/0 now, so ConfirmDefaultRouteTakeover is the expected overlay).
-        if let Some(idx) = self
-            .runtime
-            .profiles
-            .iter()
-            .position(|p| p.name == old_name)
-        {
-            self.connect_profile(idx);
-        } else {
-            self.show_toast(
-                format!("Cannot revert — profile '{old_name}' not found"),
-                ToastType::Error,
+        let Some((old, candidates, _)) = self.auto_promote_candidate.as_ref() else {
+            return;
+        };
+        if !candidates.contains(&new) {
+            tracing::debug!(
+                target: "vortix::app::auto_promote",
+                new = %new.as_str(),
+                "new primary not in candidate list — initial connect or unexpected transition"
             );
+            return;
         }
+        let old = old.clone();
+        // Consume the candidate — banner only fires once per
+        // disconnect.
+        self.auto_promote_candidate = None;
+
+        tracing::info!(
+            target: "vortix::app::auto_promote",
+            old = %old.as_str(),
+            new = %new.as_str(),
+            "firing auto-promote toast"
+        );
+        // Toast-only notification, no [u] hotkey, no banner widget.
+        // User chooses what to do (reconnect old, leave new, disconnect
+        // either) — vortix just informs them which tunnel is now the
+        // active exit.
+        let toast_msg = format!(
+            "'{}' is now the active exit — '{}' disconnected.",
+            new.as_str(),
+            old.as_str(),
+        );
+        self.log(&format!("STATUS: {toast_msg}"));
+        self.show_toast(toast_msg, ToastType::Warning);
     }
 
     fn handle_cycle_log_filter(&mut self) {

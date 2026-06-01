@@ -116,13 +116,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     render_overlays(frame, app);
 
-    // Plan 001 U19: auto-promote banner rides above the dashboard
-    // (top-center) when the registry just promoted a 0/0 secondary
-    // because the prior primary dropped. The banner state is
-    // mutated by `update.rs`'s tick loop; this is the render path
-    // that was missing — without it the user never sees the
-    // banner and never knows `[u]` is available to revert.
-    super::overlays::auto_promote_banner::render(frame, app);
+    // Auto-promote notification surfaces as a top-right toast (set in
+    // `detect_primary_change_for_banner`). No central banner widget,
+    // no [u] revert hotkey — the user decides what action to take.
 
     // Render Zoomed Panel Overlay (if active)
     if let Some(panel) = &app.zoomed_panel {
