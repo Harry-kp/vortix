@@ -69,8 +69,13 @@ use ratatui::{
 ///
 /// Returns the (glyph, style) pair for the status cell. `None` means the row
 /// is fully disconnected with no failure — caller renders a blank cell.
+///
+/// All visual specs (glyph + color + modifiers) come from
+/// [`crate::ui::sigils::CATALOG`] — the single source of truth shared
+/// between this renderer and the `?` help overlay's Sigils tab.
 fn status_badge_for(snapshot: &TunnelSnapshot) -> Option<(&'static str, Style)> {
-    match &snapshot.state {
+    use crate::ui::sigils::{sigil, SigilId};
+    let id = match &snapshot.state {
         Connection::Connected { details, .. } => {
             // R4 of the state-authority contract: Connected entries whose
             // interface name vortix couldn't reliably attribute to a PID
@@ -79,30 +84,22 @@ fn status_badge_for(snapshot: &TunnelSnapshot) -> Option<(&'static str, Style)> 
             // PIDs) render with a muted/dim treatment. They ARE up;
             // vortix just can't verify their routing posture.
             if details.interface_authoritative {
-                Some(("●", Style::default().fg(theme::SUCCESS)))
+                SigilId::Connected
             } else {
-                Some((
-                    "●",
-                    Style::default()
-                        .fg(theme::INACTIVE)
-                        .add_modifier(Modifier::DIM),
-                ))
+                SigilId::ConnectedUnauthoritative
             }
         }
-        Connection::Connecting { .. } => Some(("◐", Style::default().fg(theme::WARNING))),
-        Connection::Reconnecting { .. } => Some((
-            "↻",
-            Style::default()
-                .fg(theme::WARNING)
-                .add_modifier(Modifier::DIM),
-        )),
-        Connection::Disconnecting { .. } => Some(("◑", Style::default().fg(theme::WARNING))),
-        Connection::AwaitingUserInput { .. } => Some(("?", Style::default().fg(theme::WARNING))),
+        Connection::Connecting { .. } => SigilId::Connecting,
+        Connection::Reconnecting { .. } => SigilId::Reconnecting,
+        Connection::Disconnecting { .. } => SigilId::Disconnecting,
+        Connection::AwaitingUserInput { .. } => SigilId::AwaitingInput,
         Connection::Disconnected {
             last_failure: Some(_),
-        } => Some(("✗", Style::default().fg(theme::ERROR))),
-        Connection::Disconnected { last_failure: None } => None,
-    }
+        } => SigilId::Failed,
+        Connection::Disconnected { last_failure: None } => return None,
+    };
+    let s = sigil(id);
+    Some((s.glyph, s.style()))
 }
 
 /// Does this snapshot warrant a `!` risk annotation in the sidebar?

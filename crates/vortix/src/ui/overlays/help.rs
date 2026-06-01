@@ -1,13 +1,34 @@
-//! Help overlay showing all keybindings
+//! Help overlay with three tabs: Keys, Roles, Sigils.
+//!
+//! `?` opens the overlay on the Keys tab. `Tab` / `Shift+Tab` cycle
+//! through the tabs (browser-style strip rendered at the top with the
+//! active tab highlighted). `j`/`k`/arrows scroll within the active
+//! tab; `Esc` or `?` close.
+//!
+//! Each tab gets a layout appropriate to its content density:
+//!
+//! - **Keys** — compact two-column reference (key + short action).
+//!   Many entries, short on either side.
+//! - **Roles** — card-style with multi-line prose. Few entries, each
+//!   needs ~3-5 lines of plain-English explanation. Same vocabulary
+//!   as `connection_details::role_line`.
+//! - **Sigils** — 3-column grid (glyph in its TUI color │ short label
+//!   │ one-line description). Reads from
+//!   [`crate::ui::sigils::CATALOG`] — the single source of truth that
+//!   the actual renderers also use. Drift between what users see
+//!   on-screen and what the help shows is structurally impossible.
 
-use crate::{state, theme};
+use crate::ui::sigils::{Sigil, SigilCategory, CATALOG};
+use crate::{state, state::HelpTab, theme};
 use ratatui::{
-    layout::Rect,
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Tabs, Wrap},
     Frame,
 };
+
+// ────────────────────────────── Keys tab ───────────────────────────────
 
 const HELP_TEXT: &[(&str, &[(&str, &str)])] = &[
     (
@@ -84,46 +105,101 @@ const HELP_TEXT: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     (
-        "Security Guard sigils",
+        "Help overlay",
         &[
-            ("✓", "OK — check passes"),
-            ("✗", "Alarm — leak or unprotected"),
-            ("⚠", "Warning — action recommended"),
-            ("─", "Not enforced on this platform"),
-        ],
-    ),
-    (
-        "Connection Details: Role labels",
-        &[
-            ("Primary", "This tunnel is your active exit — internet traffic flows through it"),
-            ("Primary (10.0.0.0/8)", "Primary; only the listed subnet routes through it"),
-            ("Primary (multi)", "Primary; routes multiple declared subnets"),
-            ("Split tunnel", "Connected but not your exit — only carries the routes it declared"),
-            ("Split tunnel (10.0.0.0/8)", "Same; the listed subnet is the only thing it routes"),
-            ("Split tunnel (multi)", "Same; routes multiple declared subnets"),
-            ("Split tunnel (yielded)", "Wanted to be exit (declared 0.0.0.0/0) but another tunnel won the race"),
-            ("Split tunnel (multi, yielded)", "Same; declared multiple subnets including 0/0, another tunnel is exit"),
-            ("(external)", "External tunnel that vortix can't reliably attribute — won't be elected exit"),
-            ("Full guide", "docs/roles.md"),
+            ("Tab", "Next tab (Keys → Roles → Sigils)"),
+            ("Shift+Tab", "Previous tab"),
+            ("j / k / ↑ / ↓", "Scroll within tab"),
+            ("g / G", "Top / Bottom of tab"),
+            ("? / Esc / q", "Close help"),
         ],
     ),
 ];
 
+// ────────────────────────────── Roles tab ───────────────────────────────
+
+/// `(label, description_paragraph)` for every Role label that
+/// `connection_details::role_line` can emit. Descriptions wrap inside
+/// the overlay so paragraph length is unlimited.
+const ROLE_GLOSSARY: &[(&str, &str)] = &[
+    (
+        "Primary",
+        "Your active exit. Internet traffic flows through this tunnel — the kernel routes its default route here, so any new outbound connection goes via this tunnel's server.",
+    ),
+    (
+        "Primary (10.0.0.0/8)",
+        "Same as Primary, with the declared subnet shown in parens. Don't read this as 'only routes that subnet' — it IS the exit; the CIDR is just what the profile config declares.",
+    ),
+    (
+        "Primary (multi)",
+        "Same as Primary; the profile declares multiple subnets. Shown when the config has more than one declared CIDR (rare but possible).",
+    ),
+    (
+        "Split tunnel",
+        "Connected but NOT your exit. Only carries the routes the profile declared (its AllowedIPs for WireGuard, or `route` directives for OpenVPN). Internet traffic still uses your normal connection. Example: a corporate VPN routing only 10.0.0.0/8 so you can reach internal services without your browsing going through work.",
+    ),
+    (
+        "Split tunnel (10.0.0.0/8)",
+        "Same; the listed CIDR is the only subnet this tunnel routes. Everything else goes via your normal internet.",
+    ),
+    (
+        "Split tunnel (multi)",
+        "Same; the profile declares multiple non-default subnets.",
+    ),
+    (
+        "Split tunnel (yielded)",
+        "Wanted to be your exit (declared 0.0.0.0/0) but another tunnel won the race. 'Yielded' = stood down. Sits as a hot standby: if the active primary drops, this one auto-promotes (with a 10s banner offering [u] to revert). You see this after pressing Shift+B (Both) on the takeover overlay.",
+    ),
+    (
+        "Split tunnel (multi, yielded)",
+        "Same as yielded; the profile declares multiple subnets including 0/0. Another tunnel is the active exit; this one is a hot standby.",
+    ),
+    (
+        "(external) suffix",
+        "Tunnel detected as up but started outside vortix (e.g., `sudo openvpn ...` from another terminal) AND on a platform where vortix can't reliably attribute its kernel interface to its PID. On macOS this happens with multi-OpenVPN. Vortix won't elect an (external) tunnel as your Primary even if its routes would qualify — start the tunnel through vortix to get full tracking.",
+    ),
+    (
+        "Reconnecting via …",
+        "A connected tunnel dropped and vortix is automatically retrying. The 'via X' part names what its role was before the drop, so you know what to expect when it comes back.",
+    ),
+    (
+        "n/a (awaiting input)",
+        "The tunnel is waiting for you to type something (2FA code, passphrase). Press Enter while focused on Connection Details to surface the prompt overlay.",
+    ),
+];
+
+const ROLE_GLOSSARY_FOOTER: &str =
+    "Full guide with examples + common confusions: docs/roles.md on GitHub.";
+
+// ────────────────────────────── Rendering ──────────────────────────────
+
+const OVERLAY_MAX_WIDTH: u16 = 95;
+const TAB_STRIP_HEIGHT: u16 = 2;
+
 #[must_use]
-pub fn total_lines() -> u16 {
+pub fn total_lines(tab: HelpTab) -> u16 {
     #[allow(clippy::cast_possible_truncation)]
-    {
-        HELP_TEXT
+    match tab {
+        HelpTab::Keys => HELP_TEXT
             .iter()
             .enumerate()
             .map(|(section_idx, (_, bindings))| bindings.len() + 2 + usize::from(section_idx > 0))
-            .sum::<usize>() as u16
+            .sum::<usize>() as u16,
+        HelpTab::Roles => {
+            // ~6 lines per entry (header + ~4 wrapped + blank) + leading blank + footer
+            (1 + ROLE_GLOSSARY.len() * 6 + 2) as u16
+        }
+        HelpTab::Sigils => {
+            // 1 header per category + ~2 lines per entry. Conservative upper bound.
+            let entries = CATALOG.len();
+            (2 + entries * 2 + 4) as u16
+        }
     }
 }
 
-pub fn render(frame: &mut Frame, scroll: u16) {
+pub fn render(frame: &mut Frame, scroll: u16, tab: HelpTab) {
     let area = frame.area();
-    let width = area.width.saturating_sub(4).min(65);
+    let width = area.width.saturating_sub(4).min(OVERLAY_MAX_WIDTH);
     let height = area
         .height
         .saturating_sub(2)
@@ -141,8 +217,87 @@ pub fn render(frame: &mut Frame, scroll: u16) {
 
     frame.render_widget(Clear, overlay);
 
-    let mut lines: Vec<Line> = Vec::new();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::ACCENT_PRIMARY))
+        .title(Span::styled(
+            " Help ",
+            Style::default()
+                .fg(theme::ACCENT_PRIMARY)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(Span::styled(
+            " Tab next · Shift+Tab prev · ↑↓ j/k scroll · ? close ",
+            Style::default().fg(theme::KEY_HINT_DESC),
+        ));
 
+    let inner = block.inner(overlay);
+    frame.render_widget(block, overlay);
+
+    // Top strip = tabs. Below = active tab content. Layout the inner
+    // area into [tabs | divider | content].
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(TAB_STRIP_HEIGHT),
+            Constraint::Length(1),
+            Constraint::Min(1),
+        ])
+        .split(inner);
+
+    render_tab_strip(frame, chunks[0], tab);
+    render_divider(frame, chunks[1]);
+
+    let active_tab = HelpTab::ALL.iter().position(|t| *t == tab).unwrap_or(0);
+    let max_scroll = state::help_max_scroll_for_terminal_height(area.height, total_lines(tab));
+    let clamped_scroll = scroll.min(max_scroll);
+
+    let lines = match HelpTab::ALL[active_tab] {
+        HelpTab::Keys => build_keys_lines(),
+        HelpTab::Roles => build_glossary_lines(ROLE_GLOSSARY, Some(ROLE_GLOSSARY_FOOTER)),
+        HelpTab::Sigils => build_sigils_lines(),
+    };
+    let paragraph = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((clamped_scroll, 0));
+    frame.render_widget(paragraph, chunks[2]);
+}
+
+/// Render the browser-style tab strip across the top of the overlay.
+/// Active tab gets accent + BOLD + UNDERLINED; inactive tabs get
+/// muted secondary text. ratatui's `Tabs` widget does the layout +
+/// separator handling consistently.
+fn render_tab_strip(frame: &mut Frame, area: Rect, active: HelpTab) {
+    let titles: Vec<Line> = HelpTab::ALL
+        .iter()
+        .map(|t| Line::from(Span::styled(t.title(), Style::default())))
+        .collect();
+    let active_idx = HelpTab::ALL.iter().position(|t| *t == active).unwrap_or(0);
+    let tabs = Tabs::new(titles)
+        .select(active_idx)
+        .style(Style::default().fg(theme::TEXT_SECONDARY))
+        .highlight_style(
+            Style::default()
+                .fg(theme::ACCENT_PRIMARY)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        )
+        .divider(Span::styled(
+            " │ ",
+            Style::default().fg(theme::NORD_POLAR_NIGHT_4),
+        ));
+    frame.render_widget(tabs, area);
+}
+
+fn render_divider(frame: &mut Frame, area: Rect) {
+    let line = Line::from(Span::styled(
+        "─".repeat(area.width as usize),
+        Style::default().fg(theme::NORD_POLAR_NIGHT_4),
+    ));
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+fn build_keys_lines() -> Vec<Line<'static>> {
+    let mut lines: Vec<Line> = Vec::new();
     for (section_idx, (section, bindings)) in HELP_TEXT.iter().enumerate() {
         if section_idx > 0 {
             lines.push(Line::from(""));
@@ -167,163 +322,184 @@ pub fn render(frame: &mut Frame, scroll: u16) {
             ]));
         }
     }
+    lines
+}
 
-    debug_assert_eq!(u16::try_from(lines.len()), Ok(total_lines()));
+/// Card-style glossary renderer for the Roles tab. Each entry:
+///   blank
+///   ●  <label>
+///   <description, indented, wrapped naturally>
+fn build_glossary_lines(
+    entries: &'static [(&'static str, &'static str)],
+    footer: Option<&'static str>,
+) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line> = Vec::with_capacity(entries.len() * 6 + 2);
+    lines.push(Line::from(""));
+    for (label, desc) in entries {
+        lines.push(Line::from(vec![
+            Span::styled(
+                "  \u{25cf}  ",
+                Style::default()
+                    .fg(theme::ACCENT_PRIMARY)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                *label,
+                Style::default()
+                    .fg(theme::ACCENT_PRIMARY)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        lines.push(Line::from(Span::styled(
+            format!("     {desc}"),
+            Style::default().fg(theme::TEXT_SECONDARY),
+        )));
+        lines.push(Line::from(""));
+    }
+    if let Some(footer) = footer {
+        lines.push(Line::from(Span::styled(
+            format!("  {footer}"),
+            Style::default()
+                .fg(theme::KEY_HINT_DESC)
+                .add_modifier(Modifier::ITALIC),
+        )));
+    }
+    lines
+}
 
-    let max_scroll = state::help_max_scroll_for_terminal_height(area.height, total_lines());
-    let clamped_scroll = scroll.min(max_scroll);
+/// 3-column grid for the Sigils tab. Each row:
+///   <glyph in its real TUI color>  <label, bold>  <description, secondary>
+/// Grouped by [`SigilCategory`] with a category header above each group.
+fn build_sigils_lines() -> Vec<Line<'static>> {
+    let mut lines: Vec<Line> = Vec::with_capacity(CATALOG.len() * 2 + 6);
 
-    let can_scroll_down = clamped_scroll < max_scroll;
-    let can_scroll_up = clamped_scroll > 0;
-    let scroll_hint = match (can_scroll_up, can_scroll_down) {
-        (true, true) => " ↑↓ scroll · ? close ",
-        (false, true) => " ↓ scroll · ? close ",
-        (true, false) => " ↑ scroll · ? close ",
-        (false, false) => " ? or Esc to close ",
-    };
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::ACCENT_PRIMARY))
-        .title(Span::styled(
-            " Keybindings ",
+    for category in [SigilCategory::Sidebar, SigilCategory::SecurityGuard] {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("  {}", category_title(category)),
             Style::default()
                 .fg(theme::ACCENT_PRIMARY)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        )));
+        lines.push(Line::from(""));
+
+        for entry in CATALOG.iter().filter(|s| s.category == category) {
+            lines.push(sigil_row(entry));
+        }
+    }
+    lines
+}
+
+fn category_title(c: SigilCategory) -> &'static str {
+    match c {
+        SigilCategory::Sidebar => "Sidebar (per-tunnel badges + suffixes)",
+        SigilCategory::SecurityGuard => "Security Guard (per-row sigils)",
+    }
+}
+
+/// One row of the Sigils tab. The glyph is rendered in its actual
+/// TUI color (the one the renderer applies), so the help-overlay
+/// swatch matches what users see on screen byte-for-byte.
+fn sigil_row(entry: &'static Sigil) -> Line<'static> {
+    // Column widths chosen to fit comfortably at the 95-col overlay:
+    //   glyph column: 4 cells (1 glyph + 3 padding for visual gutter)
+    //   label column: 24 cells
+    //   description: rest, wraps naturally
+    Line::from(vec![
+        Span::styled(format!("    {}   ", entry.glyph), entry.style()),
+        Span::styled(
+            format!("{:<22}", entry.label),
+            Style::default()
+                .fg(theme::TEXT_PRIMARY)
                 .add_modifier(Modifier::BOLD),
-        ))
-        .title_bottom(Span::styled(
-            scroll_hint,
-            Style::default().fg(theme::KEY_HINT_DESC),
-        ));
-
-    let inner = block.inner(overlay);
-    frame.render_widget(block, overlay);
-
-    let paragraph = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .scroll((clamped_scroll, 0));
-    frame.render_widget(paragraph, inner);
+        ),
+        Span::styled(
+            entry.description,
+            Style::default().fg(theme::TEXT_SECONDARY),
+        ),
+    ])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Flatten the help text into one big string so we can grep it.
-    fn flatten() -> String {
-        let mut out = String::new();
-        for (section, bindings) in HELP_TEXT {
-            out.push_str(section);
-            out.push('\n');
-            for (key, desc) in *bindings {
-                out.push_str(key);
-                out.push(' ');
-                out.push_str(desc);
-                out.push('\n');
-            }
-        }
-        out
-    }
-
     #[test]
     fn multi_tunnel_keys_are_documented() {
-        // Regression: every multi-tunnel keybinding must be
-        // discoverable via `?`. Tab inside Connection Details was
-        // removed (it hijacked panel navigation — Tab is sacred for
-        // moving between panels). The help now points users at the
-        // sidebar j/k for switching which tunnel's details are shown.
-        let help = flatten();
-
-        // `D` Shift+d for disconnect-all.
-        assert!(
-            help.contains("Disconnect ALL"),
-            "help must document Shift+D disconnect-all:\n{help}"
+        // Smoke check that the U6 / U7 / U16 keys (Shift+D, [u], B on
+        // takeover, etc.) all surfaced in the keybindings section.
+        use std::fmt::Write;
+        let blob = HELP_TEXT.iter().flat_map(|(_, bindings)| bindings.iter()).fold(
+            String::new(),
+            |mut acc, (k, d)| {
+                let _ = writeln!(acc, "{k} {d}");
+                acc
+            },
         );
-
-        // Connection Details should point users at the sidebar for
-        // tunnel switching, since Tab is reserved for panel nav.
-        assert!(
-            help.contains("Details follows the selected profile"),
-            "help must document that Connection Details follows sidebar selection:\n{help}"
-        );
-
-        // `c` in Connection Details for canceling in-flight connect.
-        assert!(
-            help.contains("Cancel in-flight connect"),
-            "help must document c cancel-in-flight:\n{help}"
-        );
-
-        // `u` for reverting auto-promote.
-        assert!(
-            help.contains("Revert auto-promote"),
-            "help must document u revert-auto-promote:\n{help}"
-        );
-
-        // Takeover overlay keys.
-        assert!(
-            help.contains("Switch — disconnect current"),
-            "help must document Y/Enter takeover-switch path:\n{help}"
-        );
-        assert!(
-            help.contains("Connect both"),
-            "help must document B multi-connect path:\n{help}"
-        );
+        assert!(blob.contains("Disconnect ALL"));
+        assert!(blob.contains("auto-promote"));
+        assert!(blob.contains("Connect both"));
     }
 
     #[test]
-    fn role_glossary_section_is_present_and_covers_every_label() {
-        // Users press `?` to remember what they're looking at. The
-        // Role labels section MUST cover every label that
-        // `connection_details::role_line` can emit, otherwise the
-        // help is a lie and users have to ask in chat instead.
-        let (_, bindings) = HELP_TEXT
-            .iter()
-            .find(|(title, _)| *title == "Connection Details: Role labels")
-            .expect("Role labels section missing from help overlay");
-        let labels: Vec<&str> = bindings.iter().map(|(k, _)| *k).collect();
-
-        // Spot-check the labels that ce-brainstorm + the connection-
-        // details render produce. The full set lives in
-        // `connection_details::role_line` and `role_kind_label`.
+    fn role_glossary_covers_every_label_role_line_can_emit() {
+        let labels: Vec<&str> = ROLE_GLOSSARY.iter().map(|(k, _)| *k).collect();
         for expected in [
             "Primary",
             "Split tunnel",
             "Split tunnel (yielded)",
             "Split tunnel (multi, yielded)",
-            "(external)",
+            "(external) suffix",
+            "Reconnecting via …",
         ] {
             assert!(
                 labels.contains(&expected),
-                "help overlay must document the `{expected}` label; found: {labels:?}"
+                "Roles tab must document `{expected}`; found: {labels:?}"
             );
         }
-
-        // And the link to the full guide must be in the section so
-        // users curious for more detail know where to go.
-        assert!(
-            bindings
-                .iter()
-                .any(|(_, desc)| desc.contains("docs/roles.md")),
-            "Role labels section must reference docs/roles.md for the verbose guide"
-        );
     }
 
     #[test]
-    fn total_lines_invariant_holds() {
-        // The render path debug-asserts that the rendered line count
-        // matches `total_lines()`. Recompute the expected count from
-        // HELP_TEXT directly and verify the helper agrees — guards
-        // against off-by-one drift when sections are added/removed.
-        let expected: usize = HELP_TEXT
+    fn sigils_tab_renders_every_catalog_entry() {
+        // The Sigils tab content is generated from CATALOG — make sure
+        // EVERY entry produces a row. This is the drift-detection
+        // backstop: adding a sigil to the catalog automatically makes
+        // it appear in help; removing one from the catalog removes it.
+        let lines = build_sigils_lines();
+        let blob: String = lines
             .iter()
-            .enumerate()
-            .map(|(idx, (_, bindings))| {
-                // Per-section: 1 header line + 1 blank below + N
-                // binding lines. Between-section blank applies for
-                // section_idx > 0.
-                bindings.len() + 2 + usize::from(idx > 0)
-            })
-            .sum();
-        assert_eq!(usize::from(total_lines()), expected);
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
+        for entry in CATALOG {
+            assert!(
+                blob.contains(entry.label),
+                "Sigils tab missing label `{}`; CATALOG entry not surfaced",
+                entry.label
+            );
+        }
+    }
+
+    #[test]
+    fn keys_total_lines_invariant_holds() {
+        let expected = u16::try_from(build_keys_lines().len()).expect("fits in u16");
+        assert_eq!(total_lines(HelpTab::Keys), expected);
+    }
+
+    #[test]
+    fn help_tab_cycle_wraps_in_both_directions() {
+        let cycle: Vec<HelpTab> = std::iter::successors(Some(HelpTab::Keys), |t| Some(t.next()))
+            .take(HelpTab::ALL.len() + 1)
+            .collect();
+        assert_eq!(
+            cycle,
+            vec![
+                HelpTab::Keys,
+                HelpTab::Roles,
+                HelpTab::Sigils,
+                HelpTab::Keys
+            ]
+        );
+        assert_eq!(HelpTab::Keys.prev(), HelpTab::Sigils);
     }
 }

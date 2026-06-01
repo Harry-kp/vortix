@@ -146,15 +146,30 @@ impl App {
                     self.handle_message(Message::CloseOverlay);
                 }
             }
-            InputMode::Help { mut scroll } => {
+            InputMode::Help { mut scroll, mut tab } => {
                 let max_scroll = help_max_scroll_for_terminal_height(
                     self.terminal_size.1,
-                    crate::ui::help_total_lines(),
+                    crate::ui::help_total_lines(tab),
                 );
                 scroll = scroll.min(max_scroll);
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('?' | 'q') => {
                         self.handle_message(Message::CloseOverlay);
+                    }
+                    KeyCode::Tab | KeyCode::BackTab => {
+                        // Tab → next, Shift+Tab → previous. Switching
+                        // tabs resets scroll because (a) tab content
+                        // varies in length and a carried-over scroll
+                        // could land outside the new tab's bounds, and
+                        // (b) users expect "switching to a new view
+                        // shows the top of it." No per-tab scroll
+                        // memory.
+                        tab = if matches!(key.code, KeyCode::BackTab) {
+                            tab.prev()
+                        } else {
+                            tab.next()
+                        };
+                        scroll = 0;
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
                         scroll = scroll.saturating_add(1).min(max_scroll);
@@ -171,7 +186,7 @@ impl App {
                     _ => {}
                 }
                 if let InputMode::Help { .. } = self.input_mode {
-                    self.input_mode = InputMode::Help { scroll };
+                    self.input_mode = InputMode::Help { scroll, tab };
                 }
             }
             InputMode::Rename {
@@ -331,18 +346,18 @@ impl App {
         // let mouse events pass through to panels behind it.
         if self.input_mode != InputMode::Normal {
             match (&mut self.input_mode, mouse.kind) {
-                (InputMode::Help { scroll }, MouseEventKind::ScrollDown) => {
+                (InputMode::Help { scroll, tab }, MouseEventKind::ScrollDown) => {
                     let max_scroll = help_max_scroll_for_terminal_height(
                         self.terminal_size.1,
-                        crate::ui::help_total_lines(),
+                        crate::ui::help_total_lines(*tab),
                     );
                     *scroll = (*scroll).min(max_scroll);
                     *scroll = scroll.saturating_add(3).min(max_scroll);
                 }
-                (InputMode::Help { scroll }, MouseEventKind::ScrollUp) => {
+                (InputMode::Help { scroll, tab }, MouseEventKind::ScrollUp) => {
                     let max_scroll = help_max_scroll_for_terminal_height(
                         self.terminal_size.1,
-                        crate::ui::help_total_lines(),
+                        crate::ui::help_total_lines(*tab),
                     );
                     *scroll = (*scroll).min(max_scroll);
                     *scroll = scroll.saturating_sub(3);

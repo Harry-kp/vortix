@@ -1420,7 +1420,7 @@ fn test_help_mode_opens_and_closes() {
     let mut app = test_app();
     assert!(matches!(app.input_mode, InputMode::Normal));
 
-    app.input_mode = InputMode::Help { scroll: 0 };
+    app.input_mode = InputMode::Help { scroll: 0, tab: crate::state::HelpTab::Keys };
     assert!(matches!(app.input_mode, InputMode::Help { .. }));
 
     app.handle_message(Message::CloseOverlay);
@@ -1743,9 +1743,9 @@ fn test_help_scroll_down_clamps_at_max() {
     let mut app = test_app();
     let max_scroll = crate::state::help_max_scroll_for_terminal_height(
         app.terminal_size.1,
-        crate::ui::help_total_lines(),
+        crate::ui::help_total_lines(crate::state::HelpTab::Keys),
     );
-    app.input_mode = InputMode::Help { scroll: 0 };
+    app.input_mode = InputMode::Help { scroll: 0, tab: crate::state::HelpTab::Keys };
 
     for _ in 0..(usize::from(max_scroll) + 10) {
         app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
@@ -1753,7 +1753,7 @@ fn test_help_scroll_down_clamps_at_max() {
 
     assert!(matches!(
         app.input_mode,
-        InputMode::Help { scroll } if scroll == max_scroll
+        InputMode::Help { scroll, .. } if scroll == max_scroll
     ));
 }
 
@@ -1763,11 +1763,11 @@ fn test_help_scroll_does_not_move_when_terminal_size_unknown() {
 
     let mut app = test_app();
     app.terminal_size = (0, 0);
-    app.input_mode = InputMode::Help { scroll: 0 };
+    app.input_mode = InputMode::Help { scroll: 0, tab: crate::state::HelpTab::Keys };
 
     app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
 
-    assert!(matches!(app.input_mode, InputMode::Help { scroll: 0 }));
+    assert!(matches!(app.input_mode, InputMode::Help { scroll: 0, tab: crate::state::HelpTab::Keys }));
 }
 
 #[test]
@@ -1777,17 +1777,18 @@ fn test_help_scroll_clamps_after_resize_before_key_handling() {
     let mut app = test_app();
     let max_scroll = crate::state::help_max_scroll_for_terminal_height(
         app.terminal_size.1,
-        crate::ui::help_total_lines(),
+        crate::ui::help_total_lines(crate::state::HelpTab::Keys),
     );
     app.input_mode = InputMode::Help {
         scroll: max_scroll.saturating_add(10),
+        tab: crate::state::HelpTab::Keys,
     };
 
     app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
 
     assert!(matches!(
         app.input_mode,
-        InputMode::Help { scroll } if scroll == max_scroll.saturating_sub(1)
+        InputMode::Help { scroll, .. } if scroll == max_scroll.saturating_sub(1)
     ));
 }
 
@@ -1798,15 +1799,15 @@ fn test_help_end_jumps_to_max_scroll() {
     let mut app = test_app();
     let max_scroll = crate::state::help_max_scroll_for_terminal_height(
         app.terminal_size.1,
-        crate::ui::help_total_lines(),
+        crate::ui::help_total_lines(crate::state::HelpTab::Keys),
     );
-    app.input_mode = InputMode::Help { scroll: 0 };
+    app.input_mode = InputMode::Help { scroll: 0, tab: crate::state::HelpTab::Keys };
 
     app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
 
     assert!(matches!(
         app.input_mode,
-        InputMode::Help { scroll } if scroll == max_scroll
+        InputMode::Help { scroll, .. } if scroll == max_scroll
     ));
 }
 
@@ -1817,9 +1818,9 @@ fn test_help_mouse_scroll_down_clamps_at_max() {
     let mut app = test_app();
     let max_scroll = crate::state::help_max_scroll_for_terminal_height(
         app.terminal_size.1,
-        crate::ui::help_total_lines(),
+        crate::ui::help_total_lines(crate::state::HelpTab::Keys),
     );
-    app.input_mode = InputMode::Help { scroll: 0 };
+    app.input_mode = InputMode::Help { scroll: 0, tab: crate::state::HelpTab::Keys };
 
     for _ in 0..20 {
         app.handle_mouse(MouseEvent {
@@ -1832,7 +1833,7 @@ fn test_help_mouse_scroll_down_clamps_at_max() {
 
     assert!(matches!(
         app.input_mode,
-        InputMode::Help { scroll } if scroll == max_scroll
+        InputMode::Help { scroll, .. } if scroll == max_scroll
     ));
 }
 
@@ -1843,10 +1844,11 @@ fn test_help_mouse_scroll_up_clamps_after_resize() {
     let mut app = test_app();
     let max_scroll = crate::state::help_max_scroll_for_terminal_height(
         app.terminal_size.1,
-        crate::ui::help_total_lines(),
+        crate::ui::help_total_lines(crate::state::HelpTab::Keys),
     );
     app.input_mode = InputMode::Help {
         scroll: max_scroll.saturating_add(9),
+        tab: crate::state::HelpTab::Keys,
     };
 
     app.handle_mouse(MouseEvent {
@@ -1858,7 +1860,7 @@ fn test_help_mouse_scroll_up_clamps_after_resize() {
 
     assert!(matches!(
         app.input_mode,
-        InputMode::Help { scroll } if scroll == max_scroll.saturating_sub(3)
+        InputMode::Help { scroll, .. } if scroll == max_scroll.saturating_sub(3)
     ));
 }
 

@@ -55,27 +55,25 @@ enum Sigil {
 }
 
 impl Sigil {
-    fn glyph(self) -> &'static str {
+    /// Map this panel-local sigil onto its [`SigilId`] in the shared
+    /// catalog. The mapping is intentionally explicit so any new SG
+    /// sigil added here forces a catalog entry too.
+    fn id(self) -> crate::ui::sigils::SigilId {
+        use crate::ui::sigils::SigilId;
         match self {
-            Self::OkMuted => "✓",
-            Self::NotApplicable => "─",
-            Self::AlarmWarn => "⚠",
-            Self::AlarmError => "✗",
+            Self::OkMuted => SigilId::SgOk,
+            Self::NotApplicable => SigilId::SgNotApplicable,
+            Self::AlarmWarn => SigilId::SgAlarmWarn,
+            Self::AlarmError => SigilId::SgAlarmError,
         }
     }
 
+    fn glyph(self) -> &'static str {
+        crate::ui::sigils::sigil(self.id()).glyph
+    }
+
     fn style(self) -> Style {
-        let base = match self {
-            Self::OkMuted => Style::default().fg(theme::SUCCESS),
-            Self::NotApplicable => Style::default().fg(theme::INACTIVE),
-            Self::AlarmWarn => Style::default().fg(theme::WARNING),
-            Self::AlarmError => Style::default().fg(theme::ERROR),
-        };
-        if matches!(self, Self::AlarmWarn | Self::AlarmError) {
-            base.add_modifier(Modifier::BOLD)
-        } else {
-            base
-        }
+        crate::ui::sigils::sigil(self.id()).style()
     }
 }
 

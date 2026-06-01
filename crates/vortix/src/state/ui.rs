@@ -39,6 +39,52 @@ pub enum FocusedPanel {
     Logs,
 }
 
+/// Active tab in the Help overlay. `?` opens the overlay on
+/// [`HelpTab::Keys`] by default; `Tab` / `Shift+Tab` cycle through
+/// the tabs. Each tab renders its own content with an appropriate
+/// layout (compact two-column for Keys; card-style with multi-line
+/// prose for the glossary tabs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum HelpTab {
+    /// Keybindings reference — `?`'s historic content.
+    #[default]
+    Keys,
+    /// Role label glossary for the Connection Details panel.
+    Roles,
+    /// Sigil reference for the Security Guard panel and sidebar.
+    Sigils,
+}
+
+impl HelpTab {
+    /// Tabs in cycle order — used by `Tab` / `Shift+Tab` navigation
+    /// in the Help overlay.
+    pub const ALL: &'static [HelpTab] = &[HelpTab::Keys, HelpTab::Roles, HelpTab::Sigils];
+
+    /// Title shown in the tab strip at the top of the overlay.
+    #[must_use]
+    pub fn title(self) -> &'static str {
+        match self {
+            HelpTab::Keys => "Keys",
+            HelpTab::Roles => "Roles",
+            HelpTab::Sigils => "Sigils",
+        }
+    }
+
+    /// Next tab in [`HelpTab::ALL`] (wraps).
+    #[must_use]
+    pub fn next(self) -> HelpTab {
+        let idx = Self::ALL.iter().position(|t| *t == self).unwrap_or(0);
+        Self::ALL[(idx + 1) % Self::ALL.len()]
+    }
+
+    /// Previous tab in [`HelpTab::ALL`] (wraps).
+    #[must_use]
+    pub fn prev(self) -> HelpTab {
+        let idx = Self::ALL.iter().position(|t| *t == self).unwrap_or(0);
+        Self::ALL[(idx + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+}
+
 /// Which field is focused in the auth credentials overlay.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum AuthField {
@@ -84,10 +130,16 @@ pub enum InputMode {
         /// Is "Yes" selected?
         confirm_selected: bool,
     },
-    /// Help overlay showing all keybindings.
+    /// Help overlay showing all keybindings + glossaries.
     Help {
-        /// Vertical scroll offset.
+        /// Vertical scroll offset within the active tab. Reset to 0
+        /// on tab switch — no per-tab scroll memory (simplifies the
+        /// state and matches user expectation of "switching gives a
+        /// fresh page").
         scroll: u16,
+        /// Currently active tab. `?` opens on [`HelpTab::Keys`];
+        /// `Tab` / `Shift+Tab` cycle.
+        tab: HelpTab,
     },
     /// Profile rename dialog.
     Rename {

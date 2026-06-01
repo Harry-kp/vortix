@@ -6,6 +6,9 @@ mod helpers;
 /// path pre-builds the cached `Vec<Line>` once (`CachedConfigView`)
 /// instead of letting the renderer re-parse on every frame.
 pub(crate) mod overlays;
+/// Single source of truth for every sigil rendered in the TUI.
+/// Renderers + the `?` help overlay both read from `sigils::CATALOG`.
+pub(crate) mod sigils;
 mod widgets;
 
 use crate::app::App;

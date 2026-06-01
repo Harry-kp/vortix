@@ -324,7 +324,10 @@ impl App {
                 };
             }
             Message::OpenHelp => {
-                self.input_mode = InputMode::Help { scroll: 0 };
+                self.input_mode = InputMode::Help {
+                    scroll: 0,
+                    tab: crate::state::HelpTab::default(),
+                };
             }
             Message::CycleLogFilter => self.handle_cycle_log_filter(),
 
