@@ -39,12 +39,21 @@ pub enum HelpTab {
     Roles,
     /// Sigil reference for the Security Guard panel and sidebar.
     Sigils,
+    /// Security Guard panel reference: what each row checks, what the
+    /// headline states (EXPOSED / PARTIAL / PROTECTED) mean, when to
+    /// worry vs ignore.
+    Guard,
 }
 
 impl HelpTab {
     /// Tabs in cycle order — used by `Tab` / `Shift+Tab` navigation
     /// in the Help overlay.
-    pub const ALL: &'static [HelpTab] = &[HelpTab::Keys, HelpTab::Roles, HelpTab::Sigils];
+    pub const ALL: &'static [HelpTab] = &[
+        HelpTab::Keys,
+        HelpTab::Roles,
+        HelpTab::Sigils,
+        HelpTab::Guard,
+    ];
 
     /// Title shown in the tab strip at the top of the overlay.
     #[must_use]
@@ -53,6 +62,7 @@ impl HelpTab {
             HelpTab::Keys => "Keys",
             HelpTab::Roles => "Roles",
             HelpTab::Sigils => "Sigils",
+            HelpTab::Guard => "Guard",
         }
     }
 

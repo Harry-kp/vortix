@@ -1,4 +1,4 @@
-//! Help overlay with three tabs: Keys, Roles, Sigils.
+//! Help overlay with four tabs: Keys, Roles, Sigils, Guard.
 //!
 //! `?` opens the overlay on the Keys tab. `Tab` / `Shift+Tab` cycle
 //! through the tabs (browser-style strip rendered at the top with the
@@ -17,6 +17,11 @@
 //!   [`crate::ui::sigils::CATALOG`] — the single source of truth that
 //!   the actual renderers also use. Drift between what users see
 //!   on-screen and what the help shows is structurally impossible.
+//! - **Guard** — card-style explainer for the Security Guard panel:
+//!   the three headline states (EXPOSED / PARTIAL / PROTECTED) and
+//!   what each row (IP, DNS, Killswitch, Encryption, IPv6) actually
+//!   checks. Complements the Sigils tab — sigils explain the glyphs,
+//!   Guard explains the semantics.
 
 use crate::ui::sigils::{Sigil, SigilCategory, CATALOG};
 use crate::{state, state::HelpTab, theme};
@@ -106,7 +111,7 @@ const HELP_TEXT: &[(&str, &[(&str, &str)])] = &[
     (
         "Help overlay",
         &[
-            ("Tab", "Next tab (Keys → Roles → Sigils)"),
+            ("Tab", "Next tab (Keys → Roles → Sigils → Guard)"),
             ("Shift+Tab", "Previous tab"),
             ("j / k / ↑ / ↓", "Scroll within tab"),
             ("g / G", "Top / Bottom of tab"),
@@ -170,6 +175,64 @@ const ROLE_GLOSSARY: &[(&str, &str)] = &[
 const ROLE_GLOSSARY_FOOTER: &str =
     "Full guide with examples + common confusions: docs/roles.md on GitHub.";
 
+// ────────────────────────────── Guard tab ───────────────────────────────
+
+/// Plain-English explainer for the Security Guard panel. Each entry is
+/// `(label, description_paragraph)` matching the same card-style
+/// layout as the Roles tab. Two clusters:
+///   1. The three headline states (EXPOSED / PARTIAL / PROTECTED).
+///   2. Each row the panel renders (IP, DNS, Killswitch, etc.) and
+///      what makes that row light up vs stay quiet.
+const GUARD_GLOSSARY: &[(&str, &str)] = &[
+    (
+        "EXPOSED",
+        "No tunnel is up, or no tunnel claims your kernel default route. All internet traffic flows via your normal ISP — websites see your real IP. If you intended a VPN, this is the alarm state: connect a profile or check why your tunnel dropped.",
+    ),
+    (
+        "PARTIAL",
+        "At least one tunnel is Connected, but none owns the default route. Declared subnets (e.g. corp 10.0.0.0/8) tunnel correctly, but general internet traffic still uses your real ISP. Correct for split-only setups; suspicious if you expected a full-tunnel exit (check the tunnel's Role in Connection Details).",
+    ),
+    (
+        "PROTECTED",
+        "A tunnel owns your kernel default route. New outbound connections flow through it. The Real IP row reflects the tunnel's exit IP, not your ISP's. This is the goal state for a full-tunnel VPN.",
+    ),
+    (
+        "DROPPED",
+        "A tunnel was Connected and was your exit, then went down unexpectedly (process died, network flaked). What happens next depends on the Killswitch row: Off lets traffic out as your real IP immediately; Block-on-drop engages a default-DROP firewall rule on the drop; VPN-only was already blocking and stays that way.",
+    ),
+    (
+        "Identity → Real IP",
+        "Your public IP as the rest of the internet sees you right now (polled via ipinfo.io). With a full-tunnel VPN up, this should equal the VPN server's exit IP, not your ISP's. If it shows your ISP's IP while you think a VPN is up, traffic is leaking.",
+    ),
+    (
+        "Identity → VPN IP",
+        "The interface address vortix observed on the tunnel itself (utunN on macOS, wgN/tunN on Linux). Internal to the tunnel — this is NOT what websites see. Useful for confirming the tunnel actually negotiated an address.",
+    ),
+    (
+        "Identity → DNS",
+        "Which DNS server resolves your queries right now. If a VPN pushed DNS, this should be the VPN's resolver, not your ISP's — otherwise DNS queries leak the names of sites you visit even while the tunnel carries the actual traffic.",
+    ),
+    (
+        "Identity → Location",
+        "Geo lookup of Real IP (city + country). Quick sanity check: connect a German VPN, this should say DE. If it still says your home country, the tunnel didn't take over the route.",
+    ),
+    (
+        "Defense → Killswitch",
+        "Current killswitch mode and runtime state. Modes: Off (no firewall, traffic always allowed), Block-on-drop (firewall armed but quiet while VPN is up; engages default-DROP egress the moment VPN drops), VPN-only (firewall always engaged with per-tunnel ACCEPT rules — closes the gap-between-drop-and-reconnect leak window). Cycle modes with Shift+K from anywhere.",
+    ),
+    (
+        "Defense → Encryption",
+        "The tunnel's cipher as reported by the protocol layer (ChaCha20-Poly1305 for WireGuard; AES-256-GCM or whatever the OpenVPN handshake negotiated). Should always show a value when a tunnel is up — an empty row means metadata didn't surface.",
+    ),
+    (
+        "Defense → IPv6",
+        "Honest line: vortix's killswitch enforces v4-only today. If your system has IPv6 connectivity to the internet AND your VPN doesn't tunnel v6, IPv6 traffic CAN bypass the firewall even in VPN-only mode. The row tells you whether this risk applies to your machine right now.",
+    ),
+];
+
+const GUARD_GLOSSARY_FOOTER: &str =
+    "Sigils tab covers the glyphs (✓ ✗ ⚠ etc.); this tab covers what each row checks.";
+
 // ────────────────────────────── Rendering ──────────────────────────────
 
 const OVERLAY_MAX_WIDTH: u16 = 120;
@@ -192,6 +255,11 @@ pub fn total_lines(tab: HelpTab) -> u16 {
             // 1 header per category + ~2 lines per entry. Conservative upper bound.
             let entries = CATALOG.len();
             (2 + entries * 2 + 4) as u16
+        }
+        HelpTab::Guard => {
+            // Same shape as Roles — ~6 lines per entry (header + wrapped
+            // body + blank) + leading blank + footer.
+            (1 + GUARD_GLOSSARY.len() * 6 + 2) as u16
         }
     }
 }
@@ -261,6 +329,7 @@ pub fn render(frame: &mut Frame, scroll: u16, tab: HelpTab) {
         HelpTab::Keys => build_keys_lines(),
         HelpTab::Roles => build_glossary_lines(ROLE_GLOSSARY, Some(ROLE_GLOSSARY_FOOTER)),
         HelpTab::Sigils => build_sigils_lines(),
+        HelpTab::Guard => build_glossary_lines(GUARD_GLOSSARY, Some(GUARD_GLOSSARY_FOOTER)),
     };
     let paragraph = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
@@ -501,9 +570,40 @@ mod tests {
                 HelpTab::Keys,
                 HelpTab::Roles,
                 HelpTab::Sigils,
+                HelpTab::Guard,
                 HelpTab::Keys
             ]
         );
-        assert_eq!(HelpTab::Keys.prev(), HelpTab::Sigils);
+        assert_eq!(HelpTab::Keys.prev(), HelpTab::Guard);
+    }
+
+    #[test]
+    fn guard_glossary_covers_headline_states_and_every_panel_row() {
+        // Drift-detection backstop: the Guard tab must document each
+        // headline state the panel can render AND every row the panel
+        // shows. If a new row or state is added, the assertion fails
+        // until the glossary catches up.
+        let labels: Vec<&str> = GUARD_GLOSSARY.iter().map(|(k, _)| *k).collect();
+        for expected in [
+            // Headline states
+            "EXPOSED",
+            "PARTIAL",
+            "PROTECTED",
+            "DROPPED",
+            // Identity rows
+            "Identity → Real IP",
+            "Identity → VPN IP",
+            "Identity → DNS",
+            "Identity → Location",
+            // Defense rows
+            "Defense → Killswitch",
+            "Defense → Encryption",
+            "Defense → IPv6",
+        ] {
+            assert!(
+                labels.contains(&expected),
+                "Guard tab must document `{expected}`; found: {labels:?}"
+            );
+        }
     }
 }
