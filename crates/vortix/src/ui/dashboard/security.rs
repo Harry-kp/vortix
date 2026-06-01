@@ -31,6 +31,10 @@ const SECTION_HEADER_MIN_INNER_WIDTH: u16 = 24;
 /// (2 chars). Mirrors `connection_details.rs`'s `<label>: <value>` style
 /// so the two side-by-side panels read with the same tabular rhythm.
 /// The block itself already adds 1 cell of horizontal padding.
+///
+/// 10 chars accommodates the longest Identity/Defense row labels
+/// without truncation: `Killswitch` (10), `Encryption` (10),
+/// `Real IP` / `Exit IP` / `Location` / `DNS` / `IPv6` (≤8).
 const LABEL_COLUMN_WIDTH: usize = 12;
 
 /// Total width of the right-pinned sigil column: 1-char sigil + 1-space pad.
@@ -285,6 +289,14 @@ struct PanelState {
     show_section_headers: bool,
 
     // Identity
+    /// Cached pre-VPN public IP (your ISP-visible address). Always
+    /// shown in its own row when known so the user can see what
+    /// they'd be exposed as if the VPN dropped — the masking question
+    /// has two sides and the panel now surfaces both.
+    real_ip: Option<String>,
+    /// Currently-observed public IP. With a working VPN this equals
+    /// the tunnel's exit IP; without (or with a leak) this equals
+    /// `real_ip`.
     public_ip: String,
     location: Option<String>,
     ip_status: IpStatus,
@@ -513,6 +525,7 @@ fn collect_protected_state(
     PanelState {
         inner_width,
         show_section_headers: true,
+        real_ip: app.runtime.real_ip.clone(),
         public_ip: app.runtime.public_ip.clone(),
         location,
         ip_status,
@@ -597,6 +610,7 @@ fn collect_partial_state(
     PanelState {
         inner_width,
         show_section_headers: true,
+        real_ip: app.runtime.real_ip.clone(),
         public_ip,
         location,
         ip_status,
@@ -653,7 +667,7 @@ fn dns_provider_label(dns_server: &str) -> Option<&'static str> {
 // ── Builders (pure) ─────────────────────────────────────────────────────────
 
 fn build_protected_audit(s: &PanelState) -> Vec<Line<'static>> {
-    let mut lines = Vec::with_capacity(16);
+    let mut lines = Vec::with_capacity(20);
     let w = s.inner_width as usize;
     let show_headers = s.show_headers();
 
@@ -661,19 +675,58 @@ fn build_protected_audit(s: &PanelState) -> Vec<Line<'static>> {
         lines.push(section_header("Identity"));
     }
 
-    // IP row
-    let ip_value = format_value_with_tag(&s.public_ip, s.location.as_deref());
-    let (ip_sigil, ip_value_color) = match s.ip_status {
+    // Real IP row — your cached pre-VPN IP. Always informational (no
+    // safety verdict on this row — the Exit IP row carries the verdict).
+    // Detection-pending lands on `─`; known value shows muted-OK.
+    let (real_ip_value, real_ip_sigil, real_ip_color) = match s.real_ip.as_deref() {
+        Some(ip) if !ip.is_empty() => (ip.to_string(), Sigil::OkMuted, theme::TEXT_PRIMARY),
+        _ => (
+            "detecting…".to_string(),
+            Sigil::NotApplicable,
+            theme::INACTIVE,
+        ),
+    };
+    lines.push(audit_row(
+        "Real IP",
+        &real_ip_value,
+        real_ip_color,
+        real_ip_sigil,
+        w,
+    ));
+
+    // Exit IP row — what the world sees right now. Carries the
+    // masking verdict: ✓ when it differs from Real IP (mask works),
+    // ✗ when it matches (leak), pending while detecting.
+    let (exit_sigil, exit_color) = match s.ip_status {
         IpStatus::Masked => (Sigil::OkMuted, theme::TEXT_PRIMARY),
         IpStatus::Leaking => (Sigil::AlarmError, theme::ERROR),
         IpStatus::Pending => (Sigil::NotApplicable, theme::WARNING),
     };
-    lines.push(audit_row("IP", &ip_value, ip_value_color, ip_sigil, w));
+    lines.push(audit_row(
+        "Exit IP",
+        &s.public_ip,
+        exit_color,
+        exit_sigil,
+        w,
+    ));
     if s.ip_status == IpStatus::Leaking {
         lines.push(alarm_subline("real IP exposed", w));
     }
 
-    // DNS row
+    // Location row — geo of Exit IP. Informational sanity check
+    // (connected a DE server, should say DE).
+    let (loc_value, loc_sigil, loc_color) = match s.location.as_deref() {
+        Some(loc) if !loc.is_empty() => (loc.to_string(), Sigil::OkMuted, theme::TEXT_PRIMARY),
+        _ => (
+            "detecting…".to_string(),
+            Sigil::NotApplicable,
+            theme::INACTIVE,
+        ),
+    };
+    lines.push(audit_row("Location", &loc_value, loc_color, loc_sigil, w));
+
+    // DNS row — provider tag still inlines (Cloudflare/Google/Quad9)
+    // since DNS doesn't have a separate "Provider" row to graduate to.
     let dns_value = format_value_with_tag(&s.dns_server, s.dns_provider);
     let (dns_sigil, dns_color) = if s.dns_leaking {
         (Sigil::AlarmError, theme::ERROR)
@@ -736,7 +789,7 @@ fn build_protected_audit(s: &PanelState) -> Vec<Line<'static>> {
 }
 
 fn build_partial_audit(s: &PanelState) -> Vec<Line<'static>> {
-    let mut lines = Vec::with_capacity(12);
+    let mut lines = Vec::with_capacity(16);
     let w = s.inner_width as usize;
     let show_headers = s.show_headers();
 
@@ -744,32 +797,69 @@ fn build_partial_audit(s: &PanelState) -> Vec<Line<'static>> {
         lines.push(section_header("Identity"));
     }
 
-    // IP row: when a primary owns the default route (Partial fired
-    // from a degraded-defense signal like killswitch=off), render the
-    // real exit IP the same way Protected does. When no primary owns
-    // the default route (split-only topology), flag IP as
-    // not-applicable. `public_ip` being empty is the in-band signal
-    // for the no-primary case (set by `collect_partial_state`).
+    // Real IP row — same as Protected: always informational. Carries
+    // no verdict; just surfaces what you'd be exposed as if the VPN
+    // went down.
+    let (real_ip_value, real_ip_sigil, real_ip_color) = match s.real_ip.as_deref() {
+        Some(ip) if !ip.is_empty() => (ip.to_string(), Sigil::OkMuted, theme::TEXT_PRIMARY),
+        _ => (
+            "detecting…".to_string(),
+            Sigil::NotApplicable,
+            theme::INACTIVE,
+        ),
+    };
+    lines.push(audit_row(
+        "Real IP",
+        &real_ip_value,
+        real_ip_color,
+        real_ip_sigil,
+        w,
+    ));
+
+    // Exit IP row: when a primary owns the default route (Partial
+    // fired from a degraded-defense signal like killswitch=off),
+    // render the real exit IP the same way Protected does. When no
+    // primary owns the default route (split-only topology), flag the
+    // row as not-applicable with the `split-route — no exit`
+    // placeholder. `public_ip` being empty is the in-band signal for
+    // the no-primary case (set by `collect_partial_state`).
     if s.public_ip.is_empty() {
         lines.push(audit_row(
-            "IP",
+            "Exit IP",
             "split-route — no exit",
             theme::INACTIVE,
             Sigil::NotApplicable,
             w,
         ));
     } else {
-        let ip_value = format_value_with_tag(&s.public_ip, s.location.as_deref());
-        let (ip_sigil, ip_value_color) = match s.ip_status {
+        let (exit_sigil, exit_color) = match s.ip_status {
             IpStatus::Masked => (Sigil::OkMuted, theme::TEXT_PRIMARY),
             IpStatus::Leaking => (Sigil::AlarmError, theme::ERROR),
             IpStatus::Pending => (Sigil::NotApplicable, theme::WARNING),
         };
-        lines.push(audit_row("IP", &ip_value, ip_value_color, ip_sigil, w));
+        lines.push(audit_row(
+            "Exit IP",
+            &s.public_ip,
+            exit_color,
+            exit_sigil,
+            w,
+        ));
         if s.ip_status == IpStatus::Leaking {
             lines.push(alarm_subline("real IP exposed", w));
         }
     }
+
+    // Location row — geo of Exit IP when known; n-a placeholder
+    // otherwise (the split-only branch and the pending case).
+    let (loc_value, loc_sigil, loc_color) = match s.location.as_deref() {
+        Some(loc) if !loc.is_empty() => (loc.to_string(), Sigil::OkMuted, theme::TEXT_PRIMARY),
+        _ => (
+            "detecting…".to_string(),
+            Sigil::NotApplicable,
+            theme::INACTIVE,
+        ),
+    };
+    lines.push(audit_row("Location", &loc_value, loc_color, loc_sigil, w));
 
     let dns_value = format_value_with_tag(&s.dns_server, s.dns_provider);
     lines.push(audit_row(
@@ -828,10 +918,14 @@ fn build_partial_audit(s: &PanelState) -> Vec<Line<'static>> {
 }
 
 fn build_exposed_audit(app: &App, inner_width: u16) -> Vec<Line<'static>> {
-    let mut lines = Vec::with_capacity(10);
+    let mut lines = Vec::with_capacity(14);
     let w = inner_width as usize;
 
-    let real_ip = if app.runtime.public_ip.is_empty()
+    // In EXPOSED both Real IP and Exit IP resolve to the same value
+    // (no tunnel masking anything). Showing both rows side-by-side
+    // with the same IP IS the alarm visualization: "your exit IP IS
+    // your real IP".
+    let exposed_ip = if app.runtime.public_ip.is_empty()
         || app.runtime.public_ip == constants::MSG_DETECTING
         || app.runtime.public_ip == constants::MSG_FETCHING
     {
@@ -840,14 +934,58 @@ fn build_exposed_audit(app: &App, inner_width: u16) -> Vec<Line<'static>> {
         app.runtime.public_ip.clone()
     };
 
+    // Real IP row — informational, muted-OK (we know what it is).
     lines.push(audit_row(
-        "IP",
-        &real_ip,
+        "Real IP",
+        &exposed_ip,
+        theme::TEXT_PRIMARY,
+        Sigil::OkMuted,
+        w,
+    ));
+    // Exit IP row — same value, carries the alarm.
+    lines.push(audit_row(
+        "Exit IP",
+        &exposed_ip,
         theme::WARNING,
         Sigil::AlarmWarn,
         w,
     ));
     lines.push(alarm_subline("no VPN — your real IP is visible", w));
+
+    // Location of Exit IP — informational sanity check.
+    let location = if app.runtime.location.is_empty()
+        || app.runtime.location == constants::MSG_DETECTING
+        || app.runtime.location == constants::MSG_FETCHING
+    {
+        "detecting…".to_string()
+    } else {
+        app.runtime.location.clone()
+    };
+    let loc_sigil = if location == "detecting…" {
+        Sigil::NotApplicable
+    } else {
+        Sigil::OkMuted
+    };
+    let loc_color = if location == "detecting…" {
+        theme::INACTIVE
+    } else {
+        theme::TEXT_PRIMARY
+    };
+    lines.push(audit_row("Location", &location, loc_color, loc_sigil, w));
+
+    // DNS row — your ISP's DNS (no VPN to leak from, so no leak check).
+    let dns_value = format_value_with_tag(
+        &app.runtime.dns_server,
+        dns_provider_label(&app.runtime.dns_server),
+    );
+    lines.push(audit_row(
+        "DNS",
+        &dns_value,
+        theme::TEXT_PRIMARY,
+        Sigil::OkMuted,
+        w,
+    ));
+
     lines.push(Line::from(""));
 
     lines.push(audit_row(
@@ -1065,6 +1203,7 @@ mod tests {
         PanelState {
             inner_width,
             show_section_headers: true,
+            real_ip: Some("203.0.113.5".to_string()),
             public_ip: "1.2.3.4".to_string(),
             location: Some("US-East".to_string()),
             ip_status: IpStatus::Masked,
@@ -1260,18 +1399,18 @@ mod tests {
     #[test]
     fn protected_sigils_render_in_right_column() {
         // R2: every row ends in the right-pinned sigil column.
-        let s = baseline_protected_state(34);
+        let s = baseline_protected_state(40);
         let lines = build_protected_audit(&s);
-        let ip_line = lines
+        let exit_line = lines
             .iter()
-            .find(|l| line_text(l).contains("IP "))
-            .expect("IP row missing");
+            .find(|l| line_text(l).starts_with("Exit IP"))
+            .expect("Exit IP row missing");
         let dns_line = lines
             .iter()
-            .find(|l| line_text(l).contains("DNS "))
+            .find(|l| line_text(l).starts_with("DNS"))
             .expect("DNS row missing");
 
-        for row in [ip_line, dns_line] {
+        for row in [exit_line, dns_line] {
             let last_span = row.spans.last().expect("non-empty row");
             assert!(
                 last_span.content.trim_end() == "✓",
@@ -1327,15 +1466,15 @@ mod tests {
             "leaking DNS must render an alarm sub-line (got {subline_text:?})"
         );
 
-        // IP row stays calm.
+        // Exit IP row stays calm.
         let ip_idx = lines
             .iter()
-            .position(|l| line_text(l).starts_with("IP"))
-            .expect("IP row missing");
+            .position(|l| line_text(l).starts_with("Exit IP"))
+            .expect("Exit IP row missing");
         for span in &lines[ip_idx].spans {
             assert!(
                 !span.style.add_modifier.contains(Modifier::BOLD),
-                "IP row must stay muted while DNS alarms: {:?}",
+                "Exit IP row must stay muted while DNS alarms: {:?}",
                 span.content
             );
         }
@@ -1408,20 +1547,47 @@ mod tests {
     }
 
     #[test]
-    fn protected_real_ip_not_in_default_render() {
-        // R11: `Real IP: <ip> (hidden)` sub-bullet is removed from the
-        // default render. The masking sigil already attests masking is
-        // working.
+    fn protected_renders_real_ip_and_exit_ip_as_separate_rows() {
+        // The split-row redesign: Real IP (your ISP-visible IP) lives
+        // in its own row alongside Exit IP (the world-visible IP).
+        // Both must appear in the Protected branch with different
+        // values when masking works.
         let s = baseline_protected_state(40);
         let lines = build_protected_audit(&s);
         let all_text: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(
-            !all_text.contains("Real IP"),
-            "`Real IP` sub-bullet must be removed: {all_text}"
+            all_text.contains("Real IP") && all_text.contains("203.0.113.5"),
+            "Real IP row must render with cached real IP: {all_text}"
         );
         assert!(
-            !all_text.contains("(hidden)"),
-            "`(hidden)` marker must be removed: {all_text}"
+            all_text.contains("Exit IP") && all_text.contains("1.2.3.4"),
+            "Exit IP row must render with current public IP: {all_text}"
+        );
+    }
+
+    #[test]
+    fn protected_location_has_its_own_row_not_inlined_with_exit_ip() {
+        // Location lives in its own row now — the Exit IP row should
+        // NOT inline location with `·` separator any more.
+        let s = baseline_protected_state(50);
+        let lines = build_protected_audit(&s);
+        let exit_line_text = lines
+            .iter()
+            .map(line_text)
+            .find(|t| t.starts_with("Exit IP"))
+            .expect("Exit IP row missing");
+        assert!(
+            !exit_line_text.contains("·"),
+            "Exit IP must not inline location with `·`: {exit_line_text:?}"
+        );
+        let loc_line_text = lines
+            .iter()
+            .map(line_text)
+            .find(|t| t.starts_with("Location"))
+            .expect("Location row missing");
+        assert!(
+            loc_line_text.contains("US-East"),
+            "Location row must render the geo value: {loc_line_text:?}"
         );
     }
 
@@ -1475,8 +1641,17 @@ mod tests {
             !all_text.contains("Defense"),
             "section words must drop at narrow widths: {all_text}"
         );
-        // Five content rows still render (IP / DNS / Killswitch / Encryption / IPv6).
-        for label in ["IP", "DNS", "Killswitch", "Encryption", "IPv6"] {
+        // Seven content rows still render (Real IP / Exit IP / Location
+        // / DNS / Killswitch / Encryption / IPv6).
+        for label in [
+            "Real IP",
+            "Exit IP",
+            "Location",
+            "DNS",
+            "Killswitch",
+            "Encryption",
+            "IPv6",
+        ] {
             assert!(
                 all_text.contains(label),
                 "row `{label}` missing at narrow width:\n{all_text}"
@@ -1509,8 +1684,10 @@ mod tests {
             out.contains("EXPOSED"),
             "EXPOSED banner must be present:\n{out}"
         );
-        // IP row present + alarm sub-line.
-        assert!(out.contains("IP"), "IP row missing:\n{out}");
+        // Real IP + Exit IP rows present (same value in EXPOSED — that
+        // IS the leak visualization) + alarm sub-line on Exit IP.
+        assert!(out.contains("Real IP"), "Real IP row missing:\n{out}");
+        assert!(out.contains("Exit IP"), "Exit IP row missing:\n{out}");
         assert!(
             out.contains("no VPN — your real IP is visible"),
             "EXPOSED alarm sub-line missing:\n{out}"

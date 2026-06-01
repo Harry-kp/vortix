@@ -190,48 +190,44 @@ const GUARD_GLOSSARY: &[(&str, &str)] = &[
     ),
     (
         "PARTIAL",
-        "At least one tunnel is Connected, but none owns the default route. Declared subnets (e.g. corp 10.0.0.0/8) tunnel correctly, but general internet traffic still uses your real ISP. Correct for split-only setups; suspicious if you expected a full-tunnel exit (check the tunnel's Role in Connection Details).",
+        "At least one tunnel is Connected, but none owns the default route (split-only topology), OR a primary IS up but a defense row is degraded (killswitch off, cipher weak, DNS leak). Declared subnets tunnel correctly; general internet traffic posture depends on which signal demoted the panel.",
     ),
     (
         "PROTECTED",
-        "A tunnel owns your kernel default route. New outbound connections flow through it. The Real IP row reflects the tunnel's exit IP, not your ISP's. This is the goal state for a full-tunnel VPN.",
-    ),
-    (
-        "DROPPED",
-        "A tunnel was Connected and was your exit, then went down unexpectedly (process died, network flaked). What happens next depends on the Killswitch row: Off lets traffic out as your real IP immediately; Block-on-drop engages a default-DROP firewall rule on the drop; VPN-only was already blocking and stays that way.",
+        "A tunnel owns your kernel default route, the cipher is modern AEAD, killswitch is engaged, and neither IP nor DNS is leaking. New outbound connections flow through the tunnel. This is the goal state for a full-tunnel VPN.",
     ),
     (
         "Identity → Real IP",
-        "Your public IP as the rest of the internet sees you right now (polled via ipinfo.io). With a full-tunnel VPN up, this should equal the VPN server's exit IP, not your ISP's. If it shows your ISP's IP while you think a VPN is up, traffic is leaking.",
+        "Your cached pre-VPN public IP — what your ISP would expose you as if no tunnel were up. Always informational (no safety verdict on this row): it's what you'd revert to if the VPN dropped. In EXPOSED state this equals Exit IP because nothing is masking.",
     ),
     (
-        "Identity → VPN IP",
-        "The interface address vortix observed on the tunnel itself (utunN on macOS, wgN/tunN on Linux). Internal to the tunnel — this is NOT what websites see. Useful for confirming the tunnel actually negotiated an address.",
-    ),
-    (
-        "Identity → DNS",
-        "Which DNS server resolves your queries right now. If a VPN pushed DNS, this should be the VPN's resolver, not your ISP's — otherwise DNS queries leak the names of sites you visit even while the tunnel carries the actual traffic.",
+        "Identity → Exit IP",
+        "The public IP the rest of the internet sees you as right now. With a working full-tunnel VPN this is the tunnel's exit IP and the row reads ✓. When it matches Real IP, the row goes ✗ with 'real IP exposed' — masking has failed and your traffic is leaking.",
     ),
     (
         "Identity → Location",
-        "Geo lookup of Real IP (city + country). Quick sanity check: connect a German VPN, this should say DE. If it still says your home country, the tunnel didn't take over the route.",
+        "Geo lookup of Exit IP (city + country). Sanity check: connect a German VPN, this should say DE. If it still says your home country, the tunnel didn't take over the default route.",
+    ),
+    (
+        "Identity → DNS",
+        "Which DNS server resolves your queries right now, with the provider tag inlined when recognised (Cloudflare/Google/Quad9). If a VPN pushed DNS, this should be the VPN's resolver, not your ISP's — otherwise DNS queries leak the names of sites you visit even while the tunnel carries the actual traffic.",
     ),
     (
         "Defense → Killswitch",
-        "Current killswitch mode and runtime state. Modes: Off (no firewall, traffic always allowed), Block-on-drop (firewall armed but quiet while VPN is up; engages default-DROP egress the moment VPN drops), VPN-only (firewall always engaged with per-tunnel ACCEPT rules — closes the gap-between-drop-and-reconnect leak window). Cycle modes with Shift+K from anywhere.",
+        "Current killswitch mode and runtime state. Modes: Off (no firewall), Block-on-drop (firewall armed but quiet while VPN is up; engages default-DROP egress the moment VPN drops — also reads 'VPN dropped' with 'press r to reconnect' sub-line during the drop window), VPN-only (firewall always engaged with per-tunnel ACCEPT rules — closes the gap-between-drop-and-reconnect leak window). Cycle modes with Shift+K.",
     ),
     (
         "Defense → Encryption",
-        "The tunnel's cipher as reported by the protocol layer (ChaCha20-Poly1305 for WireGuard; AES-256-GCM or whatever the OpenVPN handshake negotiated). Should always show a value when a tunnel is up — an empty row means metadata didn't surface.",
+        "The tunnel's cipher annotated with its security grade. ChaCha20-Poly1305 / AES-GCM → modern AEAD. AES-256-CBC / AES-256-CTR → strong. 3DES / AES-128-CBC → deprecated (alarm + 'upgrade to AES-GCM' sub-line). BF / DES / RC4 / NULL → INSECURE (loud alarm + 'broken cipher' sub-line).",
     ),
     (
         "Defense → IPv6",
-        "Honest line: vortix's killswitch enforces v4-only today. If your system has IPv6 connectivity to the internet AND your VPN doesn't tunnel v6, IPv6 traffic CAN bypass the firewall even in VPN-only mode. The row tells you whether this risk applies to your machine right now.",
+        "Honest line: vortix's killswitch enforces v4-only on every platform today. If your system has IPv6 connectivity AND your VPN doesn't tunnel v6, IPv6 traffic CAN bypass the firewall even in VPN-only mode. The row's `─` sigil is the 'not-applicable' marker, not a green check — it means 'we are not enforcing this dimension'.",
     ),
 ];
 
 const GUARD_GLOSSARY_FOOTER: &str =
-    "Sigils tab covers the glyphs (✓ ✗ ⚠ etc.); this tab covers what each row checks.";
+    "Sigils tab covers the glyphs (✓ ✗ ⚠ ─); this tab covers what each row checks.";
 
 // ────────────────────────────── Rendering ──────────────────────────────
 
@@ -581,21 +577,21 @@ mod tests {
     fn guard_glossary_covers_headline_states_and_every_panel_row() {
         // Drift-detection backstop: the Guard tab must document each
         // headline state the panel can render AND every row the panel
-        // shows. If a new row or state is added, the assertion fails
-        // until the glossary catches up.
+        // shows. If a new row or state is added to security.rs, the
+        // assertion fails until the glossary catches up. Labels MUST
+        // match the panel's actual row labels byte-for-byte.
         let labels: Vec<&str> = GUARD_GLOSSARY.iter().map(|(k, _)| *k).collect();
         for expected in [
-            // Headline states
+            // Headline states (Verdict enum in security.rs).
             "EXPOSED",
             "PARTIAL",
             "PROTECTED",
-            "DROPPED",
-            // Identity rows
+            // Identity rows.
             "Identity → Real IP",
-            "Identity → VPN IP",
-            "Identity → DNS",
+            "Identity → Exit IP",
             "Identity → Location",
-            // Defense rows
+            "Identity → DNS",
+            // Defense rows.
             "Defense → Killswitch",
             "Defense → Encryption",
             "Defense → IPv6",
