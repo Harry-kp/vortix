@@ -353,23 +353,37 @@ impl App {
                 // candidates' ifaces look like. Exposes the iface-mismatch
                 // case (kernel reports utunX but no Connected tunnel
                 // stores utunX) directly in the Event Log.
+                // Diagnostic: log kernel egress + every Connected tunnel's
+                // iface whenever the scanner ticks AND we have at least
+                // one Connected tunnel but no primary. This is the
+                // smoking-gun trace for the "tunnels up but header
+                // says NO EXIT" symptom — it shows whether the kernel
+                // is reporting a useful iface (wg-quick / kernel
+                // limitation if not) AND whether vortix's stored
+                // ifaces match (iface-mismatch if not).
                 use crate::vortix_core::engine::state::Connection;
-                if let Some((_, candidates, _)) = self.auto_promote_candidate.as_ref() {
+                let any_connected = self
+                    .registry
+                    .snapshot_all()
+                    .iter()
+                    .any(|s| matches!(s.state, Connection::Connected { .. }));
+                let no_primary = self.registry.primary().is_none();
+                if any_connected && no_primary {
                     let kernel = default_route_interface.clone();
-                    let candidate_ifaces: Vec<(String, String)> = candidates
-                        .iter()
-                        .filter_map(|pid| {
-                            self.registry.snapshot(pid).and_then(|snap| match snap.state {
-                                Connection::Connected { details, .. } => Some((
-                                    pid.as_str().to_string(),
-                                    details.interface.clone(),
-                                )),
-                                _ => None,
-                            })
+                    let connected_ifaces: Vec<(String, String)> = self
+                        .registry
+                        .snapshot_all()
+                        .into_iter()
+                        .filter_map(|snap| match snap.state {
+                            Connection::Connected { details, .. } => Some((
+                                snap.profile_id.as_str().to_string(),
+                                details.interface.clone(),
+                            )),
+                            _ => None,
                         })
                         .collect();
                     self.log(&format!(
-                        "NET: Scanner tick — kernel egress={kernel:?}, candidate ifaces={candidate_ifaces:?}"
+                        "NET: Scanner tick (NO EXIT diagnostic) — kernel egress={kernel:?}, connected tunnel ifaces={connected_ifaces:?}"
                     ));
                 }
                 self.registry
