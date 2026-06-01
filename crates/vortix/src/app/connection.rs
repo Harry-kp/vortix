@@ -676,13 +676,18 @@ impl App {
                 .filter(|s| matches!(s.role, Role::AddressableSuppressed { .. }))
                 .map(|s| s.profile_id)
                 .collect();
-            if !candidates.is_empty() {
-                tracing::info!(
-                    target: "vortix::app::auto_promote",
-                    prior = %profile_name,
-                    candidates = ?candidates.iter().map(crate::vortix_core::profile::ProfileId::as_str).collect::<Vec<_>>(),
-                    "recording auto-promote candidates before primary disconnect"
-                );
+            if candidates.is_empty() {
+                self.log(&format!(
+                    "INFO: Disconnecting primary '{profile_name}' — no eligible auto-promote candidates (no Connected tunnel with declared 0/0 / Split tunnel (yielded) role)"
+                ));
+            } else {
+                let candidate_names: Vec<&str> = candidates
+                    .iter()
+                    .map(crate::vortix_core::profile::ProfileId::as_str)
+                    .collect();
+                self.log(&format!(
+                    "INFO: Disconnecting primary '{profile_name}' — auto-promote candidates: {candidate_names:?}"
+                ));
                 self.auto_promote_candidate =
                     Some((profile_id.clone(), candidates, Instant::now()));
             }

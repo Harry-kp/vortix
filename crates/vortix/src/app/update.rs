@@ -347,6 +347,31 @@ impl App {
                 // downstream `set_connected` / `set_disconnected` calls
                 // `recompute_primary`, which now reads this cached value
                 // instead of shelling out from the main thread.
+                //
+                // Auto-promote diagnostic: if a candidate snapshot is
+                // pending, log what the kernel says vs what the
+                // candidates' ifaces look like. Exposes the iface-mismatch
+                // case (kernel reports utunX but no Connected tunnel
+                // stores utunX) directly in the Event Log.
+                use crate::vortix_core::engine::state::Connection;
+                if let Some((_, candidates, _)) = self.auto_promote_candidate.as_ref() {
+                    let kernel = default_route_interface.clone();
+                    let candidate_ifaces: Vec<(String, String)> = candidates
+                        .iter()
+                        .filter_map(|pid| {
+                            self.registry.snapshot(pid).and_then(|snap| match snap.state {
+                                Connection::Connected { details, .. } => Some((
+                                    pid.as_str().to_string(),
+                                    details.interface.clone(),
+                                )),
+                                _ => None,
+                            })
+                        })
+                        .collect();
+                    self.log(&format!(
+                        "NET: Scanner tick — kernel egress={kernel:?}, candidate ifaces={candidate_ifaces:?}"
+                    ));
+                }
                 self.registry
                     .feed_default_route_interface(default_route_interface);
                 self.handle_sync_system_state(sessions);
@@ -1466,17 +1491,32 @@ impl App {
         // registry at disconnect-time qualify; a fresh connect
         // (via mirror_connect, which clears the candidate) does not.
         let Some(new) = current else {
+            // Primary went from Some → None. If we have a candidate,
+            // log that we're WAITING for the candidate to be elected.
+            // This is the diagnostic for the user-reported bug — if
+            // this line appears repeatedly with no follow-up, the
+            // kernel isn't re-electing OR the iface stored on the
+            // candidate doesn't match `route -n get 8.8.8.8`.
+            if let Some((old, candidates, _)) = self.auto_promote_candidate.as_ref() {
+                let names: Vec<&str> = candidates
+                    .iter()
+                    .map(crate::vortix_core::profile::ProfileId::as_str)
+                    .collect();
+                self.log(&format!(
+                    "INFO: Primary slot empty after '{}' disconnected — awaiting kernel re-election of one of: {names:?}",
+                    old.as_str()
+                ));
+            }
             return;
         };
         let Some((old, candidates, _)) = self.auto_promote_candidate.as_ref() else {
             return;
         };
         if !candidates.contains(&new) {
-            tracing::debug!(
-                target: "vortix::app::auto_promote",
-                new = %new.as_str(),
-                "new primary not in candidate list — initial connect or unexpected transition"
-            );
+            self.log(&format!(
+                "INFO: Primary changed to '{}' — not in auto-promote candidate list (initial connect or unexpected transition)",
+                new.as_str()
+            ));
             return;
         }
         let old = old.clone();
