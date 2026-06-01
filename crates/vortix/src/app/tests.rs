@@ -1257,9 +1257,21 @@ fn test_dns_not_leaking_when_vpn_pushed_new_dns() {
 
 #[test]
 fn test_real_dns_captured_when_disconnected() {
+    // Updated post-gate: real_dns caching requires the scanner to
+    // have reported zero kernel sessions before the DNS sample is
+    // trusted. test_app() doesn't auto-tick the scanner, so we
+    // drive a clean SyncSystemState first to mirror what production
+    // does (~1s after launch). The dedicated gate-behavior tests
+    // (real_dns_not_cached_when_scanner_has_not_ticked_yet etc.)
+    // pin each gate branch individually.
     use crate::core::telemetry::TelemetryUpdate;
     let mut app = test_app();
     assert!(app.runtime.real_dns.is_none());
+
+    app.handle_message(Message::SyncSystemState {
+        sessions: vec![],
+        default_route_interface: None,
+    });
 
     app.handle_message(Message::Telemetry(TelemetryUpdate::Dns(
         "8.8.8.8".to_string(),
@@ -3565,6 +3577,84 @@ fn real_ip_telemetry_persists_to_disk_cache() {
 
     // Cleanup.
     let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn real_dns_not_cached_when_scanner_has_not_ticked_yet() {
+    // Parallel to real_ip_not_cached_when_scanner_has_not_ticked_yet.
+    // DNS telemetry firing before the scanner's first SyncSystemState
+    // tick must NOT cache the VPN's pushed DNS as `real_dns` — that
+    // would later read as a DNS leak in `verdict_for_protected`
+    // and lock the header into PARTIAL forever.
+    use crate::core::telemetry::TelemetryUpdate;
+    let mut app = test_app();
+    assert!(!app.runtime.scanner_first_tick_done);
+    assert!(app.runtime.real_dns.is_none());
+
+    app.handle_message(Message::Telemetry(TelemetryUpdate::Dns(
+        "10.8.0.1".to_string(),
+    )));
+
+    assert!(
+        app.runtime.real_dns.is_none(),
+        "real_dns must stay None until scanner reports kernel state"
+    );
+    assert_eq!(
+        app.runtime.dns_server, "10.8.0.1",
+        "dns_server still updates — only the real_dns cache is gated"
+    );
+}
+
+#[test]
+fn real_dns_not_cached_when_kernel_has_active_sessions() {
+    // If the scanner sees a kernel session, the DNS sample is the
+    // VPN's pushed resolver — don't cache it as real_dns.
+    use crate::core::telemetry::TelemetryUpdate;
+    let mut app = test_app();
+    add_profiles(&mut app, &["vpn-a"]);
+
+    app.handle_message(Message::SyncSystemState {
+        sessions: vec![fake_session("vpn-a")],
+        default_route_interface: Some("wg0".to_string()),
+    });
+    assert!(app.runtime.scanner_first_tick_done);
+    assert_eq!(app.runtime.last_kernel_session_count, 1);
+
+    let pid = crate::vortix_core::profile::ProfileId::new("vpn-a");
+    app.registry.set_disconnected(&pid);
+    assert!(!app.has_active_connection());
+
+    app.handle_message(Message::Telemetry(TelemetryUpdate::Dns(
+        "10.8.0.1".to_string(),
+    )));
+
+    assert!(
+        app.runtime.real_dns.is_none(),
+        "real_dns must stay None while kernel reports any VPN session"
+    );
+}
+
+#[test]
+fn real_dns_cached_after_clean_scanner_tick_with_zero_sessions() {
+    // Happy path: scanner says zero kernel sessions, registry has
+    // no Connected tunnel, DNS sample is genuinely your ISP's DNS.
+    use crate::core::telemetry::TelemetryUpdate;
+    let mut app = test_app();
+
+    app.handle_message(Message::SyncSystemState {
+        sessions: vec![],
+        default_route_interface: None,
+    });
+
+    app.handle_message(Message::Telemetry(TelemetryUpdate::Dns(
+        "1.1.1.1".to_string(),
+    )));
+
+    assert_eq!(
+        app.runtime.real_dns.as_deref(),
+        Some("1.1.1.1"),
+        "real_dns must cache once scanner confirms zero sessions"
+    );
 }
 
 #[test]

@@ -881,7 +881,19 @@ impl App {
                 self.runtime.isp = isp;
             }
             TelemetryUpdate::Dns(dns) => {
-                if !self.has_active_connection() {
+                // Same startup-race protection as TelemetryUpdate::PublicIp
+                // — without this, a vortix opened while a VPN is up would
+                // race: DNS telemetry samples the VPN's pushed resolver
+                // before the scanner has adopted the tunnel, registry
+                // says `!is_connected`, and the VPN's DNS gets cached as
+                // `real_dns`. Subsequent dns_server reads then match
+                // real_dns and `verdict_for_protected` reads that as a
+                // DNS leak → header reads PARTIAL forever even with the
+                // killswitch toggled on.
+                let safe_to_cache = self.runtime.scanner_first_tick_done
+                    && self.runtime.last_kernel_session_count == 0
+                    && !self.has_active_connection();
+                if safe_to_cache {
                     if self.runtime.real_dns.is_none() {
                         self.log(&format!("NET: Pre-VPN DNS: {dns}"));
                     }
