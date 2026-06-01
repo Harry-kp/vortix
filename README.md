@@ -375,7 +375,8 @@ When running with `sudo`, vortix automatically resolves the invoking user's home
 ├── config.toml               User settings (optional, see below)
 ├── settings.toml             Figment-layered settings (optional, new in v0.3.0)
 ├── metadata.json             Profile metadata (last used, sort order)
-└── killswitch.state          Kill switch state for crash recovery
+├── killswitch.state          Kill switch state for crash recovery
+└── real-ip.cache             Cached pre-VPN public IP (Security Guard's Real IP row)
 ```
 
 Session event journals live in a separate XDG directory because they're observability data, not user config:
@@ -405,6 +406,7 @@ All files and directories under the config dir are owned by your user account, e
 | `settings.toml` | `644` | Optional figment-layered settings (new in v0.3.0): defaults → system file → this user file → `VORTIX_*` env vars. Not auto-created. |
 | `metadata.json` | `644` | Internal bookkeeping (last used, sort order). Auto-managed. |
 | `killswitch.state` | `644` | Persists kill switch mode across crashes. Auto-managed. |
+| `real-ip.cache` | `600` | Last-known pre-VPN public IP, written whenever vortix observes you in the un-tunneled state. Loaded on startup so the Security Guard's `Real IP` row populates immediately — including when vortix is opened while a VPN is already up. Two-line plain text (`<ip>\n<unix-timestamp>\n`). Refreshes on any future disconnected sample; stale entries (network moves while vortix is closed) self-correct the next time you disconnect. |
 
 ### Config file
 

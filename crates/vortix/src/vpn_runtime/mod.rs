@@ -184,6 +184,16 @@ impl VpnRuntime {
             }
         }
 
+        // Restore real_ip from the on-disk cache. Handles the
+        // "launch vortix with VPN already up" case where the
+        // current process has no disconnected window to learn the
+        // real IP from telemetry. Stale loads are acceptable — a
+        // fresh disconnected sample will overwrite the cache the
+        // moment the user disconnects.
+        if let Some(cached) = crate::core::real_ip_cache::load(&engine.config_dir) {
+            engine.real_ip = Some(cached.ip);
+        }
+
         // Load profiles
         engine.profiles = crate::vpn::load_profiles();
 

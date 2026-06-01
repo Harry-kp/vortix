@@ -773,6 +773,7 @@ impl App {
         self.should_quit = true;
     }
 
+    #[allow(clippy::too_many_lines)] // TEA-style dispatch — every arm is one telemetry variant; splitting would obscure the handler shape without simplifying it
     fn handle_telemetry(&mut self, update: TelemetryUpdate) {
         match update {
             TelemetryUpdate::PublicIp(ip) => {
@@ -818,10 +819,22 @@ impl App {
                     && self.runtime.last_kernel_session_count == 0
                     && !is_connected;
                 if safe_to_cache {
-                    if self.runtime.real_ip.is_none() {
+                    let first_detection = self.runtime.real_ip.is_none();
+                    let changed = self.runtime.real_ip.as_deref() != Some(ip.as_str());
+                    if first_detection {
                         self.log(&format!("NET: Real IP detected: {ip}"));
                     }
                     self.runtime.real_ip = Some(ip.clone());
+                    // Persist to disk so the next launch can render
+                    // the Real IP row immediately — including when
+                    // vortix is opened while a VPN is already up
+                    // (the in-process gate would withhold caching
+                    // forever in that scenario without the file).
+                    // Only write when the value actually changes to
+                    // avoid pointless I/O on every 30s telemetry tick.
+                    if first_detection || changed {
+                        crate::core::real_ip_cache::save(&self.runtime.config_dir, &ip);
+                    }
                 } else if self.runtime.public_ip != ip
                     && self.runtime.public_ip != constants::MSG_FETCHING
                 {

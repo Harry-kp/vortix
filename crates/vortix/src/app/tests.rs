@@ -3531,6 +3531,43 @@ fn real_ip_overwrites_on_disconnected_telemetry_samples() {
 }
 
 #[test]
+fn real_ip_telemetry_persists_to_disk_cache() {
+    // After a clean scanner tick + telemetry sample, the cache
+    // file on disk must contain the captured real IP. Future
+    // launches load this so the Real IP row populates even when
+    // vortix is opened with a VPN already up.
+    use crate::core::telemetry::TelemetryUpdate;
+    let mut app = test_app();
+
+    // Point the runtime at a fresh scratch dir so we can inspect
+    // the cache file without colliding with the user's real config.
+    let scratch =
+        std::env::temp_dir().join(format!("vortix-real-ip-cache-app-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir_all(&scratch).expect("scratch dir");
+    app.runtime.config_dir = scratch.clone();
+
+    app.handle_message(Message::SyncSystemState {
+        sessions: vec![],
+        default_route_interface: None,
+    });
+    app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIp(
+        "203.0.113.42".to_string(),
+    )));
+
+    // In-memory caches.
+    assert_eq!(app.runtime.real_ip.as_deref(), Some("203.0.113.42"));
+
+    // Disk cache populated.
+    let loaded = crate::core::real_ip_cache::load(&scratch)
+        .expect("on-disk cache must exist after a safe-to-cache telemetry sample");
+    assert_eq!(loaded.ip, "203.0.113.42");
+
+    // Cleanup.
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
 fn real_ip_frozen_once_connected_then_thaws_on_disconnect() {
     // While connected, telemetry samples are the VPN's exit IP and
     // must NOT overwrite real_ip. After disconnect (kernel session

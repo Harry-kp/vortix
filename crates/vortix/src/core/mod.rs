@@ -12,6 +12,7 @@ pub mod icmp;
 pub mod importer;
 pub mod killswitch;
 pub mod network_monitor;
+pub mod real_ip_cache;
 pub mod scanner;
 pub mod telemetry;
 pub mod telemetry_http;
