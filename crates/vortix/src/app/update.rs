@@ -470,11 +470,19 @@ impl App {
     }
 
     fn handle_disconnect_result(&mut self, profile: String, success: bool, error: Option<String>) {
-        // Guard: ignore stale results if we're no longer disconnecting this profile.
-        let still_disconnecting = matches!(
-            self.legacy_state(),
-            ConnectionState::Disconnecting { profile: ref p, .. } if *p == profile
-        );
+        // Stale-arrival check: read THIS profile's own registry state,
+        // not `legacy_state()`. In multi-tunnel topologies the legacy
+        // view reports the PRIMARY's state, and a name-equality check
+        // against the SECONDARY being disconnected would wrongly mark
+        // its result as stale — silently skipping `complete_disconnect`
+        // and leaving the entry as Disconnecting forever. Same pattern
+        // as the prior ConnectResult fix.
+        use crate::vortix_core::engine::state::Connection;
+        use crate::vortix_core::profile::ProfileId;
+        let still_disconnecting = self
+            .registry
+            .snapshot(&ProfileId::new(&profile))
+            .is_some_and(|snap| matches!(snap.state, Connection::Disconnecting { .. }));
         if !still_disconnecting {
             self.log(&format!(
                 "INFO: Ignoring stale DisconnectResult for '{profile}' (state changed)"
