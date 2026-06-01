@@ -731,7 +731,10 @@ mod tests {
             "expected ○ glyph next to NO EXIT (matches DISCONNECTED's glyph for visual consistency):\n{text}"
         );
         assert!(text.contains("Real:"), "expected 'Real:' label:\n{text}");
-        assert!(text.contains("198.51.100.42"), "expected public IP:\n{text}");
+        assert!(
+            text.contains("198.51.100.42"),
+            "expected public IP:\n{text}"
+        );
 
         // The NO EXIT title uses WARNING styling, not ERROR — the
         // situation is suboptimal but tunnels ARE up, unlike the

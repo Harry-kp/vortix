@@ -9,28 +9,6 @@ use std::time::{Duration, Instant};
 pub const DISMISS_DURATION: Duration = Duration::from_secs(4);
 pub const HELP_OVERLAY_MAX_HEIGHT: u16 = 40;
 
-/// Window (in seconds) during which the user can press `[u]` to revert an
-/// automatic primary promotion. After this window elapses the banner
-/// auto-dismisses and the `[u]` shortcut is no longer available — manual
-/// revert via `vortix up <old-primary>` (fires the
-/// [`InputMode::ConfirmDefaultRouteTakeover`] overlay) remains available
-/// indefinitely.
-///
-/// Multi-connection plan #001 U19 (D-3): 10s chosen as a defensible default
-/// for a novel banner the user has never seen, with a novel `[u]` shortcut
-/// not in today's keymap. 5s is too short to read+parse+decide+act on first
-/// encounter; conventional actionable-banner UX defaults sit in the 8-10s
-/// range (Android undo banners 5-8s, Gmail undo-send 5-30s configurable).
-/// Maximum age of `App::auto_promote_candidate` snapshot before it
-/// expires and stops being eligible to trigger the auto-promote
-/// toast. Bounds the case where a user disconnects everything, walks
-/// away, then connects a fresh tunnel — without expiry the stale
-/// candidate would fire a spurious "promoted X because Y
-/// disconnected" toast for a Y that disconnected long ago. 30s is
-/// comfortably longer than the scanner's worst-case latency (~2-3s)
-/// and shorter than any reasonable "I came back from a break" gap.
-pub const AUTO_PROMOTE_DETECTION_WINDOW_SECS: u64 = 30;
-
 /// Currently focused UI panel for keyboard navigation.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub enum FocusedPanel {
@@ -392,7 +370,6 @@ impl Toast {
         Instant::now() > self.expires
     }
 }
-
 
 #[cfg(test)]
 mod tests {

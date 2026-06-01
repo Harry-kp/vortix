@@ -434,13 +434,13 @@ mod tests {
         // Smoke check that the multi-tunnel keys (Shift+D, B on
         // takeover, etc.) all surfaced in the keybindings section.
         use std::fmt::Write;
-        let blob = HELP_TEXT.iter().flat_map(|(_, bindings)| bindings.iter()).fold(
-            String::new(),
-            |mut acc, (k, d)| {
+        let blob = HELP_TEXT
+            .iter()
+            .flat_map(|(_, bindings)| bindings.iter())
+            .fold(String::new(), |mut acc, (k, d)| {
                 let _ = writeln!(acc, "{k} {d}");
                 acc
-            },
-        );
+            });
         assert!(blob.contains("Disconnect ALL"));
         assert!(blob.contains("Connect both"));
     }

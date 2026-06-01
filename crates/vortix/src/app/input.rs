@@ -146,7 +146,10 @@ impl App {
                     self.handle_message(Message::CloseOverlay);
                 }
             }
-            InputMode::Help { mut scroll, mut tab } => {
+            InputMode::Help {
+                mut scroll,
+                mut tab,
+            } => {
                 let max_scroll = help_max_scroll_for_terminal_height(
                     self.terminal_size.1,
                     crate::ui::help_total_lines(tab),

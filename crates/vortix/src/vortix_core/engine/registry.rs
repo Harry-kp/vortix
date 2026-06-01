@@ -1293,7 +1293,7 @@ mod tests {
         assert!(matches!(lab.role, Role::Addressable { .. }));
     }
 
-    // ─────────────── SC2 — auto-promote ───────────────
+    // ─────────────── SC2 — registry follows kernel re-election ───────────────
 
     #[test]
     fn disconnect_primary_promotes_secondary_with_zero_slash_zero() {

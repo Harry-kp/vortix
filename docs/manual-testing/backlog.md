@@ -13,9 +13,9 @@ Pre-release human-verification checks. Every row here is something that CI can't
 | 5 | Multi-tunnel routing: corp owns default, lab owns 10/8 | `vortix up corp; vortix up lab; ip route get 1.1.1.1` shows `dev wg-corp`; `ip route get 10.x.y.z` shows `dev wg-lab` | Multi-tunnel netns harness not built (plan 002 U1+U2) |
 | 6 | Multi-tunnel real-internet exit IP differs per tunnel | `curl https://api.ipify.org` via corp returns IP A; same via lab returns IP B (when lab is primary) | Requires real public IPs; netns can't fake this |
 | 7 | 3+ tunnels overflow ladder in header degrades cleanly | Connect 6 tunnels on a 60-col terminal; verify Tier 1 → Tier 2 → Tier 3 (dot-row) transitions; never wraps | TUI rendering; needs ratatui snapshot harness (Phase 2) |
-| 8 | Auto-promote banner fires + `[u]` reverts within 10s | `wg-quick down corp` externally; banner appears; press `[u]` within 10s; corp reconnects | Feature wiring gap — `PrimaryTunnelChanged` event not emitted in production yet |
-| 9 | Auto-promote banner auto-dismisses after 10s | Same as #8 but wait >10s; banner gone; `[u]` does nothing | Same as #8 |
-| 10 | No auto-promote when no eligible secondary | Only one tunnel up; disconnect it; no banner fires | Same as #8 |
+| 8 | _(removed — auto-promote feature retired; primary changes are silent, user manages manually)_ | — | — |
+| 9 | _(removed — see #8)_ | — | — |
+| 10 | _(removed — see #8)_ | — | — |
 | 11 | Multi-tunnel disconnect via `d` key disconnects single tunnel | Connect 2 tunnels; focus secondary in sidebar; press `d`; only that one disconnects | TUI keybinding; needs snapshot harness |
 | 12 | `Shift+D` with N≥2 fires "Disconnect all N?" confirm dialog | Connect 3 tunnels; press `Shift+D`; verify dialog renders; Y disconnects all | Same as #11 |
 | 13 | `Tab` cycles Connection Details focus across active tunnels | 2 tunnels up; focus Connection Details; press `Tab`; focus advances; wraps at end | Same as #11 |
@@ -65,7 +65,7 @@ Pre-release human-verification checks. Every row here is something that CI can't
 | 57 | 10 active tunnels: TUI render budget under 16ms/frame | Connect 10 tunnels; observe TUI doesn't lag on `Tab` / sidebar nav | Perf benchmark cadence (Phase 2) |
 | 58 | Killswitch ruleset rewrite latency sub-100ms at N=5 | `sudo time pfctl -f -` / `iptables-restore` round-trip during a 5-tunnel transition | Perf benchmark cadence (Phase 2) |
 | 59 | 50 profiles loaded: sidebar scroll + search responsive | Synthesize 50 empty `.conf` files; verify no perceptible TUI lag | Perf benchmark cadence (Phase 2) |
-| 60 | Journal shows `PrimaryTunnelChanged` event after auto-promote | After auto-promote: `tail -f ~/.local/share/vortix/journal.jsonl \| jq '.event'` shows the event with correct `from`/`to`/`reason` | Feature wiring gap — event not emitted in production yet |
+| 60 | _(removed — auto-promote feature retired)_ | — | — |
 | 61 | Journal shows `ConnectAttemptBlockedByConflict` on overlay-cancelled connect | Trigger conflict overlay; cancel it; journal entry appears | Same as #60 |
 | 62 | `vpn-only` engages firewall immediately while VPN is up | `vortix up corp`; `vortix killswitch vpn-only`; `iptables -L OUTPUT -n` head shows `policy DROP`; before the P5d-era fix this silently produced "Armed" with no enforcement | Regression check for the `vpn-only` (`AlwaysOn`) semantic change (commit `34f07e3`) |
 | 63 | `vpn-only` keeps blocking through a VPN drop → reconnect cycle | With `vpn-only` engaged and corp up, externally `wg-quick down corp`; verify `iptables -L OUTPUT -n` still shows `policy DROP` between drop and reconnect; no ICMP escapes during the gap | Canonical Linux killswitch invariant |

@@ -468,15 +468,6 @@ impl App {
         details: &crate::vpn_runtime::DetailedConnectionInfo,
         since: Instant,
     ) {
-        // A fresh user-initiated connect clears any pending auto-
-        // promote candidate snapshot. Without this, the user could
-        // disconnect the primary AND then connect a fresh tunnel —
-        // and if the fresh tunnel happens to match an old candidate
-        // (rare but possible if they reconnect the SAME profile
-        // they had as a yielded secondary), the banner would
-        // wrongly fire. Fresh connect = initial-connect-shaped, no
-        // banner.
-        self.auto_promote_candidate = None;
         let Some(profile) = self
             .runtime
             .profiles
@@ -642,57 +633,8 @@ impl App {
     /// registry's FSM to `Disconnected` (without running `Disconnecting`
     /// or `tunnel.down()`) and remove the entry. Idempotent — a profile
     /// the registry never had is a no-op.
-    ///
-    /// Side effect: when the disconnected profile WAS the active
-    /// primary, snapshot the other Connected tunnels that claim the
-    /// default route. The snapshot lets
-    /// `detect_primary_change_for_banner` distinguish "secondary
-    /// auto-promoted" from "fresh user-initiated connect" later —
-    /// only candidates in the snapshot trigger the auto-promote
-    /// notification.
     pub fn mirror_disconnect_into_registry(&mut self, profile_name: &str) {
-        use crate::vortix_core::engine::state::Connection;
         let profile_id = ProfileId::new(profile_name);
-
-        // BEFORE set_disconnected, capture the pre-disconnect state.
-        // If this profile is the active primary, snapshot other
-        // Connected 0/0-claimants as auto-promote candidates.
-        let was_primary = self.registry.primary() == Some(&profile_id);
-        if was_primary {
-            // Eligible auto-promote candidate = Connected tunnel
-            // whose role is AddressableSuppressed. That role is
-            // produced exactly when (a) the tunnel claims the default
-            // route via its declared AllowedIPs and (b) another
-            // tunnel (the active primary about to disconnect) owns
-            // the kernel route. After the primary leaves, these
-            // tunnels are the natural promotion candidates.
-            use crate::vortix_core::engine::registry::Role;
-            let candidates: Vec<ProfileId> = self
-                .registry
-                .snapshot_all()
-                .into_iter()
-                .filter(|s| s.profile_id != profile_id)
-                .filter(|s| matches!(s.state, Connection::Connected { .. }))
-                .filter(|s| matches!(s.role, Role::AddressableSuppressed { .. }))
-                .map(|s| s.profile_id)
-                .collect();
-            if candidates.is_empty() {
-                self.log(&format!(
-                    "INFO: Disconnecting primary '{profile_name}' — no eligible auto-promote candidates (no Connected tunnel with declared 0/0 / Split tunnel (yielded) role)"
-                ));
-            } else {
-                let candidate_names: Vec<&str> = candidates
-                    .iter()
-                    .map(crate::vortix_core::profile::ProfileId::as_str)
-                    .collect();
-                self.log(&format!(
-                    "INFO: Disconnecting primary '{profile_name}' — auto-promote candidates: {candidate_names:?}"
-                ));
-                self.auto_promote_candidate =
-                    Some((profile_id.clone(), candidates, Instant::now()));
-            }
-        }
-
         self.registry.set_disconnected(&profile_id);
     }
 

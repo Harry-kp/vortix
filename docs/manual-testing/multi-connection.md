@@ -22,10 +22,10 @@ WireGuard `wg-split` or an OpenVPN profile with explicit non-default routes only
 | 4 | F1 up, then connect S where S's route overlaps F1's | F1 | F1 | Primary | — | Addressable | F1's exit IP, ✓ | ConfirmRouteOverlap → press Y |
 | 5 | F1 up, then connect F2, press Y on takeover (Switch) | F2 | F2 | — (disconnected) | Primary | — | F2's exit IP, ✓ | ConfirmDefaultRouteTakeover → Y |
 | 6 | F1 up, then connect F2, press B on takeover (Both) | F2 | F2 | AddressableSuppressed | Primary | — | F2's exit IP, ✓ | ConfirmDefaultRouteTakeover → B |
-| 7 | From #6 state, disconnect F2 | F1 | F1 | Primary | — | — | F1's exit IP, ✓ | none; banner: `Promoted 'F1' because 'F2' disconnected — [u] to revert` |
-| 8 | From #6 state, disconnect F1 | F2 | F2 | — | Primary | — | F2's exit IP, ✓ | none (F1 was suppressed, no banner) |
+| 7 | From #6 state, disconnect F2 | F1 | F1 | Primary | — | — | F1's exit IP, ✓ | none — user disconnects/reconnects manually if they want a different primary |
+| 8 | From #6 state, disconnect F1 | F2 | F2 | — | Primary | — | F2's exit IP, ✓ | none |
 | 9 | From #3 state, disconnect S | F1 | F1 | Primary | — | — | F1's exit IP, ✓ | none |
-| 10 | From #3 state, disconnect F1 | (no exit) | — | — | — | Addressable | "split-route — no exit" | none; no auto-promote candidate |
+| 10 | From #3 state, disconnect F1 | (no exit) | — | — | — | Addressable | "split-route — no exit" | none |
 | 11 | From #6 state, connect F1' (third F-class profile) | F1' | F1' | AddressableSuppressed | AddressableSuppressed | — | F1''s exit IP, ✓ | ConfirmDefaultRouteTakeover → B |
 | 12 | Connect S, then connect F1 (S already up, no overlap) | F1 | F1 | Primary | — | Addressable | F1's exit IP, ✓ | none (no conflict — S didn't own default) |
 
@@ -82,5 +82,5 @@ When running this matrix as part of a release verification, capture either:
   `route -n get 8.8.8.8` output.
 
 The JSON dump is sufficient evidence for scenarios 1–4 and 9–12; the visual
-verification is necessary for 5–8 and 11 because the auto-promote banner and
-the takeover overlay are visible-only state.
+verification is necessary for 5, 6, and 11 because the takeover overlay is
+visible-only state.

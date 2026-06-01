@@ -79,7 +79,6 @@ impl CachedConfigView {
     }
 }
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
 
 use crate::constants;
 use crate::logger;
@@ -90,8 +89,8 @@ use crate::vpn_runtime::VpnRuntime;
 
 // Re-export state types for convenient access
 pub use crate::state::{
-    AuthField, FlipAnimation, FocusedPanel, InputMode, ProfileSortOrder,
-    Protocol, Toast, ToastType, VpnProfile, DISMISS_DURATION,
+    AuthField, FlipAnimation, FocusedPanel, InputMode, ProfileSortOrder, Protocol, Toast,
+    ToastType, VpnProfile, DISMISS_DURATION,
 };
 // The legacy single-tunnel `ConnectionState`/`DetailedConnectionInfo` enum
 // lives on `crate::vpn_runtime` after U6 Stage B; re-export through `app::`
@@ -154,34 +153,6 @@ pub struct App {
     pub panel_areas: HashMap<FocusedPanel, Rect>,
     pub toast: Option<Toast>,
     pub terminal_size: (u16, u16),
-
-    /// Multi-connection plan #001 U19: tracks the last primary observed by
-    /// the App's tick loop so we can detect `Some(old) -> Some(new)` primary
-    /// transitions triggered by `PriorPrimaryDisconnected` and fire the
-    /// auto-promote banner. `None` initially and after the last primary
-    /// disconnects (no-primary state).
-    pub last_known_primary: Option<crate::vortix_core::profile::ProfileId>,
-
-    /// Snapshot of eligible auto-promote candidates captured at the
-    /// moment the active primary disconnected. When set, the next
-    /// `None → Some(new)` primary transition can verify that `new`
-    /// was an eligible candidate at disconnect-time — distinguishing
-    /// "yielded secondary just got promoted" (fire banner) from
-    /// "user disconnected everything and reconnected fresh" (don't).
-    ///
-    /// Set in `mirror_disconnect_into_registry` when the disconnected
-    /// profile was the active primary. Cleared on:
-    /// - A successful auto-promote detection (banner fires).
-    /// - A fresh user-initiated connect via `mirror_connect`.
-    /// - Stale entries (> `AUTO_PROMOTE_DETECTION_WINDOW_SECS`).
-    ///
-    /// Tuple: `(prior_primary, eligible_candidates, recorded_at)`.
-    pub auto_promote_candidate: Option<(
-        crate::vortix_core::profile::ProfileId,
-        Vec<crate::vortix_core::profile::ProfileId>,
-        Instant,
-    )>,
-
 }
 
 // Plan 005 U5 removed the previous `impl Deref<Target = VpnRuntime>` — the
@@ -231,8 +202,6 @@ impl App {
             panel_areas: HashMap::new(),
             toast: None,
             terminal_size: (0, 0),
-            last_known_primary: None,
-            auto_promote_candidate: None,
         };
 
         // Select first profile if available
@@ -387,8 +356,6 @@ impl App {
             panel_areas: HashMap::new(),
             toast: None,
             terminal_size: (80, 24),
-            last_known_primary: None,
-            auto_promote_candidate: None,
         }
     }
 }

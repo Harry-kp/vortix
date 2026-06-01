@@ -347,45 +347,6 @@ impl App {
                 // downstream `set_connected` / `set_disconnected` calls
                 // `recompute_primary`, which now reads this cached value
                 // instead of shelling out from the main thread.
-                //
-                // Auto-promote diagnostic: if a candidate snapshot is
-                // pending, log what the kernel says vs what the
-                // candidates' ifaces look like. Exposes the iface-mismatch
-                // case (kernel reports utunX but no Connected tunnel
-                // stores utunX) directly in the Event Log.
-                // Diagnostic: log kernel egress + every Connected tunnel's
-                // iface whenever the scanner ticks AND we have at least
-                // one Connected tunnel but no primary. This is the
-                // smoking-gun trace for the "tunnels up but header
-                // says NO EXIT" symptom — it shows whether the kernel
-                // is reporting a useful iface (wg-quick / kernel
-                // limitation if not) AND whether vortix's stored
-                // ifaces match (iface-mismatch if not).
-                use crate::vortix_core::engine::state::Connection;
-                let any_connected = self
-                    .registry
-                    .snapshot_all()
-                    .iter()
-                    .any(|s| matches!(s.state, Connection::Connected { .. }));
-                let no_primary = self.registry.primary().is_none();
-                if any_connected && no_primary {
-                    let kernel = default_route_interface.clone();
-                    let connected_ifaces: Vec<(String, String)> = self
-                        .registry
-                        .snapshot_all()
-                        .into_iter()
-                        .filter_map(|snap| match snap.state {
-                            Connection::Connected { details, .. } => Some((
-                                snap.profile_id.as_str().to_string(),
-                                details.interface.clone(),
-                            )),
-                            _ => None,
-                        })
-                        .collect();
-                    self.log(&format!(
-                        "NET: Scanner tick (NO EXIT diagnostic) — kernel egress={kernel:?}, connected tunnel ifaces={connected_ifaces:?}"
-                    ));
-                }
                 self.registry
                     .feed_default_route_interface(default_route_interface);
                 self.handle_sync_system_state(sessions);
@@ -1006,8 +967,7 @@ impl App {
                 }
                 (Connection::Disconnected { .. }, _) => {
                     // Historic marker (post-failure entry kept for the
-                    // ✗ badge). Scanner never auto-promotes these — the
-                    // user must retry or dismiss.
+                    // ✗ badge). User must retry or dismiss.
                 }
                 (
                     Connection::Reconnecting { .. } | Connection::AwaitingUserInput { .. },
@@ -1402,11 +1362,6 @@ impl App {
                 self.handle_message(Message::ConnectionTimeout(profile));
             }
         }
-        // Detect primary-tunnel transitions and fire the auto-promote
-        // toast. Toast-only notification (no central banner widget, no
-        // [u] revert hotkey — the user decides what action to take
-        // after being informed).
-        self.detect_primary_change_for_banner();
         // 2. Expire toast
         if let Some(toast) = &self.toast {
             if toast.is_expired() {
@@ -1456,113 +1411,6 @@ impl App {
                 }
             }
         }
-    }
-
-    /// Multi-connection plan #001 U19 (D-3): poll the registry's current
-    /// primary against `last_known_primary` and fire the auto-promote
-    /// banner toast on a `Some(old) -> Some(new)` transition triggered by
-    /// a prior-primary disconnect. We approximate the
-    /// `PrimaryChangeReason::PriorPrimaryDisconnected` heuristic by
-    /// checking that the previous primary's snapshot is now Disconnected
-    /// (or absent from the registry entirely) — that catches the user-
-    /// initiated disconnect case the plan targets and avoids firing on
-    /// `InitialConnect` (no prior primary) or `ExternalRouteChange`
-    /// (previous primary still up, route flapped).
-    fn detect_primary_change_for_banner(&mut self) {
-        let current = self.registry.primary().cloned();
-
-        // Expire stale auto-promote candidates regardless of primary
-        // transitions. Old candidates from minutes-ago disconnects
-        // would otherwise fire spurious banners on the next fresh
-        // connect that happens to be in their eligibility list.
-        if let Some((_, _, recorded_at)) = &self.auto_promote_candidate {
-            if recorded_at.elapsed().as_secs()
-                > crate::state::AUTO_PROMOTE_DETECTION_WINDOW_SECS
-            {
-                tracing::debug!(
-                    target: "vortix::app::auto_promote",
-                    "expiring stale auto-promote candidate snapshot"
-                );
-                self.auto_promote_candidate = None;
-            }
-        }
-
-        if current == self.last_known_primary {
-            return;
-        }
-        let prev_known = self.last_known_primary.clone();
-        self.last_known_primary.clone_from(&current);
-        tracing::debug!(
-            target: "vortix::app::auto_promote",
-            ?prev_known,
-            current = ?current,
-            "primary transition observed"
-        );
-
-        // Fire auto-promote ONLY when:
-        // 1. Current primary transitioned to Some(new).
-        // 2. We have an unexpired candidate snapshot from a prior
-        //    disconnect of an active primary.
-        // 3. `new` is in the candidate eligibility list — i.e., it
-        //    was a Connected AddressableSuppressed tunnel at the
-        //    moment the prior primary disconnected.
-        //
-        // This is the cleanest distinguisher between "secondary
-        // auto-promoted" and "user disconnected everything and
-        // reconnected fresh" — only candidates present in the
-        // registry at disconnect-time qualify; a fresh connect
-        // (via mirror_connect, which clears the candidate) does not.
-        let Some(new) = current else {
-            // Primary went from Some → None. If we have a candidate,
-            // log that we're WAITING for the candidate to be elected.
-            // This is the diagnostic for the user-reported bug — if
-            // this line appears repeatedly with no follow-up, the
-            // kernel isn't re-electing OR the iface stored on the
-            // candidate doesn't match `route -n get 8.8.8.8`.
-            if let Some((old, candidates, _)) = self.auto_promote_candidate.as_ref() {
-                let names: Vec<&str> = candidates
-                    .iter()
-                    .map(crate::vortix_core::profile::ProfileId::as_str)
-                    .collect();
-                self.log(&format!(
-                    "INFO: Primary slot empty after '{}' disconnected — awaiting kernel re-election of one of: {names:?}",
-                    old.as_str()
-                ));
-            }
-            return;
-        };
-        let Some((old, candidates, _)) = self.auto_promote_candidate.as_ref() else {
-            return;
-        };
-        if !candidates.contains(&new) {
-            self.log(&format!(
-                "INFO: Primary changed to '{}' — not in auto-promote candidate list (initial connect or unexpected transition)",
-                new.as_str()
-            ));
-            return;
-        }
-        let old = old.clone();
-        // Consume the candidate — banner only fires once per
-        // disconnect.
-        self.auto_promote_candidate = None;
-
-        tracing::info!(
-            target: "vortix::app::auto_promote",
-            old = %old.as_str(),
-            new = %new.as_str(),
-            "firing auto-promote toast"
-        );
-        // Toast-only notification, no [u] hotkey, no banner widget.
-        // User chooses what to do (reconnect old, leave new, disconnect
-        // either) — vortix just informs them which tunnel is now the
-        // active exit.
-        let toast_msg = format!(
-            "'{}' is now the active exit — '{}' disconnected.",
-            new.as_str(),
-            old.as_str(),
-        );
-        self.log(&format!("STATUS: {toast_msg}"));
-        self.show_toast(toast_msg, ToastType::Warning);
     }
 
     fn handle_cycle_log_filter(&mut self) {

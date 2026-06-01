@@ -62,7 +62,7 @@ The Role line answers one question: **"if I open a new browser tab right now, wh
 - `Split tunnel (0.0.0.0/0, yielded)` — same; the 0/0 in parens is from the config.
 - `Split tunnel (multi, yielded)` — declares multiple subnets including 0/0; another tunnel won.
 
-**What if both routes worked?** They don't — the OS routes each packet via exactly one path. The yielded tunnel sits idle from a default-traffic perspective. If the active primary disconnects, the kernel re-routes through the yielded one and vortix surfaces a toast naming the new active exit — that's what Shift+B's "keep both" gives you: a hot standby.
+**What if both routes worked?** They don't — the OS routes each packet via exactly one path. The yielded tunnel sits idle from a default-traffic perspective. If the active primary disconnects, the kernel re-elects whichever tunnel still has matching routes (typically the yielded one); vortix reads the new state and updates the Primary label on the next scanner tick. Vortix doesn't actively switch tunnels — it reports whatever the kernel decided.
 
 **Pet peeve note**: "yielded" is shorthand for "this VPN wanted to be primary but isn't right now." If you don't want it as a standby, just disconnect it.
 
@@ -108,7 +108,7 @@ If those three disagree, that's a bug — file an issue.
 ## Common confusing scenarios
 
 **"I connected two tunnels and one says `(multi, yielded)` — did I do something wrong?"**
-No. You pressed Shift+B (Both), and one of the two full-tunnel profiles won the route race while the other stood down. The yielded one is a standby — if the active primary drops, the yielded one promotes automatically.
+No. You pressed Shift+B (Both), and one of the two full-tunnel profiles won the route race while the other stood down. The yielded one stays connected as a parallel tunnel; if the active primary drops, the kernel may or may not re-route through the yielded one depending on its routing-table state. Vortix reports whichever tunnel currently owns the default route as Primary — it does not actively promote.
 
 **"I see `Split tunnel` but the profile claims `redirect-gateway` — why isn't it Primary?"**
 Either (a) another tunnel is already Primary and you connected this one as a secondary without taking over, or (b) the OpenVPN server isn't actually pushing the redirect at runtime (some VPN providers' free tiers do this). Check `route -n get 8.8.8.8` — if the answer isn't this tunnel's `utun*`, the kernel never installed the default route through it.

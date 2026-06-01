@@ -48,8 +48,6 @@ fn test_app() -> App {
         panel_areas: std::collections::HashMap::new(),
         toast: None,
         terminal_size: (80, 24),
-        last_known_primary: None,
-        auto_promote_candidate: None,
     }
 }
 
@@ -1420,7 +1418,10 @@ fn test_help_mode_opens_and_closes() {
     let mut app = test_app();
     assert!(matches!(app.input_mode, InputMode::Normal));
 
-    app.input_mode = InputMode::Help { scroll: 0, tab: crate::state::HelpTab::Keys };
+    app.input_mode = InputMode::Help {
+        scroll: 0,
+        tab: crate::state::HelpTab::Keys,
+    };
     assert!(matches!(app.input_mode, InputMode::Help { .. }));
 
     app.handle_message(Message::CloseOverlay);
@@ -1745,7 +1746,10 @@ fn test_help_scroll_down_clamps_at_max() {
         app.terminal_size.1,
         crate::ui::help_total_lines(crate::state::HelpTab::Keys),
     );
-    app.input_mode = InputMode::Help { scroll: 0, tab: crate::state::HelpTab::Keys };
+    app.input_mode = InputMode::Help {
+        scroll: 0,
+        tab: crate::state::HelpTab::Keys,
+    };
 
     for _ in 0..(usize::from(max_scroll) + 10) {
         app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
@@ -1763,11 +1767,20 @@ fn test_help_scroll_does_not_move_when_terminal_size_unknown() {
 
     let mut app = test_app();
     app.terminal_size = (0, 0);
-    app.input_mode = InputMode::Help { scroll: 0, tab: crate::state::HelpTab::Keys };
+    app.input_mode = InputMode::Help {
+        scroll: 0,
+        tab: crate::state::HelpTab::Keys,
+    };
 
     app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
 
-    assert!(matches!(app.input_mode, InputMode::Help { scroll: 0, tab: crate::state::HelpTab::Keys }));
+    assert!(matches!(
+        app.input_mode,
+        InputMode::Help {
+            scroll: 0,
+            tab: crate::state::HelpTab::Keys
+        }
+    ));
 }
 
 #[test]
@@ -1801,7 +1814,10 @@ fn test_help_end_jumps_to_max_scroll() {
         app.terminal_size.1,
         crate::ui::help_total_lines(crate::state::HelpTab::Keys),
     );
-    app.input_mode = InputMode::Help { scroll: 0, tab: crate::state::HelpTab::Keys };
+    app.input_mode = InputMode::Help {
+        scroll: 0,
+        tab: crate::state::HelpTab::Keys,
+    };
 
     app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
 
@@ -1820,7 +1836,10 @@ fn test_help_mouse_scroll_down_clamps_at_max() {
         app.terminal_size.1,
         crate::ui::help_total_lines(crate::state::HelpTab::Keys),
     );
-    app.input_mode = InputMode::Help { scroll: 0, tab: crate::state::HelpTab::Keys };
+    app.input_mode = InputMode::Help {
+        scroll: 0,
+        tab: crate::state::HelpTab::Keys,
+    };
 
     for _ in 0..20 {
         app.handle_mouse(MouseEvent {
@@ -2375,7 +2394,7 @@ fn disconnect_clears_animation() {
 }
 
 // ====================================================================
-// U19 — Connect/disconnect flow + auto-promote banner
+// U19 — Connect/disconnect flow
 // ====================================================================
 
 /// Helper: dispatch a `KeyEvent` matching the given char in `Normal` mode.
@@ -2756,7 +2775,6 @@ fn u19_cancel_connect_message_drives_disconnect_on_legacy_connecting() {
     );
 }
 
-
 #[test]
 fn u19_active_tunnel_count_reflects_registry_after_connect() {
     // Pre-P5a this exercised the legacy fallback when the registry
@@ -2768,25 +2786,6 @@ fn u19_active_tunnel_count_reflects_registry_after_connect() {
     assert_eq!(app.active_tunnel_count(), 0);
     set_connected(&mut app, "p1");
     assert_eq!(app.active_tunnel_count(), 1);
-}
-
-
-#[test]
-fn detect_primary_change_records_initial_primary_without_toast() {
-    // The first time a primary appears (None -> Some), no toast fires
-    // (that's `InitialConnect`-shaped, not a promotion).
-    let mut app = test_app();
-    app.handle_message(Message::Tick);
-    assert!(
-        app.toast
-            .as_ref()
-            .map_or(true, |t| !t.message.contains("Promoted"))
-            && app
-                .toast
-                .as_ref()
-                .map_or(true, |t| !t.message.contains("active exit"))
-    );
-    assert!(app.last_known_primary.is_none());
 }
 
 #[test]
@@ -2896,7 +2895,8 @@ fn scanner_promotion_from_connecting_to_connected_mirrors_into_registry() {
     // write (scanner + protocol layer both writing the interface) was
     // the source of bugs #3 and #12 in the origin requirements doc.
     // Now we assert the opposite: a kernel-visible session for a
-    // Connecting profile must NOT auto-promote.
+    // Connecting profile must NOT promote it to Connected — only the
+    // protocol layer's success result can.
     let mut app = test_app();
     add_profiles(&mut app, &["AWS_VPN"]);
     set_connecting(&mut app, "AWS_VPN");

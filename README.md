@@ -340,7 +340,6 @@ vortix status --watch --json
 | `c` | Cancel an in-flight `Connecting` profile from Connection Details |
 | `r` | Reconnect — cycle every Connected tunnel |
 | `B` | "Both" — from the takeover overlay, connect both tunnels (multi-tunnel) |
-| `u` | Revert auto-promote (undo a primary-switch banner action) |
 | `i` | Import Profile (Direct) |
 | `v` | View Profile Configuration |
 | `y` | Copy Public IP to Clipboard |
