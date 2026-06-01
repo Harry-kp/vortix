@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 /// Duration for toast notifications to remain visible.
 pub const DISMISS_DURATION: Duration = Duration::from_secs(4);
-pub const HELP_OVERLAY_MAX_HEIGHT: u16 = 38;
+pub const HELP_OVERLAY_MAX_HEIGHT: u16 = 40;
 
 /// Window (in seconds) during which the user can press `[u]` to revert an
 /// automatic primary promotion. After this window elapses the banner
@@ -220,6 +220,11 @@ pub enum InputMode {
     },
 }
 
+/// Number of rows the tabbed help-overlay's chrome eats from the
+/// inner area (tab strip + divider). The actual content paragraph
+/// gets `inner_height - HELP_OVERLAY_CHROME_ROWS`.
+pub const HELP_OVERLAY_CHROME_ROWS: u16 = 3;
+
 #[must_use]
 pub fn help_max_scroll_for_terminal_height(terminal_height: u16, total_lines: u16) -> u16 {
     if terminal_height == 0 {
@@ -229,8 +234,13 @@ pub fn help_max_scroll_for_terminal_height(terminal_height: u16, total_lines: u1
     let overlay_height = terminal_height
         .saturating_sub(2)
         .min(HELP_OVERLAY_MAX_HEIGHT);
+    // Subtract 2 for the Block border (top+bottom), then 3 more for
+    // the tab strip + divider that `render` inserts at the top of the
+    // inner area. Without the chrome subtraction, the bottom 3 lines
+    // of each tab would be unreachable via scroll.
     let inner_height = overlay_height.saturating_sub(2);
-    total_lines.saturating_sub(inner_height)
+    let content_height = inner_height.saturating_sub(HELP_OVERLAY_CHROME_ROWS);
+    total_lines.saturating_sub(content_height)
 }
 
 /// State for the panel flip animation.

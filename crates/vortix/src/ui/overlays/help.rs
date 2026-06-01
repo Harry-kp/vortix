@@ -173,7 +173,7 @@ const ROLE_GLOSSARY_FOOTER: &str =
 
 // ────────────────────────────── Rendering ──────────────────────────────
 
-const OVERLAY_MAX_WIDTH: u16 = 95;
+const OVERLAY_MAX_WIDTH: u16 = 120;
 const TAB_STRIP_HEIGHT: u16 = 2;
 
 #[must_use]
@@ -249,7 +249,13 @@ pub fn render(frame: &mut Frame, scroll: u16, tab: HelpTab) {
     render_divider(frame, chunks[1]);
 
     let active_tab = HelpTab::ALL.iter().position(|t| *t == tab).unwrap_or(0);
-    let max_scroll = state::help_max_scroll_for_terminal_height(area.height, total_lines(tab));
+    // Clamp scroll against the ACTUAL content-paragraph height
+    // (chunks[2]), not the full inner area. The tab strip + divider
+    // eat 3 rows from the top of inner; without accounting for that
+    // here, max_scroll would underestimate and the bottom 3 lines of
+    // each tab would be unreachable.
+    let content_height = chunks[2].height;
+    let max_scroll = total_lines(tab).saturating_sub(content_height);
     let clamped_scroll = scroll.min(max_scroll);
 
     let lines = match HelpTab::ALL[active_tab] {
