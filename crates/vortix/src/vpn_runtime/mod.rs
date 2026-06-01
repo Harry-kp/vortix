@@ -63,6 +63,24 @@ pub struct VpnRuntime {
     pub ip_unchanged_warned: bool,
     pub last_connected_profile: Option<String>,
 
+    /// True once the scanner has completed at least one
+    /// `Message::SyncSystemState` tick. Until then we don't know
+    /// whether the kernel has any active VPN interfaces, so the
+    /// real-IP cache gate must withhold trust on the first
+    /// telemetry sample. Without this flag, vortix opened while a
+    /// VPN is already up races: telemetry returns the VPN's exit
+    /// IP, the registry is briefly empty (adoption hasn't run
+    /// yet), and the wrong IP gets cached as `real_ip`.
+    pub scanner_first_tick_done: bool,
+
+    /// Number of kernel-visible VPN sessions observed at the most
+    /// recent scanner tick. Reading raw kernel state (not the
+    /// registry) catches tunnels that have not yet been adopted —
+    /// e.g. an OVPN process running outside vortix on macOS where
+    /// adoption needs the lsof Method A probe to attribute the
+    /// iface to the PID. Real-IP caching requires this to be zero.
+    pub last_kernel_session_count: usize,
+
     // === Configuration ===
     pub config: AppConfig,
     pub config_dir: PathBuf,
@@ -127,6 +145,8 @@ impl VpnRuntime {
             last_security_check: None,
             ip_unchanged_warned: false,
             last_connected_profile: None,
+            scanner_first_tick_done: false,
+            last_kernel_session_count: 0,
 
             config,
             config_dir,
@@ -204,6 +224,8 @@ impl VpnRuntime {
             last_security_check: None,
             ip_unchanged_warned: false,
             last_connected_profile: None,
+            scanner_first_tick_done: false,
+            last_kernel_session_count: 0,
 
             config,
             config_dir,
@@ -271,6 +293,8 @@ impl VpnRuntime {
             last_security_check: None,
             ip_unchanged_warned: false,
             last_connected_profile: None,
+            scanner_first_tick_done: false,
+            last_kernel_session_count: 0,
             config: AppConfig::default(),
             config_dir: std::env::temp_dir().join("vortix_test"),
             is_root: false,

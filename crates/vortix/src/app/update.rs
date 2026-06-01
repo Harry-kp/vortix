@@ -795,8 +795,29 @@ impl App {
                     }
                 }
 
-                // Store as real_ip when disconnected (for security comparison)
-                if !is_connected {
+                // Store as real_ip ONLY when we have positive proof
+                // there's no VPN active. Three conditions must hold:
+                //
+                // 1. Scanner has completed at least one tick — without
+                //    this, telemetry-on-startup races and we'd cache
+                //    the wrong IP before the scanner reports kernel
+                //    state.
+                // 2. Kernel reports zero VPN sessions — using raw
+                //    scanner state (not the registry) catches tunnels
+                //    that are kernel-visible but not yet adopted
+                //    (e.g. external openvpn awaiting lsof Method A on
+                //    macOS).
+                // 3. Registry has no Connected tunnel — defensive belt
+                //    against the scanner race; cheap so include it.
+                //
+                // Without ALL three, withhold caching. real_ip stays
+                // None and the UI shows "detecting…" — honest about
+                // not knowing rather than fabricating the VPN's exit
+                // IP as the user's real IP.
+                let safe_to_cache = self.runtime.scanner_first_tick_done
+                    && self.runtime.last_kernel_session_count == 0
+                    && !is_connected;
+                if safe_to_cache {
                     if self.runtime.real_ip.is_none() {
                         self.log(&format!("NET: Real IP detected: {ip}"));
                     }
@@ -894,6 +915,14 @@ impl App {
         use crate::vortix_core::profile::ProfileId;
         use std::collections::HashSet;
         use std::time::SystemTime;
+
+        // Record raw kernel state for the real-IP cache gate. Reading
+        // active.len() (not registry.tunnel_count) catches tunnels
+        // that aren't adopted yet — the startup-race window where
+        // telemetry fires before the registry has a chance to mirror
+        // kernel state.
+        self.runtime.scanner_first_tick_done = true;
+        self.runtime.last_kernel_session_count = active.len();
 
         let snapshots = self.registry.snapshot_all();
         let session_count = active.len();

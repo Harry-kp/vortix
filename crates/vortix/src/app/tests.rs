@@ -3407,3 +3407,179 @@ fn refresh_registry_preserves_authoritative_iface_across_scanner_ticks() {
         "scanner must NOT overwrite authoritative iface set by Tunnel::up()"
     );
 }
+
+// ====================================================================
+// Real-IP cache gate — startup-race regression suite
+// ====================================================================
+//
+// Bug: vortix opened while a VPN tunnel is already up cached the
+// VPN's exit IP as `real_ip`. Cause: telemetry's first PublicIp
+// poll fires before the scanner's first SyncSystemState tick, so
+// the registry is briefly empty, `!is_connected` is true, and the
+// VPN exit IP gets baked into `real_ip`. Fix: require positive
+// proof of zero VPN sessions (scanner has ticked AND kernel
+// reports zero sessions AND registry has zero Connected) before
+// caching. The tests below pin each branch of that gate.
+
+#[test]
+fn real_ip_not_cached_when_scanner_has_not_ticked_yet() {
+    // Telemetry fires before scanner. The bug: this used to cache
+    // the IP unconditionally because `!is_connected` was true.
+    // Fix: scanner_first_tick_done starts false → cache withheld.
+    use crate::core::telemetry::TelemetryUpdate;
+    let mut app = test_app();
+    assert!(!app.runtime.scanner_first_tick_done);
+    assert!(app.runtime.real_ip.is_none());
+
+    app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIp(
+        "46.101.235.146".to_string(),
+    )));
+
+    assert!(
+        app.runtime.real_ip.is_none(),
+        "real_ip must stay None until scanner reports kernel state"
+    );
+}
+
+#[test]
+fn real_ip_not_cached_when_kernel_has_active_sessions() {
+    // Scanner reports an active kernel session (a tunnel started
+    // outside vortix that hasn't been adopted yet, or one in flight).
+    // Telemetry then fires — the IP IS the VPN's exit IP, so we
+    // must withhold caching.
+    use crate::core::telemetry::TelemetryUpdate;
+    let mut app = test_app();
+    add_profiles(&mut app, &["vpn-a"]);
+
+    // Scanner sees a kernel session but registry hasn't adopted yet.
+    app.handle_message(Message::SyncSystemState {
+        sessions: vec![fake_session("vpn-a")],
+        default_route_interface: Some("wg0".to_string()),
+    });
+    assert!(app.runtime.scanner_first_tick_done);
+    assert_eq!(app.runtime.last_kernel_session_count, 1);
+
+    // The fake session got adopted in handle_sync_system_state, so
+    // is_connected is now true too. Verify that even if we manually
+    // reset is_connected (by removing the registry entry) but leave
+    // last_kernel_session_count > 0, the gate STILL holds.
+    let pid = crate::vortix_core::profile::ProfileId::new("vpn-a");
+    app.registry.set_disconnected(&pid);
+    assert!(!app.has_active_connection());
+    assert_eq!(app.runtime.last_kernel_session_count, 1);
+
+    app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIp(
+        "46.101.235.146".to_string(),
+    )));
+
+    assert!(
+        app.runtime.real_ip.is_none(),
+        "real_ip must stay None while kernel reports any VPN session"
+    );
+}
+
+#[test]
+fn real_ip_cached_after_clean_scanner_tick_with_zero_sessions() {
+    // Happy path: scanner has ticked and reports zero sessions,
+    // registry is empty, telemetry fires — cache the IP as real_ip.
+    use crate::core::telemetry::TelemetryUpdate;
+    let mut app = test_app();
+
+    app.handle_message(Message::SyncSystemState {
+        sessions: vec![],
+        default_route_interface: None,
+    });
+    assert!(app.runtime.scanner_first_tick_done);
+    assert_eq!(app.runtime.last_kernel_session_count, 0);
+
+    app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIp(
+        "203.0.113.5".to_string(),
+    )));
+
+    assert_eq!(
+        app.runtime.real_ip.as_deref(),
+        Some("203.0.113.5"),
+        "real_ip must cache once scanner confirms zero sessions"
+    );
+}
+
+#[test]
+fn real_ip_overwrites_on_disconnected_telemetry_samples() {
+    // After a clean disconnect, subsequent telemetry samples
+    // should overwrite real_ip (in case the user moved networks).
+    use crate::core::telemetry::TelemetryUpdate;
+    let mut app = test_app();
+
+    app.handle_message(Message::SyncSystemState {
+        sessions: vec![],
+        default_route_interface: None,
+    });
+
+    app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIp(
+        "203.0.113.5".to_string(),
+    )));
+    assert_eq!(app.runtime.real_ip.as_deref(), Some("203.0.113.5"));
+
+    app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIp(
+        "198.51.100.10".to_string(),
+    )));
+    assert_eq!(
+        app.runtime.real_ip.as_deref(),
+        Some("198.51.100.10"),
+        "real_ip must update when user moves networks"
+    );
+}
+
+#[test]
+fn real_ip_frozen_once_connected_then_thaws_on_disconnect() {
+    // While connected, telemetry samples are the VPN's exit IP and
+    // must NOT overwrite real_ip. After disconnect (kernel session
+    // count drops to 0), the next sample can re-cache.
+    use crate::core::telemetry::TelemetryUpdate;
+    let mut app = test_app();
+
+    // Clean tick → cache real IP.
+    app.handle_message(Message::SyncSystemState {
+        sessions: vec![],
+        default_route_interface: None,
+    });
+    app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIp(
+        "203.0.113.5".to_string(),
+    )));
+    assert_eq!(app.runtime.real_ip.as_deref(), Some("203.0.113.5"));
+
+    // VPN comes up — kernel reports a session.
+    add_profiles(&mut app, &["vpn-a"]);
+    app.handle_message(Message::SyncSystemState {
+        sessions: vec![fake_session("vpn-a")],
+        default_route_interface: Some("wg0".to_string()),
+    });
+
+    // Telemetry while connected (VPN exit IP) — must NOT overwrite.
+    app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIp(
+        "46.101.235.146".to_string(),
+    )));
+    assert_eq!(
+        app.runtime.real_ip.as_deref(),
+        Some("203.0.113.5"),
+        "real_ip must stay frozen while connected"
+    );
+
+    // VPN goes away — kernel reports zero sessions, registry too.
+    let pid = crate::vortix_core::profile::ProfileId::new("vpn-a");
+    app.registry.set_disconnected(&pid);
+    app.handle_message(Message::SyncSystemState {
+        sessions: vec![],
+        default_route_interface: None,
+    });
+
+    // Now telemetry can re-cache (user may have moved networks).
+    app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIp(
+        "198.51.100.99".to_string(),
+    )));
+    assert_eq!(
+        app.runtime.real_ip.as_deref(),
+        Some("198.51.100.99"),
+        "real_ip must thaw and update after clean disconnect"
+    );
+}
