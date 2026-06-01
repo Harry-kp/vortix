@@ -13,7 +13,7 @@ use tracing::info;
 // `warn!` is only invoked on macOS (the `resolve_wireguard_interface
 // returned None` diagnostic at line ~223). Gate the import so Linux
 // clippy doesn't flag it as unused.
-#[cfg(target_os = "macos")]
+#[cfg(target_os = "macos")] // xtask:allow-platform-cfg: scopes a tracing macro import used only by the macOS-only warn! call below
 use tracing::warn;
 
 use crate::vortix_protocol_wireguard::parser::parse_wg_conf;
