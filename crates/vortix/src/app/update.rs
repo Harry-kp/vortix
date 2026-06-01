@@ -1434,42 +1434,61 @@ impl App {
         if current == self.last_known_primary {
             return;
         }
-        let previous = self.last_known_primary.clone();
         self.last_known_primary.clone_from(&current);
 
-        // Only fire on Some(old) -> Some(new); no-primary transitions and
-        // initial-connect transitions are silent.
-        let (Some(old), Some(new)) = (previous, current) else {
-            return;
-        };
-        if old == new {
-            return;
-        }
+        // Auto-promote-on-disconnect is structurally a TWO-TICK
+        // transition:
+        //   Tick N:    primary was Some(old); user disconnects old;
+        //              set_disconnected runs recompute_primary against
+        //              the still-stale cache → primary becomes None.
+        //              Observed: Some(old) → None.
+        //   Tick N+1:  scanner ticks; cache updated to the new kernel
+        //              egress; refresh_registry fires set_connected on
+        //              the surviving 0/0 tunnel → primary becomes
+        //              Some(new). Observed: None → Some(new).
+        //
+        // A naive `Some(old) → Some(new)` check on `last_known_primary`
+        // would miss this — the intermediate None breaks the
+        // single-step pattern. `last_active_primary` survives the None
+        // gap by only updating when current is Some, so the N+1 tick
+        // can fire the banner with the right `old → new` pair.
+        if let Some(new) = current.as_ref() {
+            let prior = self.last_active_primary.replace(new.clone());
+            let Some(old) = prior else {
+                // No prior active primary → initial connect, silent.
+                return;
+            };
+            if old == *new {
+                return;
+            }
+            // Heuristic: the prior primary should have just disconnected
+            // (snapshot is Disconnected or gone). When the prior primary
+            // is still active this is an `ExternalRouteChange`-shaped
+            // transition (route flapped while both tunnels remain up)
+            // and the banner is not appropriate.
+            let prior_active = self
+                .registry
+                .snapshot(&old)
+                .is_some_and(|s| !matches!(s.state, Connection::Disconnected { .. }));
+            if prior_active {
+                return;
+            }
 
-        // Heuristic: the prior primary should have just disconnected
-        // (snapshot is Disconnected or gone). When the prior primary is
-        // still active this is an `ExternalRouteChange`-shaped transition
-        // and the banner is not appropriate.
-        let prior_active = self
-            .registry
-            .snapshot(&old)
-            .is_some_and(|s| !matches!(s.state, Connection::Disconnected { .. }));
-        if prior_active {
-            return;
+            let banner_msg = format!(
+                "Promoted '{}' to primary because '{}' disconnected — [u] to revert ({}s)",
+                new.as_str(),
+                old.as_str(),
+                crate::state::AUTO_PROMOTE_REVERT_WINDOW_SECS,
+            );
+            self.log(&format!("STATUS: {banner_msg}"));
+            self.auto_promote_banner = Some(crate::state::AutoPromoteBanner::new(old, new.clone()));
+            // Surface the message through the existing toast channel so users
+            // see it even if the banner widget hasn't rendered yet (U17 owns
+            // banner painting; U19 wires the data flow).
+            self.show_toast(banner_msg, ToastType::Warning);
         }
-
-        let banner_msg = format!(
-            "Promoted '{}' to primary because '{}' disconnected — [u] to revert ({}s)",
-            new.as_str(),
-            old.as_str(),
-            crate::state::AUTO_PROMOTE_REVERT_WINDOW_SECS,
-        );
-        self.log(&format!("STATUS: {banner_msg}"));
-        self.auto_promote_banner = Some(crate::state::AutoPromoteBanner::new(old, new));
-        // Surface the message through the existing toast channel so users
-        // see it even if the banner widget hasn't rendered yet (U17 owns
-        // banner painting; U19 wires the data flow).
-        self.show_toast(banner_msg, ToastType::Warning);
+        // current is None: keep `last_active_primary` as-is so the
+        // next Some transition can reference the old primary.
     }
 
     /// Multi-connection plan #001 U19 (D-3): revert an auto-promotion.

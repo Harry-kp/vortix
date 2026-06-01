@@ -161,6 +161,18 @@ pub struct App {
     /// disconnects (no-primary state).
     pub last_known_primary: Option<crate::vortix_core::profile::ProfileId>,
 
+    /// Most-recently-active primary, distinct from
+    /// [`Self::last_known_primary`] in that it SURVIVES None gaps in
+    /// the primary slot. Auto-promote-on-disconnect typically takes
+    /// two ticks: tick N observes `Some(old) -> None` (the disconnect
+    /// zeroed primary; new election hasn't happened yet); tick N+1
+    /// observes `None -> Some(new)` (scanner re-elected). The single-
+    /// step `Some(old) -> Some(new)` check on `last_known_primary`
+    /// would miss this — both ticks see one side as None. This field
+    /// remembers `old` across the None gap so the N+1 tick can fire
+    /// the banner with `old -> new`.
+    pub last_active_primary: Option<crate::vortix_core::profile::ProfileId>,
+
     /// Multi-connection plan #001 U19 (D-3): active auto-promote banner.
     /// When `Some`, the `[u]` keybinding reverts the promotion. Cleared by
     /// the tick loop after [`AUTO_PROMOTE_REVERT_WINDOW_SECS`] elapses or
@@ -216,6 +228,7 @@ impl App {
             toast: None,
             terminal_size: (0, 0),
             last_known_primary: None,
+            last_active_primary: None,
             auto_promote_banner: None,
         };
 
@@ -372,6 +385,7 @@ impl App {
             toast: None,
             terminal_size: (80, 24),
             last_known_primary: None,
+            last_active_primary: None,
             auto_promote_banner: None,
         }
     }

@@ -49,6 +49,7 @@ fn test_app() -> App {
         toast: None,
         terminal_size: (80, 24),
         last_known_primary: None,
+        last_active_primary: None,
         auto_promote_banner: None,
     }
 }
@@ -2836,6 +2837,102 @@ fn u19_active_tunnel_count_reflects_registry_after_connect() {
     assert_eq!(app.active_tunnel_count(), 0);
     set_connected(&mut app, "p1");
     assert_eq!(app.active_tunnel_count(), 1);
+}
+
+#[test]
+fn auto_promote_banner_fires_across_two_tick_some_none_some_transition() {
+    // Regression for the auto-promote-on-disconnect bug:
+    //
+    //   Tick N:   primary was Some(old); user disconnects old;
+    //             set_disconnected runs recompute_primary with stale
+    //             cache → primary becomes None. The tick observes
+    //             Some(old) → None.
+    //   Tick N+1: scanner ticks; cache updated; refresh_registry
+    //             elects the surviving 0/0 tunnel → primary becomes
+    //             Some(new). The tick observes None → Some(new).
+    //
+    // The naive `Some(old) → Some(new)` single-step check on
+    // `last_known_primary` misses both halves (each tick sees one
+    // side as None). The fix uses `last_active_primary` which
+    // survives the None gap.
+    use crate::vortix_core::engine::state::Connection;
+    use crate::vortix_core::profile::ProfileId;
+
+    let mut app = test_app();
+    add_profiles(&mut app, &["old-primary", "new-primary"]);
+
+    // Both tunnels are present in the registry. Seed initial primary
+    // tracking state: previously old-primary was the active primary.
+    app.last_known_primary = Some(ProfileId::new("old-primary"));
+    app.last_active_primary = Some(ProfileId::new("old-primary"));
+
+    // ─── Tick N: simulate "old-primary just disconnected, new-primary
+    //              not yet elected" — primary slot is None.
+    // (No registry entries → registry.primary() == None.)
+    app.handle_message(Message::Tick);
+    assert!(
+        app.auto_promote_banner.is_none(),
+        "Tick observing Some → None must not fire a banner (the new primary hasn't been elected yet)"
+    );
+    assert_eq!(
+        app.last_active_primary,
+        Some(ProfileId::new("old-primary")),
+        "last_active_primary must survive the None gap so tick N+1 has a `from` reference"
+    );
+
+    // ─── Tick N+1: scanner re-elected new-primary. Seed the registry.
+    // Inject a Connected entry for new-primary so registry.primary()
+    // resolves it. Need a kernel-iface probe override too — using
+    // mirror_connect_into_registry skips the probe and lets primary
+    // election happen via the test seam.
+    let details = DetailedConnectionInfo {
+        interface: "wg-utun".to_string(),
+        pid: Some(123),
+        ..Default::default()
+    };
+    app.mirror_connect_into_registry("new-primary", &details, Instant::now());
+    // Feed the cache so recompute_primary will match.
+    app.registry
+        .feed_default_route_interface(Some("wg-utun".to_string()));
+    app.registry.refresh_primary();
+    // Sanity check: registry primary IS now new-primary.
+    assert_eq!(
+        app.registry.primary().map(ProfileId::as_str),
+        Some("new-primary"),
+        "setup precondition"
+    );
+    // Pre-condition for old-primary being treated as disconnected:
+    // the registry has no entry for it (set_disconnected removed it).
+    assert!(app
+        .registry
+        .snapshot(&ProfileId::new("old-primary"))
+        .is_none());
+
+    app.handle_message(Message::Tick);
+
+    let banner = app
+        .auto_promote_banner
+        .as_ref()
+        .expect("banner MUST fire on the Some→Some-across-None auto-promote transition");
+    assert_eq!(
+        banner.from.as_str(),
+        "old-primary",
+        "banner names the prior active primary that disconnected"
+    );
+    assert_eq!(
+        banner.to.as_str(),
+        "new-primary",
+        "banner names the newly-elected primary"
+    );
+    // Toast surfaces the same message so users see it even if the
+    // banner widget hasn't rendered yet.
+    assert!(
+        app.toast.is_some(),
+        "auto-promote also surfaces via toast for visibility"
+    );
+    // Suppress unused warning on Connection (used by sibling tests
+    // that don't import it explicitly here).
+    let _ = std::marker::PhantomData::<Connection>;
 }
 
 #[test]
