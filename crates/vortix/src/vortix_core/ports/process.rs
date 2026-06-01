@@ -55,8 +55,7 @@ pub struct CommandSpec {
     pub kind: Kind,
     /// Arg indices to redact in `tracing` audit logs. Used by callers that pass
     /// secret material (e.g., file paths in `/tmp/vortix-*.conf`) as args.
-    /// Today vortix has no such callsite; the field is reserved for plan 006's
-    /// SecretStore-aware Tunnel impls.
+    /// No current callsite uses this; the field is reserved for future use.
     pub redact_in_audit: Vec<usize>,
     /// When `true`, the process will fork+detach (e.g. `openvpn --daemon`).
     /// The runner takes two precautions:

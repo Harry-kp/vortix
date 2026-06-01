@@ -96,10 +96,11 @@ Today, Vortix is a macOS-first tool that happens to compile on Linux. v0.2.0 mak
 
 1. **Existing CLI unchanged.** `vortix up`, `down`, `status`, `list`, `import`, `killswitch` — all preserved exactly. Profiles, killswitch state, and `.auth` files keep working unchanged.
 
-2. **Three new top-level subcommands:**
-   - `vortix secrets {set,get,delete}` — optional OS-keyring-backed encrypted credential store (AES-256-GCM + argon2id fallback for headless installs).
+2. **Two new top-level subcommands:**
    - `vortix audit [--pid N] [--vpn-only] [--json]` — per-process socket inventory; useful for answering "is this traffic actually routing through the VPN?" (issues [#168](https://github.com/Harry-kp/vortix/issues/168), [#166](https://github.com/Harry-kp/vortix/issues/166)).
    - `vortix daemon [--socket PATH]` — long-running IPC server for `EngineHandle::Remote` (issue [#16](https://github.com/Harry-kp/vortix/issues/16)). Skeleton + wire-contract ships in v0.3.0; engine routing through the daemon lands in v0.3.x.
+
+   *(A `vortix secrets {set,get,delete}` keyring-backed credential store also shipped in v0.3.0 and was retired in v0.3.1 — the macOS keyring lied about persistence for unsigned binaries and the TUI's connect path never consulted the store; auth credentials now flow only through the existing `auth/<profile>.auth` files and the TUI's prompt overlay.)*
 
 3. **Lifecycle hooks** ([plan 009](docs/plans/2026-05-24-009-feat-lifecycle-hooks-plan.md), issue [#36](https://github.com/Harry-kp/vortix/issues/36)). Run shell commands on FSM transitions (pre/post connect/disconnect, connect_failed, reconnecting). Configure via `[[hooks]]` in `settings.toml`. Empty by default, zero overhead.
 

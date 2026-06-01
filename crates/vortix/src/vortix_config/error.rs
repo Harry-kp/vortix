@@ -10,6 +10,4 @@ pub enum ConfigError {
     Settings(#[from] crate::vortix_config::settings::SettingsError),
     #[error("profile store error: {0}")]
     ProfileStore(#[from] crate::vortix_config::profile_store::ProfileStoreError),
-    #[error("secret store error: {0}")]
-    SecretStore(#[from] crate::vortix_config::secret_store::SecretStoreError),
 }

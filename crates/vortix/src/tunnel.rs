@@ -108,47 +108,6 @@ impl crate::vortix_core::ports::tunnel::Tunnel for TunnelKind {
     }
 }
 
-/// Extended variant of [`tunnel_for`] that wires the `SecretStore`-backed
-/// auth provider onto the `OpenVPN` tunnel (plan 006 U5). The provider tries
-/// the layered store at `<config_dir>/secrets.enc` keyed by
-/// `creds/<profile_id>`; missing entries silently fall through to the
-/// legacy `auth_dir` lookup inside the tunnel.
-#[must_use]
-pub fn tunnel_for_with_secrets(
-    protocol: Protocol,
-    config_dir: &Path,
-    ovpn_verbosity: &str,
-    connect_timeout_secs: u64,
-) -> TunnelKind {
-    let mut kind = tunnel_for(protocol, config_dir, ovpn_verbosity, connect_timeout_secs);
-    if let TunnelKind::OpenVpn(ref mut ovpn) = kind {
-        let store_dir = config_dir.to_path_buf();
-        let provider: crate::vortix_protocol_openvpn::SecretProvider =
-            std::sync::Arc::new(move |profile_id: &str| {
-                use crate::vortix_config::secret_store::{
-                    LayeredSecretStore, SecretBackendTag, SecretRef, SecretStore, SecretStoreConfig,
-                };
-                let store = LayeredSecretStore::new(SecretStoreConfig {
-                    fallback_path: store_dir.join("secrets.enc"),
-                    passphrase: None,
-                    force_fallback: false,
-                })
-                .ok()?;
-                let id = format!("creds/{profile_id}");
-                for backend in [SecretBackendTag::Keyring, SecretBackendTag::EncryptedFile] {
-                    let r = SecretRef::new(backend, &id);
-                    if let Ok(s) = store.get(&r) {
-                        return Some(s.as_bytes().to_vec());
-                    }
-                }
-                None
-            });
-        let updated = ovpn.clone().with_secret_provider(provider);
-        *ovpn = updated;
-    }
-    kind
-}
-
 /// THE single routing function: protocol → `TunnelKind`.
 ///
 /// Engine and CLI call this once per connect/disconnect and never branch on

@@ -64,11 +64,7 @@ pub fn handle_command(
             mode,
         ),
         Commands::Import { file } => handle_import(file, mode),
-        Commands::Show {
-            profile,
-            raw,
-            inline_secrets,
-        } => handle_show(profile, *raw, *inline_secrets, config, config_dir, mode),
+        Commands::Show { profile, raw } => handle_show(profile, *raw, config, config_dir, mode),
         Commands::Delete { profile, yes } => handle_delete(profile, *yes, config, config_dir, mode),
         Commands::Rename { old, new } => handle_rename(old, new, config, config_dir, mode),
         Commands::KillSwitch { mode: ks_mode } => {
@@ -90,102 +86,11 @@ pub fn handle_command(
             super::report::run(config_dir, config_source);
             0
         }
-        Commands::Secrets { op } => handle_secrets(op, config_dir, mode),
         Commands::Audit { pid, vpn_only } => handle_audit(*pid, *vpn_only, mode),
         Commands::Daemon { socket } => handle_daemon(socket.clone(), mode),
         Commands::Completions { shell } => {
             handle_completions(*shell);
             0
-        }
-    }
-}
-
-fn parse_secret_backend(
-    s: Option<&String>,
-) -> crate::vortix_config::secret_store::SecretBackendTag {
-    use crate::vortix_config::secret_store::SecretBackendTag;
-    match s.map(String::as_str) {
-        Some("encrypted-file" | "file") => SecretBackendTag::EncryptedFile,
-        _ => SecretBackendTag::Keyring,
-    }
-}
-
-fn handle_secrets(op: &crate::cli::args::SecretsOp, config_dir: &Path, mode: OutputMode) -> i32 {
-    use crate::cli::args::SecretsOp;
-    use crate::vortix_config::secret_store::{
-        LayeredSecretStore, Secret, SecretRef, SecretStore, SecretStoreConfig,
-    };
-    use std::io::Read;
-
-    let fallback_path = config_dir.join("secrets.enc");
-    let cfg = SecretStoreConfig {
-        fallback_path,
-        passphrase: None,
-        force_fallback: false,
-    };
-    let store = match LayeredSecretStore::new(cfg) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("secret store unavailable: {e}");
-            eprintln!("hint: set $VORTIX_PASSPHRASE or install a system keyring.");
-            return 1;
-        }
-    };
-
-    match op {
-        SecretsOp::Set { id } => {
-            let mut bytes = Vec::new();
-            if let Err(e) = std::io::stdin().read_to_end(&mut bytes) {
-                eprintln!("read stdin: {e}");
-                return 1;
-            }
-            if bytes.is_empty() {
-                eprintln!(
-                    "refusing to store an empty secret — pipe the value into stdin:\n  echo -n 'value' | vortix secrets set {id}"
-                );
-                return 1;
-            }
-            match store.set(id, Secret::new(bytes)) {
-                Ok(secret_ref) => {
-                    if matches!(mode, OutputMode::Human) {
-                        println!("Stored {} in {:?}", secret_ref.id, secret_ref.backend);
-                    }
-                    0
-                }
-                Err(e) => {
-                    eprintln!("set failed: {e}");
-                    1
-                }
-            }
-        }
-        SecretsOp::Get { id, backend } => {
-            let secret_ref = SecretRef::new(parse_secret_backend(backend.as_ref()), id.clone());
-            match store.get(&secret_ref) {
-                Ok(secret) => {
-                    use std::io::Write;
-                    let _ = std::io::stdout().write_all(secret.as_bytes());
-                    0
-                }
-                Err(e) => {
-                    eprintln!("get failed: {e}");
-                    1
-                }
-            }
-        }
-        SecretsOp::Delete { id, backend } => {
-            let secret_ref = SecretRef::new(parse_secret_backend(backend.as_ref()), id.clone());
-            match store.delete(&secret_ref) {
-                Ok(()) => {
-                    if matches!(mode, OutputMode::Human) {
-                        println!("Deleted {id}");
-                    }
-                    0
-                }
-                Err(e) => {
-                    eprintln!("delete failed: {e}");
-                    1
-                }
-            }
         }
     }
 }
@@ -329,32 +234,6 @@ fn handle_daemon(socket_override: Option<std::path::PathBuf>, mode: OutputMode) 
         }
     });
     0
-}
-
-/// Pull `id` from the configured `LayeredSecretStore`. Returns `Ok(None)`
-/// when the entry is missing; `Err` when the store itself is unavailable.
-fn try_export_secret(
-    config_dir: &Path,
-    id: &str,
-) -> Result<Option<Vec<u8>>, crate::vortix_config::secret_store::SecretStoreError> {
-    use crate::vortix_config::secret_store::{
-        LayeredSecretStore, SecretBackendTag, SecretRef, SecretStore, SecretStoreConfig,
-    };
-    let store = LayeredSecretStore::new(SecretStoreConfig {
-        fallback_path: config_dir.join("secrets.enc"),
-        passphrase: None,
-        force_fallback: false,
-    })?;
-    // Try keyring first (the default backend); fall back to encrypted-file.
-    for backend in [SecretBackendTag::Keyring, SecretBackendTag::EncryptedFile] {
-        let r = SecretRef::new(backend, id);
-        match store.get(&r) {
-            Ok(s) => return Ok(Some(s.as_bytes().to_vec())),
-            Err(crate::vortix_config::secret_store::SecretStoreError::NotFound(_)) => {}
-            Err(other) => return Err(other),
-        }
-    }
-    Ok(None)
 }
 
 // ── Connection ──────────────────────────────────────────────────────────
@@ -1679,7 +1558,6 @@ struct ShowData {
 fn handle_show(
     profile_name: &str,
     raw: bool,
-    inline_secrets: bool,
     config: &AppConfig,
     config_dir: &Path,
     mode: OutputMode,
@@ -1696,42 +1574,7 @@ fn handle_show(
 
     let raw_content = if raw {
         match std::fs::read_to_string(&profile.config_path) {
-            Ok(mut content) => {
-                // --inline-secrets: previously the responsibility of `vortix
-                // export`. Folded into `show --raw` per the v0.3.0 CLI
-                // surface cleanup. Appends a `# vortix-secret:<base64>`
-                // trailing comment when a stored credential exists for the
-                // profile. Missing-store / missing-secret cases warn on
-                // stderr but don't fail the call.
-                if inline_secrets {
-                    let secret_id = format!("creds/{}", profile.name);
-                    match try_export_secret(config_dir, &secret_id) {
-                        Ok(Some(bytes)) => {
-                            use base64::Engine as _;
-                            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                            if !content.ends_with('\n') {
-                                content.push('\n');
-                            }
-                            content.push_str("# vortix-secret:");
-                            content.push_str(&b64);
-                            content.push('\n');
-                            eprintln!(
-                                "# vortix: inlined secret '{secret_id}' as a trailing comment ({} bytes base64)",
-                                b64.len()
-                            );
-                        }
-                        Ok(None) => {
-                            eprintln!(
-                                "# vortix: --inline-secrets: no secret stored at '{secret_id}'"
-                            );
-                        }
-                        Err(e) => {
-                            eprintln!("# vortix: --inline-secrets: secret store unavailable ({e})");
-                        }
-                    }
-                }
-                Some(content)
-            }
+            Ok(content) => Some(content),
             Err(e) => {
                 print_error_and_exit(
                     mode,

@@ -14,14 +14,6 @@ Common traps documented there (each cost one CI cycle):
 
 "Passes locally" is a claim that requires the full command output, not a verbal assertion.
 
-## Dependency pins to leave alone
-
-`crates/vortix/Cargo.toml` pins `rand = "0.8"` and `sha2 = "0.10"`. Dependabot will keep proposing bumps — DO NOT accept them naively:
-- `aes-gcm 0.10` (in `vortix_config/secret_store.rs`) expects `rand_core 0.6`; `rand 0.10` ships `rand_core 0.10` and the two are not interchangeable
-- The PR comment chain on #208/#209/#211 documents the breakage if you need receipts
-
-If you bump, also rewrite `secret_store.rs`'s nonce generation against whatever rand_core version aes-gcm exposes that release.
-
 ## Architectural boundaries are enforced by xtask, not just convention
 
 - `vortix_core/` must not import from `vortix_platform_*`, `vortix_protocol_*`, or the process layer

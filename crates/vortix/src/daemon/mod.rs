@@ -49,7 +49,7 @@ pub fn build_engine_handle(
     profiles_dir: &Path,
 ) -> Option<crate::vortix_core::engine::EngineHandle> {
     use crate::state::Protocol;
-    use crate::tunnel::{tunnel_for_with_secrets, TunnelKind};
+    use crate::tunnel::{tunnel_for, TunnelKind};
     use crate::vortix_config::profile_store::{FsProfileStore, ProfileStore};
     use crate::vortix_core::engine::{Engine, EngineHandle};
     use crate::vortix_core::profile::{ProfileId, ProtocolKind};
@@ -81,7 +81,7 @@ pub fn build_engine_handle(
             // Default to WireGuard for any future variants.
             _ => Protocol::WireGuard,
         };
-        tunnel_for_with_secrets(proto, &factory_config_dir, "3", 30)
+        tunnel_for(proto, &factory_config_dir, "3", 30)
     };
 
     let initial_tunnel = TunnelKind::WireGuard(WgTunnel::new());

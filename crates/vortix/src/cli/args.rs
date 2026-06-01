@@ -255,11 +255,6 @@ pub enum Commands {
     ///     vortix show work-vpn                  Parsed config with masked secrets
     ///     vortix show work-vpn --raw            Raw `.conf`/`.ovpn` file contents
     ///     vortix show work-vpn --json           Parsed config as JSON
-    ///     vortix show work-vpn --raw            Raw config to stdout
-    ///     vortix show work-vpn --raw --inline-secrets   Raw config with
-    ///         stored credentials appended as a `# vortix-secret:<b64>` trailing
-    ///         comment (intended for sharing with a teammate who needs the
-    ///         credentials inline)
     Show {
         /// Profile name
         #[arg(value_hint = ValueHint::Other)]
@@ -268,12 +263,6 @@ pub enum Commands {
         /// Show raw config file contents
         #[arg(long)]
         raw: bool,
-
-        /// When combined with `--raw`, append SecretStore-backed
-        /// credentials as a trailing `# vortix-secret:<base64>` comment.
-        /// No-op when no stored secret matches the profile.
-        #[arg(long, requires = "raw")]
-        inline_secrets: bool,
     },
 
     /// Delete a VPN profile
@@ -362,23 +351,6 @@ pub enum Commands {
     ///     vortix report
     Report,
 
-    /// Manage stored secrets (plan 006 U3)
-    ///
-    /// Lightweight wrapper over the `LayeredSecretStore` (OS keyring with
-    /// AES-256-GCM/argon2id encrypted-file fallback). Secrets stored
-    /// under `creds/<profile>` are consumed by `OvpnTunnel::up` at
-    /// connect time; profiles without a stored secret keep using the
-    /// legacy `auth/<profile>.auth` file path unchanged.
-    ///
-    /// EXAMPLES:
-    ///     echo -n 'my-password' | vortix secrets set creds/corp
-    ///     vortix secrets get creds/corp > /tmp/.creds      # restrict perms after
-    ///     vortix secrets delete creds/corp
-    Secrets {
-        #[command(subcommand)]
-        op: SecretsOp,
-    },
-
     /// Run the vortix daemon (plan 015 phase D / plan 010)
     ///
     /// Hosts the engine FSM as a long-running process and accepts
@@ -430,33 +402,6 @@ pub enum Commands {
     Completions {
         /// Target shell: bash, zsh, fish, powershell
         shell: clap_complete::Shell,
-    },
-}
-
-/// Subcommands for `vortix secrets`.
-#[derive(clap::Subcommand, Debug, Clone)]
-pub enum SecretsOp {
-    /// Store a secret. Reads the raw bytes from stdin.
-    Set {
-        /// Logical secret id (e.g. `creds/corp`).
-        id: String,
-    },
-    /// Print a stored secret to stdout (no trailing newline).
-    Get {
-        /// Logical secret id to retrieve.
-        id: String,
-        /// Backend hint (`keyring` or `encrypted-file`). Defaults to
-        /// whatever the layered store picks at runtime.
-        #[arg(long)]
-        backend: Option<String>,
-    },
-    /// Delete a stored secret.
-    Delete {
-        /// Logical secret id to remove.
-        id: String,
-        /// Backend hint (`keyring` or `encrypted-file`).
-        #[arg(long)]
-        backend: Option<String>,
     },
 }
 

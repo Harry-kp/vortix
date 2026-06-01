@@ -37,9 +37,8 @@ Vortix handles sensitive VPN configurations. Key security measures:
 - No config data transmitted externally
 - Root privileges required only for network interface operations
 - No telemetry or analytics collected
-- Optional encrypted secret store using the OS keyring (Keychain on
-  macOS, Secret Service on Linux) with AES-256-GCM + argon2id
-  fallback for headless installs
+- OpenVPN credentials are stored in `~/.config/vortix/auth/<profile>.auth`
+  with `600` permissions; reachable only by the owning user
 
 ## Daemon authentication model (v0.3.0 phase E)
 
@@ -65,8 +64,8 @@ Unix domain socket.
   (Linux) / `getpeereid(2)` (macOS). Filesystem permissions on the
   socket (`mode 0600`, owned by the daemon's effective UID) are the
   secondary guard.
-- Casual disk-snooping. Profile configs are mode 0600. The encrypted
-  secret store uses keyring-first + AES-256-GCM + argon2id fallback.
+- Casual disk-snooping. Profile configs and `auth/<profile>.auth`
+  files are mode 0600.
 
 **NOT protected against:**
 

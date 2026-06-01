@@ -11,4 +11,4 @@ pub mod parser;
 pub mod tunnel;
 
 pub use parser::OvpnParsedProfile;
-pub use tunnel::{OvpnTunnel, SecretProvider};
+pub use tunnel::OvpnTunnel;
