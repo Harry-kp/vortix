@@ -92,6 +92,21 @@ const HELP_TEXT: &[(&str, &[(&str, &str)])] = &[
             ("─", "Not enforced on this platform"),
         ],
     ),
+    (
+        "Connection Details: Role labels",
+        &[
+            ("Primary", "This tunnel is your active exit — internet traffic flows through it"),
+            ("Primary (10.0.0.0/8)", "Primary; only the listed subnet routes through it"),
+            ("Primary (multi)", "Primary; routes multiple declared subnets"),
+            ("Split tunnel", "Connected but not your exit — only carries the routes it declared"),
+            ("Split tunnel (10.0.0.0/8)", "Same; the listed subnet is the only thing it routes"),
+            ("Split tunnel (multi)", "Same; routes multiple declared subnets"),
+            ("Split tunnel (yielded)", "Wanted to be exit (declared 0.0.0.0/0) but another tunnel won the race"),
+            ("Split tunnel (multi, yielded)", "Same; declared multiple subnets including 0/0, another tunnel is exit"),
+            ("(external)", "External tunnel that vortix can't reliably attribute — won't be elected exit"),
+            ("Full guide", "docs/roles.md"),
+        ],
+    ),
 ];
 
 #[must_use]
@@ -252,6 +267,44 @@ mod tests {
         assert!(
             help.contains("Connect both"),
             "help must document B multi-connect path:\n{help}"
+        );
+    }
+
+    #[test]
+    fn role_glossary_section_is_present_and_covers_every_label() {
+        // Users press `?` to remember what they're looking at. The
+        // Role labels section MUST cover every label that
+        // `connection_details::role_line` can emit, otherwise the
+        // help is a lie and users have to ask in chat instead.
+        let (_, bindings) = HELP_TEXT
+            .iter()
+            .find(|(title, _)| *title == "Connection Details: Role labels")
+            .expect("Role labels section missing from help overlay");
+        let labels: Vec<&str> = bindings.iter().map(|(k, _)| *k).collect();
+
+        // Spot-check the labels that ce-brainstorm + the connection-
+        // details render produce. The full set lives in
+        // `connection_details::role_line` and `role_kind_label`.
+        for expected in [
+            "Primary",
+            "Split tunnel",
+            "Split tunnel (yielded)",
+            "Split tunnel (multi, yielded)",
+            "(external)",
+        ] {
+            assert!(
+                labels.contains(&expected),
+                "help overlay must document the `{expected}` label; found: {labels:?}"
+            );
+        }
+
+        // And the link to the full guide must be in the section so
+        // users curious for more detail know where to go.
+        assert!(
+            bindings
+                .iter()
+                .any(|(_, desc)| desc.contains("docs/roles.md")),
+            "Role labels section must reference docs/roles.md for the verbose guide"
         );
     }
 
