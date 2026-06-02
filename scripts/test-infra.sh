@@ -667,13 +667,27 @@ write_files:
       useradd -m -s /bin/false "$TEST_USER" || true
       echo "${TEST_USER}:${TEST_PASS}" | chpasswd
 
-      # Generate TOTP secret for the user
+      # Generate TOTP secret for the user.
+      #
+      # Standard production layout: the secret lives under
+      #   /etc/openvpn/google-auth/<user>/.google_authenticator
+      # NOT under /home/<user>/. This is what the upstream
+      # openvpn-2fa tutorials (incl. DigitalOcean's) recommend and is
+      # required by systemd-hardened openvpn units that set
+      # ProtectHome=yes (the packaged Ubuntu openvpn@.service does).
+      # With ProtectHome=yes the unit's mount namespace makes /home
+      # invisible — pam_google_authenticator would fail to read its
+      # secret no matter what perms or path expansion you tried.
+      mkdir -p /etc/openvpn/google-auth/"$TEST_USER"
       su -s /bin/bash - "$TEST_USER" -c \
-        "google-authenticator -t -d -f -C -r 3 -R 30 -w 3 -Q NONE -i 'vortix-test' -s ~/.google_authenticator" \
+        "google-authenticator -t -d -f -C -r 3 -R 30 -w 3 -Q NONE -i 'vortix-test' -s /etc/openvpn/google-auth/$TEST_USER/.google_authenticator" \
         > /root/client-profiles/ovpn-totp-setup.txt 2>&1
+      chown -R "$TEST_USER":"$TEST_USER" /etc/openvpn/google-auth/"$TEST_USER"
+      chmod 0700 /etc/openvpn/google-auth/"$TEST_USER"
+      chmod 0400 /etc/openvpn/google-auth/"$TEST_USER"/.google_authenticator
 
       # Extract the secret key for the tester
-      TOTP_SECRET=$(head -1 /home/${TEST_USER}/.google_authenticator)
+      TOTP_SECRET=$(head -1 /etc/openvpn/google-auth/${TEST_USER}/.google_authenticator)
 
       # Init PKI
       export EASYRSA_BATCH=1
@@ -689,19 +703,26 @@ write_files:
 
       # PAM: password + TOTP.
       #
-      # NOTE: pam_google_authenticator.so's "user=" option is NOT a token
-      # — it expects a fixed UID/name and the module literally calls
-      # getpwnam() on the value. Passing "\${USER}" makes it look up a
-      # user named "\${USER}" and fail with:
-      #   pam_google_authenticator: Failed to look up user "\${USER}"
-      # The "secret=" option DOES support \${USER} expansion (it's a magic
-      # token implemented in the module's C source). So we keep secret=
-      # using \${USER} but omit "user=" entirely — the module's default
-      # is to run as the authenticating user, which is exactly what we
-      # want.
+      # Two non-obvious bits about pam_google_authenticator.so:
+      #
+      # 1. The "secret=" path supports the \${USER} magic token — it's
+      #    expanded by the module's C source at auth time to the
+      #    authenticating user's name. NOT shell expansion (PAM doesn't
+      #    do shell expansion), and NOT a generic env var. Just this one
+      #    token plus a few siblings (\${HOME}, ~).
+      # 2. There is no "user=\${USER}" option that would work — the
+      #    "user=" parameter expects a fixed UID/name and calls
+      #    getpwnam() on the literal value. Default behavior (no "user="
+      #    given) is to run as the authenticating user, which is what
+      #    we want, so we omit the option entirely.
+      #
+      # Path matches the cloud-init's google-authenticator output above.
+      # We put secrets under /etc/openvpn/google-auth/ (not /home) so
+      # the systemd-hardened openvpn unit (ProtectHome=yes) can see
+      # them through its mount namespace.
       cat > /etc/pam.d/openvpn-totp <<PAMEOF
       auth    required    pam_unix.so
-      auth    required    pam_google_authenticator.so secret=/home/\${USER}/.google_authenticator
+      auth    required    pam_google_authenticator.so secret=/etc/openvpn/google-auth/\${USER}/.google_authenticator
       account required    pam_permit.so
       PAMEOF
 
