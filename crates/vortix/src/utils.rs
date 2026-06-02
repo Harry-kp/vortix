@@ -292,16 +292,16 @@ pub fn get_openvpn_auth_path(profile_name: &str) -> std::io::Result<std::path::P
 
 /// Build the auth-file body. Line 1 is the username; line 2 is either the
 /// plain password (when `otp` is `None` or empty) or the SCRV1 envelope
-/// `SCRV1:base64(password):base64(otp)` that OpenVPN's static-challenge
+/// `SCRV1:base64(password):base64(otp)` that `OpenVPN`'s static-challenge
 /// directive expects.
 ///
-/// `base64` uses the standard RFC 4648 alphabet — NOT URL_SAFE. OpenVPN's
-/// SCRV1 parser only accepts the standard alphabet; using URL_SAFE silently
+/// `base64` uses the standard RFC 4648 alphabet — NOT `URL_SAFE`. `OpenVPN`'s
+/// SCRV1 parser only accepts the standard alphabet; using `URL_SAFE` silently
 /// produces wrong-password auth failures for passwords whose standard
 /// encoding contains `+` or `/`.
 ///
 /// Empty OTP is treated as `None` to avoid producing `SCRV1:cA==:` which
-/// OpenVPN rejects.
+/// `OpenVPN` rejects.
 fn format_openvpn_auth_body(username: &str, password: &str, otp: Option<&str>) -> String {
     match otp.filter(|s| !s.is_empty()) {
         Some(code) => format!(
@@ -319,7 +319,7 @@ fn format_openvpn_auth_body(username: &str, password: &str, otp: Option<&str>) -
 /// `None` (the default and the format the daemon expects for non-MFA
 /// `auth-user-pass` profiles), or the SCRV1 envelope
 /// `SCRV1:base64(password):base64(otp)` when `otp` is `Some(non_empty)` (the
-/// format OpenVPN expects when the .ovpn carries a `static-challenge`
+/// format `OpenVPN` expects when the .ovpn carries a `static-challenge`
 /// directive).
 ///
 /// The file is created with `chmod 600` (owner read/write only) in a single
@@ -418,7 +418,7 @@ pub fn read_openvpn_static_challenge_prompt(config_path: &std::path::Path) -> Op
     parsed.static_challenge.map(|sc| sc.prompt)
 }
 
-/// Scan the OpenVPN auth directory for files whose line 2 is an SCRV1
+/// Scan the `OpenVPN` auth directory for files whose line 2 is an SCRV1
 /// envelope, and delete them.
 ///
 /// Safety net for the crash-window in [`write_openvpn_auth_file`]'s SCRV1
@@ -1234,13 +1234,23 @@ mod tests {
 
     // === OpenVPN auth file write/read tests ===
 
-    fn set_temp_config_dir() -> tempfile::TempDir {
+    /// Global mutex serialising any test that mutates the process-wide
+    /// config dir via `set_config_dir`. Without this, parallel test
+    /// execution races on the shared global — one test's write returns
+    /// a path under its temp dir, but a concurrent test resets the
+    /// global before the metadata check, causing the original path to
+    /// resolve to a now-deleted location. Hold the guard for the test's
+    /// full lifetime.
+    static CONFIG_DIR_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn set_temp_config_dir() -> (tempfile::TempDir, std::sync::MutexGuard<'static, ()>) {
+        let guard = CONFIG_DIR_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::Builder::new()
             .prefix("vortix_utils_test_")
             .tempdir()
             .unwrap();
         crate::config::set_config_dir(dir.path().to_path_buf());
-        dir
+        (dir, guard)
     }
 
     #[test]
@@ -1327,9 +1337,8 @@ mod tests {
         // Parse: split on `\n`, strip `SCRV1:`, split on `:`.
         let line2 = body.lines().nth(1).unwrap();
         let rest = line2.strip_prefix("SCRV1:").unwrap();
-        let mut parts = rest.splitn(2, ':');
-        let pw_b64 = parts.next().unwrap();
-        let otp_b64 = parts.next().unwrap();
+        let (pw_b64, otp_b64) = rest.split_once(':').unwrap();
+
         assert_eq!(BASE64.decode(pw_b64).unwrap(), pw.as_bytes());
         assert_eq!(BASE64.decode(otp_b64).unwrap(), otp.as_bytes());
     }

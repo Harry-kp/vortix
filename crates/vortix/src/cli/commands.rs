@@ -26,33 +26,31 @@ use crate::vpn_runtime::VpnRuntime;
 /// Implementation uses `crossterm`'s raw mode (already in the workspace,
 /// no new dep) and reads byte-by-byte. A `RawModeGuard` ensures the
 /// terminal returns to cooked mode on every exit path including panic.
+struct RawModeGuard;
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
 fn prompt_masked_otp(prompt: &str) -> std::io::Result<String> {
     use crossterm::event::{self, Event, KeyCode, KeyModifiers};
-    use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+    use crossterm::terminal::enable_raw_mode;
 
     if !crossterm::tty::IsTty::is_tty(&std::io::stdin()) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "stdin is not a tty",
-        ));
+        return Err(std::io::Error::other("stdin is not a tty"));
     }
 
     print!("{prompt}: ");
     std::io::stdout().flush().ok();
 
-    struct RawModeGuard;
-    impl Drop for RawModeGuard {
-        fn drop(&mut self) {
-            let _ = disable_raw_mode();
-        }
-    }
     enable_raw_mode()?;
     let _guard = RawModeGuard;
 
     let mut otp = String::new();
     loop {
-        match event::read()? {
-            Event::Key(k) => match k.code {
+        if let Event::Key(k) = event::read()? {
+            match k.code {
                 KeyCode::Enter => {
                     println!();
                     break;
@@ -83,8 +81,7 @@ fn prompt_masked_otp(prompt: &str) -> std::io::Result<String> {
                     ));
                 }
                 _ => {}
-            },
-            _ => continue,
+            }
         }
     }
     Ok(otp.trim().to_string())

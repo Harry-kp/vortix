@@ -89,7 +89,7 @@ pub enum AuthField {
     /// Password text input (masked).
     Password,
     /// OTP / 2FA code text input (always masked). Only rendered when the
-    /// profile declares an OpenVPN `static-challenge` directive — plan
+    /// profile declares an `OpenVPN` `static-challenge` directive — plan
     /// 2026-06-02-001 U3.
     Otp,
     /// "Save credentials" checkbox.

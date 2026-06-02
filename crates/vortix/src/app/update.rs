@@ -726,9 +726,12 @@ impl App {
                     // user's session. U6's startup scrub catches the
                     // crash-window residue separately.
                     if otp.is_some() {
-                        if let Err(e) =
-                            utils::write_openvpn_auth_file(&profile_name, &username, &password, None)
-                        {
+                        if let Err(e) = utils::write_openvpn_auth_file(
+                            &profile_name,
+                            &username,
+                            &password,
+                            None,
+                        ) {
                             self.log(&format!("AUTH: SCRV1 restore failed: {}", e.kind()));
                         }
                         // When the user chose not to save, delete instead

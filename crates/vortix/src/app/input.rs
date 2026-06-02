@@ -447,14 +447,13 @@ impl App {
             _ => Self::handle_text_field_input(key, path, cursor),
         }
     }
-
 }
 
 /// Compute the next focused field in the auth overlay's tab cycle.
 ///
-/// With `has_otp_field = false` the cycle is Username → Password → SaveCheckbox →
+/// With `has_otp_field = false` the cycle is Username → Password → `SaveCheckbox` →
 /// Username (today's three-control behaviour). With `has_otp_field = true`
-/// the cycle is Username → Password → Otp → SaveCheckbox → Username.
+/// the cycle is Username → Password → Otp → `SaveCheckbox` → Username.
 /// Plan 2026-06-02-001 U3.
 fn next_auth_field(
     current: &AuthField,
