@@ -310,38 +310,86 @@ fn check_openvpn_by_pid(pid: u32, config_path: &Path) -> Option<ActiveSession> {
     }
 
     // 2. Find OpenVPN tun/tap interface
-    // Method A: Use lsof to find the device file opened by the process (most reliable on macOS)
     let mut detected_iface = String::new();
     // Tracks whether the interface name written into `session.interface`
-    // came from a per-PID-reliable source. Method A (lsof per PID)
-    // resolves the right utun for THIS process; Method B (ifconfig scan
-    // for "first utun with an inet that isn't WG") cannot distinguish
-    // between multiple OpenVPN PIDs and collides — both PIDs resolve
-    // to the lowest-numbered utun. The flag flows into
-    // `session.interface_authoritative` at session-return time so
-    // `App::adopt_registry_from_session` (U4) can mark the adopted
-    // entry ineligible for primary-election when the iface can't be
-    // trusted against the kernel.
+    // came from a per-PID-reliable source.
+    //
+    // Resolution order:
+    //   Method 0 -- read the authoritative iface from vortix's own
+    //               openvpn log (`<run_dir>/<safe_name>.log`). Vortix
+    //               writes this on every `OvpnTunnel::up` call (CLI or
+    //               TUI) and `parse_kernel_interface` extracts the iface
+    //               from openvpn's log output. If the file exists and
+    //               parses, we know vortix spawned this tunnel and the
+    //               iface is authoritatively attributable -- works
+    //               across vortix process restarts (e.g. `vortix up`
+    //               then opening the TUI).
+    //   Method A -- macOS: `lsof -p <pid>` looking for `/dev/utun*`.
+    //               Works for legacy openvpn that opens the tun device
+    //               file directly; FAILS for modern openvpn that uses
+    //               the utun socket API (PF_SYSTEM/com.apple.net.utun_-
+    //               control). When it works, attributable to THIS pid.
+    //   Method B -- ifconfig scan for "first utun with an inet that
+    //               isn't WG". Cannot distinguish between multiple
+    //               openvpn pids; marked unauthoritative.
+    //
+    // The flag flows into `session.interface_authoritative` at session-
+    // return time so `App::adopt_registry_from_session` can mark the
+    // adopted entry ineligible for primary-election when the iface
+    // can't be trusted against the kernel.
     let mut iface_authoritative = false;
+
+    // Method 0: vortix-spawned tunnel? If our run-dir holds an openvpn
+    // log for this profile, parse the authoritative iface from it.
+    // Works for both `vortix up` (CLI) and TUI-spawned tunnels -- and
+    // crucially across process restarts, which is the path the user
+    // hits when they connect via CLI and then open the TUI: the TUI's
+    // scanner sees a live openvpn process, and instead of guessing the
+    // iface via lsof (which fails on macOS for modern openvpn's utun
+    // socket), we read the log vortix's own protocol layer wrote.
+    if let Some(profile_name) = config_path.file_stem().and_then(|s| s.to_str()) {
+        let safe_name = crate::utils::sanitize_profile_name(profile_name);
+        if let Ok(config_dir) = crate::utils::get_app_config_dir() {
+            let log_path = config_dir
+                .join(crate::constants::OPENVPN_RUN_DIR)
+                .join(format!("{safe_name}.log"));
+            if let Ok(log_text) = std::fs::read_to_string(&log_path) {
+                if let Some(iface) =
+                    crate::vortix_protocol_openvpn::tunnel::parse_kernel_interface(&log_text)
+                {
+                    detected_iface = iface;
+                    iface_authoritative = true;
+                }
+            }
+        }
+    }
 
     #[cfg(target_os = "macos")]
     // xtask:allow-platform-cfg: lsof-based OpenVPN tun-iface discovery is macOS-only; Interface port extension deferred
     {
-        if let Some(output) = cmd_output("lsof", &["-n", "-P", "-p", &pid.to_string()]) {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                if let Some(idx) = line.find("/dev/") {
-                    let dev_path = line[idx..].split_whitespace().next().unwrap_or("");
-                    if dev_path.contains("utun")
-                        || dev_path.contains("tun")
-                        || dev_path.contains("tap")
-                    {
-                        detected_iface = dev_path.trim_start_matches("/dev/").to_string();
-                        // Method A succeeded — lsof showed THIS PID's
-                        // own /dev/utun fd, so the iface is reliably
-                        // attributable to this process.
-                        iface_authoritative = true;
-                        break;
+        // Skip Method A when Method 0 already resolved the iface
+        // authoritatively from vortix's own log -- lsof Method A
+        // returns a /dev/utun device file only for legacy openvpn
+        // builds; on modern openvpn (utun-socket API) it returns
+        // nothing and would leave detected_iface untouched anyway,
+        // but the explicit skip keeps the intent obvious.
+        if !iface_authoritative {
+            if let Some(output) = cmd_output("lsof", &["-n", "-P", "-p", &pid.to_string()]) {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                for line in stdout.lines() {
+                    if let Some(idx) = line.find("/dev/") {
+                        let dev_path = line[idx..].split_whitespace().next().unwrap_or("");
+                        if dev_path.contains("utun")
+                            || dev_path.contains("tun")
+                            || dev_path.contains("tap")
+                        {
+                            detected_iface = dev_path.trim_start_matches("/dev/").to_string();
+                            // Method A succeeded — lsof showed THIS PID's
+                            // own /dev/utun fd, so the iface is reliably
+                            // attributable to this process.
+                            iface_authoritative = true;
+                            break;
+                        }
                     }
                 }
             }
