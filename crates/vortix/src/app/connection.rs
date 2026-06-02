@@ -206,34 +206,54 @@ impl App {
             }
         }
 
-        // Check if OpenVPN config needs auth credentials
+        // Check if OpenVPN config needs auth credentials. Two distinct
+        // gates:
+        //   - `static_challenge_prompt.is_some()` — the .ovpn declares a
+        //     `static-challenge` directive (plan 2026-06-02-001 U3, #191).
+        //     The OTP is single-use, so the overlay MUST fire on every
+        //     connect attempt regardless of whether username/password are
+        //     saved. When creds are saved we pre-fill them and focus the
+        //     OTP field directly so the user only types the code.
+        //   - `read_openvpn_saved_auth(...).is_none()` — legacy path for
+        //     non-MFA `auth-user-pass` profiles. Show the overlay only
+        //     when creds aren't saved; saved-creds connects go straight
+        //     through.
         if matches!(protocol, Protocol::OpenVPN) && utils::openvpn_config_needs_auth(&config_path) {
-            // Check for saved credentials first
-            if utils::read_openvpn_saved_auth(&name).is_none() {
-                // No saved creds -- show the auth prompt overlay. The
-                // discoverability surface for a 2FA profile is the
-                // labeled OTP field at overlay-open (plan
-                // 2026-06-02-001 U3 / DEC-3) — no separate sidebar
-                // badge or overlay title change.
-                let static_challenge_prompt =
-                    utils::read_openvpn_static_challenge_prompt(&config_path);
+            let static_challenge_prompt = utils::read_openvpn_static_challenge_prompt(&config_path);
+            let saved = utils::read_openvpn_saved_auth(&name);
+            let force_overlay = static_challenge_prompt.is_some();
+            if force_overlay || saved.is_none() {
+                let (username, password) = saved.unwrap_or_default();
+                let username_cursor = username.chars().count();
+                let password_cursor = password.chars().count();
+                // When the profile is MFA AND username+password are
+                // pre-filled, focus the OTP field directly — the user
+                // only needs to type the single-use code. Otherwise
+                // start at Username (today's behaviour).
+                let focused_field = if force_overlay && !username.is_empty() && !password.is_empty()
+                {
+                    crate::state::AuthField::Otp
+                } else {
+                    crate::state::AuthField::Username
+                };
                 self.input_mode = InputMode::AuthPrompt {
                     profile_idx: idx,
                     profile_name: name,
-                    username: String::new(),
-                    username_cursor: 0,
-                    password: String::new(),
-                    password_cursor: 0,
+                    username,
+                    username_cursor,
+                    password,
+                    password_cursor,
                     otp: String::new(),
                     otp_cursor: 0,
-                    focused_field: crate::state::AuthField::Username,
+                    focused_field,
                     save_credentials: true,
                     connect_after: true,
                     static_challenge_prompt,
                 };
                 return;
             }
-            // Saved creds exist -- they'll be picked up in the thread below
+            // Saved creds exist AND no static-challenge -- they'll be
+            // picked up in the connect thread below.
         }
 
         // Start connecting — write directly to the registry (P5d: the

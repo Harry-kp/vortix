@@ -1244,7 +1244,9 @@ mod tests {
     static CONFIG_DIR_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn set_temp_config_dir() -> (tempfile::TempDir, std::sync::MutexGuard<'static, ()>) {
-        let guard = CONFIG_DIR_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = CONFIG_DIR_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::Builder::new()
             .prefix("vortix_utils_test_")
             .tempdir()

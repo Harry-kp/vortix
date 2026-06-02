@@ -994,6 +994,31 @@ fn add_openvpn_profiles_with_auth(app: &mut App, names: &[&str], dir: &std::path
     }
 }
 
+/// Helper: add `OpenVPN` profiles with a `static-challenge` directive
+/// alongside auth-user-pass (plan 2026-06-02-001, #191).
+fn add_openvpn_profiles_with_static_challenge(
+    app: &mut App,
+    names: &[&str],
+    dir: &std::path::Path,
+) {
+    let _ = std::fs::create_dir_all(dir);
+    for name in names {
+        let config_path = dir.join(format!("{name}.ovpn"));
+        std::fs::write(
+            &config_path,
+            "client\nremote example.com 1194\nauth-user-pass\nstatic-challenge \"Enter TOTP code\" 1\ndev tun\nproto udp\n",
+        )
+        .unwrap();
+        app.runtime.profiles.push(VpnProfile {
+            name: (*name).to_string(),
+            protocol: Protocol::OpenVPN,
+            config_path,
+            location: "Test".to_string(),
+            last_used: None,
+        });
+    }
+}
+
 /// Helper: add `OpenVPN` profiles WITHOUT auth-user-pass.
 fn add_openvpn_profiles_no_auth(app: &mut App, names: &[&str], dir: &std::path::Path) {
     let _ = std::fs::create_dir_all(dir);
@@ -1062,6 +1087,92 @@ fn test_auth_prompt_skipped_when_creds_saved() {
     );
 
     crate::utils::delete_openvpn_auth_file("saved-vpn");
+}
+
+#[test]
+fn test_auth_prompt_fires_for_static_challenge_even_with_saved_creds() {
+    // Plan 2026-06-02-001 U3 / overlay-skip bug fix: a profile with
+    // `static-challenge` MUST surface the auth overlay on every connect
+    // attempt regardless of saved-creds state, because the OTP is
+    // single-use and cannot be persisted. When creds are pre-saved the
+    // overlay starts with them filled and focuses the OTP field directly.
+    let mut app = test_app();
+    let tmp = tempfile::Builder::new()
+        .prefix("vortix_auth_")
+        .tempdir()
+        .unwrap();
+    add_openvpn_profiles_with_static_challenge(&mut app, &["mfa-saved"], tmp.path());
+    app.runtime.is_root = true;
+
+    let _ = crate::utils::write_openvpn_auth_file("mfa-saved", "user", "pass", None);
+
+    app.connect_profile(0);
+
+    if let InputMode::AuthPrompt {
+        username,
+        password,
+        focused_field,
+        static_challenge_prompt,
+        ..
+    } = &app.input_mode
+    {
+        assert_eq!(username, "user", "username should be pre-filled");
+        assert_eq!(password, "pass", "password should be pre-filled");
+        assert_eq!(
+            focused_field,
+            &AuthField::Otp,
+            "focus should jump to the OTP field when creds are pre-filled"
+        );
+        assert_eq!(
+            static_challenge_prompt.as_deref(),
+            Some("Enter TOTP code"),
+            "the directive's prompt text should reach the overlay"
+        );
+    } else {
+        panic!(
+            "Expected AuthPrompt overlay for static-challenge profile with saved creds; got {:?}",
+            app.input_mode
+        );
+    }
+
+    crate::utils::delete_openvpn_auth_file("mfa-saved");
+}
+
+#[test]
+fn test_auth_prompt_fires_for_static_challenge_without_saved_creds() {
+    // Same gate, no saved creds path: overlay should still fire, with
+    // empty fields focused on Username (the legacy initial-focus
+    // behaviour, since the user has to type everything).
+    let mut app = test_app();
+    let tmp = tempfile::Builder::new()
+        .prefix("vortix_auth_")
+        .tempdir()
+        .unwrap();
+    add_openvpn_profiles_with_static_challenge(&mut app, &["mfa-fresh"], tmp.path());
+    app.runtime.is_root = true;
+
+    crate::utils::delete_openvpn_auth_file("mfa-fresh");
+
+    app.connect_profile(0);
+
+    if let InputMode::AuthPrompt {
+        username,
+        password,
+        focused_field,
+        static_challenge_prompt,
+        ..
+    } = &app.input_mode
+    {
+        assert!(username.is_empty());
+        assert!(password.is_empty());
+        assert_eq!(focused_field, &AuthField::Username);
+        assert_eq!(static_challenge_prompt.as_deref(), Some("Enter TOTP code"));
+    } else {
+        panic!(
+            "Expected AuthPrompt overlay for static-challenge profile without saved creds; got {:?}",
+            app.input_mode
+        );
+    }
 }
 
 #[test]
