@@ -676,8 +676,9 @@ write_files:
       # required by systemd-hardened openvpn units that set
       # ProtectHome=yes (the packaged Ubuntu openvpn@.service does).
       # With ProtectHome=yes the unit's mount namespace makes /home
-      # invisible — pam_google_authenticator would fail to read its
+      # invisible -- pam_google_authenticator would fail to read its
       # secret no matter what perms or path expansion you tried.
+      # (ASCII-only in this heredoc -- cloud-init YAML rejects high bytes.)
       mkdir -p /etc/openvpn/google-auth/"$TEST_USER"
       su -s /bin/bash - "$TEST_USER" -c \
         "google-authenticator -t -d -f -C -r 3 -R 30 -w 3 -Q NONE -i 'vortix-test' -s /etc/openvpn/google-auth/$TEST_USER/.google_authenticator" \
@@ -705,12 +706,12 @@ write_files:
       #
       # Two non-obvious bits about pam_google_authenticator.so:
       #
-      # 1. The "secret=" path supports the \${USER} magic token — it's
+      # 1. The "secret=" path supports the \${USER} magic token -- it's
       #    expanded by the module's C source at auth time to the
       #    authenticating user's name. NOT shell expansion (PAM doesn't
       #    do shell expansion), and NOT a generic env var. Just this one
       #    token plus a few siblings (\${HOME}, ~).
-      # 2. There is no "user=\${USER}" option that would work — the
+      # 2. There is no "user=\${USER}" option that would work -- the
       #    "user=" parameter expects a fixed UID/name and calls
       #    getpwnam() on the literal value. Default behavior (no "user="
       #    given) is to run as the authenticating user, which is what
