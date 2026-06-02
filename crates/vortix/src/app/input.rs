@@ -479,8 +479,11 @@ fn next_auth_field(
         return AuthField::Username;
     };
     let next_idx = match key {
-        KeyCode::Tab => (idx + 1) % order.len(),
-        KeyCode::BackTab => (idx + order.len() - 1) % order.len(),
+        // Tab / Down advance to the next field (vertical-stack
+        // navigation: form rows are stacked top-to-bottom).
+        KeyCode::Tab | KeyCode::Down => (idx + 1) % order.len(),
+        // Shift+Tab / Up go to the previous field.
+        KeyCode::BackTab | KeyCode::Up => (idx + order.len() - 1) % order.len(),
         _ => idx,
     };
     order[next_idx].clone()
@@ -512,8 +515,12 @@ impl crate::app::App {
         let has_otp_field = static_challenge_prompt.is_some();
         match key.code {
             KeyCode::Esc => self.handle_message(Message::CloseOverlay),
-            KeyCode::Tab | KeyCode::BackTab => {
-                // Cycle: Username -> Password -> [Otp ->] SaveCheckbox -> Username
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Down | KeyCode::Up => {
+                // Vertical-stack navigation: rows are stacked top-to-
+                // bottom, so Down/Up move between them; Tab/Shift+Tab
+                // mirror that for users with Tab muscle memory. All
+                // four wrap around the same Username -> Password ->
+                // [Otp ->] SaveCheckbox cycle.
                 *focused_field = next_auth_field(focused_field, key.code, has_otp_field);
             }
             KeyCode::Enter => {
