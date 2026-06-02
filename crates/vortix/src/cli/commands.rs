@@ -459,7 +459,7 @@ fn handle_up(
         .iter()
         .find(|p| p.name == profile_name)
         .and_then(|p| crate::utils::read_openvpn_static_challenge_prompt(&p.config_path));
-    let mut scrv1_restore_needed: Option<(String, String, String)> = None;
+    let mut scrv1_restore_needed: Option<String> = None;
     if let Some(prompt_text) = static_challenge_prompt {
         let saved = crate::utils::read_openvpn_saved_auth(&profile_name);
         let Some((user, pass)) = saved else {
@@ -521,37 +521,29 @@ fn handle_up(
             }
         };
         if let Err(e) =
-            crate::utils::write_openvpn_auth_file(&profile_name, &user, &pass, Some(&otp))
+            crate::utils::write_openvpn_scrv1_auth_file(&profile_name, &user, &pass, &otp)
         {
             print_error_and_exit(
                 mode,
                 "up",
                 CliError {
                     code: "auth_write_failed",
-                    message: format!("Failed to write auth file: {e}"),
+                    message: format!("Failed to write SCRV1 auth file: {e}"),
                     hint: None,
                 },
                 ExitCode::GeneralError,
             );
         }
-        scrv1_restore_needed = Some((profile_name.clone(), user, pass));
+        scrv1_restore_needed = Some(profile_name.clone());
     }
 
     let result = engine.connect_and_wait(&profile_name, Duration::from_secs(timeout_secs));
-    // Restore plain-text auth file on every exit path — success, failure,
-    // or timeout. The OTP has been consumed by openvpn (which loads the
-    // auth file synchronously before forking in daemon mode) and must
-    // not linger on disk. U6's startup scrub handles the rare
-    // crash-before-restore window separately. Best-effort: log
-    // restore failures but never block the user's session.
-    if let Some((name, user, pass)) = scrv1_restore_needed {
-        if let Err(e) = crate::utils::write_openvpn_auth_file(&name, &user, &pass, None) {
-            tracing::warn!(
-                profile = %name,
-                error = %e.kind(),
-                "AUTH: SCRV1 restore failed",
-            );
-        }
+    // The protocol layer deletes the SCRV1 envelope after openvpn forks
+    // (plan 2026-06-02-001 U3 / PF-2). Belt-and-braces: if the connect
+    // never reached spawn (early-failure path), clear the envelope
+    // here so it doesn't linger.
+    if let Some(name) = scrv1_restore_needed {
+        crate::utils::delete_openvpn_scrv1_auth_file(&name);
     }
 
     match result {

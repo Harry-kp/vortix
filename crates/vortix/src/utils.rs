@@ -313,6 +313,85 @@ fn format_openvpn_auth_body(username: &str, password: &str, otp: Option<&str>) -
     }
 }
 
+/// Path of the transient SCRV1 envelope auth file used for
+/// static-challenge connects (plan 2026-06-02-001 U3 / PF-2, #191).
+///
+/// The connect path writes the envelope here, openvpn consumes it via
+/// `--auth-user-pass`, and the protocol layer deletes it immediately
+/// after the daemon fork. The canonical `<safe>.auth` is never
+/// touched during connect — no race window for async callers to lose
+/// against.
+///
+/// # Errors
+///
+/// Returns an error if the auth directory cannot be resolved or created.
+pub fn get_openvpn_scrv1_auth_path(profile_name: &str) -> std::io::Result<std::path::PathBuf> {
+    let root = get_app_config_dir()?;
+    let auth_dir = root.join(crate::constants::OPENVPN_AUTH_DIR);
+
+    if !auth_dir.exists() {
+        create_user_dir(&auth_dir)?;
+    }
+
+    let safe_name = sanitize_profile_name(profile_name);
+    Ok(auth_dir.join(format!("{safe_name}.scrv1.auth")))
+}
+
+/// Write the static-challenge SCRV1 envelope to the transient
+/// `<safe>.scrv1.auth` path. Mirrors [`write_openvpn_auth_file`]'s
+/// chmod-600 + open-without-overwrite shape; differs only in the
+/// path it writes to.
+///
+/// # Errors
+///
+/// Returns an error if the file write fails.
+#[cfg(unix)]
+pub fn write_openvpn_scrv1_auth_file(
+    profile_name: &str,
+    username: &str,
+    password: &str,
+    otp: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    use crate::vortix_core::secret_file::{write_secret_file, SecretFileError};
+
+    let auth_path = get_openvpn_scrv1_auth_path(profile_name)?;
+
+    match std::fs::remove_file(&auth_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+
+    let body = format_openvpn_auth_body(username, password, Some(otp));
+    write_secret_file(&auth_path, body.as_bytes()).map_err(|e| match e {
+        SecretFileError::Io(io) => io,
+        other => std::io::Error::other(other.to_string()),
+    })?;
+
+    Ok(auth_path)
+}
+
+/// Write the static-challenge SCRV1 envelope (non-Unix fallback).
+#[cfg(not(unix))]
+pub fn write_openvpn_scrv1_auth_file(
+    profile_name: &str,
+    username: &str,
+    password: &str,
+    otp: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    let auth_path = get_openvpn_scrv1_auth_path(profile_name)?;
+    let body = format_openvpn_auth_body(username, password, Some(otp));
+    write_user_file(&auth_path, body)?;
+    Ok(auth_path)
+}
+
+/// Delete the static-challenge SCRV1 auth file for a profile if present.
+pub fn delete_openvpn_scrv1_auth_file(profile_name: &str) {
+    if let Ok(auth_path) = get_openvpn_scrv1_auth_path(profile_name) {
+        let _ = std::fs::remove_file(&auth_path);
+    }
+}
+
 /// Writes `OpenVPN` credentials to a file.
 ///
 /// Line 1 is always the username. Line 2 is the plain password when `otp` is
@@ -450,6 +529,26 @@ pub fn scrub_stale_scrv1_auth_files() {
     };
     for entry in entries.flatten() {
         let path = entry.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        // Always-stale: the transient SCRV1 envelope sibling. The
+        // protocol layer deletes this after openvpn forks; if it's
+        // still on disk at startup, vortix crashed mid-connect and
+        // the envelope is orphaned. Plan 2026-06-02-001 U6 / PF-2.
+        if name.to_ascii_lowercase().ends_with(".scrv1.auth") {
+            tracing::warn!(
+                file = %name,
+                "AUTH: stale SCRV1 envelope file — clearing"
+            );
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        // Belt-and-braces: catch any canonical `<safe>.auth` whose
+        // line 2 happens to be an SCRV1 envelope (pre-PF-2 builds
+        // wrote into the canonical path). Mostly irrelevant once
+        // every connect uses the transient sibling, but cheap to
+        // keep.
         if path.extension().and_then(|s| s.to_str()) != Some("auth") {
             continue;
         }
@@ -466,7 +565,7 @@ pub fn scrub_stale_scrv1_auth_files() {
                 .unwrap_or("<unknown>");
             tracing::warn!(
                 profile = %profile,
-                "AUTH: stale SCRV1 in auth file — clearing"
+                "AUTH: stale SCRV1 in canonical auth file — clearing"
             );
             let _ = std::fs::remove_file(&path);
         }

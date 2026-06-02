@@ -159,6 +159,19 @@ impl OvpnTunnel {
             .as_ref()
             .map(|d| d.join(format!("{safe_name}.auth")))
     }
+
+    /// Path used by the static-challenge SCRV1 envelope (plan
+    /// 2026-06-02-001 U3 / PF-2, #191). The connect path writes the
+    /// envelope to this sibling of the canonical auth file, hands it
+    /// to openvpn via `--auth-user-pass`, and deletes it immediately
+    /// after the daemon fork returns — keeping the canonical
+    /// `<safe>.auth` plain at all times, with no race window for the
+    /// async TUI worker thread to lose against.
+    fn scrv1_auth_path(&self, safe_name: &str) -> Option<PathBuf> {
+        self.auth_dir
+            .as_ref()
+            .map(|d| d.join(format!("{safe_name}.scrv1.auth")))
+    }
 }
 
 /// `OpenVPN`-specific status (placeholder; richer parsing arrives with plan #005).
@@ -400,7 +413,17 @@ impl Tunnel for OvpnTunnel {
             );
         }
 
-        if let Some(auth) = self.auth_path(&safe_name).filter(|p| p.exists()) {
+        // Prefer the static-challenge SCRV1 envelope file when present
+        // (plan 2026-06-02-001 U3 / PF-2). The caller writes it just
+        // before invoking `up()`, openvpn consumes it during its synchronous
+        // pre-fork setup, and we delete it immediately after the parent
+        // returns so the single-use OTP doesn't linger on disk and the
+        // canonical auth file stays plain throughout.
+        let scrv1_path = self.scrv1_auth_path(&safe_name).filter(|p| p.exists());
+        let auth_arg = scrv1_path
+            .clone()
+            .or_else(|| self.auth_path(&safe_name).filter(|p| p.exists()));
+        if let Some(auth) = auth_arg {
             args.push("--auth-user-pass".to_string());
             args.push(auth.to_string_lossy().into_owned());
         }
@@ -417,6 +440,24 @@ impl Tunnel for OvpnTunnel {
                 .daemonizes(),
         )
         .map_err(|e| TunnelError::Subprocess(format!("openvpn: {e}")))?;
+
+        // Clean up the SCRV1 envelope file immediately after the daemon
+        // parent returns — openvpn has read the auth file as part of its
+        // synchronous pre-fork setup, so the file is no longer needed.
+        // Best-effort: a missing file is fine; permission errors get
+        // surfaced through the existing log facility.
+        if let Some(path) = scrv1_path {
+            if let Err(e) = std::fs::remove_file(&path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    warn!(
+                        target: "vortix::tunnel::openvpn",
+                        profile = %profile.id,
+                        error = %e,
+                        "ovpn.up: failed to delete SCRV1 auth file after openvpn fork"
+                    );
+                }
+            }
+        }
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();

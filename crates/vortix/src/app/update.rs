@@ -675,32 +675,25 @@ impl App {
             return;
         }
 
-        // Two-call structure when `save=true` AND an OTP is present (plan
-        // 2026-06-02-001 U3 / PF-3): the canonical auth file must remain
-        // plain-text on disk for future connects, so we write plain first
-        // and then overwrite with the SCRV1 envelope just before the
-        // connect attempt. Each connect rewrites and restores; U6's
-        // startup scrub handles the crash window. When `save=false` we
-        // also write plain at the end so subsequent reads via
-        // `read_openvpn_saved_auth` never see SCRV1 — the connect call
-        // we're about to issue runs synchronously enough that the daemon
-        // has consumed the file before we restore.
+        // Plan 2026-06-02-001 U3 / PF-2 (#191): write the canonical
+        // `<safe>.auth` exactly once with plain credentials (when
+        // `save=true` or when there's no OTP to save), and write the
+        // single-use SCRV1 envelope to a transient sibling
+        // `<safe>.scrv1.auth` that the protocol layer prefers and
+        // deletes after openvpn forks. This eliminates the race the
+        // earlier "write-SCRV1-then-restore" approach had against the
+        // async connect-worker thread.
         let result = (|| -> std::io::Result<()> {
-            if save {
+            if save || otp.is_none() {
                 utils::write_openvpn_auth_file(&profile_name, &username, &password, None)?;
             }
             if let Some(ref code) = otp {
-                utils::write_openvpn_auth_file(
+                utils::write_openvpn_scrv1_auth_file(
                     &profile_name,
                     &username,
                     &password,
-                    Some(code.as_str()),
+                    code.as_str(),
                 )?;
-            } else if !save {
-                // No OTP, no save: this is the legacy one-time path. Write
-                // plain so the connect_profile call below has something to
-                // hand to openvpn.
-                utils::write_openvpn_auth_file(&profile_name, &username, &password, None)?;
             }
             Ok(())
         })();
@@ -721,30 +714,15 @@ impl App {
                     // Call the post-auth connect path so the
                     // static-challenge gate in `connect_profile_inner`
                     // doesn't re-open the overlay we just closed —
-                    // the OTP is already baked into the auth file.
+                    // the OTP is already baked into the transient
+                    // `<safe>.scrv1.auth` file the protocol layer
+                    // consumes during openvpn spawn.
                     self.connect_profile_after_auth(idx);
-                    // After the connect path returns (success or failure),
-                    // restore the canonical auth file to plain text so the
-                    // single-use OTP never lingers on disk. Best-effort:
-                    // failure logs an error kind but does not block the
-                    // user's session. U6's startup scrub catches the
-                    // crash-window residue separately.
-                    if otp.is_some() {
-                        if let Err(e) = utils::write_openvpn_auth_file(
-                            &profile_name,
-                            &username,
-                            &password,
-                            None,
-                        ) {
-                            self.log(&format!("AUTH: SCRV1 restore failed: {}", e.kind()));
-                        }
-                        // When the user chose not to save, delete instead
-                        // of leaving the plain file behind.
-                        if !save {
-                            utils::delete_openvpn_auth_file(&profile_name);
-                        }
-                    } else if !save {
-                        // Legacy one-time path: still delete the file.
+                    // For the one-time-only path (no save), the
+                    // canonical plain auth file must not linger.
+                    // The SCRV1 envelope cleanup happens in the
+                    // protocol layer after openvpn forks.
+                    if otp.is_none() && !save {
                         utils::delete_openvpn_auth_file(&profile_name);
                     }
                 } else {
