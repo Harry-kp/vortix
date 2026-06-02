@@ -558,7 +558,6 @@ write_files:
       persist-tun
       plugin /usr/lib/openvpn/openvpn-plugin-auth-pam.so openvpn
       verify-client-cert optional
-      username-as-common-name
       verb 3
       mssfix 1400
       tun-mtu 1400
@@ -714,7 +713,6 @@ write_files:
       persist-tun
       plugin /usr/lib/openvpn/openvpn-plugin-auth-pam.so openvpn-totp
       verify-client-cert optional
-      username-as-common-name
       verb 3
       mssfix 1400
       tun-mtu 1400
