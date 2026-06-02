@@ -21,6 +21,8 @@ All notable changes to this project will be documented in this file.
 - Multi-tunnel keybindings: `Shift+D` (disconnect every active tunnel with confirm), `c` (cancel an in-flight connect from Connection Details), `B` (Both from the takeover overlay), `u` (revert auto-promote).
 - JSON status reports every connected tunnel in `data.connections[]` plus `data.primary`. The legacy `data.connection` field stays populated when only one tunnel is up (back-compat for v1 consumers).
 - Sigil legend (`✓ ✗ ⚠ ─`) in the `?` help overlay.
+- **OpenVPN inline 2FA / static-challenge support (#191).** Profiles declaring `static-challenge "<prompt>" 1` now prompt for the TOTP/PIN at connect time and feed it to the server via the OpenVPN management socket using the SCRV1 envelope. TUI shows a 3-field auth overlay; CLI `vortix up <profile>` adds a masked OTP prompt below the password. The static-challenge `0` (cleartext echo) variant is intentionally unsupported.
+- Auth overlay redesigned as a form: fixed-width label column, single `▸` focus marker, `Up`/`Down` arrows now cycle between Username / Password / OTP / Save-checkbox in a circular loop (Tab/BackTab still work). Empty values render an em-dash placeholder; secrets mask to filled-circle dots.
 
 ### Changed
 
@@ -31,6 +33,7 @@ All notable changes to this project will be documented in this file.
 - `vortix reconnect` cycles every currently-connected tunnel.
 - Telemetry switched from `reqwest` / `curl` / `ping` shell-outs to in-process HTTP (`ureq`) + raw-ICMP (`socket2`). Smaller binary, faster startup, no transient child processes.
 - Interface and process lookups on Linux / macOS go through `libc` directly (`getifaddrs`, `sysctlbyname`, `kill`) instead of parsing `ip addr show` / `ifconfig` / `ps` output. Fewer locale-dependent parser bugs.
+- Default OpenVPN connect timeout bumped from 20s → 35s to accommodate the static-challenge MFA flow (TLS + PAM + `PUSH_REPLY` can comfortably exceed 20s on geographically distant servers).
 
 ### Fixed
 
@@ -43,10 +46,13 @@ All notable changes to this project will be documented in this file.
 - TUI stays responsive on broken VPN servers. When a tunnel comes up but its server's routing is misconfigured (everything behind the VPN times out), the scanner and network-monitor threads were both probing the kernel's default-route every 1-2 seconds and each hitting their 1s timeout — burning two tokio runtime workers continuously and starving the scanner of cycles to do useful session work. The probe now shares a process-wide failure backoff: first 1-2 failures retry immediately, 3-5 cool down 5s, 6-10 cool down 15s, 10+ cap at 60s. Reset on any successful probe.
 - Aggressive scroll-spam in the `v` config viewer no longer wedges the TUI. Two compounding causes: (1) every keystroke ran `content.lines().count()` for scroll bounds AND a full per-line re-parse + re-highlight for the render. On a multi-thousand-line `.ovpn` (typical when certs/keys are inlined), that was ~4N string-iterations per arrow-key. (2) Mouse wheels emit 30+ events per second; the event loop processed one event per render, so a fast scroll burst queued hundreds of events and the TUI ground through them long after the user stopped scrolling. Fix: a `CachedConfigView` is built once when the viewer opens (pre-counted line total + pre-highlighted `Vec<Line>`); the main event loop now drains every queued event into state before rendering, so a 100-event scroll burst lands in one render frame at the final position.
 - New observability: any `Message` handler that holds the UI thread for more than 50ms emits a `tracing::warn` (silent by default; turn on with `RUST_LOG=vortix::app=warn`). Future regressions of this class surface immediately instead of being chased down with ad-hoc instrumentation.
+- CLI → TUI handoff for OpenVPN tunnels (#191). When a profile was connected via `vortix up` and the TUI then opened, the sidebar sigil flashed grey (`external` — "not started by vortix") because the scanner couldn't authoritatively resolve the kernel interface from the running `openvpn` process. The scanner now reads the per-profile log file as Method 0 (platform-neutral, runs ahead of the lsof/ifconfig methods) and extracts the interface via the existing `parse_kernel_interface` parser. Vortix-started tunnels render with the correct owned sigil regardless of which entry point launched them.
+- Manage-credentials save-only path no longer writes a plaintext-OTP `.scrv1.auth` bundle to disk. The `static_challenge_prompt` field is now explicitly cleared in the ManageAuth handler so the save path takes the username/password-only branch even for profiles that declare a static-challenge directive.
 
 ### Removed
 
 - The Security Guard panel no longer renders the sigil legend inline (moved to the `?` help overlay) or the `Real IP: <ip> (hidden)` sub-bullet (avoids leaking the real IP in screenshots of an otherwise-clean panel).
+- Approach A dead code from the early static-challenge design (#191). An exploratory path tried to embed the SCRV1 envelope as a third line of the `--auth-user-pass` file, but OpenVPN 2.7 does not consult that file for static-challenge responses. Removed: the SCRV1 branch in `format_openvpn_auth_body`, the `otp: Option<&str>` parameter on `write_openvpn_auth_file`, the dead branch in `scrub_stale_scrv1_auth_files`, and 5 dead tests. The shipping flow drives the management socket exclusively.
 
 ## [0.3.1] - 2026-05-25
 
