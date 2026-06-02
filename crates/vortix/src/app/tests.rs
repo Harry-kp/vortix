@@ -1048,7 +1048,7 @@ fn test_auth_prompt_skipped_when_creds_saved() {
     add_openvpn_profiles_with_auth(&mut app, &["saved-vpn"], tmp.path());
     app.runtime.is_root = true;
 
-    let _ = crate::utils::write_openvpn_auth_file("saved-vpn", "user", "pass");
+    let _ = crate::utils::write_openvpn_auth_file("saved-vpn", "user", "pass", None);
 
     app.connect_profile(0);
 
@@ -1210,7 +1210,7 @@ fn test_auth_delete_profile_cleans_auth_file() {
     add_openvpn_profiles_with_auth(&mut app, &["del-vpn"], tmp.path());
     app.profile_list_state.select(Some(0));
 
-    let auth_path = crate::utils::write_openvpn_auth_file("del-vpn", "user", "pass").unwrap();
+    let auth_path = crate::utils::write_openvpn_auth_file("del-vpn", "user", "pass", None).unwrap();
     assert!(auth_path.exists());
 
     app.confirm_delete(0);

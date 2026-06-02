@@ -2750,6 +2750,7 @@ name = "vortix"
 version = "0.3.1"
 dependencies = [
  "arboard",
+ "base64",
  "clap",
  "clap_complete",
  "color-eyre",

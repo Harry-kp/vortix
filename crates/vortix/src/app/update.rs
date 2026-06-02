@@ -666,8 +666,11 @@ impl App {
             return;
         }
 
-        // Write credentials to auth file
-        match utils::write_openvpn_auth_file(&profile_name, &username, &password) {
+        // Write credentials to auth file. The optional OTP for static-challenge
+        // profiles is plumbed through here by U3 (plan 2026-06-02-001); for the
+        // U2 baseline we pass `None`, which preserves today's behaviour
+        // byte-for-byte for non-MFA profiles.
+        match utils::write_openvpn_auth_file(&profile_name, &username, &password, None) {
             Ok(_) => {
                 if save {
                     self.log(&format!("AUTH: Saved credentials for '{profile_name}'"));

@@ -3,6 +3,8 @@
 //! This module provides helper functions for common operations like
 //! formatting byte rates, durations, and managing configuration directories.
 
+use base64::engine::{general_purpose::STANDARD as BASE64, Engine as _};
+
 /// Check if the current process is running as root (UID 0)
 ///
 /// Uses the effective user ID from the OS instead of spawning an external command.
@@ -288,13 +290,49 @@ pub fn get_openvpn_auth_path(profile_name: &str) -> std::io::Result<std::path::P
     Ok(auth_dir.join(format!("{safe_name}.auth")))
 }
 
-/// Writes `OpenVPN` credentials to a file (username on line 1, password on line 2).
+/// Build the auth-file body. Line 1 is the username; line 2 is either the
+/// plain password (when `otp` is `None` or empty) or the SCRV1 envelope
+/// `SCRV1:base64(password):base64(otp)` that OpenVPN's static-challenge
+/// directive expects.
+///
+/// `base64` uses the standard RFC 4648 alphabet — NOT URL_SAFE. OpenVPN's
+/// SCRV1 parser only accepts the standard alphabet; using URL_SAFE silently
+/// produces wrong-password auth failures for passwords whose standard
+/// encoding contains `+` or `/`.
+///
+/// Empty OTP is treated as `None` to avoid producing `SCRV1:cA==:` which
+/// OpenVPN rejects.
+fn format_openvpn_auth_body(username: &str, password: &str, otp: Option<&str>) -> String {
+    match otp.filter(|s| !s.is_empty()) {
+        Some(code) => format!(
+            "{username}\nSCRV1:{}:{}\n",
+            BASE64.encode(password),
+            BASE64.encode(code),
+        ),
+        None => format!("{username}\n{password}\n"),
+    }
+}
+
+/// Writes `OpenVPN` credentials to a file.
+///
+/// Line 1 is always the username. Line 2 is the plain password when `otp` is
+/// `None` (the default and the format the daemon expects for non-MFA
+/// `auth-user-pass` profiles), or the SCRV1 envelope
+/// `SCRV1:base64(password):base64(otp)` when `otp` is `Some(non_empty)` (the
+/// format OpenVPN expects when the .ovpn carries a `static-challenge`
+/// directive).
 ///
 /// The file is created with `chmod 600` (owner read/write only) in a single
 /// step via [`crate::vortix_core::secret_file::write_secret_file`], which
 /// uses `openat(2)` against a held parent-directory fd to close the
 /// parent-directory TOCTOU window. If the auth file already exists from a
 /// previous run, it is removed first so the credential rewrite succeeds.
+///
+/// The SCRV1 path is meant to be transient — connect handlers write the
+/// envelope, spawn openvpn (which loads the file synchronously before
+/// daemonizing), then call this again with `otp: None` to restore plain
+/// text. [`scrub_stale_scrv1_auth_files`] handles the rare crash-window
+/// case at startup.
 ///
 /// # Errors
 ///
@@ -304,6 +342,7 @@ pub fn write_openvpn_auth_file(
     profile_name: &str,
     username: &str,
     password: &str,
+    otp: Option<&str>,
 ) -> std::io::Result<std::path::PathBuf> {
     use crate::vortix_core::secret_file::{write_secret_file, SecretFileError};
 
@@ -318,7 +357,7 @@ pub fn write_openvpn_auth_file(
         Err(e) => return Err(e),
     }
 
-    let body = format!("{username}\n{password}\n");
+    let body = format_openvpn_auth_body(username, password, otp);
     write_secret_file(&auth_path, body.as_bytes()).map_err(|e| match e {
         SecretFileError::Io(io) => io,
         other => std::io::Error::other(other.to_string()),
@@ -333,9 +372,11 @@ pub fn write_openvpn_auth_file(
     profile_name: &str,
     username: &str,
     password: &str,
+    otp: Option<&str>,
 ) -> std::io::Result<std::path::PathBuf> {
     let auth_path = get_openvpn_auth_path(profile_name)?;
-    write_user_file(&auth_path, format!("{username}\n{password}\n"))?;
+    let body = format_openvpn_auth_body(username, password, otp);
+    write_user_file(&auth_path, body)?;
     Ok(auth_path)
 }
 
@@ -1136,7 +1177,7 @@ mod tests {
     fn test_write_read_openvpn_auth_file() {
         let _tmp = set_temp_config_dir();
         let name = "test_auth_roundtrip";
-        let result = write_openvpn_auth_file(name, "myuser", "mypass");
+        let result = write_openvpn_auth_file(name, "myuser", "mypass", None);
         assert!(result.is_ok());
         let path = result.unwrap();
         assert!(path.exists());
@@ -1158,7 +1199,79 @@ mod tests {
 
         let _tmp = set_temp_config_dir();
         let name = "test_auth_perms";
-        let result = write_openvpn_auth_file(name, "user", "pass");
+        let result = write_openvpn_auth_file(name, "user", "pass", None);
+        assert!(result.is_ok());
+        let path = result.unwrap();
+
+        let perms = std::fs::metadata(&path).unwrap().permissions();
+        assert_eq!(perms.mode() & 0o777, 0o600);
+
+        delete_openvpn_auth_file(name);
+    }
+
+    #[test]
+    fn auth_file_plain_format_unchanged_with_none_otp() {
+        // Byte-for-byte regression check: the legacy `username\npassword\n`
+        // shape must survive the signature change.
+        let body = format_openvpn_auth_body("u", "p", None);
+        assert_eq!(body, "u\np\n");
+    }
+
+    #[test]
+    fn auth_file_scrv1_envelope_when_otp_supplied() {
+        let body = format_openvpn_auth_body("u", "p", Some("123456"));
+        // base64("p") == "cA==", base64("123456") == "MTIzNDU2"
+        assert_eq!(body, "u\nSCRV1:cA==:MTIzNDU2\n");
+    }
+
+    #[test]
+    fn auth_file_empty_otp_falls_back_to_plain() {
+        // OpenVPN rejects `SCRV1:cA==:` — empty OTP must degrade to the
+        // plain format so the user gets a meaningful auth error rather
+        // than a malformed-envelope rejection.
+        let body = format_openvpn_auth_body("u", "p", Some(""));
+        assert_eq!(body, "u\np\n");
+    }
+
+    #[test]
+    fn auth_file_scrv1_uses_standard_alphabet_not_url_safe() {
+        // The ASCII string "???>>>" encodes to "Pz8/Pj4+" in STANDARD,
+        // "Pz8_Pj4-" in URL_SAFE. If the wrong engine is wired, this test
+        // catches it before the auth failure shows up in production.
+        let body = format_openvpn_auth_body("u", "???>>>", Some("x"));
+        assert!(
+            body.contains("Pz8/Pj4+"),
+            "expected STANDARD alphabet (+, /); got {body:?}",
+        );
+        assert!(
+            !body.contains("Pz8_Pj4-"),
+            "URL_SAFE alphabet leaked into output: {body:?}",
+        );
+    }
+
+    #[test]
+    fn auth_file_scrv1_round_trips_special_chars_in_password() {
+        let pw = "p:a+s/s=word";
+        let otp = "654321";
+        let body = format_openvpn_auth_body("u", pw, Some(otp));
+        // Parse: split on `\n`, strip `SCRV1:`, split on `:`.
+        let line2 = body.lines().nth(1).unwrap();
+        let rest = line2.strip_prefix("SCRV1:").unwrap();
+        let mut parts = rest.splitn(2, ':');
+        let pw_b64 = parts.next().unwrap();
+        let otp_b64 = parts.next().unwrap();
+        assert_eq!(BASE64.decode(pw_b64).unwrap(), pw.as_bytes());
+        assert_eq!(BASE64.decode(otp_b64).unwrap(), otp.as_bytes());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_auth_file_permissions_with_scrv1() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _tmp = set_temp_config_dir();
+        let name = "test_auth_perms_scrv1";
+        let result = write_openvpn_auth_file(name, "user", "pass", Some("123456"));
         assert!(result.is_ok());
         let path = result.unwrap();
 

@@ -79,6 +79,11 @@ directories = { workspace = true }
 enum_dispatch = { workspace = true }
 figment = { workspace = true }
 sha2 = "0.10"
+# Plan 2026-06-02-001 U2 (#191): base64 envelope for OpenVPN SCRV1
+# static-challenge auth files. STANDARD alphabet only — see
+# `vortix_protocol_openvpn::tunnel` consumers and the plan's Key Tech
+# Decisions for the URL_SAFE-vs-STANDARD reasoning.
+base64 = "0.22"
 # Plan 002 U8: text-only clipboard. Image features pull in `image` /
 # `x11rb` / `zune-*` deps for clipboard image support we don't use;
 # disable defaults to keep binary lean.
