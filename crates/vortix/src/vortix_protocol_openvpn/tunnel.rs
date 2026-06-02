@@ -5,9 +5,13 @@
 //! one of the known error patterns. Behaviour matches the existing engine
 //! invocation byte-for-byte.
 
-use std::path::PathBuf;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
+
+use base64::engine::{general_purpose::STANDARD as BASE64, Engine as _};
 
 use crate::vortix_core::ports::tunnel::{
     ParseError, ParsedProfile, ProtocolStatus, Tunnel, TunnelCapabilities, TunnelError,
@@ -18,6 +22,185 @@ use crate::vortix_process::{CommandSpec, PrivilegeReq};
 use tracing::{debug, info, warn};
 
 use crate::vortix_protocol_openvpn::parser::parse_ovpn_conf;
+
+/// Maximum wall-clock to wait for openvpn to create the unix
+/// management socket after spawn (plan 2026-06-02-001, #191,
+/// Approach B-minimal). Typical macOS spawn takes <200ms; 5s gives
+/// loaded systems ample headroom while still surfacing
+/// catastrophic-spawn-failure within the user's attention span.
+const OVPN_MGMT_SOCKET_TIMEOUT_MS: u64 = 5000;
+
+/// Read the credentials bundle file written by the TUI/CLI auth flow
+/// (plan 2026-06-02-001 U3/U4, #191, Approach B-minimal). Returns
+/// `Ok(Some((user, pass, otp)))` when the file exists and has the
+/// expected 3-line shape, `Ok(None)` when the file is absent
+/// (non-MFA connect path), `Err` when the file exists but is
+/// malformed.
+fn read_mgmt_credentials_bundle(path: &Path) -> std::io::Result<Option<(String, String, String)>> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => {
+            let mut lines = content.lines();
+            let user = lines.next().unwrap_or("").to_string();
+            let pass = lines.next().unwrap_or("").to_string();
+            let otp = lines.next().unwrap_or("").to_string();
+            // Best-effort delete: keep the credentials surface tiny.
+            // If delete fails the startup scrub catches the residue.
+            let _ = std::fs::remove_file(path);
+            if user.is_empty() || pass.is_empty() || otp.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "mgmt credentials bundle: empty field(s)",
+                ));
+            }
+            Ok(Some((user, pass, otp)))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Drive `OpenVPN`'s management protocol auth dance over a unix socket
+/// (plan 2026-06-02-001, #191, Approach B-minimal). Implements only
+/// the static-challenge-inline path used by `ovpn-totp`-shaped
+/// profiles: release the hold, respond to `>PASSWORD:Need 'Auth' SC:
+/// 1,<prompt>` with username + SCRV1 envelope. Returns `Ok(())` when
+/// `>STATE:<ts>,CONNECTED,...` is observed; returns `Err` on
+/// `>FATAL:`, `>PASSWORD:Verification Failed`, or socket error.
+///
+/// Dynamic CRV1, passphrase, and push MFA are deferred to a future
+/// brainstorm — when encountered, this function returns a
+/// `TunnelError::AuthFailed` describing the unhandled event so the
+/// failure is loud rather than a hang.
+fn drive_mgmt_auth(
+    stream: UnixStream,
+    user: &str,
+    pass: &str,
+    otp: &str,
+    profile_id: &str,
+) -> Result<(), TunnelError> {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .map_err(|e| TunnelError::Subprocess(format!("mgmt: set_read_timeout: {e}")))?;
+    let mut writer = stream
+        .try_clone()
+        .map_err(|e| TunnelError::Subprocess(format!("mgmt: try_clone: {e}")))?;
+    let mut reader = BufReader::new(stream);
+
+    let send = |w: &mut UnixStream, line: &str| -> Result<(), TunnelError> {
+        // No log emit of the line content — credentials cannot
+        // appear in tracing spans (plan 2026-06-02-001 PF-8).
+        w.write_all(line.as_bytes())
+            .and_then(|()| w.write_all(b"\n"))
+            .and_then(|()| w.flush())
+            .map_err(|e| TunnelError::Subprocess(format!("mgmt: write: {e}")))
+    };
+
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = reader
+            .read_line(&mut line)
+            .map_err(|e| TunnelError::Subprocess(format!("mgmt: read_line: {e}")))?;
+        if n == 0 {
+            return Err(TunnelError::Subprocess(
+                "mgmt: socket closed before CONNECTED state".into(),
+            ));
+        }
+        let trimmed = line.trim();
+        debug!(
+            target: "vortix::tunnel::openvpn::mgmt",
+            profile = %profile_id,
+            event = %trimmed,
+            "mgmt event"
+        );
+
+        if trimmed.starts_with(">HOLD:") {
+            send(&mut writer, "hold release")?;
+        } else if let Some(rest) = trimmed.strip_prefix(">PASSWORD:Need 'Auth' SC:") {
+            // Static-challenge inline. `rest` is `<echo>,<prompt>` —
+            // we don't need either; we just send the SCRV1 envelope.
+            let _ = rest;
+            send(
+                &mut writer,
+                &format!("username \"Auth\" \"{}\"", escape_mgmt(user)),
+            )?;
+            let pw_b64 = BASE64.encode(pass);
+            let otp_b64 = BASE64.encode(otp);
+            send(
+                &mut writer,
+                &format!("password \"Auth\" \"SCRV1:{pw_b64}:{otp_b64}\""),
+            )?;
+        } else if trimmed.starts_with(">PASSWORD:Need 'Auth'") {
+            // Non-static-challenge auth-user-pass query — plain creds.
+            send(
+                &mut writer,
+                &format!("username \"Auth\" \"{}\"", escape_mgmt(user)),
+            )?;
+            send(
+                &mut writer,
+                &format!("password \"Auth\" \"{}\"", escape_mgmt(pass)),
+            )?;
+        } else if trimmed.starts_with(">PASSWORD:Verification Failed") {
+            return Err(TunnelError::AuthFailed(trimmed.to_string()));
+        } else if trimmed.starts_with(">PASSWORD:Need 'Private Key'") {
+            return Err(TunnelError::AuthFailed(
+                "OpenVPN requested a private-key passphrase; this profile shape is not yet supported (deferred to next brainstorm).".into(),
+            ));
+        } else if trimmed.starts_with(">FATAL:") {
+            return Err(TunnelError::DaemonExited(trimmed.to_string()));
+        } else if let Some(state) = trimmed.strip_prefix(">STATE:") {
+            // `>STATE:<ts>,<state>,...` — we only care about CONNECTED
+            // (success) and EXITING (early failure).
+            let mut fields = state.splitn(3, ',');
+            let _ts = fields.next();
+            if let Some(state_name) = fields.next() {
+                if state_name == "CONNECTED" {
+                    return Ok(());
+                }
+                if state_name == "EXITING" {
+                    return Err(TunnelError::DaemonExited(format!(
+                        "OpenVPN entered EXITING state mid-auth: {trimmed}"
+                    )));
+                }
+            }
+        }
+        // Other events (>INFO:, >LOG:, >BYTECOUNT:, etc.) are
+        // ignored — the auth dance only cares about HOLD, PASSWORD,
+        // STATE, FATAL.
+    }
+}
+
+/// Escape a value for the `OpenVPN` management protocol's quoted-string
+/// form. Per `management-notes.txt`: backslash and double-quote are
+/// the only characters that need escaping inside `"..."`.
+fn escape_mgmt(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Wait for openvpn to create the management unix socket. Returns
+/// `Ok(())` when the path becomes a socket, `Err` on timeout.
+fn wait_for_mgmt_socket(path: &Path, timeout: Duration) -> Result<(), TunnelError> {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if path.exists() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Err(TunnelError::Subprocess(format!(
+        "openvpn management socket did not appear within {}ms at {}",
+        timeout.as_millis(),
+        path.display()
+    )))
+}
 
 /// Log line indicating successful tunnel establishment.
 pub const OVPN_LOG_SUCCESS: &str = "Initialization Sequence Completed";
@@ -413,19 +596,46 @@ impl Tunnel for OvpnTunnel {
             );
         }
 
-        // Prefer the static-challenge SCRV1 envelope file when present
-        // (plan 2026-06-02-001 U3 / PF-2). The caller writes it just
-        // before invoking `up()`, openvpn consumes it during its synchronous
-        // pre-fork setup, and we delete it immediately after the parent
-        // returns so the single-use OTP doesn't linger on disk and the
-        // canonical auth file stays plain throughout.
-        let scrv1_path = self.scrv1_auth_path(&safe_name).filter(|p| p.exists());
-        let auth_arg = scrv1_path
-            .clone()
-            .or_else(|| self.auth_path(&safe_name).filter(|p| p.exists()));
-        if let Some(auth) = auth_arg {
-            args.push("--auth-user-pass".to_string());
-            args.push(auth.to_string_lossy().into_owned());
+        // Plan 2026-06-02-001, #191, Approach B-minimal: if the
+        // credentials bundle file is present, this is a
+        // static-challenge connect. Read user/pass/otp out of the
+        // bundle (the file is consumed/deleted on read), spawn
+        // openvpn with `--management <sock> unix --management-hold
+        // --management-query-passwords --daemon`, and drive the auth
+        // dance over the socket on a worker thread while
+        // run_to_output waits for the parent to daemonize.
+        //
+        // Non-MFA profiles take the existing --auth-user-pass file
+        // path unchanged.
+        let bundle_path = self.scrv1_auth_path(&safe_name);
+        let mgmt_creds = if let Some(p) = &bundle_path {
+            read_mgmt_credentials_bundle(p)
+                .map_err(|e| TunnelError::Subprocess(format!("mgmt creds bundle: {e}")))?
+        } else {
+            None
+        };
+
+        let mgmt_sock_path = if mgmt_creds.is_some() {
+            let path = self.run_dir.join(format!("{safe_name}.mgmt.sock"));
+            // Stale socket from a prior crash — delete before spawn
+            // so openvpn can bind cleanly.
+            let _ = std::fs::remove_file(&path);
+            args.push("--management".to_string());
+            args.push(path.to_string_lossy().into_owned());
+            args.push("unix".to_string());
+            args.push("--management-hold".to_string());
+            args.push("--management-query-passwords".to_string());
+            Some(path)
+        } else {
+            None
+        };
+
+        // Non-MFA: legacy `--auth-user-pass <file>` flow.
+        if mgmt_creds.is_none() {
+            if let Some(auth) = self.auth_path(&safe_name).filter(|p| p.exists()) {
+                args.push("--auth-user-pass".to_string());
+                args.push(auth.to_string_lossy().into_owned());
+            }
         }
 
         // `openvpn --daemon` forks and detaches — the grandchild inherits
@@ -434,30 +644,58 @@ impl Tunnel for OvpnTunnel {
         // forever waiting for pipe EOF that never comes. The daemon writes
         // diagnostics to `--log <log_path>` (read via `tail_lines` on the
         // error path below), so dropping pipe capture costs no signal.
-        let output = crate::vortix_process::run_to_output(
-            CommandSpec::oneshot("openvpn", args)
-                .privilege(PrivilegeReq::Root)
-                .daemonizes(),
-        )
-        .map_err(|e| TunnelError::Subprocess(format!("openvpn: {e}")))?;
+        //
+        // For the management-socket flow, the parent does NOT fork
+        // until auth completes successfully — so we spawn openvpn on
+        // a worker thread and drive the management dance on the main
+        // thread while run_to_output blocks on the parent.
+        let output = if let (Some(creds), Some(sock_path)) = (mgmt_creds, mgmt_sock_path) {
+            let (user, pass, otp) = creds;
+            let profile_id_for_log = profile.id.to_string();
+            let spawn_thread = thread::spawn(move || {
+                crate::vortix_process::run_to_output(
+                    CommandSpec::oneshot("openvpn", args)
+                        .privilege(PrivilegeReq::Root)
+                        .daemonizes(),
+                )
+            });
 
-        // Clean up the SCRV1 envelope file immediately after the daemon
-        // parent returns — openvpn has read the auth file as part of its
-        // synchronous pre-fork setup, so the file is no longer needed.
-        // Best-effort: a missing file is fine; permission errors get
-        // surfaced through the existing log facility.
-        if let Some(path) = scrv1_path {
-            if let Err(e) = std::fs::remove_file(&path) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    warn!(
-                        target: "vortix::tunnel::openvpn",
-                        profile = %profile.id,
-                        error = %e,
-                        "ovpn.up: failed to delete SCRV1 auth file after openvpn fork"
-                    );
-                }
-            }
-        }
+            // Wait for openvpn to bind its management socket, then
+            // connect and drive the auth dance. If anything fails,
+            // we still need to join the spawn thread to avoid leaks.
+            let mgmt_result = (|| -> Result<(), TunnelError> {
+                wait_for_mgmt_socket(
+                    &sock_path,
+                    Duration::from_millis(OVPN_MGMT_SOCKET_TIMEOUT_MS),
+                )?;
+                let stream = UnixStream::connect(&sock_path).map_err(|e| {
+                    TunnelError::Subprocess(format!("mgmt: connect {}: {e}", sock_path.display()))
+                })?;
+                drive_mgmt_auth(stream, &user, &pass, &otp, &profile_id_for_log)
+            })();
+
+            // Always join. If mgmt failed, openvpn is probably about
+            // to exit anyway (we never released the hold or the
+            // SCRV1 was rejected). The join returns whatever the
+            // parent gave us.
+            let spawn_result = spawn_thread
+                .join()
+                .map_err(|_| TunnelError::Subprocess("openvpn spawn thread panicked".into()))?;
+
+            // Best-effort cleanup of the management socket file.
+            let _ = std::fs::remove_file(&sock_path);
+
+            // Bubble up the most informative error.
+            mgmt_result?;
+            spawn_result.map_err(|e| TunnelError::Subprocess(format!("openvpn: {e}")))?
+        } else {
+            crate::vortix_process::run_to_output(
+                CommandSpec::oneshot("openvpn", args)
+                    .privilege(PrivilegeReq::Root)
+                    .daemonizes(),
+            )
+            .map_err(|e| TunnelError::Subprocess(format!("openvpn: {e}")))?
+        };
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();

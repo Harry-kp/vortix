@@ -337,10 +337,23 @@ pub fn get_openvpn_scrv1_auth_path(profile_name: &str) -> std::io::Result<std::p
     Ok(auth_dir.join(format!("{safe_name}.scrv1.auth")))
 }
 
-/// Write the static-challenge SCRV1 envelope to the transient
-/// `<safe>.scrv1.auth` path. Mirrors [`write_openvpn_auth_file`]'s
-/// chmod-600 + open-without-overwrite shape; differs only in the
-/// path it writes to.
+/// Write a transient 3-line credentials bundle for the `OpenVPN`
+/// management-socket auth flow (plan 2026-06-02-001, #191, Approach
+/// B-minimal). The protocol layer reads this file, drives the
+/// `--management` socket dance with the embedded user/pass/otp, then
+/// deletes the file. Each line is `<value>` followed by `\n`:
+///
+/// ```text
+/// <username>\n
+/// <password>\n
+/// <otp>\n
+/// ```
+///
+/// This is NOT an `OpenVPN` auth-user-pass file — `OpenVPN` 2.7 doesn't
+/// consult `--auth-user-pass <file>` for the static-challenge case
+/// (the prompt fires before the file is read; see the U0 spike
+/// outcome in the plan). The credentials reach openvpn via the
+/// management socket, not via the file.
 ///
 /// # Errors
 ///
@@ -362,7 +375,7 @@ pub fn write_openvpn_scrv1_auth_file(
         Err(e) => return Err(e),
     }
 
-    let body = format_openvpn_auth_body(username, password, Some(otp));
+    let body = format!("{username}\n{password}\n{otp}\n");
     write_secret_file(&auth_path, body.as_bytes()).map_err(|e| match e {
         SecretFileError::Io(io) => io,
         other => std::io::Error::other(other.to_string()),
@@ -371,7 +384,7 @@ pub fn write_openvpn_scrv1_auth_file(
     Ok(auth_path)
 }
 
-/// Write the static-challenge SCRV1 envelope (non-Unix fallback).
+/// Non-Unix fallback: same 3-line bundle, no chmod.
 #[cfg(not(unix))]
 pub fn write_openvpn_scrv1_auth_file(
     profile_name: &str,
@@ -380,7 +393,7 @@ pub fn write_openvpn_scrv1_auth_file(
     otp: &str,
 ) -> std::io::Result<std::path::PathBuf> {
     let auth_path = get_openvpn_scrv1_auth_path(profile_name)?;
-    let body = format_openvpn_auth_body(username, password, Some(otp));
+    let body = format!("{username}\n{password}\n{otp}\n");
     write_user_file(&auth_path, body)?;
     Ok(auth_path)
 }
