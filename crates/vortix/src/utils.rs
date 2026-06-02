@@ -393,26 +393,24 @@ pub fn delete_openvpn_scrv1_auth_file(profile_name: &str) {
     }
 }
 
-/// Writes `OpenVPN` credentials to a file.
+/// Write the canonical `<safe>.auth` credentials file: line 1 username,
+/// line 2 password, both in plain text.
 ///
-/// Line 1 is always the username. Line 2 is the plain password when `otp` is
-/// `None` (the default and the format the daemon expects for non-MFA
-/// `auth-user-pass` profiles), or the SCRV1 envelope
-/// `SCRV1:base64(password):base64(otp)` when `otp` is `Some(non_empty)` (the
-/// format `OpenVPN` expects when the .ovpn carries a `static-challenge`
-/// directive).
+/// Reserved for non-MFA `auth-user-pass` profiles. Static-challenge
+/// (MFA) profiles route credentials through a transient sibling file
+/// (see [`write_openvpn_scrv1_auth_file`]) and reach openvpn via the
+/// management socket -- the canonical `.auth` file is never used for
+/// SCRV1 envelopes because `OpenVPN` 2.7's static-challenge path
+/// prompts stdin for the OTP before reading the file (see the U0
+/// spike outcome in
+/// `docs/plans/2026-06-02-001-feat-openvpn-static-challenge-plan.md`).
 ///
-/// The file is created with `chmod 600` (owner read/write only) in a single
-/// step via [`crate::vortix_core::secret_file::write_secret_file`], which
-/// uses `openat(2)` against a held parent-directory fd to close the
-/// parent-directory TOCTOU window. If the auth file already exists from a
-/// previous run, it is removed first so the credential rewrite succeeds.
-///
-/// The SCRV1 path is meant to be transient — connect handlers write the
-/// envelope, spawn openvpn (which loads the file synchronously before
-/// daemonizing), then call this again with `otp: None` to restore plain
-/// text. [`scrub_stale_scrv1_auth_files`] handles the rare crash-window
-/// case at startup.
+/// The file is created with `chmod 600` (owner read/write only) in a
+/// single step via [`crate::vortix_core::secret_file::write_secret_file`],
+/// which uses `openat(2)` against a held parent-directory fd to close
+/// the parent-directory TOCTOU window. If the auth file already
+/// exists from a previous run, it is removed first so the credential
+/// rewrite succeeds.
 ///
 /// # Errors
 ///

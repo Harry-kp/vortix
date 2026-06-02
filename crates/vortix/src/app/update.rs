@@ -391,15 +391,22 @@ impl App {
                         ToastType::Info,
                     );
                 } else {
-                    // Pre-fill with existing credentials if saved. OTP is
-                    // never persisted (plan 2026-06-02-001) so it is
-                    // always initialized empty at overlay-open.
+                    // Pre-fill with existing credentials if saved. ManageAuth
+                    // is save-only (`connect_after: false`) so we DO NOT
+                    // surface the OTP field even on static-challenge profiles:
+                    // (1) the OTP is single-use and expires in ~30s, so
+                    // pre-saving has no value; (2) the submit handler writes
+                    // a `.scrv1.auth` bundle whenever `otp.is_some()`, and
+                    // without a connect path consuming it that bundle would
+                    // persist on disk with the plaintext OTP until the next
+                    // startup scrub -- a real leak window. Setting
+                    // static_challenge_prompt=None here keeps the overlay at
+                    // 2 fields (Username/Password) and forces `otp = None`
+                    // in the AuthSubmit message.
                     let (username, password) =
                         utils::read_openvpn_saved_auth(&profile.name).unwrap_or_default();
                     let username_cursor = username.len();
                     let password_cursor = password.len();
-                    let static_challenge_prompt =
-                        utils::read_openvpn_static_challenge_prompt(&profile.config_path);
                     self.input_mode = InputMode::AuthPrompt {
                         profile_idx: idx,
                         profile_name: profile.name.clone(),
@@ -412,7 +419,7 @@ impl App {
                         focused_field: crate::state::AuthField::Username,
                         save_credentials: true,
                         connect_after: false,
-                        static_challenge_prompt,
+                        static_challenge_prompt: None,
                     };
                 }
             }

@@ -77,9 +77,17 @@ fn drive_mgmt_auth(
     pass: &str,
     otp: &str,
     profile_id: &str,
+    connect_timeout_secs: u64,
 ) -> Result<(), TunnelError> {
+    // Per-recv read timeout. Aligned with the configured overall
+    // connect_timeout so a slow MFA handshake (TLS + auth-pam fork +
+    // sequential PAM modules + PUSH_REPLY) doesn't trip the socket
+    // budget before the outer connect-timeout would. In the normal
+    // path events arrive continuously (HOLD -> PASSWORD prompt ->
+    // SUCCESS -> multiple STATE events) and no single recv takes
+    // more than ~1-2s; this timeout only fires when openvpn hangs.
     stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
+        .set_read_timeout(Some(Duration::from_secs(connect_timeout_secs)))
         .map_err(|e| TunnelError::Subprocess(format!("mgmt: set_read_timeout: {e}")))?;
     let mut writer = stream
         .try_clone()
@@ -668,6 +676,7 @@ impl Tunnel for OvpnTunnel {
         let output = if let (Some(creds), Some(sock_path)) = (mgmt_creds, mgmt_sock_path) {
             let (user, pass, otp) = creds;
             let profile_id_for_log = profile.id.to_string();
+            let mgmt_timeout = self.connect_timeout_secs;
             let spawn_thread = thread::spawn(move || {
                 crate::vortix_process::run_to_output(
                     CommandSpec::oneshot("openvpn", args)
@@ -687,7 +696,14 @@ impl Tunnel for OvpnTunnel {
                 let stream = UnixStream::connect(&sock_path).map_err(|e| {
                     TunnelError::Subprocess(format!("mgmt: connect {}: {e}", sock_path.display()))
                 })?;
-                drive_mgmt_auth(stream, &user, &pass, &otp, &profile_id_for_log)
+                drive_mgmt_auth(
+                    stream,
+                    &user,
+                    &pass,
+                    &otp,
+                    &profile_id_for_log,
+                    mgmt_timeout,
+                )
             })();
 
             // Always join. If mgmt failed, openvpn is probably about
