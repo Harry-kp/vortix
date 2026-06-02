@@ -3,6 +3,7 @@
 //! Each handler operates headlessly via `VpnRuntime` (no TUI), produces
 //! structured output via [`OutputMode`], and exits with semantic exit codes.
 
+use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
 
@@ -16,6 +17,78 @@ use crate::cli::output::{
 use crate::config::AppConfig;
 use crate::constants;
 use crate::vpn_runtime::VpnRuntime;
+
+/// Prompt for a 2FA code on the controlling tty with masked echo (each
+/// character is replaced by `*`). Returns `Err` when stdin is not a tty —
+/// the connect path treats this as a hard failure and exits non-zero with
+/// an actionable message naming the prompt kind. Plan 2026-06-02-001 U4.
+///
+/// Implementation uses `crossterm`'s raw mode (already in the workspace,
+/// no new dep) and reads byte-by-byte. A `RawModeGuard` ensures the
+/// terminal returns to cooked mode on every exit path including panic.
+fn prompt_masked_otp(prompt: &str) -> std::io::Result<String> {
+    use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+    use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+
+    if !crossterm::tty::IsTty::is_tty(&std::io::stdin()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "stdin is not a tty",
+        ));
+    }
+
+    print!("{prompt}: ");
+    std::io::stdout().flush().ok();
+
+    struct RawModeGuard;
+    impl Drop for RawModeGuard {
+        fn drop(&mut self) {
+            let _ = disable_raw_mode();
+        }
+    }
+    enable_raw_mode()?;
+    let _guard = RawModeGuard;
+
+    let mut otp = String::new();
+    loop {
+        match event::read()? {
+            Event::Key(k) => match k.code {
+                KeyCode::Enter => {
+                    println!();
+                    break;
+                }
+                KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                    println!();
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "user cancelled",
+                    ));
+                }
+                KeyCode::Char(c) => {
+                    otp.push(c);
+                    print!("*");
+                    std::io::stdout().flush().ok();
+                }
+                KeyCode::Backspace => {
+                    if otp.pop().is_some() {
+                        print!("\u{08} \u{08}");
+                        std::io::stdout().flush().ok();
+                    }
+                }
+                KeyCode::Esc => {
+                    println!();
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "user cancelled",
+                    ));
+                }
+                _ => {}
+            },
+            _ => continue,
+        }
+    }
+    Ok(otp.trim().to_string())
+}
 
 /// Dispatch a CLI command. Returns `true` if handled (program should exit).
 #[must_use]
@@ -377,7 +450,114 @@ fn handle_up(
         }
     }
 
-    match engine.connect_and_wait(&profile_name, Duration::from_secs(timeout_secs)) {
+    // Plan 2026-06-02-001 U4 (#191): if the profile declares a
+    // `static-challenge` directive, prompt for the OTP on the
+    // controlling tty (always masked, regardless of the directive's
+    // echo flag — DEC-2), write the SCRV1 envelope into the canonical
+    // auth file, run the connect, and restore plain text on every exit
+    // path. Non-tty stdin and missing saved credentials produce
+    // actionable non-zero exits.
+    let static_challenge_prompt = engine
+        .profiles
+        .iter()
+        .find(|p| p.name == profile_name)
+        .and_then(|p| crate::utils::read_openvpn_static_challenge_prompt(&p.config_path));
+    let mut scrv1_restore_needed: Option<(String, String, String)> = None;
+    if let Some(prompt_text) = static_challenge_prompt {
+        let saved = crate::utils::read_openvpn_saved_auth(&profile_name);
+        let Some((user, pass)) = saved else {
+            print_error_and_exit(
+                mode,
+                "up",
+                CliError {
+                    code: "auth_required",
+                    message: format!(
+                        "Profile '{profile_name}' requires 2FA ('{prompt_text}'). Save \
+                         username/password first via the TUI (Auth Manager), then re-run; \
+                         the OTP will be prompted at each connect."
+                    ),
+                    hint: Some("Open the TUI and use Auth Manager to save credentials.".into()),
+                },
+                ExitCode::PermissionDenied,
+            );
+        };
+        let otp = match prompt_masked_otp(&prompt_text) {
+            Ok(s) if !s.is_empty() => s,
+            Ok(_) => {
+                print_error_and_exit(
+                    mode,
+                    "up",
+                    CliError {
+                        code: "auth_required",
+                        message: "OTP required for 2FA profile".into(),
+                        hint: None,
+                    },
+                    ExitCode::GeneralError,
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                print_error_and_exit(
+                    mode,
+                    "up",
+                    CliError {
+                        code: "user_cancelled",
+                        message: "OTP prompt cancelled".into(),
+                        hint: None,
+                    },
+                    ExitCode::GeneralError,
+                );
+            }
+            Err(_) => {
+                print_error_and_exit(
+                    mode,
+                    "up",
+                    CliError {
+                        code: "auth_required",
+                        message: format!(
+                            "Profile '{profile_name}' requires 2FA but stdin is not a tty. \
+                             Run the TUI instead, or invoke from an interactive terminal."
+                        ),
+                        hint: None,
+                    },
+                    ExitCode::GeneralError,
+                );
+            }
+        };
+        if let Err(e) =
+            crate::utils::write_openvpn_auth_file(&profile_name, &user, &pass, Some(&otp))
+        {
+            print_error_and_exit(
+                mode,
+                "up",
+                CliError {
+                    code: "auth_write_failed",
+                    message: format!("Failed to write auth file: {e}"),
+                    hint: None,
+                },
+                ExitCode::GeneralError,
+            );
+        }
+        scrv1_restore_needed = Some((profile_name.clone(), user, pass));
+    }
+
+    let result = engine.connect_and_wait(&profile_name, Duration::from_secs(timeout_secs));
+    // Restore plain-text auth file on every exit path — success, failure,
+    // or timeout. The OTP has been consumed by openvpn (which loads the
+    // auth file synchronously before forking in daemon mode) and must
+    // not linger on disk. U6's startup scrub handles the rare
+    // crash-before-restore window separately. Best-effort: log
+    // restore failures but never block the user's session.
+    if let Some((name, user, pass)) = scrv1_restore_needed {
+        if let Err(e) = crate::utils::write_openvpn_auth_file(&name, &user, &pass, None) {
+            tracing::warn!(
+                profile = %name,
+                error = %e.kind(),
+                "AUTH: SCRV1 restore failed",
+            );
+        }
+    }
+
+    match result {
         Ok(result) if result.success => {
             let data = UpData {
                 state: "connected".into(),
