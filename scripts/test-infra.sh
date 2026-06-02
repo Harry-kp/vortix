@@ -679,12 +679,15 @@ write_files:
       # invisible -- pam_google_authenticator would fail to read its
       # secret no matter what perms or path expansion you tried.
       # (ASCII-only in this heredoc -- cloud-init YAML rejects high bytes.)
+      # chown BEFORE the su -- vortix must own the target directory
+      # before google-authenticator (running as vortix) tries to
+      # write the secret file into it.
       mkdir -p /etc/openvpn/google-auth/"$TEST_USER"
+      chown "$TEST_USER":"$TEST_USER" /etc/openvpn/google-auth/"$TEST_USER"
+      chmod 0700 /etc/openvpn/google-auth/"$TEST_USER"
       su -s /bin/bash - "$TEST_USER" -c \
         "google-authenticator -t -d -f -C -r 3 -R 30 -w 3 -Q NONE -i 'vortix-test' -s /etc/openvpn/google-auth/$TEST_USER/.google_authenticator" \
         > /root/client-profiles/ovpn-totp-setup.txt 2>&1
-      chown -R "$TEST_USER":"$TEST_USER" /etc/openvpn/google-auth/"$TEST_USER"
-      chmod 0700 /etc/openvpn/google-auth/"$TEST_USER"
       chmod 0400 /etc/openvpn/google-auth/"$TEST_USER"/.google_authenticator
 
       # Extract the secret key for the tester
