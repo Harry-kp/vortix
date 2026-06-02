@@ -69,12 +69,26 @@ pub struct OvpnRoute {
     pub metric: Option<u32>,
 }
 
+/// `static-challenge` directive: the server requests an inline second-factor
+/// alongside the username/password. `prompt` is the user-facing text rendered
+/// next to the OTP input; `echo` records the server-declared echo bit but is
+/// not used to decide masking — vortix always masks OTP input (see plan
+/// 2026-06-02-001 DEC-2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaticChallenge {
+    pub prompt: String,
+    pub echo: bool,
+}
+
 /// Parsed `OpenVPN` profile body.
 #[derive(Debug, Default, Clone)]
 pub struct OvpnParsedProfile {
     /// Whether the profile expects interactive auth (`auth-user-pass` directive
     /// without a file path).
     pub interactive_auth: bool,
+    /// `static-challenge` directive when present. Drives the conditional OTP
+    /// field in the auth overlay and the masked prompt in the CLI.
+    pub static_challenge: Option<StaticChallenge>,
     /// Ordered list of `remote` directives.
     pub remotes: Vec<RemoteSpec>,
     /// `remote-random` flag — caller may shuffle `remotes` when true.
@@ -146,11 +160,73 @@ pub fn parse_ovpn_conf(text: &str) -> Result<OvpnParsedProfile, ParseError> {
                     warn!(line = %line, "ovpn: malformed route directive — skipping");
                 }
             }
+            "static-challenge" => {
+                if let Some(sc) = parse_static_challenge(line) {
+                    profile.static_challenge = Some(sc);
+                } else {
+                    warn!(line = %line, "ovpn: malformed static-challenge directive — skipping");
+                }
+            }
             _ => {}
         }
     }
 
     Ok(profile)
+}
+
+/// Parse `static-challenge "<prompt>" <echo>` from a trimmed config line.
+///
+/// The prompt may be double-quoted (with backslash-escaped `\"` and `\\`) and
+/// commonly contains spaces, so `split_whitespace` cannot tokenize it. We
+/// re-parse the line after the `static-challenge` prefix:
+///
+/// 1. Strip the directive name and surrounding whitespace.
+/// 2. If the remainder begins with `"`, extract the quoted span (honouring
+///    escapes) as the prompt; otherwise take the next whitespace-delimited
+///    token.
+/// 3. Parse the next token as the echo bit (`1` → true, `0`/anything else →
+///    false).
+///
+/// Returns `None` when the prompt is empty or absent. An unparseable echo bit
+/// is degraded to `false` rather than rejected — most servers send `1`, but a
+/// missing or malformed echo should not prevent the prompt from rendering.
+fn parse_static_challenge(line: &str) -> Option<StaticChallenge> {
+    let rest = line.strip_prefix("static-challenge")?.trim_start();
+    let (prompt, after_prompt) = if let Some(after_quote) = rest.strip_prefix('"') {
+        // Quoted: scan until the matching `"`, handling `\\` and `\"` escapes.
+        let mut prompt = String::new();
+        let mut chars = after_quote.char_indices();
+        let mut closed_at: Option<usize> = None;
+        while let Some((idx, ch)) = chars.next() {
+            match ch {
+                '\\' => {
+                    if let Some((_, escaped)) = chars.next() {
+                        prompt.push(escaped);
+                    }
+                }
+                '"' => {
+                    closed_at = Some(idx);
+                    break;
+                }
+                _ => prompt.push(ch),
+            }
+        }
+        let closed = closed_at?;
+        let remainder = &after_quote[closed + 1..];
+        (prompt, remainder)
+    } else {
+        // Unquoted: take next whitespace-delimited token.
+        let mut tokens = rest.split_whitespace();
+        let prompt = tokens.next()?.to_string();
+        let remainder_start = rest.find(&prompt).map(|i| i + prompt.len())?;
+        (prompt, &rest[remainder_start..])
+    };
+    if prompt.is_empty() {
+        return None;
+    }
+    let echo_token = after_prompt.split_whitespace().next();
+    let echo = matches!(echo_token, Some("1"));
+    Some(StaticChallenge { prompt, echo })
 }
 
 fn parse_remote<'a, I>(tokens: &mut I) -> Option<RemoteSpec>
@@ -337,5 +413,105 @@ mod tests {
         let text = "route 10.0.0.0 255.0.255.0\n";
         let p = parse_ovpn_conf(text).unwrap();
         assert!(p.routes.is_empty());
+    }
+
+    #[test]
+    fn static_challenge_quoted_multi_word_with_echo_1() {
+        let text = "client\nstatic-challenge \"Enter authenticator code\" 1\n";
+        let p = parse_ovpn_conf(text).unwrap();
+        let sc = p.static_challenge.expect("static-challenge parsed");
+        assert_eq!(sc.prompt, "Enter authenticator code");
+        assert!(sc.echo);
+    }
+
+    #[test]
+    fn static_challenge_echo_zero() {
+        let text = "static-challenge \"OTP\" 0\n";
+        let p = parse_ovpn_conf(text).unwrap();
+        let sc = p.static_challenge.unwrap();
+        assert_eq!(sc.prompt, "OTP");
+        assert!(!sc.echo);
+    }
+
+    #[test]
+    fn static_challenge_unquoted_single_token() {
+        let text = "static-challenge Code 1\n";
+        let p = parse_ovpn_conf(text).unwrap();
+        let sc = p.static_challenge.unwrap();
+        assert_eq!(sc.prompt, "Code");
+        assert!(sc.echo);
+    }
+
+    #[test]
+    fn static_challenge_embedded_escaped_quote() {
+        let text = "static-challenge \"Type \\\"code\\\" here\" 1\n";
+        let p = parse_ovpn_conf(text).unwrap();
+        let sc = p.static_challenge.unwrap();
+        assert_eq!(sc.prompt, "Type \"code\" here");
+        assert!(sc.echo);
+    }
+
+    #[test]
+    fn static_challenge_apostrophe_in_prompt() {
+        let text = "static-challenge \"Enter user's TOTP\" 1\n";
+        let p = parse_ovpn_conf(text).unwrap();
+        let sc = p.static_challenge.unwrap();
+        assert_eq!(sc.prompt, "Enter user's TOTP");
+    }
+
+    #[test]
+    fn static_challenge_empty_quoted_prompt_is_skipped() {
+        let text = "static-challenge \"\" 1\n";
+        let p = parse_ovpn_conf(text).unwrap();
+        assert!(p.static_challenge.is_none());
+    }
+
+    #[test]
+    fn static_challenge_malformed_echo_defaults_to_false() {
+        let text = "static-challenge \"OTP\" 2\n";
+        let p = parse_ovpn_conf(text).unwrap();
+        let sc = p.static_challenge.unwrap();
+        assert_eq!(sc.prompt, "OTP");
+        assert!(!sc.echo);
+    }
+
+    #[test]
+    fn static_challenge_extra_whitespace_tolerated() {
+        let text = "static-challenge   \"OTP\"   1   \n";
+        let p = parse_ovpn_conf(text).unwrap();
+        let sc = p.static_challenge.unwrap();
+        assert_eq!(sc.prompt, "OTP");
+        assert!(sc.echo);
+    }
+
+    #[test]
+    fn static_challenge_absent_when_directive_missing() {
+        let text = "client\nauth-user-pass\nremote vpn.example.com\n";
+        let p = parse_ovpn_conf(text).unwrap();
+        assert!(p.static_challenge.is_none());
+    }
+
+    #[test]
+    fn static_challenge_commented_out_is_skipped() {
+        let text = "# static-challenge \"OTP\" 1\n; static-challenge \"OTP\" 1\n";
+        let p = parse_ovpn_conf(text).unwrap();
+        assert!(p.static_challenge.is_none());
+    }
+
+    #[test]
+    fn static_challenge_coexists_with_auth_user_pass() {
+        let text = "auth-user-pass\nstatic-challenge \"Enter code\" 1\n";
+        let p = parse_ovpn_conf(text).unwrap();
+        assert!(p.interactive_auth);
+        let sc = p.static_challenge.unwrap();
+        assert_eq!(sc.prompt, "Enter code");
+        assert!(sc.echo);
+    }
+
+    #[test]
+    fn static_challenge_unterminated_quote_is_skipped() {
+        let text = "static-challenge \"unterminated 1\n";
+        let p = parse_ovpn_conf(text).unwrap();
+        assert!(p.static_challenge.is_none());
     }
 }
