@@ -210,7 +210,13 @@ impl App {
         if matches!(protocol, Protocol::OpenVPN) && utils::openvpn_config_needs_auth(&config_path) {
             // Check for saved credentials first
             if utils::read_openvpn_saved_auth(&name).is_none() {
-                // No saved creds -- show the auth prompt overlay
+                // No saved creds -- show the auth prompt overlay. The
+                // discoverability surface for a 2FA profile is the
+                // labeled OTP field at overlay-open (plan
+                // 2026-06-02-001 U3 / DEC-3) — no separate sidebar
+                // badge or overlay title change.
+                let static_challenge_prompt =
+                    utils::read_openvpn_static_challenge_prompt(&config_path);
                 self.input_mode = InputMode::AuthPrompt {
                     profile_idx: idx,
                     profile_name: name,
@@ -218,9 +224,12 @@ impl App {
                     username_cursor: 0,
                     password: String::new(),
                     password_cursor: 0,
+                    otp: String::new(),
+                    otp_cursor: 0,
                     focused_field: crate::state::AuthField::Username,
                     save_credentials: true,
                     connect_after: true,
+                    static_challenge_prompt,
                 };
                 return;
             }

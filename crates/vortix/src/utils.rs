@@ -403,6 +403,21 @@ pub fn delete_openvpn_auth_file(profile_name: &str) {
     }
 }
 
+/// Read a .ovpn config and return the `static-challenge` prompt text if the
+/// directive is present.
+///
+/// Helper for the auth-overlay construction sites that need to know whether
+/// to render a third (OTP) field. Parse-on-demand symmetric with
+/// [`openvpn_config_needs_auth`]: we read the file at use-time rather than
+/// caching the parsed profile on `Profile`. Returns `None` on any read or
+/// parse failure so callers always degrade to the existing two-field flow.
+#[must_use]
+pub fn read_openvpn_static_challenge_prompt(config_path: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(config_path).ok()?;
+    let parsed = crate::vortix_protocol_openvpn::parser::parse_ovpn_conf(&text).ok()?;
+    parsed.static_challenge.map(|sc| sc.prompt)
+}
+
 /// Scan the OpenVPN auth directory for files whose line 2 is an SCRV1
 /// envelope, and delete them.
 ///

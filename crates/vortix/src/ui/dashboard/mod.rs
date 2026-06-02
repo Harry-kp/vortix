@@ -242,9 +242,12 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
             username_cursor,
             password,
             password_cursor,
+            otp,
+            otp_cursor,
             focused_field,
             save_credentials,
             connect_after,
+            static_challenge_prompt,
             ..
         } => super::overlays::auth::render(
             frame,
@@ -253,9 +256,12 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
             *username_cursor,
             password,
             *password_cursor,
+            otp,
+            *otp_cursor,
             focused_field,
             *save_credentials,
             *connect_after,
+            static_challenge_prompt.as_deref(),
         ),
         InputMode::Rename {
             new_name, cursor, ..

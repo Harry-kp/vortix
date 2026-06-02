@@ -205,6 +205,11 @@ pub enum Message {
         username: String,
         /// Password entered by the user
         password: String,
+        /// 2FA code from the static-challenge OTP field, when the profile
+        /// declares a `static-challenge` directive (plan 2026-06-02-001 U3).
+        /// `None` for non-MFA profiles; the connect path embeds `Some(otp)`
+        /// in the SCRV1 envelope and the save path always writes plain.
+        otp: Option<String>,
         /// Whether to persist credentials for future sessions
         save: bool,
         /// Whether to auto-connect after saving (false = save-only from manage flow)

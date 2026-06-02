@@ -88,6 +88,10 @@ pub enum AuthField {
     Username,
     /// Password text input (masked).
     Password,
+    /// OTP / 2FA code text input (always masked). Only rendered when the
+    /// profile declares an OpenVPN `static-challenge` directive — plan
+    /// 2026-06-02-001 U3.
+    Otp,
     /// "Save credentials" checkbox.
     SaveCheckbox,
 }
@@ -207,12 +211,25 @@ pub enum InputMode {
         password: String,
         /// Cursor position in the password field.
         password_cursor: usize,
+        /// OTP / 2FA code input (always initialized to an empty string at
+        /// overlay-open so the field cannot inherit prior state — plan
+        /// 2026-06-02-001 U3 / FYI-8). Only used when
+        /// `static_challenge_prompt.is_some()`.
+        otp: String,
+        /// Cursor position in the OTP field.
+        otp_cursor: usize,
         /// Which field is currently focused.
         focused_field: AuthField,
         /// Whether to persist credentials for future sessions.
         save_credentials: bool,
         /// Whether to auto-connect after submitting (false = save-only mode).
         connect_after: bool,
+        /// Prompt text from the .ovpn's `static-challenge` directive. When
+        /// `Some`, the overlay renders a third (OTP) field labelled with
+        /// this text and the submit handler embeds the OTP in the
+        /// SCRV1 envelope (plan 2026-06-02-001 U3). When `None`, the
+        /// overlay renders the two-field layout unchanged.
+        static_challenge_prompt: Option<String>,
     },
 }
 

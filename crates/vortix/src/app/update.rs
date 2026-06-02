@@ -286,9 +286,10 @@ impl App {
                 idx,
                 username,
                 password,
+                otp,
                 save,
                 connect_after,
-            } => self.handle_auth_submit(idx, username, password, save, connect_after),
+            } => self.handle_auth_submit(idx, username, password, otp, save, connect_after),
 
             Message::CycleSortOrder => {
                 let selected_name = self
@@ -390,11 +391,15 @@ impl App {
                         ToastType::Info,
                     );
                 } else {
-                    // Pre-fill with existing credentials if saved
+                    // Pre-fill with existing credentials if saved. OTP is
+                    // never persisted (plan 2026-06-02-001) so it is
+                    // always initialized empty at overlay-open.
                     let (username, password) =
                         utils::read_openvpn_saved_auth(&profile.name).unwrap_or_default();
                     let username_cursor = username.len();
                     let password_cursor = password.len();
+                    let static_challenge_prompt =
+                        utils::read_openvpn_static_challenge_prompt(&profile.config_path);
                     self.input_mode = InputMode::AuthPrompt {
                         profile_idx: idx,
                         profile_name: profile.name.clone(),
@@ -402,9 +407,12 @@ impl App {
                         username_cursor,
                         password,
                         password_cursor,
+                        otp: String::new(),
+                        otp_cursor: 0,
                         focused_field: crate::state::AuthField::Username,
                         save_credentials: true,
                         connect_after: false,
+                        static_challenge_prompt,
                     };
                 }
             }
@@ -647,6 +655,7 @@ impl App {
         idx: usize,
         username: String,
         password: String,
+        otp: Option<String>,
         save: bool,
         connect_after: bool,
     ) {
@@ -666,12 +675,40 @@ impl App {
             return;
         }
 
-        // Write credentials to auth file. The optional OTP for static-challenge
-        // profiles is plumbed through here by U3 (plan 2026-06-02-001); for the
-        // U2 baseline we pass `None`, which preserves today's behaviour
-        // byte-for-byte for non-MFA profiles.
-        match utils::write_openvpn_auth_file(&profile_name, &username, &password, None) {
-            Ok(_) => {
+        // Two-call structure when `save=true` AND an OTP is present (plan
+        // 2026-06-02-001 U3 / PF-3): the canonical auth file must remain
+        // plain-text on disk for future connects, so we write plain first
+        // and then overwrite with the SCRV1 envelope just before the
+        // connect attempt. Each connect rewrites and restores; U6's
+        // startup scrub handles the crash window. When `save=false` we
+        // also write plain at the end so subsequent reads via
+        // `read_openvpn_saved_auth` never see SCRV1 — the connect call
+        // we're about to issue runs synchronously enough that the daemon
+        // has consumed the file before we restore.
+        let result = (|| -> std::io::Result<()> {
+            if save {
+                utils::write_openvpn_auth_file(&profile_name, &username, &password, None)?;
+            }
+            if let Some(ref code) = otp {
+                utils::write_openvpn_auth_file(
+                    &profile_name,
+                    &username,
+                    &password,
+                    Some(code.as_str()),
+                )?;
+            } else if !save {
+                // No OTP, no save: this is the legacy one-time path. Write
+                // plain so the connect_profile call below has something to
+                // hand to openvpn.
+                utils::write_openvpn_auth_file(&profile_name, &username, &password, None)?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                // No OTP/SCRV1 content in logs — the OTP value is single-use
+                // and must never appear in tracing spans (plan 2026-06-02-001
+                // PF-8).
                 if save {
                     self.log(&format!("AUTH: Saved credentials for '{profile_name}'"));
                 } else {
@@ -682,6 +719,27 @@ impl App {
 
                 if connect_after {
                     self.connect_profile(idx);
+                    // After the connect path returns (success or failure),
+                    // restore the canonical auth file to plain text so the
+                    // single-use OTP never lingers on disk. Best-effort:
+                    // failure logs an error kind but does not block the
+                    // user's session. U6's startup scrub catches the
+                    // crash-window residue separately.
+                    if otp.is_some() {
+                        if let Err(e) =
+                            utils::write_openvpn_auth_file(&profile_name, &username, &password, None)
+                        {
+                            self.log(&format!("AUTH: SCRV1 restore failed: {}", e.kind()));
+                        }
+                        // When the user chose not to save, delete instead
+                        // of leaving the plain file behind.
+                        if !save {
+                            utils::delete_openvpn_auth_file(&profile_name);
+                        }
+                    } else if !save {
+                        // Legacy one-time path: still delete the file.
+                        utils::delete_openvpn_auth_file(&profile_name);
+                    }
                 } else {
                     // Save-only mode (from ManageAuth)
                     self.show_toast(

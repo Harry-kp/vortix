@@ -1116,6 +1116,7 @@ fn test_auth_submit_triggers_connect() {
         idx: 0,
         username: "testuser".to_string(),
         password: "testpass".to_string(),
+        otp: None,
         save: true,
         connect_after: true,
     });
@@ -1133,6 +1134,75 @@ fn test_auth_submit_triggers_connect() {
     assert_eq!(pass, "testpass");
 
     crate::utils::delete_openvpn_auth_file("submit-vpn");
+}
+
+#[test]
+fn test_auth_submit_with_otp_and_save_restores_plain_after_connect() {
+    // Plan 2026-06-02-001 U3 / PF-3: when `save=true` AND `otp=Some(...)`,
+    // the canonical auth file must end up plain-text on disk after the
+    // connect call returns. The submit handler writes plain, then SCRV1,
+    // then restores plain — the on-disk state after handle_auth_submit
+    // returns is what subsequent `read_openvpn_saved_auth` callers see.
+    let mut app = test_app();
+    let tmp = tempfile::Builder::new()
+        .prefix("vortix_auth_")
+        .tempdir()
+        .unwrap();
+    add_openvpn_profiles_with_auth(&mut app, &["mfa-save-vpn"], tmp.path());
+    app.runtime.is_root = true;
+    crate::utils::delete_openvpn_auth_file("mfa-save-vpn");
+
+    app.handle_message(Message::AuthSubmit {
+        idx: 0,
+        username: "u".to_string(),
+        password: "p".to_string(),
+        otp: Some("123456".to_string()),
+        save: true,
+        connect_after: true,
+    });
+
+    // After the handler returns, read_openvpn_saved_auth must see the
+    // plain password, not the SCRV1 envelope.
+    let creds = crate::utils::read_openvpn_saved_auth("mfa-save-vpn");
+    assert!(creds.is_some(), "saved file must exist after save+connect");
+    let (_, line2) = creds.unwrap();
+    assert!(
+        !line2.starts_with("SCRV1:"),
+        "auth file must be restored to plain after connect; got line 2 = {line2:?}"
+    );
+    assert_eq!(line2, "p", "expected plain password, got {line2:?}");
+
+    crate::utils::delete_openvpn_auth_file("mfa-save-vpn");
+}
+
+#[test]
+fn test_auth_submit_with_otp_no_save_deletes_file() {
+    // Plan 2026-06-02-001 U3 / PF-4: when `save=false` AND `otp=Some(...)`,
+    // the auth file must be deleted after the connect call returns —
+    // OTP is single-use and the user explicitly chose not to persist
+    // credentials.
+    let mut app = test_app();
+    let tmp = tempfile::Builder::new()
+        .prefix("vortix_auth_")
+        .tempdir()
+        .unwrap();
+    add_openvpn_profiles_with_auth(&mut app, &["mfa-no-save-vpn"], tmp.path());
+    app.runtime.is_root = true;
+    crate::utils::delete_openvpn_auth_file("mfa-no-save-vpn");
+
+    app.handle_message(Message::AuthSubmit {
+        idx: 0,
+        username: "u".to_string(),
+        password: "p".to_string(),
+        otp: Some("123456".to_string()),
+        save: false,
+        connect_after: true,
+    });
+
+    assert!(
+        crate::utils::read_openvpn_saved_auth("mfa-no-save-vpn").is_none(),
+        "auth file must be deleted after one-time MFA connect"
+    );
 }
 
 #[test]
@@ -1159,6 +1229,45 @@ fn test_auth_cancel_returns_to_normal() {
 }
 
 #[test]
+fn test_auth_field_otp_appears_in_tab_cycle_for_static_challenge_profile() {
+    // Plan 2026-06-02-001 U3: tab cycle becomes a 4-stop cycle when
+    // static_challenge_prompt.is_some() — Username -> Password -> Otp ->
+    // SaveCheckbox -> Username.
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut app = test_app();
+    app.input_mode = InputMode::AuthPrompt {
+        profile_idx: 0,
+        profile_name: "mfa".to_string(),
+        username: String::new(),
+        username_cursor: 0,
+        password: String::new(),
+        password_cursor: 0,
+        otp: String::new(),
+        otp_cursor: 0,
+        focused_field: AuthField::Username,
+        save_credentials: true,
+        connect_after: true,
+        static_challenge_prompt: Some("Enter code".to_string()),
+    };
+
+    // Username -> Password -> Otp -> SaveCheckbox -> Username
+    let expected = [
+        AuthField::Password,
+        AuthField::Otp,
+        AuthField::SaveCheckbox,
+        AuthField::Username,
+    ];
+    for expected_field in &expected {
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        if let InputMode::AuthPrompt { focused_field, .. } = &app.input_mode {
+            assert_eq!(focused_field, expected_field, "tab cycle drifted");
+        } else {
+            panic!("Expected AuthPrompt");
+        }
+    }
+}
+
+#[test]
 fn test_auth_field_switching() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -1170,9 +1279,12 @@ fn test_auth_field_switching() {
         username_cursor: 0,
         password: String::new(),
         password_cursor: 0,
+        otp: String::new(),
+        otp_cursor: 0,
         focused_field: AuthField::Username,
         save_credentials: true,
         connect_after: true,
+        static_challenge_prompt: None,
     };
 
     // Tab from Username -> Password

@@ -16,10 +16,14 @@ pub fn render(
     username_cursor: usize,
     password: &str,
     password_cursor: usize,
+    otp: &str,
+    otp_cursor: usize,
     focused_field: &AuthField,
     save_credentials: bool,
     connect_after: bool,
+    static_challenge_prompt: Option<&str>,
 ) {
+    let has_otp_field = static_challenge_prompt.is_some();
     let area = frame.area();
     let popup_layout = Layout::vertical([
         Constraint::Percentage(25),
@@ -121,7 +125,12 @@ pub fn render(
         Style::default().fg(theme::TEXT_SECONDARY)
     };
 
-    let text = vec![
+    // Layout budget: today's two-field overlay fits at 80x24 by allocating
+    // a blank row between each labelled field. With the third (OTP) field
+    // we drop the inter-field blanks (Username/Password/OTP packed) so the
+    // overlay still fits inside the 50% vertical allocation — plan
+    // 2026-06-02-001 U3 / PF-5. The non-MFA path is byte-identical to today.
+    let mut text = vec![
         Line::from(""),
         Line::from(vec![
             Span::styled("  Profile: ", Style::default().fg(theme::TEXT_SECONDARY)),
@@ -150,29 +159,53 @@ pub fn render(
             *focused_field == AuthField::Username,
             false,
         ),
-        Line::from(""),
-        Line::from(Span::styled(
-            "  Password:",
-            if *focused_field == AuthField::Password {
+    ];
+    if !has_otp_field {
+        text.push(Line::from(""));
+    }
+    text.push(Line::from(Span::styled(
+        "  Password:",
+        if *focused_field == AuthField::Password {
+            Style::default()
+                .fg(theme::TEXT_PRIMARY)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme::TEXT_SECONDARY)
+        },
+    )));
+    text.push(make_cursor_line(
+        password,
+        password_cursor,
+        *focused_field == AuthField::Password,
+        true,
+    ));
+    if let Some(prompt) = static_challenge_prompt {
+        // The prompt comes from the user's .ovpn config and is rendered
+        // verbatim. OTP input is ALWAYS masked regardless of the echo
+        // flag (plan 2026-06-02-001 DEC-2) — echo=1 means the server
+        // permits display, not that vortix must show.
+        text.push(Line::from(Span::styled(
+            format!("  {prompt}:"),
+            if *focused_field == AuthField::Otp {
                 Style::default()
                     .fg(theme::TEXT_PRIMARY)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(theme::TEXT_SECONDARY)
             },
-        )),
-        make_cursor_line(
-            password,
-            password_cursor,
-            *focused_field == AuthField::Password,
+        )));
+        text.push(make_cursor_line(
+            otp,
+            otp_cursor,
+            *focused_field == AuthField::Otp,
             true,
-        ),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled(format!("  {checkbox_icon} "), checkbox_style),
-            Span::styled("Save credentials for future sessions", checkbox_label_style),
-        ]),
-    ];
+        ));
+    }
+    text.push(Line::from(""));
+    text.push(Line::from(vec![
+        Span::styled(format!("  {checkbox_icon} "), checkbox_style),
+        Span::styled("Save credentials for future sessions", checkbox_label_style),
+    ]));
 
     frame.render_widget(Paragraph::new(text).alignment(Alignment::Left), inner);
 }
