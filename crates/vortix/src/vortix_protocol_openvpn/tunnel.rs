@@ -115,21 +115,37 @@ fn drive_mgmt_auth(
         );
 
         if trimmed.starts_with(">HOLD:") {
+            // Subscribe to STATE events BEFORE releasing the hold.
+            // OpenVPN's management protocol does NOT send `>STATE:...`
+            // real-time messages by default; without `state on` the
+            // socket goes silent after the password handshake and
+            // drive_mgmt_auth sits on read_timeout waiting for a
+            // `>STATE:CONNECTED` event that will never arrive --
+            // even when the tunnel is actually up and routing
+            // traffic. The handshake-success path needs explicit
+            // subscription. (Management-notes.txt: "STATE (when
+            // state is on)" -- not in the default-enabled list.)
+            send(&mut writer, "state on")?;
             send(&mut writer, "hold release")?;
-        } else if let Some(rest) = trimmed.strip_prefix(">PASSWORD:Need 'Auth' SC:") {
-            // Static-challenge inline. `rest` is `<echo>,<prompt>` —
-            // we don't need either; we just send the SCRV1 envelope.
-            let _ = rest;
+        } else if trimmed.starts_with(">PASSWORD:Need 'Auth'") && trimmed.contains(" SC:") {
+            // Static-challenge inline. The prompt CAN come in two
+            // observed shapes from OpenVPN:
+            //   ">PASSWORD:Need 'Auth' SC:1,Enter TOTP code"
+            //   ">PASSWORD:Need 'Auth' username/password SC:1,Enter TOTP code"
+            // (OpenVPN 2.6.19 server uses the second form; earlier
+            // versions used the first. The `username/password` token
+            // appears when the server asks for both creds in one
+            // round-trip alongside the static-challenge.)
+            // We don't parse echo/prompt -- vortix already showed the
+            // overlay; here we just send the SCRV1 envelope.
             send(
                 &mut writer,
                 &format!("username \"Auth\" \"{}\"", escape_mgmt(user)),
             )?;
             let pw_b64 = BASE64.encode(pass);
             let otp_b64 = BASE64.encode(otp);
-            send(
-                &mut writer,
-                &format!("password \"Auth\" \"SCRV1:{pw_b64}:{otp_b64}\""),
-            )?;
+            let password_cmd = format!("password \"Auth\" \"SCRV1:{pw_b64}:{otp_b64}\"");
+            send(&mut writer, &password_cmd)?;
         } else if trimmed.starts_with(">PASSWORD:Need 'Auth'") {
             // Non-static-challenge auth-user-pass query — plain creds.
             send(

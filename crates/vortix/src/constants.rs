@@ -23,7 +23,16 @@ pub const DEFAULT_API_TIMEOUT: u64 = 5;
 /// Default timeout for ping commands (seconds).
 pub const DEFAULT_PING_TIMEOUT: u64 = 2;
 /// Default maximum seconds to wait for `OpenVPN` log confirmation.
-pub const DEFAULT_CONNECT_TIMEOUT: u64 = 20;
+///
+/// Bumped from 20s to 35s for #191 — the MFA flow (TLS handshake +
+/// `auth-pam` plugin spawning a PAM background process + two PAM
+/// modules running sequentially + `PUSH_REPLY` processing) legitimately
+/// takes 15-25s on a real droplet. The previous 20s default caused
+/// a timeout-race where the protocol-layer success signal arrived
+/// 1-2 seconds AFTER vortix gave up. Single-tunnel `WireGuard` and
+/// cert-only `OpenVPN` flows complete in 2-5s and are unaffected by
+/// the higher ceiling.
+pub const DEFAULT_CONNECT_TIMEOUT: u64 = 35;
 /// Maximum seconds to wait for a local system command (`ps`, `lsof`, `ifconfig`, etc.)
 /// before killing it. This is a safety net against hung processes — it does NOT affect
 /// UI responsiveness because all scanner/netstats commands run in background threads.

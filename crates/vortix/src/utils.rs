@@ -3,8 +3,6 @@
 //! This module provides helper functions for common operations like
 //! formatting byte rates, durations, and managing configuration directories.
 
-use base64::engine::{general_purpose::STANDARD as BASE64, Engine as _};
-
 /// Check if the current process is running as root (UID 0)
 ///
 /// Uses the effective user ID from the OS instead of spawning an external command.
@@ -290,27 +288,17 @@ pub fn get_openvpn_auth_path(profile_name: &str) -> std::io::Result<std::path::P
     Ok(auth_dir.join(format!("{safe_name}.auth")))
 }
 
-/// Build the auth-file body. Line 1 is the username; line 2 is either the
-/// plain password (when `otp` is `None` or empty) or the SCRV1 envelope
-/// `SCRV1:base64(password):base64(otp)` that `OpenVPN`'s static-challenge
-/// directive expects.
-///
-/// `base64` uses the standard RFC 4648 alphabet — NOT `URL_SAFE`. `OpenVPN`'s
-/// SCRV1 parser only accepts the standard alphabet; using `URL_SAFE` silently
-/// produces wrong-password auth failures for passwords whose standard
-/// encoding contains `+` or `/`.
-///
-/// Empty OTP is treated as `None` to avoid producing `SCRV1:cA==:` which
-/// `OpenVPN` rejects.
-fn format_openvpn_auth_body(username: &str, password: &str, otp: Option<&str>) -> String {
-    match otp.filter(|s| !s.is_empty()) {
-        Some(code) => format!(
-            "{username}\nSCRV1:{}:{}\n",
-            BASE64.encode(password),
-            BASE64.encode(code),
-        ),
-        None => format!("{username}\n{password}\n"),
-    }
+/// Build the auth-file body. Line 1 is the username; line 2 is the
+/// plain password. The canonical `<safe>.auth` file is reserved for
+/// non-MFA `auth-user-pass` flows — `OpenVPN` 2.7's static-challenge
+/// path does NOT consume SCRV1 envelopes from this file (the OTP
+/// prompt fires before the file is read; see the U0 spike outcome in
+/// `docs/plans/2026-06-02-001-feat-openvpn-static-challenge-plan.md`).
+/// MFA credentials flow through the transient sibling file (see
+/// [`write_openvpn_scrv1_auth_file`]) and reach openvpn via the
+/// management socket.
+fn format_openvpn_auth_body(username: &str, password: &str) -> String {
+    format!("{username}\n{password}\n")
 }
 
 /// Path of the transient SCRV1 envelope auth file used for
@@ -434,7 +422,6 @@ pub fn write_openvpn_auth_file(
     profile_name: &str,
     username: &str,
     password: &str,
-    otp: Option<&str>,
 ) -> std::io::Result<std::path::PathBuf> {
     use crate::vortix_core::secret_file::{write_secret_file, SecretFileError};
 
@@ -449,7 +436,7 @@ pub fn write_openvpn_auth_file(
         Err(e) => return Err(e),
     }
 
-    let body = format_openvpn_auth_body(username, password, otp);
+    let body = format_openvpn_auth_body(username, password);
     write_secret_file(&auth_path, body.as_bytes()).map_err(|e| match e {
         SecretFileError::Io(io) => io,
         other => std::io::Error::other(other.to_string()),
@@ -464,10 +451,9 @@ pub fn write_openvpn_auth_file(
     profile_name: &str,
     username: &str,
     password: &str,
-    otp: Option<&str>,
 ) -> std::io::Result<std::path::PathBuf> {
     let auth_path = get_openvpn_auth_path(profile_name)?;
-    let body = format_openvpn_auth_body(username, password, otp);
+    let body = format_openvpn_auth_body(username, password);
     write_user_file(&auth_path, body)?;
     Ok(auth_path)
 }
@@ -510,28 +496,21 @@ pub fn read_openvpn_static_challenge_prompt(config_path: &std::path::Path) -> Op
     parsed.static_challenge.map(|sc| sc.prompt)
 }
 
-/// Scan the `OpenVPN` auth directory for files whose line 2 is an SCRV1
-/// envelope, and delete them.
+/// Scan the `OpenVPN` auth directory and delete any leftover transient
+/// `<safe>.scrv1.auth` credentials bundle (plan 2026-06-02-001 U6, #191).
 ///
-/// Safety net for the crash-window in [`write_openvpn_auth_file`]'s SCRV1
-/// flow: the connect path writes the envelope, spawns openvpn, then restores
-/// plain text. If vortix is killed (SIGKILL, panic mid-restore, system OOM)
-/// in that window, the file persists in SCRV1 form. On the next vortix
-/// start, the saved password slot (`read_openvpn_saved_auth`) would surface
-/// the SCRV1 string as-if it were the user's password, and the auth-overlay
-/// guard at `app/connection.rs` would skip prompting and feed the stale
-/// envelope to openvpn — which then auth-fails silently with no UX recovery
-/// path short of manually deleting the file.
+/// The bundle is a 3-line `user\npass\notp\n` file the submit handler
+/// writes for the protocol layer to consume at the start of a
+/// static-challenge connect. The protocol layer deletes the file
+/// immediately on read; if it's still on disk at vortix startup,
+/// something crashed mid-connect and the file is now an orphaned
+/// plaintext OTP that should never persist. The OTP would also be
+/// stale (TOTP expires in 30s), so the only correct cleanup is
+/// deletion — the user re-enters credentials on the next connect.
 ///
-/// The cleanup is delete, not rewrite-to-plain: SCRV1 is a one-way encoding
-/// of the credentials but the OTP inside it is single-use, and we cannot
-/// reconstruct the user's original plain password from the SCRV1 envelope
-/// alone. Deletion forces the next connect to re-prompt for credentials,
-/// which is the correct UX after a crash.
-///
-/// Silently skips files we can't read, can't parse, or can't delete — the
-/// scrubber must not block app startup. Each deletion is logged at warn
-/// level with the profile name (NOT the envelope content).
+/// Silently skips files it can't read or delete — the scrubber must
+/// not block app startup. Each deletion is logged at warn level with
+/// the file name (NOT the file contents).
 pub fn scrub_stale_scrv1_auth_files() {
     let Ok(root) = get_app_config_dir() else {
         return;
@@ -545,40 +524,10 @@ pub fn scrub_stale_scrv1_auth_files() {
         let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
             continue;
         };
-        // Always-stale: the transient SCRV1 envelope sibling. The
-        // protocol layer deletes this after openvpn forks; if it's
-        // still on disk at startup, vortix crashed mid-connect and
-        // the envelope is orphaned. Plan 2026-06-02-001 U6 / PF-2.
         if name.to_ascii_lowercase().ends_with(".scrv1.auth") {
             tracing::warn!(
                 file = %name,
-                "AUTH: stale SCRV1 envelope file — clearing"
-            );
-            let _ = std::fs::remove_file(&path);
-            continue;
-        }
-        // Belt-and-braces: catch any canonical `<safe>.auth` whose
-        // line 2 happens to be an SCRV1 envelope (pre-PF-2 builds
-        // wrote into the canonical path). Mostly irrelevant once
-        // every connect uses the transient sibling, but cheap to
-        // keep.
-        if path.extension().and_then(|s| s.to_str()) != Some("auth") {
-            continue;
-        }
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let Some(line2) = content.lines().nth(1) else {
-            continue;
-        };
-        if line2.starts_with("SCRV1:") {
-            let profile = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("<unknown>");
-            tracing::warn!(
-                profile = %profile,
-                "AUTH: stale SCRV1 in canonical auth file — clearing"
+                "AUTH: stale credentials bundle — clearing"
             );
             let _ = std::fs::remove_file(&path);
         }
@@ -1371,7 +1320,7 @@ mod tests {
     fn test_write_read_openvpn_auth_file() {
         let _tmp = set_temp_config_dir();
         let name = "test_auth_roundtrip";
-        let result = write_openvpn_auth_file(name, "myuser", "mypass", None);
+        let result = write_openvpn_auth_file(name, "myuser", "mypass");
         assert!(result.is_ok());
         let path = result.unwrap();
         assert!(path.exists());
@@ -1393,7 +1342,7 @@ mod tests {
 
         let _tmp = set_temp_config_dir();
         let name = "test_auth_perms";
-        let result = write_openvpn_auth_file(name, "user", "pass", None);
+        let result = write_openvpn_auth_file(name, "user", "pass");
         assert!(result.is_ok());
         let path = result.unwrap();
 
@@ -1404,84 +1353,33 @@ mod tests {
     }
 
     #[test]
-    fn auth_file_plain_format_unchanged_with_none_otp() {
-        // Byte-for-byte regression check: the legacy `username\npassword\n`
-        // shape must survive the signature change.
-        let body = format_openvpn_auth_body("u", "p", None);
+    fn auth_file_format_is_username_then_password() {
+        // Byte-for-byte: canonical `<safe>.auth` is always plain
+        // `username\npassword\n`. Static-challenge OTPs go via the
+        // transient sibling file + management socket -- never here.
+        let body = format_openvpn_auth_body("u", "p");
         assert_eq!(body, "u\np\n");
     }
 
     #[test]
-    fn auth_file_scrv1_envelope_when_otp_supplied() {
-        let body = format_openvpn_auth_body("u", "p", Some("123456"));
-        // base64("p") == "cA==", base64("123456") == "MTIzNDU2"
-        assert_eq!(body, "u\nSCRV1:cA==:MTIzNDU2\n");
-    }
-
-    #[test]
-    fn auth_file_empty_otp_falls_back_to_plain() {
-        // OpenVPN rejects `SCRV1:cA==:` — empty OTP must degrade to the
-        // plain format so the user gets a meaningful auth error rather
-        // than a malformed-envelope rejection.
-        let body = format_openvpn_auth_body("u", "p", Some(""));
-        assert_eq!(body, "u\np\n");
-    }
-
-    #[test]
-    fn auth_file_scrv1_uses_standard_alphabet_not_url_safe() {
-        // The ASCII string "???>>>" encodes to "Pz8/Pj4+" in STANDARD,
-        // "Pz8_Pj4-" in URL_SAFE. If the wrong engine is wired, this test
-        // catches it before the auth failure shows up in production.
-        let body = format_openvpn_auth_body("u", "???>>>", Some("x"));
-        assert!(
-            body.contains("Pz8/Pj4+"),
-            "expected STANDARD alphabet (+, /); got {body:?}",
-        );
-        assert!(
-            !body.contains("Pz8_Pj4-"),
-            "URL_SAFE alphabet leaked into output: {body:?}",
-        );
-    }
-
-    #[test]
-    fn auth_file_scrv1_round_trips_special_chars_in_password() {
-        let pw = "p:a+s/s=word";
-        let otp = "654321";
-        let body = format_openvpn_auth_body("u", pw, Some(otp));
-        // Parse: split on `\n`, strip `SCRV1:`, split on `:`.
-        let line2 = body.lines().nth(1).unwrap();
-        let rest = line2.strip_prefix("SCRV1:").unwrap();
-        let (pw_b64, otp_b64) = rest.split_once(':').unwrap();
-
-        assert_eq!(BASE64.decode(pw_b64).unwrap(), pw.as_bytes());
-        assert_eq!(BASE64.decode(otp_b64).unwrap(), otp.as_bytes());
-    }
-
-    #[test]
-    fn scrub_deletes_scrv1_files_and_leaves_plain_alone() {
+    fn scrub_deletes_scrv1_bundle_and_leaves_canonical_auth_alone() {
         let _tmp = set_temp_config_dir();
-        // Seed three auth files: plain (should stay), SCRV1 (should
-        // be deleted), and a malformed file with only one line (treated
-        // as plain — left alone).
-        let plain = write_openvpn_auth_file("scrub-plain", "u", "p", None).unwrap();
-        let scrv1 = write_openvpn_auth_file("scrub-scrv1", "u", "p", Some("123456")).unwrap();
-        let one_line = get_openvpn_auth_path("scrub-oneline").unwrap();
-        std::fs::write(&one_line, "only-username\n").unwrap();
+        // Plain canonical `<safe>.auth` (should survive scrub) and a
+        // transient `<safe>.scrv1.auth` bundle (should be deleted).
+        let plain = write_openvpn_auth_file("scrub-plain", "u", "p").unwrap();
+        let bundle = write_openvpn_scrv1_auth_file("scrub-bundle", "u", "p", "123456").unwrap();
         assert!(plain.exists());
-        assert!(scrv1.exists());
-        assert!(one_line.exists());
+        assert!(bundle.exists());
 
         scrub_stale_scrv1_auth_files();
 
-        assert!(plain.exists(), "plain auth file must survive scrub");
-        assert!(!scrv1.exists(), "SCRV1 auth file must be deleted by scrub");
+        assert!(plain.exists(), "canonical .auth file must survive scrub");
         assert!(
-            one_line.exists(),
-            "single-line file (no line 2) must survive scrub"
+            !bundle.exists(),
+            ".scrv1.auth bundle must be deleted by scrub"
         );
 
         delete_openvpn_auth_file("scrub-plain");
-        delete_openvpn_auth_file("scrub-oneline");
     }
 
     #[test]
@@ -1491,23 +1389,6 @@ mod tests {
         let _tmp = set_temp_config_dir();
         scrub_stale_scrv1_auth_files();
         // No assertion needed — the test passes by not panicking.
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_auth_file_permissions_with_scrv1() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let _tmp = set_temp_config_dir();
-        let name = "test_auth_perms_scrv1";
-        let result = write_openvpn_auth_file(name, "user", "pass", Some("123456"));
-        assert!(result.is_ok());
-        let path = result.unwrap();
-
-        let perms = std::fs::metadata(&path).unwrap().permissions();
-        assert_eq!(perms.mode() & 0o777, 0o600);
-
-        delete_openvpn_auth_file(name);
     }
 
     #[test]

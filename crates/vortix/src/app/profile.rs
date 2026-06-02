@@ -163,7 +163,7 @@ impl App {
 
             if matches!(self.runtime.profiles[idx].protocol, Protocol::OpenVPN) {
                 if let Some(auth) = utils::read_openvpn_saved_auth(&old_name) {
-                    let _ = utils::write_openvpn_auth_file(new_name, &auth.0, &auth.1, None);
+                    let _ = utils::write_openvpn_auth_file(new_name, &auth.0, &auth.1);
                     utils::delete_openvpn_auth_file(&old_name);
                 }
             }

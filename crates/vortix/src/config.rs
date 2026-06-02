@@ -503,7 +503,7 @@ mod tests {
         assert_eq!(config.telemetry_poll_rate, 30);
         assert_eq!(config.api_timeout, 5);
         assert_eq!(config.ping_timeout, 2);
-        assert_eq!(config.connect_timeout, 20);
+        assert_eq!(config.connect_timeout, 35);
         assert_eq!(config.ping_targets.len(), 4);
         assert_eq!(config.ipv6_check_apis.len(), 3);
         assert_eq!(config.ip_api_fallbacks.len(), 3);

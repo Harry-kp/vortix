@@ -685,7 +685,7 @@ impl App {
         // async connect-worker thread.
         let result = (|| -> std::io::Result<()> {
             if save || otp.is_none() {
-                utils::write_openvpn_auth_file(&profile_name, &username, &password, None)?;
+                utils::write_openvpn_auth_file(&profile_name, &username, &password)?;
             }
             if let Some(ref code) = otp {
                 utils::write_openvpn_scrv1_auth_file(
