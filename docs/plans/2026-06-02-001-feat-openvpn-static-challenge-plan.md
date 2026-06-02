@@ -3,30 +3,54 @@ date: 2026-06-02
 type: feat
 origin: docs/brainstorms/2026-06-02-openvpn-interactive-auth-requirements.md
 origin_issue: https://github.com/Harry-kp/vortix/issues/191
-status: active
+status: pre-approach-b-infrastructure
 ---
 
-# feat: OpenVPN static-challenge inline 2FA (issue #191, Approach A)
+# feat: OpenVPN static-challenge — Approach B infrastructure (issue #191)
 
-## Summary
+## ⚠️ Approach A is broken on OpenVPN 2.7 — confirmed 2026-06-02
 
-Close issue #191 *for OpenVPN profiles whose server is configured for inline static-challenge authentication.* Detect the `static-challenge` directive in the .ovpn config, extend the auth overlay (TUI) and `vortix connect` (CLI) to capture an OTP alongside username/password, and write the auth file's line 2 in OpenVPN's SCRV1 envelope (`SCRV1:base64(password):base64(otp)`). OpenVPN consumes the auth file via the existing `--auth-user-pass <path>` flag — no daemon-mode changes, no management socket, no new FSM state.
+This branch was originally scoped as Approach A: write the static-challenge OTP into the auth file as an SCRV1 envelope (`SCRV1:base64(password):base64(otp)` on line 2), let openvpn consume it via `--auth-user-pass <file>`, no daemon-mode changes. After implementation (U0–U6) shipped to a local test profile, the U0 manual spike was finally run against a real openvpn binary + the reporter's server config. **OpenVPN 2.7 does not consult the SCRV1 envelope in the auth file**: it prompts stdin for the OTP *before* the file is ever read.
 
-This is the narrow fix scoped at brainstorm time after the doc-review surfaced that the original Approach B (foreground supervisor + management socket) was selected on inference about the reporter's server type, not evidence. **The plan's closure of #191 is contingent on the reporter's server being static-challenge, not dynamic CRV1.** That evidence still has not been captured — the Pre-merge gate below blocks shipment on capturing it. If the server is dynamic CRV1, the brainstorm's Approach B becomes the next follow-up.
+Evidence (collected via `/tmp/vortix-debug-ovpn.sh` on 2026-06-02 against the user's `ovpn-totp.ovpn` profile, `OpenVPN 2.7.0 aarch64-apple-darwin24.6.0`, three zombie connect attempts left in the process table):
+
+- The parameter dump showed `username = '[UNDEF]'` even though `--auth-user-pass <SCRV1-file>` was passed — the file had not been read.
+- The next stdout line was `CHALLENGE: Enter TOTP code`, emitted at us=289606 (sub-second into startup), *before* any `Resolving remote` / `TCP/UDP link` / `TLS handshake` log lines that would mark the network-auth phase.
+- The process then blocked reading stdin. No `--daemon` fork occurred, no `Initialization Sequence Completed` line appeared, no `.pid` / `.log` files were created.
+- Repeating with the canonical 2-line `<user>\n<password>\n` auth file produced identical output (same prompt, same hang).
+
+The OpenVPN man page now confirms: *"The challenge string in t will be passed to the management interface (or be shown on the user's terminal) before the username and password are entered."* The auth-user-pass file is read *after* the interactive prompt, and there is no documented path in OpenVPN 2.7 for the SCRV1 envelope to come from anywhere other than the management interface or stdin.
+
+**The conclusion is unambiguous: Approach A — as originally specified — cannot close #191 on OpenVPN 2.7.** The fix the issue actually needs is Approach B (foreground supervised child + management socket), which the brainstorm's own adversarial reviewer flagged ("foregrounded supervised child reverses a deliberate architectural choice documented in code — without refuting the original reason"). The Pre-merge Gate (now satisfied as a "no, escalate to Approach B" outcome) prevented a fix-that-isn't from landing as a #191 closer.
+
+## What this branch ships now
+
+Despite Approach A being broken end-to-end, the eight commits on this branch contain reusable infrastructure for Approach B. Treat the branch as **a foundational stack**, not a user-visible fix. None of these change runtime behavior for profiles without a `static-challenge` directive — non-MFA OpenVPN, WireGuard, and the existing auth overlay are byte-for-byte unchanged.
+
+| Surface | Status | Survives Approach B? |
+|---|---|---|
+| `static-challenge` directive parser (U1) | ✅ working, fully tested | Yes — Approach B needs the same flag to decide whether to capture the OTP |
+| `base64` STANDARD-engine SCRV1 envelope helpers (U2) | ✅ working, fully tested | Yes — Approach B sends SCRV1 over the management socket, same envelope format |
+| Startup stale-SCRV1 scrubber (U6) | ✅ working, fully tested | Yes — Approach B may still write transient files; the scrub is a safety net |
+| TUI 3-field auth overlay + tab cycle + always-mask + collapsed spacing (U3) | ✅ working visually | **Probably no** — Approach B's design is a separate Mid-Connect Prompt overlay tied to the `AwaitingUserInput` FSM state, fired *after* openvpn emits the challenge. U3's pre-spawn overlay would be deleted. The auth-overlay extension is the largest single piece of throwaway code on this branch. |
+| CLI masked OTP prompt + RawModeGuard (U4) | ✅ working as a UX surface | Yes — Approach B's CLI still needs an interactive prompt; the helper is independent of *when* it fires |
+| Manual-testing rows 76–83 (U5) | Reframe needed | Most rows describe the Approach A success path; they won't pass. Update to "pending Approach B" or move to that future plan. |
+| Connect-path overlay fires for static-challenge + saved creds (commit `68465bf`) | Behavior survives | Yes — Approach B needs the same "always show prompt for MFA profiles" gate |
+| Post-submit gate bypass (`connect_profile_after_auth`, commit `9c10940`) | Behavior survives | Yes — same submit-loop concern applies to Approach B's flow |
+| SCRV1-to-transient-sibling pattern + `OvpnTunnel.scrv1_auth_path` (commit `9d2c09c`) | Currently unused | Likely deleted under Approach B — the management socket sends SCRV1 in-band, no file needed |
+
+## Recommended next steps
+
+1. **Do NOT close issue #191 with this branch.** Approach A confirmed broken on OpenVPN 2.7; merging without a working user-visible fix would be misleading.
+2. **Update issue #191** with the OpenVPN 2.7 diagnostic output (above) so the next investigation starts from this evidence.
+3. **Open a new brainstorm** for Approach B with the OpenVPN 2.7 finding as a load-bearing input: management socket is the *only* viable transport on modern openvpn; there is no longer a "static-challenge via file" alternative to weigh against it.
+4. **Decide whether to merge this branch as-is.** Two options:
+   - **Merge as Approach B infrastructure.** Keep the parser + SCRV1 helpers + CLI prompt + overlay scaffolding. Approach B picks up the pieces it needs and rewrites the rest. The TUI 3-field overlay would be marked as `#[allow(dead_code)]` or deleted in the Approach B PR.
+   - **Discard the branch.** Cherry-pick only the parser (U1) and SCRV1 helpers (U2) into a tiny prep PR; let Approach B start from there. Cleaner history, less Approach B mental load.
+
+The author's recommendation is to merge as infrastructure (option a). The auth-overlay extension is the only piece that genuinely won't survive; everything else accelerates Approach B by 1–2 days at the cost of a small `dead_code` allowance until Approach B's first PR lands.
 
 ---
-
-## Pre-merge gate
-
-Before U1–U6 are merged and #191 is announced as closed, the implementer must:
-
-1. **Comment on issue #191** asking the reporter for an `openvpn --verb 4` log excerpt (or the literal text of the `>PASSWORD:` line that openvpn emits when their connect hangs). Acceptable substitutes: a sanitized copy of the server-side `static-challenge` directive, or a screenshot of the CLI hang showing the prompt text.
-2. **Inspect the artifact:**
-   - If the artifact shows `SC:1,<prompt>` on a `>PASSWORD:Need 'Auth'` line OR a `static-challenge "<prompt>" <0|1>` directive in the server config → server is **static-challenge** → proceed; this plan closes #191.
-   - If the artifact shows `Verification Failed: 'Auth' ['CHALLENGE: <text>']` on a `>PASSWORD:` line OR no `static-challenge` directive on the server → server is **dynamic CRV1** → **stop**; this plan does not close #191. Escalate to a fresh brainstorm for Approach B (foreground supervisor + management socket).
-3. **Record the evidence in the PR description** before merging so future reviewers can audit the decision.
-
-Until the gate is cleared, this plan ships in a feature branch but is not announced as a fix for #191. The gate is cheap (one comment, one re-read) and prevents shipping a fix-that-isn't.
 
 ---
 
