@@ -105,83 +105,85 @@ pub fn render(
     //   - value: masked password / OTP renders as filled-circle dots;
     //     cursor block sits inline; non-focused rows show muted text
     //     without a blinking cursor
-    let row = |label: &str,
-               value: &str,
-               cursor: usize,
-               mask: bool,
-               focused: bool|
-     -> Line<'static> {
-        let display_text: String = if mask {
-            "\u{25CF}".repeat(value.chars().count())
-        } else {
-            value.to_string()
-        };
-
-        let marker = if focused { "\u{25B8}" } else { " " }; // ▸
-
-        let label_style = if focused {
-            Style::default()
-                .fg(theme::ACCENT_PRIMARY)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme::TEXT_SECONDARY)
-        };
-
-        // Truncate over-long labels to keep the value column aligned;
-        // pad shorter labels with spaces. Both arms always produce
-        // exactly LABEL_WIDTH visible chars.
-        let label_text: String = {
-            let count = label.chars().count();
-            if count > LABEL_WIDTH {
-                label.chars().take(LABEL_WIDTH).collect()
+    let row =
+        |label: &str, value: &str, cursor: usize, mask: bool, focused: bool| -> Line<'static> {
+            let display_text: String = if mask {
+                "\u{25CF}".repeat(value.chars().count())
             } else {
-                let mut s = label.to_string();
-                s.push_str(&" ".repeat(LABEL_WIDTH - count));
-                s
-            }
-        };
-
-        let mut spans: Vec<Span<'static>> = vec![
-            Span::styled(
-                format!("   {marker} "),
-                Style::default().fg(theme::ACCENT_PRIMARY),
-            ),
-            Span::styled(label_text, label_style),
-            Span::raw("  "),
-        ];
-
-        if focused {
-            // Split the displayed value around the cursor position so
-            // the cursor block falls between the right characters when
-            // the user moves left/right inside the field.
-            let before: String = display_text.chars().take(cursor).collect();
-            let cursor_char: String = display_text
-                .chars()
-                .nth(cursor)
-                .map_or_else(|| "\u{2588}".to_string(), |c| c.to_string()); // █
-            let after: String = display_text.chars().skip(cursor + 1).collect();
-            spans.push(Span::styled(before, Style::default().fg(theme::TEXT_PRIMARY)));
-            spans.push(Span::styled(
-                cursor_char,
-                Style::default()
-                    .fg(theme::ACCENT_SECONDARY)
-                    .add_modifier(Modifier::REVERSED)
-                    .add_modifier(Modifier::SLOW_BLINK),
-            ));
-            spans.push(Span::styled(after, Style::default().fg(theme::TEXT_PRIMARY)));
-        } else {
-            // Non-focused rows: show the value muted; empty values
-            // render an em-dash placeholder so the row never looks
-            // visually broken on first paint.
-            let shown = if display_text.is_empty() {
-                "\u{2014}".to_string() // —
-            } else {
-                display_text
+                value.to_string()
             };
-            spans.push(Span::styled(shown, Style::default().fg(theme::INACTIVE)));
-        }
-        Line::from(spans)
-    };
+
+            let marker = if focused { "\u{25B8}" } else { " " }; // ▸
+
+            let label_style = if focused {
+                Style::default()
+                    .fg(theme::ACCENT_PRIMARY)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme::TEXT_SECONDARY)
+            };
+
+            // Truncate over-long labels to keep the value column aligned;
+            // pad shorter labels with spaces. Both arms always produce
+            // exactly LABEL_WIDTH visible chars.
+            let label_text: String = {
+                let count = label.chars().count();
+                if count > LABEL_WIDTH {
+                    label.chars().take(LABEL_WIDTH).collect()
+                } else {
+                    let mut s = label.to_string();
+                    s.push_str(&" ".repeat(LABEL_WIDTH - count));
+                    s
+                }
+            };
+
+            let mut spans: Vec<Span<'static>> = vec![
+                Span::styled(
+                    format!("   {marker} "),
+                    Style::default().fg(theme::ACCENT_PRIMARY),
+                ),
+                Span::styled(label_text, label_style),
+                Span::raw("  "),
+            ];
+
+            if focused {
+                // Split the displayed value around the cursor position so
+                // the cursor block falls between the right characters when
+                // the user moves left/right inside the field.
+                let before: String = display_text.chars().take(cursor).collect();
+                let cursor_char: String = display_text
+                    .chars()
+                    .nth(cursor)
+                    .map_or_else(|| "\u{2588}".to_string(), |c| c.to_string()); // █
+                let after: String = display_text.chars().skip(cursor + 1).collect();
+                spans.push(Span::styled(
+                    before,
+                    Style::default().fg(theme::TEXT_PRIMARY),
+                ));
+                spans.push(Span::styled(
+                    cursor_char,
+                    Style::default()
+                        .fg(theme::ACCENT_SECONDARY)
+                        .add_modifier(Modifier::REVERSED)
+                        .add_modifier(Modifier::SLOW_BLINK),
+                ));
+                spans.push(Span::styled(
+                    after,
+                    Style::default().fg(theme::TEXT_PRIMARY),
+                ));
+            } else {
+                // Non-focused rows: show the value muted; empty values
+                // render an em-dash placeholder so the row never looks
+                // visually broken on first paint.
+                let shown = if display_text.is_empty() {
+                    "\u{2014}".to_string() // —
+                } else {
+                    display_text
+                };
+                spans.push(Span::styled(shown, Style::default().fg(theme::INACTIVE)));
+            }
+            Line::from(spans)
+        };
 
     // ── Build the body ──
     let mut text: Vec<Line> = Vec::with_capacity(if has_otp_field { 12 } else { 10 });
@@ -233,10 +235,7 @@ pub fn render(
         "\u{2610}" // ☐
     };
     let (marker, marker_style) = if checkbox_focused {
-        (
-            "\u{25B8}",
-            Style::default().fg(theme::ACCENT_PRIMARY),
-        )
+        ("\u{25B8}", Style::default().fg(theme::ACCENT_PRIMARY))
     } else {
         (" ", Style::default().fg(theme::ACCENT_PRIMARY))
     };
@@ -250,10 +249,7 @@ pub fn render(
     text.push(Line::from(vec![
         Span::styled(format!("   {marker} "), marker_style),
         Span::styled(format!("{checkbox_icon}  "), checkbox_style),
-        Span::styled(
-            "Save credentials for future sessions",
-            checkbox_style,
-        ),
+        Span::styled("Save credentials for future sessions", checkbox_style),
     ]));
 
     frame.render_widget(Paragraph::new(text).alignment(Alignment::Left), inner);
