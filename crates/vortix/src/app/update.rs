@@ -718,7 +718,11 @@ impl App {
                 }
 
                 if connect_after {
-                    self.connect_profile(idx);
+                    // Call the post-auth connect path so the
+                    // static-challenge gate in `connect_profile_inner`
+                    // doesn't re-open the overlay we just closed —
+                    // the OTP is already baked into the auth file.
+                    self.connect_profile_after_auth(idx);
                     // After the connect path returns (success or failure),
                     // restore the canonical auth file to plain text so the
                     // single-use OTP never lingers on disk. Best-effort:

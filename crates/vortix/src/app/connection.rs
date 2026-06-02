@@ -150,18 +150,26 @@ impl App {
     /// #001 U7) before the existing tunnel-up flow; on conflict, fires the
     /// appropriate overlay and returns without touching the tunnel.
     pub(crate) fn connect_profile(&mut self, idx: usize) {
-        self.connect_profile_inner(idx, false);
+        self.connect_profile_inner(idx, false, false);
     }
 
     /// Bypass the multi-connection conflict check and force the connect.
     /// Called after the user accepts the [`InputMode::ConfirmDefaultRouteTakeover`]
     /// or [`InputMode::ConfirmRouteOverlap`] overlay.
     pub(crate) fn connect_profile_forced(&mut self, idx: usize) {
-        self.connect_profile_inner(idx, true);
+        self.connect_profile_inner(idx, true, false);
+    }
+
+    /// Connect immediately after the user submitted the auth overlay. Skips
+    /// the static-challenge gate that would otherwise re-open the overlay
+    /// (plan 2026-06-02-001 U3 — the OTP has just been written into the
+    /// auth file; re-prompting would loop).
+    pub(crate) fn connect_profile_after_auth(&mut self, idx: usize) {
+        self.connect_profile_inner(idx, false, true);
     }
 
     #[allow(clippy::too_many_lines)]
-    fn connect_profile_inner(&mut self, idx: usize, force: bool) {
+    fn connect_profile_inner(&mut self, idx: usize, force: bool, skip_auth_overlay: bool) {
         // Clone needed data to release borrow on self
         let (name, protocol, config_path, cmd_tx) =
             if let Some(profile) = self.runtime.profiles.get(idx) {
@@ -218,7 +226,10 @@ impl App {
         //     non-MFA `auth-user-pass` profiles. Show the overlay only
         //     when creds aren't saved; saved-creds connects go straight
         //     through.
-        if matches!(protocol, Protocol::OpenVPN) && utils::openvpn_config_needs_auth(&config_path) {
+        if !skip_auth_overlay
+            && matches!(protocol, Protocol::OpenVPN)
+            && utils::openvpn_config_needs_auth(&config_path)
+        {
             let static_challenge_prompt = utils::read_openvpn_static_challenge_prompt(&config_path);
             let saved = utils::read_openvpn_saved_auth(&name);
             let force_overlay = static_challenge_prompt.is_some();

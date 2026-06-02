@@ -1287,6 +1287,44 @@ fn test_auth_submit_with_otp_and_save_restores_plain_after_connect() {
 }
 
 #[test]
+fn test_auth_submit_does_not_reopen_overlay_for_static_challenge_profile() {
+    // Regression for the submit-loop bug discovered after U3 landed:
+    // handle_auth_submit calls connect_profile, which (via the
+    // overlay-fires-fix) used to see static_challenge.is_some() and
+    // re-open the auth overlay with an empty OTP — so pressing Enter
+    // appeared to do nothing because the freshly-opened overlay was
+    // then overwritten by the pre-submit values. The fix routes the
+    // post-submit connect through connect_profile_after_auth, which
+    // skips the overlay gate. This test asserts input_mode lands on
+    // Normal (or Connecting) — never on a re-opened AuthPrompt.
+    let mut app = test_app();
+    let tmp = tempfile::Builder::new()
+        .prefix("vortix_auth_")
+        .tempdir()
+        .unwrap();
+    add_openvpn_profiles_with_static_challenge(&mut app, &["mfa-resubmit"], tmp.path());
+    app.runtime.is_root = true;
+    crate::utils::delete_openvpn_auth_file("mfa-resubmit");
+
+    app.handle_message(Message::AuthSubmit {
+        idx: 0,
+        username: "u".to_string(),
+        password: "p".to_string(),
+        otp: Some("123456".to_string()),
+        save: true,
+        connect_after: true,
+    });
+
+    assert!(
+        !matches!(app.input_mode, InputMode::AuthPrompt { .. }),
+        "AuthSubmit must NOT re-open the AuthPrompt overlay for a static-challenge profile; got {:?}",
+        app.input_mode
+    );
+
+    crate::utils::delete_openvpn_auth_file("mfa-resubmit");
+}
+
+#[test]
 fn test_auth_submit_with_otp_no_save_deletes_file() {
     // Plan 2026-06-02-001 U3 / PF-4: when `save=false` AND `otp=Some(...)`,
     // the auth file must be deleted after the connect call returns —
