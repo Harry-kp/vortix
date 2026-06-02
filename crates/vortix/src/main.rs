@@ -114,6 +114,12 @@ fn main() -> Result<()> {
     // Store the resolved config dir globally so all utility functions use it
     config::set_config_dir(config_dir.clone());
 
+    // U6 (plan 2026-06-02-001, #191): clear any SCRV1 envelopes left on
+    // disk by a previous crash mid-connect. Runs once at startup before
+    // the CLI/TUI fork so both paths see a clean auth dir. Cheap O(N)
+    // scan; failures are swallowed.
+    vortix::utils::scrub_stale_scrv1_auth_files();
+
     // Plan #009 U13: session-liveness sweep of `${config_dir}/tmp/`. Any
     // per-session subdir whose name does not match the current journal
     // `session_id` is, by construction, a crash orphan — every session has a

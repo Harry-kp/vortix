@@ -403,6 +403,61 @@ pub fn delete_openvpn_auth_file(profile_name: &str) {
     }
 }
 
+/// Scan the OpenVPN auth directory for files whose line 2 is an SCRV1
+/// envelope, and delete them.
+///
+/// Safety net for the crash-window in [`write_openvpn_auth_file`]'s SCRV1
+/// flow: the connect path writes the envelope, spawns openvpn, then restores
+/// plain text. If vortix is killed (SIGKILL, panic mid-restore, system OOM)
+/// in that window, the file persists in SCRV1 form. On the next vortix
+/// start, the saved password slot (`read_openvpn_saved_auth`) would surface
+/// the SCRV1 string as-if it were the user's password, and the auth-overlay
+/// guard at `app/connection.rs` would skip prompting and feed the stale
+/// envelope to openvpn — which then auth-fails silently with no UX recovery
+/// path short of manually deleting the file.
+///
+/// The cleanup is delete, not rewrite-to-plain: SCRV1 is a one-way encoding
+/// of the credentials but the OTP inside it is single-use, and we cannot
+/// reconstruct the user's original plain password from the SCRV1 envelope
+/// alone. Deletion forces the next connect to re-prompt for credentials,
+/// which is the correct UX after a crash.
+///
+/// Silently skips files we can't read, can't parse, or can't delete — the
+/// scrubber must not block app startup. Each deletion is logged at warn
+/// level with the profile name (NOT the envelope content).
+pub fn scrub_stale_scrv1_auth_files() {
+    let Ok(root) = get_app_config_dir() else {
+        return;
+    };
+    let auth_dir = root.join(crate::constants::OPENVPN_AUTH_DIR);
+    let Ok(entries) = std::fs::read_dir(&auth_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("auth") {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Some(line2) = content.lines().nth(1) else {
+            continue;
+        };
+        if line2.starts_with("SCRV1:") {
+            let profile = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("<unknown>");
+            tracing::warn!(
+                profile = %profile,
+                "AUTH: stale SCRV1 in auth file — clearing"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
 /// Checks whether an `OpenVPN` config file contains `auth-user-pass` without a file argument.
 ///
 /// Returns `true` if the config has a bare `auth-user-pass` directive (meaning
@@ -1262,6 +1317,42 @@ mod tests {
         let otp_b64 = parts.next().unwrap();
         assert_eq!(BASE64.decode(pw_b64).unwrap(), pw.as_bytes());
         assert_eq!(BASE64.decode(otp_b64).unwrap(), otp.as_bytes());
+    }
+
+    #[test]
+    fn scrub_deletes_scrv1_files_and_leaves_plain_alone() {
+        let _tmp = set_temp_config_dir();
+        // Seed three auth files: plain (should stay), SCRV1 (should
+        // be deleted), and a malformed file with only one line (treated
+        // as plain — left alone).
+        let plain = write_openvpn_auth_file("scrub-plain", "u", "p", None).unwrap();
+        let scrv1 = write_openvpn_auth_file("scrub-scrv1", "u", "p", Some("123456")).unwrap();
+        let one_line = get_openvpn_auth_path("scrub-oneline").unwrap();
+        std::fs::write(&one_line, "only-username\n").unwrap();
+        assert!(plain.exists());
+        assert!(scrv1.exists());
+        assert!(one_line.exists());
+
+        scrub_stale_scrv1_auth_files();
+
+        assert!(plain.exists(), "plain auth file must survive scrub");
+        assert!(!scrv1.exists(), "SCRV1 auth file must be deleted by scrub");
+        assert!(
+            one_line.exists(),
+            "single-line file (no line 2) must survive scrub"
+        );
+
+        delete_openvpn_auth_file("scrub-plain");
+        delete_openvpn_auth_file("scrub-oneline");
+    }
+
+    #[test]
+    fn scrub_no_op_when_auth_dir_missing() {
+        // Set a temp config dir with no `auth/` subdir created. The scrub
+        // must not panic or error.
+        let _tmp = set_temp_config_dir();
+        scrub_stale_scrv1_auth_files();
+        // No assertion needed — the test passes by not panicking.
     }
 
     #[cfg(unix)]
