@@ -687,10 +687,21 @@ write_files:
       ./easyrsa gen-dh
       openvpn --genkey secret /etc/openvpn/easy-rsa/pki/ta.key
 
-      # PAM: password + TOTP
+      # PAM: password + TOTP.
+      #
+      # NOTE: pam_google_authenticator.so's "user=" option is NOT a token
+      # — it expects a fixed UID/name and the module literally calls
+      # getpwnam() on the value. Passing "\${USER}" makes it look up a
+      # user named "\${USER}" and fail with:
+      #   pam_google_authenticator: Failed to look up user "\${USER}"
+      # The "secret=" option DOES support \${USER} expansion (it's a magic
+      # token implemented in the module's C source). So we keep secret=
+      # using \${USER} but omit "user=" entirely — the module's default
+      # is to run as the authenticating user, which is exactly what we
+      # want.
       cat > /etc/pam.d/openvpn-totp <<PAMEOF
       auth    required    pam_unix.so
-      auth    required    pam_google_authenticator.so secret=/home/\${USER}/.google_authenticator user=\${USER}
+      auth    required    pam_google_authenticator.so secret=/home/\${USER}/.google_authenticator
       account required    pam_permit.so
       PAMEOF
 
