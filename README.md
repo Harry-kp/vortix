@@ -86,16 +86,16 @@ If you use Vortix on Linux and hit a problem, please open an issue and include `
 |------------|-------|-------|---------|
 | `openvpn` | `brew install openvpn` | `apt install openvpn` | OpenVPN sessions |
 | `wireguard-tools` | `brew install wireguard-tools` | `apt install wireguard-tools` | WireGuard sessions |
-| `resolvconf` / `systemd-resolved` | N/A (uses native DNS) | `systemd-resolvconf` or `openresolv` | WireGuard DNS management (optional, needed if DNS in config) |
+| `resolvconf` / `systemd-resolved` | N/A (uses native DNS) | Auto-detected; see DNS note below | WireGuard DNS management (only on non-resolved hosts) |
 | `iptables` or `nftables` | N/A (uses `pfctl`) | Pre-installed | Kill switch |
 
 > Vortix checks for missing tools at startup and shows a warning toast with install instructions.
 > Interface inspection, network stats, DNS detection, HTTP telemetry, ICMP latency, and clipboard handoff now run in-process — no `curl`, `ping`, `which`, `ifconfig`, `ip addr`, `ps`, `netstat`, `lsof`, `scutil`, `pbcopy`, or `xclip` shell-out required.
 
-**DNS tools note:** If your WireGuard profile includes a `DNS =` directive, Vortix will automatically detect and warn about missing DNS tools. Install accordingly:
-- **Arch/Fedora (systemd-based):** `sudo pacman -S systemd-resolvconf` or `sudo dnf install systemd-resolved`
-- **Debian/Ubuntu:** `sudo apt install systemd-resolved` (usually pre-installed)
-- **Alpine/Void (OpenRC):** Vortix falls back to `/etc/resolv.conf` editing automatically
+**DNS tools note:** If your WireGuard profile includes a `DNS =` directive, Vortix manages per-link DNS itself:
+- **systemd-resolved hosts (Arch / Omarchy, NixOS with `services.resolved.enable = true`, default Fedora Workstation):** no extra package required. Vortix calls `resolvectl` (shipped with systemd) to register the tunnel's DNS server on the kernel interface. The legacy `systemd-resolvconf` / `openresolv` shim is no longer needed on these distros.
+- **Non-resolved Linux (Debian/Ubuntu without resolved, etc.):** Vortix falls back to `wg-quick`'s built-in `resolvconf` path — install `openresolv` if your distro doesn't ship one (`sudo apt install openresolv`).
+- **Alpine/Void (OpenRC):** `/etc/resolv.conf` editing as the universal fallback.
 
 ### Build dependencies (source installs only)
 
@@ -116,10 +116,10 @@ sudo dnf install wireguard-tools openvpn iptables systemd-resolved
 
 **Arch Linux** (only needed for source builds — `pacman -S vortix` handles deps automatically):
 ```bash
-sudo pacman -S wireguard-tools openvpn iptables systemd-resolvconf
+sudo pacman -S wireguard-tools openvpn iptables
 ```
 
-> **DNS management:** Vortix uses `resolvconf` (via `systemd-resolvconf` or `openresolv`) to manage DNS when your WireGuard profile contains `DNS =`. On systemd distros (most modern Linux), this is automatic via systemd-resolved. Non-systemd distros (Alpine, Void, Gentoo OpenRC) will use `/etc/resolv.conf` editing as a fallback.
+> **DNS management:** When your WireGuard profile contains `DNS =`, Vortix detects systemd-resolved and registers per-link DNS via `resolvectl` directly (no `systemd-resolvconf` / `openresolv` shim required). On non-resolved Linux Vortix falls back to `wg-quick`'s built-in `resolvconf` path; install `openresolv` if your distro doesn't ship one. Non-systemd distros (Alpine, Void, Gentoo OpenRC) use `/etc/resolv.conf` editing.
 
 ## Installation
 
@@ -505,7 +505,7 @@ ip_api_fallbacks = ["https://api.ipify.org", "https://icanhazip.com", "https://i
 
 | Error Message | Cause | Solution |
 |---------------|-------|----------|
-| `Missing dependencies: resolvconf (systemd)` | WireGuard profile has DNS but `resolvconf` not installed | Run `sudo pacman -S systemd-resolvconf` (Arch) or `sudo dnf install systemd-resolved` (Fedora) |
+| `Missing dependencies: resolvconf (systemd)` | WireGuard profile has DNS, systemd-resolved is *not* the resolver, and no `resolvconf` shim is installed. If you're on a resolved host this error no longer fires — vortix routes DNS through `resolvectl` directly. | Run `sudo apt install openresolv` (or your distro's equivalent) **only on non-resolved Linux**. Resolved hosts need no extra package. |
 | `iptables-restore: unable to initialize table` | Cloud kernel doesn't support iptables; profile uses `AllowedIPs = 0.0.0.0/0` | Change `AllowedIPs` to `10.0.0.0/8` or disable kill switch |
 | `wg-quick: The config file must be a valid interface name` | Profile name > 15 characters | Rename: `vortix rename long-name short-name` |
 | `Connection succeeded but no internet` | `AllowedIPs` doesn't include your target | Add target IP to `AllowedIPs` in config |
@@ -535,21 +535,20 @@ sudo chown -R $(whoami) ~/.config/vortix/
 
 #### Q: Connection fails with "Missing dependencies: resolvconf (systemd)"
 
-**A:** This happens on Arch, Fedora, and NixOS when your WireGuard profile has DNS settings but `resolvconf` isn't installed. These distros don't include DNS management tools by default.
+**A:** Since v0.4 vortix manages per-link DNS via `resolvectl` directly on systemd-resolved hosts — Arch, Omarchy, NixOS with `services.resolved.enable = true`, and default Fedora Workstation no longer need the `systemd-resolvconf` / `openresolv` shim package.
 
-**Fix:**
+This error now only fires when:
+- Your `.conf` has `DNS = …`, AND
+- systemd-resolved is NOT the host's resolver (or resolved is installed but `resolvectl` itself is broken), AND
+- no working `resolvconf` shim is on PATH
+
+Fix it where it still applies (non-resolved Linux):
 ```bash
-# Arch Linux (systemd-based)
-sudo pacman -S systemd-resolvconf
-
-# Fedora (systemd-based)
-sudo dnf install systemd-resolved
-
-# Debian/Ubuntu (should be pre-installed)
-sudo apt install systemd-resolved
+sudo apt install openresolv          # Debian/Ubuntu without resolved
+sudo zypper install openresolv       # openSUSE
 ```
 
-Vortix will now automatically detect `resolvconf` and proceed with the connection. No restart needed.
+If you're on a resolved host and still see this error, your `resolvectl` probe is failing — run `resolvectl --version` to debug, then file an issue with the output.
 
 #### Q: Connection fails with "iptables-restore: unable to initialize table"
 
