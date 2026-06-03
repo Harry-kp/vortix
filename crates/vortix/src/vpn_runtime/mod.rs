@@ -624,11 +624,12 @@ impl VpnRuntime {
     }
 }
 
-/// Inputs to the WireGuard DNS-shim missing-dep decision. Wrapping the
+/// Inputs to the `WireGuard` DNS-shim missing-dep decision. Wrapping the
 /// four booleans in a struct keeps the call-site readable (named fields)
 /// and dodges the `fn_params_excessive_bools` lint while staying purely
 /// declarative — no behavior moves into the struct itself.
 #[derive(Debug, Clone, Copy)]
+#[allow(clippy::struct_excessive_bools)] // intentional flag record; mirrors TunnelCapabilities
 #[cfg(target_os = "linux")] // xtask:allow-platform-cfg: WG DNS-shim gate is Linux-only
 pub(crate) struct WireguardDnsGateInputs {
     pub has_dns_directive: bool,
@@ -637,7 +638,7 @@ pub(crate) struct WireguardDnsGateInputs {
     pub is_systemd_resolved: bool,
 }
 
-/// Pure decision logic for the WireGuard DNS-shim missing-dep label on Linux.
+/// Pure decision logic for the `WireGuard` DNS-shim missing-dep label on Linux.
 ///
 /// Returns `Some(label)` when the user must install a DNS-management shim,
 /// `None` when the connect can proceed. Split out so the four-quadrant
@@ -682,6 +683,7 @@ impl Drop for VpnRuntime {
 mod dns_gate_tests {
     use super::{wireguard_dns_missing_dep, WireguardDnsGateInputs};
 
+    #[allow(clippy::fn_params_excessive_bools)] // test fixture mirrors the WireguardDnsGateInputs shape
     fn inputs(
         has_dns_directive: bool,
         resolvectl_path_available: bool,

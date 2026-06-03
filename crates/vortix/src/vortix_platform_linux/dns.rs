@@ -15,9 +15,10 @@ const RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
 /// Timeout for each `resolvectl` invocation in [`set_link_dns`].
 ///
 /// 5s is generous for a healthy resolved (typical roundtrip is ~10ms over
-/// the local DBus / Varlink socket). Caps the failure window when resolved
-/// is wedged or DBus is stuck — the caller's fail-open posture surfaces
-/// the timeout as a `tracing::warn!` rather than blocking the connect.
+/// the local `DBus` / `Varlink` socket). Caps the failure window when
+/// resolved is wedged or `DBus` is stuck — the caller's fail-open posture
+/// surfaces the timeout as a `tracing::warn!` rather than blocking the
+/// connect.
 const RESOLVECTL_CALL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Linux DNS resolution with fallback chain:
@@ -58,7 +59,7 @@ impl std::error::Error for DnsManagerError {}
 ///
 /// Pure function — no I/O. Splits spec construction from execution so the
 /// invocation shape (program, args, timeout) can be unit-tested without
-/// fighting the process-wide runner OnceLock. The first spec is always
+/// fighting the process-wide runner `OnceLock`. The first spec is always
 /// the `resolvectl dns <iface> <ips...>` call; the second (present only
 /// when `authoritative` is `true`) is the `resolvectl domain <iface> ~.`
 /// call that marks the link as the catchall resolver.
@@ -211,7 +212,7 @@ mod tests {
     use super::*;
 
     fn args_of(spec: &CommandSpec) -> Vec<String> {
-        spec.args.iter().cloned().collect()
+        spec.args.to_vec()
     }
 
     // ── build_set_link_dns_specs (pure spec construction) ────────────────
