@@ -89,11 +89,68 @@ Pre-release human-verification checks. Every row here is something that CI can't
 | 81 | _(reserved — Approach B happy-path rows belong to the next plan)_ | — | — |
 | 82 | _(reserved — Approach B happy-path rows belong to the next plan)_ | — | — |
 | 83 | _(reserved — Approach B happy-path rows belong to the next plan)_ | — | — |
-| 84 | Fresh resolved-native distro connects WG-with-DNS without resolvconf shim | On a clean Omarchy / Arch + `systemd-resolved` host with NO `systemd-resolvconf` or `openresolv` installed (`pacman -Qi systemd-resolvconf` errors), import a WG profile containing `DNS = 1.1.1.1`. Connect via TUI or `vortix up`. Pass: dep-check does NOT raise `Missing dependencies: resolvconf (systemd)`; tunnel comes Connected; `resolvectl status <iface>` shows `DNS Servers: 1.1.1.1` and `Default Route: yes`. Issue #190 acceptance signal. | Headline #190 verification; needs a fresh systemd-resolved host without the shim |
+| 84 | Fresh resolved-native distro connects WG-with-DNS without resolvconf shim | On a clean Omarchy / Arch + `systemd-resolved` host with NO `systemd-resolvconf` or `openresolv` installed (`pacman -Qi systemd-resolvconf` errors), import a WG profile containing `DNS = 1.1.1.1` (use `scripts/test-profiles/wg-full.conf`). Connect via TUI or `vortix up wg-full`. Pass: dep-check does NOT raise `Missing dependencies: resolvconf (systemd)`; tunnel comes Connected; `resolvectl status wg-full` shows `DNS Servers: 1.1.1.1` and `Default Route: yes`. Issue #190 acceptance signal. See "Linux test environments for rows 84–88" below for a 5-min Colima/Lima setup on macOS. | Headline #190 verification; needs a fresh systemd-resolved host without the shim |
 | 85 | Default Fedora Workstation connects WG-with-DNS without openresolv | Fedora 39+ default install (resolved is the default since F33), `openresolv` NOT installed (`dnf list installed openresolv` empty). Same WG profile + connect as #84. Pass: same observations as #84. | Confirms the path works across the two major resolved-shipping distros |
-| 86 | Multi-tunnel on resolved registers per-link DNS for both, primary owns catchall | On a resolved host, connect a primary WG profile and a secondary WG profile (different `AllowedIPs`, different `DNS = …` values). Pass: `resolvectl status` lists BOTH interfaces with their respective DNS servers; only the primary shows `Default Route: yes`; secondary shows the DNS but no default route. Verify `resolvectl query -i <secondary-iface> some.host` resolves via the secondary's DNS. | R3 acceptance; needs real resolved + two distinct profiles |
-| 87 | Fail-open path: resolvectl failure mid-connect leaves tunnel up | On a resolved host with a WG profile that has `DNS = …`, set up a script that does `sudo systemctl stop systemd-resolved` AFTER you press connect but BEFORE the connect-success path fires (or block `resolvectl` via a permissions trick). Connect. Pass: `wg-quick up` succeeds, the tunnel reaches Connected, sidebar shows the normal connected sigil, `journalctl -u vortix` (or stderr with `RUST_LOG=vortix::tunnel::wireguard=warn`) contains the `resolvectl set_link_dns failed` warn line, tunnel still routes packets. R5 acceptance — fail-open posture. | Failure-window timing on real resolved; can't be simulated by unit tests |
-| 88 | Resolved auto-clears link state on `vortix down` (no explicit revert call needed) | On a resolved host with a WG tunnel up under the new path, run `resolvectl status <iface>` and capture the DNS / Default Route lines. Disconnect: `vortix down <profile>`. Pass: `resolvectl status` no longer lists the iface (or `resolvectl status <iface>` returns "link not found"). No residual per-link DNS registration. R6 acceptance — verifies the "no explicit revert" decision empirically. If this FAILS, add `resolvectl revert <iface>` to `WgTunnel::down()` as a follow-up. | Verifies resolved's documented auto-cleanup on `ip link delete`; behaviour varies subtly across systemd versions |
+| 86 | Multi-tunnel on resolved registers per-link DNS for both, primary owns catchall | On a resolved host, connect `wg-full` (primary, `DNS = 1.1.1.1`) and `wg-split` (secondary, `DNS = 1.0.0.1`). Pass: `resolvectl status` lists BOTH interfaces with their respective DNS servers; only `wg-full` shows `Default Route: yes`; `wg-split` shows the DNS but no default route. Verify `resolvectl query -i wg-split google.com` resolves via the secondary's DNS. | R3 acceptance; needs real resolved + two distinct profiles |
+| 87 | Fail-open path: resolvectl failure mid-connect leaves tunnel up | On a resolved host with a WG profile that has `DNS = …`, set up a script that does `sudo systemctl stop systemd-resolved` AFTER you press connect but BEFORE the connect-success path fires (or block `resolvectl` via a permissions trick — `sudo chmod -x $(which resolvectl)` then restore after). Connect. Pass: `wg-quick up` succeeds, the tunnel reaches Connected, sidebar shows the normal connected sigil, `journalctl -u vortix` (or stderr with `RUST_LOG=vortix::tunnel::wireguard=warn`) contains the `resolvectl set_link_dns failed` warn line, tunnel still routes packets. R5 acceptance — fail-open posture. | Failure-window timing on real resolved; can't be simulated by unit tests |
+| 88 | Resolved auto-clears link state on `vortix down` (no explicit revert call needed) | On a resolved host with a WG tunnel up under the new path, run `resolvectl status wg-full` and capture the DNS / Default Route lines. Disconnect: `vortix down wg-full`. Pass: `resolvectl status` no longer lists the iface (or `resolvectl status wg-full` returns "link not found"). No residual per-link DNS registration. R6 acceptance — verifies the "no explicit revert" decision empirically. If this FAILS, add `resolvectl revert <iface>` to `WgTunnel::down()` as a follow-up. | Verifies resolved's documented auto-cleanup on `ip link delete`; behaviour varies subtly across systemd versions |
+
+## Linux test environments for rows 84–88
+
+The systemd-resolved DNS-integration path is Linux-only — `#[cfg(target_os = "linux")]` compiles it out on macOS / Windows hosts. To exercise rows 84–88 from a macOS development box, spin up a VM with a real Linux kernel + systemd-resolved. Lima (used under the hood by Colima) gives you that in ~1 minute.
+
+```bash
+# Already have Colima? You almost certainly have limactl too.
+which limactl  # if missing: brew install lima
+
+# Fedora 41 ships systemd-resolved on by default — perfect for row 85.
+# Arch (closer to the Omarchy reporter's setup, row 84) is also available
+# via `template://archlinux`. Pick one.
+limactl start --name=vortix-resolved template://fedora
+limactl shell vortix-resolved
+```
+
+Inside the VM:
+
+```bash
+# Sanity-check resolved is the resolver and resolvectl is on PATH.
+sudo systemctl is-active systemd-resolved   # → active
+resolvectl --version                         # → systemd 25x (…)
+
+# For row 84's Arch-flavoured setup, also confirm the shim is absent:
+#   dnf list installed openresolv systemd-resolvconf 2>/dev/null   # must be empty
+
+# Build vortix from the feature branch.
+sudo dnf install -y wireguard-tools cargo git iptables-services
+git clone https://github.com/Harry-kp/vortix.git
+cd vortix
+git checkout feat/systemd-resolved-dns   # or main, post-merge
+cargo install --path crates/vortix
+
+# Copy a WG profile in. From your Mac:
+#   limactl copy scripts/test-profiles/wg-full.conf  vortix-resolved:/tmp/wg-full.conf
+#   limactl copy scripts/test-profiles/wg-split.conf vortix-resolved:/tmp/wg-split.conf
+mkdir -p ~/.config/vortix/profiles
+cp /tmp/wg-full.conf  ~/.config/vortix/profiles/
+cp /tmp/wg-split.conf ~/.config/vortix/profiles/
+
+# Run the scenario. Note that the cargo-installed binary lives under the
+# invoking user's home; sudo's secure_path won't see it without a full path.
+sudo "$(which vortix)" up wg-full
+resolvectl status wg-full     # row 84/85 pass signal
+```
+
+For row 87's fail-open scenario, the cleanest reproduction is the `chmod -x` trick — it lets `wg-quick up` succeed (resolved is still running, just `resolvectl` can't be executed by vortix), so you observe the post-`wg-quick up` failure path specifically.
+
+For row 88's cleanup verification, capture `resolvectl status wg-full` BEFORE `vortix down`, run the down, capture again. Diff should show the link's DNS / Default Route entries gone.
+
+Cleanup when done:
+
+```bash
+limactl stop vortix-resolved && limactl delete vortix-resolved
+```
+
+The VM is disposable — rerun the whole sequence on a fresh VM if anything gets into a weird state.
 
 ## How to add a row
 
