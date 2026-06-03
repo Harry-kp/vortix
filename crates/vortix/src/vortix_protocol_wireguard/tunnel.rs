@@ -74,29 +74,72 @@ impl WgTunnel {
     }
 }
 
-/// Strip `DNS = …` lines from a `WireGuard` `.conf` body. The directive name
-/// is matched case-insensitively (wg-quick keys are case-insensitive); the
-/// rest of the file — comments, blank lines, trailing whitespace — is
-/// preserved verbatim so `PrivateKey`, `Address`, hooks, and peers reach
-/// wg-quick unchanged.
+/// Strip `DNS = …` lines from a `WireGuard` `.conf` body.
+///
+/// Wrapper around [`strip_and_capture_dns_directive`] kept for the
+/// equivalence-test surface — production callers go through the capture-
+/// aware function directly so they can pass the IP list to resolvectl
+/// (see `WgTunnel::up`).
+#[cfg(test)]
 #[must_use]
 pub(crate) fn strip_dns_directive(text: &str) -> String {
+    strip_and_capture_dns_directive(text).0
+}
+
+/// Strip `DNS = …` lines AND return the captured DNS server IPs.
+///
+/// Same stripping behaviour as [`strip_dns_directive`]: case-insensitive
+/// directive match, non-directive lines preserved verbatim. The captured
+/// list contains valid IP addresses (IPv4 + IPv6) in source order across
+/// every `DNS =` line. Non-IP entries on the RHS (wg-quick treats those as
+/// DNS search domains) are skipped — the caller is interested in resolver
+/// targets, not search suffixes. Trailing `#` and `;` comments on the
+/// directive line are stripped before parsing.
+#[must_use]
+pub(crate) fn strip_and_capture_dns_directive(text: &str) -> (String, Vec<String>) {
+    use std::net::IpAddr;
+    use std::str::FromStr;
+
     let mut out = String::with_capacity(text.len());
+    let mut ips: Vec<String> = Vec::new();
     for line in text.split_inclusive('\n') {
         let trimmed = line.trim_start();
         // Match "DNS" (case-insensitive) followed (after optional
         // whitespace) by '='. Anything else starting with "dns" (e.g. a
-        // comment that mentions DNS) is kept.
-        let is_dns = trimmed
+        // comment that mentions DNS, or a `dns_search = …` directive) is
+        // kept verbatim.
+        let after_dns = trimmed
             .strip_prefix(|c: char| c == 'D' || c == 'd')
             .and_then(|r| r.strip_prefix(|c: char| c == 'N' || c == 'n'))
-            .and_then(|r| r.strip_prefix(|c: char| c == 'S' || c == 's'))
-            .is_some_and(|r| r.trim_start().starts_with('='));
-        if !is_dns {
-            out.push_str(line);
+            .and_then(|r| r.strip_prefix(|c: char| c == 'S' || c == 's'));
+        let value_after_eq = after_dns.and_then(|r| {
+            let r = r.trim_start();
+            r.strip_prefix('=')
+        });
+
+        match value_after_eq {
+            Some(rhs) => {
+                // RHS may carry a trailing comment; strip everything from
+                // the first `#` or `;` onwards before splitting on commas.
+                let rhs_no_comment = rhs.split(['#', ';']).next().unwrap_or("");
+                for entry in rhs_no_comment.split(',') {
+                    let token = entry.trim();
+                    if token.is_empty() {
+                        continue;
+                    }
+                    if IpAddr::from_str(token).is_ok() {
+                        ips.push(token.to_string());
+                    }
+                    // Non-IP tokens are wg-quick DNS search domains; skip.
+                }
+                // Directive line itself is dropped from `out`.
+            }
+            None => {
+                out.push_str(line);
+            }
         }
     }
-    out
+    (out, ips)
 }
 
 /// Resolve the current `session_id` from the global journal, or fall back to
@@ -242,26 +285,57 @@ fn interface_from_path(path: &std::path::Path) -> String {
         .to_string()
 }
 
+/// Decide whether `WgTunnel::up()` should strip the `DNS = …` line before
+/// invoking `wg-quick up`.
+///
+/// Two reasons to strip:
+/// 1. Secondary tunnels (multi-tunnel guarantee: only the primary owns
+///    system DNS — wg-quick is not given DNS for secondaries).
+/// 2. Linux hosts on the resolvectl path: vortix takes over per-link DNS
+///    via `resolvectl` itself, so wg-quick must not attempt to call its
+///    own `resolvconf` shim.
+#[must_use]
+pub(crate) fn should_strip_dns(is_secondary: bool) -> bool {
+    if is_secondary {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    // xtask:allow-platform-cfg: resolvectl-path strip predicate is Linux-only
+    {
+        crate::utils::use_resolvectl_path()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
 impl Tunnel for WgTunnel {
     fn up(&mut self, profile: &Profile) -> Result<TunnelHandle, TunnelError> {
-        // Secondaries: read the user's `.conf`, strip `DNS = …`, write to a
-        // per-session temp file at mode 0o600, and `wg-quick up` against the
-        // temp path. The basename is preserved so `%i` substitution in any
-        // PostUp/PreDown hook still resolves to the user's original
-        // interface name.
-        let (effective_path, temp_path) = if self.is_secondary {
-            let user_body = std::fs::read_to_string(&profile.config_path).map_err(|e| {
-                TunnelError::Subprocess(format!(
-                    "read WG config {}: {e}",
-                    profile.config_path.display()
-                ))
-            })?;
-            let stripped = strip_dns_directive(&user_body);
-            let temp = write_secondary_temp_config(&profile.config_path, stripped.as_bytes())?;
-            (temp.clone(), Some(temp))
-        } else {
-            (profile.config_path.clone(), None)
-        };
+        // Strip the user's `DNS = …` line and run wg-quick against a
+        // sanitized copy when:
+        //   - this tunnel is a secondary in a multi-tunnel session, OR
+        //   - we're on Linux + systemd-resolved + resolvectl works (the
+        //     resolvectl path takes ownership of per-link DNS after up).
+        //
+        // The temp file's basename is preserved so wg-quick's interface
+        // name derivation — and any `%i` substitution in PostUp/PreDown
+        // hooks — stays equivalent to the user's original profile.
+        let strip_dns = should_strip_dns(self.is_secondary);
+        let (effective_path, temp_path, captured_dns_ips): (PathBuf, Option<PathBuf>, Vec<String>) =
+            if strip_dns {
+                let user_body = std::fs::read_to_string(&profile.config_path).map_err(|e| {
+                    TunnelError::Subprocess(format!(
+                        "read WG config {}: {e}",
+                        profile.config_path.display()
+                    ))
+                })?;
+                let (stripped, ips) = strip_and_capture_dns_directive(&user_body);
+                let temp = write_secondary_temp_config(&profile.config_path, stripped.as_bytes())?;
+                (temp.clone(), Some(temp), ips)
+            } else {
+                (profile.config_path.clone(), None, Vec::new())
+            };
 
         let path_str = effective_path.to_string_lossy().into_owned();
         info!(
@@ -307,6 +381,32 @@ impl Tunnel for WgTunnel {
                 .resolve_wireguard_interface(&basename),
             &profile.id,
         );
+
+        // On the resolvectl path with captured DNS servers, register
+        // per-link DNS via systemd-resolved now that wg-quick has brought
+        // the kernel interface up. Fail-open: on error the tunnel still
+        // works (packets flow, routes are installed) and the user's host
+        // resolver answers queries — log the failure and proceed.
+        #[cfg(target_os = "linux")]
+        // xtask:allow-platform-cfg: resolvectl set_link_dns is Linux-only
+        if !captured_dns_ips.is_empty() && crate::utils::use_resolvectl_path() {
+            let authoritative = !self.is_secondary;
+            if let Err(e) = crate::vortix_platform_linux::dns::set_link_dns(
+                &interface_name,
+                &captured_dns_ips,
+                authoritative,
+            ) {
+                tracing::warn!(
+                    target: "vortix::tunnel::wireguard",
+                    profile = %profile.id,
+                    interface = %interface_name,
+                    err = %e,
+                    "resolvectl set_link_dns failed; tunnel is up but DNS not registered via resolved"
+                );
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = captured_dns_ips;
 
         Ok(TunnelHandle {
             profile_id: profile.id.clone(),
@@ -511,6 +611,156 @@ mod tests {
         assert_eq!(strip_dns_directive(body), body);
     }
 
+    // ── strip_and_capture_dns_directive ──────────────────────────────────
+
+    #[test]
+    fn capture_dns_empty_input() {
+        let (out, ips) = strip_and_capture_dns_directive("");
+        assert_eq!(out, "");
+        assert!(ips.is_empty());
+    }
+
+    #[test]
+    fn capture_dns_no_directive_returns_input_verbatim() {
+        let body = "[Interface]\nPrivateKey = abc\nAddress = 10.0.0.2/24\n";
+        let (out, ips) = strip_and_capture_dns_directive(body);
+        assert_eq!(out, body);
+        assert!(ips.is_empty());
+    }
+
+    #[test]
+    fn capture_dns_single_ip() {
+        let body = "[Interface]\nPrivateKey = abc\nDNS = 1.1.1.1\n";
+        let (out, ips) = strip_and_capture_dns_directive(body);
+        assert!(!out.contains("DNS"));
+        assert_eq!(ips, vec!["1.1.1.1".to_string()]);
+    }
+
+    #[test]
+    fn capture_dns_comma_separated() {
+        let body = "[Interface]\nDNS = 1.1.1.1, 8.8.8.8\nAddress = 10.0.0.2/24\n";
+        let (_out, ips) = strip_and_capture_dns_directive(body);
+        assert_eq!(ips, vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()]);
+    }
+
+    #[test]
+    fn capture_dns_multiple_directive_lines_preserve_order() {
+        // A .conf may legally split DNS across multiple lines; capture
+        // every IP in source order.
+        let body = "[Interface]\nDNS = 1.1.1.1\nAddress = 10.0.0.2/24\nDNS = 8.8.8.8\n";
+        let (out, ips) = strip_and_capture_dns_directive(body);
+        assert!(!out.contains("DNS"));
+        assert_eq!(ips, vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()]);
+    }
+
+    #[test]
+    fn capture_dns_case_insensitive() {
+        // The directive name is case-insensitive (wg-quick keys are).
+        // Each capital/lowercase variant captures identically.
+        for variant in ["DNS = 1.1.1.1", "dns = 1.1.1.1", "Dns = 1.1.1.1"] {
+            let body = format!("[Interface]\n{variant}\nAddress = 10.0.0.2/24\n");
+            let (_out, ips) = strip_and_capture_dns_directive(&body);
+            assert_eq!(
+                ips,
+                vec!["1.1.1.1".to_string()],
+                "variant `{variant}` did not capture"
+            );
+        }
+    }
+
+    #[test]
+    fn capture_dns_whitespace_variation_around_equals() {
+        // wg-quick accepts the directive with arbitrary whitespace around
+        // `=`; the capture path must mirror that tolerance.
+        for variant in ["DNS=1.1.1.1", "DNS =1.1.1.1", "DNS  =  1.1.1.1"] {
+            let body = format!("[Interface]\n{variant}\nAddress = 10.0.0.2/24\n");
+            let (_out, ips) = strip_and_capture_dns_directive(&body);
+            assert_eq!(
+                ips,
+                vec!["1.1.1.1".to_string()],
+                "variant `{variant}` did not capture"
+            );
+        }
+    }
+
+    #[test]
+    fn capture_dns_ipv6() {
+        let body = "[Interface]\nDNS = 2001:db8::1\n";
+        let (_out, ips) = strip_and_capture_dns_directive(body);
+        assert_eq!(ips, vec!["2001:db8::1".to_string()]);
+    }
+
+    #[test]
+    fn capture_dns_mixed_ipv4_ipv6() {
+        let body = "[Interface]\nDNS = 1.1.1.1, 2001:db8::1\n";
+        let (_out, ips) = strip_and_capture_dns_directive(body);
+        assert_eq!(ips, vec!["1.1.1.1".to_string(), "2001:db8::1".to_string()]);
+    }
+
+    #[test]
+    fn capture_dns_strips_trailing_hash_comment() {
+        let body = "[Interface]\nDNS = 1.1.1.1  # corp resolver\n";
+        let (_out, ips) = strip_and_capture_dns_directive(body);
+        assert_eq!(ips, vec!["1.1.1.1".to_string()]);
+    }
+
+    #[test]
+    fn capture_dns_strips_trailing_semicolon_comment() {
+        let body = "[Interface]\nDNS = 1.1.1.1 ; corp resolver\n";
+        let (_out, ips) = strip_and_capture_dns_directive(body);
+        assert_eq!(ips, vec!["1.1.1.1".to_string()]);
+    }
+
+    #[test]
+    fn capture_dns_search_domains_dropped() {
+        // wg-quick treats non-IP tokens on the RHS as DNS search suffixes.
+        // resolvectl wants IPs, not suffixes, so non-IP tokens are dropped
+        // from the captured list while the directive line is still stripped.
+        let body = "[Interface]\nDNS = 1.1.1.1, corp.example.com\n";
+        let (out, ips) = strip_and_capture_dns_directive(body);
+        assert!(!out.contains("DNS"));
+        assert_eq!(ips, vec!["1.1.1.1".to_string()]);
+    }
+
+    #[test]
+    fn capture_dns_search_directive_is_not_dns() {
+        // `dns_search = …` looks DNS-ish but is not the wg-quick `DNS`
+        // directive; both the line and any IPs on it must be left alone.
+        let body = "[Interface]\ndns_search = corp.example.com\nPrivateKey = abc\n";
+        let (out, ips) = strip_and_capture_dns_directive(body);
+        assert!(out.contains("dns_search = corp.example.com"));
+        assert!(ips.is_empty());
+    }
+
+    #[test]
+    fn capture_dns_leading_whitespace_on_directive() {
+        let body = "[Interface]\n  DNS = 1.1.1.1\n";
+        let (out, ips) = strip_and_capture_dns_directive(body);
+        assert!(!out.contains("DNS"));
+        assert_eq!(ips, vec!["1.1.1.1".to_string()]);
+    }
+
+    #[test]
+    fn capture_dns_strip_path_is_byte_identical_to_legacy_helper() {
+        // Equivalence guard: anything the wrapper `strip_dns_directive`
+        // returned for a given input, the capture-aware function must
+        // return identically in its first tuple element. Prevents
+        // accidental drift between the two paths.
+        let bodies = [
+            "",
+            "[Interface]\nPrivateKey = abc\n",
+            "[Interface]\nDNS = 1.1.1.1\nAddress = 10.0.0.2/24\n",
+            "[Interface]\n  DNS  =  1.1.1.1, 8.8.8.8  # corp\n",
+            "[Interface]\ndns = 8.8.8.8\nDns=4.4.4.4\n",
+            "[Interface]\n# Custom DNS overrides below\nPrivateKey = abc\n",
+        ];
+        for body in bodies {
+            let legacy = strip_dns_directive(body);
+            let (capture, _ips) = strip_and_capture_dns_directive(body);
+            assert_eq!(legacy, capture, "drift for input `{body}`");
+        }
+    }
+
     /// Per-test isolation: build a fresh session-style subdir at mode `0o700`
     /// under a tempdir. Avoids touching the process-global `config_dir`
     /// (`OnceLock` → first-write-wins → races across tests when set in each).
@@ -711,10 +961,37 @@ mod tests {
         // We can't safely call `up()` here without owning the process-global
         // runner, but the structural invariant is observable directly: a
         // primary's `is_secondary` is false and its `temp_config_path`
-        // starts unset. The `up()` body's `if self.is_secondary { ... }`
-        // branch is the single source of truth for the temp-file path.
+        // starts unset. The `up()` body's strip predicate is the single
+        // source of truth for the temp-file path; see `should_strip_dns`
+        // tests below for the resolved-host coverage.
         let t = WgTunnel::new();
         assert!(!t.is_secondary());
         assert!(t.temp_config_path.is_none());
     }
+
+    // ── should_strip_dns ─────────────────────────────────────────────────
+
+    #[test]
+    fn should_strip_dns_secondary_always_true() {
+        // Independent of platform / resolvectl detection — secondaries
+        // always strip so the multi-tunnel "primary owns system DNS"
+        // contract holds regardless of which Linux DNS path is active.
+        assert!(should_strip_dns(true));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn should_strip_dns_primary_on_non_linux_is_false() {
+        // macOS / Windows: no resolvectl path; primary never strips
+        // (matches the legacy behaviour on those platforms).
+        assert!(!should_strip_dns(false));
+    }
+
+    // Linux primary behaviour depends on `use_resolvectl_path()` which
+    // probes systemd-resolved + resolvectl at runtime. That probe is
+    // host-state-dependent and not unit-testable from inside the crate
+    // (the global runner is mock-default-success, but `is_systemd_resolved`
+    // reads /etc/resolv.conf directly). Linux CI lanes + the manual-
+    // testing rows in `docs/manual-testing/backlog.md` cover the
+    // resolved-host integration matrix.
 }

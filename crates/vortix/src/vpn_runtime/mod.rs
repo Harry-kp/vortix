@@ -567,18 +567,24 @@ impl VpnRuntime {
                     missing.push("wireguard-tools".to_string());
                 }
                 // On Linux, wg-quick uses `resolvconf` to set DNS when the
-                // config contains a DNS directive.  We must verify that a
-                // working resolvconf is present — `openresolv` installed on
-                // a systemd-resolved system will exist but fail at runtime
-                // with "signature mismatch".
+                // config contains a DNS directive. Two escape hatches:
+                //   1. systemd-resolved + working `resolvectl` →
+                //      `WgTunnel::up` takes over per-link DNS via
+                //      `resolvectl` itself; no resolvconf shim needed.
+                //   2. A working `resolvconf` (openresolv on non-resolved
+                //      hosts; systemd-resolvconf shim on resolved hosts).
+                //
+                // Otherwise emit the missing-dep label with a hint at
+                // which shim the user actually needs.
                 #[cfg(target_os = "linux")]
                 // xtask:allow-platform-cfg: resolvconf check is Linux-only DNS plumbing
-                if utils::wireguard_config_has_dns(config_path) && !utils::resolvconf_works() {
-                    if utils::is_systemd_resolved() {
-                        missing.push("resolvconf (systemd)".to_string());
-                    } else {
-                        missing.push("resolvconf".to_string());
-                    }
+                if let Some(label) = wireguard_dns_missing_dep(WireguardDnsGateInputs {
+                    has_dns_directive: utils::wireguard_config_has_dns(config_path),
+                    resolvectl_path_available: utils::use_resolvectl_path(),
+                    resolvconf_works: utils::resolvconf_works(),
+                    is_systemd_resolved: utils::is_systemd_resolved(),
+                }) {
+                    missing.push(label);
                 }
                 #[cfg(not(target_os = "linux"))]
                 let _ = config_path; // suppress unused warning on non-Linux
@@ -618,6 +624,48 @@ impl VpnRuntime {
     }
 }
 
+/// Inputs to the WireGuard DNS-shim missing-dep decision. Wrapping the
+/// four booleans in a struct keeps the call-site readable (named fields)
+/// and dodges the `fn_params_excessive_bools` lint while staying purely
+/// declarative — no behavior moves into the struct itself.
+#[derive(Debug, Clone, Copy)]
+#[cfg(target_os = "linux")] // xtask:allow-platform-cfg: WG DNS-shim gate is Linux-only
+pub(crate) struct WireguardDnsGateInputs {
+    pub has_dns_directive: bool,
+    pub resolvectl_path_available: bool,
+    pub resolvconf_works: bool,
+    pub is_systemd_resolved: bool,
+}
+
+/// Pure decision logic for the WireGuard DNS-shim missing-dep label on Linux.
+///
+/// Returns `Some(label)` when the user must install a DNS-management shim,
+/// `None` when the connect can proceed. Split out so the four-quadrant
+/// gate can be unit-tested without depending on host state (each input
+/// helper — `is_systemd_resolved`, `resolvconf_works`, `resolvectl_works`
+/// — probes real OS state and would make these tests host-dependent).
+#[must_use]
+#[cfg(target_os = "linux")] // xtask:allow-platform-cfg: gate decision is Linux-only DNS plumbing
+pub(crate) fn wireguard_dns_missing_dep(inputs: WireguardDnsGateInputs) -> Option<String> {
+    if !inputs.has_dns_directive {
+        return None;
+    }
+    if inputs.resolvectl_path_available {
+        return None;
+    }
+    if inputs.resolvconf_works {
+        return None;
+    }
+    Some(
+        if inputs.is_systemd_resolved {
+            "resolvconf (systemd)"
+        } else {
+            "resolvconf"
+        }
+        .to_string(),
+    )
+}
+
 impl Drop for VpnRuntime {
     fn drop(&mut self) {
         // VPN connections are independent OS processes (wg-quick, openvpn) that
@@ -627,5 +675,94 @@ impl Drop for VpnRuntime {
         //
         // Kill switch firewall rules also persist — the next launch recovers
         // them via `load_state()`.
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod dns_gate_tests {
+    use super::{wireguard_dns_missing_dep, WireguardDnsGateInputs};
+
+    fn inputs(
+        has_dns_directive: bool,
+        resolvectl_path_available: bool,
+        resolvconf_works: bool,
+        is_systemd_resolved: bool,
+    ) -> WireguardDnsGateInputs {
+        WireguardDnsGateInputs {
+            has_dns_directive,
+            resolvectl_path_available,
+            resolvconf_works,
+            is_systemd_resolved,
+        }
+    }
+
+    #[test]
+    fn no_dns_directive_returns_none_regardless_of_host_state() {
+        // Every host-state combination with `has_dns = false` must return None.
+        for resolvectl in [false, true] {
+            for resolvconf in [false, true] {
+                for resolved in [false, true] {
+                    assert_eq!(
+                        wireguard_dns_missing_dep(inputs(false, resolvectl, resolvconf, resolved)),
+                        None,
+                        "has_dns=false resolvectl={resolvectl} resolvconf={resolvconf} resolved={resolved}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resolved_with_resolvectl_returns_none() {
+        // The headline behaviour change: a resolved host with a working
+        // resolvectl no longer needs a resolvconf shim, even when the
+        // .conf carries `DNS = ...`.
+        assert_eq!(
+            wireguard_dns_missing_dep(inputs(true, true, false, true)),
+            None
+        );
+    }
+
+    #[test]
+    fn resolved_without_resolvectl_falls_back_to_systemd_label() {
+        // Edge case: resolved is detected but resolvectl probe fails
+        // (service crashed, broken systemd install). The user genuinely
+        // needs the `systemd-resolvconf` shim; emit the resolved-flavoured
+        // missing-dep label.
+        assert_eq!(
+            wireguard_dns_missing_dep(inputs(true, false, false, true)),
+            Some("resolvconf (systemd)".to_string())
+        );
+    }
+
+    #[test]
+    fn non_resolved_without_resolvconf_returns_plain_label() {
+        // Classic missing-resolvconf on a non-resolved Linux host.
+        assert_eq!(
+            wireguard_dns_missing_dep(inputs(true, false, false, false)),
+            Some("resolvconf".to_string())
+        );
+    }
+
+    #[test]
+    fn non_resolved_with_resolvconf_returns_none() {
+        // Ubuntu / Debian-shaped happy path: resolvconf is installed and
+        // the host doesn't use systemd-resolved. Unchanged from today.
+        assert_eq!(
+            wireguard_dns_missing_dep(inputs(true, false, true, false)),
+            None
+        );
+    }
+
+    #[test]
+    fn resolved_with_both_paths_prefers_resolvectl_over_resolvconf() {
+        // Belt-and-braces: even if resolvconf is also installed, the
+        // resolvectl path takes precedence. This avoids double-management
+        // surprises and matches the WgTunnel::up wiring (which always
+        // uses resolvectl when use_resolvectl_path() is true).
+        assert_eq!(
+            wireguard_dns_missing_dep(inputs(true, true, true, true)),
+            None
+        );
     }
 }

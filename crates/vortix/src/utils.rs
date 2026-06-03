@@ -938,6 +938,46 @@ pub(crate) fn resolvconf_works() -> bool {
     .is_ok_and(|o| o.status.success())
 }
 
+/// Check whether `resolvectl` is installed and functional.
+///
+/// Returns `true` only when the `resolvectl` binary exists **and** a
+/// `--version` probe succeeds. `resolvectl` ships with systemd itself, so
+/// presence on PATH plus a working probe is a sufficient signal that the
+/// resolved per-link DNS API is callable.
+///
+/// The 10s cap mirrors the [`resolvconf_works`] probe shape — a hung
+/// resolved/DBus would otherwise wedge the connect-success path on the
+/// UI thread.
+#[cfg(target_os = "linux")] // xtask:allow-platform-cfg: resolvectl probing is Linux-only DNS plumbing
+pub(crate) fn resolvectl_works() -> bool {
+    use crate::vortix_process::CommandSpec;
+    use std::time::Duration;
+    if !binary_exists("resolvectl") {
+        return false;
+    }
+    crate::vortix_process::run_to_output(
+        CommandSpec::oneshot("resolvectl", vec!["--version".into()])
+            .timeout(Duration::from_secs(10)),
+    )
+    .is_ok_and(|o| o.status.success())
+}
+
+/// Should the resolvectl-based DNS path be used on this Linux host?
+///
+/// True when systemd-resolved is detected ([`is_systemd_resolved`]) AND
+/// `resolvectl` works ([`resolvectl_works`]). False otherwise — callers
+/// fall back to the legacy resolvconf path (the existing `wg-quick`
+/// behaviour) when this returns false.
+///
+/// All callers (dep-check, `WgTunnel::up`) MUST go through this single
+/// accessor so a subtle drift between two predicates can't make
+/// `check_dependencies` say "OK, no resolvconf needed" while the tunnel
+/// path then takes the resolvconf branch.
+#[cfg(target_os = "linux")] // xtask:allow-platform-cfg: trigger gate is Linux-only DNS plumbing
+pub(crate) fn use_resolvectl_path() -> bool {
+    is_systemd_resolved() && resolvectl_works()
+}
+
 /// Detect whether `systemd-resolved` is managing DNS on this system.
 ///
 /// Checks if `/etc/resolv.conf` is a symlink pointing into a
