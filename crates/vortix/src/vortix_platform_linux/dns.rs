@@ -212,7 +212,7 @@ mod tests {
     use super::*;
 
     fn args_of(spec: &CommandSpec) -> Vec<String> {
-        spec.args.to_vec()
+        spec.args.clone()
     }
 
     // ── build_set_link_dns_specs (pure spec construction) ────────────────
