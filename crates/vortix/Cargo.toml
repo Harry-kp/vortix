@@ -78,7 +78,7 @@ thiserror = { workspace = true }
 directories = { workspace = true }
 enum_dispatch = { workspace = true }
 figment = { workspace = true }
-sha2 = "0.10"
+sha2 = "0.11"
 # Plan 2026-06-02-001 U2 (#191): base64 envelope for OpenVPN SCRV1
 # static-challenge auth files. STANDARD alphabet only — see
 # `vortix_protocol_openvpn::tunnel` consumers and the plan's Key Tech
