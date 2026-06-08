@@ -92,7 +92,7 @@ arboard = { version = "3.6.1", default-features = false }
 # Thin libc wrapper; we hand-roll the 8-byte ICMP packet + RFC 792
 # checksum and fall back to TCP-connect-port-443 when the kernel
 # refuses unprivileged ICMP.
-socket2 = "0.5"
+socket2 = "0.6"
 # Plan 002 U9 (revised): blocking HTTP for telemetry (replaces `curl`).
 # Picked `ureq` over `reqwest::blocking` because we don't share vortix's
 # tokio runtime from the std::thread-based telemetry workers anyway —
