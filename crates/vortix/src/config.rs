@@ -433,15 +433,36 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
 /// Simple rule: anything under the user's home should be theirs.
 /// When running under `sudo`, newly created files/dirs end up as root.
 /// This fixes that. No-op when not running as root.
+///
+/// Logging policy: routes through `tracing` (never direct stdio) because
+/// this can fire while the TUI owns the terminal — any `println!`/`eprintln!`
+/// here would scramble ratatui's rendering. Two failure paths:
+/// - `SUDO_UID` / `SUDO_GID` unset (vortix invoked as direct root, not via
+///   sudo): chown is structurally impossible, no operator action available,
+///   so we emit `tracing::debug!` only.
+/// - chown call itself failed (`EPERM`, broken filesystem, etc.): real
+///   failure the operator may want to know about — `tracing::warn!`.
 pub fn fix_ownership(path: &Path) {
     if !crate::utils::is_root() {
         return;
     }
     if let Err(e) = chown_to_real_user(path) {
-        eprintln!(
-            "Note: could not set ownership of {} to your user: {e}",
-            path.display()
-        );
+        if e.kind() == std::io::ErrorKind::NotFound {
+            // SUDO_UID/SUDO_GID unset — running as direct root. The chown
+            // is a no-op by design; nothing for the operator to act on.
+            tracing::debug!(
+                target: "vortix::config",
+                path = %path.display(),
+                "skipping chown: no SUDO_UID (direct-root invocation)"
+            );
+        } else {
+            tracing::warn!(
+                target: "vortix::config",
+                path = %path.display(),
+                err = %e,
+                "failed to chown to invoking user; files may remain root-owned"
+            );
+        }
     }
 }
 
