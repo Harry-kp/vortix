@@ -162,6 +162,37 @@ pub fn claims_default_route_v4(allowed_ips: &[Cidr]) -> bool {
     covers_full_u32(&mut ranges)
 }
 
+/// Decide whether an IPv6-reachable host is *leaking* — i.e. v6 traffic is
+/// escaping the VPN — given the currently-connected tunnels' declared
+/// `AllowedIPs`.
+///
+/// "Leak" is **not** the same as "IPv6 reaches the public internet." On an
+/// IPv6-routed VPN tunnel (`AllowedIPs` covers `::/0`), v6 reachability IS
+/// the by-design success state — see issue #227. A leak only exists when
+/// IPv6 packets travel via the host's underlying connection AROUND the
+/// active tunnel(s).
+///
+/// Inputs:
+/// - `ipv6_reachable` — did an out-of-band IPv6 probe just succeed?
+/// - `connected_tunnels_allowed_ips` — for each currently-Connected
+///   tunnel, the union of `AllowedIPs` it declared.
+///
+/// Returns `true` only when IPv6 reaches AND no connected tunnel covers
+/// the IPv6 default route (`::/0`).
+#[must_use]
+pub fn ipv6_traffic_is_leaking(
+    ipv6_reachable: bool,
+    connected_tunnels_allowed_ips: &[&[Cidr]],
+) -> bool {
+    if !ipv6_reachable {
+        return false;
+    }
+    let any_tunnel_covers_v6 = connected_tunnels_allowed_ips
+        .iter()
+        .any(|aips| claims_default_route_v6(aips));
+    !any_tunnel_covers_v6
+}
+
 /// Returns `true` iff the union of all IPv6 CIDRs in `allowed_ips` covers
 /// `::/0`. IPv4 entries are ignored.
 #[must_use]
@@ -413,5 +444,93 @@ mod tests {
         assert!(Cidr::new(v4_addr, 33).is_none());
         let v6_addr: IpAddr = "::".parse().unwrap();
         assert!(Cidr::new(v6_addr, 129).is_none());
+    }
+
+    // ── ipv6_traffic_is_leaking ─────────────────────────────────────────
+    // Regression coverage for #227: IPv6-only tunnels (AllowedIPs = ::/0)
+    // were reported as "leaking" because the probe-success path treated
+    // "IPv6 is reachable" as equivalent to "IPv6 is bypassing the VPN."
+    // Correct semantics: IPv6 leaks only when v6 traffic is going OUTSIDE
+    // any active tunnel that claims the v6 default route.
+
+    fn parse_cidrs(s: &[&str]) -> Vec<Cidr> {
+        s.iter()
+            .map(|c| {
+                let (addr, prefix) = c.split_once('/').expect("CIDR fixture needs a slash");
+                let addr: IpAddr = addr.parse().expect("CIDR fixture addr must parse");
+                let prefix: u8 = prefix.parse().expect("CIDR fixture prefix must parse");
+                Cidr::new(addr, prefix).expect("CIDR fixture must be in range")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ipv6_leak_unreachable_is_never_a_leak() {
+        // No IPv6 reachable -> no leak by definition, regardless of tunnel state.
+        assert!(!ipv6_traffic_is_leaking(false, &[]));
+        let dual_stack = parse_cidrs(&["0.0.0.0/0", "::/0"]);
+        assert!(!ipv6_traffic_is_leaking(false, &[dual_stack.as_slice()]));
+    }
+
+    #[test]
+    fn ipv6_leak_reachable_no_tunnels_is_a_leak() {
+        // IPv6 reachable while NO tunnel is up -> traffic is going via the
+        // host's underlying connection. That IS a leak relative to "should
+        // be tunneled."
+        assert!(ipv6_traffic_is_leaking(true, &[]));
+    }
+
+    #[test]
+    fn ipv6_leak_tunnel_covers_v6_default_route_no_leak() {
+        // The #227 case: a single tunnel declares `0.0.0.0/0,::/0`.
+        // IPv6 reachable IS the by-design success state, not a leak.
+        let dual_stack = parse_cidrs(&["0.0.0.0/0", "::/0"]);
+        assert!(!ipv6_traffic_is_leaking(true, &[dual_stack.as_slice()]));
+    }
+
+    #[test]
+    fn ipv6_leak_ipv6_only_tunnel_no_leak() {
+        // IPv6-only tunnel (no IPv4 default route) still covers ::/0
+        // and should NOT report v6 leak. Matches the reporter's exact
+        // config in issue #227.
+        let v6_only = parse_cidrs(&["::/0"]);
+        assert!(!ipv6_traffic_is_leaking(true, &[v6_only.as_slice()]));
+    }
+
+    #[test]
+    fn ipv6_leak_ipv4_only_tunnel_with_v6_reachable_is_a_leak() {
+        // Tunnel only claims 0.0.0.0/0 — IPv6 traffic is bypassing it
+        // via the host's underlying v6 connection. Real leak.
+        let v4_only = parse_cidrs(&["0.0.0.0/0"]);
+        assert!(ipv6_traffic_is_leaking(true, &[v4_only.as_slice()]));
+    }
+
+    #[test]
+    fn ipv6_leak_split_tunnel_with_v6_reachable_is_a_leak() {
+        // Split tunnel covers a specific v4 subnet (no v6 claim).
+        // General v6 traffic bypasses it -> leak.
+        let split = parse_cidrs(&["10.8.0.0/24"]);
+        assert!(ipv6_traffic_is_leaking(true, &[split.as_slice()]));
+    }
+
+    #[test]
+    fn ipv6_leak_multi_tunnel_at_least_one_covers_v6_no_leak() {
+        // Multi-tunnel: one is the primary covering ::/0, another is a
+        // v4-only split tunnel. v6 routes through the primary -> no leak.
+        let primary = parse_cidrs(&["0.0.0.0/0", "::/0"]);
+        let split = parse_cidrs(&["10.0.0.0/8"]);
+        assert!(!ipv6_traffic_is_leaking(
+            true,
+            &[primary.as_slice(), split.as_slice()]
+        ));
+    }
+
+    #[test]
+    fn ipv6_leak_multi_tunnel_no_one_covers_v6_is_a_leak() {
+        // Multi-tunnel where no tunnel claims ::/0 — every v6 packet
+        // escapes via the host's underlying connection.
+        let a = parse_cidrs(&["10.0.0.0/8"]);
+        let b = parse_cidrs(&["192.168.0.0/16"]);
+        assert!(ipv6_traffic_is_leaking(true, &[a.as_slice(), b.as_slice()]));
     }
 }

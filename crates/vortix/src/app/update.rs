@@ -959,7 +959,37 @@ impl App {
                 self.runtime.dns_server = dns;
                 self.runtime.last_security_check = Some(Instant::now());
             }
-            TelemetryUpdate::Ipv6Leak(leak) => {
+            TelemetryUpdate::Ipv6Leak(ipv6_reachable) => {
+                // The telemetry probe sends "true" when an IPv6 endpoint
+                // was reachable. That's NOT equivalent to "leaking" — see
+                // issue #227. Reinterpret here using the registry: if any
+                // Connected tunnel declares ::/0 in its AllowedIPs, IPv6
+                // reachability is by-design (the tunnel IS the v6 path).
+                // Only count it as a leak when v6 reaches AND no active
+                // tunnel covers ::/0.
+                let connected_allowed_ips: Vec<Vec<crate::vortix_core::cidr::Cidr>> =
+                    self.registry
+                        .snapshot_all()
+                        .into_iter()
+                        .filter_map(|snap| match (snap.state, snap.role) {
+                            (
+                                crate::vortix_core::engine::Connection::Connected { .. },
+                                crate::vortix_core::engine::Role::Primary { allowed_ips }
+                                | crate::vortix_core::engine::Role::Addressable { allowed_ips }
+                                | crate::vortix_core::engine::Role::AddressableSuppressed {
+                                    allowed_ips,
+                                },
+                            ) => Some(allowed_ips),
+                            _ => None,
+                        })
+                        .collect();
+                let allowed_ips_refs: Vec<&[crate::vortix_core::cidr::Cidr]> =
+                    connected_allowed_ips.iter().map(Vec::as_slice).collect();
+                let leak = crate::vortix_core::cidr::ipv6_traffic_is_leaking(
+                    ipv6_reachable,
+                    &allowed_ips_refs,
+                );
+
                 if self.runtime.ipv6_leak != leak {
                     if leak {
                         self.log("WARN: IPv6 leak detected — traffic may bypass VPN tunnel");
