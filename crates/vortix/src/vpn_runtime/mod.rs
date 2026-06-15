@@ -53,12 +53,13 @@ pub struct VpnRuntime {
     pub location: String,
     pub isp: String,
     pub dns_server: String,
-    pub ipv6_leak: bool,
+    pub dns_leak: crate::core::dns_leak::DnsLeakStatus,
 
     // === System Info ===
     pub public_ip: String,
     pub real_ip: Option<String>,
-    pub real_dns: Option<String>,
+    pub public_ipv6: Option<String>,
+    pub real_ipv6: Option<String>,
     pub last_security_check: Option<Instant>,
     pub ip_unchanged_warned: bool,
     pub last_connected_profile: Option<String>,
@@ -137,11 +138,12 @@ impl VpnRuntime {
             location: constants::MSG_DETECTING.to_string(),
             isp: constants::MSG_DETECTING.to_string(),
             dns_server: constants::MSG_DETECTING.to_string(),
-            ipv6_leak: false,
+            dns_leak: crate::core::dns_leak::DnsLeakStatus::Unknown,
 
             public_ip: constants::MSG_DETECTING.to_string(),
             real_ip: None,
-            real_dns: None,
+            public_ipv6: None,
+            real_ipv6: None,
             last_security_check: None,
             ip_unchanged_warned: false,
             last_connected_profile: None,
@@ -184,14 +186,12 @@ impl VpnRuntime {
             }
         }
 
-        // Restore real_ip from the on-disk cache. Handles the
-        // "launch vortix with VPN already up" case where the
-        // current process has no disconnected window to learn the
-        // real IP from telemetry. Stale loads are acceptable — a
-        // fresh disconnected sample will overwrite the cache the
-        // moment the user disconnects.
+        // Restore the cached real IPv4 / IPv6 / DNS — handles launch-with-VPN-up.
         if let Some(cached) = crate::core::real_ip_cache::load(&engine.config_dir) {
             engine.real_ip = Some(cached.ip);
+        }
+        if let Some(cached) = crate::core::real_ip_cache::load_ipv6(&engine.config_dir) {
+            engine.real_ipv6 = Some(cached.ip);
         }
 
         // Load profiles
@@ -226,11 +226,12 @@ impl VpnRuntime {
             location: String::new(),
             isp: String::new(),
             dns_server: String::new(),
-            ipv6_leak: false,
+            dns_leak: crate::core::dns_leak::DnsLeakStatus::Unknown,
 
             public_ip: String::new(),
             real_ip: None,
-            real_dns: None,
+            public_ipv6: None,
+            real_ipv6: None,
             last_security_check: None,
             ip_unchanged_warned: false,
             last_connected_profile: None,
@@ -296,10 +297,11 @@ impl VpnRuntime {
             location: String::new(),
             isp: String::new(),
             dns_server: String::new(),
-            ipv6_leak: false,
+            dns_leak: crate::core::dns_leak::DnsLeakStatus::Unknown,
             public_ip: String::new(),
             real_ip: None,
-            real_dns: None,
+            public_ipv6: None,
+            real_ipv6: None,
             last_security_check: None,
             ip_unchanged_warned: false,
             last_connected_profile: None,

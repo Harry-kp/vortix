@@ -151,7 +151,7 @@ fn render_connected(
         ]),
     ];
 
-    // `Exit` reflects the ASN/location of the public IP returned by
+    // `Exit` reflects the ASN/location of the public IPv4 returned by
     // ipinfo.io, which only describes the egress path that the PRIMARY
     // tunnel owns. For split tunnels (Addressable / AddressableSuppressed)
     // the same row would either copy the primary's info (misleading —

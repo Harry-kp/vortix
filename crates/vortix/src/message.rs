@@ -319,7 +319,7 @@ pub fn get_single_actions(focused_panel: &FocusedPanel) -> Vec<ActionMenuItem> {
         FocusedPanel::ConnectionDetails => {
             actions.push(ActionMenuItem {
                 key: "y",
-                label: "Copy Public IP",
+                label: "Copy Public IPv4",
                 message: Message::CopyIp,
             });
         }
@@ -374,7 +374,7 @@ pub fn get_bulk_actions() -> Vec<ActionMenuItem> {
         },
         ActionMenuItem {
             key: "y",
-            label: "Copy Public IP",
+            label: "Copy Public IPv4",
             message: Message::CopyIp,
         },
         ActionMenuItem {

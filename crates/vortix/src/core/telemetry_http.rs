@@ -90,23 +90,25 @@ pub fn get_json<T: DeserializeOwned>(url: &str, timeout: Duration) -> Option<T> 
     response.body_mut().read_json::<T>().ok()
 }
 
-/// IPv6-only GET — used by the IPv6-leak probe in
-/// `fetch_security_info`. Returns `true` if the request reached a
-/// 2xx response over IPv6; `false` for any failure (no IPv6 route,
-/// timeout, non-2xx).
-///
-/// Curl achieves IPv6-only with `-6`; ureq exposes the same via
-/// `Config::ip_family(IpFamily::Ipv6Only)`.
+/// IPv6-only GET. Returns the trimmed response body (the host's public
+/// IPv6 when the endpoint echoes it) or `None` on any failure.
 #[must_use]
-pub fn probe_ipv6(url: &str, timeout: Duration) -> bool {
-    let Ok(response) = ipv6_agent()
+pub fn probe_ipv6(url: &str, timeout: Duration) -> Option<String> {
+    let mut response = ipv6_agent()
         .get(url)
         .config()
         .timeout_global(Some(timeout))
         .build()
         .call()
-    else {
-        return false;
-    };
-    response.status().is_success()
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let body = response.body_mut().read_to_string().ok()?;
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }

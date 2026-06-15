@@ -39,7 +39,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
 
     let ks_indicator = get_killswitch_indicator(app);
 
-    // ── 0-active branch: no tunnels in the registry → real IP exposed.
+    // ── 0-active branch: no tunnels in the registry → real IPv4 exposed.
     // Show the explicit `○ DISCONNECTED` title here — the user's
     // mental model is "no VPN at all" and the title makes that
     // unambiguous. The no-primary-but-tunnels-up branch below still

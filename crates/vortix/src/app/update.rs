@@ -875,16 +875,9 @@ impl App {
                     let first_detection = self.runtime.real_ip.is_none();
                     let changed = self.runtime.real_ip.as_deref() != Some(ip.as_str());
                     if first_detection {
-                        self.log(&format!("NET: Real IP detected: {ip}"));
+                        self.log(&format!("NET: Real IPv4 detected: {ip}"));
                     }
                     self.runtime.real_ip = Some(ip.clone());
-                    // Persist to disk so the next launch can render
-                    // the Real IP row immediately — including when
-                    // vortix is opened while a VPN is already up
-                    // (the in-process gate would withhold caching
-                    // forever in that scenario without the file).
-                    // Only write when the value actually changes to
-                    // avoid pointless I/O on every 30s telemetry tick.
                     if first_detection || changed {
                         crate::core::real_ip_cache::save(&self.runtime.config_dir, &ip);
                     }
@@ -892,7 +885,7 @@ impl App {
                     && self.runtime.public_ip != constants::MSG_FETCHING
                 {
                     self.runtime.ip_unchanged_warned = false;
-                    self.log(&format!("NET: Public IP changed {old_ip} -> {ip}"));
+                    self.log(&format!("NET: Public IPv4 changed {old_ip} -> {ip}"));
                 } else if is_connected
                     && self.runtime.public_ip == ip
                     && self.runtime.public_ip != constants::MSG_FETCHING
@@ -900,11 +893,11 @@ impl App {
                 {
                     self.runtime.ip_unchanged_warned = true;
                     self.log(&format!(
-                        "WARN: Public IP unchanged ({ip}) while connected — possible leak or split-tunnel"
+                        "WARN: Public IPv4 unchanged ({ip}) while connected — possible leak or split-tunnel"
                     ));
                     if let Some(ref real) = self.runtime.real_ip {
                         if real == &ip {
-                            self.log(&format!("ERR: IP leak detected — current IP ({ip}) matches pre-VPN IP ({real})"));
+                            self.log(&format!("ERR: IPv4 leak detected — current IPv4 ({ip}) matches pre-VPN IPv4 ({real})"));
                         }
                     }
                 }
@@ -934,66 +927,71 @@ impl App {
                 self.runtime.isp = isp;
             }
             TelemetryUpdate::Dns(dns) => {
-                // Same startup-race protection as TelemetryUpdate::PublicIp
-                // — without this, a vortix opened while a VPN is up would
-                // race: DNS telemetry samples the VPN's pushed resolver
-                // before the scanner has adopted the tunnel, registry
-                // says `!is_connected`, and the VPN's DNS gets cached as
-                // `real_dns`. Subsequent dns_server reads then match
-                // real_dns and `verdict_for_protected` reads that as a
-                // DNS leak → header reads PARTIAL forever even with the
-                // killswitch toggled on.
-                let safe_to_cache = self.runtime.scanner_first_tick_done
-                    && self.runtime.last_kernel_session_count == 0
-                    && !self.has_active_connection();
-                if safe_to_cache {
-                    if self.runtime.real_dns.is_none() {
-                        self.log(&format!("NET: Pre-VPN DNS: {dns}"));
-                    }
-                    self.runtime.real_dns = Some(dns.clone());
-                } else if self.runtime.dns_server != dns
+                if self.runtime.dns_server != dns
                     && self.runtime.dns_server != constants::MSG_NO_DATA
+                    && self.runtime.dns_server != constants::MSG_DETECTING
                 {
                     self.log(&format!("SEC: DNS server: {dns}"));
                 }
                 self.runtime.dns_server = dns;
+                self.spawn_dns_leak_probe();
                 self.runtime.last_security_check = Some(Instant::now());
             }
-            TelemetryUpdate::Ipv6Leak(ipv6_reachable) => {
-                // The probe sends "v6 reachable", which #227 showed is not
-                // equivalent to "v6 leaks": a tunnel covering ::/0 makes
-                // v6 reachability by-design.
-                let connected_allowed_ips: Vec<Vec<crate::vortix_core::cidr::Cidr>> =
-                    self.registry
-                        .snapshot_all()
-                        .into_iter()
-                        .filter_map(|snap| match (snap.state, snap.role) {
+            TelemetryUpdate::DnsLeak(status) => {
+                use crate::core::dns_leak::DnsLeakStatus;
+                if let DnsLeakStatus::Leaking {
+                    recursor,
+                    configured,
+                } = &status
+                {
+                    self.log(&format!(
+                        "WARN: DNS leak — recursor {recursor} answered, expected {configured}"
+                    ));
+                }
+                self.runtime.dns_leak = status;
+            }
+            TelemetryUpdate::PublicIpv6(observed) => {
+                let is_connected = self.has_active_connection();
+                let disconnect_safe = self.runtime.scanner_first_tick_done
+                    && self.runtime.last_kernel_session_count == 0
+                    && !is_connected;
+                let no_tunnel_routes_v6 = is_connected
+                    && !self.registry.snapshot_all().into_iter().any(|snap| {
+                        use crate::vortix_core::engine::{Connection, Role};
+                        match (snap.state, snap.role) {
                             (
-                                crate::vortix_core::engine::Connection::Connected { .. },
-                                crate::vortix_core::engine::Role::Primary { allowed_ips }
-                                | crate::vortix_core::engine::Role::Addressable { allowed_ips }
-                                | crate::vortix_core::engine::Role::AddressableSuppressed {
-                                    allowed_ips,
-                                },
-                            ) => Some(allowed_ips),
-                            _ => None,
-                        })
-                        .collect();
-                let allowed_ips_refs: Vec<&[crate::vortix_core::cidr::Cidr]> =
-                    connected_allowed_ips.iter().map(Vec::as_slice).collect();
-                let leak = crate::vortix_core::cidr::ipv6_traffic_is_leaking(
-                    ipv6_reachable,
-                    &allowed_ips_refs,
-                );
-
-                if self.runtime.ipv6_leak != leak {
-                    if leak {
-                        self.log("WARN: IPv6 leak detected — traffic may bypass VPN tunnel");
-                    } else {
-                        self.log("SEC: IPv6 secure (blocked)");
+                                Connection::Connected { .. },
+                                Role::Primary { allowed_ips }
+                                | Role::Addressable { allowed_ips }
+                                | Role::AddressableSuppressed { allowed_ips },
+                            ) => crate::vortix_core::cidr::claims_default_route_v6(&allowed_ips),
+                            _ => false,
+                        }
+                    });
+                let safe_to_cache = disconnect_safe || no_tunnel_routes_v6;
+                if safe_to_cache {
+                    if let Some(ref ip) = observed {
+                        let changed = self.runtime.real_ipv6.as_deref() != Some(ip.as_str());
+                        if changed {
+                            let first = self.runtime.real_ipv6.is_none();
+                            if first {
+                                self.log(&format!("NET: Real IPv6 detected: {ip}"));
+                            }
+                            self.runtime.real_ipv6 = Some(ip.clone());
+                            crate::core::real_ip_cache::save_ipv6(&self.runtime.config_dir, ip);
+                        }
                     }
                 }
-                self.runtime.ipv6_leak = leak;
+                if is_connected {
+                    if let (Some(real), Some(public)) = (&self.runtime.real_ipv6, &observed) {
+                        if real == public {
+                            self.log(&format!(
+                                "WARN: IPv6 leak detected — public {public} matches real {real}"
+                            ));
+                        }
+                    }
+                }
+                self.runtime.public_ipv6 = observed;
                 self.runtime.last_security_check = Some(Instant::now());
             }
             TelemetryUpdate::Log(level, msg) => {

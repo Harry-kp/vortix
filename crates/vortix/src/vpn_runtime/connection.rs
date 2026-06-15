@@ -51,7 +51,6 @@ pub struct StatusSnapshot {
     /// [`crate::state::KillSwitchState::cli_verb`] (slug).
     pub killswitch_state: crate::state::KillSwitchState,
     pub dns_leak: Option<bool>,
-    pub ipv6_leak: Option<bool>,
     pub encryption: Option<String>,
     pub location: Option<String>,
     pub isp: Option<String>,
@@ -400,7 +399,6 @@ impl VpnRuntime {
             killswitch_mode: self.killswitch_mode,
             killswitch_state: self.killswitch_state,
             dns_leak: None,
-            ipv6_leak: None,
             encryption,
             location: None,
             isp: None,

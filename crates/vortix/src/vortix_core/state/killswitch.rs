@@ -144,7 +144,7 @@ impl KillSwitchMode {
         match self {
             Self::Off => (
                 "VPN up: all traffic flows freely.",
-                "VPN down: real IP exposed.",
+                "VPN down: real IPv4 (and IPv6, if present) exposed.",
             ),
             Self::Auto => (
                 "VPN up: browse normally.",

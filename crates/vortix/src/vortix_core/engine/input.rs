@@ -110,7 +110,7 @@ pub enum TelemetryReport {
     PacketLoss(f32),
     Jitter(u64),
     Dns(String),
-    Ipv6Leak(bool),
+    PublicIpv6(Option<String>),
 }
 
 /// The single input type `Engine::handle(input)` consumes.

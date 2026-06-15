@@ -23,6 +23,13 @@
 #   wg-full      WireGuard, AllowedIPs = 0.0.0.0/0 (full tunnel / primary)
 #   wg-split     WireGuard, AllowedIPs = 10.8.0.0/24 (split tunnel / secondary)
 #   wg-fwmark    WireGuard, AllowedIPs = 0.0.0.0/0, FwMark = 51820
+#   wg-v6        WireGuard dual-stack: v4 + v6 Address, AllowedIPs = 0.0.0.0/0, ::/0
+#                (server enables ip6_forward + ip6tables MASQUERADE so v6 is
+#                actually tunneled — exercises the IPv6 Protected ✓ row).
+#   wg-dns-leak  WireGuard with `DNS = 8.8.8.8` pushed to the client, but
+#                AllowedIPs covers everything EXCEPT 8.8.8.0/24. The kernel
+#                routes 8.8.8.8 via the native interface (outside the tunnel
+#                scope), so DNS queries leak while web traffic still tunnels.
 #   ovpn-cert    OpenVPN, certificate-only auth (no user/pass)
 #   ovpn-auth    OpenVPN, username + password auth
 #   ovpn-totp    OpenVPN, username + password + TOTP (google-authenticator)
@@ -41,7 +48,7 @@ SSH_KEY_FILE="${DO_SSH_KEY_FILE:-}"             # blank = auto-detect from DO fi
 SESSION_FILE="${TMPDIR:-/tmp}/vortix-test-session"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROFILE_DIR="${SCRIPT_DIR}/test-profiles"
-ALL_FLAVORS=(wg-full wg-split wg-fwmark ovpn-cert ovpn-auth ovpn-totp)
+ALL_FLAVORS=(wg-full wg-split wg-fwmark wg-v6 wg-dns-leak ovpn-cert ovpn-auth ovpn-totp)
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -349,6 +356,148 @@ write_files:
       EOF
 
       sed -i 's/^      //' /etc/wireguard/wg0.conf /root/client-profiles/wg-fwmark.conf
+
+      sysctl -w net.ipv4.ip_forward=1
+      echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+      systemctl enable wg-quick@wg0
+      systemctl start wg-quick@wg0
+      echo "READY" > /root/.vpn-ready
+
+runcmd:
+  - bash /root/setup-wg.sh
+CLOUD_INIT
+}
+
+# Dual-stack WireGuard: server runs both v4 and v6, enables forwarding +
+# MASQUERADE for both families, hands the client a v6 Address so the
+# kernel can actually source v6 from the tunnel. Use this droplet to
+# verify the Security Guard's `Exit IPv6` row reads Protected (✓) and
+# `curl -6 ifconfig.co/ip` returns the droplet's public v6, not yours.
+cloudinit_wg_v6() {
+    cat <<'CLOUD_INIT'
+#cloud-config
+package_update: true
+packages: [wireguard]
+
+write_files:
+  - path: /root/setup-wg.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      mkdir -p /root/client-profiles
+
+      SERVER_PRIV=$(wg genkey)
+      SERVER_PUB=$(echo "$SERVER_PRIV" | wg pubkey)
+      CLIENT_PRIV=$(wg genkey)
+      CLIENT_PUB=$(echo "$CLIENT_PRIV" | wg pubkey)
+      PSK=$(wg genpsk)
+
+      SERVER_IP=$(curl -s http://169.254.169.254/metadata/v1/interfaces/public/0/ipv4/address)
+      # See `cloudinit_wg_full` for why we don't hardcode `eth0`.
+      PUBLIC_IF=$(ip route show default | awk '/^default/ {print $5; exit}')
+
+      cat > /etc/wireguard/wg0.conf <<EOF
+      [Interface]
+      PrivateKey = ${SERVER_PRIV}
+      Address = 10.99.99.1/24, fd00:99:99::1/64
+      ListenPort = 51823
+      PostUp = iptables -t nat -A POSTROUTING -o ${PUBLIC_IF} -j MASQUERADE; iptables -A FORWARD -i wg0 -j ACCEPT; iptables -A FORWARD -o wg0 -j ACCEPT; ip6tables -t nat -A POSTROUTING -o ${PUBLIC_IF} -j MASQUERADE; ip6tables -A FORWARD -i wg0 -j ACCEPT; ip6tables -A FORWARD -o wg0 -j ACCEPT
+      PostDown = iptables -t nat -D POSTROUTING -o ${PUBLIC_IF} -j MASQUERADE; iptables -D FORWARD -i wg0 -j ACCEPT; iptables -D FORWARD -o wg0 -j ACCEPT; ip6tables -t nat -D POSTROUTING -o ${PUBLIC_IF} -j MASQUERADE; ip6tables -D FORWARD -i wg0 -j ACCEPT; ip6tables -D FORWARD -o wg0 -j ACCEPT
+
+      [Peer]
+      PublicKey = ${CLIENT_PUB}
+      PresharedKey = ${PSK}
+      AllowedIPs = 10.99.99.2/32, fd00:99:99::2/128
+      EOF
+
+      cat > /root/client-profiles/wg-v6.conf <<EOF
+      [Interface]
+      PrivateKey = ${CLIENT_PRIV}
+      Address = 10.99.99.2/24, fd00:99:99::2/64
+      DNS = 1.1.1.1, 2606:4700:4700::1111
+
+      [Peer]
+      PublicKey = ${SERVER_PUB}
+      PresharedKey = ${PSK}
+      Endpoint = ${SERVER_IP}:51823
+      AllowedIPs = 0.0.0.0/0, ::/0
+      PersistentKeepalive = 25
+      EOF
+
+      sed -i 's/^      //' /etc/wireguard/wg0.conf /root/client-profiles/wg-v6.conf
+
+      sysctl -w net.ipv4.ip_forward=1
+      sysctl -w net.ipv6.conf.all.forwarding=1
+      echo "net.ipv4.ip_forward=1"           >> /etc/sysctl.conf
+      echo "net.ipv6.conf.all.forwarding=1"  >> /etc/sysctl.conf
+
+      systemctl enable wg-quick@wg0
+      systemctl start wg-quick@wg0
+      echo "READY" > /root/.vpn-ready
+
+runcmd:
+  - bash /root/setup-wg.sh
+CLOUD_INIT
+}
+
+# WG profile that hijacks tunnel DNS to a different provider than the
+# client config claims. Client says `DNS = 9.9.9.9` (Quad9). Server
+# iptables DNATs every tunnel UDP/53 to 208.67.222.222 (OpenDNS). The
+# recursor that Google's authoritative server sees is OpenDNS, not
+# Quad9 -- vortix's recursor-IP check fires.
+cloudinit_wg_dns_leak() {
+    cat <<'CLOUD_INIT'
+#cloud-config
+package_update: true
+packages: [wireguard]
+
+write_files:
+  - path: /root/setup-wg.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      mkdir -p /root/client-profiles
+
+      SERVER_PRIV=$(wg genkey)
+      SERVER_PUB=$(echo "$SERVER_PRIV" | wg pubkey)
+      CLIENT_PRIV=$(wg genkey)
+      CLIENT_PUB=$(echo "$CLIENT_PRIV" | wg pubkey)
+      PSK=$(wg genpsk)
+
+      SERVER_IP=$(curl -s http://169.254.169.254/metadata/v1/interfaces/public/0/ipv4/address)
+      PUBLIC_IF=$(ip route show default | awk '/^default/ {print $5; exit}')
+
+      cat > /etc/wireguard/wg0.conf <<EOF
+      [Interface]
+      PrivateKey = ${SERVER_PRIV}
+      Address = 10.55.55.1/24
+      ListenPort = 51824
+      PostUp = iptables -t nat -A POSTROUTING -o ${PUBLIC_IF} -j MASQUERADE; iptables -A FORWARD -i wg0 -j ACCEPT; iptables -A FORWARD -o wg0 -j ACCEPT; iptables -t nat -A PREROUTING -i wg0 -p udp --dport 53 -j DNAT --to-destination 208.67.222.222; iptables -t nat -A PREROUTING -i wg0 -p tcp --dport 53 -j DNAT --to-destination 208.67.222.222
+      PostDown = iptables -t nat -D POSTROUTING -o ${PUBLIC_IF} -j MASQUERADE; iptables -D FORWARD -i wg0 -j ACCEPT; iptables -D FORWARD -o wg0 -j ACCEPT; iptables -t nat -D PREROUTING -i wg0 -p udp --dport 53 -j DNAT --to-destination 208.67.222.222; iptables -t nat -D PREROUTING -i wg0 -p tcp --dport 53 -j DNAT --to-destination 208.67.222.222
+
+      [Peer]
+      PublicKey = ${CLIENT_PUB}
+      PresharedKey = ${PSK}
+      AllowedIPs = 10.55.55.2/32
+      EOF
+
+      cat > /root/client-profiles/wg-dns-leak.conf <<EOF
+      [Interface]
+      PrivateKey = ${CLIENT_PRIV}
+      Address = 10.55.55.2/24
+      DNS = 9.9.9.9
+
+      [Peer]
+      PublicKey = ${SERVER_PUB}
+      PresharedKey = ${PSK}
+      Endpoint = ${SERVER_IP}:51824
+      AllowedIPs = 0.0.0.0/0
+      PersistentKeepalive = 25
+      EOF
+
+      sed -i 's/^      //' /etc/wireguard/wg0.conf /root/client-profiles/wg-dns-leak.conf
 
       sysctl -w net.ipv4.ip_forward=1
       echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
@@ -877,13 +1026,15 @@ cmd_up() {
         local cloud_init_file
         cloud_init_file=$(mktemp)
         case "$flavor" in
-            wg-full)    cloudinit_wg_full    > "$cloud_init_file" ;;
-            wg-split)   cloudinit_wg_split   > "$cloud_init_file" ;;
-            wg-fwmark)  cloudinit_wg_fwmark  > "$cloud_init_file" ;;
-            ovpn-cert)  cloudinit_ovpn_cert  > "$cloud_init_file" ;;
-            ovpn-auth)  cloudinit_ovpn_auth  > "$cloud_init_file" ;;
-            ovpn-totp)  cloudinit_ovpn_totp  > "$cloud_init_file" ;;
-            *)          die "Unknown flavor: ${flavor}. Available: ${ALL_FLAVORS[*]}" ;;
+            wg-full)     cloudinit_wg_full     > "$cloud_init_file" ;;
+            wg-split)    cloudinit_wg_split    > "$cloud_init_file" ;;
+            wg-fwmark)   cloudinit_wg_fwmark   > "$cloud_init_file" ;;
+            wg-v6)       cloudinit_wg_v6       > "$cloud_init_file" ;;
+            wg-dns-leak) cloudinit_wg_dns_leak > "$cloud_init_file" ;;
+            ovpn-cert)   cloudinit_ovpn_cert   > "$cloud_init_file" ;;
+            ovpn-auth)   cloudinit_ovpn_auth   > "$cloud_init_file" ;;
+            ovpn-totp)   cloudinit_ovpn_totp   > "$cloud_init_file" ;;
+            *)           die "Unknown flavor: ${flavor}. Available: ${ALL_FLAVORS[*]}" ;;
         esac
 
         # Pre-flight: cloud-init's YAML parser silently drops the entire
@@ -899,6 +1050,12 @@ cmd_up() {
             die "Replace em-dashes / smart-quotes with ASCII equivalents in cloudinit_${flavor//-/_}() and retry."
         fi
 
+        # wg-v6 needs a publicly-routed v6 address on the droplet so it
+        # can MASQUERADE client traffic out via the host. DO doesn't
+        # enable v6 by default — pass --enable-ipv6 for this flavor.
+        local extra_args=()
+        [[ "$flavor" == "wg-v6" ]] && extra_args+=(--enable-ipv6)
+
         doctl compute droplet create "$name" \
             --region "$REGION" \
             --size "$SIZE" \
@@ -906,6 +1063,7 @@ cmd_up() {
             --ssh-keys "$key_id" \
             --tag-name "$(tag)" \
             --user-data-file "$cloud_init_file" \
+            "${extra_args[@]}" \
             --wait \
             --no-header \
             --format ID,Name,PublicIPv4
@@ -1197,17 +1355,19 @@ confirm() {
 interactive_up() {
     echo
     pick "Which flavors do you want to spin up?" \
-        "All 6 flavors (full test matrix)" \
+        "All 8 flavors (full test matrix)" \
         "Let me pick specific ones"
 
     local -a flavors=()
-    if [[ "$REPLY" == "All 6 flavors (full test matrix)" ]]; then
+    if [[ "$REPLY" == "All 8 flavors (full test matrix)" ]]; then
         flavors=("${ALL_FLAVORS[@]}")
     else
         multi_pick "Select the VPN servers you need:" \
             "wg-full      WireGuard full tunnel (0.0.0.0/0)" \
             "wg-split     WireGuard split tunnel (10.8.0.0/24)" \
             "wg-fwmark    WireGuard full tunnel + FwMark=51820" \
+            "wg-v6        WireGuard dual-stack v4 + v6 (IPv6 Protected ✓)" \
+            "wg-dns-leak  WireGuard full tunnel, no client DNS = (DNS ✗ leaking)" \
             "ovpn-cert    OpenVPN certificate-only (no user/pass)" \
             "ovpn-auth    OpenVPN username + password" \
             "ovpn-totp    OpenVPN username + password + TOTP"
@@ -1371,7 +1531,7 @@ Commands (non-interactive):
   down             Destroy all droplets + clean up
   ssh <name>       SSH into a droplet
 
-Flavors: wg-full, wg-split, wg-fwmark, ovpn-cert, ovpn-auth, ovpn-totp
+Flavors: wg-full, wg-split, wg-fwmark, wg-v6, wg-dns-leak, ovpn-cert, ovpn-auth, ovpn-totp
 EOF
         ;;
     *)        interactive_menu ;;

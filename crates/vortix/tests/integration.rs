@@ -874,12 +874,19 @@ mod message_routing {
     }
 
     #[test]
-    fn telemetry_ipv6_leak_detection() {
+    fn telemetry_publicipv6_leak_detection() {
         use vortix::core::telemetry::TelemetryUpdate;
 
         let mut app = test_app();
-        app.handle_message(Message::Telemetry(TelemetryUpdate::Ipv6Leak(true)));
-        assert!(app.runtime.ipv6_leak);
+        app.runtime.scanner_first_tick_done = true;
+        app.runtime.last_kernel_session_count = 0;
+
+        let ip = "2401:4900:1c61:23c4::1".to_string();
+        app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIpv6(Some(
+            ip.clone(),
+        ))));
+        assert_eq!(app.runtime.real_ipv6.as_ref(), Some(&ip));
+        assert_eq!(app.runtime.public_ipv6.as_ref(), Some(&ip));
     }
 
     #[test]

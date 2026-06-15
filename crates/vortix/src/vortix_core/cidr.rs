@@ -162,23 +162,6 @@ pub fn claims_default_route_v4(allowed_ips: &[Cidr]) -> bool {
     covers_full_u32(&mut ranges)
 }
 
-/// Returns `true` when v6 reaches AND no connected tunnel claims `::/0`.
-/// IPv6 reachability through a tunnel that covers `::/0` is by-design, not
-/// a leak — see issue #227.
-#[must_use]
-pub fn ipv6_traffic_is_leaking(
-    ipv6_reachable: bool,
-    connected_tunnels_allowed_ips: &[&[Cidr]],
-) -> bool {
-    if !ipv6_reachable {
-        return false;
-    }
-    let any_tunnel_covers_v6 = connected_tunnels_allowed_ips
-        .iter()
-        .any(|aips| claims_default_route_v6(aips));
-    !any_tunnel_covers_v6
-}
-
 /// Returns `true` iff the union of all IPv6 CIDRs in `allowed_ips` covers
 /// `::/0`. IPv4 entries are ignored.
 #[must_use]
@@ -430,69 +413,5 @@ mod tests {
         assert!(Cidr::new(v4_addr, 33).is_none());
         let v6_addr: IpAddr = "::".parse().unwrap();
         assert!(Cidr::new(v6_addr, 129).is_none());
-    }
-
-    fn parse_cidrs(s: &[&str]) -> Vec<Cidr> {
-        s.iter()
-            .map(|c| {
-                let (addr, prefix) = c.split_once('/').expect("CIDR fixture needs a slash");
-                let addr: IpAddr = addr.parse().expect("CIDR fixture addr must parse");
-                let prefix: u8 = prefix.parse().expect("CIDR fixture prefix must parse");
-                Cidr::new(addr, prefix).expect("CIDR fixture must be in range")
-            })
-            .collect()
-    }
-
-    #[test]
-    fn ipv6_leak_unreachable_is_never_a_leak() {
-        assert!(!ipv6_traffic_is_leaking(false, &[]));
-        let dual_stack = parse_cidrs(&["0.0.0.0/0", "::/0"]);
-        assert!(!ipv6_traffic_is_leaking(false, &[dual_stack.as_slice()]));
-    }
-
-    #[test]
-    fn ipv6_leak_reachable_no_tunnels_is_a_leak() {
-        assert!(ipv6_traffic_is_leaking(true, &[]));
-    }
-
-    #[test]
-    fn ipv6_leak_tunnel_covers_v6_default_route_no_leak() {
-        let dual_stack = parse_cidrs(&["0.0.0.0/0", "::/0"]);
-        assert!(!ipv6_traffic_is_leaking(true, &[dual_stack.as_slice()]));
-    }
-
-    #[test]
-    fn ipv6_leak_ipv6_only_tunnel_no_leak() {
-        let v6_only = parse_cidrs(&["::/0"]);
-        assert!(!ipv6_traffic_is_leaking(true, &[v6_only.as_slice()]));
-    }
-
-    #[test]
-    fn ipv6_leak_ipv4_only_tunnel_with_v6_reachable_is_a_leak() {
-        let v4_only = parse_cidrs(&["0.0.0.0/0"]);
-        assert!(ipv6_traffic_is_leaking(true, &[v4_only.as_slice()]));
-    }
-
-    #[test]
-    fn ipv6_leak_split_tunnel_with_v6_reachable_is_a_leak() {
-        let split = parse_cidrs(&["10.8.0.0/24"]);
-        assert!(ipv6_traffic_is_leaking(true, &[split.as_slice()]));
-    }
-
-    #[test]
-    fn ipv6_leak_multi_tunnel_at_least_one_covers_v6_no_leak() {
-        let primary = parse_cidrs(&["0.0.0.0/0", "::/0"]);
-        let split = parse_cidrs(&["10.0.0.0/8"]);
-        assert!(!ipv6_traffic_is_leaking(
-            true,
-            &[primary.as_slice(), split.as_slice()]
-        ));
-    }
-
-    #[test]
-    fn ipv6_leak_multi_tunnel_no_one_covers_v6_is_a_leak() {
-        let a = parse_cidrs(&["10.0.0.0/8"]);
-        let b = parse_cidrs(&["192.168.0.0/16"]);
-        assert!(ipv6_traffic_is_leaking(true, &[a.as_slice(), b.as_slice()]));
     }
 }

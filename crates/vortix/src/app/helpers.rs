@@ -129,6 +129,30 @@ impl App {
             .collect()
     }
 
+    /// Off-thread DNS leak probe (3s UDP timeout). Result returns via
+    /// `TelemetryUpdate::DnsLeak`. See [`crate::core::dns_leak`].
+    pub(crate) fn spawn_dns_leak_probe(&self) {
+        use crate::core::dns_leak::DnsLeakStatus;
+        if self.registry.primary().is_none() {
+            let _ = self.runtime.cmd_tx.send(crate::message::Message::Telemetry(
+                crate::core::telemetry::TelemetryUpdate::DnsLeak(DnsLeakStatus::Unknown),
+            ));
+            return;
+        }
+        let configured = self
+            .runtime
+            .dns_server
+            .split([',', ' '])
+            .find_map(|s| s.trim().parse::<std::net::IpAddr>().ok());
+        let tx = self.runtime.cmd_tx.clone();
+        std::thread::spawn(move || {
+            let status = crate::core::dns_leak::check(configured);
+            let _ = tx.send(crate::message::Message::Telemetry(
+                crate::core::telemetry::TelemetryUpdate::DnsLeak(status),
+            ));
+        });
+    }
+
     /// Whether the registry currently has at least one Connected tunnel.
     #[must_use]
     pub(crate) fn has_active_connection(&self) -> bool {
@@ -388,22 +412,17 @@ impl App {
         cached.total_lines.saturating_sub(viewport_height)
     }
 
-    /// Copy public IP address to clipboard.
-    ///
-    /// Plan 002 U8: replaced platform-specific shell-outs (pbcopy on
-    /// macOS; xclip/wl-copy/xsel on Linux) with the `arboard` crate,
-    /// which auto-detects the platform clipboard backend. Users no
-    /// longer need any of those binaries installed.
+    /// Copy the current public IPv4 address to clipboard.
     pub(crate) fn copy_ip_to_clipboard(&mut self) {
         let ip_str = self.runtime.public_ip.clone();
         if ip_str.is_empty() || ip_str == constants::MSG_FETCHING || ip_str.starts_with("Error") {
-            self.show_toast("No valid IP available yet".to_string(), ToastType::Error);
+            self.show_toast("No valid IPv4 available yet".to_string(), ToastType::Error);
             return;
         }
         match arboard::Clipboard::new() {
             Ok(mut clipboard) => match clipboard.set_text(ip_str.clone()) {
                 Ok(()) => {
-                    self.show_toast(format!("Copied IP: {ip_str}"), ToastType::Success);
+                    self.show_toast(format!("Copied IPv4: {ip_str}"), ToastType::Success);
                 }
                 Err(e) => {
                     self.show_toast(

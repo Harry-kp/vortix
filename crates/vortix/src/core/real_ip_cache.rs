@@ -1,40 +1,13 @@
-//! Persisted real-IP cache.
+//! Persisted real-IP cache — IPv4 + IPv6. Lets the Security Guard
+//! populate the Real IPv4 / Real IPv6 rows on launch even when no
+//! disconnected window has occurred in the current process.
 //!
-//! The Security Guard's `Real IP` row needs the user's pre-VPN
-//! public IP to (a) render something useful and (b) detect IP
-//! leaks (`real_ip == public_ip` means the VPN isn't masking).
-//!
-//! Telemetry can only learn the real IP during a disconnected
-//! window — once a VPN is up, every IP probe routes through the
-//! VPN and returns the exit IP. Users who always launch vortix
-//! with a VPN already running have NO disconnected window in the
-//! current process lifetime, so the in-memory `real_ip` stays
-//! `None` and the row reads `detecting…` forever.
-//!
-//! This module persists the last-known real IP to a tiny file
-//! (`<config_dir>/real-ip.cache`) so subsequent launches can
-//! display it immediately. The cache refreshes whenever
-//! telemetry confirms a fresh disconnected sample (overwrite on
-//! each safe-to-cache event in the telemetry handler).
-//!
-//! File format — plain text, two lines:
-//!   `<ip>\n`
-//!   `<captured-unix-timestamp>\n`
-//!
-//! Mode 0600 on Unix (modest privacy concern — your real public
-//! IP shouldn't be world-readable on a shared system).
-//!
-//! Staleness: the timestamp lets callers reason about freshness
-//! ("loaded value is 47 days old — user has probably moved
-//! networks") but loading IS unconditional — a stale `real_ip`
-//! beats no `real_ip` for the Security Guard's purposes, and a
-//! fresh disconnected sample will overwrite it the moment the
-//! user disconnects in the new session.
+//! File format: `<ip>\n<unix-timestamp>\n`. Mode 0600 on Unix.
 
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::constants::REAL_IP_CACHE_FILE;
+use crate::constants::{REAL_IPV6_CACHE_FILE, REAL_IP_CACHE_FILE};
 
 /// Cached real-IP record loaded from disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,13 +20,26 @@ pub struct CachedRealIp {
     pub captured_at: Option<u64>,
 }
 
-/// Load the cached real IP from `<config_dir>/real-ip.cache`.
-/// Returns `None` if the file doesn't exist, is empty, or is
-/// malformed — caller falls back to telemetry detection in that
-/// case.
 #[must_use]
 pub fn load(config_dir: &Path) -> Option<CachedRealIp> {
-    let path = config_dir.join(REAL_IP_CACHE_FILE);
+    load_from(config_dir, REAL_IP_CACHE_FILE)
+}
+
+pub fn save(config_dir: &Path, ip: &str) {
+    save_to(config_dir, REAL_IP_CACHE_FILE, ip);
+}
+
+#[must_use]
+pub fn load_ipv6(config_dir: &Path) -> Option<CachedRealIp> {
+    load_from(config_dir, REAL_IPV6_CACHE_FILE)
+}
+
+pub fn save_ipv6(config_dir: &Path, ip: &str) {
+    save_to(config_dir, REAL_IPV6_CACHE_FILE, ip);
+}
+
+fn load_from(config_dir: &Path, file: &str) -> Option<CachedRealIp> {
+    let path = config_dir.join(file);
     let content = std::fs::read_to_string(&path).ok()?;
     let mut lines = content.lines();
     let ip = lines.next()?.trim().to_string();
@@ -64,10 +50,7 @@ pub fn load(config_dir: &Path) -> Option<CachedRealIp> {
     Some(CachedRealIp { ip, captured_at })
 }
 
-/// Persist the real IP to `<config_dir>/real-ip.cache`. Best-
-/// effort: any I/O failure is silently ignored — the cache is a
-/// convenience, not a correctness guarantee. Mode 0600 on Unix.
-pub fn save(config_dir: &Path, ip: &str) {
+fn save_to(config_dir: &Path, file: &str, ip: &str) {
     let trimmed = ip.trim();
     if trimmed.is_empty() {
         return;
@@ -77,7 +60,7 @@ pub fn save(config_dir: &Path, ip: &str) {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let content = format!("{trimmed}\n{ts}\n");
-    let path = config_dir.join(REAL_IP_CACHE_FILE);
+    let path = config_dir.join(file);
 
     // Best-effort create the parent dir; silently skip on failure
     // (a misconfigured config dir doesn't deserve a crash here).

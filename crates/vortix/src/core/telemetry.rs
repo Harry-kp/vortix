@@ -65,8 +65,9 @@ pub enum TelemetryUpdate {
     Dns(String),
     /// Updated physical location (City, Country).
     Location(String),
-    /// IPv6 leak detection result (true = leak detected).
-    Ipv6Leak(bool),
+    /// Public IPv6 observed by the probe, `None` if unreachable.
+    PublicIpv6(Option<String>),
+    DnsLeak(crate::core::dns_leak::DnsLeakStatus),
     /// Log message with level for production logging (uses centralized logger)
     Log(LogLevel, String),
 }
@@ -551,28 +552,25 @@ fn fetch_latency(tx: &Sender<TelemetryUpdate>, cfg: &std::sync::Arc<TelemetryCon
     });
 }
 
-/// Fetches DNS configuration and checks for IPv6 leaks.
+/// Fetches DNS configuration and probes the current public IPv6.
 fn fetch_security_info(tx: &Sender<TelemetryUpdate>, cfg: &std::sync::Arc<TelemetryConfig>) {
     let tx_clone = tx.clone();
     let cfg = std::sync::Arc::clone(cfg);
     thread::spawn(move || {
-        // Route DNS lookup through the platform aggregate (plan 003 U7).
         let dns = crate::platform::current_platform().dns.get_dns_server();
-
         if let Some(dns_server) = dns {
             let _ = tx_clone.send(TelemetryUpdate::Dns(dns_server));
         }
 
-        // Check for IPv6 connectivity with multiple endpoints (indicates potential leak when VPN active)
-        let mut is_leaking = false;
         let ipv6_timeout = Duration::from_secs(cfg.api_timeout);
+        let mut public_v6: Option<String> = None;
         for endpoint in &cfg.ipv6_check_apis {
-            if crate::core::telemetry_http::probe_ipv6(endpoint, ipv6_timeout) {
-                is_leaking = true;
+            if let Some(ip) = crate::core::telemetry_http::probe_ipv6(endpoint, ipv6_timeout) {
+                public_v6 = Some(ip);
                 break;
             }
         }
-        let _ = tx_clone.send(TelemetryUpdate::Ipv6Leak(is_leaking));
+        let _ = tx_clone.send(TelemetryUpdate::PublicIpv6(public_v6));
     });
 }
 

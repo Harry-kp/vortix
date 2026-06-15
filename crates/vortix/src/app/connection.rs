@@ -419,7 +419,8 @@ impl App {
         self.runtime.location = crate::constants::MSG_DETECTING.to_string();
         self.runtime.isp = crate::constants::MSG_DETECTING.to_string();
         self.runtime.dns_server = crate::constants::MSG_DETECTING.to_string();
-        self.runtime.ipv6_leak = false;
+        self.runtime.dns_leak = crate::core::dns_leak::DnsLeakStatus::Unknown;
+        self.runtime.public_ipv6 = None;
         self.runtime.latency_ms = 0;
         self.runtime.packet_loss = 0.0;
         self.runtime.jitter_ms = 0;

@@ -19,7 +19,7 @@
 //!   on-screen and what the help shows is structurally impossible.
 //! - **Guard** — card-style explainer for the Security Guard panel:
 //!   the three headline states (EXPOSED / PARTIAL / PROTECTED) and
-//!   what each row (IP, DNS, Killswitch, Encryption, IPv6) actually
+//!   what each row (IP, DNS, Killswitch, Encryption) actually
 //!   checks. Complements the Sigils tab — sigils explain the glyphs,
 //!   Guard explains the semantics.
 
@@ -186,7 +186,7 @@ const ROLE_GLOSSARY_FOOTER: &str =
 const GUARD_GLOSSARY: &[(&str, &str)] = &[
     (
         "EXPOSED",
-        "No tunnel is up, or no tunnel claims your kernel default route. All internet traffic flows via your normal ISP — websites see your real IP. If you intended a VPN, this is the alarm state: connect a profile or check why your tunnel dropped.",
+        "No tunnel is up, or no tunnel claims your kernel default route. All internet traffic flows via your normal ISP — websites see your real IPv4 (and IPv6 if you have it). If you intended a VPN, this is the alarm state: connect a profile or check why your tunnel dropped.",
     ),
     (
         "PARTIAL",
@@ -197,20 +197,20 @@ const GUARD_GLOSSARY: &[(&str, &str)] = &[
         "A tunnel owns your kernel default route, the cipher is modern AEAD, killswitch is engaged, and neither IP nor DNS is leaking. New outbound connections flow through the tunnel. This is the goal state for a full-tunnel VPN.",
     ),
     (
-        "Identity → Real IP",
-        "Your cached pre-VPN public IP — what your ISP would expose you as if no tunnel were up. Always informational (no safety verdict on this row): it's what you'd revert to if the VPN dropped. In EXPOSED state this equals Exit IP because nothing is masking.",
+        "Identity → Real IPv4 / Real IPv6",
+        "Your cached pre-VPN public addresses — what your ISP would expose you as if no tunnel were up. Always informational (no safety verdict on these rows): they're what you'd revert to if the VPN dropped. When your host has no IPv6 connectivity the row collapses to a single `Real IP` line; with v6 present, `Real IPv4` and `Real IPv6` render as separate rows. `Real IPv6` reads `checking…` until vortix can prove the v6 probe escaped any active tunnel (either a fully-disconnected sample or a tunnel whose AllowedIPs lack `::/0`).",
     ),
     (
-        "Identity → Exit IP",
-        "The public IP the rest of the internet sees you as right now. With a working full-tunnel VPN this is the tunnel's exit IP and the row reads ✓. When it matches Real IP, the row goes ✗ with 'real IP exposed' — masking has failed and your traffic is leaking.",
+        "Identity → Exit IPv4 / Exit IPv6",
+        "The public addresses the rest of the internet sees you as right now. With a working full-tunnel VPN these are the tunnel's exit addresses and the rows read ✓. When `Exit IPv4` matches `Real IPv4` the row goes ✗ with 'real IPv4 exposed' — IPv4 masking has failed. The `Exit IPv6` row carries the same per-family verdict: ✓ when `public_ipv6` differs from `real_ipv6`, ✗ with 'v6 exposed — matches real IPv6' when they match.",
     ),
     (
         "Identity → Location",
-        "Geo lookup of Exit IP (city + country). Sanity check: connect a German VPN, this should say DE. If it still says your home country, the tunnel didn't take over the default route.",
+        "Geo lookup of the IPv4 exit (city + country). Sanity check: connect a German VPN, this should say DE. If it still says your home country, the tunnel didn't take over the default route.",
     ),
     (
         "Identity → DNS",
-        "Which DNS server resolves your queries right now, with the provider tag inlined when recognised (Cloudflare/Google/Quad9). If a VPN pushed DNS, this should be the VPN's resolver, not your ISP's — otherwise DNS queries leak the names of sites you visit even while the tunnel carries the actual traffic.",
+        "Configured resolver IP with the provider tag inlined when recognised (Cloudflare/Google/Quad9/OpenDNS). The ✓/✗ verdict is a recursor-IP echo probe: vortix resolves `o-o.myaddr.l.google.com` TXT through the configured DNS, and Google's authoritative server returns the IP of the recursor that actually walked the chain. If the recursor IP is in the same provider as the configured DNS → ✓ Protected (the resolver you set IS the one answering). If it's a different provider → ✗ leaking, sub-line names the foreign recursor (e.g. `leaking — queries answered by 208.67.222.222, not configured 9.9.9.9`). This is the same mechanism dnsleaktest.com and ipleak.net use.",
     ),
     (
         "Defense → Killswitch",
@@ -219,10 +219,6 @@ const GUARD_GLOSSARY: &[(&str, &str)] = &[
     (
         "Defense → Encryption",
         "The tunnel's cipher annotated with its security grade. ChaCha20-Poly1305 / AES-GCM → modern AEAD. AES-256-CBC / AES-256-CTR → strong. 3DES / AES-128-CBC → deprecated (alarm + 'upgrade to AES-GCM' sub-line). BF / DES / RC4 / NULL → INSECURE (loud alarm + 'broken cipher' sub-line).",
-    ),
-    (
-        "Defense → IPv6",
-        "Three states based on whether IPv6 traffic is going through (or bypassing) your VPN: \"Protected ✓\" — at least one Connected tunnel declares `::/0` in its routes, so v6 packets ride inside it. \"Leaking ✗\" — your host CAN reach IPv6 endpoints but NO active tunnel covers v6; v6 traffic is escaping via your normal ISP connection (real privacy leak). \"Inactive ─\" — no v6 traffic in play (host has no IPv6 connectivity OR no v6 endpoints were probed); not a leak and not a protection, just nothing to evaluate. Note: vortix's killswitch itself still enforces v4-only on every platform today — IPv6 protection comes from the VPN tunnel's own routes, not from the firewall.",
     ),
 ];
 
@@ -587,14 +583,13 @@ mod tests {
             "PARTIAL",
             "PROTECTED",
             // Identity rows.
-            "Identity → Real IP",
-            "Identity → Exit IP",
+            "Identity → Real IPv4 / Real IPv6",
+            "Identity → Exit IPv4 / Exit IPv6",
             "Identity → Location",
             "Identity → DNS",
             // Defense rows.
             "Defense → Killswitch",
             "Defense → Encryption",
-            "Defense → IPv6",
         ] {
             assert!(
                 labels.contains(&expected),

@@ -96,13 +96,10 @@ pub const LOGS_DIR_NAME: &str = "logs";
 pub const METADATA_FILE_NAME: &str = "metadata.json";
 /// Kill switch state persistence filename.
 pub const KILLSWITCH_STATE_FILE: &str = "killswitch.state";
-/// Cached real IP persistence filename. Holds the user's last-known
-/// pre-VPN public IP so the Security Guard can populate the `Real IP`
-/// row across vortix restarts — including the launch-with-VPN-up
-/// case where vortix has no opportunity to learn the real IP from
-/// telemetry in its current process lifetime. Format:
-/// `<ip>\n<unix-timestamp>\n`. Mode 0600.
+/// Cached pre-VPN public IPv4 / IPv6 filenames (mode 0600). See
+/// [`crate::core::real_ip_cache`].
 pub const REAL_IP_CACHE_FILE: &str = "real-ip.cache";
+pub const REAL_IPV6_CACHE_FILE: &str = "real-ipv6.cache";
 
 // === Platform-Specific Paths ===
 

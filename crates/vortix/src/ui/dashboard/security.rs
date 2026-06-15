@@ -34,7 +34,8 @@ const SECTION_HEADER_MIN_INNER_WIDTH: u16 = 24;
 ///
 /// 10 chars accommodates the longest Identity/Defense row labels
 /// without truncation: `Killswitch` (10), `Encryption` (10),
-/// `Real IP` / `Exit IP` / `Location` / `DNS` / `IPv6` (≤8).
+/// `Real IPv4` / `Real IPv6` / `Exit IPv4` / `Exit IPv6` (9), and
+/// the v4-only fallbacks `Real IP` / `Exit IP` (≤8).
 const LABEL_COLUMN_WIDTH: usize = 12;
 
 /// Total width of the right-pinned sigil column: 1-char sigil + 1-space pad.
@@ -78,6 +79,10 @@ impl Sigil {
 
     fn style(self) -> Style {
         crate::ui::sigils::sigil(self.id()).style()
+    }
+
+    fn value_color(self) -> Color {
+        crate::ui::sigils::sigil(self.id()).color
     }
 }
 
@@ -123,14 +128,6 @@ impl CipherStrength {
             Self::Modern | Self::Strong => Sigil::OkMuted,
             Self::Deprecated => Sigil::AlarmWarn,
             Self::Insecure => Sigil::AlarmError,
-        }
-    }
-
-    fn value_color(self) -> Color {
-        match self {
-            Self::Modern | Self::Strong => theme::NORD_YELLOW,
-            Self::Deprecated => theme::WARNING,
-            Self::Insecure => theme::ERROR,
         }
     }
 
@@ -219,19 +216,8 @@ fn section_header(name: &'static str) -> Line<'static> {
     ))
 }
 
-/// Single row in the audit panel. Three columns visually: indent+label
-/// (fixed width), value (gets the remaining space), sigil (right-pinned).
-///
-/// `value_color` is the colour of the value text itself — usually
-/// `theme::TEXT_PRIMARY` for muted-OK rows or the sigil's colour for
-/// alarming rows.
-fn audit_row(
-    label: &str,
-    value: &str,
-    value_color: Color,
-    sigil: Sigil,
-    inner_width: usize,
-) -> Line<'static> {
+/// Value color is derived from the sigil so each row reads as one unit.
+fn audit_row(label: &str, value: &str, sigil: Sigil, inner_width: usize) -> Line<'static> {
     let label_col = format!("{label:<10}: ");
     debug_assert_eq!(label_col.chars().count(), LABEL_COLUMN_WIDTH);
 
@@ -246,10 +232,91 @@ fn audit_row(
 
     Line::from(vec![
         Span::styled(label_col, Style::default().fg(theme::TEXT_SECONDARY)),
-        Span::styled(value_truncated, Style::default().fg(value_color)),
+        Span::styled(value_truncated, Style::default().fg(sigil.value_color())),
         Span::raw(padding),
         Span::styled(sigil_col, sigil.style()),
     ])
+}
+
+fn push_dns_rows(lines: &mut Vec<Line<'static>>, s: &PanelState, w: usize) {
+    use crate::core::dns_leak::DnsLeakStatus;
+    let dns_value = format_value_with_tag(&s.dns_server, s.dns_provider);
+    let sigil = match &s.dns_leak {
+        DnsLeakStatus::Leaking { .. } => Sigil::AlarmError,
+        DnsLeakStatus::ProbeFailed => Sigil::NotApplicable,
+        DnsLeakStatus::Protected { .. } | DnsLeakStatus::Unknown => Sigil::OkMuted,
+    };
+    lines.push(audit_row("DNS", &dns_value, sigil, w));
+    if let DnsLeakStatus::Leaking {
+        recursor,
+        configured,
+    } = &s.dns_leak
+    {
+        let msg = format!("leaking — queries answered by {recursor}, not configured {configured}");
+        lines.push(alarm_subline(&msg, w));
+    }
+}
+
+fn has_v6_signal(s: &PanelState) -> bool {
+    s.real_ipv6.is_some() || s.public_ipv6.is_some()
+}
+
+fn push_real_ip_rows(lines: &mut Vec<Line<'static>>, s: &PanelState, w: usize) {
+    let v6 = has_v6_signal(s);
+    let v4_label = if v6 { "Real IPv4" } else { "Real IP" };
+    let (v4_value, v4_sigil) = match s.real_ip.as_deref() {
+        Some(ip) if !ip.is_empty() => (ip.to_string(), Sigil::OkMuted),
+        _ => ("detecting…".to_string(), Sigil::NotApplicable),
+    };
+    lines.push(audit_row(v4_label, &v4_value, v4_sigil, w));
+    if v6 {
+        let (v6_value, v6_sigil) = match s.real_ipv6.as_deref() {
+            Some(ip) => (ip.to_string(), Sigil::OkMuted),
+            None => ("checking…".to_string(), Sigil::NotApplicable),
+        };
+        lines.push(audit_row("Real IPv6", &v6_value, v6_sigil, w));
+    }
+}
+
+fn push_exit_ip_rows(lines: &mut Vec<Line<'static>>, s: &PanelState, w: usize) {
+    let v6 = has_v6_signal(s);
+    let v4_label = if v6 { "Exit IPv4" } else { "Exit IP" };
+    let v4_sigil = match s.ip_status {
+        IpStatus::Masked => Sigil::OkMuted,
+        IpStatus::Leaking => Sigil::AlarmError,
+        IpStatus::Pending => Sigil::NotApplicable,
+    };
+    lines.push(audit_row(v4_label, &s.public_ip, v4_sigil, w));
+    if s.ip_status == IpStatus::Leaking {
+        lines.push(alarm_subline("real IPv4 exposed", w));
+    }
+    if v6 {
+        push_exit_ipv6_row(lines, s, w);
+    }
+}
+
+fn push_exit_ipv6_row(lines: &mut Vec<Line<'static>>, s: &PanelState, w: usize) {
+    let (v6_value, v6_sigil, leak_subline) = match s.ipv6_status {
+        Ipv6RowStatus::Masked => (
+            s.public_ipv6.clone().unwrap_or_else(|| "checking…".into()),
+            Sigil::OkMuted,
+            false,
+        ),
+        Ipv6RowStatus::Leaking => (
+            s.public_ipv6.clone().unwrap_or_default(),
+            Sigil::AlarmError,
+            true,
+        ),
+        Ipv6RowStatus::Pending | Ipv6RowStatus::Absent => (
+            s.public_ipv6.clone().unwrap_or_else(|| "checking…".into()),
+            Sigil::NotApplicable,
+            false,
+        ),
+    };
+    lines.push(audit_row("Exit IPv6", &v6_value, v6_sigil, w));
+    if leak_subline {
+        lines.push(alarm_subline("v6 exposed — matches real IPv6", w));
+    }
 }
 
 /// One-line human-readable explainer rendered under an alarming row.
@@ -289,27 +356,21 @@ struct PanelState {
     show_section_headers: bool,
 
     // Identity
-    /// Cached pre-VPN public IP (your ISP-visible address). Always
-    /// shown in its own row when known so the user can see what
-    /// they'd be exposed as if the VPN dropped — the masking question
-    /// has two sides and the panel now surfaces both.
     real_ip: Option<String>,
-    /// Currently-observed public IP. With a working VPN this equals
-    /// the tunnel's exit IP; without (or with a leak) this equals
-    /// `real_ip`.
     public_ip: String,
+    real_ipv6: Option<String>,
+    public_ipv6: Option<String>,
     location: Option<String>,
     ip_status: IpStatus,
+    ipv6_status: Ipv6RowStatus,
     dns_server: String,
     dns_provider: Option<&'static str>,
-    dns_leaking: bool,
-    real_dns: Option<String>,
+    dns_leak: crate::core::dns_leak::DnsLeakStatus,
 
     // Defense
     killswitch_mode: KillSwitchMode,
     killswitch_state: KillSwitchState,
     encryption: String,
-    ipv6_status: Ipv6Status,
 
     // Footer
     last_check_secs: Option<u64>,
@@ -323,10 +384,11 @@ enum IpStatus {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Ipv6Status {
-    Protected,
-    V4Only,
+enum Ipv6RowStatus {
+    Absent,
+    Masked,
     Leaking,
+    Pending,
 }
 
 impl PanelState {
@@ -442,8 +504,10 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
 /// degraded so the title doesn't claim full protection while a row is red.
 fn verdict_for_protected(app: &App, primary_snap: Option<&TunnelSnapshot>) -> Verdict {
     let ip_leaking = matches!(&app.runtime.real_ip, Some(real) if &app.runtime.public_ip == real);
-    let dns_leaking =
-        matches!(&app.runtime.real_dns, Some(real) if &app.runtime.dns_server == real);
+    let dns_leaking = matches!(
+        app.runtime.dns_leak,
+        crate::core::dns_leak::DnsLeakStatus::Leaking { .. }
+    );
     let ks_alarm = matches!(
         (app.runtime.killswitch_mode, app.runtime.killswitch_state),
         (
@@ -491,33 +555,19 @@ fn compact_to_fit(audit: Vec<Line<'static>>, available_height: usize) -> Vec<Lin
 
 // ── State collection ────────────────────────────────────────────────────────
 
-fn ipv6_row_style(status: Ipv6Status) -> (&'static str, ratatui::style::Color, Sigil) {
-    match status {
-        Ipv6Status::Protected => ("Protected", theme::SUCCESS, Sigil::OkMuted),
-        Ipv6Status::V4Only => ("Inactive", theme::INACTIVE, Sigil::NotApplicable),
-        Ipv6Status::Leaking => ("Leaking", theme::ERROR, Sigil::AlarmError),
+fn derive_ipv6_row_status(app: &App) -> Ipv6RowStatus {
+    let public = app.runtime.public_ipv6.as_deref();
+    let real = app.runtime.real_ipv6.as_deref();
+    if public.is_none() && real.is_none() {
+        return Ipv6RowStatus::Absent;
     }
-}
-
-fn derive_ipv6_status(app: &App) -> Ipv6Status {
-    if app.runtime.ipv6_leak {
-        return Ipv6Status::Leaking;
+    if app.registry.primary().is_none() {
+        return Ipv6RowStatus::Masked;
     }
-    let any_tunnel_covers_v6 = app.registry.snapshot_all().into_iter().any(|snap| {
-        matches!(snap.state, Connection::Connected { .. })
-            && match snap.role {
-                crate::vortix_core::engine::Role::Primary { allowed_ips }
-                | crate::vortix_core::engine::Role::Addressable { allowed_ips }
-                | crate::vortix_core::engine::Role::AddressableSuppressed { allowed_ips } => {
-                    crate::vortix_core::cidr::claims_default_route_v6(&allowed_ips)
-                }
-                _ => false,
-            }
-    });
-    if any_tunnel_covers_v6 {
-        Ipv6Status::Protected
-    } else {
-        Ipv6Status::V4Only
+    match (public, real) {
+        (Some(p), Some(r)) if p == r => Ipv6RowStatus::Leaking,
+        (Some(_), Some(_)) => Ipv6RowStatus::Masked,
+        _ => Ipv6RowStatus::Pending,
     }
 }
 
@@ -542,13 +592,7 @@ fn collect_protected_state(
         _ => IpStatus::Pending,
     };
 
-    let dns_leaking = match &app.runtime.real_dns {
-        Some(real_dns) => &app.runtime.dns_server == real_dns,
-        None => false,
-    };
-
     let dns_provider = dns_provider_label(&app.runtime.dns_server);
-
     let encryption = derive_encryption(primary_snap);
 
     let location = if app.runtime.location.is_empty()
@@ -565,16 +609,17 @@ fn collect_protected_state(
         show_section_headers: true,
         real_ip: app.runtime.real_ip.clone(),
         public_ip: app.runtime.public_ip.clone(),
+        real_ipv6: app.runtime.real_ipv6.clone(),
+        public_ipv6: app.runtime.public_ipv6.clone(),
         location,
         ip_status,
+        ipv6_status: derive_ipv6_row_status(app),
         dns_server: app.runtime.dns_server.clone(),
         dns_provider,
-        dns_leaking,
-        real_dns: app.runtime.real_dns.clone(),
+        dns_leak: app.runtime.dns_leak.clone(),
         killswitch_mode: app.runtime.killswitch_mode,
         killswitch_state: app.runtime.killswitch_state,
         encryption,
-        ipv6_status: derive_ipv6_status(app),
         last_check_secs: app
             .runtime
             .last_security_check
@@ -608,7 +653,7 @@ fn collect_partial_state(
     // when no primary owns the default route does "split-route — no
     // exit" become the truthful rendering.
     let has_primary = primary_snap.is_some();
-    let (public_ip, location, ip_status, dns_leaking, real_dns) = if has_primary {
+    let (public_ip, location, ip_status) = if has_primary {
         let ip_status = match &app.runtime.real_ip {
             Some(real)
                 if !app.runtime.public_ip.is_empty()
@@ -624,7 +669,6 @@ fn collect_partial_state(
             }
             _ => IpStatus::Pending,
         };
-        let dns_leaking = matches!(&app.runtime.real_dns, Some(r) if &app.runtime.dns_server == r);
         let location = if app.runtime.location.is_empty()
             || app.runtime.location == constants::MSG_DETECTING
             || app.runtime.location == constants::MSG_FETCHING
@@ -633,17 +677,9 @@ fn collect_partial_state(
         } else {
             Some(app.runtime.location.clone())
         };
-        (
-            app.runtime.public_ip.clone(),
-            location,
-            ip_status,
-            dns_leaking,
-            app.runtime.real_dns.clone(),
-        )
+        (app.runtime.public_ip.clone(), location, ip_status)
     } else {
-        // No primary — IP row will render "split-route — no exit"
-        // (the build_partial_audit branch keys off public_ip being empty).
-        (String::new(), None, IpStatus::Pending, false, None)
+        (String::new(), None, IpStatus::Pending)
     };
 
     PanelState {
@@ -651,16 +687,17 @@ fn collect_partial_state(
         show_section_headers: true,
         real_ip: app.runtime.real_ip.clone(),
         public_ip,
+        real_ipv6: app.runtime.real_ipv6.clone(),
+        public_ipv6: app.runtime.public_ipv6.clone(),
         location,
         ip_status,
+        ipv6_status: derive_ipv6_row_status(app),
         dns_server: app.runtime.dns_server.clone(),
         dns_provider: dns_provider_label(&app.runtime.dns_server),
-        dns_leaking,
-        real_dns,
+        dns_leak: app.runtime.dns_leak.clone(),
         killswitch_mode: app.runtime.killswitch_mode,
         killswitch_state: app.runtime.killswitch_state,
         encryption,
-        ipv6_status: derive_ipv6_status(app),
         last_check_secs: app
             .runtime
             .last_security_check
@@ -715,72 +752,16 @@ fn build_protected_audit(s: &PanelState) -> Vec<Line<'static>> {
         lines.push(section_header("Identity"));
     }
 
-    // Real IP row — your cached pre-VPN IP. Always informational (no
-    // safety verdict on this row — the Exit IP row carries the verdict).
-    // Detection-pending lands on `─`; known value shows muted-OK.
-    let (real_ip_value, real_ip_sigil, real_ip_color) = match s.real_ip.as_deref() {
-        Some(ip) if !ip.is_empty() => (ip.to_string(), Sigil::OkMuted, theme::TEXT_PRIMARY),
-        _ => (
-            "detecting…".to_string(),
-            Sigil::NotApplicable,
-            theme::INACTIVE,
-        ),
-    };
-    lines.push(audit_row(
-        "Real IP",
-        &real_ip_value,
-        real_ip_color,
-        real_ip_sigil,
-        w,
-    ));
+    push_real_ip_rows(&mut lines, s, w);
+    push_exit_ip_rows(&mut lines, s, w);
 
-    // Exit IP row — what the world sees right now. Carries the
-    // masking verdict: ✓ when it differs from Real IP (mask works),
-    // ✗ when it matches (leak), pending while detecting.
-    let (exit_sigil, exit_color) = match s.ip_status {
-        IpStatus::Masked => (Sigil::OkMuted, theme::TEXT_PRIMARY),
-        IpStatus::Leaking => (Sigil::AlarmError, theme::ERROR),
-        IpStatus::Pending => (Sigil::NotApplicable, theme::WARNING),
+    let (loc_value, loc_sigil) = match s.location.as_deref() {
+        Some(loc) if !loc.is_empty() => (loc.to_string(), Sigil::OkMuted),
+        _ => ("detecting…".to_string(), Sigil::NotApplicable),
     };
-    lines.push(audit_row(
-        "Exit IP",
-        &s.public_ip,
-        exit_color,
-        exit_sigil,
-        w,
-    ));
-    if s.ip_status == IpStatus::Leaking {
-        lines.push(alarm_subline("real IP exposed", w));
-    }
+    lines.push(audit_row("Location", &loc_value, loc_sigil, w));
 
-    // Location row — geo of Exit IP. Informational sanity check
-    // (connected a DE server, should say DE).
-    let (loc_value, loc_sigil, loc_color) = match s.location.as_deref() {
-        Some(loc) if !loc.is_empty() => (loc.to_string(), Sigil::OkMuted, theme::TEXT_PRIMARY),
-        _ => (
-            "detecting…".to_string(),
-            Sigil::NotApplicable,
-            theme::INACTIVE,
-        ),
-    };
-    lines.push(audit_row("Location", &loc_value, loc_color, loc_sigil, w));
-
-    // DNS row — provider tag still inlines (Cloudflare/Google/Quad9)
-    // since DNS doesn't have a separate "Provider" row to graduate to.
-    let dns_value = format_value_with_tag(&s.dns_server, s.dns_provider);
-    let (dns_sigil, dns_color) = if s.dns_leaking {
-        (Sigil::AlarmError, theme::ERROR)
-    } else {
-        (Sigil::OkMuted, theme::TEXT_PRIMARY)
-    };
-    lines.push(audit_row("DNS", &dns_value, dns_color, dns_sigil, w));
-    if s.dns_leaking {
-        let why = match &s.real_dns {
-            Some(_) => "leaking — matches pre-VPN resolver",
-            None => "leaking — see status",
-        };
-        lines.push(alarm_subline(why, w));
-    }
+    push_dns_rows(&mut lines, s, w);
 
     lines.push(Line::from(""));
 
@@ -788,33 +769,24 @@ fn build_protected_audit(s: &PanelState) -> Vec<Line<'static>> {
         lines.push(section_header("Defense"));
     }
 
-    // Killswitch row
-    let (ks_sigil, ks_color, ks_subline) =
-        killswitch_visuals(s.killswitch_mode, s.killswitch_state);
+    let (ks_sigil, ks_subline) = killswitch_visuals(s.killswitch_mode, s.killswitch_state);
     let ks_value = killswitch_value(s.killswitch_mode, s.killswitch_state);
-    lines.push(audit_row("Killswitch", &ks_value, ks_color, ks_sigil, w));
+    lines.push(audit_row("Killswitch", &ks_value, ks_sigil, w));
     if let Some(why) = ks_subline {
         lines.push(alarm_subline(why, w));
     }
 
-    // Encryption row — annotates the cipher with its security grade.
-    // Modern AEAD / strong stay muted; deprecated / insecure pull the
-    // eye and get an alarm sub-line so the user knows what to do.
     let cipher_strength = classify_cipher(&s.encryption);
     let encryption_value = format!("{} · {}", s.encryption, cipher_strength.label());
     lines.push(audit_row(
         "Encryption",
         &encryption_value,
-        cipher_strength.value_color(),
         cipher_strength.sigil(),
         w,
     ));
     if let Some(why) = cipher_strength.alarm_subline() {
         lines.push(alarm_subline(why, w));
     }
-
-    let (ipv6_value, ipv6_color, ipv6_sigil) = ipv6_row_style(s.ipv6_status);
-    lines.push(audit_row("IPv6", ipv6_value, ipv6_color, ipv6_sigil, w));
 
     lines.push(Line::from(""));
     lines.push(footer_line(s.last_check_secs));
@@ -831,78 +803,35 @@ fn build_partial_audit(s: &PanelState) -> Vec<Line<'static>> {
         lines.push(section_header("Identity"));
     }
 
-    // Real IP row — same as Protected: always informational. Carries
-    // no verdict; just surfaces what you'd be exposed as if the VPN
-    // went down.
-    let (real_ip_value, real_ip_sigil, real_ip_color) = match s.real_ip.as_deref() {
-        Some(ip) if !ip.is_empty() => (ip.to_string(), Sigil::OkMuted, theme::TEXT_PRIMARY),
-        _ => (
-            "detecting…".to_string(),
-            Sigil::NotApplicable,
-            theme::INACTIVE,
-        ),
-    };
-    lines.push(audit_row(
-        "Real IP",
-        &real_ip_value,
-        real_ip_color,
-        real_ip_sigil,
-        w,
-    ));
-
-    // Exit IP row: when a primary owns the default route (Partial
-    // fired from a degraded-defense signal like killswitch=off),
-    // render the real exit IP the same way Protected does. When no
-    // primary owns the default route (split-only topology), flag the
-    // row as not-applicable with the `split-route — no exit`
-    // placeholder. `public_ip` being empty is the in-band signal for
-    // the no-primary case (set by `collect_partial_state`).
+    push_real_ip_rows(&mut lines, s, w);
+    let v6 = has_v6_signal(s);
     if s.public_ip.is_empty() {
+        let v4_label = if v6 { "Exit IPv4" } else { "Exit IP" };
         lines.push(audit_row(
-            "Exit IP",
+            v4_label,
             "split-route — no exit",
-            theme::INACTIVE,
             Sigil::NotApplicable,
             w,
         ));
-    } else {
-        let (exit_sigil, exit_color) = match s.ip_status {
-            IpStatus::Masked => (Sigil::OkMuted, theme::TEXT_PRIMARY),
-            IpStatus::Leaking => (Sigil::AlarmError, theme::ERROR),
-            IpStatus::Pending => (Sigil::NotApplicable, theme::WARNING),
-        };
-        lines.push(audit_row(
-            "Exit IP",
-            &s.public_ip,
-            exit_color,
-            exit_sigil,
-            w,
-        ));
-        if s.ip_status == IpStatus::Leaking {
-            lines.push(alarm_subline("real IP exposed", w));
+        if v6 {
+            lines.push(audit_row(
+                "Exit IPv6",
+                "split-route — no exit",
+                Sigil::NotApplicable,
+                w,
+            ));
         }
+    } else {
+        push_exit_ip_rows(&mut lines, s, w);
     }
 
-    // Location row — geo of Exit IP when known; n-a placeholder
-    // otherwise (the split-only branch and the pending case).
-    let (loc_value, loc_sigil, loc_color) = match s.location.as_deref() {
-        Some(loc) if !loc.is_empty() => (loc.to_string(), Sigil::OkMuted, theme::TEXT_PRIMARY),
-        _ => (
-            "detecting…".to_string(),
-            Sigil::NotApplicable,
-            theme::INACTIVE,
-        ),
+    let (loc_value, loc_sigil) = match s.location.as_deref() {
+        Some(loc) if !loc.is_empty() => (loc.to_string(), Sigil::OkMuted),
+        _ => ("detecting…".to_string(), Sigil::NotApplicable),
     };
-    lines.push(audit_row("Location", &loc_value, loc_color, loc_sigil, w));
+    lines.push(audit_row("Location", &loc_value, loc_sigil, w));
 
-    let dns_value = format_value_with_tag(&s.dns_server, s.dns_provider);
-    lines.push(audit_row(
-        "DNS",
-        &dns_value,
-        theme::TEXT_PRIMARY,
-        Sigil::OkMuted,
-        w,
-    ));
+    push_dns_rows(&mut lines, s, w);
 
     lines.push(Line::from(""));
 
@@ -910,25 +839,19 @@ fn build_partial_audit(s: &PanelState) -> Vec<Line<'static>> {
         lines.push(section_header("Defense"));
     }
 
-    let (ks_sigil, ks_color, ks_subline) =
-        killswitch_visuals(s.killswitch_mode, s.killswitch_state);
+    let (ks_sigil, ks_subline) = killswitch_visuals(s.killswitch_mode, s.killswitch_state);
     let ks_value = killswitch_value(s.killswitch_mode, s.killswitch_state);
-    lines.push(audit_row("Killswitch", &ks_value, ks_color, ks_sigil, w));
+    lines.push(audit_row("Killswitch", &ks_value, ks_sigil, w));
     if let Some(why) = ks_subline {
         lines.push(alarm_subline(why, w));
     }
 
-    // Encryption row — sourced from a representative active tunnel.
-    // Only render when we have a real cipher (skip the `N/A` case where
-    // no tunnel was Connected at scan time — the Killswitch row already
-    // carries the relevant alarm in that situation).
     if s.encryption != "N/A" {
         let cipher_strength = classify_cipher(&s.encryption);
         let encryption_value = format!("{} · {}", s.encryption, cipher_strength.label());
         lines.push(audit_row(
             "Encryption",
             &encryption_value,
-            cipher_strength.value_color(),
             cipher_strength.sigil(),
             w,
         ));
@@ -937,15 +860,13 @@ fn build_partial_audit(s: &PanelState) -> Vec<Line<'static>> {
         }
     }
 
-    let (ipv6_value, ipv6_color, ipv6_sigil) = ipv6_row_style(s.ipv6_status);
-    lines.push(audit_row("IPv6", ipv6_value, ipv6_color, ipv6_sigil, w));
-
     lines.push(Line::from(""));
     lines.push(footer_line(s.last_check_secs));
 
     lines
 }
 
+#[allow(clippy::too_many_lines)]
 fn build_exposed_audit(app: &App, inner_width: u16) -> Vec<Line<'static>> {
     let mut lines = Vec::with_capacity(14);
     let w = inner_width as usize;
@@ -963,25 +884,38 @@ fn build_exposed_audit(app: &App, inner_width: u16) -> Vec<Line<'static>> {
         app.runtime.public_ip.clone()
     };
 
-    // Real IP row — informational, muted-OK (we know what it is).
-    lines.push(audit_row(
-        "Real IP",
-        &exposed_ip,
-        theme::TEXT_PRIMARY,
-        Sigil::OkMuted,
-        w,
-    ));
-    // Exit IP row — same value, carries the alarm.
-    lines.push(audit_row(
-        "Exit IP",
-        &exposed_ip,
-        theme::WARNING,
-        Sigil::AlarmWarn,
-        w,
-    ));
-    lines.push(alarm_subline("no VPN — your real IP is visible", w));
+    let v6_ip = app
+        .runtime
+        .real_ipv6
+        .as_deref()
+        .or(app.runtime.public_ipv6.as_deref())
+        .map(str::to_string);
+    let real_label = if v6_ip.is_some() {
+        "Real IPv4"
+    } else {
+        "Real IP"
+    };
+    let exit_label = if v6_ip.is_some() {
+        "Exit IPv4"
+    } else {
+        "Exit IP"
+    };
 
-    // Location of Exit IP — informational sanity check.
+    lines.push(audit_row(real_label, &exposed_ip, Sigil::OkMuted, w));
+    if let Some(ref ip6) = v6_ip {
+        lines.push(audit_row("Real IPv6", ip6, Sigil::OkMuted, w));
+    }
+    lines.push(audit_row(exit_label, &exposed_ip, Sigil::AlarmWarn, w));
+    if let Some(ref ip6) = v6_ip {
+        lines.push(audit_row("Exit IPv6", ip6, Sigil::AlarmWarn, w));
+    }
+    let alarm = if v6_ip.is_some() {
+        "no VPN — your real IPv4 and IPv6 are visible"
+    } else {
+        "no VPN — your real IPv4 is visible"
+    };
+    lines.push(alarm_subline(alarm, w));
+
     let location = if app.runtime.location.is_empty()
         || app.runtime.location == constants::MSG_DETECTING
         || app.runtime.location == constants::MSG_FETCHING
@@ -995,25 +929,13 @@ fn build_exposed_audit(app: &App, inner_width: u16) -> Vec<Line<'static>> {
     } else {
         Sigil::OkMuted
     };
-    let loc_color = if location == "detecting…" {
-        theme::INACTIVE
-    } else {
-        theme::TEXT_PRIMARY
-    };
-    lines.push(audit_row("Location", &location, loc_color, loc_sigil, w));
+    lines.push(audit_row("Location", &location, loc_sigil, w));
 
-    // DNS row — your ISP's DNS (no VPN to leak from, so no leak check).
     let dns_value = format_value_with_tag(
         &app.runtime.dns_server,
         dns_provider_label(&app.runtime.dns_server),
     );
-    lines.push(audit_row(
-        "DNS",
-        &dns_value,
-        theme::TEXT_PRIMARY,
-        Sigil::OkMuted,
-        w,
-    ));
+    lines.push(audit_row("DNS", &dns_value, Sigil::OkMuted, w));
 
     lines.push(Line::from(""));
 
@@ -1021,18 +943,11 @@ fn build_exposed_audit(app: &App, inner_width: u16) -> Vec<Line<'static>> {
         "Killswitch",
         killswitch_mode_label(app.runtime.killswitch_mode),
         match app.runtime.killswitch_mode {
-            KillSwitchMode::Off => theme::ERROR,
-            _ => theme::TEXT_PRIMARY,
-        },
-        match app.runtime.killswitch_mode {
             KillSwitchMode::Off => Sigil::AlarmError,
             _ => Sigil::OkMuted,
         },
         w,
     ));
-    let (ipv6_value, ipv6_color, ipv6_sigil) = ipv6_row_style(derive_ipv6_status(app));
-    lines.push(audit_row("IPv6", ipv6_value, ipv6_color, ipv6_sigil, w));
-
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "Connect to a profile to protect this traffic.",
@@ -1061,25 +976,16 @@ fn killswitch_value(mode: KillSwitchMode, state: KillSwitchState) -> String {
     }
 }
 
-/// Returns `(sigil, value_color, optional_subline)` for the Killswitch row.
 fn killswitch_visuals(
     mode: KillSwitchMode,
     state: KillSwitchState,
-) -> (Sigil, Color, Option<&'static str>) {
+) -> (Sigil, Option<&'static str>) {
     use KillSwitchMode::{AlwaysOn, Auto, Off};
     use KillSwitchState::Blocking;
     match (mode, state) {
-        (Off, _) => (
-            Sigil::AlarmError,
-            theme::ERROR,
-            Some("off — not protecting"),
-        ),
-        (Auto, Blocking) => (
-            Sigil::AlarmWarn,
-            theme::WARNING,
-            Some("press r to reconnect"),
-        ),
-        (AlwaysOn | Auto, _) => (Sigil::OkMuted, theme::TEXT_PRIMARY, None),
+        (Off, _) => (Sigil::AlarmError, Some("off — not protecting")),
+        (Auto, Blocking) => (Sigil::AlarmWarn, Some("press r to reconnect")),
+        (AlwaysOn | Auto, _) => (Sigil::OkMuted, None),
     }
 }
 
@@ -1229,16 +1135,20 @@ mod tests {
             show_section_headers: true,
             real_ip: Some("203.0.113.5".to_string()),
             public_ip: "1.2.3.4".to_string(),
+            real_ipv6: None,
+            public_ipv6: None,
             location: Some("US-East".to_string()),
             ip_status: IpStatus::Masked,
+            ipv6_status: Ipv6RowStatus::Absent,
             dns_server: "1.1.1.1".to_string(),
             dns_provider: Some("Cloudflare"),
-            dns_leaking: false,
-            real_dns: None,
+            dns_leak: crate::core::dns_leak::DnsLeakStatus::Protected {
+                recursor: "1.1.1.1".parse().unwrap(),
+                configured: "1.1.1.1".parse().unwrap(),
+            },
             killswitch_mode: KillSwitchMode::AlwaysOn,
             killswitch_state: KillSwitchState::Blocking,
             encryption: "ChaCha20-Poly1305".to_string(),
-            ipv6_status: Ipv6Status::V4Only,
             last_check_secs: Some(3),
         }
     }
@@ -1463,11 +1373,12 @@ mod tests {
 
     #[test]
     fn protected_dns_leak_brightens_dns_sigil_and_adds_subline() {
-        // R7 + R15 (AE2): a leaking DNS row goes bright `✗ ` and gets
-        // exactly one sub-line below it. Other rows stay muted.
+        use crate::core::dns_leak::DnsLeakStatus;
         let mut s = baseline_protected_state(40);
-        s.dns_leaking = true;
-        s.real_dns = Some("1.1.1.1".to_string());
+        s.dns_leak = DnsLeakStatus::Leaking {
+            configured: "1.1.1.1".parse().unwrap(),
+            recursor: "218.248.42.7".parse().unwrap(),
+        };
         let lines = build_protected_audit(&s);
 
         let dns_idx = lines
@@ -1535,58 +1446,76 @@ mod tests {
     }
 
     #[test]
-    fn protected_ipv6_inactive_renders_dash_sigil() {
-        let s = baseline_protected_state(34);
+    fn protected_no_v6_connectivity_keeps_legacy_real_ip_and_exit_ip_labels() {
+        let s = baseline_protected_state(48);
         let lines = build_protected_audit(&s);
-        let ipv6 = lines
-            .iter()
-            .find(|l| line_text(l).starts_with("IPv6"))
-            .expect("IPv6 row missing");
-        let text = line_text(ipv6);
-        assert!(text.contains("Inactive"), "IPv6 value got {text:?}");
-        let sigil = ipv6.spans.last().expect("non-empty row");
+        let all_text: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(
-            sigil.content.trim_end() == "─",
-            "IPv6 sigil must be ─, got {:?}",
-            sigil.content
+            all_text.contains("Real IP   :") && all_text.contains("Exit IP   :"),
+            "labels stay as `Real IP` / `Exit IP` when no v6 present: {all_text}"
+        );
+        assert!(
+            !all_text.contains("Real IPv6") && !all_text.contains("Exit IPv6"),
+            "no v6 rows when no v6 connectivity: {all_text}"
         );
     }
 
     #[test]
-    fn protected_ipv6_when_tunnel_covers_v6_renders_protected() {
-        let mut s = baseline_protected_state(34);
-        s.ipv6_status = Ipv6Status::Protected;
+    fn protected_v6_present_renames_v4_label_and_renders_ok_v6_row() {
+        let mut s = baseline_protected_state(60);
+        s.real_ipv6 = Some("2401:4900::abcd".to_string());
+        s.public_ipv6 = Some("2001:db8::1".to_string());
+        s.ipv6_status = Ipv6RowStatus::Masked;
         let lines = build_protected_audit(&s);
-        let ipv6 = lines
-            .iter()
-            .find(|l| line_text(l).starts_with("IPv6"))
-            .expect("IPv6 row missing");
-        let text = line_text(ipv6);
-        assert!(text.contains("Protected"), "IPv6 value got {text:?}");
-        let sigil = ipv6.spans.last().expect("non-empty row");
+        let all_text: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(
-            sigil.content.trim_end() == "✓",
-            "IPv6 sigil must be ✓, got {:?}",
-            sigil.content
+            all_text.contains("Real IPv4") && all_text.contains("Exit IPv4"),
+            "v4 rows must switch to explicit IPv4 labels when v6 present: {all_text}"
+        );
+        let exit_v6_idx = lines
+            .iter()
+            .position(|l| line_text(l).starts_with("Exit IPv6"))
+            .expect("Exit IPv6 row missing");
+        let v6_line = &lines[exit_v6_idx];
+        assert!(line_text(v6_line).contains("2001:db8::1"));
+        assert_eq!(v6_line.spans.last().unwrap().content.trim_end(), "✓");
+    }
+
+    #[test]
+    fn protected_v6_leaking_alarms_exit_ipv6_row() {
+        let mut s = baseline_protected_state(60);
+        s.real_ipv6 = Some("2401:4900::abcd".to_string());
+        s.public_ipv6 = Some("2401:4900::abcd".to_string());
+        s.ipv6_status = Ipv6RowStatus::Leaking;
+        let lines = build_protected_audit(&s);
+        let exit_v6_idx = lines
+            .iter()
+            .position(|l| line_text(l).starts_with("Exit IPv6"))
+            .expect("Exit IPv6 row missing");
+        let v6_line = &lines[exit_v6_idx];
+        assert_eq!(v6_line.spans.last().unwrap().content.trim_end(), "✗");
+        let sub_text = line_text(&lines[exit_v6_idx + 1]);
+        assert!(
+            sub_text.contains("v6 exposed"),
+            "alarm sub-line: {sub_text:?}"
         );
     }
 
     #[test]
-    fn protected_ipv6_when_leaking_renders_alarm() {
-        let mut s = baseline_protected_state(34);
-        s.ipv6_status = Ipv6Status::Leaking;
+    fn protected_v6_pending_renders_checking_in_real_ipv6_row() {
+        let mut s = baseline_protected_state(60);
+        s.real_ipv6 = None;
+        s.public_ipv6 = Some("2401:4900::abcd".to_string());
+        s.ipv6_status = Ipv6RowStatus::Pending;
         let lines = build_protected_audit(&s);
-        let ipv6 = lines
+        let real_v6_idx = lines
             .iter()
-            .find(|l| line_text(l).starts_with("IPv6"))
-            .expect("IPv6 row missing");
-        let text = line_text(ipv6);
-        assert!(text.contains("Leaking"), "IPv6 value got {text:?}");
-        let sigil = ipv6.spans.last().expect("non-empty row");
+            .position(|l| line_text(l).starts_with("Real IPv6"))
+            .expect("Real IPv6 row missing");
+        let text = line_text(&lines[real_v6_idx]);
         assert!(
-            sigil.content.trim_end() == "✗",
-            "IPv6 sigil must be ✗ alarm, got {:?}",
-            sigil.content
+            text.contains("checking…"),
+            "Real IPv6 must show checking…: {text:?}"
         );
     }
 
@@ -1702,8 +1631,6 @@ mod tests {
             !all_text.contains("Defense"),
             "section words must drop at narrow widths: {all_text}"
         );
-        // Seven content rows still render (Real IP / Exit IP / Location
-        // / DNS / Killswitch / Encryption / IPv6).
         for label in [
             "Real IP",
             "Exit IP",
@@ -1711,7 +1638,6 @@ mod tests {
             "DNS",
             "Killswitch",
             "Encryption",
-            "IPv6",
         ] {
             assert!(
                 all_text.contains(label),
@@ -1750,7 +1676,7 @@ mod tests {
         assert!(out.contains("Real IP"), "Real IP row missing:\n{out}");
         assert!(out.contains("Exit IP"), "Exit IP row missing:\n{out}");
         assert!(
-            out.contains("no VPN — your real IP is visible"),
+            out.contains("no VPN — your real IPv4 is visible"),
             "EXPOSED alarm sub-line missing:\n{out}"
         );
         // No legend inside the panel — lives in `?` overlay now.
@@ -1855,18 +1781,18 @@ mod tests {
     }
 
     #[test]
-    fn partial_ipv6_is_not_applicable() {
+    fn partial_no_v6_connectivity_keeps_legacy_labels() {
         let mut app = App::new_test();
         insert_idle_tunnel(&mut app, "alpha");
-        app.runtime.ipv6_leak = false;
 
         let out = render_to_string(&app, 70, 20);
-        assert!(out.contains("Inactive"), "IPv6 value missing:\n{out}");
+        assert!(
+            !out.contains("Real IPv6") && !out.contains("Exit IPv6"),
+            "no v6 connectivity must not render IPv6 rows:\n{out}"
+        );
         assert!(
             !out.contains("Not enforced"),
             "old IPv6 explainer must be gone:\n{out}"
         );
-        // The `─` sigil renders in the right column for the IPv6 row.
-        assert!(out.contains("─"), "IPv6 ─ sigil missing:\n{out}");
     }
 }
