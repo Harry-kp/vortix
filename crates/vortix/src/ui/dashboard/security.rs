@@ -494,7 +494,7 @@ fn compact_to_fit(audit: Vec<Line<'static>>, available_height: usize) -> Vec<Lin
 fn ipv6_row_style(status: Ipv6Status) -> (&'static str, ratatui::style::Color, Sigil) {
     match status {
         Ipv6Status::Protected => ("Protected", theme::SUCCESS, Sigil::OkMuted),
-        Ipv6Status::V4Only => ("v4-only", theme::INACTIVE, Sigil::NotApplicable),
+        Ipv6Status::V4Only => ("Inactive", theme::INACTIVE, Sigil::NotApplicable),
         Ipv6Status::Leaking => ("Leaking", theme::ERROR, Sigil::AlarmError),
     }
 }
@@ -1535,7 +1535,7 @@ mod tests {
     }
 
     #[test]
-    fn protected_ipv6_v4only_renders_dash_sigil() {
+    fn protected_ipv6_inactive_renders_dash_sigil() {
         let s = baseline_protected_state(34);
         let lines = build_protected_audit(&s);
         let ipv6 = lines
@@ -1543,7 +1543,7 @@ mod tests {
             .find(|l| line_text(l).starts_with("IPv6"))
             .expect("IPv6 row missing");
         let text = line_text(ipv6);
-        assert!(text.contains("v4-only"), "IPv6 value got {text:?}");
+        assert!(text.contains("Inactive"), "IPv6 value got {text:?}");
         let sigil = ipv6.spans.last().expect("non-empty row");
         assert!(
             sigil.content.trim_end() == "─",
@@ -1861,7 +1861,7 @@ mod tests {
         app.runtime.ipv6_leak = false;
 
         let out = render_to_string(&app, 70, 20);
-        assert!(out.contains("v4-only"), "IPv6 value missing:\n{out}");
+        assert!(out.contains("Inactive"), "IPv6 value missing:\n{out}");
         assert!(
             !out.contains("Not enforced"),
             "old IPv6 explainer must be gone:\n{out}"
