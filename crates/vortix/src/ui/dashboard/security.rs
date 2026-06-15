@@ -309,6 +309,7 @@ struct PanelState {
     killswitch_mode: KillSwitchMode,
     killswitch_state: KillSwitchState,
     encryption: String,
+    ipv6_status: Ipv6Status,
 
     // Footer
     last_check_secs: Option<u64>,
@@ -319,6 +320,13 @@ enum IpStatus {
     Masked,
     Leaking,
     Pending,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Ipv6Status {
+    Protected,
+    V4Only,
+    Leaking,
 }
 
 impl PanelState {
@@ -483,6 +491,36 @@ fn compact_to_fit(audit: Vec<Line<'static>>, available_height: usize) -> Vec<Lin
 
 // ── State collection ────────────────────────────────────────────────────────
 
+fn ipv6_row_style(status: Ipv6Status) -> (&'static str, ratatui::style::Color, Sigil) {
+    match status {
+        Ipv6Status::Protected => ("Protected", theme::SUCCESS, Sigil::OkMuted),
+        Ipv6Status::V4Only => ("v4-only", theme::INACTIVE, Sigil::NotApplicable),
+        Ipv6Status::Leaking => ("Leaking", theme::ERROR, Sigil::AlarmError),
+    }
+}
+
+fn derive_ipv6_status(app: &App) -> Ipv6Status {
+    if app.runtime.ipv6_leak {
+        return Ipv6Status::Leaking;
+    }
+    let any_tunnel_covers_v6 = app.registry.snapshot_all().into_iter().any(|snap| {
+        matches!(snap.state, Connection::Connected { .. })
+            && match snap.role {
+                crate::vortix_core::engine::Role::Primary { allowed_ips }
+                | crate::vortix_core::engine::Role::Addressable { allowed_ips }
+                | crate::vortix_core::engine::Role::AddressableSuppressed { allowed_ips } => {
+                    crate::vortix_core::cidr::claims_default_route_v6(&allowed_ips)
+                }
+                _ => false,
+            }
+    });
+    if any_tunnel_covers_v6 {
+        Ipv6Status::Protected
+    } else {
+        Ipv6Status::V4Only
+    }
+}
+
 fn collect_protected_state(
     app: &App,
     primary_snap: Option<&TunnelSnapshot>,
@@ -536,6 +574,7 @@ fn collect_protected_state(
         killswitch_mode: app.runtime.killswitch_mode,
         killswitch_state: app.runtime.killswitch_state,
         encryption,
+        ipv6_status: derive_ipv6_status(app),
         last_check_secs: app
             .runtime
             .last_security_check
@@ -621,6 +660,7 @@ fn collect_partial_state(
         killswitch_mode: app.runtime.killswitch_mode,
         killswitch_state: app.runtime.killswitch_state,
         encryption,
+        ipv6_status: derive_ipv6_status(app),
         last_check_secs: app
             .runtime
             .last_security_check
@@ -773,14 +813,8 @@ fn build_protected_audit(s: &PanelState) -> Vec<Line<'static>> {
         lines.push(alarm_subline(why, w));
     }
 
-    // IPv6 row — always `─` (v4-only killswitch on every supported platform)
-    lines.push(audit_row(
-        "IPv6",
-        "v4-only",
-        theme::INACTIVE,
-        Sigil::NotApplicable,
-        w,
-    ));
+    let (ipv6_value, ipv6_color, ipv6_sigil) = ipv6_row_style(s.ipv6_status);
+    lines.push(audit_row("IPv6", ipv6_value, ipv6_color, ipv6_sigil, w));
 
     lines.push(Line::from(""));
     lines.push(footer_line(s.last_check_secs));
@@ -903,13 +937,8 @@ fn build_partial_audit(s: &PanelState) -> Vec<Line<'static>> {
         }
     }
 
-    lines.push(audit_row(
-        "IPv6",
-        "v4-only",
-        theme::INACTIVE,
-        Sigil::NotApplicable,
-        w,
-    ));
+    let (ipv6_value, ipv6_color, ipv6_sigil) = ipv6_row_style(s.ipv6_status);
+    lines.push(audit_row("IPv6", ipv6_value, ipv6_color, ipv6_sigil, w));
 
     lines.push(Line::from(""));
     lines.push(footer_line(s.last_check_secs));
@@ -1001,13 +1030,8 @@ fn build_exposed_audit(app: &App, inner_width: u16) -> Vec<Line<'static>> {
         },
         w,
     ));
-    lines.push(audit_row(
-        "IPv6",
-        "v4-only",
-        theme::INACTIVE,
-        Sigil::NotApplicable,
-        w,
-    ));
+    let (ipv6_value, ipv6_color, ipv6_sigil) = ipv6_row_style(derive_ipv6_status(app));
+    lines.push(audit_row("IPv6", ipv6_value, ipv6_color, ipv6_sigil, w));
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
@@ -1214,6 +1238,7 @@ mod tests {
             killswitch_mode: KillSwitchMode::AlwaysOn,
             killswitch_state: KillSwitchState::Blocking,
             encryption: "ChaCha20-Poly1305".to_string(),
+            ipv6_status: Ipv6Status::V4Only,
             last_check_secs: Some(3),
         }
     }
@@ -1510,9 +1535,7 @@ mod tests {
     }
 
     #[test]
-    fn protected_ipv6_is_not_applicable_not_a_warning() {
-        // R10: IPv6 uses ─ (not ⚠) and value reads `v4-only`. The previous
-        // explainer string is removed.
+    fn protected_ipv6_v4only_renders_dash_sigil() {
         let s = baseline_protected_state(34);
         let lines = build_protected_audit(&s);
         let ipv6 = lines
@@ -1525,6 +1548,44 @@ mod tests {
         assert!(
             sigil.content.trim_end() == "─",
             "IPv6 sigil must be ─, got {:?}",
+            sigil.content
+        );
+    }
+
+    #[test]
+    fn protected_ipv6_when_tunnel_covers_v6_renders_protected() {
+        let mut s = baseline_protected_state(34);
+        s.ipv6_status = Ipv6Status::Protected;
+        let lines = build_protected_audit(&s);
+        let ipv6 = lines
+            .iter()
+            .find(|l| line_text(l).starts_with("IPv6"))
+            .expect("IPv6 row missing");
+        let text = line_text(ipv6);
+        assert!(text.contains("Protected"), "IPv6 value got {text:?}");
+        let sigil = ipv6.spans.last().expect("non-empty row");
+        assert!(
+            sigil.content.trim_end() == "✓",
+            "IPv6 sigil must be ✓, got {:?}",
+            sigil.content
+        );
+    }
+
+    #[test]
+    fn protected_ipv6_when_leaking_renders_alarm() {
+        let mut s = baseline_protected_state(34);
+        s.ipv6_status = Ipv6Status::Leaking;
+        let lines = build_protected_audit(&s);
+        let ipv6 = lines
+            .iter()
+            .find(|l| line_text(l).starts_with("IPv6"))
+            .expect("IPv6 row missing");
+        let text = line_text(ipv6);
+        assert!(text.contains("Leaking"), "IPv6 value got {text:?}");
+        let sigil = ipv6.spans.last().expect("non-empty row");
+        assert!(
+            sigil.content.trim_end() == "✗",
+            "IPv6 sigil must be ✗ alarm, got {:?}",
             sigil.content
         );
     }
