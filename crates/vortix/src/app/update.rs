@@ -960,13 +960,9 @@ impl App {
                 self.runtime.last_security_check = Some(Instant::now());
             }
             TelemetryUpdate::Ipv6Leak(ipv6_reachable) => {
-                // The telemetry probe sends "true" when an IPv6 endpoint
-                // was reachable. That's NOT equivalent to "leaking" — see
-                // issue #227. Reinterpret here using the registry: if any
-                // Connected tunnel declares ::/0 in its AllowedIPs, IPv6
-                // reachability is by-design (the tunnel IS the v6 path).
-                // Only count it as a leak when v6 reaches AND no active
-                // tunnel covers ::/0.
+                // The probe sends "v6 reachable", which #227 showed is not
+                // equivalent to "v6 leaks": a tunnel covering ::/0 makes
+                // v6 reachability by-design.
                 let connected_allowed_ips: Vec<Vec<crate::vortix_core::cidr::Cidr>> =
                     self.registry
                         .snapshot_all()
