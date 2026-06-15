@@ -224,7 +224,7 @@ pub const CATALOG: &[Sigil] = &[
         id: SigilId::SgNotApplicable,
         glyph: "\u{2500}",
         label: "Not applicable",
-        description: "This row's check doesn't apply on the current platform or in the current state. E.g., IPv6 when vortix's killswitch is v4-only, or IP when no primary owns the default route.",
+        description: "This row's check doesn't apply on the current platform or in the current state. E.g., IPv6 when there's no v6 traffic to evaluate (host has no v6, or no Connected tunnel covers ::/0), or IP when no primary owns the default route.",
         color: theme::INACTIVE,
         bold: false,
         dim: false,

@@ -222,7 +222,7 @@ const GUARD_GLOSSARY: &[(&str, &str)] = &[
     ),
     (
         "Defense → IPv6",
-        "Honest line: vortix's killswitch enforces v4-only on every platform today. If your system has IPv6 connectivity AND your VPN doesn't tunnel v6, IPv6 traffic CAN bypass the firewall even in VPN-only mode. The row's `─` sigil is the 'not-applicable' marker, not a green check — it means 'we are not enforcing this dimension'.",
+        "Three states based on whether IPv6 traffic is going through (or bypassing) your VPN: \"Protected ✓\" — at least one Connected tunnel declares `::/0` in its routes, so v6 packets ride inside it. \"Leaking ✗\" — your host CAN reach IPv6 endpoints but NO active tunnel covers v6; v6 traffic is escaping via your normal ISP connection (real privacy leak). \"Inactive ─\" — no v6 traffic in play (host has no IPv6 connectivity OR no v6 endpoints were probed); not a leak and not a protection, just nothing to evaluate. Note: vortix's killswitch itself still enforces v4-only on every platform today — IPv6 protection comes from the VPN tunnel's own routes, not from the firewall.",
     ),
 ];
 
