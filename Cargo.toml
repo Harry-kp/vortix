@@ -4,7 +4,7 @@ members = ["crates/vortix", "crates/xtask"]
 default-members = ["crates/vortix"]
 
 [workspace.package]
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"

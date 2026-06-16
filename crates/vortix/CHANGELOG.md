@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-06-16
+
+### Features
+
+- **security-guard:** Dual-stack identity rows + recursor-IP DNS leak detection ([#227](https://github.com/Harry-kp/vortix/pull/227)) ([#228](https://github.com/Harry-kp/vortix/pull/228))
+
+
+
 ## [0.4.1] - 2026-06-12
 
 ### Fixed
