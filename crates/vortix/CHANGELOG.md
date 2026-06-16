@@ -6,9 +6,31 @@ All notable changes to this project will be documented in this file.
 
 ## [0.4.2] - 2026-06-16
 
-### Features
+### Highlights
 
-- **security-guard:** Dual-stack identity rows + recursor-IP DNS leak detection ([#227](https://github.com/Harry-kp/vortix/pull/227)) ([#228](https://github.com/Harry-kp/vortix/pull/228))
+- **No more false IPv6-leak alarms on dual-stack tunnels** ([#227](https://github.com/Harry-kp/vortix/issues/227)). IPv6 leak detection now uses ground-truth `real_ipv6 == public_ipv6` comparison (mirroring the v4 check) instead of introspecting the tunnel's declared `AllowedIPs`. The old check produced false positives on tunnels that declared `::/0` but where the kernel didn't actually route v6 through them — the reporter's exact scenario.
+- **Real DNS leak detection.** The previous string-compare of pre- vs post-VPN resolver IPs was broken — it false-flagged the common case where both pre- and post-VPN DNS happened to be the same public resolver (e.g. you set Cloudflare and the VPN also pushed Cloudflare). v0.4.2 replaces it with a recursor-IP echo probe: vortix resolves `o-o.myaddr.l.google.com` TXT through your configured resolver and Google's authoritative server returns the IP of the recursor that actually walked the chain. Same mechanism dnsleaktest.com / ipleak.net use. Provider-aware match across Cloudflare / Google / Quad9 / OpenDNS v4 + v6 anycast ranges.
+- **Dual-stack Identity rows.** When the host has IPv6, the Security Guard panel renders four explicit rows — `Real IPv4`, `Real IPv6`, `Exit IPv4`, `Exit IPv6` — each with its own ✓/✗ sigil. Collapses back to a single `Real IP` / `Exit IP` pair on v4-only hosts so users without v6 don't see jargon.
+- **Sigil-colored value text.** Audit-row value text now inherits the sigil's color so every row reads as one visual unit — green ✓ throughout, red ✗ throughout, etc. Removes the prior visual split where the value was always white while only the sigil carried the verdict.
+
+### Fixed
+
+- IPv6 leak detection no longer reports `Leaking` when an IPv6-only tunnel correctly carries v6 traffic via `::/0` ([#227](https://github.com/Harry-kp/vortix/issues/227)). The `ipv6_traffic_is_leaking` AllowedIPs-introspection helper and the `Ipv6Status` enum are deleted; the panel now reads off the same ground-truth signal as the JSON envelope.
+- DNS leak false positives on shared public resolvers (configured DNS and VPN-pushed DNS both pointing at `1.1.1.1` no longer alarms). DNS leak verdict is now path-of-recursion, not destination-IP equality.
+
+### Added
+
+- `Real IPv6` survives vortix restarts via a new `real-ipv6.cache` (parallel to `real-ip.cache`). Launching vortix with a VPN already up populates the row immediately instead of stalling on `checking…`. The cache also writes when the registry shows the active tunnel's AllowedIPs don't claim `::/0` — the safe one-sided half of the old config-introspection logic, now used only for caching, never for leak verdict.
+- Security Guard `Exit IPv6` row carries a per-family alarm sub-line on leak (`v6 exposed — matches real IPv6`) so the user knows which family escaped.
+- `scripts/test-infra.sh` flavors:
+  - `wg-v6` — dual-stack server (v4 + v6 `Address`, ip6_forward + ip6tables MASQUERADE on the egress interface, droplet provisioned with `--enable-ipv6`). Validates the `Exit IPv6 ✓ Protected` path.
+  - `wg-dns-leak` — full-tunnel WG that silently DNATs every tunnel-side UDP/53 query to a different DNS provider than the one the client config claims. The same MitM pattern a hostile coffee-shop AP or ISP-side DNS hijacker uses, and exactly what the recursor-IP probe is designed to catch.
+
+### Changed
+
+- Help-overlay entries refreshed: `Identity → Real IPv4 / Real IPv6`, `Identity → Exit IPv4 / Exit IPv6`, `Identity → DNS` (now describes the recursor-IP echo probe and references dnsleaktest.com / ipleak.net as the inspiration).
+- Log lines and the `Copy Public IP` clipboard action renamed to be explicit about IPv4 vs IPv6 (e.g. `NET: Real IPv4 detected`, `WARN: Public IPv4 changed`, `Copy Public IPv4`).
+- Removed: `runtime.real_dns` field + `real-dns.cache` (dead after the recursor-IP rewrite), `runtime.ipv6_leak: bool` (replaced by ground-truth comparison), `Ipv6Status` enum + helpers, `cidr::ipv6_traffic_is_leaking` + its 8 unit tests, the `Defense → IPv6` standalone help entry.
 
 
 
