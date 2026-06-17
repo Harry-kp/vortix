@@ -55,6 +55,19 @@ Existing options (`wg show`, NetworkManager, Tunnelblick) either lack real-time 
 | Keyboard-driven | ✅ | ❌ | ✅ |
 | Works over SSH | ✅ | ❌ | ✅ |
 
+### Compared to specific tools
+
+| Tool | Protocols | TUI | Leak detection | Multi-tunnel | Cross-platform |
+|---|---|:-:|:-:|:-:|:-:|
+| **Vortix** | WireGuard + OpenVPN | ✅ | IPv4 / IPv6 / DNS | ✅ | macOS, Linux |
+| `wg-quick` / `wg show` | WireGuard only | ❌ | ❌ | manual | Linux + macOS |
+| NetworkManager-gnome | Both (via plugins) | ❌ (GUI) | ❌ | one default | Linux only |
+| Tunnelblick | OpenVPN only | ❌ (GUI) | ❌ | ❌ | macOS only |
+| WireGuard.app (menu bar) | WireGuard only | ❌ (GUI) | ❌ | switch only | macOS / Windows |
+| Mullvad app | Provider-locked | ❌ (GUI) | provider's own | ❌ | macOS, Linux, Windows |
+
+Use the right tool: if you only run one WireGuard tunnel and don't care about telemetry, plain `wg-quick` is the lightest option. If you're locked into a single VPN provider's app, you don't need Vortix. If you want a unified TUI across multiple profiles, both protocols, and active leak detection — that's the gap Vortix fills.
+
 ## Features
 
 - **WireGuard & OpenVPN** — Auto-detects `.conf` and `.ovpn` files
@@ -123,49 +136,21 @@ sudo pacman -S wireguard-tools openvpn iptables
 
 ## Installation
 
-**Homebrew (macOS/Linux):**
-```bash
-brew install Harry-kp/tap/vortix
-```
+Pick the method that matches how you usually install CLI tools.
 
-**npm/npx:**
-```bash
-npm install -g @harry-kp/vortix
-# or run directly without installing:
-npx @harry-kp/vortix
-```
+| Channel | OS | Install | Upgrade | Uninstall |
+|---|---|---|---|---|
+| **Homebrew** | macOS / Linux | `brew install Harry-kp/tap/vortix` | `brew upgrade vortix` | `brew uninstall vortix` |
+| **pacman** ([Arch extra](https://archlinux.org/packages/extra/x86_64/vortix/)) | Arch Linux | `sudo pacman -S vortix` | `sudo pacman -Syu vortix` | `sudo pacman -R vortix` |
+| **cargo** | Any | `cargo install vortix` | `cargo install vortix --force` | `cargo uninstall vortix` |
+| **npm** | Any | `npm i -g @harry-kp/vortix` | `npm i -g @harry-kp/vortix@latest` | `npm uninstall -g @harry-kp/vortix` |
+| **npx** *(no install)* | Any | `npx @harry-kp/vortix` | — (always latest) | — |
+| **Shell installer** | macOS / Linux | `curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Harry-kp/vortix/releases/latest/download/vortix-installer.sh \| sh` | re-run the curl command | `rm $(which vortix)` |
+| **Nix flake** | Any with Nix | `nix profile install github:Harry-kp/vortix` (or `nix run github:Harry-kp/vortix` to run without installing) | `nix profile upgrade vortix` | `nix profile remove vortix` |
+| **Static binary** | Linux (any libc) | Download `vortix-x86_64-unknown-linux-musl.tar.xz` from [releases](https://github.com/Harry-kp/vortix/releases) and place on `$PATH` | re-download | `rm /path/to/vortix` |
+| **From source** | Any | `git clone https://github.com/Harry-kp/vortix.git && cd vortix && cargo install --path .` | `git pull && cargo install --path . --force` | `cargo uninstall vortix` |
 
-**From crates.io:**
-```bash
-cargo install vortix
-```
-
-**Arch Linux ([extra repo](https://archlinux.org/packages/extra/x86_64/vortix/)):**
-```bash
-pacman -S vortix
-```
-
-**Quick install (Binary):**
-```bash
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/Harry-kp/vortix/releases/latest/download/vortix-installer.sh | sh
-```
-
-**Static binary (Linux):**
-
-Download the `x86_64-unknown-linux-musl` release from the [releases page](https://github.com/Harry-kp/vortix/releases). This is a statically linked binary (no glibc needed), but you still need the runtime dependencies above (openvpn/wireguard-tools and the kill-switch tools).
-
-**Nix (flakes):**
-```bash
-nix run github:Harry-kp/vortix        # Run without installing
-nix profile install github:Harry-kp/vortix  # Install to profile
-```
-
-**From source:**
-```bash
-git clone https://github.com/Harry-kp/vortix.git
-cd vortix
-cargo install --path .
-```
+> The static-binary build needs no glibc but still needs the runtime dependencies above (`openvpn`/`wireguard-tools` and the kill-switch tools).
 
 ### Linux: setting up sudo access
 
@@ -191,6 +176,17 @@ After this, `sudo vortix` works as expected.
 ### Linux support note
 
 Most day-to-day development happens on macOS. Linux support is continuously tested in CI, but real-world distro coverage is still growing. If something behaves differently on your Linux setup, please treat that as useful signal and report it rather than assuming it is expected.
+
+## Security model
+
+Vortix asks for root because managing VPN tunnels and firewall state is privileged on every supported OS. Here's the short list of what it actually does with that privilege:
+
+- **What it reads:** profile files (`~/.config/vortix/profiles/*`), kernel network state (`getifaddrs`, `sysctl` route table, `wg show`, `openvpn` management socket).
+- **What it writes:** kernel tunnel interfaces via `wg-quick` / `openvpn`; the platform firewall (`pfctl` on macOS, `iptables` / `nftables` on Linux) for the kill switch; tiny config-dir files (`real-ip.cache`, `real-ipv6.cache`, log + journal under `${XDG_DATA_HOME}/vortix/`, mode 0600).
+- **What it does NOT touch:** the bootloader, system services, package manager state, `/etc/` outside `/etc/wireguard` (managed by `wg-quick`), other users' files, your shell history, your keychain, any cloud account.
+- **Network egress:** ipinfo.io and ifconfig.co for the IP / geo / leak probes; the configured DNS resolver for the recursor-IP echo probe. No telemetry to vortix infrastructure — there is no vortix infrastructure.
+
+Code that runs as root is in `crates/vortix/src/vortix_platform_*` (per-OS firewall + DNS) and `crates/vortix/src/vortix_protocol_*` (subprocess wrappers for `wg`, `wg-quick`, `openvpn`). Both modules are kept thin so the privileged surface is small and reviewable. Tunnel binaries (`wg-quick`, `openvpn`) are the same ones a hand-rolled `sudo wg-quick up …` would invoke; vortix doesn't ship its own VPN implementation.
 
 ## Usage
 
@@ -745,6 +741,17 @@ vortix show my-profile --raw | grep -E "^(PrivateKey|PublicKey|AllowedIPs|Endpoi
 ```
 
 All fields above are required except `DNS` (optional).
+
+## Contributing
+
+PRs welcome — see [CONTRIBUTING.md](https://github.com/Harry-kp/vortix/blob/main/CONTRIBUTING.md) for the dev workflow, CI parity commands, and architectural boundaries enforced by `cargo xtask check-*`.
+
+Easy ways in:
+
+- **[good first issue](https://github.com/Harry-kp/vortix/labels/good%20first%20issue)** — small, scoped tasks with full context in the issue body.
+- **[Manual-testing backlog](https://github.com/Harry-kp/vortix/blob/main/docs/manual-testing/backlog.md)** — one row per scenario that automated tests can't cover (real kernels, real terminals, real distro quirks). Pick a row, run it on your hardware, post results.
+- **[Linux tester discussion](https://github.com/Harry-kp/vortix/discussions/184)** — if you're on Arch / Fedora / NixOS / Debian, your distro-specific bug reports are disproportionately valuable.
+- **[Discussions](https://github.com/Harry-kp/vortix/discussions)** — best place for "should this work?" / "is this a bug?" questions before opening an issue.
 
 ## Roadmap
 
