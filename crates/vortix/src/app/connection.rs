@@ -412,8 +412,7 @@ impl App {
     pub(crate) fn complete_disconnect(&mut self, profile_name: &str) {
         self.runtime.session_start = None;
         self.runtime.scanner_rx = None; // discard stale scanner data pre-disconnect
-        self.panel_flipped.clear();
-        self.flip_animation = None;
+        self.flip_states.clear();
 
         self.runtime.public_ip = crate::constants::MSG_DETECTING.to_string();
         self.runtime.location = crate::constants::MSG_DETECTING.to_string();

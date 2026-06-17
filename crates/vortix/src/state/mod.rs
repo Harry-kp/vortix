@@ -22,7 +22,6 @@ pub use killswitch::{KillSwitchMode, KillSwitchState};
 pub use profile::{Protocol, VpnProfile};
 pub use retry::RetryState;
 pub use ui::{
-    help_max_scroll_for_terminal_height, AuthField, FlipAnimation, FocusedPanel, HelpTab,
-    InputMode, ProfileSortOrder, QualityLevel, Toast, ToastType, DISMISS_DURATION,
-    HELP_OVERLAY_MAX_HEIGHT,
+    help_max_scroll_for_terminal_height, AuthField, FlipState, FocusedPanel, HelpTab, InputMode,
+    ProfileSortOrder, QualityLevel, Toast, ToastType, DISMISS_DURATION, HELP_OVERLAY_MAX_HEIGHT,
 };

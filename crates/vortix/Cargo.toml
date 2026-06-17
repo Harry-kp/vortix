@@ -44,6 +44,7 @@ path = "src/main.rs"
 # TUI Framework
 ratatui = { workspace = true }
 crossterm = { workspace = true }
+ratatui-flip-panel = { git = "https://github.com/Harry-kp/ratatui-flip-panel.git", branch = "main" }
 
 # Date/time formatting (local-offset needed for OffsetDateTime::now_local)
 time = { workspace = true }

@@ -78,7 +78,7 @@ impl CachedConfigView {
         }
     }
 }
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::constants;
 use crate::logger;
@@ -89,8 +89,8 @@ use crate::vpn_runtime::VpnRuntime;
 
 // Re-export state types for convenient access
 pub use crate::state::{
-    AuthField, FlipAnimation, FocusedPanel, InputMode, ProfileSortOrder, Protocol, Toast,
-    ToastType, VpnProfile, DISMISS_DURATION,
+    AuthField, FlipState, FocusedPanel, InputMode, ProfileSortOrder, Protocol, Toast, ToastType,
+    VpnProfile, DISMISS_DURATION,
 };
 // The legacy single-tunnel `ConnectionState`/`DetailedConnectionInfo` enum
 // lives on `crate::vpn_runtime` after U6 Stage B; re-export through `app::`
@@ -134,8 +134,8 @@ pub struct App {
     // === UI State (Panel-based) ===
     pub focused_panel: FocusedPanel,
     pub zoomed_panel: Option<FocusedPanel>,
-    pub panel_flipped: HashSet<FocusedPanel>,
-    pub flip_animation: Option<FlipAnimation>,
+    /// Per-panel flip animation state (front/back card-flip via ratatui-flip-panel).
+    pub flip_states: HashMap<FocusedPanel, FlipState>,
     pub input_mode: InputMode,
     pub show_config: bool,
     pub show_action_menu: bool,
@@ -188,8 +188,7 @@ impl App {
 
             focused_panel: FocusedPanel::Sidebar,
             zoomed_panel: None,
-            panel_flipped: HashSet::new(),
-            flip_animation: None,
+            flip_states: HashMap::new(),
             input_mode: InputMode::Normal,
             show_config: false,
             show_action_menu: false,
@@ -272,44 +271,36 @@ impl App {
     }
 
     /// Check if a panel is currently showing its back (detailed) view.
+    /// Mid-animation aware: returns the post-midpoint face during a flip.
     #[must_use]
     pub fn is_flipped(&self, panel: &FocusedPanel) -> bool {
-        self.panel_flipped.contains(panel)
+        self.flip_states
+            .get(panel)
+            .is_some_and(FlipState::showing_back)
     }
 
-    /// Whether a flip animation is in progress.
+    /// Whether any panel is currently mid-flip.
     #[must_use]
     pub fn has_active_animation(&self) -> bool {
-        self.flip_animation.is_some()
+        self.flip_states.values().any(FlipState::is_animating)
     }
 
-    /// Advance the flip animation; finalize the state change when complete.
+    /// Drive every flip state machine forward one tick. Call once per frame.
     pub fn advance_animation(&mut self) {
-        let complete = self
-            .flip_animation
-            .as_ref()
-            .is_some_and(FlipAnimation::is_complete);
-        if complete {
-            if let Some(anim) = self.flip_animation.take() {
-                if anim.to_back {
-                    self.panel_flipped.insert(anim.panel);
-                } else {
-                    self.panel_flipped.remove(&anim.panel);
-                }
-            }
+        for state in self.flip_states.values_mut() {
+            state.tick();
         }
     }
 
-    /// Effective flip state for rendering, accounting for mid-animation view switch.
+    /// Effective flip state for rendering, accounting for mid-animation view swap.
     #[must_use]
     pub fn effective_flipped(&self, panel: &FocusedPanel) -> bool {
-        let base = self.is_flipped(panel);
-        if let Some(anim) = &self.flip_animation {
-            if anim.panel == *panel && anim.past_midpoint() {
-                return !base;
-            }
-        }
-        base
+        self.is_flipped(panel)
+    }
+
+    /// Borrow the flip state for `panel`, creating a default one if missing.
+    pub fn flip_state_mut(&mut self, panel: FocusedPanel) -> &mut FlipState {
+        self.flip_states.entry(panel).or_default()
     }
 }
 
@@ -342,8 +333,7 @@ impl App {
 
             focused_panel: FocusedPanel::Sidebar,
             zoomed_panel: None,
-            panel_flipped: HashSet::new(),
-            flip_animation: None,
+            flip_states: HashMap::new(),
             input_mode: InputMode::Normal,
             show_config: false,
             show_action_menu: false,

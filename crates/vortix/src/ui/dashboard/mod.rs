@@ -149,11 +149,11 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
 /// Compute a horizontally-narrowed rect for the card-flip animation.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn animated_rect(area: Rect, width_ratio: f64) -> Rect {
+fn animated_rect(area: Rect, width_ratio: f32) -> Rect {
     if area.width == 0 || area.height == 0 {
         return area;
     }
-    let mut new_width = (f64::from(area.width) * width_ratio).max(1.0) as u16;
+    let mut new_width = (f32::from(area.width) * width_ratio).max(1.0) as u16;
     if new_width > area.width {
         new_width = area.width;
     }
@@ -169,11 +169,10 @@ fn render_animated_panel(
     area: Rect,
     render_fn: impl FnOnce(&mut Frame, &App, Rect),
 ) {
-    if let Some(anim) = &app.flip_animation {
-        if anim.panel == *panel {
+    if let Some(state) = app.flip_states.get(panel) {
+        if state.is_animating() {
             frame.render_widget(Clear, area);
-            let ratio = anim.width_ratio();
-            let narrow = animated_rect(area, ratio);
+            let narrow = animated_rect(area, state.width_ratio());
             if narrow.width >= constants::FLIP_ANIMATION_MIN_WIDTH {
                 render_fn(frame, app, narrow);
             } else {

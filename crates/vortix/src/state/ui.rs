@@ -256,50 +256,7 @@ pub fn help_max_scroll_for_terminal_height(terminal_height: u16, total_lines: u1
     total_lines.saturating_sub(content_height)
 }
 
-/// State for the panel flip animation.
-pub struct FlipAnimation {
-    /// Which panel is being animated.
-    pub panel: FocusedPanel,
-    /// When the animation started.
-    pub started: Instant,
-    /// Whether flipping toward the back (true) or toward the front (false).
-    pub to_back: bool,
-}
-
-impl FlipAnimation {
-    /// Progress from 0.0 (start) to 1.0 (complete), clamped.
-    #[must_use]
-    #[allow(clippy::cast_precision_loss)]
-    pub fn progress(&self) -> f64 {
-        let elapsed_us = self.started.elapsed().as_micros().min(u128::from(u64::MAX)) as f64;
-        let duration_us = (crate::constants::FLIP_ANIMATION_DURATION_MS * 1000) as f64;
-        (elapsed_us / duration_us).min(1.0)
-    }
-
-    /// True when the animation has run its full duration.
-    #[must_use]
-    pub fn is_complete(&self) -> bool {
-        self.started.elapsed()
-            >= Duration::from_millis(crate::constants::FLIP_ANIMATION_DURATION_MS)
-    }
-
-    /// Width ratio for the current animation frame (1.0 → 0.0 → 1.0).
-    #[must_use]
-    pub fn width_ratio(&self) -> f64 {
-        let p = self.progress();
-        if p < 0.5 {
-            1.0 - (p * 2.0)
-        } else {
-            (p - 0.5) * 2.0
-        }
-    }
-
-    /// True when past the midpoint (showing the target view).
-    #[must_use]
-    pub fn past_midpoint(&self) -> bool {
-        self.progress() >= 0.5
-    }
-}
+pub use ratatui_flip_panel::FlipState;
 
 /// Profile list sort ordering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -440,75 +397,5 @@ mod tests {
         assert_eq!(help_max_scroll_for_terminal_height(0, 44), 0);
     }
 
-    // --- FlipAnimation tests ---
-
-    fn make_animation(to_back: bool) -> FlipAnimation {
-        FlipAnimation {
-            panel: FocusedPanel::Chart,
-            started: Instant::now(),
-            to_back,
-        }
-    }
-
-    #[test]
-    fn animation_starts_not_complete() {
-        let anim = make_animation(true);
-        assert!(!anim.is_complete());
-        assert!(anim.progress() < 0.1);
-    }
-
-    #[test]
-    fn animation_width_ratio_starts_near_one() {
-        let anim = make_animation(true);
-        assert!(anim.width_ratio() > 0.8);
-    }
-
-    #[test]
-    fn animation_not_past_midpoint_at_start() {
-        let anim = make_animation(true);
-        assert!(!anim.past_midpoint());
-    }
-
-    #[test]
-    fn animation_complete_after_duration() {
-        let anim = FlipAnimation {
-            panel: FocusedPanel::Security,
-            started: Instant::now()
-                .checked_sub(Duration::from_millis(
-                    crate::constants::FLIP_ANIMATION_DURATION_MS + 10,
-                ))
-                .unwrap(),
-            to_back: false,
-        };
-        assert!(anim.is_complete());
-        assert!((anim.progress() - 1.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn animation_past_midpoint_after_duration() {
-        let anim = FlipAnimation {
-            panel: FocusedPanel::Chart,
-            started: Instant::now()
-                .checked_sub(Duration::from_millis(
-                    crate::constants::FLIP_ANIMATION_DURATION_MS,
-                ))
-                .unwrap(),
-            to_back: true,
-        };
-        assert!(anim.past_midpoint());
-    }
-
-    #[test]
-    fn animation_width_ratio_one_when_complete() {
-        let anim = FlipAnimation {
-            panel: FocusedPanel::ConnectionDetails,
-            started: Instant::now()
-                .checked_sub(Duration::from_millis(
-                    crate::constants::FLIP_ANIMATION_DURATION_MS + 50,
-                ))
-                .unwrap(),
-            to_back: true,
-        };
-        assert!((anim.width_ratio() - 1.0).abs() < f64::EPSILON);
-    }
+    // FlipState behavior is tested in the `ratatui-flip-panel` crate.
 }

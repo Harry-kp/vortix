@@ -230,14 +230,8 @@ impl App {
                 if matches!(
                     panel,
                     FocusedPanel::Chart | FocusedPanel::ConnectionDetails | FocusedPanel::Security
-                ) && self.flip_animation.is_none()
-                {
-                    let to_back = !self.is_flipped(&panel);
-                    self.flip_animation = Some(crate::state::FlipAnimation {
-                        panel,
-                        started: std::time::Instant::now(),
-                        to_back,
-                    });
+                ) {
+                    self.flip_state_mut(panel).flip();
                 }
             }
             Message::CloseOverlay => {
