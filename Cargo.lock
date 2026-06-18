@@ -1912,7 +1912,8 @@ dependencies = [
 [[package]]
 name = "ratatui-flip-panel"
 version = "0.1.0"
-source = "git+https://github.com/Harry-kp/ratatui-flip-panel.git?branch=main#a0f5abfd362017c9e051d2023639e0f23978984a"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed2539e91d41615fca6b61254a8e7e8348abd68eb9bbc244a466a30719d7a8b7"
 dependencies = [
  "ratatui-core",
 ]
