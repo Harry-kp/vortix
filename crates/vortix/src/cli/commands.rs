@@ -246,7 +246,24 @@ fn handle_audit(pid_filter: Option<u32>, vpn_only: bool, mode: OutputMode) -> i3
 fn handle_daemon(socket_override: Option<std::path::PathBuf>, mode: OutputMode) -> i32 {
     let socket_path = socket_override.unwrap_or_else(crate::daemon::default_socket_path);
 
-    let server = match crate::daemon::DaemonServer::bind(socket_path.clone()) {
+    // Tokio-backed daemon socket binding must happen inside an active Tokio runtime.
+    // Binding before runtime creation panics with:
+    // "there is no reactor running, must be called from the context of a Tokio 1.x runtime".
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("vortix daemon: failed to build runtime: {e}");
+            return 1;
+        }
+    };
+
+    let server = match runtime
+        .block_on(async { crate::daemon::DaemonServer::bind(socket_path.clone()) })
+    {
         Ok(s) => s,
         Err(e) => {
             print_error_and_exit(
@@ -264,23 +281,12 @@ fn handle_daemon(socket_override: Option<std::path::PathBuf>, mode: OutputMode) 
             );
         }
     };
+
     eprintln!(
         "vortix daemon: ready. Set VORTIX_DAEMON_SOCKET={} in your shell to route through the daemon.",
         server.socket_path().display()
     );
 
-    // Spin up the bundled runtime to drive the accept loop.
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            eprintln!("vortix daemon: failed to build runtime: {e}");
-            return 1;
-        }
-    };
     // Build the `EngineHandle::Local` inside the daemon's runtime context
     // (the actor task spawn lands on this runtime, not the runner's). The
     // factory reads the resolved global config dir for profile sidecars.
@@ -288,6 +294,7 @@ fn handle_daemon(socket_override: Option<std::path::PathBuf>, mode: OutputMode) 
         |_| std::path::PathBuf::from("/tmp/vortix-profiles"),
         |d| d.join(constants::PROFILES_DIR_NAME),
     );
+
     let server = runtime.block_on(async move {
         if let Some(handle) = crate::daemon::build_engine_handle(&profiles_dir) {
             server.with_engine_handle(handle)
@@ -298,11 +305,13 @@ fn handle_daemon(socket_override: Option<std::path::PathBuf>, mode: OutputMode) 
             server
         }
     });
+
     runtime.block_on(async {
         if let Err(e) = server.run().await {
             eprintln!("vortix daemon: accept loop terminated: {e}");
         }
     });
+
     0
 }
 
