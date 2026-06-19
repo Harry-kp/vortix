@@ -1,6 +1,7 @@
 # Vortix
 
-[![CI](https://github.com/Harry-kp/vortix/actions/workflows/ci.yml/badge.svg)](https://github.com/Harry-kp/vortix/actions/workflows/ci.yml)
+[![Test](https://github.com/Harry-kp/vortix/actions/workflows/test.yml/badge.svg)](https://github.com/Harry-kp/vortix/actions/workflows/test.yml)
+[![Lint](https://github.com/Harry-kp/vortix/actions/workflows/lint.yml/badge.svg)](https://github.com/Harry-kp/vortix/actions/workflows/lint.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/Harry-kp/vortix/blob/main/LICENSE)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/Harry-kp/vortix/blob/main/CONTRIBUTING.md)
 [![Crates.io](https://img.shields.io/crates/v/vortix.svg)](https://crates.io/crates/vortix)
@@ -17,7 +18,7 @@
 
 Terminal UI for WireGuard and OpenVPN with real-time telemetry and leak guarding.
 
-![Vortix Demo](./assets/demo.gif)
+![Vortix Demo](https://raw.githubusercontent.com/Harry-kp/vortix/main/assets/demo.gif)
 
 <details>
 <summary><b>More scenarios — click to expand</b></summary>
@@ -28,26 +29,24 @@ Terminal UI for WireGuard and OpenVPN with real-time telemetry and leak guarding
   <tr>
     <td align="center" width="50%" valign="top">
       <b>multi-connection</b><br>
-      <img src="./assets/multi-connection.gif" alt="multi-connection demo" />
+      <img src="https://raw.githubusercontent.com/Harry-kp/vortix/main/assets/multi-connection.gif" alt="multi-connection demo" />
     </td>
     <td align="center" width="50%" valign="top">
       <b>leak detection</b><br>
-      <img src="./assets/leak-detection.gif" alt="leak detection demo" />
+      <img src="https://raw.githubusercontent.com/Harry-kp/vortix/main/assets/leak-detection.gif" alt="leak detection demo" />
     </td>
   </tr>
   <tr>
     <td align="center" width="50%" valign="top">
       <b>split tunnel</b><br>
-      <img src="./assets/split-tunnel.gif" alt="split tunnel demo" />
+      <img src="https://raw.githubusercontent.com/Harry-kp/vortix/main/assets/split-tunnel.gif" alt="split tunnel demo" />
     </td>
     <td align="center" width="50%" valign="top">
       <b>profile management</b><br>
-      <img src="./assets/profile-management.gif" alt="profile management demo" />
+      <img src="https://raw.githubusercontent.com/Harry-kp/vortix/main/assets/profile-management.gif" alt="profile management demo" />
     </td>
   </tr>
 </table>
-
-Recording tapes for all GIFs live under [`tapes/`](./tapes); regenerate with `vhs tapes/<name>.tape` after spinning up the matching test profile via [`scripts/test-infra.sh`](./scripts/test-infra.sh).
 
 </details>
 
