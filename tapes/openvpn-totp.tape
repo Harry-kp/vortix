@@ -11,8 +11,10 @@
 #   ./scripts/test-infra.sh import
 #   sudo NOPASSWD configured for vortix (see README).
 #   A working TOTP code for the test profile. The test-infra script provisions
-#   a known secret per droplet; generate the current code with:
-#     oathtool --totp --base32 "$(./scripts/test-infra.sh totp-secret ovpn-totp)"
+#   a per-droplet secret; read it from
+#   scripts/test-profiles/ovpn-totp-credentials.txt after `./scripts/test-infra.sh profiles`,
+#   then generate a current code:
+#     oathtool --totp -b "$(awk '/totp_secret:/ {print $2}' scripts/test-profiles/ovpn-totp-credentials.txt)"
 #   Substitute the 6-digit code into the Type "000000" line below before running.
 #
 #   vhs tapes/openvpn-totp.tape
@@ -58,9 +60,10 @@ Sleep 500ms
 Tab
 Sleep 300ms
 
-# OTP / TOTP code — populated at record time by the orchestrator (oathtool
-# against the test-infra secret HPRU355AHROYXTAVZAJXWYIZJ4). The literal in
-# the tape is a placeholder; replace with a current code via sed before vhs.
+# OTP / TOTP code — populated at record time by the orchestrator (run
+# `oathtool` against the per-droplet secret extracted from
+# scripts/test-profiles/ovpn-totp-credentials.txt). The literal in the
+# tape is a placeholder; replace with a current code via sed before vhs.
 Type "000000"
 Sleep 400ms
 
