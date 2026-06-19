@@ -24,6 +24,14 @@
           inherit cargoArtifacts;
           # Tests exercise local user state and can fail in Nix build sandboxes.
           doCheck = false;
+
+          meta = with pkgs.lib; {
+            description = "Terminal UI for WireGuard and OpenVPN with real-time telemetry and leak guarding";
+            homepage = "https://github.com/Harry-kp/vortix";
+            license = licenses.mit;
+            mainProgram = "vortix";
+            platforms = platforms.unix;
+          };
         });
       in
       {
@@ -31,6 +39,15 @@
         packages.vortix = vortix;
 
         apps.default = flake-utils.lib.mkApp { drv = vortix; };
+
+        checks = {
+          # `nix flake check` builds the package; if it builds, the flake is sound.
+          inherit vortix;
+
+          vortix-fmt = craneLib.cargoFmt { inherit (commonArgs) src; };
+        };
+
+        formatter = pkgs.nixpkgs-fmt;
 
         devShells.default = pkgs.mkShell {
           inputsFrom = [ vortix ];

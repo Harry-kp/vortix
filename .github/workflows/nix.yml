@@ -1,0 +1,57 @@
+name: Nix
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "flake.nix"
+      - "flake.lock"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - ".github/workflows/nix.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "flake.nix"
+      - "flake.lock"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - ".github/workflows/nix.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  flake:
+    name: Nix flake check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Show flake metadata
+        run: nix flake metadata
+
+      - name: Run flake check
+        run: nix flake check --print-build-logs
+
+      - name: Build vortix package
+        run: nix build .#vortix --print-build-logs
+
+      - name: Verify binary runs
+        run: nix run .#vortix -- --version
