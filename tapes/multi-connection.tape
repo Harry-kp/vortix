@@ -14,13 +14,15 @@
 Output assets/multi-connection.gif
 
 Set Theme "Catppuccin Mocha"
-Set FontSize 16
-Set Width 1600
-Set Height 900
-Set Padding 40
+Set FontSize 20
+Set Width 1920
+Set Height 1080
+Set Padding 50
+Set Framerate 60
+Set PlaybackSpeed 1.4
 
 Hide
-Type "echo $SUDO_PASSWORD | sudo -S vortix"
+Type "/tmp/vortix-demo-launch.sh"
 Enter
 Sleep 4s
 Show
@@ -29,8 +31,11 @@ Show
 Sleep 2s
 
 # === First tunnel: wg-full ===
-# Top profile is wg-full (primary/full tunnel). Connect.
-Type "g"
+# Profiles sort alphabetically: ovpn-totp / wg-dns-leak / wg-full / wg-split.
+# Two Downs from the top lands on wg-full.
+Down
+Sleep 500ms
+Down
 Sleep 800ms
 Enter
 Sleep 12s
@@ -39,8 +44,8 @@ Sleep 12s
 Sleep 3s
 
 # === Second tunnel: wg-split (secondary) ===
-# Move down to wg-split. Pressing Enter on a second profile triggers vortix's
-# takeover overlay; pressing `B` ("Both") brings up the second tunnel alongside.
+# One more Down lands on wg-split. Enter triggers vortix's takeover overlay;
+# `B` ("Both") brings up the second tunnel alongside the first.
 Down
 Sleep 800ms
 Enter

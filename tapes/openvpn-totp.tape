@@ -13,57 +13,56 @@
 #   A working TOTP code for the test profile. The test-infra script provisions
 #   a known secret per droplet; generate the current code with:
 #     oathtool --totp --base32 "$(./scripts/test-infra.sh totp-secret ovpn-totp)"
-#   Substitute the 6-digit code into the Type "123456" line below before running.
+#   Substitute the 6-digit code into the Type "000000" line below before running.
 #
 #   vhs tapes/openvpn-totp.tape
 
 Output assets/openvpn-totp.gif
 
 Set Theme "Catppuccin Mocha"
-Set FontSize 16
-Set Width 1600
-Set Height 900
-Set Padding 40
+Set FontSize 20
+Set Width 1920
+Set Height 1080
+Set Padding 50
+Set Framerate 60
+Set PlaybackSpeed 1.4
 
 Hide
-Type "echo $SUDO_PASSWORD | sudo -S vortix"
+Type "/tmp/vortix-demo-launch.sh"
 Enter
 Sleep 4s
 Show
 
-Sleep 2s
-
-# Navigate to the ovpn-totp profile
-Down
-Sleep 500ms
-Down
-Sleep 500ms
-Down
-Sleep 500ms
-Down
-Sleep 500ms
-Down
 Sleep 1500ms
 
-# Connect — vortix detects the static-challenge profile and opens the auth overlay
+# Profiles sort alphabetically: ovpn-totp is already at the top — no Down needed.
+Sleep 800ms
+
+# Connect — vortix detects the static-challenge profile and opens the auth overlay.
+# This tape assumes /tmp/vortix-demo-config/auth/ovpn-totp.auth does NOT exist
+# at record time (clear it before running if needed). With no saved creds,
+# vortix sets initial focus to Username (per connection.rs:242), so the
+# Tab order is: Username → Password → OTP → SaveCheckbox → Username.
 Enter
-Sleep 2500ms
+Sleep 1500ms
 
 # Username field
-Type "vortix-demo"
-Sleep 1500ms
+Type "vortix"
+Sleep 500ms
 Tab
-Sleep 800ms
+Sleep 300ms
 
 # Password field
-Type "demo-password"
-Sleep 1500ms
+Type "testpass123"
+Sleep 500ms
 Tab
-Sleep 800ms
+Sleep 300ms
 
-# TOTP code field — replace with a current code before recording
-Type "123456"
-Sleep 1500ms
+# OTP / TOTP code — populated at record time by the orchestrator (oathtool
+# against the test-infra secret HPRU355AHROYXTAVZAJXWYIZJ4). The literal in
+# the tape is a placeholder; replace with a current code via sed before vhs.
+Type "000000"
+Sleep 400ms
 
 # Submit
 Enter
@@ -74,8 +73,10 @@ Sleep 15s
 # Connected. Brief breath on the dashboard.
 Sleep 3s
 
-# Disconnect
-Type "d"
+# Disconnect everything (focus-independent, safe with overlays open)
+Type "D"
+Sleep 1200ms
+Enter
 Sleep 4s
 
 Sleep 1500ms

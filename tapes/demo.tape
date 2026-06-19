@@ -20,14 +20,16 @@
 Output assets/demo.gif
 
 Set Theme "Catppuccin Mocha"
-Set FontSize 16
-Set Width 1600
-Set Height 900
-Set Padding 40
+Set FontSize 20
+Set Width 1920
+Set Height 1080
+Set Padding 50
+Set Framerate 60
+Set PlaybackSpeed 1.4
 
 # --- launch (hidden so any "Password:" prompt is never recorded) ---
 Hide
-Type "echo $SUDO_PASSWORD | sudo -S vortix"
+Type "/tmp/vortix-demo-launch.sh"
 Enter
 Sleep 4s
 Show
@@ -35,93 +37,114 @@ Show
 # === Act 1 — open on the disconnected dashboard ===
 Sleep 2s
 
-# === Act 2 — help overlay flash ===
-# `?` opens the full keymap. Hold long enough to read the highlights, then close.
-Type "?"
-Sleep 3s
-Escape
-Sleep 1s
-
-# === Act 3 — profile sidebar tour ===
+# === Act 2 — profile sidebar tour ===
+# Cursor starts on the alphabetically-first profile (ovpn-totp). Walk down
+# through the list — three Downs land on wg-split, the last entry.
+Down
+Sleep 900ms
 Down
 Sleep 900ms
 Down
 Sleep 1200ms
 
-# === Act 4 — sort cycle ===
-# `s` cycles ProfileSortOrder. One press shows the sidebar reflowing.
-Type "s"
-Sleep 1800ms
-
-# === Act 5 — peek at the highlighted profile's config ===
+# === Act 3 — peek at the highlighted profile's config ===
 Type "v"
 Sleep 3s
 Escape
 Sleep 1200ms
 
-# === Act 6 — connect ===
-# Snap to the top profile, hit Enter, real handshake.
-Type "g"
+# === Act 5 — connect to wg-full ===
+# Up once from wg-split lands on wg-full (the natural full-tunnel headline).
+Up
 Sleep 1200ms
 Enter
 Sleep 12s
 
-# === Act 7 — connected breath ===
+# === Act 5 — connected breath ===
 # Header is green; IP + geo-location have rotated; throughput chart is filling.
-Sleep 4s
+Sleep 3s
 
-# === Act 8 — flip the Chart panel ===
+# === Act 6 — sort cycle flash (post-connect — purely visual, tunnel unaffected) ===
+# `s` cycles ProfileSortOrder. One press shows the sidebar reflowing without
+# disturbing the active tunnel (cursor stays on wg-full through the reorder).
+Type "s"
+Sleep 1800ms
+
+# === Act 7 — flip Chart panel (round trip) ===
 Tab
 Sleep 1200ms
 Type "f"
-Sleep 3500ms
+Sleep 2500ms
+Type "f"
+Sleep 1500ms
 
-# === Act 9 — flip Connection Details + zoom ===
+# === Act 9 — flip Connection Details (round trip) + zoom ===
 Tab
 Sleep 1200ms
 Type "f"
-Sleep 3000ms
-# Zoom on the (now-flipped) Connection Details — focus pops to full-frame, then collapses.
+Sleep 2500ms
+Type "f"
+Sleep 1500ms
+# Zoom — `z` expands the focused panel to full-frame, `z` again collapses.
 Type "z"
-Sleep 3000ms
+Sleep 2500ms
 Type "z"
-Sleep 1200ms
+Sleep 1500ms
 
-# === Act 10 — Security Guard, the centrepiece ===
+# === Act 10 — Security Guard, the centrepiece (round trip) ===
 # IPv4 + IPv6 dual-stack identity rows, recursor-IP DNS leak probe, kill-switch row.
-# Hold this beat — it's the headline.
+# Hold the front face longer — it's the headline. Then flip + flip back.
 Tab
 Sleep 4s
 Type "f"
-Sleep 3500ms
+Sleep 2500ms
+Type "f"
+Sleep 1500ms
 
-# === Act 11 — log filter ===
-# Tab once more to the log panel; `f` here cycles the log filter (info/warn/error/debug).
+# === Act 11 — log filter cycle ===
+# Tab to the Event Log panel; `f` here cycles the log filter overlay.
 Tab
 Sleep 1200ms
 Type "f"
 Sleep 1500ms
 Type "f"
 Sleep 1500ms
+# Dismiss the filter overlay so the action menu doesn't stack on top of it.
+Escape
+Sleep 800ms
 
 # === Act 12 — action menu flash ===
-# `x` opens the contextual action menu. Flash open + dismiss.
+# `x` opens the contextual action menu; `x` again toggles it closed (the
+# overlay handler accepts `x`, `q`, `b`, or Esc as dismiss — using `x`
+# avoids vhs's Escape racing the terminal parser's ANSI-sequence timeout).
 Type "x"
 Sleep 2500ms
-Escape
+Type "x"
 Sleep 1200ms
 
-# === Act 13 — kill switch cycle ===
-# Shift+K cycles Off → block-on-drop → vpn-only. Two presses takes the viewer
-# from the resting mode through the next one, then back.
-Type "K"
-Sleep 2500ms
-Type "K"
-Sleep 2500ms
-
-# === Act 14 — disconnect ===
-Type "d"
+# === Act 13 — disconnect everything ===
+# Shift+D disconnects ALL active tunnels regardless of which panel is focused.
+# Safer than `d` (which acts on the focused tunnel and depends on panel context).
+Type "D"
+Sleep 1200ms
+# If a "disconnect all (N>1)" confirm dialog appears, Enter accepts it. With one
+# tunnel up this is a no-op but harmless.
+Enter
 Sleep 5s
+
+# === Act 14 — help overlay + tab through its sections (closing reference) ===
+# Show the full keymap LAST — viewers have seen what the tool does; this is
+# the "here's how to reach everything" closing beat. Tab cycles help sections.
+Type "?"
+Sleep 2000ms
+Tab
+Sleep 1500ms
+Tab
+Sleep 1500ms
+Tab
+Sleep 1500ms
+Escape
+Sleep 1200ms
 
 # === Final closing shot ===
 Sleep 2s

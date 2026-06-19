@@ -15,22 +15,27 @@
 Output assets/split-tunnel.gif
 
 Set Theme "Catppuccin Mocha"
-Set FontSize 16
-Set Width 1600
-Set Height 900
-Set Padding 40
+Set FontSize 20
+Set Width 1920
+Set Height 1080
+Set Padding 50
+Set Framerate 60
+Set PlaybackSpeed 1.4
 
 Hide
-Type "echo $SUDO_PASSWORD | sudo -S vortix"
+Type "/tmp/vortix-demo-launch.sh"
 Enter
 Sleep 4s
 Show
 
 Sleep 2s
 
-# Navigate to wg-split — adjust the Down count to match your sidebar order
+# Profiles sort alphabetically: ovpn-totp / wg-dns-leak / wg-full / wg-split.
+# Three Downs from the top lands on wg-split.
 Down
-Sleep 600ms
+Sleep 500ms
+Down
+Sleep 500ms
 Down
 Sleep 1500ms
 
@@ -42,12 +47,16 @@ Sleep 10s
 Tab
 Sleep 3500ms
 
-# Flip the panel for any expanded routing/MTU view
+# Flip the panel back face (round trip) for any expanded routing / MTU view
 Type "f"
-Sleep 3500ms
+Sleep 2500ms
+Type "f"
+Sleep 1500ms
 
-# Disconnect
-Type "d"
+# Disconnect everything (focus-independent, safe with overlays open)
+Type "D"
+Sleep 1200ms
+Enter
 Sleep 4s
 
 Sleep 1500ms
