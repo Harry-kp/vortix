@@ -1,5 +1,12 @@
 name: Nix
 
+# Nix builds in a sandbox and crane rebuilds deps when the lockfile shifts,
+# so a cold run takes ~5-8 minutes per OS. To keep this off the PR critical
+# path, the pull_request trigger is restricted to changes that can ACTUALLY
+# break the flake (flake.nix / flake.lock / this workflow). Push to main
+# still runs the full set so Cargo.lock drift gets caught after merge, and
+# workflow_dispatch is available if you want to force a run on a PR that
+# didn't touch flake files.
 on:
   push:
     branches: [main]
@@ -15,10 +22,8 @@ on:
     paths:
       - "flake.nix"
       - "flake.lock"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "crates/**"
       - ".github/workflows/nix.yml"
+  workflow_dispatch: {}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -57,11 +62,10 @@ jobs:
       - name: Show flake metadata
         run: nix flake metadata
 
+      # `nix flake check` already builds checks.vortix (which IS the vortix
+      # package), so a separate `nix build .#vortix` step would be redundant.
       - name: Run flake check
         run: nix flake check --print-build-logs
-
-      - name: Build vortix package
-        run: nix build .#vortix --print-build-logs
 
       - name: Verify binary runs
         run: nix run .#vortix -- --version
