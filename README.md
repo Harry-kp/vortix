@@ -17,23 +17,6 @@
 
 Terminal UI for WireGuard and OpenVPN with real-time telemetry and leak guarding.
 
-> **New in v0.4.0 — multi-tunnel.** Run multiple VPN tunnels at the
-> same time; one owns the kernel default route (the *primary*), the
-> rest are *addressable* on their declared `AllowedIPs`. Per-profile
-> retry and auto-reconnect. Scanner auto-adopts externally-started
-> tunnels. JSON status envelope bumps to `schema_version: 2` with
-> `data.connections[]` + `data.primary`. Kill switch **VPN-only** mode
-> now keeps the firewall engaged whether the VPN is up or down
-> (canonical Linux killswitch shape — closes a
-> gap-between-drop-and-reconnect leak path). See the
-> [CHANGELOG](https://github.com/Harry-kp/vortix/blob/main/CHANGELOG.md) for the full list.
->
-> **v0.3.0 migration** (Engine FSM, session journal, encrypted secret store):
->
-> - [Release notes](https://github.com/Harry-kp/vortix/blob/main/docs/v0.3.0-RELEASE-NOTES.md) — what changed (60s read)
-> - [Upgrade guide](https://github.com/Harry-kp/vortix/blob/main/docs/MIGRATION.md) — for v0.2.x users
-> - [FAQ](https://github.com/Harry-kp/vortix/blob/main/docs/v0.3.0-FAQ.md) — common upgrade questions
-
 ![Vortix Demo](https://raw.githubusercontent.com/Harry-kp/vortix/main/assets/demo.gif)
 
 <details>
@@ -359,9 +342,13 @@ vortix status --watch --json
 | `v` | View Profile Configuration |
 | `y` | Copy Public IP to Clipboard |
 | `K` | Toggle Kill Switch (Shift+K) |
+| `R` | Rename Profile (Shift+R) |
+| `s` | Cycle Profile Sort Order (Sidebar) |
+| `f` | Flip Panel (Chart / Connection Details / Security) — back face shows alternate view. Inside Event Log, cycles the log-level filter. |
 | `z` | Toggle Zoom View (Panel) |
 | `x` | Open Action Menu (Contextual) |
 | `b` | Open Bulk Menu |
+| `?` | Open Help Overlay (Tab cycles sections) |
 | `Del` | Delete Profile (Sidebar) |
 | `q` | Quit Application |
 
