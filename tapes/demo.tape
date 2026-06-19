@@ -27,7 +27,7 @@ Set Padding 40
 
 # --- launch (hidden so any "Password:" prompt is never recorded) ---
 Hide
-Type "sudo vortix"
+Type "echo $SUDO_PASSWORD | sudo -S vortix"
 Enter
 Sleep 4s
 Show

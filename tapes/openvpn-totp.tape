@@ -26,7 +26,7 @@ Set Height 900
 Set Padding 40
 
 Hide
-Type "sudo vortix"
+Type "echo $SUDO_PASSWORD | sudo -S vortix"
 Enter
 Sleep 4s
 Show
