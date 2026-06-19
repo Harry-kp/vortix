@@ -35,10 +35,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # cachix/install-nix-action collides with the preinstalled Nix on
+      # GitHub's macOS runners (eDSRecordAlreadyExists on _nixbld1). The
+      # Determinate installer handles that case cleanly on both macOS and Linux.
       - name: Install Nix
-        uses: cachix/install-nix-action@v27
+        uses: DeterminateSystems/nix-installer-action@main
         with:
-          extra_nix_config: |
+          extra-conf: |
             experimental-features = nix-command flakes
             accept-flake-config = true
 
