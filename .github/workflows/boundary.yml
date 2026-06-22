@@ -28,7 +28,7 @@ jobs:
     name: Boundary
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/rust-setup
       - name: Subprocess boundary (plan 002)
         run: cargo xtask check-subprocess

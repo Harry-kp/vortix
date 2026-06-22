@@ -34,7 +34,7 @@ jobs:
         os: [macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/rust-setup
       - name: Install VPN tools (Linux)
         if: runner.os == 'Linux'
@@ -54,7 +54,7 @@ jobs:
         run: |
           dnf install -y ca-certificates curl gcc gcc-c++ git make nftables openvpn pkgconf-pkg-config shadow-utils which wireguard-tools
           useradd -m tester
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.91.0"

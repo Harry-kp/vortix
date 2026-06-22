@@ -62,7 +62,7 @@ jobs:
     # re-soft-gate.
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Build integration harness image (${{ matrix.distro.label }})
         run: |

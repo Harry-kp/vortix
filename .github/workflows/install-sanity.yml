@@ -35,7 +35,7 @@ jobs:
     steps:
       - name: Checkout (for shell-installer + static-binary)
         if: matrix.method == 'shell-installer' || matrix.method == 'static-binary'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Node (npm-install)
         if: matrix.method == 'npm-install'
