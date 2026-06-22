@@ -22,7 +22,7 @@ crossterm = "0.29"
 # anyone without `--locked`. Drop the cap once upstream releases a
 # clean 0.3.49+ — until then, pinning here keeps the canonical install
 # command working for end users on crates.io.
-time = { version = ">=0.3, <0.3.50", features = ["local-offset", "formatting", "macros"] }
+time = { version = ">=0.3, <0.3.51", features = ["local-offset", "formatting", "macros"] }
 
 # Error Handling
 color-eyre = "0.6"
