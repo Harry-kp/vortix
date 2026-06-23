@@ -61,7 +61,14 @@ pub struct SocketSnapshot {
 }
 
 /// Errors produced by [`SocketAudit::snapshot`].
-#[derive(Debug, Error)]
+///
+/// `Clone` is derived because this error rides the App message bus
+/// (`Message::SocketAuditUpdate`) which itself derives `Clone` for the
+/// action-menu fan-out. The `Io` variant carries the underlying
+/// `std::io::Error`'s `to_string()` rather than the error itself —
+/// `std::io::Error` is not `Clone`, and the diagnostic string is the
+/// only field the consumer renders.
+#[derive(Debug, Clone, Error)]
 #[non_exhaustive]
 pub enum SocketAuditError {
     /// The platform impl is a stub (Windows in v0.3.0). The CLI
@@ -79,7 +86,13 @@ pub enum SocketAuditError {
     ParseFailed(String),
     /// I/O error reading `/proc` or running a command.
     #[error("socket audit I/O: {0}")]
-    Io(#[from] std::io::Error),
+    Io(String),
+}
+
+impl From<std::io::Error> for SocketAuditError {
+    fn from(err: std::io::Error) -> Self {
+        Self::Io(err.to_string())
+    }
 }
 
 /// Result alias for socket-audit operations.

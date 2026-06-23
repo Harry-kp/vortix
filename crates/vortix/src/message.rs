@@ -9,6 +9,7 @@
 use crate::core::scanner::ActiveSession;
 use crate::core::telemetry::TelemetryUpdate;
 use crate::state::{FocusedPanel, ToastType};
+use crate::vortix_core::ports::socket_audit::{SocketAuditError, SocketSnapshot};
 
 /// All messages that can modify application state.
 ///
@@ -137,6 +138,11 @@ pub enum Message {
     Quit,
     /// Background telemetry update
     Telemetry(TelemetryUpdate),
+    /// Result of a `SocketAudit::snapshot()` poll. The poller runs at
+    /// ~3 s cadence from `App::poll_socket_audit`; the handler stores
+    /// the snapshot + a derived `SocketAuditStatus` on `VpnRuntime`
+    /// for the Security Guard back face to render.
+    SocketAuditUpdate(Result<Vec<SocketSnapshot>, SocketAuditError>),
     /// Periodic system state synchronization (active profiles +
     /// default-route interface). The route iface is probed by the
     /// scanner's background thread alongside the active-session work

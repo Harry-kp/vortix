@@ -1,7 +1,7 @@
 //! Background telemetry and scanner polling.
 
 use std::sync::mpsc;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use super::App;
 use crate::constants;
@@ -167,5 +167,32 @@ impl App {
             let _ = tx.send(totals);
         });
         self.runtime.netstats_rx = Some(rx);
+    }
+
+    /// Spawn a `SocketAudit::snapshot()` probe at most every
+    /// `SOCKET_AUDIT_POLL_SECS`. Result returns via
+    /// `Message::SocketAuditUpdate` through `runtime.cmd_tx`. Pattern
+    /// matches `spawn_dns_leak_probe` — a short-lived thread per tick,
+    /// no shared mutable state, single-flight guarded by
+    /// `runtime.socket_audit_in_flight`.
+    pub(crate) fn poll_socket_audit(&mut self) {
+        if self.runtime.socket_audit_in_flight {
+            return;
+        }
+        let due = match self.runtime.last_socket_audit_poll {
+            None => true,
+            Some(prev) => prev.elapsed() >= Duration::from_secs(constants::SOCKET_AUDIT_POLL_SECS),
+        };
+        if !due {
+            return;
+        }
+
+        self.runtime.last_socket_audit_poll = Some(Instant::now());
+        self.runtime.socket_audit_in_flight = true;
+        let tx = self.runtime.cmd_tx.clone();
+        std::thread::spawn(move || {
+            let result = crate::platform::current_platform().socket_audit.snapshot();
+            let _ = tx.send(Message::SocketAuditUpdate(result));
+        });
     }
 }

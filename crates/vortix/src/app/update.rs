@@ -333,6 +333,7 @@ impl App {
                 self.log("APP: Logs cleared");
             }
             Message::Telemetry(update) => self.handle_telemetry(update),
+            Message::SocketAuditUpdate(result) => self.handle_socket_audit_update(result),
             Message::SyncSystemState {
                 sessions,
                 default_route_interface,
@@ -818,6 +819,38 @@ impl App {
             persisted_tunnels,
         );
         self.should_quit = true;
+    }
+
+    fn handle_socket_audit_update(
+        &mut self,
+        result: Result<
+            Vec<crate::vortix_core::ports::socket_audit::SocketSnapshot>,
+            crate::vortix_core::ports::socket_audit::SocketAuditError,
+        >,
+    ) {
+        use crate::vortix_core::ports::socket_audit::SocketAuditError;
+        use crate::vpn_runtime::SocketAuditStatus;
+
+        self.runtime.socket_audit_in_flight = false;
+        match result {
+            Ok(snapshot) => {
+                let partial = snapshot.iter().any(|s| s.pid == 0);
+                self.runtime.socket_audit_status = if partial {
+                    SocketAuditStatus::PartialNonRoot
+                } else {
+                    SocketAuditStatus::Ok
+                };
+                self.runtime.socket_audit_snapshot = Some(snapshot);
+            }
+            Err(SocketAuditError::Unsupported) => {
+                self.runtime.socket_audit_snapshot = None;
+                self.runtime.socket_audit_status = SocketAuditStatus::Unsupported;
+            }
+            Err(err) => {
+                self.runtime.socket_audit_snapshot = None;
+                self.runtime.socket_audit_status = SocketAuditStatus::Error(err.to_string());
+            }
+        }
     }
 
     #[allow(clippy::too_many_lines)] // TEA-style dispatch — every arm is one telemetry variant; splitting would obscure the handler shape without simplifying it
@@ -1504,6 +1537,9 @@ impl App {
 
         // 6. Poll network stats (spawn-on-demand, non-blocking)
         self.poll_network_stats();
+
+        // 6a. Poll socket audit (3 s cadence, single-flight)
+        self.poll_socket_audit();
 
         // 7. Update network stats history (O(1) ring-buffer rotation)
         self.runtime.down_history.pop_front();

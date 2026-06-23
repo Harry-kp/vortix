@@ -54,6 +54,10 @@ pub const DEFAULT_AUTO_RECONNECT: bool = true;
 pub const DEFAULT_AUTO_RECONNECT_DELAY_SECS: u64 = 3;
 /// Network monitor gateway check interval in seconds.
 pub const NETWORK_MONITOR_POLL_SECS: u64 = 3;
+/// Socket-audit poll cadence in seconds. Drives the Security Guard
+/// back face's live inventory; matches `NETWORK_MONITOR_POLL_SECS`
+/// since both are exception-surface refreshers, not throughput meters.
+pub const SOCKET_AUDIT_POLL_SECS: u64 = 3;
 /// Duration of the panel flip animation in milliseconds.
 pub const FLIP_ANIMATION_DURATION_MS: u64 = 200;
 /// Target frame interval during flip animation (~40 FPS).

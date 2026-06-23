@@ -3864,3 +3864,54 @@ fn real_ip_frozen_once_connected_then_thaws_on_disconnect() {
         "real_ip must thaw and update after clean disconnect"
     );
 }
+
+// ====================================================================
+// SocketAuditUpdate handler tests (BackFace v1 / Security Guard EICAS)
+// ====================================================================
+
+fn sample_socket(pid: u32) -> crate::vortix_core::ports::socket_audit::SocketSnapshot {
+    use crate::vortix_core::ports::socket_audit::{SocketProtocol, SocketSnapshot};
+    SocketSnapshot {
+        pid,
+        command: "curl".to_string(),
+        local: "10.0.0.2:54321".parse().unwrap(),
+        remote: Some("1.1.1.1:443".parse().unwrap()),
+        protocol: SocketProtocol::Tcp,
+        interface: Some("utun3".to_string()),
+    }
+}
+
+#[test]
+fn socket_audit_update_with_ok_writes_snapshot_to_app() {
+    use crate::vpn_runtime::SocketAuditStatus;
+    let mut app = test_app();
+    let sample = sample_socket(1234);
+
+    app.handle_message(Message::SocketAuditUpdate(Ok(vec![sample.clone()])));
+
+    assert_eq!(
+        app.runtime.socket_audit_snapshot.as_deref(),
+        Some(&[sample][..]),
+    );
+    assert_eq!(app.runtime.socket_audit_status, SocketAuditStatus::Ok);
+    assert!(!app.runtime.socket_audit_in_flight);
+}
+
+#[test]
+fn socket_audit_update_with_unsupported_sets_status_and_nones_snapshot() {
+    use crate::vortix_core::ports::socket_audit::SocketAuditError;
+    use crate::vpn_runtime::SocketAuditStatus;
+    let mut app = test_app();
+    // Seed a prior snapshot so we can prove Unsupported clears it.
+    app.runtime.socket_audit_snapshot = Some(vec![sample_socket(42)]);
+
+    app.handle_message(Message::SocketAuditUpdate(Err(
+        SocketAuditError::Unsupported,
+    )));
+
+    assert!(app.runtime.socket_audit_snapshot.is_none());
+    assert_eq!(
+        app.runtime.socket_audit_status,
+        SocketAuditStatus::Unsupported,
+    );
+}

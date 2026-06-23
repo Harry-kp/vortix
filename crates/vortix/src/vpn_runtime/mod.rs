@@ -15,6 +15,33 @@ pub mod openvpn;
 
 pub use connection_state::{ConnectionState, DetailedConnectionInfo};
 
+/// Coarse status of the most recent `SocketAudit::snapshot()` poll.
+///
+/// Mirrors the relevant `SocketAuditError` variants for the renderer
+/// without dragging the full error into the UI layer. `PartialNonRoot`
+/// is not derived from an error variant — the port returns `Ok(...)`
+/// with `pid: 0` entries on non-root hosts — but the message handler
+/// flags the snapshot as partial when any entry lacks a resolved pid so
+/// the Security Guard back face can render `scope: partial …`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum SocketAuditStatus {
+    /// Never polled yet, or in flight.
+    #[default]
+    Unknown,
+    /// Snapshot returned with full process attribution.
+    Ok,
+    /// Snapshot returned but at least one entry has `pid == 0` —
+    /// running without root on Linux/macOS leaves cross-user sockets
+    /// unattributed.
+    PartialNonRoot,
+    /// Platform impl is a stub (currently Windows). The snapshot
+    /// is `None` in this state.
+    Unsupported,
+    /// The probe itself failed (command non-zero, parse failure,
+    /// I/O error). Renderer surfaces the message verbatim.
+    Error(String),
+}
+
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -54,6 +81,21 @@ pub struct VpnRuntime {
     pub isp: String,
     pub dns_server: String,
     pub dns_leak: crate::core::dns_leak::DnsLeakStatus,
+
+    /// Latest `SocketAudit::snapshot()` result, polled every
+    /// `SOCKET_AUDIT_POLL_SECS` from `App::handle_tick`. `None` until
+    /// the first poll completes or when the platform is `Unsupported`.
+    pub socket_audit_snapshot: Option<Vec<crate::vortix_core::ports::socket_audit::SocketSnapshot>>,
+    /// Coarse status of the latest poll — drives the Security Guard
+    /// back face scope footer.
+    pub socket_audit_status: SocketAuditStatus,
+    /// Instant of the last `poll_socket_audit` dispatch (Some after the
+    /// first dispatch). Read by the throttle gate so the 3 s cadence
+    /// holds even though `handle_tick` fires every 1 s.
+    pub(crate) last_socket_audit_poll: Option<Instant>,
+    /// True between dispatch and message receipt so concurrent ticks
+    /// don't spawn duplicate probes.
+    pub(crate) socket_audit_in_flight: bool,
 
     // === System Info ===
     pub public_ip: String,
@@ -139,6 +181,10 @@ impl VpnRuntime {
             isp: constants::MSG_DETECTING.to_string(),
             dns_server: constants::MSG_DETECTING.to_string(),
             dns_leak: crate::core::dns_leak::DnsLeakStatus::Unknown,
+            socket_audit_snapshot: None,
+            socket_audit_status: SocketAuditStatus::Unknown,
+            last_socket_audit_poll: None,
+            socket_audit_in_flight: false,
 
             public_ip: constants::MSG_DETECTING.to_string(),
             real_ip: None,
@@ -227,6 +273,10 @@ impl VpnRuntime {
             isp: String::new(),
             dns_server: String::new(),
             dns_leak: crate::core::dns_leak::DnsLeakStatus::Unknown,
+            socket_audit_snapshot: None,
+            socket_audit_status: SocketAuditStatus::Unknown,
+            last_socket_audit_poll: None,
+            socket_audit_in_flight: false,
 
             public_ip: String::new(),
             real_ip: None,
@@ -298,6 +348,10 @@ impl VpnRuntime {
             isp: String::new(),
             dns_server: String::new(),
             dns_leak: crate::core::dns_leak::DnsLeakStatus::Unknown,
+            socket_audit_snapshot: None,
+            socket_audit_status: SocketAuditStatus::Unknown,
+            last_socket_audit_poll: None,
+            socket_audit_in_flight: false,
             public_ip: String::new(),
             real_ip: None,
             public_ipv6: None,
