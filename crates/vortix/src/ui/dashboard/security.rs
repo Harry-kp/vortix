@@ -1,7 +1,7 @@
 use crate::app::App;
 use crate::state::{KillSwitchMode, KillSwitchState};
 use crate::ui::dashboard::backface::{
-    render_nav_hint_band, render_scope_footer, render_verdict_band, Scope, Severity, VerdictMode,
+    render_scope_footer, render_verdict_band, Scope, Severity, VerdictMode,
 };
 use crate::vortix_core::engine::registry::TunnelSnapshot;
 use crate::vortix_core::engine::state::Connection;
@@ -1049,8 +1049,7 @@ fn render_back(frame: &mut Frame, app: &App, area: Rect, border_style: Style) {
         Vec::new()
     };
 
-    // Layout: verdict, optional [blank + ribbon], blank, footer, nav-hint.
-    let mut constraints: Vec<Constraint> = Vec::with_capacity(6);
+    let mut constraints: Vec<Constraint> = Vec::with_capacity(5);
     constraints.push(Constraint::Length(1)); // verdict
     let has_ribbon = !ribbon_rows.is_empty();
     if has_ribbon {
@@ -1061,14 +1060,12 @@ fn render_back(frame: &mut Frame, app: &App, area: Rect, border_style: Style) {
     }
     constraints.push(Constraint::Min(1)); // filler pushes footer to bottom
     constraints.push(Constraint::Length(1)); // footer
-    constraints.push(Constraint::Length(1)); // nav-hint
 
     let chunks = Layout::vertical(constraints).split(inner);
 
     render_verdict_band(frame, chunks[0], verdict, &headline);
 
-    let footer_idx = chunks.len() - 2;
-    let nav_idx = chunks.len() - 1;
+    let footer_idx = chunks.len() - 1;
 
     if has_ribbon {
         let ribbon_area = chunks[2];
@@ -1076,7 +1073,6 @@ fn render_back(frame: &mut Frame, app: &App, area: Rect, border_style: Style) {
     }
 
     render_scope_footer(frame, chunks[footer_idx], &scope);
-    render_nav_hint_band(frame, chunks[nav_idx], &[("Esc", "back")]);
 }
 
 fn primary_connected_details(
@@ -1115,6 +1111,11 @@ fn build_scope(
                 interface: Some(adopted_iface),
             };
         }
+        if has_active_non_primary_tunnel(app) {
+            return Scope::Partial {
+                reason: "split-tunnel only",
+            };
+        }
     }
     match primary_details {
         None => Scope::Partial {
@@ -1148,6 +1149,13 @@ fn first_unauthoritative_iface(app: &App) -> Option<String> {
     })
 }
 
+fn has_active_non_primary_tunnel(app: &App) -> bool {
+    app.registry
+        .snapshot_all()
+        .into_iter()
+        .any(|snap| matches!(snap.state, Connection::Connected { .. }))
+}
+
 fn build_verdict(
     app: &App,
     primary_details: Option<&crate::vortix_core::engine::state::DetailedConnectionInfo>,
@@ -1162,6 +1170,11 @@ fn build_verdict(
         Scope::Partial { reason } if *reason == "not connected" => (
             VerdictMode::Unknown,
             "Not connected".to_string(),
+            Vec::new(),
+        ),
+        Scope::Partial { reason } if *reason == "split-tunnel only" => (
+            VerdictMode::Unknown,
+            "Split-tunnel only — internet not via VPN".to_string(),
             Vec::new(),
         ),
         Scope::ExternalAdopted { .. } => (

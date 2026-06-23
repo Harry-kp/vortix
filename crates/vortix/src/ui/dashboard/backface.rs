@@ -225,6 +225,7 @@ pub fn render_scope_footer(frame: &mut Frame, area: Rect, scope: &Scope) {
 /// Render a nav-hint band as right-aligned `<key> <label>` pairs
 /// joined by three spaces. Empty `hints` produces an empty line so
 /// callers can claim a row unconditionally without a branch.
+#[allow(dead_code)] // first consumer arrives with #166 / #167
 pub fn render_nav_hint_band(frame: &mut Frame, area: Rect, hints: &[(&str, &str)]) {
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(hints.len().saturating_mul(4));
     for (i, (key, label)) in hints.iter().enumerate() {
