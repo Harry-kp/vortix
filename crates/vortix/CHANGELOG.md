@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **BackFace v1 spec** — shared verdict band + scope footer + nav-hint band helpers that future back faces will consume. New `VerdictMode` / `Severity` / `Scope` types live in `ui::dashboard::backface` and mirror the `KillSwitchMode` "one vocabulary, used everywhere" pattern (verdict slugs `pass` / `watch` / `fail` / `unknown`; severities `Warning` / `Caution` / `Advisory` / `Status` borrowed from aviation EICAS standard ARP 4102/4).
+- **`SocketAudit` live polling** — the TUI now refreshes the socket inventory every 3 s on the existing message-loop tick. The snapshot and a `SocketAuditStatus` verdict (`Ok` / `PartialNonRoot` / `Unsupported` / `Error`) land on `VpnRuntime` for any panel that needs them.
+
+### Changed
+
+- **Security Guard back face** now renders EICAS-style content using the BackFace v1 helpers — verdict band (`PASS` / `FAIL` / `???` + headline) → alert ribbon (one Warning row per leak socket, only when failing, truncated at 5 + `+N more`) → scope footer + nav-hint band. Replaces the placeholder that pointed at [#168](https://github.com/Harry-kp/vortix/issues/168). Closes [#168](https://github.com/Harry-kp/vortix/issues/168). Connection Details ([#167](https://github.com/Harry-kp/vortix/issues/167)) and Throughput ([#166](https://github.com/Harry-kp/vortix/issues/166)) back faces keep their existing placeholders pending follow-up PRs.
+
 ## [0.4.2] - 2026-06-16
 
 ### Highlights
