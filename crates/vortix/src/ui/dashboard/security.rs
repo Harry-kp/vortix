@@ -1,15 +1,21 @@
 use crate::app::App;
 use crate::state::{KillSwitchMode, KillSwitchState};
+use crate::ui::dashboard::backface::{
+    render_nav_hint_band, render_scope_footer, render_verdict_band, Scope, Severity, VerdictMode,
+};
 use crate::vortix_core::engine::registry::TunnelSnapshot;
 use crate::vortix_core::engine::state::Connection;
+use crate::vortix_core::ports::socket_audit::SocketSnapshot;
+use crate::vpn_runtime::SocketAuditStatus;
 use crate::{constants, theme, utils};
 use ratatui::{
-    layout::Rect,
+    layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Padding, Paragraph},
     Frame,
 };
+use std::net::IpAddr;
 
 // ── Layout primitives ───────────────────────────────────────────────────────
 //
@@ -998,7 +1004,23 @@ fn format_value_with_tag(value: &str, tag: Option<&str>) -> String {
     }
 }
 
-// ── Flip-side view (unchanged — placeholder for issue #168) ────────────────
+// ── Flip-side view: BackFace v1 EICAS rendering ─────────────────────────────
+//
+// Verdict band → optional alert ribbon (only on Fail) → scope footer +
+// nav-hint band. Helpers live in `super::backface` so every back face
+// built on the v1 contract speaks the same vocabulary.
+
+/// Max ribbon rows before truncation. Above this we surface a `+N more`
+/// summary row so the panel doesn't stretch past its 80×24 budget.
+const RIBBON_MAX_ROWS: usize = 5;
+
+/// Classification of a single socket against the primary tunnel.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SocketClass {
+    Vpn,
+    Lan,
+    Leak,
+}
 
 fn render_back(frame: &mut Frame, app: &App, area: Rect, border_style: Style) {
     let block = Block::default()
@@ -1017,68 +1039,261 @@ fn render_back(frame: &mut Frame, app: &App, area: Rect, border_style: Style) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let is_connected = app.registry.primary().is_some();
+    let primary_details = primary_connected_details(app);
+    let scope = build_scope(app, primary_details.as_ref());
+    let (verdict, headline, leaks) = build_verdict(app, primary_details.as_ref(), &scope);
 
-    let text = if is_connected {
-        vec![
-            Line::from(Span::styled(
-                "Active Connections Audit",
-                Style::default()
-                    .fg(theme::ACCENT_PRIMARY)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "  Per-socket VPN routing verification",
-                Style::default().fg(theme::TEXT_SECONDARY),
-            )),
-            Line::from(Span::styled(
-                "  will be available in a future release.",
-                Style::default().fg(theme::TEXT_SECONDARY),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "  This view will show which connections",
-                Style::default().fg(theme::TEXT_SECONDARY),
-            )),
-            Line::from(Span::styled(
-                "  are routed through the VPN tunnel vs",
-                Style::default().fg(theme::TEXT_SECONDARY),
-            )),
-            Line::from(Span::styled(
-                "  bypassing it (split-tunnel detection).",
-                Style::default().fg(theme::TEXT_SECONDARY),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "  See: github.com/Harry-kp/vortix/issues/168",
-                Style::default().fg(theme::NORD_POLAR_NIGHT_4),
-            )),
-        ]
+    let ribbon_rows = if verdict == VerdictMode::Fail {
+        build_ribbon_rows(&leaks)
     } else {
-        vec![
-            Line::from(Span::styled(
-                "Active Connections Audit",
-                Style::default()
-                    .fg(theme::INACTIVE)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "  Connect to a VPN to see",
-                Style::default().fg(theme::TEXT_SECONDARY),
-            )),
-            Line::from(Span::styled(
-                "  connection routing details.",
-                Style::default().fg(theme::TEXT_SECONDARY),
-            )),
-        ]
+        Vec::new()
     };
 
-    let max_lines = inner.height as usize;
-    let mut text = text;
-    text.truncate(max_lines);
-    frame.render_widget(Paragraph::new(text), inner);
+    // Layout: verdict, optional [blank + ribbon], blank, footer, nav-hint.
+    let mut constraints: Vec<Constraint> = Vec::with_capacity(6);
+    constraints.push(Constraint::Length(1)); // verdict
+    let has_ribbon = !ribbon_rows.is_empty();
+    if has_ribbon {
+        constraints.push(Constraint::Length(1)); // blank
+        constraints.push(Constraint::Length(
+            u16::try_from(ribbon_rows.len()).unwrap_or(u16::MAX),
+        ));
+    }
+    constraints.push(Constraint::Min(1)); // filler pushes footer to bottom
+    constraints.push(Constraint::Length(1)); // footer
+    constraints.push(Constraint::Length(1)); // nav-hint
+
+    let chunks = Layout::vertical(constraints).split(inner);
+
+    render_verdict_band(frame, chunks[0], verdict, &headline);
+
+    let footer_idx = chunks.len() - 2;
+    let nav_idx = chunks.len() - 1;
+
+    if has_ribbon {
+        let ribbon_area = chunks[2];
+        frame.render_widget(Paragraph::new(ribbon_rows), ribbon_area);
+    }
+
+    render_scope_footer(frame, chunks[footer_idx], &scope);
+    render_nav_hint_band(frame, chunks[nav_idx], &[("Esc", "back")]);
+}
+
+fn primary_connected_details(
+    app: &App,
+) -> Option<crate::vortix_core::engine::state::DetailedConnectionInfo> {
+    let id = app.registry.primary()?;
+    let snap = app.registry.snapshot(id)?;
+    if let Connection::Connected { details, .. } = snap.state {
+        Some(*details)
+    } else {
+        None
+    }
+}
+
+fn build_scope(
+    app: &App,
+    primary_details: Option<&crate::vortix_core::engine::state::DetailedConnectionInfo>,
+) -> Scope {
+    if matches!(
+        app.runtime.socket_audit_status,
+        SocketAuditStatus::Unsupported
+    ) {
+        return Scope::Unsupported {
+            platform: platform_label(),
+        };
+    }
+    // External adopted: any tunnel where vortix couldn't authoritatively
+    // attribute the kernel iface (macOS multi-OpenVPN Method-B fallback).
+    // These can't win primary election, so checking only the primary
+    // slot misses them. Surface the unauthoritative scope explicitly so
+    // the back face doesn't silently fall through to "not connected"
+    // when an adopted tunnel IS active.
+    if primary_details.is_none() {
+        if let Some(adopted_iface) = first_unauthoritative_iface(app) {
+            return Scope::ExternalAdopted {
+                interface: Some(adopted_iface),
+            };
+        }
+    }
+    match primary_details {
+        None => Scope::Partial {
+            reason: "not connected",
+        },
+        Some(details) if !details.interface_authoritative => Scope::ExternalAdopted {
+            interface: Some(details.interface.clone()),
+        },
+        Some(_)
+            if matches!(
+                app.runtime.socket_audit_status,
+                SocketAuditStatus::PartialNonRoot
+            ) =>
+        {
+            Scope::Partial { reason: "non-root" }
+        }
+        Some(details) => Scope::Primary {
+            interface: details.interface.clone(),
+        },
+    }
+}
+
+fn first_unauthoritative_iface(app: &App) -> Option<String> {
+    app.registry.snapshot_all().into_iter().find_map(|snap| {
+        if let Connection::Connected { details, .. } = snap.state {
+            if !details.interface_authoritative {
+                return Some(details.interface);
+            }
+        }
+        None
+    })
+}
+
+fn build_verdict(
+    app: &App,
+    primary_details: Option<&crate::vortix_core::engine::state::DetailedConnectionInfo>,
+    scope: &Scope,
+) -> (VerdictMode, String, Vec<SocketSnapshot>) {
+    match scope {
+        Scope::Unsupported { platform } => (
+            VerdictMode::Unknown,
+            format!("Socket audit unsupported on {platform}"),
+            Vec::new(),
+        ),
+        Scope::Partial { reason } if *reason == "not connected" => (
+            VerdictMode::Unknown,
+            "Not connected".to_string(),
+            Vec::new(),
+        ),
+        Scope::ExternalAdopted { .. } => (
+            VerdictMode::Unknown,
+            "Socket attribution unavailable for adopted tunnels".to_string(),
+            Vec::new(),
+        ),
+        _ => match (&app.runtime.socket_audit_snapshot, primary_details) {
+            (None, _) => (
+                VerdictMode::Unknown,
+                "Loading socket inventory\u{2026}".to_string(),
+                Vec::new(),
+            ),
+            (Some(sockets), Some(details)) => classify_and_summarize(sockets, details),
+            (Some(_), None) => (
+                VerdictMode::Unknown,
+                "Not connected".to_string(),
+                Vec::new(),
+            ),
+        },
+    }
+}
+
+fn classify_and_summarize(
+    sockets: &[SocketSnapshot],
+    details: &crate::vortix_core::engine::state::DetailedConnectionInfo,
+) -> (VerdictMode, String, Vec<SocketSnapshot>) {
+    let vpn_ip: Option<IpAddr> = details.internal_ip.parse().ok();
+    let total = sockets.len();
+    let mut leaks: Vec<SocketSnapshot> = Vec::new();
+    for s in sockets {
+        if classify_socket(s, vpn_ip) == SocketClass::Leak {
+            leaks.push(s.clone());
+        }
+    }
+    if leaks.is_empty() {
+        let headline = format!("{total}/{total} sockets via primary {}", details.interface);
+        (VerdictMode::Pass, headline, leaks)
+    } else {
+        let leak_word = if leaks.len() == 1 { "leak" } else { "leaks" };
+        let headline = format!("{total} sockets \u{00B7} {} {leak_word}", leaks.len());
+        (VerdictMode::Fail, headline, leaks)
+    }
+}
+
+fn classify_socket(s: &SocketSnapshot, vpn_ip: Option<IpAddr>) -> SocketClass {
+    if let Some(vpn) = vpn_ip {
+        if s.local.ip() == vpn {
+            return SocketClass::Vpn;
+        }
+    }
+    // Listening sockets without a remote: not a leak — they're local-only.
+    let Some(remote) = s.remote else {
+        return SocketClass::Lan;
+    };
+    let remote_ip = remote.ip();
+    if is_loopback(remote_ip) || is_private(remote_ip) {
+        SocketClass::Lan
+    } else {
+        SocketClass::Leak
+    }
+}
+
+fn is_loopback(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => v6.is_loopback(),
+    }
+}
+
+fn is_private(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_private() || v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            // RFC4193 fc00::/7 — Unique Local Address.
+            let segs = v6.segments();
+            (segs[0] & 0xFE00) == 0xFC00
+        }
+    }
+}
+
+fn build_ribbon_rows(leaks: &[SocketSnapshot]) -> Vec<Line<'static>> {
+    let mut rows: Vec<Line<'static>> = Vec::with_capacity(leaks.len().min(RIBBON_MAX_ROWS) + 1);
+    let visible = leaks.iter().take(RIBBON_MAX_ROWS);
+    for s in visible {
+        rows.push(leak_row(s));
+    }
+    if leaks.len() > RIBBON_MAX_ROWS {
+        let extra = leaks.len() - RIBBON_MAX_ROWS;
+        rows.push(Line::from(Span::styled(
+            format!("\u{00B7} +{extra} more"),
+            Style::default().fg(theme::TEXT_SECONDARY),
+        )));
+    }
+    rows
+}
+
+fn leak_row(s: &SocketSnapshot) -> Line<'static> {
+    let sev = Severity::Warning;
+    let glyph = sev.glyph().to_string();
+    let color = sev.color();
+    let command = if s.command.is_empty() {
+        "?".to_string()
+    } else {
+        s.command.clone()
+    };
+    let remote = s.remote.map_or_else(|| "?".to_string(), |r| r.to_string());
+    // Age is not carried on `SocketSnapshot` today — render "now" until
+    // a future plan threads a per-socket observed-at timestamp through
+    // the port.
+    let body = format!(
+        "LEAK pid {pid} {command} \u{2192} {remote} (now)",
+        pid = s.pid,
+        command = command,
+    );
+    Line::from(vec![
+        Span::styled(glyph, Style::default().fg(color)),
+        Span::raw(" "),
+        Span::styled(body, Style::default().fg(color)),
+    ])
+}
+
+fn platform_label() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "Windows"
+    } else if cfg!(target_os = "macos") {
+        "macOS"
+    } else if cfg!(target_os = "linux") {
+        "Linux"
+    } else {
+        "this platform"
+    }
 }
 
 #[cfg(test)]
@@ -1794,5 +2009,211 @@ mod tests {
             !out.contains("Not enforced"),
             "old IPv6 explainer must be gone:\n{out}"
         );
+    }
+
+    // ── render_back: BackFace v1 snapshot tests (U4) ──────────────────────
+    //
+    // Covers AE1–AE5. Width 80 / height 24 — the documented density
+    // budget. AE4 (`interface_authoritative=false`) is reachable via the
+    // `details` field on a registry-Connected entry; we use the
+    // `set_connected` registry method directly so the test doesn't drag
+    // in the scanner pipeline.
+
+    mod back_face_tests {
+        use super::*;
+        use crate::vortix_core::engine::state::DetailedConnectionInfo;
+        use crate::vortix_core::ports::socket_audit::{SocketProtocol, SocketSnapshot};
+        use crate::vortix_core::profile::ProfileId;
+        use crate::vpn_runtime::SocketAuditStatus;
+        use std::time::SystemTime;
+
+        fn render_back_to_string(app: &App, width: u16, height: u16) -> String {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).expect("terminal");
+            terminal
+                .draw(|frame| {
+                    let area = Rect::new(0, 0, width, height);
+                    render_back(frame, app, area, Style::default());
+                })
+                .expect("draw");
+            let buf = terminal.backend().buffer().clone();
+            let mut out = String::new();
+            for y in 0..buf.area.height {
+                for x in 0..buf.area.width {
+                    out.push_str(buf[(x, y)].symbol());
+                }
+                out.push('\n');
+            }
+            out
+        }
+
+        fn row_text(rendered: &str, idx: usize) -> &str {
+            rendered.lines().nth(idx).unwrap_or("")
+        }
+
+        fn assert_row_contains(rendered: &str, idx: usize, needle: &str) {
+            let row = row_text(rendered, idx);
+            assert!(
+                row.contains(needle),
+                "expected row {idx} to contain {needle:?}, got: {row:?}\nfull:\n{rendered}"
+            );
+        }
+
+        fn make_details(
+            iface: &str,
+            internal_ip: &str,
+            authoritative: bool,
+        ) -> DetailedConnectionInfo {
+            DetailedConnectionInfo {
+                interface: iface.to_string(),
+                internal_ip: internal_ip.to_string(),
+                interface_authoritative: authoritative,
+                ..Default::default()
+            }
+        }
+
+        fn install_primary(app: &mut App, name: &str, details: DetailedConnectionInfo) {
+            let profile_id = ProfileId::new(name);
+            let iface = details.interface.clone();
+            app.registry
+                .set_connected(profile_id, Vec::new(), details, SystemTime::now(), || {
+                    crate::vortix_core::engine::Engine::new(
+                        crate::tunnel::TunnelKind::Mock(
+                            crate::vortix_core::ports::tunnel::mock::MockTunnel::new(),
+                        ),
+                        |_| None,
+                    )
+                });
+            // Feed the cached default route so this tunnel wins primary
+            // election when `refresh_primary` runs against the cache.
+            app.registry.feed_default_route_interface(Some(iface));
+            app.registry.refresh_primary();
+        }
+
+        fn sock(local: &str, remote: Option<&str>) -> SocketSnapshot {
+            SocketSnapshot {
+                pid: 1234,
+                command: "curl".to_string(),
+                local: local.parse().expect("local addr"),
+                remote: remote.map(|r| r.parse().expect("remote addr")),
+                protocol: SocketProtocol::Tcp,
+                interface: None,
+            }
+        }
+
+        fn app_with_primary(sockets: Vec<SocketSnapshot>) -> App {
+            let mut app = App::new_test();
+            let details = make_details("utun3", "10.0.0.2", true);
+            install_primary(&mut app, "corp", details);
+            app.runtime.socket_audit_snapshot = Some(sockets);
+            app.runtime.socket_audit_status = SocketAuditStatus::Ok;
+            app
+        }
+
+        fn app_disconnected() -> App {
+            App::new_test()
+        }
+
+        #[test]
+        fn render_back_clean_session_shows_pass_verdict_only() {
+            // AE1: all sockets via VPN or LAN — verdict PASS, no ribbon.
+            let sockets = vec![
+                sock("10.0.0.2:443", Some("203.0.113.10:443")), // VPN (local on internal_ip)
+                sock("10.0.0.2:8080", Some("198.51.100.7:443")), // VPN
+                sock("10.0.0.2:9000", Some("203.0.113.55:80")), // VPN
+                sock("10.0.0.2:9001", Some("203.0.113.56:80")), // VPN
+                sock("10.0.0.2:9002", Some("203.0.113.57:80")), // VPN
+                sock("192.168.1.20:50000", Some("192.168.1.1:53")), // LAN-private
+                sock("127.0.0.1:60000", Some("127.0.0.1:631")), // LAN-loopback
+            ];
+            let app = app_with_primary(sockets);
+
+            let out = render_back_to_string(&app, 80, 24);
+            // Row 0 is the top border. Row 1 = first inner row.
+            assert_row_contains(&out, 1, "PASS");
+            assert_row_contains(&out, 1, "7/7 sockets via primary utun3");
+            // No LEAK row anywhere.
+            assert!(
+                !out.contains("LEAK"),
+                "PASS verdict must not render any leak rows:\n{out}"
+            );
+        }
+
+        #[test]
+        fn render_back_leak_session_shows_fail_and_warning_ribbon() {
+            // AE2: 5 VPN + 1 leak — verdict FAIL, one warning row.
+            let sockets = vec![
+                sock("10.0.0.2:443", Some("203.0.113.10:443")),
+                sock("10.0.0.2:444", Some("203.0.113.11:443")),
+                sock("10.0.0.2:445", Some("203.0.113.12:443")),
+                sock("10.0.0.2:446", Some("203.0.113.13:443")),
+                sock("10.0.0.2:447", Some("203.0.113.14:443")),
+                // Leak: local is a non-VPN public IP, remote is public.
+                sock("198.51.100.5:55555", Some("93.184.216.34:443")),
+            ];
+            let app = app_with_primary(sockets);
+
+            let out = render_back_to_string(&app, 80, 24);
+            assert_row_contains(&out, 1, "FAIL");
+            assert_row_contains(&out, 1, "6 sockets");
+            assert_row_contains(&out, 1, "1 leak");
+            // Ribbon row sits two below the verdict (verdict, blank, ribbon).
+            assert_row_contains(&out, 3, "\u{25CF}"); // Severity::Warning glyph
+            assert_row_contains(&out, 3, "LEAK pid");
+        }
+
+        #[test]
+        fn render_back_disconnected_shows_unknown_verdict() {
+            // AE3: no primary — verdict Unknown, scope "not connected".
+            let app = app_disconnected();
+            let out = render_back_to_string(&app, 80, 24);
+            assert_row_contains(&out, 1, "???");
+            assert_row_contains(&out, 1, "Not connected");
+            // Footer (row 21 = inner height 22 - 1) contains the partial label.
+            // Find the row containing "scope:" — it lives near the bottom.
+            let has_scope = out
+                .lines()
+                .any(|l| l.contains("scope: partial") && l.contains("not connected"));
+            assert!(
+                has_scope,
+                "disconnected back face must render `scope: partial — not connected` footer:\n{out}"
+            );
+        }
+
+        #[test]
+        fn render_back_external_adopted_shows_unknown_with_unauthoritative_scope() {
+            // AE4: primary with interface_authoritative=false.
+            let mut app = App::new_test();
+            let details = make_details("utun5", "10.0.1.2", false);
+            install_primary(&mut app, "adopted", details);
+            app.runtime.socket_audit_snapshot = Some(Vec::new());
+            app.runtime.socket_audit_status = SocketAuditStatus::Ok;
+
+            let out = render_back_to_string(&app, 80, 24);
+            assert_row_contains(&out, 1, "???");
+            let has_scope = out
+                .lines()
+                .any(|l| l.contains("scope: external-adopted, unauthoritative"));
+            assert!(
+                has_scope,
+                "external-adopted back face must render the unauthoritative scope footer:\n{out}"
+            );
+        }
+
+        #[test]
+        fn render_back_windows_shows_unsupported_scope() {
+            // AE5: SocketAuditStatus::Unsupported renders the unsupported
+            // scope regardless of primary state.
+            let mut app = App::new_test();
+            app.runtime.socket_audit_status = SocketAuditStatus::Unsupported;
+
+            let out = render_back_to_string(&app, 80, 24);
+            assert_row_contains(&out, 1, "???");
+            let has_scope = out.lines().any(|l| l.contains("scope: unsupported on"));
+            assert!(
+                has_scope,
+                "unsupported back face must render `scope: unsupported on <platform>` footer:\n{out}"
+            );
+        }
     }
 }

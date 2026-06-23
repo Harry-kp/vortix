@@ -25,11 +25,6 @@
 //! cockpits (Boeing 757+, ARP 4102/4): a single character per row,
 //! sorted most-severe-first so the eye lands on the loudest entry.
 
-// U1 ships the module standalone; U3 (Security Guard render_back
-// migration) is the first in-tree caller of the render helpers and
-// `Scope`. Drop this allow once the helpers have a real call site.
-#![allow(dead_code)]
-
 use ratatui::{
     layout::{Alignment, Rect},
     style::{Color, Style},
@@ -60,7 +55,11 @@ pub enum VerdictMode {
 
 impl VerdictMode {
     /// Long-form prose label rendered alongside the headline.
-    /// `Pass` / `Watch` / `Fail` / `Unknown`.
+    /// `Pass` / `Watch` / `Fail` / `Unknown`. v1 callers only use
+    /// `short_label`; this method is kept for future surfaces (JSON
+    /// envelope, accessibility readers) and is exercised by the unit
+    /// tests.
+    #[allow(dead_code)]
     #[must_use]
     pub const fn display_name(self) -> &'static str {
         match self {
@@ -102,6 +101,12 @@ impl VerdictMode {
 /// Severity tier for an EICAS-style alert ribbon row. Variants are
 /// declared most-severe first so the derived [`Ord`] gives ascending
 /// sort = surface alarms before status. Direct EICAS borrow.
+///
+/// v1 only emits `Warning` (the only severity Security Guard's leak
+/// rows produce); `Caution`, `Advisory`, and `Status` are reserved so
+/// future back faces can land without an enum-breaking change. The
+/// variants are exercised by the unit tests in this module.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Severity {
     /// Top-tier alarm — red, demands attention.
@@ -143,6 +148,12 @@ impl Severity {
 /// Where the back-face's data applies. Rendered as a right-aligned
 /// `scope: …` footer on every v1 back face so the operator always
 /// knows which entity the verdict above belongs to.
+///
+/// `FocusedSecondary` is reserved for the Connection Details back face
+/// migration (#167); v1 Security Guard renders only `Primary` /
+/// `ExternalAdopted` / `Unsupported` / `Partial`. Exercised by the
+/// unit tests below.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Scope {
     /// The primary tunnel — owns the default route, full telemetry.
