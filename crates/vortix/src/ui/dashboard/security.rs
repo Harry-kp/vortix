@@ -1015,7 +1015,7 @@ fn format_value_with_tag(value: &str, tag: Option<&str>) -> String {
 const RIBBON_MAX_ROWS: usize = 5;
 
 /// Classification of a single socket against the primary tunnel.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SocketClass {
     Vpn,
     Lan,
@@ -1234,11 +1234,16 @@ fn is_loopback(ip: IpAddr) -> bool {
 
 fn is_private(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v4) => v4.is_private() || v4.is_link_local(),
+        // IPv4: RFC1918 + link-local 169.254/16 + multicast 224/4 (mDNS, SSDP, AirPlay).
+        IpAddr::V4(v4) => v4.is_private() || v4.is_link_local() || v4.is_multicast(),
         IpAddr::V6(v6) => {
-            // RFC4193 fc00::/7 — Unique Local Address.
+            // RFC4193 fc00::/7 ULA, fe80::/10 link-local (neighbor discovery, mDNS-v6),
+            // ff00::/8 multicast. All three are non-routable LAN scopes that should not
+            // be classified as VPN leaks.
             let segs = v6.segments();
-            (segs[0] & 0xFE00) == 0xFC00
+            let is_ula = (segs[0] & 0xFE00) == 0xFC00;
+            let is_link_local = (segs[0] & 0xFFC0) == 0xFE80;
+            is_ula || is_link_local || v6.is_multicast()
         }
     }
 }
@@ -2018,6 +2023,116 @@ mod tests {
     // `details` field on a registry-Connected entry; we use the
     // `set_connected` registry method directly so the test doesn't drag
     // in the scanner pipeline.
+
+    mod classify_socket_tests {
+        use super::*;
+        use crate::vortix_core::ports::socket_audit::{SocketProtocol, SocketSnapshot};
+        use std::net::{Ipv4Addr, Ipv6Addr};
+
+        fn sock(local: &str, remote: Option<&str>) -> SocketSnapshot {
+            SocketSnapshot {
+                pid: 1,
+                command: "x".into(),
+                local: local.parse().unwrap(),
+                remote: remote.map(|r| r.parse().unwrap()),
+                protocol: SocketProtocol::Tcp,
+                interface: None,
+            }
+        }
+
+        #[test]
+        fn ipv4_multicast_classified_as_lan() {
+            // 224.0.0.0/4 — mDNS, SSDP, AirPlay, Chromecast. Every macOS box
+            // emits these by default; misclassifying them as Leak would
+            // produce a permanent FAIL verdict for the typical user.
+            let s = sock("192.168.1.5:5353", Some("224.0.0.251:5353"));
+            assert_eq!(
+                classify_socket(&s, Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)))),
+                SocketClass::Lan
+            );
+        }
+
+        #[test]
+        fn ipv6_link_local_classified_as_lan() {
+            // fe80::/10 — neighbor discovery, mDNS-v6, router solicitation.
+            // Non-routable; never traverses the VPN tunnel.
+            let s = sock("[fe80::1]:546", Some("[fe80::2]:547"));
+            assert_eq!(
+                classify_socket(&s, Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)))),
+                SocketClass::Lan
+            );
+        }
+
+        #[test]
+        fn ipv6_multicast_classified_as_lan() {
+            // ff00::/8 — mDNS-v6 (ff02::fb), all-nodes (ff02::1), etc.
+            let s = sock("[fe80::1]:5353", Some("[ff02::fb]:5353"));
+            assert_eq!(
+                classify_socket(&s, Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)))),
+                SocketClass::Lan
+            );
+        }
+
+        #[test]
+        fn rfc1918_remote_classified_as_lan() {
+            // Regression guard on the existing 192.168/16 path.
+            let s = sock("10.0.0.5:22", Some("192.168.1.1:22"));
+            assert_eq!(
+                classify_socket(&s, Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)))),
+                SocketClass::Lan
+            );
+        }
+
+        #[test]
+        fn public_ipv4_not_via_vpn_classified_as_leak() {
+            // 1.1.1.1 from a non-VPN local addr is the canonical leak case.
+            let s = sock("192.168.1.5:443", Some("1.1.1.1:443"));
+            assert_eq!(
+                classify_socket(&s, Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)))),
+                SocketClass::Leak
+            );
+        }
+
+        #[test]
+        fn vpn_internal_ip_local_classified_as_vpn() {
+            let s = sock("10.0.0.2:54321", Some("1.1.1.1:443"));
+            assert_eq!(
+                classify_socket(&s, Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)))),
+                SocketClass::Vpn
+            );
+        }
+
+        #[test]
+        fn ipv6_ula_classified_as_lan() {
+            // fc00::/7 — Unique Local Address (regression guard).
+            let s = sock("[fc00::1]:80", Some("[fc00::2]:80"));
+            assert_eq!(
+                classify_socket(&s, Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)))),
+                SocketClass::Lan
+            );
+        }
+
+        #[test]
+        fn is_private_recognizes_v4_link_local() {
+            assert!(is_private(IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1))));
+        }
+
+        #[test]
+        fn is_private_recognizes_v6_link_local_boundary() {
+            // fe80:: is the lowest link-local; febf:ffff::/10 still link-local.
+            assert!(is_private(IpAddr::V6(
+                "fe80::1".parse::<Ipv6Addr>().unwrap()
+            )));
+            assert!(is_private(IpAddr::V6(
+                "febf:ffff::".parse::<Ipv6Addr>().unwrap()
+            )));
+            // fec0:: is OUTSIDE fe80::/10 (it's deprecated site-local but
+            // our matcher correctly rejects it).
+            assert!(!is_private(IpAddr::V6(
+                "fec0::1".parse::<Ipv6Addr>().unwrap()
+            )));
+        }
+    }
 
     mod back_face_tests {
         use super::*;
