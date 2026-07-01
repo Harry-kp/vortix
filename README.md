@@ -15,6 +15,7 @@
 [![Rust](https://img.shields.io/badge/Rust-1.85+-orange?logo=rust)](https://www.rust-lang.org/)
 [![GitHub Stars](https://img.shields.io/github/stars/Harry-kp/vortix?style=social)](https://github.com/Harry-kp/vortix)
 [![GitHub Sponsors](https://img.shields.io/github/sponsors/Harry-kp?logo=github)](https://github.com/sponsors/Harry-kp)
+[![X (Twitter)](https://img.shields.io/badge/X-%40Harshitc007-000000?logo=x&logoColor=white)](https://x.com/Harshitc007)
 
 Terminal UI for WireGuard and OpenVPN with real-time telemetry and leak guarding.
 
