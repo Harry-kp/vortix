@@ -821,4 +821,17 @@ mod ipv6_gate_tests {
     fn silent_when_neither() {
         assert_eq!(wireguard_ipv6_missing_dep(false, false), None);
     }
+
+    #[test]
+    fn label_maps_to_the_sysctl_hint_not_the_generic_package_fallback() {
+        // The label lives here; the hint arm lives in platform::install_hint.
+        // Pin the pair so a rename on either side fails loudly instead of
+        // rendering "sudo apt install host IPv6 (kernel disabled)".
+        let label = wireguard_ipv6_missing_dep(true, true).unwrap();
+        let hint = crate::platform::install_hint(&label);
+        assert!(
+            hint.contains("sysctl"),
+            "hint fell back to generic package install: {hint}"
+        );
+    }
 }
