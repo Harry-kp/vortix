@@ -1019,6 +1019,51 @@ pub(crate) fn wireguard_config_has_dns(config_path: &std::path::Path) -> bool {
     false
 }
 
+/// Detect whether the kernel has IPv6 disabled.
+///
+/// True when `/proc/sys/net/ipv6` is absent (booted with
+/// `ipv6.disable=1`) or either the `all` or `default` `disable_ipv6`
+/// sysctl reads `1`. `default` matters because `wg-quick` creates a
+/// fresh interface, which inherits the `default` setting.
+#[cfg(target_os = "linux")] // xtask:allow-platform-cfg: /proc sysctl probe is Linux-only
+pub(crate) fn host_ipv6_disabled() -> bool {
+    if !std::path::Path::new("/proc/sys/net/ipv6").exists() {
+        return true;
+    }
+    ["all", "default"].iter().any(|scope| {
+        std::fs::read_to_string(format!("/proc/sys/net/ipv6/conf/{scope}/disable_ipv6"))
+            .is_ok_and(|v| v.trim() == "1")
+    })
+}
+
+/// Check whether a `WireGuard` config declares an IPv6 entry on an
+/// `Address =` line. `wg-quick` runs `ip -6 address add` for each such
+/// entry, which fails outright when the kernel has IPv6 disabled
+/// (issue #242).
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn wireguard_config_has_ipv6_address(config_path: &std::path::Path) -> bool {
+    let Ok(content) = std::fs::read_to_string(config_path) else {
+        return false;
+    };
+    for line in content.lines() {
+        let trimmed = line.trim().to_lowercase();
+        let Some(rest) = trimmed.strip_prefix("address") else {
+            continue;
+        };
+        let Some(rhs) = rest.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let rhs = rhs.split(['#', ';']).next().unwrap_or("");
+        for entry in rhs.split(',') {
+            let ip_part = entry.trim().split('/').next().unwrap_or("");
+            if ip_part.parse::<std::net::Ipv6Addr>().is_ok() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1557,6 +1602,73 @@ mod tests {
         )
         .unwrap();
         assert!(!wireguard_config_has_dns(&path));
+    }
+
+    // --- wireguard_config_has_ipv6_address tests (issue #242) ---
+
+    fn write_wg_conf(address_line: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wg0.conf");
+        std::fs::write(
+            &path,
+            format!(
+                "[Interface]\nPrivateKey = abc\n{address_line}\n\n[Peer]\nPublicKey = xyz\nAllowedIPs = 0.0.0.0/0, ::/0\nEndpoint = 1.2.3.4:51820\n"
+            ),
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn test_wg_config_ipv6_address_v4_only_is_false() {
+        let (_dir, path) = write_wg_conf("Address = 10.0.0.2/24");
+        assert!(!wireguard_config_has_ipv6_address(&path));
+    }
+
+    #[test]
+    fn test_wg_config_ipv6_address_mixed_v4_v6_is_true() {
+        let (_dir, path) = write_wg_conf("Address = 10.0.0.2/24, fd00::2/64");
+        assert!(wireguard_config_has_ipv6_address(&path));
+    }
+
+    #[test]
+    fn test_wg_config_ipv6_address_v6_only_is_true() {
+        let (_dir, path) = write_wg_conf("Address = fd00::2/128");
+        assert!(wireguard_config_has_ipv6_address(&path));
+    }
+
+    #[test]
+    fn test_wg_config_ipv6_address_no_address_line_is_false() {
+        let (_dir, path) = write_wg_conf("MTU = 1420");
+        assert!(!wireguard_config_has_ipv6_address(&path));
+    }
+
+    #[test]
+    fn test_wg_config_ipv6_address_case_insensitive() {
+        let (_dir, path) = write_wg_conf("address = FD00::2/64");
+        assert!(wireguard_config_has_ipv6_address(&path));
+    }
+
+    #[test]
+    fn test_wg_config_ipv6_address_trailing_comment_stripped() {
+        let (_dir, path) = write_wg_conf("Address = 10.0.0.2/24 # fd00::2 mentioned in comment");
+        assert!(!wireguard_config_has_ipv6_address(&path));
+    }
+
+    #[test]
+    fn test_wg_config_ipv6_address_v6_allowed_ips_alone_is_false() {
+        // Fixture's AllowedIPs carries ::/0; only the Address line
+        // triggers `ip -6 address add`, so this must not fire.
+        let (_dir, path) = write_wg_conf("Address = 10.0.0.2/24");
+        assert!(!wireguard_config_has_ipv6_address(&path));
+    }
+
+    #[test]
+    fn test_wg_config_ipv6_address_nonexistent_file_is_false() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!wireguard_config_has_ipv6_address(
+            &dir.path().join("missing.conf")
+        ));
     }
 
     // --- get_tmp_config_dir (U13) ---

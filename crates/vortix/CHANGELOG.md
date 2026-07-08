@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- WireGuard connect on a Linux host with IPv6 disabled no longer fails mid-way inside `wg-quick` with a raw `RTNETLINK answers: Operation not supported` dump ([#242](https://github.com/Harry-kp/vortix/issues/242)). When the profile's `Address` line declares an IPv6 entry but kernel IPv6 is off (sysctl `disable_ipv6=1` or `ipv6.disable=1` boot param), both the TUI and CLI now refuse pre-flight with an actionable message: re-enable IPv6 via sysctl, or remove the IPv6 entry from the profile. The profile is never rewritten silently.
+
 ## [0.4.2] - 2026-06-16
 
 ### Highlights

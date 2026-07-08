@@ -588,6 +588,14 @@ impl VpnRuntime {
                 }) {
                     missing.push(label);
                 }
+                #[cfg(target_os = "linux")]
+                // xtask:allow-platform-cfg: /proc sysctl gate is Linux-only (issue #242)
+                if let Some(label) = wireguard_ipv6_missing_dep(
+                    utils::wireguard_config_has_ipv6_address(config_path),
+                    utils::host_ipv6_disabled(),
+                ) {
+                    missing.push(label);
+                }
                 #[cfg(not(target_os = "linux"))]
                 let _ = config_path; // suppress unused warning on non-Linux
             }
@@ -667,6 +675,22 @@ pub(crate) fn wireguard_dns_missing_dep(inputs: WireguardDnsGateInputs) -> Optio
         }
         .to_string(),
     )
+}
+
+/// Pure decision logic for the host-IPv6 pre-flight gate on Linux (#242).
+///
+/// `wg-quick` runs `ip -6 address add` for each IPv6 entry on the
+/// profile's `Address =` line, which aborts the whole bring-up when
+/// kernel IPv6 is disabled. Refuse up front instead of surfacing raw
+/// wg-quick stderr; never silently strip the user's IPv6 entry.
+#[must_use]
+#[cfg(target_os = "linux")] // xtask:allow-platform-cfg: gate decision is Linux-only (issue #242)
+pub(crate) fn wireguard_ipv6_missing_dep(
+    profile_has_ipv6_address: bool,
+    host_ipv6_disabled: bool,
+) -> Option<String> {
+    (profile_has_ipv6_address && host_ipv6_disabled)
+        .then(|| "host IPv6 (kernel disabled)".to_string())
 }
 
 impl Drop for VpnRuntime {
@@ -768,5 +792,33 @@ mod dns_gate_tests {
             wireguard_dns_missing_dep(inputs(true, true, true, true)),
             None
         );
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod ipv6_gate_tests {
+    use super::wireguard_ipv6_missing_dep;
+
+    #[test]
+    fn fires_only_when_profile_declares_v6_and_host_disabled() {
+        assert_eq!(
+            wireguard_ipv6_missing_dep(true, true),
+            Some("host IPv6 (kernel disabled)".to_string())
+        );
+    }
+
+    #[test]
+    fn silent_when_profile_is_v4_only() {
+        assert_eq!(wireguard_ipv6_missing_dep(false, true), None);
+    }
+
+    #[test]
+    fn silent_when_host_ipv6_enabled() {
+        assert_eq!(wireguard_ipv6_missing_dep(true, false), None);
+    }
+
+    #[test]
+    fn silent_when_neither() {
+        assert_eq!(wireguard_ipv6_missing_dep(false, false), None);
     }
 }
