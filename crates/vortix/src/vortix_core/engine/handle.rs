@@ -16,6 +16,7 @@ use crate::vortix_core::engine::error::EngineError;
 use crate::vortix_core::engine::event::EventEnvelope;
 use crate::vortix_core::engine::fsm::Engine;
 use crate::vortix_core::engine::input::{Input, UserCommand};
+use crate::vortix_core::engine::registry_handle::RegistrySnapshot;
 use crate::vortix_core::engine::state::Connection;
 use crate::vortix_core::ipc::{IpcOp, IpcResult, IpcTransport, TransportError};
 use crate::vortix_core::journal::Journal;
@@ -123,6 +124,40 @@ impl RemoteHandle {
             }),
             other => Err(TransportError::Protocol(format!(
                 "expected snapshot, daemon answered {other:?}"
+            ))),
+        }
+    }
+
+    /// Fetch the daemon's full multi-tunnel [`RegistrySnapshot`] — the
+    /// authoritative view of every active tunnel plus the derived
+    /// primary and global kill-switch (plan 2026-07-18-001 U2). Prefer
+    /// this over [`Self::snapshot_remote`] for multi-tunnel-aware
+    /// surfaces; the primary-only `Snapshot` stays for v1 compatibility.
+    ///
+    /// Same tri-state [`TransportError`] contract as `snapshot_remote`:
+    /// unavailable falls back silently, version mismatch is loud.
+    ///
+    /// # Errors
+    ///
+    /// See [`TransportError`].
+    pub async fn registry_snapshot_remote(&self) -> Result<RegistrySnapshot, TransportError> {
+        let transport = Arc::clone(&self.transport);
+        let result =
+            tokio::task::spawn_blocking(move || transport.request(IpcOp::RegistrySnapshot))
+                .await
+                .map_err(|e| TransportError::Protocol(format!("blocking task join: {e}")))??;
+        match result {
+            IpcResult::RegistrySnapshot {
+                tunnels,
+                primary,
+                killswitch,
+            } => Ok(RegistrySnapshot {
+                tunnels,
+                primary,
+                killswitch,
+            }),
+            other => Err(TransportError::Protocol(format!(
+                "expected registry snapshot, daemon answered {other:?}"
             ))),
         }
     }
@@ -432,6 +467,62 @@ mod tests {
         assert!(matches!(
             remote.snapshot_remote().await,
             Err(TransportError::Protocol(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn remote_registry_snapshot_maps_wire_into_snapshot() {
+        use crate::vortix_core::engine::registry::{Role, TunnelSnapshot};
+        use crate::vortix_core::engine::state::ConnectionHealth;
+        use crate::vortix_core::profile::ProfileId;
+        use crate::vortix_core::state::KillSwitchState;
+
+        let tunnel = TunnelSnapshot {
+            profile_id: ProfileId::new("corp"),
+            state: Connection::Disconnected { last_failure: None },
+            role: Role::Primary {
+                allowed_ips: Vec::new(),
+            },
+            health: ConnectionHealth::Healthy,
+            interface_name: Some("wg0".into()),
+            started_at: None,
+        };
+        let transport = Arc::new(MockTransport::new(Ok(IpcResult::RegistrySnapshot {
+            tunnels: vec![tunnel],
+            primary: Some(ProfileId::new("corp")),
+            killswitch: KillSwitchState::Disabled,
+        })));
+        let remote = RemoteHandle::new(transport);
+        let snap = remote.registry_snapshot_remote().await.expect("snapshot");
+        assert_eq!(snap.tunnels.len(), 1);
+        assert_eq!(snap.tunnels[0].profile_id.as_str(), "corp");
+        assert_eq!(snap.primary.as_ref().map(ProfileId::as_str), Some("corp"));
+        assert_eq!(snap.killswitch, KillSwitchState::Disabled);
+    }
+
+    #[tokio::test]
+    async fn remote_registry_snapshot_rejects_non_registry_result() {
+        let transport = Arc::new(MockTransport::new(Ok(IpcResult::Accepted)));
+        let remote = RemoteHandle::new(transport);
+        assert!(matches!(
+            remote.registry_snapshot_remote().await,
+            Err(TransportError::Protocol(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn remote_registry_snapshot_propagates_version_mismatch() {
+        let transport = Arc::new(MockTransport::new(Err(TransportError::VersionMismatch {
+            daemon: 2,
+            client: 1,
+        })));
+        let remote = RemoteHandle::new(transport);
+        assert!(matches!(
+            remote.registry_snapshot_remote().await,
+            Err(TransportError::VersionMismatch {
+                daemon: 2,
+                client: 1
+            })
         ));
     }
 
