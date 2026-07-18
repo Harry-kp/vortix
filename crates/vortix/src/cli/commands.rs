@@ -357,7 +357,9 @@ fn handle_daemon(socket_override: Option<std::path::PathBuf>, mode: OutputMode) 
             crate::vortix_core::engine::registry::TunnelRegistry::new(),
         )
     });
-    let server = server.with_registry_handle(registry.clone());
+    let server = server
+        .with_registry_handle(registry.clone())
+        .with_profiles_dir(profiles_dir.clone());
 
     // R7: adopt already-running tunnels ONCE before serving, so the first
     // snapshot a client reads includes restart-survivors (a daemon restart

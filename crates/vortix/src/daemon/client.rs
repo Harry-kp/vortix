@@ -371,9 +371,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unix_transport_subscribe_receives_pushed_events() {
         let socket = fresh_socket_path();
+        // Clone the engine handle to emit journal events (shared journal);
+        // writes route to the registry now, so the event source for this
+        // wire test is the journal driven directly.
+        let engine = EngineHandle::for_test();
+        let driver = engine.clone();
         let server = crate::daemon::DaemonServer::bind(socket.clone())
             .expect("bind")
-            .with_engine_handle(EngineHandle::for_test());
+            .with_engine_handle(engine);
         let task = tokio::spawn(server.run());
 
         // subscribe() blocks (connect + ack + spawn reader) — keep it off
@@ -387,19 +392,13 @@ mod tests {
         // Let the server enter its streaming loop before generating events.
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        // Drive an event through a second (request) connection.
-        let cmd_socket = socket.clone();
-        tokio::task::spawn_blocking(move || {
-            request(
-                &cmd_socket,
-                IpcOp::Execute(UserCommand::Connect {
-                    profile_id: ProfileId::new("corp"),
-                }),
-            )
-        })
-        .await
-        .expect("join")
-        .expect("execute");
+        // Emit an event on the shared journal via the cloned handle.
+        driver
+            .execute_command(UserCommand::Connect {
+                profile_id: ProfileId::new("corp"),
+            })
+            .await
+            .expect("execute");
 
         let event = tokio::time::timeout(Duration::from_secs(3), rx.recv())
             .await

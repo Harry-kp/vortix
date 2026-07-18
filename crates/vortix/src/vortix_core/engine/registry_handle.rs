@@ -174,6 +174,15 @@ impl<T: Tunnel + Send + 'static> RegistryHandle<T> {
         self.apply(TunnelRegistry::disconnect_all).await
     }
 
+    /// Reconnect every active tunnel.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError`] if the owner task is gone.
+    pub async fn reconnect_all(&self) -> Result<(), EngineError> {
+        self.apply(TunnelRegistry::reconnect_all).await
+    }
+
     /// Reconnect a single profile's tunnel through its own engine.
     ///
     /// # Errors

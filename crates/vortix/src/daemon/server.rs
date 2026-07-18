@@ -9,7 +9,9 @@ use std::sync::Arc;
 
 use crate::tunnel::TunnelKind;
 use crate::vortix_core::engine::input::UserCommand;
-use crate::vortix_core::engine::registry_handle::RegistryHandle;
+use crate::vortix_core::engine::registry::RegistryError;
+use crate::vortix_core::engine::registry_handle::{RegistryHandle, RegistrySnapshot};
+use crate::vortix_core::engine::state::Connection;
 use crate::vortix_core::engine::EngineHandle;
 use crate::vortix_core::ipc::{
     decode_frame, encode_frame, FrameError, IpcError, IpcOp, IpcRequest, IpcResponse, IpcResult,
@@ -30,6 +32,10 @@ pub struct DaemonServer {
     /// supervisor loop populates it. `None` in the skeleton/no-registry
     /// path.
     registry_handle: Option<RegistryHandle<TunnelKind>>,
+    /// Profiles directory used to resolve profiles + build per-profile
+    /// engines when routing `Execute(Connect)` through the registry
+    /// (plan 2026-07-19-001 P1). `None` disables daemon-side writes.
+    profiles_dir: Option<PathBuf>,
     /// The effective UID of the daemon process at bind time. Every
     /// accepted client is checked against this value via
     /// `SO_PEERCRED` (Linux) / `getpeereid(2)` (macOS) and rejected
@@ -77,6 +83,7 @@ impl DaemonServer {
             listener,
             engine_handle: None,
             registry_handle: None,
+            profiles_dir: None,
             daemon_uid,
         })
     }
@@ -97,6 +104,15 @@ impl DaemonServer {
     #[must_use]
     pub fn with_registry_handle(mut self, handle: RegistryHandle<TunnelKind>) -> Self {
         self.registry_handle = Some(handle);
+        self
+    }
+
+    /// Set the profiles directory used to resolve profiles + build
+    /// per-profile engines when routing `Execute(Connect)` through the
+    /// registry (plan 2026-07-19-001 P1).
+    #[must_use]
+    pub fn with_profiles_dir(mut self, profiles_dir: PathBuf) -> Self {
+        self.profiles_dir = Some(profiles_dir);
         self
     }
 
@@ -133,8 +149,11 @@ impl DaemonServer {
                     // Both handles are cheap to clone (Arc / mpsc-sender).
                     let handle = self.engine_handle.clone();
                     let registry = self.registry_handle.clone();
+                    let profiles_dir = self.profiles_dir.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_client(stream, daemon_uid, handle, registry).await {
+                        if let Err(e) =
+                            handle_client(stream, daemon_uid, handle, registry, profiles_dir).await
+                        {
                             eprintln!("vortix daemon: client session ended: {e}");
                         }
                     });
@@ -170,6 +189,7 @@ async fn handle_client(
     daemon_uid: u32,
     engine_handle: Option<Arc<EngineHandle>>,
     registry_handle: Option<RegistryHandle<TunnelKind>>,
+    profiles_dir: Option<PathBuf>,
 ) -> Result<(), DaemonError> {
     // Peer-UID enforcement runs before any frame is read so an
     // unauthorized client never gets the chance to drive dispatch.
@@ -240,8 +260,13 @@ async fn handle_client(
                 Ok(Some((req, consumed))) => {
                     read_pos += consumed;
                     let is_subscribe = matches!(req.op, IpcOp::Subscribe);
-                    let resp =
-                        dispatch(req, engine_handle.as_deref(), registry_handle.as_ref()).await;
+                    let resp = dispatch(
+                        req,
+                        engine_handle.as_deref(),
+                        registry_handle.as_ref(),
+                        profiles_dir.as_deref(),
+                    )
+                    .await;
                     let acked = matches!(resp.result, Ok(IpcResult::Subscribed));
                     let frame = encode_frame(&resp).map_err(DaemonError::Frame)?;
                     stream.write_all(&frame).await?;
@@ -455,10 +480,91 @@ fn validate_execute(cmd: &UserCommand) -> Result<(), IpcError> {
     }
 }
 
+/// The v1-compat single `Connection` = the registry primary's state (or
+/// Disconnected when there's no primary). Projected from the one registry.
+fn primary_connection(snap: &RegistrySnapshot) -> Connection {
+    snap.primary
+        .as_ref()
+        .and_then(|p| snap.tunnels.iter().find(|t| &t.profile_id == p))
+        .map_or(Connection::Disconnected { last_failure: None }, |t| {
+            t.state.clone()
+        })
+}
+
+/// Execute a write command against the profile's OWN engine in the
+/// registry (plan 2026-07-19-001 P1). Connect builds a fresh per-profile
+/// engine (via the daemon's resolver + tunnel factory) and resolves the
+/// profile's `AllowedIPs`; disconnect/reconnect drive the existing entry.
+/// `ForceDisconnect` currently maps to disconnect (a force flag through
+/// the registry is a follow-up).
+async fn execute_via_registry(
+    cmd: UserCommand,
+    reg: &RegistryHandle<TunnelKind>,
+    profiles_dir: Option<&Path>,
+) -> Result<IpcResult, IpcError> {
+    let outcome = match cmd {
+        UserCommand::Connect { profile_id } => {
+            let Some(profiles_dir) = profiles_dir else {
+                return Err(IpcError::Internal(
+                    "daemon has no profiles directory configured".into(),
+                ));
+            };
+            let Some(allowed_ips) = crate::daemon::connect_allowed_ips(profiles_dir, &profile_id)
+            else {
+                return Err(IpcError::MalformedRequest(format!(
+                    "profile '{}' not found in catalog",
+                    profile_id.as_str()
+                )));
+            };
+            let Some(engine) = crate::daemon::build_engine(profiles_dir) else {
+                return Err(IpcError::Internal(
+                    "daemon engine prerequisites unavailable (no runner installed)".into(),
+                ));
+            };
+            reg.connect(profile_id, allowed_ips, move || engine, true)
+                .await
+        }
+        UserCommand::Disconnect {
+            profile_id: Some(id),
+        }
+        | UserCommand::ForceDisconnect {
+            profile_id: Some(id),
+        } => reg.disconnect(id).await,
+        UserCommand::Disconnect { profile_id: None }
+        | UserCommand::ForceDisconnect { profile_id: None } => {
+            return reg
+                .disconnect_all()
+                .await
+                .map(|()| IpcResult::Accepted)
+                .map_err(|e| IpcError::Internal(format!("registry actor: {e}")));
+        }
+        UserCommand::Reconnect {
+            profile_id: Some(id),
+        } => reg.reconnect(id).await,
+        UserCommand::Reconnect { profile_id: None } => {
+            return reg
+                .reconnect_all()
+                .await
+                .map(|()| IpcResult::Accepted)
+                .map_err(|e| IpcError::Internal(format!("registry actor: {e}")));
+        }
+        // 2FA answers aren't wired through the daemon path yet.
+        UserCommand::UserAnswered { .. } => return Ok(IpcResult::Accepted),
+    };
+
+    match outcome {
+        Ok(Ok(())) => Ok(IpcResult::Accepted),
+        Ok(Err(RegistryError::Conflict(conflict))) => Err(IpcError::Conflict { conflict }),
+        Ok(Err(other)) => Err(IpcError::Internal(format!("registry: {other:?}"))),
+        Err(e) => Err(IpcError::Internal(format!("registry actor: {e}"))),
+    }
+}
+
 async fn dispatch(
     req: IpcRequest,
     engine_handle: Option<&EngineHandle>,
     registry_handle: Option<&RegistryHandle<TunnelKind>>,
+    profiles_dir: Option<&Path>,
 ) -> IpcResponse {
     // Version gate before any op runs. A pre-versioning client's frames
     // deserialize with protocol_version = 0 and land here — the typed
@@ -474,35 +580,32 @@ async fn dispatch(
         };
     }
     let result = match req.op {
-        IpcOp::Execute(cmd) => match engine_handle {
-            Some(h) => match validate_execute(&cmd) {
-                Ok(()) => match h.execute_command(cmd).await {
-                    Ok(_ack) => Ok(IpcResult::Accepted),
-                    Err(e) => Err(IpcError::Internal(format!("engine error: {e}"))),
-                },
-                Err(e) => Err(e),
+        // Writes route to the profile's OWN engine in the registry — the
+        // single source of truth (plan 2026-07-19-001 P1). No shared FSM.
+        IpcOp::Execute(cmd) => match validate_execute(&cmd) {
+            Ok(()) => match registry_handle {
+                // disconnect/reconnect need only the registry; Connect also
+                // needs profiles_dir (checked inside execute_via_registry).
+                Some(reg) => execute_via_registry(cmd, reg, profiles_dir).await,
+                None => Err(IpcError::Internal(
+                    "registry not initialized in daemon".into(),
+                )),
             },
-            None => Err(IpcError::Internal(
-                "engine handle not initialized in daemon".into(),
-            )),
+            Err(e) => Err(e),
         },
-        IpcOp::Snapshot => match engine_handle {
-            Some(h) => match h.snapshot().await {
-                // v1-compat: populate `Snapshot { state }` with the
-                // primary's Connection (or Disconnected when no
-                // primary). New v2 callers should switch to
-                // `RegistrySnapshot` once they upgrade — see plan
-                // #001 U22. Today the EngineHandle exposes a single
-                // FSM (D1 wired the single-tunnel handle in the
-                // daemon); the registry-aware variant lands when a
-                // follow-up unit threads the registry into the
-                // daemon's accept loop.
-                Ok(snap) => Ok(IpcResult::Snapshot { state: snap.state }),
+        // v1-compat single-Connection view = the registry primary's state
+        // (or Disconnected). Sourced from the SAME registry as writes, so
+        // it can never go stale relative to them.
+        IpcOp::Snapshot => match registry_handle {
+            Some(reg) => match reg.registry_snapshot().await {
+                Ok(snap) => Ok(IpcResult::Snapshot {
+                    state: primary_connection(&snap),
+                }),
                 Err(e) => Err(IpcError::Internal(format!("snapshot error: {e}"))),
             },
-            None => Err(IpcError::Internal(
-                "engine handle not initialized in daemon".into(),
-            )),
+            None => Ok(IpcResult::Snapshot {
+                state: Connection::Disconnected { last_failure: None },
+            }),
         },
         IpcOp::RegistrySnapshot => match registry_handle {
             Some(reg) => match reg.registry_snapshot().await {
@@ -585,24 +688,31 @@ mod tests {
                 profile_id: ProfileId::new("corp"),
             }),
         };
-        let resp = dispatch(req, None, None).await;
+        let resp = dispatch(req, None, None, None).await;
         assert_eq!(resp.id, 1);
         match resp.result {
-            Err(IpcError::Internal(msg)) => assert!(msg.contains("engine handle not initialized")),
+            Err(IpcError::Internal(msg)) => assert!(msg.contains("registry not initialized")),
             other => panic!("expected Internal error, got {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn dispatch_snapshot_without_handle_returns_internal_error() {
+    async fn dispatch_snapshot_without_registry_is_disconnected() {
+        // P1: Snapshot projects the registry primary. With no registry the
+        // graceful v1-compat answer is Disconnected (not an error).
         let req = IpcRequest {
             id: 2,
             protocol_version: IPC_PROTOCOL_VERSION,
             op: IpcOp::Snapshot,
         };
-        let resp = dispatch(req, None, None).await;
+        let resp = dispatch(req, None, None, None).await;
         assert_eq!(resp.id, 2);
-        assert!(matches!(resp.result, Err(IpcError::Internal(_))));
+        match resp.result {
+            Ok(IpcResult::Snapshot { state }) => {
+                assert!(matches!(state, Connection::Disconnected { .. }));
+            }
+            other => panic!("expected Snapshot Disconnected, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -612,7 +722,7 @@ mod tests {
             protocol_version: IPC_PROTOCOL_VERSION,
             op: IpcOp::Subscribe,
         };
-        let resp = dispatch(req, None, None).await;
+        let resp = dispatch(req, None, None, None).await;
         assert_eq!(resp.id, 3);
         assert!(matches!(resp.result, Err(IpcError::Internal(_))));
     }
@@ -624,7 +734,7 @@ mod tests {
             protocol_version: IPC_PROTOCOL_VERSION,
             op: IpcOp::Shutdown,
         };
-        let resp = dispatch(req, None, None).await;
+        let resp = dispatch(req, None, None, None).await;
         assert_eq!(resp.id, 4);
         assert!(matches!(resp.result, Ok(IpcResult::ShuttingDown)));
     }
@@ -637,7 +747,7 @@ mod tests {
             protocol_version: IPC_PROTOCOL_VERSION,
             op: IpcOp::Snapshot,
         };
-        let resp = dispatch(req, Some(&handle), None).await;
+        let resp = dispatch(req, Some(&handle), None, None).await;
         match resp.result {
             Ok(IpcResult::Snapshot { state }) => {
                 assert!(matches!(state, Connection::Disconnected { .. }));
@@ -653,7 +763,7 @@ mod tests {
             protocol_version: IPC_PROTOCOL_VERSION,
             op: IpcOp::RegistrySnapshot,
         };
-        let resp = dispatch(req, None, None).await;
+        let resp = dispatch(req, None, None, None).await;
         assert!(matches!(resp.result, Err(IpcError::Internal(_))));
     }
 
@@ -667,7 +777,7 @@ mod tests {
             protocol_version: IPC_PROTOCOL_VERSION,
             op: IpcOp::RegistrySnapshot,
         };
-        let resp = dispatch(req, None, Some(&registry)).await;
+        let resp = dispatch(req, None, Some(&registry), None).await;
         match resp.result {
             Ok(IpcResult::RegistrySnapshot {
                 tunnels, primary, ..
@@ -680,8 +790,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_execute_connect_with_handle_returns_accepted() {
-        let handle = EngineHandle::for_test();
+    async fn dispatch_execute_without_registry_returns_internal_error() {
+        // P1: writes route to the per-profile registry, not a shared FSM.
+        // With no registry/profiles wired, Execute is a typed Internal
+        // error (not a silent no-op). The happy path (real per-profile
+        // connect) is covered in registry_handle tests + live.
         let req = IpcRequest {
             id: 6,
             protocol_version: IPC_PROTOCOL_VERSION,
@@ -689,8 +802,8 @@ mod tests {
                 profile_id: ProfileId::new("corp"),
             }),
         };
-        let resp = dispatch(req, Some(&handle), None).await;
-        assert!(matches!(resp.result, Ok(IpcResult::Accepted)));
+        let resp = dispatch(req, None, None, None).await;
+        assert!(matches!(resp.result, Err(IpcError::Internal(_))));
     }
 
     #[test]
@@ -746,7 +859,7 @@ mod tests {
                 profile_id: ProfileId::new("../../etc/passwd"),
             }),
         };
-        let resp = dispatch(req, Some(&handle), None).await;
+        let resp = dispatch(req, Some(&handle), None, None).await;
         assert!(matches!(resp.result, Err(IpcError::MalformedRequest(_))));
     }
 
@@ -758,7 +871,7 @@ mod tests {
             protocol_version: IPC_PROTOCOL_VERSION,
             op: IpcOp::Subscribe,
         };
-        let resp = dispatch(req, Some(&handle), None).await;
+        let resp = dispatch(req, Some(&handle), None, None).await;
         assert!(matches!(resp.result, Ok(IpcResult::Subscribed)));
     }
 
@@ -847,9 +960,16 @@ mod tests {
         }
 
         let socket = fresh_socket_path();
+        // Keep a clone of the engine handle to emit journal events: it
+        // shares the journal with the server's handle, so driving it makes
+        // the subscriber's stream fire. (Writes no longer flow through the
+        // engine handle — they route to the registry — so the event source
+        // for this wire test is the shared journal directly.)
+        let engine = EngineHandle::for_test();
+        let driver = engine.clone();
         let server = DaemonServer::bind(socket.clone())
             .expect("bind")
-            .with_engine_handle(EngineHandle::for_test());
+            .with_engine_handle(engine);
         let task = tokio::spawn(server.run());
 
         // Open the subscription and read the ack.
@@ -871,19 +991,12 @@ mod tests {
         // before we generate events, so the broadcast receiver exists.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        // Drive an event on the daemon engine through a second client.
-        let mut cmd = conn(&socket).await;
-        let cmd_req = IpcRequest {
-            id: 2,
-            protocol_version: IPC_PROTOCOL_VERSION,
-            op: IpcOp::Execute(UserCommand::Connect {
+        // Emit an event on the shared journal by driving the cloned handle.
+        let _ = driver
+            .execute_command(UserCommand::Connect {
                 profile_id: ProfileId::new("corp"),
-            }),
-        };
-        cmd.write_all(&encode_frame(&cmd_req).unwrap())
-            .await
-            .unwrap();
-        let _ = read_resp(&mut cmd).await;
+            })
+            .await;
 
         // The subscriber should receive at least one pushed Event frame.
         let event = tokio::time::timeout(std::time::Duration::from_secs(3), read_resp(&mut sub))
@@ -906,10 +1019,9 @@ mod tests {
         let (server_end, mut client_end) = TokioUnixStream::pair().expect("socketpair");
 
         let fake_daemon_uid = u32::MAX;
-        let server_task =
-            tokio::spawn(
-                async move { handle_client(server_end, fake_daemon_uid, None, None).await },
-            );
+        let server_task = tokio::spawn(async move {
+            handle_client(server_end, fake_daemon_uid, None, None, None).await
+        });
 
         let mut buf = vec![0u8; 4096];
         let n = client_end.read(&mut buf).await.expect("read");
@@ -934,67 +1046,51 @@ mod tests {
 
     // ===== U22 multi-tunnel command dispatch =====
 
-    #[tokio::test]
-    async fn dispatch_execute_disconnect_all_routes_through_engine_handle() {
-        let handle = EngineHandle::for_test();
-        // Connect first so disconnect has something to act on.
-        let connect_req = IpcRequest {
-            protocol_version: IPC_PROTOCOL_VERSION,
-            id: 10,
-            op: IpcOp::Execute(UserCommand::Connect {
-                profile_id: ProfileId::new("corp"),
-            }),
-        };
-        let _ = dispatch(connect_req, Some(&handle), None).await;
+    // ===== P1: Execute routes to the per-profile registry =====
 
+    fn spawn_empty_registry() -> RegistryHandle<TunnelKind> {
+        use crate::vortix_core::engine::registry::TunnelRegistry;
+        RegistryHandle::spawn(TunnelRegistry::new())
+    }
+
+    #[tokio::test]
+    async fn dispatch_execute_disconnect_all_via_registry_is_accepted() {
+        let registry = spawn_empty_registry();
         let req = IpcRequest {
             id: 11,
             protocol_version: IPC_PROTOCOL_VERSION,
             op: IpcOp::Execute(UserCommand::Disconnect { profile_id: None }),
         };
-        let resp = dispatch(req, Some(&handle), None).await;
-        assert_eq!(resp.id, 11);
+        let resp = dispatch(req, None, Some(&registry), None).await;
         assert!(matches!(resp.result, Ok(IpcResult::Accepted)));
     }
 
     #[tokio::test]
-    async fn dispatch_execute_disconnect_specific_routes_through_engine_handle() {
-        let handle = EngineHandle::for_test();
-        let req = IpcRequest {
-            id: 12,
-            protocol_version: IPC_PROTOCOL_VERSION,
-            op: IpcOp::Execute(UserCommand::Disconnect {
-                profile_id: Some(ProfileId::new("corp")),
-            }),
-        };
-        let resp = dispatch(req, Some(&handle), None).await;
-        assert!(matches!(resp.result, Ok(IpcResult::Accepted)));
-    }
-
-    #[tokio::test]
-    async fn dispatch_execute_reconnect_all_routes_through_engine_handle() {
-        let handle = EngineHandle::for_test();
+    async fn dispatch_execute_reconnect_all_via_registry_is_accepted() {
+        let registry = spawn_empty_registry();
         let req = IpcRequest {
             id: 13,
             protocol_version: IPC_PROTOCOL_VERSION,
             op: IpcOp::Execute(UserCommand::Reconnect { profile_id: None }),
         };
-        let resp = dispatch(req, Some(&handle), None).await;
+        let resp = dispatch(req, None, Some(&registry), None).await;
         assert!(matches!(resp.result, Ok(IpcResult::Accepted)));
     }
 
     #[tokio::test]
-    async fn dispatch_execute_force_disconnect_specific_routes_through_engine_handle() {
-        let handle = EngineHandle::for_test();
+    async fn dispatch_execute_disconnect_unknown_profile_via_registry_errors() {
+        // Disconnecting a profile the registry doesn't track surfaces the
+        // typed ProfileNotFound as an Internal error (not a false success).
+        let registry = spawn_empty_registry();
         let req = IpcRequest {
-            id: 14,
+            id: 12,
             protocol_version: IPC_PROTOCOL_VERSION,
-            op: IpcOp::Execute(UserCommand::ForceDisconnect {
-                profile_id: Some(ProfileId::new("corp")),
+            op: IpcOp::Execute(UserCommand::Disconnect {
+                profile_id: Some(ProfileId::new("ghost")),
             }),
         };
-        let resp = dispatch(req, Some(&handle), None).await;
-        assert!(matches!(resp.result, Ok(IpcResult::Accepted)));
+        let resp = dispatch(req, None, Some(&registry), None).await;
+        assert!(matches!(resp.result, Err(IpcError::Internal(_))));
     }
 
     #[test]
@@ -1077,7 +1173,7 @@ mod tests {
             protocol_version: 0,
             op: IpcOp::Shutdown,
         };
-        let resp = dispatch(req, None, None).await;
+        let resp = dispatch(req, None, None, None).await;
         assert_eq!(resp.id, 9);
         assert_eq!(resp.protocol_version, IPC_PROTOCOL_VERSION);
         match resp.result {

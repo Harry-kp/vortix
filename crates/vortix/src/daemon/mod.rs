@@ -50,45 +50,77 @@ use std::path::{Path, PathBuf};
 pub fn build_engine_handle(
     profiles_dir: &Path,
 ) -> Option<crate::vortix_core::engine::EngineHandle> {
+    use crate::vortix_core::engine::EngineHandle;
+    let journal = crate::vortix_core::journal::global_journal().cloned()?;
+    let engine = build_engine(profiles_dir)?;
+    Some(EngineHandle::local(engine, journal))
+}
+
+/// Build a fresh, `Disconnected` `Engine<TunnelKind>` wired with the live
+/// `FsProfileStore` resolver and the per-Connect WG/OVPN tunnel factory —
+/// the raw engine `build_engine_handle` wraps, and the engine the daemon's
+/// per-profile registry drives directly (plan 2026-07-19-001 P1).
+///
+/// Returns `None` when prerequisites are missing (no real subprocess
+/// runner installed) so callers fall back to legacy paths.
+#[must_use]
+pub fn build_engine(
+    profiles_dir: &Path,
+) -> Option<crate::vortix_core::engine::fsm::Engine<crate::tunnel::TunnelKind>> {
     use crate::state::Protocol;
     use crate::tunnel::{tunnel_for, TunnelKind};
     use crate::vortix_config::profile_store::{FsProfileStore, ProfileStore};
-    use crate::vortix_core::engine::{Engine, EngineHandle};
+    use crate::vortix_core::engine::Engine;
     use crate::vortix_core::profile::{ProfileId, ProtocolKind};
     use crate::vortix_protocol_wireguard::WgTunnel;
 
-    // Prerequisites: real subprocess runner + journal. Both are installed
-    // very early in `main.rs`; their absence means the bootstrap order
-    // was disturbed (e.g. a unit test harness skipping the runner) — bail
-    // out so callers fall back to legacy paths.
     let _runner = crate::vortix_process::global_runner().as_real()?;
-    let journal = crate::vortix_core::journal::global_journal().cloned()?;
 
-    // Live profile resolver — reads sidecars via `FsProfileStore` so any
-    // consumer calling `handle.execute(Connect{id})` sees the user's
-    // actual profiles (post-migration).
     let resolver_dir = profiles_dir.to_path_buf();
     let resolver = move |id: &ProfileId| {
         let store = FsProfileStore::new(resolver_dir.clone());
         store.get(id).ok()
     };
 
-    // Per-Connect tunnel factory — picks WG vs OVPN from the resolved
-    // profile's protocol. Plan 006 U6's wire-up.
     let factory_config_dir =
         crate::utils::get_app_config_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
     let factory = move |profile: &crate::vortix_core::profile::Profile| {
         let proto = match profile.protocol {
             ProtocolKind::OpenVpn => Protocol::OpenVPN,
-            // Default to WireGuard for any future variants.
             _ => Protocol::WireGuard,
         };
         tunnel_for(proto, &factory_config_dir, "3", 30)
     };
 
     let initial_tunnel = TunnelKind::WireGuard(WgTunnel::new());
-    let engine = Engine::new(initial_tunnel, resolver).with_tunnel_factory(factory);
-    Some(EngineHandle::local(engine, journal))
+    Some(Engine::new(initial_tunnel, resolver).with_tunnel_factory(factory))
+}
+
+/// Resolve a profile and its declared `AllowedIPs` for a daemon-side
+/// connect. Returns `None` when the profile isn't in the catalog (the
+/// daemon surfaces that as a not-found error). The `AllowedIPs` drive the
+/// registry's conflict/role logic; the engine's own resolver handles the
+/// actual tunnel bring-up.
+#[must_use]
+pub fn connect_allowed_ips(
+    profiles_dir: &Path,
+    id: &crate::vortix_core::profile::ProfileId,
+) -> Option<Vec<crate::vortix_core::cidr::Cidr>> {
+    use crate::state::Protocol;
+    use crate::vortix_config::profile_store::{FsProfileStore, ProfileStore};
+    use crate::vortix_core::profile::ProtocolKind;
+
+    let profile = FsProfileStore::new(profiles_dir.to_path_buf())
+        .get(id)
+        .ok()?;
+    let proto = match profile.protocol {
+        ProtocolKind::OpenVpn => Protocol::OpenVPN,
+        _ => Protocol::WireGuard,
+    };
+    Some(crate::app::connection::extract_allowed_ips(
+        proto,
+        &profile.config_path,
+    ))
 }
 
 /// Default socket path. Linux uses `${XDG_RUNTIME_DIR}/vortix.sock`
