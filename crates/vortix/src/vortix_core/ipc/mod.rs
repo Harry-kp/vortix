@@ -30,6 +30,9 @@ use thiserror::Error;
 /// comparison and surfaces the upgrade hint.
 pub const IPC_PROTOCOL_VERSION: u32 = 1;
 
+use tokio::sync::broadcast;
+
+use crate::vortix_core::engine::event::EventEnvelope;
 use crate::vortix_core::engine::input::UserCommand;
 use crate::vortix_core::engine::registry::{Conflict, TunnelSnapshot};
 use crate::vortix_core::engine::state::Connection;
@@ -102,6 +105,11 @@ pub enum IpcResult {
     },
     /// `Subscribe` acknowledged; subsequent frames are streamed events.
     Subscribed,
+    /// A streamed engine event, pushed by the daemon after the
+    /// `Subscribed` ack on a subscription connection (plan
+    /// 2026-07-18-001 U2). Only ever appears server→client on a
+    /// subscribe stream, never as a request/response result.
+    Event(EventEnvelope),
     /// `Shutdown` acknowledged; daemon will terminate after draining.
     ShuttingDown,
 }
@@ -153,6 +161,22 @@ pub trait IpcTransport: Send + Sync {
     /// from protocol failures so callers can fall back silently on the
     /// former and fail loudly on the latter.
     fn request(&self, op: IpcOp) -> Result<IpcResult, TransportError>;
+
+    /// Open a live event subscription: send `Subscribe` and return a
+    /// receiver fed by the daemon's pushed [`IpcResult::Event`] stream
+    /// (plan 2026-07-18-001 U2). The concrete transport owns the reader
+    /// that forwards frames into the returned channel.
+    ///
+    /// Default: unsupported — read-only / mock transports don't stream.
+    ///
+    /// # Errors
+    ///
+    /// See [`TransportError`].
+    fn subscribe(&self) -> Result<broadcast::Receiver<EventEnvelope>, TransportError> {
+        Err(TransportError::Protocol(
+            "this transport does not support event streaming".into(),
+        ))
+    }
 }
 
 /// Client-side transport error surface, discriminated by how callers

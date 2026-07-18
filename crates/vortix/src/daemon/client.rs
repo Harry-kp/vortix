@@ -15,6 +15,9 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use tokio::sync::broadcast;
+
+use crate::vortix_core::engine::event::EventEnvelope;
 use crate::vortix_core::ipc::{
     decode_frame, encode_frame, FrameError, IpcError, IpcOp, IpcRequest, IpcResponse, IpcResult,
     IpcTransport, TransportError, IPC_PROTOCOL_VERSION,
@@ -183,6 +186,113 @@ impl IpcTransport for UnixTransport {
             ClientError::Unexpected(s) => TransportError::Protocol(s),
         })
     }
+
+    fn subscribe(&self) -> Result<broadcast::Receiver<EventEnvelope>, TransportError> {
+        subscribe(&self.socket_path).map_err(|e| match e {
+            ClientError::Io(io) => TransportError::Unavailable(io.to_string()),
+            ClientError::VersionMismatch { daemon, client } => {
+                TransportError::VersionMismatch { daemon, client }
+            }
+            ClientError::Frame(f) => TransportError::Protocol(f.to_string()),
+            ClientError::Daemon(d) => TransportError::Protocol(d.to_string()),
+            ClientError::Unexpected(s) => TransportError::Protocol(s),
+        })
+    }
+}
+
+/// Capacity of the client-side event fan-out channel. Matches the
+/// daemon's journal broadcast order of magnitude; a slow consumer that
+/// overflows sees `Lagged` and resyncs from a fresh snapshot.
+const SUBSCRIBE_CHANNEL_CAP: usize = 256;
+
+/// Open a live subscription: connect, send `Subscribe`, read the
+/// `Subscribed` ack, then spawn a reader thread that forwards every
+/// pushed [`IpcResult::Event`] into a broadcast channel. The returned
+/// receiver yields events until the daemon closes the stream (the thread
+/// exits on EOF/error, dropping the sender so receivers see `Closed`).
+///
+/// # Errors
+///
+/// Surfaces connect/version/framing failures encountered before the
+/// stream is established.
+fn subscribe(socket_path: &Path) -> Result<broadcast::Receiver<EventEnvelope>, ClientError> {
+    let mut stream = UnixStream::connect(socket_path)?;
+    // Streaming is long-lived: no read timeout (block for the next event).
+    stream.set_read_timeout(None)?;
+    stream.set_write_timeout(Some(Duration::from_secs(DEFAULT_READ_TIMEOUT_SECS)))?;
+
+    let req = IpcRequest {
+        id: 1,
+        protocol_version: IPC_PROTOCOL_VERSION,
+        op: IpcOp::Subscribe,
+    };
+    stream.write_all(&encode_frame(&req)?)?;
+
+    // Read frames until the first one decodes; that's the ack. Any bytes
+    // read past it (an event the daemon already pushed) stay in `buf` and
+    // are carried into the reader thread.
+    let mut buf = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 4096];
+    let ack: IpcResponse = loop {
+        if let Some((resp, consumed)) = decode_frame::<IpcResponse>(&buf)? {
+            buf.drain(..consumed);
+            break resp;
+        }
+        let n = stream.read(&mut chunk)?;
+        if n == 0 {
+            return Err(ClientError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "daemon closed connection before acking subscribe",
+            )));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    };
+
+    if ack.protocol_version != IPC_PROTOCOL_VERSION {
+        return Err(ClientError::VersionMismatch {
+            daemon: ack.protocol_version,
+            client: IPC_PROTOCOL_VERSION,
+        });
+    }
+    match ack.result {
+        Ok(IpcResult::Subscribed) => {}
+        Ok(other) => return Err(ClientError::Unexpected(format!("{other:?}"))),
+        Err(e) => return Err(ClientError::Daemon(e)),
+    }
+
+    let (tx, rx) = broadcast::channel(SUBSCRIBE_CHANNEL_CAP);
+    std::thread::spawn(move || forward_events(&mut stream, buf, &tx));
+    Ok(rx)
+}
+
+/// Reader-thread body: decode `Event` frames off `stream` and re-publish
+/// them on `tx`. Exits on EOF, a framing error, or when all receivers
+/// drop (send returns `Err`). `carry` holds any bytes read past the ack.
+fn forward_events(stream: &mut UnixStream, carry: Vec<u8>, tx: &broadcast::Sender<EventEnvelope>) {
+    let mut buf = carry;
+    let mut chunk = [0u8; 4096];
+    loop {
+        // Drain any complete frames already buffered.
+        loop {
+            match decode_frame::<IpcResponse>(&buf) {
+                Ok(Some((resp, consumed))) => {
+                    buf.drain(..consumed);
+                    if let Ok(IpcResult::Event(event)) = resp.result {
+                        // Send failing means no receivers remain — stop.
+                        if tx.send(event).is_err() {
+                            return;
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => return, // framing broke; end the stream
+            }
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => return, // EOF or read error
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    }
 }
 
 /// Convenience wrapper: ask the daemon for a `Snapshot` and unwrap
@@ -199,5 +309,73 @@ pub fn snapshot(
     match request(socket_path, IpcOp::Snapshot)? {
         IpcResult::Snapshot { state } => Ok(state),
         other => Err(ClientError::Unexpected(format!("{other:?}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vortix_core::engine::handle::EngineHandle;
+    use crate::vortix_core::engine::input::UserCommand;
+    use crate::vortix_core::profile::ProfileId;
+
+    fn fresh_socket_path() -> PathBuf {
+        let mut p = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        p.push(format!(
+            "vortix-client-test-{}-{nanos}.sock",
+            std::process::id()
+        ));
+        p
+    }
+
+    // Full client path: UnixTransport::subscribe opens the stream, reads
+    // the ack, and its reader thread forwards pushed events into the
+    // broadcast channel the caller receives on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unix_transport_subscribe_receives_pushed_events() {
+        let socket = fresh_socket_path();
+        let server = crate::daemon::DaemonServer::bind(socket.clone())
+            .expect("bind")
+            .with_engine_handle(EngineHandle::for_test());
+        let task = tokio::spawn(server.run());
+
+        // subscribe() blocks (connect + ack + spawn reader) — keep it off
+        // the runtime so the server task can accept.
+        let sub_socket = socket.clone();
+        let mut rx = tokio::task::spawn_blocking(move || subscribe(&sub_socket))
+            .await
+            .expect("join")
+            .expect("subscribe");
+
+        // Let the server enter its streaming loop before generating events.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Drive an event through a second (request) connection.
+        let cmd_socket = socket.clone();
+        tokio::task::spawn_blocking(move || {
+            request(
+                &cmd_socket,
+                IpcOp::Execute(UserCommand::Connect {
+                    profile_id: ProfileId::new("corp"),
+                }),
+            )
+        })
+        .await
+        .expect("join")
+        .expect("execute");
+
+        let event = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("event within timeout")
+            .expect("event, not lag/close");
+        // The forwarded value is a real engine event envelope.
+        let _ = event;
+
+        task.abort();
+        let _ = std::fs::remove_file(&socket);
     }
 }

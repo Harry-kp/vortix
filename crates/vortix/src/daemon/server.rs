@@ -224,10 +224,19 @@ async fn handle_client(
                 Ok(None) => break, // need more bytes
                 Ok(Some((req, consumed))) => {
                     read_pos += consumed;
+                    let is_subscribe = matches!(req.op, IpcOp::Subscribe);
                     let resp =
                         dispatch(req, engine_handle.as_deref(), registry_handle.as_ref()).await;
+                    let acked = matches!(resp.result, Ok(IpcResult::Subscribed));
                     let frame = encode_frame(&resp).map_err(DaemonError::Frame)?;
                     stream.write_all(&frame).await?;
+                    // A successful Subscribe turns this connection one-way:
+                    // pump engine events until the client disconnects. The
+                    // client sends no further requests on a subscription.
+                    if is_subscribe && acked {
+                        stream_events(&mut stream, engine_handle.as_deref()).await?;
+                        return Ok(());
+                    }
                 }
                 Err(e) => return Err(DaemonError::Frame(e)),
             }
@@ -236,6 +245,49 @@ async fn handle_client(
         if read_pos > 0 && read_pos >= buf.len() / 2 {
             buf.drain(..read_pos);
             read_pos = 0;
+        }
+    }
+}
+
+/// Pump engine events to a subscribed client until it disconnects (plan
+/// 2026-07-18-001 U2). Each event is framed as an
+/// `IpcResponse { result: Ok(Event(..)) }`. A write error means the
+/// client is gone; a broadcast `Lagged` means a slow client missed some
+/// events (dropped-oldest backpressure) — we keep streaming and the
+/// client resyncs from a fresh snapshot on reconnect.
+async fn stream_events(
+    stream: &mut UnixStream,
+    engine_handle: Option<&EngineHandle>,
+) -> Result<(), DaemonError> {
+    use tokio::sync::broadcast::error::RecvError;
+
+    let Some(engine) = engine_handle else {
+        return Ok(());
+    };
+    let mut receiver = match engine.subscribe().await {
+        Ok(sub) => sub.receiver,
+        Err(e) => {
+            tracing::warn!(error = %e, "subscribe: could not open event stream");
+            return Ok(());
+        }
+    };
+    loop {
+        match receiver.recv().await {
+            Ok(event) => {
+                let resp = IpcResponse {
+                    id: 0,
+                    protocol_version: IPC_PROTOCOL_VERSION,
+                    result: Ok(IpcResult::Event(event)),
+                };
+                let frame = encode_frame(&resp).map_err(DaemonError::Frame)?;
+                if stream.write_all(&frame).await.is_err() {
+                    return Ok(()); // client disconnected
+                }
+            }
+            Err(RecvError::Lagged(n)) => {
+                tracing::debug!(dropped = n, "subscribe: slow client lagged");
+            }
+            Err(RecvError::Closed) => return Ok(()),
         }
     }
 }
@@ -722,6 +774,86 @@ mod tests {
         assert!(matches!(resp.result, Ok(IpcResult::ShuttingDown)));
 
         handle.abort();
+        let _ = std::fs::remove_file(&socket);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subscribe_streams_engine_events_to_client() {
+        async fn conn(socket: &std::path::Path) -> TokioUnixStream {
+            loop {
+                match TokioUnixStream::connect(socket).await {
+                    Ok(s) => return s,
+                    Err(_) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                }
+            }
+        }
+        // Read exactly one framed IpcResponse (events arrive ~100ms after
+        // the ack, so nothing is glued to a prior frame here).
+        async fn read_resp(stream: &mut TokioUnixStream) -> IpcResponse {
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                if let Some((resp, _)) = decode_frame::<IpcResponse>(&buf).expect("decode") {
+                    return resp;
+                }
+                let n = stream.read(&mut chunk).await.expect("read");
+                assert!(n > 0, "unexpected eof");
+                buf.extend_from_slice(&chunk[..n]);
+            }
+        }
+
+        let socket = fresh_socket_path();
+        let server = DaemonServer::bind(socket.clone())
+            .expect("bind")
+            .with_engine_handle(EngineHandle::for_test());
+        let task = tokio::spawn(server.run());
+
+        // Open the subscription and read the ack.
+        let mut sub = conn(&socket).await;
+        let sub_req = IpcRequest {
+            id: 1,
+            protocol_version: IPC_PROTOCOL_VERSION,
+            op: IpcOp::Subscribe,
+        };
+        sub.write_all(&encode_frame(&sub_req).unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(
+            read_resp(&mut sub).await.result,
+            Ok(IpcResult::Subscribed)
+        ));
+
+        // Let the server enter stream_events (subscribe to the journal)
+        // before we generate events, so the broadcast receiver exists.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Drive an event on the daemon engine through a second client.
+        let mut cmd = conn(&socket).await;
+        let cmd_req = IpcRequest {
+            id: 2,
+            protocol_version: IPC_PROTOCOL_VERSION,
+            op: IpcOp::Execute(UserCommand::Connect {
+                profile_id: ProfileId::new("corp"),
+            }),
+        };
+        cmd.write_all(&encode_frame(&cmd_req).unwrap())
+            .await
+            .unwrap();
+        let _ = read_resp(&mut cmd).await;
+
+        // The subscriber should receive at least one pushed Event frame.
+        let event = tokio::time::timeout(std::time::Duration::from_secs(3), read_resp(&mut sub))
+            .await
+            .expect("event within timeout");
+        assert!(
+            matches!(event.result, Ok(IpcResult::Event(_))),
+            "expected a streamed Event, got {:?}",
+            event.result
+        );
+
+        task.abort();
         let _ = std::fs::remove_file(&socket);
     }
 

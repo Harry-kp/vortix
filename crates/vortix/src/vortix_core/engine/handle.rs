@@ -185,6 +185,20 @@ impl RemoteHandle {
             ))),
         }
     }
+
+    /// Open a live subscription to the daemon's event stream (plan
+    /// 2026-07-18-001 U2). Pairs the current snapshot (catch-up) with a
+    /// receiver fed by the daemon's pushed events, mirroring the shape
+    /// [`LocalHandle::subscribe`] returns so consumers are variant-blind.
+    ///
+    /// # Errors
+    ///
+    /// See [`TransportError`].
+    pub async fn subscribe_remote(&self) -> Result<EngineSubscription, TransportError> {
+        let snapshot = self.snapshot_remote().await?;
+        let receiver = self.transport.subscribe()?;
+        Ok(EngineSubscription { snapshot, receiver })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -266,9 +280,10 @@ impl EngineHandle {
     pub async fn subscribe(&self) -> Result<EngineSubscription, EngineError> {
         match self {
             Self::Local(h) => h.subscribe().await,
-            Self::Remote(_) => Err(EngineError::Other(
-                "remote subscribe is not supported yet (lands with event streaming, plan 2026-07-18-001 U2)".into(),
-            )),
+            Self::Remote(h) => h
+                .subscribe_remote()
+                .await
+                .map_err(|e| EngineError::Other(e.to_string())),
         }
     }
 
@@ -585,8 +600,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn engine_handle_remote_subscribe_still_unsupported() {
-        let transport = Arc::new(MockTransport::new(Ok(IpcResult::Accepted)));
+    async fn remote_subscribe_errors_when_transport_lacks_streaming() {
+        // The snapshot half succeeds; the mock transport uses the default
+        // `IpcTransport::subscribe` (no streaming), so subscribe fails at
+        // the stream step — exercising the Remote arm's error mapping.
+        let transport = Arc::new(MockTransport::new(Ok(IpcResult::Snapshot {
+            state: Connection::Disconnected { last_failure: None },
+        })));
         let handle = EngineHandle::Remote(RemoteHandle::new(transport));
         assert!(handle.subscribe().await.is_err());
     }
