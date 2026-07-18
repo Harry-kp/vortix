@@ -6,10 +6,12 @@
 //! support is a follow-up hardening pass once the wire contract has
 //! stabilized.
 //!
-//! Auth: phase E (plan 015 phase E) layers `SO_PEERCRED` / `getpeereid`
-//! on top — the daemon refuses requests from a UID other than its
-//! own. Today the daemon trusts any client that can open the socket
-//! (filesystem-permissions guard at mode 0600).
+//! Auth: `SO_PEERCRED` / `getpeereid` — the daemon refuses requests from
+//! a UID other than its own (`daemon/server.rs`), backed by the mode-0600
+//! socket. The client performs the reciprocal check
+//! ([`socket_owner_trusted`]) before connecting, refusing a socket owned
+//! by anyone but root or the current user so a rogue `/tmp/vortix.sock`
+//! can't impersonate the daemon.
 //!
 //! Lifecycle:
 //! 1. Bind the socket (cleaning up any stale socket file)
@@ -134,7 +136,7 @@ pub fn daemon_socket_path_override() -> Option<PathBuf> {
 #[must_use]
 pub fn daemon_socket_path_if_present() -> Option<PathBuf> {
     let candidate = daemon_socket_path_override().unwrap_or_else(default_socket_path);
-    if candidate.exists() && is_unix_socket(&candidate) {
+    if candidate.exists() && is_unix_socket(&candidate) && socket_owner_trusted(&candidate) {
         Some(candidate)
     } else {
         None
@@ -151,6 +153,34 @@ fn is_unix_socket(path: &Path) -> bool {
 
 #[cfg(not(unix))]
 fn is_unix_socket(_path: &Path) -> bool {
+    false
+}
+
+/// Whether the daemon socket's owner is trustworthy before we connect.
+///
+/// The daemon enforces a peer-UID gate; this is the client's reciprocal
+/// check. Without it, when `XDG_RUNTIME_DIR`/`TMPDIR` are unset the socket
+/// resolves to the world-writable `/tmp/vortix.sock`, where a local
+/// attacker could bind their own listener and feed us a fabricated
+/// "Connected" — a false VPN-state signal (real-IP exposure) in a security
+/// tool. We trust only a socket owned by root (the real deployment) or by
+/// the current user (a same-user daemon, e.g. tests); any other owner is
+/// refused and the client falls back to the direct scanner path.
+#[cfg(unix)]
+fn socket_owner_trusted(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    let owner = meta.uid();
+    // SAFETY: `geteuid` is a trivial, always-succeeds syscall.
+    #[allow(unsafe_code)]
+    let me = unsafe { libc::geteuid() };
+    owner == 0 || owner == me
+}
+
+#[cfg(not(unix))]
+fn socket_owner_trusted(_path: &Path) -> bool {
     false
 }
 
@@ -183,5 +213,21 @@ mod tests {
         let path = tmp.path().join("sock");
         let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         assert!(is_unix_socket(&path));
+    }
+
+    #[test]
+    fn self_owned_socket_is_trusted() {
+        // A socket we bind is owned by the current euid, so the owner
+        // check accepts it (root and same-user are the trusted owners).
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        assert!(socket_owner_trusted(&path));
+    }
+
+    #[test]
+    fn missing_socket_owner_is_not_trusted() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!socket_owner_trusted(&tmp.path().join("nope")));
     }
 }
