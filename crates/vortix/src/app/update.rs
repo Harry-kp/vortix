@@ -1006,6 +1006,7 @@ impl App {
     /// (kill-switch sync, scanner-dispatch helpers) consult
     /// [`App::legacy_state`], a derived view from the registry primary.
     fn handle_sync_system_state(&mut self, active: Vec<ActiveSession>) {
+        use crate::vortix_core::engine::reconcile::{classify, ReconcileAction};
         use crate::vortix_core::engine::state::Connection;
         use crate::vortix_core::profile::ProfileId;
         use std::collections::HashSet;
@@ -1028,84 +1029,66 @@ impl App {
             handled.insert(snap.profile_id.clone());
             let matching_session = active.iter().find(|s| s.name == profile_name);
 
-            match (&snap.state, matching_session) {
-                (Connection::Disconnecting { .. }, None) => {
-                    self.complete_disconnect(&profile_name);
-                }
-                (Connection::Disconnecting { started_at, .. }, Some(_)) => {
-                    let elapsed = SystemTime::now()
-                        .duration_since(*started_at)
-                        .unwrap_or_default()
-                        .as_secs();
-                    if elapsed >= self.runtime.config.disconnect_timeout {
-                        self.scanner_force_disconnect(&profile_name);
-                    }
-                }
-                (Connection::Connecting { started_at, .. }, Some(_session)) => {
-                    // U4 contract: scanner cannot promote Connecting →
-                    // Connected. Only the protocol layer's `Tunnel::up()`
-                    // success result (delivered via
-                    // `Message::ConnectResult` → `mirror_connect_into_registry`)
-                    // can complete the transition. The scanner observing
-                    // a matching kernel session is informational only —
-                    // the connect is proceeding; the protocol layer
-                    // will report the authoritative iface shortly. The
-                    // existing `handle_connection_timeout` safety net
-                    // catches the genuinely-stuck case.
-                    let elapsed = SystemTime::now()
-                        .duration_since(*started_at)
-                        .unwrap_or_default()
-                        .as_secs();
-                    if elapsed > 0 && elapsed % constants::SCANNER_LOG_INTERVAL_SECS == 0 {
-                        self.log(&format!(
-                            "NET: Scanner: kernel tunnel visible for '{profile_name}' \
-                             ({elapsed}s elapsed) — awaiting protocol-layer success"
-                        ));
-                    }
-                }
-                (Connection::Connecting { started_at, .. }, None) => {
-                    let elapsed = SystemTime::now()
-                        .duration_since(*started_at)
-                        .unwrap_or_default()
-                        .as_secs();
-                    if elapsed > 0 && elapsed % constants::SCANNER_LOG_INTERVAL_SECS == 0 {
-                        self.log(&format!(
-                            "NET: Scanner: no tunnel interface for '{profile_name}' yet \
-                             ({elapsed}s elapsed, {} active session{})",
-                            session_count,
-                            if session_count == 1 { "" } else { "s" }
-                        ));
-                    }
-                }
-                (Connection::Connected { .. }, Some(session)) => {
-                    self.scanner_refresh_connected(&profile_name, session);
-                }
-                (
-                    Connection::Connected { .. }
-                    | Connection::Reconnecting { .. }
-                    | Connection::AwaitingUserInput { .. },
-                    None,
-                ) => {
-                    let was_connected = matches!(snap.state, Connection::Connected { .. });
-                    self.scanner_handle_drop(&profile_name, was_connected);
-                }
-                (Connection::Disconnected { .. }, _) => {
-                    // Historic marker (post-failure entry kept for the
-                    // ✗ badge). User must retry or dismiss.
-                }
-                (
-                    Connection::Reconnecting { .. } | Connection::AwaitingUserInput { .. },
-                    Some(_),
-                ) => {
-                    // These FSM states aren't currently driven by the
-                    // App's connect flow (reserved for plan 008 U2
-                    // interactive prompts and FSM auto-reconnect). If
-                    // they ever materialize alongside an active
-                    // kernel session, treat as a refresh — the kernel
-                    // is the truth.
+            // Decision half lives in the shared classifier (plan
+            // 2026-07-18-001 U2) so the daemon supervisor reconciles
+            // identically; the side-effecting half (logs, toasts,
+            // kill-switch sync) stays here in the TUI.
+            let disconnecting_elapsed = match &snap.state {
+                Connection::Disconnecting { started_at, .. } => SystemTime::now()
+                    .duration_since(*started_at)
+                    .unwrap_or_default()
+                    .as_secs(),
+                _ => 0,
+            };
+            let action = classify(
+                &snap.state,
+                matching_session.is_some(),
+                disconnecting_elapsed,
+                self.runtime.config.disconnect_timeout,
+            );
+
+            match action {
+                ReconcileAction::CompleteDisconnect => self.complete_disconnect(&profile_name),
+                ReconcileAction::ForceDisconnect => self.scanner_force_disconnect(&profile_name),
+                ReconcileAction::RefreshConnected => {
                     if let Some(session) = matching_session {
                         self.scanner_refresh_connected(&profile_name, session);
                     }
+                }
+                ReconcileAction::HandleDrop { was_connected } => {
+                    self.scanner_handle_drop(&profile_name, was_connected);
+                }
+                ReconcileAction::AwaitingConnect => {
+                    // U4 contract: scanner cannot promote Connecting →
+                    // Connected — only the protocol layer's Tunnel::up()
+                    // success can. This arm is informational logging at
+                    // SCANNER_LOG_INTERVAL_SECS cadence; the message
+                    // differs by whether a kernel session is visible yet.
+                    if let Connection::Connecting { started_at, .. } = &snap.state {
+                        let elapsed = SystemTime::now()
+                            .duration_since(*started_at)
+                            .unwrap_or_default()
+                            .as_secs();
+                        if elapsed > 0 && elapsed % constants::SCANNER_LOG_INTERVAL_SECS == 0 {
+                            if matching_session.is_some() {
+                                self.log(&format!(
+                                    "NET: Scanner: kernel tunnel visible for '{profile_name}' \
+                                     ({elapsed}s elapsed) — awaiting protocol-layer success"
+                                ));
+                            } else {
+                                self.log(&format!(
+                                    "NET: Scanner: no tunnel interface for '{profile_name}' yet \
+                                     ({elapsed}s elapsed, {} active session{})",
+                                    session_count,
+                                    if session_count == 1 { "" } else { "s" }
+                                ));
+                            }
+                        }
+                    }
+                }
+                ReconcileAction::None => {
+                    // Historic Disconnected marker (kept for the ✗
+                    // badge) or a wait state still within budget.
                 }
             }
         }

@@ -12,6 +12,7 @@ pub mod event;
 pub mod fsm;
 pub mod handle;
 pub mod input;
+pub mod reconcile;
 pub mod registry;
 pub mod registry_handle;
 pub mod state;
