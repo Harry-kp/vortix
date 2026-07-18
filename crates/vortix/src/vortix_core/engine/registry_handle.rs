@@ -17,8 +17,10 @@
 
 use tokio::sync::{mpsc, oneshot};
 
+use crate::vortix_core::cidr::Cidr;
 use crate::vortix_core::engine::error::EngineError;
-use crate::vortix_core::engine::registry::{TunnelRegistry, TunnelSnapshot};
+use crate::vortix_core::engine::fsm::Engine;
+use crate::vortix_core::engine::registry::{RegistryError, TunnelRegistry, TunnelSnapshot};
 use crate::vortix_core::ports::tunnel::Tunnel;
 use crate::vortix_core::profile::ProfileId;
 use crate::vortix_core::state::KillSwitchState;
@@ -122,6 +124,68 @@ impl<T: Tunnel + Send + 'static> RegistryHandle<T> {
         rx.await
             .map_err(|_| EngineError::Other("registry actor dropped reply".into()))
     }
+
+    // ── Per-profile commands (plan 2026-07-19-001 P1) ──────────────────
+    //
+    // The daemon routes every write to the profile's OWN engine, owned by
+    // this registry — never a shared single FSM. Each is a thin async
+    // wrapper over `apply` so the mutation runs on the owner task
+    // (serialized w.r.t. snapshots and other commands). The inner
+    // `Result<_, RegistryError>` carries the typed connect/disconnect
+    // outcome; the outer `EngineError` only signals a dead owner task.
+
+    /// Connect `profile_id` through its own engine, constructing a fresh
+    /// engine via `make_engine` if the profile has no entry yet.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError`] if the owner task is gone; the inner result carries
+    /// [`RegistryError`] (conflict, profile-not-found, tunnel failure).
+    pub async fn connect(
+        &self,
+        profile_id: ProfileId,
+        allowed_ips: Vec<Cidr>,
+        make_engine: impl FnOnce() -> Engine<T> + Send + 'static,
+        force: bool,
+    ) -> Result<Result<(), RegistryError>, EngineError> {
+        self.apply(move |reg| reg.connect(profile_id, allowed_ips, make_engine, force))
+            .await
+    }
+
+    /// Disconnect a single profile's tunnel through its own engine.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError`] if the owner task is gone; inner [`RegistryError`]
+    /// if the profile has no entry.
+    pub async fn disconnect(
+        &self,
+        profile_id: ProfileId,
+    ) -> Result<Result<(), RegistryError>, EngineError> {
+        self.apply(move |reg| reg.disconnect(&profile_id)).await
+    }
+
+    /// Disconnect every active tunnel.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError`] if the owner task is gone.
+    pub async fn disconnect_all(&self) -> Result<(), EngineError> {
+        self.apply(TunnelRegistry::disconnect_all).await
+    }
+
+    /// Reconnect a single profile's tunnel through its own engine.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError`] if the owner task is gone; inner [`RegistryError`]
+    /// if the profile has no entry.
+    pub async fn reconnect(
+        &self,
+        profile_id: ProfileId,
+    ) -> Result<Result<(), RegistryError>, EngineError> {
+        self.apply(move |reg| reg.reconnect(&profile_id)).await
+    }
 }
 
 /// Snapshot the registry's current state — a convenience for `apply`
@@ -204,5 +268,92 @@ mod tests {
             .await
             .expect("apply");
         assert_eq!(count, 0);
+    }
+
+    // ── Per-profile commands (P1) ──────────────────────────────────────
+
+    fn mock_engine(name: &str) -> Engine<MockTunnel> {
+        use crate::vortix_core::profile::{Profile, ProtocolKind};
+        use std::path::PathBuf;
+        let name = name.to_string();
+        Engine::new(MockTunnel::new(), move |id: &ProfileId| {
+            Some(Profile::new(
+                id.clone(),
+                &name,
+                ProtocolKind::WireGuard,
+                PathBuf::from(format!("/tmp/{name}.conf")),
+            ))
+        })
+    }
+
+    #[tokio::test]
+    async fn connect_then_disconnect_drives_the_profiles_own_engine() {
+        use crate::vortix_core::engine::state::Connection;
+        let handle = RegistryHandle::spawn(TunnelRegistry::<MockTunnel>::new());
+        let corp = ProfileId::new("corp");
+
+        handle
+            .connect(corp.clone(), Vec::new(), || mock_engine("corp"), true)
+            .await
+            .expect("actor alive")
+            .expect("connect ok");
+
+        let snap = handle.registry_snapshot().await.expect("snap");
+        assert_eq!(snap.tunnels.len(), 1);
+        assert!(matches!(
+            snap.tunnels[0].state,
+            Connection::Connected { .. }
+        ));
+
+        handle
+            .disconnect(corp.clone())
+            .await
+            .expect("actor alive")
+            .expect("disconnect ok");
+
+        // corp is no longer Connected after its own engine tore down.
+        let snap = handle.registry_snapshot().await.expect("snap2");
+        assert!(
+            !snap
+                .tunnels
+                .iter()
+                .any(|t| t.profile_id == corp && matches!(t.state, Connection::Connected { .. })),
+            "corp should not be Connected after disconnect: {:?}",
+            snap.tunnels
+        );
+    }
+
+    #[tokio::test]
+    async fn two_profiles_connect_independently() {
+        use crate::vortix_core::engine::state::Connection;
+        let handle = RegistryHandle::spawn(TunnelRegistry::<MockTunnel>::new());
+        for name in ["corp", "home"] {
+            handle
+                .connect(
+                    ProfileId::new(name),
+                    Vec::new(),
+                    move || mock_engine(name),
+                    true,
+                )
+                .await
+                .expect("actor")
+                .expect("connect");
+        }
+        let snap = handle.registry_snapshot().await.expect("snap");
+        assert_eq!(snap.tunnels.len(), 2);
+        assert!(snap
+            .tunnels
+            .iter()
+            .all(|t| matches!(t.state, Connection::Connected { .. })));
+    }
+
+    #[tokio::test]
+    async fn disconnect_unknown_profile_is_profile_not_found() {
+        let handle = RegistryHandle::spawn(TunnelRegistry::<MockTunnel>::new());
+        let res = handle
+            .disconnect(ProfileId::new("ghost"))
+            .await
+            .expect("actor alive");
+        assert!(matches!(res, Err(RegistryError::ProfileNotFound(_))));
     }
 }
