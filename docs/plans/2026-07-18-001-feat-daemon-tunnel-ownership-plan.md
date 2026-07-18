@@ -12,6 +12,20 @@ supersedes: docs/plans/2026-05-24-010-feat-ipc-engine-handle-remote-plan.md
 
 # Plan: Daemon as tunnel owner — phased completion arc
 
+> **Resequence (2026-07-18, during execution):** U2 and U4 are merged. A
+> real `RegistrySnapshot` over IPC (U2) requires the daemon to *own*
+> registry state, which is exactly what the supervision migration (U4)
+> provides — serving a snapshot the daemon doesn't hold is a placeholder,
+> not the end-state. The merged phase (referred to below as **U2** — U4's
+> unit body is retained for its test scenarios but its work folds into
+> U2) makes the daemon host the `TunnelRegistry` + supervision loops,
+> then exposes them over IPC. Delivered as a sequence of green commits
+> within the single arc PR: (a) concurrent accept loop [done, `1c5289b`],
+> (b) daemon hosts a registry structure, (c) supervisor loops re-homed
+> from the TUI, (d) `RegistrySnapshot` served, (e) Subscribe streaming,
+> (f) restart adoption, (g) TUI Remote cutover. Boot integration (U5),
+> privilege hardening within U3, and closure (U6) are unchanged.
+
 ## Problem Frame
 
 Every disruption-handling gap vortix has traces to one root: no long-lived process owns the tunnels. Supervision (drop detection, retry ladder, network monitor, kill-switch sync) runs only inside the TUI; the CLI is fire-and-forget; the kill switch is silently unenforced between reboot and next launch (#250); `sudo` is required for every mutation (#153). The daemon IPC skeleton shipped in v0.3.0 (UID-gated socket, framed protocol, Execute/Snapshot ops) but nothing operational routes through it — `EngineHandle` is `Local`-only, Subscribe is an ack stub, the snapshot is single-FSM, and the accept loop is serial.
