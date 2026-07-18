@@ -52,7 +52,7 @@ pub struct ReconcileOutcome {
 /// A live kernel session as the scanner reports it, carrying the fields
 /// needed both to match against the registry (by `name`) and to adopt an
 /// as-yet-unknown session into it. Mirrors the subset of
-/// [`ActiveSession`](crate::core::scanner::ActiveSession) the registry's
+/// [`crate::core::scanner::ActiveSession`] the registry's
 /// `DetailedConnectionInfo` consumes; the daemon boot loop translates the
 /// real scanner output into these.
 #[derive(Debug, Clone, Default)]
