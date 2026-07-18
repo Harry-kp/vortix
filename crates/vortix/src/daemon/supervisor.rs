@@ -8,16 +8,24 @@
 //! IPC command handler can't interleave between the decision and the
 //! mutation.
 //!
-//! This commit implements the reconcile tick: drop detection and
-//! disconnect finalization mutate the registry, and dropped tunnels are
-//! reported back so the caller can drive the kill-switch and retry
-//! follow-ups (next commit). Live kernel-scanner cadence and the retry
-//! timer wire in subsequently.
+//! This commit adds adoption to the reconcile tick: kernel sessions the
+//! registry doesn't yet know about are adopted as `Connected` entries
+//! (the daemon's connects flow through a single FSM, so without this the
+//! daemon-owned registry stays empty and `IpcOp::RegistrySnapshot` has
+//! nothing to serve). Drop detection and disconnect finalization mutate
+//! the registry, and dropped tunnels are reported back so the caller can
+//! drive the kill-switch and retry follow-ups. Live kernel-scanner
+//! cadence and the retry timer wire in subsequently.
+
+use std::time::SystemTime;
 
 use crate::tunnel::TunnelKind;
 use crate::vortix_core::engine::reconcile::{classify, ReconcileAction};
 use crate::vortix_core::engine::registry_handle::RegistryHandle;
-use crate::vortix_core::engine::state::Connection;
+use crate::vortix_core::engine::state::{Connection, DetailedConnectionInfo};
+use crate::vortix_core::engine::Engine;
+use crate::vortix_core::ports::tunnel::mock::MockTunnel;
+use crate::vortix_core::profile::ProfileId;
 
 /// A tunnel the reconcile tick found dropped (registry said active, the
 /// kernel scanner saw no matching session). The caller uses this to
@@ -31,25 +39,82 @@ pub struct DroppedTunnel {
     pub was_connected: bool,
 }
 
-/// Names the scanner reports as currently active. Kept as a thin type so
-/// the tick is unit-testable without constructing full `ActiveSession`s.
+/// What one reconcile tick changed: tunnels that dropped (need
+/// kill-switch / retry follow-up) and tunnels newly adopted from the
+/// kernel scanner (informational — already reflected in the registry).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReconcileOutcome {
+    pub dropped: Vec<DroppedTunnel>,
+    pub adopted: Vec<String>,
+}
+
+/// A live kernel session as the scanner reports it, carrying the fields
+/// needed both to match against the registry (by `name`) and to adopt an
+/// as-yet-unknown session into it. Mirrors the subset of
+/// [`ActiveSession`](crate::core::scanner::ActiveSession) the registry's
+/// `DetailedConnectionInfo` consumes; the daemon boot loop translates the
+/// real scanner output into these.
+#[derive(Debug, Clone, Default)]
+pub struct ScannedSession {
+    pub name: String,
+    pub interface: String,
+    pub interface_authoritative: bool,
+    pub internal_ip: String,
+    pub endpoint: String,
+    pub mtu: String,
+    pub public_key: String,
+    pub listen_port: String,
+    pub transfer_rx: String,
+    pub transfer_tx: String,
+    pub latest_handshake: String,
+    pub pid: Option<u32>,
+    pub started_at: Option<SystemTime>,
+}
+
+impl ScannedSession {
+    /// Build the registry's `DetailedConnectionInfo` from this session —
+    /// the same field mapping `App::adopt_registry_from_session` uses.
+    fn to_details(&self) -> DetailedConnectionInfo {
+        DetailedConnectionInfo {
+            interface: self.interface.clone(),
+            interface_authoritative: self.interface_authoritative,
+            internal_ip: self.internal_ip.clone(),
+            endpoint: self.endpoint.clone(),
+            mtu: self.mtu.clone(),
+            public_key: self.public_key.clone(),
+            listen_port: self.listen_port.clone(),
+            transfer_rx: self.transfer_rx.clone(),
+            transfer_tx: self.transfer_tx.clone(),
+            latest_handshake: self.latest_handshake.clone(),
+            pid: self.pid,
+        }
+    }
+}
+
+/// The scanner's view of currently-live kernel sessions this tick.
 pub struct ScannerView {
-    /// Profile names with a live kernel session this tick.
-    pub active_names: Vec<String>,
+    pub sessions: Vec<ScannedSession>,
 }
 
 impl ScannerView {
     fn contains(&self, name: &str) -> bool {
-        self.active_names.iter().any(|n| n == name)
+        self.sessions.iter().any(|s| s.name == name)
     }
 }
 
 /// Run one reconcile tick against the daemon-owned registry.
 ///
-/// Classifies each registry entry against the scanner view via the
-/// shared decision table, applies the registry mutation for drops and
-/// disconnect finalization, and returns the tunnels that dropped so the
-/// caller can drive kill-switch / retry follow-ups.
+/// Two passes, atomic within one [`RegistryHandle::apply`] so a
+/// concurrent IPC command handler can't interleave:
+/// 1. **Reconcile** existing registry entries against the scanner view
+///    via the shared decision table — finalize disconnects and detect
+///    drops.
+/// 2. **Adopt** scanner sessions with no registry entry as fresh
+///    `Connected` entries so the daemon owns state for tunnels started
+///    outside its FSM (CLI, external `wg-quick`, restart-survivors).
+///
+/// Returns what changed: dropped tunnels (kill-switch / retry follow-up)
+/// and newly-adopted names.
 ///
 /// # Errors
 ///
@@ -59,16 +124,17 @@ pub async fn reconcile_tick(
     registry: &RegistryHandle<TunnelKind>,
     view: ScannerView,
     disconnect_timeout_secs: u64,
-) -> Result<Vec<DroppedTunnel>, crate::vortix_core::engine::error::EngineError> {
+) -> Result<ReconcileOutcome, crate::vortix_core::engine::error::EngineError> {
     registry
         .apply(move |reg| {
-            let mut dropped = Vec::new();
+            let mut outcome = ReconcileOutcome::default();
             // Snapshot first so we iterate a stable set while mutating.
-            for snap in reg.snapshot_all() {
+            let existing = reg.snapshot_all();
+            for snap in &existing {
                 let profile = snap.profile_id.as_str().to_string();
                 let present = view.contains(&profile);
                 let disconnecting_elapsed = match &snap.state {
-                    Connection::Disconnecting { started_at, .. } => std::time::SystemTime::now()
+                    Connection::Disconnecting { started_at, .. } => SystemTime::now()
                         .duration_since(*started_at)
                         .unwrap_or_default()
                         .as_secs(),
@@ -85,22 +151,53 @@ pub async fn reconcile_tick(
                     }
                     ReconcileAction::HandleDrop { was_connected } => {
                         reg.set_disconnected(&snap.profile_id);
-                        dropped.push(DroppedTunnel {
+                        outcome.dropped.push(DroppedTunnel {
                             profile,
                             was_connected,
                         });
                     }
-                    // Refresh, AwaitingConnect, and None make no
-                    // registry mutation in this commit. Refresh's
-                    // detail-resync and adoption land next.
+                    // Refresh's detail-resync for existing Connected
+                    // entries lands with the streaming unit; AwaitingConnect
+                    // and None make no mutation.
                     ReconcileAction::RefreshConnected
                     | ReconcileAction::AwaitingConnect
                     | ReconcileAction::None => {}
                 }
             }
-            dropped
+
+            // Adoption pass: kernel sessions with no registry entry are
+            // adopted as Connected. The registry constructs a placeholder
+            // Engine that is never driven (Tunnel::up is never called on
+            // an adopted entry) — the Mock tunnel just satisfies the
+            // `T: Tunnel` bound, matching `App::adopt_registry_from_session`.
+            for session in &view.sessions {
+                if existing
+                    .iter()
+                    .any(|e| e.profile_id.as_str() == session.name)
+                {
+                    continue;
+                }
+                let profile_id = ProfileId::new(&session.name);
+                let since = session.started_at.unwrap_or_else(SystemTime::now);
+                reg.set_connected(
+                    profile_id,
+                    Vec::new(),
+                    session.to_details(),
+                    since,
+                    placeholder_engine,
+                );
+                outcome.adopted.push(session.name.clone());
+            }
+            outcome
         })
         .await
+}
+
+/// A never-driven `Engine<TunnelKind>` for adopted entries. Adoption
+/// records kernel-observed state; it never issues `Tunnel::up`/`down`, so
+/// the inner tunnel is dead storage that only satisfies the generic bound.
+fn placeholder_engine() -> Engine<TunnelKind> {
+    Engine::new(TunnelKind::Mock(MockTunnel::new()), |_: &ProfileId| None)
 }
 
 #[cfg(test)]
@@ -132,6 +229,16 @@ mod tests {
         );
     }
 
+    // A scanner session for `name` with just enough to adopt.
+    fn session(name: &str) -> ScannedSession {
+        ScannedSession {
+            name: name.into(),
+            interface: format!("utun-{name}"),
+            interface_authoritative: true,
+            ..Default::default()
+        }
+    }
+
     #[tokio::test]
     async fn connected_without_session_is_detected_as_drop_and_removed() {
         let registry: RegistryHandle<TunnelKind> = RegistryHandle::spawn({
@@ -139,22 +246,17 @@ mod tests {
             seed_connected(&mut reg, "corp");
             reg
         });
-        let dropped = reconcile_tick(
-            &registry,
-            ScannerView {
-                active_names: vec![],
-            },
-            30,
-        )
-        .await
-        .expect("tick");
+        let outcome = reconcile_tick(&registry, ScannerView { sessions: vec![] }, 30)
+            .await
+            .expect("tick");
         assert_eq!(
-            dropped,
+            outcome.dropped,
             vec![DroppedTunnel {
                 profile: "corp".into(),
                 was_connected: true
             }]
         );
+        assert!(outcome.adopted.is_empty());
         // The entry was removed from the registry.
         let snap = registry.registry_snapshot().await.expect("snap");
         assert!(snap.tunnels.is_empty());
@@ -167,32 +269,99 @@ mod tests {
             seed_connected(&mut reg, "corp");
             reg
         });
-        let dropped = reconcile_tick(
+        let outcome = reconcile_tick(
             &registry,
             ScannerView {
-                active_names: vec!["corp".into()],
+                sessions: vec![session("corp")],
             },
             30,
         )
         .await
         .expect("tick");
-        assert!(dropped.is_empty());
+        assert!(outcome.dropped.is_empty());
+        assert!(outcome.adopted.is_empty());
         let snap = registry.registry_snapshot().await.expect("snap");
         assert_eq!(snap.tunnels.len(), 1);
     }
 
     #[tokio::test]
-    async fn empty_registry_tick_is_noop() {
+    async fn empty_registry_tick_with_no_sessions_is_noop() {
         let registry: RegistryHandle<TunnelKind> = RegistryHandle::spawn(TunnelRegistry::new());
-        let dropped = reconcile_tick(
+        let outcome = reconcile_tick(&registry, ScannerView { sessions: vec![] }, 30)
+            .await
+            .expect("tick");
+        assert_eq!(outcome, ReconcileOutcome::default());
+    }
+
+    #[tokio::test]
+    async fn unknown_session_is_adopted_as_connected() {
+        let registry: RegistryHandle<TunnelKind> = RegistryHandle::spawn(TunnelRegistry::new());
+        let outcome = reconcile_tick(
             &registry,
             ScannerView {
-                active_names: vec!["ghost".into()],
+                sessions: vec![session("home")],
             },
             30,
         )
         .await
         .expect("tick");
-        assert!(dropped.is_empty());
+        assert_eq!(outcome.adopted, vec!["home".to_string()]);
+        assert!(outcome.dropped.is_empty());
+        let snap = registry.registry_snapshot().await.expect("snap");
+        assert_eq!(snap.tunnels.len(), 1);
+        assert_eq!(snap.tunnels[0].profile_id.as_str(), "home");
+        assert!(matches!(
+            snap.tunnels[0].state,
+            Connection::Connected { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn already_known_session_is_not_re_adopted() {
+        let registry: RegistryHandle<TunnelKind> = RegistryHandle::spawn({
+            let mut reg = TunnelRegistry::new();
+            seed_connected(&mut reg, "corp");
+            reg
+        });
+        let outcome = reconcile_tick(
+            &registry,
+            ScannerView {
+                sessions: vec![session("corp")],
+            },
+            30,
+        )
+        .await
+        .expect("tick");
+        assert!(outcome.adopted.is_empty());
+    }
+
+    #[tokio::test]
+    async fn adopts_new_while_dropping_a_vanished_one_in_one_tick() {
+        let registry: RegistryHandle<TunnelKind> = RegistryHandle::spawn({
+            let mut reg = TunnelRegistry::new();
+            seed_connected(&mut reg, "corp");
+            reg
+        });
+        // "corp" vanished from the kernel; "home" appeared.
+        let outcome = reconcile_tick(
+            &registry,
+            ScannerView {
+                sessions: vec![session("home")],
+            },
+            30,
+        )
+        .await
+        .expect("tick");
+        assert_eq!(
+            outcome.dropped,
+            vec![DroppedTunnel {
+                profile: "corp".into(),
+                was_connected: true
+            }]
+        );
+        assert_eq!(outcome.adopted, vec!["home".to_string()]);
+        let snap = registry.registry_snapshot().await.expect("snap");
+        assert_eq!(snap.tunnels.len(), 1);
+        assert_eq!(snap.tunnels[0].profile_id.as_str(), "home");
     }
 }
