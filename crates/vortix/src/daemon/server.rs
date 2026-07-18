@@ -7,6 +7,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::tunnel::TunnelKind;
+use crate::vortix_core::engine::registry_handle::RegistryHandle;
 use crate::vortix_core::engine::EngineHandle;
 use crate::vortix_core::ipc::{
     decode_frame, encode_frame, FrameError, IpcError, IpcOp, IpcRequest, IpcResponse, IpcResult,
@@ -21,6 +23,11 @@ pub struct DaemonServer {
     socket_path: PathBuf,
     listener: UnixListener,
     engine_handle: Option<Arc<EngineHandle>>,
+    /// The daemon-owned multi-tunnel registry handle (plan
+    /// 2026-07-18-001 U2). Answers `IpcOp::RegistrySnapshot`; the
+    /// supervisor loop populates it. `None` in the skeleton/no-registry
+    /// path.
+    registry_handle: Option<RegistryHandle<TunnelKind>>,
     /// The effective UID of the daemon process at bind time. Every
     /// accepted client is checked against this value via
     /// `SO_PEERCRED` (Linux) / `getpeereid(2)` (macOS) and rejected
@@ -67,6 +74,7 @@ impl DaemonServer {
             socket_path,
             listener,
             engine_handle: None,
+            registry_handle: None,
             daemon_uid,
         })
     }
@@ -78,6 +86,15 @@ impl DaemonServer {
     #[must_use]
     pub fn with_engine_handle(mut self, handle: EngineHandle) -> Self {
         self.engine_handle = Some(Arc::new(handle));
+        self
+    }
+
+    /// Attach the multi-tunnel registry handle so `RegistrySnapshot`
+    /// is answered from live registry state instead of returning an
+    /// "engine handle not initialized"-style error.
+    #[must_use]
+    pub fn with_registry_handle(mut self, handle: RegistryHandle<TunnelKind>) -> Self {
+        self.registry_handle = Some(handle);
         self
     }
 
@@ -111,10 +128,11 @@ impl DaemonServer {
                     // Each client runs in its own task so a long-lived
                     // connection (a TUI holding a Subscribe stream, U2)
                     // does not block command clients on the accept loop.
-                    // The engine handle is cheap to clone (Arc-internal).
+                    // Both handles are cheap to clone (Arc / mpsc-sender).
                     let handle = self.engine_handle.clone();
+                    let registry = self.registry_handle.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_client(stream, daemon_uid, handle).await {
+                        if let Err(e) = handle_client(stream, daemon_uid, handle, registry).await {
                             eprintln!("vortix daemon: client session ended: {e}");
                         }
                     });
@@ -149,6 +167,7 @@ async fn handle_client(
     mut stream: UnixStream,
     daemon_uid: u32,
     engine_handle: Option<Arc<EngineHandle>>,
+    registry_handle: Option<RegistryHandle<TunnelKind>>,
 ) -> Result<(), DaemonError> {
     // Peer-UID enforcement runs before any frame is read so an
     // unauthorized client never gets the chance to drive dispatch.
@@ -203,7 +222,8 @@ async fn handle_client(
                 Ok(None) => break, // need more bytes
                 Ok(Some((req, consumed))) => {
                     read_pos += consumed;
-                    let resp = dispatch(req, engine_handle.as_deref()).await;
+                    let resp =
+                        dispatch(req, engine_handle.as_deref(), registry_handle.as_ref()).await;
                     let frame = encode_frame(&resp).map_err(DaemonError::Frame)?;
                     stream.write_all(&frame).await?;
                 }
@@ -297,7 +317,11 @@ fn get_peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
 /// into a streaming event channel is follow-up scope (the wire contract
 /// reserves it). For now clients can correlate the `Subscribed` ack and
 /// then poll `Snapshot` until the streaming half lands.
-async fn dispatch(req: IpcRequest, engine_handle: Option<&EngineHandle>) -> IpcResponse {
+async fn dispatch(
+    req: IpcRequest,
+    engine_handle: Option<&EngineHandle>,
+    registry_handle: Option<&RegistryHandle<TunnelKind>>,
+) -> IpcResponse {
     // Version gate before any op runs. A pre-versioning client's frames
     // deserialize with protocol_version = 0 and land here — the typed
     // error names both sides so the user knows which binary to upgrade.
@@ -337,6 +361,19 @@ async fn dispatch(req: IpcRequest, engine_handle: Option<&EngineHandle>) -> IpcR
             },
             None => Err(IpcError::Internal(
                 "engine handle not initialized in daemon".into(),
+            )),
+        },
+        IpcOp::RegistrySnapshot => match registry_handle {
+            Some(reg) => match reg.registry_snapshot().await {
+                Ok(snap) => Ok(IpcResult::RegistrySnapshot {
+                    tunnels: snap.tunnels,
+                    primary: snap.primary,
+                    killswitch: snap.killswitch,
+                }),
+                Err(e) => Err(IpcError::Internal(format!("registry snapshot error: {e}"))),
+            },
+            None => Err(IpcError::Internal(
+                "registry handle not initialized in daemon".into(),
             )),
         },
         IpcOp::Subscribe => {
@@ -407,7 +444,7 @@ mod tests {
                 profile_id: ProfileId::new("corp"),
             }),
         };
-        let resp = dispatch(req, None).await;
+        let resp = dispatch(req, None, None).await;
         assert_eq!(resp.id, 1);
         match resp.result {
             Err(IpcError::Internal(msg)) => assert!(msg.contains("engine handle not initialized")),
@@ -422,7 +459,7 @@ mod tests {
             protocol_version: IPC_PROTOCOL_VERSION,
             op: IpcOp::Snapshot,
         };
-        let resp = dispatch(req, None).await;
+        let resp = dispatch(req, None, None).await;
         assert_eq!(resp.id, 2);
         assert!(matches!(resp.result, Err(IpcError::Internal(_))));
     }
@@ -434,7 +471,7 @@ mod tests {
             protocol_version: IPC_PROTOCOL_VERSION,
             op: IpcOp::Subscribe,
         };
-        let resp = dispatch(req, None).await;
+        let resp = dispatch(req, None, None).await;
         assert_eq!(resp.id, 3);
         assert!(matches!(resp.result, Err(IpcError::Internal(_))));
     }
@@ -446,7 +483,7 @@ mod tests {
             protocol_version: IPC_PROTOCOL_VERSION,
             op: IpcOp::Shutdown,
         };
-        let resp = dispatch(req, None).await;
+        let resp = dispatch(req, None, None).await;
         assert_eq!(resp.id, 4);
         assert!(matches!(resp.result, Ok(IpcResult::ShuttingDown)));
     }
@@ -459,12 +496,45 @@ mod tests {
             protocol_version: IPC_PROTOCOL_VERSION,
             op: IpcOp::Snapshot,
         };
-        let resp = dispatch(req, Some(&handle)).await;
+        let resp = dispatch(req, Some(&handle), None).await;
         match resp.result {
             Ok(IpcResult::Snapshot { state }) => {
                 assert!(matches!(state, Connection::Disconnected { .. }));
             }
             other => panic!("expected Snapshot, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_registry_snapshot_without_handle_returns_internal_error() {
+        let req = IpcRequest {
+            id: 50,
+            protocol_version: IPC_PROTOCOL_VERSION,
+            op: IpcOp::RegistrySnapshot,
+        };
+        let resp = dispatch(req, None, None).await;
+        assert!(matches!(resp.result, Err(IpcError::Internal(_))));
+    }
+
+    #[tokio::test]
+    async fn dispatch_registry_snapshot_with_handle_returns_registry_variant() {
+        use crate::vortix_core::engine::registry::TunnelRegistry;
+        use crate::vortix_core::engine::registry_handle::RegistryHandle;
+        let registry: RegistryHandle<TunnelKind> = RegistryHandle::spawn(TunnelRegistry::new());
+        let req = IpcRequest {
+            id: 51,
+            protocol_version: IPC_PROTOCOL_VERSION,
+            op: IpcOp::RegistrySnapshot,
+        };
+        let resp = dispatch(req, None, Some(&registry)).await;
+        match resp.result {
+            Ok(IpcResult::RegistrySnapshot {
+                tunnels, primary, ..
+            }) => {
+                assert!(tunnels.is_empty());
+                assert!(primary.is_none());
+            }
+            other => panic!("expected RegistrySnapshot, got {other:?}"),
         }
     }
 
@@ -478,7 +548,7 @@ mod tests {
                 profile_id: ProfileId::new("corp"),
             }),
         };
-        let resp = dispatch(req, Some(&handle)).await;
+        let resp = dispatch(req, Some(&handle), None).await;
         assert!(matches!(resp.result, Ok(IpcResult::Accepted)));
     }
 
@@ -490,7 +560,7 @@ mod tests {
             protocol_version: IPC_PROTOCOL_VERSION,
             op: IpcOp::Subscribe,
         };
-        let resp = dispatch(req, Some(&handle)).await;
+        let resp = dispatch(req, Some(&handle), None).await;
         assert!(matches!(resp.result, Ok(IpcResult::Subscribed)));
     }
 
@@ -555,7 +625,9 @@ mod tests {
 
         let fake_daemon_uid = u32::MAX;
         let server_task =
-            tokio::spawn(async move { handle_client(server_end, fake_daemon_uid, None).await });
+            tokio::spawn(
+                async move { handle_client(server_end, fake_daemon_uid, None, None).await },
+            );
 
         let mut buf = vec![0u8; 4096];
         let n = client_end.read(&mut buf).await.expect("read");
@@ -591,14 +663,14 @@ mod tests {
                 profile_id: ProfileId::new("corp"),
             }),
         };
-        let _ = dispatch(connect_req, Some(&handle)).await;
+        let _ = dispatch(connect_req, Some(&handle), None).await;
 
         let req = IpcRequest {
             id: 11,
             protocol_version: IPC_PROTOCOL_VERSION,
             op: IpcOp::Execute(UserCommand::Disconnect { profile_id: None }),
         };
-        let resp = dispatch(req, Some(&handle)).await;
+        let resp = dispatch(req, Some(&handle), None).await;
         assert_eq!(resp.id, 11);
         assert!(matches!(resp.result, Ok(IpcResult::Accepted)));
     }
@@ -613,7 +685,7 @@ mod tests {
                 profile_id: Some(ProfileId::new("corp")),
             }),
         };
-        let resp = dispatch(req, Some(&handle)).await;
+        let resp = dispatch(req, Some(&handle), None).await;
         assert!(matches!(resp.result, Ok(IpcResult::Accepted)));
     }
 
@@ -625,7 +697,7 @@ mod tests {
             protocol_version: IPC_PROTOCOL_VERSION,
             op: IpcOp::Execute(UserCommand::Reconnect { profile_id: None }),
         };
-        let resp = dispatch(req, Some(&handle)).await;
+        let resp = dispatch(req, Some(&handle), None).await;
         assert!(matches!(resp.result, Ok(IpcResult::Accepted)));
     }
 
@@ -639,7 +711,7 @@ mod tests {
                 profile_id: Some(ProfileId::new("corp")),
             }),
         };
-        let resp = dispatch(req, Some(&handle)).await;
+        let resp = dispatch(req, Some(&handle), None).await;
         assert!(matches!(resp.result, Ok(IpcResult::Accepted)));
     }
 
@@ -723,7 +795,7 @@ mod tests {
             protocol_version: 0,
             op: IpcOp::Shutdown,
         };
-        let resp = dispatch(req, None).await;
+        let resp = dispatch(req, None, None).await;
         assert_eq!(resp.id, 9);
         assert_eq!(resp.protocol_version, IPC_PROTOCOL_VERSION);
         match resp.result {

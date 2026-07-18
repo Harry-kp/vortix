@@ -43,8 +43,11 @@ use crate::vortix_core::state::KillSwitchState;
 pub enum IpcOp {
     /// Execute a user command (Connect, Disconnect, Reconnect, ...).
     Execute(UserCommand),
-    /// Read the current FSM snapshot.
+    /// Read the current single-FSM snapshot (v1-compat).
     Snapshot,
+    /// Read the full multi-tunnel registry snapshot (plan
+    /// 2026-07-18-001 U2). Answered with [`IpcResult::RegistrySnapshot`].
+    RegistrySnapshot,
     /// Subscribe to live `EngineEvent` stream. The daemon switches the
     /// connection into streaming mode after sending the ack; subsequent
     /// frames on this connection are events until the client closes.
