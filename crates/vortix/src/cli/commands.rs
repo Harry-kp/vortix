@@ -296,8 +296,8 @@ fn handle_daemon(socket_override: Option<std::path::PathBuf>, mode: OutputMode) 
         |d| d.join(constants::PROFILES_DIR_NAME),
     );
 
-    // Build the engine handle once; keep a clone for the supervisor's
-    // headless auto-reconnect (it drives connects through the same FSM).
+    // Build the engine handle the IPC server uses for client-driven
+    // Execute/Snapshot/Subscribe.
     let engine_handle =
         runtime.block_on(async { crate::daemon::build_engine_handle(&profiles_dir) });
     if engine_handle.is_none() {
@@ -305,12 +305,19 @@ fn handle_daemon(socket_override: Option<std::path::PathBuf>, mode: OutputMode) 
             "vortix daemon: engine handle unavailable (journal or runner not installed) — Execute/Snapshot/Subscribe will return Internal errors"
         );
     }
-    let supervisor_engine = engine_handle.clone();
     let server = if let Some(handle) = engine_handle {
         server.with_engine_handle(handle)
     } else {
         server
     };
+
+    // The supervisor's auto-reconnect drives a FRESH engine per attempt —
+    // never the shared server FSM, which tracks one tunnel and goes stale
+    // on a drop. Each fresh engine starts Disconnected, so its Connect
+    // actually brings the tunnel up and its result is truthful.
+    let factory_profiles_dir = profiles_dir.clone();
+    let engine_factory: crate::daemon::supervisor::EngineFactory =
+        std::sync::Arc::new(move || crate::daemon::build_engine_handle(&factory_profiles_dir));
 
     // The daemon owns a multi-tunnel registry independent of the single
     // FSM engine handle. A headless supervisor loop keeps it in sync with
@@ -368,7 +375,7 @@ fn handle_daemon(socket_override: Option<std::path::PathBuf>, mode: OutputMode) 
     };
     runtime.spawn(crate::daemon::supervisor::run_supervisor(
         registry,
-        supervisor_engine,
+        engine_factory,
         supervisor_config,
     ));
 

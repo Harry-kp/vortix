@@ -252,40 +252,78 @@ fn is_connected_to(state: &Connection, name: &str) -> bool {
     matches!(state, Connection::Connected { profile_id, .. } if profile_id.as_str() == name)
 }
 
+/// Builds a fresh, `Disconnected` engine used to perform ONE reconnect.
+///
+/// Each reconnect drives a DEDICATED engine rather than a single shared
+/// FSM. This is deliberate: the daemon's shared FSM tracks only one
+/// tunnel and is never told about kernel drops, so a shared-engine
+/// `Connect` no-ops against a stale `Connected` state and the snapshot
+/// check then reports a false success (the tunnel stays down). A fresh
+/// engine always starts `Disconnected`, so `Connect` actually runs
+/// `tunnel.up`, and its snapshot reflects *that* profile's real result.
+/// It also makes concurrent multi-tunnel reconnects independent. The
+/// brought-up tunnel survives the transient engine being dropped (the
+/// FSM's `Drop` is a no-op; the scanner re-adopts it into the registry).
+///
+/// Injected so the loop is unit-testable without real tunnels. Returns
+/// `None` when prerequisites are missing (no runner/journal).
+pub type EngineFactory = std::sync::Arc<dyn Fn() -> Option<EngineHandle> + Send + Sync>;
+
+/// Hard cap on one kernel scan so a hung `wg`/`ip`/`/proc` read can't
+/// wedge the whole supervision loop.
+const SCAN_TIMEOUT_SECS: u64 = 15;
+
 /// The daemon's headless supervision loop: on each tick, scan the kernel
 /// for live sessions, reconcile them against the daemon-owned registry
 /// (adopt new, finalize disconnects, detect drops), and drive headless
 /// auto-reconnect for tunnels that dropped unexpectedly (AE2/AE3). Runs
 /// until the registry owner task terminates (daemon shutdown).
 ///
-/// Reconnect execution needs the daemon's `engine` handle; when absent
-/// (engine unavailable at boot) the loop still reconciles the registry
-/// but cannot reconnect. Kill-switch arming on drop is a follow-up (it
-/// needs the daemon to load kill-switch mode + apply root firewall
-/// rules, validated live).
+/// `engine_factory` builds a fresh engine per reconnect (see
+/// [`EngineFactory`]); when it yields `None` (engine prerequisites
+/// missing) the loop still reconciles the registry but performs no
+/// reconnects. Kill-switch arming on drop is a follow-up (it needs the
+/// daemon to load kill-switch mode + apply root firewall rules, validated
+/// live).
 ///
 /// Spawn this onto the daemon runtime alongside the accept loop.
 pub async fn run_supervisor(
     registry: RegistryHandle<TunnelKind>,
-    engine: Option<EngineHandle>,
+    engine_factory: EngineFactory,
     config: SupervisorConfig,
 ) {
     let mut retries: HashMap<String, RetryTrack> = HashMap::new();
     let mut ticker = tokio::time::interval(Duration::from_secs(config.scan_interval_secs.max(1)));
+    // A blocking reconnect can overrun several tick periods; Skip collapses
+    // the missed-tick backlog to a single tick so the loop doesn't fire a
+    // burst of back-to-back kernel scans when it catches up.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         ticker.tick().await;
 
         // The scan reads `/proc`, runs `wg`/`ip`, and loads profile
-        // sidecars — all blocking. Keep it off the async worker.
-        let sessions = match tokio::task::spawn_blocking(|| {
-            let profiles = crate::vpn::load_profiles();
-            crate::core::scanner::get_active_profiles(&profiles)
-        })
-        .await
-        {
-            Ok(sessions) => sessions,
-            Err(e) => {
+        // sidecars — all blocking. Keep it off the async worker AND bound
+        // it, so a hung subprocess skips the tick rather than freezing
+        // supervision forever.
+        let scan = tokio::time::timeout(
+            Duration::from_secs(SCAN_TIMEOUT_SECS),
+            tokio::task::spawn_blocking(|| {
+                let profiles = crate::vpn::load_profiles();
+                crate::core::scanner::get_active_profiles(&profiles)
+            }),
+        )
+        .await;
+        let sessions = match scan {
+            Ok(Ok(sessions)) => sessions,
+            Ok(Err(e)) => {
                 tracing::warn!(error = %e, "supervisor scan task failed; skipping tick");
+                continue;
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    timeout_secs = SCAN_TIMEOUT_SECS,
+                    "supervisor scan timed out; skipping tick"
+                );
                 continue;
             }
         };
@@ -309,49 +347,95 @@ pub async fn run_supervisor(
         }
 
         // A tunnel that reappeared (adopted) is healthy again — clear any
-        // pending reconnect for it.
+        // pending reconnect for it. This is also how a *successful*
+        // reconnect is confirmed: the scanner re-adopts the tunnel a tick
+        // later and its retry is cleared here.
         for name in &outcome.adopted {
             retries.remove(name);
         }
 
-        // Schedule auto-reconnect for genuine drops (a Connected tunnel
-        // that vanished). The first attempt waits the fixed grace window;
-        // failures escalate via exponential backoff up to `max_retries`.
-        if config.auto_reconnect {
-            for dropped in &outcome.dropped {
-                if dropped.was_connected && !retries.contains_key(&dropped.profile) {
-                    let delay = crate::state::retry::reconnect_delay_for_attempt(
-                        1,
-                        config.auto_reconnect_delay_secs,
-                        config.retry_base_delay_secs,
-                        config.retry_max_delay_secs,
-                    );
-                    tracing::info!(profile = %dropped.profile, delay, "auto-reconnect scheduled");
-                    retries.insert(
-                        dropped.profile.clone(),
-                        RetryTrack {
-                            attempt: 1,
-                            next_at: Instant::now() + Duration::from_secs(delay),
-                        },
-                    );
-                }
-            }
-        }
+        schedule_drops(&outcome, &config, &mut retries, Instant::now());
 
-        // Fire any reconnect whose delay has elapsed. Executing a connect
-        // blocks this loop until the FSM settles — intended: the whole
-        // point of the tick is to bring the tunnel back.
-        if let Some(engine) = &engine {
-            drive_due_reconnects(engine, &config, &mut retries).await;
+        // Fire any reconnect whose delay has elapsed.
+        drive_due_reconnects(&engine_factory, &config, &mut retries).await;
+    }
+}
+
+/// Insert a first-attempt retry for each genuine drop (a `Connected`
+/// tunnel that vanished) not already being retried. Pure over `now` so
+/// the scheduling is unit-testable. No-op when `auto_reconnect` is off.
+fn schedule_drops(
+    outcome: &ReconcileOutcome,
+    config: &SupervisorConfig,
+    retries: &mut HashMap<String, RetryTrack>,
+    now: Instant,
+) {
+    if !config.auto_reconnect {
+        return;
+    }
+    for dropped in &outcome.dropped {
+        if dropped.was_connected && !retries.contains_key(&dropped.profile) {
+            let delay = crate::state::retry::reconnect_delay_for_attempt(
+                1,
+                config.auto_reconnect_delay_secs,
+                config.retry_base_delay_secs,
+                config.retry_max_delay_secs,
+            );
+            tracing::info!(profile = %dropped.profile, delay, "auto-reconnect scheduled");
+            retries.insert(
+                dropped.profile.clone(),
+                RetryTrack {
+                    attempt: 1,
+                    next_at: now + Duration::from_secs(delay),
+                },
+            );
         }
     }
 }
 
-/// Execute every reconnect that is due, updating the retry bookkeeping:
-/// success clears the entry, failure reschedules with backoff until the
-/// budget is exhausted (then gives up).
+/// After an attempt for `name`, either reschedule the next attempt with
+/// backoff (budget remaining) or give up and drop the entry. Pure over
+/// `now`; unit-testable. Returns `true` when the entry was kept.
+fn reschedule_after_attempt(
+    name: &str,
+    config: &SupervisorConfig,
+    retries: &mut HashMap<String, RetryTrack>,
+    now: Instant,
+) -> bool {
+    let attempt = retries.get(name).map_or(1, |t| t.attempt);
+    if crate::state::retry::has_retry_budget(config.max_retries, attempt) {
+        let next_attempt = attempt + 1;
+        let delay = crate::state::retry::reconnect_delay_for_attempt(
+            next_attempt,
+            config.auto_reconnect_delay_secs,
+            config.retry_base_delay_secs,
+            config.retry_max_delay_secs,
+        );
+        tracing::warn!(profile = %name, next_attempt, delay, "auto-reconnect attempt made; will retry if still down");
+        retries.insert(
+            name.to_string(),
+            RetryTrack {
+                attempt: next_attempt,
+                next_at: now + Duration::from_secs(delay),
+            },
+        );
+        true
+    } else {
+        tracing::warn!(profile = %name, "auto-reconnect gave up (retry budget exhausted)");
+        retries.remove(name);
+        false
+    }
+}
+
+/// Execute every reconnect that is due. Each fires against a FRESH engine
+/// (see [`EngineFactory`]) so the connect actually runs and its result is
+/// truthful; a genuine success is confirmed on a later tick when the
+/// scanner re-adopts the tunnel (clearing the retry in `run_supervisor`).
+/// Whether or not the fresh engine reports connected this instant, we
+/// reschedule with backoff / give up so a slow-to-come-up tunnel keeps
+/// being retried until adoption clears it or the budget is exhausted.
 async fn drive_due_reconnects(
-    engine: &EngineHandle,
+    engine_factory: &EngineFactory,
     config: &SupervisorConfig,
     retries: &mut HashMap<String, RetryTrack>,
 ) {
@@ -364,6 +448,11 @@ async fn drive_due_reconnects(
 
     for name in due {
         let attempt = retries.get(&name).map_or(1, |t| t.attempt);
+        let Some(engine) = engine_factory() else {
+            tracing::warn!(profile = %name, "auto-reconnect skipped: no engine available");
+            // Keep the entry; a later tick may find the engine available.
+            continue;
+        };
         tracing::info!(profile = %name, attempt, "auto-reconnect attempt");
         let _ = engine
             .execute_command(UserCommand::Connect {
@@ -371,31 +460,17 @@ async fn drive_due_reconnects(
             })
             .await;
 
+        // The fresh engine is dedicated to this profile, so its snapshot
+        // is a truthful (not stale) signal — but we treat it as advisory
+        // only. Success is *confirmed* by the scanner re-adopting the
+        // tunnel on a later tick (which clears the retry in run_supervisor);
+        // until then we keep the retry armed and reschedule with backoff,
+        // so a tunnel that comes up slowly, or comes up then drops again
+        // before adoption, is not abandoned.
         let connected =
             matches!(engine.snapshot().await, Ok(s) if is_connected_to(&s.state, &name));
-        if connected {
-            tracing::info!(profile = %name, "auto-reconnect succeeded");
-            retries.remove(&name);
-        } else if crate::state::retry::has_retry_budget(config.max_retries, attempt) {
-            let next_attempt = attempt + 1;
-            let delay = crate::state::retry::reconnect_delay_for_attempt(
-                next_attempt,
-                config.auto_reconnect_delay_secs,
-                config.retry_base_delay_secs,
-                config.retry_max_delay_secs,
-            );
-            tracing::warn!(profile = %name, next_attempt, delay, "auto-reconnect failed; retrying");
-            retries.insert(
-                name,
-                RetryTrack {
-                    attempt: next_attempt,
-                    next_at: Instant::now() + Duration::from_secs(delay),
-                },
-            );
-        } else {
-            tracing::warn!(profile = %name, "auto-reconnect gave up (retry budget exhausted)");
-            retries.remove(&name);
-        }
+        tracing::info!(profile = %name, connected, "auto-reconnect attempt completed");
+        let _ = reschedule_after_attempt(&name, config, retries, Instant::now());
     }
 }
 
@@ -436,6 +511,168 @@ mod tests {
             interface_authoritative: true,
             ..Default::default()
         }
+    }
+
+    fn test_config() -> SupervisorConfig {
+        SupervisorConfig {
+            scan_interval_secs: 2,
+            disconnect_timeout_secs: 30,
+            auto_reconnect: true,
+            auto_reconnect_delay_secs: 5,
+            max_retries: 3,
+            retry_base_delay_secs: 2,
+            retry_max_delay_secs: 300,
+        }
+    }
+
+    fn outcome_with_drop(name: &str, was_connected: bool) -> ReconcileOutcome {
+        ReconcileOutcome {
+            dropped: vec![DroppedTunnel {
+                profile: name.into(),
+                was_connected,
+            }],
+            adopted: vec![],
+        }
+    }
+
+    // ===== scheduling (pure over `now`) =====
+
+    #[test]
+    fn schedule_drops_arms_first_attempt_for_connected_drop() {
+        let mut retries = HashMap::new();
+        schedule_drops(
+            &outcome_with_drop("corp", true),
+            &test_config(),
+            &mut retries,
+            Instant::now(),
+        );
+        assert_eq!(retries.get("corp").map(|t| t.attempt), Some(1));
+    }
+
+    #[test]
+    fn schedule_drops_ignores_never_connected_and_already_tracked() {
+        let cfg = test_config();
+        let mut retries = HashMap::new();
+        // A Connecting/never-up drop does not schedule an auto-reconnect.
+        schedule_drops(
+            &outcome_with_drop("corp", false),
+            &cfg,
+            &mut retries,
+            Instant::now(),
+        );
+        assert!(retries.is_empty());
+        // An already-tracked profile is not re-armed (attempt preserved).
+        retries.insert(
+            "home".to_string(),
+            RetryTrack {
+                attempt: 2,
+                next_at: Instant::now() + Duration::from_secs(999),
+            },
+        );
+        schedule_drops(
+            &outcome_with_drop("home", true),
+            &cfg,
+            &mut retries,
+            Instant::now(),
+        );
+        assert_eq!(retries.get("home").map(|t| t.attempt), Some(2));
+    }
+
+    #[test]
+    fn schedule_drops_noop_when_auto_reconnect_off() {
+        let mut cfg = test_config();
+        cfg.auto_reconnect = false;
+        let mut retries = HashMap::new();
+        schedule_drops(
+            &outcome_with_drop("corp", true),
+            &cfg,
+            &mut retries,
+            Instant::now(),
+        );
+        assert!(retries.is_empty());
+    }
+
+    #[test]
+    fn reschedule_backs_off_until_budget_exhausted() {
+        let cfg = test_config(); // max_retries = 3
+        let mut retries = HashMap::new();
+        retries.insert(
+            "corp".to_string(),
+            RetryTrack {
+                attempt: 1,
+                next_at: Instant::now(),
+            },
+        );
+        // attempt 1 → budget remains → rescheduled at attempt 2.
+        assert!(reschedule_after_attempt(
+            "corp",
+            &cfg,
+            &mut retries,
+            Instant::now()
+        ));
+        assert_eq!(retries.get("corp").map(|t| t.attempt), Some(2));
+        // bump to the cap and confirm give-up removes the entry.
+        retries.get_mut("corp").unwrap().attempt = 3;
+        assert!(!reschedule_after_attempt(
+            "corp",
+            &cfg,
+            &mut retries,
+            Instant::now()
+        ));
+        assert!(!retries.contains_key("corp"));
+    }
+
+    // ===== drive_due_reconnects (fresh-engine factory) =====
+
+    #[tokio::test]
+    async fn drive_fires_due_and_reschedules_next_attempt() {
+        let factory: EngineFactory = std::sync::Arc::new(|| Some(EngineHandle::for_test()));
+        let cfg = test_config();
+        let mut retries = HashMap::new();
+        retries.insert(
+            "corp".to_string(),
+            RetryTrack {
+                attempt: 1,
+                next_at: Instant::now().checked_sub(Duration::from_secs(1)).unwrap(), // due
+            },
+        );
+        drive_due_reconnects(&factory, &cfg, &mut retries).await;
+        // Fired, and rescheduled to attempt 2 (success is confirmed later
+        // by adoption, not here).
+        assert_eq!(retries.get("corp").map(|t| t.attempt), Some(2));
+    }
+
+    #[tokio::test]
+    async fn drive_ignores_not_due_entries() {
+        let factory: EngineFactory = std::sync::Arc::new(|| Some(EngineHandle::for_test()));
+        let cfg = test_config();
+        let mut retries = HashMap::new();
+        retries.insert(
+            "corp".to_string(),
+            RetryTrack {
+                attempt: 1,
+                next_at: Instant::now() + Duration::from_secs(999), // not due
+            },
+        );
+        drive_due_reconnects(&factory, &cfg, &mut retries).await;
+        assert_eq!(retries.get("corp").map(|t| t.attempt), Some(1));
+    }
+
+    #[tokio::test]
+    async fn drive_keeps_entry_when_no_engine_available() {
+        let factory: EngineFactory = std::sync::Arc::new(|| None);
+        let cfg = test_config();
+        let mut retries = HashMap::new();
+        retries.insert(
+            "corp".to_string(),
+            RetryTrack {
+                attempt: 1,
+                next_at: Instant::now().checked_sub(Duration::from_secs(1)).unwrap(), // due
+            },
+        );
+        drive_due_reconnects(&factory, &cfg, &mut retries).await;
+        // No engine → attempt not consumed, entry preserved for a later tick.
+        assert_eq!(retries.get("corp").map(|t| t.attempt), Some(1));
     }
 
     #[tokio::test]
