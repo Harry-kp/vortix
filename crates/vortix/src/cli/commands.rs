@@ -341,6 +341,7 @@ fn handle_up(
     // registry conflict-check into the CLI path, this flag will gate
     // the bypass.
     let _ = yes;
+    let _lifecycle_lock = crate::utils::acquire_lifecycle_lock();
     let mut engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
 
     let profile_name = if let Some(name) = profile {
@@ -410,6 +411,38 @@ fn handle_up(
                 ExitCode::GeneralError,
             );
         }
+    }
+
+    // True idempotency: `up` of an already-connected profile is a
+    // success no-op, mirroring `down`'s already-disconnected path.
+    // Without this, a second `up` re-spawned the tunnel — for OpenVPN
+    // that meant a duplicate daemon whose pidfile clobbered the first's.
+    if crate::core::scanner::get_active_profiles(&engine.profiles)
+        .iter()
+        .any(|s| s.name == profile_name)
+    {
+        let protocol = engine
+            .profiles
+            .iter()
+            .find(|p| p.name == profile_name)
+            .map_or_else(|| "VPN".to_string(), |p| p.protocol.to_string());
+        let data = UpData {
+            state: "connected".into(),
+            profile: profile_name.clone(),
+            protocol: protocol.clone(),
+        };
+        let next = vec![
+            "vortix status --json".into(),
+            "sudo vortix down --json".to_string(),
+        ];
+        match mode {
+            OutputMode::Human => {
+                println!("● Already connected to {profile_name} ({protocol})");
+            }
+            OutputMode::Json => print_success(mode, "up", &data, next),
+            OutputMode::Quiet => {}
+        }
+        return 0;
     }
 
     // Multi-connection plan #001 U7: route the CLI connect through the
@@ -698,6 +731,7 @@ fn handle_down(
     mode: OutputMode,
 ) -> i32 {
     let _ = all; // `--all` is the explicit form of the no-profile case (already the default).
+    let _lifecycle_lock = crate::utils::acquire_lifecycle_lock();
     let mut engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
 
     // NotFound (exit 3) takes precedence over idempotence: a typo'd
@@ -807,6 +841,7 @@ fn handle_reconnect(
     config_dir: &Path,
     mode: OutputMode,
 ) -> i32 {
+    let _lifecycle_lock = crate::utils::acquire_lifecycle_lock();
     let mut engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
     engine.load_metadata();
 

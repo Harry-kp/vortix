@@ -591,6 +591,28 @@ impl Tunnel for OvpnTunnel {
         if let Some(parent) = pid_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+
+        // Refuse double-up: if the pidfile records a live daemon, a second
+        // spawn would orphan it (--writepid last-write-wins clobbers the
+        // record `down` uses for teardown). Dead-pid files fall through to
+        // the stale cleanup below.
+        if let Ok(content) = std::fs::read_to_string(&pid_path) {
+            if let Ok(existing_pid) = content.trim().parse::<u32>() {
+                let alive = crate::vortix_process::run_to_output(CommandSpec::oneshot(
+                    "kill",
+                    vec!["-0".into(), existing_pid.to_string()],
+                ))
+                .is_ok_and(|o| o.status.success());
+                if alive {
+                    return Err(TunnelError::Subprocess(format!(
+                        "OpenVPN for '{}' is already running (pid {existing_pid}) — \
+                         disconnect it first with `vortix down`",
+                        profile.display_name
+                    )));
+                }
+            }
+        }
+
         // Stale-file cleanup from any previous run.
         let _ = std::fs::remove_file(&pid_path);
         let _ = std::fs::remove_file(&log_path);

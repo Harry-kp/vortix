@@ -1036,6 +1036,53 @@ pub(crate) fn host_ipv6_disabled() -> bool {
     })
 }
 
+/// Serialize tunnel lifecycle mutations (`up` / `down` / `reconnect`)
+/// across concurrent vortix processes via `flock` on a lockfile in the
+/// config dir. Without it, two `vortix up` invocations of the same
+/// `OpenVPN` profile both spawn daemons and the second clobbers the
+/// first's pidfile, orphaning it.
+///
+/// The lock is held for the returned `File`'s lifetime and released by
+/// the OS on process exit — safe across `std::process::exit` paths.
+/// Blocks (with a stderr note) when another invocation holds the lock.
+#[cfg(unix)]
+pub fn acquire_lifecycle_lock() -> std::io::Result<std::fs::File> {
+    use std::os::unix::io::AsRawFd;
+
+    let root = get_app_config_dir()?;
+    let path = root.join("lifecycle.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)?;
+
+    // SAFETY: flock is a thin syscall wrapper over a valid owned fd; no
+    // buffers, no aliasing. Same invariant analysis as libc::kill in the
+    // OpenVPN teardown path.
+    #[allow(unsafe_code)]
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        eprintln!("Another vortix lifecycle operation is in progress — waiting…");
+        #[allow(unsafe_code)]
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+pub fn acquire_lifecycle_lock() -> std::io::Result<std::fs::File> {
+    let root = get_app_config_dir()?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(root.join("lifecycle.lock"))
+}
+
 /// Check whether a `WireGuard` config declares an IPv6 entry on an
 /// `Address =` line. `wg-quick` runs `ip -6 address add` for each such
 /// entry, which fails outright when the kernel has IPv6 disabled

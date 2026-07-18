@@ -173,7 +173,18 @@ fn main() -> Result<()> {
     // `wireguard-go` daemon is probably still running. Warn so they
     // know to clean up (no auto-adopt — adoption arrives with the
     // plan 010 IPC layer).
-    let orphans = vortix::vortix_process::scan_orphans();
+    //
+    // PIDs recorded in a profile's `run/<name>.pid` belong to a tracked
+    // session (openvpn daemons reparent to init, so the bare scan can't
+    // tell "mine" from "leftover") — exclude them from the warning.
+    let tracked_pids: Vec<u32> = vortix::vpn::load_profiles()
+        .iter()
+        .filter_map(|p| vortix::utils::read_openvpn_pid(&p.name))
+        .collect();
+    let orphans = vortix::vortix_process::filter_untracked(
+        vortix::vortix_process::scan_orphans(),
+        &tracked_pids,
+    );
     if !orphans.is_empty() {
         eprintln!(
             "Warning: detected {} possible orphan VPN process(es) from a previous session:",

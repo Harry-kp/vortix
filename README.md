@@ -90,7 +90,7 @@ Use the right tool: if you only run one WireGuard tunnel and don't care about te
 - **Advanced Telemetry** — Real-time throughput, latency, **jitter**, and **packet loss**
 - **Geo-Location** — Instant detection of your exit IP's city and country
 - **Leak detection** — Monitors for IPv6 leaks and DNS leaks in real-time
-- **Kill Switch** — Platform-native firewall (PF on macOS; `iptables` or `nftables` on Linux). Three modes — **Off** (no firewall), **Block on drop** (engages only if the VPN drops unexpectedly), **VPN-only** (firewall stays engaged whether the VPN is up or down — closes the gap-between-drop-and-reconnect leak window). Multi-tunnel-aware: every active tunnel's interface is allow-listed
+- **Kill Switch** — Platform-native firewall (PF on macOS; `iptables` or `nftables` on Linux). Three modes — **Off** (no firewall), **Block on drop** (engages only if the VPN drops unexpectedly), **VPN-only** (firewall stays engaged whether the VPN is up or down — closes the gap-between-drop-and-reconnect leak window). Multi-tunnel-aware: every active tunnel's interface is allow-listed. Rules survive vortix restarts and crashes but not an OS reboot — re-arm after boot
 - **Session event journal** *(v0.3.0)* — JSONL event log per session under `${XDG_DATA_HOME}/vortix/sessions/`, 30-day retention; useful for diagnostics and scripting
 - **Per-process socket audit** *(v0.3.0)* — `vortix audit` answers "is this traffic actually routing through the tunnel?" with per-PID socket inventory; Linux + macOS supported
 - **Versioned structured output** *(v0.3.0)* — every `--json` envelope carries a `schema_version` field (currently `2`) so consumers can detect breaking changes instead of finding them at runtime
@@ -266,6 +266,12 @@ sudo vortix killswitch vpn-only
 vortix killswitch               # Show current mode + behaviour
 sudo vortix release-killswitch  # Emergency firewall release
 ```
+
+> **Reboot boundary:** kill-switch firewall rules live in the OS firewall
+> (PF / iptables / nftables), which is flushed on reboot. `vpn-only` mode is
+> therefore **not enforced between boot and the next vortix launch** — re-arm
+> it (`sudo vortix killswitch vpn-only`) after restarting. Rules do survive
+> vortix restarts, crashes, and binary upgrades within one boot.
 
 **System:**
 ```bash

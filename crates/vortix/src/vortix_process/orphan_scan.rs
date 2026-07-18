@@ -56,6 +56,19 @@ pub fn scan_orphans() -> Vec<OrphanProcess> {
     parse_ps_output(&stdout)
 }
 
+/// Drop scanned processes whose PID is tracked by a live vortix session
+/// (e.g. an `openvpn --daemon` recorded in a profile's `run/<name>.pid`).
+/// Without this filter every vortix invocation flags its own active
+/// tunnel as an orphan — the daemon reparents to init, so a bare process
+/// scan cannot tell "mine" from "leftover".
+#[must_use]
+pub fn filter_untracked(orphans: Vec<OrphanProcess>, tracked_pids: &[u32]) -> Vec<OrphanProcess> {
+    orphans
+        .into_iter()
+        .filter(|o| !tracked_pids.contains(&o.pid))
+        .collect()
+}
+
 fn parse_ps_output(stdout: &str) -> Vec<OrphanProcess> {
     let mut out = Vec::new();
     for line in stdout.lines() {
@@ -163,5 +176,30 @@ mod tests {
         // ps returned an error, etc.). The test's job is to lock in
         // the no-panic contract that main.rs depends on.
         let _ = scan_orphans();
+    }
+
+    fn orphan(pid: u32) -> OrphanProcess {
+        OrphanProcess {
+            pid,
+            command: "openvpn".into(),
+        }
+    }
+
+    #[test]
+    fn filter_untracked_drops_tracked_pids() {
+        let got = filter_untracked(vec![orphan(100), orphan(200), orphan(300)], &[200]);
+        assert_eq!(got, vec![orphan(100), orphan(300)]);
+    }
+
+    #[test]
+    fn filter_untracked_keeps_all_when_nothing_tracked() {
+        let got = filter_untracked(vec![orphan(100)], &[]);
+        assert_eq!(got, vec![orphan(100)]);
+    }
+
+    #[test]
+    fn filter_untracked_empty_when_all_tracked() {
+        let got = filter_untracked(vec![orphan(100), orphan(200)], &[100, 200]);
+        assert_eq!(got, Vec::new());
     }
 }

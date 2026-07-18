@@ -6,7 +6,15 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **`vortix up` is now truly idempotent.** Re-running `up` for an already-connected profile prints `Already connected` and exits 0 instead of re-spawning the tunnel. Previously a second `up` of an OpenVPN profile spawned a duplicate daemon whose `--writepid` clobbered the first's pidfile, leaving the original daemon untracked.
+- **No more spurious orphan warnings for live tunnels.** The startup orphan scan now excludes PIDs recorded in profile pidfiles (`run/<name>.pid`), so `vortix down` / `status` no longer flags the active session's own `openvpn` daemon as a "possible orphan from a previous session."
+- **Concurrent `up`/`down`/`reconnect` invocations are serialized** via a `flock` lifecycle lock in the config dir. Two terminals racing the same mutation now queue instead of interleaving; the second prints a one-line "waiting…" note.
+- **OpenVPN double-spawn guard** at the tunnel layer: `up()` refuses when the profile's pidfile records a live daemon (covers the mid-negotiation window the scanner can't see).
 - WireGuard connect on a Linux host with IPv6 disabled no longer fails mid-way inside `wg-quick` with a raw `RTNETLINK answers: Operation not supported` dump ([#242](https://github.com/Harry-kp/vortix/issues/242)). When the profile's `Address` line declares an IPv6 entry but kernel IPv6 is off (sysctl `disable_ipv6=1` or `ipv6.disable=1` boot param), both the TUI and CLI now refuse pre-flight with an actionable message: re-enable IPv6 via sysctl, or remove the IPv6 entry from the profile. The profile is never rewritten silently.
+
+### Changed
+
+- README now documents the kill-switch **reboot boundary**: firewall rules do not survive an OS reboot, so `vpn-only` is unenforced between boot and the next vortix launch. (Persistence across reboot is tracked separately.)
 
 ## [0.4.2] - 2026-06-16
 
