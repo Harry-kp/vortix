@@ -8,12 +8,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::tunnel::TunnelKind;
+use crate::vortix_core::engine::input::UserCommand;
 use crate::vortix_core::engine::registry_handle::RegistryHandle;
 use crate::vortix_core::engine::EngineHandle;
 use crate::vortix_core::ipc::{
     decode_frame, encode_frame, FrameError, IpcError, IpcOp, IpcRequest, IpcResponse, IpcResult,
     IPC_PROTOCOL_VERSION,
 };
+use crate::vortix_core::profile::ProfileId;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
@@ -317,6 +319,52 @@ fn get_peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
 /// into a streaming event channel is follow-up scope (the wire contract
 /// reserves it). For now clients can correlate the `Subscribed` ack and
 /// then poll `Snapshot` until the streaming half lands.
+/// Longest profile id the daemon will act on. Generous for real names,
+/// tight enough to bound any path the resolver derives from it.
+const MAX_PROFILE_ID_LEN: usize = 64;
+
+/// Reject a malformed profile identifier at the daemon boundary. The
+/// daemon is a privilege boundary (plan 2026-07-18-001 U3 / R10): a
+/// client-supplied id flows into the config resolver, which builds a
+/// filesystem path from it, so a traversal id like `../../etc/passwd`
+/// must never reach the engine. We reject (not sanitize) — silently
+/// rewriting an id could map an attacker's input onto a real profile.
+fn validate_profile_id(id: &ProfileId) -> Result<(), IpcError> {
+    let s = id.as_str();
+    if s.is_empty() || s.len() > MAX_PROFILE_ID_LEN {
+        return Err(IpcError::MalformedRequest(format!(
+            "profile id must be 1..={MAX_PROFILE_ID_LEN} characters"
+        )));
+    }
+    if s.contains("..") {
+        return Err(IpcError::MalformedRequest(
+            "profile id must not contain '..'".into(),
+        ));
+    }
+    if !s
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return Err(IpcError::MalformedRequest(
+            "profile id may only contain [A-Za-z0-9._-]".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate every profile id a command carries before it executes.
+fn validate_execute(cmd: &UserCommand) -> Result<(), IpcError> {
+    match cmd {
+        UserCommand::Connect { profile_id } => validate_profile_id(profile_id),
+        UserCommand::Disconnect { profile_id }
+        | UserCommand::Reconnect { profile_id }
+        | UserCommand::ForceDisconnect { profile_id } => {
+            profile_id.as_ref().map_or(Ok(()), validate_profile_id)
+        }
+        UserCommand::UserAnswered { .. } => Ok(()),
+    }
+}
+
 async fn dispatch(
     req: IpcRequest,
     engine_handle: Option<&EngineHandle>,
@@ -337,9 +385,12 @@ async fn dispatch(
     }
     let result = match req.op {
         IpcOp::Execute(cmd) => match engine_handle {
-            Some(h) => match h.execute_command(cmd).await {
-                Ok(_ack) => Ok(IpcResult::Accepted),
-                Err(e) => Err(IpcError::Internal(format!("engine error: {e}"))),
+            Some(h) => match validate_execute(&cmd) {
+                Ok(()) => match h.execute_command(cmd).await {
+                    Ok(_ack) => Ok(IpcResult::Accepted),
+                    Err(e) => Err(IpcError::Internal(format!("engine error: {e}"))),
+                },
+                Err(e) => Err(e),
             },
             None => Err(IpcError::Internal(
                 "engine handle not initialized in daemon".into(),
@@ -550,6 +601,63 @@ mod tests {
         };
         let resp = dispatch(req, Some(&handle), None).await;
         assert!(matches!(resp.result, Ok(IpcResult::Accepted)));
+    }
+
+    #[test]
+    fn validate_profile_id_accepts_realistic_names() {
+        let sixty_four = "x".repeat(64);
+        for ok in ["corp", "us-east.1", "home_vpn", "a", sixty_four.as_str()] {
+            assert!(
+                validate_profile_id(&ProfileId::new(ok)).is_ok(),
+                "expected {ok:?} to be valid"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_profile_id_rejects_traversal_and_separators() {
+        let sixty_five = "x".repeat(65);
+        for bad in [
+            "",
+            "../../etc/passwd",
+            "a/b",
+            "a..b",
+            "with space",
+            "semi;colon",
+            sixty_five.as_str(),
+        ] {
+            assert!(
+                matches!(
+                    validate_profile_id(&ProfileId::new(bad)),
+                    Err(IpcError::MalformedRequest(_))
+                ),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_execute_allows_none_targets_and_checks_some() {
+        assert!(validate_execute(&UserCommand::Disconnect { profile_id: None }).is_ok());
+        assert!(validate_execute(&UserCommand::Reconnect { profile_id: None }).is_ok());
+        assert!(validate_execute(&UserCommand::Disconnect {
+            profile_id: Some(ProfileId::new("../escape")),
+        })
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn dispatch_rejects_execute_with_traversal_profile_id() {
+        let handle = EngineHandle::for_test();
+        let req = IpcRequest {
+            id: 42,
+            protocol_version: IPC_PROTOCOL_VERSION,
+            op: IpcOp::Execute(UserCommand::Connect {
+                profile_id: ProfileId::new("../../etc/passwd"),
+            }),
+        };
+        let resp = dispatch(req, Some(&handle), None).await;
+        assert!(matches!(resp.result, Err(IpcError::MalformedRequest(_))));
     }
 
     #[tokio::test]
