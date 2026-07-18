@@ -508,7 +508,14 @@ fn handle_up(
         ) {
             // Daemon vanished mid-command — fall through to the local path.
             None => {}
-            Some(crate::vortix_core::engine::state::Connection::Connected { .. }) => {
+            // Success ONLY when the daemon reports Connected to the
+            // profile we asked for. A single-FSM daemon that is already
+            // Connected to a *different* profile no-ops our Connect and
+            // returns that other profile's state — matching bare
+            // `Connected { .. }` here would falsely claim success.
+            Some(crate::vortix_core::engine::state::Connection::Connected {
+                profile_id, ..
+            }) if profile_id.as_str() == profile_name => {
                 match mode {
                     OutputMode::Human => {
                         println!("● Connected to {profile_name} ({protocol})");
@@ -968,22 +975,54 @@ fn handle_down(
         } else {
             crate::vortix_core::engine::input::UserCommand::Disconnect { profile_id }
         };
-        // Disconnect isn't ambiguous the way connect is — once the FSM
-        // processes it the tunnel is torn down — so we render the target
-        // set the client discovered regardless of the resulting state.
         if daemon_execute(&socket, cmd, mode, "down").is_some() {
-            let names: Vec<String> = targets.iter().map(|s| s.name.clone()).collect();
+            // The single-FSM daemon can't reliably target a specific
+            // profile (its Disconnect ignores the profile_id), so DON'T
+            // trust the requested target set — verify against the kernel.
+            // Re-scan and report only the requested tunnels that actually
+            // went away; a request that tore down nothing is an error, not
+            // a false "disconnected".
+            let still_active: std::collections::HashSet<String> =
+                crate::core::scanner::get_active_profiles(&engine.profiles)
+                    .into_iter()
+                    .map(|s| s.name)
+                    .collect();
+            let disconnected: Vec<String> = targets
+                .iter()
+                .map(|s| s.name.clone())
+                .filter(|n| !still_active.contains(n))
+                .collect();
+
+            if disconnected.is_empty() {
+                let requested: Vec<&str> = targets.iter().map(|s| s.name.as_str()).collect();
+                print_error_and_exit(
+                    mode,
+                    "down",
+                    CliError {
+                        code: "disconnect_failed",
+                        message: format!(
+                            "daemon did not tear down {}; it may be managing a different tunnel",
+                            requested.join(", ")
+                        ),
+                        hint: Some(
+                            "Check `vortix status`; multi-tunnel teardown through the daemon is limited today.".into(),
+                        ),
+                    },
+                    ExitCode::GeneralError,
+                );
+            }
+
             let data = DownData {
                 state: "disconnected".into(),
-                disconnected: names.clone(),
+                disconnected: disconnected.clone(),
             };
             match mode {
                 OutputMode::Human => {
-                    if names.len() == 1 {
-                        println!("Disconnected {}", names[0]);
+                    if disconnected.len() == 1 {
+                        println!("Disconnected {}", disconnected[0]);
                     } else {
-                        println!("Disconnected {} tunnels:", names.len());
-                        for name in &names {
+                        println!("Disconnected {} tunnels:", disconnected.len());
+                        for name in &disconnected {
                             println!("  - {name}");
                         }
                     }
@@ -1108,14 +1147,21 @@ fn handle_reconnect(
         };
         match daemon_execute(&socket, cmd, mode, "reconnect") {
             None => {} // daemon unavailable — fall through to the local loop
-            Some(crate::vortix_core::engine::state::Connection::Connected { .. }) => {
-                let label = profile_filter.unwrap_or("all tunnels");
+            // Success only when the daemon reports Connected to the
+            // profile we asked for (or to whatever single tunnel it holds
+            // when no filter was given). Report the ACTUAL connected
+            // profile, never a blanket "all tunnels" the single FSM can't
+            // deliver.
+            Some(crate::vortix_core::engine::state::Connection::Connected {
+                profile_id, ..
+            }) if profile_filter.is_none() || profile_filter == Some(profile_id.as_str()) => {
+                let label = profile_id.as_str();
                 match mode {
                     OutputMode::Human => println!("Reconnected {label}"),
                     OutputMode::Json => print_success(
                         mode,
                         "reconnect",
-                        &serde_json::json!({ "state": "reconnected", "target": profile_filter }),
+                        &serde_json::json!({ "state": "reconnected", "target": label }),
                         vec!["vortix status --json".into()],
                     ),
                     OutputMode::Quiet => {}
@@ -1735,6 +1781,13 @@ fn daemon_connect_failure_message(
             }
             FailureReason::Other(e) => format!("Connection to '{profile}' failed: {e}"),
         },
+        // The daemon reports Connected to a DIFFERENT profile: its single
+        // FSM is already occupied, so our request no-op'd. Say so plainly
+        // rather than a vague "did not complete".
+        Connection::Connected { profile_id, .. } if profile_id.as_str() != profile => format!(
+            "daemon is currently managing '{}', not '{profile}' — multi-tunnel connect through the daemon isn't supported yet",
+            profile_id.as_str()
+        ),
         _ => format!("Connection to '{profile}' did not complete"),
     }
 }
