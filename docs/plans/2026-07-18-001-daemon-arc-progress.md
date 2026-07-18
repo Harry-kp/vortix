@@ -3,7 +3,32 @@
 Companion to `docs/plans/2026-07-18-001-feat-daemon-tunnel-ownership-plan.md`
 (the decision artifact — do **not** edit its body; state lives here + in git).
 
-**Last updated:** 2026-07-18 (session 2, cont.)
+**Last updated:** 2026-07-19 (session 2 — post-review fixes)
+
+## Code review (2026-07-19)
+
+Five independent reviewers (correctness, security, adversarial, reliability,
+testing) audited the arc. Headline finding: the U4 auto-reconnect was a
+false-success no-op (drove reconnects through the shared single-tunnel FSM,
+which never hears about drops → `Connect` no-op'd → verified against its own
+stale snapshot). All correctly-raised findings are now fixed (commits
+`f5513da`→`0d484de`):
+
+- **F1/F2** auto-reconnect now uses a fresh per-profile engine + scanner-
+  confirmed success; multi-tunnel-independent.
+- **F3/F4** daemon `up`/`down`/`reconnect` report honestly (profile-matched
+  success; `down` re-scans and reports only what actually went away).
+- **Security P1** client refuses a foreign-owned socket (fake-daemon spoof).
+- **Reliability** Execute-timeout no longer double-connects; subscribe idle
+  leak reaped via heartbeat; accept idle timeout; SIGTERM graceful shutdown +
+  socket cleanup; `MissedTickBehavior::Skip`; bounded scan.
+- **Tests** supervisor scheduling (pure) + no-daemon `down` idempotency.
+
+**Still architecturally deferred (per-profile "registry of engines"):**
+genuinely *targeting* an arbitrary tunnel for daemon-routed `down B`/`up B`
+in a multi-tunnel session (the single FSM can't); today those report honest
+failure instead of acting on the wrong tunnel. Kill-switch-on-drop and the
+TUI cutover remain (need live iteration).
 
 ## Where it lives
 
@@ -11,10 +36,11 @@ Companion to `docs/plans/2026-07-18-001-feat-daemon-tunnel-ownership-plan.md`
 - **Branch:** `origin/feat/daemon-u1-remote-handle` (PR head). The local
   mirror `tmp-daemon-arc` is identical to it. **The local branch
   `feat/daemon-u1-remote-handle` is STALE** (ahead 2 / behind 12) — ignore it.
-- **HEAD:** `d667ea3` — U1–U3 complete + U4 core (adoption, boot, headless
-  auto-reconnect, event streaming, R7 startup adoption). The daemon owns
-  tunnels, serves multi-tunnel state, streams events, and executes writes
-  no-sudo. Remaining: TUI cutover, kill-switch-on-drop, U5 boot, U6 closure.
+- **HEAD:** `0d484de` — U1–U3 complete + U4 core + **all code-review fixes**
+  (see the review section below). The daemon owns tunnels, serves multi-tunnel
+  state, streams events, executes writes no-sudo, and auto-reconnects
+  correctly. Remaining: TUI cutover, kill-switch-on-drop, per-profile targeted
+  writes, U5 boot, U6 closure.
 - **Do NOT merge** until the already-shipped fixes are released. User decision:
   release existing work first, daemon PRs merge after. (Independent of PR #252,
   the release-notes workflow.)
