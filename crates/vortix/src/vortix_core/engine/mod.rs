@@ -13,6 +13,7 @@ pub mod fsm;
 pub mod handle;
 pub mod input;
 pub mod registry;
+pub mod registry_handle;
 pub mod state;
 
 pub use error::EngineError;
