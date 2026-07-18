@@ -14,7 +14,7 @@
 
 mod killswitch;
 mod profile;
-mod retry;
+pub mod retry;
 mod ui;
 
 // Re-export all types for easy access

@@ -606,8 +606,7 @@ impl App {
                 .is_some_and(|r| r.auto_reconnect);
 
             if let Some(idx) = profile_idx.filter(|_| {
-                max_retries > 0
-                    && current_attempt < max_retries
+                crate::state::retry::has_retry_budget(max_retries, current_attempt)
                     && self.runtime.pending_connect.is_none()
             }) {
                 let attempt = current_attempt + 1;
@@ -620,11 +619,11 @@ impl App {
                     },
                 );
 
-                let base = self.runtime.config.connect_retry_base_delay_secs;
-                let shift = (attempt - 1).min(63);
-                let delay_secs = base
-                    .saturating_mul(1u64 << shift)
-                    .min(self.runtime.config.connect_retry_max_delay_secs);
+                let delay_secs = crate::state::retry::backoff_delay_secs(
+                    self.runtime.config.connect_retry_base_delay_secs,
+                    self.runtime.config.connect_retry_max_delay_secs,
+                    attempt,
+                );
 
                 self.log(&format!(
                     "RETRY: Attempt {attempt}/{max_retries} for '{profile}' in {delay_secs}s..."
