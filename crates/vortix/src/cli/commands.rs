@@ -341,7 +341,7 @@ fn handle_up(
     // registry conflict-check into the CLI path, this flag will gate
     // the bypass.
     let _ = yes;
-    let _lifecycle_lock = crate::utils::acquire_lifecycle_lock();
+    let _lifecycle_lock = acquire_lifecycle_lock_or_exit(mode, "up");
     let mut engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
 
     let profile_name = if let Some(name) = profile {
@@ -666,6 +666,25 @@ fn handle_up(
 /// same set of takeovers. The route-overlap branch is a CLI-only
 /// superset until R10 v2 brings route-overlap detection into the
 /// registry.
+/// Acquire the cross-process lifecycle lock or exit with a structured
+/// error. Proceeding without the lock would reintroduce the concurrent
+/// `up`/`down` interleaving the lock exists to prevent.
+fn acquire_lifecycle_lock_or_exit(mode: OutputMode, command: &str) -> std::fs::File {
+    match crate::utils::acquire_lifecycle_lock() {
+        Ok(file) => file,
+        Err(e) => print_error_and_exit(
+            mode,
+            command,
+            CliError {
+                code: "lock_failed",
+                message: format!("Could not acquire the vortix lifecycle lock: {e}"),
+                hint: Some("Check permissions on the vortix config directory.".into()),
+            },
+            ExitCode::GeneralError,
+        ),
+    }
+}
+
 fn detect_conflict_for_cli(
     engine: &VpnRuntime,
     target_name: &str,
@@ -731,7 +750,7 @@ fn handle_down(
     mode: OutputMode,
 ) -> i32 {
     let _ = all; // `--all` is the explicit form of the no-profile case (already the default).
-    let _lifecycle_lock = crate::utils::acquire_lifecycle_lock();
+    let _lifecycle_lock = acquire_lifecycle_lock_or_exit(mode, "down");
     let mut engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
 
     // NotFound (exit 3) takes precedence over idempotence: a typo'd
@@ -841,7 +860,7 @@ fn handle_reconnect(
     config_dir: &Path,
     mode: OutputMode,
 ) -> i32 {
-    let _lifecycle_lock = crate::utils::acquire_lifecycle_lock();
+    let _lifecycle_lock = acquire_lifecycle_lock_or_exit(mode, "reconnect");
     let mut engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
     engine.load_metadata();
 

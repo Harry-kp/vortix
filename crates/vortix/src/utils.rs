@@ -253,6 +253,26 @@ pub fn get_openvpn_run_paths(
     Ok((pid_path, log_path))
 }
 
+/// PIDs recorded in `<config_dir>/run/*.pid` — the `OpenVPN` daemons a
+/// vortix session is tracking. Reads only the run dir (no profile
+/// parsing), so it's cheap enough for the startup orphan scan.
+#[must_use]
+pub fn tracked_openvpn_pids() -> Vec<u32> {
+    let Ok(root) = get_app_config_dir() else {
+        return Vec::new();
+    };
+    let run_dir = root.join(crate::constants::OPENVPN_RUN_DIR);
+    let Ok(entries) = std::fs::read_dir(run_dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(std::result::Result::ok)
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "pid"))
+        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .filter_map(|content| content.trim().parse::<u32>().ok())
+        .collect()
+}
+
 /// Cleans up `OpenVPN` runtime files (pid, log) for a given profile.
 pub fn cleanup_openvpn_run_files(profile_name: &str) {
     if let Ok((pid_path, log_path)) = get_openvpn_run_paths(profile_name) {
@@ -1045,6 +1065,10 @@ pub(crate) fn host_ipv6_disabled() -> bool {
 /// The lock is held for the returned `File`'s lifetime and released by
 /// the OS on process exit — safe across `std::process::exit` paths.
 /// Blocks (with a stderr note) when another invocation holds the lock.
+///
+/// Unix-only mutual exclusion: the non-Unix build opens the lockfile
+/// without locking (a placeholder — vortix tunnels are unsupported on
+/// Windows, so there is no lifecycle to serialize there yet).
 #[cfg(unix)]
 pub fn acquire_lifecycle_lock() -> std::io::Result<std::fs::File> {
     use std::os::unix::io::AsRawFd;
