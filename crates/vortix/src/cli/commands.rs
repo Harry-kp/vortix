@@ -243,6 +243,7 @@ fn handle_audit(pid_filter: Option<u32>, vpn_only: bool, mode: OutputMode) -> i3
 
 /// `vortix daemon` — host the engine as a long-running IPC server
 /// (plan 015 phase D / plan 010).
+#[allow(clippy::too_many_lines)]
 fn handle_daemon(socket_override: Option<std::path::PathBuf>, mode: OutputMode) -> i32 {
     let socket_path = socket_override.unwrap_or_else(crate::daemon::default_socket_path);
 
@@ -325,6 +326,31 @@ fn handle_daemon(socket_override: Option<std::path::PathBuf>, mode: OutputMode) 
         )
     });
     let server = server.with_registry_handle(registry.clone());
+
+    // R7: adopt already-running tunnels ONCE before serving, so the first
+    // snapshot a client reads includes restart-survivors (a daemon restart
+    // issues zero connect commands — the tunnels were never torn down).
+    // The periodic supervisor keeps them fresh afterward.
+    runtime.block_on(async {
+        let sessions = tokio::task::spawn_blocking(|| {
+            let profiles = crate::vpn::load_profiles();
+            crate::core::scanner::get_active_profiles(&profiles)
+        })
+        .await
+        .unwrap_or_default();
+        let view = crate::daemon::supervisor::ScannerView {
+            sessions: sessions
+                .iter()
+                .map(crate::daemon::supervisor::ScannedSession::from)
+                .collect(),
+        };
+        let _ = crate::daemon::supervisor::reconcile_tick(
+            &registry,
+            view,
+            constants::DEFAULT_DISCONNECT_TIMEOUT,
+        )
+        .await;
+    });
 
     // Retry/cadence knobs from config so the daemon and TUI behave alike.
     let cfg = crate::utils::get_app_config_dir()
