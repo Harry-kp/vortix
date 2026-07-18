@@ -43,6 +43,10 @@ pub enum ClientError {
     /// Peer speaks a different IPC protocol version. Loud by contract
     /// (AE8) — callers must not fold this into the silent bypass path.
     VersionMismatch { daemon: u32, client: u32 },
+    /// The connection was made but the daemon didn't answer within the
+    /// read deadline — present but slow. Kept distinct from `Io` so a
+    /// write caller doesn't fall through to a second local attempt.
+    Timeout(String),
 }
 
 impl std::fmt::Display for ClientError {
@@ -56,6 +60,7 @@ impl std::fmt::Display for ClientError {
                 f,
                 "IPC protocol mismatch: daemon speaks v{daemon}, client speaks v{client}"
             ),
+            Self::Timeout(s) => write!(f, "daemon read timeout: {s}"),
         }
     }
 }
@@ -128,7 +133,22 @@ pub fn request(socket_path: &Path, op: IpcOp) -> Result<IpcResult, ClientError> 
         if let Some((resp, _consumed)) = decode_frame::<IpcResponse>(&buf)? {
             break resp;
         }
-        let n = stream.read(&mut chunk)?;
+        let n = match stream.read(&mut chunk) {
+            Ok(n) => n,
+            // A `set_read_timeout` deadline elapses as WouldBlock (Unix)
+            // or TimedOut — the daemon is connected but slow, NOT gone.
+            // Surface it as a distinct Timeout so a write caller doesn't
+            // fall through to a second local attempt.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err(ClientError::Timeout(e.to_string()));
+            }
+            Err(e) => return Err(ClientError::Io(e)),
+        };
         if n == 0 {
             return Err(ClientError::Io(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -184,6 +204,7 @@ impl IpcTransport for UnixTransport {
             ClientError::Frame(f) => TransportError::Protocol(f.to_string()),
             ClientError::Daemon(d) => TransportError::Protocol(d.to_string()),
             ClientError::Unexpected(s) => TransportError::Protocol(s),
+            ClientError::Timeout(s) => TransportError::Timeout(s),
         })
     }
 
@@ -196,6 +217,7 @@ impl IpcTransport for UnixTransport {
             ClientError::Frame(f) => TransportError::Protocol(f.to_string()),
             ClientError::Daemon(d) => TransportError::Protocol(d.to_string()),
             ClientError::Unexpected(s) => TransportError::Protocol(s),
+            ClientError::Timeout(s) => TransportError::Timeout(s),
         })
     }
 }
@@ -277,11 +299,22 @@ fn forward_events(stream: &mut UnixStream, carry: Vec<u8>, tx: &broadcast::Sende
             match decode_frame::<IpcResponse>(&buf) {
                 Ok(Some((resp, consumed))) => {
                     buf.drain(..consumed);
-                    if let Ok(IpcResult::Event(event)) = resp.result {
-                        // Send failing means no receivers remain — stop.
-                        if tx.send(event).is_err() {
-                            return;
+                    match resp.result {
+                        Ok(IpcResult::Event(event)) => {
+                            // Send failing means no receivers remain — stop.
+                            if tx.send(event).is_err() {
+                                return;
+                            }
                         }
+                        // A heartbeat carries no event; use it as a chance
+                        // to reap this thread if the caller dropped the
+                        // receiver (otherwise it would park on the next read).
+                        Ok(IpcResult::Heartbeat) => {
+                            if tx.receiver_count() == 0 {
+                                return;
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 Ok(None) => break,

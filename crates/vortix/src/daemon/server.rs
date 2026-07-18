@@ -209,9 +209,24 @@ async fn handle_client(
     let mut buf = Vec::with_capacity(4096);
     let mut read_pos = 0usize;
     loop {
-        // Read into buf.
+        // Read into buf, bounded by an idle deadline so a client that
+        // connects (passing the UID gate) but never sends a full frame
+        // can't park this per-connection task + fd forever. One-shot
+        // command clients send immediately; a subscriber's connection is
+        // handed to stream_events before it can idle here.
         let mut chunk = [0u8; 4096];
-        let n = stream.read(&mut chunk).await?;
+        let n = match tokio::time::timeout(
+            std::time::Duration::from_secs(CLIENT_IDLE_TIMEOUT_SECS),
+            stream.read(&mut chunk),
+        )
+        .await
+        {
+            Ok(r) => r?,
+            Err(_elapsed) => {
+                tracing::debug!("client idle past deadline; closing connection");
+                return Ok(());
+            }
+        };
         if n == 0 {
             // EOF — client closed.
             return Ok(());
@@ -271,23 +286,36 @@ async fn stream_events(
             return Ok(());
         }
     };
+    // On an idle stream `receiver.recv()` parks forever, so a client that
+    // silently disconnects would leak this task + fd until the next event
+    // (maybe never). A periodic heartbeat write turns that broken pipe
+    // into an observable write error, reaping the connection promptly.
+    // `interval_at` (not `interval`) so the first tick is a full period
+    // out — a heartbeat at t=0 would be a pointless immediate frame ahead
+    // of any real event.
+    let period = std::time::Duration::from_secs(SUBSCRIBE_HEARTBEAT_SECS);
+    let mut heartbeat = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        match receiver.recv().await {
-            Ok(event) => {
-                let resp = IpcResponse {
-                    id: 0,
-                    protocol_version: IPC_PROTOCOL_VERSION,
-                    result: Ok(IpcResult::Event(event)),
-                };
-                let frame = encode_frame(&resp).map_err(DaemonError::Frame)?;
-                if stream.write_all(&frame).await.is_err() {
-                    return Ok(()); // client disconnected
+        let result = tokio::select! {
+            recv = receiver.recv() => match recv {
+                Ok(event) => Ok(IpcResult::Event(event)),
+                Err(RecvError::Lagged(n)) => {
+                    tracing::debug!(dropped = n, "subscribe: slow client lagged");
+                    continue;
                 }
-            }
-            Err(RecvError::Lagged(n)) => {
-                tracing::debug!(dropped = n, "subscribe: slow client lagged");
-            }
-            Err(RecvError::Closed) => return Ok(()),
+                Err(RecvError::Closed) => return Ok(()),
+            },
+            _ = heartbeat.tick() => Ok(IpcResult::Heartbeat),
+        };
+        let resp = IpcResponse {
+            id: 0,
+            protocol_version: IPC_PROTOCOL_VERSION,
+            result,
+        };
+        let frame = encode_frame(&resp).map_err(DaemonError::Frame)?;
+        if stream.write_all(&frame).await.is_err() {
+            return Ok(()); // client disconnected
         }
     }
 }
@@ -374,6 +402,16 @@ fn get_peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
 /// Longest profile id the daemon will act on. Generous for real names,
 /// tight enough to bound any path the resolver derives from it.
 const MAX_PROFILE_ID_LEN: usize = 64;
+
+/// How often an idle subscription stream emits a keep-alive so a dead
+/// subscriber is reaped promptly rather than lingering until the next
+/// real event.
+const SUBSCRIBE_HEARTBEAT_SECS: u64 = 15;
+
+/// Idle deadline for a connected client that hasn't completed a request
+/// frame. Bounds a silent/half-frame connection so it can't park its
+/// per-connection task and fd indefinitely.
+const CLIENT_IDLE_TIMEOUT_SECS: u64 = 30;
 
 /// Reject a malformed profile identifier at the daemon boundary. The
 /// daemon is a privilege boundary (plan 2026-07-18-001 U3 / R10): a
@@ -789,13 +827,17 @@ mod tests {
                 }
             }
         }
-        // Read exactly one framed IpcResponse (events arrive ~100ms after
-        // the ack, so nothing is glued to a prior frame here).
+        // Read one framed IpcResponse, skipping keep-alive heartbeats
+        // (a real client ignores them too).
         async fn read_resp(stream: &mut TokioUnixStream) -> IpcResponse {
             let mut buf = Vec::new();
             let mut chunk = [0u8; 4096];
             loop {
-                if let Some((resp, _)) = decode_frame::<IpcResponse>(&buf).expect("decode") {
+                if let Some((resp, consumed)) = decode_frame::<IpcResponse>(&buf).expect("decode") {
+                    buf.drain(..consumed);
+                    if matches!(resp.result, Ok(IpcResult::Heartbeat)) {
+                        continue;
+                    }
                     return resp;
                 }
                 let n = stream.read(&mut chunk).await.expect("read");

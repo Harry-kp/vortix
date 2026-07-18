@@ -243,6 +243,31 @@ fn handle_audit(pid_filter: Option<u32>, vpn_only: bool, mode: OutputMode) -> i3
 
 /// `vortix daemon` — host the engine as a long-running IPC server
 /// (plan 015 phase D / plan 010).
+/// Resolve when the daemon should shut down: SIGTERM (systemd/launchd
+/// stop) or Ctrl-C (foreground run).
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            // If the SIGTERM handler can't be installed, fall back to Ctrl-C.
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn handle_daemon(socket_override: Option<std::path::PathBuf>, mode: OutputMode) -> i32 {
     let socket_path = socket_override.unwrap_or_else(crate::daemon::default_socket_path);
@@ -379,11 +404,24 @@ fn handle_daemon(socket_override: Option<std::path::PathBuf>, mode: OutputMode) 
         supervisor_config,
     ));
 
+    // Run the accept loop until it ends or a shutdown signal arrives, so
+    // SIGTERM/Ctrl-C stop the daemon cleanly and we can unlink the socket
+    // (there is no Drop unlink; bind() cleans a stale socket on next start,
+    // but a graceful stop shouldn't leave one behind).
+    let socket_for_cleanup = server.socket_path().to_path_buf();
     runtime.block_on(async {
-        if let Err(e) = server.run().await {
-            eprintln!("vortix daemon: accept loop terminated: {e}");
+        tokio::select! {
+            result = server.run() => {
+                if let Err(e) = result {
+                    eprintln!("vortix daemon: accept loop terminated: {e}");
+                }
+            }
+            () = shutdown_signal() => {
+                eprintln!("vortix daemon: shutdown signal received; exiting");
+            }
         }
     });
+    let _ = std::fs::remove_file(&socket_for_cleanup);
 
     0
 }
@@ -1521,7 +1559,8 @@ fn daemon_snapshot_via_remote(
     match runtime.block_on(remote.snapshot_remote()) {
         Ok(snapshot) => Ok(Some(snapshot.state)),
         Err(TransportError::VersionMismatch { daemon, client }) => Err((daemon, client)),
-        Err(TransportError::Unavailable(_)) => Ok(None),
+        // A read that's unavailable or slow just falls back to the scanner.
+        Err(TransportError::Unavailable(_) | TransportError::Timeout(_)) => Ok(None),
         Err(TransportError::Protocol(e)) => {
             tracing::warn!(error = %e, "daemon snapshot protocol failure; using scanner view");
             Ok(None)
@@ -1590,7 +1629,7 @@ fn daemon_registry_via_remote(
     match runtime.block_on(remote.registry_snapshot_remote()) {
         Ok(snapshot) => Ok(Some(snapshot)),
         Err(TransportError::VersionMismatch { daemon, client }) => Err((daemon, client)),
-        Err(TransportError::Unavailable(_)) => Ok(None),
+        Err(TransportError::Unavailable(_) | TransportError::Timeout(_)) => Ok(None),
         Err(TransportError::Protocol(e)) => {
             tracing::warn!(error = %e, "daemon registry snapshot unavailable; trying single-FSM snapshot");
             Ok(None)
@@ -1736,6 +1775,22 @@ fn daemon_execute(
             Some(state)
         }
         Err(TransportError::Unavailable(_)) => None,
+        // A timeout is NOT a fall-through: the daemon received the command
+        // and may still be executing it (a slow connect). Falling back to
+        // the local path here would double-act on the same profile. Exit
+        // loud and point the user at status instead.
+        Err(TransportError::Timeout(_)) => print_error_and_exit(
+            mode,
+            command,
+            CliError {
+                code: "daemon_timeout",
+                message: "the daemon accepted the command but did not report a result in time — it may still be working".into(),
+                hint: Some(
+                    "Check `vortix status`; do not retry blindly (the operation may still be in flight).".into(),
+                ),
+            },
+            ExitCode::Timeout,
+        ),
         Err(TransportError::VersionMismatch { daemon, client }) => {
             exit_daemon_version_mismatch(mode, command, daemon, client)
         }

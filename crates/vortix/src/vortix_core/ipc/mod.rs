@@ -110,6 +110,12 @@ pub enum IpcResult {
     /// 2026-07-18-001 U2). Only ever appears server→client on a
     /// subscribe stream, never as a request/response result.
     Event(EventEnvelope),
+    /// Periodic keep-alive on an idle subscription stream. Its only job
+    /// is to make a broken pipe observable: the daemon's write fails when
+    /// the subscriber is gone (reaping the server task/fd), and the client
+    /// reader wakes to check whether any receiver remains (reaping its
+    /// thread). Carries no data and is never forwarded as an event.
+    Heartbeat,
     /// `Shutdown` acknowledged; daemon will terminate after draining.
     ShuttingDown,
 }
@@ -184,10 +190,18 @@ pub trait IpcTransport: Send + Sync {
 /// mismatch = loud error).
 #[derive(Debug, Clone, Error)]
 pub enum TransportError {
-    /// The daemon is not reachable (connect refused, socket gone, EOF,
-    /// timeout). Callers fall back to the Local path silently.
+    /// The daemon is not reachable (connect refused, socket gone, EOF).
+    /// Callers fall back to the Local path silently.
     #[error("daemon unavailable: {0}")]
     Unavailable(String),
+    /// The connection was established but the daemon did not answer within
+    /// the read deadline — it is present but slow (e.g. mid-connect).
+    /// Distinct from [`Self::Unavailable`] so a WRITE caller does NOT fall
+    /// through to a second local attempt (which would double-act on the
+    /// same profile while the daemon is still processing the first); read
+    /// callers may still treat it as a silent bypass.
+    #[error("daemon did not respond in time: {0}")]
+    Timeout(String),
     /// Peer version differs — loud, never silently swallowed.
     #[error("IPC protocol mismatch: daemon speaks v{daemon}, client speaks v{client}")]
     VersionMismatch { daemon: u32, client: u32 },
