@@ -3,7 +3,35 @@
 Companion to `docs/plans/2026-07-19-001-feat-daemon-single-source-of-truth-plan.md`
 (the current decision artifact — supersedes the 2026-07-18 phased plan — do **not** edit its body; state lives here + in git).
 
-**Last updated:** 2026-07-19 (session 2 — post-review fixes)
+**Last updated:** 2026-07-19 (North Star re-architecture underway)
+
+## North Star re-architecture (active plan: `2026-07-19-001-...-single-source-of-truth-plan.md`)
+
+Goal: daemon owns ALL state (a registry of per-profile engines) = single
+source of truth; CLI/TUI/GUI are thin clients; always in sync; persistent.
+Four scenarios (S1 persistence-across-exit, S2 instant attach, S3 bidirectional
+sync, S4 many-clients-one-state) are the acceptance tests.
+
+**Done — P1 foundation (`39354d2`):** `TunnelRegistry` already has per-profile
+`connect`/`disconnect`/`reconnect` (each drives that entry's own engine).
+`RegistryHandle` now exposes them as async commands over its serialized owner
+task (+ tests). `daemon::build_engine` / `connect_allowed_ips` extracted for the
+dispatch to call.
+
+**NEXT increment (resume here) — P1 dispatch rewrite (task #18):** route the
+daemon IPC `Execute` through `RegistryHandle::{connect,disconnect,reconnect}`
+(using `build_engine` + `connect_allowed_ips`), route `Snapshot` from the
+registry primary, keep `Subscribe` on the shared global journal (all per-profile
+engines write to it), and **retire the daemon's shared single `EngineHandle`'s
+Execute/Snapshot role**. This is ATOMIC — Execute and Snapshot must move to the
+registry together or they diverge. Touches `daemon/server.rs` (dispatch + struct
++ ~6 execute tests), `handle_daemon` boot. Map `RegistryError::Conflict` →
+`IpcError::Conflict`.
+
+**Then:** P1 adoption-real-engine (task #19) → P2 owner auth (#20) → P4 TUI
+cutover (#21, delivers S2/S3/S4, needs live) → P5 boot service (#22) → P6
+closure (#23). See the plan for full detail. All review fixes from earlier this
+session remain and fold into these phases.
 
 ## Code review (2026-07-19)
 
