@@ -1032,59 +1032,73 @@ fn handle_status(
     let engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
     let mut snap = engine.scan_status();
     // When the daemon socket is connectable, overlay its authoritative
-    // view of the FSM onto the scanner-derived snapshot via the
-    // EngineHandle::Remote seam (plan 2026-07-18-001 U1). The scanner
-    // still owns live counters and kill-switch state. Failure handling
-    // is deliberately split: unavailable/protocol errors keep the
-    // scanner-only view silently (bypass-on-error keeps `vortix status`
-    // reliable), but a version mismatch is a loud typed exit — silent
-    // fallback there would mask a real client/daemon skew (AE8).
+    // view onto the scanner-derived snapshot via the EngineHandle::Remote
+    // seam. Prefer the full multi-tunnel registry snapshot (U2); fall back
+    // to the single-FSM snapshot (U1) for an older daemon that doesn't
+    // serve a registry. The scanner still owns live counters and
+    // kill-switch state. Failure handling is deliberately split:
+    // unavailable/protocol errors keep the scanner view silently
+    // (bypass-on-error keeps `vortix status` reliable), but a version
+    // mismatch is a loud typed exit — silent fallback there would mask a
+    // real client/daemon skew (AE8).
+    let mut daemon_registry: Option<crate::vortix_core::engine::registry_handle::RegistrySnapshot> =
+        None;
     if let Some(socket) = daemon_socket {
-        match daemon_snapshot_via_remote(&socket) {
-            Ok(Some(state)) => overlay_daemon_state(&mut snap, &state),
-            Ok(None) => {}
-            Err((daemon, client)) => {
-                print_error_and_exit(
-                    mode,
-                    "status",
-                    CliError {
-                        code: "daemon_version_mismatch",
-                        message: format!(
-                            "daemon speaks IPC protocol v{daemon}, this vortix speaks v{client} — upgrade the older binary so both match"
-                        ),
-                        hint: Some(
-                            "Restart the daemon after upgrading (sudo systemctl restart vortix-daemon, or relaunch `vortix daemon`).".into(),
-                        ),
-                    },
-                    ExitCode::GeneralError,
-                );
+        match daemon_registry_via_remote(&socket) {
+            Ok(Some(reg)) => {
+                // Reflect the daemon's primary onto the scanner snapshot so
+                // the human summary + network block follow the daemon's view.
+                match reg.primary.as_ref().and_then(|id| {
+                    reg.tunnels
+                        .iter()
+                        .find(|t| &t.profile_id == id)
+                        .map(|t| &t.state)
+                }) {
+                    Some(state) => overlay_daemon_state(&mut snap, state),
+                    None => overlay_daemon_state(
+                        &mut snap,
+                        &crate::vortix_core::engine::state::Connection::Disconnected {
+                            last_failure: None,
+                        },
+                    ),
+                }
+                daemon_registry = Some(reg);
             }
+            Ok(None) => match daemon_snapshot_via_remote(&socket) {
+                Ok(Some(state)) => overlay_daemon_state(&mut snap, &state),
+                Ok(None) => {}
+                Err((daemon, client)) => exit_daemon_version_mismatch(mode, daemon, client),
+            },
+            Err((daemon, client)) => exit_daemon_version_mismatch(mode, daemon, client),
         }
     }
 
     let is_connected = snap.connection_state == "connected";
 
-    // U21 transitional shape: the registry-driven multi-tunnel snapshot
-    // lands in U22. Until then, "primary" is the single active tunnel
-    // (when connected), and `connections` is a one-element vec mirroring
-    // it. When disconnected, `connections` is empty and `primary` /
-    // `connection` are both `null`.
-    let primary_entry = if is_connected {
-        Some(ConnectionEntry {
-            state: snap.connection_state.clone(),
-            profile: snap.profile.clone(),
-            protocol: snap.protocol.clone(),
-            uptime_secs: snap.uptime_secs,
-        })
-    } else {
-        None
-    };
-    let connections: Vec<ConnectionEntry> = primary_entry.iter().cloned().collect();
-    let primary: Option<String> = if is_connected {
-        snap.profile.clone()
-    } else {
-        None
-    };
+    // `connections[]` + `primary` come from the daemon registry when
+    // present (full multi-tunnel view); otherwise they mirror the
+    // scanner's single active tunnel. `connection` stays the primary
+    // entry for v1 back-compat.
+    let (connections, primary): (Vec<ConnectionEntry>, Option<String>) =
+        if let Some(reg) = &daemon_registry {
+            registry_status_entries(reg, snap.protocol.as_deref())
+        } else if is_connected {
+            let entry = ConnectionEntry {
+                state: snap.connection_state.clone(),
+                profile: snap.profile.clone(),
+                protocol: snap.protocol.clone(),
+                uptime_secs: snap.uptime_secs,
+            };
+            (vec![entry], snap.profile.clone())
+        } else {
+            (Vec::new(), None)
+        };
+    let primary_entry: Option<ConnectionEntry> = primary.as_deref().and_then(|p| {
+        connections
+            .iter()
+            .find(|c| c.profile.as_deref() == Some(p))
+            .cloned()
+    });
 
     let data = StatusData {
         connections,
@@ -1253,6 +1267,130 @@ fn overlay_daemon_state(
             }
         }
     }
+}
+
+/// Fetch the daemon's full multi-tunnel registry snapshot through
+/// `EngineHandle::Remote` (plan 2026-07-18-001 U2). Same tri-state
+/// contract as [`daemon_snapshot_via_remote`]: `Ok(Some)` on success,
+/// `Ok(None)` for silent-fallback degradations (unreachable, or an older
+/// daemon that doesn't serve a registry), and `Err((daemon, client))`
+/// for a version mismatch that must surface loudly.
+fn daemon_registry_via_remote(
+    socket: &Path,
+) -> Result<Option<crate::vortix_core::engine::registry_handle::RegistrySnapshot>, (u32, u32)> {
+    use crate::vortix_core::engine::handle::RemoteHandle;
+    use crate::vortix_core::ipc::TransportError;
+    use std::sync::Arc;
+
+    let Some(runtime) = crate::vortix_process::global_runner()
+        .as_real()
+        .map(|r| r.runtime().handle().clone())
+    else {
+        return Ok(None);
+    };
+
+    let transport = Arc::new(crate::daemon::client::UnixTransport::new(
+        socket.to_path_buf(),
+    ));
+    let remote = RemoteHandle::new(transport);
+    match runtime.block_on(remote.registry_snapshot_remote()) {
+        Ok(snapshot) => Ok(Some(snapshot)),
+        Err(TransportError::VersionMismatch { daemon, client }) => Err((daemon, client)),
+        Err(TransportError::Unavailable(_)) => Ok(None),
+        Err(TransportError::Protocol(e)) => {
+            tracing::warn!(error = %e, "daemon registry snapshot unavailable; trying single-FSM snapshot");
+            Ok(None)
+        }
+    }
+}
+
+/// The `connection_state` string vocabulary shared by the scanner
+/// snapshot and the daemon overlay.
+fn connection_state_label(state: &crate::vortix_core::engine::state::Connection) -> &'static str {
+    use crate::vortix_core::engine::state::Connection;
+    match state {
+        Connection::Disconnected { .. } => "disconnected",
+        Connection::Connecting { .. }
+        | Connection::Reconnecting { .. }
+        | Connection::AwaitingUserInput { .. } => "connecting",
+        Connection::Disconnecting { .. } => "disconnecting",
+        Connection::Connected { .. } => "connected",
+    }
+}
+
+/// Best-effort per-tunnel protocol from the interface name. Only a `wg`
+/// prefix is an unambiguous signal (`WireGuard`); `utun`/`tun` collide
+/// across protocols, so we report nothing rather than guess wrong.
+fn protocol_from_interface(interface: Option<&str>) -> Option<String> {
+    match interface {
+        Some(i) if i.starts_with("wg") => Some("wireguard".to_string()),
+        _ => None,
+    }
+}
+
+/// Seconds since a tunnel came up, from the FSM `since` when Connected,
+/// else the registry's `started_at`.
+fn tunnel_uptime_secs(t: &crate::vortix_core::engine::registry::TunnelSnapshot) -> Option<u64> {
+    use crate::vortix_core::engine::state::Connection;
+    let since = match &t.state {
+        Connection::Connected { since, .. } => Some(*since),
+        _ => t.started_at,
+    };
+    since
+        .and_then(|s| std::time::SystemTime::now().duration_since(s).ok())
+        .map(|d| d.as_secs())
+}
+
+/// Build the v2 `connections[]` + `primary` from a daemon registry
+/// snapshot. Disconnected entries are omitted (the array is "active
+/// tunnels"). For the primary, the scanner's protocol (authoritative,
+/// passed in) wins over the interface-name heuristic.
+fn registry_status_entries(
+    reg: &crate::vortix_core::engine::registry_handle::RegistrySnapshot,
+    scanner_protocol: Option<&str>,
+) -> (Vec<ConnectionEntry>, Option<String>) {
+    let primary = reg.primary.as_ref().map(|p| p.as_str().to_string());
+    let mut connections = Vec::with_capacity(reg.tunnels.len());
+    for t in &reg.tunnels {
+        let label = connection_state_label(&t.state);
+        if label == "disconnected" {
+            continue;
+        }
+        let profile = t.profile_id.as_str().to_string();
+        let is_primary = primary.as_deref() == Some(profile.as_str());
+        let heuristic = protocol_from_interface(t.interface_name.as_deref());
+        let protocol = if is_primary {
+            scanner_protocol.map(str::to_string).or(heuristic)
+        } else {
+            heuristic
+        };
+        connections.push(ConnectionEntry {
+            state: label.to_string(),
+            profile: Some(profile),
+            protocol,
+            uptime_secs: tunnel_uptime_secs(t),
+        });
+    }
+    (connections, primary)
+}
+
+/// Loud exit for a client/daemon IPC version skew (AE8) — never a silent
+/// fallback, since it masks real skew bugs.
+fn exit_daemon_version_mismatch(mode: OutputMode, daemon: u32, client: u32) -> ! {
+    print_error_and_exit(
+        mode,
+        "status",
+        CliError {
+            code: "daemon_version_mismatch",
+            message: format!(
+                "daemon speaks IPC protocol v{daemon}, this vortix speaks v{client} — upgrade the older binary so both match"
+            ),
+            hint: Some(
+                "Restart the daemon after upgrading (sudo systemctl restart vortix-daemon, or relaunch `vortix daemon`).".into(),
+            ),
+        },
+        ExitCode::GeneralError,
+    );
 }
 
 fn run_watch(interval: u64, config: &AppConfig, config_dir: &Path, mode: OutputMode) -> i32 {
@@ -2434,5 +2572,103 @@ mod tests {
         assert_eq!(format_elapsed(120), "2 min ago");
         assert_eq!(format_elapsed(7200), "2 hours ago");
         assert_eq!(format_elapsed(172_800), "2 days ago");
+    }
+
+    // ===== daemon registry -> status envelope (plan 2026-07-18-001 U2) =====
+
+    use crate::vortix_core::engine::registry::{Role, TunnelSnapshot};
+    use crate::vortix_core::engine::registry_handle::RegistrySnapshot;
+    use crate::vortix_core::engine::state::{Connection, ConnectionHealth};
+    use crate::vortix_core::profile::ProfileId;
+    use crate::vortix_core::state::KillSwitchState;
+
+    fn connected_tunnel(name: &str, iface: &str) -> TunnelSnapshot {
+        TunnelSnapshot {
+            profile_id: ProfileId::new(name),
+            state: Connection::Connected {
+                profile_id: ProfileId::new(name),
+                since: std::time::SystemTime::now(),
+                health: ConnectionHealth::Healthy,
+                details: Box::default(),
+            },
+            role: Role::Primary {
+                allowed_ips: Vec::new(),
+            },
+            health: ConnectionHealth::Healthy,
+            interface_name: Some(iface.into()),
+            started_at: Some(std::time::SystemTime::now()),
+        }
+    }
+
+    #[test]
+    fn protocol_from_interface_only_confident_for_wireguard() {
+        assert_eq!(
+            protocol_from_interface(Some("wg0")),
+            Some("wireguard".into())
+        );
+        assert_eq!(protocol_from_interface(Some("utun4")), None);
+        assert_eq!(protocol_from_interface(Some("tun0")), None);
+        assert_eq!(protocol_from_interface(None), None);
+    }
+
+    #[test]
+    fn registry_entries_lists_all_active_tunnels_with_primary() {
+        let reg = RegistrySnapshot {
+            tunnels: vec![
+                connected_tunnel("corp", "wg0"),
+                connected_tunnel("home", "tun0"),
+            ],
+            primary: Some(ProfileId::new("corp")),
+            killswitch: KillSwitchState::Disabled,
+        };
+        let (connections, primary) = registry_status_entries(&reg, None);
+        assert_eq!(connections.len(), 2);
+        assert_eq!(primary.as_deref(), Some("corp"));
+        // wg interface -> wireguard; tun -> unknown (omitted).
+        let corp = connections
+            .iter()
+            .find(|c| c.profile.as_deref() == Some("corp"))
+            .unwrap();
+        assert_eq!(corp.protocol.as_deref(), Some("wireguard"));
+        assert_eq!(corp.state, "connected");
+        let home = connections
+            .iter()
+            .find(|c| c.profile.as_deref() == Some("home"))
+            .unwrap();
+        assert_eq!(home.protocol, None);
+    }
+
+    #[test]
+    fn registry_entries_scanner_protocol_wins_for_primary() {
+        // Primary interface is a utun (protocol ambiguous from iface),
+        // but the scanner knows it's openvpn — that must win.
+        let reg = RegistrySnapshot {
+            tunnels: vec![connected_tunnel("corp", "utun5")],
+            primary: Some(ProfileId::new("corp")),
+            killswitch: KillSwitchState::Disabled,
+        };
+        let (connections, _) = registry_status_entries(&reg, Some("openvpn"));
+        assert_eq!(connections[0].protocol.as_deref(), Some("openvpn"));
+    }
+
+    #[test]
+    fn registry_entries_omit_disconnected_and_report_empty() {
+        let reg = RegistrySnapshot {
+            tunnels: vec![TunnelSnapshot {
+                profile_id: ProfileId::new("corp"),
+                state: Connection::Disconnected { last_failure: None },
+                role: Role::Primary {
+                    allowed_ips: Vec::new(),
+                },
+                health: ConnectionHealth::Unknown,
+                interface_name: None,
+                started_at: None,
+            }],
+            primary: None,
+            killswitch: KillSwitchState::Disabled,
+        };
+        let (connections, primary) = registry_status_entries(&reg, None);
+        assert!(connections.is_empty());
+        assert_eq!(primary, None);
     }
 }
