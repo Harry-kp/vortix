@@ -94,7 +94,8 @@ fn read_timeout_for(op: &IpcOp) -> Duration {
 
 /// One-shot RPC against the daemon. Opens a fresh `UnixStream`,
 /// sends `op` framed with `id`, reads exactly one response frame. The
-/// read timeout is chosen per-op ([`read_timeout_for`]).
+/// read timeout is chosen per-op (`Execute` gets a long timeout for the
+/// tunnel lifecycle; reads are quick).
 ///
 /// # Errors
 ///
