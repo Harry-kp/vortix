@@ -88,9 +88,10 @@ sudo apt install openresolv  # Debian/Ubuntu\n\
 sudo pacman -S openresolv    # Arch\n\
 sudo dnf install openresolv  # Fedora"
             .to_string(),
-        // Not a package (#242) — the fix is a sysctl or a profile edit.
+        // Not a package (#242) — the fix is a sysctl, boot-param, or profile edit.
         "host IPv6 (kernel disabled)" => "\
 sudo sysctl -w net.ipv6.conf.all.disable_ipv6=0 net.ipv6.conf.default.disable_ipv6=0\n\
+# if that reports 'unknown oid': remove ipv6.disable=1 from the kernel cmdline\n\
 # or: remove the IPv6 entry from the profile's Address line"
             .to_string(),
         // WireGuard binaries (wg, wg-quick) and the package itself all
