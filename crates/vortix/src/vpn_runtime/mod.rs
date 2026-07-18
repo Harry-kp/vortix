@@ -592,7 +592,7 @@ impl VpnRuntime {
                 // xtask:allow-platform-cfg: /proc sysctl gate is Linux-only (issue #242)
                 if let Some(label) = wireguard_ipv6_missing_dep(
                     utils::wireguard_config_has_ipv6_address(config_path),
-                    utils::host_ipv6_disabled(),
+                    utils::host_ipv6_disabled,
                 ) {
                     missing.push(label);
                 }
@@ -683,13 +683,16 @@ pub(crate) fn wireguard_dns_missing_dep(inputs: WireguardDnsGateInputs) -> Optio
 /// profile's `Address =` line, which aborts the whole bring-up when
 /// kernel IPv6 is disabled. Refuse up front instead of surfacing raw
 /// wg-quick stderr; never silently strip the user's IPv6 entry.
+///
+/// The host probe is a closure so its `/proc` reads only happen for
+/// profiles that actually declare an IPv6 address.
 #[must_use]
 #[cfg(target_os = "linux")] // xtask:allow-platform-cfg: gate decision is Linux-only (issue #242)
 pub(crate) fn wireguard_ipv6_missing_dep(
     profile_has_ipv6_address: bool,
-    host_ipv6_disabled: bool,
+    host_ipv6_disabled: impl FnOnce() -> bool,
 ) -> Option<String> {
-    (profile_has_ipv6_address && host_ipv6_disabled)
+    (profile_has_ipv6_address && host_ipv6_disabled())
         .then(|| "host IPv6 (kernel disabled)".to_string())
 }
 
@@ -802,24 +805,35 @@ mod ipv6_gate_tests {
     #[test]
     fn fires_only_when_profile_declares_v6_and_host_disabled() {
         assert_eq!(
-            wireguard_ipv6_missing_dep(true, true),
+            wireguard_ipv6_missing_dep(true, || true),
             Some("host IPv6 (kernel disabled)".to_string())
         );
     }
 
     #[test]
     fn silent_when_profile_is_v4_only() {
-        assert_eq!(wireguard_ipv6_missing_dep(false, true), None);
+        assert_eq!(wireguard_ipv6_missing_dep(false, || true), None);
     }
 
     #[test]
     fn silent_when_host_ipv6_enabled() {
-        assert_eq!(wireguard_ipv6_missing_dep(true, false), None);
+        assert_eq!(wireguard_ipv6_missing_dep(true, || false), None);
     }
 
     #[test]
     fn silent_when_neither() {
-        assert_eq!(wireguard_ipv6_missing_dep(false, false), None);
+        assert_eq!(wireguard_ipv6_missing_dep(false, || false), None);
+    }
+
+    #[test]
+    fn host_probe_not_evaluated_for_v4_only_profiles() {
+        let called = std::cell::Cell::new(false);
+        let result = wireguard_ipv6_missing_dep(false, || {
+            called.set(true);
+            true
+        });
+        assert_eq!(result, None);
+        assert!(!called.get(), "host probe ran for a v4-only profile");
     }
 
     #[test]
@@ -827,7 +841,7 @@ mod ipv6_gate_tests {
         // The label lives here; the hint arm lives in platform::install_hint.
         // Pin the pair so a rename on either side fails loudly instead of
         // rendering "sudo apt install host IPv6 (kernel disabled)".
-        let label = wireguard_ipv6_missing_dep(true, true).unwrap();
+        let label = wireguard_ipv6_missing_dep(true, || true).unwrap();
         let hint = crate::platform::install_hint(&label);
         assert!(
             hint.contains("sysctl"),
