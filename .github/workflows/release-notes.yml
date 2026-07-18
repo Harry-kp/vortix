@@ -1,0 +1,81 @@
+name: Release Notes
+
+# cargo-dist creates the GitHub release with an install/download body only —
+# its changelog auto-detection doesn't reliably extract our keep-a-changelog
+# sections, so release pages shipped without notes (v0.4.2, v0.4.3 fixed by
+# hand). This workflow prepends the matching CHANGELOG.md section as
+# "## Release Notes" once the release is published, preserving dist's install
+# block below a separator. It lives in its own file so `dist generate` never
+# clobbers it (unlike release.yml).
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  inject-notes:
+    name: Inject changelog into release body
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Prepend changelog section to release body
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+          EXISTING_BODY: ${{ github.event.release.body }}
+        run: |
+          set -euo pipefail
+
+          # Idempotency: if notes are already present (manual fix, or a
+          # re-run), do nothing.
+          case "$EXISTING_BODY" in
+            *"## Release Notes"*)
+              echo "Release body already has notes; nothing to do."
+              exit 0
+              ;;
+          esac
+
+          # Tag "v0.4.3" -> changelog version "0.4.3".
+          VERSION="${TAG#v}"
+
+          CHANGELOG="crates/vortix/CHANGELOG.md"
+          if [ ! -f "$CHANGELOG" ]; then
+            echo "No $CHANGELOG found; skipping." >&2
+            exit 0
+          fi
+
+          # Extract the section between "## [<version>]" and the next
+          # "## [" heading, dropping the version heading line itself
+          # (the release page already shows the version).
+          SECTION="$(awk -v ver="$VERSION" '
+            $0 ~ "^## \\[" ver "\\]" { grab = 1; next }
+            grab && /^## \[/ { exit }
+            grab { print }
+          ' "$CHANGELOG" | sed '/^[[:space:]]*$/{ /./d }' )"
+
+          # Trim leading/trailing blank lines.
+          SECTION="$(printf '%s\n' "$SECTION" | sed -e '/./,$!d' | sed -e ':a' -e '/^\n*$/{$d;N;ba}')"
+
+          if [ -z "$SECTION" ]; then
+            echo "No changelog section for $VERSION; leaving body unchanged." >&2
+            exit 0
+          fi
+
+          BODYFILE="$(mktemp)"
+          {
+            echo "## Release Notes"
+            echo
+            printf '%s\n' "$SECTION"
+            echo
+            echo "---"
+            echo
+            printf '%s\n' "$EXISTING_BODY"
+          } > "$BODYFILE"
+
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file "$BODYFILE"
+          echo "Injected notes for $TAG."
