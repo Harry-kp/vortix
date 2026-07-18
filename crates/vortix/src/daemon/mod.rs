@@ -8,10 +8,9 @@
 //!
 //! Auth: `SO_PEERCRED` / `getpeereid` — the daemon refuses requests from
 //! a UID other than its own (`daemon/server.rs`), backed by the mode-0600
-//! socket. The client performs the reciprocal check
-//! ([`socket_owner_trusted`]) before connecting, refusing a socket owned
-//! by anyone but root or the current user so a rogue `/tmp/vortix.sock`
-//! can't impersonate the daemon.
+//! socket. The client performs the reciprocal check (`socket_owner_trusted`)
+//! before connecting, refusing a socket owned by anyone but root or the
+//! current user so a rogue `/tmp/vortix.sock` can't impersonate the daemon.
 //!
 //! Lifecycle:
 //! 1. Bind the socket (cleaning up any stale socket file)
