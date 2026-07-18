@@ -3,7 +3,8 @@ date: 2026-07-18
 seq: 001
 type: feat
 slug: daemon-tunnel-ownership
-status: active
+status: superseded
+superseded_by: docs/plans/2026-07-19-001-feat-daemon-single-source-of-truth-plan.md
 depth: deep
 origin: docs/brainstorms/2026-07-18-daemon-tunnel-ownership-requirements.md
 issues: ["#234", "#250", "#153", "#16"]

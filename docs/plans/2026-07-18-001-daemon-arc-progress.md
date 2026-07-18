@@ -1,7 +1,7 @@
 # Daemon-tunnel-ownership arc — progress & resume notes
 
-Companion to `docs/plans/2026-07-18-001-feat-daemon-tunnel-ownership-plan.md`
-(the decision artifact — do **not** edit its body; state lives here + in git).
+Companion to `docs/plans/2026-07-19-001-feat-daemon-single-source-of-truth-plan.md`
+(the current decision artifact — supersedes the 2026-07-18 phased plan — do **not** edit its body; state lives here + in git).
 
 **Last updated:** 2026-07-19 (session 2 — post-review fixes)
 
