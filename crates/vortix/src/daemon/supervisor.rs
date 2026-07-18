@@ -25,11 +25,11 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::core::scanner::ActiveSession;
 use crate::tunnel::TunnelKind;
-use crate::vortix_core::engine::input::UserCommand;
+use crate::vortix_core::cidr::Cidr;
 use crate::vortix_core::engine::reconcile::{classify, ReconcileAction};
 use crate::vortix_core::engine::registry_handle::RegistryHandle;
 use crate::vortix_core::engine::state::{Connection, DetailedConnectionInfo};
-use crate::vortix_core::engine::{Engine, EngineHandle};
+use crate::vortix_core::engine::Engine;
 use crate::vortix_core::ports::tunnel::mock::MockTunnel;
 use crate::vortix_core::profile::ProfileId;
 
@@ -247,27 +247,18 @@ struct RetryTrack {
     next_at: Instant,
 }
 
-/// True when `state` is `Connected` to the named profile.
-fn is_connected_to(state: &Connection, name: &str) -> bool {
-    matches!(state, Connection::Connected { profile_id, .. } if profile_id.as_str() == name)
-}
-
-/// Builds a fresh, `Disconnected` engine used to perform ONE reconnect.
+/// Resolves the per-reconnect context for a profile: its declared
+/// `AllowedIPs` plus a fresh `Disconnected` `Engine<TunnelKind>` to drive
+/// the connect through the registry (plan 2026-07-19-001 P1). Returns
+/// `None` when the profile isn't resolvable or engine prerequisites are
+/// missing. Injected so the loop is unit-testable without real tunnels;
+/// in production it wraps `daemon::connect_allowed_ips` + `build_engine`.
 ///
-/// Each reconnect drives a DEDICATED engine rather than a single shared
-/// FSM. This is deliberate: the daemon's shared FSM tracks only one
-/// tunnel and is never told about kernel drops, so a shared-engine
-/// `Connect` no-ops against a stale `Connected` state and the snapshot
-/// check then reports a false success (the tunnel stays down). A fresh
-/// engine always starts `Disconnected`, so `Connect` actually runs
-/// `tunnel.up`, and its snapshot reflects *that* profile's real result.
-/// It also makes concurrent multi-tunnel reconnects independent. The
-/// brought-up tunnel survives the transient engine being dropped (the
-/// FSM's `Drop` is a no-op; the scanner re-adopts it into the registry).
-///
-/// Injected so the loop is unit-testable without real tunnels. Returns
-/// `None` when prerequisites are missing (no runner/journal).
-pub type EngineFactory = std::sync::Arc<dyn Fn() -> Option<EngineHandle> + Send + Sync>;
+/// Reconnect goes through `RegistryHandle::connect` (not a throwaway
+/// engine) so the recovered tunnel becomes a real, drivable entry in the
+/// one source of truth — disconnectable/reconnectable like any other.
+pub type ReconnectContext =
+    std::sync::Arc<dyn Fn(&str) -> Option<(Vec<Cidr>, Engine<TunnelKind>)> + Send + Sync>;
 
 /// Hard cap on one kernel scan so a hung `wg`/`ip`/`/proc` read can't
 /// wedge the whole supervision loop.
@@ -279,17 +270,16 @@ const SCAN_TIMEOUT_SECS: u64 = 15;
 /// auto-reconnect for tunnels that dropped unexpectedly (AE2/AE3). Runs
 /// until the registry owner task terminates (daemon shutdown).
 ///
-/// `engine_factory` builds a fresh engine per reconnect (see
-/// [`EngineFactory`]); when it yields `None` (engine prerequisites
-/// missing) the loop still reconciles the registry but performs no
-/// reconnects. Kill-switch arming on drop is a follow-up (it needs the
-/// daemon to load kill-switch mode + apply root firewall rules, validated
-/// live).
+/// `reconnect_ctx` resolves a profile's `AllowedIPs` + a fresh engine per
+/// reconnect (see [`ReconnectContext`]); when it yields `None` the loop
+/// still reconciles the registry but performs no reconnect for that
+/// profile. Kill-switch arming on drop is a follow-up (it needs the daemon
+/// to load kill-switch mode + apply root firewall rules, validated live).
 ///
 /// Spawn this onto the daemon runtime alongside the accept loop.
 pub async fn run_supervisor(
     registry: RegistryHandle<TunnelKind>,
-    engine_factory: EngineFactory,
+    reconnect_ctx: ReconnectContext,
     config: SupervisorConfig,
 ) {
     let mut retries: HashMap<String, RetryTrack> = HashMap::new();
@@ -357,7 +347,7 @@ pub async fn run_supervisor(
         schedule_drops(&outcome, &config, &mut retries, Instant::now());
 
         // Fire any reconnect whose delay has elapsed.
-        drive_due_reconnects(&engine_factory, &config, &mut retries).await;
+        drive_due_reconnects(&registry, &reconnect_ctx, &config, &mut retries).await;
     }
 }
 
@@ -427,15 +417,14 @@ fn reschedule_after_attempt(
     }
 }
 
-/// Execute every reconnect that is due. Each fires against a FRESH engine
-/// (see [`EngineFactory`]) so the connect actually runs and its result is
-/// truthful; a genuine success is confirmed on a later tick when the
-/// scanner re-adopts the tunnel (clearing the retry in `run_supervisor`).
-/// Whether or not the fresh engine reports connected this instant, we
-/// reschedule with backoff / give up so a slow-to-come-up tunnel keeps
-/// being retried until adoption clears it or the budget is exhausted.
+/// Execute every reconnect that is due by driving `RegistryHandle::connect`
+/// for the profile — so the recovered tunnel becomes a real entry in the
+/// one source of truth. `registry.connect` is authoritative: on success we
+/// clear the retry immediately; on a connect failure (or a missing
+/// context) we reschedule with backoff / give up per budget.
 async fn drive_due_reconnects(
-    engine_factory: &EngineFactory,
+    registry: &RegistryHandle<TunnelKind>,
+    reconnect_ctx: &ReconnectContext,
     config: &SupervisorConfig,
     retries: &mut HashMap<String, RetryTrack>,
 ) {
@@ -448,29 +437,29 @@ async fn drive_due_reconnects(
 
     for name in due {
         let attempt = retries.get(&name).map_or(1, |t| t.attempt);
-        let Some(engine) = engine_factory() else {
-            tracing::warn!(profile = %name, "auto-reconnect skipped: no engine available");
-            // Keep the entry; a later tick may find the engine available.
+        let Some((allowed_ips, engine)) = reconnect_ctx(&name) else {
+            tracing::warn!(profile = %name, "auto-reconnect skipped: profile/engine unavailable");
+            // Keep the entry; a later tick may resolve the context.
             continue;
         };
         tracing::info!(profile = %name, attempt, "auto-reconnect attempt");
-        let _ = engine
-            .execute_command(UserCommand::Connect {
-                profile_id: ProfileId::new(&name),
-            })
-            .await;
-
-        // The fresh engine is dedicated to this profile, so its snapshot
-        // is a truthful (not stale) signal — but we treat it as advisory
-        // only. Success is *confirmed* by the scanner re-adopting the
-        // tunnel on a later tick (which clears the retry in run_supervisor);
-        // until then we keep the retry armed and reschedule with backoff,
-        // so a tunnel that comes up slowly, or comes up then drops again
-        // before adoption, is not abandoned.
-        let connected =
-            matches!(engine.snapshot().await, Ok(s) if is_connected_to(&s.state, &name));
-        tracing::info!(profile = %name, connected, "auto-reconnect attempt completed");
-        let _ = reschedule_after_attempt(&name, config, retries, Instant::now());
+        match registry
+            .connect(ProfileId::new(&name), allowed_ips, move || engine, true)
+            .await
+        {
+            Ok(Ok(())) => {
+                tracing::info!(profile = %name, "auto-reconnect succeeded");
+                retries.remove(&name);
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(profile = %name, ?e, "auto-reconnect failed; will retry");
+                let _ = reschedule_after_attempt(&name, config, retries, Instant::now());
+            }
+            Err(e) => {
+                tracing::warn!(profile = %name, %e, "auto-reconnect: registry actor gone");
+                let _ = reschedule_after_attempt(&name, config, retries, Instant::now());
+            }
+        }
     }
 }
 
@@ -624,9 +613,35 @@ mod tests {
 
     // ===== drive_due_reconnects (fresh-engine factory) =====
 
+    // A reconnect context that hands back a mock engine (connects instantly)
+    // and empty AllowedIPs, so `registry.connect` succeeds in tests.
+    fn mock_ctx() -> ReconnectContext {
+        std::sync::Arc::new(|name: &str| {
+            let engine = mock_engine_for(name);
+            Some((Vec::new(), engine))
+        })
+    }
+
+    fn mock_engine_for(name: &str) -> Engine<TunnelKind> {
+        use crate::vortix_core::profile::{Profile, ProtocolKind};
+        use std::path::PathBuf;
+        let name = name.to_string();
+        Engine::new(
+            TunnelKind::Mock(MockTunnel::new()),
+            move |id: &ProfileId| {
+                Some(Profile::new(
+                    id.clone(),
+                    &name,
+                    ProtocolKind::WireGuard,
+                    PathBuf::from(format!("/tmp/{name}.conf")),
+                ))
+            },
+        )
+    }
+
     #[tokio::test]
-    async fn drive_fires_due_and_reschedules_next_attempt() {
-        let factory: EngineFactory = std::sync::Arc::new(|| Some(EngineHandle::for_test()));
+    async fn drive_fires_due_and_clears_on_success() {
+        let registry = RegistryHandle::spawn(TunnelRegistry::<TunnelKind>::new());
         let cfg = test_config();
         let mut retries = HashMap::new();
         retries.insert(
@@ -636,15 +651,17 @@ mod tests {
                 next_at: Instant::now().checked_sub(Duration::from_secs(1)).unwrap(), // due
             },
         );
-        drive_due_reconnects(&factory, &cfg, &mut retries).await;
-        // Fired, and rescheduled to attempt 2 (success is confirmed later
-        // by adoption, not here).
-        assert_eq!(retries.get("corp").map(|t| t.attempt), Some(2));
+        drive_due_reconnects(&registry, &mock_ctx(), &cfg, &mut retries).await;
+        // registry.connect succeeded (mock) → retry cleared, and the
+        // profile is now a real Connected entry in the registry.
+        assert!(!retries.contains_key("corp"));
+        let snap = registry.registry_snapshot().await.expect("snap");
+        assert!(snap.tunnels.iter().any(|t| t.profile_id.as_str() == "corp"));
     }
 
     #[tokio::test]
     async fn drive_ignores_not_due_entries() {
-        let factory: EngineFactory = std::sync::Arc::new(|| Some(EngineHandle::for_test()));
+        let registry = RegistryHandle::spawn(TunnelRegistry::<TunnelKind>::new());
         let cfg = test_config();
         let mut retries = HashMap::new();
         retries.insert(
@@ -654,13 +671,14 @@ mod tests {
                 next_at: Instant::now() + Duration::from_secs(999), // not due
             },
         );
-        drive_due_reconnects(&factory, &cfg, &mut retries).await;
+        drive_due_reconnects(&registry, &mock_ctx(), &cfg, &mut retries).await;
         assert_eq!(retries.get("corp").map(|t| t.attempt), Some(1));
     }
 
     #[tokio::test]
-    async fn drive_keeps_entry_when_no_engine_available() {
-        let factory: EngineFactory = std::sync::Arc::new(|| None);
+    async fn drive_keeps_entry_when_context_unavailable() {
+        let registry = RegistryHandle::spawn(TunnelRegistry::<TunnelKind>::new());
+        let none_ctx: ReconnectContext = std::sync::Arc::new(|_| None);
         let cfg = test_config();
         let mut retries = HashMap::new();
         retries.insert(
@@ -670,8 +688,8 @@ mod tests {
                 next_at: Instant::now().checked_sub(Duration::from_secs(1)).unwrap(), // due
             },
         );
-        drive_due_reconnects(&factory, &cfg, &mut retries).await;
-        // No engine → attempt not consumed, entry preserved for a later tick.
+        drive_due_reconnects(&registry, &none_ctx, &cfg, &mut retries).await;
+        // No context → attempt not consumed, entry preserved for a later tick.
         assert_eq!(retries.get("corp").map(|t| t.attempt), Some(1));
     }
 

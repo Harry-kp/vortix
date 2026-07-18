@@ -336,13 +336,19 @@ fn handle_daemon(socket_override: Option<std::path::PathBuf>, mode: OutputMode) 
         server
     };
 
-    // The supervisor's auto-reconnect drives a FRESH engine per attempt —
-    // never the shared server FSM, which tracks one tunnel and goes stale
-    // on a drop. Each fresh engine starts Disconnected, so its Connect
-    // actually brings the tunnel up and its result is truthful.
-    let factory_profiles_dir = profiles_dir.clone();
-    let engine_factory: crate::daemon::supervisor::EngineFactory =
-        std::sync::Arc::new(move || crate::daemon::build_engine_handle(&factory_profiles_dir));
+    // The supervisor's auto-reconnect drives RegistryHandle::connect for
+    // the dropped profile — the same per-profile engine path as client
+    // writes, so a recovered tunnel becomes a real, drivable registry
+    // entry. The context resolves the profile's AllowedIPs + a fresh engine.
+    let ctx_profiles_dir = profiles_dir.clone();
+    let reconnect_ctx: crate::daemon::supervisor::ReconnectContext =
+        std::sync::Arc::new(move |name: &str| {
+            let id = crate::vortix_core::profile::ProfileId::new(name);
+            let allowed_ips =
+                crate::daemon::connect_allowed_ips(&ctx_profiles_dir, &id).unwrap_or_default();
+            let engine = crate::daemon::build_engine(&ctx_profiles_dir)?;
+            Some((allowed_ips, engine))
+        });
 
     // The daemon owns a multi-tunnel registry independent of the single
     // FSM engine handle. A headless supervisor loop keeps it in sync with
@@ -402,7 +408,7 @@ fn handle_daemon(socket_override: Option<std::path::PathBuf>, mode: OutputMode) 
     };
     runtime.spawn(crate::daemon::supervisor::run_supervisor(
         registry,
-        engine_factory,
+        reconnect_ctx,
         supervisor_config,
     ));
 
