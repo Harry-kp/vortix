@@ -108,10 +108,16 @@ impl DaemonServer {
         loop {
             match self.listener.accept().await {
                 Ok((stream, _addr)) => {
+                    // Each client runs in its own task so a long-lived
+                    // connection (a TUI holding a Subscribe stream, U2)
+                    // does not block command clients on the accept loop.
+                    // The engine handle is cheap to clone (Arc-internal).
                     let handle = self.engine_handle.clone();
-                    if let Err(e) = handle_client(stream, daemon_uid, handle).await {
-                        eprintln!("vortix daemon: client session ended: {e}");
-                    }
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_client(stream, daemon_uid, handle).await {
+                            eprintln!("vortix daemon: client session ended: {e}");
+                        }
+                    });
                 }
                 Err(e) => {
                     eprintln!("vortix daemon: accept failed: {e}");
