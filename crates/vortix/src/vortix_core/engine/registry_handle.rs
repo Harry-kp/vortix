@@ -77,11 +77,14 @@ impl RegistryHandle {
     }
 }
 
+// The owner task is the sole owner of the registry for its entire
+// lifetime; a borrow cannot cross the spawn_blocking boundary. Mutating
+// messages (supervisor feed: drop detection, retry, adoption) consume it
+// as `mut` in the following commits.
+#[allow(clippy::needless_pass_by_value)]
 fn owner_loop<T: Tunnel>(registry: TunnelRegistry<T>, mut rx: mpsc::Receiver<RegistryEnvelope>) {
     // Blocking loop on a tokio blocking thread — the registry is sync,
-    // so any tunnel work it drives blocks this thread only. Mutating
-    // messages (supervisor feed) land here in later commits, which is
-    // why `registry` is bound `mut`-ready by ownership here.
+    // so any tunnel work it drives blocks this thread only.
     while let Some(env) = rx.blocking_recv() {
         match env {
             RegistryEnvelope::Snapshot { reply } => {
