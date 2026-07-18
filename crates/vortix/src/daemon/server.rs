@@ -10,6 +10,7 @@ use std::sync::Arc;
 use crate::vortix_core::engine::EngineHandle;
 use crate::vortix_core::ipc::{
     decode_frame, encode_frame, FrameError, IpcError, IpcOp, IpcRequest, IpcResponse, IpcResult,
+    IPC_PROTOCOL_VERSION,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -154,6 +155,7 @@ async fn handle_client(
             // error rather than an opaque EOF.
             let resp = IpcResponse {
                 id: 0,
+                protocol_version: IPC_PROTOCOL_VERSION,
                 result: Err(IpcError::Unauthorized),
             };
             if let Ok(frame) = encode_frame(&resp) {
@@ -166,6 +168,7 @@ async fn handle_client(
             tracing::warn!(error = %e, "peer-UID lookup failed; closing connection");
             let resp = IpcResponse {
                 id: 0,
+                protocol_version: IPC_PROTOCOL_VERSION,
                 result: Err(IpcError::Internal(format!("peer-UID lookup failed: {e}"))),
             };
             if let Ok(frame) = encode_frame(&resp) {
@@ -289,6 +292,19 @@ fn get_peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
 /// reserves it). For now clients can correlate the `Subscribed` ack and
 /// then poll `Snapshot` until the streaming half lands.
 async fn dispatch(req: IpcRequest, engine_handle: Option<&EngineHandle>) -> IpcResponse {
+    // Version gate before any op runs. A pre-versioning client's frames
+    // deserialize with protocol_version = 0 and land here — the typed
+    // error names both sides so the user knows which binary to upgrade.
+    if req.protocol_version != IPC_PROTOCOL_VERSION {
+        return IpcResponse {
+            id: req.id,
+            protocol_version: IPC_PROTOCOL_VERSION,
+            result: Err(IpcError::VersionMismatch {
+                daemon: IPC_PROTOCOL_VERSION,
+                client: req.protocol_version,
+            }),
+        };
+    }
     let result = match req.op {
         IpcOp::Execute(cmd) => match engine_handle {
             Some(h) => match h.execute_command(cmd).await {
@@ -335,7 +351,11 @@ async fn dispatch(req: IpcRequest, engine_handle: Option<&EngineHandle>) -> IpcR
         }
         IpcOp::Shutdown => Ok(IpcResult::ShuttingDown),
     };
-    IpcResponse { id: req.id, result }
+    IpcResponse {
+        id: req.id,
+        protocol_version: IPC_PROTOCOL_VERSION,
+        result,
+    }
 }
 
 #[derive(Debug)]
@@ -376,6 +396,7 @@ mod tests {
     async fn dispatch_execute_without_handle_returns_internal_error() {
         let req = IpcRequest {
             id: 1,
+            protocol_version: IPC_PROTOCOL_VERSION,
             op: IpcOp::Execute(UserCommand::Connect {
                 profile_id: ProfileId::new("corp"),
             }),
@@ -392,6 +413,7 @@ mod tests {
     async fn dispatch_snapshot_without_handle_returns_internal_error() {
         let req = IpcRequest {
             id: 2,
+            protocol_version: IPC_PROTOCOL_VERSION,
             op: IpcOp::Snapshot,
         };
         let resp = dispatch(req, None).await;
@@ -403,6 +425,7 @@ mod tests {
     async fn dispatch_subscribe_without_handle_returns_internal_error() {
         let req = IpcRequest {
             id: 3,
+            protocol_version: IPC_PROTOCOL_VERSION,
             op: IpcOp::Subscribe,
         };
         let resp = dispatch(req, None).await;
@@ -414,6 +437,7 @@ mod tests {
     async fn dispatch_shutdown_does_not_require_engine_handle() {
         let req = IpcRequest {
             id: 4,
+            protocol_version: IPC_PROTOCOL_VERSION,
             op: IpcOp::Shutdown,
         };
         let resp = dispatch(req, None).await;
@@ -426,6 +450,7 @@ mod tests {
         let handle = EngineHandle::for_test();
         let req = IpcRequest {
             id: 5,
+            protocol_version: IPC_PROTOCOL_VERSION,
             op: IpcOp::Snapshot,
         };
         let resp = dispatch(req, Some(&handle)).await;
@@ -442,6 +467,7 @@ mod tests {
         let handle = EngineHandle::for_test();
         let req = IpcRequest {
             id: 6,
+            protocol_version: IPC_PROTOCOL_VERSION,
             op: IpcOp::Execute(UserCommand::Connect {
                 profile_id: ProfileId::new("corp"),
             }),
@@ -455,6 +481,7 @@ mod tests {
         let handle = EngineHandle::for_test();
         let req = IpcRequest {
             id: 7,
+            protocol_version: IPC_PROTOCOL_VERSION,
             op: IpcOp::Subscribe,
         };
         let resp = dispatch(req, Some(&handle)).await;
@@ -496,6 +523,7 @@ mod tests {
         // Shutdown is the simplest op — dispatched regardless of engine handle.
         let req = IpcRequest {
             id: 7,
+            protocol_version: IPC_PROTOCOL_VERSION,
             op: IpcOp::Shutdown,
         };
         let frame = encode_frame(&req).expect("encode");
@@ -551,6 +579,7 @@ mod tests {
         let handle = EngineHandle::for_test();
         // Connect first so disconnect has something to act on.
         let connect_req = IpcRequest {
+            protocol_version: IPC_PROTOCOL_VERSION,
             id: 10,
             op: IpcOp::Execute(UserCommand::Connect {
                 profile_id: ProfileId::new("corp"),
@@ -560,6 +589,7 @@ mod tests {
 
         let req = IpcRequest {
             id: 11,
+            protocol_version: IPC_PROTOCOL_VERSION,
             op: IpcOp::Execute(UserCommand::Disconnect { profile_id: None }),
         };
         let resp = dispatch(req, Some(&handle)).await;
@@ -572,6 +602,7 @@ mod tests {
         let handle = EngineHandle::for_test();
         let req = IpcRequest {
             id: 12,
+            protocol_version: IPC_PROTOCOL_VERSION,
             op: IpcOp::Execute(UserCommand::Disconnect {
                 profile_id: Some(ProfileId::new("corp")),
             }),
@@ -585,6 +616,7 @@ mod tests {
         let handle = EngineHandle::for_test();
         let req = IpcRequest {
             id: 13,
+            protocol_version: IPC_PROTOCOL_VERSION,
             op: IpcOp::Execute(UserCommand::Reconnect { profile_id: None }),
         };
         let resp = dispatch(req, Some(&handle)).await;
@@ -596,6 +628,7 @@ mod tests {
         let handle = EngineHandle::for_test();
         let req = IpcRequest {
             id: 14,
+            protocol_version: IPC_PROTOCOL_VERSION,
             op: IpcOp::Execute(UserCommand::ForceDisconnect {
                 profile_id: Some(ProfileId::new("corp")),
             }),
@@ -672,6 +705,27 @@ mod tests {
                 assert_eq!(killswitch, KillSwitchState::Disabled);
             }
             other => panic!("expected RegistrySnapshot, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_rejects_mismatched_protocol_version() {
+        // A pre-versioning client's frames decode with version 0 — the
+        // gate must name both sides (AE8) and never run the op.
+        let req = IpcRequest {
+            id: 9,
+            protocol_version: 0,
+            op: IpcOp::Shutdown,
+        };
+        let resp = dispatch(req, None).await;
+        assert_eq!(resp.id, 9);
+        assert_eq!(resp.protocol_version, IPC_PROTOCOL_VERSION);
+        match resp.result {
+            Err(IpcError::VersionMismatch { daemon, client }) => {
+                assert_eq!(daemon, IPC_PROTOCOL_VERSION);
+                assert_eq!(client, 0);
+            }
+            other => panic!("expected VersionMismatch, got {other:?}"),
         }
     }
 }

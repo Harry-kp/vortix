@@ -4,9 +4,9 @@
 //! in a `tokio::spawn`'d task; the handle holds a mpsc sender to the actor
 //! plus a broadcast factory for live event subscribers.
 //!
-//! `EngineHandle` is an `enum` with one variant today (`Local`); future
-//! Phase B daemon work (idea 4) adds a `Remote(RemoteHandle)` variant
-//! additively (the enum is `#[non_exhaustive]`).
+//! `EngineHandle` is an `enum` with two variants: `Local` (in-process
+//! actor) and `Remote` (daemon-hosted engine over IPC, read path as of
+//! plan 2026-07-18-001 U1). The enum stays `#[non_exhaustive]`.
 
 use std::sync::Arc;
 
@@ -17,6 +17,7 @@ use crate::vortix_core::engine::event::EventEnvelope;
 use crate::vortix_core::engine::fsm::Engine;
 use crate::vortix_core::engine::input::{Input, UserCommand};
 use crate::vortix_core::engine::state::Connection;
+use crate::vortix_core::ipc::{IpcOp, IpcResult, IpcTransport, TransportError};
 use crate::vortix_core::journal::Journal;
 use crate::vortix_core::ports::tunnel::Tunnel;
 
@@ -75,10 +76,63 @@ impl std::fmt::Debug for LocalHandle {
     }
 }
 
+/// Client-side handle to a daemon-hosted engine (plan 2026-07-18-001
+/// U1). Wraps a blocking [`IpcTransport`]; each call runs the exchange
+/// on the blocking pool. U1 ships the read path only — `execute` and
+/// `subscribe` land with the daemon-writes (U3) and streaming (U2)
+/// units.
+#[derive(Clone)]
+pub struct RemoteHandle {
+    transport: Arc<dyn IpcTransport>,
+}
+
+impl std::fmt::Debug for RemoteHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteHandle").finish_non_exhaustive()
+    }
+}
+
+impl RemoteHandle {
+    #[must_use]
+    pub fn new(transport: Arc<dyn IpcTransport>) -> Self {
+        Self { transport }
+    }
+
+    /// Fetch the daemon's FSM snapshot with the typed transport error
+    /// surface preserved — callers that must discriminate
+    /// [`TransportError::Unavailable`] (silent fallback) from
+    /// [`TransportError::VersionMismatch`] (loud error) use this
+    /// directly; the uniform [`EngineHandle::snapshot`] flattens to
+    /// [`EngineError`].
+    ///
+    /// The remote journal tail is not transported in U1; `journal_tail`
+    /// is empty until the streaming unit lands.
+    ///
+    /// # Errors
+    ///
+    /// See [`TransportError`].
+    pub async fn snapshot_remote(&self) -> Result<Snapshot, TransportError> {
+        let transport = Arc::clone(&self.transport);
+        let result = tokio::task::spawn_blocking(move || transport.request(IpcOp::Snapshot))
+            .await
+            .map_err(|e| TransportError::Protocol(format!("blocking task join: {e}")))??;
+        match result {
+            IpcResult::Snapshot { state } => Ok(Snapshot {
+                state,
+                journal_tail: Vec::new(),
+            }),
+            other => Err(TransportError::Protocol(format!(
+                "expected snapshot, daemon answered {other:?}"
+            ))),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum EngineHandle {
     Local(LocalHandle),
+    Remote(RemoteHandle),
 }
 
 impl EngineHandle {
@@ -103,6 +157,9 @@ impl EngineHandle {
     pub async fn execute(&self, input: Input) -> Result<CommandAck, EngineError> {
         match self {
             Self::Local(h) => h.execute(input).await,
+            Self::Remote(_) => Err(EngineError::Other(
+                "remote execute is not supported yet (lands with daemon-writes, plan 2026-07-18-001 U3)".into(),
+            )),
         }
     }
 
@@ -123,6 +180,10 @@ impl EngineHandle {
     pub async fn snapshot(&self) -> Result<Snapshot, EngineError> {
         match self {
             Self::Local(h) => h.snapshot().await,
+            Self::Remote(h) => h
+                .snapshot_remote()
+                .await
+                .map_err(|e| EngineError::Other(e.to_string())),
         }
     }
 
@@ -136,6 +197,9 @@ impl EngineHandle {
     pub async fn subscribe(&self) -> Result<EngineSubscription, EngineError> {
         match self {
             Self::Local(h) => h.subscribe().await,
+            Self::Remote(_) => Err(EngineError::Other(
+                "remote subscribe is not supported yet (lands with event streaming, plan 2026-07-18-001 U2)".into(),
+            )),
         }
     }
 
@@ -292,5 +356,93 @@ mod tests {
         ));
         // Receiver is alive (no events yet).
         let _ = sub.receiver;
+    }
+
+    // ===== RemoteHandle (plan 2026-07-18-001 U1) =====
+
+    struct MockTransport {
+        response: std::sync::Mutex<Option<Result<IpcResult, TransportError>>>,
+        called: std::sync::atomic::AtomicBool,
+    }
+
+    impl MockTransport {
+        fn new(response: Result<IpcResult, TransportError>) -> Self {
+            Self {
+                response: std::sync::Mutex::new(Some(response)),
+                called: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl IpcTransport for MockTransport {
+        fn request(&self, _op: IpcOp) -> Result<IpcResult, TransportError> {
+            self.called.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.response
+                .lock()
+                .unwrap()
+                .take()
+                .expect("single-shot mock")
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_snapshot_maps_wire_state_into_snapshot() {
+        let transport = Arc::new(MockTransport::new(Ok(IpcResult::Snapshot {
+            state: Connection::Disconnected { last_failure: None },
+        })));
+        let remote = RemoteHandle::new(transport.clone());
+        let snap = remote.snapshot_remote().await.expect("snapshot");
+        assert!(matches!(snap.state, Connection::Disconnected { .. }));
+        assert!(snap.journal_tail.is_empty());
+        assert!(transport.called.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn remote_snapshot_propagates_version_mismatch_with_both_sides() {
+        let transport = Arc::new(MockTransport::new(Err(TransportError::VersionMismatch {
+            daemon: 3,
+            client: 1,
+        })));
+        let remote = RemoteHandle::new(transport);
+        match remote.snapshot_remote().await {
+            Err(TransportError::VersionMismatch {
+                daemon: 3,
+                client: 1,
+            }) => {}
+            other => panic!("expected version mismatch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_snapshot_unavailable_stays_unavailable() {
+        let transport = Arc::new(MockTransport::new(Err(TransportError::Unavailable(
+            "connection refused".into(),
+        ))));
+        let remote = RemoteHandle::new(transport);
+        assert!(matches!(
+            remote.snapshot_remote().await,
+            Err(TransportError::Unavailable(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn remote_snapshot_rejects_non_snapshot_result() {
+        let transport = Arc::new(MockTransport::new(Ok(IpcResult::Accepted)));
+        let remote = RemoteHandle::new(transport);
+        assert!(matches!(
+            remote.snapshot_remote().await,
+            Err(TransportError::Protocol(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn engine_handle_remote_execute_and_subscribe_are_unsupported_in_u1() {
+        let transport = Arc::new(MockTransport::new(Ok(IpcResult::Accepted)));
+        let handle = EngineHandle::Remote(RemoteHandle::new(transport));
+        assert!(handle
+            .execute_command(UserCommand::Disconnect { profile_id: None })
+            .await
+            .is_err());
+        assert!(handle.subscribe().await.is_err());
     }
 }

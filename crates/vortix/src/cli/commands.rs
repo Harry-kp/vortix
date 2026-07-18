@@ -1012,16 +1012,33 @@ fn handle_status(
     let engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
     let mut snap = engine.scan_status();
     // When the daemon socket is connectable, overlay its authoritative
-    // view of the FSM (which profile is connecting/connected, since
-    // when) onto the scanner-derived snapshot. The scanner still owns
-    // live counters and kill-switch state. On any daemon error we
-    // silently keep the scanner-only view — bypass-on-error keeps
-    // `vortix status` reliable during partial daemon rollout. Once
-    // U21 lands the schema_version=2 multi-tunnel payload, this
-    // branch will pull richer data from the daemon directly.
+    // view of the FSM onto the scanner-derived snapshot via the
+    // EngineHandle::Remote seam (plan 2026-07-18-001 U1). The scanner
+    // still owns live counters and kill-switch state. Failure handling
+    // is deliberately split: unavailable/protocol errors keep the
+    // scanner-only view silently (bypass-on-error keeps `vortix status`
+    // reliable), but a version mismatch is a loud typed exit — silent
+    // fallback there would mask a real client/daemon skew (AE8).
     if let Some(socket) = daemon_socket {
-        if let Ok(state) = crate::daemon::client::snapshot(&socket) {
-            overlay_daemon_state(&mut snap, &state);
+        match daemon_snapshot_via_remote(&socket) {
+            Ok(Some(state)) => overlay_daemon_state(&mut snap, &state),
+            Ok(None) => {}
+            Err((daemon, client)) => {
+                print_error_and_exit(
+                    mode,
+                    "status",
+                    CliError {
+                        code: "daemon_version_mismatch",
+                        message: format!(
+                            "daemon speaks IPC protocol v{daemon}, this vortix speaks v{client} — upgrade the older binary so both match"
+                        ),
+                        hint: Some(
+                            "Restart the daemon after upgrading (sudo systemctl restart vortix-daemon, or relaunch `vortix daemon`).".into(),
+                        ),
+                    },
+                    ExitCode::GeneralError,
+                );
+            }
         }
     }
 
@@ -1148,6 +1165,42 @@ fn handle_status(
 /// the daemon's view of "what's the active profile" beats whatever
 /// the scanner inferred from sockets — relevant when the daemon is
 /// driving a tunnel the local-engine scanner doesn't recognize.
+/// Fetch the daemon's FSM state through `EngineHandle::Remote`.
+///
+/// Returns `Ok(Some(state))` on success, `Ok(None)` for every
+/// degradation that should silently fall back to the scanner view
+/// (daemon unreachable, protocol hiccup, no async runtime available),
+/// and `Err((daemon, client))` for a version mismatch — the one
+/// failure that must surface loudly instead of degrading.
+fn daemon_snapshot_via_remote(
+    socket: &Path,
+) -> Result<Option<crate::vortix_core::engine::state::Connection>, (u32, u32)> {
+    use crate::vortix_core::engine::handle::RemoteHandle;
+    use crate::vortix_core::ipc::TransportError;
+    use std::sync::Arc;
+
+    let Some(runtime) = crate::vortix_process::global_runner()
+        .as_real()
+        .map(|r| r.runtime().handle().clone())
+    else {
+        return Ok(None);
+    };
+
+    let transport = Arc::new(crate::daemon::client::UnixTransport::new(
+        socket.to_path_buf(),
+    ));
+    let remote = RemoteHandle::new(transport);
+    match runtime.block_on(remote.snapshot_remote()) {
+        Ok(snapshot) => Ok(Some(snapshot.state)),
+        Err(TransportError::VersionMismatch { daemon, client }) => Err((daemon, client)),
+        Err(TransportError::Unavailable(_)) => Ok(None),
+        Err(TransportError::Protocol(e)) => {
+            tracing::warn!(error = %e, "daemon snapshot protocol failure; using scanner view");
+            Ok(None)
+        }
+    }
+}
+
 fn overlay_daemon_state(
     snap: &mut crate::vpn_runtime::connection::StatusSnapshot,
     state: &crate::vortix_core::engine::state::Connection,

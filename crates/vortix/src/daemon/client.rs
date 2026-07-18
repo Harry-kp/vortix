@@ -12,11 +12,12 @@
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::vortix_core::ipc::{
     decode_frame, encode_frame, FrameError, IpcError, IpcOp, IpcRequest, IpcResponse, IpcResult,
+    IpcTransport, TransportError, IPC_PROTOCOL_VERSION,
 };
 
 /// IPC client error surface visible to CLI handlers. Captures the
@@ -36,6 +37,9 @@ pub enum ClientError {
     /// Daemon returned a result variant we weren't expecting for the
     /// op we sent. Carries a description string for diagnostics.
     Unexpected(String),
+    /// Peer speaks a different IPC protocol version. Loud by contract
+    /// (AE8) — callers must not fold this into the silent bypass path.
+    VersionMismatch { daemon: u32, client: u32 },
 }
 
 impl std::fmt::Display for ClientError {
@@ -45,6 +49,10 @@ impl std::fmt::Display for ClientError {
             Self::Frame(e) => write!(f, "ipc frame: {e}"),
             Self::Daemon(e) => write!(f, "daemon error: {e}"),
             Self::Unexpected(s) => write!(f, "unexpected daemon response: {s}"),
+            Self::VersionMismatch { daemon, client } => write!(
+                f,
+                "IPC protocol mismatch: daemon speaks v{daemon}, client speaks v{client}"
+            ),
         }
     }
 }
@@ -80,7 +88,11 @@ pub fn request(socket_path: &Path, op: IpcOp) -> Result<IpcResult, ClientError> 
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
 
-    let req = IpcRequest { id: 1, op };
+    let req = IpcRequest {
+        id: 1,
+        protocol_version: IPC_PROTOCOL_VERSION,
+        op,
+    };
     let frame = encode_frame(&req)?;
     stream.write_all(&frame)?;
 
@@ -103,7 +115,54 @@ pub fn request(socket_path: &Path, op: IpcOp) -> Result<IpcResult, ClientError> 
         buf.extend_from_slice(&chunk[..n]);
     };
 
+    // Version gate on both directions: a pre-versioning daemon answers
+    // with the serde default (0); a newer daemon names the mismatch as
+    // a typed error. Both surface loudly (AE8).
+    if let Err(IpcError::VersionMismatch { daemon, client }) = &resp.result {
+        return Err(ClientError::VersionMismatch {
+            daemon: *daemon,
+            client: *client,
+        });
+    }
+    if resp.protocol_version != IPC_PROTOCOL_VERSION {
+        return Err(ClientError::VersionMismatch {
+            daemon: resp.protocol_version,
+            client: IPC_PROTOCOL_VERSION,
+        });
+    }
+
     resp.result.map_err(ClientError::Daemon)
+}
+
+/// [`IpcTransport`] over the daemon's Unix socket — the transport a
+/// `RemoteHandle` drives. Maps [`ClientError`] onto the tri-state
+/// [`TransportError`] contract: availability failures fall back
+/// silently, version mismatches are loud, everything else is a
+/// protocol failure.
+#[derive(Debug, Clone)]
+pub struct UnixTransport {
+    socket_path: PathBuf,
+}
+
+impl UnixTransport {
+    #[must_use]
+    pub fn new(socket_path: PathBuf) -> Self {
+        Self { socket_path }
+    }
+}
+
+impl IpcTransport for UnixTransport {
+    fn request(&self, op: IpcOp) -> Result<IpcResult, TransportError> {
+        request(&self.socket_path, op).map_err(|e| match e {
+            ClientError::Io(io) => TransportError::Unavailable(io.to_string()),
+            ClientError::VersionMismatch { daemon, client } => {
+                TransportError::VersionMismatch { daemon, client }
+            }
+            ClientError::Frame(f) => TransportError::Protocol(f.to_string()),
+            ClientError::Daemon(d) => TransportError::Protocol(d.to_string()),
+            ClientError::Unexpected(s) => TransportError::Protocol(s),
+        })
+    }
 }
 
 /// Convenience wrapper: ask the daemon for a `Snapshot` and unwrap

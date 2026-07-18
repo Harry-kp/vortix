@@ -21,6 +21,15 @@ pub use frame::{decode_frame, encode_frame, FrameError, MAX_FRAME_BYTES};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// Wire protocol version spoken by this build. Bumped on any breaking
+/// change to the envelope, op, or result shapes. Peers compare versions
+/// on every exchange; a mismatch is a loud typed error naming both
+/// sides — never a silent fallback (#242-era lesson: silent degradation
+/// masks real bugs). Frames from pre-versioning builds deserialize with
+/// `protocol_version = 0` via `#[serde(default)]`, which fails the
+/// comparison and surfaces the upgrade hint.
+pub const IPC_PROTOCOL_VERSION: u32 = 1;
+
 use crate::vortix_core::engine::input::UserCommand;
 use crate::vortix_core::engine::registry::{Conflict, TunnelSnapshot};
 use crate::vortix_core::engine::state::Connection;
@@ -47,10 +56,13 @@ pub enum IpcOp {
 
 /// Wrapper for the client→server direction. `id` is opaque to the
 /// daemon; the client correlates response IDs back to outstanding
-/// requests.
+/// requests. `protocol_version` defaults to 0 for frames from
+/// pre-versioning builds.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcRequest {
     pub id: u64,
+    #[serde(default)]
+    pub protocol_version: u32,
     pub op: IpcOp,
 }
 
@@ -59,6 +71,8 @@ pub struct IpcRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcResponse {
     pub id: u64,
+    #[serde(default)]
+    pub protocol_version: u32,
     pub result: Result<IpcResult, IpcError>,
 }
 
@@ -115,6 +129,83 @@ pub enum IpcError {
     /// `MalformedRequest` so clients can suggest a binary upgrade.
     #[error("unsupported wire format: {0}")]
     UnsupportedWireFormat(String),
+    /// Peer speaks a different [`IPC_PROTOCOL_VERSION`]. Both sides are
+    /// named so the user knows which binary to upgrade (AE8).
+    #[error("IPC protocol mismatch: daemon speaks v{daemon}, client speaks v{client}")]
+    VersionMismatch { daemon: u32, client: u32 },
     #[error("internal daemon error: {0}")]
     Internal(String),
+}
+
+/// Blocking transport a [`RemoteHandle`](crate::vortix_core::engine::handle)
+/// drives. The trait lives in `vortix-core` so the handle stays
+/// transport-agnostic; the Unix-socket implementation lives in the
+/// binary crate's `daemon::client`.
+pub trait IpcTransport: Send + Sync {
+    /// One request/response exchange.
+    ///
+    /// # Errors
+    ///
+    /// See [`TransportError`] — availability failures are distinguished
+    /// from protocol failures so callers can fall back silently on the
+    /// former and fail loudly on the latter.
+    fn request(&self, op: IpcOp) -> Result<IpcResult, TransportError>;
+}
+
+/// Client-side transport error surface, discriminated by how callers
+/// must react (per U1: absent daemon = silent fallback; version
+/// mismatch = loud error).
+#[derive(Debug, Clone, Error)]
+pub enum TransportError {
+    /// The daemon is not reachable (connect refused, socket gone, EOF,
+    /// timeout). Callers fall back to the Local path silently.
+    #[error("daemon unavailable: {0}")]
+    Unavailable(String),
+    /// Peer version differs — loud, never silently swallowed.
+    #[error("IPC protocol mismatch: daemon speaks v{daemon}, client speaks v{client}")]
+    VersionMismatch { daemon: u32, client: u32 },
+    /// The wire broke or the daemon answered nonsense — a bug surface,
+    /// reported like unavailability but logged at warn.
+    #[error("IPC protocol failure: {0}")]
+    Protocol(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_round_trips_with_protocol_version() {
+        let req = IpcRequest {
+            id: 7,
+            protocol_version: IPC_PROTOCOL_VERSION,
+            op: IpcOp::Snapshot,
+        };
+        let bytes = encode_frame(&req).unwrap();
+        let (decoded, _) = decode_frame::<IpcRequest>(&bytes).unwrap().unwrap();
+        assert_eq!(decoded.protocol_version, IPC_PROTOCOL_VERSION);
+        assert_eq!(decoded.id, 7);
+    }
+
+    #[test]
+    fn legacy_request_without_version_field_decodes_as_v0() {
+        // Pre-versioning builds emit envelopes without protocol_version;
+        // serde default must map them to 0 so the gate catches them.
+        let legacy = br#"{"id":1,"op":{"kind":"snapshot"}}"#;
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&u32::try_from(legacy.len()).unwrap().to_be_bytes());
+        frame.extend_from_slice(legacy);
+        let (decoded, _) = decode_frame::<IpcRequest>(&frame).unwrap().unwrap();
+        assert_eq!(decoded.protocol_version, 0);
+    }
+
+    #[test]
+    fn version_mismatch_error_names_both_sides() {
+        let e = IpcError::VersionMismatch {
+            daemon: 2,
+            client: 1,
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("v2") && msg.contains("v1"), "got: {msg}");
+    }
 }
