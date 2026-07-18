@@ -59,6 +59,26 @@ pub fn has_retry_budget(max_retries: u32, current_attempt: u32) -> bool {
     max_retries > 0 && current_attempt < max_retries
 }
 
+/// Delay (seconds) before the `attempt`-th reconnect after an unexpected
+/// drop. The first attempt waits the fixed `auto_reconnect_delay` (the
+/// TUI's drop→reconnect grace window); subsequent attempts use
+/// exponential [`backoff_delay_secs`]. Re-homing the reconnect driver
+/// into the daemon supervisor (plan 2026-07-18-001 U4) must compute the
+/// same sequence the TUI does, so this pins it (AE2/AE3).
+#[must_use]
+pub fn reconnect_delay_for_attempt(
+    attempt: u32,
+    auto_reconnect_delay: u64,
+    base: u64,
+    max_delay: u64,
+) -> u64 {
+    if attempt <= 1 {
+        auto_reconnect_delay
+    } else {
+        backoff_delay_secs(base, max_delay, attempt)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,5 +116,19 @@ mod tests {
     #[test]
     fn zero_max_retries_disables_retry() {
         assert!(!has_retry_budget(0, 0));
+    }
+
+    #[test]
+    fn reconnect_first_attempt_uses_fixed_grace_then_backoff() {
+        // Drop grace (auto_reconnect_delay) = 5s; backoff base=2, cap=300.
+        assert_eq!(reconnect_delay_for_attempt(1, 5, 2, 300), 5);
+        assert_eq!(reconnect_delay_for_attempt(2, 5, 2, 300), 4);
+        assert_eq!(reconnect_delay_for_attempt(3, 5, 2, 300), 8);
+        assert_eq!(reconnect_delay_for_attempt(4, 5, 2, 300), 16);
+    }
+
+    #[test]
+    fn reconnect_attempt_zero_treated_as_first() {
+        assert_eq!(reconnect_delay_for_attempt(0, 5, 2, 300), 5);
     }
 }

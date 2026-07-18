@@ -8,23 +8,28 @@
 //! IPC command handler can't interleave between the decision and the
 //! mutation.
 //!
-//! This commit adds adoption to the reconcile tick: kernel sessions the
-//! registry doesn't yet know about are adopted as `Connected` entries
-//! (the daemon's connects flow through a single FSM, so without this the
-//! daemon-owned registry stays empty and `IpcOp::RegistrySnapshot` has
-//! nothing to serve). Drop detection and disconnect finalization mutate
-//! the registry, and dropped tunnels are reported back so the caller can
-//! drive the kill-switch and retry follow-ups. Live kernel-scanner
-//! cadence and the retry timer wire in subsequently.
+//! Responsibilities:
+//! - **Adopt** kernel sessions the registry doesn't yet know about as
+//!   `Connected` entries (the daemon's own connects flow through a single
+//!   FSM, so without adoption the registry would stay empty and
+//!   `IpcOp::RegistrySnapshot` would have nothing to serve).
+//! - **Reconcile** existing entries: finalize disconnects, detect drops.
+//! - **Auto-reconnect** tunnels that dropped unexpectedly, via the retry
+//!   ladder re-homed from the TUI (`run_supervisor` / `drive_due_reconnects`).
+//!
+//! Still to come: arming the kill switch on an unexpected drop (needs the
+//! daemon to load kill-switch mode + apply root firewall rules).
 
-use std::time::{Duration, SystemTime};
+use std::collections::HashMap;
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::core::scanner::ActiveSession;
 use crate::tunnel::TunnelKind;
+use crate::vortix_core::engine::input::UserCommand;
 use crate::vortix_core::engine::reconcile::{classify, ReconcileAction};
 use crate::vortix_core::engine::registry_handle::RegistryHandle;
 use crate::vortix_core::engine::state::{Connection, DetailedConnectionInfo};
-use crate::vortix_core::engine::Engine;
+use crate::vortix_core::engine::{Engine, EngineHandle};
 use crate::vortix_core::ports::tunnel::mock::MockTunnel;
 use crate::vortix_core::profile::ProfileId;
 
@@ -221,21 +226,52 @@ fn placeholder_engine() -> Engine<TunnelKind> {
     Engine::new(TunnelKind::Mock(MockTunnel::new()), |_: &ProfileId| None)
 }
 
+/// Knobs the supervision loop needs, lifted from `AppConfig` so the
+/// daemon and the TUI compute identical cadence and retry behavior.
+#[derive(Debug, Clone)]
+pub struct SupervisorConfig {
+    pub scan_interval_secs: u64,
+    pub disconnect_timeout_secs: u64,
+    pub auto_reconnect: bool,
+    pub auto_reconnect_delay_secs: u64,
+    pub max_retries: u32,
+    pub retry_base_delay_secs: u64,
+    pub retry_max_delay_secs: u64,
+}
+
+/// One profile's in-flight auto-reconnect bookkeeping.
+struct RetryTrack {
+    /// 1-based attempt about to be (or just) made.
+    attempt: u32,
+    /// When the next attempt is due.
+    next_at: Instant,
+}
+
+/// True when `state` is `Connected` to the named profile.
+fn is_connected_to(state: &Connection, name: &str) -> bool {
+    matches!(state, Connection::Connected { profile_id, .. } if profile_id.as_str() == name)
+}
+
 /// The daemon's headless supervision loop: on each tick, scan the kernel
-/// for live sessions and reconcile them against the daemon-owned
-/// registry (adopt new, finalize disconnects, detect drops). Runs until
-/// the registry owner task terminates (daemon shutdown).
+/// for live sessions, reconcile them against the daemon-owned registry
+/// (adopt new, finalize disconnects, detect drops), and drive headless
+/// auto-reconnect for tunnels that dropped unexpectedly (AE2/AE3). Runs
+/// until the registry owner task terminates (daemon shutdown).
 ///
-/// The kill-switch/retry follow-up for dropped tunnels lands with the
-/// retry-ladder re-homing (next commit); today drops are logged.
+/// Reconnect execution needs the daemon's `engine` handle; when absent
+/// (engine unavailable at boot) the loop still reconciles the registry
+/// but cannot reconnect. Kill-switch arming on drop is a follow-up (it
+/// needs the daemon to load kill-switch mode + apply root firewall
+/// rules, validated live).
 ///
 /// Spawn this onto the daemon runtime alongside the accept loop.
 pub async fn run_supervisor(
     registry: RegistryHandle<TunnelKind>,
-    scan_interval_secs: u64,
-    disconnect_timeout_secs: u64,
+    engine: Option<EngineHandle>,
+    config: SupervisorConfig,
 ) {
-    let mut ticker = tokio::time::interval(Duration::from_secs(scan_interval_secs.max(1)));
+    let mut retries: HashMap<String, RetryTrack> = HashMap::new();
+    let mut ticker = tokio::time::interval(Duration::from_secs(config.scan_interval_secs.max(1)));
     loop {
         ticker.tick().await;
 
@@ -257,20 +293,108 @@ pub async fn run_supervisor(
         let view = ScannerView {
             sessions: sessions.iter().map(ScannedSession::from).collect(),
         };
-        match reconcile_tick(&registry, view, disconnect_timeout_secs).await {
-            Ok(outcome) => {
-                if !outcome.adopted.is_empty() || !outcome.dropped.is_empty() {
-                    tracing::info!(
-                        adopted = ?outcome.adopted,
-                        dropped = ?outcome.dropped,
-                        "supervisor reconcile"
-                    );
-                }
-            }
+        let outcome = match reconcile_tick(&registry, view, config.disconnect_timeout_secs).await {
+            Ok(outcome) => outcome,
             Err(e) => {
                 tracing::warn!(error = %e, "supervisor registry terminated; stopping supervision");
                 break;
             }
+        };
+        if !outcome.adopted.is_empty() || !outcome.dropped.is_empty() {
+            tracing::info!(
+                adopted = ?outcome.adopted,
+                dropped = ?outcome.dropped,
+                "supervisor reconcile"
+            );
+        }
+
+        // A tunnel that reappeared (adopted) is healthy again — clear any
+        // pending reconnect for it.
+        for name in &outcome.adopted {
+            retries.remove(name);
+        }
+
+        // Schedule auto-reconnect for genuine drops (a Connected tunnel
+        // that vanished). The first attempt waits the fixed grace window;
+        // failures escalate via exponential backoff up to `max_retries`.
+        if config.auto_reconnect {
+            for dropped in &outcome.dropped {
+                if dropped.was_connected && !retries.contains_key(&dropped.profile) {
+                    let delay = crate::state::retry::reconnect_delay_for_attempt(
+                        1,
+                        config.auto_reconnect_delay_secs,
+                        config.retry_base_delay_secs,
+                        config.retry_max_delay_secs,
+                    );
+                    tracing::info!(profile = %dropped.profile, delay, "auto-reconnect scheduled");
+                    retries.insert(
+                        dropped.profile.clone(),
+                        RetryTrack {
+                            attempt: 1,
+                            next_at: Instant::now() + Duration::from_secs(delay),
+                        },
+                    );
+                }
+            }
+        }
+
+        // Fire any reconnect whose delay has elapsed. Executing a connect
+        // blocks this loop until the FSM settles — intended: the whole
+        // point of the tick is to bring the tunnel back.
+        if let Some(engine) = &engine {
+            drive_due_reconnects(engine, &config, &mut retries).await;
+        }
+    }
+}
+
+/// Execute every reconnect that is due, updating the retry bookkeeping:
+/// success clears the entry, failure reschedules with backoff until the
+/// budget is exhausted (then gives up).
+async fn drive_due_reconnects(
+    engine: &EngineHandle,
+    config: &SupervisorConfig,
+    retries: &mut HashMap<String, RetryTrack>,
+) {
+    let now = Instant::now();
+    let due: Vec<String> = retries
+        .iter()
+        .filter(|(_, track)| track.next_at <= now)
+        .map(|(name, _)| name.clone())
+        .collect();
+
+    for name in due {
+        let attempt = retries.get(&name).map_or(1, |t| t.attempt);
+        tracing::info!(profile = %name, attempt, "auto-reconnect attempt");
+        let _ = engine
+            .execute_command(UserCommand::Connect {
+                profile_id: ProfileId::new(&name),
+            })
+            .await;
+
+        let connected =
+            matches!(engine.snapshot().await, Ok(s) if is_connected_to(&s.state, &name));
+        if connected {
+            tracing::info!(profile = %name, "auto-reconnect succeeded");
+            retries.remove(&name);
+        } else if crate::state::retry::has_retry_budget(config.max_retries, attempt) {
+            let next_attempt = attempt + 1;
+            let delay = crate::state::retry::reconnect_delay_for_attempt(
+                next_attempt,
+                config.auto_reconnect_delay_secs,
+                config.retry_base_delay_secs,
+                config.retry_max_delay_secs,
+            );
+            tracing::warn!(profile = %name, next_attempt, delay, "auto-reconnect failed; retrying");
+            retries.insert(
+                name,
+                RetryTrack {
+                    attempt: next_attempt,
+                    next_at: Instant::now() + Duration::from_secs(delay),
+                },
+            );
+        } else {
+            tracing::warn!(profile = %name, "auto-reconnect gave up (retry budget exhausted)");
+            retries.remove(&name);
         }
     }
 }

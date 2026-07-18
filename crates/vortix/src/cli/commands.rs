@@ -295,23 +295,28 @@ fn handle_daemon(socket_override: Option<std::path::PathBuf>, mode: OutputMode) 
         |d| d.join(constants::PROFILES_DIR_NAME),
     );
 
-    let server = runtime.block_on(async move {
-        if let Some(handle) = crate::daemon::build_engine_handle(&profiles_dir) {
-            server.with_engine_handle(handle)
-        } else {
-            eprintln!(
-                "vortix daemon: engine handle unavailable (journal or runner not installed) — Execute/Snapshot/Subscribe will return Internal errors"
-            );
-            server
-        }
-    });
+    // Build the engine handle once; keep a clone for the supervisor's
+    // headless auto-reconnect (it drives connects through the same FSM).
+    let engine_handle =
+        runtime.block_on(async { crate::daemon::build_engine_handle(&profiles_dir) });
+    if engine_handle.is_none() {
+        eprintln!(
+            "vortix daemon: engine handle unavailable (journal or runner not installed) — Execute/Snapshot/Subscribe will return Internal errors"
+        );
+    }
+    let supervisor_engine = engine_handle.clone();
+    let server = if let Some(handle) = engine_handle {
+        server.with_engine_handle(handle)
+    } else {
+        server
+    };
 
     // The daemon owns a multi-tunnel registry independent of the single
     // FSM engine handle. A headless supervisor loop keeps it in sync with
-    // the kernel (adopt new sessions, detect drops), and the server serves
-    // it over `IpcOp::RegistrySnapshot`. Both run even when the engine
-    // handle is unavailable — read-only multi-tunnel status doesn't need
-    // the FSM. (plan 2026-07-18-001 U2)
+    // the kernel (adopt new sessions, detect drops, auto-reconnect), and
+    // the server serves it over `IpcOp::RegistrySnapshot`. Reconcile runs
+    // even when the engine handle is unavailable — read-only multi-tunnel
+    // status doesn't need the FSM. (plan 2026-07-18-001 U2/U4)
     let registry: crate::vortix_core::engine::registry_handle::RegistryHandle<
         crate::tunnel::TunnelKind,
     > = runtime.block_on(async {
@@ -320,10 +325,25 @@ fn handle_daemon(socket_override: Option<std::path::PathBuf>, mode: OutputMode) 
         )
     });
     let server = server.with_registry_handle(registry.clone());
+
+    // Retry/cadence knobs from config so the daemon and TUI behave alike.
+    let cfg = crate::utils::get_app_config_dir()
+        .ok()
+        .and_then(|dir| crate::config::load_config(&dir).ok())
+        .unwrap_or_default();
+    let supervisor_config = crate::daemon::supervisor::SupervisorConfig {
+        scan_interval_secs: constants::DAEMON_SCAN_INTERVAL_SECS,
+        disconnect_timeout_secs: constants::DEFAULT_DISCONNECT_TIMEOUT,
+        auto_reconnect: cfg.auto_reconnect,
+        auto_reconnect_delay_secs: cfg.auto_reconnect_delay_secs,
+        max_retries: cfg.connect_max_retries,
+        retry_base_delay_secs: cfg.connect_retry_base_delay_secs,
+        retry_max_delay_secs: cfg.connect_retry_max_delay_secs,
+    };
     runtime.spawn(crate::daemon::supervisor::run_supervisor(
         registry,
-        constants::DAEMON_SCAN_INTERVAL_SECS,
-        constants::DEFAULT_DISCONNECT_TIMEOUT,
+        supervisor_engine,
+        supervisor_config,
     ));
 
     runtime.block_on(async {
