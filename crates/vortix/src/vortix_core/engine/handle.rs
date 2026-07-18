@@ -161,6 +161,31 @@ impl RemoteHandle {
             ))),
         }
     }
+
+    /// Send a user command to the daemon for execution (plan
+    /// 2026-07-18-001 U3). The daemon runs it against its engine and
+    /// answers `Accepted` once the FSM has processed it (the connection
+    /// stays open for the tunnel lifecycle, so this awaits the real
+    /// connect/disconnect). A registry conflict comes back as a typed
+    /// daemon error surfaced through [`TransportError::Protocol`].
+    ///
+    /// # Errors
+    ///
+    /// See [`TransportError`]: unavailable = silent fallback candidate,
+    /// version mismatch = loud, protocol = daemon rejected/erred.
+    pub async fn execute_remote(&self, cmd: UserCommand) -> Result<(), TransportError> {
+        let transport = Arc::clone(&self.transport);
+        let result =
+            tokio::task::spawn_blocking(move || transport.request(IpcOp::Execute(cmd)))
+                .await
+                .map_err(|e| TransportError::Protocol(format!("blocking task join: {e}")))??;
+        match result {
+            IpcResult::Accepted => Ok(()),
+            other => Err(TransportError::Protocol(format!(
+                "expected execute ack, daemon answered {other:?}"
+            ))),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -192,9 +217,19 @@ impl EngineHandle {
     pub async fn execute(&self, input: Input) -> Result<CommandAck, EngineError> {
         match self {
             Self::Local(h) => h.execute(input).await,
-            Self::Remote(_) => Err(EngineError::Other(
-                "remote execute is not supported yet (lands with daemon-writes, plan 2026-07-18-001 U3)".into(),
-            )),
+            // Only user commands cross the IPC boundary; the other Input
+            // variants are internal FSM feeds (ticks, telemetry, link
+            // changes) the daemon generates for itself, never the client.
+            Self::Remote(h) => match input {
+                Input::UserCommand(cmd) => h
+                    .execute_remote(cmd)
+                    .await
+                    .map(|()| CommandAck { events_emitted: 0 })
+                    .map_err(|e| EngineError::Other(e.to_string())),
+                other => Err(EngineError::Other(format!(
+                    "remote execute only accepts user commands, got {other:?}"
+                ))),
+            },
         }
     }
 
@@ -527,13 +562,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn engine_handle_remote_execute_and_subscribe_are_unsupported_in_u1() {
+    async fn remote_execute_maps_accepted_to_ok() {
         let transport = Arc::new(MockTransport::new(Ok(IpcResult::Accepted)));
         let handle = EngineHandle::Remote(RemoteHandle::new(transport));
-        assert!(handle
+        let ack = handle
             .execute_command(UserCommand::Disconnect { profile_id: None })
             .await
+            .expect("accepted");
+        assert_eq!(ack.events_emitted, 0);
+    }
+
+    #[tokio::test]
+    async fn remote_execute_surfaces_daemon_error() {
+        // A non-Accepted success variant is a protocol error.
+        let transport = Arc::new(MockTransport::new(Ok(IpcResult::Subscribed)));
+        let handle = EngineHandle::Remote(RemoteHandle::new(transport));
+        assert!(handle
+            .execute_command(UserCommand::Connect {
+                profile_id: ProfileId::new("corp"),
+            })
+            .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn engine_handle_remote_subscribe_still_unsupported() {
+        let transport = Arc::new(MockTransport::new(Ok(IpcResult::Accepted)));
+        let handle = EngineHandle::Remote(RemoteHandle::new(transport));
         assert!(handle.subscribe().await.is_err());
     }
 }

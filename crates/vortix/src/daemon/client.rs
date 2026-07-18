@@ -71,12 +71,30 @@ impl From<FrameError> for ClientError {
     }
 }
 
+/// Default read timeout for near-instant read-only ops (`Snapshot`,
+/// `RegistrySnapshot`). If the daemon hangs longer, the caller gets an
+/// `Io` error and falls back to the direct bypass path.
+const DEFAULT_READ_TIMEOUT_SECS: u64 = 2;
+
+/// Read timeout for `Execute` — the daemon holds the connection open
+/// until the FSM finishes the (possibly slow) connect/disconnect, so
+/// this must comfortably exceed the connect timeout
+/// ([`crate::constants::DEFAULT_CONNECT_TIMEOUT`] = 35s) plus teardown
+/// margin. A write that outlives this surfaces as a transport failure.
+const EXECUTE_READ_TIMEOUT_SECS: u64 = 60;
+
+/// The read timeout appropriate for `op`. Reads are quick; `Execute`
+/// blocks on the real tunnel lifecycle.
+fn read_timeout_for(op: &IpcOp) -> Duration {
+    match op {
+        IpcOp::Execute(_) => Duration::from_secs(EXECUTE_READ_TIMEOUT_SECS),
+        _ => Duration::from_secs(DEFAULT_READ_TIMEOUT_SECS),
+    }
+}
+
 /// One-shot RPC against the daemon. Opens a fresh `UnixStream`,
-/// sends `op` framed with `id`, reads exactly one response frame.
-///
-/// Defaults to a 2-second read timeout — read-only ops should be
-/// near-instant; if the daemon hangs longer than that, the caller
-/// gets an `Io` error and falls back to the direct bypass path.
+/// sends `op` framed with `id`, reads exactly one response frame. The
+/// read timeout is chosen per-op ([`read_timeout_for`]).
 ///
 /// # Errors
 ///
@@ -84,9 +102,10 @@ impl From<FrameError> for ClientError {
 /// handlers treat any error here as "bypass: read directly from
 /// disk + scanner instead".
 pub fn request(socket_path: &Path, op: IpcOp) -> Result<IpcResult, ClientError> {
+    let read_timeout = read_timeout_for(&op);
     let mut stream = UnixStream::connect(socket_path)?;
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_read_timeout(Some(read_timeout))?;
+    stream.set_write_timeout(Some(Duration::from_secs(DEFAULT_READ_TIMEOUT_SECS)))?;
 
     let req = IpcRequest {
         id: 1,
