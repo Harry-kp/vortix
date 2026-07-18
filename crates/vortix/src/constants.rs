@@ -42,6 +42,9 @@ pub const DEFAULT_CONNECT_TIMEOUT: u64 = 35;
 pub const CMD_TIMEOUT_SECS: u64 = 5;
 /// Default maximum seconds to wait for a VPN disconnect before force-killing.
 pub const DEFAULT_DISCONNECT_TIMEOUT: u64 = 30;
+/// Cadence (seconds) of the daemon's headless supervision loop — how often
+/// it rescans the kernel to adopt new sessions and detect drops.
+pub const DAEMON_SCAN_INTERVAL_SECS: u64 = 2;
 /// Default maximum connection retry attempts on failure (0 = disabled).
 pub const DEFAULT_CONNECT_MAX_RETRIES: u32 = 3;
 /// Default base delay (seconds) for exponential backoff: delay = base * 2^(attempt-1).

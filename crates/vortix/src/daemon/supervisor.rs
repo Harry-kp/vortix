@@ -17,8 +17,9 @@
 //! drive the kill-switch and retry follow-ups. Live kernel-scanner
 //! cadence and the retry timer wire in subsequently.
 
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
+use crate::core::scanner::ActiveSession;
 use crate::tunnel::TunnelKind;
 use crate::vortix_core::engine::reconcile::{classify, ReconcileAction};
 use crate::vortix_core::engine::registry_handle::RegistryHandle;
@@ -87,6 +88,26 @@ impl ScannedSession {
             transfer_tx: self.transfer_tx.clone(),
             latest_handshake: self.latest_handshake.clone(),
             pid: self.pid,
+        }
+    }
+}
+
+impl From<&ActiveSession> for ScannedSession {
+    fn from(s: &ActiveSession) -> Self {
+        Self {
+            name: s.name.clone(),
+            interface: s.interface.clone(),
+            interface_authoritative: s.interface_authoritative,
+            internal_ip: s.internal_ip.clone(),
+            endpoint: s.endpoint.clone(),
+            mtu: s.mtu.clone(),
+            public_key: s.public_key.clone(),
+            listen_port: s.listen_port.clone(),
+            transfer_rx: s.transfer_rx.clone(),
+            transfer_tx: s.transfer_tx.clone(),
+            latest_handshake: s.latest_handshake.clone(),
+            pid: s.pid,
+            started_at: s.started_at,
         }
     }
 }
@@ -198,6 +219,60 @@ pub async fn reconcile_tick(
 /// the inner tunnel is dead storage that only satisfies the generic bound.
 fn placeholder_engine() -> Engine<TunnelKind> {
     Engine::new(TunnelKind::Mock(MockTunnel::new()), |_: &ProfileId| None)
+}
+
+/// The daemon's headless supervision loop: on each tick, scan the kernel
+/// for live sessions and reconcile them against the daemon-owned
+/// registry (adopt new, finalize disconnects, detect drops). Runs until
+/// the registry owner task terminates (daemon shutdown).
+///
+/// The kill-switch/retry follow-up for dropped tunnels lands with the
+/// retry-ladder re-homing (next commit); today drops are logged.
+///
+/// Spawn this onto the daemon runtime alongside the accept loop.
+pub async fn run_supervisor(
+    registry: RegistryHandle<TunnelKind>,
+    scan_interval_secs: u64,
+    disconnect_timeout_secs: u64,
+) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(scan_interval_secs.max(1)));
+    loop {
+        ticker.tick().await;
+
+        // The scan reads `/proc`, runs `wg`/`ip`, and loads profile
+        // sidecars — all blocking. Keep it off the async worker.
+        let sessions = match tokio::task::spawn_blocking(|| {
+            let profiles = crate::vpn::load_profiles();
+            crate::core::scanner::get_active_profiles(&profiles)
+        })
+        .await
+        {
+            Ok(sessions) => sessions,
+            Err(e) => {
+                tracing::warn!(error = %e, "supervisor scan task failed; skipping tick");
+                continue;
+            }
+        };
+
+        let view = ScannerView {
+            sessions: sessions.iter().map(ScannedSession::from).collect(),
+        };
+        match reconcile_tick(&registry, view, disconnect_timeout_secs).await {
+            Ok(outcome) => {
+                if !outcome.adopted.is_empty() || !outcome.dropped.is_empty() {
+                    tracing::info!(
+                        adopted = ?outcome.adopted,
+                        dropped = ?outcome.dropped,
+                        "supervisor reconcile"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "supervisor registry terminated; stopping supervision");
+                break;
+            }
+        }
+    }
 }
 
 #[cfg(test)]

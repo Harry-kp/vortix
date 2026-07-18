@@ -306,6 +306,26 @@ fn handle_daemon(socket_override: Option<std::path::PathBuf>, mode: OutputMode) 
         }
     });
 
+    // The daemon owns a multi-tunnel registry independent of the single
+    // FSM engine handle. A headless supervisor loop keeps it in sync with
+    // the kernel (adopt new sessions, detect drops), and the server serves
+    // it over `IpcOp::RegistrySnapshot`. Both run even when the engine
+    // handle is unavailable — read-only multi-tunnel status doesn't need
+    // the FSM. (plan 2026-07-18-001 U2)
+    let registry: crate::vortix_core::engine::registry_handle::RegistryHandle<
+        crate::tunnel::TunnelKind,
+    > = runtime.block_on(async {
+        crate::vortix_core::engine::registry_handle::RegistryHandle::spawn(
+            crate::vortix_core::engine::registry::TunnelRegistry::new(),
+        )
+    });
+    let server = server.with_registry_handle(registry.clone());
+    runtime.spawn(crate::daemon::supervisor::run_supervisor(
+        registry,
+        constants::DAEMON_SCAN_INTERVAL_SECS,
+        constants::DEFAULT_DISCONNECT_TIMEOUT,
+    ));
+
     runtime.block_on(async {
         if let Err(e) = server.run().await {
             eprintln!("vortix daemon: accept loop terminated: {e}");
