@@ -262,6 +262,33 @@ fn cli_status_disconnected() {
     assert_eq!(exit, 0);
 }
 
+// R11: with no active tunnels the no-daemon `down` path returns success
+// (idempotent "already disconnected") without touching a daemon or the
+// privileged local teardown — this is the default path the review flagged
+// as untested. The idempotent check short-circuits before the daemon
+// branch, so the test is hermetic regardless of any stray socket.
+#[test]
+fn cli_down_idempotent_when_nothing_active() {
+    use vortix::cli::args::Commands;
+    use vortix::cli::commands::handle_command;
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = vortix::config::AppConfig::default();
+
+    let exit = handle_command(
+        &Commands::Down {
+            profile: None,
+            all: false,
+            force: false,
+        },
+        dir.path(),
+        "test",
+        &config,
+        OutputMode::Quiet,
+    );
+    assert_eq!(exit, 0);
+}
+
 #[test]
 fn cli_killswitch_show_mode() {
     use vortix::cli::args::Commands;
