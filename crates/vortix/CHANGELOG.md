@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-07-18
+
+### Bug Fixes
+
+- Bind daemon socket inside Tokio runtime ([#233](https://github.com/Harry-kp/vortix/pull/233))
+- **connect:** Pre-flight gate when profile declares IPv6 but host IPv6 is disabled (closes #242) ([#247](https://github.com/Harry-kp/vortix/pull/247))
+- **cli:** Lifecycle hardening — idempotent up, tracked-orphan filter, flock lock ([#249](https://github.com/Harry-kp/vortix/pull/249))
+
+### Documentation
+
+- **readme:** Install matrix, named competitors, security model, contributing ([#230](https://github.com/Harry-kp/vortix/pull/230))
+- Refresh demo GIFs + README cleanup ([#236](https://github.com/Harry-kp/vortix/pull/236))
+- **readme:** Add X/Twitter handle badge ([#244](https://github.com/Harry-kp/vortix/pull/244))
+
+### Refactor
+
+- **flip-panel:** Consume extracted ratatui-flip-panel crate ([#232](https://github.com/Harry-kp/vortix/pull/232))
+
+
+
 ### Fixed
 
 - **`vortix up` is now truly idempotent.** Re-running `up` for an already-connected profile prints `Already connected` and exits 0 instead of re-spawning the tunnel. Previously a second `up` of an OpenVPN profile spawned a duplicate daemon whose `--writepid` clobbered the first's pidfile, leaving the original daemon untracked.
