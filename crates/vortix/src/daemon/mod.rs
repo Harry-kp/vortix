@@ -24,6 +24,7 @@
 
 pub mod client;
 mod server;
+pub mod supervisor;
 
 pub use server::DaemonServer;
 

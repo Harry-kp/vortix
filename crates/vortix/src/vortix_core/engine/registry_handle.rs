@@ -33,9 +33,11 @@ pub struct RegistrySnapshot {
     pub killswitch: KillSwitchState,
 }
 
-/// A boxed mutation closure run against the owned registry on the owner
-/// thread. Returns the post-mutation [`ApplyOutcome`].
-type ApplyFn<T> = Box<dyn FnOnce(&mut TunnelRegistry<T>) -> ApplyOutcome + Send>;
+/// A boxed job run against the owned registry on the owner thread. The
+/// job captures its own typed reply sender, so the envelope stays
+/// non-generic over the mutation's return type — the standard
+/// actor-with-arbitrary-return pattern.
+type RegistryJob<T> = Box<dyn FnOnce(&mut TunnelRegistry<T>) + Send>;
 
 /// One message to the registry owner task. Generic over the tunnel type
 /// so `Apply` can carry a closure operating on the concrete registry.
@@ -43,22 +45,11 @@ enum RegistryEnvelope<T: Tunnel> {
     Snapshot {
         reply: oneshot::Sender<RegistrySnapshot>,
     },
-    /// Run a mutation against the registry on the owner thread and
-    /// return a value. Used by the supervisor to feed scanner-derived
-    /// reconciliation without holding a lock across `.await`.
-    Apply {
-        f: ApplyFn<T>,
-        reply: oneshot::Sender<ApplyOutcome>,
-    },
-}
-
-/// Serializable-friendly result of an `apply` mutation. The supervisor
-/// needs the post-mutation snapshot to decide follow-up side effects
-/// (kill switch, retry), so `apply` returns one alongside caller-chosen
-/// data.
-#[derive(Debug, Clone)]
-pub struct ApplyOutcome {
-    pub snapshot: RegistrySnapshot,
+    /// Run a mutation against the registry on the owner thread. The job
+    /// owns its reply channel. Used by the supervisor to feed
+    /// scanner-derived reconciliation without holding a lock across
+    /// `.await`.
+    Apply(RegistryJob<T>),
 }
 
 /// Clone-able handle to the registry owner task. Cheap to clone (holds
@@ -108,21 +99,24 @@ impl<T: Tunnel + Send + 'static> RegistryHandle<T> {
     }
 
     /// Run a mutation against the registry on the owner thread and
-    /// return the resulting [`ApplyOutcome`] (post-mutation snapshot).
+    /// return the closure's value. The closure runs to completion on the
+    /// owner before any other message, so a decision-then-mutation is
+    /// atomic w.r.t. concurrent IPC command handlers.
     ///
     /// # Errors
     ///
     /// Returns [`EngineError::Other`] when the owner task has terminated.
-    pub async fn apply<F>(&self, f: F) -> Result<ApplyOutcome, EngineError>
+    pub async fn apply<F, R>(&self, f: F) -> Result<R, EngineError>
     where
-        F: FnOnce(&mut TunnelRegistry<T>) -> ApplyOutcome + Send + 'static,
+        F: FnOnce(&mut TunnelRegistry<T>) -> R + Send + 'static,
+        R: Send + 'static,
     {
-        let (reply, rx) = oneshot::channel();
+        let (reply, rx) = oneshot::channel::<R>();
+        let job: RegistryJob<T> = Box::new(move |reg| {
+            let _ = reply.send(f(reg));
+        });
         self.tx
-            .send(RegistryEnvelope::Apply {
-                f: Box::new(f),
-                reply,
-            })
+            .send(RegistryEnvelope::Apply(job))
             .await
             .map_err(|_| EngineError::Other("registry actor terminated".into()))?;
         rx.await
@@ -130,16 +124,14 @@ impl<T: Tunnel + Send + 'static> RegistryHandle<T> {
     }
 }
 
-/// Build an [`ApplyOutcome`] from the registry's current state — a
-/// convenience for `apply` closures that mutate then snapshot.
+/// Snapshot the registry's current state — a convenience for `apply`
+/// closures and the owner loop's read path.
 #[must_use]
-pub fn outcome_of<T: Tunnel>(registry: &TunnelRegistry<T>) -> ApplyOutcome {
-    ApplyOutcome {
-        snapshot: RegistrySnapshot {
-            tunnels: registry.snapshot_all(),
-            primary: registry.primary().cloned(),
-            killswitch: registry.killswitch_state(),
-        },
+pub fn snapshot_of<T: Tunnel>(registry: &TunnelRegistry<T>) -> RegistrySnapshot {
+    RegistrySnapshot {
+        tunnels: registry.snapshot_all(),
+        primary: registry.primary().cloned(),
+        killswitch: registry.killswitch_state(),
     }
 }
 
@@ -156,12 +148,9 @@ fn owner_loop<T: Tunnel>(
     while let Some(env) = rx.blocking_recv() {
         match env {
             RegistryEnvelope::Snapshot { reply } => {
-                let _ = reply.send(outcome_of(&registry).snapshot);
+                let _ = reply.send(snapshot_of(&registry));
             }
-            RegistryEnvelope::Apply { f, reply } => {
-                let outcome = f(&mut registry);
-                let _ = reply.send(outcome);
-            }
+            RegistryEnvelope::Apply(job) => job(&mut registry),
         }
     }
 }
@@ -204,23 +193,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_runs_mutation_on_owner_and_returns_outcome() {
-        // The apply closure runs on the owner thread; its ApplyOutcome
-        // carries a post-mutation snapshot. With an empty registry and a
-        // no-op mutation, the outcome snapshot is still empty — but the
-        // round-trip proves the mutation channel and outcome plumbing.
+    async fn apply_runs_mutation_on_owner_and_returns_value() {
+        // The apply closure runs on the owner thread and returns an
+        // arbitrary value. Round-trip proves the mutation channel and
+        // the reply-capturing generic-return plumbing.
         let registry: TunnelRegistry<MockTunnel> = TunnelRegistry::new();
         let handle = RegistryHandle::spawn(registry);
-        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let ran_c = ran.clone();
-        let outcome = handle
-            .apply(move |reg| {
-                ran_c.store(true, std::sync::atomic::Ordering::SeqCst);
-                outcome_of(reg)
-            })
+        let count = handle
+            .apply(|reg| reg.snapshot_all().len())
             .await
             .expect("apply");
-        assert!(ran.load(std::sync::atomic::Ordering::SeqCst));
-        assert!(outcome.snapshot.tunnels.is_empty());
+        assert_eq!(count, 0);
     }
 }
