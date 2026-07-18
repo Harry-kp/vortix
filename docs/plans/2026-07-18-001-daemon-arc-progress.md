@@ -3,7 +3,7 @@
 Companion to `docs/plans/2026-07-18-001-feat-daemon-tunnel-ownership-plan.md`
 (the decision artifact — do **not** edit its body; state lives here + in git).
 
-**Last updated:** 2026-07-18 (session 2)
+**Last updated:** 2026-07-18 (session 2, cont.)
 
 ## Where it lives
 
@@ -11,8 +11,10 @@ Companion to `docs/plans/2026-07-18-001-feat-daemon-tunnel-ownership-plan.md`
 - **Branch:** `origin/feat/daemon-u1-remote-handle` (PR head). The local
   mirror `tmp-daemon-arc` is identical to it. **The local branch
   `feat/daemon-u1-remote-handle` is STALE** (ahead 2 / behind 12) — ignore it.
-- **HEAD:** `d220ba5` — registry now served AND consumed end-to-end
-  (`vortix status` renders multi-tunnel state from a live daemon).
+- **HEAD:** `d667ea3` — U1–U3 complete + U4 core (adoption, boot, headless
+  auto-reconnect, event streaming, R7 startup adoption). The daemon owns
+  tunnels, serves multi-tunnel state, streams events, and executes writes
+  no-sudo. Remaining: TUI cutover, kill-switch-on-drop, U5 boot, U6 closure.
 - **Do NOT merge** until the already-shipped fixes are released. User decision:
   release existing work first, daemon PRs merge after. (Independent of PR #252,
   the release-notes workflow.)
@@ -48,6 +50,13 @@ U2 now carries U4's body, delivered as sub-commits (a)–(g). U3/U5/U6 unchanged
 | `a2ccca5` | U2 | daemon boot spawns a `RegistryHandle` + `run_supervisor` loop (2s cadence) + `with_registry_handle`; `IpcOp::RegistrySnapshot` now serves live state |
 | `ba4bb4b` | U2 | `vortix status` renders multi-tunnel from the registry (JSON `connections[]`/`primary`), scanner counters overlaid on primary; 3-tier fallback registry→single-FSM→scanner; no-daemon path unchanged |
 | `d220ba5` | — | rustdoc link fix |
+| `17ee6e8` | U3 | client-side `execute_remote` + op-aware transport timeout (60s for Execute); `EngineHandle::Remote::execute` routes user commands |
+| `c402cbb` | U3 | CLI `up`/`down`/`reconnect` route through the daemon when present (no sudo); connect verifies resulting state (no false "connected"); lifecycle lock moved to local path only; 2FA connects refused on daemon path |
+| `68e86ab` | U3 | daemon-boundary profile-id validation (reject `..`, separators, overlong, empty) — R10 hardening |
+| `9d04838` | — | rustdoc pub→private link fix |
+| `15e98a5` | U4 | headless auto-reconnect in the supervisor (`reconnect_delay_for_attempt` + `run_supervisor`/`drive_due_reconnects`); retry ladder re-homed, characterization-tested (AE2/AE3) |
+| `e814e49` | U2 | **Subscribe event streaming** — server push loop (`stream_events`) + client reader thread (`UnixTransport::subscribe`) + `IpcResult::Event`; two loopback tests |
+| `d667ea3` | U4 | adopt running tunnels once before serving (R7 first-snapshot guarantee) |
 
 Full CI parity set green on this branch as of 2026-07-18 session 2 (fmt,
 check, clippy --workspace --all-targets, test --workspace, rustdoc, all 4
@@ -56,70 +65,53 @@ xtask leak checks). macOS host caveat: the Linux SO_PEERCRED block in
 Linux CI leg. End-to-end smoke: `vortix status --json` routes through a
 live daemon's registry (empty when no VPN up; multi-tunnel is live-test #2).
 
-## Remaining — in dependency order
+## DONE this session (U1–U3 + U4 core)
 
-### Still inside the merged U2/U4 phase
+- **U1** version handshake + Remote read + `status` via Remote.
+- **U2** full: concurrent accept loop, `RegistryHandle` actor, adoption, boot
+  wiring, multi-tunnel `status`, and **Subscribe event streaming** (server push
+  + client reader thread, two loopback tests).
+- **U3** full: client `execute` + CLI `up`/`down`/`reconnect` routed through the
+  daemon **no-sudo** (connect verifies resulting state; lifecycle lock local-path
+  only), and daemon-boundary **profile-id validation** (R10). 2FA connects are
+  refused on the daemon path (in-band OTP delivery deferred). Covers AE1; AE7
+  (central serialization via the single engine actor) is live-verified.
+- **U4 core**: headless **auto-reconnect** (retry ladder re-homed, AE2/AE3
+  characterization-tested) + **R7 startup adoption** (first-snapshot survival).
 
-1. **RegistrySnapshot client consumer + multi-tunnel `status`.**
-   **DONE** (`a437b9f` consumer, `ba4bb4b` status render). Also DONE this
-   session: supervisor **adoption** (`c53b5f8`) + **boot wiring** (`a2ccca5`)
-   — the daemon now owns a registry populated by a 2s supervisor loop and
-   serves it, so `vortix status` shows live multi-tunnel state. Discovery that
-   drove the ordering: the daemon's connects flow through a single FSM, so
-   without adoption the registry stayed empty and the whole path was a no-op.
+## Remaining
 
-2. **Supervisor drop follow-up (kill-switch + retry).** `reconcile_tick`
-   detects drops and returns them, and `run_supervisor` logs them — but the
-   kill-switch arming and auto-reconnect scheduling for a dropped tunnel are
-   not wired yet. **Characterization-first** for the retry ladder: capture
-   today's TUI retry behavior (attempt counts, delays via `backoff_delay_secs`,
-   auth-failure stop via `has_retry_budget`) in tests before re-homing the
-   driver out of `app/update.rs` (AE3 parity proven, not assumed). Also fold in
-   `RefreshConnected` detail-resync for existing Connected entries (currently a
-   no-op arm in `reconcile_tick`).
+1. **Kill-switch on drop** (part of U4). On a `was_connected` drop the
+   supervisor should engage the kill switch per mode. Needs the daemon to load
+   kill-switch **mode** config + apply **root firewall** rules
+   (`core::killswitch::enable_blocking_multi`). Best validated live (firewall
+   effects are only observable as root on a real host) — build + live-test
+   together.
 
-3. **Restart adoption at startup (R7).** The supervisor adopts on its *periodic*
-   tick, so restart-survivors get picked up within one cadence (~2s). For the
-   R7 guarantee (present in the *first* snapshot, zero connect commands), run
-   one adoption pass in `daemon/mod.rs`/boot *before* serving. Test: restart
-   with 2 adopted sessions → both in first snapshot, zero connects.
+2. **TUI Remote cutover (R3).** Gate the in-process scanner/retry/netmon in
+   `app/update.rs` + `app/telemetry_poll.rs` behind "no daemon present"; when a
+   daemon is up, translate `subscribe_remote` events → existing `Message`
+   variants and route `app/connection.rs` connects through Remote. **Highest
+   regression risk of anything left**: it changes the live TUI message loop, and
+   its correctness (does the attached TUI render smoothly? does the no-daemon
+   default path stay intact?) is only verifiable by running the actual terminal
+   UI — not by unit tests. **Do this with live TUI iteration, not blind.** The
+   streaming + registry it consumes are already built and loopback-tested, so
+   live-validating those first (flows #2, #5–#7) de-risks it.
 
-4. **Subscribe event streaming.** Currently a stub on both ends:
-   - Server: `daemon/server.rs:316-319` — Subscribe is acked synchronously;
-     the streaming half is unbuilt. Turn the ack into a long-lived push loop.
-     Event source candidate = the journal broadcast channel
-     (`vortix_core/journal/`); **verify at execution** whether it carries
-     engine events or the registry needs its own notify hook. Backpressure:
-     state transitions never dropped (coalesce latest per tunnel); telemetry
-     ticks drop-oldest.
-   - Client: `EngineHandle::Remote::subscribe` returns "not supported yet"
-     (`handle.rs:201`). Consume the event frame stream.
-   - Tests: two clients concurrently (subscriber + command client), slow
-     subscriber drops telemetry not transitions, disconnect → no fd leak.
+3. **U5 — Boot integration.** `vortix service install/uninstall` generating
+   systemd units / launchd plists + the early-boot blocking unit; persisted-
+   profile flag. Unit/plist generation is unit-testable (golden strings), but
+   the *value* (does it start at boot? does the early-boot firewall close the
+   leak window?) is purely live (AE5, reboot on a droplet). Details below.
 
-5. **TUI Remote cutover (R3).** Gate the in-process scanner/retry/netmon in
-   `app/update.rs` + `app/telemetry_poll.rs` behind "no daemon present". When
-   daemon present: translate subscribe events → existing `Message` variants
-   (keep render handlers untouched); `app/connection.rs` TUI connect → Remote
-   execute. Local path stays fully compiled for the no-daemon case. Test: TUI
-   with daemon starts no local scanner thread; without daemon = today's behavior.
+4. **U6 — Closure.** No-daemon golden parity suite (AE6/R11 — guards the default
+   path my U3 changes touched; the existing workspace test suite currently
+   passes, so no regression is known), README daemon section, manual-testing
+   backlog rows, CHANGELOG, close #234/#250/#153/#16. Best written after live
+   validation confirms the described behavior.
 
-### U3 — CLI writes via daemon + arbitration + input hardening
-
-- `EngineHandle::Remote::execute` is stubbed "not supported yet — lands with
-  daemon-writes U3" (`handle.rs:161`). Route `up`/`down`/`reconnect`/
-  `killswitch` through Remote when socket present; Local otherwise.
-- Daemon executes against the registry engine under a **per-profile mutex**
-  (arbitration). Client disconnect ≠ cancel; daemon-side completion is
-  independent of the connection.
-- **Server-side input hardening** (the plan-011 essentials ship here, not
-  later): profile name/path canonicalization (reject `../` traversal, overlong
-  names, non-catalog profiles), command allow-list.
-- OpenVPN OTP: client collects credentials, sends in-band with the command
-  (replaces SCRV1 file handoff for daemon mode); no-log guard + wipe-after-use.
-- Covers **AE1** (no sudo for daemon users), **AE7** (cross-terminal race).
-
-### U5 — Boot integration
+### U5 — Boot integration (detail)
 
 - `vortix service install/uninstall` — generate + install systemd units /
   launchd plists (templates: `examples/systemd/vortix-daemon.service`,
