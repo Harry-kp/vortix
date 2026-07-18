@@ -175,10 +175,9 @@ impl RemoteHandle {
     /// version mismatch = loud, protocol = daemon rejected/erred.
     pub async fn execute_remote(&self, cmd: UserCommand) -> Result<(), TransportError> {
         let transport = Arc::clone(&self.transport);
-        let result =
-            tokio::task::spawn_blocking(move || transport.request(IpcOp::Execute(cmd)))
-                .await
-                .map_err(|e| TransportError::Protocol(format!("blocking task join: {e}")))??;
+        let result = tokio::task::spawn_blocking(move || transport.request(IpcOp::Execute(cmd)))
+            .await
+            .map_err(|e| TransportError::Protocol(format!("blocking task join: {e}")))??;
         match result {
             IpcResult::Accepted => Ok(()),
             other => Err(TransportError::Protocol(format!(

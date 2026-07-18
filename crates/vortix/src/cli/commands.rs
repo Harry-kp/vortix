@@ -361,7 +361,6 @@ fn handle_up(
     // registry conflict-check into the CLI path, this flag will gate
     // the bypass.
     let _ = yes;
-    let _lifecycle_lock = acquire_lifecycle_lock_or_exit(mode, "up");
     let mut engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
 
     let profile_name = if let Some(name) = profile {
@@ -391,6 +390,108 @@ fn handle_up(
         }
     };
 
+    // U3: when a daemon is running, drive the connect through it — the
+    // root daemon holds privilege, so an unprivileged client connects
+    // without sudo. 2FA profiles need the local tty prompt (in-band
+    // credential delivery over IPC is a follow-up), so they're refused on
+    // the daemon path with a pointer. If the daemon turns out unavailable,
+    // we fall through to the local privileged path unchanged (R11).
+    if let Some(socket) = crate::daemon::daemon_socket_path_if_present() {
+        engine.load_metadata();
+        let profile = engine
+            .profiles
+            .iter()
+            .find(|p| p.name == profile_name)
+            .cloned();
+        if let Some(p) = &profile {
+            let missing =
+                crate::vpn_runtime::VpnRuntime::check_dependencies(p.protocol, &p.config_path);
+            if !missing.is_empty() {
+                let hint = missing
+                    .iter()
+                    .map(|tool| crate::platform::install_hint(tool))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                print_error_and_exit(
+                    mode,
+                    "up",
+                    CliError {
+                        code: "dependency_missing",
+                        message: format!(
+                            "Missing dependencies: {}. Install with: {}",
+                            missing.join(", "),
+                            hint
+                        ),
+                        hint: None,
+                    },
+                    ExitCode::DependencyMissing,
+                );
+            }
+            if crate::utils::read_openvpn_static_challenge_prompt(&p.config_path).is_some() {
+                print_error_and_exit(
+                    mode,
+                    "up",
+                    CliError {
+                        code: "daemon_2fa_unsupported",
+                        message: format!(
+                            "Profile '{profile_name}' requires interactive 2FA, which the daemon connect path doesn't support yet."
+                        ),
+                        hint: Some(
+                            "Connect via the TUI (Auth Manager handles the OTP prompt), or stop the daemon and run `sudo vortix up` locally.".into(),
+                        ),
+                    },
+                    ExitCode::GeneralError,
+                );
+            }
+        }
+        let protocol = profile.map_or_else(|| "VPN".to_string(), |p| p.protocol.to_string());
+        match daemon_execute(
+            &socket,
+            crate::vortix_core::engine::input::UserCommand::Connect {
+                profile_id: crate::vortix_core::profile::ProfileId::new(&profile_name),
+            },
+            mode,
+            "up",
+        ) {
+            // Daemon vanished mid-command — fall through to the local path.
+            None => {}
+            Some(crate::vortix_core::engine::state::Connection::Connected { .. }) => {
+                match mode {
+                    OutputMode::Human => {
+                        println!("● Connected to {profile_name} ({protocol})");
+                    }
+                    OutputMode::Json => print_success(
+                        mode,
+                        "up",
+                        &UpData {
+                            state: "connected".into(),
+                            profile: profile_name.clone(),
+                            protocol: protocol.clone(),
+                        },
+                        vec!["vortix status --json".into(), "vortix down --json".into()],
+                    ),
+                    OutputMode::Quiet => {}
+                }
+                return 0;
+            }
+            Some(state) => {
+                print_error_and_exit(
+                    mode,
+                    "up",
+                    CliError {
+                        code: "connect_failed",
+                        message: daemon_connect_failure_message(&state, &profile_name),
+                        hint: None,
+                    },
+                    ExitCode::GeneralError,
+                );
+            }
+        }
+    }
+
+    // Local privileged path: the client-side lifecycle lock guards
+    // concurrent up/down only here (the daemon arbitrates its own path).
+    let _lifecycle_lock = acquire_lifecycle_lock_or_exit(mode, "up");
     if !engine.is_root {
         print_error_and_exit(
             mode,
@@ -761,6 +862,7 @@ struct DownData {
     disconnected: Vec<String>,
 }
 
+#[allow(clippy::too_many_lines)]
 fn handle_down(
     profile_filter: Option<&str>,
     all: bool,
@@ -770,7 +872,6 @@ fn handle_down(
     mode: OutputMode,
 ) -> i32 {
     let _ = all; // `--all` is the explicit form of the no-profile case (already the default).
-    let _lifecycle_lock = acquire_lifecycle_lock_or_exit(mode, "down");
     let mut engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
 
     // NotFound (exit 3) takes precedence over idempotence: a typo'd
@@ -803,6 +904,52 @@ fn handle_down(
         return 0;
     }
 
+    // U3: route the teardown through a running daemon (no sudo). The
+    // client already discovered the targets from the kernel scanner;
+    // the daemon owns the FSM teardown. Falls through to the local
+    // privileged path if the daemon is unavailable (R11).
+    if let Some(socket) = crate::daemon::daemon_socket_path_if_present() {
+        let profile_id = profile_filter.map(crate::vortix_core::profile::ProfileId::new);
+        let cmd = if force {
+            crate::vortix_core::engine::input::UserCommand::ForceDisconnect { profile_id }
+        } else {
+            crate::vortix_core::engine::input::UserCommand::Disconnect { profile_id }
+        };
+        // Disconnect isn't ambiguous the way connect is — once the FSM
+        // processes it the tunnel is torn down — so we render the target
+        // set the client discovered regardless of the resulting state.
+        if daemon_execute(&socket, cmd, mode, "down").is_some() {
+            let names: Vec<String> = targets.iter().map(|s| s.name.clone()).collect();
+            let data = DownData {
+                state: "disconnected".into(),
+                disconnected: names.clone(),
+            };
+            match mode {
+                OutputMode::Human => {
+                    if names.len() == 1 {
+                        println!("Disconnected {}", names[0]);
+                    } else {
+                        println!("Disconnected {} tunnels:", names.len());
+                        for name in &names {
+                            println!("  - {name}");
+                        }
+                    }
+                }
+                OutputMode::Json => print_success(
+                    mode,
+                    "down",
+                    &data,
+                    vec!["vortix status --json".into(), "vortix list --json".into()],
+                ),
+                OutputMode::Quiet => {}
+            }
+            return 0;
+        }
+        // Daemon unavailable — fall through to the local privileged path.
+    }
+
+    // Local privileged path only (the daemon arbitrates its own).
+    let _lifecycle_lock = acquire_lifecycle_lock_or_exit(mode, "down");
     if !engine.is_root {
         print_error_and_exit(
             mode,
@@ -880,7 +1027,11 @@ fn handle_reconnect(
     config_dir: &Path,
     mode: OutputMode,
 ) -> i32 {
-    let _lifecycle_lock = acquire_lifecycle_lock_or_exit(mode, "reconnect");
+    // No top-level lifecycle lock here: the local path delegates each
+    // connect to `handle_up`, which self-locks per tunnel. Holding a lock
+    // across those calls would self-deadlock (flock LOCK_EX on a second
+    // fd blocks even within one process), and the daemon path must not
+    // hold a client-side lock at all (the daemon arbitrates).
     let mut engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
     engine.load_metadata();
 
@@ -889,6 +1040,48 @@ fn handle_reconnect(
     if let Some(name) = profile_filter {
         if engine.find_profile(name).is_none() {
             print_error_and_exit(mode, "reconnect", err_not_found(name), ExitCode::NotFound);
+        }
+    }
+
+    // U3: route the reconnect through a running daemon — it cycles the
+    // tunnel(s) atomically via the FSM (disconnect then connect), so a
+    // non-root client needs no sudo. 2FA profiles that require a fresh
+    // OTP on reconnect aren't handled on this path yet (the daemon has no
+    // tty); such a reconnect surfaces as a daemon error. Falls through to
+    // the local per-tunnel loop if the daemon is unavailable (R11).
+    if let Some(socket) = crate::daemon::daemon_socket_path_if_present() {
+        let cmd = crate::vortix_core::engine::input::UserCommand::Reconnect {
+            profile_id: profile_filter.map(crate::vortix_core::profile::ProfileId::new),
+        };
+        match daemon_execute(&socket, cmd, mode, "reconnect") {
+            None => {} // daemon unavailable — fall through to the local loop
+            Some(crate::vortix_core::engine::state::Connection::Connected { .. }) => {
+                let label = profile_filter.unwrap_or("all tunnels");
+                match mode {
+                    OutputMode::Human => println!("Reconnected {label}"),
+                    OutputMode::Json => print_success(
+                        mode,
+                        "reconnect",
+                        &serde_json::json!({ "state": "reconnected", "target": profile_filter }),
+                        vec!["vortix status --json".into()],
+                    ),
+                    OutputMode::Quiet => {}
+                }
+                return 0;
+            }
+            Some(state) => {
+                let label = profile_filter.unwrap_or("tunnel");
+                print_error_and_exit(
+                    mode,
+                    "reconnect",
+                    CliError {
+                        code: "reconnect_failed",
+                        message: daemon_connect_failure_message(&state, label),
+                        hint: None,
+                    },
+                    ExitCode::GeneralError,
+                );
+            }
         }
     }
 
@@ -1067,9 +1260,11 @@ fn handle_status(
             Ok(None) => match daemon_snapshot_via_remote(&socket) {
                 Ok(Some(state)) => overlay_daemon_state(&mut snap, &state),
                 Ok(None) => {}
-                Err((daemon, client)) => exit_daemon_version_mismatch(mode, daemon, client),
+                Err((daemon, client)) => {
+                    exit_daemon_version_mismatch(mode, "status", daemon, client)
+                }
             },
-            Err((daemon, client)) => exit_daemon_version_mismatch(mode, daemon, client),
+            Err((daemon, client)) => exit_daemon_version_mismatch(mode, "status", daemon, client),
         }
     }
 
@@ -1376,10 +1571,15 @@ fn registry_status_entries(
 
 /// Loud exit for a client/daemon IPC version skew (AE8) — never a silent
 /// fallback, since it masks real skew bugs.
-fn exit_daemon_version_mismatch(mode: OutputMode, daemon: u32, client: u32) -> ! {
+fn exit_daemon_version_mismatch(
+    mode: OutputMode,
+    command: &'static str,
+    daemon: u32,
+    client: u32,
+) -> ! {
     print_error_and_exit(
         mode,
-        "status",
+        command,
         CliError {
             code: "daemon_version_mismatch",
             message: format!(
@@ -1391,6 +1591,99 @@ fn exit_daemon_version_mismatch(mode: OutputMode, daemon: u32, client: u32) -> !
         },
         ExitCode::GeneralError,
     );
+}
+
+/// Route a write command through a running daemon (plan 2026-07-18-001
+/// U3). A non-root client drives the privileged operation via the root
+/// daemon — no sudo. Returns:
+///
+/// - `Some(conn)` after the daemon executed the command, where `conn` is
+///   the resulting FSM state (fetched via a follow-up snapshot so callers
+///   can tell a real connect from a failed one — `Accepted` alone only
+///   means "the FSM processed it"),
+/// - `None` when the daemon turned out to be unavailable at send time, so
+///   the caller should fall back to the local (privileged) path,
+/// - never returns for a version mismatch or a daemon-side error — both
+///   are terminal loud exits.
+fn daemon_execute(
+    socket: &Path,
+    cmd: crate::vortix_core::engine::input::UserCommand,
+    mode: OutputMode,
+    command: &'static str,
+) -> Option<crate::vortix_core::engine::state::Connection> {
+    use crate::vortix_core::engine::handle::RemoteHandle;
+    use crate::vortix_core::engine::state::Connection;
+    use crate::vortix_core::ipc::TransportError;
+    use std::sync::Arc;
+
+    let runtime = crate::vortix_process::global_runner()
+        .as_real()
+        .map(|r| r.runtime().handle().clone())?;
+    let transport = Arc::new(crate::daemon::client::UnixTransport::new(
+        socket.to_path_buf(),
+    ));
+    let remote = RemoteHandle::new(transport);
+    match runtime.block_on(remote.execute_remote(cmd)) {
+        Ok(()) => {
+            // `Accepted` only says the FSM processed the command. Fetch
+            // the resulting state so the caller renders the truth (a
+            // failed connect leaves the FSM Disconnected with a reason).
+            // If the follow-up read fails, fall back to Disconnected —
+            // the caller treats that as "not confirmed connected".
+            let state = runtime
+                .block_on(remote.snapshot_remote())
+                .map(|s| s.state)
+                .unwrap_or(Connection::Disconnected { last_failure: None });
+            Some(state)
+        }
+        Err(TransportError::Unavailable(_)) => None,
+        Err(TransportError::VersionMismatch { daemon, client }) => {
+            exit_daemon_version_mismatch(mode, command, daemon, client)
+        }
+        Err(TransportError::Protocol(e)) => print_error_and_exit(
+            mode,
+            command,
+            CliError {
+                code: "daemon_execute_failed",
+                message: e,
+                hint: Some(
+                    "The daemon refused or failed the command. Check `journalctl -u vortix-daemon` (or the daemon's stderr).".into(),
+                ),
+                },
+            ExitCode::GeneralError,
+        ),
+    }
+}
+
+/// Human-readable reason a daemon-routed connect didn't end `Connected`.
+fn daemon_connect_failure_message(
+    state: &crate::vortix_core::engine::state::Connection,
+    profile: &str,
+) -> String {
+    use crate::vortix_core::engine::state::{Connection, FailureReason};
+    match state {
+        Connection::Disconnected {
+            last_failure: Some(reason),
+        } => match reason {
+            FailureReason::RetryBudgetExhausted { attempts, .. } => {
+                format!("Connection to '{profile}' failed after {attempts} attempt(s)")
+            }
+            FailureReason::HandshakeFailed(e) => format!("Handshake failed for '{profile}': {e}"),
+            FailureReason::AuthFailed(e) => format!("Authentication failed for '{profile}': {e}"),
+            FailureReason::ConfigInvalid(e) => {
+                format!("Profile '{profile}' has an invalid config: {e}")
+            }
+            FailureReason::Timeout(_) => format!("Connection to '{profile}' timed out"),
+            FailureReason::NoNetworkLink => {
+                format!("No network link while connecting '{profile}'")
+            }
+            FailureReason::ProfileGone(_) => {
+                format!("Profile '{profile}' was removed during the connect")
+            }
+            FailureReason::Other(e) => format!("Connection to '{profile}' failed: {e}"),
+        },
+        _ => format!("Connection to '{profile}' did not complete"),
+    }
 }
 
 fn run_watch(interval: u64, config: &AppConfig, config_dir: &Path, mode: OutputMode) -> i32 {
@@ -2649,6 +2942,33 @@ mod tests {
         };
         let (connections, _) = registry_status_entries(&reg, Some("openvpn"));
         assert_eq!(connections[0].protocol.as_deref(), Some("openvpn"));
+    }
+
+    #[test]
+    fn daemon_connect_failure_message_maps_reasons() {
+        use crate::vortix_core::engine::state::{Connection, FailureReason};
+        let auth = Connection::Disconnected {
+            last_failure: Some(FailureReason::AuthFailed("bad otp".into())),
+        };
+        assert!(daemon_connect_failure_message(&auth, "corp").contains("Authentication failed"));
+
+        let gone = Connection::Disconnected {
+            last_failure: Some(FailureReason::ProfileGone(ProfileId::new("corp"))),
+        };
+        assert!(daemon_connect_failure_message(&gone, "corp").contains("removed"));
+
+        // No recorded reason → a generic "did not complete".
+        let bare = Connection::Disconnected { last_failure: None };
+        assert!(daemon_connect_failure_message(&bare, "corp").contains("did not complete"));
+
+        // A non-terminal state also reads as "did not complete".
+        let connecting = Connection::Connecting {
+            profile_id: ProfileId::new("corp"),
+            started_at: std::time::SystemTime::now(),
+            attempt: 1,
+            retry_budget_remaining: std::time::Duration::from_secs(30),
+        };
+        assert!(daemon_connect_failure_message(&connecting, "corp").contains("did not complete"));
     }
 
     #[test]
