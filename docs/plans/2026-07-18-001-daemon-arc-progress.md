@@ -12,26 +12,29 @@ source of truth; CLI/TUI/GUI are thin clients; always in sync; persistent.
 Four scenarios (S1 persistence-across-exit, S2 instant attach, S3 bidirectional
 sync, S4 many-clients-one-state) are the acceptance tests.
 
-**Done — P1 foundation (`39354d2`):** `TunnelRegistry` already has per-profile
-`connect`/`disconnect`/`reconnect` (each drives that entry's own engine).
-`RegistryHandle` now exposes them as async commands over its serialized owner
-task (+ tests). `daemon::build_engine` / `connect_allowed_ips` extracted for the
-dispatch to call.
+**DONE — P1 (daemon owns per-profile engines) + P2 (owner auth):**
+- `39354d2` RegistryHandle per-profile `connect`/`disconnect`/`reconnect` commands.
+- `6edb262` daemon IPC dispatch routes Execute + Snapshot through the registry;
+  shared single FSM retired (kept only as Subscribe's journal source). F1–F4
+  bug class gone by construction.
+- `811ebb7` supervisor auto-reconnect drives `registry.connect` (recovered
+  tunnels become real, drivable entries).
+- `dcf4315` owner-based auth: gate accepts owner uid (VORTIX_OWNER_UID/SUDO_UID),
+  socket chowned to owner → root daemon serves its unprivileged owner (no-sudo).
 
-**NEXT increment (resume here) — P1 dispatch rewrite (task #18):** route the
-daemon IPC `Execute` through `RegistryHandle::{connect,disconnect,reconnect}`
-(using `build_engine` + `connect_allowed_ips`), route `Snapshot` from the
-registry primary, keep `Subscribe` on the shared global journal (all per-profile
-engines write to it), and **retire the daemon's shared single `EngineHandle`'s
-Execute/Snapshot role**. This is ATOMIC — Execute and Snapshot must move to the
-registry together or they diverge. Touches `daemon/server.rs` (dispatch + struct
-+ ~6 execute tests), `handle_daemon` boot. Map `RegistryError::Conflict` →
-`IpcError::Conflict`.
+**NEXT (resume here) — P4 TUI Remote cutover (task #21):** when a daemon is
+present, the TUI must render `RegistrySnapshot` + stream `subscribe` events +
+send commands via Remote, and NOT start its own scanner/retry/netmon; Local
+fallback unchanged. Delivers S2/S3/S4. Large live-dependent TUI refactor
+(main.rs bootstrap, app/mod.rs, app/update.rs event→Message translation,
+app/connection.rs). Start with the event→Message translation (testable), then
+the daemon-present gating.
 
-**Then:** P1 adoption-real-engine (task #19) → P2 owner auth (#20) → P4 TUI
-cutover (#21, delivers S2/S3/S4, needs live) → P5 boot service (#22) → P6
-closure (#23). See the plan for full detail. All review fixes from earlier this
-session remain and fold into these phases.
+**Then:** P5 boot service (#22 — also fixes the cross-uid socket PATH agreement
+P2 flagged: a canonical system socket path both daemon + client use) → P6
+closure (#23). Known P1 follow-up: externally-adopted tunnels get a placeholder
+engine (daemon-`down` on one is a no-op) until adoption seeds a real
+protocol-correct engine. See the plan for full detail.
 
 ## Code review (2026-07-19)
 
