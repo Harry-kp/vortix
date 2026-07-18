@@ -43,6 +43,39 @@ pub struct DaemonServer {
     /// prevents a local UID escalation from compromising the daemon
     /// even when the socket file's mode 0600 has been bypassed.
     daemon_uid: u32,
+    /// The daemon's OWNING user (plan 2026-07-19-001 P2). When the daemon
+    /// runs as root (via `sudo`/a service unit), the owner is the
+    /// unprivileged user it acts for — resolved from the trusted launcher's
+    /// environment (`VORTIX_OWNER_UID` / `SUDO_UID`), never from a client,
+    /// so it can't be spoofed. The peer-UID gate accepts BOTH `daemon_uid`
+    /// and `owner_uid`, which is what lets an unprivileged client drive a
+    /// root daemon without sudo (AE1). Equals `daemon_uid` for a same-user
+    /// daemon (no privilege change).
+    owner_uid: u32,
+}
+
+/// Resolve the daemon's owning user from the trusted launcher environment.
+/// `VORTIX_OWNER_UID` (service units) takes precedence over `SUDO_UID`
+/// (interactive `sudo`); absent both, the owner is the daemon's own uid.
+/// These vars are set by the launcher, not the client, so a connecting
+/// client cannot influence the value.
+fn resolve_owner_uid(daemon_uid: u32) -> u32 {
+    owner_uid_from(
+        std::env::var("VORTIX_OWNER_UID").ok().as_deref(),
+        std::env::var("SUDO_UID").ok().as_deref(),
+        daemon_uid,
+    )
+}
+
+/// Pure owner-uid resolution: `VORTIX_OWNER_UID` wins over `SUDO_UID`;
+/// unparseable/absent values fall through to `daemon_uid`.
+fn owner_uid_from(vortix_owner: Option<&str>, sudo: Option<&str>, daemon_uid: u32) -> u32 {
+    for candidate in [vortix_owner, sudo] {
+        if let Some(uid) = candidate.and_then(|v| v.trim().parse::<u32>().ok()) {
+            return uid;
+        }
+    }
+    daemon_uid
 }
 
 impl DaemonServer {
@@ -78,6 +111,27 @@ impl DaemonServer {
         // pointer arguments.
         #[allow(unsafe_code)]
         let daemon_uid = unsafe { libc::geteuid() };
+        let owner_uid = resolve_owner_uid(daemon_uid);
+
+        // P2: when the daemon runs as root FOR an unprivileged owner, the
+        // mode-0600 socket owned by root would be unreachable by the owner.
+        // chown it to the owner so they can connect at the fs level (root
+        // still can); the per-accept UID gate is the in-depth check.
+        #[cfg(unix)]
+        if owner_uid != daemon_uid {
+            use std::os::unix::ffi::OsStrExt;
+            if let Ok(path_c) = std::ffi::CString::new(socket_path.as_os_str().as_bytes()) {
+                // SAFETY: `chown` takes a valid NUL-terminated path and two
+                // ids; gid u32::MAX (-1) leaves the group unchanged. No
+                // buffers or aliasing. Best-effort — a failure just leaves
+                // the socket root-owned (the gate still governs access).
+                #[allow(unsafe_code)]
+                unsafe {
+                    libc::chown(path_c.as_ptr(), owner_uid, u32::MAX);
+                }
+            }
+        }
+
         Ok(Self {
             socket_path,
             listener,
@@ -85,6 +139,7 @@ impl DaemonServer {
             registry_handle: None,
             profiles_dir: None,
             daemon_uid,
+            owner_uid,
         })
     }
 
@@ -140,6 +195,7 @@ impl DaemonServer {
             );
         }
         let daemon_uid = self.daemon_uid;
+        let owner_uid = self.owner_uid;
         loop {
             match self.listener.accept().await {
                 Ok((stream, _addr)) => {
@@ -151,8 +207,15 @@ impl DaemonServer {
                     let registry = self.registry_handle.clone();
                     let profiles_dir = self.profiles_dir.clone();
                     tokio::spawn(async move {
-                        if let Err(e) =
-                            handle_client(stream, daemon_uid, handle, registry, profiles_dir).await
+                        if let Err(e) = handle_client(
+                            stream,
+                            daemon_uid,
+                            owner_uid,
+                            handle,
+                            registry,
+                            profiles_dir,
+                        )
+                        .await
                         {
                             eprintln!("vortix daemon: client session ended: {e}");
                         }
@@ -187,6 +250,7 @@ impl Drop for DaemonServer {
 async fn handle_client(
     mut stream: UnixStream,
     daemon_uid: u32,
+    owner_uid: u32,
     engine_handle: Option<Arc<EngineHandle>>,
     registry_handle: Option<RegistryHandle<TunnelKind>>,
     profiles_dir: Option<PathBuf>,
@@ -194,9 +258,17 @@ async fn handle_client(
     // Peer-UID enforcement runs before any frame is read so an
     // unauthorized client never gets the chance to drive dispatch.
     match get_peer_uid(&stream) {
-        Ok(peer_uid) if peer_uid == daemon_uid => { /* authorized; fall through */ }
+        // Authorized: the daemon's own uid, or its configured owner (P2 —
+        // lets an unprivileged owner drive a root daemon; owner_uid comes
+        // from the trusted launcher env, never the client).
+        Ok(peer_uid) if peer_uid == daemon_uid || peer_uid == owner_uid => { /* authorized */ }
         Ok(peer_uid) => {
-            tracing::warn!(peer_uid, daemon_uid, "rejecting client with UID mismatch");
+            tracing::warn!(
+                peer_uid,
+                daemon_uid,
+                owner_uid,
+                "rejecting client with UID mismatch"
+            );
             // Best-effort notify-and-close: write a single
             // Unauthorized frame so the client surfaces a typed
             // error rather than an opaque EOF.
@@ -1012,15 +1084,28 @@ mod tests {
         let _ = std::fs::remove_file(&socket);
     }
 
+    #[test]
+    fn owner_uid_resolution_precedence() {
+        // VORTIX_OWNER_UID wins over SUDO_UID.
+        assert_eq!(owner_uid_from(Some("501"), Some("1000"), 0), 501);
+        // Falls back to SUDO_UID when the explicit override is absent.
+        assert_eq!(owner_uid_from(None, Some("1000"), 0), 1000);
+        // Falls back to the daemon uid when neither is set.
+        assert_eq!(owner_uid_from(None, None, 42), 42);
+        // Unparseable values are ignored (fall through).
+        assert_eq!(owner_uid_from(Some("nope"), Some("1000"), 0), 1000);
+        assert_eq!(owner_uid_from(Some("nope"), None, 7), 7);
+    }
+
     #[tokio::test]
     async fn unauthorized_path_emits_unauthorized_frame_without_dispatch() {
-        // Force the rejection branch by passing a daemon_uid the
-        // peer can never match (u32::MAX is never a real UID).
+        // Force the rejection branch by passing a daemon_uid AND owner_uid
+        // the peer can never match (u32::MAX is never a real UID).
         let (server_end, mut client_end) = TokioUnixStream::pair().expect("socketpair");
 
-        let fake_daemon_uid = u32::MAX;
+        let fake_uid = u32::MAX;
         let server_task = tokio::spawn(async move {
-            handle_client(server_end, fake_daemon_uid, None, None, None).await
+            handle_client(server_end, fake_uid, fake_uid, None, None, None).await
         });
 
         let mut buf = vec![0u8; 4096];
