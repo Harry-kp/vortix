@@ -6,35 +6,34 @@ All notable changes to this project will be documented in this file.
 
 ## [0.4.3] - 2026-07-18
 
-### Bug Fixes
+### Highlights
 
-- Bind daemon socket inside Tokio runtime ([#233](https://github.com/Harry-kp/vortix/pull/233))
-- **connect:** Pre-flight gate when profile declares IPv6 but host IPv6 is disabled (closes #242) ([#247](https://github.com/Harry-kp/vortix/pull/247))
-- **cli:** Lifecycle hardening — idempotent up, tracked-orphan filter, flock lock ([#249](https://github.com/Harry-kp/vortix/pull/249))
-
-### Documentation
-
-- **readme:** Install matrix, named competitors, security model, contributing ([#230](https://github.com/Harry-kp/vortix/pull/230))
-- Refresh demo GIFs + README cleanup ([#236](https://github.com/Harry-kp/vortix/pull/236))
-- **readme:** Add X/Twitter handle badge ([#244](https://github.com/Harry-kp/vortix/pull/244))
-
-### Refactor
-
-- **flip-panel:** Consume extracted ratatui-flip-panel crate ([#232](https://github.com/Harry-kp/vortix/pull/232))
-
-
+- **IPv6-disabled hosts get a clean refusal instead of a crash-dump** ([#242](https://github.com/Harry-kp/vortix/issues/242)). Connecting a WireGuard profile whose `Address` line declares an IPv6 entry used to fail mid-way inside `wg-quick` with a raw `RTNETLINK answers: Operation not supported` error and a retry loop. Both the TUI and CLI now refuse pre-flight with an actionable message: re-enable IPv6 via sysctl (or remove `ipv6.disable=1` from the kernel cmdline), or drop the IPv6 entry from the profile. The profile is never rewritten silently. ([#247](https://github.com/Harry-kp/vortix/pull/247))
+- **CLI lifecycle hardening** ([#249](https://github.com/Harry-kp/vortix/pull/249)). `vortix up` is now truly idempotent, live tunnels are no longer flagged as "possible orphans" on every `down`, and concurrent `up`/`down`/`reconnect` invocations from multiple terminals serialize instead of racing.
 
 ### Fixed
 
-- **`vortix up` is now truly idempotent.** Re-running `up` for an already-connected profile prints `Already connected` and exits 0 instead of re-spawning the tunnel. Previously a second `up` of an OpenVPN profile spawned a duplicate daemon whose `--writepid` clobbered the first's pidfile, leaving the original daemon untracked.
-- **No more spurious orphan warnings for live tunnels.** The startup orphan scan now excludes PIDs recorded in profile pidfiles (`run/<name>.pid`), so `vortix down` / `status` no longer flags the active session's own `openvpn` daemon as a "possible orphan from a previous session."
-- **Concurrent `up`/`down`/`reconnect` invocations are serialized** via a `flock` lifecycle lock in the config dir. Two terminals racing the same mutation now queue instead of interleaving; the second prints a one-line "waiting…" note.
-- **OpenVPN double-spawn guard** at the tunnel layer: `up()` refuses when the profile's pidfile records a live daemon (covers the mid-negotiation window the scanner can't see).
-- WireGuard connect on a Linux host with IPv6 disabled no longer fails mid-way inside `wg-quick` with a raw `RTNETLINK answers: Operation not supported` dump ([#242](https://github.com/Harry-kp/vortix/issues/242)). When the profile's `Address` line declares an IPv6 entry but kernel IPv6 is off (sysctl `disable_ipv6=1` or `ipv6.disable=1` boot param), both the TUI and CLI now refuse pre-flight with an actionable message: re-enable IPv6 via sysctl, or remove the IPv6 entry from the profile. The profile is never rewritten silently.
+- **`vortix up` is now truly idempotent.** Re-running `up` for an already-connected profile prints `Already connected` and exits 0 instead of re-spawning the tunnel. Previously a second `up` of an OpenVPN profile spawned a duplicate daemon whose `--writepid` clobbered the first's pidfile, leaving the original daemon untracked. ([#249](https://github.com/Harry-kp/vortix/pull/249))
+- **No more spurious orphan warnings for live tunnels.** The startup orphan scan now excludes PIDs recorded in profile pidfiles (`run/<name>.pid`), so `vortix down` / `status` no longer flags the active session's own `openvpn` daemon as a "possible orphan from a previous session." ([#249](https://github.com/Harry-kp/vortix/pull/249))
+- **Concurrent `up`/`down`/`reconnect` invocations are serialized** via a `flock` lifecycle lock in the config dir. Two terminals racing the same mutation now queue instead of interleaving; the second prints a one-line "waiting…" note. ([#249](https://github.com/Harry-kp/vortix/pull/249))
+- **OpenVPN double-spawn guard** at the tunnel layer: `up()` refuses when the profile's pidfile records a live daemon (covers the mid-negotiation window the scanner can't see). ([#249](https://github.com/Harry-kp/vortix/pull/249))
+- WireGuard connect on a Linux host with IPv6 disabled no longer fails mid-way inside `wg-quick` (see Highlights). Detection covers both disable mechanisms: sysctl `disable_ipv6=1` and the `ipv6.disable=1` boot param, verified against real kernels in both states. ([#242](https://github.com/Harry-kp/vortix/issues/242), [#247](https://github.com/Harry-kp/vortix/pull/247))
+- Daemon socket now binds inside the Tokio runtime ([#233](https://github.com/Harry-kp/vortix/pull/233)).
+
+### Security
+
+- Bumped `crossbeam-epoch` 0.9.18 → 0.9.20 for [RUSTSEC-2026-0204](https://rustsec.org/advisories/RUSTSEC-2026-0204) (invalid pointer dereference in `fmt::Pointer`; reached via a build-tooling dependency chain, not vortix's runtime path).
 
 ### Changed
 
-- README now documents the kill-switch **reboot boundary**: firewall rules do not survive an OS reboot, so `vpn-only` is unenforced between boot and the next vortix launch. (Persistence across reboot is tracked separately.)
+- README now documents the kill-switch **reboot boundary**: firewall rules do not survive an OS reboot, so `vpn-only` is unenforced between boot and the next vortix launch. Persistence across reboot is tracked in [#250](https://github.com/Harry-kp/vortix/issues/250). ([#249](https://github.com/Harry-kp/vortix/pull/249))
+- The flip-panel widget now ships as the extracted [`ratatui-flip-panel`](https://crates.io/crates/ratatui-flip-panel) crate, consumed as a dependency. ([#232](https://github.com/Harry-kp/vortix/pull/232))
+
+### Documentation
+
+- README overhaul: install matrix, named competitor comparison, security model, contributing section. ([#230](https://github.com/Harry-kp/vortix/pull/230))
+- Refreshed demo GIFs (hero + 4 scenario clips) and README cleanup. ([#236](https://github.com/Harry-kp/vortix/pull/236))
+- X/Twitter handle badge. ([#244](https://github.com/Harry-kp/vortix/pull/244))
 
 ## [0.4.2] - 2026-06-16
 
