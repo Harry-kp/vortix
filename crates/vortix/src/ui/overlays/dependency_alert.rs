@@ -28,7 +28,7 @@ pub fn render(frame: &mut Frame, protocol: Protocol, missing: &[String]) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Red))
-        .title(" System Dependency Missing ");
+        .title(" System Requirement Missing ");
 
     let inner = block.inner(popup_area);
     frame.render_widget(block, popup_area);
@@ -40,9 +40,7 @@ pub fn render(frame: &mut Frame, protocol: Protocol, missing: &[String]) {
                 " ERROR: ",
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             ),
-            Span::raw(format!(
-                "Missing system tools required for {protocol} sessions."
-            )),
+            Span::raw(format!("Missing requirements for {protocol} sessions.")),
         ]),
         Line::from(""),
         Line::from(vec![
