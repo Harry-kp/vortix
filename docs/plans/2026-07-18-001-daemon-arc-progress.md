@@ -3,7 +3,7 @@
 Companion to `docs/plans/2026-07-18-001-feat-daemon-tunnel-ownership-plan.md`
 (the decision artifact — do **not** edit its body; state lives here + in git).
 
-**Last updated:** 2026-07-18
+**Last updated:** 2026-07-18 (session 2)
 
 ## Where it lives
 
@@ -11,7 +11,8 @@ Companion to `docs/plans/2026-07-18-001-feat-daemon-tunnel-ownership-plan.md`
 - **Branch:** `origin/feat/daemon-u1-remote-handle` (PR head). The local
   mirror `tmp-daemon-arc` is identical to it. **The local branch
   `feat/daemon-u1-remote-handle` is STALE** (ahead 2 / behind 12) — ignore it.
-- **HEAD:** `60edbdd` — U2f (serve RegistrySnapshot over IPC).
+- **HEAD:** `d220ba5` — registry now served AND consumed end-to-end
+  (`vortix status` renders multi-tunnel state from a live daemon).
 - **Do NOT merge** until the already-shipped fixes are released. User decision:
   release existing work first, daemon PRs merge after. (Independent of PR #252,
   the release-notes workflow.)
@@ -42,22 +43,48 @@ U2 now carries U4's body, delivered as sub-commits (a)–(g). U3/U5/U6 unchanged
 | `50726b1` | U2d | `RegistryHandle::apply()` generic mutation channel |
 | `d3dcdde` | U2e | supervisor `reconcile_tick()` pure fn — headless drop detection (`daemon/supervisor.rs`) |
 | `60edbdd` | U2f | serve `IpcOp::RegistrySnapshot` over IPC (**server side only**) |
+| `a437b9f` | U2 | `RemoteHandle::registry_snapshot_remote()` — client consumer |
+| `c53b5f8` | U2 | supervisor adopts kernel sessions absent from the registry (`set_connected` + placeholder engine); `ScannerView`→`ScannedSession`, `reconcile_tick`→`ReconcileOutcome{dropped,adopted}` |
+| `a2ccca5` | U2 | daemon boot spawns a `RegistryHandle` + `run_supervisor` loop (2s cadence) + `with_registry_handle`; `IpcOp::RegistrySnapshot` now serves live state |
+| `ba4bb4b` | U2 | `vortix status` renders multi-tunnel from the registry (JSON `connections[]`/`primary`), scanner counters overlaid on primary; 3-tier fallback registry→single-FSM→scanner; no-daemon path unchanged |
+| `d220ba5` | — | rustdoc link fix |
 
-Build verified green on this branch (`cargo build -p vortix`, 2026-07-18).
+Full CI parity set green on this branch as of 2026-07-18 session 2 (fmt,
+check, clippy --workspace --all-targets, test --workspace, rustdoc, all 4
+xtask leak checks). macOS host caveat: the Linux SO_PEERCRED block in
+`server.rs` isn't compiled locally — untouched by these commits; watch the
+Linux CI leg. End-to-end smoke: `vortix status --json` routes through a
+live daemon's registry (empty when no VPN up; multi-tunnel is live-test #2).
 
 ## Remaining — in dependency order
 
 ### Still inside the merged U2/U4 phase
 
 1. **RegistrySnapshot client consumer + multi-tunnel `status`.**
-   Server serves `RegistrySnapshot` (U2f), but `RemoteHandle` only has
-   `snapshot_remote()` (primary-only `Connection`), and `vortix status` still
-   overlays a single state via `overlay_daemon_state` (`cli/commands.rs:1024`).
-   Add `RemoteHandle::registry_snapshot_remote()` and render full multi-tunnel
-   state in `status` from it. (Plan U2 test: snapshot round-trips N tunnels
-   with roles/health intact.)
+   **DONE** (`a437b9f` consumer, `ba4bb4b` status render). Also DONE this
+   session: supervisor **adoption** (`c53b5f8`) + **boot wiring** (`a2ccca5`)
+   — the daemon now owns a registry populated by a 2s supervisor loop and
+   serves it, so `vortix status` shows live multi-tunnel state. Discovery that
+   drove the ordering: the daemon's connects flow through a single FSM, so
+   without adoption the registry stayed empty and the whole path was a no-op.
 
-2. **Subscribe event streaming.** Currently a stub on both ends:
+2. **Supervisor drop follow-up (kill-switch + retry).** `reconcile_tick`
+   detects drops and returns them, and `run_supervisor` logs them — but the
+   kill-switch arming and auto-reconnect scheduling for a dropped tunnel are
+   not wired yet. **Characterization-first** for the retry ladder: capture
+   today's TUI retry behavior (attempt counts, delays via `backoff_delay_secs`,
+   auth-failure stop via `has_retry_budget`) in tests before re-homing the
+   driver out of `app/update.rs` (AE3 parity proven, not assumed). Also fold in
+   `RefreshConnected` detail-resync for existing Connected entries (currently a
+   no-op arm in `reconcile_tick`).
+
+3. **Restart adoption at startup (R7).** The supervisor adopts on its *periodic*
+   tick, so restart-survivors get picked up within one cadence (~2s). For the
+   R7 guarantee (present in the *first* snapshot, zero connect commands), run
+   one adoption pass in `daemon/mod.rs`/boot *before* serving. Test: restart
+   with 2 adopted sessions → both in first snapshot, zero connects.
+
+4. **Subscribe event streaming.** Currently a stub on both ends:
    - Server: `daemon/server.rs:316-319` — Subscribe is acked synchronously;
      the streaming half is unbuilt. Turn the ack into a long-lived push loop.
      Event source candidate = the journal broadcast channel
@@ -69,21 +96,6 @@ Build verified green on this branch (`cargo build -p vortix`, 2026-07-18).
      (`handle.rs:201`). Consume the event frame stream.
    - Tests: two clients concurrently (subscriber + command client), slow
      subscriber drops telemetry not transitions, disconnect → no fd leak.
-
-3. **Supervisor loop wiring.** Pieces exist (`reconcile_tick` pure fn +
-   `RegistryHandle::apply`), but no periodic task is spawned in the daemon
-   runtime yet (`server.rs:28` comment says "supervisor loop populates it" —
-   aspirational). Spawn the interval task: scanner tick → `reconcile_tick` →
-   `apply`. **Characterization-first** for the retry ladder — capture today's
-   TUI retry behavior (attempt counts, delays, auth-failure stop) in tests
-   before re-homing the driver out of `app/update.rs` (AE3 parity must be
-   proven, not assumed).
-
-4. **Restart adoption (R7).** Daemon startup order in `daemon/mod.rs`:
-   adopt (scanner pass — reuse `scanner_adopt_session` / Method-0 log
-   attribution) → reconcile kill-switch → begin serving + supervising. Tunnels
-   never torn down by daemon exit (`Drop` stays no-op). Test: restart with 2
-   adopted sessions → both in first snapshot, zero connect commands issued.
 
 5. **TUI Remote cutover (R3).** Gate the in-process scanner/retry/netmon in
    `app/update.rs` + `app/telemetry_poll.rs` behind "no daemon present". When
