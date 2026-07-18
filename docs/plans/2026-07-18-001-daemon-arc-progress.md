@@ -22,13 +22,29 @@ sync, S4 many-clients-one-state) are the acceptance tests.
 - `dcf4315` owner-based auth: gate accepts owner uid (VORTIX_OWNER_UID/SUDO_UID),
   socket chowned to owner → root daemon serves its unprivileged owner (no-sudo).
 
-**NEXT (resume here) — P4 TUI Remote cutover (task #21):** when a daemon is
-present, the TUI must render `RegistrySnapshot` + stream `subscribe` events +
-send commands via Remote, and NOT start its own scanner/retry/netmon; Local
-fallback unchanged. Delivers S2/S3/S4. Large live-dependent TUI refactor
-(main.rs bootstrap, app/mod.rs, app/update.rs event→Message translation,
-app/connection.rs). Start with the event→Message translation (testable), then
-the daemon-present gating.
+**NEXT (resume here) — P4 TUI Remote cutover (task #21).** Concrete seams
+(investigated 2026-07-19, no re-discovery needed):
+- **Scanner→state producer:** `app/telemetry_poll.rs:104-105` spawns
+  `scanner::gather_system_state(&profiles)` and feeds `Message::SyncSystemState`
+  (line 92). THIS is the swap point: when daemon-attached, fetch the daemon's
+  `RegistrySnapshot` (via `EngineHandle::Remote` / `UnixTransport`) instead of
+  scanning the kernel, and build the registry update from it.
+  `handle_sync_system_state` (app/update.rs:336) is the consumer.
+- **Render:** untouched — renderers read `app.registry`; feeding it from the
+  daemon snapshot is enough for S2. A helper to seed `TunnelRegistry` from a
+  `RegistrySnapshot` (placeholder engines, render-only) is the pure/testable
+  first piece.
+- **Writes:** `app/connection.rs::connect_profile_inner` (line 170) + disconnect
+  route through the Remote handle when daemon-attached (Execute), instead of the
+  legacy `VpnRuntime` path. 2FA overlays stay client-side (refused on the daemon
+  path, as in the CLI).
+- **Bootstrap:** `main.rs::run_tui` (~line 365) — if `daemon_socket_path_if_present()`,
+  attach `EngineHandle::Remote` + set `App.daemon_attached`, and DON'T start the
+  local scanner/retry (telemetry_poll gates on the flag). Local path unchanged (R11).
+- Delivers **S2/S3/S4**. Live-dependent rewire of the interactive TUI loop —
+  no automated safety net for render correctness (CLAUDE.md: tests can't cover
+  real terminals), so it wants a focused session + live iteration. Everything it
+  consumes (Remote snapshot/subscribe/execute) is already built + tested.
 
 **Then:** P5 boot service (#22 — also fixes the cross-uid socket PATH agreement
 P2 flagged: a canonical system socket path both daemon + client use) → P6
