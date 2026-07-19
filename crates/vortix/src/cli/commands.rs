@@ -158,6 +158,7 @@ pub fn handle_command(
         }
         Commands::Audit { pid, vpn_only } => handle_audit(*pid, *vpn_only, mode),
         Commands::Daemon { socket } => handle_daemon(socket.clone(), mode),
+        Commands::Service { action } => handle_service(action, config_dir, mode),
         Commands::Completions { shell } => {
             handle_completions(*shell);
             0
@@ -398,6 +399,74 @@ fn handle_daemon(socket_override: Option<std::path::PathBuf>, mode: OutputMode) 
         .await;
     });
 
+    // P5: bring up boot-persisted profiles (`vortix service persist`).
+    // The R7 adoption above already covered restart survivors, so only
+    // flagged profiles with no live tunnel get a connect. force=false —
+    // if two flagged profiles both claim the default route, the first
+    // wins and the second is refused loudly here instead of silently
+    // hijacking the election.
+    {
+        use crate::vortix_config::profile_store::{FsProfileStore, ProfileStore};
+        let flagged: Vec<String> = FsProfileStore::new(profiles_dir.clone())
+            .list()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| s.boot_connect)
+            .map(|s| s.display_name)
+            .collect();
+        if !flagged.is_empty() {
+            let registry_boot = registry.clone();
+            let profiles_dir_boot = profiles_dir.clone();
+            runtime.block_on(async move {
+                let up: std::collections::HashSet<String> = registry_boot
+                    .registry_snapshot()
+                    .await
+                    .map(|s| {
+                        s.tunnels
+                            .iter()
+                            .map(|t| t.profile_id.as_str().to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for name in flagged {
+                    if up.contains(&name) {
+                        eprintln!(
+                            "vortix daemon: boot-connect '{name}': already running (adopted)"
+                        );
+                        continue;
+                    }
+                    let id = crate::vortix_core::profile::ProfileId::new(&name);
+                    let Some(allowed_ips) =
+                        crate::daemon::connect_allowed_ips(&profiles_dir_boot, &id)
+                    else {
+                        eprintln!(
+                            "vortix daemon: boot-connect '{name}': profile not found in catalog"
+                        );
+                        continue;
+                    };
+                    let Some(engine) = crate::daemon::build_engine(&profiles_dir_boot) else {
+                        eprintln!(
+                            "vortix daemon: boot-connect skipped — engine prerequisites unavailable"
+                        );
+                        break;
+                    };
+                    match registry_boot
+                        .connect(id, allowed_ips, move || engine, false)
+                        .await
+                    {
+                        Ok(Ok(())) => eprintln!("vortix daemon: boot-connect '{name}' up"),
+                        Ok(Err(e)) => {
+                            eprintln!("vortix daemon: boot-connect '{name}' failed: {e}");
+                        }
+                        Err(e) => {
+                            eprintln!("vortix daemon: boot-connect '{name}' failed: {e}");
+                        }
+                    }
+                }
+            });
+        }
+    }
+
     // Retry/cadence knobs from config so the daemon and TUI behave alike.
     let cfg = crate::utils::get_app_config_dir()
         .ok()
@@ -438,6 +507,424 @@ fn handle_daemon(socket_override: Option<std::path::PathBuf>, mode: OutputMode) 
     let _ = std::fs::remove_file(&socket_for_cleanup);
 
     0
+}
+
+// ── Boot service (plan 2026-07-19-001 P5) ───────────────────────────────
+
+/// One service-manager invocation (systemctl / launchctl) through the
+/// `CommandRunner`. Returns the trimmed stderr on failure so callers
+/// can name exactly which activation step broke.
+fn run_service_cmd(program: &str, args: &[&str]) -> Result<(), String> {
+    let spec = crate::vortix_process::CommandSpec::oneshot(
+        program,
+        args.iter().map(ToString::to_string).collect(),
+    )
+    .timeout(Duration::from_secs(15));
+    match crate::vortix_process::run_to_output(spec) {
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(out) => Err(format!(
+            "`{program} {}` failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+        Err(e) => Err(format!("`{program}` failed to run: {e}")),
+    }
+}
+
+fn handle_service(
+    action: &crate::cli::args::ServiceAction,
+    config_dir: &Path,
+    mode: OutputMode,
+) -> i32 {
+    use crate::cli::args::ServiceAction;
+    use crate::daemon::service::ServiceManager;
+
+    // Persist/unpersist are sidecar edits — no service manager needed.
+    match action {
+        ServiceAction::Persist { profile } => {
+            return handle_service_persist(profile, true, config_dir, mode);
+        }
+        ServiceAction::Unpersist { profile } => {
+            return handle_service_persist(profile, false, config_dir, mode);
+        }
+        ServiceAction::Install | ServiceAction::Uninstall | ServiceAction::Status => {}
+    }
+
+    let Some(manager) = ServiceManager::detect() else {
+        print_error_and_exit(
+            mode,
+            "service",
+            CliError {
+                code: "unsupported_platform",
+                message: "boot-service management is supported on Linux (systemd) and macOS (launchd) only".into(),
+                hint: None,
+            },
+            ExitCode::GeneralError,
+        );
+    };
+
+    match action {
+        ServiceAction::Install => handle_service_install(manager, config_dir, mode),
+        ServiceAction::Uninstall => handle_service_uninstall(manager, mode),
+        ServiceAction::Status => handle_service_status(manager, mode),
+        ServiceAction::Persist { .. } | ServiceAction::Unpersist { .. } => unreachable!(),
+    }
+}
+
+/// Set or clear a profile's boot-connect flag (plan 2026-07-19-001
+/// P5). Sidecar-only edit under the caller's config dir — the boot
+/// daemon reads the flagged set at startup.
+fn handle_service_persist(profile: &str, value: bool, config_dir: &Path, mode: OutputMode) -> i32 {
+    use crate::vortix_config::profile_store::{FsProfileStore, ProfileStore, ProfileStoreError};
+
+    let store = FsProfileStore::new(config_dir.join(crate::constants::PROFILES_DIR_NAME));
+    match store.set_boot_connect(&crate::vortix_core::profile::ProfileId::new(profile), value) {
+        Ok(()) => {
+            match mode {
+                OutputMode::Human => {
+                    if value {
+                        println!(
+                            "'{profile}' will connect at boot (requires the boot service: sudo vortix service install)"
+                        );
+                    } else {
+                        println!("'{profile}' will no longer connect at boot");
+                    }
+                }
+                OutputMode::Json => print_success(
+                    mode,
+                    "service",
+                    &serde_json::json!({ "profile": profile, "boot_connect": value }),
+                    vec!["vortix service status --json".into()],
+                ),
+                OutputMode::Quiet => {}
+            }
+            0
+        }
+        Err(ProfileStoreError::NotFound(_)) => {
+            print_error_and_exit(mode, "service", err_not_found(profile), ExitCode::NotFound)
+        }
+        Err(e) => print_error_and_exit(
+            mode,
+            "service",
+            CliError {
+                code: "sidecar_write_failed",
+                message: e.to_string(),
+                hint: None,
+            },
+            ExitCode::GeneralError,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_lines)] // linear install pipeline: resolve → write → activate → verify
+fn handle_service_install(
+    manager: crate::daemon::service::ServiceManager,
+    config_dir: &Path,
+    mode: OutputMode,
+) -> i32 {
+    use crate::daemon::service::{self, ServiceManager, ServiceSpec};
+
+    if !crate::utils::is_root() {
+        print_error_and_exit(
+            mode,
+            "service",
+            err_permission_denied("vortix service install"),
+            ExitCode::PermissionDenied,
+        );
+    }
+
+    // The daemon serves the sudo-invoking user (P2 owner auth). A
+    // direct-root install has no such user — the daemon then serves
+    // only root, which is rarely what anyone wants.
+    let owner_uid = std::env::var("SUDO_UID")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok());
+    if owner_uid.is_none() && mode == OutputMode::Human {
+        eprintln!(
+            "warning: no SUDO_UID — installing with owner root. Run `sudo vortix service install` from your user account so YOUR user can drive the daemon without sudo."
+        );
+    }
+    let owner_uid = owner_uid.unwrap_or(0);
+
+    let binary = match std::env::current_exe().and_then(std::fs::canonicalize) {
+        Ok(p) => p,
+        Err(e) => print_error_and_exit(
+            mode,
+            "service",
+            CliError {
+                code: "binary_path_unresolved",
+                message: format!("cannot resolve the vortix binary path: {e}"),
+                hint: None,
+            },
+            ExitCode::GeneralError,
+        ),
+    };
+
+    let unit_path = manager.install_path();
+    // Never clobber a unit vortix didn't generate.
+    if let Ok(existing) = std::fs::read_to_string(&unit_path) {
+        if !service::is_vortix_artifact(&existing) {
+            print_error_and_exit(
+                mode,
+                "service",
+                CliError {
+                    code: "foreign_unit_file",
+                    message: format!(
+                        "{} exists but was not generated by vortix — refusing to overwrite it",
+                        unit_path.display()
+                    ),
+                    hint: Some("Remove or rename the file, then re-run the install.".into()),
+                },
+                ExitCode::StateConflict,
+            );
+        }
+    }
+
+    let spec = ServiceSpec {
+        binary,
+        owner_uid,
+        config_dir: config_dir.to_path_buf(),
+    };
+    if let Err(e) = std::fs::write(&unit_path, manager.render(&spec)) {
+        print_error_and_exit(
+            mode,
+            "service",
+            CliError {
+                code: "unit_write_failed",
+                message: format!("cannot write {}: {e}", unit_path.display()),
+                hint: None,
+            },
+            ExitCode::GeneralError,
+        );
+    }
+
+    // Activate: start now + enable at boot. A reinstall over a running
+    // service is deactivated first so the manager re-reads the unit.
+    let unit_str = unit_path.display().to_string();
+    let activation = match manager {
+        ServiceManager::Systemd => {
+            run_service_cmd("systemctl", &["daemon-reload"]).and_then(|()| {
+                run_service_cmd("systemctl", &["enable", "--now", "vortix-daemon.service"])
+            })
+        }
+        ServiceManager::Launchd => {
+            // Best-effort unload of a previous install; then modern
+            // bootstrap with the legacy `load -w` fallback.
+            let _ = run_service_cmd("launchctl", &["bootout", "system/com.vortix.daemon"]);
+            run_service_cmd("launchctl", &["bootstrap", "system", &unit_str])
+                .or_else(|_| run_service_cmd("launchctl", &["load", "-w", &unit_str]))
+        }
+    };
+    if let Err(e) = activation {
+        print_error_and_exit(
+            mode,
+            "service",
+            CliError {
+                code: "service_activation_failed",
+                message: e,
+                hint: Some(format!(
+                    "The unit file was written to {} — inspect the service manager logs, then retry.",
+                    unit_path.display()
+                )),
+            },
+            ExitCode::GeneralError,
+        );
+    }
+
+    // Honest started-state: the daemon binds the system socket within
+    // moments of activation; report what actually happened.
+    let socket = crate::daemon::system_socket_path();
+    let mut socket_up = false;
+    for _ in 0..25 {
+        if socket.exists() {
+            socket_up = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    let data = serde_json::json!({
+        "state": "installed",
+        "unit": unit_str,
+        "owner_uid": owner_uid,
+        "socket": socket.display().to_string(),
+        "socket_up": socket_up,
+    });
+    match mode {
+        OutputMode::Human => {
+            println!("Installed {}", unit_path.display());
+            if socket_up {
+                println!(
+                    "Daemon running on {} — vortix commands now work without sudo.",
+                    socket.display()
+                );
+            } else {
+                println!(
+                    "Service activated but {} has not appeared yet — check the service manager logs.",
+                    socket.display()
+                );
+            }
+        }
+        OutputMode::Json => print_success(
+            mode,
+            "service",
+            &data,
+            vec!["vortix status --json".into(), "vortix up <PROFILE>".into()],
+        ),
+        OutputMode::Quiet => {}
+    }
+    0
+}
+
+fn handle_service_uninstall(
+    manager: crate::daemon::service::ServiceManager,
+    mode: OutputMode,
+) -> i32 {
+    use crate::daemon::service::{self, ServiceManager};
+
+    if !crate::utils::is_root() {
+        print_error_and_exit(
+            mode,
+            "service",
+            err_permission_denied("vortix service uninstall"),
+            ExitCode::PermissionDenied,
+        );
+    }
+
+    let unit_path = manager.install_path();
+    match std::fs::read_to_string(&unit_path) {
+        // Idempotent: nothing installed = success.
+        Err(_) => {
+            match mode {
+                OutputMode::Human => println!("No boot service installed"),
+                OutputMode::Json => print_success(
+                    mode,
+                    "service",
+                    &serde_json::json!({ "state": "not_installed" }),
+                    vec![],
+                ),
+                OutputMode::Quiet => {}
+            }
+            return 0;
+        }
+        Ok(existing) if !service::is_vortix_artifact(&existing) => {
+            print_error_and_exit(
+                mode,
+                "service",
+                CliError {
+                    code: "foreign_unit_file",
+                    message: format!(
+                        "{} was not generated by vortix — refusing to remove it",
+                        unit_path.display()
+                    ),
+                    hint: None,
+                },
+                ExitCode::StateConflict,
+            );
+        }
+        Ok(_) => {}
+    }
+
+    // Deactivate (best-effort — the unit may not be loaded).
+    let unit_str = unit_path.display().to_string();
+    match manager {
+        ServiceManager::Systemd => {
+            let _ = run_service_cmd("systemctl", &["disable", "--now", "vortix-daemon.service"]);
+        }
+        ServiceManager::Launchd => {
+            if run_service_cmd("launchctl", &["bootout", "system/com.vortix.daemon"]).is_err() {
+                let _ = run_service_cmd("launchctl", &["unload", "-w", &unit_str]);
+            }
+        }
+    }
+
+    let mut removed = Vec::new();
+    for artifact in service::managed_artifacts(manager) {
+        if artifact.exists() && std::fs::remove_file(&artifact).is_ok() {
+            removed.push(artifact.display().to_string());
+        }
+    }
+
+    // R12 no-zombie: verify nothing we manage survived.
+    let leftovers: Vec<String> = service::managed_artifacts(manager)
+        .into_iter()
+        .filter(|p| p.exists())
+        .map(|p| p.display().to_string())
+        .collect();
+    if !leftovers.is_empty() {
+        print_error_and_exit(
+            mode,
+            "service",
+            CliError {
+                code: "uninstall_incomplete",
+                message: format!("artifacts still present: {}", leftovers.join(", ")),
+                hint: Some(
+                    "Remove them manually, then verify with `vortix service status`.".into(),
+                ),
+            },
+            ExitCode::GeneralError,
+        );
+    }
+
+    match mode {
+        OutputMode::Human => {
+            println!("Uninstalled — removed:");
+            for r in &removed {
+                println!("  - {r}");
+            }
+        }
+        OutputMode::Json => print_success(
+            mode,
+            "service",
+            &serde_json::json!({ "state": "uninstalled", "removed": removed }),
+            vec![],
+        ),
+        OutputMode::Quiet => {}
+    }
+    0
+}
+
+fn handle_service_status(manager: crate::daemon::service::ServiceManager, mode: OutputMode) -> i32 {
+    use crate::daemon::service;
+
+    let unit_path = manager.install_path();
+    let installed =
+        std::fs::read_to_string(&unit_path).is_ok_and(|c| service::is_vortix_artifact(&c));
+    let socket = crate::daemon::system_socket_path();
+    // "Reachable" = the daemon answers THIS user on the system socket
+    // (connect + registry snapshot), not merely "a socket file exists".
+    let reachable = crate::daemon::client::registry_snapshot(&socket).is_ok();
+
+    let data = serde_json::json!({
+        "installed": installed,
+        "reachable": reachable,
+        "unit": unit_path.display().to_string(),
+        "socket": socket.display().to_string(),
+    });
+    match mode {
+        OutputMode::Human => {
+            println!(
+                "Boot service : {}",
+                if installed {
+                    "installed"
+                } else {
+                    "not installed"
+                }
+            );
+            println!(
+                "Daemon       : {} ({})",
+                if reachable {
+                    "reachable"
+                } else {
+                    "not reachable"
+                },
+                socket.display()
+            );
+        }
+        OutputMode::Json => print_success(mode, "service", &data, vec![]),
+        OutputMode::Quiet => {}
+    }
+    i32::from(!(installed && reachable))
 }
 
 // ── Connection ──────────────────────────────────────────────────────────

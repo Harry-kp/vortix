@@ -38,6 +38,9 @@ pub struct ProfileSummary {
     pub protocol: ProtocolKind,
     pub group: Option<String>,
     pub last_used: Option<SystemTime>,
+    /// Boot-persisted (plan 2026-07-19-001 P5): the boot daemon brings
+    /// this profile up at startup. Set via `vortix service persist`.
+    pub boot_connect: bool,
 }
 
 /// On-disk sidecar layout.
@@ -55,6 +58,10 @@ pub struct Sidecar {
     pub imported_at: Option<SystemTime>,
     #[serde(default)]
     pub last_used: Option<SystemTime>,
+    /// Boot-persisted flag (P5). `#[serde(default)]` keeps pre-P5
+    /// sidecars readable — absent means false.
+    #[serde(default)]
+    pub boot_connect: bool,
 }
 
 impl Sidecar {
@@ -71,6 +78,7 @@ impl Sidecar {
             source: None,
             imported_at: Some(SystemTime::now()),
             last_used: None,
+            boot_connect: false,
         }
     }
 }
@@ -116,6 +124,14 @@ pub trait ProfileStore {
     ///
     /// Returns [`ProfileStoreError::Io`] on filesystem failures.
     fn delete(&self, id: &ProfileId) -> Result<(), ProfileStoreError>;
+
+    /// Set or clear the boot-persisted flag (plan 2026-07-19-001 P5).
+    /// The boot daemon connects every flagged profile at startup.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProfileStoreError::NotFound`] if the profile is missing.
+    fn set_boot_connect(&self, id: &ProfileId, value: bool) -> Result<(), ProfileStoreError>;
 }
 
 /// Filesystem-backed implementation.
@@ -188,6 +204,7 @@ impl ProfileStore for FsProfileStore {
                 protocol: sidecar.protocol,
                 group: sidecar.group,
                 last_used: sidecar.last_used,
+                boot_connect: sidecar.boot_connect,
             });
         }
         Ok(out)
@@ -221,7 +238,11 @@ impl ProfileStore for FsProfileStore {
         let cfg_path = self.config_path(&profile.display_name, profile.protocol);
         let meta_path = self.sidecar_path(&profile.display_name);
 
-        // Detect collision with a different profile_id owning the same name.
+        // Detect collision with a different profile_id owning the same
+        // name; a same-id re-insert carries the user's sidecar metadata
+        // (group, last_used, boot flag) over — updating a config body
+        // must not silently unpersist a boot profile.
+        let mut sidecar = Sidecar::for_profile(profile);
         if meta_path.exists() {
             let existing = Self::read_sidecar(&meta_path)?;
             if existing.profile_id != profile.id.as_str() {
@@ -229,6 +250,9 @@ impl ProfileStore for FsProfileStore {
                     name: profile.display_name.clone(),
                 });
             }
+            sidecar.group = existing.group;
+            sidecar.last_used = existing.last_used;
+            sidecar.boot_connect = existing.boot_connect;
         }
 
         // Atomic-ish writes.
@@ -236,7 +260,7 @@ impl ProfileStore for FsProfileStore {
         std::fs::write(&cfg_tmp, raw_body)?;
         std::fs::rename(&cfg_tmp, &cfg_path)?;
 
-        Self::write_sidecar(&meta_path, &Sidecar::for_profile(profile))?;
+        Self::write_sidecar(&meta_path, &sidecar)?;
         Ok(())
     }
 
@@ -276,6 +300,27 @@ impl ProfileStore for FsProfileStore {
                 let _ = std::fs::remove_file(&cfg);
                 std::fs::remove_file(&path)?;
                 return Ok(());
+            }
+        }
+        Err(ProfileStoreError::NotFound(id.clone()))
+    }
+
+    fn set_boot_connect(&self, id: &ProfileId, value: bool) -> Result<(), ProfileStoreError> {
+        for entry in std::fs::read_dir(&self.profiles_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !name.ends_with(".meta.toml") {
+                continue;
+            }
+            let mut sidecar = Self::read_sidecar(&path)?;
+            // Same id-or-display-name rule as `get`: callers hold the
+            // name-shaped id the wire and registry use.
+            if sidecar.profile_id == id.as_str() || sidecar.display_name == id.as_str() {
+                sidecar.boot_connect = value;
+                return Self::write_sidecar(&path, &sidecar);
             }
         }
         Err(ProfileStoreError::NotFound(id.clone()))
@@ -336,6 +381,33 @@ mod tests {
             "canonical id must come back even when looked up by name"
         );
         assert!(store.get(&ProfileId::new("nope")).is_err());
+    }
+
+    #[test]
+    fn boot_connect_round_trips_and_survives_reinsert() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FsProfileStore::new(tmp.path().to_path_buf());
+        store.insert(&corp(), b"[Interface]\n").unwrap();
+        assert!(!store.list().unwrap()[0].boot_connect);
+
+        // Set by display name (the wire/registry key form).
+        store
+            .set_boot_connect(&ProfileId::new("corp"), true)
+            .unwrap();
+        assert!(store.list().unwrap()[0].boot_connect);
+
+        // Re-import of the same profile must not unpersist it.
+        store.insert(&corp(), b"[Interface]\n# updated\n").unwrap();
+        assert!(store.list().unwrap()[0].boot_connect);
+
+        store
+            .set_boot_connect(&ProfileId::new("corp-h1"), false)
+            .unwrap();
+        assert!(!store.list().unwrap()[0].boot_connect);
+
+        assert!(store
+            .set_boot_connect(&ProfileId::new("ghost"), true)
+            .is_err());
     }
 
     #[test]

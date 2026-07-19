@@ -371,6 +371,23 @@ pub enum Commands {
         socket: Option<std::path::PathBuf>,
     },
 
+    /// Install or remove the vortix daemon as a boot service (plan 2026-07-19-001 P5)
+    ///
+    /// `install` writes the platform service unit (systemd on Linux,
+    /// launchd on macOS), starts the daemon now, and enables
+    /// start-at-boot. The root daemon serves YOUR user over the system
+    /// socket, so `vortix up` and the TUI work without sudo afterwards.
+    /// `uninstall` stops it and removes every installed artifact.
+    ///
+    /// EXAMPLES:
+    ///     sudo vortix service install     Install + start the boot service
+    ///     sudo vortix service uninstall   Stop + remove all artifacts
+    ///     vortix service status           Report install/run state
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+
     /// Audit open sockets and which interface routes them (plan 015 phase C / plan 013)
     ///
     /// Per-process snapshot of open TCP/UDP sockets visible to the
@@ -402,6 +419,27 @@ pub enum Commands {
     Completions {
         /// Target shell: bash, zsh, fish, powershell
         shell: clap_complete::Shell,
+    },
+}
+
+/// Actions for `vortix service` (plan 2026-07-19-001 P5).
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum ServiceAction {
+    /// Generate + install the boot service unit, start it now, enable at boot
+    Install,
+    /// Stop the daemon and remove every installed artifact (unit, socket)
+    Uninstall,
+    /// Report install/run state of the boot service
+    Status,
+    /// Mark a profile for the boot daemon to connect at startup
+    Persist {
+        /// Profile name (as shown by `vortix list`)
+        profile: String,
+    },
+    /// Clear a profile's boot-connect flag
+    Unpersist {
+        /// Profile name (as shown by `vortix list`)
+        profile: String,
     },
 }
 

@@ -138,6 +138,7 @@ fn write_sidecar_for(
         source: Some("migration:v1".to_string()),
         imported_at,
         last_used: None,
+        boot_connect: false,
     };
 
     let text = toml::to_string_pretty(&sidecar)

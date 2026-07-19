@@ -25,6 +25,7 @@
 
 pub mod client;
 mod server;
+pub mod service;
 pub mod supervisor;
 
 pub use server::DaemonServer;
@@ -152,12 +153,36 @@ pub fn daemon_socket_path_override() -> Option<PathBuf> {
     }
 }
 
+/// Canonical socket path for a boot-installed root daemon (plan
+/// 2026-07-19-001 P5, `vortix service install`). Deliberately fixed —
+/// not env-derived — because systemd/launchd start the daemon with no
+/// user session environment while clients run inside one; a shared
+/// constant is the only path both sides of that uid boundary can agree
+/// on (the cross-uid gap P2 flagged).
+#[must_use]
+pub fn system_socket_path() -> PathBuf {
+    PathBuf::from("/var/run/vortix.sock")
+}
+
+/// The socket paths a client probes, in order: the env override is
+/// exclusive when set (a missing override means bypass, never a
+/// fallback — it's an explicit instruction); otherwise the per-user
+/// default first (a daemon the user started by hand), then the system
+/// path (a boot-installed root daemon).
+fn socket_probe_candidates() -> Vec<PathBuf> {
+    match daemon_socket_path_override() {
+        Some(p) => vec![p],
+        None => vec![default_socket_path(), system_socket_path()],
+    }
+}
+
 /// Resolve the effective daemon socket path **only when a daemon
 /// appears to be running** (the file exists and is a Unix socket).
 ///
 /// Resolution order:
-/// 1. `VORTIX_DAEMON_SOCKET` env var (when set + non-empty)
-/// 2. Platform default ([`default_socket_path`])
+/// 1. `VORTIX_DAEMON_SOCKET` env var (when set + non-empty; exclusive)
+/// 2. Platform per-user default ([`default_socket_path`])
+/// 3. Canonical system path ([`system_socket_path`] — boot daemons)
 ///
 /// Read-only CLI ops (`status`, `list`, `audit`) use this to decide
 /// whether to route through the daemon or fall back to the direct
@@ -166,12 +191,9 @@ pub fn daemon_socket_path_override() -> Option<PathBuf> {
 /// (plan D3, multi-connection rollout).
 #[must_use]
 pub fn daemon_socket_path_if_present() -> Option<PathBuf> {
-    let candidate = daemon_socket_path_override().unwrap_or_else(default_socket_path);
-    if candidate.exists() && is_unix_socket(&candidate) && socket_owner_trusted(&candidate) {
-        Some(candidate)
-    } else {
-        None
-    }
+    socket_probe_candidates()
+        .into_iter()
+        .find(|c| c.exists() && is_unix_socket(c) && socket_owner_trusted(c))
 }
 
 #[cfg(unix)]
@@ -260,5 +282,27 @@ mod tests {
     fn missing_socket_owner_is_not_trusted() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(!socket_owner_trusted(&tmp.path().join("nope")));
+    }
+
+    #[test]
+    fn system_socket_path_is_fixed_and_absolute() {
+        // The whole point of the system path is that a root daemon
+        // (launched with no user env) and a user client resolve the
+        // SAME string — it must never depend on the environment.
+        assert_eq!(system_socket_path(), PathBuf::from("/var/run/vortix.sock"));
+    }
+
+    #[test]
+    fn probe_candidates_end_with_the_system_path_when_no_override() {
+        // Can't clear VORTIX_DAEMON_SOCKET safely in-process; this test
+        // only asserts the no-override shape when the var is unset in
+        // the test environment (cargo doesn't set it).
+        if daemon_socket_path_override().is_some() {
+            return;
+        }
+        let candidates = socket_probe_candidates();
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0], default_socket_path());
+        assert_eq!(candidates[1], system_socket_path());
     }
 }
