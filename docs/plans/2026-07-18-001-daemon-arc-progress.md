@@ -3,7 +3,7 @@
 Companion to `docs/plans/2026-07-19-001-feat-daemon-single-source-of-truth-plan.md`
 (the current decision artifact — supersedes the 2026-07-18 phased plan — do **not** edit its body; state lives here + in git).
 
-**Last updated:** 2026-07-19 (North Star re-architecture underway)
+**Last updated:** 2026-07-19 session 2 (P4 TUI cutover built; live validation next)
 
 ## North Star re-architecture (active plan: `2026-07-19-001-...-single-source-of-truth-plan.md`)
 
@@ -22,31 +22,61 @@ sync, S4 many-clients-one-state) are the acceptance tests.
 - `dcf4315` owner-based auth: gate accepts owner uid (VORTIX_OWNER_UID/SUDO_UID),
   socket chowned to owner → root daemon serves its unprivileged owner (no-sudo).
 
-**NEXT (resume here) — P4 TUI Remote cutover (task #21).** Concrete seams
-(investigated 2026-07-19, no re-discovery needed):
-- **Scanner→state producer:** `app/telemetry_poll.rs:104-105` spawns
-  `scanner::gather_system_state(&profiles)` and feeds `Message::SyncSystemState`
-  (line 92). THIS is the swap point: when daemon-attached, fetch the daemon's
-  `RegistrySnapshot` (via `EngineHandle::Remote` / `UnixTransport`) instead of
-  scanning the kernel, and build the registry update from it.
-  `handle_sync_system_state` (app/update.rs:336) is the consumer.
-- **Render:** untouched — renderers read `app.registry`; feeding it from the
-  daemon snapshot is enough for S2. A helper to seed `TunnelRegistry` from a
-  `RegistrySnapshot` (placeholder engines, render-only) is the pure/testable
-  first piece.
-- **Writes:** `app/connection.rs::connect_profile_inner` (line 170) + disconnect
-  route through the Remote handle when daemon-attached (Execute), instead of the
-  legacy `VpnRuntime` path. 2FA overlays stay client-side (refused on the daemon
-  path, as in the CLI).
-- **Bootstrap:** `main.rs::run_tui` (~line 365) — if `daemon_socket_path_if_present()`,
-  attach `EngineHandle::Remote` + set `App.daemon_attached`, and DON'T start the
-  local scanner/retry (telemetry_poll gates on the flag). Local path unchanged (R11).
-- Delivers **S2/S3/S4**. Live-dependent rewire of the interactive TUI loop —
-  no automated safety net for render correctness (CLAUDE.md: tests can't cover
-  real terminals), so it wants a focused session + live iteration. Everything it
-  consumes (Remote snapshot/subscribe/execute) is already built + tested.
+**DONE — P4 TUI Remote cutover (task #21), built 2026-07-19:**
+- **Pure mirror:** `TunnelRegistry::apply_remote_snapshot(snapshot, keep_local,
+  engine_factory)` (registry.rs) upserts wire tunnels via the new
+  `Engine::seed_state` (verbatim `Connection`, incl. Reconnecting/health),
+  drops daemon-unknown entries, takes wire `primary` + killswitch state
+  verbatim (NO local recompute — client route cache is unfed in remote mode),
+  recovers `allowed_ips` from the wire `Role`. 5 unit tests.
+- **Bootstrap:** `main.rs::probe_daemon()` — one blocking `RegistrySnapshot`
+  probe before the event loop. Attach + first-frame daemon state on success
+  (S2); attach-deferred on Timeout (daemon busy mid-connect — its registry
+  actor is serial); **loud eyre exit on VersionMismatch (AE8)**; silent local
+  fallback otherwise (R11). Attached → `EngineHandle::Remote` set, local
+  engine-handle/journal-nudge block skipped.
+- **Scanner swap:** `App.daemon: Option<DaemonLink>` (`app/daemon_link.rs`
+  — existence = attached; bundles socket, spawn-on-demand poll slot,
+  in-flight write markers, deferred auth cleanup, staleness counter; detach
+  = drop). `handle_tick` runs `poll_daemon_state()` instead of
+  `poll_scanner()` when attached. `Message::SyncDaemonState` →
+  `handle_sync_daemon_state` mirrors into `app.registry` + feeds the real-IP
+  gate fields. Poll errors: Timeout=keep last state + staleness warning
+  after 5 consecutive (wedged-daemon signal, recovery logged);
+  VersionMismatch=loud toast+detach; else detach with toast → local pipeline
+  resumes next tick and re-adopts kernel tunnels. Connect-timeout safeguard
+  is local-only now.
+- **Writes:** `spawn_daemon_execute` worker → `Message::DaemonCommandResult`
+  with typed `DaemonWriteStatus` (Completed/Failed/**TimedOut** — timeout =
+  "may still be working", never Failed; matches the CLI's Execute-timeout
+  contract). `connect_profile_inner` (root check skipped when attached; 2FA
+  static-challenge refused with toast, as in the CLI; conflict overlay gate
+  stays client-side — the daemon Executes Connect with force=true),
+  `disconnect_specific`/`force_disconnect`/`cancel_connect` route
+  Disconnect/ForceDisconnect. In-flight markers (70s expiry > 60s Execute
+  timeout) pin the optimistic ◐/◑ badge against poll overwrites. One-time
+  OpenVPN auth files are deleted only after the daemon write concludes
+  (deferred via `DaemonLink`, Drop-safe) — an immediate delete starved the
+  daemon's openvpn of credentials.
+- **Kill switch in attached mode (interim honesty rule until P6):** nothing
+  enforces it while attached — the scanner's drop-handler is parked and the
+  daemon has no firewall logic yet. So `attach_daemon` disarms a persisted
+  Armed state (with log+toast), `sync_killswitch` early-returns, and the `k`
+  toggle refuses with a pointer. Header/Security read `runtime.killswitch_*`
+  and honestly render KS:Off. P6 moves ownership daemon-side and reverses
+  this.
+- **Adversarial review (2 workflow passes, 4 lenses):** confirmed findings
+  all fixed in-tree — Execute-timeout collapse (→ typed TimedOut), attached
+  kill-switch misrepresentation (→ honesty rule above), one-time-credential
+  starvation (→ deferred cleanup), silent stale state under a wedged daemon
+  (→ staleness warning).
+- Delivers **S2/S3/S4** pending live validation (backlog rows 102–105).
+  Deferred within P4 scope: subscribe-push (poll-per-tick is sufficient at
+  TUI tick cadence; streaming stays loopback-tested), live re-attach after a
+  detach (restart the TUI), in-band 2FA.
 
-**Then:** P5 boot service (#22 — also fixes the cross-uid socket PATH agreement
+**NEXT (resume here):** live-validate P4 (backlog rows 102–105 + flow list
+below) → P5 boot service (#22 — also fixes the cross-uid socket PATH agreement
 P2 flagged: a canonical system socket path both daemon + client use) → P6
 closure (#23). Known P1 follow-up: externally-adopted tunnels get a placeholder
 engine (daemon-`down` on one is a no-op) until adoption seeds a real
