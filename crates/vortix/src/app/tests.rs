@@ -69,6 +69,25 @@ fn set_connected(app: &mut App, name: &str) {
     app.mirror_connect_into_registry(name, &details, Instant::now());
 }
 
+#[test]
+fn u1_multi_tunnel_no_primary_projection_is_stable_and_sorted() {
+    let mut app = test_app();
+    set_connected(&mut app, "zeta");
+    set_connected(&mut app, "alpha");
+
+    let snapshots = app.registry.snapshot_all();
+    let names: Vec<&str> = snapshots
+        .iter()
+        .map(|snapshot| snapshot.profile_id.as_str())
+        .collect();
+    assert_eq!(names, ["alpha", "zeta"]);
+    assert!(app.registry.primary().is_none());
+    let ConnectionState::Connected { profile, .. } = app.legacy_state() else {
+        panic!("legacy no-primary projection must choose the first active snapshot");
+    };
+    assert_eq!(profile, "alpha");
+}
+
 /// Helper: put app into a Disconnecting state for a given profile name.
 ///
 /// Production semantics: a profile only reaches Disconnecting via
