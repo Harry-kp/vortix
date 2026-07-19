@@ -194,8 +194,17 @@ impl ProfileStore for FsProfileStore {
     }
 
     fn get(&self, id: &ProfileId) -> Result<Profile, ProfileStoreError> {
+        // Resolve by canonical sidecar id OR unique display name. Every
+        // runtime surface (IPC `UserCommand`s, registry keys, scanner
+        // reconcile) keys tunnels by display name, while migrated
+        // sidecars carry a content-hash `profile_id` — and `insert`'s
+        // `NameCollision` check makes the name exactly as unique as the
+        // hash. Daemon-side resolution (`daemon::connect_allowed_ips`,
+        // the engine's profile resolver) receives the name form off the
+        // wire; matching only the hash made every daemon-routed connect
+        // fail "not found in catalog" for migrated profiles.
         for summary in self.list()? {
-            if &summary.id == id {
+            if &summary.id == id || summary.display_name == id.as_str() {
                 return Ok(Profile::new(
                     summary.id,
                     summary.display_name.clone(),
@@ -301,6 +310,32 @@ mod tests {
         assert_eq!(p.display_name, "corp");
         assert_eq!(p.protocol, ProtocolKind::WireGuard);
         assert!(p.config_path.exists());
+    }
+
+    #[test]
+    fn get_resolves_by_display_name_when_sidecar_id_is_a_hash() {
+        // Migrated sidecars carry a content-hash profile_id, but the
+        // wire / registry / scanner all key by display name. `get` must
+        // resolve both forms — the daemon's connect path receives the
+        // name form and used to fail "not found in catalog".
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FsProfileStore::new(tmp.path().to_path_buf());
+        let hashed = Profile::new(
+            ProfileId::new("6e51824da5c05f5a5d5f7bcfe06df7afbeeb9fc0"),
+            "testwg",
+            ProtocolKind::WireGuard,
+            PathBuf::from("placeholder"),
+        );
+        store.insert(&hashed, b"[Interface]\n").unwrap();
+
+        let by_name = store.get(&ProfileId::new("testwg")).unwrap();
+        assert_eq!(by_name.display_name, "testwg");
+        assert_eq!(
+            by_name.id.as_str(),
+            "6e51824da5c05f5a5d5f7bcfe06df7afbeeb9fc0",
+            "canonical id must come back even when looked up by name"
+        );
+        assert!(store.get(&ProfileId::new("nope")).is_err());
     }
 
     #[test]

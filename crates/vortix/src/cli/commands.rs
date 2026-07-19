@@ -270,7 +270,13 @@ async fn shutdown_signal() {
 
 #[allow(clippy::too_many_lines)]
 fn handle_daemon(socket_override: Option<std::path::PathBuf>, mode: OutputMode) -> i32 {
-    let socket_path = socket_override.unwrap_or_else(crate::daemon::default_socket_path);
+    // Bind-path resolution mirrors the clients' connect-path resolution
+    // (--socket > VORTIX_DAEMON_SOCKET > platform default) so an
+    // env-configured deployment can't end up with the daemon bound at
+    // one path and every client probing another.
+    let socket_path = socket_override
+        .or_else(crate::daemon::daemon_socket_path_override)
+        .unwrap_or_else(crate::daemon::default_socket_path);
 
     // Tokio-backed daemon socket binding must happen inside an active Tokio runtime.
     // Binding before runtime creation panics with:
