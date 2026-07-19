@@ -128,7 +128,13 @@ daemon's Subscribe stream has a producer again — post-P1 it streams only
 heartbeats (the retired single FSM was the old event source); clients poll
 `RegistrySnapshot` today. Known P1 follow-up: externally-adopted tunnels get
 a placeholder engine (daemon-`down` on one is a no-op) until adoption seeds
-a real protocol-correct engine. See the plan for full detail.
+a real protocol-correct engine. Second supervisor follow-up (found while
+fixing the v0.4.x disconnect→reconnect loop, PR #253): the daemon's
+reconcile adoption can re-adopt a process its own `disconnect` just
+signalled (openvpn takes ~1-2s to die after `down()` returns) — the
+supervisor needs a short post-disconnect adoption grace per profile,
+mirroring the TUI fix (`dec268b`) that keeps entries Disconnecting until
+the kernel confirms. See the plan for full detail.
 
 ## Code review (2026-07-19)
 
