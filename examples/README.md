@@ -1,27 +1,36 @@
-# vortix daemon — deployment examples (plan 015 phase D / plan 010)
+# vortix daemon — deployment examples
 
-Reference unit files for running `vortix daemon` as a system service.
-Use these as starting points; review the `SECURITY.md` notes about
-the v0.3.0 phase E auth posture before deploying.
+**Preferred path: `sudo vortix service install`** (plan 2026-07-19-001
+P5). It generates these artifacts with your binary path, your uid as
+the daemon's owner, and your config dir baked in, then starts the
+service and enables it at boot. `sudo vortix service uninstall`
+removes everything it installed.
+
+The files here are *reference copies* of what the installer generates,
+with `<PLACEHOLDER>` values, for people who manage units by hand or
+need to adapt them (custom unit dirs, NixOS modules, etc.). If you
+hand-install one, keep it in sync with the generated shape — the
+`--socket /var/run/vortix.sock` argument and the `VORTIX_OWNER_UID` /
+`VORTIX_CONFIG_DIR` environment are what let an unprivileged user
+drive the root daemon (see SECURITY.md for the auth posture).
 
 - [`systemd/vortix-daemon.service`](systemd/vortix-daemon.service) — Linux
 - [`launchd/com.vortix.daemon.plist`](launchd/com.vortix.daemon.plist) — macOS
 
-## Quick local test
+## Quick local test (no root, no service manager)
 
 ```sh
 # Build vortix first
 cargo build --release -p vortix
 
-# Run the daemon in one terminal
+# Run the daemon in one terminal (binds your user default socket)
 ./target/release/vortix daemon
 
-# In another terminal, observe the socket
+# In another terminal, observe the socket and route through it
 ls -la "${XDG_RUNTIME_DIR:-/tmp}/vortix.sock"
+vortix status --json
 ```
 
-The frontend (TUI/CLI) checks `VORTIX_DAEMON_SOCKET` env var at
-startup and routes through the daemon when set. v0.3.0 ships the
-daemon skeleton + IPC contract; full engine routing through the
-daemon is post-v0.3 hardening (see plan 015 phase D commit body for
-the staged scope).
+A user-owned daemon can serve reads and state, but tunnel bring-up
+needs root — install the service (or run `sudo vortix daemon`) for
+real connects.

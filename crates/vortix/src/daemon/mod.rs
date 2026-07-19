@@ -1,22 +1,26 @@
-//! `vortix daemon` — IPC server hosting the engine (plan 015 phase D / plan 010).
+//! `vortix daemon` — the single source of truth for VPN state (plan
+//! 2026-07-19-001; grown from plan 015 phase D / plan 010).
 //!
-//! The daemon binds a Unix socket, hosts the FSM via the existing
-//! `EngineHandle::Local`, and serves `IpcRequest` frames from
-//! connected clients. Today single-client-at-a-time; multi-client
-//! support is a follow-up hardening pass once the wire contract has
-//! stabilized.
+//! The daemon binds a Unix socket, owns a per-profile engine registry
+//! (`RegistryHandle`), and serves `IpcRequest` frames from concurrent
+//! clients (per-client `tokio::spawn` accept loop). A headless
+//! supervisor loop reconciles the registry against the kernel — adopts
+//! external sessions, detects drops, auto-reconnects. CLI and TUI are
+//! thin clients over this socket; when no daemon runs, both fall back
+//! to their in-process paths (R11).
 //!
-//! Auth: `SO_PEERCRED` / `getpeereid` — the daemon refuses requests from
-//! a UID other than its own (`daemon/server.rs`), backed by the mode-0600
-//! socket. The client performs the reciprocal check (`socket_owner_trusted`)
+//! Auth: `SO_PEERCRED` / `getpeereid` — the daemon accepts its own uid
+//! and its configured owner (`VORTIX_OWNER_UID` / `SUDO_UID`), so a
+//! root daemon serves its unprivileged owner (`daemon/server.rs`).
+//! The client performs the reciprocal check (`socket_owner_trusted`)
 //! before connecting, refusing a socket owned by anyone but root or the
 //! current user so a rogue `/tmp/vortix.sock` can't impersonate the daemon.
 //!
 //! Lifecycle:
 //! 1. Bind the socket (cleaning up any stale socket file)
-//! 2. Install global runner + platform + journal (same as main.rs)
-//! 3. Build `Engine<TunnelKind>` + `EngineHandle::local`
-//! 4. Accept loop: handle one client at a time, terminate on SIGTERM
+//! 2. Spawn the registry actor + adopt already-running tunnels (R7)
+//! 3. Connect boot-persisted profiles (`vortix service persist`, P5)
+//! 4. Spawn the supervisor loop; accept clients until SIGTERM/Ctrl-C
 //! 5. On exit, unlink the socket file
 //!
 //! The daemon prints lifecycle events (binding, accepting, accepted,

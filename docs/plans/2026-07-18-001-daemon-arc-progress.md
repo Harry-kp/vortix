@@ -33,8 +33,10 @@ sync, S4 many-clients-one-state) are the acceptance tests.
   probe before the event loop. Attach + first-frame daemon state on success
   (S2); attach-deferred on Timeout (daemon busy mid-connect — its registry
   actor is serial); **loud eyre exit on VersionMismatch (AE8)**; silent local
-  fallback otherwise (R11). Attached → `EngineHandle::Remote` set, local
-  engine-handle/journal-nudge block skipped.
+  fallback otherwise (R11). North-star cleanup removed `App.engine_handle`
+  entirely (zero readers — the TUI's connects never drove the local FSM
+  actor, so the plan-005 handle + journal-nudge block were idle machinery);
+  the TUI's daemon connection lives on `App.daemon: Option<DaemonLink>`.
 - **Scanner swap:** `App.daemon: Option<DaemonLink>` (`app/daemon_link.rs`
   — existence = attached; bundles socket, spawn-on-demand poll slot,
   in-flight write markers, deferred auth cleanup, staleness counter; detach
@@ -121,9 +123,12 @@ sync, S4 many-clients-one-state) are the acceptance tests.
 106–107 (root daemon, real tunnels, reboot persistence AE5) → P6 closure
 (#23: kill-switch-on-drop + daemon KS ownership + early-boot unit, golden
 parity suite AE6/R11, security review, README, CHANGELOG, close
-#234/#250/#153/#16). Known P1 follow-up: externally-adopted tunnels get a
-placeholder engine (daemon-`down` on one is a no-op) until adoption seeds a
-real protocol-correct engine. See the plan for full detail.
+#234/#250/#153/#16). P6 should also journal registry transitions so the
+daemon's Subscribe stream has a producer again — post-P1 it streams only
+heartbeats (the retired single FSM was the old event source); clients poll
+`RegistrySnapshot` today. Known P1 follow-up: externally-adopted tunnels get
+a placeholder engine (daemon-`down` on one is a no-op) until adoption seeds
+a real protocol-correct engine. See the plan for full detail.
 
 ## Code review (2026-07-19)
 

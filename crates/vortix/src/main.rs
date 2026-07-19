@@ -171,8 +171,9 @@ fn main() -> Result<()> {
     // Plan 008 U5: orphan-daemon scan. If a previous vortix crashed
     // while a tunnel was up, the user's `wg-quick` / `openvpn` /
     // `wireguard-go` daemon is probably still running. Warn so they
-    // know to clean up (no auto-adopt — adoption arrives with the
-    // plan 010 IPC layer).
+    // know to clean up. (Catalog-matched sessions ARE auto-adopted —
+    // by the TUI scanner and the daemon supervisor; this scan warns
+    // about processes adoption can't attribute to a profile.)
     //
     // PIDs recorded in `run/*.pid` belong to a tracked session (openvpn
     // daemons reparent to init, so the bare scan can't tell "mine" from
@@ -349,66 +350,24 @@ fn run_tui(
     config_dir: std::path::PathBuf,
 ) -> Result<()> {
     let tick_rate = config.tick_rate;
-    let profiles_dir_for_resolver = config_dir.join(constants::PROFILES_DIR_NAME);
     let mut app = App::new(config, config_dir);
 
-    // P4 (plan 2026-07-19-001): attach to a running daemon before any
-    // local engine wiring. When attached, the daemon owns all tunnel
-    // state — the TUI renders its RegistrySnapshot and routes writes
-    // through Execute; none of the local FSM/scanner machinery starts.
-    // Socket absent = silent Local fallback; version mismatch = loud
-    // typed error naming both sides (the U1 contract).
-    let daemon_attached = match probe_daemon()? {
-        Some((socket, snapshot)) => {
-            let transport =
-                std::sync::Arc::new(vortix::daemon::client::UnixTransport::new(socket.clone()));
-            app.engine_handle = Some(vortix::vortix_core::engine::EngineHandle::Remote(
-                vortix::vortix_core::engine::handle::RemoteHandle::new(transport),
-            ));
-            app.attach_daemon(socket);
-            if let Some(snapshot) = snapshot {
-                app.handle_message(vortix::message::Message::SyncDaemonState(snapshot));
-            }
-            true
-        }
-        None => false,
-    };
-
-    // Attach an `EngineHandle` (plan 005 U5/U6). The handle wraps the
-    // FSM and gets a per-profile tunnel factory so a single
-    // `Engine<TunnelKind>` drives both WG and OVPN. The actor spawns on
-    // the bundled tokio runtime. Failure is non-fatal.
+    // P4 (plan 2026-07-19-001): attach to a running daemon. When
+    // attached, the daemon owns all tunnel state — the TUI renders its
+    // RegistrySnapshot and routes writes through Execute; when absent,
+    // the in-process scanner/mirror pipeline runs exactly as before
+    // (R11). Socket absent = silent Local fallback; version mismatch =
+    // loud typed error naming both sides (the U1 contract).
     //
-    // The construction itself lives in `daemon::build_engine_handle` so
-    // both the TUI bootstrap (here) and `vortix daemon` (`handle_daemon`)
-    // produce the same shape. Skipped when a daemon is attached — the
-    // Remote handle above replaces the in-process actor (P4).
-    if !daemon_attached {
-        if let Some(runtime) = vortix::vortix_process::global_runner().as_real() {
-            let _guard = runtime.runtime().handle().enter();
-            if let Some(handle) = vortix::daemon::build_engine_handle(&profiles_dir_for_resolver) {
-                app = app.with_engine_handle(handle);
-
-                // Plan 005 U7: spawn a journal-subscriber task that reacts
-                // to engine events. Today it nudges the legacy telemetry
-                // worker on `TunnelUp` so connect → IP-refresh happens
-                // promptly. Future units route more flows through here.
-                // TUI-only side-effect — the daemon path doesn't need it.
-                if let Some(j) = vortix::vortix_core::journal::global_journal() {
-                    let mut rx = j.subscribe();
-                    let nudge = app.runtime.telemetry_nudge.clone();
-                    tokio::spawn(async move {
-                        use vortix::vortix_core::engine::EngineEvent;
-                        while let Ok(envelope) = rx.recv().await {
-                            if matches!(envelope.event, EngineEvent::TunnelUp { .. }) {
-                                if let Some(n) = &nudge {
-                                    let _ = n.send(());
-                                }
-                            }
-                        }
-                    });
-                }
-            }
+    // North-star note: the pre-P4 bootstrap also spawned a local
+    // `EngineHandle` FSM actor + a journal-subscriber nudge here. The
+    // TUI never drove that actor (its connects spawn tunnel threads
+    // directly), so the actor idled and the TunnelUp nudge could never
+    // fire — both removed when the daemon became the engine owner.
+    if let Some((socket, snapshot)) = probe_daemon()? {
+        app.attach_daemon(socket);
+        if let Some(snapshot) = snapshot {
+            app.handle_message(vortix::message::Message::SyncDaemonState(snapshot));
         }
     }
     let events = EventHandler::new(tick_rate);

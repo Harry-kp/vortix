@@ -328,13 +328,16 @@ fn handle_daemon(socket_override: Option<std::path::PathBuf>, mode: OutputMode) 
         |d| d.join(constants::PROFILES_DIR_NAME),
     );
 
-    // Build the engine handle the IPC server uses for client-driven
-    // Execute/Snapshot/Subscribe.
+    // Post-P1, Execute/Snapshot/RegistrySnapshot all route through the
+    // registry; this legacy engine handle remains ONLY as Subscribe's
+    // journal source. Registry transitions don't journal events yet, so
+    // Subscribe streams heartbeats until P6 wires event emission —
+    // clients poll RegistrySnapshot for state in the meantime (P4).
     let engine_handle =
         runtime.block_on(async { crate::daemon::build_engine_handle(&profiles_dir) });
     if engine_handle.is_none() {
         eprintln!(
-            "vortix daemon: engine handle unavailable (journal or runner not installed) — Execute/Snapshot/Subscribe will return Internal errors"
+            "vortix daemon: engine handle unavailable (journal or runner not installed) — Subscribe will return Internal errors"
         );
     }
     let server = if let Some(handle) = engine_handle {

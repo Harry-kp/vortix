@@ -10,9 +10,10 @@
 //! (panels, overlays, animations, scroll positions) remains directly on `App`.
 //!
 //! Plan #005 U5 removed `App: Deref<Target = VpnRuntime>`. VPN-state
-//! accesses are now explicit via `self.runtime.X` / `app.runtime.X`. The
-//! optional `engine_handle` field carries the plan #005 `EngineHandle`
-//! for code paths that want to query/command through the FSM actor.
+//! accesses are now explicit via `self.runtime.X` / `app.runtime.X`.
+//! When a daemon is attached (plan 2026-07-19-001 P4), `daemon:
+//! Option<DaemonLink>` carries the connection and the registry mirrors
+//! daemon truth; otherwise the in-process scanner/mirror pipeline runs.
 //!
 //! ## Module structure
 //! - `input` — Keyboard and mouse event handling
@@ -115,13 +116,6 @@ pub struct App {
     /// `self.registry` (plan #001 U6).
     pub runtime: VpnRuntime,
 
-    /// Plan-005 `EngineHandle`. Local mode: wraps the in-process FSM
-    /// actor (non-load-bearing; multi-tunnel callers use `self.registry`).
-    /// Daemon-attached (P4): carries `EngineHandle::Remote` for
-    /// handle-shaped consumers; the poll/write paths use
-    /// `self.daemon_socket` directly.
-    pub engine_handle: Option<crate::vortix_core::engine::EngineHandle>,
-
     /// Multi-connection plan #001: the `TunnelRegistry` owns active tunnel
     /// FSMs. Panels read tunnel snapshots from here (sidebar, header,
     /// `connection_details`, security, chart).
@@ -188,7 +182,6 @@ impl App {
 
         let mut app = Self {
             runtime,
-            engine_handle: None,
             registry: TunnelRegistry::new(),
             daemon: None,
 
@@ -318,15 +311,6 @@ impl App {
 }
 
 impl App {
-    /// Attach an `EngineHandle` to the app (plan 005 U5 incremental
-    /// adoption). Local-mode bootstrap only; the daemon-attached path
-    /// sets `engine_handle` to a `Remote` handle directly.
-    #[must_use]
-    pub fn with_engine_handle(mut self, handle: crate::vortix_core::engine::EngineHandle) -> Self {
-        self.engine_handle = Some(handle);
-        self
-    }
-
     /// Whether a running daemon owns tunnel state for this session
     /// (plan 2026-07-19-001 P4). Gates the scanner swap, the write
     /// routing, and the connect-timeout safeguard.
@@ -377,7 +361,6 @@ impl App {
         let runtime = VpnRuntime::new_test();
         Self {
             runtime,
-            engine_handle: None,
             registry: TunnelRegistry::new(),
             daemon: None,
 

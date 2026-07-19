@@ -25,7 +25,6 @@ fn test_app() -> App {
     runtime.config_dir = std::env::temp_dir().join(format!("vortix_test_{}", std::process::id()));
     App {
         runtime,
-        engine_handle: None,
         registry: crate::vortix_core::engine::TunnelRegistry::new(),
         daemon: None,
         should_quit: false,
