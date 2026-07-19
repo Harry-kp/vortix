@@ -70,10 +70,24 @@ sync, S4 many-clients-one-state) are the acceptance tests.
   kill-switch misrepresentation (→ honesty rule above), one-time-credential
   starvation (→ deferred cleanup), silent stale state under a wedged daemon
   (→ staleness warning).
-- Delivers **S2/S3/S4** pending live validation (backlog rows 102–105).
-  Deferred within P4 scope: subscribe-push (poll-per-tick is sufficient at
-  TUI tick cadence; streaming stays loopback-tested), live re-attach after a
-  detach (restart the TUI), in-band 2FA.
+- **Local live smoke (2026-07-19, user-owned daemon + tmux-driven TUI, no
+  root):** attach log on first frame + clean render ✓; kill-switch refusal
+  toast in attached mode ✓; daemon-routed connect round-trips Execute and
+  reports the real tunnel error honestly (`wg-quick requires root` — correct
+  for an unprivileged daemon) with the ✗ badge ✓; daemon kill → "connection
+  lost, running locally" toast within a tick, TUI alive, local scanner + KS
+  toggle resume ✓; no-daemon boot has no attach line (R11) ✓. The smoke
+  caught two latent bugs, fixed in `47032b9`: **FsProfileStore::get matched
+  only the sidecar hash id** → every daemon-routed connect (CLI too) failed
+  "not found in catalog" for migrated profiles (now resolves display name
+  too); **`vortix daemon` ignored VORTIX_DAEMON_SOCKET** for binding while
+  clients honor it (bind now mirrors client resolution).
+- Delivers **S2/S3/S4** pending droplet validation with a ROOT daemon +
+  real tunnels (backlog rows 102–105: real connect details rendering,
+  multi-client lockstep, AE1 no-sudo end-to-end). Deferred within P4 scope:
+  subscribe-push (poll-per-tick is sufficient at TUI tick cadence;
+  streaming stays loopback-tested), live re-attach after a detach (restart
+  the TUI), in-band 2FA.
 
 **NEXT (resume here):** live-validate P4 (backlog rows 102–105 + flow list
 below) → P5 boot service (#22 — also fixes the cross-uid socket PATH agreement
