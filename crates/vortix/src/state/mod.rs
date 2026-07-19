@@ -5,7 +5,7 @@
 //! - `ui`: UI-specific state like focus, input mode, and toasts
 //! - `killswitch`: Kill switch mode and state
 //!
-//! Multi-connection plan #001 U6 Stage B retired the legacy
+//! retired the legacy
 //! `state::ConnectionState` enum. UI panels read active tunnel state
 //! from `crate::app::App::registry` (a
 //! `crate::vortix_core::engine::TunnelRegistry`); the legacy mirror that

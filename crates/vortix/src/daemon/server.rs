@@ -1,4 +1,4 @@
-//! Daemon IPC server loop (plan 015 phase D U18 / plan 010).
+//! Daemon IPC server loop.
 //!
 //! Single-client-at-a-time. Accept → peer-UID check → read frame →
 //! dispatch → write response → loop until client disconnects.
@@ -305,7 +305,7 @@ async fn dispatch(req: IpcRequest, engine_handle: Option<&EngineHandle>) -> IpcR
                 // primary's Connection (or Disconnected when no
                 // primary). New v2 callers should switch to
                 // `RegistrySnapshot` once they upgrade — see plan
-                // #001 U22. Today the EngineHandle exposes a single
+                // the multi-tunnel wire work. Today the EngineHandle exposes a single
                 // FSM (D1 wired the single-tunnel handle in the
                 // daemon); the registry-aware variant lands when a
                 // follow-up unit threads the registry into the
@@ -544,7 +544,7 @@ mod tests {
         assert_eq!(uid, me);
     }
 
-    // ===== U22 multi-tunnel command dispatch =====
+    // ===== multi-tunnel command dispatch =====
 
     #[tokio::test]
     async fn dispatch_execute_disconnect_all_routes_through_engine_handle() {

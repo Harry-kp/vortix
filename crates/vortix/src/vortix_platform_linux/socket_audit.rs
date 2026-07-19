@@ -1,4 +1,4 @@
-//! Linux `SocketAudit` impl (plan 015 phase C U11 / plan 013).
+//! Linux `SocketAudit` impl.
 //!
 //! Parses `/proc/net/{tcp,tcp6,udp,udp6}` for the socket inventory +
 //! walks `/proc/<pid>/fd/*` to map socket inodes back to processes.

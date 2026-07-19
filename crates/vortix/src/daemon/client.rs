@@ -1,4 +1,4 @@
-//! Minimal blocking IPC client for CLI use (plan multi-connection D3).
+//! Minimal blocking IPC client for CLI use.
 //!
 //! Read-only CLI ops (`vortix status`) call into the daemon when its
 //! socket is present and connectable, falling back to direct disk +

@@ -1,4 +1,4 @@
-//! IPC envelope + framing for `EngineHandle::Remote` (plan 015 phase D / plan 010).
+//! IPC envelope + framing for `EngineHandle::Remote`.
 //!
 //! The daemon (`vortix daemon`) and the client (TUI/CLI) communicate
 //! via length-prefixed JSON frames on a Unix domain socket. This
@@ -41,7 +41,7 @@ pub enum IpcOp {
     /// frames on this connection are events until the client closes.
     Subscribe,
     /// Graceful daemon shutdown. Authorized client only (UID-matching
-    /// per `SO_PEERCRED`; see plan 015 phase E).
+    /// per `SO_PEERCRED`; see peer-credential auth).
     Shutdown,
 }
 
@@ -73,7 +73,7 @@ pub enum IpcResult {
     /// registry has no primary, `state` is `Connection::Disconnected`.
     /// Multi-tunnel-aware clients should prefer [`Self::RegistrySnapshot`].
     Snapshot { state: Connection },
-    /// Multi-tunnel snapshot (plan #001 U22). Carries the full set of
+    /// Multi-tunnel snapshot. Carries the full set of
     /// active tunnels plus the derived primary and global killswitch
     /// state. New clients query this; v1 clients that only know
     /// [`Self::Snapshot`] keep working through the back-compat

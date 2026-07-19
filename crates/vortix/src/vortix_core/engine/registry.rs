@@ -1,10 +1,10 @@
-//! `TunnelRegistry<T>` — N-active-tunnel wrapper around `Engine<T>` (plan #001 U5).
+//! `TunnelRegistry<T>` — N-active-tunnel wrapper around `Engine<T>`.
 //!
 //! Owns a `HashMap<ProfileId, RegistryEntry<T>>` (each entry wraps an
 //! `Engine<T>` and the `AllowedIPs` declared at connect-time), the derived
 //! `primary: Option<ProfileId>`, and the global killswitch fields. Panels read
 //! snapshots through `snapshot`/`snapshot_all`; the multi-connection app
-//! migration in U6 retires the legacy single-tunnel `VpnEngine` and routes
+//! migration in a later stage retires the legacy single-tunnel `VpnEngine` and routes
 //! every panel through these accessors.
 //!
 //! ## Shape decision (Q-DEF-6 → D-7)
@@ -58,7 +58,7 @@ use crate::vortix_core::state::{KillSwitchMode, KillSwitchState};
 
 /// Why the primary tunnel changed.
 ///
-/// Surfaced via `tracing::info` today; the U23 journal-event wiring will
+/// Surfaced via `tracing::info` today; the journal-event wiring will
 /// translate this into an `EngineEvent::PrimaryTunnelChanged` variant the UI
 /// banner consumes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,7 +117,7 @@ pub enum Conflict {
     /// it but `tunnel.up` hasn't returned yet — the §7.3 in-flight rule).
     DefaultRouteTakeover { current: ProfileId, new: ProfileId },
     /// Non-default-route overlap. Reserved for the future v2 conflict surface
-    /// (R10's "subnet overlap" requirement); not produced by the v1
+    ///; not produced by the v1
     /// `detect_conflict` which only inspects the default route.
     RouteOverlap {
         with: ProfileId,
@@ -305,7 +305,7 @@ impl<T: Tunnel> TunnelRegistry<T> {
     }
 
     /// Register an FSM with the given `AllowedIPs` without driving any connect.
-    /// Used by U6's App migration when adopting an already-spawned FSM (e.g.,
+    /// Used by the App migration when adopting an already-spawned FSM (e.g.,
     /// hydrating from persisted state) — the registry needs the `AllowedIPs`
     /// for conflict detection but the FSM may already be `Connected`.
     pub fn insert(&mut self, profile_id: ProfileId, engine: Engine<T>, allowed_ips: Vec<Cidr>) {
@@ -330,7 +330,7 @@ impl<T: Tunnel> TunnelRegistry<T> {
     /// `Tunnel::up`. Used to mirror externally-driven kernel state
     /// (e.g. a tunnel brought up via the legacy
     /// `App::connect_profile_inner` spawned-thread path) into the
-    /// registry until plan 001 U7 routes the full connect flow through
+    /// registry until a follow-up routes the full connect flow through
     /// `EngineHandle::Local`.
     ///
     /// Behavior:
@@ -729,7 +729,7 @@ impl<T: Tunnel> TunnelRegistry<T> {
             };
         }
 
-        // Refresh primary inline — event-driven trigger per plan §U5.
+        // Refresh primary inline — event-driven trigger.
         self.refresh_primary_internal(events.iter());
         Ok(())
     }
@@ -781,7 +781,7 @@ impl<T: Tunnel> TunnelRegistry<T> {
             }));
 
         // Event-driven primary refresh. If we just took down the primary,
-        // re-probe immediately and emit a structured log so U23's journal
+        // re-probe immediately and emit a structured log so the journal
         // wiring picks it up.
         let from = self.primary.clone();
         self.refresh_primary_internal(events.iter());
@@ -827,7 +827,7 @@ impl<T: Tunnel> TunnelRegistry<T> {
         }
         // One killswitch refresh at the end is a no-op here — the App owns
         // the killswitch port; the registry just signals that it's safe to
-        // call. The U6 migration wires the actual port call.
+        // call. A later migration wires the actual port call.
     }
 
     // ──────────────────────────── Reconnect ────────────────────────────
@@ -1052,7 +1052,7 @@ impl<T: Tunnel> TunnelRegistry<T> {
     /// single-default-route invariant. Returns `None` when safe.
     ///
     /// Checks both the Connected primary AND any in-flight `Connecting` FSMs
-    /// — the latter is the §7.3 in-flight rule (SC12).
+    /// — the latter is the §7.3 in-flight rule.
     #[must_use]
     pub fn detect_conflict(
         &self,
@@ -1063,7 +1063,7 @@ impl<T: Tunnel> TunnelRegistry<T> {
             claims_default_route_v4(new_allowed_ips) || claims_default_route_v6(new_allowed_ips);
         if !new_claims_default {
             // Non-default-route profile; never conflicts (route-overlap
-            // detection is R10 v2 territory, not v1).
+            // detection is follow-up territory).
             return None;
         }
         // Find any other tunnel already claiming 0/0 in a Connected or
@@ -1144,7 +1144,7 @@ fn log_primary_change(
     to: Option<&ProfileId>,
     reason: PrimaryTunnelChangeReason,
 ) {
-    // U23 will replace this with a journal-emitted EngineEvent. For now the
+    // A follow-up will replace this with a journal-emitted EngineEvent. For now the
     // structured log is the contract.
     tracing::info!(
         target: "vortix::registry",
@@ -1188,12 +1188,12 @@ mod tests {
         vec![v4("0.0.0.0/0")]
     }
 
-    /// `0/1 + 128/1` split-CIDR pair (SC10) — covers full v4.
+    /// `0/1 + 128/1` split-CIDR pair — covers full v4.
     fn split_pair_v4() -> Vec<Cidr> {
         vec![v4("0.0.0.0/1"), v4("128.0.0.0/1")]
     }
 
-    /// `/2` quartet (SC11) — covers full v4.
+    /// `/2` quartet — covers full v4.
     fn quartet_v4() -> Vec<Cidr> {
         vec![
             v4("0.0.0.0/2"),
@@ -1293,7 +1293,7 @@ mod tests {
         assert!(matches!(lab.role, Role::Addressable { .. }));
     }
 
-    // ─────────────── SC2 — registry follows kernel re-election ───────────────
+    // ─────────────── registry follows kernel re-election ───────────────
 
     #[test]
     fn disconnect_primary_promotes_secondary_with_zero_slash_zero() {
@@ -1319,7 +1319,7 @@ mod tests {
         assert!(matches!(home.role, Role::Primary { .. }));
     }
 
-    // ─────────────── SC3 — connect-time conflict ───────────────
+    // ─────────────── connect-time conflict ───────────────
 
     #[test]
     fn conflict_when_existing_primary_holds_default_route() {
@@ -1341,7 +1341,7 @@ mod tests {
         assert!(reg.snapshot(&ProfileId::new("home")).is_none());
     }
 
-    // ─────────────── SC12 — in-flight conflict ───────────────
+    // ─────────────── in-flight conflict ───────────────
 
     #[test]
     fn conflict_against_pending_default_route_claimant() {
@@ -1356,7 +1356,7 @@ mod tests {
         //
         // Simpler: rely on the fact that detect_conflict treats both
         // Connected and Connecting as live claimants. We assert against a
-        // Connected one (already covered by SC3); for in-flight we drop
+        // Connected one (already covered above); for in-flight we drop
         // down to detect_conflict directly with a synthetic state by
         // staging it through the test seam.
         //
@@ -1371,7 +1371,8 @@ mod tests {
         assert!(reg.pending_default_route_claimant().is_none());
 
         // detect_conflict against a Connected primary is the same code path
-        // that fires for Connecting (the match arm covers both); SC3
+        // that fires for Connecting (the match arm covers both); the
+        // connect-time-conflict test
         // exercises the assertion. We additionally assert here that the
         // returned conflict names the live claimant correctly.
         let c = reg
@@ -1383,7 +1384,7 @@ mod tests {
         ));
     }
 
-    // ─────────────── SC10 — split CIDR /1 pair ───────────────
+    // ─────────────── split CIDR /1 pair ───────────────
 
     #[test]
     fn split_slash_one_pair_treated_as_default_route_for_conflict() {
@@ -1398,7 +1399,7 @@ mod tests {
         ));
     }
 
-    // ─────────────── SC11 — /2 quartet ───────────────
+    // ─────────────── /2 quartet ───────────────
 
     #[test]
     fn slash_two_quartet_treated_as_default_route_for_conflict() {
@@ -1646,7 +1647,7 @@ mod tests {
         );
     }
 
-    // ─────────────── interface_authoritative contract (U3) ───────────────
+    // ─────────────── interface_authoritative contract ───────────────
 
     /// Helper: seed an entry into the Connected state directly with a
     /// custom `interface_authoritative` value, bypassing the FSM's

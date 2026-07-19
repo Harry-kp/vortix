@@ -1,4 +1,4 @@
-//! Engine event journal — JSONL persistence + broadcast channel (plan #005 U3).
+//! Engine event journal — JSONL persistence + broadcast channel.
 //!
 //! Two output paths in parallel:
 //! - **Non-lossy mpsc to a writer task** that appends to
@@ -248,7 +248,7 @@ impl Journal {
     /// disabled (no session file exists).
     ///
     /// Used by per-session scratch directories (e.g. `WireGuard` secondary
-    /// temp configs — plan #009 U13) so that crash-orphaned subdirs can be
+    /// temp configs ) so that crash-orphaned subdirs can be
     /// distinguished from the live session purely by name: every process gets
     /// a unique `{pid}` component, so a non-matching subdir is unambiguously
     /// an orphan regardless of file age.

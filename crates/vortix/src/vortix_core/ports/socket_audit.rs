@@ -1,4 +1,4 @@
-//! `SocketAudit` capability port (plan 015 phase C / plan 013).
+//! `SocketAudit` capability port.
 //!
 //! Pull-based per-process socket inventory. Implementations live in
 //! `vortix-platform-{linux,macos,windows}`. Consumers query via the

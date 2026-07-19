@@ -1,4 +1,4 @@
-//! Windows interface stub (plan 008 U4).
+//! Windows interface stub.
 //!
 //! Real impl would query `Get-NetAdapter` / IP Helper APIs. Today
 //! every method reports "not found" — the FSM treats "no interface"

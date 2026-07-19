@@ -6,8 +6,7 @@
 //! tunnel's retry is independent — a connect-failure on profile A no
 //! longer overwrites or blocks an auto-reconnect on profile B.
 //!
-//! Plan P5b U-P5b-1: per-profile retry. See
-//! `docs/plans/2026-05-30-002-refactor-retire-legacy-connectionstate-plan.md`.
+//! Plan per-profile retry. See
 
 /// Per-profile retry attempt bookkeeping.
 ///

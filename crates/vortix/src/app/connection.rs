@@ -18,14 +18,14 @@ impl App {
     pub(crate) fn toggle_connection(&mut self, idx: usize) {
         // Cancel this profile's retry / auto-reconnect when the user
         // initiates a new action on it. Other profiles' retry state is
-        // independent (P5b U-P5b-1 per-profile retry).
+        // independent (per-profile retry).
         if let Some(target_profile) = self.runtime.profiles.get(idx) {
             self.runtime
                 .retry_state
                 .remove(&ProfileId::new(&target_profile.name));
         }
 
-        // Multi-connection plan #001 U19: registry-aware Enter routing for
+        // registry-aware Enter routing for
         // secondaries. If the focused row corresponds to a tunnel the
         // registry already knows about, disconnect/cancel it via the
         // registry path instead of falling through to the legacy single-
@@ -37,7 +37,7 @@ impl App {
                 match snap.state {
                     Connection::Connected { .. } => {
                         // Uniform `(Connected, Enter_on_same)` arm — applies
-                        // to both primary and secondary rows per U19's
+                        // to both primary and secondary rows the same
                         // "no primary/secondary distinction" rule.
                         self.disconnect_profile_by_idx(idx);
                         return;
@@ -54,7 +54,7 @@ impl App {
                         // Fall through to the existing single-tunnel state
                         // machine: Disconnected → connect path; the other
                         // in-flight states defer to legacy handling.
-                        // U19's primary scope is the Enter/d/D race-cases.
+                        // the primary scope here is the Enter/d/D race-cases.
                     }
                 }
             }
@@ -88,7 +88,7 @@ impl App {
                         self.runtime.pending_connect = None;
                         self.disconnect();
                     } else {
-                        // Multi-connection plan #001 U7: in the single-tunnel
+                        // in the single-tunnel
                         // world this used to be "switch profile". With the
                         // registry, switching while connected is a
                         // default-route takeover by definition (the active
@@ -144,8 +144,7 @@ impl App {
         );
     }
 
-    /// Connect to a profile. Runs the multi-connection conflict check (plan
-    /// #001 U7) before the existing tunnel-up flow; on conflict, fires the
+    /// Connect to a profile. Runs the multi-connection conflict check before the existing tunnel-up flow; on conflict, fires the
     /// appropriate overlay and returns without touching the tunnel.
     pub(crate) fn connect_profile(&mut self, idx: usize) {
         self.connect_profile_inner(idx, false, false);
@@ -160,8 +159,7 @@ impl App {
 
     /// Connect immediately after the user submitted the auth overlay. Skips
     /// the static-challenge gate that would otherwise re-open the overlay
-    /// (plan 2026-06-02-001 U3 — the OTP has just been written into the
-    /// auth file; re-prompting would loop).
+    ///.
     pub(crate) fn connect_profile_after_auth(&mut self, idx: usize) {
         self.connect_profile_inner(idx, false, true);
     }
@@ -199,7 +197,7 @@ impl App {
             return;
         }
 
-        // Multi-connection plan #001 U7: route the connect path through
+        // route the connect path through
         // `registry.detect_conflict` before the existing tunnel-up flow.
         // When `force` is true (user just accepted the overlay), the gate
         // is skipped and we fall through to the legacy path.
@@ -215,7 +213,7 @@ impl App {
         // Check if OpenVPN config needs auth credentials. Two distinct
         // gates:
         //   - `static_challenge_prompt.is_some()` — the .ovpn declares a
-        //     `static-challenge` directive (plan 2026-06-02-001 U3, #191).
+        //     `static-challenge` directive.
         //     The OTP is single-use, so the overlay MUST fire on every
         //     connect attempt regardless of whether username/password are
         //     saved. When creds are saved we pre-fill them and focus the
@@ -275,7 +273,7 @@ impl App {
         let connect_timeout_secs = self.runtime.config.connect_timeout;
         let ovpn_verbosity = self.runtime.config.openvpn_verbosity.clone();
 
-        // Plan #004 U4: route once via TunnelKind, no protocol match arm.
+        // route once via TunnelKind, no protocol match arm.
         std::thread::spawn(move || {
             use crate::vortix_core::profile::{Profile, ProfileId, ProtocolKind};
 
@@ -300,10 +298,10 @@ impl App {
             match tunnel.up(&profile) {
                 Ok(handle) => {
                     // Carry the authoritative iface + PID back to the
-                    // main thread. Pre-U4 these were re-detected by the
-                    // scanner; post-U4 the scanner is metadata-only,
+                    // main thread. Previously these were re-detected by the
+                    // scanner; now the scanner is metadata-only,
                     // so this message IS the only seed path into the
-                    // registry's `details.interface` field. R1 of the
+                    // registry's `details.interface` field. Part of the
                     // state-authority contract.
                     let _ = cmd_tx.send(Message::ConnectResult {
                         profile: name,
@@ -363,7 +361,7 @@ impl App {
 
     /// Kill any running VPN process and remove run files for a profile.
     ///
-    /// Plan #004 U4: routes through the `TunnelKind` dispatch so this no
+    /// routes through the `TunnelKind` dispatch so this no
     /// longer match-branches on protocol.
     pub(crate) fn cleanup_vpn_resources(&self, profile_name: &str) {
         if let Some(profile) = self
@@ -473,7 +471,7 @@ impl App {
     /// Today the connect path drives `tunnel.up()` directly from a
     /// worker thread (see `connect_profile_inner`); the registry is
     /// touched only for the pre-up `detect_conflict` check. Plan 001
-    /// U7 will eventually route the whole flow through
+    /// A follow-up will eventually route the whole flow through
     /// `EngineHandle::Local`; until then, this mirror is how the
     /// registry stays in sync with kernel state.
     ///
@@ -535,7 +533,7 @@ impl App {
     /// Push fresh kernel-reported details for a profile into the
     /// registry directly from a scanner `ActiveSession`, bypassing the
     /// legacy `connection_state` field. Used by the per-profile
-    /// scanner (P5b U-P5b-2) for secondary tunnels and adoption paths
+    /// scanner () for secondary tunnels and adoption paths
     /// where the legacy slot is occupied by a different profile (or
     /// no-op when this is the only path keeping the registry fresh).
     ///
@@ -548,7 +546,7 @@ impl App {
     /// adoption-side counterpart to `mirror_connect_into_registry`
     /// (which handles vortix-started tunnels).
     ///
-    /// U4 contract: this is the ONLY path other than
+    /// State-authority contract: this is the ONLY path other than
     /// `mirror_connect_into_registry` that creates a Connected entry.
     /// `refresh_registry_from_session` is strictly metadata-only on
     /// existing Connected entries and will early-return when the entry
@@ -556,8 +554,8 @@ impl App {
     ///
     /// The `interface_authoritative` flag is read from
     /// `session.interface_authoritative` (set by the scanner's
-    /// platform-specific iface-detection method — see U5). Unauthoritative
-    /// adoptions are excluded from primary-election candidacy per R4.
+    /// platform-specific iface-detection method ). Unauthoritative
+    /// adoptions are excluded from primary-election candidacy.
     pub fn adopt_registry_from_session(
         &mut self,
         profile_name: &str,
@@ -604,7 +602,7 @@ impl App {
         profile_name: &str,
         session: &crate::core::scanner::ActiveSession,
     ) {
-        // U4 contract: this function is metadata-only on existing
+        // State-authority contract: this function is metadata-only on existing
         // Connected entries. The interface name and
         // interface_authoritative flag are written exactly once — at
         // connect-success by `mirror_connect_into_registry` (Tunnel::up
@@ -754,7 +752,7 @@ impl App {
         // path stringifies the TunnelError before passing it back via
         // Message::ConnectResult, so we can't recover the structured
         // variant here. Use the generic `Other(msg)` carrier — when
-        // P5 retires the legacy mirror and the FSM drives directly,
+        // a later stage retires the legacy mirror and the FSM drives directly,
         // we'll get the typed reason back via the FSM's
         // `handle_connect_failure` path.
         let failure = crate::vortix_core::engine::state::FailureReason::Other(error.to_string());
@@ -821,11 +819,11 @@ impl App {
             // safety timeout starts fresh on this force-disconnect tick.
             self.mirror_disconnecting_into_registry(&name);
 
-            // Plan #004 U4: force-disconnect now routes through TunnelKind.
+            // force-disconnect now routes through TunnelKind.
             // The OvpnTunnel's down() path already escalates to pkill if the
             // pid file is stale; treating the force-flag as equivalent to a
             // regular down preserves the existing semantics on macOS where
-            // SIGKILL was used (TODO plan #005: add a force flag to Tunnel
+            // SIGKILL was used (TODO: add a force flag to Tunnel
             // trait to escalate to SIGKILL where supported).
             std::thread::spawn(move || {
                 use crate::vortix_core::ports::tunnel::{TunnelHandle, TunnelKindTag};
@@ -879,7 +877,7 @@ impl App {
     }
 
     /// Fire the appropriate confirm overlay for a registry-reported
-    /// conflict (plan #001 U7). Logs an ACTION line so the activity panel
+    /// conflict. Logs an ACTION line so the activity panel
     /// reflects the blocked attempt.
     fn fire_conflict_overlay(&mut self, conflict: Conflict, _idx: usize, target_name: String) {
         match conflict {
@@ -913,8 +911,8 @@ impl App {
         }
     }
 
-    /// Disconnect a specific profile by sidebar index (multi-connection
-    /// plan #001 U19). Drives the real per-protocol teardown via
+    /// Disconnect a specific profile by sidebar index (multi-tunnel
+    /// work). Drives the real per-protocol teardown via
     /// [`disconnect_specific`] — that's what actually kills the
     /// wg-quick / openvpn process. The registry's own `disconnect`
     /// would only drive the placeholder `MockTunnel` and leave the
@@ -931,7 +929,7 @@ impl App {
         self.disconnect_specific(&name);
     }
 
-    /// Tear down every active tunnel (multi-connection plan #001 U19).
+    /// Tear down every active tunnel ().
     /// Used by Shift+`D` after the user confirms the
     /// [`InputMode::ConfirmDisconnectAll`] dialog, and by the
     /// `Message::Disconnect` global when only one tunnel exists.
@@ -1074,7 +1072,7 @@ impl App {
         });
     }
 
-    /// Cancel an in-flight connect (multi-connection plan #001 U19).
+    /// Cancel an in-flight connect ().
     /// Currently delegates to the existing disconnect machinery — the
     /// legacy `disconnect()` already handles the Connecting state
     /// (extracting the in-flight profile and transitioning to
@@ -1191,7 +1189,7 @@ fn legacy_to_core_details(
 /// `TunnelKind::Mock(MockTunnel::new())` is used as the inert filler
 /// because `Engine<T>` requires `T: Tunnel` and we need *some* impl
 /// to satisfy the bound — not because the engine ever calls into it.
-/// When U7 lands and the connect path drives the registry directly,
+/// When the connect path drives the registry directly,
 /// this whole helper becomes dead code.
 fn placeholder_engine_for_profile(
     profile: &crate::state::VpnProfile,
@@ -1210,7 +1208,7 @@ fn placeholder_engine_for_profile(
 /// from a profile config file into the shared `vortix_core::cidr::Cidr`
 /// representation that `TunnelRegistry::detect_conflict` consumes.
 ///
-/// Plan #001 U7: this is the App-side adapter that bridges the per-protocol
+/// this is the App-side adapter that bridges the per-protocol
 /// parsers' route declarations into the registry's conflict-detection
 /// surface. Unparseable files return an empty list so the conflict gate
 /// degrades to "no conflict" (the existing tunnel-up path will still
@@ -1248,8 +1246,8 @@ fn extract_wg_allowed_ips(text: &str) -> Vec<Cidr> {
 
 /// Best-effort extraction of `route` directives from an `.ovpn` file. Only
 /// canonical `route <ip> <netmask>` and `route-ipv6 <prefix>` forms are
-/// recognised; anything else is skipped silently (the registry's role in
-/// U7 is detection, not validation — the `OpenVPN` binary still owns parse
+/// recognised; anything else is skipped silently (the registry's role
+/// here is detection, not validation — the `OpenVPN` binary still owns parse
 /// errors). Returns an empty list when nothing parses.
 fn extract_ovpn_routes(text: &str) -> Vec<Cidr> {
     use std::net::{IpAddr, Ipv4Addr};
@@ -1319,7 +1317,6 @@ fn ipv4_netmask_to_prefix(mask: std::net::Ipv4Addr) -> u8 {
 
 #[cfg(test)]
 mod u7_conflict_tests {
-    //! Plan #001 U7 — App-side conflict-detection wiring.
     //!
     //! Coverage focuses on the App's role: extracting `AllowedIPs` from a
     //! profile config and translating a `Conflict` variant into the right
@@ -1452,7 +1449,7 @@ route 10.0.0.0 255.255.255.0
 
     #[test]
     fn connect_with_empty_registry_skips_overlay() {
-        // Multi-connection plan #001 U7: until U6 Stage B populates the
+        // until the registry migration populates the
         // registry, detect_conflict against an empty registry always
         // returns None — the connect path proceeds without firing the
         // overlay. This locks in the "no false-positive" invariant.

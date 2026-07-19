@@ -1,11 +1,10 @@
-//! Live kernel interface enumeration via `libc::getifaddrs` (plan
-//! multi-connection U11; refactored by plan 002 U5).
+//! Live kernel interface enumeration via `libc::getifaddrs`.
 //!
 //! Used by the killswitch `PersistedState` V2 migration to drop phantom
 //! tunnel entries whose interface no longer exists in the kernel after a
 //! reboot or interface teardown.
 //!
-//! Plan 002 U5: replaced the `ifconfig -l` shell-out with a direct
+//! replaced the `ifconfig -l` shell-out with a direct
 //! `libc::getifaddrs` walk. Same data; faster; no PATH dependency on
 //! ifconfig (which most macOS installs have, but consistency with the
 //! Linux side's libc-based interface listing matters).

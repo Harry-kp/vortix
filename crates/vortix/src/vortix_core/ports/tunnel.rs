@@ -6,7 +6,7 @@
 //! aggregate carrier defined in the binary) and dispatches statically.
 //!
 //! Plan #004 keeps trait methods sync (engine is sync today; mocks and real
-//! impls reach the global runner directly). Plan #005's async engine
+//! impls reach the global runner directly). The async engine
 //! migration adds `&CommandRunner` arguments and `async fn` where useful.
 
 use std::sync::{Arc, Mutex};

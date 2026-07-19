@@ -1,4 +1,4 @@
-//! Windows `SocketAudit` stub (plan 015 phase C U13 / plan 013).
+//! Windows `SocketAudit` stub.
 //!
 //! Real impl would use `Get-NetTCPConnection`, `Get-NetUDPEndpoint`,
 //! or the IP Helper API (`GetTcpTable2` etc.). Today returns

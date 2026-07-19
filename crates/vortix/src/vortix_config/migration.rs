@@ -1,4 +1,4 @@
-//! One-shot profile sidecar backfill (plan #006 U4).
+//! One-shot profile sidecar backfill.
 //!
 //! Idempotent migration that walks the profiles directory, detects bare
 //! `.conf` / `.ovpn` files without a sibling `.meta.toml`, and writes a
@@ -266,7 +266,7 @@ mod tests {
         assert_ne!(id_a, id_b);
     }
 
-    // Pathology coverage (plan 007 U3): the rollout depends on
+    // Pathology coverage: the rollout depends on
     // `migrate_legacy_profiles` never panicking on a misshapen profile dir.
     // These tests pin that behaviour explicitly so a future change can't
     // silently regress it.

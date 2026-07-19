@@ -1,6 +1,6 @@
 //! Hand-rolled libproc FFI for macOS — replaces the `lsof` shell-outs.
 //!
-//! Plan 002 U7 (lsof bundle): mirrors the relevant structs from
+//! Mirrors the relevant structs from
 //! `<sys/proc_info.h>` (Apple SDK `MacOSX.sdk/usr/include/sys/proc_info.h`)
 //! so we can call `proc_pidfdinfo(pid, fd, PROC_PIDFDSOCKETINFO, …)`
 //! directly. `socket_audit::LsofSocketAudit` walks every PID's socket FDs

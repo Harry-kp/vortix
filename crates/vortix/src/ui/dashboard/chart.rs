@@ -14,7 +14,7 @@ use ratatui::{
 
 /// Render the Network Throughput chart, scoped to the primary tunnel.
 ///
-/// Multi-connection plan U6 Stage B: session-transfer totals come from
+/// Stage B: session-transfer totals come from
 /// the primary tunnel's snapshot. Rate history (`down/up_history`) stays
 /// on `app.runtime` because it's measured from the host's network stats
 /// rather than per-tunnel — secondary tunnels add to the same byte

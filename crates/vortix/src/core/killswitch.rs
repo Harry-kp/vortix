@@ -1,6 +1,6 @@
 //! Kill switch firewall control — relocated trait now lives in `vortix-core`
-//! (plan 003 U1). This module keeps the binary-crate-side state persistence
-//! and the platform dispatch shim until plan 003 U7 swaps callers over to
+//!. This module keeps the binary-crate-side state persistence
+//! and the platform dispatch shim until a later sweep swaps callers over to
 //! the `Platform` aggregate.
 
 use crate::constants;
@@ -25,7 +25,7 @@ pub type KillSwitchError = KillswitchError;
 /// allow rules for every entry in `active` plus an RFC1918 base with
 /// secondary-declared CIDRs subtracted.
 ///
-/// Multi-connection plan U8 replaces the legacy single-tunnel
+/// replaces the legacy single-tunnel
 /// `enable_blocking(interface, server_ip)` form with this slice-based
 /// API. Callers building from a single connection should construct a
 /// one-element slice; see [`ActiveTunnelInfo`].
@@ -58,8 +58,7 @@ fn get_state_path() -> Option<PathBuf> {
 }
 
 /// Current `PersistedState` on-disk schema version. V1 (pre-multi-connection)
-/// carried only `vpn_interface`/`vpn_server_ip`; V2 (plan multi-connection
-/// U11) adds `active_tunnels` for the multi-tunnel killswitch.
+/// carried only `vpn_interface`/`vpn_server_ip`; V2 adds `active_tunnels` for the multi-tunnel killswitch.
 pub const PERSISTED_STATE_SCHEMA_V2: u8 = 2;
 
 fn default_schema_version() -> u8 {
@@ -93,7 +92,7 @@ pub struct PersistedTunnelInfo {
 
 /// Persistent state for kill-switch recovery across process restarts.
 ///
-/// **Schema versioning (plan multi-connection U11):** This struct
+/// **Schema versioning:** This struct
 /// transparently absorbs both V1 (single-tunnel — `vpn_interface` +
 /// `vpn_server_ip`) and V2 (multi-tunnel — `active_tunnels`) on-disk
 /// forms via `#[serde(default)]`. On load, V1 files are coerced into V2
@@ -529,7 +528,7 @@ mod tests {
         assert!(persisted[0].is_primary);
     }
 
-    /// Forward-compat integration check (plan U11): a v0.3.x reader of
+    /// Forward-compat integration check: a v0.3.x reader of
     /// the V1 `PersistedState` (with `#[serde(deny_unknown_fields)]`
     /// **not** set, which is the default for serde) must successfully
     /// deserialize a V2 file. We simulate the v0.3.x V1 type locally.

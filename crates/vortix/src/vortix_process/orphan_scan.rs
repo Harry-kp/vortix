@@ -1,4 +1,4 @@
-//! Startup orphan-daemon scan (plan 008 U5).
+//! Startup orphan-daemon scan.
 //!
 //! When vortix starts, check for leftover `wg-quick`, `openvpn`, or
 //! `wireguard-go` processes that might be orphans from a previous

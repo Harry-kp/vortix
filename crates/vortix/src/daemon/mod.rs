@@ -1,4 +1,4 @@
-//! `vortix daemon` — IPC server hosting the engine (plan 015 phase D / plan 010).
+//! `vortix daemon` — IPC server hosting the engine.
 //!
 //! The daemon binds a Unix socket, hosts the FSM via the existing
 //! `EngineHandle::Local`, and serves `IpcRequest` frames from
@@ -6,7 +6,7 @@
 //! support is a follow-up hardening pass once the wire contract has
 //! stabilized.
 //!
-//! Auth: phase E (plan 015 phase E) layers `SO_PEERCRED` / `getpeereid`
+//! Auth: phase E layers `SO_PEERCRED` / `getpeereid`
 //! on top — the daemon refuses requests from a UID other than its
 //! own. Today the daemon trusts any client that can open the socket
 //! (filesystem-permissions guard at mode 0600).
@@ -72,7 +72,7 @@ pub fn build_engine_handle(
     };
 
     // Per-Connect tunnel factory — picks WG vs OVPN from the resolved
-    // profile's protocol. Plan 006 U6's wire-up.
+    // profile's protocol. Wired up with the profile store.
     let factory_config_dir =
         crate::utils::get_app_config_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
     let factory = move |profile: &crate::vortix_core::profile::Profile| {
@@ -129,7 +129,7 @@ pub fn daemon_socket_path_override() -> Option<PathBuf> {
 /// whether to route through the daemon or fall back to the direct
 /// disk/scanner read. Missing files are not an error — the env var
 /// pointing at a non-existent path simply triggers the bypass path
-/// (plan D3, multi-connection rollout).
+///.
 #[must_use]
 pub fn daemon_socket_path_if_present() -> Option<PathBuf> {
     let candidate = daemon_socket_path_override().unwrap_or_else(default_socket_path);

@@ -1,4 +1,4 @@
-//! Windows network stats stub (plan 008 U4).
+//! Windows network stats stub.
 //!
 //! Real impl would query `Get-NetAdapterStatistics` / IP Helper. Today
 //! it reports zero bytes in both directions; telemetry consumers

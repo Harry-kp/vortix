@@ -1,10 +1,10 @@
-//! `ProfileStore` trait + `FsProfileStore` impl (plan #006 U2).
+//! `ProfileStore` trait + `FsProfileStore` impl.
 //!
 //! Filesystem-backed profile storage with sidecar metadata. Each profile
 //! lives at `<profiles_dir>/<display_name>.<conf|ovpn>` with a sibling
 //! `<display_name>.meta.toml` carrying stable identity, group, and timestamps.
 //!
-//! Plan 006 U4 lands the migration step that backfills sidecars for users
+//! A startup migration step backfills that backfills sidecars for users
 //! whose existing `.conf`/`.ovpn` files predate this scheme.
 
 use std::path::{Path, PathBuf};

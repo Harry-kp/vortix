@@ -1,4 +1,4 @@
-//! macOS `SocketAudit` impl (plan 002 U7).
+//! macOS `SocketAudit` impl.
 //!
 //! Walks every live PID's socket FDs via the hand-rolled `libproc_ffi`
 //! module (`proc_listpids` + `proc_pidinfo(PROC_PIDLISTFDS)` +

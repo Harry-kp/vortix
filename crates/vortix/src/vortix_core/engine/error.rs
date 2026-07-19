@@ -1,4 +1,4 @@
-//! Engine errors (plan #005 U1).
+//! Engine errors.
 
 use thiserror::Error;
 
@@ -7,8 +7,8 @@ use crate::vortix_core::profile::ProfileId;
 
 /// What `Engine::handle` and the `EngineHandle` API can return as errors.
 ///
-/// Plan #005 U2/U4 may extend this; the variants here are the ones the
-/// brainstorm called out by name.
+/// The variants here are the ones the original
+/// design called out by name; later work may extend this.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum EngineError {

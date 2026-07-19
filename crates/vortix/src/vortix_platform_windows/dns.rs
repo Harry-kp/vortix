@@ -1,4 +1,4 @@
-//! Windows DNS stub (plan 008 U4).
+//! Windows DNS stub.
 //!
 //! Real impl would query Windows DNS via `Get-DnsClientServerAddress`
 //! or the `windows-sys::Win32::NetworkManagement::Dns` APIs. Today it

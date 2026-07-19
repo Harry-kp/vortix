@@ -1,6 +1,6 @@
 //! Linux VPN interface detection via `libc::getifaddrs` + `/sys/class/net` + `wg show`.
 //!
-//! Plan 002 U4: replaced the `ip addr show <iface>` shell-out with a direct
+//! replaced the `ip addr show <iface>` shell-out with a direct
 //! `libc::getifaddrs` walk for IPv4 address discovery and a `/sys/class/net/<iface>/mtu`
 //! read for MTU. No more parsing of human-formatted `ip` output; no PATH dependency
 //! on iproute2 for read-only interface inspection.
@@ -53,7 +53,7 @@ impl Interface for LinuxInterface {
     }
 
     fn get_wireguard_pid(interface: &str) -> Option<u32> {
-        // Plan 002 U6: walk /proc directly instead of shelling to `ps`.
+        // walk /proc directly instead of shelling to `ps`.
         // Kernel WG has no userspace PID (returns None); wireguard-go has
         // a process whose cmdline contains both "wireguard" and the
         // interface name.
@@ -61,7 +61,7 @@ impl Interface for LinuxInterface {
     }
 
     fn get_interface_info(interface: &str) -> (String, String) {
-        // Plan 002 U4: IPv4 address from libc::getifaddrs; MTU from sysfs.
+        // IPv4 address from libc::getifaddrs; MTU from sysfs.
         // Used to shell to `ip addr show <iface>` and parse the human-
         // formatted output — both are direct kernel reads now.
         let ip = get_interface_ipv4(interface).unwrap_or_default();
@@ -81,7 +81,6 @@ fn check_wg_interface_exists(name: &str) -> bool {
 /// `WireGuard` processes (wireguard-go). Pure stdlib; no PATH dependency
 /// on procps.
 ///
-/// Plan 002 U6.
 pub(crate) fn find_pid_with_cmdline_substrings(needles: &[&str]) -> Option<u32> {
     let needles_lower: Vec<String> = needles.iter().map(|n| n.to_lowercase()).collect();
 
@@ -117,7 +116,6 @@ pub(crate) fn find_pid_with_cmdline_substrings(needles: &[&str]) -> Option<u32> 
 /// Used by the OVPN tunnel teardown to replace `pkill -f`. Same /proc
 /// walk as the single-PID variant but collects all matches.
 ///
-/// Plan 002 U6.
 pub(crate) fn find_all_pids_with_cmdline_substring(needle: &str) -> Vec<u32> {
     let needle_lower = needle.to_lowercase();
     let mut matches = Vec::new();
@@ -153,7 +151,6 @@ pub(crate) fn find_all_pids_with_cmdline_substring(needle: &str) -> Vec<u32> {
 /// out of `ip addr show` output). Returns `None` when the interface has
 /// no IPv4 address, doesn't exist, or `getifaddrs` itself fails.
 ///
-/// Plan 002 U4.
 fn get_interface_ipv4(interface: &str) -> Option<String> {
     // SAFETY: libc::getifaddrs writes a *mut *mut ifaddrs into `ifap`.
     // We pass a stack-rooted null pointer; on success the kernel
@@ -205,7 +202,6 @@ fn get_interface_ipv4(interface: &str) -> Option<String> {
 /// newline. Returns `None` when the sysfs file is unreadable (interface
 /// doesn't exist, no permission, or kernel without sysfs).
 ///
-/// Plan 002 U4.
 fn read_sysfs_mtu(interface: &str) -> Option<String> {
     let path = format!("/sys/class/net/{interface}/mtu");
     std::fs::read_to_string(path)
@@ -218,7 +214,7 @@ fn read_sysfs_mtu(interface: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    // Plan 002 U4: the previous `parse_ip_addr_output` tests asserted
+    // the previous `parse_ip_addr_output` tests asserted
     // string-parsing of human-formatted `ip addr show` output. That
     // parser is gone; tests are obsolete. The new implementation
     // exercises libc::getifaddrs + sysfs reads, which depend on real

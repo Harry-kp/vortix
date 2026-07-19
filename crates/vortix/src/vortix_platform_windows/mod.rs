@@ -1,4 +1,4 @@
-//! `vortix-platform-windows`: Windows platform adapters (plan 008 U4 stub).
+//! `vortix-platform-windows`: Windows platform adapters.
 //!
 //! This crate exists to prove the `Platform` aggregate admits a third
 //! OS without surprises. Every port impl currently returns "not

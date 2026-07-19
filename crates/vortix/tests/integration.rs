@@ -156,11 +156,11 @@ mod connection_state_machine {
 
     #[test]
     fn scanner_does_not_promote_connecting_to_connected() {
-        // U4 contract: scanner cannot drive Connecting → Connected.
+        // State-authority contract: scanner cannot drive Connecting → Connected.
         // Only the protocol layer's `Tunnel::up()` success result
         // (delivered via `Message::ConnectResult`) can promote.
         //
-        // Pre-U4 this test asserted the opposite (and was named
+        // Previously this test asserted the opposite (and was named
         // `connecting_to_connected_via_scanner`). The dual write was
         // the source of bugs #3 and #12 in the multi-OpenVPN scenarios.
         let mut app = test_app();

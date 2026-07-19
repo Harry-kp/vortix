@@ -16,7 +16,7 @@ use crate::vortix_core::ports::tunnel::{ParseError, ParsedProfile};
 /// CIDR block: an IP address paired with a prefix length.
 ///
 /// This is a small, local wrapper used by the `WireGuard` parser. A
-/// workspace-wide `vortix_core::cidr` helper is planned (see plan U3);
+/// workspace-wide `vortix_core::cidr` helper is planned;
 /// when it lands, this type will be replaced by a re-export and the
 /// rest of the WG parser will continue to compile unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

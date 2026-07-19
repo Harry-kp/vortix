@@ -236,7 +236,6 @@ fn get_os_info() -> String {
 /// Replaces the shell-out to `uname` in `get_os_info`. Pure libc; no
 /// PATH dependency; ~10× faster than spawning a subprocess.
 ///
-/// Plan 002 U3.
 #[cfg(unix)] // xtask:allow-platform-cfg: utsname is a Unix concept
 fn uname_release() -> Option<String> {
     // SAFETY: `libc::uname` writes a `utsname` struct's worth of bytes
@@ -260,7 +259,6 @@ fn uname_release() -> Option<String> {
 /// Read `kern.osproductversion` via `sysctlbyname` — equivalent to
 /// `sw_vers -productVersion` on macOS (returns e.g. "14.5", "13.7.1").
 ///
-/// Plan 002 U3.
 #[cfg(target_os = "macos")] // xtask:allow-platform-cfg: sw_vers replacement is intrinsically macOS-only
 fn macos_product_version() -> Option<String> {
     use std::ffi::CString;
@@ -332,7 +330,7 @@ fn collect_tool_statuses() -> Vec<ToolStatus> {
 
 /// Check if a tool exists on `$PATH` and try to get its version.
 fn check_tool(name: &'static str, version_args: &[&str]) -> ToolStatus {
-    // Plan 002 U1: walk PATH directly instead of shelling to `which` —
+    // walk PATH directly instead of shelling to `which` —
     // `which` itself is not preinstalled on every distro (e.g. Fedora
     // minimal), and our own diagnostic surface shouldn't false-fail
     // because of a missing diagnostic tool.
@@ -363,7 +361,7 @@ fn check_tool(name: &'static str, version_args: &[&str]) -> ToolStatus {
 /// Check if a tool exists (path only, no version — for tools like `pfctl`).
 #[cfg(target_os = "macos")] // xtask:allow-platform-cfg: helper only used by the macOS pfctl branch above
 fn check_tool_exists(name: &'static str) -> ToolStatus {
-    // Plan 002 U1: same PATH-walking as `check_tool` — see comment above.
+    // same PATH-walking as `check_tool` — see comment above.
     let path = crate::utils::find_binary_path(name).map(|p| p.to_string_lossy().into_owned());
     ToolStatus {
         name,
@@ -559,7 +557,7 @@ fn format_issue_body(info: &ReportInfo, description: &str) -> String {
     let _ = writeln!(body, "Kill switch: {}", info.killswitch_state);
     let _ = writeln!(body, "```\n");
 
-    // Diagnostic Journal (plan 005 U8) — surface the JSONL session path
+    // Diagnostic Journal — surface the JSONL session path
     // and the in-memory tail so triagers can replay locally.
     if let Some(journal) = crate::vortix_core::journal::global_journal() {
         let _ = writeln!(body, "## Diagnostic Journal\n");

@@ -1,8 +1,8 @@
-//! Sidebar: profile catalog with multi-tunnel status badges (plan #001 U15).
+//! Sidebar: profile catalog with multi-tunnel status badges.
 //!
-//! ## Badge taxonomy (U15)
+//! ## Badge taxonomy
 //!
-//! Per plan section U15, the sidebar status char migrates from the legacy
+//! The sidebar status char migrated from the legacy
 //! `✓ / … / ⏻` vocabulary to a richer set that distinguishes connect-attempt
 //! states, awaits user input, and surfaces failures:
 //!
@@ -24,23 +24,23 @@
 //!
 //! A `!` annotation may follow the status char (`●!`) to surface per-tunnel
 //! risk states that the user should drill into Connection Details to resolve.
-//! Today U15 surfaces **mode-mismatch risk**: a tunnel whose declared `AllowedIPs`
+//! Today the taxonomy surfaces **mode-mismatch risk**: a tunnel whose declared `AllowedIPs`
 //! claim `0/0` but which did not win the kernel default route — represented in
 //! the registry as `Role::AddressableSuppressed`. The fwmark-hijack risk
-//! annotation (also `!`, per plan §U17, lines 1044-1045) lands when U17 wires
+//! annotation (also `!`, ) lands when a follow-up wires
 //! the WG-config-aware predicate; the rendering pipeline here already reserves
-//! the column so U17 only has to extend the predicate, not the layout.
+//! the column so a follow-up only has to extend the predicate, not the layout.
 //!
 //! ## Width discipline
 //!
-//! Per plan U15 (line 960), `fixed_cols = 2 + 4 + 10 + 3 = 19` (status, proto,
+//! `fixed_cols = 2 + 4 + 10 + 3 = 19` (status, proto,
 //! time, inter-column gaps). The primary `*` suffix consumes 2 chars; at the
 //! 24-char inner-width boundary `name_budget = 24 - 19 - 2 = 3`, which is the
 //! minimum that still renders the status glyph plus a 3-char name stub. Below
 //! 24 chars of inner width, the `*` marker is hidden and the name collapses
 //! to a stub — the header retains the cross-surface primary signal.
 //!
-//! ## Accessibility note (plan U15 line 975)
+//! ## Accessibility note
 //!
 //! `↻` (U+21BB) and `◐` both render in `theme::WARNING`; the `↻` glyph carries
 //! `Modifier::DIM` to keep monochrome / color-blind users discriminating by
@@ -77,7 +77,7 @@ fn status_badge_for(snapshot: &TunnelSnapshot) -> Option<(&'static str, Style)> 
     use crate::ui::sigils::{sigil, SigilId};
     let id = match &snapshot.state {
         Connection::Connected { details, .. } => {
-            // R4 of the state-authority contract: Connected entries whose
+            // the state-authority contract: Connected entries whose
             // interface name vortix couldn't reliably attribute to a PID
             // (current case: externally-started OpenVPN on macOS where
             // the scanner's ifconfig-scan fallback collides across
@@ -105,7 +105,7 @@ fn status_badge_for(snapshot: &TunnelSnapshot) -> Option<(&'static str, Style)> 
 /// Does this snapshot warrant a `!` risk annotation in the sidebar?
 ///
 /// Today: `Role::AddressableSuppressed` — declared 0/0 `AllowedIPs` but did not
-/// win the kernel default route (mode-mismatch). Plan U17 will extend this to
+/// win the kernel default route (mode-mismatch). A follow-up will extend this to
 /// also include WG-secondary-missing-FwMark while primary holds 0/0; the
 /// signature returns a `bool` so the predicate can grow without churning the
 /// render path.
@@ -115,7 +115,7 @@ fn has_risk_annotation(snapshot: &TunnelSnapshot) -> bool {
 
 /// Should the primary `*` suffix render given the available name-cell width?
 ///
-/// Plan U15 line 960: at `inner.width == 24` → `name_cell_width = 5`,
+/// at `inner.width == 24` → `name_cell_width = 5`,
 /// `name_budget = 3` after the 2-char ` *` reserve, which is the minimum
 /// usable name stub. Below that the `*` hides; the header retains the
 /// cross-surface primary signal so no information is lost.
@@ -194,7 +194,7 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // U6 Stage A: snapshots come from the registry; profile catalog still on engine.
+    // snapshots come from the registry; profile catalog still on engine.
     let snapshots = app.registry.snapshot_all();
     let primary = app.registry.primary().cloned();
 
@@ -224,7 +224,7 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    // U15 arithmetic: status(2) + proto(4) + time(10) + 3 inter-column gaps.
+    // Column arithmetic: status(2) + proto(4) + time(10) + 3 inter-column gaps.
     let fixed_cols: u16 = 2 + 4 + 10 + 3;
     // Width budget available to the name cell before primary `*` reserve.
     let name_cell_width = inner.width.saturating_sub(fixed_cols) as usize;
@@ -238,7 +238,7 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
             let signal = signal_for(&snapshots, primary.as_ref(), &p.name);
             let is_never_used = p.last_used.is_none();
 
-            // Status cell: U15 badge taxonomy + optional `!` risk annotation.
+            // Status cell: badge taxonomy + optional `!` risk annotation.
             // Numeric prefix (1..=9) remains the affordance for keyboard
             // quick-select; once a row is active the badge replaces the number
             // so the user sees state, not muscle-memory.
@@ -373,10 +373,10 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
 
 #[cfg(test)]
 mod tests {
-    //! U15 sidebar tests. Cover the badge taxonomy migration, primary `*`
+    //! Sidebar badge tests. Cover the badge taxonomy migration, primary `*`
     //! marker, `!` risk annotation for mode-mismatch (`AddressableSuppressed`),
     //! and the narrow-width fallback at the 24-char inner-width boundary.
-    //! Stage A smoke tests for U6 (empty-state, row rendering) remain.
+    //! Earlier smoke tests (empty-state, row rendering) remain.
     use super::*;
     use crate::app::App;
     use crate::state::{Protocol, VpnProfile};
@@ -512,7 +512,7 @@ mod tests {
         assert!(!sig.risk);
     }
 
-    // ── U15 badge taxonomy ────────────────────────────────────────────────
+    // ── badge taxonomy ────────────────────────────────────────────────
 
     #[test]
     fn connected_snapshot_renders_filled_circle_glyph() {
@@ -535,7 +535,7 @@ mod tests {
 
     #[test]
     fn unauthoritative_connected_badge_renders_dim_grey() {
-        // R4 of the state-authority contract: when a Connected tunnel's
+        // the state-authority contract: when a Connected tunnel's
         // iface can't be reliably attributed to its PID (current case:
         // externally-started OpenVPN on macOS where the scanner's
         // ifconfig-scan fallback collides across PIDs), the row's
@@ -632,11 +632,11 @@ mod tests {
         assert_eq!(style.fg, Some(theme::ERROR));
     }
 
-    // ── U15 width discipline ──────────────────────────────────────────────
+    // ── width discipline ──────────────────────────────────────────────
 
     #[test]
     fn unicode_width_of_reconnecting_glyph_is_one() {
-        // Load-bearing for U15 fixed_cols arithmetic: if `↻` were width=2 the
+        // Load-bearing for fixed_cols arithmetic: if `↻` were width=2 the
         // status column (Length(2)) would overflow into the name cell.
         assert_eq!(
             UnicodeWidthStr::width("↻"),
@@ -656,12 +656,12 @@ mod tests {
         }
     }
 
-    // ── U15 primary `*` marker ────────────────────────────────────────────
+    // ── primary `*` marker ────────────────────────────────────────────
 
     #[test]
     fn primary_marker_shown_when_name_cell_width_is_five() {
         // inner.width=24, fixed_cols=19 → name_cell_width=5 → name_budget=3
-        // after the 2-char reserve. This is the plan U15 boundary case
+        // after the 2-char reserve. This is the documented boundary case
         // (line 971): "inner.width = 24 → name_budget = 3; primary `*`
         // rendered".
         assert!(should_show_primary_marker(true, 5));
@@ -670,7 +670,7 @@ mod tests {
     #[test]
     fn primary_marker_hidden_when_name_cell_width_is_four() {
         // inner.width=23, fixed_cols=19 → name_cell_width=4 → name_budget=2
-        // after the 2-char reserve. Plan U15 line 972: "inner.width = 23 →
+        // after the 2-char reserve. "inner.width = 23 →
         // name_budget = 2; primary `*` hidden".
         assert!(!should_show_primary_marker(true, 4));
     }
@@ -713,7 +713,7 @@ mod tests {
         assert!(!sig.is_active);
     }
 
-    // ── U15 risk annotation ───────────────────────────────────────────────
+    // ── risk annotation ───────────────────────────────────────────────
 
     #[test]
     fn addressable_suppressed_role_triggers_risk_annotation() {

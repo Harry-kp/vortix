@@ -9,9 +9,9 @@
 //! profiles, telemetry, kill switch, retry logic). The TUI-specific state
 //! (panels, overlays, animations, scroll positions) remains directly on `App`.
 //!
-//! Plan #005 U5 removed `App: Deref<Target = VpnRuntime>`. VPN-state
+//! An earlier refactor removed `App: Deref<Target = VpnRuntime>`. VPN-state
 //! accesses are now explicit via `self.runtime.X` / `app.runtime.X`. The
-//! optional `engine_handle` field carries the plan #005 `EngineHandle`
+//! optional `engine_handle` field carries the `EngineHandle`
 //! for code paths that want to query/command through the FSM actor.
 //!
 //! ## Module structure
@@ -93,7 +93,7 @@ pub use crate::state::{
     VpnProfile, DISMISS_DURATION,
 };
 // The legacy single-tunnel `ConnectionState`/`DetailedConnectionInfo` enum
-// lives on `crate::vpn_runtime` after U6 Stage B; re-export through `app::`
+// lives on `crate::vpn_runtime` after the registry migration; re-export through `app::`
 // so the existing `app/connection.rs` / `app/update.rs` code paths that
 // drive the legacy mirror still resolve `app::ConnectionState`.
 pub use crate::vpn_runtime::{ConnectionState, DetailedConnectionInfo};
@@ -109,7 +109,7 @@ pub use crate::vpn_runtime::{ConnectionState, DetailedConnectionInfo};
 pub struct App {
     /// The headless VPN runtime — telemetry, profile catalog, config,
     /// background workers, kill-switch mode. Active tunnel FSMs live on
-    /// `self.registry` (plan #001 U6).
+    /// `self.registry`.
     pub runtime: VpnRuntime,
 
     /// Optional plan-005 `EngineHandle`. Non-load-bearing today — kept for
@@ -117,7 +117,7 @@ pub struct App {
     /// FSM actor. Multi-tunnel callers bypass this and use `self.registry`.
     pub engine_handle: Option<crate::vortix_core::engine::EngineHandle>,
 
-    /// Multi-connection plan #001: the `TunnelRegistry` owns active tunnel
+    /// The `TunnelRegistry` owns active tunnel
     /// FSMs. Panels read tunnel snapshots from here (sidebar, header,
     /// `connection_details`, security, chart).
     pub registry: TunnelRegistry<TunnelKind>,
@@ -155,7 +155,7 @@ pub struct App {
     pub terminal_size: (u16, u16),
 }
 
-// Plan 005 U5 removed the previous `impl Deref<Target = VpnRuntime>` — the
+// An earlier refactor removed the previous `impl Deref<Target = VpnRuntime>` — the
 // porous boundary let every TUI/app/CLI callsite reach into VpnRuntime
 // without the indirection being visible at the call site. Use
 // `app.runtime.X` for runtime fields and `app.registry` for active
@@ -305,8 +305,7 @@ impl App {
 }
 
 impl App {
-    /// Attach an `EngineHandle` to the app (plan 005 U5 incremental
-    /// adoption). The handle is not yet load-bearing — the TUI still
+    /// Attach an `EngineHandle` to the app. The handle is not yet load-bearing — the TUI still
     /// mutates `self.engine` through `Deref` — but future units swap UI
     /// reads / commands over to it.
     #[must_use]

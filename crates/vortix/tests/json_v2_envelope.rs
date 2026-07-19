@@ -1,4 +1,4 @@
-//! JSON v2 envelope shape tests — multi-connection plan U21.
+//! JSON v2 envelope shape tests — .
 //!
 //! Validates the wire shape downstream JSON consumers depend on:
 //! - top-level `schema_version: 2`, `ok`, `command`, optional `data`
@@ -12,7 +12,6 @@
 //! and schema-version drift. Full-path coverage of `handle_status` requires
 //! a process-spawn integration layer; deferred to a follow-up unit.
 //!
-//! Plan: docs/plans/2026-05-29-002-feat-behavioral-test-automation-plan.md (U7)
 
 use serde::Serialize;
 use vortix::cli::output::{CliResponse, ConnectionEntry, SCHEMA_VERSION};
@@ -89,7 +88,7 @@ fn json_v2_envelope_one_primary_populates_back_compat_connection_field() {
     assert_eq!(json["data"]["primary"], "corp");
     // v1 back-compat: data.connection MUST be populated when a primary
     // exists so `jq '.data.connection.profile'` from v0.3.x consumers
-    // still works. This is the load-bearing R6 invariant.
+    // still works. This is the load-bearing envelope invariant.
     assert!(!json["data"]["connection"].is_null());
     assert_eq!(json["data"]["connection"]["profile"], "corp");
 }

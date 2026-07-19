@@ -1,7 +1,7 @@
 //! macOS VPN interface detection via `libc::getifaddrs` + `/var/run/wireguard` +
 //! `libc::proc_listpids` + hand-rolled libproc FFI.
 //!
-//! Plan 002 U5/U6/U7: replaced `ifconfig <iface>`, `ps -ax -o pid,command`,
+//! Replaced `ifconfig <iface>`, `ps -ax -o pid,command`,
 //! and `lsof -t <socket>` shell-outs with direct libc / libproc calls.
 
 use crate::vortix_core::ports::interface::Interface;
@@ -47,21 +47,21 @@ impl Interface for MacInterface {
     fn get_wireguard_pid(interface: &str) -> Option<u32> {
         let sock_path = PathBuf::from(WIREGUARD_RUN_DIR).join(format!("{interface}.sock"));
 
-        // Plan 002 U7: primary path is libproc — walk every PID's socket
+        // primary path is libproc — walk every PID's socket
         // FDs and match the bound unix-socket path against `sock_path`.
         // Replaces the prior `lsof -t <sock_path>` shell-out.
         if let Some(pid) = find_pid_holding_unix_socket(&sock_path) {
             return Some(pid);
         }
 
-        // Plan 002 U6: fallback search via libc::proc_listpids + proc_pidpath
+        // fallback search via libc::proc_listpids + proc_pidpath
         // (was `ps -ax -o pid,command`). Walks the live PID list and
         // filters by binary path containing "wireguard" + interface name.
         find_pid_with_cmdline_substring("wireguard", Some(interface))
     }
 
     fn get_interface_info(interface: &str) -> (String, String) {
-        // Plan 002 U6 (per-interface, vs U5's interface listing):
+        // Per-interface (vs the interface listing):
         // ifconfig <iface> replaced with libc::getifaddrs walk for the
         // named interface. Same data, no PATH dependency.
         let ip = get_interface_ipv4(interface).unwrap_or_default();
@@ -150,7 +150,7 @@ fn get_interface_mtu(interface: &str) -> Option<String> {
 // define it locally from Apple's <sys/proc_info.h>. Value is `1`.
 const PROC_ALL_PIDS: u32 = 1;
 
-/// Plan 002 U6: find a process whose binary path contains the given
+/// find a process whose binary path contains the given
 /// substring (and optionally a second substring). Walks the live process
 /// list via `libc::proc_listpids` and inspects each PID's path via
 /// `libc::proc_pidpath`.
@@ -180,7 +180,7 @@ pub(crate) fn find_pid_with_cmdline_substring(needle: &str, also: Option<&str>) 
     None
 }
 
-/// Plan 002 U6: find ALL processes whose binary path contains the given
+/// find ALL processes whose binary path contains the given
 /// substring. Used by the OVPN tunnel teardown to replace `pkill -f`.
 pub(crate) fn find_all_pids_with_cmdline_substring(needle: &str) -> Vec<u32> {
     let Some(pids) = list_all_pids() else {
@@ -255,7 +255,7 @@ fn pid_path_lower(pid: libc::pid_t) -> Option<String> {
     String::from_utf8(path_buf).ok().map(|s| s.to_lowercase())
 }
 
-/// Plan 002 U7: find the PID with `sock_path` open as a unix domain
+/// find the PID with `sock_path` open as a unix domain
 /// socket. Walks every PID's socket FDs via `libproc_ffi::iter_all_sockets`
 /// and matches `unsi_addr.ua_sun.sun_path` (or `unsi_caddr.ua_sun.sun_path`)
 /// against the target. Replaces the prior `lsof -t <sock_path>`

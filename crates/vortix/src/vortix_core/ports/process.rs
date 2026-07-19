@@ -3,7 +3,6 @@
 //! Concrete impls (`RealRunner`, `MockRunner`) live in `vortix-process`. This module
 //! contains only the trait, the data types, and the error enum. No tokio dependency.
 //!
-//! See `docs/plans/2026-05-24-002-feat-commandrunner-port-plan.md` for the design.
 
 use std::collections::HashMap;
 use std::path::PathBuf;

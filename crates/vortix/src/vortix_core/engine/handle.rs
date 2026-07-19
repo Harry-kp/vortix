@@ -1,4 +1,4 @@
-//! `EngineHandle` + `LocalHandle` actor (plan #005 U4).
+//! `EngineHandle` + `LocalHandle` actor.
 //!
 //! Clone-able Command/Query/Subscribe API around the FSM. The actor lives
 //! in a `tokio::spawn`'d task; the handle holds a mpsc sender to the actor

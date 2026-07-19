@@ -158,7 +158,7 @@ impl App {
             }
         }
 
-        // 2. Kick off a new fetch via the platform aggregate (plan 003 U7).
+        // 2. Kick off a new fetch via the platform aggregate.
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let totals = crate::platform::current_platform()

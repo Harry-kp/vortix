@@ -1,5 +1,4 @@
-//! Live kernel interface enumeration via `/sys/class/net/` (plan
-//! multi-connection U11).
+//! Live kernel interface enumeration via `/sys/class/net/`.
 //!
 //! Used by the killswitch `PersistedState` V2 migration to drop phantom
 //! tunnel entries whose interface no longer exists in the kernel after a

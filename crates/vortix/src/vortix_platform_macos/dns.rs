@@ -1,6 +1,6 @@
 //! macOS DNS resolver via the `SystemConfiguration` framework.
 //!
-//! Plan 002 U7: replaced `scutil --dns` and `networksetup -getdnsservers`
+//! replaced `scutil --dns` and `networksetup -getdnsservers`
 //! shell-outs with direct queries against `SCDynamicStore`. Both shell-outs
 //! ultimately read the same `State:/Network/Global/DNS` /
 //! `Setup:/Network/Service/<uuid>/DNS` keys we read directly; the previous

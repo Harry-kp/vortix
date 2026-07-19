@@ -496,8 +496,7 @@ fn clap_global_flags_propagate() {
 }
 
 // ============================================================================
-// Multi-tunnel CLI grammar (plan 001 U20 — Down with profile/--all, Reconnect
-// with profile, Up --yes flag). Plan 002 U6-narrow.
+// Multi-tunnel CLI grammar.
 // ============================================================================
 
 #[test]

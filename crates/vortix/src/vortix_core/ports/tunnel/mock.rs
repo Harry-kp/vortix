@@ -1,6 +1,6 @@
 //! `MockTunnel` — scriptable test fixture for the `Tunnel` trait.
 //!
-//! Same shape as `MockKillswitch` (plan 003 U5) and `MockRunner` (plan 002):
+//! Same shape as `MockKillswitch` and `MockRunner`:
 //! scripted outcomes, an invocation log, and a default-success constructor
 //! for tests that don't care about subprocess specifics.
 

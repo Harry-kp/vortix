@@ -1,5 +1,4 @@
-//! Windows stub for `available_network_interfaces` (plan
-//! multi-connection U11). Real enumeration (via `GetAdaptersAddresses`
+//! Windows stub for `available_network_interfaces`. Real enumeration (via `GetAdaptersAddresses`
 //! or `netsh`) lands when Windows support is implemented.
 
 /// Stub — returns an empty list on Windows. The killswitch V2 migration

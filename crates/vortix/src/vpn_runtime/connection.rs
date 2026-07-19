@@ -217,7 +217,7 @@ impl VpnRuntime {
         let cmd_tx = self.cmd_tx.clone();
         let pn = profile_name.clone();
 
-        // Plan #004 U4: a single Tunnel::down call replaces the previous
+        // a single Tunnel::down call replaces the previous
         // ~80-line per-protocol match arm. The interface name carried on the
         // synthetic handle preserves the existing wg-quick semantics
         // (config-path-based lookup) for WireGuard.
@@ -407,7 +407,7 @@ impl VpnRuntime {
 
     /// Internal: run the VPN connect subprocess (shared between TUI and CLI paths).
     ///
-    /// Plan #004 U4: a single call to `TunnelKind::up` replaces the previous
+    /// a single call to `TunnelKind::up` replaces the previous
     /// 200-line per-protocol match arm. Routing happens once in
     /// [`crate::tunnel::tunnel_for`].
     fn run_connect(

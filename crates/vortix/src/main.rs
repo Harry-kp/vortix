@@ -11,18 +11,18 @@ fn main() -> Result<()> {
     // panic hook, so we must call it before installing ours.
     color_eyre::install()?;
 
-    // Subprocess runner + tracing (plan 002). Both live behind env-driven
+    // Subprocess runner + tracing. Both live behind env-driven
     // toggles so production startup is silent; `RUST_LOG=vortix::process=info`
     // surfaces every subprocess invocation as a structured event.
     init_tracing();
     vortix::vortix_process::set_global_runner(vortix::vortix_process::CommandRunner::real());
 
-    // Platform aggregate (plan 003 U7). Detect the OS variants once at startup;
+    // Platform aggregate. Detect the OS variants once at startup;
     // consumers reach for `crate::platform::current_platform()` instead of
     // branching on `cfg(target_os)`.
     vortix::platform::set_global_platform(vortix::platform::Platform::detect_current());
 
-    // Settings (plan 006 U7) — figment-layered: defaults → user file →
+    // Settings — figment-layered: defaults → user file →
     // VORTIX_* env. CLI overrides currently bypass settings.
     let settings = match vortix::vortix_config::Settings::load() {
         Ok(s) => s,
@@ -32,7 +32,7 @@ fn main() -> Result<()> {
         }
     };
 
-    // Journal (plan 005 U8 prep) — open the per-session JSONL writer using
+    // Journal — open the per-session JSONL writer using
     // the runner's own tokio runtime (writer task is spawn'd on it). We
     // borrow the runtime via Handle so the Journal stays alive after main()
     // exits to the TUI loop.
@@ -114,13 +114,13 @@ fn main() -> Result<()> {
     // Store the resolved config dir globally so all utility functions use it
     config::set_config_dir(config_dir.clone());
 
-    // U6 (plan 2026-06-02-001, #191): clear any SCRV1 envelopes left on
+    // Clear any SCRV1 envelopes left on
     // disk by a previous crash mid-connect. Runs once at startup before
     // the CLI/TUI fork so both paths see a clean auth dir. Cheap O(N)
     // scan; failures are swallowed.
     vortix::utils::scrub_stale_scrv1_auth_files();
 
-    // Plan #009 U13: session-liveness sweep of `${config_dir}/tmp/`. Any
+    // session-liveness sweep of `${config_dir}/tmp/`. Any
     // per-session subdir whose name does not match the current journal
     // `session_id` is, by construction, a crash orphan — every session has a
     // unique `{ISO}-{pid}` ID. This is correct regardless of file age (a
@@ -134,7 +134,7 @@ fn main() -> Result<()> {
         }
     }
 
-    // Plan 006 U4: backfill profile sidecars for `.conf` / `.ovpn` files
+    // backfill profile sidecars for `.conf` / `.ovpn` files
     // imported before the sidecar scheme existed. Idempotent — no-ops once
     // every profile has a `.meta.toml`. Failures are logged + non-fatal:
     // startup MUST never abort because of migration trouble.
@@ -168,11 +168,11 @@ fn main() -> Result<()> {
         }
     }
 
-    // Plan 008 U5: orphan-daemon scan. If a previous vortix crashed
+    // orphan-daemon scan. If a previous vortix crashed
     // while a tunnel was up, the user's `wg-quick` / `openvpn` /
     // `wireguard-go` daemon is probably still running. Warn so they
     // know to clean up (no auto-adopt — adoption arrives with the
-    // plan 010 IPC layer).
+    // daemon IPC layer).
     //
     // PIDs recorded in `run/*.pid` belong to a tracked session (openvpn
     // daemons reparent to init, so the bare scan can't tell "mine" from
@@ -239,7 +239,7 @@ fn main() -> Result<()> {
 }
 
 /// Sweep crash-orphaned per-session subdirs under `${config_dir}/tmp/`
-/// (plan #009 U13).
+///.
 ///
 /// Session IDs are `{ISO-timestamp}-{pid}` — guaranteed unique per process —
 /// so any subdir whose name does not match the *current* session's ID is an
@@ -352,7 +352,7 @@ fn run_tui(
     let profiles_dir_for_resolver = config_dir.join(constants::PROFILES_DIR_NAME);
     let mut app = App::new(config, config_dir);
 
-    // Attach an `EngineHandle` (plan 005 U5/U6). The handle wraps the
+    // Attach an `EngineHandle`. The handle wraps the
     // FSM and gets a per-profile tunnel factory so a single
     // `Engine<TunnelKind>` drives both WG and OVPN. The actor spawns on
     // the bundled tokio runtime. Failure is non-fatal.
@@ -365,7 +365,7 @@ fn run_tui(
         if let Some(handle) = vortix::daemon::build_engine_handle(&profiles_dir_for_resolver) {
             app = app.with_engine_handle(handle);
 
-            // Plan 005 U7: spawn a journal-subscriber task that reacts
+            // spawn a journal-subscriber task that reacts
             // to engine events. Today it nudges the legacy telemetry
             // worker on `TunnelUp` so connect → IP-refresh happens
             // promptly. Future units route more flows through here.

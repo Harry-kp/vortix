@@ -21,7 +21,7 @@ use crate::vpn_runtime::VpnRuntime;
 /// Prompt for a 2FA code on the controlling tty with masked echo (each
 /// character is replaced by `*`). Returns `Err` when stdin is not a tty —
 /// the connect path treats this as a hard failure and exits non-zero with
-/// an actionable message naming the prompt kind. Plan 2026-06-02-001 U4.
+/// an actionable message naming the prompt kind. .
 ///
 /// Implementation uses `crossterm`'s raw mode (already in the workspace,
 /// no new dep) and reads byte-by-byte. A `RawModeGuard` ensures the
@@ -165,7 +165,7 @@ pub fn handle_command(
     }
 }
 
-/// `vortix audit` — per-process socket snapshot (plan 015 phase C / plan 013).
+/// `vortix audit` — per-process socket snapshot.
 #[derive(Serialize)]
 struct AuditData {
     sockets: Vec<crate::vortix_core::ports::socket_audit::SocketSnapshot>,
@@ -242,7 +242,7 @@ fn handle_audit(pid_filter: Option<u32>, vpn_only: bool, mode: OutputMode) -> i3
 }
 
 /// `vortix daemon` — host the engine as a long-running IPC server
-/// (plan 015 phase D / plan 010).
+///.
 fn handle_daemon(socket_override: Option<std::path::PathBuf>, mode: OutputMode) -> i32 {
     let socket_path = socket_override.unwrap_or_else(crate::daemon::default_socket_path);
 
@@ -333,11 +333,11 @@ fn handle_up(
     config_dir: &Path,
     mode: OutputMode,
 ) -> i32 {
-    // `yes` bypasses the multi-tunnel conflict prompt that U7 lands on
+    // `yes` bypasses the multi-tunnel conflict prompt that lands on
     // the connect-path overlay. The CLI today goes directly through
     // `VpnRuntime::connect_and_wait` (no conflict check there), so `yes`
     // is a no-op in the current build — but the flag is wired so scripts
-    // can adopt it ahead of U7's overlay shipping. Once U7 wires the
+    // can adopt it ahead of the overlay shipping. Once the
     // registry conflict-check into the CLI path, this flag will gate
     // the bypass.
     let _ = yes;
@@ -383,7 +383,7 @@ fn handle_up(
     // Check dependencies before attempting connection. Routes through
     // `VpnRuntime::check_dependencies` so the TUI and CLI refuse the
     // same dep set — including the OpenVPN 2.4+ probe that the
-    // legacy inline CLI check used to skip (R13 / plan 001 U14).
+    // legacy inline CLI check used to skip.
     engine.load_metadata();
     if let Some(profile) = engine.profiles.iter().find(|p| p.name == profile_name) {
         let missing = crate::vpn_runtime::VpnRuntime::check_dependencies(
@@ -445,7 +445,7 @@ fn handle_up(
         return 0;
     }
 
-    // Multi-connection plan #001 U7: route the CLI connect through the
+    // route the CLI connect through the
     // registry's conflict gate before invoking the legacy tunnel-up path.
     // The CLI is headless and has no in-memory registry, so we build a
     // transient one from the scanner's active-session snapshot and ask it
@@ -489,7 +489,7 @@ fn handle_up(
         }
     }
 
-    // Plan 2026-06-02-001 U4 (#191): if the profile declares a
+    // (#191): if the profile declares a
     // `static-challenge` directive, prompt for the OTP on the
     // controlling tty (always masked, regardless of the directive's
     // echo flag — DEC-2), write the SCRV1 envelope into the canonical
@@ -581,7 +581,7 @@ fn handle_up(
 
     let result = engine.connect_and_wait(&profile_name, Duration::from_secs(timeout_secs));
     // The protocol layer deletes the SCRV1 envelope after openvpn forks
-    // (plan 2026-06-02-001 U3 / PF-2). Belt-and-braces: if the connect
+    //. Belt-and-braces: if the connect
     // never reached spawn (early-failure path), clear the envelope
     // here so it doesn't linger.
     if let Some(name) = scrv1_restore_needed {
@@ -655,7 +655,7 @@ fn handle_up(
     }
 }
 
-/// Detect a multi-tunnel conflict for the CLI's `up` path (plan #001 U7).
+/// Detect a multi-tunnel conflict for the CLI's `up` path.
 ///
 /// The CLI doesn't share an in-memory `TunnelRegistry` with the running
 /// session — active tunnels are discovered via
@@ -664,7 +664,7 @@ fn handle_up(
 /// `claims_default_route_*` helpers (same logic the TUI's
 /// `TunnelRegistry::detect_conflict` uses) so the two surfaces refuse the
 /// same set of takeovers. The route-overlap branch is a CLI-only
-/// superset until R10 v2 brings route-overlap detection into the
+/// superset until a follow-up brings route-overlap detection into the
 /// registry.
 /// Acquire the cross-process lifecycle lock or exit with a structured
 /// error. Proceeding without the lock would reintroduce the concurrent
@@ -769,7 +769,7 @@ fn handle_down(
     }
 
     if targets.is_empty() {
-        // Idempotent: already disconnected = success. Matches U20
+        // Idempotent: already disconnected = success. Matches the
         // scenario "vortix down corp with corp not active → exit 0".
         let data = DownData {
             state: "disconnected".into(),
@@ -949,8 +949,8 @@ fn handle_reconnect(
 ///   `data.connection.{state,profile,protocol,uptime_secs}` continue to
 ///   work in the primary-only case.
 ///
-/// U22 will replace the transitional single-entry construction below
-/// with a registry-driven snapshot; U21's job is just to make the v2
+/// A follow-up will replace the transitional single-entry construction below
+/// with a registry-driven snapshot; this stage's job is just to make the v2
 /// envelope shape available.
 #[derive(Serialize)]
 struct StatusData {
@@ -1000,8 +1000,7 @@ fn handle_status(
 
     // Read-only ops route through the daemon ONLY when its socket
     // exists and is connectable. Otherwise fall back to direct disk +
-    // scanner reads (plan multi-connection D3: read-only ops bypass
-    // daemon when socket absent). The `--no-daemon` flag forces the
+    // scanner reads. The `--no-daemon` flag forces the
     // bypass even when the daemon is up — useful for testing.
     let daemon_socket = if no_daemon {
         None
@@ -1017,7 +1016,7 @@ fn handle_status(
     // live counters and kill-switch state. On any daemon error we
     // silently keep the scanner-only view — bypass-on-error keeps
     // `vortix status` reliable during partial daemon rollout. Once
-    // U21 lands the schema_version=2 multi-tunnel payload, this
+    // This lands the schema_version=2 multi-tunnel payload, this
     // branch will pull richer data from the daemon directly.
     if let Some(socket) = daemon_socket {
         if let Ok(state) = crate::daemon::client::snapshot(&socket) {
@@ -1027,8 +1026,8 @@ fn handle_status(
 
     let is_connected = snap.connection_state == "connected";
 
-    // U21 transitional shape: the registry-driven multi-tunnel snapshot
-    // lands in U22. Until then, "primary" is the single active tunnel
+    // Transitional shape: the registry-driven multi-tunnel snapshot
+    // lands later. Until then, "primary" is the single active tunnel
     // (when connected), and `connections` is a one-element vec mirroring
     // it. When disconnected, `connections` is empty and `primary` /
     // `connection` are both `null`.
@@ -1284,7 +1283,7 @@ struct ProfileEntry {
     connected: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_used: Option<String>,
-    /// Stable profile ID from the `.meta.toml` sidecar (plan 006 U2/U4).
+    /// Stable profile ID from the `.meta.toml` sidecar.
     /// `None` when the profile predates the migration.
     #[serde(skip_serializing_if = "Option::is_none")]
     profile_id: Option<String>,
@@ -1356,7 +1355,7 @@ fn handle_list(
     }
 
     // Index sidecars by display_name so we can enrich each entry with the
-    // stable profile_id + group label (plan 006 U2/U4). The lookup is
+    // stable profile_id + group label. The lookup is
     // O(N + M) which is fine for the typical handful of profiles.
     let sidecars_by_name: std::collections::HashMap<String, _> = {
         use crate::vortix_config::profile_store::{FsProfileStore, ProfileStore};
@@ -2196,7 +2195,7 @@ fn handle_info(config_dir: &Path, source: &str, mode: OutputMode) {
         "defaults"
     };
 
-    // Session-journal path (plan 005). Folded into `vortix info` as part
+    // Session-journal path. Folded into `vortix info` as part
     // of the v0.3.0 CLI surface cleanup — `vortix journal path` was
     // dropped in favour of surfacing the path here.
     let journal_session = crate::vortix_core::journal::global_journal()

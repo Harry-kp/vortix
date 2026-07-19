@@ -9,7 +9,7 @@ use tracing::warn;
 
 use crate::vortix_core::ports::tunnel::{ParseError, ParsedProfile};
 
-/// IP-family CIDR. Local until U3 introduces `vortix_core::cidr`.
+/// IP-family CIDR. Local until a shared helper introduces `vortix_core::cidr`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cidr {
     pub addr: IpAddr,
@@ -73,7 +73,7 @@ pub struct OvpnRoute {
 /// alongside the username/password. `prompt` is the user-facing text rendered
 /// next to the OTP input; `echo` records the server-declared echo bit but is
 /// not used to decide masking — vortix always masks OTP input (see plan
-/// 2026-06-02-001 DEC-2).
+/// the parser decision record).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StaticChallenge {
     pub prompt: String,
