@@ -89,12 +89,41 @@ sync, S4 many-clients-one-state) are the acceptance tests.
   streaming stays loopback-tested), live re-attach after a detach (restart
   the TUI), in-band 2FA.
 
-**NEXT (resume here):** live-validate P4 (backlog rows 102–105 + flow list
-below) → P5 boot service (#22 — also fixes the cross-uid socket PATH agreement
-P2 flagged: a canonical system socket path both daemon + client use) → P6
-closure (#23). Known P1 follow-up: externally-adopted tunnels get a placeholder
-engine (daemon-`down` on one is a no-op) until adoption seeds a real
-protocol-correct engine. See the plan for full detail.
+**DONE — P5 boot service core (task #22), built 2026-07-19 session 2:**
+- **P5a socket agreement:** `system_socket_path()` = `/var/run/vortix.sock`
+  (fixed, env-free — the only path a no-user-env boot daemon and a user
+  client can both resolve; closes the P2 cross-uid gap). Client probe order:
+  env override (exclusive) → per-user default → system path.
+- **P5b generation (pure, golden-tested):** `daemon/service.rs` —
+  `ServiceSpec{binary, owner_uid, config_dir}` → `systemd_unit()` /
+  `launchd_plist()` (both testable on any host; one annotated cfg seam in
+  `ServiceManager::detect`). Units carry `--socket` + `VORTIX_OWNER_UID` +
+  `VORTIX_CONFIG_DIR`.
+- **P5c `vortix service install/uninstall/status`:** install (root-gated,
+  SUDO_UID→owner, refuses to clobber foreign unit files, systemctl
+  enable --now / launchctl bootstrap-with-load-fallback, honest
+  socket-appeared verification); uninstall (idempotent, foreign-file
+  refusal, R12 zero-leftover verification); status (installed +
+  reachable-for-this-user, exit 0 only when both).
+- **P5d boot-persisted profiles:** sidecar `boot_connect` flag
+  (`#[serde(default)]`, survives re-import), `vortix service persist/
+  unpersist <profile>`, daemon boot connects the flagged set after R7
+  adoption (force=false — conflicting 0/0 pairs refuse loudly). Live-smoked
+  unprivileged: flag round-trip ✓, boot-connect resolves catalog + attempts
+  wg-quick honestly ✓.
+- **Deferred from P5:** the early-boot default-deny firewall unit
+  (`Before=network-pre.target` + DHCP/ND carve-outs, Mullvad pattern) — its
+  `[Needs research]` semantics are only resolvable on a real VM per
+  platform, and it pairs with P6's daemon kill-switch ownership. AE5's
+  reboot leak-window probe remains the droplet test for it.
+
+**NEXT (resume here):** droplet validation — P4 rows 102–105 + P5 rows
+106–107 (root daemon, real tunnels, reboot persistence AE5) → P6 closure
+(#23: kill-switch-on-drop + daemon KS ownership + early-boot unit, golden
+parity suite AE6/R11, security review, README, CHANGELOG, close
+#234/#250/#153/#16). Known P1 follow-up: externally-adopted tunnels get a
+placeholder engine (daemon-`down` on one is a no-op) until adoption seeds a
+real protocol-correct engine. See the plan for full detail.
 
 ## Code review (2026-07-19)
 
