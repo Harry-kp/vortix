@@ -215,6 +215,13 @@ mod connection_state_machine {
             success: true,
             error: None,
         });
+        // Completion is kernel-confirmed: the worker's success keeps the
+        // entry Disconnecting; the next scan reporting the session gone
+        // finishes the disconnect (guards the re-adopt/reconnect loop).
+        app.handle_message(Message::SyncSystemState {
+            sessions: vec![],
+            default_route_interface: None,
+        });
         assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
     }
 
@@ -318,11 +325,18 @@ mod connection_state_machine {
             ConnectionState::Disconnecting { .. }
         ));
 
-        // Disconnecting -> Disconnected
+        // Disconnecting -> Disconnected (kernel-confirmed)
         app.handle_message(Message::DisconnectResult {
             profile: "vpn-a".to_string(),
             success: true,
             error: None,
+        });
+        // Completion is kernel-confirmed: the worker's success keeps the
+        // entry Disconnecting; the next scan reporting the session gone
+        // finishes the disconnect (guards the re-adopt/reconnect loop).
+        app.handle_message(Message::SyncSystemState {
+            sessions: vec![],
+            default_route_interface: None,
         });
         assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
     }
@@ -338,11 +352,19 @@ mod connection_state_machine {
         set_disconnecting(&mut app, "vpn-a");
         app.runtime.pending_connect = Some(1);
 
-        // Disconnect completes -> complete_disconnect drains pending_connect
+        // Disconnect completes -> the kernel-confirming scan drains
+        // pending_connect via complete_disconnect.
         app.handle_message(Message::DisconnectResult {
             profile: "vpn-a".to_string(),
             success: true,
             error: None,
+        });
+        // Completion is kernel-confirmed: the worker's success keeps the
+        // entry Disconnecting; the next scan reporting the session gone
+        // finishes the disconnect (guards the re-adopt/reconnect loop).
+        app.handle_message(Message::SyncSystemState {
+            sessions: vec![],
+            default_route_interface: None,
         });
 
         // complete_disconnect calls connect_profile(1) for vpn-b.

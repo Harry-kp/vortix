@@ -120,6 +120,13 @@ fn test_disconnect_result_success_transitions_to_disconnected() {
         error: None,
     });
 
+    // Completion is kernel-confirmed: the next scan reports the
+    // session gone, which finishes the disconnect.
+    app.handle_message(Message::SyncSystemState {
+        sessions: vec![],
+        default_route_interface: None,
+    });
+
     assert!(
         matches!(app.legacy_state(), ConnectionState::Disconnected),
         "Expected Disconnected after successful DisconnectResult"
@@ -602,11 +609,18 @@ fn switch_path_disconnect_completion_removes_old_profile_from_registry() {
         "setup precondition"
     );
 
-    // Worker thread reports vpn-a's disconnect completed.
+    // Worker thread reports vpn-a's disconnect completed; the next
+    // scan confirms the kernel session is gone.
     app.handle_message(Message::DisconnectResult {
         profile: "vpn-a".to_string(),
         success: true,
         error: None,
+    });
+    // Completion is kernel-confirmed: the next scan reports the
+    // session gone, which finishes the disconnect.
+    app.handle_message(Message::SyncSystemState {
+        sessions: vec![],
+        default_route_interface: None,
     });
 
     // vpn-a must be gone from the registry — the switch flow drained
@@ -697,6 +711,13 @@ fn test_pending_connect_drained_on_disconnect_success() {
         profile: "vpn-a".to_string(),
         success: true,
         error: None,
+    });
+
+    // Completion is kernel-confirmed: the next scan reports the
+    // session gone, which finishes the disconnect.
+    app.handle_message(Message::SyncSystemState {
+        sessions: vec![],
+        default_route_interface: None,
     });
 
     assert_eq!(app.runtime.pending_connect, None);
@@ -906,6 +927,13 @@ fn test_reconnect_auto_connects_after_disconnect_completes() {
         profile: "test-vpn".to_string(),
         success: true,
         error: None,
+    });
+
+    // Completion is kernel-confirmed: the next scan reports the
+    // session gone, which finishes the disconnect.
+    app.handle_message(Message::SyncSystemState {
+        sessions: vec![],
+        default_route_interface: None,
     });
 
     assert_eq!(app.runtime.pending_connect, None);
@@ -3387,6 +3415,12 @@ fn disconnect_result_success_removes_from_registry() {
         success: true,
         error: None,
     });
+    // Completion is kernel-confirmed: the next scan reports the
+    // session gone, which finishes the disconnect.
+    app.handle_message(Message::SyncSystemState {
+        sessions: vec![],
+        default_route_interface: None,
+    });
 
     assert_eq!(
         app.registry.tunnel_count(),
@@ -4072,4 +4106,58 @@ fn attach_daemon_disarms_persisted_killswitch_state() {
         app.runtime.killswitch_state,
         crate::state::KillSwitchState::Disabled
     );
+}
+
+#[test]
+fn disconnect_result_defers_completion_until_kernel_confirms() {
+    // Regression for the disconnect→reconnect loop: after `down()`
+    // reports success the VPN process can stay alive for another
+    // moment. Completing the disconnect on the worker's word removed
+    // the registry entry early; a scan captured in that window
+    // re-adopted the dying tunnel, its exit then read as an unexpected
+    // drop, and auto-reconnect resurrected the connection — making
+    // disconnect impossible. Completion must wait for the kernel.
+    let mut app = test_app();
+    add_profiles(&mut app, &["vpn-a"]);
+    set_connected(&mut app, "vpn-a");
+    app.mirror_disconnecting_into_registry("vpn-a");
+
+    // Worker reports success while the kernel session is still visible:
+    // the entry must stay Disconnecting.
+    app.handle_message(Message::DisconnectResult {
+        profile: "vpn-a".to_string(),
+        success: true,
+        error: None,
+    });
+    let id = crate::vortix_core::profile::ProfileId::new("vpn-a");
+    let snap = app.registry.snapshot(&id).expect("entry kept");
+    assert!(matches!(
+        snap.state,
+        crate::vortix_core::engine::state::Connection::Disconnecting { .. }
+    ));
+
+    // A stale scan still lists the dying session: no re-adoption, no drop.
+    app.handle_message(Message::SyncSystemState {
+        sessions: vec![fake_session("vpn-a")],
+        default_route_interface: None,
+    });
+    let snap = app.registry.snapshot(&id).expect("still tracked");
+    assert!(
+        matches!(
+            snap.state,
+            crate::vortix_core::engine::state::Connection::Disconnecting { .. }
+        ),
+        "a scan captured mid-teardown must not re-adopt the tunnel"
+    );
+    assert_eq!(app.runtime.connection_drops, 0);
+
+    // Kernel confirms the session is gone: disconnect completes, the
+    // exit is NOT an unexpected drop, and no auto-reconnect is queued.
+    app.handle_message(Message::SyncSystemState {
+        sessions: vec![],
+        default_route_interface: None,
+    });
+    assert!(app.registry.snapshot(&id).is_none());
+    assert_eq!(app.runtime.connection_drops, 0);
+    assert!(app.runtime.retry_state.is_empty());
 }
