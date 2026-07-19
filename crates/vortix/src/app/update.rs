@@ -474,7 +474,24 @@ impl App {
             // Still clean up files — the disconnect thread likely did kill the process
             utils::cleanup_openvpn_run_files(&profile);
         } else if success {
-            self.complete_disconnect(&profile);
+            // The worker's exit status is not kernel truth: openvpn can
+            // take another second or two to die after `down()` returns.
+            // Completing the disconnect here removes the registry entry
+            // while the kernel session is still visible, which reopens
+            // the adoption window — the next scanner tick re-adopts the
+            // dying process as an "externally started" tunnel, the tick
+            // after that reads its exit as an unexpected drop, and
+            // auto-reconnect resurrects the connection the user just
+            // tore down (an unbreakable disconnect→reconnect loop).
+            // Keep the entry Disconnecting; the scanner completes the
+            // disconnect via its `(Disconnecting, None)` arm the moment
+            // the kernel confirms the session is gone, which also runs
+            // the pending-connect drain and kill-switch sync exactly
+            // once. The disconnect-timeout arm still catches teardowns
+            // that never converge.
+            self.log(&format!(
+                "STATUS: Teardown finished for '{profile}' — awaiting kernel confirmation"
+            ));
         } else {
             let err_msg = error.unwrap_or_else(|| "unknown error".to_string());
             self.log(&format!("ERR: Failed to disconnect '{profile}': {err_msg}"));
