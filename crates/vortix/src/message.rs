@@ -32,6 +32,32 @@ pub enum ScrollMove {
     Bottom,
 }
 
+/// Which daemon-routed write a [`Message::DaemonCommandResult`] reports
+/// on (plan 2026-07-19-001 P4). Connect failures mark the profile
+/// Failed in the mirrored registry; disconnect successes run the
+/// shared disconnect finisher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonWriteAction {
+    Connect,
+    Disconnect,
+}
+
+/// How a daemon-routed write concluded (plan 2026-07-19-001 P4).
+/// `TimedOut` is deliberately distinct from `Failed`: the daemon holds
+/// the Execute connection open for the tunnel lifecycle, so a transport
+/// deadline elapsing means "may still be working — do not treat as
+/// failed", the same contract the CLI's `daemon_execute` enforces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonWriteStatus {
+    /// Daemon accepted and completed the command.
+    Completed,
+    /// Daemon refused or failed the command.
+    Failed,
+    /// No result within the transport window; the command may still be
+    /// executing. The snapshot poll resyncs the true outcome.
+    TimedOut,
+}
+
 /// All messages that can modify application state.
 ///
 /// Messages are the single source of truth for state mutations.
@@ -146,6 +172,24 @@ pub enum Message {
     SyncSystemState {
         sessions: Vec<ActiveSession>,
         default_route_interface: Option<String>,
+    },
+    /// Daemon-attached counterpart of [`Message::SyncSystemState`]
+    /// (plan 2026-07-19-001 P4): the polled multi-tunnel registry
+    /// snapshot from the daemon, mirrored into `app.registry` so every
+    /// panel renders daemon truth. The local kernel scanner does not
+    /// run while attached.
+    SyncDaemonState(crate::vortix_core::engine::registry_handle::RegistrySnapshot),
+    /// Result of a daemon-routed write (`Execute` over IPC) reported by
+    /// the background worker thread (plan 2026-07-19-001 P4).
+    DaemonCommandResult {
+        /// Profile name the write targeted.
+        profile: String,
+        /// Which write this reports on.
+        action: DaemonWriteAction,
+        /// How the write concluded.
+        status: DaemonWriteStatus,
+        /// Error description for `Failed` / deadline detail for `TimedOut`.
+        error: Option<String>,
     },
     /// Periodic heartbeat tick
     Tick,

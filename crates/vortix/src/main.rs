@@ -352,6 +352,28 @@ fn run_tui(
     let profiles_dir_for_resolver = config_dir.join(constants::PROFILES_DIR_NAME);
     let mut app = App::new(config, config_dir);
 
+    // P4 (plan 2026-07-19-001): attach to a running daemon before any
+    // local engine wiring. When attached, the daemon owns all tunnel
+    // state — the TUI renders its RegistrySnapshot and routes writes
+    // through Execute; none of the local FSM/scanner machinery starts.
+    // Socket absent = silent Local fallback; version mismatch = loud
+    // typed error naming both sides (the U1 contract).
+    let daemon_attached = match probe_daemon()? {
+        Some((socket, snapshot)) => {
+            let transport =
+                std::sync::Arc::new(vortix::daemon::client::UnixTransport::new(socket.clone()));
+            app.engine_handle = Some(vortix::vortix_core::engine::EngineHandle::Remote(
+                vortix::vortix_core::engine::handle::RemoteHandle::new(transport),
+            ));
+            app.attach_daemon(socket);
+            if let Some(snapshot) = snapshot {
+                app.handle_message(vortix::message::Message::SyncDaemonState(snapshot));
+            }
+            true
+        }
+        None => false,
+    };
+
     // Attach an `EngineHandle` (plan 005 U5/U6). The handle wraps the
     // FSM and gets a per-profile tunnel factory so a single
     // `Engine<TunnelKind>` drives both WG and OVPN. The actor spawns on
@@ -359,30 +381,33 @@ fn run_tui(
     //
     // The construction itself lives in `daemon::build_engine_handle` so
     // both the TUI bootstrap (here) and `vortix daemon` (`handle_daemon`)
-    // produce the same shape.
-    if let Some(runtime) = vortix::vortix_process::global_runner().as_real() {
-        let _guard = runtime.runtime().handle().enter();
-        if let Some(handle) = vortix::daemon::build_engine_handle(&profiles_dir_for_resolver) {
-            app = app.with_engine_handle(handle);
+    // produce the same shape. Skipped when a daemon is attached — the
+    // Remote handle above replaces the in-process actor (P4).
+    if !daemon_attached {
+        if let Some(runtime) = vortix::vortix_process::global_runner().as_real() {
+            let _guard = runtime.runtime().handle().enter();
+            if let Some(handle) = vortix::daemon::build_engine_handle(&profiles_dir_for_resolver) {
+                app = app.with_engine_handle(handle);
 
-            // Plan 005 U7: spawn a journal-subscriber task that reacts
-            // to engine events. Today it nudges the legacy telemetry
-            // worker on `TunnelUp` so connect → IP-refresh happens
-            // promptly. Future units route more flows through here.
-            // TUI-only side-effect — the daemon path doesn't need it.
-            if let Some(j) = vortix::vortix_core::journal::global_journal() {
-                let mut rx = j.subscribe();
-                let nudge = app.runtime.telemetry_nudge.clone();
-                tokio::spawn(async move {
-                    use vortix::vortix_core::engine::EngineEvent;
-                    while let Ok(envelope) = rx.recv().await {
-                        if matches!(envelope.event, EngineEvent::TunnelUp { .. }) {
-                            if let Some(n) = &nudge {
-                                let _ = n.send(());
+                // Plan 005 U7: spawn a journal-subscriber task that reacts
+                // to engine events. Today it nudges the legacy telemetry
+                // worker on `TunnelUp` so connect → IP-refresh happens
+                // promptly. Future units route more flows through here.
+                // TUI-only side-effect — the daemon path doesn't need it.
+                if let Some(j) = vortix::vortix_core::journal::global_journal() {
+                    let mut rx = j.subscribe();
+                    let nudge = app.runtime.telemetry_nudge.clone();
+                    tokio::spawn(async move {
+                        use vortix::vortix_core::engine::EngineEvent;
+                        while let Ok(envelope) = rx.recv().await {
+                            if matches!(envelope.event, EngineEvent::TunnelUp { .. }) {
+                                if let Some(n) = &nudge {
+                                    let _ = n.send(());
+                                }
                             }
                         }
-                    }
-                });
+                    });
+                }
             }
         }
     }
@@ -427,6 +452,40 @@ fn run_tui(
     }
 
     Ok(())
+}
+
+/// Probe for a running daemon at TUI startup (plan 2026-07-19-001 P4).
+///
+/// - `Ok(None)`: no daemon — the unchanged local mode (R11). Covers the
+///   absent socket, a stale socket file, and protocol failures (logged
+///   nowhere loud; the daemon is treated as unavailable).
+/// - `Ok(Some((socket, Some(snapshot))))`: attached, initial multi-tunnel
+///   state in hand — the first frame renders daemon truth (S2).
+/// - `Ok(Some((socket, None)))`: attached, but the daemon was busy
+///   (its registry actor runs jobs serially, e.g. mid-connect); the
+///   per-tick snapshot poll seeds state as soon as it frees up.
+/// - `Err(_)`: version mismatch — loud typed error naming both sides,
+///   no scanner fallback (the U1/AE8 contract).
+#[allow(clippy::type_complexity)] // tuple-of-options is the honest probe outcome
+fn probe_daemon() -> Result<
+    Option<(
+        std::path::PathBuf,
+        Option<vortix::vortix_core::engine::registry_handle::RegistrySnapshot>,
+    )>,
+> {
+    use vortix::daemon::client::ClientError;
+
+    let Some(socket) = vortix::daemon::daemon_socket_path_if_present() else {
+        return Ok(None);
+    };
+    match vortix::daemon::client::registry_snapshot(&socket) {
+        Ok(snapshot) => Ok(Some((socket, Some(snapshot)))),
+        Err(ClientError::Timeout(_)) => Ok(Some((socket, None))),
+        Err(ClientError::VersionMismatch { daemon, client }) => Err(color_eyre::eyre::eyre!(
+            "IPC protocol mismatch: the running vortix daemon speaks v{daemon}, this vortix speaks v{client}. Upgrade the older binary (and restart the daemon) so both sides match."
+        )),
+        Err(_) => Ok(None),
+    }
 }
 
 /// Initialise tracing-subscriber with an env-filter layer.

@@ -45,6 +45,11 @@ pub const DEFAULT_DISCONNECT_TIMEOUT: u64 = 30;
 /// Cadence (seconds) of the daemon's headless supervision loop — how often
 /// it rescans the kernel to adopt new sessions and detect drops.
 pub const DAEMON_SCAN_INTERVAL_SECS: u64 = 2;
+/// How long a daemon-routed write may pin its optimistic registry entry
+/// against snapshot overwrites before the marker expires (plan
+/// 2026-07-19-001 P4). Exceeds the 60s Execute transport timeout so a
+/// live write never expires; only a lost result message does.
+pub const DAEMON_INFLIGHT_EXPIRY: std::time::Duration = std::time::Duration::from_secs(70);
 /// Default maximum connection retry attempts on failure (0 = disabled).
 pub const DEFAULT_CONNECT_MAX_RETRIES: u32 = 3;
 /// Default base delay (seconds) for exponential backoff: delay = base * 2^(attempt-1).

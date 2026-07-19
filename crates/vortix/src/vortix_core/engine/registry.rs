@@ -515,6 +515,62 @@ impl<T: Tunnel> TunnelRegistry<T> {
         }
     }
 
+    /// Mirror a daemon-owned registry snapshot into this client-side
+    /// registry (plan 2026-07-19-001 P4 — TUI as a thin client): upsert
+    /// every reported tunnel, drop entries the daemon no longer tracks,
+    /// and take the daemon's `primary` + kill-switch state verbatim.
+    /// No local `recompute_primary` runs — the daemon owns kernel truth,
+    /// and the client's route-interface cache is unfed in remote mode.
+    ///
+    /// `keep_local(profile_id)` marks entries with a client-side write
+    /// in flight: those are neither overwritten nor removed this pass,
+    /// so the optimistic Connecting/Disconnecting badge survives until
+    /// the write result lands (the daemon registers the entry a beat
+    /// after `Execute` is sent; without this guard the next poll would
+    /// flicker the badge off).
+    ///
+    /// `engine_factory` builds a placeholder engine for tunnels this
+    /// registry hasn't seen yet — its state is seeded directly from the
+    /// wire ([`Engine::seed_state`]) and its tunnel impl is never driven.
+    pub fn apply_remote_snapshot(
+        &mut self,
+        snapshot: crate::vortix_core::engine::registry_handle::RegistrySnapshot,
+        keep_local: impl Fn(&ProfileId) -> bool,
+        mut engine_factory: impl FnMut(&TunnelSnapshot) -> Engine<T>,
+    ) {
+        let reported: std::collections::HashSet<ProfileId> = snapshot
+            .tunnels
+            .iter()
+            .map(|t| t.profile_id.clone())
+            .collect();
+        self.fsms
+            .retain(|id, _| reported.contains(id) || keep_local(id));
+
+        for tunnel in snapshot.tunnels {
+            if keep_local(&tunnel.profile_id) {
+                continue;
+            }
+            let allowed_ips = allowed_ips_from_role(&tunnel.role);
+            if let Some(entry) = self.fsms.get_mut(&tunnel.profile_id) {
+                entry.engine.seed_state(tunnel.state);
+                entry.allowed_ips = allowed_ips;
+            } else {
+                let mut engine = engine_factory(&tunnel);
+                engine.seed_state(tunnel.state);
+                self.fsms.insert(
+                    tunnel.profile_id,
+                    RegistryEntry {
+                        engine,
+                        allowed_ips,
+                    },
+                );
+            }
+        }
+
+        self.primary = snapshot.primary;
+        self.killswitch_state = snapshot.killswitch;
+    }
+
     // ──────────────────────────── Snapshots ────────────────────────────
 
     #[must_use]
@@ -1139,6 +1195,19 @@ where
     }
 }
 
+/// Recover the declared `AllowedIPs` from a wire [`Role`] so a remote
+/// mirror can rebuild its per-entry route data. Roles carry the CIDRs
+/// because [`TunnelSnapshot`] doesn't transport `allowed_ips` separately.
+fn allowed_ips_from_role(role: &Role) -> Vec<Cidr> {
+    match role {
+        Role::Primary { allowed_ips }
+        | Role::Addressable { allowed_ips }
+        | Role::AddressableSuppressed { allowed_ips } => allowed_ips.clone(),
+        Role::Reconnecting { prior_role } => allowed_ips_from_role(prior_role),
+        Role::AwaitingInput => Vec::new(),
+    }
+}
+
 fn log_primary_change(
     from: Option<&ProfileId>,
     to: Option<&ProfileId>,
@@ -1738,5 +1807,193 @@ mod tests {
         // false negatives into the primary-election filter.
         let d = DetailedConnectionInfo::default();
         assert!(d.interface_authoritative);
+    }
+
+    // ─────────────── apply_remote_snapshot (plan 2026-07-19-001 P4) ───────────────
+
+    mod apply_remote_snapshot {
+        use super::*;
+        use crate::vortix_core::engine::registry_handle::RegistrySnapshot;
+        use crate::vortix_core::engine::state::ConnectionHealth;
+        use crate::vortix_core::state::KillSwitchState;
+        use std::time::SystemTime;
+
+        fn placeholder_factory(t: &TunnelSnapshot) -> Engine<MockTunnel> {
+            let p = profile(t.profile_id.as_str());
+            Engine::new(MockTunnel::new(), move |_| Some(p.clone()))
+        }
+
+        fn connected_tunnel(name: &str, iface: &str, allowed_ips: Vec<Cidr>) -> TunnelSnapshot {
+            TunnelSnapshot {
+                profile_id: ProfileId::new(name),
+                state: Connection::Connected {
+                    profile_id: ProfileId::new(name),
+                    since: SystemTime::now(),
+                    health: ConnectionHealth::Healthy,
+                    details: Box::new(DetailedConnectionInfo {
+                        interface: iface.to_string(),
+                        ..Default::default()
+                    }),
+                },
+                role: Role::Primary { allowed_ips },
+                health: ConnectionHealth::Healthy,
+                interface_name: Some(iface.to_string()),
+                started_at: Some(SystemTime::now()),
+            }
+        }
+
+        fn wire_snapshot(tunnels: Vec<TunnelSnapshot>, primary: Option<&str>) -> RegistrySnapshot {
+            RegistrySnapshot {
+                tunnels,
+                primary: primary.map(ProfileId::new),
+                killswitch: KillSwitchState::Armed,
+            }
+        }
+
+        #[test]
+        fn seeds_tunnels_primary_and_killswitch_from_wire() {
+            let mut reg: TunnelRegistry<MockTunnel> = TunnelRegistry::new();
+            let snap = wire_snapshot(
+                vec![
+                    connected_tunnel("corp", "utun7", default_route_v4()),
+                    connected_tunnel("lab", "utun8", vec![v4("10.0.0.0/8")]),
+                ],
+                Some("corp"),
+            );
+
+            reg.apply_remote_snapshot(snap, |_| false, placeholder_factory);
+
+            assert_eq!(reg.tunnel_count(), 2);
+            // The wire primary lands verbatim — no local route probe ran
+            // (the client's route cache is unfed in remote mode).
+            assert_eq!(reg.primary(), Some(&ProfileId::new("corp")));
+            assert_eq!(reg.killswitch_state(), KillSwitchState::Armed);
+            let corp = reg.snapshot(&ProfileId::new("corp")).unwrap();
+            assert!(matches!(corp.state, Connection::Connected { .. }));
+            assert!(matches!(corp.role, Role::Primary { .. }));
+            assert_eq!(corp.interface_name.as_deref(), Some("utun7"));
+        }
+
+        #[test]
+        fn drops_entries_the_daemon_no_longer_reports() {
+            let mut reg: TunnelRegistry<MockTunnel> = TunnelRegistry::new();
+            reg.apply_remote_snapshot(
+                wire_snapshot(
+                    vec![connected_tunnel("corp", "utun7", default_route_v4())],
+                    Some("corp"),
+                ),
+                |_| false,
+                placeholder_factory,
+            );
+            assert_eq!(reg.tunnel_count(), 1);
+
+            reg.apply_remote_snapshot(wire_snapshot(vec![], None), |_| false, placeholder_factory);
+            assert_eq!(reg.tunnel_count(), 0);
+            assert!(reg.primary().is_none());
+        }
+
+        #[test]
+        fn keep_local_preserves_inflight_entry_across_removal_and_upsert() {
+            let mut reg: TunnelRegistry<MockTunnel> = TunnelRegistry::new();
+            // Client-side optimistic Connecting entry (write in flight).
+            reg.set_connecting(
+                ProfileId::new("corp"),
+                default_route_v4(),
+                SystemTime::now(),
+                1,
+                Duration::from_secs(60),
+                || Engine::new(MockTunnel::new(), resolver_for("corp")),
+            );
+
+            // Daemon hasn't registered the entry yet — snapshot is empty.
+            let inflight = ProfileId::new("corp");
+            reg.apply_remote_snapshot(
+                wire_snapshot(vec![], None),
+                |id| *id == inflight,
+                placeholder_factory,
+            );
+            let snap = reg.snapshot(&ProfileId::new("corp")).expect("kept");
+            assert!(
+                matches!(snap.state, Connection::Connecting { .. }),
+                "in-flight optimistic entry must survive an empty poll"
+            );
+
+            // Daemon now reports it Connected, but the write result
+            // hasn't landed client-side — the optimistic state still wins.
+            let inflight = ProfileId::new("corp");
+            reg.apply_remote_snapshot(
+                wire_snapshot(
+                    vec![connected_tunnel("corp", "utun7", default_route_v4())],
+                    Some("corp"),
+                ),
+                |id| *id == inflight,
+                placeholder_factory,
+            );
+            let snap = reg.snapshot(&ProfileId::new("corp")).unwrap();
+            assert!(matches!(snap.state, Connection::Connecting { .. }));
+        }
+
+        #[test]
+        fn upsert_reuses_existing_entry_and_refreshes_state() {
+            let mut reg: TunnelRegistry<MockTunnel> = TunnelRegistry::new();
+            reg.apply_remote_snapshot(
+                wire_snapshot(
+                    vec![connected_tunnel("corp", "utun7", default_route_v4())],
+                    Some("corp"),
+                ),
+                |_| false,
+                placeholder_factory,
+            );
+
+            // Next poll: the tunnel dropped to Reconnecting on the daemon.
+            let mut t = connected_tunnel("corp", "utun7", default_route_v4());
+            t.state = Connection::Reconnecting {
+                profile_id: ProfileId::new("corp"),
+                started_at: SystemTime::now(),
+                attempt: 2,
+                retry_budget_remaining: Duration::from_secs(30),
+                last_error: None,
+            };
+            t.role = Role::Reconnecting {
+                prior_role: Box::new(Role::Primary {
+                    allowed_ips: default_route_v4(),
+                }),
+            };
+            reg.apply_remote_snapshot(wire_snapshot(vec![t], None), |_| false, placeholder_factory);
+
+            assert_eq!(reg.tunnel_count(), 1);
+            let snap = reg.snapshot(&ProfileId::new("corp")).unwrap();
+            assert!(matches!(snap.state, Connection::Reconnecting { .. }));
+            // Reconnecting role recursion recovered the declared 0/0 —
+            // the entry still claims the default route for role derivation.
+            assert!(matches!(snap.role, Role::Reconnecting { .. }));
+        }
+
+        #[test]
+        fn suppressed_role_rederives_from_wire_primary_and_allowed_ips() {
+            // Two tunnels both declaring 0/0; the daemon elected "corp".
+            // The mirror must re-derive "lab" as AddressableSuppressed
+            // from the wire primary + the CIDRs recovered from its role.
+            let mut reg: TunnelRegistry<MockTunnel> = TunnelRegistry::new();
+            let mut lab = connected_tunnel("lab", "utun8", default_route_v4());
+            lab.role = Role::AddressableSuppressed {
+                allowed_ips: default_route_v4(),
+            };
+            reg.apply_remote_snapshot(
+                wire_snapshot(
+                    vec![connected_tunnel("corp", "utun7", default_route_v4()), lab],
+                    Some("corp"),
+                ),
+                |_| false,
+                placeholder_factory,
+            );
+
+            let snap = reg.snapshot(&ProfileId::new("lab")).unwrap();
+            assert!(
+                matches!(snap.role, Role::AddressableSuppressed { .. }),
+                "lab declared 0/0 but corp holds primary; got {:?}",
+                snap.role
+            );
+        }
     }
 }

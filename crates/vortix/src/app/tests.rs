@@ -27,6 +27,7 @@ fn test_app() -> App {
         runtime,
         engine_handle: None,
         registry: crate::vortix_core::engine::TunnelRegistry::new(),
+        daemon: None,
         should_quit: false,
         logs_scroll: 0,
         logs_auto_scroll: true,
@@ -3862,5 +3863,214 @@ fn real_ip_frozen_once_connected_then_thaws_on_disconnect() {
         app.runtime.real_ip.as_deref(),
         Some("198.51.100.99"),
         "real_ip must thaw and update after clean disconnect"
+    );
+}
+
+// ====================================================================
+// P4 daemon-attached mode (plan 2026-07-19-001): registry mirror +
+// write-result handling
+// ====================================================================
+
+fn wire_connected_tunnel(name: &str, iface: &str) -> crate::vortix_core::engine::TunnelSnapshot {
+    use crate::vortix_core::engine::state::{Connection, ConnectionHealth, DetailedConnectionInfo};
+    use crate::vortix_core::engine::Role;
+    let id = crate::vortix_core::profile::ProfileId::new(name);
+    crate::vortix_core::engine::TunnelSnapshot {
+        profile_id: id.clone(),
+        state: Connection::Connected {
+            profile_id: id,
+            since: std::time::SystemTime::now(),
+            health: ConnectionHealth::Healthy,
+            details: Box::new(DetailedConnectionInfo {
+                interface: iface.to_string(),
+                ..Default::default()
+            }),
+        },
+        role: Role::Primary {
+            allowed_ips: vec!["0.0.0.0/0".parse().expect("cidr")],
+        },
+        health: ConnectionHealth::Healthy,
+        interface_name: Some(iface.to_string()),
+        started_at: Some(std::time::SystemTime::now()),
+    }
+}
+
+fn wire_registry_snapshot(
+    tunnels: Vec<crate::vortix_core::engine::TunnelSnapshot>,
+    primary: Option<&str>,
+) -> crate::vortix_core::engine::registry_handle::RegistrySnapshot {
+    crate::vortix_core::engine::registry_handle::RegistrySnapshot {
+        tunnels,
+        primary: primary.map(crate::vortix_core::profile::ProfileId::new),
+        killswitch: crate::state::KillSwitchState::Disabled,
+    }
+}
+
+#[test]
+fn sync_daemon_state_mirrors_registry_and_feeds_ip_gate() {
+    let mut app = test_app();
+    add_profiles(&mut app, &["corp"]);
+
+    app.handle_message(Message::SyncDaemonState(wire_registry_snapshot(
+        vec![wire_connected_tunnel("corp", "utun7")],
+        Some("corp"),
+    )));
+
+    let id = crate::vortix_core::profile::ProfileId::new("corp");
+    let snap = app.registry.snapshot(&id).expect("mirrored entry");
+    assert!(matches!(
+        snap.state,
+        crate::vortix_core::engine::Connection::Connected { .. }
+    ));
+    assert_eq!(app.registry.primary(), Some(&id));
+    assert!(app.runtime.scanner_first_tick_done);
+    assert_eq!(app.runtime.last_kernel_session_count, 1);
+}
+
+#[test]
+fn sync_daemon_state_mirrors_tunnels_missing_from_local_catalog() {
+    // A tunnel the daemon owns but whose profile was deleted locally
+    // must still render (fallback placeholder engine).
+    let mut app = test_app();
+    app.handle_message(Message::SyncDaemonState(wire_registry_snapshot(
+        vec![wire_connected_tunnel("ghost", "utun9")],
+        Some("ghost"),
+    )));
+    let id = crate::vortix_core::profile::ProfileId::new("ghost");
+    assert!(app.registry.snapshot(&id).is_some());
+}
+
+#[test]
+fn daemon_inflight_write_survives_stale_snapshot_poll() {
+    let mut app = test_app();
+    add_profiles(&mut app, &["corp"]);
+    app.daemon = Some(crate::app::DaemonLink::new(std::path::PathBuf::from(
+        "/tmp/vortix-test.sock",
+    )));
+
+    // Optimistic Connecting entry + in-flight marker (what
+    // spawn_daemon_execute records before the Execute lands).
+    app.mirror_connecting_into_registry("corp");
+    let id = crate::vortix_core::profile::ProfileId::new("corp");
+    app.daemon.as_mut().unwrap().mark_inflight(id.clone());
+
+    // A poll raced ahead of the daemon registering the entry.
+    app.handle_message(Message::SyncDaemonState(wire_registry_snapshot(
+        vec![],
+        None,
+    )));
+    let snap = app.registry.snapshot(&id).expect("optimistic entry kept");
+    assert!(matches!(
+        snap.state,
+        crate::vortix_core::engine::Connection::Connecting { .. }
+    ));
+
+    // The write result lands: failure rolls the entry to Failed and
+    // clears the in-flight marker.
+    app.handle_message(Message::DaemonCommandResult {
+        profile: "corp".to_string(),
+        action: crate::message::DaemonWriteAction::Connect,
+        status: crate::message::DaemonWriteStatus::Failed,
+        error: Some("auth failed".to_string()),
+    });
+    assert!(!app.daemon.as_ref().unwrap().has_inflight());
+    let snap = app.registry.snapshot(&id).expect("failed entry kept");
+    assert!(matches!(
+        snap.state,
+        crate::vortix_core::engine::Connection::Disconnected {
+            last_failure: Some(_)
+        }
+    ));
+
+    // The next poll (daemon never saw the profile) may now clear it.
+    app.handle_message(Message::SyncDaemonState(wire_registry_snapshot(
+        vec![],
+        None,
+    )));
+    assert!(app.registry.snapshot(&id).is_none());
+}
+
+#[test]
+fn daemon_disconnect_result_success_runs_disconnect_finisher() {
+    let mut app = test_app();
+    add_profiles(&mut app, &["corp"]);
+    set_connected(&mut app, "corp");
+    app.daemon = Some(crate::app::DaemonLink::new(std::path::PathBuf::from(
+        "/tmp/vortix-test.sock",
+    )));
+    let id = crate::vortix_core::profile::ProfileId::new("corp");
+    app.daemon.as_mut().unwrap().mark_inflight(id.clone());
+
+    app.handle_message(Message::DaemonCommandResult {
+        profile: "corp".to_string(),
+        action: crate::message::DaemonWriteAction::Disconnect,
+        status: crate::message::DaemonWriteStatus::Completed,
+        error: None,
+    });
+
+    assert!(!app.daemon.as_ref().unwrap().has_inflight());
+    assert!(
+        app.registry.snapshot(&id).is_none(),
+        "disconnect finisher must drop the registry entry"
+    );
+}
+
+#[test]
+fn daemon_timeout_result_keeps_optimistic_state_and_inflight() {
+    // A transport timeout means "may still be working" — the profile
+    // must NOT be marked Failed and its in-flight marker must survive
+    // (expiry, not the result, releases it).
+    let mut app = test_app();
+    add_profiles(&mut app, &["corp"]);
+    app.daemon = Some(crate::app::DaemonLink::new(std::path::PathBuf::from(
+        "/tmp/vortix-test.sock",
+    )));
+    app.mirror_connecting_into_registry("corp");
+    let id = crate::vortix_core::profile::ProfileId::new("corp");
+    app.daemon.as_mut().unwrap().mark_inflight(id.clone());
+
+    app.handle_message(Message::DaemonCommandResult {
+        profile: "corp".to_string(),
+        action: crate::message::DaemonWriteAction::Connect,
+        status: crate::message::DaemonWriteStatus::TimedOut,
+        error: Some("read deadline elapsed".to_string()),
+    });
+
+    assert!(app.daemon.as_ref().unwrap().has_inflight());
+    let snap = app.registry.snapshot(&id).expect("entry kept");
+    assert!(
+        matches!(
+            snap.state,
+            crate::vortix_core::engine::Connection::Connecting { .. }
+        ),
+        "timeout must not roll the optimistic entry to Failed"
+    );
+}
+
+#[test]
+fn attach_daemon_disarms_persisted_killswitch_state() {
+    // With the scanner parked and no daemon-side kill switch until P6,
+    // an Armed state from a previous local session would render
+    // KS:Watch protection nothing enforces.
+    let mut app = test_app();
+    app.runtime.killswitch_mode = crate::state::KillSwitchMode::Auto;
+    app.runtime.killswitch_state = crate::state::KillSwitchState::Armed;
+
+    app.attach_daemon(std::path::PathBuf::from("/tmp/vortix-test.sock"));
+
+    assert_eq!(
+        app.runtime.killswitch_state,
+        crate::state::KillSwitchState::Disabled
+    );
+
+    // And the toggle refuses while attached (mode unchanged).
+    app.handle_message(Message::ToggleKillSwitch);
+    assert_eq!(
+        app.runtime.killswitch_mode,
+        crate::state::KillSwitchMode::Auto
+    );
+    assert_eq!(
+        app.runtime.killswitch_state,
+        crate::state::KillSwitchState::Disabled
     );
 }

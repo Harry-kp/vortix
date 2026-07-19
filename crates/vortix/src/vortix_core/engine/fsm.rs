@@ -219,6 +219,19 @@ impl<T: Tunnel> Engine<T> {
         };
     }
 
+    /// Bookkeeping-only: replace the FSM state wholesale with a
+    /// daemon-reported `Connection` (plan 2026-07-19-001 P4). The
+    /// daemon's own FSM already enforced transition legality; a client
+    /// mirroring its `RegistrySnapshot` must reproduce the state
+    /// verbatim — including variants the per-shape seeds can't express
+    /// (`Reconnecting`, `AwaitingUserInput`) and the health/details
+    /// carried inside `Connected`. Use
+    /// [`TunnelRegistry::apply_remote_snapshot`] from outside the FSM
+    /// rather than calling this directly.
+    pub fn seed_state(&mut self, state: Connection) {
+        self.state = state;
+    }
+
     /// Drive one input through the FSM. Returns the events emitted during
     /// the transition; the caller is expected to append them to the journal
     /// and broadcast.

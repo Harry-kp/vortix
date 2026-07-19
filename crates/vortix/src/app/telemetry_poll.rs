@@ -3,7 +3,7 @@
 use std::sync::mpsc;
 use std::time::SystemTime;
 
-use super::App;
+use super::{App, DaemonLink};
 use crate::constants;
 use crate::core::network_monitor::NetworkEvent;
 use crate::core::scanner;
@@ -106,6 +106,96 @@ impl App {
             let _ = tx.send(snapshot);
         });
         self.runtime.scanner_rx = Some(rx);
+    }
+
+    /// Daemon-attached counterpart of [`Self::poll_scanner`] (plan
+    /// 2026-07-19-001 P4): poll the daemon's multi-tunnel
+    /// `RegistrySnapshot` on a background thread and mirror it into
+    /// `app.registry`. Same spawn-on-demand pattern — one request in
+    /// flight at a time, collected on a later tick.
+    pub(crate) fn poll_daemon_state(&mut self) {
+        use super::daemon_link::PollSlot;
+
+        let result = match self.daemon.as_mut().map(DaemonLink::take_poll_result) {
+            None | Some(PollSlot::InFlight) => return,
+            Some(PollSlot::Idle) => None,
+            Some(PollSlot::Ready(result)) => Some(result),
+        };
+
+        if let Some(result) = result {
+            self.handle_daemon_poll_result(result);
+        }
+
+        // A failed poll may have detached us (dropping the link) —
+        // only a surviving link spawns the next request.
+        if let Some(link) = &mut self.daemon {
+            link.spawn_poll();
+        }
+    }
+
+    /// Route one poll outcome: fresh snapshots feed the registry
+    /// mirror; a timeout means the daemon is busy mid-write (its
+    /// registry actor runs jobs serially), so we keep the last state;
+    /// a version mismatch is loud per the U1 contract; anything else
+    /// means the daemon is gone — detach and let the local pipeline
+    /// resume next tick.
+    fn handle_daemon_poll_result(
+        &mut self,
+        result: Result<
+            crate::vortix_core::engine::registry_handle::RegistrySnapshot,
+            crate::daemon::client::ClientError,
+        >,
+    ) {
+        use crate::daemon::client::ClientError;
+        use crate::state::ToastType;
+
+        match result {
+            Ok(snapshot) => {
+                if let Some(link) = &mut self.daemon {
+                    if link.note_poll_success() {
+                        self.log("LINK: Daemon responsive again — state is live");
+                    }
+                }
+                self.handle_message(Message::SyncDaemonState(snapshot));
+            }
+            // One timeout = the serial registry actor is busy mid-write;
+            // a RUN of them = the daemon is alive but wedged and the
+            // rendered state has stopped being live. Warn once per run.
+            Err(ClientError::Timeout(_)) => {
+                if let Some(link) = &mut self.daemon {
+                    if link.note_poll_timeout() {
+                        self.log(
+                            "WARN: Daemon is not answering state polls — the panel may be \
+                             showing stale state until it recovers",
+                        );
+                        self.show_toast(
+                            "Daemon unresponsive — state may be stale".to_string(),
+                            ToastType::Warning,
+                        );
+                    }
+                }
+            }
+            Err(ClientError::VersionMismatch { daemon, client }) => {
+                self.log(&format!(
+                    "ERR: IPC protocol mismatch — daemon speaks v{daemon}, this vortix speaks v{client}; detaching"
+                ));
+                self.show_toast(
+                    format!("Daemon protocol mismatch (daemon v{daemon} / client v{client}) — running locally"),
+                    ToastType::Error,
+                );
+                self.detach_daemon();
+            }
+            Err(e) => {
+                self.log(&format!(
+                    "WARN: Daemon connection lost ({e}) — switching to local mode"
+                ));
+                self.show_toast(
+                    "Daemon connection lost — running locally".to_string(),
+                    ToastType::Warning,
+                );
+                self.detach_daemon();
+            }
+        }
     }
 
     /// Poll the network monitor for gateway changes.

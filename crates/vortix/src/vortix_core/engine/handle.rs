@@ -79,9 +79,8 @@ impl std::fmt::Debug for LocalHandle {
 
 /// Client-side handle to a daemon-hosted engine (plan 2026-07-18-001
 /// U1). Wraps a blocking [`IpcTransport`]; each call runs the exchange
-/// on the blocking pool. U1 ships the read path only — `execute` and
-/// `subscribe` land with the daemon-writes (U3) and streaming (U2)
-/// units.
+/// on the blocking pool. Carries the full surface: snapshot reads,
+/// registry reads, `execute` writes, and `subscribe` streaming.
 #[derive(Clone)]
 pub struct RemoteHandle {
     transport: Arc<dyn IpcTransport>,

@@ -346,6 +346,13 @@ impl App {
                     .feed_default_route_interface(default_route_interface);
                 self.handle_sync_system_state(sessions);
             }
+            Message::SyncDaemonState(snapshot) => self.handle_sync_daemon_state(snapshot),
+            Message::DaemonCommandResult {
+                profile,
+                action,
+                status,
+                error,
+            } => self.handle_daemon_command_result(&profile, action, status, error),
             Message::ConnectionTimeout(profile_name) => {
                 self.handle_connection_timeout(profile_name);
             }
@@ -721,9 +728,26 @@ impl App {
                     // For the one-time-only path (no save), the
                     // canonical plain auth file must not linger.
                     // The SCRV1 envelope cleanup happens in the
-                    // protocol layer after openvpn forks.
+                    // protocol layer after openvpn forks. On the
+                    // daemon path the file is read only after the IPC
+                    // round-trip, so deletion is deferred to the
+                    // write result (or marker expiry / link drop) —
+                    // an immediate delete would starve the daemon's
+                    // openvpn of credentials every time.
                     if otp.is_none() && !save {
-                        utils::delete_openvpn_auth_file(&profile_name);
+                        let profile_id = crate::vortix_core::profile::ProfileId::new(&profile_name);
+                        let deferred = self.daemon.as_mut().is_some_and(|link| {
+                            // Defer only when the connect actually went
+                            // out; a gated connect (overlay, dep error)
+                            // must not leave credentials on disk.
+                            link.is_inflight(&profile_id) && {
+                                link.defer_auth_cleanup(profile_name.clone());
+                                true
+                            }
+                        });
+                        if !deferred {
+                            utils::delete_openvpn_auth_file(&profile_name);
+                        }
                     }
                 } else {
                     // Save-only mode (from ManageAuth)
@@ -741,6 +765,19 @@ impl App {
 
     fn handle_toggle_killswitch(&mut self) {
         use crate::state::KillSwitchMode;
+
+        // Attached mode: no component enforces the kill switch until
+        // the daemon owns it (P6) — refuse instead of arming a state
+        // nothing watches (see `sync_killswitch` / `attach_daemon`).
+        if self.daemon_attached() {
+            self.log("SEC: Kill switch unavailable in daemon mode until the daemon owns it (P6)");
+            self.show_toast(
+                "Kill switch isn't available in daemon mode yet — stop the daemon to manage it"
+                    .to_string(),
+                ToastType::Warning,
+            );
+            return;
+        }
 
         // Cycle to next mode
         self.runtime.killswitch_mode = self.runtime.killswitch_mode.next();
@@ -1107,6 +1144,129 @@ impl App {
         }
     }
 
+    /// Daemon-attached counterpart of [`Self::handle_sync_system_state`]
+    /// (plan 2026-07-19-001 P4): mirror the daemon's polled
+    /// `RegistrySnapshot` into `app.registry`. No reconcile decisions,
+    /// no kill-switch side effects, no retry scheduling — the daemon
+    /// owns all of that; this client only renders its truth. Profiles
+    /// with a write in flight keep their optimistic local entry until
+    /// the write result lands.
+    fn handle_sync_daemon_state(
+        &mut self,
+        snapshot: crate::vortix_core::engine::registry_handle::RegistrySnapshot,
+    ) {
+        use crate::vortix_core::engine::state::Connection;
+
+        // Real-IP cache gate parity with the scanner path: the daemon's
+        // Connected set is the kernel-session count equivalent.
+        self.runtime.scanner_first_tick_done = true;
+        self.runtime.last_kernel_session_count = snapshot
+            .tunnels
+            .iter()
+            .filter(|t| matches!(t.state, Connection::Connected { .. }))
+            .count();
+
+        let inflight = self
+            .daemon
+            .as_mut()
+            .map(super::DaemonLink::live_inflight_ids)
+            .unwrap_or_default();
+        let profiles = self.runtime.profiles.clone();
+        self.registry.apply_remote_snapshot(
+            snapshot,
+            |id| inflight.contains(id),
+            |tunnel| {
+                profiles
+                    .iter()
+                    .find(|p| p.name == tunnel.profile_id.as_str())
+                    .map_or_else(
+                        || {
+                            // Tunnel known to the daemon but absent from the
+                            // local catalog (e.g. profile deleted locally).
+                            // Render-only placeholder; never driven.
+                            use crate::vortix_core::profile::{Profile, ProtocolKind};
+                            let profile = Profile::new(
+                                tunnel.profile_id.clone(),
+                                tunnel.profile_id.as_str(),
+                                ProtocolKind::WireGuard,
+                                std::path::PathBuf::new(),
+                            );
+                            crate::vortix_core::engine::Engine::new(
+                                crate::tunnel::TunnelKind::Mock(
+                                    crate::vortix_core::ports::tunnel::mock::MockTunnel::new(),
+                                ),
+                                move |_| Some(profile.clone()),
+                            )
+                        },
+                        |p| crate::app::connection::placeholder_engine_for_profile(p)(),
+                    )
+            },
+        );
+    }
+
+    /// Land the result of a daemon-routed write (plan 2026-07-19-001
+    /// P4). Completion is mostly a log line — the next snapshot poll
+    /// renders the daemon's resulting state; failure rolls the
+    /// optimistic registry entry to Failed; a transport timeout means
+    /// the daemon may still be working, so nothing is marked failed
+    /// and the poll is left to resync the true outcome.
+    fn handle_daemon_command_result(
+        &mut self,
+        profile: &str,
+        action: crate::message::DaemonWriteAction,
+        status: crate::message::DaemonWriteStatus,
+        error: Option<String>,
+    ) {
+        use crate::message::{DaemonWriteAction, DaemonWriteStatus};
+
+        if let Some(link) = &mut self.daemon {
+            match status {
+                // TimedOut: the daemon may still read a deferred
+                // one-time auth file — keep it until the in-flight
+                // marker expires (live_inflight_ids handles both).
+                DaemonWriteStatus::TimedOut => {}
+                DaemonWriteStatus::Completed | DaemonWriteStatus::Failed => {
+                    link.clear_inflight(&crate::vortix_core::profile::ProfileId::new(profile));
+                    if action == DaemonWriteAction::Connect {
+                        link.finish_auth_cleanup(profile);
+                    }
+                }
+            }
+        }
+
+        match (action, status) {
+            (DaemonWriteAction::Connect, DaemonWriteStatus::Completed) => {
+                self.log(&format!("STATUS: Daemon connected '{profile}'"));
+                self.runtime.last_connected_profile = Some(profile.to_string());
+                self.refresh_telemetry();
+            }
+            (DaemonWriteAction::Connect, DaemonWriteStatus::Failed) => {
+                let err = error.unwrap_or_else(|| "daemon refused the connect".to_string());
+                self.log(&format!("ERR: Daemon connect '{profile}' failed: {err}"));
+                self.mirror_failed_into_registry(profile, &err);
+                self.show_toast(format!("Connect failed: {err}"), ToastType::Error);
+            }
+            (DaemonWriteAction::Disconnect, DaemonWriteStatus::Completed) => {
+                self.complete_disconnect(profile);
+            }
+            (DaemonWriteAction::Disconnect, DaemonWriteStatus::Failed) => {
+                let err = error.unwrap_or_else(|| "daemon refused the disconnect".to_string());
+                self.log(&format!("ERR: Daemon disconnect '{profile}' failed: {err}"));
+                self.show_toast(format!("Disconnect failed: {err}"), ToastType::Error);
+            }
+            (_, DaemonWriteStatus::TimedOut) => {
+                self.log(&format!(
+                    "WARN: Daemon accepted the command for '{profile}' but hasn't reported a \
+                     result — it may still be working; state will resync from the daemon"
+                ));
+                self.show_toast(
+                    format!("Daemon still working on '{profile}' — state will resync"),
+                    ToastType::Warning,
+                );
+            }
+        }
+    }
+
     /// Scanner helper (P5b U-P5b-2): force-cleanup a profile stuck in
     /// the Disconnecting state past `disconnect_timeout`. The kernel
     /// interface is still up but the teardown isn't returning;
@@ -1461,12 +1621,17 @@ impl App {
     }
 
     fn handle_tick(&mut self) {
-        // 1. Connection Timeout Safeguard
-        if let ConnectionState::Connecting { started, profile } = self.legacy_state() {
-            if started.elapsed()
-                > std::time::Duration::from_secs(self.runtime.config.connect_timeout)
-            {
-                self.handle_message(Message::ConnectionTimeout(profile));
+        // 1. Connection Timeout Safeguard. Local-mode only: on the
+        // daemon path the Execute transport timeout owns the deadline,
+        // and this safeguard's cleanup would kill processes the daemon
+        // manages (plan 2026-07-19-001 P4).
+        if !self.daemon_attached() {
+            if let ConnectionState::Connecting { started, profile } = self.legacy_state() {
+                if started.elapsed()
+                    > std::time::Duration::from_secs(self.runtime.config.connect_timeout)
+                {
+                    self.handle_message(Message::ConnectionTimeout(profile));
+                }
             }
         }
         // 2. Expire toast
@@ -1478,8 +1643,14 @@ impl App {
         // 3. Process telemetry and background results (non-blocking)
         self.process_telemetry();
 
-        // 4. Poll scanner (spawn-on-demand, non-blocking)
-        self.poll_scanner();
+        // 4. Poll the state source (spawn-on-demand, non-blocking):
+        // the daemon's registry when attached, the kernel scanner
+        // otherwise (P4 — the attached TUI never scans or reconciles).
+        if self.daemon_attached() {
+            self.poll_daemon_state();
+        } else {
+            self.poll_scanner();
+        }
 
         // 5. Poll network monitor for gateway changes
         self.poll_network_monitor();

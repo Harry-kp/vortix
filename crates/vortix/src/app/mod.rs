@@ -23,11 +23,14 @@
 //! - `helpers` — Logging, scrolling, toast notifications, and utilities
 
 pub(crate) mod connection;
+mod daemon_link;
 mod helpers;
 mod input;
 mod profile;
 mod telemetry_poll;
 mod update;
+
+pub use daemon_link::DaemonLink;
 
 #[cfg(test)]
 mod tests;
@@ -112,15 +115,24 @@ pub struct App {
     /// `self.registry` (plan #001 U6).
     pub runtime: VpnRuntime,
 
-    /// Optional plan-005 `EngineHandle`. Non-load-bearing today — kept for
-    /// IPC / remote-control surfaces that drive a single tunnel through the
-    /// FSM actor. Multi-tunnel callers bypass this and use `self.registry`.
+    /// Plan-005 `EngineHandle`. Local mode: wraps the in-process FSM
+    /// actor (non-load-bearing; multi-tunnel callers use `self.registry`).
+    /// Daemon-attached (P4): carries `EngineHandle::Remote` for
+    /// handle-shaped consumers; the poll/write paths use
+    /// `self.daemon_socket` directly.
     pub engine_handle: Option<crate::vortix_core::engine::EngineHandle>,
 
     /// Multi-connection plan #001: the `TunnelRegistry` owns active tunnel
     /// FSMs. Panels read tunnel snapshots from here (sidebar, header,
     /// `connection_details`, security, chart).
     pub registry: TunnelRegistry<TunnelKind>,
+
+    /// Daemon attach state (plan 2026-07-19-001 P4). `Some` means a
+    /// running daemon owns all tunnel state: the registry is fed from
+    /// polled `RegistrySnapshot`s instead of the kernel scanner, and
+    /// connect/disconnect route through `Execute` over IPC. `None` is
+    /// the unchanged local mode (R11).
+    pub daemon: Option<DaemonLink>,
 
     /// Flag indicating the application should exit.
     pub should_quit: bool,
@@ -178,6 +190,7 @@ impl App {
             runtime,
             engine_handle: None,
             registry: TunnelRegistry::new(),
+            daemon: None,
 
             should_quit: false,
 
@@ -306,13 +319,56 @@ impl App {
 
 impl App {
     /// Attach an `EngineHandle` to the app (plan 005 U5 incremental
-    /// adoption). The handle is not yet load-bearing — the TUI still
-    /// mutates `self.engine` through `Deref` — but future units swap UI
-    /// reads / commands over to it.
+    /// adoption). Local-mode bootstrap only; the daemon-attached path
+    /// sets `engine_handle` to a `Remote` handle directly.
     #[must_use]
     pub fn with_engine_handle(mut self, handle: crate::vortix_core::engine::EngineHandle) -> Self {
         self.engine_handle = Some(handle);
         self
+    }
+
+    /// Whether a running daemon owns tunnel state for this session
+    /// (plan 2026-07-19-001 P4). Gates the scanner swap, the write
+    /// routing, and the connect-timeout safeguard.
+    #[must_use]
+    pub fn daemon_attached(&self) -> bool {
+        self.daemon.is_some()
+    }
+
+    /// Enter daemon-attached mode: state reads come from polled
+    /// `RegistrySnapshot`s, writes route through `Execute` over IPC,
+    /// and the local kernel scanner stays parked.
+    ///
+    /// Any persisted Armed kill-switch state is disarmed: with the
+    /// scanner parked there is no drop-handler, and the daemon has no
+    /// firewall logic until P6 — rendering `KS:Watch` here would claim
+    /// protection no component provides.
+    pub fn attach_daemon(&mut self, socket: std::path::PathBuf) {
+        self.log(&format!(
+            "LINK: Attached to vortix daemon at {} — it owns tunnel state and commands",
+            socket.display()
+        ));
+        if self.runtime.killswitch_state != crate::state::KillSwitchState::Disabled {
+            self.runtime.killswitch_state = crate::state::KillSwitchState::Disabled;
+            self.log(
+                "SEC: Kill switch disarmed — not enforced while a daemon owns tunnels \
+                 (daemon-side kill switch lands in P6)",
+            );
+            self.show_toast(
+                "Kill switch not enforced in daemon mode yet — disarmed".to_string(),
+                ToastType::Warning,
+            );
+        }
+        self.daemon = Some(DaemonLink::new(socket));
+    }
+
+    /// Leave daemon-attached mode (daemon vanished or spoke a different
+    /// protocol). Dropping the link parks the poll and clears in-flight
+    /// markers; the local pipeline — kernel scanner, adoption, retry —
+    /// resumes on the next tick and re-adopts tunnels the daemon
+    /// brought up (they stay in the kernel).
+    pub(crate) fn detach_daemon(&mut self) {
+        self.daemon = None;
     }
 
     /// Lightweight constructor for testing.
@@ -323,6 +379,7 @@ impl App {
             runtime,
             engine_handle: None,
             registry: TunnelRegistry::new(),
+            daemon: None,
 
             should_quit: false,
 

@@ -1,11 +1,12 @@
-//! Minimal blocking IPC client for CLI use (plan multi-connection D3).
+//! Minimal blocking IPC client shared by the CLI and the attached TUI
+//! (plan multi-connection D3; P4 added the TUI consumers).
 //!
-//! Read-only CLI ops (`vortix status`) call into the daemon when its
-//! socket is present and connectable, falling back to direct disk +
-//! scanner reads otherwise. This client speaks one request → one
-//! response on a fresh connection — no streaming, no pooling. The
-//! daemon today handles one client at a time anyway, and the bypass
-//! path means the client never tries to fight for the socket.
+//! Callers speak one request → one response on a fresh connection —
+//! no pooling; the daemon's accept loop is concurrent, so parallel
+//! clients don't serialize on each other. `subscribe` is the one
+//! streaming exception: it holds its connection open and forwards
+//! pushed events. When the daemon is unavailable, callers fall back
+//! to direct disk + scanner reads.
 //!
 //! Lives next to the server to share the framing/envelope vocabulary
 //! without exporting tokio-flavored types from `vortix-core`.
@@ -341,6 +342,34 @@ pub fn snapshot(
 ) -> Result<crate::vortix_core::engine::state::Connection, ClientError> {
     match request(socket_path, IpcOp::Snapshot)? {
         IpcResult::Snapshot { state } => Ok(state),
+        other => Err(ClientError::Unexpected(format!("{other:?}"))),
+    }
+}
+
+/// Convenience wrapper: ask the daemon for the full multi-tunnel
+/// `RegistrySnapshot` (plan 2026-07-19-001 P4 — the TUI's per-tick
+/// state source when attached). Blocking; call from a background
+/// thread, never the UI thread.
+///
+/// # Errors
+///
+/// See [`request`] — adds an `Unexpected` arm when the daemon answers
+/// with a non-registry success variant.
+pub fn registry_snapshot(
+    socket_path: &Path,
+) -> Result<crate::vortix_core::engine::registry_handle::RegistrySnapshot, ClientError> {
+    match request(socket_path, IpcOp::RegistrySnapshot)? {
+        IpcResult::RegistrySnapshot {
+            tunnels,
+            primary,
+            killswitch,
+        } => Ok(
+            crate::vortix_core::engine::registry_handle::RegistrySnapshot {
+                tunnels,
+                primary,
+                killswitch,
+            },
+        ),
         other => Err(ClientError::Unexpected(format!("{other:?}"))),
     }
 }

@@ -166,6 +166,52 @@ impl App {
         self.connect_profile_inner(idx, false, true);
     }
 
+    /// Spawn a background thread that runs `cmd` against the attached
+    /// daemon and reports back via [`Message::DaemonCommandResult`]
+    /// (plan 2026-07-19-001 P4). Marks the profile in-flight so polled
+    /// snapshots don't overwrite the optimistic registry entry while
+    /// the daemon processes the write.
+    fn spawn_daemon_execute(
+        &mut self,
+        profile_name: &str,
+        action: crate::message::DaemonWriteAction,
+        cmd: crate::vortix_core::engine::input::UserCommand,
+    ) {
+        use crate::vortix_core::ipc::{IpcOp, IpcResult};
+
+        let Some(link) = &mut self.daemon else {
+            return;
+        };
+        link.mark_inflight(ProfileId::new(profile_name));
+        let socket = link.socket.clone();
+        let cmd_tx = self.runtime.cmd_tx.clone();
+        let profile = profile_name.to_string();
+        std::thread::spawn(move || {
+            use crate::daemon::client::ClientError;
+            use crate::message::DaemonWriteStatus;
+
+            let result = crate::daemon::client::request(&socket, IpcOp::Execute(cmd));
+            let (status, error) = match result {
+                Ok(IpcResult::Accepted) => (DaemonWriteStatus::Completed, None),
+                Ok(other) => (
+                    DaemonWriteStatus::Failed,
+                    Some(format!("unexpected daemon response: {other:?}")),
+                ),
+                // The daemon holds the connection open for the tunnel
+                // lifecycle; a deadline elapsing means "may still be
+                // working", never "failed" (the CLI's Timeout contract).
+                Err(ClientError::Timeout(detail)) => (DaemonWriteStatus::TimedOut, Some(detail)),
+                Err(e) => (DaemonWriteStatus::Failed, Some(e.to_string())),
+            };
+            let _ = cmd_tx.send(Message::DaemonCommandResult {
+                profile,
+                action,
+                status,
+                error,
+            });
+        });
+    }
+
     #[allow(clippy::too_many_lines)]
     fn connect_profile_inner(&mut self, idx: usize, force: bool, skip_auth_overlay: bool) {
         // Clone needed data to release borrow on self
@@ -191,11 +237,31 @@ impl App {
             return;
         }
 
-        // Check root second
-        if !self.runtime.is_root {
+        // Check root second. Skipped when a daemon is attached — the
+        // daemon holds privilege, which is the whole no-sudo point
+        // (plan 2026-07-19-001 P4 / AE1).
+        if !self.daemon_attached() && !self.runtime.is_root {
             self.input_mode = InputMode::PermissionDenied {
                 action: format!("Manage {protocol}"),
             };
+            return;
+        }
+
+        // 2FA profiles need in-band OTP delivery the daemon path
+        // doesn't support yet — refuse with a pointer, matching the
+        // CLI's daemon-path behavior. Gated BEFORE the auth overlay so
+        // we never collect an OTP we can't deliver.
+        if self.daemon_attached()
+            && matches!(protocol, Protocol::OpenVPN)
+            && utils::read_openvpn_static_challenge_prompt(&config_path).is_some()
+        {
+            self.log(&format!(
+                "ERR: '{name}' requires interactive 2FA, which the daemon connect path doesn't support yet"
+            ));
+            self.show_toast(
+                "2FA profiles need the local path — stop the daemon and run with sudo".to_string(),
+                ToastType::Warning,
+            );
             return;
         }
 
@@ -270,6 +336,24 @@ impl App {
         // started_at + attempt counters from the retry HashMap).
         let started_at = std::time::SystemTime::now();
         self.mirror_connecting_into_registry_at(&name, started_at);
+
+        // Daemon-attached: the daemon executes the connect against its
+        // own per-profile engine (no local tunnel thread, no sudo).
+        // The optimistic Connecting entry above renders immediately;
+        // the daemon's snapshot takes over once the write lands.
+        if self.daemon_attached() {
+            self.log(&format!(
+                "ACTION: Connecting to '{name}' [{protocol}] via daemon..."
+            ));
+            self.spawn_daemon_execute(
+                &name,
+                crate::message::DaemonWriteAction::Connect,
+                crate::vortix_core::engine::input::UserCommand::Connect {
+                    profile_id: ProfileId::new(&name),
+                },
+            );
+            return;
+        }
         self.log(&format!("ACTION: Connecting to '{name}' [{protocol}]..."));
 
         let connect_timeout_secs = self.runtime.config.connect_timeout;
@@ -336,6 +420,15 @@ impl App {
     /// transitions and firewall calls.
     pub(crate) fn sync_killswitch(&mut self) {
         use crate::state::KillSwitchState;
+
+        // Attached mode: no component enforces the kill switch until
+        // the daemon owns it (P6) — the scanner's drop-handler is
+        // parked and the daemon has no firewall logic yet. Never arm
+        // (or render) protection nothing provides; `attach_daemon`
+        // disarmed any persisted Armed state for the same reason.
+        if self.daemon_attached() {
+            return;
+        }
 
         let is_connected = self.has_active_connection();
         let active = self.active_tunnels_for_killswitch();
@@ -821,6 +914,18 @@ impl App {
             // safety timeout starts fresh on this force-disconnect tick.
             self.mirror_disconnecting_into_registry(&name);
 
+            // Daemon-attached: escalate through the daemon (P4).
+            if self.daemon_attached() {
+                self.spawn_daemon_execute(
+                    &name,
+                    crate::message::DaemonWriteAction::Disconnect,
+                    crate::vortix_core::engine::input::UserCommand::ForceDisconnect {
+                        profile_id: Some(ProfileId::new(&name)),
+                    },
+                );
+                return;
+            }
+
             // Plan #004 U4: force-disconnect now routes through TunnelKind.
             // The OvpnTunnel's down() path already escalates to pkill if the
             // pid file is stale; treating the force-flag as equivalent to a
@@ -1015,6 +1120,20 @@ impl App {
         // renderers show the `◑` badge during the teardown window.
         self.mirror_disconnecting_into_registry(profile_name);
 
+        // Daemon-attached: the daemon owns the teardown (P4). No local
+        // tunnel thread; kill-switch transitions are parked in attached
+        // mode (see `sync_killswitch`) until the daemon owns them (P6).
+        if self.daemon_attached() {
+            self.spawn_daemon_execute(
+                profile_name,
+                crate::message::DaemonWriteAction::Disconnect,
+                crate::vortix_core::engine::input::UserCommand::Disconnect {
+                    profile_id: Some(profile_id),
+                },
+            );
+            return;
+        }
+
         // Sync kill switch (multi-tunnel-aware via the registry).
         self.sync_killswitch();
         if self.runtime.killswitch_state.is_blocking() {
@@ -1088,6 +1207,21 @@ impl App {
         self.log(&format!(
             "ACTION: Cancelling in-flight connect for '{name}'"
         ));
+
+        // Daemon-attached: a cancel is a daemon-routed disconnect. The
+        // daemon's registry actor runs jobs serially, so this lands
+        // after the in-flight connect completes and tears it down —
+        // the same "cancel = disconnect" semantic the CLI gets (P4).
+        if self.daemon_attached() {
+            self.spawn_daemon_execute(
+                &name,
+                crate::message::DaemonWriteAction::Disconnect,
+                crate::vortix_core::engine::input::UserCommand::Disconnect {
+                    profile_id: Some(ProfileId::new(&name)),
+                },
+            );
+            return;
+        }
 
         // Registry-first: if the FSM tracks this connect, drive a
         // Disconnect through it.
@@ -1193,7 +1327,7 @@ fn legacy_to_core_details(
 /// to satisfy the bound — not because the engine ever calls into it.
 /// When U7 lands and the connect path drives the registry directly,
 /// this whole helper becomes dead code.
-fn placeholder_engine_for_profile(
+pub(crate) fn placeholder_engine_for_profile(
     profile: &crate::state::VpnProfile,
 ) -> impl FnOnce() -> crate::vortix_core::engine::Engine<crate::tunnel::TunnelKind> {
     let resolved_profile = profile_for_resolver(profile);
