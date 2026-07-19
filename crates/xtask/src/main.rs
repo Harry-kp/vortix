@@ -22,6 +22,8 @@ enum Command {
     CheckProtocolLeak,
     /// Verify no shell-outs to system binaries that the `CommandRunner` port replaced.
     CheckNoShellRegressions,
+    /// Freeze control-plane ownership while the canonical service replaces legacy writers.
+    CheckControlBoundaries,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -31,6 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::CheckPlatformLeak => check_platform_leak(),
         Command::CheckProtocolLeak => check_protocol_leak(),
         Command::CheckNoShellRegressions => check_no_shell_regressions(),
+        Command::CheckControlBoundaries => check_control_boundaries(),
     }
 }
 
@@ -462,6 +465,262 @@ fn find_forbidden_oneshot(line: &str) -> Option<&'static str> {
     FORBIDDEN_SHELL_OUTS.iter().copied().find(|&p| p == program)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ControlBoundaryKind {
+    ClientMutationImport,
+    SeedOrMirrorWriter,
+    RootPrivilegeRequest,
+    UnboundedChannel,
+}
+
+impl ControlBoundaryKind {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::ClientMutationImport => "direct client mutation-layer import",
+            Self::SeedOrMirrorWriter => "production seed/mirror writer",
+            Self::RootPrivilegeRequest => "root privilege request outside an owner",
+            Self::UnboundedChannel => "unbounded production channel",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ControlBoundaryViolation {
+    kind: ControlBoundaryKind,
+    path: String,
+    line: usize,
+    source: String,
+}
+
+/// Existing migration bridges are frozen as occurrence budgets instead of
+/// exempting entire directories. A new occurrence in one of these files still
+/// fails. The named unit must reduce/remove its budget when it deletes the
+/// bridge.
+const LEGACY_CONTROL_BUDGETS: &[(&str, ControlBoundaryKind, usize, &str)] = &[
+    (
+        "crates/vortix/src/app/connection.rs",
+        ControlBoundaryKind::ClientMutationImport,
+        1,
+        "U8 removes the App-side protocol parser",
+    ),
+    (
+        "crates/vortix/src/cli/commands.rs",
+        ControlBoundaryKind::ClientMutationImport,
+        1,
+        "U7 removes the CLI process probe",
+    ),
+    (
+        "crates/vortix/src/cli/report.rs",
+        ControlBoundaryKind::ClientMutationImport,
+        3,
+        "U7 moves report probes behind the control boundary",
+    ),
+    (
+        "crates/vortix/src/app/connection.rs",
+        ControlBoundaryKind::SeedOrMirrorWriter,
+        11,
+        "U8 deletes the TUI mirror bridge",
+    ),
+    (
+        "crates/vortix/src/app/update.rs",
+        ControlBoundaryKind::SeedOrMirrorWriter,
+        4,
+        "U8 deletes the TUI mirror bridge",
+    ),
+    (
+        "crates/vortix/src/vortix_core/engine/fsm.rs",
+        ControlBoundaryKind::SeedOrMirrorWriter,
+        5,
+        "U14 deletes seed APIs after cutover",
+    ),
+    (
+        "crates/vortix/src/vortix_core/engine/registry.rs",
+        ControlBoundaryKind::SeedOrMirrorWriter,
+        8,
+        "U14 deletes seed calls after cutover",
+    ),
+    (
+        "crates/vortix/src/vortix_core/journal/mod.rs",
+        ControlBoundaryKind::UnboundedChannel,
+        2,
+        "U6 replaces the journal transport with bounded backpressure",
+    ),
+    (
+        "crates/vortix/src/vortix_core/journal/writer.rs",
+        ControlBoundaryKind::UnboundedChannel,
+        2,
+        "U6 replaces the journal transport with bounded backpressure",
+    ),
+];
+
+fn check_control_boundaries() -> Result<(), Box<dyn std::error::Error>> {
+    let root = workspace_root()?;
+    let violations = scan_control_boundaries_at(&root)?;
+    if violations.is_empty() {
+        eprintln!("xtask check-control-boundaries: ok (legacy budgets unchanged)");
+        return Ok(());
+    }
+
+    eprintln!(
+        "xtask check-control-boundaries: {} violation(s) — clients must use the control contract; writers, privilege and queue ownership stay behind their approved boundaries.",
+        violations.len()
+    );
+    for violation in violations {
+        eprintln!(
+            "  {}:{}: {}: {}",
+            violation.path,
+            violation.line,
+            violation.kind.label(),
+            violation.source
+        );
+    }
+    std::process::exit(1)
+}
+
+fn scan_control_boundaries_at(
+    root: &Path,
+) -> Result<Vec<ControlBoundaryViolation>, Box<dyn std::error::Error>> {
+    use std::collections::HashMap;
+
+    let crates_dir = root.join("crates");
+    let mut candidates = Vec::new();
+    let walker = ignore::WalkBuilder::new(&crates_dir)
+        .hidden(false)
+        .git_ignore(true)
+        .build();
+
+    for result in walker {
+        let Ok(entry) = result else { continue };
+        let path = entry.path();
+        if !path.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+            continue;
+        }
+        let Ok(relative) = path.strip_prefix(root) else {
+            continue;
+        };
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        if relative.starts_with("crates/xtask/")
+            || relative.contains("/tests/")
+            || relative.ends_with("/tests.rs")
+        {
+            continue;
+        }
+        let content = std::fs::read_to_string(path)?;
+        let mut pending_test_cfg = false;
+        let mut skipping_test_item = false;
+        let mut test_item_indent = 0usize;
+        for (index, line) in content.lines().enumerate() {
+            let trimmed = line.trim_start();
+
+            if skipping_test_item {
+                let indent = line.len() - trimmed.len();
+                if indent == test_item_indent && (trimmed == "}" || trimmed == "};") {
+                    skipping_test_item = false;
+                }
+                continue;
+            }
+
+            if trimmed == "#[cfg(test)]" {
+                pending_test_cfg = true;
+                test_item_indent = line.len() - trimmed.len();
+                continue;
+            }
+
+            if pending_test_cfg && trimmed.starts_with("#[") {
+                continue;
+            }
+
+            if pending_test_cfg {
+                if trimmed.ends_with(';') {
+                    pending_test_cfg = false;
+                } else if let Some(open) = line.find('{') {
+                    pending_test_cfg = false;
+                    skipping_test_item = line[open + 1..].find('}').is_none();
+                }
+                continue;
+            }
+
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            let kind = control_boundary_kind(&relative, line);
+            if let Some(kind) = kind {
+                candidates.push(ControlBoundaryViolation {
+                    kind,
+                    path: relative.clone(),
+                    line: index + 1,
+                    source: trimmed.to_string(),
+                });
+            }
+        }
+    }
+
+    let mut seen: HashMap<(String, ControlBoundaryKind), usize> = HashMap::new();
+    let mut violations = Vec::new();
+    for candidate in candidates {
+        let key = (candidate.path.clone(), candidate.kind);
+        let count = seen.entry(key).or_default();
+        *count += 1;
+        let budget = legacy_control_budget(&candidate.path, candidate.kind);
+        if *count > budget {
+            violations.push(candidate);
+        }
+    }
+    Ok(violations)
+}
+
+fn control_boundary_kind(path: &str, line: &str) -> Option<ControlBoundaryKind> {
+    let is_client = path.starts_with("crates/vortix/src/app/")
+        || path.starts_with("crates/vortix/src/cli/")
+        || path.starts_with("crates/vortix/src/ui/");
+    let direct_mutation_layer = line.contains("crate::vortix_protocol_")
+        || line.contains("crate::vortix_platform_")
+        || line.contains("crate::vortix_process::");
+    if is_client && direct_mutation_layer {
+        return Some(ControlBoundaryKind::ClientMutationImport);
+    }
+
+    let seed_or_mirror = line.contains(".seed_")
+        || line.contains(".mirror_")
+        || line.contains("fn seed_")
+        || line.contains("fn mirror_");
+    if seed_or_mirror {
+        return Some(ControlBoundaryKind::SeedOrMirrorWriter);
+    }
+
+    if line.contains(".privilege(PrivilegeReq::Root)") && !is_privilege_owner(path) {
+        return Some(ControlBoundaryKind::RootPrivilegeRequest);
+    }
+
+    let unbounded = line.contains("unbounded_channel")
+        || line.contains("UnboundedSender")
+        || line.contains("UnboundedReceiver")
+        || line.contains("async_channel::unbounded")
+        || line.contains("crossbeam_channel::unbounded")
+        || line.contains("flume::unbounded");
+    if unbounded {
+        return Some(ControlBoundaryKind::UnboundedChannel);
+    }
+
+    None
+}
+
+fn is_privilege_owner(path: &str) -> bool {
+    path.starts_with("crates/vortix/src/vortix_protocol_")
+        || path.starts_with("crates/vortix/src/vortix_platform_")
+        || path.starts_with("crates/vortix/src/helper/")
+        || path.starts_with("crates/vortix/src/privileged/")
+}
+
+fn legacy_control_budget(path: &str, kind: ControlBoundaryKind) -> usize {
+    LEGACY_CONTROL_BUDGETS
+        .iter()
+        .find_map(|(allowed_path, allowed_kind, count, _removal)| {
+            (*allowed_path == path && *allowed_kind == kind).then_some(*count)
+        })
+        .unwrap_or(0)
+}
+
 fn workspace_root() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
     // `cargo xtask` runs from the workspace root by convention; CARGO_MANIFEST_DIR
     // points at `crates/xtask` so step up two levels.
@@ -472,4 +731,126 @@ fn workspace_root() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
         .ok_or("CARGO_MANIFEST_DIR has no grandparent")?
         .to_path_buf();
     Ok(root)
+}
+
+#[cfg(test)]
+mod control_boundary_tests {
+    use super::{scan_control_boundaries_at, ControlBoundaryKind};
+    use std::path::{Path, PathBuf};
+
+    struct Fixture {
+        root: PathBuf,
+    }
+
+    impl Fixture {
+        fn new(name: &str) -> Self {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "vortix-xtask-{name}-{}-{}",
+                std::process::id(),
+                NEXT_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("crates/vortix/src")).unwrap();
+            Self { root }
+        }
+
+        fn write(&self, relative: &str, body: &str) {
+            let path = self.root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+
+        fn root(&self) -> &Path {
+            &self.root
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn rejects_direct_client_mutation_imports() {
+        let fixture = Fixture::new("client-import");
+        fixture.write(
+            "crates/vortix/src/cli/new_writer.rs",
+            "use crate::vortix_protocol_wireguard::WgTunnel;\n",
+        );
+
+        let violations = scan_control_boundaries_at(fixture.root()).unwrap();
+        assert!(violations
+            .iter()
+            .any(|v| v.kind == ControlBoundaryKind::ClientMutationImport));
+    }
+
+    #[test]
+    fn rejects_seed_mirror_root_and_unbounded_leaks() {
+        let fixture = Fixture::new("writer-leaks");
+        fixture.write(
+            "crates/vortix/src/core/new_writer.rs",
+            "engine.seed_connected_state(id, details, since);\n",
+        );
+        fixture.write(
+            "crates/vortix/src/core/root.rs",
+            "let spec = spec.privilege(PrivilegeReq::Root);\n",
+        );
+        fixture.write(
+            "crates/vortix/src/control/queue.rs",
+            "let (tx, rx) = mpsc::unbounded_channel();\n",
+        );
+
+        let violations = scan_control_boundaries_at(fixture.root()).unwrap();
+        for kind in [
+            ControlBoundaryKind::SeedOrMirrorWriter,
+            ControlBoundaryKind::RootPrivilegeRequest,
+            ControlBoundaryKind::UnboundedChannel,
+        ] {
+            assert!(
+                violations.iter().any(|v| v.kind == kind),
+                "missing {kind:?} violation: {violations:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn approved_owners_pass_and_legacy_budget_cannot_grow() {
+        let approved = Fixture::new("approved-owner");
+        approved.write(
+            "crates/vortix/src/vortix_platform_linux/firewall.rs",
+            "let spec = spec.privilege(PrivilegeReq::Root);\n",
+        );
+        assert!(scan_control_boundaries_at(approved.root())
+            .unwrap()
+            .is_empty());
+
+        let legacy = Fixture::new("legacy-budget");
+        legacy.write(
+            "crates/vortix/src/vortix_core/journal/mod.rs",
+            "mpsc::unbounded_channel();\nmpsc::unbounded_channel();\nmpsc::unbounded_channel();\n",
+        );
+        let violations = scan_control_boundaries_at(legacy.root()).unwrap();
+        assert!(violations
+            .iter()
+            .any(|v| v.kind == ControlBoundaryKind::UnboundedChannel));
+    }
+
+    #[test]
+    fn production_after_inline_test_module_is_still_scanned() {
+        let fixture = Fixture::new("production-after-tests");
+        fixture.write(
+            "crates/vortix/src/cli/new_writer.rs",
+            "#[cfg(test)]\nuse crate::vortix_process::CommandSpec;\n\n#[cfg(test)]\nfn ignored_helper() {\n    mpsc::unbounded_channel();\n}\n\n#[cfg(test)]\nmod tests {\n    fn ignored() {\n        engine.seed_connected_state(id, details, since);\n    }\n}\n\nfn production() {\n    crate::vortix_process::run_to_output(spec);\n}\n",
+        );
+
+        let violations = scan_control_boundaries_at(fixture.root()).unwrap();
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert_eq!(
+            violations[0].kind,
+            ControlBoundaryKind::ClientMutationImport
+        );
+    }
 }
