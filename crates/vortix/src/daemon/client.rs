@@ -1,5 +1,5 @@
 //! Minimal blocking IPC client shared by the CLI and the attached TUI
-//! (plan multi-connection D3; P4 added the TUI consumers).
+//!.
 //!
 //! Callers speak one request → one response on a fresh connection —
 //! no pooling; the daemon's accept loop is concurrent, so parallel
@@ -42,7 +42,7 @@ pub enum ClientError {
     /// op we sent. Carries a description string for diagnostics.
     Unexpected(String),
     /// Peer speaks a different IPC protocol version. Loud by contract
-    /// (AE8) — callers must not fold this into the silent bypass path.
+    /// — callers must not fold this into the silent bypass path.
     VersionMismatch { daemon: u32, client: u32 },
     /// The connection was made but the daemon didn't answer within the
     /// read deadline — present but slow. Kept distinct from `Io` so a
@@ -161,7 +161,7 @@ pub fn request(socket_path: &Path, op: IpcOp) -> Result<IpcResult, ClientError> 
 
     // Version gate on both directions: a pre-versioning daemon answers
     // with the serde default (0); a newer daemon names the mismatch as
-    // a typed error. Both surface loudly (AE8).
+    // a typed error. Both surface loudly.
     if let Err(IpcError::VersionMismatch { daemon, client }) = &resp.result {
         return Err(ClientError::VersionMismatch {
             daemon: *daemon,
@@ -347,8 +347,7 @@ pub fn snapshot(
 }
 
 /// Convenience wrapper: ask the daemon for the full multi-tunnel
-/// `RegistrySnapshot` (plan 2026-07-19-001 P4 — the TUI's per-tick
-/// state source when attached). Blocking; call from a background
+/// `RegistrySnapshot`. Blocking; call from a background
 /// thread, never the UI thread.
 ///
 /// # Errors

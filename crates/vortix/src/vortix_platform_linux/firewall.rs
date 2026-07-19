@@ -2,12 +2,12 @@
 //!
 //! Prefers iptables when available, falls back to nftables (nft).
 //!
-//! Plan multi-connection U9: the iptables backend now synthesises the full
+//! The iptables backend now synthesises the full
 //! ruleset in memory and feeds it to `iptables-restore` (and
 //! `ip6tables-restore` for IPv6 server IPs) via stdin. iptables-restore
 //! performs an atomic in-kernel replace, so there is no leak window between
 //! the previous and new rulesets — mirrors the `nft -f -` pattern already
-//! in the nftables branch and the macOS `pfctl -f -` pattern from U10.
+//! in the nftables branch and the macOS `pfctl -f -` pattern.
 //!
 //! Ruleset shape (per active tunnel set):
 //!   1. Default-drop egress on OUTPUT.
@@ -294,7 +294,7 @@ impl IptablesFirewall {
 
     /// Tear down iptables state. Restore the default-ACCEPT OUTPUT policy
     /// via a minimal `iptables-restore` ruleset, and remove any legacy
-    /// `VORTIX_KILLSWITCH` chain the pre-U9 implementation may have left
+    /// `VORTIX_KILLSWITCH` chain the legacy implementation may have left
     /// behind.
     fn teardown_iptables() {
         // Reset OUTPUT policy and clear filter table via iptables-restore.
@@ -303,7 +303,7 @@ impl IptablesFirewall {
         let _ = Self::iptables_restore_stdin(reset.as_bytes());
         let _ = Self::ip6tables_restore_stdin(reset.as_bytes());
 
-        // Best-effort: remove the legacy custom chain if a pre-U9 build
+        // Best-effort: remove the legacy custom chain if an older build
         // installed it. Errors ignored — chain may not exist.
         let _ = Self::iptables(&["-D", "OUTPUT", "-j", CHAIN_NAME]);
         let _ = Self::iptables(&["-F", CHAIN_NAME]);

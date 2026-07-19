@@ -1,4 +1,4 @@
-//! Live link to a running daemon (plan 2026-07-19-001 P4).
+//! Live link to a running daemon.
 //!
 //! `DaemonLink` existing on [`App`](super::App) IS the attached state:
 //! registry reads come from polled `RegistrySnapshot`s, writes route

@@ -1,4 +1,4 @@
-//! Daemon-side supervision (plan 2026-07-18-001 U2, merged-U4).
+//! Daemon-side supervision.
 //!
 //! The supervisor is the headless equivalent of the TUI's scanner
 //! reconciliation loop. On each tick it compares the daemon-owned
@@ -249,7 +249,7 @@ struct RetryTrack {
 
 /// Resolves the per-reconnect context for a profile: its declared
 /// `AllowedIPs` plus a fresh `Disconnected` `Engine<TunnelKind>` to drive
-/// the connect through the registry (plan 2026-07-19-001 P1). Returns
+/// the connect through the registry. Returns
 /// `None` when the profile isn't resolvable or engine prerequisites are
 /// missing. Injected so the loop is unit-testable without real tunnels;
 /// in production it wraps `daemon::connect_allowed_ips` + `build_engine`.
@@ -267,7 +267,7 @@ const SCAN_TIMEOUT_SECS: u64 = 15;
 /// The daemon's headless supervision loop: on each tick, scan the kernel
 /// for live sessions, reconcile them against the daemon-owned registry
 /// (adopt new, finalize disconnects, detect drops), and drive headless
-/// auto-reconnect for tunnels that dropped unexpectedly (AE2/AE3). Runs
+/// auto-reconnect for tunnels that dropped unexpectedly. Runs
 /// until the registry owner task terminates (daemon shutdown).
 ///
 /// `reconnect_ctx` resolves a profile's `AllowedIPs` + a fresh engine per

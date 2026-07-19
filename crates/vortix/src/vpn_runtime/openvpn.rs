@@ -2,7 +2,7 @@
 //! probe.
 //!
 //! Both the TUI and the CLI need to assert `OpenVPN` ≥ 2.4 before a
-//! connect can proceed (plan 001 U14 / R13) — older builds silently
+//! connect can proceed — older builds silently
 //! ignore `--pull-filter` and leak pushed DNS into the primary tunnel's
 //! resolver. The probe lives here so both surfaces resolve through the
 //! same `VpnRuntime::check_dependencies` call site instead of one
@@ -15,7 +15,7 @@ use crate::vortix_process::{self, CommandSpec};
 
 /// Semantic version of an installed `openvpn` binary, as reported by
 /// `openvpn --version`. Used by `check_dependencies` to assert the
-/// `--pull-filter` multi-tunnel-DNS-suppression baseline (plan 001 U14, R13).
+/// `--pull-filter` multi-tunnel-DNS-suppression baseline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct OvpnVersion {
     pub major: u32,
@@ -25,7 +25,7 @@ pub struct OvpnVersion {
 
 impl OvpnVersion {
     /// Minimum `OpenVPN` release supporting `--pull-filter` reliably. Anything
-    /// older fails multi-tunnel's DNS-scoping precondition (R13).
+    /// older fails multi-tunnel's DNS-scoping precondition.
     const MIN_MULTI_TUNNEL: Self = Self {
         major: 2,
         minor: 4,
@@ -87,7 +87,7 @@ pub fn parse_openvpn_version(stdout: &str) -> Option<OvpnVersion> {
     })
 }
 
-/// Cached outcome of probing `openvpn --version` (plan 001 U14). The subprocess
+/// Cached outcome of probing `openvpn --version`. The subprocess
 /// runs at most once per process lifetime; subsequent dependency checks reuse
 /// the cached value.
 static OVPN_VERSION_PROBE: OnceLock<OvpnVersionProbe> = OnceLock::new();
@@ -112,7 +112,7 @@ pub fn probe_openvpn_version() -> OvpnVersionProbe {
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn probe_openvpn_version_uncached() -> OvpnVersionProbe {
-    // xtask:allow-protocol-leak: dependency-version probe runs before any tunnel exists; pre-flight gate (R13)
+    // xtask:allow-protocol-leak: dependency-version probe runs before any tunnel exists; pre-flight gate
     let version_output = vortix_process::run_to_output(
         CommandSpec::oneshot("openvpn", vec!["--version".into()]).timeout(PROBE_TIMEOUT),
     );
@@ -127,7 +127,7 @@ fn probe_openvpn_version_uncached() -> OvpnVersionProbe {
         }
     }
 
-    // xtask:allow-protocol-leak: dependency-feature probe runs before any tunnel exists; pre-flight gate (R13)
+    // xtask:allow-protocol-leak: dependency-feature probe runs before any tunnel exists; pre-flight gate
     let help_output = vortix_process::run_to_output(
         CommandSpec::oneshot("openvpn", vec!["--help".into()]).timeout(PROBE_TIMEOUT),
     );
@@ -147,7 +147,7 @@ fn probe_openvpn_version_uncached() -> OvpnVersionProbe {
 
 #[cfg(test)]
 mod tests {
-    //! Tests for plan 001 U14 — `OpenVPN` `--version` parsing and the 2.4+
+    //! Tests for — `OpenVPN` `--version` parsing and the 2.4+
     //! precondition assertion. The parse helper is pure so we can cover the
     //! happy path, the major-bump edge case, and the malformed-output
     //! fallback without spawning a subprocess.

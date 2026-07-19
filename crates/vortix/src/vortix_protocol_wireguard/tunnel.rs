@@ -23,13 +23,13 @@ use crate::vortix_protocol_wireguard::parser::parse_wg_conf;
 /// user-space backends land with idea 5's daemon work.
 ///
 /// `is_secondary` (default `false`) routes connect-time through the DNS-
-/// scoping path (plan #009 U13): the user's `.conf` is rewritten with
+/// scoping path: the user's `.conf` is rewritten with
 /// `DNS = …` lines stripped, written under
 /// `${config_dir}/tmp/${session_id}/${basename}` at mode `0o600`, and
 /// `wg-quick up` is invoked against the rewritten copy. Primaries keep the
 /// existing fast path (no copy, original config used directly).
 ///
-/// The `TunnelRegistry` (plan #009 U5) flips `is_secondary` via
+/// The `TunnelRegistry` flips `is_secondary` via
 /// [`WgTunnel::with_secondary`] before calling `up()` once multi-connection
 /// wiring lands; until then no production callsite sets it and behaviour is
 /// identical to v0.3.x.
@@ -52,7 +52,7 @@ impl WgTunnel {
     }
 
     /// Builder: mark this tunnel as a secondary in a multi-tunnel session
-    /// (plan #009 U13). When `true`, `up()` reads the user's `.conf`, strips
+    ///. When `true`, `up()` reads the user's `.conf`, strips
     /// any `DNS = …` directive, and writes the result to a per-session temp
     /// path at mode `0o600`; `wg-quick up` runs against that temp path. The
     /// temp file's basename matches the original so wg-quick's
@@ -224,7 +224,7 @@ fn cleanup_secondary_temp_config(temp_path: &Path) {
 }
 
 /// Minimal `WireGuard` status — extended once the binary-side scanner moves
-/// into this crate (deferred to plan #005).
+/// into this crate (deferred).
 #[derive(Debug, Default)]
 pub struct WgStatus {
     pub interface_name: String,
@@ -463,7 +463,7 @@ impl Tunnel for WgTunnel {
 
     fn status(&self, handle: &TunnelHandle) -> Result<TunnelStatus, TunnelError> {
         // Minimal status today — the engine still uses the binary-side
-        // scanner for richer wg-show parsing until plan #005 relocates it.
+        // scanner for richer wg-show parsing until the async engine migration relocates it.
         Ok(TunnelStatus {
             handle: handle.clone(),
             bytes_rx: 0,
@@ -517,7 +517,7 @@ mod tests {
         assert_eq!(interface_from_path(&p), "corp");
     }
 
-    // --- U2: resolve_kernel_iface contract ---
+    // --- resolve_kernel_iface contract ---
 
     #[test]
     fn resolve_kernel_iface_uses_port_result_when_present() {
@@ -542,7 +542,7 @@ mod tests {
     #[test]
     fn resolve_kernel_iface_preserves_port_result_even_when_equal_to_basename() {
         // Edge: Mock variant returns `Some(name)` for `wg_present=true`
-        // (the legacy default before U2 added the override). This MUST
+        // (the legacy default before the override existed). This MUST
         // be preserved verbatim — the helper has no business stripping
         // the port's answer just because it happens to equal the
         // basename.
@@ -551,7 +551,7 @@ mod tests {
         assert_eq!(resolved, "corp");
     }
 
-    // --- U13: DNS scoping for secondaries ---
+    // --- DNS scoping for secondaries ---
 
     #[test]
     fn default_is_not_secondary() {

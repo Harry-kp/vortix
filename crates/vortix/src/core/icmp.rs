@@ -1,4 +1,4 @@
-//! ICMP echo latency probe (plan 002 U10).
+//! ICMP echo latency probe.
 //!
 //! Replaces the `ping -c 3 -i 0.2 -W <ms> <target>` shell-out in
 //! `core::telemetry::fetch_latency`. The packet is hand-rolled from

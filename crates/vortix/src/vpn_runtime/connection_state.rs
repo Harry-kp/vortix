@@ -62,7 +62,7 @@ pub struct DetailedConnectionInfo {
 
 /// VPN connection state machine (legacy single-tunnel mirror).
 ///
-/// Plan #001 U7 will retire this in favour of the per-tunnel
+/// A follow-up will retire this in favour of the per-tunnel
 /// [`crate::vortix_core::engine::state::Connection`] FSM owned by
 /// [`crate::vortix_core::engine::TunnelRegistry`].
 #[derive(Clone, Debug, PartialEq, Default)]

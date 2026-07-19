@@ -6,8 +6,7 @@
 //! tunnel's retry is independent — a connect-failure on profile A no
 //! longer overwrites or blocks an auto-reconnect on profile B.
 //!
-//! Plan P5b U-P5b-1: per-profile retry. See
-//! `docs/plans/2026-05-30-002-refactor-retire-legacy-connectionstate-plan.md`.
+//! Plan per-profile retry. See
 
 /// Per-profile retry attempt bookkeeping.
 ///
@@ -41,7 +40,7 @@ pub struct RetryState {
 /// `base * 2^(attempt-1)`, saturating, capped at `max_delay`. The shift
 /// is clamped to 63 to avoid UB on the left-shift for pathological
 /// attempt counts. Pure policy shared by the TUI retry ladder and the
-/// daemon supervisor (plan 2026-07-18-001 U2) so both compute identical
+/// daemon supervisor so both compute identical
 /// delays.
 #[must_use]
 pub fn backoff_delay_secs(base: u64, max_delay: u64, attempt: u32) -> u64 {
@@ -53,7 +52,7 @@ pub fn backoff_delay_secs(base: u64, max_delay: u64, attempt: u32) -> u64 {
 ///
 /// `max_retries == 0` disables retry entirely. Pure policy shared by
 /// the TUI and daemon supervisor so the attempt cap is enforced
-/// identically on both surfaces (AE3).
+/// identically on both surfaces.
 #[must_use]
 pub fn has_retry_budget(max_retries: u32, current_attempt: u32) -> bool {
     max_retries > 0 && current_attempt < max_retries
@@ -63,8 +62,8 @@ pub fn has_retry_budget(max_retries: u32, current_attempt: u32) -> bool {
 /// drop. The first attempt waits the fixed `auto_reconnect_delay` (the
 /// TUI's drop→reconnect grace window); subsequent attempts use
 /// exponential [`backoff_delay_secs`]. Re-homing the reconnect driver
-/// into the daemon supervisor (plan 2026-07-18-001 U4) must compute the
-/// same sequence the TUI does, so this pins it (AE2/AE3).
+/// into the daemon supervisor must compute the
+/// same sequence the TUI does, so this pins it.
 #[must_use]
 pub fn reconnect_delay_for_attempt(
     attempt: u32,
@@ -85,7 +84,7 @@ mod tests {
 
     // Characterization: pins today's TUI ladder behavior with the
     // shipped defaults (base=2, max=300, max_retries=3) so the daemon
-    // supervisor re-homing cannot silently change the numbers (AE3).
+    // supervisor re-homing cannot silently change the numbers.
 
     #[test]
     fn backoff_matches_default_ladder_2_4_8() {

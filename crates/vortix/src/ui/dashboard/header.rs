@@ -12,7 +12,7 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-/// Render the header bar from the registry's three states (U16 of plan #001).
+/// Render the header bar from the registry's three states.
 ///
 /// Branches:
 /// * `tunnel_count == 0` → `⚠ Real: <public_ip>` warning form (no VPN; real
@@ -105,7 +105,7 @@ fn render_no_exit_line(app: &App, ks_indicator: Span<'static>) -> Line<'static> 
 
 /// Build the `○ DISCONNECTED │ Real: <public_ip>` header used when the
 /// registry holds zero tunnels — a genuine no-VPN state. The explicit
-/// title was removed by the U16 redesign in favour of the `⚠ Real:`
+/// title was removed by the header redesign in favour of the `⚠ Real:`
 /// form alone; that conflated "no exit selected" with "no VPN at all"
 /// from the user's perspective, so the title is back. The killswitch
 /// indicator still appends.
@@ -608,7 +608,7 @@ fn get_killswitch_indicator(app: &App) -> Span<'static> {
 
 #[cfg(test)]
 mod tests {
-    //! U16 header rendering tests. These exercise the empty-registry and
+    //! Header rendering tests. These exercise the empty-registry and
     //! `≥2` overflow ladder paths via `App::new_test` + direct construction
     //! of `TunnelSnapshot` values fed to the strip builders. The strip
     //! builders are deliberately the unit-of-test rather than the full
@@ -679,7 +679,7 @@ mod tests {
     #[test]
     fn empty_registry_renders_disconnected_title_and_real_ip() {
         // 0-tunnel state surfaces the explicit `○ DISCONNECTED` title
-        // alongside the Real: IP. The title was removed by the U16
+        // alongside the Real: IP. The title was removed by the header
         // header redesign and restored after user feedback — the
         // warning glyph alone wasn't legible enough for the
         // "no VPN at all" state.

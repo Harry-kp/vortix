@@ -108,8 +108,7 @@ impl App {
         self.runtime.scanner_rx = Some(rx);
     }
 
-    /// Daemon-attached counterpart of [`Self::poll_scanner`] (plan
-    /// 2026-07-19-001 P4): poll the daemon's multi-tunnel
+    /// Daemon-attached counterpart of [`Self::poll_scanner`]: poll the daemon's multi-tunnel
     /// `RegistrySnapshot` on a background thread and mirror it into
     /// `app.registry`. Same spawn-on-demand pattern — one request in
     /// flight at a time, collected on a later tick.
@@ -136,7 +135,7 @@ impl App {
     /// Route one poll outcome: fresh snapshots feed the registry
     /// mirror; a timeout means the daemon is busy mid-write (its
     /// registry actor runs jobs serially), so we keep the last state;
-    /// a version mismatch is loud per the U1 contract; anything else
+    /// a version mismatch is loud by contract; anything else
     /// means the daemon is gone — detach and let the local pipeline
     /// resume next tick.
     fn handle_daemon_poll_result(
@@ -248,7 +247,7 @@ impl App {
             }
         }
 
-        // 2. Kick off a new fetch via the platform aggregate (plan 003 U7).
+        // 2. Kick off a new fetch via the platform aggregate.
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let totals = crate::platform::current_platform()

@@ -15,7 +15,7 @@ use ratatui::{
 
 /// Render the Connection Details panel for the focused profile.
 ///
-/// Multi-connection plan U6 Stage B: looks up the snapshot for the
+/// Stage B: looks up the snapshot for the
 /// currently-selected profile (focused via the sidebar's
 /// `profile_list_state`). Telemetry rows scope to the primary tunnel per
 /// H7 — when the focused profile is a split-tunnel row the panel renders
@@ -63,7 +63,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
         (Some(focused), Some(primary)) if focused == primary
     );
 
-    // U17: panel is focus-driven across every snapshot state. Connected
+    // panel is focus-driven across every snapshot state. Connected
     // shows full details; transitional states render a compact summary
     // (Role + AwaitingUserInput hint + fwmark warning where applicable);
     // every other case falls back to the disconnected placeholder.
@@ -351,10 +351,10 @@ fn render_connected(
 
     text.push(Line::from(rel_spans));
 
-    // U17: Role line — declared role drawn from the snapshot.
+    // Role line — declared role drawn from the snapshot.
     text.push(role_line(&snap.role));
 
-    // U17 / D-1: persistent fwmark warning for at-risk WG secondaries.
+    // persistent fwmark warning for at-risk WG secondaries.
     if let Some(warn) = fwmark_warning_line(app, snap) {
         text.push(warn);
     }
@@ -420,7 +420,7 @@ fn render_transitional(frame: &mut Frame, app: &App, inner: Rect, snap: &TunnelS
         text.push(awaiting_user_input_hint(prompt_kind));
     }
 
-    // Tab-cycle hint when N>1 (matches plan U17 requirement).
+    // Tab-cycle hint when N>1 .
     if app.registry.tunnel_count() > 1 {
         text.push(Line::from(vec![Span::styled(
             "Press [Tab] to cycle focused tunnel",
@@ -542,7 +542,7 @@ fn render_disconnected(frame: &mut Frame, app: &App, inner: Rect) {
 
 /// Format a [`Role`] as a single `Role: ...` line.
 ///
-/// The internal `Role` enum keeps the plan U17 taxonomy
+/// The internal `Role` enum keeps the role taxonomy
 /// (`Primary` / `Addressable` / `AddressableSuppressed` / `Reconnecting` /
 /// `AwaitingInput`) so xtask boundary checks + JSON output stay
 /// stable. User-facing copy uses the industry-standard plain-English
@@ -647,7 +647,7 @@ fn awaiting_user_input_hint(
     ])
 }
 
-/// Persistent fwmark warning per plan U17 D-1.
+/// Persistent fwmark warning.
 ///
 /// Render the warning when **all** of the following hold:
 /// * focused tunnel's profile uses `WireGuard`
@@ -796,7 +796,7 @@ fn render_back(frame: &mut Frame, app: &App, area: Rect, border_style: Style) {
 
 #[cfg(test)]
 mod tests {
-    //! U17 tests: Connection Details is focus-driven; Role line covers
+    //! Connection Details is focus-driven; Role line covers
     //! every variant; `AwaitingUserInput` shows the Enter hint; the fwmark
     //! warning fires only under the conjunctive D-1 condition; deleted /
     //! unknown focused profiles surface the "no longer available" hint.

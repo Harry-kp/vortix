@@ -507,11 +507,11 @@ pub fn parse_ping_output(output: &str) -> PingStats {
 
 // Note: `parse_proc_net_dev` and `parse_ip_addr_output` moved to
 // `vortix-platform-linux::network_stats` and `vortix-platform-linux::interface`
-// respectively as part of plan 003 U2.
+// respectively as part of .
 
 /// Measures network latency, packet loss, and jitter by pinging reliable hosts.
 ///
-/// Plan 002 U10: replaced the `ping -c 3 -i 0.2 -W <timeout>` shell-out
+/// replaced the `ping -c 3 -i 0.2 -W <timeout>` shell-out
 /// with `core::icmp::measure_latency`. Same outputs (`latency_ms`,
 /// `packet_loss` %, `jitter_ms`); same retry-across-targets behavior;
 /// same `Latency(0) + PacketLoss(100) + Jitter(0)` final message when
@@ -687,7 +687,7 @@ rtt min/avg/max/mdev = 1.234/5.678/9.012/3.456 ms";
 
     // /proc/net/dev and `ip addr` parsing tests moved to
     // `vortix-platform-linux::{network_stats, interface}` along with the
-    // parsers themselves (plan 003 U2).
+    // parsers themselves.
 
     // === DNS parsing tests ===
 

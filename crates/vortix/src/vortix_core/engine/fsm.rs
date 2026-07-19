@@ -1,4 +1,4 @@
-//! Engine FSM (plan #005 U2).
+//! Engine FSM.
 //!
 //! `Engine<T>` is generic over a concrete `Tunnel` impl so the FSM stays in
 //! `vortix-core` without depending on the binary's `TunnelKind` aggregate.
@@ -7,7 +7,7 @@
 //!
 //! The FSM is **synchronous**. Per plans #002 / #003, the runner and
 //! platform are accessed via process-global helpers; `Tunnel::up` etc. are
-//! blocking. Plan #005 U4's `EngineHandle` actor wraps the FSM in a
+//! blocking. The `EngineHandle` actor wraps the FSM in a
 //! `tokio::spawn`'d task so blocking subprocess work doesn't stall the
 //! caller — but the FSM itself stays sync, which makes the state-transition
 //! match readable and the tests deterministic.
@@ -51,7 +51,7 @@ pub type ProfileResolver = Box<dyn Fn(&ProfileId) -> Option<Profile> + Send>;
 
 /// Optional factory that builds a fresh tunnel per `Connect` call.
 ///
-/// Plan #006 U6: when set, the FSM swaps `self.tunnel = factory(&profile)`
+/// when set, the FSM swaps `self.tunnel = factory(&profile)`
 /// before invoking `tunnel.up()`. Lets a single `Engine<TunnelKind>` drive
 /// arbitrary protocols by picking the right variant from the profile.
 pub type TunnelFactory<T> = Box<dyn Fn(&Profile) -> T + Send>;
@@ -70,7 +70,7 @@ pub struct Engine<T: Tunnel> {
     /// "connect B" while this FSM (A) is mid-`Disconnecting`. The registry
     /// stashes B's `ProfileId` here; when the registry observes A reaching
     /// `Disconnected`, it fires the queued connect and clears the slot.
-    /// Plan #001 (multi-connection) U5 §6.6 race row. `None` in single-tunnel
+    /// Covers the documented race row. `None` in single-tunnel
     /// mode.
     pending_after_disconnect: Option<ProfileId>,
 }
@@ -143,8 +143,8 @@ impl<T: Tunnel> Engine<T> {
     /// This exists to mirror externally-driven kernel state (e.g. a
     /// VPN brought up by the legacy `App::connect_profile_inner`
     /// spawned-thread path, or an interface adopted from a prior
-    /// vortix session) into the registry until plan 001 U7 routes
-    /// the full connect flow through `EngineHandle::Local`. Once U7
+    /// vortix session) into the registry until a follow-up routes
+    /// the full connect flow through `EngineHandle::Local`. Once that
     /// lands, every Connected entry will arrive via
     /// `handle(UserCommand::Connect)` and this seed API can be
     /// retired.
@@ -220,7 +220,7 @@ impl<T: Tunnel> Engine<T> {
     }
 
     /// Bookkeeping-only: replace the FSM state wholesale with a
-    /// daemon-reported `Connection` (plan 2026-07-19-001 P4). The
+    /// daemon-reported `Connection`. The
     /// daemon's own FSM already enforced transition legality; a client
     /// mirroring its `RegistrySnapshot` must reproduce the state
     /// verbatim — including variants the per-shape seeds can't express
@@ -242,7 +242,7 @@ impl<T: Tunnel> Engine<T> {
             Input::Tick => self.handle_tick(&mut events),
             Input::NetworkLinkChanged(link) => self.handle_link(link, &mut events),
             Input::TelemetryReport(_) => {
-                // Plan 005 U7 handles telemetry-driven health updates here.
+                // Telemetry-driven health updates land here later.
                 // For now, telemetry reports are recorded but don't trigger
                 // state transitions.
             }
@@ -264,7 +264,7 @@ impl<T: Tunnel> Engine<T> {
                 self.try_disconnect(events);
             }
             UserCommand::Reconnect { .. } => self.try_reconnect(events),
-            // Plan 008 U2: slot reserved for the 2FA flow (issue #191).
+            // slot reserved for the 2FA flow (issue #191).
             // No consumer wired in v0.3.0 — answer is dropped silently
             // because no `AwaitingUserInput` transition emits the
             // outstanding prompt yet.
@@ -298,7 +298,7 @@ impl<T: Tunnel> Engine<T> {
             attempt: 1,
         });
 
-        // Plan 006 U6: rebuild the tunnel per profile when a factory is
+        // rebuild the tunnel per profile when a factory is
         // installed. Lets `Engine<TunnelKind>` route WG vs OVPN based on
         // the profile's protocol rather than the fixed initial variant.
         if let Some(factory) = &self.tunnel_factory {
@@ -433,7 +433,7 @@ impl<T: Tunnel> Engine<T> {
                 old_display_name,
                 new_display_name,
             } => {
-                // ProfileId is stable across renames (plan 005 R3); the
+                // ProfileId is stable across renames; the
                 // FSM only records the rename.
                 events.push(EngineEvent::ProfileRenamed {
                     profile_id,
@@ -460,9 +460,9 @@ impl<T: Tunnel> Engine<T> {
         obs: TunnelStatusObservation,
         events: &mut Vec<EngineEvent>,
     ) {
-        // Per brainstorm R18 the scanner is now an input source. When it
+        // The scanner is now an input source. When it
         // reports an active tunnel we don't know about, treat that as
-        // ground truth and transition to Connected. Plan 005 U7 fleshes
+        // ground truth and transition to Connected. A follow-up fleshes
         // this out with health updates.
         if let TunnelStatusObservation::Active {
             profile_id,
@@ -507,7 +507,7 @@ impl<T: Tunnel> Engine<T> {
             interface_name: handle.interface_name.clone(),
             pid: handle.pid,
         });
-        // Killswitch auto-engage on connect (plan 005 R-killswitch).
+        // Killswitch auto-engage on connect.
         events.push(EngineEvent::KillswitchEngaged {
             reason: KillswitchEngageReason::AutoOnConnect,
         });

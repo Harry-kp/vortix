@@ -13,7 +13,7 @@ Restart=on-failure
 RestartSec=5
 # The daemon runs as root for privileged subprocess work (wg-quick,
 # openvpn, firewall rules) and serves its unprivileged owner over the
-# peer-credential-authenticated Unix socket (P2 owner auth).
+# peer-credential-authenticated Unix socket.
 User=root
 Group=root
 Environment=VORTIX_OWNER_UID=<OWNER_UID>

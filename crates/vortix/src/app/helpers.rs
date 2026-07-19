@@ -202,8 +202,8 @@ impl App {
         );
     }
 
-    /// Count active tunnels for keybinding decisions (multi-connection plan
-    /// #001 U19). "Active" means the FSM is not `Disconnected` — that
+    /// Count active tunnels for keybinding decisions.
+    /// "Active" means the FSM is not `Disconnected` — that
     /// includes `Connecting`, `Connected`, `Disconnecting`,
     /// `AwaitingUserInput`, and any other in-flight states.
     #[must_use]
@@ -233,7 +233,7 @@ impl App {
 
     /// Whether the profile at `idx` is currently in a Connected state. Used
     /// by the `d` / `Enter` keybindings to decide between connect and
-    /// disconnect routing (multi-connection plan #001 U19).
+    /// disconnect routing ().
     #[must_use]
     pub(crate) fn is_profile_connected(&self, idx: usize) -> bool {
         use crate::vortix_core::engine::state::Connection;
@@ -261,7 +261,7 @@ impl App {
     }
 
     /// Whether the profile at `idx` is currently Connecting (in-flight).
-    /// Used by the `c` cancel keybinding (multi-connection plan #001 U19).
+    /// Used by the `c` cancel keybinding ().
     #[must_use]
     pub(crate) fn is_profile_connecting(&self, idx: usize) -> bool {
         use crate::vortix_core::engine::state::Connection;

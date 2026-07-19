@@ -1,10 +1,10 @@
-//! `ProfileStore` trait + `FsProfileStore` impl (plan #006 U2).
+//! `ProfileStore` trait + `FsProfileStore` impl.
 //!
 //! Filesystem-backed profile storage with sidecar metadata. Each profile
 //! lives at `<profiles_dir>/<display_name>.<conf|ovpn>` with a sibling
 //! `<display_name>.meta.toml` carrying stable identity, group, and timestamps.
 //!
-//! Plan 006 U4 lands the migration step that backfills sidecars for users
+//! A startup migration step backfills that backfills sidecars for users
 //! whose existing `.conf`/`.ovpn` files predate this scheme.
 
 use std::path::{Path, PathBuf};
@@ -38,7 +38,7 @@ pub struct ProfileSummary {
     pub protocol: ProtocolKind,
     pub group: Option<String>,
     pub last_used: Option<SystemTime>,
-    /// Boot-persisted (plan 2026-07-19-001 P5): the boot daemon brings
+    /// Boot-persisted: the boot daemon brings
     /// this profile up at startup. Set via `vortix service persist`.
     pub boot_connect: bool,
 }
@@ -58,7 +58,7 @@ pub struct Sidecar {
     pub imported_at: Option<SystemTime>,
     #[serde(default)]
     pub last_used: Option<SystemTime>,
-    /// Boot-persisted flag (P5). `#[serde(default)]` keeps pre-P5
+    /// Boot-persisted flag. `#[serde(default)]` keeps older
     /// sidecars readable — absent means false.
     #[serde(default)]
     pub boot_connect: bool,
@@ -125,7 +125,7 @@ pub trait ProfileStore {
     /// Returns [`ProfileStoreError::Io`] on filesystem failures.
     fn delete(&self, id: &ProfileId) -> Result<(), ProfileStoreError>;
 
-    /// Set or clear the boot-persisted flag (plan 2026-07-19-001 P5).
+    /// Set or clear the boot-persisted flag.
     /// The boot daemon connects every flagged profile at startup.
     ///
     /// # Errors

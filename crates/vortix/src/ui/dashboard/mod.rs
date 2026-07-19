@@ -275,7 +275,7 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
             confirm_selected,
             ..
         } => {
-            // Multi-connect is a NEW feature (plan 001) — most users
+            // Multi-connect is a NEW feature — most users
             // running into this overlay want the familiar pre-existing
             // "switch VPN" behavior (disconnect old, connect new). So
             // [Y]/Enter is wired to Switch (the recommended/default
@@ -423,7 +423,7 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
             count,
             confirm_selected,
         } => {
-            // Multi-connection plan #001 U19: Shift+D from the sidebar
+            // Shift+D from the sidebar
             // with N>1 active tunnels opens this confirm dialog before
             // tearing them all down.
             confirm_dialog::render(

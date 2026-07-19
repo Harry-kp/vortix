@@ -97,7 +97,7 @@ pub struct VpnRuntime {
     pub killswitch_state: KillSwitchState,
 
     // === Connection Retry & Auto-Reconnect ===
-    /// Per-profile retry / auto-reconnect bookkeeping (plan P5b U-P5b-1).
+    /// Per-profile retry / auto-reconnect bookkeeping.
     /// Replaces the single-slot retry triple. Each profile retries
     /// independently — a failed connect on A no longer blocks or
     /// overwrites an in-flight retry on B.
@@ -418,7 +418,7 @@ impl VpnRuntime {
 
     /// Kill any running VPN process and remove run files for a profile.
     ///
-    /// Plan #004 U4: dispatch routes through the `TunnelKind` aggregate.
+    /// dispatch routes through the `TunnelKind` aggregate.
     pub fn cleanup_vpn_resources(&self, profile_name: &str) {
         use crate::vortix_core::ports::tunnel::{TunnelHandle, TunnelKindTag};
         use crate::vortix_core::profile::ProfileId;
@@ -556,7 +556,7 @@ impl VpnRuntime {
     /// Shared between TUI and CLI so both surfaces refuse the same
     /// missing-dep set (and run the same `OpenVPN` 2.4+ probe — older
     /// builds silently drop `--pull-filter`, breaking multi-tunnel DNS
-    /// scoping per plan 001 U14 / R13).
+    /// scoping).
     #[must_use]
     pub fn check_dependencies(protocol: Protocol, config_path: &std::path::Path) -> Vec<String> {
         let mut missing = Vec::new();

@@ -46,8 +46,7 @@ pub const DEFAULT_DISCONNECT_TIMEOUT: u64 = 30;
 /// it rescans the kernel to adopt new sessions and detect drops.
 pub const DAEMON_SCAN_INTERVAL_SECS: u64 = 2;
 /// How long a daemon-routed write may pin its optimistic registry entry
-/// against snapshot overwrites before the marker expires (plan
-/// 2026-07-19-001 P4). Exceeds the 60s Execute transport timeout so a
+/// against snapshot overwrites before the marker expires. Exceeds the 60s Execute transport timeout so a
 /// live write never expires; only a lost result message does.
 pub const DAEMON_INFLIGHT_EXPIRY: std::time::Duration = std::time::Duration::from_secs(70);
 /// Default maximum connection retry attempts on failure (0 = disabled).
@@ -217,7 +216,7 @@ pub const KILLSWITCH_EMERGENCY_MSG: &str =
 pub const OPENVPN_RUN_DIR: &str = "run";
 
 /// Subdirectory under the Vortix config dir for per-session scratch configs
-/// (e.g. `WireGuard` secondaries with `DNS =` stripped — plan #009 U13).
+/// (e.g. `WireGuard` secondaries with `DNS =` stripped).
 /// Created at mode `0o700`; per-session subdirs live one level deeper so a
 /// crashed disconnect leaves an orphan that the next startup's session-
 /// liveness sweep collects unambiguously by name.

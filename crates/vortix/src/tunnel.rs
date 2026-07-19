@@ -1,11 +1,11 @@
-//! `TunnelKind` aggregate — runtime-selectable tunnel dispatcher (plan 004 U4).
+//! `TunnelKind` aggregate — runtime-selectable tunnel dispatcher.
 //!
 //! The engine routes `profile.protocol → TunnelKind` exactly once via
 //! [`tunnel_for`]; everything downstream calls the trait without protocol
 //! match arms.
 //!
 //! The aggregate lives in the binary (not `vortix-core`) for the same
-//! Cargo-cycle reason as `Platform` (plan 003): the protocol crates already
+//! Cargo-cycle reason as `Platform`: the protocol crates already
 //! depend on `vortix-core`.
 
 use std::path::Path;

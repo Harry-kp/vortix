@@ -1,4 +1,4 @@
-//! Windows route table stub (plan 008 U4).
+//! Windows route table stub.
 //!
 //! Real impl would call `Get-NetRoute` or `GetIpForwardTable` from IP
 //! Helper. Today returns `None` (no known default gateway).
@@ -14,7 +14,7 @@ impl RouteTable for WindowsRouteTable {
     }
 
     fn default_route_interface() -> Option<String> {
-        // Plan #001 U4: Windows is out of scope for v1 multi-connection
+        // Windows is out of scope for v1 multi-connection
         // routing primitives. Real impl would call `Get-NetRoute` /
         // `GetIpForwardTable2` and read `InterfaceAlias` / `InterfaceLuid`.
         None

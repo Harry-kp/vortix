@@ -1,5 +1,4 @@
-//! `RegistryHandle` — async actor around [`TunnelRegistry`] (plan
-//! 2026-07-18-001 U2, merged-U4 registry ownership).
+//! `RegistryHandle` — async actor around [`TunnelRegistry`].
 //!
 //! The daemon owns the multi-tunnel registry, but the registry is a
 //! synchronous structure and the daemon serves concurrent IPC clients
@@ -125,7 +124,7 @@ impl<T: Tunnel + Send + 'static> RegistryHandle<T> {
             .map_err(|_| EngineError::Other("registry actor dropped reply".into()))
     }
 
-    // ── Per-profile commands (plan 2026-07-19-001 P1) ──────────────────
+    // ── Per-profile commands ──────────────────
     //
     // The daemon routes every write to the profile's OWN engine, owned by
     // this registry — never a shared single FSM. Each is a thin async
@@ -279,7 +278,7 @@ mod tests {
         assert_eq!(count, 0);
     }
 
-    // ── Per-profile commands (P1) ──────────────────────────────────────
+    // ── Per-profile commands ──────────────────────────────────────
 
     fn mock_engine(name: &str) -> Engine<MockTunnel> {
         use crate::vortix_core::profile::{Profile, ProtocolKind};

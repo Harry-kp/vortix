@@ -1,11 +1,11 @@
 //! `Killswitch` port — kill-switch firewall control.
 //!
 //! Implementations live in `vortix-platform-{macos,linux,windows}`. The
-//! trait is intentionally sync today; plan #005's async engine migration
+//! trait is intentionally sync today; the async engine migration
 //! adds `&CommandRunner` arguments and `async fn` where useful. For now,
 //! impls reach the global runner via `crate::vortix_process::run_to_output(...)`.
 //!
-//! Plan multi-connection U8 replaces the single-tunnel `enable_blocking`
+//! The multi-tunnel rework replaced the single-tunnel `enable_blocking`
 //! signature with `enable_blocking_multi`, which accepts a slice of
 //! [`ActiveTunnelInfo`] — one per active tunnel — so the platform can
 //! synthesize a multi-interface ruleset in a single restore call.
@@ -46,7 +46,7 @@ pub enum KillswitchError {
 /// Primary tunnels (claiming the default route, `is_primary == true`)
 /// do **not** contribute to RFC1918 subtraction — their interface allow
 /// rule covers all egress, and subtracting `0.0.0.0/0` would strip
-/// loopback. See plan unit U8 / Q-DEF-9 resolution D-6.
+/// loopback.
 #[derive(Debug, Clone)]
 pub struct ActiveTunnelInfo {
     /// VPN tunnel interface name, e.g. `"utun3"` (macOS) or `"wg0"` (Linux).
@@ -69,7 +69,7 @@ pub struct ActiveTunnelInfo {
 /// multi-tunnel form lets the synthesizer install allow rules for every
 /// active tunnel in a single atomic ruleset.
 ///
-/// Note: the trait stays sync in plan #003. Plan #005's async engine
+/// Note: the trait stays sync for now. The async engine
 /// transition adds an explicit `&CommandRunner` parameter; today impls
 /// route subprocess calls through `crate::vortix_process::run_to_output(...)`
 /// (the process-global runner installed by `main.rs`).

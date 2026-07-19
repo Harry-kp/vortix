@@ -1,4 +1,4 @@
-//! Cold-start performance test (plan 008 U6).
+//! Cold-start performance test.
 //!
 //! Locks in a wall-clock ceiling for `vortix --version` so future
 //! changes don't quietly inflate startup time. Runs the binary under

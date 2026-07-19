@@ -1,9 +1,9 @@
 //! `vortix-config`: settings and profile store for vortix.
 //!
 //! Plan 006 populates this crate with:
-//! - [`settings::Settings`] (U1) — figment-layered resolution of defaults →
+//! - [`settings::Settings`] — figment-layered resolution of defaults →
 //!   system file → user file → env → CLI.
-//! - [`profile_store::ProfileStore`] (U2) — filesystem-backed profile storage
+//! - [`profile_store::ProfileStore`] — filesystem-backed profile storage
 //!   with sidecar metadata.
 
 #![allow(clippy::missing_errors_doc)]

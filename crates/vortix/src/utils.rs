@@ -150,7 +150,7 @@ pub fn get_profiles_dir() -> std::io::Result<std::path::PathBuf> {
 /// Both the `tmp/` parent and the per-session subdir are forced to mode
 /// `0o700` — the default umask would yield `0o755`, allowing any local
 /// process to enumerate active session IDs by listing the parent. Used by
-/// `WireGuard` secondary connect-time DNS scoping (plan #009 U13): the
+/// `WireGuard` secondary connect-time DNS scoping: the
 /// secondary's rewritten `.conf` (with `DNS =` stripped) is written under
 /// this subdir so crashed disconnects leave isolated orphans that the
 /// startup sweep cleans by session-liveness check (subdir name ≠ current
@@ -312,8 +312,7 @@ pub fn get_openvpn_auth_path(profile_name: &str) -> std::io::Result<std::path::P
 /// plain password. The canonical `<safe>.auth` file is reserved for
 /// non-MFA `auth-user-pass` flows — `OpenVPN` 2.7's static-challenge
 /// path does NOT consume SCRV1 envelopes from this file (the OTP
-/// prompt fires before the file is read; see the U0 spike outcome in
-/// `docs/plans/2026-06-02-001-feat-openvpn-static-challenge-plan.md`).
+/// prompt fires before the file is read; see the spike outcome in
 /// MFA credentials flow through the transient sibling file (see
 /// [`write_openvpn_scrv1_auth_file`]) and reach openvpn via the
 /// management socket.
@@ -322,7 +321,7 @@ fn format_openvpn_auth_body(username: &str, password: &str) -> String {
 }
 
 /// Path of the transient SCRV1 envelope auth file used for
-/// static-challenge connects (plan 2026-06-02-001 U3 / PF-2, #191).
+/// static-challenge connects (/ PF-2, #191).
 ///
 /// The connect path writes the envelope here, openvpn consumes it via
 /// `--auth-user-pass`, and the protocol layer deletes it immediately
@@ -346,7 +345,7 @@ pub fn get_openvpn_scrv1_auth_path(profile_name: &str) -> std::io::Result<std::p
 }
 
 /// Write a transient 3-line credentials bundle for the `OpenVPN`
-/// management-socket auth flow (plan 2026-06-02-001, #191, Approach
+/// management-socket auth flow (#191, Approach
 /// B-minimal). The protocol layer reads this file, drives the
 /// `--management` socket dance with the embedded user/pass/otp, then
 /// deletes the file. Each line is `<value>` followed by `\n`:
@@ -359,7 +358,7 @@ pub fn get_openvpn_scrv1_auth_path(profile_name: &str) -> std::io::Result<std::p
 ///
 /// This is NOT an `OpenVPN` auth-user-pass file — `OpenVPN` 2.7 doesn't
 /// consult `--auth-user-pass <file>` for the static-challenge case
-/// (the prompt fires before the file is read; see the U0 spike
+/// (the prompt fires before the file is read; see the spike
 /// outcome in the plan). The credentials reach openvpn via the
 /// management socket, not via the file.
 ///
@@ -421,9 +420,7 @@ pub fn delete_openvpn_scrv1_auth_file(profile_name: &str) {
 /// (see [`write_openvpn_scrv1_auth_file`]) and reach openvpn via the
 /// management socket -- the canonical `.auth` file is never used for
 /// SCRV1 envelopes because `OpenVPN` 2.7's static-challenge path
-/// prompts stdin for the OTP before reading the file (see the U0
-/// spike outcome in
-/// `docs/plans/2026-06-02-001-feat-openvpn-static-challenge-plan.md`).
+/// prompts stdin for the OTP before reading the file.
 ///
 /// The file is created with `chmod 600` (owner read/write only) in a
 /// single step via [`crate::vortix_core::secret_file::write_secret_file`],
@@ -515,7 +512,7 @@ pub fn read_openvpn_static_challenge_prompt(config_path: &std::path::Path) -> Op
 }
 
 /// Scan the `OpenVPN` auth directory and delete any leftover transient
-/// `<safe>.scrv1.auth` credentials bundle (plan 2026-06-02-001 U6, #191).
+/// `<safe>.scrv1.auth` credentials bundle (#191).
 ///
 /// The bundle is a 3-line `user\npass\notp\n` file the submit handler
 /// writes for the protocol layer to consume at the start of a
@@ -896,7 +893,7 @@ pub(crate) fn binary_exists(name: &str) -> bool {
 /// output (`vortix doctor` / `vortix info`) that needs to print where a
 /// tool is installed.
 ///
-/// Plan 002 U1: replaces the residual `cmd_stdout("which", ...)` shell-outs
+/// replaces the residual `cmd_stdout("which", ...)` shell-outs
 /// in `cli/report.rs` so vortix doesn't break on minimal-install systems
 /// where `which` itself isn't in the default package set (e.g. Fedora
 /// minimal containers).
@@ -1174,7 +1171,7 @@ mod tests {
     //      `false` via the `let Ok(path) = env::var("PATH") else`
     //      guard — covered by inspection, not worth a racy test.
 
-    // ───── find_binary_path (plan 002 U1) ─────────────────────────────────
+    // ───── find_binary_path ─────────────────────────────────
 
     #[test]
     fn find_binary_path_returns_existing_path_for_known_unix_binary() {
@@ -1742,7 +1739,7 @@ mod tests {
         ));
     }
 
-    // --- get_tmp_config_dir (U13) ---
+    // --- get_tmp_config_dir ---
 
     #[cfg(unix)]
     #[test]

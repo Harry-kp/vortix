@@ -8,7 +8,7 @@
 //! long as the union of ranges covers the entire address space.
 //!
 //! Implemented directly — no external CIDR crate — so the dependency
-//! surface stays small. See the multi-connection plan, unit U3.
+//! surface stays small.
 
 use std::net::IpAddr;
 use std::str::FromStr;
@@ -58,7 +58,7 @@ impl Cidr {
     /// never intersect.
     ///
     /// Used by the CLI's `up` conflict gate to detect non-default
-    /// route overlap; available to the registry when R10 v2 grows
+    /// route overlap; available to the registry when conflict detection grows
     /// route-overlap detection.
     #[must_use]
     pub fn intersects(&self, other: &Cidr) -> bool {
@@ -245,7 +245,7 @@ mod tests {
 
     #[test]
     fn canonical_slash_one_pair() {
-        // SC10: classic WireGuard split into two /1 halves.
+        // classic WireGuard split into two /1 halves.
         assert!(claims_default_route_v4(&[
             v4("0.0.0.0/1"),
             v4("128.0.0.0/1"),
@@ -254,7 +254,7 @@ mod tests {
 
     #[test]
     fn slash_two_quartet() {
-        // SC11: full coverage via four /2 blocks.
+        // full coverage via four /2 blocks.
         assert!(claims_default_route_v4(&[
             v4("0.0.0.0/2"),
             v4("64.0.0.0/2"),

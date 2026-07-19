@@ -1,4 +1,4 @@
-//! HTTP helper for the telemetry workers (plan 002 U9, revised).
+//! HTTP helper for the telemetry workers.
 //!
 //! Wraps a single process-wide `ureq::Agent` (lazy-init via `OnceLock`)
 //! configured to match curl's no-flag default behavior:

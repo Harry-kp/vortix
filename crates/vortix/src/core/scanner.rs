@@ -37,13 +37,13 @@ pub struct ActiveSession {
     /// ifconfig-scan heuristic (`check_openvpn_by_pid` Method B), which
     /// collides across multiple `OpenVPN` PIDs and so cannot
     /// truthfully identify which utun belongs to which process.
-    /// Consumed by `App::adopt_registry_from_session` (U5) to set the
+    /// Consumed by `App::adopt_registry_from_session` to set the
     /// new entry's `details.interface_authoritative` flag, which in
     /// turn excludes unauthoritative adoptions from primary-election.
     ///
     /// Defaults to `true` — most platforms / protocols / paths are
     /// reliable. The macOS `OpenVPN` Method-B fallback is the narrow
-    /// exception that opts out (U5 wires this).
+    /// exception that opts out.
     pub interface_authoritative: bool,
     /// Internal VPN IP address assigned to this interface.
     pub internal_ip: String,
@@ -177,7 +177,7 @@ fn get_all_openvpn_pids() -> std::collections::HashMap<String, u32> {
 /// - macOS: /var/run/wireguard/*.name + ifconfig
 /// - Linux: ip addr + wg show
 fn check_wireguard_by_name(name: &str) -> Option<ActiveSession> {
-    // Platform-dispatched interface check via the platform aggregate (plan 003 U7).
+    // Platform-dispatched interface check via the platform aggregate.
     let platform = crate::platform::current_platform();
 
     if !platform.interface.check_wireguard_interface(name) {
@@ -519,7 +519,7 @@ fn check_openvpn_by_pid(pid: u32, config_path: &Path) -> Option<ActiveSession> {
     // when two are up, both `check_openvpn_by_pid` calls return the
     // same utun — corrupting primary-election and per-tunnel killswitch
     // ACCEPT rules if the registry takes that value as authoritative.
-    // R4 of the contract: adopted entries with unreliable iface are
+    // By contract: adopted entries with unreliable iface are
     // excluded from primary-election by the registry.
     session.interface_authoritative = iface_authoritative;
 

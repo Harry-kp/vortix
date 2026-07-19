@@ -103,7 +103,7 @@ pub enum Commands {
         timeout: u64,
 
         /// Bypass the multi-tunnel conflict gate — default-route takeover
-        /// or route overlap (multi-connection plan U7). Without this flag,
+        /// or route overlap (). Without this flag,
         /// conflicting connects exit with code 4 (`StateConflict`) so
         /// scripted callers can branch.
         #[arg(short, long)]
@@ -351,7 +351,7 @@ pub enum Commands {
     ///     vortix report
     Report,
 
-    /// Run the vortix daemon (plan 015 phase D / plan 010)
+    /// Run the vortix daemon
     ///
     /// Hosts the engine FSM as a long-running process and accepts
     /// client connections on a Unix domain socket. Set
@@ -371,7 +371,7 @@ pub enum Commands {
         socket: Option<std::path::PathBuf>,
     },
 
-    /// Install or remove the vortix daemon as a boot service (plan 2026-07-19-001 P5)
+    /// Install or remove the vortix daemon as a boot service
     ///
     /// `install` writes the platform service unit (systemd on Linux,
     /// launchd on macOS), starts the daemon now, and enables
@@ -388,7 +388,7 @@ pub enum Commands {
         action: ServiceAction,
     },
 
-    /// Audit open sockets and which interface routes them (plan 015 phase C / plan 013)
+    /// Audit open sockets and which interface routes them
     ///
     /// Per-process snapshot of open TCP/UDP sockets visible to the
     /// calling user. Useful for answering "is this traffic actually
@@ -422,7 +422,7 @@ pub enum Commands {
     },
 }
 
-/// Actions for `vortix service` (plan 2026-07-19-001 P5).
+/// Actions for `vortix service`.
 #[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
 pub enum ServiceAction {
     /// Generate + install the boot service unit, start it now, enable at boot
@@ -445,7 +445,7 @@ pub enum ServiceAction {
 
 #[cfg(test)]
 mod tests {
-    //! Multi-connection plan U20: CLI grammar additions for the
+    //! CLI grammar additions for the
     //! down/reconnect/up subcommands. The runtime behaviour lives in
     //! `commands.rs` and depends on root + live tunnels, so we test
     //! only the clap parsing surface here — the contract that scripts
@@ -511,7 +511,7 @@ mod tests {
 
     #[test]
     fn cli_down_keeps_force_flag() {
-        // SC8 single-tunnel scripts call `sudo vortix down --force` —
+        // Single-tunnel scripts call `sudo vortix down --force` —
         // make sure that grammar still parses.
         let args = parse(&["vortix", "down", "--force"]);
         let Some(Commands::Down {

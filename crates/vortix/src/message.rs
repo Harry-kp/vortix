@@ -33,7 +33,7 @@ pub enum ScrollMove {
 }
 
 /// Which daemon-routed write a [`Message::DaemonCommandResult`] reports
-/// on (plan 2026-07-19-001 P4). Connect failures mark the profile
+/// on. Connect failures mark the profile
 /// Failed in the mirrored registry; disconnect successes run the
 /// shared disconnect finisher.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,7 +42,7 @@ pub enum DaemonWriteAction {
     Disconnect,
 }
 
-/// How a daemon-routed write concluded (plan 2026-07-19-001 P4).
+/// How a daemon-routed write concluded.
 /// `TimedOut` is deliberately distinct from `Failed`: the daemon holds
 /// the Execute connection open for the tunnel lifecycle, so a transport
 /// deadline elapsing means "may still be working — do not treat as
@@ -104,35 +104,35 @@ pub enum Message {
     OpenDelete(Option<usize>),
     /// Confirm deletion
     ConfirmDelete,
-    /// Confirm default-route takeover (multi-connection plan #001 U7 —
+    /// Confirm default-route takeover (—
     /// formerly `ConfirmSwitch`). User accepted the overlay; retry the
     /// connect with `force=true`. Both tunnels stay connected per
-    /// plan SC3 ("primary inverts").
+    /// the "primary inverts" scenario.
     ConfirmDefaultRouteTakeover { idx: usize },
     /// User chose the legacy single-tunnel "switch" path on the
     /// default-route takeover overlay: disconnect the current tunnel
     /// first, then connect the new one. Fired by the `[S]` hotkey on
     /// the overlay (distinct from `[Y]es` which keeps both tunnels up).
     SwitchExclusiveAndConnect { idx: usize },
-    /// Confirm route-overlap (multi-connection plan #001 U7, R10). User
+    /// Confirm route-overlap. User
     /// accepted the AllowedIPs-overlap overlay; retry the connect with
     /// `force=true`.
     ConfirmRouteOverlap { idx: usize },
-    /// Multi-connection plan #001 U19: disconnect one specific profile by
+    /// disconnect one specific profile by
     /// index (the `d` keybinding on a Connected sidebar row). Distinct from
     /// the global `Disconnect` message which targets the legacy single-
     /// tunnel active profile.
     DisconnectProfile { idx: usize },
-    /// Multi-connection plan #001 U19: open the "Disconnect all N tunnels?"
+    /// open the "Disconnect all N tunnels?"
     /// confirmation dialog (the Shift+`D` keybinding when N>1). Fired from
     /// the sidebar; with N≤1 the input layer dispatches `DisconnectProfile`
     /// instead and this message is never sent.
     RequestDisconnectAll,
-    /// Multi-connection plan #001 U19: user accepted the
+    /// user accepted the
     /// `InputMode::ConfirmDisconnectAll` overlay; tear down every active
     /// tunnel (registry-aware) plus the legacy single-tunnel state.
     ConfirmDisconnectAll,
-    /// Multi-connection plan #001 U19: cancel an in-flight connect (the
+    /// cancel an in-flight connect (the
     /// `c` keybinding on a Connecting row's Connection Details). FSM
     /// transitions Connecting → Disconnected and the sidebar row clears
     /// the badge.
@@ -174,13 +174,13 @@ pub enum Message {
         default_route_interface: Option<String>,
     },
     /// Daemon-attached counterpart of [`Message::SyncSystemState`]
-    /// (plan 2026-07-19-001 P4): the polled multi-tunnel registry
+    ///: the polled multi-tunnel registry
     /// snapshot from the daemon, mirrored into `app.registry` so every
     /// panel renders daemon truth. The local kernel scanner does not
     /// run while attached.
     SyncDaemonState(crate::vortix_core::engine::registry_handle::RegistrySnapshot),
     /// Result of a daemon-routed write (`Execute` over IPC) reported by
-    /// the background worker thread (plan 2026-07-19-001 P4).
+    /// the background worker thread.
     DaemonCommandResult {
         /// Profile name the write targeted.
         profile: String,
@@ -219,8 +219,6 @@ pub enum Message {
         /// carry one. This field is the only path from the connect-
         /// worker thread back to `mirror_connect_into_registry`, so it
         /// IS the authoritative iface seed for the new registry entry.
-        /// See R1 of docs/brainstorms/2026-06-01-multi-tunnel-state-
-        /// authority-requirements.md.
         interface: Option<String>,
         /// Kernel PID from the protocol layer's `Tunnel::up()` result.
         /// Same flow rationale as `interface`.
@@ -250,7 +248,7 @@ pub enum Message {
         /// Password entered by the user
         password: String,
         /// 2FA code from the static-challenge OTP field, when the profile
-        /// declares a `static-challenge` directive (plan 2026-06-02-001 U3).
+        /// declares a `static-challenge` directive.
         /// `None` for non-MFA profiles; the connect path embeds `Some(otp)`
         /// in the SCRV1 envelope and the save path always writes plain.
         otp: Option<String>,

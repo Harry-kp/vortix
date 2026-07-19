@@ -1,4 +1,4 @@
-//! `EngineHandle` + `LocalHandle` actor (plan #005 U4).
+//! `EngineHandle` + `LocalHandle` actor.
 //!
 //! Clone-able Command/Query/Subscribe API around the FSM. The actor lives
 //! in a `tokio::spawn`'d task; the handle holds a mpsc sender to the actor
@@ -6,7 +6,7 @@
 //!
 //! `EngineHandle` is an `enum` with two variants: `Local` (in-process
 //! actor) and `Remote` (daemon-hosted engine over IPC, read path as of
-//! plan 2026-07-18-001 U1). The enum stays `#[non_exhaustive]`.
+//! ). The enum stays `#[non_exhaustive]`.
 
 use std::sync::Arc;
 
@@ -77,8 +77,7 @@ impl std::fmt::Debug for LocalHandle {
     }
 }
 
-/// Client-side handle to a daemon-hosted engine (plan 2026-07-18-001
-/// U1). Wraps a blocking [`IpcTransport`]; each call runs the exchange
+/// Client-side handle to a daemon-hosted engine. Wraps a blocking [`IpcTransport`]; each call runs the exchange
 /// on the blocking pool. Carries the full surface: snapshot reads,
 /// registry reads, `execute` writes, and `subscribe` streaming.
 #[derive(Clone)]
@@ -105,7 +104,7 @@ impl RemoteHandle {
     /// directly; the uniform [`EngineHandle::snapshot`] flattens to
     /// [`EngineError`].
     ///
-    /// The remote journal tail is not transported in U1; `journal_tail`
+    /// The remote journal tail is not transported yet; `journal_tail`
     /// is empty until the streaming unit lands.
     ///
     /// # Errors
@@ -129,7 +128,7 @@ impl RemoteHandle {
 
     /// Fetch the daemon's full multi-tunnel [`RegistrySnapshot`] — the
     /// authoritative view of every active tunnel plus the derived
-    /// primary and global kill-switch (plan 2026-07-18-001 U2). Prefer
+    /// primary and global kill-switch. Prefer
     /// this over [`Self::snapshot_remote`] for multi-tunnel-aware
     /// surfaces; the primary-only `Snapshot` stays for v1 compatibility.
     ///
@@ -161,8 +160,7 @@ impl RemoteHandle {
         }
     }
 
-    /// Send a user command to the daemon for execution (plan
-    /// 2026-07-18-001 U3). The daemon runs it against its engine and
+    /// Send a user command to the daemon for execution. The daemon runs it against its engine and
     /// answers `Accepted` once the FSM has processed it (the connection
     /// stays open for the tunnel lifecycle, so this awaits the real
     /// connect/disconnect). A registry conflict comes back as a typed
@@ -185,8 +183,7 @@ impl RemoteHandle {
         }
     }
 
-    /// Open a live subscription to the daemon's event stream (plan
-    /// 2026-07-18-001 U2). Pairs the current snapshot (catch-up) with a
+    /// Open a live subscription to the daemon's event stream. Pairs the current snapshot (catch-up) with a
     /// receiver fed by the daemon's pushed events, mirroring the shape
     /// [`LocalHandle::subscribe`] returns so consumers are variant-blind.
     ///
@@ -441,7 +438,7 @@ mod tests {
         let _ = sub.receiver;
     }
 
-    // ===== RemoteHandle (plan 2026-07-18-001 U1) =====
+    // ===== RemoteHandle =====
 
     struct MockTransport {
         response: std::sync::Mutex<Option<Result<IpcResult, TransportError>>>,

@@ -4,7 +4,6 @@
 //! `enum_dispatch`-driven enum carrying `Real(RealRunner)` and `Mock(MockRunner)`
 //! variants. Callers hold the enum by value; static dispatch, no `Box<dyn>`.
 //!
-//! See `docs/plans/2026-05-24-002-feat-commandrunner-port-plan.md`.
 
 #![allow(clippy::missing_errors_doc)]
 
@@ -77,8 +76,7 @@ impl CommandRunner {
     /// Borrow the production runner variant, if this enum is `Real`.
     ///
     /// Returns `None` for the `Mock` variant. Used by `main.rs` to grab the
-    /// bundled tokio runtime handle for spawning auxiliary tasks (plan 005
-    /// journal writer).
+    /// bundled tokio runtime handle for spawning auxiliary tasks.
     #[must_use]
     pub fn as_real(&self) -> Option<&RealRunner> {
         match self {

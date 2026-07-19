@@ -9,9 +9,9 @@
 //! profiles, telemetry, kill switch, retry logic). The TUI-specific state
 //! (panels, overlays, animations, scroll positions) remains directly on `App`.
 //!
-//! Plan #005 U5 removed `App: Deref<Target = VpnRuntime>`. VPN-state
+//! An earlier refactor removed `App: Deref<Target = VpnRuntime>`. VPN-state
 //! accesses are now explicit via `self.runtime.X` / `app.runtime.X`.
-//! When a daemon is attached (plan 2026-07-19-001 P4), `daemon:
+//! When a daemon is attached, `daemon:
 //! Option<DaemonLink>` carries the connection and the registry mirrors
 //! daemon truth; otherwise the in-process scanner/mirror pipeline runs.
 //!
@@ -97,7 +97,7 @@ pub use crate::state::{
     VpnProfile, DISMISS_DURATION,
 };
 // The legacy single-tunnel `ConnectionState`/`DetailedConnectionInfo` enum
-// lives on `crate::vpn_runtime` after U6 Stage B; re-export through `app::`
+// lives on `crate::vpn_runtime` after the registry migration; re-export through `app::`
 // so the existing `app/connection.rs` / `app/update.rs` code paths that
 // drive the legacy mirror still resolve `app::ConnectionState`.
 pub use crate::vpn_runtime::{ConnectionState, DetailedConnectionInfo};
@@ -113,19 +113,19 @@ pub use crate::vpn_runtime::{ConnectionState, DetailedConnectionInfo};
 pub struct App {
     /// The headless VPN runtime — telemetry, profile catalog, config,
     /// background workers, kill-switch mode. Active tunnel FSMs live on
-    /// `self.registry` (plan #001 U6).
+    /// `self.registry`.
     pub runtime: VpnRuntime,
 
-    /// Multi-connection plan #001: the `TunnelRegistry` owns active tunnel
+    /// The `TunnelRegistry` owns active tunnel
     /// FSMs. Panels read tunnel snapshots from here (sidebar, header,
     /// `connection_details`, security, chart).
     pub registry: TunnelRegistry<TunnelKind>,
 
-    /// Daemon attach state (plan 2026-07-19-001 P4). `Some` means a
+    /// Daemon attach state. `Some` means a
     /// running daemon owns all tunnel state: the registry is fed from
     /// polled `RegistrySnapshot`s instead of the kernel scanner, and
     /// connect/disconnect route through `Execute` over IPC. `None` is
-    /// the unchanged local mode (R11).
+    /// the unchanged local mode.
     pub daemon: Option<DaemonLink>,
 
     /// Flag indicating the application should exit.
@@ -161,7 +161,7 @@ pub struct App {
     pub terminal_size: (u16, u16),
 }
 
-// Plan 005 U5 removed the previous `impl Deref<Target = VpnRuntime>` — the
+// An earlier refactor removed the previous `impl Deref<Target = VpnRuntime>` — the
 // porous boundary let every TUI/app/CLI callsite reach into VpnRuntime
 // without the indirection being visible at the call site. Use
 // `app.runtime.X` for runtime fields and `app.registry` for active
@@ -312,7 +312,7 @@ impl App {
 
 impl App {
     /// Whether a running daemon owns tunnel state for this session
-    /// (plan 2026-07-19-001 P4). Gates the scanner swap, the write
+    ///. Gates the scanner swap, the write
     /// routing, and the connect-timeout safeguard.
     #[must_use]
     pub fn daemon_attached(&self) -> bool {
@@ -325,7 +325,7 @@ impl App {
     ///
     /// Any persisted Armed kill-switch state is disarmed: with the
     /// scanner parked there is no drop-handler, and the daemon has no
-    /// firewall logic until P6 — rendering `KS:Watch` here would claim
+    /// firewall logic yet — rendering `KS:Watch` here would claim
     /// protection no component provides.
     pub fn attach_daemon(&mut self, socket: std::path::PathBuf) {
         self.log(&format!(
@@ -336,7 +336,7 @@ impl App {
             self.runtime.killswitch_state = crate::state::KillSwitchState::Disabled;
             self.log(
                 "SEC: Kill switch disarmed — not enforced while a daemon owns tunnels \
-                 (daemon-side kill switch lands in P6)",
+                 (a daemon-side kill switch is planned)",
             );
             self.show_toast(
                 "Kill switch not enforced in daemon mode yet — disarmed".to_string(),

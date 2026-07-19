@@ -1,4 +1,4 @@
-//! `Input` enum and friends — what the FSM `handle(input)` consumes (plan #005 U1).
+//! `Input` enum and friends — what the FSM `handle(input)` consumes.
 
 use std::time::SystemTime;
 
@@ -8,7 +8,7 @@ use crate::vortix_core::profile::ProfileId;
 
 /// User-initiated commands routed through the engine.
 ///
-/// ## Multi-tunnel wire shape (plan 001 U22)
+/// ## Multi-tunnel wire shape
 ///
 /// The disconnect / reconnect / force-disconnect variants carry an
 /// `Option<ProfileId>` payload: `None` targets every active tunnel
@@ -31,7 +31,7 @@ pub enum UserCommand {
     /// tunnel (`None`). The daemon's UID gate is sufficient
     /// authorization for the `None` form in v1's single-user trust
     /// model; multi-user scenarios will need an explicit confirmation
-    /// parameter (see SECURITY.md once U24 lands).
+    /// parameter (see SECURITY.md).
     Disconnect {
         profile_id: Option<ProfileId>,
     },
@@ -45,7 +45,7 @@ pub enum UserCommand {
     ForceDisconnect {
         profile_id: Option<ProfileId>,
     },
-    /// Plan 008 U2: response to a mid-connect `UserPromptRequested`
+    /// response to a mid-connect `UserPromptRequested`
     /// event. Reserved for issue #191 (2FA); no consumer wired in
     /// v0.3.0. `prompt_id` matches the value emitted on the prompt
     /// event so the FSM can correlate the answer with the right
@@ -83,7 +83,7 @@ pub enum ProfileChange {
 
 /// What the scanner (or any other observer) reports about a live tunnel.
 ///
-/// Per the brainstorm R18, the scanner is now an *input source* — the FSM
+/// The scanner is now an *input source* — the FSM
 /// reconciles its model against the observation instead of the scanner
 /// mutating the engine directly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,8 +100,8 @@ pub enum TunnelStatusObservation {
 }
 
 /// Telemetry updates that the engine consumes (loose union of what
-/// `vortix::core::telemetry::TelemetryUpdate` carries today). Plan #005 U7
-/// migrates telemetry to its own actor and tightens this shape.
+/// `vortix::core::telemetry::TelemetryUpdate` carries today). A later
+/// migration moves telemetry to its own actor and tightens this shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum TelemetryReport {
@@ -128,7 +128,7 @@ pub enum Input {
 
 #[cfg(test)]
 mod tests {
-    //! Plan #001 U22 — `UserCommand` wire-format round-trip + v1 wire-break
+    //! `UserCommand` wire-format round-trip + v1 wire-break
     //! verification.
 
     use super::*;

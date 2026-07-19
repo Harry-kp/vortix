@@ -98,7 +98,7 @@ impl App {
                         profile.name
                     ));
                 }
-                // Plan 001 SC3 ("primary inverts"): both tunnels stay
+                // The "primary inverts" scenario: both tunnels stay
                 // connected; the new one claims the kernel default
                 // route and the prior primary becomes
                 // `Split tunnel (0.0.0.0/0, yielded)` in the registry's
@@ -135,7 +135,7 @@ impl App {
                         profile.name
                     ));
                 }
-                // Route-overlap does not require a disconnect (R10): both
+                // Route-overlap does not require a disconnect: both
                 // tunnels can stay up; the killswitch synthesiser handles
                 // CIDR subtraction. Connect directly with force=true.
                 self.connect_profile_forced(idx);
@@ -513,7 +513,7 @@ impl App {
         // primary), `legacy_state()` still reports the original primary,
         // and a name-equality check against the SECOND profile would
         // wrongly mark the second connect's result as stale — leaving
-        // the tunnel stuck in Connecting forever post-U4 (the scanner
+        // the tunnel stuck in Connecting forever now (the scanner
         // can no longer promote on its own).
         use crate::vortix_core::engine::state::Connection;
         use crate::vortix_core::profile::ProfileId;
@@ -533,7 +533,7 @@ impl App {
         } else if success {
             // Reset this profile's retry / auto-reconnect bookkeeping on
             // success. Other profiles' retry state is untouched (P5b
-            // U-P5b-1 per-profile retry).
+            // per-profile retry).
             self.runtime
                 .retry_state
                 .remove(&crate::vortix_core::profile::ProfileId::new(&profile));
@@ -552,10 +552,9 @@ impl App {
             // Push a Connected entry with the authoritative iface
             // and PID returned by the protocol layer's `Tunnel::up()`
             // result (carried through `Message::ConnectResult`). The
-            // scanner's metadata-only refreshes (U4) will then patch
+            // scanner's metadata-only refreshes will then patch
             // in transfer counts / MTU / endpoint on subsequent ticks
-            // without touching the iface. R1 of the state-authority
-            // contract: this is the ONE write path for iface; the
+            // without touching the iface. the state-authority // contract: this is the ONE write path for iface; the
             // scanner has no business overwriting it later.
             let mut details_seed = DetailedConnectionInfo::default();
             if let Some(iface) = interface {
@@ -592,7 +591,7 @@ impl App {
             self.cleanup_vpn_resources(&profile);
 
             // Attempt retry with exponential backoff if configured.
-            // Per-profile retry (P5b U-P5b-1): each profile's attempt
+            // Per-profile retry (): each profile's attempt
             // counter lives in runtime.retry_state[profile_id], so a
             // failed connect on A no longer blocks/overwrites a retry on
             // B. The auto_reconnect flag is preserved across attempts so
@@ -682,7 +681,7 @@ impl App {
             return;
         }
 
-        // Plan 2026-06-02-001 U3 / PF-2 (#191): write the canonical
+        // (#191): write the canonical
         // `<safe>.auth` exactly once with plain credentials (when
         // `save=true` or when there's no OTP to save), and write the
         // single-use SCRV1 envelope to a transient sibling
@@ -707,8 +706,7 @@ impl App {
         match result {
             Ok(()) => {
                 // No OTP/SCRV1 content in logs — the OTP value is single-use
-                // and must never appear in tracing spans (plan 2026-06-02-001
-                // PF-8).
+                // and must never appear in tracing spans.
                 if save {
                     self.log(&format!("AUTH: Saved credentials for '{profile_name}'"));
                 } else {
@@ -767,10 +765,10 @@ impl App {
         use crate::state::KillSwitchMode;
 
         // Attached mode: no component enforces the kill switch until
-        // the daemon owns it (P6) — refuse instead of arming a state
+        // the daemon owns it — refuse instead of arming a state
         // nothing watches (see `sync_killswitch` / `attach_daemon`).
         if self.daemon_attached() {
-            self.log("SEC: Kill switch unavailable in daemon mode until the daemon owns it (P6)");
+            self.log("SEC: Kill switch unavailable in daemon mode until the daemon owns it");
             self.show_toast(
                 "Kill switch isn't available in daemon mode yet — stop the daemon to manage it"
                     .to_string(),
@@ -863,7 +861,7 @@ impl App {
                 let is_connected = self.has_active_connection();
                 let old_ip = self.runtime.public_ip.clone();
 
-                // Plan 005 U7: emit IpChanged into the journal so the
+                // emit IpChanged into the journal so the
                 // bug-report and downstream subscribers see the trail.
                 // Only fires on actual changes, not initial detection.
                 if old_ip != ip
@@ -1066,8 +1064,7 @@ impl App {
             handled.insert(snap.profile_id.clone());
             let matching_session = active.iter().find(|s| s.name == profile_name);
 
-            // Decision half lives in the shared classifier (plan
-            // 2026-07-18-001 U2) so the daemon supervisor reconciles
+            // Decision half lives in the shared classifier so the daemon supervisor reconciles
             // identically; the side-effecting half (logs, toasts,
             // kill-switch sync) stays here in the TUI.
             let disconnecting_elapsed = match &snap.state {
@@ -1096,7 +1093,7 @@ impl App {
                     self.scanner_handle_drop(&profile_name, was_connected);
                 }
                 ReconcileAction::AwaitingConnect => {
-                    // U4 contract: scanner cannot promote Connecting →
+                    // State-authority contract: scanner cannot promote Connecting →
                     // Connected — only the protocol layer's Tunnel::up()
                     // success can. This arm is informational logging at
                     // SCANNER_LOG_INTERVAL_SECS cadence; the message
@@ -1145,7 +1142,7 @@ impl App {
     }
 
     /// Daemon-attached counterpart of [`Self::handle_sync_system_state`]
-    /// (plan 2026-07-19-001 P4): mirror the daemon's polled
+    ///: mirror the daemon's polled
     /// `RegistrySnapshot` into `app.registry`. No reconcile decisions,
     /// no kill-switch side effects, no retry scheduling — the daemon
     /// owns all of that; this client only renders its truth. Profiles
@@ -1204,8 +1201,7 @@ impl App {
         );
     }
 
-    /// Land the result of a daemon-routed write (plan 2026-07-19-001
-    /// P4). Completion is mostly a log line — the next snapshot poll
+    /// Land the result of a daemon-routed write. Completion is mostly a log line — the next snapshot poll
     /// renders the daemon's resulting state; failure rolls the
     /// optimistic registry entry to Failed; a transport timeout means
     /// the daemon may still be working, so nothing is marked failed
@@ -1267,7 +1263,7 @@ impl App {
         }
     }
 
-    /// Scanner helper (P5b U-P5b-2): force-cleanup a profile stuck in
+    /// Scanner helper (): force-cleanup a profile stuck in
     /// the Disconnecting state past `disconnect_timeout`. The kernel
     /// interface is still up but the teardown isn't returning;
     /// surface a forced-cleanup toast and drop the entry from the
@@ -1290,7 +1286,7 @@ impl App {
         self.sync_killswitch();
     }
 
-    // Removed in U4: `scanner_promote_to_connected`. The scanner can no
+    // Removed by the state-authority rework: `scanner_promote_to_connected`. The scanner can no
     // longer drive the Connecting → Connected transition. Only the
     // protocol layer's `Tunnel::up()` success result (via
     // `Message::ConnectResult` → `mirror_connect_into_registry`) can.
@@ -1299,7 +1295,7 @@ impl App {
     // SCANNER_LOG_INTERVAL_SECS cadence; the connect-timeout safety
     // net in `handle_connection_timeout` catches genuinely-stuck cases.
 
-    /// Scanner helper (P5b U-P5b-2): refresh kernel-reported details
+    /// Scanner helper (): refresh kernel-reported details
     /// on an existing Connected entry. Resyncs session-start drift
     /// and updates the registry; updates the legacy state only if it
     /// already tracks this profile.
@@ -1328,7 +1324,7 @@ impl App {
         self.refresh_registry_from_session(profile_name, session);
     }
 
-    /// Scanner helper (P5b U-P5b-2): handle drop detection for a
+    /// Scanner helper (): handle drop detection for a
     /// profile that has a Connected/Connecting/Reconnecting/Awaiting
     /// registry entry but no matching kernel session. Mirrors the
     /// legacy drop path including `connection_drops` counter, kill
@@ -1376,7 +1372,7 @@ impl App {
             );
         }
 
-        // AUTO-RECONNECT: per-profile (P5b U-P5b-1 / D-2). Each dropped
+        // AUTO-RECONNECT: per-profile (). Each dropped
         // Connected tunnel schedules its own retry; multiple drops can
         // recover concurrently.
         if was_connected && self.runtime.config.auto_reconnect {
@@ -1415,7 +1411,7 @@ impl App {
         }
     }
 
-    /// Scanner helper (P5b U-P5b-2 / D-4): adopt an externally-started
+    /// Scanner helper (): adopt an externally-started
     /// VPN session into the registry. Triggered when scanner sees an
     /// active session for a catalog profile not currently in the
     /// registry — e.g., the user ran `wg-quick up X` outside vortix,
@@ -1457,12 +1453,11 @@ impl App {
                 "INFO: Adopting externally-started tunnel '{profile_name}' as a secondary"
             ));
         }
-        // U4: adoption goes through the dedicated entry-creation path,
+        // Adoption goes through the dedicated entry-creation path,
         // NOT refresh_registry_from_session (which is metadata-only on
         // existing Connected entries). The new entry's
         // interface_authoritative flag is read from
-        // session.interface_authoritative (U5 wires the per-platform
-        // decision into the scanner; default is true).
+        // session.interface_authoritative.
         self.adopt_registry_from_session(&profile_name, session);
     }
 
@@ -1498,7 +1493,7 @@ impl App {
     }
 
     fn handle_retry_connect(&mut self, idx: usize, attempt: u32) {
-        // Per-profile retry (P5b U-P5b-1): stale check by profile_id.
+        // Per-profile retry (): stale check by profile_id.
         // The message carries `idx` for backwards compatibility; we
         // resolve it to the profile's id and verify the retry_state
         // entry still matches before firing.
@@ -1551,7 +1546,7 @@ impl App {
             }
             ConnectionState::Disconnected => {
                 // Re-trigger any auto-reconnect entries now that the
-                // network is back. Per-profile (P5b U-P5b-1 / D-2):
+                // network is back. Per-profile ():
                 // every profile with auto_reconnect=true gets its
                 // RetryConnect re-fired — disjoint tunnels can recover
                 // in parallel without contending for a single slot.
@@ -1624,7 +1619,7 @@ impl App {
         // 1. Connection Timeout Safeguard. Local-mode only: on the
         // daemon path the Execute transport timeout owns the deadline,
         // and this safeguard's cleanup would kill processes the daemon
-        // manages (plan 2026-07-19-001 P4).
+        // manages.
         if !self.daemon_attached() {
             if let ConnectionState::Connecting { started, profile } = self.legacy_state() {
                 if started.elapsed()
@@ -1645,7 +1640,7 @@ impl App {
 
         // 4. Poll the state source (spawn-on-demand, non-blocking):
         // the daemon's registry when attached, the kernel scanner
-        // otherwise (P4 — the attached TUI never scans or reconciles).
+        // otherwise.
         if self.daemon_attached() {
             self.poll_daemon_state();
         } else {

@@ -14,13 +14,13 @@ struct Cli {
 #[derive(Subcommand)]
 #[allow(clippy::enum_variant_names)]
 enum Command {
-    /// Verify no raw `Command::new` outside `vortix-process` (plan 002 R12).
+    /// Verify no raw `Command::new` outside `vortix-process`.
     CheckSubprocess,
-    /// Verify no `cfg(target_os)` outside `vortix-platform-*` (plan 003 R12).
+    /// Verify no `cfg(target_os)` outside `vortix-platform-*`.
     CheckPlatformLeak,
-    /// Verify no protocol-specific subprocess names outside their protocol crates (plan 004).
+    /// Verify no protocol-specific subprocess names outside their protocol crates.
     CheckProtocolLeak,
-    /// Verify no shell-outs to system binaries that plan 002 replaced.
+    /// Verify no shell-outs to system binaries that the `CommandRunner` port replaced.
     CheckNoShellRegressions,
 }
 
@@ -90,7 +90,7 @@ fn check_subprocess() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     } else {
         eprintln!(
-            "xtask check-subprocess: {} violation(s) — all subprocess invocations must flow through `vortix_process::CommandRunner` (plan 002 R12). Annotate exceptions with `// xtask:allow-subprocess: <reason>`.",
+            "xtask check-subprocess: {} violation(s) — all subprocess invocations must flow through `vortix_process::CommandRunner`. Annotate exceptions with `// xtask:allow-subprocess: <reason>`.",
             violations.len()
         );
         for v in &violations {
@@ -104,7 +104,7 @@ fn line_contains_violation(line: &str) -> bool {
     // Match `std::process::Command::new(` and `tokio::process::Command::new(`.
     // Bare `Command::new(` only triggers when preceded by a `use std::process::Command`
     // import — but rather than tracking imports, the lint catches the fully-qualified
-    // forms only; we already rewrote all bare usages in plan 002. Adding a bare
+    // forms only; we already rewrote all bare usages. Adding a bare
     // `Command::new(` later requires either a fully-qualified path or an annotation.
     line.contains("std::process::Command::new") || line.contains("tokio::process::Command::new")
 }
@@ -129,7 +129,7 @@ fn is_allowlisted_file(path: &Path, workspace_root: &Path) -> bool {
 }
 
 /// Scan the workspace for naked `cfg(target_os = ...)` use outside platform
-/// boundaries (plan 003 R12).
+/// boundaries.
 ///
 /// Allowlist:
 /// - `crates/vortix-platform-{macos,linux,windows}/**` — platform crates.
@@ -228,7 +228,7 @@ fn is_platform_leak_allowlisted(path: &Path, workspace_root: &Path) -> bool {
 }
 
 /// Scan the workspace for protocol-specific binary names appearing in
-/// `CommandSpec` invocations outside their protocol crates (plan 004 R13).
+/// `CommandSpec` invocations outside their protocol crates.
 ///
 /// Allowlist:
 /// - `crates/vortix-protocol-wireguard/**` may invoke `wg-quick` and `wg`.
@@ -335,15 +335,15 @@ fn check_protocol_leak() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// System binaries that plan 002 replaced. Once a binary is on this
+/// System binaries the `CommandRunner` port replaced. Once a binary is on this
 /// list, any future code that `CommandSpec::oneshot("<name>", ...)`s
 /// it gets caught at build time — preventing the regression class
 /// the Fedora-without-`which` incident (PR #1 `fcf9508`) revealed.
 ///
-/// The list deliberately covers tools removed in U1 (`which`), U2/U6
-/// (`kill`), U3 (`uname`, `sw_vers`), U4/U5/U6 (`ifconfig`, `ip`,
-/// `ps`), U7 (`netstat`, `lsof`, `scutil`), U8 (`pbcopy`, `xclip`,
-/// `wl-copy`), U9 (`curl`), and U10 (`ping`). It does NOT cover the
+/// The list deliberately covers tools we replaced:
+/// `which`, `kill`, `uname`, `sw_vers`, `ifconfig`, `ip`, `ps`,
+/// `netstat`, `lsof`, `scutil`, `pbcopy`, `xclip`, `wl-copy`,
+/// `curl`, and `ping`. It does NOT cover the
 /// irreducible product-behavior binaries (`wg-quick`, `wg`, `openvpn`,
 /// `iptables-restore`, `nft`, `pfctl`, `resolvconf`).
 const FORBIDDEN_SHELL_OUTS: &[&str] = &[
@@ -438,7 +438,7 @@ fn check_no_shell_regressions() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     } else {
         eprintln!(
-            "xtask check-no-shell-regressions: {} violation(s) — plan 002 replaced these system-binary shell-outs with native Rust. Re-introducing them risks the Fedora-without-`which` regression class. For legitimate exceptions, annotate with `// xtask:allow-shell-regression: <reason>`.",
+            "xtask check-no-shell-regressions: {} violation(s) — the CommandRunner port replaced these system-binary shell-outs with native Rust. Re-introducing them risks the Fedora-without-`which` regression class. For legitimate exceptions, annotate with `// xtask:allow-shell-regression: <reason>`.",
             violations.len()
         );
         for v in &violations {

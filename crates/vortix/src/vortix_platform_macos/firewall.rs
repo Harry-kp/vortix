@@ -1,6 +1,6 @@
 //! macOS pf (Packet Filter) firewall implementation for kill switch.
 //!
-//! Plan multi-connection U10: the ruleset synthesiser now consumes a slice
+//! The ruleset synthesiser now consumes a slice
 //! of [`ActiveTunnelInfo`] and emits per-tunnel allow rules in a single
 //! ruleset. The ruleset is fed to `pfctl -f -` via stdin, which performs
 //! an atomic in-kernel replace — so transitions from one active set to

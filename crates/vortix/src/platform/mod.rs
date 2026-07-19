@@ -2,7 +2,7 @@
 //!
 //! Plan 003 moves capability-port traits and impls into `vortix-core::ports::*`
 //! and the `vortix-platform-{linux,macos}` crates. This module keeps the
-//! legacy trait/impl path aliases working until plan 003 U7 swaps consumers
+//! legacy trait/impl path aliases working until swaps consumers
 //! over to the `Platform` aggregate.
 
 pub mod aggregate;
@@ -18,13 +18,13 @@ pub use aggregate::{
 };
 
 // ───────────────────────────────────────────────────────────────────────────
-// Process-global platform — the U7 consumer-migration seam.
+// Process-global platform — the consumer-migration seam.
 //
 // Plan #003 originally threaded the Platform aggregate through every consumer.
-// We instead install a process-wide singleton, matching plan #002's
+// We instead install a process-wide singleton, matching the runner's
 // `crate::vortix_process::global_runner()` pattern. `main.rs` initialises it once at
 // startup; consumers reach for `current_platform()` instead of branching on
-// `cfg(target_os)`. Plan #005's async engine refactor swaps this back to
+// `cfg(target_os)`. The async engine refactor swaps this back to
 // explicit dependency injection.
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -56,7 +56,7 @@ compile_error!("Vortix currently only supports macOS and Linux");
 pub use crate::constants::DEFAULT_VPN_INTERFACE;
 pub use crate::constants::KILLSWITCH_EMERGENCY_MSG;
 
-// Capability ports now live in `vortix-core::ports::*` (plan 003 U1/U2).
+// Capability ports now live in `vortix-core::ports::*`.
 // Keep the legacy trait names as aliases so existing call sites keep working.
 pub use crate::vortix_core::ports::dns::DnsResolver;
 pub use crate::vortix_core::ports::interface::Interface as InterfaceDetector;

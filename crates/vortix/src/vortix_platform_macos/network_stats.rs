@@ -1,6 +1,6 @@
 //! macOS network statistics via `libc::getifaddrs` (BSD `if_data`).
 //!
-//! Plan 002 U7: replaced `netstat -ib` shell-out + stdout parsing with a
+//! replaced `netstat -ib` shell-out + stdout parsing with a
 //! direct `getifaddrs` walk. `ifa_data` on macOS points at a `struct
 //! if_data` whose `ifi_ibytes` / `ifi_obytes` fields are the same
 //! counters `netstat -ib` reports. Behavior parity: counters are the

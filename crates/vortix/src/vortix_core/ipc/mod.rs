@@ -1,4 +1,4 @@
-//! IPC envelope + framing for `EngineHandle::Remote` (plan 015 phase D / plan 010).
+//! IPC envelope + framing for `EngineHandle::Remote`.
 //!
 //! The daemon (`vortix daemon`) and the client (TUI/CLI) communicate
 //! via length-prefixed JSON frames on a Unix domain socket. This
@@ -24,8 +24,7 @@ use thiserror::Error;
 /// Wire protocol version spoken by this build. Bumped on any breaking
 /// change to the envelope, op, or result shapes. Peers compare versions
 /// on every exchange; a mismatch is a loud typed error naming both
-/// sides — never a silent fallback (#242-era lesson: silent degradation
-/// masks real bugs). Frames from pre-versioning builds deserialize with
+/// sides — never a silent fallback. Frames from pre-versioning builds deserialize with
 /// `protocol_version = 0` via `#[serde(default)]`, which fails the
 /// comparison and surfaces the upgrade hint.
 pub const IPC_PROTOCOL_VERSION: u32 = 1;
@@ -48,15 +47,14 @@ pub enum IpcOp {
     Execute(UserCommand),
     /// Read the current single-FSM snapshot (v1-compat).
     Snapshot,
-    /// Read the full multi-tunnel registry snapshot (plan
-    /// 2026-07-18-001 U2). Answered with [`IpcResult::RegistrySnapshot`].
+    /// Read the full multi-tunnel registry snapshot. Answered with [`IpcResult::RegistrySnapshot`].
     RegistrySnapshot,
     /// Subscribe to live `EngineEvent` stream. The daemon switches the
     /// connection into streaming mode after sending the ack; subsequent
     /// frames on this connection are events until the client closes.
     Subscribe,
     /// Graceful daemon shutdown. Authorized client only (UID-matching
-    /// per `SO_PEERCRED`; see plan 015 phase E).
+    /// per `SO_PEERCRED`; see peer-credential auth).
     Shutdown,
 }
 
@@ -93,7 +91,7 @@ pub enum IpcResult {
     /// registry has no primary, `state` is `Connection::Disconnected`.
     /// Multi-tunnel-aware clients should prefer [`Self::RegistrySnapshot`].
     Snapshot { state: Connection },
-    /// Multi-tunnel snapshot (plan #001 U22). Carries the full set of
+    /// Multi-tunnel snapshot. Carries the full set of
     /// active tunnels plus the derived primary and global killswitch
     /// state. New clients query this; v1 clients that only know
     /// [`Self::Snapshot`] keep working through the back-compat
@@ -106,8 +104,7 @@ pub enum IpcResult {
     /// `Subscribe` acknowledged; subsequent frames are streamed events.
     Subscribed,
     /// A streamed engine event, pushed by the daemon after the
-    /// `Subscribed` ack on a subscription connection (plan
-    /// 2026-07-18-001 U2). Only ever appears server→client on a
+    /// `Subscribed` ack on a subscription connection. Only ever appears server→client on a
     /// subscribe stream, never as a request/response result.
     Event(EventEnvelope),
     /// Periodic keep-alive on an idle subscription stream. Its only job
@@ -147,7 +144,7 @@ pub enum IpcError {
     #[error("unsupported wire format: {0}")]
     UnsupportedWireFormat(String),
     /// Peer speaks a different [`IPC_PROTOCOL_VERSION`]. Both sides are
-    /// named so the user knows which binary to upgrade (AE8).
+    /// named so the user knows which binary to upgrade.
     #[error("IPC protocol mismatch: daemon speaks v{daemon}, client speaks v{client}")]
     VersionMismatch { daemon: u32, client: u32 },
     #[error("internal daemon error: {0}")]
@@ -170,7 +167,7 @@ pub trait IpcTransport: Send + Sync {
 
     /// Open a live event subscription: send `Subscribe` and return a
     /// receiver fed by the daemon's pushed [`IpcResult::Event`] stream
-    /// (plan 2026-07-18-001 U2). The concrete transport owns the reader
+    ///. The concrete transport owns the reader
     /// that forwards frames into the returned channel.
     ///
     /// Default: unsupported — read-only / mock transports don't stream.
@@ -186,7 +183,7 @@ pub trait IpcTransport: Send + Sync {
 }
 
 /// Client-side transport error surface, discriminated by how callers
-/// must react (per U1: absent daemon = silent fallback; version
+/// must react (absent daemon = silent fallback; version
 /// mismatch = loud error).
 #[derive(Debug, Clone, Error)]
 pub enum TransportError {

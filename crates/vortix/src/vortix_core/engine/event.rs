@@ -1,4 +1,4 @@
-//! `EngineEvent` schema and JSONL envelope (plan #005 U1).
+//! `EngineEvent` schema and JSONL envelope.
 //!
 //! Fifteen day-one event variants describe everything the FSM emits to the
 //! journal and the broadcast channel. The envelope carries a
@@ -110,7 +110,7 @@ pub enum EngineEvent {
     /// Network monitor detected the default route returning.
     NetworkLinkRestored { new_gateway: Option<String> },
     /// Profile renamed by the user; FSM updates display name in place
-    /// (`profile_id` is stable across renames per plan #005 R3).
+    /// (`profile_id` is stable across renames ).
     ProfileRenamed {
         profile_id: ProfileId,
         old_display_name: String,
@@ -127,7 +127,7 @@ pub enum EngineEvent {
         profile_id: ProfileId,
         reason: DegradedReason,
     },
-    /// Plan 008 U2: the FSM needs the user to supply input to continue
+    /// the FSM needs the user to supply input to continue
     /// (2FA code, passphrase, etc.). Reserved for issue #191; no
     /// consumer wired in v0.3.0. The corresponding `UserCommand::UserAnswered`
     /// references the same `prompt_id`.
@@ -137,18 +137,18 @@ pub enum EngineEvent {
         prompt_kind: crate::vortix_core::engine::state::PromptKind,
         prompt_text: String,
     },
-    /// Multi-connection plan U23: the primary tunnel (the one holding the
+    /// the primary tunnel (the one holding the
     /// kernel default route) changed. `from`/`to` are `None` when the
     /// transition crosses the "no primary" boundary (initial connect or
     /// last-primary disconnect). The wiring that emits this event from the
-    /// registry lands in U7/U6B; U23 only adds the variant.
+    /// registry wiring lands later; this only adds the variant.
     PrimaryTunnelChanged {
         from: Option<ProfileId>,
         to: Option<ProfileId>,
         via_interface: Option<String>,
         reason: PrimaryChangeReason,
     },
-    /// Multi-connection plan U23: a connect attempt was rejected by
+    /// a connect attempt was rejected by
     /// `TunnelRegistry::connect` because a `Conflict` was detected and the
     /// caller did not pass `force=true`. The UI uses this to render the
     /// takeover overlay; CLI replay tooling uses it to summarise blocked
@@ -163,12 +163,12 @@ pub enum EngineEvent {
 ///
 /// Distinct from `vortix_core::engine::registry::PrimaryTunnelChangeReason`
 /// (which is the internal, non-serde enum the registry uses for structured
-/// logging today). The journal-event variant is named per plan U23 — its
+/// logging today). The journal-event variant is named ahead of the registry event wiring — its
 /// `InitialConnect` value covers the "no primary → new primary" transition
 /// the registry expresses with `NewTunnelTookDefaultRoute`. Keeping them
 /// separate lets the journal vocabulary evolve without forcing every
 /// registry internal-state change to bump the journal schema, and vice
-/// versa. The U7/U6B wiring is responsible for mapping the registry's
+/// versa. The registry event wiring is responsible for mapping the registry's
 /// reason onto this enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -238,7 +238,7 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    // U23: PrimaryTunnelChanged + ConnectAttemptBlockedByConflict
+    // PrimaryTunnelChanged + ConnectAttemptBlockedByConflict
     // ─────────────────────────────────────────────────────────────────────
 
     #[test]
@@ -382,7 +382,7 @@ mod tests {
 
     #[test]
     fn existing_tunnel_up_serialization_unchanged() {
-        // Regression guard: adding U23 variants must not alter the wire shape
+        // Regression guard: adding these variants must not alter the wire shape
         // of any pre-existing variant. The serialized JSON for TunnelUp is
         // pinned exactly.
         let event = EngineEvent::TunnelUp {

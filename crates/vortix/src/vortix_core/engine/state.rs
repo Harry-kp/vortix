@@ -1,4 +1,4 @@
-//! Engine connection state types (plan #005 U1).
+//! Engine connection state types.
 //!
 //! Five-variant `Connection` machine plus the supporting health/failure
 //! enums. Matches the brainstorm shape: `Failed` collapses into
@@ -12,7 +12,7 @@ use crate::vortix_core::profile::ProfileId;
 
 /// How long the engine waits for a connect/reconnect to succeed before
 /// declaring the retry budget exhausted. Per the brainstorm: 300s default,
-/// configurable via plan #006's `[engine] retry_budget_secs`.
+/// configurable via the settings `[engine] retry_budget_secs`.
 pub const DEFAULT_RETRY_BUDGET_SECS: u64 = 300;
 
 /// Why a previous connect or reconnect attempt ended in `Disconnected`.
@@ -68,7 +68,7 @@ pub enum ConnectionHealth {
 }
 
 /// Technical details parsed from the VPN interface (relocated from the
-/// binary-side `crates/vortix/src/state/connection.rs`; plan 007 prunes
+/// binary-side `crates/vortix/src/state/connection.rs`; a later cleanup prunes
 /// the duplicate).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DetailedConnectionInfo {
@@ -126,7 +126,7 @@ impl Default for DetailedConnectionInfo {
     }
 }
 
-/// What kind of user input the FSM is paused waiting for (plan 008 U2).
+/// What kind of user input the FSM is paused waiting for.
 ///
 /// `#[non_exhaustive]` so adding e.g. `BiometricChallenge` later doesn't
 /// break consumers pattern-matching on this enum.
@@ -142,7 +142,7 @@ pub enum PromptKind {
     Generic { label: String },
 }
 
-/// The connection state machine (plan 005, extended in plan 008 U2).
+/// The connection state machine.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum Connection {
@@ -178,8 +178,8 @@ pub enum Connection {
         started_at: SystemTime,
     },
     /// Mid-connect prompt waiting for the user to supply input
-    /// (2FA challenge, certificate passphrase, etc.). Plan 008 U2
-    /// reserves the slot for issue #191 (Interactive 2FA/MFA);
+    /// (2FA challenge, certificate passphrase, etc.). The slot is reserved
+    ///  for issue #191 (Interactive 2FA/MFA);
     /// no consumer is wired in v0.3.0.
     AwaitingUserInput {
         profile_id: ProfileId,
@@ -262,9 +262,6 @@ mod tests {
         }
         .is_steady());
     }
-
-    // Plan 008 U2 — AwaitingUserInput coverage.
-
     #[test]
     fn awaiting_user_input_carries_profile_id() {
         let p = ProfileId::new("corp");

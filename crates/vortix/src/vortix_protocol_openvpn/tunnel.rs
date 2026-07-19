@@ -24,14 +24,14 @@ use tracing::{debug, info, warn};
 use crate::vortix_protocol_openvpn::parser::parse_ovpn_conf;
 
 /// Maximum wall-clock to wait for openvpn to create the unix
-/// management socket after spawn (plan 2026-06-02-001, #191,
+/// management socket after spawn (#191,
 /// Approach B-minimal). Typical macOS spawn takes <200ms; 5s gives
 /// loaded systems ample headroom while still surfacing
 /// catastrophic-spawn-failure within the user's attention span.
 const OVPN_MGMT_SOCKET_TIMEOUT_MS: u64 = 5000;
 
 /// Read the credentials bundle file written by the TUI/CLI auth flow
-/// (plan 2026-06-02-001 U3/U4, #191, Approach B-minimal). Returns
+/// (/U4, #191, Approach B-minimal). Returns
 /// `Ok(Some((user, pass, otp)))` when the file exists and has the
 /// expected 3-line shape, `Ok(None)` when the file is absent
 /// (non-MFA connect path), `Err` when the file exists but is
@@ -60,7 +60,7 @@ fn read_mgmt_credentials_bundle(path: &Path) -> std::io::Result<Option<(String, 
 }
 
 /// Drive `OpenVPN`'s management protocol auth dance over a unix socket
-/// (plan 2026-06-02-001, #191, Approach B-minimal). Implements only
+/// (#191, Approach B-minimal). Implements only
 /// the static-challenge-inline path used by `ovpn-totp`-shaped
 /// profiles: release the hold, respond to `>PASSWORD:Need 'Auth' SC:
 /// 1,<prompt>` with username + SCRV1 envelope. Returns `Ok(())` when
@@ -96,7 +96,7 @@ fn drive_mgmt_auth(
 
     let send = |w: &mut UnixStream, line: &str| -> Result<(), TunnelError> {
         // No log emit of the line content — credentials cannot
-        // appear in tracing spans (plan 2026-06-02-001 PF-8).
+        // appear in tracing spans (PF-8).
         w.write_all(line.as_bytes())
             .and_then(|()| w.write_all(b"\n"))
             .and_then(|()| w.flush())
@@ -271,12 +271,12 @@ pub struct OvpnTunnel {
     /// Overall connect timeout in seconds.
     pub connect_timeout_secs: u64,
     /// True when this tunnel is being brought up as a secondary in a
-    /// multi-tunnel session (plan 001 U14). When true, `up()` appends
+    /// multi-tunnel session. When true, `up()` appends
     /// `--pull-filter ignore "dhcp-option DNS"` to the openvpn argv so the
     /// server's pushed DNS does not clobber the primary's resolver. Defaults
     /// to `false` — single-tunnel callers see unchanged behaviour. The
-    /// `TunnelRegistry` (plan 001 U5) sets this on the tunnel before invoking
-    /// `up()`; until U5 lands no production callsite flips this.
+    /// `TunnelRegistry` sets this on the tunnel before invoking
+    /// `up()`; no production callsite yet flips this.
     pub is_secondary: bool,
 }
 
@@ -335,12 +335,12 @@ impl OvpnTunnel {
     }
 
     /// Builder: mark this tunnel as a secondary in a multi-tunnel session
-    /// (plan 001 U14). When set to `true`, `up()` appends
+    ///. When set to `true`, `up()` appends
     /// `--pull-filter ignore "dhcp-option DNS"` to the openvpn argv,
     /// suppressing server-pushed DNS so the primary tunnel's resolver
     /// stays authoritative.
     ///
-    /// Defaults to `false`. The `TunnelRegistry` (plan 001 U5) toggles this
+    /// Defaults to `false`. The `TunnelRegistry` toggles this
     /// before calling `up()` once it lands; until then no production callsite
     /// flips the flag and the existing single-tunnel argv is preserved.
     ///
@@ -367,8 +367,7 @@ impl OvpnTunnel {
             .map(|d| d.join(format!("{safe_name}.auth")))
     }
 
-    /// Path used by the static-challenge SCRV1 envelope (plan
-    /// 2026-06-02-001 U3 / PF-2, #191). The connect path writes the
+    /// Path used by the static-challenge SCRV1 envelope. The connect path writes the
     /// envelope to this sibling of the canonical auth file, hands it
     /// to openvpn via `--auth-user-pass`, and deletes it immediately
     /// after the daemon fork returns — keeping the canonical
@@ -381,7 +380,7 @@ impl OvpnTunnel {
     }
 }
 
-/// `OpenVPN`-specific status (placeholder; richer parsing arrives with plan #005).
+/// `OpenVPN`-specific status (placeholder; richer parsing planned).
 #[derive(Debug, Default)]
 pub struct OvpnStatus {
     pub pid: Option<u32>,
@@ -539,7 +538,7 @@ fn poll_log_until_ready(
 }
 
 /// Build the openvpn daemon argv for a given profile. Pure helper extracted
-/// so the secondary-DNS-suppression branch (plan 001 U14) is unit-testable
+/// so the secondary-DNS-suppression branch is unit-testable
 /// without spawning a subprocess. The caller appends `--auth-user-pass <path>`
 /// afterwards when an auth file is available.
 fn build_ovpn_args(
@@ -563,7 +562,7 @@ fn build_ovpn_args(
         verbosity.to_string(),
     ];
 
-    // Plan 001 U14: when this tunnel is a secondary, suppress server-pushed
+    // when this tunnel is a secondary, suppress server-pushed
     // DNS so the primary's resolver stays authoritative. Requires OpenVPN
     // >= 2.4 — gated upstream by `VpnRuntime::check_dependencies`.
     if is_secondary {
@@ -784,9 +783,7 @@ impl Tunnel for OvpnTunnel {
             poll_log_until_ready(&log_path, &pid_path, self.connect_timeout_secs)?;
 
         // The kernel interface name must come from the log scrape. The
-        // multi-tunnel state-authority contract (R1, R5 of
-        // docs/brainstorms/2026-06-01-multi-tunnel-state-authority-
-        // requirements.md) requires `details.interface` to be byte-
+        // multi-tunnel state-authority contract requires `details.interface` to be byte-
         // comparable with `route get`'s output. A synthetic label like
         // `openvpn-{safe_name}` would silently disable primary-election
         // for this profile and silently break per-tunnel killswitch
@@ -833,7 +830,7 @@ impl Tunnel for OvpnTunnel {
         let safe_name = sanitize_profile_name(handle.profile_id.as_str());
 
         if let Some(pid) = handle.pid {
-            // Plan 002 U2: direct PID signal via libc::kill instead of
+            // direct PID signal via libc::kill instead of
             // shelling to `/usr/bin/kill`. SIGTERM (15) gives the OVPN
             // daemon a chance to clean up before pkill (below) fires the
             // pattern-matched fallback.
@@ -872,7 +869,7 @@ impl Tunnel for OvpnTunnel {
             }
         }
 
-        // Plan 002 U6: fallback pattern-matched kill via process
+        // fallback pattern-matched kill via process
         // enumeration + libc::kill, replacing the prior `pkill -f` shell-out.
         // Substring-match "openvpn" + "vortix-<safe_name>" against each
         // PID's cmdline. Catches the daemon even when the captured PID
@@ -898,7 +895,7 @@ impl Tunnel for OvpnTunnel {
 
         for stale_pid in stale_pids {
             if let Ok(libc_pid) = libc::pid_t::try_from(stale_pid) {
-                // SAFETY: thin syscall wrapper; see U2 for the full
+                // SAFETY: thin syscall wrapper; see the full
                 // invariant analysis. Errors are best-effort warn-only —
                 // the prior `pkill` also ignored failures.
                 #[allow(unsafe_code)]
@@ -1035,7 +1032,7 @@ mod tests {
         assert_eq!(parse_kernel_interface(log), None);
     }
 
-    // Plan 001 U14: argv-building behaviour for primary vs. secondary tunnels.
+    // argv-building behaviour for primary vs. secondary tunnels.
     // The argv builder is pure so we can assert against it without spawning a
     // subprocess; the secondary branch must inject the `--pull-filter` triple
     // and the primary branch must not.

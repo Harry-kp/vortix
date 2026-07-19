@@ -1,4 +1,4 @@
-//! `Settings` struct + figment-layered resolution (plan #006 U1).
+//! `Settings` struct + figment-layered resolution.
 //!
 //! Layer precedence (last wins): defaults → `/etc/vortix/config.toml` →
 //! user file (`${XDG_CONFIG_HOME}/vortix/settings.toml`, SUDO_USER-aware) →
@@ -11,7 +11,7 @@ use figment::Figment;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// Current schema version for `settings.toml` (plan 008 U3).
+/// Current schema version for `settings.toml`.
 ///
 /// Bump when a settings field renames, removes, or changes type.
 /// Additive field additions do not require a bump.
@@ -130,7 +130,7 @@ pub enum SettingsError {
 }
 
 /// Migrate a parsed `Settings` from an older schema version to the
-/// current [`SETTINGS_SCHEMA_VERSION`] (plan 008 U3).
+/// current [`SETTINGS_SCHEMA_VERSION`].
 ///
 /// v0.3.0 only knows `schema_version` = 1; older or newer versions
 /// return `UnsupportedSchema`. Future versions will add upgrade arms
@@ -196,7 +196,7 @@ impl Settings {
         }
         fig = fig.merge(Env::prefixed("VORTIX_").split("__"));
         let s: Self = fig.extract()?;
-        // Plan 008 U3: route through migrate_settings so an unsupported
+        // route through migrate_settings so an unsupported
         // schema_version surfaces as a typed error instead of silently
         // accepting unknown fields.
         migrate_settings(s)
@@ -295,9 +295,6 @@ disk = false
         let err = Settings::load_from(None, Some(&path)).unwrap_err();
         assert!(matches!(err, SettingsError::Figment(_)));
     }
-
-    // Plan 008 U3 — schema_version + migration coverage.
-
     #[test]
     fn schema_version_defaults_to_one() {
         let s = Settings::load_from(None, None).unwrap();

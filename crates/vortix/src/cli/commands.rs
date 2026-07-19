@@ -21,7 +21,7 @@ use crate::vpn_runtime::VpnRuntime;
 /// Prompt for a 2FA code on the controlling tty with masked echo (each
 /// character is replaced by `*`). Returns `Err` when stdin is not a tty —
 /// the connect path treats this as a hard failure and exits non-zero with
-/// an actionable message naming the prompt kind. Plan 2026-06-02-001 U4.
+/// an actionable message naming the prompt kind. .
 ///
 /// Implementation uses `crossterm`'s raw mode (already in the workspace,
 /// no new dep) and reads byte-by-byte. A `RawModeGuard` ensures the
@@ -166,7 +166,7 @@ pub fn handle_command(
     }
 }
 
-/// `vortix audit` — per-process socket snapshot (plan 015 phase C / plan 013).
+/// `vortix audit` — per-process socket snapshot.
 #[derive(Serialize)]
 struct AuditData {
     sockets: Vec<crate::vortix_core::ports::socket_audit::SocketSnapshot>,
@@ -243,7 +243,7 @@ fn handle_audit(pid_filter: Option<u32>, vpn_only: bool, mode: OutputMode) -> i3
 }
 
 /// `vortix daemon` — host the engine as a long-running IPC server
-/// (plan 015 phase D / plan 010).
+///.
 /// Resolve when the daemon should shut down: SIGTERM (systemd/launchd
 /// stop) or Ctrl-C (foreground run).
 async fn shutdown_signal() {
@@ -328,11 +328,11 @@ fn handle_daemon(socket_override: Option<std::path::PathBuf>, mode: OutputMode) 
         |d| d.join(constants::PROFILES_DIR_NAME),
     );
 
-    // Post-P1, Execute/Snapshot/RegistrySnapshot all route through the
+    // Execute/Snapshot/RegistrySnapshot all route through the
     // registry; this legacy engine handle remains ONLY as Subscribe's
     // journal source. Registry transitions don't journal events yet, so
-    // Subscribe streams heartbeats until P6 wires event emission —
-    // clients poll RegistrySnapshot for state in the meantime (P4).
+    // Subscribe streams heartbeats until registry transitions are journaled —
+    // clients poll RegistrySnapshot for state in the meantime.
     let engine_handle =
         runtime.block_on(async { crate::daemon::build_engine_handle(&profiles_dir) });
     if engine_handle.is_none() {
@@ -365,7 +365,7 @@ fn handle_daemon(socket_override: Option<std::path::PathBuf>, mode: OutputMode) 
     // the kernel (adopt new sessions, detect drops, auto-reconnect), and
     // the server serves it over `IpcOp::RegistrySnapshot`. Reconcile runs
     // even when the engine handle is unavailable — read-only multi-tunnel
-    // status doesn't need the FSM. (plan 2026-07-18-001 U2/U4)
+    // status doesn't need the FSM.
     let registry: crate::vortix_core::engine::registry_handle::RegistryHandle<
         crate::tunnel::TunnelKind,
     > = runtime.block_on(async {
@@ -377,7 +377,7 @@ fn handle_daemon(socket_override: Option<std::path::PathBuf>, mode: OutputMode) 
         .with_registry_handle(registry.clone())
         .with_profiles_dir(profiles_dir.clone());
 
-    // R7: adopt already-running tunnels ONCE before serving, so the first
+    // adopt already-running tunnels ONCE before serving, so the first
     // snapshot a client reads includes restart-survivors (a daemon restart
     // issues zero connect commands — the tunnels were never torn down).
     // The periodic supervisor keeps them fresh afterward.
@@ -402,8 +402,8 @@ fn handle_daemon(socket_override: Option<std::path::PathBuf>, mode: OutputMode) 
         .await;
     });
 
-    // P5: bring up boot-persisted profiles (`vortix service persist`).
-    // The R7 adoption above already covered restart survivors, so only
+    // bring up boot-persisted profiles (`vortix service persist`).
+    // The adoption pass above already covered restart survivors, so only
     // flagged profiles with no live tunnel get a connect. force=false —
     // if two flagged profiles both claim the default route, the first
     // wins and the second is refused loudly here instead of silently
@@ -512,7 +512,7 @@ fn handle_daemon(socket_override: Option<std::path::PathBuf>, mode: OutputMode) 
     0
 }
 
-// ── Boot service (plan 2026-07-19-001 P5) ───────────────────────────────
+// ── Boot service ───────────────────────────────
 
 /// One service-manager invocation (systemctl / launchctl) through the
 /// `CommandRunner`. Returns the trimmed stderr on failure so callers
@@ -574,8 +574,7 @@ fn handle_service(
     }
 }
 
-/// Set or clear a profile's boot-connect flag (plan 2026-07-19-001
-/// P5). Sidecar-only edit under the caller's config dir — the boot
+/// Set or clear a profile's boot-connect flag. Sidecar-only edit under the caller's config dir — the boot
 /// daemon reads the flagged set at startup.
 fn handle_service_persist(profile: &str, value: bool, config_dir: &Path, mode: OutputMode) -> i32 {
     use crate::vortix_config::profile_store::{FsProfileStore, ProfileStore, ProfileStoreError};
@@ -636,7 +635,7 @@ fn handle_service_install(
         );
     }
 
-    // The daemon serves the sudo-invoking user (P2 owner auth). A
+    // The daemon serves the sudo-invoking user. A
     // direct-root install has no such user — the daemon then serves
     // only root, which is rarely what anyone wants.
     let owner_uid = std::env::var("SUDO_UID")
@@ -848,7 +847,7 @@ fn handle_service_uninstall(
         }
     }
 
-    // R12 no-zombie: verify nothing we manage survived.
+    // no-zombie guarantee: verify nothing we manage survived.
     let leftovers: Vec<String> = service::managed_artifacts(manager)
         .into_iter()
         .filter(|p| p.exists())
@@ -948,11 +947,11 @@ fn handle_up(
     config_dir: &Path,
     mode: OutputMode,
 ) -> i32 {
-    // `yes` bypasses the multi-tunnel conflict prompt that U7 lands on
+    // `yes` bypasses the multi-tunnel conflict prompt that lands on
     // the connect-path overlay. The CLI today goes directly through
     // `VpnRuntime::connect_and_wait` (no conflict check there), so `yes`
     // is a no-op in the current build — but the flag is wired so scripts
-    // can adopt it ahead of U7's overlay shipping. Once U7 wires the
+    // can adopt it ahead of the overlay shipping. Once the
     // registry conflict-check into the CLI path, this flag will gate
     // the bypass.
     let _ = yes;
@@ -985,12 +984,12 @@ fn handle_up(
         }
     };
 
-    // U3: when a daemon is running, drive the connect through it — the
+    // When a daemon is running, drive the connect through it — the
     // root daemon holds privilege, so an unprivileged client connects
     // without sudo. 2FA profiles need the local tty prompt (in-band
     // credential delivery over IPC is a follow-up), so they're refused on
     // the daemon path with a pointer. If the daemon turns out unavailable,
-    // we fall through to the local privileged path unchanged (R11).
+    // we fall through to the local privileged path unchanged.
     if let Some(socket) = crate::daemon::daemon_socket_path_if_present() {
         engine.load_metadata();
         let profile = engine
@@ -1106,7 +1105,7 @@ fn handle_up(
     // Check dependencies before attempting connection. Routes through
     // `VpnRuntime::check_dependencies` so the TUI and CLI refuse the
     // same dep set — including the OpenVPN 2.4+ probe that the
-    // legacy inline CLI check used to skip (R13 / plan 001 U14).
+    // legacy inline CLI check used to skip.
     engine.load_metadata();
     if let Some(profile) = engine.profiles.iter().find(|p| p.name == profile_name) {
         let missing = crate::vpn_runtime::VpnRuntime::check_dependencies(
@@ -1168,7 +1167,7 @@ fn handle_up(
         return 0;
     }
 
-    // Multi-connection plan #001 U7: route the CLI connect through the
+    // route the CLI connect through the
     // registry's conflict gate before invoking the legacy tunnel-up path.
     // The CLI is headless and has no in-memory registry, so we build a
     // transient one from the scanner's active-session snapshot and ask it
@@ -1212,7 +1211,7 @@ fn handle_up(
         }
     }
 
-    // Plan 2026-06-02-001 U4 (#191): if the profile declares a
+    // (#191): if the profile declares a
     // `static-challenge` directive, prompt for the OTP on the
     // controlling tty (always masked, regardless of the directive's
     // echo flag — DEC-2), write the SCRV1 envelope into the canonical
@@ -1304,7 +1303,7 @@ fn handle_up(
 
     let result = engine.connect_and_wait(&profile_name, Duration::from_secs(timeout_secs));
     // The protocol layer deletes the SCRV1 envelope after openvpn forks
-    // (plan 2026-06-02-001 U3 / PF-2). Belt-and-braces: if the connect
+    //. Belt-and-braces: if the connect
     // never reached spawn (early-failure path), clear the envelope
     // here so it doesn't linger.
     if let Some(name) = scrv1_restore_needed {
@@ -1378,7 +1377,7 @@ fn handle_up(
     }
 }
 
-/// Detect a multi-tunnel conflict for the CLI's `up` path (plan #001 U7).
+/// Detect a multi-tunnel conflict for the CLI's `up` path.
 ///
 /// The CLI doesn't share an in-memory `TunnelRegistry` with the running
 /// session — active tunnels are discovered via
@@ -1387,7 +1386,7 @@ fn handle_up(
 /// `claims_default_route_*` helpers (same logic the TUI's
 /// `TunnelRegistry::detect_conflict` uses) so the two surfaces refuse the
 /// same set of takeovers. The route-overlap branch is a CLI-only
-/// superset until R10 v2 brings route-overlap detection into the
+/// superset until a follow-up brings route-overlap detection into the
 /// registry.
 /// Acquire the cross-process lifecycle lock or exit with a structured
 /// error. Proceeding without the lock would reintroduce the concurrent
@@ -1492,7 +1491,7 @@ fn handle_down(
     }
 
     if targets.is_empty() {
-        // Idempotent: already disconnected = success. Matches U20
+        // Idempotent: already disconnected = success. Matches the
         // scenario "vortix down corp with corp not active → exit 0".
         let data = DownData {
             state: "disconnected".into(),
@@ -1506,10 +1505,10 @@ fn handle_down(
         return 0;
     }
 
-    // U3: route the teardown through a running daemon (no sudo). The
+    // Route the teardown through a running daemon (no sudo). The
     // client already discovered the targets from the kernel scanner;
     // the daemon owns the FSM teardown. Falls through to the local
-    // privileged path if the daemon is unavailable (R11).
+    // privileged path if the daemon is unavailable.
     if let Some(socket) = crate::daemon::daemon_socket_path_if_present() {
         let profile_id = profile_filter.map(crate::vortix_core::profile::ProfileId::new);
         let cmd = if force {
@@ -1677,12 +1676,12 @@ fn handle_reconnect(
         }
     }
 
-    // U3: route the reconnect through a running daemon — it cycles the
+    // Route the reconnect through a running daemon — it cycles the
     // tunnel(s) atomically via the FSM (disconnect then connect), so a
     // non-root client needs no sudo. 2FA profiles that require a fresh
     // OTP on reconnect aren't handled on this path yet (the daemon has no
     // tty); such a reconnect surfaces as a daemon error. Falls through to
-    // the local per-tunnel loop if the daemon is unavailable (R11).
+    // the local per-tunnel loop if the daemon is unavailable.
     if let Some(socket) = crate::daemon::daemon_socket_path_if_present() {
         let cmd = crate::vortix_core::engine::input::UserCommand::Reconnect {
             profile_id: profile_filter.map(crate::vortix_core::profile::ProfileId::new),
@@ -1803,8 +1802,8 @@ fn handle_reconnect(
 ///   `data.connection.{state,profile,protocol,uptime_secs}` continue to
 ///   work in the primary-only case.
 ///
-/// U22 will replace the transitional single-entry construction below
-/// with a registry-driven snapshot; U21's job is just to make the v2
+/// A follow-up will replace the transitional single-entry construction below
+/// with a registry-driven snapshot; this stage's job is just to make the v2
 /// envelope shape available.
 #[derive(Serialize)]
 struct StatusData {
@@ -1854,8 +1853,7 @@ fn handle_status(
 
     // Read-only ops route through the daemon ONLY when its socket
     // exists and is connectable. Otherwise fall back to direct disk +
-    // scanner reads (plan multi-connection D3: read-only ops bypass
-    // daemon when socket absent). The `--no-daemon` flag forces the
+    // scanner reads. The `--no-daemon` flag forces the
     // bypass even when the daemon is up — useful for testing.
     let daemon_socket = if no_daemon {
         None
@@ -1867,14 +1865,14 @@ fn handle_status(
     let mut snap = engine.scan_status();
     // When the daemon socket is connectable, overlay its authoritative
     // view onto the scanner-derived snapshot via the EngineHandle::Remote
-    // seam. Prefer the full multi-tunnel registry snapshot (U2); fall back
-    // to the single-FSM snapshot (U1) for an older daemon that doesn't
+    // seam. Prefer the full multi-tunnel registry snapshot; fall back
+    // to the single-FSM snapshot for an older daemon that doesn't
     // serve a registry. The scanner still owns live counters and
     // kill-switch state. Failure handling is deliberately split:
     // unavailable/protocol errors keep the scanner view silently
     // (bypass-on-error keeps `vortix status` reliable), but a version
     // mismatch is a loud typed exit — silent fallback there would mask a
-    // real client/daemon skew (AE8).
+    // real client/daemon skew.
     let mut daemon_registry: Option<crate::vortix_core::engine::registry_handle::RegistrySnapshot> =
         None;
     if let Some(socket) = daemon_socket {
@@ -2107,7 +2105,7 @@ fn overlay_daemon_state(
 }
 
 /// Fetch the daemon's full multi-tunnel registry snapshot through
-/// `EngineHandle::Remote` (plan 2026-07-18-001 U2). Same tri-state
+/// `EngineHandle::Remote`. Same tri-state
 /// contract as [`daemon_snapshot_via_remote`]: `Ok(Some)` on success,
 /// `Ok(None)` for silent-fallback degradations (unreachable, or an older
 /// daemon that doesn't serve a registry), and `Err((daemon, client))`
@@ -2211,7 +2209,7 @@ fn registry_status_entries(
     (connections, primary)
 }
 
-/// Loud exit for a client/daemon IPC version skew (AE8) — never a silent
+/// Loud exit for a client/daemon IPC version skew — never a silent
 /// fallback, since it masks real skew bugs.
 fn exit_daemon_version_mismatch(
     mode: OutputMode,
@@ -2235,8 +2233,7 @@ fn exit_daemon_version_mismatch(
     );
 }
 
-/// Route a write command through a running daemon (plan 2026-07-18-001
-/// U3). A non-root client drives the privileged operation via the root
+/// Route a write command through a running daemon. A non-root client drives the privileged operation via the root
 /// daemon — no sudo. Returns:
 ///
 /// - `Some(conn)` after the daemon executed the command, where `conn` is
@@ -2453,7 +2450,7 @@ struct ProfileEntry {
     connected: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_used: Option<String>,
-    /// Stable profile ID from the `.meta.toml` sidecar (plan 006 U2/U4).
+    /// Stable profile ID from the `.meta.toml` sidecar.
     /// `None` when the profile predates the migration.
     #[serde(skip_serializing_if = "Option::is_none")]
     profile_id: Option<String>,
@@ -2525,7 +2522,7 @@ fn handle_list(
     }
 
     // Index sidecars by display_name so we can enrich each entry with the
-    // stable profile_id + group label (plan 006 U2/U4). The lookup is
+    // stable profile_id + group label. The lookup is
     // O(N + M) which is fine for the typical handful of profiles.
     let sidecars_by_name: std::collections::HashMap<String, _> = {
         use crate::vortix_config::profile_store::{FsProfileStore, ProfileStore};
@@ -3365,7 +3362,7 @@ fn handle_info(config_dir: &Path, source: &str, mode: OutputMode) {
         "defaults"
     };
 
-    // Session-journal path (plan 005). Folded into `vortix info` as part
+    // Session-journal path. Folded into `vortix info` as part
     // of the v0.3.0 CLI surface cleanup — `vortix journal path` was
     // dropped in favour of surfacing the path here.
     let journal_session = crate::vortix_core::journal::global_journal()
@@ -3532,7 +3529,7 @@ mod tests {
         assert_eq!(format_elapsed(172_800), "2 days ago");
     }
 
-    // ===== daemon registry -> status envelope (plan 2026-07-18-001 U2) =====
+    // ===== daemon registry -> status envelope =====
 
     use crate::vortix_core::engine::registry::{Role, TunnelSnapshot};
     use crate::vortix_core::engine::registry_handle::RegistrySnapshot;

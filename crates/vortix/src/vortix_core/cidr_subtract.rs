@@ -12,7 +12,7 @@
 //! to the remove list.
 //!
 //! Operates on IPv4 only — the killswitch base list is RFC1918, which is
-//! v4-exclusive. v6 CIDRs in the input are ignored. See unit U8 in the
+//! v4-exclusive. v6 CIDRs in the input are ignored. See the
 //! multi-connection plan.
 
 use std::net::{IpAddr, Ipv4Addr};

@@ -89,8 +89,7 @@ pub enum AuthField {
     /// Password text input (masked).
     Password,
     /// OTP / 2FA code text input (always masked). Only rendered when the
-    /// profile declares an `OpenVPN` `static-challenge` directive — plan
-    /// 2026-06-02-001 U3.
+    /// profile declares an `OpenVPN` `static-challenge` directive.
     Otp,
     /// "Save credentials" checkbox.
     SaveCheckbox,
@@ -158,8 +157,8 @@ pub enum InputMode {
         cursor: usize,
     },
     /// Confirmation dialog when connecting a new profile would take over the
-    /// default route from an already-active tunnel (multi-connection plan #001
-    /// U7 — formerly `ConfirmSwitch`). On confirm the connect path retries
+    /// default route from an already-active tunnel (formerly
+    /// `ConfirmSwitch`). On confirm the connect path retries
     /// with `force=true`, inverting the primary.
     ConfirmDefaultRouteTakeover {
         /// Name of the profile currently holding the default route (display only).
@@ -172,7 +171,7 @@ pub enum InputMode {
         confirm_selected: bool,
     },
     /// Confirmation dialog when a new profile's `AllowedIPs` overlap with an
-    /// already-active tunnel's `AllowedIPs` on a non-default-route CIDR (R10).
+    /// already-active tunnel's `AllowedIPs` on a non-default-route CIDR.
     /// On confirm the connect path retries with `force=true`.
     ConfirmRouteOverlap {
         /// Profile id of the conflicting (already-active) tunnel.
@@ -187,7 +186,7 @@ pub enum InputMode {
         confirm_selected: bool,
     },
     /// Confirmation dialog for "Disconnect all N tunnels?" (multi-connection
-    /// plan #001 U19). Fired by Shift+`D` from the sidebar when more than one
+    /// ). Fired by Shift+`D` from the sidebar when more than one
     /// active tunnel exists; with N≤1 the shortcut acts identically to plain
     /// `d` and this overlay is skipped (backwards-compatible single-tunnel
     /// behavior).
@@ -212,9 +211,8 @@ pub enum InputMode {
         /// Cursor position in the password field.
         password_cursor: usize,
         /// OTP / 2FA code input (always initialized to an empty string at
-        /// overlay-open so the field cannot inherit prior state — plan
-        /// 2026-06-02-001 U3 / FYI-8). Only used when
-        /// `static_challenge_prompt.is_some()`.
+        /// overlay-open so the field cannot inherit prior state). Only
+        /// used when `static_challenge_prompt.is_some()`.
         otp: String,
         /// Cursor position in the OTP field.
         otp_cursor: usize,
@@ -227,7 +225,7 @@ pub enum InputMode {
         /// Prompt text from the .ovpn's `static-challenge` directive. When
         /// `Some`, the overlay renders a third (OTP) field labelled with
         /// this text and the submit handler embeds the OTP in the
-        /// SCRV1 envelope (plan 2026-06-02-001 U3). When `None`, the
+        /// SCRV1 envelope (). When `None`, the
         /// overlay renders the two-field layout unchanged.
         static_challenge_prompt: Option<String>,
     },

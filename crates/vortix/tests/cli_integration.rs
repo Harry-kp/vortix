@@ -262,7 +262,7 @@ fn cli_status_disconnected() {
     assert_eq!(exit, 0);
 }
 
-// R11: with no active tunnels the no-daemon `down` path returns success
+// with no active tunnels the no-daemon `down` path returns success
 // (idempotent "already disconnected") without touching a daemon or the
 // privileged local teardown — this is the default path the review flagged
 // as untested. The idempotent check short-circuits before the daemon
@@ -523,8 +523,7 @@ fn clap_global_flags_propagate() {
 }
 
 // ============================================================================
-// Multi-tunnel CLI grammar (plan 001 U20 — Down with profile/--all, Reconnect
-// with profile, Up --yes flag). Plan 002 U6-narrow.
+// Multi-tunnel CLI grammar.
 // ============================================================================
 
 #[test]

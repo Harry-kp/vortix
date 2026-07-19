@@ -1,10 +1,9 @@
 # vortix daemon — deployment examples
 
-**Preferred path: `sudo vortix service install`** (plan 2026-07-19-001
-P5). It generates these artifacts with your binary path, your uid as
-the daemon's owner, and your config dir baked in, then starts the
-service and enables it at boot. `sudo vortix service uninstall`
-removes everything it installed.
+**Preferred path: `sudo vortix service install`.** It generates these
+artifacts with your binary path, your uid as the daemon's owner, and
+your config dir baked in, then starts the service and enables it at
+boot. `sudo vortix service uninstall` removes everything it installed.
 
 The files here are *reference copies* of what the installer generates,
 with `<PLACEHOLDER>` values, for people who manage units by hand or

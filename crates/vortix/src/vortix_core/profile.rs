@@ -2,9 +2,8 @@
 //!
 //! Plan #004 introduces `Profile` and `ProfileId` as the Tunnel-trait input
 //! vocabulary. The binary crate's richer `VpnProfile` (with on-disk path,
-//! last-used timestamp, etc.) lives on alongside this type during plan #004;
-//! plan #007 (config + secrets stack) reconciles them.
-
+//! last-used timestamp, etc.) lives on alongside this type;
+//! a config/secrets consolidation reconciles them.
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -34,7 +33,7 @@ impl std::fmt::Display for ProfileId {
 /// Which tunnel protocol a profile uses.
 ///
 /// Mirrors `vortix::state::Protocol` — the binary-side type stays put until
-/// plan #007 consolidates profile storage. Keeping a separate `ProtocolKind`
+/// profile storage is consolidated. Keeping a separate `ProtocolKind`
 /// here lets `vortix-core` declare the Tunnel-trait vocabulary without
 /// pulling in the richer profile types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

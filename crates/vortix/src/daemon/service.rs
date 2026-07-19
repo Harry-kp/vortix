@@ -1,5 +1,4 @@
-//! Boot-service artifact generation + install locations (plan
-//! 2026-07-19-001 P5 — `vortix service install/uninstall`).
+//! Boot-service artifact generation + install locations.
 //!
 //! Generation is pure string-building over a [`ServiceSpec`] so golden
 //! tests exercise BOTH platforms' artifacts on any host (a macOS dev
@@ -14,8 +13,7 @@ use std::path::PathBuf;
 pub struct ServiceSpec {
     /// Absolute path of the vortix binary the service execs.
     pub binary: PathBuf,
-    /// Unprivileged uid the root daemon serves (P2 owner auth —
-    /// becomes `VORTIX_OWNER_UID` in the service environment).
+    /// Unprivileged uid the root daemon serves.
     pub owner_uid: u32,
     /// The owner's config dir (profiles, settings) — the daemon must
     /// resolve the SAME catalog the owner's clients use.
@@ -90,7 +88,7 @@ Restart=on-failure
 RestartSec=5
 # The daemon runs as root for privileged subprocess work (wg-quick,
 # openvpn, firewall rules) and serves its unprivileged owner over the
-# peer-credential-authenticated Unix socket (P2 owner auth).
+# peer-credential-authenticated Unix socket.
 User=root
 Group=root
 Environment=VORTIX_OWNER_UID={owner_uid}
@@ -151,7 +149,7 @@ pub fn launchd_plist(spec: &ServiceSpec) -> String {
     )
 }
 
-/// Everything `vortix service uninstall` must remove for the R12
+/// Everything `vortix service uninstall` must remove for the
 /// no-zombie guarantee, and `install`'s pre-flight overwrite check.
 #[must_use]
 pub fn managed_artifacts(manager: ServiceManager) -> Vec<PathBuf> {
@@ -194,7 +192,7 @@ Restart=on-failure
 RestartSec=5
 # The daemon runs as root for privileged subprocess work (wg-quick,
 # openvpn, firewall rules) and serves its unprivileged owner over the
-# peer-credential-authenticated Unix socket (P2 owner auth).
+# peer-credential-authenticated Unix socket.
 User=root
 Group=root
 Environment=VORTIX_OWNER_UID=501

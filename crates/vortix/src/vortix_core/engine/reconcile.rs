@@ -1,5 +1,4 @@
-//! Pure scanner-reconciliation decision table (plan 2026-07-18-001 U2,
-//! merged-U4 supervision migration).
+//! Pure scanner-reconciliation decision table.
 //!
 //! Given a registry entry's [`Connection`] state and whether the kernel
 //! scanner sees a matching session, [`classify`] returns the

@@ -1311,7 +1311,7 @@ mod tests {
 
     #[test]
     fn protected_renders_section_words_and_no_loud_banner() {
-        // R3: section words `Identity` / `Defense` replace the bold
+        // section words `Identity` / `Defense` replace the bold
         // `PROTECTED` headline.
         let s = baseline_protected_state(34);
         let lines = build_protected_audit(&s);
@@ -1333,7 +1333,7 @@ mod tests {
 
     #[test]
     fn protected_sigils_render_in_right_column() {
-        // R2: every row ends in the right-pinned sigil column.
+        // every row ends in the right-pinned sigil column.
         let s = baseline_protected_state(40);
         let lines = build_protected_audit(&s);
         let exit_line = lines
@@ -1357,7 +1357,7 @@ mod tests {
 
     #[test]
     fn protected_all_ok_state_has_no_bold_modifiers() {
-        // R7: in the all-OK state every sigil renders muted (no BOLD).
+        // in the all-OK state every sigil renders muted (no BOLD).
         let s = baseline_protected_state(34);
         let lines = build_protected_audit(&s);
         for line in &lines {
@@ -1418,7 +1418,7 @@ mod tests {
 
     #[test]
     fn protected_killswitch_auto_blocking_is_loud_with_subline() {
-        // R15 (AE3): Auto + Blocking is the alarm state — bright sigil
+        // Auto + Blocking is the alarm state — bright sigil
         // and a "press r to reconnect" sub-line.
         let mut s = baseline_protected_state(40);
         s.killswitch_mode = KillSwitchMode::Auto;
@@ -1521,7 +1521,7 @@ mod tests {
 
     #[test]
     fn protected_dns_provider_inlines_without_subbullet() {
-        // R12: provider collapses inline as `1.1.1.1 · Cloudflare`.
+        // provider collapses inline as `1.1.1.1 · Cloudflare`.
         // No `Provider:` sub-row.
         let s = baseline_protected_state(40);
         let lines = build_protected_audit(&s);
@@ -1583,7 +1583,7 @@ mod tests {
 
     #[test]
     fn protected_long_ks_phrase_removed_in_default_render() {
-        // R9: long KS status phrase (the multi-clause "firewall engaged …
+        // long KS status phrase (the multi-clause "firewall engaged …
         // only VPN traffic permitted") must not render in the default
         // PROTECTED state. The mode label is enough; the phrase only
         // surfaces as an alarm sub-line.
@@ -1602,7 +1602,7 @@ mod tests {
 
     #[test]
     fn protected_footer_says_updated_not_last_checked() {
-        // R18: `Updated 3s ago` (not `Last checked: 3s ago`).
+        // `Updated 3s ago` (not `Last checked: 3s ago`).
         let s = baseline_protected_state(34);
         let lines = build_protected_audit(&s);
         let footer_text = line_text(lines.last().expect("footer"));
@@ -1618,7 +1618,7 @@ mod tests {
 
     #[test]
     fn protected_section_headers_drop_below_width_threshold() {
-        // R16: section words drop at panel widths < threshold.
+        // section words drop at panel widths < threshold.
         let mut s = baseline_protected_state(20);
         s.show_section_headers = true;
         let lines = build_protected_audit(&s);
@@ -1648,7 +1648,7 @@ mod tests {
 
     #[test]
     fn protected_no_legend_in_panel() {
-        // R13: sigil legend lives in the help overlay, never in the panel.
+        // sigil legend lives in the help overlay, never in the panel.
         let s = baseline_protected_state(40);
         let lines = build_protected_audit(&s);
         let all_text: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");

@@ -1,4 +1,4 @@
-//! Platform aggregate — runtime-selectable per-OS port dispatcher (plan 003 U3/U5).
+//! Platform aggregate — runtime-selectable per-OS port dispatcher.
 //!
 //! The five capability ports defined in `vortix-core::ports::*` each get a
 //! lightweight `*Kind` enum carrier here. The real variants are unit tags
@@ -150,7 +150,7 @@ pub struct MockNetworkStats {
 #[derive(Debug, Default, Clone)]
 pub struct MockRouteTable {
     pub gateway: Option<String>,
-    /// Canned interface name for `default_route_interface()` (plan #001 U4).
+    /// Canned interface name for `default_route_interface()`.
     pub interface: Option<String>,
 }
 
@@ -390,7 +390,7 @@ impl RouteTableKind {
     }
 
     /// Name of the interface carrying the current default route, if any
-    /// (plan #001 U4).
+    ///.
     #[must_use]
     pub fn default_route_interface(&self) -> Option<String> {
         use crate::vortix_core::ports::route_table::RouteTable;
@@ -406,13 +406,13 @@ impl RouteTableKind {
     }
 }
 
-/// Scriptable mock for the `SocketAudit` port (plan 015 phase C).
+/// Scriptable mock for the `SocketAudit` port.
 #[derive(Debug, Default, Clone)]
 pub struct MockSocketAudit {
     pub canned: Vec<crate::vortix_core::ports::socket_audit::SocketSnapshot>,
 }
 
-/// Static-dispatch carrier for the `SocketAudit` port (plan 015 phase C).
+/// Static-dispatch carrier for the `SocketAudit` port.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum SocketAuditKind {
@@ -511,7 +511,7 @@ impl Platform {
         }
     }
 
-    /// Live network-interface enumeration (plan multi-connection U11).
+    /// Live network-interface enumeration.
     ///
     /// Dispatches to the per-OS free function — Linux reads
     /// `/sys/class/net/`, macOS parses `ifconfig -l`, Windows currently

@@ -1,5 +1,4 @@
-//! `vortix daemon` — the single source of truth for VPN state (plan
-//! 2026-07-19-001; grown from plan 015 phase D / plan 010).
+//! `vortix daemon` — the single source of truth for VPN state.
 //!
 //! The daemon binds a Unix socket, owns a per-profile engine registry
 //! (`RegistryHandle`), and serves `IpcRequest` frames from concurrent
@@ -7,7 +6,7 @@
 //! supervisor loop reconciles the registry against the kernel — adopts
 //! external sessions, detects drops, auto-reconnects. CLI and TUI are
 //! thin clients over this socket; when no daemon runs, both fall back
-//! to their in-process paths (R11).
+//! to their in-process paths.
 //!
 //! Auth: `SO_PEERCRED` / `getpeereid` — the daemon accepts its own uid
 //! and its configured owner (`VORTIX_OWNER_UID` / `SUDO_UID`), so a
@@ -18,8 +17,8 @@
 //!
 //! Lifecycle:
 //! 1. Bind the socket (cleaning up any stale socket file)
-//! 2. Spawn the registry actor + adopt already-running tunnels (R7)
-//! 3. Connect boot-persisted profiles (`vortix service persist`, P5)
+//! 2. Spawn the registry actor + adopt already-running tunnels
+//! 3. Connect boot-persisted profiles (`vortix service persist`)
 //! 4. Spawn the supervisor loop; accept clients until SIGTERM/Ctrl-C
 //! 5. On exit, unlink the socket file
 //!
@@ -64,7 +63,7 @@ pub fn build_engine_handle(
 /// Build a fresh, `Disconnected` `Engine<TunnelKind>` wired with the live
 /// `FsProfileStore` resolver and the per-Connect WG/OVPN tunnel factory —
 /// the raw engine `build_engine_handle` wraps, and the engine the daemon's
-/// per-profile registry drives directly (plan 2026-07-19-001 P1).
+/// per-profile registry drives directly.
 ///
 /// Returns `None` when prerequisites are missing (no real subprocess
 /// runner installed) so callers fall back to legacy paths.
@@ -157,12 +156,11 @@ pub fn daemon_socket_path_override() -> Option<PathBuf> {
     }
 }
 
-/// Canonical socket path for a boot-installed root daemon (plan
-/// 2026-07-19-001 P5, `vortix service install`). Deliberately fixed —
+/// Canonical socket path for a boot-installed root daemon. Deliberately fixed —
 /// not env-derived — because systemd/launchd start the daemon with no
 /// user session environment while clients run inside one; a shared
 /// constant is the only path both sides of that uid boundary can agree
-/// on (the cross-uid gap P2 flagged).
+/// on (the cross-uid gap).
 #[must_use]
 pub fn system_socket_path() -> PathBuf {
     PathBuf::from("/var/run/vortix.sock")
@@ -192,7 +190,7 @@ fn socket_probe_candidates() -> Vec<PathBuf> {
 /// whether to route through the daemon or fall back to the direct
 /// disk/scanner read. Missing files are not an error — the env var
 /// pointing at a non-existent path simply triggers the bypass path
-/// (plan D3, multi-connection rollout).
+///.
 #[must_use]
 pub fn daemon_socket_path_if_present() -> Option<PathBuf> {
     socket_probe_candidates()

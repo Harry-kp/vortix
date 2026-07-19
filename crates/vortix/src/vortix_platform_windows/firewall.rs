@@ -1,4 +1,4 @@
-//! Windows kill-switch stub (plan 008 U4).
+//! Windows kill-switch stub.
 //!
 //! Real impl would drive `netsh advfirewall` or the Windows Filtering
 //! Platform via `windows-sys`. Today this returns `Ok(())` from
@@ -15,14 +15,14 @@ pub struct WindowsFirewall;
 
 impl Killswitch for WindowsFirewall {
     fn enable_blocking_multi(_active: &[ActiveTunnelInfo]) -> Result<()> {
-        // Stub — Windows backend is plan 008 U4 work. Returning Ok lets
+        // Stub — Windows backend is work. Returning Ok lets
         // the engine progress on Windows; no actual rules are installed.
         Ok(())
     }
 
     fn disable_blocking() -> Result<()> {
         Err(KillswitchError::CommandFailed(
-            "Windows kill switch is not implemented yet (plan 008 U4 stub)".into(),
+            "Windows kill switch is not implemented yet".into(),
         ))
     }
 }

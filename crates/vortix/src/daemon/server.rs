@@ -1,4 +1,4 @@
-//! Daemon IPC server loop (plan 015 phase D U18 / plan 010).
+//! Daemon IPC server loop.
 //!
 //! Single-client-at-a-time. Accept → peer-UID check → read frame →
 //! dispatch → write response → loop until client disconnects.
@@ -27,14 +27,13 @@ pub struct DaemonServer {
     socket_path: PathBuf,
     listener: UnixListener,
     engine_handle: Option<Arc<EngineHandle>>,
-    /// The daemon-owned multi-tunnel registry handle (plan
-    /// 2026-07-18-001 U2). Answers `IpcOp::RegistrySnapshot`; the
+    /// The daemon-owned multi-tunnel registry handle. Answers `IpcOp::RegistrySnapshot`; the
     /// supervisor loop populates it. `None` in the skeleton/no-registry
     /// path.
     registry_handle: Option<RegistryHandle<TunnelKind>>,
     /// Profiles directory used to resolve profiles + build per-profile
     /// engines when routing `Execute(Connect)` through the registry
-    /// (plan 2026-07-19-001 P1). `None` disables daemon-side writes.
+    ///. `None` disables daemon-side writes.
     profiles_dir: Option<PathBuf>,
     /// The effective UID of the daemon process at bind time. Every
     /// accepted client is checked against this value via
@@ -43,13 +42,13 @@ pub struct DaemonServer {
     /// prevents a local UID escalation from compromising the daemon
     /// even when the socket file's mode 0600 has been bypassed.
     daemon_uid: u32,
-    /// The daemon's OWNING user (plan 2026-07-19-001 P2). When the daemon
+    /// The daemon's OWNING user. When the daemon
     /// runs as root (via `sudo`/a service unit), the owner is the
     /// unprivileged user it acts for — resolved from the trusted launcher's
     /// environment (`VORTIX_OWNER_UID` / `SUDO_UID`), never from a client,
     /// so it can't be spoofed. The peer-UID gate accepts BOTH `daemon_uid`
     /// and `owner_uid`, which is what lets an unprivileged client drive a
-    /// root daemon without sudo (AE1). Equals `daemon_uid` for a same-user
+    /// root daemon without sudo. Equals `daemon_uid` for a same-user
     /// daemon (no privilege change).
     owner_uid: u32,
 }
@@ -113,7 +112,7 @@ impl DaemonServer {
         let daemon_uid = unsafe { libc::geteuid() };
         let owner_uid = resolve_owner_uid(daemon_uid);
 
-        // P2: when the daemon runs as root FOR an unprivileged owner, the
+        // when the daemon runs as root FOR an unprivileged owner, the
         // mode-0600 socket owned by root would be unreachable by the owner.
         // chown it to the owner so they can connect at the fs level (root
         // still can); the per-accept UID gate is the in-depth check.
@@ -164,7 +163,7 @@ impl DaemonServer {
 
     /// Set the profiles directory used to resolve profiles + build
     /// per-profile engines when routing `Execute(Connect)` through the
-    /// registry (plan 2026-07-19-001 P1).
+    /// registry.
     #[must_use]
     pub fn with_profiles_dir(mut self, profiles_dir: PathBuf) -> Self {
         self.profiles_dir = Some(profiles_dir);
@@ -200,7 +199,7 @@ impl DaemonServer {
             match self.listener.accept().await {
                 Ok((stream, _addr)) => {
                     // Each client runs in its own task so a long-lived
-                    // connection (a TUI holding a Subscribe stream, U2)
+                    // connection (a TUI holding a Subscribe stream)
                     // does not block command clients on the accept loop.
                     // Both handles are cheap to clone (Arc / mpsc-sender).
                     let handle = self.engine_handle.clone();
@@ -258,9 +257,7 @@ async fn handle_client(
     // Peer-UID enforcement runs before any frame is read so an
     // unauthorized client never gets the chance to drive dispatch.
     match get_peer_uid(&stream) {
-        // Authorized: the daemon's own uid, or its configured owner (P2 —
-        // lets an unprivileged owner drive a root daemon; owner_uid comes
-        // from the trusted launcher env, never the client).
+        // Authorized: the daemon's own uid, or its configured owner.
         Ok(peer_uid) if peer_uid == daemon_uid || peer_uid == owner_uid => { /* authorized */ }
         Ok(peer_uid) => {
             tracing::warn!(
@@ -361,8 +358,7 @@ async fn handle_client(
     }
 }
 
-/// Pump engine events to a subscribed client until it disconnects (plan
-/// 2026-07-18-001 U2). Each event is framed as an
+/// Pump engine events to a subscribed client until it disconnects. Each event is framed as an
 /// `IpcResponse { result: Ok(Event(..)) }`. A write error means the
 /// client is gone; a broadcast `Lagged` means a slow client missed some
 /// events (dropped-oldest backpressure) — we keep streaming and the
@@ -511,7 +507,7 @@ const SUBSCRIBE_HEARTBEAT_SECS: u64 = 15;
 const CLIENT_IDLE_TIMEOUT_SECS: u64 = 30;
 
 /// Reject a malformed profile identifier at the daemon boundary. The
-/// daemon is a privilege boundary (plan 2026-07-18-001 U3 / R10): a
+/// daemon is a privilege boundary: a
 /// client-supplied id flows into the config resolver, which builds a
 /// filesystem path from it, so a traversal id like `../../etc/passwd`
 /// must never reach the engine. We reject (not sanitize) — silently
@@ -564,7 +560,7 @@ fn primary_connection(snap: &RegistrySnapshot) -> Connection {
 }
 
 /// Execute a write command against the profile's OWN engine in the
-/// registry (plan 2026-07-19-001 P1). Connect builds a fresh per-profile
+/// registry. Connect builds a fresh per-profile
 /// engine (via the daemon's resolver + tunnel factory) and resolves the
 /// profile's `AllowedIPs`; disconnect/reconnect drive the existing entry.
 /// `ForceDisconnect` currently maps to disconnect (a force flag through
@@ -653,7 +649,7 @@ async fn dispatch(
     }
     let result = match req.op {
         // Writes route to the profile's OWN engine in the registry — the
-        // single source of truth (plan 2026-07-19-001 P1). No shared FSM.
+        // single source of truth. No shared FSM.
         IpcOp::Execute(cmd) => match validate_execute(&cmd) {
             Ok(()) => match registry_handle {
                 // disconnect/reconnect need only the registry; Connect also
@@ -770,7 +766,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_snapshot_without_registry_is_disconnected() {
-        // P1: Snapshot projects the registry primary. With no registry the
+        // Snapshot projects the registry primary. With no registry the
         // graceful v1-compat answer is Disconnected (not an error).
         let req = IpcRequest {
             id: 2,
@@ -863,7 +859,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_execute_without_registry_returns_internal_error() {
-        // P1: writes route to the per-profile registry, not a shared FSM.
+        // writes route to the per-profile registry, not a shared FSM.
         // With no registry/profiles wired, Execute is a typed Internal
         // error (not a silent no-op). The happy path (real per-profile
         // connect) is covered in registry_handle tests + live.
@@ -1129,9 +1125,9 @@ mod tests {
         assert_eq!(uid, me);
     }
 
-    // ===== U22 multi-tunnel command dispatch =====
+    // ===== multi-tunnel command dispatch =====
 
-    // ===== P1: Execute routes to the per-profile registry =====
+    // ===== Execute routes to the per-profile registry =====
 
     fn spawn_empty_registry() -> RegistryHandle<TunnelKind> {
         use crate::vortix_core::engine::registry::TunnelRegistry;
@@ -1252,7 +1248,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_rejects_mismatched_protocol_version() {
         // A pre-versioning client's frames decode with version 0 — the
-        // gate must name both sides (AE8) and never run the op.
+        // gate must name both sides and never run the op.
         let req = IpcRequest {
             id: 9,
             protocol_version: 0,

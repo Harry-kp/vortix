@@ -350,7 +350,7 @@ fn confirm_default_route_takeover_message_runs_multi_connect_path() {
     // Message-handler-level test (not keybinding): when
     // `Message::ConfirmDefaultRouteTakeover` fires directly, the
     // multi-connect path runs — no pending_connect queue, no
-    // Disconnecting state. Plan 001 SC3 "primary inverts": both
+    // Disconnecting state. The "primary inverts" scenario: both
     // tunnels stay connected, the new one claims the default
     // route. This message is what the overlay's [B] key produces;
     // the keybinding test covers the input path.
@@ -372,7 +372,7 @@ fn confirm_default_route_takeover_message_runs_multi_connect_path() {
     );
     // Note: `connection_state` is the legacy single-tunnel mirror —
     // it can only hold one profile at a time, so vpn-b's connect
-    // necessarily overwrites vpn-a's slot. Once plan 001 P5 retires
+    // necessarily overwrites vpn-a's slot. Once a later stage retires
     // this enum entirely, both tunnels' states will be visible via
     // the registry exclusively.
 }
@@ -415,8 +415,8 @@ fn mirror_disconnecting_transitions_existing_connected_entry() {
     let mut app = test_app();
     add_profiles(&mut app, &["vpn-a"]);
     // Seed Connected via the authoritative protocol-layer path
-    // (mirror_connect_into_registry). Pre-U4 this test used scanner
-    // promotion (set_connecting + SyncSystemState); U4 removed that
+    // (mirror_connect_into_registry). Previously this test used scanner
+    // promotion (set_connecting + SyncSystemState); the state-authority rework removed that
     // path entirely.
     set_connected(&mut app, "vpn-a");
     assert!(matches!(
@@ -580,8 +580,8 @@ fn switch_path_disconnect_completion_removes_old_profile_from_registry() {
     add_profiles(&mut app, &["vpn-a", "vpn-b"]);
 
     // Set up vpn-a fully connected via the authoritative protocol-layer
-    // path. Pre-U4 this used scanner promotion (set_connecting +
-    // SyncSystemState); U4 removed that path.
+    // path. Previously this used scanner promotion (set_connecting +
+    // SyncSystemState); the state-authority rework removed that path.
     set_connected(&mut app, "vpn-a");
     assert_eq!(app.registry.tunnel_count(), 1, "setup precondition");
 
@@ -994,7 +994,7 @@ fn add_openvpn_profiles_with_auth(app: &mut App, names: &[&str], dir: &std::path
 }
 
 /// Helper: add `OpenVPN` profiles with a `static-challenge` directive
-/// alongside auth-user-pass (plan 2026-06-02-001, #191).
+/// alongside auth-user-pass.
 fn add_openvpn_profiles_with_static_challenge(
     app: &mut App,
     names: &[&str],
@@ -1090,7 +1090,7 @@ fn test_auth_prompt_skipped_when_creds_saved() {
 
 #[test]
 fn test_auth_prompt_fires_for_static_challenge_even_with_saved_creds() {
-    // Plan 2026-06-02-001 U3 / overlay-skip bug fix: a profile with
+    // / overlay-skip bug fix: a profile with
     // `static-challenge` MUST surface the auth overlay on every connect
     // attempt regardless of saved-creds state, because the OTP is
     // single-use and cannot be persisted. When creds are pre-saved the
@@ -1248,7 +1248,7 @@ fn test_auth_submit_triggers_connect() {
 
 #[test]
 fn test_auth_submit_with_otp_and_save_restores_plain_after_connect() {
-    // Plan 2026-06-02-001 U3 / PF-3: when `save=true` AND `otp=Some(...)`,
+    // : when `save=true` AND `otp=Some(...)`,
     // the canonical auth file must end up plain-text on disk after the
     // connect call returns. The submit handler writes plain, then SCRV1,
     // then restores plain — the on-disk state after handle_auth_submit
@@ -1287,7 +1287,7 @@ fn test_auth_submit_with_otp_and_save_restores_plain_after_connect() {
 
 #[test]
 fn test_auth_submit_does_not_reopen_overlay_for_static_challenge_profile() {
-    // Regression for the submit-loop bug discovered after U3 landed:
+    // Regression for the submit-loop bug discovered after daemon-routed writes landed:
     // handle_auth_submit calls connect_profile, which (via the
     // overlay-fires-fix) used to see static_challenge.is_some() and
     // re-open the auth overlay with an empty OTP — so pressing Enter
@@ -1325,7 +1325,7 @@ fn test_auth_submit_does_not_reopen_overlay_for_static_challenge_profile() {
 
 #[test]
 fn test_auth_submit_with_otp_no_save_deletes_file() {
-    // Plan 2026-06-02-001 U3 / PF-4: when `save=false` AND `otp=Some(...)`,
+    // : when `save=false` AND `otp=Some(...)`,
     // the auth file must be deleted after the connect call returns —
     // OTP is single-use and the user explicitly chose not to persist
     // credentials.
@@ -1378,7 +1378,7 @@ fn test_auth_cancel_returns_to_normal() {
 
 #[test]
 fn test_auth_field_otp_appears_in_tab_cycle_for_static_challenge_profile() {
-    // Plan 2026-06-02-001 U3: tab cycle becomes a 4-stop cycle when
+    // : tab cycle becomes a 4-stop cycle when
     // static_challenge_prompt.is_some() — Username -> Password -> Otp ->
     // SaveCheckbox -> Username.
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -2638,7 +2638,7 @@ fn disconnect_clears_animation() {
 }
 
 // ====================================================================
-// U19 — Connect/disconnect flow
+// Connect/disconnect flow
 // ====================================================================
 
 /// Helper: dispatch a `KeyEvent` matching the given char in `Normal` mode.
@@ -3129,13 +3129,13 @@ fn scanner_promotion_from_connecting_to_connected_mirrors_into_registry() {
     use crate::vortix_core::engine::state::Connection;
     use crate::vortix_core::profile::ProfileId;
 
-    // U4 contract: scanner cannot promote Connecting → Connected. Only
+    // State-authority contract: scanner cannot promote Connecting → Connected. Only
     // the protocol layer's `Tunnel::up()` success result (via
     // `Message::ConnectResult` → `mirror_connect_into_registry`) can
     // complete that transition. The scanner observing a matching
     // kernel session for a Connecting profile is informational only.
     //
-    // Pre-U4 this test asserted scanner promotion happens; the dual
+    // Previously this test asserted scanner promotion happens; the dual
     // write (scanner + protocol layer both writing the interface) was
     // the source of bugs #3 and #12 in the origin requirements doc.
     // Now we assert the opposite: a kernel-visible session for a
@@ -3184,7 +3184,7 @@ fn scanner_drop_from_connected_clears_registry() {
     let mut app = test_app();
     add_profiles(&mut app, &["AWS_VPN"]);
 
-    // Set up Connected via the authoritative path (post-U4 the
+    // Set up Connected via the authoritative path (now the
     // scanner-promotion path is gone).
     set_connected(&mut app, "AWS_VPN");
     assert_eq!(app.registry.tunnel_count(), 1, "setup precondition");
@@ -3208,14 +3208,14 @@ fn mirrored_registry_entry_uses_real_interface_not_mock0() {
     use crate::vortix_core::engine::state::Connection;
     use crate::vortix_core::profile::ProfileId;
 
-    // Under U4 the protocol layer's `Tunnel::up()` result is the sole
+    // By contract the protocol layer's `Tunnel::up()` result is the sole
     // writer of `details.interface`. The `set_connected` helper
     // (line 62) calls `mirror_connect_into_registry` with details
     // carrying the test's "wg0" interface — the registry must store
     // exactly that, not a synthesized mock label.
     //
-    // Pre-U4 this test asserted scanner-promotion populated the real
-    // iface. Post-U4 the scanner can't promote at all, and the iface
+    // Previously this test asserted scanner-promotion populated the real
+    // iface. Now the scanner can't promote at all, and the iface
     // comes from the authoritative ConnectResult path instead. The
     // contract being tested is the same — "registry stores the real
     // iface, not a placeholder" — only the seam moved.
@@ -3254,7 +3254,7 @@ fn mirrored_registry_entry_carries_full_rich_details_not_just_interface_and_pid(
     // The bookkeeping `set_connected` API now copies the full
     // legacy `DetailedConnectionInfo` straight into the registry.
     // Assert every field round-trips.
-    // Under U4 the registry's authoritative writer is the protocol
+    // By contract the registry's authoritative writer is the protocol
     // layer (via `mirror_connect_into_registry`); the scanner refresh
     // updates METADATA fields only (endpoint, internal_ip, mtu,
     // transfer counters, handshake) while leaving the iface alone.
@@ -3306,11 +3306,11 @@ fn mirror_refresh_updates_registry_when_details_change() {
     use crate::vortix_core::engine::state::Connection;
     use crate::vortix_core::profile::ProfileId;
 
-    // U4 contract: scanner refresh updates metadata only — never the
+    // State-authority contract: scanner refresh updates metadata only — never the
     // interface field. Once `Tunnel::up()` set the interface, it's
     // immutable for the tunnel's lifetime.
     //
-    // Pre-U4 this test asserted the opposite — scanner overwrites the
+    // Previously this test asserted the opposite — scanner overwrites the
     // empty placeholder iface with the real one. That dual-write
     // pattern was exactly the source of bugs #3 / #12 in the
     // multi-OpenVPN scenarios. Now we assert the inverse: a scanner
@@ -3401,10 +3401,10 @@ fn disconnect_result_success_removes_from_registry() {
     );
 }
 
-/// Connecting → Connected race-arrival regression (post-U4 shape).
+/// Connecting → Connected race-arrival regression (now shape).
 ///
-/// Under U4 the scanner cannot promote Connecting → Connected, so the
-/// pre-U4 race (scanner adopts as Connected before `ConnectResult`
+/// By contract the scanner cannot promote Connecting → Connected, so the
+/// previously race (scanner adopts as Connected before `ConnectResult`
 /// arrives) is structurally impossible. The race that DOES still
 /// matter is the inverse: kernel session visible to the scanner
 /// while the protocol-layer connect is in flight — the registry must
@@ -3430,7 +3430,7 @@ fn connect_result_success_arrives_after_scanner_observes_kernel_session() {
             app.legacy_state(),
             ConnectionState::Connecting { ref profile, .. } if profile == "race-test"
         ),
-        "registry must stay Connecting — scanner can't drive promotion under U4"
+        "registry must stay Connecting — scanner can't drive promotion under the state-authority contract"
     );
 
     // Now the connect-worker's ConnectResult arrives — the authoritative
@@ -3464,7 +3464,7 @@ fn connect_result_success_arrives_after_scanner_observes_kernel_session() {
 
 /// `ConnectResult` success carries the authoritative iface + pid from the
 /// connect-worker thread (`Tunnel::up`'s return value) through to
-/// `mirror_connect_into_registry`. After U4 made the scanner metadata-only,
+/// `mirror_connect_into_registry`. After the scanner became metadata-only,
 /// this is the ONLY write path for `details.interface` on a vortix-
 /// initiated connect. If it stays empty, `recompute_primary` can't match
 /// against the kernel-iface cache → primary=None → Role=Addressable for
@@ -3508,9 +3508,9 @@ fn connect_result_success_seeds_authoritative_iface_into_registry() {
 /// Multi-tunnel takeover regression: pressing Shift+B fires a second
 /// connect while the first profile is still primary. The
 /// `ConnectResult` for the second profile MUST NOT be dropped as
-/// stale by the handler. Pre-U4 the bug was hidden because the
+/// stale by the handler. Previously the bug was hidden because the
 /// scanner would promote Connecting → Connected for the second
-/// profile shortly after; post-U4 the scanner is metadata-only, so
+/// profile shortly after; now the scanner is metadata-only, so
 /// a dropped `ConnectResult` leaves the second tunnel stuck in
 /// Connecting indefinitely. The stale-check must read the specific
 /// profile's registry state, not `legacy_state()` (which returns the
@@ -3866,7 +3866,7 @@ fn real_ip_frozen_once_connected_then_thaws_on_disconnect() {
 }
 
 // ====================================================================
-// P4 daemon-attached mode (plan 2026-07-19-001): registry mirror +
+// Daemon-attached mode: registry mirror +
 // write-result handling
 // ====================================================================
 
@@ -4048,7 +4048,7 @@ fn daemon_timeout_result_keeps_optimistic_state_and_inflight() {
 
 #[test]
 fn attach_daemon_disarms_persisted_killswitch_state() {
-    // With the scanner parked and no daemon-side kill switch until P6,
+    // With the scanner parked and no daemon-side kill switch yet,
     // an Armed state from a previous local session would render
     // KS:Watch protection nothing enforces.
     let mut app = test_app();

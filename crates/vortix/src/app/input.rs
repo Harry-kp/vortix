@@ -245,9 +245,7 @@ impl App {
                 mut confirm_selected,
                 ..
             } => {
-                // Key bindings on this overlay (plan 001's multi-tunnel
-                // feature is opt-in; the legacy "switch VPNs" UX stays
-                // the default so existing users aren't surprised):
+                // Key bindings on this overlay:
                 //
                 //   [Y]/Enter  -> SwitchExclusiveAndConnect (legacy:
                 //                 disconnect current, then connect new)
@@ -454,7 +452,7 @@ impl App {
 /// With `has_otp_field = false` the cycle is Username → Password → `SaveCheckbox` →
 /// Username (today's three-control behaviour). With `has_otp_field = true`
 /// the cycle is Username → Password → Otp → `SaveCheckbox` → Username.
-/// Plan 2026-06-02-001 U3.
+/// .
 fn next_auth_field(
     current: &AuthField,
     key: crossterm::event::KeyCode,
@@ -494,7 +492,7 @@ impl crate::app::App {
     ///
     /// When `static_challenge_prompt` is `Some`, the overlay carries a third
     /// (OTP) field bound to `otp` / `otp_cursor` and Tab cycles through four
-    /// fields instead of three (plan 2026-06-02-001 U3).
+    /// fields instead of three ().
     #[allow(clippy::too_many_arguments)]
     fn handle_input_auth(
         &mut self,
@@ -634,7 +632,7 @@ impl crate::app::App {
         // tried Tab-to-cycle-tunnels-in-Details; that broke panel
         // navigation, so the binding was removed.)
 
-        // Multi-connection plan #001 U19: `c` on a Connecting row's
+        // `c` on a Connecting row's
         // Connection Details cancels the in-flight connect. Routed before
         // the global `Ctrl+C` handler (Ctrl+C already short-circuited at
         // the top of handle_key) and the panel-specific keys.
@@ -706,7 +704,7 @@ impl crate::app::App {
             KeyCode::Char('7') => self.handle_message(Message::QuickConnect(6)),
             KeyCode::Char('8') => self.handle_message(Message::QuickConnect(7)),
             KeyCode::Char('9') => self.handle_message(Message::QuickConnect(8)),
-            // Multi-connection plan #001 U19: `d` on a Connected sidebar
+            // `d` on a Connected sidebar
             // row disconnects that one tunnel; from any other panel `d`
             // preserves the legacy global Disconnect path (the primary or
             // sole active tunnel goes down).
@@ -721,7 +719,7 @@ impl crate::app::App {
                 }
                 self.handle_message(Message::Disconnect);
             }
-            // Multi-connection plan #001 U19: Shift+`D` on the sidebar
+            // Shift+`D` on the sidebar
             // opens the "Disconnect all N tunnels?" confirm when N>1; with
             // N≤1 it acts identically to plain `d` (backwards-compatible).
             KeyCode::Char('D') => {

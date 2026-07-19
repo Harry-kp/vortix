@@ -1,6 +1,6 @@
-//! Engine FSM, event schema, and supporting types (plan #005 U1).
+//! Engine FSM, event schema, and supporting types.
 //!
-//! Plan #005 U1 defines the type vocabulary the FSM operates over: the
+//! This module defines the type vocabulary the FSM operates over: the
 //! 5-variant `Connection` state machine, the 15-variant `EngineEvent`
 //! schema, the `Input` enum, and structured `EngineError`. The actual FSM
 //! implementation (`async fn handle(input)`), the JSONL journal, and the

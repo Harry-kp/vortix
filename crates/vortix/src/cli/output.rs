@@ -21,7 +21,7 @@
 //! `data.connection` block carrying `state`/`profile`/`protocol`/
 //! `uptime_secs`.
 //!
-//! ## v1 → v2 contract (multi-connection plan U21)
+//! ## v1 → v2 contract ()
 //!
 //! v0.4.0 bumps `schema_version` to `2` to admit multi-tunnel state in
 //! the `status` payload:
@@ -45,8 +45,8 @@ use serde::Serialize;
 /// way (renames, removals, type changes). Field additions do not
 /// require a bump.
 ///
-/// - `1` (plan 008 U1): single-tunnel `data.connection` block.
-/// - `2` (multi-connection plan U21): adds `data.connections` (array)
+/// - `1`: single-tunnel `data.connection` block.
+/// - `2` (): adds `data.connections` (array)
 ///   and `data.primary` (profile id, nullable). `data.connection` is
 ///   retained as the primary's entry for v1 back-compat. See the module
 ///   docs for the full v1 → v2 contract.
@@ -256,7 +256,7 @@ mod tests {
 
     #[test]
     fn schema_version_is_pinned_to_2() {
-        // Plan 008 U1 + multi-connection U21: any change to
+        // Any change to
         // SCHEMA_VERSION must be a deliberate contract bump per the
         // policy in the module docs. This test pins the current value
         // so a future drive-by edit can't quietly ship `schema_version

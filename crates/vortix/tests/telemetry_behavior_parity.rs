@@ -1,4 +1,4 @@
-//! Plan 002 U9 — behavior-parity tests for the `reqwest`-based telemetry
+//! behavior-parity tests for the `reqwest`-based telemetry
 //! HTTP helper. Locks in the contract before the curl swap: timeouts,
 //! redirect policy, non-2xx mapping, and JSON deserialization all match
 //! what the prior `curl -s --max-time N <url>` invocation produced.

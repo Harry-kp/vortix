@@ -1,4 +1,4 @@
-//! Length-prefixed JSON frame codec for IPC (plan 015 phase D U16 / plan 010).
+//! Length-prefixed JSON frame codec for IPC.
 //!
 //! Wire format:
 //! ```text
