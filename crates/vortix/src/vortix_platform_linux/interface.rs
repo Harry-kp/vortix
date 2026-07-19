@@ -6,28 +6,12 @@
 //! on iproute2 for read-only interface inspection.
 
 use crate::vortix_core::ports::interface::Interface;
-use crate::vortix_process::CommandSpec;
-
-/// Run a command and return its output.
-///
-/// No timeout — called from the scanner's background thread, cannot block the UI.
-/// All commands are read-only inspections that run unprivileged.
-fn cmd_output(program: &str, args: &[&str]) -> Option<std::process::Output> {
-    let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
-    crate::vortix_process::run_to_output(CommandSpec::oneshot(program, owned)).ok()
-}
+use crate::vortix_process::simple_output as cmd_output;
 
 /// Linux interface detection using `libc::getifaddrs`, `/sys/class/net`, and `wg show`.
 pub struct LinuxInterface;
 
 impl Interface for LinuxInterface {
-    fn check_wireguard_interface(name: &str) -> bool {
-        // On Linux, WireGuard creates interfaces directly (wg0, wg1, etc.)
-        // Also check using `wg show` which works for kernel and userspace WireGuard.
-        // `wg` stays a shell-out (it's the irreducible WireGuard tool).
-        check_wg_interface_exists(name)
-    }
-
     fn resolve_wireguard_interface(name: &str) -> Option<String> {
         // Linux doesn't use /var/run/wireguard/*.name mapping files
         // The interface name IS the WireGuard interface
@@ -82,32 +66,7 @@ fn check_wg_interface_exists(name: &str) -> bool {
 /// on procps.
 ///
 pub(crate) fn find_pid_with_cmdline_substrings(needles: &[&str]) -> Option<u32> {
-    let needles_lower: Vec<String> = needles.iter().map(|n| n.to_lowercase()).collect();
-
-    let entries = std::fs::read_dir("/proc").ok()?;
-    for entry in entries.flatten() {
-        let file_name = entry.file_name();
-        let Some(name) = file_name.to_str() else {
-            continue;
-        };
-        // Skip non-PID entries (those are numeric).
-        let Ok(pid) = name.parse::<u32>() else {
-            continue;
-        };
-        // cmdline is null-separated; replace with spaces for substring
-        // matching against the legacy `ps args` format.
-        let cmdline_path = format!("/proc/{pid}/cmdline");
-        let Ok(raw) = std::fs::read(&cmdline_path) else {
-            continue; // PID disappeared between readdir and read — fine
-        };
-        let cmdline = String::from_utf8_lossy(&raw)
-            .replace('\0', " ")
-            .to_lowercase();
-        if needles_lower.iter().all(|n| cmdline.contains(n)) {
-            return Some(pid);
-        }
-    }
-    None
+    matching_pids(needles, Some(1)).into_iter().next()
 }
 
 /// Walk `/proc/[pid]/cmdline` and return EVERY PID whose cmdline contains
@@ -117,7 +76,11 @@ pub(crate) fn find_pid_with_cmdline_substrings(needles: &[&str]) -> Option<u32> 
 /// walk as the single-PID variant but collects all matches.
 ///
 pub(crate) fn find_all_pids_with_cmdline_substring(needle: &str) -> Vec<u32> {
-    let needle_lower = needle.to_lowercase();
+    matching_pids(&[needle], None)
+}
+
+fn matching_pids(needles: &[&str], limit: Option<usize>) -> Vec<u32> {
+    let needles: Vec<String> = needles.iter().map(|needle| needle.to_lowercase()).collect();
     let mut matches = Vec::new();
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return matches;
@@ -137,8 +100,11 @@ pub(crate) fn find_all_pids_with_cmdline_substring(needle: &str) -> Vec<u32> {
         let cmdline = String::from_utf8_lossy(&raw)
             .replace('\0', " ")
             .to_lowercase();
-        if cmdline.contains(&needle_lower) {
+        if needles.iter().all(|needle| cmdline.contains(needle)) {
             matches.push(pid);
+            if limit.is_some_and(|limit| matches.len() == limit) {
+                break;
+            }
         }
     }
     matches

@@ -38,7 +38,6 @@ serde_json = "1.0"
 
 # Configuration
 toml = "1.1"
-dirs = "6"
 directories = "6"
 figment = { version = "0.10", features = ["toml", "env"] }
 
@@ -46,8 +45,6 @@ figment = { version = "0.10", features = ["toml", "env"] }
 tokio = { version = "1", features = ["rt-multi-thread", "process", "time", "macros", "sync", "io-util", "fs", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-enum_dispatch = "0.3"
-
 # Unicode display-width (for footer hint budgeting with multi-byte glyphs)
 unicode-width = "0.2"
 

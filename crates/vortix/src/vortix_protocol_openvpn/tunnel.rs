@@ -17,7 +17,7 @@ use crate::vortix_core::ports::tunnel::{
     ParseError, ParsedProfile, ProtocolStatus, Tunnel, TunnelCapabilities, TunnelError,
     TunnelHandle, TunnelKindTag, TunnelStatus,
 };
-use crate::vortix_core::profile::Profile;
+use crate::vortix_core::profile::{sanitize_profile_name, Profile};
 use crate::vortix_process::{CommandSpec, PrivilegeReq};
 use tracing::{debug, info, warn};
 
@@ -389,20 +389,6 @@ impl ProtocolStatus for OvpnStatus {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
-}
-
-/// Filesystem-safe version of a profile name (matches the binary-side
-/// `utils::sanitize_profile_name` rules).
-fn sanitize_profile_name(name: &str) -> String {
-    name.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }
 
 #[allow(clippy::too_many_lines)]

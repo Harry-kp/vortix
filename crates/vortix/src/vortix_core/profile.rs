@@ -8,6 +8,21 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+/// Strip a profile name down to ASCII `[A-Za-z0-9_-]` for safe use in
+/// daemon names, filenames, and process-match patterns.
+#[must_use]
+pub fn sanitize_profile_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 /// Stable identifier for a profile, derived from disk path + name.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ProfileId(String);

@@ -211,7 +211,7 @@ fn real_user_home() -> Option<PathBuf> {
             return home_dir_for_user(&sudo_user);
         }
     }
-    dirs::home_dir()
+    crate::utils::home_dir()
 }
 
 /// Looks up a user's home directory from `/etc/passwd` via `getpwnam`.

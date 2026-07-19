@@ -4,19 +4,9 @@
 //! by scanning system interfaces and processes for `WireGuard` and `OpenVPN` sessions.
 
 use crate::app::{Protocol, VpnProfile};
-use crate::vortix_process::CommandSpec;
+use crate::vortix_process::simple_output as cmd_output;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
-
-/// Run a command and return its output.
-///
-/// No timeout — the scanner runs in a background thread so it cannot block the UI.
-/// All commands here are read-only inspection (`ps`, `wg show`, `ip addr`, `lsof`)
-/// and run with no privilege requirement.
-fn cmd_output(program: &str, args: &[&str]) -> Option<std::process::Output> {
-    let owned_args = args.iter().map(|s| (*s).to_string()).collect();
-    crate::vortix_process::run_to_output(CommandSpec::oneshot(program, owned_args)).ok()
-}
 
 /// Information about an active VPN session detected on the system.
 #[derive(Clone, Debug)]
@@ -124,7 +114,14 @@ pub fn get_active_profiles(profiles: &[VpnProfile]) -> Vec<ActiveSession> {
     let mut active = Vec::new();
 
     // 1. Batch lookup for OpenVPN
-    let openvpn_pids = get_all_openvpn_pids();
+    let openvpn_pids = if profiles
+        .iter()
+        .any(|profile| matches!(profile.protocol, Protocol::OpenVPN))
+    {
+        get_all_openvpn_pids()
+    } else {
+        std::collections::HashMap::new()
+    };
     for profile in profiles {
         let session_info = match profile.protocol {
             Protocol::WireGuard => check_wireguard_by_name(&profile.name),
@@ -180,28 +177,15 @@ fn check_wireguard_by_name(name: &str) -> Option<ActiveSession> {
     // Platform-dispatched interface check via the platform aggregate.
     let platform = crate::platform::current_platform();
 
-    if !platform.interface.check_wireguard_interface(name) {
-        return None;
-    }
-
     // On macOS, `resolve_wireguard_interface` reads /var/run/wireguard/
-    // <name>.name and returns Some(utunN). On Linux, it returns None
-    // because the kernel device IS the config name — the fallback to
-    // `name.to_string()` is correct. The Some-branch (macOS happy
-    // path) is authoritative; the None fallback is authoritative on
-    // Linux but unauthoritative on macOS (where it indicates an
-    // anomalous wg-quick install / permission state).
-    let resolved = platform.interface.resolve_wireguard_interface(name);
-    let interface_name = resolved.clone().unwrap_or_else(|| name.to_string());
-    // `iface_authoritative` is true when the port returned Some, OR
-    // when we're on Linux (where the port always returns None and the
-    // basename IS the kernel name). The narrow unauthoritative case is
-    // macOS + None — the .name file was missing.
-    let iface_authoritative = resolved.is_some() || cfg!(target_os = "linux");
+    // <name>.name and returns Some(utunN). On Linux, the kernel device
+    // is the config name. Resolution also establishes existence, so a
+    // separate check would repeat the same `wg show` subprocess.
+    let interface_name = platform.interface.resolve_wireguard_interface(name)?;
 
     let mut session = ActiveSession {
         interface: interface_name.clone(),
-        interface_authoritative: iface_authoritative,
+        interface_authoritative: true,
         ..Default::default()
     };
 

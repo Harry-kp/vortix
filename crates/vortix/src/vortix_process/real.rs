@@ -80,7 +80,7 @@ impl RealRunner {
     }
 
     fn check_privilege(spec: &CommandSpec) -> Result<(), ProcessError> {
-        if spec.requires_privilege == PrivilegeReq::Root && !is_root() {
+        if spec.requires_privilege == PrivilegeReq::Root && !crate::utils::is_root() {
             return Err(ProcessError::PrivilegeDenied {
                 program: spec.program.clone(),
             });
@@ -308,21 +308,6 @@ impl Trait for RealRunner {
         drop(child);
 
         Ok(DetachedHandle { pid, spawned_at })
-    }
-}
-
-fn is_root() -> bool {
-    #[cfg(unix)]
-    {
-        // SAFETY: `geteuid` is a thread-safe getter with no side effects.
-        #[allow(unsafe_code)]
-        unsafe {
-            libc::geteuid() == 0
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        false
     }
 }
 

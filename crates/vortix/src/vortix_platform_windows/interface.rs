@@ -10,10 +10,6 @@ use crate::vortix_core::ports::interface::Interface;
 pub struct WindowsInterface;
 
 impl Interface for WindowsInterface {
-    fn check_wireguard_interface(_name: &str) -> bool {
-        false
-    }
-
     fn resolve_wireguard_interface(_name: &str) -> Option<String> {
         None
     }

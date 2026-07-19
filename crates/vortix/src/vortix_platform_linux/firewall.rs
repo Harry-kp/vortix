@@ -29,7 +29,7 @@
 use std::fmt::Write;
 use std::net::IpAddr;
 
-use crate::vortix_core::cidr::Cidr;
+use crate::vortix_core::cidr::{rfc1918_ranges, Cidr};
 use crate::vortix_core::cidr_subtract::cidr_subtract;
 use crate::vortix_core::ports::killswitch::{
     ActiveTunnelInfo, Killswitch, KillswitchError, Result,
@@ -48,23 +48,6 @@ enum FirewallBackend {
 
 /// Linux firewall implementation supporting iptables and nftables.
 pub struct IptablesFirewall;
-
-/// Format a `Cidr` as `addr/prefix` (e.g. `10.0.0.0/8`). Used for the v4
-/// RFC1918 lines emitted into the iptables ruleset.
-fn fmt_cidr(c: &Cidr) -> String {
-    format!("{}/{}", c.addr, c.prefix_len)
-}
-
-/// RFC1918 base list — the v4 private-network space allowed to bypass the
-/// killswitch onto the underlay. Secondaries' `declared_cidrs` are
-/// subtracted from this; primaries are excluded from the remove list per
-/// Q-DEF-9 D-6.
-fn rfc1918_base() -> Vec<Cidr> {
-    ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
-        .iter()
-        .map(|s| s.parse().expect("static RFC1918 CIDRs parse"))
-        .collect()
-}
 
 impl IptablesFirewall {
     /// Detect which firewall backend is available, preferring iptables.
@@ -123,9 +106,9 @@ impl IptablesFirewall {
             .filter(|t| !t.is_primary)
             .flat_map(|t| t.declared_cidrs.iter().copied())
             .collect();
-        let rfc1918 = cidr_subtract(&rfc1918_base(), &secondary_cidrs);
+        let rfc1918 = cidr_subtract(&rfc1918_ranges(), &secondary_cidrs);
         for c in &rfc1918 {
-            writeln!(rules, "-A OUTPUT -d {} -j ACCEPT", fmt_cidr(c)).unwrap();
+            writeln!(rules, "-A OUTPUT -d {c} -j ACCEPT").unwrap();
         }
 
         // DHCP — must precede the per-tunnel rules so a DHCP renew on the
@@ -389,14 +372,6 @@ impl IptablesFirewall {
     }
 }
 
-fn is_root() -> bool {
-    // SAFETY: `geteuid` is a thread-safe getter with no side effects.
-    #[allow(unsafe_code)]
-    unsafe {
-        libc::geteuid() == 0
-    }
-}
-
 impl Killswitch for IptablesFirewall {
     /// Engage the killswitch with a ruleset covering every tunnel in
     /// `active`. The iptables backend pipes a full ruleset through
@@ -409,7 +384,7 @@ impl Killswitch for IptablesFirewall {
     /// 1-4 only) — used during early bring-up and on hard-fail Armed
     /// states.
     fn enable_blocking_multi(active: &[ActiveTunnelInfo]) -> Result<()> {
-        if !is_root() {
+        if !crate::utils::is_root() {
             error!(target: "vortix::killswitch", "kill switch requires root privileges");
             return Err(KillswitchError::NotRoot);
         }
@@ -455,7 +430,7 @@ impl Killswitch for IptablesFirewall {
     fn disable_blocking() -> Result<()> {
         info!(target: "vortix::killswitch", "disabling kill switch");
 
-        if !is_root() {
+        if !crate::utils::is_root() {
             error!(target: "vortix::killswitch", "disabling kill switch requires root");
             return Err(KillswitchError::NotRoot);
         }

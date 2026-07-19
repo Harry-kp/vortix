@@ -128,7 +128,7 @@ pub struct MockDns {
 /// Scriptable mock for the `Interface` port.
 #[derive(Debug, Default, Clone)]
 pub struct MockInterface {
-    /// If true, `check_wireguard_interface` always returns true.
+    /// If true, resolution falls back to the requested profile name.
     pub wg_present: bool,
     /// Override the value returned by `resolve_wireguard_interface`.
     /// `Some("utun7")` simulates the macOS case where wg-quick maps
@@ -261,21 +261,6 @@ pub enum InterfaceKind {
 }
 
 impl InterfaceKind {
-    /// Whether a `WireGuard` interface exists for this profile name.
-    #[must_use]
-    pub fn check_wireguard_interface(&self, name: &str) -> bool {
-        use crate::vortix_core::ports::interface::Interface;
-        match self {
-            #[cfg(target_os = "macos")]
-            Self::Macos => platform_impl::MacInterface::check_wireguard_interface(name),
-            #[cfg(target_os = "linux")]
-            Self::Linux => platform_impl::LinuxInterface::check_wireguard_interface(name),
-            #[cfg(target_os = "windows")]
-            Self::Windows => platform_impl::WindowsInterface::check_wireguard_interface(name),
-            Self::Mock(m) => m.wg_present,
-        }
-    }
-
     /// Resolve the real interface name for a `WireGuard` profile.
     #[must_use]
     pub fn resolve_wireguard_interface(&self, name: &str) -> Option<String> {

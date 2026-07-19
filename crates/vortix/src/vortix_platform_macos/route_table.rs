@@ -18,9 +18,9 @@
 //! probe return their physical interface even while the VPN is up; that
 //! case is rare enough to accept as a known limitation.
 
-use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use crate::platform::route_probe::{ProbeOutcome, RouteProbe};
 use crate::vortix_core::ports::route_table::RouteTable;
 use crate::vortix_process::CommandSpec;
 
@@ -32,7 +32,7 @@ use crate::vortix_process::CommandSpec;
 /// macOS).
 const ROUTE_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Process-wide backoff state for the route-default probe. Without this,
+/// Process-wide backoff for the route-default probe. Without this,
 /// the scanner thread and network-monitor thread each call this
 /// subprocess every 1-2 seconds; on a broken VPN both hit the 1s
 /// timeout, burning two tokio runtime workers continuously even though
@@ -40,38 +40,7 @@ const ROUTE_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 /// and prevents the scanner's per-tick budget from being eaten by
 /// hopeless probes, which is what makes the UI feel stuttery (the
 /// scanner ticks at 1Hz so state updates land slow).
-struct ProbeBackoff {
-    /// Number of consecutive subprocess failures (timeout / I/O error).
-    /// Reset to zero on success.
-    consecutive_fails: u32,
-    /// Earliest moment the next probe is allowed. `Instant::now()` or
-    /// earlier = probe immediately; in the future = skip.
-    next_allowed: Instant,
-}
-
-fn backoff_state() -> &'static Mutex<ProbeBackoff> {
-    static STATE: OnceLock<Mutex<ProbeBackoff>> = OnceLock::new();
-    STATE.get_or_init(|| {
-        Mutex::new(ProbeBackoff {
-            consecutive_fails: 0,
-            next_allowed: Instant::now(),
-        })
-    })
-}
-
-/// Map consecutive-failure count to the cooldown that follows. Tuned to
-/// degrade gracefully: a transient kernel-transition (1-2 failures)
-/// recovers immediately; a persistent broken-network state (many
-/// failures) backs off to ~once-per-minute.
-fn cooldown_for_fails(fails: u32) -> Duration {
-    let secs = match fails {
-        0..=2 => 0,
-        3..=5 => 5,
-        6..=10 => 15,
-        _ => 60,
-    };
-    Duration::from_secs(secs)
-}
+static ROUTE_PROBE: RouteProbe = RouteProbe::new();
 
 /// Public-internet probe target. See module-level docs for why this is
 /// preferred over `route get default`.
@@ -98,55 +67,30 @@ impl RouteTable for MacRouteTable {
 /// Returns `None` if the subprocess fails (binary missing, non-zero exit,
 /// I/O error) so callers can degrade gracefully without panicking.
 fn run_route_get_default() -> Option<String> {
-    // Backoff gate — if a recent probe failed badly enough, skip this
-    // call. Callers tolerate `None`; the registry continues serving its
-    // last-known cached route iface, and the scanner thread is freed to
-    // do useful session work instead of waiting on a kernel that can't
-    // answer.
-    {
-        let state = backoff_state()
-            .lock()
-            .expect("backoff state mutex poisoned");
-        if Instant::now() < state.next_allowed {
-            return None;
-        }
-    }
-
-    let result = crate::vortix_process::run_to_output(
+    match ROUTE_PROBE.run(
         CommandSpec::oneshot(
             "route",
             vec!["-n".into(), "get".into(), ROUTE_PROBE_TARGET.into()],
         )
         .timeout(ROUTE_QUERY_TIMEOUT),
-    );
-
-    let mut state = backoff_state()
-        .lock()
-        .expect("backoff state mutex poisoned");
-    if let Ok(output) = result {
-        // Subprocess returned (even with non-zero exit). Reset
-        // backoff so the next caller probes immediately — the kernel
-        // is answering again.
-        state.consecutive_fails = 0;
-        state.next_allowed = Instant::now();
-        return Some(String::from_utf8_lossy(&output.stdout).into_owned());
+    ) {
+        ProbeOutcome::Success(stdout) => Some(stdout),
+        ProbeOutcome::BackedOff => None,
+        ProbeOutcome::Failed {
+            consecutive_failures,
+            cooldown,
+        } => {
+            if consecutive_failures == 1 || cooldown >= Duration::from_secs(5) {
+                tracing::warn!(
+                    target: "vortix::vortix_platform_macos::route_table",
+                    consecutive_fails = consecutive_failures,
+                    cooldown_secs = cooldown.as_secs(),
+                    "`route get default` probe failed; backing off to spare the tokio runtime"
+                );
+            }
+            None
+        }
     }
-    // Timeout or I/O error. Bump the fail counter and push the
-    // next-allowed time out. Emit a tracing warn so operators
-    // investigating "vortix feels slow" via
-    // `RUST_LOG=vortix::vortix_platform_macos=warn` see the backoff active.
-    state.consecutive_fails = state.consecutive_fails.saturating_add(1);
-    let cooldown = cooldown_for_fails(state.consecutive_fails);
-    state.next_allowed = Instant::now() + cooldown;
-    if state.consecutive_fails == 1 || cooldown >= Duration::from_secs(5) {
-        tracing::warn!(
-            target: "vortix::vortix_platform_macos::route_table",
-            consecutive_fails = state.consecutive_fails,
-            cooldown_secs = cooldown.as_secs(),
-            "`route get default` probe failed; backing off to spare the tokio runtime"
-        );
-    }
-    None
 }
 
 /// Extract the `gateway:` line from `route get default` output.
@@ -242,23 +186,5 @@ destination: default
     fn parse_gateway_still_works_on_sample() {
         assert_eq!(parse_gateway(SAMPLE_WIFI), Some("192.168.1.1".into()));
         assert_eq!(parse_gateway(SAMPLE_VPN), Some("10.0.0.1".into()));
-    }
-
-    /// Backoff ladder: the first two failures retry immediately so a
-    /// transient kernel-transition recovers fast. Persistent failures
-    /// escalate to ~once-per-minute so a broken VPN doesn't keep the
-    /// scanner and network-monitor threads burning a tokio worker each.
-    #[test]
-    fn cooldown_ladder_escalates_then_caps() {
-        assert_eq!(cooldown_for_fails(0), Duration::ZERO);
-        assert_eq!(cooldown_for_fails(1), Duration::ZERO);
-        assert_eq!(cooldown_for_fails(2), Duration::ZERO);
-        assert_eq!(cooldown_for_fails(3), Duration::from_secs(5));
-        assert_eq!(cooldown_for_fails(5), Duration::from_secs(5));
-        assert_eq!(cooldown_for_fails(6), Duration::from_secs(15));
-        assert_eq!(cooldown_for_fails(10), Duration::from_secs(15));
-        assert_eq!(cooldown_for_fails(11), Duration::from_secs(60));
-        // Saturates: no further escalation beyond the 60s cap.
-        assert_eq!(cooldown_for_fails(1_000_000), Duration::from_secs(60));
     }
 }

@@ -1,8 +1,8 @@
 //! `vortix-process`: concrete `CommandRunner` implementations.
 //!
-//! Owns the tokio + tracing dependency surface. Exposes `CommandRunner` as an
-//! `enum_dispatch`-driven enum carrying `Real(RealRunner)` and `Mock(MockRunner)`
-//! variants. Callers hold the enum by value; static dispatch, no `Box<dyn>`.
+//! Owns the tokio + tracing dependency surface. Exposes `CommandRunner` as a
+//! hand-dispatched enum carrying `Real(RealRunner)` and `Mock(MockRunner)`
+//! variants. Callers hold the enum by value; no `Box<dyn>`.
 //!
 
 #![allow(clippy::missing_errors_doc)]
@@ -167,6 +167,13 @@ pub fn run_to_output(spec: CommandSpec) -> std::io::Result<std::process::Output>
         ))),
         Err(ProcessError::IoError { source, .. }) => Err(source),
     }
+}
+
+/// Run a simple unprivileged command and discard invocation errors.
+#[must_use]
+pub fn simple_output(program: &str, args: &[&str]) -> Option<std::process::Output> {
+    let args = args.iter().map(|arg| (*arg).to_string()).collect();
+    run_to_output(CommandSpec::oneshot(program, args)).ok()
 }
 
 fn outcome_to_output(outcome: CommandOutcome) -> std::process::Output {

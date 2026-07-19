@@ -62,7 +62,6 @@ serde_json = { workspace = true }
 
 # Configuration
 toml = { workspace = true }
-dirs = { workspace = true }
 
 # Unicode display-width (for footer hint budgeting with multi-byte glyphs)
 unicode-width = { workspace = true }
@@ -77,7 +76,6 @@ tracing-subscriber = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "time"] }
 thiserror = { workspace = true }
 directories = { workspace = true }
-enum_dispatch = { workspace = true }
 figment = { workspace = true }
 sha2 = "0.11"
 # Plan 2026-06-02-001 U2 (#191): base64 envelope for OpenVPN SCRV1

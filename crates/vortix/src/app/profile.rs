@@ -168,8 +168,8 @@ impl App {
                 }
             }
 
-            self.save_metadata();
-            self.sort_profiles();
+            self.runtime.save_metadata();
+            self.runtime.sort_profiles();
 
             if let Some(new_idx) = self
                 .runtime
@@ -184,56 +184,6 @@ impl App {
                 format!("Renamed '{old_name}' → '{new_name}'"),
                 ToastType::Success,
             );
-        }
-    }
-
-    pub(crate) fn save_metadata(&self) {
-        use std::collections::HashMap;
-
-        let mut metadata = HashMap::new();
-        for profile in &self.runtime.profiles {
-            let key = profile.config_path.to_string_lossy().to_string();
-            metadata.insert(
-                key,
-                utils::ProfileMetadata {
-                    last_used: profile.last_used,
-                },
-            );
-        }
-
-        let _ = utils::save_profile_metadata(&metadata);
-    }
-
-    /// Sort profiles according to the current `sort_order`.
-    pub(crate) fn sort_profiles(&mut self) {
-        use crate::state::ProfileSortOrder;
-        match self.runtime.sort_order {
-            ProfileSortOrder::NameAsc => {
-                self.runtime.profiles.sort_by(|a, b| a.name.cmp(&b.name));
-            }
-            ProfileSortOrder::NameDesc => {
-                self.runtime.profiles.sort_by(|a, b| b.name.cmp(&a.name));
-            }
-            ProfileSortOrder::LastUsed => {
-                self.runtime.profiles.sort_by(|a, b| {
-                    b.last_used
-                        .unwrap_or(std::time::UNIX_EPOCH)
-                        .cmp(&a.last_used.unwrap_or(std::time::UNIX_EPOCH))
-                });
-            }
-            ProfileSortOrder::Protocol => {
-                fn proto_rank(p: crate::state::Protocol) -> u8 {
-                    match p {
-                        crate::state::Protocol::WireGuard => 0,
-                        crate::state::Protocol::OpenVPN => 1,
-                    }
-                }
-                self.runtime.profiles.sort_by(|a, b| {
-                    proto_rank(a.protocol)
-                        .cmp(&proto_rank(b.protocol))
-                        .then_with(|| a.name.cmp(&b.name))
-                });
-            }
         }
     }
 
@@ -280,7 +230,7 @@ impl App {
             }
         }
 
-        self.sort_profiles();
+        self.runtime.sort_profiles();
 
         if let Some(name) = last_imported_name {
             if let Some(idx) = self.runtime.profiles.iter().position(|p| p.name == name) {

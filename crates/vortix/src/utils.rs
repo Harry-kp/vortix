@@ -212,23 +212,9 @@ pub fn get_tmp_config_dir(session_id: &str) -> std::io::Result<std::path::PathBu
     Ok(session_dir)
 }
 
-/// Returns the `OpenVPN` runtime directory path for a given profile.
-///
-/// Creates `~/.config/vortix/run/` if it doesn't exist.
-/// Strip a profile name down to ASCII `[A-Za-z0-9_-]` so it is safe for use
-/// in daemon names, filenames, and pkill regex patterns.
-#[must_use]
-pub fn sanitize_profile_name(name: &str) -> String {
-    name.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
+/// Strip a profile name down to ASCII `[A-Za-z0-9_-]` for safe use in
+/// daemon names, filenames, and process-match patterns.
+pub use crate::vortix_core::profile::sanitize_profile_name;
 
 /// Returns `(pid_path, log_path)` for the given profile name.
 ///
@@ -687,37 +673,11 @@ pub fn format_relative_time(time: std::time::SystemTime) -> String {
 
 /// Returns the user's home directory.
 ///
-/// Checks `$HOME` first, then falls back to the system password database
-/// via `getpwuid` for containers, cron jobs, and systemd services where
-/// `$HOME` may be unset.
+/// Uses the same platform-aware base-directory resolver as settings and
+/// journal persistence.
+#[must_use]
 pub fn home_dir() -> Option<std::path::PathBuf> {
-    std::env::var("HOME")
-        .ok()
-        .map(std::path::PathBuf::from)
-        .or_else(home_dir_from_passwd)
-}
-
-/// Fallback: resolve home directory from /etc/passwd via libc.
-#[cfg(unix)]
-#[allow(unsafe_code)]
-fn home_dir_from_passwd() -> Option<std::path::PathBuf> {
-    // SAFETY: getuid() is always safe; getpwuid() returns a static pointer
-    // that is valid until the next call to any getpw* function. We copy the
-    // data immediately so the pointer is not held across calls.
-    unsafe {
-        let uid = libc::getuid();
-        let pw = libc::getpwuid(uid);
-        if pw.is_null() {
-            return None;
-        }
-        let home = std::ffi::CStr::from_ptr((*pw).pw_dir);
-        home.to_str().ok().map(std::path::PathBuf::from)
-    }
-}
-
-#[cfg(not(unix))]
-fn home_dir_from_passwd() -> Option<std::path::PathBuf> {
-    None
+    directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf())
 }
 
 /// Profile metadata for persistence

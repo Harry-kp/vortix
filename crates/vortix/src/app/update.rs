@@ -292,7 +292,7 @@ impl App {
                     .and_then(|i| self.runtime.profiles.get(i))
                     .map(|p| p.name.clone());
                 self.runtime.sort_order = self.runtime.sort_order.next();
-                self.sort_profiles();
+                self.runtime.sort_profiles();
                 if let Some(name) = selected_name {
                     if let Some(new_idx) = self.runtime.profiles.iter().position(|p| p.name == name)
                     {
@@ -578,7 +578,7 @@ impl App {
             if let Some(p) = self.runtime.profiles.iter_mut().find(|p| p.name == profile) {
                 p.last_used = Some(std::time::SystemTime::now());
             }
-            self.save_metadata();
+            self.runtime.save_metadata();
 
             self.runtime.last_connected_profile = Some(profile.clone());
             self.log(&format!("STATUS: Connected to '{profile}'"));
@@ -598,7 +598,7 @@ impl App {
             // dismisses. Before this, failed connects left no trace
             // in the registry and the sidebar reverted to blank.
             self.mirror_failed_into_registry(&profile, &err_msg);
-            self.cleanup_vpn_resources(&profile);
+            self.runtime.cleanup_vpn_resources(&profile);
 
             // Attempt retry with exponential backoff if configured.
             // Per-profile retry (): each profile's attempt
@@ -1150,7 +1150,7 @@ impl App {
             "WARN: Disconnect timed out for '{profile_name}' after {}s, forcing cleanup",
             self.runtime.config.disconnect_timeout
         ));
-        self.cleanup_vpn_resources(profile_name);
+        self.runtime.cleanup_vpn_resources(profile_name);
         self.runtime.pending_connect = None;
         if self.legacy_matches(profile_name) {
             self.runtime.session_start = None;
@@ -1475,7 +1475,7 @@ impl App {
     }
 
     fn handle_connection_timeout(&mut self, profile_name: String) {
-        self.cleanup_vpn_resources(&profile_name);
+        self.runtime.cleanup_vpn_resources(&profile_name);
         let profile_id = crate::vortix_core::profile::ProfileId::new(&profile_name);
         self.runtime.session_start = None;
         self.runtime.pending_connect = None;

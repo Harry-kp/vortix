@@ -8,8 +8,6 @@
 //! Phase B daemon work (idea 4) adds a `Remote(RemoteHandle)` variant
 //! additively (the enum is `#[non_exhaustive]`).
 
-use std::sync::Arc;
-
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::vortix_core::engine::error::EngineError;
@@ -240,7 +238,6 @@ fn actor_loop<T: Tunnel>(
                 let events = engine.handle(input);
                 let count = events.len();
                 // Best-effort journal append — failures are non-fatal.
-                let journal = Arc::new(journal.clone());
                 for ev in events {
                     let _ = journal.append(ev);
                 }

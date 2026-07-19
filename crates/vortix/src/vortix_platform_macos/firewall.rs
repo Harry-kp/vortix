@@ -15,7 +15,7 @@ use std::io::Write as IoWrite;
 use std::net::IpAddr;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-use crate::vortix_core::cidr::Cidr;
+use crate::vortix_core::cidr::{rfc1918_ranges, Cidr};
 use crate::vortix_core::cidr_subtract::cidr_subtract;
 use crate::vortix_core::ports::killswitch::{
     ActiveTunnelInfo, Killswitch, KillswitchError, Result,
@@ -48,30 +48,6 @@ fn pfctl_load_stdin(ruleset: &[u8]) -> std::io::Result<std::process::Output> {
             .privilege(PrivilegeReq::Root)
             .stdin(ruleset.to_vec()),
     )
-}
-
-fn is_root() -> bool {
-    // SAFETY: `geteuid` is a thread-safe getter with no side effects.
-    #[allow(unsafe_code)]
-    unsafe {
-        libc::geteuid() == 0
-    }
-}
-
-/// Format a `Cidr` as pf-syntax `addr/prefix` (e.g. `10.0.0.0/8`). pf
-/// accepts this for both v4 and v6; we only emit v4 today.
-fn fmt_cidr(c: &Cidr) -> String {
-    format!("{}/{}", c.addr, c.prefix_len)
-}
-
-/// The RFC1918 base list. `enable_blocking_multi` subtracts the union of
-/// secondaries' `declared_cidrs` from this; primaries don't contribute
-/// (see `cidr_subtract` docs / Q-DEF-9 D-6).
-fn rfc1918_base() -> Vec<Cidr> {
-    ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
-        .iter()
-        .map(|s| s.parse().expect("static RFC1918 CIDRs parse"))
-        .collect()
 }
 
 /// macOS pf-based firewall implementation.
@@ -115,7 +91,7 @@ impl PfFirewall {
             .filter(|t| !t.is_primary)
             .flat_map(|t| t.declared_cidrs.iter().copied())
             .collect();
-        let rfc1918 = cidr_subtract(&rfc1918_base(), &secondary_cidrs);
+        let rfc1918 = cidr_subtract(&rfc1918_ranges(), &secondary_cidrs);
 
         writeln!(
             rules,
@@ -123,7 +99,7 @@ impl PfFirewall {
         )
         .unwrap();
         for c in &rfc1918 {
-            writeln!(rules, "pass out quick to {}", fmt_cidr(c)).unwrap();
+            writeln!(rules, "pass out quick to {c}").unwrap();
         }
         writeln!(rules).unwrap();
 
@@ -215,7 +191,7 @@ impl Killswitch for PfFirewall {
             "killswitch.engage"
         );
 
-        if !is_root() {
+        if !crate::utils::is_root() {
             error!(target: "vortix::killswitch", "kill switch requires root privileges");
             return Err(KillswitchError::NotRoot);
         }
@@ -267,7 +243,7 @@ impl Killswitch for PfFirewall {
     fn disable_blocking() -> Result<()> {
         info!(target: "vortix::killswitch", "disabling kill switch");
 
-        if !is_root() {
+        if !crate::utils::is_root() {
             error!(target: "vortix::killswitch", "disabling kill switch requires root");
             return Err(KillswitchError::NotRoot);
         }

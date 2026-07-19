@@ -14,9 +14,9 @@
 //! See `vortix_platform_macos/route_table.rs` for the cross-platform
 //! rationale and the choice of 8.8.8.8 as the probe target.
 
-use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use crate::platform::route_probe::{ProbeOutcome, RouteProbe};
 use crate::vortix_core::ports::route_table::RouteTable;
 use crate::vortix_process::CommandSpec;
 
@@ -31,30 +31,7 @@ const ROUTE_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 /// a broken Linux network state doesn't keep the scanner thread + the
 /// network-monitor thread both spinning on a doomed `ip route` call
 /// every couple of seconds.
-struct ProbeBackoff {
-    consecutive_fails: u32,
-    next_allowed: Instant,
-}
-
-fn backoff_state() -> &'static Mutex<ProbeBackoff> {
-    static STATE: OnceLock<Mutex<ProbeBackoff>> = OnceLock::new();
-    STATE.get_or_init(|| {
-        Mutex::new(ProbeBackoff {
-            consecutive_fails: 0,
-            next_allowed: Instant::now(),
-        })
-    })
-}
-
-fn cooldown_for_fails(fails: u32) -> Duration {
-    let secs = match fails {
-        0..=2 => 0,
-        3..=5 => 5,
-        6..=10 => 15,
-        _ => 60,
-    };
-    Duration::from_secs(secs)
-}
+static ROUTE_PROBE: RouteProbe = RouteProbe::new();
 
 /// Public-internet probe target. See module-level docs for why this is
 /// preferred over `ip route show default`.
@@ -80,44 +57,31 @@ impl RouteTable for LinuxRouteTable {
 ///
 /// Returns `None` if the subprocess fails so callers can degrade gracefully.
 fn run_ip_route_show_default() -> Option<String> {
-    {
-        let state = backoff_state()
-            .lock()
-            .expect("backoff state mutex poisoned");
-        if Instant::now() < state.next_allowed {
-            return None;
-        }
-    }
-
-    let result = crate::vortix_process::run_to_output(
+    match ROUTE_PROBE.run(
         // xtask:allow-shell-regression: `ip route get <ip>` is the canonical Linux routing-table inspection — no libc equivalent that returns the chosen egress dev without rolling our own netlink RTNETLINK parser.
         CommandSpec::oneshot(
             "ip",
             vec!["route".into(), "get".into(), ROUTE_PROBE_TARGET.into()],
         )
         .timeout(ROUTE_QUERY_TIMEOUT),
-    );
-
-    let mut state = backoff_state()
-        .lock()
-        .expect("backoff state mutex poisoned");
-    if let Ok(output) = result {
-        state.consecutive_fails = 0;
-        state.next_allowed = Instant::now();
-        return Some(String::from_utf8_lossy(&output.stdout).into_owned());
+    ) {
+        ProbeOutcome::Success(stdout) => Some(stdout),
+        ProbeOutcome::BackedOff => None,
+        ProbeOutcome::Failed {
+            consecutive_failures,
+            cooldown,
+        } => {
+            if consecutive_failures == 1 || cooldown >= Duration::from_secs(5) {
+                tracing::warn!(
+                    target: "vortix::vortix_platform_linux::route_table",
+                    consecutive_fails = consecutive_failures,
+                    cooldown_secs = cooldown.as_secs(),
+                    "`ip route get` probe failed; backing off to spare the tokio runtime"
+                );
+            }
+            None
+        }
     }
-    state.consecutive_fails = state.consecutive_fails.saturating_add(1);
-    let cooldown = cooldown_for_fails(state.consecutive_fails);
-    state.next_allowed = Instant::now() + cooldown;
-    if state.consecutive_fails == 1 || cooldown >= Duration::from_secs(5) {
-        tracing::warn!(
-            target: "vortix::vortix_platform_linux::route_table",
-            consecutive_fails = state.consecutive_fails,
-            cooldown_secs = cooldown.as_secs(),
-            "`ip route get` probe failed; backing off to spare the tokio runtime"
-        );
-    }
-    None
 }
 
 /// Extract the gateway IP from any line containing `via <ip>`.

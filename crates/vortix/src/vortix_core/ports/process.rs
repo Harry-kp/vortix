@@ -222,7 +222,7 @@ pub enum ProcessError {
 ///
 /// Implementations live in `vortix-process` (`RealRunner` for production, `MockRunner`
 /// for tests). The trait uses native AFIT (Rust 1.75+); the `vortix-process` crate
-/// provides an `enum_dispatch`-driven enum wrapper that callers hold by value.
+/// provides a hand-dispatched enum wrapper that callers hold by value.
 pub trait CommandRunner: Send + Sync {
     /// Run a one-shot subprocess to completion.
     fn run(

@@ -6,6 +6,7 @@
 //! over to the `Platform` aggregate.
 
 pub mod aggregate;
+pub(crate) mod route_probe;
 
 #[cfg(target_os = "linux")]
 pub mod linux;

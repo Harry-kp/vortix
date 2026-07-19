@@ -6,9 +6,6 @@
 /// name and the actual kernel/userspace interface, query process state, and
 /// extract IP/MTU information.
 pub trait Interface {
-    /// Check whether a `WireGuard` interface exists for the given profile name.
-    fn check_wireguard_interface(name: &str) -> bool;
-
     /// Resolve the real interface name for a `WireGuard` profile.
     fn resolve_wireguard_interface(name: &str) -> Option<String>;
 

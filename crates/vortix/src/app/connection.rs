@@ -359,52 +359,6 @@ impl App {
         }
     }
 
-    /// Kill any running VPN process and remove run files for a profile.
-    ///
-    /// routes through the `TunnelKind` dispatch so this no
-    /// longer match-branches on protocol.
-    pub(crate) fn cleanup_vpn_resources(&self, profile_name: &str) {
-        if let Some(profile) = self
-            .runtime
-            .profiles
-            .iter()
-            .find(|p| p.name == profile_name)
-        {
-            use crate::vortix_core::ports::tunnel::{TunnelHandle, TunnelKindTag};
-            use crate::vortix_core::profile::ProfileId;
-
-            let iface = match profile.protocol {
-                Protocol::WireGuard => profile.config_path.to_string_lossy().into_owned(),
-                Protocol::OpenVPN => {
-                    format!("openvpn-{}", utils::sanitize_profile_name(profile_name))
-                }
-            };
-            let pid = match profile.protocol {
-                Protocol::OpenVPN => utils::read_openvpn_pid(profile_name),
-                Protocol::WireGuard => None,
-            };
-            let handle = TunnelHandle {
-                profile_id: ProfileId::new(profile_name),
-                interface_name: iface,
-                pid,
-                started_at: std::time::SystemTime::now(),
-                kind: match profile.protocol {
-                    Protocol::WireGuard => TunnelKindTag::WireGuard,
-                    Protocol::OpenVPN => TunnelKindTag::OpenVpn,
-                },
-            };
-
-            let config_dir =
-                utils::get_app_config_dir().unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
-            let mut tunnel = crate::tunnel::tunnel_for(profile.protocol, &config_dir, "3", 30);
-            let _ = tunnel.down(handle);
-
-            if matches!(profile.protocol, Protocol::OpenVPN) {
-                utils::cleanup_openvpn_run_files(profile_name);
-            }
-        }
-    }
-
     /// Finalize a disconnect: transition to `Disconnected`, sync kill switch,
     /// and drain `pending_connect` (auto-connect to the queued profile, if any).
     pub(crate) fn complete_disconnect(&mut self, profile_name: &str) {

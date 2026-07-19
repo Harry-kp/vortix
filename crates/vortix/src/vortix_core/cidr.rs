@@ -10,7 +10,7 @@
 //! Implemented directly — no external CIDR crate — so the dependency
 //! surface stays small.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
@@ -90,6 +90,31 @@ impl Cidr {
             _ => false,
         }
     }
+}
+
+impl std::fmt::Display for Cidr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.addr, self.prefix_len)
+    }
+}
+
+/// The ordered RFC 1918 private IPv4 ranges used by platform firewalls.
+#[must_use]
+pub const fn rfc1918_ranges() -> [Cidr; 3] {
+    [
+        Cidr {
+            addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)),
+            prefix_len: 8,
+        },
+        Cidr {
+            addr: IpAddr::V4(Ipv4Addr::new(172, 16, 0, 0)),
+            prefix_len: 12,
+        },
+        Cidr {
+            addr: IpAddr::V4(Ipv4Addr::new(192, 168, 0, 0)),
+            prefix_len: 16,
+        },
+    ]
 }
 
 /// Return the CIDRs from `a` that intersect any CIDR in `b`. O(|a|·|b|);

@@ -12,7 +12,6 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { workspace = true }
-thiserror = { workspace = true }
 ignore = "0.4"
 
 [lints]
