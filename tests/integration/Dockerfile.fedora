@@ -1,9 +1,10 @@
 # vortix integration test harness — Fedora variant.
 #
 # Privileged Fedora container with wireguard-tools + openvpn + iproute +
-# native nftables preinstalled. Parallel to the Ubuntu image; the workflow
-# matrix runs both so we catch behavioral differences between iptables-nft
-# compat (Ubuntu's default) and native nft (Fedora's default).
+# iptables-nft and native nftables preinstalled. Parallel to the Ubuntu image;
+# the workflow matrix catches distro and client-version differences, while
+# nft_killswitch.sh explicitly removes iptables from PATH to exercise native
+# nft on both images.
 #
 # Why Fedora 41: matches the test-fedora cargo-test job's container image
 # in ci.yml — same kernel + libc baseline so behaviors observed here
@@ -21,8 +22,10 @@ ENV CARGO_TERM_COLOR=always
 RUN dnf install -y \
         ca-certificates curl git \
         gcc gcc-c++ make pkgconf-pkg-config openssl-devel \
-        wireguard-tools openvpn iproute iptables nftables \
+        wireguard-tools openvpn iproute iptables-nft nftables \
         iputils sudo \
+    && iptables --version | grep -q 'nf_tables' \
+    && ip6tables --version | grep -q 'nf_tables' \
     && dnf clean all
 # NOTE: deliberately NOT installing `which`. Fedora minimal containers
 # don't ship `which` by default — neither do many real-user Fedora

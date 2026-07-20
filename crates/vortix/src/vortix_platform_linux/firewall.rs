@@ -38,11 +38,18 @@ use tracing::{debug, error, info};
 const CHAIN_NAME: &str = "VORTIX_KILLSWITCH";
 const NFT_TABLE: &str = "vortix_killswitch";
 const POLICY_COMMENT_PREFIX: &str = "vortix-policy:";
+const NFT_MISSING_ERROR: &str = "No such file or directory";
 
 /// Detected firewall backend on this system.
 enum FirewallBackend {
     Iptables,
     Nftables,
+}
+
+#[derive(Clone, Copy)]
+enum NftBatchMode {
+    Create,
+    Replace,
 }
 
 /// Linux firewall implementation supporting iptables and nftables.
@@ -69,8 +76,14 @@ impl IptablesFirewall {
     }
 
     fn has_nft() -> bool {
-        crate::vortix_process::run_to_output(CommandSpec::oneshot("nft", vec!["--version".into()]))
+        crate::vortix_process::run_to_output(Self::nft_command(vec!["--version".into()]))
             .is_ok_and(|o| o.status.success())
+    }
+
+    fn nft_command(args: Vec<String>) -> CommandSpec {
+        let mut command = CommandSpec::oneshot("nft", args);
+        command.env.insert("LC_ALL".to_string(), "C".to_string());
+        command
     }
 
     // ─── iptables backend ───────────────────────────────────────────────
@@ -437,11 +450,12 @@ impl IptablesFirewall {
 
     // ─── nftables backend ───────────────────────────────────────────────
 
-    /// Build one nft transaction that destroys any previous Vortix-owned
-    /// table and creates the complete replacement. nft commits the whole
-    /// batch or leaves the prior table untouched.
+    /// Build an nft transaction that creates the Vortix-owned table or
+    /// atomically deletes and recreates an existing one. `destroy` is avoided
+    /// because supported Ubuntu releases still ship nft clients older than
+    /// 1.0.7, where that command was introduced.
     #[must_use]
-    pub fn generate_nft_ruleset(active: &[ActiveTunnelInfo]) -> String {
+    fn generate_nft_ruleset(active: &[ActiveTunnelInfo], mode: NftBatchMode) -> String {
         let secondary_cidrs: Vec<Cidr> = active
             .iter()
             .filter(|tunnel| !tunnel.is_primary)
@@ -450,15 +464,20 @@ impl IptablesFirewall {
         let local_ranges = cidr_subtract(&rfc1918_ranges(), &secondary_cidrs);
         let digest = crate::core::killswitch::policy_digest(active);
 
-        let mut ruleset = format!(
-            r#"destroy table inet {NFT_TABLE}
-table inet {NFT_TABLE} {{
+        let mut ruleset = String::new();
+        if matches!(mode, NftBatchMode::Replace) {
+            writeln!(ruleset, "delete table inet {NFT_TABLE}").unwrap();
+        }
+        write!(
+            ruleset,
+            r#"table inet {NFT_TABLE} {{
   chain output {{
     type filter hook output priority 0; policy drop;
 
     oifname "lo" accept
 "#,
-        );
+        )
+        .unwrap();
         for range in local_ranges {
             writeln!(ruleset, "    ip daddr {range} accept").unwrap();
         }
@@ -479,6 +498,44 @@ table inet {NFT_TABLE} {{
         .unwrap();
         ruleset.push_str("  }\n}\n");
         ruleset
+    }
+
+    fn nft_table_snapshot() -> Result<Option<String>> {
+        let output = crate::vortix_process::run_to_output(
+            Self::nft_command(vec![
+                "list".into(),
+                "table".into(),
+                "inet".into(),
+                NFT_TABLE.into(),
+            ])
+            .privilege(PrivilegeReq::Root),
+        )
+        .map_err(|error| KillswitchError::CommandFailed(format!("nft read-back: {error}")))?;
+        if output.status.success() {
+            return Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()));
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains(NFT_MISSING_ERROR) {
+            Ok(None)
+        } else {
+            Err(KillswitchError::CommandFailed(format!(
+                "nft read-back failed ambiguously: {stderr}"
+            )))
+        }
+    }
+
+    fn apply_nft_batch(
+        active: &[ActiveTunnelInfo],
+        mode: NftBatchMode,
+    ) -> Result<std::process::Output> {
+        let ruleset = Self::generate_nft_ruleset(active, mode);
+        crate::vortix_process::run_to_output(
+            Self::nft_command(vec!["-f".into(), "-".into()])
+                .privilege(PrivilegeReq::Root)
+                .stdin(ruleset.into_bytes()),
+        )
+        .map_err(|error| KillswitchError::CommandFailed(format!("nft spawn: {error}")))
     }
 
     fn nft_snapshot_matches(active: &[ActiveTunnelInfo], snapshot: &str) -> bool {
@@ -526,37 +583,41 @@ table inet {NFT_TABLE} {{
     }
 
     fn setup_nftables(active: &[ActiveTunnelInfo]) -> Result<()> {
-        let ruleset = Self::generate_nft_ruleset(active);
+        let mut output = Self::apply_nft_batch(active, NftBatchMode::Replace)?;
+        let mut verified_snapshot = None;
+        if !output.status.success()
+            && String::from_utf8_lossy(&output.stderr).contains(NFT_MISSING_ERROR)
+        {
+            output = Self::apply_nft_batch(active, NftBatchMode::Create)?;
+            if !output.status.success() {
+                match Self::nft_table_snapshot()? {
+                    Some(snapshot) if Self::nft_snapshot_matches(active, &snapshot) => {
+                        verified_snapshot = Some(snapshot);
+                    }
+                    Some(_) => {
+                        output = Self::apply_nft_batch(active, NftBatchMode::Replace)?;
+                    }
+                    None => {}
+                }
+            }
+        }
 
-        let output = crate::vortix_process::run_to_output(
-            CommandSpec::oneshot("nft", vec!["-f".into(), "-".into()])
-                .privilege(PrivilegeReq::Root)
-                .stdin(ruleset.into_bytes()),
-        )
-        .map_err(|e| KillswitchError::CommandFailed(format!("nft spawn: {e}")))?;
-
-        if !output.status.success() {
+        if verified_snapshot.is_none() && !output.status.success() {
             return Err(KillswitchError::CommandFailed(format!(
                 "nft failed to replace owned table: {}",
                 String::from_utf8_lossy(&output.stderr)
             )));
         }
 
-        let output = crate::vortix_process::run_to_output(
-            CommandSpec::oneshot(
-                "nft",
-                vec![
-                    "list".into(),
-                    "table".into(),
-                    "inet".into(),
-                    NFT_TABLE.into(),
-                ],
-            )
-            .privilege(PrivilegeReq::Root),
-        )
-        .map_err(|error| KillswitchError::CommandFailed(format!("nft read-back: {error}")))?;
-        let snapshot = String::from_utf8_lossy(&output.stdout);
-        if !output.status.success() || !Self::nft_snapshot_matches(active, &snapshot) {
+        let snapshot = match verified_snapshot {
+            Some(snapshot) => snapshot,
+            None => Self::nft_table_snapshot()?.ok_or_else(|| {
+                KillswitchError::CommandFailed(
+                    "nft read-back did not find the requested policy".to_string(),
+                )
+            })?,
+        };
+        if !Self::nft_snapshot_matches(active, &snapshot) {
             return Err(KillswitchError::CommandFailed(
                 "nft read-back did not match the requested policy".to_string(),
             ));
@@ -568,47 +629,25 @@ table inet {NFT_TABLE} {{
     /// Remove the kill switch nftables table.
     fn teardown_nftables() -> Result<()> {
         let delete = crate::vortix_process::run_to_output(
-            CommandSpec::oneshot(
-                "nft",
-                vec![
-                    "delete".into(),
-                    "table".into(),
-                    "inet".into(),
-                    NFT_TABLE.into(),
-                ],
-            )
+            Self::nft_command(vec![
+                "delete".into(),
+                "table".into(),
+                "inet".into(),
+                NFT_TABLE.into(),
+            ])
             .privilege(PrivilegeReq::Root),
         )
         .map_err(|error| KillswitchError::CommandFailed(format!("nft delete: {error}")))?;
         let delete_error = String::from_utf8_lossy(&delete.stderr);
-        if !delete.status.success() && !delete_error.contains("No such file or directory") {
+        if !delete.status.success() && !delete_error.contains(NFT_MISSING_ERROR) {
             return Err(KillswitchError::CommandFailed(format!(
                 "nft delete failed: {delete_error}"
             )));
         }
-        let output = crate::vortix_process::run_to_output(
-            CommandSpec::oneshot(
-                "nft",
-                vec![
-                    "list".into(),
-                    "table".into(),
-                    "inet".into(),
-                    NFT_TABLE.into(),
-                ],
-            )
-            .privilege(PrivilegeReq::Root),
-        )
-        .map_err(|error| KillswitchError::CommandFailed(format!("nft read-back: {error}")))?;
-        if output.status.success() {
+        if Self::nft_table_snapshot()?.is_some() {
             return Err(KillswitchError::CommandFailed(
                 "nft read-back still contains the Vortix table".to_string(),
             ));
-        }
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !stderr.contains("No such file or directory") {
-            return Err(KillswitchError::CommandFailed(format!(
-                "nft read-back failed ambiguously: {stderr}"
-            )));
         }
         Ok(())
     }
@@ -972,31 +1011,43 @@ mod tests {
     }
 
     #[test]
-    fn nft_batch_replaces_owned_table_and_covers_two_tunnels_dual_stack() {
+    fn nft_batches_support_old_clients_and_cover_two_tunnels_dual_stack() {
         let first = tunnel("wg0", &["1.2.3.4"], &["0.0.0.0/0"], true);
         let second = tunnel("wg1", &["2001:db8::1"], &["10.0.0.0/8"], false);
-        let rules = IptablesFirewall::generate_nft_ruleset(&[first, second]);
+        let active = [first, second];
+        let fresh = IptablesFirewall::generate_nft_ruleset(&active, NftBatchMode::Create);
+        let replacement = IptablesFirewall::generate_nft_ruleset(&active, NftBatchMode::Replace);
 
-        assert!(rules.starts_with("destroy table inet vortix_killswitch\n"));
-        assert!(rules.contains("oifname \"wg0\" accept"));
-        assert!(rules.contains("oifname \"wg1\" accept"));
-        assert!(rules.contains("ip daddr 1.2.3.4 accept"));
-        assert!(rules.contains("ip6 daddr 2001:db8::1 accept"));
-        assert!(!rules.contains("ip daddr 10.0.0.0/8 accept"));
-        assert_eq!(rules.matches("table inet vortix_killswitch").count(), 2);
-        let active = [
-            tunnel("wg0", &["1.2.3.4"], &["0.0.0.0/0"], true),
-            tunnel("wg1", &["2001:db8::1"], &["10.0.0.0/8"], false),
-        ];
-        assert!(IptablesFirewall::nft_snapshot_matches(&active, &rules));
+        assert!(fresh.starts_with("table inet vortix_killswitch {\n"));
+        assert!(!fresh.contains("delete table"));
+        assert!(!fresh.contains("destroy table"));
+        assert!(replacement.starts_with("delete table inet vortix_killswitch\n"));
+        assert!(!replacement.contains("destroy table"));
+        assert_eq!(
+            replacement.matches("table inet vortix_killswitch").count(),
+            2
+        );
+        assert!(fresh.contains("oifname \"wg0\" accept"));
+        assert!(fresh.contains("oifname \"wg1\" accept"));
+        assert!(fresh.contains("ip daddr 1.2.3.4 accept"));
+        assert!(fresh.contains("ip6 daddr 2001:db8::1 accept"));
+        assert!(!fresh.contains("ip daddr 10.0.0.0/8 accept"));
+        assert!(IptablesFirewall::nft_snapshot_matches(&active, &fresh));
         assert!(!IptablesFirewall::nft_snapshot_matches(
             &active,
-            &rules.replace("    oifname \"wg1\" accept\n", "")
+            &fresh.replace("    oifname \"wg1\" accept\n", "")
         ));
         assert!(!IptablesFirewall::nft_snapshot_matches(
             &active,
-            &rules.replace("counter drop comment", "counter accept comment")
+            &fresh.replace("counter drop comment", "counter accept comment")
         ));
+        assert_eq!(
+            IptablesFirewall::nft_command(vec!["list".into()])
+                .env
+                .get("LC_ALL")
+                .map(String::as_str),
+            Some("C")
+        );
     }
 
     // ─── snapshot tests pinning ruleset shape ───────────────────────────

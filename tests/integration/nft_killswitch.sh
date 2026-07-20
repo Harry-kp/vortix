@@ -23,6 +23,19 @@ nft_before="$(ip netns exec "$NS_B" "$REAL_NFT" list table inet vortix_killswitc
 grep -q 'policy drop' <<<"$nft_before"
 grep -q 'vortix-policy:' <<<"$nft_before"
 
+# Exercise a successful existing-table replacement with the real distro nft
+# client. The replacement must discard drift from the owned table.
+ip netns exec "$NS_B" "$REAL_NFT" add rule inet vortix_killswitch output \
+    ip daddr 203.0.113.254 accept comment vortix-stale
+stale_snapshot="$(ip netns exec "$NS_B" "$REAL_NFT" list table inet vortix_killswitch)"
+grep -q 'vortix-stale' <<<"$stale_snapshot"
+ip netns exec "$NS_B" env PATH="$PATH_DIR" target/release/vortix killswitch vpn-only
+nft_before="$(ip netns exec "$NS_B" "$REAL_NFT" list table inet vortix_killswitch)"
+if grep -q 'vortix-stale' <<<"$nft_before"; then
+    echo "FAIL: successful nft replacement preserved stale owned-table state"
+    exit 1
+fi
+
 # An unrelated host-owned table must remain untouched.
 ip netns exec "$NS_B" "$REAL_NFT" add table inet host_sentinel
 ip netns exec "$NS_B" "$REAL_NFT" list table inet host_sentinel >/dev/null
