@@ -9,6 +9,7 @@
 //! impls reach the global runner directly). The async engine
 //! migration adds `&CommandRunner` arguments and `async fn` where useful.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
@@ -31,6 +32,17 @@ pub enum TunnelKindTag {
     Mock,
 }
 
+/// Protocol-owned configuration needed to tear a tunnel down safely.
+///
+/// `managed` distinguishes a private, sanitized lifecycle copy from the
+/// user's source profile. Protocol adapters may remove managed copies after
+/// a successful teardown, but must never remove source profiles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TunnelTeardownConfig {
+    pub path: PathBuf,
+    pub managed: bool,
+}
+
 /// Lifecycle handle returned by [`Tunnel::up`] and consumed by `down` / `status`.
 #[derive(Debug, Clone)]
 pub struct TunnelHandle {
@@ -41,6 +53,13 @@ pub struct TunnelHandle {
     pub pid: Option<u32>,
     pub started_at: SystemTime,
     pub kind: TunnelKindTag,
+    /// Optional protocol configuration used by `down`. `WireGuard` carries a
+    /// DNS-free copy here so `wg-quick down` cannot replay resolver changes.
+    pub teardown_config: Option<TunnelTeardownConfig>,
+    /// Resolver settings observed from the protocol profile and, where
+    /// available, its negotiated runtime options. Platform mutation is not
+    /// performed by the protocol adapter.
+    pub dns_request: crate::vortix_core::ports::dns::DnsRequest,
 }
 
 /// Per-protocol introspection blob returned by [`Tunnel::status`].
@@ -87,7 +106,16 @@ pub trait ParsedProfile: std::fmt::Debug + Send + Sync {
     /// `resolvconf` dependency hints before connect). Empty when the profile
     /// has no `DNS = ...` directive.
     fn dns_servers(&self) -> Vec<String> {
-        Vec::new()
+        self.dns_request()
+            .servers
+            .into_iter()
+            .map(|server| server.to_string())
+            .collect()
+    }
+
+    /// Typed DNS intent extracted without applying platform state.
+    fn dns_request(&self) -> crate::vortix_core::ports::dns::DnsRequest {
+        crate::vortix_core::ports::dns::DnsRequest::default()
     }
 }
 

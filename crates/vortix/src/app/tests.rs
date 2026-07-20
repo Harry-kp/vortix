@@ -50,6 +50,23 @@ fn test_app() -> App {
     }
 }
 
+fn wait_for_dns_policy_result(app: &mut App) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let message = app
+            .runtime
+            .cmd_rx
+            .recv_timeout(remaining)
+            .expect("DNS policy worker did not complete");
+        let is_dns_result = matches!(message, Message::DnsPolicyResult { .. });
+        app.handle_message(message);
+        if is_dns_result {
+            return;
+        }
+    }
+}
+
 /// Helper: put app into a Connected state for a given profile name.
 ///
 /// Mirrors into the registry so helpers/renderers (which read
@@ -143,7 +160,8 @@ fn test_disconnect_result_success_transitions_to_disconnected() {
     // session gone, which finishes the disconnect.
     app.handle_message(Message::SyncSystemState {
         sessions: vec![],
-        default_route_interface: None,
+        default_route:
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
     });
 
     assert!(
@@ -200,7 +218,8 @@ fn test_scanner_never_overrides_disconnecting_to_connected() {
     let sessions = vec![fake_session("test-vpn")];
     app.handle_message(Message::SyncSystemState {
         sessions,
-        default_route_interface: None,
+        default_route:
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
     });
 
     assert!(
@@ -217,7 +236,8 @@ fn test_scanner_confirms_disconnect_when_interface_gone() {
 
     app.handle_message(Message::SyncSystemState {
         sessions: vec![],
-        default_route_interface: None,
+        default_route:
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
     });
 
     assert!(
@@ -243,7 +263,8 @@ fn test_scanner_safety_timeout_after_30s() {
     let sessions = vec![fake_session("test-vpn")];
     app.handle_message(Message::SyncSystemState {
         sessions,
-        default_route_interface: None,
+        default_route:
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
     });
 
     assert!(
@@ -263,7 +284,8 @@ fn test_scanner_disconnecting_does_not_affect_other_profiles() {
     let sessions = vec![fake_session("vpn-b")];
     app.handle_message(Message::SyncSystemState {
         sessions,
-        default_route_interface: None,
+        default_route:
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
     });
 
     assert!(
@@ -502,6 +524,7 @@ fn mirror_failed_makes_registry_hold_disconnected_with_failure() {
         error: Some("handshake timeout".to_string()),
         interface: None,
         pid: None,
+        dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
     });
 
     let snap = app
@@ -639,7 +662,8 @@ fn switch_path_disconnect_completion_removes_old_profile_from_registry() {
     // session gone, which finishes the disconnect.
     app.handle_message(Message::SyncSystemState {
         sessions: vec![],
-        default_route_interface: None,
+        default_route:
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
     });
 
     // vpn-a must be gone from the registry — the switch flow drained
@@ -736,7 +760,8 @@ fn test_pending_connect_drained_on_disconnect_success() {
     // session gone, which finishes the disconnect.
     app.handle_message(Message::SyncSystemState {
         sessions: vec![],
-        default_route_interface: None,
+        default_route:
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
     });
 
     assert_eq!(app.runtime.pending_connect, None);
@@ -757,7 +782,8 @@ fn test_pending_connect_drained_on_scanner_interface_gone() {
 
     app.handle_message(Message::SyncSystemState {
         sessions: vec![],
-        default_route_interface: None,
+        default_route:
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
     });
 
     assert_eq!(app.runtime.pending_connect, None);
@@ -805,7 +831,8 @@ fn test_pending_cleared_on_30s_timeout() {
     let sessions = vec![fake_session("vpn-a")];
     app.handle_message(Message::SyncSystemState {
         sessions,
-        default_route_interface: None,
+        default_route:
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
     });
 
     assert_eq!(app.runtime.pending_connect, None);
@@ -828,11 +855,46 @@ fn test_connect_result_success_transitions_to_connected() {
         error: None,
         interface: None,
         pid: None,
+        dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
     });
 
     assert!(
         matches!(app.legacy_state(), ConnectionState::Connected { ref profile, .. } if profile == "test-vpn"),
         "Successful ConnectResult should transition to Connected"
+    );
+}
+
+#[test]
+fn connect_result_dns_request_reaches_registry_role_policy() {
+    let mut app = test_app();
+    app.runtime.start_dns_policy_worker_for_test();
+    add_profiles(&mut app, &["dns-vpn"]);
+    app.registry
+        .feed_default_route_interface(Some("wg0".to_string()));
+    set_connecting(&mut app, "dns-vpn");
+
+    app.handle_message(Message::ConnectResult {
+        profile: "dns-vpn".to_string(),
+        success: true,
+        error: None,
+        interface: Some("wg0".to_string()),
+        pid: None,
+        dns_request: crate::vortix_core::ports::dns::DnsRequest {
+            servers: vec!["1.1.1.1".parse().unwrap()],
+            search_domains: Vec::new(),
+        },
+    });
+    wait_for_dns_policy_result(&mut app);
+
+    let desired = app.runtime.dns_policy.desired().unwrap();
+    assert_eq!(desired.assignments.len(), 1);
+    assert!(matches!(
+        desired.assignments[0].scope,
+        crate::vortix_core::ports::dns::DnsScope::CatchAll
+    ));
+    assert_eq!(
+        app.runtime.dns_policy.effective().status,
+        crate::vortix_core::ports::dns::DnsEffectiveStatus::Applied
     );
 }
 
@@ -851,6 +913,7 @@ fn test_connect_result_failure_transitions_to_disconnected() {
         error: Some("wg-quick: already exists".to_string()),
         interface: None,
         pid: None,
+        dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
     });
 
     assert!(
@@ -874,6 +937,7 @@ fn test_connect_result_failure_clears_pending() {
         error: Some("error".to_string()),
         interface: None,
         pid: None,
+        dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
     });
 
     assert_eq!(
@@ -952,7 +1016,8 @@ fn test_reconnect_auto_connects_after_disconnect_completes() {
     // session gone, which finishes the disconnect.
     app.handle_message(Message::SyncSystemState {
         sessions: vec![],
-        default_route_interface: None,
+        default_route:
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
     });
 
     assert_eq!(app.runtime.pending_connect, None);
@@ -1677,6 +1742,7 @@ fn test_last_connected_profile_set_on_connect_success() {
         error: None,
         interface: None,
         pid: None,
+        dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
     });
 
     assert_eq!(
@@ -3151,6 +3217,7 @@ fn connect_result_success_mirrors_into_registry() {
         error: None,
         interface: None,
         pid: None,
+        dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
     });
 
     // Renderer-facing state: panels read these exact accessors.
@@ -3196,7 +3263,8 @@ fn scanner_promotion_from_connecting_to_connected_mirrors_into_registry() {
     // the protocol-layer success has not yet arrived.
     app.handle_message(Message::SyncSystemState {
         sessions: vec![fake_session("AWS_VPN")],
-        default_route_interface: None,
+        default_route:
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
     });
 
     // Registry must stay Connecting — scanner can't drive the
@@ -3239,7 +3307,8 @@ fn scanner_drop_from_connected_clears_registry() {
     // Scanner now reports no active sessions — the VPN went away.
     app.handle_message(Message::SyncSystemState {
         sessions: vec![],
-        default_route_interface: None,
+        default_route:
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
     });
 
     assert_eq!(
@@ -3317,7 +3386,8 @@ fn mirrored_registry_entry_carries_full_rich_details_not_just_interface_and_pid(
     let session = fake_session("AWS_VPN");
     app.handle_message(Message::SyncSystemState {
         sessions: vec![session],
-        default_route_interface: None,
+        default_route:
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
     });
 
     let snap = app
@@ -3387,7 +3457,8 @@ fn mirror_refresh_updates_registry_when_details_change() {
     session.interface = "utun99-wrong-from-scanner".to_string();
     app.handle_message(Message::SyncSystemState {
         sessions: vec![session],
-        default_route_interface: None,
+        default_route:
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
     });
 
     // Post-refresh: iface MUST still be the protocol-layer's "wg0".
@@ -3422,6 +3493,7 @@ fn disconnect_result_success_removes_from_registry() {
         error: None,
         interface: None,
         pid: None,
+        dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
     });
     assert_eq!(app.registry.tunnel_count(), 1, "setup precondition");
 
@@ -3438,7 +3510,8 @@ fn disconnect_result_success_removes_from_registry() {
     // session gone, which finishes the disconnect.
     app.handle_message(Message::SyncSystemState {
         sessions: vec![],
-        default_route_interface: None,
+        default_route:
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
     });
 
     assert_eq!(
@@ -3476,7 +3549,8 @@ fn connect_result_success_arrives_after_scanner_observes_kernel_session() {
     set_connecting(&mut app, "race-test");
     app.handle_message(Message::SyncSystemState {
         sessions: vec![fake_session("race-test")],
-        default_route_interface: None,
+        default_route:
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
     });
     assert!(
         matches!(
@@ -3494,6 +3568,7 @@ fn connect_result_success_arrives_after_scanner_observes_kernel_session() {
         error: None,
         interface: None,
         pid: None,
+        dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
     });
 
     // Bookkeeping that the success handler is responsible for:
@@ -3538,6 +3613,7 @@ fn connect_result_success_seeds_authoritative_iface_into_registry() {
         error: None,
         interface: Some("utun8".to_string()),
         pid: Some(7155),
+        dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
     });
 
     let snap = app
@@ -3592,6 +3668,7 @@ fn connect_result_for_secondary_profile_during_takeover_is_not_stale() {
         error: None,
         interface: Some("utun9".to_string()),
         pid: Some(8888),
+        dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
     });
 
     let snap = app
@@ -3751,7 +3828,9 @@ fn real_ip_not_cached_when_kernel_has_active_sessions() {
     // Scanner sees a kernel session but registry hasn't adopted yet.
     app.handle_message(Message::SyncSystemState {
         sessions: vec![fake_session("vpn-a")],
-        default_route_interface: Some("wg0".to_string()),
+        default_route: crate::vortix_core::ports::route_table::DefaultRouteObservation::Interface(
+            "wg0".to_string(),
+        ),
     });
     assert!(app.runtime.scanner_first_tick_done);
     assert_eq!(app.runtime.last_kernel_session_count, 1);
@@ -3784,7 +3863,8 @@ fn real_ip_cached_after_clean_scanner_tick_with_zero_sessions() {
 
     app.handle_message(Message::SyncSystemState {
         sessions: vec![],
-        default_route_interface: None,
+        default_route:
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
     });
     assert!(app.runtime.scanner_first_tick_done);
     assert_eq!(app.runtime.last_kernel_session_count, 0);
@@ -3809,7 +3889,8 @@ fn real_ip_overwrites_on_disconnected_telemetry_samples() {
 
     app.handle_message(Message::SyncSystemState {
         sessions: vec![],
-        default_route_interface: None,
+        default_route:
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
     });
 
     app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIp(
@@ -3846,7 +3927,8 @@ fn real_ip_telemetry_persists_to_disk_cache() {
 
     app.handle_message(Message::SyncSystemState {
         sessions: vec![],
-        default_route_interface: None,
+        default_route:
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
     });
     app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIp(
         "203.0.113.42".to_string(),
@@ -3875,7 +3957,8 @@ fn real_ip_frozen_once_connected_then_thaws_on_disconnect() {
     // Clean tick → cache real IP.
     app.handle_message(Message::SyncSystemState {
         sessions: vec![],
-        default_route_interface: None,
+        default_route:
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
     });
     app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIp(
         "203.0.113.5".to_string(),
@@ -3886,7 +3969,9 @@ fn real_ip_frozen_once_connected_then_thaws_on_disconnect() {
     add_profiles(&mut app, &["vpn-a"]);
     app.handle_message(Message::SyncSystemState {
         sessions: vec![fake_session("vpn-a")],
-        default_route_interface: Some("wg0".to_string()),
+        default_route: crate::vortix_core::ports::route_table::DefaultRouteObservation::Interface(
+            "wg0".to_string(),
+        ),
     });
 
     // Telemetry while connected (VPN exit IP) — must NOT overwrite.
@@ -3904,7 +3989,8 @@ fn real_ip_frozen_once_connected_then_thaws_on_disconnect() {
     app.registry.set_disconnected(&pid);
     app.handle_message(Message::SyncSystemState {
         sessions: vec![],
-        default_route_interface: None,
+        default_route:
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
     });
 
     // Now telemetry can re-cache (user may have moved networks).
@@ -3916,6 +4002,40 @@ fn real_ip_frozen_once_connected_then_thaws_on_disconnect() {
         Some("198.51.100.99"),
         "real_ip must thaw and update after clean disconnect"
     );
+}
+
+#[test]
+fn route_probe_failure_retains_prior_primary_and_marks_observation_stale() {
+    use crate::vortix_core::ports::route_table::DefaultRouteObservation;
+
+    let mut app = test_app();
+    add_profiles(&mut app, &["vpn-a"]);
+    let session = fake_session("vpn-a");
+    app.handle_message(Message::SyncSystemState {
+        sessions: vec![session.clone()],
+        default_route: DefaultRouteObservation::Interface("wg0".into()),
+    });
+    assert_eq!(
+        app.registry
+            .primary()
+            .map(crate::vortix_core::profile::ProfileId::as_str),
+        Some("vpn-a")
+    );
+    assert!(app.runtime.route_observation_fresh);
+
+    app.handle_message(Message::SyncSystemState {
+        sessions: vec![session],
+        default_route: DefaultRouteObservation::ProbeFailed,
+    });
+
+    assert_eq!(
+        app.registry
+            .primary()
+            .map(crate::vortix_core::profile::ProfileId::as_str),
+        Some("vpn-a"),
+        "probe failure must not be interpreted as a route removal"
+    );
+    assert!(!app.runtime.route_observation_fresh);
 }
 
 #[test]
@@ -3949,7 +4069,8 @@ fn disconnect_result_defers_completion_until_kernel_confirms() {
     // A stale scan still lists the dying session: no re-adoption, no drop.
     app.handle_message(Message::SyncSystemState {
         sessions: vec![fake_session("vpn-a")],
-        default_route_interface: None,
+        default_route:
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
     });
     let snap = app.registry.snapshot(&id).expect("still tracked");
     assert!(
@@ -3965,7 +4086,8 @@ fn disconnect_result_defers_completion_until_kernel_confirms() {
     // exit is NOT an unexpected drop, and no auto-reconnect is queued.
     app.handle_message(Message::SyncSystemState {
         sessions: vec![],
-        default_route_interface: None,
+        default_route:
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
     });
     assert!(app.registry.snapshot(&id).is_none());
     assert_eq!(app.runtime.connection_drops, 0);

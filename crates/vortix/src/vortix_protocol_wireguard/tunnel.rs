@@ -5,7 +5,7 @@ use std::time::SystemTime;
 
 use crate::vortix_core::ports::tunnel::{
     ParseError, ParsedProfile, ProtocolStatus, Tunnel, TunnelCapabilities, TunnelError,
-    TunnelHandle, TunnelKindTag, TunnelStatus,
+    TunnelHandle, TunnelKindTag, TunnelStatus, TunnelTeardownConfig,
 };
 use crate::vortix_core::profile::Profile;
 use crate::vortix_process::{CommandSpec, PrivilegeReq};
@@ -22,86 +22,44 @@ use crate::vortix_protocol_wireguard::parser::parse_wg_conf;
 /// Plan #004 v1 supports kernel `WireGuard` only — `wireguard-go`/`boringtun`
 /// user-space backends land with idea 5's daemon work.
 ///
-/// `is_secondary` (default `false`) routes connect-time through the DNS-
-/// scoping path: the user's `.conf` is rewritten with
-/// `DNS = …` lines stripped, written under
-/// `${config_dir}/tmp/${session_id}/${basename}` at mode `0o600`, and
-/// `wg-quick up` is invoked against the rewritten copy. Primaries keep the
-/// existing fast path (no copy, original config used directly).
-///
-/// The `TunnelRegistry` flips `is_secondary` via
-/// [`WgTunnel::with_secondary`] before calling `up()` once multi-connection
-/// wiring lands; until then no production callsite sets it and behaviour is
-/// identical to v0.3.x.
+/// DNS directives are always removed from the `wg-quick` input. The parsed
+/// request is returned on [`TunnelHandle`] for the protocol-neutral policy
+/// coordinator; `wg-quick` never mutates resolver state itself.
 #[derive(Debug, Default, Clone)]
-pub struct WgTunnel {
-    /// True when this tunnel is a secondary in a multi-tunnel session. When
-    /// set, `up()` strips `DNS =` lines from the user's profile before
-    /// invoking `wg-quick up` — only the primary may own system DNS.
-    pub is_secondary: bool,
-    /// Path to the temp config written at `up()` time when `is_secondary` is
-    /// true. Stored so `down()` can unlink it and (if empty) its parent
-    /// session subdir. `None` for primaries and before `up()` succeeds.
-    temp_config_path: Option<PathBuf>,
-}
+pub struct WgTunnel;
 
 impl WgTunnel {
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self
     }
 
-    /// Builder: mark this tunnel as a secondary in a multi-tunnel session
-    ///. When `true`, `up()` reads the user's `.conf`, strips
-    /// any `DNS = …` directive, and writes the result to a per-session temp
-    /// path at mode `0o600`; `wg-quick up` runs against that temp path. The
-    /// temp file's basename matches the original so wg-quick's
-    /// interface-from-basename derivation — and any `%i` substitution in
-    /// `PostUp`/`PreDown` hooks — stays equivalent to the user's original
-    /// profile.
-    ///
-    /// Defaults to `false`. No production callsite flips this until the
-    /// registry's primary-aware connect path lands.
-    #[must_use]
-    pub fn with_secondary(mut self, is_secondary: bool) -> Self {
-        self.is_secondary = is_secondary;
-        self
-    }
-
-    #[must_use]
-    pub fn is_secondary(&self) -> bool {
-        self.is_secondary
+    /// Parse requested DNS without applying platform state.
+    pub fn requested_dns(
+        &self,
+        profile: &Profile,
+    ) -> Result<crate::vortix_core::ports::dns::DnsRequest, TunnelError> {
+        let body = std::fs::read_to_string(&profile.config_path).map_err(|error| {
+            TunnelError::Subprocess(format!(
+                "read WG config {}: {error}",
+                profile.config_path.display()
+            ))
+        })?;
+        parse_wg_conf(&body)
+            .map(|parsed| parsed.dns_request())
+            .map_err(|error| {
+                TunnelError::Subprocess(format!("parse WireGuard DNS intent: {error}"))
+            })
     }
 }
 
 /// Strip `DNS = …` lines from a `WireGuard` `.conf` body.
 ///
-/// Wrapper around [`strip_and_capture_dns_directive`] kept for the
-/// equivalence-test surface — production callers go through the capture-
-/// aware function directly so they can pass the IP list to resolvectl
-/// (see `WgTunnel::up`).
-#[cfg(test)]
+/// Protocol parsing captures the request separately; this helper only keeps
+/// `wg-quick` from mutating resolver state.
 #[must_use]
 pub(crate) fn strip_dns_directive(text: &str) -> String {
-    strip_and_capture_dns_directive(text).0
-}
-
-/// Strip `DNS = …` lines AND return the captured DNS server IPs.
-///
-/// Same stripping behaviour as [`strip_dns_directive`]: case-insensitive
-/// directive match, non-directive lines preserved verbatim. The captured
-/// list contains valid IP addresses (IPv4 + IPv6) in source order across
-/// every `DNS =` line. Non-IP entries on the RHS (wg-quick treats those as
-/// DNS search domains) are skipped — the caller is interested in resolver
-/// targets, not search suffixes. Trailing `#` and `;` comments on the
-/// directive line are stripped before parsing.
-#[must_use]
-pub(crate) fn strip_and_capture_dns_directive(text: &str) -> (String, Vec<String>) {
-    use std::net::IpAddr;
-    use std::str::FromStr;
-
     let mut out = String::with_capacity(text.len());
-    let mut ips: Vec<String> = Vec::new();
     for line in text.split_inclusive('\n') {
         let trimmed = line.trim_start();
         // Match "DNS" (case-insensitive) followed (after optional
@@ -112,34 +70,12 @@ pub(crate) fn strip_and_capture_dns_directive(text: &str) -> (String, Vec<String
             .strip_prefix(|c: char| c == 'D' || c == 'd')
             .and_then(|r| r.strip_prefix(|c: char| c == 'N' || c == 'n'))
             .and_then(|r| r.strip_prefix(|c: char| c == 'S' || c == 's'));
-        let value_after_eq = after_dns.and_then(|r| {
-            let r = r.trim_start();
-            r.strip_prefix('=')
-        });
-
-        match value_after_eq {
-            Some(rhs) => {
-                // RHS may carry a trailing comment; strip everything from
-                // the first `#` or `;` onwards before splitting on commas.
-                let rhs_no_comment = rhs.split(['#', ';']).next().unwrap_or("");
-                for entry in rhs_no_comment.split(',') {
-                    let token = entry.trim();
-                    if token.is_empty() {
-                        continue;
-                    }
-                    if IpAddr::from_str(token).is_ok() {
-                        ips.push(token.to_string());
-                    }
-                    // Non-IP tokens are wg-quick DNS search domains; skip.
-                }
-                // Directive line itself is dropped from `out`.
-            }
-            None => {
-                out.push_str(line);
-            }
+        let is_dns = after_dns.is_some_and(|rest| rest.trim_start().starts_with('='));
+        if !is_dns {
+            out.push_str(line);
         }
     }
-    (out, ips)
+    out
 }
 
 /// Resolve the current `session_id` from the global journal, or fall back to
@@ -162,11 +98,11 @@ fn resolve_session_id() -> String {
 /// fast disconnect-reconnect within one session), it is unlinked first —
 /// `write_secret_file` refuses to overwrite.
 ///
-/// Separated from [`write_secondary_temp_config`] so tests can exercise the
+/// Separated from [`write_managed_temp_config`] so tests can exercise the
 /// file-writing logic against a per-test tempdir without depending on the
 /// process-global `config_dir` set by `set_config_dir` (a `OnceLock` shared
 /// across the test binary).
-fn write_secondary_temp_config_at(
+fn write_managed_temp_config_at(
     session_dir: &Path,
     user_conf_path: &Path,
     stripped_body: &[u8],
@@ -186,9 +122,9 @@ fn write_secondary_temp_config_at(
 
     write_secret_file(&temp_path, stripped_body).map_err(|e| match e {
         SecretFileError::Io(io) => {
-            TunnelError::Subprocess(format!("write secondary WG temp config: {io}"))
+            TunnelError::Subprocess(format!("write managed WG temp config: {io}"))
         }
-        other => TunnelError::Subprocess(format!("write secondary WG temp config: {other}")),
+        other => TunnelError::Subprocess(format!("write managed WG temp config: {other}")),
     })?;
 
     Ok(temp_path)
@@ -196,30 +132,77 @@ fn write_secondary_temp_config_at(
 
 /// Public wrapper used by `up()`: resolves the per-session tmp dir from the
 /// global journal `session_id`, then delegates to
-/// [`write_secondary_temp_config_at`].
-fn write_secondary_temp_config(
+/// [`write_managed_temp_config_at`].
+fn write_managed_temp_config(
     user_conf_path: &Path,
     stripped_body: &[u8],
 ) -> Result<PathBuf, TunnelError> {
     let session_id = resolve_session_id();
-    let session_dir = crate::utils::get_tmp_config_dir(&session_id).map_err(|e| {
+    let session_root = crate::utils::get_tmp_config_dir(&session_id).map_err(|e| {
         TunnelError::Subprocess(format!("failed to create per-session tmp dir: {e}"))
     })?;
-    write_secondary_temp_config_at(&session_dir, user_conf_path, stripped_body)
+    let lifecycle_dir = create_lifecycle_dir(&session_root)?;
+    match write_managed_temp_config_at(&lifecycle_dir, user_conf_path, stripped_body) {
+        Ok(path) => Ok(path),
+        Err(error) => {
+            let _ = std::fs::remove_dir(&lifecycle_dir);
+            Err(error)
+        }
+    }
 }
 
-/// Remove the per-session temp file written by [`write_secondary_temp_config`]
+fn create_lifecycle_dir(session_root: &Path) -> Result<PathBuf, TunnelError> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_LIFECYCLE: AtomicU64 = AtomicU64::new(0);
+    for _ in 0..16 {
+        let sequence = NEXT_LIFECYCLE.fetch_add(1, Ordering::Relaxed);
+        let path = session_root.join(format!("wg-{}-{sequence}", std::process::id()));
+        #[cfg(unix)]
+        let result = {
+            use std::os::unix::fs::DirBuilderExt;
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700).create(&path)
+        };
+        #[cfg(not(unix))]
+        let result = std::fs::create_dir(&path);
+
+        match result {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(TunnelError::Subprocess(format!(
+                    "create managed WG lifecycle dir: {error}"
+                )));
+            }
+        }
+    }
+    Err(TunnelError::Subprocess(
+        "could not allocate a unique managed WG lifecycle dir".into(),
+    ))
+}
+
+/// Remove the per-session temp file written by [`write_managed_temp_config`]
 /// and, if the per-session subdir is now empty, remove that too. Errors are
 /// swallowed: at disconnect time the tunnel is already down, so a residual
 /// temp file is harmless and the startup sweep will collect it on the next
 /// run.
-fn cleanup_secondary_temp_config(temp_path: &Path) {
+fn cleanup_managed_temp_config(temp_path: &Path) {
     let _ = std::fs::remove_file(temp_path);
     if let Some(parent) = temp_path.parent() {
         // `remove_dir` only succeeds when the dir is empty — exactly the
         // condition we want. Other secondaries in the same session keep
         // their own leaf and the dir survives.
-        let _ = std::fs::remove_dir(parent);
+        let removed_lifecycle = std::fs::remove_dir(parent).is_ok()
+            && parent
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(|name| name.starts_with("wg-"));
+        if removed_lifecycle {
+            if let Some(session_root) = parent.parent() {
+                let _ = std::fs::remove_dir(session_root);
+            }
+        }
     }
 }
 
@@ -285,64 +268,109 @@ fn interface_from_path(path: &std::path::Path) -> String {
         .to_string()
 }
 
-/// Decide whether `WgTunnel::up()` should strip the `DNS = …` line before
-/// invoking `wg-quick up`.
+struct PreparedDownTarget {
+    target: String,
+    cleanup_after_attempt: Option<PathBuf>,
+    cleanup_after_success: Option<PathBuf>,
+}
+
+fn looks_like_config_path(value: &str) -> bool {
+    Path::new(value)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("conf"))
+        || Path::new(value).components().count() > 1
+}
+
+/// Resolve a teardown-safe `wg-quick down` target.
 ///
-/// Two reasons to strip:
-/// 1. Secondary tunnels (multi-tunnel guarantee: only the primary owns
-///    system DNS — wg-quick is not given DNS for secondaries).
-/// 2. Linux hosts on the resolvectl path: vortix takes over per-link DNS
-///    via `resolvectl` itself, so wg-quick must not attempt to call its
-///    own `resolvconf` shim.
-#[must_use]
-pub(crate) fn should_strip_dns(is_secondary: bool) -> bool {
-    if is_secondary {
-        return true;
+/// Managed configs were sanitized during `up` and must stay alive until the
+/// matching `down`. Source configs are sanitized into a fresh managed copy
+/// here when needed, covering synthetic handles built after a restart or a
+/// scanner adoption. Interface-only handles never involve a config file.
+fn prepare_down_target_with(
+    handle: &TunnelHandle,
+    write_managed: impl FnOnce(&Path, &[u8]) -> Result<PathBuf, TunnelError>,
+) -> Result<PreparedDownTarget, TunnelError> {
+    let config = handle.teardown_config.clone().or_else(|| {
+        looks_like_config_path(&handle.interface_name).then(|| TunnelTeardownConfig {
+            path: PathBuf::from(&handle.interface_name),
+            managed: false,
+        })
+    });
+
+    let Some(config) = config else {
+        return Ok(PreparedDownTarget {
+            target: handle.interface_name.clone(),
+            cleanup_after_attempt: None,
+            cleanup_after_success: None,
+        });
+    };
+
+    if config.managed {
+        return Ok(PreparedDownTarget {
+            target: config.path.to_string_lossy().into_owned(),
+            cleanup_after_attempt: None,
+            cleanup_after_success: Some(config.path),
+        });
     }
-    #[cfg(target_os = "linux")]
-    // xtask:allow-platform-cfg: resolvectl-path strip predicate is Linux-only
-    {
-        crate::utils::use_resolvectl_path()
+
+    let body = std::fs::read_to_string(&config.path).map_err(|error| {
+        TunnelError::Subprocess(format!(
+            "read WG teardown config {}: {error}",
+            config.path.display()
+        ))
+    })?;
+    let stripped = strip_dns_directive(&body);
+    if stripped == body {
+        return Ok(PreparedDownTarget {
+            target: config.path.to_string_lossy().into_owned(),
+            cleanup_after_attempt: None,
+            cleanup_after_success: None,
+        });
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        false
-    }
+
+    let temp_path = write_managed(&config.path, stripped.as_bytes())?;
+    Ok(PreparedDownTarget {
+        target: temp_path.to_string_lossy().into_owned(),
+        cleanup_after_attempt: Some(temp_path),
+        cleanup_after_success: None,
+    })
+}
+
+fn prepare_down_target(handle: &TunnelHandle) -> Result<PreparedDownTarget, TunnelError> {
+    prepare_down_target_with(handle, write_managed_temp_config)
+}
+
+fn wg_quick_down_spec(target: String) -> CommandSpec {
+    CommandSpec::oneshot("wg-quick", vec!["down".into(), target]).privilege(PrivilegeReq::Root)
 }
 
 impl Tunnel for WgTunnel {
     fn up(&mut self, profile: &Profile) -> Result<TunnelHandle, TunnelError> {
-        // Strip the user's `DNS = …` line and run wg-quick against a
-        // sanitized copy when:
-        //   - this tunnel is a secondary in a multi-tunnel session, OR
-        //   - we're on Linux + systemd-resolved + resolvectl works (the
-        //     resolvectl path takes ownership of per-link DNS after up).
-        //
-        // The temp file's basename is preserved so wg-quick's interface
-        // name derivation — and any `%i` substitution in PostUp/PreDown
-        // hooks — stays equivalent to the user's original profile.
-        let strip_dns = should_strip_dns(self.is_secondary);
-        let (effective_path, temp_path, captured_dns_ips): (PathBuf, Option<PathBuf>, Vec<String>) =
-            if strip_dns {
-                let user_body = std::fs::read_to_string(&profile.config_path).map_err(|e| {
-                    TunnelError::Subprocess(format!(
-                        "read WG config {}: {e}",
-                        profile.config_path.display()
-                    ))
-                })?;
-                let (stripped, ips) = strip_and_capture_dns_directive(&user_body);
-                let temp = write_secondary_temp_config(&profile.config_path, stripped.as_bytes())?;
-                (temp.clone(), Some(temp), ips)
-            } else {
-                (profile.config_path.clone(), None, Vec::new())
-            };
+        let user_body = std::fs::read_to_string(&profile.config_path).map_err(|e| {
+            TunnelError::Subprocess(format!(
+                "read WG config {}: {e}",
+                profile.config_path.display()
+            ))
+        })?;
+        let dns_request = parse_wg_conf(&user_body)
+            .map(|parsed| parsed.dns_request())
+            .map_err(|error| {
+                TunnelError::Subprocess(format!("parse WireGuard DNS intent: {error}"))
+            })?;
+        let stripped = strip_dns_directive(&user_body);
+        // Keep one private lifecycle copy even when the source has no DNS.
+        // `wg-quick down` needs the same routes/hooks as `up`, and arbitrary
+        // imported profiles are not discoverable through `/etc/wireguard` by
+        // interface name alone.
+        let temp_path = write_managed_temp_config(&profile.config_path, stripped.as_bytes())?;
+        let effective_path = temp_path.clone();
 
         let path_str = effective_path.to_string_lossy().into_owned();
         info!(
             target: "vortix::tunnel::wireguard",
             profile = %profile.id,
             config = %path_str,
-            secondary = self.is_secondary,
             "wg.up"
         );
 
@@ -354,24 +382,15 @@ impl Tunnel for WgTunnel {
             // Subprocess invocation itself failed (not just non-zero exit).
             // Clean up the temp file we wrote — the tunnel never came up so
             // nobody else holds a reference to it.
-            if let Some(p) = &temp_path {
-                cleanup_secondary_temp_config(p);
-            }
+            cleanup_managed_temp_config(&temp_path);
             TunnelError::Subprocess(format!("wg-quick up: {e}"))
         })?;
 
         if !output.status.success() {
-            if let Some(p) = &temp_path {
-                cleanup_secondary_temp_config(p);
-            }
+            cleanup_managed_temp_config(&temp_path);
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             return Err(TunnelError::HandshakeFailed(format!("WireGuard: {stderr}")));
         }
-
-        // Stash the temp path on `self` so `down()` can unlink it. The
-        // interface name is still derived from the basename, which equals
-        // the temp file's basename (preserved by design).
-        self.temp_config_path = temp_path;
 
         let basename = interface_from_path(&effective_path);
         let interface_name = resolve_kernel_iface(
@@ -382,38 +401,17 @@ impl Tunnel for WgTunnel {
             &profile.id,
         );
 
-        // On the resolvectl path with captured DNS servers, register
-        // per-link DNS via systemd-resolved now that wg-quick has brought
-        // the kernel interface up. Fail-open: on error the tunnel still
-        // works (packets flow, routes are installed) and the user's host
-        // resolver answers queries — log the failure and proceed.
-        #[cfg(target_os = "linux")]
-        // xtask:allow-platform-cfg: resolvectl set_link_dns is Linux-only
-        if !captured_dns_ips.is_empty() && crate::utils::use_resolvectl_path() {
-            let authoritative = !self.is_secondary;
-            if let Err(e) = crate::vortix_platform_linux::dns::set_link_dns(
-                &interface_name,
-                &captured_dns_ips,
-                authoritative,
-            ) {
-                tracing::warn!(
-                    target: "vortix::tunnel::wireguard",
-                    profile = %profile.id,
-                    interface = %interface_name,
-                    err = %e,
-                    "resolvectl set_link_dns failed; tunnel is up but DNS not registered via resolved"
-                );
-            }
-        }
-        #[cfg(not(target_os = "linux"))]
-        let _ = captured_dns_ips;
-
         Ok(TunnelHandle {
             profile_id: profile.id.clone(),
             interface_name,
             pid: None,
             started_at: SystemTime::now(),
             kind: TunnelKindTag::WireGuard,
+            teardown_config: Some(TunnelTeardownConfig {
+                path: temp_path,
+                managed: true,
+            }),
+            dns_request,
         })
     }
 
@@ -422,40 +420,25 @@ impl Tunnel for WgTunnel {
             target: "vortix::tunnel::wireguard",
             profile = %handle.profile_id,
             interface = %handle.interface_name,
-            secondary = self.is_secondary,
             "wg.down"
         );
 
-        // Pass the interface name; `wg-quick down <iface>` looks up the
-        // config in the standard locations. (The engine's previous code
-        // passed the full path here too — both forms work; the iface name
-        // is shorter and matches the handle.)
-        let output = crate::vortix_process::run_to_output(
-            CommandSpec::oneshot(
-                "wg-quick",
-                vec!["down".into(), handle.interface_name.clone()],
-            )
-            .privilege(PrivilegeReq::Root),
-        );
+        let prepared = prepare_down_target(&handle)?;
+        let output = crate::vortix_process::run_to_output(wg_quick_down_spec(prepared.target));
 
-        // Always attempt to unlink the temp file, even when `wg-quick down`
-        // errors — leaving it behind would still be collected by the next
-        // startup sweep, but eager cleanup keeps the dir tidy. `take()`
-        // ensures we don't double-unlink across a retry.
-        let temp_to_remove = self.temp_config_path.take();
+        if let Some(path) = &prepared.cleanup_after_attempt {
+            cleanup_managed_temp_config(path);
+        }
 
         let output = output.map_err(|e| TunnelError::Subprocess(format!("wg-quick down: {e}")))?;
 
         if !output.status.success() {
-            if let Some(p) = &temp_to_remove {
-                cleanup_secondary_temp_config(p);
-            }
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             return Err(TunnelError::Subprocess(format!("WireGuard down: {stderr}")));
         }
 
-        if let Some(p) = &temp_to_remove {
-            cleanup_secondary_temp_config(p);
+        if let Some(path) = &prepared.cleanup_after_success {
+            cleanup_managed_temp_config(path);
         }
 
         Ok(())
@@ -551,20 +534,7 @@ mod tests {
         assert_eq!(resolved, "corp");
     }
 
-    // --- DNS scoping for secondaries ---
-
-    #[test]
-    fn default_is_not_secondary() {
-        let t = WgTunnel::new();
-        assert!(!t.is_secondary());
-        assert!(t.temp_config_path.is_none());
-    }
-
-    #[test]
-    fn with_secondary_builder_flips_flag() {
-        let t = WgTunnel::new().with_secondary(true);
-        assert!(t.is_secondary());
-    }
+    // --- DNS extraction and protocol-side suppression ---
 
     #[test]
     fn strip_dns_removes_directive_with_equals() {
@@ -611,154 +581,94 @@ mod tests {
         assert_eq!(strip_dns_directive(body), body);
     }
 
-    // ── strip_and_capture_dns_directive ──────────────────────────────────
-
-    #[test]
-    fn capture_dns_empty_input() {
-        let (out, ips) = strip_and_capture_dns_directive("");
-        assert_eq!(out, "");
-        assert!(ips.is_empty());
-    }
-
-    #[test]
-    fn capture_dns_no_directive_returns_input_verbatim() {
-        let body = "[Interface]\nPrivateKey = abc\nAddress = 10.0.0.2/24\n";
-        let (out, ips) = strip_and_capture_dns_directive(body);
-        assert_eq!(out, body);
-        assert!(ips.is_empty());
-    }
-
-    #[test]
-    fn capture_dns_single_ip() {
-        let body = "[Interface]\nPrivateKey = abc\nDNS = 1.1.1.1\n";
-        let (out, ips) = strip_and_capture_dns_directive(body);
-        assert!(!out.contains("DNS"));
-        assert_eq!(ips, vec!["1.1.1.1".to_string()]);
-    }
-
-    #[test]
-    fn capture_dns_comma_separated() {
-        let body = "[Interface]\nDNS = 1.1.1.1, 8.8.8.8\nAddress = 10.0.0.2/24\n";
-        let (_out, ips) = strip_and_capture_dns_directive(body);
-        assert_eq!(ips, vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()]);
-    }
-
-    #[test]
-    fn capture_dns_multiple_directive_lines_preserve_order() {
-        // A .conf may legally split DNS across multiple lines; capture
-        // every IP in source order.
-        let body = "[Interface]\nDNS = 1.1.1.1\nAddress = 10.0.0.2/24\nDNS = 8.8.8.8\n";
-        let (out, ips) = strip_and_capture_dns_directive(body);
-        assert!(!out.contains("DNS"));
-        assert_eq!(ips, vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()]);
-    }
-
-    #[test]
-    fn capture_dns_case_insensitive() {
-        // The directive name is case-insensitive (wg-quick keys are).
-        // Each capital/lowercase variant captures identically.
-        for variant in ["DNS = 1.1.1.1", "dns = 1.1.1.1", "Dns = 1.1.1.1"] {
-            let body = format!("[Interface]\n{variant}\nAddress = 10.0.0.2/24\n");
-            let (_out, ips) = strip_and_capture_dns_directive(&body);
-            assert_eq!(
-                ips,
-                vec!["1.1.1.1".to_string()],
-                "variant `{variant}` did not capture"
-            );
+    fn wg_handle(
+        interface_name: &str,
+        teardown_config: Option<TunnelTeardownConfig>,
+    ) -> TunnelHandle {
+        TunnelHandle {
+            profile_id: crate::vortix_core::profile::ProfileId::new("corp"),
+            interface_name: interface_name.to_string(),
+            pid: None,
+            started_at: SystemTime::now(),
+            kind: TunnelKindTag::WireGuard,
+            teardown_config,
+            dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
         }
     }
 
     #[test]
-    fn capture_dns_whitespace_variation_around_equals() {
-        // wg-quick accepts the directive with arbitrary whitespace around
-        // `=`; the capture path must mirror that tolerance.
-        for variant in ["DNS=1.1.1.1", "DNS =1.1.1.1", "DNS  =  1.1.1.1"] {
-            let body = format!("[Interface]\n{variant}\nAddress = 10.0.0.2/24\n");
-            let (_out, ips) = strip_and_capture_dns_directive(&body);
-            assert_eq!(
-                ips,
-                vec!["1.1.1.1".to_string()],
-                "variant `{variant}` did not capture"
-            );
-        }
+    fn synthetic_down_command_uses_dns_free_managed_copy() {
+        let (_root, session) = fresh_session_dir();
+        let scratch = tempfile::tempdir().unwrap();
+        let source = scratch.path().join("corp.conf");
+        std::fs::write(
+            &source,
+            "[Interface]\nPrivateKey = SECRET\nDNS = 1.1.1.1\nAddress = 10.0.0.2/24\n",
+        )
+        .unwrap();
+        let handle = wg_handle(
+            "corp",
+            Some(TunnelTeardownConfig {
+                path: source.clone(),
+                managed: false,
+            }),
+        );
+
+        let prepared = prepare_down_target_with(&handle, |path, body| {
+            write_managed_temp_config_at(&session, path, body)
+        })
+        .unwrap();
+        let spec = wg_quick_down_spec(prepared.target.clone());
+
+        assert_eq!(spec.program, "wg-quick");
+        assert_eq!(spec.args, vec!["down", prepared.target.as_str()]);
+        assert_ne!(prepared.target, source.to_string_lossy());
+        let command_body = std::fs::read_to_string(&prepared.target).unwrap();
+        assert!(!command_body.contains("DNS ="));
+        assert!(command_body.contains("PrivateKey = SECRET"));
     }
 
     #[test]
-    fn capture_dns_ipv6() {
-        let body = "[Interface]\nDNS = 2001:db8::1\n";
-        let (_out, ips) = strip_and_capture_dns_directive(body);
-        assert_eq!(ips, vec!["2001:db8::1".to_string()]);
+    fn real_handle_down_command_keeps_managed_config_until_success() {
+        let scratch = tempfile::tempdir().unwrap();
+        let managed = scratch.path().join("corp.conf");
+        std::fs::write(&managed, "[Interface]\nPrivateKey = SECRET\n").unwrap();
+        let handle = wg_handle(
+            "wg0",
+            Some(TunnelTeardownConfig {
+                path: managed.clone(),
+                managed: true,
+            }),
+        );
+
+        let prepared = prepare_down_target_with(&handle, |_path, _body| {
+            panic!("managed config must not be rewritten")
+        })
+        .unwrap();
+        let spec = wg_quick_down_spec(prepared.target);
+
+        assert_eq!(spec.args, vec!["down", managed.to_string_lossy().as_ref()]);
+        assert!(prepared.cleanup_after_attempt.is_none());
+        assert_eq!(
+            prepared.cleanup_after_success.as_deref(),
+            Some(managed.as_path())
+        );
+        assert!(
+            managed.exists(),
+            "managed config must survive until down succeeds"
+        );
     }
 
     #[test]
-    fn capture_dns_mixed_ipv4_ipv6() {
-        let body = "[Interface]\nDNS = 1.1.1.1, 2001:db8::1\n";
-        let (_out, ips) = strip_and_capture_dns_directive(body);
-        assert_eq!(ips, vec!["1.1.1.1".to_string(), "2001:db8::1".to_string()]);
-    }
+    fn adopted_interface_down_command_never_uses_a_profile_path() {
+        let handle = wg_handle("utun7", None);
+        let prepared = prepare_down_target_with(&handle, |_path, _body| {
+            panic!("interface-only teardown must not create a config")
+        })
+        .unwrap();
+        let spec = wg_quick_down_spec(prepared.target);
 
-    #[test]
-    fn capture_dns_strips_trailing_hash_comment() {
-        let body = "[Interface]\nDNS = 1.1.1.1  # corp resolver\n";
-        let (_out, ips) = strip_and_capture_dns_directive(body);
-        assert_eq!(ips, vec!["1.1.1.1".to_string()]);
-    }
-
-    #[test]
-    fn capture_dns_strips_trailing_semicolon_comment() {
-        let body = "[Interface]\nDNS = 1.1.1.1 ; corp resolver\n";
-        let (_out, ips) = strip_and_capture_dns_directive(body);
-        assert_eq!(ips, vec!["1.1.1.1".to_string()]);
-    }
-
-    #[test]
-    fn capture_dns_search_domains_dropped() {
-        // wg-quick treats non-IP tokens on the RHS as DNS search suffixes.
-        // resolvectl wants IPs, not suffixes, so non-IP tokens are dropped
-        // from the captured list while the directive line is still stripped.
-        let body = "[Interface]\nDNS = 1.1.1.1, corp.example.com\n";
-        let (out, ips) = strip_and_capture_dns_directive(body);
-        assert!(!out.contains("DNS"));
-        assert_eq!(ips, vec!["1.1.1.1".to_string()]);
-    }
-
-    #[test]
-    fn capture_dns_search_directive_is_not_dns() {
-        // `dns_search = …` looks DNS-ish but is not the wg-quick `DNS`
-        // directive; both the line and any IPs on it must be left alone.
-        let body = "[Interface]\ndns_search = corp.example.com\nPrivateKey = abc\n";
-        let (out, ips) = strip_and_capture_dns_directive(body);
-        assert!(out.contains("dns_search = corp.example.com"));
-        assert!(ips.is_empty());
-    }
-
-    #[test]
-    fn capture_dns_leading_whitespace_on_directive() {
-        let body = "[Interface]\n  DNS = 1.1.1.1\n";
-        let (out, ips) = strip_and_capture_dns_directive(body);
-        assert!(!out.contains("DNS"));
-        assert_eq!(ips, vec!["1.1.1.1".to_string()]);
-    }
-
-    #[test]
-    fn capture_dns_strip_path_is_byte_identical_to_legacy_helper() {
-        // Equivalence guard: anything the wrapper `strip_dns_directive`
-        // returned for a given input, the capture-aware function must
-        // return identically in its first tuple element. Prevents
-        // accidental drift between the two paths.
-        let bodies = [
-            "",
-            "[Interface]\nPrivateKey = abc\n",
-            "[Interface]\nDNS = 1.1.1.1\nAddress = 10.0.0.2/24\n",
-            "[Interface]\n  DNS  =  1.1.1.1, 8.8.8.8  # corp\n",
-            "[Interface]\ndns = 8.8.8.8\nDns=4.4.4.4\n",
-            "[Interface]\n# Custom DNS overrides below\nPrivateKey = abc\n",
-        ];
-        for body in bodies {
-            let legacy = strip_dns_directive(body);
-            let (capture, _ips) = strip_and_capture_dns_directive(body);
-            assert_eq!(legacy, capture, "drift for input `{body}`");
-        }
+        assert_eq!(spec.args, vec!["down", "utun7"]);
     }
 
     /// Per-test isolation: build a fresh session-style subdir at mode `0o700`
@@ -805,7 +715,7 @@ mod tests {
     }
 
     #[test]
-    fn write_secondary_temp_config_strips_dns_and_preserves_basename() {
+    fn managed_temp_config_strips_dns_and_preserves_basename() {
         let (_root, session) = fresh_session_dir();
         let scratch = tempfile::tempdir().unwrap();
         let user_conf = scratch.path().join("corp.conf");
@@ -817,8 +727,7 @@ mod tests {
         let body = std::fs::read_to_string(&user_conf).unwrap();
         let stripped = strip_dns_directive(&body);
 
-        let temp =
-            write_secondary_temp_config_at(&session, &user_conf, stripped.as_bytes()).unwrap();
+        let temp = write_managed_temp_config_at(&session, &user_conf, stripped.as_bytes()).unwrap();
         // Basename matches the original — wg-quick will derive interface
         // "corp" from this path, identical to the user's original.
         assert_eq!(temp.file_name().unwrap(), "corp.conf");
@@ -831,7 +740,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn secondary_temp_file_is_0600() {
+    fn managed_temp_file_is_0600() {
         use std::os::unix::fs::PermissionsExt;
 
         let (_root, session) = fresh_session_dir();
@@ -843,30 +752,42 @@ mod tests {
         )
         .unwrap();
 
-        let temp = write_secondary_temp_config_at(
-            &session,
-            &user_conf,
-            b"[Interface]\nPrivateKey = abc\n",
-        )
-        .unwrap();
+        let temp =
+            write_managed_temp_config_at(&session, &user_conf, b"[Interface]\nPrivateKey = abc\n")
+                .unwrap();
         let perms = std::fs::metadata(&temp).unwrap().permissions();
         assert_eq!(perms.mode() & 0o777, 0o600);
     }
 
     #[test]
-    fn write_secondary_overwrites_stale_same_session_leaf() {
+    fn write_managed_overwrites_stale_same_session_leaf() {
         let (_root, session) = fresh_session_dir();
         let scratch = tempfile::tempdir().unwrap();
         let user_conf = scratch.path().join("vpn.conf");
         std::fs::write(&user_conf, "[Interface]\nPrivateKey = a\n").unwrap();
 
         // First write — leaf does not exist yet.
-        let t1 = write_secondary_temp_config_at(&session, &user_conf, b"first").unwrap();
+        let t1 = write_managed_temp_config_at(&session, &user_conf, b"first").unwrap();
         // Second write within same session — stale leaf is unlinked first
         // (write_secret_file would otherwise refuse with FileExists).
-        let t2 = write_secondary_temp_config_at(&session, &user_conf, b"second").unwrap();
+        let t2 = write_managed_temp_config_at(&session, &user_conf, b"second").unwrap();
         assert_eq!(t1, t2);
         assert_eq!(std::fs::read_to_string(&t2).unwrap(), "second");
+    }
+
+    #[test]
+    fn lifecycle_directories_do_not_overwrite_an_active_teardown_config() {
+        let (_root, session) = fresh_session_dir();
+        let first_dir = create_lifecycle_dir(&session).unwrap();
+        let second_dir = create_lifecycle_dir(&session).unwrap();
+        let source = session.join("corp.conf");
+
+        let first = write_managed_temp_config_at(&first_dir, &source, b"first").unwrap();
+        let second = write_managed_temp_config_at(&second_dir, &source, b"second").unwrap();
+
+        assert_ne!(first, second);
+        assert_eq!(std::fs::read_to_string(first).unwrap(), "first");
+        assert_eq!(std::fs::read_to_string(second).unwrap(), "second");
     }
 
     #[test]
@@ -876,11 +797,11 @@ mod tests {
         let user_conf = scratch.path().join("only.conf");
         std::fs::write(&user_conf, "[Interface]\nPrivateKey = a\n").unwrap();
 
-        let temp = write_secondary_temp_config_at(&session, &user_conf, b"body").unwrap();
+        let temp = write_managed_temp_config_at(&session, &user_conf, b"body").unwrap();
         assert!(temp.exists());
         assert!(session.exists());
 
-        cleanup_secondary_temp_config(&temp);
+        cleanup_managed_temp_config(&temp);
         assert!(!temp.exists());
         assert!(!session.exists(), "empty session dir should be removed");
     }
@@ -894,17 +815,17 @@ mod tests {
         std::fs::write(&conf_a, "x").unwrap();
         std::fs::write(&conf_b, "y").unwrap();
 
-        let temp_a = write_secondary_temp_config_at(&session, &conf_a, b"a-body").unwrap();
-        let temp_b = write_secondary_temp_config_at(&session, &conf_b, b"b-body").unwrap();
+        let temp_a = write_managed_temp_config_at(&session, &conf_a, b"a-body").unwrap();
+        let temp_b = write_managed_temp_config_at(&session, &conf_b, b"b-body").unwrap();
         assert_eq!(session, temp_a.parent().unwrap());
         assert_eq!(session, temp_b.parent().unwrap());
 
-        cleanup_secondary_temp_config(&temp_a);
+        cleanup_managed_temp_config(&temp_a);
         assert!(!temp_a.exists());
-        assert!(temp_b.exists(), "sibling secondary's leaf must survive");
+        assert!(temp_b.exists(), "sibling managed leaf must survive");
         assert!(session.exists(), "session dir must survive while non-empty");
 
-        cleanup_secondary_temp_config(&temp_b);
+        cleanup_managed_temp_config(&temp_b);
         assert!(!session.exists());
     }
 
@@ -955,43 +876,4 @@ mod tests {
         sweep_orphan_temp_configs(tmp.path(), "sid");
         assert!(!tmp.path().join("tmp").exists());
     }
-
-    #[test]
-    fn primary_skips_dns_stripping_at_struct_level() {
-        // We can't safely call `up()` here without owning the process-global
-        // runner, but the structural invariant is observable directly: a
-        // primary's `is_secondary` is false and its `temp_config_path`
-        // starts unset. The `up()` body's strip predicate is the single
-        // source of truth for the temp-file path; see `should_strip_dns`
-        // tests below for the resolved-host coverage.
-        let t = WgTunnel::new();
-        assert!(!t.is_secondary());
-        assert!(t.temp_config_path.is_none());
-    }
-
-    // ── should_strip_dns ─────────────────────────────────────────────────
-
-    #[test]
-    fn should_strip_dns_secondary_always_true() {
-        // Independent of platform / resolvectl detection — secondaries
-        // always strip so the multi-tunnel "primary owns system DNS"
-        // contract holds regardless of which Linux DNS path is active.
-        assert!(should_strip_dns(true));
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    #[test]
-    fn should_strip_dns_primary_on_non_linux_is_false() {
-        // macOS / Windows: no resolvectl path; primary never strips
-        // (matches the legacy behaviour on those platforms).
-        assert!(!should_strip_dns(false));
-    }
-
-    // Linux primary behaviour depends on `use_resolvectl_path()` which
-    // probes systemd-resolved + resolvectl at runtime. That probe is
-    // host-state-dependent and not unit-testable from inside the crate
-    // (the global runner is mock-default-success, but `is_systemd_resolved`
-    // reads /etc/resolv.conf directly). Linux CI lanes + the manual-
-    // testing rows in `docs/manual-testing/backlog.md` cover the
-    // resolved-host integration matrix.
 }

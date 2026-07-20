@@ -137,6 +137,8 @@ fn outcome_to_handle(
             pid: None,
             started_at: SystemTime::now(),
             kind: TunnelKindTag::Mock,
+            teardown_config: None,
+            dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
         }),
         ScriptedTunnelOutcome::UpSuccess {
             interface_name,
@@ -147,6 +149,8 @@ fn outcome_to_handle(
             pid,
             started_at: SystemTime::now(),
             kind: TunnelKindTag::Mock,
+            teardown_config: None,
+            dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
         }),
         ScriptedTunnelOutcome::Failure(msg) => Err(TunnelError::Subprocess(msg)),
         ScriptedTunnelOutcome::HandshakeFailed(msg) => Err(TunnelError::HandshakeFailed(msg)),

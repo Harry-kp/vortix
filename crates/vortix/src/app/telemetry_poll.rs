@@ -91,7 +91,7 @@ impl App {
         if let Some(result) = result {
             self.handle_message(Message::SyncSystemState {
                 sessions: result.sessions,
-                default_route_interface: result.default_route_interface,
+                default_route: result.default_route,
             });
         }
 

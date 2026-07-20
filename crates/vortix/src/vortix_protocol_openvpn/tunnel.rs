@@ -23,11 +23,83 @@ use tracing::{debug, info, warn};
 
 use crate::vortix_protocol_openvpn::parser::parse_ovpn_conf;
 
+/// Quality of the DNS intent recovered from an `OpenVPN` session log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OvpnDnsEvidence {
+    /// A complete negotiation contained pushed DNS settings.
+    Observed(crate::vortix_core::ports::dns::DnsRequest),
+    /// A complete negotiation contained no pushed DNS settings. Statically
+    /// configured settings, if any, remain in the request.
+    ExplicitlyEmpty(crate::vortix_core::ports::dns::DnsRequest),
+    /// The runtime log was missing or did not prove a completed negotiation.
+    /// The configured request is returned separately from runtime evidence.
+    Unavailable {
+        configured: crate::vortix_core::ports::dns::DnsRequest,
+        reason: String,
+    },
+}
+
 /// Maximum wall-clock to wait for openvpn to create the unix
 /// management socket after spawn. Typical macOS spawn takes <200ms; 5s gives
 /// loaded systems ample headroom while still surfacing
 /// catastrophic-spawn-failure within the user's attention span.
 const OVPN_MGMT_SOCKET_TIMEOUT_MS: u64 = 5000;
+const MANAGED_CONFIG_MARKER: &str = "# managed-by: vortix dns policy\n";
+
+struct ManagedConfigGuard(PathBuf);
+
+impl Drop for ManagedConfigGuard {
+    fn drop(&mut self) {
+        if std::fs::read_to_string(&self.0)
+            .is_ok_and(|body| body.starts_with(MANAGED_CONFIG_MARKER))
+        {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+}
+
+fn strip_dns_directives(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let mut tokens = line.split_whitespace();
+        let is_dns = matches!(tokens.next(), Some(value) if value.eq_ignore_ascii_case("dhcp-option"))
+            && matches!(tokens.next(), Some(value) if value.eq_ignore_ascii_case("DNS")
+                || value.eq_ignore_ascii_case("DOMAIN")
+                || value.eq_ignore_ascii_case("DOMAIN-SEARCH"));
+        if !is_dns {
+            output.push_str(line);
+        }
+    }
+    output
+}
+
+fn managed_config(profile: &Profile) -> Result<(PathBuf, Option<ManagedConfigGuard>), TunnelError> {
+    let body = std::fs::read_to_string(&profile.config_path)?;
+    let stripped = strip_dns_directives(&body);
+    if stripped == body {
+        return Ok((profile.config_path.clone(), None));
+    }
+    let parent = profile
+        .config_path
+        .parent()
+        .ok_or_else(|| TunnelError::Subprocess("OpenVPN config has no parent directory".into()))?;
+    let safe_name = sanitize_profile_name(&profile.display_name);
+    let path = parent.join(format!(".{safe_name}.vortix-dns-policy.ovpn"));
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        if !existing.starts_with(MANAGED_CONFIG_MARKER) {
+            return Err(TunnelError::Subprocess(format!(
+                "refusing to replace foreign managed-config path {}",
+                path.display()
+            )));
+        }
+        std::fs::remove_file(&path)?;
+    }
+    let managed_body = format!("{MANAGED_CONFIG_MARKER}{stripped}");
+    crate::vortix_core::secret_file::write_secret_file(&path, managed_body.as_bytes()).map_err(
+        |error| TunnelError::Subprocess(format!("write managed OpenVPN config: {error}")),
+    )?;
+    Ok((path.clone(), Some(ManagedConfigGuard(path))))
+}
 
 /// Read the credentials bundle file written by the TUI/CLI auth flow
 ///. Returns
@@ -269,14 +341,6 @@ pub struct OvpnTunnel {
     pub verbosity: String,
     /// Overall connect timeout in seconds.
     pub connect_timeout_secs: u64,
-    /// True when this tunnel is being brought up as a secondary in a
-    /// multi-tunnel session. When true, `up()` appends
-    /// `--pull-filter ignore "dhcp-option DNS"` to the openvpn argv so the
-    /// server's pushed DNS does not clobber the primary's resolver. Defaults
-    /// to `false` — single-tunnel callers see unchanged behaviour. The
-    /// `TunnelRegistry` sets this on the tunnel before invoking
-    /// `up()`; no production callsite yet flips this.
-    pub is_secondary: bool,
 }
 
 impl std::fmt::Debug for OvpnTunnel {
@@ -286,7 +350,6 @@ impl std::fmt::Debug for OvpnTunnel {
             .field("auth_dir", &self.auth_dir)
             .field("verbosity", &self.verbosity)
             .field("connect_timeout_secs", &self.connect_timeout_secs)
-            .field("is_secondary", &self.is_secondary)
             .finish()
     }
 }
@@ -298,7 +361,6 @@ impl Default for OvpnTunnel {
             auth_dir: None,
             verbosity: DEFAULT_OVPN_VERBOSITY.to_string(),
             connect_timeout_secs: 30,
-            is_secondary: false,
         }
     }
 }
@@ -333,23 +395,31 @@ impl OvpnTunnel {
         self
     }
 
-    /// Builder: mark this tunnel as a secondary in a multi-tunnel session
-    ///. When set to `true`, `up()` appends
-    /// `--pull-filter ignore "dhcp-option DNS"` to the openvpn argv,
-    /// suppressing server-pushed DNS so the primary tunnel's resolver
-    /// stays authoritative.
-    ///
-    /// Defaults to `false`. The `TunnelRegistry` toggles this
-    /// before calling `up()` once it lands; until then no production callsite
-    /// flips the flag and the existing single-tunnel argv is preserved.
-    ///
-    /// Requires `OpenVPN` >= 2.4 — version assertion lives in the
-    /// shared dependency probe at `VpnRuntime::check_dependencies`
-    /// (uses `vpn_runtime::openvpn::probe_openvpn_version`).
-    #[must_use]
-    pub fn with_secondary(mut self, is_secondary: bool) -> Self {
-        self.is_secondary = is_secondary;
-        self
+    /// Recover configured and negotiated DNS intent without conflating an
+    /// unreadable/truncated log with a completed negotiation that pushed no
+    /// DNS options.
+    pub fn requested_dns_evidence(
+        &self,
+        profile: &Profile,
+    ) -> Result<OvpnDnsEvidence, TunnelError> {
+        let profile_text = std::fs::read_to_string(&profile.config_path).map_err(|error| {
+            TunnelError::Subprocess(format!("read OpenVPN profile for DNS intent: {error}"))
+        })?;
+        let configured = parse_ovpn_conf(&profile_text)
+            .map_err(|error| TunnelError::Subprocess(format!("parse OpenVPN DNS intent: {error}")))?
+            .dns_request();
+        let safe_name = sanitize_profile_name(&profile.display_name);
+        let log_path = self.log_path(&safe_name);
+        let log = match std::fs::read_to_string(&log_path) {
+            Ok(log) => log,
+            Err(error) => {
+                return Ok(OvpnDnsEvidence::Unavailable {
+                    configured,
+                    reason: format!("read {}: {error}", log_path.display()),
+                });
+            }
+        };
+        Ok(pushed_dns_evidence(configured, &log))
     }
 
     fn pid_path(&self, safe_name: &str) -> PathBuf {
@@ -522,17 +592,14 @@ fn poll_log_until_ready(
     }
 }
 
-/// Build the openvpn daemon argv for a given profile. Pure helper extracted
-/// so the secondary-DNS-suppression branch is unit-testable
-/// without spawning a subprocess. The caller appends `--auth-user-pass <path>`
-/// afterwards when an auth file is available.
+/// Build the openvpn daemon argv for a given profile. DNS mutations are
+/// always suppressed here and applied later by the global coordinator.
 fn build_ovpn_args(
     config_path: &std::path::Path,
     safe_name: &str,
     pid_path: &std::path::Path,
     log_path: &std::path::Path,
     verbosity: &str,
-    is_secondary: bool,
 ) -> Vec<String> {
     let mut args = vec![
         "--config".to_string(),
@@ -547,13 +614,10 @@ fn build_ovpn_args(
         verbosity.to_string(),
     ];
 
-    // when this tunnel is a secondary, suppress server-pushed
-    // DNS so the primary's resolver stays authoritative. Requires OpenVPN
-    // >= 2.4 — gated upstream by `VpnRuntime::check_dependencies`.
-    if is_secondary {
+    for option in ["dhcp-option DNS", "dhcp-option DOMAIN"] {
         args.push("--pull-filter".to_string());
         args.push("ignore".to_string());
-        args.push("dhcp-option DNS".to_string());
+        args.push(option.to_string());
     }
 
     args
@@ -563,6 +627,88 @@ fn tail_lines(content: &str, n: usize) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let start = lines.len().saturating_sub(n);
     lines[start..].join("\n")
+}
+
+/// Parse DNS options from the latest completed `OpenVPN` negotiation.
+/// Missing, incomplete, or malformed runtime evidence is never interpreted
+/// as an authoritative empty request. The corresponding options are filtered
+/// from `OpenVPN` itself, so this is intent capture only.
+fn pushed_dns_evidence(
+    mut request: crate::vortix_core::ports::dns::DnsRequest,
+    log: &str,
+) -> OvpnDnsEvidence {
+    const COMPLETED: &str = "Initialization Sequence Completed";
+    let Some(completed_at) = log.rfind(COMPLETED) else {
+        return OvpnDnsEvidence::Unavailable {
+            configured: request,
+            reason: "OpenVPN log has no completed negotiation marker".into(),
+        };
+    };
+    if log[completed_at + COMPLETED.len()..].contains("PUSH_REPLY") {
+        return OvpnDnsEvidence::Unavailable {
+            configured: request,
+            reason: "OpenVPN log contains a newer incomplete negotiation".into(),
+        };
+    }
+    let completed_log = &log[..completed_at];
+    let session_start = completed_log
+        .rfind(COMPLETED)
+        .map_or(0, |previous| previous + COMPLETED.len());
+    let session_log = &completed_log[session_start..];
+    let Some(push_at) = session_log.rfind("PUSH_REPLY") else {
+        return OvpnDnsEvidence::ExplicitlyEmpty(request);
+    };
+
+    let push_reply = session_log[push_at + "PUSH_REPLY".len()..]
+        .lines()
+        .next()
+        .unwrap_or_default();
+    let mut observed = false;
+    for option in push_reply.split(',') {
+        let option = option.trim().trim_matches('\'');
+        let mut tokens = option.split_whitespace();
+        if !matches!(tokens.next(), Some(prefix) if prefix.eq_ignore_ascii_case("dhcp-option")) {
+            continue;
+        }
+        match tokens.next() {
+            Some(kind) if kind.eq_ignore_ascii_case("DNS") => {
+                let Some(server) = tokens.next().and_then(|value| value.parse().ok()) else {
+                    return OvpnDnsEvidence::Unavailable {
+                        configured: request,
+                        reason: "OpenVPN PUSH_REPLY contained malformed DNS evidence".into(),
+                    };
+                };
+                observed = true;
+                if !request.servers.contains(&server) {
+                    request.servers.push(server);
+                }
+            }
+            Some(kind)
+                if kind.eq_ignore_ascii_case("DOMAIN")
+                    || kind.eq_ignore_ascii_case("DOMAIN-SEARCH") =>
+            {
+                let domains = tokens.collect::<Vec<_>>();
+                if domains.is_empty() {
+                    return OvpnDnsEvidence::Unavailable {
+                        configured: request,
+                        reason: "OpenVPN PUSH_REPLY contained malformed domain evidence".into(),
+                    };
+                }
+                observed = true;
+                for domain in domains {
+                    if !request.search_domains.iter().any(|item| item == domain) {
+                        request.search_domains.push(domain.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if observed {
+        OvpnDnsEvidence::Observed(request)
+    } else {
+        OvpnDnsEvidence::ExplicitlyEmpty(request)
+    }
 }
 
 impl Tunnel for OvpnTunnel {
@@ -619,21 +765,19 @@ impl Tunnel for OvpnTunnel {
             "ovpn.up"
         );
 
+        let (effective_config, _managed_config_guard) = managed_config(profile)?;
         let mut args = build_ovpn_args(
-            &profile.config_path,
+            &effective_config,
             &safe_name,
             &pid_path,
             &log_path,
             &self.verbosity,
-            self.is_secondary,
         );
-        if self.is_secondary {
-            debug!(
-                target: "vortix::tunnel::openvpn",
-                profile = %profile.id,
-                "ovpn.up: secondary tunnel, suppressing pushed DNS via --pull-filter"
-            );
-        }
+        debug!(
+            target: "vortix::tunnel::openvpn",
+            profile = %profile.id,
+            "ovpn.up: DNS mutation suppressed for coordinator-owned policy"
+        );
 
         // Plan 2026-06-02-001, #191, Approach B-minimal: if the
         // credentials bundle file is present, this is a
@@ -795,12 +939,25 @@ impl Tunnel for OvpnTunnel {
             )));
         };
 
+        let dns_request = match self.requested_dns_evidence(profile)? {
+            OvpnDnsEvidence::Observed(request) | OvpnDnsEvidence::ExplicitlyEmpty(request) => {
+                request
+            }
+            OvpnDnsEvidence::Unavailable { reason, .. } => {
+                return Err(TunnelError::DaemonExited(format!(
+                    "OpenVPN connected but DNS negotiation evidence is unavailable: {reason}"
+                )));
+            }
+        };
+
         Ok(TunnelHandle {
             profile_id: profile.id.clone(),
             interface_name,
             pid: Some(pid),
             started_at: SystemTime::now(),
             kind: TunnelKindTag::OpenVpn,
+            teardown_config: None,
+            dns_request,
         })
     }
 
@@ -1017,60 +1174,188 @@ mod tests {
         assert_eq!(parse_kernel_interface(log), None);
     }
 
-    // argv-building behaviour for primary vs. secondary tunnels.
-    // The argv builder is pure so we can assert against it without spawning a
-    // subprocess; the secondary branch must inject the `--pull-filter` triple
-    // and the primary branch must not.
-
     #[test]
-    fn build_ovpn_args_primary_omits_pull_filter() {
-        let args = build_ovpn_args(
-            std::path::Path::new("/etc/vortix/corp.ovpn"),
-            "corp",
-            std::path::Path::new("/run/vortix/corp.pid"),
-            std::path::Path::new("/run/vortix/corp.log"),
-            "3",
-            false,
-        );
-        assert!(
-            !args.iter().any(|a| a == "--pull-filter"),
-            "primary argv must not contain --pull-filter; got: {args:?}"
-        );
-        assert!(args.contains(&"--config".to_string()));
-        assert!(args.contains(&"--daemon".to_string()));
-    }
-
-    #[test]
-    fn build_ovpn_args_secondary_injects_pull_filter() {
+    fn build_ovpn_args_always_suppresses_protocol_dns_mutation() {
         let args = build_ovpn_args(
             std::path::Path::new("/etc/vortix/lab.ovpn"),
             "lab",
             std::path::Path::new("/run/vortix/lab.pid"),
             std::path::Path::new("/run/vortix/lab.log"),
             "3",
-            true,
         );
         // The three flag tokens must appear in order: `--pull-filter`,
         // `ignore`, `dhcp-option DNS`.
         let pf_idx = args
             .iter()
             .position(|a| a == "--pull-filter")
-            .expect("secondary argv must contain --pull-filter");
+            .expect("argv must contain DNS pull-filter");
         assert_eq!(args.get(pf_idx + 1).map(String::as_str), Some("ignore"));
         assert_eq!(
             args.get(pf_idx + 2).map(String::as_str),
             Some("dhcp-option DNS")
         );
+        assert_eq!(
+            args.iter()
+                .filter(|arg| arg.as_str() == "--pull-filter")
+                .count(),
+            2
+        );
     }
 
     #[test]
-    fn with_secondary_flips_field_and_default_is_false() {
-        let primary = OvpnTunnel::default();
-        assert!(!primary.is_secondary);
-        let secondary = OvpnTunnel::default().with_secondary(true);
-        assert!(secondary.is_secondary);
-        // Toggle back.
-        let toggled = secondary.with_secondary(false);
-        assert!(!toggled.is_secondary);
+    fn managed_config_strips_local_dns_but_preserves_other_options() {
+        let input = "client\ndhcp-option DNS 1.1.1.1\ndhcp-option DOMAIN corp.example\ndhcp-option NTP 10.0.0.1\nremote vpn.example 1194\n";
+        let output = strip_dns_directives(input);
+        assert!(!output.contains("dhcp-option DNS"));
+        assert!(!output.contains("dhcp-option DOMAIN"));
+        assert!(output.contains("dhcp-option NTP 10.0.0.1"));
+        assert!(output.contains("remote vpn.example 1194"));
+    }
+
+    #[test]
+    fn managed_config_is_same_directory_and_guard_removes_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("corp.ovpn");
+        std::fs::write(&path, "client\ndhcp-option DNS 1.1.1.1\n").unwrap();
+        let profile = Profile::new(
+            crate::vortix_core::profile::ProfileId::new("corp"),
+            "corp",
+            crate::vortix_core::profile::ProtocolKind::OpenVpn,
+            path,
+        );
+        let (managed, guard) = managed_config(&profile).unwrap();
+        assert_eq!(managed.parent(), Some(temp.path()));
+        assert!(!std::fs::read_to_string(&managed)
+            .unwrap()
+            .contains("dhcp-option DNS"));
+        drop(guard);
+        assert!(!managed.exists());
+    }
+
+    #[test]
+    fn pushed_dns_is_captured_without_platform_mutation() {
+        let evidence = pushed_dns_evidence(
+            crate::vortix_core::ports::dns::DnsRequest::default(),
+            "PUSH: Received control message: 'PUSH_REPLY,redirect-gateway def1,dhcp-option DNS 10.8.0.1,dhcp-option DOMAIN corp.example'\nInitialization Sequence Completed\n",
+        );
+        let OvpnDnsEvidence::Observed(request) = evidence else {
+            panic!("complete pushed DNS must be observed");
+        };
+        assert_eq!(
+            request.servers,
+            vec!["10.8.0.1".parse::<std::net::IpAddr>().unwrap()]
+        );
+        assert_eq!(request.search_domains, vec!["corp.example"]);
+    }
+
+    #[test]
+    fn dns_evidence_recovers_push_reply_from_existing_log() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile_path = temp.path().join("corp.ovpn");
+        std::fs::write(&profile_path, "client\ndhcp-option DNS 1.1.1.1\n").unwrap();
+        std::fs::write(
+            temp.path().join("corp.log"),
+            "PUSH_REPLY,dhcp-option DNS 10.8.0.1,dhcp-option DOMAIN corp.example\nInitialization Sequence Completed\n",
+        )
+        .unwrap();
+        let profile = Profile::new(
+            crate::vortix_core::profile::ProfileId::new("corp"),
+            "corp",
+            crate::vortix_core::profile::ProtocolKind::OpenVpn,
+            profile_path,
+        );
+        let evidence = OvpnTunnel::new(temp.path().to_path_buf())
+            .requested_dns_evidence(&profile)
+            .unwrap();
+        let OvpnDnsEvidence::Observed(request) = evidence else {
+            panic!("complete pushed DNS must be observed");
+        };
+        assert_eq!(request.servers.len(), 2);
+        assert_eq!(request.search_domains, vec!["corp.example"]);
+    }
+
+    #[test]
+    fn completed_negotiation_without_pushed_dns_is_explicitly_empty() {
+        let configured = crate::vortix_core::ports::dns::DnsRequest {
+            servers: vec!["1.1.1.1".parse().unwrap()],
+            search_domains: Vec::new(),
+        };
+        let evidence = pushed_dns_evidence(
+            configured.clone(),
+            "PUSH_REPLY,redirect-gateway def1,ping 10\nInitialization Sequence Completed\n",
+        );
+        assert_eq!(evidence, OvpnDnsEvidence::ExplicitlyEmpty(configured));
+    }
+
+    #[test]
+    fn truncated_negotiation_is_unavailable_not_explicitly_empty() {
+        let configured = crate::vortix_core::ports::dns::DnsRequest::default();
+        let evidence = pushed_dns_evidence(
+            configured.clone(),
+            "PUSH_REPLY,redirect-gateway def1,dhcp-option DNS 10.8.0.1\n",
+        );
+        assert!(matches!(
+            evidence,
+            OvpnDnsEvidence::Unavailable {
+                configured: actual,
+                ..
+            } if actual == configured
+        ));
+    }
+
+    #[test]
+    fn newer_incomplete_negotiation_does_not_reuse_old_pushed_dns() {
+        let evidence = pushed_dns_evidence(
+            crate::vortix_core::ports::dns::DnsRequest::default(),
+            "PUSH_REPLY,dhcp-option DNS 10.8.0.1\nInitialization Sequence Completed\nPUSH_REPLY,redirect-gateway def1\n",
+        );
+        assert!(matches!(evidence, OvpnDnsEvidence::Unavailable { .. }));
+    }
+
+    #[test]
+    fn latest_completed_negotiation_replaces_older_pushed_dns() {
+        let evidence = pushed_dns_evidence(
+            crate::vortix_core::ports::dns::DnsRequest::default(),
+            "PUSH_REPLY,dhcp-option DNS 10.8.0.1\nInitialization Sequence Completed\nPUSH_REPLY,dhcp-option DNS 10.9.0.1\nInitialization Sequence Completed\n",
+        );
+        let OvpnDnsEvidence::Observed(request) = evidence else {
+            panic!("latest completed negotiation must be observed");
+        };
+        assert_eq!(
+            request.servers,
+            vec!["10.9.0.1".parse::<std::net::IpAddr>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn malformed_pushed_dns_is_unavailable_not_explicitly_empty() {
+        let configured = crate::vortix_core::ports::dns::DnsRequest::default();
+        let evidence = pushed_dns_evidence(
+            configured,
+            "PUSH_REPLY,dhcp-option DNS not-an-address\nInitialization Sequence Completed\n",
+        );
+        assert!(matches!(evidence, OvpnDnsEvidence::Unavailable { .. }));
+    }
+
+    #[test]
+    fn missing_runtime_log_is_unavailable() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile_path = temp.path().join("corp.ovpn");
+        std::fs::write(&profile_path, "client\ndhcp-option DNS 1.1.1.1\n").unwrap();
+        let profile = Profile::new(
+            crate::vortix_core::profile::ProfileId::new("corp"),
+            "corp",
+            crate::vortix_core::profile::ProtocolKind::OpenVpn,
+            profile_path,
+        );
+
+        let evidence = OvpnTunnel::new(temp.path().to_path_buf())
+            .requested_dns_evidence(&profile)
+            .unwrap();
+        assert!(matches!(
+            evidence,
+            OvpnDnsEvidence::Unavailable { configured, .. }
+                if configured.servers == vec!["1.1.1.1".parse::<std::net::IpAddr>().unwrap()]
+        ));
     }
 }

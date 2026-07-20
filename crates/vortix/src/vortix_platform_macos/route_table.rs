@@ -21,7 +21,7 @@
 use std::time::Duration;
 
 use crate::platform::route_probe::{ProbeOutcome, RouteProbe};
-use crate::vortix_core::ports::route_table::RouteTable;
+use crate::vortix_core::ports::route_table::{DefaultRouteObservation, RouteTable};
 use crate::vortix_process::CommandSpec;
 
 /// Upper bound on the `route get default` subprocess. The query goes
@@ -55,9 +55,14 @@ impl RouteTable for MacRouteTable {
         parse_gateway(&text)
     }
 
-    fn default_route_interface() -> Option<String> {
-        let text = run_route_get_default()?;
-        parse_interface(&text)
+    fn default_route_observation() -> DefaultRouteObservation {
+        let Some(text) = run_route_get_default() else {
+            return DefaultRouteObservation::ProbeFailed;
+        };
+        parse_interface(&text).map_or(
+            DefaultRouteObservation::NoDefaultRoute,
+            DefaultRouteObservation::Interface,
+        )
     }
 }
 

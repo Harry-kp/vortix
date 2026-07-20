@@ -505,6 +505,8 @@ impl<T: Tunnel> Engine<T> {
             details: Box::new(DetailedConnectionInfo {
                 interface: handle.interface_name,
                 pid: handle.pid,
+                teardown_config: handle.teardown_config,
+                dns_request: handle.dns_request,
                 ..Default::default()
             }),
         };
@@ -534,9 +536,19 @@ impl<T: Tunnel> Engine<T> {
         // The FSM doesn't track the last-seen `TunnelHandle` directly today
         // (Connected only carries DetailedConnectionInfo). Synthesise one
         // from the current state for tunnel.down().
-        let (interface, pid) = match &self.state {
-            Connection::Connected { details, .. } => (details.interface.clone(), details.pid),
-            _ => (String::new(), None),
+        let (interface, pid, teardown_config, dns_request) = match &self.state {
+            Connection::Connected { details, .. } => (
+                details.interface.clone(),
+                details.pid,
+                details.teardown_config.clone(),
+                details.dns_request.clone(),
+            ),
+            _ => (
+                String::new(),
+                None,
+                None,
+                crate::vortix_core::ports::dns::DnsRequest::default(),
+            ),
         };
         TunnelHandle {
             profile_id: profile_id.clone(),
@@ -544,6 +556,8 @@ impl<T: Tunnel> Engine<T> {
             pid,
             started_at: SystemTime::now(),
             kind: self.tunnel.kind_tag(),
+            teardown_config,
+            dns_request,
         }
     }
 }
@@ -610,6 +624,27 @@ mod tests {
         assert!(kinds.contains(&"start"));
         assert!(kinds.contains(&"up"));
         assert!(kinds.contains(&"ks"));
+    }
+
+    #[test]
+    fn synthesized_disconnect_handle_preserves_teardown_config() {
+        let mut engine = engine_with(MockTunnel::new());
+        let teardown = crate::vortix_core::ports::tunnel::TunnelTeardownConfig {
+            path: PathBuf::from("/private/tmp/vortix/corp.conf"),
+            managed: true,
+        };
+        engine.seed_connected_state(
+            ProfileId::new("corp"),
+            DetailedConnectionInfo {
+                interface: "wg0".into(),
+                teardown_config: Some(teardown.clone()),
+                ..Default::default()
+            },
+            SystemTime::now(),
+        );
+
+        let handle = engine.synth_handle(&ProfileId::new("corp"));
+        assert_eq!(handle.teardown_config, Some(teardown));
     }
 
     #[test]

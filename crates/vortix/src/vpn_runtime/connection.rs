@@ -140,9 +140,12 @@ impl VpnRuntime {
                     profile,
                     success,
                     error,
+                    interface: _,
+                    dns_request,
                     ..
                 }) => {
                     if success {
+                        self.remember_dns_request(&profile, dns_request);
                         self.session_start = Some(Instant::now());
                         self.last_connected_profile = Some(profile.clone());
 
@@ -158,6 +161,7 @@ impl VpnRuntime {
                         // tunnel a concurrent TUI session was tracking.
                         let (is_connected, active) = self.killswitch_view_from_scanner();
                         self.sync_killswitch(is_connected, &active);
+                        self.reconcile_dns_from_scanner();
                     } else {
                         self.cleanup_vpn_resources(&profile);
                     }
@@ -217,14 +221,24 @@ impl VpnRuntime {
         let cmd_tx = self.cmd_tx.clone();
         let pn = profile_name.clone();
 
-        // a single Tunnel::down call replaces the previous
-        // ~80-line per-protocol match arm. The interface name carried on the
-        // synthetic handle preserves the existing wg-quick semantics
-        // (config-path-based lookup) for WireGuard.
+        // A single Tunnel::down call replaces the previous ~80-line
+        // per-protocol match arm. WireGuard carries the source config
+        // separately so its adapter can sanitize DNS before invoking
+        // `wg-quick down`.
         let iface_for_handle = match protocol {
-            Protocol::WireGuard => config_path.to_string_lossy().into_owned(),
+            Protocol::WireGuard => config_path
+                .file_stem()
+                .and_then(std::ffi::OsStr::to_str)
+                .unwrap_or("wg0")
+                .to_string(),
             Protocol::OpenVPN => format!("openvpn-{}", utils::sanitize_profile_name(&pn)),
         };
+        let teardown_config = matches!(protocol, Protocol::WireGuard).then(|| {
+            crate::vortix_core::ports::tunnel::TunnelTeardownConfig {
+                path: config_path,
+                managed: false,
+            }
+        });
         let pid_for_handle = match protocol {
             Protocol::OpenVPN => utils::read_openvpn_pid(&pn).or(pid),
             Protocol::WireGuard => None,
@@ -244,6 +258,8 @@ impl VpnRuntime {
                     Protocol::WireGuard => TunnelKindTag::WireGuard,
                     Protocol::OpenVPN => TunnelKindTag::OpenVpn,
                 },
+                teardown_config,
+                dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
             };
 
             let config_dir = crate::utils::get_app_config_dir()
@@ -288,6 +304,8 @@ impl VpnRuntime {
                     self.sync_killswitch(is_connected, &active);
 
                     if success {
+                        self.forget_dns_request(&profile_name);
+                        self.reconcile_dns_from_scanner();
                         return Ok(());
                     }
                     return Err(error.unwrap_or_else(|| "Disconnect failed".into()));
@@ -446,6 +464,7 @@ impl VpnRuntime {
                     error: None,
                     interface: Some(handle.interface_name),
                     pid: handle.pid,
+                    dns_request: handle.dns_request,
                 });
             }
             Err(err) => {
@@ -455,6 +474,7 @@ impl VpnRuntime {
                     error: Some(format!("{protocol}: {err}")),
                     interface: None,
                     pid: None,
+                    dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
                 });
             }
         }

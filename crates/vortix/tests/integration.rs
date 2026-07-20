@@ -132,6 +132,7 @@ mod connection_state_machine {
             error: None,
             interface: None,
             pid: None,
+            dns_request: vortix::vortix_core::ports::dns::DnsRequest::default(),
         });
         assert!(matches!(
             app.legacy_state(),
@@ -150,6 +151,7 @@ mod connection_state_machine {
             error: Some("refused".to_string()),
             interface: None,
             pid: None,
+            dns_request: vortix::vortix_core::ports::dns::DnsRequest::default(),
         });
         assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
     }
@@ -169,7 +171,8 @@ mod connection_state_machine {
 
         app.handle_message(Message::SyncSystemState {
             sessions: vec![fake_session("vpn-a")],
-            default_route_interface: None,
+            default_route:
+                vortix::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
         });
         assert!(
             matches!(app.legacy_state(), ConnectionState::Connecting { .. }),
@@ -184,7 +187,8 @@ mod connection_state_machine {
 
         app.handle_message(Message::SyncSystemState {
             sessions: vec![],
-            default_route_interface: None,
+            default_route:
+                vortix::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
         });
         assert!(
             matches!(app.legacy_state(), ConnectionState::Connecting { .. }),
@@ -220,7 +224,8 @@ mod connection_state_machine {
         // finishes the disconnect (guards the re-adopt/reconnect loop).
         app.handle_message(Message::SyncSystemState {
             sessions: vec![],
-            default_route_interface: None,
+            default_route:
+                vortix::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
         });
         assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
     }
@@ -232,7 +237,8 @@ mod connection_state_machine {
 
         app.handle_message(Message::SyncSystemState {
             sessions: vec![],
-            default_route_interface: None,
+            default_route:
+                vortix::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
         });
         assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
     }
@@ -251,7 +257,8 @@ mod connection_state_machine {
 
         app.handle_message(Message::SyncSystemState {
             sessions: vec![fake_session("vpn-a")],
-            default_route_interface: None,
+            default_route:
+                vortix::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
         });
         assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
     }
@@ -273,7 +280,8 @@ mod connection_state_machine {
 
         app.handle_message(Message::SyncSystemState {
             sessions: vec![],
-            default_route_interface: None,
+            default_route:
+                vortix::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
         });
         assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
         assert_eq!(app.runtime.connection_drops, 1);
@@ -289,6 +297,7 @@ mod connection_state_machine {
             error: None,
             interface: None,
             pid: None,
+            dns_request: vortix::vortix_core::ports::dns::DnsRequest::default(),
         });
         assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
     }
@@ -312,6 +321,7 @@ mod connection_state_machine {
             error: None,
             interface: None,
             pid: None,
+            dns_request: vortix::vortix_core::ports::dns::DnsRequest::default(),
         });
         assert!(matches!(
             app.legacy_state(),
@@ -336,7 +346,8 @@ mod connection_state_machine {
         // finishes the disconnect (guards the re-adopt/reconnect loop).
         app.handle_message(Message::SyncSystemState {
             sessions: vec![],
-            default_route_interface: None,
+            default_route:
+                vortix::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
         });
         assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
     }
@@ -364,7 +375,8 @@ mod connection_state_machine {
         // finishes the disconnect (guards the re-adopt/reconnect loop).
         app.handle_message(Message::SyncSystemState {
             sessions: vec![],
-            default_route_interface: None,
+            default_route:
+                vortix::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
         });
 
         // complete_disconnect calls connect_profile(1) for vpn-b.
@@ -440,7 +452,8 @@ mod killswitch_lifecycle {
         // VPN drops
         app.handle_message(Message::SyncSystemState {
             sessions: vec![],
-            default_route_interface: None,
+            default_route:
+                vortix::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
         });
 
         assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
@@ -458,7 +471,8 @@ mod killswitch_lifecycle {
         // VPN drops
         app.handle_message(Message::SyncSystemState {
             sessions: vec![],
-            default_route_interface: None,
+            default_route:
+                vortix::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
         });
 
         assert_eq!(app.runtime.killswitch_state, KillSwitchState::Disabled);
