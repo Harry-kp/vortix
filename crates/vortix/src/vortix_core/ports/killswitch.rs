@@ -22,6 +22,9 @@ pub type Result<T> = std::result::Result<T, KillswitchError>;
 /// Errors that can occur during kill-switch operations.
 #[derive(Debug, Error)]
 pub enum KillswitchError {
+    /// The normalized policy contains an unsafe or unsupported value.
+    #[error("invalid kill-switch policy: {0}")]
+    InvalidPolicy(String),
     /// A firewall subprocess returned a non-zero exit or otherwise failed.
     #[error("firewall command failed: {0}")]
     CommandFailed(String),

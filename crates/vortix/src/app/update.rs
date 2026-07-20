@@ -771,7 +771,13 @@ impl App {
             && !self.runtime.is_root
             && !self.runtime.killswitch_state.is_blocking();
 
-        if !blocking_refused {
+        if self.runtime.killswitch_state == crate::state::KillSwitchState::Degraded {
+            self.log("ERR: Kill-switch policy could not be verified; protection is degraded");
+            self.show_toast(
+                "Kill-switch policy could not be verified — protection degraded".to_string(),
+                ToastType::Error,
+            );
+        } else if !blocking_refused {
             // Toast / log strings use the user-facing UI labels
             // (`KillSwitchMode::display_name`). Log lines keep the
             // enum variant name in parens so on-disk logs stay
@@ -1493,6 +1499,9 @@ impl App {
     }
 
     fn handle_tick(&mut self) {
+        if self.runtime.killswitch_verification_needs_refresh() {
+            self.sync_killswitch();
+        }
         // 1. Connection Timeout Safeguard
         if let ConnectionState::Connecting { started, profile } = self.legacy_state() {
             if started.elapsed()

@@ -33,8 +33,10 @@ either script is safe.
 
 - `wg_happy_path.sh` — WireGuard connect → status → ping → disconnect
 - `ovpn_happy_path.sh` — OpenVPN connect → status → ping → disconnect
-- `killswitch.sh` — engage iptables-based killswitch, verify blocked
-  destinations are unreachable, release, verify restored
+- `killswitch.sh` — verify owned dual-stack iptables chains, host-rule
+  preservation, blocked egress, and clean release; it also invokes
+  `nft_killswitch.sh` to exercise the native nft backend and failed atomic
+  replacement
 
 ## What's not yet wired (scope-honest)
 
@@ -55,6 +57,7 @@ docker run --privileged --rm -v "$PWD:/workspace" -w /workspace vortix-integrati
     bash -c 'cargo build --release -p vortix && \
              bash tests/integration/setup-netns.sh && \
              bash tests/integration/wg_happy_path.sh && \
+             bash tests/integration/killswitch.sh && \
              bash tests/integration/teardown-netns.sh'
 ```
 
