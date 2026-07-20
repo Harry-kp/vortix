@@ -215,7 +215,8 @@ impl App {
                 error,
                 interface,
                 pid,
-            } => self.handle_connect_result(profile, success, error, interface, pid),
+                dns_request,
+            } => self.handle_connect_result(profile, success, error, interface, pid, dns_request),
 
             // UI Toggles
             Message::ToggleZoom => {
@@ -335,16 +336,65 @@ impl App {
             Message::Telemetry(update) => self.handle_telemetry(update),
             Message::SyncSystemState {
                 sessions,
-                default_route_interface,
+                default_route,
             } => {
                 // Pre-feed the scanner's route-iface probe into the
                 // registry's cache BEFORE processing sessions. Every
                 // downstream `set_connected` / `set_disconnected` calls
                 // `recompute_primary`, which now reads this cached value
                 // instead of shelling out from the main thread.
-                self.registry
-                    .feed_default_route_interface(default_route_interface);
+                let route_changed = match default_route {
+                    crate::vortix_core::ports::route_table::DefaultRouteObservation::Interface(
+                        interface,
+                    ) => {
+                        self.registry.feed_default_route_interface(Some(interface));
+                        self.runtime.route_observation_fresh = true;
+                        true
+                    }
+                    crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute => {
+                        self.registry.feed_default_route_interface(None);
+                        self.runtime.route_observation_fresh = true;
+                        true
+                    }
+                    crate::vortix_core::ports::route_table::DefaultRouteObservation::ProbeFailed => {
+                        let was_fresh = self.runtime.route_observation_fresh;
+                        self.runtime.route_observation_fresh = false;
+                        if was_fresh || !self.runtime.scanner_first_tick_done {
+                            self.log("WARN: Default-route observation failed; retaining the last known primary");
+                        }
+                        false
+                    }
+                };
                 self.handle_sync_system_state(sessions);
+                if route_changed {
+                    self.reconcile_dns_policy();
+                }
+            }
+            Message::DnsPolicyResult {
+                revision,
+                coordinator,
+                external_sessions,
+                error,
+            } => {
+                let previous_external_sessions = self.runtime.dns_external_sessions;
+                let was_degraded = self.runtime.dns_policy.effective().status
+                    == crate::vortix_core::ports::dns::DnsEffectiveStatus::Degraded;
+                if self
+                    .runtime
+                    .complete_dns_policy(revision, coordinator, external_sessions)
+                {
+                    if let Some(error) = error {
+                        if !(external_sessions > 0 && previous_external_sessions > 0) {
+                            self.log(&format!("WARN: {error}"));
+                        }
+                    }
+                    if self.runtime.dns_policy.effective().status
+                        == crate::vortix_core::ports::dns::DnsEffectiveStatus::Degraded
+                        && !was_degraded
+                    {
+                        self.log("WARN: DNS policy is degraded; tunnel routing remains active");
+                    }
+                }
             }
             Message::ConnectionTimeout(profile_name) => {
                 self.handle_connection_timeout(profile_name);
@@ -513,6 +563,7 @@ impl App {
         error: Option<String>,
         interface: Option<String>,
         pid: Option<u32>,
+        dns_request: crate::vortix_core::ports::dns::DnsRequest,
     ) {
         // Stale-arrival check. A `ConnectResult` is stale ONLY when the
         // user cancelled / changed context before the spawn thread's
@@ -541,6 +592,7 @@ impl App {
                 "INFO: Ignoring stale ConnectResult for '{profile}' (state changed)"
             ));
         } else if success {
+            self.runtime.remember_dns_request(&profile, dns_request);
             // Reset this profile's retry / auto-reconnect bookkeeping on
             // success. Other profiles' retry state is untouched (P5b
             // per-profile retry).
@@ -574,6 +626,7 @@ impl App {
                 details_seed.pid = Some(p);
             }
             self.mirror_connect_into_registry(&profile, &details_seed, now);
+            self.reconcile_dns_policy();
 
             if let Some(p) = self.runtime.profiles.iter_mut().find(|p| p.name == profile) {
                 p.last_used = Some(std::time::SystemTime::now());

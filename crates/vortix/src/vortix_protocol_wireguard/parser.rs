@@ -60,6 +60,7 @@ pub struct WgPeer {
 #[derive(Debug, Default, Clone)]
 pub struct WgParsedProfile {
     pub dns_servers: Vec<String>,
+    pub dns_search_domains: Vec<String>,
     pub address: Option<String>,
     pub mtu: Option<u32>,
     pub peers: Vec<WgPeer>,
@@ -83,6 +84,17 @@ impl ParsedProfile for WgParsedProfile {
 
     fn dns_servers(&self) -> Vec<String> {
         self.dns_servers.clone()
+    }
+
+    fn dns_request(&self) -> crate::vortix_core::ports::dns::DnsRequest {
+        crate::vortix_core::ports::dns::DnsRequest {
+            servers: self
+                .dns_servers
+                .iter()
+                .filter_map(|server| server.parse().ok())
+                .collect(),
+            search_domains: self.dns_search_domains.clone(),
+        }
     }
 }
 
@@ -133,10 +145,20 @@ pub fn parse_wg_conf(text: &str) -> Result<WgParsedProfile, ParseError> {
         match section {
             Section::Interface => {
                 if key.eq_ignore_ascii_case("DNS") {
+                    // Strip valid trailing comments before comma
+                    // tokenization. Otherwise `1.1.1.1 # note` is no
+                    // longer an IP and is misclassified as a search domain.
+                    let value = value
+                        .find(['#', ';'])
+                        .map_or(value, |comment| &value[..comment]);
                     for entry in value.split(',') {
                         let entry = entry.trim();
                         if !entry.is_empty() {
-                            profile.dns_servers.push(entry.to_string());
+                            if entry.parse::<std::net::IpAddr>().is_ok() {
+                                profile.dns_servers.push(entry.to_string());
+                            } else {
+                                profile.dns_search_domains.push(entry.to_string());
+                            }
                         }
                     }
                 } else if key.eq_ignore_ascii_case("Address") {
@@ -233,6 +255,33 @@ Endpoint = 203.0.113.5:51820
         assert_eq!(p.dns_servers, vec!["1.1.1.1", "8.8.8.8"]);
         assert_eq!(p.address.as_deref(), Some("10.0.0.2/32"));
         assert_eq!(p.mtu, Some(1420));
+    }
+
+    #[test]
+    fn separates_resolver_addresses_from_search_domains() {
+        let p = parse_wg_conf("[Interface]\nDNS = 1.1.1.1, corp.example\n").unwrap();
+        assert_eq!(p.dns_servers, vec!["1.1.1.1"]);
+        assert_eq!(p.dns_search_domains, vec!["corp.example"]);
+    }
+
+    #[test]
+    fn strips_hash_comment_from_dns_value_before_classification() {
+        let p = parse_wg_conf(
+            "[Interface]\nDNS = 1.1.1.1, corp.example # primary resolver and search\n",
+        )
+        .unwrap();
+        assert_eq!(p.dns_servers, vec!["1.1.1.1"]);
+        assert_eq!(p.dns_search_domains, vec!["corp.example"]);
+    }
+
+    #[test]
+    fn strips_semicolon_comment_from_dns_value_before_classification() {
+        let p = parse_wg_conf(
+            "[Interface]\nDNS = 2606:4700:4700::1111, internal.example ; office DNS\n",
+        )
+        .unwrap();
+        assert_eq!(p.dns_servers, vec!["2606:4700:4700::1111"]);
+        assert_eq!(p.dns_search_domains, vec!["internal.example"]);
     }
 
     #[test]

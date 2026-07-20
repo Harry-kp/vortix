@@ -309,6 +309,7 @@ impl App {
                         error: None,
                         interface: Some(handle.interface_name),
                         pid: handle.pid,
+                        dns_request: handle.dns_request,
                     });
                 }
                 Err(err) => {
@@ -318,6 +319,7 @@ impl App {
                         error: Some(format!("{protocol}: {err}")),
                         interface: None,
                         pid: None,
+                        dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
                     });
                 }
             }
@@ -398,6 +400,8 @@ impl App {
         // staying green and header continuing to list the
         // disconnected tunnel even after logs reported success.
         self.mirror_disconnect_into_registry(profile_name);
+        self.runtime.forget_dns_request(profile_name);
+        self.reconcile_dns_policy();
 
         // Drain pending_connect: switch directly to the next profile
         if let Some(idx) = self.runtime.pending_connect.take() {
@@ -538,6 +542,8 @@ impl App {
             transfer_tx: session.transfer_tx.clone(),
             latest_handshake: session.latest_handshake.clone(),
             pid: session.pid,
+            dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
+            teardown_config: None,
         };
         let since = session
             .started_at
@@ -609,6 +615,8 @@ impl App {
             transfer_tx: session.transfer_tx.clone(),
             latest_handshake: session.latest_handshake.clone(),
             pid: session.pid,
+            dns_request: existing_details.dns_request,
+            teardown_config: existing_details.teardown_config,
         };
         self.registry.set_connected(
             profile_id,
@@ -718,6 +726,47 @@ impl App {
         );
     }
 
+    /// Reconcile the full resolver policy from registry route truth. This is
+    /// the transitional local coordinator seam that U5's control service
+    /// consumes unchanged.
+    pub(crate) fn reconcile_dns_policy(&mut self) {
+        use crate::vortix_core::engine::{Connection, Role};
+
+        let snapshots = self.registry.snapshot_all();
+        let external_sessions = snapshots
+            .iter()
+            .filter(|snapshot| {
+                matches!(snapshot.state, Connection::Connected { .. })
+                    && !self.runtime.owns_dns_session(snapshot.profile_id.as_str())
+            })
+            .count();
+        let observations = snapshots
+            .into_iter()
+            .filter_map(|snapshot| {
+                let Connection::Connected { .. } = snapshot.state else {
+                    return None;
+                };
+                if !self.runtime.owns_dns_session(snapshot.profile_id.as_str()) {
+                    return None;
+                }
+                Some((
+                    snapshot.profile_id.as_str().to_string(),
+                    snapshot.interface_name?,
+                    matches!(snapshot.role, Role::Primary { .. }),
+                ))
+            })
+            .collect::<Vec<_>>();
+        if let Err(error) = self
+            .runtime
+            .schedule_dns_observations(&observations, external_sessions)
+        {
+            self.runtime
+                .dns_policy
+                .invalidate_effective(format!("DNS policy scheduling failed: {error}"));
+            self.log(&format!("WARN: DNS policy scheduling failed: {error}"));
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     /// Global single-tunnel disconnect — finds the profile from the
     /// derived legacy view (registry primary) and delegates to
@@ -784,7 +833,11 @@ impl App {
                 use crate::vortix_core::profile::ProfileId;
 
                 let iface = match protocol {
-                    Protocol::WireGuard => config_path.to_string_lossy().into_owned(),
+                    Protocol::WireGuard => config_path
+                        .file_stem()
+                        .and_then(std::ffi::OsStr::to_str)
+                        .unwrap_or("wg0")
+                        .to_string(),
                     Protocol::OpenVPN => {
                         format!("openvpn-{}", crate::utils::sanitize_profile_name(&name))
                     }
@@ -802,6 +855,13 @@ impl App {
                         Protocol::WireGuard => TunnelKindTag::WireGuard,
                         Protocol::OpenVPN => TunnelKindTag::OpenVpn,
                     },
+                    teardown_config: matches!(protocol, Protocol::WireGuard).then(|| {
+                        crate::vortix_core::ports::tunnel::TunnelTeardownConfig {
+                            path: config_path,
+                            managed: false,
+                        }
+                    }),
+                    dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
                 };
                 let config_dir = crate::utils::get_app_config_dir()
                     .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
@@ -981,7 +1041,11 @@ impl App {
             use crate::vortix_core::ports::tunnel::{TunnelHandle, TunnelKindTag};
 
             let iface = match protocol {
-                Protocol::WireGuard => config_path.to_string_lossy().into_owned(),
+                Protocol::WireGuard => config_path
+                    .file_stem()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .unwrap_or("wg0")
+                    .to_string(),
                 Protocol::OpenVPN => {
                     format!("openvpn-{}", crate::utils::sanitize_profile_name(&pn))
                 }
@@ -999,6 +1063,13 @@ impl App {
                     Protocol::WireGuard => TunnelKindTag::WireGuard,
                     Protocol::OpenVPN => TunnelKindTag::OpenVpn,
                 },
+                teardown_config: matches!(protocol, Protocol::WireGuard).then(|| {
+                    crate::vortix_core::ports::tunnel::TunnelTeardownConfig {
+                        path: config_path,
+                        managed: false,
+                    }
+                }),
+                dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
             };
             let config_dir = crate::utils::get_app_config_dir()
                 .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
@@ -1126,6 +1197,8 @@ fn legacy_to_core_details(
         transfer_tx: legacy.transfer_tx.clone(),
         latest_handshake: legacy.latest_handshake.clone(),
         pid: legacy.pid,
+        dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
+        teardown_config: None,
         // mirror_connect_into_registry funnels through this helper after
         // `Tunnel::up()` succeeds. The interface is authoritative by
         // construction — it's whatever the protocol layer (OpenVPN log

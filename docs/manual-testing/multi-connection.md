@@ -84,3 +84,20 @@ When running this matrix as part of a release verification, capture either:
 The JSON dump is sufficient evidence for scenarios 1–4 and 9–12; the visual
 verification is necessary for 5, 6, and 11 because the takeover overlay is
 visible-only state.
+
+## DNS agreement addendum
+
+For every scenario with two active tunnels, capture the resolver view beside
+the route and JSON evidence:
+
+- Linux resolved: `resolvectl status <primary-iface>` and each secondary.
+- Linux fallback: `resolvconf -l`.
+- macOS: `scutil --dns` plus `ls -l /etc/resolver` and the Vortix-managed file contents.
+
+Exactly one `Role::Primary` may own catch-all DNS (`~.` on resolved or the
+Vortix-marked `default` resolver on macOS). A secondary with explicit search
+domains may own only those suffixes; otherwise its requested global DNS is
+suppressed. Resolver suppression must never remove its CIDR/AllowedIPs routes.
+During scenarios 6–8 (primary transfer/disconnect), record the DNS policy
+generation before and after, verify only prior-generation Vortix resources
+were released, and repeat the final reconcile/release to prove idempotency.

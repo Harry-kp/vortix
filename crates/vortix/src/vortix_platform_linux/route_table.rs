@@ -17,7 +17,7 @@
 use std::time::Duration;
 
 use crate::platform::route_probe::{ProbeOutcome, RouteProbe};
-use crate::vortix_core::ports::route_table::RouteTable;
+use crate::vortix_core::ports::route_table::{DefaultRouteObservation, RouteTable};
 use crate::vortix_process::CommandSpec;
 
 /// Upper bound on the `ip route show default` subprocess. Netlink is
@@ -46,9 +46,14 @@ impl RouteTable for LinuxRouteTable {
         parse_gateway(&text)
     }
 
-    fn default_route_interface() -> Option<String> {
-        let text = run_ip_route_show_default()?;
-        parse_interface(&text)
+    fn default_route_observation() -> DefaultRouteObservation {
+        let Some(text) = run_ip_route_show_default() else {
+            return DefaultRouteObservation::ProbeFailed;
+        };
+        parse_interface(&text).map_or(
+            DefaultRouteObservation::NoDefaultRoute,
+            DefaultRouteObservation::Interface,
+        )
     }
 }
 

@@ -83,6 +83,13 @@ pub struct DetailedConnectionInfo {
     pub transfer_tx: String,
     pub latest_handshake: String,
     pub pid: Option<u32>,
+    /// Protocol-requested resolver intent retained for the global policy
+    /// worker. Internal-only so existing IPC/JSON snapshots remain stable.
+    #[serde(skip)]
+    pub dns_request: crate::vortix_core::ports::dns::DnsRequest,
+    /// Protocol-owned teardown config. Never serialized into snapshots.
+    #[serde(skip)]
+    pub teardown_config: Option<crate::vortix_core::ports::tunnel::TunnelTeardownConfig>,
     /// Whether `interface` came from a reliable per-tunnel source.
     ///
     /// `true` when set by the protocol layer's `Tunnel::up()` result
@@ -121,6 +128,8 @@ impl Default for DetailedConnectionInfo {
             transfer_tx: String::new(),
             latest_handshake: String::new(),
             pid: None,
+            dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
+            teardown_config: None,
             interface_authoritative: true,
         }
     }

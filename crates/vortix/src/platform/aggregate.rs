@@ -152,6 +152,8 @@ pub struct MockRouteTable {
     pub gateway: Option<String>,
     /// Canned interface name for `default_route_interface()`.
     pub interface: Option<String>,
+    /// Distinguish an unavailable probe from a successful no-route result.
+    pub probe_failed: bool,
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -243,6 +245,99 @@ impl DnsResolverKind {
             #[cfg(target_os = "windows")]
             Self::Windows => platform_impl::WindowsDns::get_dns_server(),
             Self::Mock(m) => m.dns.clone(),
+        }
+    }
+}
+
+impl crate::vortix_core::ports::dns::DnsPolicyAdapter for DnsResolverKind {
+    fn capabilities(&self) -> crate::vortix_core::ports::dns::DnsPlatformCapabilities {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Macos => platform_impl::MacDns.capabilities(),
+            #[cfg(target_os = "linux")]
+            Self::Linux => platform_impl::LinuxDns.capabilities(),
+            #[cfg(target_os = "windows")]
+            Self::Windows => crate::vortix_core::ports::dns::DnsPlatformCapabilities {
+                scoped_domains: false,
+            },
+            Self::Mock(_) => crate::vortix_core::ports::dns::DnsPlatformCapabilities {
+                scoped_domains: true,
+            },
+        }
+    }
+
+    fn apply(
+        &self,
+        desired: &crate::vortix_core::ports::dns::DnsPolicy,
+        previous_desired: Option<&crate::vortix_core::ports::dns::DnsPolicy>,
+        previous_effective: &crate::vortix_core::ports::dns::DnsEffectiveState,
+    ) -> crate::vortix_core::ports::dns::DnsEffectiveState {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Macos => {
+                platform_impl::MacDns.apply(desired, previous_desired, previous_effective)
+            }
+            #[cfg(target_os = "linux")]
+            Self::Linux => {
+                platform_impl::LinuxDns.apply(desired, previous_desired, previous_effective)
+            }
+            #[cfg(target_os = "windows")]
+            Self::Windows => crate::vortix_core::ports::dns::DnsEffectiveState {
+                requested_generation: desired.generation,
+                applied_generation: None,
+                status: crate::vortix_core::ports::dns::DnsEffectiveStatus::Degraded,
+                owned: previous_effective.owned.clone(),
+                errors: vec!["Windows DNS policy adapter is unavailable".into()],
+            },
+            Self::Mock(_) => crate::vortix_core::ports::dns::DnsEffectiveState {
+                requested_generation: desired.generation,
+                applied_generation: Some(desired.generation),
+                status: if desired.assignments.iter().all(|assignment| {
+                    matches!(
+                        assignment.scope,
+                        crate::vortix_core::ports::dns::DnsScope::Suppressed
+                    )
+                }) {
+                    crate::vortix_core::ports::dns::DnsEffectiveStatus::Released
+                } else {
+                    crate::vortix_core::ports::dns::DnsEffectiveStatus::Applied
+                },
+                owned: desired
+                    .assignments
+                    .iter()
+                    .filter(|assignment| {
+                        !matches!(
+                            assignment.scope,
+                            crate::vortix_core::ports::dns::DnsScope::Suppressed
+                        )
+                    })
+                    .map(
+                        |assignment| crate::vortix_core::ports::dns::DnsOwnedResource {
+                            generation: desired.generation,
+                            id: format!("mock:{}", assignment.interface),
+                            profile_id: assignment.profile_id.clone(),
+                            interface: assignment.interface.clone(),
+                        },
+                    )
+                    .collect(),
+                errors: Vec::new(),
+            },
+        }
+    }
+
+    fn verify(
+        &self,
+        desired: &crate::vortix_core::ports::dns::DnsPolicy,
+        effective: &crate::vortix_core::ports::dns::DnsEffectiveState,
+    ) -> Result<(), Vec<String>> {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Macos => platform_impl::MacDns.verify(desired, effective),
+            #[cfg(target_os = "linux")]
+            Self::Linux => platform_impl::LinuxDns.verify(desired, effective),
+            #[cfg(target_os = "windows")]
+            Self::Windows => Err(vec!["Windows DNS policy adapter is unavailable".into()]),
+            Self::Mock(_) => Ok(()),
         }
     }
 }
@@ -374,20 +469,35 @@ impl RouteTableKind {
         }
     }
 
-    /// Name of the interface carrying the current default route, if any
-    ///.
+    /// Tri-state default-route observation, preserving probe failures.
     #[must_use]
-    pub fn default_route_interface(&self) -> Option<String> {
+    pub fn default_route_observation(
+        &self,
+    ) -> crate::vortix_core::ports::route_table::DefaultRouteObservation {
         use crate::vortix_core::ports::route_table::RouteTable;
         match self {
             #[cfg(target_os = "macos")]
-            Self::Macos => platform_impl::MacRouteTable::default_route_interface(),
+            Self::Macos => platform_impl::MacRouteTable::default_route_observation(),
             #[cfg(target_os = "linux")]
-            Self::Linux => platform_impl::LinuxRouteTable::default_route_interface(),
+            Self::Linux => platform_impl::LinuxRouteTable::default_route_observation(),
             #[cfg(target_os = "windows")]
-            Self::Windows => platform_impl::WindowsRouteTable::default_route_interface(),
-            Self::Mock(m) => m.interface.clone(),
+            Self::Windows => platform_impl::WindowsRouteTable::default_route_observation(),
+            Self::Mock(m) if m.probe_failed => {
+                crate::vortix_core::ports::route_table::DefaultRouteObservation::ProbeFailed
+            }
+            Self::Mock(m) => m.interface.clone().map_or(
+                crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
+                crate::vortix_core::ports::route_table::DefaultRouteObservation::Interface,
+            ),
         }
+    }
+
+    /// Compatibility view for callers that do not need freshness semantics.
+    #[must_use]
+    pub fn default_route_interface(&self) -> Option<String> {
+        self.default_route_observation()
+            .interface()
+            .map(ToOwned::to_owned)
     }
 }
 
@@ -605,6 +715,7 @@ mod tests {
         let rt = RouteTableKind::Mock(MockRouteTable {
             gateway: Some("192.168.1.1".into()),
             interface: None,
+            probe_failed: false,
         });
         assert_eq!(rt.default_gateway(), Some("192.168.1.1".into()));
     }
@@ -614,6 +725,7 @@ mod tests {
         let rt = RouteTableKind::Mock(MockRouteTable {
             gateway: None,
             interface: Some("utun3".into()),
+            probe_failed: false,
         });
         assert_eq!(rt.default_route_interface(), Some("utun3".into()));
     }

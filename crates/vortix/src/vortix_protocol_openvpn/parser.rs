@@ -97,6 +97,10 @@ pub struct OvpnParsedProfile {
     pub redirect_gateway: bool,
     /// Explicit `route` directives.
     pub routes: Vec<OvpnRoute>,
+    /// Resolver addresses requested with `dhcp-option DNS`.
+    pub dns_servers: Vec<IpAddr>,
+    /// Suffixes requested with `dhcp-option DOMAIN` / `DOMAIN-SEARCH`.
+    pub dns_search_domains: Vec<String>,
     /// The raw config text — `openvpn` consumes the on-disk file, so this is
     /// retained for introspection only.
     pub raw: String,
@@ -105,6 +109,13 @@ pub struct OvpnParsedProfile {
 impl ParsedProfile for OvpnParsedProfile {
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn dns_request(&self) -> crate::vortix_core::ports::dns::DnsRequest {
+        crate::vortix_core::ports::dns::DnsRequest {
+            servers: self.dns_servers.clone(),
+            search_domains: self.dns_search_domains.clone(),
+        }
     }
 }
 
@@ -160,6 +171,22 @@ pub fn parse_ovpn_conf(text: &str) -> Result<OvpnParsedProfile, ParseError> {
                     warn!(line = %line, "ovpn: malformed route directive — skipping");
                 }
             }
+            "dhcp-option" => match tokens.next() {
+                Some(kind) if kind.eq_ignore_ascii_case("DNS") => {
+                    if let Some(server) = tokens.next().and_then(|value| value.parse().ok()) {
+                        profile.dns_servers.push(server);
+                    }
+                }
+                Some(kind)
+                    if kind.eq_ignore_ascii_case("DOMAIN")
+                        || kind.eq_ignore_ascii_case("DOMAIN-SEARCH") =>
+                {
+                    profile
+                        .dns_search_domains
+                        .extend(tokens.map(str::to_string));
+                }
+                _ => {}
+            },
             "static-challenge" => {
                 if let Some(sc) = parse_static_challenge(line) {
                     profile.static_challenge = Some(sc);
@@ -286,6 +313,22 @@ mod tests {
         let text = "client\nproto udp\nauth-user-pass\nremote example.com 1194\n";
         let p = parse_ovpn_conf(text).unwrap();
         assert!(p.interactive_auth);
+    }
+
+    #[test]
+    fn parses_dns_intent_without_applying_it() {
+        let p = parse_ovpn_conf(
+            "dhcp-option DNS 10.8.0.1\ndhcp-option DOMAIN corp.example\ndhcp-option DOMAIN-SEARCH dev.example lab.example\n",
+        )
+        .unwrap();
+        assert_eq!(
+            p.dns_servers,
+            vec!["10.8.0.1".parse::<std::net::IpAddr>().unwrap()]
+        );
+        assert_eq!(
+            p.dns_search_domains,
+            vec!["corp.example", "dev.example", "lab.example"]
+        );
     }
 
     #[test]

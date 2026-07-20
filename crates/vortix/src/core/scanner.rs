@@ -79,7 +79,7 @@ impl Default for ActiveSession {
 #[derive(Default, Debug)]
 pub struct ScannerResult {
     pub sessions: Vec<ActiveSession>,
-    pub default_route_interface: Option<String>,
+    pub default_route: crate::vortix_core::ports::route_table::DefaultRouteObservation,
 }
 
 /// Gather both active VPN sessions and the kernel default-route
@@ -91,9 +91,9 @@ pub struct ScannerResult {
 pub fn gather_system_state(profiles: &[VpnProfile]) -> ScannerResult {
     ScannerResult {
         sessions: get_active_profiles(profiles),
-        default_route_interface: crate::platform::current_platform()
+        default_route: crate::platform::current_platform()
             .route_table
-            .default_route_interface(),
+            .default_route_observation(),
     }
 }
 
@@ -691,7 +691,10 @@ mod tests {
             "default ScannerResult must have no sessions"
         );
         assert!(
-            result.default_route_interface.is_none(),
+            matches!(
+                result.default_route,
+                crate::vortix_core::ports::route_table::DefaultRouteObservation::ProbeFailed
+            ),
             "default ScannerResult must have no route interface"
         );
     }

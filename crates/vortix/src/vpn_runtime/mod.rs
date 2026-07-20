@@ -56,6 +56,9 @@ fn current_unix_ms() -> u64 {
 use crate::utils;
 use crate::vortix_core::profile::ProfileId;
 
+type DnsObservation = (String, String, bool);
+type DnsSchedule = (Vec<DnsObservation>, usize, Instant);
+
 /// Core VPN engine — all VPN-related state, no UI dependencies.
 ///
 /// Created by [`VpnRuntime::new`] for TUI use (spawns background workers) or
@@ -124,6 +127,20 @@ pub struct VpnRuntime {
     /// Bounds retries after a persistent platform mutation/read-back failure.
     killswitch_last_verification_attempt_ms: Option<u64>,
 
+    /// Full desired/effective resolver policy owned by the global network
+    /// policy path. Protocol adapters only populate `dns_requests`.
+    pub dns_policy: crate::vortix_core::ports::dns::DnsPolicyCoordinator,
+    dns_requests: HashMap<ProfileId, crate::vortix_core::ports::dns::DnsRequest>,
+    persist_dns_policy: bool,
+    dns_policy_worker: Option<crate::core::dns_policy::DnsPolicyWorker>,
+    dns_policy_revision: u64,
+    dns_policy_completed_revision: u64,
+    dns_last_scheduled: Option<DnsSchedule>,
+    /// Scanner-visible sessions for which this process has no protocol handle.
+    pub dns_external_sessions: usize,
+    /// False after a route probe failure; the prior registry primary is retained.
+    pub route_observation_fresh: bool,
+
     // === Connection Retry & Auto-Reconnect ===
     /// Per-profile retry / auto-reconnect bookkeeping.
     /// Replaces the single-slot retry triple. Each profile retries
@@ -190,6 +207,15 @@ impl VpnRuntime {
             killswitch_state: KillSwitchState::default(),
             killswitch_verification: None,
             killswitch_last_verification_attempt_ms: None,
+            dns_policy: crate::vortix_core::ports::dns::DnsPolicyCoordinator::default(),
+            dns_requests: HashMap::new(),
+            persist_dns_policy: true,
+            dns_policy_worker: None,
+            dns_policy_revision: 0,
+            dns_policy_completed_revision: 0,
+            dns_last_scheduled: None,
+            dns_external_sessions: 0,
+            route_observation_fresh: false,
 
             retry_state: HashMap::new(),
 
@@ -216,6 +242,9 @@ impl VpnRuntime {
             } else {
                 engine.killswitch_state = persisted.state;
             }
+        }
+        if let Some(persisted) = crate::core::dns_policy::load(&engine.config_dir) {
+            engine.dns_policy = persisted;
         }
 
         // Restore the cached real IPv4 / IPv6 / DNS — handles launch-with-VPN-up.
@@ -282,6 +311,15 @@ impl VpnRuntime {
             killswitch_state: KillSwitchState::default(),
             killswitch_verification: None,
             killswitch_last_verification_attempt_ms: None,
+            dns_policy: crate::vortix_core::ports::dns::DnsPolicyCoordinator::default(),
+            dns_requests: HashMap::new(),
+            persist_dns_policy: true,
+            dns_policy_worker: None,
+            dns_policy_revision: 0,
+            dns_policy_completed_revision: 0,
+            dns_last_scheduled: None,
+            dns_external_sessions: 0,
+            route_observation_fresh: false,
 
             retry_state: HashMap::new(),
 
@@ -304,6 +342,9 @@ impl VpnRuntime {
             } else {
                 engine.killswitch_state = persisted.state;
             }
+        }
+        if let Some(persisted) = crate::core::dns_policy::load(&engine.config_dir) {
+            engine.dns_policy = persisted;
         }
 
         engine.profiles = crate::vpn::load_profiles();
@@ -349,6 +390,15 @@ impl VpnRuntime {
             killswitch_state: KillSwitchState::Disabled,
             killswitch_verification: None,
             killswitch_last_verification_attempt_ms: None,
+            dns_policy: crate::vortix_core::ports::dns::DnsPolicyCoordinator::default(),
+            dns_requests: HashMap::new(),
+            persist_dns_policy: false,
+            dns_policy_worker: None,
+            dns_policy_revision: 0,
+            dns_policy_completed_revision: 0,
+            dns_last_scheduled: None,
+            dns_external_sessions: 0,
+            route_observation_fresh: false,
             retry_state: HashMap::new(),
             telemetry_rx: None,
             telemetry_nudge: None,
@@ -373,6 +423,21 @@ impl VpnRuntime {
             std::time::Duration::from_secs(constants::NETWORK_MONITOR_POLL_SECS),
         );
         self.netmon_rx = Some(netmon_rx);
+        self.start_dns_policy_worker();
+    }
+
+    fn start_dns_policy_worker(&mut self) {
+        if self.dns_policy_worker.is_none() {
+            self.dns_policy_worker = Some(crate::core::dns_policy::DnsPolicyWorker::spawn(
+                self.dns_policy.clone(),
+                self.cmd_tx.clone(),
+            ));
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_dns_policy_worker_for_test(&mut self) {
+        self.start_dns_policy_worker();
     }
 
     /// Wake the telemetry worker so it refreshes IP/ISP/latency immediately.
@@ -380,6 +445,180 @@ impl VpnRuntime {
         if let Some(nudge) = &self.telemetry_nudge {
             let _ = nudge.send(());
         }
+    }
+
+    pub fn remember_dns_request(
+        &mut self,
+        profile_name: &str,
+        request: crate::vortix_core::ports::dns::DnsRequest,
+    ) {
+        self.dns_requests
+            .insert(ProfileId::new(profile_name), request);
+    }
+
+    pub fn forget_dns_request(&mut self, profile_name: &str) {
+        self.dns_requests.remove(&ProfileId::new(profile_name));
+    }
+
+    #[must_use]
+    pub fn owns_dns_session(&self, profile_name: &str) -> bool {
+        self.dns_requests
+            .contains_key(&ProfileId::new(profile_name))
+    }
+
+    fn dns_intents(
+        &self,
+        observations: &[DnsObservation],
+    ) -> Vec<crate::vortix_core::ports::dns::DnsTunnelIntent> {
+        use crate::vortix_core::ports::dns::{DnsTunnelIntent, DnsTunnelRole};
+
+        observations
+            .iter()
+            .filter_map(|(name, interface, is_primary)| {
+                let profile_id = ProfileId::new(name);
+                // A scanner match or a persisted profile is not ownership.
+                // Only a live protocol-layer success in this process installs
+                // a request and authorizes platform DNS mutation.
+                let request = self.dns_requests.get(&profile_id)?.clone();
+                Some(DnsTunnelIntent {
+                    profile_id,
+                    interface: interface.clone(),
+                    role: if *is_primary {
+                        DnsTunnelRole::Primary
+                    } else {
+                        DnsTunnelRole::Secondary
+                    },
+                    request,
+                })
+            })
+            .collect()
+    }
+
+    /// Recompute one complete policy from kernel-derived roles. The tuple is
+    /// `(profile name, kernel interface, is primary)`.
+    pub fn reconcile_dns_observations(
+        &mut self,
+        observations: &[DnsObservation],
+    ) -> crate::vortix_core::ports::dns::DnsEffectiveState {
+        let intents = self.dns_intents(observations);
+        let _lock = match crate::core::dns_policy::acquire_policy_lock(&self.config_dir) {
+            Ok(lock) => lock,
+            Err(error) => {
+                self.dns_policy
+                    .invalidate_effective(format!("DNS policy lock failed: {error}"));
+                tracing::error!(target: "vortix::dns", error = %error, "DNS policy lock failed");
+                return self.dns_policy.effective().clone();
+            }
+        };
+        let adapter = &crate::platform::current_platform().dns;
+        let result = if self.persist_dns_policy {
+            let config_dir = self.config_dir.clone();
+            self.dns_policy
+                .reconcile_durable(&intents, adapter, |coordinator| {
+                    crate::core::dns_policy::save(&config_dir, coordinator)
+                })
+        } else {
+            self.dns_policy.reconcile(&intents, adapter)
+        };
+        if let Err(error) = result {
+            tracing::error!(target: "vortix::dns", error = %error, "DNS policy rejected");
+        }
+        self.dns_policy.effective().clone()
+    }
+
+    /// Queue a latest-wins reconciliation for the long-lived TUI. Returns
+    /// immediately; platform probes, lock waits and persistence happen on the
+    /// single DNS policy worker.
+    pub fn schedule_dns_observations(
+        &mut self,
+        observations: &[DnsObservation],
+        external_sessions: usize,
+    ) -> Result<u64, String> {
+        let same_topology = self.dns_last_scheduled.as_ref().is_some_and(
+            |(previous, previous_external, scheduled_at)| {
+                previous == observations
+                    && *previous_external == external_sessions
+                    && (self.dns_policy.effective().status
+                        == crate::vortix_core::ports::dns::DnsEffectiveStatus::Degraded
+                        || scheduled_at.elapsed() < std::time::Duration::from_secs(5))
+            },
+        );
+        if same_topology {
+            return Ok(self.dns_policy_revision);
+        }
+        let intents = self.dns_intents(observations);
+        self.dns_policy_revision = self.dns_policy_revision.saturating_add(1);
+        let revision = self.dns_policy_revision;
+        let Some(worker) = &self.dns_policy_worker else {
+            return Err("DNS policy worker is unavailable".into());
+        };
+        worker.schedule(crate::core::dns_policy::DnsPolicyWork {
+            revision,
+            intents,
+            external_sessions,
+            config_dir: self.config_dir.clone(),
+            persist: self.persist_dns_policy,
+        })?;
+        self.dns_last_scheduled = Some((observations.to_vec(), external_sessions, Instant::now()));
+        Ok(revision)
+    }
+
+    /// Accept a worker completion unless it predates one already applied.
+    pub fn complete_dns_policy(
+        &mut self,
+        revision: u64,
+        coordinator: crate::vortix_core::ports::dns::DnsPolicyCoordinator,
+        external_sessions: usize,
+    ) -> bool {
+        if revision < self.dns_policy_completed_revision {
+            return false;
+        }
+        self.dns_policy_completed_revision = revision;
+        self.dns_policy = coordinator;
+        self.dns_external_sessions = external_sessions;
+        true
+    }
+
+    /// Headless CLI reconciliation uses the same scanner route truth as the
+    /// kill-switch path; no CLI-local primary heuristic is retained.
+    pub fn reconcile_dns_from_scanner(
+        &mut self,
+    ) -> crate::vortix_core::ports::dns::DnsEffectiveState {
+        let scan = crate::core::scanner::gather_system_state(&self.profiles);
+        let route_interface = match scan.default_route {
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::Interface(
+                interface,
+            ) => Some(interface),
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute => None,
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::ProbeFailed => {
+                self.route_observation_fresh = false;
+                self.dns_policy.invalidate_effective(
+                    "default-route probe failed; retaining prior DNS topology",
+                );
+                return self.dns_policy.effective().clone();
+            }
+        };
+        self.route_observation_fresh = true;
+        let external_sessions = scan
+            .sessions
+            .iter()
+            .filter(|session| !self.owns_dns_session(&session.name))
+            .count();
+        let observations = scan
+            .sessions
+            .into_iter()
+            .map(|session| {
+                let primary = route_interface.as_deref() == Some(session.interface.as_str());
+                (session.name, session.interface, primary)
+            })
+            .collect::<Vec<_>>();
+        self.dns_external_sessions = external_sessions;
+        if external_sessions > 0 {
+            self.dns_policy
+                .invalidate_effective("external VPN session observed; DNS ownership is unknown");
+            return self.dns_policy.effective().clone();
+        }
+        self.reconcile_dns_observations(&observations)
     }
 
     /// Find a profile by name, returning its index.
@@ -459,7 +698,12 @@ impl VpnRuntime {
 
         if let Some(profile) = self.profiles.iter().find(|p| p.name == profile_name) {
             let iface = match profile.protocol {
-                Protocol::WireGuard => profile.config_path.to_string_lossy().into_owned(),
+                Protocol::WireGuard => profile
+                    .config_path
+                    .file_stem()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .unwrap_or("wg0")
+                    .to_string(),
                 Protocol::OpenVPN => {
                     format!("openvpn-{}", utils::sanitize_profile_name(profile_name))
                 }
@@ -477,6 +721,13 @@ impl VpnRuntime {
                     Protocol::WireGuard => TunnelKindTag::WireGuard,
                     Protocol::OpenVPN => TunnelKindTag::OpenVpn,
                 },
+                teardown_config: matches!(profile.protocol, Protocol::WireGuard).then(|| {
+                    crate::vortix_core::ports::tunnel::TunnelTeardownConfig {
+                        path: profile.config_path.clone(),
+                        managed: false,
+                    }
+                }),
+                dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
             };
 
             let config_dir =

@@ -145,7 +145,14 @@ pub enum Message {
     /// election reads the cached value handed in here.
     SyncSystemState {
         sessions: Vec<ActiveSession>,
-        default_route_interface: Option<String>,
+        default_route: crate::vortix_core::ports::route_table::DefaultRouteObservation,
+    },
+    /// Completion from the single bounded DNS policy worker.
+    DnsPolicyResult {
+        revision: u64,
+        coordinator: crate::vortix_core::ports::dns::DnsPolicyCoordinator,
+        external_sessions: usize,
+        error: Option<String>,
     },
     /// Periodic heartbeat tick
     Tick,
@@ -179,6 +186,9 @@ pub enum Message {
         /// Kernel PID from the protocol layer's `Tunnel::up()` result.
         /// Same flow rationale as `interface`.
         pid: Option<u32>,
+        /// Protocol-parsed/negotiated resolver intent. The receiving control
+        /// path recomputes the complete platform policy from all roles.
+        dns_request: crate::vortix_core::ports::dns::DnsRequest,
     },
     /// Result from the background disconnect thread
     DisconnectResult {
