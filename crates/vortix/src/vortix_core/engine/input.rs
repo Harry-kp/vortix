@@ -133,6 +133,11 @@ mod tests {
 
     use super::*;
 
+    fn pid(label: &str) -> ProfileId {
+        let digit = if label == "corp" { 'c' } else { 'd' };
+        ProfileId::parse(digit.to_string().repeat(ProfileId::HEX_LEN)).unwrap()
+    }
+
     fn roundtrip(cmd: &UserCommand) -> UserCommand {
         let json = serde_json::to_string(cmd).expect("serialize");
         serde_json::from_str::<UserCommand>(&json).expect("deserialize")
@@ -151,13 +156,13 @@ mod tests {
     #[test]
     fn disconnect_some_round_trips() {
         let cmd = UserCommand::Disconnect {
-            profile_id: Some(ProfileId::new("corp")),
+            profile_id: Some(pid("corp")),
         };
         let back = roundtrip(&cmd);
         match back {
             UserCommand::Disconnect {
                 profile_id: Some(id),
-            } => assert_eq!(id.as_str(), "corp"),
+            } => assert_eq!(id, pid("corp")),
             other => panic!("expected Disconnect{{Some(corp)}}, got {other:?}"),
         }
     }
@@ -174,12 +179,12 @@ mod tests {
     #[test]
     fn force_disconnect_some_round_trips() {
         let cmd = UserCommand::ForceDisconnect {
-            profile_id: Some(ProfileId::new("home")),
+            profile_id: Some(pid("home")),
         };
         match roundtrip(&cmd) {
             UserCommand::ForceDisconnect {
                 profile_id: Some(id),
-            } => assert_eq!(id.as_str(), "home"),
+            } => assert_eq!(id, pid("home")),
             other => panic!("expected ForceDisconnect{{Some}}, got {other:?}"),
         }
     }

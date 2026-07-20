@@ -16,6 +16,7 @@ use crate::cli::output::{
 };
 use crate::config::AppConfig;
 use crate::constants;
+use crate::vortix_config::profile_store::{FsProfileStore, ProfileStore, ProfileStoreError};
 use crate::vpn_runtime::VpnRuntime;
 
 /// Prompt for a 2FA code on the controlling tty with masked echo (each
@@ -496,14 +497,20 @@ fn handle_up(
     // auth file, run the connect, and restore plain text on every exit
     // path. Non-tty stdin and missing saved credentials produce
     // actionable non-zero exits.
-    let static_challenge_prompt = engine
+    let openvpn_identity = engine
         .profiles
         .iter()
         .find(|p| p.name == profile_name)
-        .and_then(|p| crate::utils::read_openvpn_static_challenge_prompt(&p.config_path));
-    let mut scrv1_restore_needed: Option<String> = None;
-    if let Some(prompt_text) = static_challenge_prompt {
-        let saved = crate::utils::read_openvpn_saved_auth(&profile_name);
+        .map(|p| {
+            (
+                p.id.clone(),
+                crate::utils::read_openvpn_static_challenge_prompt(&p.config_path),
+            )
+        });
+    let mut scrv1_restore_needed = None;
+    if let Some((profile_id, Some(prompt_text))) = openvpn_identity {
+        let saved =
+            crate::utils::read_openvpn_saved_auth_compat(profile_id.as_str(), &profile_name);
         let Some((user, pass)) = saved else {
             print_error_and_exit(
                 mode,
@@ -563,7 +570,7 @@ fn handle_up(
             }
         };
         if let Err(e) =
-            crate::utils::write_openvpn_scrv1_auth_file(&profile_name, &user, &pass, &otp)
+            crate::utils::write_openvpn_scrv1_auth_file(profile_id.as_str(), &user, &pass, &otp)
         {
             print_error_and_exit(
                 mode,
@@ -576,7 +583,7 @@ fn handle_up(
                 ExitCode::GeneralError,
             );
         }
-        scrv1_restore_needed = Some(profile_name.clone());
+        scrv1_restore_needed = Some(profile_id);
     }
 
     let result = engine.connect_and_wait(&profile_name, Duration::from_secs(timeout_secs));
@@ -584,8 +591,8 @@ fn handle_up(
     //. Belt-and-braces: if the connect
     // never reached spawn (early-failure path), clear the envelope
     // here so it doesn't linger.
-    if let Some(name) = scrv1_restore_needed {
-        crate::utils::delete_openvpn_scrv1_auth_file(&name);
+    if let Some(profile_id) = scrv1_restore_needed {
+        crate::utils::delete_openvpn_scrv1_auth_file(profile_id.as_str());
     }
 
     match result {
@@ -694,8 +701,6 @@ fn detect_conflict_for_cli(
         claims_default_route_v4, claims_default_route_v6, overlapping_cidrs,
     };
     use crate::vortix_core::engine::Conflict;
-    use crate::vortix_core::profile::ProfileId;
-
     let target_profile = engine.profiles.iter().find(|p| p.name == target_name)?;
     let target_allowed = extract_allowed_ips(target_profile.protocol, &target_profile.config_path);
     let target_claims_default =
@@ -718,14 +723,14 @@ fn detect_conflict_for_cli(
 
         if target_claims_default && active_claims_default {
             return Some(Conflict::DefaultRouteTakeover {
-                current: ProfileId::new(&session.name),
-                new: ProfileId::new(target_name),
+                current: active_profile.id.clone(),
+                new: target_profile.id.clone(),
             });
         }
         let overlap = overlapping_cidrs(&target_allowed, &active_allowed);
         if !overlap.is_empty() {
             return Some(Conflict::RouteOverlap {
-                with: ProfileId::new(&session.name),
+                with: active_profile.id.clone(),
                 overlapping_cidrs: overlap,
             });
         }
@@ -1020,7 +1025,7 @@ fn handle_status(
     // branch will pull richer data from the daemon directly.
     if let Some(socket) = daemon_socket {
         if let Ok(state) = crate::daemon::client::snapshot(&socket) {
-            overlay_daemon_state(&mut snap, &state);
+            overlay_daemon_state(&mut snap, &state, &engine.profiles);
         }
     }
 
@@ -1150,8 +1155,18 @@ fn handle_status(
 fn overlay_daemon_state(
     snap: &mut crate::vpn_runtime::connection::StatusSnapshot,
     state: &crate::vortix_core::engine::state::Connection,
+    profiles: &[crate::state::VpnProfile],
 ) {
     use crate::vortix_core::engine::state::Connection;
+    let display_name = |id: &crate::vortix_core::profile::ProfileId| {
+        profiles
+            .iter()
+            .find(|profile| &profile.id == id)
+            .map_or_else(
+                || format!("ProfileMissing:{id}"),
+                |profile| profile.name.clone(),
+            )
+    };
     match state {
         Connection::Disconnected { .. } => {
             snap.connection_state = "disconnected".into();
@@ -1163,17 +1178,17 @@ fn overlay_daemon_state(
         | Connection::Reconnecting { profile_id, .. }
         | Connection::AwaitingUserInput { profile_id, .. } => {
             snap.connection_state = "connecting".into();
-            snap.profile = Some(profile_id.as_str().to_string());
+            snap.profile = Some(display_name(profile_id));
         }
         Connection::Disconnecting { profile_id, .. } => {
             snap.connection_state = "disconnecting".into();
-            snap.profile = Some(profile_id.as_str().to_string());
+            snap.profile = Some(display_name(profile_id));
         }
         Connection::Connected {
             profile_id, since, ..
         } => {
             snap.connection_state = "connected".into();
-            snap.profile = Some(profile_id.as_str().to_string());
+            snap.profile = Some(display_name(profile_id));
             if let Ok(elapsed) = std::time::SystemTime::now().duration_since(*since) {
                 snap.uptime_secs = Some(elapsed.as_secs());
             }
@@ -1358,7 +1373,6 @@ fn handle_list(
     // stable profile_id + group label. The lookup is
     // O(N + M) which is fine for the typical handful of profiles.
     let sidecars_by_name: std::collections::HashMap<String, _> = {
-        use crate::vortix_config::profile_store::{FsProfileStore, ProfileStore};
         let store = FsProfileStore::new(config_dir.join(constants::PROFILES_DIR_NAME));
         store
             .list()
@@ -1503,6 +1517,7 @@ mod list_tests {
 
     fn profile(name: &str) -> VpnProfile {
         VpnProfile {
+            id: crate::vortix_core::profile::ProfileId::new(name),
             name: name.to_string(),
             protocol: Protocol::WireGuard,
             config_path: std::path::PathBuf::from(format!("/tmp/{name}.conf")),
@@ -1857,6 +1872,31 @@ struct DeleteData {
     deleted: String,
 }
 
+fn require_profile_inactive(
+    engine: &VpnRuntime,
+    active_name: &str,
+    requested_name: &str,
+    command: &str,
+    retry_command: &str,
+    mode: OutputMode,
+) {
+    let active = crate::core::scanner::get_active_profiles(&engine.profiles);
+    if active.iter().any(|session| session.name == active_name) {
+        print_error_and_exit(
+            mode,
+            command,
+            CliError {
+                code: "state_conflict",
+                message: format!(
+                    "Cannot {command} active profile '{requested_name}' — disconnect first"
+                ),
+                hint: Some(format!("sudo vortix down && {retry_command}")),
+            },
+            ExitCode::StateConflict,
+        );
+    }
+}
+
 fn handle_delete(
     profile_name: &str,
     yes: bool,
@@ -1864,7 +1904,7 @@ fn handle_delete(
     config_dir: &Path,
     mode: OutputMode,
 ) -> i32 {
-    let mut engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
+    let engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
 
     let Some(idx) = engine.find_profile(profile_name) else {
         print_error_and_exit(
@@ -1874,23 +1914,16 @@ fn handle_delete(
             ExitCode::NotFound,
         );
     };
+    let profile_id = engine.profiles[idx].id.clone();
 
-    // Check if profile is active
-    let active = crate::core::scanner::get_active_profiles(&engine.profiles);
-    if active.iter().any(|s| s.name == profile_name) {
-        print_error_and_exit(
-            mode,
-            "delete",
-            CliError {
-                code: "state_conflict",
-                message: format!(
-                    "Cannot delete active profile '{profile_name}' — disconnect first"
-                ),
-                hint: Some(format!("sudo vortix down && vortix delete {profile_name}")),
-            },
-            ExitCode::StateConflict,
-        );
-    }
+    require_profile_inactive(
+        &engine,
+        profile_name,
+        profile_name,
+        "delete",
+        &format!("vortix delete {profile_name}"),
+        mode,
+    );
 
     if !yes && !matches!(mode, OutputMode::Json | OutputMode::Quiet) {
         use std::io::Write;
@@ -1905,15 +1938,50 @@ fn handle_delete(
         }
     }
 
-    let config_path = engine.profiles[idx].config_path.clone();
-    let protocol = engine.profiles[idx].protocol;
-    engine.profiles.remove(idx);
-    if config_path.exists() {
-        let _ = std::fs::remove_file(&config_path);
+    // Profile mutation shares the same cross-process lifecycle authority as
+    // up/down. Reload under the lock and re-check kernel state immediately
+    // before deleting so a tunnel started while the prompt was open cannot
+    // lose its profile.
+    let _lifecycle_lock = acquire_lifecycle_lock_or_exit(mode, "delete");
+    let fresh_engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
+    let Some(fresh_profile) = fresh_engine
+        .profiles
+        .iter()
+        .find(|profile| profile.id == profile_id)
+    else {
+        print_error_and_exit(
+            mode,
+            "delete",
+            err_not_found(profile_name),
+            ExitCode::NotFound,
+        );
+    };
+    let fresh_name = fresh_profile.name.clone();
+    require_profile_inactive(
+        &fresh_engine,
+        &fresh_name,
+        profile_name,
+        "delete",
+        &format!("vortix delete {profile_name}"),
+        mode,
+    );
+
+    let store = FsProfileStore::new(config_dir.join(constants::PROFILES_DIR_NAME));
+    if let Err(error) = store.delete(&profile_id) {
+        print_error_and_exit(
+            mode,
+            "delete",
+            CliError {
+                code: "io_error",
+                message: format!("Delete failed: {error}"),
+                hint: None,
+            },
+            ExitCode::GeneralError,
+        );
     }
-    if matches!(protocol, crate::state::Protocol::OpenVPN) {
-        crate::utils::delete_openvpn_auth_file(profile_name);
-        crate::utils::cleanup_openvpn_run_files(profile_name);
+    if matches!(fresh_profile.protocol, crate::state::Protocol::OpenVPN) {
+        crate::utils::delete_openvpn_auth_file_compat(profile_id.as_str(), &fresh_name);
+        crate::utils::cleanup_openvpn_run_files_compat(profile_id.as_str(), &fresh_name);
     }
 
     let data = DeleteData {
@@ -1941,25 +2009,21 @@ fn handle_rename(
     config_dir: &Path,
     mode: OutputMode,
 ) -> i32 {
-    let mut engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
+    let engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
 
     let Some(idx) = engine.find_profile(old) else {
         print_error_and_exit(mode, "rename", err_not_found(old), ExitCode::NotFound);
     };
+    let profile_id = engine.profiles[idx].id.clone();
 
-    let active = crate::core::scanner::get_active_profiles(&engine.profiles);
-    if active.iter().any(|s| s.name == old) {
-        print_error_and_exit(
-            mode,
-            "rename",
-            CliError {
-                code: "state_conflict",
-                message: format!("Cannot rename active profile '{old}' — disconnect first"),
-                hint: Some(format!("sudo vortix down && vortix rename {old} {new}")),
-            },
-            ExitCode::StateConflict,
-        );
-    }
+    require_profile_inactive(
+        &engine,
+        old,
+        old,
+        "rename",
+        &format!("vortix rename {old} {new}"),
+        mode,
+    );
 
     let trimmed = new.trim();
     if trimmed.is_empty()
@@ -1979,15 +2043,44 @@ fn handle_rename(
             ExitCode::GeneralError,
         );
     }
+    // Preserve the established CLI contract: renaming a profile to its
+    // current display name is reported as the same collision as any other
+    // occupied target, even though the storage port treats it as idempotent.
+    if trimmed == old {
+        print_error_and_exit(
+            mode,
+            "rename",
+            CliError {
+                code: "already_exists",
+                message: format!("A profile named '{trimmed}' already exists"),
+                hint: None,
+            },
+            ExitCode::StateConflict,
+        );
+    }
 
-    let old_path = engine.profiles[idx].config_path.clone();
-    if let Some(parent) = old_path.parent() {
-        let ext = old_path
-            .extension()
-            .map_or("conf", |e| e.to_str().unwrap_or("conf"));
-        let new_file = parent.join(format!("{trimmed}.{ext}"));
+    let _lifecycle_lock = acquire_lifecycle_lock_or_exit(mode, "rename");
+    let fresh_engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
+    let Some(fresh_profile) = fresh_engine
+        .profiles
+        .iter()
+        .find(|profile| profile.id == profile_id)
+    else {
+        print_error_and_exit(mode, "rename", err_not_found(old), ExitCode::NotFound);
+    };
+    require_profile_inactive(
+        &fresh_engine,
+        &fresh_profile.name,
+        old,
+        "rename",
+        &format!("vortix rename {old} {new}"),
+        mode,
+    );
 
-        if new_file.exists() {
+    let store = FsProfileStore::new(config_dir.join(constants::PROFILES_DIR_NAME));
+    match store.rename(&profile_id, trimmed) {
+        Ok(_) => {}
+        Err(ProfileStoreError::NameCollision { .. }) => {
             print_error_and_exit(
                 mode,
                 "rename",
@@ -1999,34 +2092,16 @@ fn handle_rename(
                 ExitCode::StateConflict,
             );
         }
-
-        if let Err(e) = std::fs::rename(&old_path, &new_file) {
-            print_error_and_exit(
-                mode,
-                "rename",
-                CliError {
-                    code: "io_error",
-                    message: format!("Rename failed: {e}"),
-                    hint: None,
-                },
-                ExitCode::GeneralError,
-            );
-        }
-
-        engine.profiles[idx].name = trimmed.to_string();
-        engine.profiles[idx].config_path = new_file;
-        engine.save_metadata();
-    } else {
-        print_error_and_exit(
+        Err(error) => print_error_and_exit(
             mode,
             "rename",
             CliError {
-                code: "invalid_path",
-                message: "Cannot determine parent directory for profile config path".into(),
+                code: "io_error",
+                message: format!("Rename failed: {error}"),
                 hint: None,
             },
             ExitCode::GeneralError,
-        );
+        ),
     }
 
     let data = RenameData {

@@ -56,7 +56,7 @@ fn current_unix_ms() -> u64 {
 use crate::utils;
 use crate::vortix_core::profile::ProfileId;
 
-type DnsObservation = (String, String, bool);
+type DnsObservation = (ProfileId, String, bool);
 type DnsSchedule = (Vec<DnsObservation>, usize, Instant);
 
 /// Core VPN engine — all VPN-related state, no UI dependencies.
@@ -67,6 +67,9 @@ type DnsSchedule = (Vec<DnsObservation>, usize, Instant);
 pub struct VpnRuntime {
     // === VPN State ===
     pub profiles: Vec<VpnProfile>,
+    /// Debounced filesystem observation keyed by stable identity. It never
+    /// allocates or rekeys a profile when an editor moves a config.
+    pub profile_presence: HashMap<ProfileId, crate::state::ProfilePresenceTracker>,
     pub session_start: Option<Instant>,
 
     // === Network Telemetry ===
@@ -171,6 +174,7 @@ impl VpnRuntime {
 
         let mut engine = Self {
             profiles: Vec::new(),
+            profile_presence: HashMap::new(),
             session_start: None,
 
             down_history: VecDeque::from(vec![0.0; history_size]),
@@ -275,6 +279,7 @@ impl VpnRuntime {
 
         let mut engine = Self {
             profiles: Vec::new(),
+            profile_presence: HashMap::new(),
             session_start: None,
 
             down_history: VecDeque::from(vec![0.0; history_size]),
@@ -359,6 +364,7 @@ impl VpnRuntime {
         let history_size = constants::NETWORK_HISTORY_SIZE;
         Self {
             profiles: Vec::new(),
+            profile_presence: HashMap::new(),
             session_start: None,
             down_history: VecDeque::from(vec![0.0; history_size]),
             up_history: VecDeque::from(vec![0.0; history_size]),
@@ -452,18 +458,28 @@ impl VpnRuntime {
         profile_name: &str,
         request: crate::vortix_core::ports::dns::DnsRequest,
     ) {
-        self.dns_requests
-            .insert(ProfileId::new(profile_name), request);
+        if let Some(profile) = self
+            .profiles
+            .iter()
+            .find(|profile| profile.name == profile_name)
+        {
+            self.dns_requests.insert(profile.id.clone(), request);
+        }
     }
 
     pub fn forget_dns_request(&mut self, profile_name: &str) {
-        self.dns_requests.remove(&ProfileId::new(profile_name));
+        if let Some(profile) = self
+            .profiles
+            .iter()
+            .find(|profile| profile.name == profile_name)
+        {
+            self.dns_requests.remove(&profile.id);
+        }
     }
 
     #[must_use]
-    pub fn owns_dns_session(&self, profile_name: &str) -> bool {
-        self.dns_requests
-            .contains_key(&ProfileId::new(profile_name))
+    pub fn owns_dns_session(&self, profile_id: &ProfileId) -> bool {
+        self.dns_requests.contains_key(profile_id)
     }
 
     fn dns_intents(
@@ -474,14 +490,13 @@ impl VpnRuntime {
 
         observations
             .iter()
-            .filter_map(|(name, interface, is_primary)| {
-                let profile_id = ProfileId::new(name);
+            .filter_map(|(profile_id, interface, is_primary)| {
                 // A scanner match or a persisted profile is not ownership.
                 // Only a live protocol-layer success in this process installs
                 // a request and authorizes platform DNS mutation.
-                let request = self.dns_requests.get(&profile_id)?.clone();
+                let request = self.dns_requests.get(profile_id)?.clone();
                 Some(DnsTunnelIntent {
-                    profile_id,
+                    profile_id: profile_id.clone(),
                     interface: interface.clone(),
                     role: if *is_primary {
                         DnsTunnelRole::Primary
@@ -602,14 +617,25 @@ impl VpnRuntime {
         let external_sessions = scan
             .sessions
             .iter()
-            .filter(|session| !self.owns_dns_session(&session.name))
+            .filter(|session| {
+                self.profiles
+                    .iter()
+                    .find(|profile| profile.name == session.name)
+                    .is_none_or(|profile| !self.owns_dns_session(&profile.id))
+            })
             .count();
         let observations = scan
             .sessions
             .into_iter()
-            .map(|session| {
+            .filter_map(|session| {
+                let profile_id = self
+                    .profiles
+                    .iter()
+                    .find(|profile| profile.name == session.name)?
+                    .id
+                    .clone();
                 let primary = route_interface.as_deref() == Some(session.interface.as_str());
-                (session.name, session.interface, primary)
+                Some((profile_id, session.interface, primary))
             })
             .collect::<Vec<_>>();
         self.dns_external_sessions = external_sessions;
@@ -694,8 +720,6 @@ impl VpnRuntime {
     /// dispatch routes through the `TunnelKind` aggregate.
     pub fn cleanup_vpn_resources(&self, profile_name: &str) {
         use crate::vortix_core::ports::tunnel::{TunnelHandle, TunnelKindTag};
-        use crate::vortix_core::profile::ProfileId;
-
         if let Some(profile) = self.profiles.iter().find(|p| p.name == profile_name) {
             let iface = match profile.protocol {
                 Protocol::WireGuard => profile
@@ -709,11 +733,14 @@ impl VpnRuntime {
                 }
             };
             let pid = match profile.protocol {
-                Protocol::OpenVPN => utils::read_openvpn_pid(profile_name),
+                Protocol::OpenVPN => {
+                    utils::read_openvpn_pid_compat(profile.id.as_str(), profile_name)
+                }
                 Protocol::WireGuard => None,
             };
             let handle = TunnelHandle {
-                profile_id: ProfileId::new(profile_name),
+                profile_id: profile.id.clone(),
+                display_name: profile.name.clone(),
                 interface_name: iface,
                 pid,
                 started_at: std::time::SystemTime::now(),
@@ -736,7 +763,7 @@ impl VpnRuntime {
             let _ = tunnel.down(handle);
 
             if matches!(profile.protocol, Protocol::OpenVPN) {
-                utils::cleanup_openvpn_run_files(profile_name);
+                utils::cleanup_openvpn_run_files_compat(profile.id.as_str(), profile_name);
             }
         }
     }

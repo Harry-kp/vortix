@@ -133,6 +133,7 @@ fn outcome_to_handle(
     match outcome {
         ScriptedTunnelOutcome::DefaultSuccess => Ok(TunnelHandle {
             profile_id: profile.id.clone(),
+            display_name: profile.display_name.clone(),
             interface_name: "mock0".to_string(),
             pid: None,
             started_at: SystemTime::now(),
@@ -145,6 +146,7 @@ fn outcome_to_handle(
             pid,
         } => Ok(TunnelHandle {
             profile_id: profile.id.clone(),
+            display_name: profile.display_name.clone(),
             interface_name,
             pid,
             started_at: SystemTime::now(),

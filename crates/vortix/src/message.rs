@@ -162,8 +162,9 @@ pub enum Message {
     NetworkChanged,
     /// Retry a failed connection after exponential backoff delay
     RetryConnect {
-        /// Profile index to retry
-        idx: usize,
+        /// Stable profile identity to retry. The current catalog index is
+        /// resolved only when the delayed message is delivered.
+        profile_id: crate::vortix_core::profile::ProfileId,
         /// Which attempt this is (1-based)
         attempt: u32,
     },

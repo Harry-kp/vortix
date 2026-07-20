@@ -262,7 +262,7 @@ impl App {
                         .runtime
                         .profiles
                         .iter()
-                        .position(|p| p.name == to_profile_id.as_str());
+                        .position(|p| p.id == to_profile_id);
                     if let Some(i) = idx {
                         self.handle_message(Message::ConfirmDefaultRouteTakeover { idx: i });
                     } else {
@@ -282,7 +282,7 @@ impl App {
                             .runtime
                             .profiles
                             .iter()
-                            .position(|p| p.name == to_profile_id.as_str());
+                            .position(|p| p.id == to_profile_id);
                         if let Some(i) = idx {
                             self.handle_message(Message::SwitchExclusiveAndConnect { idx: i });
                         } else {
@@ -311,7 +311,7 @@ impl App {
                         .runtime
                         .profiles
                         .iter()
-                        .position(|p| p.name == to_profile_id.as_str());
+                        .position(|p| p.id == to_profile_id);
                     if let Some(i) = idx {
                         self.handle_message(Message::ConfirmRouteOverlap { idx: i });
                     } else {

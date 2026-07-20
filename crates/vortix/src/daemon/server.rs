@@ -370,6 +370,11 @@ mod tests {
     use crate::vortix_core::profile::ProfileId;
     use tokio::net::UnixStream as TokioUnixStream;
 
+    fn pid(label: &str) -> ProfileId {
+        let digit = if label == "corp" { 'c' } else { 'd' };
+        ProfileId::parse(digit.to_string().repeat(ProfileId::HEX_LEN)).unwrap()
+    }
+
     // ===== D1 dispatch tests =====
 
     #[tokio::test]
@@ -377,7 +382,7 @@ mod tests {
         let req = IpcRequest {
             id: 1,
             op: IpcOp::Execute(UserCommand::Connect {
-                profile_id: ProfileId::new("corp"),
+                profile_id: pid("corp"),
             }),
         };
         let resp = dispatch(req, None).await;
@@ -443,7 +448,7 @@ mod tests {
         let req = IpcRequest {
             id: 6,
             op: IpcOp::Execute(UserCommand::Connect {
-                profile_id: ProfileId::new("corp"),
+                profile_id: pid("corp"),
             }),
         };
         let resp = dispatch(req, Some(&handle)).await;
@@ -553,7 +558,7 @@ mod tests {
         let connect_req = IpcRequest {
             id: 10,
             op: IpcOp::Execute(UserCommand::Connect {
-                profile_id: ProfileId::new("corp"),
+                profile_id: pid("corp"),
             }),
         };
         let _ = dispatch(connect_req, Some(&handle)).await;
@@ -573,7 +578,7 @@ mod tests {
         let req = IpcRequest {
             id: 12,
             op: IpcOp::Execute(UserCommand::Disconnect {
-                profile_id: Some(ProfileId::new("corp")),
+                profile_id: Some(pid("corp")),
             }),
         };
         let resp = dispatch(req, Some(&handle)).await;
@@ -597,7 +602,7 @@ mod tests {
         let req = IpcRequest {
             id: 14,
             op: IpcOp::Execute(UserCommand::ForceDisconnect {
-                profile_id: Some(ProfileId::new("corp")),
+                profile_id: Some(pid("corp")),
             }),
         };
         let resp = dispatch(req, Some(&handle)).await;
@@ -634,8 +639,8 @@ mod tests {
         use crate::vortix_core::engine::registry::Conflict;
         let err = IpcError::Conflict {
             conflict: Conflict::DefaultRouteTakeover {
-                current: ProfileId::new("corp"),
-                new: ProfileId::new("home"),
+                current: pid("corp"),
+                new: pid("home"),
             },
         };
         let json = serde_json::to_string(&err).expect("serialize");
@@ -644,8 +649,8 @@ mod tests {
             IpcError::Conflict {
                 conflict: Conflict::DefaultRouteTakeover { current, new },
             } => {
-                assert_eq!(current.as_str(), "corp");
-                assert_eq!(new.as_str(), "home");
+                assert_eq!(current, pid("corp"));
+                assert_eq!(new, pid("home"));
             }
             other => panic!("expected Conflict round-trip, got {other:?}"),
         }

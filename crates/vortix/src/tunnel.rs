@@ -14,7 +14,7 @@ use crate::vortix_core::ports::tunnel::{
     ParseError, ParsedProfile, Tunnel, TunnelCapabilities, TunnelError, TunnelHandle,
     TunnelKindTag, TunnelStatus,
 };
-use crate::vortix_core::profile::{Profile, ProfileId, ProtocolKind};
+use crate::vortix_core::profile::{Profile, ProtocolKind};
 use crate::vortix_protocol_openvpn::OvpnTunnel;
 use crate::vortix_protocol_wireguard::WgTunnel;
 
@@ -137,7 +137,7 @@ pub fn tunnel_for(
 #[must_use]
 pub fn profile_view(p: &VpnProfile) -> Profile {
     Profile::new(
-        ProfileId::new(&p.name),
+        p.id.clone(),
         &p.name,
         match p.protocol {
             Protocol::WireGuard => ProtocolKind::WireGuard,

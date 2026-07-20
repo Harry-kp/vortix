@@ -136,8 +136,9 @@ fn main() -> Result<()> {
 
     // backfill profile sidecars for `.conf` / `.ovpn` files
     // imported before the sidecar scheme existed. Idempotent — no-ops once
-    // every profile has a `.meta.toml`. Failures are logged + non-fatal:
-    // startup MUST never abort because of migration trouble.
+    // every profile has a `.meta.toml`. Identity ambiguity is fatal before
+    // any lifecycle path starts; proceeding would let two names own one
+    // tunnel or invent a replacement ID after a transient file move.
     //
     // VORTIX_SKIP_MIGRATION=<anything> bypasses the startup backfill for
     // users who need to disable it (see docs/MIGRATION.md).
@@ -161,9 +162,9 @@ fn main() -> Result<()> {
                 }
             }
             Err(e) => {
-                eprintln!(
-                    "Warning: profile sidecar migration skipped — {e}. Startup continues; run `vortix migrate` once the issue is resolved."
-                );
+                return Err(color_eyre::eyre::eyre!(
+                    "profile identity migration refused startup: {e}. Repair the profile inventory or run `vortix migrate` before managing tunnels"
+                ));
             }
         }
     }

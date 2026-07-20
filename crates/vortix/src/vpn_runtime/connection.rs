@@ -61,7 +61,15 @@ impl VpnRuntime {
     fn validate_connect(
         &self,
         profile_name: &str,
-    ) -> Result<(String, Protocol, std::path::PathBuf), String> {
+    ) -> Result<
+        (
+            crate::vortix_core::profile::ProfileId,
+            String,
+            Protocol,
+            std::path::PathBuf,
+        ),
+        String,
+    > {
         let idx = self
             .find_profile(profile_name)
             .ok_or_else(|| format!("Profile '{profile_name}' not found"))?;
@@ -92,7 +100,7 @@ impl VpnRuntime {
 
         if matches!(protocol, Protocol::OpenVPN)
             && utils::openvpn_config_needs_auth(&config_path)
-            && utils::read_openvpn_saved_auth(&name).is_none()
+            && utils::read_openvpn_saved_auth_compat(profile.id.as_str(), &name).is_none()
         {
             return Err(format!(
                 "OpenVPN profile '{name}' requires auth credentials. \
@@ -100,7 +108,7 @@ impl VpnRuntime {
             ));
         }
 
-        Ok((name, protocol, config_path))
+        Ok((profile.id.clone(), name, protocol, config_path))
     }
 
     /// Blocking connect for CLI — waits until connected or timeout.
@@ -115,7 +123,7 @@ impl VpnRuntime {
         profile_name: &str,
         timeout: Duration,
     ) -> Result<ConnectResult, String> {
-        let (name, protocol, config_path) = self.validate_connect(profile_name)?;
+        let (profile_id, name, protocol, config_path) = self.validate_connect(profile_name)?;
 
         let cmd_tx = self.cmd_tx.clone();
         let connect_timeout_secs = timeout.as_secs();
@@ -124,6 +132,7 @@ impl VpnRuntime {
 
         std::thread::spawn(move || {
             Self::run_connect(
+                profile_id,
                 &name_for_thread,
                 protocol,
                 &config_path,
@@ -216,7 +225,8 @@ impl VpnRuntime {
             .iter()
             .find(|p| p.name == profile_name)
             .ok_or_else(|| format!("Profile '{profile_name}' not found in loaded profiles"))?;
-        let (protocol, config_path) = (prof.protocol, prof.config_path.clone());
+        let (profile_id, protocol, config_path) =
+            (prof.id.clone(), prof.protocol, prof.config_path.clone());
 
         let cmd_tx = self.cmd_tx.clone();
         let pn = profile_name.clone();
@@ -240,17 +250,17 @@ impl VpnRuntime {
             }
         });
         let pid_for_handle = match protocol {
-            Protocol::OpenVPN => utils::read_openvpn_pid(&pn).or(pid),
+            Protocol::OpenVPN => utils::read_openvpn_pid_compat(profile_id.as_str(), &pn).or(pid),
             Protocol::WireGuard => None,
         };
         let _ = force; // SIGTERM vs SIGKILL handled inside OvpnTunnel::down today.
 
         std::thread::spawn(move || {
             use crate::vortix_core::ports::tunnel::{TunnelHandle, TunnelKindTag};
-            use crate::vortix_core::profile::ProfileId;
-
+            let cleanup_profile_id = profile_id.clone();
             let handle = TunnelHandle {
-                profile_id: ProfileId::new(&pn),
+                profile_id,
+                display_name: pn.clone(),
                 interface_name: iface_for_handle,
                 pid: pid_for_handle,
                 started_at: std::time::SystemTime::now(),
@@ -269,7 +279,7 @@ impl VpnRuntime {
             match tunnel.down(handle) {
                 Ok(()) => {
                     if matches!(protocol, Protocol::OpenVPN) {
-                        utils::cleanup_openvpn_run_files(&pn);
+                        utils::cleanup_openvpn_run_files_compat(cleanup_profile_id.as_str(), &pn);
                     }
                     let _ = cmd_tx.send(Message::DisconnectResult {
                         profile: pn,
@@ -429,6 +439,7 @@ impl VpnRuntime {
     /// 200-line per-protocol match arm. Routing happens once in
     /// [`crate::tunnel::tunnel_for`].
     fn run_connect(
+        profile_id: crate::vortix_core::profile::ProfileId,
         name: &str,
         protocol: Protocol,
         config_path: &std::path::Path,
@@ -436,7 +447,7 @@ impl VpnRuntime {
         ovpn_verbosity: &str,
         cmd_tx: &std::sync::mpsc::Sender<Message>,
     ) {
-        use crate::vortix_core::profile::{ProfileId, ProtocolKind};
+        use crate::vortix_core::profile::ProtocolKind;
 
         let name = name.to_string();
         let cmd_tx = cmd_tx.clone();
@@ -444,7 +455,7 @@ impl VpnRuntime {
             crate::utils::get_app_config_dir().unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
 
         let profile = crate::vortix_core::profile::Profile::new(
-            ProfileId::new(&name),
+            profile_id,
             &name,
             match protocol {
                 Protocol::WireGuard => ProtocolKind::WireGuard,

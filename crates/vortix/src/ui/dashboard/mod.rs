@@ -374,7 +374,16 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
             ..
         } => {
             let max = 28;
-            let with_t = utils::truncate(with_profile_id.as_str(), max);
+            let with_name = app
+                .runtime
+                .profiles
+                .iter()
+                .find(|profile| profile.id == *with_profile_id)
+                .map_or_else(
+                    || format!("ProfileMissing:{with_profile_id}"),
+                    |profile| profile.name.clone(),
+                );
+            let with_t = utils::truncate(&with_name, max);
             let to_t = utils::truncate(to_name, max);
             // Display up to two overlapping CIDRs inline; the rest collapse
             // into a "+N more" tail so a wide AllowedIPs set doesn't blow

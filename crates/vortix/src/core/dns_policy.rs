@@ -643,11 +643,13 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let blocker = acquire_policy_lock(temp.path()).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
+        let external_profile =
+            crate::vortix_core::profile::ProfileId::parse("e".repeat(64)).unwrap();
         let mut persisted: DnsPolicyCoordinator = serde_json::from_value(serde_json::json!({
             "desired": {
                 "generation": 7,
                 "assignments": [{
-                    "profile_id": "external-vpn",
+                    "profile_id": external_profile,
                     "interface": "wg-old",
                     "servers": ["10.0.0.53"],
                     "search_domains": ["corp.example"],
@@ -749,12 +751,14 @@ mod tests {
         let path = temp.path().join(DNS_POLICY_STATE_FILE);
         let mut state: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let attacker_profile =
+            crate::vortix_core::profile::ProfileId::parse("a".repeat(64)).unwrap();
         state["coordinator"]["effective"]["applied_generation"] = serde_json::json!(7);
         state["coordinator"]["effective"]["status"] = serde_json::json!("Applied");
         state["coordinator"]["effective"]["owned"] = serde_json::json!([{
             "generation": 7,
             "id": "resolved:eth0",
-            "profile_id": "attacker-controlled",
+            "profile_id": attacker_profile,
             "interface": "eth0"
         }]);
         std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();

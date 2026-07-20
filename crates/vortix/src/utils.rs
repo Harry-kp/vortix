@@ -216,14 +216,33 @@ pub fn get_tmp_config_dir(session_id: &str) -> std::io::Result<std::path::PathBu
 /// daemon names, filenames, and process-match patterns.
 pub use crate::vortix_core::profile::sanitize_profile_name;
 
-/// Returns `(pid_path, log_path)` for the given profile name.
+fn validate_openvpn_artifact_key(key: &str) -> std::io::Result<()> {
+    if !key.is_empty()
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "OpenVPN artifact key contains unsafe characters",
+        ))
+    }
+}
+
+/// Returns `(pid_path, log_path)` for an opaque profile artifact key.
+///
+/// Production callers pass [`crate::vortix_core::profile::ProfileId::as_str`].
+/// Display names are accepted only by explicit legacy compatibility helpers.
 ///
 /// # Errors
 ///
 /// Returns an error if directory creation fails.
 pub fn get_openvpn_run_paths(
-    profile_name: &str,
+    profile_key: &str,
 ) -> std::io::Result<(std::path::PathBuf, std::path::PathBuf)> {
+    validate_openvpn_artifact_key(profile_key)?;
     let root = get_app_config_dir()?;
     let run_dir = root.join(crate::constants::OPENVPN_RUN_DIR);
 
@@ -231,10 +250,8 @@ pub fn get_openvpn_run_paths(
         create_user_dir(&run_dir)?;
     }
 
-    let safe_name = sanitize_profile_name(profile_name);
-
-    let pid_path = run_dir.join(format!("{safe_name}.pid"));
-    let log_path = run_dir.join(format!("{safe_name}.log"));
+    let pid_path = run_dir.join(format!("{profile_key}.pid"));
+    let log_path = run_dir.join(format!("{profile_key}.log"));
 
     Ok((pid_path, log_path))
 }
@@ -260,8 +277,8 @@ pub fn tracked_openvpn_pids() -> Vec<u32> {
 }
 
 /// Cleans up `OpenVPN` runtime files (pid, log) for a given profile.
-pub fn cleanup_openvpn_run_files(profile_name: &str) {
-    if let Ok((pid_path, log_path)) = get_openvpn_run_paths(profile_name) {
+pub fn cleanup_openvpn_run_files(profile_key: &str) {
+    if let Ok((pid_path, log_path)) = get_openvpn_run_paths(profile_key) {
         let _ = std::fs::remove_file(&pid_path);
         let _ = std::fs::remove_file(&log_path);
     }
@@ -269,10 +286,38 @@ pub fn cleanup_openvpn_run_files(profile_name: &str) {
 
 /// Reads the PID from an `OpenVPN` pid file.
 #[must_use]
-pub fn read_openvpn_pid(profile_name: &str) -> Option<u32> {
-    let (pid_path, _) = get_openvpn_run_paths(profile_name).ok()?;
+pub fn read_openvpn_pid(profile_key: &str) -> Option<u32> {
+    let (pid_path, _) = get_openvpn_run_paths(profile_key).ok()?;
     let content = std::fs::read_to_string(&pid_path).ok()?;
     content.trim().parse::<u32>().ok()
+}
+
+/// A legacy display name is safe to inspect only when it was already a valid
+/// artifact key. Names that required sanitizing are ambiguous (`a/b` and
+/// `a?b` both became `a_b`), so compatibility code must never touch them.
+fn unambiguous_legacy_openvpn_key(display_name: &str) -> Option<&str> {
+    (!display_name.is_empty() && sanitize_profile_name(display_name) == display_name)
+        .then_some(display_name)
+}
+
+/// Read a canonical ID-keyed PID, falling back to an unambiguous legacy
+/// name-keyed artifact created by an older Vortix release.
+#[must_use]
+pub fn read_openvpn_pid_compat(profile_id: &str, legacy_display_name: &str) -> Option<u32> {
+    read_openvpn_pid(profile_id)
+        .or_else(|| unambiguous_legacy_openvpn_key(legacy_display_name).and_then(read_openvpn_pid))
+}
+
+/// Remove canonical ID-keyed run files and, when collision-free, legacy
+/// name-keyed files. Ambiguous sanitized legacy names are deliberately left
+/// for manual cleanup rather than risking another profile's active daemon.
+pub fn cleanup_openvpn_run_files_compat(profile_id: &str, legacy_display_name: &str) {
+    cleanup_openvpn_run_files(profile_id);
+    if let Some(legacy_key) = unambiguous_legacy_openvpn_key(legacy_display_name) {
+        if legacy_key != profile_id {
+            cleanup_openvpn_run_files(legacy_key);
+        }
+    }
 }
 
 /// Returns the path for an `OpenVPN` auth credentials file.
@@ -282,7 +327,8 @@ pub fn read_openvpn_pid(profile_name: &str) -> Option<u32> {
 /// # Errors
 ///
 /// Returns an error if directory creation fails.
-pub fn get_openvpn_auth_path(profile_name: &str) -> std::io::Result<std::path::PathBuf> {
+pub fn get_openvpn_auth_path(profile_key: &str) -> std::io::Result<std::path::PathBuf> {
+    validate_openvpn_artifact_key(profile_key)?;
     let root = get_app_config_dir()?;
     let auth_dir = root.join(crate::constants::OPENVPN_AUTH_DIR);
 
@@ -290,8 +336,7 @@ pub fn get_openvpn_auth_path(profile_name: &str) -> std::io::Result<std::path::P
         create_user_dir(&auth_dir)?;
     }
 
-    let safe_name = sanitize_profile_name(profile_name);
-    Ok(auth_dir.join(format!("{safe_name}.auth")))
+    Ok(auth_dir.join(format!("{profile_key}.auth")))
 }
 
 /// Build the auth-file body. Line 1 is the username; line 2 is the
@@ -318,7 +363,8 @@ fn format_openvpn_auth_body(username: &str, password: &str) -> String {
 /// # Errors
 ///
 /// Returns an error if the auth directory cannot be resolved or created.
-pub fn get_openvpn_scrv1_auth_path(profile_name: &str) -> std::io::Result<std::path::PathBuf> {
+pub fn get_openvpn_scrv1_auth_path(profile_key: &str) -> std::io::Result<std::path::PathBuf> {
+    validate_openvpn_artifact_key(profile_key)?;
     let root = get_app_config_dir()?;
     let auth_dir = root.join(crate::constants::OPENVPN_AUTH_DIR);
 
@@ -326,8 +372,7 @@ pub fn get_openvpn_scrv1_auth_path(profile_name: &str) -> std::io::Result<std::p
         create_user_dir(&auth_dir)?;
     }
 
-    let safe_name = sanitize_profile_name(profile_name);
-    Ok(auth_dir.join(format!("{safe_name}.scrv1.auth")))
+    Ok(auth_dir.join(format!("{profile_key}.scrv1.auth")))
 }
 
 /// Write a transient 3-line credentials bundle for the `OpenVPN`
@@ -474,10 +519,33 @@ pub fn read_openvpn_saved_auth(profile_name: &str) -> Option<(String, String)> {
     Some((username, password))
 }
 
+/// Read canonical ID-keyed credentials with a collision-free compatibility
+/// fallback for legacy name-keyed files.
+#[must_use]
+pub fn read_openvpn_saved_auth_compat(
+    profile_id: &str,
+    legacy_display_name: &str,
+) -> Option<(String, String)> {
+    read_openvpn_saved_auth(profile_id).or_else(|| {
+        unambiguous_legacy_openvpn_key(legacy_display_name).and_then(read_openvpn_saved_auth)
+    })
+}
+
 /// Deletes the saved `OpenVPN` auth credentials file for a profile.
 pub fn delete_openvpn_auth_file(profile_name: &str) {
     if let Ok(auth_path) = get_openvpn_auth_path(profile_name) {
         let _ = std::fs::remove_file(&auth_path);
+    }
+}
+
+/// Delete canonical ID-keyed credentials and an unambiguous legacy file.
+pub fn delete_openvpn_auth_file_compat(profile_id: &str, legacy_display_name: &str) {
+    delete_openvpn_auth_file(profile_id);
+    if let Some(legacy_key) = unambiguous_legacy_openvpn_key(legacy_display_name) {
+        if legacy_key != profile_id {
+            delete_openvpn_auth_file(legacy_key);
+            delete_openvpn_scrv1_auth_file(legacy_key);
+        }
     }
 }
 
@@ -1444,6 +1512,29 @@ mod tests {
 
         delete_openvpn_auth_file(name);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn ambiguous_legacy_name_never_crosses_profile_identity() {
+        let _tmp = set_temp_config_dir();
+        let first = "1".repeat(crate::vortix_core::profile::ProfileId::HEX_LEN);
+        let second = "2".repeat(crate::vortix_core::profile::ProfileId::HEX_LEN);
+        let first_path = write_openvpn_auth_file(&first, "one", "secret").unwrap();
+        let second_path = write_openvpn_auth_file(&second, "two", "secret").unwrap();
+        let legacy_collision = write_openvpn_auth_file("team_a", "legacy", "secret").unwrap();
+
+        delete_openvpn_auth_file_compat(&first, "team/a");
+
+        assert!(!first_path.exists());
+        assert!(second_path.exists());
+        assert!(
+            legacy_collision.exists(),
+            "ambiguous legacy artifact must be left untouched"
+        );
+        assert_eq!(
+            read_openvpn_saved_auth_compat(&second, "team?a").map(|credentials| credentials.0),
+            Some("two".to_string())
+        );
     }
 
     #[cfg(unix)]

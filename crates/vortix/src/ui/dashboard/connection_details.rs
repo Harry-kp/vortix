@@ -3,7 +3,6 @@ use crate::state::{Protocol, QualityLevel};
 use crate::vortix_core::cidr::Cidr;
 use crate::vortix_core::engine::registry::{Role, TunnelSnapshot};
 use crate::vortix_core::engine::state::Connection;
-use crate::vortix_core::profile::ProfileId;
 use crate::{constants, theme, utils};
 use ratatui::{
     layout::Rect,
@@ -51,7 +50,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
         .profile_list_state
         .selected()
         .and_then(|idx| app.runtime.profiles.get(idx))
-        .map(|p| ProfileId::new(&p.name))
+        .map(|p| p.id.clone())
         .or_else(|| app.registry.primary().cloned());
 
     let focused_snap = focused_profile_id
@@ -89,11 +88,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
         // the runtime profile catalogue carries it — typically a delete-
         // mid-render race. Surface an explicit hint rather than a stale
         // placeholder so the user notices.
-        let in_catalogue = app
-            .runtime
-            .profiles
-            .iter()
-            .any(|p| ProfileId::new(&p.name) == *id);
+        let in_catalogue = app.runtime.profiles.iter().any(|p| p.id == *id);
         if !in_catalogue {
             render_profile_unavailable(frame, inner);
             return;
@@ -671,7 +666,7 @@ fn fwmark_warning_line(app: &App, snap: &TunnelSnapshot) -> Option<Line<'static>
         .runtime
         .profiles
         .iter()
-        .find(|p| ProfileId::new(&p.name) == snap.profile_id)?;
+        .find(|p| p.id == snap.profile_id)?;
     if profile.protocol != Protocol::WireGuard {
         return None;
     }
@@ -820,6 +815,7 @@ mod tests {
 
     fn make_profile(name: &str, config_path: PathBuf) -> VpnProfile {
         VpnProfile {
+            id: crate::vortix_core::profile::ProfileId::new(name),
             name: name.to_string(),
             protocol: Protocol::WireGuard,
             location: String::new(),

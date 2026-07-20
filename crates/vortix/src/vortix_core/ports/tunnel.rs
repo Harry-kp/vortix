@@ -47,6 +47,9 @@ pub struct TunnelTeardownConfig {
 #[derive(Debug, Clone)]
 pub struct TunnelHandle {
     pub profile_id: ProfileId,
+    /// Boundary label used only for user-visible output and legacy runtime
+    /// filenames; lifecycle ownership remains keyed by `profile_id`.
+    pub display_name: String,
     pub interface_name: String,
     /// Some(pid) when the impl manages a long-running daemon (e.g., `openvpn`);
     /// `None` when the kernel owns the lifecycle (e.g., kernel `WireGuard`).
