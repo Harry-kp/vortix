@@ -62,7 +62,7 @@ fi
 grep -qi 'protection is degraded' <<<"$human_error"
 
 json_error="$(ip netns exec "$NS_B" env PATH="$PATH_DIR" target/release/vortix --json killswitch vpn-only 2>/dev/null || true)"
-grep -q '"code":"protection_degraded"' <<<"$json_error"
+grep -Eq '"code"[[:space:]]*:[[:space:]]*"protection_degraded"' <<<"$json_error"
 if ip netns exec "$NS_B" env PATH="$PATH_DIR" target/release/vortix --quiet killswitch vpn-only; then
     echo "FAIL: quiet forced nft replacement returned success"
     exit 1
