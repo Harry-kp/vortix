@@ -155,17 +155,14 @@ impl RowSignal {
 fn signal_for(
     snapshots: &[TunnelSnapshot],
     primary: Option<&ProfileId>,
-    profile_name: &str,
+    profile_id: &ProfileId,
 ) -> RowSignal {
-    let Some(snap) = snapshots
-        .iter()
-        .find(|s| s.profile_id.as_str() == profile_name)
-    else {
+    let Some(snap) = snapshots.iter().find(|s| &s.profile_id == profile_id) else {
         return RowSignal::empty();
     };
     let badge = status_badge_for(snap);
     let accent = badge.map_or(Color::Reset, |(_, style)| style.fg.unwrap_or(Color::Reset));
-    let is_primary = primary.is_some_and(|p| p.as_str() == profile_name);
+    let is_primary = primary == Some(profile_id);
     RowSignal {
         badge,
         accent,
@@ -235,8 +232,15 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
         .enumerate()
         .map(|(idx, p)| {
             let is_selected = app.profile_list_state.selected() == Some(idx);
-            let signal = signal_for(&snapshots, primary.as_ref(), &p.name);
+            let signal = signal_for(&snapshots, primary.as_ref(), &p.id);
             let is_never_used = p.last_used.is_none();
+            let profile_missing = app
+                .runtime
+                .profile_presence
+                .get(&p.id)
+                .is_some_and(|tracker| {
+                    matches!(tracker.state(), crate::state::ProfilePresence::Missing)
+                });
 
             // Status cell: badge taxonomy + optional `!` risk annotation.
             // Numeric prefix (1..=9) remains the affordance for keyboard
@@ -244,10 +248,12 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
             // so the user sees state, not muscle-memory.
             let status_cell = if let Some((glyph, style)) = signal.badge {
                 let mut spans = vec![Span::styled(glyph, style)];
-                if signal.risk {
+                if signal.risk || profile_missing {
                     spans.push(Span::styled("!", Style::default().fg(theme::WARNING)));
                 }
                 Cell::from(Line::from(spans))
+            } else if profile_missing {
+                Cell::from(Span::styled("!", Style::default().fg(theme::WARNING)))
             } else if idx < 9 {
                 Cell::from(Span::styled(
                     format!("{}", idx + 1),
@@ -265,7 +271,9 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
             let primary_reserve = if show_primary_marker { 2 } else { 0 };
             let name_budget = name_cell_width.saturating_sub(primary_reserve).max(1);
 
-            let name_style = if is_selected && signal.is_active {
+            let name_style = if profile_missing {
+                Style::default().fg(theme::WARNING)
+            } else if is_selected && signal.is_active {
                 Style::default()
                     .fg(signal.accent)
                     .add_modifier(Modifier::BOLD)
@@ -392,6 +400,7 @@ mod tests {
 
     fn make_profile(name: &str) -> VpnProfile {
         VpnProfile {
+            id: crate::vortix_core::profile::ProfileId::new(name),
             name: name.to_string(),
             protocol: Protocol::WireGuard,
             location: String::new(),
@@ -505,7 +514,7 @@ mod tests {
     #[test]
     fn empty_registry_yields_no_active_marker_for_any_profile() {
         let snapshots: Vec<TunnelSnapshot> = Vec::new();
-        let sig = signal_for(&snapshots, None, "anything");
+        let sig = signal_for(&snapshots, None, &ProfileId::new("anything"));
         assert!(!sig.is_active);
         assert!(sig.badge.is_none());
         assert!(!sig.is_primary);
@@ -693,7 +702,11 @@ mod tests {
             },
         );
         let primary = ProfileId::new("corp");
-        let sig = signal_for(std::slice::from_ref(&snap), Some(&primary), "corp");
+        let sig = signal_for(
+            std::slice::from_ref(&snap),
+            Some(&primary),
+            &ProfileId::new("corp"),
+        );
         assert!(sig.is_primary);
         assert!(sig.is_active);
         assert_eq!(sig.badge.map(|(g, _)| g), Some("●"));
@@ -708,7 +721,11 @@ mod tests {
             },
         );
         let primary = ProfileId::new("corp");
-        let sig = signal_for(std::slice::from_ref(&snap), Some(&primary), "other");
+        let sig = signal_for(
+            std::slice::from_ref(&snap),
+            Some(&primary),
+            &ProfileId::new("other"),
+        );
         assert!(!sig.is_primary);
         assert!(!sig.is_active);
     }

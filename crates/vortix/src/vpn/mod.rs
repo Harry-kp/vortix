@@ -3,11 +3,14 @@
 use crate::constants;
 use crate::logger::{self, LogLevel};
 use crate::state::{Protocol, VpnProfile};
+use crate::vortix_config::profile_store::{FsProfileStore, ProfileStore};
+use crate::vortix_core::profile::{Profile, ProfileId, ProtocolKind};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 /// Import a VPN profile from a file
+#[allow(clippy::too_many_lines)] // validation, secure copy and identity-sidecar commit form one rollback sequence
 pub fn import_profile(path: &Path) -> Result<VpnProfile, String> {
     logger::log(
         LogLevel::Debug,
@@ -92,22 +95,20 @@ pub fn import_profile(path: &Path) -> Result<VpnProfile, String> {
         .unwrap_or(&name)
         .to_string();
 
-    fs::copy(path, &dest_path).map_err(|e| {
-        logger::log(
-            LogLevel::Error,
-            "IMPORT",
-            format!("Failed to copy profile: {e}"),
-        );
-        format!("Failed to copy profile: {e}")
-    })?;
-
-    // Secure the file (chmod 600)
-    let mut perms = fs::metadata(&dest_path)
-        .map_err(|e| format!("Failed to read metadata: {e}"))?
-        .permissions();
-    perms.set_mode(0o600);
-    fs::set_permissions(&dest_path, perms)
-        .map_err(|e| format!("Failed to set permissions: {e}"))?;
+    let id =
+        ProfileId::generate().map_err(|error| format!("Failed to create profile ID: {error}"))?;
+    let stored = Profile::new(
+        id.clone(),
+        &name,
+        match protocol {
+            Protocol::WireGuard => ProtocolKind::WireGuard,
+            Protocol::OpenVPN => ProtocolKind::OpenVpn,
+        },
+        dest_path.clone(),
+    );
+    FsProfileStore::new(profiles_dir)
+        .insert(&stored, content.as_bytes())
+        .map_err(|error| format!("Failed to persist profile identity: {error}"))?;
 
     logger::log(
         LogLevel::Info,
@@ -121,6 +122,7 @@ pub fn import_profile(path: &Path) -> Result<VpnProfile, String> {
     );
 
     Ok(VpnProfile {
+        id,
         name,
         protocol,
         location,
@@ -439,6 +441,7 @@ pub fn get_profiles_dir() -> Result<PathBuf, String> {
 
 /// Load all profiles from the profiles directory
 #[must_use]
+#[allow(clippy::too_many_lines)] // one catalog scan keeps sidecar validation and config parsing visibly paired
 pub fn load_profiles() -> Vec<VpnProfile> {
     logger::log(LogLevel::Debug, "PROFILE", "Loading profiles from disk...");
 
@@ -451,64 +454,74 @@ pub fn load_profiles() -> Vec<VpnProfile> {
         return Vec::new();
     };
 
+    let store = FsProfileStore::new(profiles_dir.clone());
+    let summaries = match store.list() {
+        Ok(summaries) => summaries,
+        Err(error) => {
+            logger::log(
+                LogLevel::Error,
+                "PROFILE",
+                format!("Profile identity validation failed: {error}"),
+            );
+            return Vec::new();
+        }
+    };
     let mut profiles = Vec::new();
     let mut errors = 0;
-
-    if let Ok(entries) = fs::read_dir(&profiles_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_file() {
-                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                if ext == "conf" || ext == "ovpn" {
-                    if let Ok(content) = fs::read_to_string(&path) {
-                        // Detect protocol: .ovpn is always OpenVPN, .conf uses content detection
-                        let protocol = if ext == "ovpn" {
-                            Protocol::OpenVPN
-                        } else {
-                            detect_protocol_from_content(&content)
-                        };
-
-                        let result = match protocol {
-                            Protocol::WireGuard => parse_wireguard_config(&content, &path),
-                            Protocol::OpenVPN => parse_openvpn_config(&content, &path),
-                        };
-
-                        match result {
-                            Ok((name, location)) => {
-                                // Enforce secure permissions (chmod 600) whenever loaded
-                                if let Ok(metadata) = fs::metadata(&path) {
-                                    let mut perms = metadata.permissions();
-                                    if perms.mode() & 0o777 != 0o600 {
-                                        perms.set_mode(0o600);
-                                        let _ = fs::set_permissions(&path, perms);
-                                        logger::log(
-                                            LogLevel::Debug,
-                                            "PROFILE",
-                                            format!("Fixed permissions for '{name}'"),
-                                        );
-                                    }
-                                }
-
-                                profiles.push(VpnProfile {
-                                    name,
-                                    protocol,
-                                    location,
-                                    config_path: path.clone(),
-                                    last_used: None,
-                                });
-                            }
-                            Err(e) => {
-                                logger::log(
-                                    LogLevel::Warning,
-                                    "PROFILE",
-                                    format!("Skipped {}: {}", path.display(), e),
-                                );
-                                errors += 1;
-                            }
+    for summary in summaries {
+        let protocol = match summary.protocol {
+            ProtocolKind::WireGuard => Protocol::WireGuard,
+            ProtocolKind::OpenVpn => Protocol::OpenVPN,
+        };
+        let path = profiles_dir.join(format!(
+            "{}.{}",
+            summary.display_name,
+            match protocol {
+                Protocol::WireGuard => "conf",
+                Protocol::OpenVPN => "ovpn",
+            }
+        ));
+        if let Ok(content) = fs::read_to_string(&path) {
+            let result = match protocol {
+                Protocol::WireGuard => parse_wireguard_config(&content, &path),
+                Protocol::OpenVPN => parse_openvpn_config(&content, &path),
+            };
+            match result {
+                Ok((name, location)) => {
+                    // Enforce secure permissions (chmod 600) whenever loaded
+                    if let Ok(metadata) = fs::metadata(&path) {
+                        let mut perms = metadata.permissions();
+                        if perms.mode() & 0o777 != 0o600 {
+                            perms.set_mode(0o600);
+                            let _ = fs::set_permissions(&path, perms);
+                            logger::log(
+                                LogLevel::Debug,
+                                "PROFILE",
+                                format!("Fixed permissions for '{name}'"),
+                            );
                         }
                     }
+
+                    profiles.push(VpnProfile {
+                        id: summary.id,
+                        name,
+                        protocol,
+                        location,
+                        config_path: path.clone(),
+                        last_used: None,
+                    });
+                }
+                Err(e) => {
+                    logger::log(
+                        LogLevel::Warning,
+                        "PROFILE",
+                        format!("Skipped {}: {}", path.display(), e),
+                    );
+                    errors += 1;
                 }
             }
+        } else {
+            errors += 1;
         }
     }
 

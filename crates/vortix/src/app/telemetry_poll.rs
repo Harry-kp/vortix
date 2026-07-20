@@ -74,7 +74,11 @@ impl App {
                                 "NET",
                                 format!(
                                     "Scanner still running for '{}' ({elapsed}s elapsed)",
-                                    profile_id.as_str()
+                                    self.runtime
+                                        .profiles
+                                        .iter()
+                                        .find(|profile| profile.id == profile_id)
+                                        .map_or("missing profile", |profile| profile.name.as_str())
                                 ),
                             );
                         }

@@ -131,7 +131,14 @@ pub fn get_active_profiles(profiles: &[VpnProfile]) -> Vec<ActiveSession> {
                 openvpn_pids
                     .iter()
                     .find(|(path, _)| path.contains(path_str) || path_str.contains(*path))
-                    .and_then(|(_, &pid)| check_openvpn_by_pid(pid, &profile.config_path))
+                    .and_then(|(_, &pid)| {
+                        check_openvpn_by_pid(
+                            pid,
+                            &profile.config_path,
+                            profile.id.as_str(),
+                            &profile.name,
+                        )
+                    })
             }
         };
 
@@ -276,7 +283,12 @@ fn check_wireguard_by_name(name: &str) -> Option<ActiveSession> {
 /// - MTU from the interface
 /// - Remote endpoint from process args or config file
 #[allow(clippy::too_many_lines)]
-fn check_openvpn_by_pid(pid: u32, config_path: &Path) -> Option<ActiveSession> {
+fn check_openvpn_by_pid(
+    pid: u32,
+    config_path: &Path,
+    profile_id: &str,
+    display_name: &str,
+) -> Option<ActiveSession> {
     let mut session = ActiveSession {
         pid: Some(pid),
         ..Default::default()
@@ -300,7 +312,7 @@ fn check_openvpn_by_pid(pid: u32, config_path: &Path) -> Option<ActiveSession> {
     //
     // Resolution order:
     //   Method 0 -- read the authoritative iface from vortix's own
-    //               openvpn log (`<run_dir>/<safe_name>.log`). Vortix
+    //               openvpn log (`<run_dir>/<profile_id>.log`). Vortix
     //               writes this on every `OvpnTunnel::up` call (CLI or
     //               TUI) and `parse_kernel_interface` extracts the iface
     //               from openvpn's log output. If the file exists and
@@ -331,19 +343,24 @@ fn check_openvpn_by_pid(pid: u32, config_path: &Path) -> Option<ActiveSession> {
     // scanner sees a live openvpn process, and instead of guessing the
     // iface via lsof (which fails on macOS for modern openvpn's utun
     // socket), we read the log vortix's own protocol layer wrote.
-    if let Some(profile_name) = config_path.file_stem().and_then(|s| s.to_str()) {
-        let safe_name = crate::utils::sanitize_profile_name(profile_name);
-        if let Ok(config_dir) = crate::utils::get_app_config_dir() {
-            let log_path = config_dir
-                .join(crate::constants::OPENVPN_RUN_DIR)
-                .join(format!("{safe_name}.log"));
-            if let Ok(log_text) = std::fs::read_to_string(&log_path) {
-                if let Some(iface) =
-                    crate::vortix_protocol_openvpn::tunnel::parse_kernel_interface(&log_text)
-                {
-                    detected_iface = iface;
-                    iface_authoritative = true;
-                }
+    if let Ok(config_dir) = crate::utils::get_app_config_dir() {
+        let run_dir = config_dir.join(crate::constants::OPENVPN_RUN_DIR);
+        let canonical_log = run_dir.join(format!("{profile_id}.log"));
+        let log_path = if canonical_log.exists() {
+            canonical_log
+        } else if !display_name.is_empty()
+            && crate::utils::sanitize_profile_name(display_name) == display_name
+        {
+            run_dir.join(format!("{display_name}.log"))
+        } else {
+            canonical_log
+        };
+        if let Ok(log_text) = std::fs::read_to_string(&log_path) {
+            if let Some(iface) =
+                crate::vortix_protocol_openvpn::tunnel::parse_kernel_interface(&log_text)
+            {
+                detected_iface = iface;
+                iface_authoritative = true;
             }
         }
     }

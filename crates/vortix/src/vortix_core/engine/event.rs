@@ -211,10 +211,15 @@ pub enum KillswitchEngageReason {
 mod tests {
     use super::*;
 
+    fn pid(label: &str) -> ProfileId {
+        let digit = if label == "corp" { 'c' } else { 'd' };
+        ProfileId::parse(digit.to_string().repeat(ProfileId::HEX_LEN)).unwrap()
+    }
+
     #[test]
     fn envelope_round_trips_through_json() {
         let env = EventEnvelope::new(EngineEvent::TunnelUp {
-            profile_id: ProfileId::new("corp"),
+            profile_id: pid("corp"),
             protocol: ProtocolKind::WireGuard,
             interface_name: "wg0".to_string(),
             pid: None,
@@ -244,8 +249,8 @@ mod tests {
     #[test]
     fn primary_tunnel_changed_round_trips_through_json() {
         let event = EngineEvent::PrimaryTunnelChanged {
-            from: Some(ProfileId::new("corp")),
-            to: Some(ProfileId::new("home")),
+            from: Some(pid("corp")),
+            to: Some(pid("home")),
             via_interface: Some("wg1".to_string()),
             reason: PrimaryChangeReason::PriorPrimaryDisconnected,
         };
@@ -261,8 +266,8 @@ mod tests {
                 via_interface,
                 reason,
             } => {
-                assert_eq!(from.as_ref().map(ProfileId::as_str), Some("corp"));
-                assert_eq!(to.as_ref().map(ProfileId::as_str), Some("home"));
+                assert_eq!(from, Some(pid("corp")));
+                assert_eq!(to, Some(pid("home")));
                 assert_eq!(via_interface.as_deref(), Some("wg1"));
                 assert_eq!(reason, PrimaryChangeReason::PriorPrimaryDisconnected);
             }
@@ -275,7 +280,7 @@ mod tests {
         // Initial-connect: `from` is `None`.
         let event = EngineEvent::PrimaryTunnelChanged {
             from: None,
-            to: Some(ProfileId::new("corp")),
+            to: Some(pid("corp")),
             via_interface: None,
             reason: PrimaryChangeReason::InitialConnect,
         };
@@ -289,7 +294,7 @@ mod tests {
                 reason,
             } => {
                 assert!(from.is_none());
-                assert_eq!(to.as_ref().map(ProfileId::as_str), Some("corp"));
+                assert_eq!(to, Some(pid("corp")));
                 assert!(via_interface.is_none());
                 assert_eq!(reason, PrimaryChangeReason::InitialConnect);
             }
@@ -300,7 +305,7 @@ mod tests {
     #[test]
     fn primary_change_reason_external_route_change_round_trips() {
         let event = EngineEvent::PrimaryTunnelChanged {
-            from: Some(ProfileId::new("corp")),
+            from: Some(pid("corp")),
             to: None,
             via_interface: None,
             reason: PrimaryChangeReason::ExternalRouteChange,
@@ -319,10 +324,10 @@ mod tests {
     fn connect_attempt_blocked_by_conflict_round_trips_default_route_takeover() {
         let event = EngineEvent::ConnectAttemptBlockedByConflict {
             conflict: Conflict::DefaultRouteTakeover {
-                current: ProfileId::new("corp"),
-                new: ProfileId::new("home"),
+                current: pid("corp"),
+                new: pid("home"),
             },
-            profile_id: ProfileId::new("home"),
+            profile_id: pid("home"),
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains(r#""kind":"connect_attempt_blocked_by_conflict""#));
@@ -333,11 +338,11 @@ mod tests {
                 conflict,
                 profile_id,
             } => {
-                assert_eq!(profile_id.as_str(), "home");
+                assert_eq!(profile_id, pid("home"));
                 match conflict {
                     Conflict::DefaultRouteTakeover { current, new } => {
-                        assert_eq!(current.as_str(), "corp");
-                        assert_eq!(new.as_str(), "home");
+                        assert_eq!(current, pid("corp"));
+                        assert_eq!(new, pid("home"));
                     }
                     _ => panic!("expected DefaultRouteTakeover"),
                 }
@@ -355,10 +360,10 @@ mod tests {
         let cidr = Cidr::new(IpAddr::from_str("10.0.0.0").unwrap(), 8).unwrap();
         let event = EngineEvent::ConnectAttemptBlockedByConflict {
             conflict: Conflict::RouteOverlap {
-                with: ProfileId::new("corp"),
+                with: pid("corp"),
                 overlapping_cidrs: vec![cidr],
             },
-            profile_id: ProfileId::new("home"),
+            profile_id: pid("home"),
         };
         let json = serde_json::to_string(&event).unwrap();
         let back: EngineEvent = serde_json::from_str(&json).unwrap();
@@ -371,8 +376,8 @@ mod tests {
                     },
                 profile_id,
             } => {
-                assert_eq!(with.as_str(), "corp");
-                assert_eq!(profile_id.as_str(), "home");
+                assert_eq!(with, pid("corp"));
+                assert_eq!(profile_id, pid("home"));
                 assert_eq!(overlapping_cidrs.len(), 1);
                 assert_eq!(overlapping_cidrs[0].prefix_len, 8);
             }
@@ -386,7 +391,7 @@ mod tests {
         // of any pre-existing variant. The serialized JSON for TunnelUp is
         // pinned exactly.
         let event = EngineEvent::TunnelUp {
-            profile_id: ProfileId::new("corp"),
+            profile_id: pid("corp"),
             protocol: ProtocolKind::WireGuard,
             interface_name: "wg0".to_string(),
             pid: Some(1234),
@@ -394,7 +399,10 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         assert_eq!(
             json,
-            r#"{"kind":"tunnel_up","profile_id":"corp","protocol":"WireGuard","interface_name":"wg0","pid":1234}"#
+            format!(
+                r#"{{"kind":"tunnel_up","profile_id":"{}","protocol":"WireGuard","interface_name":"wg0","pid":1234}}"#,
+                pid("corp")
+            )
         );
     }
 

@@ -403,6 +403,7 @@ impl Tunnel for WgTunnel {
 
         Ok(TunnelHandle {
             profile_id: profile.id.clone(),
+            display_name: profile.display_name.clone(),
             interface_name,
             pid: None,
             started_at: SystemTime::now(),
@@ -587,6 +588,7 @@ mod tests {
     ) -> TunnelHandle {
         TunnelHandle {
             profile_id: crate::vortix_core::profile::ProfileId::new("corp"),
+            display_name: "corp".to_string(),
             interface_name: interface_name.to_string(),
             pid: None,
             started_at: SystemTime::now(),

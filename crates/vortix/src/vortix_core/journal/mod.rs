@@ -292,7 +292,7 @@ mod tests {
 
     fn sample_event() -> EngineEvent {
         EngineEvent::TunnelUp {
-            profile_id: ProfileId::new("corp"),
+            profile_id: ProfileId::parse("c".repeat(ProfileId::HEX_LEN)).unwrap(),
             protocol: ProtocolKind::WireGuard,
             interface_name: "wg0".into(),
             pid: None,

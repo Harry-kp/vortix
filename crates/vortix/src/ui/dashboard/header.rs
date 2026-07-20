@@ -2,6 +2,7 @@ use crate::app::App;
 use crate::state::QualityLevel;
 use crate::vortix_core::engine::state::Connection;
 use crate::vortix_core::engine::TunnelSnapshot;
+use crate::vortix_core::profile::ProfileId;
 use crate::{constants, theme, utils};
 use ratatui::{
     layout::Rect,
@@ -11,6 +12,14 @@ use ratatui::{
     Frame,
 };
 use unicode_width::UnicodeWidthStr;
+
+fn profile_display_name(app: &App, id: &ProfileId) -> String {
+    app.runtime
+        .profiles
+        .iter()
+        .find(|profile| &profile.id == id)
+        .map_or_else(|| format!("missing:{id}"), |profile| profile.name.clone())
+}
 
 /// Render the header bar from the registry's three states.
 ///
@@ -60,7 +69,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     let Some(primary_snap) = primary_snap else {
         let snapshots = app.registry.snapshot_all();
         let mut line = render_no_exit_line(app, ks_indicator.clone());
-        line = append_tunnels_strip(line, &snapshots, primary.as_ref(), area.width);
+        line = append_tunnels_strip(Some(app), line, &snapshots, primary.as_ref(), area.width);
         frame.render_widget(Paragraph::new(line), area);
         return;
     };
@@ -71,7 +80,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
 
     if tunnel_count >= 2 {
         let snapshots = app.registry.snapshot_all();
-        line = append_tunnels_strip(line, &snapshots, primary.as_ref(), area.width);
+        line = append_tunnels_strip(Some(app), line, &snapshots, primary.as_ref(), area.width);
     }
 
     frame.render_widget(Paragraph::new(line), area);
@@ -151,7 +160,7 @@ fn render_primary_line(
         Connection::Connecting { started_at, .. }
         | Connection::Disconnecting { started_at, .. }
         | Connection::Reconnecting { started_at, .. } => {
-            let profile_name = primary_snap.profile_id.as_str();
+            let profile_name = profile_display_name(app, &primary_snap.profile_id);
             let elapsed = started_at.elapsed().map_or(0, |d| d.as_secs());
             let spinner_frames = ['◐', '◓', '◑', '◒'];
             #[allow(clippy::cast_possible_truncation)]
@@ -191,7 +200,7 @@ fn render_primary_line(
             ks_indicator,
         ]),
         Connection::Connected { details, since, .. } => {
-            let profile_name = primary_snap.profile_id.as_str();
+            let profile_name = profile_display_name(app, &primary_snap.profile_id);
 
             let elapsed = since.elapsed().map_or(0, |d| d.as_secs());
             let uptime = if elapsed >= 86400 {
@@ -334,6 +343,7 @@ fn line_display_width(line: &Line<'_>) -> usize {
 /// The primary is rendered first in stable order so the user always sees
 /// "which tunnel owns the default route" at position 0.
 fn append_tunnels_strip(
+    app: Option<&App>,
     mut line: Line<'static>,
     snapshots: &[TunnelSnapshot],
     primary: Option<&crate::vortix_core::profile::ProfileId>,
@@ -373,7 +383,7 @@ fn append_tunnels_strip(
     let sep_w = separator.width();
 
     // ── Tier 1: full names.
-    let full_inner = build_strip_inner(&visible);
+    let full_inner = build_strip_inner(&visible, app);
     let full_w = sep_w + "Tunnels: [".width() + full_inner.0 + "]".width();
     if full_w <= budget {
         push_strip(&mut line, /* label */ true, &full_inner.1);
@@ -383,6 +393,7 @@ fn append_tunnels_strip(
     // ── Tier 2: 1-char names + `+N` overflow tail.
     if let Some(narrow) = build_narrow_strip(
         &visible,
+        app,
         budget.saturating_sub(sep_w + "Tunnels: [".width() + "]".width()),
     ) {
         push_strip(&mut line, /* label */ true, &narrow);
@@ -406,6 +417,7 @@ fn append_tunnels_strip(
 /// committing to this density.
 fn build_strip_inner(
     visible: &[(&TunnelSnapshot, &'static str, Color)],
+    app: Option<&App>,
 ) -> (usize, Vec<Span<'static>>) {
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(visible.len() * 3);
     let mut width = 0usize;
@@ -422,7 +434,10 @@ fn build_strip_inner(
             Style::default().fg(*color),
         ));
         width += badge.width();
-        let name = snap.profile_id.as_str().to_string();
+        let name = app.map_or_else(
+            || snap.profile_id.as_str().to_string(),
+            |app| profile_display_name(app, &snap.profile_id),
+        );
         if !name.is_empty() {
             width += name.width();
             spans.push(Span::styled(name, Style::default().fg(theme::TEXT_PRIMARY)));
@@ -435,6 +450,7 @@ fn build_strip_inner(
 /// summarising the drop as ` +N`.
 fn build_narrow_strip(
     visible: &[(&TunnelSnapshot, &'static str, Color)],
+    app: Option<&App>,
     inner_budget: usize,
 ) -> Option<Vec<Span<'static>>> {
     // Greedy fit: include as many tunnels as possible at 1-char-name density.
@@ -446,7 +462,10 @@ fn build_narrow_strip(
 
     for (idx, (snap, badge, color)) in visible.iter().enumerate() {
         // Cost of this tunnel: optional separator + badge + 1-char name.
-        let name = snap.profile_id.as_str();
+        let name = app.map_or_else(
+            || snap.profile_id.as_str().to_string(),
+            |app| profile_display_name(app, &snap.profile_id),
+        );
         let first_char: String = name.chars().take(1).collect();
         let sep_cost = usize::from(idx != 0);
         let cost = sep_cost + badge.width() + first_char.width();
@@ -794,7 +813,7 @@ mod tests {
             .iter()
             .filter_map(|s| strip_badge(&s.state).map(|(g, c)| (s, g, c)))
             .collect();
-        let (width, spans) = build_strip_inner(&visible);
+        let (width, spans) = build_strip_inner(&visible, None);
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("corp"), "expected full name 'corp': {text}");
         assert!(text.contains("lab"), "expected 'lab': {text}");
@@ -810,7 +829,7 @@ mod tests {
             .filter_map(|s| strip_badge(&s.state).map(|(g, c)| (s, g, c)))
             .collect();
         // Budget tight enough that only ~2 fit.
-        let spans = build_narrow_strip(&visible, 10).expect("some fit");
+        let spans = build_narrow_strip(&visible, None, 10).expect("some fit");
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains('+'), "expected overflow marker: {text}");
     }
@@ -843,7 +862,7 @@ mod tests {
         let base = Line::from(vec![Span::raw("XXX")]);
         let snaps = vec![connected("a"), connected("b")];
         let pid = ProfileId::new("a");
-        let out = append_tunnels_strip(base.clone(), &snaps, Some(&pid), 5);
+        let out = append_tunnels_strip(None, base.clone(), &snaps, Some(&pid), 5);
         // No new spans appended.
         assert_eq!(
             out.spans.len(),
@@ -857,7 +876,7 @@ mod tests {
         let base = Line::from(vec![Span::raw("PRIMARY-LINE")]);
         let snaps = vec![connected("alpha"), connected("bravo")];
         let pid = ProfileId::new("alpha");
-        let out = append_tunnels_strip(base, &snaps, Some(&pid), 200);
+        let out = append_tunnels_strip(None, base, &snaps, Some(&pid), 200);
         let text: String = out.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("Tunnels:"), "expected label, got:\n{text}");
         assert!(text.contains("alpha"), "expected alpha name, got:\n{text}");
@@ -870,7 +889,13 @@ mod tests {
         disc.state = Connection::Disconnected { last_failure: None };
         let snaps = vec![connected("alpha"), disc];
         let pid = ProfileId::new("alpha");
-        let out = append_tunnels_strip(Line::from(vec![Span::raw("X")]), &snaps, Some(&pid), 200);
+        let out = append_tunnels_strip(
+            None,
+            Line::from(vec![Span::raw("X")]),
+            &snaps,
+            Some(&pid),
+            200,
+        );
         let text: String = out.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("alpha"), "alpha kept: {text}");
         assert!(!text.contains("ghost"), "ghost dropped: {text}");

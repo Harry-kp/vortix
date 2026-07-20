@@ -354,6 +354,7 @@ fn set_connecting(app: &mut App, name: &str) {
 fn add_profiles(app: &mut App, names: &[&str]) {
     for name in names {
         app.runtime.profiles.push(VpnProfile {
+            id: crate::vortix_core::profile::ProfileId::new(*name),
             name: (*name).to_string(),
             protocol: Protocol::WireGuard,
             config_path: std::path::PathBuf::from(format!("/tmp/{name}.conf")),
@@ -1096,6 +1097,7 @@ fn add_openvpn_profiles_with_auth(app: &mut App, names: &[&str], dir: &std::path
         )
         .unwrap();
         app.runtime.profiles.push(VpnProfile {
+            id: crate::vortix_core::profile::ProfileId::new(*name),
             name: (*name).to_string(),
             protocol: Protocol::OpenVPN,
             config_path,
@@ -1121,6 +1123,7 @@ fn add_openvpn_profiles_with_static_challenge(
         )
         .unwrap();
         app.runtime.profiles.push(VpnProfile {
+            id: crate::vortix_core::profile::ProfileId::new(*name),
             name: (*name).to_string(),
             protocol: Protocol::OpenVPN,
             config_path,
@@ -1141,6 +1144,7 @@ fn add_openvpn_profiles_no_auth(app: &mut App, names: &[&str], dir: &std::path::
         )
         .unwrap();
         app.runtime.profiles.push(VpnProfile {
+            id: crate::vortix_core::profile::ProfileId::new(*name),
             name: (*name).to_string(),
             protocol: Protocol::OpenVPN,
             config_path,
@@ -1579,10 +1583,32 @@ fn test_auth_delete_profile_cleans_auth_file() {
         .prefix("vortix_auth_")
         .tempdir()
         .unwrap();
-    add_openvpn_profiles_with_auth(&mut app, &["del-vpn"], tmp.path());
+    let stable_id = crate::vortix_core::profile::ProfileId::parse("11".repeat(32)).unwrap();
+    let config_path = tmp.path().join("del-vpn.ovpn");
+    let stored = crate::vortix_core::profile::Profile::new(
+        stable_id.clone(),
+        "del-vpn",
+        crate::vortix_core::profile::ProtocolKind::OpenVpn,
+        config_path.clone(),
+    );
+    crate::vortix_config::profile_store::ProfileStore::insert(
+        &crate::vortix_config::profile_store::FsProfileStore::new(tmp.path().to_path_buf()),
+        &stored,
+        b"client\nremote example.com 1194\nauth-user-pass\ndev tun\nproto udp\n",
+    )
+    .unwrap();
+    app.runtime.profiles.push(VpnProfile {
+        id: stable_id.clone(),
+        name: "del-vpn".to_string(),
+        protocol: Protocol::OpenVPN,
+        config_path,
+        location: "Test".to_string(),
+        last_used: None,
+    });
     app.profile_list_state.select(Some(0));
 
-    let auth_path = crate::utils::write_openvpn_auth_file("del-vpn", "user", "pass").unwrap();
+    let auth_path =
+        crate::utils::write_openvpn_auth_file(stable_id.as_str(), "user", "pass").unwrap();
     assert!(auth_path.exists());
 
     app.confirm_delete(0);
@@ -1863,6 +1889,7 @@ fn test_open_config_caches_content_and_close_clears() {
     let tmp = tempfile::Builder::new().suffix(".conf").tempfile().unwrap();
     std::fs::write(tmp.path(), "[Interface]\nAddress = 10.0.0.1/24").unwrap();
     app.runtime.profiles.push(VpnProfile {
+        id: crate::vortix_core::profile::ProfileId::new("test-vpn"),
         name: "test-vpn".to_string(),
         protocol: Protocol::WireGuard,
         config_path: tmp.path().to_path_buf(),
@@ -2326,8 +2353,21 @@ fn test_rename_updates_last_connected_profile() {
     let mut app = test_app();
     let dir = tempfile::tempdir().unwrap();
     let conf_path = dir.path().join("old-name.conf");
-    std::fs::write(&conf_path, "dummy").unwrap();
+    let stable_id = crate::vortix_core::profile::ProfileId::parse("22".repeat(32)).unwrap();
+    let stored = crate::vortix_core::profile::Profile::new(
+        stable_id.clone(),
+        "old-name",
+        crate::vortix_core::profile::ProtocolKind::WireGuard,
+        conf_path.clone(),
+    );
+    crate::vortix_config::profile_store::ProfileStore::insert(
+        &crate::vortix_config::profile_store::FsProfileStore::new(dir.path().to_path_buf()),
+        &stored,
+        b"dummy",
+    )
+    .unwrap();
     app.runtime.profiles.push(VpnProfile {
+        id: stable_id.clone(),
         name: "old-name".to_string(),
         protocol: Protocol::WireGuard,
         config_path: conf_path,
@@ -2357,6 +2397,7 @@ fn test_rename_on_active_profile_is_refused_at_overlay() {
     let conf_path = dir.path().join("active-vpn.conf");
     std::fs::write(&conf_path, "dummy").unwrap();
     app.runtime.profiles.push(VpnProfile {
+        id: crate::vortix_core::profile::ProfileId::new("active-vpn"),
         name: "active-vpn".to_string(),
         protocol: Protocol::WireGuard,
         config_path: conf_path,
@@ -2371,6 +2412,46 @@ fn test_rename_on_active_profile_is_refused_at_overlay() {
         !matches!(app.input_mode, InputMode::Rename { .. }),
         "Rename overlay must refuse to open for an active profile"
     );
+}
+
+#[test]
+fn rename_rechecks_stable_identity_after_overlay_opens() {
+    let mut app = test_app();
+    let dir = tempfile::tempdir().unwrap();
+    let profile_id = crate::vortix_core::profile::ProfileId::parse("33".repeat(32)).unwrap();
+    let config_path = dir.path().join("race-vpn.conf");
+    let stored = crate::vortix_core::profile::Profile::new(
+        profile_id.clone(),
+        "race-vpn",
+        crate::vortix_core::profile::ProtocolKind::WireGuard,
+        config_path.clone(),
+    );
+    crate::vortix_config::profile_store::ProfileStore::insert(
+        &crate::vortix_config::profile_store::FsProfileStore::new(dir.path().to_path_buf()),
+        &stored,
+        b"[Interface]\n",
+    )
+    .unwrap();
+    app.runtime.profiles.push(VpnProfile {
+        id: profile_id,
+        name: "race-vpn".to_string(),
+        protocol: Protocol::WireGuard,
+        config_path: config_path.clone(),
+        location: String::new(),
+        last_used: None,
+    });
+    app.profile_list_state.select(Some(0));
+
+    app.handle_message(Message::OpenRename);
+    assert!(matches!(app.input_mode, InputMode::Rename { .. }));
+
+    // A connection starts while the rename dialog remains open.
+    set_connected(&mut app, "race-vpn");
+    app.rename_profile(0, "must-not-rename");
+
+    assert!(config_path.exists());
+    assert!(!dir.path().join("must-not-rename.conf").exists());
+    assert_eq!(app.runtime.profiles[0].name, "race-vpn");
 }
 
 #[test]
@@ -2950,6 +3031,39 @@ fn u19_confirm_disconnect_all_closes_overlay() {
 }
 
 #[test]
+fn delayed_retry_follows_stable_id_across_reorder_and_rename() {
+    use crate::vortix_core::profile::ProfileId;
+
+    let mut app = test_app();
+    add_profiles(&mut app, &["first", "target"]);
+    let target_id = ProfileId::parse("44".repeat(32)).unwrap();
+    app.runtime.profiles[1].id = target_id.clone();
+    app.runtime.retry_state.insert(
+        target_id.clone(),
+        crate::state::RetryState {
+            profile_id: target_id.clone(),
+            attempt: 1,
+            auto_reconnect: false,
+        },
+    );
+
+    // Mutations after scheduling must not redirect the delayed retry to the
+    // profile that happens to occupy the old index.
+    app.runtime.profiles[1].name = "renamed-target".to_string();
+    app.runtime.profiles.swap(0, 1);
+    app.handle_message(Message::RetryConnect {
+        profile_id: target_id,
+        attempt: 1,
+    });
+
+    assert!(crate::logger::get_logs().iter().any(|entry| {
+        entry
+            .message
+            .contains("Attempting reconnect to 'renamed-target'")
+    }));
+}
+
+#[test]
 fn shift_d_disconnect_all_processes_every_active_tunnel() {
     // Regression for the Shift+D bug where only one of N active
     // tunnels was actually torn down. The pre-fix path only called
@@ -2983,11 +3097,12 @@ fn shift_d_disconnect_all_processes_every_active_tunnel() {
     // later assert got cleared. (Imagine they had failed before and
     // were in a retry sequence.)
     for name in ["alpha", "beta"] {
+        let profile_id = ProfileId::new(name);
         app.runtime.retry_state.insert(
-            ProfileId::new(name),
+            profile_id.clone(),
             crate::state::RetryState {
+                profile_id,
                 attempt: 1,
-                profile_idx: 0,
                 auto_reconnect: true,
             },
         );
@@ -3042,11 +3157,12 @@ fn shift_d_disconnect_profile_by_idx_works_for_secondary() {
     add_profiles(&mut app, &["alpha", "beta"]);
     set_connected(&mut app, "alpha");
     set_connected(&mut app, "beta");
+    let beta_id = ProfileId::new("beta");
     app.runtime.retry_state.insert(
-        ProfileId::new("beta"),
+        beta_id.clone(),
         crate::state::RetryState {
+            profile_id: beta_id,
             attempt: 1,
-            profile_idx: 1,
             auto_reconnect: true,
         },
     );

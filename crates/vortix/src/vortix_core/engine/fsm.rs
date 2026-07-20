@@ -552,6 +552,10 @@ impl<T: Tunnel> Engine<T> {
         };
         TunnelHandle {
             profile_id: profile_id.clone(),
+            display_name: (self.profile_resolver)(profile_id).map_or_else(
+                || format!("missing-{profile_id}"),
+                |profile| profile.display_name,
+            ),
             interface_name: interface,
             pid,
             started_at: SystemTime::now(),

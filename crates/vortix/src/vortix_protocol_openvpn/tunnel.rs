@@ -17,7 +17,7 @@ use crate::vortix_core::ports::tunnel::{
     ParseError, ParsedProfile, ProtocolStatus, Tunnel, TunnelCapabilities, TunnelError,
     TunnelHandle, TunnelKindTag, TunnelStatus,
 };
-use crate::vortix_core::profile::{sanitize_profile_name, Profile};
+use crate::vortix_core::profile::Profile;
 use crate::vortix_process::{CommandSpec, PrivilegeReq};
 use tracing::{debug, info, warn};
 
@@ -45,6 +45,12 @@ pub enum OvpnDnsEvidence {
 /// catastrophic-spawn-failure within the user's attention span.
 const OVPN_MGMT_SOCKET_TIMEOUT_MS: u64 = 5000;
 const MANAGED_CONFIG_MARKER: &str = "# managed-by: vortix dns policy\n";
+
+fn unambiguous_legacy_key(display_name: &str) -> Option<&str> {
+    (!display_name.is_empty()
+        && crate::vortix_core::profile::sanitize_profile_name(display_name) == display_name)
+        .then_some(display_name)
+}
 
 struct ManagedConfigGuard(PathBuf);
 
@@ -83,8 +89,7 @@ fn managed_config(profile: &Profile) -> Result<(PathBuf, Option<ManagedConfigGua
         .config_path
         .parent()
         .ok_or_else(|| TunnelError::Subprocess("OpenVPN config has no parent directory".into()))?;
-    let safe_name = sanitize_profile_name(&profile.display_name);
-    let path = parent.join(format!(".{safe_name}.vortix-dns-policy.ovpn"));
+    let path = parent.join(format!(".{}.vortix-dns-policy.ovpn", profile.id));
     if let Ok(existing) = std::fs::read_to_string(&path) {
         if !existing.starts_with(MANAGED_CONFIG_MARKER) {
             return Err(TunnelError::Subprocess(format!(
@@ -332,9 +337,9 @@ pub const DEFAULT_OVPN_VERBOSITY: &str = "3";
 /// passes resolved paths in based on the app config.
 #[derive(Clone)]
 pub struct OvpnTunnel {
-    /// Directory where `<safe_name>.pid` and `<safe_name>.log` are written.
+    /// Directory where `<profile_id>.pid` and `<profile_id>.log` are written.
     pub run_dir: PathBuf,
-    /// Optional auth file directory (`<safe_name>.auth`); absent when the
+    /// Optional auth file directory (`<profile_id>.auth`); absent when the
     /// profile uses other auth mechanisms.
     pub auth_dir: Option<PathBuf>,
     /// `--verb N` value passed to the daemon.
@@ -408,8 +413,14 @@ impl OvpnTunnel {
         let configured = parse_ovpn_conf(&profile_text)
             .map_err(|error| TunnelError::Subprocess(format!("parse OpenVPN DNS intent: {error}")))?
             .dns_request();
-        let safe_name = sanitize_profile_name(&profile.display_name);
-        let log_path = self.log_path(&safe_name);
+        let canonical_log = self.log_path(profile.id.as_str());
+        let log_path = if canonical_log.exists() {
+            canonical_log
+        } else if let Some(legacy_key) = unambiguous_legacy_key(&profile.display_name) {
+            self.log_path(legacy_key)
+        } else {
+            canonical_log
+        };
         let log = match std::fs::read_to_string(&log_path) {
             Ok(log) => log,
             Err(error) => {
@@ -422,18 +433,18 @@ impl OvpnTunnel {
         Ok(pushed_dns_evidence(configured, &log))
     }
 
-    fn pid_path(&self, safe_name: &str) -> PathBuf {
-        self.run_dir.join(format!("{safe_name}.pid"))
+    fn pid_path(&self, profile_id: &str) -> PathBuf {
+        self.run_dir.join(format!("{profile_id}.pid"))
     }
 
-    fn log_path(&self, safe_name: &str) -> PathBuf {
-        self.run_dir.join(format!("{safe_name}.log"))
+    fn log_path(&self, profile_id: &str) -> PathBuf {
+        self.run_dir.join(format!("{profile_id}.log"))
     }
 
-    fn auth_path(&self, safe_name: &str) -> Option<PathBuf> {
+    fn auth_path(&self, profile_id: &str) -> Option<PathBuf> {
         self.auth_dir
             .as_ref()
-            .map(|d| d.join(format!("{safe_name}.auth")))
+            .map(|d| d.join(format!("{profile_id}.auth")))
     }
 
     /// Path used by the static-challenge SCRV1 envelope. The connect path writes the
@@ -442,10 +453,34 @@ impl OvpnTunnel {
     /// after the daemon fork returns — keeping the canonical
     /// `<safe>.auth` plain at all times, with no race window for the
     /// async TUI worker thread to lose against.
-    fn scrv1_auth_path(&self, safe_name: &str) -> Option<PathBuf> {
+    fn scrv1_auth_path(&self, profile_id: &str) -> Option<PathBuf> {
         self.auth_dir
             .as_ref()
-            .map(|d| d.join(format!("{safe_name}.scrv1.auth")))
+            .map(|d| d.join(format!("{profile_id}.scrv1.auth")))
+    }
+
+    fn management_socket_path(&self, profile_id: &str) -> PathBuf {
+        self.run_dir.join(format!("{profile_id}.mgmt.sock"))
+    }
+
+    fn existing_auth_path(&self, profile: &Profile) -> Option<PathBuf> {
+        self.auth_path(profile.id.as_str())
+            .filter(|path| path.exists())
+            .or_else(|| {
+                unambiguous_legacy_key(&profile.display_name)
+                    .and_then(|legacy_key| self.auth_path(legacy_key))
+                    .filter(|path| path.exists())
+            })
+    }
+
+    fn existing_scrv1_auth_path(&self, profile: &Profile) -> Option<PathBuf> {
+        self.scrv1_auth_path(profile.id.as_str())
+            .filter(|path| path.exists())
+            .or_else(|| {
+                unambiguous_legacy_key(&profile.display_name)
+                    .and_then(|legacy_key| self.scrv1_auth_path(legacy_key))
+                    .filter(|path| path.exists())
+            })
     }
 }
 
@@ -596,7 +631,7 @@ fn poll_log_until_ready(
 /// always suppressed here and applied later by the global coordinator.
 fn build_ovpn_args(
     config_path: &std::path::Path,
-    safe_name: &str,
+    profile_id: &str,
     pid_path: &std::path::Path,
     log_path: &std::path::Path,
     verbosity: &str,
@@ -605,7 +640,7 @@ fn build_ovpn_args(
         "--config".to_string(),
         config_path.to_string_lossy().into_owned(),
         "--daemon".to_string(),
-        format!("vortix-{safe_name}"),
+        format!("vortix-{profile_id}"),
         "--writepid".to_string(),
         pid_path.to_string_lossy().into_owned(),
         "--log".to_string(),
@@ -714,9 +749,9 @@ fn pushed_dns_evidence(
 impl Tunnel for OvpnTunnel {
     #[allow(clippy::too_many_lines)] // single linear sequence of pid/log/auth setup + daemon spawn + log-poll; splitting would obscure the connect flow without simplifying it
     fn up(&mut self, profile: &Profile) -> Result<TunnelHandle, TunnelError> {
-        let safe_name = sanitize_profile_name(&profile.display_name);
-        let pid_path = self.pid_path(&safe_name);
-        let log_path = self.log_path(&safe_name);
+        let artifact_key = profile.id.as_str();
+        let pid_path = self.pid_path(artifact_key);
+        let log_path = self.log_path(artifact_key);
 
         if let Some(parent) = pid_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -768,7 +803,7 @@ impl Tunnel for OvpnTunnel {
         let (effective_config, _managed_config_guard) = managed_config(profile)?;
         let mut args = build_ovpn_args(
             &effective_config,
-            &safe_name,
+            artifact_key,
             &pid_path,
             &log_path,
             &self.verbosity,
@@ -790,7 +825,7 @@ impl Tunnel for OvpnTunnel {
         //
         // Non-MFA profiles take the existing --auth-user-pass file
         // path unchanged.
-        let bundle_path = self.scrv1_auth_path(&safe_name);
+        let bundle_path = self.existing_scrv1_auth_path(profile);
         let mgmt_creds = if let Some(p) = &bundle_path {
             read_mgmt_credentials_bundle(p)
                 .map_err(|e| TunnelError::Subprocess(format!("mgmt creds bundle: {e}")))?
@@ -799,7 +834,7 @@ impl Tunnel for OvpnTunnel {
         };
 
         let mgmt_sock_path = if mgmt_creds.is_some() {
-            let path = self.run_dir.join(format!("{safe_name}.mgmt.sock"));
+            let path = self.management_socket_path(artifact_key);
             // Stale socket from a prior crash — delete before spawn
             // so openvpn can bind cleanly.
             let _ = std::fs::remove_file(&path);
@@ -815,7 +850,7 @@ impl Tunnel for OvpnTunnel {
 
         // Non-MFA: legacy `--auth-user-pass <file>` flow.
         if mgmt_creds.is_none() {
-            if let Some(auth) = self.auth_path(&safe_name).filter(|p| p.exists()) {
+            if let Some(auth) = self.existing_auth_path(profile) {
                 args.push("--auth-user-pass".to_string());
                 args.push(auth.to_string_lossy().into_owned());
             }
@@ -914,7 +949,7 @@ impl Tunnel for OvpnTunnel {
         // The kernel interface name must come from the log scrape. The
         // multi-tunnel state-authority contract requires `details.interface` to be byte-
         // comparable with `route get`'s output. A synthetic label like
-        // `openvpn-{safe_name}` would silently disable primary-election
+        // a synthetic daemon label would silently disable primary-election
         // for this profile and silently break per-tunnel killswitch
         // ACCEPT rules (firewall.rs reads details.interface to build
         // PF/iptables rules — wrong iface = silent leak).
@@ -952,6 +987,7 @@ impl Tunnel for OvpnTunnel {
 
         Ok(TunnelHandle {
             profile_id: profile.id.clone(),
+            display_name: profile.display_name.clone(),
             interface_name,
             pid: Some(pid),
             started_at: SystemTime::now(),
@@ -969,7 +1005,7 @@ impl Tunnel for OvpnTunnel {
             "ovpn.down"
         );
 
-        let safe_name = sanitize_profile_name(handle.profile_id.as_str());
+        let artifact_key = handle.profile_id.as_str();
 
         if let Some(pid) = handle.pid {
             // direct PID signal via libc::kill instead of
@@ -1013,7 +1049,7 @@ impl Tunnel for OvpnTunnel {
 
         // fallback pattern-matched kill via process
         // enumeration + libc::kill, replacing the prior `pkill -f` shell-out.
-        // Substring-match "openvpn" + "vortix-<safe_name>" against each
+        // Substring-match "openvpn" + "vortix-<profile_id>" against each
         // PID's cmdline. Catches the daemon even when the captured PID
         // is stale (process re-spawned, exec'd, etc.).
         //
@@ -1021,19 +1057,39 @@ impl Tunnel for OvpnTunnel {
         // a controlled cross-layer reach. The alternative — adding a
         // `ProcessEnumerate` port to vortix_core — is heavier for one
         // caller. Revisit if a second protocol module needs this.
-        let needle = format!("vortix-{safe_name}");
+        let mut needles = vec![format!("vortix-{artifact_key}")];
+        if let Some(legacy_key) = unambiguous_legacy_key(&handle.display_name) {
+            if legacy_key != artifact_key {
+                needles.push(format!("vortix-{legacy_key}"));
+            }
+        }
 
         #[cfg(target_os = "linux")]
         // xtask:allow-platform-cfg: process enumeration is OS-specific (Linux /proc walk)
-        let stale_pids =
-            crate::vortix_platform_linux::interface::find_all_pids_with_cmdline_substring(&needle);
+        let mut stale_pids = needles
+            .iter()
+            .flat_map(|needle| {
+                crate::vortix_platform_linux::interface::find_all_pids_with_cmdline_substring(
+                    needle,
+                )
+            })
+            .collect::<Vec<_>>();
         #[cfg(target_os = "macos")]
         // xtask:allow-platform-cfg: process enumeration is OS-specific (macOS proc_listpids)
-        let stale_pids =
-            crate::vortix_platform_macos::interface::find_all_pids_with_cmdline_substring(&needle);
+        let mut stale_pids = needles
+            .iter()
+            .flat_map(|needle| {
+                crate::vortix_platform_macos::interface::find_all_pids_with_cmdline_substring(
+                    needle,
+                )
+            })
+            .collect::<Vec<_>>();
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         // xtask:allow-platform-cfg: Windows / other OS fallback (NG per origin)
-        let stale_pids: Vec<u32> = Vec::new();
+        let mut stale_pids: Vec<u32> = Vec::new();
+
+        stale_pids.sort_unstable();
+        stale_pids.dedup();
 
         for stale_pid in stale_pids {
             if let Ok(libc_pid) = libc::pid_t::try_from(stale_pid) {
@@ -1055,8 +1111,16 @@ impl Tunnel for OvpnTunnel {
         }
 
         // Cleanup run files.
-        let _ = std::fs::remove_file(self.pid_path(&safe_name));
-        let _ = std::fs::remove_file(self.log_path(&safe_name));
+        let _ = std::fs::remove_file(self.pid_path(artifact_key));
+        let _ = std::fs::remove_file(self.log_path(artifact_key));
+        let _ = std::fs::remove_file(self.management_socket_path(artifact_key));
+        if let Some(legacy_key) = unambiguous_legacy_key(&handle.display_name) {
+            if legacy_key != artifact_key {
+                let _ = std::fs::remove_file(self.pid_path(legacy_key));
+                let _ = std::fs::remove_file(self.log_path(legacy_key));
+                let _ = std::fs::remove_file(self.management_socket_path(legacy_key));
+            }
+        }
 
         Ok(())
     }
@@ -1109,9 +1173,52 @@ mod tests {
 
     #[test]
     fn sanitize_replaces_unsafe_chars() {
-        assert_eq!(sanitize_profile_name("hello world"), "hello_world");
-        assert_eq!(sanitize_profile_name("a/b.c"), "a_b_c");
-        assert_eq!(sanitize_profile_name("safe-name_1"), "safe-name_1");
+        assert_eq!(
+            crate::vortix_core::profile::sanitize_profile_name("hello world"),
+            "hello_world"
+        );
+    }
+
+    #[test]
+    fn colliding_display_names_have_isolated_openvpn_artifacts() {
+        let temp = tempfile::tempdir().unwrap();
+        let auth = temp.path().join("auth");
+        let tunnel = OvpnTunnel::new(temp.path().to_path_buf()).with_auth_dir(auth);
+        let first = "1".repeat(crate::vortix_core::profile::ProfileId::HEX_LEN);
+        let second = "2".repeat(crate::vortix_core::profile::ProfileId::HEX_LEN);
+
+        assert_eq!(
+            crate::vortix_core::profile::sanitize_profile_name("team/a"),
+            crate::vortix_core::profile::sanitize_profile_name("team?a")
+        );
+        assert_ne!(tunnel.pid_path(&first), tunnel.pid_path(&second));
+        assert_ne!(tunnel.log_path(&first), tunnel.log_path(&second));
+        assert_ne!(tunnel.auth_path(&first), tunnel.auth_path(&second));
+        assert_ne!(
+            tunnel.scrv1_auth_path(&first),
+            tunnel.scrv1_auth_path(&second)
+        );
+        assert_ne!(
+            tunnel.management_socket_path(&first),
+            tunnel.management_socket_path(&second)
+        );
+
+        let first_args = build_ovpn_args(
+            std::path::Path::new("/tmp/one.ovpn"),
+            &first,
+            &tunnel.pid_path(&first),
+            &tunnel.log_path(&first),
+            "3",
+        );
+        let second_args = build_ovpn_args(
+            std::path::Path::new("/tmp/two.ovpn"),
+            &second,
+            &tunnel.pid_path(&second),
+            &tunnel.log_path(&second),
+            "3",
+        );
+        assert!(first_args.contains(&format!("vortix-{first}")));
+        assert!(second_args.contains(&format!("vortix-{second}")));
     }
 
     #[test]
@@ -1253,17 +1360,17 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let profile_path = temp.path().join("corp.ovpn");
         std::fs::write(&profile_path, "client\ndhcp-option DNS 1.1.1.1\n").unwrap();
-        std::fs::write(
-            temp.path().join("corp.log"),
-            "PUSH_REPLY,dhcp-option DNS 10.8.0.1,dhcp-option DOMAIN corp.example\nInitialization Sequence Completed\n",
-        )
-        .unwrap();
         let profile = Profile::new(
             crate::vortix_core::profile::ProfileId::new("corp"),
             "corp",
             crate::vortix_core::profile::ProtocolKind::OpenVpn,
             profile_path,
         );
+        std::fs::write(
+            temp.path().join(format!("{}.log", profile.id)),
+            "PUSH_REPLY,dhcp-option DNS 10.8.0.1,dhcp-option DOMAIN corp.example\nInitialization Sequence Completed\n",
+        )
+        .unwrap();
         let evidence = OvpnTunnel::new(temp.path().to_path_buf())
             .requested_dns_evidence(&profile)
             .unwrap();

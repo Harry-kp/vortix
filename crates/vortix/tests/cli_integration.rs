@@ -40,6 +40,7 @@ fn engine_new_test_has_empty_profiles() {
 fn engine_find_profile_by_name() {
     let mut engine = VpnRuntime::new_test();
     engine.profiles.push(VpnProfile {
+        id: vortix::vortix_core::profile::ProfileId::new("work-vpn"),
         name: "work-vpn".into(),
         protocol: Protocol::WireGuard,
         config_path: "/tmp/work.conf".into(),
@@ -47,6 +48,7 @@ fn engine_find_profile_by_name() {
         last_used: None,
     });
     engine.profiles.push(VpnProfile {
+        id: vortix::vortix_core::profile::ProfileId::new("personal"),
         name: "personal".into(),
         protocol: Protocol::OpenVPN,
         config_path: "/tmp/personal.ovpn".into(),
@@ -64,6 +66,7 @@ fn engine_sort_profiles_by_name() {
     let mut engine = VpnRuntime::new_test();
     for name in &["charlie", "alpha", "bravo"] {
         engine.profiles.push(VpnProfile {
+            id: vortix::vortix_core::profile::ProfileId::new(*name),
             name: (*name).into(),
             protocol: Protocol::WireGuard,
             config_path: format!("/tmp/{name}.conf").into(),
@@ -87,6 +90,7 @@ fn engine_sort_profiles_by_name() {
 fn engine_sort_profiles_by_protocol() {
     let mut engine = VpnRuntime::new_test();
     engine.profiles.push(VpnProfile {
+        id: vortix::vortix_core::profile::ProfileId::new("ovpn-profile"),
         name: "ovpn-profile".into(),
         protocol: Protocol::OpenVPN,
         config_path: "/tmp/a.ovpn".into(),
@@ -94,6 +98,7 @@ fn engine_sort_profiles_by_protocol() {
         last_used: None,
     });
     engine.profiles.push(VpnProfile {
+        id: vortix::vortix_core::profile::ProfileId::new("wg-profile"),
         name: "wg-profile".into(),
         protocol: Protocol::WireGuard,
         config_path: "/tmp/b.conf".into(),

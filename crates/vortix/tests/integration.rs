@@ -45,6 +45,7 @@ fn test_app() -> App {
 fn add_wg_profiles(app: &mut App, names: &[&str]) {
     for name in names {
         app.runtime.profiles.push(VpnProfile {
+            id: vortix::vortix_core::profile::ProfileId::new(*name),
             name: (*name).to_string(),
             protocol: Protocol::WireGuard,
             config_path: std::path::PathBuf::from(format!("/tmp/{name}.conf")),
