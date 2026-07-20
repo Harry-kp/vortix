@@ -2,15 +2,13 @@
 //!
 //! Prefers iptables when available, falls back to nftables (nft).
 //!
-//! The iptables backend now synthesises the full
-//! ruleset in memory and feeds it to `iptables-restore` (and
-//! `ip6tables-restore` for IPv6 server IPs) via stdin. iptables-restore
-//! performs an atomic in-kernel replace, so there is no leak window between
-//! the previous and new rulesets — mirrors the `nft -f -` pattern already
-//! in the nftables branch and the macOS `pfctl -f -` pattern.
+//! The iptables backend owns one chain per address family and updates it with
+//! `iptables-restore --noflush`. Host filter tables and policies remain
+//! untouched. The nftables backend owns one table and replaces it in a single
+//! nft transaction.
 //!
 //! Ruleset shape (per active tunnel set):
-//!   1. Default-drop egress on OUTPUT.
+//!   1. A Vortix-owned OUTPUT chain ending in DROP.
 //!   2. Loopback always allowed.
 //!   3. RFC1918 pass list, with secondaries' `declared_cidrs` subtracted
 //!      via `cidr_subtract`. Primaries (`is_primary == true`) do NOT
@@ -39,6 +37,7 @@ use tracing::{debug, error, info};
 
 const CHAIN_NAME: &str = "VORTIX_KILLSWITCH";
 const NFT_TABLE: &str = "vortix_killswitch";
+const POLICY_COMMENT_PREFIX: &str = "vortix-policy:";
 
 /// Detected firewall backend on this system.
 enum FirewallBackend {
@@ -88,14 +87,11 @@ impl IptablesFirewall {
         writeln!(rules, "# Vortix Kill Switch Rules - Auto-generated").unwrap();
         writeln!(rules, "# DO NOT EDIT - Will be overwritten").unwrap();
         writeln!(rules, "*filter").unwrap();
-        writeln!(rules, ":INPUT ACCEPT [0:0]").unwrap();
-        writeln!(rules, ":FORWARD ACCEPT [0:0]").unwrap();
-        // Default-deny egress at the OUTPUT chain — no leak path if a
-        // per-tunnel ACCEPT rule fails to match.
-        writeln!(rules, ":OUTPUT DROP [0:0]").unwrap();
+        writeln!(rules, ":{CHAIN_NAME} - [0:0]").unwrap();
+        writeln!(rules, "-F {CHAIN_NAME}").unwrap();
 
         // Allow loopback.
-        writeln!(rules, "-A OUTPUT -o lo -j ACCEPT").unwrap();
+        writeln!(rules, "-A {CHAIN_NAME} -o lo -j ACCEPT").unwrap();
 
         // RFC1918, with secondaries' declared CIDRs carved out. Primaries
         // (0/0) are excluded from the remove list per Q-DEF-9 / D-6 — their
@@ -108,12 +104,16 @@ impl IptablesFirewall {
             .collect();
         let rfc1918 = cidr_subtract(&rfc1918_ranges(), &secondary_cidrs);
         for c in &rfc1918 {
-            writeln!(rules, "-A OUTPUT -d {c} -j ACCEPT").unwrap();
+            writeln!(rules, "-A {CHAIN_NAME} -d {c} -j ACCEPT").unwrap();
         }
 
         // DHCP — must precede the per-tunnel rules so a DHCP renew on the
         // underlay isn't dropped.
-        writeln!(rules, "-A OUTPUT -p udp --sport 68 --dport 67 -j ACCEPT").unwrap();
+        writeln!(
+            rules,
+            "-A {CHAIN_NAME} -p udp --sport 68 --dport 67 -j ACCEPT"
+        )
+        .unwrap();
 
         // Per-tunnel rules. Order preserved from caller — typically
         // primary first, then secondaries by attach order.
@@ -124,13 +124,20 @@ impl IptablesFirewall {
                 tunnel.interface, tunnel.is_primary
             )
             .unwrap();
-            writeln!(rules, "-A OUTPUT -o {} -j ACCEPT", tunnel.interface).unwrap();
+            writeln!(rules, "-A {CHAIN_NAME} -o {} -j ACCEPT", tunnel.interface).unwrap();
             for ip in &tunnel.server_ips {
                 if let IpAddr::V4(v4) = ip {
-                    writeln!(rules, "-A OUTPUT -d {v4} -j ACCEPT").unwrap();
+                    writeln!(rules, "-A {CHAIN_NAME} -d {v4} -j ACCEPT").unwrap();
                 }
             }
         }
+
+        let digest = crate::core::killswitch::policy_digest(active);
+        writeln!(
+            rules,
+            "-A {CHAIN_NAME} -m comment --comment {POLICY_COMMENT_PREFIX}{digest} -j DROP"
+        )
+        .unwrap();
 
         writeln!(rules, "COMMIT").unwrap();
         rules
@@ -138,70 +145,59 @@ impl IptablesFirewall {
 
     /// Synthesise the IPv6 `ip6tables-restore` ruleset. Same shape as v4
     /// but without RFC1918 carve-out (RFC1918 is v4-only). Only IPv6
-    /// server IPs are emitted as `-A OUTPUT -d ... -j ACCEPT` lines.
+    /// server IPs are emitted as owned-chain destination exceptions.
     ///
-    /// Returns `None` when no tunnel has any IPv6 server IP — in that case
-    /// there's no v6 ruleset to apply and the caller skips
-    /// `ip6tables-restore` entirely (the v4 ruleset is the authoritative
-    /// state).
     #[must_use]
-    pub fn generate_v6_ruleset(active: &[ActiveTunnelInfo]) -> Option<String> {
-        let has_v6 = active
-            .iter()
-            .any(|t| t.server_ips.iter().any(IpAddr::is_ipv6));
-        if !has_v6 {
-            return None;
-        }
-
+    pub fn generate_v6_ruleset(active: &[ActiveTunnelInfo]) -> String {
         let mut rules = String::new();
         writeln!(rules, "# Vortix Kill Switch Rules (IPv6) - Auto-generated").unwrap();
         writeln!(rules, "# DO NOT EDIT - Will be overwritten").unwrap();
         writeln!(rules, "*filter").unwrap();
-        writeln!(rules, ":INPUT ACCEPT [0:0]").unwrap();
-        writeln!(rules, ":FORWARD ACCEPT [0:0]").unwrap();
-        writeln!(rules, ":OUTPUT DROP [0:0]").unwrap();
+        writeln!(rules, ":{CHAIN_NAME} - [0:0]").unwrap();
+        writeln!(rules, "-F {CHAIN_NAME}").unwrap();
 
         // Loopback (v6 lo is the same interface name).
-        writeln!(rules, "-A OUTPUT -o lo -j ACCEPT").unwrap();
+        writeln!(rules, "-A {CHAIN_NAME} -o lo -j ACCEPT").unwrap();
 
-        // Per-tunnel v6 server IPs only. We don't emit interface allows
-        // here — the v4 ruleset already permits the interface and the
-        // tunnel transport itself is v4 (server endpoints we care about
-        // for reconnect). If a tunnel has only v6 server IPs we still
-        // emit the interface allow so reconnect works.
+        // Every tunnel interface is allowed in both families. Endpoint
+        // family only selects the reconnect exception.
         for tunnel in active {
             let v6_ips: Vec<&IpAddr> = tunnel.server_ips.iter().filter(|ip| ip.is_ipv6()).collect();
-            if v6_ips.is_empty() {
-                continue;
-            }
             writeln!(
                 rules,
                 "# Tunnel: {} (primary={})",
                 tunnel.interface, tunnel.is_primary
             )
             .unwrap();
-            writeln!(rules, "-A OUTPUT -o {} -j ACCEPT", tunnel.interface).unwrap();
+            writeln!(rules, "-A {CHAIN_NAME} -o {} -j ACCEPT", tunnel.interface).unwrap();
             for ip in v6_ips {
                 if let IpAddr::V6(v6) = ip {
-                    writeln!(rules, "-A OUTPUT -d {v6} -j ACCEPT").unwrap();
+                    writeln!(rules, "-A {CHAIN_NAME} -d {v6} -j ACCEPT").unwrap();
                 }
             }
         }
 
+        let digest = crate::core::killswitch::policy_digest(active);
+        writeln!(
+            rules,
+            "-A {CHAIN_NAME} -m comment --comment {POLICY_COMMENT_PREFIX}{digest} -j DROP"
+        )
+        .unwrap();
+
         writeln!(rules, "COMMIT").unwrap();
-        Some(rules)
+        rules
     }
 
     /// Invoke `iptables-restore` with the given ruleset on stdin. The
     /// kernel performs an atomic ruleset replace — if the parse fails,
     /// the prior ruleset stays in force, no leak window.
-    fn iptables_restore_stdin(ruleset: &[u8]) -> std::result::Result<(), String> {
+    fn iptables_restore_stdin(program: &str, ruleset: &[u8]) -> std::result::Result<(), String> {
         let output = crate::vortix_process::run_to_output(
-            CommandSpec::oneshot("iptables-restore", vec![])
+            CommandSpec::oneshot(program, vec!["--noflush".into()])
                 .privilege(PrivilegeReq::Root)
                 .stdin(ruleset.to_vec()),
         )
-        .map_err(|e| format!("Failed to spawn iptables-restore: {e}"))?;
+        .map_err(|e| format!("Failed to spawn {program}: {e}"))?;
 
         if output.status.success() {
             Ok(())
@@ -210,37 +206,134 @@ impl IptablesFirewall {
         }
     }
 
-    /// IPv6 counterpart. Same atomic semantics via `ip6tables-restore`.
-    fn ip6tables_restore_stdin(ruleset: &[u8]) -> std::result::Result<(), String> {
+    fn iptables_command(program: &str, args: &[&str]) -> std::result::Result<bool, String> {
+        let args = args.iter().map(|arg| (*arg).to_string()).collect();
         let output = crate::vortix_process::run_to_output(
-            CommandSpec::oneshot("ip6tables-restore", vec![])
-                .privilege(PrivilegeReq::Root)
-                .stdin(ruleset.to_vec()),
+            CommandSpec::oneshot(program, args).privilege(PrivilegeReq::Root),
         )
-        .map_err(|e| format!("Failed to spawn ip6tables-restore: {e}"))?;
+        .map_err(|e| format!("Failed to run {program}: {e}"))?;
+        Ok(output.status.success())
+    }
 
-        if output.status.success() {
-            Ok(())
+    fn iptables_snapshot(program: &str) -> std::result::Result<String, String> {
+        let output = crate::vortix_process::run_to_output(
+            CommandSpec::oneshot(program, vec!["-t".into(), "filter".into()])
+                .privilege(PrivilegeReq::Root),
+        )
+        .map_err(|e| format!("Failed to run {program}: {e}"))?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    fn ensure_iptables_jump(program: &str) -> std::result::Result<(), String> {
+        let listing = Self::iptables_listing(program, "OUTPUT")?;
+        if Self::output_jump_is_first(&listing) {
+            return Ok(());
+        }
+        // Insert the enforcing first-position jump before touching any stale
+        // later duplicate. Removing the only live jump first would create a
+        // leak window. Later duplicates are harmless and teardown removes all.
+        if Self::iptables_command(program, &["-I", "OUTPUT", "1", "-j", CHAIN_NAME])? {
+            let listing = Self::iptables_listing(program, "OUTPUT")?;
+            if Self::output_jump_is_first(&listing) {
+                Ok(())
+            } else {
+                Err(format!("{program} read-back did not place Vortix first"))
+            }
         } else {
-            Err(String::from_utf8_lossy(&output.stderr).to_string())
+            Err(format!(
+                "{program} could not install the Vortix OUTPUT jump"
+            ))
         }
     }
 
-    /// Legacy per-rule iptables invocation, retained only for the
-    /// teardown path (`iptables -D OUTPUT -j VORTIX_KILLSWITCH` etc.).
-    /// New rulesets are installed via `iptables-restore` (see
-    /// `iptables_restore_stdin`).
-    fn iptables(args: &[&str]) -> std::result::Result<(), String> {
-        let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+    fn iptables_listing(program: &str, chain: &str) -> std::result::Result<String, String> {
         let output = crate::vortix_process::run_to_output(
-            CommandSpec::oneshot("iptables", owned).privilege(PrivilegeReq::Root),
+            CommandSpec::oneshot(program, vec!["-S".into(), chain.into()])
+                .privilege(PrivilegeReq::Root),
         )
-        .map_err(|e| format!("Failed to run iptables: {e}"))?;
+        .map_err(|error| format!("Failed to run {program} -S {chain}: {error}"))?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
 
-        if output.status.success() {
+    fn output_jump_is_first(listing: &str) -> bool {
+        let expected = format!("-A OUTPUT -j {CHAIN_NAME}");
+        listing.lines().find(|line| line.starts_with("-A OUTPUT ")) == Some(expected.as_str())
+    }
+
+    fn canonical_owned_iptables_rules(rules: &str) -> Vec<String> {
+        rules
+            .lines()
+            .filter(|line| line.starts_with(&format!("-A {CHAIN_NAME} ")))
+            .map(|line| {
+                line.replace("--comment \"", "--comment ")
+                    .replace("\" -j", " -j")
+                    .replace("-p udp -m udp", "-p udp")
+                    .replace("/32 ", " ")
+                    .replace("/128 ", " ")
+            })
+            .collect()
+    }
+
+    fn snapshot_verifies_iptables(snapshot: &str, expected_ruleset: &str) -> bool {
+        let expected_jump = format!("-A OUTPUT -j {CHAIN_NAME}");
+        let jump_first = snapshot.lines().find(|line| line.starts_with("-A OUTPUT "))
+            == Some(expected_jump.as_str());
+        jump_first
+            && snapshot.contains(&format!(":{CHAIN_NAME} "))
+            && Self::canonical_owned_iptables_rules(snapshot)
+                == Self::canonical_owned_iptables_rules(expected_ruleset)
+    }
+
+    fn is_legacy_global_policy(snapshot: &str, ipv6: bool) -> bool {
+        if !snapshot.contains(":OUTPUT DROP ") || snapshot.contains(CHAIN_NAME) {
+            return false;
+        }
+        let rules: Vec<&str> = snapshot
+            .lines()
+            .filter(|line| line.starts_with("-A "))
+            .collect();
+        if rules.is_empty()
+            || rules
+                .iter()
+                .any(|line| !line.starts_with("-A OUTPUT ") || !line.ends_with("-j ACCEPT"))
+            || !rules.iter().any(|line| line.contains(" -o lo "))
+        {
+            return false;
+        }
+        if ipv6 {
+            rules
+                .iter()
+                .any(|line| line.contains(" -o ") && !line.contains(" -o lo "))
+                && rules.iter().any(|line| line.contains(" -d "))
+        } else {
+            rules
+                .iter()
+                .any(|line| line.contains("--sport 68") && line.contains("--dport 67"))
+        }
+    }
+
+    fn legacy_cleanup_ruleset() -> &'static str {
+        "*filter\n:OUTPUT ACCEPT [0:0]\n-F OUTPUT\nCOMMIT\n"
+    }
+
+    fn verify_iptables_policy(
+        save_program: &str,
+        expected_ruleset: &str,
+        digest: &str,
+    ) -> std::result::Result<(), String> {
+        let snapshot = Self::iptables_snapshot(save_program)?;
+        if Self::snapshot_verifies_iptables(&snapshot, expected_ruleset) {
             Ok(())
         } else {
-            Err(String::from_utf8_lossy(&output.stderr).to_string())
+            Err(format!(
+                "{save_program} read-back did not match policy {digest}"
+            ))
         }
     }
 
@@ -255,22 +348,30 @@ impl IptablesFirewall {
             tunnels = active.len(),
             "loading iptables ruleset via iptables-restore stdin"
         );
-        Self::iptables_restore_stdin(v4.as_bytes()).map_err(|e| {
+        Self::iptables_restore_stdin("iptables-restore", v4.as_bytes()).map_err(|e| {
             error!(target: "vortix::killswitch", stderr = %e, "iptables-restore failed");
             KillswitchError::CommandFailed(format!("iptables-restore: {e}"))
         })?;
 
-        if let Some(v6) = Self::generate_v6_ruleset(active) {
-            debug!(
-                target: "vortix::killswitch",
-                bytes = v6.len(),
-                "loading ip6tables ruleset via ip6tables-restore stdin"
-            );
-            Self::ip6tables_restore_stdin(v6.as_bytes()).map_err(|e| {
-                error!(target: "vortix::killswitch", stderr = %e, "ip6tables-restore failed");
-                KillswitchError::CommandFailed(format!("ip6tables-restore: {e}"))
-            })?;
-        }
+        Self::ensure_iptables_jump("iptables").map_err(KillswitchError::CommandFailed)?;
+
+        let v6 = Self::generate_v6_ruleset(active);
+        debug!(
+            target: "vortix::killswitch",
+            bytes = v6.len(),
+            "loading ip6tables ruleset via ip6tables-restore stdin"
+        );
+        Self::iptables_restore_stdin("ip6tables-restore", v6.as_bytes()).map_err(|e| {
+            error!(target: "vortix::killswitch", stderr = %e, "ip6tables-restore failed");
+            KillswitchError::CommandFailed(format!("ip6tables-restore: {e}"))
+        })?;
+        Self::ensure_iptables_jump("ip6tables").map_err(KillswitchError::CommandFailed)?;
+
+        let digest = crate::core::killswitch::policy_digest(active);
+        Self::verify_iptables_policy("iptables-save", &v4, &digest)
+            .map_err(KillswitchError::CommandFailed)?;
+        Self::verify_iptables_policy("ip6tables-save", &v6, &digest)
+            .map_err(KillswitchError::CommandFailed)?;
 
         Ok(())
     }
@@ -279,77 +380,154 @@ impl IptablesFirewall {
     /// via a minimal `iptables-restore` ruleset, and remove any legacy
     /// `VORTIX_KILLSWITCH` chain the legacy implementation may have left
     /// behind.
-    fn teardown_iptables() {
-        // Reset OUTPUT policy and clear filter table via iptables-restore.
-        let reset =
-            "*filter\n:INPUT ACCEPT [0:0]\n:FORWARD ACCEPT [0:0]\n:OUTPUT ACCEPT [0:0]\nCOMMIT\n";
-        let _ = Self::iptables_restore_stdin(reset.as_bytes());
-        let _ = Self::ip6tables_restore_stdin(reset.as_bytes());
-
-        // Best-effort: remove the legacy custom chain if an older build
-        // installed it. Errors ignored — chain may not exist.
-        let _ = Self::iptables(&["-D", "OUTPUT", "-j", CHAIN_NAME]);
-        let _ = Self::iptables(&["-F", CHAIN_NAME]);
-        let _ = Self::iptables(&["-X", CHAIN_NAME]);
+    fn teardown_iptables() -> Result<()> {
+        for (command, save) in [
+            ("iptables", "iptables-save"),
+            ("ip6tables", "ip6tables-save"),
+        ] {
+            while Self::iptables_command(command, &["-C", "OUTPUT", "-j", CHAIN_NAME])
+                .map_err(KillswitchError::CommandFailed)?
+            {
+                if !Self::iptables_command(command, &["-D", "OUTPUT", "-j", CHAIN_NAME])
+                    .map_err(KillswitchError::CommandFailed)?
+                {
+                    return Err(KillswitchError::CommandFailed(format!(
+                        "{command} could not remove the Vortix OUTPUT jump"
+                    )));
+                }
+            }
+            let _ = Self::iptables_command(command, &["-F", CHAIN_NAME]);
+            let _ = Self::iptables_command(command, &["-X", CHAIN_NAME]);
+            let mut snapshot =
+                Self::iptables_snapshot(save).map_err(KillswitchError::CommandFailed)?;
+            let ipv6 = command == "ip6tables";
+            if Self::is_legacy_global_policy(&snapshot, ipv6) {
+                // v0.4.3 and earlier owned the global OUTPUT policy. Only
+                // reset it after the strict legacy-shape check proves every
+                // remaining OUTPUT rule belongs to that displaced design.
+                // The policy change and flush share one restore transaction.
+                let restore = if ipv6 {
+                    "ip6tables-restore"
+                } else {
+                    "iptables-restore"
+                };
+                Self::iptables_restore_stdin(restore, Self::legacy_cleanup_ruleset().as_bytes())
+                    .map_err(KillswitchError::CommandFailed)?;
+                snapshot = Self::iptables_snapshot(save).map_err(KillswitchError::CommandFailed)?;
+                if !snapshot.contains(":OUTPUT ACCEPT ")
+                    || snapshot.lines().any(|line| line.starts_with("-A OUTPUT "))
+                {
+                    return Err(KillswitchError::CommandFailed(format!(
+                        "{save} did not fully remove the legacy Vortix OUTPUT policy"
+                    )));
+                }
+            } else if snapshot.contains(":OUTPUT DROP ") {
+                return Err(KillswitchError::CommandFailed(format!(
+                    "{save} shows an unrecognized host-owned OUTPUT DROP policy; refusing to claim release"
+                )));
+            }
+            if snapshot.contains(CHAIN_NAME) {
+                return Err(KillswitchError::CommandFailed(format!(
+                    "{save} read-back still contains Vortix rules"
+                )));
+            }
+        }
+        Ok(())
     }
 
     // ─── nftables backend ───────────────────────────────────────────────
 
-    fn nft(args: &[&str]) -> std::result::Result<(), String> {
-        let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
-        let output = crate::vortix_process::run_to_output(
-            CommandSpec::oneshot("nft", owned).privilege(PrivilegeReq::Root),
-        )
-        .map_err(|e| format!("Failed to run nft: {e}"))?;
-
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(String::from_utf8_lossy(&output.stderr).to_string())
-        }
-    }
-
-    /// Set up the kill switch with nftables using an atomic ruleset load.
-    /// Single-tunnel fallback shape — multi-tunnel synthesis on nftables
-    /// lands in a follow-up unit; for now we install the first tunnel's
-    /// rules when invoked from `enable_blocking_multi`.
-    fn setup_nftables(vpn_interface: &str, vpn_server_ip: Option<&str>) -> Result<()> {
-        use std::fmt::Write;
+    /// Build one nft transaction that destroys any previous Vortix-owned
+    /// table and creates the complete replacement. nft commits the whole
+    /// batch or leaves the prior table untouched.
+    #[must_use]
+    pub fn generate_nft_ruleset(active: &[ActiveTunnelInfo]) -> String {
+        let secondary_cidrs: Vec<Cidr> = active
+            .iter()
+            .filter(|tunnel| !tunnel.is_primary)
+            .flat_map(|tunnel| tunnel.declared_cidrs.iter().copied())
+            .collect();
+        let local_ranges = cidr_subtract(&rfc1918_ranges(), &secondary_cidrs);
+        let digest = crate::core::killswitch::policy_digest(active);
 
         let mut ruleset = format!(
-            r#"table inet {NFT_TABLE} {{
+            r#"destroy table inet {NFT_TABLE}
+table inet {NFT_TABLE} {{
   chain output {{
     type filter hook output priority 0; policy drop;
 
-    # Allow loopback
     oifname "lo" accept
-
-    # Allow VPN interface
-    oifname "{vpn_interface}" accept
-
-    # Allow local networks (RFC1918)
-    ip daddr 192.168.0.0/16 accept
-    ip daddr 10.0.0.0/8 accept
-    ip daddr 172.16.0.0/12 accept
-
-    # Allow DHCP
-    udp sport 68 udp dport 67 accept
 "#,
         );
+        for range in local_ranges {
+            writeln!(ruleset, "    ip daddr {range} accept").unwrap();
+        }
+        writeln!(ruleset, "    udp sport 68 udp dport 67 accept").unwrap();
+        for tunnel in active {
+            writeln!(ruleset, "    oifname \"{}\" accept", tunnel.interface).unwrap();
+            for endpoint in &tunnel.server_ips {
+                match endpoint {
+                    IpAddr::V4(ip) => writeln!(ruleset, "    ip daddr {ip} accept").unwrap(),
+                    IpAddr::V6(ip) => writeln!(ruleset, "    ip6 daddr {ip} accept").unwrap(),
+                }
+            }
+        }
+        writeln!(
+            ruleset,
+            "    counter drop comment \"{POLICY_COMMENT_PREFIX}{digest}\""
+        )
+        .unwrap();
+        ruleset.push_str("  }\n}\n");
+        ruleset
+    }
 
-        if let Some(ip) = vpn_server_ip {
-            let _ = write!(
-                ruleset,
-                "\n    # Allow VPN server for reconnection\n    ip daddr {ip} accept\n"
-            );
+    fn nft_snapshot_matches(active: &[ActiveTunnelInfo], snapshot: &str) -> bool {
+        let secondary_cidrs: Vec<Cidr> = active
+            .iter()
+            .filter(|tunnel| !tunnel.is_primary)
+            .flat_map(|tunnel| tunnel.declared_cidrs.iter().copied())
+            .collect();
+        let mut expected = vec!["oifname \"lo\" accept".to_string()];
+        expected.extend(
+            cidr_subtract(&rfc1918_ranges(), &secondary_cidrs)
+                .into_iter()
+                .map(|range| format!("ip daddr {range} accept")),
+        );
+        expected.push("udp sport 68 udp dport 67 accept".to_string());
+        for tunnel in active {
+            expected.push(format!("oifname \"{}\" accept", tunnel.interface));
+            expected.extend(tunnel.server_ips.iter().map(|endpoint| match endpoint {
+                IpAddr::V4(ip) => format!("ip daddr {ip} accept"),
+                IpAddr::V6(ip) => format!("ip6 daddr {ip} accept"),
+            }));
         }
 
-        ruleset.push_str("  }\n}\n");
+        let accept_lines: Vec<&str> = snapshot
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.ends_with(" accept"))
+            .collect();
+        let ordered = accept_lines.len() == expected.len()
+            && accept_lines
+                .iter()
+                .zip(&expected)
+                .all(|(observed, expected)| observed == expected);
+        let digest = crate::core::killswitch::policy_digest(active);
+        let terminal_lines: Vec<&str> = snapshot
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.contains(POLICY_COMMENT_PREFIX))
+            .collect();
+        ordered
+            && snapshot.contains("policy drop")
+            && terminal_lines.len() == 1
+            && terminal_lines[0].contains(" drop ")
+            && terminal_lines[0].contains(&format!("{POLICY_COMMENT_PREFIX}{digest}"))
+    }
 
-        // Delete existing table first (ignore error if not present)
-        let _ = Self::nft(&["delete", "table", "inet", NFT_TABLE]);
+    fn setup_nftables(active: &[ActiveTunnelInfo]) -> Result<()> {
+        let ruleset = Self::generate_nft_ruleset(active);
 
-        // Apply the full ruleset atomically via stdin
         let output = crate::vortix_process::run_to_output(
             CommandSpec::oneshot("nft", vec!["-f".into(), "-".into()])
                 .privilege(PrivilegeReq::Root)
@@ -358,8 +536,29 @@ impl IptablesFirewall {
         .map_err(|e| KillswitchError::CommandFailed(format!("nft spawn: {e}")))?;
 
         if !output.status.success() {
+            return Err(KillswitchError::CommandFailed(format!(
+                "nft failed to replace owned table: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+
+        let output = crate::vortix_process::run_to_output(
+            CommandSpec::oneshot(
+                "nft",
+                vec![
+                    "list".into(),
+                    "table".into(),
+                    "inet".into(),
+                    NFT_TABLE.into(),
+                ],
+            )
+            .privilege(PrivilegeReq::Root),
+        )
+        .map_err(|error| KillswitchError::CommandFailed(format!("nft read-back: {error}")))?;
+        let snapshot = String::from_utf8_lossy(&output.stdout);
+        if !output.status.success() || !Self::nft_snapshot_matches(active, &snapshot) {
             return Err(KillswitchError::CommandFailed(
-                "nft failed to load ruleset".to_string(),
+                "nft read-back did not match the requested policy".to_string(),
             ));
         }
 
@@ -367,8 +566,51 @@ impl IptablesFirewall {
     }
 
     /// Remove the kill switch nftables table.
-    fn teardown_nftables() {
-        let _ = Self::nft(&["delete", "table", "inet", NFT_TABLE]);
+    fn teardown_nftables() -> Result<()> {
+        let delete = crate::vortix_process::run_to_output(
+            CommandSpec::oneshot(
+                "nft",
+                vec![
+                    "delete".into(),
+                    "table".into(),
+                    "inet".into(),
+                    NFT_TABLE.into(),
+                ],
+            )
+            .privilege(PrivilegeReq::Root),
+        )
+        .map_err(|error| KillswitchError::CommandFailed(format!("nft delete: {error}")))?;
+        let delete_error = String::from_utf8_lossy(&delete.stderr);
+        if !delete.status.success() && !delete_error.contains("No such file or directory") {
+            return Err(KillswitchError::CommandFailed(format!(
+                "nft delete failed: {delete_error}"
+            )));
+        }
+        let output = crate::vortix_process::run_to_output(
+            CommandSpec::oneshot(
+                "nft",
+                vec![
+                    "list".into(),
+                    "table".into(),
+                    "inet".into(),
+                    NFT_TABLE.into(),
+                ],
+            )
+            .privilege(PrivilegeReq::Root),
+        )
+        .map_err(|error| KillswitchError::CommandFailed(format!("nft read-back: {error}")))?;
+        if output.status.success() {
+            return Err(KillswitchError::CommandFailed(
+                "nft read-back still contains the Vortix table".to_string(),
+            ));
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.contains("No such file or directory") {
+            return Err(KillswitchError::CommandFailed(format!(
+                "nft read-back failed ambiguously: {stderr}"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -389,6 +631,8 @@ impl Killswitch for IptablesFirewall {
             return Err(KillswitchError::NotRoot);
         }
 
+        crate::core::killswitch::validate_policy(active)?;
+
         info!(
             target: "vortix::killswitch",
             tunnels = active.len(),
@@ -402,17 +646,7 @@ impl Killswitch for IptablesFirewall {
             }
             Some(FirewallBackend::Nftables) => {
                 debug!(target: "vortix::killswitch", "using nftables backend");
-                // nftables backend stays on the single-tunnel shape for
-                // now — multi-tunnel synthesis on nft is tracked as a
-                // follow-up. Apply the first tunnel's rules; empty active
-                // set yields a base block-all (the existing `setup_nftables`
-                // handles `vpn_interface = ""` gracefully via the default
-                // drop policy).
-                let first = active.first();
-                let interface = first.map_or("lo", |t| t.interface.as_str());
-                let server_ip_owned: Option<String> =
-                    first.and_then(|t| t.server_ips.first().map(ToString::to_string));
-                Self::setup_nftables(interface, server_ip_owned.as_deref())?;
+                Self::setup_nftables(active)?;
             }
             None => {
                 return Err(KillswitchError::NoBackendAvailable);
@@ -435,9 +669,18 @@ impl Killswitch for IptablesFirewall {
             return Err(KillswitchError::NotRoot);
         }
 
-        // Clean up both backends — safe to call on each even if not active
-        Self::teardown_iptables();
-        Self::teardown_nftables();
+        let mut found = false;
+        if Self::has_iptables() {
+            found = true;
+            Self::teardown_iptables()?;
+        }
+        if Self::has_nft() {
+            found = true;
+            Self::teardown_nftables()?;
+        }
+        if !found {
+            return Err(KillswitchError::NoBackendAvailable);
+        }
 
         info!(target: "vortix::killswitch", "kill switch DISABLED — normal traffic restored");
         Ok(())
@@ -478,12 +721,12 @@ mod tests {
     fn empty_active_set_yields_base_blockall() {
         let rules = IptablesFirewall::generate_v4_ruleset(&[]);
         assert!(rules.contains("*filter"));
-        assert!(rules.contains(":OUTPUT DROP [0:0]"));
-        assert!(rules.contains("-A OUTPUT -o lo -j ACCEPT"));
+        assert!(rules.contains(":VORTIX_KILLSWITCH - [0:0]"));
+        assert!(rules.contains("-A VORTIX_KILLSWITCH -o lo -j ACCEPT"));
         // Full RFC1918 base intact.
-        assert!(rules.contains("-A OUTPUT -d 10.0.0.0/8 -j ACCEPT"));
-        assert!(rules.contains("-A OUTPUT -d 172.16.0.0/12 -j ACCEPT"));
-        assert!(rules.contains("-A OUTPUT -d 192.168.0.0/16 -j ACCEPT"));
+        assert!(rules.contains("-A VORTIX_KILLSWITCH -d 10.0.0.0/8 -j ACCEPT"));
+        assert!(rules.contains("-A VORTIX_KILLSWITCH -d 172.16.0.0/12 -j ACCEPT"));
+        assert!(rules.contains("-A VORTIX_KILLSWITCH -d 192.168.0.0/16 -j ACCEPT"));
         // DHCP present.
         assert!(rules.contains("--sport 68 --dport 67"));
         // No per-tunnel rules.
@@ -498,11 +741,11 @@ mod tests {
         // the default route would carve loopback. See D-6.
         let t = tunnel("wg0", &["1.2.3.4"], &["0.0.0.0/0"], true);
         let rules = IptablesFirewall::generate_v4_ruleset(&[t]);
-        assert!(rules.contains("-A OUTPUT -d 10.0.0.0/8 -j ACCEPT"));
-        assert!(rules.contains("-A OUTPUT -d 172.16.0.0/12 -j ACCEPT"));
-        assert!(rules.contains("-A OUTPUT -d 192.168.0.0/16 -j ACCEPT"));
-        assert!(rules.contains("-A OUTPUT -o wg0 -j ACCEPT"));
-        assert!(rules.contains("-A OUTPUT -d 1.2.3.4 -j ACCEPT"));
+        assert!(rules.contains("-A VORTIX_KILLSWITCH -d 10.0.0.0/8 -j ACCEPT"));
+        assert!(rules.contains("-A VORTIX_KILLSWITCH -d 172.16.0.0/12 -j ACCEPT"));
+        assert!(rules.contains("-A VORTIX_KILLSWITCH -d 192.168.0.0/16 -j ACCEPT"));
+        assert!(rules.contains("-A VORTIX_KILLSWITCH -o wg0 -j ACCEPT"));
+        assert!(rules.contains("-A VORTIX_KILLSWITCH -d 1.2.3.4 -j ACCEPT"));
     }
 
     #[test]
@@ -511,11 +754,11 @@ mod tests {
         // RFC1918 pass list. 172.16/12 + 192.168/16 remain.
         let t = tunnel("wg1", &["5.6.7.8"], &["10.0.0.0/8"], false);
         let rules = IptablesFirewall::generate_v4_ruleset(&[t]);
-        assert!(!rules.contains("-A OUTPUT -d 10.0.0.0/8 -j ACCEPT"));
-        assert!(rules.contains("-A OUTPUT -d 172.16.0.0/12 -j ACCEPT"));
-        assert!(rules.contains("-A OUTPUT -d 192.168.0.0/16 -j ACCEPT"));
-        assert!(rules.contains("-A OUTPUT -o wg1 -j ACCEPT"));
-        assert!(rules.contains("-A OUTPUT -d 5.6.7.8 -j ACCEPT"));
+        assert!(!rules.contains("-A VORTIX_KILLSWITCH -d 10.0.0.0/8 -j ACCEPT"));
+        assert!(rules.contains("-A VORTIX_KILLSWITCH -d 172.16.0.0/12 -j ACCEPT"));
+        assert!(rules.contains("-A VORTIX_KILLSWITCH -d 192.168.0.0/16 -j ACCEPT"));
+        assert!(rules.contains("-A VORTIX_KILLSWITCH -o wg1 -j ACCEPT"));
+        assert!(rules.contains("-A VORTIX_KILLSWITCH -d 5.6.7.8 -j ACCEPT"));
     }
 
     #[test]
@@ -525,14 +768,14 @@ mod tests {
         let t1 = tunnel("wg1", &["1.1.1.1"], &["10.0.0.0/8"], false);
         let t2 = tunnel("wg2", &["2.2.2.2"], &["192.168.0.0/16"], false);
         let rules = IptablesFirewall::generate_v4_ruleset(&[t1, t2]);
-        assert!(!rules.contains("-A OUTPUT -d 10.0.0.0/8 -j ACCEPT"));
-        assert!(rules.contains("-A OUTPUT -d 172.16.0.0/12 -j ACCEPT"));
-        assert!(!rules.contains("-A OUTPUT -d 192.168.0.0/16 -j ACCEPT"));
+        assert!(!rules.contains("-A VORTIX_KILLSWITCH -d 10.0.0.0/8 -j ACCEPT"));
+        assert!(rules.contains("-A VORTIX_KILLSWITCH -d 172.16.0.0/12 -j ACCEPT"));
+        assert!(!rules.contains("-A VORTIX_KILLSWITCH -d 192.168.0.0/16 -j ACCEPT"));
         // Both interfaces appear.
-        assert!(rules.contains("-A OUTPUT -o wg1 -j ACCEPT"));
-        assert!(rules.contains("-A OUTPUT -o wg2 -j ACCEPT"));
-        assert!(rules.contains("-A OUTPUT -d 1.1.1.1 -j ACCEPT"));
-        assert!(rules.contains("-A OUTPUT -d 2.2.2.2 -j ACCEPT"));
+        assert!(rules.contains("-A VORTIX_KILLSWITCH -o wg1 -j ACCEPT"));
+        assert!(rules.contains("-A VORTIX_KILLSWITCH -o wg2 -j ACCEPT"));
+        assert!(rules.contains("-A VORTIX_KILLSWITCH -d 1.1.1.1 -j ACCEPT"));
+        assert!(rules.contains("-A VORTIX_KILLSWITCH -d 2.2.2.2 -j ACCEPT"));
     }
 
     #[test]
@@ -543,9 +786,9 @@ mod tests {
         let t2 = tunnel("wg4", &["2.2.2.2"], &["10.5.0.0/16"], false);
         let rules = IptablesFirewall::generate_v4_ruleset(&[t1, t2]);
         // No 10.* leftover anywhere in the RFC1918 ACCEPT lines.
-        assert!(!rules.contains("-A OUTPUT -d 10."));
-        assert!(rules.contains("-A OUTPUT -d 172.16.0.0/12 -j ACCEPT"));
-        assert!(rules.contains("-A OUTPUT -d 192.168.0.0/16 -j ACCEPT"));
+        assert!(!rules.contains("-A VORTIX_KILLSWITCH -d 10."));
+        assert!(rules.contains("-A VORTIX_KILLSWITCH -d 172.16.0.0/12 -j ACCEPT"));
+        assert!(rules.contains("-A VORTIX_KILLSWITCH -d 192.168.0.0/16 -j ACCEPT"));
     }
 
     #[test]
@@ -555,20 +798,20 @@ mod tests {
         let sec = tunnel("wg1", &["8.8.8.8"], &["10.0.0.0/8"], false);
         let rules = IptablesFirewall::generate_v4_ruleset(&[prim, sec]);
         // 10/8 is gone.
-        assert!(!rules.contains("-A OUTPUT -d 10.0.0.0/8 -j ACCEPT"));
+        assert!(!rules.contains("-A VORTIX_KILLSWITCH -d 10.0.0.0/8 -j ACCEPT"));
         // 172.16 and 192.168 intact.
-        assert!(rules.contains("-A OUTPUT -d 172.16.0.0/12 -j ACCEPT"));
-        assert!(rules.contains("-A OUTPUT -d 192.168.0.0/16 -j ACCEPT"));
+        assert!(rules.contains("-A VORTIX_KILLSWITCH -d 172.16.0.0/12 -j ACCEPT"));
+        assert!(rules.contains("-A VORTIX_KILLSWITCH -d 192.168.0.0/16 -j ACCEPT"));
         // Both interfaces present.
-        assert!(rules.contains("-A OUTPUT -o wg0 -j ACCEPT"));
-        assert!(rules.contains("-A OUTPUT -o wg1 -j ACCEPT"));
+        assert!(rules.contains("-A VORTIX_KILLSWITCH -o wg0 -j ACCEPT"));
+        assert!(rules.contains("-A VORTIX_KILLSWITCH -o wg1 -j ACCEPT"));
     }
 
     #[test]
     fn tunnel_with_no_server_ips_still_gets_interface_rule() {
         let t = tunnel("wg5", &[], &[], true);
         let rules = IptablesFirewall::generate_v4_ruleset(&[t]);
-        assert!(rules.contains("-A OUTPUT -o wg5 -j ACCEPT"));
+        assert!(rules.contains("-A VORTIX_KILLSWITCH -o wg5 -j ACCEPT"));
         // No spurious -d <ip> line for the empty server list — count
         // occurrences of "wg5" — should appear exactly once on its own
         // interface allow line plus once in the "# Tunnel:" comment.
@@ -583,19 +826,26 @@ mod tests {
     fn tunnel_with_multiple_server_ips_emits_one_pass_per_ip() {
         let t = tunnel("wg6", &["1.2.3.4", "5.6.7.8"], &[], true);
         let rules = IptablesFirewall::generate_v4_ruleset(&[t]);
-        assert!(rules.contains("-A OUTPUT -d 1.2.3.4 -j ACCEPT"));
-        assert!(rules.contains("-A OUTPUT -d 5.6.7.8 -j ACCEPT"));
+        assert!(rules.contains("-A VORTIX_KILLSWITCH -d 1.2.3.4 -j ACCEPT"));
+        assert!(rules.contains("-A VORTIX_KILLSWITCH -d 5.6.7.8 -j ACCEPT"));
     }
 
     // ─── v6 ruleset generation ──────────────────────────────────────────
 
     #[test]
-    fn no_v6_server_ips_yields_none_v6_ruleset() {
-        // Only v4 server IPs — v6 ruleset is None (caller skips
-        // ip6tables-restore entirely).
+    fn no_v6_server_ips_still_yields_default_deny_v6_ruleset() {
+        // IPv6 must remain default-deny even when every tunnel endpoint is
+        // IPv4. Endpoint family controls reconnect exceptions, never whether
+        // the IPv6 policy exists.
         let t = tunnel("wg0", &["1.2.3.4"], &[], true);
-        assert!(IptablesFirewall::generate_v6_ruleset(&[t]).is_none());
-        assert!(IptablesFirewall::generate_v6_ruleset(&[]).is_none());
+        let with_tunnel = IptablesFirewall::generate_v6_ruleset(&[t]);
+        assert!(with_tunnel.contains(":VORTIX_KILLSWITCH - [0:0]"));
+        assert!(with_tunnel.contains("-A VORTIX_KILLSWITCH -o wg0 -j ACCEPT"));
+        assert!(with_tunnel.contains("-j DROP"));
+
+        let empty = IptablesFirewall::generate_v6_ruleset(&[]);
+        assert!(empty.contains("-A VORTIX_KILLSWITCH -o lo -j ACCEPT"));
+        assert!(empty.contains("-j DROP"));
     }
 
     #[test]
@@ -606,12 +856,12 @@ mod tests {
             declared_cidrs: vec![],
             is_primary: true,
         };
-        let v6 = IptablesFirewall::generate_v6_ruleset(&[t]).expect("v6 ruleset present");
+        let v6 = IptablesFirewall::generate_v6_ruleset(&[t]);
         assert!(v6.contains("*filter"));
-        assert!(v6.contains(":OUTPUT DROP [0:0]"));
-        assert!(v6.contains("-A OUTPUT -o lo -j ACCEPT"));
-        assert!(v6.contains("-A OUTPUT -o wg7 -j ACCEPT"));
-        assert!(v6.contains("-A OUTPUT -d 2001:db8::1 -j ACCEPT"));
+        assert!(v6.contains(":VORTIX_KILLSWITCH - [0:0]"));
+        assert!(v6.contains("-A VORTIX_KILLSWITCH -o lo -j ACCEPT"));
+        assert!(v6.contains("-A VORTIX_KILLSWITCH -o wg7 -j ACCEPT"));
+        assert!(v6.contains("-A VORTIX_KILLSWITCH -d 2001:db8::1 -j ACCEPT"));
         assert!(v6.trim_end().ends_with("COMMIT"));
     }
 
@@ -624,20 +874,17 @@ mod tests {
             is_primary: true,
         };
         let v4 = IptablesFirewall::generate_v4_ruleset(std::slice::from_ref(&t));
-        let v6 = IptablesFirewall::generate_v6_ruleset(std::slice::from_ref(&t))
-            .expect("v6 ruleset present");
+        let v6 = IptablesFirewall::generate_v6_ruleset(std::slice::from_ref(&t));
         // v4 ruleset has the v4 server IP, not the v6 one.
-        assert!(v4.contains("-A OUTPUT -d 1.2.3.4 -j ACCEPT"));
+        assert!(v4.contains("-A VORTIX_KILLSWITCH -d 1.2.3.4 -j ACCEPT"));
         assert!(!v4.contains("2001:db8"));
         // v6 ruleset has the v6 server IP, not the v4 one.
-        assert!(v6.contains("-A OUTPUT -d 2001:db8::1 -j ACCEPT"));
+        assert!(v6.contains("-A VORTIX_KILLSWITCH -d 2001:db8::1 -j ACCEPT"));
         assert!(!v6.contains("1.2.3.4"));
     }
 
     #[test]
-    fn v6_ruleset_skips_tunnels_with_only_v4_ips() {
-        // wg9 has only a v4 server IP; wg10 has a v6 one. The v6 ruleset
-        // should contain wg10's allow rule but no wg9 entries.
+    fn v6_ruleset_allows_every_tunnel_interface_but_only_v6_endpoints() {
         let t9 = tunnel("wg9", &["1.2.3.4"], &[], true);
         let t10 = ActiveTunnelInfo {
             interface: "wg10".to_string(),
@@ -645,10 +892,111 @@ mod tests {
             declared_cidrs: vec![],
             is_primary: false,
         };
-        let v6 = IptablesFirewall::generate_v6_ruleset(&[t9, t10]).expect("v6 ruleset present");
-        assert!(!v6.contains("wg9"));
-        assert!(v6.contains("-A OUTPUT -o wg10 -j ACCEPT"));
-        assert!(v6.contains("-A OUTPUT -d 2001:db8::1 -j ACCEPT"));
+        let v6 = IptablesFirewall::generate_v6_ruleset(&[t9, t10]);
+        assert!(v6.contains("-A VORTIX_KILLSWITCH -o wg9 -j ACCEPT"));
+        assert!(v6.contains("-A VORTIX_KILLSWITCH -o wg10 -j ACCEPT"));
+        assert!(v6.contains("-A VORTIX_KILLSWITCH -d 2001:db8::1 -j ACCEPT"));
+    }
+
+    #[test]
+    fn iptables_rulesets_only_replace_vortix_owned_chains() {
+        let tunnel = tunnel("wg0", &["1.2.3.4"], &["0.0.0.0/0"], true);
+        for rules in [
+            IptablesFirewall::generate_v4_ruleset(std::slice::from_ref(&tunnel)),
+            IptablesFirewall::generate_v6_ruleset(std::slice::from_ref(&tunnel)),
+        ] {
+            assert!(rules.contains(":VORTIX_KILLSWITCH - [0:0]"));
+            assert!(rules.contains("-F VORTIX_KILLSWITCH"));
+            assert!(!rules.contains(":INPUT"));
+            assert!(!rules.contains(":FORWARD"));
+            assert!(!rules.contains(":OUTPUT"));
+            assert!(!rules.contains("-F OUTPUT"));
+        }
+    }
+
+    #[test]
+    fn iptables_readback_requires_first_jump_and_marker_bound_drop() {
+        let expected = "*filter\n:VORTIX_KILLSWITCH - [0:0]\n-A VORTIX_KILLSWITCH -o lo -j ACCEPT\n-A VORTIX_KILLSWITCH -m comment --comment vortix-policy:abc123 -j DROP\nCOMMIT\n";
+        let valid = "*filter\n:VORTIX_KILLSWITCH - [0:0]\n-A OUTPUT -j VORTIX_KILLSWITCH\n-A OUTPUT -d 203.0.113.1 -j ACCEPT\n-A VORTIX_KILLSWITCH -o lo -j ACCEPT\n-A VORTIX_KILLSWITCH -m comment --comment \"vortix-policy:abc123\" -j DROP\nCOMMIT\n";
+        assert!(IptablesFirewall::snapshot_verifies_iptables(
+            valid, expected
+        ));
+        assert!(IptablesFirewall::output_jump_is_first(
+            "-P OUTPUT ACCEPT\n-A OUTPUT -j VORTIX_KILLSWITCH\n-A OUTPUT -j ACCEPT\n"
+        ));
+
+        let bypass = valid.replace(
+            "-A OUTPUT -j VORTIX_KILLSWITCH\n",
+            "-A OUTPUT -j ACCEPT\n-A OUTPUT -j VORTIX_KILLSWITCH\n",
+        );
+        assert!(!IptablesFirewall::snapshot_verifies_iptables(
+            &bypass, expected
+        ));
+
+        let false_marker = valid.replace(
+            "--comment \"vortix-policy:abc123\" -j DROP",
+            "--comment \"vortix-policy:abc123\" -j ACCEPT",
+        );
+        assert!(!IptablesFirewall::snapshot_verifies_iptables(
+            &false_marker,
+            expected
+        ));
+        let missing_allow = valid.replace("-A VORTIX_KILLSWITCH -o lo -j ACCEPT\n", "");
+        assert!(!IptablesFirewall::snapshot_verifies_iptables(
+            &missing_allow,
+            expected
+        ));
+    }
+
+    #[test]
+    fn legacy_global_policy_detection_is_strict() {
+        let legacy_v4 = "*filter\n:INPUT ACCEPT [0:0]\n:FORWARD ACCEPT [0:0]\n:OUTPUT DROP [0:0]\n-A OUTPUT -o lo -j ACCEPT\n-A OUTPUT -p udp -m udp --sport 68 --dport 67 -j ACCEPT\nCOMMIT\n";
+        assert!(IptablesFirewall::is_legacy_global_policy(legacy_v4, false));
+        assert!(!IptablesFirewall::is_legacy_global_policy(
+            &format!("{legacy_v4}-A INPUT -j ACCEPT\n"),
+            false
+        ));
+        assert!(!IptablesFirewall::is_legacy_global_policy(
+            &legacy_v4.replace(":OUTPUT DROP", ":OUTPUT ACCEPT"),
+            false
+        ));
+        let host_owned_drop = "*filter\n:INPUT ACCEPT [0:0]\n:FORWARD ACCEPT [0:0]\n:OUTPUT DROP [0:0]\n-A OUTPUT -d 203.0.113.10 -j ACCEPT\nCOMMIT\n";
+        assert!(!IptablesFirewall::is_legacy_global_policy(
+            host_owned_drop,
+            false
+        ));
+        assert_eq!(
+            IptablesFirewall::legacy_cleanup_ruleset(),
+            "*filter\n:OUTPUT ACCEPT [0:0]\n-F OUTPUT\nCOMMIT\n"
+        );
+    }
+
+    #[test]
+    fn nft_batch_replaces_owned_table_and_covers_two_tunnels_dual_stack() {
+        let first = tunnel("wg0", &["1.2.3.4"], &["0.0.0.0/0"], true);
+        let second = tunnel("wg1", &["2001:db8::1"], &["10.0.0.0/8"], false);
+        let rules = IptablesFirewall::generate_nft_ruleset(&[first, second]);
+
+        assert!(rules.starts_with("destroy table inet vortix_killswitch\n"));
+        assert!(rules.contains("oifname \"wg0\" accept"));
+        assert!(rules.contains("oifname \"wg1\" accept"));
+        assert!(rules.contains("ip daddr 1.2.3.4 accept"));
+        assert!(rules.contains("ip6 daddr 2001:db8::1 accept"));
+        assert!(!rules.contains("ip daddr 10.0.0.0/8 accept"));
+        assert_eq!(rules.matches("table inet vortix_killswitch").count(), 2);
+        let active = [
+            tunnel("wg0", &["1.2.3.4"], &["0.0.0.0/0"], true),
+            tunnel("wg1", &["2001:db8::1"], &["10.0.0.0/8"], false),
+        ];
+        assert!(IptablesFirewall::nft_snapshot_matches(&active, &rules));
+        assert!(!IptablesFirewall::nft_snapshot_matches(
+            &active,
+            &rules.replace("    oifname \"wg1\" accept\n", "")
+        ));
+        assert!(!IptablesFirewall::nft_snapshot_matches(
+            &active,
+            &rules.replace("counter drop comment", "counter accept comment")
+        ));
     }
 
     // ─── snapshot tests pinning ruleset shape ───────────────────────────
@@ -656,20 +1004,23 @@ mod tests {
     #[test]
     fn snapshot_empty_active_set() {
         let rules = IptablesFirewall::generate_v4_ruleset(&[]);
-        let expected = "\
+        let digest = crate::core::killswitch::policy_digest(&[]);
+        let expected = format!(
+            "\
 # Vortix Kill Switch Rules - Auto-generated
 # DO NOT EDIT - Will be overwritten
 *filter
-:INPUT ACCEPT [0:0]
-:FORWARD ACCEPT [0:0]
-:OUTPUT DROP [0:0]
--A OUTPUT -o lo -j ACCEPT
--A OUTPUT -d 10.0.0.0/8 -j ACCEPT
--A OUTPUT -d 172.16.0.0/12 -j ACCEPT
--A OUTPUT -d 192.168.0.0/16 -j ACCEPT
--A OUTPUT -p udp --sport 68 --dport 67 -j ACCEPT
+:VORTIX_KILLSWITCH - [0:0]
+-F VORTIX_KILLSWITCH
+-A VORTIX_KILLSWITCH -o lo -j ACCEPT
+-A VORTIX_KILLSWITCH -d 10.0.0.0/8 -j ACCEPT
+-A VORTIX_KILLSWITCH -d 172.16.0.0/12 -j ACCEPT
+-A VORTIX_KILLSWITCH -d 192.168.0.0/16 -j ACCEPT
+-A VORTIX_KILLSWITCH -p udp --sport 68 --dport 67 -j ACCEPT
+-A VORTIX_KILLSWITCH -m comment --comment vortix-policy:{digest} -j DROP
 COMMIT
-";
+"
+        );
         assert_eq!(rules, expected);
     }
 
@@ -681,24 +1032,28 @@ COMMIT
             declared_cidrs: vec![cidr("0.0.0.0/0")],
             is_primary: true,
         };
-        let rules = IptablesFirewall::generate_v4_ruleset(&[t]);
-        let expected = "\
+        let active = [t];
+        let rules = IptablesFirewall::generate_v4_ruleset(&active);
+        let digest = crate::core::killswitch::policy_digest(&active);
+        let expected = format!(
+            "\
 # Vortix Kill Switch Rules - Auto-generated
 # DO NOT EDIT - Will be overwritten
 *filter
-:INPUT ACCEPT [0:0]
-:FORWARD ACCEPT [0:0]
-:OUTPUT DROP [0:0]
--A OUTPUT -o lo -j ACCEPT
--A OUTPUT -d 10.0.0.0/8 -j ACCEPT
--A OUTPUT -d 172.16.0.0/12 -j ACCEPT
--A OUTPUT -d 192.168.0.0/16 -j ACCEPT
--A OUTPUT -p udp --sport 68 --dport 67 -j ACCEPT
+:VORTIX_KILLSWITCH - [0:0]
+-F VORTIX_KILLSWITCH
+-A VORTIX_KILLSWITCH -o lo -j ACCEPT
+-A VORTIX_KILLSWITCH -d 10.0.0.0/8 -j ACCEPT
+-A VORTIX_KILLSWITCH -d 172.16.0.0/12 -j ACCEPT
+-A VORTIX_KILLSWITCH -d 192.168.0.0/16 -j ACCEPT
+-A VORTIX_KILLSWITCH -p udp --sport 68 --dport 67 -j ACCEPT
 # Tunnel: wg0 (primary=true)
--A OUTPUT -o wg0 -j ACCEPT
--A OUTPUT -d 1.2.3.4 -j ACCEPT
+-A VORTIX_KILLSWITCH -o wg0 -j ACCEPT
+-A VORTIX_KILLSWITCH -d 1.2.3.4 -j ACCEPT
+-A VORTIX_KILLSWITCH -m comment --comment vortix-policy:{digest} -j DROP
 COMMIT
-";
+"
+        );
         assert_eq!(rules, expected);
     }
 
@@ -716,26 +1071,30 @@ COMMIT
             declared_cidrs: vec![cidr("10.0.0.0/8")],
             is_primary: false,
         };
-        let rules = IptablesFirewall::generate_v4_ruleset(&[prim, sec]);
-        let expected = "\
+        let active = [prim, sec];
+        let rules = IptablesFirewall::generate_v4_ruleset(&active);
+        let digest = crate::core::killswitch::policy_digest(&active);
+        let expected = format!(
+            "\
 # Vortix Kill Switch Rules - Auto-generated
 # DO NOT EDIT - Will be overwritten
 *filter
-:INPUT ACCEPT [0:0]
-:FORWARD ACCEPT [0:0]
-:OUTPUT DROP [0:0]
--A OUTPUT -o lo -j ACCEPT
--A OUTPUT -d 172.16.0.0/12 -j ACCEPT
--A OUTPUT -d 192.168.0.0/16 -j ACCEPT
--A OUTPUT -p udp --sport 68 --dport 67 -j ACCEPT
+:VORTIX_KILLSWITCH - [0:0]
+-F VORTIX_KILLSWITCH
+-A VORTIX_KILLSWITCH -o lo -j ACCEPT
+-A VORTIX_KILLSWITCH -d 172.16.0.0/12 -j ACCEPT
+-A VORTIX_KILLSWITCH -d 192.168.0.0/16 -j ACCEPT
+-A VORTIX_KILLSWITCH -p udp --sport 68 --dport 67 -j ACCEPT
 # Tunnel: wg0 (primary=true)
--A OUTPUT -o wg0 -j ACCEPT
--A OUTPUT -d 1.2.3.4 -j ACCEPT
+-A VORTIX_KILLSWITCH -o wg0 -j ACCEPT
+-A VORTIX_KILLSWITCH -d 1.2.3.4 -j ACCEPT
 # Tunnel: wg1 (primary=false)
--A OUTPUT -o wg1 -j ACCEPT
--A OUTPUT -d 5.6.7.8 -j ACCEPT
+-A VORTIX_KILLSWITCH -o wg1 -j ACCEPT
+-A VORTIX_KILLSWITCH -d 5.6.7.8 -j ACCEPT
+-A VORTIX_KILLSWITCH -m comment --comment vortix-policy:{digest} -j DROP
 COMMIT
-";
+"
+        );
         assert_eq!(rules, expected);
     }
 }

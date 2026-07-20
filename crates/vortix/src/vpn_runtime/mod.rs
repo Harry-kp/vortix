@@ -29,6 +29,30 @@ use crate::message::Message;
 use crate::state::{
     KillSwitchMode, KillSwitchState, ProfileSortOrder, Protocol, RetryState, VpnProfile,
 };
+
+fn effective_killswitch_state(
+    requested: KillSwitchState,
+    firewall_result: Option<bool>,
+) -> KillSwitchState {
+    match firewall_result {
+        Some(false) => KillSwitchState::Degraded,
+        Some(true) | None => requested,
+    }
+}
+
+fn needs_firewall_release(old: KillSwitchState, requested: KillSwitchState) -> bool {
+    !requested.is_blocking() && matches!(old, KillSwitchState::Blocking | KillSwitchState::Degraded)
+}
+
+fn current_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
 use crate::utils;
 use crate::vortix_core::profile::ProfileId;
 
@@ -95,6 +119,10 @@ pub struct VpnRuntime {
     // === Kill Switch ===
     pub killswitch_mode: KillSwitchMode,
     pub killswitch_state: KillSwitchState,
+    /// Fresh platform read-back proof for the current Blocking state.
+    pub killswitch_verification: Option<crate::core::killswitch::FirewallVerification>,
+    /// Bounds retries after a persistent platform mutation/read-back failure.
+    killswitch_last_verification_attempt_ms: Option<u64>,
 
     // === Connection Retry & Auto-Reconnect ===
     /// Per-profile retry / auto-reconnect bookkeeping.
@@ -160,6 +188,8 @@ impl VpnRuntime {
 
             killswitch_mode: KillSwitchMode::default(),
             killswitch_state: KillSwitchState::default(),
+            killswitch_verification: None,
+            killswitch_last_verification_attempt_ms: None,
 
             retry_state: HashMap::new(),
 
@@ -178,9 +208,11 @@ impl VpnRuntime {
         if let Some(persisted) = crate::core::killswitch::load_state() {
             engine.killswitch_mode = persisted.mode;
             if persisted.state == KillSwitchState::Blocking {
-                let _ = crate::core::killswitch::disable_blocking();
-                engine.killswitch_state = KillSwitchState::Disabled;
-                crate::core::killswitch::clear_state();
+                // A persisted blocking request is not fresh proof, but its
+                // kernel policy may still be the only fail-closed barrier.
+                // Keep it in place and report unverified/watching until the
+                // next synchronization applies and reads back the policy.
+                engine.killswitch_state = KillSwitchState::Degraded;
             } else {
                 engine.killswitch_state = persisted.state;
             }
@@ -248,6 +280,8 @@ impl VpnRuntime {
 
             killswitch_mode: KillSwitchMode::default(),
             killswitch_state: KillSwitchState::default(),
+            killswitch_verification: None,
+            killswitch_last_verification_attempt_ms: None,
 
             retry_state: HashMap::new(),
 
@@ -266,9 +300,7 @@ impl VpnRuntime {
         if let Some(persisted) = crate::core::killswitch::load_state() {
             engine.killswitch_mode = persisted.mode;
             if persisted.state == KillSwitchState::Blocking {
-                let _ = crate::core::killswitch::disable_blocking();
-                engine.killswitch_state = KillSwitchState::Disabled;
-                crate::core::killswitch::clear_state();
+                engine.killswitch_state = KillSwitchState::Degraded;
             } else {
                 engine.killswitch_state = persisted.state;
             }
@@ -315,6 +347,8 @@ impl VpnRuntime {
             sort_order: ProfileSortOrder::default(),
             killswitch_mode: KillSwitchMode::Off,
             killswitch_state: KillSwitchState::Disabled,
+            killswitch_verification: None,
+            killswitch_last_verification_attempt_ms: None,
             retry_state: HashMap::new(),
             telemetry_rx: None,
             telemetry_nudge: None,
@@ -508,7 +542,7 @@ impl VpnRuntime {
         &mut self,
         is_connected: bool,
         active_tunnels: &[crate::core::killswitch::ActiveTunnelInfo],
-    ) {
+    ) -> bool {
         let old_state = self.killswitch_state;
 
         // Pure mode → state decision lives on `KillSwitchMode` so it
@@ -516,39 +550,88 @@ impl VpnRuntime {
         // always resolves to Blocking — the firewall stays engaged
         // whether the VPN is up or down (canonical Linux killswitch
         // shape; see `tests/integration/killswitch.sh`).
-        self.killswitch_state = self.killswitch_mode.desired_state(old_state, is_connected);
+        let mut requested_state = self.killswitch_mode.desired_state(old_state, is_connected);
 
-        if self.killswitch_state.is_blocking() && !self.is_root {
-            self.killswitch_state = KillSwitchState::Armed;
+        if requested_state.is_blocking() && !self.is_root {
+            requested_state = KillSwitchState::Armed;
         }
 
-        if self.killswitch_state != old_state || self.killswitch_state == KillSwitchState::Blocking
-        {
-            if self.killswitch_state.is_blocking() {
-                if let Err(e) = crate::core::killswitch::enable_blocking_multi(active_tunnels) {
-                    logger::log(
-                        logger::LogLevel::Warning,
-                        "SEC",
-                        format!("Failed to enable kill switch: {e}"),
-                    );
+        let mut firewall_result = None;
+        if requested_state != old_state || requested_state == KillSwitchState::Blocking {
+            self.killswitch_last_verification_attempt_ms = Some(current_unix_ms());
+            if requested_state.is_blocking() {
+                match crate::core::killswitch::enable_blocking_multi(active_tunnels) {
+                    Ok(()) => firewall_result = Some(true),
+                    Err(e) => {
+                        firewall_result = Some(false);
+                        logger::log(
+                            logger::LogLevel::Warning,
+                            "SEC",
+                            format!(
+                                "Kill switch policy was not verified; protection degraded: {e}"
+                            ),
+                        );
+                    }
                 }
-            } else if old_state.is_blocking() {
-                if let Err(e) = crate::core::killswitch::disable_blocking() {
-                    logger::log(
-                        logger::LogLevel::Warning,
-                        "SEC",
-                        format!("Failed to release kill switch: {e}"),
-                    );
+            } else if needs_firewall_release(old_state, requested_state) {
+                match crate::core::killswitch::disable_blocking() {
+                    Ok(()) => firewall_result = Some(true),
+                    Err(e) => {
+                        firewall_result = Some(false);
+                        logger::log(
+                            logger::LogLevel::Warning,
+                            "SEC",
+                            format!("Kill switch release was not verified; state degraded: {e}"),
+                        );
+                    }
                 }
             }
         }
+        self.killswitch_state = effective_killswitch_state(requested_state, firewall_result);
 
         let persisted_tunnels = crate::core::killswitch::persisted_from_active(active_tunnels);
-        let _ = crate::core::killswitch::save_state(
+        let verification = (self.killswitch_state == KillSwitchState::Blocking
+            && firewall_result == Some(true))
+        .then(|| crate::core::killswitch::local_verification(active_tunnels));
+        self.killswitch_verification.clone_from(&verification);
+        if let Err(e) = crate::core::killswitch::save_state_with_verification(
             self.killswitch_mode,
             self.killswitch_state,
             persisted_tunnels,
-        );
+            verification,
+        ) {
+            logger::log(
+                logger::LogLevel::Warning,
+                "SEC",
+                format!("Failed to persist kill switch state: {e}"),
+            );
+        }
+        firewall_result != Some(false)
+    }
+
+    /// Whether Blocking truth needs a new platform observation. Degraded
+    /// state also retries so a transient apply/read-back failure can recover.
+    #[must_use]
+    pub fn killswitch_verification_needs_refresh(&self) -> bool {
+        if !matches!(
+            self.killswitch_state,
+            KillSwitchState::Blocking | KillSwitchState::Degraded
+        ) {
+            return false;
+        }
+        let now_ms = current_unix_ms();
+        if self
+            .killswitch_last_verification_attempt_ms
+            .is_some_and(|attempt| now_ms < attempt.saturating_add(5_000))
+        {
+            return false;
+        }
+        if self.killswitch_state == KillSwitchState::Degraded {
+            return true;
+        }
+        self.killswitch_verification
+            .as_ref()
+            .is_none_or(|proof| proof.fresh_until_unix_ms <= now_ms)
     }
 
     /// Check if required binaries are available for a given protocol.
@@ -705,6 +788,47 @@ impl Drop for VpnRuntime {
         //
         // Kill switch firewall rules also persist — the next launch recovers
         // them via `load_state()`.
+    }
+}
+
+#[cfg(test)]
+mod killswitch_truth_tests {
+    use super::{effective_killswitch_state, needs_firewall_release, KillSwitchState};
+
+    #[test]
+    fn failed_apply_or_readback_never_retains_blocking_truth() {
+        assert_eq!(
+            effective_killswitch_state(KillSwitchState::Blocking, Some(false)),
+            KillSwitchState::Degraded
+        );
+    }
+
+    #[test]
+    fn verified_and_noop_transitions_keep_the_requested_state() {
+        assert_eq!(
+            effective_killswitch_state(KillSwitchState::Blocking, Some(true)),
+            KillSwitchState::Blocking
+        );
+        assert_eq!(
+            effective_killswitch_state(KillSwitchState::Disabled, None),
+            KillSwitchState::Disabled
+        );
+    }
+
+    #[test]
+    fn degraded_prior_policy_retries_release_until_verified() {
+        assert!(needs_firewall_release(
+            KillSwitchState::Degraded,
+            KillSwitchState::Disabled
+        ));
+        assert!(needs_firewall_release(
+            KillSwitchState::Degraded,
+            KillSwitchState::Armed
+        ));
+        assert!(!needs_firewall_release(
+            KillSwitchState::Degraded,
+            KillSwitchState::Blocking
+        ));
     }
 }
 

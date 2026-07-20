@@ -583,13 +583,19 @@ fn get_killswitch_indicator(app: &App) -> Span<'static> {
     use crate::state::{KillSwitchMode, KillSwitchState};
 
     match (app.runtime.killswitch_mode, app.runtime.killswitch_state) {
+        (_, KillSwitchState::Degraded) => Span::styled(
+            " KS:DEGRADED ",
+            Style::default()
+                .fg(theme::ERROR)
+                .add_modifier(Modifier::BOLD),
+        ),
         (KillSwitchMode::Off, _) | (_, KillSwitchState::Disabled) => {
             Span::styled(" KS:Off ", Style::default().fg(theme::INACTIVE))
         }
         // AlwaysOn + Blocking is the steady state for VPN-only mode —
         // green/by-design, not an alarm. Caught before the generic
         // `(_, Blocking)` arm so it doesn't get the red alarm treatment.
-        (KillSwitchMode::AlwaysOn, _) => {
+        (KillSwitchMode::AlwaysOn, KillSwitchState::Blocking) => {
             Span::styled(" KS:VPN-only ", Style::default().fg(theme::SUCCESS))
         }
         // Auto + Blocking means the VPN actually dropped and the
@@ -600,7 +606,7 @@ fn get_killswitch_indicator(app: &App) -> Span<'static> {
                 .fg(theme::ERROR)
                 .add_modifier(Modifier::BOLD),
         ),
-        (KillSwitchMode::Auto, KillSwitchState::Armed) => {
+        (_, KillSwitchState::Armed) => {
             Span::styled(" KS:Watch ", Style::default().fg(theme::SUCCESS))
         }
     }
@@ -672,6 +678,17 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    #[test]
+    fn degraded_firewall_truth_overrides_mode_success_label() {
+        let mut app = App::new_test();
+        app.runtime.killswitch_mode = crate::state::KillSwitchMode::AlwaysOn;
+        app.runtime.killswitch_state = crate::state::KillSwitchState::Degraded;
+        assert_eq!(
+            get_killswitch_indicator(&app).content.as_ref(),
+            " KS:DEGRADED "
+        );
     }
 
     // ─────────── State 0: no tunnels → ⚠ Real ───────────

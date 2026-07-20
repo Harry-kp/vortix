@@ -7,9 +7,12 @@ use crate::constants;
 use crate::logger::{self, LogLevel};
 use crate::state::{KillSwitchMode, KillSwitchState};
 use crate::utils;
+use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 // Re-export the canonical types so existing `crate::core::killswitch::*`
 // imports keep resolving.
@@ -17,6 +20,166 @@ pub use crate::vortix_core::ports::killswitch::{ActiveTunnelInfo, KillswitchErro
 
 // Backwards-compat alias — the old name is `KillSwitchError`.
 pub type KillSwitchError = KillswitchError;
+
+/// Typed proof attached only after a platform adapter has read back the
+/// Vortix-owned policy it just applied.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FirewallVerification {
+    /// Digest of the complete normalized multi-tunnel policy.
+    pub policy_digest: String,
+    /// Wall-clock observation timestamp for diagnostics/persistence.
+    pub observed_at_unix_ms: u64,
+    /// Hard freshness ceiling; later units add event-driven invalidation.
+    pub fresh_until_unix_ms: u64,
+    /// Local authority epoch. A process restart cannot reuse this proof.
+    pub executor_epoch: String,
+    /// OS boot identity. Proof cannot cross a reboot even if process metadata
+    /// is accidentally reused.
+    pub boot_id: String,
+    /// Observation mechanism, currently platform-owned kernel read-back.
+    pub source: FirewallObservationSource,
+}
+
+/// Allowlisted source of firewall verification evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum FirewallObservationSource {
+    /// The selected platform adapter read back its owned kernel policy.
+    PlatformReadback,
+}
+
+/// Construct fresh local proof after a successful platform read-back.
+#[must_use]
+pub fn local_verification(active: &[ActiveTunnelInfo]) -> FirewallVerification {
+    let observed_at_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    FirewallVerification {
+        policy_digest: policy_digest(active),
+        observed_at_unix_ms,
+        fresh_until_unix_ms: observed_at_unix_ms.saturating_add(5_000),
+        executor_epoch: local_executor_epoch().to_string(),
+        boot_id: boot_identity(),
+        source: FirewallObservationSource::PlatformReadback,
+    }
+}
+
+fn local_executor_epoch() -> &'static str {
+    static EPOCH: OnceLock<String> = OnceLock::new();
+    EPOCH.get_or_init(|| {
+        let started_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        format!("standard-local:{}:{started_ns}", std::process::id())
+    })
+}
+
+#[cfg(target_os = "linux")] // xtask:allow-platform-cfg: boot identity proof needs the OS kernel primitive until U12 moves executor epochs behind the helper port
+fn boot_identity() -> String {
+    fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map(|value| value.trim().to_string())
+        .unwrap_or_else(|_| "linux-boot-unknown".to_string())
+}
+
+#[cfg(target_os = "macos")]
+// xtask:allow-platform-cfg: boot identity proof needs the OS kernel primitive until U12 moves executor epochs behind the helper port
+#[allow(unsafe_code)]
+fn boot_identity() -> String {
+    let mut boot_time = libc::timeval {
+        tv_sec: 0,
+        tv_usec: 0,
+    };
+    let mut size = std::mem::size_of::<libc::timeval>();
+    // SAFETY: `kern.boottime` writes one timeval into the correctly sized,
+    // aligned output buffer; no input buffer is supplied.
+    let result = unsafe {
+        libc::sysctlbyname(
+            c"kern.boottime".as_ptr(),
+            (&raw mut boot_time).cast(),
+            &raw mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if result == 0 {
+        format!("macos-boot:{}:{}", boot_time.tv_sec, boot_time.tv_usec)
+    } else {
+        "macos-boot-unknown".to_string()
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))] // xtask:allow-platform-cfg: unsupported targets need an explicit non-authoritative boot identity
+fn boot_identity() -> String {
+    "unsupported-boot-identity".to_string()
+}
+
+/// Stable digest of the complete requested firewall policy.
+///
+/// The digest is independent of caller iteration order: tunnels, endpoints,
+/// and declared CIDRs are sorted before hashing. Platform adapters stamp this
+/// value into their owned rules and require the same value during read-back,
+/// so a successful command alone can never promote protection truth.
+#[must_use]
+pub fn policy_digest(active: &[ActiveTunnelInfo]) -> String {
+    let mut tunnels: Vec<String> = active
+        .iter()
+        .map(|tunnel| {
+            let mut endpoints: Vec<String> =
+                tunnel.server_ips.iter().map(ToString::to_string).collect();
+            endpoints.sort_unstable();
+            let mut cidrs: Vec<String> = tunnel
+                .declared_cidrs
+                .iter()
+                .map(|cidr| format!("{}/{}", cidr.addr, cidr.prefix_len))
+                .collect();
+            cidrs.sort_unstable();
+            format!(
+                "{}|{}|{}|{}",
+                tunnel.interface,
+                tunnel.is_primary,
+                endpoints.join(","),
+                cidrs.join(",")
+            )
+        })
+        .collect();
+    tunnels.sort_unstable();
+
+    let digest = Sha256::digest(tunnels.join("\n").as_bytes());
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
+}
+
+/// Validate values that platform adapters interpolate into firewall syntax.
+/// Typed addresses/CIDRs are already syntax-safe; interface names are the
+/// remaining text boundary and must fit the common Unix IFNAMSIZ contract.
+///
+/// # Errors
+///
+/// Returns [`KillswitchError::InvalidPolicy`] for empty, overlong, or
+/// non-portable interface names.
+pub fn validate_policy(active: &[ActiveTunnelInfo]) -> Result<()> {
+    for tunnel in active {
+        let interface = tunnel.interface.as_bytes();
+        if interface.is_empty()
+            || interface.len() > 15
+            || !interface
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'-' | b'.'))
+        {
+            return Err(KillswitchError::InvalidPolicy(format!(
+                "unsafe interface name {:?}",
+                tunnel.interface
+            )));
+        }
+    }
+    Ok(())
+}
 
 /// Enable kill switch with a per-tunnel ruleset.
 ///
@@ -73,7 +236,7 @@ fn default_schema_version() -> u8 {
 /// compatibility — the in-memory `ActiveTunnelInfo` uses typed `IpAddr`
 /// and `Cidr`, but persisted state must tolerate any value that round-
 /// trips through `Display`/`FromStr`, including future address families.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PersistedTunnelInfo {
     /// Tunnel interface name, e.g. `utun3` or `wg0`.
     pub interface: String,
@@ -110,6 +273,10 @@ pub struct PersistedState {
     pub schema_version: u8,
     pub mode: KillSwitchMode,
     pub state: KillSwitchState,
+    /// Expanded effective truth for new readers. The legacy `state` field is
+    /// kept downgrade-readable (`Degraded` is encoded there as `Armed`).
+    #[serde(default)]
+    pub effective_state: Option<KillSwitchState>,
     /// V1 legacy — single-tunnel interface name. `None` on fresh V2
     /// writes.
     #[serde(default)]
@@ -121,6 +288,10 @@ pub struct PersistedState {
     /// Empty for V1 files until coerced by `load_state`.
     #[serde(default)]
     pub active_tunnels: Vec<PersistedTunnelInfo>,
+    /// Present only for a successfully read-back Blocking policy. Missing or
+    /// stale evidence makes the next process start explicitly Degraded.
+    #[serde(default)]
+    pub firewall_verification: Option<FirewallVerification>,
 }
 
 /// Coerce a V1 (or unknown-version-fallback) `PersistedState` into V2
@@ -187,6 +358,9 @@ pub fn load_state() -> Option<PersistedState> {
             return None;
         }
     };
+    if let Some(effective) = persisted.effective_state {
+        persisted.state = effective;
+    }
 
     logger::log(
         LogLevel::Debug,
@@ -243,6 +417,20 @@ pub fn save_state(
     state: KillSwitchState,
     active_tunnels: Vec<PersistedTunnelInfo>,
 ) -> Result<()> {
+    save_state_with_verification(mode, state, active_tunnels, None)
+}
+
+/// Save requested/effective state with optional fresh kernel read-back proof.
+///
+/// # Errors
+///
+/// Returns [`KillswitchError::Io`] when the file cannot be written.
+pub fn save_state_with_verification(
+    mode: KillSwitchMode,
+    state: KillSwitchState,
+    active_tunnels: Vec<PersistedTunnelInfo>,
+    firewall_verification: Option<FirewallVerification>,
+) -> Result<()> {
     let Some(path) = get_state_path() else {
         return Ok(()); // Silently skip if no home dir
     };
@@ -252,21 +440,72 @@ pub fn save_state(
         fs::create_dir_all(parent)?;
     }
 
+    let firewall_verification = firewall_verification.or_else(|| {
+        if state != KillSwitchState::Blocking {
+            return None;
+        }
+        let content = fs::read_to_string(&path).ok()?;
+        let existing: PersistedState = serde_json::from_str(&content).ok()?;
+        let verification = existing.firewall_verification?;
+        let expected = policy_digest_from_persisted(&active_tunnels)?;
+        let now_ms: u64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_millis()
+            .try_into()
+            .ok()?;
+        (verification.policy_digest == expected
+            && verification.fresh_until_unix_ms > now_ms
+            && verification.executor_epoch == local_executor_epoch()
+            && verification.boot_id == boot_identity())
+        .then_some(verification)
+    });
+
+    let legacy_state = if state == KillSwitchState::Degraded {
+        KillSwitchState::Armed
+    } else {
+        state
+    };
     let persisted = PersistedState {
         schema_version: PERSISTED_STATE_SCHEMA_V2,
         mode,
-        state,
+        state: legacy_state,
+        effective_state: Some(state),
         // V1 legacy fields — left empty on fresh V2 writes. V1 readers
         // that lack `#[serde(default)]` tolerance need D5 (see plan).
         vpn_interface: None,
         vpn_server_ip: None,
         active_tunnels,
+        firewall_verification,
     };
 
     let content = serde_json::to_string_pretty(&persisted).map_err(io::Error::other)?;
 
     atomic_write(&path, content.as_bytes())?;
     Ok(())
+}
+
+fn policy_digest_from_persisted(active: &[PersistedTunnelInfo]) -> Option<String> {
+    let parsed: Option<Vec<ActiveTunnelInfo>> = active
+        .iter()
+        .map(|tunnel| {
+            Some(ActiveTunnelInfo {
+                interface: tunnel.interface.clone(),
+                server_ips: tunnel
+                    .server_ips
+                    .iter()
+                    .map(|ip| ip.parse().ok())
+                    .collect::<Option<Vec<_>>>()?,
+                declared_cidrs: tunnel
+                    .declared_cidrs
+                    .iter()
+                    .map(|cidr| cidr.parse().ok())
+                    .collect::<Option<Vec<_>>>()?,
+                is_primary: tunnel.is_primary,
+            })
+        })
+        .collect();
+    parsed.map(|active| policy_digest(&active))
 }
 
 /// Convenience helper: build a `PersistedTunnelInfo` slice from
@@ -322,11 +561,98 @@ mod tests {
     use super::*;
 
     #[test]
+    fn policy_digest_covers_full_policy_but_not_iteration_order() {
+        use crate::vortix_core::cidr::Cidr;
+        use std::net::IpAddr;
+
+        let first = ActiveTunnelInfo {
+            interface: "wg0".to_string(),
+            server_ips: vec!["1.2.3.4".parse::<IpAddr>().unwrap()],
+            declared_cidrs: vec!["0.0.0.0/0".parse::<Cidr>().unwrap()],
+            is_primary: true,
+        };
+        let second = ActiveTunnelInfo {
+            interface: "wg1".to_string(),
+            server_ips: vec!["2001:db8::1".parse::<IpAddr>().unwrap()],
+            declared_cidrs: vec!["10.0.0.0/8".parse::<Cidr>().unwrap()],
+            is_primary: false,
+        };
+
+        assert_eq!(
+            policy_digest(&[first.clone(), second.clone()]),
+            policy_digest(&[second.clone(), first.clone()])
+        );
+
+        let mut changed = second;
+        changed.interface = "wg2".to_string();
+        assert_ne!(
+            policy_digest(&[first.clone(), changed]),
+            policy_digest(&[first])
+        );
+    }
+
+    #[test]
+    fn policy_validation_rejects_firewall_script_injection() {
+        let malicious = ActiveTunnelInfo {
+            interface: "wg0\nblock all".to_string(),
+            server_ips: Vec::new(),
+            declared_cidrs: Vec::new(),
+            is_primary: true,
+        };
+        assert!(matches!(
+            validate_policy(&[malicious]),
+            Err(KillswitchError::InvalidPolicy(_))
+        ));
+        let safe = ActiveTunnelInfo {
+            interface: "wg-corp.1".to_string(),
+            server_ips: Vec::new(),
+            declared_cidrs: Vec::new(),
+            is_primary: true,
+        };
+        assert!(validate_policy(&[safe]).is_ok());
+    }
+
+    #[test]
+    fn local_verification_is_typed_bounded_and_policy_bound() {
+        use crate::vortix_core::cidr::Cidr;
+        use std::net::IpAddr;
+        let active = [ActiveTunnelInfo {
+            interface: "wg0".to_string(),
+            server_ips: vec!["1.2.3.4".parse::<IpAddr>().unwrap()],
+            declared_cidrs: vec!["0.0.0.0/0".parse::<Cidr>().unwrap()],
+            is_primary: true,
+        }];
+        let verification = local_verification(&active);
+        assert_eq!(verification.policy_digest, policy_digest(&active));
+        assert_eq!(
+            verification.source,
+            FirewallObservationSource::PlatformReadback
+        );
+        assert_eq!(
+            verification
+                .fresh_until_unix_ms
+                .saturating_sub(verification.observed_at_unix_ms),
+            5_000
+        );
+        assert!(verification.executor_epoch.starts_with("standard-local:"));
+        assert_eq!(verification.executor_epoch, local_executor_epoch());
+        assert!(!verification.boot_id.is_empty());
+        assert_eq!(verification.boot_id, boot_identity());
+
+        let persisted = persisted_from_active(&active);
+        assert_eq!(
+            policy_digest_from_persisted(&persisted).as_deref(),
+            Some(verification.policy_digest.as_str())
+        );
+    }
+
+    #[test]
     fn v2_persisted_state_round_trips() {
         let state = PersistedState {
             schema_version: PERSISTED_STATE_SCHEMA_V2,
             mode: KillSwitchMode::Auto,
             state: KillSwitchState::Armed,
+            effective_state: None,
             vpn_interface: None,
             vpn_server_ip: None,
             active_tunnels: vec![PersistedTunnelInfo {
@@ -335,6 +661,7 @@ mod tests {
                 declared_cidrs: vec!["10.0.0.0/8".to_string()],
                 is_primary: true,
             }],
+            firewall_verification: None,
         };
 
         let json = serde_json::to_string_pretty(&state).unwrap();
@@ -425,6 +752,7 @@ mod tests {
             schema_version: PERSISTED_STATE_SCHEMA_V2,
             mode: KillSwitchMode::Auto,
             state: KillSwitchState::Armed,
+            effective_state: None,
             vpn_interface: None,
             vpn_server_ip: None,
             active_tunnels: vec![
@@ -441,6 +769,7 @@ mod tests {
                     is_primary: false,
                 },
             ],
+            firewall_verification: None,
         };
         let live = vec!["lo".to_string(), "eth0".to_string()];
         filter_phantom_tunnels(&mut state, &live);
@@ -455,6 +784,7 @@ mod tests {
             schema_version: PERSISTED_STATE_SCHEMA_V2,
             mode: KillSwitchMode::Auto,
             state: KillSwitchState::Armed,
+            effective_state: None,
             vpn_interface: None,
             vpn_server_ip: None,
             active_tunnels: vec![PersistedTunnelInfo {
@@ -463,6 +793,7 @@ mod tests {
                 declared_cidrs: Vec::new(),
                 is_primary: true,
             }],
+            firewall_verification: None,
         };
         filter_phantom_tunnels(&mut state, &[]);
         assert_eq!(state.active_tunnels.len(), 1);
@@ -558,5 +889,31 @@ mod tests {
         assert_eq!(parsed.mode, KillSwitchMode::Auto);
         assert_eq!(parsed.state, KillSwitchState::Armed);
         assert!(parsed.vpn_interface.is_none());
+    }
+
+    #[test]
+    fn degraded_write_remains_readable_as_armed_to_v0_3() {
+        #[derive(Debug, serde::Deserialize)]
+        struct V1PersistedState {
+            state: KillSwitchState,
+        }
+
+        let state = PersistedState {
+            schema_version: PERSISTED_STATE_SCHEMA_V2,
+            mode: KillSwitchMode::AlwaysOn,
+            state: KillSwitchState::Armed,
+            effective_state: Some(KillSwitchState::Degraded),
+            vpn_interface: None,
+            vpn_server_ip: None,
+            active_tunnels: Vec::new(),
+            firewall_verification: None,
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let old: V1PersistedState = serde_json::from_str(&json).unwrap();
+        assert_eq!(old.state, KillSwitchState::Armed);
+
+        let mut current: PersistedState = serde_json::from_str(&json).unwrap();
+        current.state = current.effective_state.unwrap_or(current.state);
+        assert_eq!(current.state, KillSwitchState::Degraded);
     }
 }

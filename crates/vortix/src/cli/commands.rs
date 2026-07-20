@@ -2085,7 +2085,22 @@ fn handle_killswitch(
 
         engine.killswitch_mode = ks_mode;
         let (is_connected, active_tunnels) = engine.killswitch_view_from_scanner();
-        engine.sync_killswitch(is_connected, &active_tunnels);
+        if !engine.sync_killswitch(is_connected, &active_tunnels) {
+            print_error_and_exit(
+                output_mode,
+                "killswitch",
+                CliError {
+                    code: "protection_degraded",
+                    message: "Kill-switch policy could not be verified; protection is degraded"
+                        .to_string(),
+                    hint: Some(
+                        "Inspect firewall permissions/backend health, then retry the command"
+                            .to_string(),
+                    ),
+                },
+                ExitCode::GeneralError,
+            );
+        }
     }
 
     // JSON envelope carries the canonical slug — the same string
@@ -2157,8 +2172,16 @@ fn handle_release_killswitch(mode: OutputMode) {
             }
         }
         Err(e) => {
-            eprintln!("Warning: {e}");
-            eprintln!("{}", crate::platform::KILLSWITCH_EMERGENCY_MSG);
+            print_error_and_exit(
+                mode,
+                "release-killswitch",
+                CliError {
+                    code: "release_failed",
+                    message: format!("Kill switch release could not be verified: {e}"),
+                    hint: Some(crate::platform::KILLSWITCH_EMERGENCY_MSG.to_string()),
+                },
+                ExitCode::GeneralError,
+            );
         }
     }
 }

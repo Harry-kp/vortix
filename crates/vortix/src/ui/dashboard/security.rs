@@ -513,7 +513,8 @@ fn verdict_for_protected(app: &App, primary_snap: Option<&TunnelSnapshot>) -> Ve
         (
             crate::state::KillSwitchMode::Auto,
             crate::state::KillSwitchState::Blocking
-        ) | (crate::state::KillSwitchMode::Off, _)
+        ) | (_, crate::state::KillSwitchState::Degraded)
+            | (crate::state::KillSwitchMode::Off, _)
     );
     // Insecure cipher = effective wire plaintext. Demote to Partial so
     // the title doesn't claim full protection while crypto is broken.
@@ -966,7 +967,9 @@ fn killswitch_mode_label(mode: KillSwitchMode) -> &'static str {
 fn killswitch_value(mode: KillSwitchMode, state: KillSwitchState) -> String {
     // Auto + Blocking is the alarm state — value names the situation,
     // not the mode label. The mode is implied by the rest of the panel.
-    if matches!(
+    if state == KillSwitchState::Degraded {
+        "Degraded".to_string()
+    } else if matches!(
         (mode, state),
         (KillSwitchMode::Auto, KillSwitchState::Blocking)
     ) {
@@ -981,11 +984,29 @@ fn killswitch_visuals(
     state: KillSwitchState,
 ) -> (Sigil, Option<&'static str>) {
     use KillSwitchMode::{AlwaysOn, Auto, Off};
-    use KillSwitchState::Blocking;
+    use KillSwitchState::{Blocking, Degraded};
     match (mode, state) {
+        (_, Degraded) => (Sigil::AlarmError, Some("firewall policy unverified")),
         (Off, _) => (Sigil::AlarmError, Some("off — not protecting")),
         (Auto, Blocking) => (Sigil::AlarmWarn, Some("press r to reconnect")),
         (AlwaysOn | Auto, _) => (Sigil::OkMuted, None),
+    }
+}
+
+#[cfg(test)]
+mod killswitch_degraded_tests {
+    use super::*;
+
+    #[test]
+    fn degraded_state_is_loud_and_never_renders_the_requested_mode_as_effective() {
+        assert_eq!(
+            killswitch_value(KillSwitchMode::AlwaysOn, KillSwitchState::Degraded),
+            "Degraded"
+        );
+        let (sigil, detail) =
+            killswitch_visuals(KillSwitchMode::AlwaysOn, KillSwitchState::Degraded);
+        assert!(matches!(sigil, Sigil::AlarmError));
+        assert_eq!(detail, Some("firewall policy unverified"));
     }
 }
 
