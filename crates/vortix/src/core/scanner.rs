@@ -27,9 +27,9 @@ pub struct ActiveSession {
     /// ifconfig-scan heuristic (`check_openvpn_by_pid` Method B), which
     /// collides across multiple `OpenVPN` PIDs and so cannot
     /// truthfully identify which utun belongs to which process.
-    /// Consumed by `App::adopt_registry_from_session` to set the
-    /// new entry's `details.interface_authoritative` flag, which in
-    /// turn excludes unauthoritative adoptions from primary-election.
+    /// Scanner evidence remains observational regardless of this bit. It is
+    /// useful for display attribution, but U6 no longer grants primary or
+    /// retry authority to scanner-only sessions.
     ///
     /// Defaults to `true` — most platforms / protocols / paths are
     /// reliable. The macOS `OpenVPN` Method-B fallback is the narrow

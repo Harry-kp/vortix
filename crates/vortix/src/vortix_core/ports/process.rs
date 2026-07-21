@@ -5,11 +5,16 @@
 //!
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
+use std::fs::File;
+use std::io::Read as _;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use crate::vortix_core::profile::ProfileId;
 
 /// What privilege level a `CommandSpec` requires.
 ///
@@ -182,6 +187,75 @@ impl CommandOutcome {
 pub struct DetachedHandle {
     pub pid: u32,
     pub spawned_at: SystemTime,
+}
+
+/// Stable ownership key for a foreground protocol child.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ManagedProcessId {
+    pub profile_id: ProfileId,
+    /// Non-zero per-attempt generation. It is useful for diagnostics, but is
+    /// never accepted as authentication on its own.
+    pub generation: u64,
+    /// Cryptographically opaque ownership capability. A stale handle cannot
+    /// address a later child for the same stable profile identity.
+    pub ownership_token: String,
+}
+
+impl ManagedProcessId {
+    /// Allocate an identity before spawning the child so every cleanup path,
+    /// including partial startup, is bound to the exact attempt.
+    pub fn generate(profile_id: ProfileId) -> std::io::Result<Self> {
+        let mut bytes = [0_u8; 32];
+        File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+        let mut ownership_token = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            let _ = write!(ownership_token, "{byte:02x}");
+        }
+        let generation =
+            u64::from_be_bytes(bytes[..8].try_into().expect("fixed-size prefix")).max(1);
+        Ok(Self {
+            profile_id,
+            generation,
+            ownership_token,
+        })
+    }
+
+    #[must_use]
+    pub fn has_valid_token(&self) -> bool {
+        self.generation != 0
+            && self.ownership_token.len() == 64
+            && self
+                .ownership_token
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+}
+
+/// Child ownership receipt. It contains no command arguments or credentials.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessOwnership {
+    pub identity: ManagedProcessId,
+    pub pid: u32,
+}
+
+/// Process-lifecycle port used by the Standard-mode custodian. Protocol
+/// adapters build the command specification; only the process layer spawns,
+/// signals, waits for, and reaps the child.
+pub trait ProcessLifecycle: Send + 'static {
+    fn spawn_foreground(
+        &mut self,
+        identity: ManagedProcessId,
+        spec: CommandSpec,
+    ) -> Result<ProcessOwnership, ProcessError>;
+    fn is_alive(&mut self, identity: &ManagedProcessId) -> Result<bool, ProcessError>;
+    fn graceful_stop(&mut self, identity: &ManagedProcessId) -> Result<(), ProcessError>;
+    fn wait_for_exit(
+        &mut self,
+        identity: &ManagedProcessId,
+        timeout: Duration,
+    ) -> Result<bool, ProcessError>;
+    fn force_kill(&mut self, identity: &ManagedProcessId) -> Result<(), ProcessError>;
+    fn reap(&mut self, identity: &ManagedProcessId) -> Result<(), ProcessError>;
 }
 
 /// What failed when invoking a subprocess.

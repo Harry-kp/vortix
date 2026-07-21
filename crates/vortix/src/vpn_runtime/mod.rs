@@ -718,7 +718,24 @@ impl VpnRuntime {
     /// Kill any running VPN process and remove run files for a profile.
     ///
     /// dispatch routes through the `TunnelKind` aggregate.
-    pub fn cleanup_vpn_resources(&self, profile_name: &str) {
+    pub fn cleanup_vpn_resources(
+        &self,
+        profile_name: &str,
+    ) -> Result<(), crate::vortix_core::ports::tunnel::TunnelError> {
+        let Some(profile) = self.profiles.iter().find(|p| p.name == profile_name) else {
+            return Ok(());
+        };
+        let config_dir =
+            utils::get_app_config_dir().unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
+        let mut tunnel = crate::tunnel::tunnel_for(profile.protocol, &config_dir, "3", 30);
+        self.cleanup_vpn_resources_with(profile_name, &mut tunnel)
+    }
+
+    fn cleanup_vpn_resources_with(
+        &self,
+        profile_name: &str,
+        tunnel: &mut crate::tunnel::TunnelKind,
+    ) -> Result<(), crate::vortix_core::ports::tunnel::TunnelError> {
         use crate::vortix_core::ports::tunnel::{TunnelHandle, TunnelKindTag};
         if let Some(profile) = self.profiles.iter().find(|p| p.name == profile_name) {
             let iface = match profile.protocol {
@@ -748,6 +765,7 @@ impl VpnRuntime {
                     Protocol::WireGuard => TunnelKindTag::WireGuard,
                     Protocol::OpenVPN => TunnelKindTag::OpenVpn,
                 },
+                process_ownership: None,
                 teardown_config: matches!(profile.protocol, Protocol::WireGuard).then(|| {
                     crate::vortix_core::ports::tunnel::TunnelTeardownConfig {
                         path: profile.config_path.clone(),
@@ -757,15 +775,13 @@ impl VpnRuntime {
                 dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
             };
 
-            let config_dir =
-                utils::get_app_config_dir().unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
-            let mut tunnel = crate::tunnel::tunnel_for(profile.protocol, &config_dir, "3", 30);
-            let _ = tunnel.down(handle);
+            tunnel.down(handle)?;
 
             if matches!(profile.protocol, Protocol::OpenVPN) {
                 utils::cleanup_openvpn_run_files_compat(profile.id.as_str(), profile_name);
             }
         }
+        Ok(())
     }
 
     /// Build the `(is_connected, active_tunnels)` pair from the
@@ -1197,6 +1213,39 @@ mod dns_gate_tests {
             wireguard_dns_missing_dep(inputs(true, true, true, true)),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use super::*;
+    use crate::vortix_core::ports::tunnel::mock::{MockTunnel, ScriptedTunnelOutcome};
+
+    #[test]
+    fn cleanup_propagates_teardown_failure_instead_of_claiming_disconnect() {
+        let mut runtime = VpnRuntime::new_test();
+        runtime.profiles.push(crate::state::VpnProfile {
+            id: crate::vortix_core::profile::ProfileId::new("cleanup-failure"),
+            name: "cleanup-failure".into(),
+            protocol: Protocol::WireGuard,
+            config_path: "/tmp/cleanup-failure.conf".into(),
+            location: "Test".into(),
+            last_used: None,
+        });
+        let mock = MockTunnel::new();
+        mock.script_down(ScriptedTunnelOutcome::Failure(
+            "injected teardown failure".into(),
+        ));
+        let calls = mock.invocations();
+        let mut tunnel = crate::tunnel::TunnelKind::Mock(mock);
+
+        let error = runtime
+            .cleanup_vpn_resources_with("cleanup-failure", &mut tunnel)
+            .expect_err("teardown failure must remain observable");
+
+        assert!(error.to_string().contains("injected teardown failure"));
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert_eq!(calls.lock().unwrap()[0].method, "down");
     }
 }
 

@@ -530,7 +530,10 @@ impl App {
         let allowed_ips = extract_allowed_ips(profile.protocol, &profile.config_path);
         let core_details = crate::vortix_core::engine::state::DetailedConnectionInfo {
             interface: session.interface.clone(),
-            interface_authoritative: session.interface_authoritative,
+            // Scanner-only sessions are observation, not protocol ownership.
+            // They remain visible but cannot become primary until a future
+            // explicit adoption handshake yields a managed TunnelHandle.
+            interface_authoritative: false,
             internal_ip: session.internal_ip.clone(),
             endpoint: session.endpoint.clone(),
             mtu: session.mtu.clone(),
@@ -540,6 +543,7 @@ impl App {
             transfer_tx: session.transfer_tx.clone(),
             latest_handshake: session.latest_handshake.clone(),
             pid: session.pid,
+            process_ownership: None,
             dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
             teardown_config: None,
         };
@@ -613,6 +617,7 @@ impl App {
             transfer_tx: session.transfer_tx.clone(),
             latest_handshake: session.latest_handshake.clone(),
             pid: session.pid,
+            process_ownership: existing_details.process_ownership,
             dns_request: existing_details.dns_request,
             teardown_config: existing_details.teardown_config,
         };
@@ -681,13 +686,10 @@ impl App {
         self.mirror_connecting_into_registry_at(profile_name, std::time::SystemTime::now());
     }
 
-    /// Mirror a legacy-path Disconnecting transition into
-    /// `self.registry` so renderers show the `◑` badge during the
-    /// teardown window. Called when the legacy `disconnect()` enters
-    /// Disconnecting state. No-op when the registry doesn't already
-    /// have a Connected entry to transition — `set_disconnecting`
-    /// internally skips missing entries.
-    pub fn mirror_disconnecting_into_registry(&mut self, profile_name: &str) {
+    /// Mark a teardown as nonterminal so renderers show the `◑` badge until
+    /// kernel absence is observed. No-op when the registry has no existing
+    /// entry to transition.
+    pub fn mark_teardown_pending(&mut self, profile_name: &str) {
         if let Some(profile_id) = self.profile_id_for_name(profile_name) {
             let started_at = std::time::SystemTime::now();
             self.registry.set_disconnecting(&profile_id, started_at);
@@ -821,7 +823,7 @@ impl App {
 
             // Reset the Disconnecting timer (registry-side) so the 30s
             // safety timeout starts fresh on this force-disconnect tick.
-            self.mirror_disconnecting_into_registry(&name);
+            self.mark_teardown_pending(&name);
 
             // force-disconnect now routes through TunnelKind.
             // The OvpnTunnel's down() path already escalates to pkill if the
@@ -858,6 +860,7 @@ impl App {
                         Protocol::WireGuard => TunnelKindTag::WireGuard,
                         Protocol::OpenVPN => TunnelKindTag::OpenVpn,
                     },
+                    process_ownership: None,
                     teardown_config: matches!(protocol, Protocol::WireGuard).then(|| {
                         crate::vortix_core::ports::tunnel::TunnelTeardownConfig {
                             path: config_path,
@@ -1051,7 +1054,7 @@ impl App {
 
         // Mirror the Disconnecting transition into the registry so
         // renderers show the `◑` badge during the teardown window.
-        self.mirror_disconnecting_into_registry(profile_name);
+        self.mark_teardown_pending(profile_name);
 
         // Sync kill switch (multi-tunnel-aware via the registry).
         self.sync_killswitch();
@@ -1094,6 +1097,7 @@ impl App {
                     Protocol::WireGuard => TunnelKindTag::WireGuard,
                     Protocol::OpenVPN => TunnelKindTag::OpenVpn,
                 },
+                process_ownership: None,
                 teardown_config: matches!(protocol, Protocol::WireGuard).then(|| {
                     crate::vortix_core::ports::tunnel::TunnelTeardownConfig {
                         path: config_path,
@@ -1234,6 +1238,7 @@ fn legacy_to_core_details(
         transfer_tx: legacy.transfer_tx.clone(),
         latest_handshake: legacy.latest_handshake.clone(),
         pid: legacy.pid,
+        process_ownership: None,
         dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
         teardown_config: None,
         // mirror_connect_into_registry funnels through this helper after

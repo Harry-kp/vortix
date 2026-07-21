@@ -119,7 +119,7 @@ fn set_disconnecting(app: &mut App, name: &str) {
     if app.registry.snapshot(&ProfileId::new(name)).is_none() {
         set_connected(app, name);
     }
-    app.mirror_disconnecting_into_registry(name);
+    app.mark_teardown_pending(name);
 }
 
 /// Helper: create a fake `ActiveSession` for scanner results.
@@ -206,6 +206,23 @@ fn test_disconnect_result_success_from_non_disconnecting_state() {
     assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
 }
 
+#[test]
+fn connection_timeout_retains_nonterminal_state_when_teardown_is_unconfirmed() {
+    let mut app = test_app();
+    set_connecting(&mut app, "test-vpn");
+
+    app.handle_message(Message::ConnectionTimeout("test-vpn".to_string()));
+
+    assert!(matches!(
+        app.legacy_state(),
+        ConnectionState::Disconnecting { .. }
+    ));
+    assert!(app
+        .toast
+        .as_ref()
+        .is_some_and(|toast| toast.message.contains("teardown")));
+}
+
 // ====================================================================
 // Scanner debounce guard tests (SyncSystemState while Disconnecting)
 // ====================================================================
@@ -267,13 +284,16 @@ fn test_scanner_safety_timeout_after_30s() {
             crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
     });
 
-    assert!(
-        matches!(app.legacy_state(), ConnectionState::Disconnected),
-        "Should time out to Disconnected after 30s"
-    );
+    assert!(matches!(
+        app.legacy_state(),
+        ConnectionState::Disconnecting { .. }
+    ));
     let toast = app.toast.as_ref().expect("timeout should show toast");
-    assert_eq!(toast.toast_type, ToastType::Warning);
-    assert!(toast.message.contains("timed out"));
+    assert!(matches!(
+        toast.toast_type,
+        ToastType::Warning | ToastType::Error
+    ));
+    assert!(toast.message.contains("teardown"));
 }
 
 #[test]
@@ -362,6 +382,18 @@ fn add_profiles(app: &mut App, names: &[&str]) {
             last_used: None,
         });
     }
+}
+
+fn attach_confirmable_cleanup_config(app: &mut App, name: &str) -> tempfile::NamedTempFile {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), "[Interface]\nPrivateKey = test\n").unwrap();
+    app.runtime
+        .profiles
+        .iter_mut()
+        .find(|profile| profile.name == name)
+        .unwrap()
+        .config_path = file.path().to_path_buf();
+    file
 }
 
 // ====================================================================
@@ -477,7 +509,7 @@ fn mirror_disconnecting_transitions_existing_connected_entry() {
     ));
 
     // Now trigger Disconnecting mirror.
-    app.mirror_disconnecting_into_registry("vpn-a");
+    app.mark_teardown_pending("vpn-a");
 
     let snap = app
         .registry
@@ -497,7 +529,7 @@ fn mirror_disconnecting_no_op_when_registry_has_no_entry() {
     // insert a phantom entry.
     let mut app = test_app();
     add_profiles(&mut app, &["vpn-a"]);
-    app.mirror_disconnecting_into_registry("vpn-a");
+    app.mark_teardown_pending("vpn-a");
     assert_eq!(
         app.registry.tunnel_count(),
         0,
@@ -516,6 +548,7 @@ fn mirror_failed_makes_registry_hold_disconnected_with_failure() {
     // overwrites with Connecting) or explicitly clears.
     let mut app = test_app();
     add_profiles(&mut app, &["vpn-a"]);
+    let _config = attach_confirmable_cleanup_config(&mut app, "vpn-a");
     set_connecting(&mut app, "vpn-a");
 
     // Worker thread reports failure.
@@ -837,7 +870,10 @@ fn test_pending_cleared_on_30s_timeout() {
     });
 
     assert_eq!(app.runtime.pending_connect, None);
-    assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
+    assert!(matches!(
+        app.legacy_state(),
+        ConnectionState::Disconnecting { .. }
+    ));
 }
 
 // ====================================================================
@@ -907,6 +943,7 @@ fn test_connect_result_failure_transitions_to_disconnected() {
     // behavior this test was originally written to exercise.
     app.runtime.config.connect_max_retries = 0;
     set_connecting(&mut app, "test-vpn");
+    let _config = attach_confirmable_cleanup_config(&mut app, "test-vpn");
 
     app.handle_message(Message::ConnectResult {
         profile: "test-vpn".to_string(),
@@ -3616,7 +3653,7 @@ fn disconnect_result_success_removes_from_registry() {
     // Now disconnect: registry path goes Connected -> Disconnecting ->
     // (worker thread tears down kernel state) -> DisconnectResult ->
     // complete_disconnect.
-    app.mirror_disconnecting_into_registry("mirror-test");
+    app.mark_teardown_pending("mirror-test");
     app.handle_message(Message::DisconnectResult {
         profile: "mirror-test".to_string(),
         success: true,
@@ -4126,6 +4163,7 @@ fn route_probe_failure_retains_prior_primary_and_marks_observation_stale() {
 
     let mut app = test_app();
     add_profiles(&mut app, &["vpn-a"]);
+    set_connected(&mut app, "vpn-a");
     let session = fake_session("vpn-a");
     app.handle_message(Message::SyncSystemState {
         sessions: vec![session.clone()],
@@ -4166,7 +4204,7 @@ fn disconnect_result_defers_completion_until_kernel_confirms() {
     let mut app = test_app();
     add_profiles(&mut app, &["vpn-a"]);
     set_connected(&mut app, "vpn-a");
-    app.mirror_disconnecting_into_registry("vpn-a");
+    app.mark_teardown_pending("vpn-a");
 
     // Worker reports success while the kernel session is still visible:
     // the entry must stay Disconnecting.

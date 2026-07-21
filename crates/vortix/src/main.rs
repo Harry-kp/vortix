@@ -7,6 +7,13 @@ use vortix::{cli, config, constants, event, ui};
 
 #[allow(clippy::too_many_lines)] // main() carries the whole bootstrap sequence
 fn main() -> Result<()> {
+    // Private Standard-mode lifecycle actor. Handle this before error hooks,
+    // configuration migration, argument parsing, or any user-facing startup
+    // work: the custodian has exactly one child and only status/stop IPC.
+    if let Some(exit_code) = vortix::vortix_process::custodian::maybe_run_hidden_entrypoint() {
+        std::process::exit(exit_code);
+    }
+
     // Initialize error handling first — color_eyre::install() sets its own
     // panic hook, so we must call it before installing ours.
     color_eyre::install()?;

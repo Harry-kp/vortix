@@ -625,25 +625,13 @@ const LEGACY_CONTROL_BUDGETS: &[(&str, ControlBoundaryKind, usize, &str)] = &[
         8,
         "U14 deletes seed calls after cutover",
     ),
-    (
-        "crates/vortix/src/vortix_core/journal/mod.rs",
-        ControlBoundaryKind::UnboundedChannel,
-        2,
-        "U6 replaces the journal transport with bounded backpressure",
-    ),
-    (
-        "crates/vortix/src/vortix_core/journal/writer.rs",
-        ControlBoundaryKind::UnboundedChannel,
-        2,
-        "U6 replaces the journal transport with bounded backpressure",
-    ),
 ];
 
 fn check_control_boundaries() -> Result<(), Box<dyn std::error::Error>> {
     let root = workspace_root()?;
     let violations = scan_control_boundaries_at(&root)?;
     if violations.is_empty() {
-        eprintln!("xtask check-control-boundaries: ok (legacy budgets unchanged)");
+        eprintln!("xtask check-control-boundaries: ok");
         return Ok(());
     }
 
