@@ -9,6 +9,7 @@
 
 pub mod cidr;
 pub mod cidr_subtract;
+pub mod control;
 pub mod engine;
 pub mod ipc;
 pub mod journal;

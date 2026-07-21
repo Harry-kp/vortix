@@ -29,6 +29,37 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Serde adapter for public wire fields that must use the canonical CLI
+/// slugs instead of Rust variant names.
+///
+/// Apply with `#[serde(with = "...::serde_mode_slug")]`. Keeping this
+/// opt-in avoids silently changing older on-disk formats while ensuring new
+/// control-plane contracts cannot expose `Auto` or `AlwaysOn`.
+pub mod serde_mode_slug {
+    use serde::{de::Error as _, Deserialize, Deserializer, Serializer};
+
+    use super::KillSwitchMode;
+
+    pub fn serialize<S>(mode: &KillSwitchMode, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(mode.cli_verb())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<KillSwitchMode, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let slug = String::deserialize(deserializer)?;
+        KillSwitchMode::from_cli_verb(&slug).ok_or_else(|| {
+            D::Error::custom(format_args!(
+                "invalid kill-switch mode `{slug}`; use off, block-on-drop, vpn-only"
+            ))
+        })
+    }
+}
+
 /// Kill switch operating mode.
 ///
 /// Determines when the kill switch should activate. See the module

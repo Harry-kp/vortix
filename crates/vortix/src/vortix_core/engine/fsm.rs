@@ -251,10 +251,9 @@ impl<T: Tunnel> Engine<T> {
                 self.try_disconnect(events);
             }
             UserCommand::Reconnect { .. } => self.try_reconnect(events),
-            // slot reserved for the 2FA flow (issue #191).
-            // No consumer wired in v0.3.0 — answer is dropped silently
-            // because no `AwaitingUserInput` transition emits the
-            // outstanding prompt yet.
+            // Compatibility for the unfinished legacy 2FA flow. Keeping this
+            // as an engine-local no-op prevents its String payload from ever
+            // entering the canonical journal/broadcast/snapshot path.
             UserCommand::UserAnswered { .. } => {}
         }
     }
@@ -663,6 +662,19 @@ mod tests {
                 last_failure: Some(FailureReason::ProfileGone(_))
             }
         ));
+    }
+
+    #[test]
+    fn legacy_user_answered_remains_a_no_op() {
+        let mut engine = engine_with(MockTunnel::new());
+        let before = engine.state().clone();
+        let events = engine.handle(Input::UserCommand(UserCommand::UserAnswered {
+            prompt_id: "prompt-7".to_owned(),
+            answer: "legacy-secret".to_owned(),
+        }));
+
+        assert_eq!(engine.state(), &before);
+        assert!(events.is_empty());
     }
 
     #[test]

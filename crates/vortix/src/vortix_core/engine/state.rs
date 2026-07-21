@@ -135,21 +135,9 @@ impl Default for DetailedConnectionInfo {
     }
 }
 
-/// What kind of user input the FSM is paused waiting for.
-///
-/// `#[non_exhaustive]` so adding e.g. `BiometricChallenge` later doesn't
-/// break consumers pattern-matching on this enum.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-#[serde(rename_all = "snake_case")]
-pub enum PromptKind {
-    /// One-time code from an authenticator app or SMS.
-    TwoFactorCode,
-    /// Password / passphrase for an encrypted credential file.
-    Passphrase,
-    /// Anything else; `label` is rendered verbatim to the user.
-    Generic { label: String },
-}
+// U7/U8 compatibility name. Interactive challenge vocabulary is canonical in
+// the control model so credential-bearing flows cannot drift independently.
+pub use crate::vortix_core::control::model::ChallengeKind as PromptKind;
 
 /// The connection state machine.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
