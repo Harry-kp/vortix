@@ -5,12 +5,11 @@
 //! Real use: `Engine<TunnelKind>` constructed in `vortix` after `tunnel_for`
 //! resolves the variant. Tests use `Engine<MockTunnel>`.
 //!
-//! The FSM is **synchronous**. Per plans #002 / #003, the runner and
-//! platform are accessed via process-global helpers; `Tunnel::up` etc. are
-//! blocking. The `EngineHandle` actor wraps the FSM in a
-//! `tokio::spawn`'d task so blocking subprocess work doesn't stall the
-//! caller — but the FSM itself stays sync, which makes the state-transition
-//! match readable and the tests deterministic.
+//! The FSM is synchronous and side-effectful for the legacy U7/U8 authority
+//! path. U6's canonical shadow path first uses `control::reconcile` for pure
+//! level-triggered planning and then dispatches this protocol FSM on bounded
+//! per-profile workers. Keeping transition logic synchronous makes worker
+//! panic/cancellation containment and deterministic fakes straightforward.
 
 use std::time::{Duration, SystemTime};
 
@@ -504,6 +503,7 @@ impl<T: Tunnel> Engine<T> {
             details: Box::new(DetailedConnectionInfo {
                 interface: handle.interface_name,
                 pid: handle.pid,
+                process_ownership: handle.process_ownership,
                 teardown_config: handle.teardown_config,
                 dns_request: handle.dns_request,
                 ..Default::default()
@@ -535,15 +535,17 @@ impl<T: Tunnel> Engine<T> {
         // The FSM doesn't track the last-seen `TunnelHandle` directly today
         // (Connected only carries DetailedConnectionInfo). Synthesise one
         // from the current state for tunnel.down().
-        let (interface, pid, teardown_config, dns_request) = match &self.state {
+        let (interface, pid, process_ownership, teardown_config, dns_request) = match &self.state {
             Connection::Connected { details, .. } => (
                 details.interface.clone(),
                 details.pid,
+                details.process_ownership.clone(),
                 details.teardown_config.clone(),
                 details.dns_request.clone(),
             ),
             _ => (
                 String::new(),
+                None,
                 None,
                 None,
                 crate::vortix_core::ports::dns::DnsRequest::default(),
@@ -559,6 +561,7 @@ impl<T: Tunnel> Engine<T> {
             pid,
             started_at: SystemTime::now(),
             kind: self.tunnel.kind_tag(),
+            process_ownership,
             teardown_config,
             dns_request,
         }

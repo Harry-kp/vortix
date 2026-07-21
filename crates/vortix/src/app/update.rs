@@ -527,10 +527,6 @@ impl App {
             self.log(&format!(
                 "INFO: Ignoring stale DisconnectResult for '{profile}' (state changed)"
             ));
-            // Still clean up files — the disconnect thread likely did kill the process
-            if let Some(profile_id) = self.profile_id_for_name(&profile) {
-                utils::cleanup_openvpn_run_files_compat(profile_id.as_str(), &profile);
-            }
         } else if success {
             // The worker's exit status is not kernel truth: openvpn can
             // take another second or two to die after `down()` returns.
@@ -657,8 +653,19 @@ impl App {
             // (which the Connecting mirror will overwrite) or
             // dismisses. Before this, failed connects left no trace
             // in the registry and the sidebar reverted to blank.
-            self.mirror_failed_into_registry(&profile, &err_msg);
-            self.runtime.cleanup_vpn_resources(&profile);
+            let cleanup_confirmed = match self.runtime.cleanup_vpn_resources(&profile) {
+                Ok(()) => {
+                    self.mirror_failed_into_registry(&profile, &err_msg);
+                    true
+                }
+                Err(cleanup) => {
+                    self.mark_teardown_pending(&profile);
+                    self.log(&format!(
+                        "ERR: Failed connection teardown for '{profile}' remains ambiguous-owned: {cleanup}"
+                    ));
+                    false
+                }
+            };
 
             // Attempt retry with exponential backoff if configured.
             // Per-profile retry (): each profile's attempt
@@ -686,7 +693,8 @@ impl App {
                 .get(&profile_id)
                 .is_some_and(|r| r.auto_reconnect);
 
-            if profile_idx.is_some()
+            if cleanup_confirmed
+                && profile_idx.is_some()
                 && max_retries > 0
                 && current_attempt < max_retries
                 && self.runtime.pending_connect.is_none()
@@ -892,8 +900,8 @@ impl App {
     }
 
     fn handle_quit(&mut self) {
-        // VPN connections are independent OS processes (wg-quick configures the
-        // kernel; openvpn runs as a daemon). They should persist after the TUI
+        // VPN connections are independent OS resources (wg-quick configures the
+        // kernel; OpenVPN is a custodian-owned foreground child). They should persist after the TUI
         // exits so the user can reopen the TUI or run `vortix status` later.
         // Only explicit disconnect actions (`vortix down`, disconnect button)
         // should tear them down.
@@ -1269,25 +1277,36 @@ impl App {
 
     /// Scanner helper (): force-cleanup a profile stuck in
     /// the Disconnecting state past `disconnect_timeout`. The kernel
-    /// interface is still up but the teardown isn't returning;
-    /// surface a forced-cleanup toast and drop the entry from the
-    /// registry. Mirrors the legacy timeout path.
+    /// interface is still up but the teardown isn't returning. Request an
+    /// authenticated teardown, but retain the nonterminal registry entry until
+    /// a later scanner observation proves kernel absence.
     fn scanner_force_disconnect(&mut self, profile_name: &str) {
         self.log(&format!(
             "WARN: Disconnect timed out for '{profile_name}' after {}s, forcing cleanup",
             self.runtime.config.disconnect_timeout
         ));
-        self.runtime.cleanup_vpn_resources(profile_name);
+        let cleanup = self.runtime.cleanup_vpn_resources(profile_name);
         self.runtime.pending_connect = None;
-        if self.legacy_matches(profile_name) {
-            self.runtime.session_start = None;
+        match cleanup {
+            Ok(()) => {
+                self.log(&format!(
+                    "STATUS: Forced teardown requested for '{profile_name}' — awaiting kernel confirmation"
+                ));
+                self.show_toast(
+                    "Forced teardown requested — awaiting kernel confirmation".to_string(),
+                    ToastType::Warning,
+                );
+            }
+            Err(error) => {
+                self.log(&format!(
+                    "ERR: Forced teardown for '{profile_name}' remains ambiguous-owned: {error}"
+                ));
+                self.show_toast(
+                    "Forced teardown unconfirmed — ownership retained".to_string(),
+                    ToastType::Error,
+                );
+            }
         }
-        self.mirror_disconnect_into_registry(profile_name);
-        self.show_toast(
-            "Disconnect timed out — forced cleanup".to_string(),
-            ToastType::Warning,
-        );
-        self.sync_killswitch();
     }
 
     // Removed by the state-authority rework: `scanner_promote_to_connected`. The scanner can no
@@ -1334,6 +1353,9 @@ impl App {
     /// legacy drop path including `connection_drops` counter, kill
     /// switch activation, and per-profile auto-reconnect scheduling.
     fn scanner_handle_drop(&mut self, profile_name: &str, was_connected: bool) {
+        let managed_by_this_process = self
+            .profile_id_for_name(profile_name)
+            .is_some_and(|profile_id| self.runtime.owns_dns_session(&profile_id));
         if was_connected {
             self.runtime.connection_drops += 1;
             self.log(&format!(
@@ -1381,7 +1403,7 @@ impl App {
         // AUTO-RECONNECT: per-profile (). Each dropped
         // Connected tunnel schedules its own retry; multiple drops can
         // recover concurrently.
-        if was_connected && self.runtime.config.auto_reconnect {
+        if was_connected && managed_by_this_process && self.runtime.config.auto_reconnect {
             if let Some(idx) = self
                 .runtime
                 .profiles
@@ -1465,8 +1487,8 @@ impl App {
         // Adoption goes through the dedicated entry-creation path,
         // NOT refresh_registry_from_session (which is metadata-only on
         // existing Connected entries). The new entry's
-        // interface_authoritative flag is read from
-        // session.interface_authoritative.
+        // Scanner-only sessions are read-only and non-primary. A later unit
+        // may promote one only after a protocol-correct ownership handshake.
         self.adopt_registry_from_session(&profile_name, session);
     }
 
@@ -1612,19 +1634,22 @@ impl App {
     }
 
     fn handle_connection_timeout(&mut self, profile_name: String) {
-        self.runtime.cleanup_vpn_resources(&profile_name);
         let Some(profile_id) = self.profile_id_for_name(&profile_name) else {
             return;
         };
-        self.runtime.session_start = None;
+        self.mark_teardown_pending(&profile_name);
+        let cleanup = self.runtime.cleanup_vpn_resources(&profile_name);
         self.runtime.pending_connect = None;
         self.runtime.retry_state.remove(&profile_id);
-        // Drop the in-flight registry entry so the renderers stop
-        // showing the phantom Connecting state.
-        self.registry.set_disconnected(&profile_id);
-        self.log(&format!("ERR: Connection timed out for '{profile_name}'"));
+        let detail = cleanup.map_or_else(
+            |error| format!("teardown remains ambiguous-owned: {error}"),
+            |()| "teardown requested; awaiting kernel confirmation".into(),
+        );
+        self.log(&format!(
+            "ERR: Connection timed out for '{profile_name}'; {detail}"
+        ));
         self.show_toast(
-            format!("Connection timed out for '{profile_name}'"),
+            format!("Connection timed out for '{profile_name}' — {detail}"),
             ToastType::Error,
         );
         self.sync_killswitch();

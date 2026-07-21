@@ -56,6 +56,9 @@ pub struct TunnelHandle {
     pub pid: Option<u32>,
     pub started_at: SystemTime,
     pub kind: TunnelKindTag,
+    /// Exact lifecycle ownership capability for a userspace child. Kernel
+    /// tunnels and externally observed sessions carry `None`.
+    pub process_ownership: Option<crate::vortix_core::ports::process::ManagedProcessId>,
     /// Optional protocol configuration used by `down`. `WireGuard` carries a
     /// DNS-free copy here so `wg-quick down` cannot replay resolver changes.
     pub teardown_config: Option<TunnelTeardownConfig>,
@@ -200,6 +203,78 @@ pub trait Tunnel {
     /// Tag this impl reports — used by `TunnelHandle::kind` and by the engine
     /// when dispatching back to the right `TunnelKind` variant.
     fn kind_tag(&self) -> TunnelKindTag;
+}
+
+/// Marker contract for scanner evidence accepted for future ownership
+/// adoption. Creating a value requires protocol-specific, stable identity and
+/// interface evidence; ordinary scanner observations never produce one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdoptionEvidence {
+    profile_id: ProfileId,
+    interface_name: String,
+    kind: TunnelKindTag,
+    pid: Option<u32>,
+    protocol_attestation: String,
+}
+
+impl AdoptionEvidence {
+    /// Issue protocol-authoritative adoption evidence. The attestation must be
+    /// derived from stable protocol metadata (never display/scanner text).
+    // U6 exposes the crate-private protocol seam before U7 routes the legacy
+    // protocol adapters through it. Keeping construction private prevents an
+    // external client/scanner from self-attesting in the interim.
+    #[allow(dead_code)]
+    pub(crate) fn attest(
+        profile_id: ProfileId,
+        interface_name: impl Into<String>,
+        kind: TunnelKindTag,
+        pid: Option<u32>,
+        protocol_attestation: impl Into<String>,
+    ) -> Result<Self, TunnelError> {
+        let interface_name = interface_name.into();
+        let protocol_attestation = protocol_attestation.into();
+        if interface_name.is_empty()
+            || interface_name.len() > 256
+            || protocol_attestation.len() < 16
+            || protocol_attestation.len() > 256
+        {
+            return Err(TunnelError::Other(
+                "invalid protocol adoption attestation".to_owned(),
+            ));
+        }
+        Ok(Self {
+            profile_id,
+            interface_name,
+            kind,
+            pid,
+            protocol_attestation,
+        })
+    }
+
+    #[must_use]
+    pub const fn profile_id(&self) -> &ProfileId {
+        &self.profile_id
+    }
+
+    #[must_use]
+    pub fn interface_name(&self) -> &str {
+        &self.interface_name
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> TunnelKindTag {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn pid(&self) -> Option<u32> {
+        self.pid
+    }
+
+    #[must_use]
+    pub fn protocol_attestation(&self) -> &str {
+        &self.protocol_attestation
+    }
 }
 
 /// Convenience: builds a [`Profile`] for tests / quick prototypes.

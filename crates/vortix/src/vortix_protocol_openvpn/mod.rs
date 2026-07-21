@@ -1,9 +1,8 @@
 //! `vortix-protocol-openvpn`: `OpenVPN` `Tunnel` impl.
 //!
-//! Wraps the `openvpn` binary in detached-daemon mode and watches the
+//! Runs the `openvpn` binary as a custodian-owned foreground child and watches the
 //! `--log` file for `Initialization Sequence Completed` to declare the
-//! tunnel established. Matches the existing engine's behaviour byte-for-byte
-//! (subprocess flags, log-poll cadence, error patterns).
+//! tunnel established.
 
 #![allow(clippy::missing_errors_doc)]
 

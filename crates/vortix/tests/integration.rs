@@ -80,7 +80,7 @@ fn set_disconnecting(app: &mut App, name: &str) {
     if app.registry.snapshot(&ProfileId::new(name)).is_none() {
         set_connected(app, name);
     }
-    app.mirror_disconnecting_into_registry(name);
+    app.mark_teardown_pending(name);
 }
 
 fn fake_session(name: &str) -> ActiveSession {
@@ -142,7 +142,7 @@ mod connection_state_machine {
     }
 
     #[test]
-    fn connecting_to_disconnected_on_failure() {
+    fn connecting_failure_retains_nonterminal_state_when_cleanup_is_unconfirmed() {
         let mut app = test_app();
         set_connecting(&mut app, "vpn-a");
 
@@ -154,7 +154,10 @@ mod connection_state_machine {
             pid: None,
             dns_request: vortix::vortix_core::ports::dns::DnsRequest::default(),
         });
-        assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
+        assert!(matches!(
+            app.legacy_state(),
+            ConnectionState::Disconnecting { .. }
+        ));
     }
 
     #[test]
@@ -261,7 +264,10 @@ mod connection_state_machine {
             default_route:
                 vortix::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
         });
-        assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
+        assert!(matches!(
+            app.legacy_state(),
+            ConnectionState::Disconnecting { .. }
+        ));
     }
 
     #[test]
@@ -270,7 +276,10 @@ mod connection_state_machine {
         set_connecting(&mut app, "vpn-a");
 
         app.handle_message(Message::ConnectionTimeout("vpn-a".to_string()));
-        assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
+        assert!(matches!(
+            app.legacy_state(),
+            ConnectionState::Disconnecting { .. }
+        ));
         assert!(app.runtime.pending_connect.is_none());
     }
 

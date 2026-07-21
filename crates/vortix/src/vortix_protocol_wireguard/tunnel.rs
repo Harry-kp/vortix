@@ -408,6 +408,7 @@ impl Tunnel for WgTunnel {
             pid: None,
             started_at: SystemTime::now(),
             kind: TunnelKindTag::WireGuard,
+            process_ownership: None,
             teardown_config: Some(TunnelTeardownConfig {
                 path: temp_path,
                 managed: true,
@@ -593,6 +594,7 @@ mod tests {
             pid: None,
             started_at: SystemTime::now(),
             kind: TunnelKindTag::WireGuard,
+            process_ownership: None,
             teardown_config,
             dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
         }

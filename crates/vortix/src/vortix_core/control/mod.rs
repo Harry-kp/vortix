@@ -6,8 +6,11 @@
 
 pub mod command;
 pub mod model;
+pub mod reconcile;
 pub mod service;
 pub mod snapshot;
+pub mod supervisor;
+pub mod worker;
 
 pub use command::{
     ChallengeResponse, CommandRequest, Deadline, IdempotencyKey, Secret, UserCommand,
@@ -22,7 +25,8 @@ pub use model::{
 pub use service::{
     AdmissionError, AdmittedOperation, ChallengeAnswerReceiver, ChallengeDeliveryError,
     ChallengeError, Clock, CompleterHandle, CompletionError, CompletionResult, ControlHandle,
-    ControlService, ControlServiceConfig, ControlSubscription, EventReceiveError, IssuedChallenge,
-    ObservationError, ObserverHandle, ReadinessError, RealClock,
+    ControlService, ControlServiceConfig, ControlSubscription, EventReceiveError,
+    ExecutionSelection, IssuedChallenge, ObservationError, ObserverHandle, ProfileTopology,
+    ReadinessError, RealClock,
 };
 pub use snapshot::{ControlSnapshot, ServiceReadiness};

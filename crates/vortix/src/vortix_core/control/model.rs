@@ -95,7 +95,7 @@ impl<'de> Deserialize<'de> for ClientId {
 #[serde(transparent)]
 pub struct AuthorityEpoch(pub u64);
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct PolicyDigest(pub String);
 

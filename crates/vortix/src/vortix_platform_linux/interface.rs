@@ -69,16 +69,6 @@ pub(crate) fn find_pid_with_cmdline_substrings(needles: &[&str]) -> Option<u32> 
     matching_pids(needles, Some(1)).into_iter().next()
 }
 
-/// Walk `/proc/[pid]/cmdline` and return EVERY PID whose cmdline contains
-/// the given substring needle (case-insensitive).
-///
-/// Used by the OVPN tunnel teardown to replace `pkill -f`. Same /proc
-/// walk as the single-PID variant but collects all matches.
-///
-pub(crate) fn find_all_pids_with_cmdline_substring(needle: &str) -> Vec<u32> {
-    matching_pids(&[needle], None)
-}
-
 fn matching_pids(needles: &[&str], limit: Option<usize>) -> Vec<u32> {
     let needles: Vec<String> = needles.iter().map(|needle| needle.to_lowercase()).collect();
     let mut matches = Vec::new();

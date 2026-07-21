@@ -21,7 +21,16 @@ use crate::vortix_core::control::model::{
     OperationResult, OperationStatus, PolicyDigest, ProtectionEvidence, ProtectionStatus,
     RequestedTunnelState, MAX_PROTECTION_AGE_MILLIS,
 };
+use crate::vortix_core::control::reconcile::{
+    plan_reconciliation, DisconnectTombstone, InFlightMutation, ObservationOwnership,
+    ReconcileAction, ReconcileInput, ScanEvidence, TunnelObservation,
+};
 use crate::vortix_core::control::snapshot::{ControlSnapshot, ServiceReadiness};
+use crate::vortix_core::control::supervisor::{PolicyVerification, SupervisedTruth, Supervisor};
+use crate::vortix_core::control::worker::{
+    ControlRevision, ProfileAdmission, RouteClaim, TopologyPolicy, TopologyState,
+    TopologyTransitionKind, TunnelMutation, TunnelWork, WorkFailure,
+};
 use crate::vortix_core::profile::ProfileId;
 
 /// Injectable authority-local service clock.
@@ -53,10 +62,39 @@ pub struct ControlServiceConfig {
     pub max_challenges: usize,
     pub max_observed_profiles: usize,
     pub known_profiles: BTreeSet<ProfileId>,
+    /// Canonical resources parsed from real profiles before authority starts.
+    pub profile_topologies: BTreeMap<ProfileId, ProfileTopology>,
     pub freshness_poll_interval: Duration,
     pub authority_epoch: AuthorityEpoch,
     pub reconciliation_complete: bool,
     pub authority_verified: bool,
+}
+
+/// Immutable profile resources used for admission and topology planning.
+#[derive(Debug, Clone, Default)]
+pub struct ProfileTopology {
+    /// Protocol-authoritative interface, when it is known before connection.
+    pub interface_name: Option<String>,
+    /// Canonical CIDR claims requested by this profile.
+    pub routes: BTreeSet<String>,
+    /// Digest of the profile's complete DNS intent.
+    pub dns_digest: PolicyDigest,
+    /// Digest of the profile's firewall intent.
+    pub firewall_digest: PolicyDigest,
+    /// Durable resource ownership receipts available to compensation.
+    pub ownership_receipts: BTreeSet<String>,
+}
+
+/// U6 execution is explicit so shipping the supervised seam cannot create a
+/// second writer while U7/U8 still select the legacy authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionSelection {
+    /// U5-compatible owner/model only. Legacy code remains the sole writer.
+    LegacyAuthority,
+    /// Run the pure planner for observability, but dispatch no effects.
+    CanonicalShadow,
+    /// Supervised canonical effects. Selected only by explicit construction.
+    CanonicalAuthority,
 }
 
 impl Default for ControlServiceConfig {
@@ -69,6 +107,7 @@ impl Default for ControlServiceConfig {
             max_challenges: 16,
             max_observed_profiles: 512,
             known_profiles: BTreeSet::new(),
+            profile_topologies: BTreeMap::new(),
             freshness_poll_interval: Duration::from_millis(250),
             authority_epoch: AuthorityEpoch(0),
             reconciliation_complete: true,
@@ -99,6 +138,8 @@ pub enum AdmissionError {
     InvalidInput { reason: String },
     #[error("control service stopped")]
     Stopped,
+    #[error("requested routes conflict with an admitted or active profile")]
+    RouteConflict,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -250,6 +291,7 @@ enum Envelope {
         operation_id: OperationId,
         admitted_at: u64,
         evicted: Vec<OperationId>,
+        work_admissions: Vec<(ProfileId, ProfileAdmission)>,
     },
     Observe {
         observation: Observation,
@@ -290,6 +332,8 @@ struct Shared {
     admission: Arc<Mutex<AdmissionState>>,
     clock: Arc<dyn Clock>,
     config: ControlServiceConfig,
+    selection: ExecutionSelection,
+    supervisor: Option<Arc<Supervisor>>,
 }
 
 /// Public mutation/subscription capability. It cannot forge observations,
@@ -334,6 +378,7 @@ pub struct ControlService {
     client: ControlHandle,
     observer: ObserverHandle,
     completer: CompleterHandle,
+    supervisor: Option<Arc<Supervisor>>,
 }
 
 impl ControlService {
@@ -344,6 +389,28 @@ impl ControlService {
 
     #[must_use]
     pub fn start_with_clock(config: ControlServiceConfig, clock: Arc<dyn Clock>) -> Self {
+        Self::start_selected(config, clock, ExecutionSelection::LegacyAuthority, None)
+    }
+
+    /// Construct the canonical actor with an explicit supervision selection.
+    /// Passing `CanonicalAuthority` requires a supervisor and is the only path
+    /// that can dispatch effects.
+    #[must_use]
+    pub fn start_supervised(
+        config: ControlServiceConfig,
+        clock: Arc<dyn Clock>,
+        selection: ExecutionSelection,
+        supervisor: Arc<Supervisor>,
+    ) -> Self {
+        Self::start_selected(config, clock, selection, Some(supervisor))
+    }
+
+    fn start_selected(
+        config: ControlServiceConfig,
+        clock: Arc<dyn Clock>,
+        selection: ExecutionSelection,
+        supervisor: Option<Arc<Supervisor>>,
+    ) -> Self {
         assert!(config.command_capacity > 0);
         assert!(config.event_capacity > 0);
         assert!(config.max_operations > 0);
@@ -366,7 +433,12 @@ impl ControlService {
         };
         initial.desired.authority_epoch = config.authority_epoch;
         recompute_policy_digest(&mut initial);
-        derive_effective(&mut initial, clock.now_millis());
+        derive_effective(
+            &mut initial,
+            clock.now_millis(),
+            selection,
+            supervisor.as_deref(),
+        );
         let (snapshot_tx, snapshots) = watch::channel(initial.clone());
         let (events, _) = broadcast::channel(config.event_capacity);
         let shared = Arc::new(Shared {
@@ -376,6 +448,8 @@ impl ControlService {
             admission: Arc::clone(&admission),
             clock: Arc::clone(&clock),
             config: config.clone(),
+            selection,
+            supervisor: supervisor.clone(),
         });
         let client_id = ClientId::from_parts(config.authority_epoch, 1);
         tokio::spawn(run_service(
@@ -386,6 +460,8 @@ impl ControlService {
             clock,
             config,
             initial,
+            selection,
+            supervisor.clone(),
         ));
         Self {
             client: ControlHandle {
@@ -394,6 +470,7 @@ impl ControlService {
             },
             observer: ObserverHandle(Arc::clone(&shared)),
             completer: CompleterHandle(Arc::clone(&shared)),
+            supervisor,
             shared,
         }
     }
@@ -428,6 +505,14 @@ impl ControlService {
     #[must_use]
     pub fn completer(&self) -> CompleterHandle {
         self.completer.clone()
+    }
+}
+
+impl Drop for ControlService {
+    fn drop(&mut self) {
+        if let Some(supervisor) = &self.supervisor {
+            let _ = supervisor.shutdown_bounded(Duration::from_millis(250));
+        }
     }
 }
 
@@ -547,6 +632,32 @@ impl ControlHandle {
                 Err(AdmissionError::IdempotencyConflict)
             };
         }
+        let admission_profiles = command_profiles(&request.command, &admission.known_profiles);
+        let mut work_admissions = Vec::new();
+        if self.shared.selection == ExecutionSelection::CanonicalAuthority {
+            let supervisor = self
+                .shared
+                .supervisor
+                .as_ref()
+                .ok_or(AdmissionError::Stopped)?;
+            for profile_id in admission_profiles {
+                let routes = self
+                    .shared
+                    .config
+                    .profile_topologies
+                    .get(&profile_id)
+                    .map(|topology| topology.routes.iter().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                let reserved = supervisor
+                    .reserve_tunnel(&profile_id, routes)
+                    .map_err(|error| match error {
+                        WorkFailure::RouteConflict => AdmissionError::RouteConflict,
+                        WorkFailure::Stopped => AdmissionError::Stopped,
+                        _ => AdmissionError::Busy,
+                    })?;
+                work_admissions.push((profile_id, reserved));
+            }
+        }
         if let Some(profile_id) = command_profile(&request.command) {
             if !admission.known_profiles.contains(profile_id)
                 && admission.known_profiles.len() >= self.shared.config.max_observed_profiles
@@ -585,6 +696,7 @@ impl ControlHandle {
             operation_id: operation_id.clone(),
             admitted_at: now,
             evicted,
+            work_admissions,
         });
         Ok(AdmittedOperation { operation_id })
     }
@@ -822,6 +934,8 @@ struct OwnerState {
     challenge_terminals: BTreeMap<ChallengeId, ChallengeTerminal>,
     challenge_answers: BTreeMap<ChallengeId, oneshot::Sender<Secret>>,
     observation_clocks: BTreeMap<ObservationScope, u64>,
+    work_admissions: BTreeMap<(OperationId, ProfileId), ProfileAdmission>,
+    recovery_operations: BTreeSet<OperationId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -833,6 +947,7 @@ enum ObservationScope {
     Firewall,
 }
 
+#[allow(clippy::too_many_arguments)] // One actor owns these bounded channels and authority state.
 async fn run_service(
     mut rx: mpsc::Receiver<Envelope>,
     snapshot_tx: watch::Sender<ControlSnapshot>,
@@ -841,11 +956,15 @@ async fn run_service(
     clock: Arc<dyn Clock>,
     config: ControlServiceConfig,
     mut snapshot: ControlSnapshot,
+    selection: ExecutionSelection,
+    supervisor: Option<Arc<Supervisor>>,
 ) {
     let mut owner = OwnerState {
         challenge_terminals: BTreeMap::new(),
         challenge_answers: BTreeMap::new(),
         observation_clocks: BTreeMap::new(),
+        work_admissions: BTreeMap::new(),
+        recovery_operations: BTreeSet::new(),
     };
     let mut ticker = tokio::time::interval(config.freshness_poll_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -855,24 +974,530 @@ async fn run_service(
                 let Some(envelope) = envelope else { break };
                 let mut pending = Vec::new();
                 let now = clock.now_millis();
-                expire_operations(&mut snapshot, &admission, now, &mut pending);
+                expire_operations(&mut snapshot, &mut owner, &admission, now, &config, selection, &mut pending);
                 expire_challenges(&mut snapshot, &mut owner, now, config.max_challenges, &mut pending);
                 handle_envelope(envelope, &mut snapshot, &mut owner, &admission, now, &config, &mut pending);
-                derive_effective(&mut snapshot, now);
+                drive_supervision(selection, supervisor.as_deref(), &mut snapshot, &mut owner, &admission, now, &config, &mut pending);
+                derive_effective(&mut snapshot, now, selection, supervisor.as_deref());
                 publish_then_events(&mut snapshot, &snapshot_tx, &events, pending);
             }
             _ = ticker.tick() => {
                 let before = snapshot.clone();
                 let mut pending = Vec::new();
                 let now = clock.now_millis();
-                expire_operations(&mut snapshot, &admission, now, &mut pending);
+                expire_operations(&mut snapshot, &mut owner, &admission, now, &config, selection, &mut pending);
                 expire_challenges(&mut snapshot, &mut owner, now, config.max_challenges, &mut pending);
-                derive_effective(&mut snapshot, now);
+                drive_supervision(selection, supervisor.as_deref(), &mut snapshot, &mut owner, &admission, now, &config, &mut pending);
+                derive_effective(&mut snapshot, now, selection, supervisor.as_deref());
                 if snapshot != before || !pending.is_empty() {
                     publish_then_events(&mut snapshot, &snapshot_tx, &events, pending);
                 }
             }
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn drive_supervision(
+    selection: ExecutionSelection,
+    supervisor: Option<&Supervisor>,
+    snapshot: &mut ControlSnapshot,
+    owner: &mut OwnerState,
+    admission: &Arc<Mutex<AdmissionState>>,
+    now: u64,
+    config: &ControlServiceConfig,
+    events: &mut Vec<ControlEvent>,
+) {
+    if selection == ExecutionSelection::LegacyAuthority {
+        return;
+    }
+    let Some(supervisor) = supervisor else {
+        return;
+    };
+
+    if supervisor.lost_results() > 0 {
+        invalidate_gates(
+            snapshot,
+            DriftGates {
+                interface: true,
+                route: true,
+                dns: true,
+                firewall: true,
+            },
+            now,
+            now,
+        );
+    }
+
+    while let Some(result) = supervisor.poll_tunnel() {
+        if result.result.is_err() {
+            invalidate_gates(
+                snapshot,
+                DriftGates {
+                    interface: true,
+                    route: true,
+                    dns: true,
+                    firewall: true,
+                },
+                now,
+                now,
+            );
+        }
+    }
+    while let Some(result) = supervisor.poll_policy() {
+        if !matches!(
+            result.outcome,
+            crate::vortix_core::control::worker::PolicyOutcome::Applied
+                | crate::vortix_core::control::worker::PolicyOutcome::Superseded
+        ) {
+            invalidate_gates(
+                snapshot,
+                DriftGates {
+                    interface: true,
+                    route: true,
+                    dns: true,
+                    firewall: true,
+                },
+                now,
+                now,
+            );
+        }
+    }
+
+    let revision = ControlRevision {
+        authority_epoch: snapshot.desired.authority_epoch,
+        generation: snapshot.desired.generation,
+        digest: snapshot.desired.policy_digest.clone(),
+    };
+    let evidence_is_exact_and_fresh = snapshot.observed.evidence.as_ref().is_some_and(|evidence| {
+        evidence.desired_generation == revision.generation
+            && evidence.authority_epoch == revision.authority_epoch
+            && evidence.policy_digest == revision.digest
+            && snapshot
+                .observed
+                .evidence_received_at_millis
+                .is_some_and(|received| {
+                    received <= now && now.saturating_sub(received) <= MAX_PROTECTION_AGE_MILLIS
+                })
+    });
+    if evidence_is_exact_and_fresh {
+        for (profile_id, fact) in &snapshot.observed.tunnels {
+            if supervisor.profile_truth(profile_id).is_some_and(|entry| {
+                entry.revision() == revision
+                    && entry.truth == SupervisedTruth::WaitingForObservation
+            }) {
+                let _ = supervisor.confirm_tunnel(
+                    profile_id,
+                    &revision,
+                    fact.active,
+                    fact.interface_name.as_deref(),
+                );
+            }
+        }
+    }
+    let supervised = supervisor.profiles();
+    let tombstones = supervisor.tombstones();
+    let desired_connected = snapshot
+        .desired
+        .tunnels
+        .iter()
+        .filter_map(|(profile, state)| {
+            (*state == RequestedTunnelState::Connected).then_some(profile.clone())
+        })
+        .collect::<BTreeSet<_>>();
+    let mut observations = snapshot
+        .observed
+        .tunnels
+        .iter()
+        .map(|(profile, fact)| {
+            let supervision = supervised.get(profile);
+            let managed = supervision.is_some_and(|entry| {
+                entry.truth == SupervisedTruth::ObservedPresent && entry.adoption.is_some()
+            });
+            let managed_revision =
+                managed.then(|| supervision.expect("managed supervision checked").revision());
+            (
+                profile.clone(),
+                TunnelObservation {
+                    evidence: if fact.active {
+                        ScanEvidence::ConfirmedPresent
+                    } else {
+                        ScanEvidence::ConfirmedAbsent
+                    },
+                    interface_name: fact.interface_name.clone(),
+                    ownership: if managed {
+                        ObservationOwnership::Managed
+                    } else {
+                        ObservationOwnership::UnknownExternal
+                    },
+                    revision: managed_revision,
+                    adoption: None,
+                    observed_at_millis: fact.received_at_millis,
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    for profile in tombstones.keys() {
+        observations
+            .entry(profile.clone())
+            .or_insert(TunnelObservation {
+                evidence: ScanEvidence::MissingPartial,
+                interface_name: None,
+                ownership: ObservationOwnership::Managed,
+                revision: supervised
+                    .get(profile)
+                    .map(crate::vortix_core::control::supervisor::ProfileSupervision::revision),
+                adoption: None,
+                observed_at_millis: now,
+            });
+    }
+    let in_flight = supervised
+        .iter()
+        .filter(|(profile, entry)| {
+            !tombstones.contains_key(*profile)
+                && matches!(
+                    entry.truth,
+                    SupervisedTruth::Reserved
+                        | SupervisedTruth::WaitingForObservation
+                        | SupervisedTruth::OutcomeUnknown
+                )
+        })
+        .map(|(profile, entry)| {
+            (
+                profile.clone(),
+                InFlightMutation {
+                    revision: entry.revision(),
+                    operation: entry.operation_id.clone(),
+                },
+            )
+        })
+        .collect();
+    let disconnect_tombstones = tombstones
+        .iter()
+        .map(|(profile, entry)| {
+            (
+                profile.clone(),
+                DisconnectTombstone {
+                    revision: entry.revision(),
+                    teardown_failed: matches!(
+                        entry.truth,
+                        SupervisedTruth::Degraded(_) | SupervisedTruth::OutcomeUnknown
+                    ),
+                },
+            )
+        })
+        .collect();
+    let plan = plan_reconciliation(&ReconcileInput {
+        revision: revision.clone(),
+        desired_connected,
+        observations,
+        in_flight,
+        disconnect_tombstones,
+    });
+    if selection == ExecutionSelection::CanonicalShadow {
+        return;
+    }
+
+    for action in &plan.actions {
+        match action {
+            ReconcileAction::ClearTombstone { profile_id } => {
+                let _ = supervisor.confirm_tunnel(profile_id, &revision, false, None);
+            }
+            ReconcileAction::AdoptAttested {
+                evidence,
+                revision: adoption_revision,
+                ..
+            } => {
+                if let Some(operation) =
+                    operation_for_generation(snapshot, adoption_revision.generation)
+                {
+                    let _ = supervisor.adopt_attested(
+                        evidence.clone(),
+                        adoption_revision.clone(),
+                        operation.id.clone(),
+                    );
+                }
+            }
+            ReconcileAction::Connect {
+                profile_id,
+                revision: action_revision,
+            }
+            | ReconcileAction::Disconnect {
+                profile_id,
+                revision: action_revision,
+            }
+            | ReconcileAction::CleanupStaleManaged {
+                profile_id,
+                target_revision: action_revision,
+                ..
+            } => {
+                let Some(operation) =
+                    operation_for_generation(snapshot, action_revision.generation)
+                else {
+                    continue;
+                };
+                let remaining = operation.deadline_millis.saturating_sub(now);
+                let mutation = if matches!(action, ReconcileAction::Connect { .. }) {
+                    TunnelMutation::Connect
+                } else {
+                    TunnelMutation::Disconnect
+                };
+                let work = TunnelWork {
+                    profile_id: profile_id.clone(),
+                    operation_id: operation.id.clone(),
+                    generation: action_revision.generation,
+                    authority_epoch: action_revision.authority_epoch,
+                    policy_digest: action_revision.digest.clone(),
+                    mutation,
+                    deadline: Instant::now() + Duration::from_millis(remaining),
+                };
+                let key = (operation.id.clone(), profile_id.clone());
+                let reserved = owner.work_admissions.remove(&key).or_else(|| {
+                    if owner.recovery_operations.contains(&operation.id) {
+                        let routes = config
+                            .profile_topologies
+                            .get(profile_id)
+                            .map(|topology| topology.routes.iter().cloned().collect::<Vec<_>>())
+                            .unwrap_or_default();
+                        supervisor.reserve_tunnel(profile_id, routes).ok()
+                    } else {
+                        None
+                    }
+                });
+                let Some(reserved) = reserved else {
+                    invalidate_gates(
+                        snapshot,
+                        DriftGates {
+                            interface: true,
+                            route: true,
+                            dns: true,
+                            firewall: true,
+                        },
+                        now,
+                        now,
+                    );
+                    continue;
+                };
+                if matches!(
+                    supervisor.dispatch_reserved_tunnel(work, reserved),
+                    Err(WorkFailure::Busy | WorkFailure::RouteConflict)
+                ) {
+                    invalidate_gates(
+                        snapshot,
+                        DriftGates {
+                            interface: true,
+                            route: true,
+                            dns: true,
+                            firewall: true,
+                        },
+                        now,
+                        now,
+                    );
+                }
+            }
+            ReconcileAction::ObserveReadOnly { .. } => {}
+        }
+    }
+
+    let tunnel_barrier_ready = plan.actions.is_empty()
+        && snapshot.desired.tunnels.iter().all(|(profile, desired)| {
+            let should_be_present = *desired == RequestedTunnelState::Connected;
+            let observed = snapshot.observed.tunnels.get(profile);
+            if should_be_present {
+                supervisor.profile_truth(profile).is_some_and(|entry| {
+                    entry.revision() == revision
+                        && entry.truth == SupervisedTruth::ObservedPresent
+                        && entry.adoption.is_some()
+                }) && observed.is_some_and(|fact| {
+                    fact.active
+                        && fact.received_at_millis <= now
+                        && now.saturating_sub(fact.received_at_millis) <= MAX_PROTECTION_AGE_MILLIS
+                })
+            } else {
+                observed.is_none_or(|fact| !fact.active)
+                    && supervisor.profile_truth(profile).is_none()
+                    && !supervisor.is_tombstoned(profile)
+            }
+        });
+
+    if tunnel_barrier_ready {
+        if let Some(operation) = operation_for_generation(snapshot, revision.generation).cloned() {
+            let target_profiles = snapshot
+                .desired
+                .tunnels
+                .iter()
+                .filter_map(|(profile, state)| {
+                    (*state == RequestedTunnelState::Connected).then_some(profile.clone())
+                })
+                .collect();
+            let prior_profiles = snapshot
+                .observed
+                .tunnels
+                .iter()
+                .filter_map(|(profile, fact)| fact.active.then_some(profile.clone()))
+                .collect();
+            let policy = TopologyPolicy {
+                generation: revision.generation,
+                authority_epoch: revision.authority_epoch,
+                digest: revision.digest.clone(),
+                operation_id: operation.id.clone(),
+                deadline: Instant::now()
+                    + Duration::from_millis(operation.deadline_millis.saturating_sub(now)),
+                prior: supervisor.applied_topology().unwrap_or_else(|| {
+                    build_topology_state(
+                        prior_profiles,
+                        &snapshot.observed.tunnels,
+                        config,
+                        crate::vortix_core::state::killswitch::KillSwitchMode::Off,
+                    )
+                }),
+                target: build_topology_state(
+                    target_profiles,
+                    &snapshot.observed.tunnels,
+                    config,
+                    snapshot.desired.kill_switch,
+                ),
+                transition: transition_for_plan(&plan.actions),
+                required_blocking: snapshot.desired.kill_switch
+                    != crate::vortix_core::state::killswitch::KillSwitchMode::Off,
+            };
+            match supervisor.submit_policy(&policy) {
+                Ok(()) | Err(WorkFailure::Stale) => {}
+                Err(_) => invalidate_gates(
+                    snapshot,
+                    DriftGates {
+                        interface: true,
+                        route: true,
+                        dns: true,
+                        firewall: true,
+                    },
+                    now,
+                    now,
+                ),
+            }
+        }
+    }
+
+    if let (Some(evidence), Some((policy_revision, operation_id))) = (
+        snapshot
+            .observed
+            .evidence
+            .as_ref()
+            .filter(|_| supervisor.lost_results() == 0),
+        supervisor.latest_policy(),
+    ) {
+        let verification = PolicyVerification {
+            revision: policy_revision.clone(),
+            operation_id: operation_id.clone(),
+            observed_at_millis: evidence.observed_at_millis,
+            received_at_millis: snapshot.observed.evidence_received_at_millis.unwrap_or(now),
+            interface_verified: evidence.interface == GateEvidence::Verified,
+            route_verified: evidence.route == GateEvidence::Verified,
+            dns_verified: evidence.dns == GateEvidence::Verified,
+            firewall_verified: evidence.firewall == GateEvidence::Verified,
+        };
+        if evidence.desired_generation == policy_revision.generation
+            && evidence.authority_epoch == policy_revision.authority_epoch
+            && evidence.policy_digest == policy_revision.digest
+            && supervisor.verify_policy(&verification, now).is_ok()
+        {
+            let converged =
+                snapshot.desired.tunnels.iter().all(|(profile, state)| {
+                    snapshot.observed.tunnels.get(profile).is_some_and(|fact| {
+                        fact.active == (*state == RequestedTunnelState::Connected)
+                    })
+                });
+            if converged {
+                let completion_operation =
+                    operation_for_generation(snapshot, policy_revision.generation)
+                        .map(|operation| operation.id.clone())
+                        .unwrap_or(operation_id);
+                let _ = complete_operation(
+                    OperationCompletion {
+                        operation_id: completion_operation,
+                        desired_generation: policy_revision.generation,
+                        outcome: CompletionOutcome::ObservedSuccess(evidence.clone()),
+                    },
+                    snapshot,
+                    owner,
+                    admission,
+                    now,
+                    events,
+                );
+            }
+        }
+    }
+}
+
+fn operation_for_generation(
+    snapshot: &ControlSnapshot,
+    generation: u64,
+) -> Option<&OperationRecord> {
+    snapshot.operations.values().rev().find(|operation| {
+        operation.desired_generation == generation && !operation.status.is_terminal()
+    })
+}
+
+fn transition_for_plan(actions: &[ReconcileAction]) -> TopologyTransitionKind {
+    let connects = actions
+        .iter()
+        .any(|action| matches!(action, ReconcileAction::Connect { .. }));
+    let disconnects = actions
+        .iter()
+        .any(|action| matches!(action, ReconcileAction::Disconnect { .. }));
+    match (connects, disconnects) {
+        (true, true) => TopologyTransitionKind::Reconnect,
+        (true, false) => TopologyTransitionKind::Connect,
+        (false, true) => TopologyTransitionKind::Disconnect,
+        (false, false) => TopologyTransitionKind::PolicyOnly,
+    }
+}
+
+fn build_topology_state(
+    profiles: BTreeSet<ProfileId>,
+    observed: &BTreeMap<ProfileId, ObservedTunnel>,
+    config: &ControlServiceConfig,
+    kill_switch: crate::vortix_core::state::killswitch::KillSwitchMode,
+) -> TopologyState {
+    let mut interfaces = BTreeMap::new();
+    let mut routes = BTreeMap::new();
+    let mut ownership_receipts = BTreeSet::new();
+    let mut dns_material = Vec::new();
+    let mut firewall_material = Vec::new();
+    for profile in &profiles {
+        let configured = config.profile_topologies.get(profile);
+        let interface = configured
+            .and_then(|topology| topology.interface_name.clone())
+            .or_else(|| {
+                observed
+                    .get(profile)
+                    .and_then(|fact| fact.interface_name.clone())
+            });
+        if let Some(interface) = interface {
+            interfaces.insert(profile.clone(), interface);
+        }
+        if let Some(topology) = configured {
+            let claims = topology
+                .routes
+                .iter()
+                .filter_map(|route| RouteClaim::parse(route).ok())
+                .collect::<BTreeSet<_>>();
+            routes.insert(profile.clone(), claims);
+            dns_material.extend_from_slice(profile.as_str().as_bytes());
+            dns_material.extend_from_slice(topology.dns_digest.0.as_bytes());
+            firewall_material.extend_from_slice(profile.as_str().as_bytes());
+            firewall_material.extend_from_slice(topology.firewall_digest.0.as_bytes());
+            ownership_receipts.extend(topology.ownership_receipts.iter().cloned());
+        }
+    }
+    TopologyState {
+        profiles,
+        interfaces,
+        routes,
+        dns_digest: PolicyDigest(encode_digest(&dns_material)),
+        kill_switch,
+        firewall_digest: PolicyDigest(encode_digest(&firewall_material)),
+        ownership_receipts,
     }
 }
 
@@ -894,6 +1519,7 @@ fn handle_envelope(
             operation_id,
             admitted_at,
             evicted,
+            work_admissions,
         } => {
             for evicted_id in evicted {
                 snapshot.operations.remove(&evicted_id);
@@ -925,11 +1551,19 @@ fn handle_envelope(
                     result: expired.then_some(OperationResult::Expired),
                 },
             );
+            for (profile_id, reserved) in work_admissions {
+                owner
+                    .work_admissions
+                    .insert((operation_id.clone(), profile_id), reserved);
+            }
             events.push(ControlEvent::OperationAdmitted {
                 operation_id: operation_id.clone(),
                 desired_generation,
             });
             if expired {
+                owner
+                    .work_admissions
+                    .retain(|(reserved_operation, _), _| reserved_operation != &operation_id);
                 mark_terminal(admission, operation_id.clone());
                 events.push(ControlEvent::OperationCompleted {
                     operation_id,
@@ -944,7 +1578,7 @@ fn handle_envelope(
             let _ = reply.send(result);
         }
         Envelope::Complete { completion, reply } => {
-            let result = complete_operation(completion, snapshot, admission, now, events);
+            let result = complete_operation(completion, snapshot, owner, admission, now, events);
             let _ = reply.send(result);
         }
         Envelope::IssueChallenge {
@@ -1093,6 +1727,20 @@ fn command_profile(command: &UserCommand) -> Option<&ProfileId> {
         | UserCommand::Reconnect { profile_id: None }
         | UserCommand::ForceDisconnect { profile_id: None }
         | UserCommand::SetKillSwitch { .. } => None,
+    }
+}
+
+fn command_profiles(command: &UserCommand, known_profiles: &BTreeSet<ProfileId>) -> Vec<ProfileId> {
+    if let Some(profile) = command_profile(command) {
+        return vec![profile.clone()];
+    }
+    match command {
+        UserCommand::Disconnect { profile_id: None }
+        | UserCommand::Reconnect { profile_id: None }
+        | UserCommand::ForceDisconnect { profile_id: None } => {
+            known_profiles.iter().cloned().collect()
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -1373,6 +2021,7 @@ fn invalidate_gates(
 fn complete_operation(
     completion: OperationCompletion,
     snapshot: &mut ControlSnapshot,
+    owner: &mut OwnerState,
     admission: &Arc<Mutex<AdmissionState>>,
     now: u64,
     events: &mut Vec<ControlEvent>,
@@ -1397,7 +2046,15 @@ fn complete_operation(
     if record.deadline_millis <= now {
         record.status = OperationStatus::Expired;
         record.result = Some(OperationResult::Expired);
-        mark_terminal(admission, completion.operation_id.clone());
+        let was_recovery = owner.recovery_operations.remove(&completion.operation_id);
+        owner
+            .work_admissions
+            .retain(|(operation, _), _| operation != &completion.operation_id);
+        if was_recovery {
+            snapshot.operations.remove(&completion.operation_id);
+        } else {
+            mark_terminal(admission, completion.operation_id.clone());
+        }
         events.push(ControlEvent::OperationCompleted {
             operation_id: completion.operation_id,
             status: OperationStatus::Expired,
@@ -1430,7 +2087,14 @@ fn complete_operation(
         }
     }
     let status = record.status;
-    mark_terminal(admission, completion.operation_id.clone());
+    owner
+        .work_admissions
+        .retain(|(operation, _), _| operation != &completion.operation_id);
+    if owner.recovery_operations.remove(&completion.operation_id) {
+        snapshot.operations.remove(&completion.operation_id);
+    } else {
+        mark_terminal(admission, completion.operation_id.clone());
+    }
     events.push(ControlEvent::OperationCompleted {
         operation_id: completion.operation_id,
         status,
@@ -1440,8 +2104,11 @@ fn complete_operation(
 
 fn expire_operations(
     snapshot: &mut ControlSnapshot,
+    owner: &mut OwnerState,
     admission: &Arc<Mutex<AdmissionState>>,
     now: u64,
+    _config: &ControlServiceConfig,
+    selection: ExecutionSelection,
     events: &mut Vec<ControlEvent>,
 ) {
     let expired: Vec<_> = snapshot
@@ -1452,14 +2119,64 @@ fn expire_operations(
         })
         .collect();
     for id in expired {
+        let expired_record = snapshot.operations.get(&id).cloned();
+        let was_recovery = owner.recovery_operations.remove(&id);
         if let Some(record) = snapshot.operations.get_mut(&id) {
             record.status = OperationStatus::Expired;
             record.result = Some(OperationResult::Expired);
         }
-        mark_terminal(admission, id.clone());
+        owner
+            .work_admissions
+            .retain(|(operation, _), _| operation != &id);
+        if was_recovery {
+            snapshot.operations.remove(&id);
+        } else {
+            mark_terminal(admission, id.clone());
+        }
         events.push(ControlEvent::OperationCompleted {
             operation_id: id,
             status: OperationStatus::Expired,
+        });
+        let Some(expired_record) = expired_record else {
+            continue;
+        };
+        if selection != ExecutionSelection::CanonicalAuthority
+            || expired_record.desired_generation != snapshot.desired.generation
+            || snapshot.operations.values().any(|operation| {
+                operation.desired_generation == snapshot.desired.generation
+                    && !operation.status.is_terminal()
+            })
+        {
+            continue;
+        }
+        let recovery_id = {
+            let mut state = admission.lock().expect("admission mutex poisoned");
+            state.next_operation = state.next_operation.saturating_add(1);
+            OperationId::from_parts(snapshot.desired.authority_epoch, state.next_operation)
+        };
+        let recovery_deadline = now.saturating_add(30_000);
+        snapshot.operations.insert(
+            recovery_id.clone(),
+            OperationRecord {
+                id: recovery_id.clone(),
+                idempotency_key: IdempotencyKey::new(format!(
+                    "service-recovery-{}-{now}",
+                    snapshot.desired.generation
+                )),
+                client_id: ClientId::from_parts(snapshot.desired.authority_epoch, 0),
+                command_digest: snapshot.desired.policy_digest.clone(),
+                authority_epoch: snapshot.desired.authority_epoch,
+                desired_generation: snapshot.desired.generation,
+                admitted_at_millis: now,
+                deadline_millis: recovery_deadline,
+                status: OperationStatus::WaitingForObservation,
+                result: None,
+            },
+        );
+        owner.recovery_operations.insert(recovery_id.clone());
+        events.push(ControlEvent::OperationAdmitted {
+            operation_id: recovery_id,
+            desired_generation: snapshot.desired.generation,
         });
     }
 }
@@ -1592,7 +2309,12 @@ fn record_challenge_terminal(
     terminals.insert(id, terminal);
 }
 
-fn derive_effective(snapshot: &mut ControlSnapshot, now: u64) {
+fn derive_effective(
+    snapshot: &mut ControlSnapshot,
+    now: u64,
+    selection: ExecutionSelection,
+    supervisor: Option<&Supervisor>,
+) {
     let desired = &snapshot.desired;
     let Some(evidence) = snapshot.observed.evidence.as_ref() else {
         snapshot.effective = EffectiveState {
@@ -1609,8 +2331,15 @@ fn derive_effective(snapshot: &mut ControlSnapshot, now: u64) {
     };
     let age = now.saturating_sub(evidence.observed_at_millis);
     let current = evidence_matches(evidence, snapshot, now);
+    let revision = ControlRevision {
+        authority_epoch: desired.authority_epoch,
+        generation: desired.generation,
+        digest: desired.policy_digest.clone(),
+    };
+    let supervised_protection = selection != ExecutionSelection::CanonicalAuthority
+        || supervisor.is_some_and(|supervisor| supervisor.protects(&revision, now));
     snapshot.effective = EffectiveState {
-        protection: if current && evidence.all_gates_verified() {
+        protection: if current && evidence.all_gates_verified() && supervised_protection {
             ProtectionStatus::Protected
         } else {
             ProtectionStatus::Degraded

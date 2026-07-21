@@ -83,6 +83,10 @@ pub struct DetailedConnectionInfo {
     pub transfer_tx: String,
     pub latest_handshake: String,
     pub pid: Option<u32>,
+    /// Exact userspace-child ownership capability. Internal-only and never
+    /// exposed through snapshots or JSON.
+    #[serde(skip)]
+    pub process_ownership: Option<crate::vortix_core::ports::process::ManagedProcessId>,
     /// Protocol-requested resolver intent retained for the global policy
     /// worker. Internal-only so existing IPC/JSON snapshots remain stable.
     #[serde(skip)]
@@ -128,6 +132,7 @@ impl Default for DetailedConnectionInfo {
             transfer_tx: String::new(),
             latest_handshake: String::new(),
             pid: None,
+            process_ownership: None,
             dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
             teardown_config: None,
             interface_authoritative: true,

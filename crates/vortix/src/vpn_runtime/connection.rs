@@ -148,7 +148,7 @@ impl VpnRuntime {
                 Ok(Message::ConnectResult {
                     profile,
                     success,
-                    error,
+                    mut error,
                     interface: _,
                     dns_request,
                     ..
@@ -171,8 +171,11 @@ impl VpnRuntime {
                         let (is_connected, active) = self.killswitch_view_from_scanner();
                         self.sync_killswitch(is_connected, &active);
                         self.reconcile_dns_from_scanner();
-                    } else {
-                        self.cleanup_vpn_resources(&profile);
+                    } else if let Err(cleanup) = self.cleanup_vpn_resources(&profile) {
+                        let original = error.unwrap_or_else(|| "connection failed".into());
+                        error = Some(format!(
+                            "{original}; teardown remains ambiguous-owned: {cleanup}"
+                        ));
                     }
 
                     return Ok(ConnectResult {
@@ -185,13 +188,14 @@ impl VpnRuntime {
                 Ok(_) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     if Instant::now() >= deadline {
-                        self.cleanup_vpn_resources(&name);
+                        let cleanup = self.cleanup_vpn_resources(&name).err();
                         return Ok(ConnectResult {
                             profile: name,
                             protocol,
                             success: false,
-                            error: Some(format!(
-                                "Connection timed out after {connect_timeout_secs}s"
+                            error: Some(cleanup.map_or_else(
+                                || format!("Connection timed out after {connect_timeout_secs}s; teardown requested and awaiting kernel confirmation"),
+                                |error| format!("Connection timed out after {connect_timeout_secs}s; teardown remains ambiguous-owned: {error}"),
                             )),
                         });
                     }
@@ -268,6 +272,7 @@ impl VpnRuntime {
                     Protocol::WireGuard => TunnelKindTag::WireGuard,
                     Protocol::OpenVPN => TunnelKindTag::OpenVpn,
                 },
+                process_ownership: None,
                 teardown_config,
                 dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
             };
@@ -323,9 +328,15 @@ impl VpnRuntime {
                 Ok(_) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     if Instant::now() >= deadline {
-                        self.cleanup_vpn_resources(&profile_name);
-                        self.session_start = None;
-                        return Err("Disconnect timed out".into());
+                        return match self.cleanup_vpn_resources(&profile_name) {
+                            Ok(()) => Err(
+                                "Disconnect timed out; teardown requested and awaiting kernel confirmation"
+                                    .into(),
+                            ),
+                            Err(error) => Err(format!(
+                                "Disconnect timed out; teardown remains ambiguous-owned: {error}"
+                            )),
+                        };
                     }
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {

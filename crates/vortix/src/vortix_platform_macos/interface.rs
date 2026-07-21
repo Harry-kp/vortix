@@ -135,12 +135,6 @@ pub(crate) fn find_pid_with_cmdline_substring(needle: &str, also: Option<&str>) 
     matching_pids(&needles, Some(1)).into_iter().next()
 }
 
-/// find ALL processes whose binary path contains the given
-/// substring. Used by the OVPN tunnel teardown to replace `pkill -f`.
-pub(crate) fn find_all_pids_with_cmdline_substring(needle: &str) -> Vec<u32> {
-    matching_pids(&[needle], None)
-}
-
 fn matching_pids(needles: &[&str], limit: Option<usize>) -> Vec<u32> {
     let needles: Vec<String> = needles.iter().map(|needle| needle.to_lowercase()).collect();
     let mut matches = Vec::new();
