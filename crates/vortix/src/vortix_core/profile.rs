@@ -27,7 +27,7 @@ pub fn sanitize_profile_name(name: &str) -> String {
 }
 
 /// Stable, opaque identifier for a profile.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct ProfileId(String);
 
 impl ProfileId {

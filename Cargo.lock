@@ -2915,6 +2915,7 @@ dependencies = [
  "unicode-width",
  "ureq",
  "urlencoding",
+ "zeroize",
 ]
 
 [[package]]
