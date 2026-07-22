@@ -954,6 +954,9 @@ fn prepare_down_target_with(
     }
 
     let body = read_bounded_profile(&config.path)?;
+    parse_wg_conf(&body).map_err(|error| {
+        TunnelError::Subprocess(format!("validate WireGuard teardown profile: {error}"))
+    })?;
     let stripped = strip_dns_directive(&body);
     if stripped == body {
         return Ok(PreparedDownTarget {
@@ -988,7 +991,7 @@ impl Tunnel for WgTunnel {
         }
         let user_body = read_bounded_profile(&profile.config_path)?;
         let parsed = parse_wg_conf(&user_body).map_err(|error| {
-            TunnelError::Subprocess(format!("parse WireGuard DNS intent: {error}"))
+            TunnelError::Subprocess(format!("validate WireGuard profile: {error}"))
         })?;
         let dns_request = parsed.dns_request();
         let plan = self.handshake_plan(&parsed)?;

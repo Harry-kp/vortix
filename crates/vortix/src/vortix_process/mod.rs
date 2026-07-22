@@ -21,8 +21,8 @@ pub use real::{RealProcessLifecycle, RealRunner};
 // just to construct specs.
 pub use crate::vortix_core::ports::process::{
     CommandOutcome, CommandRunner as CommandRunnerTrait, CommandSpec, DetachedHandle,
-    ExitStatusInfo, Kind, ManagedProcessId, PrivilegeReq, ProcessError, ProcessLifecycle,
-    ProcessOwnership,
+    ExitStatusInfo, Kind, ManagedProcessId, PrivilegeReq, ProcessCredentials, ProcessError,
+    ProcessLifecycle, ProcessOwnership,
 };
 
 /// The enum carrier — held by value, dispatched statically.
@@ -201,6 +201,10 @@ pub fn run_to_output(spec: CommandSpec) -> std::io::Result<std::process::Output>
         Err(ProcessError::PrivilegeDenied { program }) => Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             format!("`{program}` requires root"),
+        )),
+        Err(ProcessError::InvalidCredentials { program, reason }) => Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("`{program}` has invalid owner credentials: {reason}"),
         )),
         Err(ProcessError::Killed { program, signal }) => Err(std::io::Error::other(format!(
             "`{program}` killed by signal {signal}"

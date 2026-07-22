@@ -5,6 +5,7 @@
 //! protocol, platform, process, filesystem, or network work.
 
 pub mod command;
+pub mod hooks;
 pub mod model;
 pub mod reconcile;
 pub mod service;
@@ -15,6 +16,7 @@ pub mod worker;
 pub use command::{
     ChallengeResponse, CommandRequest, Deadline, IdempotencyKey, Secret, UserCommand,
 };
+pub use hooks::{HookEvent, HookEventId, LifecycleFact};
 pub use model::{
     AuthorityEpoch, ChallengeId, ChallengeKind, ChallengeRecord, ClientId, CompletionOutcome,
     ControlEvent, ControlEventEnvelope, DesiredState, DriftGates, EffectiveState, EventEnvelope,

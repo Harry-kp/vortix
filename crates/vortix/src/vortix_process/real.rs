@@ -478,7 +478,174 @@ impl RealRunner {
                 program: spec.program.clone(),
             });
         }
+        if let Some(credentials) = &spec.run_as {
+            if credentials.uid == 0 || credentials.gid == 0 {
+                return Err(ProcessError::InvalidCredentials {
+                    program: spec.program.clone(),
+                    reason: "owner-run subprocess must use a non-root uid and gid".into(),
+                });
+            }
+            if spec.requires_privilege == PrivilegeReq::Root {
+                return Err(ProcessError::InvalidCredentials {
+                    program: spec.program.clone(),
+                    reason: "a subprocess cannot require root and request credential drop".into(),
+                });
+            }
+            if credentials.supplementary_groups.contains(&0) {
+                return Err(ProcessError::InvalidCredentials {
+                    program: spec.program.clone(),
+                    reason: "owner-run subprocess cannot retain root supplementary groups".into(),
+                });
+            }
+            if i32::try_from(credentials.supplementary_groups.len()).is_err() {
+                return Err(ProcessError::InvalidCredentials {
+                    program: spec.program.clone(),
+                    reason: "too many supplementary groups".into(),
+                });
+            }
+            let (process_user, process_group) = crate::utils::effective_user_group_ids();
+            if process_user != 0
+                && (process_user != credentials.uid || process_group != credentials.gid)
+            {
+                return Err(ProcessError::InvalidCredentials {
+                    program: spec.program.clone(),
+                    reason: "non-root caller may execute only as its current uid/gid".into(),
+                });
+            }
+            if process_user != 0 && current_groups()? != credentials.supplementary_groups {
+                return Err(ProcessError::InvalidCredentials {
+                    program: spec.program.clone(),
+                    reason: "non-root caller cannot change supplementary groups".into(),
+                });
+            }
+        }
+        if spec.terminate_process_group && spec.kind == Kind::DetachedSpawn {
+            return Err(ProcessError::InvalidCredentials {
+                program: spec.program.clone(),
+                reason: "contained process groups cannot use detached spawn".into(),
+            });
+        }
         Ok(())
+    }
+}
+
+fn configure_owner_process(command: &mut Command, spec: &CommandSpec) {
+    command.kill_on_drop(spec.terminate_process_group);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+
+        if spec.terminate_process_group {
+            command.as_std_mut().process_group(0);
+        }
+        if crate::utils::effective_user_group_ids().0 == 0 {
+            if let Some(credentials) = spec.run_as.clone() {
+                let groups = credentials.supplementary_groups;
+                let group_count = i32::try_from(groups.len()).expect("validated group count");
+                let gid = credentials.gid;
+                let uid = credentials.uid;
+                #[allow(unsafe_code)]
+                unsafe {
+                    command
+                        .as_std_mut()
+                        .pre_exec(move || drop_credentials(&groups, group_count, gid, uid));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn drop_credentials(groups: &[u32], group_count: i32, gid: u32, uid: u32) -> std::io::Result<()> {
+    // SAFETY: pointers remain valid for the duration of each syscall and all
+    // values were prepared before fork. Ordering prevents reacquiring privilege.
+    #[allow(unsafe_code)]
+    unsafe {
+        if libc::setgroups(group_count, groups.as_ptr()) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if libc::setgid(gid) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if libc::setuid(uid) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn current_groups() -> Result<Vec<u32>, ProcessError> {
+    // SAFETY: the first call obtains the required length; the second writes
+    // into an allocated vector of exactly that length.
+    #[allow(unsafe_code)]
+    unsafe {
+        let count = libc::getgroups(0, std::ptr::null_mut());
+        if count < 0 {
+            return Err(ProcessError::InvalidCredentials {
+                program: "process-owner".into(),
+                reason: std::io::Error::last_os_error().to_string(),
+            });
+        }
+        let mut groups = vec![0; usize::try_from(count).unwrap_or(0)];
+        if count > 0 && libc::getgroups(count, groups.as_mut_ptr()) < 0 {
+            return Err(ProcessError::InvalidCredentials {
+                program: "process-owner".into(),
+                reason: std::io::Error::last_os_error().to_string(),
+            });
+        }
+        Ok(groups)
+    }
+}
+
+async fn terminate_child(child: &mut tokio::process::Child, process_group: bool) {
+    #[cfg(unix)]
+    if process_group {
+        if let Some(pid) = child.id().and_then(|pid| i32::try_from(pid).ok()) {
+            // SAFETY: the child was placed in a fresh group whose id is its pid.
+            #[allow(unsafe_code)]
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+    } else {
+        let _ = child.start_kill();
+    }
+    #[cfg(not(unix))]
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+}
+
+#[cfg(unix)]
+struct ProcessGroupGuard(Option<i32>);
+
+#[cfg(unix)]
+impl ProcessGroupGuard {
+    fn new(child: &tokio::process::Child, enabled: bool) -> Self {
+        Self(
+            enabled
+                .then(|| child.id())
+                .flatten()
+                .and_then(|pid| i32::try_from(pid).ok()),
+        )
+    }
+
+    fn contain_descendants(&mut self) {
+        if let Some(pgid) = self.0.take() {
+            // SAFETY: `pgid` belongs to the fresh child group created before
+            // exec. Killing a missing group is harmless.
+            #[allow(unsafe_code)]
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        self.contain_descendants();
     }
 }
 
@@ -508,6 +675,7 @@ impl Trait for RealRunner {
         for (k, v) in &spec.env {
             cmd.env(k, v);
         }
+        configure_owner_process(&mut cmd, &spec);
         if let Some(cwd) = &spec.cwd {
             cmd.current_dir(cwd);
         }
@@ -542,6 +710,8 @@ impl Trait for RealRunner {
                 }
             }
         })?;
+        #[cfg(unix)]
+        let mut process_group = ProcessGroupGuard::new(&child, spec.terminate_process_group);
 
         // Optionally write stdin.
         if let Some(stdin_bytes) = &spec.stdin_bytes {
@@ -570,6 +740,7 @@ impl Trait for RealRunner {
                         duration_ms = %timeout.as_millis(),
                         "subprocess.timeout"
                     );
+                    terminate_child(&mut child, spec.terminate_process_group).await;
                     return Err(ProcessError::Timeout {
                         program: spec.program.clone(),
                         duration: timeout,
@@ -585,6 +756,8 @@ impl Trait for RealRunner {
                     source: e,
                 })?
             };
+            #[cfg(unix)]
+            process_group.contain_descendants();
             (status, Vec::new(), Vec::new())
         } else if let Some(limit) = spec.output_limit {
             let stdout = child.stdout.take().ok_or_else(|| ProcessError::IoError {
@@ -599,8 +772,7 @@ impl Trait for RealRunner {
             let stderr_task = tokio::spawn(drain_bounded(stderr, limit));
             let status = if let Some(timeout) = spec.timeout {
                 let Ok(result) = tokio::time::timeout(timeout, child.wait()).await else {
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
+                    terminate_child(&mut child, spec.terminate_process_group).await;
                     return Err(ProcessError::Timeout {
                         program: spec.program.clone(),
                         duration: timeout,
@@ -616,6 +788,8 @@ impl Trait for RealRunner {
                     source,
                 })?
             };
+            #[cfg(unix)]
+            process_group.contain_descendants();
             let (stdout, stdout_overflow) = stdout_task
                 .await
                 .map_err(|error| ProcessError::IoError {
@@ -671,6 +845,8 @@ impl Trait for RealRunner {
                         source: e,
                     })?
             };
+            #[cfg(unix)]
+            process_group.contain_descendants();
             (output.status, output.stdout, output.stderr)
         };
 
@@ -727,6 +903,7 @@ impl Trait for RealRunner {
         for (k, v) in &spec.env {
             cmd.env(k, v);
         }
+        configure_owner_process(&mut cmd, &spec);
         if let Some(cwd) = &spec.cwd {
             cmd.current_dir(cwd);
         }
@@ -783,4 +960,82 @@ fn redact_args(args: &[String], redact_indices: &[usize]) -> Vec<String> {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vortix_core::ports::process::ProcessCredentials;
+
+    #[test]
+    fn explicit_owner_credentials_never_resolve_to_root() {
+        let (process_user, process_group) = crate::utils::effective_user_group_ids();
+        let (uid, gid) = if process_user == 0 {
+            (65_534, 65_534)
+        } else {
+            (process_user, process_group)
+        };
+        let supplementary_groups = if process_user == 0 {
+            Vec::new()
+        } else {
+            current_groups().unwrap()
+        };
+        let mut spec =
+            CommandSpec::oneshot("/usr/bin/id", vec!["-u".into()]).run_as(ProcessCredentials {
+                uid,
+                gid,
+                supplementary_groups,
+            });
+        spec.env_clear = true;
+        let outcome = RealRunner::new().run_blocking(spec).unwrap();
+        assert_eq!(outcome.stdout_lossy().trim(), uid.to_string());
+        assert_ne!(uid, 0);
+    }
+
+    #[test]
+    fn timeout_contains_hook_descendants() {
+        let temp = tempfile::tempdir().unwrap();
+        let pids = temp.path().join("pids");
+        let script = "/bin/sleep 30 & echo \"$$ $!\" > \"$1\"; wait";
+        let spec = CommandSpec::oneshot(
+            "/bin/sh",
+            vec![
+                "-c".into(),
+                script.into(),
+                "vortix-hook-test".into(),
+                pids.to_string_lossy().into_owned(),
+            ],
+        )
+        .timeout(Duration::from_millis(250))
+        .output_limit(1024)
+        .contain_process_group();
+        assert!(matches!(
+            RealRunner::new().run_blocking(spec),
+            Err(ProcessError::Timeout { .. })
+        ));
+        let recorded = std::fs::read_to_string(&pids).unwrap();
+        let pids = recorded
+            .split_whitespace()
+            .map(|pid| pid.parse::<u32>().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(pids.len(), 2);
+        for _ in 0..20 {
+            if pids.iter().all(|pid| !process_is_live(*pid)) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("hook process group still has a live member: {pids:?}");
+    }
+
+    fn process_is_live(pid: u32) -> bool {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output();
+        output.is_ok_and(|output| {
+            let state = String::from_utf8_lossy(&output.stdout);
+            let state = state.trim();
+            !state.is_empty() && !state.starts_with('Z')
+        })
+    }
 }

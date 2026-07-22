@@ -147,6 +147,7 @@ pub fn parse_ovpn_conf(text: &str) -> Result<OvpnParsedProfile, ParseError> {
         let Some(directive) = tokens.next() else {
             continue;
         };
+        reject_executable_directive(directive.trim_start_matches('-'))?;
 
         match directive {
             "remote" => {
@@ -199,6 +200,38 @@ pub fn parse_ovpn_conf(text: &str) -> Result<OvpnParsedProfile, ParseError> {
     }
 
     Ok(profile)
+}
+
+fn reject_executable_directive(directive: &str) -> Result<(), ParseError> {
+    const EXECUTABLE_DIRECTIVES: &[&str] = &[
+        "daemon",
+        "config",
+        "include",
+        "plugin",
+        "up",
+        "down",
+        "route-up",
+        "route-pre-down",
+        "ipchange",
+        "client-connect",
+        "client-connect-deferred",
+        "client-disconnect",
+        "learn-address",
+        "tls-verify",
+        "tls-crypt-v2-verify",
+        "auth-user-pass-verify",
+        "iproute",
+    ];
+    if EXECUTABLE_DIRECTIVES
+        .iter()
+        .any(|candidate| directive.eq_ignore_ascii_case(candidate))
+    {
+        return Err(ParseError::Unsupported(format!(
+            "OpenVPN `{}` executable directive is not allowed: Vortix never runs profile commands as root; migrate lifecycle automation to a global hook using an absolute executable plus argv",
+            directive.to_ascii_lowercase()
+        )));
+    }
+    Ok(())
 }
 
 /// Parse `static-challenge "<prompt>" <echo>` from a trimmed config line.
@@ -307,6 +340,17 @@ where
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+
+    #[test]
+    fn executable_directives_fail_unprivileged_parsing_with_migration_guidance() {
+        for directive in ["up ./up.sh", "--route-up ./route.sh", "plugin evil.so"] {
+            let error = parse_ovpn_conf(&format!("client\n{directive}\n"))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("never runs profile commands as root"));
+            assert!(error.contains("global hook"));
+        }
+    }
 
     #[test]
     fn detects_interactive_auth() {

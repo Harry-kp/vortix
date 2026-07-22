@@ -383,6 +383,10 @@ pub struct ChallengeRecord {
 #[non_exhaustive]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ControlEvent {
+    /// Committed lifecycle fact for asynchronous, unprivileged observers.
+    Lifecycle {
+        fact: crate::vortix_core::control::hooks::LifecycleFact,
+    },
     OperationAdmitted {
         operation_id: OperationId,
         desired_generation: u64,

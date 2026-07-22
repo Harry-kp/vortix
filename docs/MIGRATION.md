@@ -279,6 +279,39 @@ read-then-write-new-file, so the worst-case rollback is "delete
 
 ---
 
+## Migrate profile scripts to lifecycle hooks
+
+Vortix no longer permits executable directives inside WireGuard or OpenVPN
+profiles. In particular, WireGuard `PreUp`, `PostUp`, `PreDown`, and
+`PostDown`, and OpenVPN script/plugin directives are rejected before the
+profile can reach a privileged protocol process. This closes the historical
+path where `sudo vortix` could cause profile text to execute as root.
+
+Move observational automation into `settings.toml` as a global hook:
+
+```toml
+[[hooks]]
+event = "connected"
+executable = "/usr/local/bin/vpn-notify"
+args = ["connected"]
+timeout_secs = 5
+```
+
+Supported events are `connect_started`, `connected`, `disconnect_started`,
+`disconnected`, `connect_failed`, and `reconnecting`. The executable must be
+an absolute path and arguments must be separate array entries; Vortix never
+passes this through a shell. Hooks run asynchronously as the proved non-root
+owner with a clean, allowlisted environment. They cannot veto or delay a VPN
+transition, are attempted at most once, and may be lost if Vortix crashes.
+
+There is no automatic conversion from a profile command string: shell syntax
+cannot be translated safely into an executable/argv boundary. Split the old
+command manually and choose the lifecycle fact that matches its observational
+purpose. Firewall, route, DNS, and other privileged policy changes should use
+Vortix's managed policy instead of a hook.
+
+---
+
 ## Got stuck?
 
 Run `vortix bug-report` — v0.3.0 attaches the current session's

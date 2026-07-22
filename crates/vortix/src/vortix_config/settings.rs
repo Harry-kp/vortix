@@ -11,6 +11,8 @@ use figment::Figment;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::vortix_config::hooks_config::{validate_hooks, HookConfigError, HookSpec};
+
 /// Current schema version for `settings.toml`.
 ///
 /// Bump when a settings field renames, removes, or changes type.
@@ -33,6 +35,8 @@ pub struct Settings {
     pub engine: EngineSettings,
     pub journal: JournalSettings,
     pub ui: UiSettings,
+    /// Global, asynchronous lifecycle observers. Empty means no runner task.
+    pub hooks: Vec<HookSpec>,
 }
 
 impl Default for Settings {
@@ -42,6 +46,7 @@ impl Default for Settings {
             engine: EngineSettings::default(),
             journal: JournalSettings::default(),
             ui: UiSettings::default(),
+            hooks: Vec::new(),
         }
     }
 }
@@ -140,6 +145,8 @@ pub enum SettingsError {
         "settings schema version {found} is not supported by this build (max supported: {supported_max}). Upgrade vortix or migrate the file."
     )]
     UnsupportedSchema { found: u32, supported_max: u32 },
+    #[error("invalid lifecycle hook configuration: {0}")]
+    InvalidHook(#[from] HookConfigError),
 }
 
 /// Migrate a parsed `Settings` from an older schema version to the
@@ -261,7 +268,9 @@ impl Settings {
         // route through migrate_settings so an unsupported
         // schema_version surfaces as a typed error instead of silently
         // accepting unknown fields.
-        migrate_settings(s)
+        let s = migrate_settings(s)?;
+        validate_hooks(&s.hooks)?;
+        Ok(s)
     }
 }
 
@@ -338,6 +347,51 @@ disk = false
         assert!(!s.journal.disk);
         // Other fields keep defaults.
         assert_eq!(s.journal.retention_days, 30);
+    }
+
+    #[test]
+    fn lifecycle_hooks_load_as_absolute_argv_specs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.toml");
+        fs::write(
+            &path,
+            r#"
+[[hooks]]
+event = "connected"
+executable = "/usr/bin/notify-send"
+args = ["VPN connected"]
+timeout_secs = 7
+"#,
+        )
+        .unwrap();
+
+        let settings = Settings::load_from(None, Some(&path)).unwrap();
+        assert_eq!(settings.hooks.len(), 1);
+        assert_eq!(settings.hooks[0].timeout_secs, 7);
+        assert_eq!(
+            settings.hooks[0].event,
+            crate::vortix_core::control::HookEvent::Connected
+        );
+    }
+
+    #[test]
+    fn invalid_hook_fails_the_settings_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.toml");
+        fs::write(
+            &path,
+            r#"
+[[hooks]]
+event = "connected"
+executable = "notify-send VPN-connected"
+"#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            Settings::load_from(None, Some(&path)),
+            Err(SettingsError::InvalidHook(_))
+        ));
     }
 
     #[test]
@@ -486,6 +540,7 @@ wireguard_health_targets = ["10.0.0.1"]
             engine,
             journal: JournalSettings::default(),
             ui: UiSettings::default(),
+            hooks: Vec::new(),
         };
         let migrated = migrate_settings(s).unwrap();
         assert_eq!(migrated.schema_version, SETTINGS_SCHEMA_VERSION);
