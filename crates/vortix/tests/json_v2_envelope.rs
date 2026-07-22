@@ -44,6 +44,8 @@ fn make_connection_entry(profile: &str, protocol: &str) -> ConnectionEntry {
         profile: Some(profile.into()),
         protocol: Some(protocol.into()),
         uptime_secs: Some(120),
+        health: None,
+        generation: None,
     }
 }
 

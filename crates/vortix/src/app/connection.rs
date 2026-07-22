@@ -10,6 +10,29 @@ use crate::vortix_core::engine::Conflict;
 use crate::vortix_core::profile::ProfileId;
 
 impl App {
+    /// Record the health probe the `WireGuard` protocol path actually issued.
+    /// This is called only after handshake-gated `up` succeeds; configured
+    /// targets alone never establish an ongoing traffic expectation.
+    pub(crate) fn record_wireguard_probe_activity(
+        &mut self,
+        profile_name: &str,
+        receipts: Vec<crate::vortix_core::ports::tunnel::ProbeReceipt>,
+    ) {
+        let Some(profile) = self.runtime.profiles.iter().find(|profile| {
+            profile.name == profile_name && profile.protocol == Protocol::WireGuard
+        }) else {
+            return;
+        };
+        if receipts.is_empty() {
+            self.runtime.wireguard_probe_activity.remove(&profile.id);
+        } else {
+            self.runtime
+                .wireguard_probe_activity
+                .insert(profile.id.clone(), receipts);
+        }
+        self.runtime.scanner_observed_wireguard.remove(&profile.id);
+    }
+
     /// Smart connection toggle: Connect, Disconnect, or Switch.
     ///
     /// Uses `pending_connect` to queue a connection that fires automatically
@@ -269,6 +292,8 @@ impl App {
         self.log(&format!("ACTION: Connecting to '{name}' [{protocol}]..."));
 
         let connect_timeout_secs = self.runtime.config.connect_timeout;
+        let wireguard_handshake_timeout_secs = self.runtime.config.wireguard_handshake_timeout_secs;
+        let wireguard_health_targets = self.runtime.config.ping_targets.clone();
         let ovpn_verbosity = self.runtime.config.openvpn_verbosity.clone();
 
         // route once via TunnelKind, no protocol match arm.
@@ -286,11 +311,13 @@ impl App {
                 },
                 config_path,
             );
-            let mut tunnel = crate::tunnel::tunnel_for(
+            let mut tunnel = crate::tunnel::tunnel_for_with_wireguard_policy(
                 protocol,
                 &config_dir,
                 &ovpn_verbosity,
                 connect_timeout_secs,
+                wireguard_handshake_timeout_secs,
+                &wireguard_health_targets,
             );
 
             match tunnel.up(&profile) {
@@ -307,6 +334,9 @@ impl App {
                         error: None,
                         interface: Some(handle.interface_name),
                         pid: handle.pid,
+                        generation: handle.generation,
+                        handshake: handle.handshake,
+                        probe_receipts: handle.probe_receipts,
                         dns_request: handle.dns_request,
                     });
                 }
@@ -317,6 +347,9 @@ impl App {
                         error: Some(format!("{protocol}: {err}")),
                         interface: None,
                         pid: None,
+                        generation: 0,
+                        handshake: None,
+                        probe_receipts: Vec::new(),
                         dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
                     });
                 }
@@ -362,6 +395,7 @@ impl App {
     /// Finalize a disconnect: transition to `Disconnected`, sync kill switch,
     /// and drain `pending_connect` (auto-connect to the queued profile, if any).
     pub(crate) fn complete_disconnect(&mut self, profile_name: &str) {
+        let disconnected_profile_id = self.profile_id_for_name(profile_name);
         self.runtime.session_start = None;
         self.runtime.scanner_rx = None; // discard stale scanner data pre-disconnect
         self.flip_states.clear();
@@ -398,6 +432,13 @@ impl App {
         // staying green and header continuing to list the
         // disconnected tunnel even after logs reported success.
         self.mirror_disconnect_into_registry(profile_name);
+        if let Some(profile_id) = disconnected_profile_id {
+            let _ = crate::core::managed_wireguard::remove_after_kernel_absence(
+                &self.runtime.config_dir,
+                &profile_id,
+                profile_name,
+            );
+        }
         self.runtime.forget_dns_request(profile_name);
         self.reconcile_dns_policy();
 
@@ -497,13 +538,15 @@ impl App {
     /// existing entry's state). When the profile isn't in the catalog
     /// or the registry has no prior entry, behaves the same as a fresh
     /// insertion via `set_connected`.
-    /// Register a brand-new Connected entry from a scanner-detected
-    /// session for a tunnel started outside vortix. This is the
+    /// Register a scanner-detected session for a tunnel started outside
+    /// vortix. `OpenVPN` remains the legacy observable Connected case;
+    /// `WireGuard` is represented as unmanaged Handshaking because scanner
+    /// evidence cannot recreate a current-attempt receipt. This is the
     /// adoption-side counterpart to `mirror_connect_into_registry`
     /// (which handles vortix-started tunnels).
     ///
-    /// State-authority contract: this is the ONLY path other than
-    /// `mirror_connect_into_registry` that creates a Connected entry.
+    /// State-authority contract: only the `OpenVPN` branch creates a Connected
+    /// entry; `WireGuard` never does so from scanner input.
     /// `refresh_registry_from_session` is strictly metadata-only on
     /// existing Connected entries and will early-return when the entry
     /// doesn't exist.
@@ -512,6 +555,7 @@ impl App {
     /// `session.interface_authoritative` (set by the scanner's
     /// platform-specific iface-detection method ). Unauthoritative
     /// adoptions are excluded from primary-election candidacy.
+    #[allow(clippy::too_many_lines)] // adoption validates receipt, health, and registry atomically
     pub fn adopt_registry_from_session(
         &mut self,
         profile_name: &str,
@@ -528,6 +572,96 @@ impl App {
         };
         let profile_id = profile.id.clone();
         let allowed_ips = extract_allowed_ips(profile.protocol, &profile.config_path);
+        if matches!(profile.protocol, Protocol::WireGuard) {
+            if let Some(mut receipt) =
+                crate::core::managed_wireguard::load(&self.runtime.config_dir, &profile_id)
+                    .filter(|receipt| receipt.validates(&profile_id, session))
+            {
+                let probe_receipts = receipt.probe_receipts.clone();
+                let activity = self
+                    .runtime
+                    .wireguard_peer_activity
+                    .entry(profile_id.clone())
+                    .or_default();
+                let health = wireguard_health_from_session(
+                    &session.wireguard_peers,
+                    activity,
+                    &probe_receipts,
+                    std::time::Duration::from_secs(
+                        self.runtime.config.wireguard_handshake_stale_secs,
+                    ),
+                );
+                if probe_receipts.is_empty() {
+                    self.runtime.wireguard_probe_activity.remove(&profile_id);
+                } else {
+                    self.runtime
+                        .wireguard_probe_activity
+                        .insert(profile_id.clone(), probe_receipts.clone());
+                }
+                self.runtime.scanner_observed_wireguard.remove(&profile_id);
+                let details = crate::vortix_core::engine::state::DetailedConnectionInfo {
+                    interface: receipt.interface_name.clone(),
+                    interface_authoritative: true,
+                    internal_ip: session.internal_ip.clone(),
+                    endpoint: session.endpoint.clone(),
+                    mtu: session.mtu.clone(),
+                    public_key: session.public_key.clone(),
+                    listen_port: session.listen_port.clone(),
+                    transfer_rx: session.transfer_rx.clone(),
+                    transfer_tx: session.transfer_tx.clone(),
+                    latest_handshake: session.latest_handshake.clone(),
+                    health_hint: health.clone(),
+                    generation: receipt.generation,
+                    handshake: Some(receipt.handshake.clone()),
+                    probe_receipts,
+                    pid: session.pid,
+                    process_ownership: None,
+                    dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
+                    teardown_config: None,
+                };
+                self.registry.set_connected(
+                    profile_id.clone(),
+                    allowed_ips,
+                    details,
+                    receipt.connected_at,
+                    placeholder_engine_for_profile(&profile),
+                );
+                if let Ok(Some(old)) = crate::core::managed_wireguard::update_health(
+                    &self.runtime.config_dir,
+                    &mut receipt,
+                    health.clone(),
+                ) {
+                    if let Some(journal) = crate::vortix_core::journal::global_journal() {
+                        let _ = journal.append(
+                            crate::vortix_core::engine::EngineEvent::ConnectionHealthChanged {
+                                profile_id,
+                                old,
+                                new: health,
+                            },
+                        );
+                    }
+                }
+                return;
+            }
+            // Observation is not ownership. A scanner-only WireGuard device
+            // has no current-attempt receipt, so represent it as unmanaged
+            // Handshaking and never seed Connected from timestamps, bytes, or
+            // peer identity guessed after the fact.
+            self.runtime
+                .scanner_observed_wireguard
+                .insert(profile_id.clone());
+            self.registry.set_connecting(
+                profile_id,
+                allowed_ips,
+                session
+                    .started_at
+                    .unwrap_or_else(std::time::SystemTime::now),
+                0,
+                std::time::Duration::ZERO,
+                placeholder_engine_for_profile(&profile),
+            );
+            return;
+        }
         let core_details = crate::vortix_core::engine::state::DetailedConnectionInfo {
             interface: session.interface.clone(),
             // Scanner-only sessions are observation, not protocol ownership.
@@ -542,6 +676,10 @@ impl App {
             transfer_rx: session.transfer_rx.clone(),
             transfer_tx: session.transfer_tx.clone(),
             latest_handshake: session.latest_handshake.clone(),
+            health_hint: crate::vortix_core::engine::state::ConnectionHealth::Unknown,
+            generation: 0,
+            handshake: None,
+            probe_receipts: Vec::new(),
             pid: session.pid,
             process_ownership: None,
             dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
@@ -592,6 +730,7 @@ impl App {
         let Some(snap) = self.registry.snapshot(&profile_id) else {
             return;
         };
+        let prior_health = snap.health.clone();
         let crate::vortix_core::engine::state::Connection::Connected {
             details: existing_details,
             since,
@@ -602,6 +741,29 @@ impl App {
         };
 
         let allowed_ips = extract_allowed_ips(profile.protocol, &profile.config_path);
+        let health = if matches!(profile.protocol, Protocol::WireGuard) {
+            let stale_after =
+                std::time::Duration::from_secs(self.runtime.config.wireguard_handshake_stale_secs);
+            let probe_receipts = self
+                .runtime
+                .wireguard_probe_activity
+                .get(&profile_id)
+                .cloned()
+                .unwrap_or_else(|| existing_details.probe_receipts.clone());
+            let activity = self
+                .runtime
+                .wireguard_peer_activity
+                .entry(profile_id.clone())
+                .or_default();
+            wireguard_health_from_session(
+                &session.wireguard_peers,
+                activity,
+                &probe_receipts,
+                stale_after,
+            )
+        } else {
+            prior_health.clone()
+        };
         // Interface and authoritativity carry over from the existing
         // entry verbatim — scanner never touches them. Mutable
         // metadata fields take the scanner's fresh observation.
@@ -616,6 +778,10 @@ impl App {
             transfer_rx: session.transfer_rx.clone(),
             transfer_tx: session.transfer_tx.clone(),
             latest_handshake: session.latest_handshake.clone(),
+            health_hint: health.clone(),
+            generation: existing_details.generation,
+            handshake: existing_details.handshake,
+            probe_receipts: existing_details.probe_receipts,
             pid: session.pid,
             process_ownership: existing_details.process_ownership,
             dns_request: existing_details.dns_request,
@@ -628,6 +794,26 @@ impl App {
             since,
             placeholder_engine_for_profile(&profile),
         );
+        if matches!(profile.protocol, Protocol::WireGuard) && health != prior_health {
+            if let Some(mut receipt) =
+                crate::core::managed_wireguard::load(&self.runtime.config_dir, &profile.id)
+            {
+                let _ = crate::core::managed_wireguard::update_health(
+                    &self.runtime.config_dir,
+                    &mut receipt,
+                    health.clone(),
+                );
+            }
+            if let Some(journal) = crate::vortix_core::journal::global_journal() {
+                let _ = journal.append(
+                    crate::vortix_core::engine::EngineEvent::ConnectionHealthChanged {
+                        profile_id: profile.id.clone(),
+                        old: prior_health,
+                        new: health,
+                    },
+                );
+            }
+        }
     }
 
     /// Mirror a legacy-path disconnect into `self.registry`: seed the
@@ -636,6 +822,9 @@ impl App {
     /// the registry never had is a no-op.
     pub fn mirror_disconnect_into_registry(&mut self, profile_name: &str) {
         if let Some(profile_id) = self.profile_id_for_name(profile_name) {
+            self.runtime.scanner_observed_wireguard.remove(&profile_id);
+            self.runtime.wireguard_peer_activity.remove(&profile_id);
+            self.runtime.wireguard_probe_activity.remove(&profile_id);
             self.registry.set_disconnected(&profile_id);
         }
     }
@@ -860,6 +1049,9 @@ impl App {
                         Protocol::WireGuard => TunnelKindTag::WireGuard,
                         Protocol::OpenVPN => TunnelKindTag::OpenVpn,
                     },
+                    generation: 0,
+                    handshake: None,
+                    probe_receipts: Vec::new(),
                     process_ownership: None,
                     teardown_config: matches!(protocol, Protocol::WireGuard).then(|| {
                         crate::vortix_core::ports::tunnel::TunnelTeardownConfig {
@@ -1016,6 +1208,7 @@ impl App {
     /// (for non-primary tunnels), and [`disconnect`] (which derives
     /// the target from `legacy_state` and then delegates here).
     /// No-op when the named profile isn't in the catalog.
+    #[allow(clippy::too_many_lines)]
     fn disconnect_specific(&mut self, profile_name: &str) {
         use crate::vortix_core::engine::state::Connection;
 
@@ -1031,6 +1224,10 @@ impl App {
             return;
         };
         let profile_id = profile.id.clone();
+        // An explicit user disconnect grants lifecycle intent even when the
+        // prior status was scanner-only. Leave observation mode so teardown
+        // completion and timeout handling use the normal Disconnecting path.
+        self.runtime.scanner_observed_wireguard.remove(&profile_id);
         self.runtime.retry_state.remove(&profile_id);
         // Discard any in-flight scanner result so stale data doesn't
         // re-promote this profile back to Connected after teardown.
@@ -1097,6 +1294,9 @@ impl App {
                     Protocol::WireGuard => TunnelKindTag::WireGuard,
                     Protocol::OpenVPN => TunnelKindTag::OpenVpn,
                 },
+                generation: 0,
+                handshake: None,
+                probe_receipts: Vec::new(),
                 process_ownership: None,
                 teardown_config: matches!(protocol, Protocol::WireGuard).then(|| {
                     crate::vortix_core::ports::tunnel::TunnelTeardownConfig {
@@ -1199,6 +1399,94 @@ impl App {
     }
 }
 
+pub(crate) fn wireguard_health_from_session(
+    peers: &[crate::vortix_core::ports::tunnel::TunnelPeerStatus],
+    activity: &mut std::collections::HashMap<String, crate::vpn_runtime::WireGuardPeerActivity>,
+    probe_receipts: &[crate::vortix_core::ports::tunnel::ProbeReceipt],
+    stale_after: std::time::Duration,
+) -> crate::vortix_core::engine::state::ConnectionHealth {
+    use crate::vortix_core::engine::state::{ConnectionHealth, DegradedReason};
+    use crate::vortix_core::ports::tunnel::{
+        classify_peer_handshake_health, PeerHandshakeHealth, PeerTrafficExpectation,
+    };
+
+    let now = std::time::SystemTime::now();
+    let expectation_window = stale_after.saturating_mul(2);
+    let mut expected_peers = 0_usize;
+    for peer in peers {
+        let peer_activity = activity.entry(peer.public_key.clone()).or_insert(
+            crate::vpn_runtime::WireGuardPeerActivity {
+                bytes_rx: peer.bytes_rx,
+                bytes_tx: peer.bytes_tx,
+                observed_at: peer.evidence_observed_at,
+                last_transfer_at: None,
+            },
+        );
+        if peer.evidence_observed_at > peer_activity.observed_at {
+            if peer.bytes_rx > peer_activity.bytes_rx || peer.bytes_tx > peer_activity.bytes_tx {
+                peer_activity.last_transfer_at = Some(peer.evidence_observed_at);
+            }
+            peer_activity.bytes_rx = peer.bytes_rx;
+            peer_activity.bytes_tx = peer.bytes_tx;
+            peer_activity.observed_at = peer.evidence_observed_at;
+        }
+
+        let recent_transfer = peer_activity.last_transfer_at.is_some_and(|at| {
+            now.duration_since(at)
+                .is_ok_and(|age| age <= expectation_window)
+        });
+        // An actually-issued probe is durable connection metadata. Aging the
+        // issue timestamp out would silently turn a stale expected peer into
+        // Unknown even though the connection policy still expects that peer
+        // to remain fresh. Absence/explicit replacement removes the receipt;
+        // a fresh handshake clears the degraded result naturally.
+        let configured_probe = probe_receipts.iter().find(|record| {
+            record.peer_public_key == peer.public_key
+                && record.allowed_routes == peer.allowed_routes
+        });
+        let expectation = if peer.keepalive_expected() {
+            PeerTrafficExpectation::PersistentKeepalive
+        } else if recent_transfer {
+            PeerTrafficExpectation::RoutedTraffic
+        } else if let Some(record) = configured_probe {
+            PeerTrafficExpectation::ConfiguredProbe {
+                target: record.target,
+            }
+        } else {
+            PeerTrafficExpectation::Idle
+        };
+        if !matches!(expectation, PeerTrafficExpectation::Idle) {
+            expected_peers += 1;
+        }
+        match classify_peer_handshake_health(peer, now, &expectation, stale_after) {
+            PeerHandshakeHealth::Stale { age } => {
+                return ConnectionHealth::Degraded {
+                    reason: DegradedReason::WireGuardPeerStale {
+                        peer_public_key: peer.public_key.clone(),
+                        allowed_routes: peer.allowed_routes.clone(),
+                        seconds_since_last_handshake: age.as_secs(),
+                    },
+                };
+            }
+            PeerHandshakeHealth::NeverObserved => {
+                return ConnectionHealth::Degraded {
+                    reason: DegradedReason::WireGuardPeerNeverObserved {
+                        peer_public_key: peer.public_key.clone(),
+                        allowed_routes: peer.allowed_routes.clone(),
+                    },
+                };
+            }
+            PeerHandshakeHealth::Healthy { .. } | PeerHandshakeHealth::InformationalIdle { .. } => {
+            }
+        }
+    }
+    if expected_peers > 0 {
+        ConnectionHealth::Healthy
+    } else {
+        ConnectionHealth::Unknown
+    }
+}
+
 /// Build the `Profile` that the registry's `profile_resolver` closure
 /// returns for the mirror-into-registry path. Mirrors the inline
 /// construction inside `connect_profile_inner`'s spawned thread so the
@@ -1237,6 +1525,10 @@ fn legacy_to_core_details(
         transfer_rx: legacy.transfer_rx.clone(),
         transfer_tx: legacy.transfer_tx.clone(),
         latest_handshake: legacy.latest_handshake.clone(),
+        health_hint: crate::vortix_core::engine::state::ConnectionHealth::Unknown,
+        generation: legacy.generation,
+        handshake: legacy.handshake.clone(),
+        probe_receipts: legacy.probe_receipts.clone(),
         pid: legacy.pid,
         process_ownership: None,
         dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),

@@ -3,7 +3,7 @@
 //! Implements the capability ports defined in `vortix-core::ports::*`:
 //! - `Killswitch` via iptables (preferred) → nftables fallback.
 //! - `DnsResolver` via resolvectl → nmcli → /etc/resolv.conf.
-//! - `Interface` via `ip addr` + `wg show`.
+//! - `Interface` via direct kernel/sysfs observation.
 //! - `NetworkStats` via /proc/net/dev.
 //! - `RouteTable` via `ip route show default`.
 

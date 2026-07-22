@@ -19,7 +19,7 @@ use vortix::vortix_core::control::{
     GateEvidence, IdempotencyKey, Observation, ProfileTopology, ProtectionEvidence,
     ProtectionStatus, UserCommand,
 };
-use vortix::vortix_core::ports::tunnel::TunnelKindTag;
+use vortix::vortix_core::ports::tunnel::{HandshakeEvidence, TunnelKindTag};
 use vortix::vortix_core::profile::ProfileId;
 
 fn profile(value: &str) -> ProfileId {
@@ -48,6 +48,7 @@ fn work(
         authority_epoch: AuthorityEpoch(1),
         policy_digest: PolicyDigest(format!("digest-{generation}")),
         mutation,
+        protocol: TunnelKindTag::Mock,
         deadline: Instant::now() + Duration::from_secs(2),
     }
 }
@@ -227,6 +228,46 @@ fn stale_generation_and_same_generation_digest_never_converge() {
             matches!(plan.actions.as_slice(), [ReconcileAction::CleanupStaleManaged { stale_revision: Some(found), .. }] if found == &stale)
         );
     }
+}
+
+#[test]
+fn wireguard_interface_attestation_alone_remains_read_only() {
+    let target = revision(4, "digest-4");
+    let profile_id = profile("corp");
+    let receipt = TunnelExecutionReceipt::wireguard(
+        profile_id.clone(),
+        "wg0",
+        "wireguard-test-attestation",
+        HandshakeEvidence {
+            generation: 3,
+            peer_public_key: "peer".into(),
+            handshake_at: std::time::SystemTime::now(),
+            observed_at: std::time::SystemTime::now(),
+            allowed_routes: vec!["10.0.0.0/24".into()],
+        },
+    )
+    .unwrap();
+    let plan = plan_reconciliation(&ReconcileInput {
+        revision: target,
+        desired_connected: BTreeSet::from([profile_id.clone()]),
+        observations: BTreeMap::from([(
+            profile_id.clone(),
+            TunnelObservation {
+                evidence: ScanEvidence::ConfirmedPresent,
+                interface_name: Some("wg0".into()),
+                ownership: ObservationOwnership::ExternalUnambiguous,
+                revision: None,
+                adoption: receipt.adoption,
+                observed_at_millis: 10,
+            },
+        )]),
+        in_flight: BTreeMap::new(),
+        disconnect_tombstones: BTreeMap::new(),
+    });
+    assert!(matches!(
+        plan.actions.as_slice(),
+        [ReconcileAction::ObserveReadOnly { profile_id: found, .. }] if found == &profile_id
+    ));
 }
 
 #[test]
@@ -447,7 +488,9 @@ fn supervisor_rejects_same_generation_different_digest_verification() {
         2,
         4,
     );
-    supervisor.submit_policy(&policy(7, "expected")).unwrap();
+    let mut policy_only = policy(7, "expected");
+    policy_only.target.profiles.clear();
+    supervisor.submit_policy(&policy_only).unwrap();
     let premature = PolicyVerification {
         revision: revision(7, "expected"),
         operation_id: operation(7),
@@ -986,4 +1029,90 @@ async fn expired_client_operation_leaves_queryable_record_and_starts_recovery() 
             && operation.desired_generation == snapshot.desired.generation
             && !operation.status.is_terminal()
     }));
+}
+
+#[tokio::test]
+async fn cleaned_handshake_failure_terminalizes_original_before_policy_retry() {
+    struct MissingHandshake;
+    impl TunnelExecutor for MissingHandshake {
+        fn execute(
+            &self,
+            work: &TunnelWork,
+            _: &CancellationToken,
+        ) -> Result<TunnelExecutionReceipt, String> {
+            TunnelExecutionReceipt::attested(
+                work.profile_id.clone(),
+                "wg-cleaned",
+                TunnelKindTag::WireGuard,
+                None,
+                "wg-missing-handshake",
+            )
+        }
+
+        fn compensate_uncertain(&self, _: &TunnelWork) -> Result<(), String> {
+            // Models the protocol adapter's exact-attempt teardown plus fresh
+            // absence observation.
+            Ok(())
+        }
+    }
+
+    let target = profile("handshake-terminal");
+    let service = ControlService::start_supervised(
+        ControlServiceConfig {
+            authority_epoch: AuthorityEpoch(1),
+            known_profiles: BTreeSet::from([target.clone()]),
+            profile_topologies: BTreeMap::from([(
+                target.clone(),
+                ProfileTopology {
+                    protocol: Some(vortix::vortix_core::profile::ProtocolKind::WireGuard),
+                    ..ProfileTopology::default()
+                },
+            )]),
+            freshness_poll_interval: Duration::from_millis(5),
+            ..ControlServiceConfig::default()
+        },
+        Arc::new(TestClock::default()),
+        ExecutionSelection::CanonicalAuthority,
+        Arc::new(Supervisor::new(
+            AuthorityEpoch(1),
+            Arc::new(MissingHandshake),
+            Arc::new(OkPolicy),
+            2,
+            4,
+        )),
+    );
+    let admitted = service
+        .client()
+        .submit(CommandRequest {
+            command: UserCommand::Connect { profile_id: target },
+            idempotency_key: IdempotencyKey::new("handshake-terminal"),
+            deadline: Deadline(1_000),
+        })
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        let snapshot = service.client().snapshot();
+        if snapshot
+            .operations
+            .get(&admitted.operation_id)
+            .is_some_and(|operation| {
+                operation.status == vortix::vortix_core::control::OperationStatus::Failed
+            })
+        {
+            assert_eq!(
+                snapshot.operations[&admitted.operation_id].result,
+                Some(vortix::vortix_core::control::OperationResult::Failed(
+                    vortix::vortix_core::control::OperationFailure::HandshakeFailed
+                ))
+            );
+            assert!(snapshot.operations.values().any(|operation| {
+                operation.id != admitted.operation_id
+                    && operation.desired_generation == snapshot.desired.generation
+            }));
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::task::yield_now().await;
+    }
 }

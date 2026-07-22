@@ -12,7 +12,9 @@ use crate::vortix_core::control::worker::{
     ProfileAdmission, ProfileWorkerPool, TopologyPolicy, TopologyState, TunnelExecutor,
     TunnelMutation, TunnelWork, TunnelWorkResult, WorkFailure,
 };
-use crate::vortix_core::ports::tunnel::AdoptionEvidence;
+use crate::vortix_core::ports::tunnel::{
+    AdoptionEvidence, HandshakeEvidence, ProbeReceipt, TunnelKindTag,
+};
 use crate::vortix_core::profile::ProfileId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +35,8 @@ pub struct ProfileSupervision {
     pub operation_id: OperationId,
     pub mutation: TunnelMutation,
     pub adoption: Option<AdoptionEvidence>,
+    pub handshake: Option<HandshakeEvidence>,
+    pub probe_receipts: Vec<ProbeReceipt>,
     pub truth: SupervisedTruth,
 }
 
@@ -167,6 +171,8 @@ impl Supervisor {
             operation_id: work.operation_id.clone(),
             mutation: work.mutation,
             adoption: None,
+            handshake: None,
+            probe_receipts: Vec::new(),
             truth: if work.mutation == TunnelMutation::Disconnect {
                 SupervisedTruth::DisconnectedTombstone
             } else {
@@ -226,6 +232,8 @@ impl Supervisor {
             operation_id: work.operation_id.clone(),
             mutation: work.mutation,
             adoption: None,
+            handshake: None,
+            probe_receipts: Vec::new(),
             truth: if work.mutation == TunnelMutation::Disconnect {
                 SupervisedTruth::DisconnectedTombstone
             } else {
@@ -248,6 +256,13 @@ impl Supervisor {
         revision: ControlRevision,
         operation_id: OperationId,
     ) -> Result<(), WorkFailure> {
+        // WireGuard adoption requires an exact worker receipt containing the
+        // current revision, operation and cryptographic handshake. This
+        // legacy adoption seam carries only interface attestation, so WG is
+        // deliberately observation-only here.
+        if evidence.kind() == TunnelKindTag::WireGuard {
+            return Err(WorkFailure::EffectFailed);
+        }
         let mut state = self.state.lock().expect("supervisor mutex poisoned");
         if revision.authority_epoch != state.authority_epoch {
             return Err(WorkFailure::Stale);
@@ -272,6 +287,8 @@ impl Supervisor {
                 operation_id,
                 mutation: TunnelMutation::Connect,
                 adoption: Some(evidence),
+                handshake: None,
+                probe_receipts: Vec::new(),
                 truth: SupervisedTruth::ObservedPresent,
             },
         );
@@ -324,6 +341,8 @@ impl Supervisor {
             entry.truth = truth;
             if result.result.is_ok() {
                 entry.adoption.clone_from(&result.adoption);
+                entry.handshake.clone_from(&result.handshake);
+                entry.probe_receipts.clone_from(&result.probe_receipts);
             }
         }
         if let Some(entry) = state.tombstones.get_mut(&result.profile_id) {
@@ -383,7 +402,23 @@ impl Supervisor {
                     && latest.1 == evidence.operation_id
                     && applied == latest
             });
-        if !exact {
+        let tunnel_truth_exact = state.latest_topology.as_ref().is_some_and(|policy| {
+            policy.target.profiles.iter().all(|profile| {
+                state.profiles.get(profile).is_some_and(|entry| {
+                    entry.revision() == evidence.revision
+                        && entry.operation_id == evidence.operation_id
+                        && entry.truth == SupervisedTruth::ObservedPresent
+                        && entry.adoption.as_ref().is_some_and(|adoption| {
+                            adoption.kind() != TunnelKindTag::WireGuard
+                                || entry.handshake.as_ref().is_some_and(|handshake| {
+                                    handshake.generation == evidence.revision.generation
+                                        && !handshake.peer_public_key.is_empty()
+                                })
+                        })
+                })
+            })
+        });
+        if !exact || !tunnel_truth_exact {
             state.protected = None;
             state.policy_degraded = Some(WorkFailure::Stale);
             return Err(WorkFailure::Stale);
@@ -435,6 +470,13 @@ impl Supervisor {
                     .adoption
                     .as_ref()
                     .is_none_or(|adoption| Some(adoption.interface_name()) != interface_name)
+                || entry.adoption.as_ref().is_some_and(|adoption| {
+                    adoption.kind() == TunnelKindTag::WireGuard
+                        && entry.handshake.as_ref().is_none_or(|handshake| {
+                            handshake.generation != revision.generation
+                                || handshake.peer_public_key.is_empty()
+                        })
+                })
             {
                 return Err(WorkFailure::EffectFailed);
             }

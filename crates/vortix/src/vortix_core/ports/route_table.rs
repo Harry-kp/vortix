@@ -4,6 +4,8 @@
 //! for `list`/`add`/`remove` once split-tunnelling and route manipulation
 //! land (deliberately deferred).
 
+use std::net::IpAddr;
+
 /// Result of probing the route used for public-internet traffic.
 ///
 /// `NoDefaultRoute` is an observed kernel state. `ProbeFailed` means the
@@ -38,4 +40,10 @@ pub trait RouteTable {
     /// can identify primary tunnels and reason about VPN-over-VPN topologies
     ///.
     fn default_route_observation() -> DefaultRouteObservation;
+
+    /// Observe the exact kernel route selected for `target`.
+    ///
+    /// Protocol probes use this before emitting traffic so a configured
+    /// split-tunnel destination cannot silently escape over a physical link.
+    fn route_interface_for(target: IpAddr) -> DefaultRouteObservation;
 }

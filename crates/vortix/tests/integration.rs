@@ -96,6 +96,7 @@ fn fake_session(name: &str) -> ActiveSession {
         transfer_rx: "100 KiB".to_string(),
         transfer_tx: "50 KiB".to_string(),
         latest_handshake: "5 seconds ago".to_string(),
+        wireguard_peers: Vec::new(),
         pid: Some(12345),
         started_at: None,
     }
@@ -133,6 +134,9 @@ mod connection_state_machine {
             error: None,
             interface: None,
             pid: None,
+            generation: 0,
+            handshake: None,
+            probe_receipts: Vec::new(),
             dns_request: vortix::vortix_core::ports::dns::DnsRequest::default(),
         });
         assert!(matches!(
@@ -142,7 +146,7 @@ mod connection_state_machine {
     }
 
     #[test]
-    fn connecting_failure_retains_nonterminal_state_when_cleanup_is_unconfirmed() {
+    fn connecting_failure_becomes_terminal_when_absence_is_confirmed() {
         let mut app = test_app();
         set_connecting(&mut app, "vpn-a");
 
@@ -152,12 +156,12 @@ mod connection_state_machine {
             error: Some("refused".to_string()),
             interface: None,
             pid: None,
+            generation: 0,
+            handshake: None,
+            probe_receipts: Vec::new(),
             dns_request: vortix::vortix_core::ports::dns::DnsRequest::default(),
         });
-        assert!(matches!(
-            app.legacy_state(),
-            ConnectionState::Disconnecting { .. }
-        ));
+        assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
     }
 
     #[test]
@@ -307,6 +311,9 @@ mod connection_state_machine {
             error: None,
             interface: None,
             pid: None,
+            generation: 0,
+            handshake: None,
+            probe_receipts: Vec::new(),
             dns_request: vortix::vortix_core::ports::dns::DnsRequest::default(),
         });
         assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
@@ -331,6 +338,9 @@ mod connection_state_machine {
             error: None,
             interface: None,
             pid: None,
+            generation: 0,
+            handshake: None,
+            probe_receipts: Vec::new(),
             dns_request: vortix::vortix_core::ports::dns::DnsRequest::default(),
         });
         assert!(matches!(

@@ -61,7 +61,16 @@ pub struct AppConfig {
     pub ping_timeout: u64,
     /// `OpenVPN` connection timeout in seconds.
     pub connect_timeout: u64,
-    /// Ping targets for latency measurement (tried in order).
+    /// Legacy `config.toml` compatibility value for the `WireGuard` handshake
+    /// deadline. Effective runtime values are resolved through
+    /// `vortix_config::EngineSettings`.
+    pub wireguard_handshake_timeout_secs: u64,
+    /// Legacy compatibility value for the `WireGuard` peer freshness
+    /// threshold when traffic is expected.
+    pub wireguard_handshake_stale_secs: u64,
+    /// Ping targets for latency measurement and the legacy `WireGuard` health
+    /// target list. `[engine].wireguard_health_targets` is authoritative when
+    /// explicitly configured.
     pub ping_targets: Vec<String>,
     /// IPv6 leak detection endpoints.
     pub ipv6_check_apis: Vec<String>,
@@ -105,6 +114,8 @@ impl Default for AppConfig {
             api_timeout: constants::DEFAULT_API_TIMEOUT,
             ping_timeout: constants::DEFAULT_PING_TIMEOUT,
             connect_timeout: constants::DEFAULT_CONNECT_TIMEOUT,
+            wireguard_handshake_timeout_secs: 20,
+            wireguard_handshake_stale_secs: 180,
             ping_targets: constants::DEFAULT_PING_TARGETS
                 .iter()
                 .map(|s| (*s).to_string())
@@ -257,6 +268,64 @@ pub fn load_config(config_dir: &Path) -> Result<AppConfig, String> {
 
     toml::from_str(&content)
         .map_err(|e| format!("Invalid config at {}: {e}", config_path.display()))
+}
+
+/// Load the effective application configuration.
+///
+/// Engine settings have one authoritative resolution path:
+/// `Settings` defaults, layered files and `VORTIX_ENGINE__*` environment
+/// overrides. Existing `config.toml` values seed that defaults layer so old
+/// partial files keep working until they are migrated to `settings.toml`.
+/// The returned `AppConfig` is a compatibility carrier for the legacy App and
+/// CLI runtime; tunnel factories must consume these resolved values rather
+/// than reading `config.toml` again.
+pub fn load_effective_config(config_dir: &Path) -> Result<AppConfig, String> {
+    let config = load_config(config_dir)?;
+    let legacy_engine = crate::vortix_config::EngineSettings {
+        openvpn_verbosity: config.openvpn_verbosity.clone(),
+        connect_timeout_secs: config.connect_timeout,
+        wireguard_handshake_timeout_secs: config.wireguard_handshake_timeout_secs,
+        wireguard_handshake_stale_secs: config.wireguard_handshake_stale_secs,
+        wireguard_health_targets: config.ping_targets.clone(),
+        ..crate::vortix_config::EngineSettings::default()
+    };
+    let settings = crate::vortix_config::Settings::load_from_config_dir_with_engine_defaults(
+        config_dir,
+        legacy_engine,
+    )
+    .map_err(|error| format!("Failed to resolve engine settings: {error}"))?;
+    validate_engine_settings(&settings.engine)?;
+    Ok(with_engine_settings(config, settings.engine))
+}
+
+fn validate_engine_settings(engine: &crate::vortix_config::EngineSettings) -> Result<(), String> {
+    if !(1..=300).contains(&engine.wireguard_handshake_timeout_secs) {
+        return Err("wireguard_handshake_timeout_secs must be between 1 and 300 seconds".into());
+    }
+    if !(1..=86_400).contains(&engine.wireguard_handshake_stale_secs) {
+        return Err("wireguard_handshake_stale_secs must be between 1 and 86400 seconds".into());
+    }
+    if engine.wireguard_health_targets.len() > 64 {
+        return Err("wireguard_health_targets accepts at most 64 addresses".into());
+    }
+    for target in &engine.wireguard_health_targets {
+        target
+            .parse::<std::net::IpAddr>()
+            .map_err(|_| format!("wireguard_health_targets contains a non-IP address: {target}"))?;
+    }
+    Ok(())
+}
+
+fn with_engine_settings(
+    mut config: AppConfig,
+    engine: crate::vortix_config::EngineSettings,
+) -> AppConfig {
+    config.openvpn_verbosity = engine.openvpn_verbosity;
+    config.connect_timeout = engine.connect_timeout_secs;
+    config.wireguard_handshake_timeout_secs = engine.wireguard_handshake_timeout_secs;
+    config.wireguard_handshake_stale_secs = engine.wireguard_handshake_stale_secs;
+    config.ping_targets = engine.wireguard_health_targets;
+    config
 }
 
 // ======================== Migration ========================
@@ -528,6 +597,71 @@ mod tests {
         assert_eq!(config.ping_targets.len(), 4);
         assert_eq!(config.ipv6_check_apis.len(), 3);
         assert_eq!(config.ip_api_fallbacks.len(), 3);
+    }
+
+    #[test]
+    fn resolved_engine_values_are_the_factory_compatibility_carrier() {
+        let resolved = with_engine_settings(
+            AppConfig::default(),
+            crate::vortix_config::EngineSettings {
+                openvpn_verbosity: "6".into(),
+                connect_timeout_secs: 17,
+                wireguard_handshake_timeout_secs: 8,
+                wireguard_handshake_stale_secs: 99,
+                wireguard_health_targets: vec!["10.0.0.1".into()],
+                ..crate::vortix_config::EngineSettings::default()
+            },
+        );
+        assert_eq!(resolved.openvpn_verbosity, "6");
+        assert_eq!(resolved.connect_timeout, 17);
+        assert_eq!(resolved.wireguard_handshake_timeout_secs, 8);
+        assert_eq!(resolved.wireguard_handshake_stale_secs, 99);
+        assert_eq!(resolved.ping_targets, ["10.0.0.1"]);
+    }
+
+    #[test]
+    fn invalid_wireguard_engine_settings_fail_before_factory_construction() {
+        let invalid_timeout = crate::vortix_config::EngineSettings {
+            wireguard_handshake_timeout_secs: 0,
+            ..crate::vortix_config::EngineSettings::default()
+        };
+        assert!(validate_engine_settings(&invalid_timeout).is_err());
+
+        let invalid_stale = crate::vortix_config::EngineSettings {
+            wireguard_handshake_stale_secs: 0,
+            ..crate::vortix_config::EngineSettings::default()
+        };
+        assert!(validate_engine_settings(&invalid_stale).is_err());
+
+        let invalid_target = crate::vortix_config::EngineSettings {
+            wireguard_health_targets: vec!["not-an-ip".into()],
+            ..crate::vortix_config::EngineSettings::default()
+        };
+        assert!(validate_engine_settings(&invalid_target).is_err());
+
+        let too_many_targets = crate::vortix_config::EngineSettings {
+            wireguard_health_targets: (0..65).map(|_| "10.0.0.1".into()).collect(),
+            ..crate::vortix_config::EngineSettings::default()
+        };
+        assert!(validate_engine_settings(&too_many_targets).is_err());
+    }
+
+    #[test]
+    fn effective_config_reads_settings_from_supplied_directory() {
+        let selected = tempfile::tempdir().unwrap();
+        std::fs::write(
+            selected.path().join("config.toml"),
+            "wireguard_handshake_timeout_secs = 44\n",
+        )
+        .unwrap();
+        std::fs::write(
+            selected.path().join("settings.toml"),
+            "[engine]\nwireguard_handshake_timeout_secs = 7\n",
+        )
+        .unwrap();
+
+        let config = load_effective_config(selected.path()).unwrap();
+        assert_eq!(config.wireguard_handshake_timeout_secs, 7);
     }
 
     // ---- load_config ----

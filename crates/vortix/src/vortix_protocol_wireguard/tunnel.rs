@@ -1,11 +1,17 @@
 //! `WgTunnel` — `WireGuard` impl of the `Tunnel` port.
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read as _;
+use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::vortix_core::ports::tunnel::{
-    ParseError, ParsedProfile, ProtocolStatus, Tunnel, TunnelCapabilities, TunnelError,
-    TunnelHandle, TunnelKindTag, TunnelStatus, TunnelTeardownConfig,
+    HandshakeAttempt, ParseError, ParsedProfile, ProbeReceipt, ProtocolStatus, Tunnel,
+    TunnelCapabilities, TunnelError, TunnelExecutionContext, TunnelHandle, TunnelKindTag,
+    TunnelPeerStatus, TunnelStatus, TunnelTeardownConfig,
 };
 use crate::vortix_core::profile::Profile;
 use crate::vortix_process::{CommandSpec, PrivilegeReq};
@@ -25,13 +31,136 @@ use crate::vortix_protocol_wireguard::parser::parse_wg_conf;
 /// DNS directives are always removed from the `wg-quick` input. The parsed
 /// request is returned on [`TunnelHandle`] for the protocol-neutral policy
 /// coordinator; `wg-quick` never mutates resolver state itself.
-#[derive(Debug, Default, Clone)]
-pub struct WgTunnel;
+const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
+const DEFAULT_STATUS_POLL: Duration = Duration::from_millis(250);
+const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+const MIN_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(1);
+const MAX_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(300);
+const MIN_STATUS_POLL: Duration = Duration::from_millis(10);
+const MAX_STATUS_POLL: Duration = Duration::from_secs(5);
+const MAX_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_HEALTH_TARGETS: usize = 64;
+const MAX_WG_DUMP_BYTES: usize = 1024 * 1024;
+const MAX_WG_PEERS: usize = 256;
+const MAX_ROUTES_PER_PEER: usize = 256;
+const MAX_WG_FIELD_BYTES: usize = 4096;
+const MAX_WG_PROFILE_BYTES: usize = 1024 * 1024;
+const HANDSHAKE_FUTURE_TOLERANCE: Duration = Duration::from_secs(300);
+static NEXT_ATTEMPT_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone)]
+pub struct WgTunnel {
+    handshake_timeout: Duration,
+    status_poll: Duration,
+    probe_timeout: Duration,
+    health_targets: Vec<IpAddr>,
+    generation_override: Option<u64>,
+    execution_context: Option<TunnelExecutionContext>,
+    /// Exact attempt capability retained across unwinding until `up` returns
+    /// a trustworthy handle or proves absence.
+    inflight: Option<Box<WgInflightAttempt>>,
+}
+
+#[derive(Debug, Clone)]
+struct WgInflightAttempt {
+    profile_id: crate::vortix_core::profile::ProfileId,
+    display_name: String,
+    interface_basename: String,
+    started_at: SystemTime,
+    generation: u64,
+    temp_path: PathBuf,
+}
+
+impl Default for WgTunnel {
+    fn default() -> Self {
+        Self {
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            status_poll: DEFAULT_STATUS_POLL,
+            probe_timeout: DEFAULT_PROBE_TIMEOUT,
+            health_targets: crate::constants::DEFAULT_PING_TARGETS
+                .iter()
+                .filter_map(|target| target.parse().ok())
+                .collect(),
+            generation_override: None,
+            execution_context: None,
+            inflight: None,
+        }
+    }
+}
 
 impl WgTunnel {
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn with_handshake_policy(
+        mut self,
+        timeout: Duration,
+        health_targets: impl IntoIterator<Item = IpAddr>,
+    ) -> Self {
+        self.handshake_timeout = timeout;
+        self.health_targets = health_targets.into_iter().collect();
+        self
+    }
+
+    /// Fence the next connect to the canonical worker's desired generation.
+    #[must_use]
+    pub fn for_generation(mut self, generation: u64) -> Self {
+        self.generation_override = Some(generation);
+        self
+    }
+
+    /// Bind cancellation and the canonical operation deadline to this effect.
+    #[must_use]
+    pub fn with_execution_context(mut self, context: TunnelExecutionContext) -> Self {
+        self.execution_context = Some(context);
+        self
+    }
+
+    fn validate_settings(&self) -> Result<(), TunnelError> {
+        if self.generation_override == Some(0) {
+            return Err(TunnelError::Other(
+                "WireGuard canonical generation must be non-zero".into(),
+            ));
+        }
+        if !(MIN_HANDSHAKE_TIMEOUT..=MAX_HANDSHAKE_TIMEOUT).contains(&self.handshake_timeout) {
+            return Err(TunnelError::Other(format!(
+                "WireGuard handshake timeout must be between {} and {} seconds",
+                MIN_HANDSHAKE_TIMEOUT.as_secs(),
+                MAX_HANDSHAKE_TIMEOUT.as_secs()
+            )));
+        }
+        if !(MIN_STATUS_POLL..=MAX_STATUS_POLL).contains(&self.status_poll) {
+            return Err(TunnelError::Other(
+                "WireGuard status poll interval is outside the supported range".into(),
+            ));
+        }
+        if self.probe_timeout.is_zero() || self.probe_timeout > MAX_PROBE_TIMEOUT {
+            return Err(TunnelError::Other(
+                "WireGuard probe timeout must be non-zero and at most 10 seconds".into(),
+            ));
+        }
+        if self.health_targets.len() > MAX_HEALTH_TARGETS {
+            return Err(TunnelError::Other(format!(
+                "WireGuard health target count exceeds {MAX_HEALTH_TARGETS}"
+            )));
+        }
+        if self
+            .execution_context
+            .as_ref()
+            .is_some_and(|context| context.deadline <= Instant::now())
+        {
+            return Err(TunnelError::Timeout(Duration::ZERO));
+        }
+        Ok(())
+    }
+
+    fn cancellation_requested(&self) -> bool {
+        self.execution_context
+            .as_ref()
+            .is_some_and(|context| context.cancellation.is_cancelled())
     }
 
     /// Parse requested DNS without applying platform state.
@@ -39,18 +168,33 @@ impl WgTunnel {
         &self,
         profile: &Profile,
     ) -> Result<crate::vortix_core::ports::dns::DnsRequest, TunnelError> {
-        let body = std::fs::read_to_string(&profile.config_path).map_err(|error| {
-            TunnelError::Subprocess(format!(
-                "read WG config {}: {error}",
-                profile.config_path.display()
-            ))
-        })?;
+        let body = read_bounded_profile(&profile.config_path)?;
         parse_wg_conf(&body)
             .map(|parsed| parsed.dns_request())
             .map_err(|error| {
                 TunnelError::Subprocess(format!("parse WireGuard DNS intent: {error}"))
             })
     }
+}
+
+fn read_bounded_profile(path: &Path) -> Result<String, TunnelError> {
+    let file = std::fs::File::open(path).map_err(|error| {
+        TunnelError::Subprocess(format!("read WG config {}: {error}", path.display()))
+    })?;
+    let mut bytes = Vec::with_capacity(8192);
+    file.take((MAX_WG_PROFILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            TunnelError::Subprocess(format!("read WG config {}: {error}", path.display()))
+        })?;
+    if bytes.len() > MAX_WG_PROFILE_BYTES {
+        return Err(TunnelError::ResourceLimit {
+            resource: "WireGuard profile bytes",
+            limit: MAX_WG_PROFILE_BYTES,
+        });
+    }
+    String::from_utf8(bytes)
+        .map_err(|error| TunnelError::MalformedStatus(format!("profile UTF-8: {error}")))
 }
 
 /// Strip `DNS = …` lines from a `WireGuard` `.conf` body.
@@ -206,17 +350,512 @@ fn cleanup_managed_temp_config(temp_path: &Path) {
     }
 }
 
-/// Minimal `WireGuard` status — extended once the binary-side scanner moves
-/// into this crate (deferred).
-#[derive(Debug, Default)]
+/// Typed `wg show <iface> dump` observation.
+#[derive(Debug, Default, Clone)]
 pub struct WgStatus {
     pub interface_name: String,
+    pub interface_public_key: String,
+    pub listen_port: Option<u16>,
+    pub peers: Vec<TunnelPeerStatus>,
 }
 
 impl ProtocolStatus for WgStatus {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+}
+
+fn parse_unix_timestamp(
+    value: &str,
+    observed_at: SystemTime,
+) -> Result<Option<SystemTime>, TunnelError> {
+    let seconds = value
+        .parse::<u64>()
+        .map_err(|_| TunnelError::MalformedStatus("handshake timestamp".into()))?;
+    if seconds == 0 {
+        return Ok(None);
+    }
+    let timestamp = UNIX_EPOCH
+        .checked_add(Duration::from_secs(seconds))
+        .ok_or_else(|| TunnelError::MalformedStatus("handshake timestamp overflow".into()))?;
+    let latest_allowed = observed_at
+        .checked_add(HANDSHAKE_FUTURE_TOLERANCE)
+        .ok_or_else(|| TunnelError::MalformedStatus("observation clock overflow".into()))?;
+    if timestamp > latest_allowed {
+        return Err(TunnelError::MalformedStatus(
+            "handshake timestamp is implausibly far in the future".into(),
+        ));
+    }
+    Ok(Some(timestamp))
+}
+
+/// Parse the stable tab-separated `WireGuard` dump format.
+pub fn parse_wg_dump(
+    interface_name: &str,
+    dump: &str,
+    observed_at: SystemTime,
+    generation: u64,
+) -> Result<WgStatus, TunnelError> {
+    if dump.len() > MAX_WG_DUMP_BYTES {
+        return Err(TunnelError::ResourceLimit {
+            resource: "WireGuard status bytes",
+            limit: MAX_WG_DUMP_BYTES,
+        });
+    }
+    let mut lines = dump.lines();
+    let interface = lines
+        .next()
+        .ok_or_else(|| TunnelError::MalformedStatus("WireGuard dump was empty".into()))?;
+    let fields = interface.split('\t').collect::<Vec<_>>();
+    if fields.len() != 4 || fields.iter().any(|field| field.len() > MAX_WG_FIELD_BYTES) {
+        return Err(TunnelError::MalformedStatus(
+            "WireGuard interface dump shape".into(),
+        ));
+    }
+    let listen_port = fields[2]
+        .parse::<u16>()
+        .map_err(|_| TunnelError::MalformedStatus("WireGuard listen port".into()))?;
+    let fwmark_valid = fields[3].eq_ignore_ascii_case("off")
+        || fields[3].parse::<u32>().is_ok()
+        || fields[3]
+            .strip_prefix("0x")
+            .and_then(|value| u32::from_str_radix(value, 16).ok())
+            .is_some();
+    if !fwmark_valid {
+        return Err(TunnelError::MalformedStatus("WireGuard fwmark".into()));
+    }
+    let mut status = WgStatus {
+        interface_name: interface_name.to_string(),
+        interface_public_key: fields[1].to_string(),
+        listen_port: Some(listen_port),
+        peers: Vec::new(),
+    };
+    for line in lines {
+        if status.peers.len() >= MAX_WG_PEERS {
+            return Err(TunnelError::ResourceLimit {
+                resource: "WireGuard peers",
+                limit: MAX_WG_PEERS,
+            });
+        }
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() != 8 || fields.iter().any(|field| field.len() > MAX_WG_FIELD_BYTES) {
+            return Err(TunnelError::MalformedStatus(
+                "WireGuard peer dump shape".into(),
+            ));
+        }
+        let allowed_routes = fields[3]
+            .split(',')
+            .map(str::trim)
+            .filter(|route| !route.is_empty())
+            .map(|route| {
+                route
+                    .parse::<crate::vortix_core::cidr::Cidr>()
+                    .map(|_| route.to_string())
+                    .map_err(|_| TunnelError::MalformedStatus("WireGuard AllowedIPs".into()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if allowed_routes.len() > MAX_ROUTES_PER_PEER {
+            return Err(TunnelError::ResourceLimit {
+                resource: "WireGuard peer routes",
+                limit: MAX_ROUTES_PER_PEER,
+            });
+        }
+        let bytes_rx = fields[5]
+            .parse()
+            .map_err(|_| TunnelError::MalformedStatus("WireGuard receive counter".into()))?;
+        let bytes_tx = fields[6]
+            .parse()
+            .map_err(|_| TunnelError::MalformedStatus("WireGuard transmit counter".into()))?;
+        let keepalive = fields[7]
+            .parse::<u64>()
+            .map_err(|_| TunnelError::MalformedStatus("WireGuard keepalive interval".into()))?;
+        let endpoint = if fields[2] == "(none)" {
+            None
+        } else {
+            fields[2]
+                .parse::<SocketAddr>()
+                .map_err(|_| TunnelError::MalformedStatus("WireGuard peer endpoint".into()))?;
+            Some(fields[2].to_string())
+        };
+        status.peers.push(TunnelPeerStatus {
+            public_key: fields[0].to_string(),
+            endpoint,
+            allowed_routes,
+            latest_handshake: parse_unix_timestamp(fields[4], observed_at)?,
+            evidence_observed_at: observed_at,
+            evidence_generation: generation,
+            bytes_rx,
+            bytes_tx,
+            persistent_keepalive: (keepalive > 0).then(|| Duration::from_secs(keepalive)),
+        });
+    }
+    Ok(status)
+}
+
+fn observe_interface_with_generation(
+    interface_name: &str,
+    generation: u64,
+    timeout: Duration,
+) -> Result<WgStatus, TunnelError> {
+    if timeout.is_zero() {
+        return Err(TunnelError::Timeout(Duration::ZERO));
+    }
+    let output = crate::vortix_process::run_to_output(
+        CommandSpec::oneshot(
+            "wg",
+            vec!["show".into(), interface_name.into(), "dump".into()],
+        )
+        .timeout(timeout.min(Duration::from_secs(2)))
+        .output_limit(MAX_WG_DUMP_BYTES),
+    )
+    .map_err(|error| TunnelError::Subprocess(format!("wg show {interface_name} dump: {error}")))?;
+    if !output.status.success() {
+        return Err(TunnelError::Subprocess(format!(
+            "wg show {interface_name} dump: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let observed_at = SystemTime::now();
+    let dump = std::str::from_utf8(&output.stdout)
+        .map_err(|error| TunnelError::Other(format!("WireGuard status was not UTF-8: {error}")))?;
+    parse_wg_dump(interface_name, dump, observed_at, generation)
+}
+
+impl WgTunnel {
+    /// Protocol-owned read-only observation used by the scanner.
+    pub fn observe_interface(interface_name: &str) -> Result<WgStatus, TunnelError> {
+        observe_interface_with_generation(interface_name, 0, Duration::from_secs(2))
+    }
+
+    #[must_use]
+    pub fn interface_exists(interface_name: &str) -> bool {
+        Self::observe_interface(interface_name).is_ok()
+    }
+
+    /// Compensate an attempt interrupted by unwinding before a receipt was
+    /// returned. Absence is observed before the capability is forgotten.
+    pub fn compensate_inflight(&mut self) -> Result<(), TunnelError> {
+        let Some(attempt) = self.inflight.take() else {
+            return Err(TunnelError::OutcomeUnknown(
+                "no exact WireGuard attempt capability was retained".into(),
+            ));
+        };
+        let interface_name = resolve_kernel_iface(
+            &attempt.interface_basename,
+            crate::platform::current_platform()
+                .interface
+                .resolve_wireguard_interface(&attempt.interface_basename),
+            &attempt.profile_id,
+        );
+        if !Self::interface_exists(&interface_name) {
+            cleanup_managed_temp_config(&attempt.temp_path);
+            return Ok(());
+        }
+        let handle = TunnelHandle {
+            profile_id: attempt.profile_id,
+            display_name: attempt.display_name,
+            interface_name: interface_name.clone(),
+            pid: None,
+            started_at: attempt.started_at,
+            kind: TunnelKindTag::WireGuard,
+            generation: attempt.generation,
+            handshake: None,
+            probe_receipts: Vec::new(),
+            process_ownership: None,
+            teardown_config: Some(TunnelTeardownConfig {
+                path: attempt.temp_path,
+                managed: true,
+            }),
+            dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
+        };
+        self.down(handle)?;
+        if wait_for_interface_absence(&interface_name, Duration::from_secs(2)) {
+            Ok(())
+        } else {
+            Err(TunnelError::OutcomeUnknown(format!(
+                "WireGuard interface {interface_name} remained after panic compensation"
+            )))
+        }
+    }
+
+    fn handshake_plan(
+        &self,
+        parsed: &crate::vortix_protocol_wireguard::parser::WgParsedProfile,
+    ) -> Result<HandshakePlan, TunnelError> {
+        let expected = parsed
+            .peers
+            .iter()
+            .filter(|peer| !peer.public_key.is_empty())
+            .map(|peer| peer.public_key.clone())
+            .collect::<BTreeSet<_>>();
+        if expected.is_empty() {
+            return Err(TunnelError::HandshakeFailed(
+                "WireGuard profile has no peer public key".into(),
+            ));
+        }
+        let mut probes = Vec::new();
+        for peer in &parsed.peers {
+            if peer.public_key.is_empty() || peer.persistent_keepalive.is_some() {
+                continue;
+            }
+            let target = self
+                .health_targets
+                .iter()
+                .copied()
+                .find(|target| peer_covers_target(peer, *target))
+                .ok_or_else(|| {
+                    TunnelError::HandshakeFailed(format!(
+                        "WireGuard peer {} has no PersistentKeepalive and no configured health target covered by its AllowedIPs; add a covered ping_target",
+                        peer.public_key
+                    ))
+                })?;
+            probes.push(ProbePlan {
+                peer_public_key: peer.public_key.clone(),
+                target,
+                allowed_routes: peer
+                    .allowed_ips
+                    .iter()
+                    .map(|route| format!("{}/{}", route.addr, route.prefix_len))
+                    .collect(),
+            });
+        }
+        Ok(HandshakePlan { expected, probes })
+    }
+
+    fn await_handshake(
+        &self,
+        handle: &TunnelHandle,
+        attempt: &HandshakeAttempt,
+        probes: &[ProbePlan],
+    ) -> Result<
+        (
+            crate::vortix_core::ports::tunnel::HandshakeEvidence,
+            Vec<ProbeReceipt>,
+        ),
+        TunnelError,
+    > {
+        let local_deadline = Instant::now()
+            .checked_add(self.handshake_timeout)
+            .ok_or_else(|| TunnelError::Other("WireGuard deadline overflowed".into()))?;
+        let deadline = self
+            .execution_context
+            .as_ref()
+            .map_or(local_deadline, |context| {
+                local_deadline.min(context.deadline)
+            });
+        let mut receipts = Vec::with_capacity(probes.len());
+        for probe in probes {
+            if self.cancellation_requested() {
+                return Err(TunnelError::Cancelled);
+            }
+            Self::ensure_probe_route(probe.target, &handle.interface_name)?;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(TunnelError::Timeout(self.handshake_timeout));
+            }
+            send_handshake_probe(probe.target, self.probe_timeout.min(remaining)).map_err(
+                |error| TunnelError::Other(format!("WireGuard handshake probe failed: {error}")),
+            )?;
+            receipts.push(ProbeReceipt {
+                peer_public_key: probe.peer_public_key.clone(),
+                target: probe.target,
+                allowed_routes: probe.allowed_routes.clone(),
+                issued_at: SystemTime::now(),
+            });
+        }
+        loop {
+            if self.cancellation_requested() {
+                return Err(TunnelError::Cancelled);
+            }
+            if let Ok(status) = self.status(handle) {
+                if let Some(evidence) = attempt.evaluate(&status) {
+                    return Ok((evidence, receipts));
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(TunnelError::HandshakeFailed(format!(
+                    "no current-generation peer handshake within {} seconds",
+                    self.handshake_timeout.as_secs()
+                )));
+            }
+            std::thread::sleep(
+                self.status_poll
+                    .min(deadline.saturating_duration_since(Instant::now())),
+            );
+        }
+    }
+
+    fn ensure_probe_route(target: IpAddr, owned_interface: &str) -> Result<(), TunnelError> {
+        let observation = crate::platform::current_platform()
+            .route_table
+            .route_interface_for(target);
+        verify_probe_route(observation, target, owned_interface)
+    }
+
+    /// Fence a failed `wg-quick up` against the exact interface derived from
+    /// this attempt. A runner error or non-zero status can happen after
+    /// partial kernel creation, so the managed config remains available until
+    /// teardown and a fresh absence observation both succeed.
+    fn settle_failed_up(
+        &mut self,
+        profile: &Profile,
+        temp_path: PathBuf,
+        generation: u64,
+        started_at: SystemTime,
+        dns_request: crate::vortix_core::ports::dns::DnsRequest,
+        original: TunnelError,
+    ) -> TunnelError {
+        let basename = interface_from_path(&temp_path);
+        let interface_name = resolve_kernel_iface(
+            &basename,
+            crate::platform::current_platform()
+                .interface
+                .resolve_wireguard_interface(&basename),
+            &profile.id,
+        );
+        let initially_exists = Self::interface_exists(&interface_name);
+        let cleanup_path = temp_path.clone();
+        let handle = TunnelHandle {
+            profile_id: profile.id.clone(),
+            display_name: profile.display_name.clone(),
+            interface_name: interface_name.clone(),
+            pid: None,
+            started_at,
+            kind: TunnelKindTag::WireGuard,
+            generation,
+            handshake: None,
+            probe_receipts: Vec::new(),
+            process_ownership: None,
+            teardown_config: Some(TunnelTeardownConfig {
+                path: temp_path,
+                managed: true,
+            }),
+            dns_request,
+        };
+        settle_failed_attempt(
+            original,
+            &interface_name,
+            initially_exists,
+            || cleanup_managed_temp_config(&cleanup_path),
+            || self.down(handle),
+            || wait_for_interface_absence(&interface_name, Duration::from_secs(2)),
+        )
+    }
+}
+
+fn settle_failed_attempt(
+    original: TunnelError,
+    interface_name: &str,
+    initially_exists: bool,
+    cleanup_absent: impl FnOnce(),
+    teardown: impl FnOnce() -> Result<(), TunnelError>,
+    confirm_absence: impl FnOnce() -> bool,
+) -> TunnelError {
+    if !initially_exists {
+        cleanup_absent();
+        return original;
+    }
+    match teardown() {
+        Ok(()) if confirm_absence() => original,
+        Ok(()) => TunnelError::OutcomeUnknown(format!(
+            "{original}; attempt-owned interface {interface_name} remained after cleanup"
+        )),
+        Err(cleanup) => TunnelError::OutcomeUnknown(format!(
+            "{original}; attempt-owned interface {interface_name} cleanup failed: {cleanup}"
+        )),
+    }
+}
+
+fn verify_probe_route(
+    observation: crate::vortix_core::ports::route_table::DefaultRouteObservation,
+    target: IpAddr,
+    owned_interface: &str,
+) -> Result<(), TunnelError> {
+    use crate::vortix_core::ports::route_table::DefaultRouteObservation;
+    match observation {
+            DefaultRouteObservation::Interface(interface) if interface == owned_interface => Ok(()),
+            DefaultRouteObservation::Interface(interface) => Err(TunnelError::HandshakeFailed(
+                format!(
+                    "WireGuard probe target {target} routes through {interface}, not owned interface {owned_interface}; check Table/AllowedIPs policy"
+                ),
+            )),
+            DefaultRouteObservation::NoDefaultRoute => Err(TunnelError::HandshakeFailed(format!(
+                "WireGuard probe target {target} has no kernel route"
+            ))),
+            DefaultRouteObservation::ProbeFailed => Err(TunnelError::OutcomeUnknown(format!(
+                "kernel route for WireGuard probe target {target} could not be verified"
+            ))),
+    }
+}
+
+#[derive(Debug)]
+struct HandshakePlan {
+    expected: BTreeSet<String>,
+    probes: Vec<ProbePlan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProbePlan {
+    peer_public_key: String,
+    target: IpAddr,
+    allowed_routes: Vec<String>,
+}
+
+fn peer_covers_target(
+    peer: &crate::vortix_protocol_wireguard::parser::WgPeer,
+    target: IpAddr,
+) -> bool {
+    peer.allowed_ips.iter().any(|route| {
+        crate::vortix_core::cidr::Cidr::new(route.addr, route.prefix_len).is_some_and(|route| {
+            let target_prefix = if target.is_ipv4() { 32 } else { 128 };
+            crate::vortix_core::cidr::Cidr::new(target, target_prefix)
+                .is_some_and(|target| route.intersects(&target))
+        })
+    })
+}
+
+fn send_handshake_probe(target: IpAddr, timeout: Duration) -> std::io::Result<()> {
+    let bind_addr = match target {
+        IpAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], 0)),
+        IpAddr::V6(_) => SocketAddr::from(([0_u16; 8], 0)),
+    };
+    let socket = UdpSocket::bind(bind_addr)?;
+    socket.set_write_timeout(Some(timeout))?;
+    socket.connect(SocketAddr::new(target, 9))?;
+    // Discard service: one byte is sufficient to cause route lookup and a
+    // WireGuard handshake; no application response is read or interpreted.
+    socket.send(&[0]).map(|_| ())
+}
+
+fn wait_for_interface_absence(interface_name: &str, timeout: Duration) -> bool {
+    let Some(deadline) = Instant::now().checked_add(timeout) else {
+        return false;
+    };
+    loop {
+        if !WgTunnel::interface_exists(interface_name) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Select the first configured target covered by a peer route. Selection is
+/// deterministic and side-effect-free so split-tunnel preflight runs before
+/// `wg-quick up`.
+#[must_use]
+pub fn select_health_probe(
+    parsed: &crate::vortix_protocol_wireguard::parser::WgParsedProfile,
+    health_targets: &[IpAddr],
+) -> Option<IpAddr> {
+    parsed.peers.iter().find_map(|peer| {
+        health_targets
+            .iter()
+            .copied()
+            .find(|target| peer_covers_target(peer, *target))
+    })
 }
 
 /// Decide the kernel-visible interface name for a `WireGuard` tunnel
@@ -314,12 +953,7 @@ fn prepare_down_target_with(
         });
     }
 
-    let body = std::fs::read_to_string(&config.path).map_err(|error| {
-        TunnelError::Subprocess(format!(
-            "read WG teardown config {}: {error}",
-            config.path.display()
-        ))
-    })?;
+    let body = read_bounded_profile(&config.path)?;
     let stripped = strip_dns_directive(&body);
     if stripped == body {
         return Ok(PreparedDownTarget {
@@ -346,25 +980,72 @@ fn wg_quick_down_spec(target: String) -> CommandSpec {
 }
 
 impl Tunnel for WgTunnel {
+    #[allow(clippy::too_many_lines)]
     fn up(&mut self, profile: &Profile) -> Result<TunnelHandle, TunnelError> {
-        let user_body = std::fs::read_to_string(&profile.config_path).map_err(|e| {
-            TunnelError::Subprocess(format!(
-                "read WG config {}: {e}",
-                profile.config_path.display()
-            ))
+        self.validate_settings()?;
+        if self.cancellation_requested() {
+            return Err(TunnelError::Cancelled);
+        }
+        let user_body = read_bounded_profile(&profile.config_path)?;
+        let parsed = parse_wg_conf(&user_body).map_err(|error| {
+            TunnelError::Subprocess(format!("parse WireGuard DNS intent: {error}"))
         })?;
-        let dns_request = parse_wg_conf(&user_body)
-            .map(|parsed| parsed.dns_request())
-            .map_err(|error| {
-                TunnelError::Subprocess(format!("parse WireGuard DNS intent: {error}"))
-            })?;
+        let dns_request = parsed.dns_request();
+        let plan = self.handshake_plan(&parsed)?;
+        let generation = self
+            .generation_override
+            .take()
+            .unwrap_or_else(|| NEXT_ATTEMPT_GENERATION.fetch_add(1, Ordering::Relaxed));
+        let source_basename = interface_from_path(&profile.config_path);
+        let baseline_timeout = self
+            .execution_context
+            .as_ref()
+            .map_or(Duration::from_secs(2), |context| {
+                context.deadline.saturating_duration_since(Instant::now())
+            });
+        let baseline_status =
+            observe_interface_with_generation(&source_basename, generation, baseline_timeout).ok();
+        let baseline = plan
+            .expected
+            .iter()
+            .map(|peer| {
+                let timestamp = baseline_status.as_ref().and_then(|status| {
+                    status
+                        .peers
+                        .iter()
+                        .find(|observed| &observed.public_key == peer)
+                        .and_then(|observed| observed.latest_handshake)
+                });
+                (peer.clone(), timestamp)
+            })
+            .collect::<BTreeMap<_, _>>();
+        let attempt_started = SystemTime::now();
         let stripped = strip_dns_directive(&user_body);
+        if self.cancellation_requested() {
+            return Err(TunnelError::Cancelled);
+        }
+        if self
+            .execution_context
+            .as_ref()
+            .is_some_and(|context| context.deadline <= Instant::now())
+        {
+            return Err(TunnelError::Timeout(self.handshake_timeout));
+        }
         // Keep one private lifecycle copy even when the source has no DNS.
         // `wg-quick down` needs the same routes/hooks as `up`, and arbitrary
         // imported profiles are not discoverable through `/etc/wireguard` by
         // interface name alone.
         let temp_path = write_managed_temp_config(&profile.config_path, stripped.as_bytes())?;
         let effective_path = temp_path.clone();
+
+        self.inflight = Some(Box::new(WgInflightAttempt {
+            profile_id: profile.id.clone(),
+            display_name: profile.display_name.clone(),
+            interface_basename: interface_from_path(&effective_path),
+            started_at: attempt_started,
+            generation,
+            temp_path: temp_path.clone(),
+        }));
 
         let path_str = effective_path.to_string_lossy().into_owned();
         info!(
@@ -374,22 +1055,52 @@ impl Tunnel for WgTunnel {
             "wg.up"
         );
 
+        let command_timeout = self
+            .execution_context
+            .as_ref()
+            .map_or(self.handshake_timeout, |context| {
+                context.deadline.saturating_duration_since(Instant::now())
+            });
+        if command_timeout.is_zero() || self.cancellation_requested() {
+            self.inflight = None;
+            cleanup_managed_temp_config(&temp_path);
+            return Err(if self.cancellation_requested() {
+                TunnelError::Cancelled
+            } else {
+                TunnelError::Timeout(Duration::ZERO)
+            });
+        }
         let output = crate::vortix_process::run_to_output(
             CommandSpec::oneshot("wg-quick", vec!["up".into(), path_str.clone()])
-                .privilege(PrivilegeReq::Root),
-        )
-        .map_err(|e| {
-            // Subprocess invocation itself failed (not just non-zero exit).
-            // Clean up the temp file we wrote — the tunnel never came up so
-            // nobody else holds a reference to it.
-            cleanup_managed_temp_config(&temp_path);
-            TunnelError::Subprocess(format!("wg-quick up: {e}"))
-        })?;
+                .privilege(PrivilegeReq::Root)
+                .timeout(command_timeout),
+        );
+        let output = match output {
+            Ok(output) => output,
+            Err(error) => {
+                self.inflight = None;
+                return Err(self.settle_failed_up(
+                    profile,
+                    temp_path,
+                    generation,
+                    attempt_started,
+                    dns_request,
+                    TunnelError::Subprocess(format!("wg-quick up: {error}")),
+                ));
+            }
+        };
 
         if !output.status.success() {
-            cleanup_managed_temp_config(&temp_path);
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            return Err(TunnelError::HandshakeFailed(format!("WireGuard: {stderr}")));
+            self.inflight = None;
+            return Err(self.settle_failed_up(
+                profile,
+                temp_path,
+                generation,
+                attempt_started,
+                dns_request,
+                TunnelError::Subprocess(format!("wg-quick up: {stderr}")),
+            ));
         }
 
         let basename = interface_from_path(&effective_path);
@@ -401,20 +1112,75 @@ impl Tunnel for WgTunnel {
             &profile.id,
         );
 
-        Ok(TunnelHandle {
+        let mut handle = TunnelHandle {
             profile_id: profile.id.clone(),
             display_name: profile.display_name.clone(),
             interface_name,
             pid: None,
-            started_at: SystemTime::now(),
+            started_at: attempt_started,
             kind: TunnelKindTag::WireGuard,
+            generation,
+            handshake: None,
+            probe_receipts: Vec::new(),
             process_ownership: None,
             teardown_config: Some(TunnelTeardownConfig {
                 path: temp_path,
                 managed: true,
             }),
             dns_request,
-        })
+        };
+        let attempt = HandshakeAttempt {
+            generation,
+            started_at: attempt_started,
+            expected_peers: plan.expected,
+            baseline,
+        };
+        let awaited = panic::catch_unwind(AssertUnwindSafe(|| {
+            self.await_handshake(&handle, &attempt, &plan.probes)
+        }));
+        match awaited {
+            Ok(Ok((evidence, receipts))) => {
+                handle.handshake = Some(evidence);
+                handle.probe_receipts = receipts;
+                self.inflight = None;
+            }
+            Ok(Err(error)) => {
+                self.inflight = None;
+                let cleanup = self.down(handle.clone());
+                return Err(match cleanup {
+                    Ok(())
+                        if wait_for_interface_absence(
+                            &handle.interface_name,
+                            Duration::from_secs(2),
+                        ) =>
+                    {
+                        error
+                    }
+                    Ok(()) => TunnelError::OutcomeUnknown(format!(
+                        "{error}; attempt-owned interface still exists after teardown"
+                    )),
+                    Err(cleanup) => TunnelError::OutcomeUnknown(format!(
+                        "{error}; attempt-owned interface cleanup failed: {cleanup}"
+                    )),
+                });
+            }
+            Err(_) => {
+                self.inflight = None;
+                let cleanup = self.down(handle.clone());
+                return Err(match cleanup {
+                    Ok(()) if wait_for_interface_absence(&handle.interface_name, Duration::from_secs(2)) => {
+                        TunnelError::Other("WireGuard handshake worker panicked; attempt was cleaned up".into())
+                    }
+                    Ok(()) => TunnelError::OutcomeUnknown(
+                        "WireGuard handshake worker panicked and interface absence was not verified".into(),
+                    ),
+                    Err(error) => TunnelError::OutcomeUnknown(format!(
+                        "WireGuard handshake worker panicked and cleanup failed: {error}"
+                    )),
+                });
+            }
+        }
+        Ok(handle)
     }
 
     fn down(&mut self, handle: TunnelHandle) -> Result<(), TunnelError> {
@@ -424,6 +1190,20 @@ impl Tunnel for WgTunnel {
             interface = %handle.interface_name,
             "wg.down"
         );
+
+        // Teardown is idempotent only after platform-observed absence. This
+        // lets the caller safely reconcile a handshake-timeout cleanup without
+        // replaying `wg-quick down` against an already-removed interface.
+        if !looks_like_config_path(&handle.interface_name)
+            && !Self::interface_exists(&handle.interface_name)
+        {
+            if let Some(config) = &handle.teardown_config {
+                if config.managed {
+                    cleanup_managed_temp_config(&config.path);
+                }
+            }
+            return Ok(());
+        }
 
         let prepared = prepare_down_target(&handle)?;
         let output = crate::vortix_process::run_to_output(wg_quick_down_spec(prepared.target));
@@ -439,25 +1219,51 @@ impl Tunnel for WgTunnel {
             return Err(TunnelError::Subprocess(format!("WireGuard down: {stderr}")));
         }
 
-        if let Some(path) = &prepared.cleanup_after_success {
-            cleanup_managed_temp_config(path);
+        if wait_for_interface_absence(&handle.interface_name, Duration::from_secs(2)) {
+            if let Some(path) = &prepared.cleanup_after_success {
+                cleanup_managed_temp_config(path);
+            }
+            Ok(())
+        } else {
+            Err(TunnelError::OutcomeUnknown(format!(
+                "WireGuard interface {} remained after teardown",
+                handle.interface_name
+            )))
         }
-
-        Ok(())
     }
 
     fn status(&self, handle: &TunnelHandle) -> Result<TunnelStatus, TunnelError> {
-        // Minimal status today — the engine still uses the binary-side
-        // scanner for richer wg-show parsing until a later migration relocates it.
+        if self.cancellation_requested() {
+            return Err(TunnelError::Cancelled);
+        }
+        let timeout = self
+            .execution_context
+            .as_ref()
+            .map_or(Duration::from_secs(2), |context| {
+                context.deadline.saturating_duration_since(Instant::now())
+            });
+        let detail =
+            observe_interface_with_generation(&handle.interface_name, handle.generation, timeout)?;
+        let observed_at = detail
+            .peers
+            .first()
+            .map_or_else(SystemTime::now, |peer| peer.evidence_observed_at);
+        let bytes_rx = detail.peers.iter().map(|peer| peer.bytes_rx).sum();
+        let bytes_tx = detail.peers.iter().map(|peer| peer.bytes_tx).sum();
+        let last_handshake = detail
+            .peers
+            .iter()
+            .filter_map(|peer| peer.latest_handshake)
+            .max();
+        let peers = detail.peers.clone();
         Ok(TunnelStatus {
             handle: handle.clone(),
-            bytes_rx: 0,
-            bytes_tx: 0,
-            last_handshake: None,
-            observed_at: SystemTime::now(),
-            detail: Box::new(WgStatus {
-                interface_name: handle.interface_name.clone(),
-            }),
+            bytes_rx,
+            bytes_tx,
+            last_handshake,
+            observed_at,
+            peers,
+            detail: Box::new(detail),
         })
     }
 
@@ -594,6 +1400,9 @@ mod tests {
             pid: None,
             started_at: SystemTime::now(),
             kind: TunnelKindTag::WireGuard,
+            generation: 0,
+            handshake: None,
+            probe_receipts: Vec::new(),
             process_ownership: None,
             teardown_config,
             dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
@@ -661,6 +1470,44 @@ mod tests {
             managed.exists(),
             "managed config must survive until down succeeds"
         );
+    }
+
+    #[test]
+    fn partial_creation_timeout_retains_config_when_absence_is_unproved() {
+        let scratch = tempfile::tempdir().unwrap();
+        let managed = scratch.path().join("corp.conf");
+        std::fs::write(&managed, "managed-attempt").unwrap();
+        let error = settle_failed_attempt(
+            TunnelError::Timeout(Duration::from_secs(1)),
+            "wg0",
+            true,
+            || panic!("present attempt must be torn down"),
+            || Err(TunnelError::Subprocess("down timed out".into())),
+            || false,
+        );
+        assert!(matches!(error, TunnelError::OutcomeUnknown(_)));
+        assert!(managed.exists(), "ambiguous attempt must retain its config");
+    }
+
+    #[test]
+    fn nonzero_up_cleans_config_only_after_exact_absence() {
+        let scratch = tempfile::tempdir().unwrap();
+        let managed = scratch.path().join("corp.conf");
+        std::fs::write(&managed, "managed-attempt").unwrap();
+        let cleanup_path = managed.clone();
+        let error = settle_failed_attempt(
+            TunnelError::Subprocess("wg-quick up exited 1".into()),
+            "wg0",
+            true,
+            || panic!("present attempt must be torn down"),
+            || {
+                std::fs::remove_file(cleanup_path).unwrap();
+                Ok(())
+            },
+            || true,
+        );
+        assert!(matches!(error, TunnelError::Subprocess(_)));
+        assert!(!managed.exists());
     }
 
     #[test]
@@ -879,5 +1726,128 @@ mod tests {
         // No tmp/ created. Sweep must not panic and must not create anything.
         sweep_orphan_temp_configs(tmp.path(), "sid");
         assert!(!tmp.path().join("tmp").exists());
+    }
+
+    #[test]
+    fn persistent_keepalive_peer_needs_no_probe_target() {
+        let parsed = parse_wg_conf(
+            "[Peer]\nPublicKey = peer\nAllowedIPs = 10.0.0.0/24\nPersistentKeepalive = 25\n",
+        )
+        .unwrap();
+        let tunnel = WgTunnel::new().with_handshake_policy(Duration::from_secs(20), []);
+        let plan = tunnel.handshake_plan(&parsed).unwrap();
+        assert_eq!(plan.expected, BTreeSet::from(["peer".to_string()]));
+        assert!(plan.probes.is_empty());
+    }
+
+    #[test]
+    fn every_non_keepalive_peer_requires_its_own_covered_target() {
+        let parsed = parse_wg_conf(
+            "[Peer]\nPublicKey = keepalive\nAllowedIPs = 10.0.0.0/24\nPersistentKeepalive = 25\n\
+             [Peer]\nPublicKey = active\nAllowedIPs = 192.168.0.0/16\n",
+        )
+        .unwrap();
+        let covered = IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 0, 7));
+        let plan = WgTunnel::new()
+            .with_handshake_policy(Duration::from_secs(20), [covered])
+            .handshake_plan(&parsed)
+            .unwrap();
+        assert_eq!(plan.probes.len(), 1);
+        assert_eq!(plan.probes[0].peer_public_key, "active");
+        assert_eq!(plan.probes[0].target, covered);
+        assert_eq!(plan.probes[0].allowed_routes, vec!["192.168.0.0/16"]);
+
+        let error = WgTunnel::new()
+            .with_handshake_policy(
+                Duration::from_secs(20),
+                [IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1))],
+            )
+            .handshake_plan(&parsed)
+            .unwrap_err();
+        assert!(error.to_string().contains("active"));
+    }
+
+    #[test]
+    fn probe_route_must_resolve_to_exact_owned_interface() {
+        use crate::vortix_core::ports::route_table::DefaultRouteObservation;
+        let target = IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 7));
+        assert!(verify_probe_route(
+            DefaultRouteObservation::Interface("wg0".into()),
+            target,
+            "wg0"
+        )
+        .is_ok());
+        assert!(verify_probe_route(
+            DefaultRouteObservation::Interface("en0".into()),
+            target,
+            "wg0"
+        )
+        .is_err());
+        assert!(
+            verify_probe_route(DefaultRouteObservation::ProbeFailed, target, "wg0")
+                .unwrap_err()
+                .to_string()
+                .contains("ambiguous")
+        );
+    }
+
+    #[test]
+    fn dump_parser_rejects_extra_fields_oversize_and_future_timestamps() {
+        let observed = UNIX_EPOCH + Duration::from_secs(1_000);
+        let extra = "private\tpublic\t51820\toff\textra\n";
+        assert!(parse_wg_dump("wg0", extra, observed, 1).is_err());
+
+        let future =
+            "private\tpublic\t51820\toff\npeer\t(none)\t(none)\t10.0.0.0/24\t2000\t0\t0\t0\n";
+        assert!(parse_wg_dump("wg0", future, observed, 1).is_err());
+
+        let oversized = "x".repeat(MAX_WG_DUMP_BYTES + 1);
+        assert!(parse_wg_dump("wg0", &oversized, observed, 1).is_err());
+    }
+
+    #[test]
+    fn dump_parser_bounds_peer_and_route_cardinality() {
+        let observed = UNIX_EPOCH + Duration::from_secs(1_000);
+        let routes = std::iter::repeat_n("10.0.0.0/24", MAX_ROUTES_PER_PEER + 1)
+            .collect::<Vec<_>>()
+            .join(",");
+        let dump =
+            format!("private\tpublic\t51820\toff\npeer\t(none)\t(none)\t{routes}\t900\t0\t0\t0\n");
+        assert!(parse_wg_dump("wg0", &dump, observed, 1).is_err());
+
+        let peer = "peer\t(none)\t(none)\t10.0.0.0/24\t900\t0\t0\t0\n";
+        let dump = format!(
+            "private\tpublic\t51820\toff\n{}",
+            peer.repeat(MAX_WG_PEERS + 1)
+        );
+        assert!(parse_wg_dump("wg0", &dump, observed, 1).is_err());
+    }
+
+    #[test]
+    fn invalid_or_cancelled_policy_fails_before_profile_io() {
+        let profile = Profile::new(
+            crate::vortix_core::profile::ProfileId::new("missing"),
+            "missing",
+            crate::vortix_core::profile::ProtocolKind::WireGuard,
+            PathBuf::from("/definitely/missing.conf"),
+        );
+        let mut invalid = WgTunnel::new().with_handshake_policy(Duration::ZERO, []);
+        assert!(matches!(invalid.up(&profile), Err(TunnelError::Other(_))));
+        let mut zero_generation = WgTunnel::new().for_generation(0);
+        assert!(matches!(
+            zero_generation.up(&profile),
+            Err(TunnelError::Other(_))
+        ));
+
+        let cancellation = crate::vortix_core::ports::tunnel::TunnelCancellation::default();
+        cancellation.cancel();
+        let mut cancelled = WgTunnel::new().with_execution_context(TunnelExecutionContext {
+            cancellation,
+            deadline: Instant::now() + Duration::from_secs(1),
+        });
+        assert!(matches!(
+            cancelled.up(&profile),
+            Err(TunnelError::Cancelled)
+        ));
     }
 }

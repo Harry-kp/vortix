@@ -9,6 +9,7 @@ use vortix::vortix_core::control::{
     Observation, ObservationError, OperationCompletion, OperationFailure, OperationStatus,
     ProtectionEvidence, ProtectionStatus, ReadinessError, Secret, UserCommand,
 };
+use vortix::vortix_core::engine::state::{ConnectionHealth, DegradedReason};
 use vortix::vortix_core::profile::ProfileId;
 
 #[derive(Default)]
@@ -200,6 +201,69 @@ async fn observations_use_owner_receipt_time_and_reject_future_or_older_evidence
             })
             .await,
         Err(ObservationError::Stale)
+    );
+}
+
+#[tokio::test]
+async fn connection_health_is_generation_fenced_and_published_to_snapshot_subscribers() {
+    let clock = Arc::new(FakeClock::default());
+    clock.set(10);
+    let service = ControlService::start_with_clock(config(), clock);
+    let client = service.client();
+    let observer = service.observer();
+    client
+        .submit(request("health", profile('a'), 100))
+        .expect("admitted");
+    wait_for_generation(&client, 1).await;
+
+    assert_eq!(
+        observer
+            .observe(Observation::ConnectionHealth {
+                profile_id: profile('a'),
+                desired_generation: 0,
+                health: ConnectionHealth::Healthy,
+                observed_at_millis: 9,
+            })
+            .await,
+        Err(ObservationError::MismatchedProtection)
+    );
+
+    let mut subscription = client.subscribe();
+    let stale = ConnectionHealth::Degraded {
+        reason: DegradedReason::WireGuardPeerStale {
+            peer_public_key: "peer-a".into(),
+            allowed_routes: vec!["0.0.0.0/0".into()],
+            seconds_since_last_handshake: 181,
+        },
+    };
+    observer
+        .observe(Observation::ConnectionHealth {
+            profile_id: profile('a'),
+            desired_generation: 1,
+            health: stale.clone(),
+            observed_at_millis: 9,
+        })
+        .await
+        .expect("stale health accepted");
+    let snapshot = subscription.changed().await.expect("stale publication");
+    assert_eq!(
+        snapshot.observed.connection_health[&profile('a')].health,
+        stale
+    );
+
+    observer
+        .observe(Observation::ConnectionHealth {
+            profile_id: profile('a'),
+            desired_generation: 1,
+            health: ConnectionHealth::Healthy,
+            observed_at_millis: 10,
+        })
+        .await
+        .expect("recovery accepted");
+    let snapshot = subscription.changed().await.expect("recovery publication");
+    assert_eq!(
+        snapshot.observed.connection_health[&profile('a')].health,
+        ConnectionHealth::Healthy
     );
 }
 

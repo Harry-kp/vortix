@@ -190,6 +190,10 @@ pub fn run_to_output(spec: CommandSpec) -> std::io::Result<std::process::Output>
             std::io::ErrorKind::TimedOut,
             format!("`{program}` timed out after {duration:?}"),
         )),
+        Err(ProcessError::OutputLimitExceeded { program, limit }) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("`{program}` output exceeded {limit} bytes"),
+        )),
         Err(ProcessError::ProgramNotFound { program }) => Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             format!("`{program}` not found on PATH"),

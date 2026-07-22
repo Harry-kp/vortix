@@ -45,6 +45,18 @@ pub enum FailureReason {
 pub enum DegradedReason {
     /// `wg show` reports `latest_handshake` exceeding the staleness threshold.
     HandshakeStale { seconds_since_last_handshake: u64 },
+    /// One `WireGuard` peer with expected traffic has stale evidence; unrelated
+    /// peers/routes do not borrow another peer's health.
+    WireGuardPeerStale {
+        peer_public_key: String,
+        allowed_routes: Vec<String>,
+        seconds_since_last_handshake: u64,
+    },
+    /// A peer with expected traffic has never produced cryptographic evidence.
+    WireGuardPeerNeverObserved {
+        peer_public_key: String,
+        allowed_routes: Vec<String>,
+    },
     /// Telemetry reports high packet loss to all configured probe targets.
     HighPacketLoss { loss_percent: f32 },
     /// Telemetry reports ICMP latency above the configured threshold.
@@ -70,7 +82,7 @@ pub enum ConnectionHealth {
 /// Technical details parsed from the VPN interface (relocated from the
 /// binary-side `crates/vortix/src/state/connection.rs`; a later cleanup prunes
 /// the duplicate).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DetailedConnectionInfo {
     pub interface: String,
     pub internal_ip: String,
@@ -82,7 +94,20 @@ pub struct DetailedConnectionInfo {
     pub transfer_rx: String,
     pub transfer_tx: String,
     pub latest_handshake: String,
+    /// Scanner-derived health carried atomically with refreshed metadata.
+    /// Internal-only; the enclosing `Connection` owns the public projection.
+    #[serde(skip)]
+    pub health_hint: ConnectionHealth,
     pub pid: Option<u32>,
+    /// Exact attempt generation that produced this connected state.
+    #[serde(skip)]
+    pub generation: u64,
+    /// Protocol-authoritative handshake evidence for this attempt.
+    #[serde(skip)]
+    pub handshake: Option<crate::vortix_core::ports::tunnel::HandshakeEvidence>,
+    /// Per-peer probes actually issued and route-verified for this attempt.
+    #[serde(skip)]
+    pub probe_receipts: Vec<crate::vortix_core::ports::tunnel::ProbeReceipt>,
     /// Exact userspace-child ownership capability. Internal-only and never
     /// exposed through snapshots or JSON.
     #[serde(skip)]
@@ -131,7 +156,11 @@ impl Default for DetailedConnectionInfo {
             transfer_rx: String::new(),
             transfer_tx: String::new(),
             latest_handshake: String::new(),
+            health_hint: ConnectionHealth::default(),
             pid: None,
+            generation: 0,
+            handshake: None,
+            probe_receipts: Vec::new(),
             process_ownership: None,
             dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
             teardown_config: None,

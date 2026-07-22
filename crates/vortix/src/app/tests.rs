@@ -136,9 +136,187 @@ fn fake_session(name: &str) -> ActiveSession {
         transfer_rx: "100 KiB".to_string(),
         transfer_tx: "50 KiB".to_string(),
         latest_handshake: "5 seconds ago".to_string(),
+        wireguard_peers: Vec::new(),
         pid: Some(12345),
         started_at: None,
     }
+}
+
+fn wg_peer(
+    key: &str,
+    observed_at: std::time::SystemTime,
+    handshake: Option<std::time::SystemTime>,
+    bytes: u64,
+    keepalive: bool,
+) -> crate::vortix_core::ports::tunnel::TunnelPeerStatus {
+    crate::vortix_core::ports::tunnel::TunnelPeerStatus {
+        public_key: key.into(),
+        endpoint: None,
+        allowed_routes: vec!["10.0.0.0/24".into()],
+        latest_handshake: handshake,
+        evidence_observed_at: observed_at,
+        evidence_generation: 0,
+        persistent_keepalive: keepalive.then(|| std::time::Duration::from_secs(25)),
+        bytes_rx: bytes,
+        bytes_tx: 0,
+    }
+}
+
+#[test]
+fn scanner_only_wireguard_is_unmanaged_handshaking_even_with_history() {
+    use crate::vortix_core::engine::state::Connection;
+    use crate::vortix_core::profile::ProfileId;
+
+    let mut app = test_app();
+    add_profiles(&mut app, &["vpn-a"]);
+    let mut session = fake_session("vpn-a");
+    session.wireguard_peers = vec![wg_peer(
+        "peer-a",
+        std::time::SystemTime::now(),
+        Some(std::time::SystemTime::now()),
+        10_000,
+        true,
+    )];
+    app.handle_message(Message::SyncSystemState {
+        sessions: vec![session],
+        default_route: crate::vortix_core::ports::route_table::DefaultRouteObservation::Interface(
+            "wg0".into(),
+        ),
+    });
+    let id = ProfileId::new("vpn-a");
+    let snap = app.registry.snapshot(&id).unwrap();
+    assert!(matches!(
+        snap.state,
+        Connection::Connecting { attempt: 0, .. }
+    ));
+    assert!(app.runtime.scanner_observed_wireguard.contains(&id));
+    assert!(app.registry.primary().is_none());
+}
+
+#[test]
+fn cumulative_bytes_without_a_recent_delta_leave_peer_informational() {
+    let now = std::time::SystemTime::now();
+    let old = now
+        .checked_sub(std::time::Duration::from_secs(600))
+        .unwrap();
+    let mut activity = std::collections::HashMap::new();
+    let health = super::connection::wireguard_health_from_session(
+        &[wg_peer("peer-a", now, Some(old), 50_000, false)],
+        &mut activity,
+        &[],
+        std::time::Duration::from_secs(180),
+    );
+    assert_eq!(
+        health,
+        crate::vortix_core::engine::state::ConnectionHealth::Unknown
+    );
+}
+
+#[test]
+fn recent_per_peer_delta_establishes_expectation_and_stale_health() {
+    use crate::vortix_core::engine::state::{ConnectionHealth, DegradedReason};
+    let now = std::time::SystemTime::now();
+    let prior = now.checked_sub(std::time::Duration::from_secs(1)).unwrap();
+    let old_handshake = now
+        .checked_sub(std::time::Duration::from_secs(600))
+        .unwrap();
+    let mut activity = std::collections::HashMap::new();
+    let _ = super::connection::wireguard_health_from_session(
+        &[wg_peer("peer-a", prior, Some(old_handshake), 100, false)],
+        &mut activity,
+        &[],
+        std::time::Duration::from_secs(180),
+    );
+    let health = super::connection::wireguard_health_from_session(
+        &[wg_peer("peer-a", now, Some(old_handshake), 101, false)],
+        &mut activity,
+        &[],
+        std::time::Duration::from_secs(180),
+    );
+    assert!(matches!(
+        health,
+        ConnectionHealth::Degraded {
+            reason: DegradedReason::WireGuardPeerStale { peer_public_key, .. }
+        } if peer_public_key == "peer-a"
+    ));
+}
+
+#[test]
+fn expected_never_observed_peer_prevents_aggregate_healthy() {
+    use crate::vortix_core::engine::state::{ConnectionHealth, DegradedReason};
+    let now = std::time::SystemTime::now();
+    let mut activity = std::collections::HashMap::new();
+    let health = super::connection::wireguard_health_from_session(
+        &[
+            wg_peer("healthy", now, Some(now), 0, true),
+            wg_peer("missing", now, None, 0, true),
+        ],
+        &mut activity,
+        &[],
+        std::time::Duration::from_secs(180),
+    );
+    assert!(matches!(
+        health,
+        ConnectionHealth::Degraded {
+            reason: DegradedReason::WireGuardPeerNeverObserved { peer_public_key, .. }
+        } if peer_public_key == "missing"
+    ));
+}
+
+#[test]
+fn recorded_probe_not_config_presence_establishes_route_expectation() {
+    use crate::vortix_core::engine::state::ConnectionHealth;
+    let now = std::time::SystemTime::now();
+    let old = now
+        .checked_sub(std::time::Duration::from_secs(600))
+        .unwrap();
+    let peer = wg_peer("peer-a", now, Some(old), 0, false);
+    let mut activity = std::collections::HashMap::new();
+    let no_probe = super::connection::wireguard_health_from_session(
+        std::slice::from_ref(&peer),
+        &mut activity,
+        &[],
+        std::time::Duration::from_secs(180),
+    );
+    assert_eq!(no_probe, ConnectionHealth::Unknown);
+
+    let probe = crate::vortix_core::ports::tunnel::ProbeReceipt {
+        peer_public_key: "peer-a".into(),
+        target: "10.0.0.1".parse().unwrap(),
+        allowed_routes: peer.allowed_routes.clone(),
+        issued_at: now,
+    };
+    let with_probe = super::connection::wireguard_health_from_session(
+        &[peer],
+        &mut activity,
+        &[probe],
+        std::time::Duration::from_secs(180),
+    );
+    assert!(matches!(with_probe, ConnectionHealth::Degraded { .. }));
+}
+
+#[test]
+fn issued_probe_expectation_does_not_expire_into_unknown() {
+    use crate::vortix_core::engine::state::ConnectionHealth;
+    let now = std::time::SystemTime::now();
+    let old = now
+        .checked_sub(std::time::Duration::from_secs(900))
+        .unwrap();
+    let peer = wg_peer("peer-a", now, Some(old), 0, false);
+    let probe = crate::vortix_core::ports::tunnel::ProbeReceipt {
+        peer_public_key: "peer-a".into(),
+        target: "10.0.0.1".parse().unwrap(),
+        allowed_routes: peer.allowed_routes.clone(),
+        issued_at: old,
+    };
+    let mut activity = std::collections::HashMap::new();
+    let health = super::connection::wireguard_health_from_session(
+        &[peer],
+        &mut activity,
+        &[probe],
+        std::time::Duration::from_secs(180),
+    );
+    assert!(matches!(health, ConnectionHealth::Degraded { .. }));
 }
 
 // ====================================================================
@@ -558,6 +736,9 @@ fn mirror_failed_makes_registry_hold_disconnected_with_failure() {
         error: Some("handshake timeout".to_string()),
         interface: None,
         pid: None,
+        generation: 0,
+        handshake: None,
+        probe_receipts: Vec::new(),
         dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
     });
 
@@ -892,6 +1073,9 @@ fn test_connect_result_success_transitions_to_connected() {
         error: None,
         interface: None,
         pid: None,
+        generation: 0,
+        handshake: None,
+        probe_receipts: Vec::new(),
         dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
     });
 
@@ -899,6 +1083,52 @@ fn test_connect_result_success_transitions_to_connected() {
         matches!(app.legacy_state(), ConnectionState::Connected { ref profile, .. } if profile == "test-vpn"),
         "Successful ConnectResult should transition to Connected"
     );
+}
+
+#[test]
+fn connect_result_preserves_wireguard_receipt_in_canonical_details() {
+    use crate::vortix_core::engine::state::Connection;
+    use crate::vortix_core::ports::tunnel::HandshakeEvidence;
+    use crate::vortix_core::profile::ProfileId;
+
+    let mut app = test_app();
+    add_profiles(&mut app, &["receipt-vpn"]);
+    set_connecting(&mut app, "receipt-vpn");
+    let now = std::time::SystemTime::now();
+    let handshake = HandshakeEvidence {
+        generation: 42,
+        peer_public_key: "peer-a".into(),
+        handshake_at: now,
+        observed_at: now,
+        allowed_routes: vec!["10.0.0.0/24".into()],
+    };
+    app.handle_message(Message::ConnectResult {
+        profile: "receipt-vpn".into(),
+        success: true,
+        error: None,
+        interface: Some("wg0".into()),
+        pid: None,
+        generation: 42,
+        handshake: Some(handshake.clone()),
+        probe_receipts: vec![crate::vortix_core::ports::tunnel::ProbeReceipt {
+            peer_public_key: "peer-a".into(),
+            target: "10.0.0.1".parse().unwrap(),
+            allowed_routes: vec!["10.0.0.0/24".into()],
+            issued_at: now,
+        }],
+        dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
+    });
+    let snap = app
+        .registry
+        .snapshot(&ProfileId::new("receipt-vpn"))
+        .unwrap();
+    let Connection::Connected { details, .. } = snap.state else {
+        panic!("receipt must produce Connected")
+    };
+    assert_eq!(details.generation, 42);
+    assert_eq!(details.handshake, Some(handshake));
+    assert_eq!(details.probe_receipts.len(), 1);
+    assert_eq!(details.probe_receipts[0].peer_public_key, "peer-a");
 }
 
 #[test]
@@ -916,6 +1146,9 @@ fn connect_result_dns_request_reaches_registry_role_policy() {
         error: None,
         interface: Some("wg0".to_string()),
         pid: None,
+        generation: 0,
+        handshake: None,
+        probe_receipts: Vec::new(),
         dns_request: crate::vortix_core::ports::dns::DnsRequest {
             servers: vec!["1.1.1.1".parse().unwrap()],
             search_domains: Vec::new(),
@@ -951,6 +1184,9 @@ fn test_connect_result_failure_transitions_to_disconnected() {
         error: Some("wg-quick: already exists".to_string()),
         interface: None,
         pid: None,
+        generation: 0,
+        handshake: None,
+        probe_receipts: Vec::new(),
         dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
     });
 
@@ -975,6 +1211,9 @@ fn test_connect_result_failure_clears_pending() {
         error: Some("error".to_string()),
         interface: None,
         pid: None,
+        generation: 0,
+        handshake: None,
+        probe_receipts: Vec::new(),
         dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
     });
 
@@ -1805,6 +2044,9 @@ fn test_last_connected_profile_set_on_connect_success() {
         error: None,
         interface: None,
         pid: None,
+        generation: 0,
+        handshake: None,
+        probe_receipts: Vec::new(),
         dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
     });
 
@@ -3370,6 +3612,9 @@ fn connect_result_success_mirrors_into_registry() {
         error: None,
         interface: None,
         pid: None,
+        generation: 0,
+        handshake: None,
+        probe_receipts: Vec::new(),
         dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
     });
 
@@ -3646,6 +3891,9 @@ fn disconnect_result_success_removes_from_registry() {
         error: None,
         interface: None,
         pid: None,
+        generation: 0,
+        handshake: None,
+        probe_receipts: Vec::new(),
         dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
     });
     assert_eq!(app.registry.tunnel_count(), 1, "setup precondition");
@@ -3721,6 +3969,9 @@ fn connect_result_success_arrives_after_scanner_observes_kernel_session() {
         error: None,
         interface: None,
         pid: None,
+        generation: 0,
+        handshake: None,
+        probe_receipts: Vec::new(),
         dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
     });
 
@@ -3766,6 +4017,9 @@ fn connect_result_success_seeds_authoritative_iface_into_registry() {
         error: None,
         interface: Some("utun8".to_string()),
         pid: Some(7155),
+        generation: 0,
+        handshake: None,
+        probe_receipts: Vec::new(),
         dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
     });
 
@@ -3821,6 +4075,9 @@ fn connect_result_for_secondary_profile_during_takeover_is_not_stale() {
         error: None,
         interface: Some("utun9".to_string()),
         pid: Some(8888),
+        generation: 0,
+        handshake: None,
+        probe_receipts: Vec::new(),
         dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
     });
 

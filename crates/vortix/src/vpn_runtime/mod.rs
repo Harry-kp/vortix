@@ -15,7 +15,7 @@ pub mod openvpn;
 
 pub use connection_state::{ConnectionState, DetailedConnectionInfo};
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Instant;
@@ -58,6 +58,17 @@ use crate::vortix_core::profile::ProfileId;
 
 type DnsObservation = (ProfileId, String, bool);
 type DnsSchedule = (Vec<DnsObservation>, usize, Instant);
+
+/// Last accepted counter sample for one `WireGuard` peer. Cumulative byte
+/// totals are not activity by themselves: only a positive delta between two
+/// ordered observations advances `last_transfer_at`.
+#[derive(Debug, Clone)]
+pub(crate) struct WireGuardPeerActivity {
+    pub bytes_rx: u64,
+    pub bytes_tx: u64,
+    pub observed_at: std::time::SystemTime,
+    pub last_transfer_at: Option<std::time::SystemTime>,
+}
 
 /// Core VPN engine — all VPN-related state, no UI dependencies.
 ///
@@ -143,6 +154,15 @@ pub struct VpnRuntime {
     pub dns_external_sessions: usize,
     /// False after a route probe failure; the prior registry primary is retained.
     pub route_observation_fresh: bool,
+    /// Scanner-only `WireGuard` interfaces are visible but unmanaged. They are
+    /// represented as Handshaking and are exempt from the managed-connect
+    /// timeout/cleanup path until an explicit ownership receipt exists.
+    pub(crate) scanner_observed_wireguard: HashSet<ProfileId>,
+    /// Per-profile, per-peer ordered counter history for ongoing health.
+    pub(crate) wireguard_peer_activity: HashMap<ProfileId, HashMap<String, WireGuardPeerActivity>>,
+    /// Actual protocol probe activity, never inferred from configured targets.
+    pub(crate) wireguard_probe_activity:
+        HashMap<ProfileId, Vec<crate::vortix_core::ports::tunnel::ProbeReceipt>>,
 
     // === Connection Retry & Auto-Reconnect ===
     /// Per-profile retry / auto-reconnect bookkeeping.
@@ -220,6 +240,9 @@ impl VpnRuntime {
             dns_last_scheduled: None,
             dns_external_sessions: 0,
             route_observation_fresh: false,
+            scanner_observed_wireguard: HashSet::new(),
+            wireguard_peer_activity: HashMap::new(),
+            wireguard_probe_activity: HashMap::new(),
 
             retry_state: HashMap::new(),
 
@@ -325,6 +348,9 @@ impl VpnRuntime {
             dns_last_scheduled: None,
             dns_external_sessions: 0,
             route_observation_fresh: false,
+            scanner_observed_wireguard: HashSet::new(),
+            wireguard_peer_activity: HashMap::new(),
+            wireguard_probe_activity: HashMap::new(),
 
             retry_state: HashMap::new(),
 
@@ -405,6 +431,9 @@ impl VpnRuntime {
             dns_last_scheduled: None,
             dns_external_sessions: 0,
             route_observation_fresh: false,
+            scanner_observed_wireguard: HashSet::new(),
+            wireguard_peer_activity: HashMap::new(),
+            wireguard_probe_activity: HashMap::new(),
             retry_state: HashMap::new(),
             telemetry_rx: None,
             telemetry_nudge: None,
@@ -765,6 +794,9 @@ impl VpnRuntime {
                     Protocol::WireGuard => TunnelKindTag::WireGuard,
                     Protocol::OpenVPN => TunnelKindTag::OpenVpn,
                 },
+                generation: 0,
+                handshake: None,
+                probe_receipts: Vec::new(),
                 process_ownership: None,
                 teardown_config: matches!(profile.protocol, Protocol::WireGuard).then(|| {
                     crate::vortix_core::ports::tunnel::TunnelTeardownConfig {

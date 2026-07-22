@@ -18,9 +18,9 @@ pub use command::{
 pub use model::{
     AuthorityEpoch, ChallengeId, ChallengeKind, ChallengeRecord, ClientId, CompletionOutcome,
     ControlEvent, ControlEventEnvelope, DesiredState, DriftGates, EffectiveState, EventEnvelope,
-    Freshness, GateEvidence, Observation, ObservedState, OperationCompletion, OperationFailure,
-    OperationId, OperationRecord, OperationResult, OperationStatus, PolicyDigest,
-    ProtectionEvidence, ProtectionStatus, RequestedTunnelState,
+    Freshness, GateEvidence, Observation, ObservedConnectionHealth, ObservedState,
+    OperationCompletion, OperationFailure, OperationId, OperationRecord, OperationResult,
+    OperationStatus, PolicyDigest, ProtectionEvidence, ProtectionStatus, RequestedTunnelState,
 };
 pub use service::{
     AdmissionError, AdmittedOperation, ChallengeAnswerReceiver, ChallengeDeliveryError,

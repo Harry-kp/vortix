@@ -58,6 +58,12 @@ pub struct EngineSettings {
     pub openvpn_verbosity: String,
     /// Connect timeout used by `OvpnTunnel::with_connect_timeout`.
     pub connect_timeout_secs: u64,
+    /// `WireGuard` remains Handshaking until current-generation evidence arrives.
+    pub wireguard_handshake_timeout_secs: u64,
+    /// Ongoing freshness threshold when peer traffic is expected.
+    pub wireguard_handshake_stale_secs: u64,
+    /// Ordered explicit probe destinations used to elicit a handshake.
+    pub wireguard_health_targets: Vec<String>,
 }
 
 impl Default for EngineSettings {
@@ -67,6 +73,13 @@ impl Default for EngineSettings {
             retry_initial_backoff_ms: 2_000,
             openvpn_verbosity: "3".to_string(),
             connect_timeout_secs: 30,
+            wireguard_handshake_timeout_secs: 20,
+            wireguard_handshake_stale_secs: 180,
+            wireguard_health_targets: vec![
+                "1.1.1.1".to_string(),
+                "8.8.8.8".to_string(),
+                "9.9.9.9".to_string(),
+            ],
         }
     }
 }
@@ -175,6 +188,43 @@ impl Settings {
         Self::load_from(None, Some(&user_path))
     }
 
+    /// Load settings from the already-resolved application configuration
+    /// directory. This is the authoritative production entry point: the
+    /// same `--config-dir` / `VORTIX_CONFIG_DIR` / sudo-user decision that
+    /// selects profiles and `config.toml` also selects `settings.toml`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsError`] when the selected file or environment layer
+    /// cannot be decoded.
+    pub fn load_from_config_dir(config_dir: &Path) -> Result<Self, SettingsError> {
+        Self::load_from(None, Some(&config_dir.join("settings.toml")))
+    }
+
+    /// Load settings with compatibility values supplied by the legacy
+    /// `config.toml` engine fields. Explicit `settings.toml` and
+    /// `VORTIX_ENGINE__*` values still win; the legacy values are only the
+    /// defaults layer. This is the migration bridge while `config.toml`
+    /// remains accepted by older installations.
+    pub fn load_with_engine_defaults(engine: EngineSettings) -> Result<Self, SettingsError> {
+        let user_path = user_config_path()?;
+        Self::load_from_with_engine_defaults(None, Some(&user_path), engine)
+    }
+
+    /// Load compatibility defaults and then layer the authoritative
+    /// `${config_dir}/settings.toml` and `VORTIX_*` environment values.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettingsError`] when the selected file or environment layer
+    /// cannot be decoded.
+    pub fn load_from_config_dir_with_engine_defaults(
+        config_dir: &Path,
+        engine: EngineSettings,
+    ) -> Result<Self, SettingsError> {
+        Self::load_from_with_engine_defaults(None, Some(&config_dir.join("settings.toml")), engine)
+    }
+
     /// Same as [`Self::load`] but with explicit `system` and `user` paths
     /// (`None` skips that layer). Useful for tests.
     ///
@@ -183,7 +233,19 @@ impl Settings {
     /// Returns [`SettingsError::Figment`] when a present layer fails to
     /// parse.
     pub fn load_from(system: Option<&Path>, user: Option<&Path>) -> Result<Self, SettingsError> {
-        let mut fig = Figment::new().merge(Serialized::defaults(Self::default()));
+        Self::load_from_with_engine_defaults(system, user, EngineSettings::default())
+    }
+
+    fn load_from_with_engine_defaults(
+        system: Option<&Path>,
+        user: Option<&Path>,
+        engine: EngineSettings,
+    ) -> Result<Self, SettingsError> {
+        let defaults = Self {
+            engine,
+            ..Self::default()
+        };
+        let mut fig = Figment::new().merge(Serialized::defaults(defaults));
         if let Some(p) = system {
             if p.exists() {
                 fig = fig.merge(Toml::file(p));
@@ -249,6 +311,9 @@ mod tests {
         let s = Settings::load_from(None, None).unwrap();
         assert_eq!(s.engine.retry_budget_secs, 300);
         assert_eq!(s.engine.retry_initial_backoff_ms, 2_000);
+        assert_eq!(s.engine.wireguard_handshake_timeout_secs, 20);
+        assert_eq!(s.engine.wireguard_handshake_stale_secs, 180);
+        assert!(!s.engine.wireguard_health_targets.is_empty());
         assert!(s.journal.disk);
         assert_eq!(s.journal.retention_days, 30);
     }
@@ -273,6 +338,69 @@ disk = false
         assert!(!s.journal.disk);
         // Other fields keep defaults.
         assert_eq!(s.journal.retention_days, 30);
+    }
+
+    #[test]
+    fn explicit_engine_settings_override_legacy_compatibility_defaults() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.toml");
+        fs::write(
+            &path,
+            r#"
+[engine]
+wireguard_handshake_timeout_secs = 7
+wireguard_handshake_stale_secs = 91
+wireguard_health_targets = ["10.0.0.1"]
+"#,
+        )
+        .unwrap();
+        let legacy = EngineSettings {
+            wireguard_handshake_timeout_secs: 44,
+            wireguard_handshake_stale_secs: 444,
+            wireguard_health_targets: vec!["192.0.2.1".into()],
+            ..EngineSettings::default()
+        };
+        let resolved = Settings::load_from_with_engine_defaults(None, Some(&path), legacy).unwrap();
+        assert_eq!(resolved.engine.wireguard_handshake_timeout_secs, 7);
+        assert_eq!(resolved.engine.wireguard_handshake_stale_secs, 91);
+        assert_eq!(resolved.engine.wireguard_health_targets, ["10.0.0.1"]);
+    }
+
+    #[test]
+    fn old_partial_settings_keep_legacy_wireguard_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.toml");
+        fs::write(&path, "[engine]\nretry_budget_secs = 60\n").unwrap();
+        let legacy = EngineSettings {
+            wireguard_handshake_timeout_secs: 44,
+            wireguard_handshake_stale_secs: 444,
+            wireguard_health_targets: vec!["192.0.2.1".into()],
+            ..EngineSettings::default()
+        };
+        let resolved = Settings::load_from_with_engine_defaults(None, Some(&path), legacy).unwrap();
+        assert_eq!(resolved.engine.retry_budget_secs, 60);
+        assert_eq!(resolved.engine.wireguard_handshake_timeout_secs, 44);
+        assert_eq!(resolved.engine.wireguard_handshake_stale_secs, 444);
+        assert_eq!(resolved.engine.wireguard_health_targets, ["192.0.2.1"]);
+    }
+
+    #[test]
+    fn authoritative_config_dir_selects_settings_file() {
+        let selected = tempfile::tempdir().unwrap();
+        let unrelated = tempfile::tempdir().unwrap();
+        fs::write(
+            selected.path().join("settings.toml"),
+            "[engine]\nwireguard_handshake_timeout_secs = 7\n",
+        )
+        .unwrap();
+        fs::write(
+            unrelated.path().join("settings.toml"),
+            "[engine]\nwireguard_handshake_timeout_secs = 99\n",
+        )
+        .unwrap();
+
+        let resolved = Settings::load_from_config_dir(selected.path()).unwrap();
+        assert_eq!(resolved.engine.wireguard_handshake_timeout_secs, 7);
     }
 
     #[test]

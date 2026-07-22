@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::vortix_core::control::worker::ControlRevision;
-use crate::vortix_core::ports::tunnel::AdoptionEvidence;
+use crate::vortix_core::ports::tunnel::{AdoptionEvidence, TunnelKindTag};
 use crate::vortix_core::profile::ProfileId;
 
 /// Why an observed tunnel can (or cannot) be controlled by Vortix.
@@ -174,6 +174,7 @@ pub fn plan_reconciliation(input: &ReconcileInput) -> ReconcilePlan {
                     if let Some(evidence) = fact.adoption.clone().filter(|evidence| {
                         evidence.profile_id() == &profile_id
                             && Some(evidence.interface_name()) == fact.interface_name.as_deref()
+                            && evidence.kind() != TunnelKindTag::WireGuard
                     }) {
                         actions.push(ReconcileAction::AdoptAttested {
                             profile_id,

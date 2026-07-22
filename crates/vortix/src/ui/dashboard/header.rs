@@ -68,6 +68,23 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     // strip still appends so the user sees what's connected.
     let Some(primary_snap) = primary_snap else {
         let snapshots = app.registry.snapshot_all();
+        if let Some(transitional) = snapshots.iter().find(|snapshot| {
+            matches!(
+                snapshot.state,
+                Connection::Connecting { .. }
+                    | Connection::Reconnecting { .. }
+                    | Connection::Disconnecting { .. }
+                    | Connection::AwaitingUserInput { .. }
+            )
+        }) {
+            let mut line = render_primary_line(app, transitional, ks_indicator.clone(), area.width);
+            if snapshots.len() >= 2 {
+                line =
+                    append_tunnels_strip(Some(app), line, &snapshots, primary.as_ref(), area.width);
+            }
+            frame.render_widget(Paragraph::new(line), area);
+            return;
+        }
         let mut line = render_no_exit_line(app, ks_indicator.clone());
         line = append_tunnels_strip(Some(app), line, &snapshots, primary.as_ref(), area.width);
         frame.render_widget(Paragraph::new(line), area);
@@ -168,6 +185,18 @@ fn render_primary_line(
             let action = match primary_snap.state {
                 Connection::Disconnecting { .. } => "DISCONNECTING",
                 Connection::Reconnecting { .. } => "RECONNECTING",
+                Connection::Connecting { .. }
+                    if app
+                        .runtime
+                        .profiles
+                        .iter()
+                        .find(|profile| profile.id == primary_snap.profile_id)
+                        .is_some_and(|profile| {
+                            profile.protocol == crate::state::Protocol::WireGuard
+                        }) =>
+                {
+                    "HANDSHAKING"
+                }
                 _ => "CONNECTING",
             };
             Line::from(vec![
@@ -697,6 +726,31 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    fn app_handshaking(protocol: crate::state::Protocol) -> App {
+        let mut app = App::new_test();
+        app.runtime.profiles.push(crate::state::VpnProfile {
+            id: ProfileId::new("corp"),
+            name: "corp".into(),
+            protocol,
+            config_path: "/tmp/corp.conf".into(),
+            location: String::new(),
+            last_used: None,
+        });
+        app.mirror_connecting_into_registry("corp");
+        app
+    }
+
+    #[test]
+    fn compact_header_uses_protocol_specific_connect_label() {
+        let wg = render_to_string(&app_handshaking(crate::state::Protocol::WireGuard), 80, 1);
+        assert!(wg.contains("HANDSHAKING"), "{wg}");
+        assert!(!wg.contains("NO EXIT"), "{wg}");
+
+        let ovpn = render_to_string(&app_handshaking(crate::state::Protocol::OpenVPN), 80, 1);
+        assert!(ovpn.contains("CONNECTING"), "{ovpn}");
+        assert!(!ovpn.contains("HANDSHAKING"), "{ovpn}");
     }
 
     #[test]

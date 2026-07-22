@@ -731,6 +731,8 @@ rtt min/avg/max/mdev = 1.234/5.678/9.012/3.456 ms";
             api_timeout: 8,
             ping_timeout: 3,
             connect_timeout: 30, // not used by TelemetryConfig
+            wireguard_handshake_timeout_secs: 20,
+            wireguard_handshake_stale_secs: 180,
             ping_targets: vec!["4.4.4.4".to_string()],
             ipv6_check_apis: vec!["https://v6.example.com".to_string()],
             ip_api_primary: "https://custom.api/json".to_string(),

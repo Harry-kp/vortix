@@ -5,7 +5,6 @@
 //! and `lsof -t <socket>` shell-outs with direct libc / libproc calls.
 
 use crate::vortix_core::ports::interface::Interface;
-use crate::vortix_process::simple_output as cmd_output;
 use std::path::{Path, PathBuf};
 
 use super::libproc_ffi::{self, SocketView};
@@ -23,7 +22,7 @@ impl Interface for MacInterface {
                 std::fs::read_to_string(&pid_file)
                     .map_or_else(|_| name.to_string(), |s| s.trim().to_string()),
             )
-        } else if check_wg_interface_exists(name) {
+        } else if interface_exists(name) {
             Some(name.to_string())
         } else {
             None
@@ -55,8 +54,9 @@ impl Interface for MacInterface {
     }
 }
 
-fn check_wg_interface_exists(name: &str) -> bool {
-    cmd_output("wg", &["show", name, "public-key"]).is_some_and(|o| o.status.success())
+fn interface_exists(name: &str) -> bool {
+    let (address, mtu) = get_interface_addr_and_mtu(name);
+    address.is_some() || mtu.is_some()
 }
 
 /// Read both IPv4 address and MTU for `interface` from `libc::getifaddrs`.

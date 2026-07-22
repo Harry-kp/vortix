@@ -187,6 +187,12 @@ pub enum Message {
         /// Kernel PID from the protocol layer's `Tunnel::up()` result.
         /// Same flow rationale as `interface`.
         pid: Option<u32>,
+        /// Exact attempt generation returned by the protocol adapter.
+        generation: u64,
+        /// Current-generation `WireGuard` proof; absent for `OpenVPN`/failure.
+        handshake: Option<crate::vortix_core::ports::tunnel::HandshakeEvidence>,
+        /// Per-peer protocol receipts for probes actually issued.
+        probe_receipts: Vec<crate::vortix_core::ports::tunnel::ProbeReceipt>,
         /// Protocol-parsed/negotiated resolver intent. The receiving control
         /// path recomputes the complete platform policy from all roles.
         dns_request: crate::vortix_core::ports::dns::DnsRequest,
