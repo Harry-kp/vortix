@@ -541,14 +541,13 @@ fn configure_owner_process(command: &mut Command, spec: &CommandSpec) {
         if crate::utils::effective_user_group_ids().0 == 0 {
             if let Some(credentials) = spec.run_as.clone() {
                 let groups = credentials.supplementary_groups;
-                let group_count = i32::try_from(groups.len()).expect("validated group count");
                 let gid = credentials.gid;
                 let uid = credentials.uid;
                 #[allow(unsafe_code)]
                 unsafe {
                     command
                         .as_std_mut()
-                        .pre_exec(move || drop_credentials(&groups, group_count, gid, uid));
+                        .pre_exec(move || drop_credentials(&groups, gid, uid));
                 }
             }
         }
@@ -556,14 +555,12 @@ fn configure_owner_process(command: &mut Command, spec: &CommandSpec) {
 }
 
 #[cfg(unix)]
-fn drop_credentials(groups: &[u32], group_count: i32, gid: u32, uid: u32) -> std::io::Result<()> {
+fn drop_credentials(groups: &[u32], gid: u32, uid: u32) -> std::io::Result<()> {
     // SAFETY: pointers remain valid for the duration of each syscall and all
     // values were prepared before fork. Ordering prevents reacquiring privilege.
+    crate::platform::set_process_supplementary_groups(groups)?;
     #[allow(unsafe_code)]
     unsafe {
-        if libc::setgroups(group_count, groups.as_ptr()) != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
         if libc::setgid(gid) != 0 {
             return Err(std::io::Error::last_os_error());
         }

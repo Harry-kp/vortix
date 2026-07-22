@@ -65,6 +65,37 @@ pub use crate::vortix_core::ports::killswitch::Killswitch as Firewall;
 pub use crate::vortix_core::ports::network_stats::NetworkStats as NetworkStatsProvider;
 pub use crate::vortix_core::ports::route_table::RouteTable;
 
+fn syscall_result(result: libc::c_int) -> std::io::Result<()> {
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Replace the current process's supplementary groups on macOS.
+///
+/// This is called from a `pre_exec` closure, so it performs only bounded
+/// scalar conversion and the async-signal-safe `setgroups` syscall.
+#[cfg(target_os = "macos")]
+pub(crate) fn set_process_supplementary_groups(groups: &[u32]) -> std::io::Result<()> {
+    let count =
+        i32::try_from(groups.len()).map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+    // SAFETY: `groups` remains valid for the duration of the syscall.
+    #[allow(unsafe_code)]
+    let result = unsafe { libc::setgroups(count, groups.as_ptr()) };
+    syscall_result(result)
+}
+
+/// Linux variant of [`set_process_supplementary_groups`].
+#[cfg(target_os = "linux")]
+pub(crate) fn set_process_supplementary_groups(groups: &[u32]) -> std::io::Result<()> {
+    // SAFETY: `groups` remains valid for the duration of the syscall.
+    #[allow(unsafe_code)]
+    let result = unsafe { libc::setgroups(groups.len(), groups.as_ptr()) };
+    syscall_result(result)
+}
+
 /// Resolve a user's complete OS group list without invoking an external
 /// command. The libc signature differs between macOS and Linux, so the
 /// normalization belongs at this platform boundary.
