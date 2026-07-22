@@ -38,8 +38,8 @@ and creates a sibling `.meta.toml` next to each existing `.conf` /
 └── home.meta.toml            ← new sidecar
 ```
 
-Each sidecar carries a stable `profile_id` (SHA-256 of the name + first
-4 KiB of the config), the original `display_name`, and the protocol.
+Each sidecar carries a stable `profile_id` assigned once during import or
+migration, the original `display_name`, and the protocol.
 v0.2.x ignores `.meta.toml` files entirely, so rollback is safe.
 
 The migration is **idempotent** — it re-runs at every startup and only
@@ -48,8 +48,10 @@ touches profiles that don't have a sidecar yet. There is no explicit
 something (e.g., a permissions issue), just restart vortix.
 
 If migration ever fails (read-only profile dir, unusual perms, etc.),
-startup continues and the warning is logged to stderr. No panic, no
-data loss.
+startup fails before any tunnel lifecycle mutation. No profile is silently
+adopted or assigned a replacement identity. If the managed profile inventory
+changed unexpectedly, restore that directory to its saved inventory first;
+then add new profiles from outside it with `vortix import <path>`.
 
 ### Override
 
