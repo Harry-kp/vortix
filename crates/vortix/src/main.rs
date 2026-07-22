@@ -163,14 +163,14 @@ fn main() -> Result<()> {
                 }
                 if stats.failed > 0 {
                     eprintln!(
-                        "Warning: {} profile(s) failed to migrate; existing files untouched. Run `vortix migrate` to retry.",
+                        "Warning: {} profile(s) failed to migrate; existing files untouched. Repair the profile files and restart vortix to retry.",
                         stats.failed
                     );
                 }
             }
             Err(e) => {
                 return Err(color_eyre::eyre::eyre!(
-                    "profile identity migration refused startup: {e}. Repair the profile inventory or run `vortix migrate` before managing tunnels"
+                    "profile identity migration refused startup: {e}. Restore the managed profile directory to its saved inventory before managing tunnels; add new profiles from outside that directory with `vortix import <path>`"
                 ));
             }
         }
