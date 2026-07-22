@@ -65,6 +65,72 @@ pub use crate::vortix_core::ports::killswitch::Killswitch as Firewall;
 pub use crate::vortix_core::ports::network_stats::NetworkStats as NetworkStatsProvider;
 pub use crate::vortix_core::ports::route_table::RouteTable;
 
+/// Resolve a user's complete OS group list without invoking an external
+/// command. The libc signature differs between macOS and Linux, so the
+/// normalization belongs at this platform boundary.
+#[cfg(target_os = "macos")]
+pub(crate) fn supplementary_groups_for_user(
+    user: &std::ffi::CStr,
+    gid: u32,
+    max_groups: usize,
+) -> Option<Vec<u32>> {
+    let base_group = i32::try_from(gid).ok()?;
+    let mut group_count = i32::try_from(max_groups).ok()?;
+    let mut groups = vec![0_i32; max_groups];
+    // SAFETY: the call uses the stable C string and a buffer whose length is
+    // supplied through `group_count`.
+    #[allow(unsafe_code)]
+    unsafe {
+        if libc::getgrouplist(
+            user.as_ptr(),
+            base_group,
+            groups.as_mut_ptr(),
+            &raw mut group_count,
+        ) < 0
+        {
+            return None;
+        }
+        groups.truncate(usize::try_from(group_count).ok()?);
+        if groups.is_empty() {
+            return None;
+        }
+        groups
+            .into_iter()
+            .map(|group| u32::try_from(group).ok())
+            .collect()
+    }
+}
+
+/// Linux variant of [`supplementary_groups_for_user`].
+#[cfg(target_os = "linux")]
+pub(crate) fn supplementary_groups_for_user(
+    user: &std::ffi::CStr,
+    gid: u32,
+    max_groups: usize,
+) -> Option<Vec<u32>> {
+    let mut group_count = i32::try_from(max_groups).ok()?;
+    let mut groups = vec![0_u32; max_groups];
+    // SAFETY: the call uses the stable C string and a buffer whose length is
+    // supplied through `group_count`.
+    #[allow(unsafe_code)]
+    unsafe {
+        if libc::getgrouplist(
+            user.as_ptr(),
+            gid,
+            groups.as_mut_ptr(),
+            &raw mut group_count,
+        ) < 0
+        {
+            return None;
+        }
+        groups.truncate(usize::try_from(group_count).ok()?);
+        if groups.is_empty() {
+            return None;
+        }
+        Some(groups)
+    }
+}
+
 /// Platform-appropriate install hint for a package.
 #[cfg(target_os = "macos")]
 #[must_use]

@@ -14,6 +14,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use crate::vortix_core::control::command::{
     CommandRequest, Deadline, IdempotencyKey, Secret, UserCommand,
 };
+use crate::vortix_core::control::hooks::{HookEvent, HookEventId, LifecycleFact};
 use crate::vortix_core::control::model::{
     AuthorityEpoch, ChallengeId, ChallengeKind, ChallengeRecord, ClientId, CompletionOutcome,
     ControlEvent, ControlEventEnvelope, DriftGates, EffectiveState, Freshness, GateEvidence,
@@ -75,6 +76,8 @@ pub struct ControlServiceConfig {
 pub struct ProfileTopology {
     /// Protocol kind required for protocol-specific convergence gates.
     pub protocol: Option<crate::vortix_core::profile::ProtocolKind>,
+    /// Owner-visible label allowed in lifecycle-hook environments.
+    pub display_name: Option<String>,
     /// Protocol-authoritative interface, when it is known before connection.
     pub interface_name: Option<String>,
     /// Canonical CIDR claims requested by this profile.
@@ -938,6 +941,15 @@ struct OwnerState {
     observation_clocks: BTreeMap<ObservationScope, u64>,
     work_admissions: BTreeMap<(OperationId, ProfileId), ProfileAdmission>,
     recovery_operations: BTreeSet<OperationId>,
+    lifecycle_operations: BTreeMap<OperationId, LifecycleOperation>,
+    next_lifecycle_event: u64,
+}
+
+#[derive(Debug)]
+struct LifecycleOperation {
+    profiles: Vec<ProfileId>,
+    success: HookEvent,
+    failure: Option<HookEvent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -967,6 +979,8 @@ async fn run_service(
         observation_clocks: BTreeMap::new(),
         work_admissions: BTreeMap::new(),
         recovery_operations: BTreeSet::new(),
+        lifecycle_operations: BTreeMap::new(),
+        next_lifecycle_event: 0,
     };
     let mut ticker = tokio::time::interval(config.freshness_poll_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1080,6 +1094,7 @@ fn drive_supervision(
                     owner,
                     admission,
                     now,
+                    config,
                     events,
                 );
                 if !was_recovery
@@ -1095,6 +1110,7 @@ fn drive_supervision(
                         now,
                         selection,
                         result.generation,
+                        config,
                         events,
                     );
                 }
@@ -1535,6 +1551,7 @@ fn drive_supervision(
                     owner,
                     admission,
                     now,
+                    config,
                     events,
                 );
             }
@@ -1680,15 +1697,24 @@ fn handle_envelope(
                 operation_id: operation_id.clone(),
                 desired_generation,
             });
+            if let Some((lifecycle, started)) =
+                lifecycle_for_command(&request.command, &config.known_profiles)
+            {
+                emit_lifecycle_facts(owner, config, &lifecycle.profiles, started, now, events);
+                owner
+                    .lifecycle_operations
+                    .insert(operation_id.clone(), lifecycle);
+            }
             if expired {
                 owner
                     .work_admissions
                     .retain(|(reserved_operation, _), _| reserved_operation != &operation_id);
                 mark_terminal(admission, operation_id.clone());
                 events.push(ControlEvent::OperationCompleted {
-                    operation_id,
+                    operation_id: operation_id.clone(),
                     status,
                 });
+                finish_lifecycle_operation(owner, config, &operation_id, status, now, events);
             } else {
                 events.push(ControlEvent::DesiredStateChanged { desired_generation });
             }
@@ -1698,7 +1724,8 @@ fn handle_envelope(
             let _ = reply.send(result);
         }
         Envelope::Complete { completion, reply } => {
-            let result = complete_operation(completion, snapshot, owner, admission, now, events);
+            let result =
+                complete_operation(completion, snapshot, owner, admission, now, config, events);
             let _ = reply.send(result);
         }
         Envelope::IssueChallenge {
@@ -1888,6 +1915,98 @@ fn command_profiles(command: &UserCommand, known_profiles: &BTreeSet<ProfileId>)
             known_profiles.iter().cloned().collect()
         }
         _ => Vec::new(),
+    }
+}
+
+fn lifecycle_for_command(
+    command: &UserCommand,
+    known_profiles: &BTreeSet<ProfileId>,
+) -> Option<(LifecycleOperation, HookEvent)> {
+    let profiles = command_profiles(command, known_profiles);
+    if profiles.is_empty() {
+        return None;
+    }
+    let (started, success, failure) = match command {
+        UserCommand::Connect { .. } => (
+            HookEvent::ConnectStarted,
+            HookEvent::Connected,
+            Some(HookEvent::ConnectFailed),
+        ),
+        UserCommand::Reconnect { .. } => (
+            HookEvent::Reconnecting,
+            HookEvent::Connected,
+            Some(HookEvent::ConnectFailed),
+        ),
+        UserCommand::Disconnect { .. } | UserCommand::ForceDisconnect { .. } => {
+            (HookEvent::DisconnectStarted, HookEvent::Disconnected, None)
+        }
+        UserCommand::SetKillSwitch { .. } => return None,
+    };
+    Some((
+        LifecycleOperation {
+            profiles,
+            success,
+            failure,
+        },
+        started,
+    ))
+}
+
+fn emit_lifecycle_facts(
+    owner: &mut OwnerState,
+    config: &ControlServiceConfig,
+    profiles: &[ProfileId],
+    event: HookEvent,
+    now: u64,
+    events: &mut Vec<ControlEvent>,
+) {
+    for profile_id in profiles {
+        let Some(topology) = config.profile_topologies.get(profile_id) else {
+            continue;
+        };
+        let Some(protocol) = topology.protocol else {
+            continue;
+        };
+        owner.next_lifecycle_event = owner.next_lifecycle_event.saturating_add(1);
+        events.push(ControlEvent::Lifecycle {
+            fact: LifecycleFact {
+                event_id: HookEventId::from_parts(
+                    config.authority_epoch.0,
+                    owner.next_lifecycle_event,
+                ),
+                event,
+                profile_id: profile_id.clone(),
+                display_name: topology
+                    .display_name
+                    .clone()
+                    .unwrap_or_else(|| profile_id.to_string()),
+                protocol,
+                occurred_at_millis: now,
+            },
+        });
+    }
+}
+
+fn finish_lifecycle_operation(
+    owner: &mut OwnerState,
+    config: &ControlServiceConfig,
+    operation_id: &OperationId,
+    status: OperationStatus,
+    now: u64,
+    events: &mut Vec<ControlEvent>,
+) {
+    let Some(operation) = owner.lifecycle_operations.remove(operation_id) else {
+        return;
+    };
+    let terminal = match status {
+        OperationStatus::Succeeded => Some(operation.success),
+        OperationStatus::Failed | OperationStatus::Expired => operation.failure,
+        OperationStatus::Admitted
+        | OperationStatus::WaitingForObservation
+        | OperationStatus::Cancelled => None,
+    };
+    if let Some(event) = terminal {
+        emit_lifecycle_facts(owner, config, &operation.profiles, event, now, events);
     }
 }
 
@@ -2207,6 +2326,7 @@ fn complete_operation(
     owner: &mut OwnerState,
     admission: &Arc<Mutex<AdmissionState>>,
     now: u64,
+    config: &ControlServiceConfig,
     events: &mut Vec<ControlEvent>,
 ) -> Result<CompletionResult, CompletionError> {
     let success_is_current = match &completion.outcome {
@@ -2238,10 +2358,19 @@ fn complete_operation(
         } else {
             mark_terminal(admission, completion.operation_id.clone());
         }
+        let operation_id = completion.operation_id.clone();
         events.push(ControlEvent::OperationCompleted {
             operation_id: completion.operation_id,
             status: OperationStatus::Expired,
         });
+        finish_lifecycle_operation(
+            owner,
+            config,
+            &operation_id,
+            OperationStatus::Expired,
+            now,
+            events,
+        );
         return Err(CompletionError::DeadlineExpired);
     }
     if completion.desired_generation != record.desired_generation {
@@ -2278,10 +2407,12 @@ fn complete_operation(
     } else {
         mark_terminal(admission, completion.operation_id.clone());
     }
+    let operation_id = completion.operation_id.clone();
     events.push(ControlEvent::OperationCompleted {
         operation_id: completion.operation_id,
         status,
     });
+    finish_lifecycle_operation(owner, config, &operation_id, status, now, events);
     Ok(CompletionResult::Terminal(status))
 }
 
@@ -2290,7 +2421,7 @@ fn expire_operations(
     owner: &mut OwnerState,
     admission: &Arc<Mutex<AdmissionState>>,
     now: u64,
-    _config: &ControlServiceConfig,
+    config: &ControlServiceConfig,
     selection: ExecutionSelection,
     events: &mut Vec<ControlEvent>,
 ) {
@@ -2316,10 +2447,19 @@ fn expire_operations(
         } else {
             mark_terminal(admission, id.clone());
         }
+        let operation_id = id.clone();
         events.push(ControlEvent::OperationCompleted {
             operation_id: id,
             status: OperationStatus::Expired,
         });
+        finish_lifecycle_operation(
+            owner,
+            config,
+            &operation_id,
+            OperationStatus::Expired,
+            now,
+            events,
+        );
         let Some(expired_record) = expired_record else {
             continue;
         };
@@ -2358,15 +2498,17 @@ fn expire_operations(
         );
         owner.recovery_operations.insert(recovery_id.clone());
         events.push(ControlEvent::OperationAdmitted {
-            operation_id: recovery_id,
+            operation_id: recovery_id.clone(),
             desired_generation: snapshot.desired.generation,
         });
+        register_recovery_lifecycle(owner, snapshot, config, &recovery_id, now, events);
     }
 }
 
 /// Start a policy-owned retry only after the user-visible operation reached a
 /// typed terminal. This keeps idempotent callers from waiting until expiry,
 /// while preserving level-triggered convergence for unchanged desired state.
+#[allow(clippy::too_many_arguments)] // Recovery is one owner transition across operation and hook facts.
 fn start_recovery_operation(
     snapshot: &mut ControlSnapshot,
     owner: &mut OwnerState,
@@ -2374,6 +2516,7 @@ fn start_recovery_operation(
     now: u64,
     selection: ExecutionSelection,
     generation: u64,
+    config: &ControlServiceConfig,
     events: &mut Vec<ControlEvent>,
 ) {
     if selection != ExecutionSelection::CanonicalAuthority
@@ -2406,9 +2549,44 @@ fn start_recovery_operation(
     );
     owner.recovery_operations.insert(recovery_id.clone());
     events.push(ControlEvent::OperationAdmitted {
-        operation_id: recovery_id,
+        operation_id: recovery_id.clone(),
         desired_generation: generation,
     });
+    register_recovery_lifecycle(owner, snapshot, config, &recovery_id, now, events);
+}
+
+fn register_recovery_lifecycle(
+    owner: &mut OwnerState,
+    snapshot: &ControlSnapshot,
+    config: &ControlServiceConfig,
+    recovery_id: &OperationId,
+    now: u64,
+    events: &mut Vec<ControlEvent>,
+) {
+    let profiles = snapshot
+        .desired
+        .tunnels
+        .iter()
+        .filter_map(|(profile, state)| {
+            (*state == RequestedTunnelState::Connected).then_some(profile.clone())
+        })
+        .collect::<Vec<_>>();
+    emit_lifecycle_facts(
+        owner,
+        config,
+        &profiles,
+        HookEvent::Reconnecting,
+        now,
+        events,
+    );
+    owner.lifecycle_operations.insert(
+        recovery_id.clone(),
+        LifecycleOperation {
+            profiles,
+            success: HookEvent::Connected,
+            failure: Some(HookEvent::ConnectFailed),
+        },
+    );
 }
 
 fn mark_terminal(admission: &Arc<Mutex<AdmissionState>>, operation_id: OperationId) {

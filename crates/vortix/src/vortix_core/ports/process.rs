@@ -43,6 +43,18 @@ pub enum Kind {
     DetachedSpawn,
 }
 
+/// Explicit non-root identity for an owner-run subprocess.
+///
+/// Supplying this never grants privilege: a non-root caller may name only
+/// its current identity, while a root caller must drop all three credential
+/// sets before `exec`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessCredentials {
+    pub uid: u32,
+    pub gid: u32,
+    pub supplementary_groups: Vec<u32>,
+}
+
 /// The full specification of a subprocess invocation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandSpec {
@@ -80,6 +92,13 @@ pub struct CommandSpec {
     /// EOFs. Callers using `daemonizes` are responsible for surfacing errors
     /// via an alternate channel (e.g., the daemon's own `--log` file).
     pub daemonizes: bool,
+    /// Verified non-root credentials applied before `exec`.
+    #[serde(default)]
+    pub run_as: Option<ProcessCredentials>,
+    /// Put the child in a new process group and contain descendants on
+    /// timeout/cancellation. Required for lifecycle hooks.
+    #[serde(default)]
+    pub terminate_process_group: bool,
 }
 
 impl CommandSpec {
@@ -98,6 +117,8 @@ impl CommandSpec {
             kind: Kind::OneShot,
             redact_in_audit: Vec::new(),
             daemonizes: false,
+            run_as: None,
+            terminate_process_group: false,
         }
     }
 
@@ -152,6 +173,20 @@ impl CommandSpec {
     #[must_use]
     pub fn daemonizes(mut self) -> Self {
         self.daemonizes = true;
+        self
+    }
+
+    /// Builder: execute under an already-verified non-root identity.
+    #[must_use]
+    pub fn run_as(mut self, credentials: ProcessCredentials) -> Self {
+        self.run_as = Some(credentials);
+        self
+    }
+
+    /// Builder: contain the child and descendants in a dedicated process group.
+    #[must_use]
+    pub fn contain_process_group(mut self) -> Self {
+        self.terminate_process_group = true;
         self
     }
 }
@@ -279,6 +314,9 @@ pub enum ProcessError {
     /// The spec required root but the running uid is not zero.
     #[error("subprocess `{program}` requires root but current uid is not 0")]
     PrivilegeDenied { program: String },
+    /// Requested credential transition is unsafe or unavailable.
+    #[error("subprocess `{program}` has invalid owner credentials: {reason}")]
+    InvalidCredentials { program: String, reason: String },
     /// The program could not be found on PATH (`exec` returned ENOENT).
     #[error("subprocess `{program}` not found on PATH")]
     ProgramNotFound { program: String },

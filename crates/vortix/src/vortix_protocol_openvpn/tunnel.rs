@@ -48,7 +48,7 @@ const MANAGED_CONFIG_MARKER: &str = "# managed-by: vortix openvpn custodian";
 
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "OpenVPN `{directive}` directives are not allowed in managed profiles: they can load configuration or execute code outside Vortix lifecycle custody"
+    "OpenVPN `{directive}` directives are not allowed in managed profiles: Vortix never runs profile commands as root; migrate lifecycle automation to a global hook using an absolute executable plus argv"
 )]
 struct ManagedConfigViolation {
     directive: String,

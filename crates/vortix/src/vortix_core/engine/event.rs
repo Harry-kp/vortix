@@ -4,3 +4,4 @@ pub use crate::vortix_core::control::model::{
     ControlEvent as EngineEvent, EventEnvelope, KillswitchEngageReason, PrimaryChangeReason,
     TunnelDownReason, SCHEMA_VERSION,
 };
+pub use crate::vortix_core::control::{HookEvent, HookEventId, LifecycleFact};

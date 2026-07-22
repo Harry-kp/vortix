@@ -4,8 +4,8 @@
 //! `resolvconf` dependency hinting), peer routing data (`AllowedIPs`,
 //! `Endpoint`, `FwMark`) used by the multi-tunnel registry's conflict
 //! detector and killswitch synthesis, a `has_hooks` flag derived from
-//! the presence of `PreUp`/`PostUp`/`PreDown`/`PostDown` directives in
-//! the `[Interface]` section, and a passthrough of the raw text. The
+//! rejection of `PreUp`/`PostUp`/`PreDown`/`PostDown` executable directives
+//! in the `[Interface]` section, and a passthrough of the raw text. The
 //! binary still hands `wg-quick` the on-disk path; this parser is only
 //! used for pre-flight inspection.
 
@@ -70,9 +70,6 @@ pub struct WgParsedProfile {
     pub address: Option<String>,
     pub mtu: Option<u32>,
     pub peers: Vec<WgPeer>,
-    /// True if the `[Interface]` section declares any of
-    /// `PreUp`/`PostUp`/`PreDown`/`PostDown` (matched case-insensitively).
-    pub has_hooks: bool,
     pub raw: String,
 }
 
@@ -194,7 +191,9 @@ pub fn parse_wg_conf(text: &str) -> Result<WgParsedProfile, ParseError> {
                     || key.eq_ignore_ascii_case("PreDown")
                     || key.eq_ignore_ascii_case("PostDown")
                 {
-                    profile.has_hooks = true;
+                    return Err(ParseError::Unsupported(format!(
+                        "WireGuard `{key}` executable directives are not allowed: Vortix never runs profile commands as root; migrate this automation to a global lifecycle hook using an absolute executable plus argv"
+                    )));
                 }
             }
             Section::Peer => {
@@ -546,30 +545,31 @@ FwMark = 0xca6c
     }
 
     #[test]
-    fn postup_sets_has_hooks() {
+    fn postup_is_rejected_with_owner_hook_migration_guidance() {
         let text = "\
 [Interface]
 PrivateKey = AAAA
 Address = 10.0.0.2/32
 PostUp = iptables -A FORWARD -i %i -j ACCEPT
 ";
-        let p = parse_wg_conf(text).unwrap();
-        assert!(p.has_hooks);
+        let error = parse_wg_conf(text).unwrap_err().to_string();
+        assert!(error.contains("PostUp"));
+        assert!(error.contains("never runs profile commands as root"));
+        assert!(error.contains("lifecycle hook"));
     }
 
     #[test]
-    fn lowercase_postup_sets_has_hooks() {
+    fn lowercase_postup_is_rejected() {
         let text = "\
 [Interface]
 PrivateKey = AAAA
 postup = iptables -A FORWARD -i %i -j ACCEPT
 ";
-        let p = parse_wg_conf(text).unwrap();
-        assert!(p.has_hooks);
+        assert!(parse_wg_conf(text).is_err());
     }
 
     #[test]
-    fn comment_mentioning_preup_does_not_set_has_hooks() {
+    fn comment_mentioning_preup_remains_valid() {
         let text = "\
 [Interface]
 PrivateKey = AAAA
@@ -577,11 +577,11 @@ PrivateKey = AAAA
 Address = 10.0.0.2/32
 ";
         let p = parse_wg_conf(text).unwrap();
-        assert!(!p.has_hooks);
+        assert_eq!(p.address.as_deref(), Some("10.0.0.2/32"));
     }
 
     #[test]
-    fn profile_without_hooks_reports_false() {
+    fn profile_without_executable_directives_remains_valid() {
         let text = "\
 [Interface]
 PrivateKey = AAAA
@@ -592,7 +592,7 @@ PublicKey = BBBB
 AllowedIPs = 10.0.0.0/8
 ";
         let p = parse_wg_conf(text).unwrap();
-        assert!(!p.has_hooks);
+        assert_eq!(p.peers.len(), 1);
     }
 
     #[test]
@@ -611,11 +611,14 @@ AllowedIPs = 10.0.0.0/8
     }
 
     #[test]
-    fn all_four_hook_directives_detected() {
+    fn all_four_executable_directives_are_rejected() {
         for directive in ["PreUp", "PostUp", "PreDown", "PostDown"] {
             let text = format!("[Interface]\n{directive} = echo hi\n");
-            let p = parse_wg_conf(&text).unwrap();
-            assert!(p.has_hooks, "directive {directive} should set has_hooks");
+            let error = parse_wg_conf(&text).unwrap_err().to_string();
+            assert!(
+                error.contains(directive),
+                "directive {directive} should be named in the error"
+            );
         }
     }
 }

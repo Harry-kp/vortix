@@ -16,6 +16,14 @@ pub fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
+/// Effective process uid/gid without a subprocess lookup.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+pub(crate) fn effective_user_group_ids() -> (u32, u32) {
+    // SAFETY: these libc calls return scalar process credentials.
+    unsafe { (libc::geteuid(), libc::getegid()) }
+}
+
 /// Check if the current process is running as root (UID 0)
 ///
 /// On non-Unix platforms, this always returns `false` because there is no

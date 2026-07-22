@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::vortix_core::ports::process::{
     CommandOutcome, CommandRunner as Trait, CommandSpec, DetachedHandle, ExitStatusInfo,
-    ProcessError,
+    ProcessCredentials, ProcessError,
 };
 
 /// What a recorded invocation looks like.
@@ -21,6 +21,11 @@ pub struct RecordedInvocation {
     pub program: String,
     pub args: Vec<String>,
     pub kind: crate::vortix_core::ports::process::Kind,
+    pub env: std::collections::HashMap<String, String>,
+    pub env_clear: bool,
+    pub run_as: Option<ProcessCredentials>,
+    pub terminate_process_group: bool,
+    pub redact_in_audit: Vec<usize>,
 }
 
 /// Matches a `CommandSpec` against expected criteria.
@@ -270,6 +275,11 @@ impl MockRunner {
             program: spec.program.clone(),
             args: spec.args.clone(),
             kind: spec.kind,
+            env: spec.env.clone(),
+            env_clear: spec.env_clear,
+            run_as: spec.run_as.clone(),
+            terminate_process_group: spec.terminate_process_group,
+            redact_in_audit: spec.redact_in_audit.clone(),
         });
 
         if inner.default_success {
