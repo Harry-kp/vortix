@@ -25,8 +25,10 @@ trap cleanup EXIT
 # Bring up the peer side first (the "server").
 ip netns exec "$NS_A" wg-quick up "$FIXTURE_DIR/wg-a.conf"
 
-# Place the client profile in vortix's profile dir + drive it via the CLI.
+# Place both client profiles before the first vortix invocation so the
+# identity migration inventories the complete fixture set atomically.
 cp "$FIXTURE_DIR/wg-b.conf" "$PROFILE_DIR/integration.conf"
+cp "$FIXTURE_DIR/wg-b.conf" "$PROFILE_DIR/unreachable.conf"
 cat >"$CONFIG_DIR/config.toml" <<'EOF'
 ping_targets = ["10.99.99.1"]
 wireguard_handshake_timeout_secs = 4
@@ -53,7 +55,6 @@ ip netns exec "$NS_B" target/release/vortix down
 # Interface creation is not success: an unreachable peer must stay
 # Handshaking, fail the bounded gate, and leave no owned interface behind.
 ip netns exec "$NS_A" wg-quick down "$FIXTURE_DIR/wg-a.conf"
-cp "$FIXTURE_DIR/wg-b.conf" "$PROFILE_DIR/unreachable.conf"
 set +e
 ip netns exec "$NS_B" target/release/vortix up unreachable >"$CONFIG_DIR/unreachable.log" 2>&1 &
 UP_PID=$!
