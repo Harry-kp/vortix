@@ -198,12 +198,15 @@ fn spawn_hidden_until_ready(
 
 fn wait_for_group_absence(pid: u32) {
     for _ in 0..200 {
-        if !group_exists(pid) {
+        if !group_has_live_members(pid) {
             return;
         }
         thread::sleep(Duration::from_millis(10));
     }
-    assert!(!group_exists(pid), "process group {pid} remained alive");
+    assert!(
+        !group_has_live_members(pid),
+        "process group {pid} retained a live member"
+    );
 }
 
 struct EnvGuard;
@@ -219,12 +222,62 @@ fn real_identity(profile_byte: char) -> ManagedProcessId {
     ManagedProcessId::generate(ProfileId::new(profile_byte.to_string().repeat(64))).unwrap()
 }
 
-fn group_exists(pid: u32) -> bool {
+fn group_has_live_members(pid: u32) -> bool {
+    // `kill(-pgid, 0)` reports zombie-only groups as present. That is useful
+    // for raw existence checks but wrong for leak detection after abrupt
+    // custodian death, where the orphaned guardian is already dead and only
+    // awaiting OS reaping. Prefer a process-state snapshot and fall back to
+    // the signal probe when `ps` is unavailable.
+    if let Ok(output) = Command::new("ps").args(["-axo", "pgid=,stat="]).output() {
+        if output.status.success() {
+            let text = String::from_utf8_lossy(&output.stdout);
+            return text.lines().any(|line| {
+                let mut fields = line.split_whitespace();
+                let member_group = fields.next().and_then(|value| value.parse::<u32>().ok());
+                let state = fields.next();
+                member_group == Some(pid) && state.is_some_and(|value| !value.starts_with('Z'))
+            });
+        }
+    }
+
     let pid = i32::try_from(pid).unwrap();
     // SAFETY: signal zero is an existence probe for the process group.
     #[allow(unsafe_code)]
     let result = unsafe { libc::kill(-pid, 0) };
     result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[test]
+fn zombie_only_process_group_is_not_a_live_leak() {
+    use std::os::unix::process::CommandExt as _;
+
+    if std::env::var_os("CODEX_SANDBOX").is_some() {
+        eprintln!("skipping process-state test inside the Codex seatbelt sandbox");
+        return;
+    }
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "exit 0"])
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let mut state = String::new();
+    for _ in 0..200 {
+        let status = Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        state = String::from_utf8(status.stdout).unwrap();
+        if state.trim_start().starts_with('Z') {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(state.trim_start().starts_with('Z'), "state was {state:?}");
+    let reported_alive = group_has_live_members(pid);
+    child.wait().unwrap();
+
+    assert!(!reported_alive, "a zombie-only group is not a live leak");
 }
 
 #[test]
@@ -273,9 +326,9 @@ fn real_tunnel_scoped_custodians_handoff_authenticate_and_contain_groups() {
     };
     wrong.ownership_token.replace_range(63..64, replacement);
     assert!(vortix::vortix_process::status_managed_foreground(&wrong).is_err());
-    assert!(group_exists(handshake.pid));
+    assert!(group_has_live_members(handshake.pid));
     vortix::vortix_process::stop_managed_foreground(&first).unwrap();
-    assert!(!group_exists(handshake.pid));
+    assert!(!group_has_live_members(handshake.pid));
     assert!(vortix::vortix_process::status_managed_foreground(&first).is_err());
 
     // A stale capability cannot stop a newer attempt for the same profile.
@@ -325,7 +378,7 @@ fn real_tunnel_scoped_custodians_handoff_authenticate_and_contain_groups() {
     .unwrap();
     thread::sleep(Duration::from_millis(50));
     vortix::vortix_process::stop_managed_foreground(&stubborn).unwrap();
-    assert!(!group_exists(stubborn_handshake.pid));
+    assert!(!group_has_live_members(stubborn_handshake.pid));
 
     // Natural exit releases the exact receipt and permits reconnect.
     let natural = real_identity('e');
@@ -392,7 +445,7 @@ fn real_tunnel_scoped_custodians_handoff_authenticate_and_contain_groups() {
     drop(hidden_stdin);
     assert!(!hidden.wait().unwrap().success());
     wait_for_group_absence(group_pid);
-    assert!(!group_exists(child_pid));
+    assert!(!group_has_live_members(child_pid));
 
     // Signals are installed before spawn and the READY/COMMIT wait polls the
     // termination flag. Keep stdin open to prove SIGTERM, rather than EOF,
@@ -441,7 +494,7 @@ fn real_tunnel_scoped_custodians_handoff_authenticate_and_contain_groups() {
     let mut committed = String::new();
     output.read_line(&mut committed).unwrap();
     assert!(committed.contains("\"type\":\"committed\""));
-    assert!(group_exists(group_pid));
+    assert!(group_has_live_members(group_pid));
     hidden.kill().unwrap();
     let _ = hidden.wait();
     wait_for_group_absence(group_pid);
