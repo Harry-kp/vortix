@@ -163,13 +163,35 @@ impl ProtectionEvidence {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ObservedState {
     pub evidence: Option<ProtectionEvidence>,
     /// Authority-clock receipt time for the current protection evidence.
     pub evidence_received_at_millis: Option<u64>,
     /// Observer-owned tunnel facts. They never overwrite desired intent.
     pub tunnels: BTreeMap<ProfileId, ObservedTunnel>,
+    /// Protocol-authoritative `WireGuard` evidence, fenced to the current
+    /// desired generation. Scanner presence can never populate this map.
+    #[serde(default)]
+    pub wireguard_handshakes:
+        BTreeMap<ProfileId, crate::vortix_core::ports::tunnel::HandshakeEvidence>,
+    /// Per-peer probes issued by the exact successful protocol attempt.
+    #[serde(default)]
+    pub wireguard_probe_receipts:
+        BTreeMap<ProfileId, Vec<crate::vortix_core::ports::tunnel::ProbeReceipt>>,
+    /// Ongoing typed health fenced to the successful desired generation.
+    /// Snapshot subscribers consume this same record as CLI/TUI projections.
+    #[serde(default)]
+    pub connection_health: BTreeMap<ProfileId, ObservedConnectionHealth>,
+}
+
+/// Generation-consistent ongoing health published by the control owner.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ObservedConnectionHealth {
+    pub desired_generation: u64,
+    pub health: ConnectionHealth,
+    pub observed_at_millis: u64,
+    pub received_at_millis: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -249,6 +271,9 @@ pub enum OperationStatus {
 pub enum OperationFailure {
     Timeout,
     Rejected,
+    /// A managed `WireGuard` attempt failed its cryptographic liveness gate
+    /// after exact-attempt cleanup was confirmed.
+    HandshakeFailed,
     ObservationFailed,
     Internal,
 }
@@ -303,7 +328,7 @@ pub struct OperationCompletion {
     pub outcome: CompletionOutcome,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Observation {
     Protection(ProtectionEvidence),
     Tunnel {
@@ -321,6 +346,14 @@ pub enum Observation {
         gates: DriftGates,
         observed_at_millis: u64,
         protection: Option<ProtectionEvidence>,
+    },
+    /// Typed ongoing tunnel health. It cannot create connection truth and is
+    /// accepted only for the current desired generation.
+    ConnectionHealth {
+        profile_id: ProfileId,
+        desired_generation: u64,
+        health: ConnectionHealth,
+        observed_at_millis: u64,
     },
 }
 
@@ -396,6 +429,12 @@ pub enum ControlEvent {
     HandshakeStale {
         profile_id: ProfileId,
         seconds_since_last_handshake: u64,
+    },
+    WireGuardHandshakeObserved {
+        profile_id: ProfileId,
+        desired_generation: u64,
+        handshake_at_millis: u64,
+        observed_at_millis: u64,
     },
     ConnectionHealthChanged {
         profile_id: ProfileId,

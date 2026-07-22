@@ -27,8 +27,10 @@ pub enum SigilId {
     /// `●` muted/dim — Connected but iface attribution is unreliable
     /// (e.g., externally-started `OpenVPN` on macOS multi-tunnel).
     ConnectedUnauthoritative,
-    /// `◐` yellow — Connecting (handshake in flight).
+    /// `◐` yellow — `OpenVPN` process/authentication setup in flight.
     Connecting,
+    /// `◐` yellow — `WireGuard` awaits current-attempt peer evidence.
+    Handshaking,
     /// `↻` yellow dim — Reconnecting after a drop.
     Reconnecting,
     /// `◑` yellow — Disconnecting (teardown in flight).
@@ -142,8 +144,18 @@ pub const CATALOG: &[Sigil] = &[
     Sigil {
         id: SigilId::Connecting,
         glyph: "\u{25d0}",
-        label: "Connecting",
-        description: "Handshake in flight. Auto-times-out per the configured connect_timeout if the protocol layer doesn't report success.",
+        label: "Connecting (OpenVPN)",
+        description: "OpenVPN process startup and authentication are still in progress.",
+        color: theme::WARNING,
+        bold: false,
+        dim: false,
+        category: SigilCategory::Sidebar,
+    },
+    Sigil {
+        id: SigilId::Handshaking,
+        glyph: "\u{25d0}",
+        label: "Handshaking (WireGuard)",
+        description: "WireGuard waits for current-attempt peer evidence and cleans up after the configured handshake timeout.",
         color: theme::WARNING,
         bold: false,
         dim: false,
@@ -270,6 +282,7 @@ mod tests {
             SigilId::Connected,
             SigilId::ConnectedUnauthoritative,
             SigilId::Connecting,
+            SigilId::Handshaking,
             SigilId::Reconnecting,
             SigilId::Disconnecting,
             SigilId::AwaitingInput,
@@ -292,6 +305,7 @@ mod tests {
                 SigilId::Connected => (),
                 SigilId::ConnectedUnauthoritative => (),
                 SigilId::Connecting => (),
+                SigilId::Handshaking => (),
                 SigilId::Reconnecting => (),
                 SigilId::Disconnecting => (),
                 SigilId::AwaitingInput => (),

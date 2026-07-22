@@ -14,6 +14,7 @@
 //! See `vortix_platform_macos/route_table.rs` for the cross-platform
 //! rationale and the choice of 8.8.8.8 as the probe target.
 
+use std::net::IpAddr;
 use std::time::Duration;
 
 use crate::platform::route_probe::{ProbeOutcome, RouteProbe};
@@ -50,6 +51,25 @@ impl RouteTable for LinuxRouteTable {
         let Some(text) = run_ip_route_show_default() else {
             return DefaultRouteObservation::ProbeFailed;
         };
+        parse_interface(&text).map_or(
+            DefaultRouteObservation::NoDefaultRoute,
+            DefaultRouteObservation::Interface,
+        )
+    }
+
+    fn route_interface_for(target: IpAddr) -> DefaultRouteObservation {
+        let spec =
+            // xtask:allow-shell-regression: `ip route get <target>` is the supported Linux route-selection proof; no existing libc port exposes policy-routing resolution.
+            CommandSpec::oneshot("ip", vec!["route".into(), "get".into(), target.to_string()])
+                .timeout(ROUTE_QUERY_TIMEOUT)
+                .output_limit(64 * 1024);
+        let Ok(output) = crate::vortix_process::run_to_output(spec) else {
+            return DefaultRouteObservation::ProbeFailed;
+        };
+        if !output.status.success() {
+            return DefaultRouteObservation::ProbeFailed;
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
         parse_interface(&text).map_or(
             DefaultRouteObservation::NoDefaultRoute,
             DefaultRouteObservation::Interface,

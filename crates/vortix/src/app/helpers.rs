@@ -91,6 +91,9 @@ impl App {
                         transfer_rx: details.transfer_rx.clone(),
                         transfer_tx: details.transfer_tx.clone(),
                         latest_handshake: details.latest_handshake.clone(),
+                        generation: details.generation,
+                        handshake: details.handshake.clone(),
+                        probe_receipts: details.probe_receipts.clone(),
                         pid: details.pid,
                     }),
                 }

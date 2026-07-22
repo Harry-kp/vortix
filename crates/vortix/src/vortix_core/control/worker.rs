@@ -13,7 +13,10 @@ use std::time::{Duration, Instant};
 
 use crate::vortix_core::cidr::Cidr;
 use crate::vortix_core::control::model::{AuthorityEpoch, OperationId, PolicyDigest};
-use crate::vortix_core::ports::tunnel::{AdoptionEvidence, TunnelKindTag};
+pub use crate::vortix_core::ports::tunnel::TunnelCancellation as CancellationToken;
+use crate::vortix_core::ports::tunnel::{
+    AdoptionEvidence, HandshakeEvidence, ProbeReceipt, TunnelKindTag,
+};
 use crate::vortix_core::profile::ProfileId;
 use crate::vortix_core::state::killswitch::KillSwitchMode;
 
@@ -39,6 +42,7 @@ pub struct TunnelWork {
     pub authority_epoch: AuthorityEpoch,
     pub policy_digest: PolicyDigest,
     pub mutation: TunnelMutation,
+    pub protocol: TunnelKindTag,
     pub deadline: Instant,
 }
 
@@ -61,6 +65,8 @@ pub enum WorkFailure {
     Cancelled,
     Panicked,
     EffectFailed,
+    /// `WireGuard` connect returned without exact current-generation peer proof.
+    HandshakeFailed,
     /// The effect may have happened but no trustworthy receipt was obtained.
     OutcomeUnknown,
     Stale,
@@ -79,27 +85,16 @@ pub struct TunnelWorkResult {
     /// Protocol-authoritative identity produced by the exact successful
     /// connect call. Scanner presence alone can never manufacture this.
     pub adoption: Option<AdoptionEvidence>,
+    pub handshake: Option<HandshakeEvidence>,
+    pub probe_receipts: Vec<ProbeReceipt>,
     pub result: Result<(), WorkFailure>,
-}
-
-/// Cooperative cancellation visible to deterministic and real executors.
-#[derive(Debug, Clone, Default)]
-pub struct CancellationToken(Arc<AtomicBool>);
-
-impl CancellationToken {
-    pub fn cancel(&self) {
-        self.0.store(true, Ordering::Release);
-    }
-
-    #[must_use]
-    pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Acquire)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TunnelExecutionReceipt {
     pub adoption: Option<AdoptionEvidence>,
+    pub handshake: Option<HandshakeEvidence>,
+    pub probe_receipts: Vec<ProbeReceipt>,
 }
 
 impl TunnelExecutionReceipt {
@@ -114,8 +109,39 @@ impl TunnelExecutionReceipt {
         AdoptionEvidence::attest(profile_id, interface_name, kind, pid, protocol_attestation)
             .map(|adoption| Self {
                 adoption: Some(adoption),
+                handshake: None,
+                probe_receipts: Vec::new(),
             })
             .map_err(|error| error.to_string())
+    }
+
+    /// Construct a `WireGuard` receipt whose adoption and cryptographic proof
+    /// are bound to the exact worker generation.
+    pub fn wireguard(
+        profile_id: ProfileId,
+        interface_name: impl Into<String>,
+        attestation: impl Into<String>,
+        handshake: HandshakeEvidence,
+    ) -> Result<Self, String> {
+        AdoptionEvidence::attest(
+            profile_id,
+            interface_name,
+            TunnelKindTag::WireGuard,
+            None,
+            attestation,
+        )
+        .map(|adoption| Self {
+            adoption: Some(adoption),
+            handshake: Some(handshake),
+            probe_receipts: Vec::new(),
+        })
+        .map_err(|error| error.to_string())
+    }
+
+    #[must_use]
+    pub fn with_probe_receipts(mut self, receipts: Vec<ProbeReceipt>) -> Self {
+        self.probe_receipts = receipts;
+        self
     }
 }
 
@@ -125,6 +151,25 @@ pub trait TunnelExecutor: Send + Sync + 'static {
         work: &TunnelWork,
         cancellation: &CancellationToken,
     ) -> Result<TunnelExecutionReceipt, String>;
+
+    /// Classify a concrete executor error without exposing protocol strings to
+    /// the supervisor. Existing deterministic fakes keep `EffectFailed`.
+    fn classify_failure(&self, _error: &str) -> WorkFailure {
+        WorkFailure::EffectFailed
+    }
+
+    /// Compensate a successful effect that lost the final cancellation or
+    /// deadline race before its receipt could be accepted.
+    fn compensate_late_success(&self, _work: &TunnelWork) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Fence an effect whose executor panicked or returned a malformed
+    /// receipt after dispatch. The default cannot prove absence and is
+    /// intentionally fail-closed.
+    fn compensate_uncertain(&self, _work: &TunnelWork) -> Result<(), String> {
+        Err("executor cannot prove uncertain-effect absence".into())
+    }
 }
 
 /// Canonical, host-bit-normalized route claim.
@@ -220,6 +265,9 @@ impl ReservationBook {
             .iter_mut()
             .find(|(_, lease)| lease.profile_id == *profile_id && lease.routes == routes)
         {
+            if lease.ambiguous {
+                return Err(WorkFailure::Busy);
+            }
             lease.refs = lease.refs.saturating_add(1);
             return Ok(Reservation {
                 book: self.clone(),
@@ -694,6 +742,10 @@ fn spawn_profile_worker(
                 let lease_id = envelope.reservation.lease_id();
                 let result = execution.as_ref().map(|_| ()).map_err(|error| *error);
                 envelope.reservation.finish(work.mutation, result);
+                let (adoption, handshake, probe_receipts) = execution
+                    .map_or((None, None, Vec::new()), |receipt| {
+                        (receipt.adoption, receipt.handshake, receipt.probe_receipts)
+                    });
                 let completion = TunnelWorkResult {
                     profile_id: work.profile_id,
                     operation_id: work.operation_id,
@@ -702,7 +754,9 @@ fn spawn_profile_worker(
                     policy_digest: work.policy_digest,
                     lease_id,
                     mutation: work.mutation,
-                    adoption: execution.ok().and_then(|receipt| receipt.adoption),
+                    adoption,
+                    handshake,
+                    probe_receipts,
                     result,
                 };
                 // A per-profile latest terminal slot is bounded by the worker
@@ -734,17 +788,46 @@ fn run_tunnel_effect(
     if Instant::now() >= work.deadline {
         return Err(WorkFailure::TimedOut);
     }
-    let result = panic::catch_unwind(AssertUnwindSafe(|| executor.execute(work, cancellation)))
-        .map_err(|_| WorkFailure::Panicked)?
-        .map_err(|_| WorkFailure::EffectFailed)?;
+    let result =
+        match panic::catch_unwind(AssertUnwindSafe(|| executor.execute(work, cancellation))) {
+            Ok(Ok(receipt)) => receipt,
+            Ok(Err(error)) => return Err(executor.classify_failure(&error)),
+            Err(_) => {
+                return match executor.compensate_uncertain(work) {
+                    Ok(()) => Err(WorkFailure::Panicked),
+                    Err(_) => Err(WorkFailure::OutcomeUnknown),
+                };
+            }
+        };
     if stopping.load(Ordering::Acquire) || cancellation.is_cancelled() {
-        return Err(WorkFailure::Cancelled);
+        return match executor.compensate_late_success(work) {
+            Ok(()) => Err(WorkFailure::Cancelled),
+            Err(_) => Err(WorkFailure::OutcomeUnknown),
+        };
     }
     if Instant::now() >= work.deadline {
-        return Err(WorkFailure::TimedOut);
+        return match executor.compensate_late_success(work) {
+            Ok(()) => Err(WorkFailure::TimedOut),
+            Err(_) => Err(WorkFailure::OutcomeUnknown),
+        };
     }
     if work.mutation == TunnelMutation::Connect && result.adoption.is_none() {
-        return Err(WorkFailure::EffectFailed);
+        return match executor.compensate_uncertain(work) {
+            Ok(()) => Err(WorkFailure::EffectFailed),
+            Err(_) => Err(WorkFailure::OutcomeUnknown),
+        };
+    }
+    if work.mutation == TunnelMutation::Connect
+        && work.protocol == TunnelKindTag::WireGuard
+        && result
+            .handshake
+            .as_ref()
+            .is_none_or(|evidence| evidence.generation != work.generation)
+    {
+        return match executor.compensate_uncertain(work) {
+            Ok(()) => Err(WorkFailure::HandshakeFailed),
+            Err(_) => Err(WorkFailure::OutcomeUnknown),
+        };
     }
     Ok(result)
 }

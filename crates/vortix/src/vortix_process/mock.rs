@@ -191,17 +191,27 @@ impl MockRunner {
                 stdout,
                 stderr,
                 exit_code,
-            } => Ok(CommandOutcome {
-                stdout,
-                stderr,
-                exit_status: ExitStatusInfo {
-                    code: Some(exit_code),
-                    signal: None,
-                    success: exit_code == 0,
-                },
-                duration: Duration::from_millis(1),
-                started_at: SystemTime::now(),
-            }),
+            } => {
+                if let Some(limit) = spec.output_limit {
+                    if stdout.len() > limit || stderr.len() > limit {
+                        return Err(ProcessError::OutputLimitExceeded {
+                            program: spec.program,
+                            limit,
+                        });
+                    }
+                }
+                Ok(CommandOutcome {
+                    stdout,
+                    stderr,
+                    exit_status: ExitStatusInfo {
+                        code: Some(exit_code),
+                        signal: None,
+                        success: exit_code == 0,
+                    },
+                    duration: Duration::from_millis(1),
+                    started_at: SystemTime::now(),
+                })
+            }
             ScriptedOutcome::Failure(stderr) => Err(ProcessError::NonZeroExit {
                 program: spec.program,
                 code: Some(1),
@@ -355,6 +365,27 @@ mod tests {
             .run(CommandSpec::oneshot("wg-quick", vec!["up".into()]))
             .await;
         assert!(matches!(result, Err(ProcessError::NonZeroExit { .. })));
+    }
+
+    #[tokio::test]
+    async fn explicit_output_limit_rejects_oversized_capture() {
+        let runner = MockRunner::new();
+        runner.expect(
+            SpecMatcher::ExactProgram("wg".into()),
+            ScriptedOutcome::Success {
+                stdout: vec![b'x'; 17],
+                stderr: Vec::new(),
+                exit_code: 0,
+            },
+        );
+        // xtask:allow-protocol-leak: mock-runner bound test, not a real wg invocation
+        let result = runner
+            .run(CommandSpec::oneshot("wg", Vec::new()).output_limit(16))
+            .await;
+        assert!(matches!(
+            result,
+            Err(ProcessError::OutputLimitExceeded { limit: 16, .. })
+        ));
     }
 
     #[tokio::test]

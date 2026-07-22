@@ -13,7 +13,7 @@ use crate::vortix_core::ports::process::{
     CommandOutcome, CommandRunner as Trait, CommandSpec, DetachedHandle, ExitStatusInfo, Kind,
     ManagedProcessId, PrivilegeReq, ProcessError, ProcessLifecycle, ProcessOwnership,
 };
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::runtime::Runtime;
 use tracing::{debug, info, warn};
@@ -28,6 +28,25 @@ use tracing::{debug, info, warn};
 #[derive(Debug, Clone)]
 pub struct RealRunner {
     runtime: Arc<Runtime>,
+}
+
+async fn drain_bounded(
+    mut stream: impl AsyncRead + Unpin,
+    limit: usize,
+) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut retained = Vec::with_capacity(limit.min(8192));
+    let mut overflowed = false;
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let read = stream.read(&mut chunk).await?;
+        if read == 0 {
+            return Ok((retained, overflowed));
+        }
+        let remaining = limit.saturating_sub(retained.len());
+        let keep = remaining.min(read);
+        retained.extend_from_slice(&chunk[..keep]);
+        overflowed |= keep != read;
+    }
 }
 
 /// Real foreground-child backend. Each child is placed in its own process
@@ -567,6 +586,63 @@ impl Trait for RealRunner {
                 })?
             };
             (status, Vec::new(), Vec::new())
+        } else if let Some(limit) = spec.output_limit {
+            let stdout = child.stdout.take().ok_or_else(|| ProcessError::IoError {
+                program: spec.program.clone(),
+                source: std::io::Error::other("child stdout pipe unavailable"),
+            })?;
+            let stderr = child.stderr.take().ok_or_else(|| ProcessError::IoError {
+                program: spec.program.clone(),
+                source: std::io::Error::other("child stderr pipe unavailable"),
+            })?;
+            let stdout_task = tokio::spawn(drain_bounded(stdout, limit));
+            let stderr_task = tokio::spawn(drain_bounded(stderr, limit));
+            let status = if let Some(timeout) = spec.timeout {
+                let Ok(result) = tokio::time::timeout(timeout, child.wait()).await else {
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    return Err(ProcessError::Timeout {
+                        program: spec.program.clone(),
+                        duration: timeout,
+                    });
+                };
+                result.map_err(|source| ProcessError::IoError {
+                    program: spec.program.clone(),
+                    source,
+                })?
+            } else {
+                child.wait().await.map_err(|source| ProcessError::IoError {
+                    program: spec.program.clone(),
+                    source,
+                })?
+            };
+            let (stdout, stdout_overflow) = stdout_task
+                .await
+                .map_err(|error| ProcessError::IoError {
+                    program: spec.program.clone(),
+                    source: std::io::Error::other(error.to_string()),
+                })?
+                .map_err(|source| ProcessError::IoError {
+                    program: spec.program.clone(),
+                    source,
+                })?;
+            let (stderr, stderr_overflow) = stderr_task
+                .await
+                .map_err(|error| ProcessError::IoError {
+                    program: spec.program.clone(),
+                    source: std::io::Error::other(error.to_string()),
+                })?
+                .map_err(|source| ProcessError::IoError {
+                    program: spec.program.clone(),
+                    source,
+                })?;
+            if stdout_overflow || stderr_overflow {
+                return Err(ProcessError::OutputLimitExceeded {
+                    program: spec.program.clone(),
+                    limit,
+                });
+            }
+            (status, stdout, stderr)
         } else {
             let output = if let Some(timeout) = spec.timeout {
                 let Ok(result) = tokio::time::timeout(timeout, child.wait_with_output()).await

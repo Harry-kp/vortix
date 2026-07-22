@@ -55,6 +55,10 @@ pub struct CommandSpec {
     pub cwd: Option<PathBuf>,
     pub stdin_bytes: Option<Vec<u8>>,
     pub timeout: Option<Duration>,
+    /// Maximum bytes retained from each captured output stream. The runner
+    /// continues draining the child after the limit so a noisy process cannot
+    /// deadlock on a full pipe, then returns a typed overflow error.
+    pub output_limit: Option<usize>,
     pub requires_privilege: PrivilegeReq,
     pub kind: Kind,
     /// Arg indices to redact in `tracing` audit logs. Used by callers that pass
@@ -89,6 +93,7 @@ impl CommandSpec {
             cwd: None,
             stdin_bytes: None,
             timeout: None,
+            output_limit: None,
             requires_privilege: PrivilegeReq::None,
             kind: Kind::OneShot,
             redact_in_audit: Vec::new(),
@@ -115,6 +120,13 @@ impl CommandSpec {
     #[must_use]
     pub fn timeout(mut self, duration: Duration) -> Self {
         self.timeout = Some(duration);
+        self
+    }
+
+    /// Builder: bound each captured stdout/stderr stream.
+    #[must_use]
+    pub fn output_limit(mut self, bytes: usize) -> Self {
+        self.output_limit = Some(bytes);
         self
     }
 
@@ -273,6 +285,9 @@ pub enum ProcessError {
     /// The subprocess did not complete within the configured timeout.
     #[error("subprocess `{program}` timed out after {duration:?}")]
     Timeout { program: String, duration: Duration },
+    /// A captured stream exceeded the caller's explicit memory bound.
+    #[error("subprocess `{program}` output exceeded {limit} bytes")]
+    OutputLimitExceeded { program: String, limit: usize },
     /// The subprocess exited non-zero.
     #[error("subprocess `{program}` exited with code {code:?}")]
     NonZeroExit {

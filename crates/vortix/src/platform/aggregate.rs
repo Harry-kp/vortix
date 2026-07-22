@@ -499,6 +499,30 @@ impl RouteTableKind {
             .interface()
             .map(ToOwned::to_owned)
     }
+
+    /// Tri-state route selected by the kernel for one concrete destination.
+    #[must_use]
+    pub fn route_interface_for(
+        &self,
+        target: std::net::IpAddr,
+    ) -> crate::vortix_core::ports::route_table::DefaultRouteObservation {
+        use crate::vortix_core::ports::route_table::RouteTable;
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Macos => platform_impl::MacRouteTable::route_interface_for(target),
+            #[cfg(target_os = "linux")]
+            Self::Linux => platform_impl::LinuxRouteTable::route_interface_for(target),
+            #[cfg(target_os = "windows")]
+            Self::Windows => platform_impl::WindowsRouteTable::route_interface_for(target),
+            Self::Mock(m) if m.probe_failed => {
+                crate::vortix_core::ports::route_table::DefaultRouteObservation::ProbeFailed
+            }
+            Self::Mock(m) => m.interface.clone().map_or(
+                crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
+                crate::vortix_core::ports::route_table::DefaultRouteObservation::Interface,
+            ),
+        }
+    }
 }
 
 /// Scriptable mock for the `SocketAudit` port.

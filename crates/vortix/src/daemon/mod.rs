@@ -49,7 +49,7 @@ pub fn build_engine_handle(
     profiles_dir: &Path,
 ) -> Option<crate::vortix_core::engine::EngineHandle> {
     use crate::state::Protocol;
-    use crate::tunnel::{tunnel_for, TunnelKind};
+    use crate::tunnel::{tunnel_for_with_wireguard_policy, TunnelKind};
     use crate::vortix_config::profile_store::{FsProfileStore, ProfileStore};
     use crate::vortix_core::engine::{Engine, EngineHandle};
     use crate::vortix_core::profile::{ProfileId, ProtocolKind};
@@ -75,16 +75,33 @@ pub fn build_engine_handle(
     // profile's protocol. Wired up with the profile store.
     let factory_config_dir =
         crate::utils::get_app_config_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
+    let app_config = crate::config::load_effective_config(&factory_config_dir).ok()?;
+    let factory_config = app_config.clone();
     let factory = move |profile: &crate::vortix_core::profile::Profile| {
         let proto = match profile.protocol {
             ProtocolKind::OpenVpn => Protocol::OpenVPN,
             // Default to WireGuard for any future variants.
             _ => Protocol::WireGuard,
         };
-        tunnel_for(proto, &factory_config_dir, "3", 30)
+        tunnel_for_with_wireguard_policy(
+            proto,
+            &factory_config_dir,
+            &factory_config.openvpn_verbosity,
+            factory_config.connect_timeout,
+            factory_config.wireguard_handshake_timeout_secs,
+            &factory_config.ping_targets,
+        )
     };
 
-    let initial_tunnel = TunnelKind::WireGuard(WgTunnel::new());
+    let initial_tunnel = TunnelKind::WireGuard(
+        WgTunnel::new().with_handshake_policy(
+            std::time::Duration::from_secs(app_config.wireguard_handshake_timeout_secs),
+            app_config
+                .ping_targets
+                .iter()
+                .filter_map(|target| target.parse().ok()),
+        ),
+    );
     let engine = Engine::new(initial_tunnel, resolver).with_tunnel_factory(factory);
     Some(EngineHandle::local(engine, journal))
 }

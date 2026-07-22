@@ -26,7 +26,7 @@ impl Default for ServiceReadiness {
 }
 
 /// Complete bounded view consumed by CLI/TUI clients.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ControlSnapshot {
     /// Monotonically increasing publication generation.
     pub generation: u64,

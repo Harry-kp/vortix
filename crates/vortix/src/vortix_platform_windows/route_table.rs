@@ -19,4 +19,8 @@ impl RouteTable for WindowsRouteTable {
         // `GetIpForwardTable2` and read `InterfaceAlias` / `InterfaceLuid`.
         DefaultRouteObservation::ProbeFailed
     }
+
+    fn route_interface_for(_target: std::net::IpAddr) -> DefaultRouteObservation {
+        DefaultRouteObservation::ProbeFailed
+    }
 }

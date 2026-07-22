@@ -12,7 +12,7 @@ use serde::Serialize;
 use crate::cli::args::Commands;
 use crate::cli::output::{
     err_not_found, err_permission_denied, print_error_and_exit, print_success, CliError,
-    ConnectionEntry, ExitCode, OutputMode,
+    ConnectionEntry, ConnectionHealthEntry, ExitCode, OutputMode,
 };
 use crate::config::AppConfig;
 use crate::constants;
@@ -1030,23 +1030,26 @@ fn handle_status(
     }
 
     let is_connected = snap.connection_state == "connected";
+    let is_present = snap.connection_state != "disconnected";
 
     // Transitional shape: the registry-driven multi-tunnel snapshot
     // lands later. Until then, "primary" is the single active tunnel
     // (when connected), and `connections` is a one-element vec mirroring
     // it. When disconnected, `connections` is empty and `primary` /
     // `connection` are both `null`.
-    let primary_entry = if is_connected {
+    let visible_entry = if is_present {
         Some(ConnectionEntry {
             state: snap.connection_state.clone(),
             profile: snap.profile.clone(),
             protocol: snap.protocol.clone(),
             uptime_secs: snap.uptime_secs,
+            health: snap.health.as_ref().map(connection_health_entry),
+            generation: snap.generation,
         })
     } else {
         None
     };
-    let connections: Vec<ConnectionEntry> = primary_entry.iter().cloned().collect();
+    let connections: Vec<ConnectionEntry> = visible_entry.iter().cloned().collect();
     let primary: Option<String> = if is_connected {
         snap.profile.clone()
     } else {
@@ -1056,7 +1059,11 @@ fn handle_status(
     let data = StatusData {
         connections,
         primary,
-        connection: primary_entry,
+        connection: if is_connected {
+            visible_entry.clone()
+        } else {
+            None
+        },
         network: if is_connected {
             Some(StatusNetwork {
                 server: snap.server.clone(),
@@ -1077,17 +1084,11 @@ fn handle_status(
     match mode {
         OutputMode::Human => {
             if brief {
-                if is_connected {
-                    let profile = snap.profile.as_deref().unwrap_or("unknown");
-                    let proto = snap.protocol.as_deref().unwrap_or("");
-                    println!("● Connected to {profile} ({proto})");
-                } else {
-                    println!("○ Disconnected");
-                }
+                println!("{}", human_status_headline(&snap));
             } else if is_connected {
                 let profile = snap.profile.as_deref().unwrap_or("unknown");
-                let proto = snap.protocol.as_deref().unwrap_or("");
-                println!("● Connected to {profile} ({proto})");
+                let protocol = snap.protocol.as_deref().unwrap_or("");
+                println!("● Connected to {profile} ({protocol})");
                 println!();
                 if let Some(s) = &snap.server {
                     println!("  Server       {s}");
@@ -1115,8 +1116,11 @@ fn handle_status(
                     snap.killswitch_mode.display_name(),
                     snap.killswitch_state.display_status()
                 );
+                if let Some(health) = &snap.health {
+                    println!("  Health       {}", connection_health_human(health));
+                }
             } else {
-                println!("○ Disconnected");
+                println!("{}", human_status_headline(&snap));
                 println!();
                 println!(
                     "  Kill Switch  {} ({})",
@@ -1126,7 +1130,7 @@ fn handle_status(
             }
         }
         OutputMode::Json => {
-            let next = if is_connected {
+            let next = if is_present {
                 vec![
                     "sudo vortix down --json".into(),
                     "vortix list --json".into(),
@@ -1141,7 +1145,25 @@ fn handle_status(
         }
         OutputMode::Quiet => {}
     }
-    0
+    status_exit_code(mode, &snap)
+}
+
+fn status_exit_code(
+    mode: OutputMode,
+    snap: &crate::vpn_runtime::connection::StatusSnapshot,
+) -> i32 {
+    if mode == OutputMode::Quiet
+        && snap.health.as_ref().is_some_and(|health| {
+            matches!(
+                health,
+                crate::vortix_core::engine::state::ConnectionHealth::Degraded { .. }
+            )
+        })
+    {
+        ExitCode::StateConflict.code()
+    } else {
+        ExitCode::Success.code()
+    }
 }
 
 /// Merge an authoritative `Connection` from the daemon onto a
@@ -1158,13 +1180,13 @@ fn overlay_daemon_state(
     profiles: &[crate::state::VpnProfile],
 ) {
     use crate::vortix_core::engine::state::Connection;
-    let display_name = |id: &crate::vortix_core::profile::ProfileId| {
+    let profile_projection = |id: &crate::vortix_core::profile::ProfileId| {
         profiles
             .iter()
             .find(|profile| &profile.id == id)
             .map_or_else(
-                || format!("ProfileMissing:{id}"),
-                |profile| profile.name.clone(),
+                || (format!("ProfileMissing:{id}"), None),
+                |profile| (profile.name.clone(), Some(profile.protocol.to_string())),
             )
     };
     match state {
@@ -1174,21 +1196,46 @@ fn overlay_daemon_state(
             snap.protocol = None;
             snap.uptime_secs = None;
         }
-        Connection::Connecting { profile_id, .. }
-        | Connection::Reconnecting { profile_id, .. }
-        | Connection::AwaitingUserInput { profile_id, .. } => {
-            snap.connection_state = "connecting".into();
-            snap.profile = Some(display_name(profile_id));
+        Connection::Connecting { profile_id, .. } => {
+            let (name, protocol) = profile_projection(profile_id);
+            snap.connection_state = if protocol.as_deref() == Some("WireGuard") {
+                "handshaking".into()
+            } else {
+                "connecting".into()
+            };
+            snap.profile = Some(name);
+            snap.protocol = protocol;
+        }
+        Connection::Reconnecting { profile_id, .. } => {
+            let (name, protocol) = profile_projection(profile_id);
+            snap.connection_state = "reconnecting".into();
+            snap.profile = Some(name);
+            snap.protocol = protocol;
+        }
+        Connection::AwaitingUserInput { profile_id, .. } => {
+            let (name, protocol) = profile_projection(profile_id);
+            snap.connection_state = "awaiting_input".into();
+            snap.profile = Some(name);
+            snap.protocol = protocol;
         }
         Connection::Disconnecting { profile_id, .. } => {
+            let (name, protocol) = profile_projection(profile_id);
             snap.connection_state = "disconnecting".into();
-            snap.profile = Some(display_name(profile_id));
+            snap.profile = Some(name);
+            snap.protocol = protocol;
         }
         Connection::Connected {
-            profile_id, since, ..
+            profile_id,
+            since,
+            health,
+            details,
         } => {
             snap.connection_state = "connected".into();
-            snap.profile = Some(display_name(profile_id));
+            snap.health = Some(health.clone());
+            snap.generation = (details.generation > 0).then_some(details.generation);
+            let (name, protocol) = profile_projection(profile_id);
+            snap.profile = Some(name);
+            snap.protocol = protocol;
             if let Ok(elapsed) = std::time::SystemTime::now().duration_since(*since) {
                 snap.uptime_secs = Some(elapsed.as_secs());
             }
@@ -1211,20 +1258,25 @@ fn run_watch(interval: u64, config: &AppConfig, config_dir: &Path, mode: OutputM
                     profile: Option<String>,
                     #[serde(skip_serializing_if = "Option::is_none")]
                     uptime_secs: Option<u64>,
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    health: Option<ConnectionHealthEntry>,
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    generation: Option<u64>,
                 }
                 let line = WatchLine {
                     ts: chrono_now(),
                     state: snap.connection_state,
                     profile: snap.profile,
                     uptime_secs: snap.uptime_secs,
+                    health: snap.health.as_ref().map(connection_health_entry),
+                    generation: snap.generation,
                 };
                 println!("{}", serde_json::to_string(&line).unwrap_or_default());
             }
             OutputMode::Human => {
                 use std::io::Write;
                 if snap.connection_state == "connected" {
-                    let profile = snap.profile.as_deref().unwrap_or("?");
-                    print!("\r● {profile}");
+                    print!("\r{}", human_status_headline(&snap));
                     if let Some(up) = snap.uptime_secs {
                         let m = up / 60;
                         let s = up % 60;
@@ -1232,7 +1284,7 @@ fn run_watch(interval: u64, config: &AppConfig, config_dir: &Path, mode: OutputM
                     }
                     print!("    ");
                 } else {
-                    print!("\r○ Disconnected    ");
+                    print!("\r{}    ", human_status_headline(&snap));
                 }
                 let _ = std::io::stdout().flush();
             }
@@ -1240,6 +1292,231 @@ fn run_watch(interval: u64, config: &AppConfig, config_dir: &Path, mode: OutputM
         }
 
         std::thread::sleep(Duration::from_secs(interval));
+    }
+}
+
+fn human_status_headline(snap: &crate::vpn_runtime::connection::StatusSnapshot) -> String {
+    let profile = snap.profile.as_deref().unwrap_or("unknown");
+    let protocol = snap.protocol.as_deref().unwrap_or("");
+    match snap.connection_state.as_str() {
+        "connected" => snap.health.as_ref().map_or_else(
+            || format!("● Connected to {profile} ({protocol})"),
+            |health| match health {
+                crate::vortix_core::engine::state::ConnectionHealth::Degraded { .. } => format!(
+                    "⚠ Connected to {profile} ({protocol}) — {}",
+                    connection_health_human(health)
+                ),
+                _ => format!("● Connected to {profile} ({protocol})"),
+            },
+        ),
+        "handshaking" => format!("◐ Handshaking with {profile} (WireGuard)"),
+        "connecting" => format!("◐ Connecting to {profile} (OpenVPN)"),
+        "reconnecting" => format!("↻ Reconnecting to {profile} ({protocol})"),
+        "disconnecting" => format!("◑ Disconnecting {profile} ({protocol})"),
+        "awaiting_input" => format!("? Awaiting input for {profile} ({protocol})"),
+        _ => "○ Disconnected".to_string(),
+    }
+}
+
+fn connection_health_entry(
+    health: &crate::vortix_core::engine::state::ConnectionHealth,
+) -> ConnectionHealthEntry {
+    use crate::vortix_core::engine::state::ConnectionHealth;
+    match health {
+        ConnectionHealth::Unknown => ConnectionHealthEntry {
+            status: "unknown".into(),
+            reason: None,
+        },
+        ConnectionHealth::Healthy => ConnectionHealthEntry {
+            status: "healthy".into(),
+            reason: None,
+        },
+        ConnectionHealth::Degraded { reason } => ConnectionHealthEntry {
+            status: "degraded".into(),
+            reason: Some(degraded_reason_human(reason)),
+        },
+    }
+}
+
+fn connection_health_human(health: &crate::vortix_core::engine::state::ConnectionHealth) -> String {
+    use crate::vortix_core::engine::state::ConnectionHealth;
+    match health {
+        ConnectionHealth::Unknown => "Unknown (measuring)".into(),
+        ConnectionHealth::Healthy => "Healthy".into(),
+        ConnectionHealth::Degraded { reason } => {
+            format!("Degraded: {}", degraded_reason_human(reason))
+        }
+    }
+}
+
+fn degraded_reason_human(reason: &crate::vortix_core::engine::state::DegradedReason) -> String {
+    use crate::vortix_core::engine::state::DegradedReason;
+    match reason {
+        DegradedReason::HandshakeStale {
+            seconds_since_last_handshake,
+        } => format!("handshake stale for {seconds_since_last_handshake}s"),
+        DegradedReason::WireGuardPeerStale {
+            peer_public_key,
+            allowed_routes,
+            seconds_since_last_handshake,
+        } => format!(
+            "peer {} stale for {}s on {}",
+            short_peer(peer_public_key),
+            seconds_since_last_handshake,
+            allowed_routes.join(",")
+        ),
+        DegradedReason::WireGuardPeerNeverObserved {
+            peer_public_key,
+            allowed_routes,
+        } => format!(
+            "peer {} has no handshake on {}",
+            short_peer(peer_public_key),
+            allowed_routes.join(",")
+        ),
+        DegradedReason::HighPacketLoss { loss_percent } => {
+            format!("{loss_percent:.1}% packet loss")
+        }
+        DegradedReason::HighLatency { latency_ms } => format!("{latency_ms}ms latency"),
+    }
+}
+
+fn short_peer(peer: &str) -> &str {
+    peer.get(..peer.len().min(8)).unwrap_or(peer)
+}
+
+#[cfg(test)]
+mod handshake_status_tests {
+    use super::*;
+    use crate::state::{KillSwitchMode, KillSwitchState, Protocol, VpnProfile};
+    use crate::vortix_core::engine::state::Connection;
+    use crate::vortix_core::profile::ProfileId;
+
+    fn snapshot(state: &str, protocol: &str) -> crate::vpn_runtime::connection::StatusSnapshot {
+        crate::vpn_runtime::connection::StatusSnapshot {
+            connection_state: state.into(),
+            health: None,
+            generation: None,
+            profile: Some("corp".into()),
+            protocol: Some(protocol.into()),
+            uptime_secs: None,
+            public_ip: None,
+            server: None,
+            interface: None,
+            internal_ip: None,
+            latency_ms: None,
+            jitter_ms: None,
+            packet_loss_pct: None,
+            quality: None,
+            download_bytes: None,
+            upload_bytes: None,
+            killswitch_mode: KillSwitchMode::Off,
+            killswitch_state: KillSwitchState::Disabled,
+            dns_leak: None,
+            encryption: None,
+            location: None,
+            isp: None,
+        }
+    }
+
+    fn profile(protocol: Protocol) -> VpnProfile {
+        VpnProfile {
+            id: ProfileId::new("corp"),
+            name: "corp".into(),
+            protocol,
+            config_path: "/tmp/corp.conf".into(),
+            location: String::new(),
+            last_used: None,
+        }
+    }
+
+    #[test]
+    fn human_and_watch_headline_distinguish_wireguard_from_openvpn() {
+        assert_eq!(
+            human_status_headline(&snapshot("handshaking", "WireGuard")),
+            "◐ Handshaking with corp (WireGuard)"
+        );
+        assert_eq!(
+            human_status_headline(&snapshot("connecting", "OpenVPN")),
+            "◐ Connecting to corp (OpenVPN)"
+        );
+    }
+
+    #[test]
+    fn daemon_overlay_uses_protocol_specific_transitional_state() {
+        let state = Connection::Connecting {
+            profile_id: ProfileId::new("corp"),
+            started_at: std::time::SystemTime::now(),
+            attempt: 1,
+            retry_budget_remaining: Duration::from_secs(30),
+        };
+        let mut wg = snapshot("disconnected", "");
+        overlay_daemon_state(&mut wg, &state, &[profile(Protocol::WireGuard)]);
+        assert_eq!(wg.connection_state, "handshaking");
+        assert_eq!(wg.protocol.as_deref(), Some("WireGuard"));
+
+        let mut ovpn = snapshot("disconnected", "");
+        overlay_daemon_state(&mut ovpn, &state, &[profile(Protocol::OpenVPN)]);
+        assert_eq!(ovpn.connection_state, "connecting");
+        assert_eq!(ovpn.protocol.as_deref(), Some("OpenVPN"));
+    }
+
+    #[test]
+    fn daemon_overlay_and_human_projection_preserve_typed_health_generation() {
+        let degraded = crate::vortix_core::engine::state::ConnectionHealth::Degraded {
+            reason: crate::vortix_core::engine::state::DegradedReason::WireGuardPeerStale {
+                peer_public_key: "peer-public-key".into(),
+                allowed_routes: vec!["10.0.0.0/24".into()],
+                seconds_since_last_handshake: 181,
+            },
+        };
+        let details = crate::vortix_core::engine::state::DetailedConnectionInfo {
+            generation: 7,
+            ..Default::default()
+        };
+        let state = Connection::Connected {
+            profile_id: ProfileId::new("corp"),
+            since: std::time::SystemTime::now(),
+            health: degraded.clone(),
+            details: Box::new(details),
+        };
+        let mut snap = snapshot("disconnected", "");
+        overlay_daemon_state(&mut snap, &state, &[profile(Protocol::WireGuard)]);
+        assert_eq!(snap.health, Some(degraded));
+        assert_eq!(snap.generation, Some(7));
+        assert!(human_status_headline(&snap).contains("stale for 181s"));
+        let projected = connection_health_entry(snap.health.as_ref().unwrap());
+        assert_eq!(projected.status, "degraded");
+        assert!(projected.reason.unwrap().contains("peer-pub"));
+        assert_eq!(status_exit_code(OutputMode::Quiet, &snap), 4);
+        assert_eq!(status_exit_code(OutputMode::Human, &snap), 0);
+        snap.health = Some(crate::vortix_core::engine::state::ConnectionHealth::Healthy);
+        assert_eq!(status_exit_code(OutputMode::Quiet, &snap), 0);
+    }
+
+    #[test]
+    fn json_v2_adds_handshaking_without_claiming_a_primary() {
+        let entry = ConnectionEntry {
+            state: "handshaking".into(),
+            profile: Some("corp".into()),
+            protocol: Some("WireGuard".into()),
+            uptime_secs: None,
+            health: None,
+            generation: None,
+        };
+        let data = StatusData {
+            connections: vec![entry],
+            primary: None,
+            connection: None,
+            network: None,
+            security: StatusSecurity {
+                killswitch_mode: "off".into(),
+                killswitch_state: "disabled".into(),
+            },
+        };
+        let value = serde_json::to_value(data).unwrap();
+        assert_eq!(value["connections"][0]["state"], "handshaking");
+        assert!(value["primary"].is_null());
+        assert!(value["connection"].is_null());
     }
 }
 

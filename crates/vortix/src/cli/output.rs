@@ -67,6 +67,20 @@ pub struct ConnectionEntry {
     pub protocol: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uptime_secs: Option<u64>,
+    /// Additive v2 health projection. Absent for scanner-only observations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health: Option<ConnectionHealthEntry>,
+    /// Exact managed attempt generation, when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
+}
+
+/// Stable JSON projection of typed connection health.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConnectionHealthEntry {
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// Output mode selected by global CLI flags.
@@ -308,6 +322,8 @@ mod tests {
             profile: Some("corp".into()),
             protocol: Some("wireguard".into()),
             uptime_secs: Some(42),
+            health: None,
+            generation: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         assert!(json.contains("\"state\":\"connected\""));
@@ -323,6 +339,8 @@ mod tests {
             profile: None,
             protocol: None,
             uptime_secs: None,
+            health: None,
+            generation: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         assert_eq!(json, "{\"state\":\"disconnected\"}");

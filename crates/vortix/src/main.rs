@@ -29,43 +29,6 @@ fn main() -> Result<()> {
     // branching on `cfg(target_os)`.
     vortix::platform::set_global_platform(vortix::platform::Platform::detect_current());
 
-    // Settings — figment-layered: defaults → user file →
-    // VORTIX_* env. CLI overrides currently bypass settings.
-    let settings = match vortix::vortix_config::Settings::load() {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("warning: failed to load settings ({e}); using defaults");
-            vortix::vortix_config::Settings::default()
-        }
-    };
-
-    // Journal — open the per-session JSONL writer using
-    // the runner's own tokio runtime (writer task is spawn'd on it). We
-    // borrow the runtime via Handle so the Journal stays alive after main()
-    // exits to the TUI loop.
-    let runtime_handle = vortix::vortix_process::global_runner()
-        .as_real()
-        .map(|r| r.runtime().handle().clone());
-    if let Some(handle) = runtime_handle.clone() {
-        let _guard = handle.enter();
-        match vortix::vortix_core::journal::Journal::open(
-            vortix::vortix_core::journal::JournalConfig {
-                disk: settings.journal.disk,
-                retention_days: settings.journal.retention_days,
-                retention_count: settings.journal.retention_count,
-                ..Default::default()
-            },
-        ) {
-            Ok(journal) => {
-                vortix::vortix_core::journal::set_global_journal(journal);
-            }
-            Err(e) => {
-                eprintln!("warning: failed to open journal ({e}); diagnostics will be limited");
-            }
-        }
-    }
-    let _ = runtime_handle; // suppress unused warning when no real runner installed
-
     // Now capture color_eyre's hook and wrap it with terminal restoration
     // and recovery instructions. Drop glue on App will still run to release
     // kill switch rules and VPN processes.
@@ -120,6 +83,43 @@ fn main() -> Result<()> {
 
     // Store the resolved config dir globally so all utility functions use it
     config::set_config_dir(config_dir.clone());
+
+    // Settings use the same authoritative directory as profiles and
+    // config.toml. Resolve this only after clap/env/sudo-user selection so an
+    // old default-path settings file can never silently override
+    // `--config-dir` or `VORTIX_CONFIG_DIR`.
+    let settings = match vortix::vortix_config::Settings::load_from_config_dir(&config_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("warning: failed to load settings ({e}); using defaults");
+            vortix::vortix_config::Settings::default()
+        }
+    };
+
+    // Journal — open the per-session JSONL writer using the runner's own
+    // tokio runtime after the authoritative settings path is known.
+    let runtime_handle = vortix::vortix_process::global_runner()
+        .as_real()
+        .map(|r| r.runtime().handle().clone());
+    if let Some(handle) = runtime_handle.clone() {
+        let _guard = handle.enter();
+        match vortix::vortix_core::journal::Journal::open(
+            vortix::vortix_core::journal::JournalConfig {
+                disk: settings.journal.disk,
+                retention_days: settings.journal.retention_days,
+                retention_count: settings.journal.retention_count,
+                ..Default::default()
+            },
+        ) {
+            Ok(journal) => {
+                vortix::vortix_core::journal::set_global_journal(journal);
+            }
+            Err(e) => {
+                eprintln!("warning: failed to open journal ({e}); diagnostics will be limited");
+            }
+        }
+    }
+    let _ = runtime_handle;
 
     // Clear any SCRV1 envelopes left on
     // disk by a previous crash mid-connect. Runs once at startup before
@@ -205,7 +205,7 @@ fn main() -> Result<()> {
     }
 
     // Load config.toml (or use defaults)
-    let app_config = match config::load_config(&config_dir) {
+    let app_config = match config::load_effective_config(&config_dir) {
         Ok(cfg) => cfg,
         Err(e) => {
             eprintln!("Error: {e}");

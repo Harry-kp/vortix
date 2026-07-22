@@ -56,6 +56,12 @@ pub struct DetailedConnectionInfo {
     pub transfer_tx: String,
     /// Time since last successful handshake.
     pub latest_handshake: String,
+    /// Protocol attempt fence used by the canonical snapshot.
+    pub generation: u64,
+    /// Current-generation `WireGuard` proof.
+    pub handshake: Option<crate::vortix_core::ports::tunnel::HandshakeEvidence>,
+    /// Per-peer receipts for probes actually issued by the protocol path.
+    pub probe_receipts: Vec<crate::vortix_core::ports::tunnel::ProbeReceipt>,
     /// Process ID (for targeted termination).
     pub pid: Option<u32>,
 }

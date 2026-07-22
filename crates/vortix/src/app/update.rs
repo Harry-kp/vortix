@@ -215,8 +215,21 @@ impl App {
                 error,
                 interface,
                 pid,
+                generation,
+                handshake,
+                probe_receipts,
                 dns_request,
-            } => self.handle_connect_result(profile, success, error, interface, pid, dns_request),
+            } => self.handle_connect_result(
+                profile,
+                success,
+                error,
+                interface,
+                pid,
+                generation,
+                handshake,
+                probe_receipts,
+                dns_request,
+            ),
 
             // UI Toggles
             Message::ToggleZoom => {
@@ -559,7 +572,7 @@ impl App {
         }
     }
 
-    #[allow(clippy::too_many_lines)] // single linear sequence of stale-check, success bookkeeping, failure logging; splitting would obscure the flow
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // one message payload + linear stale-check/bookkeeping flow
     fn handle_connect_result(
         &mut self,
         profile: String,
@@ -567,6 +580,9 @@ impl App {
         error: Option<String>,
         interface: Option<String>,
         pid: Option<u32>,
+        generation: u64,
+        handshake: Option<crate::vortix_core::ports::tunnel::HandshakeEvidence>,
+        probe_receipts: Vec<crate::vortix_core::ports::tunnel::ProbeReceipt>,
         dns_request: crate::vortix_core::ports::dns::DnsRequest,
     ) {
         // Stale-arrival check. A `ConnectResult` is stale ONLY when the
@@ -596,6 +612,7 @@ impl App {
             ));
         } else if success {
             self.runtime.remember_dns_request(&profile, dns_request);
+            self.record_wireguard_probe_activity(&profile, probe_receipts.clone());
             // Reset this profile's retry / auto-reconnect bookkeeping on
             // success. Other profiles' retry state is untouched (P5b
             // per-profile retry).
@@ -628,6 +645,9 @@ impl App {
             if let Some(p) = pid {
                 details_seed.pid = Some(p);
             }
+            details_seed.generation = generation;
+            details_seed.handshake = handshake;
+            details_seed.probe_receipts = probe_receipts;
             self.mirror_connect_into_registry(&profile, &details_seed, now);
             self.reconcile_dns_policy();
 
@@ -1103,6 +1123,7 @@ impl App {
     /// / `set_failed` here. The few residual single-tunnel-shaped reads
     /// (kill-switch sync, scanner-dispatch helpers) consult
     /// [`App::legacy_state`], a derived view from the registry primary.
+    #[allow(clippy::too_many_lines)]
     fn handle_sync_system_state(&mut self, active: Vec<ActiveSession>) {
         use crate::vortix_core::engine::state::Connection;
         use crate::vortix_core::profile::ProfileId;
@@ -1138,6 +1159,26 @@ impl App {
             };
             handled.insert(snap.profile_id.clone());
             let matching_session = active.iter().find(|s| s.name == profile_name);
+
+            if self
+                .runtime
+                .scanner_observed_wireguard
+                .contains(&snap.profile_id)
+            {
+                // An unmanaged scanner observation stays Handshaking for as
+                // long as the kernel device exists. It is neither promoted by
+                // peer timestamps nor driven through managed timeout/cleanup.
+                if matching_session.is_none() {
+                    self.runtime
+                        .scanner_observed_wireguard
+                        .remove(&snap.profile_id);
+                    self.runtime
+                        .wireguard_peer_activity
+                        .remove(&snap.profile_id);
+                    self.registry.set_disconnected(&snap.profile_id);
+                }
+                continue;
+            }
 
             match (&snap.state, matching_session) {
                 (Connection::Disconnecting { .. }, None) => {
@@ -1377,6 +1418,11 @@ impl App {
 
         if let Some(profile_id) = self.profile_id_for_name(profile_name) {
             utils::cleanup_openvpn_run_files_compat(profile_id.as_str(), profile_name);
+            let _ = crate::core::managed_wireguard::remove_after_kernel_absence(
+                &self.runtime.config_dir,
+                &profile_id,
+                profile_name,
+            );
         }
 
         if self.legacy_matches(profile_name) {
@@ -1450,6 +1496,27 @@ impl App {
     fn scanner_adopt_session(&mut self, session: &ActiveSession) {
         let profile_name = session.name.clone();
 
+        if let Some(profile) =
+            self.runtime.profiles.iter().find(|profile| {
+                profile.name == profile_name && profile.protocol == Protocol::WireGuard
+            })
+        {
+            let recovered =
+                crate::core::managed_wireguard::load(&self.runtime.config_dir, &profile.id)
+                    .is_some_and(|receipt| receipt.validates(&profile.id, session));
+            if recovered {
+                self.log(&format!(
+                    "STATUS: Recovered managed WireGuard connection '{profile_name}'"
+                ));
+            } else {
+                self.log(&format!(
+                    "INFO: Observed unmanaged WireGuard tunnel '{profile_name}' — awaiting an ownership receipt"
+                ));
+            }
+            self.adopt_registry_from_session(&profile_name, session);
+            return;
+        }
+
         let start_time = if let Some(real) = session.started_at {
             if let Ok(duration) = std::time::SystemTime::now().duration_since(real) {
                 Instant::now()
@@ -1484,11 +1551,10 @@ impl App {
                 "INFO: Adopting externally-started tunnel '{profile_name}' as a secondary"
             ));
         }
-        // Adoption goes through the dedicated entry-creation path,
-        // NOT refresh_registry_from_session (which is metadata-only on
-        // existing Connected entries). The new entry's
-        // Scanner-only sessions are read-only and non-primary. A later unit
-        // may promote one only after a protocol-correct ownership handshake.
+        // Adoption goes through the dedicated entry-creation path, not the
+        // metadata-only refresh. WireGuard scanner observations stay
+        // read-only Handshaking/non-primary; only a protocol-correct ownership
+        // receipt may promote one.
         self.adopt_registry_from_session(&profile_name, session);
     }
 
@@ -1662,8 +1728,16 @@ impl App {
         }
         // 1. Connection Timeout Safeguard
         if let ConnectionState::Connecting { started, profile } = self.legacy_state() {
-            if started.elapsed()
-                > std::time::Duration::from_secs(self.runtime.config.connect_timeout)
+            let scanner_observed = self
+                .profile_id_for_name(&profile)
+                .is_some_and(|profile_id| {
+                    self.runtime
+                        .scanner_observed_wireguard
+                        .contains(&profile_id)
+                });
+            if !scanner_observed
+                && started.elapsed()
+                    > std::time::Duration::from_secs(self.runtime.config.connect_timeout)
             {
                 self.handle_message(Message::ConnectionTimeout(profile));
             }

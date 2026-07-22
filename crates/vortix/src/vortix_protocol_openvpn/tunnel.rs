@@ -1025,6 +1025,9 @@ impl Tunnel for OvpnTunnel {
                 pid: Some(pid),
                 started_at: SystemTime::now(),
                 kind: TunnelKindTag::OpenVpn,
+                generation: 0,
+                handshake: None,
+                probe_receipts: Vec::new(),
                 process_ownership: Some(handshake.identity),
                 teardown_config: None,
                 dns_request,
@@ -1088,6 +1091,7 @@ impl Tunnel for OvpnTunnel {
             bytes_tx: 0,
             last_handshake: None,
             observed_at: SystemTime::now(),
+            peers: Vec::new(),
             detail: Box::new(OvpnStatus { pid: handle.pid }),
         })
     }

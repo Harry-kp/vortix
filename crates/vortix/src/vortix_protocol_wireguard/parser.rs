@@ -13,6 +13,11 @@ use std::net::{IpAddr, SocketAddr};
 
 use crate::vortix_core::ports::tunnel::{ParseError, ParsedProfile};
 
+const MAX_CONFIG_BYTES: usize = 1024 * 1024;
+const MAX_CONFIG_PEERS: usize = 256;
+const MAX_CONFIG_ROUTES_PER_PEER: usize = 256;
+const MAX_CONFIG_FIELD_BYTES: usize = 4096;
+
 /// CIDR block: an IP address paired with a prefix length.
 ///
 /// This is a small, local wrapper used by the `WireGuard` parser. A
@@ -54,6 +59,7 @@ pub struct WgPeer {
     pub allowed_ips: Vec<Cidr>,
     pub endpoint: Option<SocketAddr>,
     pub fwmark: Option<u32>,
+    pub persistent_keepalive: Option<u16>,
 }
 
 /// Parsed `WireGuard` profile body.
@@ -107,6 +113,12 @@ impl ParsedProfile for WgParsedProfile {
 /// expand the error set.
 #[allow(clippy::too_many_lines)]
 pub fn parse_wg_conf(text: &str) -> Result<WgParsedProfile, ParseError> {
+    if text.len() > MAX_CONFIG_BYTES {
+        return Err(ParseError::MalformedField {
+            field: "profile",
+            detail: format!("exceeds {MAX_CONFIG_BYTES} bytes"),
+        });
+    }
     let mut profile = WgParsedProfile {
         raw: text.to_string(),
         ..Default::default()
@@ -122,6 +134,12 @@ pub fn parse_wg_conf(text: &str) -> Result<WgParsedProfile, ParseError> {
         if let Some(header) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
             // Finalize any in-flight peer before switching section.
             if let Some(peer) = current_peer.take() {
+                if profile.peers.len() >= MAX_CONFIG_PEERS {
+                    return Err(ParseError::MalformedField {
+                        field: "Peer",
+                        detail: format!("exceeds {MAX_CONFIG_PEERS} entries"),
+                    });
+                }
                 profile.peers.push(peer);
             }
             let header = header.trim();
@@ -141,6 +159,12 @@ pub fn parse_wg_conf(text: &str) -> Result<WgParsedProfile, ParseError> {
         };
         let key = key.trim();
         let value = value.trim();
+        if key.len() > MAX_CONFIG_FIELD_BYTES || value.len() > MAX_CONFIG_FIELD_BYTES {
+            return Err(ParseError::MalformedField {
+                field: "WireGuard directive",
+                detail: format!("field exceeds {MAX_CONFIG_FIELD_BYTES} bytes"),
+            });
+        }
 
         match section {
             Section::Interface => {
@@ -184,7 +208,17 @@ pub fn parse_wg_conf(text: &str) -> Result<WgParsedProfile, ParseError> {
                                 continue;
                             }
                             match Cidr::parse(entry) {
-                                Some(cidr) => peer.allowed_ips.push(cidr),
+                                Some(cidr) => {
+                                    if peer.allowed_ips.len() >= MAX_CONFIG_ROUTES_PER_PEER {
+                                        return Err(ParseError::MalformedField {
+                                            field: "AllowedIPs",
+                                            detail: format!(
+                                                "peer exceeds {MAX_CONFIG_ROUTES_PER_PEER} routes"
+                                            ),
+                                        });
+                                    }
+                                    peer.allowed_ips.push(cidr);
+                                }
                                 None => {
                                     tracing::warn!(
                                         cidr = entry,
@@ -219,6 +253,12 @@ pub fn parse_wg_conf(text: &str) -> Result<WgParsedProfile, ParseError> {
                                 tracing::warn!(value, "ignoring malformed FwMark value in [Peer]");
                             }
                         }
+                    } else if key.eq_ignore_ascii_case("PersistentKeepalive") {
+                        peer.persistent_keepalive = value
+                            .split(['#', ';'])
+                            .next()
+                            .and_then(|seconds| seconds.trim().parse::<u16>().ok())
+                            .filter(|seconds| *seconds > 0);
                     }
                 }
             }
@@ -227,6 +267,12 @@ pub fn parse_wg_conf(text: &str) -> Result<WgParsedProfile, ParseError> {
     }
 
     if let Some(peer) = current_peer.take() {
+        if profile.peers.len() >= MAX_CONFIG_PEERS {
+            return Err(ParseError::MalformedField {
+                field: "Peer",
+                detail: format!("exceeds {MAX_CONFIG_PEERS} entries"),
+            });
+        }
         profile.peers.push(peer);
     }
 
@@ -255,6 +301,15 @@ Endpoint = 203.0.113.5:51820
         assert_eq!(p.dns_servers, vec!["1.1.1.1", "8.8.8.8"]);
         assert_eq!(p.address.as_deref(), Some("10.0.0.2/32"));
         assert_eq!(p.mtu, Some(1420));
+    }
+
+    #[test]
+    fn parses_persistent_keepalive_as_peer_expectation() {
+        let parsed = parse_wg_conf(
+            "[Interface]\nPrivateKey = private\n[Peer]\nPublicKey = peer\nAllowedIPs = 10.0.0.0/24\nPersistentKeepalive = 25 # seconds\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.peers[0].persistent_keepalive, Some(25));
     }
 
     #[test]

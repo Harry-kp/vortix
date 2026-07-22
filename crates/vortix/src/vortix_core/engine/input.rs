@@ -68,9 +68,9 @@ pub enum ProfileChange {
 
 /// What the scanner (or any other observer) reports about a live tunnel.
 ///
-/// The scanner is now an *input source* — the FSM
-/// reconciles its model against the observation instead of the scanner
-/// mutating the engine directly.
+/// Scanner facts are observation-only. In particular, an `Active` fact does
+/// not contain a protocol receipt and can never promote `Disconnected` to
+/// `Connected`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum TunnelStatusObservation {

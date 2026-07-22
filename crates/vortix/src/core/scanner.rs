@@ -51,6 +51,9 @@ pub struct ActiveSession {
     pub transfer_tx: String,
     /// Time since last successful handshake.
     pub latest_handshake: String,
+    /// Typed `WireGuard` peer facts. Empty for `OpenVPN`. Display strings above
+    /// are compatibility projections and never control authority.
+    pub wireguard_peers: Vec<crate::vortix_core::ports::tunnel::TunnelPeerStatus>,
 }
 
 impl Default for ActiveSession {
@@ -69,6 +72,7 @@ impl Default for ActiveSession {
             transfer_rx: String::new(),
             transfer_tx: String::new(),
             latest_handshake: String::new(),
+            wireguard_peers: Vec::new(),
         }
     }
 }
@@ -179,15 +183,15 @@ fn get_all_openvpn_pids() -> std::collections::HashMap<String, u32> {
 ///
 /// Uses platform-specific interface detection:
 /// - macOS: /var/run/wireguard/*.name + ifconfig
-/// - Linux: ip addr + wg show
+/// - Linux: kernel interface lookup + typed `WireGuard` protocol observation
 fn check_wireguard_by_name(name: &str) -> Option<ActiveSession> {
     // Platform-dispatched interface check via the platform aggregate.
     let platform = crate::platform::current_platform();
 
     // On macOS, `resolve_wireguard_interface` reads /var/run/wireguard/
     // <name>.name and returns Some(utunN). On Linux, the kernel device
-    // is the config name. Resolution also establishes existence, so a
-    // separate check would repeat the same `wg show` subprocess.
+    // is the config name. Protocol identity is established below by the
+    // typed WireGuard observer.
     let interface_name = platform.interface.resolve_wireguard_interface(name)?;
 
     let mut session = ActiveSession {
@@ -233,32 +237,39 @@ fn check_wireguard_by_name(name: &str) -> Option<ActiveSession> {
         );
     }
 
-    // 3. Parse `wg show {interface_name}` (works the same on both platforms)
-    if let Some(output) = cmd_output("wg", &["show", &interface_name]) {
-        let out = String::from_utf8_lossy(&output.stdout);
-        for line in out.lines() {
-            let line = line.trim();
-            if let Some(v) = line.strip_prefix("public key: ") {
-                session.public_key = v.to_string();
-            }
-            if let Some(v) = line.strip_prefix("listening port: ") {
-                session.listen_port = v.to_string();
-            }
-            if let Some(v) = line.strip_prefix("endpoint: ") {
-                session.endpoint = v.to_string();
-            }
-            if let Some(v) = line.strip_prefix("latest handshake: ") {
-                session.latest_handshake = v.to_string();
-            }
-            if let Some(v) = line.strip_prefix("transfer: ") {
-                let parts: Vec<&str> = v.split_terminator(',').collect();
-                if parts.len() >= 2 {
-                    session.transfer_rx = parts[0].trim().replace(" received", "");
-                    session.transfer_tx = parts[1].trim().replace(" sent", "");
-                }
-            }
-        }
-    }
+    // Protocol-owned machine-readable observation. The scanner projects
+    // display metadata but cannot manufacture connection truth.
+    let status =
+        crate::vortix_protocol_wireguard::WgTunnel::observe_interface(&interface_name).ok()?;
+    session.public_key = status.interface_public_key;
+    session.listen_port = status
+        .listen_port
+        .map_or_else(String::new, |port| port.to_string());
+    session.endpoint = status
+        .peers
+        .iter()
+        .find_map(|peer| peer.endpoint.clone())
+        .unwrap_or_default();
+    session.transfer_rx = status
+        .peers
+        .iter()
+        .map(|peer| peer.bytes_rx)
+        .sum::<u64>()
+        .to_string();
+    session.transfer_tx = status
+        .peers
+        .iter()
+        .map(|peer| peer.bytes_tx)
+        .sum::<u64>()
+        .to_string();
+    session.latest_handshake = status
+        .peers
+        .iter()
+        .filter_map(|peer| peer.latest_handshake)
+        .max()
+        .and_then(|handshake| SystemTime::now().duration_since(handshake).ok())
+        .map_or_else(String::new, |age| format!("{}s ago", age.as_secs()));
+    session.wireguard_peers = status.peers;
 
     // 4. Get IP and MTU using platform-specific interface info
     let (ip, mtu) = platform.interface.get_interface_info(&interface_name);
@@ -437,14 +448,15 @@ fn check_openvpn_by_pid(
                     let line = line.trim();
                     if line.starts_with("inet ") {
                         let parts: Vec<&str> = line.split_whitespace().collect();
-                        if parts.len() >= 2 {
-                            let wg_check = cmd_output("wg", &["show", &current_iface]);
-                            if !matches!(wg_check, Some(o) if o.status.success()) {
-                                session.internal_ip = parts[1].to_string();
-                                session.mtu.clone_from(&iface_mtu);
-                                session.interface.clone_from(&current_iface);
-                                break;
-                            }
+                        if parts.len() >= 2
+                            && !crate::vortix_protocol_wireguard::WgTunnel::interface_exists(
+                                &current_iface,
+                            )
+                        {
+                            session.internal_ip = parts[1].to_string();
+                            session.mtu.clone_from(&iface_mtu);
+                            session.interface.clone_from(&current_iface);
+                            break;
                         }
                     }
                 }
@@ -470,9 +482,11 @@ fn check_openvpn_by_pid(
                             current_iface.starts_with("tun") || current_iface.starts_with("tap");
 
                         if found_tun {
-                            // Check it's not a WireGuard interface
-                            let wg_check = cmd_output("wg", &["show", &current_iface]);
-                            if matches!(wg_check, Some(o) if o.status.success()) {
+                            // Check it's not a WireGuard interface through the
+                            // protocol-owned typed observer.
+                            if crate::vortix_protocol_wireguard::WgTunnel::interface_exists(
+                                &current_iface,
+                            ) {
                                 found_tun = false;
                                 continue;
                             }

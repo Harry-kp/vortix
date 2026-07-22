@@ -160,7 +160,7 @@ impl<T: Tunnel> Engine<T> {
         self.state = Connection::Connected {
             profile_id,
             since,
-            health: crate::vortix_core::engine::state::ConnectionHealth::default(),
+            health: details.health_hint.clone(),
             details: Box::new(details),
         };
     }
@@ -222,9 +222,23 @@ impl<T: Tunnel> Engine<T> {
     /// the transition; the caller is expected to append them to the journal
     /// and broadcast.
     pub fn handle(&mut self, input: Input) -> Vec<EngineEvent> {
+        self.handle_with_transition_observer(input, |_, _| {})
+    }
+
+    /// Drive one input while publishing pre-effect transition points.
+    ///
+    /// The local actor uses this to make `Connecting`/`Handshaking` visible
+    /// before a synchronous protocol adapter begins bounded blocking work.
+    pub fn handle_with_transition_observer(
+        &mut self,
+        input: Input,
+        mut observer: impl FnMut(&Connection, &[EngineEvent]),
+    ) -> Vec<EngineEvent> {
         let mut events = Vec::new();
         match input {
-            Input::UserCommand(cmd) => self.handle_user_command(cmd, &mut events),
+            Input::UserCommand(cmd) => {
+                self.handle_user_command(cmd, &mut events, &mut observer);
+            }
             Input::Tick => self.handle_tick(&mut events),
             Input::NetworkLinkChanged(link) => self.handle_link(link, &mut events),
             Input::TelemetryReport(_) => {
@@ -233,14 +247,21 @@ impl<T: Tunnel> Engine<T> {
                 // state transitions.
             }
             Input::ProfileChanged(change) => self.handle_profile_change(change, &mut events),
-            Input::TunnelStatusObserved(obs) => self.handle_tunnel_status(obs, &mut events),
+            Input::TunnelStatusObserved(obs) => Self::handle_tunnel_status(obs),
         }
         events
     }
 
-    fn handle_user_command(&mut self, cmd: UserCommand, events: &mut Vec<EngineEvent>) {
+    fn handle_user_command(
+        &mut self,
+        cmd: UserCommand,
+        events: &mut Vec<EngineEvent>,
+        observer: &mut impl FnMut(&Connection, &[EngineEvent]),
+    ) {
         match cmd {
-            UserCommand::Connect { profile_id } => self.try_connect(profile_id, events),
+            UserCommand::Connect { profile_id } => {
+                self.try_connect(profile_id, events, observer);
+            }
             // The single FSM drives one tunnel. `profile_id` on the
             // multi-tunnel variants is a registry-level routing key —
             // by the time the command reaches a single FSM, the
@@ -249,7 +270,7 @@ impl<T: Tunnel> Engine<T> {
             UserCommand::Disconnect { .. } | UserCommand::ForceDisconnect { .. } => {
                 self.try_disconnect(events);
             }
-            UserCommand::Reconnect { .. } => self.try_reconnect(events),
+            UserCommand::Reconnect { .. } => self.try_reconnect(events, observer),
             // Compatibility for the unfinished legacy 2FA flow. Keeping this
             // as an engine-local no-op prevents its String payload from ever
             // entering the canonical journal/broadcast/snapshot path.
@@ -257,7 +278,12 @@ impl<T: Tunnel> Engine<T> {
         }
     }
 
-    fn try_connect(&mut self, profile_id: ProfileId, events: &mut Vec<EngineEvent>) {
+    fn try_connect(
+        &mut self,
+        profile_id: ProfileId,
+        events: &mut Vec<EngineEvent>,
+        observer: &mut impl FnMut(&Connection, &[EngineEvent]),
+    ) {
         // Only Disconnected → Connecting is valid here; other states are
         // ignored (caller should query state first).
         if !matches!(self.state, Connection::Disconnected { .. }) {
@@ -282,6 +308,7 @@ impl<T: Tunnel> Engine<T> {
             protocol: profile.protocol,
             attempt: 1,
         });
+        observer(&self.state, events);
 
         // rebuild the tunnel per profile when a factory is
         // installed. Lets `Engine<TunnelKind>` route WG vs OVPN based on
@@ -336,14 +363,18 @@ impl<T: Tunnel> Engine<T> {
         }
     }
 
-    fn try_reconnect(&mut self, events: &mut Vec<EngineEvent>) {
+    fn try_reconnect(
+        &mut self,
+        events: &mut Vec<EngineEvent>,
+        observer: &mut impl FnMut(&Connection, &[EngineEvent]),
+    ) {
         let profile_id = match self.state.profile_id() {
             Some(id) => id.clone(),
             None => return,
         };
         // Treat reconnect as disconnect-then-connect at FSM level.
         self.try_disconnect(events);
-        self.try_connect(profile_id, events);
+        self.try_connect(profile_id, events, observer);
     }
 
     fn handle_tick(&mut self, events: &mut Vec<EngineEvent>) {
@@ -440,43 +471,12 @@ impl<T: Tunnel> Engine<T> {
         }
     }
 
-    fn handle_tunnel_status(
-        &mut self,
-        obs: TunnelStatusObservation,
-        events: &mut Vec<EngineEvent>,
-    ) {
-        // The scanner is now an input source. When it
-        // reports an active tunnel we don't know about, treat that as
-        // ground truth and transition to Connected. A follow-up fleshes
-        // this out with health updates.
-        if let TunnelStatusObservation::Active {
-            profile_id,
-            interface_name,
-            started_at,
-        } = obs
-        {
-            if matches!(self.state, Connection::Disconnected { .. }) {
-                self.state = Connection::Connected {
-                    profile_id: profile_id.clone(),
-                    since: started_at,
-                    health: crate::vortix_core::engine::state::ConnectionHealth::default(),
-                    details: Box::new(DetailedConnectionInfo {
-                        interface: interface_name.clone(),
-                        ..Default::default()
-                    }),
-                };
-                // We can't know the protocol from the observation alone;
-                // resolve via the profile resolver.
-                let protocol = (self.profile_resolver)(&profile_id)
-                    .map_or(ProtocolKind::WireGuard, |p| p.protocol);
-                events.push(EngineEvent::TunnelUp {
-                    profile_id,
-                    protocol,
-                    interface_name,
-                    pid: None,
-                });
-            }
-        }
+    fn handle_tunnel_status(obs: TunnelStatusObservation) {
+        // Generic scanner observations lack protocol identity, operation,
+        // generation, and handshake proof. Keep them observation-only. The
+        // canonical reconciler owns protocol-attested OpenVPN adoption; a
+        // managed connect reaches this FSM through `Tunnel::up` instead.
+        drop(obs);
     }
 
     fn transition_to_connected(
@@ -503,6 +503,9 @@ impl<T: Tunnel> Engine<T> {
             details: Box::new(DetailedConnectionInfo {
                 interface: handle.interface_name,
                 pid: handle.pid,
+                generation: handle.generation,
+                handshake: handle.handshake,
+                probe_receipts: handle.probe_receipts,
                 process_ownership: handle.process_ownership,
                 teardown_config: handle.teardown_config,
                 dns_request: handle.dns_request,
@@ -535,10 +538,22 @@ impl<T: Tunnel> Engine<T> {
         // The FSM doesn't track the last-seen `TunnelHandle` directly today
         // (Connected only carries DetailedConnectionInfo). Synthesise one
         // from the current state for tunnel.down().
-        let (interface, pid, process_ownership, teardown_config, dns_request) = match &self.state {
+        let (
+            interface,
+            pid,
+            generation,
+            handshake,
+            probe_receipts,
+            process_ownership,
+            teardown_config,
+            dns_request,
+        ) = match &self.state {
             Connection::Connected { details, .. } => (
                 details.interface.clone(),
                 details.pid,
+                details.generation,
+                details.handshake.clone(),
+                details.probe_receipts.clone(),
                 details.process_ownership.clone(),
                 details.teardown_config.clone(),
                 details.dns_request.clone(),
@@ -546,6 +561,9 @@ impl<T: Tunnel> Engine<T> {
             _ => (
                 String::new(),
                 None,
+                0,
+                None,
+                Vec::new(),
                 None,
                 None,
                 crate::vortix_core::ports::dns::DnsRequest::default(),
@@ -561,6 +579,9 @@ impl<T: Tunnel> Engine<T> {
             pid,
             started_at: SystemTime::now(),
             kind: self.tunnel.kind_tag(),
+            generation,
+            handshake,
+            probe_receipts,
             process_ownership,
             teardown_config,
             dns_request,
@@ -572,6 +593,14 @@ fn tunnel_err_to_failure(err: crate::vortix_core::ports::tunnel::TunnelError) ->
     use crate::vortix_core::ports::tunnel::TunnelError;
     match err {
         TunnelError::HandshakeFailed(s) => FailureReason::HandshakeFailed(s),
+        TunnelError::Cancelled => FailureReason::Other("tunnel operation cancelled".into()),
+        TunnelError::OutcomeUnknown(s) => {
+            FailureReason::Other(format!("ambiguous tunnel outcome: {s}"))
+        }
+        TunnelError::MalformedStatus(s) => FailureReason::Other(format!("malformed status: {s}")),
+        TunnelError::ResourceLimit { resource, limit } => {
+            FailureReason::Other(format!("{resource} exceeded limit {limit}"))
+        }
         TunnelError::AuthFailed(s) => FailureReason::AuthFailed(s),
         TunnelError::Timeout(d) => FailureReason::Timeout(d),
         TunnelError::DaemonExited(s) | TunnelError::Subprocess(s) | TunnelError::Other(s) => {
@@ -665,6 +694,23 @@ mod tests {
                 last_failure: Some(FailureReason::ProfileGone(_))
             }
         ));
+    }
+
+    #[test]
+    fn generic_scanner_presence_cannot_promote_disconnected() {
+        let mut engine = engine_with(MockTunnel::new());
+        let events = engine.handle(Input::TunnelStatusObserved(
+            TunnelStatusObservation::Active {
+                profile_id: ProfileId::new("corp"),
+                interface_name: "wg0".into(),
+                started_at: SystemTime::now(),
+            },
+        ));
+        assert!(matches!(
+            engine.state(),
+            Connection::Disconnected { last_failure: None }
+        ));
+        assert!(events.is_empty());
     }
 
     #[test]

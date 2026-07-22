@@ -17,9 +17,9 @@ use crate::vortix_core::control::command::{
 use crate::vortix_core::control::model::{
     AuthorityEpoch, ChallengeId, ChallengeKind, ChallengeRecord, ClientId, CompletionOutcome,
     ControlEvent, ControlEventEnvelope, DriftGates, EffectiveState, Freshness, GateEvidence,
-    Observation, ObservedTunnel, OperationCompletion, OperationId, OperationRecord,
-    OperationResult, OperationStatus, PolicyDigest, ProtectionEvidence, ProtectionStatus,
-    RequestedTunnelState, MAX_PROTECTION_AGE_MILLIS,
+    Observation, ObservedConnectionHealth, ObservedTunnel, OperationCompletion, OperationFailure,
+    OperationId, OperationRecord, OperationResult, OperationStatus, PolicyDigest,
+    ProtectionEvidence, ProtectionStatus, RequestedTunnelState, MAX_PROTECTION_AGE_MILLIS,
 };
 use crate::vortix_core::control::reconcile::{
     plan_reconciliation, DisconnectTombstone, InFlightMutation, ObservationOwnership,
@@ -73,6 +73,8 @@ pub struct ControlServiceConfig {
 /// Immutable profile resources used for admission and topology planning.
 #[derive(Debug, Clone, Default)]
 pub struct ProfileTopology {
+    /// Protocol kind required for protocol-specific convergence gates.
+    pub protocol: Option<crate::vortix_core::profile::ProtocolKind>,
     /// Protocol-authoritative interface, when it is known before connection.
     pub interface_name: Option<String>,
     /// Canonical CIDR claims requested by this profile.
@@ -1030,7 +1032,73 @@ fn drive_supervision(
     }
 
     while let Some(result) = supervisor.poll_tunnel() {
+        if let Some(handshake) = result
+            .handshake
+            .as_ref()
+            .filter(|handshake| result.result.is_ok() && handshake.generation == result.generation)
+        {
+            snapshot
+                .observed
+                .wireguard_handshakes
+                .insert(result.profile_id.clone(), handshake.clone());
+            snapshot
+                .observed
+                .wireguard_probe_receipts
+                .insert(result.profile_id.clone(), result.probe_receipts.clone());
+            events.push(ControlEvent::WireGuardHandshakeObserved {
+                profile_id: result.profile_id.clone(),
+                desired_generation: result.generation,
+                handshake_at_millis: system_time_millis(handshake.handshake_at),
+                observed_at_millis: system_time_millis(handshake.observed_at),
+            });
+        }
         if result.result.is_err() {
+            snapshot
+                .observed
+                .wireguard_handshakes
+                .remove(&result.profile_id);
+            snapshot
+                .observed
+                .wireguard_probe_receipts
+                .remove(&result.profile_id);
+            if result.result == Err(WorkFailure::HandshakeFailed) {
+                let was_recovery = owner.recovery_operations.contains(&result.operation_id);
+                events.push(ControlEvent::ConnectAttemptFailed {
+                    profile_id: result.profile_id.clone(),
+                    attempt: 1,
+                    reason: crate::vortix_core::engine::state::FailureReason::HandshakeFailed(
+                        "current-generation WireGuard peer evidence was not observed".into(),
+                    ),
+                });
+                let completion = complete_operation(
+                    OperationCompletion {
+                        operation_id: result.operation_id.clone(),
+                        desired_generation: result.generation,
+                        outcome: CompletionOutcome::Failed(OperationFailure::HandshakeFailed),
+                    },
+                    snapshot,
+                    owner,
+                    admission,
+                    now,
+                    events,
+                );
+                if !was_recovery
+                    && matches!(
+                        completion,
+                        Ok(CompletionResult::Terminal(OperationStatus::Failed))
+                    )
+                {
+                    start_recovery_operation(
+                        snapshot,
+                        owner,
+                        admission,
+                        now,
+                        selection,
+                        result.generation,
+                        events,
+                    );
+                }
+            }
             invalidate_gates(
                 snapshot,
                 DriftGates {
@@ -1242,6 +1310,21 @@ fn drive_supervision(
                 } else {
                     TunnelMutation::Disconnect
                 };
+                let Some(deadline) = Instant::now().checked_add(Duration::from_millis(remaining))
+                else {
+                    invalidate_gates(
+                        snapshot,
+                        DriftGates {
+                            interface: true,
+                            route: true,
+                            dns: true,
+                            firewall: true,
+                        },
+                        now,
+                        now,
+                    );
+                    continue;
+                };
                 let work = TunnelWork {
                     profile_id: profile_id.clone(),
                     operation_id: operation.id.clone(),
@@ -1249,7 +1332,22 @@ fn drive_supervision(
                     authority_epoch: action_revision.authority_epoch,
                     policy_digest: action_revision.digest.clone(),
                     mutation,
-                    deadline: Instant::now() + Duration::from_millis(remaining),
+                    protocol: config
+                        .profile_topologies
+                        .get(profile_id)
+                        .and_then(|topology| topology.protocol)
+                        .map_or(
+                            crate::vortix_core::ports::tunnel::TunnelKindTag::Mock,
+                            |protocol| match protocol {
+                                crate::vortix_core::profile::ProtocolKind::WireGuard => {
+                                    crate::vortix_core::ports::tunnel::TunnelKindTag::WireGuard
+                                }
+                                crate::vortix_core::profile::ProtocolKind::OpenVpn => {
+                                    crate::vortix_core::ports::tunnel::TunnelKindTag::OpenVpn
+                                }
+                            },
+                        ),
+                    deadline,
                 };
                 let key = (operation.id.clone(), profile_id.clone());
                 let reserved = owner.work_admissions.remove(&key).or_else(|| {
@@ -1336,13 +1434,28 @@ fn drive_supervision(
                 .iter()
                 .filter_map(|(profile, fact)| fact.active.then_some(profile.clone()))
                 .collect();
+            let Some(deadline) = Instant::now().checked_add(Duration::from_millis(
+                operation.deadline_millis.saturating_sub(now),
+            )) else {
+                invalidate_gates(
+                    snapshot,
+                    DriftGates {
+                        interface: true,
+                        route: true,
+                        dns: true,
+                        firewall: true,
+                    },
+                    now,
+                    now,
+                );
+                return;
+            };
             let policy = TopologyPolicy {
                 generation: revision.generation,
                 authority_epoch: revision.authority_epoch,
                 digest: revision.digest.clone(),
                 operation_id: operation.id.clone(),
-                deadline: Instant::now()
-                    + Duration::from_millis(operation.deadline_millis.saturating_sub(now)),
+                deadline,
                 prior: supervisor.applied_topology().unwrap_or_else(|| {
                     build_topology_state(
                         prior_profiles,
@@ -1427,6 +1540,13 @@ fn drive_supervision(
             }
         }
     }
+}
+
+fn system_time_millis(time: std::time::SystemTime) -> u64 {
+    time.duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 fn operation_for_generation(
@@ -1666,6 +1786,33 @@ fn apply_desired(command: &UserCommand, snapshot: &mut ControlSnapshot) {
         UserCommand::Connect { profile_id }
         | UserCommand::Reconnect {
             profile_id: Some(profile_id),
+        }
+        | UserCommand::Disconnect {
+            profile_id: Some(profile_id),
+        }
+        | UserCommand::ForceDisconnect {
+            profile_id: Some(profile_id),
+        } => {
+            snapshot.observed.wireguard_handshakes.remove(profile_id);
+            snapshot
+                .observed
+                .wireguard_probe_receipts
+                .remove(profile_id);
+            snapshot.observed.connection_health.remove(profile_id);
+        }
+        UserCommand::Disconnect { profile_id: None }
+        | UserCommand::ForceDisconnect { profile_id: None }
+        | UserCommand::Reconnect { profile_id: None } => {
+            snapshot.observed.wireguard_handshakes.clear();
+            snapshot.observed.wireguard_probe_receipts.clear();
+            snapshot.observed.connection_health.clear();
+        }
+        UserCommand::SetKillSwitch { .. } => {}
+    }
+    match command {
+        UserCommand::Connect { profile_id }
+        | UserCommand::Reconnect {
+            profile_id: Some(profile_id),
         } => {
             snapshot
                 .desired
@@ -1773,6 +1920,7 @@ fn observation_evidence(observation: &Observation) -> Option<&ProtectionEvidence
         Observation::Tunnel { protection, .. } | Observation::Drift { protection, .. } => {
             protection.as_ref()
         }
+        Observation::ConnectionHealth { .. } => None,
     }
 }
 
@@ -1799,6 +1947,9 @@ fn apply_observation(
             observed_at_millis, ..
         }
         | Observation::Drift {
+            observed_at_millis, ..
+        }
+        | Observation::ConnectionHealth {
             observed_at_millis, ..
         } => *observed_at_millis,
     };
@@ -1847,6 +1998,16 @@ fn apply_observation(
             profile_id: Some(profile_id),
             ..
         } => validate_observed_profile(profile_id, admission)?,
+        Observation::ConnectionHealth {
+            profile_id,
+            desired_generation,
+            ..
+        } => {
+            validate_observed_profile(profile_id, admission)?;
+            if *desired_generation != snapshot.desired.generation {
+                return Err(ObservationError::MismatchedProtection);
+            }
+        }
         _ => {}
     }
     for scope in scopes {
@@ -1864,6 +2025,9 @@ fn apply_observation(
             observed_at_millis,
             protection,
         } => {
+            if !active {
+                snapshot.observed.connection_health.remove(&profile_id);
+            }
             invalidate_gates(
                 snapshot,
                 DriftGates {
@@ -1900,6 +2064,22 @@ fn apply_observation(
                 snapshot.observed.evidence = Some(evidence);
                 snapshot.observed.evidence_received_at_millis = Some(now);
             }
+        }
+        Observation::ConnectionHealth {
+            profile_id,
+            desired_generation,
+            health,
+            observed_at_millis,
+        } => {
+            snapshot.observed.connection_health.insert(
+                profile_id,
+                ObservedConnectionHealth {
+                    desired_generation,
+                    health,
+                    observed_at_millis,
+                    received_at_millis: now,
+                },
+            );
         }
     }
     Ok(())
@@ -1976,6 +2156,9 @@ fn observation_scopes(observation: &Observation) -> Vec<ObservationScope> {
                 ]);
             }
             scopes
+        }
+        Observation::ConnectionHealth { profile_id, .. } => {
+            vec![ObservationScope::Profile(profile_id.clone())]
         }
     };
     scopes.sort();
@@ -2179,6 +2362,53 @@ fn expire_operations(
             desired_generation: snapshot.desired.generation,
         });
     }
+}
+
+/// Start a policy-owned retry only after the user-visible operation reached a
+/// typed terminal. This keeps idempotent callers from waiting until expiry,
+/// while preserving level-triggered convergence for unchanged desired state.
+fn start_recovery_operation(
+    snapshot: &mut ControlSnapshot,
+    owner: &mut OwnerState,
+    admission: &Arc<Mutex<AdmissionState>>,
+    now: u64,
+    selection: ExecutionSelection,
+    generation: u64,
+    events: &mut Vec<ControlEvent>,
+) {
+    if selection != ExecutionSelection::CanonicalAuthority
+        || generation != snapshot.desired.generation
+        || snapshot.operations.values().any(|operation| {
+            operation.desired_generation == generation && !operation.status.is_terminal()
+        })
+    {
+        return;
+    }
+    let recovery_id = {
+        let mut state = admission.lock().expect("admission mutex poisoned");
+        state.next_operation = state.next_operation.saturating_add(1);
+        OperationId::from_parts(snapshot.desired.authority_epoch, state.next_operation)
+    };
+    snapshot.operations.insert(
+        recovery_id.clone(),
+        OperationRecord {
+            id: recovery_id.clone(),
+            idempotency_key: IdempotencyKey::new(format!("service-recovery-{generation}-{now}")),
+            client_id: ClientId::from_parts(snapshot.desired.authority_epoch, 0),
+            command_digest: snapshot.desired.policy_digest.clone(),
+            authority_epoch: snapshot.desired.authority_epoch,
+            desired_generation: generation,
+            admitted_at_millis: now,
+            deadline_millis: now.saturating_add(30_000),
+            status: OperationStatus::WaitingForObservation,
+            result: None,
+        },
+    );
+    owner.recovery_operations.insert(recovery_id.clone());
+    events.push(ControlEvent::OperationAdmitted {
+        operation_id: recovery_id,
+        desired_generation: generation,
+    });
 }
 
 fn mark_terminal(admission: &Arc<Mutex<AdmissionState>>, operation_id: OperationId) {
