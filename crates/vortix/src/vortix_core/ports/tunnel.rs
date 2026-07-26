@@ -280,6 +280,22 @@ pub struct TunnelCapabilities {
 pub trait ParsedProfile: std::fmt::Debug + Send + Sync {
     fn as_any(&self) -> &dyn std::any::Any;
 
+    /// Convert already-parsed, validated protocol data into the narrow plan
+    /// accepted by privileged execution.
+    ///
+    /// Protocol implementations override this seam during the helper
+    /// cutover. The core never parses raw profile text and the returned type
+    /// cannot carry commands, paths, hooks, plugins, or arbitrary options.
+    fn privileged_plan(
+        &self,
+        _profile_id: &ProfileId,
+        _generation: u64,
+    ) -> Result<crate::vortix_core::privileged::ProtocolPlan, ParseError> {
+        Err(ParseError::Unsupported(
+            "privileged planning is not implemented for this protocol".to_owned(),
+        ))
+    }
+
     /// DNS servers this profile expects the system to apply (used to surface
     /// `resolvconf` dependency hints before connect). Empty when the profile
     /// has no `DNS = ...` directive.
