@@ -52,9 +52,10 @@ isolate applications running as the same Unix user from one another.
 
 U11 implements step 2's wire vocabulary and step 3's verification seam. U12's
 first typed slice adds replay-before-read observation, authenticated receipts,
-and post-delivery loss classification without a listener or platform executor.
-The `vortix-helper` binary exits with code 78 for every entrypoint except
-`--version`.
+post-delivery loss classification, bounded symmetric framing, and an opaque
+root-peer/fixed-socket/package-artifact proof without a listener or platform
+executor. The `vortix-helper` binary exits with code 78 for every entrypoint
+except `--version`.
 
 ## Admitted operation family
 
