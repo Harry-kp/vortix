@@ -24,11 +24,12 @@ use crate::vortix_core::privileged::{
     VerifiedReceipt,
 };
 
-const ENABLED_CAPABILITIES: [HelperCapability; 4] = [
+const ENABLED_CAPABILITIES: [HelperCapability; 5] = [
     HelperCapability::Handshake,
     HelperCapability::Observe,
     HelperCapability::TunnelLifecycle,
     HelperCapability::NetworkPolicy,
+    HelperCapability::CleanupOwned,
 ];
 
 /// Typed platform seam for read-back. Implementations may inspect only the
@@ -101,6 +102,17 @@ pub(crate) enum NetworkPolicyOutcome {
     Observed(Vec<ResourceObservation>),
 }
 
+/// Bounded recovery seam for resources already owned by this helper
+/// incarnation. The server authenticates every resource before entry and
+/// forgets ownership only after exact absence observations validate.
+pub(crate) trait CleanupExecutor {
+    fn cleanup_owned(
+        &mut self,
+        resources: &[ResourceTag],
+        children: &[ObservedChildIdentity],
+    ) -> Result<Vec<ResourceObservation>, PrivilegedExecutionError>;
+}
+
 /// Root-owned atomic persistence seam. A successful return means the replay
 /// checkpoint has reached durable storage before an executor is entered.
 pub(crate) trait ReplayStore {
@@ -126,7 +138,7 @@ pub(crate) struct EnrolledHelperSession<E, S> {
 
 impl<E, S> EnrolledHelperSession<E, S>
 where
-    E: ObservationExecutor + TunnelLifecycleExecutor + NetworkPolicyExecutor,
+    E: ObservationExecutor + TunnelLifecycleExecutor + NetworkPolicyExecutor + CleanupExecutor,
     S: ReplayStore,
 {
     pub(crate) fn resume(
@@ -209,6 +221,7 @@ where
                 | PrivilegedOperation::StartTunnel(_)
                 | PrivilegedOperation::StopTunnel(_)
                 | PrivilegedOperation::NetworkPolicy(_)
+                | PrivilegedOperation::CleanupOwned(_)
         ) {
             return Err(HelperError::CapabilityUnavailable {
                 capability: capability_for(request.operation()),
@@ -268,9 +281,9 @@ where
             PrivilegedOperation::NetworkPolicy(operation) => {
                 self.execute_network_policy(request, operation)
             }
-            PrivilegedOperation::CleanupOwned(_) => {
-                unreachable!("unsupported operations return before admission")
-            }
+            PrivilegedOperation::CleanupOwned(resources) => self
+                .cleanup_owned(request, resources)
+                .map_err(map_receipt_error),
         }?;
         self.last_receipt = Some(receipt.clone());
         receipt_result(receipt)
@@ -430,6 +443,87 @@ where
         Ok(receipt)
     }
 
+    fn cleanup_owned(
+        &mut self,
+        request: &crate::vortix_core::privileged::PrivilegedRequest,
+        resources: &[ResourceTag],
+    ) -> Result<VerifiedReceipt, ReceiptError> {
+        if resources.is_empty()
+            || resources
+                .iter()
+                .any(|resource| !self.owns_cleanup_resource(resource))
+        {
+            return self
+                .receipts
+                .rejected(request, RejectionCode::InvalidResource);
+        }
+
+        let children = self.cleanup_children(resources);
+        let observations = match self.executor.cleanup_owned(resources, &children) {
+            Ok(observations) => observations,
+            Err(error) => return self.execution_error_receipt(request, error),
+        };
+        let receipt = match self.receipts.observed(request, observations) {
+            Ok(receipt) => receipt,
+            Err(_) => self
+                .receipts
+                .ambiguous(request, AmbiguousPhase::EffectMayHaveApplied)?,
+        };
+        if !receipt.is_ambiguous() {
+            for resource in resources {
+                match resource.kind() {
+                    ResourceKind::Tunnel => {
+                        self.owned_tunnels.remove(resource);
+                    }
+                    ResourceKind::ProcessGroup => {
+                        if let Some(tunnel) = tunnel_for_profile_resource(resource) {
+                            self.owned_children.remove(&tunnel);
+                        }
+                    }
+                    ResourceKind::RuntimeSecret => {}
+                    ResourceKind::Firewall | ResourceKind::Dns | ResourceKind::Routes => {
+                        unreachable!("cleanup operation validation excludes policy resources")
+                    }
+                }
+            }
+        }
+        Ok(receipt)
+    }
+
+    fn owns_cleanup_resource(&self, resource: &ResourceTag) -> bool {
+        match resource.kind() {
+            ResourceKind::Tunnel => self.owned_tunnels.contains(resource),
+            ResourceKind::ProcessGroup => tunnel_for_profile_resource(resource)
+                .is_some_and(|tunnel| self.owned_children.contains_key(&tunnel)),
+            ResourceKind::RuntimeSecret
+            | ResourceKind::Firewall
+            | ResourceKind::Dns
+            | ResourceKind::Routes => false,
+        }
+    }
+
+    fn cleanup_children(&self, resources: &[ResourceTag]) -> Vec<ObservedChildIdentity> {
+        let mut children = BTreeMap::new();
+        for resource in resources {
+            let tunnel = match resource.kind() {
+                ResourceKind::Tunnel => Some(resource.clone()),
+                ResourceKind::ProcessGroup => tunnel_for_profile_resource(resource),
+                ResourceKind::RuntimeSecret
+                | ResourceKind::Firewall
+                | ResourceKind::Dns
+                | ResourceKind::Routes => None,
+            };
+            if let Some((tunnel, child)) = tunnel.and_then(|tunnel| {
+                self.owned_children
+                    .get(&tunnel)
+                    .map(|child| (tunnel, child))
+            }) {
+                children.insert(tunnel, child.identity().clone());
+            }
+        }
+        children.into_values().collect()
+    }
+
     fn execution_error_receipt(
         &self,
         request: &crate::vortix_core::privileged::PrivilegedRequest,
@@ -450,6 +544,10 @@ where
                 .ambiguous(request, AmbiguousPhase::EffectMayHaveApplied),
         }
     }
+}
+
+fn tunnel_for_profile_resource(resource: &ResourceTag) -> Option<ResourceTag> {
+    ResourceTag::tunnel(resource.profile_id()?.clone(), resource.generation()).ok()
 }
 
 fn capability_for(operation: &PrivilegedOperation) -> HelperCapability {
@@ -528,16 +626,27 @@ mod tests {
     }
 
     #[derive(Default)]
+    enum FakeCleanupEvidence {
+        #[default]
+        Absent,
+        Present,
+    }
+
+    #[derive(Default)]
     struct FakeExecutor {
         starts: usize,
         stops: usize,
         stops_with_child: usize,
         policy_calls: usize,
+        cleanups: usize,
+        cleanup_children: usize,
         containments: usize,
         foreground_start: bool,
         foreign_start: bool,
         containment_fails: bool,
         start_error: Option<PrivilegedExecutionError>,
+        cleanup_error: Option<PrivilegedExecutionError>,
+        cleanup_evidence: FakeCleanupEvidence,
     }
 
     impl ObservationExecutor for FakeExecutor {
@@ -636,6 +745,35 @@ mod tests {
                 | NetworkPolicyOperation::ApplyDns { .. }
                 | NetworkPolicyOperation::ApplyFirewall { .. } => Ok(NetworkPolicyOutcome::Applied),
             }
+        }
+    }
+
+    impl CleanupExecutor for FakeExecutor {
+        fn cleanup_owned(
+            &mut self,
+            resources: &[ResourceTag],
+            children: &[ObservedChildIdentity],
+        ) -> Result<Vec<ResourceObservation>, PrivilegedExecutionError> {
+            self.cleanups += 1;
+            self.cleanup_children += children.len();
+            if let Some(error) = self.cleanup_error {
+                return Err(error);
+            }
+            resources
+                .iter()
+                .cloned()
+                .map(|resource| {
+                    ResourceObservation::new(
+                        resource,
+                        match self.cleanup_evidence {
+                            FakeCleanupEvidence::Absent => ObservationState::Absent,
+                            FakeCleanupEvidence::Present => ObservationState::Present,
+                        },
+                        4,
+                    )
+                    .map_err(|_| PrivilegedExecutionError::EffectMayHaveApplied)
+                })
+                .collect()
         }
     }
 
@@ -762,6 +900,10 @@ mod tests {
 
         fn for_policy(executor: FakeExecutor) -> Self {
             Self::with_capability(executor, HelperCapability::NetworkPolicy)
+        }
+
+        fn for_cleanup(executor: FakeExecutor) -> Self {
+            Self::with_capability(executor, HelperCapability::CleanupOwned)
         }
 
         fn with_capability(executor: FakeExecutor, capability: HelperCapability) -> Self {
@@ -1146,6 +1288,77 @@ mod tests {
         assert_eq!(harness.server.executor.starts, 1);
         assert!(harness.server.owned_tunnels.is_empty());
         assert!(harness.server.owned_children.is_empty());
+    }
+
+    #[test]
+    fn cleanup_reaches_executor_only_for_exact_owned_resources_and_is_duplicate_safe() {
+        let mut harness = LifecycleHarness::for_cleanup(FakeExecutor {
+            foreground_start: true,
+            ..FakeExecutor::default()
+        });
+        let start = harness.request(1, PrivilegedOperation::StartTunnel(openvpn_plan(1)));
+        assert!(!harness.execute(2, &start).is_ambiguous());
+        let tunnel = resource();
+        let group = ResourceTag::profile(
+            tunnel.profile_id().unwrap().clone(),
+            tunnel.generation(),
+            ResourceKind::ProcessGroup,
+        )
+        .unwrap();
+        let cleanup = harness.request(2, PrivilegedOperation::CleanupOwned(vec![tunnel, group]));
+
+        for id in [3, 4] {
+            assert!(!harness.execute(id, &cleanup).is_ambiguous());
+        }
+        assert_eq!(harness.server.executor.cleanups, 1);
+        assert_eq!(harness.server.executor.cleanup_children, 1);
+        assert!(harness.server.owned_tunnels.is_empty());
+        assert!(harness.server.owned_children.is_empty());
+    }
+
+    #[test]
+    fn forged_cleanup_ownership_never_reaches_executor() {
+        let mut harness = LifecycleHarness::for_cleanup(FakeExecutor::default());
+        let start = harness.request(1, PrivilegedOperation::StartTunnel(wireguard_plan(1)));
+        assert!(!harness.execute(2, &start).is_ambiguous());
+        let secret = ResourceTag::profile(
+            resource().profile_id().unwrap().clone(),
+            1,
+            ResourceKind::RuntimeSecret,
+        )
+        .unwrap();
+        let cleanup = harness.request(
+            2,
+            PrivilegedOperation::CleanupOwned(vec![resource(), secret]),
+        );
+
+        assert!(!harness.execute(3, &cleanup).is_ambiguous());
+        assert_eq!(harness.server.executor.cleanups, 0);
+        assert!(harness.server.owned_tunnels.contains(&resource()));
+    }
+
+    #[test]
+    fn empty_cleanup_never_reaches_executor() {
+        let mut harness = LifecycleHarness::for_cleanup(FakeExecutor::default());
+        let cleanup = harness.request(1, PrivilegedOperation::CleanupOwned(Vec::new()));
+
+        assert!(!harness.execute(2, &cleanup).is_ambiguous());
+        assert_eq!(harness.server.executor.cleanups, 0);
+    }
+
+    #[test]
+    fn cleanup_keeps_ownership_when_absence_cannot_be_proven() {
+        let mut harness = LifecycleHarness::for_cleanup(FakeExecutor::default());
+        let start = harness.request(1, PrivilegedOperation::StartTunnel(wireguard_plan(1)));
+        assert!(!harness.execute(2, &start).is_ambiguous());
+        harness.server.executor.cleanup_evidence = FakeCleanupEvidence::Present;
+        let cleanup = harness.request(2, PrivilegedOperation::CleanupOwned(vec![resource()]));
+
+        for id in [3, 4] {
+            assert!(harness.execute(id, &cleanup).is_ambiguous());
+        }
+        assert_eq!(harness.server.executor.cleanups, 1);
+        assert!(harness.server.owned_tunnels.contains(&resource()));
     }
 
     #[test]
