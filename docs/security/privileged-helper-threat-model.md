@@ -1,9 +1,10 @@
 # Privileged helper threat model
 
-Status: U11 contract frozen; U12 authenticated observation/recovery core is
-implemented but dormant; helper staged and **unenrolled**. No privileged
-operation is reachable in this release. U12 enables remaining operation
-families behind the dormant boundary; U13 alone may enroll authority.
+Status: U11 contract frozen; U12 authenticated observation/recovery and tunnel
+lifecycle admission cores are implemented but dormant; helper staged and
+**unenrolled**. No privileged operation is reachable in this release. U12
+enables remaining operation families behind the dormant boundary; U13 alone
+may enroll authority.
 
 ## Security objective
 
@@ -51,11 +52,12 @@ isolate applications running as the same Unix user from one another.
    sequence.
 
 U11 implements step 2's wire vocabulary and step 3's verification seam. U12's
-first typed slice adds replay-before-read observation, authenticated receipts,
-post-delivery loss classification, bounded symmetric framing, and an opaque
-root-peer/fixed-socket/package-artifact proof without a listener or platform
-executor. The `vortix-helper` binary exits with code 78 for every entrypoint
-except `--version`.
+first typed slices add replay-before-effect admission, authenticated receipts,
+post-delivery loss classification, bounded symmetric framing, an opaque
+root-peer/fixed-socket/package-artifact proof, and exact tunnel-child ownership
+with duplicate-safe lifecycle receipts. No listener or production platform
+executor exists yet. The `vortix-helper` binary exits with code 78 for every
+entrypoint except `--version`.
 
 ## Admitted operation family
 
@@ -93,6 +95,11 @@ profile parsing, hooks, or arbitrary cleanup.
   and canonical semantic digest. Same-ID/different-digest requests fail.
 - The root replay high-water record is monotonic, boot/lease bound, and written
   atomically before an effect is admitted.
+- A tunnel start becomes owned only after its OS-observed profile/generation
+  and containment identity exactly match the admitted plan. A duplicate of the
+  current operation returns the cached receipt instead of executing again.
+- Stop reaches the executor only for an exact child owned by the current helper
+  incarnation and completes only on an exact absent observation after reap.
 - PID identity always includes a process start token and containment identity;
   a numeric PID alone is never ownership evidence.
 
