@@ -1,682 +1,789 @@
-//! Daemon IPC server loop.
-//!
-//! Single-client-at-a-time. Accept → peer-UID check → read frame →
-//! dispatch → write response → loop until client disconnects.
-//! Multi-client support is follow-up scope.
+//! Bounded, authenticated IPC for the passive daemon candidate.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
-use crate::vortix_core::engine::EngineHandle;
-use crate::vortix_core::ipc::{
-    decode_frame, encode_frame, FrameError, IpcError, IpcOp, IpcRequest, IpcResponse, IpcResult,
-};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::{mpsc, oneshot, watch, Semaphore};
+use tokio::task::JoinSet;
 
-/// The daemon server. Holds the socket binding, engine handle, and
-/// the effective UID captured at bind time for peer-UID enforcement.
+use super::passive::{legacy_connection, PassiveQueryProvider};
+use crate::vortix_core::ipc::{
+    negotiate_passive, FrameError, IpcCapability, IpcError, IpcOp, IpcRequest, IpcResponse,
+    IpcResult, PassiveSnapshot, MAX_FRAME_BYTES,
+};
+
+const MAX_CONNECTIONS: usize = 32;
+const MAX_REQUEST_IDS: usize = 128;
+const OUTPUT_CAPACITY: usize = 16;
+const FRAME_TIMEOUT: Duration = Duration::from_secs(5);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+struct EmptyQueryProvider {
+    events: tokio::sync::broadcast::Sender<PassiveSnapshot>,
+}
+
+impl EmptyQueryProvider {
+    fn new() -> Self {
+        let (events, _) = tokio::sync::broadcast::channel(1);
+        Self { events }
+    }
+}
+
+impl PassiveQueryProvider for EmptyQueryProvider {
+    fn snapshot(&self) -> PassiveSnapshot {
+        PassiveSnapshot::default()
+    }
+
+    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<PassiveSnapshot> {
+        self.events.subscribe()
+    }
+}
+
+/// Passive daemon server. It has no field capable of executing a command,
+/// loading desired intent, or applying network policy.
 pub struct DaemonServer {
     socket_path: PathBuf,
     listener: UnixListener,
-    engine_handle: Option<Arc<EngineHandle>>,
-    /// The effective UID of the daemon process at bind time. Every
-    /// accepted client is checked against this value via
-    /// `SO_PEERCRED` (Linux) / `getpeereid(2)` (macOS) and rejected
-    /// if they do not match. This is the security boundary that
-    /// prevents a local UID escalation from compromising the daemon
-    /// even when the socket file's mode 0600 has been bypassed.
+    provider: Arc<dyn PassiveQueryProvider>,
     daemon_uid: u32,
+    socket_identity: SocketIdentity,
+    shutdown: watch::Sender<bool>,
 }
 
 impl DaemonServer {
-    /// Bind the daemon socket. Cleans up any stale file at the path.
-    ///
-    /// The returned server has no engine handle attached; clients see
-    /// structured "engine handle not initialized" errors for
-    /// `Execute`/`Snapshot`/`Subscribe`. Use [`Self::with_engine_handle`]
-    /// to attach a `EngineHandle::Local` so dispatch routes through the
-    /// real FSM actor.
-    ///
-    /// # Errors
-    ///
-    /// Returns `io::Error` when the parent directory is unwritable or
-    /// the bind itself fails.
+    /// Bind a private owner socket without replacing a live or foreign path.
     pub fn bind(socket_path: PathBuf) -> std::io::Result<Self> {
-        // Best-effort cleanup of a stale socket from a crashed previous run.
-        let _ = std::fs::remove_file(&socket_path);
+        prepare_socket_path(&socket_path)?;
         let listener = UnixListener::bind(&socket_path)?;
-        // Restrict access — only the daemon's owning UID should be
-        // able to connect at the filesystem level. SO_PEERCRED /
-        // getpeereid auth (below, on each accept) is the in-depth
-        // guard on top of this.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&socket_path)?.permissions();
-            perms.set_mode(0o600);
-            std::fs::set_permissions(&socket_path, perms)?;
-        }
-        // SAFETY: `geteuid` is a vDSO-fast syscall on Linux and a
-        // trivial syscall on macOS. It cannot fail and has no
-        // pointer arguments.
-        #[allow(unsafe_code)]
-        let daemon_uid = unsafe { libc::geteuid() };
+        set_socket_mode(&socket_path)?;
+        let socket_identity = SocketIdentity::read(&socket_path)?;
         Ok(Self {
             socket_path,
             listener,
-            engine_handle: None,
-            daemon_uid,
+            provider: Arc::new(EmptyQueryProvider::new()),
+            daemon_uid: effective_uid(),
+            socket_identity,
+            shutdown: watch::channel(false).0,
         })
     }
 
-    /// Attach an engine handle so dispatch routes `Execute`/`Snapshot`/
-    /// `Subscribe` through it. Without this, the daemon responds with
-    /// structured "engine handle not initialized" errors so clients see
-    /// typed wire errors instead of empty responses or connection drops.
     #[must_use]
-    pub fn with_engine_handle(mut self, handle: EngineHandle) -> Self {
-        self.engine_handle = Some(Arc::new(handle));
+    pub fn with_query_provider(mut self, provider: Arc<dyn PassiveQueryProvider>) -> Self {
+        self.provider = provider;
         self
     }
 
-    /// Path to the bound socket.
     #[must_use]
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
     }
 
-    /// The daemon's own effective UID, captured at bind time. Used
-    /// to authenticate connecting clients on each accept.
     #[must_use]
-    pub fn daemon_uid(&self) -> u32 {
+    pub const fn daemon_uid(&self) -> u32 {
         self.daemon_uid
     }
 
-    /// Accept loop. Returns when the listener is dropped or SIGTERM
-    /// arrives (caller handles signal observation; this future
-    /// terminates cleanly via `select!` from the caller).
+    /// Serve bounded concurrent clients until an authenticated shutdown.
     pub async fn run(self) -> std::io::Result<()> {
-        eprintln!("vortix daemon: listening on {}", self.socket_path.display());
-        if self.engine_handle.is_none() {
-            tracing::warn!(
-                "daemon started without an engine handle — Execute/Snapshot/Subscribe will return Internal errors"
-            );
-        }
-        let daemon_uid = self.daemon_uid;
+        eprintln!(
+            "vortix daemon: passive candidate listening on {}",
+            self.socket_path.display()
+        );
+        let capacity = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+        let mut shutdown = self.shutdown.subscribe();
+        let mut clients = JoinSet::new();
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         loop {
-            match self.listener.accept().await {
-                Ok((stream, _addr)) => {
-                    let handle = self.engine_handle.clone();
-                    if let Err(e) = handle_client(stream, daemon_uid, handle).await {
-                        eprintln!("vortix daemon: client session ended: {e}");
+            tokio::select! {
+                _ = terminate.recv() => break,
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
                     }
                 }
-                Err(e) => {
-                    eprintln!("vortix daemon: accept failed: {e}");
-                    // Brief backoff before re-accepting to avoid
-                    // tight loop on persistent failure.
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                accepted = self.listener.accept() => {
+                    let (mut stream, _) = accepted?;
+                    let Ok(permit) = Arc::clone(&capacity).try_acquire_owned() else {
+                        let _ = write_response_direct(&mut stream, IpcResponse {
+                            id: 0,
+                            result: Err(IpcError::ServerBusy),
+                        }).await;
+                        continue;
+                    };
+                    let provider = Arc::clone(&self.provider);
+                    let shutdown = self.shutdown.clone();
+                    let daemon_uid = self.daemon_uid;
+                    clients.spawn(async move {
+                        let _permit = permit;
+                        if let Err(error) = handle_client(stream, daemon_uid, provider, shutdown).await {
+                            tracing::debug!(%error, "passive daemon client closed");
+                        }
+                    });
+                }
+                joined = clients.join_next(), if !clients.is_empty() => {
+                    if let Some(Err(error)) = joined {
+                        tracing::warn!(%error, "passive daemon client task failed");
+                    }
                 }
             }
         }
+        let _ = self.shutdown.send(true);
+        let drain = async { while clients.join_next().await.is_some() {} };
+        let _ = tokio::time::timeout(FRAME_TIMEOUT + WRITE_TIMEOUT, drain).await;
+        Ok(())
     }
 }
 
 impl Drop for DaemonServer {
     fn drop(&mut self) {
-        // Unlink the socket file on shutdown so the next daemon start
-        // doesn't trip over a stale file.
-        let _ = std::fs::remove_file(&self.socket_path);
+        if SocketIdentity::read(&self.socket_path).ok().as_ref() == Some(&self.socket_identity) {
+            let _ = std::fs::remove_file(&self.socket_path);
+        }
     }
 }
 
-/// Handle one client connection. Reads framed requests, dispatches
-/// them, writes framed responses. Returns when the client disconnects.
-///
-/// Before any dispatching, the peer's UID is checked against the
-/// daemon's own UID via `SO_PEERCRED` (Linux) / `getpeereid` (macOS).
-/// A mismatched peer receives a single `IpcError::Unauthorized` frame
-/// (best-effort) and the connection is closed.
+struct Outbound {
+    response: IpcResponse,
+    written: oneshot::Sender<Result<(), String>>,
+}
+
 async fn handle_client(
-    mut stream: UnixStream,
+    stream: UnixStream,
     daemon_uid: u32,
-    engine_handle: Option<Arc<EngineHandle>>,
+    provider: Arc<dyn PassiveQueryProvider>,
+    shutdown: watch::Sender<bool>,
 ) -> Result<(), DaemonError> {
-    // Peer-UID enforcement runs before any frame is read so an
-    // unauthorized client never gets the chance to drive dispatch.
-    match get_peer_uid(&stream) {
-        Ok(peer_uid) if peer_uid == daemon_uid => { /* authorized; fall through */ }
-        Ok(peer_uid) => {
-            tracing::warn!(peer_uid, daemon_uid, "rejecting client with UID mismatch");
-            // Best-effort notify-and-close: write a single
-            // Unauthorized frame so the client surfaces a typed
-            // error rather than an opaque EOF.
-            let resp = IpcResponse {
+    if get_peer_uid(&stream)? != daemon_uid {
+        let mut stream = stream;
+        let _ = write_response_direct(
+            &mut stream,
+            IpcResponse {
                 id: 0,
                 result: Err(IpcError::Unauthorized),
-            };
-            if let Ok(frame) = encode_frame(&resp) {
-                let _ = stream.write_all(&frame).await;
-                let _ = stream.shutdown().await;
-            }
-            return Ok(());
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "peer-UID lookup failed; closing connection");
-            let resp = IpcResponse {
-                id: 0,
-                result: Err(IpcError::Internal(format!("peer-UID lookup failed: {e}"))),
-            };
-            if let Ok(frame) = encode_frame(&resp) {
-                let _ = stream.write_all(&frame).await;
-                let _ = stream.shutdown().await;
-            }
-            return Ok(());
-        }
+            },
+        )
+        .await;
+        return Ok(());
     }
 
-    let mut buf = Vec::with_capacity(4096);
-    let mut read_pos = 0usize;
-    loop {
-        // Read into buf.
-        let mut chunk = [0u8; 4096];
-        let n = stream.read(&mut chunk).await?;
-        if n == 0 {
-            // EOF — client closed.
-            return Ok(());
-        }
-        buf.extend_from_slice(&chunk[..n]);
+    let (mut reader, writer) = stream.into_split();
+    let (output, output_rx) = mpsc::channel(OUTPUT_CAPACITY);
+    let writer_task = tokio::spawn(writer_loop(writer, output_rx));
+    let result = connection_loop(&mut reader, &output, provider, shutdown).await;
+    drop(output);
+    let _ = writer_task.await;
+    result
+}
 
-        // Drain as many full frames as we have.
-        loop {
-            match decode_frame::<IpcRequest>(&buf[read_pos..]) {
-                Ok(None) => break, // need more bytes
-                Ok(Some((req, consumed))) => {
-                    read_pos += consumed;
-                    let resp = dispatch(req, engine_handle.as_deref()).await;
-                    let frame = encode_frame(&resp).map_err(DaemonError::Frame)?;
-                    stream.write_all(&frame).await?;
-                }
-                Err(e) => return Err(DaemonError::Frame(e)),
-            }
+async fn connection_loop<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    output: &mpsc::Sender<Outbound>,
+    provider: Arc<dyn PassiveQueryProvider>,
+    shutdown: watch::Sender<bool>,
+) -> Result<(), DaemonError> {
+    let first = read_request(reader).await?;
+    let IpcOp::Handshake { hello } = &first.op else {
+        send_response(
+            output,
+            IpcResponse {
+                id: first.id,
+                result: Err(IpcError::HandshakeRequired),
+            },
+        )
+        .await?;
+        return Ok(());
+    };
+    let negotiated = negotiate_passive(hello);
+    let handshake_ok = negotiated.is_ok();
+    send_response(
+        output,
+        IpcResponse {
+            id: first.id,
+            result: negotiated.map(|hello| IpcResult::Handshake { hello }),
+        },
+    )
+    .await?;
+    if !handshake_ok {
+        return Ok(());
+    }
+
+    let mut requests = BTreeMap::<u64, (Vec<u8>, IpcResponse)>::new();
+    let mut shutdown_receiver = shutdown.subscribe();
+    loop {
+        let request = tokio::select! {
+            () = wait_for_shutdown(&mut shutdown_receiver) => return Ok(()),
+            request = read_request(reader) => request?,
+        };
+        if matches!(request.op, IpcOp::Handshake { .. }) {
+            send_response(
+                output,
+                IpcResponse {
+                    id: request.id,
+                    result: Err(IpcError::MalformedRequest(
+                        "handshake may appear only once".into(),
+                    )),
+                },
+            )
+            .await?;
+            continue;
         }
-        // Compact the buffer when we've consumed a meaningful chunk.
-        if read_pos > 0 && read_pos >= buf.len() / 2 {
-            buf.drain(..read_pos);
-            read_pos = 0;
+        let digest = serde_json::to_vec(&request.op).map_err(FrameError::Serialize)?;
+        if let Some((prior_digest, prior_response)) = requests.get(&request.id) {
+            let response = if prior_digest == &digest {
+                prior_response.clone()
+            } else {
+                IpcResponse {
+                    id: request.id,
+                    result: Err(IpcError::DuplicateRequestId),
+                }
+            };
+            send_response(output, response).await?;
+            continue;
+        }
+        if requests.len() >= MAX_REQUEST_IDS {
+            send_response(
+                output,
+                IpcResponse {
+                    id: request.id,
+                    result: Err(IpcError::MalformedRequest(
+                        "request-id retention is full; reconnect".into(),
+                    )),
+                },
+            )
+            .await?;
+            continue;
+        }
+
+        let subscribe = matches!(request.op, IpcOp::Subscribe | IpcOp::PassiveSubscribe);
+        let mut subscription = subscribe.then(|| provider.subscribe());
+        let response = dispatch(&request, provider.as_ref(), &shutdown);
+        let subscription_boundary = match &response.result {
+            Ok(IpcResult::PassiveSubscribed { snapshot }) => snapshot.generation,
+            _ => 0,
+        };
+        requests.insert(request.id, (digest, response.clone()));
+        send_response(output, response).await?;
+        if let Some(receiver) = subscription.as_mut() {
+            stream_snapshots(
+                reader,
+                output,
+                provider.as_ref(),
+                receiver,
+                subscription_boundary,
+                &shutdown,
+            )
+            .await?;
+            return Ok(());
         }
     }
 }
 
-/// Look up the peer UID on an accepted Unix-domain socket connection.
-///
-/// Linux uses `SO_PEERCRED` (returns `struct ucred` with pid/uid/gid).
-/// macOS uses `getpeereid(2)` (returns uid + gid directly). Both are
-/// syscall-level primitives with no portable abstraction in `std` or
-/// `tokio`, hence the platform cfg gating lives here rather than in a
-/// `vortix-platform-*` crate.
-#[cfg(unix)]
-#[allow(unsafe_code)]
-fn get_peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
-    use std::os::unix::io::AsRawFd;
-    let fd = stream.as_raw_fd();
+fn dispatch(
+    request: &IpcRequest,
+    provider: &dyn PassiveQueryProvider,
+    shutdown: &watch::Sender<bool>,
+) -> IpcResponse {
+    let result = match &request.op {
+        IpcOp::Handshake { .. } => Err(IpcError::HandshakeRequired),
+        IpcOp::Execute(_) => Err(IpcError::CapabilityUnavailable {
+            capability: IpcCapability::ControlMutation,
+        }),
+        IpcOp::Snapshot => Ok(IpcResult::Snapshot {
+            state: legacy_connection(&provider.snapshot()),
+        }),
+        IpcOp::PassiveSnapshot => Ok(IpcResult::PassiveSnapshot {
+            snapshot: provider.snapshot(),
+        }),
+        IpcOp::Subscribe | IpcOp::PassiveSubscribe => Ok(IpcResult::PassiveSubscribed {
+            snapshot: provider.snapshot(),
+        }),
+        IpcOp::Shutdown => {
+            let _ = shutdown.send(true);
+            Ok(IpcResult::ShuttingDown)
+        }
+    };
+    IpcResponse {
+        id: request.id,
+        result,
+    }
+}
 
-    // xtask:allow-platform-cfg: SO_PEERCRED/getpeereid are syscall-level primitives, no abstraction layer available.
-    #[cfg(target_os = "linux")]
-    {
-        // SAFETY: `getsockopt` writes at most `len` bytes into the
-        // pointer we provide. We zero-initialize a `ucred` (a POD
-        // struct of three integers) and pass its size; the kernel
-        // either fills it and returns 0, or returns -1 and sets
-        // errno without touching the buffer.
-        unsafe {
-            let mut cred: libc::ucred = std::mem::zeroed();
-            let mut len = libc::socklen_t::try_from(std::mem::size_of::<libc::ucred>()).expect(
-                "ucred size fits in socklen_t (a small POD struct on every supported target)",
-            );
-            let rc = libc::getsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_PEERCRED,
-                std::ptr::addr_of_mut!(cred).cast::<libc::c_void>(),
-                std::ptr::from_mut(&mut len),
-            );
-            if rc != 0 {
-                return Err(std::io::Error::last_os_error());
+async fn stream_snapshots<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    output: &mpsc::Sender<Outbound>,
+    provider: &dyn PassiveQueryProvider,
+    receiver: &mut tokio::sync::broadcast::Receiver<PassiveSnapshot>,
+    boundary: u64,
+    shutdown: &watch::Sender<bool>,
+) -> Result<(), DaemonError> {
+    let mut probe = [0_u8; 1];
+    let mut shutdown_receiver = shutdown.subscribe();
+    loop {
+        tokio::select! {
+            () = wait_for_shutdown(&mut shutdown_receiver) => return Ok(()),
+            read = reader.read(&mut probe) => {
+                match read {
+                    Ok(0) => return Ok(()),
+                    Ok(_) => return Err(DaemonError::Protocol("subscription connections are read-only".into())),
+                    Err(error) => return Err(DaemonError::Io(error)),
+                }
             }
-            Ok(cred.uid)
+            event = receiver.recv() => match event {
+                Ok(snapshot) if snapshot.generation > boundary => {
+                    send_response(output, IpcResponse {
+                        id: 0,
+                        result: Ok(IpcResult::PassiveEvent { snapshot }),
+                    }).await?;
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    send_response(output, IpcResponse {
+                        id: 0,
+                        result: Ok(IpcResult::ResyncRequired {
+                            newest_generation: provider.snapshot().generation,
+                        }),
+                    }).await?;
+                    return Ok(());
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+            }
         }
     }
+}
 
-    // xtask:allow-platform-cfg: SO_PEERCRED/getpeereid are syscall-level primitives, no abstraction layer available.
-    #[cfg(target_os = "macos")]
-    {
-        // SAFETY: `getpeereid` writes exactly one `uid_t` and one
-        // `gid_t` into the two out-pointers we provide. We pass
-        // pointers to stack locals of the correct types.
-        unsafe {
-            let mut uid: libc::uid_t = 0;
-            let mut gid: libc::gid_t = 0;
-            let rc = libc::getpeereid(
-                fd,
-                std::ptr::from_mut(&mut uid),
-                std::ptr::from_mut(&mut gid),
-            );
-            if rc != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(uid)
+async fn wait_for_shutdown(receiver: &mut watch::Receiver<bool>) {
+    if *receiver.borrow() {
+        return;
+    }
+    while receiver.changed().await.is_ok() {
+        if *receiver.borrow() {
+            return;
         }
     }
+}
 
-    // xtask:allow-platform-cfg: SO_PEERCRED/getpeereid are syscall-level primitives, no abstraction layer available.
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+async fn writer_loop<W: AsyncWrite + Unpin>(mut writer: W, mut output: mpsc::Receiver<Outbound>) {
+    while let Some(outbound) = output.recv().await {
+        let result = write_response_direct(&mut writer, outbound.response)
+            .await
+            .map_err(|error| error.to_string());
+        let failed = result.is_err();
+        let _ = outbound.written.send(result);
+        if failed {
+            return;
+        }
+    }
+    let _ = writer.shutdown().await;
+}
+
+async fn send_response(
+    output: &mpsc::Sender<Outbound>,
+    response: IpcResponse,
+) -> Result<(), DaemonError> {
+    let (written, completion) = oneshot::channel();
+    output
+        .send(Outbound { response, written })
+        .await
+        .map_err(|_| DaemonError::Protocol("connection writer stopped".into()))?;
+    tokio::time::timeout(WRITE_TIMEOUT, completion)
+        .await
+        .map_err(|_| DaemonError::Timeout("response write"))?
+        .map_err(|_| DaemonError::Protocol("connection writer stopped".into()))?
+        .map_err(DaemonError::Protocol)
+}
+
+async fn write_response_direct<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    response: IpcResponse,
+) -> Result<(), DaemonError> {
+    let frame = crate::vortix_core::ipc::encode_frame(&response)?;
+    tokio::time::timeout(WRITE_TIMEOUT, writer.write_all(&frame))
+        .await
+        .map_err(|_| DaemonError::Timeout("response write"))??;
+    Ok(())
+}
+
+async fn read_request<R: AsyncRead + Unpin>(reader: &mut R) -> Result<IpcRequest, DaemonError> {
+    read_request_with_timeout(reader, FRAME_TIMEOUT).await
+}
+
+async fn read_request_with_timeout<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    timeout: Duration,
+) -> Result<IpcRequest, DaemonError> {
+    let mut header = [0_u8; 4];
+    tokio::time::timeout(timeout, reader.read_exact(&mut header))
+        .await
+        .map_err(|_| DaemonError::Timeout("frame header"))??;
+    let body_len = u32::from_be_bytes(header) as usize;
+    if body_len > MAX_FRAME_BYTES {
+        return Err(DaemonError::Frame(FrameError::TooLarge {
+            got: body_len,
+            max: MAX_FRAME_BYTES,
+        }));
+    }
+    let mut body = vec![0_u8; body_len];
+    tokio::time::timeout(timeout, reader.read_exact(&mut body))
+        .await
+        .map_err(|_| DaemonError::Timeout("frame body"))??;
+    serde_json::from_slice(&body)
+        .map_err(FrameError::Serialize)
+        .map_err(DaemonError::Frame)
+}
+
+fn prepare_socket_path(path: &Path) -> std::io::Result<()> {
+    if std::fs::symlink_metadata(path.parent().unwrap_or_else(|| Path::new(".")))
+        .is_ok_and(|metadata| metadata.file_type().is_symlink() || !metadata.is_dir())
     {
-        let _ = fd;
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "daemon socket parent must be a real directory",
+        ));
+    }
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
+        if !metadata.file_type().is_socket()
+            || metadata.uid() != effective_uid()
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "refusing to replace unsafe or foreign daemon socket path",
+            ));
+        }
+        let identity = (metadata.dev(), metadata.ino());
+        match std::os::unix::net::UnixStream::connect(path) {
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AddrInUse,
+                    "daemon socket is already accepting connections",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {}
+            Err(error) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AddrInUse,
+                    format!("daemon socket liveness is ambiguous: {error}"),
+                ));
+            }
+        }
+        let current = std::fs::symlink_metadata(path)?;
+        if !current.file_type().is_socket() || (current.dev(), current.ino()) != identity {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "daemon socket changed during stale-path validation",
+            ));
+        }
+    }
+    std::fs::remove_file(path)
+}
+
+fn set_socket_mode(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SocketIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl SocketIdentity {
+    fn read(path: &Path) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let metadata = std::fs::symlink_metadata(path)?;
+            return Ok(Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            });
+        }
+        #[allow(unreachable_code)]
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
-            "peer-UID lookup not supported on this unix variant",
+            "Unix socket identity is unavailable",
         ))
     }
 }
 
-/// Route one `IpcRequest` to the engine handle (if attached) and build
-/// the response envelope.
-///
-/// `Subscribe` is acknowledged synchronously — turning the connection
-/// into a streaming event channel is follow-up scope (the wire contract
-/// reserves it). For now clients can correlate the `Subscribed` ack and
-/// then poll `Snapshot` until the streaming half lands.
-async fn dispatch(req: IpcRequest, engine_handle: Option<&EngineHandle>) -> IpcResponse {
-    let result = match req.op {
-        IpcOp::Execute(cmd) => match engine_handle {
-            Some(h) => match h.execute_command(cmd).await {
-                Ok(_ack) => Ok(IpcResult::Accepted),
-                Err(e) => Err(IpcError::Internal(format!("engine error: {e}"))),
-            },
-            None => Err(IpcError::Internal(
-                "engine handle not initialized in daemon".into(),
-            )),
-        },
-        IpcOp::Snapshot => match engine_handle {
-            Some(h) => match h.snapshot().await {
-                // v1-compat: populate `Snapshot { state }` with the
-                // primary's Connection (or Disconnected when no
-                // primary). New v2 callers should switch to
-                // `RegistrySnapshot` once they upgrade — see plan
-                // the multi-tunnel wire work. Today the EngineHandle exposes a single
-                // FSM (D1 wired the single-tunnel handle in the
-                // daemon); the registry-aware variant lands when a
-                // follow-up unit threads the registry into the
-                // daemon's accept loop.
-                Ok(snap) => Ok(IpcResult::Snapshot { state: snap.state }),
-                Err(e) => Err(IpcError::Internal(format!("snapshot error: {e}"))),
-            },
-            None => Err(IpcError::Internal(
-                "engine handle not initialized in daemon".into(),
-            )),
-        },
-        IpcOp::Subscribe => {
-            // v1: ack only. Promoting this connection into an event
-            // stream (server-pushed `IpcResponse`-like envelopes after
-            // the ack) is a follow-up unit — the wire contract reserves
-            // it but no client consumes it today.
-            if engine_handle.is_some() {
-                tracing::warn!(
-                    "daemon: Subscribe acknowledged but streaming half is not yet implemented — clients should poll Snapshot until the streaming unit lands"
-                );
-                Ok(IpcResult::Subscribed)
-            } else {
-                Err(IpcError::Internal(
-                    "engine handle not initialized in daemon".into(),
-                ))
-            }
+fn effective_uid() -> u32 {
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid returns a scalar and has no failure mode.
+        #[allow(unsafe_code)]
+        unsafe {
+            libc::geteuid()
         }
-        IpcOp::Shutdown => Ok(IpcResult::ShuttingDown),
-    };
-    IpcResponse { id: req.id, result }
-}
-
-#[derive(Debug)]
-pub enum DaemonError {
-    Io(std::io::Error),
-    Frame(FrameError),
-}
-
-impl std::fmt::Display for DaemonError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io(e) => write!(f, "IO error on client session: {e}"),
-            Self::Frame(e) => write!(f, "frame protocol error: {e}"),
-        }
+    }
+    #[cfg(not(unix))]
+    {
+        0
     }
 }
 
-impl std::error::Error for DaemonError {}
-
-impl From<std::io::Error> for DaemonError {
-    fn from(e: std::io::Error) -> Self {
-        Self::Io(e)
-    }
-}
-
-#[cfg(all(test, unix))]
+#[cfg(unix)]
 #[allow(unsafe_code)]
+fn get_peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
+    use std::os::fd::AsRawFd as _;
+    let fd = stream.as_raw_fd();
+    // xtask:allow-platform-cfg: local IPC peer-credential socket ABI is transport-specific
+    #[cfg(target_os = "linux")]
+    {
+        let mut credential: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut length = libc::socklen_t::try_from(std::mem::size_of::<libc::ucred>())
+            .expect("ucred size fits socklen_t");
+        let result = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                std::ptr::addr_of_mut!(credential).cast(),
+                std::ptr::from_mut(&mut length),
+            )
+        };
+        if result == 0 {
+            Ok(credential.uid)
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+    // xtask:allow-platform-cfg: local IPC peer-credential socket ABI is transport-specific
+    #[cfg(target_os = "macos")]
+    {
+        let mut uid = 0;
+        let mut gid = 0;
+        let result = unsafe {
+            libc::getpeereid(
+                fd,
+                std::ptr::from_mut(&mut uid),
+                std::ptr::from_mut(&mut gid),
+            )
+        };
+        if result == 0 {
+            Ok(uid)
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum DaemonError {
+    #[error("IPC I/O: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("IPC frame: {0}")]
+    Frame(#[from] FrameError),
+    #[error("IPC {0} timed out")]
+    Timeout(&'static str),
+    #[error("IPC protocol: {0}")]
+    Protocol(String),
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vortix_core::engine::input::UserCommand;
-    use crate::vortix_core::engine::state::Connection;
-    use crate::vortix_core::profile::ProfileId;
-    use tokio::net::UnixStream as TokioUnixStream;
+    use crate::vortix_core::ipc::{ClientHello, IpcCapability};
 
-    fn pid(label: &str) -> ProfileId {
-        let digit = if label == "corp" { 'c' } else { 'd' };
-        ProfileId::parse(digit.to_string().repeat(ProfileId::HEX_LEN)).unwrap()
+    struct FixedProvider {
+        snapshot: PassiveSnapshot,
+        events: tokio::sync::broadcast::Sender<PassiveSnapshot>,
     }
 
-    // ===== D1 dispatch tests =====
+    impl PassiveQueryProvider for FixedProvider {
+        fn snapshot(&self) -> PassiveSnapshot {
+            self.snapshot.clone()
+        }
 
-    #[tokio::test]
-    async fn dispatch_execute_without_handle_returns_internal_error() {
-        let req = IpcRequest {
-            id: 1,
-            op: IpcOp::Execute(UserCommand::Connect {
-                profile_id: pid("corp"),
-            }),
-        };
-        let resp = dispatch(req, None).await;
-        assert_eq!(resp.id, 1);
-        match resp.result {
-            Err(IpcError::Internal(msg)) => assert!(msg.contains("engine handle not initialized")),
-            other => panic!("expected Internal error, got {other:?}"),
+        fn subscribe(&self) -> tokio::sync::broadcast::Receiver<PassiveSnapshot> {
+            self.events.subscribe()
         }
     }
 
-    #[tokio::test]
-    async fn dispatch_snapshot_without_handle_returns_internal_error() {
-        let req = IpcRequest {
-            id: 2,
-            op: IpcOp::Snapshot,
-        };
-        let resp = dispatch(req, None).await;
-        assert_eq!(resp.id, 2);
-        assert!(matches!(resp.result, Err(IpcError::Internal(_))));
-    }
-
-    #[tokio::test]
-    async fn dispatch_subscribe_without_handle_returns_internal_error() {
-        let req = IpcRequest {
-            id: 3,
-            op: IpcOp::Subscribe,
-        };
-        let resp = dispatch(req, None).await;
-        assert_eq!(resp.id, 3);
-        assert!(matches!(resp.result, Err(IpcError::Internal(_))));
-    }
-
-    #[tokio::test]
-    async fn dispatch_shutdown_does_not_require_engine_handle() {
-        let req = IpcRequest {
-            id: 4,
-            op: IpcOp::Shutdown,
-        };
-        let resp = dispatch(req, None).await;
-        assert_eq!(resp.id, 4);
-        assert!(matches!(resp.result, Ok(IpcResult::ShuttingDown)));
-    }
-
-    #[tokio::test]
-    async fn dispatch_snapshot_with_handle_returns_disconnected_initially() {
-        let handle = EngineHandle::for_test();
-        let req = IpcRequest {
-            id: 5,
-            op: IpcOp::Snapshot,
-        };
-        let resp = dispatch(req, Some(&handle)).await;
-        match resp.result {
-            Ok(IpcResult::Snapshot { state }) => {
-                assert!(matches!(state, Connection::Disconnected { .. }));
-            }
-            other => panic!("expected Snapshot, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn dispatch_execute_connect_with_handle_returns_accepted() {
-        let handle = EngineHandle::for_test();
-        let req = IpcRequest {
-            id: 6,
-            op: IpcOp::Execute(UserCommand::Connect {
-                profile_id: pid("corp"),
-            }),
-        };
-        let resp = dispatch(req, Some(&handle)).await;
-        assert!(matches!(resp.result, Ok(IpcResult::Accepted)));
-    }
-
-    #[tokio::test]
-    async fn dispatch_subscribe_with_handle_returns_subscribed_ack() {
-        let handle = EngineHandle::for_test();
-        let req = IpcRequest {
-            id: 7,
-            op: IpcOp::Subscribe,
-        };
-        let resp = dispatch(req, Some(&handle)).await;
-        assert!(matches!(resp.result, Ok(IpcResult::Subscribed)));
-    }
-
-    // ===== D2 peer-UID enforcement tests =====
-
-    /// Helper: pick a unique temp socket path.
-    fn fresh_socket_path() -> PathBuf {
-        let mut p = std::env::temp_dir();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        p.push(format!("vortix-test-{}-{nanos}.sock", std::process::id()));
-        p
-    }
-
-    #[tokio::test]
-    async fn peer_uid_matches_daemon_uid_for_same_process() {
-        // Same-process connect: UID matches, dispatch fires normally.
-        let socket = fresh_socket_path();
-        let server = DaemonServer::bind(socket.clone()).expect("bind");
-        let daemon_uid = server.daemon_uid();
-        // SAFETY: trivial syscall, see DaemonServer::bind.
-        let process_uid = unsafe { libc::geteuid() };
-        assert_eq!(daemon_uid, process_uid, "daemon UID captured correctly");
-
-        let handle = tokio::spawn(server.run());
-
-        let mut client = loop {
-            match TokioUnixStream::connect(&socket).await {
-                Ok(s) => break s,
-                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
-            }
-        };
-
-        // Shutdown is the simplest op — dispatched regardless of engine handle.
-        let req = IpcRequest {
-            id: 7,
-            op: IpcOp::Shutdown,
-        };
-        let frame = encode_frame(&req).expect("encode");
-        client.write_all(&frame).await.expect("write");
-
-        let mut buf = vec![0u8; 4096];
-        let n = client.read(&mut buf).await.expect("read");
-        let (resp, _) = decode_frame::<IpcResponse>(&buf[..n])
-            .expect("decode ok")
-            .expect("complete frame");
-        assert_eq!(resp.id, 7);
-        assert!(matches!(resp.result, Ok(IpcResult::ShuttingDown)));
-
-        handle.abort();
-        let _ = std::fs::remove_file(&socket);
-    }
-
-    #[tokio::test]
-    async fn unauthorized_path_emits_unauthorized_frame_without_dispatch() {
-        // Force the rejection branch by passing a daemon_uid the
-        // peer can never match (u32::MAX is never a real UID).
-        let (server_end, mut client_end) = TokioUnixStream::pair().expect("socketpair");
-
-        let fake_daemon_uid = u32::MAX;
-        let server_task =
-            tokio::spawn(async move { handle_client(server_end, fake_daemon_uid, None).await });
-
-        let mut buf = vec![0u8; 4096];
-        let n = client_end.read(&mut buf).await.expect("read");
-        let (resp, _) = decode_frame::<IpcResponse>(&buf[..n])
-            .expect("decode ok")
-            .expect("complete frame");
-        assert_eq!(resp.id, 0, "unauthorized frame uses id=0");
-        assert!(matches!(resp.result, Err(IpcError::Unauthorized)));
-
-        let outcome = server_task.await.expect("join");
-        assert!(outcome.is_ok());
-    }
-
-    #[tokio::test]
-    async fn get_peer_uid_returns_current_process_uid_on_socketpair() {
-        let (a, _b) = TokioUnixStream::pair().expect("socketpair");
-        let uid = get_peer_uid(&a).expect("peer uid lookup");
-        // SAFETY: trivial syscall, see DaemonServer::bind.
-        let me = unsafe { libc::geteuid() };
-        assert_eq!(uid, me);
-    }
-
-    // ===== multi-tunnel command dispatch =====
-
-    #[tokio::test]
-    async fn dispatch_execute_disconnect_all_routes_through_engine_handle() {
-        let handle = EngineHandle::for_test();
-        // Connect first so disconnect has something to act on.
-        let connect_req = IpcRequest {
-            id: 10,
-            op: IpcOp::Execute(UserCommand::Connect {
-                profile_id: pid("corp"),
-            }),
-        };
-        let _ = dispatch(connect_req, Some(&handle)).await;
-
-        let req = IpcRequest {
-            id: 11,
-            op: IpcOp::Execute(UserCommand::Disconnect { profile_id: None }),
-        };
-        let resp = dispatch(req, Some(&handle)).await;
-        assert_eq!(resp.id, 11);
-        assert!(matches!(resp.result, Ok(IpcResult::Accepted)));
-    }
-
-    #[tokio::test]
-    async fn dispatch_execute_disconnect_specific_routes_through_engine_handle() {
-        let handle = EngineHandle::for_test();
-        let req = IpcRequest {
-            id: 12,
-            op: IpcOp::Execute(UserCommand::Disconnect {
-                profile_id: Some(pid("corp")),
-            }),
-        };
-        let resp = dispatch(req, Some(&handle)).await;
-        assert!(matches!(resp.result, Ok(IpcResult::Accepted)));
-    }
-
-    #[tokio::test]
-    async fn dispatch_execute_reconnect_all_routes_through_engine_handle() {
-        let handle = EngineHandle::for_test();
-        let req = IpcRequest {
-            id: 13,
-            op: IpcOp::Execute(UserCommand::Reconnect { profile_id: None }),
-        };
-        let resp = dispatch(req, Some(&handle)).await;
-        assert!(matches!(resp.result, Ok(IpcResult::Accepted)));
-    }
-
-    #[tokio::test]
-    async fn dispatch_execute_force_disconnect_specific_routes_through_engine_handle() {
-        let handle = EngineHandle::for_test();
-        let req = IpcRequest {
-            id: 14,
-            op: IpcOp::Execute(UserCommand::ForceDisconnect {
-                profile_id: Some(pid("corp")),
-            }),
-        };
-        let resp = dispatch(req, Some(&handle)).await;
-        assert!(matches!(resp.result, Ok(IpcResult::Accepted)));
-    }
-
-    #[test]
-    fn v1_disconnect_unit_form_does_not_decode_against_v2_op() {
-        // A v1 client sending `{"kind":"execute","Execute":"Disconnect"}`
-        // (legacy unit-variant payload) must NOT silently mis-parse on
-        // the v2 server. Verify against IpcOp::Execute(UserCommand) end
-        // to end.
-        let v1_envelope = r#"{"kind":"execute","Execute":"Disconnect"}"#;
-        let parsed: Result<IpcOp, _> = serde_json::from_str(v1_envelope);
-        assert!(
-            parsed.is_err(),
-            "v1 unit-variant Disconnect should be rejected by v2 IpcOp decoder, got {parsed:?}"
-        );
-    }
-
-    #[test]
-    fn v2_disconnect_struct_form_round_trips_through_ipc_op() {
-        let op = IpcOp::Execute(UserCommand::Disconnect { profile_id: None });
-        let json = serde_json::to_string(&op).expect("serialize");
-        let back: IpcOp = serde_json::from_str(&json).expect("deserialize");
-        match back {
-            IpcOp::Execute(UserCommand::Disconnect { profile_id: None }) => {}
-            other => panic!("v2 Disconnect{{None}} round-trip mismatch: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn ipc_error_conflict_round_trips() {
-        use crate::vortix_core::engine::registry::Conflict;
-        let err = IpcError::Conflict {
-            conflict: Conflict::DefaultRouteTakeover {
-                current: pid("corp"),
-                new: pid("home"),
+    fn handshake(id: u64) -> IpcRequest {
+        IpcRequest {
+            id,
+            op: IpcOp::Handshake {
+                hello: ClientHello::current(vec![IpcCapability::PassiveSnapshot]),
             },
-        };
-        let json = serde_json::to_string(&err).expect("serialize");
-        let back: IpcError = serde_json::from_str(&json).expect("deserialize");
-        match back {
-            IpcError::Conflict {
-                conflict: Conflict::DefaultRouteTakeover { current, new },
-            } => {
-                assert_eq!(current, pid("corp"));
-                assert_eq!(new, pid("home"));
-            }
-            other => panic!("expected Conflict round-trip, got {other:?}"),
         }
     }
 
-    #[test]
-    fn ipc_result_registry_snapshot_round_trips() {
-        use crate::vortix_core::state::KillSwitchState;
-        let r = IpcResult::RegistrySnapshot {
-            tunnels: vec![],
-            primary: None,
-            killswitch: KillSwitchState::Disabled,
+    #[tokio::test]
+    async fn first_non_handshake_request_is_rejected() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        let provider: Arc<dyn PassiveQueryProvider> = Arc::new(EmptyQueryProvider::new());
+        let shutdown = watch::channel(false).0;
+        let task = tokio::spawn(async move {
+            let (mut reader, writer_half) = tokio::io::split(server);
+            let (output, output_rx) = mpsc::channel(2);
+            let writer = tokio::spawn(writer_loop(writer_half, output_rx));
+            let result = connection_loop(&mut reader, &output, provider, shutdown).await;
+            drop(output);
+            let _ = writer.await;
+            result
+        });
+        let request = IpcRequest {
+            id: 1,
+            op: IpcOp::PassiveSnapshot,
         };
-        let json = serde_json::to_string(&r).expect("serialize");
-        let back: IpcResult = serde_json::from_str(&json).expect("deserialize");
-        match back {
-            IpcResult::RegistrySnapshot {
-                tunnels,
-                primary,
-                killswitch,
-            } => {
-                assert!(tunnels.is_empty());
-                assert!(primary.is_none());
-                assert_eq!(killswitch, KillSwitchState::Disabled);
-            }
-            other => panic!("expected RegistrySnapshot, got {other:?}"),
+        let frame = crate::vortix_core::ipc::encode_frame(&request).unwrap();
+        client.write_all(&frame).await.unwrap();
+        let mut response_bytes = vec![0_u8; 4096];
+        let read = client.read(&mut response_bytes).await.unwrap();
+        let (response, _) =
+            crate::vortix_core::ipc::decode_frame::<IpcResponse>(&response_bytes[..read])
+                .unwrap()
+                .unwrap();
+        assert!(matches!(response.result, Err(IpcError::HandshakeRequired)));
+        task.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn passive_dispatch_rejects_execute() {
+        let provider = EmptyQueryProvider::new();
+        let shutdown = watch::channel(false).0;
+        let request = IpcRequest {
+            id: 9,
+            op: IpcOp::Execute(crate::vortix_core::engine::input::UserCommand::Disconnect {
+                profile_id: None,
+            }),
+        };
+        assert!(matches!(
+            dispatch(&request, &provider, &shutdown).result,
+            Err(IpcError::CapabilityUnavailable {
+                capability: IpcCapability::ControlMutation
+            })
+        ));
+    }
+
+    #[test]
+    fn handshake_fixture_is_well_formed() {
+        assert!(matches!(handshake(1).op, IpcOp::Handshake { .. }));
+    }
+
+    #[test]
+    fn bind_refuses_regular_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("daemon.sock");
+        std::fs::write(&path, b"not a socket").unwrap();
+        assert!(DaemonServer::bind(path).is_err());
+    }
+
+    #[tokio::test]
+    async fn bind_refuses_live_socket_and_drop_preserves_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("daemon.sock");
+        let server = DaemonServer::bind(path.clone()).unwrap();
+        assert_eq!(
+            DaemonServer::bind(path.clone()).err().unwrap().kind(),
+            std::io::ErrorKind::AddrInUse
+        );
+        let moved = directory.path().join("moved.sock");
+        std::fs::rename(&path, moved).unwrap();
+        std::fs::write(&path, b"replacement").unwrap();
+        drop(server);
+        assert_eq!(std::fs::read(path).unwrap(), b"replacement");
+    }
+
+    #[tokio::test]
+    async fn partial_header_and_body_are_deadline_bounded() {
+        let (mut client, mut server) = tokio::io::duplex(64);
+        client.write_all(&[0, 0]).await.unwrap();
+        assert!(matches!(
+            read_request_with_timeout(&mut server, Duration::from_millis(10)).await,
+            Err(DaemonError::Timeout("frame header"))
+        ));
+
+        let (mut client, mut server) = tokio::io::duplex(64);
+        client.write_all(&10_u32.to_be_bytes()).await.unwrap();
+        client.write_all(b"{}").await.unwrap();
+        assert!(matches!(
+            read_request_with_timeout(&mut server, Duration::from_millis(10)).await,
+            Err(DaemonError::Timeout("frame body"))
+        ));
+    }
+
+    #[tokio::test]
+    async fn oversized_prefix_is_rejected_before_allocation() {
+        let (mut client, mut server) = tokio::io::duplex(64);
+        let oversized = u32::try_from(MAX_FRAME_BYTES + 1).unwrap();
+        client.write_all(&oversized.to_be_bytes()).await.unwrap();
+        assert!(matches!(
+            read_request(&mut server).await,
+            Err(DaemonError::Frame(FrameError::TooLarge { .. }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn lagged_subscription_requests_full_resynchronization() {
+        let (events, _) = tokio::sync::broadcast::channel(1);
+        let provider = FixedProvider {
+            snapshot: PassiveSnapshot {
+                generation: 3,
+                ..PassiveSnapshot::default()
+            },
+            events,
+        };
+        let mut receiver = provider.subscribe();
+        for generation in 2..=3 {
+            provider
+                .events
+                .send(PassiveSnapshot {
+                    generation,
+                    ..PassiveSnapshot::default()
+                })
+                .unwrap();
         }
+
+        let (_idle_client, mut idle_reader) = tokio::io::duplex(64);
+        let (output_client, output_server) = tokio::io::duplex(4096);
+        let (output, output_rx) = mpsc::channel(2);
+        let writer = tokio::spawn(writer_loop(output_server, output_rx));
+        let shutdown = watch::channel(false).0;
+        stream_snapshots(
+            &mut idle_reader,
+            &output,
+            &provider,
+            &mut receiver,
+            1,
+            &shutdown,
+        )
+        .await
+        .unwrap();
+        drop(output);
+        writer.await.unwrap();
+
+        let mut response_bytes = Vec::new();
+        let mut output_client = output_client;
+        output_client
+            .read_to_end(&mut response_bytes)
+            .await
+            .unwrap();
+        let (response, _) = crate::vortix_core::ipc::decode_frame::<IpcResponse>(&response_bytes)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            response.result,
+            Ok(IpcResult::ResyncRequired {
+                newest_generation: 3
+            })
+        ));
     }
 }
