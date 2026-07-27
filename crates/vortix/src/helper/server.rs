@@ -17,16 +17,18 @@ use crate::helper::protocol::{
     HelperResponse, HelperResult, HelperSessionBinding,
 };
 use crate::vortix_core::privileged::{
-    AmbiguousPhase, ChildOwner, ChildSpawnAuthority, HelperEpoch, ObservationState,
-    ObservedChildIdentity, OperationAdmission, OperationError, OperationGuard, OwnedChild,
-    PrivilegedOperation, ProtocolPlan, ReceiptError, ReceiptLedger, RejectionCode, ReplayRecord,
-    ResourceKind, ResourceObservation, ResourceTag, RootAuthorityLedger, VerifiedReceipt,
+    AmbiguousPhase, ChildOwner, ChildSpawnAuthority, HelperEpoch, NetworkPolicyOperation,
+    ObservationState, ObservedChildIdentity, OperationAdmission, OperationError, OperationGuard,
+    OwnedChild, PrivilegedOperation, ProtocolPlan, ReceiptError, ReceiptLedger, RejectionCode,
+    ReplayRecord, ResourceKind, ResourceObservation, ResourceTag, RootAuthorityLedger,
+    VerifiedReceipt,
 };
 
-const ENABLED_CAPABILITIES: [HelperCapability; 3] = [
+const ENABLED_CAPABILITIES: [HelperCapability; 4] = [
     HelperCapability::Handshake,
     HelperCapability::Observe,
     HelperCapability::TunnelLifecycle,
+    HelperCapability::NetworkPolicy,
 ];
 
 /// Typed platform seam for read-back. Implementations may inspect only the
@@ -52,20 +54,20 @@ pub(crate) trait TunnelLifecycleExecutor {
     fn start_tunnel(
         &mut self,
         plan: &ProtocolPlan,
-    ) -> Result<TunnelStartOutcome, TunnelLifecycleError>;
+    ) -> Result<TunnelStartOutcome, PrivilegedExecutionError>;
 
     fn stop_tunnel(
         &mut self,
         tunnel: &ResourceTag,
         child: Option<&ObservedChildIdentity>,
-    ) -> Result<ResourceObservation, TunnelLifecycleError>;
+    ) -> Result<ResourceObservation, PrivilegedExecutionError>;
 
     /// Contain a child whose returned identity cannot be claimed for the
     /// admitted request. Failure means the effect remains ambiguous.
     fn contain_unclaimed(
         &mut self,
         child: &ObservedChildIdentity,
-    ) -> Result<(), TunnelLifecycleError>;
+    ) -> Result<(), PrivilegedExecutionError>;
 }
 
 /// Protocol-specific successful start evidence. `WireGuard` must leave no
@@ -77,11 +79,26 @@ pub(crate) enum TunnelStartOutcome {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TunnelLifecycleError {
+pub(crate) enum PrivilegedExecutionError {
     InvalidPlan,
     Overloaded,
     FailedBeforeEffect,
     EffectMayHaveApplied,
+}
+
+/// Ordered platform-policy seam. The executor may report one applied mutation
+/// phase or exact read-back observations for a barrier or release. The helper
+/// derives receipt ownership from the admitted canonical operation.
+pub(crate) trait NetworkPolicyExecutor {
+    fn execute_network_policy(
+        &mut self,
+        operation: &NetworkPolicyOperation,
+    ) -> Result<NetworkPolicyOutcome, PrivilegedExecutionError>;
+}
+
+pub(crate) enum NetworkPolicyOutcome {
+    Applied,
+    Observed(Vec<ResourceObservation>),
 }
 
 /// Root-owned atomic persistence seam. A successful return means the replay
@@ -109,7 +126,7 @@ pub(crate) struct EnrolledHelperSession<E, S> {
 
 impl<E, S> EnrolledHelperSession<E, S>
 where
-    E: ObservationExecutor + TunnelLifecycleExecutor,
+    E: ObservationExecutor + TunnelLifecycleExecutor + NetworkPolicyExecutor,
     S: ReplayStore,
 {
     pub(crate) fn resume(
@@ -191,6 +208,7 @@ where
             PrivilegedOperation::Observe(_)
                 | PrivilegedOperation::StartTunnel(_)
                 | PrivilegedOperation::StopTunnel(_)
+                | PrivilegedOperation::NetworkPolicy(_)
         ) {
             return Err(HelperError::CapabilityUnavailable {
                 capability: capability_for(request.operation()),
@@ -239,14 +257,21 @@ where
                 Err(ObservationError::Overloaded) => {
                     self.receipts.rejected(request, RejectionCode::Overloaded)
                 }
-            },
-            PrivilegedOperation::StartTunnel(plan) => self.start_tunnel(request, plan),
-            PrivilegedOperation::StopTunnel(resource) => self.stop_tunnel(request, resource),
-            PrivilegedOperation::NetworkPolicy(_) | PrivilegedOperation::CleanupOwned(_) => {
+            }
+            .map_err(map_receipt_error),
+            PrivilegedOperation::StartTunnel(plan) => {
+                self.start_tunnel(request, plan).map_err(map_receipt_error)
+            }
+            PrivilegedOperation::StopTunnel(resource) => self
+                .stop_tunnel(request, resource)
+                .map_err(map_receipt_error),
+            PrivilegedOperation::NetworkPolicy(operation) => {
+                self.execute_network_policy(request, operation)
+            }
+            PrivilegedOperation::CleanupOwned(_) => {
                 unreachable!("unsupported operations return before admission")
             }
-        }
-        .map_err(map_receipt_error)?;
+        }?;
         self.last_receipt = Some(receipt.clone());
         receipt_result(receipt)
     }
@@ -267,7 +292,7 @@ where
 
         let outcome = match self.executor.start_tunnel(plan) {
             Ok(outcome) => outcome,
-            Err(error) => return self.lifecycle_error_receipt(request, error),
+            Err(error) => return self.execution_error_receipt(request, error),
         };
         let resources = match (plan, outcome) {
             (ProtocolPlan::WireGuard(_), TunnelStartOutcome::InterfaceApplied(observation))
@@ -333,7 +358,7 @@ where
             .map(|owned| owned.identity().clone());
         let observation = match self.executor.stop_tunnel(tunnel, identity.as_ref()) {
             Ok(observation) => observation,
-            Err(error) => return self.lifecycle_error_receipt(request, error),
+            Err(error) => return self.execution_error_receipt(request, error),
         };
         let receipt = match self.receipts.observed(request, vec![observation]) {
             Ok(receipt) => receipt,
@@ -348,22 +373,79 @@ where
         Ok(receipt)
     }
 
-    fn lifecycle_error_receipt(
+    fn execute_network_policy(
+        &mut self,
+        request: &crate::vortix_core::privileged::PrivilegedRequest,
+        operation: &NetworkPolicyOperation,
+    ) -> Result<VerifiedReceipt, HelperError> {
+        let outcome = match self.executor.execute_network_policy(operation) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                return self
+                    .execution_error_receipt(request, error)
+                    .map_err(map_receipt_error);
+            }
+        };
+        let receipt = match (operation, outcome) {
+            (
+                NetworkPolicyOperation::EstablishBlocking { .. }
+                | NetworkPolicyOperation::ApplyRoutes { .. }
+                | NetworkPolicyOperation::ApplyDns { .. }
+                | NetworkPolicyOperation::ApplyFirewall { .. },
+                NetworkPolicyOutcome::Applied,
+            ) => self
+                .receipts
+                .applied(request, vec![operation.policy_resource().clone()]),
+            (
+                NetworkPolicyOperation::ObserveBarrier { .. }
+                | NetworkPolicyOperation::ReleaseObsolete { .. },
+                NetworkPolicyOutcome::Observed(observations),
+            ) => self.receipts.observed(request, observations),
+            _ => self
+                .receipts
+                .ambiguous(request, AmbiguousPhase::EffectMayHaveApplied),
+        }
+        .map_err(map_receipt_error)?;
+
+        if !receipt.is_ambiguous() {
+            let confirmed = match operation {
+                NetworkPolicyOperation::ObserveBarrier { .. } => self
+                    .guard
+                    .confirm_observation(request, &receipt, &self.root),
+                NetworkPolicyOperation::ReleaseObsolete { .. } => {
+                    self.guard.confirm_release(request, &receipt, &self.root)
+                }
+                _ => return Ok(receipt),
+            };
+            if confirmed.is_err()
+                || self
+                    .guard
+                    .checkpoint()
+                    .is_none_or(|checkpoint| self.replay_store.persist(&checkpoint).is_err())
+            {
+                self.poisoned = true;
+                return Err(HelperError::LedgerUnavailable);
+            }
+        }
+        Ok(receipt)
+    }
+
+    fn execution_error_receipt(
         &self,
         request: &crate::vortix_core::privileged::PrivilegedRequest,
-        error: TunnelLifecycleError,
+        error: PrivilegedExecutionError,
     ) -> Result<VerifiedReceipt, ReceiptError> {
         match error {
-            TunnelLifecycleError::InvalidPlan => {
+            PrivilegedExecutionError::InvalidPlan => {
                 self.receipts.rejected(request, RejectionCode::InvalidPlan)
             }
-            TunnelLifecycleError::Overloaded => {
+            PrivilegedExecutionError::Overloaded => {
                 self.receipts.rejected(request, RejectionCode::Overloaded)
             }
-            TunnelLifecycleError::FailedBeforeEffect => self
+            PrivilegedExecutionError::FailedBeforeEffect => self
                 .receipts
                 .rejected(request, RejectionCode::ExecutionFailed),
-            TunnelLifecycleError::EffectMayHaveApplied => self
+            PrivilegedExecutionError::EffectMayHaveApplied => self
                 .receipts
                 .ambiguous(request, AmbiguousPhase::EffectMayHaveApplied),
         }
@@ -431,11 +513,12 @@ mod tests {
     struct MemoryReplayStore {
         writes: Vec<ReplayRecord>,
         fail: bool,
+        fail_on_write: Option<usize>,
     }
 
     impl ReplayStore for MemoryReplayStore {
         fn persist(&mut self, checkpoint: &ReplayRecord) -> Result<(), ()> {
-            if self.fail {
+            if self.fail || self.fail_on_write == Some(self.writes.len() + 1) {
                 Err(())
             } else {
                 self.writes.push(checkpoint.clone());
@@ -449,11 +532,12 @@ mod tests {
         starts: usize,
         stops: usize,
         stops_with_child: usize,
+        policy_calls: usize,
         containments: usize,
         foreground_start: bool,
         foreign_start: bool,
         containment_fails: bool,
-        start_error: Option<TunnelLifecycleError>,
+        start_error: Option<PrivilegedExecutionError>,
     }
 
     impl ObservationExecutor for FakeExecutor {
@@ -474,7 +558,7 @@ mod tests {
         fn start_tunnel(
             &mut self,
             plan: &ProtocolPlan,
-        ) -> Result<TunnelStartOutcome, TunnelLifecycleError> {
+        ) -> Result<TunnelStartOutcome, PrivilegedExecutionError> {
             self.starts += 1;
             if let Some(error) = self.start_error {
                 return Err(error);
@@ -488,11 +572,11 @@ mod tests {
             if self.foreground_start {
                 ObservedChildIdentity::new(resource, 42, 99, ContainmentId::new([3; 32]))
                     .map(TunnelStartOutcome::ForegroundOwned)
-                    .map_err(|_| TunnelLifecycleError::EffectMayHaveApplied)
+                    .map_err(|_| PrivilegedExecutionError::EffectMayHaveApplied)
             } else {
                 ResourceObservation::new(resource, ObservationState::Present, 1)
                     .map(TunnelStartOutcome::InterfaceApplied)
-                    .map_err(|_| TunnelLifecycleError::EffectMayHaveApplied)
+                    .map_err(|_| PrivilegedExecutionError::EffectMayHaveApplied)
             }
         }
 
@@ -500,22 +584,57 @@ mod tests {
             &mut self,
             tunnel: &ResourceTag,
             child: Option<&ObservedChildIdentity>,
-        ) -> Result<ResourceObservation, TunnelLifecycleError> {
+        ) -> Result<ResourceObservation, PrivilegedExecutionError> {
             self.stops += 1;
             self.stops_with_child += usize::from(child.is_some());
             ResourceObservation::new(tunnel.clone(), ObservationState::Absent, 2)
-                .map_err(|_| TunnelLifecycleError::EffectMayHaveApplied)
+                .map_err(|_| PrivilegedExecutionError::EffectMayHaveApplied)
         }
 
         fn contain_unclaimed(
             &mut self,
             _child: &ObservedChildIdentity,
-        ) -> Result<(), TunnelLifecycleError> {
+        ) -> Result<(), PrivilegedExecutionError> {
             self.containments += 1;
             if self.containment_fails {
-                Err(TunnelLifecycleError::EffectMayHaveApplied)
+                Err(PrivilegedExecutionError::EffectMayHaveApplied)
             } else {
                 Ok(())
+            }
+        }
+    }
+
+    impl NetworkPolicyExecutor for FakeExecutor {
+        fn execute_network_policy(
+            &mut self,
+            operation: &NetworkPolicyOperation,
+        ) -> Result<NetworkPolicyOutcome, PrivilegedExecutionError> {
+            self.policy_calls += 1;
+            match operation {
+                NetworkPolicyOperation::ObserveBarrier { policy, .. } => {
+                    Ok(NetworkPolicyOutcome::Observed(vec![
+                        ResourceObservation::new(policy.clone(), ObservationState::Present, 3)
+                            .unwrap(),
+                    ]))
+                }
+                NetworkPolicyOperation::ReleaseObsolete {
+                    policy, resources, ..
+                } => {
+                    let mut observations = vec![ResourceObservation::new(
+                        policy.clone(),
+                        ObservationState::Present,
+                        3,
+                    )
+                    .unwrap()];
+                    observations.extend(resources.iter().cloned().map(|resource| {
+                        ResourceObservation::new(resource, ObservationState::Absent, 3).unwrap()
+                    }));
+                    Ok(NetworkPolicyOutcome::Observed(observations))
+                }
+                NetworkPolicyOperation::EstablishBlocking { .. }
+                | NetworkPolicyOperation::ApplyRoutes { .. }
+                | NetworkPolicyOperation::ApplyDns { .. }
+                | NetworkPolicyOperation::ApplyFirewall { .. } => Ok(NetworkPolicyOutcome::Applied),
             }
         }
     }
@@ -638,6 +757,14 @@ mod tests {
 
     impl LifecycleHarness {
         fn new(executor: FakeExecutor) -> Self {
+            Self::with_capability(executor, HelperCapability::TunnelLifecycle)
+        }
+
+        fn for_policy(executor: FakeExecutor) -> Self {
+            Self::with_capability(executor, HelperCapability::NetworkPolicy)
+        }
+
+        fn with_capability(executor: FakeExecutor, capability: HelperCapability) -> Self {
             let (root, principal, claim, helper_epoch, baseline) = fixture();
             let mut server = EnrolledHelperSession::resume(
                 root,
@@ -649,11 +776,7 @@ mod tests {
             .unwrap();
             let handshake = server.handle(HelperRequest {
                 id: 1,
-                op: HelperOp::Handshake(HelperClientHello::current(
-                    501,
-                    claim,
-                    vec![HelperCapability::TunnelLifecycle],
-                )),
+                op: HelperOp::Handshake(HelperClientHello::current(501, claim, vec![capability])),
             });
             let HelperResult::Handshake(server_hello) = handshake.result.unwrap() else {
                 panic!("expected handshake");
@@ -749,6 +872,7 @@ mod tests {
             MemoryReplayStore {
                 writes: Vec::new(),
                 fail: true,
+                ..MemoryReplayStore::default()
             },
         )
         .unwrap();
@@ -1010,7 +1134,7 @@ mod tests {
     #[test]
     fn uncertain_start_is_ambiguous_and_duplicate_never_reexecutes() {
         let mut harness = LifecycleHarness::new(FakeExecutor {
-            start_error: Some(TunnelLifecycleError::EffectMayHaveApplied),
+            start_error: Some(PrivilegedExecutionError::EffectMayHaveApplied),
             ..FakeExecutor::default()
         });
         let start = harness.request(1, PrivilegedOperation::StartTunnel(wireguard_plan(1)));
@@ -1022,5 +1146,79 @@ mod tests {
         assert_eq!(harness.server.executor.starts, 1);
         assert!(harness.server.owned_tunnels.is_empty());
         assert!(harness.server.owned_children.is_empty());
+    }
+
+    #[test]
+    fn network_policy_barrier_is_confirmed_and_persisted_before_next_phase() {
+        let mut harness = LifecycleHarness::for_policy(FakeExecutor::default());
+        let firewall = ResourceTag::topology(AuthorityEpoch(3), 1, ResourceKind::Firewall).unwrap();
+        let blocking = harness.request(
+            1,
+            PrivilegedOperation::NetworkPolicy(NetworkPolicyOperation::EstablishBlocking {
+                policy: firewall.clone(),
+                tunnels: Vec::new(),
+            }),
+        );
+        assert!(!harness.execute(2, &blocking).is_ambiguous());
+        let unobserved = harness.server.guard.policy_predecessor().unwrap();
+
+        let barrier = harness.request(
+            2,
+            PrivilegedOperation::NetworkPolicy(NetworkPolicyOperation::ObserveBarrier {
+                policy: firewall,
+                predecessor: unobserved,
+            }),
+        );
+        assert!(!harness.execute(3, &barrier).is_ambiguous());
+        assert!(!harness.execute(4, &barrier).is_ambiguous());
+        let observed = harness.server.guard.policy_predecessor().unwrap();
+        assert_ne!(observed, unobserved);
+
+        let routes = ResourceTag::topology(AuthorityEpoch(3), 1, ResourceKind::Routes).unwrap();
+        let apply = harness.request(
+            3,
+            PrivilegedOperation::NetworkPolicy(NetworkPolicyOperation::ApplyRoutes {
+                policy: routes,
+                routes: Vec::new(),
+                predecessor: observed,
+            }),
+        );
+        assert!(!harness.execute(5, &apply).is_ambiguous());
+        assert_eq!(harness.server.executor.policy_calls, 3);
+        assert_eq!(harness.server.replay_store.writes.len(), 4);
+    }
+
+    #[test]
+    fn failed_barrier_confirmation_persistence_poisons_policy_session() {
+        let mut harness = LifecycleHarness::for_policy(FakeExecutor::default());
+        let firewall = ResourceTag::topology(AuthorityEpoch(3), 1, ResourceKind::Firewall).unwrap();
+        let blocking = harness.request(
+            1,
+            PrivilegedOperation::NetworkPolicy(NetworkPolicyOperation::EstablishBlocking {
+                policy: firewall.clone(),
+                tunnels: Vec::new(),
+            }),
+        );
+        harness.execute(2, &blocking);
+        let predecessor = harness.server.guard.policy_predecessor().unwrap();
+        let barrier = harness.request(
+            2,
+            PrivilegedOperation::NetworkPolicy(NetworkPolicyOperation::ObserveBarrier {
+                policy: firewall,
+                predecessor,
+            }),
+        );
+        harness.server.replay_store.fail_on_write = Some(3);
+
+        let response = harness.server.handle(HelperRequest {
+            id: 3,
+            op: HelperOp::Execute(Box::new(barrier)),
+        });
+        assert!(matches!(
+            response.result,
+            Err(HelperError::LedgerUnavailable)
+        ));
+        assert!(harness.server.poisoned);
+        assert_eq!(harness.server.executor.policy_calls, 2);
     }
 }
