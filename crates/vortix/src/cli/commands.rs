@@ -242,8 +242,7 @@ fn handle_audit(pid_filter: Option<u32>, vpn_only: bool, mode: OutputMode) -> i3
     }
 }
 
-/// `vortix daemon` — host the engine as a long-running IPC server
-///.
+/// `vortix daemon` — run the bounded, read-only IPC candidate.
 fn handle_daemon(socket_override: Option<std::path::PathBuf>, mode: OutputMode) -> i32 {
     let socket_path = socket_override.unwrap_or_else(crate::daemon::default_socket_path);
 
@@ -284,28 +283,24 @@ fn handle_daemon(socket_override: Option<std::path::PathBuf>, mode: OutputMode) 
     };
 
     eprintln!(
-        "vortix daemon: ready. Set VORTIX_DAEMON_SOCKET={} in your shell to route through the daemon.",
+        "vortix daemon: passive read-only candidate ready at {}. Set VORTIX_DAEMON_SOCKET to this path to use snapshot queries.",
         server.socket_path().display()
     );
 
-    // Build the `EngineHandle::Local` inside the daemon's runtime context
-    // (the actor task spawn lands on this runtime, not the runner's). The
-    // factory reads the resolved global config dir for profile sidecars.
-    let profiles_dir = crate::utils::get_app_config_dir().map_or_else(
-        |_| std::path::PathBuf::from("/tmp/vortix-profiles"),
-        |d| d.join(constants::PROFILES_DIR_NAME),
-    );
-
-    let server = runtime.block_on(async move {
-        if let Some(handle) = crate::daemon::build_engine_handle(&profiles_dir) {
-            server.with_engine_handle(handle)
-        } else {
-            eprintln!(
-                "vortix daemon: engine handle unavailable (journal or runner not installed) — Execute/Snapshot/Subscribe will return Internal errors"
-            );
-            server
+    // The candidate is deliberately passive: it polls scanner truth for
+    // queries/subscriptions but never constructs an engine, loads desired
+    // intent, acquires lifecycle authority, or exposes mutation capability.
+    let provider = match crate::daemon::passive::ScannerQueryProvider::start(
+        crate::vpn::load_profiles(),
+        std::time::Duration::from_secs(1),
+    ) {
+        Ok(provider) => std::sync::Arc::new(provider),
+        Err(error) => {
+            eprintln!("vortix daemon: failed to start passive observer: {error}");
+            return 1;
         }
-    });
+    };
+    let server = server.with_query_provider(provider);
 
     runtime.block_on(async {
         if let Err(e) = server.run().await {
@@ -1014,18 +1009,24 @@ fn handle_status(
     };
 
     let engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
-    let mut snap = engine.scan_status();
-    // When the daemon socket is connectable, overlay its authoritative
-    // view of the FSM (which profile is connecting/connected, since
-    // when) onto the scanner-derived snapshot. The scanner still owns
-    // live counters and kill-switch state. On any daemon error we
-    // silently keep the scanner-only view — bypass-on-error keeps
-    // `vortix status` reliable during partial daemon rollout. Once
-    // This lands the schema_version=2 multi-tunnel payload, this
-    // branch will pull richer data from the daemon directly.
+    let snap = engine.scan_status();
+    // The candidate is shadow-only: compare its passive observation with the
+    // local scanner but never let it override local control or status truth.
+    // Any error or rollout mismatch leaves user-visible output unchanged.
     if let Some(socket) = daemon_socket {
-        if let Ok(state) = crate::daemon::client::snapshot(&socket) {
-            overlay_daemon_state(&mut snap, &state, &engine.profiles);
+        if let Ok(crate::vortix_core::ipc::IpcResult::PassiveSnapshot { snapshot }) =
+            crate::daemon::client::request(&socket, crate::vortix_core::ipc::IpcOp::PassiveSnapshot)
+        {
+            if !passive_projection_matches(&snap, &snapshot) {
+                tracing::debug!(
+                    local_state = %snap.connection_state,
+                    local_profile = ?snap.profile,
+                    local_interface = ?snap.interface,
+                    remote_generation = snapshot.generation,
+                    remote_tunnels = snapshot.tunnels.len(),
+                    "passive daemon shadow projection differs from local scanner"
+                );
+            }
         }
     }
 
@@ -1166,81 +1167,20 @@ fn status_exit_code(
     }
 }
 
-/// Merge an authoritative `Connection` from the daemon onto a
-/// scanner-derived `StatusSnapshot`. The daemon owns the FSM state
-/// (which profile is connecting/connected, since when, retry budget);
-/// the scanner owns the live counters (transfer bytes, kill-switch
-/// state). Today we overlay just the connection-state vocabulary so
-/// the daemon's view of "what's the active profile" beats whatever
-/// the scanner inferred from sockets — relevant when the daemon is
-/// driving a tunnel the local-engine scanner doesn't recognize.
-fn overlay_daemon_state(
-    snap: &mut crate::vpn_runtime::connection::StatusSnapshot,
-    state: &crate::vortix_core::engine::state::Connection,
-    profiles: &[crate::state::VpnProfile],
-) {
-    use crate::vortix_core::engine::state::Connection;
-    let profile_projection = |id: &crate::vortix_core::profile::ProfileId| {
-        profiles
-            .iter()
-            .find(|profile| &profile.id == id)
-            .map_or_else(
-                || (format!("ProfileMissing:{id}"), None),
-                |profile| (profile.name.clone(), Some(profile.protocol.to_string())),
-            )
-    };
-    match state {
-        Connection::Disconnected { .. } => {
-            snap.connection_state = "disconnected".into();
-            snap.profile = None;
-            snap.protocol = None;
-            snap.uptime_secs = None;
-        }
-        Connection::Connecting { profile_id, .. } => {
-            let (name, protocol) = profile_projection(profile_id);
-            snap.connection_state = if protocol.as_deref() == Some("WireGuard") {
-                "handshaking".into()
-            } else {
-                "connecting".into()
-            };
-            snap.profile = Some(name);
-            snap.protocol = protocol;
-        }
-        Connection::Reconnecting { profile_id, .. } => {
-            let (name, protocol) = profile_projection(profile_id);
-            snap.connection_state = "reconnecting".into();
-            snap.profile = Some(name);
-            snap.protocol = protocol;
-        }
-        Connection::AwaitingUserInput { profile_id, .. } => {
-            let (name, protocol) = profile_projection(profile_id);
-            snap.connection_state = "awaiting_input".into();
-            snap.profile = Some(name);
-            snap.protocol = protocol;
-        }
-        Connection::Disconnecting { profile_id, .. } => {
-            let (name, protocol) = profile_projection(profile_id);
-            snap.connection_state = "disconnecting".into();
-            snap.profile = Some(name);
-            snap.protocol = protocol;
-        }
-        Connection::Connected {
-            profile_id,
-            since,
-            health,
-            details,
-        } => {
-            snap.connection_state = "connected".into();
-            snap.health = Some(health.clone());
-            snap.generation = (details.generation > 0).then_some(details.generation);
-            let (name, protocol) = profile_projection(profile_id);
-            snap.profile = Some(name);
-            snap.protocol = protocol;
-            if let Ok(elapsed) = std::time::SystemTime::now().duration_since(*since) {
-                snap.uptime_secs = Some(elapsed.as_secs());
-            }
-        }
+fn passive_projection_matches(
+    local: &crate::vpn_runtime::connection::StatusSnapshot,
+    remote: &crate::vortix_core::ipc::PassiveSnapshot,
+) -> bool {
+    if local.connection_state == "disconnected" {
+        return remote.tunnels.is_empty();
     }
+    remote.tunnels.iter().any(|tunnel| {
+        local.profile.as_deref() == Some(tunnel.display_name.as_str())
+            && local
+                .interface
+                .as_deref()
+                .is_none_or(|name| name == tunnel.interface_name)
+    })
 }
 
 fn run_watch(interval: u64, config: &AppConfig, config_dir: &Path, mode: OutputMode) -> i32 {
@@ -1387,8 +1327,8 @@ fn short_peer(peer: &str) -> &str {
 #[cfg(test)]
 mod handshake_status_tests {
     use super::*;
-    use crate::state::{KillSwitchMode, KillSwitchState, Protocol, VpnProfile};
-    use crate::vortix_core::engine::state::Connection;
+    use crate::state::{KillSwitchMode, KillSwitchState};
+    use crate::vortix_core::ipc::{PassiveSnapshot, PassiveTunnel};
     use crate::vortix_core::profile::ProfileId;
 
     fn snapshot(state: &str, protocol: &str) -> crate::vpn_runtime::connection::StatusSnapshot {
@@ -1418,17 +1358,6 @@ mod handshake_status_tests {
         }
     }
 
-    fn profile(protocol: Protocol) -> VpnProfile {
-        VpnProfile {
-            id: ProfileId::new("corp"),
-            name: "corp".into(),
-            protocol,
-            config_path: "/tmp/corp.conf".into(),
-            location: String::new(),
-            last_used: None,
-        }
-    }
-
     #[test]
     fn human_and_watch_headline_distinguish_wireguard_from_openvpn() {
         assert_eq!(
@@ -1442,26 +1371,7 @@ mod handshake_status_tests {
     }
 
     #[test]
-    fn daemon_overlay_uses_protocol_specific_transitional_state() {
-        let state = Connection::Connecting {
-            profile_id: ProfileId::new("corp"),
-            started_at: std::time::SystemTime::now(),
-            attempt: 1,
-            retry_budget_remaining: Duration::from_secs(30),
-        };
-        let mut wg = snapshot("disconnected", "");
-        overlay_daemon_state(&mut wg, &state, &[profile(Protocol::WireGuard)]);
-        assert_eq!(wg.connection_state, "handshaking");
-        assert_eq!(wg.protocol.as_deref(), Some("WireGuard"));
-
-        let mut ovpn = snapshot("disconnected", "");
-        overlay_daemon_state(&mut ovpn, &state, &[profile(Protocol::OpenVPN)]);
-        assert_eq!(ovpn.connection_state, "connecting");
-        assert_eq!(ovpn.protocol.as_deref(), Some("OpenVPN"));
-    }
-
-    #[test]
-    fn daemon_overlay_and_human_projection_preserve_typed_health_generation() {
+    fn human_projection_preserves_typed_health_generation() {
         let degraded = crate::vortix_core::engine::state::ConnectionHealth::Degraded {
             reason: crate::vortix_core::engine::state::DegradedReason::WireGuardPeerStale {
                 peer_public_key: "peer-public-key".into(),
@@ -1469,20 +1379,9 @@ mod handshake_status_tests {
                 seconds_since_last_handshake: 181,
             },
         };
-        let details = crate::vortix_core::engine::state::DetailedConnectionInfo {
-            generation: 7,
-            ..Default::default()
-        };
-        let state = Connection::Connected {
-            profile_id: ProfileId::new("corp"),
-            since: std::time::SystemTime::now(),
-            health: degraded.clone(),
-            details: Box::new(details),
-        };
-        let mut snap = snapshot("disconnected", "");
-        overlay_daemon_state(&mut snap, &state, &[profile(Protocol::WireGuard)]);
-        assert_eq!(snap.health, Some(degraded));
-        assert_eq!(snap.generation, Some(7));
+        let mut snap = snapshot("connected", "WireGuard");
+        snap.health = Some(degraded.clone());
+        snap.generation = Some(7);
         assert!(human_status_headline(&snap).contains("stale for 181s"));
         let projected = connection_health_entry(snap.health.as_ref().unwrap());
         assert_eq!(projected.status, "degraded");
@@ -1491,6 +1390,28 @@ mod handshake_status_tests {
         assert_eq!(status_exit_code(OutputMode::Human, &snap), 0);
         snap.health = Some(crate::vortix_core::engine::state::ConnectionHealth::Healthy);
         assert_eq!(status_exit_code(OutputMode::Quiet, &snap), 0);
+    }
+
+    #[test]
+    fn passive_shadow_comparison_never_requires_authority() {
+        let tunnel = PassiveTunnel {
+            profile_id: ProfileId::new("corp"),
+            display_name: "corp".into(),
+            protocol: crate::vortix_core::profile::ProtocolKind::WireGuard,
+            interface_name: "wg0".into(),
+            observed_at_millis: 1,
+        };
+        let remote = PassiveSnapshot {
+            generation: 1,
+            observed_at_millis: 1,
+            tunnels: vec![tunnel],
+            authoritative: false,
+        };
+        let mut local = snapshot("connected", "WireGuard");
+        local.interface = Some("wg0".into());
+        assert!(passive_projection_matches(&local, &remote));
+        local.interface = Some("wg1".into());
+        assert!(!passive_projection_matches(&local, &remote));
     }
 
     #[test]

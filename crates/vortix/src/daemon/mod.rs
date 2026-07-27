@@ -1,28 +1,22 @@
-//! `vortix daemon` — IPC server hosting the engine.
+//! `vortix daemon` — bounded, passive IPC candidate.
 //!
-//! The daemon binds a Unix socket, hosts the FSM via the existing
-//! `EngineHandle::Local`, and serves `IpcRequest` frames from
-//! connected clients. Today single-client-at-a-time; multi-client
-//! support is a follow-up hardening pass once the wire contract has
-//! stabilized.
+//! The daemon binds an owner-only Unix socket and publishes scanner-derived
+//! snapshots to concurrent clients. It deliberately has no desired-state,
+//! lifecycle-authority, persistence, retry, or mutation capability.
 //!
-//! Auth: phase E layers `SO_PEERCRED` / `getpeereid`
-//! on top — the daemon refuses requests from a UID other than its
-//! own. Today the daemon trusts any client that can open the socket
-//! (filesystem-permissions guard at mode 0600).
+//! Filesystem ownership and peer credentials both enforce same-UID access.
+//! A mandatory compatibility handshake precedes all requests. Connections,
+//! frames, queues, writes, and shutdown drain are bounded.
 //!
 //! Lifecycle:
-//! 1. Bind the socket (cleaning up any stale socket file)
-//! 2. Install global runner + platform + journal (same as main.rs)
-//! 3. Build `Engine<TunnelKind>` + `EngineHandle::local`
-//! 4. Accept loop: handle one client at a time, terminate on SIGTERM
-//! 5. On exit, unlink the socket file
-//!
-//! The daemon prints lifecycle events (binding, accepting, accepted,
-//! shutting down) to stderr at `tracing::info` so a `systemd journalctl`
-//! or `launchctl log` view surfaces what's happening.
+//! 1. Validate and bind an owner-only socket without unsafe stale cleanup
+//! 2. Start the scanner-only query provider
+//! 3. Serve bounded concurrent snapshot/subscription connections
+//! 4. Drain admitted connections on authenticated shutdown or `SIGTERM`
+//! 5. Unlink only the exact socket inode this process created
 
 pub mod client;
+pub mod passive;
 mod server;
 
 pub use server::DaemonServer;
@@ -31,10 +25,10 @@ use std::path::{Path, PathBuf};
 
 /// Build an `EngineHandle::Local` for hosting the FSM in-process.
 ///
-/// Shared bootstrap path between `run_tui` (in-process engine for the TUI)
-/// and `vortix daemon` (engine hosted behind the IPC server). The caller
-/// MUST invoke this from within an active tokio runtime context — the
-/// handle spawns its actor task immediately.
+/// Compatibility bootstrap for the TUI's current in-process engine. The
+/// passive daemon does not call this function. The caller MUST invoke it
+/// from within an active tokio runtime context because the handle spawns its
+/// actor task immediately.
 ///
 /// Returns `None` when prerequisites are missing (no real runner installed,
 /// no global journal). Failure is non-fatal: both call sites already
@@ -107,7 +101,8 @@ pub fn build_engine_handle(
 }
 
 /// Default socket path. Linux uses `${XDG_RUNTIME_DIR}/vortix.sock`
-/// when set; otherwise falls back to `/tmp`. macOS uses `${TMPDIR}`.
+/// when set; macOS normally uses its per-user `${TMPDIR}`. The shared
+/// `/tmp` fallback includes the effective UID to avoid cross-user collisions.
 #[must_use]
 pub fn default_socket_path() -> PathBuf {
     if let Ok(rt) = std::env::var("XDG_RUNTIME_DIR") {
@@ -120,7 +115,22 @@ pub fn default_socket_path() -> PathBuf {
             return PathBuf::from(tmp).join("vortix.sock");
         }
     }
-    PathBuf::from("/tmp/vortix.sock")
+    PathBuf::from(format!("/tmp/vortix-{}.sock", effective_uid_for_path()))
+}
+
+fn effective_uid_for_path() -> u32 {
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid returns a scalar and has no failure mode.
+        #[allow(unsafe_code)]
+        unsafe {
+            libc::geteuid()
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
 }
 
 /// Honor the `VORTIX_DAEMON_SOCKET` env override. Returns `None` when
