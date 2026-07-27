@@ -104,6 +104,11 @@ impl ResourceObservation {
     pub const fn resource(&self) -> &ResourceTag {
         &self.resource
     }
+
+    #[must_use]
+    pub(crate) const fn state(&self) -> ObservationState {
+        self.state
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -458,10 +463,20 @@ fn validate_outcome(
                         ResourceKind::ProcessGroup,
                     )
                     .map_err(|_| ReceiptError::UnrelatedResource)?;
-                    if !ownership.iter().any(|item| item.resource == tunnel)
-                        || !ownership.iter().any(|item| item.resource == group)
-                    {
-                        return Err(ReceiptError::MissingRequiredResource);
+                    match plan {
+                        crate::vortix_core::privileged::ProtocolPlan::WireGuard(_) => {
+                            if ownership.len() != 1 || ownership[0].resource != tunnel {
+                                return Err(ReceiptError::MissingRequiredResource);
+                            }
+                        }
+                        crate::vortix_core::privileged::ProtocolPlan::OpenVpn(_) => {
+                            if ownership.len() != 2
+                                || !ownership.iter().any(|item| item.resource == tunnel)
+                                || !ownership.iter().any(|item| item.resource == group)
+                            {
+                                return Err(ReceiptError::MissingRequiredResource);
+                            }
+                        }
                     }
                 }
                 PrivilegedOperation::StopTunnel(_)

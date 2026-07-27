@@ -54,10 +54,10 @@ isolate applications running as the same Unix user from one another.
 U11 implements step 2's wire vocabulary and step 3's verification seam. U12's
 first typed slices add replay-before-effect admission, authenticated receipts,
 post-delivery loss classification, bounded symmetric framing, an opaque
-root-peer/fixed-socket/package-artifact proof, and exact tunnel-child ownership
-with duplicate-safe lifecycle receipts. No listener or production platform
-executor exists yet. The `vortix-helper` binary exits with code 78 for every
-entrypoint except `--version`.
+root-peer/fixed-socket/package-artifact proof, and protocol-specific tunnel
+ownership with duplicate-safe lifecycle receipts. No listener or production
+platform executor exists yet. The `vortix-helper` binary exits with code 78 for
+every entrypoint except `--version`.
 
 ## Admitted operation family
 
@@ -95,11 +95,13 @@ profile parsing, hooks, or arbitrary cleanup.
   and canonical semantic digest. Same-ID/different-digest requests fail.
 - The root replay high-water record is monotonic, boot/lease bound, and written
   atomically before an effect is admitted.
-- A tunnel start becomes owned only after its OS-observed profile/generation
-  and containment identity exactly match the admitted plan. A duplicate of the
+- A WireGuard start owns only the exact present interface after its bounded
+  setup process exits. An OpenVPN start additionally owns the exact foreground
+  containment identity for the admitted profile/generation. A duplicate of the
   current operation returns the cached receipt instead of executing again.
-- Stop reaches the executor only for an exact child owned by the current helper
-  incarnation and completes only on an exact absent observation after reap.
+- Stop reaches the executor only for an exact tunnel owned by the current
+  helper incarnation and completes only on an exact absent observation after
+  any foreground child has been reaped.
 - PID identity always includes a process start token and containment identity;
   a numeric PID alone is never ownership evidence.
 

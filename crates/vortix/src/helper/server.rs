@@ -10,17 +10,17 @@
     reason = "U12 execution slice remains unreachable until U13 enrollment gates it"
 )]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::helper::protocol::{
     negotiate_enrolled, HelperCapability, HelperClientHello, HelperError, HelperOp, HelperRequest,
     HelperResponse, HelperResult, HelperSessionBinding,
 };
 use crate::vortix_core::privileged::{
-    AmbiguousPhase, ChildOwner, ChildSpawnAuthority, HelperEpoch, ObservedChildIdentity,
-    OperationAdmission, OperationError, OperationGuard, OwnedChild, PrivilegedOperation,
-    ProtocolPlan, ReceiptError, ReceiptLedger, RejectionCode, ReplayRecord, ResourceKind,
-    ResourceObservation, ResourceTag, RootAuthorityLedger, VerifiedReceipt,
+    AmbiguousPhase, ChildOwner, ChildSpawnAuthority, HelperEpoch, ObservationState,
+    ObservedChildIdentity, OperationAdmission, OperationError, OperationGuard, OwnedChild,
+    PrivilegedOperation, ProtocolPlan, ReceiptError, ReceiptLedger, RejectionCode, ReplayRecord,
+    ResourceKind, ResourceObservation, ResourceTag, RootAuthorityLedger, VerifiedReceipt,
 };
 
 const ENABLED_CAPABILITIES: [HelperCapability; 3] = [
@@ -44,19 +44,20 @@ pub(crate) enum ObservationError {
     Overloaded,
 }
 
-/// Typed foreground-child seam. A successful start returns OS-observed
-/// containment identity, not ownership; this server checks the exact resource
-/// and mints the non-serializable ownership capability. A successful stop must
-/// mean the contained process group is gone and reaped.
+/// Typed protocol lifecycle seam. `WireGuard` returns exact interface evidence
+/// after its bounded setup child has exited; `OpenVPN` returns OS-observed
+/// foreground containment identity, not ownership. A successful stop must mean
+/// the interface is absent and any contained process group is gone and reaped.
 pub(crate) trait TunnelLifecycleExecutor {
     fn start_tunnel(
         &mut self,
         plan: &ProtocolPlan,
-    ) -> Result<ObservedChildIdentity, TunnelLifecycleError>;
+    ) -> Result<TunnelStartOutcome, TunnelLifecycleError>;
 
     fn stop_tunnel(
         &mut self,
-        child: &ObservedChildIdentity,
+        tunnel: &ResourceTag,
+        child: Option<&ObservedChildIdentity>,
     ) -> Result<ResourceObservation, TunnelLifecycleError>;
 
     /// Contain a child whose returned identity cannot be claimed for the
@@ -65,6 +66,14 @@ pub(crate) trait TunnelLifecycleExecutor {
         &mut self,
         child: &ObservedChildIdentity,
     ) -> Result<(), TunnelLifecycleError>;
+}
+
+/// Protocol-specific successful start evidence. `WireGuard` must leave no
+/// long-lived setup child; `OpenVPN` must return a foreground containment
+/// identity that the helper can claim.
+pub(crate) enum TunnelStartOutcome {
+    InterfaceApplied(ResourceObservation),
+    ForegroundOwned(ObservedChildIdentity),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +100,7 @@ pub(crate) struct EnrolledHelperSession<E, S> {
     receipts: ReceiptLedger,
     executor: E,
     replay_store: S,
+    owned_tunnels: BTreeSet<ResourceTag>,
     owned_children: BTreeMap<ResourceTag, OwnedChild>,
     last_receipt: Option<VerifiedReceipt>,
     handshaken: bool,
@@ -120,6 +130,7 @@ where
             receipts,
             executor,
             replay_store,
+            owned_tunnels: BTreeSet::new(),
             owned_children: BTreeMap::new(),
             last_receipt: None,
             handshaken: false,
@@ -248,43 +259,62 @@ where
         let Ok(tunnel) = ResourceTag::tunnel(plan.profile_id().clone(), plan.generation()) else {
             return self.receipts.rejected(request, RejectionCode::InvalidPlan);
         };
-        if self.owned_children.contains_key(&tunnel) {
+        if self.owned_tunnels.contains(&tunnel) {
             return self
                 .receipts
                 .rejected(request, RejectionCode::InvalidResource);
         }
 
-        let identity = match self.executor.start_tunnel(plan) {
-            Ok(identity) => identity,
+        let outcome = match self.executor.start_tunnel(plan) {
+            Ok(outcome) => outcome,
             Err(error) => return self.lifecycle_error_receipt(request, error),
         };
-        if identity.resource() != &tunnel {
-            return if self.executor.contain_unclaimed(&identity).is_ok() {
-                self.receipts
-                    .rejected(request, RejectionCode::InvalidResource)
-            } else {
-                self.receipts
-                    .ambiguous(request, AmbiguousPhase::EffectMayHaveApplied)
-            };
-        }
-
-        let authority = ChildSpawnAuthority::new(ChildOwner::BackgroundHelper(self.helper_epoch));
-        let Ok(owned) = authority.claim(identity) else {
-            return self
-                .receipts
-                .ambiguous(request, AmbiguousPhase::EffectMayHaveApplied);
+        let resources = match (plan, outcome) {
+            (ProtocolPlan::WireGuard(_), TunnelStartOutcome::InterfaceApplied(observation))
+                if observation.resource() == &tunnel
+                    && observation.state() == ObservationState::Present =>
+            {
+                vec![tunnel.clone()]
+            }
+            (ProtocolPlan::OpenVpn(_), TunnelStartOutcome::ForegroundOwned(identity))
+                if identity.resource() == &tunnel =>
+            {
+                let authority =
+                    ChildSpawnAuthority::new(ChildOwner::BackgroundHelper(self.helper_epoch));
+                let Ok(owned) = authority.claim(identity) else {
+                    return self
+                        .receipts
+                        .ambiguous(request, AmbiguousPhase::EffectMayHaveApplied);
+                };
+                let Ok(group) = ResourceTag::profile(
+                    plan.profile_id().clone(),
+                    plan.generation(),
+                    ResourceKind::ProcessGroup,
+                ) else {
+                    return self
+                        .receipts
+                        .ambiguous(request, AmbiguousPhase::EffectMayHaveApplied);
+                };
+                self.owned_children.insert(tunnel.clone(), owned);
+                vec![tunnel.clone(), group]
+            }
+            (_, TunnelStartOutcome::ForegroundOwned(identity)) => {
+                return if self.executor.contain_unclaimed(&identity).is_ok() {
+                    self.receipts
+                        .rejected(request, RejectionCode::InvalidResource)
+                } else {
+                    self.receipts
+                        .ambiguous(request, AmbiguousPhase::EffectMayHaveApplied)
+                };
+            }
+            (_, TunnelStartOutcome::InterfaceApplied(_)) => {
+                return self
+                    .receipts
+                    .ambiguous(request, AmbiguousPhase::EffectMayHaveApplied);
+            }
         };
-        let Ok(group) = ResourceTag::profile(
-            plan.profile_id().clone(),
-            plan.generation(),
-            ResourceKind::ProcessGroup,
-        ) else {
-            return self
-                .receipts
-                .ambiguous(request, AmbiguousPhase::EffectMayHaveApplied);
-        };
-        self.owned_children.insert(tunnel.clone(), owned);
-        self.receipts.applied(request, vec![tunnel, group])
+        self.owned_tunnels.insert(tunnel);
+        self.receipts.applied(request, resources)
     }
 
     fn stop_tunnel(
@@ -292,16 +322,16 @@ where
         request: &crate::vortix_core::privileged::PrivilegedRequest,
         tunnel: &ResourceTag,
     ) -> Result<VerifiedReceipt, ReceiptError> {
-        let Some(identity) = self
-            .owned_children
-            .get(tunnel)
-            .map(|owned| owned.identity().clone())
-        else {
+        if !self.owned_tunnels.contains(tunnel) {
             return self
                 .receipts
                 .rejected(request, RejectionCode::InvalidResource);
-        };
-        let observation = match self.executor.stop_tunnel(&identity) {
+        }
+        let identity = self
+            .owned_children
+            .get(tunnel)
+            .map(|owned| owned.identity().clone());
+        let observation = match self.executor.stop_tunnel(tunnel, identity.as_ref()) {
             Ok(observation) => observation,
             Err(error) => return self.lifecycle_error_receipt(request, error),
         };
@@ -312,6 +342,7 @@ where
                 .ambiguous(request, AmbiguousPhase::EffectMayHaveApplied)?,
         };
         if !receipt.is_ambiguous() {
+            self.owned_tunnels.remove(tunnel);
             self.owned_children.remove(tunnel);
         }
         Ok(receipt)
@@ -387,9 +418,11 @@ mod tests {
     use crate::vortix_core::cidr::Cidr;
     use crate::vortix_core::control::AuthorityEpoch;
     use crate::vortix_core::privileged::{
-        BootScope, ContainmentId, LeaseId, ObservationState, OperationDigest, PeerProcessIdentity,
-        PrivilegedRequest, ProtocolEndpoint, RequestSequence, ServiceInstanceClaim, ServiceManager,
-        WireGuardInterfaceOptions, WireGuardPeerPlan, WireGuardPlan,
+        BootScope, ContainmentId, LeaseId, ObservationState, OpenVpnAuthFactors, OpenVpnPlan,
+        OpenVpnRemote, OpenVpnRemoteSelection, OpenVpnTransport, OperationDigest,
+        PeerProcessIdentity, PrivilegedRequest, ProtocolEndpoint, RequestSequence,
+        ServiceInstanceClaim, ServiceManager, WireGuardInterfaceOptions, WireGuardPeerPlan,
+        WireGuardPlan,
     };
     use crate::vortix_core::profile::ProfileId;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -415,7 +448,9 @@ mod tests {
     struct FakeExecutor {
         starts: usize,
         stops: usize,
+        stops_with_child: usize,
         containments: usize,
+        foreground_start: bool,
         foreign_start: bool,
         containment_fails: bool,
         start_error: Option<TunnelLifecycleError>,
@@ -439,7 +474,7 @@ mod tests {
         fn start_tunnel(
             &mut self,
             plan: &ProtocolPlan,
-        ) -> Result<ObservedChildIdentity, TunnelLifecycleError> {
+        ) -> Result<TunnelStartOutcome, TunnelLifecycleError> {
             self.starts += 1;
             if let Some(error) = self.start_error {
                 return Err(error);
@@ -450,16 +485,25 @@ mod tests {
                 plan.profile_id().clone()
             };
             let resource = ResourceTag::tunnel(profile_id, plan.generation()).unwrap();
-            ObservedChildIdentity::new(resource, 42, 99, ContainmentId::new([3; 32]))
-                .map_err(|_| TunnelLifecycleError::EffectMayHaveApplied)
+            if self.foreground_start {
+                ObservedChildIdentity::new(resource, 42, 99, ContainmentId::new([3; 32]))
+                    .map(TunnelStartOutcome::ForegroundOwned)
+                    .map_err(|_| TunnelLifecycleError::EffectMayHaveApplied)
+            } else {
+                ResourceObservation::new(resource, ObservationState::Present, 1)
+                    .map(TunnelStartOutcome::InterfaceApplied)
+                    .map_err(|_| TunnelLifecycleError::EffectMayHaveApplied)
+            }
         }
 
         fn stop_tunnel(
             &mut self,
-            child: &ObservedChildIdentity,
+            tunnel: &ResourceTag,
+            child: Option<&ObservedChildIdentity>,
         ) -> Result<ResourceObservation, TunnelLifecycleError> {
             self.stops += 1;
-            ResourceObservation::new(child.resource().clone(), ObservationState::Absent, 2)
+            self.stops_with_child += usize::from(child.is_some());
+            ResourceObservation::new(tunnel.clone(), ObservationState::Absent, 2)
                 .map_err(|_| TunnelLifecycleError::EffectMayHaveApplied)
         }
 
@@ -562,6 +606,24 @@ mod tests {
                 Vec::new(),
                 vec![peer],
                 WireGuardInterfaceOptions::default(),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn openvpn_plan(generation: u64) -> ProtocolPlan {
+        ProtocolPlan::OpenVpn(
+            OpenVpnPlan::new(
+                ProfileId::parse("a".repeat(ProfileId::HEX_LEN)).unwrap(),
+                generation,
+                vec![OpenVpnRemote::new(
+                    SocketAddr::from(([203, 0, 113, 9], 1194)),
+                    OpenVpnTransport::Udp,
+                )
+                .unwrap()],
+                OpenVpnRemoteSelection::Ordered,
+                OpenVpnAuthFactors::certificate(),
+                Vec::new(),
             )
             .unwrap(),
         )
@@ -871,12 +933,15 @@ mod tests {
             assert!(!receipt.is_ambiguous());
         }
         assert_eq!(harness.server.executor.starts, 1);
-        assert_eq!(harness.server.owned_children.len(), 1);
+        assert_eq!(harness.server.owned_tunnels.len(), 1);
+        assert!(harness.server.owned_children.is_empty());
 
         let stop = harness.request(2, PrivilegedOperation::StopTunnel(resource()));
         let receipt = harness.execute(4, &stop);
         assert!(!receipt.is_ambiguous());
         assert_eq!(harness.server.executor.stops, 1);
+        assert_eq!(harness.server.executor.stops_with_child, 0);
+        assert!(harness.server.owned_tunnels.is_empty());
         assert!(harness.server.owned_children.is_empty());
         assert_eq!(harness.server.replay_store.writes.len(), 2);
     }
@@ -888,34 +953,57 @@ mod tests {
 
         harness.execute(2, &stop);
         assert_eq!(harness.server.executor.stops, 0);
+        assert!(harness.server.owned_tunnels.is_empty());
+        assert!(harness.server.owned_children.is_empty());
+    }
+
+    #[test]
+    fn openvpn_start_claims_foreground_child_and_stop_reaps_it() {
+        let mut harness = LifecycleHarness::new(FakeExecutor {
+            foreground_start: true,
+            ..FakeExecutor::default()
+        });
+        let start = harness.request(1, PrivilegedOperation::StartTunnel(openvpn_plan(1)));
+        assert!(!harness.execute(2, &start).is_ambiguous());
+        assert_eq!(harness.server.owned_tunnels.len(), 1);
+        assert_eq!(harness.server.owned_children.len(), 1);
+
+        let stop = harness.request(2, PrivilegedOperation::StopTunnel(resource()));
+        assert!(!harness.execute(3, &stop).is_ambiguous());
+        assert_eq!(harness.server.executor.stops_with_child, 1);
+        assert!(harness.server.owned_tunnels.is_empty());
         assert!(harness.server.owned_children.is_empty());
     }
 
     #[test]
     fn foreign_start_evidence_is_contained_without_minting_ownership() {
         let mut harness = LifecycleHarness::new(FakeExecutor {
+            foreground_start: true,
             foreign_start: true,
             ..FakeExecutor::default()
         });
-        let start = harness.request(1, PrivilegedOperation::StartTunnel(wireguard_plan(1)));
+        let start = harness.request(1, PrivilegedOperation::StartTunnel(openvpn_plan(1)));
 
         harness.execute(2, &start);
         assert_eq!(harness.server.executor.starts, 1);
         assert_eq!(harness.server.executor.containments, 1);
+        assert!(harness.server.owned_tunnels.is_empty());
         assert!(harness.server.owned_children.is_empty());
     }
 
     #[test]
     fn failed_foreign_containment_stays_ambiguous() {
         let mut harness = LifecycleHarness::new(FakeExecutor {
+            foreground_start: true,
             foreign_start: true,
             containment_fails: true,
             ..FakeExecutor::default()
         });
-        let start = harness.request(1, PrivilegedOperation::StartTunnel(wireguard_plan(1)));
+        let start = harness.request(1, PrivilegedOperation::StartTunnel(openvpn_plan(1)));
 
         assert!(harness.execute(2, &start).is_ambiguous());
         assert_eq!(harness.server.executor.containments, 1);
+        assert!(harness.server.owned_tunnels.is_empty());
         assert!(harness.server.owned_children.is_empty());
     }
 
@@ -932,6 +1020,7 @@ mod tests {
             assert!(receipt.is_ambiguous());
         }
         assert_eq!(harness.server.executor.starts, 1);
+        assert!(harness.server.owned_tunnels.is_empty());
         assert!(harness.server.owned_children.is_empty());
     }
 }
