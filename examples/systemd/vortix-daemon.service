@@ -1,22 +1,22 @@
 [Unit]
-Description=Vortix VPN engine daemon
+Description=Vortix passive daemon candidate (user service)
 Documentation=https://github.com/Harry-kp/vortix
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/vortix daemon
+ExecStart=/usr/libexec/vortix/vortix daemon
 Restart=on-failure
 RestartSec=5
-# The daemon runs as root for privileged subprocess
-# work (wg-quick, openvpn, iptables). Frontend clients connect via
-# SO_PEERCRED-authenticated Unix socket. See SECURITY.md for the
-# v0.3.0 auth posture.
-User=root
-Group=root
-# Log to journald — `journalctl -u vortix-daemon` surfaces output.
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateDevices=true
 StandardOutput=journal
 StandardError=journal
 
+# Install this file in a user's systemd unit directory. Packages stage it but
+# MUST NOT enable or start it automatically. U10 is read-only and unprivileged.
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target

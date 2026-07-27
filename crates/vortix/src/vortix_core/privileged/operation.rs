@@ -293,6 +293,16 @@ impl ServiceInstanceClaim {
         self.executable_digest
     }
 
+    #[must_use]
+    pub const fn manager(&self) -> ServiceManager {
+        self.manager
+    }
+
+    #[must_use]
+    pub const fn manager_instance_nonce(&self) -> [u8; 32] {
+        self.manager_instance_nonce
+    }
+
     fn binding_digest(&self) -> OperationDigest {
         OperationDigest::semantic(b"service-instance", self)
     }
@@ -386,7 +396,7 @@ impl U11PlatformAuthorityVerifier {
 
 #[allow(dead_code, reason = "U11 platform verifier seam")]
 impl PlatformVerifiedAuthority {
-    fn from_platform_verifier(
+    pub(crate) fn from_platform_verifier(
         owner_uid: u32,
         peer: PeerProcessIdentity,
         service: &ServiceInstanceClaim,
