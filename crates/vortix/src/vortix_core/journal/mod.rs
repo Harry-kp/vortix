@@ -380,8 +380,16 @@ mod tests {
             journal.append(sample_event()).unwrap();
         }
 
-        // Let the writer drain.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // The tail is updated only after each record has been written and
+        // flushed, so it is the deterministic completion signal for this
+        // asynchronous writer.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while journal.tail().len() < 6 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("journal writer should flush all accepted records");
 
         let path = journal.session_path.clone().expect("session path");
         let content = std::fs::read_to_string(&path).unwrap();
