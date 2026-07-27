@@ -16,6 +16,7 @@
 //! 5. Unlink only the exact socket inode this process created
 
 pub mod client;
+pub(crate) mod helper_client;
 pub mod passive;
 mod server;
 

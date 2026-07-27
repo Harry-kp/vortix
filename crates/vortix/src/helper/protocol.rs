@@ -3,8 +3,11 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::vortix_core::control::AuthorityEpoch;
 use crate::vortix_core::ipc::CompatibilityRange;
-use crate::vortix_core::privileged::{PrivilegedRequest, ServiceInstanceClaim};
+use crate::vortix_core::privileged::{
+    HelperEpoch, LeaseId, PrivilegedRequest, ServiceInstanceClaim,
+};
 
 pub const HELPER_PROTOCOL_MIN: u16 = 1;
 pub const HELPER_PROTOCOL_MAX: u16 = 1;
@@ -86,6 +89,18 @@ pub struct HelperServerHello {
     pub authority_mode: HelperAuthorityMode,
     pub contract_capabilities: Vec<HelperCapability>,
     pub enabled_capabilities: Vec<HelperCapability>,
+    pub session: Option<HelperSessionBinding>,
+}
+
+/// Authenticated incarnation expected on every enrolled receipt. The daemon
+/// still treats these scalars as untrusted until the peer socket and installed
+/// helper identity have been verified by the platform boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HelperSessionBinding {
+    pub authority_epoch: AuthorityEpoch,
+    pub lease_id: LeaseId,
+    pub helper_epoch: HelperEpoch,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,7 +138,9 @@ pub struct HelperResponse {
 )]
 pub enum HelperResult {
     Handshake(HelperServerHello),
-    /// U12 replaces this dormant outcome with the strict receipt wire.
+    /// A receipt remains an untrusted JSON value until the daemon decodes it
+    /// as `UntrustedReceipt` and authenticates every binding field.
+    Receipt(serde_json::Value),
     Staged,
 }
 
@@ -140,17 +157,56 @@ pub enum HelperError {
     Malformed { reason: String },
     #[error("helper frame is too large: {size} > {max}")]
     FrameTooLarge { size: usize, max: usize },
+    #[error("helper peer did not authenticate as the enrolled daemon")]
+    AuthenticationFailed,
+    #[error("root replay ledger is unavailable; helper session is fail-closed")]
+    LedgerUnavailable,
 }
 
 /// Negotiate the installed-but-unenrolled U11 helper contract.
 pub fn negotiate_staged(hello: &HelperClientHello) -> Result<HelperServerHello, HelperError> {
+    negotiate_common(hello, &STAGED_CAPABILITIES)
+}
+
+#[allow(
+    dead_code,
+    reason = "U12 execution slice remains unreachable until U13 enrollment gates it"
+)]
+pub(crate) fn negotiate_enrolled(
+    hello: &HelperClientHello,
+    binding: HelperSessionBinding,
+    enabled_capabilities: &[HelperCapability],
+) -> Result<HelperServerHello, HelperError> {
+    let mut negotiated = negotiate_common(hello, enabled_capabilities)?;
+    negotiated.authority_mode = HelperAuthorityMode::Enrolled;
+    negotiated.session = Some(binding);
+    Ok(negotiated)
+}
+
+#[allow(
+    dead_code,
+    reason = "U12 execution slice remains unreachable until U13 enrollment gates it"
+)]
+fn negotiate_common(
+    hello: &HelperClientHello,
+    enabled_capabilities: &[HelperCapability],
+) -> Result<HelperServerHello, HelperError> {
     if hello.product != "vortix"
         || hello.product_version.is_empty()
         || hello.product_version.len() > 64
         || hello.owner_uid == 0
+        || enabled_capabilities.is_empty()
+        || !enabled_capabilities.contains(&HelperCapability::Handshake)
+        || enabled_capabilities
+            .iter()
+            .enumerate()
+            .any(|(index, capability)| enabled_capabilities[..index].contains(capability))
+        || enabled_capabilities
+            .iter()
+            .any(|capability| !CONTRACT_CAPABILITIES.contains(capability))
     {
         return Err(HelperError::Incompatible {
-            reason: "product and non-root owner identity are required".into(),
+            reason: "invalid product, owner, or enabled capability set".into(),
         });
     }
     if hello.required_capabilities.len() > CONTRACT_CAPABILITIES.len()
@@ -188,7 +244,7 @@ pub fn negotiate_staged(hello: &HelperClientHello) -> Result<HelperServerHello, 
             reason: "helper schema ranges do not overlap".into(),
         })?;
     for capability in &hello.required_capabilities {
-        if !STAGED_CAPABILITIES.contains(capability) {
+        if !enabled_capabilities.contains(capability) {
             return Err(HelperError::CapabilityUnavailable {
                 capability: *capability,
             });
@@ -201,7 +257,8 @@ pub fn negotiate_staged(hello: &HelperClientHello) -> Result<HelperServerHello, 
         schema,
         authority_mode: HelperAuthorityMode::Staged,
         contract_capabilities: CONTRACT_CAPABILITIES.to_vec(),
-        enabled_capabilities: STAGED_CAPABILITIES.to_vec(),
+        enabled_capabilities: enabled_capabilities.to_vec(),
+        session: None,
     })
 }
 

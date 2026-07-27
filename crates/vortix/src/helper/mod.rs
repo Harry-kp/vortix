@@ -1,17 +1,18 @@
-//! Dormant privileged-helper contract and packaging boundary.
+//! Privileged-helper contract, dormant execution core, and packaging boundary.
 //!
-//! This module deliberately contains no privileged execution. U11 freezes the
-//! wire, identity, and installation rules so the later executor cannot grow a
-//! generic command, path, environment, or profile-shaped escape hatch.
+//! U11 froze the wire, identity, and installation rules. U12 operation families
+//! are implemented behind crate-private capabilities one at a time; the helper
+//! binary remains staged and exposes no server entrypoint until U13 enrollment.
 
 pub mod protocol;
+mod server;
 pub mod validate;
 
 pub use protocol::{
     negotiate_staged, parse_request, HelperAuthorityMode, HelperCapability, HelperClientHello,
     HelperError, HelperOp, HelperRequest, HelperResponse, HelperResult, HelperServerHello,
-    HELPER_PROTOCOL_MAX, HELPER_PROTOCOL_MIN, HELPER_SCHEMA_MAX, HELPER_SCHEMA_MIN,
-    MAX_HELPER_FRAME_BYTES,
+    HelperSessionBinding, HELPER_PROTOCOL_MAX, HELPER_PROTOCOL_MIN, HELPER_SCHEMA_MAX,
+    HELPER_SCHEMA_MIN, MAX_HELPER_FRAME_BYTES,
 };
 pub use validate::{
     ArtifactKind, EnrollmentSupport, InstallError, InstallManifest, InstallPlan, InstallRequest,

@@ -1,8 +1,9 @@
 # Privileged helper threat model
 
-Status: U11 contract frozen; helper staged and **unenrolled**. No privileged
-operation is reachable in this release. U12 may implement the frozen contract;
-U13 alone may enroll authority.
+Status: U11 contract frozen; U12 authenticated observation/recovery core is
+implemented but dormant; helper staged and **unenrolled**. No privileged
+operation is reachable in this release. U12 enables remaining operation
+families behind the dormant boundary; U13 alone may enroll authority.
 
 ## Security objective
 
@@ -49,9 +50,11 @@ isolate applications running as the same Unix user from one another.
    it back to the authenticated helper, request digest, epoch, lease, and
    sequence.
 
-U11 implements steps 2's wire vocabulary and 3's verification seam, but no
-listener or executor. The `vortix-helper` binary exits with code 78 for every
-entrypoint except `--version`.
+U11 implements step 2's wire vocabulary and step 3's verification seam. U12's
+first typed slice adds replay-before-read observation, authenticated receipts,
+and post-delivery loss classification without a listener or platform executor.
+The `vortix-helper` binary exits with code 78 for every entrypoint except
+`--version`.
 
 ## Admitted operation family
 
