@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::vortix_core::control::AuthorityEpoch;
-use crate::vortix_core::ipc::CompatibilityRange;
+use crate::vortix_core::ipc::frame::{decode_frame_bounded, encode_frame_bounded};
+use crate::vortix_core::ipc::{CompatibilityRange, FrameError};
 use crate::vortix_core::privileged::{
     HelperEpoch, LeaseId, PrivilegedRequest, ServiceInstanceClaim,
 };
@@ -273,4 +274,25 @@ pub fn parse_request(bytes: &[u8]) -> Result<HelperRequest, HelperError> {
     serde_json::from_slice(bytes).map_err(|error| HelperError::Malformed {
         reason: error.to_string(),
     })
+}
+
+/// Encode one daemon-to-helper request with the helper-specific frame cap.
+pub fn encode_request_frame(request: &HelperRequest) -> Result<Vec<u8>, FrameError> {
+    encode_frame_bounded::<_, MAX_HELPER_FRAME_BYTES>(request)
+}
+
+/// Decode at most one daemon-to-helper frame without allocating its declared
+/// body until the 256 KiB helper limit has been checked.
+pub fn decode_request_frame(bytes: &[u8]) -> Result<Option<(HelperRequest, usize)>, FrameError> {
+    decode_frame_bounded::<_, MAX_HELPER_FRAME_BYTES>(bytes)
+}
+
+/// Encode one helper-to-daemon response with the same symmetric bound.
+pub fn encode_response_frame(response: &HelperResponse) -> Result<Vec<u8>, FrameError> {
+    encode_frame_bounded::<_, MAX_HELPER_FRAME_BYTES>(response)
+}
+
+/// Decode at most one helper-to-daemon response frame under the helper cap.
+pub fn decode_response_frame(bytes: &[u8]) -> Result<Option<(HelperResponse, usize)>, FrameError> {
+    decode_frame_bounded::<_, MAX_HELPER_FRAME_BYTES>(bytes)
 }

@@ -483,6 +483,86 @@ pub(super) fn verify_service_instance(
         .map_err(|_| InstallError::UntrustedServiceInstance)
 }
 
+/// Kernel/filesystem facts for the helper peer observed by the unprivileged
+/// daemon. The wire hello cannot construct these facts.
+#[allow(
+    dead_code,
+    reason = "U13 platform transport constructs helper peer facts"
+)]
+pub(super) struct HelperPeerFacts {
+    peer_uid: u32,
+    peer_pid: u32,
+    process_start_token: u64,
+    socket_path: PathBuf,
+    socket_owner_uid: u32,
+    socket_mode: u32,
+    helper_artifact: ArtifactFact,
+}
+
+#[allow(
+    dead_code,
+    reason = "U13 platform transport constructs helper peer facts"
+)]
+impl HelperPeerFacts {
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::similar_names,
+        reason = "the OS verifier supplies each independent helper identity fact"
+    )]
+    pub(super) const fn from_os_verifier(
+        peer_uid: u32,
+        peer_pid: u32,
+        process_start_token: u64,
+        socket_path: PathBuf,
+        socket_owner_uid: u32,
+        socket_mode: u32,
+        helper_artifact: ArtifactFact,
+    ) -> Self {
+        Self {
+            peer_uid,
+            peer_pid,
+            process_start_token,
+            socket_path,
+            socket_owner_uid,
+            socket_mode,
+            helper_artifact,
+        }
+    }
+}
+
+/// Opaque daemon-side proof that the connected process and socket match the
+/// installed root-owned helper for this enrolled owner. Scalar handshake data
+/// cannot create this capability.
+#[allow(dead_code, reason = "U13 passes this capability to the helper client")]
+pub(crate) struct VerifiedHelperPeer {
+    private: (),
+}
+
+#[allow(dead_code, reason = "U13 invokes this with kernel/filesystem facts")]
+pub(super) fn verify_helper_peer(
+    owner_uid: u32,
+    layout: PlatformLayout,
+    manifest: &InstallManifest,
+    facts: &HelperPeerFacts,
+) -> Result<VerifiedHelperPeer, InstallError> {
+    if owner_uid == 0
+        || facts.peer_uid != 0
+        || facts.peer_pid == 0
+        || facts.process_start_token == 0
+        || facts.socket_path != Path::new(layout.helper_socket())
+        || facts.socket_owner_uid != owner_uid
+        || facts.socket_mode != HELPER_SOCKET_MODE
+        || facts.helper_artifact.kind != ArtifactKind::Helper
+    {
+        return Err(InstallError::UntrustedHelperPeer);
+    }
+    facts
+        .helper_artifact
+        .validate(layout, manifest)
+        .map_err(|_| InstallError::UntrustedHelperPeer)?;
+    Ok(VerifiedHelperPeer { private: () })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum InstallError {
     #[error("invalid canonical release manifest")]
@@ -497,6 +577,8 @@ pub enum InstallError {
     UntrustedArtifact { kind: ArtifactKind },
     #[error("daemon service instance did not match OS-owned facts")]
     UntrustedServiceInstance,
+    #[error("helper peer, socket, or installed artifact did not match OS-owned facts")]
+    UntrustedHelperPeer,
 }
 
 #[cfg(test)]
@@ -518,6 +600,60 @@ mod tests {
             true,
         );
         assert!(verify_service_instance(501, &claim, &facts).is_ok());
+    }
+
+    #[test]
+    fn helper_peer_requires_root_process_fixed_owner_socket_and_package_artifact() {
+        let helper_digest = OperationDigest::of_bytes(b"helper");
+        let manifest = InstallManifest::new(
+            "0.4.3".into(),
+            1,
+            OperationDigest::of_bytes(b"daemon"),
+            helper_digest,
+            OperationDigest::of_bytes(b"bootstrap"),
+            None,
+        )
+        .unwrap();
+        let artifact = ArtifactFact::from_os_verifier(
+            ArtifactKind::Helper,
+            PathBuf::from(PlatformLayout::Linux.helper_path()),
+            0,
+            0o755,
+            helper_digest,
+            false,
+        );
+        let facts = HelperPeerFacts::from_os_verifier(
+            0,
+            77,
+            91,
+            PathBuf::from(PlatformLayout::Linux.helper_socket()),
+            501,
+            HELPER_SOCKET_MODE,
+            artifact,
+        );
+        assert!(verify_helper_peer(501, PlatformLayout::Linux, &manifest, &facts).is_ok());
+
+        let wrong_socket = HelperPeerFacts::from_os_verifier(
+            0,
+            77,
+            91,
+            PathBuf::from("/tmp/helper.sock"),
+            501,
+            HELPER_SOCKET_MODE,
+            facts.helper_artifact.clone(),
+        );
+        assert!(verify_helper_peer(501, PlatformLayout::Linux, &manifest, &wrong_socket).is_err());
+
+        let non_root = HelperPeerFacts::from_os_verifier(
+            501,
+            77,
+            91,
+            PathBuf::from(PlatformLayout::Linux.helper_socket()),
+            501,
+            HELPER_SOCKET_MODE,
+            facts.helper_artifact.clone(),
+        );
+        assert!(verify_helper_peer(501, PlatformLayout::Linux, &manifest, &non_root).is_err());
     }
 
     #[test]

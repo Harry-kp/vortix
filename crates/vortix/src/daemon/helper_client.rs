@@ -12,6 +12,7 @@
 
 use thiserror::Error;
 
+use crate::helper::validate::VerifiedHelperPeer;
 use crate::helper::{
     HelperAuthorityMode, HelperCapability, HelperResponse, HelperResult, HelperServerHello,
     HELPER_PROTOCOL_MAX, HELPER_PROTOCOL_MIN, HELPER_SCHEMA_MAX, HELPER_SCHEMA_MIN,
@@ -28,6 +29,7 @@ pub(crate) struct AuthenticatedHelperSession {
 impl AuthenticatedHelperSession {
     pub(crate) fn from_handshake(
         principal: &TrustedDaemonPrincipal,
+        _peer: &VerifiedHelperPeer,
         hello: &HelperServerHello,
     ) -> Result<Self, HelperClientError> {
         let Some(binding) = hello.session else {

@@ -210,7 +210,10 @@ fn map_receipt_error(_error: ReceiptError) -> HelperError {
 mod tests {
     use super::*;
     use crate::daemon::helper_client::{AuthenticatedHelperSession, DeliveryState, RecoveryAction};
-    use crate::helper::validate::{verify_service_instance, VerifiedServiceFacts};
+    use crate::helper::validate::{
+        verify_helper_peer, verify_service_instance, ArtifactFact, HelperPeerFacts,
+        InstallManifest, PlatformLayout, VerifiedServiceFacts,
+    };
     use crate::vortix_core::control::AuthorityEpoch;
     use crate::vortix_core::privileged::{
         BootScope, LeaseId, ObservationState, OperationDigest, PeerProcessIdentity,
@@ -286,6 +289,37 @@ mod tests {
         (root, principal, claim, helper_epoch, baseline)
     }
 
+    fn verified_helper_peer() -> crate::helper::validate::VerifiedHelperPeer {
+        let helper_digest = OperationDigest::of_bytes(b"helper");
+        let manifest = InstallManifest::new(
+            "0.4.3".into(),
+            1,
+            OperationDigest::of_bytes(b"daemon"),
+            helper_digest,
+            OperationDigest::of_bytes(b"bootstrap"),
+            None,
+        )
+        .unwrap();
+        let artifact = ArtifactFact::from_os_verifier(
+            crate::helper::ArtifactKind::Helper,
+            std::path::PathBuf::from(PlatformLayout::Linux.helper_path()),
+            0,
+            0o755,
+            helper_digest,
+            false,
+        );
+        let facts = HelperPeerFacts::from_os_verifier(
+            0,
+            77,
+            91,
+            std::path::PathBuf::from(PlatformLayout::Linux.helper_socket()),
+            501,
+            crate::helper::HELPER_SOCKET_MODE,
+            artifact,
+        );
+        verify_helper_peer(501, PlatformLayout::Linux, &manifest, &facts).unwrap()
+    }
+
     fn resource() -> ResourceTag {
         ResourceTag::tunnel(ProfileId::parse("a".repeat(ProfileId::HEX_LEN)).unwrap(), 1).unwrap()
     }
@@ -313,7 +347,12 @@ mod tests {
         let HelperResult::Handshake(server_hello) = handshake.result.unwrap() else {
             panic!("expected handshake");
         };
-        let client = AuthenticatedHelperSession::from_handshake(&principal, &server_hello).unwrap();
+        let client = AuthenticatedHelperSession::from_handshake(
+            &principal,
+            &verified_helper_peer(),
+            &server_hello,
+        )
+        .unwrap();
         let request = PrivilegedRequest::new(
             &principal,
             helper_epoch,
@@ -493,7 +532,12 @@ mod tests {
         let HelperResult::Handshake(server_hello) = handshake.result.unwrap() else {
             panic!("expected handshake");
         };
-        let client = AuthenticatedHelperSession::from_handshake(&principal, &server_hello).unwrap();
+        let client = AuthenticatedHelperSession::from_handshake(
+            &principal,
+            &verified_helper_peer(),
+            &server_hello,
+        )
+        .unwrap();
         let request = PrivilegedRequest::new(
             &principal,
             helper_epoch,
