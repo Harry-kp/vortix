@@ -73,6 +73,11 @@ impl ObservedChildIdentity {
             containment,
         })
     }
+
+    #[must_use]
+    pub(crate) const fn resource(&self) -> &ResourceTag {
+        &self.resource
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,6 +124,11 @@ impl ChildSpawnAuthority {
 }
 
 impl OwnedChild {
+    #[must_use]
+    pub(crate) const fn identity(&self) -> &ObservedChildIdentity {
+        &self.identity
+    }
+
     #[must_use]
     pub fn after(&self, event: ChildExit) -> ChildOwnershipState {
         match event {

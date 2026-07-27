@@ -90,6 +90,7 @@ mod protocol_plan;
 mod receipt;
 mod resource;
 
+pub(crate) use child_owner::ChildSpawnAuthority;
 pub use child_owner::{
     ChildExit, ChildObservation, ChildOwner, ChildOwnershipError, ChildOwnershipState,
     ContainmentId, CustodianAction, ObservedChildIdentity, OwnedChild, StandardCustodianContract,

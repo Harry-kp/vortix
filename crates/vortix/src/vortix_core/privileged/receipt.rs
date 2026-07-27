@@ -30,6 +30,7 @@ pub enum RejectionCode {
     InvalidResource,
     InvalidPlan,
     Overloaded,
+    ExecutionFailed,
 }
 
 /// Root-ledger ownership fact. It is never accepted from deserialized wire.
