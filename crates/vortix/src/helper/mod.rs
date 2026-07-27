@@ -5,6 +5,7 @@
 //! binary remains staged and exposes no server entrypoint until U13 enrollment.
 
 pub mod protocol;
+mod replay_store;
 mod server;
 pub mod validate;
 
