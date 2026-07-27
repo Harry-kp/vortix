@@ -14,7 +14,7 @@ use thiserror::Error;
 
 use super::server::ReplayStore;
 use super::{PlatformLayout, HELPER_LEDGER_MODE, HELPER_RUNTIME_DIR_MODE};
-use crate::vortix_core::privileged::{ReplayBaseline, ReplayRecord};
+use crate::vortix_core::privileged::{HelperLedgerRecord, ReplayBaseline, ReplayRecord};
 
 const MAX_REPLAY_BYTES: u64 = 64 * 1024;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -44,6 +44,10 @@ impl FsReplayStore {
     }
 
     pub(crate) fn load(&self) -> Result<ReplayRecord, ReplayStoreError> {
+        self.load_ledger().map(HelperLedgerRecord::into_replay)
+    }
+
+    fn load_ledger(&self) -> Result<HelperLedgerRecord, ReplayStoreError> {
         let parent = self.parent()?;
         validate_directory(parent, self.expected_owner_uid)?;
         let file = open_read_no_follow(&self.path)?;
@@ -74,7 +78,15 @@ impl FsReplayStore {
             Err(error) => return Err(error.into()),
         }
 
-        let bytes = serde_json::to_vec(checkpoint)?;
+        let mut ledger = match self.load_ledger() {
+            Ok(ledger) => ledger,
+            Err(ReplayStoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                HelperLedgerRecord::empty(checkpoint.clone())
+            }
+            Err(error) => return Err(error),
+        };
+        ledger.replace_replay(checkpoint.clone());
+        let bytes = serde_json::to_vec(&ledger)?;
         if bytes.is_empty() || bytes.len() as u64 > MAX_REPLAY_BYTES {
             return Err(ReplayStoreError::Capacity);
         }

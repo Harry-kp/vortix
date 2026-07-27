@@ -113,6 +113,8 @@ profile parsing, hooks, or arbitrary cleanup.
   strict-decoded, root-owned `0600` file in a root-owned `0700` directory.
   Updates use same-directory create-exclusive temporary files, file and
   directory fsync, atomic rename, no-follow opens, and reject hard links.
+  The versioned envelope already bounds exact owned-resource and child-
+  observation slots; loading a child identity never recreates `OwnedChild`.
 - PID identity always includes a process start token and containment identity;
   a numeric PID alone is never ownership evidence.
 

@@ -85,6 +85,7 @@ pub(super) fn invalid_unicast_ip(address: &IpAddr) -> bool {
 }
 
 mod child_owner;
+mod ledger;
 mod operation;
 mod protocol_plan;
 mod receipt;
@@ -95,6 +96,7 @@ pub use child_owner::{
     ChildExit, ChildObservation, ChildOwner, ChildOwnershipError, ChildOwnershipState,
     ContainmentId, CustodianAction, ObservedChildIdentity, OwnedChild, StandardCustodianContract,
 };
+pub(crate) use ledger::HelperLedgerRecord;
 pub(crate) use operation::PlatformVerifiedAuthority;
 pub use operation::{
     BootScope, HelperEpoch, LeaseId, NetworkPolicyOperation, OperationAdmission, OperationDigest,
