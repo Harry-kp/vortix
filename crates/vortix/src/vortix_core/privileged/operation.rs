@@ -1637,6 +1637,7 @@ pub enum OperationError {
 mod tests {
     use super::*;
     use crate::vortix_core::privileged::protocol_plan::{
+        OpenVpnAuthFactors, OpenVpnPlan, OpenVpnRemote, OpenVpnRemoteSelection, OpenVpnTransport,
         ProtocolEndpoint, WireGuardInterfaceOptions, WireGuardPeerPlan, WireGuardPlan,
     };
     use crate::vortix_core::privileged::receipt::{
@@ -1687,6 +1688,24 @@ mod tests {
                 Vec::new(),
                 vec![peer],
                 WireGuardInterfaceOptions::default(),
+            )
+            .unwrap(),
+        ))
+    }
+
+    fn openvpn_start_operation(generation: u64) -> PrivilegedOperation {
+        PrivilegedOperation::StartTunnel(ProtocolPlan::OpenVpn(
+            OpenVpnPlan::new(
+                profile('a'),
+                generation,
+                vec![OpenVpnRemote::new(
+                    SocketAddr::from(([203, 0, 113, 9], 1194)),
+                    OpenVpnTransport::Udp,
+                )
+                .unwrap()],
+                OpenVpnRemoteSelection::Ordered,
+                OpenVpnAuthFactors::certificate(),
+                Vec::new(),
             )
             .unwrap(),
         ))
@@ -1877,7 +1896,7 @@ mod tests {
     }
 
     #[test]
-    fn receipts_require_exact_start_resources_and_authentication() {
+    fn wireguard_receipts_require_interface_only_and_authentication() {
         let (root, principal) = authority();
         let request = PrivilegedRequest::new(
             &principal,
@@ -1893,12 +1912,7 @@ mod tests {
             receipts.applied(&request, Vec::new()).unwrap_err(),
             ReceiptError::MissingRequiredResource
         );
-        assert_eq!(
-            receipts
-                .applied(&request, vec![tunnel.clone()])
-                .unwrap_err(),
-            ReceiptError::MissingRequiredResource
-        );
+        let verified_receipt = receipts.applied(&request, vec![tunnel.clone()]).unwrap();
         assert_eq!(
             receipts
                 .applied(
@@ -1912,7 +1926,13 @@ mod tests {
                 .unwrap_err(),
             ReceiptError::UnrelatedResource
         );
-        let verified_receipt = receipts.applied(&request, vec![tunnel, group]).unwrap();
+        assert_eq!(
+            receipts
+                .applied(&request, vec![tunnel.clone(), group.clone()])
+                .unwrap_err(),
+            ReceiptError::MissingRequiredResource
+        );
+
         let wire: crate::vortix_core::privileged::receipt::UntrustedReceipt =
             serde_json::from_value(serde_json::to_value(&verified_receipt).unwrap()).unwrap();
         let receipt_verifier = AuthenticatedReceiptVerifier::from_authenticated_helper(
@@ -1970,6 +1990,29 @@ mod tests {
             receipts.applied(&observe, Vec::new()).unwrap_err(),
             ReceiptError::OutcomeMismatch
         );
+    }
+
+    #[test]
+    fn openvpn_receipts_require_tunnel_and_foreground_group() {
+        let (root, principal) = authority();
+        let receipts = ReceiptLedger::new(&root, &principal).unwrap();
+        let request = PrivilegedRequest::new(
+            &principal,
+            HelperEpoch::new(3).unwrap(),
+            RequestSequence::new(1).unwrap(),
+            openvpn_start_operation(5),
+        )
+        .unwrap();
+        let tunnel = ResourceTag::tunnel(profile('a'), 5).unwrap();
+        let group = ResourceTag::profile(profile('a'), 5, ResourceKind::ProcessGroup).unwrap();
+
+        assert_eq!(
+            receipts
+                .applied(&request, vec![tunnel.clone()])
+                .unwrap_err(),
+            ReceiptError::MissingRequiredResource
+        );
+        receipts.applied(&request, vec![tunnel, group]).unwrap();
     }
 
     #[test]
