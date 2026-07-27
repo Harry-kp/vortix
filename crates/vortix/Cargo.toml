@@ -40,6 +40,10 @@ exclude = [
 name = "vortix"
 path = "src/main.rs"
 
+[[bin]]
+name = "vortix-helper"
+path = "src/bin/vortix-helper.rs"
+
 [dependencies]
 # TUI Framework
 ratatui = { workspace = true }

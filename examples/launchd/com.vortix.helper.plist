@@ -3,19 +3,15 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.vortix.daemon</string>
+    <string>com.vortix.helper</string>
     <key>Disabled</key>
     <true/>
-    <!-- Package tooling replaces this placeholder only after validating the
-         non-root enrollment owner. Never load this example verbatim. -->
     <key>UserName</key>
-    <string>VORTIX_ENROLLED_USER</string>
+    <string>root</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Library/Application Support/Vortix/bin/vortix</string>
-        <string>daemon</string>
-        <string>--socket</string>
-        <string>/var/run/vortix/daemon.sock</string>
+        <string>/Library/PrivilegedHelperTools/com.vortix.helper</string>
+        <string>--serve</string>
     </array>
     <key>RunAtLoad</key>
     <false/>
@@ -24,8 +20,8 @@
     <key>ProcessType</key>
     <string>Background</string>
     <key>StandardOutPath</key>
-    <string>/var/log/vortix-daemon.log</string>
+    <string>/var/log/vortix-helper.log</string>
     <key>StandardErrorPath</key>
-    <string>/var/log/vortix-daemon.log</string>
+    <string>/var/log/vortix-helper.log</string>
 </dict>
 </plist>

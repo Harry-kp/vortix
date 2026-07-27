@@ -94,6 +94,7 @@ pub use child_owner::{
     ChildExit, ChildObservation, ChildOwner, ChildOwnershipError, ChildOwnershipState,
     ContainmentId, CustodianAction, ObservedChildIdentity, OwnedChild, StandardCustodianContract,
 };
+pub(crate) use operation::PlatformVerifiedAuthority;
 pub use operation::{
     BootScope, HelperEpoch, LeaseId, NetworkPolicyOperation, OperationAdmission, OperationDigest,
     OperationError, OperationGuard, PeerProcessIdentity, PolicyDigest, PolicyPhase,
