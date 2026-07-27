@@ -1,10 +1,10 @@
 # Privileged helper threat model
 
-Status: U11 contract frozen; U12 authenticated observation/recovery and tunnel
-lifecycle admission cores are implemented but dormant; helper staged and
-**unenrolled**. No privileged operation is reachable in this release. U12
-enables remaining operation families behind the dormant boundary; U13 alone
-may enroll authority.
+Status: U11 contract frozen; U12 authenticated observation/recovery, tunnel
+lifecycle, and ordered network-policy admission cores are implemented but
+dormant; helper staged and **unenrolled**. No privileged operation is reachable
+in this release. U12 enables remaining execution backends behind the dormant
+boundary; U13 alone may enroll authority.
 
 ## Security objective
 
@@ -102,6 +102,10 @@ profile parsing, hooks, or arbitrary cleanup.
 - Stop reaches the executor only for an exact tunnel owned by the current
   helper incarnation and completes only on an exact absent observation after
   any foreground child has been reaped.
+- Network policy advances through blocking, routes, DNS, firewall, and release
+  under the persisted predecessor cursor. Observation barriers and release
+  absence proofs update that cursor only after their authenticated receipt is
+  durably persisted; failure poisons the helper session.
 - PID identity always includes a process start token and containment identity;
   a numeric PID alone is never ownership evidence.
 
