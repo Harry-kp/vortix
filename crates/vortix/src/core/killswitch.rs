@@ -61,7 +61,7 @@ pub fn local_verification(active: &[ActiveTunnelInfo]) -> FirewallVerification {
         observed_at_unix_ms,
         fresh_until_unix_ms: observed_at_unix_ms.saturating_add(5_000),
         executor_epoch: local_executor_epoch().to_string(),
-        boot_id: boot_identity(),
+        boot_id: utils::boot_identity().unwrap_or_else(|| "boot-identity-unavailable".to_string()),
         source: FirewallObservationSource::PlatformReadback,
     }
 }
@@ -75,45 +75,6 @@ fn local_executor_epoch() -> &'static str {
             .as_nanos();
         format!("standard-local:{}:{started_ns}", std::process::id())
     })
-}
-
-#[cfg(target_os = "linux")] // xtask:allow-platform-cfg: boot identity proof needs the OS kernel primitive until U12 moves executor epochs behind the helper port
-fn boot_identity() -> String {
-    fs::read_to_string("/proc/sys/kernel/random/boot_id")
-        .map(|value| value.trim().to_string())
-        .unwrap_or_else(|_| "linux-boot-unknown".to_string())
-}
-
-#[cfg(target_os = "macos")]
-// xtask:allow-platform-cfg: boot identity proof needs the OS kernel primitive until U12 moves executor epochs behind the helper port
-#[allow(unsafe_code)]
-fn boot_identity() -> String {
-    let mut boot_time = libc::timeval {
-        tv_sec: 0,
-        tv_usec: 0,
-    };
-    let mut size = std::mem::size_of::<libc::timeval>();
-    // SAFETY: `kern.boottime` writes one timeval into the correctly sized,
-    // aligned output buffer; no input buffer is supplied.
-    let result = unsafe {
-        libc::sysctlbyname(
-            c"kern.boottime".as_ptr(),
-            (&raw mut boot_time).cast(),
-            &raw mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if result == 0 {
-        format!("macos-boot:{}:{}", boot_time.tv_sec, boot_time.tv_usec)
-    } else {
-        "macos-boot-unknown".to_string()
-    }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))] // xtask:allow-platform-cfg: unsupported targets need an explicit non-authoritative boot identity
-fn boot_identity() -> String {
-    "unsupported-boot-identity".to_string()
 }
 
 /// Stable digest of the complete requested firewall policy.
@@ -457,7 +418,7 @@ pub fn save_state_with_verification(
         (verification.policy_digest == expected
             && verification.fresh_until_unix_ms > now_ms
             && verification.executor_epoch == local_executor_epoch()
-            && verification.boot_id == boot_identity())
+            && utils::boot_identity().is_some_and(|boot_id| verification.boot_id == boot_id))
         .then_some(verification)
     });
 
@@ -637,7 +598,7 @@ mod tests {
         assert!(verification.executor_epoch.starts_with("standard-local:"));
         assert_eq!(verification.executor_epoch, local_executor_epoch());
         assert!(!verification.boot_id.is_empty());
-        assert_eq!(verification.boot_id, boot_identity());
+        assert_eq!(Some(verification.boot_id), utils::boot_identity());
 
         let persisted = persisted_from_active(&active);
         assert_eq!(

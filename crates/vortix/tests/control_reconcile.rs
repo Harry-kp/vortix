@@ -8,7 +8,7 @@ use vortix::vortix_core::control::reconcile::{
     merge_observation, plan_reconciliation, DisconnectTombstone, InFlightMutation,
     ObservationOwnership, ReconcileAction, ReconcileInput, ScanEvidence, TunnelObservation,
 };
-use vortix::vortix_core::control::supervisor::{PolicyVerification, Supervisor};
+use vortix::vortix_core::control::supervisor::{PolicyVerification, SupervisedTruth, Supervisor};
 use vortix::vortix_core::control::worker::{
     wait_until, CancellationToken, ControlRevision, PolicyBarrier, PolicyExecutor, PolicyOutcome,
     PolicyWorker, ProfileWorkerPool, TopologyPolicy, TopologyState, TopologyTransitionKind,
@@ -16,8 +16,8 @@ use vortix::vortix_core::control::worker::{
 };
 use vortix::vortix_core::control::{
     Clock, CommandRequest, ControlService, ControlServiceConfig, Deadline, ExecutionSelection,
-    GateEvidence, IdempotencyKey, Observation, ProfileTopology, ProtectionEvidence,
-    ProtectionStatus, UserCommand,
+    GateEvidence, IdempotencyKey, Observation, PersistedTombstone, ProfileTopology,
+    ProtectionEvidence, ProtectionStatus, UserCommand,
 };
 use vortix::vortix_core::ports::tunnel::{HandshakeEvidence, TunnelKindTag};
 use vortix::vortix_core::profile::ProfileId;
@@ -66,6 +66,37 @@ fn execution_receipt(work: &TunnelWork) -> TunnelExecutionReceipt {
         )
         .unwrap()
     }
+}
+
+#[test]
+fn restart_restores_only_disconnect_tombstone_fences() {
+    let target = profile("recovery-tombstone");
+    let supervisor = Supervisor::new(
+        AuthorityEpoch(1),
+        Arc::new(OkExecutor),
+        Arc::new(OkPolicy),
+        1,
+        4,
+    );
+    supervisor
+        .restore_tombstones(&BTreeMap::from([(
+            target.clone(),
+            PersistedTombstone {
+                authority_epoch: AuthorityEpoch(1),
+                generation: 4,
+                policy_digest: PolicyDigest("persisted-policy".into()),
+                operation_id: operation(9),
+                teardown_failed: true,
+            },
+        )]))
+        .unwrap();
+
+    let restored = supervisor.tombstones().remove(&target).unwrap();
+    assert_eq!(restored.generation, 4);
+    assert!(restored.adoption.is_none());
+    assert!(restored.handshake.is_none());
+    assert!(restored.probe_receipts.is_empty());
+    assert_eq!(restored.truth, SupervisedTruth::OutcomeUnknown);
 }
 
 struct BarrierExecutor {
@@ -690,6 +721,7 @@ async fn canonical_service_dispatches_admitted_mutation_without_blocking_snapsho
             idempotency_key: IdempotencyKey::new("canonical-connect"),
             deadline: Deadline(1_000),
         })
+        .await
         .expect("canonical operation admitted");
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
@@ -731,6 +763,7 @@ async fn canonical_service_dispatches_admitted_mutation_without_blocking_snapsho
             idempotency_key: IdempotencyKey::new("canonical-disconnect"),
             deadline: Deadline(1_000),
         })
+        .await
         .expect("disconnect admitted after connect observation");
     while !executor
         .0
@@ -773,13 +806,16 @@ async fn canonical_profile_limit_returns_busy_before_operation_admission() {
         ExecutionSelection::CanonicalAuthority,
         supervisor,
     );
-    let result = service.client().submit(CommandRequest {
-        command: UserCommand::Connect {
-            profile_id: rejected,
-        },
-        idempotency_key: IdempotencyKey::new("bounded-profile"),
-        deadline: Deadline(1_000),
-    });
+    let result = service
+        .client()
+        .submit(CommandRequest {
+            command: UserCommand::Connect {
+                profile_id: rejected,
+            },
+            idempotency_key: IdempotencyKey::new("bounded-profile"),
+            deadline: Deadline(1_000),
+        })
+        .await;
     assert_eq!(
         result,
         Err(vortix::vortix_core::control::AdmissionError::Busy)
@@ -863,14 +899,18 @@ async fn admission_reserves_normalized_routes_before_desired_mutation() {
             idempotency_key: IdempotencyKey::new("route-a"),
             deadline: Deadline(1_000),
         })
+        .await
         .unwrap();
-    let rejected = service.client().submit(CommandRequest {
-        command: UserCommand::Connect {
-            profile_id: second.clone(),
-        },
-        idempotency_key: IdempotencyKey::new("route-b"),
-        deadline: Deadline(1_000),
-    });
+    let rejected = service
+        .client()
+        .submit(CommandRequest {
+            command: UserCommand::Connect {
+                profile_id: second.clone(),
+            },
+            idempotency_key: IdempotencyKey::new("route-b"),
+            deadline: Deadline(1_000),
+        })
+        .await;
     assert_eq!(
         rejected,
         Err(vortix::vortix_core::control::AdmissionError::RouteConflict)
@@ -935,6 +975,7 @@ async fn policy_waits_for_attested_tunnel_and_carries_complete_topology() {
             idempotency_key: IdempotencyKey::new("complete-policy"),
             deadline: Deadline(1_000),
         })
+        .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert!(capture.0.lock().unwrap().is_empty());
@@ -1014,6 +1055,7 @@ async fn expired_client_operation_leaves_queryable_record_and_starts_recovery() 
             idempotency_key: IdempotencyKey::new("expires"),
             deadline: Deadline(5),
         })
+        .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(10)).await;
     clock.0.store(6, Ordering::Release);
@@ -1088,6 +1130,7 @@ async fn cleaned_handshake_failure_terminalizes_original_before_policy_retry() {
             idempotency_key: IdempotencyKey::new("handshake-terminal"),
             deadline: Deadline(1_000),
         })
+        .await
         .unwrap();
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(1);

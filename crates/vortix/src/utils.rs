@@ -24,6 +24,79 @@ pub(crate) fn effective_user_group_ids() -> (u32, u32) {
     unsafe { (libc::geteuid(), libc::getegid()) }
 }
 
+/// Stable OS boot identity shared by persisted authority and verification.
+#[cfg(target_os = "linux")] // xtask:allow-platform-cfg: boot identity uses the OS kernel primitive until U12 moves it behind a platform port
+pub(crate) fn boot_identity() -> Option<String> {
+    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Stable OS boot identity shared by persisted authority and verification.
+#[cfg(target_os = "macos")]
+// xtask:allow-platform-cfg: boot identity uses the OS kernel primitive until U12 moves it behind a platform port
+#[allow(unsafe_code)]
+pub(crate) fn boot_identity() -> Option<String> {
+    let mut boot_time = libc::timeval {
+        tv_sec: 0,
+        tv_usec: 0,
+    };
+    let mut size = std::mem::size_of::<libc::timeval>();
+    // SAFETY: `kern.boottime` writes one timeval into the correctly sized,
+    // aligned output buffer; no input buffer is supplied.
+    let result = unsafe {
+        libc::sysctlbyname(
+            c"kern.boottime".as_ptr(),
+            (&raw mut boot_time).cast(),
+            &raw mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if result == 0 {
+        Some(format!(
+            "macos-boot:{}:{}",
+            boot_time.tv_sec, boot_time.tv_usec
+        ))
+    } else {
+        None
+    }
+}
+
+/// Stable OS boot identity shared by persisted authority and verification.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))] // xtask:allow-platform-cfg: unsupported targets need an explicit non-authoritative boot identity
+pub(crate) fn boot_identity() -> Option<String> {
+    None
+}
+
+/// Milliseconds on the OS monotonic clock, stable across process restarts
+/// within one boot. Persisted deadlines must never use process-local time.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+pub(crate) fn boot_elapsed_millis() -> Option<u64> {
+    let mut time = std::mem::MaybeUninit::<libc::timespec>::uninit();
+    // SAFETY: `clock_gettime` initializes the supplied timespec when it
+    // returns zero. CLOCK_MONOTONIC is process-independent and non-adjustable.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, time.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: the successful syscall above initialized the complete value.
+    let time = unsafe { time.assume_init() };
+    let seconds = u64::try_from(time.tv_sec).ok()?;
+    let nanos = u64::try_from(time.tv_nsec).ok()?;
+    Some(
+        seconds
+            .saturating_mul(1_000)
+            .saturating_add(nanos / 1_000_000),
+    )
+}
+
+#[cfg(not(unix))]
+pub(crate) fn boot_elapsed_millis() -> Option<u64> {
+    None
+}
+
 /// Check if the current process is running as root (UID 0)
 ///
 /// On non-Unix platforms, this always returns `false` because there is no

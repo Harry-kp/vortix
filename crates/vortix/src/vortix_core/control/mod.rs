@@ -7,6 +7,7 @@
 pub mod command;
 pub mod hooks;
 pub mod model;
+pub mod persistence;
 pub mod reconcile;
 pub mod service;
 pub mod snapshot;
@@ -24,11 +25,16 @@ pub use model::{
     OperationCompletion, OperationFailure, OperationId, OperationRecord, OperationResult,
     OperationStatus, PolicyDigest, ProtectionEvidence, ProtectionStatus, RequestedTunnelState,
 };
+pub use persistence::{
+    BootConnection, BootEligibility, ControlStateStore, ControlStateStoreError,
+    DurableControlState, PersistedTombstone, RecoveredControlState, RequestedResources,
+    RetentionMetadata,
+};
 pub use service::{
     AdmissionError, AdmittedOperation, ChallengeAnswerReceiver, ChallengeDeliveryError,
     ChallengeError, Clock, CompleterHandle, CompletionError, CompletionResult, ControlHandle,
-    ControlService, ControlServiceConfig, ControlSubscription, EventReceiveError,
-    ExecutionSelection, IssuedChallenge, ObservationError, ObserverHandle, ProfileTopology,
-    ReadinessError, RealClock,
+    ControlPersistenceConfig, ControlService, ControlServiceConfig, ControlSubscription,
+    EventReceiveError, ExecutionSelection, IssuedChallenge, ObservationError, ObserverHandle,
+    ProfileTopology, ReadinessError, RealClock,
 };
 pub use snapshot::{ControlSnapshot, ServiceReadiness};
