@@ -1266,6 +1266,15 @@ pub enum ReplayRecord {
     HighWater(ReplayHighWater),
 }
 
+impl ReplayRecord {
+    pub(super) const fn authority_epoch(&self) -> AuthorityEpoch {
+        match self {
+            Self::Unused(record) => record.authority_epoch,
+            Self::HighWater(record) => record.authority_epoch,
+        }
+    }
+}
+
 /// Non-serializable replay capability authenticated by the root ledger.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplayBaseline(ReplayRecord);
