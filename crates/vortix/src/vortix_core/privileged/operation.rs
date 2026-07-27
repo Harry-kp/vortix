@@ -1270,6 +1270,14 @@ pub enum ReplayRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplayBaseline(ReplayRecord);
 
+impl ReplayBaseline {
+    /// Consume the authenticated baseline for root-ledger persistence. This
+    /// stays crate-private so wire callers cannot manufacture replay state.
+    pub(crate) fn into_record(self) -> ReplayRecord {
+        self.0
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReplayHighWaterWire {

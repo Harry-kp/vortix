@@ -109,6 +109,10 @@ profile parsing, hooks, or arbitrary cleanup.
 - Cleanup reaches the platform executor only for exact resources already owned
   by this helper incarnation. Ownership survives ambiguous/mismatched results
   and is forgotten only after authenticated exact-absence observations.
+- Replay high-water state uses the fixed package layout and a bounded,
+  strict-decoded, root-owned `0600` file in a root-owned `0700` directory.
+  Updates use same-directory create-exclusive temporary files, file and
+  directory fsync, atomic rename, no-follow opens, and reject hard links.
 - PID identity always includes a process start token and containment identity;
   a numeric PID alone is never ownership evidence.
 
