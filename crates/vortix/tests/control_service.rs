@@ -1,5 +1,7 @@
+use std::future::{poll_fn, Future as _};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 
 use vortix::vortix_core::control::{
@@ -73,7 +75,10 @@ async fn idempotency_is_scoped_to_service_client_epoch_and_semantic_command() {
     let service = ControlService::start_with_clock(config(), clock.clone());
     let client = service.client();
     let first_request = request("same", profile('a'), 100);
-    let first = client.submit(first_request.clone()).expect("admitted");
+    let first = client
+        .submit(first_request.clone())
+        .await
+        .expect("admitted");
     wait_for_generation(&client, 1).await;
 
     let retry = client
@@ -81,18 +86,20 @@ async fn idempotency_is_scoped_to_service_client_epoch_and_semantic_command() {
             deadline: Deadline(200),
             ..first_request
         })
+        .await
         .expect("same semantic retry with a different transport deadline");
     assert_eq!(first.operation_id, retry.operation_id);
     assert_eq!(client.snapshot().desired.generation, 1);
 
     assert_eq!(
-        client.submit(request("same", profile('b'), 100)),
+        client.submit(request("same", profile('b'), 100)).await,
         Err(AdmissionError::IdempotencyConflict)
     );
 
-    let other_client = service.new_client();
+    let other_client = service.new_client().expect("client identifier available");
     let independent = other_client
         .submit(request("same", profile('b'), 100))
+        .await
         .expect("key is scoped to service-created client identity");
     assert_ne!(first.operation_id, independent.operation_id);
 }
@@ -108,14 +115,18 @@ async fn saturation_and_expiry_happen_before_execution() {
         clock.clone(),
     );
     let client = service.client();
-    let admitted = client
-        .submit(request("reserved", profile('a'), 10))
-        .expect("reserved");
+    let mut reserved = Box::pin(client.submit(request("reserved", profile('a'), 10)));
+    poll_fn(|context| {
+        assert!(reserved.as_mut().poll(context).is_pending());
+        Poll::Ready(())
+    })
+    .await;
     assert_eq!(
-        client.submit(request("busy", profile('b'), 10)),
+        client.submit(request("busy", profile('b'), 10)).await,
         Err(AdmissionError::Busy)
     );
     clock.set(10);
+    let admitted = reserved.await.expect("reserved");
     tokio::task::yield_now().await;
     let snapshot = client.snapshot();
     assert_eq!(snapshot.desired.generation, 0);
@@ -133,11 +144,15 @@ async fn public_client_and_trusted_roles_have_distinct_capabilities() {
     let completer = service.completer();
     let admitted = client
         .submit(request("roles", profile('a'), u64::MAX))
+        .await
         .expect("admitted");
     wait_for_generation(&client, 1).await;
 
     observer
-        .observe(Observation::Protection(current_evidence(&client, 0)))
+        .observe(Observation::Protection(current_evidence(
+            &client,
+            observer.now_millis(),
+        )))
         .await
         .expect("observer has observation capability");
     assert_eq!(
@@ -161,6 +176,7 @@ async fn observations_use_owner_receipt_time_and_reject_future_or_older_evidence
     let observer = service.observer();
     client
         .submit(request("known", profile('a'), 100))
+        .await
         .expect("admitted");
     wait_for_generation(&client, 1).await;
 
@@ -213,6 +229,7 @@ async fn connection_health_is_generation_fenced_and_published_to_snapshot_subscr
     let observer = service.observer();
     client
         .submit(request("health", profile('a'), 100))
+        .await
         .expect("admitted");
     wait_for_generation(&client, 1).await;
 
@@ -276,6 +293,7 @@ async fn drift_invalidates_gates_atomically_and_same_message_can_reverify() {
     let observer = service.observer();
     client
         .submit(request("drift", profile('a'), 100))
+        .await
         .expect("admitted");
     wait_for_generation(&client, 1).await;
     observer
@@ -333,10 +351,12 @@ async fn success_requires_every_gate_while_failure_can_finish_superseded_operati
     let completer = service.completer();
     let first = client
         .submit(request("first", profile('a'), 100))
+        .await
         .expect("first");
     wait_for_generation(&client, 1).await;
     let second = client
         .submit(request("second", profile('b'), 100))
+        .await
         .expect("second");
     wait_for_generation(&client, 2).await;
 
@@ -376,6 +396,7 @@ async fn success_requires_every_gate_while_failure_can_finish_superseded_operati
 
     let third = client
         .submit(request("third", profile('c'), 100))
+        .await
         .expect("newer desired generation");
     wait_for_generation(&client, 3).await;
     assert_eq!(
@@ -423,10 +444,13 @@ async fn admitted_deadlines_and_terminal_compaction_are_owner_enforced() {
     let completer = service.completer();
     let first = client
         .submit(request("first", profile('a'), 10))
+        .await
         .expect("first");
     wait_for_generation(&client, 1).await;
     assert_eq!(
-        client.submit(request("active-cannot-evict", profile('b'), 10)),
+        client
+            .submit(request("active-cannot-evict", profile('b'), 10))
+            .await,
         Err(AdmissionError::RetentionFull)
     );
     completer
@@ -439,6 +463,7 @@ async fn admitted_deadlines_and_terminal_compaction_are_owner_enforced() {
         .expect("terminal");
     let second = client
         .submit(request("second", profile('b'), 10))
+        .await
         .expect("terminal record compacted");
     wait_for_generation(&client, 2).await;
     assert!(!client
@@ -471,6 +496,7 @@ async fn challenges_deliver_secret_once_and_expiry_wins_over_cancel() {
     let completer = service.completer();
     let operation = client
         .submit(request("challenge", profile('a'), 100))
+        .await
         .expect("operation");
     wait_for_generation(&client, 1).await;
     let issued = completer
@@ -542,10 +568,11 @@ async fn challenges_deliver_secret_once_and_expiry_wins_over_cancel() {
 async fn challenge_authorization_comes_from_issuing_operation_client() {
     let service = ControlService::start(config());
     let owner = service.client();
-    let other = service.new_client();
+    let other = service.new_client().expect("client identifier available");
     let completer = service.completer();
     let operation = owner
         .submit(request("owned", profile('a'), u64::MAX))
+        .await
         .expect("operation");
     wait_for_generation(&owner, 1).await;
     let issued = completer
@@ -573,6 +600,7 @@ async fn snapshot_is_published_before_generation_stamped_events_and_boundary_ded
     let mut subscriber = client.subscribe();
     client
         .submit(request("event", profile('a'), u64::MAX))
+        .await
         .expect("admitted");
     let event = subscriber.recv_event().await.expect("event");
     assert!(subscriber.snapshot().generation >= event.snapshot_generation);
@@ -587,6 +615,7 @@ async fn snapshot_is_published_before_generation_stamped_events_and_boundary_ded
     );
     client
         .submit(request("event-2", profile('b'), u64::MAX))
+        .await
         .expect("admitted");
     let next = boundary.recv_event().await.expect("new event");
     assert!(next.snapshot_generation > event.snapshot_generation);
@@ -603,6 +632,7 @@ async fn lag_requires_resync_to_at_least_event_generation() {
     for (index, seed) in ['a', 'b', 'c', 'd'].into_iter().enumerate() {
         client
             .submit(request(&format!("lag-{index}"), profile(seed), u64::MAX))
+            .await
             .expect("admitted");
     }
     wait_for_generation(&client, 4).await;
@@ -625,7 +655,9 @@ async fn readiness_is_live_epoch_checked_owner_state() {
     let client = service.client();
     let completer = service.completer();
     assert_eq!(
-        client.submit(request("closed", profile('a'), u64::MAX)),
+        client
+            .submit(request("closed", profile('a'), u64::MAX))
+            .await,
         Err(AdmissionError::NotReady)
     );
     assert_eq!(
@@ -639,6 +671,7 @@ async fn readiness_is_live_epoch_checked_owner_state() {
     assert!(client.snapshot().readiness.reconciliation_complete);
     client
         .submit(request("open", profile('a'), u64::MAX))
+        .await
         .expect("same handle admitted after readiness transition");
 }
 

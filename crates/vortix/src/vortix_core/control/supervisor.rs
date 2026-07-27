@@ -7,6 +7,7 @@ use std::time::Duration;
 use crate::vortix_core::control::model::{
     AuthorityEpoch, OperationId, PolicyDigest, MAX_PROTECTION_AGE_MILLIS,
 };
+use crate::vortix_core::control::persistence::PersistedTombstone;
 use crate::vortix_core::control::worker::{
     CancellationToken, ControlRevision, PolicyExecutor, PolicyOutcome, PolicyResult, PolicyWorker,
     ProfileAdmission, ProfileWorkerPool, TopologyPolicy, TopologyState, TunnelExecutor,
@@ -526,6 +527,45 @@ impl Supervisor {
             .expect("supervisor mutex poisoned")
             .tombstones
             .clone()
+    }
+
+    /// Restore only teardown fences. Persisted observations, adoption handles,
+    /// and connection truth are intentionally never reconstructed.
+    pub fn restore_tombstones(
+        &self,
+        tombstones: &BTreeMap<ProfileId, PersistedTombstone>,
+    ) -> Result<(), WorkFailure> {
+        let mut state = self.state.lock().expect("supervisor mutex poisoned");
+        if tombstones
+            .values()
+            .any(|tombstone| tombstone.authority_epoch != state.authority_epoch)
+        {
+            return Err(WorkFailure::Stale);
+        }
+        state.tombstones = tombstones
+            .iter()
+            .map(|(profile_id, tombstone)| {
+                (
+                    profile_id.clone(),
+                    ProfileSupervision {
+                        generation: tombstone.generation,
+                        authority_epoch: tombstone.authority_epoch,
+                        policy_digest: tombstone.policy_digest.clone(),
+                        operation_id: tombstone.operation_id.clone(),
+                        mutation: TunnelMutation::Disconnect,
+                        adoption: None,
+                        handshake: None,
+                        probe_receipts: Vec::new(),
+                        truth: if tombstone.teardown_failed {
+                            SupervisedTruth::OutcomeUnknown
+                        } else {
+                            SupervisedTruth::DisconnectedTombstone
+                        },
+                    },
+                )
+            })
+            .collect();
+        Ok(())
     }
     #[must_use]
     pub fn latest_policy(&self) -> Option<(ControlRevision, OperationId)> {

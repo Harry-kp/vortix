@@ -22,6 +22,10 @@ use crate::vortix_core::control::model::{
     OperationId, OperationRecord, OperationResult, OperationStatus, PolicyDigest,
     ProtectionEvidence, ProtectionStatus, RequestedTunnelState, MAX_PROTECTION_AGE_MILLIS,
 };
+use crate::vortix_core::control::persistence::{
+    ControlStateStore, DurableControlState, PersistedTombstone, RequestedResources,
+    RetentionMetadata,
+};
 use crate::vortix_core::control::reconcile::{
     plan_reconciliation, DisconnectTombstone, InFlightMutation, ObservationOwnership,
     ReconcileAction, ReconcileInput, ScanEvidence, TunnelObservation,
@@ -45,6 +49,11 @@ pub struct RealClock;
 impl Clock for RealClock {
     fn now_millis(&self) -> u64 {
         static START: OnceLock<Instant> = OnceLock::new();
+        if let Some(millis) = crate::utils::boot_elapsed_millis() {
+            return millis;
+        }
+        // Unsupported targets retain the process-local fallback. Durable
+        // persistence is unavailable there because boot_identity() is absent.
         START
             .get_or_init(Instant::now)
             .elapsed()
@@ -65,10 +74,32 @@ pub struct ControlServiceConfig {
     pub known_profiles: BTreeSet<ProfileId>,
     /// Canonical resources parsed from real profiles before authority starts.
     pub profile_topologies: BTreeMap<ProfileId, ProfileTopology>,
+    /// Explicit boot intent and prevalidated credential eligibility.
+    pub boot_connections:
+        BTreeMap<ProfileId, crate::vortix_core::control::persistence::BootConnection>,
     pub freshness_poll_interval: Duration,
     pub authority_epoch: AuthorityEpoch,
     pub reconciliation_complete: bool,
     pub authority_verified: bool,
+    /// Optional user-owned durable intent. Presence forces scanner-first
+    /// startup before any mutation or supervised effect is admitted.
+    pub persistence: Option<ControlPersistenceConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ControlPersistenceConfig {
+    boot_id: String,
+    store: Arc<dyn ControlStateStore>,
+}
+
+impl ControlPersistenceConfig {
+    #[must_use]
+    pub fn new(boot_id: impl Into<String>, store: Arc<dyn ControlStateStore>) -> Self {
+        Self {
+            boot_id: boot_id.into(),
+            store,
+        }
+    }
 }
 
 /// Immutable profile resources used for admission and topology planning.
@@ -113,10 +144,12 @@ impl Default for ControlServiceConfig {
             max_observed_profiles: 512,
             known_profiles: BTreeSet::new(),
             profile_topologies: BTreeMap::new(),
+            boot_connections: BTreeMap::new(),
             freshness_poll_interval: Duration::from_millis(250),
             authority_epoch: AuthorityEpoch(0),
             reconciliation_complete: true,
             authority_verified: true,
+            persistence: None,
         }
     }
 }
@@ -139,6 +172,10 @@ pub enum AdmissionError {
     IdempotencyConflict,
     #[error("bounded operation or idempotency retention is full")]
     RetentionFull,
+    #[error("control identifier space is exhausted")]
+    IdentifierExhausted,
+    #[error("admitted operation could not be persisted")]
+    Persistence,
     #[error("invalid bounded control input: {reason}")]
     InvalidInput { reason: String },
     #[error("control service stopped")]
@@ -185,6 +222,8 @@ pub enum CompletionError {
     DeadlineExpired,
     #[error("success evidence is stale or does not match current desired state")]
     StaleSuccess,
+    #[error("terminal operation result could not be persisted")]
+    Persistence,
     #[error("control service stopped")]
     Stopped,
 }
@@ -195,6 +234,8 @@ pub enum ReadinessError {
     EpochMismatch,
     #[error("control service stopped")]
     Stopped,
+    #[error("startup reconciliation could not be persisted")]
+    Persistence,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -263,13 +304,45 @@ impl AdmissionState {
         Self {
             next_operation: 0,
             next_challenge: 0,
-            next_client: 1,
+            next_client: 0,
             retained_operations: 0,
             idempotency: BTreeMap::new(),
             terminal_operations: BTreeSet::new(),
             known_profiles,
             readiness,
         }
+    }
+
+    fn recover(
+        readiness: ServiceReadiness,
+        known_profiles: BTreeSet<ProfileId>,
+        operations: &BTreeMap<OperationId, OperationRecord>,
+    ) -> Self {
+        let mut state = Self::new(readiness, known_profiles);
+        for (operation_id, record) in operations {
+            state.next_operation = state
+                .next_operation
+                .max(operation_id.sequence().unwrap_or_default());
+            state.next_client = state
+                .next_client
+                .max(record.client_id.sequence().unwrap_or_default());
+            state.idempotency.insert(
+                IdempotencyScope {
+                    client_id: record.client_id.clone(),
+                    authority_epoch: record.authority_epoch,
+                    key: record.idempotency_key.clone(),
+                },
+                IdempotencyBinding {
+                    operation_id: operation_id.clone(),
+                    command_digest: record.command_digest.clone(),
+                },
+            );
+            if record.status.is_terminal() {
+                state.terminal_operations.insert(operation_id.clone());
+            }
+        }
+        state.retained_operations = operations.len();
+        state
     }
 
     fn compact_one(&mut self) -> Option<OperationId> {
@@ -279,6 +352,17 @@ impl AdmissionState {
         self.retained_operations = self.retained_operations.saturating_sub(1);
         Some(operation_id)
     }
+}
+
+fn next_operation_id(
+    admission: &mut AdmissionState,
+    authority_epoch: AuthorityEpoch,
+) -> Option<OperationId> {
+    admission.next_operation = admission.next_operation.checked_add(1)?;
+    Some(OperationId::from_parts(
+        authority_epoch,
+        admission.next_operation,
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -297,6 +381,7 @@ enum Envelope {
         admitted_at: u64,
         evicted: Vec<OperationId>,
         work_admissions: Vec<(ProfileId, ProfileAdmission)>,
+        reply: oneshot::Sender<Result<AdmittedOperation, AdmissionError>>,
     },
     Observe {
         observation: Observation,
@@ -422,22 +507,37 @@ impl ControlService {
         assert!(config.max_idempotency_keys > 0);
         assert!(config.max_challenges > 0);
         assert!(config.max_observed_profiles > 0);
+        if let Some(persistence) = &config.persistence {
+            assert!(!persistence.boot_id.is_empty() && persistence.boot_id.len() <= 128);
+        }
 
         let readiness = ServiceReadiness {
-            reconciliation_complete: config.reconciliation_complete,
+            reconciliation_complete: config.persistence.is_none() && config.reconciliation_complete,
             authority_verified: config.authority_verified,
         };
-        let admission = Arc::new(Mutex::new(AdmissionState::new(
-            readiness,
-            config.known_profiles.clone(),
-        )));
         let (tx, rx) = mpsc::channel(config.command_capacity);
         let mut initial = ControlSnapshot {
             readiness,
             ..ControlSnapshot::default()
         };
         initial.desired.authority_epoch = config.authority_epoch;
+        let recovery = recover_control_state(&config, &mut initial);
+        let mut durable = recovery.durable;
+        let startup_persistence_fault = recovery.startup_persistence_fault;
+        let recovered_control_state = recovery.recovered_control_state;
+        durable.requested_resources = requested_resources(&config);
         recompute_policy_digest(&mut initial);
+        durable.desired.clone_from(&initial.desired);
+        if let Some(supervisor) = supervisor.as_deref() {
+            if supervisor.restore_tombstones(&durable.tombstones).is_err() {
+                durable.tombstones.clear();
+            }
+        }
+        let admission = Arc::new(Mutex::new(AdmissionState::recover(
+            initial.readiness,
+            config.known_profiles.clone(),
+            &initial.operations,
+        )));
         derive_effective(
             &mut initial,
             clock.now_millis(),
@@ -456,7 +556,14 @@ impl ControlService {
             selection,
             supervisor: supervisor.clone(),
         });
-        let client_id = ClientId::from_parts(config.authority_epoch, 1);
+        let client_id = {
+            let mut state = admission.lock().expect("admission mutex poisoned");
+            state.next_client = state
+                .next_client
+                .checked_add(1)
+                .expect("recovered client identifier space must have capacity");
+            ClientId::from_parts(initial.desired.authority_epoch, state.next_client)
+        };
         tokio::spawn(run_service(
             rx,
             snapshot_tx,
@@ -465,6 +572,9 @@ impl ControlService {
             clock,
             config,
             initial,
+            durable,
+            startup_persistence_fault,
+            recovered_control_state,
             selection,
             supervisor.clone(),
         ));
@@ -485,21 +595,23 @@ impl ControlService {
         self.client.clone()
     }
 
-    #[must_use]
-    pub fn new_client(&self) -> ControlHandle {
+    pub fn new_client(&self) -> Result<ControlHandle, AdmissionError> {
         let client_id = {
             let mut admission = self
                 .shared
                 .admission
                 .lock()
                 .expect("admission mutex poisoned");
-            admission.next_client = admission.next_client.saturating_add(1);
+            admission.next_client = admission
+                .next_client
+                .checked_add(1)
+                .ok_or(AdmissionError::IdentifierExhausted)?;
             ClientId::from_parts(self.shared.config.authority_epoch, admission.next_client)
         };
-        ControlHandle {
+        Ok(ControlHandle {
             shared: Arc::clone(&self.shared),
             client_id,
-        }
+        })
     }
 
     #[must_use]
@@ -574,7 +686,10 @@ impl ControlHandle {
     }
 
     #[allow(clippy::too_many_lines)] // Admission intentionally remains one lock/permit transaction.
-    pub fn submit(&self, request: CommandRequest) -> Result<AdmittedOperation, AdmissionError> {
+    pub async fn submit(
+        &self,
+        request: CommandRequest,
+    ) -> Result<AdmittedOperation, AdmissionError> {
         if !request.idempotency_key.is_valid() {
             return Err(AdmissionError::InvalidInput {
                 reason: "idempotency key must contain 1..=128 bytes".to_owned(),
@@ -620,80 +735,85 @@ impl ControlHandle {
         if request.deadline.0 <= now {
             return Err(AdmissionError::DeadlineExpired);
         }
-        let mut admission = self
-            .shared
-            .admission
-            .lock()
-            .expect("admission mutex poisoned");
-        if !admission.readiness.reconciliation_complete || !admission.readiness.authority_verified {
-            return Err(AdmissionError::NotReady);
-        }
-        if let Some(binding) = admission.idempotency.get(&scope) {
-            return if binding.command_digest == command_digest {
-                Ok(AdmittedOperation {
-                    operation_id: binding.operation_id.clone(),
-                })
-            } else {
-                Err(AdmissionError::IdempotencyConflict)
-            };
-        }
-        let admission_profiles = command_profiles(&request.command, &admission.known_profiles);
-        let mut work_admissions = Vec::new();
-        if self.shared.selection == ExecutionSelection::CanonicalAuthority {
-            let supervisor = self
+        let (operation_id, evicted, work_admissions) = {
+            let mut admission = self
                 .shared
-                .supervisor
-                .as_ref()
-                .ok_or(AdmissionError::Stopped)?;
-            for profile_id in admission_profiles {
-                let routes = self
-                    .shared
-                    .config
-                    .profile_topologies
-                    .get(&profile_id)
-                    .map(|topology| topology.routes.iter().cloned().collect::<Vec<_>>())
-                    .unwrap_or_default();
-                let reserved = supervisor
-                    .reserve_tunnel(&profile_id, routes)
-                    .map_err(|error| match error {
-                        WorkFailure::RouteConflict => AdmissionError::RouteConflict,
-                        WorkFailure::Stopped => AdmissionError::Stopped,
-                        _ => AdmissionError::Busy,
-                    })?;
-                work_admissions.push((profile_id, reserved));
-            }
-        }
-        if let Some(profile_id) = command_profile(&request.command) {
-            if !admission.known_profiles.contains(profile_id)
-                && admission.known_profiles.len() >= self.shared.config.max_observed_profiles
+                .admission
+                .lock()
+                .expect("admission mutex poisoned");
+            if !admission.readiness.reconciliation_complete
+                || !admission.readiness.authority_verified
             {
-                return Err(AdmissionError::InvalidInput {
-                    reason: "known profile capacity is full".to_owned(),
-                });
+                return Err(AdmissionError::NotReady);
             }
-            admission.known_profiles.insert(profile_id.clone());
-        }
-        let mut evicted = Vec::new();
-        while admission.retained_operations >= self.shared.config.max_operations
-            || admission.idempotency.len() >= self.shared.config.max_idempotency_keys
-        {
-            let Some(operation_id) = admission.compact_one() else {
-                return Err(AdmissionError::RetentionFull);
-            };
-            evicted.push(operation_id);
-        }
-        admission.next_operation = admission.next_operation.saturating_add(1);
-        admission.retained_operations = admission.retained_operations.saturating_add(1);
-        let operation_id =
-            OperationId::from_parts(self.shared.config.authority_epoch, admission.next_operation);
-        admission.idempotency.insert(
-            scope,
-            IdempotencyBinding {
-                operation_id: operation_id.clone(),
-                command_digest: command_digest.clone(),
-            },
-        );
-        drop(admission);
+            if let Some(binding) = admission.idempotency.get(&scope) {
+                return if binding.command_digest == command_digest {
+                    Ok(AdmittedOperation {
+                        operation_id: binding.operation_id.clone(),
+                    })
+                } else {
+                    Err(AdmissionError::IdempotencyConflict)
+                };
+            }
+            let admission_profiles = command_profiles(&request.command, &admission.known_profiles);
+            let mut work_admissions = Vec::new();
+            if self.shared.selection == ExecutionSelection::CanonicalAuthority {
+                let supervisor = self
+                    .shared
+                    .supervisor
+                    .as_ref()
+                    .ok_or(AdmissionError::Stopped)?;
+                for profile_id in admission_profiles {
+                    let routes = self
+                        .shared
+                        .config
+                        .profile_topologies
+                        .get(&profile_id)
+                        .map(|topology| topology.routes.iter().cloned().collect::<Vec<_>>())
+                        .unwrap_or_default();
+                    let reserved = supervisor.reserve_tunnel(&profile_id, routes).map_err(
+                        |error| match error {
+                            WorkFailure::RouteConflict => AdmissionError::RouteConflict,
+                            WorkFailure::Stopped => AdmissionError::Stopped,
+                            _ => AdmissionError::Busy,
+                        },
+                    )?;
+                    work_admissions.push((profile_id, reserved));
+                }
+            }
+            if let Some(profile_id) = command_profile(&request.command) {
+                if !admission.known_profiles.contains(profile_id)
+                    && admission.known_profiles.len() >= self.shared.config.max_observed_profiles
+                {
+                    return Err(AdmissionError::InvalidInput {
+                        reason: "known profile capacity is full".to_owned(),
+                    });
+                }
+                admission.known_profiles.insert(profile_id.clone());
+            }
+            let mut evicted = Vec::new();
+            while admission.retained_operations >= self.shared.config.max_operations
+                || admission.idempotency.len() >= self.shared.config.max_idempotency_keys
+            {
+                let Some(operation_id) = admission.compact_one() else {
+                    return Err(AdmissionError::RetentionFull);
+                };
+                evicted.push(operation_id);
+            }
+            let operation_id =
+                next_operation_id(&mut admission, self.shared.config.authority_epoch)
+                    .ok_or(AdmissionError::IdentifierExhausted)?;
+            admission.retained_operations = admission.retained_operations.saturating_add(1);
+            admission.idempotency.insert(
+                scope,
+                IdempotencyBinding {
+                    operation_id: operation_id.clone(),
+                    command_digest: command_digest.clone(),
+                },
+            );
+            (operation_id, evicted, work_admissions)
+        };
+        let (reply, receiver) = oneshot::channel();
         permit.send(Envelope::Mutate {
             request,
             client_id: self.client_id.clone(),
@@ -702,8 +822,9 @@ impl ControlHandle {
             admitted_at: now,
             evicted,
             work_admissions,
+            reply,
         });
-        Ok(AdmittedOperation { operation_id })
+        receiver.await.map_err(|_| AdmissionError::Stopped)?
     }
 
     pub async fn respond_challenge(
@@ -777,6 +898,12 @@ impl ControlHandle {
 }
 
 impl ObserverHandle {
+    /// Current authority-clock timestamp for observation receipts.
+    #[must_use]
+    pub fn now_millis(&self) -> u64 {
+        self.0.clock.now_millis()
+    }
+
     pub async fn observe(&self, observation: Observation) -> Result<(), ObservationError> {
         let invalid = matches!(
             &observation,
@@ -869,7 +996,10 @@ impl CompleterHandle {
         }
         let challenge_id = {
             let mut admission = self.0.admission.lock().expect("admission mutex poisoned");
-            admission.next_challenge = admission.next_challenge.saturating_add(1);
+            admission.next_challenge = admission
+                .next_challenge
+                .checked_add(1)
+                .ok_or(ChallengeError::RetentionFull)?;
             ChallengeId::from_counter(admission.next_challenge)
         };
         let authorized_client = {
@@ -952,6 +1082,103 @@ struct LifecycleOperation {
     failure: Option<HookEvent>,
 }
 
+struct DeferredReadiness {
+    reply: oneshot::Sender<Result<(), ReadinessError>>,
+    readiness: ServiceReadiness,
+}
+
+enum DeferredDurability {
+    Admission {
+        operation_id: OperationId,
+        reply: oneshot::Sender<Result<AdmittedOperation, AdmissionError>>,
+    },
+    Completion {
+        result: Result<CompletionResult, CompletionError>,
+        reply: oneshot::Sender<Result<CompletionResult, CompletionError>>,
+    },
+}
+
+fn send_durability_reply(deferred: DeferredDurability, persisted: bool) {
+    match deferred {
+        DeferredDurability::Admission {
+            operation_id,
+            reply,
+        } => {
+            let result = if persisted {
+                Ok(AdmittedOperation { operation_id })
+            } else {
+                Err(AdmissionError::Persistence)
+            };
+            let _ = reply.send(result);
+        }
+        DeferredDurability::Completion { result, reply } => {
+            let result = match result {
+                Ok(_) if !persisted => Err(CompletionError::Persistence),
+                result => result,
+            };
+            let _ = reply.send(result);
+        }
+    }
+}
+
+struct ControlRuntime<'a> {
+    config: &'a ControlServiceConfig,
+    admission: &'a Arc<Mutex<AdmissionState>>,
+    supervisor: Option<&'a Supervisor>,
+    selection: ExecutionSelection,
+    startup_persistence_fault: bool,
+}
+
+impl ControlRuntime<'_> {
+    async fn advance(
+        &self,
+        before: &ControlSnapshot,
+        snapshot: &mut ControlSnapshot,
+        durable: &mut DurableControlState,
+        owner: &mut OwnerState,
+        now: u64,
+        events: &mut Vec<ControlEvent>,
+    ) -> bool {
+        let persisted_before_effects = persist_control_state_if_changed(
+            self.config,
+            before,
+            snapshot,
+            durable,
+            self.supervisor,
+            self.admission,
+            self.startup_persistence_fault,
+        )
+        .await;
+        if persisted_before_effects {
+            let before_supervision = snapshot.clone();
+            drive_supervision(
+                self.selection,
+                self.supervisor,
+                snapshot,
+                owner,
+                self.admission,
+                now,
+                self.config,
+                events,
+            );
+            derive_effective(snapshot, now, self.selection, self.supervisor);
+            let _ = persist_control_state_if_changed(
+                self.config,
+                &before_supervision,
+                snapshot,
+                durable,
+                self.supervisor,
+                self.admission,
+                self.startup_persistence_fault,
+            )
+            .await;
+        } else {
+            derive_effective(snapshot, now, self.selection, self.supervisor);
+        }
+        persisted_before_effects
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum ObservationScope {
     Protection,
@@ -959,6 +1186,128 @@ enum ObservationScope {
     Route,
     Dns,
     Firewall,
+}
+
+struct RecoveryOutcome {
+    durable: DurableControlState,
+    startup_persistence_fault: bool,
+    recovered_control_state: bool,
+}
+
+fn recover_control_state(
+    config: &ControlServiceConfig,
+    snapshot: &mut ControlSnapshot,
+) -> RecoveryOutcome {
+    let mut durable = durable_state(config, snapshot);
+    let Some(persistence) = &config.persistence else {
+        return RecoveryOutcome {
+            durable,
+            startup_persistence_fault: false,
+            recovered_control_state: false,
+        };
+    };
+    match persistence.store.load(&persistence.boot_id) {
+        Ok(Some(recovered))
+            if recovered.state.desired.authority_epoch == config.authority_epoch
+                && recovered_identifiers_have_capacity(&recovered.state) =>
+        {
+            let same_boot = recovered.same_boot;
+            durable = recovered.state;
+            durable
+                .boot_connections
+                .clone_from(&config.boot_connections);
+            if !same_boot {
+                durable.prepare_for_reboot();
+            }
+            snapshot.desired.clone_from(&durable.desired);
+            snapshot.operations.clone_from(&durable.operations);
+            RecoveryOutcome {
+                durable,
+                startup_persistence_fault: false,
+                recovered_control_state: true,
+            }
+        }
+        Ok(None) => RecoveryOutcome {
+            durable,
+            startup_persistence_fault: false,
+            recovered_control_state: false,
+        },
+        Ok(Some(_)) | Err(_) => {
+            snapshot.readiness.authority_verified = false;
+            RecoveryOutcome {
+                durable,
+                startup_persistence_fault: true,
+                recovered_control_state: false,
+            }
+        }
+    }
+}
+
+fn recovered_identifiers_have_capacity(state: &DurableControlState) -> bool {
+    state.operations.iter().all(|(operation_id, operation)| {
+        operation_id
+            .sequence()
+            .is_some_and(|sequence| sequence < u64::MAX)
+            && operation
+                .client_id
+                .sequence()
+                .is_some_and(|sequence| sequence < u64::MAX)
+    })
+}
+
+fn durable_state(config: &ControlServiceConfig, snapshot: &ControlSnapshot) -> DurableControlState {
+    DurableControlState {
+        desired: snapshot.desired.clone(),
+        operations: snapshot.operations.clone(),
+        boot_connections: config.boot_connections.clone(),
+        requested_resources: requested_resources(config),
+        tombstones: BTreeMap::new(),
+        retention: RetentionMetadata::default(),
+        reconciliation_required: !snapshot.readiness.reconciliation_complete,
+    }
+}
+
+fn requested_resources(config: &ControlServiceConfig) -> BTreeMap<ProfileId, RequestedResources> {
+    config
+        .profile_topologies
+        .iter()
+        .map(|(profile_id, topology)| {
+            (
+                profile_id.clone(),
+                RequestedResources {
+                    routes: topology.routes.clone(),
+                    dns_digest: topology.dns_digest.clone(),
+                    firewall_digest: topology.firewall_digest.clone(),
+                },
+            )
+        })
+        .collect()
+}
+
+fn persisted_tombstones(
+    supervisor: Option<&Supervisor>,
+) -> BTreeMap<ProfileId, PersistedTombstone> {
+    supervisor
+        .map(Supervisor::tombstones)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(profile_id, tombstone)| {
+            let teardown_failed = matches!(
+                tombstone.truth,
+                SupervisedTruth::Degraded(_) | SupervisedTruth::OutcomeUnknown
+            );
+            (
+                profile_id,
+                PersistedTombstone {
+                    authority_epoch: tombstone.authority_epoch,
+                    generation: tombstone.generation,
+                    policy_digest: tombstone.policy_digest,
+                    operation_id: tombstone.operation_id,
+                    teardown_failed,
+                },
+            )
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)] // One actor owns these bounded channels and authority state.
@@ -970,6 +1319,9 @@ async fn run_service(
     clock: Arc<dyn Clock>,
     config: ControlServiceConfig,
     mut snapshot: ControlSnapshot,
+    mut durable: DurableControlState,
+    startup_persistence_fault: bool,
+    recovered_control_state: bool,
     selection: ExecutionSelection,
     supervisor: Option<Arc<Supervisor>>,
 ) {
@@ -978,23 +1330,71 @@ async fn run_service(
         challenge_answers: BTreeMap::new(),
         observation_clocks: BTreeMap::new(),
         work_admissions: BTreeMap::new(),
-        recovery_operations: BTreeSet::new(),
+        recovery_operations: snapshot
+            .operations
+            .values()
+            .filter(|operation| {
+                !operation.status.is_terminal()
+                    && operation.desired_generation == snapshot.desired.generation
+            })
+            .map(|operation| operation.id.clone())
+            .collect(),
         lifecycle_operations: BTreeMap::new(),
         next_lifecycle_event: 0,
     };
     let mut ticker = tokio::time::interval(config.freshness_poll_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let runtime = ControlRuntime {
+        config: &config,
+        admission: &admission,
+        supervisor: supervisor.as_deref(),
+        selection,
+        startup_persistence_fault,
+    };
     loop {
         tokio::select! {
             envelope = rx.recv() => {
                 let Some(envelope) = envelope else { break };
+                let before = snapshot.clone();
                 let mut pending = Vec::new();
+                let mut readiness_reply = None;
+                let mut durability_reply = None;
                 let now = clock.now_millis();
                 expire_operations(&mut snapshot, &mut owner, &admission, now, &config, selection, &mut pending);
                 expire_challenges(&mut snapshot, &mut owner, now, config.max_challenges, &mut pending);
-                handle_envelope(envelope, &mut snapshot, &mut owner, &admission, now, &config, &mut pending);
-                drive_supervision(selection, supervisor.as_deref(), &mut snapshot, &mut owner, &admission, now, &config, &mut pending);
-                derive_effective(&mut snapshot, now, selection, supervisor.as_deref());
+                handle_envelope(envelope, &mut snapshot, &mut owner, &admission, now, &config, startup_persistence_fault, &mut readiness_reply, &mut durability_reply, &mut pending);
+                if recovered_control_state
+                    && !before.readiness.reconciliation_complete
+                    && snapshot.readiness.reconciliation_complete
+                {
+                    let generation = snapshot.desired.generation;
+                    start_recovery_operation(
+                        &mut snapshot,
+                        &mut owner,
+                        &admission,
+                        now,
+                        selection,
+                        generation,
+                        &config,
+                        &mut pending,
+                    );
+                }
+                let persisted = runtime.advance(&before, &mut snapshot, &mut durable, &mut owner, now, &mut pending).await;
+                if let Some(deferred) = readiness_reply {
+                    let result = if snapshot.readiness == deferred.readiness {
+                        admission
+                            .lock()
+                            .expect("admission mutex poisoned")
+                            .readiness = deferred.readiness;
+                        Ok(())
+                    } else {
+                        Err(ReadinessError::Persistence)
+                    };
+                    let _ = deferred.reply.send(result);
+                }
+                if let Some(deferred) = durability_reply {
+                    send_durability_reply(deferred, persisted);
+                }
                 publish_then_events(&mut snapshot, &snapshot_tx, &events, pending);
             }
             _ = ticker.tick() => {
@@ -1003,14 +1403,68 @@ async fn run_service(
                 let now = clock.now_millis();
                 expire_operations(&mut snapshot, &mut owner, &admission, now, &config, selection, &mut pending);
                 expire_challenges(&mut snapshot, &mut owner, now, config.max_challenges, &mut pending);
-                drive_supervision(selection, supervisor.as_deref(), &mut snapshot, &mut owner, &admission, now, &config, &mut pending);
-                derive_effective(&mut snapshot, now, selection, supervisor.as_deref());
+                runtime.advance(&before, &mut snapshot, &mut durable, &mut owner, now, &mut pending).await;
                 if snapshot != before || !pending.is_empty() {
                     publish_then_events(&mut snapshot, &snapshot_tx, &events, pending);
                 }
             }
         }
     }
+}
+
+async fn persist_control_state_if_changed(
+    config: &ControlServiceConfig,
+    before: &ControlSnapshot,
+    snapshot: &mut ControlSnapshot,
+    durable: &mut DurableControlState,
+    supervisor: Option<&Supervisor>,
+    admission: &Arc<Mutex<AdmissionState>>,
+    startup_persistence_fault: bool,
+) -> bool {
+    let Some(persistence) = &config.persistence else {
+        return true;
+    };
+    if startup_persistence_fault {
+        return false;
+    }
+    let tombstones = persisted_tombstones(supervisor);
+    if durable.desired == snapshot.desired
+        && durable.operations == snapshot.operations
+        && durable.reconciliation_required != snapshot.readiness.reconciliation_complete
+        && durable.tombstones == tombstones
+    {
+        return true;
+    }
+    let mut candidate = durable.clone();
+    candidate.retention.compacted_operations =
+        candidate.retention.compacted_operations.saturating_add(
+            before
+                .operations
+                .keys()
+                .filter(|operation_id| !snapshot.operations.contains_key(*operation_id))
+                .count() as u64,
+        );
+    candidate.desired.clone_from(&snapshot.desired);
+    candidate.operations.clone_from(&snapshot.operations);
+    candidate.tombstones = tombstones;
+    candidate.reconciliation_required = !snapshot.readiness.reconciliation_complete;
+    let store = Arc::clone(&persistence.store);
+    let boot_id = persistence.boot_id.clone();
+    let state = candidate.clone();
+    let saved = tokio::task::spawn_blocking(move || store.save(&boot_id, &state))
+        .await
+        .is_ok_and(|result| result.is_ok());
+    if saved {
+        *durable = candidate;
+        return true;
+    }
+    snapshot.readiness.reconciliation_complete = false;
+    admission
+        .lock()
+        .expect("admission mutex poisoned")
+        .readiness
+        .reconciliation_complete = false;
+    false
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -1024,7 +1478,10 @@ fn drive_supervision(
     config: &ControlServiceConfig,
     events: &mut Vec<ControlEvent>,
 ) {
-    if selection == ExecutionSelection::LegacyAuthority {
+    if selection == ExecutionSelection::LegacyAuthority
+        || !snapshot.readiness.reconciliation_complete
+        || !snapshot.readiness.authority_verified
+    {
         return;
     }
     let Some(supervisor) = supervisor else {
@@ -1638,7 +2095,11 @@ fn build_topology_state(
     }
 }
 
-#[allow(clippy::too_many_lines)] // Exhaustive owner-envelope dispatch is kept in one auditable match.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "one owner transition carries snapshot, durable intent, admission, and events"
+)]
 fn handle_envelope(
     envelope: Envelope,
     snapshot: &mut ControlSnapshot,
@@ -1646,6 +2107,9 @@ fn handle_envelope(
     admission: &Arc<Mutex<AdmissionState>>,
     now: u64,
     config: &ControlServiceConfig,
+    startup_persistence_fault: bool,
+    readiness_reply: &mut Option<DeferredReadiness>,
+    durability_reply: &mut Option<DeferredDurability>,
     events: &mut Vec<ControlEvent>,
 ) {
     match envelope {
@@ -1657,6 +2121,7 @@ fn handle_envelope(
             admitted_at,
             evicted,
             work_admissions,
+            reply,
         } => {
             for evicted_id in evicted {
                 snapshot.operations.remove(&evicted_id);
@@ -1718,6 +2183,10 @@ fn handle_envelope(
             } else {
                 events.push(ControlEvent::DesiredStateChanged { desired_generation });
             }
+            *durability_reply = Some(DeferredDurability::Admission {
+                operation_id,
+                reply,
+            });
         }
         Envelope::Observe { observation, reply } => {
             let result = apply_observation(observation, snapshot, owner, admission, now, config);
@@ -1726,7 +2195,7 @@ fn handle_envelope(
         Envelope::Complete { completion, reply } => {
             let result =
                 complete_operation(completion, snapshot, owner, admission, now, config, events);
-            let _ = reply.send(result);
+            *durability_reply = Some(DeferredDurability::Completion { result, reply });
         }
         Envelope::IssueChallenge {
             record,
@@ -1791,17 +2260,20 @@ fn handle_envelope(
             readiness,
             reply,
         } => {
-            let result = if expected_epoch == snapshot.desired.authority_epoch {
+            if startup_persistence_fault {
+                let _ = reply.send(Err(ReadinessError::Persistence));
+            } else if expected_epoch == snapshot.desired.authority_epoch {
                 snapshot.readiness = readiness;
-                admission
-                    .lock()
-                    .expect("admission mutex poisoned")
-                    .readiness = readiness;
-                Ok(())
+                if !readiness.reconciliation_complete || !readiness.authority_verified {
+                    admission
+                        .lock()
+                        .expect("admission mutex poisoned")
+                        .readiness = readiness;
+                }
+                *readiness_reply = Some(DeferredReadiness { reply, readiness });
             } else {
-                Err(ReadinessError::EpochMismatch)
-            };
-            let _ = reply.send(result);
+                let _ = reply.send(Err(ReadinessError::EpochMismatch));
+            }
         }
         Envelope::Refresh => {}
     }
@@ -2474,8 +2946,14 @@ fn expire_operations(
         }
         let recovery_id = {
             let mut state = admission.lock().expect("admission mutex poisoned");
-            state.next_operation = state.next_operation.saturating_add(1);
-            OperationId::from_parts(snapshot.desired.authority_epoch, state.next_operation)
+            let Some(operation_id) =
+                next_operation_id(&mut state, snapshot.desired.authority_epoch)
+            else {
+                state.readiness.reconciliation_complete = false;
+                snapshot.readiness.reconciliation_complete = false;
+                return;
+            };
+            operation_id
         };
         let recovery_deadline = now.saturating_add(30_000);
         snapshot.operations.insert(
@@ -2529,8 +3007,13 @@ fn start_recovery_operation(
     }
     let recovery_id = {
         let mut state = admission.lock().expect("admission mutex poisoned");
-        state.next_operation = state.next_operation.saturating_add(1);
-        OperationId::from_parts(snapshot.desired.authority_epoch, state.next_operation)
+        let Some(operation_id) = next_operation_id(&mut state, snapshot.desired.authority_epoch)
+        else {
+            state.readiness.reconciliation_complete = false;
+            snapshot.readiness.reconciliation_complete = false;
+            return;
+        };
+        operation_id
     };
     snapshot.operations.insert(
         recovery_id.clone(),

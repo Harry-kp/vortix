@@ -38,13 +38,34 @@ macro_rules! opaque_id {
 opaque_id!(ChallengeId, "challenge");
 
 /// Opaque operation identity scoped by the monotonic authority epoch.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct OperationId(String);
 
 impl OperationId {
     pub(crate) fn from_parts(authority_epoch: AuthorityEpoch, sequence: u64) -> Self {
         Self(format!("op-{:016x}-{sequence:016x}", authority_epoch.0))
+    }
+
+    pub(crate) fn sequence(&self) -> Option<u64> {
+        parse_scoped_id(&self.0, "op").map(|(_, sequence)| sequence)
+    }
+
+    pub(crate) fn authority_epoch(&self) -> Option<AuthorityEpoch> {
+        parse_scoped_id(&self.0, "op").map(|(epoch, _)| AuthorityEpoch(epoch))
+    }
+}
+
+impl<'de> Deserialize<'de> for OperationId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Self(String::deserialize(deserializer)?);
+        value
+            .sequence()
+            .map(|_| value)
+            .ok_or_else(|| serde::de::Error::custom("invalid service-issued operation ID"))
     }
 }
 
@@ -64,17 +85,32 @@ impl ClientId {
     }
 
     pub(crate) fn is_valid(&self) -> bool {
-        let Some(rest) = self.0.strip_prefix("client-") else {
-            return false;
-        };
-        let Some((epoch, sequence)) = rest.split_once('-') else {
-            return false;
-        };
-        epoch.len() == 16
-            && sequence.len() == 16
-            && epoch.bytes().all(|byte| byte.is_ascii_hexdigit())
-            && sequence.bytes().all(|byte| byte.is_ascii_hexdigit())
+        parse_scoped_id(&self.0, "client").is_some()
     }
+
+    pub(crate) fn sequence(&self) -> Option<u64> {
+        parse_scoped_id(&self.0, "client").map(|(_, sequence)| sequence)
+    }
+
+    pub(crate) fn authority_epoch(&self) -> Option<AuthorityEpoch> {
+        parse_scoped_id(&self.0, "client").map(|(epoch, _)| AuthorityEpoch(epoch))
+    }
+}
+
+fn parse_scoped_id(value: &str, prefix: &str) -> Option<(u64, u64)> {
+    let rest = value.strip_prefix(prefix)?.strip_prefix('-')?;
+    let (epoch, sequence) = rest.split_once('-')?;
+    if epoch.len() != 16
+        || sequence.len() != 16
+        || !epoch.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !sequence.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    Some((
+        u64::from_str_radix(epoch, 16).ok()?,
+        u64::from_str_radix(sequence, 16).ok()?,
+    ))
 }
 
 impl<'de> Deserialize<'de> for ClientId {

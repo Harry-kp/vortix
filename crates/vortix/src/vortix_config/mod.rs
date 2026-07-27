@@ -8,6 +8,7 @@
 
 #![allow(clippy::missing_errors_doc)]
 
+pub mod control_state;
 pub mod error;
 pub mod hooks_config;
 pub mod migration;

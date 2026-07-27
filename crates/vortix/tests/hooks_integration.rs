@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::{poll_fn, Future as _};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 
 use vortix::vortix_core::control::{
@@ -47,7 +49,7 @@ fn current_evidence(client: &ControlHandle) -> ProtectionEvidence {
         desired_generation: desired.generation,
         authority_epoch: desired.authority_epoch,
         policy_digest: desired.policy_digest,
-        observed_at_millis: 0,
+        observed_at_millis: client.deadline_after(Duration::ZERO).0,
         interface: GateEvidence::Verified,
         route: GateEvidence::Verified,
         dns: GateEvidence::Verified,
@@ -97,6 +99,7 @@ async fn committed_connect_lifecycle_has_stable_ordered_event_ids() {
             idempotency_key: IdempotencyKey::new("hook-connect"),
             deadline: Deadline(u64::MAX),
         })
+        .await
         .unwrap();
 
     assert!(matches!(
@@ -152,6 +155,7 @@ async fn reconnect_and_disconnect_use_their_distinct_lifecycle_vocabulary() {
             idempotency_key: IdempotencyKey::new("hook-reconnect"),
             deadline: Deadline(u64::MAX),
         })
+        .await
         .unwrap();
     assert_eq!(
         next_lifecycle(&mut reconnect_events).await.event,
@@ -170,6 +174,7 @@ async fn reconnect_and_disconnect_use_their_distinct_lifecycle_vocabulary() {
             idempotency_key: IdempotencyKey::new("hook-disconnect"),
             deadline: Deadline(u64::MAX),
         })
+        .await
         .unwrap();
     assert_eq!(
         next_lifecycle(&mut disconnect_events).await.event,
@@ -196,16 +201,20 @@ async fn expiry_after_queue_admission_keeps_start_and_failure_facts_ordered() {
     let service = ControlService::start_with_clock(config(), clock.clone());
     let client = service.client();
     let mut events = client.subscribe();
-    client
-        .submit(CommandRequest {
-            command: UserCommand::Connect {
-                profile_id: profile_id(),
-            },
-            idempotency_key: IdempotencyKey::new("hook-expired-in-queue"),
-            deadline: Deadline(1),
-        })
-        .unwrap();
+    let mut admission = Box::pin(client.submit(CommandRequest {
+        command: UserCommand::Connect {
+            profile_id: profile_id(),
+        },
+        idempotency_key: IdempotencyKey::new("hook-expired-in-queue"),
+        deadline: Deadline(1),
+    }));
+    poll_fn(|context| {
+        assert!(admission.as_mut().poll(context).is_pending());
+        Poll::Ready(())
+    })
+    .await;
     clock.0.store(2, Ordering::SeqCst);
+    admission.await.unwrap();
 
     assert!(matches!(
         next_event(&mut events).await,
@@ -251,6 +260,7 @@ async fn connect_failure_is_observational_and_keeps_operation_terminal() {
             idempotency_key: IdempotencyKey::new("hook-failure"),
             deadline: Deadline(u64::MAX),
         })
+        .await
         .unwrap();
     assert_eq!(
         next_lifecycle(&mut subscription).await.event,
