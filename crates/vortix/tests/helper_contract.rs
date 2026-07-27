@@ -41,6 +41,7 @@ fn manifest() -> InstallManifest {
 fn staged_handshake_tells_the_truth_and_cannot_enable_operations() {
     let hello = negotiate_staged(&handshake(vec![HelperCapability::Handshake])).unwrap();
     assert_eq!(hello.authority_mode, HelperAuthorityMode::Staged);
+    assert!(hello.session.is_none());
     assert_eq!(
         hello.enabled_capabilities,
         vec![HelperCapability::Handshake]

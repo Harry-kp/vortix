@@ -488,6 +488,22 @@ impl RootAuthorityLedger {
         self.lease_id
     }
 
+    #[allow(
+        dead_code,
+        reason = "U12 execution slice remains unreachable until U13 enrollment gates it"
+    )]
+    pub(crate) const fn owner_uid(&self) -> u32 {
+        self.owner_uid
+    }
+
+    #[allow(
+        dead_code,
+        reason = "U12 execution slice remains unreachable until U13 enrollment gates it"
+    )]
+    pub(crate) fn matches_service_claim(&self, claim: &ServiceInstanceClaim) -> bool {
+        self.service == *claim
+    }
+
     pub(crate) fn matches_principal(&self, principal: &TrustedDaemonPrincipal) -> bool {
         self.owner_uid == principal.owner_uid
             && self.authority_epoch == principal.authority_epoch

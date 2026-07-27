@@ -109,6 +109,7 @@ pub use protocol_plan::{
     ProfileMaterialSlot, ProtocolEndpoint, ProtocolPlan, ProtocolPlanError,
     WireGuardInterfaceOptions, WireGuardPeerPlan, WireGuardPlan, WireGuardPresharedKeyRef,
 };
+pub(crate) use receipt::AuthenticatedReceiptVerifier;
 pub use receipt::{
     AmbiguousPhase, ObservationState, ReceiptError, ReceiptLedger, ReceiptOutcome, RejectionCode,
     ResourceObservation, ResourceOwnership, UntrustedReceipt, VerifiedReceipt,
