@@ -10,18 +10,18 @@
     reason = "U12 execution slice remains unreachable until U13 enrollment gates it"
 )]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use crate::helper::protocol::{
     negotiate_enrolled, HelperCapability, HelperClientHello, HelperError, HelperOp, HelperRequest,
     HelperResponse, HelperResult, HelperSessionBinding,
 };
 use crate::vortix_core::privileged::{
-    AmbiguousPhase, ChildOwner, ChildSpawnAuthority, HelperEpoch, NetworkPolicyOperation,
-    ObservationState, ObservedChildIdentity, OperationAdmission, OperationError, OperationGuard,
-    OwnedChild, PrivilegedOperation, ProtocolPlan, ReceiptError, ReceiptLedger, RejectionCode,
-    ReplayRecord, ResourceKind, ResourceObservation, ResourceTag, RootAuthorityLedger,
-    VerifiedReceipt,
+    AmbiguousPhase, ChildOwner, ChildSpawnAuthority, HelperEpoch, HelperLedgerRecord,
+    HelperLedgerResource, HelperResourceState, NetworkPolicyOperation, ObservationState,
+    ObservedChildIdentity, OperationAdmission, OperationError, OperationGuard, OwnedChild,
+    PrivilegedOperation, ProtocolPlan, ReceiptError, ReceiptLedger, RejectionCode, ResourceKind,
+    ResourceObservation, ResourceTag, RootAuthorityLedger, VerifiedReceipt,
 };
 
 const ENABLED_CAPABILITIES: [HelperCapability; 5] = [
@@ -115,8 +115,22 @@ pub(crate) trait CleanupExecutor {
 
 /// Root-owned atomic persistence seam. A successful return means the replay
 /// checkpoint has reached durable storage before an executor is entered.
-pub(crate) trait ReplayStore {
-    fn persist(&mut self, checkpoint: &ReplayRecord) -> Result<(), ()>;
+pub(crate) trait HelperLedgerStore {
+    fn persist(&mut self, ledger: &HelperLedgerRecord) -> Result<(), ()>;
+}
+
+enum ChildEvidence {
+    Live(OwnedChild),
+    Recovered(ObservedChildIdentity),
+}
+
+impl ChildEvidence {
+    const fn identity(&self) -> &ObservedChildIdentity {
+        match self {
+            Self::Live(child) => child.identity(),
+            Self::Recovered(identity) => identity,
+        }
+    }
 }
 
 /// One authenticated helper connection. U13 will own construction after its
@@ -128,9 +142,9 @@ pub(crate) struct EnrolledHelperSession<E, S> {
     guard: OperationGuard,
     receipts: ReceiptLedger,
     executor: E,
-    replay_store: S,
-    owned_tunnels: BTreeSet<ResourceTag>,
-    owned_children: BTreeMap<ResourceTag, OwnedChild>,
+    ledger_store: S,
+    resource_states: BTreeMap<ResourceTag, HelperResourceState>,
+    children: BTreeMap<ResourceTag, ChildEvidence>,
     last_receipt: Option<VerifiedReceipt>,
     handshaken: bool,
     poisoned: bool,
@@ -139,14 +153,14 @@ pub(crate) struct EnrolledHelperSession<E, S> {
 impl<E, S> EnrolledHelperSession<E, S>
 where
     E: ObservationExecutor + TunnelLifecycleExecutor + NetworkPolicyExecutor + CleanupExecutor,
-    S: ReplayStore,
+    S: HelperLedgerStore,
 {
     pub(crate) fn resume(
         root: RootAuthorityLedger,
         helper_epoch: HelperEpoch,
         baseline: crate::vortix_core::privileged::ReplayBaseline,
         executor: E,
-        replay_store: S,
+        ledger_store: S,
     ) -> Result<Self, OperationError> {
         let principal = root.principal();
         let guard = OperationGuard::resume(&principal, helper_epoch, baseline)?;
@@ -158,13 +172,44 @@ where
             guard,
             receipts,
             executor,
-            replay_store,
-            owned_tunnels: BTreeSet::new(),
-            owned_children: BTreeMap::new(),
+            ledger_store,
+            resource_states: BTreeMap::new(),
+            children: BTreeMap::new(),
             last_receipt: None,
             handshaken: false,
             poisoned: false,
         })
+    }
+
+    /// Rebuilds only root-ledger-backed resource authority. Persisted child
+    /// identities remain observation/containment evidence and are never
+    /// converted into `OwnedChild` for the new helper incarnation.
+    pub(crate) fn recover(
+        root: RootAuthorityLedger,
+        helper_epoch: HelperEpoch,
+        ledger: HelperLedgerRecord,
+        executor: E,
+        ledger_store: S,
+    ) -> Result<Self, OperationError> {
+        let principal = root.principal();
+        let (replay, resources, child_observations) = ledger.into_parts();
+        let baseline = root.loaded_replay_baseline(&principal, replay)?;
+        let mut session = Self::resume(root, helper_epoch, baseline, executor, ledger_store)?;
+        for entry in resources {
+            session
+                .resource_states
+                .insert(entry.resource().clone(), entry.state());
+        }
+        session.children = child_observations
+            .into_iter()
+            .map(|identity| {
+                (
+                    identity.resource().clone(),
+                    ChildEvidence::Recovered(identity),
+                )
+            })
+            .collect();
+        Ok(session)
     }
 
     pub(crate) fn handle(&mut self, request: HelperRequest) -> HelperResponse {
@@ -251,13 +296,13 @@ where
             // A later duplicate must never inherit the prior operation's
             // receipt if this fresh execution loses its terminal result.
             self.last_receipt = None;
-            let Some(checkpoint) = self.guard.checkpoint() else {
-                self.poisoned = true;
-                return Err(HelperError::LedgerUnavailable);
-            };
-            if self.replay_store.persist(&checkpoint).is_err() {
-                self.poisoned = true;
-                return Err(HelperError::LedgerUnavailable);
+            if !matches!(
+                request.operation(),
+                PrivilegedOperation::StartTunnel(_)
+                    | PrivilegedOperation::StopTunnel(_)
+                    | PrivilegedOperation::CleanupOwned(_)
+            ) {
+                self.persist_ledger()?;
             }
         }
 
@@ -272,18 +317,12 @@ where
                 }
             }
             .map_err(map_receipt_error),
-            PrivilegedOperation::StartTunnel(plan) => {
-                self.start_tunnel(request, plan).map_err(map_receipt_error)
-            }
-            PrivilegedOperation::StopTunnel(resource) => self
-                .stop_tunnel(request, resource)
-                .map_err(map_receipt_error),
+            PrivilegedOperation::StartTunnel(plan) => self.start_tunnel(request, plan),
+            PrivilegedOperation::StopTunnel(resource) => self.stop_tunnel(request, resource),
             PrivilegedOperation::NetworkPolicy(operation) => {
                 self.execute_network_policy(request, operation)
             }
-            PrivilegedOperation::CleanupOwned(resources) => self
-                .cleanup_owned(request, resources)
-                .map_err(map_receipt_error),
+            PrivilegedOperation::CleanupOwned(resources) => self.cleanup_owned(request, resources),
         }?;
         self.last_receipt = Some(receipt.clone());
         receipt_result(receipt)
@@ -293,27 +332,46 @@ where
         &mut self,
         request: &crate::vortix_core::privileged::PrivilegedRequest,
         plan: &ProtocolPlan,
-    ) -> Result<VerifiedReceipt, ReceiptError> {
+    ) -> Result<VerifiedReceipt, HelperError> {
         let Ok(tunnel) = ResourceTag::tunnel(plan.profile_id().clone(), plan.generation()) else {
-            return self.receipts.rejected(request, RejectionCode::InvalidPlan);
-        };
-        if self.owned_tunnels.contains(&tunnel) {
+            self.persist_ledger()?;
             return self
                 .receipts
-                .rejected(request, RejectionCode::InvalidResource);
+                .rejected(request, RejectionCode::InvalidPlan)
+                .map_err(map_receipt_error);
+        };
+        let process_group = matches!(plan, ProtocolPlan::OpenVpn(_))
+            .then(|| process_group_for_tunnel(&tunnel))
+            .transpose()
+            .map_err(|()| HelperError::LedgerUnavailable)?;
+        let intended = std::iter::once(tunnel.clone())
+            .chain(process_group.iter().cloned())
+            .collect::<Vec<_>>();
+        if intended
+            .iter()
+            .any(|resource| self.resource_states.contains_key(resource))
+        {
+            self.persist_ledger()?;
+            return self
+                .receipts
+                .rejected(request, RejectionCode::InvalidResource)
+                .map_err(map_receipt_error);
         }
+
+        for resource in &intended {
+            self.resource_states
+                .insert(resource.clone(), HelperResourceState::PendingEffect);
+        }
+        self.persist_ledger()?;
 
         let outcome = match self.executor.start_tunnel(plan) {
             Ok(outcome) => outcome,
-            Err(error) => return self.execution_error_receipt(request, error),
+            Err(error) => return self.start_error_receipt(request, &intended, error),
         };
-        let resources = match (plan, outcome) {
+        match (plan, outcome) {
             (ProtocolPlan::WireGuard(_), TunnelStartOutcome::InterfaceApplied(observation))
                 if observation.resource() == &tunnel
-                    && observation.state() == ObservationState::Present =>
-            {
-                vec![tunnel.clone()]
-            }
+                    && observation.state() == ObservationState::Present => {}
             (ProtocolPlan::OpenVpn(_), TunnelStartOutcome::ForegroundOwned(identity))
                 if identity.resource() == &tunnel =>
             {
@@ -322,66 +380,91 @@ where
                 let Ok(owned) = authority.claim(identity) else {
                     return self
                         .receipts
-                        .ambiguous(request, AmbiguousPhase::EffectMayHaveApplied);
+                        .ambiguous(request, AmbiguousPhase::EffectMayHaveApplied)
+                        .map_err(map_receipt_error);
                 };
-                let Ok(group) = ResourceTag::profile(
-                    plan.profile_id().clone(),
-                    plan.generation(),
-                    ResourceKind::ProcessGroup,
-                ) else {
-                    return self
-                        .receipts
-                        .ambiguous(request, AmbiguousPhase::EffectMayHaveApplied);
-                };
-                self.owned_children.insert(tunnel.clone(), owned);
-                vec![tunnel.clone(), group]
+                self.children
+                    .insert(tunnel.clone(), ChildEvidence::Live(owned));
             }
             (_, TunnelStartOutcome::ForegroundOwned(identity)) => {
                 return if self.executor.contain_unclaimed(&identity).is_ok() {
+                    self.clear_resources(&intended)?;
                     self.receipts
                         .rejected(request, RejectionCode::InvalidResource)
+                        .map_err(map_receipt_error)
                 } else {
                     self.receipts
                         .ambiguous(request, AmbiguousPhase::EffectMayHaveApplied)
+                        .map_err(map_receipt_error)
                 };
             }
             (_, TunnelStartOutcome::InterfaceApplied(_)) => {
                 return self
                     .receipts
-                    .ambiguous(request, AmbiguousPhase::EffectMayHaveApplied);
+                    .ambiguous(request, AmbiguousPhase::EffectMayHaveApplied)
+                    .map_err(map_receipt_error);
             }
-        };
-        self.owned_tunnels.insert(tunnel);
-        self.receipts.applied(request, resources)
+        }
+        for resource in &intended {
+            self.resource_states
+                .insert(resource.clone(), HelperResourceState::Owned);
+        }
+        if let Err(error) = self.persist_ledger() {
+            if let Some(identity) = self
+                .children
+                .get(&tunnel)
+                .map(|child| child.identity().clone())
+            {
+                let _ = self.executor.contain_unclaimed(&identity);
+            }
+            return Err(error);
+        }
+        self.receipts
+            .applied(request, intended)
+            .map_err(map_receipt_error)
     }
 
     fn stop_tunnel(
         &mut self,
         request: &crate::vortix_core::privileged::PrivilegedRequest,
         tunnel: &ResourceTag,
-    ) -> Result<VerifiedReceipt, ReceiptError> {
-        if !self.owned_tunnels.contains(tunnel) {
+    ) -> Result<VerifiedReceipt, HelperError> {
+        if !self.owns_tunnel(tunnel) {
+            self.persist_ledger()?;
             return self
                 .receipts
-                .rejected(request, RejectionCode::InvalidResource);
+                .rejected(request, RejectionCode::InvalidResource)
+                .map_err(map_receipt_error);
         }
-        let identity = self
-            .owned_children
-            .get(tunnel)
-            .map(|owned| owned.identity().clone());
+        let identity = self.child_identity(tunnel).cloned();
+        let mut releasing = vec![tunnel.clone()];
+        if identity.is_some() {
+            releasing.push(
+                process_group_for_tunnel(tunnel).map_err(|()| HelperError::LedgerUnavailable)?,
+            );
+        }
+        for resource in &releasing {
+            self.resource_states
+                .insert(resource.clone(), HelperResourceState::PendingRelease);
+        }
+        self.persist_ledger()?;
         let observation = match self.executor.stop_tunnel(tunnel, identity.as_ref()) {
             Ok(observation) => observation,
-            Err(error) => return self.execution_error_receipt(request, error),
+            Err(error) => return self.release_error_receipt(request, &releasing, error),
         };
         let receipt = match self.receipts.observed(request, vec![observation]) {
             Ok(receipt) => receipt,
             Err(_) => self
                 .receipts
-                .ambiguous(request, AmbiguousPhase::EffectMayHaveApplied)?,
+                .ambiguous(request, AmbiguousPhase::EffectMayHaveApplied)
+                .map_err(map_receipt_error)?,
         };
         if !receipt.is_ambiguous() {
-            self.owned_tunnels.remove(tunnel);
-            self.owned_children.remove(tunnel);
+            for resource in &releasing {
+                self.resource_states.remove(resource);
+            }
+            self.children.remove(tunnel);
+            self.persist_ledger()?;
         }
         Ok(receipt)
     }
@@ -430,12 +513,7 @@ where
                 }
                 _ => return Ok(receipt),
             };
-            if confirmed.is_err()
-                || self
-                    .guard
-                    .checkpoint()
-                    .is_none_or(|checkpoint| self.replay_store.persist(&checkpoint).is_err())
-            {
+            if confirmed.is_err() || self.persist_ledger().is_err() {
                 self.poisoned = true;
                 return Err(HelperError::LedgerUnavailable);
             }
@@ -447,54 +525,81 @@ where
         &mut self,
         request: &crate::vortix_core::privileged::PrivilegedRequest,
         resources: &[ResourceTag],
-    ) -> Result<VerifiedReceipt, ReceiptError> {
+    ) -> Result<VerifiedReceipt, HelperError> {
         if resources.is_empty()
             || resources
                 .iter()
                 .any(|resource| !self.owns_cleanup_resource(resource))
+            || !self.cleanup_set_is_closed(resources)
         {
+            self.persist_ledger()?;
             return self
                 .receipts
-                .rejected(request, RejectionCode::InvalidResource);
+                .rejected(request, RejectionCode::InvalidResource)
+                .map_err(map_receipt_error);
         }
 
         let children = self.cleanup_children(resources);
+        for resource in resources {
+            self.resource_states
+                .insert(resource.clone(), HelperResourceState::PendingRelease);
+        }
+        self.persist_ledger()?;
         let observations = match self.executor.cleanup_owned(resources, &children) {
             Ok(observations) => observations,
-            Err(error) => return self.execution_error_receipt(request, error),
+            Err(error) => return self.release_error_receipt(request, resources, error),
         };
         let receipt = match self.receipts.observed(request, observations) {
             Ok(receipt) => receipt,
             Err(_) => self
                 .receipts
-                .ambiguous(request, AmbiguousPhase::EffectMayHaveApplied)?,
+                .ambiguous(request, AmbiguousPhase::EffectMayHaveApplied)
+                .map_err(map_receipt_error)?,
         };
         if !receipt.is_ambiguous() {
             for resource in resources {
+                self.resource_states.remove(resource);
                 match resource.kind() {
-                    ResourceKind::Tunnel => {
-                        self.owned_tunnels.remove(resource);
-                    }
                     ResourceKind::ProcessGroup => {
                         if let Some(tunnel) = tunnel_for_profile_resource(resource) {
-                            self.owned_children.remove(&tunnel);
+                            self.children.remove(&tunnel);
                         }
                     }
-                    ResourceKind::RuntimeSecret => {}
+                    ResourceKind::Tunnel | ResourceKind::RuntimeSecret => {}
                     ResourceKind::Firewall | ResourceKind::Dns | ResourceKind::Routes => {
                         unreachable!("cleanup operation validation excludes policy resources")
                     }
                 }
             }
+            self.persist_ledger()?;
         }
         Ok(receipt)
     }
 
+    fn cleanup_set_is_closed(&self, resources: &[ResourceTag]) -> bool {
+        self.children.keys().all(|tunnel| {
+            if !resources.contains(tunnel) {
+                return true;
+            }
+            process_group_for_tunnel(tunnel).is_ok_and(|group| resources.contains(&group))
+        })
+    }
+
+    fn owns_tunnel(&self, resource: &ResourceTag) -> bool {
+        resource.kind() == ResourceKind::Tunnel
+            && self.resource_states.get(resource).is_some_and(|state| {
+                matches!(
+                    state,
+                    HelperResourceState::Owned | HelperResourceState::PendingRelease
+                )
+            })
+    }
+
     fn owns_cleanup_resource(&self, resource: &ResourceTag) -> bool {
         match resource.kind() {
-            ResourceKind::Tunnel => self.owned_tunnels.contains(resource),
+            ResourceKind::Tunnel => self.owns_tunnel(resource),
             ResourceKind::ProcessGroup => tunnel_for_profile_resource(resource)
-                .is_some_and(|tunnel| self.owned_children.contains_key(&tunnel)),
+                .is_some_and(|tunnel| self.child_identity(&tunnel).is_some()),
             ResourceKind::RuntimeSecret
             | ResourceKind::Firewall
             | ResourceKind::Dns
@@ -513,15 +618,88 @@ where
                 | ResourceKind::Dns
                 | ResourceKind::Routes => None,
             };
-            if let Some((tunnel, child)) = tunnel.and_then(|tunnel| {
-                self.owned_children
-                    .get(&tunnel)
-                    .map(|child| (tunnel, child))
-            }) {
-                children.insert(tunnel, child.identity().clone());
+            if let Some((tunnel, child)) =
+                tunnel.and_then(|tunnel| self.child_identity(&tunnel).map(|child| (tunnel, child)))
+            {
+                children.insert(tunnel, child.clone());
             }
         }
         children.into_values().collect()
+    }
+
+    fn child_identity(&self, tunnel: &ResourceTag) -> Option<&ObservedChildIdentity> {
+        self.children.get(tunnel).map(ChildEvidence::identity)
+    }
+
+    fn persist_ledger(&mut self) -> Result<(), HelperError> {
+        let Some(checkpoint) = self.guard.checkpoint() else {
+            self.poisoned = true;
+            return Err(HelperError::LedgerUnavailable);
+        };
+        let resources = self
+            .resource_states
+            .iter()
+            .map(|(resource, state)| match state {
+                HelperResourceState::PendingEffect => {
+                    HelperLedgerResource::pending(resource.clone())
+                }
+                HelperResourceState::Owned => HelperLedgerResource::owned(resource.clone()),
+                HelperResourceState::PendingRelease => {
+                    HelperLedgerResource::releasing(resource.clone())
+                }
+            })
+            .collect();
+        let child_observations = self
+            .children
+            .iter()
+            .map(|child| child.1.identity().clone())
+            .collect();
+        let Ok(ledger) = HelperLedgerRecord::new(checkpoint, resources, child_observations) else {
+            self.poisoned = true;
+            return Err(HelperError::LedgerUnavailable);
+        };
+        if self.ledger_store.persist(&ledger).is_err() {
+            self.poisoned = true;
+            return Err(HelperError::LedgerUnavailable);
+        }
+        Ok(())
+    }
+
+    fn clear_resources(&mut self, resources: &[ResourceTag]) -> Result<(), HelperError> {
+        for resource in resources {
+            self.resource_states.remove(resource);
+        }
+        self.persist_ledger()
+    }
+
+    fn start_error_receipt(
+        &mut self,
+        request: &crate::vortix_core::privileged::PrivilegedRequest,
+        resources: &[ResourceTag],
+        error: PrivilegedExecutionError,
+    ) -> Result<VerifiedReceipt, HelperError> {
+        if !matches!(error, PrivilegedExecutionError::EffectMayHaveApplied) {
+            self.clear_resources(resources)?;
+        }
+        self.execution_error_receipt(request, error)
+            .map_err(map_receipt_error)
+    }
+
+    fn release_error_receipt(
+        &mut self,
+        request: &crate::vortix_core::privileged::PrivilegedRequest,
+        resources: &[ResourceTag],
+        error: PrivilegedExecutionError,
+    ) -> Result<VerifiedReceipt, HelperError> {
+        if !matches!(error, PrivilegedExecutionError::EffectMayHaveApplied) {
+            for resource in resources {
+                self.resource_states
+                    .insert(resource.clone(), HelperResourceState::Owned);
+            }
+            self.persist_ledger()?;
+        }
+        self.execution_error_receipt(request, error)
+            .map_err(map_receipt_error)
     }
 
     fn execution_error_receipt(
@@ -548,6 +726,18 @@ where
 
 fn tunnel_for_profile_resource(resource: &ResourceTag) -> Option<ResourceTag> {
     ResourceTag::tunnel(resource.profile_id()?.clone(), resource.generation()).ok()
+}
+
+fn process_group_for_tunnel(tunnel: &ResourceTag) -> Result<ResourceTag, ()> {
+    let Some(profile_id) = tunnel.profile_id() else {
+        return Err(());
+    };
+    ResourceTag::profile(
+        profile_id.clone(),
+        tunnel.generation(),
+        ResourceKind::ProcessGroup,
+    )
+    .map_err(|_| ())
 }
 
 fn capability_for(operation: &PrivilegedOperation) -> HelperCapability {
@@ -608,14 +798,14 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     #[derive(Default)]
-    struct MemoryReplayStore {
-        writes: Vec<ReplayRecord>,
+    struct MemoryHelperLedgerStore {
+        writes: Vec<HelperLedgerRecord>,
         fail: bool,
         fail_on_write: Option<usize>,
     }
 
-    impl ReplayStore for MemoryReplayStore {
-        fn persist(&mut self, checkpoint: &ReplayRecord) -> Result<(), ()> {
+    impl HelperLedgerStore for MemoryHelperLedgerStore {
+        fn persist(&mut self, checkpoint: &HelperLedgerRecord) -> Result<(), ()> {
             if self.fail || self.fail_on_write == Some(self.writes.len() + 1) {
                 Err(())
             } else {
@@ -887,7 +1077,7 @@ mod tests {
     }
 
     struct LifecycleHarness {
-        server: EnrolledHelperSession<FakeExecutor, MemoryReplayStore>,
+        server: EnrolledHelperSession<FakeExecutor, MemoryHelperLedgerStore>,
         principal: crate::vortix_core::privileged::TrustedDaemonPrincipal,
         client: AuthenticatedHelperSession,
         helper_epoch: HelperEpoch,
@@ -913,7 +1103,7 @@ mod tests {
                 helper_epoch,
                 baseline,
                 executor,
-                MemoryReplayStore::default(),
+                MemoryHelperLedgerStore::default(),
             )
             .unwrap();
             let handshake = server.handle(HelperRequest {
@@ -964,7 +1154,7 @@ mod tests {
             helper_epoch,
             baseline,
             FakeExecutor::default(),
-            MemoryReplayStore::default(),
+            MemoryHelperLedgerStore::default(),
         )
         .unwrap();
         let hello = HelperClientHello::current(
@@ -1000,7 +1190,7 @@ mod tests {
             });
             client.verify_receipt(id, &request, response).unwrap();
         }
-        assert_eq!(server.replay_store.writes.len(), 1);
+        assert_eq!(server.ledger_store.writes.len(), 1);
     }
 
     #[test]
@@ -1011,10 +1201,10 @@ mod tests {
             helper_epoch,
             baseline,
             FakeExecutor::default(),
-            MemoryReplayStore {
+            MemoryHelperLedgerStore {
                 writes: Vec::new(),
                 fail: true,
-                ..MemoryReplayStore::default()
+                ..MemoryHelperLedgerStore::default()
             },
         )
         .unwrap();
@@ -1044,6 +1234,59 @@ mod tests {
     }
 
     #[test]
+    fn failed_post_start_ownership_persistence_keeps_pending_intent_and_poisons() {
+        let mut harness = LifecycleHarness::new(FakeExecutor::default());
+        harness.server.ledger_store.fail_on_write = Some(2);
+        let start = harness.request(1, PrivilegedOperation::StartTunnel(wireguard_plan(1)));
+
+        let response = harness.server.handle(HelperRequest {
+            id: 2,
+            op: HelperOp::Execute(Box::new(start)),
+        });
+
+        assert!(matches!(
+            response.result,
+            Err(HelperError::LedgerUnavailable)
+        ));
+        assert!(harness.server.poisoned);
+        assert_eq!(harness.server.executor.starts, 1);
+        let persisted = harness.server.ledger_store.writes.last().unwrap();
+        assert_eq!(persisted.resources().len(), 1);
+        assert_eq!(
+            persisted.resources()[0].state(),
+            HelperResourceState::PendingEffect
+        );
+    }
+
+    #[test]
+    fn failed_openvpn_ownership_persistence_contains_unrecorded_child() {
+        let mut harness = LifecycleHarness::new(FakeExecutor {
+            foreground_start: true,
+            ..FakeExecutor::default()
+        });
+        harness.server.ledger_store.fail_on_write = Some(2);
+        let start = harness.request(1, PrivilegedOperation::StartTunnel(openvpn_plan(1)));
+
+        let response = harness.server.handle(HelperRequest {
+            id: 2,
+            op: HelperOp::Execute(Box::new(start)),
+        });
+
+        assert!(matches!(
+            response.result,
+            Err(HelperError::LedgerUnavailable)
+        ));
+        assert_eq!(harness.server.executor.containments, 1);
+        assert!(harness.server.poisoned);
+        let persisted = harness.server.ledger_store.writes.last().unwrap();
+        assert_eq!(persisted.resources().len(), 2);
+        assert!(persisted
+            .resources()
+            .iter()
+            .all(|entry| entry.state() == HelperResourceState::PendingEffect));
+    }
+
+    #[test]
     fn sent_request_without_receipt_requires_observation_before_retry() {
         let (_root, principal, _claim, helper_epoch, _baseline) = fixture();
         let request = PrivilegedRequest::new(
@@ -1067,7 +1310,7 @@ mod tests {
             helper_epoch,
             baseline,
             FakeExecutor::default(),
-            MemoryReplayStore::default(),
+            MemoryHelperLedgerStore::default(),
         )
         .unwrap();
         let wrong_peer = PeerProcessIdentity::untrusted_claim(501, 43, 99).unwrap();
@@ -1104,7 +1347,7 @@ mod tests {
             helper_epoch,
             baseline,
             FakeExecutor::default(),
-            MemoryReplayStore::default(),
+            MemoryHelperLedgerStore::default(),
         )
         .unwrap();
         let request = PrivilegedRequest::new(
@@ -1151,7 +1394,7 @@ mod tests {
             helper_epoch,
             baseline,
             FakeExecutor::default(),
-            MemoryReplayStore::default(),
+            MemoryHelperLedgerStore::default(),
         )
         .unwrap();
         let handshake = server.handle(HelperRequest {
@@ -1199,17 +1442,44 @@ mod tests {
             assert!(!receipt.is_ambiguous());
         }
         assert_eq!(harness.server.executor.starts, 1);
-        assert_eq!(harness.server.owned_tunnels.len(), 1);
-        assert!(harness.server.owned_children.is_empty());
+        assert!(harness.server.owns_tunnel(&resource()));
+        assert!(harness.server.children.is_empty());
 
         let stop = harness.request(2, PrivilegedOperation::StopTunnel(resource()));
         let receipt = harness.execute(4, &stop);
         assert!(!receipt.is_ambiguous());
         assert_eq!(harness.server.executor.stops, 1);
         assert_eq!(harness.server.executor.stops_with_child, 0);
-        assert!(harness.server.owned_tunnels.is_empty());
-        assert!(harness.server.owned_children.is_empty());
-        assert_eq!(harness.server.replay_store.writes.len(), 2);
+        assert!(!harness.server.owns_tunnel(&resource()));
+        assert!(harness.server.children.is_empty());
+        assert_eq!(harness.server.ledger_store.writes.len(), 4);
+    }
+
+    #[test]
+    fn failed_post_stop_persistence_keeps_release_intent_and_poisons() {
+        let mut harness = LifecycleHarness::new(FakeExecutor::default());
+        let start = harness.request(1, PrivilegedOperation::StartTunnel(wireguard_plan(1)));
+        assert!(!harness.execute(2, &start).is_ambiguous());
+        harness.server.ledger_store.fail_on_write = Some(4);
+        let stop = harness.request(2, PrivilegedOperation::StopTunnel(resource()));
+
+        let response = harness.server.handle(HelperRequest {
+            id: 3,
+            op: HelperOp::Execute(Box::new(stop)),
+        });
+
+        assert!(matches!(
+            response.result,
+            Err(HelperError::LedgerUnavailable)
+        ));
+        assert!(harness.server.poisoned);
+        assert_eq!(harness.server.executor.stops, 1);
+        let persisted = harness.server.ledger_store.writes.last().unwrap();
+        assert_eq!(persisted.resources().len(), 1);
+        assert_eq!(
+            persisted.resources()[0].state(),
+            HelperResourceState::PendingRelease
+        );
     }
 
     #[test]
@@ -1219,8 +1489,8 @@ mod tests {
 
         harness.execute(2, &stop);
         assert_eq!(harness.server.executor.stops, 0);
-        assert!(harness.server.owned_tunnels.is_empty());
-        assert!(harness.server.owned_children.is_empty());
+        assert!(!harness.server.owns_tunnel(&resource()));
+        assert!(harness.server.children.is_empty());
     }
 
     #[test]
@@ -1231,14 +1501,66 @@ mod tests {
         });
         let start = harness.request(1, PrivilegedOperation::StartTunnel(openvpn_plan(1)));
         assert!(!harness.execute(2, &start).is_ambiguous());
-        assert_eq!(harness.server.owned_tunnels.len(), 1);
-        assert_eq!(harness.server.owned_children.len(), 1);
+        assert!(harness.server.owns_tunnel(&resource()));
+        assert_eq!(harness.server.children.len(), 1);
 
         let stop = harness.request(2, PrivilegedOperation::StopTunnel(resource()));
         assert!(!harness.execute(3, &stop).is_ambiguous());
         assert_eq!(harness.server.executor.stops_with_child, 1);
-        assert!(harness.server.owned_tunnels.is_empty());
-        assert!(harness.server.owned_children.is_empty());
+        assert!(!harness.server.owns_tunnel(&resource()));
+        assert!(harness.server.children.is_empty());
+    }
+
+    #[test]
+    fn restart_restores_resources_but_keeps_child_identity_observation_only() {
+        let mut harness = LifecycleHarness::new(FakeExecutor {
+            foreground_start: true,
+            ..FakeExecutor::default()
+        });
+        let start = harness.request(1, PrivilegedOperation::StartTunnel(openvpn_plan(1)));
+        assert!(!harness.execute(2, &start).is_ambiguous());
+        let ledger = harness.server.ledger_store.writes.last().unwrap().clone();
+        let root = harness.server.root.clone();
+        let (_fixture_root, principal, claim, _old_epoch, _baseline) = fixture();
+        let helper_epoch = HelperEpoch::new(9).unwrap();
+        let mut recovered = EnrolledHelperSession::recover(
+            root,
+            helper_epoch,
+            ledger,
+            FakeExecutor::default(),
+            MemoryHelperLedgerStore::default(),
+        )
+        .unwrap();
+
+        let handshake = recovered.handle(HelperRequest {
+            id: 1,
+            op: HelperOp::Handshake(HelperClientHello::current(
+                501,
+                claim,
+                vec![HelperCapability::TunnelLifecycle],
+            )),
+        });
+        assert!(handshake.result.is_ok());
+        assert!(recovered.owns_tunnel(&resource()));
+        assert!(matches!(
+            recovered.children.get(&resource()),
+            Some(ChildEvidence::Recovered(_))
+        ));
+
+        let stop = PrivilegedRequest::new(
+            &principal,
+            helper_epoch,
+            RequestSequence::new(2).unwrap(),
+            PrivilegedOperation::StopTunnel(resource()),
+        )
+        .unwrap();
+        let response = recovered.handle(HelperRequest {
+            id: 2,
+            op: HelperOp::Execute(Box::new(stop)),
+        });
+        assert!(response.result.is_ok());
+        assert_eq!(recovered.executor.stops_with_child, 1);
+        assert!(recovered.children.is_empty());
     }
 
     #[test]
@@ -1253,8 +1575,8 @@ mod tests {
         harness.execute(2, &start);
         assert_eq!(harness.server.executor.starts, 1);
         assert_eq!(harness.server.executor.containments, 1);
-        assert!(harness.server.owned_tunnels.is_empty());
-        assert!(harness.server.owned_children.is_empty());
+        assert!(!harness.server.owns_tunnel(&resource()));
+        assert!(harness.server.children.is_empty());
     }
 
     #[test]
@@ -1269,8 +1591,8 @@ mod tests {
 
         assert!(harness.execute(2, &start).is_ambiguous());
         assert_eq!(harness.server.executor.containments, 1);
-        assert!(harness.server.owned_tunnels.is_empty());
-        assert!(harness.server.owned_children.is_empty());
+        assert!(!harness.server.owns_tunnel(&resource()));
+        assert!(harness.server.children.is_empty());
     }
 
     #[test]
@@ -1286,8 +1608,8 @@ mod tests {
             assert!(receipt.is_ambiguous());
         }
         assert_eq!(harness.server.executor.starts, 1);
-        assert!(harness.server.owned_tunnels.is_empty());
-        assert!(harness.server.owned_children.is_empty());
+        assert!(!harness.server.owns_tunnel(&resource()));
+        assert!(harness.server.children.is_empty());
     }
 
     #[test]
@@ -1312,8 +1634,8 @@ mod tests {
         }
         assert_eq!(harness.server.executor.cleanups, 1);
         assert_eq!(harness.server.executor.cleanup_children, 1);
-        assert!(harness.server.owned_tunnels.is_empty());
-        assert!(harness.server.owned_children.is_empty());
+        assert!(!harness.server.owns_tunnel(&resource()));
+        assert!(harness.server.children.is_empty());
     }
 
     #[test]
@@ -1334,7 +1656,7 @@ mod tests {
 
         assert!(!harness.execute(3, &cleanup).is_ambiguous());
         assert_eq!(harness.server.executor.cleanups, 0);
-        assert!(harness.server.owned_tunnels.contains(&resource()));
+        assert!(harness.server.owns_tunnel(&resource()));
     }
 
     #[test]
@@ -1358,7 +1680,7 @@ mod tests {
             assert!(harness.execute(id, &cleanup).is_ambiguous());
         }
         assert_eq!(harness.server.executor.cleanups, 1);
-        assert!(harness.server.owned_tunnels.contains(&resource()));
+        assert!(harness.server.owns_tunnel(&resource()));
     }
 
     #[test]
@@ -1398,7 +1720,7 @@ mod tests {
         );
         assert!(!harness.execute(5, &apply).is_ambiguous());
         assert_eq!(harness.server.executor.policy_calls, 3);
-        assert_eq!(harness.server.replay_store.writes.len(), 4);
+        assert_eq!(harness.server.ledger_store.writes.len(), 4);
     }
 
     #[test]
@@ -1421,7 +1743,7 @@ mod tests {
                 predecessor,
             }),
         );
-        harness.server.replay_store.fail_on_write = Some(3);
+        harness.server.ledger_store.fail_on_write = Some(3);
 
         let response = harness.server.handle(HelperRequest {
             id: 3,
