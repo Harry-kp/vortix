@@ -12,22 +12,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use thiserror::Error;
 
-use super::server::ReplayStore;
+use super::server::HelperLedgerStore;
 use super::{PlatformLayout, HELPER_LEDGER_MODE, HELPER_RUNTIME_DIR_MODE};
-use crate::vortix_core::privileged::{HelperLedgerRecord, ReplayBaseline, ReplayRecord};
+use crate::vortix_core::privileged::{HelperLedgerRecord, ReplayBaseline};
 
-const MAX_REPLAY_BYTES: u64 = 64 * 1024;
+const MAX_HELPER_LEDGER_BYTES: u64 = 64 * 1024;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Filesystem-backed replay store rooted in the package-created helper data
 /// directory. Production construction requires UID 0; tests can exercise the
 /// same ownership checks with their current effective UID.
-pub(crate) struct FsReplayStore {
+pub(crate) struct FsHelperLedgerStore {
     path: PathBuf,
     expected_owner_uid: u32,
 }
 
-impl FsReplayStore {
+impl FsHelperLedgerStore {
     pub(crate) fn root_owned(layout: PlatformLayout) -> Self {
         Self {
             path: PathBuf::from(layout.root_ledger()),
@@ -43,52 +43,49 @@ impl FsReplayStore {
         }
     }
 
-    pub(crate) fn load(&self) -> Result<ReplayRecord, ReplayStoreError> {
-        self.load_ledger().map(HelperLedgerRecord::into_replay)
-    }
-
-    fn load_ledger(&self) -> Result<HelperLedgerRecord, ReplayStoreError> {
+    pub(crate) fn load(&self) -> Result<HelperLedgerRecord, HelperLedgerStoreError> {
         let parent = self.parent()?;
         validate_directory(parent, self.expected_owner_uid)?;
+        self.load_from_validated_parent()
+    }
+
+    fn load_from_validated_parent(&self) -> Result<HelperLedgerRecord, HelperLedgerStoreError> {
         let file = open_read_no_follow(&self.path)?;
         validate_file(&file, self.expected_owner_uid)?;
         let length = file.metadata()?.len();
-        if length == 0 || length > MAX_REPLAY_BYTES {
-            return Err(ReplayStoreError::Capacity);
+        if length == 0 || length > MAX_HELPER_LEDGER_BYTES {
+            return Err(HelperLedgerStoreError::Capacity);
         }
-        let capacity = usize::try_from(length).map_err(|_| ReplayStoreError::Capacity)?;
+        let capacity = usize::try_from(length).map_err(|_| HelperLedgerStoreError::Capacity)?;
         let mut bytes = Vec::with_capacity(capacity);
-        file.take(MAX_REPLAY_BYTES + 1).read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > MAX_REPLAY_BYTES {
-            return Err(ReplayStoreError::Capacity);
+        file.take(MAX_HELPER_LEDGER_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_HELPER_LEDGER_BYTES {
+            return Err(HelperLedgerStoreError::Capacity);
         }
-        serde_json::from_slice(&bytes).map_err(|_| ReplayStoreError::Corrupt)
+        serde_json::from_slice(&bytes).map_err(|_| HelperLedgerStoreError::Corrupt)
     }
 
-    pub(crate) fn initialize(&mut self, baseline: ReplayBaseline) -> Result<(), ReplayStoreError> {
-        self.write(&baseline.into_record())
+    pub(crate) fn initialize(
+        &mut self,
+        baseline: ReplayBaseline,
+    ) -> Result<(), HelperLedgerStoreError> {
+        self.write(&HelperLedgerRecord::empty(baseline.into_record()))
     }
 
-    fn write(&self, checkpoint: &ReplayRecord) -> Result<(), ReplayStoreError> {
+    fn write(&self, ledger: &HelperLedgerRecord) -> Result<(), HelperLedgerStoreError> {
         let parent = self.parent()?;
         validate_directory(parent, self.expected_owner_uid)?;
-        match open_read_no_follow(&self.path) {
-            Ok(file) => validate_file(&file, self.expected_owner_uid)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+        match self.load_from_validated_parent() {
+            Ok(_) => {}
+            Err(HelperLedgerStoreError::Io(error))
+                if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
 
-        let mut ledger = match self.load_ledger() {
-            Ok(ledger) => ledger,
-            Err(ReplayStoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                HelperLedgerRecord::empty(checkpoint.clone())
-            }
-            Err(error) => return Err(error),
-        };
-        ledger.replace_replay(checkpoint.clone());
-        let bytes = serde_json::to_vec(&ledger)?;
-        if bytes.is_empty() || bytes.len() as u64 > MAX_REPLAY_BYTES {
-            return Err(ReplayStoreError::Capacity);
+        let bytes = serde_json::to_vec(ledger)?;
+        if bytes.is_empty() || bytes.len() as u64 > MAX_HELPER_LEDGER_BYTES {
+            return Err(HelperLedgerStoreError::Capacity);
         }
         let (temporary, mut file) = create_temporary(parent)?;
         let result = (|| {
@@ -106,12 +103,12 @@ impl FsReplayStore {
         result
     }
 
-    fn parent(&self) -> Result<&Path, ReplayStoreError> {
-        self.path.parent().ok_or(ReplayStoreError::UnsafePath)
+    fn parent(&self) -> Result<&Path, HelperLedgerStoreError> {
+        self.path.parent().ok_or(HelperLedgerStoreError::UnsafePath)
     }
 }
 
-fn create_temporary(parent: &Path) -> Result<(PathBuf, File), ReplayStoreError> {
+fn create_temporary(parent: &Path) -> Result<(PathBuf, File), HelperLedgerStoreError> {
     for _ in 0..64 {
         let path = parent.join(format!(
             ".helper-ledger.{}.{}.tmp",
@@ -131,9 +128,9 @@ fn create_temporary(parent: &Path) -> Result<(PathBuf, File), ReplayStoreError> 
     .into())
 }
 
-impl ReplayStore for FsReplayStore {
-    fn persist(&mut self, checkpoint: &ReplayRecord) -> Result<(), ()> {
-        self.write(checkpoint).map_err(|_| ())
+impl HelperLedgerStore for FsHelperLedgerStore {
+    fn persist(&mut self, ledger: &HelperLedgerRecord) -> Result<(), ()> {
+        self.write(ledger).map_err(|_| ())
     }
 }
 
@@ -161,10 +158,10 @@ fn open_new_private(path: &Path) -> std::io::Result<File> {
     options.open(path)
 }
 
-fn validate_directory(path: &Path, expected_owner_uid: u32) -> Result<(), ReplayStoreError> {
+fn validate_directory(path: &Path, expected_owner_uid: u32) -> Result<(), HelperLedgerStoreError> {
     let metadata = std::fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(ReplayStoreError::UnsafePath);
+        return Err(HelperLedgerStoreError::UnsafePath);
     }
     #[cfg(unix)]
     {
@@ -172,16 +169,16 @@ fn validate_directory(path: &Path, expected_owner_uid: u32) -> Result<(), Replay
         if metadata.uid() != expected_owner_uid
             || metadata.permissions().mode() & 0o777 != HELPER_RUNTIME_DIR_MODE
         {
-            return Err(ReplayStoreError::UnsafePath);
+            return Err(HelperLedgerStoreError::UnsafePath);
         }
     }
     Ok(())
 }
 
-fn validate_file(file: &File, expected_owner_uid: u32) -> Result<(), ReplayStoreError> {
+fn validate_file(file: &File, expected_owner_uid: u32) -> Result<(), HelperLedgerStoreError> {
     let metadata = file.metadata()?;
     if !metadata.is_file() {
-        return Err(ReplayStoreError::UnsafePath);
+        return Err(HelperLedgerStoreError::UnsafePath);
     }
     #[cfg(unix)]
     {
@@ -190,14 +187,14 @@ fn validate_file(file: &File, expected_owner_uid: u32) -> Result<(), ReplayStore
             || metadata.permissions().mode() & 0o777 != HELPER_LEDGER_MODE
             || metadata.nlink() != 1
         {
-            return Err(ReplayStoreError::UnsafePath);
+            return Err(HelperLedgerStoreError::UnsafePath);
         }
     }
     Ok(())
 }
 
 #[derive(Debug, Error)]
-pub(crate) enum ReplayStoreError {
+pub(crate) enum HelperLedgerStoreError {
     #[error("helper replay ledger path, owner, mode, or link count is unsafe")]
     UnsafePath,
     #[error("helper replay ledger is empty or exceeds its fixed size")]
@@ -247,11 +244,11 @@ mod tests {
             .unwrap()
     }
 
-    fn replay_record() -> ReplayRecord {
-        replay_baseline().into_record()
+    fn ledger_record() -> HelperLedgerRecord {
+        HelperLedgerRecord::empty(replay_baseline().into_record())
     }
 
-    fn store() -> (tempfile::TempDir, FsReplayStore) {
+    fn store() -> (tempfile::TempDir, FsHelperLedgerStore) {
         let directory = tempfile::tempdir().unwrap();
         #[cfg(unix)]
         {
@@ -263,7 +260,7 @@ mod tests {
             .unwrap();
         }
         let uid = crate::utils::effective_user_group_ids().0;
-        let store = FsReplayStore::for_test(directory.path().join("ledger.json"), uid);
+        let store = FsHelperLedgerStore::for_test(directory.path().join("ledger.json"), uid);
         (directory, store)
     }
 
@@ -271,7 +268,7 @@ mod tests {
     fn private_checkpoint_roundtrips_and_replaces_atomically() {
         let (directory, mut store) = store();
         let baseline = replay_baseline();
-        let record = baseline.clone().into_record();
+        let record = HelperLedgerRecord::empty(baseline.clone().into_record());
         store.initialize(baseline).unwrap();
         store.persist(&record).unwrap();
 
@@ -287,28 +284,39 @@ mod tests {
     #[test]
     fn corrupt_oversized_and_unsafe_paths_fail_closed() {
         let (directory, store) = store();
-        let record = replay_record();
-        let mut writable = FsReplayStore::for_test(
+        let record = ledger_record();
+        let mut writable = FsHelperLedgerStore::for_test(
             directory.path().join("ledger.json"),
             crate::utils::effective_user_group_ids().0,
         );
         writable.persist(&record).unwrap();
         std::fs::write(directory.path().join("ledger.json"), b"not json").unwrap();
-        assert!(matches!(store.load(), Err(ReplayStoreError::Corrupt)));
+        assert!(matches!(store.load(), Err(HelperLedgerStoreError::Corrupt)));
+        assert!(writable.persist(&record).is_err());
+        assert_eq!(
+            std::fs::read(directory.path().join("ledger.json")).unwrap(),
+            b"not json"
+        );
 
         std::fs::write(
             directory.path().join("ledger.json"),
-            vec![b'x'; usize::try_from(MAX_REPLAY_BYTES).unwrap() + 1],
+            vec![b'x'; usize::try_from(MAX_HELPER_LEDGER_BYTES).unwrap() + 1],
         )
         .unwrap();
-        assert!(matches!(store.load(), Err(ReplayStoreError::Capacity)));
+        assert!(matches!(
+            store.load(),
+            Err(HelperLedgerStoreError::Capacity)
+        ));
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
             std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o755))
                 .unwrap();
-            assert!(matches!(store.load(), Err(ReplayStoreError::UnsafePath)));
+            assert!(matches!(
+                store.load(),
+                Err(HelperLedgerStoreError::UnsafePath)
+            ));
         }
     }
 
@@ -322,7 +330,7 @@ mod tests {
         std::fs::write(&outside, b"outside").unwrap();
         symlink(&outside, directory.path().join("ledger.json")).unwrap();
 
-        assert!(store.persist(&replay_record()).is_err());
+        assert!(store.persist(&ledger_record()).is_err());
         assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
     }
 
@@ -330,7 +338,7 @@ mod tests {
     #[test]
     fn hard_linked_ledger_is_never_loaded_or_replaced() {
         let (directory, mut store) = store();
-        let record = replay_record();
+        let record = ledger_record();
         store.persist(&record).unwrap();
         std::fs::hard_link(
             directory.path().join("ledger.json"),
@@ -338,7 +346,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(matches!(store.load(), Err(ReplayStoreError::UnsafePath)));
+        assert!(matches!(
+            store.load(),
+            Err(HelperLedgerStoreError::UnsafePath)
+        ));
         assert!(store.persist(&record).is_err());
     }
 }
