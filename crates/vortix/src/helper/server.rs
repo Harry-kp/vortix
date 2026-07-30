@@ -38,7 +38,37 @@ pub(crate) trait ObservationExecutor {
     fn observe(
         &mut self,
         resources: &[ResourceTag],
-    ) -> Result<Vec<ResourceObservation>, ObservationError>;
+    ) -> Result<ObservationOutcome, ObservationError>;
+}
+
+pub(crate) struct ObservationOutcome {
+    observations: Vec<ResourceObservation>,
+    child_observations: Vec<ObservedChildIdentity>,
+}
+
+impl ObservationOutcome {
+    pub(crate) const fn new(
+        observations: Vec<ResourceObservation>,
+        child_observations: Vec<ObservedChildIdentity>,
+    ) -> Self {
+        Self {
+            observations,
+            child_observations,
+        }
+    }
+}
+
+fn child_observations_match_request(
+    resources: &[ResourceTag],
+    children: &[ObservedChildIdentity],
+) -> bool {
+    children.len() <= resources.len()
+        && children.iter().enumerate().all(|(index, child)| {
+            resources.contains(child.resource())
+                && !children[..index]
+                    .iter()
+                    .any(|prior| prior.resource() == child.resource())
+        })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -307,16 +337,7 @@ where
         }
 
         let receipt = match request.operation() {
-            PrivilegedOperation::Observe(resources) => match self.executor.observe(resources) {
-                Ok(observations) => self.receipts.observed(request, observations),
-                Err(ObservationError::InvalidResource) => self
-                    .receipts
-                    .rejected(request, RejectionCode::InvalidResource),
-                Err(ObservationError::Overloaded) => {
-                    self.receipts.rejected(request, RejectionCode::Overloaded)
-                }
-            }
-            .map_err(map_receipt_error),
+            PrivilegedOperation::Observe(resources) => self.observe(request, resources),
             PrivilegedOperation::StartTunnel(plan) => self.start_tunnel(request, plan),
             PrivilegedOperation::StopTunnel(resource) => self.stop_tunnel(request, resource),
             PrivilegedOperation::NetworkPolicy(operation) => {
@@ -326,6 +347,162 @@ where
         }?;
         self.last_receipt = Some(receipt.clone());
         receipt_result(receipt)
+    }
+
+    fn observe(
+        &mut self,
+        request: &crate::vortix_core::privileged::PrivilegedRequest,
+        resources: &[ResourceTag],
+    ) -> Result<VerifiedReceipt, HelperError> {
+        let outcome = match self.executor.observe(resources) {
+            Ok(outcome) => outcome,
+            Err(ObservationError::InvalidResource) => {
+                return self
+                    .receipts
+                    .rejected(request, RejectionCode::InvalidResource)
+                    .map_err(map_receipt_error);
+            }
+            Err(ObservationError::Overloaded) => {
+                return self
+                    .receipts
+                    .rejected(request, RejectionCode::Overloaded)
+                    .map_err(map_receipt_error);
+            }
+        };
+        if !child_observations_match_request(resources, &outcome.child_observations) {
+            return self
+                .receipts
+                .rejected(request, RejectionCode::InvalidResource)
+                .map_err(map_receipt_error);
+        }
+        let receipt = self
+            .receipts
+            .observed(request, outcome.observations.clone())
+            .map_err(map_receipt_error)?;
+        if self.reconcile_recovery(&outcome) {
+            self.persist_ledger()?;
+        }
+        Ok(receipt)
+    }
+
+    fn reconcile_recovery(&mut self, outcome: &ObservationOutcome) -> bool {
+        let mut changed = false;
+        for observation in &outcome.observations {
+            let resource = observation.resource();
+            if resource.kind() != ResourceKind::Tunnel {
+                continue;
+            }
+            let Some(state) = self.resource_states.get(resource).copied() else {
+                continue;
+            };
+            let process_group = process_group_for_tunnel(resource).ok();
+            let paired_state = process_group
+                .as_ref()
+                .and_then(|group| self.resource_states.get(group).copied());
+            match (state, paired_state) {
+                (HelperResourceState::PendingEffect, None) => {
+                    changed |= self.reconcile_wireguard_observation(observation);
+                }
+                (HelperResourceState::PendingRelease, None)
+                    if observation.state() == ObservationState::Absent =>
+                {
+                    self.resource_states.remove(resource);
+                    changed = true;
+                }
+                (HelperResourceState::PendingEffect, Some(HelperResourceState::PendingEffect)) => {
+                    let Some(group) = process_group.as_ref() else {
+                        continue;
+                    };
+                    changed |= self.reconcile_openvpn_pending(
+                        resource,
+                        group,
+                        &outcome.observations,
+                        &outcome.child_observations,
+                    );
+                }
+                (
+                    HelperResourceState::PendingRelease,
+                    Some(HelperResourceState::PendingRelease),
+                ) => {
+                    let Some(group) = process_group.as_ref() else {
+                        continue;
+                    };
+                    if observation.state() == ObservationState::Absent
+                        && observation_state(&outcome.observations, group)
+                            == Some(ObservationState::Absent)
+                    {
+                        self.resource_states.remove(resource);
+                        self.resource_states.remove(group);
+                        self.children.remove(resource);
+                        changed = true;
+                    }
+                }
+                (
+                    HelperResourceState::Owned | HelperResourceState::PendingRelease,
+                    Some(HelperResourceState::Owned | HelperResourceState::PendingEffect) | None,
+                )
+                | (
+                    HelperResourceState::PendingEffect | HelperResourceState::Owned,
+                    Some(HelperResourceState::PendingRelease),
+                )
+                | (HelperResourceState::PendingEffect, Some(HelperResourceState::Owned)) => {}
+            }
+        }
+        changed
+    }
+
+    fn reconcile_wireguard_observation(&mut self, observation: &ResourceObservation) -> bool {
+        match observation.state() {
+            ObservationState::Present => {
+                self.resource_states
+                    .insert(observation.resource().clone(), HelperResourceState::Owned);
+                true
+            }
+            ObservationState::Absent => {
+                self.resource_states.remove(observation.resource());
+                true
+            }
+            ObservationState::Drifted | ObservationState::Unknown => false,
+        }
+    }
+
+    fn reconcile_openvpn_pending(
+        &mut self,
+        tunnel: &ResourceTag,
+        process_group: &ResourceTag,
+        observations: &[ResourceObservation],
+        child_observations: &[ObservedChildIdentity],
+    ) -> bool {
+        let tunnel_state = observation_state(observations, tunnel);
+        let group_state = observation_state(observations, process_group);
+        if tunnel_state == Some(ObservationState::Absent)
+            && group_state == Some(ObservationState::Absent)
+        {
+            self.resource_states.remove(tunnel);
+            self.resource_states.remove(process_group);
+            return true;
+        }
+        if tunnel_state != Some(ObservationState::Present)
+            || group_state != Some(ObservationState::Present)
+        {
+            return false;
+        }
+        let mut matching = child_observations
+            .iter()
+            .filter(|identity| identity.resource() == tunnel);
+        let Some(identity) = matching.next() else {
+            return false;
+        };
+        if matching.next().is_some() {
+            return false;
+        }
+        self.resource_states
+            .insert(tunnel.clone(), HelperResourceState::Owned);
+        self.resource_states
+            .insert(process_group.clone(), HelperResourceState::Owned);
+        self.children
+            .insert(tunnel.clone(), ChildEvidence::Recovered(identity.clone()));
+        true
     }
 
     fn start_tunnel(
@@ -740,6 +917,16 @@ fn process_group_for_tunnel(tunnel: &ResourceTag) -> Result<ResourceTag, ()> {
     .map_err(|_| ())
 }
 
+fn observation_state(
+    observations: &[ResourceObservation],
+    resource: &ResourceTag,
+) -> Option<ObservationState> {
+    observations
+        .iter()
+        .find(|observation| observation.resource() == resource)
+        .map(ResourceObservation::state)
+}
+
 fn capability_for(operation: &PrivilegedOperation) -> HelperCapability {
     match operation {
         PrivilegedOperation::StartTunnel(_) | PrivilegedOperation::StopTunnel(_) => {
@@ -823,6 +1010,14 @@ mod tests {
     }
 
     #[derive(Default)]
+    enum FakeChildObservation {
+        #[default]
+        None,
+        Matching,
+        Foreign,
+    }
+
+    #[derive(Default)]
     struct FakeExecutor {
         starts: usize,
         stops: usize,
@@ -837,19 +1032,48 @@ mod tests {
         start_error: Option<PrivilegedExecutionError>,
         cleanup_error: Option<PrivilegedExecutionError>,
         cleanup_evidence: FakeCleanupEvidence,
+        observation_state: Option<ObservationState>,
+        child_observation: FakeChildObservation,
     }
 
     impl ObservationExecutor for FakeExecutor {
         fn observe(
             &mut self,
             resources: &[ResourceTag],
-        ) -> Result<Vec<ResourceObservation>, ObservationError> {
-            resources
+        ) -> Result<ObservationOutcome, ObservationError> {
+            let observations = resources
                 .iter()
                 .cloned()
-                .map(|resource| ResourceObservation::new(resource, ObservationState::Present, 1))
+                .map(|resource| {
+                    ResourceObservation::new(
+                        resource,
+                        self.observation_state.unwrap_or(ObservationState::Present),
+                        1,
+                    )
+                })
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| ObservationError::InvalidResource)
+                .map_err(|_| ObservationError::InvalidResource)?;
+            let child_resources = match self.child_observation {
+                FakeChildObservation::None => Vec::new(),
+                FakeChildObservation::Matching => resources
+                    .iter()
+                    .filter(|resource| resource.kind() == ResourceKind::Tunnel)
+                    .cloned()
+                    .collect(),
+                FakeChildObservation::Foreign => vec![ResourceTag::tunnel(
+                    ProfileId::parse("b".repeat(ProfileId::HEX_LEN)).unwrap(),
+                    1,
+                )
+                .unwrap()],
+            };
+            let child_observations = child_resources
+                .into_iter()
+                .map(|resource| {
+                    ObservedChildIdentity::new(resource, 42, 99, ContainmentId::new([3; 32]))
+                        .map_err(|_| ObservationError::InvalidResource)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ObservationOutcome::new(observations, child_observations))
         }
     }
 
@@ -1058,10 +1282,10 @@ mod tests {
         )
     }
 
-    fn openvpn_plan(generation: u64) -> ProtocolPlan {
+    fn openvpn_plan_for(profile: &str, generation: u64) -> ProtocolPlan {
         ProtocolPlan::OpenVpn(
             OpenVpnPlan::new(
-                ProfileId::parse("a".repeat(ProfileId::HEX_LEN)).unwrap(),
+                ProfileId::parse(profile.repeat(ProfileId::HEX_LEN)).unwrap(),
                 generation,
                 vec![OpenVpnRemote::new(
                     SocketAddr::from(([203, 0, 113, 9], 1194)),
@@ -1074,6 +1298,10 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    fn openvpn_plan(generation: u64) -> ProtocolPlan {
+        openvpn_plan_for("a", generation)
     }
 
     struct LifecycleHarness {
@@ -1144,6 +1372,94 @@ mod tests {
             });
             self.client.verify_receipt(id, request, response).unwrap()
         }
+    }
+
+    fn recover_session(
+        root: RootAuthorityLedger,
+        ledger: HelperLedgerRecord,
+        executor: FakeExecutor,
+        capability: HelperCapability,
+    ) -> (
+        EnrolledHelperSession<FakeExecutor, MemoryHelperLedgerStore>,
+        crate::vortix_core::privileged::TrustedDaemonPrincipal,
+        HelperEpoch,
+    ) {
+        let (_fixture_root, principal, claim, _old_epoch, _baseline) = fixture();
+        let helper_epoch = HelperEpoch::new(9).unwrap();
+        let mut recovered = EnrolledHelperSession::recover(
+            root,
+            helper_epoch,
+            ledger,
+            executor,
+            MemoryHelperLedgerStore::default(),
+        )
+        .unwrap();
+        let response = recovered.handle(HelperRequest {
+            id: 1,
+            op: HelperOp::Handshake(HelperClientHello::current(501, claim, vec![capability])),
+        });
+        assert!(response.result.is_ok());
+        (recovered, principal, helper_epoch)
+    }
+
+    fn pending_tunnel_ledger(
+        plans: impl IntoIterator<Item = ProtocolPlan>,
+    ) -> (RootAuthorityLedger, HelperLedgerRecord) {
+        let mut harness = LifecycleHarness::new(FakeExecutor {
+            start_error: Some(PrivilegedExecutionError::EffectMayHaveApplied),
+            ..FakeExecutor::default()
+        });
+        for (index, plan) in plans.into_iter().enumerate() {
+            let sequence = u64::try_from(index + 1).unwrap();
+            let start = harness.request(sequence, PrivilegedOperation::StartTunnel(plan));
+            assert!(harness.execute(sequence + 1, &start).is_ambiguous());
+        }
+        (
+            harness.server.root.clone(),
+            harness.server.ledger_store.writes.last().unwrap().clone(),
+        )
+    }
+
+    fn pending_release_ledger(
+        plan: ProtocolPlan,
+        executor: FakeExecutor,
+    ) -> (RootAuthorityLedger, HelperLedgerRecord, ResourceTag) {
+        let tunnel = ResourceTag::tunnel(plan.profile_id().clone(), plan.generation()).unwrap();
+        let mut harness = LifecycleHarness::new(executor);
+        let start = harness.request(1, PrivilegedOperation::StartTunnel(plan));
+        assert!(!harness.execute(2, &start).is_ambiguous());
+        harness.server.ledger_store.fail_on_write = Some(4);
+        let stop = harness.request(2, PrivilegedOperation::StopTunnel(tunnel.clone()));
+        assert!(matches!(
+            harness
+                .server
+                .handle(HelperRequest {
+                    id: 3,
+                    op: HelperOp::Execute(Box::new(stop)),
+                })
+                .result,
+            Err(HelperError::LedgerUnavailable)
+        ));
+        (
+            harness.server.root.clone(),
+            harness.server.ledger_store.writes.last().unwrap().clone(),
+            tunnel,
+        )
+    }
+
+    fn observation_request(
+        principal: &crate::vortix_core::privileged::TrustedDaemonPrincipal,
+        helper_epoch: HelperEpoch,
+        sequence: u64,
+        resources: Vec<ResourceTag>,
+    ) -> PrivilegedRequest {
+        PrivilegedRequest::new(
+            principal,
+            helper_epoch,
+            RequestSequence::new(sequence).unwrap(),
+            PrivilegedOperation::Observe(resources),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1561,6 +1877,273 @@ mod tests {
         assert!(response.result.is_ok());
         assert_eq!(recovered.executor.stops_with_child, 1);
         assert!(recovered.children.is_empty());
+    }
+
+    #[test]
+    fn restart_scan_promotes_pending_wireguard_only_after_exact_presence() {
+        let (root, ledger) = pending_tunnel_ledger([wireguard_plan(1)]);
+        let (mut recovered, principal, helper_epoch) = recover_session(
+            root,
+            ledger,
+            FakeExecutor::default(),
+            HelperCapability::Observe,
+        );
+        assert!(!recovered.owns_tunnel(&resource()));
+
+        let observe = observation_request(&principal, helper_epoch, 2, vec![resource()]);
+        let response = recovered.handle(HelperRequest {
+            id: 2,
+            op: HelperOp::Execute(Box::new(observe)),
+        });
+
+        assert!(response.result.is_ok());
+        assert!(recovered.owns_tunnel(&resource()));
+        let persisted = recovered.ledger_store.writes.last().unwrap();
+        assert_eq!(persisted.resources().len(), 1);
+        assert_eq!(persisted.resources()[0].state(), HelperResourceState::Owned);
+    }
+
+    #[test]
+    fn restart_scan_requires_openvpn_topology_and_containment_identity() {
+        let (root, ledger) = pending_tunnel_ledger([openvpn_plan(1)]);
+        let (mut without_child, principal, helper_epoch) = recover_session(
+            root.clone(),
+            ledger.clone(),
+            FakeExecutor::default(),
+            HelperCapability::Observe,
+        );
+        let tunnel = resource();
+        let group = process_group_for_tunnel(&tunnel).unwrap();
+        let observe = observation_request(
+            &principal,
+            helper_epoch,
+            2,
+            vec![tunnel.clone(), group.clone()],
+        );
+
+        assert!(without_child
+            .handle(HelperRequest {
+                id: 2,
+                op: HelperOp::Execute(Box::new(observe)),
+            })
+            .result
+            .is_ok());
+        assert!(!without_child.owns_tunnel(&tunnel));
+        assert!(without_child.children.is_empty());
+
+        let (mut with_child, principal, helper_epoch) = recover_session(
+            root,
+            ledger,
+            FakeExecutor {
+                child_observation: FakeChildObservation::Matching,
+                ..FakeExecutor::default()
+            },
+            HelperCapability::Observe,
+        );
+        let observe = observation_request(&principal, helper_epoch, 2, vec![tunnel.clone(), group]);
+        assert!(with_child
+            .handle(HelperRequest {
+                id: 2,
+                op: HelperOp::Execute(Box::new(observe)),
+            })
+            .result
+            .is_ok());
+        assert!(with_child.owns_tunnel(&tunnel));
+        assert!(matches!(
+            with_child.children.get(&tunnel),
+            Some(ChildEvidence::Recovered(_))
+        ));
+        let persisted = with_child.ledger_store.writes.last().unwrap();
+        assert!(persisted
+            .resources()
+            .iter()
+            .all(|entry| entry.state() == HelperResourceState::Owned));
+    }
+
+    #[test]
+    fn restart_scan_rejects_foreign_child_evidence_without_minting_ownership() {
+        let (root, ledger) = pending_tunnel_ledger([openvpn_plan(1)]);
+        let (mut recovered, principal, helper_epoch) = recover_session(
+            root,
+            ledger,
+            FakeExecutor {
+                child_observation: FakeChildObservation::Foreign,
+                ..FakeExecutor::default()
+            },
+            HelperCapability::Observe,
+        );
+        let tunnel = resource();
+        let group = process_group_for_tunnel(&tunnel).unwrap();
+        let observe = observation_request(&principal, helper_epoch, 2, vec![tunnel.clone(), group]);
+
+        assert!(recovered
+            .handle(HelperRequest {
+                id: 2,
+                op: HelperOp::Execute(Box::new(observe)),
+            })
+            .result
+            .is_ok());
+        assert!(!recovered.owns_tunnel(&tunnel));
+        assert!(recovered.children.is_empty());
+        assert!(recovered
+            .resource_states
+            .values()
+            .all(|state| *state == HelperResourceState::PendingEffect));
+        assert_eq!(recovered.ledger_store.writes.len(), 1);
+    }
+
+    #[test]
+    fn restart_scan_reconciles_each_openvpn_tunnel_independently() {
+        let (root, ledger) =
+            pending_tunnel_ledger([openvpn_plan_for("a", 1), openvpn_plan_for("b", 1)]);
+        let (mut recovered, principal, helper_epoch) = recover_session(
+            root,
+            ledger,
+            FakeExecutor {
+                child_observation: FakeChildObservation::Matching,
+                ..FakeExecutor::default()
+            },
+            HelperCapability::Observe,
+        );
+        let tunnels = ["a", "b"].map(|profile| {
+            ResourceTag::tunnel(
+                ProfileId::parse(profile.repeat(ProfileId::HEX_LEN)).unwrap(),
+                1,
+            )
+            .unwrap()
+        });
+        let resources = tunnels
+            .iter()
+            .flat_map(|tunnel| [tunnel.clone(), process_group_for_tunnel(tunnel).unwrap()])
+            .collect();
+        let observe = observation_request(&principal, helper_epoch, 3, resources);
+
+        assert!(recovered
+            .handle(HelperRequest {
+                id: 4,
+                op: HelperOp::Execute(Box::new(observe)),
+            })
+            .result
+            .is_ok());
+        assert!(tunnels.iter().all(|tunnel| recovered.owns_tunnel(tunnel)));
+        assert_eq!(recovered.children.len(), 2);
+        assert!(recovered
+            .children
+            .values()
+            .all(|child| matches!(child, ChildEvidence::Recovered(_))));
+    }
+
+    #[test]
+    fn failed_recovery_transition_persistence_poisons_without_reporting_success() {
+        let (root, ledger) = pending_tunnel_ledger([wireguard_plan(1)]);
+        let (mut recovered, principal, helper_epoch) = recover_session(
+            root,
+            ledger,
+            FakeExecutor::default(),
+            HelperCapability::Observe,
+        );
+        recovered.ledger_store.fail_on_write = Some(2);
+        let observe = observation_request(&principal, helper_epoch, 2, vec![resource()]);
+
+        let response = recovered.handle(HelperRequest {
+            id: 2,
+            op: HelperOp::Execute(Box::new(observe)),
+        });
+
+        assert!(matches!(
+            response.result,
+            Err(HelperError::LedgerUnavailable)
+        ));
+        assert!(recovered.poisoned);
+        let persisted = recovered.ledger_store.writes.last().unwrap();
+        assert_eq!(persisted.resources().len(), 1);
+        assert_eq!(
+            persisted.resources()[0].state(),
+            HelperResourceState::PendingEffect
+        );
+    }
+
+    #[test]
+    fn restart_scan_clears_pending_wireguard_only_after_exact_absence() {
+        let (root, ledger) = pending_tunnel_ledger([wireguard_plan(1)]);
+        let (mut recovered, principal, helper_epoch) = recover_session(
+            root,
+            ledger,
+            FakeExecutor {
+                observation_state: Some(ObservationState::Absent),
+                ..FakeExecutor::default()
+            },
+            HelperCapability::Observe,
+        );
+        let observe = observation_request(&principal, helper_epoch, 2, vec![resource()]);
+
+        assert!(recovered
+            .handle(HelperRequest {
+                id: 2,
+                op: HelperOp::Execute(Box::new(observe)),
+            })
+            .result
+            .is_ok());
+        assert!(!recovered.resource_states.contains_key(&resource()));
+        assert!(recovered
+            .ledger_store
+            .writes
+            .last()
+            .unwrap()
+            .resources()
+            .is_empty());
+    }
+
+    #[test]
+    fn restart_scan_completes_pending_release_after_exact_absence() {
+        for (plan, executor) in [
+            (wireguard_plan(1), FakeExecutor::default()),
+            (
+                openvpn_plan(1),
+                FakeExecutor {
+                    foreground_start: true,
+                    ..FakeExecutor::default()
+                },
+            ),
+        ] {
+            let (root, ledger, tunnel) = pending_release_ledger(plan, executor);
+            let resources = if ledger.resources().len() == 2 {
+                vec![tunnel.clone(), process_group_for_tunnel(&tunnel).unwrap()]
+            } else {
+                vec![tunnel.clone()]
+            };
+            assert!(ledger
+                .resources()
+                .iter()
+                .all(|entry| entry.state() == HelperResourceState::PendingRelease));
+            let (mut recovered, principal, helper_epoch) = recover_session(
+                root,
+                ledger,
+                FakeExecutor {
+                    observation_state: Some(ObservationState::Absent),
+                    ..FakeExecutor::default()
+                },
+                HelperCapability::Observe,
+            );
+            let observe = observation_request(&principal, helper_epoch, 3, resources);
+
+            assert!(recovered
+                .handle(HelperRequest {
+                    id: 4,
+                    op: HelperOp::Execute(Box::new(observe)),
+                })
+                .result
+                .is_ok());
+            assert!(recovered.resource_states.is_empty());
+            assert!(recovered.children.is_empty());
+            assert!(recovered
+                .ledger_store
+                .writes
+                .last()
+                .unwrap()
+                .resources()
+                .is_empty());
+        }
     }
 
     #[test]
