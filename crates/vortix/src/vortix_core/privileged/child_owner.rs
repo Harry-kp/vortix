@@ -78,6 +78,21 @@ impl ObservedChildIdentity {
     pub(crate) const fn resource(&self) -> &ResourceTag {
         &self.resource
     }
+
+    #[must_use]
+    pub(crate) const fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    #[must_use]
+    pub(crate) const fn process_start_token(&self) -> u64 {
+        self.process_start_token
+    }
+
+    #[must_use]
+    pub(crate) const fn containment(&self) -> ContainmentId {
+        self.containment
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

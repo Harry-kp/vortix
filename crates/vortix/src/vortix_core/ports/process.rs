@@ -236,6 +236,38 @@ pub struct DetachedHandle {
     pub spawned_at: SystemTime,
 }
 
+/// Kernel-observed identity for one live process. The start token prevents PID
+/// reuse from authenticating a later process; group leadership proves the PID
+/// names the private containment group rather than an arbitrary member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KernelProcessIdentity {
+    start_token: u64,
+    process_group_leader: bool,
+}
+
+impl KernelProcessIdentity {
+    pub(crate) const fn new(start_token: u64, process_group_leader: bool) -> Option<Self> {
+        if start_token == 0 {
+            None
+        } else {
+            Some(Self {
+                start_token,
+                process_group_leader,
+            })
+        }
+    }
+
+    #[must_use]
+    pub const fn start_token(self) -> u64 {
+        self.start_token
+    }
+
+    #[must_use]
+    pub const fn is_process_group_leader(self) -> bool {
+        self.process_group_leader
+    }
+}
+
 /// Stable ownership key for a foreground protocol child.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ManagedProcessId {

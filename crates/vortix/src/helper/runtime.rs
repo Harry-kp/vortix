@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 use crate::helper::validate::PlatformLayout;
-use crate::vortix_core::privileged::{LeaseId, OperationDigest, ResourceKind, ResourceTag};
+use crate::vortix_core::privileged::{
+    ContainmentId, LeaseId, OperationDigest, ResourceKind, ResourceTag,
+};
 
 const KERNEL_ALIAS_PREFIX: &str = "vx";
 const KERNEL_ALIAS_HASH_CHARS: usize = 13;
@@ -23,6 +25,7 @@ const BASE32: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 pub(crate) struct HelperRuntimeIdentity {
     runtime_dir: PathBuf,
     kernel_alias: String,
+    containment: ContainmentId,
 }
 
 impl HelperRuntimeIdentity {
@@ -43,12 +46,19 @@ impl HelperRuntimeIdentity {
         material.extend_from_slice(profile_id.as_str().as_bytes());
         material.extend_from_slice(&resource.generation().to_be_bytes());
         let digest = OperationDigest::of_bytes(&material).as_bytes();
+        material.clear();
+        material.extend_from_slice(b"vortix-helper-containment-v1\0");
+        material.extend_from_slice(&lease_id.as_bytes());
+        material.extend_from_slice(profile_id.as_str().as_bytes());
+        material.extend_from_slice(&resource.generation().to_be_bytes());
+        let containment = ContainmentId::new(OperationDigest::of_bytes(&material).as_bytes());
         let runtime_dir = runtime_root(layout)
             .join("resources")
             .join(lower_hex(&digest));
         Ok(Self {
             runtime_dir,
             kernel_alias: format!("{KERNEL_ALIAS_PREFIX}{}", base32_prefix(&digest)),
+            containment,
         })
     }
 
@@ -58,6 +68,10 @@ impl HelperRuntimeIdentity {
 
     pub(crate) fn kernel_alias(&self) -> &str {
         &self.kernel_alias
+    }
+
+    pub(crate) const fn containment(&self) -> ContainmentId {
+        self.containment
     }
 
     pub(crate) fn wireguard_config(&self) -> PathBuf {
@@ -72,8 +86,8 @@ impl HelperRuntimeIdentity {
         self.runtime_dir.join("openvpn.log")
     }
 
-    pub(crate) fn openvpn_pid(&self) -> PathBuf {
-        self.runtime_dir.join("openvpn.pid")
+    pub(crate) fn openvpn_child_evidence(&self) -> PathBuf {
+        self.runtime_dir.join("openvpn-child.json")
     }
 
     pub(crate) fn interface_evidence(&self) -> PathBuf {
@@ -186,6 +200,7 @@ mod tests {
         ] {
             assert_ne!(candidate.kernel_alias(), baseline.kernel_alias());
             assert_ne!(candidate.runtime_dir(), baseline.runtime_dir());
+            assert_ne!(candidate.containment(), baseline.containment());
         }
     }
 
@@ -221,12 +236,13 @@ mod tests {
         );
         for artifact in [
             identity.openvpn_log(),
-            identity.openvpn_pid(),
+            identity.openvpn_child_evidence(),
             identity.interface_evidence(),
             identity.secret_dir(),
         ] {
             assert!(artifact.starts_with(identity.runtime_dir()));
         }
+        assert_ne!(identity.containment(), ContainmentId::new([0; 32]));
     }
 
     #[test]

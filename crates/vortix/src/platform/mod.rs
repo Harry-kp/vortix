@@ -70,6 +70,19 @@ pub fn current_platform() -> &'static Platform {
     GLOBAL_PLATFORM.get_or_init(Platform::for_test)
 }
 
+pub(crate) fn observe_process_identity(
+    pid: u32,
+) -> std::io::Result<Option<crate::vortix_core::ports::process::KernelProcessIdentity>> {
+    #[cfg(target_os = "linux")]
+    {
+        crate::vortix_platform_linux::process_identity::observe(pid)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        crate::vortix_platform_macos::process_identity::observe(pid)
+    }
+}
+
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 compile_error!("Vortix currently only supports macOS and Linux");
 
