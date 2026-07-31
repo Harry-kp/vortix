@@ -117,6 +117,22 @@ impl ProtocolEndpoint {
         }
     }
 
+    #[must_use]
+    pub const fn socket_addr(&self) -> Option<SocketAddr> {
+        match self {
+            Self::Ip { address } => Some(*address),
+            Self::Dns { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn port(&self) -> u16 {
+        match self {
+            Self::Ip { address } => address.port(),
+            Self::Dns { port, .. } => *port,
+        }
+    }
+
     fn validate(&self) -> Result<(), ProtocolPlanError> {
         match self {
             Self::Ip { address } => validate_socket_addr(*address),
@@ -531,6 +547,8 @@ pub struct OpenVpnPlan {
     authentication: OpenVpnAuthFactors,
     requested_routes: Vec<OpenVpnRoute>,
     materials: BTreeSet<ProfileMaterialSlot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tls_auth_direction: Option<OpenVpnKeyDirection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -543,13 +561,15 @@ struct OpenVpnPlanWire {
     authentication: OpenVpnAuthFactors,
     requested_routes: BoundedVec<OpenVpnRoute, MAX_ALLOWED_ROUTES>,
     materials: BoundedVec<ProfileMaterialSlot, 8>,
+    #[serde(default)]
+    tls_auth_direction: Option<OpenVpnKeyDirection>,
 }
 
 impl TryFrom<OpenVpnPlanWire> for OpenVpnPlan {
     type Error = ProtocolPlanError;
 
     fn try_from(wire: OpenVpnPlanWire) -> Result<Self, Self::Error> {
-        Self::with_materials(
+        let plan = Self::with_materials(
             wire.profile_id,
             wire.generation,
             wire.remotes.into_vec(),
@@ -557,7 +577,11 @@ impl TryFrom<OpenVpnPlanWire> for OpenVpnPlan {
             wire.authentication,
             wire.requested_routes.into_vec(),
             wire.materials.into_vec().into_iter().collect(),
-        )
+        )?;
+        match wire.tls_auth_direction {
+            Some(direction) => plan.with_tls_auth_direction(direction),
+            None => Ok(plan),
+        }
     }
 }
 
@@ -632,7 +656,47 @@ impl OpenVpnPlan {
             authentication,
             requested_routes,
             materials,
+            tls_auth_direction: None,
         })
+    }
+
+    pub fn with_tls_auth_direction(
+        mut self,
+        direction: OpenVpnKeyDirection,
+    ) -> Result<Self, ProtocolPlanError> {
+        if !self
+            .materials
+            .contains(&ProfileMaterialSlot::OpenVpnTlsAuthKey)
+        {
+            return Err(ProtocolPlanError::InvalidMaterialSlots);
+        }
+        self.tls_auth_direction = Some(direction);
+        Ok(self)
+    }
+
+    #[must_use]
+    pub fn remotes(&self) -> &[OpenVpnRemote] {
+        &self.remotes
+    }
+
+    #[must_use]
+    pub const fn remote_selection(&self) -> OpenVpnRemoteSelection {
+        self.remote_selection
+    }
+
+    #[must_use]
+    pub const fn authentication(&self) -> OpenVpnAuthFactors {
+        self.authentication
+    }
+
+    #[must_use]
+    pub const fn materials(&self) -> &BTreeSet<ProfileMaterialSlot> {
+        &self.materials
+    }
+
+    #[must_use]
+    pub const fn tls_auth_direction(&self) -> Option<OpenVpnKeyDirection> {
+        self.tls_auth_direction
     }
 }
 
@@ -669,6 +733,16 @@ impl OpenVpnRemote {
     ) -> Result<Self, ProtocolPlanError> {
         Self::with_endpoint(ProtocolEndpoint::dns(hostname, port)?, transport)
     }
+
+    #[must_use]
+    pub const fn endpoint(&self) -> &ProtocolEndpoint {
+        &self.endpoint
+    }
+
+    #[must_use]
+    pub const fn transport(&self) -> OpenVpnTransport {
+        self.transport
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -676,6 +750,25 @@ impl OpenVpnRemote {
 pub enum OpenVpnTransport {
     Udp,
     Tcp,
+}
+
+/// Optional direction paired with an `OpenVPN` `tls-auth` key. The numeric
+/// values are protocol vocabulary, not caller-controlled argv.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenVpnKeyDirection {
+    Zero,
+    One,
+}
+
+impl OpenVpnKeyDirection {
+    #[must_use]
+    pub const fn as_openvpn_value(self) -> &'static str {
+        match self {
+            Self::Zero => "0",
+            Self::One => "1",
+        }
+    }
 }
 
 /// Whether remotes are tried in profile order or randomized first, preserving
@@ -781,6 +874,16 @@ impl OpenVpnAuthFactors {
             self.username_password,
             Some(challenge),
         )
+    }
+
+    #[must_use]
+    pub const fn uses_username_password(self) -> bool {
+        self.username_password
+    }
+
+    #[must_use]
+    pub const fn challenge(self) -> Option<OpenVpnChallengeKind> {
+        self.challenge
     }
 
     fn required_materials(self) -> BTreeSet<ProfileMaterialSlot> {
