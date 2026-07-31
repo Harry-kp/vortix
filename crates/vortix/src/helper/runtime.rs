@@ -23,6 +23,7 @@ const BASE32: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 /// No caller-provided path or interface string participates.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HelperRuntimeIdentity {
+    resource: ResourceTag,
     runtime_dir: PathBuf,
     kernel_alias: String,
     containment: ContainmentId,
@@ -56,6 +57,7 @@ impl HelperRuntimeIdentity {
             .join("resources")
             .join(lower_hex(&digest));
         Ok(Self {
+            resource: resource.clone(),
             runtime_dir,
             kernel_alias: format!("{KERNEL_ALIAS_PREFIX}{}", base32_prefix(&digest)),
             containment,
@@ -64,6 +66,10 @@ impl HelperRuntimeIdentity {
 
     pub(crate) fn runtime_dir(&self) -> &Path {
         &self.runtime_dir
+    }
+
+    pub(crate) const fn resource(&self) -> &ResourceTag {
+        &self.resource
     }
 
     pub(crate) fn kernel_alias(&self) -> &str {

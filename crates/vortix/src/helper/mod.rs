@@ -5,6 +5,7 @@
 //! the helper binary remains staged and exposes no server entrypoint until U13
 //! enrollment.
 
+mod child_evidence;
 mod observe;
 pub mod protocol;
 mod replay_store;
