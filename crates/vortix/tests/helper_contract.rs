@@ -117,6 +117,11 @@ fn fixed_layout_and_permissions_are_part_of_the_contract() {
         PlatformLayout::MacOs.helper_path(),
         "/Library/PrivilegedHelperTools/com.vortix.helper"
     );
+    assert_eq!(PlatformLayout::Linux.helper_runtime_dir(), "/run/vortix");
+    assert_eq!(
+        PlatformLayout::MacOs.helper_runtime_dir(),
+        "/var/run/vortix"
+    );
     assert_eq!(manifest().generation(), 3);
 }
 

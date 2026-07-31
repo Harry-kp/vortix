@@ -115,6 +115,12 @@ profile parsing, hooks, or arbitrary cleanup.
   directory fsync, atomic rename, no-follow opens, and reject hard links.
   The versioned envelope already bounds exact owned-resource and child-
   observation slots; loading a child identity never recreates `OwnedChild`.
+- Each tunnel's physical runtime identity is derived from the root-ledger lease
+  plus the exact profile/generation tag. The derivation yields a full-digest
+  root-runtime directory and a 15-byte kernel-safe alias; no caller-supplied
+  path or interface name participates. Same-lease helper restarts therefore
+  scan the same artifacts, while a new authority lease cannot silently adopt
+  stale physical state.
 - PID identity always includes a process start token and containment identity;
   a numeric PID alone is never ownership evidence.
 
@@ -144,11 +150,13 @@ identity and the canonical manifest before staging fixed paths.
 | Linux | helper | `/usr/libexec/vortix/vortix-helper` |
 | Linux | bootstrap | `/usr/libexec/vortix/vortix-bootstrap` |
 | Linux | helper socket | `/run/vortix/helper.sock` |
+| Linux | helper runtime root | `/run/vortix` |
 | Linux | root ledger | `/var/lib/vortix/helper-ledger.json` |
 | macOS | daemon | `/Library/Application Support/Vortix/bin/vortix` |
 | macOS | helper | `/Library/PrivilegedHelperTools/com.vortix.helper` |
 | macOS | bootstrap | `/Library/PrivilegedHelperTools/com.vortix.bootstrap` |
 | macOS | helper socket | `/var/run/vortix/helper.sock` |
+| macOS | helper runtime root | `/var/run/vortix` |
 | macOS | root ledger | `/Library/Application Support/Vortix/helper-ledger.json` |
 
 Package-channel classification is fail closed:
