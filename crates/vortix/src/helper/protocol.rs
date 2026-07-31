@@ -12,8 +12,8 @@ use crate::vortix_core::privileged::{
 
 pub const HELPER_PROTOCOL_MIN: u16 = 1;
 pub const HELPER_PROTOCOL_MAX: u16 = 1;
-pub const HELPER_SCHEMA_MIN: u16 = 1;
-pub const HELPER_SCHEMA_MAX: u16 = 1;
+pub const HELPER_SCHEMA_MIN: u16 = 2;
+pub const HELPER_SCHEMA_MAX: u16 = 2;
 pub const MAX_HELPER_FRAME_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

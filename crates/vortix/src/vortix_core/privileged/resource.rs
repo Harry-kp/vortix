@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::vortix_core::control::AuthorityEpoch;
-use crate::vortix_core::profile::ProfileId;
+use crate::vortix_core::profile::{ProfileId, ProtocolKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -164,10 +164,68 @@ impl ResourceTag {
     }
 }
 
+/// An exact resource read-back target with the protocol needed to interpret
+/// tunnel-scoped OS evidence. The helper derives every physical name from the
+/// resource tag; callers cannot supply an interface, path, PID, or command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ResourceObservationTarget {
+    resource: ResourceTag,
+    protocol: Option<ProtocolKind>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResourceObservationTargetWire {
+    resource: ResourceTag,
+    protocol: Option<ProtocolKind>,
+}
+
+impl<'de> Deserialize<'de> for ResourceObservationTarget {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = ResourceObservationTargetWire::deserialize(deserializer)?;
+        Self::new(wire.resource, wire.protocol).map_err(serde::de::Error::custom)
+    }
+}
+
+impl ResourceObservationTarget {
+    pub fn new(
+        resource: ResourceTag,
+        protocol: Option<ProtocolKind>,
+    ) -> Result<Self, ResourceError> {
+        let valid = match resource.kind() {
+            ResourceKind::Tunnel => protocol.is_some(),
+            ResourceKind::ProcessGroup => protocol == Some(ProtocolKind::OpenVpn),
+            ResourceKind::Firewall
+            | ResourceKind::Dns
+            | ResourceKind::Routes
+            | ResourceKind::RuntimeSecret => protocol.is_none(),
+        };
+        if !valid {
+            return Err(ResourceError::ObservationProtocolMismatch);
+        }
+        Ok(Self { resource, protocol })
+    }
+
+    #[must_use]
+    pub const fn resource(&self) -> &ResourceTag {
+        &self.resource
+    }
+
+    #[must_use]
+    pub const fn protocol(&self) -> Option<ProtocolKind> {
+        self.protocol
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum ResourceError {
     #[error("resource generation must be non-zero")]
     InvalidGeneration,
     #[error("resource kind does not belong to its namespace")]
     NamespaceMismatch,
+    #[error("resource kind and observation protocol do not match")]
+    ObservationProtocolMismatch,
 }

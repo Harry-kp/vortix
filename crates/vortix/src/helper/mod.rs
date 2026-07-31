@@ -1,8 +1,9 @@
 //! Privileged-helper contract, dormant execution core, and packaging boundary.
 //!
-//! U11 froze the wire, identity, and installation rules. U12 operation families
-//! are implemented behind crate-private capabilities one at a time; the helper
-//! binary remains staged and exposes no server entrypoint until U13 enrollment.
+//! U11 established the wire, identity, and installation rules. U12 operation
+//! families are implemented behind crate-private capabilities one at a time;
+//! the helper binary remains staged and exposes no server entrypoint until U13
+//! enrollment.
 
 pub mod protocol;
 mod replay_store;

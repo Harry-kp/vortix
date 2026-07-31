@@ -13,7 +13,7 @@ use serde::de::{SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
 pub(super) const MAX_RESOURCE_ITEMS: usize = 256;
-pub(super) const CONTRACT_SCHEMA_VERSION: u16 = 1;
+pub(super) const CONTRACT_SCHEMA_VERSION: u16 = 2;
 
 /// Allocation-bounded sequence decoder for every collection crossing the
 /// untrusted privileged wire. It rejects the first element beyond `LIMIT`
@@ -117,4 +117,4 @@ pub use receipt::{
     AmbiguousPhase, ObservationState, ReceiptError, ReceiptLedger, ReceiptOutcome, RejectionCode,
     ResourceObservation, ResourceOwnership, UntrustedReceipt, VerifiedReceipt,
 };
-pub use resource::{ResourceError, ResourceKind, ResourceTag};
+pub use resource::{ResourceError, ResourceKind, ResourceObservationTarget, ResourceTag};

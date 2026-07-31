@@ -21,7 +21,8 @@ use crate::vortix_core::privileged::{
     HelperLedgerResource, HelperResourceState, NetworkPolicyOperation, ObservationState,
     ObservedChildIdentity, OperationAdmission, OperationError, OperationGuard, OwnedChild,
     PrivilegedOperation, ProtocolPlan, ReceiptError, ReceiptLedger, RejectionCode, ResourceKind,
-    ResourceObservation, ResourceTag, RootAuthorityLedger, VerifiedReceipt,
+    ResourceObservation, ResourceObservationTarget, ResourceTag, RootAuthorityLedger,
+    VerifiedReceipt,
 };
 
 const ENABLED_CAPABILITIES: [HelperCapability; 5] = [
@@ -37,7 +38,7 @@ const ENABLED_CAPABILITIES: [HelperCapability; 5] = [
 pub(crate) trait ObservationExecutor {
     fn observe(
         &mut self,
-        resources: &[ResourceTag],
+        targets: &[ResourceObservationTarget],
     ) -> Result<ObservationOutcome, ObservationError>;
 }
 
@@ -59,12 +60,14 @@ impl ObservationOutcome {
 }
 
 fn child_observations_match_request(
-    resources: &[ResourceTag],
+    targets: &[ResourceObservationTarget],
     children: &[ObservedChildIdentity],
 ) -> bool {
-    children.len() <= resources.len()
+    children.len() <= targets.len()
         && children.iter().enumerate().all(|(index, child)| {
-            resources.contains(child.resource())
+            targets
+                .iter()
+                .any(|target| target.resource() == child.resource())
                 && !children[..index]
                     .iter()
                     .any(|prior| prior.resource() == child.resource())
@@ -337,7 +340,7 @@ where
         }
 
         let receipt = match request.operation() {
-            PrivilegedOperation::Observe(resources) => self.observe(request, resources),
+            PrivilegedOperation::Observe(targets) => self.observe(request, targets),
             PrivilegedOperation::StartTunnel(plan) => self.start_tunnel(request, plan),
             PrivilegedOperation::StopTunnel(resource) => self.stop_tunnel(request, resource),
             PrivilegedOperation::NetworkPolicy(operation) => {
@@ -352,9 +355,9 @@ where
     fn observe(
         &mut self,
         request: &crate::vortix_core::privileged::PrivilegedRequest,
-        resources: &[ResourceTag],
+        targets: &[ResourceObservationTarget],
     ) -> Result<VerifiedReceipt, HelperError> {
-        let outcome = match self.executor.observe(resources) {
+        let outcome = match self.executor.observe(targets) {
             Ok(outcome) => outcome,
             Err(ObservationError::InvalidResource) => {
                 return self
@@ -369,7 +372,7 @@ where
                     .map_err(map_receipt_error);
             }
         };
-        if !child_observations_match_request(resources, &outcome.child_observations) {
+        if !child_observations_match_request(targets, &outcome.child_observations) {
             return self
                 .receipts
                 .rejected(request, RejectionCode::InvalidResource)
@@ -981,7 +984,7 @@ mod tests {
         ServiceInstanceClaim, ServiceManager, WireGuardInterfaceOptions, WireGuardPeerPlan,
         WireGuardPlan,
     };
-    use crate::vortix_core::profile::ProfileId;
+    use crate::vortix_core::profile::{ProfileId, ProtocolKind};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     #[derive(Default)]
@@ -1039,14 +1042,13 @@ mod tests {
     impl ObservationExecutor for FakeExecutor {
         fn observe(
             &mut self,
-            resources: &[ResourceTag],
+            targets: &[ResourceObservationTarget],
         ) -> Result<ObservationOutcome, ObservationError> {
-            let observations = resources
+            let observations = targets
                 .iter()
-                .cloned()
-                .map(|resource| {
+                .map(|target| {
                     ResourceObservation::new(
-                        resource,
+                        target.resource().clone(),
                         self.observation_state.unwrap_or(ObservationState::Present),
                         1,
                     )
@@ -1055,8 +1057,9 @@ mod tests {
                 .map_err(|_| ObservationError::InvalidResource)?;
             let child_resources = match self.child_observation {
                 FakeChildObservation::None => Vec::new(),
-                FakeChildObservation::Matching => resources
+                FakeChildObservation::Matching => targets
                     .iter()
+                    .map(ResourceObservationTarget::resource)
                     .filter(|resource| resource.kind() == ResourceKind::Tunnel)
                     .cloned()
                     .collect(),
@@ -1261,6 +1264,14 @@ mod tests {
         ResourceTag::tunnel(ProfileId::parse("a".repeat(ProfileId::HEX_LEN)).unwrap(), 1).unwrap()
     }
 
+    fn wireguard_target(resource: ResourceTag) -> ResourceObservationTarget {
+        ResourceObservationTarget::new(resource, Some(ProtocolKind::WireGuard)).unwrap()
+    }
+
+    fn openvpn_target(resource: ResourceTag) -> ResourceObservationTarget {
+        ResourceObservationTarget::new(resource, Some(ProtocolKind::OpenVpn)).unwrap()
+    }
+
     fn wireguard_plan(generation: u64) -> ProtocolPlan {
         let allowed = Cidr::new(IpAddr::V4(Ipv4Addr::new(10, 7, 0, 0)), 16).unwrap();
         let peer = WireGuardPeerPlan::new(
@@ -1451,13 +1462,13 @@ mod tests {
         principal: &crate::vortix_core::privileged::TrustedDaemonPrincipal,
         helper_epoch: HelperEpoch,
         sequence: u64,
-        resources: Vec<ResourceTag>,
+        targets: Vec<ResourceObservationTarget>,
     ) -> PrivilegedRequest {
         PrivilegedRequest::new(
             principal,
             helper_epoch,
             RequestSequence::new(sequence).unwrap(),
-            PrivilegedOperation::Observe(resources),
+            PrivilegedOperation::Observe(targets),
         )
         .unwrap()
     }
@@ -1495,7 +1506,7 @@ mod tests {
             &principal,
             helper_epoch,
             RequestSequence::new(1).unwrap(),
-            PrivilegedOperation::Observe(vec![resource()]),
+            PrivilegedOperation::Observe(vec![wireguard_target(resource())]),
         )
         .unwrap();
 
@@ -1536,7 +1547,7 @@ mod tests {
             &principal,
             helper_epoch,
             RequestSequence::new(1).unwrap(),
-            PrivilegedOperation::Observe(vec![resource()]),
+            PrivilegedOperation::Observe(vec![wireguard_target(resource())]),
         )
         .unwrap();
         let response = server.handle(HelperRequest {
@@ -1609,7 +1620,7 @@ mod tests {
             &principal,
             helper_epoch,
             RequestSequence::new(1).unwrap(),
-            PrivilegedOperation::Observe(vec![resource()]),
+            PrivilegedOperation::Observe(vec![wireguard_target(resource())]),
         )
         .unwrap();
         let mut delivery = DeliveryState::prepared(request);
@@ -1670,7 +1681,7 @@ mod tests {
             &principal,
             helper_epoch,
             RequestSequence::new(1).unwrap(),
-            PrivilegedOperation::Observe(vec![resource()]),
+            PrivilegedOperation::Observe(vec![wireguard_target(resource())]),
         )
         .unwrap();
         assert!(matches!(
@@ -1734,7 +1745,7 @@ mod tests {
             &principal,
             helper_epoch,
             RequestSequence::new(1).unwrap(),
-            PrivilegedOperation::Observe(vec![resource()]),
+            PrivilegedOperation::Observe(vec![wireguard_target(resource())]),
         )
         .unwrap();
         let mut response = server.handle(HelperRequest {
@@ -1890,7 +1901,12 @@ mod tests {
         );
         assert!(!recovered.owns_tunnel(&resource()));
 
-        let observe = observation_request(&principal, helper_epoch, 2, vec![resource()]);
+        let observe = observation_request(
+            &principal,
+            helper_epoch,
+            2,
+            vec![wireguard_target(resource())],
+        );
         let response = recovered.handle(HelperRequest {
             id: 2,
             op: HelperOp::Execute(Box::new(observe)),
@@ -1918,7 +1934,10 @@ mod tests {
             &principal,
             helper_epoch,
             2,
-            vec![tunnel.clone(), group.clone()],
+            vec![
+                openvpn_target(tunnel.clone()),
+                openvpn_target(group.clone()),
+            ],
         );
 
         assert!(without_child
@@ -1940,7 +1959,12 @@ mod tests {
             },
             HelperCapability::Observe,
         );
-        let observe = observation_request(&principal, helper_epoch, 2, vec![tunnel.clone(), group]);
+        let observe = observation_request(
+            &principal,
+            helper_epoch,
+            2,
+            vec![openvpn_target(tunnel.clone()), openvpn_target(group)],
+        );
         assert!(with_child
             .handle(HelperRequest {
                 id: 2,
@@ -1974,7 +1998,12 @@ mod tests {
         );
         let tunnel = resource();
         let group = process_group_for_tunnel(&tunnel).unwrap();
-        let observe = observation_request(&principal, helper_epoch, 2, vec![tunnel.clone(), group]);
+        let observe = observation_request(
+            &principal,
+            helper_epoch,
+            2,
+            vec![openvpn_target(tunnel.clone()), openvpn_target(group)],
+        );
 
         assert!(recovered
             .handle(HelperRequest {
@@ -2012,11 +2041,12 @@ mod tests {
             )
             .unwrap()
         });
-        let resources = tunnels
+        let targets = tunnels
             .iter()
             .flat_map(|tunnel| [tunnel.clone(), process_group_for_tunnel(tunnel).unwrap()])
+            .map(openvpn_target)
             .collect();
-        let observe = observation_request(&principal, helper_epoch, 3, resources);
+        let observe = observation_request(&principal, helper_epoch, 3, targets);
 
         assert!(recovered
             .handle(HelperRequest {
@@ -2043,7 +2073,12 @@ mod tests {
             HelperCapability::Observe,
         );
         recovered.ledger_store.fail_on_write = Some(2);
-        let observe = observation_request(&principal, helper_epoch, 2, vec![resource()]);
+        let observe = observation_request(
+            &principal,
+            helper_epoch,
+            2,
+            vec![wireguard_target(resource())],
+        );
 
         let response = recovered.handle(HelperRequest {
             id: 2,
@@ -2075,7 +2110,12 @@ mod tests {
             },
             HelperCapability::Observe,
         );
-        let observe = observation_request(&principal, helper_epoch, 2, vec![resource()]);
+        let observe = observation_request(
+            &principal,
+            helper_epoch,
+            2,
+            vec![wireguard_target(resource())],
+        );
 
         assert!(recovered
             .handle(HelperRequest {
@@ -2112,6 +2152,14 @@ mod tests {
             } else {
                 vec![tunnel.clone()]
             };
+            let targets = resources
+                .into_iter()
+                .map(if ledger.resources().len() == 2 {
+                    openvpn_target
+                } else {
+                    wireguard_target
+                })
+                .collect();
             assert!(ledger
                 .resources()
                 .iter()
@@ -2125,7 +2173,7 @@ mod tests {
                 },
                 HelperCapability::Observe,
             );
-            let observe = observation_request(&principal, helper_epoch, 3, resources);
+            let observe = observation_request(&principal, helper_epoch, 3, targets);
 
             assert!(recovered
                 .handle(HelperRequest {

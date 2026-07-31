@@ -9,11 +9,11 @@ use vortix::vortix_core::privileged::{
     ObservedChildIdentity, OpenVpnAuthFactors, OpenVpnChallengeKind, OpenVpnPlan, OpenVpnRemote,
     OpenVpnRemoteSelection, OpenVpnRoute, OpenVpnTransport, OperationDigest,
     PrivilegedDnsAssignment, PrivilegedDnsScope, ProfileMaterialRef, ProfileMaterialSlot,
-    ProtocolEndpoint, ProtocolPlan, ProtocolPlanError, ResourceKind, ResourceTag,
-    ServiceInstanceClaim, StandardCustodianContract, WireGuardInterfaceOptions, WireGuardPeerPlan,
-    WireGuardPlan, WireGuardPresharedKeyRef,
+    ProtocolEndpoint, ProtocolPlan, ProtocolPlanError, ResourceKind, ResourceObservationTarget,
+    ResourceTag, ServiceInstanceClaim, StandardCustodianContract, WireGuardInterfaceOptions,
+    WireGuardPeerPlan, WireGuardPlan, WireGuardPresharedKeyRef,
 };
-use vortix::vortix_core::profile::ProfileId;
+use vortix::vortix_core::profile::{ProfileId, ProtocolKind};
 
 fn profile(byte: char) -> ProfileId {
     ProfileId::parse(byte.to_string().repeat(ProfileId::HEX_LEN)).unwrap()
@@ -257,6 +257,35 @@ fn observations_and_untrusted_claims_never_become_capabilities() {
     );
     // There is intentionally no public API from this claim to a root ledger
     // or TrustedDaemonPrincipal.
+}
+
+#[test]
+fn observation_targets_authenticate_protocol_without_accepting_execution_inputs() {
+    let tunnel = ResourceTag::tunnel(profile('a'), 8).unwrap();
+    let wireguard =
+        ResourceObservationTarget::new(tunnel.clone(), Some(ProtocolKind::WireGuard)).unwrap();
+    assert_eq!(wireguard.resource(), &tunnel);
+    assert_eq!(wireguard.protocol(), Some(ProtocolKind::WireGuard));
+    assert_eq!(
+        serde_json::from_value::<ResourceObservationTarget>(
+            serde_json::to_value(&wireguard).unwrap()
+        )
+        .unwrap(),
+        wireguard
+    );
+
+    let group = ResourceTag::profile(profile('b'), 8, ResourceKind::ProcessGroup).unwrap();
+    assert!(ResourceObservationTarget::new(group.clone(), Some(ProtocolKind::OpenVpn)).is_ok());
+    assert!(ResourceObservationTarget::new(group, Some(ProtocolKind::WireGuard)).is_err());
+    assert!(ResourceObservationTarget::new(tunnel.clone(), None).is_err());
+
+    let firewall = ResourceTag::topology(AuthorityEpoch(9), 8, ResourceKind::Firewall).unwrap();
+    assert!(ResourceObservationTarget::new(firewall.clone(), None).is_ok());
+    assert!(ResourceObservationTarget::new(firewall, Some(ProtocolKind::OpenVpn)).is_err());
+
+    let mut injected = serde_json::to_value(wireguard).unwrap();
+    injected["path"] = json!("/tmp/attacker-controlled");
+    assert!(serde_json::from_value::<ResourceObservationTarget>(injected).is_err());
 }
 
 #[test]

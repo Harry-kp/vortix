@@ -1,6 +1,6 @@
 # Privileged helper threat model
 
-Status: U11 contract frozen; U12 authenticated observation/recovery, tunnel
+Status: U11 contract foundation frozen; U12 authenticated observation/recovery, tunnel
 lifecycle, ordered network-policy, and exact-owned cleanup admission cores are
 implemented but dormant; helper staged and **unenrolled**. No privileged
 operation is reachable in this release. U12 enables remaining execution
@@ -121,6 +121,11 @@ profile parsing, hooks, or arbitrary cleanup.
   path or interface name participates. Same-lease helper restarts therefore
   scan the same artifacts, while a new authority lease cannot silently adopt
   stale physical state.
+- Privileged contract schema v2 binds each observation target to its validated
+  protocol when OS evidence is protocol-specific. Tunnel observations require
+  a protocol, process-group observations require OpenVPN, and topology or
+  runtime-secret observations reject one. The executor therefore never guesses
+  a backend from mutable files, processes, or interface names.
 - PID identity always includes a process start token and containment identity;
   a numeric PID alone is never ownership evidence.
 
