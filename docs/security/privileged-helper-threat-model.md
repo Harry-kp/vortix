@@ -134,7 +134,10 @@ profile parsing, hooks, or arbitrary cleanup.
   private process-group leadership through `/proc/<pid>/stat` on Linux or
   `proc_pidinfo` on macOS. Child records are installed by an atomic,
   no-overwrite hard-link handoff beneath lease-derived `0700` directories and
-  removed only when their strict content still matches the reaped child.
+  removed only when their strict content still matches the reaped child. The
+  store obtains the start token and private-group proof directly from the
+  kernel after spawn containment; it cannot persist a numeric PID or a
+  caller-constructed start token.
   Evidence opens are no-follow and accept only root-owned, single-link regular
   files that are not group/world writable.
   Missing or unreadable evidence remains `unknown`; stale, relabelled, or

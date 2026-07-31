@@ -15,6 +15,7 @@ use thiserror::Error;
 
 use crate::helper::runtime::HelperRuntimeIdentity;
 use crate::helper::validate::{PlatformLayout, HELPER_LEDGER_MODE, HELPER_RUNTIME_DIR_MODE};
+use crate::vortix_core::ports::process::KernelProcessIdentity;
 use crate::vortix_core::privileged::{ContainmentId, ObservedChildIdentity, ResourceTag};
 
 const MAX_CHILD_EVIDENCE_BYTES: u64 = 4 * 1024;
@@ -61,12 +62,40 @@ impl ChildEvidenceStore {
         }
     }
 
-    /// Persist only the exact observed identity for this derived runtime.
-    /// The hard-link install is atomic and refuses to replace stale evidence.
-    pub(crate) fn persist(
+    /// Observe the kernel identity only after spawn containment, then persist
+    /// the exact result. A numeric PID or caller-created token is insufficient.
+    pub(crate) fn persist_live(
         &self,
-        identity: &ObservedChildIdentity,
-    ) -> Result<(), ChildEvidenceError> {
+        pid: u32,
+    ) -> Result<ObservedChildIdentity, ChildEvidenceError> {
+        self.persist_live_with(pid, crate::platform::observe_process_identity)
+    }
+
+    fn persist_live_with<F>(
+        &self,
+        pid: u32,
+        observe: F,
+    ) -> Result<ObservedChildIdentity, ChildEvidenceError>
+    where
+        F: FnOnce(u32) -> std::io::Result<Option<KernelProcessIdentity>>,
+    {
+        let kernel = observe(pid)?.ok_or(ChildEvidenceError::ProcessUnavailable)?;
+        if !kernel.is_process_group_leader() {
+            return Err(ChildEvidenceError::NotPrivateProcessGroup);
+        }
+        let identity = ObservedChildIdentity::new(
+            self.resource.clone(),
+            pid,
+            kernel.start_token(),
+            self.containment,
+        )
+        .map_err(|_| ChildEvidenceError::IdentityMismatch)?;
+        self.persist(&identity)?;
+        Ok(identity)
+    }
+
+    /// The hard-link install is atomic and refuses to replace stale evidence.
+    fn persist(&self, identity: &ObservedChildIdentity) -> Result<(), ChildEvidenceError> {
         self.validate_identity(identity)?;
         self.prepare_runtime_dir()?;
         if self.path.try_exists()? {
@@ -228,6 +257,10 @@ pub(crate) enum ChildEvidenceError {
     IdentityMismatch,
     #[error("child evidence already exists and cannot be replaced")]
     AlreadyExists,
+    #[error("foreground child exited before kernel identity attestation")]
+    ProcessUnavailable,
+    #[error("foreground child is not the leader of a private process group")]
+    NotPrivateProcessGroup,
     #[error("child evidence path, owner, mode, or link count is unsafe")]
     UnsafePath,
     #[error("child evidence is empty or exceeds its fixed size")]
@@ -301,6 +334,35 @@ mod tests {
         assert_eq!(store.load().unwrap(), child);
         store.remove(&child).unwrap();
         assert!(!store.path.exists());
+    }
+
+    #[test]
+    fn live_persistence_gets_start_token_and_group_leadership_from_kernel_probe() {
+        let (_root, store) = store();
+        let observed = store
+            .persist_live_with(42, |_| Ok(KernelProcessIdentity::new(99, true)))
+            .unwrap();
+        assert_eq!(observed, child());
+        assert_eq!(store.load().unwrap(), observed);
+    }
+
+    #[test]
+    fn exited_or_nonleader_process_never_creates_evidence() {
+        for (identity, expected) in [
+            (None, ChildEvidenceError::ProcessUnavailable),
+            (
+                KernelProcessIdentity::new(99, false),
+                ChildEvidenceError::NotPrivateProcessGroup,
+            ),
+        ] {
+            let (_root, store) = store();
+            let error = store.persist_live_with(42, |_| Ok(identity)).unwrap_err();
+            assert_eq!(
+                std::mem::discriminant(&error),
+                std::mem::discriminant(&expected)
+            );
+            assert!(!store.path.exists());
+        }
     }
 
     #[test]
