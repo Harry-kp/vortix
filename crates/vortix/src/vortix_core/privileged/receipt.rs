@@ -9,7 +9,9 @@ use crate::vortix_core::privileged::operation::{
     PrivilegedOperationId, PrivilegedRequest, RequestSequence, RootAuthorityLedger,
     TrustedDaemonPrincipal,
 };
-use crate::vortix_core::privileged::resource::{ResourceKind, ResourceTag};
+use crate::vortix_core::privileged::resource::{
+    ResourceKind, ResourceObservationTarget, ResourceTag,
+};
 use crate::vortix_core::privileged::{
     has_duplicates, BoundedVec, CONTRACT_SCHEMA_VERSION, MAX_RESOURCE_ITEMS,
 };
@@ -503,8 +505,8 @@ fn validate_outcome(
                 return Err(ReceiptError::UnrelatedResource);
             }
             match operation {
-                PrivilegedOperation::Observe(resources) => {
-                    exact_observations(resources, observations)
+                PrivilegedOperation::Observe(targets) => {
+                    exact_target_observations(targets, observations)
                 }
                 PrivilegedOperation::StopTunnel(resource) => exact_observation_state(
                     std::slice::from_ref(resource),
@@ -549,6 +551,23 @@ fn exact_observations(
         && expected
             .iter()
             .all(|resource| actual.iter().any(|item| &item.resource == resource))
+    {
+        Ok(())
+    } else {
+        Err(ReceiptError::MissingRequiredResource)
+    }
+}
+
+fn exact_target_observations(
+    expected: &[ResourceObservationTarget],
+    actual: &[ResourceObservation],
+) -> Result<(), ReceiptError> {
+    if expected.len() == actual.len()
+        && expected.iter().all(|target| {
+            actual
+                .iter()
+                .any(|item| &item.resource == target.resource())
+        })
     {
         Ok(())
     } else {

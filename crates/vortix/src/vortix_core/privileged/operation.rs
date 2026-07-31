@@ -11,7 +11,9 @@ use crate::vortix_core::cidr::Cidr;
 use crate::vortix_core::control::AuthorityEpoch;
 use crate::vortix_core::privileged::protocol_plan::{DnsHostname, ProtocolPlan};
 use crate::vortix_core::privileged::receipt::{ObservationState, VerifiedReceipt};
-use crate::vortix_core::privileged::resource::{ResourceKind, ResourceTag};
+use crate::vortix_core::privileged::resource::{
+    ResourceKind, ResourceObservationTarget, ResourceTag,
+};
 use crate::vortix_core::privileged::{
     has_duplicates, invalid_unicast_ip, BoundedVec, CONTRACT_SCHEMA_VERSION, MAX_RESOURCE_ITEMS,
 };
@@ -949,7 +951,10 @@ pub enum PrivilegedOperation {
     StartTunnel(ProtocolPlan),
     StopTunnel(ResourceTag),
     NetworkPolicy(NetworkPolicyOperation),
-    Observe(#[serde(deserialize_with = "deserialize_resource_vec")] Vec<ResourceTag>),
+    Observe(
+        #[serde(deserialize_with = "deserialize_observation_target_vec")]
+        Vec<ResourceObservationTarget>,
+    ),
     CleanupOwned(#[serde(deserialize_with = "deserialize_resource_vec")] Vec<ResourceTag>),
 }
 
@@ -958,6 +963,16 @@ where
     D: serde::Deserializer<'de>,
 {
     BoundedVec::<ResourceTag, MAX_RESOURCE_ITEMS>::deserialize(deserializer)
+        .map(BoundedVec::into_vec)
+}
+
+fn deserialize_observation_target_vec<'de, D>(
+    deserializer: D,
+) -> Result<Vec<ResourceObservationTarget>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    BoundedVec::<ResourceObservationTarget, MAX_RESOURCE_ITEMS>::deserialize(deserializer)
         .map(BoundedVec::into_vec)
 }
 
@@ -985,10 +1000,11 @@ impl PrivilegedOperation {
             Self::StartTunnel(_) => Ok(()),
             Self::StopTunnel(resource) => require_profile_kind(resource, ResourceKind::Tunnel),
             Self::NetworkPolicy(operation) => operation.validate(authority),
-            Self::Observe(resources) => {
-                bounded(resources)?;
-                if has_duplicates(resources)
-                    || resources.iter().any(|resource| {
+            Self::Observe(targets) => {
+                bounded(targets)?;
+                if has_duplicates(targets.iter().map(ResourceObservationTarget::resource))
+                    || targets.iter().any(|target| {
+                        let resource = target.resource();
                         resource.authority_epoch().is_some()
                             && resource.authority_epoch() != Some(authority)
                     })
@@ -1035,9 +1051,8 @@ impl PrivilegedOperation {
                 resource == operation.policy()
                     || matches!(operation, NetworkPolicyOperation::ReleaseObsolete { resources, .. } if resources.contains(resource))
             }
-            Self::Observe(resources) | Self::CleanupOwned(resources) => {
-                resources.contains(resource)
-            }
+            Self::Observe(targets) => targets.iter().any(|target| target.resource() == resource),
+            Self::CleanupOwned(resources) => resources.contains(resource),
         }
     }
 }
@@ -1665,7 +1680,7 @@ mod tests {
     use crate::vortix_core::privileged::receipt::{
         AuthenticatedReceiptVerifier, ReceiptError, ReceiptLedger, ResourceObservation,
     };
-    use crate::vortix_core::profile::ProfileId;
+    use crate::vortix_core::profile::{ProfileId, ProtocolKind};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     fn profile(byte: char) -> ProfileId {
@@ -1831,16 +1846,22 @@ mod tests {
         )
         .unwrap();
         let mut value = serde_json::to_value(&request).unwrap();
-        assert_eq!(value["schema_version"], 1);
-        value["schema_version"] = serde_json::json!(2);
+        assert_eq!(value["schema_version"], 2);
+        value["schema_version"] = serde_json::json!(3);
         assert!(serde_json::from_value::<PrivilegedRequest>(value).is_err());
 
         let mut oversized = serde_json::to_value(&request).unwrap();
         oversized["operation"]["payload"] = serde_json::Value::Array(
             (1..=257)
                 .map(|generation| {
-                    serde_json::to_value(ResourceTag::tunnel(profile('a'), generation).unwrap())
-                        .unwrap()
+                    serde_json::to_value(
+                        ResourceObservationTarget::new(
+                            ResourceTag::tunnel(profile('a'), generation).unwrap(),
+                            Some(ProtocolKind::WireGuard),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap()
                 })
                 .collect(),
         );
@@ -1853,7 +1874,27 @@ mod tests {
     }
 
     #[test]
-    fn canonical_v1_digest_golden_and_deterministic_mutations() {
+    fn observation_targets_are_unique_by_resource_not_protocol_label() {
+        let (_root, principal) = authority();
+        let tunnel = ResourceTag::tunnel(profile('a'), 4).unwrap();
+        let targets = [ProtocolKind::WireGuard, ProtocolKind::OpenVpn]
+            .map(|protocol| ResourceObservationTarget::new(tunnel.clone(), Some(protocol)).unwrap())
+            .to_vec();
+
+        assert_eq!(
+            PrivilegedRequest::new(
+                &principal,
+                HelperEpoch::new(3).unwrap(),
+                RequestSequence::new(1).unwrap(),
+                PrivilegedOperation::Observe(targets),
+            )
+            .unwrap_err(),
+            OperationError::ResourceScopeMismatch
+        );
+    }
+
+    #[test]
+    fn canonical_v2_digest_golden_and_deterministic_mutations() {
         let service = ServiceInstanceClaim::systemd(
             75,
             7_500,
@@ -1886,8 +1927,8 @@ mod tests {
         assert_eq!(
             base.digest().as_bytes(),
             [
-                9, 100, 29, 218, 171, 147, 144, 59, 242, 215, 14, 4, 216, 87, 108, 245, 136, 86,
-                146, 75, 103, 237, 75, 65, 174, 17, 153, 12, 78, 252, 107, 32,
+                217, 226, 84, 177, 156, 128, 206, 189, 48, 238, 129, 99, 46, 7, 181, 121, 73, 143,
+                71, 69, 205, 216, 174, 31, 42, 150, 65, 77, 58, 95, 74, 249,
             ]
         );
         for mutated in [
@@ -1965,7 +2006,7 @@ mod tests {
         receipt_verifier.verify(&request, wire).unwrap();
 
         let mut unsupported = serde_json::to_value(&verified_receipt).unwrap();
-        unsupported["schema_version"] = serde_json::json!(2);
+        unsupported["schema_version"] = serde_json::json!(3);
         assert!(
             serde_json::from_value::<crate::vortix_core::privileged::receipt::UntrustedReceipt>(
                 unsupported
@@ -2005,7 +2046,11 @@ mod tests {
             &principal,
             HelperEpoch::new(3).unwrap(),
             RequestSequence::new(2).unwrap(),
-            PrivilegedOperation::Observe(vec![ResourceTag::tunnel(profile('a'), 4).unwrap()]),
+            PrivilegedOperation::Observe(vec![ResourceObservationTarget::new(
+                ResourceTag::tunnel(profile('a'), 4).unwrap(),
+                Some(ProtocolKind::WireGuard),
+            )
+            .unwrap()]),
         )
         .unwrap();
         assert_eq!(

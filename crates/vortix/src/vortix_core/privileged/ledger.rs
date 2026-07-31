@@ -7,7 +7,7 @@ use super::{
     MAX_RESOURCE_ITEMS,
 };
 
-const HELPER_LEDGER_SCHEMA_VERSION: u16 = 2;
+const HELPER_LEDGER_SCHEMA_VERSION: u16 = 3;
 
 /// Durable lifecycle phase for one exact helper-managed resource. Intent is
 /// written before an external effect; release intent is written before
@@ -211,7 +211,7 @@ mod tests {
         let replay: ReplayRecord = serde_json::from_value(serde_json::json!({
             "state": "unused",
             "record": {
-                "schema_version": 1,
+                "schema_version": crate::vortix_core::privileged::CONTRACT_SCHEMA_VERSION,
                 "authority_epoch": 3,
                 "lease_id": vec![5; 32],
                 "principal_binding": vec![7; 32],
@@ -242,7 +242,7 @@ mod tests {
         let replay: ReplayRecord = serde_json::from_value(serde_json::json!({
             "state": "unused",
             "record": {
-                "schema_version": 1,
+                "schema_version": crate::vortix_core::privileged::CONTRACT_SCHEMA_VERSION,
                 "authority_epoch": 3,
                 "lease_id": vec![5; 32],
                 "principal_binding": vec![7; 32],
