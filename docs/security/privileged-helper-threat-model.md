@@ -126,13 +126,18 @@ profile parsing, hooks, or arbitrary cleanup.
   a protocol, process-group observations require OpenVPN, and topology or
   runtime-secret observations reject one. The executor therefore never guesses
   a backend from mutable files, processes, or interface names.
-- The first production read-back slice proves Linux tunnel state only against
-  the authority-derived kernel alias and proves macOS dynamic tunnel state only
-  through a bounded fixed-path interface-name artifact. Evidence opens are
-  no-follow and accept only root-owned, single-link regular files that are not
-  group/world writable. Process-group and policy evidence remains `unknown`
-  until its OS-specific identity verifier lands; absence is never inferred from
-  an unsupported probe.
+- Tunnel read-back proves Linux state only against the authority-derived kernel
+  alias and proves macOS dynamic state only through a bounded fixed-path
+  interface-name artifact. OpenVPN process-group read-back requires a bounded
+  fixed-path child record whose tunnel resource and containment ID match the
+  authenticated lease, then revalidates the live kernel PID start token and
+  private process-group leadership through `/proc/<pid>/stat` on Linux or
+  `proc_pidinfo` on macOS. Evidence opens are no-follow and accept only
+  root-owned, single-link regular files that are not group/world writable.
+  Missing or unreadable evidence remains `unknown`; stale, relabelled, or
+  malformed evidence is `drifted`. Policy evidence remains `unknown` until its
+  OS-specific verifier lands; absence is never inferred from an unsupported
+  probe.
 - PID identity always includes a process start token and containment identity;
   a numeric PID alone is never ownership evidence.
 
