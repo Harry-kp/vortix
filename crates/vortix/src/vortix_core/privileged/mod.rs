@@ -107,8 +107,8 @@ pub use operation::{
     ServiceManager, TrustedDaemonPrincipal,
 };
 pub use protocol_plan::{
-    DnsHostname, OpenVpnAuthFactors, OpenVpnChallengeKind, OpenVpnPlan, OpenVpnRemote,
-    OpenVpnRemoteSelection, OpenVpnRoute, OpenVpnTransport, ProfileMaterialRef,
+    DnsHostname, OpenVpnAuthFactors, OpenVpnChallengeKind, OpenVpnKeyDirection, OpenVpnPlan,
+    OpenVpnRemote, OpenVpnRemoteSelection, OpenVpnRoute, OpenVpnTransport, ProfileMaterialRef,
     ProfileMaterialSlot, ProtocolEndpoint, ProtocolPlan, ProtocolPlanError,
     WireGuardInterfaceOptions, WireGuardPeerPlan, WireGuardPlan, WireGuardPresharedKeyRef,
 };
