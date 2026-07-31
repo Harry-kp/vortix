@@ -132,8 +132,11 @@ profile parsing, hooks, or arbitrary cleanup.
   fixed-path child record whose tunnel resource and containment ID match the
   authenticated lease, then revalidates the live kernel PID start token and
   private process-group leadership through `/proc/<pid>/stat` on Linux or
-  `proc_pidinfo` on macOS. Evidence opens are no-follow and accept only
-  root-owned, single-link regular files that are not group/world writable.
+  `proc_pidinfo` on macOS. Child records are installed by an atomic,
+  no-overwrite hard-link handoff beneath lease-derived `0700` directories and
+  removed only when their strict content still matches the reaped child.
+  Evidence opens are no-follow and accept only root-owned, single-link regular
+  files that are not group/world writable.
   Missing or unreadable evidence remains `unknown`; stale, relabelled, or
   malformed evidence is `drifted`. Policy evidence remains `unknown` until its
   OS-specific verifier lands; absence is never inferred from an unsupported
