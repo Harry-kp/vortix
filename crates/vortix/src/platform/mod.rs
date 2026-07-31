@@ -18,6 +18,26 @@ pub use aggregate::{
     MockNetworkStats, MockRouteTable, NetworkStatsKind, Platform, RouteTableKind,
 };
 
+#[allow(
+    dead_code,
+    reason = "the opposite family is constructed on its target OS"
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlatformFamily {
+    Linux,
+    MacOs,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) const fn current_platform_family() -> PlatformFamily {
+    PlatformFamily::Linux
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) const fn current_platform_family() -> PlatformFamily {
+    PlatformFamily::MacOs
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Process-global platform — the consumer-migration seam.
 //
