@@ -56,6 +56,14 @@ impl PlatformLayout {
     }
 
     #[must_use]
+    pub const fn helper_runtime_dir(self) -> &'static str {
+        match self {
+            Self::Linux => "/run/vortix",
+            Self::MacOs => "/var/run/vortix",
+        }
+    }
+
+    #[must_use]
     pub const fn root_ledger(self) -> &'static str {
         match self {
             Self::Linux => "/var/lib/vortix/helper-ledger.json",

@@ -6,6 +6,7 @@
 
 pub mod protocol;
 mod replay_store;
+mod runtime;
 mod server;
 pub mod validate;
 

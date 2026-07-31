@@ -355,6 +355,11 @@ impl LeaseId {
         Self(value)
     }
 
+    #[must_use]
+    pub(crate) const fn as_bytes(self) -> [u8; 32] {
+        self.0
+    }
+
     fn is_zero(self) -> bool {
         self.0 == [0; 32]
     }
