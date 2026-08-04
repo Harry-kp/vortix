@@ -21,6 +21,25 @@
 
 use std::path::Path;
 
+/// Stable identity of a file created by [`write_secret_file_tracked`].
+///
+/// Callers that own transient files retain this identity so cleanup cannot
+/// unlink a different file later installed at the same path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SecretFileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl SecretFileIdentity {
+    #[cfg(unix)]
+    pub(crate) fn matches_metadata(self, metadata: &std::fs::Metadata) -> bool {
+        use std::os::unix::fs::MetadataExt as _;
+
+        metadata.dev() == self.device && metadata.ino() == self.inode
+    }
+}
+
 /// Errors returned by [`write_secret_file`].
 #[derive(Debug, thiserror::Error)]
 pub enum SecretFileError {
@@ -56,11 +75,38 @@ pub enum SecretFileError {
 /// pre-existing targets, or any underlying syscall failure.
 #[cfg(unix)]
 pub fn write_secret_file(path: &Path, contents: &[u8]) -> Result<(), SecretFileError> {
+    write_secret_file_tracked(path, contents).map(|_| ())
+}
+
+/// Create a credential file and return the identity of the exact inode.
+///
+/// This is crate-private because only lifecycle owners need tracked cleanup;
+/// ordinary callers keep using [`write_secret_file`]. Any failure after the
+/// exclusive create removes the partial file if the directory entry still
+/// names that created inode.
+#[cfg(unix)]
+pub(crate) fn write_secret_file_tracked(
+    path: &Path,
+    contents: &[u8],
+) -> Result<SecretFileIdentity, SecretFileError> {
+    write_secret_file_tracked_with(path, contents, |file, body| {
+        use std::io::Write as _;
+
+        file.write_all(body)?;
+        file.sync_all()
+    })
+}
+
+#[cfg(unix)]
+fn write_secret_file_tracked_with(
+    path: &Path,
+    contents: &[u8],
+    persist: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
+) -> Result<SecretFileIdentity, SecretFileError> {
     use std::ffi::CString;
     use std::fs::{File, OpenOptions};
-    use std::io::Write;
     use std::os::fd::{AsRawFd, FromRawFd};
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt};
 
     let parent = path.parent().ok_or(SecretFileError::NoParent)?;
     // `path.parent()` returns `Some("")` for bare filenames like "foo.txt".
@@ -164,12 +210,79 @@ pub fn write_secret_file(path: &Path, contents: &[u8]) -> Result<(), SecretFileE
     #[allow(unsafe_code)]
     let mut file = unsafe { File::from_raw_fd(raw_fd) };
 
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            remove_created_file_if_same(&parent_fd, &c_name, &file)?;
+            return Err(SecretFileError::Io(error));
+        }
+    };
+    let identity = SecretFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    };
+
     // 5. Write the contents and fsync. Hold `parent_fd` alive until after
-    //    the write so the inode pin remains in effect throughout.
-    file.write_all(contents)?;
-    file.sync_all()?;
-    drop(file);
-    drop(parent_fd);
+    //    the write so the inode pin remains in effect throughout. If either
+    //    operation fails, remove only the directory entry that still points
+    //    at this exact open inode; a replacement is never unlinked.
+    if let Err(error) = persist(&mut file, contents) {
+        remove_created_file_if_same(&parent_fd, &c_name, &file)?;
+        return Err(SecretFileError::Io(error));
+    }
+    Ok(identity)
+}
+
+#[cfg(unix)]
+fn remove_created_file_if_same(
+    parent: &std::fs::File,
+    basename: &std::ffi::CStr,
+    created: &std::fs::File,
+) -> Result<(), SecretFileError> {
+    use std::os::fd::AsRawFd as _;
+
+    #[allow(unsafe_code)]
+    let (created_stat, current_stat) = unsafe {
+        // SAFETY: both descriptors are live and both output pointers refer to
+        // initialized stack storage. `basename` is a valid NUL-terminated
+        // name relative to the pinned parent directory descriptor.
+        let mut created_stat: libc::stat = std::mem::zeroed();
+        let mut current_stat: libc::stat = std::mem::zeroed();
+        #[allow(clippy::borrow_as_ptr)]
+        if libc::fstat(created.as_raw_fd(), &mut created_stat) != 0 {
+            return Err(SecretFileError::Io(std::io::Error::last_os_error()));
+        }
+        #[allow(clippy::borrow_as_ptr)]
+        if libc::fstatat(
+            parent.as_raw_fd(),
+            basename.as_ptr(),
+            &mut current_stat,
+            libc::AT_SYMLINK_NOFOLLOW,
+        ) != 0
+        {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return Ok(());
+            }
+            return Err(SecretFileError::Io(error));
+        }
+        (created_stat, current_stat)
+    };
+
+    if created_stat.st_dev != current_stat.st_dev || created_stat.st_ino != current_stat.st_ino {
+        return Ok(());
+    }
+
+    #[allow(unsafe_code)]
+    let result = unsafe {
+        // SAFETY: the parent descriptor and basename are the same pinned
+        // values authenticated above. The inode comparison ensures this is
+        // still the file created by this operation.
+        libc::unlinkat(parent.as_raw_fd(), basename.as_ptr(), 0)
+    };
+    if result != 0 {
+        return Err(SecretFileError::Io(std::io::Error::last_os_error()));
+    }
     Ok(())
 }
 
@@ -177,6 +290,17 @@ pub fn write_secret_file(path: &Path, contents: &[u8]) -> Result<(), SecretFileE
 /// primitive set; tracked for follow-up.
 #[cfg(not(unix))]
 pub fn write_secret_file(_path: &Path, _contents: &[u8]) -> Result<(), SecretFileError> {
+    Err(SecretFileError::Io(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "write_secret_file is not yet implemented on this platform",
+    )))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn write_secret_file_tracked(
+    _path: &Path,
+    _contents: &[u8],
+) -> Result<SecretFileIdentity, SecretFileError> {
     Err(SecretFileError::Io(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "write_secret_file is not yet implemented on this platform",
@@ -240,6 +364,38 @@ mod tests {
 
         // Original content must be preserved.
         assert_eq!(std::fs::read(&target).unwrap(), b"pre-existing");
+    }
+
+    #[test]
+    fn post_create_error_removes_the_partial_file() {
+        use std::io::Write as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("partial.auth");
+        let result = write_secret_file_tracked_with(&target, b"secret", |file, _| {
+            file.write_all(b"partial-secret")?;
+            Err(std::io::Error::other("injected persistence failure"))
+        });
+
+        assert!(matches!(result, Err(SecretFileError::Io(_))));
+        assert!(!target.exists(), "partial secret must be rolled back");
+    }
+
+    #[test]
+    fn post_create_error_preserves_a_replacement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("replaced.auth");
+        let original = tmp.path().join("original.auth");
+        let result = write_secret_file_tracked_with(&target, b"secret", |_, _| {
+            std::fs::rename(&target, &original)?;
+            std::fs::write(&target, b"replacement")?;
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))?;
+            Err(std::io::Error::other("injected persistence failure"))
+        });
+
+        assert!(matches!(result, Err(SecretFileError::Io(_))));
+        assert_eq!(std::fs::read(&target).unwrap(), b"replacement");
+        assert!(original.exists());
     }
 
     #[test]

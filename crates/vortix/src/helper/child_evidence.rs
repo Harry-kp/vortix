@@ -7,12 +7,13 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read as _, Write as _};
-use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use thiserror::Error;
 
+use crate::helper::private_fs::{create_private_directory, private_directory_is_valid};
 use crate::helper::runtime::HelperRuntimeIdentity;
 use crate::helper::validate::{PlatformLayout, HELPER_LEDGER_MODE, HELPER_RUNTIME_DIR_MODE};
 use crate::vortix_core::ports::process::KernelProcessIdentity;
@@ -177,12 +178,12 @@ impl ChildEvidenceStore {
     fn prepare_runtime_dir(&self) -> Result<(), ChildEvidenceError> {
         validate_directory(&self.runtime_root, self.expected_owner_uid)?;
         let resources = self.runtime_root.join("resources");
-        create_private_directory(&resources)?;
+        create_private_directory(&resources, HELPER_RUNTIME_DIR_MODE)?;
         validate_directory(&resources, self.expected_owner_uid)?;
         if self.runtime_dir.parent() != Some(resources.as_path()) {
             return Err(ChildEvidenceError::UnsafePath);
         }
-        create_private_directory(&self.runtime_dir)?;
+        create_private_directory(&self.runtime_dir, HELPER_RUNTIME_DIR_MODE)?;
         validate_directory(&self.runtime_dir, self.expected_owner_uid)
     }
 
@@ -209,24 +210,8 @@ impl ChildEvidenceStore {
     }
 }
 
-fn create_private_directory(path: &Path) -> std::io::Result<()> {
-    match std::fs::DirBuilder::new()
-        .mode(HELPER_RUNTIME_DIR_MODE)
-        .create(path)
-    {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
 fn validate_directory(path: &Path, expected_owner_uid: u32) -> Result<(), ChildEvidenceError> {
-    let metadata = std::fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_dir()
-        || metadata.uid() != expected_owner_uid
-        || metadata.mode() & 0o777 != HELPER_RUNTIME_DIR_MODE
-    {
+    if !private_directory_is_valid(path, expected_owner_uid, HELPER_RUNTIME_DIR_MODE)? {
         return Err(ChildEvidenceError::UnsafePath);
     }
     Ok(())

@@ -10,6 +10,7 @@
     reason = "U12 execution specs remain dormant until helper enrollment"
 )]
 
+use std::collections::BTreeMap;
 use std::fmt::{Debug, Formatter, Write as _};
 use std::path::{Component, Path, PathBuf};
 
@@ -28,31 +29,59 @@ const FIXED_VERBOSITY: &str = "3";
 const STATIC_CHALLENGE_PROMPT: &str = "Vortix second factor";
 const HELPER_RESOURCE_ROOTS: [&str; 2] = ["/run/vortix/resources", "/var/run/vortix/resources"];
 const RESOURCE_DIGEST_LEN: usize = 64;
-const MATERIAL_DIRECTIVES: [(ProfileMaterialSlot, &str, &str); 5] = [
-    (ProfileMaterialSlot::OpenVpnCaCertificate, "ca", "ca.pem"),
-    (
+const MATERIAL_DIRECTIVES: [MaterialDirective; 5] = [
+    MaterialDirective::new(ProfileMaterialSlot::OpenVpnCaCertificate, "ca", "ca.pem"),
+    MaterialDirective::new(
         ProfileMaterialSlot::OpenVpnClientCertificate,
         "cert",
         "client.crt",
     ),
-    (ProfileMaterialSlot::OpenVpnPrivateKey, "key", "client.key"),
-    (
+    MaterialDirective::new(ProfileMaterialSlot::OpenVpnPrivateKey, "key", "client.key"),
+    MaterialDirective::new(
         ProfileMaterialSlot::OpenVpnTlsAuthKey,
         "tls-auth",
         "tls-auth.key",
     ),
-    (
+    MaterialDirective::new(
         ProfileMaterialSlot::OpenVpnTlsCryptKey,
         "tls-crypt",
         "tls-crypt.key",
     ),
 ];
 
+#[derive(Clone, Copy)]
+struct MaterialDirective {
+    slot: ProfileMaterialSlot,
+    directive: &'static str,
+    filename: &'static str,
+}
+
+impl MaterialDirective {
+    const fn new(
+        slot: ProfileMaterialSlot,
+        directive: &'static str,
+        filename: &'static str,
+    ) -> Self {
+        Self {
+            slot,
+            directive,
+            filename,
+        }
+    }
+}
+
+pub(crate) fn supports_material_slot(slot: ProfileMaterialSlot) -> bool {
+    MATERIAL_DIRECTIVES
+        .iter()
+        .any(|material| material.slot == slot)
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct OpenVpnExecutionSpec {
     config_path: PathBuf,
     log_path: PathBuf,
     management_socket: PathBuf,
+    material_paths: BTreeMap<ProfileMaterialSlot, PathBuf>,
     config: String,
     arguments: Vec<String>,
 }
@@ -63,6 +92,7 @@ impl Debug for OpenVpnExecutionSpec {
             .debug_struct("OpenVpnExecutionSpec")
             .field("config_bytes", &self.config.len())
             .field("argument_count", &self.arguments.len())
+            .field("material_count", &self.material_paths.len())
             .finish_non_exhaustive()
     }
 }
@@ -78,6 +108,14 @@ impl OpenVpnExecutionSpec {
 
     pub(crate) fn management_socket(&self) -> &Path {
         &self.management_socket
+    }
+
+    pub(crate) fn material_path(&self, slot: ProfileMaterialSlot) -> Option<&Path> {
+        self.material_paths.get(&slot).map(PathBuf::as_path)
+    }
+
+    pub(crate) fn material_paths(&self) -> impl Iterator<Item = &Path> {
+        self.material_paths.values().map(PathBuf::as_path)
     }
 
     pub(crate) fn config(&self) -> &str {
@@ -99,12 +137,31 @@ pub(crate) fn render_helper_execution(
     plan: &OpenVpnPlan,
     runtime_directory: &Path,
 ) -> Result<OpenVpnExecutionSpec, OpenVpnExecutionError> {
-    validate_runtime_directory(runtime_directory)?;
+    validate_runtime_directory(runtime_directory, &HELPER_RESOURCE_ROOTS.map(Path::new))?;
+    Ok(render_validated_execution(plan, runtime_directory))
+}
 
+/// Render beneath one already-authenticated helper resource root. The caller
+/// owns verification of the root itself; this function still requires one
+/// exact lower-hex resource directory directly beneath it.
+pub(crate) fn render_helper_execution_under(
+    plan: &OpenVpnPlan,
+    runtime_directory: &Path,
+    resource_root: &Path,
+) -> Result<OpenVpnExecutionSpec, OpenVpnExecutionError> {
+    validate_runtime_directory(runtime_directory, &[resource_root])?;
+    Ok(render_validated_execution(plan, runtime_directory))
+}
+
+fn render_validated_execution(
+    plan: &OpenVpnPlan,
+    runtime_directory: &Path,
+) -> OpenVpnExecutionSpec {
     let config_path = runtime_directory.join(CONFIG_FILE);
     let log_path = runtime_directory.join(LOG_FILE);
     let management_socket = runtime_directory.join(MANAGEMENT_SOCKET);
     let secret_directory = runtime_directory.join(SECRET_DIRECTORY);
+    let mut material_paths = BTreeMap::new();
     let mut config = String::from(
         "client\n\
          dev tun\n\
@@ -140,14 +197,13 @@ pub(crate) fn render_helper_execution(
         config.push_str("remote-random\n");
     }
 
-    for (slot, directive, filename) in MATERIAL_DIRECTIVES {
-        append_material_directive(
-            &mut config,
-            plan,
-            slot,
-            directive,
-            &secret_directory.join(filename),
-        );
+    for material in MATERIAL_DIRECTIVES {
+        if !plan.materials().contains(&material.slot) {
+            continue;
+        }
+        let path = secret_directory.join(material.filename);
+        append_material_directive(&mut config, material, &path, plan.tls_auth_direction());
+        material_paths.insert(material.slot, path);
     }
 
     let authentication = plan.authentication();
@@ -173,41 +229,44 @@ pub(crate) fn render_helper_execution(
         "--management-query-passwords".to_owned(),
     ];
 
-    Ok(OpenVpnExecutionSpec {
+    OpenVpnExecutionSpec {
         config_path,
         log_path,
         management_socket,
+        material_paths,
         config,
         arguments,
-    })
+    }
 }
 
 fn append_material_directive(
     config: &mut String,
-    plan: &OpenVpnPlan,
-    slot: ProfileMaterialSlot,
-    directive: &str,
+    material: MaterialDirective,
     path: &Path,
+    tls_auth_direction: Option<crate::vortix_core::privileged::OpenVpnKeyDirection>,
 ) {
-    if plan.materials().contains(&slot) {
-        if slot == ProfileMaterialSlot::OpenVpnTlsAuthKey {
-            if let Some(direction) = plan.tls_auth_direction() {
-                writeln!(
-                    config,
-                    "{directive} {} {}",
-                    path_text(path),
-                    direction.as_openvpn_value()
-                )
-                .expect("writing to String cannot fail");
-                return;
-            }
+    if material.slot == ProfileMaterialSlot::OpenVpnTlsAuthKey {
+        if let Some(direction) = tls_auth_direction {
+            writeln!(
+                config,
+                "{} {} {}",
+                material.directive,
+                path_text(path),
+                direction.as_openvpn_value()
+            )
+            .expect("writing to String cannot fail");
+            return;
         }
-        writeln!(config, "{directive} {}", path_text(path)).expect("writing to String cannot fail");
     }
+    writeln!(config, "{} {}", material.directive, path_text(path))
+        .expect("writing to String cannot fail");
 }
 
-fn validate_runtime_directory(path: &Path) -> Result<(), OpenVpnExecutionError> {
-    for root in HELPER_RESOURCE_ROOTS.map(Path::new) {
+fn validate_runtime_directory(
+    path: &Path,
+    resource_roots: &[&Path],
+) -> Result<(), OpenVpnExecutionError> {
+    for root in resource_roots {
         let Ok(relative) = path.strip_prefix(root) else {
             continue;
         };
