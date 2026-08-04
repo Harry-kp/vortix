@@ -6,7 +6,9 @@
 //! enrollment.
 
 mod child_evidence;
+mod material;
 mod observe;
+mod private_fs;
 pub mod protocol;
 mod replay_store;
 mod runtime;

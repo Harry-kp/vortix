@@ -121,6 +121,17 @@ profile parsing, hooks, or arbitrary cleanup.
   path or interface name participates. Same-lease helper restarts therefore
   scan the same artifacts, while a new authority lease cannot silently adopt
   stale physical state.
+- OpenVPN certificate/key material crosses the dormant helper seam only as an
+  inherited, non-serializable regular-file descriptor set keyed by the plan's
+  fixed slots. The helper binds the plan to the runtime profile/generation,
+  requires an exact slot match, rewinds and length-checks each descriptor,
+  bounds it to 1 MiB, zeroizes its read buffer, and creates the minimal
+  configuration plus material files at `0600` inside lease-derived root-owned
+  `0700` directories using exclusive no-follow writes. Partial staging rolls
+  back through an owning guard; terminal cleanup authenticates the created
+  device/inode and leaves shared lifecycle directories or replaced artifacts
+  untouched rather than recursively deleting them. No profile path or material
+  byte enters the helper request, debug output, or error text.
 - Privileged contract schema v2 binds each observation target to its validated
   protocol when OS evidence is protocol-specific. Tunnel observations require
   a protocol, process-group observations require OpenVPN, and topology or

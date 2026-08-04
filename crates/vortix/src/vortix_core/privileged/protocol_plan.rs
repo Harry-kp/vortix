@@ -675,6 +675,16 @@ impl OpenVpnPlan {
     }
 
     #[must_use]
+    pub fn profile_id(&self) -> &ProfileId {
+        &self.profile_id
+    }
+
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    #[must_use]
     pub fn remotes(&self) -> &[OpenVpnRemote] {
         &self.remotes
     }
