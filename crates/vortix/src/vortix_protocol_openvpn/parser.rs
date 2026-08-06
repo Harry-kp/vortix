@@ -143,11 +143,12 @@ pub fn parse_ovpn_conf(text: &str) -> Result<OvpnParsedProfile, ParseError> {
             continue;
         }
 
+        reject_privileged_directive(line)?;
+
         let mut tokens = line.split_whitespace();
         let Some(directive) = tokens.next() else {
             continue;
         };
-        reject_privileged_directive(directive.trim_start_matches('-'))?;
 
         match directive {
             "remote" => {
@@ -202,7 +203,7 @@ pub fn parse_ovpn_conf(text: &str) -> Result<OvpnParsedProfile, ParseError> {
     Ok(profile)
 }
 
-pub(super) fn is_forbidden_privileged_directive(directive: &str) -> bool {
+fn is_forbidden_privileged_directive(directive: &str) -> bool {
     const FORBIDDEN: &[&str] = &[
         "daemon",
         "config",
@@ -230,11 +231,73 @@ pub(super) fn is_forbidden_privileged_directive(directive: &str) -> bool {
         .any(|forbidden| directive.eq_ignore_ascii_case(forbidden))
 }
 
-fn reject_privileged_directive(directive: &str) -> Result<(), ParseError> {
-    if is_forbidden_privileged_directive(directive) {
+/// Return the privileged directive that `OpenVPN` would effectively parse.
+///
+/// `OpenVPN` dequotes option tokens before dispatch and treats `setenv opt X`
+/// as though `X` were the directive. Inspecting only the first whitespace
+/// token therefore leaves privileged aliases such as `"up"` and
+/// `setenv opt plugin` unchecked.
+pub(super) fn forbidden_effective_directive(line: &str) -> Option<String> {
+    let tokens = openvpn_option_tokens(line, 3)?;
+    let effective = match tokens.as_slice() {
+        [setenv, opt, directive]
+            if setenv.eq_ignore_ascii_case("setenv") && opt.eq_ignore_ascii_case("opt") =>
+        {
+            directive
+        }
+        [directive, ..] => directive,
+        [] => return None,
+    };
+    let directive = effective.trim_start_matches('-');
+    is_forbidden_privileged_directive(directive).then(|| directive.to_ascii_lowercase())
+}
+
+/// Tokenize the security-relevant prefix using `OpenVPN`'s config-file quoting
+/// rules. `None` means `OpenVPN` would reject the malformed line itself.
+fn openvpn_option_tokens(line: &str, limit: usize) -> Option<Vec<String>> {
+    let mut chars = line.chars().peekable();
+    let mut tokens = Vec::with_capacity(limit);
+
+    while tokens.len() < limit {
+        while chars.next_if(|ch| ch.is_whitespace()).is_some() {}
+        if chars.peek().is_none_or(|ch| matches!(ch, '#' | ';')) {
+            break;
+        }
+
+        let quote = chars.next_if(|ch| matches!(ch, '\'' | '"'));
+        let mut token = String::new();
+        let mut closed = quote.is_none();
+        while let Some(ch) = chars.next() {
+            if quote == Some('\'') {
+                if ch == '\'' {
+                    closed = true;
+                    break;
+                }
+                token.push(ch);
+            } else if ch == '"' && quote == Some('"') {
+                closed = true;
+                break;
+            } else if ch == '\\' {
+                token.push(chars.next()?);
+            } else if quote.is_none() && ch.is_whitespace() {
+                break;
+            } else {
+                token.push(ch);
+            }
+        }
+        if !closed {
+            return None;
+        }
+        tokens.push(token);
+    }
+
+    Some(tokens)
+}
+
+fn reject_privileged_directive(line: &str) -> Result<(), ParseError> {
+    if let Some(directive) = forbidden_effective_directive(line) {
         return Err(ParseError::Unsupported(format!(
-            "OpenVPN `{}` privileged directive is not allowed: Vortix never runs profile commands as root or loads profile-selected crypto providers; migrate lifecycle automation to a global hook using an absolute executable plus argv",
-            directive.to_ascii_lowercase()
+            "OpenVPN `{directive}` privileged directive is not allowed: Vortix never runs profile commands as root or loads profile-selected crypto providers; migrate lifecycle automation to a global hook using an absolute executable plus argv"
         )));
     }
     Ok(())
@@ -373,6 +436,24 @@ mod tests {
                 "unexpected error for {directive}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn effective_privileged_aliases_fail_unprivileged_parsing() {
+        for directive in [
+            "setenv opt plugin malicious.so",
+            "SeTeNv OpT providers legacy default",
+            "setenv opt --config nested.ovpn",
+            "\"up\" ./up.sh",
+        ] {
+            let error = parse_ovpn_conf(&format!("client\n{directive}\n"))
+                .expect_err("effective privileged aliases must be rejected")
+                .to_string();
+            assert!(error.contains("not allowed"), "unexpected error: {error}");
+        }
+
+        parse_ovpn_conf("client\nsetenv opt block-outside-dns\n")
+            .expect("safe forward-compatibility directives must remain supported");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use vortix::vortix_core::control::model::{AuthorityEpoch, OperationId, PolicyDigest};
@@ -929,6 +929,306 @@ async fn kill_switch_change_preserves_settled_tunnel_revision() {
         tunnel_calls_before,
         "policy-only changes must not mutate settled tunnels"
     );
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // One end-to-end stale-revision retry and convergence assertion.
+async fn later_policy_command_drives_retry_for_older_tunnel_revision() {
+    #[derive(Default)]
+    struct FailFirstCapture {
+        calls: Mutex<Vec<(ProfileId, OperationId, TunnelRevision)>>,
+        policies: Mutex<Vec<TopologyPolicy>>,
+    }
+    impl TunnelExecutor for FailFirstCapture {
+        fn execute(
+            &self,
+            work: &TunnelWork,
+            _: &CancellationToken,
+        ) -> Result<TunnelExecutionReceipt, String> {
+            let mut calls = self.calls.lock().unwrap();
+            calls.push((
+                work.profile_id.clone(),
+                work.operation_id.clone(),
+                work.revision,
+            ));
+            if calls.len() == 1 {
+                Err("first attempt failed".into())
+            } else {
+                Ok(execution_receipt(work))
+            }
+        }
+    }
+    impl PolicyExecutor for FailFirstCapture {
+        fn apply(&self, policy: &TopologyPolicy, barrier: PolicyBarrier) -> Result<(), String> {
+            if barrier == PolicyBarrier::Blocking {
+                self.policies.lock().unwrap().push(policy.clone());
+            }
+            Ok(())
+        }
+
+        fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) {}
+    }
+
+    let target = profile("retry-after-policy");
+    let capture = Arc::new(FailFirstCapture::default());
+    let supervisor = Arc::new(Supervisor::new(
+        AuthorityEpoch(1),
+        capture.clone(),
+        capture.clone(),
+        2,
+        4,
+    ));
+    let service = ControlService::start_supervised(
+        ControlServiceConfig {
+            authority_epoch: AuthorityEpoch(1),
+            known_profiles: BTreeSet::from([target.clone()]),
+            freshness_poll_interval: Duration::from_millis(5),
+            ..ControlServiceConfig::default()
+        },
+        Arc::new(TestClock::default()),
+        ExecutionSelection::CanonicalAuthority,
+        supervisor.clone(),
+    );
+    let connect = service
+        .client()
+        .submit(CommandRequest {
+            command: UserCommand::Connect {
+                profile_id: target.clone(),
+            },
+            idempotency_key: IdempotencyKey::new("retry-connect"),
+            deadline: Deadline(1_000),
+        })
+        .await
+        .unwrap();
+    wait_for_condition(
+        || {
+            supervisor
+                .profile_truth(&target)
+                .is_some_and(|entry| matches!(entry.truth, SupervisedTruth::Degraded(_)))
+        },
+        "failed tunnel attempt was not recorded",
+    )
+    .await;
+
+    let policy = service
+        .client()
+        .submit(CommandRequest {
+            command: UserCommand::SetKillSwitch {
+                mode: vortix::vortix_core::state::killswitch::KillSwitchMode::Auto,
+            },
+            idempotency_key: IdempotencyKey::new("retry-policy"),
+            deadline: Deadline(1_000),
+        })
+        .await
+        .unwrap();
+    wait_for_condition(
+        || capture.calls.lock().unwrap().len() >= 2,
+        "current policy operation did not drive the stale tunnel retry",
+    )
+    .await;
+    let calls = capture.calls.lock().unwrap().clone();
+    assert_eq!(calls[1].1, policy.operation_id);
+    assert_eq!(calls[1].2.generation, 1);
+    drop(calls);
+
+    observe_connected(&service, &target, "tun-retry-after-policy").await;
+    wait_for_condition(
+        || {
+            let snapshot = service.client().snapshot();
+            snapshot.operations[&connect.operation_id].status == OperationStatus::Succeeded
+                && snapshot.operations[&policy.operation_id].status == OperationStatus::Succeeded
+        },
+        "fresh policy evidence did not complete compatible operations",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn disjoint_connect_operations_complete_from_shared_current_evidence() {
+    let first = profile("pending-first");
+    let second = profile("pending-second");
+    let (service, _, capture) = topology_service(BTreeSet::from([first.clone(), second.clone()]));
+    let first_operation = service
+        .client()
+        .submit(CommandRequest {
+            command: UserCommand::Connect {
+                profile_id: first.clone(),
+            },
+            idempotency_key: IdempotencyKey::new("pending-first"),
+            deadline: Deadline(1_000),
+        })
+        .await
+        .unwrap();
+    let second_operation = service
+        .client()
+        .submit(CommandRequest {
+            command: UserCommand::Connect {
+                profile_id: second.clone(),
+            },
+            idempotency_key: IdempotencyKey::new("pending-second"),
+            deadline: Deadline(1_000),
+        })
+        .await
+        .unwrap();
+    wait_for_condition(
+        || capture.tunnel_calls.lock().unwrap().len() == 2,
+        "both disjoint tunnel effects were not dispatched",
+    )
+    .await;
+
+    observe_connected(&service, &first, "tun-pending-first").await;
+    observe_connected(&service, &second, "tun-pending-second").await;
+    wait_for_condition(
+        || {
+            let snapshot = service.client().snapshot();
+            snapshot.operations[&first_operation.operation_id].status == OperationStatus::Succeeded
+                && snapshot.operations[&second_operation.operation_id].status
+                    == OperationStatus::Succeeded
+        },
+        "shared current policy evidence did not complete both connects",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // One held-policy race proves superseded intent is cancelled.
+async fn opposite_profile_intent_cancels_older_pending_operation() {
+    #[derive(Default)]
+    struct HeldFirstPolicy {
+        entered: Mutex<bool>,
+        release: (Mutex<bool>, Condvar),
+    }
+    impl PolicyExecutor for HeldFirstPolicy {
+        fn apply(&self, policy: &TopologyPolicy, barrier: PolicyBarrier) -> Result<(), String> {
+            if barrier == PolicyBarrier::Blocking && policy.generation == 1 {
+                *self.entered.lock().unwrap() = true;
+                let (released, wake) = &self.release;
+                let mut released = released.lock().unwrap();
+                while !*released {
+                    released = wake.wait(released).unwrap();
+                }
+            }
+            Ok(())
+        }
+
+        fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) {}
+    }
+
+    let target = profile("opposite-intent");
+    let policy = Arc::new(HeldFirstPolicy::default());
+    let capture = Arc::new(TopologyCapture::default());
+    let supervisor = Arc::new(Supervisor::new(
+        AuthorityEpoch(1),
+        capture.clone(),
+        policy.clone(),
+        2,
+        4,
+    ));
+    let service = ControlService::start_supervised(
+        ControlServiceConfig {
+            authority_epoch: AuthorityEpoch(1),
+            known_profiles: BTreeSet::from([target.clone()]),
+            freshness_poll_interval: Duration::from_millis(5),
+            ..ControlServiceConfig::default()
+        },
+        Arc::new(TestClock::default()),
+        ExecutionSelection::CanonicalAuthority,
+        supervisor.clone(),
+    );
+    let connect = service
+        .client()
+        .submit(CommandRequest {
+            command: UserCommand::Connect {
+                profile_id: target.clone(),
+            },
+            idempotency_key: IdempotencyKey::new("opposite-connect"),
+            deadline: Deadline(1_000),
+        })
+        .await
+        .unwrap();
+    wait_for_condition(
+        || !capture.tunnel_calls.lock().unwrap().is_empty(),
+        "connect was not dispatched",
+    )
+    .await;
+    observe_connected(&service, &target, "tun-opposite-intent").await;
+    wait_for_condition(
+        || *policy.entered.lock().unwrap(),
+        "first-generation policy did not enter the held worker",
+    )
+    .await;
+
+    let disconnect = service
+        .client()
+        .submit(CommandRequest {
+            command: UserCommand::Disconnect {
+                profile_id: Some(target.clone()),
+            },
+            idempotency_key: IdempotencyKey::new("opposite-disconnect"),
+            deadline: Deadline(1_000),
+        })
+        .await
+        .unwrap();
+    wait_for_condition(
+        || {
+            capture
+                .tunnel_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(profile_id, mutation, _)| {
+                    profile_id == &target && *mutation == TunnelMutation::Disconnect
+                })
+        },
+        "opposite disconnect was not dispatched",
+    )
+    .await;
+    {
+        let (released, wake) = &policy.release;
+        *released.lock().unwrap() = true;
+        wake.notify_all();
+    }
+    wait_for_condition(
+        || {
+            supervisor.profile_truth(&target).is_some_and(|entry| {
+                entry.mutation == TunnelMutation::Disconnect
+                    && entry.truth == SupervisedTruth::WaitingForObservation
+            })
+        },
+        "disconnect did not reach its observation barrier",
+    )
+    .await;
+    let desired = service.client().snapshot().desired;
+    service
+        .observer()
+        .observe(Observation::Tunnel {
+            profile_id: target,
+            active: false,
+            interface_name: None,
+            observed_at_millis: 0,
+            protection: Some(ProtectionEvidence {
+                desired_generation: desired.generation,
+                authority_epoch: desired.authority_epoch,
+                policy_digest: desired.policy_digest,
+                observed_at_millis: 0,
+                interface: GateEvidence::Verified,
+                route: GateEvidence::Verified,
+                dns: GateEvidence::Verified,
+                firewall: GateEvidence::Verified,
+            }),
+        })
+        .await
+        .unwrap();
+    wait_for_condition(
+        || {
+            let snapshot = service.client().snapshot();
+            snapshot.operations[&connect.operation_id].status == OperationStatus::Cancelled
+                && snapshot.operations[&disconnect.operation_id].status
+                    == OperationStatus::Succeeded
+        },
+        "opposite intent did not cancel the superseded operation",
+    )
+    .await;
 }
 
 #[tokio::test]

@@ -345,8 +345,68 @@ pub struct OperationRecord {
     pub desired_generation: u64,
     pub admitted_at_millis: u64,
     pub deadline_millis: u64,
+    /// The bounded subset of desired state this operation requested. Older
+    /// persisted records deserialize as generation-scoped so they can never
+    /// be falsely completed by evidence for a later desired generation.
+    #[serde(default)]
+    pub intent: OperationIntent,
     pub status: OperationStatus,
     pub result: Option<OperationResult>,
+}
+
+/// Durable completion scope for an admitted operation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum OperationIntent {
+    /// Backward-compatible scope for records written before intent was
+    /// persisted. Only evidence for the record's own generation may satisfy
+    /// it.
+    #[default]
+    GenerationScoped,
+    /// The command-owned subset of desired state. Unmentioned profiles and
+    /// policy fields may change without superseding this operation.
+    DesiredSubset {
+        #[serde(default)]
+        tunnels: BTreeMap<ProfileId, RequestedTunnelState>,
+        #[serde(default, with = "serde_optional_killswitch_slug")]
+        kill_switch: Option<KillSwitchMode>,
+    },
+}
+
+mod serde_optional_killswitch_slug {
+    use serde::{de::Error as _, Deserialize, Deserializer, Serializer};
+
+    use crate::vortix_core::state::killswitch::KillSwitchMode;
+
+    #[allow(
+        clippy::ref_option,
+        clippy::trivially_copy_pass_by_ref,
+        reason = "serde adapters receive a shared reference to the annotated field"
+    )]
+    pub fn serialize<S>(mode: &Option<KillSwitchMode>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match mode {
+            Some(mode) => serializer.serialize_some(mode.cli_verb()),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<KillSwitchMode>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<String>::deserialize(deserializer)?
+            .map(|slug| {
+                KillSwitchMode::from_cli_verb(&slug).ok_or_else(|| {
+                    D::Error::custom(format_args!(
+                        "invalid kill-switch mode `{slug}`; use off, block-on-drop, vpn-only"
+                    ))
+                })
+            })
+            .transpose()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
