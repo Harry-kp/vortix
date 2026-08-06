@@ -1201,10 +1201,7 @@ async fn reconnect_all_targets_only_currently_managed_profiles() {
         client.snapshot().desired.tunnels.get(&disconnected),
         Some(&RequestedTunnelState::Disconnected)
     );
-    let reconnect_revision = TunnelRevision {
-        authority_epoch: AuthorityEpoch(1),
-        generation: client.snapshot().desired.generation,
-    };
+    let reconnect_revision = tunnel_revision(client.snapshot().desired.generation);
     wait_for_condition(
         || {
             executor.0.lock().unwrap()[executions_before..].iter().any(

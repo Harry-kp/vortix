@@ -154,7 +154,7 @@ impl Drop for DaemonServer {
 }
 
 struct Outbound {
-    response: IpcResponse,
+    frame: Arc<[u8]>,
     written: oneshot::Sender<Result<(), String>>,
 }
 
@@ -162,26 +162,18 @@ type RequestDigest = [u8; REQUEST_DIGEST_BYTES];
 
 struct ReplayEntry {
     request_digest: RequestDigest,
-    response_json: Box<[u8]>,
+    response_frame: Arc<[u8]>,
 }
 
+#[derive(Default)]
 struct ReplayCache<const RESPONSE_BYTE_LIMIT: usize> {
     entries: BTreeMap<u64, ReplayEntry>,
     response_bytes: usize,
 }
 
-impl<const RESPONSE_BYTE_LIMIT: usize> Default for ReplayCache<RESPONSE_BYTE_LIMIT> {
-    fn default() -> Self {
-        Self {
-            entries: BTreeMap::new(),
-            response_bytes: 0,
-        }
-    }
-}
-
 enum ReplayLookup {
     Miss,
-    Replay(IpcResponse),
+    Replay(Arc<[u8]>),
     Conflict,
 }
 
@@ -190,44 +182,39 @@ impl<const RESPONSE_BYTE_LIMIT: usize> ReplayCache<RESPONSE_BYTE_LIMIT> {
         self.entries.len()
     }
 
-    fn lookup(
-        &self,
-        request_id: u64,
-        request_digest: &RequestDigest,
-    ) -> Result<ReplayLookup, FrameError> {
+    fn lookup(&self, request_id: u64, request_digest: &RequestDigest) -> ReplayLookup {
         let Some(entry) = self.entries.get(&request_id) else {
-            return Ok(ReplayLookup::Miss);
+            return ReplayLookup::Miss;
         };
         if &entry.request_digest != request_digest {
-            return Ok(ReplayLookup::Conflict);
+            return ReplayLookup::Conflict;
         }
-        let response = serde_json::from_slice(&entry.response_json)?;
-        Ok(ReplayLookup::Replay(response))
+        ReplayLookup::Replay(Arc::clone(&entry.response_frame))
     }
 
     fn insert(
         &mut self,
         request_id: u64,
         request_digest: RequestDigest,
-        response: &IpcResponse,
-    ) -> Result<bool, FrameError> {
+        response_frame: Arc<[u8]>,
+    ) -> bool {
         debug_assert!(!self.entries.contains_key(&request_id));
-        let response_json = serde_json::to_vec(response)?;
-        let Some(next_bytes) = self.response_bytes.checked_add(response_json.len()) else {
-            return Ok(false);
+        let response_bytes = response_frame.len().saturating_sub(size_of::<u32>());
+        let Some(next_bytes) = self.response_bytes.checked_add(response_bytes) else {
+            return false;
         };
         if next_bytes > RESPONSE_BYTE_LIMIT {
-            return Ok(false);
+            return false;
         }
         self.entries.insert(
             request_id,
             ReplayEntry {
                 request_digest,
-                response_json: response_json.into_boxed_slice(),
+                response_frame,
             },
         );
         self.response_bytes = next_bytes;
-        Ok(true)
+        true
     }
 
     #[cfg(test)]
@@ -247,15 +234,20 @@ async fn respond_to_replay<const RESPONSE_BYTE_LIMIT: usize>(
     request_id: u64,
     digest: &RequestDigest,
 ) -> Result<bool, DaemonError> {
-    let response = match requests.lookup(request_id, digest)? {
+    match requests.lookup(request_id, digest) {
         ReplayLookup::Miss => return Ok(false),
-        ReplayLookup::Replay(response) => response,
-        ReplayLookup::Conflict => IpcResponse {
-            id: request_id,
-            result: Err(IpcError::DuplicateRequestId),
-        },
-    };
-    send_response(output, response).await?;
+        ReplayLookup::Replay(frame) => send_frame(output, frame).await?,
+        ReplayLookup::Conflict => {
+            send_response(
+                output,
+                IpcResponse {
+                    id: request_id,
+                    result: Err(IpcError::DuplicateRequestId),
+                },
+            )
+            .await?;
+        }
+    }
     Ok(true)
 }
 
@@ -366,8 +358,9 @@ async fn connection_loop<R: AsyncRead + Unpin>(
         };
         // Subscription connections become read-only immediately, so no later
         // request can replay this acknowledgement and it need not be retained.
-        let retained = subscribe || requests.insert(request.id, digest, &response)?;
-        send_response(output, response).await?;
+        let frame = response_frame(&response)?;
+        let retained = subscribe || requests.insert(request.id, digest, Arc::clone(&frame));
+        send_frame(output, frame).await?;
         if let Some(receiver) = subscription.as_mut() {
             stream_snapshots(
                 reader,
@@ -475,7 +468,7 @@ async fn wait_for_shutdown(receiver: &mut watch::Receiver<bool>) {
 
 async fn writer_loop<W: AsyncWrite + Unpin>(mut writer: W, mut output: mpsc::Receiver<Outbound>) {
     while let Some(outbound) = output.recv().await {
-        let result = write_response_direct(&mut writer, outbound.response)
+        let result = write_frame_direct(&mut writer, &outbound.frame)
             .await
             .map_err(|error| error.to_string());
         let failed = result.is_err();
@@ -491,9 +484,13 @@ async fn send_response(
     output: &mpsc::Sender<Outbound>,
     response: IpcResponse,
 ) -> Result<(), DaemonError> {
+    send_frame(output, response_frame(&response)?).await
+}
+
+async fn send_frame(output: &mpsc::Sender<Outbound>, frame: Arc<[u8]>) -> Result<(), DaemonError> {
     let (written, completion) = oneshot::channel();
     output
-        .send(Outbound { response, written })
+        .send(Outbound { frame, written })
         .await
         .map_err(|_| DaemonError::Protocol("connection writer stopped".into()))?;
     tokio::time::timeout(WRITE_TIMEOUT, completion)
@@ -507,8 +504,18 @@ async fn write_response_direct<W: AsyncWrite + Unpin>(
     writer: &mut W,
     response: IpcResponse,
 ) -> Result<(), DaemonError> {
-    let frame = crate::vortix_core::ipc::encode_frame(&response)?;
-    tokio::time::timeout(WRITE_TIMEOUT, writer.write_all(&frame))
+    write_frame_direct(writer, &response_frame(&response)?).await
+}
+
+fn response_frame(response: &IpcResponse) -> Result<Arc<[u8]>, FrameError> {
+    crate::vortix_core::ipc::encode_frame(response).map(Arc::from)
+}
+
+async fn write_frame_direct<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    frame: &[u8],
+) -> Result<(), DaemonError> {
+    tokio::time::timeout(WRITE_TIMEOUT, writer.write_all(frame))
         .await
         .map_err(|_| DaemonError::Timeout("response write"))??;
     Ok(())
@@ -794,7 +801,7 @@ mod tests {
             id: 7,
             result: Err(IpcError::Internal("small".into())),
         };
-        assert!(cache.insert(7, digest, &retained).unwrap());
+        assert!(cache.insert(7, digest, response_frame(&retained).unwrap()));
         let retained_bytes = cache.retained_response_bytes();
         assert!(retained_bytes > 0);
         assert!(retained_bytes <= 256);
@@ -804,7 +811,7 @@ mod tests {
             result: Err(IpcError::Internal("x".repeat(256))),
         };
         let oversized_digest = request_digest(&IpcOp::Shutdown).unwrap();
-        assert!(!cache.insert(8, oversized_digest, &oversized).unwrap());
+        assert!(!cache.insert(8, oversized_digest, response_frame(&oversized).unwrap()));
         assert_eq!(cache.retained_response_bytes(), retained_bytes);
         assert_eq!(cache.len(), 1);
     }
@@ -817,23 +824,21 @@ mod tests {
             id: 41,
             result: Err(IpcError::Internal("stable replay".into())),
         };
-        assert!(cache.insert(41, snapshot_digest, &response).unwrap());
+        let response_frame = response_frame(&response).unwrap();
+        assert!(cache.insert(41, snapshot_digest, Arc::clone(&response_frame)));
 
-        let ReplayLookup::Replay(replayed) = cache.lookup(41, &snapshot_digest).unwrap() else {
+        let ReplayLookup::Replay(replayed) = cache.lookup(41, &snapshot_digest) else {
             panic!("same id and operation must replay the retained response");
         };
-        assert_eq!(
-            serde_json::to_value(replayed).unwrap(),
-            serde_json::to_value(response).unwrap()
-        );
+        assert_eq!(replayed.as_ref(), response_frame.as_ref());
 
         let shutdown_digest = request_digest(&IpcOp::Shutdown).unwrap();
         assert!(matches!(
-            cache.lookup(41, &shutdown_digest).unwrap(),
+            cache.lookup(41, &shutdown_digest),
             ReplayLookup::Conflict
         ));
         assert!(matches!(
-            cache.lookup(42, &shutdown_digest).unwrap(),
+            cache.lookup(42, &shutdown_digest),
             ReplayLookup::Miss
         ));
     }

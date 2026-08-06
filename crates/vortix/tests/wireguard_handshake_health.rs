@@ -201,15 +201,10 @@ impl TunnelExecutor for HandshakeReceipt {
         work: &TunnelWork,
         _: &CancellationToken,
     ) -> Result<TunnelExecutionReceipt, String> {
-        let generation = if self.generation_offset.is_negative() {
-            work.revision
-                .generation
-                .saturating_sub(self.generation_offset.unsigned_abs())
-        } else {
-            work.revision
-                .generation
-                .saturating_add(self.generation_offset.unsigned_abs())
-        };
+        let generation = work
+            .revision
+            .generation
+            .saturating_add_signed(self.generation_offset);
         TunnelExecutionReceipt::wireguard(
             work.profile_id.clone(),
             "wg0",
