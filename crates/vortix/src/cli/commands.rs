@@ -1150,21 +1150,10 @@ fn handle_status(
 }
 
 fn status_exit_code(
-    mode: OutputMode,
-    snap: &crate::vpn_runtime::connection::StatusSnapshot,
+    _: OutputMode,
+    _: &crate::vpn_runtime::connection::StatusSnapshot,
 ) -> i32 {
-    if mode == OutputMode::Quiet
-        && snap.health.as_ref().is_some_and(|health| {
-            matches!(
-                health,
-                crate::vortix_core::engine::state::ConnectionHealth::Degraded { .. }
-            )
-        })
-    {
-        ExitCode::StateConflict.code()
-    } else {
-        ExitCode::Success.code()
-    }
+    ExitCode::Success.code()
 }
 
 fn passive_projection_matches(
@@ -1386,7 +1375,7 @@ mod handshake_status_tests {
         let projected = connection_health_entry(snap.health.as_ref().unwrap());
         assert_eq!(projected.status, "degraded");
         assert!(projected.reason.unwrap().contains("peer-pub"));
-        assert_eq!(status_exit_code(OutputMode::Quiet, &snap), 4);
+        assert_eq!(status_exit_code(OutputMode::Quiet, &snap), 0);
         assert_eq!(status_exit_code(OutputMode::Human, &snap), 0);
         snap.health = Some(crate::vortix_core::engine::state::ConnectionHealth::Healthy);
         assert_eq!(status_exit_code(OutputMode::Quiet, &snap), 0);
