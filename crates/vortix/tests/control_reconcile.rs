@@ -12,7 +12,8 @@ use vortix::vortix_core::control::supervisor::{PolicyVerification, SupervisedTru
 use vortix::vortix_core::control::worker::{
     wait_until, CancellationToken, ControlRevision, PolicyBarrier, PolicyExecutor, PolicyOutcome,
     PolicyWorker, ProfileWorkerPool, TopologyPolicy, TopologyState, TopologyTransitionKind,
-    TunnelExecutionReceipt, TunnelExecutor, TunnelMutation, TunnelWork, WorkFailure,
+    TunnelExecutionReceipt, TunnelExecutor, TunnelMutation, TunnelRevision, TunnelWork,
+    WorkFailure,
 };
 use vortix::vortix_core::control::{
     Clock, CommandRequest, ControlEvent, ControlService, ControlServiceConfig, Deadline,
@@ -35,6 +36,12 @@ fn revision(generation: u64, digest: &str) -> ControlRevision {
         digest: PolicyDigest(digest.into()),
     }
 }
+fn tunnel_revision(generation: u64) -> TunnelRevision {
+    TunnelRevision {
+        authority_epoch: AuthorityEpoch(1),
+        generation,
+    }
+}
 fn work(
     profile_id: ProfileId,
     generation: u64,
@@ -44,9 +51,7 @@ fn work(
     TunnelWork {
         profile_id,
         operation_id: operation(operation_value),
-        generation,
-        authority_epoch: AuthorityEpoch(1),
-        policy_digest: PolicyDigest(format!("digest-{generation}")),
+        revision: tunnel_revision(generation),
         mutation,
         protocol: TunnelKindTag::Mock,
         deadline: Instant::now() + Duration::from_secs(2),
@@ -92,7 +97,7 @@ fn restart_restores_only_disconnect_tombstone_fences() {
         .unwrap();
 
     let restored = supervisor.tombstones().remove(&target).unwrap();
-    assert_eq!(restored.generation, 4);
+    assert_eq!(restored.revision.generation, 4);
     assert!(restored.adoption.is_none());
     assert!(restored.handshake.is_none());
     assert!(restored.probe_receipts.is_empty());
@@ -224,7 +229,7 @@ fn cooperative_effect_is_cancelled_and_joined_without_abandoning_a_thread() {
 fn observation(
     evidence: ScanEvidence,
     ownership: ObservationOwnership,
-    revision: Option<ControlRevision>,
+    revision: Option<TunnelRevision>,
 ) -> TunnelObservation {
     TunnelObservation {
         evidence,
@@ -237,28 +242,28 @@ fn observation(
 }
 
 #[test]
-fn stale_generation_and_same_generation_digest_never_converge() {
+fn stale_tunnel_generation_never_converges() {
     let id = profile("corp");
     let target = revision(4, "new");
-    for stale in [revision(3, "old"), revision(4, "other-digest")] {
-        let plan = plan_reconciliation(&ReconcileInput {
-            revision: target.clone(),
-            desired_connected: BTreeSet::from([id.clone()]),
-            observations: BTreeMap::from([(
-                id.clone(),
-                observation(
-                    ScanEvidence::ConfirmedPresent,
-                    ObservationOwnership::Managed,
-                    Some(stale.clone()),
-                ),
-            )]),
-            in_flight: BTreeMap::new(),
-            disconnect_tombstones: BTreeMap::new(),
-        });
-        assert!(
-            matches!(plan.actions.as_slice(), [ReconcileAction::CleanupStaleManaged { stale_revision: Some(found), .. }] if found == &stale)
-        );
-    }
+    let stale = tunnel_revision(3);
+    let plan = plan_reconciliation(&ReconcileInput {
+        revision: target,
+        tunnel_revisions: BTreeMap::from([(id.clone(), tunnel_revision(4))]),
+        desired_connected: BTreeSet::from([id.clone()]),
+        observations: BTreeMap::from([(
+            id.clone(),
+            observation(
+                ScanEvidence::ConfirmedPresent,
+                ObservationOwnership::Managed,
+                Some(stale),
+            ),
+        )]),
+        in_flight: BTreeMap::new(),
+        disconnect_tombstones: BTreeMap::new(),
+    });
+    assert!(
+        matches!(plan.actions.as_slice(), [ReconcileAction::CleanupStaleManaged { stale_revision: Some(found), .. }] if found == &stale)
+    );
 }
 
 #[test]
@@ -280,6 +285,7 @@ fn wireguard_interface_attestation_alone_remains_read_only() {
     .unwrap();
     let plan = plan_reconciliation(&ReconcileInput {
         revision: target,
+        tunnel_revisions: BTreeMap::from([(profile_id.clone(), tunnel_revision(4))]),
         desired_connected: BTreeSet::from([profile_id.clone()]),
         observations: BTreeMap::from([(
             profile_id.clone(),
@@ -305,22 +311,24 @@ fn wireguard_interface_attestation_alone_remains_read_only() {
 fn failed_teardown_retries_and_probe_failure_does_not_clear_tombstone() {
     let id = profile("corp");
     let rev = revision(5, "digest");
+    let tunnel_rev = tunnel_revision(5);
     let input = ReconcileInput {
         revision: rev.clone(),
+        tunnel_revisions: BTreeMap::from([(id.clone(), tunnel_rev)]),
         desired_connected: BTreeSet::new(),
         observations: BTreeMap::from([(
             id.clone(),
             observation(
                 ScanEvidence::ProbeFailed,
                 ObservationOwnership::Managed,
-                Some(rev.clone()),
+                Some(tunnel_rev),
             ),
         )]),
         in_flight: BTreeMap::new(),
         disconnect_tombstones: BTreeMap::from([(
             id.clone(),
             DisconnectTombstone {
-                revision: rev.clone(),
+                revision: tunnel_rev,
                 teardown_failed: true,
             },
         )]),
@@ -335,7 +343,7 @@ fn failed_teardown_retries_and_probe_failure_does_not_clear_tombstone() {
             observation(
                 ScanEvidence::ConfirmedAbsent,
                 ObservationOwnership::Managed,
-                Some(rev.clone()),
+                Some(tunnel_rev),
             ),
         )]),
         ..input
@@ -348,11 +356,11 @@ fn failed_teardown_retries_and_probe_failure_does_not_clear_tombstone() {
 
 #[test]
 fn scanner_never_overwrites_inflight_protocol_identity() {
-    let rev = revision(7, "digest");
+    let rev = tunnel_revision(7);
     let mut current = observation(
         ScanEvidence::ConfirmedAbsent,
         ObservationOwnership::Managed,
-        Some(rev.clone()),
+        Some(rev),
     );
     current.interface_name = Some("tun-authoritative".into());
     let mut scanner = observation(
@@ -405,6 +413,7 @@ fn policy(generation: u64, digest: &str) -> TopologyPolicy {
             profiles: BTreeSet::from([profile("corp")]),
             ..TopologyState::default()
         },
+        tunnel_revisions: BTreeMap::from([(profile("corp"), tunnel_revision(generation))]),
         transition: TopologyTransitionKind::Connect,
         required_blocking: true,
     }
@@ -630,12 +639,13 @@ fn stale_inflight_tuple_plans_cleanup_not_convergence() {
     let id = profile("corp");
     let input = ReconcileInput {
         revision: revision(2, "new"),
+        tunnel_revisions: BTreeMap::from([(id.clone(), tunnel_revision(2))]),
         desired_connected: BTreeSet::from([id.clone()]),
         observations: BTreeMap::new(),
         in_flight: BTreeMap::from([(
             id.clone(),
             InFlightMutation {
-                revision: revision(2, "old"),
+                revision: tunnel_revision(1),
                 operation: operation(1),
             },
         )]),
@@ -665,7 +675,7 @@ fn result_saturation_retains_latest_profile_terminal_without_drop() {
     std::thread::sleep(Duration::from_millis(50));
     let latest = pool.try_result().expect("latest result retained");
     assert_eq!(latest.profile_id, profile("a"));
-    assert_eq!(latest.generation, 2);
+    assert_eq!(latest.revision.generation, 2);
     assert_eq!(pool.dropped_results(), 0);
 }
 
@@ -676,6 +686,248 @@ impl Clock for TestClock {
     fn now_millis(&self) -> u64 {
         self.0.load(Ordering::Acquire)
     }
+}
+
+#[derive(Default)]
+struct TopologyCapture {
+    tunnel_calls: Mutex<Vec<(ProfileId, TunnelMutation, u64)>>,
+    policies: Mutex<Vec<TopologyPolicy>>,
+}
+
+impl TunnelExecutor for TopologyCapture {
+    fn execute(
+        &self,
+        work: &TunnelWork,
+        _: &CancellationToken,
+    ) -> Result<TunnelExecutionReceipt, String> {
+        self.tunnel_calls.lock().unwrap().push((
+            work.profile_id.clone(),
+            work.mutation,
+            work.revision.generation,
+        ));
+        Ok(execution_receipt(work))
+    }
+}
+
+impl PolicyExecutor for TopologyCapture {
+    fn apply(&self, policy: &TopologyPolicy, barrier: PolicyBarrier) -> Result<(), String> {
+        if barrier == PolicyBarrier::Blocking {
+            self.policies.lock().unwrap().push(policy.clone());
+        }
+        Ok(())
+    }
+
+    fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) {}
+}
+
+async fn wait_for_condition(mut condition: impl FnMut() -> bool, message: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while !condition() {
+        assert!(tokio::time::Instant::now() < deadline, "{message}");
+        tokio::task::yield_now().await;
+    }
+}
+
+async fn observe_connected(service: &ControlService, profile_id: &ProfileId, interface_name: &str) {
+    let desired = service.client().snapshot().desired;
+    service
+        .observer()
+        .observe(Observation::Tunnel {
+            profile_id: profile_id.clone(),
+            active: true,
+            interface_name: Some(interface_name.into()),
+            observed_at_millis: 0,
+            protection: Some(ProtectionEvidence {
+                desired_generation: desired.generation,
+                authority_epoch: desired.authority_epoch,
+                policy_digest: desired.policy_digest,
+                observed_at_millis: 0,
+                interface: GateEvidence::Verified,
+                route: GateEvidence::Verified,
+                dns: GateEvidence::Verified,
+                firewall: GateEvidence::Verified,
+            }),
+        })
+        .await
+        .expect("managed tunnel observation accepted");
+}
+
+fn topology_service(
+    profiles: BTreeSet<ProfileId>,
+) -> (ControlService, Arc<Supervisor>, Arc<TopologyCapture>) {
+    let capture = Arc::new(TopologyCapture::default());
+    let supervisor = Arc::new(Supervisor::new(
+        AuthorityEpoch(1),
+        capture.clone(),
+        capture.clone(),
+        profiles.len().max(1),
+        8,
+    ));
+    let service = ControlService::start_supervised(
+        ControlServiceConfig {
+            authority_epoch: AuthorityEpoch(1),
+            known_profiles: profiles,
+            freshness_poll_interval: Duration::from_millis(5),
+            ..ControlServiceConfig::default()
+        },
+        Arc::new(TestClock::default()),
+        ExecutionSelection::CanonicalAuthority,
+        supervisor.clone(),
+    );
+    (service, supervisor, capture)
+}
+
+async fn connect_and_settle(
+    service: &ControlService,
+    supervisor: &Supervisor,
+    capture: &TopologyCapture,
+    profile_id: &ProfileId,
+    key: &str,
+) {
+    service
+        .client()
+        .submit(CommandRequest {
+            command: UserCommand::Connect {
+                profile_id: profile_id.clone(),
+            },
+            idempotency_key: IdempotencyKey::new(key),
+            deadline: Deadline(1_000),
+        })
+        .await
+        .expect("connect admitted");
+    wait_for_condition(
+        || {
+            capture
+                .tunnel_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(called, mutation, _)| {
+                    called == profile_id && *mutation == TunnelMutation::Connect
+                })
+        },
+        "tunnel effect was not dispatched",
+    )
+    .await;
+    observe_connected(service, profile_id, &format!("tun-{profile_id}")).await;
+    wait_for_condition(
+        || {
+            supervisor
+                .profile_truth(profile_id)
+                .is_some_and(|entry| entry.truth == SupervisedTruth::ObservedPresent)
+        },
+        "tunnel did not settle",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn connecting_second_profile_preserves_settled_first_tunnel_revision() {
+    let first = profile("stable-first");
+    let second = profile("new-second");
+    let (service, supervisor, capture) =
+        topology_service(BTreeSet::from([first.clone(), second.clone()]));
+    connect_and_settle(
+        &service,
+        &supervisor,
+        &capture,
+        &first,
+        "connect-stable-first",
+    )
+    .await;
+    let first_calls = capture.tunnel_calls.lock().unwrap().len();
+
+    connect_and_settle(
+        &service,
+        &supervisor,
+        &capture,
+        &second,
+        "connect-new-second",
+    )
+    .await;
+    let second_generation = service.client().snapshot().desired.generation;
+    wait_for_condition(
+        || {
+            capture.policies.lock().unwrap().iter().any(|policy| {
+                policy.generation == second_generation
+                    && policy.target.profiles == BTreeSet::from([first.clone(), second.clone()])
+            })
+        },
+        "two-tunnel topology did not reach the policy worker",
+    )
+    .await;
+
+    assert_eq!(
+        capture
+            .tunnel_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(profile_id, _, _)| profile_id == &first)
+            .count(),
+        first_calls,
+        "adding a profile must not mutate an already-settled tunnel"
+    );
+}
+
+#[tokio::test]
+async fn kill_switch_change_preserves_settled_tunnel_revision() {
+    let target = profile("stable-policy");
+    let (service, supervisor, capture) = topology_service(BTreeSet::from([target.clone()]));
+    connect_and_settle(
+        &service,
+        &supervisor,
+        &capture,
+        &target,
+        "connect-stable-policy",
+    )
+    .await;
+    let tunnel_calls_before = capture.tunnel_calls.lock().unwrap().len();
+
+    service
+        .client()
+        .submit(CommandRequest {
+            command: UserCommand::SetKillSwitch {
+                mode: vortix::vortix_core::state::killswitch::KillSwitchMode::Auto,
+            },
+            idempotency_key: IdempotencyKey::new("change-policy-only"),
+            deadline: Deadline(1_000),
+        })
+        .await
+        .expect("kill-switch change admitted");
+    let desired = service.client().snapshot().desired;
+    let policy_generation = desired.generation;
+    service
+        .observer()
+        .observe(Observation::Protection(ProtectionEvidence {
+            desired_generation: desired.generation,
+            authority_epoch: desired.authority_epoch,
+            policy_digest: desired.policy_digest,
+            observed_at_millis: 0,
+            interface: GateEvidence::Verified,
+            route: GateEvidence::Verified,
+            dns: GateEvidence::Verified,
+            firewall: GateEvidence::Verified,
+        }))
+        .await
+        .expect("policy evidence accepted");
+    wait_for_condition(
+        || {
+            capture.policies.lock().unwrap().iter().any(|policy| {
+                policy.generation == policy_generation
+                    && policy.target.kill_switch
+                        == vortix::vortix_core::state::killswitch::KillSwitchMode::Auto
+            })
+        },
+        "kill-switch-only topology did not reach the policy worker",
+    )
+    .await;
+
+    assert_eq!(
+        capture.tunnel_calls.lock().unwrap().len(),
+        tunnel_calls_before,
+        "policy-only changes must not mutate settled tunnels"
+    );
 }
 
 #[tokio::test]
@@ -1008,7 +1260,7 @@ fn scanner_confirmation_requires_exact_successful_protocol_receipt() {
         4,
     );
     let item = work(target.clone(), 1, 1, TunnelMutation::Connect);
-    let revision = item.revision();
+    let revision = item.revision;
     supervisor.dispatch_tunnel(item, Vec::new()).unwrap();
     assert_eq!(
         supervisor.confirm_tunnel(&target, &revision, true, Some("tun-receipt")),

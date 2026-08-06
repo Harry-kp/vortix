@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::vortix_core::control::worker::ControlRevision;
+use crate::vortix_core::control::worker::{ControlRevision, TunnelRevision};
 use crate::vortix_core::ports::tunnel::{AdoptionEvidence, TunnelKindTag};
 use crate::vortix_core::profile::ProfileId;
 
@@ -46,7 +46,7 @@ pub struct TunnelObservation {
     pub ownership: ObservationOwnership,
     /// Exact protocol-authoritative fence. Managed facts without this tuple
     /// are stale and cannot establish convergence.
-    pub revision: Option<ControlRevision>,
+    pub revision: Option<TunnelRevision>,
     /// Only a protocol adapter can issue this attestation. Scanner guesses do
     /// not become managed merely because profile/interface strings match.
     pub adoption: Option<AdoptionEvidence>,
@@ -55,13 +55,13 @@ pub struct TunnelObservation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InFlightMutation {
-    pub revision: ControlRevision,
+    pub revision: TunnelRevision,
     pub operation: crate::vortix_core::control::model::OperationId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DisconnectTombstone {
-    pub revision: ControlRevision,
+    pub revision: TunnelRevision,
     /// A failed or ambiguous teardown remains retry eligible while the
     /// tombstone continues to suppress scanner adoption.
     pub teardown_failed: bool,
@@ -70,7 +70,11 @@ pub struct DisconnectTombstone {
 /// One complete level-triggered input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconcileInput {
+    /// Global topology/policy revision for the plan as a whole.
     pub revision: ControlRevision,
+    /// Stable per-profile intent revisions. Untargeted profiles retain their
+    /// previous entry when the global policy revision advances.
+    pub tunnel_revisions: BTreeMap<ProfileId, TunnelRevision>,
     pub desired_connected: BTreeSet<ProfileId>,
     pub observations: BTreeMap<ProfileId, TunnelObservation>,
     pub in_flight: BTreeMap<ProfileId, InFlightMutation>,
@@ -82,16 +86,16 @@ pub struct ReconcileInput {
 pub enum ReconcileAction {
     Connect {
         profile_id: ProfileId,
-        revision: ControlRevision,
+        revision: TunnelRevision,
     },
     Disconnect {
         profile_id: ProfileId,
-        revision: ControlRevision,
+        revision: TunnelRevision,
     },
     CleanupStaleManaged {
         profile_id: ProfileId,
-        stale_revision: Option<ControlRevision>,
-        target_revision: ControlRevision,
+        stale_revision: Option<TunnelRevision>,
+        target_revision: TunnelRevision,
     },
     ObserveReadOnly {
         profile_id: ProfileId,
@@ -100,7 +104,7 @@ pub enum ReconcileAction {
     AdoptAttested {
         profile_id: ProfileId,
         evidence: AdoptionEvidence,
-        revision: ControlRevision,
+        revision: TunnelRevision,
     },
     ClearTombstone {
         profile_id: ProfileId,
@@ -111,6 +115,17 @@ pub enum ReconcileAction {
 pub struct ReconcilePlan {
     pub revision: ControlRevision,
     pub actions: Vec<ReconcileAction>,
+}
+
+fn target_tunnel_revision(input: &ReconcileInput, profile_id: &ProfileId) -> TunnelRevision {
+    input
+        .tunnel_revisions
+        .get(profile_id)
+        .copied()
+        .unwrap_or(TunnelRevision {
+            authority_epoch: input.revision.authority_epoch,
+            generation: input.revision.generation,
+        })
 }
 
 /// Compute a complete reconciliation plan without performing side effects.
@@ -130,6 +145,7 @@ pub fn plan_reconciliation(input: &ReconcileInput) -> ReconcilePlan {
         let desired = input.desired_connected.contains(&profile_id);
         let observed = input.observations.get(&profile_id);
         let in_flight = input.in_flight.get(&profile_id);
+        let target_revision = target_tunnel_revision(input, &profile_id);
 
         if let Some(tombstone) = input.disconnect_tombstones.get(&profile_id) {
             if observed.is_some_and(|fact| fact.evidence.is_fresh_absence()) {
@@ -137,18 +153,19 @@ pub fn plan_reconciliation(input: &ReconcileInput) -> ReconcilePlan {
             } else if tombstone.teardown_failed && in_flight.is_none() {
                 actions.push(ReconcileAction::Disconnect {
                     profile_id,
-                    revision: input.revision.clone(),
+                    revision: target_revision,
                 });
             }
             continue;
         }
 
-        let exact_in_flight = in_flight.is_some_and(|mutation| mutation.revision == input.revision);
+        let exact_in_flight =
+            in_flight.is_some_and(|mutation| mutation.revision == target_revision);
         if in_flight.is_some() && !exact_in_flight {
             actions.push(ReconcileAction::CleanupStaleManaged {
                 profile_id,
-                stale_revision: in_flight.map(|mutation| mutation.revision.clone()),
-                target_revision: input.revision.clone(),
+                stale_revision: in_flight.map(|mutation| mutation.revision),
+                target_revision,
             });
             continue;
         }
@@ -156,19 +173,19 @@ pub fn plan_reconciliation(input: &ReconcileInput) -> ReconcilePlan {
         match observed {
             Some(fact) if fact.evidence.is_fresh_presence() => {
                 let exact_managed = fact.ownership == ObservationOwnership::Managed
-                    && fact.revision.as_ref() == Some(&input.revision);
+                    && fact.revision == Some(target_revision);
                 if fact.ownership == ObservationOwnership::Managed && !exact_managed {
                     actions.push(ReconcileAction::CleanupStaleManaged {
                         profile_id,
-                        stale_revision: fact.revision.clone(),
-                        target_revision: input.revision.clone(),
+                        stale_revision: fact.revision,
+                        target_revision,
                     });
                 } else if exact_in_flight {
                     // Scanner presence cannot complete protocol work.
                 } else if exact_managed && !desired {
                     actions.push(ReconcileAction::Disconnect {
                         profile_id,
-                        revision: input.revision.clone(),
+                        revision: target_revision,
                     });
                 } else if !exact_managed {
                     if let Some(evidence) = fact.adoption.clone().filter(|evidence| {
@@ -179,7 +196,7 @@ pub fn plan_reconciliation(input: &ReconcileInput) -> ReconcilePlan {
                         actions.push(ReconcileAction::AdoptAttested {
                             profile_id,
                             evidence,
-                            revision: input.revision.clone(),
+                            revision: target_revision,
                         });
                     } else {
                         actions.push(ReconcileAction::ObserveReadOnly {
@@ -205,7 +222,7 @@ pub fn plan_reconciliation(input: &ReconcileInput) -> ReconcilePlan {
             }
             _ if desired && !exact_in_flight => actions.push(ReconcileAction::Connect {
                 profile_id,
-                revision: input.revision.clone(),
+                revision: target_revision,
             }),
             _ => {}
         }
@@ -220,7 +237,7 @@ pub fn plan_reconciliation(input: &ReconcileInput) -> ReconcilePlan {
 pub fn merge_observation(
     current: &mut TunnelObservation,
     scanner: TunnelObservation,
-    in_flight: Option<&ControlRevision>,
+    in_flight: Option<&TunnelRevision>,
 ) {
     if in_flight.is_some()
         || current.ownership == ObservationOwnership::Managed

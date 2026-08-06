@@ -4,11 +4,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use vortix::vortix_core::control::model::{AuthorityEpoch, OperationId, PolicyDigest};
+use vortix::vortix_core::control::model::{AuthorityEpoch, OperationId};
 use vortix::vortix_core::control::snapshot::ControlSnapshot;
 use vortix::vortix_core::control::worker::{
     wait_until, CancellationToken, ProfileWorkerPool, TunnelExecutionReceipt, TunnelExecutor,
-    TunnelMutation, TunnelWork, WorkFailure,
+    TunnelMutation, TunnelRevision, TunnelWork, WorkFailure,
 };
 use vortix::vortix_core::ports::dns::DnsRequest;
 use vortix::vortix_core::ports::tunnel::{
@@ -179,7 +179,7 @@ impl TunnelExecutor for LateCancellation {
             "wg0",
             "wireguard-late-cancel-attestation",
             HandshakeEvidence {
-                generation: work.generation,
+                generation: work.revision.generation,
                 peer_public_key: "expected".into(),
                 handshake_at: at(201),
                 observed_at: at(202),
@@ -202,10 +202,12 @@ impl TunnelExecutor for HandshakeReceipt {
         _: &CancellationToken,
     ) -> Result<TunnelExecutionReceipt, String> {
         let generation = if self.generation_offset.is_negative() {
-            work.generation
+            work.revision
+                .generation
                 .saturating_sub(self.generation_offset.unsigned_abs())
         } else {
-            work.generation
+            work.revision
+                .generation
                 .saturating_add(self.generation_offset.unsigned_abs())
         };
         TunnelExecutionReceipt::wireguard(
@@ -235,9 +237,10 @@ fn wg_work() -> TunnelWork {
     TunnelWork {
         profile_id: ProfileId::new("corp"),
         operation_id: operation(),
-        generation: 9,
-        authority_epoch: AuthorityEpoch(1),
-        policy_digest: PolicyDigest("digest-9".into()),
+        revision: TunnelRevision {
+            authority_epoch: AuthorityEpoch(1),
+            generation: 9,
+        },
         mutation: TunnelMutation::Connect,
         protocol: TunnelKindTag::WireGuard,
         deadline: Instant::now() + Duration::from_secs(1),
