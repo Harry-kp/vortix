@@ -15,12 +15,12 @@ use vortix::vortix_core::control::worker::{
     TunnelExecutionReceipt, TunnelExecutor, TunnelMutation, TunnelWork, WorkFailure,
 };
 use vortix::vortix_core::control::{
-    Clock, CommandRequest, ControlService, ControlServiceConfig, Deadline, ExecutionSelection,
-    GateEvidence, IdempotencyKey, Observation, PersistedTombstone, ProfileTopology,
-    ProtectionEvidence, ProtectionStatus, UserCommand,
+    Clock, CommandRequest, ControlEvent, ControlService, ControlServiceConfig, Deadline,
+    ExecutionSelection, GateEvidence, HookEvent, IdempotencyKey, Observation, PersistedTombstone,
+    ProfileTopology, ProtectionEvidence, ProtectionStatus, RequestedTunnelState, UserCommand,
 };
 use vortix::vortix_core::ports::tunnel::{HandshakeEvidence, TunnelKindTag};
-use vortix::vortix_core::profile::ProfileId;
+use vortix::vortix_core::profile::{ProfileId, ProtocolKind};
 
 fn profile(value: &str) -> ProfileId {
     ProfileId::new(value)
@@ -777,6 +777,180 @@ async fn canonical_service_dispatches_admitted_mutation_without_blocking_snapsho
         );
         tokio::task::yield_now().await;
     }
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // One end-to-end admission, effect, and hook assertion.
+async fn reconnect_all_targets_only_currently_managed_profiles() {
+    #[derive(Default)]
+    struct Capture(Mutex<Vec<(ProfileId, TunnelMutation)>>);
+    impl TunnelExecutor for Capture {
+        fn execute(
+            &self,
+            work: &TunnelWork,
+            _: &CancellationToken,
+        ) -> Result<TunnelExecutionReceipt, String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((work.profile_id.clone(), work.mutation));
+            Ok(execution_receipt(work))
+        }
+    }
+
+    let connected = profile("connected");
+    let disconnected = profile("disconnected");
+    let executor = Arc::new(Capture::default());
+    let supervisor = Arc::new(Supervisor::new(
+        AuthorityEpoch(1),
+        executor.clone(),
+        Arc::new(OkPolicy),
+        4,
+        8,
+    ));
+    let service = ControlService::start_supervised(
+        ControlServiceConfig {
+            authority_epoch: AuthorityEpoch(1),
+            known_profiles: BTreeSet::from([connected.clone(), disconnected.clone()]),
+            profile_topologies: BTreeMap::from([
+                (
+                    connected.clone(),
+                    ProfileTopology {
+                        protocol: Some(ProtocolKind::OpenVpn),
+                        ..ProfileTopology::default()
+                    },
+                ),
+                (
+                    disconnected.clone(),
+                    ProfileTopology {
+                        protocol: Some(ProtocolKind::OpenVpn),
+                        ..ProfileTopology::default()
+                    },
+                ),
+            ]),
+            freshness_poll_interval: Duration::from_millis(5),
+            ..ControlServiceConfig::default()
+        },
+        Arc::new(TestClock::default()),
+        ExecutionSelection::CanonicalAuthority,
+        supervisor.clone(),
+    );
+    let client = service.client();
+
+    client
+        .submit(CommandRequest {
+            command: UserCommand::Disconnect {
+                profile_id: Some(disconnected.clone()),
+            },
+            idempotency_key: IdempotencyKey::new("keep-disconnected"),
+            deadline: Deadline(1_000),
+        })
+        .await
+        .expect("explicit disconnected intent admitted");
+    assert_eq!(
+        client.snapshot().desired.tunnels.get(&disconnected),
+        Some(&RequestedTunnelState::Disconnected)
+    );
+
+    client
+        .submit(CommandRequest {
+            command: UserCommand::Connect {
+                profile_id: connected.clone(),
+            },
+            idempotency_key: IdempotencyKey::new("connect-managed"),
+            deadline: Deadline(1_000),
+        })
+        .await
+        .expect("managed connect admitted");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while !executor
+        .0
+        .lock()
+        .unwrap()
+        .contains(&(connected.clone(), TunnelMutation::Connect))
+    {
+        assert!(tokio::time::Instant::now() < deadline, "connect dispatched");
+        tokio::task::yield_now().await;
+    }
+    let desired = client.snapshot().desired;
+    service
+        .observer()
+        .observe(Observation::Tunnel {
+            profile_id: connected.clone(),
+            active: true,
+            interface_name: Some("tun-connected".into()),
+            observed_at_millis: 0,
+            protection: Some(ProtectionEvidence {
+                desired_generation: desired.generation,
+                authority_epoch: desired.authority_epoch,
+                policy_digest: desired.policy_digest,
+                observed_at_millis: 0,
+                interface: GateEvidence::Verified,
+                route: GateEvidence::Verified,
+                dns: GateEvidence::Verified,
+                firewall: GateEvidence::Verified,
+            }),
+        })
+        .await
+        .expect("managed connection observed");
+    while supervisor
+        .profile_truth(&connected)
+        .is_none_or(|entry| entry.truth != SupervisedTruth::ObservedPresent)
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "managed connection promoted"
+        );
+        tokio::task::yield_now().await;
+    }
+
+    let mut events = client.subscribe();
+    let executions_before = executor.0.lock().unwrap().len();
+    let reconnect = client
+        .submit(CommandRequest {
+            command: UserCommand::Reconnect { profile_id: None },
+            idempotency_key: IdempotencyKey::new("reconnect-managed-only"),
+            deadline: Deadline(1_000),
+        })
+        .await
+        .expect("reconnect-all admitted for the managed target only");
+
+    let mut reconnecting = Vec::new();
+    let mut command_seen = false;
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(1), events.recv_event())
+            .await
+            .expect("control event timeout")
+            .expect("control service remains live")
+            .event;
+        match event {
+            ControlEvent::OperationAdmitted { operation_id, .. }
+                if operation_id == reconnect.operation_id =>
+            {
+                command_seen = true;
+            }
+            ControlEvent::Lifecycle { fact }
+                if command_seen && fact.event == HookEvent::Reconnecting =>
+            {
+                reconnecting.push(fact.profile_id);
+            }
+            ControlEvent::DesiredStateChanged { .. } if command_seen => break,
+            _ => {}
+        }
+    }
+    assert_eq!(reconnecting, vec![connected.clone()]);
+    assert_eq!(
+        client.snapshot().desired.tunnels.get(&disconnected),
+        Some(&RequestedTunnelState::Disconnected)
+    );
+
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    let executions = executor.0.lock().unwrap();
+    let reconnect_executions = &executions[executions_before..];
+    assert!(!reconnect_executions.is_empty());
+    assert!(reconnect_executions
+        .iter()
+        .all(|(profile_id, _)| profile_id == &connected));
 }
 
 #[tokio::test]

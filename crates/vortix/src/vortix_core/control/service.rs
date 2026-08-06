@@ -380,6 +380,7 @@ enum Envelope {
         operation_id: OperationId,
         admitted_at: u64,
         evicted: Vec<OperationId>,
+        target_profiles: Vec<ProfileId>,
         work_admissions: Vec<(ProfileId, ProfileAdmission)>,
         reply: oneshot::Sender<Result<AdmittedOperation, AdmissionError>>,
     },
@@ -735,7 +736,7 @@ impl ControlHandle {
         if request.deadline.0 <= now {
             return Err(AdmissionError::DeadlineExpired);
         }
-        let (operation_id, evicted, work_admissions) = {
+        let (operation_id, evicted, target_profiles, work_admissions) = {
             let mut admission = self
                 .shared
                 .admission
@@ -755,7 +756,13 @@ impl ControlHandle {
                     Err(AdmissionError::IdempotencyConflict)
                 };
             }
-            let admission_profiles = command_profiles(&request.command, &admission.known_profiles);
+            let target_profiles = target_profiles_for_command(
+                &request.command,
+                &admission.known_profiles,
+                &self.shared.snapshots.borrow().desired.tunnels,
+                self.shared.selection,
+                self.shared.supervisor.as_deref(),
+            )?;
             let mut work_admissions = Vec::new();
             if self.shared.selection == ExecutionSelection::CanonicalAuthority {
                 let supervisor = self
@@ -763,22 +770,22 @@ impl ControlHandle {
                     .supervisor
                     .as_ref()
                     .ok_or(AdmissionError::Stopped)?;
-                for profile_id in admission_profiles {
+                for profile_id in &target_profiles {
                     let routes = self
                         .shared
                         .config
                         .profile_topologies
-                        .get(&profile_id)
+                        .get(profile_id)
                         .map(|topology| topology.routes.iter().cloned().collect::<Vec<_>>())
                         .unwrap_or_default();
-                    let reserved = supervisor.reserve_tunnel(&profile_id, routes).map_err(
+                    let reserved = supervisor.reserve_tunnel(profile_id, routes).map_err(
                         |error| match error {
                             WorkFailure::RouteConflict => AdmissionError::RouteConflict,
                             WorkFailure::Stopped => AdmissionError::Stopped,
                             _ => AdmissionError::Busy,
                         },
                     )?;
-                    work_admissions.push((profile_id, reserved));
+                    work_admissions.push((profile_id.clone(), reserved));
                 }
             }
             if let Some(profile_id) = command_profile(&request.command) {
@@ -811,7 +818,7 @@ impl ControlHandle {
                     command_digest: command_digest.clone(),
                 },
             );
-            (operation_id, evicted, work_admissions)
+            (operation_id, evicted, target_profiles, work_admissions)
         };
         let (reply, receiver) = oneshot::channel();
         permit.send(Envelope::Mutate {
@@ -821,6 +828,7 @@ impl ControlHandle {
             operation_id: operation_id.clone(),
             admitted_at: now,
             evicted,
+            target_profiles,
             work_admissions,
             reply,
         });
@@ -2120,6 +2128,7 @@ fn handle_envelope(
             operation_id,
             admitted_at,
             evicted,
+            target_profiles,
             work_admissions,
             reply,
         } => {
@@ -2130,7 +2139,7 @@ fn handle_envelope(
             let desired_generation = if expired {
                 snapshot.desired.generation
             } else {
-                apply_desired(&request.command, snapshot);
+                apply_desired(&request.command, &target_profiles, snapshot);
                 snapshot.desired.generation
             };
             let status = if expired {
@@ -2163,7 +2172,7 @@ fn handle_envelope(
                 desired_generation,
             });
             if let Some((lifecycle, started)) =
-                lifecycle_for_command(&request.command, &config.known_profiles)
+                lifecycle_for_command(&request.command, &target_profiles)
             {
                 emit_lifecycle_facts(owner, config, &lifecycle.profiles, started, now, events);
                 owner
@@ -2279,7 +2288,11 @@ fn handle_envelope(
     }
 }
 
-fn apply_desired(command: &UserCommand, snapshot: &mut ControlSnapshot) {
+fn apply_desired(
+    command: &UserCommand,
+    target_profiles: &[ProfileId],
+    snapshot: &mut ControlSnapshot,
+) {
     snapshot.desired.generation = snapshot.desired.generation.saturating_add(1);
     match command {
         UserCommand::Connect { profile_id }
@@ -2300,11 +2313,20 @@ fn apply_desired(command: &UserCommand, snapshot: &mut ControlSnapshot) {
             snapshot.observed.connection_health.remove(profile_id);
         }
         UserCommand::Disconnect { profile_id: None }
-        | UserCommand::ForceDisconnect { profile_id: None }
-        | UserCommand::Reconnect { profile_id: None } => {
+        | UserCommand::ForceDisconnect { profile_id: None } => {
             snapshot.observed.wireguard_handshakes.clear();
             snapshot.observed.wireguard_probe_receipts.clear();
             snapshot.observed.connection_health.clear();
+        }
+        UserCommand::Reconnect { profile_id: None } => {
+            for profile_id in target_profiles {
+                snapshot.observed.wireguard_handshakes.remove(profile_id);
+                snapshot
+                    .observed
+                    .wireguard_probe_receipts
+                    .remove(profile_id);
+                snapshot.observed.connection_health.remove(profile_id);
+            }
         }
         UserCommand::SetKillSwitch { .. } => {}
     }
@@ -2335,11 +2357,14 @@ fn apply_desired(command: &UserCommand, snapshot: &mut ControlSnapshot) {
             .tunnels
             .values_mut()
             .for_each(|state| *state = RequestedTunnelState::Disconnected),
-        UserCommand::Reconnect { profile_id: None } => snapshot
-            .desired
-            .tunnels
-            .values_mut()
-            .for_each(|state| *state = RequestedTunnelState::Connected),
+        UserCommand::Reconnect { profile_id: None } => {
+            for profile_id in target_profiles {
+                snapshot
+                    .desired
+                    .tunnels
+                    .insert(profile_id.clone(), RequestedTunnelState::Connected);
+            }
+        }
         UserCommand::SetKillSwitch { mode } => snapshot.desired.kill_switch = *mode,
     }
     recompute_policy_digest(snapshot);
@@ -2382,7 +2407,6 @@ fn command_profiles(command: &UserCommand, known_profiles: &BTreeSet<ProfileId>)
     }
     match command {
         UserCommand::Disconnect { profile_id: None }
-        | UserCommand::Reconnect { profile_id: None }
         | UserCommand::ForceDisconnect { profile_id: None } => {
             known_profiles.iter().cloned().collect()
         }
@@ -2390,11 +2414,65 @@ fn command_profiles(command: &UserCommand, known_profiles: &BTreeSet<ProfileId>)
     }
 }
 
-fn lifecycle_for_command(
+fn target_profiles_for_command(
     command: &UserCommand,
     known_profiles: &BTreeSet<ProfileId>,
+    desired_tunnels: &BTreeMap<ProfileId, RequestedTunnelState>,
+    selection: ExecutionSelection,
+    supervisor: Option<&Supervisor>,
+) -> Result<Vec<ProfileId>, AdmissionError> {
+    if !matches!(command, UserCommand::Reconnect { profile_id: None }) {
+        return Ok(command_profiles(command, known_profiles));
+    }
+    if selection == ExecutionSelection::CanonicalAuthority {
+        return Ok(supervisor
+            .ok_or(AdmissionError::Stopped)?
+            .profiles()
+            .into_iter()
+            .filter_map(|(profile_id, supervision)| {
+                (supervision.truth == SupervisedTruth::ObservedPresent
+                    && supervision.adoption.is_some())
+                .then_some(profile_id)
+            })
+            .collect());
+    }
+    Ok(desired_tunnels
+        .iter()
+        .filter_map(|(profile_id, state)| {
+            (*state == RequestedTunnelState::Connected).then_some(profile_id.clone())
+        })
+        .collect())
+}
+
+#[cfg(test)]
+mod target_profiles_tests {
+    use super::*;
+
+    #[test]
+    fn reconnect_all_uses_connected_desired_profiles_without_canonical_supervision() {
+        let connected = ProfileId::new("connected");
+        let disconnected = ProfileId::new("disconnected");
+        let targets = target_profiles_for_command(
+            &UserCommand::Reconnect { profile_id: None },
+            &BTreeSet::from([connected.clone(), disconnected.clone()]),
+            &BTreeMap::from([
+                (connected.clone(), RequestedTunnelState::Connected),
+                (disconnected, RequestedTunnelState::Disconnected),
+            ]),
+            ExecutionSelection::LegacyAuthority,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(targets, vec![connected]);
+    }
+}
+
+fn lifecycle_for_command(
+    command: &UserCommand,
+    target_profiles: &[ProfileId],
 ) -> Option<(LifecycleOperation, HookEvent)> {
-    let profiles = command_profiles(command, known_profiles);
+    let profiles = target_profiles.to_vec();
     if profiles.is_empty() {
         return None;
     }
