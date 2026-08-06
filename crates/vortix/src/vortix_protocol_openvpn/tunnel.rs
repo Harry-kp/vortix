@@ -21,7 +21,7 @@ use crate::vortix_core::profile::{unambiguous_legacy_artifact_key, Profile};
 use crate::vortix_process::{CommandSpec, PrivilegeReq};
 use tracing::{debug, info, warn};
 
-use crate::vortix_protocol_openvpn::parser::{is_forbidden_privileged_directive, parse_ovpn_conf};
+use crate::vortix_protocol_openvpn::parser::{forbidden_effective_directive, parse_ovpn_conf};
 
 /// Quality of the DNS intent recovered from an `OpenVPN` session log.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,13 +57,10 @@ struct ManagedConfigViolation {
 fn sanitize_managed_config(text: &str) -> Result<String, TunnelError> {
     let mut output = String::with_capacity(text.len());
     for line in text.split_inclusive('\n') {
+        validate_managed_line(line).map_err(|error| TunnelError::Subprocess(error.to_string()))?;
         let directive = line.split(['#', ';']).next().unwrap_or_default();
         let mut tokens = directive.split_whitespace();
         let first = tokens.next().map(|value| value.trim_start_matches('-'));
-        if let Some(value) = first {
-            validate_managed_directive(value)
-                .map_err(|error| TunnelError::Subprocess(error.to_string()))?;
-        }
         let is_dns = matches!(first, Some(value) if value.eq_ignore_ascii_case("dhcp-option"))
             && matches!(tokens.next(), Some(value) if value.eq_ignore_ascii_case("DNS")
                 || value.eq_ignore_ascii_case("DOMAIN")
@@ -75,11 +72,9 @@ fn sanitize_managed_config(text: &str) -> Result<String, TunnelError> {
     Ok(output)
 }
 
-fn validate_managed_directive(directive: &str) -> Result<(), ManagedConfigViolation> {
-    if is_forbidden_privileged_directive(directive) {
-        return Err(ManagedConfigViolation {
-            directive: directive.to_ascii_lowercase(),
-        });
+fn validate_managed_line(line: &str) -> Result<(), ManagedConfigViolation> {
+    if let Some(directive) = forbidden_effective_directive(line) {
+        return Err(ManagedConfigViolation { directive });
     }
     Ok(())
 }
@@ -1408,6 +1403,26 @@ mod tests {
                 "unexpected error for {directive}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn managed_config_rejects_effective_privileged_aliases() {
+        for directive in [
+            "setenv opt plugin malicious.so",
+            "SeTeNv OpT providers legacy default",
+            "setenv opt --config nested.ovpn",
+            "\"up\" ./up.sh",
+        ] {
+            let error = sanitize_managed_config(&format!("client\n{directive}\n"))
+                .expect_err("effective privileged aliases must not reach root OpenVPN");
+            assert!(
+                error.to_string().contains("not allowed"),
+                "unexpected error for {directive}: {error}"
+            );
+        }
+
+        let safe = "client\nsetenv opt block-outside-dns\n";
+        assert_eq!(sanitize_managed_config(safe).unwrap(), safe);
     }
 
     #[test]

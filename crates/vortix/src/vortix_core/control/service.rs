@@ -19,7 +19,7 @@ use crate::vortix_core::control::model::{
     AuthorityEpoch, ChallengeId, ChallengeKind, ChallengeRecord, ClientId, CompletionOutcome,
     ControlEvent, ControlEventEnvelope, DriftGates, EffectiveState, Freshness, GateEvidence,
     Observation, ObservedConnectionHealth, ObservedTunnel, OperationCompletion, OperationFailure,
-    OperationId, OperationRecord, OperationResult, OperationStatus, PolicyDigest,
+    OperationId, OperationIntent, OperationRecord, OperationResult, OperationStatus, PolicyDigest,
     ProtectionEvidence, ProtectionStatus, RequestedTunnelState, MAX_PROTECTION_AGE_MILLIS,
 };
 use crate::vortix_core::control::persistence::{
@@ -1816,14 +1816,17 @@ fn drive_supervision(
                 revision: adoption_revision,
                 ..
             } => {
-                if let Some(operation) =
-                    operation_for_generation(snapshot, adoption_revision.generation)
+                let Some(operation) =
+                    operation_for_tunnel_action(snapshot, adoption_revision.generation)
+                else {
+                    invalidate_all_gates(snapshot, now);
+                    continue;
+                };
+                if supervisor
+                    .adopt_attested(evidence.clone(), *adoption_revision, operation.id.clone())
+                    .is_err()
                 {
-                    let _ = supervisor.adopt_attested(
-                        evidence.clone(),
-                        *adoption_revision,
-                        operation.id.clone(),
-                    );
+                    invalidate_all_gates(snapshot, now);
                 }
             }
             ReconcileAction::Connect {
@@ -1840,8 +1843,9 @@ fn drive_supervision(
                 ..
             } => {
                 let Some(operation) =
-                    operation_for_generation(snapshot, action_revision.generation)
+                    operation_for_tunnel_action(snapshot, action_revision.generation).cloned()
                 else {
+                    invalidate_all_gates(snapshot, now);
                     continue;
                 };
                 let operation_id = operation.id.clone();
@@ -1899,10 +1903,13 @@ fn drive_supervision(
                         .reconnect_operations
                         .get(&operation_id)
                         .is_some_and(|reconnect| reconnect.can_reconnect(profile_id));
+                let level_triggered_readmission =
+                    operation_generation != action_revision.generation;
                 let reserved = owner.work_admissions.remove(&key).map_or_else(
                     || {
                         if owner.recovery_operations.contains(&operation_id)
                             || reconnect_readmission
+                            || level_triggered_readmission
                         {
                             let routes = config
                                 .profile_topologies
@@ -1944,7 +1951,7 @@ fn drive_supervision(
                             now,
                             now,
                         );
-                        if reconnect_target {
+                        if reconnect_target || level_triggered_readmission {
                             fail_tunnel_dispatch_operation(
                                 &operation_id,
                                 operation_generation,
@@ -1984,7 +1991,7 @@ fn drive_supervision(
                             now,
                             now,
                         );
-                        if reconnect_target {
+                        if reconnect_target || level_triggered_readmission {
                             fail_tunnel_dispatch_operation(
                                 &operation_id,
                                 operation_generation,
@@ -2141,23 +2148,39 @@ fn drive_supervision(
                     })
                 });
             if converged {
-                let completion_operation =
-                    operation_for_generation(snapshot, policy_revision.generation)
-                        .map(|operation| operation.id.clone())
-                        .unwrap_or(operation_id);
-                let _ = complete_operation(
-                    OperationCompletion {
-                        operation_id: completion_operation,
-                        desired_generation: policy_revision.generation,
-                        outcome: CompletionOutcome::ObservedSuccess(evidence.clone()),
-                    },
-                    snapshot,
-                    owner,
-                    admission,
-                    now,
-                    config,
-                    events,
-                );
+                let evidence = evidence.clone();
+                let pending = snapshot
+                    .operations
+                    .values()
+                    .filter(|operation| !operation.status.is_terminal())
+                    .map(|operation| {
+                        (
+                            operation.id.clone(),
+                            operation.desired_generation,
+                            operation_intent_is_compatible(operation, snapshot),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                for (operation_id, desired_generation, compatible) in pending {
+                    let outcome = if compatible {
+                        CompletionOutcome::ObservedSuccess(evidence.clone())
+                    } else {
+                        CompletionOutcome::Cancelled
+                    };
+                    let _ = complete_operation(
+                        OperationCompletion {
+                            operation_id,
+                            desired_generation,
+                            outcome,
+                        },
+                        snapshot,
+                        owner,
+                        admission,
+                        now,
+                        config,
+                        events,
+                    );
+                }
             }
         }
     }
@@ -2177,6 +2200,61 @@ fn operation_for_generation(
     snapshot.operations.values().rev().find(|operation| {
         operation.desired_generation == generation && !operation.status.is_terminal()
     })
+}
+
+/// Tunnel revisions fence worker effects independently from global policy
+/// generations. When a tunnel still needs level-triggered work after a later
+/// command advanced global desired state, that current command (or its
+/// recovery operation) is the dispatch vehicle while the worker retains the
+/// profile's older exact revision.
+fn operation_for_tunnel_action(
+    snapshot: &ControlSnapshot,
+    tunnel_generation: u64,
+) -> Option<&OperationRecord> {
+    let dispatch_generation = if tunnel_generation == snapshot.desired.generation {
+        tunnel_generation
+    } else {
+        snapshot.desired.generation
+    };
+    operation_for_generation(snapshot, dispatch_generation)
+}
+
+fn operation_intent_is_compatible(operation: &OperationRecord, snapshot: &ControlSnapshot) -> bool {
+    match &operation.intent {
+        OperationIntent::GenerationScoped => {
+            operation.desired_generation == snapshot.desired.generation
+        }
+        OperationIntent::DesiredSubset {
+            tunnels,
+            kill_switch,
+        } => {
+            tunnels.iter().all(|(profile_id, requested)| {
+                let desired = snapshot.desired.tunnels.get(profile_id);
+                match requested {
+                    RequestedTunnelState::Connected => {
+                        desired == Some(&RequestedTunnelState::Connected)
+                    }
+                    RequestedTunnelState::Disconnected => {
+                        desired != Some(&RequestedTunnelState::Connected)
+                    }
+                }
+            }) && kill_switch.is_none_or(|mode| snapshot.desired.kill_switch == mode)
+        }
+    }
+}
+
+fn invalidate_all_gates(snapshot: &mut ControlSnapshot, now: u64) {
+    invalidate_gates(
+        snapshot,
+        DriftGates {
+            interface: true,
+            route: true,
+            dns: true,
+            firewall: true,
+        },
+        now,
+        now,
+    );
 }
 
 #[allow(clippy::too_many_arguments)] // Failure closes one admitted effect and starts owned recovery.
@@ -2355,6 +2433,7 @@ fn handle_envelope(
                     desired_generation,
                     admitted_at_millis: admitted_at,
                     deadline_millis: request.deadline.0,
+                    intent: intent_for_command(&request.command, &target_profiles),
                     status,
                     result: expired.then_some(OperationResult::Expired),
                 },
@@ -2594,6 +2673,33 @@ fn apply_desired(
 fn command_digest(command: &UserCommand) -> PolicyDigest {
     let bytes = serde_json::to_vec(command).expect("commands are serializable");
     PolicyDigest(encode_digest(&bytes))
+}
+
+fn intent_for_command(command: &UserCommand, target_profiles: &[ProfileId]) -> OperationIntent {
+    let requested = match command {
+        UserCommand::Connect { .. } | UserCommand::Reconnect { .. } => {
+            Some(RequestedTunnelState::Connected)
+        }
+        UserCommand::Disconnect { .. } | UserCommand::ForceDisconnect { .. } => {
+            Some(RequestedTunnelState::Disconnected)
+        }
+        UserCommand::SetKillSwitch { .. } => None,
+    };
+    let tunnels = requested.map_or_else(BTreeMap::new, |state| {
+        target_profiles
+            .iter()
+            .cloned()
+            .map(|profile_id| (profile_id, state))
+            .collect()
+    });
+    let kill_switch = match command {
+        UserCommand::SetKillSwitch { mode } => Some(*mode),
+        _ => None,
+    };
+    OperationIntent::DesiredSubset {
+        tunnels,
+        kill_switch,
+    }
 }
 
 fn command_profile(command: &UserCommand) -> Option<&ProfileId> {
@@ -3070,12 +3176,13 @@ fn complete_operation(
     events: &mut Vec<ControlEvent>,
 ) -> Result<CompletionResult, CompletionError> {
     let success_is_current = match &completion.outcome {
-        CompletionOutcome::ObservedSuccess(evidence) => {
-            completion.desired_generation == snapshot.desired.generation
-                && evidence_matches(evidence, snapshot, now)
-        }
+        CompletionOutcome::ObservedSuccess(evidence) => evidence_matches(evidence, snapshot, now),
         CompletionOutcome::Failed(_) | CompletionOutcome::Cancelled => true,
     };
+    let intent_is_compatible = snapshot
+        .operations
+        .get(&completion.operation_id)
+        .is_some_and(|operation| operation_intent_is_compatible(operation, snapshot));
     let Some(record) = snapshot.operations.get_mut(&completion.operation_id) else {
         return Err(CompletionError::NotFound);
     };
@@ -3116,7 +3223,7 @@ fn complete_operation(
     }
     match completion.outcome {
         CompletionOutcome::ObservedSuccess(evidence) => {
-            if !success_is_current {
+            if !success_is_current || !intent_is_compatible {
                 return Err(CompletionError::StaleSuccess);
             }
             snapshot.observed.evidence = Some(evidence.clone());
@@ -3232,6 +3339,7 @@ fn expire_operations(
                 desired_generation: snapshot.desired.generation,
                 admitted_at_millis: now,
                 deadline_millis: recovery_deadline,
+                intent: intent_for_desired_state(snapshot),
                 status: OperationStatus::WaitingForObservation,
                 result: None,
             },
@@ -3288,6 +3396,7 @@ fn start_recovery_operation(
             desired_generation: generation,
             admitted_at_millis: now,
             deadline_millis: now.saturating_add(30_000),
+            intent: intent_for_desired_state(snapshot),
             status: OperationStatus::WaitingForObservation,
             result: None,
         },
@@ -3298,6 +3407,13 @@ fn start_recovery_operation(
         desired_generation: generation,
     });
     register_recovery_lifecycle(owner, snapshot, config, &recovery_id, now, events);
+}
+
+fn intent_for_desired_state(snapshot: &ControlSnapshot) -> OperationIntent {
+    OperationIntent::DesiredSubset {
+        tunnels: snapshot.desired.tunnels.clone(),
+        kill_switch: Some(snapshot.desired.kill_switch),
+    }
 }
 
 fn register_recovery_lifecycle(

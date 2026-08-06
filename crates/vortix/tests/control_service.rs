@@ -344,7 +344,7 @@ async fn drift_invalidates_gates_atomically_and_same_message_can_reverify() {
 }
 
 #[tokio::test]
-async fn success_requires_every_gate_while_failure_can_finish_superseded_operation() {
+async fn success_requires_every_gate_and_accepts_compatible_newer_evidence() {
     let clock = Arc::new(FakeClock::default());
     let service = ControlService::start_with_clock(config(), clock);
     let client = service.client();
@@ -407,21 +407,11 @@ async fn success_requires_every_gate_while_failure_can_finish_superseded_operati
                 outcome: CompletionOutcome::ObservedSuccess(current_evidence(&client, 0)),
             })
             .await,
-        Err(CompletionError::StaleSuccess)
-    );
-    assert_eq!(
-        completer
-            .complete(OperationCompletion {
-                operation_id: second.operation_id.clone(),
-                desired_generation: 2,
-                outcome: CompletionOutcome::Cancelled,
-            })
-            .await,
-        Ok(CompletionResult::Terminal(OperationStatus::Cancelled))
+        Ok(CompletionResult::Terminal(OperationStatus::Succeeded))
     );
     assert_eq!(
         client.snapshot().operations[&second.operation_id].status,
-        OperationStatus::Cancelled
+        OperationStatus::Succeeded
     );
     assert_eq!(
         client.snapshot().operations[&third.operation_id].status,

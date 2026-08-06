@@ -10,9 +10,9 @@ use thiserror::Error;
 use crate::vortix_config::profile_store::write_atomic;
 use crate::vortix_core::control::{
     BootConnection, ControlPersistenceConfig, ControlStateStore, ControlStateStoreError,
-    DesiredState, DurableControlState, OperationId, OperationRecord, OperationResult,
-    OperationStatus, PersistedTombstone, RecoveredControlState, RequestedResources,
-    RetentionMetadata,
+    DesiredState, DurableControlState, OperationId, OperationIntent, OperationRecord,
+    OperationResult, OperationStatus, PersistedTombstone, RecoveredControlState,
+    RequestedResources, RetentionMetadata,
 };
 use crate::vortix_core::profile::ProfileId;
 
@@ -96,6 +96,11 @@ impl PersistedControlState {
                     || !operation.command_digest.is_valid()
                     || operation.desired_generation > self.desired.generation
                     || operation.admitted_at_millis > operation.deadline_millis
+                    || matches!(
+                        &operation.intent,
+                        OperationIntent::DesiredSubset { tunnels, .. }
+                            if tunnels.len() > MAX_PROFILES
+                    )
                     || !operation_result_matches_status(operation)
             })
         {
@@ -421,9 +426,54 @@ mod tests {
             desired_generation: 0,
             admitted_at_millis: 0,
             deadline_millis: 1,
+            intent: OperationIntent::GenerationScoped,
             status: OperationStatus::WaitingForObservation,
             result: None,
         }
+    }
+
+    #[test]
+    fn operation_intent_defaults_to_generation_scope_for_older_state() {
+        let mut persisted = state("legacy-intent");
+        let operation = operation(7, 1, 1);
+        persisted.operations.insert(operation.id.clone(), operation);
+        let mut encoded = serde_json::to_value(&persisted).unwrap();
+        encoded["operations"]
+            .as_object_mut()
+            .unwrap()
+            .values_mut()
+            .for_each(|operation| {
+                operation.as_object_mut().unwrap().remove("intent");
+            });
+
+        let decoded: PersistedControlState = serde_json::from_value(encoded).unwrap();
+        assert!(matches!(
+            decoded.operations.values().next().unwrap().intent,
+            OperationIntent::GenerationScoped
+        ));
+        decoded.validate().unwrap();
+    }
+
+    #[test]
+    fn operation_intent_persists_canonical_kill_switch_slug() {
+        let mut persisted = state("intent-slug");
+        let mut operation = operation(7, 1, 1);
+        operation.intent = OperationIntent::DesiredSubset {
+            tunnels: BTreeMap::new(),
+            kill_switch: Some(crate::vortix_core::state::killswitch::KillSwitchMode::Auto),
+        };
+        persisted.operations.insert(operation.id.clone(), operation);
+
+        let encoded = serde_json::to_value(&persisted).unwrap();
+        let intent = &encoded["operations"]
+            .as_object()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()["intent"];
+        assert_eq!(intent["kill_switch"], "block-on-drop");
+        let decoded: PersistedControlState = serde_json::from_value(encoded).unwrap();
+        decoded.validate().unwrap();
     }
 
     #[test]
