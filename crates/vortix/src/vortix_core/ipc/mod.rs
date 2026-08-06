@@ -21,8 +21,10 @@ pub use frame::{decode_frame, encode_frame, FrameError, MAX_FRAME_BYTES};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// Inclusive protocol range supported by this build.
-pub const IPC_PROTOCOL_MIN: u16 = 1;
+/// Inclusive protocol range supported by this build. Protocol 2 introduced
+/// the mandatory first-frame handshake; pre-handshake protocol 1 is not wire
+/// compatible with this server.
+pub const IPC_PROTOCOL_MIN: u16 = 2;
 pub const IPC_PROTOCOL_MAX: u16 = 2;
 /// Inclusive snapshot schema range supported by this build.
 pub const IPC_SCHEMA_MIN: u16 = 1;
@@ -180,14 +182,14 @@ pub enum IpcResult {
     Handshake { hello: ServerHello },
     /// Reserved response for a future enrolled mutation authority.
     Accepted,
-    /// `Snapshot` payload — **v1-compat** primary-only view. When the
+    /// `Snapshot` payload — legacy primary-only view. When the
     /// registry has no primary, `state` is `Connection::Disconnected`.
     /// Multi-tunnel-aware clients should prefer [`Self::RegistrySnapshot`].
     Snapshot { state: Connection },
     /// Multi-tunnel snapshot. Carries the full set of
     /// active tunnels plus the derived primary and global killswitch
-    /// state. New clients query this; v1 clients that only know
-    /// [`Self::Snapshot`] keep working through the back-compat
+    /// state. New clients query this; transitional protocol-2 clients that
+    /// only know [`Self::Snapshot`] keep working through the legacy
     /// population the daemon does alongside.
     RegistrySnapshot {
         tunnels: Vec<TunnelSnapshot>,
@@ -212,8 +214,8 @@ pub enum IpcResult {
 
 /// Typed wire errors the daemon can return to the client.
 ///
-/// External tagging (default serde repr) is preserved so the existing
-/// v1 client decoders that match `"Unauthorized"` and
+/// External tagging (default serde repr) is preserved so existing wire
+/// decoders that match `"Unauthorized"` and
 /// `"ShuttingDown"` as bare strings continue to round-trip.
 #[derive(Debug, Clone, Error, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -240,7 +242,7 @@ pub enum IpcError {
     /// direct-app path.
     #[error("connect blocked by conflict: {conflict:?}")]
     Conflict { conflict: Conflict },
-    /// A v1 client sent a wire shape this v2 daemon cannot parse
+    /// A client sent a legacy wire shape this daemon cannot parse
     /// (e.g. `{"kind":"disconnect"}` instead of
     /// `{"kind":"disconnect","profile_id":null}`). Distinct from
     /// `MalformedRequest` so clients can suggest a binary upgrade.
@@ -326,10 +328,13 @@ mod handshake_tests {
     }
 
     #[test]
-    fn previous_protocol_generation_remains_compatible() {
+    fn pre_handshake_protocol_generation_is_incompatible() {
         let mut hello = ClientHello::current(vec![IpcCapability::PassiveSnapshot]);
         hello.protocol = CompatibilityRange { min: 1, max: 1 };
-        assert_eq!(negotiate_passive(&hello).unwrap().protocol, 1);
+        assert!(matches!(
+            negotiate_passive(&hello),
+            Err(IpcError::Incompatible { .. })
+        ));
     }
 
     #[test]

@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot, watch, Semaphore};
@@ -18,6 +19,11 @@ use crate::vortix_core::ipc::{
 
 const MAX_CONNECTIONS: usize = 32;
 const MAX_REQUEST_IDS: usize = 128;
+const REQUEST_DIGEST_BYTES: usize = 32;
+// Serialized responses are the only variable-sized replay state. Together
+// with MAX_REQUEST_IDS this bounds each connection to 1 MiB plus fixed-size
+// map entries and SHA-256 request digests.
+const MAX_REPLAY_RESPONSE_BYTES: usize = MAX_FRAME_BYTES;
 const OUTPUT_CAPACITY: usize = 16;
 const FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -152,6 +158,107 @@ struct Outbound {
     written: oneshot::Sender<Result<(), String>>,
 }
 
+type RequestDigest = [u8; REQUEST_DIGEST_BYTES];
+
+struct ReplayEntry {
+    request_digest: RequestDigest,
+    response_json: Box<[u8]>,
+}
+
+struct ReplayCache<const RESPONSE_BYTE_LIMIT: usize> {
+    entries: BTreeMap<u64, ReplayEntry>,
+    response_bytes: usize,
+}
+
+impl<const RESPONSE_BYTE_LIMIT: usize> Default for ReplayCache<RESPONSE_BYTE_LIMIT> {
+    fn default() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            response_bytes: 0,
+        }
+    }
+}
+
+enum ReplayLookup {
+    Miss,
+    Replay(IpcResponse),
+    Conflict,
+}
+
+impl<const RESPONSE_BYTE_LIMIT: usize> ReplayCache<RESPONSE_BYTE_LIMIT> {
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn lookup(
+        &self,
+        request_id: u64,
+        request_digest: &RequestDigest,
+    ) -> Result<ReplayLookup, FrameError> {
+        let Some(entry) = self.entries.get(&request_id) else {
+            return Ok(ReplayLookup::Miss);
+        };
+        if &entry.request_digest != request_digest {
+            return Ok(ReplayLookup::Conflict);
+        }
+        let response = serde_json::from_slice(&entry.response_json)?;
+        Ok(ReplayLookup::Replay(response))
+    }
+
+    fn insert(
+        &mut self,
+        request_id: u64,
+        request_digest: RequestDigest,
+        response: &IpcResponse,
+    ) -> Result<bool, FrameError> {
+        debug_assert!(!self.entries.contains_key(&request_id));
+        let response_json = serde_json::to_vec(response)?;
+        let Some(next_bytes) = self.response_bytes.checked_add(response_json.len()) else {
+            return Ok(false);
+        };
+        if next_bytes > RESPONSE_BYTE_LIMIT {
+            return Ok(false);
+        }
+        self.entries.insert(
+            request_id,
+            ReplayEntry {
+                request_digest,
+                response_json: response_json.into_boxed_slice(),
+            },
+        );
+        self.response_bytes = next_bytes;
+        Ok(true)
+    }
+
+    #[cfg(test)]
+    const fn retained_response_bytes(&self) -> usize {
+        self.response_bytes
+    }
+}
+
+fn request_digest(op: &IpcOp) -> Result<RequestDigest, FrameError> {
+    let serialized = serde_json::to_vec(op)?;
+    Ok(Sha256::digest(serialized).into())
+}
+
+async fn respond_to_replay<const RESPONSE_BYTE_LIMIT: usize>(
+    requests: &ReplayCache<RESPONSE_BYTE_LIMIT>,
+    output: &mpsc::Sender<Outbound>,
+    request_id: u64,
+    digest: &RequestDigest,
+) -> Result<bool, DaemonError> {
+    let response = match requests.lookup(request_id, digest)? {
+        ReplayLookup::Miss => return Ok(false),
+        ReplayLookup::Replay(response) => response,
+        ReplayLookup::Conflict => IpcResponse {
+            id: request_id,
+            result: Err(IpcError::DuplicateRequestId),
+        },
+    };
+    send_response(output, response).await?;
+    Ok(true)
+}
+
 async fn handle_client(
     stream: UnixStream,
     daemon_uid: u32,
@@ -212,7 +319,7 @@ async fn connection_loop<R: AsyncRead + Unpin>(
         return Ok(());
     }
 
-    let mut requests = BTreeMap::<u64, (Vec<u8>, IpcResponse)>::new();
+    let mut requests = ReplayCache::<MAX_REPLAY_RESPONSE_BYTES>::default();
     let mut shutdown_receiver = shutdown.subscribe();
     loop {
         let request = tokio::select! {
@@ -232,17 +339,8 @@ async fn connection_loop<R: AsyncRead + Unpin>(
             .await?;
             continue;
         }
-        let digest = serde_json::to_vec(&request.op).map_err(FrameError::Serialize)?;
-        if let Some((prior_digest, prior_response)) = requests.get(&request.id) {
-            let response = if prior_digest == &digest {
-                prior_response.clone()
-            } else {
-                IpcResponse {
-                    id: request.id,
-                    result: Err(IpcError::DuplicateRequestId),
-                }
-            };
-            send_response(output, response).await?;
+        let digest = request_digest(&request.op)?;
+        if respond_to_replay(&requests, output, request.id, &digest).await? {
             continue;
         }
         if requests.len() >= MAX_REQUEST_IDS {
@@ -266,7 +364,9 @@ async fn connection_loop<R: AsyncRead + Unpin>(
             Ok(IpcResult::PassiveSubscribed { snapshot }) => snapshot.generation,
             _ => 0,
         };
-        requests.insert(request.id, (digest, response.clone()));
+        // Subscription connections become read-only immediately, so no later
+        // request can replay this acknowledgement and it need not be retained.
+        let retained = subscribe || requests.insert(request.id, digest, &response)?;
         send_response(output, response).await?;
         if let Some(receiver) = subscription.as_mut() {
             stream_snapshots(
@@ -278,6 +378,12 @@ async fn connection_loop<R: AsyncRead + Unpin>(
                 &shutdown,
             )
             .await?;
+            return Ok(());
+        }
+        // Never keep processing IDs whose response could not be retained:
+        // closing after the one successful write preserves exact replay
+        // semantics without letting cached response memory exceed its cap.
+        if !retained {
             return Ok(());
         }
     }
@@ -676,6 +782,60 @@ mod tests {
     #[test]
     fn handshake_fixture_is_well_formed() {
         assert!(matches!(handshake(1).op, IpcOp::Handshake { .. }));
+    }
+
+    #[test]
+    fn replay_cache_uses_fixed_digests_and_bounds_response_bytes() {
+        let mut cache = ReplayCache::<256>::default();
+        let digest = request_digest(&IpcOp::PassiveSnapshot).unwrap();
+        assert_eq!(std::mem::size_of_val(&digest), REQUEST_DIGEST_BYTES);
+
+        let retained = IpcResponse {
+            id: 7,
+            result: Err(IpcError::Internal("small".into())),
+        };
+        assert!(cache.insert(7, digest, &retained).unwrap());
+        let retained_bytes = cache.retained_response_bytes();
+        assert!(retained_bytes > 0);
+        assert!(retained_bytes <= 256);
+
+        let oversized = IpcResponse {
+            id: 8,
+            result: Err(IpcError::Internal("x".repeat(256))),
+        };
+        let oversized_digest = request_digest(&IpcOp::Shutdown).unwrap();
+        assert!(!cache.insert(8, oversized_digest, &oversized).unwrap());
+        assert_eq!(cache.retained_response_bytes(), retained_bytes);
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn replay_cache_preserves_same_id_semantics() {
+        let mut cache = ReplayCache::<1024>::default();
+        let snapshot_digest = request_digest(&IpcOp::PassiveSnapshot).unwrap();
+        let response = IpcResponse {
+            id: 41,
+            result: Err(IpcError::Internal("stable replay".into())),
+        };
+        assert!(cache.insert(41, snapshot_digest, &response).unwrap());
+
+        let ReplayLookup::Replay(replayed) = cache.lookup(41, &snapshot_digest).unwrap() else {
+            panic!("same id and operation must replay the retained response");
+        };
+        assert_eq!(
+            serde_json::to_value(replayed).unwrap(),
+            serde_json::to_value(response).unwrap()
+        );
+
+        let shutdown_digest = request_digest(&IpcOp::Shutdown).unwrap();
+        assert!(matches!(
+            cache.lookup(41, &shutdown_digest).unwrap(),
+            ReplayLookup::Conflict
+        ));
+        assert!(matches!(
+            cache.lookup(42, &shutdown_digest).unwrap(),
+            ReplayLookup::Miss
+        ));
     }
 
     #[test]

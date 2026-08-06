@@ -114,7 +114,13 @@ async fn passive_candidate_is_concurrent_race_free_and_cannot_mutate() {
             id: 7,
             op: IpcOp::PassiveSnapshot,
         };
-        assert!(raw_exchange(&mut stream, &snapshot).result.is_ok());
+        let first = raw_exchange(&mut stream, &snapshot);
+        assert!(first.result.is_ok());
+        let replayed = raw_exchange(&mut stream, &snapshot);
+        assert_eq!(
+            serde_json::to_value(replayed).unwrap(),
+            serde_json::to_value(first).unwrap()
+        );
         let conflicting = IpcRequest {
             id: 7,
             op: IpcOp::Shutdown,

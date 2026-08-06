@@ -352,7 +352,7 @@ mod tests {
     }
 
     #[test]
-    fn current_client_range_includes_previous_protocol() {
+    fn current_client_range_starts_at_the_handshake_protocol() {
         let hello = ClientHello::current(Vec::new());
         assert_eq!(
             hello.protocol,
@@ -361,6 +361,6 @@ mod tests {
                 max: IPC_PROTOCOL_MAX,
             }
         );
-        assert!(hello.protocol.min < hello.protocol.max);
+        assert_eq!(hello.protocol.min, 2);
     }
 }
