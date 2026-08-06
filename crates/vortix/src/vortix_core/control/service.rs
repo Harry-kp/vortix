@@ -1078,10 +1078,35 @@ struct OwnerState {
     challenge_answers: BTreeMap<ChallengeId, oneshot::Sender<Secret>>,
     observation_clocks: BTreeMap<ObservationScope, u64>,
     work_admissions: BTreeMap<(OperationId, ProfileId), ProfileAdmission>,
+    reconnect_operations: BTreeMap<OperationId, ReconnectOperation>,
     tunnel_revisions: BTreeMap<ProfileId, TunnelRevision>,
     recovery_operations: BTreeSet<OperationId>,
     lifecycle_operations: BTreeMap<OperationId, LifecycleOperation>,
     next_lifecycle_event: u64,
+}
+
+impl OwnerState {
+    fn release_operation_admission(&mut self, operation_id: &OperationId) {
+        self.work_admissions
+            .retain(|(operation, _), _| operation != operation_id);
+        self.reconnect_operations.remove(operation_id);
+    }
+}
+
+#[derive(Debug)]
+struct ReconnectOperation {
+    targets: BTreeSet<ProfileId>,
+    teardown_dispatched: BTreeSet<ProfileId>,
+}
+
+impl ReconnectOperation {
+    fn includes(&self, profile_id: &ProfileId) -> bool {
+        self.targets.contains(profile_id)
+    }
+
+    fn can_reconnect(&self, profile_id: &ProfileId) -> bool {
+        self.includes(profile_id) && self.teardown_dispatched.contains(profile_id)
+    }
 }
 
 #[derive(Debug)]
@@ -1341,6 +1366,7 @@ async fn run_service(
         challenge_answers: BTreeMap::new(),
         observation_clocks: BTreeMap::new(),
         work_admissions: BTreeMap::new(),
+        reconnect_operations: BTreeMap::new(),
         tunnel_revisions,
         recovery_operations: snapshot
             .operations
@@ -1818,6 +1844,8 @@ fn drive_supervision(
                 else {
                     continue;
                 };
+                let operation_id = operation.id.clone();
+                let operation_generation = operation.desired_generation;
                 let remaining = operation.deadline_millis.saturating_sub(now);
                 let mutation = if matches!(action, ReconcileAction::Connect { .. }) {
                     TunnelMutation::Connect
@@ -1841,7 +1869,7 @@ fn drive_supervision(
                 };
                 let work = TunnelWork {
                     profile_id: profile_id.clone(),
-                    operation_id: operation.id.clone(),
+                    operation_id: operation_id.clone(),
                     revision: *action_revision,
                     mutation,
                     protocol: config
@@ -1861,48 +1889,116 @@ fn drive_supervision(
                         ),
                     deadline,
                 };
-                let key = (operation.id.clone(), profile_id.clone());
-                let reserved = owner.work_admissions.remove(&key).or_else(|| {
-                    if owner.recovery_operations.contains(&operation.id) {
-                        let routes = config
-                            .profile_topologies
-                            .get(profile_id)
-                            .map(|topology| topology.routes.iter().cloned().collect::<Vec<_>>())
-                            .unwrap_or_default();
-                        supervisor.reserve_tunnel(profile_id, routes).ok()
-                    } else {
-                        None
+                let key = (operation_id.clone(), profile_id.clone());
+                let reconnect_target = owner
+                    .reconnect_operations
+                    .get(&operation_id)
+                    .is_some_and(|reconnect| reconnect.includes(profile_id));
+                let reconnect_readmission = mutation == TunnelMutation::Connect
+                    && owner
+                        .reconnect_operations
+                        .get(&operation_id)
+                        .is_some_and(|reconnect| reconnect.can_reconnect(profile_id));
+                let reserved = owner.work_admissions.remove(&key).map_or_else(
+                    || {
+                        if owner.recovery_operations.contains(&operation_id)
+                            || reconnect_readmission
+                        {
+                            let routes = config
+                                .profile_topologies
+                                .get(profile_id)
+                                .map(|topology| topology.routes.iter().cloned().collect::<Vec<_>>())
+                                .unwrap_or_default();
+                            supervisor.reserve_tunnel(profile_id, routes).map(Some)
+                        } else {
+                            Ok(None)
+                        }
+                    },
+                    |admission| Ok(Some(admission)),
+                );
+                let reserved = match reserved {
+                    Ok(Some(reserved)) => reserved,
+                    Ok(None) => {
+                        invalidate_gates(
+                            snapshot,
+                            DriftGates {
+                                interface: true,
+                                route: true,
+                                dns: true,
+                                firewall: true,
+                            },
+                            now,
+                            now,
+                        );
+                        continue;
                     }
-                });
-                let Some(reserved) = reserved else {
-                    invalidate_gates(
-                        snapshot,
-                        DriftGates {
-                            interface: true,
-                            route: true,
-                            dns: true,
-                            firewall: true,
-                        },
-                        now,
-                        now,
-                    );
-                    continue;
+                    Err(error) => {
+                        invalidate_gates(
+                            snapshot,
+                            DriftGates {
+                                interface: true,
+                                route: true,
+                                dns: true,
+                                firewall: true,
+                            },
+                            now,
+                            now,
+                        );
+                        if reconnect_target {
+                            fail_tunnel_dispatch_operation(
+                                &operation_id,
+                                operation_generation,
+                                error,
+                                snapshot,
+                                owner,
+                                admission,
+                                now,
+                                selection,
+                                config,
+                                events,
+                            );
+                        }
+                        continue;
+                    }
                 };
-                if matches!(
-                    supervisor.dispatch_reserved_tunnel(work, reserved),
-                    Err(WorkFailure::Busy | WorkFailure::RouteConflict)
-                ) {
-                    invalidate_gates(
-                        snapshot,
-                        DriftGates {
-                            interface: true,
-                            route: true,
-                            dns: true,
-                            firewall: true,
-                        },
-                        now,
-                        now,
-                    );
+                match supervisor.dispatch_reserved_tunnel(work, reserved) {
+                    Ok(_) => {
+                        if reconnect_target && mutation == TunnelMutation::Disconnect {
+                            owner
+                                .reconnect_operations
+                                .get_mut(&operation_id)
+                                .expect("reconnect ownership checked")
+                                .teardown_dispatched
+                                .insert(profile_id.clone());
+                        }
+                    }
+                    Err(error) => {
+                        invalidate_gates(
+                            snapshot,
+                            DriftGates {
+                                interface: true,
+                                route: true,
+                                dns: true,
+                                firewall: true,
+                            },
+                            now,
+                            now,
+                        );
+                        if reconnect_target {
+                            fail_tunnel_dispatch_operation(
+                                &operation_id,
+                                operation_generation,
+                                error,
+                                snapshot,
+                                owner,
+                                admission,
+                                now,
+                                selection,
+                                config,
+                                events,
+                            );
+                        }
+                    }
                 }
             }
             ReconcileAction::ObserveReadOnly { .. } => {}
@@ -2083,6 +2179,63 @@ fn operation_for_generation(
     })
 }
 
+#[allow(clippy::too_many_arguments)] // Failure closes one admitted effect and starts owned recovery.
+fn fail_tunnel_dispatch_operation(
+    operation_id: &OperationId,
+    desired_generation: u64,
+    failure: WorkFailure,
+    snapshot: &mut ControlSnapshot,
+    owner: &mut OwnerState,
+    admission: &Arc<Mutex<AdmissionState>>,
+    now: u64,
+    selection: ExecutionSelection,
+    config: &ControlServiceConfig,
+    events: &mut Vec<ControlEvent>,
+) {
+    let was_recovery = owner.recovery_operations.contains(operation_id);
+    let operation_failure = match failure {
+        WorkFailure::TimedOut => OperationFailure::Timeout,
+        WorkFailure::Busy | WorkFailure::RouteConflict => OperationFailure::Rejected,
+        WorkFailure::Cancelled
+        | WorkFailure::Panicked
+        | WorkFailure::EffectFailed
+        | WorkFailure::HandshakeFailed
+        | WorkFailure::OutcomeUnknown
+        | WorkFailure::Stale
+        | WorkFailure::Stopped => OperationFailure::Internal,
+    };
+    let completion = complete_operation(
+        OperationCompletion {
+            operation_id: operation_id.clone(),
+            desired_generation,
+            outcome: CompletionOutcome::Failed(operation_failure),
+        },
+        snapshot,
+        owner,
+        admission,
+        now,
+        config,
+        events,
+    );
+    if !was_recovery
+        && matches!(
+            completion,
+            Ok(CompletionResult::Terminal(OperationStatus::Failed))
+        )
+    {
+        start_recovery_operation(
+            snapshot,
+            owner,
+            admission,
+            now,
+            selection,
+            desired_generation,
+            config,
+            events,
+        );
+    }
+}
+
 fn transition_for_plan(actions: &[ReconcileAction]) -> TopologyTransitionKind {
     let connects = actions
         .iter()
@@ -2177,6 +2330,7 @@ fn handle_envelope(
         } => {
             for evicted_id in evicted {
                 snapshot.operations.remove(&evicted_id);
+                owner.release_operation_admission(&evicted_id);
             }
             let expired = request.deadline.0 <= now;
             let desired_generation = if expired {
@@ -2210,6 +2364,15 @@ fn handle_envelope(
                     .work_admissions
                     .insert((operation_id.clone(), profile_id), reserved);
             }
+            if !expired && matches!(&request.command, UserCommand::Reconnect { .. }) {
+                owner.reconnect_operations.insert(
+                    operation_id.clone(),
+                    ReconnectOperation {
+                        targets: target_profiles.iter().cloned().collect(),
+                        teardown_dispatched: BTreeSet::new(),
+                    },
+                );
+            }
             events.push(ControlEvent::OperationAdmitted {
                 operation_id: operation_id.clone(),
                 desired_generation,
@@ -2223,9 +2386,7 @@ fn handle_envelope(
                     .insert(operation_id.clone(), lifecycle);
             }
             if expired {
-                owner
-                    .work_admissions
-                    .retain(|(reserved_operation, _), _| reserved_operation != &operation_id);
+                owner.release_operation_admission(&operation_id);
                 mark_terminal(admission, operation_id.clone());
                 events.push(ControlEvent::OperationCompleted {
                     operation_id: operation_id.clone(),
@@ -2929,9 +3090,7 @@ fn complete_operation(
         record.status = OperationStatus::Expired;
         record.result = Some(OperationResult::Expired);
         let was_recovery = owner.recovery_operations.remove(&completion.operation_id);
-        owner
-            .work_admissions
-            .retain(|(operation, _), _| operation != &completion.operation_id);
+        owner.release_operation_admission(&completion.operation_id);
         if was_recovery {
             snapshot.operations.remove(&completion.operation_id);
         } else {
@@ -2978,9 +3137,7 @@ fn complete_operation(
         }
     }
     let status = record.status;
-    owner
-        .work_admissions
-        .retain(|(operation, _), _| operation != &completion.operation_id);
+    owner.release_operation_admission(&completion.operation_id);
     if owner.recovery_operations.remove(&completion.operation_id) {
         snapshot.operations.remove(&completion.operation_id);
     } else {
@@ -3018,9 +3175,7 @@ fn expire_operations(
             record.status = OperationStatus::Expired;
             record.result = Some(OperationResult::Expired);
         }
-        owner
-            .work_admissions
-            .retain(|(operation, _), _| operation != &id);
+        owner.release_operation_admission(&id);
         if was_recovery {
             snapshot.operations.remove(&id);
         } else {
