@@ -16,9 +16,10 @@ use vortix::vortix_core::control::worker::{
     WorkFailure,
 };
 use vortix::vortix_core::control::{
-    Clock, CommandRequest, ControlEvent, ControlService, ControlServiceConfig, Deadline,
-    ExecutionSelection, GateEvidence, HookEvent, IdempotencyKey, Observation, PersistedTombstone,
-    ProfileTopology, ProtectionEvidence, ProtectionStatus, RequestedTunnelState, UserCommand,
+    Clock, CommandRequest, CompletionOutcome, CompletionResult, ControlEvent, ControlService,
+    ControlServiceConfig, Deadline, ExecutionSelection, GateEvidence, HookEvent, IdempotencyKey,
+    Observation, OperationCompletion, OperationStatus, PersistedTombstone, ProfileTopology,
+    ProtectionEvidence, ProtectionStatus, RequestedTunnelState, UserCommand,
 };
 use vortix::vortix_core::ports::tunnel::{HandshakeEvidence, TunnelKindTag};
 use vortix::vortix_core::profile::{ProfileId, ProtocolKind};
@@ -1035,17 +1036,19 @@ async fn canonical_service_dispatches_admitted_mutation_without_blocking_snapsho
 #[allow(clippy::too_many_lines)] // One end-to-end admission, effect, and hook assertion.
 async fn reconnect_all_targets_only_currently_managed_profiles() {
     #[derive(Default)]
-    struct Capture(Mutex<Vec<(ProfileId, TunnelMutation)>>);
+    struct Capture(Mutex<Vec<(ProfileId, OperationId, TunnelRevision, TunnelMutation)>>);
     impl TunnelExecutor for Capture {
         fn execute(
             &self,
             work: &TunnelWork,
             _: &CancellationToken,
         ) -> Result<TunnelExecutionReceipt, String> {
-            self.0
-                .lock()
-                .unwrap()
-                .push((work.profile_id.clone(), work.mutation));
+            self.0.lock().unwrap().push((
+                work.profile_id.clone(),
+                work.operation_id.clone(),
+                work.revision,
+                work.mutation,
+            ));
             Ok(execution_receipt(work))
         }
     }
@@ -1119,7 +1122,10 @@ async fn reconnect_all_targets_only_currently_managed_profiles() {
         .0
         .lock()
         .unwrap()
-        .contains(&(connected.clone(), TunnelMutation::Connect))
+        .iter()
+        .any(|(profile_id, _, _, mutation)| {
+            profile_id == &connected && *mutation == TunnelMutation::Connect
+        })
     {
         assert!(tokio::time::Instant::now() < deadline, "connect dispatched");
         tokio::task::yield_now().await;
@@ -1195,14 +1201,147 @@ async fn reconnect_all_targets_only_currently_managed_profiles() {
         client.snapshot().desired.tunnels.get(&disconnected),
         Some(&RequestedTunnelState::Disconnected)
     );
-
-    tokio::time::sleep(Duration::from_millis(25)).await;
-    let executions = executor.0.lock().unwrap();
-    let reconnect_executions = &executions[executions_before..];
-    assert!(!reconnect_executions.is_empty());
-    assert!(reconnect_executions
+    let reconnect_revision = TunnelRevision {
+        authority_epoch: AuthorityEpoch(1),
+        generation: client.snapshot().desired.generation,
+    };
+    wait_for_condition(
+        || {
+            executor.0.lock().unwrap()[executions_before..].iter().any(
+                |(profile_id, operation_id, revision, mutation)| {
+                    profile_id == &connected
+                        && operation_id == &reconnect.operation_id
+                        && revision == &reconnect_revision
+                        && *mutation == TunnelMutation::Disconnect
+                },
+            )
+        },
+        "reconnect teardown was not dispatched",
+    )
+    .await;
+    assert!(executor.0.lock().unwrap()[executions_before..]
         .iter()
-        .all(|(profile_id, _)| profile_id == &connected));
+        .all(|(profile_id, _, _, _)| profile_id == &connected));
+
+    wait_for_condition(
+        || {
+            supervisor.profile_truth(&connected).is_some_and(|entry| {
+                entry.operation_id == reconnect.operation_id
+                    && entry.revision == reconnect_revision
+                    && entry.mutation == TunnelMutation::Disconnect
+                    && entry.truth == SupervisedTruth::WaitingForObservation
+            })
+        },
+        "reconnect teardown did not reach its observation barrier",
+    )
+    .await;
+    let desired = client.snapshot().desired;
+    service
+        .observer()
+        .observe(Observation::Tunnel {
+            profile_id: connected.clone(),
+            active: false,
+            interface_name: None,
+            observed_at_millis: 0,
+            protection: Some(ProtectionEvidence {
+                desired_generation: desired.generation,
+                authority_epoch: desired.authority_epoch,
+                policy_digest: desired.policy_digest.clone(),
+                observed_at_millis: 0,
+                interface: GateEvidence::Verified,
+                route: GateEvidence::Verified,
+                dns: GateEvidence::Verified,
+                firewall: GateEvidence::Verified,
+            }),
+        })
+        .await
+        .expect("reconnect absence observed");
+
+    wait_for_condition(
+        || {
+            executor.0.lock().unwrap()[executions_before..].iter().any(
+                |(profile_id, operation_id, revision, mutation)| {
+                    profile_id == &connected
+                        && operation_id == &reconnect.operation_id
+                        && revision == &reconnect_revision
+                        && *mutation == TunnelMutation::Connect
+                },
+            )
+        },
+        "reconnect did not dispatch its second-phase connect",
+    )
+    .await;
+    wait_for_condition(
+        || {
+            supervisor.profile_truth(&connected).is_some_and(|entry| {
+                entry.operation_id == reconnect.operation_id
+                    && entry.revision == reconnect_revision
+                    && entry.mutation == TunnelMutation::Connect
+                    && entry.truth == SupervisedTruth::WaitingForObservation
+            })
+        },
+        "reconnect connect did not reach its observation barrier",
+    )
+    .await;
+    service
+        .observer()
+        .observe(Observation::Tunnel {
+            profile_id: connected.clone(),
+            active: true,
+            interface_name: Some("tun-connected".into()),
+            observed_at_millis: 0,
+            protection: Some(ProtectionEvidence {
+                desired_generation: desired.generation,
+                authority_epoch: desired.authority_epoch,
+                policy_digest: desired.policy_digest.clone(),
+                observed_at_millis: 0,
+                interface: GateEvidence::Verified,
+                route: GateEvidence::Verified,
+                dns: GateEvidence::Verified,
+                firewall: GateEvidence::Verified,
+            }),
+        })
+        .await
+        .expect("reconnect presence observed");
+    wait_for_condition(
+        || {
+            supervisor.profile_truth(&connected).is_some_and(|entry| {
+                entry.operation_id == reconnect.operation_id
+                    && entry.revision == reconnect_revision
+                    && entry.truth == SupervisedTruth::ObservedPresent
+            })
+        },
+        "reconnect presence did not settle",
+    )
+    .await;
+    assert_eq!(
+        service
+            .completer()
+            .complete(OperationCompletion {
+                operation_id: reconnect.operation_id.clone(),
+                desired_generation: desired.generation,
+                outcome: CompletionOutcome::ObservedSuccess(ProtectionEvidence {
+                    desired_generation: desired.generation,
+                    authority_epoch: desired.authority_epoch,
+                    policy_digest: desired.policy_digest,
+                    observed_at_millis: 0,
+                    interface: GateEvidence::Verified,
+                    route: GateEvidence::Verified,
+                    dns: GateEvidence::Verified,
+                    firewall: GateEvidence::Verified,
+                }),
+            })
+            .await,
+        Ok(CompletionResult::Terminal(OperationStatus::Succeeded))
+    );
+    wait_for_condition(
+        || {
+            client.snapshot().operations[&reconnect.operation_id].status
+                == OperationStatus::Succeeded
+        },
+        "reconnect operation did not converge",
+    )
+    .await;
 }
 
 #[tokio::test]
