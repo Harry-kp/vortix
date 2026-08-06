@@ -21,7 +21,7 @@ use crate::vortix_core::profile::Profile;
 use crate::vortix_process::{CommandSpec, PrivilegeReq};
 use tracing::{debug, info, warn};
 
-use crate::vortix_protocol_openvpn::parser::parse_ovpn_conf;
+use crate::vortix_protocol_openvpn::parser::{is_forbidden_privileged_directive, parse_ovpn_conf};
 
 /// Quality of the DNS intent recovered from an `OpenVPN` session log.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,29 +82,7 @@ fn sanitize_managed_config(text: &str) -> Result<String, TunnelError> {
 }
 
 fn validate_managed_directive(directive: &str) -> Result<(), ManagedConfigViolation> {
-    const FORBIDDEN: &[&str] = &[
-        "daemon",
-        "config",
-        "include",
-        "plugin",
-        "up",
-        "down",
-        "route-up",
-        "route-pre-down",
-        "ipchange",
-        "client-connect",
-        "client-connect-deferred",
-        "client-disconnect",
-        "learn-address",
-        "tls-verify",
-        "tls-crypt-v2-verify",
-        "auth-user-pass-verify",
-        "iproute",
-    ];
-    if FORBIDDEN
-        .iter()
-        .any(|forbidden| directive.eq_ignore_ascii_case(forbidden))
-    {
+    if is_forbidden_privileged_directive(directive) {
         return Err(ManagedConfigViolation {
             directive: directive.to_ascii_lowercase(),
         });
@@ -719,6 +697,34 @@ fn build_ovpn_args(
     args
 }
 
+fn resolve_standard_openvpn_binary() -> Result<PathBuf, TunnelError> {
+    // Standard mode deliberately accepts the owner's full client and package
+    // installation as root-trusted input (including Homebrew). Canonicalizing
+    // the existing PATH result prevents a second lookup inside the privileged
+    // child; package-owned identity/digest verification belongs to U12's
+    // Background-mode helper boundary.
+    let candidate = crate::utils::find_binary_path("openvpn").ok_or_else(|| {
+        TunnelError::Subprocess("OpenVPN executable was not found on PATH".into())
+    })?;
+    candidate.canonicalize().map_err(|error| {
+        TunnelError::Subprocess(format!(
+            "resolve OpenVPN executable {}: {error}",
+            candidate.display()
+        ))
+    })
+}
+
+fn privileged_openvpn_command(program: &Path, args: Vec<String>) -> CommandSpec {
+    let mut command =
+        CommandSpec::oneshot(program.to_string_lossy(), args).privilege(PrivilegeReq::Root);
+    // The daemon may inherit caller-controlled OpenSSL provider and dynamic
+    // loader variables. Resolve the executable before this boundary, then
+    // launch it with an empty environment so the child never searches PATH or
+    // consumes provider/loader configuration from its caller.
+    command.env_clear = true;
+    command
+}
+
 fn tail_lines(content: &str, n: usize) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let start = lines.len().saturating_sub(n);
@@ -827,6 +833,7 @@ impl Tunnel for OvpnTunnel {
         // Reject recursive configuration and executable hooks before creating
         // runtime artifacts or spawning any privileged process.
         let validated_config = validate_managed_config(&profile.config_path)?;
+        let openvpn_binary = resolve_standard_openvpn_binary()?;
 
         if let Some(parent) = pid_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -930,7 +937,7 @@ impl Tunnel for OvpnTunnel {
 
         let handshake = crate::vortix_process::start_managed_foreground(
             ownership_id.clone(),
-            CommandSpec::oneshot("openvpn", args).privilege(PrivilegeReq::Root),
+            privileged_openvpn_command(&openvpn_binary, args),
             vec![
                 effective_config.clone(),
                 self.management_socket_path(artifact_key),
@@ -1281,6 +1288,31 @@ mod tests {
     }
 
     #[test]
+    fn privileged_openvpn_spawn_uses_an_allowlisted_environment() {
+        let command = privileged_openvpn_command(
+            std::path::Path::new("/usr/sbin/openvpn"),
+            vec!["--version".into()],
+        );
+        assert_eq!(command.requires_privilege, PrivilegeReq::Root);
+        assert!(std::path::Path::new(&command.program).is_absolute());
+        assert!(command.env_clear);
+        assert!(command.env.is_empty());
+        for unsafe_name in [
+            "OPENSSL_CONF",
+            "OPENSSL_MODULES",
+            "OPENSSL_ENGINES",
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "LD_AUDIT",
+            "DYLD_INSERT_LIBRARIES",
+            "DYLD_LIBRARY_PATH",
+            "DYLD_FRAMEWORK_PATH",
+        ] {
+            assert!(!command.env.contains_key(unsafe_name));
+        }
+    }
+
+    #[test]
     fn managed_config_strips_local_dns_but_preserves_other_options() {
         let input = "client\ndhcp-option DNS 1.1.1.1\ndhcp-option DOMAIN corp.example\ndhcp-option NTP 10.0.0.1\nremote vpn.example 1194\n";
         let output = sanitize_managed_config(input).unwrap();
@@ -1354,6 +1386,30 @@ mod tests {
                         .next()
                         .unwrap()
                         .trim_start_matches('-')
+                ),
+                "unexpected error for {directive}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn managed_config_rejects_external_crypto_providers() {
+        for directive in [
+            "providers legacy default",
+            "--EnGiNe pkcs11",
+            "pkcs11-providers /tmp/evil.so",
+        ] {
+            let error = sanitize_managed_config(&format!("client\n{directive}\n"))
+                .expect_err("provider-loading directives must not reach privileged OpenVPN");
+            assert!(
+                error.to_string().contains(
+                    directive
+                        .split_whitespace()
+                        .next()
+                        .unwrap()
+                        .trim_start_matches('-')
+                        .to_ascii_lowercase()
+                        .as_str()
                 ),
                 "unexpected error for {directive}: {error}"
             );

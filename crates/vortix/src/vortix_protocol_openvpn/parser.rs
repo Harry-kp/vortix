@@ -147,7 +147,7 @@ pub fn parse_ovpn_conf(text: &str) -> Result<OvpnParsedProfile, ParseError> {
         let Some(directive) = tokens.next() else {
             continue;
         };
-        reject_executable_directive(directive.trim_start_matches('-'))?;
+        reject_privileged_directive(directive.trim_start_matches('-'))?;
 
         match directive {
             "remote" => {
@@ -202,8 +202,8 @@ pub fn parse_ovpn_conf(text: &str) -> Result<OvpnParsedProfile, ParseError> {
     Ok(profile)
 }
 
-fn reject_executable_directive(directive: &str) -> Result<(), ParseError> {
-    const EXECUTABLE_DIRECTIVES: &[&str] = &[
+pub(super) fn is_forbidden_privileged_directive(directive: &str) -> bool {
+    const FORBIDDEN: &[&str] = &[
         "daemon",
         "config",
         "include",
@@ -221,13 +221,19 @@ fn reject_executable_directive(directive: &str) -> Result<(), ParseError> {
         "tls-crypt-v2-verify",
         "auth-user-pass-verify",
         "iproute",
+        "engine",
+        "providers",
+        "pkcs11-providers",
     ];
-    if EXECUTABLE_DIRECTIVES
+    FORBIDDEN
         .iter()
-        .any(|candidate| directive.eq_ignore_ascii_case(candidate))
-    {
+        .any(|forbidden| directive.eq_ignore_ascii_case(forbidden))
+}
+
+fn reject_privileged_directive(directive: &str) -> Result<(), ParseError> {
+    if is_forbidden_privileged_directive(directive) {
         return Err(ParseError::Unsupported(format!(
-            "OpenVPN `{}` executable directive is not allowed: Vortix never runs profile commands as root; migrate lifecycle automation to a global hook using an absolute executable plus argv",
+            "OpenVPN `{}` privileged directive is not allowed: Vortix never runs profile commands as root or loads profile-selected crypto providers; migrate lifecycle automation to a global hook using an absolute executable plus argv",
             directive.to_ascii_lowercase()
         )));
     }
@@ -349,6 +355,23 @@ mod tests {
                 .to_string();
             assert!(error.contains("never runs profile commands as root"));
             assert!(error.contains("global hook"));
+        }
+    }
+
+    #[test]
+    fn external_crypto_provider_directives_fail_unprivileged_parsing() {
+        for directive in [
+            "providers legacy default",
+            "--EnGiNe pkcs11",
+            "pkcs11-providers /tmp/evil.so",
+        ] {
+            let error = parse_ovpn_conf(&format!("client\n{directive}\n"))
+                .expect_err("provider-loading directives must not reach privileged OpenVPN")
+                .to_string();
+            assert!(
+                error.contains("not allowed"),
+                "unexpected error for {directive}: {error}"
+            );
         }
     }
 
