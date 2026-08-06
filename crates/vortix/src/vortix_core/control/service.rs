@@ -34,7 +34,7 @@ use crate::vortix_core::control::snapshot::{ControlSnapshot, ServiceReadiness};
 use crate::vortix_core::control::supervisor::{PolicyVerification, SupervisedTruth, Supervisor};
 use crate::vortix_core::control::worker::{
     ControlRevision, ProfileAdmission, RouteClaim, TopologyPolicy, TopologyState,
-    TopologyTransitionKind, TunnelMutation, TunnelWork, WorkFailure,
+    TopologyTransitionKind, TunnelMutation, TunnelRevision, TunnelWork, WorkFailure,
 };
 use crate::vortix_core::profile::ProfileId;
 
@@ -1078,6 +1078,7 @@ struct OwnerState {
     challenge_answers: BTreeMap<ChallengeId, oneshot::Sender<Secret>>,
     observation_clocks: BTreeMap<ObservationScope, u64>,
     work_admissions: BTreeMap<(OperationId, ProfileId), ProfileAdmission>,
+    tunnel_revisions: BTreeMap<ProfileId, TunnelRevision>,
     recovery_operations: BTreeSet<OperationId>,
     lifecycle_operations: BTreeMap<OperationId, LifecycleOperation>,
     next_lifecycle_event: u64,
@@ -1294,6 +1295,7 @@ fn requested_resources(config: &ControlServiceConfig) -> BTreeMap<ProfileId, Req
 
 fn persisted_tombstones(
     supervisor: Option<&Supervisor>,
+    policy_digest: &PolicyDigest,
 ) -> BTreeMap<ProfileId, PersistedTombstone> {
     supervisor
         .map(Supervisor::tombstones)
@@ -1307,9 +1309,9 @@ fn persisted_tombstones(
             (
                 profile_id,
                 PersistedTombstone {
-                    authority_epoch: tombstone.authority_epoch,
-                    generation: tombstone.generation,
-                    policy_digest: tombstone.policy_digest,
+                    authority_epoch: tombstone.revision.authority_epoch,
+                    generation: tombstone.revision.generation,
+                    policy_digest: policy_digest.clone(),
                     operation_id: tombstone.operation_id,
                     teardown_failed,
                 },
@@ -1333,11 +1335,13 @@ async fn run_service(
     selection: ExecutionSelection,
     supervisor: Option<Arc<Supervisor>>,
 ) {
+    let tunnel_revisions = initial_tunnel_revisions(&snapshot, supervisor.as_deref());
     let mut owner = OwnerState {
         challenge_terminals: BTreeMap::new(),
         challenge_answers: BTreeMap::new(),
         observation_clocks: BTreeMap::new(),
         work_admissions: BTreeMap::new(),
+        tunnel_revisions,
         recovery_operations: snapshot
             .operations
             .values()
@@ -1420,6 +1424,32 @@ async fn run_service(
     }
 }
 
+fn initial_tunnel_revisions(
+    snapshot: &ControlSnapshot,
+    supervisor: Option<&Supervisor>,
+) -> BTreeMap<ProfileId, TunnelRevision> {
+    let recovered = TunnelRevision {
+        authority_epoch: snapshot.desired.authority_epoch,
+        generation: snapshot.desired.generation,
+    };
+    let mut revisions = snapshot
+        .desired
+        .tunnels
+        .keys()
+        .cloned()
+        .map(|profile_id| (profile_id, recovered))
+        .collect::<BTreeMap<_, _>>();
+    if let Some(supervisor) = supervisor {
+        revisions.extend(
+            supervisor
+                .tombstones()
+                .into_iter()
+                .map(|(profile_id, tombstone)| (profile_id, tombstone.revision)),
+        );
+    }
+    revisions
+}
+
 async fn persist_control_state_if_changed(
     config: &ControlServiceConfig,
     before: &ControlSnapshot,
@@ -1435,7 +1465,7 @@ async fn persist_control_state_if_changed(
     if startup_persistence_fault {
         return false;
     }
-    let tombstones = persisted_tombstones(supervisor);
+    let tombstones = persisted_tombstones(supervisor, &snapshot.desired.policy_digest);
     if durable.desired == snapshot.desired
         && durable.operations == snapshot.operations
         && durable.reconciliation_required != snapshot.readiness.reconciliation_complete
@@ -1511,11 +1541,9 @@ fn drive_supervision(
     }
 
     while let Some(result) = supervisor.poll_tunnel() {
-        if let Some(handshake) = result
-            .handshake
-            .as_ref()
-            .filter(|handshake| result.result.is_ok() && handshake.generation == result.generation)
-        {
+        if let Some(handshake) = result.handshake.as_ref().filter(|handshake| {
+            result.result.is_ok() && handshake.generation == result.revision.generation
+        }) {
             snapshot
                 .observed
                 .wireguard_handshakes
@@ -1526,7 +1554,7 @@ fn drive_supervision(
                 .insert(result.profile_id.clone(), result.probe_receipts.clone());
             events.push(ControlEvent::WireGuardHandshakeObserved {
                 profile_id: result.profile_id.clone(),
-                desired_generation: result.generation,
+                desired_generation: result.revision.generation,
                 handshake_at_millis: system_time_millis(handshake.handshake_at),
                 observed_at_millis: system_time_millis(handshake.observed_at),
             });
@@ -1552,7 +1580,7 @@ fn drive_supervision(
                 let completion = complete_operation(
                     OperationCompletion {
                         operation_id: result.operation_id.clone(),
-                        desired_generation: result.generation,
+                        desired_generation: result.revision.generation,
                         outcome: CompletionOutcome::Failed(OperationFailure::HandshakeFailed),
                     },
                     snapshot,
@@ -1574,7 +1602,7 @@ fn drive_supervision(
                         admission,
                         now,
                         selection,
-                        result.generation,
+                        result.revision.generation,
                         config,
                         events,
                     );
@@ -1631,13 +1659,17 @@ fn drive_supervision(
     });
     if evidence_is_exact_and_fresh {
         for (profile_id, fact) in &snapshot.observed.tunnels {
-            if supervisor.profile_truth(profile_id).is_some_and(|entry| {
-                entry.revision() == revision
-                    && entry.truth == SupervisedTruth::WaitingForObservation
-            }) {
+            if let Some(tunnel_revision) =
+                owner.tunnel_revisions.get(profile_id).filter(|revision| {
+                    supervisor.profile_truth(profile_id).is_some_and(|entry| {
+                        entry.revision == **revision
+                            && entry.truth == SupervisedTruth::WaitingForObservation
+                    })
+                })
+            {
                 let _ = supervisor.confirm_tunnel(
                     profile_id,
-                    &revision,
+                    tunnel_revision,
                     fact.active,
                     fact.interface_name.as_deref(),
                 );
@@ -1664,7 +1696,7 @@ fn drive_supervision(
                 entry.truth == SupervisedTruth::ObservedPresent && entry.adoption.is_some()
             });
             let managed_revision =
-                managed.then(|| supervision.expect("managed supervision checked").revision());
+                managed.then(|| supervision.expect("managed supervision checked").revision);
             (
                 profile.clone(),
                 TunnelObservation {
@@ -1693,9 +1725,7 @@ fn drive_supervision(
                 evidence: ScanEvidence::MissingPartial,
                 interface_name: None,
                 ownership: ObservationOwnership::Managed,
-                revision: supervised
-                    .get(profile)
-                    .map(crate::vortix_core::control::supervisor::ProfileSupervision::revision),
+                revision: supervised.get(profile).map(|entry| entry.revision),
                 adoption: None,
                 observed_at_millis: now,
             });
@@ -1715,7 +1745,7 @@ fn drive_supervision(
             (
                 profile.clone(),
                 InFlightMutation {
-                    revision: entry.revision(),
+                    revision: entry.revision,
                     operation: entry.operation_id.clone(),
                 },
             )
@@ -1727,7 +1757,7 @@ fn drive_supervision(
             (
                 profile.clone(),
                 DisconnectTombstone {
-                    revision: entry.revision(),
+                    revision: entry.revision,
                     teardown_failed: matches!(
                         entry.truth,
                         SupervisedTruth::Degraded(_) | SupervisedTruth::OutcomeUnknown
@@ -1738,6 +1768,7 @@ fn drive_supervision(
         .collect();
     let plan = plan_reconciliation(&ReconcileInput {
         revision: revision.clone(),
+        tunnel_revisions: owner.tunnel_revisions.clone(),
         desired_connected,
         observations,
         in_flight,
@@ -1750,7 +1781,9 @@ fn drive_supervision(
     for action in &plan.actions {
         match action {
             ReconcileAction::ClearTombstone { profile_id } => {
-                let _ = supervisor.confirm_tunnel(profile_id, &revision, false, None);
+                if let Some(tunnel_revision) = owner.tunnel_revisions.get(profile_id) {
+                    let _ = supervisor.confirm_tunnel(profile_id, tunnel_revision, false, None);
+                }
             }
             ReconcileAction::AdoptAttested {
                 evidence,
@@ -1762,7 +1795,7 @@ fn drive_supervision(
                 {
                     let _ = supervisor.adopt_attested(
                         evidence.clone(),
-                        adoption_revision.clone(),
+                        *adoption_revision,
                         operation.id.clone(),
                     );
                 }
@@ -1809,9 +1842,7 @@ fn drive_supervision(
                 let work = TunnelWork {
                     profile_id: profile_id.clone(),
                     operation_id: operation.id.clone(),
-                    generation: action_revision.generation,
-                    authority_epoch: action_revision.authority_epoch,
-                    policy_digest: action_revision.digest.clone(),
+                    revision: *action_revision,
                     mutation,
                     protocol: config
                         .profile_topologies
@@ -1883,10 +1914,12 @@ fn drive_supervision(
             let should_be_present = *desired == RequestedTunnelState::Connected;
             let observed = snapshot.observed.tunnels.get(profile);
             if should_be_present {
-                supervisor.profile_truth(profile).is_some_and(|entry| {
-                    entry.revision() == revision
-                        && entry.truth == SupervisedTruth::ObservedPresent
-                        && entry.adoption.is_some()
+                owner.tunnel_revisions.get(profile).is_some_and(|revision| {
+                    supervisor.profile_truth(profile).is_some_and(|entry| {
+                        entry.revision == *revision
+                            && entry.truth == SupervisedTruth::ObservedPresent
+                            && entry.adoption.is_some()
+                    })
                 }) && observed.is_some_and(|fact| {
                     fact.active
                         && fact.received_at_millis <= now
@@ -1901,7 +1934,7 @@ fn drive_supervision(
 
     if tunnel_barrier_ready {
         if let Some(operation) = operation_for_generation(snapshot, revision.generation).cloned() {
-            let target_profiles = snapshot
+            let target_profiles: BTreeSet<ProfileId> = snapshot
                 .desired
                 .tunnels
                 .iter()
@@ -1946,11 +1979,21 @@ fn drive_supervision(
                     )
                 }),
                 target: build_topology_state(
-                    target_profiles,
+                    target_profiles.clone(),
                     &snapshot.observed.tunnels,
                     config,
                     snapshot.desired.kill_switch,
                 ),
+                tunnel_revisions: target_profiles
+                    .iter()
+                    .filter_map(|profile| {
+                        owner
+                            .tunnel_revisions
+                            .get(profile)
+                            .copied()
+                            .map(|revision| (profile.clone(), revision))
+                    })
+                    .collect(),
                 transition: transition_for_plan(&plan.actions),
                 required_blocking: snapshot.desired.kill_switch
                     != crate::vortix_core::state::killswitch::KillSwitchMode::Off,
@@ -2139,7 +2182,7 @@ fn handle_envelope(
             let desired_generation = if expired {
                 snapshot.desired.generation
             } else {
-                apply_desired(&request.command, &target_profiles, snapshot);
+                apply_desired(&request.command, &target_profiles, snapshot, owner);
                 snapshot.desired.generation
             };
             let status = if expired {
@@ -2292,8 +2335,18 @@ fn apply_desired(
     command: &UserCommand,
     target_profiles: &[ProfileId],
     snapshot: &mut ControlSnapshot,
+    owner: &mut OwnerState,
 ) {
     snapshot.desired.generation = snapshot.desired.generation.saturating_add(1);
+    let tunnel_revision = TunnelRevision {
+        authority_epoch: snapshot.desired.authority_epoch,
+        generation: snapshot.desired.generation,
+    };
+    for profile_id in target_profiles {
+        owner
+            .tunnel_revisions
+            .insert(profile_id.clone(), tunnel_revision);
+    }
     match command {
         UserCommand::Connect { profile_id }
         | UserCommand::Reconnect {
@@ -2442,30 +2495,6 @@ fn target_profiles_for_command(
             (*state == RequestedTunnelState::Connected).then_some(profile_id.clone())
         })
         .collect())
-}
-
-#[cfg(test)]
-mod target_profiles_tests {
-    use super::*;
-
-    #[test]
-    fn reconnect_all_uses_connected_desired_profiles_without_canonical_supervision() {
-        let connected = ProfileId::new("connected");
-        let disconnected = ProfileId::new("disconnected");
-        let targets = target_profiles_for_command(
-            &UserCommand::Reconnect { profile_id: None },
-            &BTreeSet::from([connected.clone(), disconnected.clone()]),
-            &BTreeMap::from([
-                (connected.clone(), RequestedTunnelState::Connected),
-                (disconnected, RequestedTunnelState::Disconnected),
-            ]),
-            ExecutionSelection::LegacyAuthority,
-            None,
-        )
-        .unwrap();
-
-        assert_eq!(targets, vec![connected]);
-    }
 }
 
 fn lifecycle_for_command(
@@ -3338,5 +3367,29 @@ fn publish_then_events(
             snapshot_generation: snapshot.generation,
             event,
         });
+    }
+}
+
+#[cfg(test)]
+mod target_profiles_tests {
+    use super::*;
+
+    #[test]
+    fn reconnect_all_uses_connected_desired_profiles_without_canonical_supervision() {
+        let connected = ProfileId::new("connected");
+        let disconnected = ProfileId::new("disconnected");
+        let targets = target_profiles_for_command(
+            &UserCommand::Reconnect { profile_id: None },
+            &BTreeSet::from([connected.clone(), disconnected.clone()]),
+            &BTreeMap::from([
+                (connected.clone(), RequestedTunnelState::Connected),
+                (disconnected, RequestedTunnelState::Disconnected),
+            ]),
+            ExecutionSelection::LegacyAuthority,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(targets, vec![connected]);
     }
 }

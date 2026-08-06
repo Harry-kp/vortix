@@ -28,6 +28,16 @@ pub struct ControlRevision {
     pub digest: PolicyDigest,
 }
 
+/// Per-profile tunnel intent fence.
+///
+/// Tunnel effects advance only when that profile is targeted. Global policy
+/// changes use [`ControlRevision`] and must not invalidate healthy tunnels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TunnelRevision {
+    pub authority_epoch: AuthorityEpoch,
+    pub generation: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TunnelMutation {
     Connect,
@@ -38,23 +48,10 @@ pub enum TunnelMutation {
 pub struct TunnelWork {
     pub profile_id: ProfileId,
     pub operation_id: OperationId,
-    pub generation: u64,
-    pub authority_epoch: AuthorityEpoch,
-    pub policy_digest: PolicyDigest,
+    pub revision: TunnelRevision,
     pub mutation: TunnelMutation,
     pub protocol: TunnelKindTag,
     pub deadline: Instant,
-}
-
-impl TunnelWork {
-    #[must_use]
-    pub fn revision(&self) -> ControlRevision {
-        ControlRevision {
-            authority_epoch: self.authority_epoch,
-            generation: self.generation,
-            digest: self.policy_digest.clone(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,9 +74,7 @@ pub enum WorkFailure {
 pub struct TunnelWorkResult {
     pub profile_id: ProfileId,
     pub operation_id: OperationId,
-    pub generation: u64,
-    pub authority_epoch: AuthorityEpoch,
-    pub policy_digest: PolicyDigest,
+    pub revision: TunnelRevision,
     pub lease_id: LeaseId,
     pub mutation: TunnelMutation,
     /// Protocol-authoritative identity produced by the exact successful
@@ -749,9 +744,7 @@ fn spawn_profile_worker(
                 let completion = TunnelWorkResult {
                     profile_id: work.profile_id,
                     operation_id: work.operation_id,
-                    generation: work.generation,
-                    authority_epoch: work.authority_epoch,
-                    policy_digest: work.policy_digest,
+                    revision: work.revision,
                     lease_id,
                     mutation: work.mutation,
                     adoption,
@@ -822,7 +815,7 @@ fn run_tunnel_effect(
         && result
             .handshake
             .as_ref()
-            .is_none_or(|evidence| evidence.generation != work.generation)
+            .is_none_or(|evidence| evidence.generation != work.revision.generation)
     {
         return match executor.compensate_uncertain(work) {
             Ok(()) => Err(WorkFailure::HandshakeFailed),
@@ -884,6 +877,8 @@ pub struct TopologyPolicy {
     pub deadline: Instant,
     pub prior: TopologyState,
     pub target: TopologyState,
+    /// Expected identity of every managed tunnel in `target`.
+    pub tunnel_revisions: BTreeMap<ProfileId, TunnelRevision>,
     pub transition: TopologyTransitionKind,
     pub required_blocking: bool,
 }

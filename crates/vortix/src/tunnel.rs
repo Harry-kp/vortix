@@ -183,7 +183,7 @@ impl CanonicalTunnelExecutor {
             self.settings.wireguard_handshake_timeout_secs,
             &self.settings.wireguard_health_targets,
         )
-        .for_generation(work.generation)
+        .for_generation(work.revision.generation)
         .with_execution_context(context);
         let handle = match panic::catch_unwind(AssertUnwindSafe(|| tunnel.up(&profile))) {
             Ok(result) => result.map_err(|error| error.to_string())?,
@@ -236,13 +236,13 @@ impl CanonicalTunnelExecutor {
                 handle.interface_name.clone(),
                 work.protocol,
                 handle.pid,
-                format!("openvpn-generation:{}", work.generation),
+                format!("openvpn-generation:{}", work.revision.generation),
             );
         }
         let handshake = handle
             .handshake
             .clone()
-            .filter(|evidence| evidence.generation == work.generation)
+            .filter(|evidence| evidence.generation == work.revision.generation)
             .ok_or_else(|| {
                 "WireGuard returned without exact current-generation handshake evidence".to_string()
             })?;
@@ -251,7 +251,7 @@ impl CanonicalTunnelExecutor {
             handle.interface_name.clone(),
             format!(
                 "wg-generation:{}:peer:{}",
-                work.generation, handshake.peer_public_key
+                work.revision.generation, handshake.peer_public_key
             ),
             handshake,
         )
@@ -332,7 +332,7 @@ impl crate::vortix_core::control::worker::TunnelExecutor for CanonicalTunnelExec
         let Some((mut tunnel, handle)) = owned else {
             return Ok(());
         };
-        if handle.generation != work.generation {
+        if handle.generation != work.revision.generation {
             self.active
                 .lock()
                 .map_err(|_| "canonical active-tunnel ledger poisoned".to_string())?
@@ -439,8 +439,8 @@ pub fn profile_view(p: &VpnProfile) -> Profile {
 #[cfg(test)]
 mod canonical_tests {
     use super::*;
-    use crate::vortix_core::control::model::{AuthorityEpoch, OperationId, PolicyDigest};
-    use crate::vortix_core::control::worker::{TunnelMutation, TunnelWork};
+    use crate::vortix_core::control::model::{AuthorityEpoch, OperationId};
+    use crate::vortix_core::control::worker::{TunnelMutation, TunnelRevision, TunnelWork};
     use crate::vortix_core::ports::dns::DnsRequest;
     use crate::vortix_core::ports::tunnel::{HandshakeEvidence, TunnelTeardownConfig};
     use std::time::{Duration, Instant, SystemTime};
@@ -452,9 +452,10 @@ mod canonical_tests {
                 "\"op-0000000000000001-0000000000000001\"",
             )
             .unwrap(),
-            generation,
-            authority_epoch: AuthorityEpoch(1),
-            policy_digest: PolicyDigest("digest".into()),
+            revision: TunnelRevision {
+                authority_epoch: AuthorityEpoch(1),
+                generation,
+            },
             mutation: TunnelMutation::Connect,
             protocol: TunnelKindTag::WireGuard,
             deadline: Instant::now() + Duration::from_secs(1),

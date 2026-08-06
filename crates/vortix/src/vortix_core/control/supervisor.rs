@@ -4,14 +4,12 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::vortix_core::control::model::{
-    AuthorityEpoch, OperationId, PolicyDigest, MAX_PROTECTION_AGE_MILLIS,
-};
+use crate::vortix_core::control::model::{AuthorityEpoch, OperationId, MAX_PROTECTION_AGE_MILLIS};
 use crate::vortix_core::control::persistence::PersistedTombstone;
 use crate::vortix_core::control::worker::{
     CancellationToken, ControlRevision, PolicyExecutor, PolicyOutcome, PolicyResult, PolicyWorker,
     ProfileAdmission, ProfileWorkerPool, TopologyPolicy, TopologyState, TunnelExecutor,
-    TunnelMutation, TunnelWork, TunnelWorkResult, WorkFailure,
+    TunnelMutation, TunnelRevision, TunnelWork, TunnelWorkResult, WorkFailure,
 };
 use crate::vortix_core::ports::tunnel::{
     AdoptionEvidence, HandshakeEvidence, ProbeReceipt, TunnelKindTag,
@@ -30,26 +28,13 @@ pub enum SupervisedTruth {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProfileSupervision {
-    pub generation: u64,
-    pub authority_epoch: AuthorityEpoch,
-    pub policy_digest: PolicyDigest,
+    pub revision: TunnelRevision,
     pub operation_id: OperationId,
     pub mutation: TunnelMutation,
     pub adoption: Option<AdoptionEvidence>,
     pub handshake: Option<HandshakeEvidence>,
     pub probe_receipts: Vec<ProbeReceipt>,
     pub truth: SupervisedTruth,
-}
-
-impl ProfileSupervision {
-    #[must_use]
-    pub fn revision(&self) -> ControlRevision {
-        ControlRevision {
-            authority_epoch: self.authority_epoch,
-            generation: self.generation,
-            digest: self.policy_digest.clone(),
-        }
-    }
 }
 
 /// Fresh platform evidence required before publishing protection.
@@ -143,7 +128,7 @@ impl Supervisor {
         routes: impl IntoIterator<Item = String>,
     ) -> Result<CancellationToken, WorkFailure> {
         let mut state = self.state.lock().expect("supervisor mutex poisoned");
-        if work.authority_epoch != state.authority_epoch {
+        if work.revision.authority_epoch != state.authority_epoch {
             return Err(WorkFailure::Stale);
         }
         if let Some(entry) = state.profiles.get(&work.profile_id) {
@@ -153,12 +138,12 @@ impl Supervisor {
                     | SupervisedTruth::OutcomeUnknown
                     | SupervisedTruth::DisconnectedTombstone
             ) {
-                if entry.revision() != work.revision() {
+                if entry.revision != work.revision {
                     self.tunnels.cancel_profile(&work.profile_id);
                 }
                 return Err(WorkFailure::Busy);
             }
-            if entry.revision() == work.revision()
+            if entry.revision == work.revision
                 && matches!(entry.truth, SupervisedTruth::WaitingForObservation)
             {
                 return Err(WorkFailure::Busy);
@@ -166,9 +151,7 @@ impl Supervisor {
         }
         let profile_id = work.profile_id.clone();
         let entry = ProfileSupervision {
-            generation: work.generation,
-            authority_epoch: work.authority_epoch,
-            policy_digest: work.policy_digest.clone(),
+            revision: work.revision,
             operation_id: work.operation_id.clone(),
             mutation: work.mutation,
             adoption: None,
@@ -222,14 +205,12 @@ impl Supervisor {
         admission: ProfileAdmission,
     ) -> Result<CancellationToken, WorkFailure> {
         let mut state = self.state.lock().expect("supervisor mutex poisoned");
-        if work.authority_epoch != state.authority_epoch {
+        if work.revision.authority_epoch != state.authority_epoch {
             return Err(WorkFailure::Stale);
         }
         let profile_id = work.profile_id.clone();
         let entry = ProfileSupervision {
-            generation: work.generation,
-            authority_epoch: work.authority_epoch,
-            policy_digest: work.policy_digest.clone(),
+            revision: work.revision,
             operation_id: work.operation_id.clone(),
             mutation: work.mutation,
             adoption: None,
@@ -254,7 +235,7 @@ impl Supervisor {
     pub fn adopt_attested(
         &self,
         evidence: AdoptionEvidence,
-        revision: ControlRevision,
+        revision: TunnelRevision,
         operation_id: OperationId,
     ) -> Result<(), WorkFailure> {
         // WireGuard adoption requires an exact worker receipt containing the
@@ -282,9 +263,7 @@ impl Supervisor {
         state.profiles.insert(
             profile_id,
             ProfileSupervision {
-                generation: revision.generation,
-                authority_epoch: revision.authority_epoch,
-                policy_digest: revision.digest,
+                revision,
                 operation_id,
                 mutation: TunnelMutation::Connect,
                 adoption: Some(evidence),
@@ -321,9 +300,7 @@ impl Supervisor {
         let mut result = self.tunnels.try_result()?;
         let mut state = self.state.lock().expect("supervisor mutex poisoned");
         let exact = state.profiles.get(&result.profile_id).is_some_and(|entry| {
-            entry.generation == result.generation
-                && entry.authority_epoch == result.authority_epoch
-                && entry.policy_digest == result.policy_digest
+            entry.revision == result.revision
                 && entry.operation_id == result.operation_id
                 && entry.mutation == result.mutation
         });
@@ -405,18 +382,22 @@ impl Supervisor {
             });
         let tunnel_truth_exact = state.latest_topology.as_ref().is_some_and(|policy| {
             policy.target.profiles.iter().all(|profile| {
-                state.profiles.get(profile).is_some_and(|entry| {
-                    entry.revision() == evidence.revision
-                        && entry.operation_id == evidence.operation_id
-                        && entry.truth == SupervisedTruth::ObservedPresent
-                        && entry.adoption.as_ref().is_some_and(|adoption| {
-                            adoption.kind() != TunnelKindTag::WireGuard
-                                || entry.handshake.as_ref().is_some_and(|handshake| {
-                                    handshake.generation == evidence.revision.generation
-                                        && !handshake.peer_public_key.is_empty()
+                policy
+                    .tunnel_revisions
+                    .get(profile)
+                    .is_some_and(|revision| {
+                        state.profiles.get(profile).is_some_and(|entry| {
+                            entry.revision == *revision
+                                && entry.truth == SupervisedTruth::ObservedPresent
+                                && entry.adoption.as_ref().is_some_and(|adoption| {
+                                    adoption.kind() != TunnelKindTag::WireGuard
+                                        || entry.handshake.as_ref().is_some_and(|handshake| {
+                                            handshake.generation == revision.generation
+                                                && !handshake.peer_public_key.is_empty()
+                                        })
                                 })
                         })
-                })
+                    })
             })
         });
         if !exact || !tunnel_truth_exact {
@@ -442,7 +423,7 @@ impl Supervisor {
     pub fn confirm_tunnel(
         &self,
         profile_id: &ProfileId,
-        revision: &ControlRevision,
+        revision: &TunnelRevision,
         present: bool,
         interface_name: Option<&str>,
     ) -> Result<(), WorkFailure> {
@@ -450,7 +431,7 @@ impl Supervisor {
         let exact = state
             .profiles
             .get(profile_id)
-            .is_some_and(|entry| entry.revision() == *revision);
+            .is_some_and(|entry| entry.revision == *revision);
         if !exact {
             return Err(WorkFailure::Stale);
         }
@@ -548,9 +529,10 @@ impl Supervisor {
                 (
                     profile_id.clone(),
                     ProfileSupervision {
-                        generation: tombstone.generation,
-                        authority_epoch: tombstone.authority_epoch,
-                        policy_digest: tombstone.policy_digest.clone(),
+                        revision: TunnelRevision {
+                            authority_epoch: tombstone.authority_epoch,
+                            generation: tombstone.generation,
+                        },
                         operation_id: tombstone.operation_id.clone(),
                         mutation: TunnelMutation::Disconnect,
                         adoption: None,
