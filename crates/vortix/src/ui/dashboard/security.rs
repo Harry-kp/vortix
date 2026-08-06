@@ -968,7 +968,7 @@ fn killswitch_value(mode: KillSwitchMode, state: KillSwitchState) -> String {
     // Auto + Blocking is the alarm state — value names the situation,
     // not the mode label. The mode is implied by the rest of the panel.
     if state == KillSwitchState::Degraded {
-        "Degraded".to_string()
+        state.display_status().to_string()
     } else if matches!(
         (mode, state),
         (KillSwitchMode::Auto, KillSwitchState::Blocking)
