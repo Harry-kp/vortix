@@ -296,6 +296,7 @@ pub fn get_tmp_config_dir(session_id: &str) -> std::io::Result<std::path::PathBu
 /// Strip a profile name down to ASCII `[A-Za-z0-9_-]` for safe use in
 /// daemon names, filenames, and process-match patterns.
 pub use crate::vortix_core::profile::sanitize_profile_name;
+use crate::vortix_core::profile::unambiguous_legacy_artifact_key;
 
 fn validate_openvpn_artifact_key(key: &str) -> std::io::Result<()> {
     if !key.is_empty()
@@ -373,20 +374,12 @@ pub fn read_openvpn_pid(profile_key: &str) -> Option<u32> {
     content.trim().parse::<u32>().ok()
 }
 
-/// A legacy display name is safe to inspect only when it was already a valid
-/// artifact key. Names that required sanitizing are ambiguous (`a/b` and
-/// `a?b` both became `a_b`), so compatibility code must never touch them.
-fn unambiguous_legacy_openvpn_key(display_name: &str) -> Option<&str> {
-    (!display_name.is_empty() && sanitize_profile_name(display_name) == display_name)
-        .then_some(display_name)
-}
-
 /// Read a canonical ID-keyed PID, falling back to an unambiguous legacy
 /// name-keyed artifact created by an older Vortix release.
 #[must_use]
 pub fn read_openvpn_pid_compat(profile_id: &str, legacy_display_name: &str) -> Option<u32> {
     read_openvpn_pid(profile_id)
-        .or_else(|| unambiguous_legacy_openvpn_key(legacy_display_name).and_then(read_openvpn_pid))
+        .or_else(|| unambiguous_legacy_artifact_key(legacy_display_name).and_then(read_openvpn_pid))
 }
 
 /// Remove canonical ID-keyed run files and, when collision-free, legacy
@@ -394,7 +387,7 @@ pub fn read_openvpn_pid_compat(profile_id: &str, legacy_display_name: &str) -> O
 /// for manual cleanup rather than risking another profile's active daemon.
 pub fn cleanup_openvpn_run_files_compat(profile_id: &str, legacy_display_name: &str) {
     cleanup_openvpn_run_files(profile_id);
-    if let Some(legacy_key) = unambiguous_legacy_openvpn_key(legacy_display_name) {
+    if let Some(legacy_key) = unambiguous_legacy_artifact_key(legacy_display_name) {
         if legacy_key != profile_id {
             cleanup_openvpn_run_files(legacy_key);
         }
@@ -608,7 +601,7 @@ pub fn read_openvpn_saved_auth_compat(
     legacy_display_name: &str,
 ) -> Option<(String, String)> {
     read_openvpn_saved_auth(profile_id).or_else(|| {
-        unambiguous_legacy_openvpn_key(legacy_display_name).and_then(read_openvpn_saved_auth)
+        unambiguous_legacy_artifact_key(legacy_display_name).and_then(read_openvpn_saved_auth)
     })
 }
 
@@ -622,7 +615,7 @@ pub fn delete_openvpn_auth_file(profile_name: &str) {
 /// Delete canonical ID-keyed credentials and an unambiguous legacy file.
 pub fn delete_openvpn_auth_file_compat(profile_id: &str, legacy_display_name: &str) {
     delete_openvpn_auth_file(profile_id);
-    if let Some(legacy_key) = unambiguous_legacy_openvpn_key(legacy_display_name) {
+    if let Some(legacy_key) = unambiguous_legacy_artifact_key(legacy_display_name) {
         if legacy_key != profile_id {
             delete_openvpn_auth_file(legacy_key);
             delete_openvpn_scrv1_auth_file(legacy_key);

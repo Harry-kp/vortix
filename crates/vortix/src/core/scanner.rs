@@ -359,10 +359,10 @@ fn check_openvpn_by_pid(
         let canonical_log = run_dir.join(format!("{profile_id}.log"));
         let log_path = if canonical_log.exists() {
             canonical_log
-        } else if !display_name.is_empty()
-            && crate::utils::sanitize_profile_name(display_name) == display_name
+        } else if let Some(legacy_key) =
+            crate::vortix_core::profile::unambiguous_legacy_artifact_key(display_name)
         {
-            run_dir.join(format!("{display_name}.log"))
+            run_dir.join(format!("{legacy_key}.log"))
         } else {
             canonical_log
         };

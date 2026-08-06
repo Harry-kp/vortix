@@ -17,7 +17,7 @@ use crate::vortix_core::ports::tunnel::{
     ParseError, ParsedProfile, ProtocolStatus, Tunnel, TunnelCapabilities, TunnelError,
     TunnelHandle, TunnelKindTag, TunnelStatus,
 };
-use crate::vortix_core::profile::Profile;
+use crate::vortix_core::profile::{unambiguous_legacy_artifact_key, Profile};
 use crate::vortix_process::{CommandSpec, PrivilegeReq};
 use tracing::{debug, info, warn};
 
@@ -52,12 +52,6 @@ const MANAGED_CONFIG_MARKER: &str = "# managed-by: vortix openvpn custodian";
 )]
 struct ManagedConfigViolation {
     directive: String,
-}
-
-fn unambiguous_legacy_key(display_name: &str) -> Option<&str> {
-    (!display_name.is_empty()
-        && crate::vortix_core::profile::sanitize_profile_name(display_name) == display_name)
-        .then_some(display_name)
 }
 
 fn sanitize_managed_config(text: &str) -> Result<String, TunnelError> {
@@ -440,7 +434,7 @@ impl OvpnTunnel {
         let canonical_log = self.log_path(profile.id.as_str());
         let log_path = if canonical_log.exists() {
             canonical_log
-        } else if let Some(legacy_key) = unambiguous_legacy_key(&profile.display_name) {
+        } else if let Some(legacy_key) = unambiguous_legacy_artifact_key(&profile.display_name) {
             self.log_path(legacy_key)
         } else {
             canonical_log
@@ -492,7 +486,7 @@ impl OvpnTunnel {
         let _ = std::fs::remove_file(self.pid_path(artifact_key));
         let _ = std::fs::remove_file(self.log_path(artifact_key));
         let _ = std::fs::remove_file(self.management_socket_path(artifact_key));
-        if let Some(legacy_key) = unambiguous_legacy_key(&handle.display_name) {
+        if let Some(legacy_key) = unambiguous_legacy_artifact_key(&handle.display_name) {
             if legacy_key != artifact_key {
                 let _ = std::fs::remove_file(self.pid_path(legacy_key));
                 let _ = std::fs::remove_file(self.log_path(legacy_key));
@@ -505,7 +499,7 @@ impl OvpnTunnel {
         self.auth_path(profile.id.as_str())
             .filter(|path| path.exists())
             .or_else(|| {
-                unambiguous_legacy_key(&profile.display_name)
+                unambiguous_legacy_artifact_key(&profile.display_name)
                     .and_then(|legacy_key| self.auth_path(legacy_key))
                     .filter(|path| path.exists())
             })
@@ -515,7 +509,7 @@ impl OvpnTunnel {
         self.scrv1_auth_path(profile.id.as_str())
             .filter(|path| path.exists())
             .or_else(|| {
-                unambiguous_legacy_key(&profile.display_name)
+                unambiguous_legacy_artifact_key(&profile.display_name)
                     .and_then(|legacy_key| self.scrv1_auth_path(legacy_key))
                     .filter(|path| path.exists())
             })

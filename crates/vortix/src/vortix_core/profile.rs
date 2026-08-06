@@ -26,6 +26,17 @@ pub fn sanitize_profile_name(name: &str) -> String {
         .collect()
 }
 
+/// Return a legacy display name only when it is an unambiguous artifact key.
+///
+/// Older releases keyed some files by sanitized display name. Compatibility
+/// readers may inspect the original name only when it is nonempty and already
+/// canonical; otherwise multiple names could resolve to the same artifact.
+#[must_use]
+pub fn unambiguous_legacy_artifact_key(display_name: &str) -> Option<&str> {
+    (!display_name.is_empty() && sanitize_profile_name(display_name) == display_name)
+        .then_some(display_name)
+}
+
 /// Stable, opaque identifier for a profile.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct ProfileId(String);
@@ -160,7 +171,29 @@ impl Profile {
 
 #[cfg(test)]
 mod tests {
-    use super::ProfileId;
+    use super::{unambiguous_legacy_artifact_key, ProfileId};
+
+    #[test]
+    fn legacy_artifact_keys_are_nonempty_and_unchanged_by_sanitizing() {
+        let cases = [
+            ("", None),
+            ("corp", Some("corp")),
+            ("corp-vpn_2", Some("corp-vpn_2")),
+            ("corp vpn", None),
+            ("team/a", None),
+            ("team?a", None),
+            ("café", None),
+            ("日本VPN", None),
+        ];
+
+        for (display_name, expected) in cases {
+            assert_eq!(
+                unambiguous_legacy_artifact_key(display_name),
+                expected,
+                "unexpected legacy artifact decision for {display_name:?}"
+            );
+        }
+    }
 
     #[test]
     fn deserialize_profile_id_enforces_canonical_wire_format() {

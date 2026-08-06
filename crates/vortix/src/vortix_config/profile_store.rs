@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::vortix_core::profile::{
-    sanitize_profile_name, Profile, ProfileId, ProfileIdError, ProtocolKind,
+    unambiguous_legacy_artifact_key, Profile, ProfileId, ProfileIdError, ProtocolKind,
 };
 
 const RENAME_INTENT: &str = ".vortix-profile-rename.toml";
@@ -342,10 +342,10 @@ impl FsProfileStore {
     }
 
     fn legacy_auth_path(&self, display_name: &str) -> Option<PathBuf> {
-        (sanitize_profile_name(display_name) == display_name).then(|| {
+        unambiguous_legacy_artifact_key(display_name).map(|legacy_key| {
             self.root_dir()
                 .join("auth")
-                .join(format!("{display_name}.auth"))
+                .join(format!("{legacy_key}.auth"))
         })
     }
 
@@ -1235,8 +1235,8 @@ mod tests {
             PathBuf::from("placeholder"),
         );
         assert_eq!(
-            sanitize_profile_name(&first.display_name),
-            sanitize_profile_name(&second.display_name)
+            crate::vortix_core::profile::sanitize_profile_name(&first.display_name),
+            crate::vortix_core::profile::sanitize_profile_name(&second.display_name)
         );
         store.insert(&first, b"client\ndev tun\n").unwrap();
         store.insert(&second, b"client\ndev tun\n").unwrap();
