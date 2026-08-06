@@ -1005,16 +1005,17 @@ pub(crate) fn find_binary_path(name: &str) -> Option<std::path::PathBuf> {
 
     for dir in env::split_paths(&path) {
         let candidate = dir.join(name);
-        if !candidate.is_file() {
+        let Ok(metadata) = candidate.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
             continue;
         }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            if let Ok(meta) = candidate.metadata() {
-                if meta.permissions().mode() & 0o111 != 0 {
-                    return Some(candidate);
-                }
+            if metadata.permissions().mode() & 0o111 != 0 {
+                return Some(candidate);
             }
         }
         #[cfg(not(unix))]
