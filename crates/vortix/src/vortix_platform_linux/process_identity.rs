@@ -56,12 +56,9 @@ fn parse_proc_stat(pid: u32, stat: &str) -> io::Result<ProcStat> {
 pub(crate) fn process_group_has_live_members(group_id: u32) -> io::Result<Option<bool>> {
     let mut complete_snapshot = true;
     for entry in std::fs::read_dir("/proc")? {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(_) => {
-                complete_snapshot = false;
-                continue;
-            }
+        let Ok(entry) = entry else {
+            complete_snapshot = false;
+            continue;
         };
         let Some(pid) = entry
             .file_name()
@@ -78,12 +75,9 @@ pub(crate) fn process_group_has_live_members(group_id: u32) -> io::Result<Option
                 continue;
             }
         };
-        let stat = match parse_proc_stat(pid, &stat) {
-            Ok(stat) => stat,
-            Err(_) => {
-                complete_snapshot = false;
-                continue;
-            }
+        let Ok(stat) = parse_proc_stat(pid, &stat) else {
+            complete_snapshot = false;
+            continue;
         };
         if stat.process_group == group_id && !is_dead_state(stat.state) {
             return Ok(Some(true));
