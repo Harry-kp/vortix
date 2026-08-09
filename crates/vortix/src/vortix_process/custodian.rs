@@ -420,19 +420,7 @@ pub fn remote_stop(identity: &ManagedProcessId) -> Result<(), CustodianError> {
 }
 
 fn process_group_absent(pid: u32) -> Result<bool, CustodianError> {
-    let pid = i32::try_from(pid)
-        .map_err(|_| CustodianError::Protocol("custodian PID exceeds pid_t".into()))?;
-    // SAFETY: signal zero is a read-only existence probe for the exact group.
-    #[allow(unsafe_code)]
-    let result = unsafe { libc::kill(-pid, 0) };
-    if result == 0 {
-        return Ok(false);
-    }
-    match std::io::Error::last_os_error().raw_os_error() {
-        Some(libc::ESRCH) => Ok(true),
-        Some(libc::EPERM) => Ok(false),
-        _ => Err(std::io::Error::last_os_error().into()),
-    }
+    Ok(!crate::vortix_process::real::process_group_has_live_members(pid)?)
 }
 
 #[allow(clippy::needless_pass_by_value)] // the complete request is serialized once below
