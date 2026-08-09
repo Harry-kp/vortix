@@ -982,16 +982,6 @@ fn build_resolved_apply_specs(assignment: &DnsAssignment) -> Vec<CommandSpec> {
     ]
 }
 
-fn build_resolvconf_apply_specs(generation: u64, assignment: &DnsAssignment) -> Vec<CommandSpec> {
-    if !matches!(assignment.scope, DnsScope::CatchAll) {
-        return Vec::new();
-    }
-    vec![build_resolvconf_apply_spec(
-        &assignment.interface,
-        resolvconf_body(generation, assignment),
-    )]
-}
-
 fn build_resolvconf_apply_spec(interface: &str, body: Vec<u8>) -> CommandSpec {
     CommandSpec::oneshot(
         "resolvconf",
@@ -1278,13 +1268,25 @@ mod tests {
 
     #[test]
     fn resolvconf_uses_vortix_owned_record_and_stdin() {
-        let specs = build_resolvconf_apply_specs(7, &assignment(DnsScope::CatchAll));
+        let mut engine = LinuxDnsPolicyEngine::new(FakeDnsCommandRunner::default());
+        engine
+            .apply_assignment(
+                LinuxDnsBackend::Resolvconf,
+                7,
+                &assignment(DnsScope::CatchAll),
+            )
+            .unwrap();
+        let spec = engine
+            .runner
+            .calls
+            .iter()
+            .find(|spec| {
+                spec.program == "resolvconf" && spec.args.first().is_some_and(|arg| arg == "-a")
+            })
+            .expect("production apply path must write the Vortix-owned record");
+        assert_eq!(args_of(spec), vec!["-a", "vortix.wg0", "-m", "0", "-x"]);
         assert_eq!(
-            args_of(&specs[0]),
-            vec!["-a", "vortix.wg0", "-m", "0", "-x"]
-        );
-        assert_eq!(
-            specs[0].stdin_bytes.as_deref(),
+            spec.stdin_bytes.as_deref(),
             Some(b"# managed-by: vortix dns generation 7\nnameserver 1.1.1.1\n".as_slice())
         );
     }
@@ -1292,7 +1294,15 @@ mod tests {
     #[test]
     fn suppressed_secondary_has_no_platform_commands() {
         assert!(build_resolved_apply_specs(&assignment(DnsScope::Suppressed)).is_empty());
-        assert!(build_resolvconf_apply_specs(7, &assignment(DnsScope::Suppressed)).is_empty());
+        let mut engine = LinuxDnsPolicyEngine::new(FakeDnsCommandRunner::default());
+        engine
+            .apply_assignment(
+                LinuxDnsBackend::Resolvconf,
+                7,
+                &assignment(DnsScope::Suppressed),
+            )
+            .unwrap();
+        assert!(engine.runner.calls.is_empty());
     }
 
     #[test]
