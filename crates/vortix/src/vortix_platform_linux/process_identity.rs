@@ -17,10 +17,10 @@ pub fn observe(pid: u32) -> io::Result<Option<KernelProcessIdentity>> {
     if is_dead_state(stat.state) {
         return Ok(None);
     }
-    Ok(Some(KernelProcessIdentity::new(
+    Ok(KernelProcessIdentity::new(
         stat.start_token,
         stat.process_group == pid,
-    )))
+    ))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
