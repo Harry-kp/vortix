@@ -83,6 +83,20 @@ pub(crate) fn observe_process_identity(
     }
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn process_group_has_live_members(group_id: u32) -> std::io::Result<Option<bool>> {
+    crate::vortix_platform_linux::process_identity::process_group_has_live_members(group_id)
+}
+
+#[cfg(target_os = "macos")]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "matches the Linux platform probe so the process layer stays OS-agnostic"
+)]
+pub(crate) fn process_group_has_live_members(_group_id: u32) -> std::io::Result<Option<bool>> {
+    Ok(None)
+}
+
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 compile_error!("Vortix currently only supports macOS and Linux");
 

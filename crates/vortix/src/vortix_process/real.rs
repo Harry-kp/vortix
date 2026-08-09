@@ -185,7 +185,7 @@ impl ProcessLifecycle for RealProcessLifecycle {
                 source,
             })?
             .is_none();
-        Ok(leader_alive || process_group_exists(&owned.guardian)?)
+        Ok(leader_alive || process_group_has_live_members(owned.guardian.id())?)
     }
 
     fn graceful_stop(&mut self, identity: &ManagedProcessId) -> Result<(), ProcessError> {
@@ -365,20 +365,43 @@ fn kill_guardian_group() -> ! {
 }
 
 #[cfg(unix)]
-fn process_group_exists(child: &Child) -> Result<bool, ProcessError> {
-    let pid = i32::try_from(child.id()).map_err(|_| ProcessError::IoError {
+pub(super) fn process_group_has_live_members(group_id: u32) -> Result<bool, ProcessError> {
+    match probe_process_group(group_id)? {
+        ProcessGroupProbe::Absent => return Ok(false),
+        ProcessGroupProbe::PermissionDenied => return Ok(true),
+        ProcessGroupProbe::Signalable => {}
+    }
+
+    if let Ok(Some(has_live_members)) = crate::platform::process_group_has_live_members(group_id) {
+        return Ok(has_live_members);
+    }
+
+    Ok(true)
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProcessGroupProbe {
+    Absent,
+    Signalable,
+    PermissionDenied,
+}
+
+#[cfg(unix)]
+fn probe_process_group(group_id: u32) -> Result<ProcessGroupProbe, ProcessError> {
+    let pid = i32::try_from(group_id).map_err(|_| ProcessError::IoError {
         program: "managed-child".into(),
-        source: std::io::Error::other("child PID exceeds pid_t"),
+        source: std::io::Error::other("process-group ID exceeds pid_t"),
     })?;
     // SAFETY: signal zero is an existence/permission probe for the group.
     #[allow(unsafe_code)]
     let status = unsafe { libc::kill(-pid, 0) };
     if status == 0 {
-        return Ok(true);
+        return Ok(ProcessGroupProbe::Signalable);
     }
     match std::io::Error::last_os_error().raw_os_error() {
-        Some(libc::ESRCH) => Ok(false),
-        Some(libc::EPERM) => Ok(true),
+        Some(libc::ESRCH) => Ok(ProcessGroupProbe::Absent),
+        Some(libc::EPERM) => Ok(ProcessGroupProbe::PermissionDenied),
         _ => Err(ProcessError::IoError {
             program: "managed-child".into(),
             source: std::io::Error::last_os_error(),
@@ -1028,11 +1051,10 @@ mod tests {
     fn process_is_live(pid: u32) -> bool {
         let output = std::process::Command::new("ps")
             .args(["-o", "stat=", "-p", &pid.to_string()])
-            .output();
-        output.is_ok_and(|output| {
-            let state = String::from_utf8_lossy(&output.stdout);
-            let state = state.trim();
-            !state.is_empty() && !state.starts_with('Z')
-        })
+            .output()
+            .expect("ps must be installed for process-containment tests");
+        let state = String::from_utf8_lossy(&output.stdout);
+        let state = state.trim();
+        !state.is_empty() && !state.starts_with('Z')
     }
 }
