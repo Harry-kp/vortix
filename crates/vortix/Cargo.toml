@@ -82,7 +82,7 @@ sha2 = "0.11"
 # static-challenge auth files. STANDARD alphabet only — see
 # `vortix_protocol_openvpn::tunnel` consumers and the plan's Key Tech
 # Decisions for the URL_SAFE-vs-STANDARD reasoning.
-base64 = "0.22"
+base64 = "0.23"
 # Plan 002 U8: text-only clipboard. Image features pull in `image` /
 # `x11rb` / `zune-*` deps for clipboard image support we don't use;
 # disable defaults to keep binary lean.
