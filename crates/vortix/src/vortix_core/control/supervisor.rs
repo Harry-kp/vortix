@@ -7,9 +7,9 @@ use std::time::Duration;
 use crate::vortix_core::control::model::{AuthorityEpoch, OperationId, MAX_PROTECTION_AGE_MILLIS};
 use crate::vortix_core::control::persistence::PersistedTombstone;
 use crate::vortix_core::control::worker::{
-    CancellationToken, ControlRevision, PolicyExecutor, PolicyOutcome, PolicyResult, PolicyWorker,
-    ProfileAdmission, ProfileWorkerPool, TopologyPolicy, TopologyState, TunnelExecutor,
-    TunnelMutation, TunnelRevision, TunnelWork, TunnelWorkResult, WorkFailure,
+    CancellationToken, ControlRevision, PolicyExecutor, PolicyOutcome, PolicyResult, PolicyStage,
+    PolicyWorker, ProfileAdmission, ProfileWorkerPool, TopologyPolicy, TopologyState,
+    TunnelExecutor, TunnelMutation, TunnelRevision, TunnelWork, TunnelWorkResult, WorkFailure,
 };
 use crate::vortix_core::ports::tunnel::{
     AdoptionEvidence, HandshakeEvidence, ProbeReceipt, TunnelKindTag,
@@ -68,8 +68,9 @@ impl PolicyVerification {
 #[derive(Debug)]
 struct State {
     authority_epoch: AuthorityEpoch,
-    latest_policy: Option<(ControlRevision, OperationId)>,
+    latest_policy: Option<(ControlRevision, OperationId, PolicyStage)>,
     latest_topology: Option<TopologyPolicy>,
+    pre_tunnel_blocking: Option<(ControlRevision, OperationId)>,
     applied_policy: Option<(ControlRevision, OperationId)>,
     applied_topology: Option<TopologyState>,
     profiles: BTreeMap<ProfileId, ProfileSupervision>,
@@ -84,6 +85,7 @@ impl State {
             authority_epoch,
             latest_policy: None,
             latest_topology: None,
+            pre_tunnel_blocking: None,
             applied_policy: None,
             applied_topology: None,
             profiles: BTreeMap::new(),
@@ -275,22 +277,109 @@ impl Supervisor {
         Ok(())
     }
 
+    /// Restore an exact protocol-owned Standard-mode capability after a
+    /// one-shot client process exits. Scanner evidence alone cannot call this
+    /// seam: `WireGuard` requires its generation-bound handshake, while
+    /// `OpenVPN` requires the authenticated custodian identity.
+    pub fn restore_owned_tunnel(
+        &self,
+        evidence: AdoptionEvidence,
+        handshake: Option<HandshakeEvidence>,
+        probe_receipts: Vec<ProbeReceipt>,
+        process_ownership: Option<&crate::vortix_core::ports::process::ManagedProcessId>,
+        revision: TunnelRevision,
+        operation_id: OperationId,
+    ) -> Result<(), WorkFailure> {
+        if revision.authority_epoch
+            != self
+                .state
+                .lock()
+                .expect("supervisor mutex poisoned")
+                .authority_epoch
+        {
+            return Err(WorkFailure::Stale);
+        }
+        let profile_id = evidence.profile_id().clone();
+        let protocol_correct = match evidence.kind() {
+            TunnelKindTag::WireGuard => {
+                process_ownership.is_none()
+                    && handshake.as_ref().is_some_and(|handshake| {
+                        handshake.generation == revision.generation
+                            && !handshake.peer_public_key.is_empty()
+                    })
+            }
+            TunnelKindTag::OpenVpn => {
+                handshake.is_none()
+                    && process_ownership.as_ref().is_some_and(|identity| {
+                        identity.profile_id == profile_id
+                            && identity.generation == revision.generation
+                            && identity.has_valid_token()
+                    })
+            }
+            TunnelKindTag::Mock => false,
+        };
+        if !protocol_correct {
+            return Err(WorkFailure::EffectFailed);
+        }
+        let mut state = self.state.lock().expect("supervisor mutex poisoned");
+        if state.profiles.get(&profile_id).is_some_and(|entry| {
+            matches!(
+                entry.truth,
+                SupervisedTruth::Reserved
+                    | SupervisedTruth::OutcomeUnknown
+                    | SupervisedTruth::DisconnectedTombstone
+            )
+        }) {
+            return Err(WorkFailure::Busy);
+        }
+        state.profiles.insert(
+            profile_id,
+            ProfileSupervision {
+                revision,
+                operation_id,
+                mutation: TunnelMutation::Connect,
+                adoption: Some(evidence),
+                handshake,
+                probe_receipts,
+                truth: SupervisedTruth::ObservedPresent,
+            },
+        );
+        Ok(())
+    }
+
     pub fn submit_policy(&self, policy: &TopologyPolicy) -> Result<(), WorkFailure> {
         let mut state = self.state.lock().expect("supervisor mutex poisoned");
         let revision = policy.revision();
         if revision.authority_epoch != state.authority_epoch
-            || state.latest_policy.as_ref().is_some_and(|(current, _)| {
-                current.generation > revision.generation
-                    || current.generation == revision.generation
-                        && current.digest == revision.digest
-            })
+            || state
+                .latest_policy
+                .as_ref()
+                .is_some_and(|(current, operation, stage)| {
+                    current.generation > revision.generation
+                        || current.generation == revision.generation
+                            && current.digest == revision.digest
+                            && operation == &policy.operation_id
+                            && *stage >= policy.stage
+                })
         {
             return Err(WorkFailure::Stale);
         }
+        if policy.stage == PolicyStage::Final
+            && policy.required_blocking
+            && state.pre_tunnel_blocking.as_ref()
+                != Some(&(revision.clone(), policy.operation_id.clone()))
+        {
+            return Err(WorkFailure::Busy);
+        }
         self.policy.submit(policy.clone())?;
-        state.latest_policy = Some((revision, policy.operation_id.clone()));
+        if policy.stage == PolicyStage::PreTunnelBlocking {
+            state.pre_tunnel_blocking = None;
+        }
+        state.latest_policy = Some((revision, policy.operation_id.clone(), policy.stage));
         state.latest_topology = Some(policy.clone());
-        state.applied_policy = None;
+        if policy.stage == PolicyStage::Final {
+            state.applied_policy = None;
+        }
         state.protected = None;
         state.policy_degraded = None;
         Ok(())
@@ -335,13 +424,29 @@ impl Supervisor {
         let exact = state
             .latest_policy
             .as_ref()
-            .is_some_and(|(revision, operation)| {
+            .is_some_and(|(revision, operation, stage)| {
                 revision.authority_epoch == result.authority_epoch
                     && revision.generation == result.generation
                     && revision.digest == result.digest
                     && operation == &result.operation_id
+                    && *stage == result.stage
             });
-        if exact && result.outcome == PolicyOutcome::Applied {
+        if exact
+            && result.stage == PolicyStage::PreTunnelBlocking
+            && result.outcome == PolicyOutcome::Applied
+        {
+            state.pre_tunnel_blocking = Some((
+                ControlRevision {
+                    authority_epoch: result.authority_epoch,
+                    generation: result.generation,
+                    digest: result.digest.clone(),
+                },
+                result.operation_id.clone(),
+            ));
+        } else if exact
+            && result.stage == PolicyStage::Final
+            && result.outcome == PolicyOutcome::Applied
+        {
             state.applied_policy = Some((
                 ControlRevision {
                     authority_epoch: result.authority_epoch,
@@ -355,6 +460,9 @@ impl Supervisor {
                 .as_ref()
                 .map(|policy| policy.target.clone());
         } else {
+            if exact && result.stage == PolicyStage::PreTunnelBlocking {
+                state.pre_tunnel_blocking = None;
+            }
             state.policy_degraded = Some(if exact {
                 WorkFailure::EffectFailed
             } else {
@@ -378,7 +486,9 @@ impl Supervisor {
             .is_some_and(|(latest, applied)| {
                 latest.0 == evidence.revision
                     && latest.1 == evidence.operation_id
-                    && applied == latest
+                    && latest.2 == PolicyStage::Final
+                    && applied.0 == latest.0
+                    && applied.1 == latest.1
             });
         let tunnel_truth_exact = state.latest_topology.as_ref().is_some_and(|policy| {
             policy.target.profiles.iter().all(|profile| {
@@ -555,7 +665,10 @@ impl Supervisor {
             .lock()
             .expect("supervisor mutex poisoned")
             .latest_policy
-            .clone()
+            .as_ref()
+            .and_then(|(revision, operation, stage)| {
+                (*stage == PolicyStage::Final).then(|| (revision.clone(), operation.clone()))
+            })
     }
     #[must_use]
     pub fn applied_topology(&self) -> Option<TopologyState> {

@@ -182,6 +182,7 @@ pub enum Commands {
     ///     vortix status --brief                  One-line summary
     ///     vortix status --watch                  Live updates every 2s
     ///     vortix status --watch --json           NDJSON stream for monitoring
+    ///     vortix status --operation op-...       Query a durable operation
     Status {
         /// Continuously update (streams NDJSON in --json mode)
         #[arg(short, long)]
@@ -200,6 +201,10 @@ pub enum Commands {
         /// bypass path or working around a misbehaving daemon.
         #[arg(long)]
         no_daemon: bool,
+
+        /// Query one durable lifecycle operation returned by a prior timeout.
+        #[arg(long, value_name = "ID", conflicts_with_all = ["watch", "brief"])]
+        operation: Option<String>,
     },
 
     /// List imported VPN profiles

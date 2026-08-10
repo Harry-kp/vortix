@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -15,10 +15,15 @@ use vortix::vortix_core::control::{
     CompletionError, CompletionOutcome, ControlPersistenceConfig, ControlService,
     ControlServiceConfig, ControlStateStore, ControlStateStoreError, Deadline, DurableControlState,
     ExecutionSelection, IdempotencyKey, Observation, OperationCompletion, OperationFailure,
-    OperationStatus, ReadinessError, RecoveredControlState, RequestedTunnelState, UserCommand,
+    OperationStatus, ProfileTopology, ReadinessError, RecoveredControlState, RequestedTunnelState,
+    UserCommand,
 };
 use vortix::vortix_core::ports::tunnel::TunnelKindTag;
 use vortix::vortix_core::profile::ProfileId;
+
+fn topology_catalog(profile_id: &ProfileId) -> BTreeMap<ProfileId, ProfileTopology> {
+    BTreeMap::from([(profile_id.clone(), ProfileTopology::default())])
+}
 
 #[derive(Debug, Default)]
 struct RecordingStore {
@@ -243,6 +248,7 @@ async fn desired_intent_is_saved_before_supervised_effect_dispatch() {
         ControlServiceConfig {
             authority_epoch: AuthorityEpoch(8),
             known_profiles: BTreeSet::from([profile_id.clone()]),
+            profile_topologies: topology_catalog(&profile_id),
             persistence: Some(ControlPersistenceConfig::new("boot-a", store.clone())),
             freshness_poll_interval: Duration::from_millis(5),
             ..ControlServiceConfig::default()
@@ -289,6 +295,7 @@ async fn failed_mutation_save_is_retried_before_effect_dispatch() {
         ControlServiceConfig {
             authority_epoch: AuthorityEpoch(11),
             known_profiles: BTreeSet::from([profile_id.clone()]),
+            profile_topologies: topology_catalog(&profile_id),
             persistence: Some(ControlPersistenceConfig::new("boot-a", store.clone())),
             freshness_poll_interval: Duration::from_millis(5),
             ..ControlServiceConfig::default()
@@ -353,6 +360,7 @@ async fn terminal_reply_waits_for_durable_operation_result() {
     let service = ControlService::start(ControlServiceConfig {
         authority_epoch: AuthorityEpoch(12),
         known_profiles: BTreeSet::from([profile_id.clone()]),
+        profile_topologies: topology_catalog(&profile_id),
         persistence: Some(ControlPersistenceConfig::new("boot-a", store.clone())),
         ..ControlServiceConfig::default()
     });
@@ -396,6 +404,7 @@ async fn same_boot_restart_scans_before_resuming_one_nonterminal_operation() {
     let config = ControlServiceConfig {
         authority_epoch: AuthorityEpoch(9),
         known_profiles: BTreeSet::from([profile_id.clone()]),
+        profile_topologies: topology_catalog(&profile_id),
         persistence: Some(ControlPersistenceConfig::new("boot-a", store.clone())),
         freshness_poll_interval: Duration::from_millis(5),
         ..ControlServiceConfig::default()
@@ -493,6 +502,7 @@ async fn new_boot_creates_one_recovery_operation_only_for_eligible_intent() {
     let base_config = ControlServiceConfig {
         authority_epoch: AuthorityEpoch(10),
         known_profiles: BTreeSet::from([profile_id.clone()]),
+        profile_topologies: topology_catalog(&profile_id),
         boot_connections: std::collections::BTreeMap::from([(
             profile_id.clone(),
             BootConnection {
@@ -602,6 +612,7 @@ async fn reboot_uses_current_boot_policy_instead_of_persisted_eligibility() {
     let base = ControlServiceConfig {
         authority_epoch: AuthorityEpoch(13),
         known_profiles: BTreeSet::from([profile_id.clone()]),
+        profile_topologies: topology_catalog(&profile_id),
         boot_connections: std::collections::BTreeMap::from([(profile_id.clone(), enabled)]),
         persistence: Some(ControlPersistenceConfig::new("boot-a", store.clone())),
         ..ControlServiceConfig::default()
@@ -629,6 +640,7 @@ async fn reboot_uses_current_boot_policy_instead_of_persisted_eligibility() {
     let rebooted = ControlService::start(ControlServiceConfig {
         authority_epoch: AuthorityEpoch(13),
         known_profiles: BTreeSet::from([profile_id.clone()]),
+        profile_topologies: topology_catalog(&profile_id),
         boot_connections: std::collections::BTreeMap::from([(
             profile_id.clone(),
             BootConnection {

@@ -7,6 +7,7 @@
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io::Read as _;
+use std::net::IpAddr;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Deserializer, Serialize};
@@ -127,6 +128,27 @@ pub enum ProtocolKind {
     OpenVpn,
 }
 
+/// One DNS endpoint resolution bound to an exact profile body by the caller.
+/// Protocol adapters consume this only when rendering their private managed
+/// config; source profiles are never modified.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ResolvedEndpoint {
+    pub hostname: String,
+    pub port: u16,
+    pub address: IpAddr,
+}
+
+impl ResolvedEndpoint {
+    #[must_use]
+    pub fn new(hostname: impl Into<String>, port: u16, address: IpAddr) -> Self {
+        Self {
+            hostname: hostname.into(),
+            port,
+            address,
+        }
+    }
+}
+
 impl std::fmt::Display for ProtocolKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -149,6 +171,13 @@ pub struct Profile {
     pub protocol: ProtocolKind,
     /// Absolute path to the on-disk config (e.g., `.conf` or `.ovpn`).
     pub config_path: PathBuf,
+    /// Exact endpoint substitutions captured while the profile body was
+    /// authenticated and parsed. Empty means hostname startup must fail
+    /// closed rather than ask DNS through a blocking firewall.
+    pub endpoint_resolutions: Vec<ResolvedEndpoint>,
+    /// Canonical Standard mode requires every hostname to be replaced in the
+    /// managed config. Legacy callers default to protocol-native DNS.
+    pub require_managed_endpoint_resolution: bool,
 }
 
 impl Profile {
@@ -165,7 +194,38 @@ impl Profile {
             display_name: display_name.into(),
             protocol,
             config_path,
+            endpoint_resolutions: Vec::new(),
+            require_managed_endpoint_resolution: false,
         }
+    }
+
+    #[must_use]
+    pub fn require_managed_endpoint_resolution(mut self) -> Self {
+        self.require_managed_endpoint_resolution = true;
+        self
+    }
+
+    #[must_use]
+    pub fn with_endpoint_resolutions(
+        mut self,
+        resolutions: impl IntoIterator<Item = ResolvedEndpoint>,
+    ) -> Self {
+        self.endpoint_resolutions = resolutions.into_iter().collect();
+        self
+    }
+
+    /// Return one unambiguous exact host/port substitution.
+    #[must_use]
+    pub fn resolved_endpoint(&self, hostname: &str, port: u16) -> Option<IpAddr> {
+        let mut matches = self
+            .endpoint_resolutions
+            .iter()
+            .filter(|resolution| {
+                resolution.port == port && resolution.hostname.eq_ignore_ascii_case(hostname)
+            })
+            .map(|resolution| resolution.address);
+        let first = matches.next()?;
+        matches.all(|address| address == first).then_some(first)
     }
 }
 

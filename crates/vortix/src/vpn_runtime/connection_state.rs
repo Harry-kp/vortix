@@ -1,5 +1,5 @@
-//! Single-tunnel `ConnectionState` enum — surviving as the CLI's local
-//! state shape and as the return type of `App::legacy_state()`.
+//! Single-tunnel `ConnectionState` enum retained only as the derived return
+//! type of `App::legacy_state()`.
 //!
 //! After plan P5d the canonical source of truth for active VPN state on
 //! the App side is the [`crate::vortix_core::engine::TunnelRegistry`] that
@@ -7,32 +7,21 @@
 //! `VpnRuntime` is gone; every panel renderer reads `app.registry`
 //! snapshots directly.
 //!
-//! Two remaining users of this enum:
-//!
-//! 1. The CLI's blocking helpers in
-//!    [`crate::vpn_runtime::connection`] (`connect_and_wait`,
-//!    `disconnect_and_wait`) used to carry their own local
-//!    `ConnectionState` value during the lifetime of one CLI
-//!    invocation. They now derive the active-tunnel slice for the
-//!    kill switch directly from the scanner via
-//!    `VpnRuntime::killswitch_view_from_scanner` (every kernel-visible
-//!    tunnel contributes, not just the one this CLI call touched).
-//!
-//! 2. [`crate::app::App::legacy_state`] returns this enum as a derived
+//! [`crate::app::App::legacy_state`] returns this enum as a derived
 //!    view of the registry primary so the few residual single-tunnel-
 //!    shaped reads (kill-switch sync, profile-delete safety,
 //!    scanner-dispatch helpers) keep working without a stored field.
 //!
-//! Visibility: still re-exported from [`crate::vpn_runtime`] for those
-//! two callers, but **not** from [`crate::state`] — panels never see it.
+//! Visibility: still re-exported from [`crate::vpn_runtime`] for that
+//! compatibility view, but **not** from [`crate::state`] — panels never see it.
 
 use std::time::Instant;
 
 /// Technical details parsed from the VPN interface.
 ///
 /// Companion to [`crate::vortix_core::engine::state::DetailedConnectionInfo`]
-/// — the registry's snapshot panels read; this one is the CLI-local
-/// shape carried by [`ConnectionState::Connected`] and the return type
+/// — the registry's snapshot panels read; this is the compatibility shape
+/// carried by [`ConnectionState::Connected`] and the return type
 /// of [`crate::app::App::legacy_state`]. Both shapes have identical
 /// field names + types; `legacy_to_core_details` in `app/connection.rs`
 /// translates between them when populating the registry.

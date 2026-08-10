@@ -104,6 +104,18 @@ pub const CONTROL_SCENARIOS: &[ControlScenario] = &[
         OutputSurface::JsonWatch,
     ),
     scenario(
+        "status-durable-operation",
+        ContractArea::Status,
+        &[
+            "vortix",
+            "status",
+            "--operation",
+            "op-0000000000000001-0000000000000002",
+        ],
+        "status",
+        OutputSurface::Human,
+    ),
+    scenario(
         "killswitch-show-json",
         ContractArea::KillSwitch,
         &["vortix", "--json", "killswitch"],

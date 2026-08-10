@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
+use crate::vortix_core::control::OperationId;
 use crate::vortix_core::ports::process::{
     CommandSpec, ManagedProcessId, ProcessError, ProcessLifecycle,
 };
@@ -37,6 +38,10 @@ const POLL_INTERVAL: Duration = Duration::from_millis(25);
 pub struct CustodianHandshake {
     pub identity: ManagedProcessId,
     pub pid: u32,
+    /// Canonical connect operation that created this child. Legacy receipts
+    /// omit it and remain readable, but cannot outlive operation retention.
+    #[serde(default)]
+    pub operation_id: Option<OperationId>,
 }
 
 #[derive(Debug, Error)]
@@ -67,6 +72,8 @@ struct LaunchRequest {
     spec: CommandSpec,
     cleanup_paths: Vec<PathBuf>,
     graceful_timeout_ms: u64,
+    #[serde(default)]
+    operation_id: Option<OperationId>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -96,6 +103,8 @@ struct LifecycleResponse {
 struct OwnershipReceipt {
     identity: ManagedProcessId,
     child_pid: u32,
+    #[serde(default)]
+    operation_id: Option<OperationId>,
 }
 
 /// Bounded lifecycle custodian parameterized by a deterministic fake or real
@@ -149,6 +158,7 @@ impl<P: ProcessLifecycle> StandardCustodian<P> {
             Ok(true) => Ok(CustodianHandshake {
                 identity,
                 pid: ownership.pid,
+                operation_id: None,
             }),
             Ok(false) => match self.force_cleanup(&identity) {
                 Ok(()) => Err(CustodianError::StartupFailed),
@@ -250,6 +260,19 @@ pub fn spawn_custodian(
     cleanup_paths: Vec<PathBuf>,
     graceful_timeout: Duration,
 ) -> Result<CustodianHandshake, CustodianError> {
+    spawn_custodian_for_operation(identity, spec, cleanup_paths, graceful_timeout, None)
+}
+
+/// Start a private custodian and bind its authenticated durable receipt to
+/// the canonical operation that created the child.
+#[allow(clippy::needless_pass_by_value)] // ownership crosses the process boundary in the frame
+pub fn spawn_custodian_for_operation(
+    identity: ManagedProcessId,
+    spec: CommandSpec,
+    cleanup_paths: Vec<PathBuf>,
+    graceful_timeout: Duration,
+    operation_id: Option<OperationId>,
+) -> Result<CustodianHandshake, CustodianError> {
     if !identity.has_valid_token() {
         return Err(CustodianError::Protocol(
             "invalid ownership identity".into(),
@@ -279,6 +302,7 @@ pub fn spawn_custodian(
             spec,
             cleanup_paths,
             graceful_timeout_ms: u64::try_from(graceful_timeout.as_millis()).unwrap_or(u64::MAX),
+            operation_id,
         };
         write_json_line(&mut stdin, &request)?;
 
@@ -344,7 +368,19 @@ fn wait_for_handoff_cleanup(child: &mut Child) {
 
 /// Read the exact current receipt for a profile. Absence is not ownership.
 pub fn load_identity(profile_id: &ProfileId) -> Result<Option<ManagedProcessId>, CustodianError> {
-    Ok(load_receipt(profile_id)?.map(|receipt| receipt.identity))
+    Ok(load_handshake(profile_id)?.map(|receipt| receipt.identity))
+}
+
+/// Read the authenticated Standard-mode child capability and PID needed to
+/// reconstruct an exact lifecycle handle in a later one-shot process.
+pub fn load_handshake(
+    profile_id: &ProfileId,
+) -> Result<Option<CustodianHandshake>, CustodianError> {
+    Ok(load_receipt(profile_id)?.map(|receipt| CustodianHandshake {
+        identity: receipt.identity,
+        pid: receipt.child_pid,
+        operation_id: receipt.operation_id,
+    }))
 }
 
 fn load_receipt(profile_id: &ProfileId) -> Result<Option<OwnershipReceipt>, CustodianError> {
@@ -506,7 +542,10 @@ fn run_hidden() -> Result<(), CustodianError> {
     }
     let mut custodian = StandardCustodian::new(RealProcessLifecycle::default(), graceful_timeout);
     let handshake = match custodian.start(request.identity.clone(), request.spec) {
-        Ok(handshake) => handshake,
+        Ok(mut handshake) => {
+            handshake.operation_id = request.operation_id;
+            handshake
+        }
         Err(error) => {
             let _ = write_json_line(
                 &mut std::io::stdout().lock(),
@@ -819,6 +858,7 @@ fn write_receipt(handshake: &CustodianHandshake) -> Result<(), CustodianError> {
     let receipt = OwnershipReceipt {
         identity: handshake.identity.clone(),
         child_pid: handshake.pid,
+        operation_id: handshake.operation_id.clone(),
     };
     let final_path = receipt_path(&handshake.identity.profile_id);
     let temp_path = runtime_dir().join(format!(
@@ -970,5 +1010,25 @@ fn install_termination_handler() {
     unsafe {
         libc::signal(libc::SIGTERM, termination_handler as libc::sighandler_t);
         libc::signal(libc::SIGINT, termination_handler as libc::sighandler_t);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_receipt_without_operation_remains_readable_but_unbound() {
+        let receipt: OwnershipReceipt = serde_json::from_value(serde_json::json!({
+            "identity": {
+                "profile_id": "b".repeat(64),
+                "generation": 7,
+                "ownership_token": "a".repeat(64),
+            },
+            "child_pid": 42,
+        }))
+        .unwrap();
+        assert_eq!(receipt.identity.profile_id.as_str(), "b".repeat(64));
+        assert_eq!(receipt.operation_id, None);
     }
 }

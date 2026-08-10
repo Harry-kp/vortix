@@ -1,6 +1,6 @@
 use std::future::{poll_fn, Future as _};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::Duration;
 
@@ -9,12 +9,14 @@ use vortix::vortix_core::control::{
     CompletionOutcome, CompletionResult, ControlEvent, ControlHandle, ControlService,
     ControlServiceConfig, Deadline, DriftGates, EventReceiveError, GateEvidence, IdempotencyKey,
     Observation, ObservationError, OperationCompletion, OperationFailure, OperationStatus,
-    ProtectionEvidence, ProtectionStatus, ReadinessError, Secret, UserCommand,
+    ProfileMutation, ProfileMutationApplied, ProfileMutationExecutor, ProfileMutationFailure,
+    ProfileMutationWork, ProfileTopology, ProtectionEvidence, ProtectionStatus, ReadinessError,
+    Secret, UserCommand,
 };
 use vortix::vortix_core::engine::state::{ConnectionHealth, DegradedReason};
 use vortix::vortix_core::profile::ProfileId;
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct FakeClock(AtomicU64);
 
 impl FakeClock {
@@ -46,6 +48,320 @@ fn config() -> ControlServiceConfig {
         freshness_poll_interval: Duration::from_secs(60),
         ..ControlServiceConfig::default()
     }
+}
+
+#[derive(Debug)]
+struct FakeProfileMutations {
+    delay: Duration,
+    import_has_topology: bool,
+    calls: Mutex<Vec<ProfileMutation>>,
+}
+
+impl ProfileMutationExecutor for FakeProfileMutations {
+    fn execute(
+        &self,
+        work: ProfileMutationWork,
+    ) -> Result<ProfileMutationApplied, ProfileMutationFailure> {
+        std::thread::sleep(self.delay);
+        self.calls.lock().unwrap().push(work.mutation.clone());
+        Ok(match work.mutation {
+            ProfileMutation::Import { profile_id } => ProfileMutationApplied::Imported {
+                profile_id,
+                topology: self.import_has_topology.then(ProfileTopology::default),
+            },
+            ProfileMutation::Rename {
+                profile_id,
+                new_display_name,
+            } => ProfileMutationApplied::Renamed {
+                profile_id,
+                topology: ProfileTopology {
+                    display_name: Some(new_display_name),
+                    ..ProfileTopology::default()
+                },
+            },
+            ProfileMutation::Delete { profile_id } => {
+                ProfileMutationApplied::Deleted { profile_id }
+            }
+        })
+    }
+}
+
+async fn wait_for_terminal(
+    handle: &ControlHandle,
+    operation_id: &vortix::vortix_core::control::OperationId,
+) {
+    let mut subscription = handle.subscribe();
+    loop {
+        let snapshot = subscription.snapshot();
+        if snapshot
+            .operations
+            .get(operation_id)
+            .is_some_and(|operation| operation.status.is_terminal())
+        {
+            return;
+        }
+        subscription.changed().await.expect("service remains live");
+    }
+}
+
+#[tokio::test]
+async fn typed_profile_import_updates_the_single_service_catalog() {
+    let mutations = Arc::new(FakeProfileMutations {
+        delay: Duration::ZERO,
+        import_has_topology: true,
+        calls: Mutex::new(Vec::new()),
+    });
+    let imported = profile('e');
+    let service = ControlService::start(ControlServiceConfig {
+        profile_mutations: Some(mutations.clone()),
+        ..config()
+    });
+    let client = service.client();
+    let operation = client
+        .submit(CommandRequest {
+            command: UserCommand::ImportProfile {
+                profile_id: imported.clone(),
+            },
+            idempotency_key: IdempotencyKey::new("profile-import"),
+            deadline: Deadline(u64::MAX),
+        })
+        .await
+        .expect("typed import admitted");
+    wait_for_terminal(&client, &operation.operation_id).await;
+    assert_eq!(
+        client.snapshot().operations[&operation.operation_id].status,
+        OperationStatus::Succeeded
+    );
+
+    client
+        .submit(request("connect-imported", imported, u64::MAX))
+        .await
+        .expect("the same dynamic catalog admits the imported identity");
+    assert_eq!(mutations.calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn profile_mutation_fences_racing_lifecycle_and_rejects_active_profiles() {
+    let mutations = Arc::new(FakeProfileMutations {
+        delay: Duration::from_millis(50),
+        import_has_topology: true,
+        calls: Mutex::new(Vec::new()),
+    });
+    let existing = profile('d');
+    let service = ControlService::start(ControlServiceConfig {
+        known_profiles: [existing.clone()].into_iter().collect(),
+        profile_topologies: [(existing.clone(), ProfileTopology::default())]
+            .into_iter()
+            .collect(),
+        profile_mutations: Some(mutations),
+        ..config()
+    });
+    let client = service.client();
+    let rename = client
+        .submit(CommandRequest {
+            command: UserCommand::RenameProfile {
+                profile_id: existing.clone(),
+                new_display_name: "work".to_owned(),
+            },
+            idempotency_key: IdempotencyKey::new("profile-rename"),
+            deadline: Deadline(u64::MAX),
+        })
+        .await
+        .expect("rename admitted");
+    assert_eq!(
+        client
+            .submit(request("racing-connect", existing.clone(), u64::MAX))
+            .await,
+        Err(AdmissionError::ProfileBusy)
+    );
+    wait_for_terminal(&client, &rename.operation_id).await;
+
+    let observer = service.observer();
+    let observed_at_millis = observer.now_millis();
+    observer
+        .observe(Observation::Tunnel {
+            profile_id: existing.clone(),
+            active: true,
+            interface_name: Some("tun0".to_owned()),
+            observed_at_millis,
+            protection: None,
+        })
+        .await
+        .expect("active observation accepted");
+    assert_eq!(
+        client
+            .submit(CommandRequest {
+                command: UserCommand::DeleteProfile {
+                    profile_id: existing,
+                },
+                idempotency_key: IdempotencyKey::new("profile-delete"),
+                deadline: Deadline(u64::MAX),
+            })
+            .await,
+        Err(AdmissionError::ProfileActive)
+    );
+}
+
+#[tokio::test]
+async fn imported_profile_without_topology_is_known_but_cannot_connect() {
+    let mutations = Arc::new(FakeProfileMutations {
+        delay: Duration::ZERO,
+        import_has_topology: false,
+        calls: Mutex::new(Vec::new()),
+    });
+    let imported = profile('f');
+    let service = ControlService::start(ControlServiceConfig {
+        profile_mutations: Some(mutations),
+        ..config()
+    });
+    let client = service.client();
+    let operation = client
+        .submit(CommandRequest {
+            command: UserCommand::ImportProfile {
+                profile_id: imported.clone(),
+            },
+            idempotency_key: IdempotencyKey::new("profile-import-no-topology"),
+            deadline: Deadline(u64::MAX),
+        })
+        .await
+        .expect("storage mutation remains truthful");
+    wait_for_terminal(&client, &operation.operation_id).await;
+
+    assert_eq!(
+        client
+            .submit(request("unsafe-connect", imported, u64::MAX))
+            .await,
+        Err(AdmissionError::InvalidInput {
+            reason: "profile topology is unavailable".to_owned(),
+        })
+    );
+}
+
+#[derive(Debug)]
+struct LateProfileMutation {
+    clock: Arc<FakeClock>,
+}
+
+impl ProfileMutationExecutor for LateProfileMutation {
+    fn execute(
+        &self,
+        work: ProfileMutationWork,
+    ) -> Result<ProfileMutationApplied, ProfileMutationFailure> {
+        self.clock.set(work.deadline.0.saturating_add(1));
+        Ok(ProfileMutationApplied::Imported {
+            profile_id: work.mutation.profile_id().clone(),
+            topology: Some(ProfileTopology::default()),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct MismatchedProfileMutation;
+
+impl ProfileMutationExecutor for MismatchedProfileMutation {
+    fn execute(
+        &self,
+        work: ProfileMutationWork,
+    ) -> Result<ProfileMutationApplied, ProfileMutationFailure> {
+        Ok(ProfileMutationApplied::Deleted {
+            profile_id: work.mutation.profile_id().clone(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn mismatched_profile_storage_result_cannot_mutate_the_catalog() {
+    let imported = profile('8');
+    let service = ControlService::start(ControlServiceConfig {
+        profile_mutations: Some(Arc::new(MismatchedProfileMutation)),
+        ..config()
+    });
+    let client = service.client();
+    let operation = client
+        .submit(CommandRequest {
+            command: UserCommand::ImportProfile {
+                profile_id: imported.clone(),
+            },
+            idempotency_key: IdempotencyKey::new("mismatched-profile-import"),
+            deadline: Deadline(u64::MAX),
+        })
+        .await
+        .expect("typed import admitted");
+    wait_for_terminal(&client, &operation.operation_id).await;
+    let snapshot = client.snapshot();
+    assert_eq!(
+        snapshot.operations[&operation.operation_id].status,
+        OperationStatus::Failed
+    );
+    assert_eq!(
+        snapshot.operations[&operation.operation_id].result,
+        Some(vortix::vortix_core::control::OperationResult::Failed(
+            OperationFailure::Internal
+        ))
+    );
+
+    client
+        .submit(CommandRequest {
+            command: UserCommand::ImportProfile {
+                profile_id: imported,
+            },
+            idempotency_key: IdempotencyKey::new("mismatched-profile-import-retry"),
+            deadline: Deadline(u64::MAX),
+        })
+        .await
+        .expect("mismatched result neither catalogs nor leaves the profile fenced");
+}
+
+#[tokio::test]
+async fn late_profile_storage_is_reconciled_but_never_reported_as_timely_success() {
+    let clock = Arc::new(FakeClock::default());
+    let imported = profile('9');
+    let service = ControlService::start_with_clock(
+        ControlServiceConfig {
+            profile_mutations: Some(Arc::new(LateProfileMutation {
+                clock: clock.clone(),
+            })),
+            ..config()
+        },
+        clock,
+    );
+    let client = service.client();
+    let operation = client
+        .submit(CommandRequest {
+            command: UserCommand::ImportProfile {
+                profile_id: imported.clone(),
+            },
+            idempotency_key: IdempotencyKey::new("late-profile-import"),
+            deadline: Deadline(10),
+        })
+        .await
+        .expect("work admitted before its deadline");
+    wait_for_terminal(&client, &operation.operation_id).await;
+    assert_eq!(
+        client.snapshot().operations[&operation.operation_id].status,
+        OperationStatus::Expired
+    );
+    assert_eq!(
+        client.snapshot().operations[&operation.operation_id].result,
+        Some(vortix::vortix_core::control::OperationResult::ProfileMutationAppliedAfterDeadline)
+    );
+
+    client
+        .submit(request("connect-late-import", imported, u64::MAX))
+        .await
+        .expect("committed storage result was reconciled into the catalog");
+}
+
+#[tokio::test]
+async fn fresh_local_service_imports_existing_kill_switch_intent() {
+    let service = ControlService::start(ControlServiceConfig {
+        initial_kill_switch_mode: vortix::vortix_core::state::killswitch::KillSwitchMode::AlwaysOn,
+        ..config()
+    });
+    assert_eq!(
+        service.client().snapshot().desired.kill_switch,
+        vortix::vortix_core::state::killswitch::KillSwitchMode::AlwaysOn
+    );
 }
 
 async fn wait_for_generation(handle: &ControlHandle, desired_generation: u64) {
@@ -580,6 +896,115 @@ async fn challenge_authorization_comes_from_issuing_operation_client() {
             .respond_challenge(issued.record.id, Secret::new(b"stolen".to_vec()))
             .await,
         Err(ChallengeError::Unauthorized)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocking_worker_challenge_keeps_actor_live_and_is_one_shot() {
+    let service = ControlService::start(config());
+    let client = service.client();
+    let operation = client
+        .submit(request("blocking-challenge", profile('a'), u64::MAX))
+        .await
+        .expect("operation");
+    wait_for_generation(&client, 1).await;
+
+    let completer = service.completer();
+    let operation_id = operation.operation_id.clone();
+    let issuance = tokio::task::spawn_blocking(move || {
+        completer.issue_challenge_blocking(
+            operation_id,
+            profile('a'),
+            vortix::vortix_core::control::ChallengeKind::TwoFactorCode,
+            "OTP",
+            u64::MAX,
+        )
+    });
+
+    let challenge_id = loop {
+        if let Some(id) = client.snapshot().challenges.keys().next().copied() {
+            break id;
+        }
+        tokio::task::yield_now().await;
+    };
+    client
+        .refresh()
+        .expect("actor accepts progress while worker waits");
+    let issued = issuance
+        .await
+        .expect("worker task")
+        .expect("challenge issued");
+    assert_eq!(issued.record.id, challenge_id);
+
+    client
+        .respond_challenge(challenge_id, Secret::new(b"123456".to_vec()))
+        .await
+        .expect("authorized answer");
+    assert!(issued
+        .response
+        .receive_timeout(Duration::from_secs(1))
+        .expect("receiver remains live")
+        .is_some());
+    assert_eq!(
+        client
+            .respond_challenge(challenge_id, Secret::new(b"again".to_vec()))
+            .await,
+        Err(ChallengeError::NotFound)
+    );
+}
+
+#[tokio::test]
+async fn no_op_refresh_preserves_snapshot_generation_and_does_not_wake_subscribers() {
+    let service = ControlService::start(config());
+    let client = service.client();
+    let mut subscription = client.subscribe();
+    let generation = subscription.snapshot().generation;
+
+    client.refresh().expect("refresh accepted");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), subscription.changed())
+            .await
+            .is_err(),
+        "a no-op refresh must preserve the watch channel's no-change signal"
+    );
+    assert_eq!(client.snapshot().generation, generation);
+}
+
+#[tokio::test]
+async fn terminal_operation_cancels_its_unanswered_challenge() {
+    let service = ControlService::start(config());
+    let client = service.client();
+    let completer = service.completer();
+    let operation = client
+        .submit(request("terminal-challenge", profile('a'), u64::MAX))
+        .await
+        .expect("operation");
+    wait_for_generation(&client, 1).await;
+    let issued = completer
+        .issue_challenge(
+            operation.operation_id.clone(),
+            profile('a'),
+            vortix::vortix_core::control::ChallengeKind::TwoFactorCode,
+            "OTP",
+            u64::MAX,
+        )
+        .await
+        .expect("challenge");
+    let id = issued.record.id;
+
+    completer
+        .complete(OperationCompletion {
+            operation_id: operation.operation_id,
+            desired_generation: 1,
+            outcome: CompletionOutcome::Cancelled,
+        })
+        .await
+        .expect("terminal completion");
+    assert!(issued.response.receive().await.is_err());
+    assert!(!client.snapshot().challenges.contains_key(&id));
+    assert_eq!(
+        client.cancel_challenge(id).await,
+        Err(ChallengeError::Cancelled)
     );
 }
 
