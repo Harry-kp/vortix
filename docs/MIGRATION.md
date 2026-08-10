@@ -42,10 +42,28 @@ Each sidecar carries a stable `profile_id` assigned once during import or
 migration, the original `display_name`, and the protocol.
 v0.2.x ignores `.meta.toml` files entirely, so rollback is safe.
 
-The migration is **idempotent** — it re-runs at every startup and only
-touches profiles that don't have a sidecar yet. There is no explicit
-`vortix migrate` command; if you need to re-trigger after fixing
-something (e.g., a permissions issue), just restart vortix.
+The migration is **idempotent** — it re-runs at every startup and creates
+sidecars only for profiles that lack one. There is no explicit `vortix migrate`
+command; if you need to re-trigger after fixing something (e.g., a permissions
+issue), just restart vortix.
+
+Older Vortix releases could leave a `.meta.toml` behind after deleting its
+profile config. During the one-time archive phase, Vortix first saves the
+active profile IDs plus a size and SHA-256 record for each config-less legacy
+sidecar. It then moves those exact files into
+`profiles/.vortix-legacy-sidecars-v1/` and atomically marks the phase complete.
+If startup is interrupted, the next run revalidates the active catalog and
+resumes from the durable record before moving anything else. The archived files
+remain available to the invoking user for rollback and inspection, but no
+longer participate in the active profile catalog. Active configs and their
+matching sidecars are unchanged.
+
+To restore an archived identity, stop Vortix, restore the matching `.conf` or
+`.ovpn`, move its `.meta.toml` from `.vortix-legacy-sidecars-v1/` back beside
+the config, back up and remove `.vortix-profile-inventory-v1.toml`, then restart
+Vortix. The rebuilt inventory reads the restored sidecar and keeps its existing
+profile ID. Do this only while Vortix is stopped; a config-set change against a
+saved inventory intentionally fails closed.
 
 If migration ever fails (read-only profile dir, unusual perms, etc.),
 startup fails before any tunnel lifecycle mutation. No profile is silently

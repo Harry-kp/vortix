@@ -143,9 +143,11 @@ fn main() -> Result<()> {
 
     // backfill profile sidecars for `.conf` / `.ovpn` files
     // imported before the sidecar scheme existed. Idempotent — no-ops once
-    // every profile has a `.meta.toml`. Identity ambiguity is fatal before
-    // any lifecycle path starts; proceeding would let two names own one
-    // tunnel or invent a replacement ID after a transient file move.
+    // every profile has a `.meta.toml`. The first canonical migration records
+    // config-less sidecars left by legacy delete paths in its durable inventory,
+    // archives those exact bytes, then marks the phase complete. Interrupted
+    // archival resumes from that record. Identity ambiguity is still fatal
+    // before any lifecycle path starts.
     //
     // VORTIX_SKIP_MIGRATION=<anything> bypasses the startup backfill for
     // users who need to disable it (see docs/MIGRATION.md).
@@ -159,6 +161,12 @@ fn main() -> Result<()> {
                     eprintln!(
                         "Migrated {} profile(s) to the new sidecar scheme.",
                         stats.created
+                    );
+                }
+                if stats.archived_legacy_sidecars > 0 {
+                    eprintln!(
+                        "Archived {} stale legacy profile metadata file(s) under profiles/.vortix-legacy-sidecars-v1.",
+                        stats.archived_legacy_sidecars
                     );
                 }
                 if stats.failed > 0 {
