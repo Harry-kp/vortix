@@ -33,6 +33,19 @@ pub enum UserCommand {
         #[serde(with = "crate::vortix_core::state::killswitch::serde_mode_slug")]
         mode: KillSwitchMode,
     },
+    /// Commit a profile body previously prepared in a memory-only mutation
+    /// executor. The durable command carries only the new stable identity;
+    /// private protocol configuration never enters operation state/events.
+    ImportProfile {
+        profile_id: ProfileId,
+    },
+    RenameProfile {
+        profile_id: ProfileId,
+        new_display_name: String,
+    },
+    DeleteProfile {
+        profile_id: ProfileId,
+    },
 }
 
 /// Service-clock deadline in milliseconds.
@@ -89,6 +102,11 @@ impl Secret {
 
     pub(crate) fn is_valid(&self) -> bool {
         !self.0.is_empty() && self.0.len() <= 16 * 1024
+    }
+
+    /// Borrow credential bytes only at the final in-process protocol boundary.
+    pub(crate) fn expose(&self) -> &[u8] {
+        &self.0
     }
 
     fn clear(&mut self) {

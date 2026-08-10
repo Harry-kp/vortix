@@ -319,8 +319,8 @@ struct HookJob {
 
 /// Owns the bounded in-memory queue and its non-replaying workers.
 pub struct HookRunner {
-    dispatcher: HookDispatcher,
-    task: JoinHandle<()>,
+    dispatcher: Option<HookDispatcher>,
+    task: Option<JoinHandle<()>>,
     source_task: Option<JoinHandle<()>>,
 }
 
@@ -350,8 +350,8 @@ impl HookRunner {
         let task = tokio::spawn(run_jobs(receiver, diagnostics, owner, runner));
         Ok(Some((
             Self {
-                dispatcher,
-                task,
+                dispatcher: Some(dispatcher),
+                task: Some(task),
                 source_task: None,
             },
             HookDiagnostics {
@@ -361,15 +361,33 @@ impl HookRunner {
     }
 
     #[must_use]
+    /// Clone the non-blocking hook dispatcher.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if called while the runner is being consumed by shutdown;
+    /// safe Rust ownership prevents that state from being observed by callers.
     pub fn dispatcher(&self) -> HookDispatcher {
-        self.dispatcher.clone()
+        self.dispatcher
+            .as_ref()
+            .expect("hook runner has not shut down")
+            .clone()
     }
 
     /// Consume committed control-service facts. Lag and service restart may
     /// lose observational hooks; neither condition is replayed.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if called while the runner is being consumed by shutdown;
+    /// safe Rust ownership prevents that state from being observed by callers.
     pub fn attach_control(&mut self, mut subscription: ControlSubscription) {
         if let Some(task) = self.source_task.replace(tokio::spawn({
-            let dispatcher = self.dispatcher.clone();
+            let dispatcher = self
+                .dispatcher
+                .as_ref()
+                .expect("hook runner has not shut down")
+                .clone();
             async move {
                 loop {
                     match subscription.recv_event().await {
@@ -390,11 +408,34 @@ impl HookRunner {
             task.abort();
         }
     }
+
+    /// Stop accepting control events and give already-queued observers a
+    /// bounded opportunity to finish. Lifecycle never waits for hook success;
+    /// this is only the Standard-mode process-exit drain.
+    pub async fn shutdown_bounded(mut self, timeout: std::time::Duration) {
+        // Let the subscription task consume events published by the same
+        // service turn that completed the caller's operation.
+        tokio::task::yield_now().await;
+        if let Some(source_task) = self.source_task.take() {
+            source_task.abort();
+            let _ = source_task.await;
+        }
+        drop(self.dispatcher.take());
+        let Some(task) = self.task.take() else {
+            return;
+        };
+        let abort = task.abort_handle();
+        if tokio::time::timeout(timeout, task).await.is_err() {
+            abort.abort();
+        }
+    }
 }
 
 impl Drop for HookRunner {
     fn drop(&mut self) {
-        self.task.abort();
+        if let Some(task) = &self.task {
+            task.abort();
+        }
         if let Some(task) = &self.source_task {
             task.abort();
         }
@@ -537,6 +578,7 @@ fn map_failure(error: &ProcessError) -> HookFailure {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::time::Duration;
 
     use super::*;
     use crate::vortix_core::profile::{ProfileId, ProtocolKind};
@@ -644,6 +686,35 @@ mod tests {
             1,
             "same fact is never attempted twice"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn bounded_shutdown_drains_jobs_already_accepted() {
+        let mock = crate::vortix_process::MockRunner::with_default_success();
+        let (runner, _diagnostics) = HookRunner::start(
+            vec![HookSpec {
+                event: HookEvent::Disconnected,
+                executable: PathBuf::from("/usr/bin/true"),
+                args: Vec::new(),
+                timeout_secs: 5,
+            }],
+            VerifiedHookOwner::from_ids(501, 20),
+            CommandRunner::Mock(mock.clone()),
+        )
+        .unwrap()
+        .unwrap();
+        runner.dispatcher().dispatch(&LifecycleFact {
+            event_id: HookEventId::from_parts(1, 3),
+            event: HookEvent::Disconnected,
+            profile_id: ProfileId::new("corp"),
+            display_name: "Corporate".into(),
+            protocol: ProtocolKind::WireGuard,
+            occurred_at_millis: 9,
+        });
+
+        runner.shutdown_bounded(Duration::from_secs(1)).await;
+
+        assert_eq!(mock.invocations().len(), 1);
     }
 
     #[tokio::test(flavor = "current_thread")]

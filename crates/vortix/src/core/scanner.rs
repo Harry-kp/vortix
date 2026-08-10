@@ -124,20 +124,23 @@ pub fn get_active_profiles(profiles: &[VpnProfile]) -> Vec<ActiveSession> {
     {
         get_all_openvpn_pids()
     } else {
-        std::collections::HashMap::new()
+        Vec::new()
     };
     for profile in profiles {
         let session_info = match profile.protocol {
             Protocol::WireGuard => check_wireguard_by_name(&profile.name),
             Protocol::OpenVPN => {
                 let path_str = profile.config_path.to_str().unwrap_or("");
-                // Check if any PID matches this path
+                // Match either the exact source config argument or Vortix's
+                // exact generation-bound private config name.
                 openvpn_pids
                     .iter()
-                    .find(|(path, _)| path.contains(path_str) || path_str.contains(*path))
-                    .and_then(|(_, &pid)| {
+                    .find(|(path, _)| {
+                        openvpn_config_matches_profile(path, path_str, profile.id.as_str())
+                    })
+                    .and_then(|(_, pid)| {
                         check_openvpn_by_pid(
-                            pid,
+                            *pid,
                             &profile.config_path,
                             profile.id.as_str(),
                             &profile.name,
@@ -155,28 +158,106 @@ pub fn get_active_profiles(profiles: &[VpnProfile]) -> Vec<ActiveSession> {
     active
 }
 
-fn get_all_openvpn_pids() -> std::collections::HashMap<String, u32> {
-    let mut pids = std::collections::HashMap::new();
+fn openvpn_config_matches_profile(
+    config: &Path,
+    source_config_path: &str,
+    profile_id: &str,
+) -> bool {
+    let source = Path::new(source_config_path);
+    if config == source {
+        return true;
+    }
+    let Some(source_parent) = source.parent() else {
+        return false;
+    };
+    if config.parent() != Some(source_parent) {
+        return false;
+    }
+    let Some(file_name) = config.file_name().and_then(std::ffi::OsStr::to_str) else {
+        return false;
+    };
+    let prefix = format!(".vortix-{profile_id}-");
+    let Some(suffix) = file_name
+        .strip_prefix(&prefix)
+        .and_then(|name| name.strip_suffix(".ovpn"))
+    else {
+        return false;
+    };
+    let Some((generation, token)) = suffix.split_once('-') else {
+        return false;
+    };
+    let valid = [generation, token]
+        .into_iter()
+        .all(|part| part.len() == 16 && part.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    valid
+}
+
+fn openvpn_config_argument(command: &str) -> Option<String> {
+    let arguments = shell_words(command);
+    arguments.iter().enumerate().find_map(|(index, argument)| {
+        if argument == "--config" {
+            arguments.get(index + 1).cloned()
+        } else {
+            argument.strip_prefix("--config=").map(str::to_owned)
+        }
+    })
+}
+
+fn shell_words(command: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    for character in command.chars() {
+        if escaped {
+            current.push(character);
+            escaped = false;
+            continue;
+        }
+        match (quote, character) {
+            (_, '\\') => escaped = true,
+            (Some(active), value) if value == active => quote = None,
+            (None, '\'' | '"') => quote = Some(character),
+            (None, value) if value.is_whitespace() => {
+                if !current.is_empty() {
+                    words.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(character),
+        }
+    }
+    if escaped {
+        current.push('\\');
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
+}
+
+fn get_all_openvpn_pids() -> Vec<(PathBuf, u32)> {
+    let mut processes = Vec::new();
     // Use ps -ax -o pid,args to get PID and full command line
     if let Some(output) = cmd_output("ps", &["-ax", "-o", "pid,command"]) {
         let stdout = String::from_utf8_lossy(&output.stdout);
         for line in stdout.lines().skip(1) {
             // Skip header
             let line = line.trim();
-            // Match any openvpn process with --config (covers .ovpn, .conf, and any extension)
-            if line.contains("openvpn") && line.contains("--config") {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    if let Ok(pid) = parts[0].parse::<u32>() {
-                        // Store the whole command line as the key for fuzzy matching
-                        let cmd = parts[1..].join(" ");
-                        pids.insert(cmd, pid);
-                    }
+            // Parse each process command once; profile matching below stays
+            // allocation-free even with many profiles and processes.
+            let mut fields = line.splitn(2, char::is_whitespace);
+            let Some(pid) = fields.next().and_then(|value| value.parse::<u32>().ok()) else {
+                continue;
+            };
+            let command = fields.next().map(str::trim).unwrap_or_default();
+            if command.contains("openvpn") {
+                if let Some(config) = openvpn_config_argument(command) {
+                    processes.push((PathBuf::from(config), pid));
                 }
             }
         }
     }
-    pids
+    processes
 }
 
 /// Checks if a `WireGuard` interface exists and returns session details.
@@ -728,5 +809,29 @@ mod tests {
             ),
             "default ScannerResult must have no route interface"
         );
+    }
+
+    #[test]
+    fn managed_openvpn_config_matches_only_its_exact_stable_profile_id() {
+        use crate::vortix_core::profile::ProfileId;
+
+        let id = "a".repeat(ProfileId::HEX_LEN);
+        let source = "/profiles/corp.ovpn";
+        let managed = PathBuf::from(format!(
+            "/profiles/.vortix-{id}-0000000000000007-bbbbbbbbbbbbbbbb.ovpn"
+        ));
+        assert!(openvpn_config_matches_profile(&managed, source, &id));
+
+        let other = format!("{}b", "a".repeat(ProfileId::HEX_LEN - 1));
+        let foreign = PathBuf::from(format!(
+            "/profiles/.vortix-{other}-0000000000000007-bbbbbbbbbbbbbbbb.ovpn"
+        ));
+        assert!(!openvpn_config_matches_profile(&foreign, source, &id));
+
+        assert!(!openvpn_config_matches_profile(
+            Path::new("/profiles/corp.ovpn.backup"),
+            source,
+            &id,
+        ));
     }
 }

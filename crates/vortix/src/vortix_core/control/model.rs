@@ -43,6 +43,12 @@ opaque_id!(ChallengeId, "challenge");
 pub struct OperationId(String);
 
 impl OperationId {
+    #[must_use]
+    pub fn parse(value: impl Into<String>) -> Option<Self> {
+        let value = Self(value.into());
+        value.sequence().map(|_| value)
+    }
+
     pub(crate) fn from_parts(authority_epoch: AuthorityEpoch, sequence: u64) -> Self {
         Self(format!("op-{:016x}-{sequence:016x}", authority_epoch.0))
     }
@@ -136,6 +142,20 @@ pub struct AuthorityEpoch(pub u64);
 pub struct PolicyDigest(pub String);
 
 impl PolicyDigest {
+    #[must_use]
+    pub(crate) fn sha256(bytes: &[u8]) -> Self {
+        use sha2::Digest as _;
+
+        let digest = sha2::Sha256::digest(bytes);
+        let mut encoded = String::with_capacity(71);
+        encoded.push_str("sha256:");
+        for byte in digest {
+            use std::fmt::Write as _;
+            write!(&mut encoded, "{byte:02x}").expect("String write");
+        }
+        Self(encoded)
+    }
+
     pub(crate) fn is_valid(&self) -> bool {
         self.0.len() <= 128
     }
@@ -318,12 +338,29 @@ pub enum OperationFailure {
 #[serde(rename_all = "snake_case")]
 pub enum OperationResult {
     ObservedConvergence,
+    ProfileMutationApplied,
+    /// Storage committed after the admitted deadline. The operation remains
+    /// expired, but callers must not mistake the durable side effect for an
+    /// unapplied timeout and retry it blindly.
+    ProfileMutationAppliedAfterDeadline,
     Failed(OperationFailure),
     Cancelled,
     Expired,
 }
 
 impl OperationStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Admitted => "admitted",
+            Self::WaitingForObservation => "waiting_for_observation",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Expired => "expired",
+        }
+    }
+
     #[must_use]
     pub const fn is_terminal(self) -> bool {
         matches!(
@@ -371,17 +408,9 @@ pub enum OperationIntent {
         #[serde(default, with = "serde_optional_killswitch_slug")]
         kill_switch: Option<KillSwitchMode>,
     },
-    /// Service-owned recovery after a canonically managed tunnel vanished.
-    /// Persisting this distinction ensures a same-boot restart re-enters the
-    /// pre-block phase instead of treating the operation as an ordinary
-    /// reconnect.
-    UnexpectedRecovery {
-        profile_id: ProfileId,
-        #[serde(default)]
-        tunnels: BTreeMap<ProfileId, RequestedTunnelState>,
-        #[serde(default, with = "serde_optional_killswitch_slug")]
-        kill_switch: Option<KillSwitchMode>,
-    },
+    /// Filesystem/catalog mutation. The prepared import body remains in the
+    /// injected executor and is never serialized here.
+    ProfileMutation { profile_id: ProfileId },
 }
 
 mod serde_optional_killswitch_slug {
@@ -664,4 +693,16 @@ pub enum KillswitchEngageReason {
     AutoOnConnect,
     AlwaysOn,
     RecoveredFromCrash,
+}
+
+#[cfg(test)]
+mod operation_id_tests {
+    use super::OperationId;
+
+    #[test]
+    fn public_operation_id_parser_accepts_only_service_shape() {
+        assert!(OperationId::parse("op-0000000000000001-0000000000000002").is_some());
+        assert!(OperationId::parse("op-1-2").is_none());
+        assert!(OperationId::parse("client-0000000000000001-0000000000000002").is_none());
+    }
 }

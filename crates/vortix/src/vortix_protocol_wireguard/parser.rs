@@ -58,6 +58,10 @@ pub struct WgPeer {
     pub public_key: String,
     pub allowed_ips: Vec<Cidr>,
     pub endpoint: Option<SocketAddr>,
+    /// Original endpoint host and port, retained when DNS resolution is
+    /// required before a firewall safety barrier is installed.
+    pub endpoint_host: Option<String>,
+    pub endpoint_port: Option<u16>,
     pub fwmark: Option<u32>,
     pub persistent_keepalive: Option<u16>,
 }
@@ -233,6 +237,10 @@ pub fn parse_wg_conf(text: &str) -> Result<WgParsedProfile, ParseError> {
                         if let Ok(addr) = value.parse::<SocketAddr>() {
                             peer.endpoint = Some(addr);
                         }
+                        if let Some((host, port)) = parse_endpoint_host(value) {
+                            peer.endpoint_host = Some(host);
+                            peer.endpoint_port = Some(port);
+                        }
                     } else if key.eq_ignore_ascii_case("FwMark") {
                         if value.eq_ignore_ascii_case("off") {
                             peer.fwmark = Some(0);
@@ -276,6 +284,13 @@ pub fn parse_wg_conf(text: &str) -> Result<WgParsedProfile, ParseError> {
     }
 
     Ok(profile)
+}
+
+pub(crate) fn parse_endpoint_host(value: &str) -> Option<(String, u16)> {
+    let (host, port) = value.rsplit_once(':')?;
+    let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+    let port = port.parse::<u16>().ok().filter(|port| *port != 0)?;
+    (!host.is_empty()).then(|| (host.to_owned(), port))
 }
 
 #[cfg(test)]
@@ -434,6 +449,20 @@ AllowedIPs = 172.16.0.0/12
         assert_eq!(p.peers[0].public_key, "PEER1");
         assert_eq!(p.peers[1].public_key, "PEER2");
         assert_eq!(p.peers[2].public_key, "PEER3");
+    }
+
+    #[test]
+    fn hostname_endpoint_is_retained_for_pre_block_resolution() {
+        let parsed = parse_wg_conf(
+            "[Interface]\nPrivateKey = AAAA\n[Peer]\nPublicKey = BBBB\nEndpoint = vpn.example.com:51820\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.peers[0].endpoint, None);
+        assert_eq!(
+            parsed.peers[0].endpoint_host.as_deref(),
+            Some("vpn.example.com")
+        );
+        assert_eq!(parsed.peers[0].endpoint_port, Some(51820));
     }
 
     #[test]

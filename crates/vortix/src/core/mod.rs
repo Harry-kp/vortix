@@ -17,6 +17,7 @@ pub mod managed_wireguard;
 pub mod network_monitor;
 pub mod real_ip_cache;
 pub mod scanner;
+pub mod standard_tunnel_ownership;
 pub mod telemetry;
 pub mod telemetry_http;
 

@@ -222,6 +222,51 @@ pub(crate) fn strip_dns_directive(text: &str) -> String {
     out
 }
 
+fn managed_up_body(text: &str, profile: &Profile) -> Result<String, TunnelError> {
+    let stripped = strip_dns_directive(text);
+    if !profile.require_managed_endpoint_resolution {
+        return Ok(stripped);
+    }
+    let mut output = String::with_capacity(stripped.len());
+    for line in stripped.split_inclusive('\n') {
+        let Some((left, right)) = line.split_once('=') else {
+            output.push_str(line);
+            continue;
+        };
+        if !left.trim().eq_ignore_ascii_case("Endpoint") {
+            output.push_str(line);
+            continue;
+        }
+        let endpoint = right.split(['#', ';']).next().unwrap_or_default().trim();
+        let Some((host, port)) =
+            crate::vortix_protocol_wireguard::parser::parse_endpoint_host(endpoint)
+        else {
+            return Err(TunnelError::Subprocess(
+                "managed WireGuard endpoint is malformed".into(),
+            ));
+        };
+        if host.parse::<IpAddr>().is_ok() {
+            output.push_str(line);
+            continue;
+        }
+        let Some(address) = profile.resolved_endpoint(&host, port) else {
+            return Err(TunnelError::Subprocess(format!(
+                "managed WireGuard endpoint {host}:{port} has no unambiguous profile-bound resolution"
+            )));
+        };
+        let formatted = match address {
+            IpAddr::V4(address) => format!("{address}:{port}"),
+            IpAddr::V6(address) => format!("[{address}]:{port}"),
+        };
+        let newline = if line.ends_with('\n') { "\n" } else { "" };
+        output.push_str(left);
+        output.push_str("= ");
+        output.push_str(&formatted);
+        output.push_str(newline);
+    }
+    Ok(output)
+}
+
 /// Resolve the current `session_id` from the global journal, or fall back to
 /// a pid-derived stable value when the journal is disabled (tests, or
 /// `[journal] disk = false`). The fallback is deterministic within a process
@@ -1043,7 +1088,7 @@ impl Tunnel for WgTunnel {
             })
             .collect::<BTreeMap<_, _>>();
         let attempt_started = SystemTime::now();
-        let stripped = strip_dns_directive(&user_body);
+        let stripped = managed_up_body(&user_body, profile)?;
         if self.cancellation_requested() {
             return Err(TunnelError::Cancelled);
         }
@@ -1317,6 +1362,19 @@ impl Tunnel for WgTunnel {
 mod tests {
     use super::*;
 
+    fn managed_profile(
+        resolutions: impl IntoIterator<Item = crate::vortix_core::profile::ResolvedEndpoint>,
+    ) -> Profile {
+        Profile::new(
+            crate::vortix_core::profile::ProfileId::new("managed-test"),
+            "managed-test",
+            crate::vortix_core::profile::ProtocolKind::WireGuard,
+            PathBuf::from("managed-test.conf"),
+        )
+        .with_endpoint_resolutions(resolutions)
+        .require_managed_endpoint_resolution()
+    }
+
     #[test]
     fn capabilities_match_kernel_wireguard() {
         let caps = WgTunnel::new().capabilities();
@@ -1410,6 +1468,77 @@ mod tests {
         let body =
             "[Interface]\nPrivateKey = abc\nAddress = 10.0.0.2/24\n\n[Peer]\nPublicKey = xyz\n";
         assert_eq!(strip_dns_directive(body), body);
+    }
+
+    #[test]
+    fn managed_up_config_rewrites_cached_hostname_without_dns() {
+        let input = "[Interface]\nPrivateKey = abc\nDNS = 10.0.0.53\n[Peer]\nPublicKey = xyz\nEndpoint = vpn.example:51820\nAllowedIPs = 0.0.0.0/0\n";
+        let resolution = crate::vortix_core::profile::ResolvedEndpoint::new(
+            "vpn.example",
+            51820,
+            "203.0.113.19".parse().unwrap(),
+        );
+        let managed = managed_up_body(input, &managed_profile([resolution])).unwrap();
+        assert!(!managed.contains("DNS ="));
+        assert!(managed.contains("Endpoint = 203.0.113.19:51820"));
+        assert!(!managed.contains("vpn.example"));
+
+        let error = managed_up_body(input, &managed_profile([]))
+            .expect_err("missing cache must fail closed");
+        assert!(error.to_string().contains("vpn.example:51820"));
+    }
+
+    #[test]
+    fn managed_up_config_preserves_ipv6_endpoint_family_and_port() {
+        let input = "[Interface]\nPrivateKey = abc\n[Peer]\nPublicKey = xyz\nEndpoint = vpn.example:51820\n";
+        let resolution = crate::vortix_core::profile::ResolvedEndpoint::new(
+            "vpn.example",
+            51820,
+            "2001:db8::19".parse().unwrap(),
+        );
+        let managed = managed_up_body(input, &managed_profile([resolution])).unwrap();
+        assert!(managed.contains("Endpoint = [2001:db8::19]:51820"));
+    }
+
+    #[test]
+    fn cached_profile_resolution_reaches_managed_config_without_dns() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("corp.conf");
+        let body = "[Interface]\nPrivateKey = abc\n[Peer]\nPublicKey = xyz\nEndpoint = endpoint.invalid:51820\nAllowedIPs = 0.0.0.0/0\n";
+        std::fs::write(&path, body).unwrap();
+        let vpn_profile = crate::state::VpnProfile {
+            id: crate::vortix_core::profile::ProfileId::new("corp"),
+            name: "Corporate".into(),
+            protocol: crate::state::Protocol::WireGuard,
+            location: String::new(),
+            config_path: path,
+            last_used: None,
+        };
+        let digest = crate::vortix_core::control::PolicyDigest::sha256(body.as_bytes()).0;
+        let cache_json = serde_json::json!({
+            "schema_version": 1,
+            "profiles": {
+                "corp": {
+                    "profile_digest": digest,
+                    "endpoints": [{
+                        "hostname": "endpoint.invalid",
+                        "port": 51820,
+                        "address": "203.0.113.19"
+                    }]
+                }
+            }
+        });
+        let encoded = serde_json::to_vec(&cache_json).unwrap();
+        let mut cache =
+            crate::topology_policy::EndpointResolutionCache::decode(Some(&encoded)).unwrap();
+        let topology = crate::topology_policy::topology_for_profile(&vpn_profile, &mut cache)
+            .expect("exact cache entry resolves topology without DNS");
+        let profile = crate::tunnel::profile_view(&vpn_profile)
+            .with_endpoint_resolutions(topology.resolved_endpoints)
+            .require_managed_endpoint_resolution();
+        let managed = managed_up_body(body, &profile).unwrap();
+        assert!(managed.contains("Endpoint = 203.0.113.19:51820"));
+        assert!(!managed.contains("endpoint.invalid"));
     }
 
     fn wg_handle(

@@ -246,6 +246,16 @@ fn main() -> Result<()> {
         std::process::exit(exit_code);
     }
 
+    // The legacy TUI still owns its lifecycle actor until U8 cuts it over to
+    // the canonical control service. Hold the same cross-process writer lock
+    // as the CLI so the two authorities can never mutate one tunnel at once.
+    // Acquisition is fail-fast because a TUI session has no bounded duration.
+    let _lifecycle_lock = vortix::utils::acquire_lifecycle_lock().map_err(|error| {
+        color_eyre::eyre::eyre!(
+            "another vortix lifecycle writer is active; close it or wait for its command to finish ({error})"
+        )
+    })?;
+
     // Run the TUI application
     let terminal = init_terminal()?;
     let result = run_tui(terminal, app_config, config_dir);
