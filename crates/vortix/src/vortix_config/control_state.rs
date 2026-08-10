@@ -560,7 +560,7 @@ fn prepare_created_descriptor(
     let metadata = descriptor.metadata()?;
     if metadata.uid() != uid
         || metadata.gid() != gid
-        || metadata.permissions().mode() & 0o777 != u32::from(mode)
+        || u64::from(metadata.permissions().mode() & 0o777) != u64::from(mode)
     {
         return Err(ControlStateError::UnsafeFile);
     }
