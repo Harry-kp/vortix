@@ -36,6 +36,7 @@ pub use service::{
     ChallengeError, Clock, CompleterHandle, CompletionError, CompletionResult, ControlHandle,
     ControlPersistenceConfig, ControlService, ControlServiceConfig, ControlSubscription,
     EventReceiveError, ExecutionSelection, IssuedChallenge, ObservationError, ObserverHandle,
-    ProfileTopology, ReadinessError, RealClock,
+    ProfileMutation, ProfileMutationApplied, ProfileMutationExecutor, ProfileMutationFailure,
+    ProfileMutationWork, ProfileTopology, ReadinessError, RealClock,
 };
 pub use snapshot::{ControlSnapshot, ServiceReadiness};

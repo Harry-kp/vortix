@@ -151,13 +151,15 @@ impl PfFirewall {
         // primary first, then secondaries by attach order.
         for tunnel in active {
             writeln!(rules).unwrap();
-            writeln!(
-                rules,
-                "# Tunnel: {} (primary={})",
-                tunnel.interface, tunnel.is_primary
-            )
-            .unwrap();
-            writeln!(rules, "pass out quick on {} all", tunnel.interface).unwrap();
+            if !tunnel.is_endpoint_allowlist() {
+                writeln!(
+                    rules,
+                    "# Tunnel: {} (primary={})",
+                    tunnel.interface, tunnel.is_primary
+                )
+                .unwrap();
+                writeln!(rules, "pass out quick on {} all", tunnel.interface).unwrap();
+            }
             for ip in &tunnel.server_ips {
                 writeln!(rules, "pass out quick to {}", fmt_ip(ip)).unwrap();
             }
@@ -505,6 +507,14 @@ mod tests {
         let rules = PfFirewall::generate_pf_rules(&[t]);
         assert!(rules.contains("pass out quick to 1.2.3.4"));
         assert!(rules.contains("pass out quick to 5.6.7.8"));
+    }
+
+    #[test]
+    fn endpoint_allowlist_emits_no_interface_rule() {
+        let policy = ActiveTunnelInfo::endpoint_allowlist(vec!["1.2.3.4".parse().unwrap()]);
+        let rules = PfFirewall::generate_pf_rules(&[policy]);
+        assert!(rules.contains("pass out quick to 1.2.3.4"));
+        assert!(!rules.contains("pass out quick on  all"));
     }
 
     #[test]

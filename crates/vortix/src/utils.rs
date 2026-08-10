@@ -605,6 +605,163 @@ pub fn read_openvpn_saved_auth_compat(
     })
 }
 
+/// Read saved `OpenVPN` credentials through a pinned, owner-checked directory.
+///
+/// This is the privileged Standard-mode read boundary. It never follows the
+/// configuration directory, auth directory, or credential-file symlink, and
+/// it rejects credentials that are not an owner-only regular file.
+#[cfg(unix)]
+fn unsafe_openvpn_auth_file(reason: &str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::PermissionDenied, reason)
+}
+
+#[cfg(unix)]
+fn validate_openvpn_auth_directory(
+    file: &std::fs::File,
+    expected_owner_uid: u32,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = file.metadata()?;
+    if !metadata.is_dir() || metadata.uid() != expected_owner_uid {
+        return Err(unsafe_openvpn_auth_file(
+            "unsafe OpenVPN auth directory owner",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_openvpn_auth_directory_at(
+    parent: &std::fs::File,
+    name: &std::ffi::CStr,
+) -> std::io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+    // SAFETY: the parent descriptor is live, `name` is NUL-terminated,
+    // and a successful descriptor is transferred into `File` exactly once.
+    #[allow(unsafe_code)]
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `openat` returned a new descriptor owned by this call.
+    #[allow(unsafe_code)]
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn read_openvpn_auth_entry_owned(
+    auth_dir: &std::fs::File,
+    profile_key: &str,
+    expected_owner_uid: u32,
+) -> std::io::Result<Option<(zeroize::Zeroizing<String>, zeroize::Zeroizing<String>)>> {
+    use std::ffi::CString;
+    use std::io::Read as _;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::fs::MetadataExt as _;
+
+    const MAX_AUTH_BYTES: u64 = 16 * 1024;
+
+    validate_openvpn_artifact_key(profile_key)?;
+    let basename = CString::new(format!("{profile_key}.auth")).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid auth filename")
+    })?;
+    // SAFETY: the directory descriptor and C string are valid for the call;
+    // the returned descriptor is checked below.
+    #[allow(unsafe_code)]
+    let fd = unsafe {
+        libc::openat(
+            auth_dir.as_raw_fd(),
+            basename.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        return if error.kind() == std::io::ErrorKind::NotFound {
+            Ok(None)
+        } else {
+            Err(error)
+        };
+    }
+    // SAFETY: `openat` returned a new descriptor owned by this call.
+    #[allow(unsafe_code)]
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.uid() != expected_owner_uid
+        || metadata.mode() & 0o777 != 0o600
+        || metadata.len() == 0
+        || metadata.len() > MAX_AUTH_BYTES
+    {
+        return Err(unsafe_openvpn_auth_file(
+            "unsafe OpenVPN auth credential file",
+        ));
+    }
+    let mut content = zeroize::Zeroizing::new(String::new());
+    file.take(MAX_AUTH_BYTES + 1).read_to_string(&mut content)?;
+    if content.len() as u64 > MAX_AUTH_BYTES {
+        return Err(unsafe_openvpn_auth_file(
+            "OpenVPN auth credential file is too large",
+        ));
+    }
+    let mut lines = content.lines();
+    let username = zeroize::Zeroizing::new(lines.next().unwrap_or_default().to_owned());
+    let password = zeroize::Zeroizing::new(lines.next().unwrap_or_default().to_owned());
+    if username.is_empty() || password.is_empty() {
+        return Err(unsafe_openvpn_auth_file(
+            "OpenVPN auth credentials are incomplete",
+        ));
+    }
+    Ok(Some((username, password)))
+}
+
+#[cfg(unix)]
+pub(crate) fn read_openvpn_saved_auth_compat_owned(
+    config_dir: &std::path::Path,
+    expected_owner_uid: u32,
+    profile_id: &str,
+    legacy_display_name: &str,
+) -> std::io::Result<Option<(zeroize::Zeroizing<String>, zeroize::Zeroizing<String>)>> {
+    use std::ffi::CString;
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let config = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(config_dir)?;
+    validate_openvpn_auth_directory(&config, expected_owner_uid)?;
+    let auth_name = CString::new(crate::constants::OPENVPN_AUTH_DIR)
+        .expect("OpenVPN auth directory constant contains no NUL");
+    let auth_dir = match open_openvpn_auth_directory_at(&config, &auth_name) {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    validate_openvpn_auth_directory(&auth_dir, expected_owner_uid)?;
+
+    if let Some(credentials) =
+        read_openvpn_auth_entry_owned(&auth_dir, profile_id, expected_owner_uid)?
+    {
+        return Ok(Some(credentials));
+    }
+    let Some(legacy_key) = unambiguous_legacy_artifact_key(legacy_display_name) else {
+        return Ok(None);
+    };
+    if legacy_key == profile_id {
+        return Ok(None);
+    }
+    read_openvpn_auth_entry_owned(&auth_dir, legacy_key, expected_owner_uid)
+}
+
 /// Deletes the saved `OpenVPN` auth credentials file for a profile.
 pub fn delete_openvpn_auth_file(profile_name: &str) {
     if let Ok(auth_path) = get_openvpn_auth_path(profile_name) {
@@ -1162,8 +1319,9 @@ pub(crate) fn host_ipv6_disabled() -> bool {
 /// first's pidfile, orphaning it.
 ///
 /// The lock is held for the returned `File`'s lifetime and released by
-/// the OS on process exit — safe across `std::process::exit` paths.
-/// Blocks (with a stderr note) when another invocation holds the lock.
+/// the OS on process exit — safe across `std::process::exit` paths. It fails
+/// with [`std::io::ErrorKind::WouldBlock`] when another writer owns the lock;
+/// a TUI may hold it for its entire session, so waiting would be unbounded.
 ///
 /// Unix-only mutual exclusion: the non-Unix build opens the lockfile
 /// without locking (a placeholder — vortix tunnels are unsupported on
@@ -1186,12 +1344,7 @@ pub fn acquire_lifecycle_lock() -> std::io::Result<std::fs::File> {
     #[allow(unsafe_code)]
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc != 0 {
-        eprintln!("Another vortix lifecycle operation is in progress — waiting…");
-        #[allow(unsafe_code)]
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-        if rc != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
+        return Err(std::io::Error::last_os_error());
     }
     Ok(file)
 }
@@ -1627,6 +1780,49 @@ mod tests {
         assert_eq!(perms.mode() & 0o777, 0o600);
 
         delete_openvpn_auth_file(name);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn privileged_auth_read_rejects_symlinks_and_loose_modes() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let _tmp = set_temp_config_dir();
+        let config_dir = get_app_config_dir().unwrap();
+        let owner_uid = effective_user_group_ids().0;
+
+        let safe = write_openvpn_auth_file("owned-safe", "user", "pass").unwrap();
+        let credentials = read_openvpn_saved_auth_compat_owned(
+            &config_dir,
+            owner_uid,
+            "owned-safe",
+            "owned-safe",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(credentials.0.as_str(), "user");
+        assert_eq!(credentials.1.as_str(), "pass");
+
+        std::fs::set_permissions(&safe, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_openvpn_saved_auth_compat_owned(
+            &config_dir,
+            owner_uid,
+            "owned-safe",
+            "owned-safe",
+        )
+        .is_err());
+
+        let target = config_dir.join("root-readable-decoy");
+        std::fs::write(&target, "secret-user\nsecret-pass\n").unwrap();
+        let link = get_openvpn_auth_path("owned-link").unwrap();
+        symlink(&target, &link).unwrap();
+        assert!(read_openvpn_saved_auth_compat_owned(
+            &config_dir,
+            owner_uid,
+            "owned-link",
+            "owned-link",
+        )
+        .is_err());
     }
 
     #[test]

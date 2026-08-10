@@ -127,16 +127,27 @@ pub fn policy_digest(active: &[ActiveTunnelInfo]) -> String {
 pub fn validate_policy(active: &[ActiveTunnelInfo]) -> Result<()> {
     for tunnel in active {
         let interface = tunnel.interface.as_bytes();
-        if interface.is_empty()
-            || interface.len() > 15
-            || !interface
-                .iter()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'-' | b'.'))
+        let endpoint_allowlist = tunnel.is_endpoint_allowlist()
+            && !tunnel.server_ips.is_empty()
+            && tunnel.declared_cidrs.is_empty()
+            && !tunnel.is_primary;
+        if !endpoint_allowlist
+            && (interface.is_empty()
+                || interface.len() > 15
+                || !interface.iter().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'-' | b'.')
+                }))
         {
             return Err(KillswitchError::InvalidPolicy(format!(
                 "unsafe interface name {:?}",
                 tunnel.interface
             )));
+        }
+        if tunnel.is_endpoint_allowlist() && !endpoint_allowlist {
+            return Err(KillswitchError::InvalidPolicy(
+                "endpoint-only policy entries require at least one server IP and no route role"
+                    .into(),
+            ));
         }
     }
     Ok(())
@@ -282,7 +293,9 @@ fn filter_phantom_tunnels(state: &mut PersistedState, live: &[String]) {
     }
     let mut dropped: Vec<String> = Vec::new();
     state.active_tunnels.retain(|t| {
-        if live.iter().any(|name| name == &t.interface) {
+        // Empty-interface entries are endpoint-only vpn-only reconnect
+        // allowances, not phantom kernel tunnels.
+        if t.interface.is_empty() || live.iter().any(|name| name == &t.interface) {
             true
         } else {
             dropped.push(t.interface.clone());
@@ -574,6 +587,17 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_allowlist_is_valid_only_with_resolved_servers() {
+        let valid = ActiveTunnelInfo::endpoint_allowlist(vec!["1.2.3.4".parse().unwrap()]);
+        assert!(validate_policy(&[valid]).is_ok());
+        let empty = ActiveTunnelInfo::endpoint_allowlist(Vec::new());
+        assert!(matches!(
+            validate_policy(&[empty]),
+            Err(KillswitchError::InvalidPolicy(_))
+        ));
+    }
+
+    #[test]
     fn local_verification_is_typed_bounded_and_policy_bound() {
         use crate::vortix_core::cidr::Cidr;
         use std::net::IpAddr;
@@ -729,13 +753,20 @@ mod tests {
                     declared_cidrs: Vec::new(),
                     is_primary: false,
                 },
+                PersistedTunnelInfo {
+                    interface: String::new(),
+                    server_ips: vec!["203.0.113.19".into()],
+                    declared_cidrs: Vec::new(),
+                    is_primary: false,
+                },
             ],
             firewall_verification: None,
         };
         let live = vec!["lo".to_string(), "eth0".to_string()];
         filter_phantom_tunnels(&mut state, &live);
-        assert_eq!(state.active_tunnels.len(), 1);
+        assert_eq!(state.active_tunnels.len(), 2);
         assert_eq!(state.active_tunnels[0].interface, "eth0");
+        assert!(state.active_tunnels[1].interface.is_empty());
     }
 
     #[test]

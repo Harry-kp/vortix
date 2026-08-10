@@ -131,13 +131,15 @@ impl IptablesFirewall {
         // Per-tunnel rules. Order preserved from caller — typically
         // primary first, then secondaries by attach order.
         for tunnel in active {
-            writeln!(
-                rules,
-                "# Tunnel: {} (primary={})",
-                tunnel.interface, tunnel.is_primary
-            )
-            .unwrap();
-            writeln!(rules, "-A {CHAIN_NAME} -o {} -j ACCEPT", tunnel.interface).unwrap();
+            if !tunnel.is_endpoint_allowlist() {
+                writeln!(
+                    rules,
+                    "# Tunnel: {} (primary={})",
+                    tunnel.interface, tunnel.is_primary
+                )
+                .unwrap();
+                writeln!(rules, "-A {CHAIN_NAME} -o {} -j ACCEPT", tunnel.interface).unwrap();
+            }
             for ip in &tunnel.server_ips {
                 if let IpAddr::V4(v4) = ip {
                     writeln!(rules, "-A {CHAIN_NAME} -d {v4} -j ACCEPT").unwrap();
@@ -176,13 +178,15 @@ impl IptablesFirewall {
         // family only selects the reconnect exception.
         for tunnel in active {
             let v6_ips: Vec<&IpAddr> = tunnel.server_ips.iter().filter(|ip| ip.is_ipv6()).collect();
-            writeln!(
-                rules,
-                "# Tunnel: {} (primary={})",
-                tunnel.interface, tunnel.is_primary
-            )
-            .unwrap();
-            writeln!(rules, "-A {CHAIN_NAME} -o {} -j ACCEPT", tunnel.interface).unwrap();
+            if !tunnel.is_endpoint_allowlist() {
+                writeln!(
+                    rules,
+                    "# Tunnel: {} (primary={})",
+                    tunnel.interface, tunnel.is_primary
+                )
+                .unwrap();
+                writeln!(rules, "-A {CHAIN_NAME} -o {} -j ACCEPT", tunnel.interface).unwrap();
+            }
             for ip in v6_ips {
                 if let IpAddr::V6(v6) = ip {
                     writeln!(rules, "-A {CHAIN_NAME} -d {v6} -j ACCEPT").unwrap();
@@ -483,7 +487,9 @@ impl IptablesFirewall {
         }
         writeln!(ruleset, "    udp sport 68 udp dport 67 accept").unwrap();
         for tunnel in active {
-            writeln!(ruleset, "    oifname \"{}\" accept", tunnel.interface).unwrap();
+            if !tunnel.is_endpoint_allowlist() {
+                writeln!(ruleset, "    oifname \"{}\" accept", tunnel.interface).unwrap();
+            }
             for endpoint in &tunnel.server_ips {
                 match endpoint {
                     IpAddr::V4(ip) => writeln!(ruleset, "    ip daddr {ip} accept").unwrap(),
@@ -552,7 +558,9 @@ impl IptablesFirewall {
         );
         expected.push("udp sport 68 udp dport 67 accept".to_string());
         for tunnel in active {
-            expected.push(format!("oifname \"{}\" accept", tunnel.interface));
+            if !tunnel.is_endpoint_allowlist() {
+                expected.push(format!("oifname \"{}\" accept", tunnel.interface));
+            }
             expected.extend(tunnel.server_ips.iter().map(|endpoint| match endpoint {
                 IpAddr::V4(ip) => format!("ip daddr {ip} accept"),
                 IpAddr::V6(ip) => format!("ip6 daddr {ip} accept"),
@@ -867,6 +875,17 @@ mod tests {
         let rules = IptablesFirewall::generate_v4_ruleset(&[t]);
         assert!(rules.contains("-A VORTIX_KILLSWITCH -d 1.2.3.4 -j ACCEPT"));
         assert!(rules.contains("-A VORTIX_KILLSWITCH -d 5.6.7.8 -j ACCEPT"));
+    }
+
+    #[test]
+    fn endpoint_allowlist_emits_no_interface_rule() {
+        let policy = ActiveTunnelInfo::endpoint_allowlist(vec!["1.2.3.4".parse().unwrap()]);
+        let v4 = IptablesFirewall::generate_v4_ruleset(std::slice::from_ref(&policy));
+        assert!(v4.contains("-A VORTIX_KILLSWITCH -d 1.2.3.4 -j ACCEPT"));
+        assert!(!v4.contains("-A VORTIX_KILLSWITCH -o  -j ACCEPT"));
+        let nft = IptablesFirewall::generate_nft_ruleset(&[policy], NftBatchMode::Create);
+        assert!(nft.contains("ip daddr 1.2.3.4 accept"));
+        assert!(!nft.contains("oifname \"\" accept"));
     }
 
     // ─── v6 ruleset generation ──────────────────────────────────────────

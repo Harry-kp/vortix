@@ -130,6 +130,23 @@ pub fn start_managed_foreground(
     )
 }
 
+/// Start a foreground protocol child and persist the canonical operation in
+/// the custodian's authenticated receipt for restart recovery.
+pub fn start_managed_foreground_for_operation(
+    identity: ManagedProcessId,
+    spec: CommandSpec,
+    cleanup_paths: Vec<std::path::PathBuf>,
+    operation_id: crate::vortix_core::control::OperationId,
+) -> Result<CustodianHandshake, CustodianError> {
+    custodian::spawn_custodian_for_operation(
+        identity,
+        spec,
+        cleanup_paths,
+        std::time::Duration::from_secs(5),
+        Some(operation_id),
+    )
+}
+
 /// Stop and reap a foreground protocol child by stable identity.
 pub fn stop_managed_foreground(identity: &ManagedProcessId) -> Result<(), CustodianError> {
     custodian::remote_stop(identity)
@@ -214,10 +231,18 @@ pub fn run_to_output(spec: CommandSpec) -> std::io::Result<std::process::Output>
 }
 
 /// Run a simple unprivileged command and discard invocation errors.
+///
+/// This helper is used by scanner probes, which must never retain a blocking
+/// worker indefinitely during control-runtime shutdown.
 #[must_use]
 pub fn simple_output(program: &str, args: &[&str]) -> Option<std::process::Output> {
     let args = args.iter().map(|arg| (*arg).to_string()).collect();
-    run_to_output(CommandSpec::oneshot(program, args)).ok()
+    run_to_output(
+        CommandSpec::oneshot(program, args)
+            .timeout(std::time::Duration::from_secs(2))
+            .output_limit(1024 * 1024),
+    )
+    .ok()
 }
 
 fn outcome_to_output(outcome: CommandOutcome) -> std::process::Output {

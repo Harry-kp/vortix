@@ -261,6 +261,7 @@ fn cli_status_disconnected() {
             interval: 2,
             brief: true,
             no_daemon: true,
+            operation: None,
         },
         dir.path(),
         "test",
@@ -290,26 +291,21 @@ fn cli_killswitch_show_mode() {
 
 #[test]
 fn cli_release_killswitch() {
+    use clap::Parser;
+    use vortix::cli::args::Args;
     use vortix::cli::args::Commands;
-    use vortix::cli::commands::handle_command;
 
-    let dir = tempfile::tempdir().unwrap();
-    let config = vortix::config::AppConfig::default();
-
-    let exit = handle_command(
-        &Commands::ReleaseKillSwitch,
-        dir.path(),
-        "test",
-        &config,
-        OutputMode::Quiet,
-    );
-    assert_eq!(exit, 0);
+    let args = Args::try_parse_from(["vortix", "release-kill-switch"])
+        .expect("emergency release command parses");
+    assert!(matches!(args.command, Some(Commands::ReleaseKillSwitch)));
 }
 
 #[test]
 fn cli_import_single_file() {
     use vortix::cli::args::Commands;
     use vortix::cli::commands::handle_command;
+    use vortix::vortix_config::profile_store::FsProfileStore;
+    use vortix::vortix_config::ProfileStore as _;
 
     let dir = tempfile::tempdir().unwrap();
     let config_dir = tempfile::tempdir().unwrap();
@@ -335,12 +331,54 @@ fn cli_import_single_file() {
         OutputMode::Quiet,
     );
 
-    std::env::remove_var("VORTIX_CONFIG_DIR");
     assert_eq!(exit, 0, "Importing a valid profile should succeed");
 
     // Verify the profile landed in the temp dir, not the real config
     let profiles_dir = config_dir.path().join("profiles");
     assert!(profiles_dir.join("test.conf").exists());
+    let persisted = std::fs::read_to_string(config_dir.path().join("control/control-state.json"))
+        .expect("typed import persists its terminal operation");
+    assert!(
+        persisted.contains("\"status\": \"succeeded\""),
+        "terminal import must be durable before CLI success: {persisted}"
+    );
+
+    let store = FsProfileStore::new(profiles_dir.clone());
+    let stable_id = store.resolve_display_name("test").unwrap();
+    let persisted_json: serde_json::Value = serde_json::from_str(&persisted).unwrap();
+    assert!(
+        persisted_json["requested_resources"]
+            .get(stable_id.as_str())
+            .is_some(),
+        "terminal import must persist canonical requested resources"
+    );
+    let rename = handle_command(
+        &Commands::Rename {
+            old: "test".to_owned(),
+            new: "work".to_owned(),
+        },
+        config_dir.path(),
+        "test",
+        &config,
+        OutputMode::Quiet,
+    );
+    assert_eq!(rename, 0, "typed rename should preserve the CLI result");
+    assert_eq!(store.resolve_display_name("work").unwrap(), stable_id);
+    assert!(profiles_dir.join("work.conf").exists());
+
+    let delete = handle_command(
+        &Commands::Delete {
+            profile: "work".to_owned(),
+            yes: true,
+        },
+        config_dir.path(),
+        "test",
+        &config,
+        OutputMode::Quiet,
+    );
+    assert_eq!(delete, 0, "typed delete should preserve the CLI result");
+    assert!(!profiles_dir.join("work.conf").exists());
+    std::env::remove_var("VORTIX_CONFIG_DIR");
 }
 
 // ============================================================================
@@ -630,6 +668,35 @@ fn clap_parses_up_yes_defaults_false() {
     } else {
         panic!("Expected Up command");
     }
+}
+
+#[test]
+fn clap_parses_durable_operation_query() {
+    use clap::Parser;
+    use vortix::cli::args::{Args, Commands};
+
+    let args = Args::try_parse_from([
+        "vortix",
+        "status",
+        "--operation",
+        "op-0000000000000001-0000000000000002",
+    ])
+    .unwrap();
+    assert!(matches!(
+        args.command,
+        Some(Commands::Status {
+            operation: Some(operation),
+            ..
+        }) if operation == "op-0000000000000001-0000000000000002"
+    ));
+    assert!(Args::try_parse_from([
+        "vortix",
+        "status",
+        "--operation",
+        "op-0000000000000001-0000000000000002",
+        "--watch",
+    ])
+    .is_err());
 }
 
 #[test]

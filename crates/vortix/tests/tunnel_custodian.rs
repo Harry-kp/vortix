@@ -1,8 +1,10 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead as _, Write as _};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+use std::time::Instant;
 
 use serde::Serialize;
 use vortix::vortix_core::ports::process::{
@@ -332,6 +334,138 @@ fn real_tunnel_scoped_custodians_handoff_authenticate_and_contain_groups() {
             .as_ref(),
         Some(&first)
     );
+
+    // A later one-shot Standard-mode authority reconstructs the exact
+    // OpenVPN handle from the authenticated custodian receipt and can stop it
+    // without an in-memory executor ledger.
+    let recovered_identity = real_identity('0');
+    let operation: vortix::vortix_core::control::OperationId =
+        serde_json::from_str("\"op-0000000000000001-0000000000000001\"").unwrap();
+    let recovered_handshake = vortix::vortix_process::start_managed_foreground_for_operation(
+        recovered_identity.clone(),
+        CommandSpec::oneshot("/bin/sleep", vec!["30".into()]),
+        Vec::new(),
+        operation.clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        vortix::vortix_process::custodian::load_handshake(&recovered_identity.profile_id)
+            .unwrap()
+            .and_then(|handshake| handshake.operation_id),
+        Some(operation.clone()),
+        "authenticated receipt must retain the connect operation independently of history",
+    );
+    {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use vortix::core::scanner::ActiveSession;
+        use vortix::core::standard_tunnel_ownership::StandardTunnelOwnershipStore;
+        use vortix::tunnel::{CanonicalTunnelExecutor, CanonicalTunnelSettings};
+        use vortix::vortix_core::control::supervisor::Supervisor;
+        use vortix::vortix_core::control::worker::{
+            CancellationToken, PolicyBarrier, PolicyExecutor, TopologyPolicy, TunnelExecutor,
+            TunnelMutation, TunnelRevision, TunnelWork,
+        };
+        use vortix::vortix_core::control::AuthorityEpoch;
+        use vortix::vortix_core::ports::tunnel::TunnelKindTag;
+        use vortix::vortix_core::profile::{Profile, ProtocolKind};
+
+        struct NoopPolicy;
+        impl PolicyExecutor for NoopPolicy {
+            fn apply(&self, _: &TopologyPolicy, _: PolicyBarrier) -> Result<(), String> {
+                Ok(())
+            }
+            fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) {}
+        }
+
+        let config = temp.path().join("owned.ovpn");
+        std::fs::write(&config, "client\n").unwrap();
+        let profile = Profile::new(
+            recovered_identity.profile_id.clone(),
+            "owned",
+            ProtocolKind::OpenVpn,
+            config,
+        );
+        // SAFETY: geteuid returns one scalar credential without side effects.
+        #[allow(unsafe_code)]
+        let uid = unsafe { libc::geteuid() };
+        let ownership = Arc::new(
+            StandardTunnelOwnershipStore::new(
+                temp.path().join("standard-ownership"),
+                uid,
+                uid,
+                "test-boot",
+            )
+            .unwrap(),
+        );
+        let profile_for_lookup = profile.clone();
+        let profile_for_scan = profile.clone();
+        let recovered_pid = recovered_handshake.pid;
+        let scanner_pid = Arc::new(AtomicU32::new(recovered_pid.saturating_add(1)));
+        let scanner_pid_for_lookup = Arc::clone(&scanner_pid);
+        let executor = Arc::new(CanonicalTunnelExecutor::new_standard(
+            CanonicalTunnelSettings {
+                config_dir: temp.path().to_path_buf(),
+                openvpn_verbosity: "3".into(),
+                connect_timeout_secs: 1,
+                wireguard_handshake_timeout_secs: 1,
+                wireguard_health_targets: Vec::new(),
+            },
+            move |id| (id == &profile_for_lookup.id).then(|| profile_for_lookup.clone()),
+            ownership,
+            move |id| {
+                (id == &profile_for_scan.id).then(|| ActiveSession {
+                    name: profile_for_scan.display_name.clone(),
+                    pid: Some(scanner_pid_for_lookup.load(Ordering::Relaxed)),
+                    interface: "tun0".into(),
+                    interface_authoritative: true,
+                    ..ActiveSession::default()
+                })
+            },
+        ));
+        let supervisor = Supervisor::new(
+            AuthorityEpoch(1),
+            executor.clone(),
+            Arc::new(NoopPolicy),
+            1,
+            4,
+        );
+        let revision = TunnelRevision {
+            authority_epoch: AuthorityEpoch(1),
+            generation: recovered_identity.generation,
+        };
+        let mismatch = executor
+            .restore_standard_profile(
+                &supervisor,
+                &recovered_identity.profile_id,
+                revision,
+                operation.clone(),
+            )
+            .expect_err("scanner PID must be bound to the authenticated child");
+        assert!(mismatch.contains("scanner PID does not match"));
+        scanner_pid.store(recovered_pid, Ordering::Relaxed);
+        assert!(executor
+            .restore_standard_profile(
+                &supervisor,
+                &recovered_identity.profile_id,
+                revision,
+                operation.clone(),
+            )
+            .unwrap());
+        TunnelExecutor::execute(
+            executor.as_ref(),
+            &TunnelWork {
+                profile_id: recovered_identity.profile_id.clone(),
+                operation_id: operation,
+                revision,
+                mutation: TunnelMutation::Disconnect,
+                protocol: TunnelKindTag::OpenVpn,
+                deadline: Instant::now() + Duration::from_secs(3),
+            },
+            &CancellationToken::default(),
+        )
+        .unwrap();
+    }
+    assert!(!group_has_live_members(recovered_handshake.pid));
 
     let mut wrong = first.clone();
     let replacement = if wrong.ownership_token.ends_with('0') {

@@ -66,6 +66,26 @@ pub struct ActiveTunnelInfo {
     pub is_primary: bool,
 }
 
+impl ActiveTunnelInfo {
+    /// Policy-only endpoint allowance used while a tunnel interface does not
+    /// exist yet. Platform adapters emit only the destination exceptions and
+    /// never an interface allow rule for this value.
+    #[must_use]
+    pub fn endpoint_allowlist(server_ips: Vec<IpAddr>) -> Self {
+        Self {
+            interface: String::new(),
+            server_ips,
+            declared_cidrs: Vec::new(),
+            is_primary: false,
+        }
+    }
+
+    #[must_use]
+    pub fn is_endpoint_allowlist(&self) -> bool {
+        self.interface.is_empty()
+    }
+}
+
 /// Firewall control for the kill switch.
 ///
 /// Implementations block all non-VPN traffic when enabled. The

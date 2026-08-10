@@ -4,5 +4,7 @@
 
 pub mod args;
 pub mod commands;
+#[doc(hidden)]
+pub mod control;
 pub mod output;
 pub mod report;
