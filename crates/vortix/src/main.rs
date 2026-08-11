@@ -248,9 +248,8 @@ fn main() -> Result<()> {
         std::process::exit(exit_code);
     }
 
-    // The legacy TUI still owns its lifecycle actor until U8 cuts it over to
-    // the canonical control service. Hold the same cross-process writer lock
-    // as the CLI so the two authorities can never mutate one tunnel at once.
+    // Standard-mode TUI and CLI share the same cross-process writer lock. The
+    // TUI holds it for the lifetime of its one canonical in-process service.
     // Acquisition is fail-fast because a TUI session has no bounded duration.
     let _lifecycle_lock = vortix::utils::acquire_lifecycle_lock().map_err(|error| {
         color_eyre::eyre::eyre!(
@@ -346,43 +345,15 @@ fn run_tui(
     config_dir: std::path::PathBuf,
 ) -> Result<()> {
     let tick_rate = config.tick_rate;
-    let profiles_dir_for_resolver = config_dir.join(constants::PROFILES_DIR_NAME);
     let mut app = App::new(config, config_dir);
-
-    // Attach an `EngineHandle`. The handle wraps the
-    // FSM and gets a per-profile tunnel factory so a single
-    // `Engine<TunnelKind>` drives both WG and OVPN. The actor spawns on
-    // the bundled tokio runtime. Failure is non-fatal.
-    //
-    // The construction itself lives in `daemon::build_engine_handle` so
-    // both the TUI bootstrap (here) and `vortix daemon` (`handle_daemon`)
-    // produce the same shape.
-    if let Some(runtime) = vortix::vortix_process::global_runner().as_real() {
-        let _guard = runtime.runtime().handle().enter();
-        if let Some(handle) = vortix::daemon::build_engine_handle(&profiles_dir_for_resolver) {
-            app = app.with_engine_handle(handle);
-
-            // spawn a journal-subscriber task that reacts
-            // to engine events. Today it nudges the legacy telemetry
-            // worker on `TunnelUp` so connect → IP-refresh happens
-            // promptly. Future units route more flows through here.
-            // TUI-only side-effect — the daemon path doesn't need it.
-            if let Some(j) = vortix::vortix_core::journal::global_journal() {
-                let mut rx = j.subscribe();
-                let nudge = app.runtime.telemetry_nudge.clone();
-                tokio::spawn(async move {
-                    use vortix::vortix_core::engine::EngineEvent;
-                    while let Ok(envelope) = rx.recv().await {
-                        if matches!(envelope.event, EngineEvent::TunnelUp { .. }) {
-                            if let Some(n) = &nudge {
-                                let _ = n.send(());
-                            }
-                        }
-                    }
-                });
-            }
-        }
-    }
+    let control = vortix::cli::control::LocalControlSession::start(
+        &app.runtime.config,
+        &app.runtime.config_dir,
+        app.runtime.profiles.clone(),
+    )
+    .map_err(|error| color_eyre::eyre::eyre!("cannot start TUI control service: {error}"))?;
+    app.attach_control_session(control)
+        .map_err(|error| color_eyre::eyre::eyre!("cannot attach TUI control service: {error}"))?;
     let events = EventHandler::new(tick_rate);
     let size = terminal.size()?;
     app.on_resize(size.width, size.height);

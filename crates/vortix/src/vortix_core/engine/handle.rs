@@ -332,6 +332,7 @@ mod tests {
             ))
         });
         let handle = EngineHandle::local(engine, journal);
+        let mut events = handle.subscribe().await.unwrap().receiver;
         let connect = {
             let handle = handle.clone();
             tokio::spawn(async move {
@@ -342,7 +343,19 @@ mod tests {
                     .await
             })
         };
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let envelope = events.recv().await.expect("journal remains live");
+                if matches!(
+                    envelope.event,
+                    crate::vortix_core::control::model::ControlEvent::ConnectAttemptStarted { .. }
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("connect attempt publication timeout");
         let snapshot = handle.snapshot().await.unwrap();
         assert!(matches!(snapshot.state, Connection::Connecting { .. }));
         assert!(snapshot.journal_tail.iter().any(|envelope| matches!(

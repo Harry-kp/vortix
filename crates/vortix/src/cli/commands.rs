@@ -524,6 +524,7 @@ fn handle_up(
     }
     let command = crate::vortix_core::control::UserCommand::Connect {
         profile_id: target.id.clone(),
+        conflict_acknowledgement: None,
     };
     control
         .validate(&command)
@@ -711,13 +712,15 @@ fn detect_conflict_for_cli(
     engine: &VpnRuntime,
     target_name: &str,
 ) -> Option<crate::vortix_core::engine::Conflict> {
-    use crate::app::connection::extract_allowed_ips;
     use crate::vortix_core::cidr::{
         claims_default_route_v4, claims_default_route_v6, overlapping_cidrs,
     };
     use crate::vortix_core::engine::Conflict;
     let target_profile = engine.profiles.iter().find(|p| p.name == target_name)?;
-    let target_allowed = extract_allowed_ips(target_profile.protocol, &target_profile.config_path);
+    let target_allowed = crate::topology_policy::declared_routes(
+        target_profile.protocol,
+        &target_profile.config_path,
+    );
     let target_claims_default =
         claims_default_route_v4(&target_allowed) || claims_default_route_v6(&target_allowed);
 
@@ -731,8 +734,10 @@ fn detect_conflict_for_cli(
         let Some(active_profile) = engine.profiles.iter().find(|p| p.name == session.name) else {
             continue;
         };
-        let active_allowed =
-            extract_allowed_ips(active_profile.protocol, &active_profile.config_path);
+        let active_allowed = crate::topology_policy::declared_routes(
+            active_profile.protocol,
+            &active_profile.config_path,
+        );
         let active_claims_default =
             claims_default_route_v4(&active_allowed) || claims_default_route_v6(&active_allowed);
 

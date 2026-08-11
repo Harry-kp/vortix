@@ -259,7 +259,11 @@ impl CanonicalTunnelExecutor {
         Ok(())
     }
 
-    fn openvpn_static_challenge_credentials(
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one bounded secret handoff keeps challenge issuance, cancellation, and decoding adjacent"
+    )]
+    fn openvpn_interactive_credentials(
         &self,
         work: &crate::vortix_core::control::worker::TunnelWork,
         profile: &Profile,
@@ -271,24 +275,25 @@ impl CanonicalTunnelExecutor {
         if work.protocol != TunnelKindTag::OpenVpn {
             return Ok(None);
         }
-        let Some(prompt) = crate::utils::read_openvpn_static_challenge_prompt(&profile.config_path)
-        else {
+        if !crate::utils::openvpn_config_needs_auth(&profile.config_path) {
             return Ok(None);
-        };
+        }
+        let static_prompt =
+            crate::utils::read_openvpn_static_challenge_prompt(&profile.config_path);
         let owner_uid = self.standard_ownership.as_ref().map_or_else(
             || crate::utils::effective_user_group_ids().0,
             |store| store.owner_uid(),
         );
-        let (username, password) = crate::utils::read_openvpn_saved_auth_compat_owned(
+        let saved_credentials = crate::utils::read_openvpn_saved_auth_compat_owned(
             &self.settings.config_dir,
             owner_uid,
             profile.id.as_str(),
             &profile.display_name,
         )
-        .map_err(|error| format!("saved OpenVPN credentials were rejected: {error}"))?
-        .ok_or_else(|| {
-            "interactive challenge requires saved OpenVPN username/password".to_string()
-        })?;
+        .map_err(|error| format!("saved OpenVPN credentials were rejected: {error}"))?;
+        if static_prompt.is_none() && saved_credentials.is_some() {
+            return Ok(None);
+        }
         let challenge_capability = self
             .challenge_issuer
             .lock()
@@ -306,12 +311,22 @@ impl CanonicalTunnelExecutor {
         let expires_at = challenge_capability
             .now_millis()
             .saturating_add(remaining_millis);
+        let challenge_kind = if static_prompt.is_some() {
+            crate::vortix_core::control::ChallengeKind::TwoFactorCode
+        } else {
+            crate::vortix_core::control::ChallengeKind::Generic {
+                label: "OpenVPN credentials".to_string(),
+            }
+        };
+        let challenge_label = static_prompt
+            .clone()
+            .unwrap_or_else(|| "OpenVPN username and password".to_string());
         let issued_challenge = challenge_capability
             .issue_challenge_blocking(
                 work.operation_id.clone(),
                 work.profile_id.clone(),
-                crate::vortix_core::control::ChallengeKind::TwoFactorCode,
-                prompt,
+                challenge_kind,
+                challenge_label,
                 expires_at,
             )
             .map_err(|error| format!("interactive challenge issuance failed: {error}"))?;
@@ -327,9 +342,34 @@ impl CanonicalTunnelExecutor {
                 .receive_timeout(std::time::Duration::from_millis(50))
             {
                 Ok(Some(answer)) => {
+                    if let Some((username, password, challenge_answer)) =
+                        answer.decode_openvpn_credentials()
+                    {
+                        return Ok(Some(
+                            crate::vortix_protocol_openvpn::tunnel::OpenVpnStaticChallengeCredentials::new(
+                                username.to_string(),
+                                password.to_string(),
+                                challenge_answer,
+                            ),
+                        ));
+                    }
+                    let Some((username, password)) = saved_credentials.as_ref() else {
+                        return Err(
+                            "interactive credential response did not contain username/password"
+                                .to_string(),
+                        );
+                    };
+                    if static_prompt.is_none() {
+                        return Err(
+                            "OpenVPN credential response used an unsupported legacy format"
+                                .to_string(),
+                        );
+                    }
                     return Ok(Some(
                         crate::vortix_protocol_openvpn::tunnel::OpenVpnStaticChallengeCredentials::new(
-                            username.to_string(), password.to_string(), answer,
+                            username.to_string(),
+                            password.to_string(),
+                            answer,
                         ),
                     ));
                 }
@@ -435,8 +475,8 @@ impl CanonicalTunnelExecutor {
             cancellation: cancellation.clone(),
             deadline: work.deadline,
         };
-        let static_challenge =
-            self.openvpn_static_challenge_credentials(work, &profile, cancellation)?;
+        let interactive_credentials =
+            self.openvpn_interactive_credentials(work, &profile, cancellation)?;
         let mut tunnel = tunnel_for_with_wireguard_policy(
             protocol,
             &self.settings.config_dir,
@@ -448,7 +488,7 @@ impl CanonicalTunnelExecutor {
         .for_generation(work.revision.generation)
         .for_operation(work.operation_id.clone())
         .with_execution_context(context);
-        if let Some(credentials) = static_challenge {
+        if let Some(credentials) = interactive_credentials {
             tunnel = tunnel.with_openvpn_static_challenge(credentials);
         }
         let mut handle = match panic::catch_unwind(AssertUnwindSafe(|| tunnel.up(&profile))) {

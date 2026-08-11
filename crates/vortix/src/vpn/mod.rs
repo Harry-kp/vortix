@@ -8,6 +8,7 @@ use crate::vortix_core::profile::{Profile, ProfileId, ProtocolKind};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use zeroize::Zeroize;
 
 /// Import a VPN profile from a file
 pub fn import_profile(path: &Path) -> Result<VpnProfile, String> {
@@ -23,6 +24,12 @@ pub(crate) struct PreparedProfileImport {
     stored: Profile,
     raw_body: Box<[u8]>,
     source_path: PathBuf,
+}
+
+impl Drop for PreparedProfileImport {
+    fn drop(&mut self) {
+        self.raw_body.zeroize();
+    }
 }
 
 impl PreparedProfileImport {
@@ -153,6 +160,7 @@ pub(crate) fn commit_profile_import(
     prepared: PreparedProfileImport,
     profiles_dir: &Path,
 ) -> Result<VpnProfile, String> {
+    let profile = prepared.profile.clone();
     FsProfileStore::new(profiles_dir.to_path_buf())
         .insert(&prepared.stored, &prepared.raw_body)
         .map_err(|error| format!("Failed to persist profile identity: {error}"))?;
@@ -166,14 +174,8 @@ pub(crate) fn commit_profile_import(
             prepared.profile.config_path.display()
         ),
     );
-    Ok(VpnProfile {
-        id: prepared.profile.id,
-        name: prepared.profile.name,
-        protocol: prepared.profile.protocol,
-        location: prepared.profile.location,
-        config_path: prepared.profile.config_path,
-        last_used: None,
-    })
+    drop(prepared);
+    Ok(profile)
 }
 
 /// Detect protocol by inspecting file content.
@@ -498,8 +500,13 @@ pub fn load_profiles() -> Vec<VpnProfile> {
         );
         return Vec::new();
     };
+    load_profiles_from(&profiles_dir)
+}
 
-    let store = FsProfileStore::new(profiles_dir.clone());
+/// Load the authenticated profile catalog from an explicit directory.
+#[must_use]
+pub(crate) fn load_profiles_from(profiles_dir: &Path) -> Vec<VpnProfile> {
+    let store = FsProfileStore::new(profiles_dir.to_path_buf());
     let summaries = match store.list() {
         Ok(summaries) => summaries,
         Err(error) => {

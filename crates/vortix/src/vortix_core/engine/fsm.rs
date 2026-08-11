@@ -139,14 +139,8 @@ impl<T: Tunnel> Engine<T> {
     /// currently holds — no transition guards, no events emitted, no
     /// tunnel invocation.
     ///
-    /// This exists to mirror externally-driven kernel state (e.g. a
-    /// VPN brought up by the legacy `App::connect_profile_inner`
-    /// spawned-thread path, or an interface adopted from a prior
-    /// vortix session) into the registry until a follow-up routes
-    /// the full connect flow through `EngineHandle::Local`. Once that
-    /// lands, every Connected entry will arrive via
-    /// `handle(UserCommand::Connect)` and this seed API can be
-    /// retired.
+    /// This exists for registry compatibility and renderer tests. Production
+    /// TUI state is supplied by the canonical control projection.
     ///
     /// Use [`TunnelRegistry::set_connected`] from outside the FSM
     /// rather than calling this directly — the registry call also
@@ -169,18 +163,13 @@ impl<T: Tunnel> Engine<T> {
     /// drop straight back to `Disconnected { last_failure: None }`
     /// without running the `Disconnecting` transition or invoking
     /// `Tunnel::down`. Used by [`TunnelRegistry::set_disconnected`]
-    /// when the App's legacy disconnect path has already torn down
-    /// the kernel state.
+    /// after an external owner has already torn down the kernel state.
     pub fn seed_disconnected_state(&mut self) {
         self.state = Connection::Disconnected { last_failure: None };
     }
 
-    /// Bookkeeping-only: seed `Connection::Connecting` directly. Used by
-    /// [`TunnelRegistry::set_connecting`] when the legacy connect path
-    /// (`App::connect_profile_inner`) sets its single-tunnel
-    /// `ConnectionState = Connecting{...}` and we need the registry to
-    /// reflect the in-flight attempt so sidebar / header render the
-    /// `◐` badge during the connect window.
+    /// Bookkeeping-only: seed `Connection::Connecting` directly for
+    /// compatibility and renderer tests.
     pub fn seed_connecting_state(
         &mut self,
         profile_id: ProfileId,

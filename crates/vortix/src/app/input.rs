@@ -272,12 +272,10 @@ impl App {
                 }
                 match handle_confirm_keys(key, &mut confirm_selected) {
                     ConfirmAction::Confirmed => {
-                        // [Y]es fires the legacy switch path. Index is
-                        // preferred over ProfileId at the Message
-                        // boundary because the downstream
-                        // `disconnect` + `pending_connect` flow is
-                        // indexed; future units can move this to
-                        // ProfileId.
+                        // [Y]es fires the exclusive canonical switch. The
+                        // message still carries the selected row index; the
+                        // update boundary immediately resolves its stable
+                        // profile identity before admission.
                         let idx = self
                             .runtime
                             .profiles

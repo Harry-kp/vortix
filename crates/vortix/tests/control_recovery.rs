@@ -269,6 +269,7 @@ async fn desired_intent_is_saved_before_supervised_effect_dispatch() {
         .submit(CommandRequest {
             command: UserCommand::Connect {
                 profile_id: profile_id.clone(),
+                conflict_acknowledgement: None,
             },
             idempotency_key: IdempotencyKey::new("save-before-connect"),
             deadline: Deadline(u64::MAX),
@@ -323,6 +324,7 @@ async fn failed_mutation_save_is_retried_before_effect_dispatch() {
             .submit(CommandRequest {
                 command: UserCommand::Connect {
                     profile_id: profile_id.clone(),
+                    conflict_acknowledgement: None,
                 },
                 idempotency_key: IdempotencyKey::new("retry-after-disk-failure"),
                 deadline: Deadline(u64::MAX),
@@ -372,7 +374,10 @@ async fn terminal_reply_waits_for_durable_operation_result() {
     let admitted = service
         .client()
         .submit(CommandRequest {
-            command: UserCommand::Connect { profile_id },
+            command: UserCommand::Connect {
+                profile_id,
+                conflict_acknowledgement: None,
+            },
             idempotency_key: IdempotencyKey::new("terminal-durability"),
             deadline: Deadline(u64::MAX),
         })
@@ -422,6 +427,7 @@ async fn same_boot_restart_scans_before_resuming_one_nonterminal_operation() {
             .submit(CommandRequest {
                 command: UserCommand::Connect {
                     profile_id: profile_id.clone(),
+                    conflict_acknowledgement: None,
                 },
                 idempotency_key: IdempotencyKey::new("survive-restart"),
                 deadline: Deadline(u64::MAX),
@@ -495,6 +501,10 @@ async fn same_boot_restart_scans_before_resuming_one_nonterminal_operation() {
 }
 
 #[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one recovery scenario verifies both eligible and ineligible boot intent"
+)]
 async fn new_boot_creates_one_recovery_operation_only_for_eligible_intent() {
     let directory = tempdir().unwrap();
     let store = Arc::new(FsControlStateStore::new(directory.path()));
@@ -527,6 +537,7 @@ async fn new_boot_creates_one_recovery_operation_only_for_eligible_intent() {
             .submit(CommandRequest {
                 command: UserCommand::Connect {
                     profile_id: profile_id.clone(),
+                    conflict_acknowledgement: None,
                 },
                 idempotency_key: IdempotencyKey::new("boot-connect"),
                 deadline: Deadline(u64::MAX),
@@ -629,6 +640,7 @@ async fn reboot_uses_current_boot_policy_instead_of_persisted_eligibility() {
             .submit(CommandRequest {
                 command: UserCommand::Connect {
                     profile_id: profile_id.clone(),
+                    conflict_acknowledgement: None,
                 },
                 idempotency_key: IdempotencyKey::new("persisted-boot-policy"),
                 deadline: Deadline(u64::MAX),

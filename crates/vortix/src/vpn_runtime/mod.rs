@@ -15,20 +15,17 @@ pub mod openvpn;
 
 pub use connection_state::{ConnectionState, DetailedConnectionInfo};
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Instant;
 
 use crate::config::AppConfig;
 use crate::constants;
-use crate::core::network_monitor::NetworkEvent;
 use crate::core::telemetry::{self, TelemetryUpdate};
 use crate::logger;
 use crate::message::Message;
-use crate::state::{
-    KillSwitchMode, KillSwitchState, ProfileSortOrder, Protocol, RetryState, VpnProfile,
-};
+use crate::state::{KillSwitchMode, KillSwitchState, ProfileSortOrder, Protocol, VpnProfile};
 
 fn effective_killswitch_state(
     requested: KillSwitchState,
@@ -57,7 +54,6 @@ use crate::utils;
 use crate::vortix_core::profile::ProfileId;
 
 type DnsObservation = (ProfileId, String, bool);
-type DnsSchedule = (Vec<DnsObservation>, usize, Instant);
 
 /// Last accepted counter sample for one `WireGuard` peer. Cumulative byte
 /// totals are not activity by themselves: only a positive delta between two
@@ -130,7 +126,6 @@ pub struct VpnRuntime {
 
     // === Connection Management ===
     pub connection_drops: u32,
-    pub pending_connect: Option<usize>,
     pub sort_order: ProfileSortOrder,
 
     // === Kill Switch ===
@@ -146,45 +141,26 @@ pub struct VpnRuntime {
     pub dns_policy: crate::vortix_core::ports::dns::DnsPolicyCoordinator,
     dns_requests: HashMap<ProfileId, crate::vortix_core::ports::dns::DnsRequest>,
     persist_dns_policy: bool,
-    dns_policy_worker: Option<crate::core::dns_policy::DnsPolicyWorker>,
-    dns_policy_revision: u64,
-    dns_policy_completed_revision: u64,
-    dns_last_scheduled: Option<DnsSchedule>,
     /// Scanner-visible sessions for which this process has no protocol handle.
     pub dns_external_sessions: usize,
     /// False after a route probe failure; the prior registry primary is retained.
     pub route_observation_fresh: bool,
-    /// Scanner-only `WireGuard` interfaces are visible but unmanaged. They are
-    /// represented as Handshaking and are exempt from the managed-connect
-    /// timeout/cleanup path until an explicit ownership receipt exists.
-    pub(crate) scanner_observed_wireguard: HashSet<ProfileId>,
-    /// Per-profile, per-peer ordered counter history for ongoing health.
-    pub(crate) wireguard_peer_activity: HashMap<ProfileId, HashMap<String, WireGuardPeerActivity>>,
-    /// Actual protocol probe activity, never inferred from configured targets.
-    pub(crate) wireguard_probe_activity:
-        HashMap<ProfileId, Vec<crate::vortix_core::ports::tunnel::ProbeReceipt>>,
-
-    // === Connection Retry & Auto-Reconnect ===
-    /// Per-profile retry / auto-reconnect bookkeeping.
-    /// Replaces the single-slot retry triple. Each profile retries
-    /// independently — a failed connect on A no longer blocks or
-    /// overwrites an in-flight retry on B.
-    pub retry_state: HashMap<ProfileId, RetryState>,
 
     // === Async Communication ===
     pub(crate) telemetry_rx: Option<mpsc::Receiver<TelemetryUpdate>>,
     pub telemetry_nudge: Option<mpsc::Sender<()>>,
     pub(crate) cmd_tx: mpsc::Sender<Message>,
     pub(crate) cmd_rx: mpsc::Receiver<Message>,
-    pub(crate) scanner_rx: Option<mpsc::Receiver<crate::core::scanner::ScannerResult>>,
-    pub(crate) netmon_rx: Option<mpsc::Receiver<NetworkEvent>>,
     pub(crate) netstats_rx: Option<mpsc::Receiver<(u64, u64)>>,
     pub(crate) last_bytes_in: u64,
     pub(crate) last_bytes_out: u64,
 }
 
 impl VpnRuntime {
-    /// Create an engine with background workers (telemetry, scanner, network monitor).
+    /// Create the TUI presentation runtime. Lifecycle observation, retry,
+    /// network-change handling, DNS/firewall policy, and protocol effects are
+    /// owned by the attached canonical control service; this runtime starts
+    /// telemetry only.
     ///
     /// Use this constructor when the engine will be long-lived (TUI mode).
     #[must_use]
@@ -224,7 +200,6 @@ impl VpnRuntime {
             is_root: utils::is_root(),
 
             connection_drops: 0,
-            pending_connect: None,
             sort_order: ProfileSortOrder::default(),
 
             killswitch_mode: KillSwitchMode::default(),
@@ -234,24 +209,13 @@ impl VpnRuntime {
             dns_policy: crate::vortix_core::ports::dns::DnsPolicyCoordinator::default(),
             dns_requests: HashMap::new(),
             persist_dns_policy: true,
-            dns_policy_worker: None,
-            dns_policy_revision: 0,
-            dns_policy_completed_revision: 0,
-            dns_last_scheduled: None,
             dns_external_sessions: 0,
             route_observation_fresh: false,
-            scanner_observed_wireguard: HashSet::new(),
-            wireguard_peer_activity: HashMap::new(),
-            wireguard_probe_activity: HashMap::new(),
-
-            retry_state: HashMap::new(),
 
             telemetry_rx: None,
             telemetry_nudge: None,
             cmd_tx,
             cmd_rx,
-            scanner_rx: None,
-            netmon_rx: None,
             netstats_rx: None,
             last_bytes_in: 0,
             last_bytes_out: 0,
@@ -332,7 +296,6 @@ impl VpnRuntime {
             is_root: utils::is_root(),
 
             connection_drops: 0,
-            pending_connect: None,
             sort_order: ProfileSortOrder::default(),
 
             killswitch_mode: KillSwitchMode::default(),
@@ -342,24 +305,13 @@ impl VpnRuntime {
             dns_policy: crate::vortix_core::ports::dns::DnsPolicyCoordinator::default(),
             dns_requests: HashMap::new(),
             persist_dns_policy: true,
-            dns_policy_worker: None,
-            dns_policy_revision: 0,
-            dns_policy_completed_revision: 0,
-            dns_last_scheduled: None,
             dns_external_sessions: 0,
             route_observation_fresh: false,
-            scanner_observed_wireguard: HashSet::new(),
-            wireguard_peer_activity: HashMap::new(),
-            wireguard_probe_activity: HashMap::new(),
-
-            retry_state: HashMap::new(),
 
             telemetry_rx: None,
             telemetry_nudge: None,
             cmd_tx,
             cmd_rx,
-            scanner_rx: None,
-            netmon_rx: None,
             netstats_rx: None,
             last_bytes_in: 0,
             last_bytes_out: 0,
@@ -416,7 +368,6 @@ impl VpnRuntime {
             config_dir: std::env::temp_dir().join("vortix_test"),
             is_root: false,
             connection_drops: 0,
-            pending_connect: None,
             sort_order: ProfileSortOrder::default(),
             killswitch_mode: KillSwitchMode::Off,
             killswitch_state: KillSwitchState::Disabled,
@@ -425,56 +376,25 @@ impl VpnRuntime {
             dns_policy: crate::vortix_core::ports::dns::DnsPolicyCoordinator::default(),
             dns_requests: HashMap::new(),
             persist_dns_policy: false,
-            dns_policy_worker: None,
-            dns_policy_revision: 0,
-            dns_policy_completed_revision: 0,
-            dns_last_scheduled: None,
             dns_external_sessions: 0,
             route_observation_fresh: false,
-            scanner_observed_wireguard: HashSet::new(),
-            wireguard_peer_activity: HashMap::new(),
-            wireguard_probe_activity: HashMap::new(),
-            retry_state: HashMap::new(),
             telemetry_rx: None,
             telemetry_nudge: None,
             cmd_tx,
             cmd_rx,
-            scanner_rx: None,
-            netmon_rx: None,
             netstats_rx: None,
             last_bytes_in: 0,
             last_bytes_out: 0,
         }
     }
 
-    /// Start background workers for telemetry, scanning, and network monitoring.
+    /// Start presentation-only telemetry workers.
     pub fn start_background_workers(&mut self) {
         let telemetry_config = telemetry::TelemetryConfig::from(&self.config);
         let (telem_rx, telem_nudge) = telemetry::spawn_telemetry_worker(telemetry_config);
         self.telemetry_rx = Some(telem_rx);
         self.telemetry_nudge = Some(telem_nudge);
-
-        let netmon_rx = crate::core::network_monitor::spawn_network_monitor(
-            std::time::Duration::from_secs(constants::NETWORK_MONITOR_POLL_SECS),
-        );
-        self.netmon_rx = Some(netmon_rx);
-        self.start_dns_policy_worker();
     }
-
-    fn start_dns_policy_worker(&mut self) {
-        if self.dns_policy_worker.is_none() {
-            self.dns_policy_worker = Some(crate::core::dns_policy::DnsPolicyWorker::spawn(
-                self.dns_policy.clone(),
-                self.cmd_tx.clone(),
-            ));
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn start_dns_policy_worker_for_test(&mut self) {
-        self.start_dns_policy_worker();
-    }
-
     /// Wake the telemetry worker so it refreshes IP/ISP/latency immediately.
     pub fn refresh_telemetry(&self) {
         if let Some(nudge) = &self.telemetry_nudge {
@@ -569,60 +489,6 @@ impl VpnRuntime {
         }
         self.dns_policy.effective().clone()
     }
-
-    /// Queue a latest-wins reconciliation for the long-lived TUI. Returns
-    /// immediately; platform probes, lock waits and persistence happen on the
-    /// single DNS policy worker.
-    pub fn schedule_dns_observations(
-        &mut self,
-        observations: &[DnsObservation],
-        external_sessions: usize,
-    ) -> Result<u64, String> {
-        let same_topology = self.dns_last_scheduled.as_ref().is_some_and(
-            |(previous, previous_external, scheduled_at)| {
-                previous == observations
-                    && *previous_external == external_sessions
-                    && (self.dns_policy.effective().status
-                        == crate::vortix_core::ports::dns::DnsEffectiveStatus::Degraded
-                        || scheduled_at.elapsed() < std::time::Duration::from_secs(5))
-            },
-        );
-        if same_topology {
-            return Ok(self.dns_policy_revision);
-        }
-        let intents = self.dns_intents(observations);
-        self.dns_policy_revision = self.dns_policy_revision.saturating_add(1);
-        let revision = self.dns_policy_revision;
-        let Some(worker) = &self.dns_policy_worker else {
-            return Err("DNS policy worker is unavailable".into());
-        };
-        worker.schedule(crate::core::dns_policy::DnsPolicyWork {
-            revision,
-            intents,
-            external_sessions,
-            config_dir: self.config_dir.clone(),
-            persist: self.persist_dns_policy,
-        })?;
-        self.dns_last_scheduled = Some((observations.to_vec(), external_sessions, Instant::now()));
-        Ok(revision)
-    }
-
-    /// Accept a worker completion unless it predates one already applied.
-    pub fn complete_dns_policy(
-        &mut self,
-        revision: u64,
-        coordinator: crate::vortix_core::ports::dns::DnsPolicyCoordinator,
-        external_sessions: usize,
-    ) -> bool {
-        if revision < self.dns_policy_completed_revision {
-            return false;
-        }
-        self.dns_policy_completed_revision = revision;
-        self.dns_policy = coordinator;
-        self.dns_external_sessions = external_sessions;
-        true
-    }
-
     /// Headless CLI reconciliation uses the same scanner route truth as the
     /// kill-switch path; no CLI-local primary heuristic is retained.
     pub fn reconcile_dns_from_scanner(

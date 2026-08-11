@@ -211,6 +211,16 @@ impl Supervisor {
             .reserve(profile_id, std::iter::empty::<String>())
     }
 
+    pub fn reserve_tunnel_with_acknowledgement(
+        &self,
+        profile_id: &ProfileId,
+        routes: impl IntoIterator<Item = String>,
+        acknowledgement: Option<&crate::vortix_core::engine::registry::Conflict>,
+    ) -> Result<ProfileAdmission, WorkFailure> {
+        self.tunnels
+            .reserve_with_acknowledgement(profile_id, routes, acknowledgement)
+    }
+
     pub fn dispatch_reserved_tunnel(
         &self,
         work: TunnelWork,
