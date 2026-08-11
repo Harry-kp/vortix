@@ -3657,13 +3657,27 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(1));
         }
+        while session.take_changed_snapshot().unwrap().is_some() {}
+        let published_default_route = session.published_default_route.borrow().clone();
+        let published_tunnel_details = session.published_tunnel_details.borrow().clone();
+        let published_observations = session.published_observations.borrow().clone();
 
         session
             .runtime()
             .block_on(session.publish_observations_from(scan()))
             .unwrap();
-        session.runtime().block_on(tokio::task::yield_now());
-        assert!(session.take_changed_snapshot().unwrap().is_none());
+        assert_eq!(
+            *session.published_default_route.borrow(),
+            published_default_route
+        );
+        assert_eq!(
+            *session.published_tunnel_details.borrow(),
+            published_tunnel_details
+        );
+        assert_eq!(
+            *session.published_observations.borrow(),
+            published_observations
+        );
     }
 
     #[test]

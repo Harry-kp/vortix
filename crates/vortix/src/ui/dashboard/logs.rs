@@ -25,9 +25,9 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     };
 
     let title = if app.logs_auto_scroll {
-        format!(" Event Log [Live{filter_label}] ")
+        format!(" Event Log [Live{filter_label}] · Background diagnostics: b→G ")
     } else {
-        format!(" Event Log [Paused{filter_label}] ")
+        format!(" Event Log [Paused{filter_label}] · Background diagnostics: b→G ")
     };
 
     let block = Block::default()

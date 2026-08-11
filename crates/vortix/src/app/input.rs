@@ -94,6 +94,47 @@ impl App {
         // Handle based on Input Mode
         let input_mode = self.input_mode.clone();
         match input_mode {
+            InputMode::BackgroundSetup { mut state } => {
+                use crate::background::BackgroundFocus;
+                match key.code {
+                    KeyCode::Esc if !state.committed => {
+                        self.handle_message(Message::CloseOverlay);
+                    }
+                    KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right => {
+                        state.focus = state.focus.next();
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        state.scroll = state.scroll.saturating_add(1).min(
+                            crate::ui::overlays::background_setup::max_scroll(
+                                &self.background_mode,
+                                state.workflow,
+                                self.terminal_size.0,
+                                self.terminal_size.1,
+                            ),
+                        );
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        state.scroll = state.scroll.saturating_sub(1);
+                    }
+                    KeyCode::Home | KeyCode::Char('g') => state.scroll = 0,
+                    KeyCode::End | KeyCode::Char('G') => {
+                        state.scroll = crate::ui::overlays::background_setup::max_scroll(
+                            &self.background_mode,
+                            state.workflow,
+                            self.terminal_size.0,
+                            self.terminal_size.1,
+                        );
+                    }
+                    KeyCode::Enter if state.focus == BackgroundFocus::Continue => {
+                        self.handle_message(Message::ConfirmBackgroundAction);
+                    }
+                    KeyCode::Enter => self.handle_message(Message::CloseOverlay),
+                    _ => {}
+                }
+                if matches!(self.input_mode, InputMode::BackgroundSetup { .. }) {
+                    self.input_mode = InputMode::BackgroundSetup { state };
+                }
+            }
             InputMode::Import {
                 mut path,
                 mut cursor,
@@ -837,7 +878,7 @@ impl crate::app::App {
     /// Handle keys when the action menu is open
     fn handle_action_menu_keys(&mut self, key: KeyEvent) {
         let actions = if self.show_bulk_menu {
-            message::get_bulk_actions()
+            message::get_bulk_actions_for(&self.background_mode.permitted_actions)
         } else {
             message::get_single_actions(&self.focused_panel)
         };

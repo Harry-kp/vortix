@@ -211,6 +211,25 @@ Vortix has two modes: an interactive TUI dashboard (default) and a headless CLI 
 sudo vortix              # Launch TUI dashboard (default)
 ```
 
+### Standard and Background modes
+
+Vortix starts in **Standard mode** with no always-on Vortix control service
+while idle. Optional **Background mode** adds routine control without `sudo`
+after one-time setup, live CLI/TUI synchronization, automatic drop recovery,
+boot connections, and continuous policy verification by running persistent
+Vortix processes. Declining setup removes no Standard-mode feature.
+
+This preparatory release exposes `vortix setup` and `vortix background
+{status,recover,diagnostics,disable}` for review. Confirmed setup, recovery,
+and disable requests return the nonzero `background_activation_unavailable`
+error and run no privileged process until enrollment is activated. Diagnostics
+remain bounded/redacted; fallback data is visibly unauthenticated and cannot
+establish authority or protection. `background diagnostics --follow --json`
+is an NDJSON stream and emits only newly observed records after its initial
+snapshot. Boot preflight rejects parser-identified interactive OpenVPN
+profiles and fails closed on external OpenVPN key/PKCS#12 material before
+saving intent.
+
 ### CLI Commands
 
 Every subcommand supports `--json` for machine-readable output and `--quiet` for silent operation (exit code only).
