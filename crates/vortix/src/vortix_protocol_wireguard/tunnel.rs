@@ -946,6 +946,26 @@ fn prepare_down_target_with(
     };
 
     if config.managed {
+        if interface_from_path(&config.path) != handle.interface_name {
+            if Path::new(&handle.interface_name).components().count() != 1 {
+                return Err(TunnelError::Subprocess(
+                    "managed WireGuard interface is not a safe basename".into(),
+                ));
+            }
+            let body = read_bounded_profile(&config.path)?;
+            parse_wg_conf(&body).map_err(|error| {
+                TunnelError::Subprocess(format!(
+                    "validate recovered WireGuard teardown profile: {error}"
+                ))
+            })?;
+            let interface_config = PathBuf::from(format!("{}.conf", handle.interface_name));
+            let temp_path = write_managed(&interface_config, body.as_bytes())?;
+            return Ok(PreparedDownTarget {
+                target: temp_path.to_string_lossy().into_owned(),
+                cleanup_after_attempt: Some(temp_path),
+                cleanup_after_success: Some(config.path),
+            });
+        }
         return Ok(PreparedDownTarget {
             target: config.path.to_string_lossy().into_owned(),
             cleanup_after_attempt: None,
@@ -1450,7 +1470,7 @@ mod tests {
         let managed = scratch.path().join("corp.conf");
         std::fs::write(&managed, "[Interface]\nPrivateKey = SECRET\n").unwrap();
         let handle = wg_handle(
-            "wg0",
+            "corp",
             Some(TunnelTeardownConfig {
                 path: managed.clone(),
                 managed: true,
@@ -1472,6 +1492,46 @@ mod tests {
         assert!(
             managed.exists(),
             "managed config must survive until down succeeds"
+        );
+    }
+
+    #[test]
+    fn recovered_managed_down_uses_authoritative_interface_basename() {
+        let (_root, session) = fresh_session_dir();
+        let scratch = tempfile::tempdir().unwrap();
+        let persisted = scratch.path().join("ownership-record-hash.conf");
+        std::fs::write(&persisted, "[Interface]\nPrivateKey = SECRET\n").unwrap();
+        let handle = wg_handle(
+            "integration",
+            Some(TunnelTeardownConfig {
+                path: persisted.clone(),
+                managed: true,
+            }),
+        );
+
+        let prepared = prepare_down_target_with(&handle, |path, body| {
+            write_managed_temp_config_at(&session, path, body)
+        })
+        .unwrap();
+
+        assert_eq!(
+            std::path::Path::new(&prepared.target)
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str),
+            Some("integration.conf"),
+            "wg-quick derives the interface from the managed filename"
+        );
+        assert_eq!(
+            prepared.cleanup_after_attempt.as_deref(),
+            Some(std::path::Path::new(&prepared.target))
+        );
+        assert_eq!(
+            prepared.cleanup_after_success.as_deref(),
+            Some(persisted.as_path())
+        );
+        assert!(
+            persisted.exists(),
+            "durable recovery config stays until success"
         );
     }
 
