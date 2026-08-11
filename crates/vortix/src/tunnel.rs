@@ -793,10 +793,13 @@ impl crate::vortix_core::control::worker::TunnelExecutor for CanonicalTunnelExec
             WorkFailure::Panicked
         } else if error.contains("cancelled") {
             WorkFailure::Cancelled
+        } else if error.contains("handshake") || error.contains("Handshake") {
+            // A bounded health probe can report a transport timeout while the
+            // semantic failure is still an exact WireGuard handshake gate.
+            // This check must precede the generic operation-timeout fallback.
+            WorkFailure::HandshakeFailed
         } else if error.contains("expired") || error.contains("timed out") {
             WorkFailure::TimedOut
-        } else if error.contains("handshake") || error.contains("Handshake") {
-            WorkFailure::HandshakeFailed
         } else {
             WorkFailure::EffectFailed
         }
@@ -1062,6 +1065,33 @@ mod canonical_tests {
         assert_eq!(
             executor.classify_failure("interactive challenge was cancelled or expired"),
             WorkFailure::ChallengeFailed
+        );
+    }
+
+    #[test]
+    fn wireguard_handshake_context_outranks_generic_probe_timeout_wording() {
+        use crate::vortix_core::control::worker::{TunnelExecutor as _, WorkFailure};
+
+        let executor = CanonicalTunnelExecutor::new(
+            CanonicalTunnelSettings {
+                config_dir: PathBuf::new(),
+                openvpn_verbosity: "3".into(),
+                connect_timeout_secs: 1,
+                wireguard_handshake_timeout_secs: 1,
+                wireguard_health_targets: Vec::new(),
+            },
+            |_| None,
+        );
+
+        assert_eq!(
+            executor.classify_failure(
+                "WireGuard handshake probe failed: ping timed out before peer response"
+            ),
+            WorkFailure::HandshakeFailed
+        );
+        assert_eq!(
+            executor.classify_failure("canonical tunnel operation timed out"),
+            WorkFailure::TimedOut
         );
     }
 
