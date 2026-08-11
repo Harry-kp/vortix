@@ -138,6 +138,56 @@ impl PolicyExecutor for OkPolicy {
     fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) {}
 }
 
+#[tokio::test]
+async fn disconnect_all_does_not_reserve_connect_routes() {
+    let first = profile("disconnect-overlap-first");
+    let second = profile("disconnect-overlap-second");
+    let supervisor = Arc::new(Supervisor::new(
+        AuthorityEpoch(1),
+        Arc::new(OkExecutor),
+        Arc::new(OkPolicy),
+        2,
+        8,
+    ));
+    let overlapping = BTreeSet::from(["0.0.0.0/0".into()]);
+    let service = ControlService::start_supervised(
+        ControlServiceConfig {
+            authority_epoch: AuthorityEpoch(1),
+            known_profiles: BTreeSet::from([first.clone(), second.clone()]),
+            profile_topologies: BTreeMap::from([
+                (
+                    first,
+                    ProfileTopology {
+                        routes: overlapping.clone(),
+                        ..ProfileTopology::default()
+                    },
+                ),
+                (
+                    second,
+                    ProfileTopology {
+                        routes: overlapping,
+                        ..ProfileTopology::default()
+                    },
+                ),
+            ]),
+            ..ControlServiceConfig::default()
+        },
+        Arc::new(TestClock::default()),
+        ExecutionSelection::CanonicalAuthority,
+        supervisor,
+    );
+
+    service
+        .client()
+        .submit(CommandRequest {
+            command: UserCommand::Disconnect { profile_id: None },
+            idempotency_key: IdempotencyKey::new("disconnect-overlap-all"),
+            deadline: Deadline(1_000),
+        })
+        .await
+        .expect("disconnect admission must not claim routes used only by connect");
+}
+
 #[test]
 fn supervisor_restores_only_protocol_correct_owned_tunnels() {
     let wg_profile = profile("restored-wg");

@@ -1088,18 +1088,29 @@ impl ControlHandle {
                     .as_ref()
                     .ok_or(AdmissionError::Stopped)?;
                 for profile_id in &target_profiles {
-                    let routes = config
-                        .profile_topologies
-                        .get(profile_id)
-                        .map(|topology| topology.routes.iter().cloned().collect::<Vec<_>>())
-                        .unwrap_or_default();
-                    let reserved = supervisor.reserve_tunnel(profile_id, routes).map_err(
-                        |error| match error {
-                            WorkFailure::RouteConflict => AdmissionError::RouteConflict,
-                            WorkFailure::Stopped => AdmissionError::Stopped,
-                            _ => AdmissionError::Busy,
-                        },
-                    )?;
+                    let disconnecting = matches!(
+                        request.command,
+                        UserCommand::Disconnect { .. } | UserCommand::ForceDisconnect { .. }
+                    );
+                    let routes = if disconnecting {
+                        Vec::new()
+                    } else {
+                        config
+                            .profile_topologies
+                            .get(profile_id)
+                            .map(|topology| topology.routes.iter().cloned().collect::<Vec<_>>())
+                            .unwrap_or_default()
+                    };
+                    let reserved = if disconnecting {
+                        supervisor.reserve_disconnect(profile_id)
+                    } else {
+                        supervisor.reserve_tunnel(profile_id, routes)
+                    }
+                    .map_err(|error| match error {
+                        WorkFailure::RouteConflict => AdmissionError::RouteConflict,
+                        WorkFailure::Stopped => AdmissionError::Stopped,
+                        _ => AdmissionError::Busy,
+                    })?;
                     work_admissions.push((profile_id.clone(), reserved));
                 }
             }
