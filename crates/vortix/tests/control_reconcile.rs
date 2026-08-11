@@ -3418,7 +3418,10 @@ async fn cleaned_wireguard_connect_timeout_is_a_terminal_handshake_failure() {
     let admitted = service
         .client()
         .submit(CommandRequest {
-            command: UserCommand::Connect { profile_id: target },
+            command: UserCommand::Connect {
+                profile_id: target,
+                conflict_acknowledgement: None,
+            },
             idempotency_key: IdempotencyKey::new("handshake-timeout-terminal"),
             deadline: Deadline(1_000),
         })
