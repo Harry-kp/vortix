@@ -127,6 +127,7 @@ pub fn handle_command(
     config_dir: &Path,
     config_source: &str,
     config: &AppConfig,
+    settings: &crate::vortix_config::Settings,
     mode: OutputMode,
 ) -> i32 {
     match command {
@@ -195,7 +196,9 @@ pub fn handle_command(
             0
         }
         Commands::Audit { pid, vpn_only } => handle_audit(*pid, *vpn_only, mode),
-        Commands::Daemon { socket } => handle_daemon(socket.clone(), mode),
+        Commands::Daemon { socket } => {
+            handle_daemon(socket.clone(), mode, config_dir, &settings.diagnostics)
+        }
         Commands::Completions { shell } => {
             handle_completions(*shell);
             0
@@ -280,7 +283,12 @@ fn handle_audit(pid_filter: Option<u32>, vpn_only: bool, mode: OutputMode) -> i3
 }
 
 /// `vortix daemon` — run the bounded, read-only IPC candidate.
-fn handle_daemon(socket_override: Option<std::path::PathBuf>, mode: OutputMode) -> i32 {
+fn handle_daemon(
+    socket_override: Option<std::path::PathBuf>,
+    mode: OutputMode,
+    config_directory: &Path,
+    settings: &crate::vortix_config::DiagnosticsSettings,
+) -> i32 {
     let socket_path = socket_override.unwrap_or_else(crate::daemon::default_socket_path);
 
     // Tokio-backed daemon socket binding must happen inside an active Tokio runtime.
@@ -324,12 +332,39 @@ fn handle_daemon(socket_override: Option<std::path::PathBuf>, mode: OutputMode) 
         server.socket_path().display()
     );
 
+    let fallback_path = if settings.fallback_snapshot {
+        let diagnostic_directory = config_directory.join("control");
+        if let Err(error) =
+            crate::daemon::diagnostics::prepare_fallback_directory(&diagnostic_directory)
+        {
+            eprintln!("vortix daemon: failed to prepare diagnostics: {error}");
+            return 1;
+        }
+        Some(diagnostic_directory.join("diagnostics.json"))
+    } else {
+        None
+    };
+    let diagnostics = match crate::daemon::diagnostics::DiagnosticHub::start_with_stale_after(
+        fallback_path,
+        std::time::Duration::from_secs(settings.stale_after_secs.clamp(1, 86_400)),
+    ) {
+        Ok(diagnostics) => std::sync::Arc::new(diagnostics),
+        Err(error) => {
+            eprintln!("vortix daemon: failed to start diagnostics: {error}");
+            return 1;
+        }
+    };
     // The candidate is deliberately passive: it polls scanner truth for
     // queries/subscriptions but never constructs an engine, loads desired
     // intent, acquires lifecycle authority, or exposes mutation capability.
-    let provider = match crate::daemon::passive::ScannerQueryProvider::start(
+    // Its typed observation transitions feed the same bounded diagnostics
+    // provider served over IPC; raw scanner data never enters that provider.
+    let diagnostic_sink: std::sync::Arc<dyn crate::daemon::passive::PassiveDiagnosticSink> =
+        diagnostics.clone();
+    let provider = match crate::daemon::passive::ScannerQueryProvider::start_with_diagnostics(
         crate::vpn::load_profiles(),
         std::time::Duration::from_secs(1),
+        Some(diagnostic_sink),
     ) {
         Ok(provider) => std::sync::Arc::new(provider),
         Err(error) => {
@@ -337,7 +372,9 @@ fn handle_daemon(socket_override: Option<std::path::PathBuf>, mode: OutputMode) 
             return 1;
         }
     };
-    let server = server.with_query_provider(provider);
+    let server = server
+        .with_query_provider(provider)
+        .with_diagnostic_provider(diagnostics);
 
     runtime.block_on(async {
         if let Err(e) = server.run().await {

@@ -11,7 +11,9 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot, watch, Semaphore};
 use tokio::task::JoinSet;
 
+use super::diagnostics::{DiagnosticHub, DiagnosticQueryProvider};
 use super::passive::{legacy_connection, PassiveQueryProvider};
+use crate::vortix_core::control::DiagnosticSnapshot;
 use crate::vortix_core::ipc::{
     negotiate_passive, FrameError, IpcCapability, IpcError, IpcOp, IpcRequest, IpcResponse,
     IpcResult, PassiveSnapshot, MAX_FRAME_BYTES,
@@ -55,6 +57,7 @@ pub struct DaemonServer {
     socket_path: PathBuf,
     listener: UnixListener,
     provider: Arc<dyn PassiveQueryProvider>,
+    diagnostics: Arc<dyn DiagnosticQueryProvider>,
     daemon_uid: u32,
     socket_identity: SocketIdentity,
     shutdown: watch::Sender<bool>,
@@ -71,6 +74,7 @@ impl DaemonServer {
             socket_path,
             listener,
             provider: Arc::new(EmptyQueryProvider::new()),
+            diagnostics: Arc::new(DiagnosticHub::start(None)?),
             daemon_uid: effective_uid(),
             socket_identity,
             shutdown: watch::channel(false).0,
@@ -80,6 +84,15 @@ impl DaemonServer {
     #[must_use]
     pub fn with_query_provider(mut self, provider: Arc<dyn PassiveQueryProvider>) -> Self {
         self.provider = provider;
+        self
+    }
+
+    #[must_use]
+    pub fn with_diagnostic_provider(
+        mut self,
+        diagnostics: Arc<dyn DiagnosticQueryProvider>,
+    ) -> Self {
+        self.diagnostics = diagnostics;
         self
     }
 
@@ -122,11 +135,12 @@ impl DaemonServer {
                         continue;
                     };
                     let provider = Arc::clone(&self.provider);
+                    let diagnostics = Arc::clone(&self.diagnostics);
                     let shutdown = self.shutdown.clone();
                     let daemon_uid = self.daemon_uid;
                     clients.spawn(async move {
                         let _permit = permit;
-                        if let Err(error) = handle_client(stream, daemon_uid, provider, shutdown).await {
+                        if let Err(error) = handle_client(stream, daemon_uid, provider, diagnostics, shutdown).await {
                             tracing::debug!(%error, "passive daemon client closed");
                         }
                     });
@@ -255,6 +269,7 @@ async fn handle_client(
     stream: UnixStream,
     daemon_uid: u32,
     provider: Arc<dyn PassiveQueryProvider>,
+    diagnostics: Arc<dyn DiagnosticQueryProvider>,
     shutdown: watch::Sender<bool>,
 ) -> Result<(), DaemonError> {
     if get_peer_uid(&stream)? != daemon_uid {
@@ -273,16 +288,21 @@ async fn handle_client(
     let (mut reader, writer) = stream.into_split();
     let (output, output_rx) = mpsc::channel(OUTPUT_CAPACITY);
     let writer_task = tokio::spawn(writer_loop(writer, output_rx));
-    let result = connection_loop(&mut reader, &output, provider, shutdown).await;
+    let result = connection_loop(&mut reader, &output, provider, diagnostics, shutdown).await;
     drop(output);
     let _ = writer_task.await;
     result
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one connection loop keeps handshake, replay, subscription, and shutdown ordering adjacent"
+)]
 async fn connection_loop<R: AsyncRead + Unpin>(
     reader: &mut R,
     output: &mpsc::Sender<Outbound>,
     provider: Arc<dyn PassiveQueryProvider>,
+    diagnostics: Arc<dyn DiagnosticQueryProvider>,
     shutdown: watch::Sender<bool>,
 ) -> Result<(), DaemonError> {
     let first = read_request(reader).await?;
@@ -349,26 +369,43 @@ async fn connection_loop<R: AsyncRead + Unpin>(
             continue;
         }
 
-        let subscribe = matches!(request.op, IpcOp::Subscribe | IpcOp::PassiveSubscribe);
-        let mut subscription = subscribe.then(|| provider.subscribe());
-        let response = dispatch(&request, provider.as_ref(), &shutdown);
+        let passive_subscribe = matches!(request.op, IpcOp::Subscribe | IpcOp::PassiveSubscribe);
+        let diagnostic_subscribe = matches!(request.op, IpcOp::DiagnosticsSubscribe);
+        let mut subscription = passive_subscribe.then(|| provider.subscribe());
+        let mut diagnostic_subscription = diagnostic_subscribe.then(|| diagnostics.subscribe());
+        let response = dispatch(&request, provider.as_ref(), diagnostics.as_ref(), &shutdown);
         let subscription_boundary = match &response.result {
             Ok(IpcResult::PassiveSubscribed { snapshot }) => snapshot.generation,
+            Ok(IpcResult::DiagnosticSubscribed { snapshot }) => snapshot.generation,
             _ => 0,
         };
         // Subscription connections become read-only immediately, so no later
         // request can replay this acknowledgement and it need not be retained.
         let frame = response_frame(&response)?;
-        let retained = subscribe || requests.insert(request.id, digest, Arc::clone(&frame));
+        let retained = passive_subscribe
+            || diagnostic_subscribe
+            || requests.insert(request.id, digest, Arc::clone(&frame));
         send_frame(output, frame).await?;
         if let Some(receiver) = subscription.as_mut() {
-            stream_snapshots(
+            stream_subscription(
                 reader,
                 output,
-                provider.as_ref(),
                 receiver,
                 subscription_boundary,
                 &shutdown,
+                || provider.snapshot().generation,
+            )
+            .await?;
+            return Ok(());
+        }
+        if let Some(receiver) = diagnostic_subscription.as_mut() {
+            stream_subscription(
+                reader,
+                output,
+                receiver,
+                subscription_boundary,
+                &shutdown,
+                || diagnostics.snapshot().generation,
             )
             .await?;
             return Ok(());
@@ -385,6 +422,7 @@ async fn connection_loop<R: AsyncRead + Unpin>(
 fn dispatch(
     request: &IpcRequest,
     provider: &dyn PassiveQueryProvider,
+    diagnostics: &dyn DiagnosticQueryProvider,
     shutdown: &watch::Sender<bool>,
 ) -> IpcResponse {
     let result = match &request.op {
@@ -401,6 +439,12 @@ fn dispatch(
         IpcOp::Subscribe | IpcOp::PassiveSubscribe => Ok(IpcResult::PassiveSubscribed {
             snapshot: provider.snapshot(),
         }),
+        IpcOp::Diagnostics => Ok(IpcResult::DiagnosticSnapshot {
+            snapshot: diagnostics.snapshot(),
+        }),
+        IpcOp::DiagnosticsSubscribe => Ok(IpcResult::DiagnosticSubscribed {
+            snapshot: diagnostics.snapshot(),
+        }),
         IpcOp::Shutdown => {
             let _ = shutdown.send(true);
             Ok(IpcResult::ShuttingDown)
@@ -412,14 +456,43 @@ fn dispatch(
     }
 }
 
-async fn stream_snapshots<R: AsyncRead + Unpin>(
+trait SubscriptionSnapshot: Clone + Send + 'static {
+    fn generation(&self) -> u64;
+    fn into_event(self) -> IpcResult;
+}
+
+impl SubscriptionSnapshot for PassiveSnapshot {
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn into_event(self) -> IpcResult {
+        IpcResult::PassiveEvent { snapshot: self }
+    }
+}
+
+impl SubscriptionSnapshot for DiagnosticSnapshot {
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn into_event(self) -> IpcResult {
+        IpcResult::DiagnosticEvent { snapshot: self }
+    }
+}
+
+async fn stream_subscription<R, S>(
     reader: &mut R,
     output: &mpsc::Sender<Outbound>,
-    provider: &dyn PassiveQueryProvider,
-    receiver: &mut tokio::sync::broadcast::Receiver<PassiveSnapshot>,
+    receiver: &mut tokio::sync::broadcast::Receiver<S>,
     boundary: u64,
     shutdown: &watch::Sender<bool>,
-) -> Result<(), DaemonError> {
+    newest_generation: impl Fn() -> u64,
+) -> Result<(), DaemonError>
+where
+    R: AsyncRead + Unpin,
+    S: SubscriptionSnapshot,
+{
     let mut probe = [0_u8; 1];
     let mut shutdown_receiver = shutdown.subscribe();
     loop {
@@ -433,10 +506,10 @@ async fn stream_snapshots<R: AsyncRead + Unpin>(
                 }
             }
             event = receiver.recv() => match event {
-                Ok(snapshot) if snapshot.generation > boundary => {
+                Ok(snapshot) if snapshot.generation() > boundary => {
                     send_response(output, IpcResponse {
                         id: 0,
-                        result: Ok(IpcResult::PassiveEvent { snapshot }),
+                        result: Ok(snapshot.into_event()),
                     }).await?;
                 }
                 Ok(_) => {}
@@ -444,7 +517,7 @@ async fn stream_snapshots<R: AsyncRead + Unpin>(
                     send_response(output, IpcResponse {
                         id: 0,
                         result: Ok(IpcResult::ResyncRequired {
-                            newest_generation: provider.snapshot().generation,
+                            newest_generation: newest_generation(),
                         }),
                     }).await?;
                     return Ok(());
@@ -729,6 +802,21 @@ mod tests {
         }
     }
 
+    struct FixedDiagnostics {
+        snapshot: std::sync::Mutex<DiagnosticSnapshot>,
+        events: tokio::sync::broadcast::Sender<DiagnosticSnapshot>,
+    }
+
+    impl DiagnosticQueryProvider for FixedDiagnostics {
+        fn snapshot(&self) -> DiagnosticSnapshot {
+            self.snapshot.lock().unwrap().clone()
+        }
+
+        fn subscribe(&self) -> tokio::sync::broadcast::Receiver<DiagnosticSnapshot> {
+            self.events.subscribe()
+        }
+    }
+
     fn handshake(id: u64) -> IpcRequest {
         IpcRequest {
             id,
@@ -742,12 +830,15 @@ mod tests {
     async fn first_non_handshake_request_is_rejected() {
         let (mut client, server) = tokio::io::duplex(4096);
         let provider: Arc<dyn PassiveQueryProvider> = Arc::new(EmptyQueryProvider::new());
+        let diagnostics: Arc<dyn DiagnosticQueryProvider> =
+            Arc::new(DiagnosticHub::start(None).unwrap());
         let shutdown = watch::channel(false).0;
         let task = tokio::spawn(async move {
             let (mut reader, writer_half) = tokio::io::split(server);
             let (output, output_rx) = mpsc::channel(2);
             let writer = tokio::spawn(writer_loop(writer_half, output_rx));
-            let result = connection_loop(&mut reader, &output, provider, shutdown).await;
+            let result =
+                connection_loop(&mut reader, &output, provider, diagnostics, shutdown).await;
             drop(output);
             let _ = writer.await;
             result
@@ -771,6 +862,7 @@ mod tests {
     #[test]
     fn passive_dispatch_rejects_execute() {
         let provider = EmptyQueryProvider::new();
+        let diagnostics = DiagnosticHub::start(None).unwrap();
         let shutdown = watch::channel(false).0;
         let request = IpcRequest {
             id: 9,
@@ -779,7 +871,7 @@ mod tests {
             }),
         };
         assert!(matches!(
-            dispatch(&request, &provider, &shutdown).result,
+            dispatch(&request, &provider, &diagnostics, &shutdown).result,
             Err(IpcError::CapabilityUnavailable {
                 capability: IpcCapability::ControlMutation
             })
@@ -789,6 +881,52 @@ mod tests {
     #[test]
     fn handshake_fixture_is_well_formed() {
         assert!(matches!(handshake(1).op, IpcOp::Handshake { .. }));
+    }
+
+    #[tokio::test]
+    async fn lagged_diagnostic_stream_requires_resynchronization() {
+        let (events, _) = tokio::sync::broadcast::channel(1);
+        let initial = DiagnosticHub::start(None).unwrap().snapshot();
+        let provider = Arc::new(FixedDiagnostics {
+            snapshot: std::sync::Mutex::new(initial.clone()),
+            events,
+        });
+        let mut receiver = provider.subscribe();
+        for generation in 2..=4 {
+            let mut snapshot = initial.clone();
+            snapshot.generation = generation;
+            *provider.snapshot.lock().unwrap() = snapshot.clone();
+            let _ = provider.events.send(snapshot);
+        }
+
+        let (mut client, server) = tokio::io::duplex(4096);
+        let (mut server_reader, server_writer) = tokio::io::split(server);
+        let (output, output_rx) = mpsc::channel(2);
+        let writer = tokio::spawn(writer_loop(server_writer, output_rx));
+        let shutdown = watch::channel(false).0;
+        stream_subscription(
+            &mut server_reader,
+            &output,
+            &mut receiver,
+            1,
+            &shutdown,
+            || provider.snapshot().generation,
+        )
+        .await
+        .unwrap();
+        drop(output);
+        writer.await.unwrap();
+        let mut bytes = vec![0_u8; 4096];
+        let read = client.read(&mut bytes).await.unwrap();
+        let (response, _) = crate::vortix_core::ipc::decode_frame::<IpcResponse>(&bytes[..read])
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            response.result,
+            Ok(IpcResult::ResyncRequired {
+                newest_generation: 4
+            })
+        ));
     }
 
     #[test]
@@ -922,13 +1060,13 @@ mod tests {
         let (output, output_rx) = mpsc::channel(2);
         let writer = tokio::spawn(writer_loop(output_server, output_rx));
         let shutdown = watch::channel(false).0;
-        stream_snapshots(
+        stream_subscription(
             &mut idle_reader,
             &output,
-            &provider,
             &mut receiver,
             1,
             &shutdown,
+            || provider.snapshot().generation,
         )
         .await
         .unwrap();
