@@ -19,6 +19,16 @@ use crate::vortix_core::state::killswitch::KillSwitchMode;
 pub enum UserCommand {
     Connect {
         profile_id: ProfileId,
+        /// Exact canonical conflict the user acknowledged after preflight.
+        /// Missing remains the safe default for old serialized clients.
+        #[serde(default)]
+        conflict_acknowledgement: Option<crate::vortix_core::engine::registry::Conflict>,
+    },
+    /// Make one tunnel the sole requested connection in a single durable
+    /// desired-state transition. The service tears down every other managed
+    /// tunnel before it dispatches the target connect.
+    ConnectExclusive {
+        profile_id: ProfileId,
     },
     Disconnect {
         profile_id: Option<ProfileId>,
@@ -109,6 +119,60 @@ impl Secret {
         &self.0
     }
 
+    /// Transfer through an existing byte-oriented local client boundary.
+    /// The source allocation is cleared before this value is returned; the
+    /// receiver must immediately re-wrap the returned bytes in `Secret`.
+    #[must_use]
+    pub fn into_vec(mut self) -> Vec<u8> {
+        let bytes = self.0.to_vec();
+        self.clear();
+        bytes
+    }
+
+    /// Build a memory-only `OpenVPN` credential response. The framing is an
+    /// internal service/worker contract and is never serialized, journaled,
+    /// logged, or persisted.
+    #[must_use]
+    pub fn openvpn_credentials(
+        username: &str,
+        password: &str,
+        challenge_answer: Option<&str>,
+    ) -> Self {
+        const MAGIC: &[u8] = b"VORTIX-OVPN-CREDENTIALS\0";
+        let answer = challenge_answer.unwrap_or_default();
+        let mut bytes =
+            Vec::with_capacity(MAGIC.len() + username.len() + password.len() + answer.len() + 12);
+        bytes.extend_from_slice(MAGIC);
+        for value in [username, password, answer] {
+            let len = u32::try_from(value.len()).unwrap_or(u32::MAX);
+            bytes.extend_from_slice(&len.to_be_bytes());
+            bytes.extend_from_slice(value.as_bytes());
+        }
+        Self::new(bytes)
+    }
+
+    pub(crate) fn decode_openvpn_credentials(
+        &self,
+    ) -> Option<(
+        zeroize::Zeroizing<String>,
+        zeroize::Zeroizing<String>,
+        Secret,
+    )> {
+        const MAGIC: &[u8] = b"VORTIX-OVPN-CREDENTIALS\0";
+        let mut bytes = self.expose().strip_prefix(MAGIC)?;
+        let mut next = || {
+            let (raw_len, rest) = bytes.split_at_checked(4)?;
+            let len = usize::try_from(u32::from_be_bytes(raw_len.try_into().ok()?)).ok()?;
+            let (value, rest) = rest.split_at_checked(len)?;
+            bytes = rest;
+            String::from_utf8(value.to_vec()).ok()
+        };
+        let username = zeroize::Zeroizing::new(next()?);
+        let password = zeroize::Zeroizing::new(next()?);
+        let answer = Secret::new(next()?.into_bytes());
+        bytes.is_empty().then_some((username, password, answer))
+    }
+
     fn clear(&mut self) {
         self.0.zeroize();
     }
@@ -139,12 +203,44 @@ impl fmt::Debug for ChallengeResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::Secret;
+    use super::{Secret, UserCommand};
 
     #[test]
     fn secret_clear_overwrites_every_initialized_byte() {
         let mut secret = Secret::new(b"compiler-resistant-answer".to_vec());
         secret.clear();
         assert!(secret.0.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn openvpn_credentials_round_trip_only_through_memory_secret() {
+        let secret = Secret::openvpn_credentials("alice", "correct horse", Some("123456"));
+        let (username, password, answer) = secret.decode_openvpn_credentials().unwrap();
+        assert_eq!(username.as_str(), "alice");
+        assert_eq!(password.as_str(), "correct horse");
+        assert_eq!(answer.expose(), b"123456");
+    }
+
+    #[test]
+    fn ordinary_challenge_answer_is_not_misread_as_credentials() {
+        assert!(Secret::new(b"123456".to_vec())
+            .decode_openvpn_credentials()
+            .is_none());
+    }
+
+    #[test]
+    fn legacy_connect_json_defaults_to_unconfirmed_topology() {
+        let encoded = format!(
+            r#"{{"Connect":{{"profile_id":"{}"}}}}"#,
+            "a".repeat(crate::vortix_core::profile::ProfileId::HEX_LEN)
+        );
+        let command: UserCommand = serde_json::from_str(&encoded).unwrap();
+        assert!(matches!(
+            command,
+            UserCommand::Connect {
+                conflict_acknowledgement: None,
+                ..
+            }
+        ));
     }
 }

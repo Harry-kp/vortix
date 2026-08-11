@@ -37,10 +37,85 @@ fn profile(seed: char) -> ProfileId {
 
 fn request(key: &str, profile_id: ProfileId, deadline: u64) -> CommandRequest {
     CommandRequest {
-        command: UserCommand::Connect { profile_id },
+        command: UserCommand::Connect {
+            profile_id,
+            conflict_acknowledgement: None,
+        },
         idempotency_key: IdempotencyKey::new(key),
         deadline: Deadline(deadline),
     }
+}
+
+#[tokio::test]
+async fn exclusive_connect_replaces_multi_tunnel_desire_atomically() {
+    let first = profile('a');
+    let target = profile('b');
+    let untouched = profile('c');
+    let service = ControlService::start(ControlServiceConfig {
+        known_profiles: [first.clone(), target.clone(), untouched.clone()]
+            .into_iter()
+            .collect(),
+        profile_topologies: [
+            (first.clone(), ProfileTopology::default()),
+            (target.clone(), ProfileTopology::default()),
+            (untouched.clone(), ProfileTopology::default()),
+        ]
+        .into_iter()
+        .collect(),
+        ..config()
+    });
+    let client = service.client();
+    for (key, profile_id) in [
+        ("connect-first", first.clone()),
+        ("connect-target", target.clone()),
+    ] {
+        client
+            .submit(request(key, profile_id, u64::MAX))
+            .await
+            .unwrap();
+    }
+    let before = client.subscribe().snapshot();
+    assert_eq!(
+        before.desired.tunnels.get(&first),
+        Some(&vortix::vortix_core::control::RequestedTunnelState::Connected)
+    );
+    assert_eq!(
+        before.desired.tunnels.get(&target),
+        Some(&vortix::vortix_core::control::RequestedTunnelState::Connected)
+    );
+
+    let admitted = client
+        .submit(CommandRequest {
+            command: UserCommand::ConnectExclusive {
+                profile_id: target.clone(),
+            },
+            idempotency_key: IdempotencyKey::new("exclusive-target"),
+            deadline: Deadline(u64::MAX),
+        })
+        .await
+        .unwrap();
+    let after = client.subscribe().snapshot();
+    assert_eq!(after.desired.generation, before.desired.generation + 1);
+    assert_eq!(
+        after.desired.tunnels.get(&first),
+        Some(&vortix::vortix_core::control::RequestedTunnelState::Disconnected)
+    );
+    assert_eq!(
+        after.desired.tunnels.get(&target),
+        Some(&vortix::vortix_core::control::RequestedTunnelState::Connected)
+    );
+    assert_eq!(
+        after.desired.tunnels.get(&untouched),
+        Some(&vortix::vortix_core::control::RequestedTunnelState::Disconnected),
+        "the atomic subset must explicitly include untouched catalog profiles"
+    );
+    let operation = after.operations.get(&admitted.operation_id).unwrap();
+    let vortix::vortix_core::control::OperationIntent::DesiredSubset { tunnels, .. } =
+        &operation.intent
+    else {
+        panic!("exclusive switch must retain its exact desired subset");
+    };
+    assert_eq!(tunnels, &after.desired.tunnels);
 }
 
 fn config() -> ControlServiceConfig {
@@ -1179,4 +1254,93 @@ fn control_kill_switch_json_uses_only_canonical_slugs() {
         serde_json::from_value(json).expect("deserialize desired state");
     assert_eq!(decoded.kill_switch, vortix::state::KillSwitchMode::AlwaysOn);
     assert!(serde_json::from_str::<UserCommand>(r#"{"SetKillSwitch":{"mode":"Auto"}}"#).is_err());
+}
+
+#[tokio::test]
+async fn canonical_tunnel_projection_carries_kernel_role_details_and_health() {
+    use std::collections::BTreeSet;
+    use std::time::{Duration, SystemTime};
+
+    use vortix::vortix_core::engine::registry::Role;
+    use vortix::vortix_core::engine::state::{Connection, DetailedConnectionInfo};
+
+    let profile_id = profile('a');
+    let clock = Arc::new(FakeClock::default());
+    clock.set(100);
+    let service = ControlService::start_with_clock(
+        ControlServiceConfig {
+            known_profiles: [profile_id.clone()].into_iter().collect(),
+            profile_topologies: [(
+                profile_id.clone(),
+                ProfileTopology {
+                    routes: BTreeSet::from(["0.0.0.0/0".to_string()]),
+                    ..ProfileTopology::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..config()
+        },
+        clock,
+    );
+    let client = service.client();
+    client
+        .submit(request("project", profile_id.clone(), u64::MAX))
+        .await
+        .expect("connect admitted");
+
+    let started_at = SystemTime::UNIX_EPOCH + Duration::from_secs(80);
+    let mut details = DetailedConnectionInfo {
+        interface: "wg7".to_string(),
+        interface_authoritative: true,
+        endpoint: "198.51.100.7:51820".to_string(),
+        mtu: "1420".to_string(),
+        ..DetailedConnectionInfo::default()
+    };
+    details.health_hint = ConnectionHealth::Healthy;
+    service
+        .observer()
+        .observe(Observation::TunnelDetails {
+            profile_id: profile_id.clone(),
+            details: Box::new(details),
+            started_at: Some(started_at),
+            observed_at_millis: 90,
+        })
+        .await
+        .expect("details accepted");
+    service
+        .observer()
+        .observe(Observation::DefaultRoute {
+            interface_name: Some("wg7".to_string()),
+            observed_at_millis: 90,
+        })
+        .await
+        .expect("route accepted");
+    service
+        .observer()
+        .observe(Observation::Tunnel {
+            profile_id: profile_id.clone(),
+            active: true,
+            interface_name: Some("wg7".to_string()),
+            observed_at_millis: 90,
+            protection: None,
+        })
+        .await
+        .expect("presence accepted");
+
+    let snapshot = client.snapshot();
+    assert_eq!(snapshot.primary.as_ref(), Some(&profile_id));
+    let projected = snapshot
+        .tunnels
+        .get(&profile_id)
+        .expect("canonical projection");
+    assert!(matches!(projected.role, Role::Primary { .. }));
+    assert_eq!(projected.health, ConnectionHealth::Healthy);
+    assert_eq!(projected.started_at, Some(started_at));
+    let Connection::Connected { details, .. } = &projected.state else {
+        panic!("active observed tunnel must project as connected");
+    };
+    assert_eq!(details.interface, "wg7");
+    assert_eq!(details.endpoint, "198.51.100.7:51820");
+    assert_eq!(details.mtu, "1420");
 }

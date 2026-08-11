@@ -97,7 +97,7 @@ pub enum Role {
 }
 
 /// Read-only view of one FSM. UI panels read through these.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TunnelSnapshot {
     pub profile_id: ProfileId,
     pub state: Connection,
@@ -218,6 +218,10 @@ struct CachedRouteInterface {
 
 pub struct TunnelRegistry<T: Tunnel> {
     fsms: HashMap<ProfileId, RegistryEntry<T>>,
+    /// Client-mode cache copied one-way from the canonical control snapshot.
+    /// When present, renderers read this immutable projection and none of the
+    /// local FSM entries participate in lifecycle or role authority.
+    projected: Option<HashMap<ProfileId, TunnelSnapshot>>,
     /// Derived: the `ProfileId` whose interface owns the kernel default route.
     /// Updated by `refresh_primary()`; never set directly.
     primary: Option<ProfileId>,
@@ -248,6 +252,7 @@ impl<T: Tunnel> TunnelRegistry<T> {
     pub fn new() -> Self {
         Self {
             fsms: HashMap::new(),
+            projected: None,
             primary: None,
             killswitch_mode: KillSwitchMode::default(),
             killswitch_state: KillSwitchState::default(),
@@ -266,6 +271,7 @@ impl<T: Tunnel> TunnelRegistry<T> {
     {
         Self {
             fsms: HashMap::new(),
+            projected: None,
             primary: None,
             killswitch_mode: KillSwitchMode::default(),
             killswitch_state: KillSwitchState::default(),
@@ -276,7 +282,9 @@ impl<T: Tunnel> TunnelRegistry<T> {
 
     #[must_use]
     pub fn tunnel_count(&self) -> usize {
-        self.fsms.len()
+        self.projected
+            .as_ref()
+            .map_or_else(|| self.fsms.len(), HashMap::len)
     }
 
     #[must_use]
@@ -327,11 +335,9 @@ impl<T: Tunnel> TunnelRegistry<T> {
 
     /// Bookkeeping API: register or refresh a `Connected` entry directly
     /// from a populated `DetailedConnectionInfo` without driving
-    /// `Tunnel::up`. Used to mirror externally-driven kernel state
-    /// (e.g. a tunnel brought up via the legacy
-    /// `App::connect_profile_inner` spawned-thread path) into the
-    /// registry until a follow-up routes the full connect flow through
-    /// `EngineHandle::Local`.
+    /// `Tunnel::up`. Compatibility and renderer tests use this to seed
+    /// externally owned state; production TUI state arrives through
+    /// [`Self::replace_control_projection`].
     ///
     /// Behavior:
     /// - If an entry already exists for `profile_id`, its FSM is
@@ -390,9 +396,8 @@ impl<T: Tunnel> TunnelRegistry<T> {
     /// the FSM (if present) directly into `Disconnected` without
     /// running `Disconnecting` or calling `Tunnel::down`, then drop
     /// the entry. Idempotent — a missing profile is a no-op. Use
-    /// when the App's legacy disconnect path has already torn down
-    /// the kernel state and we just need the registry's
-    /// snapshot/primary derivation to follow.
+    /// when an external owner has already torn down the kernel state and
+    /// the registry's snapshot/primary derivation only needs to follow.
     pub fn set_disconnected(&mut self, profile_id: &ProfileId) {
         if let Some(entry) = self.fsms.get_mut(profile_id) {
             entry.engine.seed_disconnected_state();
@@ -409,11 +414,9 @@ impl<T: Tunnel> TunnelRegistry<T> {
         }
     }
 
-    /// Bookkeeping API: register a `Connecting` entry — used by
-    /// `App::mirror_connecting_into_registry` when the legacy connect
-    /// path sets `ConnectionState = Connecting{...}` and spawns its
-    /// worker thread. Renderers see the `◐` badge until the connect
-    /// completes and `set_connected` replaces this entry.
+    /// Bookkeeping API: register a `Connecting` entry for compatibility
+    /// and renderer tests. Production TUI state arrives through the
+    /// canonical control projection.
     #[allow(clippy::needless_pass_by_value)] // owned ProfileId stored in the HashMap key
     pub fn set_connecting(
         &mut self,
@@ -519,12 +522,20 @@ impl<T: Tunnel> TunnelRegistry<T> {
 
     #[must_use]
     pub fn snapshot(&self, profile_id: &ProfileId) -> Option<TunnelSnapshot> {
+        if let Some(projected) = &self.projected {
+            return projected.get(profile_id).cloned();
+        }
         let entry = self.fsms.get(profile_id)?;
         Some(self.build_snapshot(profile_id, entry))
     }
 
     #[must_use]
     pub fn snapshot_all(&self) -> Vec<TunnelSnapshot> {
+        if let Some(projected) = &self.projected {
+            let mut out = projected.values().cloned().collect::<Vec<_>>();
+            out.sort_by(|a, b| a.profile_id.as_str().cmp(b.profile_id.as_str()));
+            return out;
+        }
         let mut out: Vec<TunnelSnapshot> = self
             .fsms
             .iter()
@@ -533,6 +544,22 @@ impl<T: Tunnel> TunnelRegistry<T> {
         // Stable order so panel rendering doesn't flicker between frames.
         out.sort_by(|a, b| a.profile_id.as_str().cmp(b.profile_id.as_str()));
         out
+    }
+
+    /// Replace the renderer cache from one immutable canonical publication.
+    /// No FSM is driven and no primary/role is recomputed in the client.
+    pub fn replace_control_projection(
+        &mut self,
+        tunnels: &std::collections::BTreeMap<ProfileId, TunnelSnapshot>,
+        primary: Option<ProfileId>,
+    ) {
+        self.projected = Some(
+            tunnels
+                .iter()
+                .map(|(profile_id, snapshot)| (profile_id.clone(), snapshot.clone()))
+                .collect(),
+        );
+        self.primary = primary;
     }
 
     fn build_snapshot(&self, profile_id: &ProfileId, entry: &RegistryEntry<T>) -> TunnelSnapshot {

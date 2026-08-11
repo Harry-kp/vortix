@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::core::scanner::ActiveSession;
 use crate::state::{Protocol, VpnProfile};
+use crate::vortix_core::cidr::Cidr;
 use crate::vortix_core::control::service::ProfileTopology;
 use crate::vortix_core::control::worker::{
     PolicyBarrier, PolicyExecutionEvidence, PolicyExecutor, PolicyStage, TopologyPolicy,
@@ -35,6 +36,44 @@ const MAX_ENDPOINTS_PER_PROFILE: usize = 256;
 /// one-second budget. Reject unbounded plans before the first query while the
 /// policy deadline remains the tighter runtime bound.
 const MAX_ROUTE_PROBES_PER_BARRIER: usize = 256;
+
+/// Read route declarations for the compatibility conflict prompt.
+/// Canonical admission still consumes the complete [`ProfileTopology`].
+pub(crate) fn declared_routes(protocol: Protocol, config_path: &std::path::Path) -> Vec<Cidr> {
+    let Ok(text) = std::fs::read_to_string(config_path) else {
+        return Vec::new();
+    };
+    match protocol {
+        Protocol::WireGuard => crate::vortix_protocol_wireguard::parser::parse_wg_conf(&text)
+            .map(|parsed| {
+                parsed
+                    .peers
+                    .iter()
+                    .flat_map(|peer| &peer.allowed_ips)
+                    .filter_map(|route| Cidr::new(route.addr, route.prefix_len))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        Protocol::OpenVPN => crate::vortix_protocol_openvpn::parser::parse_ovpn_conf(&text)
+            .map(|parsed| {
+                let mut routes = parsed
+                    .routes
+                    .iter()
+                    .filter_map(|route| {
+                        Cidr::new(route.destination.addr, route.destination.prefix_len)
+                    })
+                    .collect::<Vec<_>>();
+                if parsed.redirect_gateway {
+                    routes.push(
+                        Cidr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0)
+                            .expect("zero prefix is valid"),
+                    );
+                }
+                routes
+            })
+            .unwrap_or_default(),
+    }
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
