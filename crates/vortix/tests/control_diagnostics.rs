@@ -171,16 +171,7 @@ async fn live_diagnostics_follow_and_disk_fallback_remains_advisory() {
         .unwrap()
         .unwrap();
 
-    let unavailable = client::diagnostics_or_fallback(
-        &socket,
-        &fallback_path,
-        fallback
-            .snapshot
-            .generated_at_unix_millis
-            .saturating_add(fallback.snapshot.stale_after_millis)
-            .saturating_add(1),
-    )
-    .unwrap();
+    let unavailable = client::diagnostics_or_fallback(&socket, &fallback_path, u64::MAX).unwrap();
     assert_eq!(
         unavailable.source,
         DiagnosticSource::UnauthenticatedAdvisoryFallback
