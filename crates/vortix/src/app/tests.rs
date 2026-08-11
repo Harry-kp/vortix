@@ -1941,11 +1941,26 @@ fn real_ip_not_cached_when_scanner_has_not_ticked_yet() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn canonical_profile_commands_preserve_identity_and_reject_active_mutation() {
-    use crate::vortix_config::profile_store::{FsProfileStore, ProfileStore};
+    use crate::vortix_config::profile_store::{
+        FsProfileStore, ProfileStore, ProfileStoreError, ProfileSummary,
+    };
     use crate::vortix_core::engine::{
         Connection, ConnectionHealth, DetailedConnectionInfo, Role, TunnelSnapshot,
     };
     use crate::vortix_core::profile::{Profile, ProfileId, ProtocolKind};
+
+    fn list_after_worker_release(store: &FsProfileStore) -> Vec<ProfileSummary> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            match store.list() {
+                Ok(profiles) => return profiles,
+                Err(ProfileStoreError::LockBusy { .. }) if std::time::Instant::now() < deadline => {
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("profile store did not settle after mutation: {error}"),
+            }
+        }
+    }
 
     let config_dir = tempfile::tempdir().unwrap();
     let profiles_dir = config_dir.path().join("profiles");
@@ -2000,7 +2015,10 @@ fn canonical_profile_commands_preserve_identity_and_reject_active_mutation() {
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    assert_eq!(store.resolve_display_name("work").unwrap(), profile_id);
+    let renamed = list_after_worker_release(&store);
+    assert_eq!(renamed.len(), 1);
+    assert_eq!(renamed[0].display_name, "work");
+    assert_eq!(renamed[0].id, profile_id);
     assert_eq!(app.runtime.profiles[0].id, profile_id);
     assert!(app.control_snapshot.generation > initial_generation);
     let rename_generation = app.control_snapshot.generation;
@@ -2044,12 +2062,12 @@ fn canonical_profile_commands_preserve_identity_and_reject_active_mutation() {
     app.confirm_delete(0);
     for _ in 0..200 {
         app.process_external();
-        if app.runtime.profiles.is_empty() && store.list().unwrap().is_empty() {
+        if app.runtime.profiles.is_empty() {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    assert!(store.list().unwrap().is_empty());
+    assert!(list_after_worker_release(&store).is_empty());
     assert!(app.control_snapshot.generation > rename_generation);
     let delete_generation = app.control_snapshot.generation;
     assert_eq!(
@@ -2066,12 +2084,12 @@ fn canonical_profile_commands_preserve_identity_and_reject_active_mutation() {
     app.import_profile_from_path(source.to_str().unwrap());
     for _ in 0..200 {
         app.process_external();
-        if app.runtime.profiles.len() == 1 && store.list().unwrap().len() == 1 {
+        if app.runtime.profiles.len() == 1 {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    let imported = store.list().unwrap();
+    let imported = list_after_worker_release(&store);
     assert_eq!(imported.len(), 1);
     assert_eq!(app.runtime.profiles[0].id, imported[0].id);
     assert!(app.control_snapshot.generation > delete_generation);
