@@ -209,6 +209,21 @@ fn wait_for_group_absence(pid: u32) {
     );
 }
 
+fn wait_for_pid_file(path: &std::path::Path) -> u32 {
+    for _ in 0..40 {
+        if let Ok(pid) = std::fs::read_to_string(path)
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or_default()
+            .parse::<u32>()
+        {
+            return pid;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!("child pid file was not populated: {}", path.display());
+}
+
 struct EnvGuard;
 
 impl Drop for EnvGuard {
@@ -431,17 +446,7 @@ fn real_tunnel_scoped_custodians_handoff_authenticate_and_contain_groups() {
         graceful_timeout_ms: 100,
     };
     let (mut hidden, hidden_stdin, _output, group_pid) = spawn_hidden_until_ready(&request);
-    for _ in 0..40 {
-        if child_pid_path.exists() {
-            break;
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-    let child_pid = std::fs::read_to_string(&child_pid_path)
-        .unwrap()
-        .trim()
-        .parse::<u32>()
-        .unwrap();
+    let child_pid = wait_for_pid_file(&child_pid_path);
     drop(hidden_stdin);
     assert!(!hidden.wait().unwrap().success());
     wait_for_group_absence(group_pid);
