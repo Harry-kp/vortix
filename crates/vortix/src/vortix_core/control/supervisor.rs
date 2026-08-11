@@ -409,9 +409,7 @@ impl Supervisor {
         }
         let truth = match result.result {
             Ok(()) => SupervisedTruth::WaitingForObservation,
-            Err(WorkFailure::OutcomeUnknown | WorkFailure::TimedOut) => {
-                SupervisedTruth::OutcomeUnknown
-            }
+            Err(WorkFailure::OutcomeUnknown) => SupervisedTruth::OutcomeUnknown,
             Err(error) => SupervisedTruth::Degraded(error),
         };
         if let Some(entry) = state.profiles.get_mut(&result.profile_id) {

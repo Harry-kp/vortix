@@ -3127,3 +3127,73 @@ async fn cleaned_handshake_failure_terminalizes_original_before_policy_retry() {
         tokio::task::yield_now().await;
     }
 }
+
+#[tokio::test]
+async fn cleaned_wireguard_connect_timeout_is_a_terminal_handshake_failure() {
+    struct CleanedTimeout;
+    impl TunnelExecutor for CleanedTimeout {
+        fn execute(
+            &self,
+            _: &TunnelWork,
+            _: &CancellationToken,
+        ) -> Result<TunnelExecutionReceipt, String> {
+            Err("bounded WireGuard connect timed out after exact cleanup".into())
+        }
+
+        fn classify_failure(&self, _: &str) -> WorkFailure {
+            WorkFailure::TimedOut
+        }
+    }
+
+    let target = profile("handshake-timeout-terminal");
+    let service = ControlService::start_supervised(
+        ControlServiceConfig {
+            authority_epoch: AuthorityEpoch(1),
+            known_profiles: BTreeSet::from([target.clone()]),
+            profile_topologies: BTreeMap::from([(
+                target.clone(),
+                ProfileTopology {
+                    protocol: Some(vortix::vortix_core::profile::ProtocolKind::WireGuard),
+                    ..ProfileTopology::default()
+                },
+            )]),
+            freshness_poll_interval: Duration::from_millis(5),
+            ..ControlServiceConfig::default()
+        },
+        Arc::new(TestClock::default()),
+        ExecutionSelection::CanonicalAuthority,
+        Arc::new(Supervisor::new(
+            AuthorityEpoch(1),
+            Arc::new(CleanedTimeout),
+            Arc::new(OkPolicy),
+            2,
+            4,
+        )),
+    );
+    let admitted = service
+        .client()
+        .submit(CommandRequest {
+            command: UserCommand::Connect { profile_id: target },
+            idempotency_key: IdempotencyKey::new("handshake-timeout-terminal"),
+            deadline: Deadline(1_000),
+        })
+        .await
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        let snapshot = service.client().snapshot();
+        let operation = &snapshot.operations[&admitted.operation_id];
+        if operation.status.is_terminal() {
+            assert_eq!(
+                operation.result,
+                Some(vortix::vortix_core::control::OperationResult::Failed(
+                    vortix::vortix_core::control::OperationFailure::HandshakeFailed
+                ))
+            );
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::task::yield_now().await;
+    }
+}
