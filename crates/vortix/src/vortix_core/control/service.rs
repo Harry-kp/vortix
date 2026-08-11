@@ -1635,6 +1635,7 @@ struct OwnerState {
     lifecycle_operations: BTreeMap<OperationId, LifecycleOperation>,
     topology_transaction: Option<TopologyTransaction>,
     next_lifecycle_event: u64,
+    diagnostics: crate::vortix_core::control::DiagnosticBuffer,
 }
 
 impl OwnerState {
@@ -2013,6 +2014,7 @@ async fn run_service(
         lifecycle_operations: BTreeMap::new(),
         topology_transaction: None,
         next_lifecycle_event: 0,
+        diagnostics: crate::vortix_core::control::DiagnosticBuffer::default(),
     };
     let mut ticker = tokio::time::interval(initial_config.freshness_poll_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2087,7 +2089,7 @@ async fn run_service(
                     send_durability_reply(deferred, persisted);
                 }
                 if snapshot != before || !pending.is_empty() {
-                    publish_then_events(&mut snapshot, &snapshot_tx, &events, pending);
+                    publish_then_events(&mut snapshot, &mut owner, &snapshot_tx, &events, pending, now);
                 }
             }
             _ = ticker.tick() => {
@@ -2109,7 +2111,7 @@ async fn run_service(
                 };
                 runtime.advance(&before, &mut snapshot, &mut durable, &mut owner, now, &mut pending).await;
                 if snapshot != before || !pending.is_empty() {
-                    publish_then_events(&mut snapshot, &snapshot_tx, &events, pending);
+                    publish_then_events(&mut snapshot, &mut owner, &snapshot_tx, &events, pending, now);
                 }
             }
         }
@@ -5934,10 +5936,16 @@ fn derive_effective_kill_switch(
 
 fn publish_then_events(
     snapshot: &mut ControlSnapshot,
+    owner: &mut OwnerState,
     sender: &watch::Sender<ControlSnapshot>,
     events: &broadcast::Sender<ControlEventEnvelope>,
     pending: Vec<ControlEvent>,
+    now_millis: u64,
 ) {
+    for event in &pending {
+        owner.diagnostics.push_control_event(now_millis, event);
+    }
+    snapshot.diagnostics = owner.diagnostics.view(now_millis);
     snapshot.generation = snapshot.generation.saturating_add(1);
     sender.send_replace(snapshot.clone());
     for event in pending {

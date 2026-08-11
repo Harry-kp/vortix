@@ -9,6 +9,7 @@ use crate::vortix_core::control::model::{
     ChallengeId, ChallengeRecord, DesiredState, EffectiveState, ObservedState, OperationId,
     OperationRecord,
 };
+use crate::vortix_core::control::ControlDiagnosticView;
 use crate::vortix_core::engine::registry::{Conflict, TunnelSnapshot};
 use crate::vortix_core::engine::state::Connection;
 use crate::vortix_core::profile::ProfileId;
@@ -53,6 +54,10 @@ pub struct ControlSnapshot {
     pub profile_routes: BTreeMap<ProfileId, Vec<Cidr>>,
     pub operations: BTreeMap<OperationId, OperationRecord>,
     pub challenges: BTreeMap<ChallengeId, ChallengeRecord>,
+    /// Redacted, bounded troubleshooting evidence. It is never an authority,
+    /// protection, enrollment, or cleanup input.
+    #[serde(default)]
+    pub diagnostics: ControlDiagnosticView,
 }
 
 impl ControlSnapshot {

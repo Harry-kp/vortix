@@ -20,6 +20,21 @@ pub trait PassiveQueryProvider: Send + Sync + 'static {
     fn subscribe(&self) -> broadcast::Receiver<PassiveSnapshot>;
 }
 
+pub(crate) trait PassiveDiagnosticSink: Send + Sync + 'static {
+    fn observer_ready(&self, active_tunnels: u32);
+    fn observation_changed(&self, active_tunnels: u32);
+}
+
+impl PassiveDiagnosticSink for super::diagnostics::DiagnosticHub {
+    fn observer_ready(&self, active_tunnels: u32) {
+        self.mark_passive_observer_ready(active_tunnels);
+    }
+
+    fn observation_changed(&self, active_tunnels: u32) {
+        self.record_passive_observation(active_tunnels);
+    }
+}
+
 /// Periodically scans already-known profiles. It owns no desired state,
 /// authority lock, persistence store, retry loop, or mutation capability.
 pub struct ScannerQueryProvider {
@@ -36,13 +51,25 @@ impl ScannerQueryProvider {
     ///
     /// Returns an OS error when the observer thread cannot be created.
     pub fn start(profiles: Vec<VpnProfile>, interval: Duration) -> std::io::Result<Self> {
+        Self::start_with_diagnostics(profiles, interval, None)
+    }
+
+    pub(crate) fn start_with_diagnostics(
+        profiles: Vec<VpnProfile>,
+        interval: Duration,
+        diagnostics: Option<Arc<dyn PassiveDiagnosticSink>>,
+    ) -> std::io::Result<Self> {
         let initial = scan(&profiles, 1);
+        if let Some(diagnostics) = &diagnostics {
+            diagnostics.observer_ready(initial.tunnels.len().try_into().unwrap_or(u32::MAX));
+        }
         let snapshot = Arc::new(Mutex::new(initial));
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
         let stopping = Arc::new(AtomicBool::new(false));
         let worker_snapshot = Arc::clone(&snapshot);
         let worker_events = events.clone();
         let worker_stopping = Arc::clone(&stopping);
+        let worker_diagnostics = diagnostics;
         let interval = interval.max(Duration::from_millis(100));
         let worker = std::thread::Builder::new()
             .name("vortix-passive-observer".into())
@@ -65,6 +92,11 @@ impl ScannerQueryProvider {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner) = next.clone();
                     if changed {
+                        if let Some(diagnostics) = &worker_diagnostics {
+                            diagnostics.observation_changed(
+                                next.tunnels.len().try_into().unwrap_or(u32::MAX),
+                            );
+                        }
                         let _ = worker_events.send(next);
                     }
                 }
@@ -171,6 +203,7 @@ pub fn legacy_connection(snapshot: &PassiveSnapshot) -> Connection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vortix_core::control::DiagnosticCode;
     use crate::vortix_core::profile::ProfileId;
 
     #[test]
@@ -210,5 +243,27 @@ mod tests {
             panic!("expected connected projection");
         };
         assert!(!details.interface_authoritative);
+    }
+
+    #[test]
+    fn production_observer_startup_feeds_the_served_diagnostic_hub() {
+        let diagnostics = Arc::new(super::super::diagnostics::DiagnosticHub::start(None).unwrap());
+        let sink: Arc<dyn PassiveDiagnosticSink> = diagnostics.clone();
+        let provider = ScannerQueryProvider::start_with_diagnostics(
+            Vec::new(),
+            Duration::from_secs(60),
+            Some(sink),
+        )
+        .unwrap();
+
+        let snapshot =
+            super::super::diagnostics::DiagnosticQueryProvider::snapshot(diagnostics.as_ref());
+        assert!(snapshot.status.reconciliation_complete);
+        assert!(!snapshot.status.authority_verified);
+        assert!(snapshot
+            .records
+            .iter()
+            .any(|record| record.code == DiagnosticCode::PassiveObservationChanged));
+        drop(provider);
     }
 }
