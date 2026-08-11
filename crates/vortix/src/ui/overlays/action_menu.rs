@@ -24,7 +24,7 @@ pub fn render(
     let max_label_len = items.iter().map(|i| i.label.len()).max().unwrap_or(20);
     let max_key_len = items.iter().map(|i| i.key.len()).max().unwrap_or(1);
     let menu_width = (max_key_len + max_label_len + 8).min(60) as u16; // key + padding + label
-    let menu_height = (items.len().max(1) + 2).min(15) as u16; // items + borders
+    let menu_height = (items.len().max(1) + 2).min(18) as u16; // items + borders
 
     let area = centered_rect_fixed(menu_width, menu_height, frame.area());
 

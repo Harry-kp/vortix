@@ -45,6 +45,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     let tunnel_count = app.registry.tunnel_count();
     let primary = app.registry.primary().cloned();
     let primary_snap = primary.as_ref().and_then(|id| app.registry.snapshot(id));
+    let mode_label = mode_signal(app, area.width);
 
     let ks_indicator = get_killswitch_indicator(app);
 
@@ -55,7 +56,10 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     // uses the `⚠ Real:` form because saying DISCONNECTED there
     // would be a lie (tunnels ARE up, just split-route only).
     if tunnel_count == 0 {
-        let line = render_disconnected_line(app, ks_indicator.clone());
+        let line = with_mode_signal(
+            mode_label,
+            render_disconnected_line(app, ks_indicator.clone()),
+        );
         frame.render_widget(Paragraph::new(line), area);
         return;
     }
@@ -68,6 +72,8 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     // strip still appends so the user sees what's connected.
     let Some(primary_snap) = primary_snap else {
         let snapshots = app.registry.snapshot_all();
+        let content_width = mode_content_width(mode_label, area.width)
+            .saturating_sub(u16::from(snapshots.len() >= 2) * 8);
         if let Some(transitional) = snapshots.iter().find(|snapshot| {
             matches!(
                 snapshot.state,
@@ -77,7 +83,10 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
                     | Connection::AwaitingUserInput { .. }
             )
         }) {
-            let mut line = render_primary_line(app, transitional, ks_indicator.clone(), area.width);
+            let mut line = with_mode_signal(
+                mode_label,
+                render_primary_line(app, transitional, ks_indicator.clone(), content_width),
+            );
             if snapshots.len() >= 2 {
                 line =
                     append_tunnels_strip(Some(app), line, &snapshots, primary.as_ref(), area.width);
@@ -85,7 +94,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
             frame.render_widget(Paragraph::new(line), area);
             return;
         }
-        let mut line = render_no_exit_line(app, ks_indicator.clone());
+        let mut line = with_mode_signal(mode_label, render_no_exit_line(app, ks_indicator.clone()));
         line = append_tunnels_strip(Some(app), line, &snapshots, primary.as_ref(), area.width);
         frame.render_widget(Paragraph::new(line), area);
         return;
@@ -93,7 +102,12 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
 
     // ── Primary present: today's single-tunnel rendering, optionally with
     // the tunnels strip when N >= 2.
-    let mut line = render_primary_line(app, &primary_snap, ks_indicator, area.width);
+    let content_width =
+        mode_content_width(mode_label, area.width).saturating_sub(u16::from(tunnel_count >= 2) * 8);
+    let mut line = with_mode_signal(
+        mode_label,
+        render_primary_line(app, &primary_snap, ks_indicator, content_width),
+    );
 
     if tunnel_count >= 2 {
         let snapshots = app.registry.snapshot_all();
@@ -101,6 +115,39 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     frame.render_widget(Paragraph::new(line), area);
+}
+
+fn mode_signal(app: &App, width: u16) -> &'static str {
+    if width >= 70 {
+        app.background_mode.state.header_signal()
+    } else {
+        match app.background_mode.state {
+            crate::background::BackgroundModeState::StandardActive => "S·",
+            crate::background::BackgroundModeState::BackgroundActive => "B●",
+            crate::background::BackgroundModeState::BackgroundEnabling
+            | crate::background::BackgroundModeState::BackgroundDisabling => "B…",
+            crate::background::BackgroundModeState::BackgroundDegraded
+            | crate::background::BackgroundModeState::BackgroundRecoveryRequired => "B!",
+        }
+    }
+}
+
+fn mode_content_width(label: &str, width: u16) -> u16 {
+    let prefix_width = label.width() + " │ ".width();
+    width.saturating_sub(u16::try_from(prefix_width).unwrap_or(u16::MAX))
+}
+
+fn with_mode_signal(label: &'static str, mut line: Line<'static>) -> Line<'static> {
+    line.spans.insert(
+        0,
+        Span::styled(
+            format!("{label} │ "),
+            Style::default()
+                .fg(theme::ACCENT_PRIMARY)
+                .add_modifier(Modifier::BOLD),
+        ),
+    );
+    line
 }
 
 /// Build the `○ NO EXIT │ Real: <public_ip>` header used when ≥1
@@ -230,6 +277,12 @@ fn render_primary_line(
         ]),
         Connection::Connected { details, since, .. } => {
             let profile_name = profile_display_name(app, &primary_snap.profile_id);
+            let compact = area_width < 70;
+            let profile_name = if compact {
+                utils::truncate(&profile_name, 10)
+            } else {
+                profile_name
+            };
 
             let elapsed = since.elapsed().map_or(0, |d| d.as_secs());
             let uptime = if elapsed >= 86400 {
@@ -298,7 +351,8 @@ fn render_primary_line(
                 ),
             ];
 
-            if !app.runtime.location.is_empty()
+            if !compact
+                && !app.runtime.location.is_empty()
                 && app.runtime.location != "Unknown"
                 && app.runtime.location != constants::MSG_DETECTING
             {
@@ -313,7 +367,7 @@ fn render_primary_line(
                 ));
             }
 
-            if !details.interface.is_empty() {
+            if !compact && !details.interface.is_empty() {
                 header_spans.push(Span::styled(
                     format!(" [{}]", details.interface),
                     Style::default().fg(theme::TEXT_SECONDARY),
@@ -323,11 +377,17 @@ fn render_primary_line(
             header_spans.extend_from_slice(&[
                 Span::styled(" │ ", Style::default().fg(theme::NORD_POLAR_NIGHT_4)),
                 Span::styled(uptime, Style::default().fg(theme::ACCENT_SECONDARY)),
-                Span::styled(" │ ", Style::default().fg(theme::NORD_POLAR_NIGHT_4)),
-                Span::styled(
-                    quality_indicator.0,
-                    Style::default().fg(quality_indicator.1),
-                ),
+            ]);
+            if !compact {
+                header_spans.extend_from_slice(&[
+                    Span::styled(" │ ", Style::default().fg(theme::NORD_POLAR_NIGHT_4)),
+                    Span::styled(
+                        quality_indicator.0,
+                        Style::default().fg(quality_indicator.1),
+                    ),
+                ]);
+            }
+            header_spans.extend_from_slice(&[
                 Span::styled(" │", Style::default().fg(theme::NORD_POLAR_NIGHT_4)),
                 ks_indicator,
             ]);
@@ -770,6 +830,35 @@ mod tests {
         let ovpn = render_to_string(&app_handshaking(crate::state::Protocol::OpenVPN), 80, 1);
         assert!(ovpn.contains("CONNECTING"), "{ovpn}");
         assert!(!ovpn.contains("HANDSHAKING"), "{ovpn}");
+    }
+
+    #[test]
+    fn background_mode_signal_is_visible_at_80_columns() {
+        let app = App::new_test();
+        let out = render_to_string(&app, 80, 1);
+        assert!(out.contains("S· Standard"), "{out}");
+        assert!(out.contains("DISCONNECTED"), "{out}");
+    }
+
+    #[test]
+    fn background_signal_reserves_multi_tunnel_strip_budget() {
+        let mut app = App::new_test();
+        let tunnels = (0..6)
+            .map(|index| {
+                let snapshot = connected(&format!("tunnel-{index}"));
+                (snapshot.profile_id.clone(), snapshot)
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let primary = ProfileId::new("tunnel-0");
+        app.registry
+            .replace_control_projection(&tunnels, Some(primary));
+
+        let out = render_to_string(&app, 80, 1);
+        assert!(out.contains("S· Standard"), "{out}");
+        assert!(
+            out.contains("[●"),
+            "tunnel strip must remain visible: {out}"
+        );
     }
 
     #[test]

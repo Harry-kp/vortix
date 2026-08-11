@@ -14,6 +14,7 @@ use crate::vortix_core::control::worker::{
     PolicyBarrier, PolicyExecutionEvidence, PolicyExecutor, PolicyStage, TopologyPolicy,
     TopologyState,
 };
+use crate::vortix_core::control::BootEligibility;
 use crate::vortix_core::control::PolicyDigest;
 use crate::vortix_core::ports::dns::{
     DnsEffectiveStatus, DnsPolicyCoordinator, DnsTunnelIntent, DnsTunnelRole,
@@ -215,6 +216,48 @@ pub fn topology_for_profile(
     profile: &VpnProfile,
     cache: &mut EndpointResolutionCache,
 ) -> Result<ProfileTopology, String> {
+    let body = read_bounded_profile(profile)?;
+    build_topology_for_profile(profile, &body, cache)
+}
+
+/// Determine whether a profile is eligible for pre-login boot connection
+/// using the same bounded read and reviewed protocol parsers as canonical
+/// admission. This deliberately performs no DNS resolution, cache update, or
+/// policy construction. Credential mechanisms not represented by the
+/// reviewed parser fail with the parser rather than being guessed here.
+pub fn boot_eligibility_for_profile(profile: &VpnProfile) -> Result<BootEligibility, String> {
+    let body = read_bounded_profile(profile)?;
+    match profile.protocol {
+        Protocol::WireGuard => {
+            crate::vortix_protocol_wireguard::parser::parse_wg_conf(&body)
+                .map_err(|error| error.to_string())?;
+            Ok(BootEligibility::Eligible)
+        }
+        Protocol::OpenVPN => {
+            let parsed = crate::vortix_protocol_openvpn::parser::parse_ovpn_conf(&body)
+                .map_err(|error| error.to_string())?;
+            Ok(openvpn_boot_eligibility(&parsed))
+        }
+    }
+}
+
+fn openvpn_boot_eligibility(
+    parsed: &crate::vortix_protocol_openvpn::parser::OvpnParsedProfile,
+) -> BootEligibility {
+    match parsed.boot_credentials {
+        crate::vortix_protocol_openvpn::parser::BootCredentialRequirement::NonInteractive => {
+            BootEligibility::Eligible
+        }
+        crate::vortix_protocol_openvpn::parser::BootCredentialRequirement::Interactive => {
+            BootEligibility::InteractiveCredentials
+        }
+        crate::vortix_protocol_openvpn::parser::BootCredentialRequirement::UnsupportedKeyProvider => {
+            BootEligibility::UnsupportedKeyProvider
+        }
+    }
+}
+
+fn read_bounded_profile(profile: &VpnProfile) -> Result<String, String> {
     let file = std::fs::File::open(&profile.config_path)
         .map_err(|error| format!("open profile: {error}"))?;
     let metadata = file
@@ -230,13 +273,21 @@ pub fn topology_for_profile(
     if body.len() as u64 > MAX_PROFILE_BYTES {
         return Err("profile is not a bounded regular file".into());
     }
+    Ok(body)
+}
+
+fn build_topology_for_profile(
+    profile: &VpnProfile,
+    body: &str,
+    cache: &mut EndpointResolutionCache,
+) -> Result<ProfileTopology, String> {
     let mut routes = BTreeSet::new();
     let mut server_ips = BTreeSet::new();
     let profile_digest = PolicyDigest::sha256(body.as_bytes()).0;
     let mut endpoint_resolutions = Vec::new();
     let (protocol, interface_name, dns_request, interactive_credentials) = match profile.protocol {
         Protocol::WireGuard => {
-            let parsed = crate::vortix_protocol_wireguard::parser::parse_wg_conf(&body)
+            let parsed = crate::vortix_protocol_wireguard::parser::parse_wg_conf(body)
                 .map_err(|error| error.to_string())?;
             for peer in &parsed.peers {
                 routes.extend(
@@ -267,7 +318,7 @@ pub fn topology_for_profile(
             )
         }
         Protocol::OpenVPN => {
-            let parsed = crate::vortix_protocol_openvpn::parser::parse_ovpn_conf(&body)
+            let parsed = crate::vortix_protocol_openvpn::parser::parse_ovpn_conf(body)
                 .map_err(|error| error.to_string())?;
             if parsed.redirect_gateway {
                 routes.insert("0.0.0.0/0".into());
@@ -293,7 +344,7 @@ pub fn topology_for_profile(
                 crate::vortix_core::profile::ProtocolKind::OpenVpn,
                 None,
                 parsed.dns_request(),
-                parsed.static_challenge.is_some(),
+                openvpn_boot_eligibility(&parsed) == BootEligibility::InteractiveCredentials,
             )
         }
     };
@@ -1054,6 +1105,76 @@ mod tests {
             topology_for_profile(&profile, &mut EndpointResolutionCache::default()).unwrap();
 
         assert!(topology.interactive_credentials);
+    }
+
+    #[test]
+    fn username_password_profile_is_explicitly_interactive() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("corp.ovpn");
+        std::fs::write(&path, "client\nremote 203.0.113.7 1194\nauth-user-pass\n").unwrap();
+        let profile = VpnProfile {
+            id: ProfileId::new("corp"),
+            name: "Corporate".into(),
+            protocol: Protocol::OpenVPN,
+            location: String::new(),
+            config_path: path,
+            last_used: None,
+        };
+
+        let topology =
+            topology_for_profile(&profile, &mut EndpointResolutionCache::default()).unwrap();
+
+        assert!(topology.interactive_credentials);
+        assert_eq!(
+            boot_eligibility_for_profile(&profile).unwrap(),
+            BootEligibility::InteractiveCredentials
+        );
+    }
+
+    #[test]
+    fn boot_eligibility_does_not_resolve_or_update_endpoint_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("corp.ovpn");
+        std::fs::write(&path, "client\nremote definitely.invalid.example 1194\n").unwrap();
+        let profile = VpnProfile {
+            id: ProfileId::new("corp"),
+            name: "Corporate".into(),
+            protocol: Protocol::OpenVPN,
+            location: String::new(),
+            config_path: path,
+            last_used: None,
+        };
+
+        assert_eq!(
+            boot_eligibility_for_profile(&profile).unwrap(),
+            BootEligibility::Eligible
+        );
+    }
+
+    #[test]
+    fn boot_eligibility_rejects_file_backed_passwords_and_key_providers() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("corp.ovpn");
+        let profile = VpnProfile {
+            id: ProfileId::new("corp"),
+            name: "Corporate".into(),
+            protocol: Protocol::OpenVPN,
+            location: String::new(),
+            config_path: path.clone(),
+            last_used: None,
+        };
+
+        std::fs::write(&path, "client\nauth-user-pass credentials.txt\n").unwrap();
+        assert_eq!(
+            boot_eligibility_for_profile(&profile).unwrap(),
+            BootEligibility::InteractiveCredentials
+        );
+
+        std::fs::write(&path, "client\npkcs11-id token\n").unwrap();
+        assert_eq!(
+            boot_eligibility_for_profile(&profile).unwrap(),
+            BootEligibility::UnsupportedKeyProvider
+        );
     }
 
     #[test]

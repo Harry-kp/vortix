@@ -11,10 +11,12 @@ use std::time::Duration;
 use serde::Serialize;
 use zeroize::Zeroize;
 
-use crate::cli::args::Commands;
+use crate::cli::args::{BackgroundCommands, Commands};
 use crate::cli::output::{
-    err_not_found, err_permission_denied, print_error_and_exit, print_success, CliError,
-    ConnectionEntry, ConnectionHealthEntry, ExitCode, OutputMode,
+    err_not_found, err_permission_denied, print_background_diagnostics,
+    print_background_unavailable, print_background_view, print_error_and_exit,
+    print_stream_error_and_exit, print_success, CliError, ConnectionEntry, ConnectionHealthEntry,
+    ExitCode, OutputMode,
 };
 use crate::config::AppConfig;
 use crate::constants;
@@ -132,6 +134,10 @@ pub fn handle_command(
     mode: OutputMode,
 ) -> i32 {
     match command {
+        Commands::Setup { boot, yes } => handle_background_setup(boot, *yes, config_dir, mode),
+        Commands::Background { command } => {
+            handle_background(command, config_dir, &settings.diagnostics, mode)
+        }
         Commands::Up {
             profile,
             timeout,
@@ -204,6 +210,306 @@ pub fn handle_command(
             handle_completions(*shell);
             0
         }
+    }
+}
+
+fn handle_background_setup(
+    boot_profiles: &[String],
+    confirmed: bool,
+    config_dir: &Path,
+    mode: OutputMode,
+) -> i32 {
+    let profiles = (!boot_profiles.is_empty()).then(|| {
+        load_setup_profiles(config_dir).unwrap_or_else(|error| {
+            print_error_and_exit(
+                mode,
+                "setup",
+                CliError {
+                    code: "profile_catalog_unavailable",
+                    message: format!("Cannot inspect the authenticated profile catalog: {error}"),
+                    hint: Some(
+                        "Repair the profile catalog or wait for the other Vortix process, then retry; no boot intent was saved."
+                            .into(),
+                    ),
+                },
+                ExitCode::GeneralError,
+            )
+        })
+    });
+    for requested in boot_profiles {
+        let profile = profiles
+            .as_ref()
+            .and_then(|profiles| profiles.get(requested))
+            .unwrap_or_else(|| {
+                print_error_and_exit(mode, "setup", err_not_found(requested), ExitCode::NotFound)
+            });
+        require_boot_eligible(profile, mode);
+    }
+
+    let mut preview = vec![
+        "Runs persistent Vortix processes for live CLI/TUI sync, automatic drop recovery, boot connections, and continuous policy verification.".into(),
+        "Uses a narrower privileged helper after one trusted package bootstrap; Standard mode keeps its existing root-assisted client boundary.".into(),
+    ];
+    if !boot_profiles.is_empty() {
+        preview.push(format!(
+            "Boot-eligible profiles checked (intent not persisted): {}",
+            boot_profiles.join(", ")
+        ));
+    }
+    if confirmed {
+        return print_background_unavailable(mode, "setup").code();
+    }
+    preview.push(
+        crate::background::BackgroundWorkflow::Setup
+            .cancelled_preview()
+            .into(),
+    );
+    print_background_view(
+        mode,
+        "setup",
+        &crate::background::BackgroundCommandView::prepared(preview),
+    );
+    0
+}
+
+fn require_boot_eligible(profile: &crate::state::VpnProfile, mode: OutputMode) {
+    let eligibility =
+        crate::topology_policy::boot_eligibility_for_profile(profile).unwrap_or_else(|error| {
+            print_error_and_exit(
+                mode,
+                "setup",
+                CliError {
+                    code: "boot_profile_unsupported",
+                    message: format!("Cannot inspect boot profile '{}': {error}", profile.name),
+                    hint: Some(
+                        "Repair or replace the profile, then retry setup; no boot intent was saved."
+                            .into(),
+                    ),
+                },
+                ExitCode::GeneralError,
+            )
+        });
+    let (code, message, hint) = match eligibility {
+        crate::vortix_core::control::BootEligibility::Eligible => return,
+        crate::vortix_core::control::BootEligibility::InteractiveCredentials => (
+            "boot_profile_interactive",
+            format!(
+                "Profile '{}' requires an interactive password, OTP, challenge, or key prompt and cannot connect at boot",
+                profile.name
+            ),
+            "Leave it out of --boot and connect it after login; no credential or boot intent was saved.",
+        ),
+        crate::vortix_core::control::BootEligibility::UnsupportedKeyProvider => (
+            "boot_profile_unsupported",
+            format!(
+                "Profile '{}' uses external or unsupported key material that is not eligible for unattended boot",
+                profile.name
+            ),
+            "Connect it after login or use a reviewed unencrypted inline key profile.",
+        ),
+    };
+    print_error_and_exit(
+        mode,
+        "setup",
+        CliError {
+            code,
+            message,
+            hint: Some(hint.into()),
+        },
+        ExitCode::StateConflict,
+    );
+}
+
+fn load_setup_profiles(
+    config_dir: &Path,
+) -> Result<
+    std::collections::BTreeMap<String, crate::state::VpnProfile>,
+    crate::vortix_config::profile_store::ProfileStoreError,
+> {
+    let profiles_dir = config_dir.join(constants::PROFILES_DIR_NAME);
+    let store = FsProfileStore::new(profiles_dir.clone());
+    store.list().map(|summaries| {
+        summaries
+            .into_iter()
+            .map(|summary| {
+                let protocol = match summary.protocol {
+                    crate::vortix_core::profile::ProtocolKind::WireGuard => {
+                        crate::state::Protocol::WireGuard
+                    }
+                    crate::vortix_core::profile::ProtocolKind::OpenVpn => {
+                        crate::state::Protocol::OpenVPN
+                    }
+                };
+                let profile = crate::state::VpnProfile {
+                    id: summary.id,
+                    name: summary.display_name.clone(),
+                    protocol,
+                    location: "Unknown".into(),
+                    config_path: profiles_dir.join(summary.config_file),
+                    last_used: summary.last_used,
+                };
+                (summary.display_name, profile)
+            })
+            .collect()
+    })
+}
+
+fn handle_background(
+    command: &BackgroundCommands,
+    config_dir: &Path,
+    settings: &crate::vortix_config::DiagnosticsSettings,
+    mode: OutputMode,
+) -> i32 {
+    match command {
+        BackgroundCommands::Status => {
+            print_background_view(
+                mode,
+                "background status",
+                &crate::background::BackgroundCommandView::prepared(vec![
+                    crate::background::BackgroundWorkflow::Status
+                        .cancelled_preview()
+                        .into(),
+                ]),
+            );
+            0
+        }
+        BackgroundCommands::Recover { yes } => {
+            if *yes {
+                return print_background_unavailable(mode, "background recover").code();
+            }
+            print_background_view(
+                mode,
+                "background recover",
+                &crate::background::BackgroundCommandView::prepared(vec![
+                    crate::background::BackgroundWorkflow::Recover
+                        .cancelled_preview()
+                        .into(),
+                ]),
+            );
+            0
+        }
+        BackgroundCommands::Disable { yes } => {
+            if *yes {
+                return print_background_unavailable(mode, "background disable").code();
+            }
+            print_background_view(
+                mode,
+                "background disable",
+                &crate::background::BackgroundCommandView::prepared(vec![
+                    crate::background::BackgroundWorkflow::Disable
+                        .cancelled_preview()
+                        .into(),
+                ]),
+            );
+            0
+        }
+        BackgroundCommands::Diagnostics { follow } => {
+            handle_background_diagnostics(*follow, config_dir, settings, mode)
+        }
+    }
+}
+
+fn handle_background_diagnostics(
+    follow: bool,
+    config_dir: &Path,
+    settings: &crate::vortix_config::DiagnosticsSettings,
+    mode: OutputMode,
+) -> i32 {
+    let socket = crate::daemon::daemon_socket_path_override()
+        .unwrap_or_else(crate::daemon::default_socket_path);
+    if follow {
+        let mut subscription = crate::daemon::client::subscribe_diagnostics(&socket)
+            .unwrap_or_else(|error| background_diagnostics_error(mode, &error, true));
+        let mut last_sequence = newest_diagnostic_sequence(subscription.initial()).unwrap_or(0);
+        print_background_diagnostics(mode, subscription.initial(), true);
+        loop {
+            let view = match subscription.recv() {
+                Ok(view) => view,
+                Err(crate::daemon::client::ClientError::ResyncRequired { .. }) => {
+                    subscription = reconnect_diagnostics(&socket)
+                        .unwrap_or_else(|error| background_diagnostics_error(mode, &error, true));
+                    subscription.initial().clone()
+                }
+                Err(error) => background_diagnostics_error(mode, &error, true),
+            };
+            if let Some(delta) = diagnostic_delta(view, &mut last_sequence) {
+                print_background_diagnostics(mode, &delta, true);
+            }
+        }
+    }
+
+    let fallback = config_dir.join("control").join("diagnostics.json");
+    let view = crate::background::load_diagnostics(
+        &socket,
+        &fallback,
+        settings.fallback_snapshot,
+        crate::daemon::diagnostics::unix_millis(),
+    )
+    .unwrap_or_else(|error| background_diagnostics_error(mode, &error, false));
+    print_background_diagnostics(mode, &view, false);
+    0
+}
+
+fn reconnect_diagnostics(
+    socket: &Path,
+) -> Result<crate::daemon::client::DiagnosticSubscription, crate::daemon::client::ClientError> {
+    let mut last_error = None;
+    for attempt in 0..3 {
+        match crate::daemon::client::subscribe_diagnostics(socket) {
+            Ok(subscription) => return Ok(subscription),
+            Err(error) => last_error = Some(error),
+        }
+        std::thread::sleep(Duration::from_millis(50_u64 << attempt));
+    }
+    Err(last_error.expect("bounded reconnect always attempts at least once"))
+}
+
+fn newest_diagnostic_sequence(view: &crate::vortix_core::control::DiagnosticView) -> Option<u64> {
+    view.snapshot.records.last().map(|record| record.sequence)
+}
+
+fn diagnostic_delta(
+    mut view: crate::vortix_core::control::DiagnosticView,
+    last_sequence: &mut u64,
+) -> Option<crate::vortix_core::control::DiagnosticView> {
+    let newest = newest_diagnostic_sequence(&view)?;
+    if newest < *last_sequence {
+        *last_sequence = 0;
+    }
+    view.snapshot
+        .records
+        .retain(|record| record.sequence > *last_sequence);
+    *last_sequence = newest;
+    (!view.snapshot.records.is_empty()).then_some(view)
+}
+
+fn background_diagnostics_error(
+    mode: OutputMode,
+    error: &crate::daemon::client::ClientError,
+    stream: bool,
+) -> ! {
+    let cli_error = CliError {
+        code: "diagnostics_unavailable",
+        message: format!("Background diagnostics are unavailable: {error}"),
+        hint: Some(
+            "Run `vortix background status`; fallback diagnostics exist only after the passive service has published one."
+                .into(),
+        ),
+    };
+    if stream {
+        print_stream_error_and_exit(
+            mode,
+            "background diagnostics",
+            cli_error,
+            ExitCode::GeneralError,
+        )
+    } else {
+        print_error_and_exit(
+            mode,
+            "background diagnostics",
+            cli_error,
+            ExitCode::GeneralError,
+        )
     }
 }
 
@@ -3220,5 +3526,76 @@ mod tests {
         assert_eq!(format_elapsed(120), "2 min ago");
         assert_eq!(format_elapsed(7200), "2 hours ago");
         assert_eq!(format_elapsed(172_800), "2 days ago");
+    }
+
+    #[test]
+    fn diagnostic_follow_emits_only_new_records_and_resets_after_restart() {
+        use crate::vortix_core::control::diagnostics::DIAGNOSTIC_SCHEMA_VERSION;
+        use crate::vortix_core::control::{
+            DiagnosticCode, DiagnosticComponent, DiagnosticFields, DiagnosticRecord,
+            DiagnosticSeverity, DiagnosticSnapshot, DiagnosticSource, DiagnosticStatus,
+            DiagnosticView,
+        };
+
+        let view = |sequences: &[u64]| DiagnosticView {
+            source: DiagnosticSource::AuthenticatedLive,
+            stale: false,
+            age_millis: 0,
+            snapshot: DiagnosticSnapshot {
+                schema_version: DIAGNOSTIC_SCHEMA_VERSION,
+                generation: *sequences.last().unwrap_or(&0),
+                generated_at_unix_millis: 1,
+                stale_after_millis: 30_000,
+                product_version: "test".into(),
+                status: DiagnosticStatus::default(),
+                records: sequences
+                    .iter()
+                    .map(|sequence| DiagnosticRecord {
+                        sequence: *sequence,
+                        age_millis: 0,
+                        component: DiagnosticComponent::Daemon,
+                        severity: DiagnosticSeverity::Info,
+                        code: DiagnosticCode::DaemonStarted,
+                        fields: DiagnosticFields::None,
+                    })
+                    .collect(),
+            },
+        };
+
+        let mut last = 2;
+        let delta = diagnostic_delta(view(&[1, 2, 3, 4]), &mut last).unwrap();
+        assert_eq!(
+            delta
+                .snapshot
+                .records
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+        assert_eq!(last, 4);
+        assert!(diagnostic_delta(view(&[1, 2, 3, 4]), &mut last).is_none());
+
+        let restarted = diagnostic_delta(view(&[1]), &mut last).unwrap();
+        assert_eq!(restarted.snapshot.records[0].sequence, 1);
+        assert_eq!(last, 1);
+    }
+
+    #[test]
+    fn setup_catalog_preserves_identity_validation_errors() {
+        let config = tempfile::tempdir().unwrap();
+        let profiles = config.path().join(constants::PROFILES_DIR_NAME);
+        std::fs::create_dir_all(&profiles).unwrap();
+        std::fs::write(
+            profiles.join("orphan.conf"),
+            "[Interface]\nPrivateKey = x\n",
+        )
+        .unwrap();
+
+        let error = load_setup_profiles(config.path()).unwrap_err();
+        assert!(matches!(
+            error,
+            crate::vortix_config::profile_store::ProfileStoreError::MissingSidecar { .. }
+        ));
     }
 }

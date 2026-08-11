@@ -634,7 +634,7 @@ fn monotonic_millis(started: Instant) -> u64 {
     started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
 }
 
-fn unix_millis() -> u64 {
+pub(crate) fn unix_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

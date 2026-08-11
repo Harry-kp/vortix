@@ -88,6 +88,26 @@ Unset it to restore the implicit migration.
 
 ## What needs manual opt-in
 
+### Prepared Background mode (optional)
+
+Upgrading does not start a Vortix service. Existing users remain in
+`Standard mode: Active` with unchanged manual CLI/TUI behavior.
+
+`vortix setup` explains the opt-in Background capabilities and persistent
+process cost. `vortix background status`, `recover`, `diagnostics [--follow]`,
+and `disable` share the TUI's typed state vocabulary. This preparatory release
+refuses confirmed setup/recovery/disable nonzero with
+`background_activation_unavailable`: no authority is enrolled, no bootstrap
+is invoked, and Standard mode remains authoritative.
+
+Authenticated diagnostics are bounded and redacted. A fallback is explicitly
+stale, unauthenticated, and advisory-only. JSON follow mode is NDJSON, emits
+each retained record once, and reconnects from a fresh authenticated boundary
+after a lag signal. Boot preflight accepts reviewed non-interactive profiles
+and rejects parser-identified username/password or static-challenge profiles
+before persisting intent. External key/PKCS#12 material and unsupported or
+malformed credential mechanisms fail closed through the canonical parser.
+
 ### Encrypted secret store (opt-in)
 
 v0.3.0 adds `vortix secrets {set,get,delete}` backed by a layered store:

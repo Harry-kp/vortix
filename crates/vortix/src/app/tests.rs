@@ -51,6 +51,9 @@ fn test_app() -> App {
         panel_areas: std::collections::HashMap::new(),
         toast: None,
         terminal_size: (80, 24),
+        background_mode: crate::background::BackgroundModeRecord::default(),
+        background_diagnostics_loading: false,
+        background_diagnostics_fallback: true,
     }
 }
 
@@ -2718,4 +2721,202 @@ fn remote_profile_terminal_failure_is_reported_to_the_user() {
     let toast = app.toast.as_ref().expect("profile failure must be visible");
     assert_eq!(toast.toast_type, ToastType::Error);
     assert!(toast.message.contains("Failed(Rejected)"));
+}
+
+#[test]
+fn background_overlay_is_keyboard_only_and_cancel_is_non_destructive() {
+    let mut app = test_app();
+    app.terminal_size = (40, 14);
+    app.handle_message(Message::OpenBackgroundSetup);
+    assert!(matches!(app.input_mode, InputMode::BackgroundSetup { .. }));
+
+    app.handle_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Tab,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert!(matches!(
+        app.input_mode,
+        InputMode::BackgroundSetup {
+            state: crate::background::BackgroundOverlayState {
+                focus: crate::background::BackgroundFocus::Cancel,
+                ..
+            }
+        }
+    ));
+    app.handle_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::BackTab,
+        crossterm::event::KeyModifiers::SHIFT,
+    ));
+    assert!(matches!(
+        app.input_mode,
+        InputMode::BackgroundSetup {
+            state: crate::background::BackgroundOverlayState {
+                focus: crate::background::BackgroundFocus::Continue,
+                ..
+            }
+        }
+    ));
+    app.handle_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Down,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert!(matches!(
+        app.input_mode,
+        InputMode::BackgroundSetup {
+            state: crate::background::BackgroundOverlayState { scroll: 1.., .. }
+        }
+    ));
+    app.handle_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::End,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    let end_scroll = match &app.input_mode {
+        InputMode::BackgroundSetup { state } => state.scroll,
+        other => panic!("unexpected input mode: {other:?}"),
+    };
+    assert!(end_scroll > 1);
+    app.handle_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Home,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert!(matches!(
+        app.input_mode,
+        InputMode::BackgroundSetup {
+            state: crate::background::BackgroundOverlayState { scroll: 0, .. }
+        }
+    ));
+    app.handle_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Esc,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+
+    assert_eq!(app.input_mode, InputMode::Normal);
+    assert_eq!(
+        app.background_mode.state,
+        crate::background::BackgroundModeState::StandardActive
+    );
+    assert!(app.toast.is_none());
+}
+
+#[test]
+fn background_diagnostics_completion_clears_loading_and_logs_each_outcome() {
+    use crate::vortix_core::control::diagnostics::DIAGNOSTIC_SCHEMA_VERSION;
+    use crate::vortix_core::control::{
+        DiagnosticCode, DiagnosticComponent, DiagnosticFields, DiagnosticRecord,
+        DiagnosticSeverity, DiagnosticSnapshot, DiagnosticSource, DiagnosticStatus, DiagnosticView,
+    };
+
+    let mut app = test_app();
+    app.background_diagnostics_loading = true;
+    let view = DiagnosticView {
+        source: DiagnosticSource::AuthenticatedLive,
+        stale: false,
+        age_millis: 0,
+        snapshot: DiagnosticSnapshot {
+            schema_version: DIAGNOSTIC_SCHEMA_VERSION,
+            generation: 91,
+            generated_at_unix_millis: 1,
+            stale_after_millis: 30_000,
+            product_version: "test".into(),
+            status: DiagnosticStatus::default(),
+            records: vec![DiagnosticRecord {
+                sequence: 1,
+                age_millis: 0,
+                component: DiagnosticComponent::Daemon,
+                severity: DiagnosticSeverity::Info,
+                code: DiagnosticCode::DaemonStarted,
+                fields: DiagnosticFields::None,
+            }],
+        },
+    };
+    app.handle_message(Message::BackgroundDiagnosticsLoaded(Ok(Box::new(view))));
+    assert!(!app.background_diagnostics_loading);
+    assert!(crate::logger::get_logs()
+        .iter()
+        .any(|entry| entry.message.contains("generation=91")));
+
+    app.background_diagnostics_loading = true;
+    app.handle_message(Message::BackgroundDiagnosticsLoaded(Err(
+        "test diagnostic transport failed".into(),
+    )));
+    assert!(!app.background_diagnostics_loading);
+    assert!(crate::logger::get_logs()
+        .iter()
+        .any(|entry| entry.message.contains("test diagnostic transport failed")));
+}
+
+#[test]
+fn background_diagnostics_duplicate_load_is_bounded() {
+    let mut app = test_app();
+    app.background_diagnostics_loading = true;
+    app.handle_message(Message::OpenBackgroundDiagnostics);
+    assert!(app.background_diagnostics_loading);
+    assert_eq!(app.focused_panel, FocusedPanel::Logs);
+    assert!(app
+        .toast
+        .as_ref()
+        .is_some_and(|toast| toast.message.contains("already loading")));
+}
+
+#[test]
+fn diagnostic_log_batch_rotates_before_crossing_the_boundary() {
+    let config = tempfile::tempdir().unwrap();
+    let entries = vec![
+        "first-01".to_string(),
+        "second02".to_string(),
+        "third-03".to_string(),
+    ];
+    App::append_to_log_file_batch(&entries, config.path(), 10, 7);
+
+    let log_dir = config.path().join(crate::constants::LOGS_DIR_NAME);
+    let files = std::fs::read_dir(&log_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(files.len(), entries.len());
+    let mut persisted = files
+        .iter()
+        .flat_map(|path| {
+            assert!(std::fs::metadata(path).unwrap().len() <= 10);
+            std::fs::read_to_string(path)
+                .unwrap()
+                .lines()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    persisted.sort();
+    let mut expected = entries;
+    expected.sort();
+    assert_eq!(persisted, expected);
+}
+
+#[test]
+fn background_confirmation_refuses_authority_before_cutover() {
+    let mut app = test_app();
+    app.handle_message(Message::OpenBackgroundSetup);
+    app.handle_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+
+    assert_eq!(
+        app.background_mode.state,
+        crate::background::BackgroundModeState::StandardActive
+    );
+    let toast = app.toast.as_ref().expect("confirmation refusal is visible");
+    assert!(toast.message.contains("not enabled"));
+}
+
+#[test]
+fn background_status_continue_is_read_only() {
+    let mut app = test_app();
+    app.handle_message(Message::OpenBackgroundStatus);
+    app.handle_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+
+    assert_eq!(app.input_mode, InputMode::Normal);
+    assert!(app.toast.is_none());
 }
