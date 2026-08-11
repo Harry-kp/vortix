@@ -529,7 +529,7 @@ fn handle_up(
             print_error_and_exit(mode, "up", err_not_found(&profile_name), ExitCode::NotFound)
         });
     let timeout_secs = connect_operation_timeout_secs(timeout_secs, target.protocol, config);
-    let control = crate::cli::control::LocalControlSession::start(
+    let control = crate::cli::control::ClientControlSession::start_production(
         config,
         config_dir,
         engine.profiles.clone(),
@@ -662,29 +662,7 @@ fn local_control_error_or_exit(
     command: &str,
     error: &crate::cli::control::LocalControlError,
 ) -> ! {
-    let (code, exit) = match &error {
-        crate::cli::control::LocalControlError::Admission(
-            crate::vortix_core::control::AdmissionError::RouteConflict,
-        ) => ("state_conflict_route_overlap", ExitCode::StateConflict),
-        crate::cli::control::LocalControlError::Admission(
-            crate::vortix_core::control::AdmissionError::DeadlineExpired,
-        )
-        | crate::cli::control::LocalControlError::ChallengeExpired => {
-            ("timeout", ExitCode::Timeout)
-        }
-        crate::cli::control::LocalControlError::Ownership(_)
-        | crate::cli::control::LocalControlError::Owner(_) => {
-            ("permission_denied", ExitCode::PermissionDenied)
-        }
-        crate::cli::control::LocalControlError::ChallengeCancelled => {
-            ("user_cancelled", ExitCode::GeneralError)
-        }
-        crate::cli::control::LocalControlError::ChallengeNonInteractive { .. }
-        | crate::cli::control::LocalControlError::ChallengeEmpty { .. } => {
-            ("auth_required", ExitCode::GeneralError)
-        }
-        _ => ("control_failed", ExitCode::GeneralError),
-    };
+    let (code, exit) = local_control_error_category(error);
     print_error_and_exit(
         mode,
         command,
@@ -697,14 +675,58 @@ fn local_control_error_or_exit(
     )
 }
 
+fn local_control_error_category(
+    error: &crate::cli::control::LocalControlError,
+) -> (&'static str, ExitCode) {
+    match error {
+        crate::cli::control::LocalControlError::Admission(
+            crate::vortix_core::control::AdmissionError::RouteConflict,
+        )
+        | crate::cli::control::LocalControlError::Remote(
+            crate::daemon::service::RemoteControlError::Admission(
+                crate::vortix_core::control::AdmissionError::RouteConflict,
+            ),
+        ) => ("state_conflict_route_overlap", ExitCode::StateConflict),
+        crate::cli::control::LocalControlError::Admission(
+            crate::vortix_core::control::AdmissionError::DeadlineExpired,
+        )
+        | crate::cli::control::LocalControlError::Remote(
+            crate::daemon::service::RemoteControlError::Admission(
+                crate::vortix_core::control::AdmissionError::DeadlineExpired,
+            )
+            | crate::daemon::service::RemoteControlError::Challenge(
+                crate::vortix_core::control::ChallengeError::Expired,
+            ),
+        )
+        | crate::cli::control::LocalControlError::ChallengeExpired => {
+            ("timeout", ExitCode::Timeout)
+        }
+        crate::cli::control::LocalControlError::Ownership(_)
+        | crate::cli::control::LocalControlError::Owner(_) => {
+            ("permission_denied", ExitCode::PermissionDenied)
+        }
+        crate::cli::control::LocalControlError::ChallengeCancelled
+        | crate::cli::control::LocalControlError::Remote(
+            crate::daemon::service::RemoteControlError::Challenge(
+                crate::vortix_core::control::ChallengeError::Cancelled,
+            ),
+        ) => ("user_cancelled", ExitCode::GeneralError),
+        crate::cli::control::LocalControlError::ChallengeNonInteractive { .. }
+        | crate::cli::control::LocalControlError::ChallengeEmpty { .. } => {
+            ("auth_required", ExitCode::GeneralError)
+        }
+        _ => ("control_failed", ExitCode::GeneralError),
+    }
+}
+
 fn operation_failure(
     action: &str,
-    outcome: &crate::cli::control::LocalOperationOutcome,
+    outcome: &impl crate::cli::control::ControlOperationOutcomeView,
 ) -> (&'static str, ExitCode, String) {
     use crate::vortix_core::control::{OperationFailure, OperationResult, OperationStatus};
 
-    let operation = &outcome.operation_id;
-    match (outcome.status, outcome.result) {
+    let operation = outcome.operation_id();
+    match (outcome.status(), outcome.result()) {
         (_, Some(OperationResult::ProfileMutationAppliedAfterDeadline)) => (
             "completed_after_deadline",
             ExitCode::Timeout,
@@ -924,7 +946,7 @@ fn handle_down(
             .find(|profile| profile.name == name)
             .map(|profile| profile.id.clone())
     });
-    let control = crate::cli::control::LocalControlSession::start(
+    let control = crate::cli::control::ClientControlSession::start_production(
         config,
         config_dir,
         engine.profiles.clone(),
@@ -1098,7 +1120,7 @@ fn handle_reconnect(
             .clone()
     });
     let target_id = requested_id.or(fallback_id);
-    let control = crate::cli::control::LocalControlSession::start(
+    let control = crate::cli::control::ClientControlSession::start_production(
         config,
         config_dir,
         engine.profiles.clone(),
@@ -2190,15 +2212,14 @@ fn import_profile_via_control(
     config_dir: &Path,
 ) -> Result<crate::state::VpnProfile, String> {
     let profiles_dir = config_dir.join(constants::PROFILES_DIR_NAME);
-    let prepared = crate::vpn::prepare_profile_import(path, &profiles_dir)?;
-    let profile_id = prepared.profile().id.clone();
     let engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
-    let control = crate::cli::control::LocalProfileMutationSession::start(
-        config_dir,
-        &engine.profiles,
-        vec![prepared],
-    )
-    .map_err(|error| error.to_string())?;
+    let (control, profile_id) =
+        crate::cli::control::ClientControlSession::start_production_profile_import(
+            config_dir,
+            &engine.profiles,
+            path,
+        )
+        .map_err(|error| error.to_string())?;
     let outcome = control
         .run(
             crate::vortix_core::control::UserCommand::ImportProfile {
@@ -2214,6 +2235,15 @@ fn import_profile_via_control(
     match outcome.profile_mutation {
         Some(Ok(crate::cli::control::LocalProfileMutationReceipt::Imported(profile))) => {
             Ok(profile)
+        }
+        Some(Ok(crate::cli::control::LocalProfileMutationReceipt::RemoteApplied { .. })) => {
+            crate::vpn::load_profiles_from(&profiles_dir)
+                .into_iter()
+                .find(|profile| profile.id == profile_id)
+                .ok_or_else(|| {
+                    "remote control applied import but the shared profile catalog did not refresh"
+                        .to_owned()
+                })
         }
         Some(Err(failure)) => Err(format!("profile storage rejected import: {failure:?}")),
         _ => Err("control service returned no import receipt".to_owned()),
@@ -2518,7 +2548,7 @@ fn handle_delete(
         mode,
     );
 
-    let control = crate::cli::control::LocalProfileMutationSession::start(
+    let control = crate::cli::control::ClientControlSession::start_production_profile(
         config_dir,
         &fresh_engine.profiles,
         Vec::new(),
@@ -2647,7 +2677,7 @@ fn handle_rename(
         mode,
     );
 
-    let control = crate::cli::control::LocalProfileMutationSession::start(
+    let control = crate::cli::control::ClientControlSession::start_production_profile(
         config_dir,
         &fresh_engine.profiles,
         Vec::new(),
@@ -2664,8 +2694,10 @@ fn handle_rename(
         )
         .unwrap_or_else(|error| local_control_error_or_exit(mode, "rename", &error));
     match outcome.profile_mutation {
-        Some(Ok(crate::cli::control::LocalProfileMutationReceipt::Renamed(_)))
-            if outcome.status == crate::vortix_core::control::OperationStatus::Succeeded => {}
+        Some(Ok(
+            crate::cli::control::LocalProfileMutationReceipt::Renamed(_)
+            | crate::cli::control::LocalProfileMutationReceipt::RemoteApplied { .. },
+        )) if outcome.status == crate::vortix_core::control::OperationStatus::Succeeded => {}
         Some(Err(crate::vortix_core::control::ProfileMutationFailure::AlreadyExists)) => {
             print_error_and_exit(
                 mode,
@@ -2745,7 +2777,7 @@ fn handle_killswitch(
         }
 
         let _lifecycle_lock = acquire_lifecycle_lock_or_exit(output_mode, "killswitch");
-        let control = crate::cli::control::LocalControlSession::start(
+        let control = crate::cli::control::ClientControlSession::start_production(
             config,
             config_dir,
             engine.profiles.clone(),
@@ -2842,7 +2874,7 @@ fn handle_release_killswitch(config: &AppConfig, config_dir: &Path, mode: Output
             ExitCode::PermissionDenied,
         );
     }
-    let control = crate::cli::control::LocalControlSession::start(
+    let control = crate::cli::control::ClientControlSession::start_production(
         config,
         config_dir,
         engine.profiles.clone(),
@@ -3088,6 +3120,47 @@ mod tests {
         assert_eq!(code, "completed_after_deadline");
         assert_eq!(exit.code(), ExitCode::Timeout.code());
         assert!(message.contains("was applied and must not be retried"));
+    }
+
+    #[test]
+    fn remote_challenge_categories_match_standard_cli_output() {
+        use crate::daemon::service::RemoteControlError;
+        use crate::vortix_core::control::ChallengeError;
+
+        let cases = [
+            (
+                crate::cli::control::LocalControlError::ChallengeCancelled,
+                crate::cli::control::LocalControlError::Remote(RemoteControlError::Challenge(
+                    ChallengeError::Cancelled,
+                )),
+                "user_cancelled",
+                ExitCode::GeneralError,
+            ),
+            (
+                crate::cli::control::LocalControlError::ChallengeExpired,
+                crate::cli::control::LocalControlError::Remote(RemoteControlError::Challenge(
+                    ChallengeError::Expired,
+                )),
+                "timeout",
+                ExitCode::Timeout,
+            ),
+        ];
+
+        for (standard, remote, expected_code, expected_exit) in cases {
+            let standard_category = local_control_error_category(&standard);
+            let remote_category = local_control_error_category(&remote);
+            assert_eq!(standard_category.0, expected_code);
+            assert_eq!(remote_category.0, expected_code);
+            assert_eq!(standard_category.1.code(), expected_exit.code());
+            assert_eq!(remote_category.1.code(), expected_exit.code());
+        }
+
+        let unauthorized = crate::cli::control::LocalControlError::Remote(
+            RemoteControlError::Challenge(ChallengeError::Unauthorized),
+        );
+        let (code, exit) = local_control_error_category(&unauthorized);
+        assert_eq!(code, "control_failed");
+        assert_eq!(exit.code(), ExitCode::GeneralError.code());
     }
 
     #[test]

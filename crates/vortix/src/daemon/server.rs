@@ -10,6 +10,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot, watch, Semaphore};
 use tokio::task::JoinSet;
+use zeroize::Zeroize as _;
 
 use super::diagnostics::{DiagnosticHub, DiagnosticQueryProvider};
 use super::passive::{legacy_connection, PassiveQueryProvider};
@@ -172,7 +173,10 @@ struct Outbound {
     written: oneshot::Sender<Result<(), String>>,
 }
 
-type RequestDigest = [u8; REQUEST_DIGEST_BYTES];
+#[derive(PartialEq, Eq)]
+struct RequestDigest(zeroize::Zeroizing<[u8; REQUEST_DIGEST_BYTES]>);
+
+impl zeroize::ZeroizeOnDrop for RequestDigest {}
 
 struct ReplayEntry {
     request_digest: RequestDigest,
@@ -238,8 +242,12 @@ impl<const RESPONSE_BYTE_LIMIT: usize> ReplayCache<RESPONSE_BYTE_LIMIT> {
 }
 
 fn request_digest(op: &IpcOp) -> Result<RequestDigest, FrameError> {
-    let serialized = serde_json::to_vec(op)?;
-    Ok(Sha256::digest(serialized).into())
+    let serialized = crate::vortix_core::ipc::frame::serialize_zeroizing(op)?;
+    let mut digest = Sha256::digest(serialized.as_slice());
+    let mut retained = zeroize::Zeroizing::new([0_u8; REQUEST_DIGEST_BYTES]);
+    retained.copy_from_slice(digest.as_slice());
+    digest.as_mut_slice().zeroize();
+    Ok(RequestDigest(retained))
 }
 
 async fn respond_to_replay<const RESPONSE_BYTE_LIMIT: usize>(
@@ -427,7 +435,15 @@ fn dispatch(
 ) -> IpcResponse {
     let result = match &request.op {
         IpcOp::Handshake { .. } => Err(IpcError::HandshakeRequired),
-        IpcOp::Execute(_) => Err(IpcError::CapabilityUnavailable {
+        IpcOp::Execute(_)
+        | IpcOp::ControlOpen
+        | IpcOp::ControlSubmit { .. }
+        | IpcOp::ControlSnapshot { .. }
+        | IpcOp::ControlSubscribe { .. }
+        | IpcOp::ControlRespondChallenge { .. }
+        | IpcOp::ControlCancelChallenge { .. }
+        | IpcOp::ControlStageProfileImport { .. }
+        | IpcOp::ControlCancelProfileImport { .. } => Err(IpcError::CapabilityUnavailable {
             capability: IpcCapability::ControlMutation,
         }),
         IpcOp::Snapshot => Ok(IpcResult::Snapshot {
@@ -613,11 +629,11 @@ async fn read_request_with_timeout<R: AsyncRead + Unpin>(
             max: MAX_FRAME_BYTES,
         }));
     }
-    let mut body = vec![0_u8; body_len];
+    let mut body = zeroize::Zeroizing::new(vec![0_u8; body_len]);
     tokio::time::timeout(timeout, reader.read_exact(&mut body))
         .await
         .map_err(|_| DaemonError::Timeout("frame body"))??;
-    serde_json::from_slice(&body)
+    serde_json::from_slice(body.as_slice())
         .map_err(FrameError::Serialize)
         .map_err(DaemonError::Frame)
 }
@@ -931,6 +947,9 @@ mod tests {
 
     #[test]
     fn replay_cache_uses_fixed_digests_and_bounds_response_bytes() {
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<RequestDigest>();
+
         let mut cache = ReplayCache::<256>::default();
         let digest = request_digest(&IpcOp::PassiveSnapshot).unwrap();
         assert_eq!(std::mem::size_of_val(&digest), REQUEST_DIGEST_BYTES);
@@ -965,7 +984,8 @@ mod tests {
         let response_frame = response_frame(&response).unwrap();
         assert!(cache.insert(41, snapshot_digest, Arc::clone(&response_frame)));
 
-        let ReplayLookup::Replay(replayed) = cache.lookup(41, &snapshot_digest) else {
+        let matching_digest = request_digest(&IpcOp::PassiveSnapshot).unwrap();
+        let ReplayLookup::Replay(replayed) = cache.lookup(41, &matching_digest) else {
             panic!("same id and operation must replay the retained response");
         };
         assert_eq!(replayed.as_ref(), response_frame.as_ref());
