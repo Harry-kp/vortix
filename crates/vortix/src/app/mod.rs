@@ -125,7 +125,7 @@ pub struct App {
 
     /// Long-lived Standard-mode canonical authority used by the TUI. Tests
     /// that characterize presentation-only helpers may leave it detached.
-    pub(crate) control_session: Option<crate::cli::control::LocalControlSession>,
+    pub(crate) control_session: Option<crate::cli::control::ClientControlSession>,
 
     /// Last complete immutable publication received from the control owner.
     pub control_snapshot: crate::vortix_core::control::ControlSnapshot,

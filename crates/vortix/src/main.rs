@@ -353,8 +353,10 @@ fn run_tui(
         app.runtime.profiles.clone(),
     )
     .map_err(|error| color_eyre::eyre::eyre!("cannot start TUI control service: {error}"))?;
-    app.attach_control_session(control)
-        .map_err(|error| color_eyre::eyre::eyre!("cannot attach TUI control service: {error}"))?;
+    app.attach_client_control_session(vortix::cli::control::ClientControlSession::standard(
+        control,
+    ))
+    .map_err(|error| color_eyre::eyre::eyre!("cannot attach TUI control service: {error}"))?;
     let events = EventHandler::new(tick_rate);
     let size = terminal.size()?;
     app.on_resize(size.width, size.height);

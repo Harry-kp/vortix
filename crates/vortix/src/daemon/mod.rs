@@ -20,6 +20,7 @@ pub mod diagnostics;
 pub(crate) mod helper_client;
 pub mod passive;
 mod server;
+pub mod service;
 
 pub use server::DaemonServer;
 

@@ -14,11 +14,36 @@ impl App {
         &mut self,
         control: crate::cli::control::LocalControlSession,
     ) -> Result<(), crate::cli::control::LocalControlError> {
+        self.attach_client_control_session(crate::cli::control::ClientControlSession::standard(
+            control,
+        ))
+    }
+
+    /// Attach the already-selected client adapter. Production startup passes
+    /// only the Standard variant until U13 atomically opens the enrollment
+    /// gate; command handlers never choose or fall back between authorities.
+    pub fn attach_client_control_session(
+        &mut self,
+        control: crate::cli::control::ClientControlSession,
+    ) -> Result<(), crate::cli::control::LocalControlError> {
         control.progress()?;
         let snapshot = control.current_snapshot();
         self.control_session = Some(control);
         self.apply_control_snapshot(snapshot);
         Ok(())
+    }
+
+    /// Test-only/preparatory attachment seam for U19's dormant remote
+    /// adapter. Production startup continues to call
+    /// [`Self::attach_control_session`] and therefore remains Standard-only.
+    #[doc(hidden)]
+    pub fn attach_remote_control_session(
+        &mut self,
+        control: crate::daemon::service::RemoteControlSession,
+    ) -> Result<(), crate::cli::control::LocalControlError> {
+        self.attach_client_control_session(
+            crate::cli::control::ClientControlSession::remote_for_parity(control),
+        )
     }
 
     pub(crate) fn issue_control_command(
@@ -87,12 +112,18 @@ impl App {
         results: Vec<crate::cli::control::LocalTuiAdmissionResult>,
     ) {
         for result in results {
-            match result.operation_id {
-                Ok(operation_id) => self.log(&format!(
-                    "CONTROL: Durable command admitted as {operation_id:?}"
-                )),
-                Err(error) => {
-                    if let crate::vortix_core::control::UserCommand::SetKillSwitch { mode } =
+            match result.completion {
+                crate::cli::control::TuiControlCompletion::Admission(Ok(operation_id)) => {
+                    let subject = result
+                        .import_display_name
+                        .as_deref()
+                        .map_or_else(|| "command".to_owned(), |name| format!("import '{name}'"));
+                    self.log(&format!(
+                        "CONTROL: Durable {subject} admitted as {operation_id:?}"
+                    ));
+                }
+                crate::cli::control::TuiControlCompletion::Admission(Err(error)) => {
+                    if let Some(crate::vortix_core::control::UserCommand::SetKillSwitch { mode }) =
                         result.command
                     {
                         if self.pending_control_killswitch_mode == Some(mode) {
@@ -106,6 +137,42 @@ impl App {
                     self.log(&format!("ERR: Control {subject} refused: {error}"));
                     self.show_toast(
                         format!("Control {subject} failed: {error}"),
+                        ToastType::Error,
+                    );
+                }
+                crate::cli::control::TuiControlCompletion::ChallengeResponse {
+                    challenge_id,
+                    result: Ok(()),
+                } => self.log(&format!(
+                    "AUTH: Service accepted challenge response {challenge_id:?}"
+                )),
+                crate::cli::control::TuiControlCompletion::ChallengeCancellation {
+                    challenge_id,
+                    result: Ok(()),
+                } => self.log(&format!(
+                    "AUTH: Service cancelled challenge {challenge_id:?}"
+                )),
+                crate::cli::control::TuiControlCompletion::ChallengeResponse {
+                    challenge_id,
+                    result: Err(error),
+                } => {
+                    self.log(&format!(
+                        "ERR: Challenge response {challenge_id:?} failed: {error}"
+                    ));
+                    self.show_toast(
+                        format!("Challenge response failed: {error}"),
+                        ToastType::Error,
+                    );
+                }
+                crate::cli::control::TuiControlCompletion::ChallengeCancellation {
+                    challenge_id,
+                    result: Err(error),
+                } => {
+                    self.log(&format!(
+                        "WARN: Challenge cancellation {challenge_id:?} failed: {error}"
+                    ));
+                    self.show_toast(
+                        format!("Challenge cancellation failed: {error}"),
                         ToastType::Error,
                     );
                 }
@@ -190,19 +257,24 @@ impl App {
                         .then_some(challenge.label),
                     };
                 } else {
+                    // Mark it before asynchronous cancellation so repeated
+                    // snapshots cannot enqueue the same cancellation again.
+                    self.control_challenge = Some(challenge.id);
                     let cancelled = self
                         .control_session
                         .as_ref()
                         .expect("snapshot challenge requires attached control session")
                         .cancel_challenge(challenge.id);
-                    self.log(&format!(
-                        "ERR: Cancelled challenge for missing profile {}: {}",
-                        challenge.profile_id,
-                        cancelled.err().map_or_else(
-                            || "profile unavailable".to_owned(),
-                            |error| error.to_string()
-                        )
-                    ));
+                    match cancelled {
+                        Ok(()) => self.log(&format!(
+                            "AUTH: Requested cancellation for missing profile {}",
+                            challenge.profile_id
+                        )),
+                        Err(error) => self.log(&format!(
+                            "ERR: Could not queue challenge cancellation for missing profile {}: {error}",
+                            challenge.profile_id
+                        )),
+                    }
                 }
             }
             None if self.control_challenge.take().is_some() => {
@@ -227,28 +299,47 @@ impl App {
             .selected()
             .and_then(|index| self.runtime.profiles.get(index))
             .map(|profile| profile.id.clone());
-        self.runtime.profiles = update.profiles;
-        self.runtime.sort_profiles();
-        self.profile_list_state.select(
-            selected_id
-                .and_then(|profile_id| {
-                    self.runtime
-                        .profiles
-                        .iter()
-                        .position(|profile| profile.id == profile_id)
-                })
-                .or_else(|| (!self.runtime.profiles.is_empty()).then_some(0)),
-        );
+        if let Some(profiles) = update.profiles {
+            self.runtime.profiles = profiles;
+            self.runtime.sort_profiles();
+            self.profile_list_state.select(
+                selected_id
+                    .and_then(|profile_id| {
+                        self.runtime
+                            .profiles
+                            .iter()
+                            .position(|profile| profile.id == profile_id)
+                    })
+                    .or_else(|| (!self.runtime.profiles.is_empty()).then_some(0)),
+            );
+        }
         for outcome in update.outcomes {
             match outcome {
-                Ok(_) => self.show_toast(
+                crate::cli::control::LocalCatalogOutcome::Applied(
+                    crate::cli::control::LocalProfileMutationReceipt::RemoteApplied {
+                        display_name: Some(display_name),
+                    },
+                ) => self.show_toast(
+                    format!(
+                        "Profile '{display_name}' updated (revision {})",
+                        update.revision
+                    ),
+                    ToastType::Success,
+                ),
+                crate::cli::control::LocalCatalogOutcome::Applied(_) => self.show_toast(
                     format!("Profile catalog updated (revision {})", update.revision),
                     ToastType::Success,
                 ),
-                Err(failure) => self.show_toast(
+                crate::cli::control::LocalCatalogOutcome::Failed(failure) => self.show_toast(
                     format!("Profile update failed: {failure:?}"),
                     ToastType::Error,
                 ),
+                crate::cli::control::LocalCatalogOutcome::RemoteTerminal { status, result } => {
+                    self.show_toast(
+                        format!("Profile update {status:?}: {result:?}"),
+                        ToastType::Error,
+                    );
+                }
             }
         }
     }

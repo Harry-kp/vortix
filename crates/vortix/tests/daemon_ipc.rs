@@ -7,6 +7,7 @@ use std::{io::Read as _, io::Write as _};
 use tokio::sync::broadcast;
 use vortix::daemon::client::{self, ClientError};
 use vortix::daemon::passive::PassiveQueryProvider;
+use vortix::daemon::service::{RemoteControlError, RemoteControlSession, RemoteControlTransport};
 use vortix::daemon::DaemonServer;
 use vortix::vortix_core::engine::input::UserCommand;
 use vortix::vortix_core::ipc::{
@@ -146,6 +147,28 @@ async fn passive_candidate_is_concurrent_race_free_and_cannot_mutate() {
             capability: IpcCapability::ControlMutation
         }))
     ));
+
+    let dormant_socket = socket.clone();
+    let dormant =
+        tokio::task::spawn_blocking(move || client::request(&dormant_socket, IpcOp::ControlOpen))
+            .await
+            .unwrap();
+    assert!(matches!(
+        dormant,
+        Err(ClientError::Daemon(IpcError::CapabilityUnavailable {
+            capability: IpcCapability::ControlMutation
+        }))
+    ));
+
+    let control_socket = socket.clone();
+    let remote = tokio::task::spawn_blocking(move || {
+        let transport: Arc<dyn RemoteControlTransport> =
+            Arc::new(client::UnixRemoteControlTransport::new(control_socket));
+        RemoteControlSession::open_for_parity(transport)
+    })
+    .await
+    .unwrap();
+    assert!(matches!(remote, Err(RemoteControlError::Incompatible(_))));
 
     let subscription_socket = socket.clone();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
