@@ -23,6 +23,10 @@ use crate::vortix_core::ipc::{
     IPC_PROTOCOL_MAX, IPC_PROTOCOL_MIN, IPC_SCHEMA_MAX, IPC_SCHEMA_MIN,
 };
 
+use super::service::{
+    RemoteControlError, RemoteControlSubscription, RemoteControlTransport, RemoteControlUpdate,
+};
+
 const IPC_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// IPC client error surface visible to CLI handlers. Captures the
@@ -137,7 +141,8 @@ fn exchange_until(
     deadline: Instant,
 ) -> Result<IpcResponse, ClientError> {
     set_deadline_timeouts(stream, deadline)?;
-    stream.write_all(&encode_frame(request)?)?;
+    let frame = zeroize::Zeroizing::new(encode_frame(request)?);
+    stream.write_all(frame.as_slice())?;
     let response = read_response_until(stream, buffered, Some(deadline))?;
     if response.id != request.id {
         return Err(ClientError::Unexpected(format!(
@@ -193,6 +198,100 @@ pub struct DiagnosticSubscription {
     stream: UnixStream,
     buffered: Vec<u8>,
     initial: DiagnosticView,
+}
+
+struct ControlSubscription {
+    stream: UnixStream,
+    buffered: Vec<u8>,
+}
+
+impl RemoteControlSubscription for ControlSubscription {
+    fn try_recv(&mut self) -> Result<Option<RemoteControlUpdate>, RemoteControlError> {
+        match read_response(&mut self.stream, &mut self.buffered) {
+            Ok(response) => match response.result.map_err(RemoteControlError::from_ipc)? {
+                IpcResult::ControlEvent { event, snapshot } => {
+                    Ok(Some(RemoteControlUpdate { event, snapshot }))
+                }
+                IpcResult::ResyncRequired { newest_generation } => {
+                    Err(RemoteControlError::ResyncRequired { newest_generation })
+                }
+                other => Err(RemoteControlError::Protocol(format!(
+                    "unexpected control subscription result: {other:?}"
+                ))),
+            },
+            Err(ClientError::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(remote_error(error)),
+        }
+    }
+}
+
+/// Unix-socket implementation of the dormant canonical control transport.
+/// Constructing this value grants no authority; production connection is
+/// still fenced by [`super::service::RemoteMutationGate`].
+#[derive(Debug, Clone)]
+pub struct UnixRemoteControlTransport {
+    socket_path: std::path::PathBuf,
+}
+
+impl UnixRemoteControlTransport {
+    #[must_use]
+    pub fn new(socket_path: std::path::PathBuf) -> Self {
+        Self { socket_path }
+    }
+}
+
+impl RemoteControlTransport for UnixRemoteControlTransport {
+    fn exchange(&self, op: IpcOp) -> Result<IpcResult, RemoteControlError> {
+        request(&self.socket_path, op).map_err(remote_error)
+    }
+
+    fn subscribe(
+        &self,
+        session_id: &crate::vortix_core::ipc::RemoteSessionId,
+    ) -> Result<
+        (
+            Box<dyn RemoteControlSubscription>,
+            crate::vortix_core::control::ControlSnapshot,
+        ),
+        RemoteControlError,
+    > {
+        let (stream, buffered, result) = open_subscription(
+            &self.socket_path,
+            IpcCapability::ControlMutation,
+            IpcOp::ControlSubscribe {
+                session_id: session_id.clone(),
+            },
+        )
+        .map_err(remote_error)?;
+        let IpcResult::ControlSubscribed { snapshot } = result else {
+            return Err(RemoteControlError::Protocol(format!(
+                "invalid control subscribe response: {result:?}"
+            )));
+        };
+        stream
+            .set_nonblocking(true)
+            .map_err(|error| RemoteControlError::Unavailable(error.to_string()))?;
+        Ok((Box::new(ControlSubscription { stream, buffered }), snapshot))
+    }
+}
+
+fn remote_error(error: ClientError) -> RemoteControlError {
+    match error {
+        ClientError::Io(error) => RemoteControlError::Unavailable(error.to_string()),
+        ClientError::Frame(error) => RemoteControlError::Protocol(error.to_string()),
+        ClientError::Daemon(error) => RemoteControlError::from_ipc(error),
+        ClientError::ResyncRequired { newest_generation } => {
+            RemoteControlError::ResyncRequired { newest_generation }
+        }
+        ClientError::Unexpected(error) => RemoteControlError::Protocol(error),
+    }
 }
 
 impl DiagnosticSubscription {
@@ -335,17 +434,19 @@ fn remaining(deadline: Instant) -> std::io::Result<Duration> {
 }
 
 fn validate_handshake(hello: &ServerHello, required: IpcCapability) -> Result<(), ClientError> {
+    let control = required == IpcCapability::ControlMutation;
     if hello.product != "vortix"
-        || !hello.passive
+        || hello.passive == control
         || !(IPC_PROTOCOL_MIN..=IPC_PROTOCOL_MAX).contains(&hello.protocol)
         || !(IPC_SCHEMA_MIN..=IPC_SCHEMA_MAX).contains(&hello.schema)
-        || hello.capabilities.as_slice() != capabilities_for_schema(hello.schema)
+        || (control && hello.schema < 3)
         || !hello.capabilities.contains(&required)
         || !required.is_available_in_schema(hello.schema)
-        || hello.capabilities.contains(&IpcCapability::ControlMutation)
+        || (!control && hello.capabilities.as_slice() != capabilities_for_schema(hello.schema))
+        || (!control && hello.capabilities.contains(&IpcCapability::ControlMutation))
     {
         return Err(ClientError::Unexpected(format!(
-            "invalid passive handshake response: {hello:?}"
+            "invalid daemon handshake response: {hello:?}"
         )));
     }
     Ok(())

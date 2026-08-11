@@ -364,7 +364,8 @@ pub enum ReadinessError {
     Persistence,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Error, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ChallengeError {
     #[error("control service is busy")]
     Busy,
