@@ -201,6 +201,16 @@ impl Supervisor {
         self.tunnels.reserve(profile_id, routes)
     }
 
+    /// Reserve teardown capacity without claiming connect-only routes or
+    /// rejecting the exact managed tunnel that the work will remove.
+    pub fn reserve_disconnect(
+        &self,
+        profile_id: &ProfileId,
+    ) -> Result<ProfileAdmission, WorkFailure> {
+        self.tunnels
+            .reserve(profile_id, std::iter::empty::<String>())
+    }
+
     pub fn dispatch_reserved_tunnel(
         &self,
         work: TunnelWork,
