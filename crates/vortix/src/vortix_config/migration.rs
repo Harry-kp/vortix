@@ -1463,12 +1463,24 @@ mod tests {
         let workers = (0..2)
             .map(|_| {
                 let dir = std::sync::Arc::clone(&dir);
-                std::thread::spawn(move || migrate_legacy_profiles(&dir).unwrap())
+                std::thread::spawn(move || migrate_legacy_profiles(&dir))
             })
             .collect::<Vec<_>>();
+        let mut completed = 0;
         for worker in workers {
-            worker.join().unwrap();
+            match worker.join().unwrap() {
+                Ok(_) => completed += 1,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::InvalidData
+                        && error.to_string().contains("profile storage is busy") => {}
+                Err(error) => panic!("concurrent migration failed unexpectedly: {error}"),
+            }
         }
+        assert!(
+            completed >= 1,
+            "one concurrent migration must acquire the lock"
+        );
+        migrate_legacy_profiles(tmp.path()).unwrap();
         let store = FsProfileStore::new(tmp.path().to_path_buf());
         assert_eq!(store.list().unwrap().len(), 1);
         assert!(ProfileId::parse(store.list().unwrap()[0].id.to_string()).is_ok());
