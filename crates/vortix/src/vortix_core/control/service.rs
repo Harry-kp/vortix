@@ -2105,6 +2105,16 @@ fn drive_supervision(
                 .observed
                 .wireguard_probe_receipts
                 .remove(&result.profile_id);
+            let wireguard_handshake_failure = result.result == Err(WorkFailure::HandshakeFailed)
+                || (result.result == Err(WorkFailure::TimedOut)
+                    && result.mutation == TunnelMutation::Connect
+                    && config
+                        .profile_topologies
+                        .get(&result.profile_id)
+                        .is_some_and(|topology| {
+                            topology.protocol
+                                == Some(crate::vortix_core::profile::ProtocolKind::WireGuard)
+                        }));
             if result.result == Err(WorkFailure::ChallengeFailed) {
                 let rollback_profiles = snapshot
                     .operations
@@ -2145,7 +2155,7 @@ fn drive_supervision(
                         events,
                     );
                 }
-            } else if result.result == Err(WorkFailure::HandshakeFailed) {
+            } else if wireguard_handshake_failure {
                 let was_recovery = owner.recovery_operations.contains(&result.operation_id);
                 events.push(ControlEvent::ConnectAttemptFailed {
                     profile_id: result.profile_id.clone(),
@@ -2184,6 +2194,19 @@ fn drive_supervision(
                         events,
                     );
                 }
+            } else if result.result == Err(WorkFailure::TimedOut) {
+                fail_tunnel_dispatch_operation(
+                    &result.operation_id,
+                    result.revision.generation,
+                    WorkFailure::TimedOut,
+                    snapshot,
+                    owner,
+                    admission,
+                    now,
+                    selection,
+                    config,
+                    events,
+                );
             }
             invalidate_gates(
                 snapshot,
