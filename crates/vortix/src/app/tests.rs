@@ -2044,7 +2044,7 @@ fn canonical_profile_commands_preserve_identity_and_reject_active_mutation() {
     app.confirm_delete(0);
     for _ in 0..200 {
         app.process_external();
-        if store.list().unwrap().is_empty() && app.runtime.profiles.is_empty() {
+        if app.runtime.profiles.is_empty() && store.list().unwrap().is_empty() {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -2066,7 +2066,7 @@ fn canonical_profile_commands_preserve_identity_and_reject_active_mutation() {
     app.import_profile_from_path(source.to_str().unwrap());
     for _ in 0..200 {
         app.process_external();
-        if store.list().unwrap().len() == 1 && app.runtime.profiles.len() == 1 {
+        if app.runtime.profiles.len() == 1 && store.list().unwrap().len() == 1 {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
