@@ -2,6 +2,10 @@
 //!
 //! Provides thread-safe logging with multiple levels, color coding,
 //! and integration with the TUI system.
+//!
+//! These entries are deliberately not serializable and are never a source for
+//! Background diagnostics. Diagnostics accept only the fixed-shape codes in
+//! `vortix_core::control::diagnostics`; arbitrary log text stays local.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};

@@ -243,6 +243,7 @@ fn main() -> Result<()> {
             &config_dir,
             config_dir_source,
             &app_config,
+            &settings,
             output_mode,
         );
         std::process::exit(exit_code);

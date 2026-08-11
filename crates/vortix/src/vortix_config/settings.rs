@@ -35,6 +35,8 @@ pub struct Settings {
     pub engine: EngineSettings,
     pub journal: JournalSettings,
     pub ui: UiSettings,
+    /// Privacy-preserving background diagnostic persistence.
+    pub diagnostics: DiagnosticsSettings,
     /// Global, asynchronous lifecycle observers. Empty means no runner task.
     pub hooks: Vec<HookSpec>,
 }
@@ -46,7 +48,26 @@ impl Default for Settings {
             engine: EngineSettings::default(),
             journal: JournalSettings::default(),
             ui: UiSettings::default(),
+            diagnostics: DiagnosticsSettings::default(),
             hooks: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DiagnosticsSettings {
+    /// Keep one owner-private, atomically replaced advisory snapshot.
+    pub fallback_snapshot: bool,
+    /// Age after which user interfaces label fallback evidence stale.
+    pub stale_after_secs: u64,
+}
+
+impl Default for DiagnosticsSettings {
+    fn default() -> Self {
+        Self {
+            fallback_snapshot: true,
+            stale_after_secs: 30,
         }
     }
 }
@@ -540,6 +561,7 @@ wireguard_health_targets = ["10.0.0.1"]
             engine,
             journal: JournalSettings::default(),
             ui: UiSettings::default(),
+            diagnostics: DiagnosticsSettings::default(),
             hooks: Vec::new(),
         };
         let migrated = migrate_settings(s).unwrap();

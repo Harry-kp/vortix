@@ -5,6 +5,7 @@
 //! protocol, platform, process, filesystem, or network work.
 
 pub mod command;
+pub mod diagnostics;
 pub mod hooks;
 pub mod model;
 pub mod persistence;
@@ -16,6 +17,11 @@ pub mod worker;
 
 pub use command::{
     ChallengeResponse, CommandRequest, Deadline, IdempotencyKey, Secret, UserCommand,
+};
+pub use diagnostics::{
+    ControlDiagnosticView, DiagnosticBuffer, DiagnosticCode, DiagnosticComponent, DiagnosticFields,
+    DiagnosticRecord, DiagnosticSeverity, DiagnosticSnapshot, DiagnosticSource, DiagnosticStatus,
+    DiagnosticView, FallbackDiagnosticState, HelperDiagnosticState,
 };
 pub use hooks::{HookEvent, HookEventId, LifecycleFact};
 pub use model::{
