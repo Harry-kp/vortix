@@ -6,7 +6,6 @@
 //! - Predictable state changes
 //! - Testable update logic
 
-use crate::core::scanner::ActiveSession;
 use crate::core::telemetry::TelemetryUpdate;
 use crate::state::{FocusedPanel, ToastType};
 
@@ -137,75 +136,10 @@ pub enum Message {
     Quit,
     /// Background telemetry update
     Telemetry(TelemetryUpdate),
-    /// Periodic system state synchronization (active profiles +
-    /// default-route interface). The route iface is probed by the
-    /// scanner's background thread alongside the active-session work
-    /// so the main thread NEVER blocks on `route get default` /
-    /// `ip route show default` — the registry's primary-tunnel
-    /// election reads the cached value handed in here.
-    SyncSystemState {
-        sessions: Vec<ActiveSession>,
-        default_route: crate::vortix_core::ports::route_table::DefaultRouteObservation,
-    },
-    /// Completion from the single bounded DNS policy worker.
-    DnsPolicyResult {
-        revision: u64,
-        coordinator: crate::vortix_core::ports::dns::DnsPolicyCoordinator,
-        external_sessions: usize,
-        error: Option<String>,
-    },
+    /// New immutable publication from the canonical control owner.
+    ControlSnapshot(Box<crate::vortix_core::control::ControlSnapshot>),
     /// Periodic heartbeat tick
     Tick,
-    /// Connection timeout detected
-    ConnectionTimeout(String),
-    /// Default gateway changed (network switch, sleep/wake)
-    NetworkChanged,
-    /// Retry a failed connection after exponential backoff delay
-    RetryConnect {
-        /// Stable profile identity to retry. The current catalog index is
-        /// resolved only when the delayed message is delivered.
-        profile_id: crate::vortix_core::profile::ProfileId,
-        /// Which attempt this is (1-based)
-        attempt: u32,
-    },
-    /// Result from the background connect thread
-    ConnectResult {
-        /// Profile name that was being connected
-        profile: String,
-        /// Whether the connect command succeeded
-        success: bool,
-        /// Error message if the command failed
-        error: Option<String>,
-        /// Kernel-visible interface name as returned by the protocol
-        /// layer's `Tunnel::up()` (`OpenVPN` log scrape, wg-quick output
-        /// resolved via platform port). `Some(_)` on success;
-        /// `None` on failure or when the protocol-layer result didn't
-        /// carry one. This field is the only path from the connect-
-        /// worker thread back to `mirror_connect_into_registry`, so it
-        /// IS the authoritative iface seed for the new registry entry.
-        interface: Option<String>,
-        /// Kernel PID from the protocol layer's `Tunnel::up()` result.
-        /// Same flow rationale as `interface`.
-        pid: Option<u32>,
-        /// Exact attempt generation returned by the protocol adapter.
-        generation: u64,
-        /// Current-generation `WireGuard` proof; absent for `OpenVPN`/failure.
-        handshake: Option<crate::vortix_core::ports::tunnel::HandshakeEvidence>,
-        /// Per-peer protocol receipts for probes actually issued.
-        probe_receipts: Vec<crate::vortix_core::ports::tunnel::ProbeReceipt>,
-        /// Protocol-parsed/negotiated resolver intent. The receiving control
-        /// path recomputes the complete platform policy from all roles.
-        dns_request: crate::vortix_core::ports::dns::DnsRequest,
-    },
-    /// Result from the background disconnect thread
-    DisconnectResult {
-        /// Profile name that was being disconnected
-        profile: String,
-        /// Whether the disconnect command succeeded
-        success: bool,
-        /// Error message if the command failed
-        error: Option<String>,
-    },
     /// Terminal resize event
     Resize(u16, u16),
     /// Import profile from path

@@ -95,6 +95,7 @@ async fn committed_connect_lifecycle_has_stable_ordered_event_ids() {
         .submit(CommandRequest {
             command: UserCommand::Connect {
                 profile_id: profile_id(),
+                conflict_acknowledgement: None,
             },
             idempotency_key: IdempotencyKey::new("hook-connect"),
             deadline: Deadline(u64::MAX),
@@ -204,6 +205,7 @@ async fn expiry_after_queue_admission_keeps_start_and_failure_facts_ordered() {
     let mut admission = Box::pin(client.submit(CommandRequest {
         command: UserCommand::Connect {
             profile_id: profile_id(),
+            conflict_acknowledgement: None,
         },
         idempotency_key: IdempotencyKey::new("hook-expired-in-queue"),
         deadline: Deadline(1),
@@ -256,6 +258,7 @@ async fn connect_failure_is_observational_and_keeps_operation_terminal() {
         .submit(CommandRequest {
             command: UserCommand::Connect {
                 profile_id: profile_id(),
+                conflict_acknowledgement: None,
             },
             idempotency_key: IdempotencyKey::new("hook-failure"),
             deadline: Deadline(u64::MAX),

@@ -9,6 +9,7 @@ use crate::vortix_core::engine::registry::Conflict;
 use crate::vortix_core::engine::state::{ConnectionHealth, DegradedReason, FailureReason};
 use crate::vortix_core::profile::{ProfileId, ProtocolKind};
 use crate::vortix_core::state::killswitch::KillSwitchMode;
+use crate::vortix_core::state::KillSwitchState;
 
 pub const SCHEMA_VERSION: u32 = 1;
 pub const MAX_PROTECTION_AGE_MILLIS: u64 = 5_000;
@@ -176,6 +177,11 @@ pub struct DesiredState {
     pub kill_switch: KillSwitchMode,
     pub authority_epoch: AuthorityEpoch,
     pub policy_digest: PolicyDigest,
+    /// User-confirmed topology conflicts, keyed by the profile whose
+    /// connection was admitted. The acknowledgement is durable so a
+    /// supervised reconnect cannot silently lose the user's exact consent.
+    #[serde(default)]
+    pub conflict_acknowledgements: BTreeMap<ProfileId, Conflict>,
 }
 
 impl Default for DesiredState {
@@ -186,6 +192,7 @@ impl Default for DesiredState {
             kill_switch: KillSwitchMode::Off,
             authority_epoch: AuthorityEpoch::default(),
             policy_digest: PolicyDigest::default(),
+            conflict_acknowledgements: BTreeMap::new(),
         }
     }
 }
@@ -226,6 +233,15 @@ pub struct ObservedState {
     pub evidence_received_at_millis: Option<u64>,
     /// Observer-owned tunnel facts. They never overwrite desired intent.
     pub tunnels: BTreeMap<ProfileId, ObservedTunnel>,
+    /// Redacted, user-visible kernel/session metadata for renderer parity.
+    /// Process ownership, teardown configuration, and DNS capabilities remain
+    /// skipped by the reused engine details serde contract.
+    #[serde(default)]
+    pub tunnel_details: BTreeMap<ProfileId, ObservedTunnelDetails>,
+    /// Latest kernel default-route observation used to derive one primary
+    /// tunnel (or an explicit no-primary projection).
+    #[serde(default)]
+    pub default_route: Option<ObservedDefaultRoute>,
     /// Protocol-authoritative `WireGuard` evidence, fenced to the current
     /// desired generation. Scanner presence can never populate this map.
     #[serde(default)]
@@ -257,6 +273,21 @@ pub struct ObservedTunnel {
     pub observed_at_millis: u64,
     /// Authority-clock receipt time. Observer clocks are never used for
     /// ordering or deadlines.
+    pub received_at_millis: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ObservedTunnelDetails {
+    pub details: crate::vortix_core::engine::state::DetailedConnectionInfo,
+    pub started_at: Option<SystemTime>,
+    pub observed_at_millis: u64,
+    pub received_at_millis: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservedDefaultRoute {
+    pub interface_name: Option<String>,
+    pub observed_at_millis: u64,
     pub received_at_millis: u64,
 }
 
@@ -294,6 +325,11 @@ pub struct EffectiveState {
     pub authority_epoch: AuthorityEpoch,
     pub policy_digest: PolicyDigest,
     pub freshness: Freshness,
+    /// Policy-owner truth for the effective kill-switch state. `None` means
+    /// the authority has not yet produced enough evidence to make a claim;
+    /// clients must not reinterpret generic protection as a firewall state.
+    #[serde(default)]
+    pub kill_switch: Option<KillSwitchState>,
 }
 
 impl Default for EffectiveState {
@@ -307,6 +343,7 @@ impl Default for EffectiveState {
                 ceiling_millis: MAX_PROTECTION_AGE_MILLIS,
                 ..Freshness::default()
             },
+            kill_switch: None,
         }
     }
 }
@@ -487,6 +524,20 @@ pub enum Observation {
         /// close gates invalidated by this tunnel change without a false
         /// protected publication between the two facts.
         protection: Option<ProtectionEvidence>,
+    },
+    /// Rich, redacted session metadata observed alongside tunnel presence.
+    /// It can enrich a projection but can never create connection truth.
+    TunnelDetails {
+        profile_id: ProfileId,
+        details: Box<crate::vortix_core::engine::state::DetailedConnectionInfo>,
+        started_at: Option<SystemTime>,
+        observed_at_millis: u64,
+    },
+    /// Kernel default-route interface observation used for canonical role
+    /// projection. `None` is an explicit no-default-route observation.
+    DefaultRoute {
+        interface_name: Option<String>,
+        observed_at_millis: u64,
     },
     Drift {
         profile_id: Option<ProfileId>,

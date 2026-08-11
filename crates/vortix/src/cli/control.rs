@@ -1,8 +1,9 @@
 //! Standard-mode CLI adapter for the canonical in-process control service.
 
-use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -20,10 +21,11 @@ use crate::vortix_config::profile_store::{FsProfileStore, ProfileStore, ProfileS
 use crate::vortix_core::control::worker::TunnelRevision;
 use crate::vortix_core::control::{
     AdmissionError, AuthorityEpoch, CommandRequest, ControlPersistenceConfig, ControlService,
-    ControlServiceConfig, ControlSnapshot, ControlStateStore, ExecutionSelection, IdempotencyKey,
-    Observation, OperationId, OperationIntent, OperationRecord, OperationResult, OperationStatus,
-    ProfileMutation, ProfileMutationApplied, ProfileMutationExecutor, ProfileMutationFailure,
-    ProfileMutationWork, ProfileTopology, RealClock, RequestedTunnelState, UserCommand,
+    ControlServiceConfig, ControlSnapshot, ControlStateStore, ControlSubscription,
+    ExecutionSelection, IdempotencyKey, Observation, OperationId, OperationIntent, OperationRecord,
+    OperationResult, OperationStatus, ProfileMutation, ProfileMutationApplied,
+    ProfileMutationExecutor, ProfileMutationFailure, ProfileMutationWork, ProfileTopology,
+    RealClock, RequestedTunnelState, UserCommand,
 };
 use crate::vortix_core::profile::{Profile, ProfileId};
 
@@ -36,6 +38,7 @@ const SCANNER_REFRESH_CEILING: Duration = Duration::from_millis(250);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 const SUPERVISED_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const HOOK_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
+const TUI_ADMISSION_CAPACITY: usize = 8;
 
 #[derive(Debug, Error)]
 pub enum LocalControlError {
@@ -55,6 +58,8 @@ pub enum LocalControlError {
     Observation(String),
     #[error("local control service refused the command: {0}")]
     Admission(AdmissionError),
+    #[error("local control command queue is busy; wait for an earlier request to finish")]
+    Busy,
     #[error("local control service stopped before the operation completed")]
     Stopped,
     #[error("interactive challenge was cancelled")]
@@ -98,6 +103,84 @@ pub enum LocalProfileMutationReceipt {
     },
 }
 
+#[derive(Debug)]
+pub(crate) struct LocalCatalogUpdate {
+    pub revision: u64,
+    pub profiles: Vec<VpnProfile>,
+    pub outcomes: Vec<Result<LocalProfileMutationReceipt, ProfileMutationFailure>>,
+}
+
+/// A durable admission result produced off the terminal thread. The permit is
+/// retained until the TUI drains this value, so queued, executing, and
+/// completed-but-undrained requests share one strict capacity bound.
+pub(crate) struct LocalTuiAdmissionResult {
+    pub command: UserCommand,
+    pub operation_id: Result<OperationId, LocalControlError>,
+    pub import_display_name: Option<String>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+struct TuiAdmissionJob {
+    request: CommandRequest,
+    command: UserCommand,
+    import: Option<(ProfileId, String)>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+struct TuiAdmissionQueue {
+    sender: tokio::sync::mpsc::Sender<TuiAdmissionJob>,
+    results: RefCell<tokio::sync::mpsc::Receiver<LocalTuiAdmissionResult>>,
+    permits: Arc<tokio::sync::Semaphore>,
+}
+
+fn start_tui_admission_queue(
+    runtime: &tokio::runtime::Runtime,
+    client: crate::vortix_core::control::ControlHandle,
+    profile_mutations: Arc<StandardProfileMutationExecutor>,
+) -> TuiAdmissionQueue {
+    let (sender, mut receiver) =
+        tokio::sync::mpsc::channel::<TuiAdmissionJob>(TUI_ADMISSION_CAPACITY);
+    let (result_sender, results) = tokio::sync::mpsc::channel(TUI_ADMISSION_CAPACITY);
+    runtime.spawn(async move {
+        while let Some(job) = receiver.recv().await {
+            let result = client
+                .submit(job.request)
+                .await
+                .map(|admitted| admitted.operation_id)
+                .map_err(LocalControlError::Admission);
+            if result.is_err() {
+                if let Some((profile_id, _)) = &job.import {
+                    profile_mutations.discard_prepared_import(profile_id);
+                }
+            }
+            let import_display_name = job.import.map(|(_, display_name)| display_name);
+            if result_sender
+                .send(LocalTuiAdmissionResult {
+                    command: job.command,
+                    operation_id: result,
+                    import_display_name,
+                    _permit: job.permit,
+                })
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    TuiAdmissionQueue {
+        sender,
+        results: RefCell::new(results),
+        permits: Arc::new(tokio::sync::Semaphore::new(TUI_ADMISSION_CAPACITY)),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct PublishedTunnelDetails {
+    details: crate::vortix_core::engine::state::DetailedConnectionInfo,
+    started_at: Option<std::time::SystemTime>,
+}
+
 struct StandardProfileMutationExecutor {
     profiles_dir: std::path::PathBuf,
     profiles: Mutex<BTreeMap<ProfileId, VpnProfile>>,
@@ -106,6 +189,9 @@ struct StandardProfileMutationExecutor {
     prepared_topologies: Mutex<BTreeMap<ProfileId, Option<ProfileTopology>>>,
     results:
         Mutex<BTreeMap<OperationId, Result<LocalProfileMutationReceipt, ProfileMutationFailure>>>,
+    catalog_revision: AtomicU64,
+    #[cfg(test)]
+    next_execution_delay: Mutex<Option<Duration>>,
 }
 
 impl std::fmt::Debug for StandardProfileMutationExecutor {
@@ -144,7 +230,51 @@ impl StandardProfileMutationExecutor {
             topologies: Mutex::new(topologies),
             prepared_topologies: Mutex::new(prepared_topologies),
             results: Mutex::new(BTreeMap::new()),
+            catalog_revision: AtomicU64::new(0),
+            #[cfg(test)]
+            next_execution_delay: Mutex::new(None),
         }
+    }
+
+    fn profiles_snapshot(&self) -> Vec<VpnProfile> {
+        self.profiles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    fn core_profile(&self, profile_id: &ProfileId) -> Option<Profile> {
+        let profile = self
+            .profiles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(profile_id)
+            .cloned()?;
+        let resolved = self
+            .topologies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(profile_id)
+            .map(|topology| topology.resolved_endpoints.clone())
+            .unwrap_or_default();
+        Some(
+            crate::tunnel::profile_view(&profile)
+                .with_endpoint_resolutions(resolved)
+                .require_managed_endpoint_resolution(),
+        )
+    }
+
+    fn core_profiles_snapshot(&self) -> BTreeMap<ProfileId, Profile> {
+        self.profiles_snapshot()
+            .into_iter()
+            .filter_map(|profile| {
+                let profile_id = profile.id.clone();
+                self.core_profile(&profile_id)
+                    .map(|core| (profile_id, core))
+            })
+            .collect()
     }
 
     fn take_result(
@@ -155,6 +285,58 @@ impl StandardProfileMutationExecutor {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(operation_id)
+    }
+
+    fn prepare_import(
+        &self,
+        prepared: crate::vpn::PreparedProfileImport,
+        topology: Option<ProfileTopology>,
+    ) -> ProfileId {
+        let profile_id = prepared.profile().id.clone();
+        self.prepared_imports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(profile_id.clone(), prepared);
+        self.prepared_topologies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(profile_id.clone(), topology);
+        profile_id
+    }
+
+    fn discard_prepared_import(&self, profile_id: &ProfileId) {
+        self.prepared_imports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(profile_id);
+        self.prepared_topologies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(profile_id);
+    }
+
+    #[cfg(test)]
+    fn prepared_import_count(&self) -> usize {
+        self.prepared_imports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    #[cfg(test)]
+    fn delay_next_execution(&self, delay: Duration) {
+        self.next_execution_delay
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace(delay);
+    }
+
+    fn catalog_revision(&self) -> u64 {
+        self.catalog_revision.load(Ordering::Acquire)
+    }
+
+    fn advance_catalog_revision(&self) {
+        self.catalog_revision.fetch_add(1, Ordering::Release);
     }
 
     fn map_store_error(error: &ProfileStoreError) -> ProfileMutationFailure {
@@ -194,6 +376,15 @@ impl ProfileMutationExecutor for StandardProfileMutationExecutor {
         &self,
         work: ProfileMutationWork,
     ) -> Result<ProfileMutationApplied, ProfileMutationFailure> {
+        #[cfg(test)]
+        if let Some(delay) = self
+            .next_execution_delay
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            std::thread::sleep(delay);
+        }
         let operation_id = work.operation_id.clone();
         let result = (|| match work.mutation {
             ProfileMutation::Import { profile_id } => {
@@ -221,6 +412,7 @@ impl ProfileMutationExecutor for StandardProfileMutationExecutor {
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .insert(profile_id.clone(), topology.clone());
                 }
+                self.advance_catalog_revision();
                 self.record(
                     operation_id.clone(),
                     Ok(LocalProfileMutationReceipt::Imported(profile)),
@@ -246,29 +438,24 @@ impl ProfileMutationExecutor for StandardProfileMutationExecutor {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .get(&profile_id)
-                    .cloned();
+                    .cloned()
+                    .ok_or(ProfileMutationFailure::Internal)?;
                 let store = FsProfileStore::new(self.profiles_dir.clone());
                 let renamed = store
                     .rename(&profile_id, &new_display_name)
                     .map_err(|error| Self::map_store_error(&error))?;
                 profile.name = renamed.display_name;
                 profile.config_path = renamed.config_path;
-                if let Some(topology) = &mut topology {
-                    topology.display_name = Some(profile.name.clone());
-                }
+                topology.display_name = Some(profile.name.clone());
                 self.profiles
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .insert(profile_id.clone(), profile.clone());
-                let mut topologies = self
-                    .topologies
+                self.topologies
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if let Some(topology) = &topology {
-                    topologies.insert(profile_id.clone(), topology.clone());
-                } else {
-                    topologies.remove(&profile_id);
-                }
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(profile_id.clone(), topology.clone());
+                self.advance_catalog_revision();
                 self.record(
                     operation_id.clone(),
                     Ok(LocalProfileMutationReceipt::Renamed(profile)),
@@ -303,6 +490,7 @@ impl ProfileMutationExecutor for StandardProfileMutationExecutor {
                         &profile.name,
                     );
                 }
+                self.advance_catalog_revision();
                 self.record(
                     operation_id.clone(),
                     Ok(LocalProfileMutationReceipt::Deleted {
@@ -324,17 +512,31 @@ impl ProfileMutationExecutor for StandardProfileMutationExecutor {
 /// tunnel-scoped protocol custodian may outlive this process.
 pub struct LocalControlSession {
     // Drop the service while its Tokio runtime is still alive.
-    service: ControlService,
+    service: Option<ControlService>,
     // The executor holds only a Weak edge, avoiding a service/supervisor cycle.
-    challenge_issuer: Arc<crate::vortix_core::control::CompleterHandle>,
+    _challenge_issuer: Arc<crate::vortix_core::control::CompleterHandle>,
     hooks: Option<crate::hooks::HookRunner>,
-    runtime: tokio::runtime::Runtime,
-    profiles: Arc<Vec<VpnProfile>>,
+    runtime: Option<tokio::runtime::Runtime>,
+    subscription: RefCell<ControlSubscription>,
     topology_errors: BTreeMap<ProfileId, String>,
     owned_active_profiles: std::collections::BTreeSet<ProfileId>,
     unowned_active_profiles: Vec<String>,
     sessions: Arc<Mutex<Vec<ActiveSession>>>,
     published_observations: RefCell<BTreeMap<ProfileId, (bool, Option<String>)>>,
+    published_default_route:
+        RefCell<crate::vortix_core::ports::route_table::DefaultRouteObservation>,
+    published_tunnel_details: RefCell<BTreeMap<ProfileId, PublishedTunnelDetails>>,
+    profile_mutations: Arc<StandardProfileMutationExecutor>,
+    tui_admission: TuiAdmissionQueue,
+    last_catalog_revision: Cell<u64>,
+    reported_profile_operations: RefCell<std::collections::BTreeSet<OperationId>>,
+    pending_scan: RefCell<
+        Option<(
+            u64,
+            tokio::task::JoinHandle<crate::core::scanner::ScannerResult>,
+        )>,
+    >,
+    last_scan_started: Cell<Instant>,
 }
 
 /// Lightweight Standard-mode authority for profile catalog mutations. It
@@ -505,13 +707,107 @@ where
 }
 
 impl LocalControlSession {
+    fn service(&self) -> &ControlService {
+        self.service
+            .as_ref()
+            .expect("local control service is available until bounded shutdown")
+    }
+
+    fn runtime(&self) -> &tokio::runtime::Runtime {
+        self.runtime
+            .as_ref()
+            .expect("local control runtime is available until bounded shutdown")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_profile_test(
+        config_dir: &Path,
+        profiles: Vec<VpnProfile>,
+    ) -> Result<Self, LocalControlError> {
+        Self::start_profile_test_with_persistence(config_dir, profiles, None)
+    }
+
+    #[cfg(test)]
+    fn start_profile_test_with_persistence(
+        config_dir: &Path,
+        profiles: Vec<VpnProfile>,
+        persistence: Option<ControlPersistenceConfig>,
+    ) -> Result<Self, LocalControlError> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("vortix-local-control-test")
+            .enable_all()
+            .build()
+            .map_err(|error| LocalControlError::Runtime(error.to_string()))?;
+        let profiles = Arc::new(profiles);
+        let mut cache = EndpointResolutionCache::default();
+        let (topologies, topology_errors) = load_profile_topologies(&profiles, &mut cache);
+        let profile_mutations = Arc::new(StandardProfileMutationExecutor::new(
+            config_dir.join(crate::constants::PROFILES_DIR_NAME),
+            &profiles,
+            Vec::new(),
+            topologies.clone(),
+            BTreeMap::new(),
+        ));
+        let service = {
+            let _runtime_guard = runtime.enter();
+            ControlService::start_with_clock(
+                ControlServiceConfig {
+                    known_profiles: profiles.iter().map(|profile| profile.id.clone()).collect(),
+                    profile_topologies: topologies,
+                    profile_mutations: Some(profile_mutations.clone()),
+                    authority_epoch: STANDARD_AUTHORITY_EPOCH,
+                    freshness_poll_interval: CONTROL_PROGRESS_INTERVAL,
+                    persistence,
+                    ..ControlServiceConfig::default()
+                },
+                Arc::new(RealClock),
+            )
+        };
+        let challenge_issuer = Arc::new(service.completer());
+        runtime
+            .block_on(
+                service
+                    .completer()
+                    .set_readiness(STANDARD_AUTHORITY_EPOCH, true, true),
+            )
+            .map_err(|error| LocalControlError::Persistence(error.to_string()))?;
+        let subscription = service.client().subscribe();
+        let tui_admission =
+            start_tui_admission_queue(&runtime, service.client(), Arc::clone(&profile_mutations));
+        Ok(Self {
+            service: Some(service),
+            _challenge_issuer: challenge_issuer,
+            hooks: None,
+            runtime: Some(runtime),
+            subscription: RefCell::new(subscription),
+            topology_errors,
+            owned_active_profiles: std::collections::BTreeSet::new(),
+            unowned_active_profiles: Vec::new(),
+            sessions: Arc::new(Mutex::new(Vec::new())),
+            published_observations: RefCell::new(BTreeMap::new()),
+            published_default_route: RefCell::new(
+                crate::vortix_core::ports::route_table::DefaultRouteObservation::ProbeFailed,
+            ),
+            published_tunnel_details: RefCell::new(BTreeMap::new()),
+            profile_mutations,
+            tui_admission,
+            last_catalog_revision: Cell::new(0),
+            reported_profile_operations: RefCell::new(std::collections::BTreeSet::new()),
+            pending_scan: RefCell::new(None),
+            last_scan_started: Cell::new(Instant::now()),
+        })
+    }
+
     #[allow(clippy::too_many_lines)]
     pub fn start(
         config: &crate::config::AppConfig,
         config_dir: &Path,
         profiles: Vec<VpnProfile>,
     ) -> Result<Self, LocalControlError> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("vortix-local-control")
             .enable_all()
             .build()
             .map_err(|error| LocalControlError::Runtime(error.to_string()))?;
@@ -533,7 +829,8 @@ impl LocalControlSession {
             StandardTunnelOwnershipStore::production(owner.0)
                 .map_err(|error| LocalControlError::Ownership(error.to_string()))?,
         );
-        let initial_sessions = crate::core::scanner::get_active_profiles(&profiles);
+        let initial_scan = crate::core::scanner::gather_system_state(&profiles);
+        let initial_sessions = initial_scan.sessions.clone();
         let sessions = Arc::new(Mutex::new(initial_sessions.clone()));
 
         let cache_bytes = state_store
@@ -545,6 +842,13 @@ impl LocalControlSession {
             .retain_profiles(&profiles.iter().map(|profile| profile.id.clone()).collect());
         let (topologies, topology_errors) = load_profile_topologies(&profiles, &mut endpoint_cache);
         persist_endpoint_cache_if_changed(&state_store, cache_bytes.as_deref(), &endpoint_cache)?;
+        let profile_mutations = Arc::new(StandardProfileMutationExecutor::new(
+            config_dir.join(crate::constants::PROFILES_DIR_NAME),
+            &profiles,
+            Vec::new(),
+            topologies.clone(),
+            BTreeMap::new(),
+        ));
         let core_profiles = Arc::new(
             profiles
                 .iter()
@@ -561,11 +865,15 @@ impl LocalControlSession {
                 .collect::<BTreeMap<_, _>>(),
         );
 
-        let executor_profiles = Arc::clone(&core_profiles);
-        let scanner_profiles = Arc::clone(&profiles);
+        let executor_catalog = Arc::clone(&profile_mutations);
+        let scanner_catalog = Arc::clone(&profile_mutations);
         let executor_sessions = Arc::clone(&sessions);
         let session_resolver = move |profile_id: &ProfileId| {
-            current_session(&scanner_profiles, &executor_sessions, profile_id)
+            current_session(
+                &scanner_catalog.profiles_snapshot(),
+                &executor_sessions,
+                profile_id,
+            )
         };
         let executor = Arc::new(CanonicalTunnelExecutor::new_standard(
             CanonicalTunnelSettings {
@@ -575,39 +883,40 @@ impl LocalControlSession {
                 wireguard_handshake_timeout_secs: config.wireguard_handshake_timeout_secs,
                 wireguard_health_targets: config.ping_targets.clone(),
             },
-            move |profile_id| executor_profiles.get(profile_id).cloned(),
+            move |profile_id| executor_catalog.core_profile(profile_id),
             Arc::clone(&ownership),
             session_resolver,
         ));
 
         let policy_profiles = Arc::clone(&profiles);
-        let policy_session_profiles = Arc::clone(&profiles);
+        let policy_catalog = Arc::clone(&profile_mutations);
         let policy_sessions = Arc::clone(&sessions);
-        let external_profiles = Arc::clone(&core_profiles);
+        let external_catalog = Arc::clone(&profile_mutations);
         let external_ownership = Arc::clone(&ownership);
         let external_sessions = Arc::clone(&sessions);
         let external_active_profiles = external_session_profiles(
             &initial_sessions,
             &policy_profiles,
-            &external_profiles,
+            &core_profiles,
             &external_ownership,
         );
         let policy = Arc::new(CanonicalPolicyExecutor::new(
             config_dir.to_path_buf(),
             move |profile_id| {
-                current_session(&policy_session_profiles, &policy_sessions, profile_id)
+                current_session(
+                    &policy_catalog.profiles_snapshot(),
+                    &policy_sessions,
+                    profile_id,
+                )
             },
             move || {
                 let sessions = external_sessions
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                external_session_profiles(
-                    &sessions,
-                    &policy_profiles,
-                    &external_profiles,
-                    &external_ownership,
-                )
-                .len()
+                let profiles = external_catalog.profiles_snapshot();
+                let core_profiles = external_catalog.core_profiles_snapshot();
+                external_session_profiles(&sessions, &profiles, &core_profiles, &external_ownership)
+                    .len()
             },
         ));
         let supervisor = Arc::new(crate::vortix_core::control::supervisor::Supervisor::new(
@@ -649,6 +958,7 @@ impl LocalControlSession {
             ControlServiceConfig {
                 known_profiles: profiles.iter().map(|profile| profile.id.clone()).collect(),
                 profile_topologies: topologies,
+                profile_mutations: Some(profile_mutations.clone()),
                 authority_epoch: STANDARD_AUTHORITY_EPOCH,
                 initial_kill_switch_mode,
                 freshness_poll_interval: CONTROL_PROGRESS_INTERVAL,
@@ -664,22 +974,35 @@ impl LocalControlSession {
             .install_challenge_issuer(&challenge_issuer)
             .map_err(LocalControlError::Runtime)?;
         let hooks = crate::hooks::start_standard_control_hooks(config_dir, &service);
+        let subscription = service.client().subscribe();
+        let tui_admission =
+            start_tui_admission_queue(&runtime, service.client(), Arc::clone(&profile_mutations));
         let session = Self {
-            service,
-            challenge_issuer,
+            service: Some(service),
+            _challenge_issuer: challenge_issuer,
             hooks,
-            runtime,
-            profiles,
+            runtime: Some(runtime),
+            subscription: RefCell::new(subscription),
             topology_errors,
             owned_active_profiles,
             unowned_active_profiles,
             sessions,
             published_observations: RefCell::new(BTreeMap::new()),
+            published_default_route: RefCell::new(
+                crate::vortix_core::ports::route_table::DefaultRouteObservation::ProbeFailed,
+            ),
+            published_tunnel_details: RefCell::new(BTreeMap::new()),
+            profile_mutations,
+            tui_admission,
+            last_catalog_revision: Cell::new(0),
+            reported_profile_operations: RefCell::new(std::collections::BTreeSet::new()),
+            pending_scan: RefCell::new(None),
+            last_scan_started: Cell::new(Instant::now()),
         };
-        session.runtime.block_on(async {
-            session.publish_observations_from(initial_sessions).await?;
+        session.runtime().block_on(async {
+            session.publish_observations_from(initial_scan).await?;
             session
-                .service
+                .service()
                 .completer()
                 .set_readiness(STANDARD_AUTHORITY_EPOCH, true, true)
                 .await
@@ -699,6 +1022,242 @@ impl LocalControlSession {
                 profile: "unknown".into(),
             })
         })
+    }
+
+    /// Admit one typed command without consuming the Standard-mode authority.
+    /// The TUI calls this synchronously only for bounded in-memory admission;
+    /// protocol and policy effects remain on supervised workers.
+    pub fn submit(
+        &self,
+        command: UserCommand,
+        wait: Duration,
+        idempotency_key: impl Into<String>,
+    ) -> Result<OperationId, LocalControlError> {
+        self.validate(&command)?;
+        self.runtime().block_on(async {
+            let client = self.service().client();
+            client
+                .submit(CommandRequest {
+                    command,
+                    idempotency_key: IdempotencyKey::new(idempotency_key),
+                    deadline: client.deadline_after(wait),
+                })
+                .await
+                .map(|admitted| admitted.operation_id)
+                .map_err(LocalControlError::Admission)
+        })
+    }
+
+    /// Queue one TUI admission without waiting for durable state I/O. A
+    /// successful return means only that bounded local capacity was acquired;
+    /// the durable admission result is delivered by
+    /// [`Self::take_tui_admission_results`].
+    pub(crate) fn enqueue_tui_command(
+        &self,
+        command: UserCommand,
+        wait: Duration,
+        idempotency_key: impl Into<String>,
+    ) -> Result<(), LocalControlError> {
+        self.validate(&command)?;
+        let permit = Arc::clone(&self.tui_admission.permits)
+            .try_acquire_owned()
+            .map_err(|_| LocalControlError::Busy)?;
+        let client = self.service().client();
+        let request = CommandRequest {
+            command: command.clone(),
+            idempotency_key: IdempotencyKey::new(idempotency_key),
+            deadline: client.deadline_after(wait),
+        };
+        self.tui_admission
+            .sender
+            .try_send(TuiAdmissionJob {
+                request,
+                command,
+                import: None,
+                permit,
+            })
+            .map_err(|error| match error {
+                tokio::sync::mpsc::error::TrySendError::Full(_) => LocalControlError::Busy,
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => LocalControlError::Stopped,
+            })
+    }
+
+    /// Prepare and queue a TUI import. Prepared private material is discarded
+    /// if the asynchronous durable admission is later refused.
+    pub(crate) fn enqueue_tui_profile_import(
+        &self,
+        path: &Path,
+        wait: Duration,
+        idempotency_key: impl Into<String>,
+    ) -> Result<String, LocalControlError> {
+        let permit = Arc::clone(&self.tui_admission.permits)
+            .try_acquire_owned()
+            .map_err(|_| LocalControlError::Busy)?;
+        let prepared =
+            crate::vpn::prepare_profile_import(path, &self.profile_mutations.profiles_dir)
+                .map_err(|reason| LocalControlError::Profile {
+                    profile: path.display().to_string(),
+                    reason,
+                })?;
+        let display_name = prepared.profile().name.clone();
+        let mut cache = EndpointResolutionCache::default();
+        let topology = topology_for_profile(&prepared.topology_profile(), &mut cache).ok();
+        let profile_id = self.profile_mutations.prepare_import(prepared, topology);
+        let command = UserCommand::ImportProfile {
+            profile_id: profile_id.clone(),
+        };
+        let client = self.service().client();
+        let request = CommandRequest {
+            command: command.clone(),
+            idempotency_key: IdempotencyKey::new(idempotency_key),
+            deadline: client.deadline_after(wait),
+        };
+        let queued = self.tui_admission.sender.try_send(TuiAdmissionJob {
+            request,
+            command,
+            import: Some((profile_id.clone(), display_name.clone())),
+            permit,
+        });
+        if let Err(error) = queued {
+            self.profile_mutations.discard_prepared_import(&profile_id);
+            return Err(match error {
+                tokio::sync::mpsc::error::TrySendError::Full(_) => LocalControlError::Busy,
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => LocalControlError::Stopped,
+            });
+        }
+        Ok(display_name)
+    }
+
+    pub(crate) fn take_tui_admission_results(&self) -> Vec<LocalTuiAdmissionResult> {
+        let mut receiver = self.tui_admission.results.borrow_mut();
+        std::iter::from_fn(|| receiver.try_recv().ok()).collect()
+    }
+
+    #[cfg(test)]
+    fn prepared_import_count(&self) -> usize {
+        self.profile_mutations.prepared_import_count()
+    }
+
+    /// Mark and return the latest publication when attaching a client.
+    pub fn current_snapshot(&self) -> ControlSnapshot {
+        let snapshot = self.subscription.borrow_mut().current();
+        self.discard_terminal_prepared_imports(&snapshot);
+        snapshot
+    }
+
+    /// Advance the local actor and its single bounded scanner. A slow scan
+    /// never blocks the caller and snapshot delivery remains a separate step.
+    pub fn progress(&self) -> Result<(), LocalControlError> {
+        let completed = {
+            let pending = self.pending_scan.borrow();
+            pending.as_ref().is_some_and(|(_, scan)| scan.is_finished())
+        }
+        .then(|| self.pending_scan.borrow_mut().take())
+        .flatten();
+        if let Some((catalog_revision, completed)) = completed {
+            let scan = self.runtime().block_on(completed).map_err(|error| {
+                LocalControlError::Observation(format!("scanner worker did not complete: {error}"))
+            })?;
+            if catalog_revision == self.profile_mutations.catalog_revision() {
+                self.runtime()
+                    .block_on(self.publish_observations_from(scan))?;
+            }
+        }
+
+        let now = Instant::now();
+        if self.pending_scan.borrow().is_none()
+            && scanner_refresh_due(self.last_scan_started.get(), now)
+        {
+            let profiles = self.profile_mutations.profiles_snapshot();
+            let scan = self
+                .runtime()
+                .handle()
+                .spawn_blocking(move || crate::core::scanner::gather_system_state(&profiles));
+            self.pending_scan
+                .replace(Some((self.profile_mutations.catalog_revision(), scan)));
+            self.last_scan_started.set(now);
+        }
+        self.runtime().block_on(tokio::task::yield_now());
+        Ok(())
+    }
+
+    /// Return a changed immutable publication without cloning on idle turns.
+    pub fn take_changed_snapshot(&self) -> Result<Option<ControlSnapshot>, LocalControlError> {
+        let snapshot = self
+            .subscription
+            .borrow_mut()
+            .take_changed()
+            .map_err(|_| LocalControlError::Stopped)?;
+        if let Some(snapshot) = &snapshot {
+            self.discard_terminal_prepared_imports(snapshot);
+        }
+        Ok(snapshot)
+    }
+
+    fn discard_terminal_prepared_imports(&self, snapshot: &ControlSnapshot) {
+        for operation in snapshot.operations.values() {
+            let OperationIntent::ProfileMutation { profile_id } = &operation.intent else {
+                continue;
+            };
+            if operation.status.is_terminal() {
+                // The executor removes successful imports before committing.
+                // This idempotent cleanup covers all paths that become
+                // terminal before `ProfileMutationExecutor::execute`, such as
+                // queue expiry or dispatch failure.
+                self.profile_mutations.discard_prepared_import(profile_id);
+            }
+        }
+    }
+
+    pub(crate) fn take_catalog_update(
+        &self,
+        snapshot: &ControlSnapshot,
+    ) -> Option<LocalCatalogUpdate> {
+        let mut outcomes = Vec::new();
+        let mut reported = self.reported_profile_operations.borrow_mut();
+        for (operation_id, operation) in &snapshot.operations {
+            if !operation.status.is_terminal()
+                || !matches!(operation.intent, OperationIntent::ProfileMutation { .. })
+                || !reported.insert(operation_id.clone())
+            {
+                continue;
+            }
+            if let Some(result) = self.profile_mutations.take_result(operation_id) {
+                outcomes.push(result);
+            }
+        }
+        let revision = self.profile_mutations.catalog_revision();
+        if revision == self.last_catalog_revision.get() && outcomes.is_empty() {
+            return None;
+        }
+        self.last_catalog_revision.set(revision);
+        Some(LocalCatalogUpdate {
+            revision,
+            profiles: self.profile_mutations.profiles_snapshot(),
+            outcomes,
+        })
+    }
+
+    pub fn respond_challenge(
+        &self,
+        challenge_id: crate::vortix_core::control::ChallengeId,
+        answer: Vec<u8>,
+    ) -> Result<(), LocalControlError> {
+        self.runtime()
+            .block_on(self.service().client().respond_challenge(
+                challenge_id,
+                crate::vortix_core::control::Secret::new(answer),
+            ))
+            .map_err(map_challenge_response_error)
+    }
+
+    pub fn cancel_challenge(
+        &self,
+        challenge_id: crate::vortix_core::control::ChallengeId,
+    ) -> Result<(), LocalControlError> {
+        self.runtime()
+            .block_on(self.service().client().cancel_challenge(challenge_id))
+            .map_err(map_challenge_response_error)
     }
 
     #[allow(
@@ -721,8 +1280,8 @@ impl LocalControlSession {
     {
         self.validate(&command)?;
         let challenge_responder = Arc::new(Mutex::new(answer_challenge));
-        let result = self.runtime.block_on(async {
-            let client = self.service.client();
+        let result = self.runtime().block_on(async {
+            let client = self.service().client();
             let admitted = client
                 .submit(CommandRequest {
                     command,
@@ -747,12 +1306,12 @@ impl LocalControlSession {
                     .is_some_and(tokio::task::JoinHandle::is_finished)
                 {
                     let completed = pending_scan.take().expect("finished scan checked");
-                    let sessions = completed.await.map_err(|error| {
+                    let scan = completed.await.map_err(|error| {
                         LocalControlError::Observation(format!(
                             "scanner worker did not complete: {error}"
                         ))
                     })?;
-                    self.publish_observations_from(sessions).await?;
+                    self.publish_observations_from(scan).await?;
                 }
                 let snapshot = client.snapshot();
                 let pending_challenges = snapshot
@@ -813,9 +1372,9 @@ impl LocalControlSession {
                 }
                 let now = Instant::now();
                 if pending_scan.is_none() && scanner_refresh_due(last_scan_started, now) {
-                    let profiles = Arc::clone(&self.profiles);
+                    let profiles = self.profile_mutations.profiles_snapshot();
                     pending_scan = Some(tokio::task::spawn_blocking(move || {
-                        crate::core::scanner::get_active_profiles(&profiles)
+                        crate::core::scanner::gather_system_state(&profiles)
                     }));
                     last_scan_started = now;
                 }
@@ -823,7 +1382,7 @@ impl LocalControlSession {
             }
         });
         if let Some(hooks) = self.hooks.take() {
-            self.runtime
+            self.runtime()
                 .block_on(hooks.shutdown_bounded(HOOK_SHUTDOWN_GRACE));
         }
         // Tokio waits indefinitely for started `spawn_blocking` work when a
@@ -831,10 +1390,14 @@ impl LocalControlSession {
         // the operation becomes terminal, so stop the service first and give
         // the runtime a finite drain window instead of extending CLI shutdown
         // to the duration of a slow platform probe.
-        let _ = self.service.shutdown_bounded(SUPERVISED_SHUTDOWN_GRACE);
-        drop(self.service);
-        drop(self.challenge_issuer);
-        self.runtime.shutdown_timeout(SHUTDOWN_GRACE);
+        if let Some(service) = self.service.take() {
+            let _ = service.shutdown_bounded(SUPERVISED_SHUTDOWN_GRACE);
+        }
+        drop(self._challenge_issuer);
+        self.runtime
+            .take()
+            .expect("local control runtime is present during shutdown")
+            .shutdown_timeout(SHUTDOWN_GRACE);
         result
     }
 
@@ -852,8 +1415,8 @@ impl LocalControlSession {
                 .iter()
                 .find(|(profile_id, _)| self.owned_active_profiles.contains(*profile_id))
             {
-                let profile = self
-                    .profiles
+                let profiles = self.profile_mutations.profiles_snapshot();
+                let profile = profiles
                     .iter()
                     .find(|profile| &profile.id == profile_id)
                     .map_or_else(|| profile_id.to_string(), |profile| profile.name.clone());
@@ -886,7 +1449,7 @@ impl LocalControlSession {
 
     fn validate_command_target(&self, command: &UserCommand) -> Result<(), LocalControlError> {
         validate_command_target(
-            &self.profiles,
+            &self.profile_mutations.profiles_snapshot(),
             &self.topology_errors,
             &self.unowned_active_profiles,
             command,
@@ -895,19 +1458,87 @@ impl LocalControlSession {
 
     async fn publish_observations_from(
         &self,
-        sessions: Vec<ActiveSession>,
+        scan: crate::core::scanner::ScannerResult,
     ) -> Result<(), LocalControlError> {
+        let sessions = scan.sessions;
+        let profiles = self.profile_mutations.profiles_snapshot();
         self.sessions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone_from(&sessions);
-        let observer = self.service.observer();
+        let observer = self.service().observer();
         let observed_at_millis = observer.now_millis();
-        let changed = observation_changes(
-            &self.profiles,
-            &sessions,
-            &self.published_observations.borrow(),
-        );
+        let default_route = scan.default_route;
+        let default_route_changed = !matches!(
+            default_route,
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::ProbeFailed
+        ) && *self.published_default_route.borrow() != default_route;
+        if default_route_changed {
+            let interface_name = match &default_route {
+                crate::vortix_core::ports::route_table::DefaultRouteObservation::Interface(
+                    interface_name,
+                ) => Some(interface_name.clone()),
+                crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute => {
+                    None
+                }
+                crate::vortix_core::ports::route_table::DefaultRouteObservation::ProbeFailed => {
+                    unreachable!("probe failures are filtered before publication")
+                }
+            };
+            observer
+                .observe(Observation::DefaultRoute {
+                    interface_name,
+                    observed_at_millis,
+                })
+                .await
+                .map_err(|error| LocalControlError::Observation(error.to_string()))?;
+            self.published_default_route.replace(default_route);
+        }
+        let mut observed_detail_profiles = std::collections::BTreeSet::new();
+        for session in &sessions {
+            let Some(profile) = profiles.iter().find(|profile| profile.name == session.name) else {
+                continue;
+            };
+            observed_detail_profiles.insert(profile.id.clone());
+            let published = PublishedTunnelDetails {
+                details: crate::vortix_core::engine::state::DetailedConnectionInfo {
+                    interface: session.interface.clone(),
+                    interface_authoritative: session.interface_authoritative,
+                    internal_ip: session.internal_ip.clone(),
+                    endpoint: session.endpoint.clone(),
+                    mtu: session.mtu.clone(),
+                    public_key: session.public_key.clone(),
+                    listen_port: session.listen_port.clone(),
+                    transfer_rx: session.transfer_rx.clone(),
+                    transfer_tx: session.transfer_tx.clone(),
+                    latest_handshake: session.latest_handshake.clone(),
+                    pid: session.pid,
+                    ..crate::vortix_core::engine::state::DetailedConnectionInfo::default()
+                },
+                started_at: session.started_at,
+            };
+            let changed =
+                self.published_tunnel_details.borrow().get(&profile.id) != Some(&published);
+            if changed {
+                observer
+                    .observe(Observation::TunnelDetails {
+                        profile_id: profile.id.clone(),
+                        details: Box::new(published.details.clone()),
+                        started_at: published.started_at,
+                        observed_at_millis,
+                    })
+                    .await
+                    .map_err(|error| LocalControlError::Observation(error.to_string()))?;
+                self.published_tunnel_details
+                    .borrow_mut()
+                    .insert(profile.id.clone(), published);
+            }
+        }
+        self.published_tunnel_details
+            .borrow_mut()
+            .retain(|profile_id, _| observed_detail_profiles.contains(profile_id));
+        let changed =
+            observation_changes(&profiles, &sessions, &self.published_observations.borrow());
         for (profile_id, state) in changed {
             observer
                 .observe(Observation::Tunnel {
@@ -924,6 +1555,20 @@ impl LocalControlSession {
                 .insert(profile_id, state);
         }
         Ok(())
+    }
+}
+
+impl Drop for LocalControlSession {
+    fn drop(&mut self) {
+        if let (Some(hooks), Some(runtime)) = (self.hooks.take(), self.runtime.as_ref()) {
+            runtime.block_on(hooks.shutdown_bounded(HOOK_SHUTDOWN_GRACE));
+        }
+        // Service shutdown may need the executor. Keep the runtime alive for
+        // that bounded teardown, then detach any stalled blocking probe.
+        self.service.take();
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_timeout(SHUTDOWN_GRACE);
+        }
     }
 }
 
@@ -982,7 +1627,8 @@ fn validate_command_target(
     command: &UserCommand,
 ) -> Result<(), LocalControlError> {
     let target = match command {
-        UserCommand::Connect { profile_id }
+        UserCommand::Connect { profile_id, .. }
+        | UserCommand::ConnectExclusive { profile_id }
         | UserCommand::Disconnect {
             profile_id: Some(profile_id),
         }
@@ -1214,38 +1860,70 @@ pub(crate) fn config_owner(_config_dir: &Path) -> Result<(u32, u32), LocalContro
     ))
 }
 
-/// Read durable canonical intent without starting protocol or policy workers.
-/// This keeps an already-disconnected `down` unprivileged while ensuring a
-/// missing kernel tunnel cannot hide a still-connected desired state.
-pub(crate) fn durable_disconnect_required(
-    config_dir: &Path,
-    target_profiles: &BTreeSet<ProfileId>,
-) -> Result<bool, LocalControlError> {
-    let boot_id = crate::utils::boot_identity()
-        .ok_or_else(|| LocalControlError::Persistence("OS boot identity is unavailable".into()))?;
-    let owner = config_owner(config_dir)?;
-    let store = FsControlStateStore::for_owner(config_dir.join("control"), owner.0, owner.1);
-    let recovered = store
-        .load(&boot_id)
-        .map_err(|error| LocalControlError::Persistence(error.to_string()))?;
-    Ok(recovered.is_some_and(|recovered| {
-        desired_disconnect_required(&recovered.state.desired.tunnels, target_profiles)
-    }))
-}
-
-fn desired_disconnect_required(
-    desired: &BTreeMap<ProfileId, RequestedTunnelState>,
-    target_profiles: &BTreeSet<ProfileId>,
-) -> bool {
-    desired.iter().any(|(profile, state)| {
-        *state == RequestedTunnelState::Connected
-            && (target_profiles.is_empty() || target_profiles.contains(profile))
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug, Default)]
+    struct BlockingNextSaveStore {
+        armed: std::sync::atomic::AtomicBool,
+        entered: (Mutex<bool>, std::sync::Condvar),
+        released: (Mutex<bool>, std::sync::Condvar),
+    }
+
+    impl BlockingNextSaveStore {
+        fn arm(&self) {
+            self.armed.store(true, Ordering::SeqCst);
+            *self.entered.0.lock().unwrap() = false;
+            *self.released.0.lock().unwrap() = false;
+        }
+
+        fn wait_until_blocked(&self) {
+            let entered = self.entered.0.lock().unwrap();
+            let (entered, timeout) = self
+                .entered
+                .1
+                .wait_timeout_while(entered, Duration::from_secs(1), |entered| !*entered)
+                .unwrap();
+            assert!(*entered && !timeout.timed_out(), "state save did not block");
+        }
+
+        fn release(&self) {
+            *self.released.0.lock().unwrap() = true;
+            self.released.1.notify_all();
+        }
+    }
+
+    impl ControlStateStore for BlockingNextSaveStore {
+        fn load(
+            &self,
+            _current_boot_id: &str,
+        ) -> Result<
+            Option<crate::vortix_core::control::RecoveredControlState>,
+            crate::vortix_core::control::ControlStateStoreError,
+        > {
+            Ok(None)
+        }
+
+        fn save(
+            &self,
+            _current_boot_id: &str,
+            _state: &crate::vortix_core::control::DurableControlState,
+        ) -> Result<(), crate::vortix_core::control::ControlStateStoreError> {
+            if self.armed.swap(false, Ordering::SeqCst) {
+                *self.entered.0.lock().unwrap() = true;
+                self.entered.1.notify_all();
+                let released = self.released.0.lock().unwrap();
+                drop(
+                    self.released
+                        .1
+                        .wait_while(released, |released| !*released)
+                        .unwrap(),
+                );
+            }
+            Ok(())
+        }
+    }
 
     fn profile_id(seed: char) -> ProfileId {
         ProfileId::parse(seed.to_string().repeat(ProfileId::HEX_LEN)).unwrap()
@@ -1270,26 +1948,6 @@ mod tests {
             started + SCANNER_REFRESH_CEILING
         ));
         assert!(SCANNER_REFRESH_CEILING > CONTROL_PROGRESS_INTERVAL);
-    }
-
-    #[test]
-    fn inactive_down_still_requires_control_when_durable_intent_is_connected() {
-        let connected = profile_id('a');
-        let disconnected = profile_id('b');
-        let desired = BTreeMap::from([
-            (connected.clone(), RequestedTunnelState::Connected),
-            (disconnected.clone(), RequestedTunnelState::Disconnected),
-        ]);
-
-        assert!(desired_disconnect_required(&desired, &BTreeSet::new()));
-        assert!(desired_disconnect_required(
-            &desired,
-            &BTreeSet::from([connected])
-        ));
-        assert!(!desired_disconnect_required(
-            &desired,
-            &BTreeSet::from([disconnected])
-        ));
     }
 
     #[test]
@@ -1333,6 +1991,314 @@ mod tests {
             observation_changes(&[profile], &[changed], &published),
             vec![(profile_id('a'), (true, Some("wg1".into())))]
         );
+    }
+
+    #[test]
+    fn unchanged_local_session_has_no_snapshot_delivery() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join(crate::constants::PROFILES_DIR_NAME)).unwrap();
+        let session = LocalControlSession::start_profile_test(temp.path(), Vec::new()).unwrap();
+
+        assert!(session.take_changed_snapshot().unwrap().is_none());
+        assert!(session.take_changed_snapshot().unwrap().is_none());
+    }
+
+    #[test]
+    fn tui_enqueue_stays_prompt_while_durable_admission_is_blocked() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join(crate::constants::PROFILES_DIR_NAME)).unwrap();
+        let store = Arc::new(BlockingNextSaveStore::default());
+        let persistence = ControlPersistenceConfig::new(
+            "test-boot",
+            Arc::clone(&store) as Arc<dyn ControlStateStore>,
+        );
+        let session = LocalControlSession::start_profile_test_with_persistence(
+            temp.path(),
+            Vec::new(),
+            Some(persistence),
+        )
+        .unwrap();
+        store.arm();
+
+        let started = Instant::now();
+        session
+            .enqueue_tui_command(
+                UserCommand::SetKillSwitch {
+                    mode: crate::state::KillSwitchMode::Off,
+                },
+                Duration::from_secs(1),
+                "async-durable",
+            )
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "TUI enqueue waited for durable state I/O"
+        );
+        store.wait_until_blocked();
+        assert!(session.take_tui_admission_results().is_empty());
+
+        store.release();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let results = session.take_tui_admission_results();
+            if let Some(result) = results.into_iter().next() {
+                assert!(result.operation_id.is_ok());
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "durable result was not delivered"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn tui_admission_capacity_includes_undrained_results() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join(crate::constants::PROFILES_DIR_NAME)).unwrap();
+        let session = LocalControlSession::start_profile_test(temp.path(), Vec::new()).unwrap();
+        for sequence in 0..TUI_ADMISSION_CAPACITY {
+            session
+                .enqueue_tui_command(
+                    UserCommand::SetKillSwitch {
+                        mode: crate::state::KillSwitchMode::Off,
+                    },
+                    Duration::from_secs(1),
+                    format!("capacity-{sequence}"),
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            session.enqueue_tui_command(
+                UserCommand::SetKillSwitch {
+                    mode: crate::state::KillSwitchMode::Off,
+                },
+                Duration::from_secs(1),
+                "capacity-overflow",
+            ),
+            Err(LocalControlError::Busy)
+        ));
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut settled = 0;
+        loop {
+            settled += session.take_tui_admission_results().len();
+            if settled == TUI_ADMISSION_CAPACITY {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "admission results did not settle: received {settled}/{TUI_ADMISSION_CAPACITY}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(session
+            .enqueue_tui_command(
+                UserCommand::SetKillSwitch {
+                    mode: crate::state::KillSwitchMode::Off,
+                },
+                Duration::from_secs(1),
+                "capacity-released",
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn local_service_deadlines_progress_while_ui_is_idle() {
+        let temp = tempfile::tempdir().unwrap();
+        let profiles_dir = temp.path().join(crate::constants::PROFILES_DIR_NAME);
+        std::fs::create_dir(&profiles_dir).unwrap();
+        let config_path = profiles_dir.join("corp.conf");
+        write_test_wireguard_config(&config_path);
+        let profile = VpnProfile {
+            id: profile_id('b'),
+            name: "corp".into(),
+            protocol: Protocol::WireGuard,
+            location: String::new(),
+            config_path,
+            last_used: None,
+        };
+        let session =
+            LocalControlSession::start_profile_test(temp.path(), vec![profile.clone()]).unwrap();
+        let operation_id = session
+            .submit(
+                UserCommand::Connect {
+                    profile_id: profile.id,
+                    conflict_acknowledgement: None,
+                },
+                Duration::from_millis(20),
+                "idle-deadline",
+            )
+            .unwrap();
+
+        // Deliberately do not call `progress`: the service ticker belongs to
+        // its own runtime workers rather than the terminal event loop.
+        std::thread::sleep(Duration::from_millis(150));
+        let snapshot = session.current_snapshot();
+        let operation = snapshot.operations.get(&operation_id).unwrap();
+        assert!(operation.status.is_terminal());
+        assert_eq!(operation.result, Some(OperationResult::Expired));
+    }
+
+    #[test]
+    fn unchanged_scanner_payload_does_not_publish_again() {
+        let temp = tempfile::tempdir().unwrap();
+        let profiles_dir = temp.path().join(crate::constants::PROFILES_DIR_NAME);
+        std::fs::create_dir(&profiles_dir).unwrap();
+        let config_path = profiles_dir.join("corp.conf");
+        std::fs::write(
+            &config_path,
+            b"[Interface]\nPrivateKey = abc=\nAddress = 10.0.0.1/24\n\n[Peer]\nPublicKey = xyz=\nEndpoint = 1.2.3.4:51820\nAllowedIPs = 0.0.0.0/0\n",
+        )
+        .unwrap();
+        let profile = VpnProfile {
+            id: profile_id('c'),
+            name: "corp".into(),
+            protocol: Protocol::WireGuard,
+            location: String::new(),
+            config_path,
+            last_used: None,
+        };
+        let session = LocalControlSession::start_profile_test(temp.path(), vec![profile]).unwrap();
+        let scan = || crate::core::scanner::ScannerResult {
+            sessions: vec![ActiveSession {
+                name: "corp".into(),
+                interface: "wg0".into(),
+                interface_authoritative: true,
+                endpoint: "1.2.3.4:51820".into(),
+                ..ActiveSession::default()
+            }],
+            default_route:
+                crate::vortix_core::ports::route_table::DefaultRouteObservation::Interface(
+                    "wg0".into(),
+                ),
+        };
+        let initial_generation = session.current_snapshot().generation;
+        session
+            .runtime()
+            .block_on(session.publish_observations_from(scan()))
+            .unwrap();
+        // Default route, tunnel details, and tunnel presence each publish.
+        // `observe` acknowledges actor receipt before the final publication,
+        // so wait for the known scan generation instead of consuming only the
+        // first watch notification and racing the tail publication.
+        let expected_generation = initial_generation.saturating_add(3);
+        let settle_deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let snapshot = session.current_snapshot();
+            if snapshot.generation >= expected_generation {
+                break;
+            }
+            assert!(
+                Instant::now() < settle_deadline,
+                "first scanner publication did not settle"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        session
+            .runtime()
+            .block_on(session.publish_observations_from(scan()))
+            .unwrap();
+        session.runtime().block_on(tokio::task::yield_now());
+        assert!(session.take_changed_snapshot().unwrap().is_none());
+    }
+
+    #[test]
+    fn admitted_import_expiry_discards_prepared_body_and_topology() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join(crate::constants::PROFILES_DIR_NAME)).unwrap();
+        let first_source = temp.path().join("first.conf");
+        let expiring_source = temp.path().join("expiring.conf");
+        write_test_wireguard_config(&first_source);
+        write_test_wireguard_config(&expiring_source);
+        let session = LocalControlSession::start_profile_test(temp.path(), Vec::new()).unwrap();
+        session
+            .profile_mutations
+            .delay_next_execution(Duration::from_millis(250));
+        session
+            .enqueue_tui_profile_import(&first_source, Duration::from_secs(1), "first")
+            .unwrap();
+        session
+            .enqueue_tui_profile_import(
+                &expiring_source,
+                Duration::from_millis(50),
+                "expires-in-queue",
+            )
+            .unwrap();
+        let admission_deadline = Instant::now() + Duration::from_secs(1);
+        let mut expiring_id = None;
+        while expiring_id.is_none() {
+            for result in session.take_tui_admission_results() {
+                if result.import_display_name.as_deref() == Some("expiring") {
+                    expiring_id = Some(result.operation_id.unwrap());
+                }
+            }
+            assert!(
+                Instant::now() < admission_deadline,
+                "import admissions did not settle"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let expiring_id = expiring_id.unwrap();
+        assert_eq!(session.prepared_import_count(), 2);
+
+        std::thread::sleep(Duration::from_millis(400));
+        let snapshot = session.current_snapshot();
+        let operation = snapshot.operations.get(&expiring_id).unwrap();
+        assert!(operation.status.is_terminal());
+        assert_eq!(operation.result, Some(OperationResult::Expired));
+        assert_eq!(session.prepared_import_count(), 0);
+        assert!(session
+            .profile_mutations
+            .prepared_topologies
+            .lock()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn async_import_admission_failure_discards_prepared_private_body() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join(crate::constants::PROFILES_DIR_NAME)).unwrap();
+        let source = temp.path().join("corp.conf");
+        write_test_wireguard_config(&source);
+        let session = LocalControlSession::start_profile_test(temp.path(), Vec::new()).unwrap();
+        session
+            .submit(
+                UserCommand::SetKillSwitch {
+                    mode: crate::state::KillSwitchMode::Off,
+                },
+                Duration::from_secs(1),
+                "collision",
+            )
+            .unwrap();
+        session
+            .enqueue_tui_profile_import(&source, Duration::from_secs(1), "collision")
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Some(result) = session.take_tui_admission_results().into_iter().next() {
+                assert!(result.operation_id.is_err());
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "admission failure was not delivered"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(session.prepared_import_count(), 0);
+    }
+
+    fn write_test_wireguard_config(path: &Path) {
+        std::fs::write(
+            path,
+            b"[Interface]\nPrivateKey = abc=\nAddress = 10.0.0.1/24\n\n[Peer]\nPublicKey = xyz=\nEndpoint = 1.2.3.4:51820\nAllowedIPs = 0.0.0.0/0\n",
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1409,6 +2375,7 @@ mod tests {
                 &[],
                 &UserCommand::Connect {
                     profile_id: broken.id.clone(),
+                    conflict_acknowledgement: None,
                 },
             ),
             Err(LocalControlError::Profile { .. })
@@ -1483,6 +2450,7 @@ mod tests {
                 std::slice::from_ref(&profile.name),
                 &UserCommand::Connect {
                     profile_id: profile.id.clone(),
+                    conflict_acknowledgement: None,
                 },
             ),
             Err(LocalControlError::Recovery { .. })

@@ -1365,6 +1365,7 @@ async fn exact_policy_readback_publishes_protection_without_external_proof() {
         .submit(CommandRequest {
             command: UserCommand::Connect {
                 profile_id: target.clone(),
+                conflict_acknowledgement: None,
             },
             idempotency_key: IdempotencyKey::new("internal-policy-readback"),
             deadline: Deadline(1_000),
@@ -1429,6 +1430,7 @@ async fn connect_and_settle(
         .submit(CommandRequest {
             command: UserCommand::Connect {
                 profile_id: profile_id.clone(),
+                conflict_acknowledgement: None,
             },
             idempotency_key: IdempotencyKey::new(key),
             deadline: Deadline(1_000),
@@ -1873,6 +1875,7 @@ async fn nonblocking_connect_dispatches_before_final_policy_and_final_waits_for_
         .submit(CommandRequest {
             command: UserCommand::Connect {
                 profile_id: target.clone(),
+                conflict_acknowledgement: None,
             },
             idempotency_key: IdempotencyKey::new("nonblocking-connect"),
             deadline: Deadline(1_000),
@@ -2185,6 +2188,7 @@ async fn later_policy_command_drives_retry_for_older_tunnel_revision() {
         .submit(CommandRequest {
             command: UserCommand::Connect {
                 profile_id: target.clone(),
+                conflict_acknowledgement: None,
             },
             idempotency_key: IdempotencyKey::new("retry-connect"),
             deadline: Deadline(1_000),
@@ -2244,6 +2248,7 @@ async fn disjoint_connect_operations_complete_from_shared_current_evidence() {
         .submit(CommandRequest {
             command: UserCommand::Connect {
                 profile_id: first.clone(),
+                conflict_acknowledgement: None,
             },
             idempotency_key: IdempotencyKey::new("pending-first"),
             deadline: Deadline(1_000),
@@ -2255,6 +2260,7 @@ async fn disjoint_connect_operations_complete_from_shared_current_evidence() {
         .submit(CommandRequest {
             command: UserCommand::Connect {
                 profile_id: second.clone(),
+                conflict_acknowledgement: None,
             },
             idempotency_key: IdempotencyKey::new("pending-second"),
             deadline: Deadline(1_000),
@@ -2332,6 +2338,7 @@ async fn opposite_profile_intent_cancels_older_pending_operation() {
         .submit(CommandRequest {
             command: UserCommand::Connect {
                 profile_id: target.clone(),
+                conflict_acknowledgement: None,
             },
             idempotency_key: IdempotencyKey::new("opposite-connect"),
             deadline: Deadline(1_000),
@@ -2463,6 +2470,7 @@ async fn canonical_service_dispatches_admitted_mutation_without_blocking_snapsho
         .submit(CommandRequest {
             command: UserCommand::Connect {
                 profile_id: target.clone(),
+                conflict_acknowledgement: None,
             },
             idempotency_key: IdempotencyKey::new("canonical-connect"),
             deadline: Deadline(1_000),
@@ -2567,6 +2575,7 @@ async fn unanswered_interactive_challenge_fails_closed_without_recovery_connect(
         .submit(CommandRequest {
             command: UserCommand::Connect {
                 profile_id: target.clone(),
+                conflict_acknowledgement: None,
             },
             idempotency_key: IdempotencyKey::new("challenge-fails-closed"),
             deadline: Deadline(1_000),
@@ -2638,6 +2647,7 @@ async fn interactive_operation_expiry_rolls_back_without_service_recovery() {
         .submit(CommandRequest {
             command: UserCommand::Connect {
                 profile_id: target.clone(),
+                conflict_acknowledgement: None,
             },
             idempotency_key: IdempotencyKey::new("interactive-expiry"),
             deadline: Deadline(10),
@@ -2739,6 +2749,7 @@ async fn reconnect_all_targets_only_currently_managed_profiles() {
         .submit(CommandRequest {
             command: UserCommand::Connect {
                 profile_id: connected.clone(),
+                conflict_acknowledgement: None,
             },
             idempotency_key: IdempotencyKey::new("connect-managed"),
             deadline: Deadline(1_000),
@@ -3005,6 +3016,7 @@ async fn canonical_profile_limit_returns_busy_before_operation_admission() {
         .submit(CommandRequest {
             command: UserCommand::Connect {
                 profile_id: rejected,
+                conflict_acknowledgement: None,
             },
             idempotency_key: IdempotencyKey::new("bounded-profile"),
             deadline: Deadline(1_000),
@@ -3089,7 +3101,10 @@ async fn admission_reserves_normalized_routes_before_desired_mutation() {
     service
         .client()
         .submit(CommandRequest {
-            command: UserCommand::Connect { profile_id: first },
+            command: UserCommand::Connect {
+                profile_id: first,
+                conflict_acknowledgement: None,
+            },
             idempotency_key: IdempotencyKey::new("route-a"),
             deadline: Deadline(1_000),
         })
@@ -3100,6 +3115,7 @@ async fn admission_reserves_normalized_routes_before_desired_mutation() {
         .submit(CommandRequest {
             command: UserCommand::Connect {
                 profile_id: second.clone(),
+                conflict_acknowledgement: None,
             },
             idempotency_key: IdempotencyKey::new("route-b"),
             deadline: Deadline(1_000),
@@ -3166,6 +3182,7 @@ async fn policy_waits_for_attested_tunnel_and_carries_complete_topology() {
         .submit(CommandRequest {
             command: UserCommand::Connect {
                 profile_id: target.clone(),
+                conflict_acknowledgement: None,
             },
             idempotency_key: IdempotencyKey::new("complete-policy"),
             deadline: Deadline(1_000),
@@ -3241,7 +3258,10 @@ async fn expired_client_operation_leaves_queryable_record_and_starts_recovery() 
     let admitted = service
         .client()
         .submit(CommandRequest {
-            command: UserCommand::Connect { profile_id: target },
+            command: UserCommand::Connect {
+                profile_id: target,
+                conflict_acknowledgement: None,
+            },
             idempotency_key: IdempotencyKey::new("expires"),
             deadline: Deadline(5),
         })
@@ -3316,7 +3336,10 @@ async fn cleaned_handshake_failure_terminalizes_original_before_policy_retry() {
     let admitted = service
         .client()
         .submit(CommandRequest {
-            command: UserCommand::Connect { profile_id: target },
+            command: UserCommand::Connect {
+                profile_id: target,
+                conflict_acknowledgement: None,
+            },
             idempotency_key: IdempotencyKey::new("handshake-terminal"),
             deadline: Deadline(1_000),
         })

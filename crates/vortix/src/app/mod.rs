@@ -5,9 +5,10 @@
 //!
 //! ## Architecture
 //!
-//! `App` embeds a [`VpnRuntime`] that owns all VPN-related state (connection,
-//! profiles, telemetry, kill switch, retry logic). The TUI-specific state
-//! (panels, overlays, animations, scroll positions) remains directly on `App`.
+//! `App` is a control client: it caches one immutable canonical snapshot and
+//! copies its tunnel projection into the renderer-facing registry. Telemetry
+//! and profile presentation remain in [`VpnRuntime`]; lifecycle, retry,
+//! scanner, policy, and protocol ownership do not.
 //!
 //! An earlier refactor removed `App: Deref<Target = VpnRuntime>`. VPN-state
 //! accesses are now explicit via `self.runtime.X` / `app.runtime.X`. The
@@ -122,6 +123,28 @@ pub struct App {
     /// `connection_details`, security, chart).
     pub registry: TunnelRegistry<TunnelKind>,
 
+    /// Long-lived Standard-mode canonical authority used by the TUI. Tests
+    /// that characterize presentation-only helpers may leave it detached.
+    pub(crate) control_session: Option<crate::cli::control::LocalControlSession>,
+
+    /// Last complete immutable publication received from the control owner.
+    pub control_snapshot: crate::vortix_core::control::ControlSnapshot,
+
+    /// Service-owned challenge currently displayed by the existing auth
+    /// overlay. The answer is returned directly to the service and never
+    /// journaled or persisted in this client.
+    pub(crate) control_challenge: Option<crate::vortix_core::control::ChallengeId>,
+
+    /// Stable identity retained when the canonical projection becomes empty,
+    /// so reconnect means "the last tunnel I used" rather than "all".
+    pub(crate) last_control_connected_profile: Option<crate::vortix_core::profile::ProfileId>,
+
+    /// Latest admitted-but-not-yet-published kill-switch intent. Rapid key
+    /// presses compose from this value until the snapshot acknowledges it.
+    pub(crate) pending_control_killswitch_mode: Option<crate::state::KillSwitchMode>,
+
+    control_request_sequence: u64,
+
     /// Flag indicating the application should exit.
     pub should_quit: bool,
 
@@ -178,6 +201,12 @@ impl App {
             runtime,
             engine_handle: None,
             registry: TunnelRegistry::new(),
+            control_session: None,
+            control_snapshot: crate::vortix_core::control::ControlSnapshot::default(),
+            control_challenge: None,
+            last_control_connected_profile: None,
+            pending_control_killswitch_mode: None,
+            control_request_sequence: 0,
 
             should_quit: false,
 
@@ -242,6 +271,32 @@ impl App {
 
     /// Process all pending external events (telemetry and background commands).
     pub fn process_external(&mut self) {
+        let control_update = self.control_session.as_ref().map(|control| {
+            control.progress().and_then(|()| {
+                let admissions = control.take_tui_admission_results();
+                let snapshot = control.take_changed_snapshot()?;
+                let catalog = snapshot
+                    .as_ref()
+                    .and_then(|snapshot| control.take_catalog_update(snapshot));
+                Ok((admissions, snapshot, catalog))
+            })
+        });
+        match control_update {
+            Some(Ok((admissions, snapshot, catalog))) => {
+                self.handle_control_admission_results(admissions);
+                if let Some(catalog) = catalog {
+                    self.apply_local_catalog_update(catalog);
+                }
+                if let Some(snapshot) = snapshot {
+                    self.handle_message(Message::ControlSnapshot(Box::new(snapshot)));
+                }
+            }
+            Some(Err(error)) => self.handle_message(Message::Toast(
+                format!("Control service unavailable: {error}"),
+                ToastType::Error,
+            )),
+            None => {}
+        }
         self.process_telemetry();
 
         while let Ok(msg) = self.runtime.cmd_rx.try_recv() {
@@ -322,6 +377,12 @@ impl App {
             runtime,
             engine_handle: None,
             registry: TunnelRegistry::new(),
+            control_session: None,
+            control_snapshot: crate::vortix_core::control::ControlSnapshot::default(),
+            control_challenge: None,
+            last_control_connected_profile: None,
+            pending_control_killswitch_mode: None,
+            control_request_sequence: 0,
 
             should_quit: false,
 

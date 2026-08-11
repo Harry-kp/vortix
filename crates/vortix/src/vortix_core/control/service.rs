@@ -3,12 +3,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
+use crate::vortix_core::cidr::{claims_default_route_v4, claims_default_route_v6, Cidr};
 use crate::vortix_core::control::command::{
     CommandRequest, Deadline, IdempotencyKey, Secret, UserCommand,
 };
@@ -16,9 +17,10 @@ use crate::vortix_core::control::hooks::{HookEvent, HookEventId, LifecycleFact};
 use crate::vortix_core::control::model::{
     AuthorityEpoch, ChallengeId, ChallengeKind, ChallengeRecord, ClientId, CompletionOutcome,
     ControlEvent, ControlEventEnvelope, DriftGates, EffectiveState, Freshness, GateEvidence,
-    Observation, ObservedConnectionHealth, ObservedTunnel, OperationCompletion, OperationFailure,
-    OperationId, OperationIntent, OperationRecord, OperationResult, OperationStatus, PolicyDigest,
-    ProtectionEvidence, ProtectionStatus, RequestedTunnelState, MAX_PROTECTION_AGE_MILLIS,
+    Observation, ObservedConnectionHealth, ObservedDefaultRoute, ObservedTunnel,
+    ObservedTunnelDetails, OperationCompletion, OperationFailure, OperationId, OperationIntent,
+    OperationRecord, OperationResult, OperationStatus, PolicyDigest, ProtectionEvidence,
+    ProtectionStatus, RequestedTunnelState, MAX_PROTECTION_AGE_MILLIS,
 };
 use crate::vortix_core::control::persistence::{
     ControlStateStore, DurableControlState, PersistedTombstone, RequestedResources,
@@ -34,6 +36,8 @@ use crate::vortix_core::control::worker::{
     ControlRevision, PolicyOutcome, PolicyStage, ProfileAdmission, RouteClaim, TopologyPolicy,
     TopologyState, TopologyTransitionKind, TunnelMutation, TunnelRevision, TunnelWork, WorkFailure,
 };
+use crate::vortix_core::engine::registry::{Conflict, Role, TunnelSnapshot};
+use crate::vortix_core::engine::state::{Connection, ConnectionHealth};
 use crate::vortix_core::profile::ProfileId;
 
 /// Injectable authority-local service clock.
@@ -78,10 +82,6 @@ pub struct ControlServiceConfig {
     pub boot_connections:
         BTreeMap<ProfileId, crate::vortix_core::control::persistence::BootConnection>,
     pub freshness_poll_interval: Duration,
-    /// Wall-clock budget for automatic convergence after an unexpected drop.
-    pub retry_budget: Duration,
-    /// Initial reconnect backoff; subsequent failures double it within budget.
-    pub retry_initial_backoff: Duration,
     pub authority_epoch: AuthorityEpoch,
     /// Compatibility seed used only when no durable control state exists.
     pub initial_kill_switch_mode: crate::vortix_core::state::killswitch::KillSwitchMode,
@@ -180,9 +180,7 @@ pub enum ProfileMutationApplied {
     },
     Renamed {
         profile_id: ProfileId,
-        /// Missing preserves catalog mutation success while lifecycle
-        /// admission remains fail-closed until topology can be rebuilt.
-        topology: Option<ProfileTopology>,
+        topology: ProfileTopology,
     },
     Deleted {
         profile_id: ProfileId,
@@ -253,8 +251,6 @@ impl Default for ControlServiceConfig {
             profile_mutations: None,
             boot_connections: BTreeMap::new(),
             freshness_poll_interval: Duration::from_millis(250),
-            retry_budget: Duration::from_secs(300),
-            retry_initial_backoff: Duration::from_secs(2),
             authority_epoch: AuthorityEpoch(0),
             initial_kill_switch_mode: crate::vortix_core::state::killswitch::KillSwitchMode::Off,
             reconciliation_complete: true,
@@ -795,6 +791,7 @@ impl ControlService {
             selection,
             supervisor.as_deref(),
         );
+        derive_tunnel_projections(&mut initial, None, &config);
         let (snapshot_tx, snapshots) = watch::channel(initial.clone());
         let (events, _) = broadcast::channel(config.event_capacity);
         let profile_mutations = config.profile_mutations.as_ref().map(|executor| {
@@ -931,6 +928,14 @@ impl ControlSubscription {
         self.snapshots.borrow().clone()
     }
 
+    /// Mark the latest publication as consumed and return it.
+    #[must_use]
+    pub fn current(&mut self) -> ControlSnapshot {
+        let snapshot = self.snapshots.borrow_and_update().clone();
+        self.minimum_generation = self.minimum_generation.max(snapshot.generation);
+        snapshot
+    }
+
     pub async fn changed(&mut self) -> Result<ControlSnapshot, EventReceiveError> {
         self.snapshots
             .changed()
@@ -939,6 +944,20 @@ impl ControlSubscription {
         let snapshot = self.snapshot();
         self.minimum_generation = self.minimum_generation.max(snapshot.generation);
         Ok(snapshot)
+    }
+
+    /// Return a newer immutable publication without waiting or cloning when
+    /// the watched generation is unchanged.
+    pub fn take_changed(&mut self) -> Result<Option<ControlSnapshot>, EventReceiveError> {
+        match self.snapshots.has_changed() {
+            Ok(false) => Ok(None),
+            Ok(true) => {
+                let snapshot = self.snapshots.borrow_and_update().clone();
+                self.minimum_generation = self.minimum_generation.max(snapshot.generation);
+                Ok(Some(snapshot))
+            }
+            Err(_) => Err(EventReceiveError::Stopped),
+        }
     }
 
     pub async fn recv_event(&mut self) -> Result<ControlEventEnvelope, EventReceiveError> {
@@ -1088,6 +1107,11 @@ impl ControlHandle {
                 &config.known_profiles,
                 &self.shared.snapshots.borrow(),
             )?;
+            let conflict_acknowledgement = validate_topology_conflict_admission(
+                &request.command,
+                &self.shared.snapshots.borrow(),
+                &config,
+            )?;
             let lifecycle_profiles = lifecycle_profiles_for_command(
                 &request.command,
                 &target_profiles,
@@ -1104,25 +1128,38 @@ impl ControlHandle {
                     .as_ref()
                     .ok_or(AdmissionError::Stopped)?;
                 for profile_id in &target_profiles {
+                    // An exclusive switch reserves teardown capacity now, but
+                    // deliberately reserves the target connect only after all
+                    // competing tunnels are absent. That prevents the old
+                    // routes from rejecting (or racing) the future target.
+                    if matches!(
+                        &request.command,
+                        UserCommand::ConnectExclusive { profile_id: target }
+                            if target == profile_id
+                    ) {
+                        continue;
+                    }
                     let disconnecting = matches!(
                         request.command,
-                        UserCommand::Disconnect { .. } | UserCommand::ForceDisconnect { .. }
+                        UserCommand::ConnectExclusive { .. }
+                            | UserCommand::Disconnect { .. }
+                            | UserCommand::ForceDisconnect { .. }
                     );
-                    let routes = if disconnecting {
-                        Vec::new()
-                    } else {
-                        config
-                            .profile_topologies
-                            .get(profile_id)
-                            .map(|topology| topology.routes.iter().cloned().collect::<Vec<_>>())
-                            .unwrap_or_default()
-                    };
                     let reserved = if disconnecting {
                         supervisor.reserve_disconnect(profile_id)
                     } else {
-                        supervisor.reserve_tunnel(profile_id, routes)
-                    }
-                    .map_err(|error| match error {
+                        let routes = config
+                            .profile_topologies
+                            .get(profile_id)
+                            .map(|topology| topology.routes.iter().cloned().collect::<Vec<_>>())
+                            .unwrap_or_default();
+                        supervisor.reserve_tunnel_with_acknowledgement(
+                            profile_id,
+                            routes,
+                            conflict_acknowledgement.as_ref(),
+                        )
+                    };
+                    let reserved = reserved.map_err(|error| match error {
                         WorkFailure::RouteConflict => AdmissionError::RouteConflict,
                         WorkFailure::Stopped => AdmissionError::Stopped,
                         _ => AdmissionError::Busy,
@@ -1274,7 +1311,12 @@ impl ObserverHandle {
     pub async fn observe(&self, observation: Observation) -> Result<(), ObservationError> {
         let invalid = matches!(
             &observation,
-            Observation::Tunnel { interface_name: Some(name), .. } if name.len() > 256
+            Observation::Tunnel { interface_name: Some(name), .. }
+                | Observation::DefaultRoute { interface_name: Some(name), .. }
+                if name.len() > 256
+        ) || matches!(
+            &observation,
+            Observation::TunnelDetails { details, .. } if tunnel_details_exceed_bounds(details)
         ) || observation_evidence(&observation)
             .is_some_and(|evidence| !evidence.policy_digest.is_valid());
         if invalid {
@@ -1542,9 +1584,9 @@ struct OwnerState {
     observation_clocks: BTreeMap<ObservationScope, u64>,
     work_admissions: BTreeMap<(OperationId, ProfileId), ProfileAdmission>,
     reconnect_operations: BTreeMap<OperationId, ReconnectOperation>,
+    exclusive_switch_operations: BTreeMap<OperationId, ExclusiveSwitchOperation>,
     tunnel_revisions: BTreeMap<ProfileId, TunnelRevision>,
     recovery_operations: BTreeSet<OperationId>,
-    unexpected_recoveries: BTreeMap<OperationId, UnexpectedRecovery>,
     lifecycle_operations: BTreeMap<OperationId, LifecycleOperation>,
     topology_transaction: Option<TopologyTransaction>,
     next_lifecycle_event: u64,
@@ -1555,7 +1597,7 @@ impl OwnerState {
         self.work_admissions
             .retain(|(operation, _), _| operation != operation_id);
         self.reconnect_operations.remove(operation_id);
-        self.unexpected_recoveries.remove(operation_id);
+        self.exclusive_switch_operations.remove(operation_id);
         if self
             .topology_transaction
             .as_ref()
@@ -1564,22 +1606,6 @@ impl OwnerState {
             self.topology_transaction = None;
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UnexpectedRecoveryPhase {
-    NeedsPreBlock,
-    PreBlockPending,
-    WaitingBackoff,
-    AttemptInFlight,
-}
-
-#[derive(Debug)]
-struct UnexpectedRecovery {
-    profile_id: ProfileId,
-    phase: UnexpectedRecoveryPhase,
-    next_attempt_millis: u64,
-    backoff_millis: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1604,6 +1630,12 @@ struct ReconnectOperation {
     teardown_dispatched: BTreeSet<ProfileId>,
 }
 
+#[derive(Debug)]
+struct ExclusiveSwitchOperation {
+    target: ProfileId,
+    teardown: BTreeSet<ProfileId>,
+}
+
 impl ReconnectOperation {
     fn includes(&self, profile_id: &ProfileId) -> bool {
         self.targets.contains(profile_id)
@@ -1616,9 +1648,19 @@ impl ReconnectOperation {
 
 #[derive(Debug)]
 struct LifecycleOperation {
+    legs: Vec<LifecycleLeg>,
+}
+
+#[derive(Debug)]
+struct LifecycleLeg {
     profiles: Vec<ProfileId>,
     success: HookEvent,
     failure: Option<HookEvent>,
+}
+
+struct LifecycleRegistration {
+    operation: LifecycleOperation,
+    started: Vec<(Vec<ProfileId>, HookEvent)>,
 }
 
 struct DeferredReadiness {
@@ -1713,6 +1755,13 @@ impl ControlRuntime<'_> {
             .await;
         } else {
             derive_effective(snapshot, now, self.selection, self.supervisor);
+        }
+        let projection_inputs_changed = snapshot.desired != before.desired
+            || snapshot.observed != before.observed
+            || snapshot.operations != before.operations
+            || snapshot.challenges != before.challenges;
+        if projection_inputs_changed {
+            derive_tunnel_projections(snapshot, Some(owner), self.config);
         }
         persisted_before_effects
     }
@@ -1870,18 +1919,19 @@ async fn run_service(
     supervisor: Option<Arc<Supervisor>>,
     profile_mutations: Option<ProfileMutationDispatcher>,
 ) {
-    let startup_now = clock.now_millis();
     let initial_config = shared_config
         .lock()
         .expect("control config mutex poisoned")
         .clone();
     let tunnel_revisions = initial_tunnel_revisions(&snapshot, supervisor.as_deref());
+    let exclusive_switch_operations = recover_exclusive_switch_operations(&snapshot);
     let mut owner = OwnerState {
         challenge_terminals: BTreeMap::new(),
         challenge_answers: BTreeMap::new(),
         observation_clocks: BTreeMap::new(),
         work_admissions: BTreeMap::new(),
         reconnect_operations: BTreeMap::new(),
+        exclusive_switch_operations,
         tunnel_revisions,
         recovery_operations: snapshot
             .operations
@@ -1892,11 +1942,6 @@ async fn run_service(
             })
             .map(|operation| operation.id.clone())
             .collect(),
-        unexpected_recoveries: restored_unexpected_recoveries(
-            &snapshot,
-            &initial_config,
-            startup_now,
-        ),
         lifecycle_operations: BTreeMap::new(),
         topology_transaction: None,
         next_lifecycle_event: 0,
@@ -1919,17 +1964,6 @@ async fn run_service(
                 expire_operations(&mut snapshot, &mut owner, &admission, now, &config, selection, &mut pending);
                 expire_challenges(&mut snapshot, &mut owner, now, config.max_challenges, &mut pending);
                 handle_envelope(envelope, &mut snapshot, &mut owner, &admission, now, &config, &shared_config, profile_mutations.as_ref(), startup_persistence_fault, &mut readiness_reply, &mut durability_reply, &mut pending);
-                admit_unexpected_loss_recovery(
-                    &before,
-                    &mut snapshot,
-                    &mut owner,
-                    &admission,
-                    now,
-                    &config,
-                    selection,
-                    supervisor.as_deref(),
-                    &mut pending,
-                );
                 if recovered_control_state
                     && !before.readiness.reconciliation_complete
                     && snapshot.readiness.reconciliation_complete
@@ -2001,6 +2035,53 @@ async fn run_service(
             }
         }
     }
+}
+
+/// Rebuild the process-local ordering guard from the exact durable intent.
+/// An exclusive switch is the only command whose subset contains one connect
+/// and one or more disconnects in the current desired generation.
+fn recover_exclusive_switch_operations(
+    snapshot: &ControlSnapshot,
+) -> BTreeMap<OperationId, ExclusiveSwitchOperation> {
+    snapshot
+        .operations
+        .values()
+        .filter(|operation| {
+            !operation.status.is_terminal()
+                && operation.desired_generation == snapshot.desired.generation
+        })
+        .filter_map(|operation| {
+            let OperationIntent::DesiredSubset {
+                tunnels,
+                kill_switch: None,
+            } = &operation.intent
+            else {
+                return None;
+            };
+            if tunnels != &snapshot.desired.tunnels {
+                return None;
+            }
+            let mut connected = tunnels
+                .iter()
+                .filter(|(_, requested)| **requested == RequestedTunnelState::Connected)
+                .map(|(profile_id, _)| profile_id.clone());
+            let target = connected.next()?;
+            if connected.next().is_some() {
+                return None;
+            }
+            let teardown = tunnels
+                .iter()
+                .filter(|(_, requested)| **requested == RequestedTunnelState::Disconnected)
+                .map(|(profile_id, _)| profile_id.clone())
+                .collect::<BTreeSet<_>>();
+            (!teardown.is_empty()).then(|| {
+                (
+                    operation.id.clone(),
+                    ExclusiveSwitchOperation { target, teardown },
+                )
+            })
+        })
+        .collect()
 }
 
 fn initial_tunnel_revisions(
@@ -2148,13 +2229,6 @@ fn drive_supervision(
             });
         }
         if result.result.is_err() {
-            let unexpected_retry = schedule_unexpected_recovery_backoff(
-                owner,
-                snapshot,
-                &result.operation_id,
-                &result.profile_id,
-                now,
-            );
             snapshot
                 .observed
                 .wireguard_handshakes
@@ -2173,23 +2247,12 @@ fn drive_supervision(
                             topology.protocol
                                 == Some(crate::vortix_core::profile::ProtocolKind::WireGuard)
                         }));
-            if unexpected_retry {
-                if wireguard_handshake_failure {
-                    events.push(ControlEvent::ConnectAttemptFailed {
-                        profile_id: result.profile_id.clone(),
-                        attempt: 1,
-                        reason: crate::vortix_core::engine::state::FailureReason::HandshakeFailed(
-                            "current-generation WireGuard peer evidence was not observed".into(),
-                        ),
-                    });
-                }
-            } else if result.result == Err(WorkFailure::ChallengeFailed) {
+            if result.result == Err(WorkFailure::ChallengeFailed) {
                 let rollback_profiles = snapshot
                     .operations
                     .get(&result.operation_id)
                     .and_then(|operation| match &operation.intent {
-                        OperationIntent::DesiredSubset { tunnels, .. }
-                        | OperationIntent::UnexpectedRecovery { tunnels, .. } => Some(
+                        OperationIntent::DesiredSubset { tunnels, .. } => Some(
                             tunnels
                                 .iter()
                                 .filter(|(_, requested)| {
@@ -2368,11 +2431,6 @@ fn drive_supervision(
                     TopologyTransactionPhase::PreBlockPending,
                 ) => {
                     transaction.phase = TopologyTransactionPhase::TunnelsAllowed;
-                    if let Some(recovery) =
-                        owner.unexpected_recoveries.get_mut(&result.operation_id)
-                    {
-                        recovery.phase = UnexpectedRecoveryPhase::WaitingBackoff;
-                    }
                     None
                 }
                 (
@@ -2564,7 +2622,10 @@ fn drive_supervision(
         if !transaction_is_current {
             let transition = transition_for_plan(
                 &plan.actions,
-                owner.reconnect_operations.contains_key(&operation.id),
+                owner.reconnect_operations.contains_key(&operation.id)
+                    || owner
+                        .exclusive_switch_operations
+                        .contains_key(&operation.id),
                 owner.recovery_operations.contains(&operation.id),
             );
             if let Some(policy) = capture_topology_policy(
@@ -2595,9 +2656,6 @@ fn drive_supervision(
                 if let Some(transaction) = owner.topology_transaction.as_mut() {
                     transaction.phase = TopologyTransactionPhase::PreBlockPending;
                 }
-                if let Some(recovery) = owner.unexpected_recoveries.get_mut(&policy.operation_id) {
-                    recovery.phase = UnexpectedRecoveryPhase::PreBlockPending;
-                }
             }
             Err(WorkFailure::Busy) => {}
             Err(failure) => {
@@ -2618,17 +2676,13 @@ fn drive_supervision(
         }
     }
 
-    let tunnel_action_operation = owner
+    let tunnel_actions_allowed = owner
         .topology_transaction
         .as_ref()
-        .filter(|transaction| {
+        .is_some_and(|transaction| {
             transaction.policy.revision() == revision
                 && transaction.phase == TopologyTransactionPhase::TunnelsAllowed
-        })
-        .map(|transaction| transaction.policy.operation_id.clone());
-    let tunnel_actions_allowed = tunnel_action_operation
-        .as_ref()
-        .is_some_and(|operation_id| unexpected_recovery_actions_allowed(owner, operation_id, now));
+        });
 
     for action in plan.actions.iter().filter(|_| tunnel_actions_allowed) {
         match action {
@@ -2668,6 +2722,26 @@ fn drive_supervision(
                 target_revision: action_revision,
                 ..
             } => {
+                if matches!(action, ReconcileAction::Connect { .. }) {
+                    let exclusive_ready = owner
+                        .exclusive_switch_operations
+                        .values()
+                        .find(|exclusive| &exclusive.target == profile_id)
+                        .is_none_or(|exclusive| {
+                            exclusive.teardown.iter().all(|teardown| {
+                                snapshot
+                                    .observed
+                                    .tunnels
+                                    .get(teardown)
+                                    .is_none_or(|fact| !fact.active)
+                                    && supervisor.profile_truth(teardown).is_none()
+                                    && !supervisor.is_tombstoned(teardown)
+                            })
+                        });
+                    if !exclusive_ready {
+                        continue;
+                    }
+                }
                 let Some(operation) =
                     operation_for_tunnel_action(snapshot, action_revision.generation).cloned()
                 else {
@@ -2729,12 +2803,18 @@ fn drive_supervision(
                         .reconnect_operations
                         .get(&operation_id)
                         .is_some_and(|reconnect| reconnect.can_reconnect(profile_id));
+                let exclusive_readmission = mutation == TunnelMutation::Connect
+                    && owner
+                        .exclusive_switch_operations
+                        .get(&operation_id)
+                        .is_some_and(|exclusive| exclusive.target == *profile_id);
                 let level_triggered_readmission =
                     operation_generation != action_revision.generation;
                 let reserved = owner.work_admissions.remove(&key).map_or_else(
                     || {
                         if owner.recovery_operations.contains(&operation_id)
                             || reconnect_readmission
+                            || exclusive_readmission
                             || level_triggered_readmission
                         {
                             let routes = config
@@ -2742,7 +2822,13 @@ fn drive_supervision(
                                 .get(profile_id)
                                 .map(|topology| topology.routes.iter().cloned().collect::<Vec<_>>())
                                 .unwrap_or_default();
-                            supervisor.reserve_tunnel(profile_id, routes).map(Some)
+                            supervisor
+                                .reserve_tunnel_with_acknowledgement(
+                                    profile_id,
+                                    routes,
+                                    snapshot.desired.conflict_acknowledgements.get(profile_id),
+                                )
+                                .map(Some)
                         } else {
                             Ok(None)
                         }
@@ -2777,16 +2863,8 @@ fn drive_supervision(
                             now,
                             now,
                         );
-                        if schedule_unexpected_recovery_backoff(
-                            owner,
-                            snapshot,
-                            &operation_id,
-                            profile_id,
-                            now,
-                        ) {
-                            continue;
-                        }
-                        if reconnect_target || level_triggered_readmission {
+                        if reconnect_target || exclusive_readmission || level_triggered_readmission
+                        {
                             fail_tunnel_dispatch_operation(
                                 &operation_id,
                                 operation_generation,
@@ -2826,16 +2904,8 @@ fn drive_supervision(
                             now,
                             now,
                         );
-                        if schedule_unexpected_recovery_backoff(
-                            owner,
-                            snapshot,
-                            &operation_id,
-                            profile_id,
-                            now,
-                        ) {
-                            continue;
-                        }
-                        if reconnect_target || level_triggered_readmission {
+                        if reconnect_target || exclusive_readmission || level_triggered_readmission
+                        {
                             fail_tunnel_dispatch_operation(
                                 &operation_id,
                                 operation_generation,
@@ -3052,11 +3122,6 @@ fn operation_intent_is_compatible(operation: &OperationRecord, snapshot: &Contro
         OperationIntent::DesiredSubset {
             tunnels,
             kill_switch,
-        }
-        | OperationIntent::UnexpectedRecovery {
-            tunnels,
-            kill_switch,
-            ..
         } => {
             tunnels.iter().all(|(profile_id, requested)| {
                 let desired = snapshot.desired.tunnels.get(profile_id);
@@ -3086,51 +3151,6 @@ fn invalidate_all_gates(snapshot: &mut ControlSnapshot, now: u64) {
         now,
         now,
     );
-}
-
-fn schedule_unexpected_recovery_backoff(
-    owner: &mut OwnerState,
-    snapshot: &ControlSnapshot,
-    operation_id: &OperationId,
-    profile_id: &ProfileId,
-    now: u64,
-) -> bool {
-    let Some(recovery) = owner
-        .unexpected_recoveries
-        .get_mut(operation_id)
-        .filter(|recovery| recovery.profile_id == *profile_id)
-    else {
-        return false;
-    };
-    let remaining = snapshot
-        .operations
-        .get(operation_id)
-        .map_or(0, |operation| operation.deadline_millis.saturating_sub(now));
-    let delay = recovery.backoff_millis.min(remaining);
-    recovery.phase = UnexpectedRecoveryPhase::WaitingBackoff;
-    recovery.next_attempt_millis = now.saturating_add(delay);
-    recovery.backoff_millis = recovery.backoff_millis.saturating_mul(2).min(remaining);
-    true
-}
-
-fn unexpected_recovery_actions_allowed(
-    owner: &mut OwnerState,
-    operation_id: &OperationId,
-    now: u64,
-) -> bool {
-    let Some(recovery) = owner.unexpected_recoveries.get_mut(operation_id) else {
-        return true;
-    };
-    match recovery.phase {
-        UnexpectedRecoveryPhase::WaitingBackoff if now >= recovery.next_attempt_millis => {
-            recovery.phase = UnexpectedRecoveryPhase::AttemptInFlight;
-            true
-        }
-        UnexpectedRecoveryPhase::NeedsPreBlock
-        | UnexpectedRecoveryPhase::PreBlockPending
-        | UnexpectedRecoveryPhase::WaitingBackoff => false,
-        UnexpectedRecoveryPhase::AttemptInFlight => true,
-    }
 }
 
 #[allow(clippy::too_many_arguments)] // Failure closes one admitted effect and starts owned recovery.
@@ -3233,6 +3253,19 @@ fn capture_topology_policy(
     let deadline = Instant::now().checked_add(Duration::from_millis(
         operation.deadline_millis.saturating_sub(now),
     ))?;
+    let required_blocking = transition_requires_blocking(snapshot.desired.kill_switch, transition);
+    let mut target = build_topology_state(
+        target_profiles.clone(),
+        &snapshot.observed.tunnels,
+        config,
+        snapshot.desired.kill_switch,
+    );
+    // `required_blocking` describes the temporary pre-tunnel safety barrier.
+    // The final policy deliberately releases that barrier for block-on-drop;
+    // only VPN-only retains a blocking firewall after successful publication.
+    // `TopologyState::firewall_blocking` is effective final truth, so it must
+    // not inherit the pre-barrier requirement.
+    target.firewall_blocking = final_firewall_blocks(snapshot.desired.kill_switch);
     Some(TopologyPolicy {
         generation: revision.generation,
         authority_epoch: revision.authority_epoch,
@@ -3249,12 +3282,7 @@ fn capture_topology_policy(
                 config.initial_kill_switch_mode,
             )
         }),
-        target: build_topology_state(
-            target_profiles.clone(),
-            &snapshot.observed.tunnels,
-            config,
-            snapshot.desired.kill_switch,
-        ),
+        target,
         tunnel_revisions: target_profiles
             .iter()
             .filter_map(|profile| {
@@ -3266,9 +3294,18 @@ fn capture_topology_policy(
             })
             .collect(),
         transition,
-        required_blocking: transition_requires_blocking(snapshot.desired.kill_switch, transition),
+        required_blocking,
         stage: PolicyStage::Final,
     })
+}
+
+const fn final_firewall_blocks(
+    mode: crate::vortix_core::state::killswitch::KillSwitchMode,
+) -> bool {
+    matches!(
+        mode,
+        crate::vortix_core::state::killswitch::KillSwitchMode::AlwaysOn
+    )
 }
 
 fn transition_requires_blocking(
@@ -3366,6 +3403,7 @@ fn build_topology_state(
         dns_requests,
         dns_digest: PolicyDigest::sha256(&dns_material),
         kill_switch,
+        firewall_blocking: false,
         firewall_digest: PolicyDigest::sha256(&firewall_material),
         ownership_receipts,
     }
@@ -3409,6 +3447,7 @@ fn handle_envelope(
                 owner.release_operation_admission(&evicted_id);
             }
             let expired = request.deadline.0 <= now;
+            let lifecycle = lifecycle_for_command(&request.command, &lifecycle_profiles, snapshot);
             let desired_generation = if expired {
                 snapshot.desired.generation
             } else {
@@ -3450,17 +3489,32 @@ fn handle_envelope(
                     },
                 );
             }
+            if !expired {
+                if let UserCommand::ConnectExclusive { profile_id } = &request.command {
+                    owner.exclusive_switch_operations.insert(
+                        operation_id.clone(),
+                        ExclusiveSwitchOperation {
+                            target: profile_id.clone(),
+                            teardown: target_profiles
+                                .iter()
+                                .filter(|candidate| *candidate != profile_id)
+                                .cloned()
+                                .collect(),
+                        },
+                    );
+                }
+            }
             events.push(ControlEvent::OperationAdmitted {
                 operation_id: operation_id.clone(),
                 desired_generation,
             });
-            if let Some((lifecycle, started)) =
-                lifecycle_for_command(&request.command, &lifecycle_profiles)
-            {
-                emit_lifecycle_facts(owner, config, &lifecycle.profiles, started, now, events);
+            if let Some(lifecycle) = lifecycle {
+                for (profiles, event) in lifecycle.started {
+                    emit_lifecycle_facts(owner, config, &profiles, event, now, events);
+                }
                 owner
                     .lifecycle_operations
-                    .insert(operation_id.clone(), lifecycle);
+                    .insert(operation_id.clone(), lifecycle.operation);
             }
             if expired {
                 owner.release_operation_admission(&operation_id);
@@ -3609,6 +3663,10 @@ fn handle_envelope(
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one atomic owner transition updates generation-fenced desired intent"
+)]
 fn apply_desired(
     command: &UserCommand,
     target_profiles: &[ProfileId],
@@ -3629,7 +3687,8 @@ fn apply_desired(
             .insert(profile_id.clone(), tunnel_revision);
     }
     match command {
-        UserCommand::Connect { profile_id }
+        UserCommand::Connect { profile_id, .. }
+        | UserCommand::ConnectExclusive { profile_id }
         | UserCommand::Reconnect {
             profile_id: Some(profile_id),
         }
@@ -3668,8 +3727,43 @@ fn apply_desired(
         | UserCommand::DeleteProfile { .. } => {}
     }
     match command {
-        UserCommand::Connect { profile_id }
-        | UserCommand::Reconnect {
+        UserCommand::Connect {
+            profile_id,
+            conflict_acknowledgement,
+        } => {
+            snapshot
+                .desired
+                .tunnels
+                .insert(profile_id.clone(), RequestedTunnelState::Connected);
+            match conflict_acknowledgement {
+                Some(conflict) => {
+                    snapshot
+                        .desired
+                        .conflict_acknowledgements
+                        .insert(profile_id.clone(), conflict.clone());
+                }
+                None => {
+                    snapshot
+                        .desired
+                        .conflict_acknowledgements
+                        .remove(profile_id);
+                }
+            }
+        }
+        UserCommand::ConnectExclusive { profile_id } => {
+            for candidate in target_profiles {
+                snapshot
+                    .desired
+                    .tunnels
+                    .insert(candidate.clone(), RequestedTunnelState::Disconnected);
+            }
+            snapshot
+                .desired
+                .tunnels
+                .insert(profile_id.clone(), RequestedTunnelState::Connected);
+            snapshot.desired.conflict_acknowledgements.clear();
+        }
+        UserCommand::Reconnect {
             profile_id: Some(profile_id),
         } => {
             snapshot
@@ -3763,20 +3857,21 @@ fn apply_profile_mutation_completion(
                     .get(profile_id)
                     .and_then(|existing| existing.display_name.clone());
                 config.known_profiles.insert(profile_id.clone());
-                if let Some(topology) = topology {
-                    config
-                        .profile_topologies
-                        .insert(profile_id.clone(), topology.clone());
-                } else {
-                    config.profile_topologies.remove(profile_id);
-                }
+                config
+                    .profile_topologies
+                    .insert(profile_id.clone(), topology.clone());
             }
             ProfileMutationApplied::Deleted { profile_id } => {
                 config.known_profiles.remove(profile_id);
                 config.profile_topologies.remove(profile_id);
                 config.boot_connections.remove(profile_id);
                 snapshot.desired.tunnels.remove(profile_id);
+                snapshot
+                    .desired
+                    .conflict_acknowledgements
+                    .remove(profile_id);
                 snapshot.observed.tunnels.remove(profile_id);
+                snapshot.observed.tunnel_details.remove(profile_id);
                 snapshot.observed.wireguard_handshakes.remove(profile_id);
                 snapshot
                     .observed
@@ -3814,10 +3909,9 @@ fn apply_profile_mutation_completion(
                 profile_id,
                 topology,
             }) => {
-                if let (Some(old_display_name), Some(new_display_name)) = (
-                    old_display_name,
-                    topology.and_then(|value| value.display_name),
-                ) {
+                if let (Some(old_display_name), Some(new_display_name)) =
+                    (old_display_name, topology.display_name)
+                {
                     events.push(ControlEvent::ProfileRenamed {
                         profile_id,
                         old_display_name,
@@ -3867,9 +3961,9 @@ fn command_digest(command: &UserCommand) -> PolicyDigest {
 
 fn intent_for_command(command: &UserCommand, target_profiles: &[ProfileId]) -> OperationIntent {
     let requested = match command {
-        UserCommand::Connect { .. } | UserCommand::Reconnect { .. } => {
-            Some(RequestedTunnelState::Connected)
-        }
+        UserCommand::Connect { .. }
+        | UserCommand::ConnectExclusive { .. }
+        | UserCommand::Reconnect { .. } => Some(RequestedTunnelState::Connected),
         UserCommand::Disconnect { .. } | UserCommand::ForceDisconnect { .. } => {
             Some(RequestedTunnelState::Disconnected)
         }
@@ -3878,13 +3972,28 @@ fn intent_for_command(command: &UserCommand, target_profiles: &[ProfileId]) -> O
         | UserCommand::RenameProfile { .. }
         | UserCommand::DeleteProfile { .. } => None,
     };
-    let tunnels = requested.map_or_else(BTreeMap::new, |state| {
+    let tunnels = if let UserCommand::ConnectExclusive { profile_id } = command {
         target_profiles
             .iter()
             .cloned()
-            .map(|profile_id| (profile_id, state))
+            .map(|candidate| {
+                let state = if &candidate == profile_id {
+                    RequestedTunnelState::Connected
+                } else {
+                    RequestedTunnelState::Disconnected
+                };
+                (candidate, state)
+            })
             .collect()
-    });
+    } else {
+        requested.map_or_else(BTreeMap::new, |state| {
+            target_profiles
+                .iter()
+                .cloned()
+                .map(|profile_id| (profile_id, state))
+                .collect()
+        })
+    };
     let kill_switch = match command {
         UserCommand::SetKillSwitch { mode } => Some(*mode),
         _ => None,
@@ -3903,7 +4012,8 @@ fn intent_for_command(command: &UserCommand, target_profiles: &[ProfileId]) -> O
 
 fn command_profile(command: &UserCommand) -> Option<&ProfileId> {
     match command {
-        UserCommand::Connect { profile_id }
+        UserCommand::Connect { profile_id, .. }
+        | UserCommand::ConnectExclusive { profile_id }
         | UserCommand::Disconnect {
             profile_id: Some(profile_id),
         }
@@ -3924,6 +4034,9 @@ fn command_profile(command: &UserCommand) -> Option<&ProfileId> {
 }
 
 fn command_profiles(command: &UserCommand, known_profiles: &BTreeSet<ProfileId>) -> Vec<ProfileId> {
+    if matches!(command, UserCommand::ConnectExclusive { .. }) {
+        return known_profiles.iter().cloned().collect();
+    }
     if let Some(profile) = command_profile(command) {
         return vec![profile.clone()];
     }
@@ -4001,13 +4114,49 @@ fn lifecycle_profiles_for_command(
 fn lifecycle_for_command(
     command: &UserCommand,
     target_profiles: &[ProfileId],
-) -> Option<(LifecycleOperation, HookEvent)> {
+    snapshot: &ControlSnapshot,
+) -> Option<LifecycleRegistration> {
+    if let UserCommand::ConnectExclusive { profile_id } = command {
+        let teardown = target_profiles
+            .iter()
+            .filter(|candidate| *candidate != profile_id)
+            .filter(|candidate| {
+                snapshot.desired.tunnels.get(*candidate) == Some(&RequestedTunnelState::Connected)
+                    || snapshot
+                        .observed
+                        .tunnels
+                        .get(*candidate)
+                        .is_some_and(|fact| fact.active)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut legs = Vec::new();
+        let mut started = Vec::new();
+        if !teardown.is_empty() {
+            started.push((teardown.clone(), HookEvent::DisconnectStarted));
+            legs.push(LifecycleLeg {
+                profiles: teardown,
+                success: HookEvent::Disconnected,
+                failure: None,
+            });
+        }
+        started.push((vec![profile_id.clone()], HookEvent::ConnectStarted));
+        legs.push(LifecycleLeg {
+            profiles: vec![profile_id.clone()],
+            success: HookEvent::Connected,
+            failure: Some(HookEvent::ConnectFailed),
+        });
+        return Some(LifecycleRegistration {
+            operation: LifecycleOperation { legs },
+            started,
+        });
+    }
     let profiles = target_profiles.to_vec();
     if profiles.is_empty() {
         return None;
     }
     let (started, success, failure) = match command {
-        UserCommand::Connect { .. } => (
+        UserCommand::Connect { .. } | UserCommand::ConnectExclusive { .. } => (
             HookEvent::ConnectStarted,
             HookEvent::Connected,
             Some(HookEvent::ConnectFailed),
@@ -4025,14 +4174,16 @@ fn lifecycle_for_command(
         | UserCommand::RenameProfile { .. }
         | UserCommand::DeleteProfile { .. } => return None,
     };
-    Some((
-        LifecycleOperation {
-            profiles,
-            success,
-            failure,
+    Some(LifecycleRegistration {
+        operation: LifecycleOperation {
+            legs: vec![LifecycleLeg {
+                profiles,
+                success,
+                failure,
+            }],
         },
-        started,
-    ))
+        started: vec![(target_profiles.to_vec(), started)],
+    })
 }
 
 fn profile_mutation_for_command(command: &UserCommand) -> Option<ProfileMutation> {
@@ -4058,7 +4209,8 @@ fn validate_profile_mutation_input(
     command: &UserCommand,
     config: &ControlServiceConfig,
 ) -> Result<(), AdmissionError> {
-    if let UserCommand::Connect { profile_id }
+    if let UserCommand::Connect { profile_id, .. }
+    | UserCommand::ConnectExclusive { profile_id }
     | UserCommand::Reconnect {
         profile_id: Some(profile_id),
     } = command
@@ -4095,6 +4247,30 @@ fn validate_profile_mutation_input(
         }
     }
     Ok(())
+}
+
+fn validate_topology_conflict_admission(
+    command: &UserCommand,
+    snapshot: &ControlSnapshot,
+    _config: &ControlServiceConfig,
+) -> Result<Option<Conflict>, AdmissionError> {
+    let UserCommand::Connect {
+        profile_id,
+        conflict_acknowledgement,
+    } = command
+    else {
+        return Ok(None);
+    };
+    let canonical = snapshot.topology_conflict(profile_id);
+    match (&canonical, conflict_acknowledgement) {
+        (None, None) => Ok(None),
+        (Some(expected), Some(actual)) if expected == actual => Ok(canonical),
+        (Some(_), None) => Err(AdmissionError::RouteConflict),
+        (None | Some(_), Some(_)) => Err(AdmissionError::InvalidInput {
+            reason: "topology conflict acknowledgement is stale or does not match canonical state"
+                .to_owned(),
+        }),
+    }
 }
 
 fn validate_profile_catalog_admission(
@@ -4178,15 +4354,17 @@ fn finish_lifecycle_operation(
     let Some(operation) = owner.lifecycle_operations.remove(operation_id) else {
         return;
     };
-    let terminal = match status {
-        OperationStatus::Succeeded => Some(operation.success),
-        OperationStatus::Failed | OperationStatus::Expired => operation.failure,
-        OperationStatus::Admitted
-        | OperationStatus::WaitingForObservation
-        | OperationStatus::Cancelled => None,
-    };
-    if let Some(event) = terminal {
-        emit_lifecycle_facts(owner, config, &operation.profiles, event, now, events);
+    for leg in operation.legs {
+        let terminal = match status {
+            OperationStatus::Succeeded => Some(leg.success),
+            OperationStatus::Failed | OperationStatus::Expired => leg.failure,
+            OperationStatus::Admitted
+            | OperationStatus::WaitingForObservation
+            | OperationStatus::Cancelled => None,
+        };
+        if let Some(event) = terminal {
+            emit_lifecycle_facts(owner, config, &leg.profiles, event, now, events);
+        }
     }
 }
 
@@ -4200,6 +4378,12 @@ fn recompute_policy_digest(snapshot: &mut ControlSnapshot) {
             RequestedTunnelState::Disconnected => b"disconnected",
         });
     }
+    for (profile_id, conflict) in &snapshot.desired.conflict_acknowledgements {
+        bytes.extend_from_slice(profile_id.as_str().as_bytes());
+        bytes.extend_from_slice(
+            &serde_json::to_vec(conflict).expect("topology conflicts are serializable"),
+        );
+    }
     snapshot.desired.policy_digest = PolicyDigest::sha256(&bytes);
 }
 
@@ -4209,7 +4393,9 @@ fn observation_evidence(observation: &Observation) -> Option<&ProtectionEvidence
         Observation::Tunnel { protection, .. } | Observation::Drift { protection, .. } => {
             protection.as_ref()
         }
-        Observation::ConnectionHealth { .. } => None,
+        Observation::ConnectionHealth { .. }
+        | Observation::TunnelDetails { .. }
+        | Observation::DefaultRoute { .. } => None,
     }
 }
 
@@ -4238,6 +4424,12 @@ fn apply_observation(
             observed_at_millis, ..
         }
         | Observation::ConnectionHealth {
+            observed_at_millis, ..
+        }
+        | Observation::TunnelDetails {
+            observed_at_millis, ..
+        }
+        | Observation::DefaultRoute {
             observed_at_millis, ..
         } => *observed_at_millis,
     };
@@ -4282,6 +4474,14 @@ fn apply_observation(
                 return Err(ObservationError::RetentionFull);
             }
         }
+        Observation::TunnelDetails { profile_id, .. } => {
+            validate_observed_profile(profile_id, config)?;
+            if !snapshot.observed.tunnel_details.contains_key(profile_id)
+                && snapshot.observed.tunnel_details.len() >= config.max_observed_profiles
+            {
+                return Err(ObservationError::RetentionFull);
+            }
+        }
         Observation::Drift {
             profile_id: Some(profile_id),
             ..
@@ -4315,6 +4515,7 @@ fn apply_observation(
         } => {
             if !active {
                 snapshot.observed.connection_health.remove(&profile_id);
+                snapshot.observed.tunnel_details.remove(&profile_id);
             }
             invalidate_gates(
                 snapshot,
@@ -4340,6 +4541,32 @@ fn apply_observation(
                 snapshot.observed.evidence = Some(evidence);
                 snapshot.observed.evidence_received_at_millis = Some(now);
             }
+        }
+        Observation::TunnelDetails {
+            profile_id,
+            details,
+            started_at,
+            observed_at_millis,
+        } => {
+            snapshot.observed.tunnel_details.insert(
+                profile_id,
+                ObservedTunnelDetails {
+                    details: *details,
+                    started_at,
+                    observed_at_millis,
+                    received_at_millis: now,
+                },
+            );
+        }
+        Observation::DefaultRoute {
+            interface_name,
+            observed_at_millis,
+        } => {
+            snapshot.observed.default_route = Some(ObservedDefaultRoute {
+                interface_name,
+                observed_at_millis,
+                received_at_millis: now,
+            });
         }
         Observation::Drift {
             gates,
@@ -4440,9 +4667,11 @@ fn observation_scopes(observation: &Observation) -> Vec<ObservationScope> {
             }
             scopes
         }
-        Observation::ConnectionHealth { profile_id, .. } => {
+        Observation::ConnectionHealth { profile_id, .. }
+        | Observation::TunnelDetails { profile_id, .. } => {
             vec![ObservationScope::Profile(profile_id.clone())]
         }
+        Observation::DefaultRoute { .. } => vec![ObservationScope::Route],
     };
     scopes.sort();
     scopes.dedup();
@@ -4534,7 +4763,6 @@ fn complete_operation(
         let was_recovery = owner.recovery_operations.remove(&completion.operation_id);
         owner.release_operation_admission(&completion.operation_id);
         if was_recovery {
-            release_active_profile_operations(admission, &completion.operation_id);
             snapshot.operations.remove(&completion.operation_id);
         } else {
             mark_terminal(admission, &completion.operation_id);
@@ -4590,7 +4818,6 @@ fn complete_operation(
     );
     owner.release_operation_admission(&completion.operation_id);
     if owner.recovery_operations.remove(&completion.operation_id) {
-        release_active_profile_operations(admission, &completion.operation_id);
         snapshot.operations.remove(&completion.operation_id);
     } else {
         mark_terminal(admission, &completion.operation_id);
@@ -4630,7 +4857,6 @@ fn expire_operations(
         cancel_operation_challenges(&id, snapshot, owner, config.max_challenges, events);
         owner.release_operation_admission(&id);
         if was_recovery {
-            release_active_profile_operations(admission, &id);
             snapshot.operations.remove(&id);
         } else {
             mark_terminal(admission, &id);
@@ -4787,154 +5013,6 @@ fn start_recovery_operation(
     register_recovery_lifecycle(owner, snapshot, config, &recovery_id, now, events);
 }
 
-#[allow(clippy::too_many_arguments)]
-fn admit_unexpected_loss_recovery(
-    before: &ControlSnapshot,
-    snapshot: &mut ControlSnapshot,
-    owner: &mut OwnerState,
-    admission: &Arc<Mutex<AdmissionState>>,
-    now: u64,
-    config: &ControlServiceConfig,
-    selection: ExecutionSelection,
-    supervisor: Option<&Supervisor>,
-    events: &mut Vec<ControlEvent>,
-) {
-    if selection != ExecutionSelection::CanonicalAuthority
-        || snapshot.operations.values().any(|operation| {
-            operation.desired_generation == snapshot.desired.generation
-                && !operation.status.is_terminal()
-        })
-    {
-        return;
-    }
-    let Some(supervisor) = supervisor else {
-        return;
-    };
-    let dropped = snapshot
-        .observed
-        .tunnels
-        .iter()
-        .find_map(|(profile_id, observed)| {
-            let was_present = before
-                .observed
-                .tunnels
-                .get(profile_id)
-                .is_some_and(|prior| prior.active);
-            let desired_connected =
-                snapshot.desired.tunnels.get(profile_id) == Some(&RequestedTunnelState::Connected);
-            let canonically_owned = supervisor.profile_truth(profile_id).is_some_and(|entry| {
-                entry.truth == SupervisedTruth::ObservedPresent && entry.adoption.is_some()
-            });
-            (was_present && !observed.active && desired_connected && canonically_owned)
-                .then_some(profile_id.clone())
-        });
-    let Some(profile_id) = dropped else {
-        return;
-    };
-
-    let recovery_id = {
-        let mut state = admission.lock().expect("admission mutex poisoned");
-        let Some(operation_id) = next_operation_id(&mut state, snapshot.desired.authority_epoch)
-        else {
-            state.readiness.reconciliation_complete = false;
-            snapshot.readiness.reconciliation_complete = false;
-            return;
-        };
-        state
-            .active_profile_operations
-            .entry(profile_id.clone())
-            .or_default()
-            .insert(operation_id.clone(), ProfileOperationKind::Lifecycle);
-        operation_id
-    };
-    let retry_budget = u64::try_from(config.retry_budget.as_millis()).unwrap_or(u64::MAX);
-    let retry_backoff = u64::try_from(config.retry_initial_backoff.as_millis()).unwrap_or(u64::MAX);
-    let generation = snapshot.desired.generation;
-    snapshot.operations.insert(
-        recovery_id.clone(),
-        OperationRecord {
-            id: recovery_id.clone(),
-            idempotency_key: IdempotencyKey::new(format!(
-                "unexpected-loss-recovery-{}-{generation}-{now}",
-                profile_id.as_str()
-            )),
-            client_id: ClientId::from_parts(snapshot.desired.authority_epoch, 0),
-            command_digest: snapshot.desired.policy_digest.clone(),
-            authority_epoch: snapshot.desired.authority_epoch,
-            desired_generation: generation,
-            admitted_at_millis: now,
-            deadline_millis: now.saturating_add(retry_budget),
-            intent: OperationIntent::UnexpectedRecovery {
-                profile_id: profile_id.clone(),
-                tunnels: snapshot.desired.tunnels.clone(),
-                kill_switch: Some(snapshot.desired.kill_switch),
-            },
-            status: OperationStatus::WaitingForObservation,
-            result: None,
-        },
-    );
-    owner.recovery_operations.insert(recovery_id.clone());
-    owner.unexpected_recoveries.insert(
-        recovery_id.clone(),
-        UnexpectedRecovery {
-            profile_id,
-            phase: if snapshot.desired.kill_switch
-                == crate::vortix_core::state::killswitch::KillSwitchMode::Auto
-            {
-                UnexpectedRecoveryPhase::NeedsPreBlock
-            } else {
-                UnexpectedRecoveryPhase::WaitingBackoff
-            },
-            next_attempt_millis: now.saturating_add(retry_backoff),
-            backoff_millis: retry_backoff,
-        },
-    );
-    events.push(ControlEvent::OperationAdmitted {
-        operation_id: recovery_id.clone(),
-        desired_generation: generation,
-    });
-    register_recovery_lifecycle(owner, snapshot, config, &recovery_id, now, events);
-}
-
-fn restored_unexpected_recoveries(
-    snapshot: &ControlSnapshot,
-    config: &ControlServiceConfig,
-    now: u64,
-) -> BTreeMap<OperationId, UnexpectedRecovery> {
-    let initial_backoff =
-        u64::try_from(config.retry_initial_backoff.as_millis()).unwrap_or(u64::MAX);
-    snapshot
-        .operations
-        .iter()
-        .filter_map(|(operation_id, operation)| {
-            if operation.status.is_terminal()
-                || operation.desired_generation != snapshot.desired.generation
-            {
-                return None;
-            }
-            let OperationIntent::UnexpectedRecovery { profile_id, .. } = &operation.intent else {
-                return None;
-            };
-            let remaining = operation.deadline_millis.saturating_sub(now);
-            Some((
-                operation_id.clone(),
-                UnexpectedRecovery {
-                    profile_id: profile_id.clone(),
-                    phase: if snapshot.desired.kill_switch
-                        == crate::vortix_core::state::killswitch::KillSwitchMode::Auto
-                    {
-                        UnexpectedRecoveryPhase::NeedsPreBlock
-                    } else {
-                        UnexpectedRecoveryPhase::WaitingBackoff
-                    },
-                    next_attempt_millis: now.saturating_add(initial_backoff.min(remaining)),
-                    backoff_millis: initial_backoff.min(remaining),
-                },
-            ))
-        })
-        .collect()
-}
-
 fn intent_for_desired_state(snapshot: &ControlSnapshot) -> OperationIntent {
     OperationIntent::DesiredSubset {
         tunnels: snapshot.desired.tunnels.clone(),
@@ -4969,9 +5047,11 @@ fn register_recovery_lifecycle(
     owner.lifecycle_operations.insert(
         recovery_id.clone(),
         LifecycleOperation {
-            profiles,
-            success: HookEvent::Connected,
-            failure: Some(HookEvent::ConnectFailed),
+            legs: vec![LifecycleLeg {
+                profiles,
+                success: HookEvent::Connected,
+                failure: Some(HookEvent::ConnectFailed),
+            }],
         },
     );
 }
@@ -4979,21 +5059,6 @@ fn register_recovery_lifecycle(
 fn mark_terminal(admission: &Arc<Mutex<AdmissionState>>, operation_id: &OperationId) {
     let mut admission = admission.lock().expect("admission mutex poisoned");
     admission.terminal_operations.insert(operation_id.clone());
-    release_active_profile_operations_locked(&mut admission, operation_id);
-}
-
-fn release_active_profile_operations(
-    admission: &Arc<Mutex<AdmissionState>>,
-    operation_id: &OperationId,
-) {
-    let mut admission = admission.lock().expect("admission mutex poisoned");
-    release_active_profile_operations_locked(&mut admission, operation_id);
-}
-
-fn release_active_profile_operations_locked(
-    admission: &mut AdmissionState,
-    operation_id: &OperationId,
-) {
     admission.active_profile_operations.retain(|_, operations| {
         operations.remove(operation_id);
         !operations.is_empty()
@@ -5003,8 +5068,7 @@ fn release_active_profile_operations_locked(
 fn operation_intent_profiles(intent: &OperationIntent) -> Vec<ProfileId> {
     match intent {
         OperationIntent::GenerationScoped => Vec::new(),
-        OperationIntent::DesiredSubset { tunnels, .. }
-        | OperationIntent::UnexpectedRecovery { tunnels, .. } => tunnels.keys().cloned().collect(),
+        OperationIntent::DesiredSubset { tunnels, .. } => tunnels.keys().cloned().collect(),
         OperationIntent::ProfileMutation { profile_id } => vec![profile_id.clone()],
     }
 }
@@ -5154,6 +5218,270 @@ fn record_challenge_terminal(
     terminals.insert(id, terminal);
 }
 
+fn tunnel_details_exceed_bounds(
+    details: &crate::vortix_core::engine::state::DetailedConnectionInfo,
+) -> bool {
+    [
+        &details.interface,
+        &details.internal_ip,
+        &details.endpoint,
+        &details.mtu,
+        &details.public_key,
+        &details.listen_port,
+        &details.transfer_rx,
+        &details.transfer_tx,
+        &details.latest_handshake,
+    ]
+    .into_iter()
+    .any(|value| value.len() > 4_096)
+}
+
+fn topology_routes(config: &ControlServiceConfig, profile_id: &ProfileId) -> Vec<Cidr> {
+    config
+        .profile_topologies
+        .get(profile_id)
+        .into_iter()
+        .flat_map(|topology| &topology.routes)
+        .filter_map(|route| route.parse::<Cidr>().ok())
+        .collect()
+}
+
+fn projected_role(
+    profile_id: &ProfileId,
+    primary: Option<&ProfileId>,
+    allowed_ips: Vec<Cidr>,
+    interface_authoritative: bool,
+) -> Role {
+    if primary == Some(profile_id) {
+        return Role::Primary { allowed_ips };
+    }
+    if !interface_authoritative {
+        return Role::Addressable { allowed_ips };
+    }
+    let claims_default =
+        claims_default_route_v4(&allowed_ips) || claims_default_route_v6(&allowed_ips);
+    if claims_default && primary.is_some() {
+        Role::AddressableSuppressed { allowed_ips }
+    } else {
+        Role::Addressable { allowed_ips }
+    }
+}
+
+fn prior_started_at(
+    previous: Option<&TunnelSnapshot>,
+    same_phase: impl FnOnce(&Connection) -> bool,
+) -> SystemTime {
+    previous
+        .filter(|snapshot| same_phase(&snapshot.state))
+        .and_then(|snapshot| snapshot.started_at)
+        .unwrap_or_else(SystemTime::now)
+}
+
+/// Build the sole user-visible tunnel projection from canonical desired and
+/// observed facts. This function performs no probing or protocol parsing.
+#[allow(clippy::too_many_lines)]
+fn derive_tunnel_projections(
+    snapshot: &mut ControlSnapshot,
+    owner: Option<&OwnerState>,
+    config: &ControlServiceConfig,
+) {
+    let previous = std::mem::take(&mut snapshot.tunnels);
+    let default_interface = snapshot
+        .observed
+        .default_route
+        .as_ref()
+        .and_then(|route| route.interface_name.as_deref());
+    let primary = default_interface.and_then(|default_interface| {
+        snapshot
+            .observed
+            .tunnels
+            .iter()
+            .find_map(|(profile_id, observed)| {
+                if !observed.active {
+                    return None;
+                }
+                let metadata = snapshot.observed.tunnel_details.get(profile_id)?;
+                (metadata.details.interface_authoritative
+                    && metadata.details.interface == default_interface)
+                    .then(|| profile_id.clone())
+            })
+    });
+
+    let mut profiles = config.known_profiles.clone();
+    profiles.extend(snapshot.desired.tunnels.keys().cloned());
+    profiles.extend(snapshot.observed.tunnels.keys().cloned());
+    profiles.extend(
+        snapshot
+            .challenges
+            .values()
+            .map(|challenge| challenge.profile_id.clone()),
+    );
+    let routes_by_profile = profiles
+        .iter()
+        .map(|profile_id| (profile_id.clone(), topology_routes(config, profile_id)))
+        .collect::<BTreeMap<_, _>>();
+    let challenges_by_profile = snapshot
+        .challenges
+        .values()
+        .map(|challenge| (challenge.profile_id.clone(), challenge))
+        .collect::<BTreeMap<_, _>>();
+    let reconnecting_profiles = owner
+        .into_iter()
+        .flat_map(|owner| owner.reconnect_operations.values())
+        .flat_map(|reconnect| reconnect.targets.iter().cloned())
+        .collect::<BTreeSet<_>>();
+
+    let mut projections = BTreeMap::new();
+    for profile_id in profiles {
+        let observed = snapshot.observed.tunnels.get(&profile_id);
+        let metadata = snapshot.observed.tunnel_details.get(&profile_id);
+        let active = observed.is_some_and(|fact| fact.active);
+        let requested = snapshot.desired.tunnels.get(&profile_id);
+        let challenge = challenges_by_profile.get(&profile_id).copied();
+        let reconnecting = reconnecting_profiles.contains(&profile_id);
+        let old = previous.get(&profile_id);
+        let allowed_ips = routes_by_profile
+            .get(&profile_id)
+            .cloned()
+            .unwrap_or_default();
+        let interface_authoritative =
+            metadata.is_some_and(|metadata| metadata.details.interface_authoritative);
+        let base_role = projected_role(
+            &profile_id,
+            primary.as_ref(),
+            allowed_ips,
+            interface_authoritative,
+        );
+
+        let (state, role, health, interface_name, started_at) = if let Some(challenge) = challenge {
+            let since = prior_started_at(old, |state| {
+                matches!(state, Connection::AwaitingUserInput { .. })
+            });
+            (
+                Connection::AwaitingUserInput {
+                    profile_id: profile_id.clone(),
+                    prompt_id: challenge.id.to_string(),
+                    prompt_kind: challenge.kind.clone(),
+                    since,
+                },
+                Role::AwaitingInput,
+                ConnectionHealth::Unknown,
+                None,
+                Some(since),
+            )
+        } else if reconnecting {
+            let started = prior_started_at(old, |state| {
+                matches!(state, Connection::Reconnecting { .. })
+            });
+            (
+                Connection::Reconnecting {
+                    profile_id: profile_id.clone(),
+                    started_at: started,
+                    attempt: 1,
+                    retry_budget_remaining: Duration::ZERO,
+                    last_error: None,
+                },
+                Role::Reconnecting {
+                    prior_role: Box::new(base_role),
+                },
+                ConnectionHealth::Unknown,
+                None,
+                Some(started),
+            )
+        } else if active && matches!(requested, Some(RequestedTunnelState::Disconnected)) {
+            let started = prior_started_at(old, |state| {
+                matches!(state, Connection::Disconnecting { .. })
+            });
+            (
+                Connection::Disconnecting {
+                    profile_id: profile_id.clone(),
+                    started_at: started,
+                },
+                base_role,
+                ConnectionHealth::Unknown,
+                metadata.and_then(|metadata| {
+                    (!metadata.details.interface.is_empty())
+                        .then(|| metadata.details.interface.clone())
+                }),
+                Some(started),
+            )
+        } else if active {
+            let mut details = metadata
+                .map(|metadata| metadata.details.clone())
+                .unwrap_or_default();
+            if details.interface.is_empty() {
+                details.interface = observed
+                    .and_then(|fact| fact.interface_name.clone())
+                    .unwrap_or_default();
+            }
+            let health = snapshot
+                .observed
+                .connection_health
+                .get(&profile_id)
+                .filter(|health| health.desired_generation == snapshot.desired.generation)
+                .map_or_else(
+                    || details.health_hint.clone(),
+                    |health| health.health.clone(),
+                );
+            details.health_hint = health.clone();
+            let since = metadata
+                .and_then(|metadata| metadata.started_at)
+                .or_else(|| {
+                    old.and_then(|snapshot| match snapshot.state {
+                        Connection::Connected { since, .. } => Some(since),
+                        _ => None,
+                    })
+                })
+                .unwrap_or_else(SystemTime::now);
+            let interface_name = (!details.interface.is_empty()).then(|| details.interface.clone());
+            (
+                Connection::Connected {
+                    profile_id: profile_id.clone(),
+                    since,
+                    health: health.clone(),
+                    details: Box::new(details),
+                },
+                base_role,
+                health,
+                interface_name,
+                Some(since),
+            )
+        } else if matches!(requested, Some(RequestedTunnelState::Connected)) {
+            let started =
+                prior_started_at(old, |state| matches!(state, Connection::Connecting { .. }));
+            (
+                Connection::Connecting {
+                    profile_id: profile_id.clone(),
+                    started_at: started,
+                    attempt: 1,
+                    retry_budget_remaining: Duration::ZERO,
+                },
+                base_role,
+                ConnectionHealth::Unknown,
+                None,
+                Some(started),
+            )
+        } else {
+            continue;
+        };
+
+        projections.insert(
+            profile_id.clone(),
+            TunnelSnapshot {
+                profile_id,
+                state,
+                role,
+                health,
+                interface_name,
+                started_at,
+            },
+        );
+    }
+    snapshot.primary = primary;
+    snapshot.tunnels = projections;
+    snapshot.profile_routes = routes_by_profile;
+}
+
 fn derive_effective(
     snapshot: &mut ControlSnapshot,
     now: u64,
@@ -5171,6 +5499,9 @@ fn derive_effective(
                 ceiling_millis: MAX_PROTECTION_AGE_MILLIS,
                 ..Freshness::default()
             },
+            kill_switch: (desired.kill_switch
+                == crate::vortix_core::state::killswitch::KillSwitchMode::Off)
+                .then_some(crate::vortix_core::state::killswitch::KillSwitchState::Disabled),
         };
         return;
     };
@@ -5183,12 +5514,16 @@ fn derive_effective(
     };
     let supervised_protection = selection != ExecutionSelection::CanonicalAuthority
         || supervisor.is_some_and(|supervisor| supervisor.protects(&revision, now));
+    let protection = if current && evidence.all_gates_verified() && supervised_protection {
+        ProtectionStatus::Protected
+    } else {
+        ProtectionStatus::Degraded
+    };
+    let applied = supervisor.and_then(Supervisor::applied_topology);
+    let kill_switch =
+        derive_effective_kill_switch(desired.kill_switch, protection, applied.as_ref());
     snapshot.effective = EffectiveState {
-        protection: if current && evidence.all_gates_verified() && supervised_protection {
-            ProtectionStatus::Protected
-        } else {
-            ProtectionStatus::Degraded
-        },
+        protection,
         desired_generation: desired.generation,
         authority_epoch: desired.authority_epoch,
         policy_digest: desired.policy_digest.clone(),
@@ -5198,7 +5533,33 @@ fn derive_effective(
             ceiling_millis: MAX_PROTECTION_AGE_MILLIS,
             current,
         },
+        kill_switch,
     };
+}
+
+fn derive_effective_kill_switch(
+    mode: crate::vortix_core::state::killswitch::KillSwitchMode,
+    protection: ProtectionStatus,
+    applied: Option<&TopologyState>,
+) -> Option<crate::vortix_core::state::killswitch::KillSwitchState> {
+    match mode {
+        crate::vortix_core::state::killswitch::KillSwitchMode::Off => {
+            Some(crate::vortix_core::state::killswitch::KillSwitchState::Disabled)
+        }
+        _ if protection == ProtectionStatus::Degraded => {
+            Some(crate::vortix_core::state::killswitch::KillSwitchState::Degraded)
+        }
+        crate::vortix_core::state::killswitch::KillSwitchMode::Auto => applied.map(|topology| {
+            if topology.firewall_blocking {
+                crate::vortix_core::state::killswitch::KillSwitchState::Blocking
+            } else {
+                crate::vortix_core::state::killswitch::KillSwitchState::Armed
+            }
+        }),
+        crate::vortix_core::state::killswitch::KillSwitchMode::AlwaysOn => applied
+            .filter(|topology| topology.firewall_blocking)
+            .map(|_| crate::vortix_core::state::killswitch::KillSwitchState::Blocking),
+    }
 }
 
 fn publish_then_events(
@@ -5223,8 +5584,114 @@ mod target_profiles_tests {
     use crate::vortix_core::control::worker::{
         CancellationToken, PolicyBarrier, PolicyExecutor, TunnelExecutionReceipt, TunnelExecutor,
     };
+    use crate::vortix_core::state::{KillSwitchMode, KillSwitchState};
 
     struct NoopTunnel;
+
+    #[test]
+    fn exclusive_switch_ordering_is_recovered_from_durable_intent() {
+        let first = ProfileId::new("first");
+        let target = ProfileId::new("target");
+        let operation_id = OperationId::from_parts(AuthorityEpoch(7), 3);
+        let tunnels = BTreeMap::from([
+            (first.clone(), RequestedTunnelState::Disconnected),
+            (target.clone(), RequestedTunnelState::Connected),
+        ]);
+        let mut snapshot = ControlSnapshot::default();
+        snapshot.desired.generation = 9;
+        snapshot.desired.tunnels.clone_from(&tunnels);
+        snapshot.operations.insert(
+            operation_id.clone(),
+            OperationRecord {
+                id: operation_id.clone(),
+                idempotency_key: IdempotencyKey::new("exclusive-before-crash"),
+                client_id: ClientId::from_parts(AuthorityEpoch(7), 1),
+                command_digest: PolicyDigest::default(),
+                authority_epoch: AuthorityEpoch(7),
+                desired_generation: 9,
+                admitted_at_millis: 1,
+                deadline_millis: u64::MAX,
+                intent: OperationIntent::DesiredSubset {
+                    tunnels,
+                    kill_switch: None,
+                },
+                status: OperationStatus::WaitingForObservation,
+                result: None,
+            },
+        );
+
+        let recovered = recover_exclusive_switch_operations(&snapshot);
+
+        assert_eq!(recovered[&operation_id].target, target);
+        assert_eq!(recovered[&operation_id].teardown, BTreeSet::from([first]));
+    }
+
+    #[test]
+    fn canonical_effective_killswitch_requires_explicit_policy_truth() {
+        assert!(!final_firewall_blocks(KillSwitchMode::Off));
+        assert!(!final_firewall_blocks(KillSwitchMode::Auto));
+        assert!(final_firewall_blocks(KillSwitchMode::AlwaysOn));
+
+        let armed = TopologyState {
+            kill_switch: KillSwitchMode::Auto,
+            ..TopologyState::default()
+        };
+        let blocking_auto = TopologyState {
+            kill_switch: KillSwitchMode::Auto,
+            firewall_blocking: true,
+            ..TopologyState::default()
+        };
+        let blocking_always = TopologyState {
+            kill_switch: KillSwitchMode::AlwaysOn,
+            firewall_blocking: true,
+            ..TopologyState::default()
+        };
+
+        assert_eq!(
+            derive_effective_kill_switch(KillSwitchMode::Off, ProtectionStatus::Protected, None),
+            Some(KillSwitchState::Disabled)
+        );
+        assert_eq!(
+            derive_effective_kill_switch(
+                KillSwitchMode::Auto,
+                ProtectionStatus::Protected,
+                Some(&armed)
+            ),
+            Some(KillSwitchState::Armed)
+        );
+        assert_eq!(
+            derive_effective_kill_switch(
+                KillSwitchMode::Auto,
+                ProtectionStatus::Protected,
+                Some(&blocking_auto)
+            ),
+            Some(KillSwitchState::Blocking)
+        );
+        assert_eq!(
+            derive_effective_kill_switch(
+                KillSwitchMode::AlwaysOn,
+                ProtectionStatus::Protected,
+                Some(&blocking_always)
+            ),
+            Some(KillSwitchState::Blocking)
+        );
+        assert_eq!(
+            derive_effective_kill_switch(
+                KillSwitchMode::Auto,
+                ProtectionStatus::Degraded,
+                Some(&armed)
+            ),
+            Some(KillSwitchState::Degraded)
+        );
+        assert_eq!(
+            derive_effective_kill_switch(
+                KillSwitchMode::AlwaysOn,
+                ProtectionStatus::Protected,
+                None
+            ),
+            None
+        );
+    }
 
     impl TunnelExecutor for NoopTunnel {
         fn execute(

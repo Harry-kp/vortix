@@ -104,43 +104,6 @@ impl App {
             },
         }
     }
-
-    /// Build the `ActiveTunnelInfo` slice consumed by the kill switch
-    /// from registry snapshots. Multi-tunnel-aware — every Connected
-    /// entry contributes a tunnel, with the registry's primary marked
-    /// `is_primary: true`.
-    #[must_use]
-    pub(crate) fn active_tunnels_for_killswitch(
-        &self,
-    ) -> Vec<crate::core::killswitch::ActiveTunnelInfo> {
-        use crate::core::killswitch::ActiveTunnelInfo;
-        use crate::vortix_core::engine::state::Connection;
-        let primary = self.registry.primary().cloned();
-        self.registry
-            .snapshot_all()
-            .into_iter()
-            .filter_map(|s| match s.state {
-                Connection::Connected { details, .. } => {
-                    let server_ips = details
-                        .endpoint
-                        .split(':')
-                        .next()
-                        .and_then(|h| h.parse().ok())
-                        .into_iter()
-                        .collect();
-                    let is_primary = primary.as_ref() == Some(&s.profile_id);
-                    Some(ActiveTunnelInfo {
-                        interface: details.interface.clone(),
-                        server_ips,
-                        declared_cidrs: Vec::new(),
-                        is_primary,
-                    })
-                }
-                _ => None,
-            })
-            .collect()
-    }
-
     /// Off-thread DNS leak probe (3s UDP timeout). Result returns via
     /// `TelemetryUpdate::DnsLeak`. See [`crate::core::dns_leak`].
     pub(crate) fn spawn_dns_leak_probe(&self) {
@@ -227,22 +190,6 @@ impl App {
             .filter(|s| !matches!(s.state, Connection::Disconnected { .. }))
             .count()
     }
-
-    /// Return the list of `ProfileId`s for currently-active tunnels in a
-    /// stable order. Used by the `Tab` focus-cycle in Connection Details.
-    pub(crate) fn active_tunnel_ids(&self) -> Vec<crate::vortix_core::profile::ProfileId> {
-        use crate::vortix_core::engine::state::Connection;
-        let mut out: Vec<_> = self
-            .registry
-            .snapshot_all()
-            .into_iter()
-            .filter(|s| !matches!(s.state, Connection::Disconnected { .. }))
-            .map(|s| s.profile_id)
-            .collect();
-        out.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-        out
-    }
-
     /// Resolve a user/scanner-facing display name at the App boundary.
     /// Internal registry and lifecycle code carries the returned stable ID.
     #[must_use]
