@@ -50,6 +50,15 @@ pub enum Message {
     /// Toggle flip (front/back view) on current panel
     ToggleFlip,
 
+    // === Optional Background mode ===
+    OpenBackgroundSetup,
+    OpenBackgroundStatus,
+    OpenBackgroundRecover,
+    OpenBackgroundDisable,
+    OpenBackgroundDiagnostics,
+    BackgroundDiagnosticsLoaded(Result<Box<crate::vortix_core::control::DiagnosticView>, String>),
+    ConfirmBackgroundAction,
+
     // === Profile Management ===
     /// Move selection in profile list
     ProfileMove(SelectionMove),
@@ -81,21 +90,29 @@ pub enum Message {
     /// formerly `ConfirmSwitch`). User accepted the overlay; retry the
     /// connect with `force=true`. Both tunnels stay connected per
     /// the "primary inverts" scenario.
-    ConfirmDefaultRouteTakeover { idx: usize },
+    ConfirmDefaultRouteTakeover {
+        idx: usize,
+    },
     /// User chose the legacy single-tunnel "switch" path on the
     /// default-route takeover overlay: disconnect the current tunnel
     /// first, then connect the new one. Fired by the `[S]` hotkey on
     /// the overlay (distinct from `[Y]es` which keeps both tunnels up).
-    SwitchExclusiveAndConnect { idx: usize },
+    SwitchExclusiveAndConnect {
+        idx: usize,
+    },
     /// Confirm route-overlap . User
     /// accepted the AllowedIPs-overlap overlay; retry the connect with
     /// `force=true`.
-    ConfirmRouteOverlap { idx: usize },
+    ConfirmRouteOverlap {
+        idx: usize,
+    },
     /// disconnect one specific profile by
     /// index (the `d` keybinding on a Connected sidebar row). Distinct from
     /// the global `Disconnect` message which targets the legacy single-
     /// tunnel active profile.
-    DisconnectProfile { idx: usize },
+    DisconnectProfile {
+        idx: usize,
+    },
     /// open the "Disconnect all N tunnels?"
     /// confirmation dialog (the Shift+`D` keybinding when N>1). Fired from
     /// the sidebar; with N≤1 the input layer dispatches `DisconnectProfile`
@@ -109,7 +126,9 @@ pub enum Message {
     /// `c` keybinding on a Connecting row's Connection Details). FSM
     /// transitions Connecting → Disconnected and the sidebar row clears
     /// the badge.
-    CancelConnect { idx: usize },
+    CancelConnect {
+        idx: usize,
+    },
 
     // === Action Menu ===
     /// Open the action menu (Single actions)
@@ -332,6 +351,31 @@ pub fn get_bulk_actions() -> Vec<ActionMenuItem> {
             message: Message::ToggleKillSwitch,
         },
         ActionMenuItem {
+            key: "S",
+            label: "Background Setup",
+            message: Message::OpenBackgroundSetup,
+        },
+        ActionMenuItem {
+            key: "T",
+            label: "Background Status",
+            message: Message::OpenBackgroundStatus,
+        },
+        ActionMenuItem {
+            key: "E",
+            label: "Background Recover",
+            message: Message::OpenBackgroundRecover,
+        },
+        ActionMenuItem {
+            key: "X",
+            label: "Disable Background",
+            message: Message::OpenBackgroundDisable,
+        },
+        ActionMenuItem {
+            key: "G",
+            label: "Background Diagnostics",
+            message: Message::OpenBackgroundDiagnostics,
+        },
+        ActionMenuItem {
             key: "/",
             label: "Search Profiles",
             message: Message::OpenSearch,
@@ -357,6 +401,33 @@ pub fn get_bulk_actions() -> Vec<ActionMenuItem> {
             message: Message::Quit,
         },
     ]
+}
+
+/// Return global actions admitted by the current typed Background-mode record.
+#[must_use]
+pub fn get_bulk_actions_for(
+    permitted: &[crate::background::BackgroundAction],
+) -> Vec<ActionMenuItem> {
+    get_bulk_actions()
+        .into_iter()
+        .filter(|item| {
+            let required = match &item.message {
+                Message::OpenBackgroundSetup => Some(crate::background::BackgroundAction::Setup),
+                Message::OpenBackgroundStatus => Some(crate::background::BackgroundAction::Status),
+                Message::OpenBackgroundRecover => {
+                    Some(crate::background::BackgroundAction::Recover)
+                }
+                Message::OpenBackgroundDiagnostics => {
+                    Some(crate::background::BackgroundAction::Diagnostics)
+                }
+                Message::OpenBackgroundDisable => {
+                    Some(crate::background::BackgroundAction::Disable)
+                }
+                _ => None,
+            };
+            required.is_none_or(|required| permitted.contains(&required))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -421,9 +492,25 @@ mod tests {
     }
 
     #[test]
-    fn test_bulk_actions_count() {
+    fn typed_mode_actions_filter_background_entries_only() {
+        let actions = get_bulk_actions_for(&[
+            crate::background::BackgroundAction::Status,
+            crate::background::BackgroundAction::Diagnostics,
+        ]);
+        assert!(actions.iter().any(|action| action.key == "T"));
+        assert!(actions.iter().any(|action| action.key == "G"));
+        assert!(!actions.iter().any(|action| action.key == "S"));
+        assert!(actions.iter().any(|action| action.key == "i"));
+    }
+
+    #[test]
+    fn bulk_actions_have_unique_keys() {
         let actions = get_bulk_actions();
-        assert_eq!(actions.len(), 10);
+        let keys = actions
+            .iter()
+            .map(|action| action.key)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(keys.len(), actions.len());
     }
 
     #[test]

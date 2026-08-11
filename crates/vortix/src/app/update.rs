@@ -24,6 +24,9 @@ const UI_HANDLER_SLOW_THRESHOLD: Duration = Duration::from_millis(50);
 /// variants, `"ConnectResult { ... }"` for struct variants, etc. — we
 /// want just the name so `tracing` events are aggregatable.
 fn message_variant_label(msg: &Message) -> String {
+    if matches!(msg, Message::BackgroundDiagnosticsLoaded(_)) {
+        return "BackgroundDiagnosticsLoaded".into();
+    }
     let s = format!("{msg:?}");
     s.split_once([' ', '(', '{'])
         .map_or(s.clone(), |(prefix, _)| prefix.to_string())
@@ -234,6 +237,57 @@ impl App {
                     self.flip_state_mut(panel).flip();
                 }
             }
+            Message::OpenBackgroundSetup => {
+                self.input_mode = InputMode::BackgroundSetup {
+                    state: crate::background::BackgroundOverlayState::new(
+                        crate::background::BackgroundWorkflow::Setup,
+                    ),
+                };
+            }
+            Message::OpenBackgroundStatus => {
+                self.input_mode = InputMode::BackgroundSetup {
+                    state: crate::background::BackgroundOverlayState::new(
+                        crate::background::BackgroundWorkflow::Status,
+                    ),
+                };
+            }
+            Message::OpenBackgroundRecover => {
+                self.input_mode = InputMode::BackgroundSetup {
+                    state: crate::background::BackgroundOverlayState::new(
+                        crate::background::BackgroundWorkflow::Recover,
+                    ),
+                };
+            }
+            Message::OpenBackgroundDisable => {
+                self.input_mode = InputMode::BackgroundSetup {
+                    state: crate::background::BackgroundOverlayState::new(
+                        crate::background::BackgroundWorkflow::Disable,
+                    ),
+                };
+            }
+            Message::OpenBackgroundDiagnostics => self.open_background_diagnostics(),
+            Message::BackgroundDiagnosticsLoaded(result) => {
+                self.background_diagnostics_loading = false;
+                match result {
+                    Ok(view) => self.log_batch(&background_diagnostic_log_lines(&view)),
+                    Err(error) => self.log(&format!(
+                        "BACKGROUND: diagnostics unavailable ({error}); status remains Standard and no authority claim was made"
+                    )),
+                }
+            }
+            Message::ConfirmBackgroundAction => {
+                let workflow = match &self.input_mode {
+                    InputMode::BackgroundSetup { state } => Some(state.workflow),
+                    _ => None,
+                };
+                if workflow != Some(crate::background::BackgroundWorkflow::Status) {
+                    self.show_toast(
+                        "Background enrollment is not enabled in this release; Standard mode is unchanged".into(),
+                        ToastType::Info,
+                    );
+                }
+                self.input_mode = InputMode::Normal;
+            }
             Message::CloseOverlay => {
                 if let Some(challenge_id) = self.control_challenge.take() {
                     if let Some(control) = &self.control_session {
@@ -355,6 +409,40 @@ impl App {
                 "ui-handler slow: a Message handler blocked the UI thread for longer than the perceptible-stutter threshold"
             );
         }
+    }
+
+    fn open_background_diagnostics(&mut self) {
+        self.focused_panel = FocusedPanel::Logs;
+        self.logs_auto_scroll = true;
+        if self.background_diagnostics_loading {
+            self.show_toast(
+                "Background diagnostics are already loading".into(),
+                ToastType::Info,
+            );
+            return;
+        }
+        self.background_diagnostics_loading = true;
+        self.log("BACKGROUND: loading redacted diagnostics");
+        let socket = crate::daemon::daemon_socket_path_override()
+            .unwrap_or_else(crate::daemon::default_socket_path);
+        let fallback = self
+            .runtime
+            .config_dir
+            .join("control")
+            .join("diagnostics.json");
+        let allow_fallback = self.background_diagnostics_fallback;
+        let tx = self.runtime.cmd_tx.clone();
+        std::thread::spawn(move || {
+            let result = crate::background::load_diagnostics(
+                &socket,
+                &fallback,
+                allow_fallback,
+                crate::daemon::diagnostics::unix_millis(),
+            )
+            .map(Box::new)
+            .map_err(|error| error.to_string());
+            let _ = tx.send(Message::BackgroundDiagnosticsLoaded(result));
+        });
     }
 
     fn handle_manage_auth(&mut self) {
@@ -797,4 +885,21 @@ impl App {
         self.logs_auto_scroll = true;
         self.show_toast(format!("Log filter: {label}"), ToastType::Info);
     }
+}
+
+fn background_diagnostic_log_lines(
+    view: &crate::vortix_core::control::DiagnosticView,
+) -> Vec<String> {
+    let mut lines = Vec::with_capacity(view.snapshot.records.len() + 1);
+    lines.push(format!(
+        "BACKGROUND: diagnostics source={:?} stale={} age_ms={} generation={}",
+        view.source, view.stale, view.age_millis, view.snapshot.generation
+    ));
+    lines.extend(view.snapshot.records.iter().map(|record| {
+        format!(
+            "BACKGROUND: diagnostic #{} {:?}/{:?} {:?} {:?}",
+            record.sequence, record.component, record.severity, record.code, record.fields
+        )
+    }));
+    lines
 }

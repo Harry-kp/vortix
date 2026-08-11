@@ -140,24 +140,7 @@ impl App {
 
     /// Add a log message via centralized logger
     pub(crate) fn log(&mut self, message: &str) {
-        // Parse "PREFIX: content" — the prefix determines both the category and the level.
-        let (category, content, level) = if let Some(idx) = message.find(':') {
-            let prefix = message[..idx].trim();
-            let msg = message[idx + 1..].trim();
-
-            let lvl = match prefix {
-                // Errors
-                "ERR" | "CMD_ERR" => LogLevel::Error,
-                // Warnings
-                "WARN" => LogLevel::Warning,
-                // Everything else is informational (STATUS, ACTION, NET, SEC, AUTH, etc.)
-                _ => LogLevel::Info,
-            };
-
-            (prefix, msg, lvl)
-        } else {
-            ("APP", message, LogLevel::Info)
-        };
+        let (category, content, level) = classify_log_message(message);
 
         // Log via centralized logger
         logger::log(level, category, content);
@@ -169,8 +152,29 @@ impl App {
         // Auto-save to log file
         let timestamp = utils::format_local_time();
         let level_tag = level.prefix();
-        Self::append_to_log_file(
-            &format!("{timestamp} [{level_tag}] {category}: {content}"),
+        Self::append_to_log_file_batch(
+            &[format!("{timestamp} [{level_tag}] {category}: {content}")],
+            &self.runtime.config_dir,
+            self.runtime.config.log_rotation_size,
+            self.runtime.config.log_retention_days,
+        );
+    }
+
+    /// Add a bounded group of messages while opening the persistent log once.
+    pub(crate) fn log_batch(&mut self, messages: &[String]) {
+        let mut persisted = Vec::with_capacity(messages.len());
+        for message in messages {
+            let (category, content, level) = classify_log_message(message);
+            logger::log(level, category, content);
+            let timestamp = utils::format_local_time();
+            let level_tag = level.prefix();
+            persisted.push(format!("{timestamp} [{level_tag}] {category}: {content}"));
+        }
+        if self.logs_auto_scroll {
+            self.logs_scroll = self.logs_max_scroll;
+        }
+        Self::append_to_log_file_batch(
+            &persisted,
             &self.runtime.config_dir,
             self.runtime.config.log_rotation_size,
             self.runtime.config.log_retention_days,
@@ -411,8 +415,8 @@ impl App {
     }
 
     /// Append log entry to file with automatic rotation
-    fn append_to_log_file(
-        entry: &str,
+    pub(super) fn append_to_log_file_batch(
+        entries: &[String],
         config_dir: &std::path::Path,
         rotation_size: u64,
         retention_days: u64,
@@ -420,6 +424,9 @@ impl App {
         static CLEANUP_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         use std::io::Write;
 
+        if entries.is_empty() {
+            return;
+        }
         let log_dir = config_dir.join(constants::LOGS_DIR_NAME);
 
         // Create log directory if needed
@@ -433,31 +440,57 @@ impl App {
             .date();
         let log_file = log_dir.join(format!("vortix-{today}.log"));
 
-        // Rotate if the file exceeds the configured size
-        if let Ok(metadata) = std::fs::metadata(&log_file) {
-            if metadata.len() > rotation_size {
-                let rotated = log_dir.join(format!("vortix-{today}.1.log"));
-                let _ = std::fs::rename(&log_file, rotated);
+        let mut current_len = std::fs::metadata(&log_file).map_or(0, |metadata| metadata.len());
+        let mut file = None;
+        for entry in entries {
+            let encoded_len = u64::try_from(entry.len())
+                .unwrap_or(u64::MAX)
+                .saturating_add(1);
+            if current_len > 0 && current_len.saturating_add(encoded_len) > rotation_size {
+                drop(file.take());
+                Self::rotate_log_file(&log_file, &log_dir, today);
+                current_len = 0;
             }
-        }
-
-        // Append to log file
-        let is_new_log = !log_file.exists();
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_file)
-        {
-            let _ = writeln!(file, "{entry}");
-            if is_new_log {
-                crate::config::fix_ownership(&log_file);
+            if file.is_none() {
+                let is_new = !log_file.exists();
+                file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log_file)
+                    .ok();
+                if is_new && file.is_some() {
+                    crate::config::fix_ownership(&log_file);
+                }
             }
+            let Some(writer) = file.as_mut() else {
+                break;
+            };
+            if writeln!(writer, "{entry}").is_err() {
+                break;
+            }
+            current_len = current_len.saturating_add(encoded_len);
         }
 
         // Clean up old logs periodically
-        let count = CLEANUP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if count % constants::LOG_CLEANUP_INTERVAL == 0 {
+        let added = u32::try_from(entries.len()).unwrap_or(u32::MAX);
+        let count = CLEANUP_COUNTER.fetch_add(added, std::sync::atomic::Ordering::Relaxed);
+        let last = count.saturating_add(added.saturating_sub(1));
+        if count % constants::LOG_CLEANUP_INTERVAL == 0
+            || count / constants::LOG_CLEANUP_INTERVAL != last / constants::LOG_CLEANUP_INTERVAL
+        {
             Self::cleanup_old_logs(&log_dir, retention_days);
+        }
+    }
+
+    fn rotate_log_file(log_file: &Path, log_dir: &Path, today: time::Date) {
+        if !log_file.exists() {
+            return;
+        }
+        let rotated = (1_u32..=u32::from(u16::MAX))
+            .map(|suffix| log_dir.join(format!("vortix-{today}.{suffix}.log")))
+            .find(|candidate| !candidate.exists());
+        if let Some(rotated) = rotated {
+            let _ = std::fs::rename(log_file, rotated);
         }
     }
 
@@ -482,4 +515,18 @@ impl App {
             }
         }
     }
+}
+
+fn classify_log_message(message: &str) -> (&str, &str, LogLevel) {
+    let Some(idx) = message.find(':') else {
+        return ("APP", message, LogLevel::Info);
+    };
+    let category = message[..idx].trim();
+    let content = message[idx + 1..].trim();
+    let level = match category {
+        "ERR" | "CMD_ERR" => LogLevel::Error,
+        "WARN" => LogLevel::Warning,
+        _ => LogLevel::Info,
+    };
+    (category, content, level)
 }

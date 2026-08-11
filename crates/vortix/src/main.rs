@@ -260,7 +260,12 @@ fn main() -> Result<()> {
 
     // Run the TUI application
     let terminal = init_terminal()?;
-    let result = run_tui(terminal, app_config, config_dir);
+    let result = run_tui(
+        terminal,
+        app_config,
+        config_dir,
+        settings.diagnostics.fallback_snapshot,
+    );
     restore_terminal();
 
     result
@@ -344,9 +349,11 @@ fn run_tui(
     mut terminal: ratatui::DefaultTerminal,
     config: config::AppConfig,
     config_dir: std::path::PathBuf,
+    diagnostics_fallback: bool,
 ) -> Result<()> {
     let tick_rate = config.tick_rate;
     let mut app = App::new(config, config_dir);
+    app.set_background_diagnostics_fallback(diagnostics_fallback);
     let control = vortix::cli::control::LocalControlSession::start(
         &app.runtime.config,
         &app.runtime.config_dir,

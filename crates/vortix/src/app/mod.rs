@@ -176,6 +176,10 @@ pub struct App {
     pub panel_areas: HashMap<FocusedPanel, Rect>,
     pub toast: Option<Toast>,
     pub terminal_size: (u16, u16),
+    /// Shared user-visible operating-mode projection.
+    pub background_mode: crate::background::BackgroundModeRecord,
+    pub(crate) background_diagnostics_loading: bool,
+    pub(crate) background_diagnostics_fallback: bool,
 }
 
 // An earlier refactor removed the previous `impl Deref<Target = VpnRuntime>` — the
@@ -230,6 +234,9 @@ impl App {
             panel_areas: HashMap::new(),
             toast: None,
             terminal_size: (0, 0),
+            background_mode: crate::background::BackgroundModeRecord::default(),
+            background_diagnostics_loading: false,
+            background_diagnostics_fallback: true,
         };
 
         // Select first profile if available
@@ -406,7 +413,14 @@ impl App {
             panel_areas: HashMap::new(),
             toast: None,
             terminal_size: (80, 24),
+            background_mode: crate::background::BackgroundModeRecord::default(),
+            background_diagnostics_loading: false,
+            background_diagnostics_fallback: true,
         }
+    }
+
+    pub fn set_background_diagnostics_fallback(&mut self, enabled: bool) {
+        self.background_diagnostics_fallback = enabled;
     }
 }
 

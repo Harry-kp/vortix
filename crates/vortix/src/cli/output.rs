@@ -205,16 +205,134 @@ pub fn print_success<T: Serialize>(
     }
 }
 
+/// Render the shared Background-mode record without inventing a second CLI
+/// vocabulary. JSON receives the same typed projection used by the TUI.
+pub fn print_background_view(
+    mode: OutputMode,
+    command: &str,
+    view: &crate::background::BackgroundCommandView,
+) {
+    match mode {
+        OutputMode::Json => print_success(mode, command, view, Vec::new()),
+        OutputMode::Quiet => {}
+        OutputMode::Human => {
+            println!("{}", view.mode.state.display_name());
+            println!("Reason: {}", view.mode.reason);
+            println!("Authority: {}", view.mode.authority.display_name());
+            println!("Protection: {}", view.mode.protection.display_name());
+            println!(
+                "Permitted actions: {}",
+                view.mode
+                    .permitted_actions
+                    .iter()
+                    .map(|action| action.display_name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            for line in &view.preview {
+                println!("- {line}");
+            }
+            if !view.activation_available {
+                println!("Activation: unavailable until the enrolled authority release");
+            }
+        }
+    }
+}
+
+/// Refuse a prepared Background mutation without claiming completion.
+/// The caller returns the supplied non-zero semantic exit code.
+#[must_use]
+pub fn print_background_unavailable(mode: OutputMode, command: &str) -> ExitCode {
+    let error = CliError {
+        code: "background_activation_unavailable",
+        message: "Background authority enrollment is not enabled in this release; no privileged process or state transition ran.".into(),
+        hint: Some("Continue using Standard mode and retry after installing an enrollment-capable release.".into()),
+    };
+    print_error(mode, command, error, false);
+    ExitCode::StateConflict
+}
+
+/// Render only allowlisted diagnostic fields. The source label is transport
+/// supplied and makes advisory fallback data unmistakable in every mode.
+pub fn print_background_diagnostics(
+    mode: OutputMode,
+    view: &crate::vortix_core::control::DiagnosticView,
+    stream: bool,
+) {
+    match mode {
+        OutputMode::Json if stream => {
+            println!("{}", background_diagnostics_json(view, true));
+        }
+        OutputMode::Json => print_success(mode, "background diagnostics", view, Vec::new()),
+        OutputMode::Quiet => {}
+        OutputMode::Human => {
+            use crate::vortix_core::control::DiagnosticSource;
+            let source = match view.source {
+                DiagnosticSource::AuthenticatedLive => "authenticated live",
+                DiagnosticSource::UnauthenticatedAdvisoryFallback => {
+                    "UNAUTHENTICATED ADVISORY FALLBACK"
+                }
+            };
+            println!("Background diagnostics: {source}");
+            println!("Stale: {} (age {} ms)", view.stale, view.age_millis);
+            println!("Generation: {}", view.snapshot.generation);
+            for record in &view.snapshot.records {
+                println!(
+                    "#{} {:?}/{:?}: {:?} {:?}",
+                    record.sequence, record.component, record.severity, record.code, record.fields
+                );
+            }
+            if matches!(
+                view.source,
+                DiagnosticSource::UnauthenticatedAdvisoryFallback
+            ) {
+                println!("Advisory only: cannot establish authority or protection state");
+            }
+        }
+    }
+}
+
+fn background_diagnostics_json(
+    view: &crate::vortix_core::control::DiagnosticView,
+    stream: bool,
+) -> String {
+    let response = CliResponse::success("background diagnostics", view, Vec::new());
+    if stream {
+        serde_json::to_string(&response).unwrap_or_else(|_| "{}".into())
+    } else {
+        serde_json::to_string_pretty(&response).unwrap_or_else(|_| "{}".into())
+    }
+}
+
 /// Print an error and exit with the appropriate code.
 pub fn print_error_and_exit(mode: OutputMode, command: &str, err: CliError, exit: ExitCode) -> ! {
+    print_error(mode, command, err, false);
+    std::process::exit(exit.code());
+}
+
+/// Print a terminal stream error using one compact JSON envelope per line.
+/// Human and quiet output retain the common CLI error grammar.
+pub fn print_stream_error_and_exit(
+    mode: OutputMode,
+    command: &str,
+    err: CliError,
+    exit: ExitCode,
+) -> ! {
+    print_error(mode, command, err, true);
+    std::process::exit(exit.code());
+}
+
+fn print_error(mode: OutputMode, command: &str, err: CliError, compact_json: bool) {
     match mode {
         OutputMode::Json => {
             let resp = error_response(command, err);
             // Errors go to stdout in JSON mode (consistent envelope)
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".into())
-            );
+            let encoded = if compact_json {
+                serde_json::to_string(&resp)
+            } else {
+                serde_json::to_string_pretty(&resp)
+            };
+            println!("{}", encoded.unwrap_or_else(|_| "{}".into()));
         }
         OutputMode::Quiet => {
             eprintln!("error: {}", err.message);
@@ -226,7 +344,6 @@ pub fn print_error_and_exit(mode: OutputMode, command: &str, err: CliError, exit
             }
         }
     }
-    std::process::exit(exit.code());
 }
 
 /// Convenience: build a `CliError` for permission denied.
@@ -344,5 +461,34 @@ mod tests {
         };
         let json = serde_json::to_string(&entry).unwrap();
         assert_eq!(json, "{\"state\":\"disconnected\"}");
+    }
+
+    #[test]
+    fn diagnostic_follow_json_is_one_compact_envelope_per_line() {
+        use crate::vortix_core::control::diagnostics::DIAGNOSTIC_SCHEMA_VERSION;
+        use crate::vortix_core::control::{
+            DiagnosticSnapshot, DiagnosticSource, DiagnosticStatus, DiagnosticView,
+        };
+        let view = DiagnosticView {
+            source: DiagnosticSource::AuthenticatedLive,
+            stale: false,
+            age_millis: 0,
+            snapshot: DiagnosticSnapshot {
+                schema_version: DIAGNOSTIC_SCHEMA_VERSION,
+                generation: 1,
+                generated_at_unix_millis: 1,
+                stale_after_millis: 30_000,
+                product_version: "test".into(),
+                status: DiagnosticStatus::default(),
+                records: Vec::new(),
+            },
+        };
+        let line = background_diagnostics_json(&view, true);
+        assert!(!line.contains('\n'));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&line).unwrap()["command"],
+            "background diagnostics"
+        );
+        assert!(background_diagnostics_json(&view, false).contains('\n'));
     }
 }
