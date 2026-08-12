@@ -52,6 +52,95 @@ enum NftBatchMode {
     Replace,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum NftAcceptRule {
+    OutputInterface(String),
+    Destination(Cidr),
+    Dhcp,
+}
+
+fn host_cidr(address: IpAddr) -> Cidr {
+    let prefix_len = if address.is_ipv4() { 32 } else { 128 };
+    Cidr::new(address, prefix_len).expect("a host prefix is valid for its address family")
+}
+
+fn parse_nft_accept_rule(line: &str) -> Option<NftAcceptRule> {
+    if line == "udp sport 68 udp dport 67 accept" {
+        return Some(NftAcceptRule::Dhcp);
+    }
+    if let Some(interface) = line
+        .strip_prefix("oifname \"")
+        .and_then(|rest| rest.strip_suffix("\" accept"))
+    {
+        if interface.is_empty() || interface.contains('"') {
+            return None;
+        }
+        return Some(NftAcceptRule::OutputInterface(interface.to_string()));
+    }
+
+    for (prefix, expect_v4) in [("ip daddr ", true), ("ip6 daddr ", false)] {
+        let Some(address) = line
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix(" accept"))
+        else {
+            continue;
+        };
+        let destination = address
+            .parse::<Cidr>()
+            .ok()
+            .or_else(|| address.parse::<IpAddr>().ok().map(host_cidr))?;
+        if destination.is_v4() != expect_v4 {
+            return None;
+        }
+        return Some(NftAcceptRule::Destination(destination));
+    }
+
+    None
+}
+
+fn has_unquoted_accept_verdict(line: &str) -> bool {
+    const ACCEPT: &[u8] = b"accept";
+
+    let bytes = line.as_bytes();
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                quoted = false;
+            }
+            continue;
+        }
+        if byte == b'"' {
+            quoted = true;
+            continue;
+        }
+
+        let end = index + ACCEPT.len();
+        if end <= bytes.len()
+            && &bytes[index..end] == ACCEPT
+            && (index == 0 || bytes[index - 1].is_ascii_whitespace())
+            && (end == bytes.len() || bytes[end].is_ascii_whitespace())
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn parse_nft_accept_rules(ruleset: &str) -> Option<Vec<NftAcceptRule>> {
+    ruleset
+        .lines()
+        .map(str::trim)
+        .filter(|line| has_unquoted_accept_verdict(line))
+        .map(parse_nft_accept_rule)
+        .collect()
+}
+
 /// Linux firewall implementation supporting iptables and nftables.
 pub struct IptablesFirewall;
 
@@ -546,38 +635,10 @@ impl IptablesFirewall {
     }
 
     fn nft_snapshot_matches(active: &[ActiveTunnelInfo], snapshot: &str) -> bool {
-        let secondary_cidrs: Vec<Cidr> = active
-            .iter()
-            .filter(|tunnel| !tunnel.is_primary)
-            .flat_map(|tunnel| tunnel.declared_cidrs.iter().copied())
-            .collect();
-        let mut expected = vec!["oifname \"lo\" accept".to_string()];
-        expected.extend(
-            cidr_subtract(&rfc1918_ranges(), &secondary_cidrs)
-                .into_iter()
-                .map(|range| format!("ip daddr {range} accept")),
-        );
-        expected.push("udp sport 68 udp dport 67 accept".to_string());
-        for tunnel in active {
-            if !tunnel.is_endpoint_allowlist() {
-                expected.push(format!("oifname \"{}\" accept", tunnel.interface));
-            }
-            expected.extend(tunnel.server_ips.iter().map(|endpoint| match endpoint {
-                IpAddr::V4(ip) => format!("ip daddr {ip} accept"),
-                IpAddr::V6(ip) => format!("ip6 daddr {ip} accept"),
-            }));
-        }
-
-        let accept_lines: Vec<&str> = snapshot
-            .lines()
-            .map(str::trim)
-            .filter(|line| line.ends_with(" accept"))
-            .collect();
-        let ordered = accept_lines.len() == expected.len()
-            && accept_lines
-                .iter()
-                .zip(&expected)
-                .all(|(observed, expected)| observed == expected);
+        let expected_rules = Self::generate_nft_ruleset(active, NftBatchMode::Create);
+        let ordered = parse_nft_accept_rules(&expected_rules)
+            .zip(parse_nft_accept_rules(snapshot))
+            .is_some_and(|(expected, observed)| observed == expected);
         let digest = crate::core::killswitch::policy_digest(active);
         let terminal_lines: Vec<&str> = snapshot
             .lines()
@@ -1078,6 +1139,41 @@ mod tests {
             ])
             .args,
             ["-n", "list", "table", "inet", NFT_TABLE]
+        );
+    }
+
+    #[test]
+    fn nft_readback_compares_host_destinations_semantically_and_rejects_unknown_rules() {
+        let host_route = tunnel("wg2", &[], &["10.0.0.1/32"], false);
+        let host_rules = IptablesFirewall::generate_nft_ruleset(
+            std::slice::from_ref(&host_route),
+            NftBatchMode::Create,
+        );
+        assert!(host_rules.contains("ip daddr 10.0.0.0/32 accept"));
+        let nft_readback =
+            host_rules.replace("ip daddr 10.0.0.0/32 accept", "ip daddr 10.0.0.0 accept");
+        assert!(IptablesFirewall::nft_snapshot_matches(
+            std::slice::from_ref(&host_route),
+            &nft_readback
+        ));
+        assert!(!IptablesFirewall::nft_snapshot_matches(
+            std::slice::from_ref(&host_route),
+            &nft_readback.replace(
+                "    counter drop comment",
+                "    meta skuid 1000 accept comment \"extra\"\n    counter drop comment",
+            )
+        ));
+        assert_eq!(
+            parse_nft_accept_rules("counter drop comment \"accept\""),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            parse_nft_accept_rule("ip daddr 10.0.0.1/32 accept"),
+            parse_nft_accept_rule("ip daddr 10.0.0.1 accept")
+        );
+        assert_eq!(
+            parse_nft_accept_rule("ip6 daddr 2001:db8::1/128 accept"),
+            parse_nft_accept_rule("ip6 daddr 2001:db8::1 accept")
         );
     }
 
