@@ -20,6 +20,24 @@ use crate::constants;
 use crate::vortix_config::profile_store::{FsProfileStore, ProfileStore};
 use crate::vpn_runtime::VpnRuntime;
 
+/// Leaves the actor enough time to classify, compensate, persist, and publish
+/// a protocol gate result before the client-side operation budget expires.
+const CONTROL_COMPLETION_GRACE_SECS: u64 = 5;
+
+fn connect_operation_timeout_secs(
+    explicit: Option<u64>,
+    protocol: crate::state::Protocol,
+    config: &AppConfig,
+) -> u64 {
+    explicit.unwrap_or_else(|| {
+        let protocol_gate = match protocol {
+            crate::state::Protocol::WireGuard => config.wireguard_handshake_timeout_secs,
+            crate::state::Protocol::OpenVPN => config.connect_timeout,
+        };
+        protocol_gate.saturating_add(CONTROL_COMPLETION_GRACE_SECS)
+    })
+}
+
 /// Prompt for a 2FA code on the controlling tty with masked echo (each
 /// character is replaced by `*`). Returns `Err` when stdin is not a tty —
 /// the connect path treats this as a hard failure and exits non-zero with
@@ -340,7 +358,7 @@ struct UpData {
 #[allow(clippy::too_many_lines)]
 fn handle_up(
     profile: Option<&str>,
-    timeout_secs: u64,
+    timeout_secs: Option<u64>,
     yes: bool,
     config: &AppConfig,
     config_dir: &Path,
@@ -471,6 +489,7 @@ fn handle_up(
         .unwrap_or_else(|| {
             print_error_and_exit(mode, "up", err_not_found(&profile_name), ExitCode::NotFound)
         });
+    let timeout_secs = connect_operation_timeout_secs(timeout_secs, target.protocol, config);
     let control = crate::cli::control::LocalControlSession::start(
         config,
         config_dir,
@@ -2976,6 +2995,36 @@ pub(crate) fn count_profiles(profiles_dir: &Path) -> (u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_connect_budget_outlives_the_protocol_gate() {
+        let config = AppConfig {
+            wireguard_handshake_timeout_secs: 20,
+            connect_timeout: 30,
+            ..AppConfig::default()
+        };
+
+        assert_eq!(
+            connect_operation_timeout_secs(None, crate::state::Protocol::WireGuard, &config),
+            25
+        );
+        assert_eq!(
+            connect_operation_timeout_secs(None, crate::state::Protocol::OpenVPN, &config),
+            35
+        );
+    }
+
+    #[test]
+    fn explicit_connect_budget_remains_the_users_hard_cap() {
+        assert_eq!(
+            connect_operation_timeout_secs(
+                Some(7),
+                crate::state::Protocol::WireGuard,
+                &AppConfig::default(),
+            ),
+            7
+        );
+    }
 
     #[test]
     fn late_profile_mutation_cli_result_forbids_a_blind_retry() {

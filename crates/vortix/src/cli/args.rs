@@ -98,9 +98,10 @@ pub enum Commands {
         #[arg(value_hint = ValueHint::Other)]
         profile: Option<String>,
 
-        /// Connection timeout in seconds
-        #[arg(long, default_value = "20", value_name = "SECS")]
-        timeout: u64,
+        /// Overall connection timeout in seconds (defaults to the protocol
+        /// gate plus a bounded cleanup/control-publication grace)
+        #[arg(long, value_name = "SECS")]
+        timeout: Option<u64>,
 
         /// Bypass the multi-tunnel conflict gate — default-route takeover
         /// or route overlap (). Without this flag,
@@ -524,7 +525,7 @@ mod tests {
             panic!("expected Up");
         };
         assert_eq!(profile.as_deref(), Some("corp"));
-        assert_eq!(timeout, 20);
+        assert_eq!(timeout, None);
         assert!(yes);
     }
 
@@ -549,10 +550,19 @@ mod tests {
             panic!("expected Up");
         };
         assert_eq!(profile.as_deref(), Some("corp"));
-        assert_eq!(timeout, 20);
+        assert_eq!(timeout, None);
         assert!(
             !yes,
             "yes must default to false to keep current scripts unaffected"
         );
+    }
+
+    #[test]
+    fn cli_up_preserves_explicit_timeout() {
+        let args = parse(&["vortix", "up", "corp", "--timeout", "60"]);
+        let Some(Commands::Up { timeout, .. }) = args.command else {
+            panic!("expected Up");
+        };
+        assert_eq!(timeout, Some(60));
     }
 }

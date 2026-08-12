@@ -417,7 +417,7 @@ fn clap_parses_up_with_options() {
     }) = args.command
     {
         assert_eq!(profile.as_deref(), Some("work-vpn"));
-        assert_eq!(timeout, 60);
+        assert_eq!(timeout, Some(60));
     } else {
         panic!("Expected Up command");
     }
