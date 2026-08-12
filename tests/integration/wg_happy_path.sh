@@ -87,6 +87,7 @@ if ! grep -Eqi \
 fi
 if ip netns exec "$NS_B" ip link show unreachable >/dev/null 2>&1; then
   echo "attempt-owned unreachable interface leaked after timeout" >&2
+  cat "$CONFIG_DIR/unreachable.log" >&2
   exit 1
 fi
 

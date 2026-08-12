@@ -398,6 +398,47 @@ fn cooperative_effect_is_cancelled_and_joined_without_abandoning_a_thread() {
     assert!(started.elapsed() < Duration::from_millis(250));
 }
 
+#[test]
+fn supervisor_gives_tunnel_compensation_the_callers_full_shutdown_budget() {
+    struct SlowCancellation {
+        entered: Arc<Barrier>,
+    }
+    impl TunnelExecutor for SlowCancellation {
+        fn execute(
+            &self,
+            _: &TunnelWork,
+            cancellation: &CancellationToken,
+        ) -> Result<TunnelExecutionReceipt, String> {
+            self.entered.wait();
+            while !cancellation.is_cancelled() {
+                std::thread::yield_now();
+            }
+            std::thread::sleep(Duration::from_millis(180));
+            Err("cancelled after owned cleanup".into())
+        }
+    }
+
+    let entered = Arc::new(Barrier::new(2));
+    let supervisor = Supervisor::new(
+        AuthorityEpoch(1),
+        Arc::new(SlowCancellation {
+            entered: Arc::clone(&entered),
+        }),
+        Arc::new(OkPolicy),
+        1,
+        4,
+    );
+    supervisor
+        .dispatch_tunnel(
+            work(profile("shutdown-budget"), 1, 1, TunnelMutation::Connect),
+            Vec::new(),
+        )
+        .unwrap();
+    entered.wait();
+
+    assert!(supervisor.shutdown_bounded(Duration::from_millis(300)));
+}
+
 fn observation(
     evidence: ScanEvidence,
     ownership: ObservationOwnership,
@@ -692,6 +733,45 @@ fn cooperative_policy_apply_is_cancelled_and_joined() {
     let started = Instant::now();
     assert!(worker.shutdown_bounded(Duration::from_millis(100)));
     assert!(started.elapsed() < Duration::from_millis(250));
+}
+
+#[test]
+fn timed_out_policy_shutdown_retains_the_owned_join_for_a_later_drain() {
+    struct SlowPolicyCancellation {
+        entered: Arc<Barrier>,
+    }
+    impl PolicyExecutor for SlowPolicyCancellation {
+        fn apply(&self, _: &TopologyPolicy, _: PolicyBarrier) -> Result<(), String> {
+            Ok(())
+        }
+        fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) {}
+        fn apply_cancellable(
+            &self,
+            _: &TopologyPolicy,
+            _: PolicyBarrier,
+            cancellation: &CancellationToken,
+        ) -> Result<(), String> {
+            self.entered.wait();
+            while !cancellation.is_cancelled() {
+                std::thread::yield_now();
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            Err("cancelled after policy cleanup".into())
+        }
+    }
+
+    let entered = Arc::new(Barrier::new(2));
+    let worker = PolicyWorker::start(
+        Arc::new(SlowPolicyCancellation {
+            entered: Arc::clone(&entered),
+        }),
+        2,
+    );
+    worker.submit(policy(1, "slow-policy-shutdown")).unwrap();
+    entered.wait();
+
+    assert!(!worker.shutdown_bounded(Duration::from_millis(10)));
+    assert!(worker.shutdown_bounded(Duration::from_millis(250)));
 }
 
 #[test]

@@ -34,6 +34,7 @@ const CONTROL_PROGRESS_INTERVAL: Duration = Duration::from_millis(50);
 /// scans that take longer are followed immediately rather than queued.
 const SCANNER_REFRESH_CEILING: Duration = Duration::from_millis(250);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+const SUPERVISED_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const HOOK_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Error)]
@@ -824,6 +825,7 @@ impl LocalControlSession {
         // the operation becomes terminal, so stop the service first and give
         // the runtime a finite drain window instead of extending CLI shutdown
         // to the duration of a slow platform probe.
+        let _ = self.service.shutdown_bounded(SUPERVISED_SHUTDOWN_GRACE);
         drop(self.service);
         drop(self.challenge_issuer);
         self.runtime.shutdown_timeout(SHUTDOWN_GRACE);
