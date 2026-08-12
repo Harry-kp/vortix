@@ -727,9 +727,12 @@ impl Supervisor {
     }
 
     pub fn shutdown_bounded(&self, timeout: Duration) -> bool {
-        let half = timeout / 2;
-        self.tunnels.shutdown_bounded(half)
-            & self.policy.shutdown_bounded(timeout.saturating_sub(half))
+        std::thread::scope(|scope| {
+            let policy = scope.spawn(|| self.policy.shutdown_bounded(timeout));
+            let tunnels_stopped = self.tunnels.shutdown_bounded(timeout);
+            let policy_stopped = policy.join().unwrap_or(false);
+            tunnels_stopped & policy_stopped
+        })
     }
     pub fn shutdown(&self) {
         let _ = self.shutdown_bounded(Duration::from_millis(200));
