@@ -1360,7 +1360,17 @@ fn run_policy_call(
         executor.apply_cancellable(policy, barrier, cancellation)
     }))
     .map_err(|_| WorkFailure::Panicked)?
-    .map_err(|_| WorkFailure::EffectFailed);
+    .map_err(|error| {
+        tracing::warn!(
+            target: "vortix::control::policy",
+            operation = %policy.operation_id,
+            generation = policy.generation,
+            ?barrier,
+            reason = %error,
+            "policy barrier failed"
+        );
+        WorkFailure::EffectFailed
+    });
     if cancellation.is_cancelled() {
         return Err(WorkFailure::Cancelled);
     }
