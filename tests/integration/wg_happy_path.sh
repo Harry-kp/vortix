@@ -61,7 +61,8 @@ ip netns exec "$NS_B" target/release/vortix down
 # Handshaking, fail the bounded gate, and leave no owned interface behind.
 ip netns exec "$NS_A" wg-quick down "$FIXTURE_DIR/wg-a.conf"
 set +e
-ip netns exec "$NS_B" target/release/vortix up unreachable >"$CONFIG_DIR/unreachable.log" 2>&1 &
+RUST_LOG="vortix::process=info,vortix::tunnel::wireguard=info" \
+  ip netns exec "$NS_B" target/release/vortix up unreachable >"$CONFIG_DIR/unreachable.log" 2>&1 &
 UP_PID=$!
 sleep 1
 if ! ip netns exec "$NS_B" target/release/vortix status --brief | grep -qi handshaking; then
