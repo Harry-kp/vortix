@@ -1204,6 +1204,7 @@ impl PolicyWorker {
             let _ = join.join();
             true
         } else {
+            *guard = Some(join);
             false
         }
     }

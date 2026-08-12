@@ -882,6 +882,16 @@ impl ControlService {
     pub fn completer(&self) -> CompleterHandle {
         self.completer.clone()
     }
+
+    /// Cancel and join every supervised effect within the caller's process
+    /// shutdown budget. Short-lived clients must call this before terminating
+    /// so a recovery attempt cannot outlive its cleanup authority.
+    #[must_use]
+    pub fn shutdown_bounded(&self, timeout: Duration) -> bool {
+        self.supervisor
+            .as_ref()
+            .is_none_or(|supervisor| supervisor.shutdown_bounded(timeout))
+    }
 }
 
 fn enforce_interactive_boot_eligibility(config: &mut ControlServiceConfig) {
@@ -897,9 +907,7 @@ fn enforce_interactive_boot_eligibility(config: &mut ControlServiceConfig) {
 
 impl Drop for ControlService {
     fn drop(&mut self) {
-        if let Some(supervisor) = &self.supervisor {
-            let _ = supervisor.shutdown_bounded(Duration::from_millis(250));
-        }
+        let _ = self.shutdown_bounded(Duration::from_millis(250));
     }
 }
 
