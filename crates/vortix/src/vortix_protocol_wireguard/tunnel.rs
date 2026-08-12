@@ -268,9 +268,7 @@ fn managed_up_body(text: &str, profile: &Profile) -> Result<String, TunnelError>
 /// `[journal] disk = false`). The fallback is deterministic within a process
 /// so repeated calls within one run yield the same subdir.
 fn resolve_session_id() -> String {
-    crate::vortix_core::journal::global_journal()
-        .and_then(crate::vortix_core::journal::Journal::session_id)
-        .unwrap_or_else(|| format!("nojournal-{}", std::process::id()))
+    crate::utils::temp_session_id()
 }
 
 /// Inner helper: write the sanitized body to `${session_dir}/${basename}` at
@@ -1879,40 +1877,20 @@ mod tests {
         assert!(!session.exists());
     }
 
-    /// Mirror of the production helper at
-    /// `crates/vortix/src/main.rs::sweep_orphan_temp_configs` so we can
-    /// exercise it without invoking `main()`.
-    fn sweep_orphan_temp_configs(config_dir: &std::path::Path, current_session_id: &str) {
-        let tmp_dir = config_dir.join(crate::constants::TMP_CONFIG_DIR);
-        if !tmp_dir.exists() {
-            return;
-        }
-        let Ok(entries) = std::fs::read_dir(&tmp_dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
-            if name == current_session_id {
-                continue;
-            }
-            let _ = std::fs::remove_dir_all(entry.path());
-        }
-    }
-
     #[test]
     fn sweep_removes_prior_session_subdirs() {
         let tmp = tempfile::tempdir().unwrap();
         let config_dir = tmp.path();
-        let prior = config_dir.join("tmp").join("2025-01-01T000000Z-9999");
+        let prior_id = "2025-01-01T000000Z-9999";
+        let prior = config_dir.join("tmp").join(prior_id);
         let current = config_dir.join("tmp").join("2026-05-28T120000Z-1234");
-        std::fs::create_dir_all(&prior).unwrap();
+        let prior_lease = crate::utils::acquire_temp_session_lease(config_dir, prior_id).unwrap();
         std::fs::create_dir_all(&current).unwrap();
         std::fs::write(prior.join("corp.conf"), "stale").unwrap();
         std::fs::write(current.join("vpn.conf"), "live").unwrap();
+        drop(prior_lease);
 
-        sweep_orphan_temp_configs(config_dir, "2026-05-28T120000Z-1234");
+        crate::utils::sweep_orphan_temp_configs(config_dir, "2026-05-28T120000Z-1234");
 
         assert!(!prior.exists(), "orphan session subdir must be removed");
         assert!(current.exists(), "current session subdir must survive");
@@ -1923,8 +1901,34 @@ mod tests {
     fn sweep_is_noop_when_tmp_dir_missing() {
         let tmp = tempfile::tempdir().unwrap();
         // No tmp/ created. Sweep must not panic and must not create anything.
-        sweep_orphan_temp_configs(tmp.path(), "sid");
+        crate::utils::sweep_orphan_temp_configs(tmp.path(), "sid");
         assert!(!tmp.path().join("tmp").exists());
+    }
+
+    #[test]
+    fn sweep_preserves_a_different_live_session_lease() {
+        let tmp = tempfile::tempdir().unwrap();
+        let live_id = "2026-05-28T120000Z-4321";
+        let live = tmp.path().join("tmp").join(live_id);
+        let _lease = crate::utils::acquire_temp_session_lease(tmp.path(), live_id).unwrap();
+        std::fs::write(live.join("corp.conf"), "live teardown capability").unwrap();
+
+        crate::utils::sweep_orphan_temp_configs(tmp.path(), "another-session-1234");
+
+        assert!(live.join("corp.conf").exists());
+    }
+
+    #[test]
+    fn sweep_preserves_a_live_legacy_session_during_upgrade() {
+        let tmp = tempfile::tempdir().unwrap();
+        let live_id = format!("legacy-{}", std::process::id());
+        let live = tmp.path().join("tmp").join(&live_id);
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::write(live.join("corp.conf"), "pre-lease live capability").unwrap();
+
+        crate::utils::sweep_orphan_temp_configs(tmp.path(), "another-session-1234");
+
+        assert!(live.join("corp.conf").exists());
     }
 
     #[test]
