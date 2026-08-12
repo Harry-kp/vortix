@@ -234,12 +234,11 @@ pub fn get_profiles_dir() -> std::io::Result<std::path::PathBuf> {
 /// `WireGuard` secondary connect-time DNS scoping: the
 /// secondary's rewritten `.conf` (with `DNS =` stripped) is written under
 /// this subdir so crashed disconnects leave isolated orphans that the
-/// startup sweep cleans by session-liveness check (subdir name ≠ current
-/// `session_id`).
+/// startup sweep cleans only after acquiring their process-lifetime lease.
 ///
 /// The subdir name matches the journal's `session_id` (`{ISO}-{pid}`), so a
-/// new vortix process is guaranteed a fresh subdir name; the prior session's
-/// subdir is unambiguously an orphan regardless of age.
+/// new Vortix process is guaranteed a fresh namespace without mistaking a
+/// concurrently running session for a crash orphan.
 ///
 /// # Errors
 ///
@@ -275,6 +274,142 @@ pub fn get_tmp_config_dir(session_id: &str) -> std::io::Result<std::path::PathBu
     }
 
     Ok(session_dir)
+}
+
+/// Process-lifetime lease for one per-session scratch directory.
+///
+/// The kernel releases the advisory lock on every process exit path,
+/// including crashes and [`std::process::exit`]. Keeping this value alive is
+/// what distinguishes a concurrently running Vortix session from a crash
+/// orphan; a different journal session ID alone is not proof of death.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct TempSessionLease {
+    _file: std::fs::File,
+}
+
+/// Resolve the scratch-session identity used by protocol-owned temporary
+/// files, including when journal disk persistence is disabled.
+#[must_use]
+pub fn temp_session_id() -> String {
+    crate::vortix_core::journal::global_journal()
+        .and_then(crate::vortix_core::journal::Journal::session_id)
+        .unwrap_or_else(|| format!("nojournal-{}", std::process::id()))
+}
+
+/// Create and exclusively lease this process's scratch-session directory.
+///
+/// # Errors
+///
+/// Returns an I/O error when the private directory or its no-follow lease
+/// file cannot be created, or when another process already holds the same
+/// session identity.
+#[cfg(unix)]
+pub fn acquire_temp_session_lease(
+    config_dir: &std::path::Path,
+    session_id: &str,
+) -> std::io::Result<TempSessionLease> {
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+    use std::os::unix::io::AsRawFd as _;
+
+    let tmp_root = config_dir.join(crate::constants::TMP_CONFIG_DIR);
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .recursive(true)
+        .create(&tmp_root)?;
+    let session_dir = tmp_root.join(session_id);
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .recursive(true)
+        .create(&session_dir)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(session_dir.join(".lease"))?;
+    // SAFETY: `file` owns a valid descriptor for the lifetime of the lease;
+    // flock changes only the kernel lock associated with that descriptor.
+    #[allow(unsafe_code)]
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    crate::config::fix_ownership(&tmp_root);
+    crate::config::fix_ownership(&session_dir);
+    crate::config::fix_ownership(&session_dir.join(".lease"));
+    Ok(TempSessionLease { _file: file })
+}
+
+#[cfg(unix)]
+fn legacy_temp_session_process_is_live(session_id: &str) -> bool {
+    let Some(pid) = session_id
+        .rsplit_once('-')
+        .and_then(|(_, pid)| pid.parse::<i32>().ok())
+        .filter(|pid| *pid > 0)
+    else {
+        return false;
+    };
+    // SAFETY: signal zero is a side-effect-free existence probe. Permission
+    // denial also proves that a process currently owns the PID.
+    #[allow(unsafe_code)]
+    let result = unsafe { libc::kill(pid, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+/// Remove only scratch sessions proven not to have a live process lease.
+///
+/// Directories from older Vortix releases have no `.lease`; during the
+/// upgrade window their PID suffix remains a conservative liveness fallback.
+/// Unknown or inaccessible entries are retained rather than risking deletion
+/// of a live tunnel's teardown capability.
+#[cfg(unix)]
+pub fn sweep_orphan_temp_configs(config_dir: &std::path::Path, current_session_id: &str) {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::os::unix::io::AsRawFd as _;
+
+    let tmp_dir = config_dir.join(crate::constants::TMP_CONFIG_DIR);
+    let Ok(entries) = std::fs::read_dir(&tmp_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if name == current_session_id
+            || !entry
+                .file_type()
+                .is_ok_and(|kind| kind.is_dir() && !kind.is_symlink())
+        {
+            continue;
+        }
+        let lease = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(entry.path().join(".lease"));
+        match lease {
+            Ok(file) => {
+                // SAFETY: `file` is an owned valid descriptor. A failed
+                // nonblocking lock means a live process still owns it.
+                #[allow(unsafe_code)]
+                let result =
+                    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                if result != 0 {
+                    continue;
+                }
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !legacy_temp_session_process_is_live(&name) {
+                    let _ = std::fs::remove_dir_all(entry.path());
+                }
+            }
+            Err(_) => {}
+        }
+    }
 }
 
 /// Non-Unix fallback: no `chmod`, just `create_dir_all` via `create_user_dir`.
