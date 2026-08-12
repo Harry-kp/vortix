@@ -509,6 +509,7 @@ impl IptablesFirewall {
     fn nft_table_snapshot() -> Result<Option<String>> {
         let output = crate::vortix_process::run_to_output(
             Self::nft_command(vec![
+                "-n".into(),
                 "list".into(),
                 "table".into(),
                 "inet".into(),
@@ -1066,6 +1067,17 @@ mod tests {
                 .get("LC_ALL")
                 .map(String::as_str),
             Some("C")
+        );
+        assert_eq!(
+            IptablesFirewall::nft_command(vec![
+                "-n".into(),
+                "list".into(),
+                "table".into(),
+                "inet".into(),
+                NFT_TABLE.into(),
+            ])
+            .args,
+            ["-n", "list", "table", "inet", NFT_TABLE]
         );
     }
 
