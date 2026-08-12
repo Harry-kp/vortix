@@ -2723,7 +2723,7 @@ fn handle_killswitch(
                 "killswitch",
                 CliError {
                     code: "protection_degraded",
-                    message,
+                    message: format!("{message}; protection is degraded"),
                     hint: Some(
                         "Inspect firewall permissions/backend health, then retry the command"
                             .to_string(),
