@@ -15,11 +15,7 @@ use crate::vortix_core::ports::tunnel::{
 };
 use crate::vortix_core::profile::Profile;
 use crate::vortix_process::{CommandSpec, PrivilegeReq};
-use tracing::info;
-// `warn!` is only used by the macOS-only diagnostic at line ~227.
-// Gate the import so Linux clippy doesn't flag it as unused.
-#[cfg(target_os = "macos")] // xtask:allow-platform-cfg: import for macOS-only warn! call
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::vortix_protocol_wireguard::parser::parse_wg_conf;
 
@@ -1284,6 +1280,17 @@ impl Tunnel for WgTunnel {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            // `wg-quick` prints commands and paths here, never the private-key
+            // values from its input. Preserve this diagnostic because a
+            // failed exact-attempt teardown intentionally leaves ownership
+            // ambiguous and the caller must not pretend it was cleaned up.
+            warn!(
+                target: "vortix::tunnel::wireguard",
+                profile = %handle.profile_id,
+                interface = %handle.interface_name,
+                stderr = %stderr.trim(),
+                "wg.down.failed"
+            );
             return Err(TunnelError::Subprocess(format!("WireGuard down: {stderr}")));
         }
 
