@@ -20,8 +20,8 @@ use crate::constants;
 use crate::vortix_config::profile_store::{FsProfileStore, ProfileStore};
 use crate::vpn_runtime::VpnRuntime;
 
-/// Leaves the actor enough time to classify, compensate, persist, and publish
-/// a protocol gate result before the client-side operation budget expires.
+/// Leaves the actor enough time to persist and publish a settled protocol
+/// result after the protocol gate and its configured teardown budget.
 const CONTROL_COMPLETION_GRACE_SECS: u64 = 5;
 
 fn connect_operation_timeout_secs(
@@ -34,7 +34,9 @@ fn connect_operation_timeout_secs(
             crate::state::Protocol::WireGuard => config.wireguard_handshake_timeout_secs,
             crate::state::Protocol::OpenVPN => config.connect_timeout,
         };
-        protocol_gate.saturating_add(CONTROL_COMPLETION_GRACE_SECS)
+        protocol_gate
+            .saturating_add(config.disconnect_timeout)
+            .saturating_add(CONTROL_COMPLETION_GRACE_SECS)
     })
 }
 
@@ -2997,20 +2999,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_connect_budget_outlives_the_protocol_gate() {
+    fn default_connect_budget_covers_protocol_cleanup_and_control_settlement() {
         let config = AppConfig {
             wireguard_handshake_timeout_secs: 20,
             connect_timeout: 30,
+            disconnect_timeout: 12,
             ..AppConfig::default()
         };
 
         assert_eq!(
             connect_operation_timeout_secs(None, crate::state::Protocol::WireGuard, &config),
-            25
+            37
         );
         assert_eq!(
             connect_operation_timeout_secs(None, crate::state::Protocol::OpenVPN, &config),
-            35
+            47
         );
     }
 
