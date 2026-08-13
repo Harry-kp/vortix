@@ -10,6 +10,7 @@ mod child_evidence;
 mod enrollment_store;
 mod material;
 mod observe;
+mod platform_identity;
 mod private_fs;
 pub mod protocol;
 mod replay_store;
@@ -20,7 +21,9 @@ mod transport;
 pub mod validate;
 
 pub use bootstrap::{
-    stage_package_from_reader, BootstrapError, BootstrapStageReceipt, MAX_INSTALL_REQUEST_BYTES,
+    commit_package_from_reader, reserve_package_from_reader, stage_package_from_reader,
+    BootstrapCommitReceipt, BootstrapError, BootstrapReserveReceipt, BootstrapStageReceipt,
+    MAX_INSTALL_REQUEST_BYTES,
 };
 pub use protocol::{
     decode_request_frame, decode_response_frame, encode_request_frame, encode_response_frame,
