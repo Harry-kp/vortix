@@ -17,6 +17,7 @@ use thiserror::Error;
 use super::descriptor_transport::{receive_request, ReceivedHelperRequest};
 use super::enrollment_store::{EnrollmentStoreError, RootEnrollmentAuthority, RootEnrollmentStore};
 use super::executor::ProductionHelperExecutor;
+use super::material::TunnelMaterialSet;
 use super::platform_identity::verify_daemon_service;
 use super::protocol::{
     encode_response_frame, negotiate_candidate, negotiate_staged, HelperCapability, HelperError,
@@ -172,11 +173,29 @@ fn serve_enrolled_session(
             }
             Err(error) => return Err(error.into()),
         };
-        // Observation-only enrollment advertises no material-bearing
-        // capability. Exact descriptor count was already authenticated
-        // against the operation; dropping here cannot enable an effect.
-        drop(descriptors);
-        write_response(stream, &session.handle(request))?;
+        let materials = match &request.op {
+            HelperOp::Execute(operation)
+                if matches!(
+                    operation.operation(),
+                    crate::vortix_core::privileged::PrivilegedOperation::StartTunnel(_)
+                ) =>
+            {
+                let crate::vortix_core::privileged::PrivilegedOperation::StartTunnel(plan) =
+                    operation.operation()
+                else {
+                    unreachable!("guard and extraction use the same operation")
+                };
+                Some(
+                    TunnelMaterialSet::for_plan(plan, descriptors)
+                        .map_err(|_| HelperTransportError::Descriptor)?,
+                )
+            }
+            _ => {
+                debug_assert!(descriptors.is_empty());
+                None
+            }
+        };
+        write_response(stream, &session.handle_with_materials(request, materials))?;
     }
 }
 
