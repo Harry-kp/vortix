@@ -72,6 +72,14 @@ impl PlatformLayout {
     }
 
     #[must_use]
+    pub const fn root_enrollment(self) -> &'static str {
+        match self {
+            Self::Linux => "/var/lib/vortix/enrollment.json",
+            Self::MacOs => "/Library/Application Support/Vortix/enrollment.json",
+        }
+    }
+
+    #[must_use]
     pub const fn requires_platform_signature(self) -> bool {
         matches!(self, Self::MacOs)
     }
@@ -248,6 +256,31 @@ impl InstallManifest {
         self.generation
     }
 
+    #[must_use]
+    pub fn digest(&self) -> OperationDigest {
+        let mut material = Vec::with_capacity(256);
+        material.extend_from_slice(b"vortix-install-manifest-v1\0");
+        material.extend_from_slice(&self.schema_version.to_be_bytes());
+        material.extend_from_slice(&self.generation.to_be_bytes());
+        material.extend_from_slice(
+            &u64::try_from(self.release_version.len())
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
+        material.extend_from_slice(self.release_version.as_bytes());
+        material.extend_from_slice(&self.daemon_digest.as_bytes());
+        material.extend_from_slice(&self.helper_digest.as_bytes());
+        material.extend_from_slice(&self.bootstrap_digest.as_bytes());
+        match self.prior_manifest_digest {
+            Some(digest) => {
+                material.push(1);
+                material.extend_from_slice(&digest.as_bytes());
+            }
+            None => material.push(0),
+        }
+        OperationDigest::of_bytes(&material)
+    }
+
     #[allow(
         dead_code,
         reason = "U12 artifact verifier consumes the signed manifest"
@@ -333,6 +366,45 @@ impl InstallRequest {
             manifest_digest,
             request_nonce,
         })
+    }
+
+    #[must_use]
+    pub const fn owner_uid(&self) -> u32 {
+        self.owner_uid
+    }
+
+    #[must_use]
+    pub const fn layout(&self) -> PlatformLayout {
+        self.layout
+    }
+
+    #[must_use]
+    pub const fn channel(&self) -> PackageChannel {
+        self.channel
+    }
+
+    #[must_use]
+    pub const fn manifest_generation(&self) -> u64 {
+        self.manifest_generation
+    }
+
+    #[must_use]
+    pub const fn manifest_digest(&self) -> OperationDigest {
+        self.manifest_digest
+    }
+
+    #[must_use]
+    pub const fn request_nonce(&self) -> [u8; 32] {
+        self.request_nonce
+    }
+
+    pub(crate) fn verify_manifest(&self, manifest: &InstallManifest) -> Result<(), InstallError> {
+        if self.manifest_generation != manifest.generation()
+            || self.manifest_digest != manifest.digest()
+        {
+            return Err(InstallError::ManifestMismatch);
+        }
+        Ok(())
     }
 }
 
@@ -577,6 +649,8 @@ pub enum InstallError {
     InvalidManifest,
     #[error("invalid sanitized install request")]
     InvalidRequest,
+    #[error("install request does not match the verified release manifest")]
+    ManifestMismatch,
     #[error("this package channel cannot enroll Background mode: {guidance}")]
     UnsupportedChannel { guidance: &'static str },
     #[error("package channel does not match the platform layout")]
