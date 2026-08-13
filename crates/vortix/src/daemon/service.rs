@@ -6,17 +6,24 @@
 //! verified authority token in U13. Standard mode therefore keeps its local
 //! [`crate::vortix_core::control::ControlService`] as the only writer.
 
+use std::collections::BTreeMap;
+use std::io::Read as _;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
 use crate::vortix_core::control::{
-    AdmissionError, AdmittedOperation, ChallengeError, ChallengeId, ClientId, ControlEventEnvelope,
-    ControlSnapshot, IdempotencyKey, OperationId, OperationResult, OperationStatus, Secret,
-    UserCommand,
+    AdmissionError, AdmittedOperation, ChallengeError, ChallengeId, ClientId, CommandRequest,
+    ControlEventEnvelope, ControlHandle, ControlService, ControlSnapshot, ControlSubscription,
+    IdempotencyKey, OperationId, OperationResult, OperationStatus, Secret, UserCommand,
 };
 use crate::vortix_core::ipc::{IpcError, IpcOp, IpcResult, RemoteSessionId, SensitiveBytes};
+use crate::vortix_core::profile::ProfileId;
+
+const MAX_REMOTE_SESSIONS: usize = 64;
+const PENDING_SESSION_TTL: Duration = Duration::from_secs(5);
+const MAX_REMOTE_OPERATION_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 /// Production activation is deliberately one-state in the preparatory
 /// release. U13 replaces this closed gate only after enrollment is verified.
@@ -72,6 +79,276 @@ impl RemoteControlError {
             other => Self::Protocol(other.to_string()),
         }
     }
+}
+
+/// Result of consuming the final chunk of one memory-only remote import.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StagedRemoteProfile {
+    pub(crate) profile_id: ProfileId,
+    pub(crate) display_name: String,
+}
+
+/// Daemon-owned profile staging seam. Implementations retain private bodies
+/// only in memory until the canonical identity-only import command commits.
+pub(crate) trait RemoteProfileStager: Send + Sync {
+    fn stage_chunk(
+        &self,
+        session_id: &RemoteSessionId,
+        file_name: &str,
+        offset: u64,
+        final_chunk: bool,
+        contents: SensitiveBytes,
+    ) -> Result<Option<StagedRemoteProfile>, IpcError>;
+
+    fn cancel(&self, session_id: &RemoteSessionId);
+}
+
+enum HostedSessionState {
+    Pending { opened_at: Instant },
+    Subscribed,
+}
+
+struct HostedSession {
+    handle: ControlHandle,
+    state: HostedSessionState,
+}
+
+/// Bounded daemon-side owner of remote client capabilities. This type is not
+/// wired into [`crate::daemon::DaemonServer`] until verified enrollment mints
+/// the activation capability; constructing it alone cannot advertise or
+/// execute remote mutation over the production socket.
+pub(crate) struct ControlAuthorityHost {
+    service: ControlService,
+    sessions: Mutex<BTreeMap<RemoteSessionId, HostedSession>>,
+    profile_stager: Option<Arc<dyn RemoteProfileStager>>,
+}
+
+impl ControlAuthorityHost {
+    #[allow(
+        dead_code,
+        reason = "the verified enrollment constructor consumes this host in U13's final activation commit"
+    )]
+    pub(crate) fn new(
+        service: ControlService,
+        profile_stager: Option<Arc<dyn RemoteProfileStager>>,
+    ) -> Self {
+        Self {
+            service,
+            sessions: Mutex::new(BTreeMap::new()),
+            profile_stager,
+        }
+    }
+
+    pub(crate) fn open_session(&self) -> Result<IpcResult, IpcError> {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        prune_pending_sessions(&mut sessions, Instant::now());
+        if sessions.len() >= MAX_REMOTE_SESSIONS {
+            return Err(IpcError::ServerBusy);
+        }
+        let handle = self
+            .service
+            .new_client()
+            .map_err(|error| IpcError::ControlAdmission { error })?;
+        let client_id = handle.client_id().clone();
+        let session_id = allocate_session_id(&sessions)?;
+        sessions.insert(
+            session_id.clone(),
+            HostedSession {
+                handle,
+                state: HostedSessionState::Pending {
+                    opened_at: Instant::now(),
+                },
+            },
+        );
+        Ok(IpcResult::ControlOpened {
+            session_id,
+            client_id,
+        })
+    }
+
+    pub(crate) fn subscribe(
+        &self,
+        session_id: &RemoteSessionId,
+    ) -> Result<(ControlSubscription, ControlSnapshot), IpcError> {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        prune_pending_sessions(&mut sessions, Instant::now());
+        let session = sessions
+            .get_mut(session_id)
+            .ok_or(IpcError::ControlSessionNotFound)?;
+        if !matches!(session.state, HostedSessionState::Pending { .. }) {
+            return Err(IpcError::MalformedRequest(
+                "control session already has a subscription".into(),
+            ));
+        }
+        let subscription = session.handle.subscribe();
+        let snapshot = subscription.snapshot();
+        session.state = HostedSessionState::Subscribed;
+        Ok((subscription, snapshot))
+    }
+
+    pub(crate) fn close_session(&self, session_id: &RemoteSessionId) {
+        self.sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id);
+        if let Some(stager) = &self.profile_stager {
+            stager.cancel(session_id);
+        }
+    }
+
+    pub(crate) async fn dispatch(&self, op: IpcOp) -> Result<IpcResult, IpcError> {
+        match op {
+            IpcOp::ControlOpen => self.open_session(),
+            IpcOp::ControlSubmit {
+                session_id,
+                command,
+                idempotency_key,
+                timeout_millis,
+            } => {
+                let timeout = checked_remote_timeout(timeout_millis)?;
+                let handle = self.subscribed_handle(&session_id)?;
+                let admitted = handle
+                    .submit(CommandRequest {
+                        command,
+                        idempotency_key,
+                        deadline: handle.deadline_after(timeout),
+                    })
+                    .await
+                    .map_err(|error| IpcError::ControlAdmission { error })?;
+                Ok(IpcResult::ControlAccepted { admitted })
+            }
+            IpcOp::ControlSnapshot { session_id } => Ok(IpcResult::ControlSnapshot {
+                snapshot: self.subscribed_handle(&session_id)?.snapshot(),
+            }),
+            IpcOp::ControlRespondChallenge {
+                session_id,
+                challenge_id,
+                answer,
+            } => {
+                self.subscribed_handle(&session_id)?
+                    .respond_challenge(challenge_id, Secret::new(answer.into_vec()))
+                    .await
+                    .map_err(|error| IpcError::ControlChallenge { error })?;
+                Ok(IpcResult::ChallengeAccepted)
+            }
+            IpcOp::ControlCancelChallenge {
+                session_id,
+                challenge_id,
+            } => {
+                self.subscribed_handle(&session_id)?
+                    .cancel_challenge(challenge_id)
+                    .await
+                    .map_err(|error| IpcError::ControlChallenge { error })?;
+                Ok(IpcResult::ChallengeAccepted)
+            }
+            IpcOp::ControlStageProfileImport {
+                session_id,
+                file_name,
+                offset,
+                final_chunk,
+                contents,
+            } => {
+                let _ = self.subscribed_handle(&session_id)?;
+                let backend = self.profile_stager.as_ref().ok_or_else(|| {
+                    IpcError::Internal("remote profile staging is unavailable".into())
+                })?;
+                let contents = contents.into_vec();
+                let chunk_len = contents.len();
+                match backend.stage_chunk(
+                    &session_id,
+                    &file_name,
+                    offset,
+                    final_chunk,
+                    SensitiveBytes::new(contents),
+                )? {
+                    Some(profile) if final_chunk => Ok(IpcResult::ControlProfileImportStaged {
+                        profile_id: profile.profile_id,
+                        display_name: profile.display_name,
+                    }),
+                    None if !final_chunk => Ok(IpcResult::ControlProfileImportChunkAccepted {
+                        next_offset: offset.saturating_add(chunk_len as u64),
+                    }),
+                    _ => Err(IpcError::Internal(
+                        "profile stager returned an invalid chunk outcome".into(),
+                    )),
+                }
+            }
+            IpcOp::ControlCancelProfileImport { session_id } => {
+                let _ = self.subscribed_handle(&session_id)?;
+                if let Some(stager) = &self.profile_stager {
+                    stager.cancel(&session_id);
+                }
+                Ok(IpcResult::ChallengeAccepted)
+            }
+            other => Err(IpcError::MalformedRequest(format!(
+                "operation is not a canonical control request: {other:?}"
+            ))),
+        }
+    }
+
+    fn subscribed_handle(&self, session_id: &RemoteSessionId) -> Result<ControlHandle, IpcError> {
+        let sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let session = sessions
+            .get(session_id)
+            .ok_or(IpcError::ControlSessionNotFound)?;
+        if !matches!(session.state, HostedSessionState::Subscribed) {
+            return Err(IpcError::ControlSessionNotFound);
+        }
+        Ok(session.handle.clone())
+    }
+}
+
+fn checked_remote_timeout(timeout_millis: u64) -> Result<Duration, IpcError> {
+    let timeout = Duration::from_millis(timeout_millis);
+    if timeout.is_zero() || timeout > MAX_REMOTE_OPERATION_TIMEOUT {
+        return Err(IpcError::MalformedRequest(
+            "control timeout must be within 1..=3600000 milliseconds".into(),
+        ));
+    }
+    Ok(timeout)
+}
+
+fn prune_pending_sessions(sessions: &mut BTreeMap<RemoteSessionId, HostedSession>, now: Instant) {
+    sessions.retain(|_, session| match session.state {
+        HostedSessionState::Pending { opened_at } => {
+            now.saturating_duration_since(opened_at) <= PENDING_SESSION_TTL
+        }
+        HostedSessionState::Subscribed => true,
+    });
+}
+
+fn allocate_session_id(
+    sessions: &BTreeMap<RemoteSessionId, HostedSession>,
+) -> Result<RemoteSessionId, IpcError> {
+    for _ in 0..8 {
+        let mut bytes = [0_u8; 16];
+        std::fs::File::open("/dev/urandom")
+            .and_then(|mut source| source.read_exact(&mut bytes))
+            .map_err(|error| IpcError::Internal(error.to_string()))?;
+        let mut encoded = String::with_capacity(40);
+        encoded.push_str("session-");
+        for byte in bytes {
+            use std::fmt::Write as _;
+            write!(&mut encoded, "{byte:02x}").expect("String write");
+        }
+        let id = RemoteSessionId::parse(encoded)
+            .ok_or_else(|| IpcError::Internal("generated invalid session ID".into()))?;
+        if !sessions.contains_key(&id) {
+            return Ok(id);
+        }
+    }
+    Err(IpcError::Internal(
+        "could not allocate a unique control session".into(),
+    ))
 }
 
 /// One canonical event plus the complete snapshot at its publication
@@ -491,6 +768,76 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use super::*;
+
+    fn hosted_authority() -> ControlAuthorityHost {
+        let profile_id = ProfileId::parse("a".repeat(ProfileId::HEX_LEN)).unwrap();
+        let known_profiles = std::collections::BTreeSet::from([profile_id.clone()]);
+        ControlAuthorityHost::new(
+            ControlService::start(crate::vortix_core::control::ControlServiceConfig {
+                known_profiles,
+                profile_topologies: BTreeMap::from([(
+                    profile_id,
+                    crate::vortix_core::control::ProfileTopology::default(),
+                )]),
+                ..crate::vortix_core::control::ControlServiceConfig::default()
+            }),
+            None,
+        )
+    }
+
+    fn opened_session(result: IpcResult) -> RemoteSessionId {
+        let IpcResult::ControlOpened { session_id, .. } = result else {
+            panic!("authority must return a control session");
+        };
+        session_id
+    }
+
+    #[tokio::test]
+    async fn hosted_session_requires_subscription_and_dies_with_it() {
+        let authority = hosted_authority();
+        let session_id = opened_session(authority.open_session().unwrap());
+        let command = UserCommand::Connect {
+            profile_id: ProfileId::parse("a".repeat(ProfileId::HEX_LEN)).unwrap(),
+            conflict_acknowledgement: None,
+        };
+        let submit = |session_id: RemoteSessionId| IpcOp::ControlSubmit {
+            session_id,
+            command: command.clone(),
+            idempotency_key: IdempotencyKey::new("hosted-session"),
+            timeout_millis: 1_000,
+        };
+
+        assert!(matches!(
+            authority.dispatch(submit(session_id.clone())).await,
+            Err(IpcError::ControlSessionNotFound)
+        ));
+        let (_subscription, initial) = authority.subscribe(&session_id).unwrap();
+        assert_eq!(
+            initial.desired.authority_epoch,
+            crate::vortix_core::control::AuthorityEpoch(0)
+        );
+        assert!(matches!(
+            authority.dispatch(submit(session_id.clone())).await,
+            Ok(IpcResult::ControlAccepted { .. })
+        ));
+        authority.close_session(&session_id);
+        assert!(matches!(
+            authority.dispatch(submit(session_id)).await,
+            Err(IpcError::ControlSessionNotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn hosted_sessions_are_bounded_before_allocating_clients() {
+        let authority = hosted_authority();
+        for _ in 0..MAX_REMOTE_SESSIONS {
+            authority.open_session().unwrap();
+        }
+        assert!(matches!(
+            authority.open_session(),
+            Err(IpcError::ServerBusy)
+        ));
+    }
 
     struct EmptySubscription;
 

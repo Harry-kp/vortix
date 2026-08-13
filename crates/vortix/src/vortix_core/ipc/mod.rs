@@ -454,8 +454,13 @@ const PASSIVE_CAPABILITIES_V1: [IpcCapability; 4] = [
     IpcCapability::Shutdown,
 ];
 
-/// Negotiate one client hello against this passive daemon build.
-pub fn negotiate_passive(hello: &ClientHello) -> Result<ServerHello, IpcError> {
+/// A control connection receives only the mutation capability. Read-only
+/// diagnostics and passive projections continue to negotiate independently,
+/// preventing an observational client from accidentally treating its stream
+/// as authoritative.
+pub const CONTROL_CAPABILITIES: [IpcCapability; 1] = [IpcCapability::ControlMutation];
+
+fn negotiate_versions(hello: &ClientHello, minimum_schema: u16) -> Result<(u16, u16), IpcError> {
     if hello.product != "vortix" {
         return Err(IpcError::Incompatible {
             reason: "product identity does not match vortix".into(),
@@ -481,15 +486,21 @@ pub fn negotiate_passive(hello: &ClientHello) -> Result<ServerHello, IpcError> {
     let schema = hello
         .schema
         .highest_common(CompatibilityRange {
-            min: IPC_SCHEMA_MIN,
+            min: minimum_schema,
             max: IPC_SCHEMA_MAX,
         })
         .ok_or_else(|| IpcError::Incompatible {
             reason: format!(
                 "schema ranges do not overlap (client {}..={}, daemon {}..={})",
-                hello.schema.min, hello.schema.max, IPC_SCHEMA_MIN, IPC_SCHEMA_MAX
+                hello.schema.min, hello.schema.max, minimum_schema, IPC_SCHEMA_MAX
             ),
         })?;
+    Ok((protocol, schema))
+}
+
+/// Negotiate one client hello against this passive daemon build.
+pub fn negotiate_passive(hello: &ClientHello) -> Result<ServerHello, IpcError> {
+    let (protocol, schema) = negotiate_versions(hello, IPC_SCHEMA_MIN)?;
     let capabilities: &[IpcCapability] = if schema >= 2 {
         &PASSIVE_CAPABILITIES
     } else {
@@ -509,6 +520,28 @@ pub fn negotiate_passive(hello: &ClientHello) -> Result<ServerHello, IpcError> {
         schema,
         capabilities: capabilities.to_vec(),
         passive: true,
+    })
+}
+
+/// Negotiate an enrolled canonical-control connection. The schema-three
+/// floor is part of the activation fence: older peers cannot see a partial
+/// mutation vocabulary and must remain on the preparatory passive path.
+pub fn negotiate_control(hello: &ClientHello) -> Result<ServerHello, IpcError> {
+    let (protocol, schema) = negotiate_versions(hello, 3)?;
+    for capability in &hello.required_capabilities {
+        if !CONTROL_CAPABILITIES.contains(capability) {
+            return Err(IpcError::CapabilityUnavailable {
+                capability: *capability,
+            });
+        }
+    }
+    Ok(ServerHello {
+        product: "vortix".into(),
+        product_version: env!("CARGO_PKG_VERSION").into(),
+        protocol,
+        schema,
+        capabilities: CONTROL_CAPABILITIES.to_vec(),
+        passive: false,
     })
 }
 
@@ -551,6 +584,24 @@ mod handshake_tests {
         let selected = negotiate_passive(&ClientHello::current(Vec::new())).unwrap();
         assert_eq!(selected.capabilities, PASSIVE_CAPABILITIES);
         assert!(selected.passive);
+    }
+
+    #[test]
+    fn enrolled_handshake_is_schema_three_and_explicitly_authoritative() {
+        let selected =
+            negotiate_control(&ClientHello::current(vec![IpcCapability::ControlMutation])).unwrap();
+        assert_eq!(selected.schema, 3);
+        assert!(!selected.passive);
+        assert!(selected
+            .capabilities
+            .contains(&IpcCapability::ControlMutation));
+
+        let mut old = ClientHello::current(vec![IpcCapability::ControlMutation]);
+        old.schema = CompatibilityRange { min: 1, max: 2 };
+        assert!(matches!(
+            negotiate_control(&old),
+            Err(IpcError::Incompatible { .. })
+        ));
     }
 
     #[test]
