@@ -5,19 +5,31 @@
 //! helper runtime identity; it never accepts hooks, scripts, paths, DNS, or
 //! arbitrary `WireGuard` directives from the user profile.
 
+#![allow(
+    unsafe_code,
+    reason = "private process-group setup and exact containment teardown require pre_exec and kill"
+)]
+
 use std::collections::BTreeMap;
 use std::fmt::{Debug, Formatter, Write as _};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use base64::engine::{general_purpose::STANDARD as BASE64, Engine as _};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt as _;
+
 use crate::vortix_core::privileged::{ProtocolEndpoint, WireGuardPlan};
 
 const KEY_BYTES: usize = 32;
 const ENCODED_KEY_BYTES: usize = 44;
+const WAIT_INTERVAL: Duration = Duration::from_millis(25);
 
 pub(crate) struct WireGuardMaterial<'a> {
     private_key: &'a [u8],
@@ -140,6 +152,88 @@ pub(crate) fn render_helper_execution(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WgQuickAction {
+    Up,
+    Down,
+}
+
+impl WgQuickAction {
+    const fn argument(self) -> &'static str {
+        match self {
+            Self::Up => "up",
+            Self::Down => "down",
+        }
+    }
+}
+
+/// Run the fixed `wg-quick` lifecycle child in a private process group.
+/// The binary and config paths must already be authenticated by the helper.
+pub(crate) fn run_wg_quick(
+    binary: &Path,
+    action: WgQuickAction,
+    config_path: &Path,
+    timeout: Duration,
+) -> Result<(), WireGuardCommandError> {
+    if !binary.is_absolute() || !config_path.is_absolute() || timeout.is_zero() {
+        return Err(WireGuardCommandError::InvalidInvocation);
+    }
+    run_bounded(
+        binary,
+        &[action.argument().into(), config_path.as_os_str().to_owned()],
+        timeout,
+    )
+}
+
+fn run_bounded(
+    binary: &Path,
+    arguments: &[std::ffi::OsString],
+    timeout: Duration,
+) -> Result<(), WireGuardCommandError> {
+    let mut command = Command::new(binary);
+    command
+        .args(arguments)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+    let mut child = command.spawn().map_err(|_| WireGuardCommandError::Spawn)?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(_)) => return Err(WireGuardCommandError::NonZeroExit),
+            Ok(None) if Instant::now() < deadline => thread::sleep(WAIT_INTERVAL),
+            Ok(None) => {
+                terminate_process_group(&mut child);
+                return Err(WireGuardCommandError::Timeout);
+            }
+            Err(_) => {
+                terminate_process_group(&mut child);
+                return Err(WireGuardCommandError::Wait);
+            }
+        }
+    }
+}
+
+fn terminate_process_group(child: &mut std::process::Child) {
+    if let Ok(pid) = libc::pid_t::try_from(child.id()) {
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+    let _ = child.wait();
+}
+
 fn canonical_key(bytes: &[u8]) -> Result<&str, WireGuardExecutionError> {
     let value = std::str::from_utf8(bytes)
         .map_err(|_| WireGuardExecutionError::InvalidKeyMaterial)?
@@ -200,6 +294,20 @@ pub(crate) enum WireGuardExecutionError {
     MaterialSetMismatch,
     #[error("WireGuard helper configuration could not be rendered")]
     Render,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub(crate) enum WireGuardCommandError {
+    #[error("WireGuard helper invocation is invalid")]
+    InvalidInvocation,
+    #[error("WireGuard helper child could not be spawned")]
+    Spawn,
+    #[error("WireGuard helper child exited unsuccessfully")]
+    NonZeroExit,
+    #[error("WireGuard helper child exceeded its deadline")]
+    Timeout,
+    #[error("WireGuard helper child could not be reaped")]
+    Wait,
 }
 
 #[cfg(test)]
@@ -310,5 +418,18 @@ mod tests {
                 WireGuardExecutionError::UnsafeConfigPath
             );
         }
+    }
+
+    #[test]
+    fn bounded_child_uses_deadline_and_reaps_its_process_group() {
+        let started = Instant::now();
+        let result = run_bounded(
+            Path::new("/bin/sleep"),
+            &["10".into()],
+            Duration::from_millis(50),
+        );
+
+        assert_eq!(result, Err(WireGuardCommandError::Timeout));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }
