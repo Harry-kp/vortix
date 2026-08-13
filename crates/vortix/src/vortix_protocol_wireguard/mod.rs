@@ -5,6 +5,7 @@
 
 #![allow(clippy::missing_errors_doc)]
 
+pub(crate) mod execution;
 pub mod parser;
 pub mod tunnel;
 
