@@ -13,15 +13,14 @@ use std::path::Path;
 use std::time::Duration;
 
 use thiserror::Error;
-use zeroize::Zeroizing;
 
+use super::descriptor_transport::{receive_request, ReceivedHelperRequest};
 use super::enrollment_store::{EnrollmentStoreError, RootEnrollmentAuthority, RootEnrollmentStore};
 use super::executor::ProductionHelperExecutor;
 use super::platform_identity::verify_daemon_service;
 use super::protocol::{
     encode_response_frame, negotiate_candidate, negotiate_staged, HelperCapability, HelperError,
     HelperOp, HelperRequest, HelperResponse, HelperResult, HelperSessionBinding,
-    MAX_HELPER_FRAME_BYTES,
 };
 #[cfg(test)]
 use super::protocol::{negotiate_enrolled, STAGED_CAPABILITIES};
@@ -92,7 +91,11 @@ fn serve_authority_connection(
     helper_epoch: HelperEpoch,
     authority: RootEnrollmentAuthority,
 ) -> Result<(), HelperTransportError> {
-    let request = read_request(stream)?;
+    let ReceivedHelperRequest {
+        request,
+        descriptors,
+    } = receive_request(stream)?;
+    debug_assert!(descriptors.is_empty(), "handshake never carries material");
     let result = match request.op {
         HelperOp::Handshake(hello) => {
             let process_id = process_id.ok_or(HelperTransportError::PeerCredentials)?;
@@ -152,9 +155,12 @@ fn serve_enrolled_session(
         }),
     )?;
     loop {
-        let request = match read_request(stream) {
+        let ReceivedHelperRequest {
+            request,
+            descriptors,
+        } = match receive_request(stream) {
             Ok(request) => request,
-            Err(HelperTransportError::Io(error))
+            Err(super::descriptor_transport::DescriptorTransportError::Io(error))
                 if matches!(
                     error.kind(),
                     std::io::ErrorKind::UnexpectedEof
@@ -164,8 +170,12 @@ fn serve_enrolled_session(
             {
                 return Ok(());
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.into()),
         };
+        // Observation-only enrollment advertises no material-bearing
+        // capability. Exact descriptor count was already authenticated
+        // against the operation; dropping here cannot enable an effect.
+        drop(descriptors);
         write_response(stream, &session.handle(request))?;
     }
 }
@@ -275,7 +285,11 @@ fn serve_staged_connection(
     owner_uid: u32,
     peer_pid: Option<u32>,
 ) -> Result<(), HelperTransportError> {
-    let request = read_request(stream)?;
+    let ReceivedHelperRequest {
+        request,
+        descriptors,
+    } = receive_request(stream)?;
+    debug_assert!(descriptors.is_empty(), "handshake never carries material");
     let result = match request.op {
         HelperOp::Handshake(hello)
             if hello.owner_uid == owner_uid
@@ -293,18 +307,6 @@ fn serve_staged_connection(
     stream.write_all(&encode_response_frame(&response)?)?;
     stream.flush()?;
     Ok(())
-}
-
-fn read_request(stream: &mut UnixStream) -> Result<HelperRequest, HelperTransportError> {
-    let mut prefix = [0_u8; 4];
-    stream.read_exact(&mut prefix)?;
-    let length = u32::from_be_bytes(prefix) as usize;
-    if length > MAX_HELPER_FRAME_BYTES {
-        return Err(HelperTransportError::FrameTooLarge);
-    }
-    let mut body = Zeroizing::new(vec![0_u8; length]);
-    stream.read_exact(&mut body)?;
-    serde_json::from_slice(&body).map_err(|_| HelperTransportError::MalformedRequest)
 }
 
 fn ensure_runtime_root(path: &Path) -> Result<(), HelperTransportError> {
@@ -443,8 +445,16 @@ pub enum HelperTransportError {
     PlatformIdentity,
     #[error("the helper response could not be encoded: {0}")]
     Frame(#[from] crate::vortix_core::ipc::FrameError),
+    #[error("helper descriptor transport failed")]
+    Descriptor,
     #[error("helper transport I/O failed: {0}")]
     Io(#[from] std::io::Error),
+}
+
+impl From<super::descriptor_transport::DescriptorTransportError> for HelperTransportError {
+    fn from(_: super::descriptor_transport::DescriptorTransportError) -> Self {
+        Self::Descriptor
+    }
 }
 
 #[cfg(test)]

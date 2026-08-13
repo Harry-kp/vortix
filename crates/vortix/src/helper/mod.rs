@@ -7,6 +7,7 @@
 
 mod bootstrap;
 mod child_evidence;
+mod descriptor_transport;
 mod enrollment_store;
 mod executor;
 mod material;
