@@ -5,7 +5,7 @@
     reason = "U12 staging remains dormant until the foreground executor is enrolled"
 )]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Debug, Formatter};
 use std::fs::File;
 use std::io::{Read as _, Seek as _, SeekFrom};
@@ -21,6 +21,7 @@ use crate::helper::private_fs::{
 use crate::helper::runtime::HelperRuntimeIdentity;
 use crate::helper::validate::{PlatformLayout, HELPER_RUNTIME_DIR_MODE, HELPER_SOCKET_DIR_MODE};
 use crate::vortix_core::privileged::{OpenVpnPlan, ProfileMaterialSlot, ResourceKind, ResourceTag};
+use crate::vortix_core::privileged::{ProfileMaterialRef, WireGuardPlan};
 use crate::vortix_core::profile::ProtocolKind;
 use crate::vortix_core::secret_file::{
     write_secret_file_tracked, SecretFileError, SecretFileIdentity,
@@ -28,8 +29,264 @@ use crate::vortix_core::secret_file::{
 use crate::vortix_protocol_openvpn::execution::{
     render_helper_execution_under, supports_material_slot, OpenVpnExecutionSpec,
 };
+use crate::vortix_protocol_wireguard::execution::{
+    render_helper_execution as render_wireguard_execution, WireGuardExecutionSpec,
+    WireGuardMaterial,
+};
 
 pub(crate) const MAX_MATERIAL_BYTES: usize = 1024 * 1024;
+
+/// Descriptor-backed `WireGuard` keys paired with their canonical material
+/// identity. The transport constructs this value locally; it is never
+/// serialized and its debug form cannot reveal key bytes.
+pub(crate) struct WireGuardMaterialSet {
+    descriptors: BTreeMap<ProfileMaterialRef, File>,
+}
+
+impl Debug for WireGuardMaterialSet {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WireGuardMaterialSet")
+            .field("material_count", &self.descriptors.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl WireGuardMaterialSet {
+    pub(crate) fn from_inherited_descriptors(
+        descriptors: impl IntoIterator<Item = (ProfileMaterialRef, File)>,
+    ) -> Result<Self, WireGuardStagingError> {
+        let mut by_ref = BTreeMap::new();
+        for (material_ref, descriptor) in descriptors {
+            if by_ref.insert(material_ref, descriptor).is_some() {
+                return Err(WireGuardStagingError::DuplicateMaterial);
+            }
+        }
+        Ok(Self {
+            descriptors: by_ref,
+        })
+    }
+}
+
+/// Fixed-root staging for the one private config consumed by `wg-quick`.
+pub(crate) struct WireGuardRuntimeStager {
+    runtime_root: PathBuf,
+    runtime_directory: PathBuf,
+    config_path: PathBuf,
+    resource: ResourceTag,
+    expected_owner_uid: u32,
+}
+
+impl WireGuardRuntimeStager {
+    pub(crate) fn root_owned(layout: PlatformLayout, runtime: &HelperRuntimeIdentity) -> Self {
+        Self {
+            runtime_root: PathBuf::from(layout.helper_runtime_dir()),
+            runtime_directory: runtime.runtime_dir().to_owned(),
+            config_path: runtime.wireguard_config(),
+            resource: runtime.resource().clone(),
+            expected_owner_uid: 0,
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test(
+        runtime_root: PathBuf,
+        runtime_directory: PathBuf,
+        config_path: PathBuf,
+        resource: ResourceTag,
+        expected_owner_uid: u32,
+    ) -> Self {
+        Self {
+            runtime_root,
+            runtime_directory,
+            config_path,
+            resource,
+            expected_owner_uid,
+        }
+    }
+
+    pub(crate) fn stage(
+        &self,
+        plan: &WireGuardPlan,
+        materials: WireGuardMaterialSet,
+    ) -> Result<StagedWireGuardRuntime, WireGuardStagingError> {
+        if self.resource.kind() != ResourceKind::Tunnel
+            || self.resource.profile_id() != Some(plan.profile_id())
+            || self.resource.generation() != plan.generation()
+        {
+            return Err(WireGuardStagingError::PlanIdentityMismatch);
+        }
+        let expected = plan.material_refs().into_iter().collect::<BTreeSet<_>>();
+        let actual = materials
+            .descriptors
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if expected != actual {
+            return Err(WireGuardStagingError::MaterialSetMismatch);
+        }
+
+        let mut bytes = BTreeMap::new();
+        for (material_ref, descriptor) in materials.descriptors {
+            bytes.insert(material_ref, read_material_descriptor(descriptor)?);
+        }
+        let private_ref = ProfileMaterialRef::ProfileSlot {
+            slot: ProfileMaterialSlot::WireGuardPrivateKey,
+        };
+        let private_key = bytes
+            .get(&private_ref)
+            .ok_or(WireGuardStagingError::MaterialSetMismatch)?;
+        let preshared_keys = bytes
+            .iter()
+            .filter_map(|(material_ref, value)| match material_ref {
+                ProfileMaterialRef::WireGuardPresharedKey { peer_public_key } => {
+                    Some((*peer_public_key, value.as_slice()))
+                }
+                ProfileMaterialRef::ProfileSlot { .. } => None,
+            })
+            .collect();
+        let execution = render_wireguard_execution(
+            plan,
+            &self.config_path,
+            &WireGuardMaterial::new(private_key, preshared_keys),
+        )
+        .map_err(|_| WireGuardStagingError::InvalidMaterial)?;
+
+        validate_directory(
+            &self.runtime_root,
+            self.expected_owner_uid,
+            HELPER_SOCKET_DIR_MODE,
+        )
+        .map_err(WireGuardStagingError::from_openvpn)?;
+        let resource_root = self.runtime_root.join("resources");
+        let mut setup = DirectorySetup::default();
+        setup
+            .create_and_validate(&resource_root, self.expected_owner_uid)
+            .map_err(WireGuardStagingError::from_openvpn)?;
+        setup
+            .create_and_validate(&self.runtime_directory, self.expected_owner_uid)
+            .map_err(WireGuardStagingError::from_openvpn)?;
+        let identity = write_staged_file(execution.config_path(), execution.config())
+            .map_err(WireGuardStagingError::from_openvpn)?;
+        setup.commit();
+        Ok(StagedWireGuardRuntime {
+            execution,
+            created: CreatedPath {
+                path: self.config_path.clone(),
+                identity,
+            },
+            expected_owner_uid: self.expected_owner_uid,
+            cleaned: false,
+        })
+    }
+}
+
+pub(crate) struct StagedWireGuardRuntime {
+    execution: WireGuardExecutionSpec,
+    created: CreatedPath,
+    expected_owner_uid: u32,
+    cleaned: bool,
+}
+
+impl Debug for StagedWireGuardRuntime {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StagedWireGuardRuntime")
+            .field("protocol", &ProtocolKind::WireGuard)
+            .finish_non_exhaustive()
+    }
+}
+
+impl StagedWireGuardRuntime {
+    pub(crate) fn execution(&self) -> &WireGuardExecutionSpec {
+        &self.execution
+    }
+
+    pub(crate) fn cleanup(mut self) -> Result<(), WireGuardStagingError> {
+        self.remove_checked()
+    }
+
+    fn remove_checked(&mut self) -> Result<(), WireGuardStagingError> {
+        if self.cleaned {
+            return Ok(());
+        }
+        if created_path_is_safe(&self.created, self.expected_owner_uid)
+            .map_err(WireGuardStagingError::from_openvpn)?
+        {
+            std::fs::remove_file(&self.created.path)?;
+        }
+        self.cleaned = true;
+        Ok(())
+    }
+}
+
+impl Drop for StagedWireGuardRuntime {
+    fn drop(&mut self) {
+        let _ = self.remove_checked();
+    }
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum WireGuardStagingError {
+    #[error("duplicate WireGuard material identity")]
+    DuplicateMaterial,
+    #[error("WireGuard descriptor set does not exactly match the canonical plan")]
+    MaterialSetMismatch,
+    #[error("WireGuard plan identity does not match the helper runtime resource")]
+    PlanIdentityMismatch,
+    #[error("WireGuard key material is invalid")]
+    InvalidMaterial,
+    #[error("WireGuard material descriptor is empty")]
+    EmptyMaterial,
+    #[error("WireGuard material descriptor exceeds its fixed byte limit")]
+    MaterialTooLarge,
+    #[error("WireGuard material descriptor is not a regular file")]
+    InvalidMaterialDescriptor,
+    #[error("WireGuard helper runtime identity, ownership, or mode is unsafe")]
+    UnsafeRuntime,
+    #[error("stale WireGuard helper runtime file already exists")]
+    StaleRuntime,
+    #[error("WireGuard material staging I/O failed")]
+    Io(#[from] std::io::Error),
+}
+
+impl WireGuardStagingError {
+    fn from_openvpn(error: OpenVpnStagingError) -> Self {
+        match error {
+            OpenVpnStagingError::StaleRuntime => Self::StaleRuntime,
+            OpenVpnStagingError::Io(error) => Self::Io(error),
+            _ => Self::UnsafeRuntime,
+        }
+    }
+}
+
+fn read_material_descriptor(
+    mut descriptor: File,
+) -> Result<Zeroizing<Vec<u8>>, WireGuardStagingError> {
+    let metadata = descriptor.metadata()?;
+    if !metadata.is_file() {
+        return Err(WireGuardStagingError::InvalidMaterialDescriptor);
+    }
+    let material_len =
+        usize::try_from(metadata.len()).map_err(|_| WireGuardStagingError::MaterialTooLarge)?;
+    if material_len > MAX_MATERIAL_BYTES {
+        return Err(WireGuardStagingError::MaterialTooLarge);
+    }
+    if material_len == 0 {
+        return Err(WireGuardStagingError::EmptyMaterial);
+    }
+    descriptor.seek(SeekFrom::Start(0))?;
+    let mut bytes = Zeroizing::new(Vec::with_capacity(material_len));
+    descriptor
+        .by_ref()
+        .take(material_len as u64)
+        .read_to_end(&mut bytes)?;
+    let mut trailing = [0_u8; 1];
+    if bytes.len() != material_len || descriptor.read(&mut trailing)? != 0 {
+        return Err(WireGuardStagingError::InvalidMaterialDescriptor);
+    }
+    Ok(bytes)
+}
 
 /// Descriptors received out-of-band from the authenticated daemon. This type
 /// has no serde implementation and its debug form reveals slots only.
@@ -455,11 +712,16 @@ mod tests {
     use crate::helper::HELPER_SOCKET_DIR_MODE;
     use crate::vortix_core::privileged::{
         OpenVpnAuthFactors, OpenVpnPlan, OpenVpnRemote, OpenVpnRemoteSelection, OpenVpnTransport,
-        ProfileMaterialSlot, ResourceTag,
+        ProfileMaterialRef, ProfileMaterialSlot, ResourceTag, WireGuardInterfaceOptions,
+        WireGuardPeerPlan, WireGuardPlan, WireGuardPresharedKeyRef,
     };
     use crate::vortix_core::profile::ProfileId;
 
-    use super::{OpenVpnMaterialSet, OpenVpnRuntimeStager, OpenVpnStagingError};
+    use super::{
+        OpenVpnMaterialSet, OpenVpnRuntimeStager, OpenVpnStagingError, WireGuardMaterialSet,
+        WireGuardRuntimeStager, WireGuardStagingError,
+    };
+    use base64::engine::{general_purpose::STANDARD as BASE64, Engine as _};
 
     fn current_uid() -> u32 {
         // SAFETY: `geteuid` has no preconditions and does not touch Rust memory.
@@ -515,6 +777,121 @@ mod tests {
             current_uid(),
         );
         (root, stager)
+    }
+
+    fn wireguard_plan() -> WireGuardPlan {
+        let public_key = [2; 32];
+        WireGuardPlan::new(
+            profile('c'),
+            9,
+            vec!["10.8.0.2/24".parse().unwrap()],
+            vec![WireGuardPeerPlan::with_preshared_key(
+                public_key,
+                None,
+                vec!["0.0.0.0/0".parse().unwrap()],
+                None,
+                WireGuardPresharedKeyRef::for_peer(public_key).unwrap(),
+            )
+            .unwrap()],
+            WireGuardInterfaceOptions::default(),
+        )
+        .unwrap()
+    }
+
+    fn wireguard_fixture() -> (tempfile::TempDir, WireGuardRuntimeStager) {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            root.path(),
+            std::fs::Permissions::from_mode(HELPER_SOCKET_DIR_MODE),
+        )
+        .unwrap();
+        let runtime = root
+            .path()
+            .join("resources")
+            .join("c".repeat(ProfileId::HEX_LEN));
+        let resource = ResourceTag::tunnel(profile('c'), 9).unwrap();
+        let stager = WireGuardRuntimeStager::for_test(
+            root.path().to_owned(),
+            runtime.clone(),
+            runtime.join("vxcandidate.conf"),
+            resource,
+            current_uid(),
+        );
+        (root, stager)
+    }
+
+    fn wireguard_materials() -> (Vec<tempfile::NamedTempFile>, WireGuardMaterialSet) {
+        let (private_source, private) = descriptor(BASE64.encode([1; 32]).as_bytes());
+        let (psk_source, psk) = descriptor(BASE64.encode([3; 32]).as_bytes());
+        let materials = WireGuardMaterialSet::from_inherited_descriptors([
+            (
+                ProfileMaterialRef::ProfileSlot {
+                    slot: ProfileMaterialSlot::WireGuardPrivateKey,
+                },
+                private,
+            ),
+            (
+                ProfileMaterialRef::WireGuardPresharedKey {
+                    peer_public_key: [2; 32],
+                },
+                psk,
+            ),
+        ])
+        .unwrap();
+        (vec![private_source, psk_source], materials)
+    }
+
+    #[test]
+    fn wireguard_exact_descriptors_stage_one_private_canonical_config() {
+        let (_root, stager) = wireguard_fixture();
+        let (_sources, materials) = wireguard_materials();
+        let runtime = stager.stage(&wireguard_plan(), materials).unwrap();
+        let path = runtime.execution().config_path().to_owned();
+        let body = std::fs::read_to_string(&path).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(body.contains("Address = 10.8.0.2/24"));
+        assert!(body.contains("AllowedIPs = 0.0.0.0/0"));
+        assert!(!body.contains("PostUp"));
+        assert!(!format!("{runtime:?}").contains(&BASE64.encode([1; 32])));
+
+        runtime.cleanup().unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn wireguard_material_identity_and_plan_generation_fail_before_staging() {
+        let (_root, stager) = wireguard_fixture();
+        let (private_source, private) = descriptor(BASE64.encode([1; 32]).as_bytes());
+        let missing = WireGuardMaterialSet::from_inherited_descriptors([(
+            ProfileMaterialRef::ProfileSlot {
+                slot: ProfileMaterialSlot::WireGuardPrivateKey,
+            },
+            private,
+        )])
+        .unwrap();
+        assert!(matches!(
+            stager.stage(&wireguard_plan(), missing),
+            Err(WireGuardStagingError::MaterialSetMismatch)
+        ));
+        drop(private_source);
+
+        let (_sources, materials) = wireguard_materials();
+        let wrong = WireGuardPlan::new(
+            profile('c'),
+            10,
+            Vec::new(),
+            vec![WireGuardPeerPlan::new([2; 32], None, Vec::new(), None).unwrap()],
+            WireGuardInterfaceOptions::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            stager.stage(&wrong, materials),
+            Err(WireGuardStagingError::PlanIdentityMismatch)
+        ));
     }
 
     fn certificate_materials() -> (Vec<tempfile::NamedTempFile>, OpenVpnMaterialSet) {
