@@ -16,13 +16,17 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 use super::enrollment_store::{EnrollmentStoreError, RootEnrollmentAuthority, RootEnrollmentStore};
+use super::executor::ProductionHelperExecutor;
 use super::platform_identity::verify_daemon_service;
 use super::protocol::{
-    encode_response_frame, negotiate_candidate, negotiate_enrolled, negotiate_staged, HelperError,
+    encode_response_frame, negotiate_candidate, negotiate_staged, HelperCapability, HelperError,
     HelperOp, HelperRequest, HelperResponse, HelperResult, HelperSessionBinding,
-    MAX_HELPER_FRAME_BYTES, STAGED_CAPABILITIES,
+    MAX_HELPER_FRAME_BYTES,
 };
+#[cfg(test)]
+use super::protocol::{negotiate_enrolled, STAGED_CAPABILITIES};
 use super::validate::{PlatformLayout, HELPER_SOCKET_DIR_MODE, HELPER_SOCKET_MODE};
+use super::{replay_store::FsHelperLedgerStore, server::EnrolledHelperSession};
 use crate::vortix_core::privileged::{HelperEpoch, PlatformVerifiedAuthority, RootAuthorityLedger};
 
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(2);
@@ -101,15 +105,26 @@ fn serve_authority_connection(
                 reservation,
             )
             .map_err(|_| HelperTransportError::PlatformIdentity)?;
-            negotiate_verified_authority(
-                &hello,
-                verified,
-                reservation,
+            let root = verified_root_authority(verified, reservation)
+                .map_err(|_| HelperTransportError::PlatformIdentity)?;
+            if authority.is_enrolled() {
+                return serve_enrolled_session(
+                    stream,
+                    request.id,
+                    hello,
+                    root,
+                    helper_epoch,
+                    PlatformLayout::current().ok_or(HelperTransportError::UnsupportedPlatform)?,
+                );
+            }
+            let binding = HelperSessionBinding {
+                authority_epoch: reservation.authority_epoch(),
+                lease_id: reservation.lease_id(),
                 helper_epoch,
-                authority.is_enrolled(),
-            )
+            };
+            negotiate_candidate(&hello, binding).map(HelperResult::Handshake)
         }
-        HelperOp::Execute(_) => Err(HelperError::ExecutionUnavailable),
+        HelperOp::Execute(_) => Err(HelperError::AuthenticationFailed),
     };
     let response = HelperResponse {
         id: request.id,
@@ -120,6 +135,96 @@ fn serve_authority_connection(
     Ok(())
 }
 
+fn serve_enrolled_session(
+    stream: &mut UnixStream,
+    request_id: u64,
+    hello: super::protocol::HelperClientHello,
+    root: RootAuthorityLedger,
+    helper_epoch: HelperEpoch,
+    layout: PlatformLayout,
+) -> Result<(), HelperTransportError> {
+    let mut session = open_observation_session(root, helper_epoch, layout)?;
+    write_response(
+        stream,
+        &session.handle(HelperRequest {
+            id: request_id,
+            op: HelperOp::Handshake(hello),
+        }),
+    )?;
+    loop {
+        let request = match read_request(stream) {
+            Ok(request) => request,
+            Err(HelperTransportError::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        write_response(stream, &session.handle(request))?;
+    }
+}
+
+fn open_observation_session(
+    root: RootAuthorityLedger,
+    helper_epoch: HelperEpoch,
+    layout: PlatformLayout,
+) -> Result<
+    EnrolledHelperSession<ProductionHelperExecutor, FsHelperLedgerStore>,
+    HelperTransportError,
+> {
+    let executor = ProductionHelperExecutor::observation_only(layout, root.lease_id())
+        .map_err(|_| HelperTransportError::SessionUnavailable)?;
+    let mut store = FsHelperLedgerStore::root_owned(layout);
+    let capabilities = vec![HelperCapability::Handshake, HelperCapability::Observe];
+    match store.load() {
+        Ok(ledger) => EnrolledHelperSession::recover_restricted(
+            root,
+            helper_epoch,
+            ledger,
+            executor,
+            store,
+            capabilities,
+        )
+        .map_err(|_| HelperTransportError::SessionUnavailable),
+        Err(super::replay_store::HelperLedgerStoreError::Io(error))
+            if error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            let baseline = root
+                .unused_replay_baseline(&root.principal(), helper_epoch)
+                .map_err(|_| HelperTransportError::SessionUnavailable)?;
+            store
+                .initialize(baseline.clone())
+                .map_err(|_| HelperTransportError::SessionUnavailable)?;
+            EnrolledHelperSession::resume_restricted(
+                root,
+                helper_epoch,
+                baseline,
+                executor,
+                store,
+                capabilities,
+            )
+            .map_err(|_| HelperTransportError::SessionUnavailable)
+        }
+        Err(_) => Err(HelperTransportError::SessionUnavailable),
+    }
+}
+
+fn write_response(
+    stream: &mut UnixStream,
+    response: &HelperResponse,
+) -> Result<(), HelperTransportError> {
+    stream.write_all(&encode_response_frame(response)?)?;
+    stream.flush()?;
+    Ok(())
+}
+
+#[cfg(test)]
 fn negotiate_verified_authority(
     hello: &super::protocol::HelperClientHello,
     verified: PlatformVerifiedAuthority,
@@ -127,13 +232,7 @@ fn negotiate_verified_authority(
     helper_epoch: HelperEpoch,
     enrolled: bool,
 ) -> Result<HelperResult, HelperError> {
-    let _root = RootAuthorityLedger::from_platform_verified(
-        verified,
-        reservation.boot_scope(),
-        reservation.authority_epoch(),
-        reservation.lease_id(),
-    )
-    .map_err(|_| HelperError::AuthenticationFailed)?;
+    let _root = verified_root_authority(verified, reservation)?;
     let binding = HelperSessionBinding {
         authority_epoch: reservation.authority_epoch(),
         lease_id: reservation.lease_id(),
@@ -144,6 +243,19 @@ fn negotiate_verified_authority(
     } else {
         negotiate_candidate(hello, binding).map(HelperResult::Handshake)
     }
+}
+
+fn verified_root_authority(
+    verified: PlatformVerifiedAuthority,
+    reservation: super::enrollment_store::AuthorityReservation,
+) -> Result<RootAuthorityLedger, HelperError> {
+    RootAuthorityLedger::from_platform_verified(
+        verified,
+        reservation.boot_scope(),
+        reservation.authority_epoch(),
+        reservation.lease_id(),
+    )
+    .map_err(|_| HelperError::AuthenticationFailed)
 }
 
 fn random_helper_epoch() -> Result<HelperEpoch, HelperTransportError> {
@@ -325,6 +437,8 @@ pub enum HelperTransportError {
     MalformedRequest,
     #[error("the helper could not establish a fresh process incarnation")]
     Randomness,
+    #[error("the enrolled helper session or replay ledger is unavailable")]
+    SessionUnavailable,
     #[error("the daemon service identity was not verified")]
     PlatformIdentity,
     #[error("the helper response could not be encoded: {0}")]

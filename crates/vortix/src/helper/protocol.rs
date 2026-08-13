@@ -155,8 +155,6 @@ pub enum HelperError {
     CapabilityUnavailable { capability: HelperCapability },
     #[error("helper authority is staged but not enrolled")]
     NotEnrolled,
-    #[error("helper execution remains disabled until every privileged adapter is verified")]
-    ExecutionUnavailable,
     #[error("malformed helper request: {reason}")]
     Malformed { reason: String },
     #[error("helper frame is too large: {size} > {max}")]
