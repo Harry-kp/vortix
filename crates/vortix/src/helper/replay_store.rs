@@ -58,10 +58,22 @@ impl FsHelperLedgerStore {
         &mut self,
         baseline: ReplayBaseline,
     ) -> Result<(), HelperLedgerStoreError> {
-        self.write(&HelperLedgerRecord::empty(baseline.into_record()))
+        let _lock = self.store.lock_sibling(c"helper-ledger.lock")?;
+        match self.load() {
+            Err(HelperLedgerStoreError::Io(error))
+                if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => return Err(HelperLedgerStoreError::AlreadyInitialized),
+            Err(error) => return Err(error),
+        }
+        self.write_under_lock(&HelperLedgerRecord::empty(baseline.into_record()))
     }
 
     fn write(&self, ledger: &HelperLedgerRecord) -> Result<(), HelperLedgerStoreError> {
+        let _lock = self.store.lock_sibling(c"helper-ledger.lock")?;
+        self.write_under_lock(ledger)
+    }
+
+    fn write_under_lock(&self, ledger: &HelperLedgerRecord) -> Result<(), HelperLedgerStoreError> {
         match self.load() {
             Ok(_) => {}
             Err(HelperLedgerStoreError::Io(error))
@@ -93,6 +105,8 @@ pub(crate) enum HelperLedgerStoreError {
     Io(#[from] std::io::Error),
     #[error("helper replay ledger serialization failed: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("helper replay ledger is already initialized")]
+    AlreadyInitialized,
 }
 
 impl From<RootStoreError> for HelperLedgerStoreError {
@@ -173,6 +187,10 @@ mod tests {
         let baseline = replay_baseline();
         let record = HelperLedgerRecord::empty(baseline.clone().into_record());
         store.initialize(baseline).unwrap();
+        assert!(matches!(
+            store.initialize(replay_baseline()),
+            Err(HelperLedgerStoreError::AlreadyInitialized)
+        ));
         store.persist(&record).unwrap();
 
         assert_eq!(store.load().unwrap(), record);

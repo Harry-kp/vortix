@@ -179,6 +179,7 @@ pub(crate) struct EnrolledHelperSession<E, S> {
     resource_states: BTreeMap<ResourceTag, HelperResourceState>,
     children: BTreeMap<ResourceTag, ChildEvidence>,
     last_receipt: Option<VerifiedReceipt>,
+    enabled_capabilities: Vec<HelperCapability>,
     handshaken: bool,
     poisoned: bool,
 }
@@ -195,6 +196,24 @@ where
         executor: E,
         ledger_store: S,
     ) -> Result<Self, OperationError> {
+        Self::resume_restricted(
+            root,
+            helper_epoch,
+            baseline,
+            executor,
+            ledger_store,
+            ENABLED_CAPABILITIES.to_vec(),
+        )
+    }
+
+    pub(crate) fn resume_restricted(
+        root: RootAuthorityLedger,
+        helper_epoch: HelperEpoch,
+        baseline: crate::vortix_core::privileged::ReplayBaseline,
+        executor: E,
+        ledger_store: S,
+        enabled_capabilities: Vec<HelperCapability>,
+    ) -> Result<Self, OperationError> {
         let principal = root.principal();
         let guard = OperationGuard::resume(&principal, helper_epoch, baseline)?;
         let receipts =
@@ -209,6 +228,7 @@ where
             resource_states: BTreeMap::new(),
             children: BTreeMap::new(),
             last_receipt: None,
+            enabled_capabilities,
             handshaken: false,
             poisoned: false,
         })
@@ -224,10 +244,35 @@ where
         executor: E,
         ledger_store: S,
     ) -> Result<Self, OperationError> {
+        Self::recover_restricted(
+            root,
+            helper_epoch,
+            ledger,
+            executor,
+            ledger_store,
+            ENABLED_CAPABILITIES.to_vec(),
+        )
+    }
+
+    pub(crate) fn recover_restricted(
+        root: RootAuthorityLedger,
+        helper_epoch: HelperEpoch,
+        ledger: HelperLedgerRecord,
+        executor: E,
+        ledger_store: S,
+        enabled_capabilities: Vec<HelperCapability>,
+    ) -> Result<Self, OperationError> {
         let principal = root.principal();
         let (replay, resources, child_observations) = ledger.into_parts();
         let baseline = root.loaded_replay_baseline(&principal, replay)?;
-        let mut session = Self::resume(root, helper_epoch, baseline, executor, ledger_store)?;
+        let mut session = Self::resume_restricted(
+            root,
+            helper_epoch,
+            baseline,
+            executor,
+            ledger_store,
+            enabled_capabilities,
+        )?;
         for entry in resources {
             session
                 .resource_states
@@ -277,7 +322,7 @@ where
                 lease_id: self.root.lease_id(),
                 helper_epoch: self.helper_epoch,
             },
-            &ENABLED_CAPABILITIES,
+            &self.enabled_capabilities,
         )?;
         self.handshaken = true;
         Ok(response)
@@ -293,14 +338,10 @@ where
         if self.poisoned {
             return Err(HelperError::LedgerUnavailable);
         }
-        if !matches!(
-            request.operation(),
-            PrivilegedOperation::Observe(_)
-                | PrivilegedOperation::StartTunnel(_)
-                | PrivilegedOperation::StopTunnel(_)
-                | PrivilegedOperation::NetworkPolicy(_)
-                | PrivilegedOperation::CleanupOwned(_)
-        ) {
+        if !self
+            .enabled_capabilities
+            .contains(&capability_for(request.operation()))
+        {
             return Err(HelperError::CapabilityUnavailable {
                 capability: capability_for(request.operation()),
             });
@@ -1711,6 +1752,51 @@ mod tests {
                 .result,
             Err(HelperError::Malformed { .. })
         ));
+    }
+
+    #[test]
+    fn restricted_session_rejects_unadvertised_operation_before_admission() {
+        let (root, principal, claim, helper_epoch, baseline) = fixture();
+        let mut server = EnrolledHelperSession::resume_restricted(
+            root,
+            helper_epoch,
+            baseline,
+            FakeExecutor::default(),
+            MemoryHelperLedgerStore::default(),
+            vec![HelperCapability::Handshake, HelperCapability::Observe],
+        )
+        .unwrap();
+        assert!(server
+            .handle(HelperRequest {
+                id: 1,
+                op: HelperOp::Handshake(HelperClientHello::current(
+                    501,
+                    claim,
+                    vec![HelperCapability::Observe],
+                )),
+            })
+            .result
+            .is_ok());
+        let request = PrivilegedRequest::new(
+            &principal,
+            helper_epoch,
+            RequestSequence::new(1).unwrap(),
+            PrivilegedOperation::StartTunnel(wireguard_plan(1)),
+        )
+        .unwrap();
+        assert!(matches!(
+            server
+                .handle(HelperRequest {
+                    id: 2,
+                    op: HelperOp::Execute(Box::new(request)),
+                })
+                .result,
+            Err(HelperError::CapabilityUnavailable {
+                capability: HelperCapability::TunnelLifecycle
+            })
+        ));
+        assert_eq!(server.executor.starts, 0);
+        assert!(server.ledger_store.writes.is_empty());
     }
 
     #[test]

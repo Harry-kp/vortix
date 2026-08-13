@@ -8,6 +8,7 @@
 mod bootstrap;
 mod child_evidence;
 mod enrollment_store;
+mod executor;
 mod material;
 mod observe;
 mod platform_identity;
