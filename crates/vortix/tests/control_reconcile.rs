@@ -413,7 +413,10 @@ fn supervisor_gives_tunnel_compensation_the_callers_full_shutdown_budget() {
             while !cancellation.is_cancelled() {
                 std::thread::yield_now();
             }
-            std::thread::sleep(Duration::from_millis(180));
+            // Longer than half the caller's shutdown budget, so this still
+            // catches the former budget-splitting implementation. Keep ample
+            // headroom below the full budget for loaded CI runners.
+            std::thread::sleep(Duration::from_millis(500));
             Err("cancelled after owned cleanup".into())
         }
     }
@@ -436,7 +439,7 @@ fn supervisor_gives_tunnel_compensation_the_callers_full_shutdown_budget() {
         .unwrap();
     entered.wait();
 
-    assert!(supervisor.shutdown_bounded(Duration::from_millis(300)));
+    assert!(supervisor.shutdown_bounded(Duration::from_millis(800)));
 }
 
 fn observation(
