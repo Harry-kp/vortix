@@ -1980,6 +1980,52 @@ async fn kill_switch_change_preserves_settled_tunnel_revision() {
 }
 
 #[tokio::test]
+async fn first_policy_after_restart_uses_initial_firewall_mode_as_rollback_baseline() {
+    use vortix::vortix_core::state::killswitch::KillSwitchMode;
+
+    let capture = Arc::new(TopologyCapture::default());
+    let supervisor = Arc::new(Supervisor::new(
+        AuthorityEpoch(1),
+        capture.clone(),
+        capture.clone(),
+        1,
+        8,
+    ));
+    let service = ControlService::start_supervised(
+        ControlServiceConfig {
+            authority_epoch: AuthorityEpoch(1),
+            initial_kill_switch_mode: KillSwitchMode::AlwaysOn,
+            freshness_poll_interval: Duration::from_millis(5),
+            ..ControlServiceConfig::default()
+        },
+        Arc::new(TestClock::default()),
+        ExecutionSelection::CanonicalAuthority,
+        supervisor,
+    );
+
+    service
+        .client()
+        .submit(CommandRequest {
+            command: UserCommand::SetKillSwitch {
+                mode: KillSwitchMode::AlwaysOn,
+            },
+            idempotency_key: IdempotencyKey::new("restart-vpn-only"),
+            deadline: Deadline(1_000),
+        })
+        .await
+        .expect("persisted kill-switch intent is admitted");
+    wait_for_condition(
+        || !capture.policies.lock().unwrap().is_empty(),
+        "restart policy did not reach the worker",
+    )
+    .await;
+
+    let policy = capture.policies.lock().unwrap()[0].clone();
+    assert_eq!(policy.stage, PolicyStage::PreTunnelBlocking);
+    assert_eq!(policy.prior.kill_switch, KillSwitchMode::AlwaysOn);
+}
+
+#[tokio::test]
 #[allow(clippy::too_many_lines)] // One end-to-end stale-revision retry and convergence assertion.
 async fn later_policy_command_drives_retry_for_older_tunnel_revision() {
     #[derive(Default)]
