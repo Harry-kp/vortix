@@ -10,6 +10,7 @@ use std::fmt::{Debug, Formatter};
 use std::fs::File;
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::os::unix::fs::MetadataExt as _;
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
@@ -30,11 +31,57 @@ use crate::vortix_protocol_openvpn::execution::{
     render_helper_execution_under, supports_material_slot, OpenVpnExecutionSpec,
 };
 use crate::vortix_protocol_wireguard::execution::{
-    render_helper_execution as render_wireguard_execution, WireGuardExecutionSpec,
-    WireGuardMaterial,
+    render_helper_execution as render_wireguard_execution, WireGuardMaterial,
 };
 
 pub(crate) const MAX_MATERIAL_BYTES: usize = 1024 * 1024;
+
+pub(crate) enum TunnelMaterialSet {
+    WireGuard(WireGuardMaterialSet),
+    OpenVpn(OpenVpnMaterialSet),
+}
+
+impl TunnelMaterialSet {
+    pub(crate) fn for_plan(
+        plan: &crate::vortix_core::privileged::ProtocolPlan,
+        descriptors: Vec<File>,
+    ) -> Result<Self, TunnelMaterialError> {
+        let refs = plan.material_refs();
+        if refs.len() != descriptors.len() {
+            return Err(TunnelMaterialError::CountMismatch);
+        }
+        match plan {
+            crate::vortix_core::privileged::ProtocolPlan::WireGuard(_) => {
+                WireGuardMaterialSet::from_inherited_descriptors(refs.into_iter().zip(descriptors))
+                    .map(Self::WireGuard)
+                    .map_err(|_| TunnelMaterialError::InvalidIdentity)
+            }
+            crate::vortix_core::privileged::ProtocolPlan::OpenVpn(_) => {
+                let slots = refs
+                    .into_iter()
+                    .zip(descriptors)
+                    .map(|(material_ref, descriptor)| match material_ref {
+                        ProfileMaterialRef::ProfileSlot { slot } => Ok((slot, descriptor)),
+                        ProfileMaterialRef::WireGuardPresharedKey { .. } => {
+                            Err(TunnelMaterialError::InvalidIdentity)
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                OpenVpnMaterialSet::from_inherited_descriptors(slots)
+                    .map(Self::OpenVpn)
+                    .map_err(|_| TunnelMaterialError::InvalidIdentity)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub(crate) enum TunnelMaterialError {
+    #[error("tunnel material descriptor count does not match the plan")]
+    CountMismatch,
+    #[error("tunnel material identity does not match the protocol plan")]
+    InvalidIdentity,
+}
 
 /// Descriptor-backed `WireGuard` keys paired with their canonical material
 /// identity. The transport constructs this value locally; it is never
@@ -170,7 +217,7 @@ impl WireGuardRuntimeStager {
             .map_err(WireGuardStagingError::from_openvpn)?;
         setup.commit();
         Ok(StagedWireGuardRuntime {
-            execution,
+            config_path: self.config_path.clone(),
             created: CreatedPath {
                 path: self.config_path.clone(),
                 identity,
@@ -179,10 +226,54 @@ impl WireGuardRuntimeStager {
             cleaned: false,
         })
     }
+
+    pub(crate) fn recover(&self) -> Result<StagedWireGuardRuntime, WireGuardStagingError> {
+        validate_directory(
+            &self.runtime_root,
+            self.expected_owner_uid,
+            HELPER_SOCKET_DIR_MODE,
+        )
+        .map_err(WireGuardStagingError::from_openvpn)?;
+        validate_directory(
+            &self.runtime_root.join("resources"),
+            self.expected_owner_uid,
+            HELPER_RUNTIME_DIR_MODE,
+        )
+        .map_err(WireGuardStagingError::from_openvpn)?;
+        validate_directory(
+            &self.runtime_directory,
+            self.expected_owner_uid,
+            HELPER_RUNTIME_DIR_MODE,
+        )
+        .map_err(WireGuardStagingError::from_openvpn)?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&self.config_path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file()
+            || metadata.uid() != self.expected_owner_uid
+            || metadata.mode() & 0o777 != 0o600
+            || metadata.nlink() != 1
+            || metadata.len() == 0
+            || metadata.len() > MAX_MATERIAL_BYTES as u64
+        {
+            return Err(WireGuardStagingError::UnsafeRuntime);
+        }
+        Ok(StagedWireGuardRuntime {
+            config_path: self.config_path.clone(),
+            created: CreatedPath {
+                path: self.config_path.clone(),
+                identity: SecretFileIdentity::from_metadata(&metadata),
+            },
+            expected_owner_uid: self.expected_owner_uid,
+            cleaned: false,
+        })
+    }
 }
 
 pub(crate) struct StagedWireGuardRuntime {
-    execution: WireGuardExecutionSpec,
+    config_path: PathBuf,
     created: CreatedPath,
     expected_owner_uid: u32,
     cleaned: bool,
@@ -198,11 +289,11 @@ impl Debug for StagedWireGuardRuntime {
 }
 
 impl StagedWireGuardRuntime {
-    pub(crate) fn execution(&self) -> &WireGuardExecutionSpec {
-        &self.execution
+    pub(crate) fn config_path(&self) -> &Path {
+        &self.config_path
     }
 
-    pub(crate) fn cleanup(mut self) -> Result<(), WireGuardStagingError> {
+    pub(crate) fn cleanup(&mut self) -> Result<(), WireGuardStagingError> {
         self.remove_checked()
     }
 
@@ -845,8 +936,8 @@ mod tests {
     fn wireguard_exact_descriptors_stage_one_private_canonical_config() {
         let (_root, stager) = wireguard_fixture();
         let (_sources, materials) = wireguard_materials();
-        let runtime = stager.stage(&wireguard_plan(), materials).unwrap();
-        let path = runtime.execution().config_path().to_owned();
+        let mut runtime = stager.stage(&wireguard_plan(), materials).unwrap();
+        let path = runtime.config_path().to_owned();
         let body = std::fs::read_to_string(&path).unwrap();
 
         assert_eq!(
@@ -891,6 +982,30 @@ mod tests {
         assert!(matches!(
             stager.stage(&wrong, materials),
             Err(WireGuardStagingError::PlanIdentityMismatch)
+        ));
+    }
+
+    #[test]
+    fn wireguard_runtime_recovery_reauthenticates_exact_private_inode() {
+        let (_root, stager) = wireguard_fixture();
+        let (_sources, materials) = wireguard_materials();
+        let runtime = stager.stage(&wireguard_plan(), materials).unwrap();
+        let config = runtime.config_path().to_owned();
+        std::mem::forget(runtime);
+
+        let mut recovered = stager.recover().unwrap();
+        assert_eq!(recovered.config_path(), config);
+        recovered.cleanup().unwrap();
+        assert!(!config.exists());
+
+        let (_sources, materials) = wireguard_materials();
+        let runtime = stager.stage(&wireguard_plan(), materials).unwrap();
+        let config = runtime.config_path().to_owned();
+        std::mem::forget(runtime);
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            stager.recover(),
+            Err(WireGuardStagingError::UnsafeRuntime)
         ));
     }
 

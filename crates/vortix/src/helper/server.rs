@@ -12,6 +12,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::helper::material::TunnelMaterialSet;
 use crate::helper::protocol::{
     negotiate_enrolled, HelperCapability, HelperClientHello, HelperError, HelperOp, HelperRequest,
     HelperResponse, HelperResult, HelperSessionBinding,
@@ -57,6 +58,10 @@ impl ObservationOutcome {
             child_observations,
         }
     }
+
+    pub(crate) fn into_parts(self) -> (Vec<ResourceObservation>, Vec<ObservedChildIdentity>) {
+        (self.observations, self.child_observations)
+    }
 }
 
 fn child_observations_match_request(
@@ -88,6 +93,7 @@ pub(crate) trait TunnelLifecycleExecutor {
     fn start_tunnel(
         &mut self,
         plan: &ProtocolPlan,
+        materials: Option<TunnelMaterialSet>,
     ) -> Result<TunnelStartOutcome, PrivilegedExecutionError>;
 
     fn stop_tunnel(
@@ -291,9 +297,17 @@ where
     }
 
     pub(crate) fn handle(&mut self, request: HelperRequest) -> HelperResponse {
+        self.handle_with_materials(request, None)
+    }
+
+    pub(crate) fn handle_with_materials(
+        &mut self,
+        request: HelperRequest,
+        materials: Option<TunnelMaterialSet>,
+    ) -> HelperResponse {
         let result = match request.op {
             HelperOp::Handshake(hello) => self.handshake(&hello).map(HelperResult::Handshake),
-            HelperOp::Execute(operation) => self.execute(&operation),
+            HelperOp::Execute(operation) => self.execute(&operation, materials),
         };
         HelperResponse {
             id: request.id,
@@ -331,6 +345,7 @@ where
     fn execute(
         &mut self,
         request: &crate::vortix_core::privileged::PrivilegedRequest,
+        materials: Option<TunnelMaterialSet>,
     ) -> Result<HelperResult, HelperError> {
         if !self.handshaken {
             return Err(HelperError::AuthenticationFailed);
@@ -382,7 +397,7 @@ where
 
         let receipt = match request.operation() {
             PrivilegedOperation::Observe(targets) => self.observe(request, targets),
-            PrivilegedOperation::StartTunnel(plan) => self.start_tunnel(request, plan),
+            PrivilegedOperation::StartTunnel(plan) => self.start_tunnel(request, plan, materials),
             PrivilegedOperation::StopTunnel(resource) => self.stop_tunnel(request, resource),
             PrivilegedOperation::NetworkPolicy(operation) => {
                 self.execute_network_policy(request, operation)
@@ -553,6 +568,7 @@ where
         &mut self,
         request: &crate::vortix_core::privileged::PrivilegedRequest,
         plan: &ProtocolPlan,
+        materials: Option<TunnelMaterialSet>,
     ) -> Result<VerifiedReceipt, HelperError> {
         let Ok(tunnel) = ResourceTag::tunnel(plan.profile_id().clone(), plan.generation()) else {
             self.persist_ledger()?;
@@ -585,7 +601,7 @@ where
         }
         self.persist_ledger()?;
 
-        let outcome = match self.executor.start_tunnel(plan) {
+        let outcome = match self.executor.start_tunnel(plan, materials) {
             Ok(outcome) => outcome,
             Err(error) => return self.start_error_receipt(request, &intended, error),
         };
@@ -1125,6 +1141,7 @@ mod tests {
         fn start_tunnel(
             &mut self,
             plan: &ProtocolPlan,
+            _materials: Option<TunnelMaterialSet>,
         ) -> Result<TunnelStartOutcome, PrivilegedExecutionError> {
             self.starts += 1;
             if let Some(error) = self.start_error {
