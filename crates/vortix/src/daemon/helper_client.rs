@@ -24,6 +24,8 @@ use crate::vortix_core::privileged::{
 
 pub(crate) struct AuthenticatedHelperSession {
     verifier: AuthenticatedReceiptVerifier,
+    binding: crate::helper::HelperSessionBinding,
+    product_version: String,
 }
 
 impl AuthenticatedHelperSession {
@@ -62,7 +64,22 @@ impl AuthenticatedHelperSession {
                 binding.lease_id,
                 binding.helper_epoch,
             ),
+            binding,
+            product_version: hello.product_version.clone(),
         })
+    }
+
+    /// Return the helper incarnation authenticated by the platform peer proof
+    /// and the daemon's non-serializable principal. Callers must retain the
+    /// session itself as the capability; scalar wire data alone is untrusted.
+    #[must_use]
+    pub(crate) const fn binding(&self) -> crate::helper::HelperSessionBinding {
+        self.binding
+    }
+
+    #[must_use]
+    pub(crate) fn product_version(&self) -> &str {
+        &self.product_version
     }
 
     pub(crate) fn verify_receipt(

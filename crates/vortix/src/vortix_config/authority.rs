@@ -176,6 +176,22 @@ impl EnrollmentRecord {
     pub(crate) const fn reserved_epoch(&self) -> Option<AuthorityEpoch> {
         self.reserved_epoch
     }
+
+    #[must_use]
+    pub(crate) const fn active_epoch(&self) -> Option<AuthorityEpoch> {
+        self.active_epoch
+    }
+
+    #[must_use]
+    pub(crate) fn matches_candidate_versions(
+        &self,
+        daemon_version: &str,
+        helper_version: &str,
+    ) -> bool {
+        self.candidate.as_ref().is_some_and(|candidate| {
+            candidate.daemon_version == daemon_version && candidate.helper_version == helper_version
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -253,11 +269,32 @@ impl EnrollmentStore {
     pub(crate) fn acquire_standard_authority(&self) -> Result<AuthorityLease, EnrollmentError> {
         let lease = self.acquire_authority(AuthorityKind::Standard)?;
         let record = self.load()?;
+        if record.phase == EnrollmentPhase::CandidateReady && record.reserved_epoch.is_some() {
+            return Err(EnrollmentError::ActivationRecoveryRequired);
+        }
         if matches!(
             record.phase,
             EnrollmentPhase::Enrolled | EnrollmentPhase::TakeoverPending
         ) {
             return Err(EnrollmentError::RemoteAuthoritySelected {
+                phase: record.phase,
+            });
+        }
+        Ok(lease)
+    }
+
+    /// Acquire the remote writer only after a durable activation reservation,
+    /// or while resuming an already enrolled/takeover-pending authority.
+    pub(crate) fn acquire_background_authority(&self) -> Result<AuthorityLease, EnrollmentError> {
+        let lease = self.acquire_authority(AuthorityKind::Background)?;
+        let record = self.load()?;
+        let eligible = matches!(
+            record.phase,
+            EnrollmentPhase::Enrolled | EnrollmentPhase::TakeoverPending
+        ) || (record.phase == EnrollmentPhase::CandidateReady
+            && record.reserved_epoch.is_some());
+        if !eligible {
+            return Err(EnrollmentError::BackgroundAuthorityNotReady {
                 phase: record.phase,
             });
         }
@@ -360,6 +397,86 @@ impl EnrollmentStore {
         next.active_epoch = None;
         next.candidate = None;
         self.persist_next(next)
+    }
+
+    /// Finalize only the exact epoch reserved before Standard released the
+    /// shared writer lock. The daemon coordinator calls this after live
+    /// service/helper identity and reconciliation checks pass.
+    pub(crate) fn commit_enrolled(
+        &self,
+        lease: &AuthorityLease,
+        expected_generation: u64,
+        verified_epoch: AuthorityEpoch,
+    ) -> Result<EnrollmentRecord, EnrollmentError> {
+        self.require_lease(lease, AuthorityKind::Background)?;
+        self.transition(
+            expected_generation,
+            EnrollmentPhase::CandidateReady,
+            |next| {
+                let reserved = next
+                    .reserved_epoch
+                    .ok_or(EnrollmentError::BackgroundAuthorityNotReady { phase: next.phase })?;
+                if reserved != verified_epoch {
+                    return Err(EnrollmentError::AuthorityEpochMismatch {
+                        reserved,
+                        verified: verified_epoch,
+                    });
+                }
+                next.phase = EnrollmentPhase::Enrolled;
+                next.active_epoch = Some(reserved);
+                next.reserved_epoch = None;
+                Ok(())
+            },
+        )
+    }
+
+    pub(crate) fn begin_takeover(
+        &self,
+        lease: &AuthorityLease,
+        expected_generation: u64,
+    ) -> Result<EnrollmentRecord, EnrollmentError> {
+        self.require_lease(lease, AuthorityKind::Background)?;
+        self.transition(expected_generation, EnrollmentPhase::Enrolled, |next| {
+            next.phase = EnrollmentPhase::TakeoverPending;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn rollback_takeover(
+        &self,
+        lease: &AuthorityLease,
+        expected_generation: u64,
+    ) -> Result<EnrollmentRecord, EnrollmentError> {
+        self.require_lease(lease, AuthorityKind::Background)?;
+        self.transition(
+            expected_generation,
+            EnrollmentPhase::TakeoverPending,
+            |next| {
+                next.phase = EnrollmentPhase::Enrolled;
+                Ok(())
+            },
+        )
+    }
+
+    /// Complete explicit verified takeover only after the Background daemon
+    /// and helper are inactive and owned resources are transferred or absent.
+    pub(crate) fn complete_unenrollment(
+        &self,
+        lease: &AuthorityLease,
+        expected_generation: u64,
+    ) -> Result<EnrollmentRecord, EnrollmentError> {
+        self.require_lease(lease, AuthorityKind::Standard)?;
+        self.transition(
+            expected_generation,
+            EnrollmentPhase::TakeoverPending,
+            |next| {
+                next.phase = EnrollmentPhase::Unenrolled;
+                next.active_epoch = None;
+                next.reserved_epoch = None;
+                next.candidate = None;
+                Ok(())
+            },
+        )
     }
 
     fn transition(
@@ -559,6 +676,17 @@ pub(crate) enum EnrollmentError {
     #[error("another Vortix authority already owns the shared writer lease")]
     AuthorityBusy,
     #[error(
+        "an interrupted Background activation must be recovered before Standard mutation resumes"
+    )]
+    ActivationRecoveryRequired,
+    #[error("Background authority is not eligible in enrollment phase {phase:?}")]
+    BackgroundAuthorityNotReady { phase: EnrollmentPhase },
+    #[error("verified authority epoch {verified:?} does not match reserved epoch {reserved:?}")]
+    AuthorityEpochMismatch {
+        reserved: AuthorityEpoch,
+        verified: AuthorityEpoch,
+    },
+    #[error(
         "Background authority remains selected in {phase:?}; local mutation fallback is forbidden"
     )]
     RemoteAuthoritySelected { phase: EnrollmentPhase },
@@ -639,6 +767,26 @@ mod tests {
         assert_eq!(loaded, reserved);
         assert_eq!(loaded.phase(), EnrollmentPhase::CandidateReady);
         assert!(loaded.reserved_epoch().is_some());
+    }
+
+    #[test]
+    fn interrupted_activation_requires_recovery_before_standard_can_write() {
+        let directory = tempdir().unwrap();
+        let store = EnrollmentStore::new(directory.path().join("control"));
+        let lease = store.acquire_standard_authority().unwrap();
+        let staged = store.stage(&lease, candidate()).unwrap();
+        let ready = store
+            .mark_candidate_ready(&lease, staged.generation())
+            .unwrap();
+        store
+            .reserve_enrollment(&lease, ready.generation())
+            .unwrap();
+        drop(lease);
+
+        assert!(matches!(
+            store.acquire_standard_authority(),
+            Err(EnrollmentError::ActivationRecoveryRequired)
+        ));
     }
 
     #[test]
@@ -727,5 +875,76 @@ mod tests {
             })
         ));
         assert_eq!(store.load().unwrap(), enrolled);
+    }
+
+    #[test]
+    fn background_commit_requires_reserved_epoch_and_background_lease() {
+        let directory = tempdir().unwrap();
+        let store = EnrollmentStore::new(directory.path().join("control"));
+        let standard = store.acquire_standard_authority().unwrap();
+        let staged = store.stage(&standard, candidate()).unwrap();
+        assert!(store.acquire_background_authority().is_err());
+        let ready = store
+            .mark_candidate_ready(&standard, staged.generation())
+            .unwrap();
+        let reserved = store
+            .reserve_enrollment(&standard, ready.generation())
+            .unwrap();
+        let epoch = reserved.reserved_epoch().unwrap();
+        drop(standard);
+        let background = store.acquire_background_authority().unwrap();
+
+        assert!(matches!(
+            store.commit_enrolled(
+                &background,
+                reserved.generation(),
+                AuthorityEpoch(epoch.0 + 1),
+            ),
+            Err(EnrollmentError::AuthorityEpochMismatch { .. })
+        ));
+        let enrolled = store
+            .commit_enrolled(&background, reserved.generation(), epoch)
+            .unwrap();
+        assert_eq!(enrolled.phase(), EnrollmentPhase::Enrolled);
+        assert_eq!(enrolled.active_epoch(), Some(epoch));
+    }
+
+    #[test]
+    fn takeover_rollback_and_unenrollment_preserve_epoch_fencing() {
+        let directory = tempdir().unwrap();
+        let store = EnrollmentStore::new(directory.path().join("control"));
+        let standard = store.acquire_standard_authority().unwrap();
+        let staged = store.stage(&standard, candidate()).unwrap();
+        let ready = store
+            .mark_candidate_ready(&standard, staged.generation())
+            .unwrap();
+        let reserved = store
+            .reserve_enrollment(&standard, ready.generation())
+            .unwrap();
+        let epoch = reserved.reserved_epoch().unwrap();
+        drop(standard);
+        let background = store.acquire_background_authority().unwrap();
+        let enrolled = store
+            .commit_enrolled(&background, reserved.generation(), epoch)
+            .unwrap();
+        let pending = store
+            .begin_takeover(&background, enrolled.generation())
+            .unwrap();
+        let restored = store
+            .rollback_takeover(&background, pending.generation())
+            .unwrap();
+        assert_eq!(restored.phase(), EnrollmentPhase::Enrolled);
+        let pending = store
+            .begin_takeover(&background, restored.generation())
+            .unwrap();
+        drop(background);
+        let takeover = store.acquire_authority(AuthorityKind::Standard).unwrap();
+        let unenrolled = store
+            .complete_unenrollment(&takeover, pending.generation())
+            .unwrap();
+        assert_eq!(unenrolled.phase(), EnrollmentPhase::Unenrolled);
+        assert_eq!(unenrolled.last_issued_epoch(), epoch);
+        drop(takeover);
+        store.acquire_standard_authority().unwrap();
     }
 }

@@ -561,6 +561,17 @@ pub struct TrustedDaemonPrincipal {
 }
 
 impl TrustedDaemonPrincipal {
+    #[cfg(test)]
+    pub(crate) fn test_fixture(authority_epoch: AuthorityEpoch, lease_id: LeaseId) -> Self {
+        Self {
+            owner_uid: 501,
+            authority_epoch,
+            boot_scope: BootScope::new([7; 16]),
+            lease_id,
+            service_binding: OperationDigest::of_bytes(b"test-service-binding"),
+        }
+    }
+
     #[must_use]
     pub const fn authority_epoch(&self) -> AuthorityEpoch {
         self.authority_epoch

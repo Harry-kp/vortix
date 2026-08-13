@@ -546,6 +546,13 @@ pub(crate) struct VerifiedHelperPeer {
     private: (),
 }
 
+#[cfg(test)]
+impl VerifiedHelperPeer {
+    pub(crate) const fn test_fixture() -> Self {
+        Self { private: () }
+    }
+}
+
 #[allow(dead_code, reason = "U13 invokes this with kernel/filesystem facts")]
 pub(super) fn verify_helper_peer(
     owner_uid: u32,

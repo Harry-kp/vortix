@@ -17,6 +17,7 @@
 
 pub mod client;
 pub mod diagnostics;
+pub(crate) mod enrollment;
 pub(crate) mod helper_client;
 pub mod passive;
 mod server;
