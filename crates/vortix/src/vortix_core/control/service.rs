@@ -3099,11 +3099,13 @@ fn capture_topology_policy(
         operation_id: operation.id.clone(),
         deadline,
         prior: supervisor.applied_topology().unwrap_or_else(|| {
+            // A fresh one-shot client has no supervisor history; its initial
+            // mode is the persisted firewall baseline, never an implicit Off.
             build_topology_state(
                 prior_profiles,
                 &snapshot.observed.tunnels,
                 config,
-                crate::vortix_core::state::killswitch::KillSwitchMode::Off,
+                config.initial_kill_switch_mode,
             )
         }),
         target: build_topology_state(
