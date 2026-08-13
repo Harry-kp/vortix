@@ -15,12 +15,15 @@ use std::time::Duration;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-use super::enrollment_store::RootEnrollmentStore;
+use super::enrollment_store::{EnrollmentStoreError, RootEnrollmentAuthority, RootEnrollmentStore};
+use super::platform_identity::verify_daemon_service;
 use super::protocol::{
-    encode_response_frame, negotiate_staged, HelperError, HelperOp, HelperRequest, HelperResponse,
-    HelperResult, MAX_HELPER_FRAME_BYTES,
+    encode_response_frame, negotiate_candidate, negotiate_enrolled, negotiate_staged, HelperError,
+    HelperOp, HelperRequest, HelperResponse, HelperResult, HelperSessionBinding,
+    MAX_HELPER_FRAME_BYTES, STAGED_CAPABILITIES,
 };
 use super::validate::{PlatformLayout, HELPER_SOCKET_DIR_MODE, HELPER_SOCKET_MODE};
+use crate::vortix_core::privileged::{HelperEpoch, PlatformVerifiedAuthority, RootAuthorityLedger};
 
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -44,6 +47,7 @@ pub fn serve_staged_helper() -> Result<(), HelperTransportError> {
     std::fs::set_permissions(socket, std::fs::Permissions::from_mode(HELPER_SOCKET_MODE))?;
     chown_socket(socket, owner_uid)?;
     validate_socket(socket, owner_uid)?;
+    let helper_epoch = random_helper_epoch()?;
 
     for connection in listener.incoming() {
         let mut connection = connection?;
@@ -53,9 +57,105 @@ pub fn serve_staged_helper() -> Result<(), HelperTransportError> {
         if peer.uid != owner_uid {
             continue;
         }
-        let _ = serve_staged_connection(&mut connection, owner_uid, peer.pid);
+        let authority = match RootEnrollmentStore::root_owned(layout).authority_for_owner(owner_uid)
+        {
+            Ok(authority) => Some(authority),
+            Err(EnrollmentStoreError::NotEnrolled) => None,
+            Err(_) => continue,
+        };
+        let result = if let Some(authority) = authority {
+            serve_authority_connection(
+                &mut connection,
+                owner_uid,
+                peer.uid,
+                peer.pid,
+                helper_epoch,
+                authority,
+            )
+        } else {
+            serve_staged_connection(&mut connection, owner_uid, peer.pid)
+        };
+        let _ = result;
     }
     Ok(())
+}
+
+fn serve_authority_connection(
+    stream: &mut UnixStream,
+    owner_uid: u32,
+    observed_uid: u32,
+    process_id: Option<u32>,
+    helper_epoch: HelperEpoch,
+    authority: RootEnrollmentAuthority,
+) -> Result<(), HelperTransportError> {
+    let request = read_request(stream)?;
+    let result = match request.op {
+        HelperOp::Handshake(hello) => {
+            let process_id = process_id.ok_or(HelperTransportError::PeerCredentials)?;
+            let reservation = authority.reservation();
+            let verified = verify_daemon_service(
+                owner_uid,
+                observed_uid,
+                process_id,
+                &hello.service,
+                reservation,
+            )
+            .map_err(|_| HelperTransportError::PlatformIdentity)?;
+            negotiate_verified_authority(
+                &hello,
+                verified,
+                reservation,
+                helper_epoch,
+                authority.is_enrolled(),
+            )
+        }
+        HelperOp::Execute(_) => Err(HelperError::ExecutionUnavailable),
+    };
+    let response = HelperResponse {
+        id: request.id,
+        result,
+    };
+    stream.write_all(&encode_response_frame(&response)?)?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn negotiate_verified_authority(
+    hello: &super::protocol::HelperClientHello,
+    verified: PlatformVerifiedAuthority,
+    reservation: super::enrollment_store::AuthorityReservation,
+    helper_epoch: HelperEpoch,
+    enrolled: bool,
+) -> Result<HelperResult, HelperError> {
+    let _root = RootAuthorityLedger::from_platform_verified(
+        verified,
+        reservation.boot_scope(),
+        reservation.authority_epoch(),
+        reservation.lease_id(),
+    )
+    .map_err(|_| HelperError::AuthenticationFailed)?;
+    let binding = HelperSessionBinding {
+        authority_epoch: reservation.authority_epoch(),
+        lease_id: reservation.lease_id(),
+        helper_epoch,
+    };
+    if enrolled {
+        negotiate_enrolled(hello, binding, &STAGED_CAPABILITIES).map(HelperResult::Handshake)
+    } else {
+        negotiate_candidate(hello, binding).map(HelperResult::Handshake)
+    }
+}
+
+fn random_helper_epoch() -> Result<HelperEpoch, HelperTransportError> {
+    let mut source = File::open("/dev/urandom")?;
+    for _ in 0..8 {
+        let mut bytes = [0_u8; 8];
+        source.read_exact(&mut bytes)?;
+        if let Ok(epoch) = HelperEpoch::new(u64::from_be_bytes(bytes)) {
+            return Ok(epoch);
+        }
+    }
+    Err(HelperTransportError::Randomness)
 }
 
 fn serve_staged_connection(
@@ -223,6 +323,10 @@ pub enum HelperTransportError {
     FrameTooLarge,
     #[error("the helper request is malformed")]
     MalformedRequest,
+    #[error("the helper could not establish a fresh process incarnation")]
+    Randomness,
+    #[error("the daemon service identity was not verified")]
+    PlatformIdentity,
     #[error("the helper response could not be encoded: {0}")]
     Frame(#[from] crate::vortix_core::ipc::FrameError),
     #[error("helper transport I/O failed: {0}")]
@@ -249,6 +353,22 @@ mod tests {
                 .unwrap(),
             vec![HelperCapability::Handshake],
         )
+    }
+
+    fn verified(uid: u32, pid: u32) -> PlatformVerifiedAuthority {
+        let digest = OperationDigest::of_bytes(b"daemon");
+        let claim = ServiceInstanceClaim::systemd(pid, 9, digest, [7; 32]).unwrap();
+        let facts = VerifiedServiceFacts::from_os_verifier(
+            ServiceManager::Systemd,
+            uid,
+            pid,
+            9,
+            digest,
+            [7; 32],
+            true,
+            true,
+        );
+        verify_service_instance(uid, &claim, &facts).unwrap()
     }
 
     fn exchange(request: &HelperRequest, owner_uid: u32, peer_pid: Option<u32>) -> HelperResponse {
@@ -326,5 +446,59 @@ mod tests {
         };
         let response = exchange(&request, uid, None);
         assert!(matches!(response.result, Err(HelperError::NotEnrolled)));
+    }
+
+    #[test]
+    fn verified_candidate_exposes_binding_but_no_execution_capability() {
+        let uid = 501;
+        let reservation = super::super::enrollment_store::AuthorityReservation::test_fixture(
+            AuthorityEpoch(3),
+            BootScope::new([4; 16]),
+            LeaseId::new([5; 32]),
+            [7; 32],
+        );
+        let candidate = negotiate_verified_authority(
+            &hello(42, uid),
+            verified(uid, 42),
+            reservation,
+            HelperEpoch::new(8).unwrap(),
+            false,
+        )
+        .unwrap();
+        let HelperResult::Handshake(candidate) = candidate else {
+            panic!("expected helper handshake");
+        };
+        assert_eq!(
+            candidate.authority_mode,
+            super::super::protocol::HelperAuthorityMode::Candidate
+        );
+        assert_eq!(
+            candidate.enabled_capabilities,
+            vec![HelperCapability::Handshake]
+        );
+        assert_eq!(
+            candidate.session.unwrap().authority_epoch,
+            AuthorityEpoch(3)
+        );
+
+        let enrolled = negotiate_verified_authority(
+            &hello(42, uid),
+            verified(uid, 42),
+            reservation,
+            HelperEpoch::new(8).unwrap(),
+            true,
+        )
+        .unwrap();
+        let HelperResult::Handshake(enrolled) = enrolled else {
+            panic!("expected helper handshake");
+        };
+        assert_eq!(
+            enrolled.authority_mode,
+            super::super::protocol::HelperAuthorityMode::Enrolled
+        );
+        assert_eq!(
+            enrolled.enabled_capabilities,
+            vec![HelperCapability::Handshake]
+        );
     }
 }

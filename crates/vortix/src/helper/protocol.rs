@@ -77,6 +77,7 @@ impl HelperClientHello {
 #[serde(rename_all = "snake_case")]
 pub enum HelperAuthorityMode {
     Staged,
+    Candidate,
     Enrolled,
 }
 
@@ -154,6 +155,8 @@ pub enum HelperError {
     CapabilityUnavailable { capability: HelperCapability },
     #[error("helper authority is staged but not enrolled")]
     NotEnrolled,
+    #[error("helper execution remains disabled until every privileged adapter is verified")]
+    ExecutionUnavailable,
     #[error("malformed helper request: {reason}")]
     Malformed { reason: String },
     #[error("helper frame is too large: {size} > {max}")]
@@ -180,6 +183,16 @@ pub(crate) fn negotiate_enrolled(
 ) -> Result<HelperServerHello, HelperError> {
     let mut negotiated = negotiate_common(hello, enabled_capabilities)?;
     negotiated.authority_mode = HelperAuthorityMode::Enrolled;
+    negotiated.session = Some(binding);
+    Ok(negotiated)
+}
+
+pub(crate) fn negotiate_candidate(
+    hello: &HelperClientHello,
+    binding: HelperSessionBinding,
+) -> Result<HelperServerHello, HelperError> {
+    let mut negotiated = negotiate_common(hello, &STAGED_CAPABILITIES)?;
+    negotiated.authority_mode = HelperAuthorityMode::Candidate;
     negotiated.session = Some(binding);
     Ok(negotiated)
 }

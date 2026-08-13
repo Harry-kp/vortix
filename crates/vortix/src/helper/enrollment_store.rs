@@ -27,11 +27,13 @@ enum EnrollmentPhase {
         authority_epoch: AuthorityEpoch,
         boot_scope: BootScope,
         lease_id: LeaseId,
+        manager_instance_nonce: [u8; 32],
     },
     Enrolled {
         authority_epoch: AuthorityEpoch,
         boot_scope: BootScope,
         lease_id: LeaseId,
+        manager_instance_nonce: [u8; 32],
     },
 }
 
@@ -96,16 +98,19 @@ impl RootEnrollmentRecord {
                 authority_epoch,
                 boot_scope,
                 lease_id,
+                manager_instance_nonce,
             }
             | EnrollmentPhase::Enrolled {
                 authority_epoch,
                 boot_scope,
                 lease_id,
+                manager_instance_nonce,
             } => {
                 if authority_epoch.0 == 0
                     || authority_epoch != self.last_authority_epoch
                     || boot_scope == BootScope::new([0; 16])
                     || lease_id == LeaseId::new([0; 32])
+                    || manager_instance_nonce == [0; 32]
                 {
                     return Err(EnrollmentStoreError::Corrupt);
                 }
@@ -120,15 +125,18 @@ impl RootEnrollmentRecord {
                 authority_epoch,
                 boot_scope,
                 lease_id,
+                manager_instance_nonce,
             }
             | EnrollmentPhase::Enrolled {
                 authority_epoch,
                 boot_scope,
                 lease_id,
+                manager_instance_nonce,
             } => Some(AuthorityReservation {
                 authority_epoch,
                 boot_scope,
                 lease_id,
+                manager_instance_nonce,
             }),
             EnrollmentPhase::Staged => None,
         }
@@ -140,9 +148,41 @@ pub(crate) struct AuthorityReservation {
     authority_epoch: AuthorityEpoch,
     boot_scope: BootScope,
     lease_id: LeaseId,
+    manager_instance_nonce: [u8; 32],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RootEnrollmentAuthority {
+    reservation: AuthorityReservation,
+    enrolled: bool,
+}
+
+impl RootEnrollmentAuthority {
+    pub(crate) const fn reservation(self) -> AuthorityReservation {
+        self.reservation
+    }
+
+    pub(crate) const fn is_enrolled(self) -> bool {
+        self.enrolled
+    }
 }
 
 impl AuthorityReservation {
+    #[cfg(test)]
+    pub(crate) const fn test_fixture(
+        authority_epoch: AuthorityEpoch,
+        boot_scope: BootScope,
+        lease_id: LeaseId,
+        manager_instance_nonce: [u8; 32],
+    ) -> Self {
+        Self {
+            authority_epoch,
+            boot_scope,
+            lease_id,
+            manager_instance_nonce,
+        }
+    }
+
     pub(crate) const fn authority_epoch(self) -> AuthorityEpoch {
         self.authority_epoch
     }
@@ -153,6 +193,10 @@ impl AuthorityReservation {
 
     pub(crate) const fn lease_id(self) -> LeaseId {
         self.lease_id
+    }
+
+    pub(crate) const fn manager_instance_nonce(self) -> [u8; 32] {
+        self.manager_instance_nonce
     }
 }
 
@@ -209,13 +253,37 @@ impl RootEnrollmentStore {
             .ok_or(EnrollmentStoreError::NotStaged)
     }
 
+    pub(crate) fn authority_for_owner(
+        &self,
+        owner_uid: u32,
+    ) -> Result<RootEnrollmentAuthority, EnrollmentStoreError> {
+        let _lock = self.store.lock_sibling(c"enrollment.lock")?;
+        let record = self
+            .load_optional()?
+            .ok_or(EnrollmentStoreError::NotStaged)?;
+        if record.owner_uid != owner_uid {
+            return Err(EnrollmentStoreError::ConflictingEnrollment);
+        }
+        let reservation = record
+            .reservation()
+            .ok_or(EnrollmentStoreError::NotEnrolled)?;
+        Ok(RootEnrollmentAuthority {
+            reservation,
+            enrolled: matches!(record.phase, EnrollmentPhase::Enrolled { .. }),
+        })
+    }
+
     pub(crate) fn reserve(
         &self,
         request: &InstallRequest,
         boot_scope: BootScope,
         lease_id: LeaseId,
+        manager_instance_nonce: [u8; 32],
     ) -> Result<AuthorityReservation, EnrollmentStoreError> {
-        if boot_scope == BootScope::new([0; 16]) || lease_id == LeaseId::new([0; 32]) {
+        if boot_scope == BootScope::new([0; 16])
+            || lease_id == LeaseId::new([0; 32])
+            || manager_instance_nonce == [0; 32]
+        {
             return Err(EnrollmentStoreError::InvalidLease);
         }
         let _lock = self.store.lock_sibling(c"enrollment.lock")?;
@@ -233,6 +301,7 @@ impl RootEnrollmentStore {
             authority_epoch: AuthorityEpoch(next),
             boot_scope,
             lease_id,
+            manager_instance_nonce,
         };
         record.generation = record
             .generation
@@ -243,6 +312,7 @@ impl RootEnrollmentStore {
             authority_epoch: reservation.authority_epoch,
             boot_scope,
             lease_id,
+            manager_instance_nonce,
         };
         self.persist(&record)?;
         Ok(reservation)
@@ -270,8 +340,42 @@ impl RootEnrollmentStore {
             authority_epoch: reservation.authority_epoch,
             boot_scope: reservation.boot_scope,
             lease_id: reservation.lease_id,
+            manager_instance_nonce: reservation.manager_instance_nonce,
         };
         self.persist(&record)
+    }
+
+    pub(crate) fn commit_epoch(
+        &self,
+        request: &InstallRequest,
+        authority_epoch: AuthorityEpoch,
+    ) -> Result<AuthorityReservation, EnrollmentStoreError> {
+        if authority_epoch.0 == 0 {
+            return Err(EnrollmentStoreError::ReservationMismatch);
+        }
+        let _lock = self.store.lock_sibling(c"enrollment.lock")?;
+        let mut record = self.load_required_for(request)?;
+        let reservation = record
+            .reservation()
+            .filter(|reservation| reservation.authority_epoch == authority_epoch)
+            .ok_or(EnrollmentStoreError::ReservationMismatch)?;
+        match record.phase {
+            EnrollmentPhase::Enrolled { .. } => return Ok(reservation),
+            EnrollmentPhase::Reserved { .. } => {}
+            EnrollmentPhase::Staged => return Err(EnrollmentStoreError::ReservationMismatch),
+        }
+        record.generation = record
+            .generation
+            .checked_add(1)
+            .ok_or(EnrollmentStoreError::GenerationExhausted)?;
+        record.phase = EnrollmentPhase::Enrolled {
+            authority_epoch: reservation.authority_epoch,
+            boot_scope: reservation.boot_scope,
+            lease_id: reservation.lease_id,
+            manager_instance_nonce: reservation.manager_instance_nonce,
+        };
+        self.persist(&record)?;
+        Ok(reservation)
     }
 
     pub(crate) fn rotate_boot_lease(
@@ -279,8 +383,12 @@ impl RootEnrollmentStore {
         request: &InstallRequest,
         boot_scope: BootScope,
         lease_id: LeaseId,
+        manager_instance_nonce: [u8; 32],
     ) -> Result<AuthorityReservation, EnrollmentStoreError> {
-        if boot_scope == BootScope::new([0; 16]) || lease_id == LeaseId::new([0; 32]) {
+        if boot_scope == BootScope::new([0; 16])
+            || lease_id == LeaseId::new([0; 32])
+            || manager_instance_nonce == [0; 32]
+        {
             return Err(EnrollmentStoreError::InvalidLease);
         }
         let _lock = self.store.lock_sibling(c"enrollment.lock")?;
@@ -298,6 +406,7 @@ impl RootEnrollmentStore {
             authority_epoch: current.authority_epoch,
             boot_scope,
             lease_id,
+            manager_instance_nonce,
         };
         record.generation = record
             .generation
@@ -307,6 +416,7 @@ impl RootEnrollmentStore {
             authority_epoch: rotated.authority_epoch,
             boot_scope,
             lease_id,
+            manager_instance_nonce,
         };
         self.persist(&record)?;
         Ok(rotated)
@@ -451,13 +561,23 @@ mod tests {
         store.stage(&request, &manifest).unwrap();
 
         let first = store
-            .reserve(&request, BootScope::new([1; 16]), LeaseId::new([2; 32]))
+            .reserve(
+                &request,
+                BootScope::new([1; 16]),
+                LeaseId::new([2; 32]),
+                [3; 32],
+            )
             .unwrap();
         assert_eq!(first.authority_epoch(), AuthorityEpoch(1));
         store.revoke(&request, first).unwrap();
 
         let second = store
-            .reserve(&request, BootScope::new([1; 16]), LeaseId::new([3; 32]))
+            .reserve(
+                &request,
+                BootScope::new([1; 16]),
+                LeaseId::new([3; 32]),
+                [4; 32],
+            )
             .unwrap();
         assert_eq!(second.authority_epoch(), AuthorityEpoch(2));
         assert_ne!(first.lease_id(), second.lease_id());
@@ -470,27 +590,58 @@ mod tests {
         let request = request(&manifest, 8);
         store.stage(&request, &manifest).unwrap();
         let reserved = store
-            .reserve(&request, BootScope::new([1; 16]), LeaseId::new([2; 32]))
+            .reserve(
+                &request,
+                BootScope::new([1; 16]),
+                LeaseId::new([2; 32]),
+                [3; 32],
+            )
             .unwrap();
         assert_eq!(
             store
-                .reserve(&request, BootScope::new([9; 16]), LeaseId::new([9; 32]))
+                .reserve(
+                    &request,
+                    BootScope::new([9; 16]),
+                    LeaseId::new([9; 32]),
+                    [9; 32],
+                )
                 .unwrap(),
             reserved
         );
         store.commit(&request, reserved).unwrap();
         store.commit(&request, reserved).unwrap();
+        assert_eq!(
+            store
+                .commit_epoch(&request, reserved.authority_epoch())
+                .unwrap(),
+            reserved
+        );
+        assert!(matches!(
+            store.commit_epoch(&request, AuthorityEpoch(99)),
+            Err(EnrollmentStoreError::ReservationMismatch)
+        ));
 
         let same_boot = store
-            .rotate_boot_lease(&request, BootScope::new([1; 16]), LeaseId::new([7; 32]))
+            .rotate_boot_lease(
+                &request,
+                BootScope::new([1; 16]),
+                LeaseId::new([7; 32]),
+                [8; 32],
+            )
             .unwrap();
         assert_eq!(same_boot, reserved);
         let rotated = store
-            .rotate_boot_lease(&request, BootScope::new([4; 16]), LeaseId::new([5; 32]))
+            .rotate_boot_lease(
+                &request,
+                BootScope::new([4; 16]),
+                LeaseId::new([5; 32]),
+                [6; 32],
+            )
             .unwrap();
         assert_eq!(rotated.authority_epoch(), reserved.authority_epoch());
         assert_eq!(rotated.boot_scope(), BootScope::new([4; 16]));
         assert_eq!(rotated.lease_id(), LeaseId::new([5; 32]));
+        assert_eq!(rotated.manager_instance_nonce(), [6; 32]);
     }
 
     #[test]
@@ -522,7 +673,8 @@ mod tests {
             store.reserve(
                 &install_request,
                 BootScope::new([1; 16]),
-                LeaseId::new([2; 32])
+                LeaseId::new([2; 32]),
+                [3; 32]
             ),
             Err(EnrollmentStoreError::Corrupt)
         ));

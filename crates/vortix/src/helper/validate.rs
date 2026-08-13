@@ -105,6 +105,22 @@ impl PlatformLayout {
     }
 
     #[must_use]
+    pub const fn daemon_service_definition(self) -> &'static str {
+        match self {
+            Self::Linux => "/usr/lib/systemd/system/vortix-daemon@.service",
+            Self::MacOs => "/Library/LaunchDaemons/com.vortix.daemon.plist",
+        }
+    }
+
+    #[must_use]
+    pub const fn daemon_environment(self) -> &'static str {
+        match self {
+            Self::Linux => "/var/lib/vortix/daemon.env",
+            Self::MacOs => "/Library/Application Support/Vortix/daemon.env",
+        }
+    }
+
+    #[must_use]
     pub const fn root_state_dir_mode(self) -> u32 {
         match self {
             Self::Linux => 0o700,
@@ -320,7 +336,7 @@ impl InstallManifest {
         dead_code,
         reason = "U12 artifact verifier consumes the signed manifest"
     )]
-    fn digest_for(&self, kind: ArtifactKind) -> OperationDigest {
+    pub(super) fn digest_for(&self, kind: ArtifactKind) -> OperationDigest {
         match kind {
             ArtifactKind::Daemon => self.daemon_digest,
             ArtifactKind::Helper => self.helper_digest,
