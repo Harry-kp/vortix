@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use thiserror::Error;
 
-use super::{HELPER_LEDGER_MODE, HELPER_RUNTIME_DIR_MODE};
+use super::HELPER_LEDGER_MODE;
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -28,6 +28,7 @@ pub(super) struct RootOwnedJsonStore {
     parent: PathBuf,
     name: CString,
     expected_owner_uid: u32,
+    expected_parent_mode: u32,
     max_bytes: u64,
     temporary_prefix: &'static str,
 }
@@ -36,6 +37,7 @@ impl RootOwnedJsonStore {
     pub(super) fn new(
         path: impl Into<PathBuf>,
         expected_owner_uid: u32,
+        expected_parent_mode: u32,
         max_bytes: u64,
         temporary_prefix: &'static str,
     ) -> Result<Self, RootStoreError> {
@@ -57,6 +59,7 @@ impl RootOwnedJsonStore {
             parent,
             name,
             expected_owner_uid,
+            expected_parent_mode,
             max_bytes,
             temporary_prefix,
         })
@@ -133,7 +136,7 @@ impl RootOwnedJsonStore {
         let metadata = directory.metadata()?;
         if !metadata.is_dir()
             || metadata.uid() != self.expected_owner_uid
-            || metadata.permissions().mode() & 0o777 != HELPER_RUNTIME_DIR_MODE
+            || metadata.permissions().mode() & 0o777 != self.expected_parent_mode
         {
             return Err(RootStoreError::UnsafePath);
         }
@@ -273,13 +276,18 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         std::fs::set_permissions(
             directory.path(),
-            std::fs::Permissions::from_mode(HELPER_RUNTIME_DIR_MODE),
+            std::fs::Permissions::from_mode(super::super::HELPER_RUNTIME_DIR_MODE),
         )
         .unwrap();
         let uid = crate::utils::effective_user_group_ids().0;
-        let store =
-            RootOwnedJsonStore::new(directory.path().join("state.json"), uid, 1024, "state")
-                .unwrap();
+        let store = RootOwnedJsonStore::new(
+            directory.path().join("state.json"),
+            uid,
+            super::super::HELPER_RUNTIME_DIR_MODE,
+            1024,
+            "state",
+        )
+        .unwrap();
         (directory, store)
     }
 
@@ -313,6 +321,7 @@ mod tests {
         let linked = RootOwnedJsonStore::new(
             link.join("state.json"),
             crate::utils::effective_user_group_ids().0,
+            super::super::HELPER_RUNTIME_DIR_MODE,
             1024,
             "state",
         )

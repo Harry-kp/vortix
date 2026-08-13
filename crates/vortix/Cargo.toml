@@ -44,6 +44,10 @@ path = "src/main.rs"
 name = "vortix-helper"
 path = "src/bin/vortix-helper.rs"
 
+[[bin]]
+name = "vortix-bootstrap"
+path = "src/bin/vortix-bootstrap.rs"
+
 [dependencies]
 # TUI Framework
 ratatui = { workspace = true }
