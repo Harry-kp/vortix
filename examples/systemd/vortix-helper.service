@@ -2,14 +2,14 @@
 Description=Vortix privileged helper (inactive U11 template)
 Documentation=https://github.com/Harry-kp/vortix
 After=local-fs.target
-ConditionPathExists=/var/lib/vortix/enrollment/enrolled
+ConditionPathExists=/var/lib/vortix/enrollment.json
 
 [Service]
 Type=simple
 User=root
 Group=root
 RuntimeDirectory=vortix
-RuntimeDirectoryMode=0700
+RuntimeDirectoryMode=0711
 StateDirectory=vortix
 StateDirectoryMode=0700
 ExecStart=/usr/libexec/vortix/vortix-helper --serve
@@ -18,5 +18,5 @@ UMask=0077
 StandardOutput=journal
 StandardError=journal
 
-# The U11 binary rejects --serve with EX_CONFIG (78). U12 implements the
-# reviewed server; U13 alone may create the enrollment marker and enable it.
+# The staged server exposes only an authenticated handshake and rejects every
+# operation. U13 alone may enable the service and promote enrolled authority.

@@ -12,6 +12,7 @@ use crate::vortix_core::privileged::{
 
 pub const INSTALL_SCHEMA_VERSION: u16 = 1;
 pub const HELPER_SOCKET_MODE: u32 = 0o600;
+pub const HELPER_SOCKET_DIR_MODE: u32 = 0o711;
 pub const HELPER_RUNTIME_DIR_MODE: u32 = 0o700;
 pub const HELPER_LEDGER_MODE: u32 = 0o600;
 

@@ -200,7 +200,7 @@ fn install_wire_rejects_unknown_fields_root_owner_and_replay_shape() {
 }
 
 #[test]
-fn staged_binary_has_no_serve_or_operation_entrypoint() {
+fn staged_binary_serves_only_when_root_enrollment_state_exists() {
     let helper = env!("CARGO_BIN_EXE_vortix-helper");
     let version = std::process::Command::new(helper) // xtask:allow-subprocess: black-box staged binary test
         .arg("--version")
@@ -209,7 +209,14 @@ fn staged_binary_has_no_serve_or_operation_entrypoint() {
     assert!(version.status.success());
     assert!(String::from_utf8_lossy(&version.stdout).contains("staged, unenrolled"));
 
-    for argument in ["--serve", "execute", "install"] {
+    let serve = std::process::Command::new(helper) // xtask:allow-subprocess: black-box staged binary test
+        .arg("--serve")
+        .output()
+        .unwrap();
+    assert_eq!(serve.status.code(), Some(78));
+    assert!(String::from_utf8_lossy(&serve.stderr).contains("refused service startup"));
+
+    for argument in ["execute", "install"] {
         let output = std::process::Command::new(helper) // xtask:allow-subprocess: black-box staged binary test
             .arg(argument)
             .output()

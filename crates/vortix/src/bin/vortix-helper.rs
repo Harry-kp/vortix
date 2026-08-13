@@ -1,5 +1,5 @@
-//! Staged privileged-helper artifact. U11 intentionally exposes no server or
-//! privileged operation entrypoint.
+//! Privileged-helper entrypoint. Before enrollment it serves only the staged
+//! handshake and rejects every operation.
 
 fn main() {
     let mut args = std::env::args_os();
@@ -11,10 +11,14 @@ fn main() {
                 env!("CARGO_PKG_VERSION")
             );
         }
+        (Some(arg), None) if arg == "--serve" => {
+            if let Err(error) = vortix::helper::serve_staged_helper() {
+                eprintln!("vortix-helper refused service startup: {error}");
+                std::process::exit(78);
+            }
+        }
         _ => {
-            eprintln!(
-                "vortix-helper is staged but not enrolled; it cannot serve or execute operations"
-            );
+            eprintln!("usage: vortix-helper --version|--serve");
             std::process::exit(78);
         }
     }
