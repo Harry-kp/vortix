@@ -19,7 +19,7 @@ use crate::helper::private_fs::{
     create_private_directory, private_directory_is_valid, DirectoryCreation,
 };
 use crate::helper::runtime::HelperRuntimeIdentity;
-use crate::helper::validate::{PlatformLayout, HELPER_RUNTIME_DIR_MODE};
+use crate::helper::validate::{PlatformLayout, HELPER_RUNTIME_DIR_MODE, HELPER_SOCKET_DIR_MODE};
 use crate::vortix_core::privileged::{OpenVpnPlan, ProfileMaterialSlot, ResourceKind, ResourceTag};
 use crate::vortix_core::profile::ProtocolKind;
 use crate::vortix_core::secret_file::{
@@ -127,7 +127,11 @@ impl OpenVpnRuntimeStager {
         let execution =
             render_helper_execution_under(plan, &self.runtime_directory, &resource_root)
                 .map_err(|_| OpenVpnStagingError::UnsafeRuntime)?;
-        validate_private_directory(&self.runtime_root, self.expected_owner_uid)?;
+        validate_directory(
+            &self.runtime_root,
+            self.expected_owner_uid,
+            HELPER_SOCKET_DIR_MODE,
+        )?;
         let mut setup = DirectorySetup::default();
         setup.create_and_validate(&resource_root, self.expected_owner_uid)?;
         setup.create_and_validate(&self.runtime_directory, self.expected_owner_uid)?;
@@ -337,11 +341,12 @@ pub(crate) enum OpenVpnStagingError {
     Io(#[from] std::io::Error),
 }
 
-fn validate_private_directory(
+fn validate_directory(
     path: &Path,
     expected_owner_uid: u32,
+    expected_mode: u32,
 ) -> Result<(), OpenVpnStagingError> {
-    if !private_directory_is_valid(path, expected_owner_uid, HELPER_RUNTIME_DIR_MODE)? {
+    if !private_directory_is_valid(path, expected_owner_uid, expected_mode)? {
         return Err(OpenVpnStagingError::UnsafeRuntime);
     }
     Ok(())
@@ -362,7 +367,7 @@ impl DirectorySetup {
         if create_private_directory(path, HELPER_RUNTIME_DIR_MODE)? == DirectoryCreation::Created {
             self.created.push(path.to_owned());
         }
-        validate_private_directory(path, expected_owner_uid)
+        validate_directory(path, expected_owner_uid, HELPER_RUNTIME_DIR_MODE)
     }
 
     fn was_created(&self, path: &Path) -> bool {
@@ -447,6 +452,7 @@ mod tests {
     use std::io::{Seek as _, SeekFrom, Write as _};
     use std::os::unix::fs::{symlink, PermissionsExt as _};
 
+    use crate::helper::HELPER_SOCKET_DIR_MODE;
     use crate::vortix_core::privileged::{
         OpenVpnAuthFactors, OpenVpnPlan, OpenVpnRemote, OpenVpnRemoteSelection, OpenVpnTransport,
         ProfileMaterialSlot, ResourceTag,
@@ -492,7 +498,11 @@ mod tests {
 
     fn fixture() -> (tempfile::TempDir, OpenVpnRuntimeStager) {
         let root = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            root.path(),
+            std::fs::Permissions::from_mode(HELPER_SOCKET_DIR_MODE),
+        )
+        .unwrap();
         let runtime = root
             .path()
             .join("resources")

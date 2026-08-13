@@ -202,6 +202,13 @@ impl RootEnrollmentStore {
         }
     }
 
+    pub(crate) fn owner_uid(&self) -> Result<u32, EnrollmentStoreError> {
+        let _lock = self.store.lock_sibling(c"enrollment.lock")?;
+        self.load_optional()?
+            .map(|record| record.owner_uid)
+            .ok_or(EnrollmentStoreError::NotStaged)
+    }
+
     pub(crate) fn reserve(
         &self,
         request: &InstallRequest,
