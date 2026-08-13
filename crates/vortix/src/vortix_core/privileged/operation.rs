@@ -70,6 +70,11 @@ impl OperationDigest {
         Self(Sha256::digest(bytes).into())
     }
 
+    #[must_use]
+    pub(crate) const fn from_sha256(digest: [u8; 32]) -> Self {
+        Self(digest)
+    }
+
     fn semantic<T: Serialize>(domain: &[u8], value: &T) -> Self {
         let mut hash = Sha256::new();
         hash.update(b"vortix\0privileged-contract\0");

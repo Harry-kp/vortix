@@ -5,6 +5,7 @@
 //! the helper binary remains staged and exposes no server entrypoint until U13
 //! enrollment.
 
+mod bootstrap;
 mod child_evidence;
 mod enrollment_store;
 mod material;
@@ -17,6 +18,9 @@ mod runtime;
 mod server;
 pub mod validate;
 
+pub use bootstrap::{
+    stage_package_from_reader, BootstrapError, BootstrapStageReceipt, MAX_INSTALL_REQUEST_BYTES,
+};
 pub use protocol::{
     decode_request_frame, decode_response_frame, encode_request_frame, encode_response_frame,
     negotiate_staged, parse_request, HelperAuthorityMode, HelperCapability, HelperClientHello,
