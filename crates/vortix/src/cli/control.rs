@@ -16,20 +16,19 @@ use crate::topology_policy::{
     topology_for_profile, CanonicalPolicyExecutor, EndpointResolutionCache,
 };
 use crate::tunnel::{CanonicalTunnelExecutor, CanonicalTunnelSettings};
+use crate::vortix_config::authority::{AuthorityLease, EnrollmentStore, STANDARD_AUTHORITY_EPOCH};
 use crate::vortix_config::control_state::FsControlStateStore;
 use crate::vortix_config::profile_store::{FsProfileStore, ProfileStore, ProfileStoreError};
 use crate::vortix_core::control::worker::TunnelRevision;
 use crate::vortix_core::control::{
-    AdmissionError, AuthorityEpoch, CommandRequest, ControlPersistenceConfig, ControlService,
-    ControlServiceConfig, ControlSnapshot, ControlStateStore, ControlSubscription,
-    ExecutionSelection, IdempotencyKey, Observation, OperationId, OperationIntent, OperationRecord,
-    OperationResult, OperationStatus, ProfileMutation, ProfileMutationApplied,
-    ProfileMutationExecutor, ProfileMutationFailure, ProfileMutationWork, ProfileTopology,
-    RealClock, RequestedTunnelState, UserCommand,
+    AdmissionError, CommandRequest, ControlPersistenceConfig, ControlService, ControlServiceConfig,
+    ControlSnapshot, ControlStateStore, ControlSubscription, ExecutionSelection, IdempotencyKey,
+    Observation, OperationId, OperationIntent, OperationRecord, OperationResult, OperationStatus,
+    ProfileMutation, ProfileMutationApplied, ProfileMutationExecutor, ProfileMutationFailure,
+    ProfileMutationWork, ProfileTopology, RealClock, RequestedTunnelState, UserCommand,
 };
 use crate::vortix_core::profile::{Profile, ProfileId};
 
-const STANDARD_AUTHORITY_EPOCH: AuthorityEpoch = AuthorityEpoch(1);
 const CONTROL_PROGRESS_INTERVAL: Duration = Duration::from_millis(50);
 /// Full process/kernel scans are intentionally slower than control progress.
 /// A completed scan can therefore be at most this old before another starts;
@@ -54,6 +53,8 @@ pub enum LocalControlError {
     Persistence(String),
     #[error("cannot open Standard-mode tunnel ownership: {0}")]
     Ownership(String),
+    #[error("cannot acquire the canonical control authority: {0}")]
+    Authority(String),
     #[error("cannot recover active profile '{profile}': {reason}")]
     Recovery { profile: String, reason: String },
     #[error("local control observation failed: {0}")]
@@ -1514,6 +1515,9 @@ pub struct LocalControlSession {
         )>,
     >,
     last_scan_started: Cell<Instant>,
+    // Declared last so the kernel writer lease outlives service/runtime
+    // teardown even when Drop performs bounded shutdown work.
+    _authority: AuthorityLease,
 }
 
 /// Lightweight Standard-mode authority for profile catalog mutations. It
@@ -1523,6 +1527,7 @@ pub(crate) struct LocalProfileMutationSession {
     service: ControlService,
     runtime: tokio::runtime::Runtime,
     profile_mutations: Arc<StandardProfileMutationExecutor>,
+    _authority: AuthorityLease,
 }
 
 impl LocalProfileMutationSession {
@@ -1538,6 +1543,9 @@ impl LocalProfileMutationSession {
             .map_err(|error| LocalControlError::Runtime(error.to_string()))?;
         let _runtime_guard = runtime.enter();
         let owner = config_owner(config_dir)?;
+        let authority = EnrollmentStore::for_owner(config_dir.join("control"), owner.0, owner.1)
+            .acquire_standard_authority()
+            .map_err(|error| LocalControlError::Authority(error.to_string()))?;
         let boot_id = crate::utils::boot_identity().ok_or_else(|| {
             LocalControlError::Persistence("OS boot identity is unavailable".into())
         })?;
@@ -1609,6 +1617,7 @@ impl LocalProfileMutationSession {
             service,
             runtime,
             profile_mutations,
+            _authority: authority,
         })
     }
 
@@ -1717,6 +1726,9 @@ impl LocalControlSession {
             .build()
             .map_err(|error| LocalControlError::Runtime(error.to_string()))?;
         let profiles = Arc::new(profiles);
+        let authority = EnrollmentStore::new(config_dir.join("control"))
+            .acquire_standard_authority()
+            .map_err(|error| LocalControlError::Authority(error.to_string()))?;
         let mut cache = EndpointResolutionCache::default();
         let (topologies, topology_errors) = load_profile_topologies(&profiles, &mut cache);
         let profile_mutations = Arc::new(StandardProfileMutationExecutor::new(
@@ -1773,6 +1785,7 @@ impl LocalControlSession {
             reported_profile_operations: RefCell::new(std::collections::BTreeSet::new()),
             pending_scan: RefCell::new(None),
             last_scan_started: Cell::new(Instant::now()),
+            _authority: authority,
         })
     }
 
@@ -1791,6 +1804,9 @@ impl LocalControlSession {
         let _runtime_guard = runtime.enter();
         let profiles = Arc::new(profiles);
         let owner = config_owner(config_dir)?;
+        let authority = EnrollmentStore::for_owner(config_dir.join("control"), owner.0, owner.1)
+            .acquire_standard_authority()
+            .map_err(|error| LocalControlError::Authority(error.to_string()))?;
         let boot_id = crate::utils::boot_identity().ok_or_else(|| {
             LocalControlError::Persistence("OS boot identity is unavailable".into())
         })?;
@@ -1975,6 +1991,7 @@ impl LocalControlSession {
             reported_profile_operations: RefCell::new(std::collections::BTreeSet::new()),
             pending_scan: RefCell::new(None),
             last_scan_started: Cell::new(Instant::now()),
+            _authority: authority,
         };
         session.runtime().block_on(async {
             session.publish_observations_from(initial_scan).await?;
@@ -3131,7 +3148,7 @@ mod tests {
             idempotency_key: IdempotencyKey::new("remote-profile-test"),
             client_id: client_id(1),
             command_digest: crate::vortix_core::control::PolicyDigest("test".into()),
-            authority_epoch: AuthorityEpoch(1),
+            authority_epoch: crate::vortix_core::control::AuthorityEpoch(1),
             desired_generation: 1,
             admitted_at_millis: 1,
             deadline_millis: 10,
@@ -3446,6 +3463,20 @@ mod tests {
 
         assert!(session.take_changed_snapshot().unwrap().is_none());
         assert!(session.take_changed_snapshot().unwrap().is_none());
+    }
+
+    #[test]
+    fn standard_sessions_cannot_overlap_the_canonical_writer_lease() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join(crate::constants::PROFILES_DIR_NAME)).unwrap();
+        let first = LocalControlSession::start_profile_test(temp.path(), Vec::new()).unwrap();
+
+        assert!(matches!(
+            LocalControlSession::start_profile_test(temp.path(), Vec::new()),
+            Err(LocalControlError::Authority(_))
+        ));
+        drop(first);
+        LocalControlSession::start_profile_test(temp.path(), Vec::new()).unwrap();
     }
 
     #[test]

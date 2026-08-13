@@ -391,15 +391,15 @@ fn decode_state(bytes: &[u8]) -> Result<DecodedState, ControlStateError> {
 }
 
 #[cfg(unix)]
-type ControlDirectory = std::fs::File;
+pub(crate) type ControlDirectory = std::fs::File;
 
 #[cfg(not(unix))]
-type ControlDirectory = PathBuf;
+pub(crate) type ControlDirectory = PathBuf;
 
 #[cfg(unix)]
 #[allow(unsafe_code)]
 #[allow(clippy::similar_names)]
-fn open_control_directory(
+pub(crate) fn open_control_directory(
     path: &Path,
     create: bool,
     expected_uid: u32,
@@ -524,7 +524,7 @@ fn is_unsafe_path_error(error: &std::io::Error) -> bool {
 
 #[cfg(unix)]
 #[allow(unsafe_code)]
-fn prepare_created_descriptor(
+pub(crate) fn prepare_created_descriptor(
     descriptor: &std::fs::File,
     uid: u32,
     gid: u32,
@@ -560,7 +560,7 @@ fn prepare_created_descriptor(
 
 #[cfg(unix)]
 #[allow(unsafe_code)]
-fn read_owned_entry(
+pub(crate) fn read_owned_entry(
     directory: &ControlDirectory,
     name: &str,
     expected_uid: u32,
@@ -611,7 +611,7 @@ fn read_owned_entry(
 }
 
 #[cfg(unix)]
-fn write_owned_atomic(
+pub(crate) fn write_owned_atomic(
     directory: &ControlDirectory,
     name: &str,
     body: &[u8],
@@ -699,7 +699,7 @@ fn write_owned_atomic_with_hook(
 }
 
 #[cfg(not(unix))]
-fn open_control_directory(
+pub(crate) fn open_control_directory(
     path: &Path,
     create: bool,
     _expected_uid: u32,
@@ -718,7 +718,7 @@ fn open_control_directory(
 }
 
 #[cfg(not(unix))]
-fn read_owned_entry(
+pub(crate) fn read_owned_entry(
     directory: &ControlDirectory,
     name: &str,
     _expected_uid: u32,
@@ -733,7 +733,7 @@ fn read_owned_entry(
 }
 
 #[cfg(not(unix))]
-fn write_owned_atomic(
+pub(crate) fn write_owned_atomic(
     directory: &ControlDirectory,
     name: &str,
     body: &[u8],

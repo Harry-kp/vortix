@@ -8,6 +8,7 @@
 
 #![allow(clippy::missing_errors_doc)]
 
+pub(crate) mod authority;
 pub mod control_state;
 pub mod error;
 pub mod hooks_config;
