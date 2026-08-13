@@ -1393,7 +1393,6 @@ impl LocalControlSession {
         if let Some(service) = self.service.take() {
             let _ = service.shutdown_bounded(SUPERVISED_SHUTDOWN_GRACE);
         }
-        drop(self._challenge_issuer);
         self.runtime
             .take()
             .expect("local control runtime is present during shutdown")
