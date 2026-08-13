@@ -166,6 +166,7 @@ impl RootEnrollmentStore {
             store: RootOwnedJsonStore::new(
                 layout.root_enrollment(),
                 0,
+                layout.root_state_dir_mode(),
                 MAX_ENROLLMENT_BYTES,
                 "enrollment",
             )
@@ -176,8 +177,14 @@ impl RootEnrollmentStore {
     #[cfg(test)]
     fn for_test(path: impl Into<PathBuf>, owner_uid: u32) -> Self {
         Self {
-            store: RootOwnedJsonStore::new(path, owner_uid, MAX_ENROLLMENT_BYTES, "enrollment")
-                .unwrap(),
+            store: RootOwnedJsonStore::new(
+                path,
+                owner_uid,
+                super::HELPER_RUNTIME_DIR_MODE,
+                MAX_ENROLLMENT_BYTES,
+                "enrollment",
+            )
+            .unwrap(),
         }
     }
 

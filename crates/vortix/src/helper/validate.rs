@@ -24,6 +24,22 @@ pub enum PlatformLayout {
 
 impl PlatformLayout {
     #[must_use]
+    pub const fn current() -> Option<Self> {
+        #[cfg(target_os = "linux")]
+        // xtask:allow-platform-cfg: package layout is selected by the build target
+        {
+            return Some(Self::Linux);
+        }
+        #[cfg(target_os = "macos")]
+        // xtask:allow-platform-cfg: package layout is selected by the build target
+        {
+            return Some(Self::MacOs);
+        }
+        #[allow(unreachable_code)]
+        None
+    }
+
+    #[must_use]
     pub const fn helper_path(self) -> &'static str {
         match self {
             Self::Linux => "/usr/libexec/vortix/vortix-helper",
@@ -76,6 +92,24 @@ impl PlatformLayout {
         match self {
             Self::Linux => "/var/lib/vortix/enrollment.json",
             Self::MacOs => "/Library/Application Support/Vortix/enrollment.json",
+        }
+    }
+
+    #[must_use]
+    pub const fn install_manifest(self) -> &'static str {
+        match self {
+            Self::Linux => "/usr/libexec/vortix/install-manifest.json",
+            Self::MacOs => "/Library/Application Support/Vortix/install-manifest.json",
+        }
+    }
+
+    #[must_use]
+    pub const fn root_state_dir_mode(self) -> u32 {
+        match self {
+            Self::Linux => 0o700,
+            // The signed daemon binary is below this package directory and
+            // must remain traversable by the enrolled unprivileged owner.
+            Self::MacOs => 0o755,
         }
     }
 

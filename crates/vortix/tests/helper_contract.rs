@@ -217,3 +217,32 @@ fn staged_binary_has_no_serve_or_operation_entrypoint() {
         assert_eq!(output.status.code(), Some(78));
     }
 }
+
+#[test]
+fn package_bootstrap_exposes_only_version_and_bounded_stage_entrypoints() {
+    let bootstrap = env!("CARGO_BIN_EXE_vortix-bootstrap");
+    let version = std::process::Command::new(bootstrap) // xtask:allow-subprocess: black-box package bootstrap test
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(version.status.success());
+    assert!(String::from_utf8_lossy(&version.stdout).contains("vortix-bootstrap"));
+
+    let unknown = std::process::Command::new(bootstrap) // xtask:allow-subprocess: black-box package bootstrap test
+        .arg("execute")
+        .output()
+        .unwrap();
+    assert_eq!(unknown.status.code(), Some(64));
+
+    let mut child = std::process::Command::new(bootstrap) // xtask:allow-subprocess: black-box package bootstrap test
+        .arg("stage")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(child.stdin.as_mut().unwrap(), b"{}").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(77));
+    assert!(output.stdout.is_empty());
+}

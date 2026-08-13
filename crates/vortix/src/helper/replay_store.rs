@@ -27,6 +27,7 @@ impl FsHelperLedgerStore {
             store: RootOwnedJsonStore::new(
                 layout.root_ledger(),
                 0,
+                layout.root_state_dir_mode(),
                 MAX_HELPER_LEDGER_BYTES,
                 "helper-ledger",
             )
@@ -40,6 +41,7 @@ impl FsHelperLedgerStore {
             store: RootOwnedJsonStore::new(
                 path,
                 expected_owner_uid,
+                super::HELPER_RUNTIME_DIR_MODE,
                 MAX_HELPER_LEDGER_BYTES,
                 "helper-ledger",
             )

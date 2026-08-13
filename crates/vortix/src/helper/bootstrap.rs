@@ -1,0 +1,352 @@
+//! Fixed-path package bootstrap for staged Background-mode enrollment.
+
+#![allow(
+    unsafe_code,
+    reason = "root artifact verification requires no-follow descriptor opens and credential syscalls"
+)]
+
+use std::ffi::CString;
+use std::fs::File;
+use std::io::Read as _;
+use std::os::fd::FromRawFd as _;
+use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+use std::path::Path;
+
+use serde::Serialize;
+use sha2::{Digest as _, Sha256};
+use thiserror::Error;
+
+use super::enrollment_store::RootEnrollmentStore;
+use super::validate::{
+    ArtifactFact, ArtifactKind, InstallManifest, InstallRequest, PlatformLayout,
+};
+use super::INSTALL_SCHEMA_VERSION;
+use crate::vortix_core::privileged::OperationDigest;
+
+pub const MAX_INSTALL_REQUEST_BYTES: u64 = 16 * 1024;
+const MAX_INSTALL_MANIFEST_BYTES: u64 = 64 * 1024;
+const MAX_INSTALLED_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BootstrapStageReceipt {
+    pub schema_version: u16,
+    pub owner_uid: u32,
+    pub layout: PlatformLayout,
+    pub manifest_generation: u64,
+    pub manifest_digest: OperationDigest,
+    pub staged_unenrolled: bool,
+}
+
+/// Verify one package-supplied installation and persist only staged authority.
+///
+/// The request is bounded and strict. All privileged paths are selected from
+/// the platform layout; no request field can name a file, executable, service,
+/// command, argument, environment entry, or network resource.
+pub fn stage_package_from_reader(
+    reader: impl std::io::Read,
+) -> Result<BootstrapStageReceipt, BootstrapError> {
+    let request_bytes = read_bounded(reader, MAX_INSTALL_REQUEST_BYTES)?;
+    let request: InstallRequest =
+        serde_json::from_slice(&request_bytes).map_err(|_| BootstrapError::InvalidRequest)?;
+    let current_layout = PlatformLayout::current().ok_or(BootstrapError::UnsupportedPlatform)?;
+    if request.layout() != current_layout {
+        return Err(BootstrapError::WrongPlatformLayout);
+    }
+    verify_root_and_original_caller(request.owner_uid())?;
+    verify_environment()?;
+    let manifest_bytes = read_root_owned_regular_file(
+        Path::new(current_layout.install_manifest()),
+        0,
+        MAX_INSTALL_MANIFEST_BYTES,
+        false,
+    )?;
+    let manifest: InstallManifest =
+        serde_json::from_slice(&manifest_bytes).map_err(|_| BootstrapError::InvalidManifest)?;
+    request.verify_manifest(&manifest)?;
+
+    for kind in [
+        ArtifactKind::Daemon,
+        ArtifactKind::Helper,
+        ArtifactKind::Bootstrap,
+    ] {
+        verify_installed_artifact(current_layout, kind, &manifest)?;
+    }
+    verify_running_bootstrap(current_layout)?;
+    ensure_root_state_directory(current_layout)?;
+
+    RootEnrollmentStore::root_owned(current_layout)
+        .stage(&request, &manifest)
+        .map_err(|_| BootstrapError::EnrollmentState)?;
+
+    Ok(BootstrapStageReceipt {
+        schema_version: INSTALL_SCHEMA_VERSION,
+        owner_uid: request.owner_uid(),
+        layout: current_layout,
+        manifest_generation: manifest.generation(),
+        manifest_digest: manifest.digest(),
+        staged_unenrolled: true,
+    })
+}
+
+fn verify_root_and_original_caller(owner_uid: u32) -> Result<(), BootstrapError> {
+    let (real_uid, effective_uid) = unsafe { (libc::getuid(), libc::geteuid()) };
+    if real_uid != 0 || effective_uid != 0 {
+        return Err(BootstrapError::RequiresRoot);
+    }
+    let sudo_uid = std::env::var_os("SUDO_UID")
+        .and_then(|value| value.into_string().ok())
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|uid| *uid != 0)
+        .ok_or(BootstrapError::MissingOriginalCaller)?;
+    if sudo_uid != owner_uid {
+        return Err(BootstrapError::WrongOriginalCaller);
+    }
+    Ok(())
+}
+
+fn verify_environment() -> Result<(), BootstrapError> {
+    if std::env::vars_os().any(|(name, _)| unsafe_environment_name(name.as_os_str().as_bytes())) {
+        return Err(BootstrapError::UnsafeEnvironment);
+    }
+    Ok(())
+}
+
+fn unsafe_environment_name(name: &[u8]) -> bool {
+    name.starts_with(b"LD_")
+        || name.starts_with(b"DYLD_")
+        || name.starts_with(b"VORTIX_")
+        || matches!(name, b"RUSTFLAGS" | b"RUSTDOCFLAGS" | b"RUST_LOG")
+}
+
+fn ensure_root_state_directory(layout: PlatformLayout) -> Result<(), BootstrapError> {
+    let state_file = Path::new(layout.root_enrollment());
+    let directory = state_file
+        .parent()
+        .ok_or(BootstrapError::UnsafeStateDirectory)?;
+    let created = match std::fs::create_dir(directory) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(error) => return Err(error.into()),
+    };
+    if created {
+        std::fs::set_permissions(
+            directory,
+            std::fs::Permissions::from_mode(layout.root_state_dir_mode()),
+        )?;
+        if let Some(parent) = directory.parent() {
+            File::open(parent)?.sync_all()?;
+        }
+    }
+    let metadata = std::fs::symlink_metadata(directory)?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != 0
+        || metadata.permissions().mode() & 0o777 != layout.root_state_dir_mode()
+    {
+        return Err(BootstrapError::UnsafeStateDirectory);
+    }
+    Ok(())
+}
+
+fn verify_installed_artifact(
+    layout: PlatformLayout,
+    kind: ArtifactKind,
+    manifest: &InstallManifest,
+) -> Result<(), BootstrapError> {
+    let path = match kind {
+        ArtifactKind::Daemon => layout.daemon_path(),
+        ArtifactKind::Helper => layout.helper_path(),
+        ArtifactKind::Bootstrap => layout.bootstrap_path(),
+    };
+    let mut file =
+        open_root_owned_regular_file(Path::new(path), 0, MAX_INSTALLED_ARTIFACT_BYTES, true)?;
+    let metadata = file.metadata()?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hash.update(&buffer[..read]);
+    }
+    let fact = ArtifactFact::from_os_verifier(
+        kind,
+        Path::new(path).to_owned(),
+        0,
+        metadata.permissions().mode() & 0o777,
+        OperationDigest::from_sha256(hash.finalize().into()),
+        false,
+    );
+    fact.validate(layout, manifest)?;
+    Ok(())
+}
+
+fn verify_running_bootstrap(layout: PlatformLayout) -> Result<(), BootstrapError> {
+    let running = std::fs::metadata("/proc/self/exe")
+        .or_else(|_| std::env::current_exe().and_then(std::fs::metadata))?;
+    let installed = open_root_owned_regular_file(
+        Path::new(layout.bootstrap_path()),
+        0,
+        MAX_INSTALLED_ARTIFACT_BYTES,
+        true,
+    )?
+    .metadata()?;
+    if running.dev() != installed.dev() || running.ino() != installed.ino() {
+        return Err(BootstrapError::WrongBootstrapExecutable);
+    }
+    Ok(())
+}
+
+fn read_root_owned_regular_file(
+    path: &Path,
+    expected_owner_uid: u32,
+    max_bytes: u64,
+    executable: bool,
+) -> Result<Vec<u8>, BootstrapError> {
+    let file = open_root_owned_regular_file(path, expected_owner_uid, max_bytes, executable)?;
+    read_bounded(file, max_bytes)
+}
+
+fn open_root_owned_regular_file(
+    path: &Path,
+    expected_owner_uid: u32,
+    max_bytes: u64,
+    executable: bool,
+) -> Result<File, BootstrapError> {
+    let encoded = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| BootstrapError::UnsafeInstalledFile)?;
+    let fd = unsafe {
+        libc::open(
+            encoded.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let file = unsafe { File::from_raw_fd(fd) };
+    let metadata = file.metadata()?;
+    let mode = metadata.permissions().mode() & 0o777;
+    if !metadata.is_file()
+        || metadata.uid() != expected_owner_uid
+        || metadata.nlink() != 1
+        || mode & 0o022 != 0
+        || executable && mode & 0o500 != 0o500
+        || metadata.len() == 0
+        || metadata.len() > max_bytes
+    {
+        return Err(BootstrapError::UnsafeInstalledFile);
+    }
+    Ok(file)
+}
+
+fn read_bounded(mut reader: impl std::io::Read, max_bytes: u64) -> Result<Vec<u8>, BootstrapError> {
+    let mut bytes = Vec::new();
+    std::io::Read::by_ref(&mut reader)
+        .take(max_bytes + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.is_empty() || bytes.len() as u64 > max_bytes {
+        return Err(BootstrapError::Capacity);
+    }
+    Ok(bytes)
+}
+
+#[derive(Debug, Error)]
+pub enum BootstrapError {
+    #[error("the install request is empty, malformed, or contains unknown fields")]
+    InvalidRequest,
+    #[error("the package manifest is malformed")]
+    InvalidManifest,
+    #[error("the install request or manifest exceeds its fixed size")]
+    Capacity,
+    #[error("this operating system has no supported package bootstrap")]
+    UnsupportedPlatform,
+    #[error("the requested package layout does not match this operating system")]
+    WrongPlatformLayout,
+    #[error("the package bootstrap must run through system sudo as root")]
+    RequiresRoot,
+    #[error("the package bootstrap cannot verify the original sudo caller")]
+    MissingOriginalCaller,
+    #[error("the install owner does not match the original sudo caller")]
+    WrongOriginalCaller,
+    #[error("the package bootstrap received an unsafe environment")]
+    UnsafeEnvironment,
+    #[error("the package state directory is not root-owned mode 0700")]
+    UnsafeStateDirectory,
+    #[error("a package artifact is not a safe root-owned regular file")]
+    UnsafeInstalledFile,
+    #[error("the running bootstrap is not the installed package bootstrap")]
+    WrongBootstrapExecutable,
+    #[error("the root-owned enrollment record could not be staged safely")]
+    EnrollmentState,
+    #[error("package validation failed: {0}")]
+    Install(#[from] super::validate::InstallError),
+    #[error("package bootstrap I/O failed: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_reader_rejects_empty_and_oversized_input() {
+        assert!(matches!(
+            read_bounded(&b""[..], 4),
+            Err(BootstrapError::Capacity)
+        ));
+        assert!(matches!(
+            read_bounded(&b"12345"[..], 4),
+            Err(BootstrapError::Capacity)
+        ));
+        assert_eq!(read_bounded(&b"1234"[..], 4).unwrap(), b"1234");
+    }
+
+    #[test]
+    fn privileged_loader_and_vortix_environment_names_are_rejected() {
+        for name in [
+            b"LD_PRELOAD".as_slice(),
+            b"DYLD_INSERT_LIBRARIES",
+            b"VORTIX_CONFIG_DIR",
+            b"RUSTFLAGS",
+            b"RUSTDOCFLAGS",
+            b"RUST_LOG",
+        ] {
+            assert!(unsafe_environment_name(name));
+        }
+        for name in [b"SUDO_UID".as_slice(), b"LANG", b"TERM", b"PATH"] {
+            assert!(!unsafe_environment_name(name));
+        }
+    }
+
+    #[test]
+    fn installed_file_reader_rejects_links_writable_files_and_capacity() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("artifact");
+        std::fs::write(&path, b"trusted").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let uid = crate::utils::effective_user_group_ids().0;
+        assert_eq!(
+            read_root_owned_regular_file(&path, uid, 7, true).unwrap(),
+            b"trusted"
+        );
+        assert!(matches!(
+            read_root_owned_regular_file(&path, uid, 6, true),
+            Err(BootstrapError::UnsafeInstalledFile)
+        ));
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o520)).unwrap();
+        assert!(matches!(
+            read_root_owned_regular_file(&path, uid, 7, true),
+            Err(BootstrapError::UnsafeInstalledFile)
+        ));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o500)).unwrap();
+        std::fs::hard_link(&path, directory.path().join("alias")).unwrap();
+        assert!(matches!(
+            read_root_owned_regular_file(&path, uid, 7, true),
+            Err(BootstrapError::UnsafeInstalledFile)
+        ));
+    }
+}
