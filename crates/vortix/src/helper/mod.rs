@@ -16,6 +16,7 @@ mod replay_store;
 mod root_store;
 mod runtime;
 mod server;
+mod transport;
 pub mod validate;
 
 pub use bootstrap::{
@@ -28,8 +29,9 @@ pub use protocol::{
     HelperSessionBinding, HELPER_PROTOCOL_MAX, HELPER_PROTOCOL_MIN, HELPER_SCHEMA_MAX,
     HELPER_SCHEMA_MIN, MAX_HELPER_FRAME_BYTES,
 };
+pub use transport::{serve_staged_helper, HelperTransportError};
 pub use validate::{
     ArtifactKind, EnrollmentSupport, InstallError, InstallManifest, InstallPlan, InstallRequest,
     PackageChannel, PlatformLayout, StagedAuthority, HELPER_LEDGER_MODE, HELPER_RUNTIME_DIR_MODE,
-    HELPER_SOCKET_MODE, INSTALL_SCHEMA_VERSION,
+    HELPER_SOCKET_DIR_MODE, HELPER_SOCKET_MODE, INSTALL_SCHEMA_VERSION,
 };

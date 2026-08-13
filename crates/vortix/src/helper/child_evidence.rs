@@ -15,7 +15,9 @@ use thiserror::Error;
 
 use crate::helper::private_fs::{create_private_directory, private_directory_is_valid};
 use crate::helper::runtime::HelperRuntimeIdentity;
-use crate::helper::validate::{PlatformLayout, HELPER_LEDGER_MODE, HELPER_RUNTIME_DIR_MODE};
+use crate::helper::validate::{
+    PlatformLayout, HELPER_LEDGER_MODE, HELPER_RUNTIME_DIR_MODE, HELPER_SOCKET_DIR_MODE,
+};
 use crate::vortix_core::ports::process::KernelProcessIdentity;
 use crate::vortix_core::privileged::{ContainmentId, ObservedChildIdentity, ResourceTag};
 
@@ -136,7 +138,11 @@ impl ChildEvidenceStore {
         identity: &ObservedChildIdentity,
     ) -> Result<(), ChildEvidenceError> {
         self.validate_identity(identity)?;
-        validate_directory(&self.runtime_dir, self.expected_owner_uid)?;
+        validate_directory(
+            &self.runtime_dir,
+            self.expected_owner_uid,
+            HELPER_RUNTIME_DIR_MODE,
+        )?;
         let installed = self.load()?;
         if &installed != identity {
             return Err(ChildEvidenceError::IdentityMismatch);
@@ -176,15 +182,23 @@ impl ChildEvidenceStore {
     }
 
     fn prepare_runtime_dir(&self) -> Result<(), ChildEvidenceError> {
-        validate_directory(&self.runtime_root, self.expected_owner_uid)?;
+        validate_directory(
+            &self.runtime_root,
+            self.expected_owner_uid,
+            HELPER_SOCKET_DIR_MODE,
+        )?;
         let resources = self.runtime_root.join("resources");
         create_private_directory(&resources, HELPER_RUNTIME_DIR_MODE)?;
-        validate_directory(&resources, self.expected_owner_uid)?;
+        validate_directory(&resources, self.expected_owner_uid, HELPER_RUNTIME_DIR_MODE)?;
         if self.runtime_dir.parent() != Some(resources.as_path()) {
             return Err(ChildEvidenceError::UnsafePath);
         }
         create_private_directory(&self.runtime_dir, HELPER_RUNTIME_DIR_MODE)?;
-        validate_directory(&self.runtime_dir, self.expected_owner_uid)
+        validate_directory(
+            &self.runtime_dir,
+            self.expected_owner_uid,
+            HELPER_RUNTIME_DIR_MODE,
+        )
     }
 
     fn create_temporary(&self) -> Result<(PathBuf, File), ChildEvidenceError> {
@@ -210,8 +224,12 @@ impl ChildEvidenceStore {
     }
 }
 
-fn validate_directory(path: &Path, expected_owner_uid: u32) -> Result<(), ChildEvidenceError> {
-    if !private_directory_is_valid(path, expected_owner_uid, HELPER_RUNTIME_DIR_MODE)? {
+fn validate_directory(
+    path: &Path,
+    expected_owner_uid: u32,
+    expected_mode: u32,
+) -> Result<(), ChildEvidenceError> {
+    if !private_directory_is_valid(path, expected_owner_uid, expected_mode)? {
         return Err(ChildEvidenceError::UnsafePath);
     }
     Ok(())
@@ -287,7 +305,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::set_permissions(
             root.path(),
-            std::fs::Permissions::from_mode(HELPER_RUNTIME_DIR_MODE),
+            std::fs::Permissions::from_mode(HELPER_SOCKET_DIR_MODE),
         )
         .unwrap();
         let store = ChildEvidenceStore::for_test(
