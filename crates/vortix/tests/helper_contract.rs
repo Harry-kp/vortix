@@ -241,6 +241,12 @@ fn package_bootstrap_exposes_only_version_and_bounded_stage_entrypoints() {
         .unwrap();
     assert_eq!(unknown.status.code(), Some(64));
 
+    let invalid_commit = std::process::Command::new(bootstrap) // xtask:allow-subprocess: black-box package bootstrap test
+        .args(["commit", "0"])
+        .output()
+        .unwrap();
+    assert_eq!(invalid_commit.status.code(), Some(64));
+
     let mut child = std::process::Command::new(bootstrap) // xtask:allow-subprocess: black-box package bootstrap test
         .arg("stage")
         .stdin(std::process::Stdio::piped())
