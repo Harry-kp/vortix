@@ -11,6 +11,7 @@ use std::fs::File;
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
@@ -25,8 +26,11 @@ use crate::helper::runtime::{
     HelperRuntimeIdentity, INTERFACE_EVIDENCE_FILE, OPENVPN_CHILD_EVIDENCE_FILE,
 };
 use crate::helper::validate::{PlatformLayout, HELPER_RUNTIME_DIR_MODE, HELPER_SOCKET_DIR_MODE};
+use crate::vortix_core::openvpn_credentials::{
+    DecodedOpenVpnCredentials, MAX_CREDENTIAL_FRAME_BYTES,
+};
 use crate::vortix_core::privileged::{OpenVpnPlan, ProfileMaterialSlot, ResourceKind, ResourceTag};
-use crate::vortix_core::privileged::{ProfileMaterialRef, WireGuardPlan};
+use crate::vortix_core::privileged::{ProfileMaterialRef, TunnelDescriptorRef, WireGuardPlan};
 use crate::vortix_core::profile::ProtocolKind;
 use crate::vortix_core::secret_file::{
     write_secret_file_tracked, SecretFileError, SecretFileIdentity,
@@ -43,7 +47,7 @@ pub(crate) const MAX_MATERIAL_BYTES: usize = 1024 * 1024;
 
 pub(crate) enum TunnelMaterialSet {
     WireGuard(WireGuardMaterialSet),
-    OpenVpn(OpenVpnMaterialSet),
+    OpenVpn(OpenVpnDescriptorSet),
 }
 
 impl TunnelMaterialSet {
@@ -51,28 +55,20 @@ impl TunnelMaterialSet {
         plan: &crate::vortix_core::privileged::ProtocolPlan,
         descriptors: Vec<File>,
     ) -> Result<Self, TunnelMaterialError> {
-        let refs = plan.material_refs();
+        let refs = plan.descriptor_refs();
         if refs.len() != descriptors.len() {
             return Err(TunnelMaterialError::CountMismatch);
         }
         match plan {
-            crate::vortix_core::privileged::ProtocolPlan::WireGuard(_) => {
-                WireGuardMaterialSet::from_inherited_descriptors(refs.into_iter().zip(descriptors))
-                    .map(Self::WireGuard)
-                    .map_err(|_| TunnelMaterialError::InvalidIdentity)
+            crate::vortix_core::privileged::ProtocolPlan::WireGuard(plan) => {
+                WireGuardMaterialSet::from_inherited_descriptors(
+                    plan.material_refs().into_iter().zip(descriptors),
+                )
+                .map(Self::WireGuard)
+                .map_err(|_| TunnelMaterialError::InvalidIdentity)
             }
             crate::vortix_core::privileged::ProtocolPlan::OpenVpn(_) => {
-                let slots = refs
-                    .into_iter()
-                    .zip(descriptors)
-                    .map(|(material_ref, descriptor)| match material_ref {
-                        ProfileMaterialRef::ProfileSlot { slot } => Ok((slot, descriptor)),
-                        ProfileMaterialRef::WireGuardPresharedKey { .. } => {
-                            Err(TunnelMaterialError::InvalidIdentity)
-                        }
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                OpenVpnMaterialSet::from_inherited_descriptors(slots)
+                OpenVpnDescriptorSet::from_tunnel_descriptors(refs.into_iter().zip(descriptors))
                     .map(Self::OpenVpn)
                     .map_err(|_| TunnelMaterialError::InvalidIdentity)
             }
@@ -82,7 +78,7 @@ impl TunnelMaterialSet {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub(crate) enum TunnelMaterialError {
-    #[error("tunnel material descriptor count does not match the plan")]
+    #[error("tunnel descriptor count does not match the plan")]
     CountMismatch,
     #[error("tunnel material identity does not match the protocol plan")]
     InvalidIdentity,
@@ -354,22 +350,47 @@ impl WireGuardStagingError {
             _ => Self::UnsafeRuntime,
         }
     }
+
+    fn from_descriptor(error: DescriptorReadError) -> Self {
+        match error {
+            DescriptorReadError::Io(error) => Self::Io(error),
+            DescriptorReadError::NotRegular | DescriptorReadError::Changed => {
+                Self::InvalidMaterialDescriptor
+            }
+            DescriptorReadError::Empty => Self::EmptyMaterial,
+            DescriptorReadError::TooLarge => Self::MaterialTooLarge,
+        }
+    }
 }
 
-fn read_material_descriptor(
+fn read_material_descriptor(descriptor: File) -> Result<Zeroizing<Vec<u8>>, WireGuardStagingError> {
+    read_bounded_descriptor(descriptor, MAX_MATERIAL_BYTES)
+        .map_err(WireGuardStagingError::from_descriptor)
+}
+
+enum DescriptorReadError {
+    Io(std::io::Error),
+    NotRegular,
+    Empty,
+    TooLarge,
+    Changed,
+}
+
+fn read_bounded_descriptor(
     mut descriptor: File,
-) -> Result<Zeroizing<Vec<u8>>, WireGuardStagingError> {
+    max_bytes: usize,
+) -> Result<Zeroizing<Vec<u8>>, DescriptorReadError> {
     let metadata = descriptor.metadata()?;
     if !metadata.is_file() {
-        return Err(WireGuardStagingError::InvalidMaterialDescriptor);
+        return Err(DescriptorReadError::NotRegular);
     }
     let material_len =
-        usize::try_from(metadata.len()).map_err(|_| WireGuardStagingError::MaterialTooLarge)?;
-    if material_len > MAX_MATERIAL_BYTES {
-        return Err(WireGuardStagingError::MaterialTooLarge);
+        usize::try_from(metadata.len()).map_err(|_| DescriptorReadError::TooLarge)?;
+    if material_len > max_bytes {
+        return Err(DescriptorReadError::TooLarge);
     }
     if material_len == 0 {
-        return Err(WireGuardStagingError::EmptyMaterial);
+        return Err(DescriptorReadError::Empty);
     }
     descriptor.seek(SeekFrom::Start(0))?;
     let mut bytes = Zeroizing::new(Vec::with_capacity(material_len));
@@ -379,27 +400,35 @@ fn read_material_descriptor(
         .read_to_end(&mut bytes)?;
     let mut trailing = [0_u8; 1];
     if bytes.len() != material_len || descriptor.read(&mut trailing)? != 0 {
-        return Err(WireGuardStagingError::InvalidMaterialDescriptor);
+        return Err(DescriptorReadError::Changed);
     }
     Ok(bytes)
 }
 
-/// Descriptors received out-of-band from the authenticated daemon. This type
-/// has no serde implementation and its debug form reveals slots only.
-pub(crate) struct OpenVpnMaterialSet {
-    descriptors: BTreeMap<ProfileMaterialSlot, File>,
+impl From<std::io::Error> for DescriptorReadError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
 }
 
-impl Debug for OpenVpnMaterialSet {
+/// Descriptors received out-of-band from the authenticated daemon. This type
+/// has no serde implementation and its debug form reveals slots only.
+pub(crate) struct OpenVpnDescriptorSet {
+    profile_materials: BTreeMap<ProfileMaterialSlot, File>,
+    credentials: Option<File>,
+}
+
+impl Debug for OpenVpnDescriptorSet {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("OpenVpnMaterialSet")
-            .field("slots", &self.descriptors.keys().collect::<Vec<_>>())
+            .debug_struct("OpenVpnDescriptorSet")
+            .field("slots", &self.profile_materials.keys().collect::<Vec<_>>())
+            .field("has_credentials", &self.credentials.is_some())
             .finish()
     }
 }
 
-impl OpenVpnMaterialSet {
+impl OpenVpnDescriptorSet {
     pub(crate) fn from_inherited_descriptors(
         descriptors: impl IntoIterator<Item = (ProfileMaterialSlot, File)>,
     ) -> Result<Self, OpenVpnStagingError> {
@@ -409,17 +438,43 @@ impl OpenVpnMaterialSet {
                 return Err(OpenVpnStagingError::InvalidMaterialSlot);
             }
             if by_slot.insert(slot, descriptor).is_some() {
-                return Err(OpenVpnStagingError::DuplicateMaterial);
+                return Err(OpenVpnStagingError::DuplicateDescriptor);
             }
         }
         Ok(Self {
-            descriptors: by_slot,
+            profile_materials: by_slot,
+            credentials: None,
         })
+    }
+
+    fn from_tunnel_descriptors(
+        descriptors: impl IntoIterator<Item = (TunnelDescriptorRef, File)>,
+    ) -> Result<Self, OpenVpnStagingError> {
+        let mut profile_materials = Vec::new();
+        let mut credentials = None;
+        for (descriptor_ref, descriptor) in descriptors {
+            match descriptor_ref {
+                TunnelDescriptorRef::ProfileMaterial(ProfileMaterialRef::ProfileSlot { slot }) => {
+                    profile_materials.push((slot, descriptor));
+                }
+                TunnelDescriptorRef::ProfileMaterial(
+                    ProfileMaterialRef::WireGuardPresharedKey { .. },
+                ) => return Err(OpenVpnStagingError::InvalidMaterialSlot),
+                TunnelDescriptorRef::OpenVpnCredentials => {
+                    if credentials.replace(descriptor).is_some() {
+                        return Err(OpenVpnStagingError::DuplicateDescriptor);
+                    }
+                }
+            }
+        }
+        let mut materials = Self::from_inherited_descriptors(profile_materials)?;
+        materials.credentials = credentials;
+        Ok(materials)
     }
 
     #[cfg(test)]
     fn into_descriptors(self) -> Vec<(ProfileMaterialSlot, File)> {
-        self.descriptors.into_iter().collect()
+        self.profile_materials.into_iter().collect()
     }
 }
 
@@ -468,17 +523,15 @@ impl OpenVpnRuntimeStager {
     pub(crate) fn stage(
         &self,
         plan: &OpenVpnPlan,
-        materials: OpenVpnMaterialSet,
-    ) -> Result<StagedOpenVpnRuntime, OpenVpnStagingError> {
+        mut materials: OpenVpnDescriptorSet,
+    ) -> Result<StagedOpenVpnStart, OpenVpnStagingError> {
         if self.resource.kind() != ResourceKind::Tunnel
             || self.resource.profile_id() != Some(plan.profile_id())
             || self.resource.generation() != plan.generation()
         {
             return Err(OpenVpnStagingError::PlanIdentityMismatch);
         }
-        if !materials.descriptors.keys().eq(plan.materials().iter()) {
-            return Err(OpenVpnStagingError::MaterialSetMismatch);
-        }
+        let credentials = take_validated_openvpn_credentials(plan, &mut materials)?;
 
         let resource_root = self.runtime_root.join("resources");
         let execution = render_helper_execution_under(
@@ -535,32 +588,9 @@ impl OpenVpnRuntimeStager {
             identity: config_identity,
         });
 
-        for (slot, mut descriptor) in materials.descriptors {
-            let metadata = descriptor.metadata()?;
-            if !metadata.is_file() {
-                return Err(OpenVpnStagingError::InvalidMaterialDescriptor);
-            }
-            let material_len = usize::try_from(metadata.len())
-                .map_err(|_| OpenVpnStagingError::MaterialTooLarge)?;
-            if material_len > MAX_MATERIAL_BYTES {
-                return Err(OpenVpnStagingError::MaterialTooLarge);
-            }
-            if material_len == 0 {
-                return Err(OpenVpnStagingError::EmptyMaterial);
-            }
-            descriptor.seek(SeekFrom::Start(0))?;
-            // Read into exact capacity, then probe one trailing byte. This
-            // bounds descriptor I/O to MAX + 1 without reallocating a secret
-            // prefix if the file changed after `metadata`.
-            let mut bytes = Zeroizing::new(Vec::with_capacity(material_len));
-            descriptor
-                .by_ref()
-                .take(material_len as u64)
-                .read_to_end(&mut bytes)?;
-            let mut trailing = [0_u8; 1];
-            if bytes.len() != material_len || descriptor.read(&mut trailing)? != 0 {
-                return Err(OpenVpnStagingError::InvalidMaterialDescriptor);
-            }
+        for (slot, descriptor) in materials.profile_materials {
+            let bytes = read_bounded_descriptor(descriptor, MAX_MATERIAL_BYTES)
+                .map_err(OpenVpnStagingError::from_material_descriptor)?;
             let path = staged
                 .execution
                 .material_path(slot)
@@ -571,7 +601,10 @@ impl OpenVpnRuntimeStager {
         }
 
         setup.commit();
-        Ok(staged)
+        Ok(StagedOpenVpnStart {
+            runtime: staged,
+            credentials,
+        })
     }
 
     pub(crate) fn recover_for_cleanup(
@@ -585,6 +618,31 @@ impl OpenVpnRuntimeStager {
         recovered.validate()?;
         Ok(recovered)
     }
+}
+
+fn take_validated_openvpn_credentials(
+    plan: &OpenVpnPlan,
+    materials: &mut OpenVpnDescriptorSet,
+) -> Result<Option<DecodedOpenVpnCredentials>, OpenVpnStagingError> {
+    if !materials
+        .profile_materials
+        .keys()
+        .eq(plan.materials().iter())
+        || materials.credentials.is_some() != plan.authentication().uses_username_password()
+    {
+        return Err(OpenVpnStagingError::MaterialSetMismatch);
+    }
+    let credentials = materials
+        .credentials
+        .take()
+        .map(read_openvpn_credential_descriptor)
+        .transpose()?;
+    if credentials.as_ref().is_some_and(|credentials| {
+        credentials.answer_is_empty() == plan.authentication().challenge().is_some()
+    }) {
+        return Err(OpenVpnStagingError::InvalidCredentials);
+    }
+    Ok(credentials)
 }
 
 struct CreatedPath {
@@ -611,6 +669,23 @@ impl CreatedDirectory {
 
 /// Owns all transient files until the foreground lifecycle executor either
 /// stores the guard beside the child or drops it on a failed start.
+pub(crate) struct StagedOpenVpnStart {
+    runtime: StagedOpenVpnRuntime,
+    credentials: Option<DecodedOpenVpnCredentials>,
+}
+
+impl StagedOpenVpnStart {
+    pub(crate) fn into_parts(self) -> (StagedOpenVpnRuntime, Option<DecodedOpenVpnCredentials>) {
+        (self.runtime, self.credentials)
+    }
+
+    #[cfg(test)]
+    fn into_runtime(self) -> StagedOpenVpnRuntime {
+        assert!(self.credentials.is_none());
+        self.runtime
+    }
+}
+
 pub(crate) struct StagedOpenVpnRuntime {
     execution: OpenVpnExecutionSpec,
     runtime_directory: PathBuf,
@@ -796,6 +871,26 @@ impl StagedOpenVpnRuntime {
         self.execution.material_paths()
     }
 
+    pub(crate) fn try_connect_management(&self) -> Result<Option<UnixStream>, OpenVpnStagingError> {
+        match std::fs::symlink_metadata(self.execution.management_socket()) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+            Ok(metadata) => validate_private_socket_metadata(&metadata, self.expected_owner_uid)?,
+        }
+        match UnixStream::connect(self.execution.management_socket()) {
+            Ok(stream) => Ok(Some(stream)),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Remove only the exact files created by this staging guard. Unknown,
     /// replaced, linked, or non-private artifacts fail closed for recovery.
     pub(crate) fn cleanup(&mut self) -> Result<(), OpenVpnStagingError> {
@@ -895,8 +990,8 @@ impl Drop for StagedOpenVpnRuntime {
 
 #[derive(Debug, Error)]
 pub(crate) enum OpenVpnStagingError {
-    #[error("duplicate OpenVPN material slot")]
-    DuplicateMaterial,
+    #[error("duplicate OpenVPN tunnel descriptor identity")]
+    DuplicateDescriptor,
     #[error("non-OpenVPN material slot supplied to OpenVPN staging")]
     InvalidMaterialSlot,
     #[error("OpenVPN descriptor set does not exactly match the canonical plan")]
@@ -909,12 +1004,40 @@ pub(crate) enum OpenVpnStagingError {
     MaterialTooLarge,
     #[error("OpenVPN material descriptor is not a regular file")]
     InvalidMaterialDescriptor,
+    #[error("OpenVPN credential descriptor is malformed or incompatible with the plan")]
+    InvalidCredentials,
     #[error("OpenVPN helper runtime identity, ownership, or mode is unsafe")]
     UnsafeRuntime,
     #[error("stale OpenVPN helper runtime file already exists")]
     StaleRuntime,
     #[error("OpenVPN material staging I/O failed")]
     Io(#[from] std::io::Error),
+}
+
+impl OpenVpnStagingError {
+    fn from_material_descriptor(error: DescriptorReadError) -> Self {
+        match error {
+            DescriptorReadError::Io(error) => Self::Io(error),
+            DescriptorReadError::NotRegular | DescriptorReadError::Changed => {
+                Self::InvalidMaterialDescriptor
+            }
+            DescriptorReadError::Empty => Self::EmptyMaterial,
+            DescriptorReadError::TooLarge => Self::MaterialTooLarge,
+        }
+    }
+}
+
+fn read_openvpn_credential_descriptor(
+    descriptor: File,
+) -> Result<DecodedOpenVpnCredentials, OpenVpnStagingError> {
+    let bytes = read_bounded_descriptor(descriptor, MAX_CREDENTIAL_FRAME_BYTES).map_err(
+        |error| match error {
+            DescriptorReadError::Empty => OpenVpnStagingError::InvalidCredentials,
+            other => OpenVpnStagingError::from_material_descriptor(other),
+        },
+    )?;
+    crate::vortix_core::openvpn_credentials::decode(&bytes)
+        .ok_or(OpenVpnStagingError::InvalidCredentials)
 }
 
 fn validate_directory(
@@ -1046,6 +1169,13 @@ fn validate_private_socket(
     expected_owner_uid: u32,
 ) -> Result<(), OpenVpnStagingError> {
     let metadata = std::fs::symlink_metadata(path)?;
+    validate_private_socket_metadata(&metadata, expected_owner_uid)
+}
+
+fn validate_private_socket_metadata(
+    metadata: &std::fs::Metadata,
+    expected_owner_uid: u32,
+) -> Result<(), OpenVpnStagingError> {
     if metadata.file_type().is_symlink()
         || !metadata.file_type().is_socket()
         || metadata.uid() != expected_owner_uid
@@ -1086,14 +1216,14 @@ mod tests {
     use crate::helper::HELPER_SOCKET_DIR_MODE;
     use crate::vortix_core::privileged::{
         OpenVpnAuthFactors, OpenVpnPlan, OpenVpnRemote, OpenVpnRemoteSelection, OpenVpnTransport,
-        ProfileMaterialRef, ProfileMaterialSlot, ResourceTag, WireGuardInterfaceOptions,
-        WireGuardPeerPlan, WireGuardPlan, WireGuardPresharedKeyRef,
+        ProfileMaterialRef, ProfileMaterialSlot, ProtocolPlan, ResourceTag,
+        WireGuardInterfaceOptions, WireGuardPeerPlan, WireGuardPlan, WireGuardPresharedKeyRef,
     };
     use crate::vortix_core::profile::ProfileId;
 
     use super::{
-        OpenVpnMaterialSet, OpenVpnRuntimeStager, OpenVpnStagingError, WireGuardMaterialSet,
-        WireGuardRuntimeStager, WireGuardStagingError,
+        OpenVpnDescriptorSet, OpenVpnRuntimeStager, OpenVpnStagingError, TunnelMaterialError,
+        TunnelMaterialSet, WireGuardMaterialSet, WireGuardRuntimeStager, WireGuardStagingError,
     };
     use base64::engine::{general_purpose::STANDARD as BASE64, Engine as _};
 
@@ -1293,11 +1423,11 @@ mod tests {
         ));
     }
 
-    fn certificate_materials() -> (Vec<tempfile::NamedTempFile>, OpenVpnMaterialSet) {
+    fn certificate_materials() -> (Vec<tempfile::NamedTempFile>, OpenVpnDescriptorSet) {
         let (ca_source, ca) = descriptor(b"ca-certificate");
         let (cert_source, cert) = descriptor(b"client-certificate");
         let (key_source, key) = descriptor(b"private-key-secret");
-        let materials = OpenVpnMaterialSet::from_inherited_descriptors([
+        let materials = OpenVpnDescriptorSet::from_inherited_descriptors([
             (ProfileMaterialSlot::OpenVpnCaCertificate, ca),
             (ProfileMaterialSlot::OpenVpnClientCertificate, cert),
             (ProfileMaterialSlot::OpenVpnPrivateKey, key),
@@ -1307,11 +1437,83 @@ mod tests {
     }
 
     #[test]
+    fn interactive_credentials_are_descriptor_bound_decoded_and_redacted_before_staging() {
+        let (root, runtime_stager) = fixture();
+        let interactive = OpenVpnPlan::new(
+            profile('a'),
+            7,
+            vec![OpenVpnRemote::dns("vpn.example.com", 1194, OpenVpnTransport::Udp).unwrap()],
+            OpenVpnRemoteSelection::Ordered,
+            OpenVpnAuthFactors::username_password(),
+            Vec::new(),
+        )
+        .unwrap();
+        let plan = ProtocolPlan::OpenVpn(interactive.clone());
+        let (ca_source, ca) = descriptor(b"ca-certificate");
+        let frame = crate::vortix_core::openvpn_credentials::encode("alice", "correct horse", None);
+        let (credential_source, credentials) = descriptor(&frame);
+        let TunnelMaterialSet::OpenVpn(materials) =
+            TunnelMaterialSet::for_plan(&plan, vec![ca, credentials]).unwrap()
+        else {
+            panic!("expected OpenVPN material set");
+        };
+        let debug = format!("{materials:?}");
+        assert!(!debug.contains("alice"));
+        assert!(!debug.contains("correct horse"));
+
+        let staged = runtime_stager.stage(&interactive, materials).unwrap();
+        let (staged, credentials) = staged.into_parts();
+        let (username, password, answer) = credentials.unwrap().into_parts();
+        assert_eq!(username.as_str(), "alice");
+        assert_eq!(password.as_str(), "correct horse");
+        assert!(answer.is_empty());
+        assert!(!format!("{staged:?}").contains("alice"));
+        drop((ca_source, credential_source, root));
+    }
+
+    #[test]
+    fn interactive_descriptor_count_and_malformed_credentials_fail_before_runtime_creation() {
+        let (_root, runtime_stager) = fixture();
+        let interactive = OpenVpnPlan::new(
+            profile('a'),
+            7,
+            vec![OpenVpnRemote::dns("vpn.example.com", 1194, OpenVpnTransport::Udp).unwrap()],
+            OpenVpnRemoteSelection::Ordered,
+            OpenVpnAuthFactors::username_password(),
+            Vec::new(),
+        )
+        .unwrap();
+        let plan = ProtocolPlan::OpenVpn(interactive.clone());
+        let (ca_source, ca) = descriptor(b"ca-certificate");
+        assert!(matches!(
+            TunnelMaterialSet::for_plan(&plan, vec![ca]),
+            Err(TunnelMaterialError::CountMismatch)
+        ));
+
+        let (ca_source_2, ca) = descriptor(b"ca-certificate");
+        let (credential_source, credentials) = descriptor(b"not-a-credential-frame");
+        let TunnelMaterialSet::OpenVpn(materials) =
+            TunnelMaterialSet::for_plan(&plan, vec![ca, credentials]).unwrap()
+        else {
+            panic!("expected OpenVPN material set");
+        };
+        assert!(matches!(
+            runtime_stager.stage(&interactive, materials),
+            Err(OpenVpnStagingError::InvalidCredentials)
+        ));
+        assert!(!runtime_stager.runtime_directory().exists());
+        drop((ca_source, ca_source_2, credential_source));
+    }
+
+    #[test]
     fn exact_descriptor_set_stages_private_runtime_and_cleans_on_drop() {
         let (root, runtime_stager) = fixture();
         let (_sources, materials) = certificate_materials();
 
-        let staged = runtime_stager.stage(&plan(), materials).unwrap();
+        let staged = runtime_stager
+            .stage(&plan(), materials)
+            .unwrap()
+            .into_runtime();
         assert!(staged.execution().config_path().is_file());
         assert_eq!(
             std::fs::metadata(staged.runtime_directory())
@@ -1370,6 +1572,7 @@ mod tests {
         runtime_stager
             .stage(&plan(), materials)
             .unwrap()
+            .into_runtime()
             .cleanup()
             .unwrap();
 
@@ -1403,7 +1606,7 @@ mod tests {
         let (_root, runtime_stager) = fixture();
         let runtime = runtime_stager.runtime_directory().to_owned();
         let (source, ca) = descriptor(b"ca");
-        let missing = OpenVpnMaterialSet::from_inherited_descriptors([(
+        let missing = OpenVpnDescriptorSet::from_inherited_descriptors([(
             ProfileMaterialSlot::OpenVpnCaCertificate,
             ca,
         )])
@@ -1419,7 +1622,7 @@ mod tests {
         let (extra_source, extra) = descriptor(b"tls-auth");
         let mut entries = materials.into_descriptors();
         entries.push((ProfileMaterialSlot::OpenVpnTlsAuthKey, extra));
-        let extra = OpenVpnMaterialSet::from_inherited_descriptors(entries).unwrap();
+        let extra = OpenVpnDescriptorSet::from_inherited_descriptors(entries).unwrap();
         assert!(matches!(
             runtime_stager.stage(&plan(), extra),
             Err(OpenVpnStagingError::MaterialSetMismatch)
@@ -1457,11 +1660,11 @@ mod tests {
         let (first_source, first) = descriptor(b"first");
         let (second_source, second) = descriptor(b"second");
         assert!(matches!(
-            OpenVpnMaterialSet::from_inherited_descriptors([
+            OpenVpnDescriptorSet::from_inherited_descriptors([
                 (ProfileMaterialSlot::OpenVpnCaCertificate, first),
                 (ProfileMaterialSlot::OpenVpnCaCertificate, second),
             ]),
-            Err(OpenVpnStagingError::DuplicateMaterial)
+            Err(OpenVpnStagingError::DuplicateDescriptor)
         ));
         drop((first_source, second_source));
 
@@ -1470,7 +1673,7 @@ mod tests {
         let (cert_source, cert) = descriptor(b"cert");
         let oversized = vec![b'x'; super::MAX_MATERIAL_BYTES + 1];
         let (key_source, key) = descriptor(&oversized);
-        let materials = OpenVpnMaterialSet::from_inherited_descriptors([
+        let materials = OpenVpnDescriptorSet::from_inherited_descriptors([
             (ProfileMaterialSlot::OpenVpnCaCertificate, ca),
             (ProfileMaterialSlot::OpenVpnClientCertificate, cert),
             (ProfileMaterialSlot::OpenVpnPrivateKey, key),
@@ -1495,7 +1698,7 @@ mod tests {
         let (ca_source, ca) = descriptor(b"ca");
         let (cert_source, cert) = descriptor(b"cert");
         let directory = File::open(root.path()).unwrap();
-        let materials = OpenVpnMaterialSet::from_inherited_descriptors([
+        let materials = OpenVpnDescriptorSet::from_inherited_descriptors([
             (ProfileMaterialSlot::OpenVpnCaCertificate, ca),
             (ProfileMaterialSlot::OpenVpnClientCertificate, cert),
             (ProfileMaterialSlot::OpenVpnPrivateKey, directory),
@@ -1518,14 +1721,17 @@ mod tests {
         let (cert_source, cert) = descriptor(b"cert");
         let (key_source, key) = descriptor(b"key");
         ca.seek(SeekFrom::End(0)).unwrap();
-        let materials = OpenVpnMaterialSet::from_inherited_descriptors([
+        let materials = OpenVpnDescriptorSet::from_inherited_descriptors([
             (ProfileMaterialSlot::OpenVpnCaCertificate, ca),
             (ProfileMaterialSlot::OpenVpnClientCertificate, cert),
             (ProfileMaterialSlot::OpenVpnPrivateKey, key),
         ])
         .unwrap();
 
-        let staged = runtime_stager.stage(&plan(), materials).unwrap();
+        let staged = runtime_stager
+            .stage(&plan(), materials)
+            .unwrap()
+            .into_runtime();
         assert_eq!(
             std::fs::read(
                 staged
@@ -1542,7 +1748,10 @@ mod tests {
     fn checked_cleanup_refuses_and_preserves_replaced_tracked_file() {
         let (_root, runtime_stager) = fixture();
         let (_sources, materials) = certificate_materials();
-        let mut staged = runtime_stager.stage(&plan(), materials).unwrap();
+        let mut staged = runtime_stager
+            .stage(&plan(), materials)
+            .unwrap()
+            .into_runtime();
         let tracked = staged
             .material_path(ProfileMaterialSlot::OpenVpnPrivateKey)
             .unwrap()
@@ -1564,7 +1773,10 @@ mod tests {
     fn recovered_runtime_removes_only_fixed_private_artifacts() {
         let (_root, runtime_stager) = fixture();
         let (_sources, materials) = certificate_materials();
-        let staged = runtime_stager.stage(&plan(), materials).unwrap();
+        let staged = runtime_stager
+            .stage(&plan(), materials)
+            .unwrap()
+            .into_runtime();
         let runtime = staged.runtime_directory().to_owned();
         std::mem::forget(staged);
         std::fs::write(runtime.join("openvpn.log"), b"started").unwrap();
@@ -1586,7 +1798,10 @@ mod tests {
         for artifact in ["unknown", "openvpn.log"] {
             let (root, runtime_stager) = fixture();
             let (_sources, materials) = certificate_materials();
-            let staged = runtime_stager.stage(&plan(), materials).unwrap();
+            let staged = runtime_stager
+                .stage(&plan(), materials)
+                .unwrap()
+                .into_runtime();
             let runtime = staged.runtime_directory().to_owned();
             std::mem::forget(staged);
             if artifact == "unknown" {
