@@ -126,14 +126,44 @@ pub(crate) enum PrivilegedExecutionError {
     EffectMayHaveApplied,
 }
 
+/// Fully ledger-derived authority for one privileged network-policy call.
+///
+/// Executors never combine an untrusted operation with separately supplied
+/// recovery state. The enrolled session validates and persists the operation,
+/// then prepares this closed plan from its root-owned projection inventory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NetworkPolicyExecutionPlan {
+    operation: NetworkPolicyOperation,
+    intended: PolicyProjection,
+    prior_effective: Option<PolicyProjection>,
+    obsolete_effective: Vec<PolicyProjection>,
+}
+
+impl NetworkPolicyExecutionPlan {
+    pub(crate) const fn operation(&self) -> &NetworkPolicyOperation {
+        &self.operation
+    }
+
+    pub(crate) const fn intended(&self) -> &PolicyProjection {
+        &self.intended
+    }
+
+    pub(crate) const fn prior_effective(&self) -> Option<&PolicyProjection> {
+        self.prior_effective.as_ref()
+    }
+
+    pub(crate) fn obsolete_effective(&self) -> &[PolicyProjection] {
+        &self.obsolete_effective
+    }
+}
+
 /// Ordered platform-policy seam. The executor may report one applied mutation
 /// phase or exact read-back observations for a barrier or release. The helper
 /// derives receipt ownership from the admitted canonical operation.
 pub(crate) trait NetworkPolicyExecutor {
     fn execute_network_policy(
         &mut self,
-        operation: &NetworkPolicyOperation,
-        projection: &PolicyProjection,
+        plan: &NetworkPolicyExecutionPlan,
     ) -> Result<NetworkPolicyOutcome, PrivilegedExecutionError>;
 }
 
@@ -803,11 +833,11 @@ where
         request: &crate::vortix_core::privileged::PrivilegedRequest,
         operation: &NetworkPolicyOperation,
     ) -> Result<VerifiedReceipt, HelperError> {
-        let Some(projection) = self.guard.policy_projection() else {
+        let Some(plan) = self.network_policy_execution_plan(operation) else {
             self.poisoned = true;
             return Err(HelperError::LedgerUnavailable);
         };
-        let outcome = match self.executor.execute_network_policy(operation, projection) {
+        let outcome = match self.executor.execute_network_policy(&plan) {
             Ok(outcome) => outcome,
             Err(error) => {
                 return self.network_policy_error_receipt(request, operation, error);
@@ -869,6 +899,53 @@ where
             }
         }
         Ok(receipt)
+    }
+
+    fn network_policy_execution_plan(
+        &self,
+        operation: &NetworkPolicyOperation,
+    ) -> Option<NetworkPolicyExecutionPlan> {
+        let policy = operation.policy_resource();
+        let state = self.policy_projections.get(policy)?;
+        let intended = self.guard.policy_projection()?;
+        if intended != &state.intended || intended.policy() != policy || !intended.is_valid() {
+            return None;
+        }
+
+        let prior_effective = state.effective.clone().or_else(|| {
+            self.policy_projections
+                .iter()
+                .filter(|(resource, candidate)| {
+                    resource.kind() == policy.kind()
+                        && resource.authority_epoch() == policy.authority_epoch()
+                        && resource.generation() < policy.generation()
+                        && self.resource_states.get(*resource) == Some(&HelperResourceState::Owned)
+                        && candidate.effective.is_some()
+                })
+                .max_by_key(|(resource, _)| resource.generation())
+                .and_then(|(_, candidate)| candidate.effective.clone())
+        });
+
+        let obsolete_effective = match operation {
+            NetworkPolicyOperation::ReleaseObsolete { resources, .. } => resources
+                .iter()
+                .map(|resource| {
+                    let state = self.policy_projections.get(resource)?;
+                    (self.resource_states.get(resource)
+                        == Some(&HelperResourceState::PendingRelease))
+                    .then(|| state.effective.clone())
+                    .flatten()
+                })
+                .collect::<Option<Vec<_>>>()?,
+            _ => Vec::new(),
+        };
+
+        Some(NetworkPolicyExecutionPlan {
+            operation: operation.clone(),
+            intended: intended.clone(),
+            prior_effective,
+            obsolete_effective,
+        })
     }
 
     fn network_policy_error_receipt(
@@ -1268,6 +1345,7 @@ mod tests {
         stops: usize,
         stops_with_child: usize,
         policy_calls: usize,
+        policy_plans: Vec<NetworkPolicyExecutionPlan>,
         cleanups: usize,
         cleanup_children: usize,
         containments: usize,
@@ -1377,15 +1455,15 @@ mod tests {
     impl NetworkPolicyExecutor for FakeExecutor {
         fn execute_network_policy(
             &mut self,
-            operation: &NetworkPolicyOperation,
-            projection: &PolicyProjection,
+            plan: &NetworkPolicyExecutionPlan,
         ) -> Result<NetworkPolicyOutcome, PrivilegedExecutionError> {
             self.policy_calls += 1;
-            assert_eq!(projection.policy(), operation.policy_resource());
+            assert_eq!(plan.intended().policy(), plan.operation().policy_resource());
+            self.policy_plans.push(plan.clone());
             if let Some(error) = self.policy_error {
                 return Err(error);
             }
-            match operation {
+            match plan.operation() {
                 NetworkPolicyOperation::ObserveBarrier { policy, .. } => {
                     Ok(NetworkPolicyOutcome::Observed(vec![
                         ResourceObservation::new(policy.clone(), ObservationState::Present, 3)
@@ -1562,6 +1640,78 @@ mod tests {
 
     fn openvpn_plan(generation: u64) -> ProtocolPlan {
         openvpn_plan_for("a", generation)
+    }
+
+    fn execute_policy_phase(
+        harness: &mut LifecycleHarness,
+        sequence: u64,
+        operation: NetworkPolicyOperation,
+    ) {
+        let policy = operation.policy_resource().clone();
+        let request = harness.request(sequence, PrivilegedOperation::NetworkPolicy(operation));
+        assert!(!harness.execute(sequence + 1, &request).is_ambiguous());
+        let barrier = harness.request(
+            sequence + 1,
+            PrivilegedOperation::NetworkPolicy(NetworkPolicyOperation::ObserveBarrier {
+                policy,
+                predecessor: harness.server.guard.policy_predecessor().unwrap(),
+            }),
+        );
+        assert!(!harness.execute(sequence + 2, &barrier).is_ambiguous());
+    }
+
+    fn install_policy_generation(
+        harness: &mut LifecycleHarness,
+        generation: u64,
+        first_sequence: u64,
+    ) -> (ResourceTag, ResourceTag, ResourceTag) {
+        use crate::vortix_core::state::killswitch::KillSwitchMode;
+
+        let firewall =
+            ResourceTag::topology(AuthorityEpoch(3), generation, ResourceKind::Firewall).unwrap();
+        let routes =
+            ResourceTag::topology(AuthorityEpoch(3), generation, ResourceKind::Routes).unwrap();
+        let dns = ResourceTag::topology(AuthorityEpoch(3), generation, ResourceKind::Dns).unwrap();
+        execute_policy_phase(
+            harness,
+            first_sequence,
+            NetworkPolicyOperation::EstablishBlocking {
+                policy: firewall.clone(),
+                tunnels: Vec::new(),
+            },
+        );
+        let predecessor = harness.server.guard.policy_predecessor().unwrap();
+        execute_policy_phase(
+            harness,
+            first_sequence + 2,
+            NetworkPolicyOperation::ApplyRoutes {
+                policy: routes.clone(),
+                routes: Vec::new(),
+                predecessor,
+            },
+        );
+        let predecessor = harness.server.guard.policy_predecessor().unwrap();
+        execute_policy_phase(
+            harness,
+            first_sequence + 4,
+            NetworkPolicyOperation::ApplyDns {
+                policy: dns.clone(),
+                assignments: Vec::new(),
+                predecessor,
+            },
+        );
+        let predecessor = harness.server.guard.policy_predecessor().unwrap();
+        execute_policy_phase(
+            harness,
+            first_sequence + 6,
+            NetworkPolicyOperation::ApplyFirewall {
+                policy: firewall.clone(),
+                mode: KillSwitchMode::AlwaysOn,
+                tunnels: Vec::new(),
+                predecessor,
+            },
+        );
+        (firewall, routes, dns)
     }
 
     struct LifecycleHarness {
@@ -2739,6 +2889,135 @@ mod tests {
         assert_eq!(
             recovered.resource_states.get(&firewall),
             Some(&HelperResourceState::Owned)
+        );
+    }
+
+    #[test]
+    fn replacement_execution_plan_carries_the_prior_effective_projection() {
+        let mut harness = LifecycleHarness::for_policy(FakeExecutor::default());
+        let first = ResourceTag::topology(AuthorityEpoch(3), 1, ResourceKind::Firewall).unwrap();
+        let blocking = harness.request(
+            1,
+            PrivilegedOperation::NetworkPolicy(NetworkPolicyOperation::EstablishBlocking {
+                policy: first.clone(),
+                tunnels: Vec::new(),
+            }),
+        );
+        assert!(!harness.execute(2, &blocking).is_ambiguous());
+        let barrier = harness.request(
+            2,
+            PrivilegedOperation::NetworkPolicy(NetworkPolicyOperation::ObserveBarrier {
+                policy: first.clone(),
+                predecessor: harness.server.guard.policy_predecessor().unwrap(),
+            }),
+        );
+        assert!(!harness.execute(3, &barrier).is_ambiguous());
+
+        let replacement =
+            ResourceTag::topology(AuthorityEpoch(3), 2, ResourceKind::Firewall).unwrap();
+        let blocking = harness.request(
+            3,
+            PrivilegedOperation::NetworkPolicy(NetworkPolicyOperation::EstablishBlocking {
+                policy: replacement.clone(),
+                tunnels: Vec::new(),
+            }),
+        );
+        assert!(!harness.execute(4, &blocking).is_ambiguous());
+
+        let plan = harness.server.executor.policy_plans.last().unwrap();
+        assert_eq!(plan.intended().policy(), &replacement);
+        assert_eq!(
+            plan.prior_effective().map(PolicyProjection::policy),
+            Some(&first)
+        );
+        assert!(plan.obsolete_effective().is_empty());
+    }
+
+    #[test]
+    fn restart_rebuilds_replacement_plan_from_persisted_root_ledger() {
+        let mut harness = LifecycleHarness::for_policy(FakeExecutor::default());
+        let first = ResourceTag::topology(AuthorityEpoch(3), 1, ResourceKind::Firewall).unwrap();
+        execute_policy_phase(
+            &mut harness,
+            1,
+            NetworkPolicyOperation::EstablishBlocking {
+                policy: first.clone(),
+                tunnels: Vec::new(),
+            },
+        );
+
+        let replacement =
+            ResourceTag::topology(AuthorityEpoch(3), 2, ResourceKind::Firewall).unwrap();
+        let blocking = harness.request(
+            3,
+            PrivilegedOperation::NetworkPolicy(NetworkPolicyOperation::EstablishBlocking {
+                policy: replacement.clone(),
+                tunnels: Vec::new(),
+            }),
+        );
+        assert!(!harness.execute(4, &blocking).is_ambiguous());
+        let ledger = harness.server.ledger_store.writes.last().unwrap().clone();
+        let root = harness.server.root.clone();
+
+        let (mut recovered, principal, helper_epoch) = recover_session(
+            root,
+            ledger,
+            FakeExecutor::default(),
+            HelperCapability::NetworkPolicy,
+        );
+        let barrier = PrivilegedRequest::new(
+            &principal,
+            helper_epoch,
+            RequestSequence::new(4).unwrap(),
+            PrivilegedOperation::NetworkPolicy(NetworkPolicyOperation::ObserveBarrier {
+                policy: replacement.clone(),
+                predecessor: recovered.guard.policy_predecessor().unwrap(),
+            }),
+        )
+        .unwrap();
+        let response = recovered.handle(HelperRequest {
+            id: 2,
+            op: HelperOp::Execute(Box::new(barrier)),
+        });
+
+        assert!(response.result.is_ok());
+        let plan = recovered.executor.policy_plans.last().unwrap();
+        assert_eq!(plan.intended().policy(), &replacement);
+        assert_eq!(
+            plan.prior_effective().map(PolicyProjection::policy),
+            Some(&first)
+        );
+    }
+
+    #[test]
+    fn release_execution_plan_carries_every_obsolete_effective_projection() {
+        let mut harness = LifecycleHarness::for_policy(FakeExecutor::default());
+        let (firewall_1, routes_1, dns_1) = install_policy_generation(&mut harness, 1, 1);
+        let (firewall_2, _, _) = install_policy_generation(&mut harness, 2, 9);
+
+        let obsolete = vec![firewall_1.clone(), routes_1.clone(), dns_1.clone()];
+        let release = harness.request(
+            17,
+            PrivilegedOperation::NetworkPolicy(NetworkPolicyOperation::ReleaseObsolete {
+                policy: firewall_2.clone(),
+                resources: obsolete.clone(),
+                predecessor: harness.server.guard.policy_predecessor().unwrap(),
+            }),
+        );
+        assert!(!harness.execute(18, &release).is_ambiguous());
+
+        let plan = harness.server.executor.policy_plans.last().unwrap();
+        assert_eq!(plan.intended().policy(), &firewall_2);
+        assert_eq!(
+            plan.prior_effective().map(PolicyProjection::policy),
+            Some(&firewall_2)
+        );
+        assert_eq!(
+            plan.obsolete_effective()
+                .iter()
+                .map(PolicyProjection::policy)
+                .collect::<Vec<_>>(),
+            obsolete.iter().collect::<Vec<_>>()
         );
     }
 

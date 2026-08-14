@@ -20,15 +20,16 @@ use super::material::{
 use super::observe::SystemObservationExecutor;
 use super::runtime::HelperRuntimeIdentity;
 use super::server::{
-    process_group_for_tunnel, tunnel_for_profile_resource, CleanupExecutor, NetworkPolicyExecutor,
-    NetworkPolicyOutcome, ObservationError, ObservationExecutor, ObservationOutcome,
-    PrivilegedExecutionError, TunnelLifecycleExecutor, TunnelStartOutcome,
+    process_group_for_tunnel, tunnel_for_profile_resource, CleanupExecutor,
+    NetworkPolicyExecutionPlan, NetworkPolicyExecutor, NetworkPolicyOutcome, ObservationError,
+    ObservationExecutor, ObservationOutcome, PrivilegedExecutionError, TunnelLifecycleExecutor,
+    TunnelStartOutcome,
 };
 use super::validate::PlatformLayout;
 use crate::vortix_core::openvpn_credentials::DecodedOpenVpnCredentials;
 use crate::vortix_core::privileged::{
-    LeaseId, NetworkPolicyOperation, ObservationState, ObservedChildIdentity, OpenVpnChallengeKind,
-    PolicyProjection, ProtocolPlan, ResourceObservation, ResourceObservationTarget, ResourceTag,
+    LeaseId, ObservationState, ObservedChildIdentity, OpenVpnChallengeKind, ProtocolPlan,
+    ResourceObservation, ResourceObservationTarget, ResourceTag,
 };
 use crate::vortix_core::profile::ProtocolKind;
 use crate::vortix_protocol_openvpn::execution::{
@@ -808,8 +809,7 @@ fn verified_protocol_binary(
 impl NetworkPolicyExecutor for ProductionHelperExecutor {
     fn execute_network_policy(
         &mut self,
-        _operation: &NetworkPolicyOperation,
-        _projection: &PolicyProjection,
+        _plan: &NetworkPolicyExecutionPlan,
     ) -> Result<NetworkPolicyOutcome, PrivilegedExecutionError> {
         Err(PrivilegedExecutionError::InvalidPlan)
     }
