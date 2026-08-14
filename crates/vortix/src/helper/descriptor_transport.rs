@@ -1,8 +1,8 @@
 //! Bounded helper frames with descriptor-only secret material.
 //!
 //! `SCM_RIGHTS` is local transport metadata, not part of the serialized helper
-//! vocabulary. Descriptors are ordered exactly like `ProtocolPlan::material_refs`
-//! and are rejected for every operation that does not declare material.
+//! vocabulary. Descriptors are ordered exactly like `ProtocolPlan::descriptor_refs`
+//! and are rejected for every operation that does not declare descriptors.
 
 #![allow(
     unsafe_code,
@@ -21,7 +21,7 @@ use super::protocol::{encode_request_frame, HelperOp, HelperRequest, MAX_HELPER_
 use crate::vortix_core::privileged::PrivilegedOperation;
 
 const MAX_FDS_PER_MESSAGE: usize = 64;
-const MAX_MATERIAL_DESCRIPTORS: usize = 257;
+const MAX_TUNNEL_DESCRIPTORS: usize = 257;
 const CONTROL_WORDS: usize = 64;
 
 pub(crate) struct ReceivedHelperRequest {
@@ -64,7 +64,7 @@ pub(crate) fn send_request(
 fn expected_descriptor_count(request: &HelperRequest) -> usize {
     match &request.op {
         HelperOp::Execute(boxed) => match boxed.operation() {
-            PrivilegedOperation::StartTunnel(plan) => plan.material_refs().len(),
+            PrivilegedOperation::StartTunnel(plan) => plan.descriptor_count(),
             _ => 0,
         },
         HelperOp::Handshake(_) => 0,
@@ -83,7 +83,7 @@ fn receive_frame(stream: &UnixStream) -> Result<(Vec<u8>, Vec<File>), Descriptor
         }
         filled += received;
         descriptors.append(&mut batch);
-        if descriptors.len() > MAX_MATERIAL_DESCRIPTORS {
+        if descriptors.len() > MAX_TUNNEL_DESCRIPTORS {
             return Err(DescriptorTransportError::TooManyDescriptors);
         }
         if filled >= 4 && target == 4 {
@@ -177,7 +177,7 @@ fn send_frame(
     frame: &[u8],
     descriptors: &[RawFd],
 ) -> Result<(), DescriptorTransportError> {
-    if descriptors.len() > MAX_MATERIAL_DESCRIPTORS {
+    if descriptors.len() > MAX_TUNNEL_DESCRIPTORS {
         return Err(DescriptorTransportError::TooManyDescriptors);
     }
     if descriptors.is_empty() {
@@ -248,9 +248,9 @@ pub(crate) enum DescriptorTransportError {
     FrameTooLarge,
     #[error("helper request is malformed")]
     MalformedRequest,
-    #[error("helper material descriptor count does not match the canonical plan")]
+    #[error("helper tunnel descriptor count does not match the canonical plan")]
     DescriptorCountMismatch,
-    #[error("helper request carries too many material descriptors")]
+    #[error("helper request carries too many tunnel descriptors")]
     TooManyDescriptors,
     #[error("helper ancillary control data was truncated")]
     TruncatedControl,
@@ -272,9 +272,10 @@ mod tests {
     use crate::helper::protocol::{HelperCapability, HelperClientHello};
     use crate::vortix_core::control::AuthorityEpoch;
     use crate::vortix_core::privileged::{
-        BootScope, HelperEpoch, LeaseId, OperationDigest, PeerProcessIdentity,
-        PlatformVerifiedAuthority, RequestSequence, RootAuthorityLedger, ServiceInstanceClaim,
-        WireGuardInterfaceOptions, WireGuardPeerPlan, WireGuardPlan,
+        BootScope, HelperEpoch, LeaseId, OpenVpnAuthFactors, OpenVpnPlan, OpenVpnRemote,
+        OpenVpnRemoteSelection, OpenVpnTransport, OperationDigest, PeerProcessIdentity,
+        PlatformVerifiedAuthority, ProtocolPlan, RequestSequence, RootAuthorityLedger,
+        ServiceInstanceClaim, WireGuardInterfaceOptions, WireGuardPeerPlan, WireGuardPlan,
     };
     use crate::vortix_core::profile::ProfileId;
     use std::io::{Read as _, Seek as _, SeekFrom};
@@ -300,6 +301,23 @@ mod tests {
             WireGuardInterfaceOptions::default(),
         )
         .unwrap();
+        start_request(ProtocolPlan::WireGuard(plan))
+    }
+
+    fn interactive_openvpn_request() -> HelperRequest {
+        let plan = OpenVpnPlan::new(
+            ProfileId::parse("b".repeat(ProfileId::HEX_LEN)).unwrap(),
+            1,
+            vec![OpenVpnRemote::dns("vpn.example.com", 1194, OpenVpnTransport::Udp).unwrap()],
+            OpenVpnRemoteSelection::Ordered,
+            OpenVpnAuthFactors::username_password(),
+            Vec::new(),
+        )
+        .unwrap();
+        start_request(ProtocolPlan::OpenVpn(plan))
+    }
+
+    fn start_request(plan: ProtocolPlan) -> HelperRequest {
         let claim =
             ServiceInstanceClaim::systemd(42, 7, OperationDigest::of_bytes(b"daemon"), [9; 32])
                 .unwrap();
@@ -317,9 +335,7 @@ mod tests {
             &root.principal(),
             HelperEpoch::new(6).unwrap(),
             RequestSequence::new(1).unwrap(),
-            PrivilegedOperation::StartTunnel(
-                crate::vortix_core::privileged::ProtocolPlan::WireGuard(plan),
-            ),
+            PrivilegedOperation::StartTunnel(plan),
         )
         .unwrap();
         HelperRequest {
@@ -375,6 +391,18 @@ mod tests {
         send_frame(&mut sender, &frame, &[descriptor.as_raw_fd()]).unwrap();
         assert!(matches!(
             receive_request(&inbound),
+            Err(DescriptorTransportError::DescriptorCountMismatch)
+        ));
+    }
+
+    #[test]
+    fn interactive_openvpn_requires_profile_material_plus_one_credential_descriptor() {
+        let request = interactive_openvpn_request();
+        assert_eq!(expected_descriptor_count(&request), 2);
+        let descriptor = tempfile::tempfile().unwrap();
+        let (mut sender, _receiver) = UnixStream::pair().unwrap();
+        assert!(matches!(
+            send_request(&mut sender, &request, &[descriptor.as_raw_fd()]),
             Err(DescriptorTransportError::DescriptorCountMismatch)
         ));
     }

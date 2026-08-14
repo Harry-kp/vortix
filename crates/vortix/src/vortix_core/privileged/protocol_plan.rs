@@ -192,6 +192,60 @@ impl ProtocolPlan {
                 .collect(),
         }
     }
+
+    /// Ordered descriptor identities for one tunnel start request.
+    ///
+    /// Profile material and one-shot runtime credentials share the local
+    /// descriptor transport, but they are deliberately distinct identities:
+    /// credentials are neither serialized in this plan nor persisted as
+    /// profile material.
+    #[must_use]
+    pub(crate) fn descriptor_refs(&self) -> Vec<TunnelDescriptorRef> {
+        let mut descriptors = Vec::with_capacity(self.descriptor_count());
+        match self {
+            Self::WireGuard(plan) => {
+                descriptors.push(TunnelDescriptorRef::ProfileMaterial(
+                    ProfileMaterialRef::ProfileSlot {
+                        slot: plan.private_key,
+                    },
+                ));
+                descriptors.extend(plan.peers.iter().filter_map(|peer| {
+                    peer.preshared_key.map(|key| {
+                        TunnelDescriptorRef::ProfileMaterial(
+                            ProfileMaterialRef::WireGuardPresharedKey {
+                                peer_public_key: key.peer_public_key,
+                            },
+                        )
+                    })
+                }));
+            }
+            Self::OpenVpn(plan) => {
+                descriptors.extend(plan.materials.iter().copied().map(|slot| {
+                    TunnelDescriptorRef::ProfileMaterial(ProfileMaterialRef::ProfileSlot { slot })
+                }));
+                if plan.authentication.uses_username_password() {
+                    descriptors.push(TunnelDescriptorRef::OpenVpnCredentials);
+                }
+            }
+        }
+        descriptors
+    }
+
+    #[must_use]
+    pub(crate) fn descriptor_count(&self) -> usize {
+        match self {
+            Self::WireGuard(plan) => {
+                1 + plan
+                    .peers
+                    .iter()
+                    .filter(|peer| peer.preshared_key.is_some())
+                    .count()
+            }
+            Self::OpenVpn(plan) => {
+                plan.materials.len() + usize::from(plan.authentication.uses_username_password())
+            }
+        }
+    }
 }
 
 /// Canonical `WireGuard` interface and peer data.
@@ -359,6 +413,18 @@ pub enum ProfileMaterialSlot {
 pub enum ProfileMaterialRef {
     ProfileSlot { slot: ProfileMaterialSlot },
     WireGuardPresharedKey { peer_public_key: [u8; 32] },
+}
+
+/// Identity of one descriptor accompanying a tunnel start request.
+///
+/// This type is derived locally from [`ProtocolPlan`] and intentionally has no
+/// serde implementation. In particular, `OpenVpnCredentials` identifies a
+/// one-shot secret channel; it never makes credential bytes part of the wire
+/// plan or durable profile inventory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum TunnelDescriptorRef {
+    ProfileMaterial(ProfileMaterialRef),
+    OpenVpnCredentials,
 }
 
 /// Bounded `WireGuard` interface options. `None` delegates to the platform

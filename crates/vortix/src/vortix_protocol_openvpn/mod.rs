@@ -10,6 +10,7 @@ pub mod parser;
 pub mod tunnel;
 
 pub(crate) mod execution;
+pub(crate) mod management;
 
 pub use parser::OvpnParsedProfile;
 pub use tunnel::{OvpnDnsEvidence, OvpnTunnel};

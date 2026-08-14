@@ -5,13 +5,11 @@
 //! self-daemonizes, so Vortix retains a reapable process-group owner.
 
 use std::fmt::Write as FmtWrite;
-use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use base64::engine::{general_purpose::STANDARD as BASE64, Engine as _};
 use zeroize::Zeroizing;
 
 use crate::vortix_core::control::{OperationId, Secret};
@@ -200,155 +198,37 @@ fn read_mgmt_credentials_bundle(path: &Path) -> std::io::Result<Option<(String, 
     }
 }
 
-/// Drive `OpenVPN`'s management protocol auth dance over a unix socket
-///. Implements only
-/// the static-challenge-inline path used by `ovpn-totp`-shaped
-/// profiles: release the hold, respond to `>PASSWORD:Need 'Auth' SC:
-/// 1,<prompt>` with username + SCRV1 envelope. Returns `Ok(())` when
-/// `>STATE:<ts>,CONNECTED,...` is observed; returns `Err` on
-/// `>FATAL:`, `>PASSWORD:Verification Failed`, or socket error.
-///
-/// Dynamic CRV1, passphrase, and push MFA are deferred to a future
-/// brainstorm — when encountered, this function returns a
-/// `TunnelError::AuthFailed` describing the unhandled event so the
-/// failure is loud rather than a hang.
+/// Adapt the shared bounded management driver to the Standard-mode tunnel
+/// error vocabulary. A non-empty answer selects the supported SCRV1 static
+/// challenge; every other interactive challenge remains fail-closed.
 fn drive_mgmt_auth(
     stream: UnixStream,
     user: &str,
     pass: &str,
-    otp: &[u8],
-    profile_id: &str,
+    answer: &[u8],
     connect_timeout_secs: u64,
 ) -> Result<(), TunnelError> {
-    // Per-recv read timeout. Aligned with the configured overall
-    // connect_timeout so a slow MFA handshake (TLS + auth-pam fork +
-    // sequential PAM modules + PUSH_REPLY) doesn't trip the socket
-    // budget before the outer connect-timeout would. In the normal
-    // path events arrive continuously (HOLD -> PASSWORD prompt ->
-    // SUCCESS -> multiple STATE events) and no single recv takes
-    // more than ~1-2s; this timeout only fires when openvpn hangs.
-    stream
-        .set_read_timeout(Some(Duration::from_secs(connect_timeout_secs)))
-        .map_err(|e| TunnelError::Subprocess(format!("mgmt: set_read_timeout: {e}")))?;
-    let mut writer = stream
-        .try_clone()
-        .map_err(|e| TunnelError::Subprocess(format!("mgmt: try_clone: {e}")))?;
-    let mut reader = BufReader::new(stream);
-
-    let send = |w: &mut UnixStream, line: &str| -> Result<(), TunnelError> {
-        // No log emit of the line content — credentials cannot
-        // appear in tracing spans.
-        w.write_all(line.as_bytes())
-            .and_then(|()| w.write_all(b"\n"))
-            .and_then(|()| w.flush())
-            .map_err(|e| TunnelError::Subprocess(format!("mgmt: write: {e}")))
-    };
-
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let n = reader
-            .read_line(&mut line)
-            .map_err(|e| TunnelError::Subprocess(format!("mgmt: read_line: {e}")))?;
-        if n == 0 {
-            return Err(TunnelError::Subprocess(
-                "mgmt: socket closed before CONNECTED state".into(),
-            ));
+    let challenge = (!answer.is_empty())
+        .then_some(crate::vortix_core::privileged::OpenVpnChallengeKind::Static);
+    crate::vortix_protocol_openvpn::management::authenticate(
+        stream,
+        user,
+        pass,
+        answer,
+        challenge,
+        Duration::from_secs(connect_timeout_secs),
+    )
+    .map_err(|error| match error {
+        crate::vortix_protocol_openvpn::management::ManagementAuthError::AuthenticationRejected
+        | crate::vortix_protocol_openvpn::management::ManagementAuthError::UnsupportedChallenge
+        | crate::vortix_protocol_openvpn::management::ManagementAuthError::InvalidCredentials => {
+            TunnelError::AuthFailed(error.to_string())
         }
-        let trimmed = line.trim();
-        debug!(
-            target: "vortix::tunnel::openvpn::mgmt",
-            profile = %profile_id,
-            event = %trimmed,
-            "mgmt event"
-        );
-
-        if trimmed.starts_with(">HOLD:") {
-            // Subscribe to STATE events BEFORE releasing the hold.
-            // OpenVPN's management protocol does NOT send `>STATE:...`
-            // real-time messages by default; without `state on` the
-            // socket goes silent after the password handshake and
-            // drive_mgmt_auth sits on read_timeout waiting for a
-            // `>STATE:CONNECTED` event that will never arrive --
-            // even when the tunnel is actually up and routing
-            // traffic. The handshake-success path needs explicit
-            // subscription. (Management-notes.txt: "STATE (when
-            // state is on)" -- not in the default-enabled list.)
-            send(&mut writer, "state on")?;
-            send(&mut writer, "hold release")?;
-        } else if trimmed.starts_with(">PASSWORD:Need 'Auth'") && trimmed.contains(" SC:") {
-            // Static-challenge inline. The prompt CAN come in two
-            // observed shapes from OpenVPN:
-            //   ">PASSWORD:Need 'Auth' SC:1,Enter TOTP code"
-            //   ">PASSWORD:Need 'Auth' username/password SC:1,Enter TOTP code"
-            // (OpenVPN 2.6.19 server uses the second form; earlier
-            // versions used the first. The `username/password` token
-            // appears when the server asks for both creds in one
-            // round-trip alongside the static-challenge.)
-            // We don't parse echo/prompt -- vortix already showed the
-            // overlay; here we just send the SCRV1 envelope.
-            let username_cmd =
-                Zeroizing::new(format!("username \"Auth\" \"{}\"", escape_mgmt(user)));
-            send(&mut writer, username_cmd.as_str())?;
-            let pw_b64 = Zeroizing::new(BASE64.encode(pass));
-            let otp_b64 = Zeroizing::new(BASE64.encode(otp));
-            let password_cmd = Zeroizing::new(format!(
-                "password \"Auth\" \"SCRV1:{}:{}\"",
-                pw_b64.as_str(),
-                otp_b64.as_str()
-            ));
-            send(&mut writer, password_cmd.as_str())?;
-        } else if trimmed.starts_with(">PASSWORD:Need 'Auth'") {
-            // Non-static-challenge auth-user-pass query — plain creds.
-            let username_cmd =
-                Zeroizing::new(format!("username \"Auth\" \"{}\"", escape_mgmt(user)));
-            let password_cmd =
-                Zeroizing::new(format!("password \"Auth\" \"{}\"", escape_mgmt(pass)));
-            send(&mut writer, username_cmd.as_str())?;
-            send(&mut writer, password_cmd.as_str())?;
-        } else if trimmed.starts_with(">PASSWORD:Verification Failed") {
-            return Err(TunnelError::AuthFailed(trimmed.to_string()));
-        } else if trimmed.starts_with(">PASSWORD:Need 'Private Key'") {
-            return Err(TunnelError::AuthFailed(
-                "OpenVPN requested a private-key passphrase; this profile shape is not yet supported (deferred to next brainstorm).".into(),
-            ));
-        } else if trimmed.starts_with(">FATAL:") {
-            return Err(TunnelError::DaemonExited(trimmed.to_string()));
-        } else if let Some(state) = trimmed.strip_prefix(">STATE:") {
-            // `>STATE:<ts>,<state>,...` — we only care about CONNECTED
-            // (success) and EXITING (early failure).
-            let mut fields = state.splitn(3, ',');
-            let _ts = fields.next();
-            if let Some(state_name) = fields.next() {
-                if state_name == "CONNECTED" {
-                    return Ok(());
-                }
-                if state_name == "EXITING" {
-                    return Err(TunnelError::DaemonExited(format!(
-                        "OpenVPN entered EXITING state mid-auth: {trimmed}"
-                    )));
-                }
-            }
+        crate::vortix_protocol_openvpn::management::ManagementAuthError::DaemonExited => {
+            TunnelError::DaemonExited(error.to_string())
         }
-        // Other events (>INFO:, >LOG:, >BYTECOUNT:, etc.) are
-        // ignored — the auth dance only cares about HOLD, PASSWORD,
-        // STATE, FATAL.
-    }
-}
-
-/// Escape a value for the `OpenVPN` management protocol's quoted-string
-/// form. Per `management-notes.txt`: backslash and double-quote are
-/// the only characters that need escaping inside `"..."`.
-fn escape_mgmt(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            _ => out.push(ch),
-        }
-    }
-    out
+        _ => TunnelError::Subprocess(error.to_string()),
+    })
 }
 
 /// Wait for openvpn to create the management unix socket. Returns
@@ -1115,7 +995,6 @@ impl Tunnel for OvpnTunnel {
         };
 
         if let (Some(creds), Some(sock_path)) = (mgmt_creds, mgmt_sock_path) {
-            let profile_id_for_log = profile.id.to_string();
             let mgmt_timeout = self.connect_timeout_secs;
             let mgmt_result = (|| -> Result<(), TunnelError> {
                 wait_for_mgmt_socket(
@@ -1130,7 +1009,6 @@ impl Tunnel for OvpnTunnel {
                     creds.username.as_str(),
                     creds.password.as_str(),
                     creds.answer.expose(),
-                    &profile_id_for_log,
                     mgmt_timeout,
                 )
             })();

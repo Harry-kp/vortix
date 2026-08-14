@@ -138,17 +138,11 @@ impl Secret {
         password: &str,
         challenge_answer: Option<&str>,
     ) -> Self {
-        const MAGIC: &[u8] = b"VORTIX-OVPN-CREDENTIALS\0";
-        let answer = challenge_answer.unwrap_or_default();
-        let mut bytes =
-            Vec::with_capacity(MAGIC.len() + username.len() + password.len() + answer.len() + 12);
-        bytes.extend_from_slice(MAGIC);
-        for value in [username, password, answer] {
-            let len = u32::try_from(value.len()).unwrap_or(u32::MAX);
-            bytes.extend_from_slice(&len.to_be_bytes());
-            bytes.extend_from_slice(value.as_bytes());
-        }
-        Self::new(bytes)
+        Self::new(crate::vortix_core::openvpn_credentials::encode(
+            username,
+            password,
+            challenge_answer,
+        ))
     }
 
     pub(crate) fn decode_openvpn_credentials(
@@ -158,19 +152,13 @@ impl Secret {
         zeroize::Zeroizing<String>,
         Secret,
     )> {
-        const MAGIC: &[u8] = b"VORTIX-OVPN-CREDENTIALS\0";
-        let mut bytes = self.expose().strip_prefix(MAGIC)?;
-        let mut next = || {
-            let (raw_len, rest) = bytes.split_at_checked(4)?;
-            let len = usize::try_from(u32::from_be_bytes(raw_len.try_into().ok()?)).ok()?;
-            let (value, rest) = rest.split_at_checked(len)?;
-            bytes = rest;
-            String::from_utf8(value.to_vec()).ok()
-        };
-        let username = zeroize::Zeroizing::new(next()?);
-        let password = zeroize::Zeroizing::new(next()?);
-        let answer = Secret::new(next()?.into_bytes());
-        bytes.is_empty().then_some((username, password, answer))
+        let credentials = crate::vortix_core::openvpn_credentials::decode(self.expose())?;
+        let (username, password, mut answer) = credentials.into_parts();
+        Some((
+            username,
+            password,
+            Secret::new(std::mem::take(&mut *answer)),
+        ))
     }
 
     fn clear(&mut self) {
@@ -226,6 +214,19 @@ mod tests {
         assert!(Secret::new(b"123456".to_vec())
             .decode_openvpn_credentials()
             .is_none());
+    }
+
+    #[test]
+    fn openvpn_credentials_reject_management_line_injection_and_oversized_fields() {
+        for secret in [
+            Secret::openvpn_credentials("alice\nstate all", "password", None),
+            Secret::openvpn_credentials("alice", "pass\0word", None),
+            Secret::openvpn_credentials("alice", "password", Some("123\r456")),
+            Secret::openvpn_credentials("alice\tadmin", "password", None),
+            Secret::openvpn_credentials(&"a".repeat(1025), "password", None),
+        ] {
+            assert!(secret.decode_openvpn_credentials().is_none());
+        }
     }
 
     #[test]

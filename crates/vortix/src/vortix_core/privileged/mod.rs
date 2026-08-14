@@ -106,6 +106,7 @@ pub use operation::{
     ReplayUnused, RequestSequence, RootAuthorityLedger, ScopedRoute, ServiceInstanceClaim,
     ServiceManager, TrustedDaemonPrincipal,
 };
+pub(crate) use protocol_plan::TunnelDescriptorRef;
 pub use protocol_plan::{
     DnsHostname, OpenVpnAuthFactors, OpenVpnChallengeKind, OpenVpnKeyDirection, OpenVpnPlan,
     OpenVpnRemote, OpenVpnRemoteSelection, OpenVpnRoute, OpenVpnTransport, ProfileMaterialRef,
