@@ -59,7 +59,9 @@ pub(crate) enum PhysicalFirewallStage {
     Prepared,
     EffectPendingObservation,
     ObservedOwned,
-    ReleasePending,
+    Superseded,
+    OwnedReleasePending,
+    SupersededReleasePending,
 }
 
 /// Root-owned binding between one logical firewall projection and the exact
@@ -147,28 +149,44 @@ impl HelperLedgerFirewall {
     }
 
     pub(crate) fn mark_release_pending(mut self) -> Result<Self, &'static str> {
-        if self.stage != PhysicalFirewallStage::ObservedOwned {
-            return Err("firewall release requires observed ownership");
-        }
-        self.stage = PhysicalFirewallStage::ReleasePending;
+        self.stage = match self.stage {
+            PhysicalFirewallStage::ObservedOwned => PhysicalFirewallStage::OwnedReleasePending,
+            PhysicalFirewallStage::Superseded => PhysicalFirewallStage::SupersededReleasePending,
+            _ => return Err("firewall release requires settled ownership"),
+        };
         Ok(self)
     }
 
-    pub(crate) fn restore_observed(
+    pub(crate) fn supersede(mut self) -> Result<Self, &'static str> {
+        if self.stage != PhysicalFirewallStage::ObservedOwned {
+            return Err("only observed firewall ownership can be superseded");
+        }
+        self.stage = PhysicalFirewallStage::Superseded;
+        Ok(self)
+    }
+
+    pub(crate) fn restore_after_failed_mutation(
         mut self,
         projection: &PolicyProjection,
     ) -> Result<Self, &'static str> {
         if !matches!(
             self.stage,
-            PhysicalFirewallStage::EffectPendingObservation
-                | PhysicalFirewallStage::ObservedOwned
-                | PhysicalFirewallStage::ReleasePending
+            PhysicalFirewallStage::EffectPendingObservation | PhysicalFirewallStage::ObservedOwned
         ) || projection.policy() != &self.resource
         {
             return Err("firewall rollback projection does not match physical ownership");
         }
         self.intended_digest = projection.digest();
         self.stage = PhysicalFirewallStage::ObservedOwned;
+        Ok(self)
+    }
+
+    pub(crate) fn restore_after_failed_release(mut self) -> Result<Self, &'static str> {
+        self.stage = match self.stage {
+            PhysicalFirewallStage::OwnedReleasePending => PhysicalFirewallStage::ObservedOwned,
+            PhysicalFirewallStage::SupersededReleasePending => PhysicalFirewallStage::Superseded,
+            _ => return Err("firewall release rollback requires pending release ownership"),
+        };
         Ok(self)
     }
 }
@@ -420,6 +438,7 @@ impl HelperLedgerRecord {
                     || physical.resource().authority_epoch() != Some(replay.authority_epoch())
                     || !physical_matches_logical(physical, &resources, &policy_projections)
             })
+            || physical_inventory_is_ambiguous(&physical_firewalls)
             || policy_projections.iter().any(|policy| {
                 policy.resource().kind() == ResourceKind::Firewall
                     && !physical_firewalls
@@ -488,6 +507,28 @@ impl HelperLedgerRecord {
     }
 }
 
+fn physical_inventory_is_ambiguous(firewalls: &[HelperLedgerFirewall]) -> bool {
+    let current_owners = firewalls
+        .iter()
+        .filter(|physical| {
+            matches!(
+                physical.stage(),
+                PhysicalFirewallStage::ObservedOwned | PhysicalFirewallStage::OwnedReleasePending
+            )
+        })
+        .count();
+    let pending_replacements = firewalls
+        .iter()
+        .filter(|physical| {
+            matches!(
+                physical.stage(),
+                PhysicalFirewallStage::Prepared | PhysicalFirewallStage::EffectPendingObservation
+            )
+        })
+        .count();
+    current_owners > 1 || pending_replacements > 1
+}
+
 fn physical_matches_logical(
     physical: &HelperLedgerFirewall,
     resources: &[HelperLedgerResource],
@@ -510,13 +551,14 @@ fn physical_matches_logical(
             resource.state() == HelperResourceState::PendingEffect
                 && physical.intended_digest() == policy.intended().digest()
         }
-        PhysicalFirewallStage::ObservedOwned => {
+        PhysicalFirewallStage::ObservedOwned | PhysicalFirewallStage::Superseded => {
             resource.state() == HelperResourceState::Owned
                 && policy
                     .effective()
                     .is_some_and(|effective| physical.intended_digest() == effective.digest())
         }
-        PhysicalFirewallStage::ReleasePending => {
+        PhysicalFirewallStage::OwnedReleasePending
+        | PhysicalFirewallStage::SupersededReleasePending => {
             resource.state() == HelperResourceState::PendingRelease
                 && policy
                     .effective()
@@ -783,6 +825,40 @@ mod tests {
         let mut missing = serde_json::to_value(&record).unwrap();
         missing["physical_firewalls"] = serde_json::json!([]);
         assert!(serde_json::from_value::<HelperLedgerRecord>(missing).is_err());
+    }
+
+    #[test]
+    fn superseded_release_rollback_cannot_mint_current_firewall_ownership() {
+        let resource = ResourceTag::topology(
+            crate::vortix_core::control::AuthorityEpoch(3),
+            1,
+            ResourceKind::Firewall,
+        )
+        .unwrap();
+        let projection = PolicyProjection::Blocking {
+            policy: resource.clone(),
+            tunnels: Vec::new(),
+        };
+        let observed = HelperLedgerFirewall::prepared(
+            resource,
+            PhysicalFirewallBackend::LinuxNft,
+            FirewallTransactionId::new([9; 32]).unwrap(),
+            projection.digest(),
+        )
+        .mark_effect_pending()
+        .unwrap()
+        .confirm_observed()
+        .unwrap();
+        let superseded = observed.supersede().unwrap();
+        let pending = superseded.mark_release_pending().unwrap();
+        assert_eq!(
+            pending.stage(),
+            PhysicalFirewallStage::SupersededReleasePending
+        );
+        assert_eq!(
+            pending.restore_after_failed_release().unwrap().stage(),
+            PhysicalFirewallStage::Superseded
+        );
     }
 
     #[test]
