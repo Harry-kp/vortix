@@ -1042,12 +1042,20 @@ where
                                 self.poisoned = true;
                                 return Err(HelperError::LedgerUnavailable);
                             };
-                            self.physical_firewalls.insert(
-                                policy.clone(),
-                                physical
-                                    .confirm_observed()
-                                    .map_err(|_| HelperError::LedgerUnavailable)?,
-                            );
+                            let observed = physical
+                                .confirm_observed()
+                                .map_err(|_| HelperError::LedgerUnavailable)?;
+                            for (resource, prior) in &mut self.physical_firewalls {
+                                if resource != policy
+                                    && prior.stage() == PhysicalFirewallStage::ObservedOwned
+                                {
+                                    *prior = prior
+                                        .clone()
+                                        .supersede()
+                                        .map_err(|_| HelperError::LedgerUnavailable)?;
+                                }
+                            }
+                            self.physical_firewalls.insert(policy.clone(), observed);
                         }
                     }
                     confirmation
@@ -1232,7 +1240,11 @@ where
             }
             NetworkPolicyOperation::ReleaseObsolete { .. } => {
                 for physical in prepared.prepared_firewalls() {
-                    if physical.stage() != PhysicalFirewallStage::ReleasePending {
+                    if !matches!(
+                        physical.stage(),
+                        PhysicalFirewallStage::OwnedReleasePending
+                            | PhysicalFirewallStage::SupersededReleasePending
+                    ) {
                         return Err(HelperError::LedgerUnavailable);
                     }
                     self.physical_firewalls
@@ -1271,7 +1283,9 @@ where
                                 .physical_firewalls
                                 .get(policy)
                                 .cloned()
-                                .and_then(|physical| physical.restore_observed(&effective).ok())
+                                .and_then(|physical| {
+                                    physical.restore_after_failed_mutation(&effective).ok()
+                                })
                                 .ok_or(HelperError::LedgerUnavailable)?;
                             self.physical_firewalls.insert(policy.clone(), physical);
                         }
@@ -1308,7 +1322,12 @@ where
                                 .physical_firewalls
                                 .get(resource)
                                 .cloned()
-                                .and_then(|physical| physical.restore_observed(effective).ok())
+                                .and_then(|physical| {
+                                    if physical.intended_digest() != effective.digest() {
+                                        return None;
+                                    }
+                                    physical.restore_after_failed_release().ok()
+                                })
                                 .ok_or(HelperError::LedgerUnavailable)?;
                             self.physical_firewalls.insert(resource.clone(), physical);
                         }
@@ -3383,8 +3402,16 @@ mod tests {
             }),
         );
         assert!(!harness.execute(4, &blocking).is_ambiguous());
+        let prepared = harness.server.executor.policy_plans.last().unwrap().clone();
+        let barrier = harness.request(
+            4,
+            PrivilegedOperation::NetworkPolicy(NetworkPolicyOperation::ObserveBarrier {
+                policy: replacement.clone(),
+                predecessor: harness.server.guard.policy_predecessor().unwrap(),
+            }),
+        );
+        assert!(!harness.execute(5, &barrier).is_ambiguous());
 
-        let prepared = harness.server.executor.policy_plans.last().unwrap();
         let plan = prepared.execution();
         assert_eq!(plan.intended().policy(), &replacement);
         assert_eq!(
@@ -3393,6 +3420,10 @@ mod tests {
         );
         assert!(plan.obsolete_effective().is_empty());
         assert_eq!(harness.server.physical_firewalls.len(), 2);
+        assert_eq!(
+            harness.server.physical_firewalls[&first].stage(),
+            PhysicalFirewallStage::Superseded
+        );
         assert_eq!(
             plan.recovered_firewalls()
                 .iter()
@@ -3497,7 +3528,7 @@ mod tests {
         );
         assert_eq!(
             prepared.prepared_firewalls()[0].stage(),
-            PhysicalFirewallStage::ReleasePending
+            PhysicalFirewallStage::SupersededReleasePending
         );
     }
 
