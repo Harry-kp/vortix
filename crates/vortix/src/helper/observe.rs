@@ -21,7 +21,7 @@ use crate::vortix_core::privileged::{
 };
 use crate::vortix_core::profile::ProtocolKind;
 
-const MAX_INTERFACE_EVIDENCE_BYTES: u64 = 64;
+pub(crate) const MAX_INTERFACE_EVIDENCE_BYTES: u64 = 64;
 const MAX_CHILD_EVIDENCE_BYTES: u64 = 4 * 1024;
 
 /// Production read-back executor. It accepts only fixed identities derived
