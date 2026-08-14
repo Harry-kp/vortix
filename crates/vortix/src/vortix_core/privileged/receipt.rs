@@ -428,6 +428,11 @@ impl VerifiedReceipt {
         matches!(self.outcome, ReceiptOutcome::Ambiguous(_))
     }
 
+    #[cfg(test)]
+    pub(crate) const fn is_rejected(&self) -> bool {
+        matches!(self.outcome, ReceiptOutcome::Rejected(_))
+    }
+
     pub(crate) fn observes(&self, resource: &ResourceTag, state: ObservationState) -> bool {
         matches!(&self.outcome, ReceiptOutcome::Observed(observations) if observations
             .iter().any(|observation| observation.resource == *resource && observation.state == state))
