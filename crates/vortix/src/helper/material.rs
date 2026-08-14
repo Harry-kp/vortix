@@ -9,17 +9,21 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Debug, Formatter};
 use std::fs::File;
 use std::io::{Read as _, Seek as _, SeekFrom};
-use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::fs::OpenOptionsExt as _;
+use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+use crate::helper::child_evidence::MAX_CHILD_EVIDENCE_BYTES;
+use crate::helper::observe::MAX_INTERFACE_EVIDENCE_BYTES;
 use crate::helper::private_fs::{
     create_private_directory, private_directory_is_valid, DirectoryCreation,
 };
-use crate::helper::runtime::HelperRuntimeIdentity;
+use crate::helper::runtime::{
+    HelperRuntimeIdentity, INTERFACE_EVIDENCE_FILE, OPENVPN_CHILD_EVIDENCE_FILE,
+};
 use crate::helper::validate::{PlatformLayout, HELPER_RUNTIME_DIR_MODE, HELPER_SOCKET_DIR_MODE};
 use crate::vortix_core::privileged::{OpenVpnPlan, ProfileMaterialSlot, ResourceKind, ResourceTag};
 use crate::vortix_core::privileged::{ProfileMaterialRef, WireGuardPlan};
@@ -28,7 +32,8 @@ use crate::vortix_core::secret_file::{
     write_secret_file_tracked, SecretFileError, SecretFileIdentity,
 };
 use crate::vortix_protocol_openvpn::execution::{
-    render_helper_execution_under, supports_material_slot, OpenVpnExecutionSpec,
+    is_helper_material_filename, render_helper_execution_under, supports_material_slot,
+    OpenVpnExecutionSpec, CONFIG_FILE, LOG_FILE, MANAGEMENT_SOCKET, SECRET_DIRECTORY,
 };
 use crate::vortix_protocol_wireguard::execution::{
     render_helper_execution as render_wireguard_execution, WireGuardMaterial,
@@ -424,6 +429,7 @@ pub(crate) struct OpenVpnRuntimeStager {
     runtime_root: PathBuf,
     runtime_directory: PathBuf,
     resource: ResourceTag,
+    interface_name: String,
     expected_owner_uid: u32,
 }
 
@@ -433,6 +439,7 @@ impl OpenVpnRuntimeStager {
             runtime_root: PathBuf::from(layout.helper_runtime_dir()),
             runtime_directory: runtime.runtime_dir().to_owned(),
             resource: runtime.resource().clone(),
+            interface_name: runtime.kernel_alias().to_owned(),
             expected_owner_uid: 0,
         }
     }
@@ -442,12 +449,14 @@ impl OpenVpnRuntimeStager {
         runtime_root: PathBuf,
         runtime_directory: PathBuf,
         resource: ResourceTag,
+        interface_name: String,
         expected_owner_uid: u32,
     ) -> Self {
         Self {
             runtime_root,
             runtime_directory,
             resource,
+            interface_name,
             expected_owner_uid,
         }
     }
@@ -472,9 +481,13 @@ impl OpenVpnRuntimeStager {
         }
 
         let resource_root = self.runtime_root.join("resources");
-        let execution =
-            render_helper_execution_under(plan, &self.runtime_directory, &resource_root)
-                .map_err(|_| OpenVpnStagingError::UnsafeRuntime)?;
+        let execution = render_helper_execution_under(
+            plan,
+            &self.runtime_directory,
+            &resource_root,
+            &self.interface_name,
+        )
+        .map_err(|_| OpenVpnStagingError::UnsafeRuntime)?;
         validate_directory(
             &self.runtime_root,
             self.expected_owner_uid,
@@ -483,13 +496,25 @@ impl OpenVpnRuntimeStager {
         let mut setup = DirectorySetup::default();
         setup.create_and_validate(&resource_root, self.expected_owner_uid)?;
         setup.create_and_validate(&self.runtime_directory, self.expected_owner_uid)?;
-        let secret_directory = self.runtime_directory.join("secrets");
+        let secret_directory = self.runtime_directory.join(SECRET_DIRECTORY);
         setup.create_and_validate(&secret_directory, self.expected_owner_uid)?;
         let created_secret_directory = if setup.was_created(&secret_directory) {
             Some(CreatedDirectory::read(secret_directory)?)
         } else {
             None
         };
+        for child_created in [
+            execution.log_path(),
+            execution.management_socket(),
+            &self.runtime_directory.join(OPENVPN_CHILD_EVIDENCE_FILE),
+            &self.runtime_directory.join(INTERFACE_EVIDENCE_FILE),
+        ] {
+            match std::fs::symlink_metadata(child_created) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+                Ok(_) => return Err(OpenVpnStagingError::StaleRuntime),
+            }
+        }
 
         let mut staged = StagedOpenVpnRuntime {
             execution,
@@ -548,6 +573,18 @@ impl OpenVpnRuntimeStager {
         setup.commit();
         Ok(staged)
     }
+
+    pub(crate) fn recover_for_cleanup(
+        &self,
+    ) -> Result<RecoveredOpenVpnRuntime, OpenVpnStagingError> {
+        let recovered = RecoveredOpenVpnRuntime {
+            runtime_root: self.runtime_root.clone(),
+            runtime_directory: self.runtime_directory.clone(),
+            expected_owner_uid: self.expected_owner_uid,
+        };
+        recovered.validate()?;
+        Ok(recovered)
+    }
 }
 
 struct CreatedPath {
@@ -583,6 +620,155 @@ pub(crate) struct StagedOpenVpnRuntime {
     cleaned: bool,
 }
 
+pub(crate) struct RecoveredOpenVpnRuntime {
+    runtime_root: PathBuf,
+    runtime_directory: PathBuf,
+    expected_owner_uid: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecoveredRuntimeState {
+    payload_present: bool,
+    child_evidence_present: bool,
+}
+
+impl Debug for RecoveredOpenVpnRuntime {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RecoveredOpenVpnRuntime")
+            .field("protocol", &ProtocolKind::OpenVpn)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RecoveredOpenVpnRuntime {
+    pub(crate) fn is_drained(&self) -> Result<bool, OpenVpnStagingError> {
+        self.validate().map(|state| !state.payload_present)
+    }
+
+    fn validate(&self) -> Result<RecoveredRuntimeState, OpenVpnStagingError> {
+        validate_directory(
+            &self.runtime_root,
+            self.expected_owner_uid,
+            HELPER_SOCKET_DIR_MODE,
+        )?;
+        let resource_root = self.runtime_root.join("resources");
+        validate_directory(
+            &resource_root,
+            self.expected_owner_uid,
+            HELPER_RUNTIME_DIR_MODE,
+        )?;
+        if self.runtime_directory.parent() != Some(resource_root.as_path()) {
+            return Err(OpenVpnStagingError::UnsafeRuntime);
+        }
+        validate_directory(
+            &self.runtime_directory,
+            self.expected_owner_uid,
+            HELPER_RUNTIME_DIR_MODE,
+        )?;
+
+        let mut payload_present = false;
+        let mut child_evidence_present = false;
+        for entry in std::fs::read_dir(&self.runtime_directory)? {
+            let entry = entry?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                return Err(OpenVpnStagingError::UnsafeRuntime);
+            };
+            let path = entry.path();
+            match name.as_str() {
+                CONFIG_FILE => {
+                    validate_private_regular(
+                        &path,
+                        self.expected_owner_uid,
+                        Some(MAX_MATERIAL_BYTES as u64),
+                    )?;
+                    payload_present = true;
+                }
+                LOG_FILE => {
+                    validate_private_regular(&path, self.expected_owner_uid, None)?;
+                    payload_present = true;
+                }
+                MANAGEMENT_SOCKET => {
+                    validate_private_socket(&path, self.expected_owner_uid)?;
+                    payload_present = true;
+                }
+                OPENVPN_CHILD_EVIDENCE_FILE => {
+                    validate_private_regular(
+                        &path,
+                        self.expected_owner_uid,
+                        Some(MAX_CHILD_EVIDENCE_BYTES),
+                    )?;
+                    child_evidence_present = true;
+                }
+                INTERFACE_EVIDENCE_FILE => {
+                    validate_private_regular(
+                        &path,
+                        self.expected_owner_uid,
+                        Some(MAX_INTERFACE_EVIDENCE_BYTES),
+                    )?;
+                    payload_present = true;
+                }
+                SECRET_DIRECTORY => {
+                    validate_directory(&path, self.expected_owner_uid, HELPER_RUNTIME_DIR_MODE)?;
+                    validate_recovered_secret_directory(&path, self.expected_owner_uid)?;
+                    payload_present = true;
+                }
+                _ => return Err(OpenVpnStagingError::UnsafeRuntime),
+            }
+        }
+        Ok(RecoveredRuntimeState {
+            payload_present,
+            child_evidence_present,
+        })
+    }
+
+    pub(crate) fn cleanup_payload_after_child(&mut self) -> Result<(), OpenVpnStagingError> {
+        if !self.validate()?.payload_present {
+            return Ok(());
+        }
+        let secrets = self.runtime_directory.join(SECRET_DIRECTORY);
+        match std::fs::read_dir(&secrets) {
+            Ok(entries) => {
+                for entry in entries {
+                    std::fs::remove_file(entry?.path())?;
+                }
+                File::open(&secrets)?.sync_all()?;
+                std::fs::remove_dir(&secrets)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        for name in [
+            CONFIG_FILE,
+            LOG_FILE,
+            MANAGEMENT_SOCKET,
+            INTERFACE_EVIDENCE_FILE,
+        ] {
+            let path = self.runtime_directory.join(name);
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        File::open(&self.runtime_directory)?.sync_all()?;
+        if self.validate()?.payload_present {
+            return Err(OpenVpnStagingError::UnsafeRuntime);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish_cleanup(self) -> Result<(), OpenVpnStagingError> {
+        let state = self.validate()?;
+        if state.payload_present || state.child_evidence_present {
+            return Err(OpenVpnStagingError::UnsafeRuntime);
+        }
+        std::fs::remove_dir(&self.runtime_directory)?;
+        File::open(self.runtime_root.join("resources"))?.sync_all()?;
+        Ok(())
+    }
+}
+
 impl Debug for StagedOpenVpnRuntime {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -612,8 +798,49 @@ impl StagedOpenVpnRuntime {
 
     /// Remove only the exact files created by this staging guard. Unknown,
     /// replaced, linked, or non-private artifacts fail closed for recovery.
-    pub(crate) fn cleanup(mut self) -> Result<(), OpenVpnStagingError> {
+    pub(crate) fn cleanup(&mut self) -> Result<(), OpenVpnStagingError> {
         self.remove_created_paths_checked()
+    }
+
+    pub(crate) fn cleanup_after_child(&mut self) -> Result<(), OpenVpnStagingError> {
+        self.cleanup_payload_after_child()?;
+        self.finish_cleanup()
+    }
+
+    pub(crate) fn cleanup_payload_after_child(&mut self) -> Result<(), OpenVpnStagingError> {
+        for path in [
+            self.execution.management_socket(),
+            self.execution.log_path(),
+            &self.runtime_directory.join(INTERFACE_EVIDENCE_FILE),
+        ] {
+            let metadata = match std::fs::symlink_metadata(path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let valid_type = if path == self.execution.management_socket() {
+                metadata.file_type().is_socket()
+            } else {
+                metadata.is_file() && metadata.nlink() == 1
+            };
+            if metadata.file_type().is_symlink()
+                || !valid_type
+                || metadata.uid() != self.expected_owner_uid
+                || metadata.mode() & 0o077 != 0
+            {
+                return Err(OpenVpnStagingError::UnsafeRuntime);
+            }
+            std::fs::remove_file(path)?;
+        }
+        self.remove_created_paths_checked()
+    }
+
+    pub(crate) fn finish_cleanup(&mut self) -> Result<(), OpenVpnStagingError> {
+        match std::fs::remove_dir(&self.runtime_directory) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn remove_created_paths_checked(&mut self) -> Result<(), OpenVpnStagingError> {
@@ -656,6 +883,7 @@ impl StagedOpenVpnRuntime {
                 let _ = std::fs::remove_dir(&directory.path);
             }
         }
+        let _ = std::fs::remove_dir(&self.runtime_directory);
     }
 }
 
@@ -794,6 +1022,61 @@ fn created_directory_is_safe(
     }
 }
 
+fn validate_private_regular(
+    path: &Path,
+    expected_owner_uid: u32,
+    max_bytes: Option<u64>,
+) -> Result<(), OpenVpnStagingError> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.uid() != expected_owner_uid
+        || metadata.mode() & 0o777 != 0o600
+        || metadata.nlink() != 1
+        || metadata.len() == 0
+        || max_bytes.is_some_and(|max| metadata.len() > max)
+    {
+        return Err(OpenVpnStagingError::UnsafeRuntime);
+    }
+    Ok(())
+}
+
+fn validate_private_socket(
+    path: &Path,
+    expected_owner_uid: u32,
+) -> Result<(), OpenVpnStagingError> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.file_type().is_socket()
+        || metadata.uid() != expected_owner_uid
+        || metadata.mode() & 0o077 != 0
+    {
+        return Err(OpenVpnStagingError::UnsafeRuntime);
+    }
+    Ok(())
+}
+
+fn validate_recovered_secret_directory(
+    directory: &Path,
+    expected_owner_uid: u32,
+) -> Result<(), OpenVpnStagingError> {
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            return Err(OpenVpnStagingError::UnsafeRuntime);
+        };
+        if !is_helper_material_filename(&name) {
+            return Err(OpenVpnStagingError::UnsafeRuntime);
+        }
+        validate_private_regular(
+            &entry.path(),
+            expected_owner_uid,
+            Some(MAX_MATERIAL_BYTES as u64),
+        )?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs::File;
@@ -865,6 +1148,7 @@ mod tests {
             root.path().to_owned(),
             runtime,
             resource,
+            "vxtest0".into(),
             current_uid(),
         );
         (root, stager)
@@ -1258,7 +1542,7 @@ mod tests {
     fn checked_cleanup_refuses_and_preserves_replaced_tracked_file() {
         let (_root, runtime_stager) = fixture();
         let (_sources, materials) = certificate_materials();
-        let staged = runtime_stager.stage(&plan(), materials).unwrap();
+        let mut staged = runtime_stager.stage(&plan(), materials).unwrap();
         let tracked = staged
             .material_path(ProfileMaterialSlot::OpenVpnPrivateKey)
             .unwrap()
@@ -1274,5 +1558,50 @@ mod tests {
             Err(OpenVpnStagingError::UnsafeRuntime)
         ));
         assert_eq!(std::fs::read(tracked).unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn recovered_runtime_removes_only_fixed_private_artifacts() {
+        let (_root, runtime_stager) = fixture();
+        let (_sources, materials) = certificate_materials();
+        let staged = runtime_stager.stage(&plan(), materials).unwrap();
+        let runtime = staged.runtime_directory().to_owned();
+        std::mem::forget(staged);
+        std::fs::write(runtime.join("openvpn.log"), b"started").unwrap();
+        std::fs::set_permissions(
+            runtime.join("openvpn.log"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+
+        let mut recovered = runtime_stager.recover_for_cleanup().unwrap();
+        recovered.cleanup_payload_after_child().unwrap();
+        recovered.finish_cleanup().unwrap();
+
+        assert!(!runtime.exists());
+    }
+
+    #[test]
+    fn recovered_runtime_refuses_unknown_or_linked_artifacts() {
+        for artifact in ["unknown", "openvpn.log"] {
+            let (root, runtime_stager) = fixture();
+            let (_sources, materials) = certificate_materials();
+            let staged = runtime_stager.stage(&plan(), materials).unwrap();
+            let runtime = staged.runtime_directory().to_owned();
+            std::mem::forget(staged);
+            if artifact == "unknown" {
+                std::fs::write(runtime.join(artifact), b"foreign").unwrap();
+            } else {
+                let target = root.path().join("foreign-log");
+                std::fs::write(&target, b"foreign").unwrap();
+                symlink(target, runtime.join(artifact)).unwrap();
+            }
+
+            assert!(matches!(
+                runtime_stager.recover_for_cleanup(),
+                Err(OpenVpnStagingError::UnsafeRuntime)
+            ));
+            assert!(runtime.exists());
+        }
     }
 }
