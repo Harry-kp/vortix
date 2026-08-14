@@ -7,7 +7,7 @@ use super::{
     ReplayRecord, ResourceKind, ResourceTag, MAX_RESOURCE_ITEMS,
 };
 
-const HELPER_LEDGER_SCHEMA_VERSION: u16 = 5;
+const HELPER_LEDGER_SCHEMA_VERSION: u16 = 6;
 
 /// Durable lifecycle phase for one exact helper-managed resource. Intent is
 /// written before an external effect; release intent is written before
@@ -59,8 +59,10 @@ pub(crate) enum PhysicalFirewallStage {
     Prepared,
     EffectPendingObservation,
     ObservedOwned,
+    ObservedAbsent,
     Superseded,
     OwnedReleasePending,
+    AbsentReleasePending,
     SupersededReleasePending,
 }
 
@@ -119,10 +121,12 @@ impl HelperLedgerFirewall {
 
     #[cfg(test)]
     pub(crate) fn prepare_for(&self, projection: &PolicyProjection) -> Result<Self, &'static str> {
-        if self.stage != PhysicalFirewallStage::ObservedOwned
-            || projection.policy() != &self.resource
+        if !matches!(
+            self.stage,
+            PhysicalFirewallStage::ObservedOwned | PhysicalFirewallStage::ObservedAbsent
+        ) || projection.policy() != &self.resource
         {
-            return Err("firewall projection does not match physical ownership");
+            return Err("firewall projection does not match settled physical state");
         }
         Ok(Self::prepared(
             self.resource.clone(),
@@ -140,17 +144,24 @@ impl HelperLedgerFirewall {
         Ok(self)
     }
 
-    pub(crate) fn confirm_observed(mut self) -> Result<Self, &'static str> {
-        if self.stage != PhysicalFirewallStage::EffectPendingObservation {
+    pub(crate) fn confirm_observed(
+        mut self,
+        projection: &PolicyProjection,
+    ) -> Result<Self, &'static str> {
+        if self.stage != PhysicalFirewallStage::EffectPendingObservation
+            || projection.policy() != &self.resource
+            || projection.digest() != self.intended_digest
+        {
             return Err("firewall observation requires a pending effect");
         }
-        self.stage = PhysicalFirewallStage::ObservedOwned;
+        self.stage = settled_firewall_stage(projection)?;
         Ok(self)
     }
 
     pub(crate) fn mark_release_pending(mut self) -> Result<Self, &'static str> {
         self.stage = match self.stage {
             PhysicalFirewallStage::ObservedOwned => PhysicalFirewallStage::OwnedReleasePending,
+            PhysicalFirewallStage::ObservedAbsent => PhysicalFirewallStage::AbsentReleasePending,
             PhysicalFirewallStage::Superseded => PhysicalFirewallStage::SupersededReleasePending,
             _ => return Err("firewall release requires settled ownership"),
         };
@@ -171,23 +182,36 @@ impl HelperLedgerFirewall {
     ) -> Result<Self, &'static str> {
         if !matches!(
             self.stage,
-            PhysicalFirewallStage::EffectPendingObservation | PhysicalFirewallStage::ObservedOwned
+            PhysicalFirewallStage::EffectPendingObservation
+                | PhysicalFirewallStage::ObservedOwned
+                | PhysicalFirewallStage::ObservedAbsent
         ) || projection.policy() != &self.resource
         {
-            return Err("firewall rollback projection does not match physical ownership");
+            return Err("firewall rollback projection does not match physical state");
         }
         self.intended_digest = projection.digest();
-        self.stage = PhysicalFirewallStage::ObservedOwned;
+        self.stage = settled_firewall_stage(projection)?;
         Ok(self)
     }
 
     pub(crate) fn restore_after_failed_release(mut self) -> Result<Self, &'static str> {
         self.stage = match self.stage {
             PhysicalFirewallStage::OwnedReleasePending => PhysicalFirewallStage::ObservedOwned,
+            PhysicalFirewallStage::AbsentReleasePending => PhysicalFirewallStage::ObservedAbsent,
             PhysicalFirewallStage::SupersededReleasePending => PhysicalFirewallStage::Superseded,
             _ => return Err("firewall release rollback requires pending release ownership"),
         };
         Ok(self)
+    }
+}
+
+fn settled_firewall_stage(
+    projection: &PolicyProjection,
+) -> Result<PhysicalFirewallStage, &'static str> {
+    match projection.firewall_blocks() {
+        Some(true) => Ok(PhysicalFirewallStage::ObservedOwned),
+        Some(false) => Ok(PhysicalFirewallStage::ObservedAbsent),
+        None => Err("physical firewall state requires a firewall projection"),
     }
 }
 
@@ -551,13 +575,16 @@ fn physical_matches_logical(
             resource.state() == HelperResourceState::PendingEffect
                 && physical.intended_digest() == policy.intended().digest()
         }
-        PhysicalFirewallStage::ObservedOwned | PhysicalFirewallStage::Superseded => {
+        PhysicalFirewallStage::ObservedOwned
+        | PhysicalFirewallStage::ObservedAbsent
+        | PhysicalFirewallStage::Superseded => {
             resource.state() == HelperResourceState::Owned
                 && policy
                     .effective()
                     .is_some_and(|effective| physical.intended_digest() == effective.digest())
         }
         PhysicalFirewallStage::OwnedReleasePending
+        | PhysicalFirewallStage::AbsentReleasePending
         | PhysicalFirewallStage::SupersededReleasePending => {
             resource.state() == HelperResourceState::PendingRelease
                 && policy
@@ -847,7 +874,7 @@ mod tests {
         )
         .mark_effect_pending()
         .unwrap()
-        .confirm_observed()
+        .confirm_observed(&projection)
         .unwrap();
         let superseded = observed.supersede().unwrap();
         let pending = superseded.mark_release_pending().unwrap();
@@ -858,6 +885,38 @@ mod tests {
         assert_eq!(
             pending.restore_after_failed_release().unwrap().stage(),
             PhysicalFirewallStage::Superseded
+        );
+    }
+
+    #[test]
+    fn absent_release_rollback_cannot_mint_firewall_ownership() {
+        let resource = ResourceTag::topology(
+            crate::vortix_core::control::AuthorityEpoch(3),
+            1,
+            ResourceKind::Firewall,
+        )
+        .unwrap();
+        let projection = PolicyProjection::Firewall {
+            policy: resource.clone(),
+            mode: crate::vortix_core::state::killswitch::KillSwitchMode::Auto,
+            tunnels: Vec::new(),
+        };
+        let absent = HelperLedgerFirewall::prepared(
+            resource,
+            PhysicalFirewallBackend::LinuxNft,
+            FirewallTransactionId::new([9; 32]).unwrap(),
+            projection.digest(),
+        )
+        .mark_effect_pending()
+        .unwrap()
+        .confirm_observed(&projection)
+        .unwrap();
+        assert_eq!(absent.stage(), PhysicalFirewallStage::ObservedAbsent);
+        let pending = absent.mark_release_pending().unwrap();
+        assert_eq!(pending.stage(), PhysicalFirewallStage::AbsentReleasePending);
+        assert_eq!(
+            pending.restore_after_failed_release().unwrap().stage(),
+            PhysicalFirewallStage::ObservedAbsent
         );
     }
 
