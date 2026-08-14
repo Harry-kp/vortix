@@ -18,12 +18,13 @@ use crate::helper::protocol::{
     HelperResponse, HelperResult, HelperSessionBinding,
 };
 use crate::vortix_core::privileged::{
-    AmbiguousPhase, ChildOwner, ChildSpawnAuthority, HelperEpoch, HelperLedgerPolicy,
-    HelperLedgerRecord, HelperLedgerResource, HelperResourceState, NetworkPolicyOperation,
-    ObservationState, ObservedChildIdentity, OperationAdmission, OperationError, OperationGuard,
-    OwnedChild, PolicyProjection, PrivilegedOperation, ProtocolPlan, ReceiptError, ReceiptLedger,
-    RejectionCode, ResourceKind, ResourceObservation, ResourceObservationTarget, ResourceTag,
-    RootAuthorityLedger, VerifiedReceipt,
+    AmbiguousPhase, ChildOwner, ChildSpawnAuthority, HelperEpoch, HelperLedgerFirewall,
+    HelperLedgerPolicy, HelperLedgerRecord, HelperLedgerResource, HelperResourceState,
+    NetworkPolicyOperation, ObservationState, ObservedChildIdentity, OperationAdmission,
+    OperationError, OperationGuard, OwnedChild, PhysicalFirewallStage, PolicyProjection,
+    PrivilegedOperation, ProtocolPlan, ReceiptError, ReceiptLedger, RejectionCode, ResourceKind,
+    ResourceObservation, ResourceObservationTarget, ResourceTag, RootAuthorityLedger,
+    VerifiedReceipt,
 };
 
 const ENABLED_CAPABILITIES: [HelperCapability; 5] = [
@@ -126,6 +127,21 @@ pub(crate) enum PrivilegedExecutionError {
     EffectMayHaveApplied,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NetworkPolicyPreparationError {
+    InvalidPlan,
+    FailedBeforeEffect,
+}
+
+impl From<NetworkPolicyPreparationError> for PrivilegedExecutionError {
+    fn from(error: NetworkPolicyPreparationError) -> Self {
+        match error {
+            NetworkPolicyPreparationError::InvalidPlan => Self::InvalidPlan,
+            NetworkPolicyPreparationError::FailedBeforeEffect => Self::FailedBeforeEffect,
+        }
+    }
+}
+
 /// Fully ledger-derived authority for one privileged network-policy call.
 ///
 /// Executors never combine an untrusted operation with separately supplied
@@ -137,6 +153,7 @@ pub(crate) struct NetworkPolicyExecutionPlan {
     intended: PolicyProjection,
     prior_effective: Option<PolicyProjection>,
     obsolete_effective: Vec<PolicyProjection>,
+    recovered_firewalls: Vec<HelperLedgerFirewall>,
 }
 
 impl NetworkPolicyExecutionPlan {
@@ -155,15 +172,67 @@ impl NetworkPolicyExecutionPlan {
     pub(crate) fn obsolete_effective(&self) -> &[PolicyProjection] {
         &self.obsolete_effective
     }
+
+    pub(crate) fn recovered_firewalls(&self) -> &[HelperLedgerFirewall] {
+        &self.recovered_firewalls
+    }
+}
+
+/// Side-effect-free executor preparation result. The server validates this
+/// against its closed logical plan, durably records physical ownership, then
+/// alone permits the corresponding effect method to run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PreparedNetworkPolicyExecutionPlan {
+    execution: NetworkPolicyExecutionPlan,
+    prepared_firewalls: Vec<HelperLedgerFirewall>,
+}
+
+impl PreparedNetworkPolicyExecutionPlan {
+    pub(crate) const fn new(
+        execution: NetworkPolicyExecutionPlan,
+        prepared_firewalls: Vec<HelperLedgerFirewall>,
+    ) -> Self {
+        Self {
+            execution,
+            prepared_firewalls,
+        }
+    }
+
+    pub(crate) const fn execution(&self) -> &NetworkPolicyExecutionPlan {
+        &self.execution
+    }
+
+    pub(crate) fn prepared_firewalls(&self) -> &[HelperLedgerFirewall] {
+        &self.prepared_firewalls
+    }
+
+    fn into_parts(self) -> (NetworkPolicyExecutionPlan, Vec<HelperLedgerFirewall>) {
+        (self.execution, self.prepared_firewalls)
+    }
 }
 
 /// Ordered platform-policy seam. The executor may report one applied mutation
 /// phase or exact read-back observations for a barrier or release. The helper
 /// derives receipt ownership from the admitted canonical operation.
 pub(crate) trait NetworkPolicyExecutor {
-    fn execute_network_policy(
+    /// Validate recovered backend ownership against the current platform. No
+    /// effects or backend selection may occur here.
+    fn validate_recovered_firewalls(
+        &self,
+        firewalls: &[HelperLedgerFirewall],
+    ) -> Result<(), PrivilegedExecutionError>;
+
+    /// Select or validate physical ownership without invoking an OS effect.
+    /// A real adapter must audit the recorded backend and reject unexpected
+    /// Vortix-owned state in every alternative backend before returning.
+    fn prepare_network_policy(
         &mut self,
         plan: &NetworkPolicyExecutionPlan,
+    ) -> Result<PreparedNetworkPolicyExecutionPlan, NetworkPolicyPreparationError>;
+
+    fn execute_network_policy(
+        &mut self,
+        plan: &PreparedNetworkPolicyExecutionPlan,
     ) -> Result<NetworkPolicyOutcome, PrivilegedExecutionError>;
 }
 
@@ -221,6 +290,7 @@ pub(crate) struct EnrolledHelperSession<E, S> {
     ledger_store: S,
     resource_states: BTreeMap<ResourceTag, HelperResourceState>,
     policy_projections: BTreeMap<ResourceTag, PolicyRecoveryState>,
+    physical_firewalls: BTreeMap<ResourceTag, HelperLedgerFirewall>,
     children: BTreeMap<ResourceTag, ChildEvidence>,
     last_receipt: Option<VerifiedReceipt>,
     enabled_capabilities: Vec<HelperCapability>,
@@ -271,6 +341,7 @@ where
             ledger_store,
             resource_states: BTreeMap::new(),
             policy_projections: BTreeMap::new(),
+            physical_firewalls: BTreeMap::new(),
             children: BTreeMap::new(),
             last_receipt: None,
             enabled_capabilities,
@@ -308,8 +379,12 @@ where
         enabled_capabilities: Vec<HelperCapability>,
     ) -> Result<Self, OperationError> {
         let principal = root.principal();
-        let (replay, resources, policy_projections, child_observations) = ledger.into_parts();
+        let (replay, resources, policy_projections, physical_firewalls, child_observations) =
+            ledger.into_parts();
         let baseline = root.loaded_replay_baseline(&principal, replay)?;
+        executor
+            .validate_recovered_firewalls(&physical_firewalls)
+            .map_err(|_| OperationError::InvalidReplayState)?;
         let mut session = Self::resume_restricted(
             root,
             helper_epoch,
@@ -335,6 +410,10 @@ where
                     },
                 )
             })
+            .collect();
+        session.physical_firewalls = physical_firewalls
+            .into_iter()
+            .map(|firewall| (firewall.resource().clone(), firewall))
             .collect();
         session.children = child_observations
             .into_iter()
@@ -457,6 +536,7 @@ where
                 request.operation(),
                 PrivilegedOperation::StartTunnel(_)
                     | PrivilegedOperation::StopTunnel(_)
+                    | PrivilegedOperation::NetworkPolicy(_)
                     | PrivilegedOperation::CleanupOwned(_)
             ) {
                 self.persist_ledger()?;
@@ -837,12 +917,90 @@ where
             self.poisoned = true;
             return Err(HelperError::LedgerUnavailable);
         };
-        let outcome = match self.executor.execute_network_policy(&plan) {
+        let prepared = match self.executor.prepare_network_policy(&plan) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return self.network_policy_error_receipt(request, operation, error.into());
+            }
+        };
+        if !Self::accept_prepared_network_policy(&plan, &prepared) {
+            return self.network_policy_error_receipt(
+                request,
+                operation,
+                PrivilegedExecutionError::InvalidPlan,
+            );
+        }
+        let effect_plan = self.persist_prepared_network_policy(prepared)?;
+        let outcome = match self.executor.execute_network_policy(&effect_plan) {
             Ok(outcome) => outcome,
             Err(error) => {
                 return self.network_policy_error_receipt(request, operation, error);
             }
         };
+        self.record_network_policy_outcome(request, operation, outcome)
+    }
+
+    fn persist_prepared_network_policy(
+        &mut self,
+        prepared: PreparedNetworkPolicyExecutionPlan,
+    ) -> Result<PreparedNetworkPolicyExecutionPlan, HelperError> {
+        let operation = prepared.execution().operation().clone();
+        let prepared = if matches!(operation, NetworkPolicyOperation::ReleaseObsolete { .. }) {
+            let (execution, firewalls) = prepared.into_parts();
+            let prepared_firewalls = firewalls
+                .into_iter()
+                .map(|physical| {
+                    physical
+                        .mark_release_pending()
+                        .map_err(|_| HelperError::LedgerUnavailable)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            PreparedNetworkPolicyExecutionPlan::new(execution, prepared_firewalls)
+        } else {
+            prepared
+        };
+        self.record_prepared_network_policy(&operation, &prepared)?;
+        self.persist_ledger()?;
+        if !matches!(
+            operation,
+            NetworkPolicyOperation::EstablishBlocking { .. }
+                | NetworkPolicyOperation::ApplyFirewall { .. }
+        ) {
+            return Ok(prepared);
+        }
+
+        let policy = operation.policy_resource();
+        let (execution, firewalls) = prepared.into_parts();
+        let mut pending_for_ledger = None;
+        let prepared_firewalls = firewalls
+            .into_iter()
+            .map(|physical| {
+                if physical.resource() != policy {
+                    return Ok(physical);
+                }
+                let pending = physical
+                    .mark_effect_pending()
+                    .map_err(|_| HelperError::LedgerUnavailable)?;
+                pending_for_ledger = Some(pending.clone());
+                Ok(pending)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let Some(pending) = pending_for_ledger else {
+            self.poisoned = true;
+            return Err(HelperError::LedgerUnavailable);
+        };
+        self.physical_firewalls.insert(policy.clone(), pending);
+        let effect_plan = PreparedNetworkPolicyExecutionPlan::new(execution, prepared_firewalls);
+        self.persist_ledger()?;
+        Ok(effect_plan)
+    }
+
+    fn record_network_policy_outcome(
+        &mut self,
+        request: &crate::vortix_core::privileged::PrivilegedRequest,
+        operation: &NetworkPolicyOperation,
+        outcome: NetworkPolicyOutcome,
+    ) -> Result<VerifiedReceipt, HelperError> {
         let receipt = match (operation, outcome) {
             (
                 NetworkPolicyOperation::EstablishBlocking { .. }
@@ -878,6 +1036,19 @@ where
                         state.effective = Some(state.intended.clone());
                         self.resource_states
                             .insert(policy.clone(), HelperResourceState::Owned);
+                        if policy.kind() == ResourceKind::Firewall {
+                            let Some(physical) = self.physical_firewalls.get(policy).cloned()
+                            else {
+                                self.poisoned = true;
+                                return Err(HelperError::LedgerUnavailable);
+                            };
+                            self.physical_firewalls.insert(
+                                policy.clone(),
+                                physical
+                                    .confirm_observed()
+                                    .map_err(|_| HelperError::LedgerUnavailable)?,
+                            );
+                        }
                     }
                     confirmation
                 }
@@ -887,6 +1058,7 @@ where
                         for resource in resources {
                             self.resource_states.remove(resource);
                             self.policy_projections.remove(resource);
+                            self.physical_firewalls.remove(resource);
                         }
                     }
                     confirmation
@@ -940,12 +1112,138 @@ where
             _ => Vec::new(),
         };
 
+        let recovered_firewalls = match operation {
+            NetworkPolicyOperation::EstablishBlocking { .. }
+            | NetworkPolicyOperation::ApplyFirewall { .. } => {
+                let mut resources = Vec::new();
+                if let Some(current) = self.physical_firewalls.get(policy) {
+                    resources.push(current.clone());
+                }
+                if let Some(prior) = prior_effective.as_ref().map(PolicyProjection::policy) {
+                    if prior != policy {
+                        resources.push(self.physical_firewalls.get(prior)?.clone());
+                    }
+                }
+                resources
+            }
+            NetworkPolicyOperation::ObserveBarrier { .. }
+                if policy.kind() == ResourceKind::Firewall =>
+            {
+                vec![self.physical_firewalls.get(policy)?.clone()]
+            }
+            NetworkPolicyOperation::ReleaseObsolete { resources, .. } => resources
+                .iter()
+                .filter(|resource| resource.kind() == ResourceKind::Firewall)
+                .map(|resource| self.physical_firewalls.get(resource).cloned())
+                .collect::<Option<Vec<_>>>()?,
+            NetworkPolicyOperation::ApplyRoutes { .. }
+            | NetworkPolicyOperation::ApplyDns { .. }
+            | NetworkPolicyOperation::ObserveBarrier { .. } => Vec::new(),
+        };
+
         Some(NetworkPolicyExecutionPlan {
             operation: operation.clone(),
             intended: intended.clone(),
             prior_effective,
             obsolete_effective,
+            recovered_firewalls,
         })
+    }
+
+    fn accept_prepared_network_policy(
+        plan: &NetworkPolicyExecutionPlan,
+        prepared: &PreparedNetworkPolicyExecutionPlan,
+    ) -> bool {
+        if prepared.execution() != plan {
+            return false;
+        }
+        match plan.operation() {
+            NetworkPolicyOperation::EstablishBlocking { policy, .. }
+            | NetworkPolicyOperation::ApplyFirewall { policy, .. } => {
+                let candidates = prepared.prepared_firewalls();
+                if candidates.len()
+                    != plan.recovered_firewalls().len()
+                        + usize::from(
+                            !plan
+                                .recovered_firewalls()
+                                .iter()
+                                .any(|physical| physical.resource() == policy),
+                        )
+                {
+                    return false;
+                }
+                let Some(current) = candidates
+                    .iter()
+                    .find(|physical| physical.resource() == policy)
+                else {
+                    return false;
+                };
+                if current.stage() != PhysicalFirewallStage::Prepared
+                    || current.intended_digest() != plan.intended().digest()
+                {
+                    return false;
+                }
+                if let Some(existing) = plan
+                    .recovered_firewalls()
+                    .iter()
+                    .find(|physical| physical.resource() == policy)
+                {
+                    if current.backend() != existing.backend()
+                        || current.transaction_id() != existing.transaction_id()
+                    {
+                        return false;
+                    }
+                }
+                candidates.iter().enumerate().all(|(index, candidate)| {
+                    !candidates[..index]
+                        .iter()
+                        .any(|prior| prior.resource() == candidate.resource())
+                        && (candidate.resource() == policy
+                            || plan
+                                .recovered_firewalls()
+                                .iter()
+                                .any(|expected| expected == candidate))
+                })
+            }
+            NetworkPolicyOperation::ReleaseObsolete { .. }
+            | NetworkPolicyOperation::ObserveBarrier { .. } => {
+                prepared.prepared_firewalls() == plan.recovered_firewalls()
+            }
+            NetworkPolicyOperation::ApplyRoutes { .. }
+            | NetworkPolicyOperation::ApplyDns { .. } => prepared.prepared_firewalls().is_empty(),
+        }
+    }
+
+    fn record_prepared_network_policy(
+        &mut self,
+        operation: &NetworkPolicyOperation,
+        prepared: &PreparedNetworkPolicyExecutionPlan,
+    ) -> Result<(), HelperError> {
+        match operation {
+            NetworkPolicyOperation::EstablishBlocking { policy, .. }
+            | NetworkPolicyOperation::ApplyFirewall { policy, .. } => {
+                let physical = prepared
+                    .prepared_firewalls()
+                    .iter()
+                    .find(|physical| physical.resource() == policy)
+                    .cloned()
+                    .ok_or(HelperError::LedgerUnavailable)?;
+                self.physical_firewalls.insert(policy.clone(), physical);
+            }
+            NetworkPolicyOperation::ReleaseObsolete { .. } => {
+                for physical in prepared.prepared_firewalls() {
+                    if physical.stage() != PhysicalFirewallStage::ReleasePending {
+                        return Err(HelperError::LedgerUnavailable);
+                    }
+                    self.physical_firewalls
+                        .insert(physical.resource().clone(), physical.clone());
+                }
+            }
+            NetworkPolicyOperation::ApplyRoutes { .. }
+            | NetworkPolicyOperation::ApplyDns { .. }
+            | NetworkPolicyOperation::ObserveBarrier { .. } => {}
+        }
+        Ok(())
     }
 
     fn network_policy_error_receipt(
@@ -968,6 +1266,15 @@ where
                         .get(policy)
                         .and_then(|state| state.effective.clone())
                     {
+                        if policy.kind() == ResourceKind::Firewall {
+                            let physical = self
+                                .physical_firewalls
+                                .get(policy)
+                                .cloned()
+                                .and_then(|physical| physical.restore_observed(&effective).ok())
+                                .ok_or(HelperError::LedgerUnavailable)?;
+                            self.physical_firewalls.insert(policy.clone(), physical);
+                        }
                         self.policy_projections.insert(
                             policy.clone(),
                             PolicyRecoveryState {
@@ -980,6 +1287,7 @@ where
                     } else {
                         self.policy_projections.remove(policy);
                         self.resource_states.remove(policy);
+                        self.physical_firewalls.remove(policy);
                     }
                     self.persist_ledger()?;
                 }
@@ -990,10 +1298,24 @@ where
                     for resource in resources {
                         self.resource_states
                             .insert(resource.clone(), HelperResourceState::Owned);
+                        if resource.kind() == ResourceKind::Firewall {
+                            let effective = self
+                                .policy_projections
+                                .get(resource)
+                                .and_then(|state| state.effective.as_ref())
+                                .ok_or(HelperError::LedgerUnavailable)?;
+                            let physical = self
+                                .physical_firewalls
+                                .get(resource)
+                                .cloned()
+                                .and_then(|physical| physical.restore_observed(effective).ok())
+                                .ok_or(HelperError::LedgerUnavailable)?;
+                            self.physical_firewalls.insert(resource.clone(), physical);
+                        }
                     }
                     self.persist_ledger()?;
                 }
-                NetworkPolicyOperation::ObserveBarrier { .. } => {}
+                NetworkPolicyOperation::ObserveBarrier { .. } => self.persist_ledger()?,
             }
         }
         self.execution_error_receipt(request, error)
@@ -1148,10 +1470,12 @@ where
             .iter()
             .map(|child| child.1.identity().clone())
             .collect();
-        let Ok(ledger) = HelperLedgerRecord::new_with_policies(
+        let physical_firewalls = self.physical_firewalls.values().cloned().collect();
+        let Ok(ledger) = HelperLedgerRecord::new_with_physical_firewalls(
             checkpoint,
             resources,
             policy_projections,
+            physical_firewalls,
             child_observations,
         ) else {
             self.poisoned = true;
@@ -1297,11 +1621,11 @@ mod tests {
     use crate::vortix_core::cidr::Cidr;
     use crate::vortix_core::control::AuthorityEpoch;
     use crate::vortix_core::privileged::{
-        BootScope, ContainmentId, LeaseId, ObservationState, OpenVpnAuthFactors, OpenVpnPlan,
-        OpenVpnRemote, OpenVpnRemoteSelection, OpenVpnTransport, OperationDigest,
-        PeerProcessIdentity, PrivilegedRequest, ProtocolEndpoint, RequestSequence,
-        ServiceInstanceClaim, ServiceManager, WireGuardInterfaceOptions, WireGuardPeerPlan,
-        WireGuardPlan,
+        BootScope, ContainmentId, FirewallTransactionId, LeaseId, ObservationState,
+        OpenVpnAuthFactors, OpenVpnPlan, OpenVpnRemote, OpenVpnRemoteSelection, OpenVpnTransport,
+        OperationDigest, PeerProcessIdentity, PhysicalFirewallBackend, PrivilegedRequest,
+        ProtocolEndpoint, RequestSequence, ServiceInstanceClaim, ServiceManager,
+        WireGuardInterfaceOptions, WireGuardPeerPlan, WireGuardPlan,
     };
     use crate::vortix_core::profile::{ProfileId, ProtocolKind};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -1345,7 +1669,9 @@ mod tests {
         stops: usize,
         stops_with_child: usize,
         policy_calls: usize,
-        policy_plans: Vec<NetworkPolicyExecutionPlan>,
+        policy_prepares: usize,
+        policy_prepare_error: Option<NetworkPolicyPreparationError>,
+        policy_plans: Vec<PreparedNetworkPolicyExecutionPlan>,
         cleanups: usize,
         cleanup_children: usize,
         containments: usize,
@@ -1453,13 +1779,76 @@ mod tests {
     }
 
     impl NetworkPolicyExecutor for FakeExecutor {
-        fn execute_network_policy(
+        fn validate_recovered_firewalls(
+            &self,
+            firewalls: &[HelperLedgerFirewall],
+        ) -> Result<(), PrivilegedExecutionError> {
+            if firewalls
+                .iter()
+                .all(|firewall| firewall.backend() != PhysicalFirewallBackend::MacOsPf)
+            {
+                Ok(())
+            } else {
+                Err(PrivilegedExecutionError::InvalidPlan)
+            }
+        }
+
+        fn prepare_network_policy(
             &mut self,
             plan: &NetworkPolicyExecutionPlan,
+        ) -> Result<PreparedNetworkPolicyExecutionPlan, NetworkPolicyPreparationError> {
+            self.policy_prepares += 1;
+            if let Some(error) = self.policy_prepare_error {
+                return Err(error);
+            }
+            let mut firewalls = plan.recovered_firewalls().to_vec();
+            if matches!(
+                plan.operation(),
+                NetworkPolicyOperation::EstablishBlocking { .. }
+                    | NetworkPolicyOperation::ApplyFirewall { .. }
+            ) {
+                let resource = plan.operation().policy_resource();
+                let prepared = if let Some(existing) = firewalls
+                    .iter()
+                    .find(|physical| physical.resource() == resource)
+                {
+                    existing
+                        .prepare_for(plan.intended())
+                        .map_err(|_| NetworkPolicyPreparationError::InvalidPlan)?
+                } else {
+                    let mut transaction = [0; 32];
+                    transaction[..8].copy_from_slice(&resource.generation().to_be_bytes());
+                    HelperLedgerFirewall::prepared(
+                        resource.clone(),
+                        PhysicalFirewallBackend::LinuxNft,
+                        FirewallTransactionId::new(transaction)
+                            .map_err(|_| NetworkPolicyPreparationError::InvalidPlan)?,
+                        plan.intended().digest(),
+                    )
+                };
+                if let Some(existing) = firewalls
+                    .iter_mut()
+                    .find(|physical| physical.resource() == resource)
+                {
+                    *existing = prepared;
+                } else {
+                    firewalls.push(prepared);
+                }
+            }
+            Ok(PreparedNetworkPolicyExecutionPlan::new(
+                plan.clone(),
+                firewalls,
+            ))
+        }
+
+        fn execute_network_policy(
+            &mut self,
+            prepared: &PreparedNetworkPolicyExecutionPlan,
         ) -> Result<NetworkPolicyOutcome, PrivilegedExecutionError> {
+            let plan = prepared.execution();
             self.policy_calls += 1;
             assert_eq!(plan.intended().policy(), plan.operation().policy_resource());
-            self.policy_plans.push(plan.clone());
+            self.policy_plans.push(prepared.clone());
             if let Some(error) = self.policy_error {
                 return Err(error);
             }
@@ -2795,15 +3184,53 @@ mod tests {
         );
         assert!(!harness.execute(5, &apply).is_ambiguous());
         assert_eq!(harness.server.executor.policy_calls, 3);
-        assert_eq!(harness.server.ledger_store.writes.len(), 4);
+        assert_eq!(harness.server.ledger_store.writes.len(), 5);
         let first = &harness.server.ledger_store.writes[0];
         assert_eq!(first.resources().len(), 1);
         assert_eq!(
             first.resources()[0].state(),
             HelperResourceState::PendingEffect
         );
-        let applied = &harness.server.ledger_store.writes[2];
+        assert_eq!(
+            first.physical_firewalls()[0].stage(),
+            PhysicalFirewallStage::Prepared
+        );
+        assert_eq!(
+            harness.server.ledger_store.writes[1].physical_firewalls()[0].stage(),
+            PhysicalFirewallStage::EffectPendingObservation
+        );
+        let applied = &harness.server.ledger_store.writes[3];
         assert_eq!(applied.resources()[0].state(), HelperResourceState::Owned);
+    }
+
+    #[test]
+    fn failed_physical_firewall_persistence_prevents_the_first_effect() {
+        for failed_write in [1, 2] {
+            let mut harness = LifecycleHarness::for_policy(FakeExecutor::default());
+            harness.server.ledger_store.fail_on_write = Some(failed_write);
+            let firewall =
+                ResourceTag::topology(AuthorityEpoch(3), 1, ResourceKind::Firewall).unwrap();
+            let blocking = harness.request(
+                1,
+                PrivilegedOperation::NetworkPolicy(NetworkPolicyOperation::EstablishBlocking {
+                    policy: firewall,
+                    tunnels: Vec::new(),
+                }),
+            );
+
+            let response = harness.server.handle(HelperRequest {
+                id: 2,
+                op: HelperOp::Execute(Box::new(blocking)),
+            });
+
+            assert!(matches!(
+                response.result,
+                Err(HelperError::LedgerUnavailable)
+            ));
+            assert_eq!(harness.server.executor.policy_prepares, 1);
+            assert_eq!(harness.server.executor.policy_calls, 0);
+            assert!(harness.server.poisoned);
+        }
     }
 
     #[test]
@@ -2890,6 +3317,39 @@ mod tests {
             recovered.resource_states.get(&firewall),
             Some(&HelperResourceState::Owned)
         );
+        let physical = recovered.physical_firewalls.get(&firewall).unwrap();
+        assert_eq!(physical.backend(), PhysicalFirewallBackend::LinuxNft);
+        assert_eq!(physical.stage(), PhysicalFirewallStage::ObservedOwned);
+    }
+
+    #[test]
+    fn restart_rejects_a_physical_firewall_backend_from_another_platform() {
+        let mut harness = LifecycleHarness::for_policy(FakeExecutor::default());
+        let firewall = ResourceTag::topology(AuthorityEpoch(3), 1, ResourceKind::Firewall).unwrap();
+        execute_policy_phase(
+            &mut harness,
+            1,
+            NetworkPolicyOperation::EstablishBlocking {
+                policy: firewall,
+                tunnels: Vec::new(),
+            },
+        );
+        let root = harness.server.root.clone();
+        let mut wire =
+            serde_json::to_value(harness.server.ledger_store.writes.last().unwrap()).unwrap();
+        wire["physical_firewalls"][0]["backend"] = serde_json::json!("mac_os_pf");
+        let ledger: HelperLedgerRecord = serde_json::from_value(wire).unwrap();
+        let helper_epoch = HelperEpoch::new(9).unwrap();
+
+        let recovered = EnrolledHelperSession::recover(
+            root,
+            helper_epoch,
+            ledger,
+            FakeExecutor::default(),
+            MemoryHelperLedgerStore::default(),
+        );
+
+        assert!(matches!(recovered, Err(OperationError::InvalidReplayState)));
     }
 
     #[test]
@@ -2924,13 +3384,22 @@ mod tests {
         );
         assert!(!harness.execute(4, &blocking).is_ambiguous());
 
-        let plan = harness.server.executor.policy_plans.last().unwrap();
+        let prepared = harness.server.executor.policy_plans.last().unwrap();
+        let plan = prepared.execution();
         assert_eq!(plan.intended().policy(), &replacement);
         assert_eq!(
             plan.prior_effective().map(PolicyProjection::policy),
             Some(&first)
         );
         assert!(plan.obsolete_effective().is_empty());
+        assert_eq!(harness.server.physical_firewalls.len(), 2);
+        assert_eq!(
+            plan.recovered_firewalls()
+                .iter()
+                .map(HelperLedgerFirewall::resource)
+                .collect::<Vec<_>>(),
+            vec![&first]
+        );
     }
 
     #[test]
@@ -2981,7 +3450,7 @@ mod tests {
         });
 
         assert!(response.result.is_ok());
-        let plan = recovered.executor.policy_plans.last().unwrap();
+        let plan = recovered.executor.policy_plans.last().unwrap().execution();
         assert_eq!(plan.intended().policy(), &replacement);
         assert_eq!(
             plan.prior_effective().map(PolicyProjection::policy),
@@ -3006,7 +3475,8 @@ mod tests {
         );
         assert!(!harness.execute(18, &release).is_ambiguous());
 
-        let plan = harness.server.executor.policy_plans.last().unwrap();
+        let prepared = harness.server.executor.policy_plans.last().unwrap();
+        let plan = prepared.execution();
         assert_eq!(plan.intended().policy(), &firewall_2);
         assert_eq!(
             plan.prior_effective().map(PolicyProjection::policy),
@@ -3019,12 +3489,22 @@ mod tests {
                 .collect::<Vec<_>>(),
             obsolete.iter().collect::<Vec<_>>()
         );
+        assert_eq!(plan.recovered_firewalls().len(), 1);
+        assert_eq!(plan.recovered_firewalls()[0].resource(), &firewall_1);
+        assert_eq!(
+            plan.recovered_firewalls()[0].backend(),
+            PhysicalFirewallBackend::LinuxNft
+        );
+        assert_eq!(
+            prepared.prepared_firewalls()[0].stage(),
+            PhysicalFirewallStage::ReleasePending
+        );
     }
 
     #[test]
     fn policy_failure_before_effect_rolls_back_intent_but_not_replay() {
         let mut harness = LifecycleHarness::for_policy(FakeExecutor {
-            policy_error: Some(PrivilegedExecutionError::FailedBeforeEffect),
+            policy_prepare_error: Some(NetworkPolicyPreparationError::FailedBeforeEffect),
             ..FakeExecutor::default()
         });
         let firewall = ResourceTag::topology(AuthorityEpoch(3), 1, ResourceKind::Firewall).unwrap();
@@ -3072,7 +3552,7 @@ mod tests {
                 predecessor,
             }),
         );
-        harness.server.ledger_store.fail_on_write = Some(3);
+        harness.server.ledger_store.fail_on_write = Some(4);
 
         let response = harness.server.handle(HelperRequest {
             id: 3,

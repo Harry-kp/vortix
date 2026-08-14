@@ -96,8 +96,13 @@ pub use child_owner::{
     ChildExit, ChildObservation, ChildOwner, ChildOwnershipError, ChildOwnershipState,
     ContainmentId, CustodianAction, ObservedChildIdentity, OwnedChild, StandardCustodianContract,
 };
+#[allow(
+    unused_imports,
+    reason = "the typed transaction minter remains dormant until the firewall adapter lands"
+)]
 pub(crate) use ledger::{
-    HelperLedgerPolicy, HelperLedgerRecord, HelperLedgerResource, HelperResourceState,
+    FirewallTransactionId, HelperLedgerFirewall, HelperLedgerPolicy, HelperLedgerRecord,
+    HelperLedgerResource, HelperResourceState, PhysicalFirewallBackend, PhysicalFirewallStage,
 };
 pub use operation::{
     BootScope, HelperEpoch, LeaseId, NetworkPolicyOperation, OperationAdmission, OperationDigest,

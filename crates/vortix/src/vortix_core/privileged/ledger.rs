@@ -3,11 +3,11 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::{
-    has_duplicates, BoundedVec, ObservedChildIdentity, PolicyProjection, ReplayRecord,
-    ResourceKind, ResourceTag, MAX_RESOURCE_ITEMS,
+    has_duplicates, BoundedVec, ObservedChildIdentity, PolicyDigest, PolicyProjection,
+    ReplayRecord, ResourceKind, ResourceTag, MAX_RESOURCE_ITEMS,
 };
 
-const HELPER_LEDGER_SCHEMA_VERSION: u16 = 4;
+const HELPER_LEDGER_SCHEMA_VERSION: u16 = 5;
 
 /// Durable lifecycle phase for one exact helper-managed resource. Intent is
 /// written before an external effect; release intent is written before
@@ -19,6 +19,158 @@ pub(crate) enum HelperResourceState {
     PendingEffect,
     Owned,
     PendingRelease,
+}
+
+/// Physical firewall engines that the root helper may select. The daemon can
+/// never supply an executable, table name, path, or argument vector through
+/// this type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PhysicalFirewallBackend {
+    LinuxNft,
+    LinuxIptablesDualFamily,
+    MacOsPf,
+}
+
+/// Fixed-size helper-minted identity for one physical firewall transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct FirewallTransactionId([u8; 32]);
+
+impl FirewallTransactionId {
+    #[cfg(test)]
+    pub(crate) fn new(bytes: [u8; 32]) -> Result<Self, &'static str> {
+        if bytes == [0; 32] {
+            Err("firewall transaction identity must be non-zero")
+        } else {
+            Ok(Self(bytes))
+        }
+    }
+
+    fn is_zero(self) -> bool {
+        self.0 == [0; 32]
+    }
+}
+
+/// Durable phase of one exact physical firewall transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PhysicalFirewallStage {
+    Prepared,
+    EffectPendingObservation,
+    ObservedOwned,
+    ReleasePending,
+}
+
+/// Root-owned binding between one logical firewall projection and the exact
+/// physical backend that must be audited, observed, updated, or released.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HelperLedgerFirewall {
+    resource: ResourceTag,
+    backend: PhysicalFirewallBackend,
+    transaction_id: FirewallTransactionId,
+    intended_digest: PolicyDigest,
+    stage: PhysicalFirewallStage,
+}
+
+impl HelperLedgerFirewall {
+    #[cfg(test)]
+    pub(crate) const fn prepared(
+        resource: ResourceTag,
+        backend: PhysicalFirewallBackend,
+        transaction_id: FirewallTransactionId,
+        intended_digest: PolicyDigest,
+    ) -> Self {
+        Self {
+            resource,
+            backend,
+            transaction_id,
+            intended_digest,
+            stage: PhysicalFirewallStage::Prepared,
+        }
+    }
+
+    pub(crate) const fn resource(&self) -> &ResourceTag {
+        &self.resource
+    }
+
+    pub(crate) const fn backend(&self) -> PhysicalFirewallBackend {
+        self.backend
+    }
+
+    pub(crate) const fn transaction_id(&self) -> FirewallTransactionId {
+        self.transaction_id
+    }
+
+    const fn transaction_id_ref(&self) -> &FirewallTransactionId {
+        &self.transaction_id
+    }
+
+    pub(crate) const fn intended_digest(&self) -> PolicyDigest {
+        self.intended_digest
+    }
+
+    pub(crate) const fn stage(&self) -> PhysicalFirewallStage {
+        self.stage
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepare_for(&self, projection: &PolicyProjection) -> Result<Self, &'static str> {
+        if self.stage != PhysicalFirewallStage::ObservedOwned
+            || projection.policy() != &self.resource
+        {
+            return Err("firewall projection does not match physical ownership");
+        }
+        Ok(Self::prepared(
+            self.resource.clone(),
+            self.backend,
+            self.transaction_id,
+            projection.digest(),
+        ))
+    }
+
+    pub(crate) fn mark_effect_pending(mut self) -> Result<Self, &'static str> {
+        if self.stage != PhysicalFirewallStage::Prepared {
+            return Err("firewall effect requires prepared ownership");
+        }
+        self.stage = PhysicalFirewallStage::EffectPendingObservation;
+        Ok(self)
+    }
+
+    pub(crate) fn confirm_observed(mut self) -> Result<Self, &'static str> {
+        if self.stage != PhysicalFirewallStage::EffectPendingObservation {
+            return Err("firewall observation requires a pending effect");
+        }
+        self.stage = PhysicalFirewallStage::ObservedOwned;
+        Ok(self)
+    }
+
+    pub(crate) fn mark_release_pending(mut self) -> Result<Self, &'static str> {
+        if self.stage != PhysicalFirewallStage::ObservedOwned {
+            return Err("firewall release requires observed ownership");
+        }
+        self.stage = PhysicalFirewallStage::ReleasePending;
+        Ok(self)
+    }
+
+    pub(crate) fn restore_observed(
+        mut self,
+        projection: &PolicyProjection,
+    ) -> Result<Self, &'static str> {
+        if !matches!(
+            self.stage,
+            PhysicalFirewallStage::EffectPendingObservation
+                | PhysicalFirewallStage::ObservedOwned
+                | PhysicalFirewallStage::ReleasePending
+        ) || projection.policy() != &self.resource
+        {
+            return Err("firewall rollback projection does not match physical ownership");
+        }
+        self.intended_digest = projection.digest();
+        self.stage = PhysicalFirewallStage::ObservedOwned;
+        Ok(self)
+    }
 }
 
 /// One exact resource plus its crash-recovery phase.
@@ -118,6 +270,7 @@ pub(crate) struct HelperLedgerRecord {
     replay: ReplayRecord,
     resources: Vec<HelperLedgerResource>,
     policy_projections: Vec<HelperLedgerPolicy>,
+    physical_firewalls: Vec<HelperLedgerFirewall>,
     child_observations: Vec<ObservedChildIdentity>,
 }
 
@@ -128,6 +281,7 @@ struct HelperLedgerWire {
     replay: ReplayRecord,
     resources: BoundedVec<HelperLedgerResource, MAX_RESOURCE_ITEMS>,
     policy_projections: BoundedVec<HelperLedgerPolicy, MAX_RESOURCE_ITEMS>,
+    physical_firewalls: BoundedVec<HelperLedgerFirewall, MAX_RESOURCE_ITEMS>,
     child_observations: BoundedVec<ObservedChildIdentity, MAX_RESOURCE_ITEMS>,
 }
 
@@ -142,6 +296,7 @@ impl<'de> Deserialize<'de> for HelperLedgerRecord {
             wire.replay,
             wire.resources.into_vec(),
             wire.policy_projections.into_vec(),
+            wire.physical_firewalls.into_vec(),
             wire.child_observations.into_vec(),
         )
         .map_err(serde::de::Error::custom)
@@ -155,6 +310,7 @@ impl HelperLedgerRecord {
             replay,
             resources: Vec::new(),
             policy_projections: Vec::new(),
+            physical_firewalls: Vec::new(),
             child_observations: Vec::new(),
         }
     }
@@ -168,10 +324,27 @@ impl HelperLedgerRecord {
         Self::new_with_policies(replay, resources, Vec::new(), child_observations)
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_policies(
         replay: ReplayRecord,
         resources: Vec<HelperLedgerResource>,
         policy_projections: Vec<HelperLedgerPolicy>,
+        child_observations: Vec<ObservedChildIdentity>,
+    ) -> Result<Self, &'static str> {
+        Self::new_with_physical_firewalls(
+            replay,
+            resources,
+            policy_projections,
+            Vec::new(),
+            child_observations,
+        )
+    }
+
+    pub(crate) fn new_with_physical_firewalls(
+        replay: ReplayRecord,
+        resources: Vec<HelperLedgerResource>,
+        policy_projections: Vec<HelperLedgerPolicy>,
+        physical_firewalls: Vec<HelperLedgerFirewall>,
         child_observations: Vec<ObservedChildIdentity>,
     ) -> Result<Self, &'static str> {
         Self::new_with_schema(
@@ -179,6 +352,7 @@ impl HelperLedgerRecord {
             replay,
             resources,
             policy_projections,
+            physical_firewalls,
             child_observations,
         )
     }
@@ -188,11 +362,13 @@ impl HelperLedgerRecord {
         replay: ReplayRecord,
         resources: Vec<HelperLedgerResource>,
         policy_projections: Vec<HelperLedgerPolicy>,
+        physical_firewalls: Vec<HelperLedgerFirewall>,
         child_observations: Vec<ObservedChildIdentity>,
     ) -> Result<Self, &'static str> {
         if schema_version != HELPER_LEDGER_SCHEMA_VERSION
             || resources.len() > MAX_RESOURCE_ITEMS
             || policy_projections.len() > MAX_RESOURCE_ITEMS
+            || physical_firewalls.len() > MAX_RESOURCE_ITEMS
             || child_observations.len() > MAX_RESOURCE_ITEMS
             || has_duplicates(resources.iter().map(HelperLedgerResource::resource))
             || resources.iter().any(|entry| {
@@ -229,6 +405,28 @@ impl HelperLedgerRecord {
                     .any(|policy| policy.resource() == entry.resource())
             })
             || has_duplicates(
+                physical_firewalls
+                    .iter()
+                    .map(HelperLedgerFirewall::resource),
+            )
+            || has_duplicates(
+                physical_firewalls
+                    .iter()
+                    .map(HelperLedgerFirewall::transaction_id_ref),
+            )
+            || physical_firewalls.iter().any(|physical| {
+                physical.transaction_id().is_zero()
+                    || physical.resource().kind() != ResourceKind::Firewall
+                    || physical.resource().authority_epoch() != Some(replay.authority_epoch())
+                    || !physical_matches_logical(physical, &resources, &policy_projections)
+            })
+            || policy_projections.iter().any(|policy| {
+                policy.resource().kind() == ResourceKind::Firewall
+                    && !physical_firewalls
+                        .iter()
+                        .any(|physical| physical.resource() == policy.resource())
+            })
+            || has_duplicates(
                 child_observations
                     .iter()
                     .map(ObservedChildIdentity::resource),
@@ -256,6 +454,7 @@ impl HelperLedgerRecord {
             replay,
             resources,
             policy_projections,
+            physical_firewalls,
             child_observations,
         })
     }
@@ -271,14 +470,58 @@ impl HelperLedgerRecord {
         ReplayRecord,
         Vec<HelperLedgerResource>,
         Vec<HelperLedgerPolicy>,
+        Vec<HelperLedgerFirewall>,
         Vec<ObservedChildIdentity>,
     ) {
         (
             self.replay,
             self.resources,
             self.policy_projections,
+            self.physical_firewalls,
             self.child_observations,
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn physical_firewalls(&self) -> &[HelperLedgerFirewall] {
+        &self.physical_firewalls
+    }
+}
+
+fn physical_matches_logical(
+    physical: &HelperLedgerFirewall,
+    resources: &[HelperLedgerResource],
+    policies: &[HelperLedgerPolicy],
+) -> bool {
+    let Some(resource) = resources
+        .iter()
+        .find(|entry| entry.resource() == physical.resource())
+    else {
+        return false;
+    };
+    let Some(policy) = policies
+        .iter()
+        .find(|entry| entry.resource() == physical.resource())
+    else {
+        return false;
+    };
+    match physical.stage() {
+        PhysicalFirewallStage::Prepared | PhysicalFirewallStage::EffectPendingObservation => {
+            resource.state() == HelperResourceState::PendingEffect
+                && physical.intended_digest() == policy.intended().digest()
+        }
+        PhysicalFirewallStage::ObservedOwned => {
+            resource.state() == HelperResourceState::Owned
+                && policy
+                    .effective()
+                    .is_some_and(|effective| physical.intended_digest() == effective.digest())
+        }
+        PhysicalFirewallStage::ReleasePending => {
+            resource.state() == HelperResourceState::PendingRelease
+                && policy
+                    .effective()
+                    .is_some_and(|effective| physical.intended_digest() == effective.digest())
+        }
     }
 }
 
@@ -425,10 +668,17 @@ mod tests {
         )
         .is_err());
 
-        let record = HelperLedgerRecord::new_with_policies(
+        let physical = HelperLedgerFirewall::prepared(
+            resource.clone(),
+            PhysicalFirewallBackend::LinuxNft,
+            FirewallTransactionId::new([9; 32]).unwrap(),
+            projection.digest(),
+        );
+        let record = HelperLedgerRecord::new_with_physical_firewalls(
             replay,
             vec![HelperLedgerResource::pending(resource.clone())],
             vec![HelperLedgerPolicy::new(resource, projection, None).unwrap()],
+            vec![physical],
             Vec::new(),
         )
         .unwrap();
@@ -467,10 +717,17 @@ mod tests {
             policy: resource.clone(),
             tunnels: vec![subject],
         };
-        let record = HelperLedgerRecord::new_with_policies(
+        let physical = HelperLedgerFirewall::prepared(
+            resource.clone(),
+            PhysicalFirewallBackend::LinuxNft,
+            FirewallTransactionId::new([9; 32]).unwrap(),
+            projection.digest(),
+        );
+        let record = HelperLedgerRecord::new_with_physical_firewalls(
             replay,
             vec![HelperLedgerResource::pending(resource.clone())],
             vec![HelperLedgerPolicy::new(resource, projection, None).unwrap()],
+            vec![physical],
             Vec::new(),
         )
         .unwrap();
@@ -482,5 +739,125 @@ mod tests {
             .push(duplicate);
 
         assert!(serde_json::from_value::<HelperLedgerRecord>(wire).is_err());
+    }
+
+    #[test]
+    fn firewall_projection_requires_exact_prepared_physical_ownership() {
+        let replay: ReplayRecord = serde_json::from_value(serde_json::json!({
+            "state": "unused",
+            "record": {
+                "schema_version": crate::vortix_core::privileged::CONTRACT_SCHEMA_VERSION,
+                "authority_epoch": 3,
+                "lease_id": vec![5; 32],
+                "principal_binding": vec![7; 32],
+                "initial_helper_epoch": 8
+            }
+        }))
+        .unwrap();
+        let resource = ResourceTag::topology(
+            crate::vortix_core::control::AuthorityEpoch(3),
+            1,
+            ResourceKind::Firewall,
+        )
+        .unwrap();
+        let projection = PolicyProjection::Blocking {
+            policy: resource.clone(),
+            tunnels: Vec::new(),
+        };
+        let physical = HelperLedgerFirewall::prepared(
+            resource.clone(),
+            PhysicalFirewallBackend::LinuxNft,
+            FirewallTransactionId::new([9; 32]).unwrap(),
+            projection.digest(),
+        );
+
+        let record = HelperLedgerRecord::new_with_physical_firewalls(
+            replay,
+            vec![HelperLedgerResource::pending(resource.clone())],
+            vec![HelperLedgerPolicy::new(resource, projection, None).unwrap()],
+            vec![physical],
+            Vec::new(),
+        )
+        .unwrap();
+
+        let mut missing = serde_json::to_value(&record).unwrap();
+        missing["physical_firewalls"] = serde_json::json!([]);
+        assert!(serde_json::from_value::<HelperLedgerRecord>(missing).is_err());
+    }
+
+    #[test]
+    fn corrupt_or_ambiguous_physical_firewall_ownership_fails_closed() {
+        let replay: ReplayRecord = serde_json::from_value(serde_json::json!({
+            "state": "unused",
+            "record": {
+                "schema_version": crate::vortix_core::privileged::CONTRACT_SCHEMA_VERSION,
+                "authority_epoch": 3,
+                "lease_id": vec![5; 32],
+                "principal_binding": vec![7; 32],
+                "initial_helper_epoch": 8
+            }
+        }))
+        .unwrap();
+        let resource = ResourceTag::topology(
+            crate::vortix_core::control::AuthorityEpoch(3),
+            1,
+            ResourceKind::Firewall,
+        )
+        .unwrap();
+        let projection = PolicyProjection::Blocking {
+            policy: resource.clone(),
+            tunnels: Vec::new(),
+        };
+        let physical = HelperLedgerFirewall::prepared(
+            resource.clone(),
+            PhysicalFirewallBackend::LinuxNft,
+            FirewallTransactionId::new([9; 32]).unwrap(),
+            projection.digest(),
+        );
+        let record = HelperLedgerRecord::new_with_physical_firewalls(
+            replay,
+            vec![HelperLedgerResource::pending(resource.clone())],
+            vec![HelperLedgerPolicy::new(resource, projection, None).unwrap()],
+            vec![physical],
+            Vec::new(),
+        )
+        .unwrap();
+        let valid = serde_json::to_value(record).unwrap();
+
+        let mut wrong_digest = valid.clone();
+        wrong_digest["physical_firewalls"][0]["intended_digest"] = serde_json::json!(vec![8; 32]);
+        assert!(serde_json::from_value::<HelperLedgerRecord>(wrong_digest).is_err());
+
+        let mut impossible_stage = valid.clone();
+        impossible_stage["physical_firewalls"][0]["stage"] = serde_json::json!("observed_owned");
+        assert!(serde_json::from_value::<HelperLedgerRecord>(impossible_stage).is_err());
+
+        let mut wrong_generation = valid.clone();
+        wrong_generation["physical_firewalls"][0]["resource"]["generation"] = serde_json::json!(2);
+        assert!(serde_json::from_value::<HelperLedgerRecord>(wrong_generation).is_err());
+
+        let mut duplicate = valid.clone();
+        duplicate["physical_firewalls"]
+            .as_array_mut()
+            .unwrap()
+            .push(valid["physical_firewalls"][0].clone());
+        assert!(serde_json::from_value::<HelperLedgerRecord>(duplicate).is_err());
+
+        let mut unknown_backend = valid.clone();
+        unknown_backend["physical_firewalls"][0]["backend"] = serde_json::json!("shell");
+        assert!(serde_json::from_value::<HelperLedgerRecord>(unknown_backend).is_err());
+
+        let mut unknown_field = valid.clone();
+        unknown_field["physical_firewalls"][0]["argv"] = serde_json::json!(["nft"]);
+        assert!(serde_json::from_value::<HelperLedgerRecord>(unknown_field).is_err());
+
+        let mut unknown_schema = valid.clone();
+        unknown_schema["schema_version"] = serde_json::json!(HELPER_LEDGER_SCHEMA_VERSION + 1);
+        assert!(serde_json::from_value::<HelperLedgerRecord>(unknown_schema).is_err());
+
+        let mut oversized = valid;
+        oversized["physical_firewalls"] =
+            serde_json::json!(vec![serde_json::Value::Null; MAX_RESOURCE_ITEMS + 1]);
+        assert!(serde_json::from_value::<HelperLedgerRecord>(oversized).is_err());
     }
 }
