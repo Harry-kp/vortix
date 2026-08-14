@@ -268,6 +268,7 @@ mod tests {
     #[test]
     fn static_challenge_uses_scrv1_and_redacts_rejection_details() {
         let (client, mut server) = UnixStream::pair().unwrap();
+        let (release_peer, keep_peer_alive) = std::sync::mpsc::channel();
         let peer = thread::spawn(move || {
             server.write_all(b">HOLD:Waiting\n").unwrap();
             let mut reader = BufReader::new(server.try_clone().unwrap());
@@ -288,6 +289,7 @@ mod tests {
             server
                 .write_all(b">PASSWORD:Verification Failed: alice secret detail\n")
                 .unwrap();
+            keep_peer_alive.recv().unwrap();
             commands
         });
 
@@ -301,6 +303,7 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error, ManagementAuthError::AuthenticationRejected);
+        release_peer.send(()).unwrap();
         assert_eq!(
             peer.join().unwrap(),
             [
