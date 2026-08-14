@@ -28,7 +28,7 @@ use super::validate::PlatformLayout;
 use crate::vortix_core::openvpn_credentials::DecodedOpenVpnCredentials;
 use crate::vortix_core::privileged::{
     LeaseId, NetworkPolicyOperation, ObservationState, ObservedChildIdentity, OpenVpnChallengeKind,
-    ProtocolPlan, ResourceObservation, ResourceObservationTarget, ResourceTag,
+    PolicyProjection, ProtocolPlan, ResourceObservation, ResourceObservationTarget, ResourceTag,
 };
 use crate::vortix_core::profile::ProtocolKind;
 use crate::vortix_protocol_openvpn::execution::{
@@ -809,6 +809,7 @@ impl NetworkPolicyExecutor for ProductionHelperExecutor {
     fn execute_network_policy(
         &mut self,
         _operation: &NetworkPolicyOperation,
+        _projection: &PolicyProjection,
     ) -> Result<NetworkPolicyOutcome, PrivilegedExecutionError> {
         Err(PrivilegedExecutionError::InvalidPlan)
     }

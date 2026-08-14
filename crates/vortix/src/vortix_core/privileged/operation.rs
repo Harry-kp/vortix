@@ -17,6 +17,7 @@ use crate::vortix_core::privileged::resource::{
 use crate::vortix_core::privileged::{
     has_duplicates, invalid_unicast_ip, BoundedVec, CONTRACT_SCHEMA_VERSION, MAX_RESOURCE_ITEMS,
 };
+use crate::vortix_core::state::killswitch::KillSwitchMode;
 
 const DIGEST_SCHEMA_VERSION: u16 = CONTRACT_SCHEMA_VERSION;
 const MAX_DNS_SERVERS: usize = 16;
@@ -641,8 +642,47 @@ struct PolicyCursor {
     digest: PolicyDigest,
     phase: PolicyPhase,
     observed: bool,
+    projection: PolicyProjection,
+    previous: Option<PolicyRollback>,
     #[serde(deserialize_with = "deserialize_resource_vec")]
     pending_release: Vec<ResourceTag>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolicyRollback {
+    authority_epoch: AuthorityEpoch,
+    generation: u64,
+    digest: PolicyDigest,
+    phase: PolicyPhase,
+    projection: PolicyProjection,
+}
+
+impl PolicyRollback {
+    fn from_observed(cursor: &PolicyCursor) -> Option<Self> {
+        (cursor.observed && cursor.previous.is_none() && cursor.pending_release.is_empty()).then(
+            || Self {
+                authority_epoch: cursor.authority_epoch,
+                generation: cursor.generation,
+                digest: cursor.digest,
+                phase: cursor.phase,
+                projection: cursor.projection.clone(),
+            },
+        )
+    }
+
+    fn into_cursor(self) -> PolicyCursor {
+        PolicyCursor {
+            authority_epoch: self.authority_epoch,
+            generation: self.generation,
+            digest: self.digest,
+            phase: self.phase,
+            observed: true,
+            projection: self.projection,
+            previous: None,
+            pending_release: Vec::new(),
+        }
+    }
 }
 
 impl PolicyCursor {
@@ -661,6 +701,102 @@ pub enum PrivilegedDnsScope {
     CatchAll,
     Scoped { domains: Vec<DnsHostname> },
     Suppressed,
+}
+
+/// Whether an admitted firewall subject already has a managed interface or
+/// only needs its transport endpoints admitted during pre-tunnel blocking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrivilegedFirewallRole {
+    Primary,
+    Secondary,
+    PendingEndpoint,
+}
+
+/// Complete firewall inputs for one helper-derived tunnel identity. Physical
+/// interface names remain authority-derived inside the helper.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PrivilegedFirewallTunnel {
+    tunnel: ResourceTag,
+    endpoint_ips: Vec<IpAddr>,
+    declared_cidrs: Vec<Cidr>,
+    role: PrivilegedFirewallRole,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrivilegedFirewallTunnelWire {
+    tunnel: ResourceTag,
+    endpoint_ips: BoundedVec<IpAddr, MAX_RESOURCE_ITEMS>,
+    declared_cidrs: BoundedVec<Cidr, MAX_RESOURCE_ITEMS>,
+    role: PrivilegedFirewallRole,
+}
+
+impl<'de> Deserialize<'de> for PrivilegedFirewallTunnel {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = PrivilegedFirewallTunnelWire::deserialize(deserializer)?;
+        Self::new(
+            wire.tunnel,
+            wire.endpoint_ips.into_vec(),
+            wire.declared_cidrs.into_vec(),
+            wire.role,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+impl PrivilegedFirewallTunnel {
+    pub fn new(
+        tunnel: ResourceTag,
+        endpoint_ips: Vec<IpAddr>,
+        declared_cidrs: Vec<Cidr>,
+        role: PrivilegedFirewallRole,
+    ) -> Result<Self, OperationError> {
+        if tunnel.kind() != ResourceKind::Tunnel
+            || endpoint_ips.len() > MAX_RESOURCE_ITEMS
+            || endpoint_ips.iter().any(invalid_unicast_ip)
+            || has_duplicates(&endpoint_ips)
+            || declared_cidrs.len() > MAX_RESOURCE_ITEMS
+            || declared_cidrs.iter().any(|cidr| !cidr.is_valid())
+            || declared_cidrs
+                .iter()
+                .enumerate()
+                .any(|(index, cidr)| declared_cidrs[..index].contains(cidr))
+            || (role == PrivilegedFirewallRole::PendingEndpoint
+                && (endpoint_ips.is_empty() || !declared_cidrs.is_empty()))
+        {
+            return Err(OperationError::ResourceScopeMismatch);
+        }
+        Ok(Self {
+            tunnel,
+            endpoint_ips,
+            declared_cidrs,
+            role,
+        })
+    }
+
+    #[must_use]
+    pub const fn tunnel(&self) -> &ResourceTag {
+        &self.tunnel
+    }
+
+    #[must_use]
+    pub fn endpoint_ips(&self) -> &[IpAddr] {
+        &self.endpoint_ips
+    }
+
+    #[must_use]
+    pub fn declared_cidrs(&self) -> &[Cidr] {
+        &self.declared_cidrs
+    }
+
+    #[must_use]
+    pub const fn role(&self) -> PrivilegedFirewallRole {
+        self.role
+    }
 }
 
 #[derive(Deserialize)]
@@ -751,6 +887,26 @@ impl PrivilegedDnsAssignment {
             scope,
         })
     }
+
+    #[must_use]
+    pub const fn tunnel(&self) -> &ResourceTag {
+        &self.tunnel
+    }
+
+    #[must_use]
+    pub fn servers(&self) -> &[IpAddr] {
+        &self.servers
+    }
+
+    #[must_use]
+    pub fn search_domains(&self) -> &[DnsHostname] {
+        &self.search_domains
+    }
+
+    #[must_use]
+    pub const fn scope(&self) -> &PrivilegedDnsScope {
+        &self.scope
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -758,8 +914,8 @@ impl PrivilegedDnsAssignment {
 pub enum NetworkPolicyOperation {
     EstablishBlocking {
         policy: ResourceTag,
-        #[serde(deserialize_with = "deserialize_resource_vec")]
-        tunnels: Vec<ResourceTag>,
+        #[serde(deserialize_with = "deserialize_firewall_tunnel_vec")]
+        tunnels: Vec<PrivilegedFirewallTunnel>,
     },
     ApplyRoutes {
         policy: ResourceTag,
@@ -775,8 +931,10 @@ pub enum NetworkPolicyOperation {
     },
     ApplyFirewall {
         policy: ResourceTag,
-        #[serde(deserialize_with = "deserialize_resource_vec")]
-        tunnels: Vec<ResourceTag>,
+        #[serde(with = "crate::vortix_core::state::killswitch::serde_mode_slug")]
+        mode: KillSwitchMode,
+        #[serde(deserialize_with = "deserialize_firewall_tunnel_vec")]
+        tunnels: Vec<PrivilegedFirewallTunnel>,
         predecessor: PolicyPredecessor,
     },
     ObserveBarrier {
@@ -796,28 +954,12 @@ impl NetworkPolicyOperation {
         let policy = self.policy();
         validate_policy_tag(policy, authority, self.expected_policy_kind())?;
         match self {
-            Self::EstablishBlocking { tunnels, .. } | Self::ApplyFirewall { tunnels, .. } => {
-                validate_tunnels(tunnels)
+            Self::EstablishBlocking { tunnels, .. } => validate_firewall_tunnels(tunnels, true),
+            Self::ApplyFirewall { mode, tunnels, .. } => {
+                validate_firewall_tunnels(tunnels, matches!(mode, KillSwitchMode::AlwaysOn))
             }
-            Self::ApplyRoutes { routes, .. } => {
-                bounded(routes)?;
-                if routes
-                    .iter()
-                    .any(|route| route.tunnel.kind() != ResourceKind::Tunnel)
-                {
-                    Err(OperationError::ResourceScopeMismatch)
-                } else {
-                    Ok(())
-                }
-            }
-            Self::ApplyDns { assignments, .. } => {
-                bounded(assignments)?;
-                if has_duplicates(assignments.iter().map(|assignment| &assignment.tunnel)) {
-                    Err(OperationError::ResourceScopeMismatch)
-                } else {
-                    Ok(())
-                }
-            }
+            Self::ApplyRoutes { routes, .. } => validate_routes(routes),
+            Self::ApplyDns { assignments, .. } => validate_dns_assignments(assignments),
             Self::ObserveBarrier { .. } => Ok(()),
             Self::ReleaseObsolete {
                 policy, resources, ..
@@ -905,13 +1047,38 @@ fn validate_policy_tag(
     }
 }
 
-fn validate_tunnels(tunnels: &[ResourceTag]) -> Result<(), OperationError> {
+fn validate_firewall_tunnels(
+    tunnels: &[PrivilegedFirewallTunnel],
+    endpoints_required: bool,
+) -> Result<(), OperationError> {
     bounded(tunnels)?;
-    if tunnels
-        .iter()
-        .any(|resource| resource.kind() != ResourceKind::Tunnel)
-        || has_duplicates(tunnels)
+    if has_duplicates(tunnels.iter().map(PrivilegedFirewallTunnel::tunnel))
+        || endpoints_required
+            && tunnels
+                .iter()
+                .any(|tunnel| tunnel.endpoint_ips().is_empty())
     {
+        Err(OperationError::ResourceScopeMismatch)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_routes(routes: &[ScopedRoute]) -> Result<(), OperationError> {
+    bounded(routes)?;
+    if routes
+        .iter()
+        .any(|route| route.tunnel.kind() != ResourceKind::Tunnel)
+    {
+        Err(OperationError::ResourceScopeMismatch)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_dns_assignments(assignments: &[PrivilegedDnsAssignment]) -> Result<(), OperationError> {
+    bounded(assignments)?;
+    if has_duplicates(assignments.iter().map(|assignment| &assignment.tunnel)) {
         Err(OperationError::ResourceScopeMismatch)
     } else {
         Ok(())
@@ -933,6 +1100,122 @@ pub struct ScopedRoute {
     tunnel: ResourceTag,
 }
 
+/// Exact typed projection persisted with the replay cursor before a policy
+/// effect. Observation and release reuse this projection after helper restart
+/// instead of reconstructing privileged intent from a digest or resource tag.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum PolicyProjection {
+    Blocking {
+        policy: ResourceTag,
+        #[serde(deserialize_with = "deserialize_firewall_tunnel_vec")]
+        tunnels: Vec<PrivilegedFirewallTunnel>,
+    },
+    Routes {
+        policy: ResourceTag,
+        #[serde(deserialize_with = "deserialize_route_vec")]
+        routes: Vec<ScopedRoute>,
+    },
+    Dns {
+        policy: ResourceTag,
+        #[serde(deserialize_with = "deserialize_dns_assignment_vec")]
+        assignments: Vec<PrivilegedDnsAssignment>,
+    },
+    Firewall {
+        policy: ResourceTag,
+        #[serde(with = "crate::vortix_core::state::killswitch::serde_mode_slug")]
+        mode: KillSwitchMode,
+        #[serde(deserialize_with = "deserialize_firewall_tunnel_vec")]
+        tunnels: Vec<PrivilegedFirewallTunnel>,
+    },
+}
+
+impl PolicyProjection {
+    fn from_mutation(operation: &NetworkPolicyOperation) -> Option<Self> {
+        match operation {
+            NetworkPolicyOperation::EstablishBlocking { policy, tunnels } => Some(Self::Blocking {
+                policy: policy.clone(),
+                tunnels: tunnels.clone(),
+            }),
+            NetworkPolicyOperation::ApplyRoutes { policy, routes, .. } => Some(Self::Routes {
+                policy: policy.clone(),
+                routes: routes.clone(),
+            }),
+            NetworkPolicyOperation::ApplyDns {
+                policy,
+                assignments,
+                ..
+            } => Some(Self::Dns {
+                policy: policy.clone(),
+                assignments: assignments.clone(),
+            }),
+            NetworkPolicyOperation::ApplyFirewall {
+                policy,
+                mode,
+                tunnels,
+                ..
+            } => Some(Self::Firewall {
+                policy: policy.clone(),
+                mode: *mode,
+                tunnels: tunnels.clone(),
+            }),
+            NetworkPolicyOperation::ObserveBarrier { .. }
+            | NetworkPolicyOperation::ReleaseObsolete { .. } => None,
+        }
+    }
+
+    pub(crate) const fn policy(&self) -> &ResourceTag {
+        match self {
+            Self::Blocking { policy, .. }
+            | Self::Routes { policy, .. }
+            | Self::Dns { policy, .. }
+            | Self::Firewall { policy, .. } => policy,
+        }
+    }
+
+    const fn phase(&self) -> PolicyPhase {
+        match self {
+            Self::Blocking { .. } => PolicyPhase::Blocking,
+            Self::Routes { .. } => PolicyPhase::Routes,
+            Self::Dns { .. } => PolicyPhase::Dns,
+            Self::Firewall { .. } => PolicyPhase::Firewall,
+        }
+    }
+
+    pub(crate) fn is_valid(&self) -> bool {
+        let (policy, expected_kind, payload) = match self {
+            Self::Blocking { policy, tunnels } => (
+                policy,
+                ResourceKind::Firewall,
+                validate_firewall_tunnels(tunnels, true),
+            ),
+            Self::Routes { policy, routes } => {
+                (policy, ResourceKind::Routes, validate_routes(routes))
+            }
+            Self::Dns {
+                policy,
+                assignments,
+            } => (
+                policy,
+                ResourceKind::Dns,
+                validate_dns_assignments(assignments),
+            ),
+            Self::Firewall {
+                policy,
+                mode,
+                tunnels,
+            } => (
+                policy,
+                ResourceKind::Firewall,
+                validate_firewall_tunnels(tunnels, matches!(mode, KillSwitchMode::AlwaysOn)),
+            ),
+        };
+        policy.authority_epoch().is_some_and(|authority| {
+            validate_policy_tag(policy, authority, expected_kind).is_ok() && payload.is_ok()
+        })
+    }
+}
+
 impl ScopedRoute {
     pub fn new(destination: Cidr, tunnel: ResourceTag) -> Result<Self, OperationError> {
         if !destination.is_valid() || tunnel.kind() != ResourceKind::Tunnel {
@@ -942,6 +1225,16 @@ impl ScopedRoute {
             destination,
             tunnel,
         })
+    }
+
+    #[must_use]
+    pub const fn destination(&self) -> Cidr {
+        self.destination
+    }
+
+    #[must_use]
+    pub const fn tunnel(&self) -> &ResourceTag {
+        &self.tunnel
     }
 }
 
@@ -968,6 +1261,16 @@ where
     D: serde::Deserializer<'de>,
 {
     BoundedVec::<ResourceTag, MAX_RESOURCE_ITEMS>::deserialize(deserializer)
+        .map(BoundedVec::into_vec)
+}
+
+fn deserialize_firewall_tunnel_vec<'de, D>(
+    deserializer: D,
+) -> Result<Vec<PrivilegedFirewallTunnel>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    BoundedVec::<PrivilegedFirewallTunnel, MAX_RESOURCE_ITEMS>::deserialize(deserializer)
         .map(BoundedVec::into_vec)
 }
 
@@ -1288,7 +1591,7 @@ impl<'de> Deserialize<'de> for ReplayUnused {
 )]
 pub enum ReplayRecord {
     Unused(ReplayUnused),
-    HighWater(ReplayHighWater),
+    HighWater(Box<ReplayHighWater>),
 }
 
 impl ReplayRecord {
@@ -1342,6 +1645,21 @@ impl<'de> Deserialize<'de> for ReplayHighWater {
                 policy.authority_epoch != wire.authority_epoch
                     || policy.generation == 0
                     || policy.digest.is_zero()
+                    || !policy.projection.is_valid()
+                    || policy.projection.policy().authority_epoch() != Some(policy.authority_epoch)
+                    || policy.projection.policy().generation() != policy.generation
+                    || (policy.phase != PolicyPhase::Released
+                        && policy.projection.phase() != policy.phase)
+                    || policy.previous.as_ref().is_some_and(|previous| {
+                        previous.authority_epoch != policy.authority_epoch
+                            || previous.generation > policy.generation
+                            || previous.digest.is_zero()
+                            || !previous.projection.is_valid()
+                            || previous.projection.policy().authority_epoch()
+                                != Some(previous.authority_epoch)
+                            || previous.projection.policy().generation() != previous.generation
+                            || previous.projection.phase() != previous.phase
+                    })
                     || (policy.phase != PolicyPhase::Released && !policy.pending_release.is_empty())
                     || (policy.phase == PolicyPhase::Released
                         && !policy.observed
@@ -1402,7 +1720,7 @@ impl OperationGuard {
                 {
                     return Err(OperationError::InvalidReplayState);
                 }
-                Some(state)
+                Some(*state)
             }
         };
         Ok(Self {
@@ -1416,7 +1734,10 @@ impl OperationGuard {
 
     #[must_use]
     pub fn checkpoint(&self) -> Option<ReplayRecord> {
-        self.highest.clone().map(ReplayRecord::HighWater)
+        self.highest
+            .clone()
+            .map(Box::new)
+            .map(ReplayRecord::HighWater)
     }
 
     #[must_use]
@@ -1426,6 +1747,38 @@ impl OperationGuard {
             .policy
             .as_ref()
             .map(PolicyCursor::predecessor)
+    }
+
+    /// Return the root-ledger-authenticated projection for the current policy
+    /// phase. This is the only policy payload an executor may use for a
+    /// barrier or post-restart release.
+    pub(crate) fn policy_projection(&self) -> Option<&PolicyProjection> {
+        self.highest
+            .as_ref()?
+            .policy
+            .as_ref()
+            .map(|policy| &policy.projection)
+    }
+
+    /// Restore the last observed cursor after an executor proves a fresh
+    /// mutation failed before any external effect. The replay high-water mark
+    /// remains advanced, so the rejected request cannot be replayed.
+    pub(crate) fn rollback_policy_before_effect(
+        &mut self,
+        request: &PrivilegedRequest,
+    ) -> Result<(), OperationError> {
+        let Some(state) = &mut self.highest else {
+            return Err(OperationError::PolicyTransition);
+        };
+        if state.highest_id != *request.operation_id() || state.highest_digest != *request.digest()
+        {
+            return Err(OperationError::PolicyTransition);
+        }
+        let Some(cursor) = &mut state.policy else {
+            return Err(OperationError::PolicyTransition);
+        };
+        state.policy = cursor.previous.take().map(PolicyRollback::into_cursor);
+        Ok(())
     }
 
     pub fn validate(
@@ -1518,19 +1871,38 @@ impl OperationGuard {
         if admission == OperationAdmission::Fresh {
             let prior_policy = self.highest.as_ref().and_then(|state| state.policy.clone());
             let policy = match &request.operation {
-                PrivilegedOperation::NetworkPolicy(operation) => Some(PolicyCursor {
-                    authority_epoch: request.authority_epoch,
-                    generation: operation.policy().generation(),
-                    digest: PolicyDigest::of(operation),
-                    phase: operation.target_phase(),
-                    observed: false,
-                    pending_release: match operation {
-                        NetworkPolicyOperation::ReleaseObsolete { resources, .. } => {
-                            resources.clone()
-                        }
-                        _ => Vec::new(),
-                    },
-                }),
+                PrivilegedOperation::NetworkPolicy(operation) => {
+                    let mutation_projection = PolicyProjection::from_mutation(operation);
+                    let previous = if mutation_projection.is_some()
+                        || matches!(operation, NetworkPolicyOperation::ReleaseObsolete { .. })
+                    {
+                        prior_policy
+                            .as_ref()
+                            .and_then(PolicyRollback::from_observed)
+                    } else {
+                        prior_policy
+                            .as_ref()
+                            .and_then(|prior| prior.previous.clone())
+                    };
+                    let projection = mutation_projection
+                        .or_else(|| prior_policy.as_ref().map(|prior| prior.projection.clone()))
+                        .ok_or(OperationError::PolicyTransition)?;
+                    Some(PolicyCursor {
+                        authority_epoch: request.authority_epoch,
+                        generation: operation.policy().generation(),
+                        digest: PolicyDigest::of(operation),
+                        phase: operation.target_phase(),
+                        observed: false,
+                        projection,
+                        previous,
+                        pending_release: match operation {
+                            NetworkPolicyOperation::ReleaseObsolete { resources, .. } => {
+                                resources.clone()
+                            }
+                            _ => Vec::new(),
+                        },
+                    })
+                }
                 _ => prior_policy,
             };
             self.highest = Some(ReplayHighWater {
@@ -1576,6 +1948,7 @@ impl OperationGuard {
             return Err(OperationError::InvalidObservationReceipt);
         };
         cursor.observed = true;
+        cursor.previous = None;
         Ok(())
     }
 
@@ -1617,6 +1990,7 @@ impl OperationGuard {
         }
         cursor.observed = true;
         cursor.pending_release.clear();
+        cursor.previous = None;
         Ok(())
     }
 }
@@ -1851,8 +2225,8 @@ mod tests {
         )
         .unwrap();
         let mut value = serde_json::to_value(&request).unwrap();
-        assert_eq!(value["schema_version"], 2);
-        value["schema_version"] = serde_json::json!(3);
+        assert_eq!(value["schema_version"], 3);
+        value["schema_version"] = serde_json::json!(4);
         assert!(serde_json::from_value::<PrivilegedRequest>(value).is_err());
 
         let mut oversized = serde_json::to_value(&request).unwrap();
@@ -1899,7 +2273,76 @@ mod tests {
     }
 
     #[test]
-    fn canonical_v2_digest_golden_and_deterministic_mutations() {
+    fn firewall_contract_requires_typed_endpoint_and_rejects_physical_names() {
+        let (_root, principal) = authority();
+        let tunnel = ResourceTag::tunnel(profile('a'), 4).unwrap();
+        let empty_active = PrivilegedFirewallTunnel::new(
+            tunnel.clone(),
+            Vec::new(),
+            Vec::new(),
+            PrivilegedFirewallRole::Primary,
+        )
+        .unwrap();
+        assert_eq!(
+            PrivilegedRequest::new(
+                &principal,
+                HelperEpoch::new(3).unwrap(),
+                RequestSequence::new(1).unwrap(),
+                PrivilegedOperation::NetworkPolicy(NetworkPolicyOperation::EstablishBlocking {
+                    policy: ResourceTag::topology(AuthorityEpoch(7), 1, ResourceKind::Firewall,)
+                        .unwrap(),
+                    tunnels: vec![empty_active],
+                }),
+            )
+            .unwrap_err(),
+            OperationError::ResourceScopeMismatch
+        );
+
+        let pending = PrivilegedFirewallTunnel::new(
+            tunnel,
+            vec!["198.51.100.1".parse().unwrap()],
+            Vec::new(),
+            PrivilegedFirewallRole::PendingEndpoint,
+        )
+        .unwrap();
+        let request = PrivilegedRequest::new(
+            &principal,
+            HelperEpoch::new(3).unwrap(),
+            RequestSequence::new(1).unwrap(),
+            PrivilegedOperation::NetworkPolicy(NetworkPolicyOperation::EstablishBlocking {
+                policy: ResourceTag::topology(AuthorityEpoch(7), 1, ResourceKind::Firewall)
+                    .unwrap(),
+                tunnels: vec![pending],
+            }),
+        )
+        .unwrap();
+        let mut wire = serde_json::to_value(request).unwrap();
+        wire["operation"]["payload"]["tunnels"][0]["interface"] = serde_json::json!("foreign0");
+        assert!(serde_json::from_value::<PrivilegedRequest>(wire).is_err());
+    }
+
+    #[test]
+    fn firewall_mode_uses_the_canonical_kill_switch_slug() {
+        let policy = ResourceTag::topology(AuthorityEpoch(7), 1, ResourceKind::Firewall).unwrap();
+        let operation = NetworkPolicyOperation::ApplyFirewall {
+            policy,
+            mode: KillSwitchMode::Auto,
+            tunnels: Vec::new(),
+            predecessor: PolicyPredecessor {
+                digest: PolicyDigest(OperationDigest::from_sha256([3; 32])),
+                phase: PolicyPhase::Dns,
+                observed: true,
+            },
+        };
+        let mut wire = serde_json::to_value(&operation).unwrap();
+
+        assert_eq!(wire["mode"], "block-on-drop");
+        wire["mode"] = serde_json::json!("block_on_drop");
+        assert!(serde_json::from_value::<NetworkPolicyOperation>(wire).is_err());
+    }
+
+    #[test]
+    fn canonical_v3_digest_golden_and_deterministic_mutations() {
         let service = ServiceInstanceClaim::systemd(
             75,
             7_500,
@@ -1932,8 +2375,8 @@ mod tests {
         assert_eq!(
             base.digest().as_bytes(),
             [
-                217, 226, 84, 177, 156, 128, 206, 189, 48, 238, 129, 99, 46, 7, 181, 121, 73, 143,
-                71, 69, 205, 216, 174, 31, 42, 150, 65, 77, 58, 95, 74, 249,
+                7, 32, 90, 185, 156, 104, 54, 76, 120, 38, 196, 92, 44, 14, 207, 91, 116, 169, 218,
+                47, 164, 203, 141, 178, 21, 220, 128, 177, 58, 190, 12, 157,
             ]
         );
         for mutated in [
@@ -2011,7 +2454,7 @@ mod tests {
         receipt_verifier.verify(&request, wire).unwrap();
 
         let mut unsupported = serde_json::to_value(&verified_receipt).unwrap();
-        unsupported["schema_version"] = serde_json::json!(3);
+        unsupported["schema_version"] = serde_json::json!(4);
         assert!(
             serde_json::from_value::<crate::vortix_core::privileged::receipt::UntrustedReceipt>(
                 unsupported
@@ -2158,6 +2601,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one end-to-end release test retains the crash/restart proof chain"
+    )]
     fn release_requires_current_protection_and_every_obsolete_resource_absent() {
         let (root, principal) = authority();
         let helper = HelperEpoch::new(3).unwrap();
@@ -2178,7 +2625,13 @@ mod tests {
             RequestSequence::new(1).unwrap(),
             PrivilegedOperation::NetworkPolicy(NetworkPolicyOperation::EstablishBlocking {
                 policy: current.clone(),
-                tunnels: vec![tunnel],
+                tunnels: vec![PrivilegedFirewallTunnel::new(
+                    tunnel,
+                    vec!["198.51.100.1".parse().unwrap()],
+                    Vec::new(),
+                    PrivilegedFirewallRole::PendingEndpoint,
+                )
+                .unwrap()],
             }),
         )
         .unwrap();
@@ -2221,12 +2674,14 @@ mod tests {
         guard.admit(&release).unwrap();
         let persisted = serde_json::to_value(guard.checkpoint().unwrap()).unwrap();
         let persisted_text = persisted.to_string();
+        assert!(persisted_text.contains("projection"));
         assert!(persisted_text.contains("dns"));
         assert!(persisted_text.contains("routes"));
         let record: ReplayRecord = serde_json::from_value(persisted).unwrap();
         let baseline = root.loaded_replay_baseline(&principal, record).unwrap();
         let mut restarted =
             OperationGuard::resume(&principal, HelperEpoch::new(4).unwrap(), baseline).unwrap();
+        assert!(restarted.policy_projection().is_some());
         assert_eq!(
             receipts
                 .observed(

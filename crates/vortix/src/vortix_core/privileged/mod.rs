@@ -13,7 +13,7 @@ use serde::de::{SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
 pub(super) const MAX_RESOURCE_ITEMS: usize = 256;
-pub(super) const CONTRACT_SCHEMA_VERSION: u16 = 2;
+pub(super) const CONTRACT_SCHEMA_VERSION: u16 = 3;
 
 /// Allocation-bounded sequence decoder for every collection crossing the
 /// untrusted privileged wire. It rejects the first element beyond `LIMIT`
@@ -96,16 +96,18 @@ pub use child_owner::{
     ChildExit, ChildObservation, ChildOwner, ChildOwnershipError, ChildOwnershipState,
     ContainmentId, CustodianAction, ObservedChildIdentity, OwnedChild, StandardCustodianContract,
 };
-pub(crate) use ledger::{HelperLedgerRecord, HelperLedgerResource, HelperResourceState};
-pub(crate) use operation::PlatformVerifiedAuthority;
+pub(crate) use ledger::{
+    HelperLedgerPolicy, HelperLedgerRecord, HelperLedgerResource, HelperResourceState,
+};
 pub use operation::{
     BootScope, HelperEpoch, LeaseId, NetworkPolicyOperation, OperationAdmission, OperationDigest,
     OperationError, OperationGuard, PeerProcessIdentity, PolicyDigest, PolicyPhase,
-    PolicyPredecessor, PrivilegedDnsAssignment, PrivilegedDnsScope, PrivilegedOperation,
-    PrivilegedOperationId, PrivilegedRequest, ReplayBaseline, ReplayHighWater, ReplayRecord,
-    ReplayUnused, RequestSequence, RootAuthorityLedger, ScopedRoute, ServiceInstanceClaim,
-    ServiceManager, TrustedDaemonPrincipal,
+    PolicyPredecessor, PrivilegedDnsAssignment, PrivilegedDnsScope, PrivilegedFirewallRole,
+    PrivilegedFirewallTunnel, PrivilegedOperation, PrivilegedOperationId, PrivilegedRequest,
+    ReplayBaseline, ReplayHighWater, ReplayRecord, ReplayUnused, RequestSequence,
+    RootAuthorityLedger, ScopedRoute, ServiceInstanceClaim, ServiceManager, TrustedDaemonPrincipal,
 };
+pub(crate) use operation::{PlatformVerifiedAuthority, PolicyProjection};
 pub(crate) use protocol_plan::TunnelDescriptorRef;
 pub use protocol_plan::{
     DnsHostname, OpenVpnAuthFactors, OpenVpnChallengeKind, OpenVpnKeyDirection, OpenVpnPlan,
