@@ -156,6 +156,36 @@ fn protocol_semantics_preserve_composite_openvpn_and_sparse_wireguard() {
 }
 
 #[test]
+fn interactive_openvpn_serializes_auth_shape_without_serializing_secrets() {
+    let plan = ProtocolPlan::OpenVpn(
+        OpenVpnPlan::new(
+            profile('b'),
+            9,
+            vec![OpenVpnRemote::new(
+                SocketAddr::from(([203, 0, 113, 9], 1194)),
+                OpenVpnTransport::Udp,
+            )
+            .unwrap()],
+            OpenVpnRemoteSelection::Ordered,
+            OpenVpnAuthFactors::certificate_and_username_password()
+                .with_challenge(OpenVpnChallengeKind::Static)
+                .unwrap(),
+            Vec::new(),
+        )
+        .unwrap(),
+    );
+
+    let serialized = serde_json::to_string(&plan).unwrap();
+    assert!(!serialized.contains("OpenVpnCredentials"));
+    assert!(!serialized.contains("alice@example.com"));
+    assert!(!serialized.contains("correct horse battery staple"));
+    assert_eq!(
+        serde_json::to_value(&plan).unwrap()["plan"]["authentication"]["username_password"],
+        json!(true)
+    );
+}
+
+#[test]
 fn fixed_material_slots_and_dns_names_carry_no_paths() {
     assert_eq!(
         wireguard_plan(1).material_refs(),

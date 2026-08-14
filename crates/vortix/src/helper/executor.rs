@@ -25,9 +25,10 @@ use super::server::{
     TunnelStartOutcome,
 };
 use super::validate::PlatformLayout;
+use crate::vortix_core::openvpn_credentials::DecodedOpenVpnCredentials;
 use crate::vortix_core::privileged::{
-    LeaseId, NetworkPolicyOperation, ObservationState, ObservedChildIdentity, ProtocolPlan,
-    ResourceObservation, ResourceObservationTarget, ResourceTag,
+    LeaseId, NetworkPolicyOperation, ObservationState, ObservedChildIdentity, OpenVpnChallengeKind,
+    ProtocolPlan, ResourceObservation, ResourceObservationTarget, ResourceTag,
 };
 use crate::vortix_core::profile::ProtocolKind;
 use crate::vortix_protocol_openvpn::execution::{
@@ -40,6 +41,8 @@ use crate::vortix_protocol_wireguard::execution::{
 
 const WIREGUARD_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const OPENVPN_TERMINATION_TIMEOUT: Duration = Duration::from_secs(5);
+const OPENVPN_MANAGEMENT_SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
+const OPENVPN_AUTHENTICATION_TIMEOUT: Duration = Duration::from_secs(30);
 const MIN_SETTLE_INTERVAL: Duration = Duration::from_millis(25);
 const MAX_SETTLE_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -244,7 +247,7 @@ impl ProductionHelperExecutor {
         plan: &crate::vortix_core::privileged::OpenVpnPlan,
         materials: Option<TunnelMaterialSet>,
     ) -> Result<TunnelStartOutcome, PrivilegedExecutionError> {
-        if plan.authentication().uses_username_password() {
+        if plan.authentication().challenge() == Some(OpenVpnChallengeKind::Remote) {
             return Err(PrivilegedExecutionError::InvalidPlan);
         }
         let Some(TunnelMaterialSet::OpenVpn(materials)) = materials else {
@@ -257,9 +260,10 @@ impl ProductionHelperExecutor {
         }
         let helper_identity = HelperRuntimeIdentity::derive(self.layout, self.lease_id, &tunnel)
             .map_err(|_| PrivilegedExecutionError::InvalidPlan)?;
-        let mut runtime = OpenVpnRuntimeStager::root_owned(self.layout, &helper_identity)
+        let staged = OpenVpnRuntimeStager::root_owned(self.layout, &helper_identity)
             .stage(plan, materials)
             .map_err(|_| PrivilegedExecutionError::FailedBeforeEffect)?;
+        let (mut runtime, credentials) = staged.into_parts();
         let binary = match verified_protocol_binary(self.layout, ProtocolKind::OpenVpn) {
             Ok(binary) => binary,
             Err(error) => {
@@ -276,8 +280,26 @@ impl ProductionHelperExecutor {
             return settle_unattested_openvpn(child, runtime);
         };
         if evidence.persist_attested(&child_identity).is_err() {
-            if matches!(evidence.load_attested(), Ok(identity) if identity == child_identity) {
-                self.openvpn.insert(
+            return self.settle_openvpn_persistence_failure(
+                tunnel,
+                ActiveOpenVpnRuntime {
+                    child,
+                    identity: child_identity,
+                    runtime,
+                    evidence,
+                },
+            );
+        }
+        if let Some(credentials) = credentials {
+            if authenticate_helper_openvpn(
+                &mut child,
+                &runtime,
+                credentials,
+                plan.authentication().challenge(),
+            )
+            .is_err()
+            {
+                return self.settle_openvpn_auth_failure(
                     tunnel,
                     ActiveOpenVpnRuntime {
                         child,
@@ -286,26 +308,7 @@ impl ProductionHelperExecutor {
                         evidence,
                     },
                 );
-                return Err(PrivilegedExecutionError::EffectMayHaveApplied);
             }
-            let terminated = terminate_helper_foreground(&mut child, OPENVPN_TERMINATION_TIMEOUT);
-            if terminated.is_err() {
-                self.openvpn.insert(
-                    tunnel,
-                    ActiveOpenVpnRuntime {
-                        child,
-                        identity: child_identity,
-                        runtime,
-                        evidence,
-                    },
-                );
-                return Err(PrivilegedExecutionError::EffectMayHaveApplied);
-            }
-            return Err(if runtime.cleanup_after_child().is_ok() {
-                PrivilegedExecutionError::FailedBeforeEffect
-            } else {
-                PrivilegedExecutionError::EffectMayHaveApplied
-            });
         }
         match child.try_wait() {
             Ok(Some(_)) => {
@@ -341,6 +344,42 @@ impl ProductionHelperExecutor {
             },
         );
         Ok(TunnelStartOutcome::ForegroundOwned(child_identity))
+    }
+
+    fn settle_openvpn_persistence_failure(
+        &mut self,
+        tunnel: ResourceTag,
+        mut active: ActiveOpenVpnRuntime,
+    ) -> Result<TunnelStartOutcome, PrivilegedExecutionError> {
+        if matches!(active.evidence.load_attested(), Ok(actual) if actual == active.identity)
+            || terminate_helper_foreground(&mut active.child, OPENVPN_TERMINATION_TIMEOUT).is_err()
+        {
+            self.openvpn.insert(tunnel, active);
+            return Err(PrivilegedExecutionError::EffectMayHaveApplied);
+        }
+        Err(if active.runtime.cleanup_after_child().is_ok() {
+            PrivilegedExecutionError::FailedBeforeEffect
+        } else {
+            PrivilegedExecutionError::EffectMayHaveApplied
+        })
+    }
+
+    fn settle_openvpn_auth_failure(
+        &mut self,
+        tunnel: ResourceTag,
+        mut active: ActiveOpenVpnRuntime,
+    ) -> Result<TunnelStartOutcome, PrivilegedExecutionError> {
+        if terminate_helper_foreground(&mut active.child, OPENVPN_TERMINATION_TIMEOUT).is_err() {
+            self.openvpn.insert(tunnel, active);
+            return Err(PrivilegedExecutionError::EffectMayHaveApplied);
+        }
+        let removed = active.evidence.remove(&active.identity);
+        let cleaned = active.runtime.cleanup_after_child();
+        Err(if removed.is_ok() && cleaned.is_ok() {
+            PrivilegedExecutionError::FailedBeforeEffect
+        } else {
+            PrivilegedExecutionError::EffectMayHaveApplied
+        })
     }
 
     fn stop_openvpn(
@@ -483,6 +522,37 @@ impl ProductionHelperExecutor {
             Err(PrivilegedExecutionError::EffectMayHaveApplied)
         }
     }
+}
+
+fn authenticate_helper_openvpn(
+    child: &mut Child,
+    runtime: &StagedOpenVpnRuntime,
+    credentials: DecodedOpenVpnCredentials,
+    challenge: Option<OpenVpnChallengeKind>,
+) -> Result<(), ()> {
+    let deadline = Instant::now() + OPENVPN_MANAGEMENT_SOCKET_TIMEOUT;
+    let mut backoff = PollBackoff::new();
+    let stream = loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return Err(()),
+            Ok(None) => {}
+        }
+        match runtime.try_connect_management() {
+            Ok(Some(stream)) => break stream,
+            Ok(None) if Instant::now() < deadline => backoff.pause(),
+            Ok(None) | Err(_) => return Err(()),
+        }
+    };
+    let (username, password, answer) = credentials.into_parts();
+    crate::vortix_protocol_openvpn::management::authenticate(
+        stream,
+        username.as_str(),
+        password.as_str(),
+        &answer,
+        challenge,
+        OPENVPN_AUTHENTICATION_TIMEOUT,
+    )
+    .map_err(|_| ())
 }
 
 fn settle_unattested_openvpn(
