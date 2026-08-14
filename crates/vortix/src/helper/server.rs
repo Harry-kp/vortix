@@ -945,14 +945,19 @@ where
         prepared: PreparedNetworkPolicyExecutionPlan,
     ) -> Result<PreparedNetworkPolicyExecutionPlan, HelperError> {
         let operation = prepared.execution().operation().clone();
-        let prepared = if matches!(operation, NetworkPolicyOperation::ReleaseObsolete { .. }) {
+        let prepared = if let NetworkPolicyOperation::ReleaseObsolete { resources, .. } = &operation
+        {
             let (execution, firewalls) = prepared.into_parts();
             let prepared_firewalls = firewalls
                 .into_iter()
                 .map(|physical| {
-                    physical
-                        .mark_release_pending()
-                        .map_err(|_| HelperError::LedgerUnavailable)
+                    if resources.contains(physical.resource()) {
+                        physical
+                            .mark_release_pending()
+                            .map_err(|_| HelperError::LedgerUnavailable)
+                    } else {
+                        Ok(physical)
+                    }
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             PreparedNetworkPolicyExecutionPlan::new(execution, prepared_firewalls)
@@ -1139,11 +1144,23 @@ where
             {
                 vec![self.physical_firewalls.get(policy)?.clone()]
             }
-            NetworkPolicyOperation::ReleaseObsolete { resources, .. } => resources
-                .iter()
-                .filter(|resource| resource.kind() == ResourceKind::Firewall)
-                .map(|resource| self.physical_firewalls.get(resource).cloned())
-                .collect::<Option<Vec<_>>>()?,
+            NetworkPolicyOperation::ReleaseObsolete {
+                policy, resources, ..
+            } => {
+                let mut firewalls = resources
+                    .iter()
+                    .filter(|resource| resource.kind() == ResourceKind::Firewall)
+                    .map(|resource| self.physical_firewalls.get(resource).cloned())
+                    .collect::<Option<Vec<_>>>()?;
+                if policy.kind() == ResourceKind::Firewall
+                    && !firewalls
+                        .iter()
+                        .any(|physical| physical.resource() == policy)
+                {
+                    firewalls.push(self.physical_firewalls.get(policy)?.clone());
+                }
+                firewalls
+            }
             NetworkPolicyOperation::ApplyRoutes { .. }
             | NetworkPolicyOperation::ApplyDns { .. }
             | NetworkPolicyOperation::ObserveBarrier { .. } => Vec::new(),
@@ -1238,17 +1255,26 @@ where
                     .ok_or(HelperError::LedgerUnavailable)?;
                 self.physical_firewalls.insert(policy.clone(), physical);
             }
-            NetworkPolicyOperation::ReleaseObsolete { .. } => {
+            NetworkPolicyOperation::ReleaseObsolete {
+                policy, resources, ..
+            } => {
                 for physical in prepared.prepared_firewalls() {
-                    if !matches!(
-                        physical.stage(),
-                        PhysicalFirewallStage::OwnedReleasePending
-                            | PhysicalFirewallStage::SupersededReleasePending
-                    ) {
+                    if resources.contains(physical.resource()) {
+                        if !matches!(
+                            physical.stage(),
+                            PhysicalFirewallStage::OwnedReleasePending
+                                | PhysicalFirewallStage::SupersededReleasePending
+                        ) {
+                            return Err(HelperError::LedgerUnavailable);
+                        }
+                        self.physical_firewalls
+                            .insert(physical.resource().clone(), physical.clone());
+                    } else if physical.resource() != policy
+                        || physical.stage() != PhysicalFirewallStage::ObservedOwned
+                        || self.physical_firewalls.get(policy) != Some(physical)
+                    {
                         return Err(HelperError::LedgerUnavailable);
                     }
-                    self.physical_firewalls
-                        .insert(physical.resource().clone(), physical.clone());
                 }
             }
             NetworkPolicyOperation::ApplyRoutes { .. }
@@ -3520,15 +3546,24 @@ mod tests {
                 .collect::<Vec<_>>(),
             obsolete.iter().collect::<Vec<_>>()
         );
-        assert_eq!(plan.recovered_firewalls().len(), 1);
+        assert_eq!(plan.recovered_firewalls().len(), 2);
         assert_eq!(plan.recovered_firewalls()[0].resource(), &firewall_1);
         assert_eq!(
             plan.recovered_firewalls()[0].backend(),
             PhysicalFirewallBackend::LinuxNft
         );
+        assert_eq!(plan.recovered_firewalls()[1].resource(), &firewall_2);
+        assert_eq!(
+            plan.recovered_firewalls()[1].stage(),
+            PhysicalFirewallStage::ObservedOwned
+        );
         assert_eq!(
             prepared.prepared_firewalls()[0].stage(),
             PhysicalFirewallStage::SupersededReleasePending
+        );
+        assert_eq!(
+            prepared.prepared_firewalls()[1].stage(),
+            PhysicalFirewallStage::ObservedOwned
         );
     }
 
