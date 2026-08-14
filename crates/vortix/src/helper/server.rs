@@ -1048,7 +1048,7 @@ where
                                 return Err(HelperError::LedgerUnavailable);
                             };
                             let observed = physical
-                                .confirm_observed()
+                                .confirm_observed(&state.intended)
                                 .map_err(|_| HelperError::LedgerUnavailable)?;
                             for (resource, prior) in &mut self.physical_firewalls {
                                 if resource != policy
@@ -1263,6 +1263,7 @@ where
                         if !matches!(
                             physical.stage(),
                             PhysicalFirewallStage::OwnedReleasePending
+                                | PhysicalFirewallStage::AbsentReleasePending
                                 | PhysicalFirewallStage::SupersededReleasePending
                         ) {
                             return Err(HelperError::LedgerUnavailable);
@@ -1270,7 +1271,11 @@ where
                         self.physical_firewalls
                             .insert(physical.resource().clone(), physical.clone());
                     } else if physical.resource() != policy
-                        || physical.stage() != PhysicalFirewallStage::ObservedOwned
+                        || !matches!(
+                            physical.stage(),
+                            PhysicalFirewallStage::ObservedOwned
+                                | PhysicalFirewallStage::ObservedAbsent
+                        )
                         || self.physical_firewalls.get(policy) != Some(physical)
                     {
                         return Err(HelperError::LedgerUnavailable);
@@ -1673,6 +1678,7 @@ mod tests {
         WireGuardInterfaceOptions, WireGuardPeerPlan, WireGuardPlan,
     };
     use crate::vortix_core::profile::{ProfileId, ProtocolKind};
+    use crate::vortix_core::state::killswitch::KillSwitchMode;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     #[derive(Default)]
@@ -2099,8 +2105,20 @@ mod tests {
         generation: u64,
         first_sequence: u64,
     ) -> (ResourceTag, ResourceTag, ResourceTag) {
-        use crate::vortix_core::state::killswitch::KillSwitchMode;
+        install_policy_generation_with_mode(
+            harness,
+            generation,
+            first_sequence,
+            KillSwitchMode::AlwaysOn,
+        )
+    }
 
+    fn install_policy_generation_with_mode(
+        harness: &mut LifecycleHarness,
+        generation: u64,
+        first_sequence: u64,
+        mode: KillSwitchMode,
+    ) -> (ResourceTag, ResourceTag, ResourceTag) {
         let firewall =
             ResourceTag::topology(AuthorityEpoch(3), generation, ResourceKind::Firewall).unwrap();
         let routes =
@@ -2140,12 +2158,31 @@ mod tests {
             first_sequence + 6,
             NetworkPolicyOperation::ApplyFirewall {
                 policy: firewall.clone(),
-                mode: KillSwitchMode::AlwaysOn,
+                mode,
                 tunnels: Vec::new(),
                 predecessor,
             },
         );
         (firewall, routes, dns)
+    }
+
+    #[test]
+    fn nonblocking_final_firewall_records_verified_absence_not_physical_ownership() {
+        let mut harness = LifecycleHarness::for_policy(FakeExecutor::default());
+        let (firewall, _, _) =
+            install_policy_generation_with_mode(&mut harness, 1, 1, KillSwitchMode::Auto);
+
+        assert_eq!(
+            harness.server.physical_firewalls[&firewall].stage(),
+            PhysicalFirewallStage::ObservedAbsent
+        );
+        let persisted = harness.server.ledger_store.writes.last().unwrap();
+        assert_eq!(
+            persisted.physical_firewalls()[0].stage(),
+            PhysicalFirewallStage::ObservedAbsent
+        );
+        let encoded = serde_json::to_vec(persisted).unwrap();
+        assert!(serde_json::from_slice::<HelperLedgerRecord>(&encoded).is_ok());
     }
 
     struct LifecycleHarness {

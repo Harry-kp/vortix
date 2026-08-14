@@ -1184,6 +1184,16 @@ impl PolicyProjection {
         PolicyDigest::of_projection(self)
     }
 
+    /// Whether this projection requires a live helper-owned firewall
+    /// resource. Non-firewall phases have no firewall disposition.
+    pub(crate) const fn firewall_blocks(&self) -> Option<bool> {
+        match self {
+            Self::Blocking { .. } => Some(true),
+            Self::Firewall { mode, .. } => Some(matches!(mode, KillSwitchMode::AlwaysOn)),
+            Self::Routes { .. } | Self::Dns { .. } => None,
+        }
+    }
+
     const fn phase(&self) -> PolicyPhase {
         match self {
             Self::Blocking { .. } => PolicyPhase::Blocking,
