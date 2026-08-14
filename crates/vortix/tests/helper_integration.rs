@@ -27,13 +27,13 @@ fn arbitrary_execution_shapes_never_decode_as_helper_requests() {
 }
 
 #[test]
-fn installed_helper_still_has_no_server_activation_path() {
+fn unprivileged_helper_cannot_activate_the_server() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_vortix-helper")) // xtask:allow-subprocess: black-box activation boundary
         .arg("--serve")
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(78));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("not enrolled"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("must run as root"));
 }
 
 #[test]
