@@ -614,6 +614,13 @@ impl PolicyDigest {
     fn is_zero(self) -> bool {
         self.0.is_zero()
     }
+
+    fn of_projection(projection: &PolicyProjection) -> Self {
+        Self(OperationDigest::semantic(
+            b"network-policy-projection",
+            projection,
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1171,6 +1178,10 @@ impl PolicyProjection {
             | Self::Dns { policy, .. }
             | Self::Firewall { policy, .. } => policy,
         }
+    }
+
+    pub(crate) fn digest(&self) -> PolicyDigest {
+        PolicyDigest::of_projection(self)
     }
 
     const fn phase(&self) -> PolicyPhase {

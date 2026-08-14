@@ -21,15 +21,17 @@ use super::observe::SystemObservationExecutor;
 use super::runtime::HelperRuntimeIdentity;
 use super::server::{
     process_group_for_tunnel, tunnel_for_profile_resource, CleanupExecutor,
-    NetworkPolicyExecutionPlan, NetworkPolicyExecutor, NetworkPolicyOutcome, ObservationError,
-    ObservationExecutor, ObservationOutcome, PrivilegedExecutionError, TunnelLifecycleExecutor,
+    NetworkPolicyExecutionPlan, NetworkPolicyExecutor, NetworkPolicyOutcome,
+    NetworkPolicyPreparationError, ObservationError, ObservationExecutor, ObservationOutcome,
+    PreparedNetworkPolicyExecutionPlan, PrivilegedExecutionError, TunnelLifecycleExecutor,
     TunnelStartOutcome,
 };
 use super::validate::PlatformLayout;
 use crate::vortix_core::openvpn_credentials::DecodedOpenVpnCredentials;
 use crate::vortix_core::privileged::{
-    LeaseId, ObservationState, ObservedChildIdentity, OpenVpnChallengeKind, ProtocolPlan,
-    ResourceObservation, ResourceObservationTarget, ResourceTag,
+    HelperLedgerFirewall, LeaseId, ObservationState, ObservedChildIdentity, OpenVpnChallengeKind,
+    PhysicalFirewallBackend, ProtocolPlan, ResourceObservation, ResourceObservationTarget,
+    ResourceTag,
 };
 use crate::vortix_core::profile::ProtocolKind;
 use crate::vortix_protocol_openvpn::execution::{
@@ -807,9 +809,37 @@ fn verified_protocol_binary(
 }
 
 impl NetworkPolicyExecutor for ProductionHelperExecutor {
-    fn execute_network_policy(
+    fn validate_recovered_firewalls(
+        &self,
+        firewalls: &[HelperLedgerFirewall],
+    ) -> Result<(), PrivilegedExecutionError> {
+        let valid = firewalls.iter().all(|firewall| {
+            matches!(
+                (self.layout, firewall.backend()),
+                (
+                    PlatformLayout::Linux,
+                    PhysicalFirewallBackend::LinuxNft
+                        | PhysicalFirewallBackend::LinuxIptablesDualFamily
+                ) | (PlatformLayout::MacOs, PhysicalFirewallBackend::MacOsPf)
+            )
+        });
+        if valid {
+            Ok(())
+        } else {
+            Err(PrivilegedExecutionError::InvalidPlan)
+        }
+    }
+
+    fn prepare_network_policy(
         &mut self,
         _plan: &NetworkPolicyExecutionPlan,
+    ) -> Result<PreparedNetworkPolicyExecutionPlan, NetworkPolicyPreparationError> {
+        Err(NetworkPolicyPreparationError::InvalidPlan)
+    }
+
+    fn execute_network_policy(
+        &mut self,
+        _plan: &PreparedNetworkPolicyExecutionPlan,
     ) -> Result<NetworkPolicyOutcome, PrivilegedExecutionError> {
         Err(PrivilegedExecutionError::InvalidPlan)
     }
