@@ -21,7 +21,7 @@ use crate::helper::validate::{
 use crate::vortix_core::ports::process::KernelProcessIdentity;
 use crate::vortix_core::privileged::{ContainmentId, ObservedChildIdentity, ResourceTag};
 
-const MAX_CHILD_EVIDENCE_BYTES: u64 = 4 * 1024;
+pub(crate) const MAX_CHILD_EVIDENCE_BYTES: u64 = 4 * 1024;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Fixed storage for one lease/profile/generation-scoped child record.
@@ -32,6 +32,13 @@ pub(crate) struct ChildEvidenceStore {
     resource: ResourceTag,
     containment: ContainmentId,
     expected_owner_uid: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AttestedChildState {
+    Live,
+    Exited,
+    Drifted,
 }
 
 impl ChildEvidenceStore {
@@ -71,10 +78,60 @@ impl ChildEvidenceStore {
         &self,
         pid: u32,
     ) -> Result<ObservedChildIdentity, ChildEvidenceError> {
-        self.persist_live_with(pid, crate::platform::observe_process_identity)
+        let identity = self.attest_live(pid)?;
+        self.persist_attested(&identity)?;
+        Ok(identity)
     }
 
-    fn persist_live_with<F>(
+    pub(crate) fn attest_live(
+        &self,
+        pid: u32,
+    ) -> Result<ObservedChildIdentity, ChildEvidenceError> {
+        self.attest_live_with(pid, crate::platform::observe_process_identity)
+    }
+
+    pub(crate) fn persist_attested(
+        &self,
+        identity: &ObservedChildIdentity,
+    ) -> Result<(), ChildEvidenceError> {
+        self.persist(identity)
+    }
+
+    pub(crate) fn load_attested(&self) -> Result<ObservedChildIdentity, ChildEvidenceError> {
+        let identity = self.load()?;
+        self.validate_identity(&identity)?;
+        Ok(identity)
+    }
+
+    pub(crate) fn classify_attested(
+        &self,
+        identity: &ObservedChildIdentity,
+    ) -> Result<AttestedChildState, ChildEvidenceError> {
+        self.classify_attested_with(identity, crate::platform::observe_process_identity)
+    }
+
+    fn classify_attested_with<F>(
+        &self,
+        identity: &ObservedChildIdentity,
+        observe: F,
+    ) -> Result<AttestedChildState, ChildEvidenceError>
+    where
+        F: FnOnce(u32) -> std::io::Result<Option<KernelProcessIdentity>>,
+    {
+        self.validate_identity(identity)?;
+        Ok(match observe(identity.pid())? {
+            None => AttestedChildState::Exited,
+            Some(kernel)
+                if kernel.start_token() == identity.process_start_token()
+                    && kernel.is_process_group_leader() =>
+            {
+                AttestedChildState::Live
+            }
+            Some(_) => AttestedChildState::Drifted,
+        })
+    }
+
+    fn attest_live_with<F>(
         &self,
         pid: u32,
         observe: F,
@@ -86,15 +143,13 @@ impl ChildEvidenceStore {
         if !kernel.is_process_group_leader() {
             return Err(ChildEvidenceError::NotPrivateProcessGroup);
         }
-        let identity = ObservedChildIdentity::new(
+        ObservedChildIdentity::new(
             self.resource.clone(),
             pid,
             kernel.start_token(),
             self.containment,
         )
-        .map_err(|_| ChildEvidenceError::IdentityMismatch)?;
-        self.persist(&identity)?;
-        Ok(identity)
+        .map_err(|_| ChildEvidenceError::IdentityMismatch)
     }
 
     /// The hard-link install is atomic and refuses to replace stale evidence.
@@ -343,8 +398,9 @@ mod tests {
     fn live_persistence_gets_start_token_and_group_leadership_from_kernel_probe() {
         let (_root, store) = store();
         let observed = store
-            .persist_live_with(42, |_| Ok(KernelProcessIdentity::new(99, true)))
+            .attest_live_with(42, |_| Ok(KernelProcessIdentity::new(99, true)))
             .unwrap();
+        store.persist_attested(&observed).unwrap();
         assert_eq!(observed, child());
         assert_eq!(store.load().unwrap(), observed);
     }
@@ -359,7 +415,7 @@ mod tests {
             ),
         ] {
             let (_root, store) = store();
-            let error = store.persist_live_with(42, |_| Ok(identity)).unwrap_err();
+            let error = store.attest_live_with(42, |_| Ok(identity)).unwrap_err();
             assert_eq!(
                 std::mem::discriminant(&error),
                 std::mem::discriminant(&expected)
@@ -407,5 +463,35 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(store.load(), Err(ChildEvidenceError::Corrupt)));
+    }
+
+    #[test]
+    fn persisted_child_classifies_exact_exit_and_pid_reuse_without_granting_kill_authority() {
+        let (_root, store) = store();
+        let child = child();
+        store.persist(&child).unwrap();
+        assert_eq!(store.load_attested().unwrap(), child);
+
+        assert_eq!(
+            store
+                .classify_attested_with(&child, |_| { Ok(KernelProcessIdentity::new(99, true)) })
+                .unwrap(),
+            AttestedChildState::Live
+        );
+        assert_eq!(
+            store.classify_attested_with(&child, |_| Ok(None)).unwrap(),
+            AttestedChildState::Exited
+        );
+        for reused in [
+            KernelProcessIdentity::new(100, true),
+            KernelProcessIdentity::new(99, false),
+        ] {
+            assert_eq!(
+                store
+                    .classify_attested_with(&child, |_| Ok(reused))
+                    .unwrap(),
+                AttestedChildState::Drifted
+            );
+        }
     }
 }

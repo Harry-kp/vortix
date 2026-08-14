@@ -18,6 +18,8 @@ use crate::vortix_core::privileged::{
 const KERNEL_ALIAS_PREFIX: &str = "vx";
 const KERNEL_ALIAS_HASH_CHARS: usize = 13;
 const BASE32: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+pub(crate) const OPENVPN_CHILD_EVIDENCE_FILE: &str = "openvpn-child.json";
+pub(crate) const INTERFACE_EVIDENCE_FILE: &str = "interface.name";
 
 /// Authority-fenced physical names derived only from root-ledger identity.
 /// No caller-provided path or interface string participates.
@@ -93,11 +95,11 @@ impl HelperRuntimeIdentity {
     }
 
     pub(crate) fn openvpn_child_evidence(&self) -> PathBuf {
-        self.runtime_dir.join("openvpn-child.json")
+        self.runtime_dir.join(OPENVPN_CHILD_EVIDENCE_FILE)
     }
 
     pub(crate) fn interface_evidence(&self) -> PathBuf {
-        self.runtime_dir.join("interface.name")
+        self.runtime_dir.join(INTERFACE_EVIDENCE_FILE)
     }
 
     pub(crate) fn secret_dir(&self) -> PathBuf {

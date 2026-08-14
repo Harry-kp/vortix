@@ -1,34 +1,46 @@
 //! Canonical helper-owned `OpenVPN` runtime configuration.
 //!
 //! This module converts the already-validated privileged plan into fixed-path
-//! runtime artifacts and argv. It deliberately does not choose or execute a
-//! binary: the helper's package verifier owns that decision, and the helper
-//! remains dormant until enrollment in U13.
+//! runtime artifacts and argv, then executes only the absolute binary selected
+//! by the helper's package verifier. It never selects a binary itself, and the
+//! helper remains dormant until enrollment in U13.
 
 #![allow(
     dead_code,
     reason = "U12 execution specs remain dormant until helper enrollment"
 )]
+#![allow(
+    unsafe_code,
+    reason = "foreground process-group containment requires pre_exec and exact group signals"
+)]
 
 use std::collections::BTreeMap;
 use std::fmt::{Debug, Formatter, Write as _};
 use std::path::{Component, Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt as _;
 
 use crate::vortix_core::privileged::{
     OpenVpnChallengeKind, OpenVpnPlan, OpenVpnRemoteSelection, OpenVpnTransport,
     ProfileMaterialSlot,
 };
 
-const CONFIG_FILE: &str = "openvpn.conf";
-const LOG_FILE: &str = "openvpn.log";
-const MANAGEMENT_SOCKET: &str = "m.sock";
-const SECRET_DIRECTORY: &str = "secrets";
+pub(crate) const CONFIG_FILE: &str = "openvpn.conf";
+pub(crate) const LOG_FILE: &str = "openvpn.log";
+pub(crate) const MANAGEMENT_SOCKET: &str = "m.sock";
+pub(crate) const SECRET_DIRECTORY: &str = "secrets";
 const FIXED_VERBOSITY: &str = "3";
 const STATIC_CHALLENGE_PROMPT: &str = "Vortix second factor";
 const HELPER_RESOURCE_ROOTS: [&str; 2] = ["/run/vortix/resources", "/var/run/vortix/resources"];
 const RESOURCE_DIGEST_LEN: usize = 64;
+const MIN_WAIT_INTERVAL: Duration = Duration::from_millis(25);
+const MAX_WAIT_INTERVAL: Duration = Duration::from_millis(250);
 const MATERIAL_DIRECTIVES: [MaterialDirective; 5] = [
     MaterialDirective::new(ProfileMaterialSlot::OpenVpnCaCertificate, "ca", "ca.pem"),
     MaterialDirective::new(
@@ -74,6 +86,12 @@ pub(crate) fn supports_material_slot(slot: ProfileMaterialSlot) -> bool {
     MATERIAL_DIRECTIVES
         .iter()
         .any(|material| material.slot == slot)
+}
+
+pub(crate) fn is_helper_material_filename(filename: &str) -> bool {
+    MATERIAL_DIRECTIVES
+        .iter()
+        .any(|material| material.filename == filename)
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -127,18 +145,137 @@ impl OpenVpnExecutionSpec {
     }
 }
 
+pub(crate) fn spawn_helper_foreground(
+    binary: &Path,
+    execution: &OpenVpnExecutionSpec,
+) -> Result<Child, OpenVpnCommandError> {
+    if !binary.is_absolute()
+        || execution.arguments.is_empty()
+        || execution.arguments.iter().any(String::is_empty)
+    {
+        return Err(OpenVpnCommandError::InvalidInvocation);
+    }
+    let mut command = Command::new(binary);
+    command
+        .args(&execution.arguments)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0);
+    // xtask:allow-platform-cfg: PR_SET_PDEATHSIG is a Linux child-setup ABI; macOS execution stays disabled
+    #[cfg(target_os = "linux")]
+    let helper_pid = std::process::id();
+    unsafe {
+        command.pre_exec(move || {
+            libc::umask(0o077);
+            // xtask:allow-platform-cfg: PR_SET_PDEATHSIG is a Linux child-setup ABI; macOS execution stays disabled
+            #[cfg(target_os = "linux")]
+            {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid()
+                    != libc::pid_t::try_from(helper_pid)
+                        .map_err(|_| std::io::Error::other("invalid helper process id"))?
+                {
+                    return Err(std::io::Error::other(
+                        "helper exited before child containment armed",
+                    ));
+                }
+            }
+            Ok(())
+        });
+    }
+    command.spawn().map_err(|_| OpenVpnCommandError::Spawn)
+}
+
+pub(crate) fn terminate_helper_foreground(
+    child: &mut Child,
+    timeout: Duration,
+) -> Result<(), OpenVpnCommandError> {
+    if timeout.is_zero() {
+        return Err(OpenVpnCommandError::InvalidInvocation);
+    }
+    signal_helper_process_group(child.id(), HelperGroupSignal::Terminate)?;
+    let deadline = Instant::now() + timeout;
+    let mut wait_interval = MIN_WAIT_INTERVAL;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(wait_interval);
+                wait_interval = (wait_interval * 2).min(MAX_WAIT_INTERVAL);
+            }
+            Ok(None) => {
+                signal_helper_process_group(child.id(), HelperGroupSignal::Kill)?;
+                child.wait().map_err(|_| OpenVpnCommandError::Wait)?;
+                return Ok(());
+            }
+            Err(_) => return Err(OpenVpnCommandError::Wait),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HelperGroupSignal {
+    Terminate,
+    Kill,
+}
+
+pub(crate) fn signal_helper_process_group(
+    pid: u32,
+    signal: HelperGroupSignal,
+) -> Result<(), OpenVpnCommandError> {
+    let pid = libc::pid_t::try_from(pid).map_err(|_| OpenVpnCommandError::InvalidChild)?;
+    let signal = match signal {
+        HelperGroupSignal::Terminate => libc::SIGTERM,
+        HelperGroupSignal::Kill => libc::SIGKILL,
+    };
+    if unsafe { libc::kill(-pid, signal) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(OpenVpnCommandError::Terminate)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub(crate) enum OpenVpnExecutionError {
     #[error("OpenVPN runtime directory is not a safe absolute helper path")]
     UnsafeRuntimeDirectory,
+    #[error("OpenVPN helper interface name is unsafe")]
+    UnsafeInterfaceName,
 }
 
-pub(crate) fn render_helper_execution(
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub(crate) enum OpenVpnCommandError {
+    #[error("OpenVPN helper invocation is invalid")]
+    InvalidInvocation,
+    #[error("OpenVPN helper child could not be spawned")]
+    Spawn,
+    #[error("OpenVPN helper child identity is invalid")]
+    InvalidChild,
+    #[error("OpenVPN helper process group could not be terminated")]
+    Terminate,
+    #[error("OpenVPN helper child could not be reaped")]
+    Wait,
+}
+
+#[cfg(test)]
+fn render_helper_execution(
     plan: &OpenVpnPlan,
     runtime_directory: &Path,
 ) -> Result<OpenVpnExecutionSpec, OpenVpnExecutionError> {
     validate_runtime_directory(runtime_directory, &HELPER_RESOURCE_ROOTS.map(Path::new))?;
-    Ok(render_validated_execution(plan, runtime_directory))
+    Ok(render_validated_execution(
+        plan,
+        runtime_directory,
+        "vxtest0",
+    ))
 }
 
 /// Render beneath one already-authenticated helper resource root. The caller
@@ -148,23 +285,32 @@ pub(crate) fn render_helper_execution_under(
     plan: &OpenVpnPlan,
     runtime_directory: &Path,
     resource_root: &Path,
+    interface_name: &str,
 ) -> Result<OpenVpnExecutionSpec, OpenVpnExecutionError> {
+    if !valid_interface_name(interface_name) {
+        return Err(OpenVpnExecutionError::UnsafeInterfaceName);
+    }
     validate_runtime_directory(runtime_directory, &[resource_root])?;
-    Ok(render_validated_execution(plan, runtime_directory))
+    Ok(render_validated_execution(
+        plan,
+        runtime_directory,
+        interface_name,
+    ))
 }
 
 fn render_validated_execution(
     plan: &OpenVpnPlan,
     runtime_directory: &Path,
+    interface_name: &str,
 ) -> OpenVpnExecutionSpec {
     let config_path = runtime_directory.join(CONFIG_FILE);
     let log_path = runtime_directory.join(LOG_FILE);
     let management_socket = runtime_directory.join(MANAGEMENT_SOCKET);
     let secret_directory = runtime_directory.join(SECRET_DIRECTORY);
     let mut material_paths = BTreeMap::new();
-    let mut config = String::from(
+    let mut config = format!(
         "client\n\
-         dev tun\n\
+         dev {interface_name}\n\
          nobind\n\
          remote-cert-tls server\n\
          script-security 0\n\
@@ -215,19 +361,23 @@ fn render_validated_execution(
             .expect("writing to String cannot fail");
     }
 
-    let arguments = vec![
+    let mut arguments = vec![
         "--config".to_owned(),
         path_text(&config_path).to_owned(),
         "--log".to_owned(),
         path_text(&log_path).to_owned(),
         "--verb".to_owned(),
         FIXED_VERBOSITY.to_owned(),
-        "--management".to_owned(),
-        path_text(&management_socket).to_owned(),
-        "unix".to_owned(),
-        "--management-hold".to_owned(),
-        "--management-query-passwords".to_owned(),
     ];
+    if authentication.uses_username_password() {
+        arguments.extend([
+            "--management".to_owned(),
+            path_text(&management_socket).to_owned(),
+            "unix".to_owned(),
+            "--management-hold".to_owned(),
+            "--management-query-passwords".to_owned(),
+        ]);
+    }
 
     OpenVpnExecutionSpec {
         config_path,
@@ -237,6 +387,14 @@ fn render_validated_execution(
         config,
         arguments,
     }
+}
+
+fn valid_interface_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 15
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
 fn append_material_directive(
@@ -306,7 +464,10 @@ mod tests {
     };
     use crate::vortix_core::profile::ProfileId;
 
-    use super::{render_helper_execution, OpenVpnExecutionError};
+    use super::{
+        render_helper_execution, spawn_helper_foreground, terminate_helper_foreground, Duration,
+        OpenVpnExecutionError,
+    };
 
     fn profile_id() -> ProfileId {
         ProfileId::parse("a".repeat(ProfileId::HEX_LEN)).unwrap()
@@ -361,7 +522,7 @@ mod tests {
             format!(
                 concat!(
                     "client\n",
-                    "dev tun\n",
+                    "dev vxtest0\n",
                     "nobind\n",
                     "remote-cert-tls server\n",
                     "script-security 0\n",
@@ -389,11 +550,6 @@ mod tests {
                 format!("{runtime}/openvpn.log"),
                 "--verb".to_owned(),
                 "3".to_owned(),
-                "--management".to_owned(),
-                format!("{runtime}/m.sock"),
-                "unix".to_owned(),
-                "--management-hold".to_owned(),
-                "--management-query-passwords".to_owned(),
             ]
         );
         assert!(!execution.config().contains("route 10."));
@@ -503,5 +659,28 @@ mod tests {
             .contains(&format!("tls-crypt {runtime}/secrets/tls-crypt.key\n")));
         assert!(!execution.config().contains("tls-auth "));
         assert!(!execution.config().contains("remote-random"));
+    }
+
+    #[test]
+    fn foreground_child_is_contained_and_reaped_as_one_process_group() {
+        let plan = OpenVpnPlan::new(
+            profile_id(),
+            1,
+            vec![OpenVpnRemote::new(
+                SocketAddr::from(([203, 0, 113, 9], 1194)),
+                OpenVpnTransport::Udp,
+            )
+            .unwrap()],
+            OpenVpnRemoteSelection::Ordered,
+            OpenVpnAuthFactors::certificate(),
+            Vec::new(),
+        )
+        .unwrap();
+        let runtime = runtime("/run/vortix/resources", 'd');
+        let execution = render_helper_execution(&plan, Path::new(&runtime)).unwrap();
+        let mut child = spawn_helper_foreground(Path::new("/usr/bin/yes"), &execution).unwrap();
+
+        terminate_helper_foreground(&mut child, Duration::from_secs(1)).unwrap();
+        assert!(child.try_wait().unwrap().is_some());
     }
 }
