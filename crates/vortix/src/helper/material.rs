@@ -219,6 +219,7 @@ impl WireGuardRuntimeStager {
         setup.commit();
         Ok(StagedWireGuardRuntime {
             config_path: self.config_path.clone(),
+            runtime_directory: self.runtime_directory.clone(),
             created: CreatedPath {
                 path: self.config_path.clone(),
                 identity,
@@ -229,24 +230,64 @@ impl WireGuardRuntimeStager {
     }
 
     pub(crate) fn recover(&self) -> Result<StagedWireGuardRuntime, WireGuardStagingError> {
+        self.recover_for_cleanup_if_present()?.ok_or_else(|| {
+            WireGuardStagingError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "WireGuard helper runtime is absent",
+            ))
+        })
+    }
+
+    /// Recover the exact staged config when it still exists. A missing or
+    /// empty derived runtime is the expected state after a completed cleanup;
+    /// any other artifact is drift and must not be treated as success.
+    pub(crate) fn recover_for_cleanup_if_present(
+        &self,
+    ) -> Result<Option<StagedWireGuardRuntime>, WireGuardStagingError> {
         validate_directory(
             &self.runtime_root,
             self.expected_owner_uid,
             HELPER_SOCKET_DIR_MODE,
         )
         .map_err(WireGuardStagingError::from_openvpn)?;
-        validate_directory(
-            &self.runtime_root.join("resources"),
+        let resource_root = self.runtime_root.join("resources");
+        if self.runtime_directory.parent() != Some(resource_root.as_path()) {
+            return Err(WireGuardStagingError::UnsafeRuntime);
+        }
+        match private_directory_presence(
+            &resource_root,
             self.expected_owner_uid,
             HELPER_RUNTIME_DIR_MODE,
-        )
-        .map_err(WireGuardStagingError::from_openvpn)?;
-        validate_directory(
+        )? {
+            None => return Ok(None),
+            Some(false) => return Err(WireGuardStagingError::UnsafeRuntime),
+            Some(true) => {}
+        }
+        match private_directory_presence(
             &self.runtime_directory,
             self.expected_owner_uid,
             HELPER_RUNTIME_DIR_MODE,
-        )
-        .map_err(WireGuardStagingError::from_openvpn)?;
+        )? {
+            None => return Ok(None),
+            Some(false) => return Err(WireGuardStagingError::UnsafeRuntime),
+            Some(true) => {}
+        }
+        let entries = std::fs::read_dir(&self.runtime_directory)?;
+        let expected_name = self
+            .config_path
+            .file_name()
+            .ok_or(WireGuardStagingError::UnsafeRuntime)?;
+        let mut config_present = false;
+        for entry in entries {
+            let entry = entry?;
+            if entry.file_name() != expected_name || config_present {
+                return Err(WireGuardStagingError::UnsafeRuntime);
+            }
+            config_present = true;
+        }
+        if !config_present {
+            return Ok(None);
+        }
         let file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
@@ -261,20 +302,22 @@ impl WireGuardRuntimeStager {
         {
             return Err(WireGuardStagingError::UnsafeRuntime);
         }
-        Ok(StagedWireGuardRuntime {
+        Ok(Some(StagedWireGuardRuntime {
             config_path: self.config_path.clone(),
+            runtime_directory: self.runtime_directory.clone(),
             created: CreatedPath {
                 path: self.config_path.clone(),
                 identity: SecretFileIdentity::from_metadata(&metadata),
             },
             expected_owner_uid: self.expected_owner_uid,
             cleaned: false,
-        })
+        }))
     }
 }
 
 pub(crate) struct StagedWireGuardRuntime {
     config_path: PathBuf,
+    runtime_directory: PathBuf,
     created: CreatedPath,
     expected_owner_uid: u32,
     cleaned: bool,
@@ -306,6 +349,7 @@ impl StagedWireGuardRuntime {
             .map_err(WireGuardStagingError::from_openvpn)?
         {
             std::fs::remove_file(&self.created.path)?;
+            File::open(&self.runtime_directory)?.sync_all()?;
         }
         self.cleaned = true;
         Ok(())
@@ -610,13 +654,52 @@ impl OpenVpnRuntimeStager {
     pub(crate) fn recover_for_cleanup(
         &self,
     ) -> Result<RecoveredOpenVpnRuntime, OpenVpnStagingError> {
+        self.recover_for_cleanup_if_present()?.ok_or_else(|| {
+            OpenVpnStagingError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "OpenVPN helper runtime is absent",
+            ))
+        })
+    }
+
+    pub(crate) fn recover_for_cleanup_if_present(
+        &self,
+    ) -> Result<Option<RecoveredOpenVpnRuntime>, OpenVpnStagingError> {
+        validate_directory(
+            &self.runtime_root,
+            self.expected_owner_uid,
+            HELPER_SOCKET_DIR_MODE,
+        )?;
+        let resource_root = self.runtime_root.join("resources");
+        if self.runtime_directory.parent() != Some(resource_root.as_path()) {
+            return Err(OpenVpnStagingError::UnsafeRuntime);
+        }
+        match private_directory_presence(
+            &resource_root,
+            self.expected_owner_uid,
+            HELPER_RUNTIME_DIR_MODE,
+        )? {
+            None => return Ok(None),
+            Some(false) => return Err(OpenVpnStagingError::UnsafeRuntime),
+            Some(true) => {}
+        }
+        match private_directory_presence(
+            &self.runtime_directory,
+            self.expected_owner_uid,
+            HELPER_RUNTIME_DIR_MODE,
+        )? {
+            None => return Ok(None),
+            Some(false) => return Err(OpenVpnStagingError::UnsafeRuntime),
+            Some(true) => {}
+        }
+        let entries = std::fs::read_dir(&self.runtime_directory)?;
         let recovered = RecoveredOpenVpnRuntime {
             runtime_root: self.runtime_root.clone(),
             runtime_directory: self.runtime_directory.clone(),
             expected_owner_uid: self.expected_owner_uid,
         };
-        recovered.validate()?;
-        Ok(recovered)
+        recovered.validate_entries(entries)?;
+        Ok(Some(recovered))
     }
 }
 
@@ -742,9 +825,16 @@ impl RecoveredOpenVpnRuntime {
             HELPER_RUNTIME_DIR_MODE,
         )?;
 
+        self.validate_entries(std::fs::read_dir(&self.runtime_directory)?)
+    }
+
+    fn validate_entries(
+        &self,
+        entries: std::fs::ReadDir,
+    ) -> Result<RecoveredRuntimeState, OpenVpnStagingError> {
         let mut payload_present = false;
         let mut child_evidence_present = false;
-        for entry in std::fs::read_dir(&self.runtime_directory)? {
+        for entry in entries {
             let entry = entry?;
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 return Err(OpenVpnStagingError::UnsafeRuntime);
@@ -1049,6 +1139,18 @@ fn validate_directory(
         return Err(OpenVpnStagingError::UnsafeRuntime);
     }
     Ok(())
+}
+
+fn private_directory_presence(
+    path: &Path,
+    expected_owner_uid: u32,
+    expected_mode: u32,
+) -> std::io::Result<Option<bool>> {
+    match private_directory_is_valid(path, expected_owner_uid, expected_mode) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+        Ok(valid) => Ok(Some(valid)),
+    }
 }
 
 #[derive(Default)]
@@ -1419,6 +1521,29 @@ mod tests {
         std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(matches!(
             stager.recover(),
+            Err(WireGuardStagingError::UnsafeRuntime)
+        ));
+    }
+
+    #[test]
+    fn wireguard_cleanup_recovery_distinguishes_drained_from_unsafe_runtime() {
+        let (root, stager) = wireguard_fixture();
+        assert!(stager.recover_for_cleanup_if_present().unwrap().is_none());
+
+        let resources = root.path().join("resources");
+        std::fs::create_dir(&resources).unwrap();
+        std::fs::set_permissions(&resources, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::create_dir(&stager.runtime_directory).unwrap();
+        std::fs::set_permissions(
+            &stager.runtime_directory,
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        assert!(stager.recover_for_cleanup_if_present().unwrap().is_none());
+
+        std::fs::write(stager.runtime_directory.join("foreign"), b"unsafe").unwrap();
+        assert!(matches!(
+            stager.recover_for_cleanup_if_present(),
             Err(WireGuardStagingError::UnsafeRuntime)
         ));
     }
@@ -1818,5 +1943,32 @@ mod tests {
             ));
             assert!(runtime.exists());
         }
+    }
+
+    #[test]
+    fn openvpn_cleanup_recovery_accepts_missing_runtime_but_not_unknown_artifacts() {
+        let (_root, runtime_stager) = fixture();
+        assert!(runtime_stager
+            .recover_for_cleanup_if_present()
+            .unwrap()
+            .is_none());
+
+        let (_sources, materials) = certificate_materials();
+        let staged = runtime_stager
+            .stage(&plan(), materials)
+            .unwrap()
+            .into_runtime();
+        let runtime = staged.runtime_directory().to_owned();
+        std::mem::forget(staged);
+        assert!(runtime_stager
+            .recover_for_cleanup_if_present()
+            .unwrap()
+            .is_some());
+
+        std::fs::write(runtime.join("foreign"), b"unsafe").unwrap();
+        assert!(matches!(
+            runtime_stager.recover_for_cleanup_if_present(),
+            Err(OpenVpnStagingError::UnsafeRuntime)
+        ));
     }
 }

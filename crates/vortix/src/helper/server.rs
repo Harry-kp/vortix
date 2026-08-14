@@ -961,11 +961,11 @@ where
     }
 }
 
-fn tunnel_for_profile_resource(resource: &ResourceTag) -> Option<ResourceTag> {
+pub(super) fn tunnel_for_profile_resource(resource: &ResourceTag) -> Option<ResourceTag> {
     ResourceTag::tunnel(resource.profile_id()?.clone(), resource.generation()).ok()
 }
 
-fn process_group_for_tunnel(tunnel: &ResourceTag) -> Result<ResourceTag, ()> {
+pub(super) fn process_group_for_tunnel(tunnel: &ResourceTag) -> Result<ResourceTag, ()> {
     let Some(profile_id) = tunnel.profile_id() else {
         return Err(());
     };

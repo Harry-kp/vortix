@@ -10,7 +10,7 @@ use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::child_evidence::{AttestedChildState, ChildEvidenceError, ChildEvidenceStore};
 use super::material::{
@@ -20,9 +20,9 @@ use super::material::{
 use super::observe::SystemObservationExecutor;
 use super::runtime::HelperRuntimeIdentity;
 use super::server::{
-    CleanupExecutor, NetworkPolicyExecutor, NetworkPolicyOutcome, ObservationError,
-    ObservationExecutor, ObservationOutcome, PrivilegedExecutionError, TunnelLifecycleExecutor,
-    TunnelStartOutcome,
+    process_group_for_tunnel, tunnel_for_profile_resource, CleanupExecutor, NetworkPolicyExecutor,
+    NetworkPolicyOutcome, ObservationError, ObservationExecutor, ObservationOutcome,
+    PrivilegedExecutionError, TunnelLifecycleExecutor, TunnelStartOutcome,
 };
 use super::validate::PlatformLayout;
 use crate::vortix_core::openvpn_credentials::DecodedOpenVpnCredentials;
@@ -76,6 +76,11 @@ struct ActiveOpenVpnRuntime {
     identity: ObservedChildIdentity,
     runtime: StagedOpenVpnRuntime,
     evidence: ChildEvidenceStore,
+}
+
+struct OpenVpnStopOutcome {
+    tunnel: ResourceObservation,
+    process_group: ResourceObservation,
 }
 
 impl ProductionHelperExecutor {
@@ -204,12 +209,36 @@ impl ProductionHelperExecutor {
         &mut self,
         tunnel: &ResourceTag,
     ) -> Result<ResourceObservation, PrivilegedExecutionError> {
-        let mut runtime = if let Some(runtime) = self.wireguard.remove(tunnel) {
-            runtime
-        } else {
-            self.wireguard_stager(tunnel)?
-                .recover()
+        let initial = self.observe_tunnel(tunnel, ProtocolKind::WireGuard)?;
+        let mut runtime = self.wireguard.remove(tunnel);
+        if initial.state() == ObservationState::Absent {
+            if runtime.is_none() {
+                runtime = self
+                    .wireguard_stager(tunnel)?
+                    .recover_for_cleanup_if_present()
+                    .map_err(|_| PrivilegedExecutionError::EffectMayHaveApplied)?;
+            }
+            if let Some(mut runtime) = runtime {
+                if runtime.cleanup().is_err() {
+                    self.wireguard.insert(tunnel.clone(), runtime);
+                    return Err(PrivilegedExecutionError::EffectMayHaveApplied);
+                }
+            }
+            return Ok(initial);
+        }
+        if initial.state() != ObservationState::Present {
+            if let Some(runtime) = runtime {
+                self.wireguard.insert(tunnel.clone(), runtime);
+            }
+            return Err(PrivilegedExecutionError::EffectMayHaveApplied);
+        }
+        let mut runtime = match runtime {
+            Some(runtime) => runtime,
+            None => self
+                .wireguard_stager(tunnel)?
+                .recover_for_cleanup_if_present()
                 .map_err(|_| PrivilegedExecutionError::EffectMayHaveApplied)?
+                .ok_or(PrivilegedExecutionError::EffectMayHaveApplied)?,
         };
         let binary = match verified_protocol_binary(self.layout, ProtocolKind::WireGuard) {
             Ok(binary) => binary,
@@ -387,6 +416,15 @@ impl ProductionHelperExecutor {
         tunnel: &ResourceTag,
         expected: &ObservedChildIdentity,
     ) -> Result<ResourceObservation, PrivilegedExecutionError> {
+        self.stop_openvpn_owned(tunnel, expected)
+            .map(|outcome| outcome.tunnel)
+    }
+
+    fn stop_openvpn_owned(
+        &mut self,
+        tunnel: &ResourceTag,
+        expected: &ObservedChildIdentity,
+    ) -> Result<OpenVpnStopOutcome, PrivilegedExecutionError> {
         if expected.resource() != tunnel {
             return Err(PrivilegedExecutionError::InvalidPlan);
         }
@@ -402,7 +440,7 @@ impl ProductionHelperExecutor {
         tunnel: &ResourceTag,
         expected: &ObservedChildIdentity,
         mut active: ActiveOpenVpnRuntime,
-    ) -> Result<ResourceObservation, PrivilegedExecutionError> {
+    ) -> Result<OpenVpnStopOutcome, PrivilegedExecutionError> {
         if &active.identity != expected
             || !matches!(active.evidence.load_attested(), Ok(identity) if &identity == expected)
         {
@@ -436,6 +474,13 @@ impl ProductionHelperExecutor {
             self.openvpn.insert(tunnel.clone(), active);
             return Err(PrivilegedExecutionError::EffectMayHaveApplied);
         }
+        let process_group = match force_process_group_absence(&active.evidence, expected) {
+            Ok(observation) => observation,
+            Err(error) => {
+                self.openvpn.insert(tunnel.clone(), active);
+                return Err(error);
+            }
+        };
         let observation = match self.wait_for_openvpn_absence(tunnel) {
             Ok(observation) => observation,
             Err(error) => {
@@ -455,52 +500,69 @@ impl ProductionHelperExecutor {
             .runtime
             .finish_cleanup()
             .map_err(|_| PrivilegedExecutionError::EffectMayHaveApplied)?;
-        Ok(observation)
+        Ok(OpenVpnStopOutcome {
+            tunnel: observation,
+            process_group,
+        })
     }
 
     fn stop_recovered_openvpn(
         &mut self,
         tunnel: &ResourceTag,
         expected: &ObservedChildIdentity,
-    ) -> Result<ResourceObservation, PrivilegedExecutionError> {
+    ) -> Result<OpenVpnStopOutcome, PrivilegedExecutionError> {
         let runtime_identity = HelperRuntimeIdentity::derive(self.layout, self.lease_id, tunnel)
             .map_err(|_| PrivilegedExecutionError::InvalidPlan)?;
         let evidence = ChildEvidenceStore::root_owned(self.layout, &runtime_identity);
         let mut runtime = OpenVpnRuntimeStager::root_owned(self.layout, &runtime_identity)
-            .recover_for_cleanup()
+            .recover_for_cleanup_if_present()
             .map_err(|_| PrivilegedExecutionError::EffectMayHaveApplied)?;
         let evidence_present = match evidence.load_attested() {
             Ok(identity) if &identity == expected => true,
-            Err(ChildEvidenceError::Io(error))
-                if error.kind() == std::io::ErrorKind::NotFound
-                    && runtime.is_drained().is_ok_and(|drained| drained) =>
-            {
+            Err(ChildEvidenceError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
                 false
             }
             Ok(_) | Err(_) => return Err(PrivilegedExecutionError::EffectMayHaveApplied),
         };
-        match evidence.classify_attested(expected) {
-            Ok(AttestedChildState::Live) => {
-                terminate_recovered_openvpn(&evidence, expected)?;
-            }
-            Ok(AttestedChildState::Exited) => {}
-            Ok(AttestedChildState::Drifted) | Err(_) => {
+        if evidence_present {
+            if runtime.is_none() {
                 return Err(PrivilegedExecutionError::EffectMayHaveApplied);
             }
+            match evidence.classify_attested(expected) {
+                Ok(AttestedChildState::Live) => {
+                    terminate_recovered_openvpn(&evidence, expected)?;
+                }
+                Ok(AttestedChildState::Exited) => {}
+                Ok(AttestedChildState::Drifted) | Err(_) => {
+                    return Err(PrivilegedExecutionError::EffectMayHaveApplied);
+                }
+            }
         }
+        let process_group = if evidence_present {
+            force_process_group_absence(&evidence, expected)?
+        } else {
+            wait_for_process_group_absence(expected)?
+        };
         let observation = self.wait_for_openvpn_absence(tunnel)?;
-        runtime
-            .cleanup_payload_after_child()
-            .map_err(|_| PrivilegedExecutionError::EffectMayHaveApplied)?;
+        if let Some(runtime) = runtime.as_mut() {
+            runtime
+                .cleanup_payload_after_child()
+                .map_err(|_| PrivilegedExecutionError::EffectMayHaveApplied)?;
+        }
         if evidence_present {
             evidence
                 .remove(expected)
                 .map_err(|_| PrivilegedExecutionError::EffectMayHaveApplied)?;
         }
-        runtime
-            .finish_cleanup()
-            .map_err(|_| PrivilegedExecutionError::EffectMayHaveApplied)?;
-        Ok(observation)
+        if let Some(runtime) = runtime {
+            runtime
+                .finish_cleanup()
+                .map_err(|_| PrivilegedExecutionError::EffectMayHaveApplied)?;
+        }
+        Ok(OpenVpnStopOutcome {
+            tunnel: observation,
+            process_group,
+        })
     }
 
     fn wait_for_openvpn_absence(
@@ -574,34 +636,110 @@ fn terminate_recovered_openvpn(
 ) -> Result<(), PrivilegedExecutionError> {
     signal_helper_process_group(identity.pid(), HelperGroupSignal::Terminate)
         .map_err(|_| PrivilegedExecutionError::EffectMayHaveApplied)?;
-    let graceful_deadline = Instant::now() + OPENVPN_TERMINATION_TIMEOUT;
-    let mut backoff = PollBackoff::new();
-    loop {
-        match evidence.classify_attested(identity) {
-            Ok(AttestedChildState::Exited) => return Ok(()),
-            Ok(AttestedChildState::Drifted) | Err(_) => {
-                return Err(PrivilegedExecutionError::EffectMayHaveApplied);
-            }
-            Ok(AttestedChildState::Live) if Instant::now() < graceful_deadline => {
-                backoff.pause();
-            }
-            Ok(AttestedChildState::Live) => break,
-        }
+    if wait_for_attested_group_absence(
+        evidence,
+        identity,
+        Instant::now() + OPENVPN_TERMINATION_TIMEOUT,
+    )? {
+        return Ok(());
     }
     signal_helper_process_group(identity.pid(), HelperGroupSignal::Kill)
         .map_err(|_| PrivilegedExecutionError::EffectMayHaveApplied)?;
-    let kill_deadline = Instant::now() + OPENVPN_TERMINATION_TIMEOUT;
+    if wait_for_attested_group_absence(
+        evidence,
+        identity,
+        Instant::now() + OPENVPN_TERMINATION_TIMEOUT,
+    )? {
+        Ok(())
+    } else {
+        Err(PrivilegedExecutionError::EffectMayHaveApplied)
+    }
+}
+
+fn wait_for_attested_group_absence(
+    evidence: &ChildEvidenceStore,
+    identity: &ObservedChildIdentity,
+    deadline: Instant,
+) -> Result<bool, PrivilegedExecutionError> {
     let mut backoff = PollBackoff::new();
     loop {
         match evidence.classify_attested(identity) {
-            Ok(AttestedChildState::Exited) => return Ok(()),
-            Ok(AttestedChildState::Live) if Instant::now() < kill_deadline => {
-                backoff.pause();
-            }
-            Ok(AttestedChildState::Live | AttestedChildState::Drifted) | Err(_) => {
+            Ok(AttestedChildState::Exited | AttestedChildState::Live) => {}
+            Ok(AttestedChildState::Drifted) | Err(_) => {
                 return Err(PrivilegedExecutionError::EffectMayHaveApplied);
             }
         }
+        if !helper_process_group_has_live_members(identity.pid())? {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        backoff.pause();
+    }
+}
+
+fn wait_for_process_group_absence(
+    identity: &ObservedChildIdentity,
+) -> Result<ResourceObservation, PrivilegedExecutionError> {
+    let deadline = Instant::now() + OPENVPN_TERMINATION_TIMEOUT;
+    let mut backoff = PollBackoff::new();
+    while helper_process_group_has_live_members(identity.pid())? {
+        if Instant::now() >= deadline {
+            return Err(PrivilegedExecutionError::EffectMayHaveApplied);
+        }
+        backoff.pause();
+    }
+    let resource = process_group_for_tunnel(identity.resource())
+        .map_err(|()| PrivilegedExecutionError::InvalidPlan)?;
+    let observed_at_millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    ResourceObservation::new(
+        resource,
+        ObservationState::Absent,
+        u64::try_from(observed_at_millis).unwrap_or(u64::MAX).max(1),
+    )
+    .map_err(|_| PrivilegedExecutionError::EffectMayHaveApplied)
+}
+
+fn force_process_group_absence(
+    evidence: &ChildEvidenceStore,
+    identity: &ObservedChildIdentity,
+) -> Result<ResourceObservation, PrivilegedExecutionError> {
+    if helper_process_group_has_live_members(identity.pid())? {
+        if matches!(
+            evidence.classify_attested(identity),
+            Ok(AttestedChildState::Drifted) | Err(_)
+        ) {
+            return Err(PrivilegedExecutionError::EffectMayHaveApplied);
+        }
+        signal_helper_process_group(identity.pid(), HelperGroupSignal::Kill)
+            .map_err(|_| PrivilegedExecutionError::EffectMayHaveApplied)?;
+    }
+    wait_for_process_group_absence(identity)
+}
+
+fn helper_process_group_has_live_members(group_id: u32) -> Result<bool, PrivilegedExecutionError> {
+    if let Some(has_live_members) = crate::platform::process_group_has_live_members(group_id)
+        .map_err(|_| PrivilegedExecutionError::EffectMayHaveApplied)?
+    {
+        return Ok(has_live_members);
+    }
+    let pid =
+        i32::try_from(group_id).map_err(|_| PrivilegedExecutionError::EffectMayHaveApplied)?;
+    // SAFETY: signal zero only probes the process-group namespace and does not
+    // mutate the target group or access Rust memory.
+    #[allow(unsafe_code)]
+    let status = unsafe { libc::kill(-pid, 0) };
+    if status == 0 {
+        return Ok(true);
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::ESRCH) => Ok(false),
+        Some(libc::EPERM) => Ok(true),
+        _ => Err(PrivilegedExecutionError::EffectMayHaveApplied),
     }
 }
 
@@ -676,12 +814,189 @@ impl NetworkPolicyExecutor for ProductionHelperExecutor {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CleanupAction {
+    WireGuard(ResourceTag),
+    OpenVpn {
+        tunnel: ResourceTag,
+        child: ObservedChildIdentity,
+    },
+}
+
+fn plan_cleanup_actions(
+    resources: &[ResourceTag],
+    children: &[ObservedChildIdentity],
+) -> Result<Vec<CleanupAction>, ()> {
+    if resources.is_empty() {
+        return Err(());
+    }
+    let resource_set = resources.iter().collect::<std::collections::BTreeSet<_>>();
+    if resource_set.len() != resources.len()
+        || resources.iter().any(|resource| {
+            !matches!(
+                resource.kind(),
+                crate::vortix_core::privileged::ResourceKind::Tunnel
+                    | crate::vortix_core::privileged::ResourceKind::ProcessGroup
+            )
+        })
+    {
+        return Err(());
+    }
+    let mut children_by_tunnel = BTreeMap::new();
+    for child in children {
+        if !resource_set.contains(child.resource())
+            || children_by_tunnel.insert(child.resource(), child).is_some()
+        {
+            return Err(());
+        }
+        let group = process_group_for_tunnel(child.resource())?;
+        if !resource_set.contains(&group) {
+            return Err(());
+        }
+    }
+    for resource in resources.iter().filter(|resource| {
+        resource.kind() == crate::vortix_core::privileged::ResourceKind::ProcessGroup
+    }) {
+        let tunnel = tunnel_for_profile_resource(resource).ok_or(())?;
+        if !children_by_tunnel.contains_key(&tunnel) || !resource_set.contains(&tunnel) {
+            return Err(());
+        }
+    }
+    resources
+        .iter()
+        .filter(|resource| resource.kind() == crate::vortix_core::privileged::ResourceKind::Tunnel)
+        .map(|tunnel| match children_by_tunnel.remove(tunnel) {
+            Some(child) => Ok(CleanupAction::OpenVpn {
+                tunnel: tunnel.clone(),
+                child: child.clone(),
+            }),
+            None => Ok(CleanupAction::WireGuard(tunnel.clone())),
+        })
+        .collect()
+}
+
 impl CleanupExecutor for ProductionHelperExecutor {
     fn cleanup_owned(
         &mut self,
-        _resources: &[ResourceTag],
-        _children: &[ObservedChildIdentity],
+        resources: &[ResourceTag],
+        children: &[ObservedChildIdentity],
     ) -> Result<Vec<ResourceObservation>, PrivilegedExecutionError> {
-        Err(PrivilegedExecutionError::InvalidPlan)
+        let actions = plan_cleanup_actions(resources, children)
+            .map_err(|()| PrivilegedExecutionError::InvalidPlan)?;
+        let mut observations = BTreeMap::new();
+        for action in actions {
+            match action {
+                CleanupAction::WireGuard(tunnel) => {
+                    let observation = self
+                        .stop_wireguard(&tunnel)
+                        .map_err(|_| PrivilegedExecutionError::EffectMayHaveApplied)?;
+                    observations.insert(tunnel, observation);
+                }
+                CleanupAction::OpenVpn { tunnel, child } => {
+                    let process_group = process_group_for_tunnel(&tunnel)
+                        .map_err(|()| PrivilegedExecutionError::InvalidPlan)?;
+                    let outcome = self
+                        .stop_openvpn_owned(&tunnel, &child)
+                        .map_err(|_| PrivilegedExecutionError::EffectMayHaveApplied)?;
+                    if outcome.process_group.resource() != &process_group
+                        || outcome.process_group.state() != ObservationState::Absent
+                    {
+                        return Err(PrivilegedExecutionError::EffectMayHaveApplied);
+                    }
+                    observations.insert(tunnel, outcome.tunnel);
+                    observations.insert(process_group, outcome.process_group);
+                }
+            }
+        }
+        resources
+            .iter()
+            .map(|resource| {
+                observations
+                    .remove(resource)
+                    .filter(|observation| observation.state() == ObservationState::Absent)
+                    .ok_or(PrivilegedExecutionError::EffectMayHaveApplied)
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::process::CommandExt as _;
+    use std::process::Command;
+
+    use crate::vortix_core::privileged::{
+        ContainmentId, ObservedChildIdentity, ResourceKind, ResourceTag,
+    };
+    use crate::vortix_core::profile::ProfileId;
+
+    use super::{
+        helper_process_group_has_live_members, plan_cleanup_actions, CleanupAction,
+        HelperGroupSignal,
+    };
+
+    fn tunnel(byte: char, generation: u64) -> ResourceTag {
+        ResourceTag::tunnel(
+            ProfileId::parse(byte.to_string().repeat(ProfileId::HEX_LEN)).unwrap(),
+            generation,
+        )
+        .unwrap()
+    }
+
+    fn group(tunnel: &ResourceTag) -> ResourceTag {
+        ResourceTag::profile(
+            tunnel.profile_id().unwrap().clone(),
+            tunnel.generation(),
+            ResourceKind::ProcessGroup,
+        )
+        .unwrap()
+    }
+
+    fn child(tunnel: &ResourceTag) -> ObservedChildIdentity {
+        ObservedChildIdentity::new(tunnel.clone(), 42, 7, ContainmentId::new([9; 32])).unwrap()
+    }
+
+    #[test]
+    fn cleanup_plan_requires_closed_exact_child_topology_before_mutation() {
+        let wireguard = tunnel('a', 3);
+        let openvpn = tunnel('b', 4);
+        let openvpn_group = group(&openvpn);
+        let openvpn_child = child(&openvpn);
+
+        let actions = plan_cleanup_actions(
+            &[wireguard.clone(), openvpn.clone(), openvpn_group.clone()],
+            std::slice::from_ref(&openvpn_child),
+        )
+        .unwrap();
+        assert!(matches!(
+            actions.as_slice(),
+            [CleanupAction::WireGuard(actual), CleanupAction::OpenVpn {
+                tunnel: actual_tunnel,
+                child: actual_child,
+            }] if actual == &wireguard
+                && actual_tunnel == &openvpn
+                && actual_child == &openvpn_child
+        ));
+
+        assert!(plan_cleanup_actions(
+            std::slice::from_ref(&openvpn),
+            std::slice::from_ref(&openvpn_child)
+        )
+        .is_err());
+        assert!(plan_cleanup_actions(&[openvpn_group], &[openvpn_child]).is_err());
+        assert!(plan_cleanup_actions(&[wireguard, openvpn], &[]).is_ok());
+    }
+
+    #[test]
+    fn process_group_probe_tracks_the_contained_group_not_only_its_leader() {
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30").process_group(0);
+        let mut child = command.spawn().unwrap();
+        let group = child.id();
+        assert!(helper_process_group_has_live_members(group).unwrap());
+
+        super::signal_helper_process_group(group, HelperGroupSignal::Kill).unwrap();
+        child.wait().unwrap();
+        assert!(!helper_process_group_has_live_members(group).unwrap());
     }
 }
