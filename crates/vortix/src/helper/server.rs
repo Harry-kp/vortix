@@ -2383,7 +2383,7 @@ pub(super) fn tunnel_for_profile_resource(resource: &ResourceTag) -> Option<Reso
     ResourceTag::tunnel(resource.profile_id()?.clone(), resource.generation()).ok()
 }
 
-pub(super) fn process_group_for_tunnel(tunnel: &ResourceTag) -> Result<ResourceTag, ()> {
+pub(crate) fn process_group_for_tunnel(tunnel: &ResourceTag) -> Result<ResourceTag, ()> {
     let Some(profile_id) = tunnel.profile_id() else {
         return Err(());
     };
