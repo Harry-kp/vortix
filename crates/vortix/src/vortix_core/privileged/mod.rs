@@ -113,12 +113,13 @@ pub(crate) use ledger::{
     PhysicalFirewallBackend, PhysicalFirewallStage,
 };
 pub use operation::{
-    BootScope, HelperEpoch, LeaseId, NetworkPolicyOperation, OperationAdmission, OperationDigest,
-    OperationError, OperationGuard, PeerProcessIdentity, PolicyDigest, PolicyPhase,
-    PolicyPredecessor, PrivilegedDnsAssignment, PrivilegedDnsScope, PrivilegedFirewallRole,
-    PrivilegedFirewallTunnel, PrivilegedOperation, PrivilegedOperationId, PrivilegedRequest,
-    ReplayBaseline, ReplayHighWater, ReplayRecord, ReplayUnused, RequestSequence,
-    RootAuthorityLedger, ScopedRoute, ServiceInstanceClaim, ServiceManager, TrustedDaemonPrincipal,
+    AuthorityBinding, BootScope, HelperEpoch, LeaseId, NetworkPolicyOperation, OperationAdmission,
+    OperationDigest, OperationError, OperationGuard, PeerProcessIdentity, PolicyDigest,
+    PolicyPhase, PolicyPredecessor, PrivilegedDnsAssignment, PrivilegedDnsScope,
+    PrivilegedFirewallRole, PrivilegedFirewallTunnel, PrivilegedOperation, PrivilegedOperationId,
+    PrivilegedRequest, ReplayBaseline, ReplayHighWater, ReplayRecord, ReplayUnused,
+    RequestSequence, RootAuthorityLedger, ScopedRoute, ServiceInstanceClaim, ServiceManager,
+    TrustedDaemonPrincipal,
 };
 pub(crate) use operation::{PlatformVerifiedAuthority, PolicyProjection};
 pub(crate) use protocol_plan::TunnelDescriptorRef;

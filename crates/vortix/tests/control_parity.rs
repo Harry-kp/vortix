@@ -27,6 +27,7 @@ use vortix::vortix_core::control::{
     ProfileTopology, Secret, UserCommand,
 };
 use vortix::vortix_core::ipc::{IpcOp, IpcResult, RemoteSessionId};
+use vortix::vortix_core::privileged::{AuthorityBinding, BootScope, LeaseId, OperationDigest};
 
 fn cidr(address: [u8; 4], prefix: u8) -> Cidr {
     Cidr::new(IpAddr::V4(Ipv4Addr::from(address)), prefix).unwrap()
@@ -123,6 +124,26 @@ fn production_remote_mutation_gate_is_closed_until_enrollment_cutover() {
         RemoteControlSession::connect_production(RemoteMutationGate::production(), transport)
             .unwrap_err(),
         RemoteControlError::MutationDisabled
+    );
+}
+
+#[test]
+fn enrolled_remote_gate_requires_exact_transport_authority_before_open() {
+    let binding = AuthorityBinding::new(
+        AuthorityEpoch(9),
+        BootScope::new([1; 16]),
+        LeaseId::new([2; 32]),
+        OperationDigest::of_bytes(b"service instance"),
+    )
+    .unwrap();
+    let transport: Arc<dyn RemoteControlTransport> = Arc::new(FaultTransport(
+        RemoteControlError::Unavailable("exchange must not run".into()),
+    ));
+
+    assert_eq!(
+        RemoteControlSession::connect_production(RemoteMutationGate::Enrolled(binding), transport,)
+            .unwrap_err(),
+        RemoteControlError::AuthorityMismatch
     );
 }
 
