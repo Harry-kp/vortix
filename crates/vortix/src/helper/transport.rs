@@ -557,7 +557,9 @@ impl From<super::descriptor_transport::DescriptorTransportError> for HelperTrans
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::helper_client::{AuthenticatedHelperTransport, HelperConnectBudget};
+    use crate::daemon::helper_client::{
+        AuthenticatedHelperTransport, HelperConnectBudget, SharedAuthenticatedHelper,
+    };
     use crate::helper::protocol::{
         decode_response_frame, encode_request_frame, HelperCapability, HelperClientHello,
     };
@@ -922,6 +924,7 @@ mod tests {
             ),
         )
         .unwrap();
+        assert_eq!(transport.authority_binding(), authority);
         for _ in 0..2 {
             let receipt = transport
                 .execute(
@@ -931,6 +934,68 @@ mod tests {
                 )
                 .unwrap();
             assert!(receipt.is_rejected());
+        }
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn shared_authenticated_helper_serializes_one_exact_authority_sequence() {
+        let (root, authority, service) = authority_fixture();
+        let helper_epoch = HelperEpoch::new(8).unwrap();
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let server = std::thread::spawn(move || {
+            accept_handshake(
+                &mut server_stream,
+                authority,
+                helper_epoch,
+                vec![HelperCapability::Handshake, HelperCapability::Observe],
+            );
+            for expected in 1..=2 {
+                let execution = read_request(&mut server_stream);
+                let HelperOp::Execute(request) = execution.op else {
+                    panic!("expected typed helper execution request");
+                };
+                assert_eq!(request.sequence(), RequestSequence::new(expected).unwrap());
+                write_response(
+                    &mut server_stream,
+                    &rejected_response(&root, &request, execution.id),
+                )
+                .unwrap();
+            }
+        });
+        let transport = AuthenticatedHelperTransport::open_verified(
+            client_stream,
+            &verified_helper_peer(),
+            501,
+            authority,
+            &service,
+            &[HelperCapability::Handshake, HelperCapability::Observe],
+            HelperConnectBudget::new(
+                RequestSequence::new(1).unwrap(),
+                Instant::now() + Duration::from_secs(1),
+            ),
+        )
+        .unwrap();
+        let helper = std::sync::Arc::new(SharedAuthenticatedHelper::new(transport));
+        assert_eq!(helper.authority_binding(), authority);
+        assert!(helper.enables(HelperCapability::Observe));
+        assert!(!helper.enables(HelperCapability::TunnelLifecycle));
+        let calls = (0..2)
+            .map(|_| {
+                let helper = std::sync::Arc::clone(&helper);
+                std::thread::spawn(move || {
+                    helper
+                        .execute(
+                            PrivilegedOperation::Observe(Vec::new()),
+                            &[],
+                            Instant::now() + Duration::from_secs(1),
+                        )
+                        .unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        for call in calls {
+            assert!(call.join().unwrap().is_rejected());
         }
         server.join().unwrap();
     }
