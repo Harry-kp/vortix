@@ -55,7 +55,14 @@ pub(crate) trait ObservationExecutor {
     fn observe(
         &mut self,
         targets: &[ResourceObservationTarget],
+        scope: ObservationScope,
     ) -> Result<ObservationOutcome, ObservationError>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ObservationScope {
+    External,
+    Managed,
 }
 
 pub(crate) struct ObservationOutcome {
@@ -98,6 +105,7 @@ fn child_observations_match_request(
 pub(crate) enum ObservationError {
     InvalidResource,
     Overloaded,
+    Unavailable,
 }
 
 /// Typed protocol lifecycle seam. `WireGuard` returns exact interface evidence
@@ -927,7 +935,16 @@ where
         request: &crate::vortix_core::privileged::PrivilegedRequest,
         targets: &[ResourceObservationTarget],
     ) -> Result<VerifiedReceipt, HelperError> {
-        let outcome = match self.executor.observe(targets) {
+        self.execute_observation(request, targets, ObservationScope::External)
+    }
+
+    fn execute_observation(
+        &mut self,
+        request: &crate::vortix_core::privileged::PrivilegedRequest,
+        targets: &[ResourceObservationTarget],
+        scope: ObservationScope,
+    ) -> Result<VerifiedReceipt, HelperError> {
+        let outcome = match self.executor.observe(targets, scope) {
             Ok(outcome) => outcome,
             Err(ObservationError::InvalidResource) => {
                 return self
@@ -941,8 +958,22 @@ where
                     .rejected(request, RejectionCode::Overloaded)
                     .map_err(map_receipt_error);
             }
+            Err(ObservationError::Unavailable) => {
+                return self
+                    .receipts
+                    .rejected(request, RejectionCode::ExecutionFailed)
+                    .map_err(map_receipt_error);
+            }
         };
         if !child_observations_match_request(targets, &outcome.child_observations) {
+            return self
+                .receipts
+                .rejected(request, RejectionCode::InvalidResource)
+                .map_err(map_receipt_error);
+        }
+        if scope == ObservationScope::Managed
+            && !managed_observation_evidence_matches(targets, &outcome.observations)
+        {
             return self
                 .receipts
                 .rejected(request, RejectionCode::InvalidResource)
@@ -969,7 +1000,7 @@ where
                 .rejected(request, RejectionCode::InvalidResource)
                 .map_err(map_receipt_error);
         }
-        self.observe(request, targets)
+        self.execute_observation(request, targets, ObservationScope::Managed)
     }
 
     fn managed_observation_is_closed(&self, targets: &[ResourceObservationTarget]) -> bool {
@@ -2224,6 +2255,27 @@ where
     }
 }
 
+fn managed_observation_evidence_matches(
+    targets: &[ResourceObservationTarget],
+    observations: &[ResourceObservation],
+) -> bool {
+    targets.iter().all(|target| {
+        let Some(observation) = observations
+            .iter()
+            .find(|observation| observation.resource() == target.resource())
+        else {
+            return false;
+        };
+        if target.protocol() == Some(ProtocolKind::WireGuard)
+            && observation.state() == ObservationState::Present
+        {
+            observation.wireguard_peers().is_some()
+        } else {
+            observation.wireguard_peers().is_none()
+        }
+    })
+}
+
 fn accepts_prepared_firewall(
     plan: &NetworkPolicyExecutionPlan,
     prepared: &PreparedNetworkPolicyExecutionPlan,
@@ -2468,16 +2520,26 @@ mod tests {
         fn observe(
             &mut self,
             targets: &[ResourceObservationTarget],
+            scope: ObservationScope,
         ) -> Result<ObservationOutcome, ObservationError> {
             self.observations += 1;
             let observations = targets
                 .iter()
                 .map(|target| {
-                    ResourceObservation::new(
-                        target.resource().clone(),
-                        self.observation_state.unwrap_or(ObservationState::Present),
-                        1,
-                    )
+                    let state = self.observation_state.unwrap_or(ObservationState::Present);
+                    if scope == ObservationScope::Managed
+                        && target.protocol() == Some(ProtocolKind::WireGuard)
+                        && state == ObservationState::Present
+                    {
+                        ResourceObservation::with_wireguard_peers(
+                            target.resource().clone(),
+                            state,
+                            1,
+                            Vec::new(),
+                        )
+                    } else {
+                        ResourceObservation::new(target.resource().clone(), state, 1)
+                    }
                 })
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|_| ObservationError::InvalidResource)?;
@@ -3323,6 +3385,10 @@ mod tests {
         let receipt = harness.execute(3, &observe);
 
         assert!(receipt.observes(&resource(), ObservationState::Present));
+        assert_eq!(
+            receipt.observation(&resource()).unwrap().wireguard_peers(),
+            Some([].as_slice())
+        );
         assert_eq!(harness.server.executor.observations, 1);
     }
 

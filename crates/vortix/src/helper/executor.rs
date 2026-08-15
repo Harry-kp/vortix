@@ -26,14 +26,15 @@ use super::server::{
     process_group_for_tunnel, tunnel_for_profile_resource, CleanupExecutor,
     NetworkPolicyExecutionPlan, NetworkPolicyExecutor, NetworkPolicyOutcome,
     NetworkPolicyPreparationError, ObservationError, ObservationExecutor, ObservationOutcome,
-    PreparedNetworkPolicyExecutionPlan, PrivilegedExecutionError, RecoveredFirewallState,
-    RecoveredRouteState, TunnelLifecycleExecutor, TunnelStartOutcome,
+    ObservationScope, PreparedNetworkPolicyExecutionPlan, PrivilegedExecutionError,
+    RecoveredFirewallState, RecoveredRouteState, TunnelLifecycleExecutor, TunnelStartOutcome,
 };
 use super::validate::PlatformLayout;
 use crate::vortix_core::openvpn_credentials::DecodedOpenVpnCredentials;
 use crate::vortix_core::privileged::{
     LeaseId, NetworkPolicyOperation, ObservationState, ObservedChildIdentity, OpenVpnChallengeKind,
     ProtocolPlan, ResourceKind, ResourceObservation, ResourceObservationTarget, ResourceTag,
+    WireGuardPeerObservation,
 };
 use crate::vortix_core::profile::ProtocolKind;
 use crate::vortix_protocol_openvpn::execution::{
@@ -41,10 +42,12 @@ use crate::vortix_protocol_openvpn::execution::{
     HelperGroupSignal,
 };
 use crate::vortix_protocol_wireguard::execution::{
-    run_wg_quick, WgQuickAction, WireGuardCommandError,
+    decode_public_key, observe_helper_interface, run_wg_quick, WgQuickAction, WireGuardCommandError,
 };
+use crate::vortix_protocol_wireguard::tunnel::WgStatus;
 
 const WIREGUARD_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const MANAGED_WIREGUARD_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
 const OPENVPN_TERMINATION_TIMEOUT: Duration = Duration::from_secs(5);
 const OPENVPN_MANAGEMENT_SOCKET_TIMEOUT: Duration = Duration::from_secs(5);
 const OPENVPN_AUTHENTICATION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -117,7 +120,7 @@ impl ProductionHelperExecutor {
             .map_err(|_| PrivilegedExecutionError::InvalidPlan)?;
         let outcome = self
             .observation
-            .observe(&[target])
+            .observe(&[target], ObservationScope::External)
             .map_err(|_| PrivilegedExecutionError::EffectMayHaveApplied)?;
         let (mut observations, children) = outcome.into_parts();
         if !children.is_empty() || observations.len() != 1 {
@@ -758,9 +761,111 @@ impl ObservationExecutor for ProductionHelperExecutor {
     fn observe(
         &mut self,
         targets: &[ResourceObservationTarget],
+        scope: ObservationScope,
     ) -> Result<ObservationOutcome, ObservationError> {
-        self.observation.observe(targets)
+        let outcome = self.observation.observe(targets, scope)?;
+        if scope == ObservationScope::Managed {
+            self.attach_managed_wireguard_evidence(targets, outcome)
+        } else {
+            Ok(outcome)
+        }
     }
+}
+
+impl ProductionHelperExecutor {
+    fn attach_managed_wireguard_evidence(
+        &self,
+        targets: &[ResourceObservationTarget],
+        outcome: ObservationOutcome,
+    ) -> Result<ObservationOutcome, ObservationError> {
+        let (mut observations, children) = outcome.into_parts();
+        let targets_by_resource = targets
+            .iter()
+            .map(|target| (target.resource(), target))
+            .collect::<BTreeMap<_, _>>();
+        let deadline = Instant::now() + MANAGED_WIREGUARD_OBSERVATION_TIMEOUT;
+        for observation in &mut observations {
+            let Some(target) = targets_by_resource.get(observation.resource()).copied() else {
+                return Err(ObservationError::InvalidResource);
+            };
+            if target.protocol() != Some(ProtocolKind::WireGuard)
+                || observation.state() != ObservationState::Present
+            {
+                continue;
+            }
+            if self.layout != PlatformLayout::Linux {
+                return Err(ObservationError::Unavailable);
+            }
+            let runtime =
+                HelperRuntimeIdentity::derive(self.layout, self.lease_id, target.resource())
+                    .map_err(|_| ObservationError::InvalidResource)?;
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or(ObservationError::Unavailable)?;
+            let (status, observed_at) = observe_helper_interface(
+                runtime.kernel_alias(),
+                target.resource().generation(),
+                remaining,
+            )
+            .map_err(|_| ObservationError::Unavailable)?;
+            if status.peers.iter().any(|peer| {
+                peer.evidence_generation != target.resource().generation()
+                    || peer.evidence_observed_at != observed_at
+            }) {
+                return Err(ObservationError::InvalidResource);
+            }
+            *observation = ResourceObservation::with_wireguard_peers(
+                target.resource().clone(),
+                ObservationState::Present,
+                system_time_millis(observed_at)?,
+                wireguard_peer_observations(&status)?,
+            )
+            .map_err(|_| ObservationError::InvalidResource)?;
+        }
+        Ok(ObservationOutcome::new(observations, children))
+    }
+}
+
+fn wireguard_peer_observations(
+    status: &WgStatus,
+) -> Result<Vec<WireGuardPeerObservation>, ObservationError> {
+    status
+        .peers
+        .iter()
+        .map(|peer| {
+            let latest_handshake_at_millis =
+                peer.latest_handshake.map(system_time_millis).transpose()?;
+            let persistent_keepalive_seconds = peer
+                .persistent_keepalive
+                .map(|duration| {
+                    u16::try_from(duration.as_secs()).map_err(|_| ObservationError::InvalidResource)
+                })
+                .transpose()?;
+            let allowed_routes = peer
+                .allowed_routes
+                .iter()
+                .map(|route| route.parse().map_err(|_| ObservationError::InvalidResource))
+                .collect::<Result<Vec<_>, _>>()?;
+            WireGuardPeerObservation::new(
+                decode_public_key(&peer.public_key)
+                    .map_err(|_| ObservationError::InvalidResource)?,
+                allowed_routes,
+                latest_handshake_at_millis,
+                persistent_keepalive_seconds,
+                peer.bytes_rx,
+                peer.bytes_tx,
+            )
+            .map_err(|_| ObservationError::InvalidResource)
+        })
+        .collect()
+}
+
+fn system_time_millis(value: SystemTime) -> Result<u64, ObservationError> {
+    let millis = value
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| ObservationError::InvalidResource)?
+        .as_millis();
+    u64::try_from(millis).map_err(|_| ObservationError::InvalidResource)
 }
 
 impl TunnelLifecycleExecutor for ProductionHelperExecutor {
@@ -1072,15 +1177,19 @@ impl CleanupExecutor for ProductionHelperExecutor {
 mod tests {
     use std::os::unix::process::CommandExt as _;
     use std::process::Command;
+    use std::time::{Duration, UNIX_EPOCH};
 
+    use base64::engine::{general_purpose::STANDARD as BASE64, Engine as _};
+
+    use crate::vortix_core::ports::tunnel::TunnelPeerStatus;
     use crate::vortix_core::privileged::{
         ContainmentId, ObservedChildIdentity, ResourceKind, ResourceTag,
     };
     use crate::vortix_core::profile::ProfileId;
 
     use super::{
-        helper_process_group_has_live_members, plan_cleanup_actions, CleanupAction,
-        HelperGroupSignal,
+        helper_process_group_has_live_members, plan_cleanup_actions, wireguard_peer_observations,
+        CleanupAction, HelperGroupSignal,
     };
 
     fn tunnel(byte: char, generation: u64) -> ResourceTag {
@@ -1146,5 +1255,39 @@ mod tests {
         super::signal_helper_process_group(group, HelperGroupSignal::Kill).unwrap();
         child.wait().unwrap();
         assert!(!helper_process_group_has_live_members(group).unwrap());
+    }
+
+    #[test]
+    fn wireguard_status_maps_to_bounded_privileged_peer_evidence() {
+        let observed_at = UNIX_EPOCH + Duration::from_secs(1_700_000_001);
+        let status = crate::vortix_protocol_wireguard::tunnel::WgStatus {
+            interface_name: "vx-test".into(),
+            interface_public_key: BASE64.encode([1; 32]),
+            listen_port: Some(51_820),
+            peers: vec![TunnelPeerStatus {
+                public_key: BASE64.encode([7; 32]),
+                endpoint: None,
+                allowed_routes: vec!["10.0.0.0/24".into()],
+                latest_handshake: Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+                evidence_observed_at: observed_at,
+                evidence_generation: 4,
+                persistent_keepalive: Some(Duration::from_secs(25)),
+                bytes_rx: 42,
+                bytes_tx: 84,
+            }],
+        };
+
+        let peers = wireguard_peer_observations(&status).unwrap();
+
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].public_key(), [7; 32]);
+        assert_eq!(peers[0].allowed_routes(), &["10.0.0.0/24".parse().unwrap()]);
+        assert_eq!(
+            peers[0].latest_handshake_at_millis(),
+            Some(1_700_000_000_000)
+        );
+        assert_eq!(peers[0].persistent_keepalive_seconds(), Some(25));
+        assert_eq!(peers[0].bytes_rx(), 42);
+        assert_eq!(peers[0].bytes_tx(), 84);
     }
 }
