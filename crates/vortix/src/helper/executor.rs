@@ -13,6 +13,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::child_evidence::{AttestedChildState, ChildEvidenceError, ChildEvidenceStore};
+use super::firewall::HelperFirewallExecutor;
 use super::material::{
     OpenVpnRuntimeStager, StagedOpenVpnRuntime, StagedWireGuardRuntime, TunnelMaterialSet,
     WireGuardRuntimeStager,
@@ -23,15 +24,14 @@ use super::server::{
     process_group_for_tunnel, tunnel_for_profile_resource, CleanupExecutor,
     NetworkPolicyExecutionPlan, NetworkPolicyExecutor, NetworkPolicyOutcome,
     NetworkPolicyPreparationError, ObservationError, ObservationExecutor, ObservationOutcome,
-    PreparedNetworkPolicyExecutionPlan, PrivilegedExecutionError, TunnelLifecycleExecutor,
-    TunnelStartOutcome,
+    PreparedNetworkPolicyExecutionPlan, PrivilegedExecutionError, RecoveredFirewallState,
+    TunnelLifecycleExecutor, TunnelStartOutcome,
 };
 use super::validate::PlatformLayout;
 use crate::vortix_core::openvpn_credentials::DecodedOpenVpnCredentials;
 use crate::vortix_core::privileged::{
-    HelperLedgerFirewall, LeaseId, ObservationState, ObservedChildIdentity, OpenVpnChallengeKind,
-    PhysicalFirewallBackend, ProtocolPlan, ResourceObservation, ResourceObservationTarget,
-    ResourceTag,
+    LeaseId, ObservationState, ObservedChildIdentity, OpenVpnChallengeKind, ProtocolPlan,
+    ResourceObservation, ResourceObservationTarget, ResourceTag,
 };
 use crate::vortix_core::profile::ProtocolKind;
 use crate::vortix_protocol_openvpn::execution::{
@@ -70,6 +70,7 @@ pub(crate) struct ProductionHelperExecutor {
     observation: SystemObservationExecutor,
     layout: PlatformLayout,
     lease_id: LeaseId,
+    firewall: HelperFirewallExecutor,
     wireguard: BTreeMap<ResourceTag, StagedWireGuardRuntime>,
     openvpn: BTreeMap<ResourceTag, ActiveOpenVpnRuntime>,
 }
@@ -95,6 +96,7 @@ impl ProductionHelperExecutor {
             observation: SystemObservationExecutor::new(layout, lease_id)?,
             layout,
             lease_id,
+            firewall: HelperFirewallExecutor::new(layout, lease_id),
             wireguard: BTreeMap::new(),
             openvpn: BTreeMap::new(),
         })
@@ -810,38 +812,25 @@ fn verified_protocol_binary(
 
 impl NetworkPolicyExecutor for ProductionHelperExecutor {
     fn validate_recovered_firewalls(
-        &self,
-        firewalls: &[HelperLedgerFirewall],
+        &mut self,
+        firewalls: &[RecoveredFirewallState],
+        policy_enabled: bool,
     ) -> Result<(), PrivilegedExecutionError> {
-        let valid = firewalls.iter().all(|firewall| {
-            matches!(
-                (self.layout, firewall.backend()),
-                (
-                    PlatformLayout::Linux,
-                    PhysicalFirewallBackend::LinuxNft
-                        | PhysicalFirewallBackend::LinuxIptablesDualFamily
-                ) | (PlatformLayout::MacOs, PhysicalFirewallBackend::MacOsPf)
-            )
-        });
-        if valid {
-            Ok(())
-        } else {
-            Err(PrivilegedExecutionError::InvalidPlan)
-        }
+        self.firewall.validate_recovered(firewalls, policy_enabled)
     }
 
     fn prepare_network_policy(
         &mut self,
-        _plan: &NetworkPolicyExecutionPlan,
+        plan: &NetworkPolicyExecutionPlan,
     ) -> Result<PreparedNetworkPolicyExecutionPlan, NetworkPolicyPreparationError> {
-        Err(NetworkPolicyPreparationError::InvalidPlan)
+        self.firewall.prepare(plan)
     }
 
     fn execute_network_policy(
         &mut self,
-        _plan: &PreparedNetworkPolicyExecutionPlan,
+        plan: &PreparedNetworkPolicyExecutionPlan,
     ) -> Result<NetworkPolicyOutcome, PrivilegedExecutionError> {
-        Err(PrivilegedExecutionError::InvalidPlan)
+        self.firewall.execute(plan)
     }
 }
 
