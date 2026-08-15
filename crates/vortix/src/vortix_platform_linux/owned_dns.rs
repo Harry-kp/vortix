@@ -182,6 +182,55 @@ impl<R: DnsRunner> OwnedDns for LinuxOwnedDns<R> {
             Err(OwnedDnsError::EffectMayHaveApplied)
         }
     }
+
+    fn audit_release_physical(
+        &mut self,
+        retained: &OwnedDnsRecoveryCandidate,
+        obsolete: &[OwnedDnsRecoveryCandidate],
+    ) -> Result<(), OwnedDnsError> {
+        let backend = retained.physical().backend();
+        if !linux_backend(backend)
+            || obsolete
+                .iter()
+                .any(|candidate| candidate.physical().backend() != backend)
+        {
+            return Err(OwnedDnsError::FailedBeforeEffect);
+        }
+        self.verify_policy(retained.policy(), retained.physical())
+            .map_err(|_| OwnedDnsError::FailedBeforeEffect)?;
+        let retained_states = policy_states(backend, retained.policy())
+            .map_err(|_| OwnedDnsError::FailedBeforeEffect)?;
+        let mut obsolete_priors = BTreeMap::<String, PhysicalDnsPrior>::new();
+        for candidate in obsolete {
+            let obsolete_states = policy_states(backend, candidate.policy())
+                .map_err(|_| OwnedDnsError::FailedBeforeEffect)?;
+            let physical = inherited_links(backend, candidate.physical().links())
+                .map_err(|_| OwnedDnsError::FailedBeforeEffect)?;
+            if obsolete_states.len() != physical.len()
+                || obsolete_states
+                    .keys()
+                    .any(|interface| !physical.contains_key(interface))
+            {
+                return Err(OwnedDnsError::FailedBeforeEffect);
+            }
+            for (interface, prior) in physical {
+                if retained_states.contains_key(&interface) {
+                    continue;
+                }
+                if obsolete_priors
+                    .insert(interface, prior.clone())
+                    .is_some_and(|existing| !state_eq(&existing, &prior))
+                {
+                    return Err(OwnedDnsError::FailedBeforeEffect);
+                }
+            }
+        }
+        for (interface, prior) in obsolete_priors {
+            self.verify_state(backend, &interface, &prior)
+                .map_err(|_| OwnedDnsError::FailedBeforeEffect)?;
+        }
+        Ok(())
+    }
 }
 
 impl<R: DnsRunner> LinuxOwnedDns<R> {
@@ -1232,6 +1281,87 @@ mod tests {
             ),
             Err(OwnedDnsError::FailedBeforeEffect)
         );
+        assert_eq!(dns.runner.write_count, 0);
+    }
+
+    #[test]
+    fn release_rejects_obsolete_only_link_that_was_not_restored_to_its_prior() {
+        let retained_prior = resolved(&["9.9.9.9"], &[], Some(false));
+        let obsolete_prior = resolved(&["8.8.8.8"], &[], Some(false));
+        let retained = policy(
+            2,
+            vec![assignment("vxcorp2", "1.1.1.1", DnsScope::CatchAll)],
+        );
+        let obsolete = policy(
+            1,
+            vec![assignment("vxcorp1", "10.0.0.53", DnsScope::CatchAll)],
+        );
+        let retained_target = policy_states(PhysicalDnsBackend::LinuxResolved, &retained).unwrap();
+        let obsolete_target = policy_states(PhysicalDnsBackend::LinuxResolved, &obsolete).unwrap();
+        let mut runner = FakeRunner::available();
+        runner
+            .resolved
+            .insert("vxcorp2".into(), retained_target["vxcorp2"].clone());
+        runner
+            .resolved
+            .insert("vxcorp1".into(), obsolete_target["vxcorp1"].clone());
+        let mut dns = LinuxOwnedDns { runner };
+        let retained = OwnedDnsRecoveryCandidate::new(
+            retained,
+            prepared_resolved(&[("vxcorp2", retained_prior)]),
+        );
+        let obsolete = OwnedDnsRecoveryCandidate::new(
+            obsolete,
+            prepared_resolved(&[("vxcorp1", obsolete_prior)]),
+        );
+
+        assert_eq!(
+            dns.audit_release_physical(&retained, &[obsolete]),
+            Err(OwnedDnsError::FailedBeforeEffect)
+        );
+        assert_eq!(dns.runner.write_count, 0);
+    }
+
+    #[test]
+    fn release_accepts_restored_obsolete_only_link_and_retained_shared_link() {
+        let obsolete_prior = resolved(&["8.8.8.8"], &[], Some(false));
+        let retained = policy(
+            2,
+            vec![assignment("vxcorp1", "1.1.1.1", DnsScope::CatchAll)],
+        );
+        let obsolete_shared = policy(
+            1,
+            vec![assignment("vxcorp1", "10.0.0.53", DnsScope::CatchAll)],
+        );
+        let obsolete_restored = policy(
+            1,
+            vec![assignment("vxcorp2", "10.0.0.54", DnsScope::CatchAll)],
+        );
+        let retained_target = policy_states(PhysicalDnsBackend::LinuxResolved, &retained).unwrap();
+        let mut runner = FakeRunner::available();
+        runner
+            .resolved
+            .insert("vxcorp1".into(), retained_target["vxcorp1"].clone());
+        runner
+            .resolved
+            .insert("vxcorp2".into(), obsolete_prior.clone());
+        let mut dns = LinuxOwnedDns { runner };
+        let retained = OwnedDnsRecoveryCandidate::new(
+            retained,
+            prepared_resolved(&[("vxcorp1", obsolete_prior.clone())]),
+        );
+        let obsolete = [
+            OwnedDnsRecoveryCandidate::new(
+                obsolete_shared,
+                prepared_resolved(&[("vxcorp1", obsolete_prior.clone())]),
+            ),
+            OwnedDnsRecoveryCandidate::new(
+                obsolete_restored,
+                prepared_resolved(&[("vxcorp2", obsolete_prior)]),
+            ),
+        ];
+
+        dns.audit_release_physical(&retained, &obsolete).unwrap();
         assert_eq!(dns.runner.write_count, 0);
     }
 
