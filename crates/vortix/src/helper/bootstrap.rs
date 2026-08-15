@@ -74,6 +74,7 @@ pub fn stage_package_from_reader(
 ) -> Result<BootstrapStageReceipt, BootstrapError> {
     let (request, current_layout, manifest) = verify_package_request(reader)?;
     ensure_root_state_directory(current_layout)?;
+    let _authority_lock = acquire_authority_lock(current_layout, request.owner_uid())?;
     RootEnrollmentStore::root_owned(current_layout)
         .stage(&request, &manifest)
         .map_err(|_| BootstrapError::EnrollmentState)?;
@@ -93,6 +94,7 @@ pub fn reserve_package_from_reader(
 ) -> Result<BootstrapReserveReceipt, BootstrapError> {
     let (request, current_layout, manifest) = verify_package_request(reader)?;
     ensure_root_state_directory(current_layout)?;
+    let _authority_lock = acquire_authority_lock(current_layout, request.owner_uid())?;
     let boot_scope = current_boot_scope()?;
     let lease_id = LeaseId::new(random_array()?);
     let manager_instance_nonce = random_array()?;
@@ -123,6 +125,7 @@ pub fn commit_package_from_reader(
     }
     let (request, current_layout, manifest) = verify_package_request(reader)?;
     ensure_root_state_directory(current_layout)?;
+    let _authority_lock = acquire_authority_lock(current_layout, request.owner_uid())?;
     let reservation = RootEnrollmentStore::root_owned(current_layout)
         .commit_epoch(&request, authority_epoch)
         .map_err(|_| BootstrapError::EnrollmentState)?;
@@ -164,6 +167,16 @@ fn verify_package_request(
     }
     verify_running_bootstrap(current_layout)?;
     Ok((request, current_layout, manifest))
+}
+
+fn acquire_authority_lock(layout: PlatformLayout, owner_uid: u32) -> Result<File, BootstrapError> {
+    crate::authority_lock::install_and_acquire(layout, owner_uid).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            BootstrapError::AuthorityLockBusy
+        } else {
+            BootstrapError::AuthorityLock
+        }
+    })
 }
 
 fn current_boot_scope() -> Result<BootScope, BootstrapError> {
@@ -419,6 +432,10 @@ pub enum BootstrapError {
     WrongBootstrapExecutable,
     #[error("the root-owned enrollment record could not be staged safely")]
     EnrollmentState,
+    #[error("the root-controlled authority transition lock could not be installed safely")]
+    AuthorityLock,
+    #[error("another Vortix authority transition is in progress; retry after it completes")]
+    AuthorityLockBusy,
     #[error("OS boot identity is unavailable")]
     MissingBootIdentity,
     #[error("authority epoch must be non-zero")]

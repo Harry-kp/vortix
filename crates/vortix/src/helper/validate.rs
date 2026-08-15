@@ -97,6 +97,19 @@ impl PlatformLayout {
     }
 
     #[must_use]
+    pub const fn authority_lock(self) -> &'static str {
+        match self {
+            Self::Linux => "/var/lib/vortix-public/authority.lock",
+            Self::MacOs => "/Library/Application Support/Vortix/Public/authority.lock",
+        }
+    }
+
+    #[must_use]
+    pub const fn authority_lock_dir_mode(self) -> u32 {
+        0o755
+    }
+
+    #[must_use]
     pub const fn install_manifest(self) -> &'static str {
         match self {
             Self::Linux => "/usr/libexec/vortix/install-manifest.json",

@@ -939,7 +939,7 @@ fn handle_up(
 /// Acquire the cross-process lifecycle lock or exit with a structured
 /// error. Proceeding without the lock would reintroduce the concurrent
 /// `up`/`down` interleaving the lock exists to prevent.
-fn acquire_lifecycle_lock_or_exit(mode: OutputMode, command: &str) -> std::fs::File {
+fn acquire_lifecycle_lock_or_exit(mode: OutputMode, command: &str) -> crate::utils::LifecycleLock {
     match crate::utils::acquire_lifecycle_lock() {
         Ok(file) => file,
         Err(e) => print_error_and_exit(

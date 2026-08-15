@@ -122,6 +122,16 @@ fn fixed_layout_and_permissions_are_part_of_the_contract() {
         PlatformLayout::MacOs.helper_runtime_dir(),
         "/var/run/vortix"
     );
+    assert_eq!(
+        PlatformLayout::Linux.authority_lock(),
+        "/var/lib/vortix-public/authority.lock"
+    );
+    assert_eq!(
+        PlatformLayout::MacOs.authority_lock(),
+        "/Library/Application Support/Vortix/Public/authority.lock"
+    );
+    assert_eq!(PlatformLayout::Linux.authority_lock_dir_mode(), 0o755);
+    assert_eq!(PlatformLayout::MacOs.authority_lock_dir_mode(), 0o755);
     assert_eq!(manifest().generation(), 3);
 }
 
