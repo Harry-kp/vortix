@@ -194,6 +194,39 @@ pub(crate) struct RecoveredFirewallState {
     effective: Option<PolicyProjection>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecoveredRouteState {
+    state: HelperResourceState,
+    intended: PolicyProjection,
+    effective: Option<PolicyProjection>,
+}
+
+impl RecoveredRouteState {
+    pub(crate) const fn new(
+        state: HelperResourceState,
+        intended: PolicyProjection,
+        effective: Option<PolicyProjection>,
+    ) -> Self {
+        Self {
+            state,
+            intended,
+            effective,
+        }
+    }
+
+    pub(crate) const fn state(&self) -> HelperResourceState {
+        self.state
+    }
+
+    pub(crate) const fn intended(&self) -> &PolicyProjection {
+        &self.intended
+    }
+
+    pub(crate) const fn effective(&self) -> Option<&PolicyProjection> {
+        self.effective.as_ref()
+    }
+}
+
 impl RecoveredFirewallState {
     pub(crate) const fn physical(&self) -> &HelperLedgerFirewall {
         &self.physical
@@ -261,6 +294,27 @@ fn recovered_dns_states(
                         physical,
                     )
                 },
+            ))
+        })
+        .collect()
+}
+
+fn recovered_route_states(
+    resources: &[HelperLedgerResource],
+    policy_projections: &[HelperLedgerPolicy],
+) -> Vec<RecoveredRouteState> {
+    policy_projections
+        .iter()
+        .filter(|policy| policy.resource().kind() == ResourceKind::Routes)
+        .filter_map(|policy| {
+            let state = resources
+                .iter()
+                .find(|resource| resource.resource() == policy.resource())
+                .map(HelperLedgerResource::state)?;
+            Some(RecoveredRouteState::new(
+                state,
+                policy.intended().clone(),
+                policy.effective().cloned(),
             ))
         })
         .collect()
@@ -338,6 +392,12 @@ pub(crate) trait NetworkPolicyExecutor {
     fn validate_recovered_dns(
         &mut self,
         states: &[RecoveredDnsState],
+        policy_enabled: bool,
+    ) -> Result<(), PrivilegedExecutionError>;
+
+    fn validate_recovered_routes(
+        &mut self,
+        states: &[RecoveredRouteState],
         policy_enabled: bool,
     ) -> Result<(), PrivilegedExecutionError>;
 
@@ -513,12 +573,16 @@ where
             recovered_firewall_states(&physical_firewalls, &policy_projections)?;
         let recovered_dns_states =
             recovered_dns_states(&physical_dns, &resources, &policy_projections);
+        let recovered_route_states = recovered_route_states(&resources, &policy_projections);
         let policy_enabled = enabled_capabilities.contains(&HelperCapability::NetworkPolicy);
         executor
             .validate_recovered_firewalls(&recovered_firewall_states, policy_enabled)
             .map_err(|_| OperationError::InvalidReplayState)?;
         executor
             .validate_recovered_dns(&recovered_dns_states, policy_enabled)
+            .map_err(|_| OperationError::InvalidReplayState)?;
+        executor
+            .validate_recovered_routes(&recovered_route_states, policy_enabled)
             .map_err(|_| OperationError::InvalidReplayState)?;
         let mut session = Self::resume_restricted(
             root,
@@ -697,6 +761,18 @@ where
 
     fn prepare_network_policy(&mut self, operation: &NetworkPolicyOperation) -> Result<(), ()> {
         let resource = operation.policy_resource().clone();
+        if matches!(operation, NetworkPolicyOperation::ApplyRoutes { .. })
+            && self.guard.policy_projection().is_some_and(|projection| {
+                projection.route_inputs().is_none_or(|(_, tunnels)| {
+                    tunnels.iter().any(|tunnel| {
+                        self.resource_states.get(tunnel.tunnel())
+                            != Some(&HelperResourceState::Owned)
+                    })
+                })
+            })
+        {
+            return Err(());
+        }
         match operation {
             NetworkPolicyOperation::EstablishBlocking { .. }
             | NetworkPolicyOperation::ApplyRoutes { .. }
@@ -1300,6 +1376,13 @@ where
         let state = self.policy_projections.get(policy)?;
         let intended = self.guard.policy_projection()?;
         if intended != &state.intended || intended.policy() != policy || !intended.is_valid() {
+            return None;
+        }
+        if intended.route_inputs().is_some_and(|(_, tunnels)| {
+            tunnels.iter().any(|tunnel| {
+                self.resource_states.get(tunnel.tunnel()) != Some(&HelperResourceState::Owned)
+            })
+        }) {
             return None;
         }
 
@@ -2086,7 +2169,7 @@ mod tests {
         BootScope, ContainmentId, DnsTransactionId, FirewallTransactionId, LeaseId,
         ObservationState, OpenVpnAuthFactors, OpenVpnPlan, OpenVpnRemote, OpenVpnRemoteSelection,
         OpenVpnTransport, OperationDigest, PeerProcessIdentity, PhysicalDnsBackend,
-        PhysicalFirewallBackend, PrivilegedRequest, ProtocolEndpoint, RequestSequence,
+        PhysicalFirewallBackend, PrivilegedRequest, ProtocolEndpoint, RequestSequence, ScopedRoute,
         ServiceInstanceClaim, ServiceManager, WireGuardInterfaceOptions, WireGuardPeerPlan,
         WireGuardPlan,
     };
@@ -2138,6 +2221,7 @@ mod tests {
         policy_plans: Vec<PreparedNetworkPolicyExecutionPlan>,
         recovered_dns_validations: Vec<Vec<RecoveredDnsState>>,
         recovered_firewall_validations: Vec<Vec<RecoveredFirewallState>>,
+        recovered_route_validations: Vec<Vec<RecoveredRouteState>>,
         recovered_policy_enabled: Vec<bool>,
         cleanups: usize,
         cleanup_children: usize,
@@ -2269,6 +2353,15 @@ mod tests {
             _policy_enabled: bool,
         ) -> Result<(), PrivilegedExecutionError> {
             self.recovered_dns_validations.push(states.to_vec());
+            Ok(())
+        }
+
+        fn validate_recovered_routes(
+            &mut self,
+            states: &[RecoveredRouteState],
+            _policy_enabled: bool,
+        ) -> Result<(), PrivilegedExecutionError> {
+            self.recovered_route_validations.push(states.to_vec());
             Ok(())
         }
 
@@ -3746,6 +3839,66 @@ mod tests {
     }
 
     #[test]
+    fn route_policy_requires_exact_helper_owned_tunnel_subjects() {
+        fn establish(harness: &mut LifecycleHarness) -> (ResourceTag, Cidr) {
+            let tunnel = resource();
+            let destination: Cidr = "10.0.0.0/8".parse().unwrap();
+            let firewall =
+                ResourceTag::topology(AuthorityEpoch(3), 1, ResourceKind::Firewall).unwrap();
+            execute_policy_phase(
+                harness,
+                1,
+                NetworkPolicyOperation::EstablishBlocking {
+                    policy: firewall,
+                    tunnels: vec![
+                        crate::vortix_core::privileged::PrivilegedFirewallTunnel::new(
+                            tunnel.clone(),
+                            vec!["198.51.100.7".parse().unwrap()],
+                            vec![destination],
+                            crate::vortix_core::privileged::PrivilegedFirewallRole::Primary,
+                        )
+                        .unwrap(),
+                    ],
+                },
+            );
+            (tunnel, destination)
+        }
+
+        let mut rejected = LifecycleHarness::for_policy(FakeExecutor::default());
+        let (tunnel, destination) = establish(&mut rejected);
+        let request = rejected.request(
+            3,
+            PrivilegedOperation::NetworkPolicy(NetworkPolicyOperation::ApplyRoutes {
+                policy: ResourceTag::topology(AuthorityEpoch(3), 1, ResourceKind::Routes).unwrap(),
+                routes: vec![ScopedRoute::new(destination, tunnel).unwrap()],
+                predecessor: rejected.server.guard.policy_predecessor().unwrap(),
+            }),
+        );
+        let receipt = rejected.execute(4, &request);
+        assert!(receipt.is_rejected());
+        assert_eq!(rejected.server.executor.policy_calls, 2);
+        assert!(!rejected.server.poisoned);
+
+        let mut accepted = LifecycleHarness::for_policy(FakeExecutor::default());
+        let (tunnel, destination) = establish(&mut accepted);
+        accepted
+            .server
+            .resource_states
+            .insert(tunnel.clone(), HelperResourceState::Owned);
+        let predecessor = accepted.server.guard.policy_predecessor().unwrap();
+        execute_policy_phase(
+            &mut accepted,
+            3,
+            NetworkPolicyOperation::ApplyRoutes {
+                policy: ResourceTag::topology(AuthorityEpoch(3), 1, ResourceKind::Routes).unwrap(),
+                routes: vec![ScopedRoute::new(destination, tunnel).unwrap()],
+                predecessor,
+            },
+        );
+        assert_eq!(accepted.server.executor.policy_calls, 4);
+    }
+
+    #[test]
     fn failed_physical_firewall_persistence_prevents_the_first_effect() {
         for failed_write in [1, 2] {
             let mut harness = LifecycleHarness::for_policy(FakeExecutor::default());
@@ -3960,6 +4113,31 @@ mod tests {
         assert_eq!(
             states[0].physical().map(HelperLedgerDns::stage),
             Some(PhysicalDnsStage::ObservedAbsent)
+        );
+    }
+
+    #[test]
+    fn restart_passes_exact_owned_route_projection_to_platform_validation() {
+        let mut harness = LifecycleHarness::for_policy(FakeExecutor::default());
+        let (_, routes, _) =
+            install_policy_generation_with_mode(&mut harness, 1, 1, KillSwitchMode::Auto);
+        let ledger = harness.server.ledger_store.writes.last().unwrap().clone();
+        let root = harness.server.root.clone();
+
+        let (recovered, _, _) = recover_session(
+            root,
+            ledger,
+            FakeExecutor::default(),
+            HelperCapability::NetworkPolicy,
+        );
+
+        let states = &recovered.executor.recovered_route_validations[0];
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].state(), HelperResourceState::Owned);
+        assert_eq!(states[0].intended().policy(), &routes);
+        assert_eq!(
+            states[0].effective().map(PolicyProjection::policy),
+            Some(&routes)
         );
     }
 

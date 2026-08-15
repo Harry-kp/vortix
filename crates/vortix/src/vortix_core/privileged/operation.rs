@@ -772,8 +772,7 @@ impl PrivilegedFirewallTunnel {
                 .iter()
                 .enumerate()
                 .any(|(index, cidr)| declared_cidrs[..index].contains(cidr))
-            || (role == PrivilegedFirewallRole::PendingEndpoint
-                && (endpoint_ips.is_empty() || !declared_cidrs.is_empty()))
+            || (role == PrivilegedFirewallRole::PendingEndpoint && endpoint_ips.is_empty())
         {
             return Err(OperationError::ResourceScopeMismatch);
         }
@@ -1083,6 +1082,51 @@ fn validate_routes(routes: &[ScopedRoute]) -> Result<(), OperationError> {
     }
 }
 
+fn validate_route_projection(
+    routes: &[ScopedRoute],
+    tunnels: &[PrivilegedFirewallTunnel],
+) -> Result<(), OperationError> {
+    validate_routes(routes)?;
+    validate_firewall_tunnels(tunnels, true)?;
+    if routes.iter().any(|route| {
+        let Some(subject) = tunnels
+            .iter()
+            .find(|subject| subject.tunnel() == route.tunnel())
+        else {
+            return true;
+        };
+        !subject
+            .declared_cidrs()
+            .iter()
+            .any(|declared| canonical_cidr(*declared) == canonical_cidr(route.destination()))
+    }) {
+        Err(OperationError::ResourceScopeMismatch)
+    } else {
+        Ok(())
+    }
+}
+
+fn canonical_cidr(cidr: Cidr) -> Cidr {
+    let addr = match cidr.addr {
+        IpAddr::V4(address) => {
+            let mask = u32::MAX
+                .checked_shl(u32::from(32 - cidr.prefix_len))
+                .unwrap_or(0);
+            IpAddr::V4((u32::from(address) & mask).into())
+        }
+        IpAddr::V6(address) => {
+            let mask = u128::MAX
+                .checked_shl(u32::from(128 - cidr.prefix_len))
+                .unwrap_or(0);
+            IpAddr::V6((u128::from(address) & mask).into())
+        }
+    };
+    Cidr {
+        addr,
+        prefix_len: cidr.prefix_len,
+    }
+}
+
 fn validate_dns_assignments(assignments: &[PrivilegedDnsAssignment]) -> Result<(), OperationError> {
     bounded(assignments)?;
     if has_duplicates(assignments.iter().map(|assignment| &assignment.tunnel)) {
@@ -1100,11 +1144,28 @@ fn bounded<T>(values: &[T]) -> Result<(), OperationError> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScopedRoute {
     destination: Cidr,
     tunnel: ResourceTag,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScopedRouteWire {
+    destination: Cidr,
+    tunnel: ResourceTag,
+}
+
+impl<'de> Deserialize<'de> for ScopedRoute {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = ScopedRouteWire::deserialize(deserializer)?;
+        Self::new(wire.destination, wire.tunnel).map_err(serde::de::Error::custom)
+    }
 }
 
 /// Exact typed projection persisted with the replay cursor before a policy
@@ -1122,6 +1183,8 @@ pub(crate) enum PolicyProjection {
         policy: ResourceTag,
         #[serde(deserialize_with = "deserialize_route_vec")]
         routes: Vec<ScopedRoute>,
+        #[serde(deserialize_with = "deserialize_firewall_tunnel_vec")]
+        tunnels: Vec<PrivilegedFirewallTunnel>,
     },
     Dns {
         policy: ResourceTag,
@@ -1138,16 +1201,26 @@ pub(crate) enum PolicyProjection {
 }
 
 impl PolicyProjection {
-    fn from_mutation(operation: &NetworkPolicyOperation) -> Option<Self> {
-        match operation {
+    fn from_mutation(
+        operation: &NetworkPolicyOperation,
+        predecessor: Option<&Self>,
+    ) -> Result<Option<Self>, OperationError> {
+        Ok(match operation {
             NetworkPolicyOperation::EstablishBlocking { policy, tunnels } => Some(Self::Blocking {
                 policy: policy.clone(),
                 tunnels: tunnels.clone(),
             }),
-            NetworkPolicyOperation::ApplyRoutes { policy, routes, .. } => Some(Self::Routes {
-                policy: policy.clone(),
-                routes: routes.clone(),
-            }),
+            NetworkPolicyOperation::ApplyRoutes { policy, routes, .. } => {
+                let Some(Self::Blocking { tunnels, .. }) = predecessor else {
+                    return Err(OperationError::PolicyTransition);
+                };
+                validate_route_projection(routes, tunnels)?;
+                Some(Self::Routes {
+                    policy: policy.clone(),
+                    routes: routes.clone(),
+                    tunnels: tunnels.clone(),
+                })
+            }
             NetworkPolicyOperation::ApplyDns {
                 policy,
                 assignments,
@@ -1168,7 +1241,7 @@ impl PolicyProjection {
             }),
             NetworkPolicyOperation::ObserveBarrier { .. }
             | NetworkPolicyOperation::ReleaseObsolete { .. } => None,
-        }
+        })
     }
 
     pub(crate) const fn policy(&self) -> &ResourceTag {
@@ -1182,6 +1255,15 @@ impl PolicyProjection {
 
     pub(crate) fn digest(&self) -> PolicyDigest {
         PolicyDigest::of_projection(self)
+    }
+
+    pub(crate) fn route_inputs(&self) -> Option<(&[ScopedRoute], &[PrivilegedFirewallTunnel])> {
+        match self {
+            Self::Routes {
+                routes, tunnels, ..
+            } => Some((routes, tunnels)),
+            Self::Blocking { .. } | Self::Dns { .. } | Self::Firewall { .. } => None,
+        }
     }
 
     /// Whether this projection requires a live helper-owned firewall
@@ -1210,9 +1292,15 @@ impl PolicyProjection {
                 ResourceKind::Firewall,
                 validate_firewall_tunnels(tunnels, true),
             ),
-            Self::Routes { policy, routes } => {
-                (policy, ResourceKind::Routes, validate_routes(routes))
-            }
+            Self::Routes {
+                policy,
+                routes,
+                tunnels,
+            } => (
+                policy,
+                ResourceKind::Routes,
+                validate_route_projection(routes, tunnels),
+            ),
             Self::Dns {
                 policy,
                 assignments,
@@ -1243,7 +1331,7 @@ impl ScopedRoute {
             return Err(OperationError::ResourceScopeMismatch);
         }
         Ok(Self {
-            destination,
+            destination: canonical_cidr(destination),
             tunnel,
         })
     }
@@ -1893,7 +1981,10 @@ impl OperationGuard {
             let prior_policy = self.highest.as_ref().and_then(|state| state.policy.clone());
             let policy = match &request.operation {
                 PrivilegedOperation::NetworkPolicy(operation) => {
-                    let mutation_projection = PolicyProjection::from_mutation(operation);
+                    let mutation_projection = PolicyProjection::from_mutation(
+                        operation,
+                        prior_policy.as_ref().map(|prior| &prior.projection),
+                    )?;
                     let previous = if mutation_projection.is_some()
                         || matches!(operation, NetworkPolicyOperation::ReleaseObsolete { .. })
                     {
@@ -2755,5 +2846,71 @@ mod tests {
             WireGuardInterfaceOptions::default(),
         )
         .is_err());
+    }
+
+    #[test]
+    fn route_projection_persists_and_validates_blocking_subjects() {
+        let tunnel = ResourceTag::tunnel(profile('a'), 1).unwrap();
+        let declared: Cidr = "10.0.0.0/8".parse().unwrap();
+        let subjects = vec![PrivilegedFirewallTunnel::new(
+            tunnel.clone(),
+            vec!["198.51.100.7".parse().unwrap()],
+            vec![declared],
+            PrivilegedFirewallRole::PendingEndpoint,
+        )
+        .unwrap()];
+        let blocking = PolicyProjection::Blocking {
+            policy: ResourceTag::topology(AuthorityEpoch(7), 1, ResourceKind::Firewall).unwrap(),
+            tunnels: subjects.clone(),
+        };
+        let routes = ResourceTag::topology(AuthorityEpoch(7), 1, ResourceKind::Routes).unwrap();
+        let operation = NetworkPolicyOperation::ApplyRoutes {
+            policy: routes.clone(),
+            routes: vec![ScopedRoute::new(declared, tunnel.clone()).unwrap()],
+            predecessor: PolicyPredecessor {
+                digest: blocking.digest(),
+                phase: PolicyPhase::Blocking,
+                observed: true,
+            },
+        };
+
+        let projection = PolicyProjection::from_mutation(&operation, Some(&blocking))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            projection,
+            PolicyProjection::Routes {
+                policy: routes,
+                routes: vec![ScopedRoute::new(declared, tunnel).unwrap()],
+                tunnels: subjects,
+            }
+        );
+
+        let foreign = ResourceTag::tunnel(profile('b'), 1).unwrap();
+        let invalid = NetworkPolicyOperation::ApplyRoutes {
+            policy: ResourceTag::topology(AuthorityEpoch(7), 1, ResourceKind::Routes).unwrap(),
+            routes: vec![ScopedRoute::new(declared, foreign).unwrap()],
+            predecessor: PolicyPredecessor {
+                digest: blocking.digest(),
+                phase: PolicyPhase::Blocking,
+                observed: true,
+            },
+        };
+        assert!(PolicyProjection::from_mutation(&invalid, Some(&blocking)).is_err());
+    }
+
+    #[test]
+    fn scoped_route_canonicalizes_host_bits_at_construction_and_decode() {
+        let tunnel = ResourceTag::tunnel(profile('a'), 1).unwrap();
+        let noncanonical: Cidr = "10.2.3.4/8".parse().unwrap();
+        let route = ScopedRoute::new(noncanonical, tunnel.clone()).unwrap();
+        assert_eq!(route.destination(), "10.0.0.0/8".parse().unwrap());
+
+        let encoded = serde_json::json!({
+            "destination": { "addr": "10.2.3.4", "prefix_len": 8 },
+            "tunnel": tunnel,
+        });
+        let decoded: ScopedRoute = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.destination(), "10.0.0.0/8".parse().unwrap());
     }
 }
