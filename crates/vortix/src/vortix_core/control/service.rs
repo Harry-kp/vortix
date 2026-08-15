@@ -1954,6 +1954,7 @@ fn persisted_tombstones(
                 PersistedTombstone {
                     authority_epoch: tombstone.revision.authority_epoch,
                     generation: tombstone.revision.generation,
+                    resource_generation: Some(tombstone.resource_revision.generation),
                     policy_digest: policy_digest.clone(),
                     operation_id: tombstone.operation_id,
                     teardown_failed,
@@ -2694,6 +2695,7 @@ fn drive_supervision(
                 profile.clone(),
                 DisconnectTombstone {
                     revision: entry.revision,
+                    resource_revision: entry.resource_revision,
                     teardown_failed: matches!(
                         entry.truth,
                         SupervisedTruth::Degraded(_) | SupervisedTruth::OutcomeUnknown
@@ -2828,6 +2830,7 @@ fn drive_supervision(
             | ReconcileAction::Disconnect {
                 profile_id,
                 revision: action_revision,
+                ..
             }
             | ReconcileAction::CleanupStaleManaged {
                 profile_id,
@@ -2868,6 +2871,24 @@ fn drive_supervision(
                 } else {
                     TunnelMutation::Disconnect
                 };
+                let resource_revision = match action {
+                    ReconcileAction::Connect { revision, .. } => *revision,
+                    ReconcileAction::Disconnect {
+                        resource_revision, ..
+                    } => *resource_revision,
+                    ReconcileAction::CleanupStaleManaged {
+                        stale_revision: Some(stale_revision),
+                        ..
+                    } => *stale_revision,
+                    ReconcileAction::CleanupStaleManaged {
+                        stale_revision: None,
+                        ..
+                    } => {
+                        invalidate_all_gates(snapshot, now);
+                        continue;
+                    }
+                    _ => unreachable!("matched tunnel effect action"),
+                };
                 let Some(deadline) = Instant::now().checked_add(Duration::from_millis(remaining))
                 else {
                     invalidate_gates(
@@ -2887,6 +2908,7 @@ fn drive_supervision(
                     profile_id: profile_id.clone(),
                     operation_id: operation_id.clone(),
                     revision: *action_revision,
+                    resource_revision,
                     mutation,
                     protocol: config
                         .profile_topologies

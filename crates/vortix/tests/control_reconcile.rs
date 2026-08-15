@@ -53,6 +53,7 @@ fn work(
         profile_id,
         operation_id: operation(operation_value),
         revision: tunnel_revision(generation),
+        resource_revision: tunnel_revision(generation),
         mutation,
         protocol: TunnelKindTag::Mock,
         deadline: Instant::now() + Duration::from_secs(2),
@@ -90,6 +91,7 @@ fn restart_restores_only_disconnect_tombstone_fences() {
             PersistedTombstone {
                 authority_epoch: AuthorityEpoch(1),
                 generation: 4,
+                resource_generation: Some(3),
                 policy_digest: PolicyDigest("persisted-policy".into()),
                 operation_id: operation(9),
                 teardown_failed: true,
@@ -99,6 +101,7 @@ fn restart_restores_only_disconnect_tombstone_fences() {
 
     let restored = supervisor.tombstones().remove(&target).unwrap();
     assert_eq!(restored.revision.generation, 4);
+    assert_eq!(restored.resource_revision.generation, 3);
     assert!(restored.adoption.is_none());
     assert!(restored.handshake.is_none());
     assert!(restored.probe_receipts.is_empty());
@@ -374,6 +377,27 @@ fn cidr_overlap_is_normalized_and_active_lease_lives_until_disconnect() {
 }
 
 #[test]
+fn worker_rejects_resource_revision_drift_before_effect_dispatch() {
+    let pool = ProfileWorkerPool::new(Arc::new(OkExecutor), 1, 2);
+    let mut mismatched_connect = work(profile("connect-drift"), 2, 1, TunnelMutation::Connect);
+    mismatched_connect.resource_revision = tunnel_revision(1);
+    assert_eq!(
+        pool.dispatch(mismatched_connect, Vec::new()).unwrap_err(),
+        WorkFailure::EffectFailed
+    );
+
+    let mut foreign_disconnect = work(profile("foreign-drift"), 3, 2, TunnelMutation::Disconnect);
+    foreign_disconnect.resource_revision = TunnelRevision {
+        authority_epoch: AuthorityEpoch(2),
+        generation: 1,
+    };
+    assert_eq!(
+        pool.dispatch(foreign_disconnect, Vec::new()).unwrap_err(),
+        WorkFailure::Stale
+    );
+}
+
+#[test]
 fn cooperative_effect_is_cancelled_and_joined_without_abandoning_a_thread() {
     struct Cooperative;
     impl TunnelExecutor for Cooperative {
@@ -545,13 +569,18 @@ fn failed_teardown_retries_and_probe_failure_does_not_clear_tombstone() {
             id.clone(),
             DisconnectTombstone {
                 revision: tunnel_rev,
+                resource_revision: tunnel_revision(4),
                 teardown_failed: true,
             },
         )]),
     };
     assert!(matches!(
         plan_reconciliation(&input).actions.as_slice(),
-        [ReconcileAction::Disconnect { .. }]
+        [ReconcileAction::Disconnect {
+            revision,
+            resource_revision,
+            ..
+        }] if revision.generation == 5 && resource_revision.generation == 4
     ));
     let absent = ReconcileInput {
         observations: BTreeMap::from([(
@@ -978,7 +1007,11 @@ fn stale_inflight_tuple_plans_cleanup_not_convergence() {
     };
     assert!(matches!(
         plan_reconciliation(&input).actions.as_slice(),
-        [ReconcileAction::CleanupStaleManaged { .. }]
+        [ReconcileAction::CleanupStaleManaged {
+            stale_revision: Some(stale),
+            target_revision: target,
+            ..
+        }] if stale.generation == 1 && target.generation == 2
     ));
 }
 
@@ -1124,6 +1157,7 @@ struct PreBlockGate {
 #[derive(Default)]
 struct TopologyCapture {
     tunnel_calls: Mutex<Vec<(ProfileId, TunnelMutation, u64)>>,
+    resource_calls: Mutex<Vec<(ProfileId, TunnelMutation, u64)>>,
     policies: Mutex<Vec<TopologyPolicy>>,
     pre_block: (Mutex<PreBlockGate>, Condvar),
     failed_final: Mutex<BTreeSet<u64>>,
@@ -1173,6 +1207,11 @@ impl TunnelExecutor for TopologyCapture {
             work.profile_id.clone(),
             work.mutation,
             work.revision.generation,
+        ));
+        self.resource_calls.lock().unwrap().push((
+            work.profile_id.clone(),
+            work.mutation,
+            work.resource_revision.generation,
         ));
         Ok(execution_receipt(work))
     }
@@ -1585,6 +1624,16 @@ async fn disconnect_waits_for_exact_pre_block_and_keeps_transition_at_final_stag
         "prepare-disconnect",
     )
     .await;
+    let connected_generation = capture
+        .resource_calls
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find_map(|(profile_id, mutation, generation)| {
+            (profile_id == &target && *mutation == TunnelMutation::Connect).then_some(*generation)
+        })
+        .expect("connected resource generation recorded");
     set_killswitch_and_settle(
         &service,
         &capture,
@@ -1629,6 +1678,13 @@ async fn disconnect_waits_for_exact_pre_block_and_keeps_transition_at_final_stag
         "disconnect did not execute after the pre-block receipt",
     )
     .await;
+    assert!(capture.resource_calls.lock().unwrap().iter().any(
+        |(profile_id, mutation, resource_generation)| {
+            profile_id == &target
+                && *mutation == TunnelMutation::Disconnect
+                && *resource_generation == connected_generation
+        }
+    ));
     observe_disconnected(&service, &target).await;
     wait_for_condition(
         || {

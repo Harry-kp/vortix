@@ -29,6 +29,7 @@ pub enum SupervisedTruth {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProfileSupervision {
     pub revision: TunnelRevision,
+    pub resource_revision: TunnelRevision,
     pub operation_id: OperationId,
     pub mutation: TunnelMutation,
     pub adoption: Option<AdoptionEvidence>,
@@ -154,6 +155,7 @@ impl Supervisor {
         let profile_id = work.profile_id.clone();
         let entry = ProfileSupervision {
             revision: work.revision,
+            resource_revision: work.resource_revision,
             operation_id: work.operation_id.clone(),
             mutation: work.mutation,
             adoption: None,
@@ -233,6 +235,7 @@ impl Supervisor {
         let profile_id = work.profile_id.clone();
         let entry = ProfileSupervision {
             revision: work.revision,
+            resource_revision: work.resource_revision,
             operation_id: work.operation_id.clone(),
             mutation: work.mutation,
             adoption: None,
@@ -286,6 +289,7 @@ impl Supervisor {
             profile_id,
             ProfileSupervision {
                 revision,
+                resource_revision: revision,
                 operation_id,
                 mutation: TunnelMutation::Connect,
                 adoption: Some(evidence),
@@ -356,6 +360,7 @@ impl Supervisor {
             profile_id,
             ProfileSupervision {
                 revision,
+                resource_revision: revision,
                 operation_id,
                 mutation: TunnelMutation::Connect,
                 adoption: Some(evidence),
@@ -645,10 +650,10 @@ impl Supervisor {
         tombstones: &BTreeMap<ProfileId, PersistedTombstone>,
     ) -> Result<(), WorkFailure> {
         let mut state = self.state.lock().expect("supervisor mutex poisoned");
-        if tombstones
-            .values()
-            .any(|tombstone| tombstone.authority_epoch != state.authority_epoch)
-        {
+        if tombstones.values().any(|tombstone| {
+            tombstone.authority_epoch != state.authority_epoch
+                || tombstone.resource_generation == Some(0)
+        }) {
             return Err(WorkFailure::Stale);
         }
         state.tombstones = tombstones
@@ -660,6 +665,12 @@ impl Supervisor {
                         revision: TunnelRevision {
                             authority_epoch: tombstone.authority_epoch,
                             generation: tombstone.generation,
+                        },
+                        resource_revision: TunnelRevision {
+                            authority_epoch: tombstone.authority_epoch,
+                            generation: tombstone
+                                .resource_generation
+                                .unwrap_or(tombstone.generation),
                         },
                         operation_id: tombstone.operation_id.clone(),
                         mutation: TunnelMutation::Disconnect,
