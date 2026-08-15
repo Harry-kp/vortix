@@ -607,6 +607,12 @@ impl VerifiedReceipt {
             | ReceiptOutcome::Ambiguous(_) => None,
         }
     }
+
+    #[must_use]
+    pub fn owns(&self, resource: &ResourceTag) -> bool {
+        matches!(&self.outcome, ReceiptOutcome::Applied(resources) if resources
+            .iter().any(|ownership| ownership.resource() == resource))
+    }
 }
 
 fn validate_outcome(
