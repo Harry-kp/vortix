@@ -110,8 +110,8 @@ pub enum IpcOp {
 }
 
 impl IpcOp {
-    /// Capability that must have been declared and negotiated before this
-    /// operation may be dispatched.
+    /// Capability required before this operation may cross the daemon IPC
+    /// boundary.
     #[must_use]
     pub const fn required_capability(&self) -> IpcCapability {
         match self {
@@ -131,6 +131,24 @@ impl IpcOp {
             Self::DiagnosticsSubscribe => IpcCapability::DiagnosticsSubscribe,
             Self::Shutdown => IpcCapability::Shutdown,
         }
+    }
+
+    /// Whether this operation belongs on an enrolled canonical-control
+    /// connection. Legacy `Execute` still requires the mutation capability,
+    /// but it is intentionally excluded from the canonical session protocol.
+    #[must_use]
+    pub const fn is_canonical_control(&self) -> bool {
+        matches!(
+            self,
+            Self::ControlOpen
+                | Self::ControlSubmit { .. }
+                | Self::ControlSnapshot { .. }
+                | Self::ControlSubscribe { .. }
+                | Self::ControlRespondChallenge { .. }
+                | Self::ControlCancelChallenge { .. }
+                | Self::ControlStageProfileImport { .. }
+                | Self::ControlCancelProfileImport { .. }
+        )
     }
 }
 
@@ -244,6 +262,17 @@ pub struct ServerHello {
     /// a control-mutation handshake is invalid unless this binding is present.
     #[serde(default)]
     pub authority_binding: Option<AuthorityBinding>,
+}
+
+/// Live daemon-control startup truth. `Active` is represented by a successful
+/// control handshake carrying an exact authority binding; the remaining
+/// variants explain why a present daemon still refuses mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlAvailability {
+    Starting,
+    Degraded,
+    RecoveryRequired,
 }
 
 /// Opaque daemon-issued session identity. It names one canonical
@@ -456,6 +485,8 @@ pub enum IpcError {
     Incompatible { reason: String },
     #[error("daemon capability is unavailable: {capability:?}")]
     CapabilityUnavailable { capability: IpcCapability },
+    #[error("canonical control is unavailable while the daemon is {state:?}")]
+    ControlUnavailable { state: ControlAvailability },
     #[error("request id was reused with different content")]
     DuplicateRequestId,
     #[error("daemon connection capacity is saturated")]
@@ -492,6 +523,11 @@ pub const PASSIVE_CAPABILITIES: [IpcCapability; 6] = [
     IpcCapability::Shutdown,
 ];
 
+/// A control connection receives only the canonical mutation capability.
+/// Passive projections and diagnostics negotiate on separate connections so
+/// neither can be mistaken for authority truth.
+pub const CONTROL_CAPABILITIES: [IpcCapability; 1] = [IpcCapability::ControlMutation];
+
 const PASSIVE_CAPABILITIES_V1: [IpcCapability; 4] = [
     IpcCapability::LegacySnapshot,
     IpcCapability::PassiveSnapshot,
@@ -511,8 +547,7 @@ pub const fn capabilities_for_schema(schema: u16) -> &'static [IpcCapability] {
     }
 }
 
-/// Negotiate one client hello against this passive daemon build.
-pub fn negotiate_passive(hello: &ClientHello) -> Result<ServerHello, IpcError> {
+fn negotiate_versions(hello: &ClientHello, minimum_schema: u16) -> Result<(u16, u16), IpcError> {
     if hello.product != "vortix" {
         return Err(IpcError::Incompatible {
             reason: "product identity does not match vortix".into(),
@@ -538,15 +573,21 @@ pub fn negotiate_passive(hello: &ClientHello) -> Result<ServerHello, IpcError> {
     let schema = hello
         .schema
         .highest_common(CompatibilityRange {
-            min: IPC_SCHEMA_MIN,
+            min: minimum_schema,
             max: IPC_SCHEMA_MAX,
         })
         .ok_or_else(|| IpcError::Incompatible {
             reason: format!(
                 "schema ranges do not overlap (client {}..={}, daemon {}..={})",
-                hello.schema.min, hello.schema.max, IPC_SCHEMA_MIN, IPC_SCHEMA_MAX
+                hello.schema.min, hello.schema.max, minimum_schema, IPC_SCHEMA_MAX
             ),
         })?;
+    Ok((protocol, schema))
+}
+
+/// Negotiate one client hello against this passive daemon build.
+pub fn negotiate_passive(hello: &ClientHello) -> Result<ServerHello, IpcError> {
+    let (protocol, schema) = negotiate_versions(hello, IPC_SCHEMA_MIN)?;
     let capabilities = capabilities_for_schema(schema);
     for capability in &hello.required_capabilities {
         if !capability.is_available_in_schema(schema) || !capabilities.contains(capability) {
@@ -563,6 +604,32 @@ pub fn negotiate_passive(hello: &ClientHello) -> Result<ServerHello, IpcError> {
         capabilities: capabilities.to_vec(),
         passive: true,
         authority_binding: None,
+    })
+}
+
+/// Negotiate an enrolled canonical-control connection. Schema three is the
+/// floor containing the complete control vocabulary, and the exact live
+/// authority binding is authenticated independently on every connection.
+pub fn negotiate_control(
+    hello: &ClientHello,
+    authority_binding: AuthorityBinding,
+) -> Result<ServerHello, IpcError> {
+    let (protocol, schema) = negotiate_versions(hello, 3)?;
+    for capability in &hello.required_capabilities {
+        if !CONTROL_CAPABILITIES.contains(capability) {
+            return Err(IpcError::CapabilityUnavailable {
+                capability: *capability,
+            });
+        }
+    }
+    Ok(ServerHello {
+        product: "vortix".into(),
+        product_version: env!("CARGO_PKG_VERSION").into(),
+        protocol,
+        schema,
+        capabilities: CONTROL_CAPABILITIES.to_vec(),
+        passive: false,
+        authority_binding: Some(authority_binding),
     })
 }
 
@@ -605,6 +672,62 @@ mod handshake_tests {
         let selected = negotiate_passive(&ClientHello::current(Vec::new())).unwrap();
         assert_eq!(selected.capabilities, PASSIVE_CAPABILITIES);
         assert!(selected.passive);
+    }
+
+    #[test]
+    fn enrolled_handshake_is_bound_to_exact_authority() {
+        let binding = AuthorityBinding::new(
+            crate::vortix_core::control::AuthorityEpoch(7),
+            crate::vortix_core::privileged::BootScope::new([1; 16]),
+            crate::vortix_core::privileged::LeaseId::new([2; 32]),
+            crate::vortix_core::privileged::OperationDigest::of_bytes(b"daemon"),
+        )
+        .unwrap();
+        let selected = negotiate_control(
+            &ClientHello::current(vec![IpcCapability::ControlMutation]),
+            binding,
+        )
+        .unwrap();
+        assert!(!selected.passive);
+        assert_eq!(selected.schema, 3);
+        assert_eq!(selected.capabilities, CONTROL_CAPABILITIES);
+        assert_eq!(selected.authority_binding, Some(binding));
+    }
+
+    #[test]
+    fn enrolled_handshake_rejects_old_schema_and_passive_capabilities() {
+        let binding = AuthorityBinding::new(
+            crate::vortix_core::control::AuthorityEpoch(7),
+            crate::vortix_core::privileged::BootScope::new([1; 16]),
+            crate::vortix_core::privileged::LeaseId::new([2; 32]),
+            crate::vortix_core::privileged::OperationDigest::of_bytes(b"daemon"),
+        )
+        .unwrap();
+        let mut old = ClientHello::current(vec![IpcCapability::ControlMutation]);
+        old.schema = CompatibilityRange { min: 1, max: 2 };
+        assert!(matches!(
+            negotiate_control(&old, binding),
+            Err(IpcError::Incompatible { .. })
+        ));
+
+        assert!(matches!(
+            negotiate_control(
+                &ClientHello::current(vec![IpcCapability::PassiveSnapshot]),
+                binding,
+            ),
+            Err(IpcError::CapabilityUnavailable {
+                capability: IpcCapability::PassiveSnapshot
+            })
+        ));
+    }
+
+    #[test]
+    fn operation_capability_keeps_legacy_execute_out_of_canonical_sessions() {
+        let legacy = IpcOp::Execute(UserCommand::Disconnect { profile_id: None });
+        assert_eq!(legacy.required_capability(), IpcCapability::ControlMutation);
+        assert!(!legacy.is_canonical_control());
+        assert!(IpcOp::ControlOpen.is_canonical_control());
+        assert!(!IpcOp::PassiveSnapshot.is_canonical_control());
     }
 
     #[test]
