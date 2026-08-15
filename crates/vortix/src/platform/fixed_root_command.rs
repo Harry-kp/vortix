@@ -40,11 +40,30 @@ pub(crate) fn run(
     stdin: Option<&[u8]>,
     max_input_bytes: usize,
 ) -> Result<FixedCommandOutput, FixedCommandError> {
+    run_with_timeout(
+        candidates,
+        arguments,
+        stdin,
+        max_input_bytes,
+        COMMAND_TIMEOUT,
+    )
+}
+
+pub(crate) fn run_with_timeout(
+    candidates: &[&str],
+    arguments: &[&str],
+    stdin: Option<&[u8]>,
+    max_input_bytes: usize,
+    timeout: Duration,
+) -> Result<FixedCommandOutput, FixedCommandError> {
+    if timeout.is_zero() || timeout > COMMAND_TIMEOUT {
+        return Err(FixedCommandError::FailedBeforeSpawn);
+    }
     if stdin.is_some_and(|body| body.len() > max_input_bytes) {
         return Err(FixedCommandError::FailedBeforeSpawn);
     }
     let binary = verified_fixed_binary(candidates)?;
-    run_bounded(&binary, arguments, stdin)
+    run_bounded(&binary, arguments, stdin, timeout)
 }
 
 fn verified_fixed_binary(candidates: &[&str]) -> Result<PathBuf, FixedCommandError> {
@@ -82,6 +101,7 @@ fn run_bounded(
     binary: &Path,
     arguments: &[&str],
     stdin: Option<&[u8]>,
+    timeout: Duration,
 ) -> Result<FixedCommandOutput, FixedCommandError> {
     let mut command = Command::new(binary);
     command
@@ -111,7 +131,7 @@ fn run_bounded(
             .stderr
             .take()
             .map(|pipe| scope.spawn(move || read_bounded(pipe)));
-        let deadline = Instant::now() + COMMAND_TIMEOUT;
+        let deadline = Instant::now() + timeout;
         let mut wait_interval = INITIAL_WAIT_INTERVAL;
         let status = loop {
             match child.try_wait() {
@@ -204,5 +224,15 @@ mod tests {
             read_bounded(Cursor::new(bytes)).unwrap_err().kind(),
             std::io::ErrorKind::InvalidData
         );
+    }
+
+    #[test]
+    fn caller_timeout_must_stay_within_the_fixed_command_ceiling() {
+        for timeout in [Duration::ZERO, COMMAND_TIMEOUT + Duration::from_millis(1)] {
+            assert!(matches!(
+                run_with_timeout(&[], &[], None, 0, timeout),
+                Err(FixedCommandError::FailedBeforeSpawn)
+            ));
+        }
     }
 }

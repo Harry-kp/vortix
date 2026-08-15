@@ -133,5 +133,6 @@ pub(crate) use receipt::AuthenticatedReceiptVerifier;
 pub use receipt::{
     AmbiguousPhase, ObservationState, ReceiptError, ReceiptLedger, ReceiptOutcome, RejectionCode,
     ResourceObservation, ResourceOwnership, UntrustedReceipt, VerifiedReceipt,
+    WireGuardPeerObservation,
 };
 pub use resource::{ResourceError, ResourceKind, ResourceObservationTarget, ResourceTag};
