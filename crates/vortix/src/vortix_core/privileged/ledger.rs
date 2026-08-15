@@ -38,7 +38,6 @@ pub(crate) enum PhysicalFirewallBackend {
 pub(crate) struct FirewallTransactionId([u8; 32]);
 
 impl FirewallTransactionId {
-    #[cfg(test)]
     pub(crate) fn new(bytes: [u8; 32]) -> Result<Self, &'static str> {
         if bytes == [0; 32] {
             Err("firewall transaction identity must be non-zero")
@@ -79,7 +78,6 @@ pub(crate) struct HelperLedgerFirewall {
 }
 
 impl HelperLedgerFirewall {
-    #[cfg(test)]
     pub(crate) const fn prepared(
         resource: ResourceTag,
         backend: PhysicalFirewallBackend,
@@ -119,7 +117,6 @@ impl HelperLedgerFirewall {
         self.stage
     }
 
-    #[cfg(test)]
     pub(crate) fn prepare_for(&self, projection: &PolicyProjection) -> Result<Self, &'static str> {
         if !matches!(
             self.stage,

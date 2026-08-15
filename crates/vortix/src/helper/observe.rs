@@ -259,6 +259,35 @@ fn read_interface_name_evidence(path: &Path) -> InterfaceNameEvidence {
     InterfaceNameEvidence::Name(name.to_owned())
 }
 
+/// Resolve the interface name only from helper-derived identity and
+/// root-owned evidence. Linux uses the deterministic kernel alias; macOS
+/// accepts exactly one protocol-owned evidence file and rejects ambiguity.
+pub(crate) fn authority_interface_name(
+    layout: PlatformLayout,
+    lease_id: LeaseId,
+    tunnel: &ResourceTag,
+) -> Result<String, ()> {
+    let identity = HelperRuntimeIdentity::derive(layout, lease_id, tunnel).map_err(|_| ())?;
+    if layout == PlatformLayout::Linux {
+        return Ok(identity.kernel_alias().to_owned());
+    }
+
+    let mut name = None;
+    for path in [
+        identity.wireguard_name_evidence(),
+        identity.interface_evidence(),
+    ] {
+        match read_interface_name_evidence(&path) {
+            InterfaceNameEvidence::Name(candidate) if name.is_none() => name = Some(candidate),
+            InterfaceNameEvidence::Missing => {}
+            InterfaceNameEvidence::Name(_)
+            | InterfaceNameEvidence::Unavailable
+            | InterfaceNameEvidence::Invalid => return Err(()),
+        }
+    }
+    name.ok_or(())
+}
+
 fn read_child_identity_evidence(path: &Path) -> ChildIdentityEvidence {
     match read_fixed_evidence(path, MAX_CHILD_EVIDENCE_BYTES) {
         FixedEvidence::Bytes(bytes) => serde_json::from_slice(&bytes).map_or(

@@ -178,6 +178,30 @@ impl NetworkPolicyExecutionPlan {
     }
 }
 
+/// Exact logical context for one physical firewall record recovered from the
+/// authenticated root ledger. Restart validation needs the payload—not only
+/// its digest—to prove the recorded backend matches kernel state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecoveredFirewallState {
+    physical: HelperLedgerFirewall,
+    intended: PolicyProjection,
+    effective: Option<PolicyProjection>,
+}
+
+impl RecoveredFirewallState {
+    pub(crate) const fn physical(&self) -> &HelperLedgerFirewall {
+        &self.physical
+    }
+
+    pub(crate) const fn intended(&self) -> &PolicyProjection {
+        &self.intended
+    }
+
+    pub(crate) const fn effective(&self) -> Option<&PolicyProjection> {
+        self.effective.as_ref()
+    }
+}
+
 /// Side-effect-free executor preparation result. The server validates this
 /// against its closed logical plan, durably records physical ownership, then
 /// alone permits the corresponding effect method to run.
@@ -218,8 +242,9 @@ pub(crate) trait NetworkPolicyExecutor {
     /// Validate recovered backend ownership against the current platform. No
     /// effects or backend selection may occur here.
     fn validate_recovered_firewalls(
-        &self,
-        firewalls: &[HelperLedgerFirewall],
+        &mut self,
+        firewalls: &[RecoveredFirewallState],
+        policy_enabled: bool,
     ) -> Result<(), PrivilegedExecutionError>;
 
     /// Select or validate physical ownership without invoking an OS effect.
@@ -374,7 +399,7 @@ where
         root: RootAuthorityLedger,
         helper_epoch: HelperEpoch,
         ledger: HelperLedgerRecord,
-        executor: E,
+        mut executor: E,
         ledger_store: S,
         enabled_capabilities: Vec<HelperCapability>,
     ) -> Result<Self, OperationError> {
@@ -382,8 +407,23 @@ where
         let (replay, resources, policy_projections, physical_firewalls, child_observations) =
             ledger.into_parts();
         let baseline = root.loaded_replay_baseline(&principal, replay)?;
+        let recovered_firewall_states = physical_firewalls
+            .iter()
+            .map(|physical| {
+                let policy = policy_projections
+                    .iter()
+                    .find(|policy| policy.resource() == physical.resource())
+                    .ok_or(OperationError::InvalidReplayState)?;
+                Ok(RecoveredFirewallState {
+                    physical: physical.clone(),
+                    intended: policy.intended().clone(),
+                    effective: policy.effective().cloned(),
+                })
+            })
+            .collect::<Result<Vec<_>, OperationError>>()?;
+        let policy_enabled = enabled_capabilities.contains(&HelperCapability::NetworkPolicy);
         executor
-            .validate_recovered_firewalls(&physical_firewalls)
+            .validate_recovered_firewalls(&recovered_firewall_states, policy_enabled)
             .map_err(|_| OperationError::InvalidReplayState)?;
         let mut session = Self::resume_restricted(
             root,
@@ -1723,6 +1763,8 @@ mod tests {
         policy_prepares: usize,
         policy_prepare_error: Option<NetworkPolicyPreparationError>,
         policy_plans: Vec<PreparedNetworkPolicyExecutionPlan>,
+        recovered_firewall_validations: Vec<Vec<RecoveredFirewallState>>,
+        recovered_policy_enabled: Vec<bool>,
         cleanups: usize,
         cleanup_children: usize,
         containments: usize,
@@ -1831,12 +1873,15 @@ mod tests {
 
     impl NetworkPolicyExecutor for FakeExecutor {
         fn validate_recovered_firewalls(
-            &self,
-            firewalls: &[HelperLedgerFirewall],
+            &mut self,
+            firewalls: &[RecoveredFirewallState],
+            policy_enabled: bool,
         ) -> Result<(), PrivilegedExecutionError> {
+            self.recovered_firewall_validations.push(firewalls.to_vec());
+            self.recovered_policy_enabled.push(policy_enabled);
             if firewalls
                 .iter()
-                .all(|firewall| firewall.backend() != PhysicalFirewallBackend::MacOsPf)
+                .all(|firewall| firewall.physical().backend() != PhysicalFirewallBackend::MacOsPf)
             {
                 Ok(())
             } else {
@@ -3402,6 +3447,14 @@ mod tests {
         let physical = recovered.physical_firewalls.get(&firewall).unwrap();
         assert_eq!(physical.backend(), PhysicalFirewallBackend::LinuxNft);
         assert_eq!(physical.stage(), PhysicalFirewallStage::ObservedOwned);
+        let recovered_state = &recovered.executor.recovered_firewall_validations[0][0];
+        assert_eq!(recovered.executor.recovered_policy_enabled, vec![true]);
+        assert_eq!(recovered_state.physical().resource(), &firewall);
+        assert_eq!(recovered_state.intended().policy(), &firewall);
+        assert_eq!(
+            recovered_state.effective().map(PolicyProjection::policy),
+            None
+        );
     }
 
     #[test]

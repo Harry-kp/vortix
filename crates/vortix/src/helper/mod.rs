@@ -10,6 +10,7 @@ mod child_evidence;
 mod descriptor_transport;
 mod enrollment_store;
 mod executor;
+mod firewall;
 mod material;
 mod observe;
 mod platform_identity;

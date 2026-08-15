@@ -16,6 +16,7 @@ pub mod interface;
 pub mod interface_list;
 mod libproc_ffi;
 pub mod network_stats;
+pub(crate) mod owned_firewall;
 pub mod process_identity;
 pub mod route_table;
 pub mod socket_audit;
