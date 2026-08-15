@@ -17,6 +17,7 @@
 use std::io::Read as _;
 use std::os::fd::{AsRawFd as _, RawFd};
 use std::os::unix::net::UnixStream;
+use std::sync::Mutex;
 use std::time::Instant;
 
 use thiserror::Error;
@@ -148,6 +149,7 @@ impl AuthenticatedHelperSession {
 pub(crate) struct AuthenticatedHelperTransport {
     stream: UnixStream,
     session: AuthenticatedHelperSession,
+    authority_binding: AuthorityBinding,
     next_id: u64,
     next_sequence: RequestSequence,
     poisoned: bool,
@@ -246,6 +248,7 @@ impl AuthenticatedHelperTransport {
         Ok(Self {
             stream,
             session,
+            authority_binding: expected_authority,
             next_id: 2,
             next_sequence,
             poisoned: false,
@@ -355,6 +358,14 @@ impl AuthenticatedHelperTransport {
         self.next_sequence
     }
 
+    pub(crate) const fn authority_binding(&self) -> AuthorityBinding {
+        self.authority_binding
+    }
+
+    pub(crate) fn enabled_capabilities(&self) -> &[HelperCapability] {
+        &self.session.enabled_capabilities
+    }
+
     fn definitive_pre_admission_failure(
         &mut self,
         expected_id: u64,
@@ -384,6 +395,51 @@ impl AuthenticatedHelperTransport {
     ) -> HelperExecutionFailure {
         self.poisoned = true;
         HelperExecutionFailure::new(delivery.transport_lost(), source)
+    }
+}
+
+/// One exact authenticated helper session shared by canonical effect workers.
+///
+/// The helper wire owns a single request sequence, so tunnel and policy
+/// workers must serialize through this capability rather than cloning or
+/// independently reconstructing authority. Mutex poisoning is classified as
+/// outcome-unknown because a panic may have interrupted an in-flight request.
+pub(crate) struct SharedAuthenticatedHelper {
+    authority_binding: AuthorityBinding,
+    enabled_capabilities: Vec<HelperCapability>,
+    transport: Mutex<AuthenticatedHelperTransport>,
+}
+
+impl SharedAuthenticatedHelper {
+    pub(crate) fn new(transport: AuthenticatedHelperTransport) -> Self {
+        Self {
+            authority_binding: transport.authority_binding(),
+            enabled_capabilities: transport.enabled_capabilities().to_vec(),
+            transport: Mutex::new(transport),
+        }
+    }
+
+    pub(crate) const fn authority_binding(&self) -> AuthorityBinding {
+        self.authority_binding
+    }
+
+    pub(crate) fn enables(&self, capability: HelperCapability) -> bool {
+        self.enabled_capabilities.contains(&capability)
+    }
+
+    pub(crate) fn execute(
+        &self,
+        operation: PrivilegedOperation,
+        descriptors: &[RawFd],
+        deadline: Instant,
+    ) -> Result<VerifiedReceipt, HelperExecutionFailure> {
+        let mut transport = self.transport.lock().map_err(|_| {
+            HelperExecutionFailure::new(
+                RecoveryAction::ReconcileRequired,
+                HelperClientError::SessionPoisoned,
+            )
+        })?;
+        transport.execute(operation, descriptors, deadline)
     }
 }
 
