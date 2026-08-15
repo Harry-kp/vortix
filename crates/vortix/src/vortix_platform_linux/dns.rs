@@ -59,10 +59,10 @@ impl DnsCommandRunner for RealDnsCommandRunner {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct ResolvedLinkState {
-    servers: Vec<String>,
-    domains: Vec<String>,
-    default_route: Option<bool>,
+pub(crate) struct ResolvedLinkState {
+    pub(crate) servers: Vec<String>,
+    pub(crate) domains: Vec<String>,
+    pub(crate) default_route: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -720,7 +720,7 @@ fn run_spec<R: DnsCommandRunner>(runner: &mut R, spec: CommandSpec) -> Result<()
     }
 }
 
-fn resolved_state_for(assignment: &DnsAssignment) -> ResolvedLinkState {
+pub(crate) fn resolved_state_for(assignment: &DnsAssignment) -> ResolvedLinkState {
     let mut servers = assignment
         .servers
         .iter()
@@ -791,6 +791,10 @@ fn read_resolvectl_values<R: DnsCommandRunner>(
         return Err(String::from_utf8_lossy(&output.stderr).into_owned());
     }
     let text = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_resolvectl_values(&text))
+}
+
+pub(crate) fn parse_resolvectl_values(text: &str) -> Vec<String> {
     let mut values = Vec::new();
     for (index, line) in text.lines().enumerate() {
         let value_text = if index == 0 {
@@ -800,7 +804,7 @@ fn read_resolvectl_values<R: DnsCommandRunner>(
         };
         values.extend(value_text.split_whitespace().map(ToOwned::to_owned));
     }
-    Ok(values)
+    values
 }
 
 fn write_resolved_state<R: DnsCommandRunner>(
@@ -857,7 +861,7 @@ fn verify_resolved_state<R: DnsCommandRunner>(
     }
 }
 
-fn resolvconf_body(generation: u64, assignment: &DnsAssignment) -> Vec<u8> {
+pub(crate) fn resolvconf_body(generation: u64, assignment: &DnsAssignment) -> Vec<u8> {
     let mut body = format!("# managed-by: vortix dns generation {generation}\n").into_bytes();
     for server in &assignment.servers {
         body.extend(format!("nameserver {server}\n").into_bytes());
@@ -938,7 +942,7 @@ fn verify_resolvconf_record<R: DnsCommandRunner>(
     }
 }
 
-fn normalized_record(record: &[u8]) -> String {
+pub(crate) fn normalized_record(record: &[u8]) -> String {
     String::from_utf8_lossy(record)
         .lines()
         .map(str::trim)

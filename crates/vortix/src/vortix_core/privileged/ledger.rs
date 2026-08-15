@@ -319,7 +319,7 @@ impl<'de> Deserialize<'de> for PhysicalDnsPrior {
     where
         D: Deserializer<'de>,
     {
-        Ok(match PhysicalDnsPriorWire::deserialize(deserializer)? {
+        let prior = match PhysicalDnsPriorWire::deserialize(deserializer)? {
             PhysicalDnsPriorWire::Resolved {
                 servers,
                 domains,
@@ -333,7 +333,11 @@ impl<'de> Deserialize<'de> for PhysicalDnsPrior {
                 record: record.map(BoundedVec::into_vec),
             },
             PhysicalDnsPriorWire::MacOsResolverFiles => Self::MacOsResolverFiles,
-        })
+        };
+        if !prior.is_valid() {
+            return Err(serde::de::Error::custom("physical DNS prior is invalid"));
+        }
+        Ok(prior)
     }
 }
 
@@ -348,9 +352,9 @@ impl PhysicalDnsPrior {
                     && servers.len() <= MAX_RESOURCE_ITEMS
                     && domains.len() <= MAX_RESOURCE_ITEMS
             }
-            Self::Resolvconf { record } => record
-                .as_ref()
-                .is_none_or(|record| record.len() <= MAX_PHYSICAL_DNS_RECORD_BYTES),
+            Self::Resolvconf { record } => record.as_ref().is_none_or(|record| {
+                record.len() <= MAX_PHYSICAL_DNS_RECORD_BYTES && std::str::from_utf8(record).is_ok()
+            }),
             Self::MacOsResolverFiles => true,
         }
     }
@@ -942,7 +946,6 @@ impl HelperLedgerRecord {
                     || !physical_dns_matches_logical(physical, &resources, &policy_projections)
             })
             || physical_dns_inventory_is_ambiguous(&physical_dns)
-            || !physical_dns_priors_are_consistent(&physical_dns)
             || has_duplicates(
                 child_observations
                     .iter()
@@ -1117,22 +1120,6 @@ fn physical_dns_inventory_is_ambiguous(records: &[HelperLedgerDns]) -> bool {
         || records
             .iter()
             .any(|physical| Some(physical.backend()) != backend)
-}
-
-fn physical_dns_priors_are_consistent(records: &[HelperLedgerDns]) -> bool {
-    records.iter().enumerate().all(|(record_index, record)| {
-        record.links().iter().all(|link| {
-            let Some(profile) = link.tunnel().profile_id() else {
-                return false;
-            };
-            records[..record_index].iter().all(|prior_record| {
-                prior_record.links().iter().all(|prior_link| {
-                    prior_link.tunnel().profile_id() != Some(profile)
-                        || prior_link.prior() == link.prior()
-                })
-            })
-        })
-    })
 }
 
 fn physical_inventory_is_ambiguous(firewalls: &[HelperLedgerFirewall]) -> bool {
@@ -1539,6 +1526,12 @@ mod tests {
             }
         );
 
+        let non_utf8_resolvconf = serde_json::json!({
+            "backend": "resolvconf",
+            "record": [255]
+        });
+        assert!(serde_json::from_value::<PhysicalDnsPrior>(non_utf8_resolvconf).is_err());
+
         let mut missing_link = encoded;
         missing_link["physical_dns"][0]["links"] = serde_json::json!([]);
         assert!(serde_json::from_value::<HelperLedgerRecord>(missing_link).is_err());
@@ -1547,9 +1540,9 @@ mod tests {
     #[test]
     #[allow(
         clippy::too_many_lines,
-        reason = "one fixture proves replacement, inherited rollback, and owner cardinality together"
+        reason = "one fixture proves generation-bound rollback and owner cardinality together"
     )]
-    fn physical_dns_replacement_inherits_the_original_prior_and_has_one_owner() {
+    fn physical_dns_replacement_binds_each_generation_prior_and_has_one_owner() {
         let replay: ReplayRecord = serde_json::from_value(serde_json::json!({
             "state": "unused",
             "record": {
@@ -1670,10 +1663,10 @@ mod tests {
         )
         .unwrap();
 
-        let mut stale_prior = serde_json::to_value(&record).unwrap();
-        stale_prior["physical_dns"][1]["links"][0]["prior"]["servers"] =
+        let mut independent_prior = serde_json::to_value(&record).unwrap();
+        independent_prior["physical_dns"][1]["links"][0]["prior"]["servers"] =
             serde_json::json!(["8.8.8.8"]);
-        assert!(serde_json::from_value::<HelperLedgerRecord>(stale_prior).is_err());
+        assert!(serde_json::from_value::<HelperLedgerRecord>(independent_prior).is_ok());
 
         let mut false_absence = serde_json::to_value(&record).unwrap();
         false_absence["physical_dns"][0]["stage"] = serde_json::json!("observed_absent");
