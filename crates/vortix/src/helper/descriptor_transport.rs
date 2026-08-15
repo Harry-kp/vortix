@@ -123,9 +123,15 @@ fn receive_chunk(
         (*pointer).msg_iov = &raw mut iovec;
         (*pointer).msg_iovlen = 1;
         (*pointer).msg_control = control.as_mut_ptr().cast();
-        (*pointer).msg_controllen = std::mem::size_of_val(&control)
-            .try_into()
-            .map_err(|_| DescriptorTransportError::TruncatedControl)?;
+        #[allow(
+            clippy::useless_conversion,
+            reason = "msghdr.msg_controllen is usize on Linux and socklen_t on macOS"
+        )]
+        {
+            (*pointer).msg_controllen = std::mem::size_of_val(&control)
+                .try_into()
+                .map_err(|_| DescriptorTransportError::TruncatedControl)?;
+        }
         &mut *pointer
     };
     let received = unsafe { libc::recvmsg(stream.as_raw_fd(), message, 0) };

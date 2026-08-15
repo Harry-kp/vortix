@@ -401,7 +401,8 @@ fn peer_credentials(stream: &UnixStream) -> Result<PeerCredentials, HelperTransp
     use std::os::fd::AsRawFd as _;
 
     let mut credentials = MaybeUninit::<libc::ucred>::uninit();
-    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let mut length = libc::socklen_t::try_from(std::mem::size_of::<libc::ucred>())
+        .map_err(|_| HelperTransportError::PeerCredentials)?;
     let result = unsafe {
         libc::getsockopt(
             stream.as_raw_fd(),
