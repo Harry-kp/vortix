@@ -1,6 +1,10 @@
 //! OS-owned daemon service identity verification for helper enrollment.
 
 #![allow(
+    unsafe_code,
+    reason = "Linux helper peer authentication requires SO_PEERCRED"
+)]
+#![allow(
     dead_code,
     reason = "the verifier is consumed by enrolled helper transport after activation"
 )]
@@ -9,6 +13,7 @@ use std::fs::File;
 use std::io::Read as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
+use std::time::Instant;
 
 use thiserror::Error;
 
@@ -19,12 +24,23 @@ use super::enrollment_store::AuthorityReservation;
 #[cfg(target_os = "linux")]
 // xtask:allow-platform-cfg: import supports the Linux procfs verifier
 use super::validate::{
-    verify_service_instance, ArtifactKind, PlatformLayout, VerifiedServiceFacts,
+    verify_helper_peer, verify_service_instance, ArtifactFact, ArtifactKind, HelperPeerFacts,
+    VerifiedServiceFacts, HELPER_SOCKET_MODE,
 };
+use super::validate::{PlatformLayout, VerifiedHelperPeer};
 #[cfg(target_os = "linux")]
 // xtask:allow-platform-cfg: import supports the Linux procfs verifier
 use crate::vortix_core::privileged::ServiceManager;
 use crate::vortix_core::privileged::{PlatformVerifiedAuthority, ServiceInstanceClaim};
+
+#[cfg(target_os = "linux")] // xtask:allow-platform-cfg: import supports Linux SO_PEERCRED
+use std::os::fd::AsRawFd as _;
+#[cfg(target_os = "linux")]
+// xtask:allow-platform-cfg: import supports Linux socket fact checks
+use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
+#[cfg(target_os = "linux")]
+// xtask:allow-platform-cfg: import supports Linux helper verification
+use std::os::unix::net::UnixStream;
 
 const MAX_PROC_FACT_BYTES: u64 = 1024 * 1024;
 
@@ -87,6 +103,104 @@ pub(super) fn verify_daemon_service(
     );
     verify_service_instance(enrolled_owner, claim, &facts)
         .map_err(|_| PlatformIdentityError::Mismatch)
+}
+
+#[cfg(target_os = "linux")] // xtask:allow-platform-cfg: SO_PEERCRED and procfs prove the connected root helper process
+pub(super) fn verify_helper_service(
+    stream: &UnixStream,
+    owner_uid: u32,
+    layout: PlatformLayout,
+    deadline: Instant,
+) -> Result<VerifiedHelperPeer, PlatformIdentityError> {
+    ensure_before(deadline)?;
+    if layout != PlatformLayout::Linux || owner_uid == 0 {
+        return Err(PlatformIdentityError::HelperMismatch);
+    }
+    let mut credentials = std::mem::MaybeUninit::<libc::ucred>::uninit();
+    let mut length = libc::socklen_t::try_from(std::mem::size_of::<libc::ucred>())
+        .map_err(|_| PlatformIdentityError::HelperMismatch)?;
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            credentials.as_mut_ptr().cast(),
+            &raw mut length,
+        )
+    };
+    if result != 0 || usize::try_from(length).ok() != Some(std::mem::size_of::<libc::ucred>()) {
+        return Err(PlatformIdentityError::HelperMismatch);
+    }
+    let credentials = unsafe { credentials.assume_init() };
+    let peer_pid = u32::try_from(credentials.pid)
+        .ok()
+        .filter(|pid| *pid != 0)
+        .ok_or(PlatformIdentityError::HelperMismatch)?;
+
+    ensure_before(deadline)?;
+    let manifest = load_verified_manifest(layout).map_err(|_| PlatformIdentityError::Artifact)?;
+    ensure_before(deadline)?;
+    let helper_digest = verify_installed_artifact(layout, ArtifactKind::Helper, &manifest)
+        .map_err(|_| PlatformIdentityError::Artifact)?;
+    ensure_before(deadline)?;
+    let installed = std::fs::metadata(layout.helper_path())?;
+    let running = std::fs::metadata(Path::new("/proc").join(peer_pid.to_string()).join("exe"))?;
+    if running.dev() != installed.dev() || running.ino() != installed.ino() {
+        return Err(PlatformIdentityError::HelperMismatch);
+    }
+    ensure_before(deadline)?;
+    let start_token = parse_proc_start_token(&read_bounded_file(
+        &Path::new("/proc").join(peer_pid.to_string()).join("stat"),
+        MAX_PROC_FACT_BYTES,
+    )?)?;
+    ensure_before(deadline)?;
+    let socket = std::fs::symlink_metadata(layout.helper_socket())?;
+    if !socket.file_type().is_socket()
+        || socket.uid() != owner_uid
+        || socket.permissions().mode() & 0o777 != HELPER_SOCKET_MODE
+    {
+        return Err(PlatformIdentityError::HelperMismatch);
+    }
+    ensure_before(deadline)?;
+    let artifact = ArtifactFact::from_os_verifier(
+        ArtifactKind::Helper,
+        Path::new(layout.helper_path()).to_owned(),
+        installed.uid(),
+        installed.permissions().mode() & 0o777,
+        helper_digest,
+        false,
+    );
+    let facts = HelperPeerFacts::from_os_verifier(
+        credentials.uid,
+        peer_pid,
+        start_token,
+        Path::new(layout.helper_socket()).to_owned(),
+        socket.uid(),
+        socket.permissions().mode() & 0o777,
+        artifact,
+    );
+    let verified = verify_helper_peer(owner_uid, layout, &manifest, &facts)
+        .map_err(|_| PlatformIdentityError::HelperMismatch)?;
+    ensure_before(deadline)?;
+    Ok(verified)
+}
+
+#[cfg(not(target_os = "linux"))] // xtask:allow-platform-cfg: macOS stays fail-closed until launchd process identity and signing proof ship
+pub(super) fn verify_helper_service(
+    _stream: &std::os::unix::net::UnixStream,
+    _owner_uid: u32,
+    _layout: PlatformLayout,
+    _deadline: Instant,
+) -> Result<VerifiedHelperPeer, PlatformIdentityError> {
+    Err(PlatformIdentityError::UnsupportedPlatform)
+}
+
+fn ensure_before(deadline: Instant) -> Result<(), PlatformIdentityError> {
+    if Instant::now() >= deadline {
+        Err(PlatformIdentityError::DeadlineExpired)
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(not(target_os = "linux"))] // xtask:allow-platform-cfg: macOS activation stays fail-closed until its signing+launchd verifier ships
@@ -186,6 +300,8 @@ fn verify_root_owned_service_definition(path: &Path) -> Result<(), PlatformIdent
 pub(super) enum PlatformIdentityError {
     #[error("daemon service identity does not match OS-owned facts")]
     Mismatch,
+    #[error("helper process, socket, or installed artifact does not match OS-owned facts")]
+    HelperMismatch,
     #[error("daemon service identity fact is malformed")]
     MalformedFact,
     #[error("daemon service identity fact exceeds its fixed size")]
@@ -196,6 +312,8 @@ pub(super) enum PlatformIdentityError {
     UnsafeServiceDefinition,
     #[error("this platform has no enrolled service verifier")]
     UnsupportedPlatform,
+    #[error("helper identity verification exceeded the caller's absolute deadline")]
+    DeadlineExpired,
     #[error("daemon service identity I/O failed: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -248,5 +366,20 @@ mod tests {
         )
         .is_none());
         assert!(manager_nonce_from_environment(b"VORTIX_MANAGER_NONCE_HEX=zz").is_none());
+    }
+
+    #[cfg(not(target_os = "linux"))] // xtask:allow-platform-cfg: unsupported service proof must remain fail-closed
+    #[test]
+    fn helper_service_identity_is_fail_closed_without_an_os_verifier() {
+        let (client, _server) = std::os::unix::net::UnixStream::pair().unwrap();
+        assert!(matches!(
+            verify_helper_service(
+                &client,
+                501,
+                PlatformLayout::MacOs,
+                Instant::now() + std::time::Duration::from_secs(1),
+            ),
+            Err(PlatformIdentityError::UnsupportedPlatform)
+        ));
     }
 }
