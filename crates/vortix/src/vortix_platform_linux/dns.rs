@@ -7,6 +7,9 @@ use crate::vortix_core::ports::dns::{
     DnsAssignment, DnsEffectiveState, DnsEffectiveStatus, DnsOwnedResource,
     DnsPlatformCapabilities, DnsPolicy, DnsPolicyAdapter, DnsResolver, DnsScope,
 };
+use crate::vortix_core::ports::owned_dns::{
+    ExpectedDnsState, OwnedDns, OwnedDnsBackend, OwnedDnsError,
+};
 use crate::vortix_process::{CommandSpec, PrivilegeReq};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
@@ -111,6 +114,44 @@ impl DnsResolver for LinuxDns {
         try_get_dns_resolvectl()
             .or_else(try_get_dns_nmcli)
             .or_else(try_get_dns_resolv_conf)
+    }
+}
+
+impl OwnedDns for LinuxDns {
+    fn backend(&self) -> OwnedDnsBackend {
+        OwnedDnsBackend::LinuxPendingPhysicalLedger
+    }
+
+    fn apply(
+        &mut self,
+        _desired: &DnsPolicy,
+        _expected: ExpectedDnsState<'_>,
+    ) -> Result<(), OwnedDnsError> {
+        Err(OwnedDnsError::FailedBeforeEffect)
+    }
+
+    fn audit(&mut self, _desired: &DnsPolicy) -> Result<(), OwnedDnsError> {
+        Err(OwnedDnsError::FailedBeforeEffect)
+    }
+
+    fn audit_absent(&mut self) -> Result<(), OwnedDnsError> {
+        Err(OwnedDnsError::FailedBeforeEffect)
+    }
+
+    fn recover_pending(
+        &mut self,
+        _desired: &DnsPolicy,
+        _prior: Option<&DnsPolicy>,
+    ) -> Result<(), OwnedDnsError> {
+        Err(OwnedDnsError::FailedBeforeEffect)
+    }
+
+    fn audit_recovery(
+        &mut self,
+        _candidates: &[DnsPolicy],
+        _allow_absent: bool,
+    ) -> Result<(), OwnedDnsError> {
+        Err(OwnedDnsError::FailedBeforeEffect)
     }
 }
 

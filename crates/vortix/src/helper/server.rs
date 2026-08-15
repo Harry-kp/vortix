@@ -12,6 +12,7 @@
 
 use std::collections::BTreeMap;
 
+use super::dns::RecoveredDnsState;
 use crate::helper::material::TunnelMaterialSet;
 use crate::helper::protocol::{
     negotiate_enrolled, HelperCapability, HelperClientHello, HelperError, HelperOp, HelperRequest,
@@ -247,6 +248,12 @@ pub(crate) trait NetworkPolicyExecutor {
         policy_enabled: bool,
     ) -> Result<(), PrivilegedExecutionError>;
 
+    fn validate_recovered_dns(
+        &mut self,
+        states: &[RecoveredDnsState],
+        policy_enabled: bool,
+    ) -> Result<(), PrivilegedExecutionError>;
+
     /// Select or validate physical ownership without invoking an OS effect.
     /// A real adapter must audit the recorded backend and reject unexpected
     /// Vortix-owned state in every alternative backend before returning.
@@ -421,9 +428,27 @@ where
                 })
             })
             .collect::<Result<Vec<_>, OperationError>>()?;
+        let recovered_dns_states = policy_projections
+            .iter()
+            .filter(|policy| policy.resource().kind() == ResourceKind::Dns)
+            .filter_map(|policy| {
+                let state = resources
+                    .iter()
+                    .find(|resource| resource.resource() == policy.resource())
+                    .map(HelperLedgerResource::state)?;
+                Some(RecoveredDnsState::new(
+                    state,
+                    policy.intended().clone(),
+                    policy.effective().cloned(),
+                ))
+            })
+            .collect::<Vec<_>>();
         let policy_enabled = enabled_capabilities.contains(&HelperCapability::NetworkPolicy);
         executor
             .validate_recovered_firewalls(&recovered_firewall_states, policy_enabled)
+            .map_err(|_| OperationError::InvalidReplayState)?;
+        executor
+            .validate_recovered_dns(&recovered_dns_states, policy_enabled)
             .map_err(|_| OperationError::InvalidReplayState)?;
         let mut session = Self::resume_restricted(
             root,
@@ -1763,6 +1788,7 @@ mod tests {
         policy_prepares: usize,
         policy_prepare_error: Option<NetworkPolicyPreparationError>,
         policy_plans: Vec<PreparedNetworkPolicyExecutionPlan>,
+        recovered_dns_validations: Vec<Vec<RecoveredDnsState>>,
         recovered_firewall_validations: Vec<Vec<RecoveredFirewallState>>,
         recovered_policy_enabled: Vec<bool>,
         cleanups: usize,
@@ -1887,6 +1913,15 @@ mod tests {
             } else {
                 Err(PrivilegedExecutionError::InvalidPlan)
             }
+        }
+
+        fn validate_recovered_dns(
+            &mut self,
+            states: &[RecoveredDnsState],
+            _policy_enabled: bool,
+        ) -> Result<(), PrivilegedExecutionError> {
+            self.recovered_dns_validations.push(states.to_vec());
+            Ok(())
         }
 
         fn prepare_network_policy(
@@ -3454,6 +3489,31 @@ mod tests {
         assert_eq!(
             recovered_state.effective().map(PolicyProjection::policy),
             None
+        );
+    }
+
+    #[test]
+    fn restart_passes_exact_owned_dns_projection_to_platform_validation() {
+        let mut harness = LifecycleHarness::for_policy(FakeExecutor::default());
+        let (_, _, dns) =
+            install_policy_generation_with_mode(&mut harness, 1, 1, KillSwitchMode::Auto);
+        let ledger = harness.server.ledger_store.writes.last().unwrap().clone();
+        let root = harness.server.root.clone();
+
+        let (recovered, _, _) = recover_session(
+            root,
+            ledger,
+            FakeExecutor::default(),
+            HelperCapability::NetworkPolicy,
+        );
+
+        let states = &recovered.executor.recovered_dns_validations[0];
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].state(), HelperResourceState::Owned);
+        assert_eq!(states[0].intended().policy(), &dns);
+        assert_eq!(
+            states[0].effective().map(PolicyProjection::policy),
+            Some(&dns)
         );
     }
 

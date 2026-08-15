@@ -1,0 +1,433 @@
+//! Helper-owned DNS policy orchestration.
+
+use super::observe::authority_interface_name;
+use super::server::{
+    NetworkPolicyExecutionPlan, NetworkPolicyOutcome, NetworkPolicyPreparationError,
+    PreparedNetworkPolicyExecutionPlan, PrivilegedExecutionError,
+};
+use super::validate::PlatformLayout;
+use crate::vortix_core::ports::dns::{DnsAssignment, DnsPolicy, DnsScope};
+use crate::vortix_core::ports::owned_dns::{
+    ExpectedDnsState, OwnedDns, OwnedDnsBackend, OwnedDnsError,
+};
+use crate::vortix_core::privileged::{
+    HelperResourceState, LeaseId, NetworkPolicyOperation, ObservationState, PolicyProjection,
+    PrivilegedDnsScope, ResourceObservation,
+};
+
+#[derive(Clone)]
+pub(crate) struct RecoveredDnsState {
+    state: HelperResourceState,
+    intended: PolicyProjection,
+    effective: Option<PolicyProjection>,
+}
+
+impl RecoveredDnsState {
+    pub(crate) fn new(
+        state: HelperResourceState,
+        intended: PolicyProjection,
+        effective: Option<PolicyProjection>,
+    ) -> Self {
+        Self {
+            state,
+            intended,
+            effective,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn state(&self) -> HelperResourceState {
+        self.state
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn intended(&self) -> &PolicyProjection {
+        &self.intended
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn effective(&self) -> Option<&PolicyProjection> {
+        self.effective.as_ref()
+    }
+}
+
+pub(crate) struct HelperDnsExecutor {
+    layout: PlatformLayout,
+    lease_id: LeaseId,
+    platform: Box<dyn OwnedDns>,
+}
+
+impl HelperDnsExecutor {
+    pub(crate) fn new(lease_id: LeaseId) -> Self {
+        let platform = crate::platform::helper_owned_dns();
+        Self {
+            layout: layout_for_backend(platform.backend()),
+            lease_id,
+            platform,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_platform(lease_id: LeaseId, platform: impl OwnedDns + 'static) -> Self {
+        let platform = Box::new(platform);
+        Self {
+            layout: layout_for_backend(platform.backend()),
+            lease_id,
+            platform,
+        }
+    }
+
+    pub(crate) fn validate_recovered(
+        &mut self,
+        states: &[RecoveredDnsState],
+        policy_enabled: bool,
+    ) -> Result<(), PrivilegedExecutionError> {
+        if states.is_empty() {
+            return if policy_enabled {
+                self.platform
+                    .audit_recovery(&[], true)
+                    .map_err(map_execution_error)
+            } else {
+                Ok(())
+            };
+        }
+        let pending = states
+            .iter()
+            .filter(|state| state.state == HelperResourceState::PendingEffect)
+            .collect::<Vec<_>>();
+        if pending.len() > 1 {
+            return Err(PrivilegedExecutionError::InvalidPlan);
+        }
+        if let Some(state) = pending.first() {
+            let desired = dns_policy(self.layout, self.lease_id, &state.intended)?;
+            let prior = state
+                .effective
+                .as_ref()
+                .map(|projection| dns_policy(self.layout, self.lease_id, projection))
+                .transpose()?;
+            return self
+                .platform
+                .recover_pending(&desired, prior.as_ref())
+                .map_err(map_execution_error);
+        }
+        let mut candidates = Vec::new();
+        let allow_absent = false;
+        for state in states {
+            match state.state {
+                HelperResourceState::PendingEffect => unreachable!("handled above"),
+                HelperResourceState::Owned | HelperResourceState::PendingRelease => {
+                    let effective = state
+                        .effective
+                        .as_ref()
+                        .ok_or(PrivilegedExecutionError::InvalidPlan)?;
+                    candidates.push(dns_policy(self.layout, self.lease_id, effective)?);
+                }
+            }
+        }
+        self.platform
+            .audit_recovery(&candidates, allow_absent)
+            .map_err(map_execution_error)
+    }
+
+    pub(crate) fn prepare(
+        &mut self,
+        plan: &NetworkPolicyExecutionPlan,
+    ) -> Result<PreparedNetworkPolicyExecutionPlan, NetworkPolicyPreparationError> {
+        match plan.operation() {
+            NetworkPolicyOperation::ApplyDns { .. } => {
+                self.audit_before_mutation(plan)?;
+                Ok(PreparedNetworkPolicyExecutionPlan::new(
+                    plan.clone(),
+                    Vec::new(),
+                ))
+            }
+            NetworkPolicyOperation::ObserveBarrier { policy, .. }
+                if policy.kind() == crate::vortix_core::privileged::ResourceKind::Dns =>
+            {
+                Ok(PreparedNetworkPolicyExecutionPlan::new(
+                    plan.clone(),
+                    Vec::new(),
+                ))
+            }
+            NetworkPolicyOperation::ReleaseObsolete {
+                policy, resources, ..
+            } if policy.kind() == crate::vortix_core::privileged::ResourceKind::Dns
+                && !resources.is_empty()
+                && resources.iter().all(|resource| {
+                    resource.kind() == crate::vortix_core::privileged::ResourceKind::Dns
+                })
+                && plan.obsolete_effective().len() == resources.len() =>
+            {
+                let intended = dns_policy(self.layout, self.lease_id, plan.intended())
+                    .map_err(|_| NetworkPolicyPreparationError::InvalidPlan)?;
+                self.platform
+                    .audit(&intended)
+                    .map_err(|_| NetworkPolicyPreparationError::FailedBeforeEffect)?;
+                if plan.obsolete_effective().iter().any(|projection| {
+                    !resources.contains(projection.policy())
+                        || dns_policy(self.layout, self.lease_id, projection).is_err()
+                }) {
+                    return Err(NetworkPolicyPreparationError::InvalidPlan);
+                }
+                Ok(PreparedNetworkPolicyExecutionPlan::new(
+                    plan.clone(),
+                    Vec::new(),
+                ))
+            }
+            _ => Err(NetworkPolicyPreparationError::InvalidPlan),
+        }
+    }
+
+    pub(crate) fn execute(
+        &mut self,
+        prepared: &PreparedNetworkPolicyExecutionPlan,
+    ) -> Result<NetworkPolicyOutcome, PrivilegedExecutionError> {
+        let plan = prepared.execution();
+        match plan.operation() {
+            NetworkPolicyOperation::ApplyDns { .. } => {
+                let desired = dns_policy(self.layout, self.lease_id, plan.intended())?;
+                let prior = plan
+                    .prior_effective()
+                    .map(|projection| dns_policy(self.layout, self.lease_id, projection))
+                    .transpose()?;
+                let expected = prior
+                    .as_ref()
+                    .map_or(ExpectedDnsState::Absent, ExpectedDnsState::Applied);
+                self.platform
+                    .apply(&desired, expected)
+                    .map_err(map_execution_error)?;
+                Ok(NetworkPolicyOutcome::Applied)
+            }
+            NetworkPolicyOperation::ObserveBarrier { policy, .. } => {
+                let desired = dns_policy(self.layout, self.lease_id, plan.intended())?;
+                self.platform.audit(&desired).map_err(map_execution_error)?;
+                Ok(NetworkPolicyOutcome::Observed(vec![
+                    ResourceObservation::new(policy.clone(), ObservationState::Present, 1)
+                        .map_err(|_| PrivilegedExecutionError::InvalidPlan)?,
+                ]))
+            }
+            NetworkPolicyOperation::ReleaseObsolete {
+                policy, resources, ..
+            } => {
+                let desired = dns_policy(self.layout, self.lease_id, plan.intended())?;
+                self.platform.audit(&desired).map_err(map_execution_error)?;
+                let mut observations =
+                    vec![
+                        ResourceObservation::new(policy.clone(), ObservationState::Present, 1)
+                            .map_err(|_| PrivilegedExecutionError::InvalidPlan)?,
+                    ];
+                observations.extend(resources.iter().cloned().map(|resource| {
+                    ResourceObservation::new(resource, ObservationState::Absent, 1)
+                        .expect("validated DNS resources produce observations")
+                }));
+                Ok(NetworkPolicyOutcome::Observed(observations))
+            }
+            _ => Err(PrivilegedExecutionError::InvalidPlan),
+        }
+    }
+
+    fn audit_before_mutation(
+        &mut self,
+        plan: &NetworkPolicyExecutionPlan,
+    ) -> Result<(), NetworkPolicyPreparationError> {
+        let result = if let Some(prior) = plan.prior_effective() {
+            let prior = dns_policy(self.layout, self.lease_id, prior)
+                .map_err(|_| NetworkPolicyPreparationError::InvalidPlan)?;
+            self.platform.audit(&prior)
+        } else {
+            self.platform.audit_absent()
+        };
+        result.map_err(|_| NetworkPolicyPreparationError::FailedBeforeEffect)
+    }
+}
+
+fn dns_policy(
+    layout: PlatformLayout,
+    lease_id: LeaseId,
+    projection: &PolicyProjection,
+) -> Result<DnsPolicy, PrivilegedExecutionError> {
+    let PolicyProjection::Dns {
+        policy,
+        assignments,
+    } = projection
+    else {
+        return Err(PrivilegedExecutionError::InvalidPlan);
+    };
+    let assignments = assignments
+        .iter()
+        .map(
+            |assignment| -> Result<DnsAssignment, PrivilegedExecutionError> {
+                let tunnel = assignment.tunnel();
+                let profile_id = tunnel
+                    .profile_id()
+                    .cloned()
+                    .ok_or(PrivilegedExecutionError::InvalidPlan)?;
+                let interface = authority_interface_name(layout, lease_id, tunnel)
+                    .map_err(|()| PrivilegedExecutionError::InvalidPlan)?;
+                let scope = match assignment.scope() {
+                    PrivilegedDnsScope::CatchAll => DnsScope::CatchAll,
+                    PrivilegedDnsScope::Scoped { domains } => DnsScope::Scoped {
+                        domains: domains
+                            .iter()
+                            .map(|domain| domain.as_str().to_string())
+                            .collect(),
+                    },
+                    PrivilegedDnsScope::Suppressed => DnsScope::Suppressed,
+                };
+                Ok(DnsAssignment {
+                    profile_id,
+                    interface,
+                    servers: assignment.servers().to_vec(),
+                    search_domains: assignment
+                        .search_domains()
+                        .iter()
+                        .map(|domain| domain.as_str().to_string())
+                        .collect(),
+                    scope,
+                })
+            },
+        )
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(DnsPolicy {
+        generation: policy.generation(),
+        assignments,
+    })
+}
+
+const fn layout_for_backend(backend: OwnedDnsBackend) -> PlatformLayout {
+    match backend {
+        OwnedDnsBackend::LinuxPendingPhysicalLedger => PlatformLayout::Linux,
+        OwnedDnsBackend::MacOsResolverFiles => PlatformLayout::MacOs,
+    }
+}
+
+const fn map_execution_error(error: OwnedDnsError) -> PrivilegedExecutionError {
+    match error {
+        OwnedDnsError::FailedBeforeEffect => PrivilegedExecutionError::FailedBeforeEffect,
+        OwnedDnsError::EffectMayHaveApplied => PrivilegedExecutionError::EffectMayHaveApplied,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+    use crate::vortix_core::control::AuthorityEpoch;
+    use crate::vortix_core::ports::owned_dns::OwnedDnsBackend;
+    use crate::vortix_core::privileged::DnsHostname;
+    use crate::vortix_core::privileged::{PrivilegedDnsAssignment, ResourceKind, ResourceTag};
+    use crate::vortix_core::profile::ProfileId;
+
+    #[derive(Default)]
+    struct AuditCapture {
+        candidates: Vec<DnsPolicy>,
+        allow_absent: bool,
+        recovered: Option<(DnsPolicy, Option<DnsPolicy>)>,
+    }
+
+    struct CaptureDns(Arc<Mutex<AuditCapture>>);
+
+    impl OwnedDns for CaptureDns {
+        fn backend(&self) -> OwnedDnsBackend {
+            OwnedDnsBackend::LinuxPendingPhysicalLedger
+        }
+
+        fn apply(
+            &mut self,
+            _desired: &DnsPolicy,
+            _expected: ExpectedDnsState<'_>,
+        ) -> Result<(), OwnedDnsError> {
+            unreachable!()
+        }
+
+        fn audit(&mut self, _desired: &DnsPolicy) -> Result<(), OwnedDnsError> {
+            unreachable!()
+        }
+
+        fn audit_absent(&mut self) -> Result<(), OwnedDnsError> {
+            unreachable!()
+        }
+
+        fn recover_pending(
+            &mut self,
+            desired: &DnsPolicy,
+            prior: Option<&DnsPolicy>,
+        ) -> Result<(), OwnedDnsError> {
+            self.0.lock().unwrap().recovered = Some((desired.clone(), prior.cloned()));
+            Ok(())
+        }
+
+        fn audit_recovery(
+            &mut self,
+            candidates: &[DnsPolicy],
+            allow_absent: bool,
+        ) -> Result<(), OwnedDnsError> {
+            let mut capture = self.0.lock().unwrap();
+            capture.candidates = candidates.to_vec();
+            capture.allow_absent = allow_absent;
+            Ok(())
+        }
+    }
+
+    fn projection(generation: u64, server: &str) -> PolicyProjection {
+        let profile_id = ProfileId::parse("a".repeat(ProfileId::HEX_LEN)).unwrap();
+        let tunnel = ResourceTag::tunnel(profile_id, generation).unwrap();
+        let assignment = PrivilegedDnsAssignment::new(
+            tunnel,
+            vec![server.parse().unwrap()],
+            vec![DnsHostname::new("corp.example").unwrap()],
+            PrivilegedDnsScope::CatchAll,
+        )
+        .unwrap();
+        PolicyProjection::Dns {
+            policy: ResourceTag::topology(AuthorityEpoch(3), generation, ResourceKind::Dns)
+                .unwrap(),
+            assignments: vec![assignment],
+        }
+    }
+
+    #[test]
+    fn typed_projection_derives_interface_and_preserves_dns_scope() {
+        let projection = projection(7, "1.1.1.1");
+        let policy = dns_policy(PlatformLayout::Linux, LeaseId::new([7; 32]), &projection).unwrap();
+
+        assert_eq!(policy.generation, 7);
+        assert_eq!(policy.assignments.len(), 1);
+        assert!(policy.assignments[0].interface.starts_with("vx"));
+        assert_eq!(
+            policy.assignments[0].servers,
+            vec!["1.1.1.1".parse::<std::net::IpAddr>().unwrap()]
+        );
+        assert_eq!(policy.assignments[0].search_domains, vec!["corp.example"]);
+        assert_eq!(policy.assignments[0].scope, DnsScope::CatchAll);
+    }
+
+    #[test]
+    fn pending_recovery_reconciles_only_intended_and_prior() {
+        let capture = Arc::new(Mutex::new(AuditCapture::default()));
+        let mut subject = HelperDnsExecutor::with_platform(
+            LeaseId::new([7; 32]),
+            CaptureDns(Arc::clone(&capture)),
+        );
+        let intended = projection(8, "9.9.9.9");
+        let prior = projection(7, "1.1.1.1");
+
+        subject
+            .validate_recovered(
+                &[RecoveredDnsState::new(
+                    HelperResourceState::PendingEffect,
+                    intended,
+                    Some(prior),
+                )],
+                true,
+            )
+            .unwrap();
+
+        let capture = capture.lock().unwrap();
+        let (desired, prior) = capture.recovered.as_ref().unwrap();
+        assert_eq!(desired.generation, 8);
+        assert_eq!(prior.as_ref().unwrap().generation, 7);
+        assert!(capture.candidates.is_empty());
+    }
+}
