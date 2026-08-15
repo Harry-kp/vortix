@@ -96,7 +96,7 @@ impl ProductionHelperExecutor {
             observation: SystemObservationExecutor::new(layout, lease_id)?,
             layout,
             lease_id,
-            firewall: HelperFirewallExecutor::new(layout, lease_id),
+            firewall: HelperFirewallExecutor::new(lease_id),
             wireguard: BTreeMap::new(),
             openvpn: BTreeMap::new(),
         })
