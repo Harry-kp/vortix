@@ -15,8 +15,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::dns::RecoveredDnsState;
 use crate::helper::material::TunnelMaterialSet;
 use crate::helper::protocol::{
-    capability_for_operation, negotiate_enrolled, HelperCapability, HelperClientHello, HelperError,
-    HelperOp, HelperRequest, HelperResponse, HelperResult,
+    capability_for_operation, minimum_schema_for_operation, negotiate_enrolled, HelperCapability,
+    HelperClientHello, HelperError, HelperOp, HelperRequest, HelperResponse, HelperResult,
 };
 use crate::vortix_core::privileged::{
     AmbiguousPhase, ChildOwner, ChildSpawnAuthority, HelperEpoch, HelperLedgerDns,
@@ -27,6 +27,7 @@ use crate::vortix_core::privileged::{
     ReceiptLedger, RejectionCode, ResourceKind, ResourceObservation, ResourceObservationTarget,
     ResourceTag, RootAuthorityLedger, VerifiedReceipt,
 };
+use crate::vortix_core::profile::ProtocolKind;
 
 const ENABLED_CAPABILITIES: [HelperCapability; 5] = [
     HelperCapability::Handshake,
@@ -558,6 +559,7 @@ pub(crate) struct EnrolledHelperSession<E, S> {
     children: BTreeMap<ResourceTag, ChildEvidence>,
     last_receipt: Option<VerifiedReceipt>,
     enabled_capabilities: Vec<HelperCapability>,
+    negotiated_schema: Option<u16>,
     handshaken: bool,
     poisoned: bool,
 }
@@ -610,6 +612,7 @@ where
             children: BTreeMap::new(),
             last_receipt: None,
             enabled_capabilities,
+            negotiated_schema: None,
             handshaken: false,
             poisoned: false,
         })
@@ -756,6 +759,7 @@ where
                 .map_err(|_| HelperError::LedgerUnavailable)?,
             &self.enabled_capabilities,
         )?;
+        self.negotiated_schema = Some(response.schema);
         self.handshaken = true;
         Ok(response)
     }
@@ -770,6 +774,14 @@ where
         }
         if self.poisoned {
             return Err(HelperError::LedgerUnavailable);
+        }
+        if self
+            .negotiated_schema
+            .is_none_or(|schema| schema < minimum_schema_for_operation(request.operation()))
+        {
+            return Err(HelperError::Incompatible {
+                reason: "operation requires a newer negotiated helper schema".into(),
+            });
         }
         if !self
             .enabled_capabilities
@@ -832,6 +844,7 @@ where
 
         let receipt = match request.operation() {
             PrivilegedOperation::Observe(targets) => self.observe(request, targets),
+            PrivilegedOperation::ObserveManaged(targets) => self.observe_managed(request, targets),
             PrivilegedOperation::StartTunnel(plan) => self.start_tunnel(request, plan, materials),
             PrivilegedOperation::StopTunnel(resource) => self.stop_tunnel(request, resource),
             PrivilegedOperation::NetworkPolicy(operation) => {
@@ -943,6 +956,56 @@ where
             self.persist_ledger()?;
         }
         Ok(receipt)
+    }
+
+    fn observe_managed(
+        &mut self,
+        request: &crate::vortix_core::privileged::PrivilegedRequest,
+        targets: &[ResourceObservationTarget],
+    ) -> Result<VerifiedReceipt, HelperError> {
+        if !self.managed_observation_is_closed(targets) {
+            return self
+                .receipts
+                .rejected(request, RejectionCode::InvalidResource)
+                .map_err(map_receipt_error);
+        }
+        self.observe(request, targets)
+    }
+
+    fn managed_observation_is_closed(&self, targets: &[ResourceObservationTarget]) -> bool {
+        let requested = targets
+            .iter()
+            .map(|target| (target.resource(), target.protocol()))
+            .collect::<BTreeMap<_, _>>();
+        targets.iter().all(|target| {
+            let resource = target.resource();
+            if !self.resource_states.contains_key(resource) {
+                return false;
+            }
+            match resource.kind() {
+                ResourceKind::Tunnel => {
+                    let Ok(group) = process_group_for_tunnel(resource) else {
+                        return false;
+                    };
+                    if self.resource_states.contains_key(&group) {
+                        target.protocol() == Some(ProtocolKind::OpenVpn)
+                            && requested.get(&group) == Some(&Some(ProtocolKind::OpenVpn))
+                    } else {
+                        target.protocol() == Some(ProtocolKind::WireGuard)
+                    }
+                }
+                ResourceKind::ProcessGroup => {
+                    tunnel_for_profile_resource(resource).is_some_and(|tunnel| {
+                        self.resource_states.contains_key(&tunnel)
+                            && requested.get(&tunnel) == Some(&Some(ProtocolKind::OpenVpn))
+                    })
+                }
+                ResourceKind::Firewall
+                | ResourceKind::Dns
+                | ResourceKind::Routes
+                | ResourceKind::RuntimeSecret => false,
+            }
+        })
     }
 
     fn reconcile_recovery(&mut self, outcome: &ObservationOutcome) -> bool {
@@ -2375,6 +2438,7 @@ mod tests {
 
     #[derive(Default)]
     struct FakeExecutor {
+        observations: usize,
         starts: usize,
         stops: usize,
         stops_with_child: usize,
@@ -2405,6 +2469,7 @@ mod tests {
             &mut self,
             targets: &[ResourceObservationTarget],
         ) -> Result<ObservationOutcome, ObservationError> {
+            self.observations += 1;
             let observations = targets
                 .iter()
                 .map(|target| {
@@ -3137,7 +3202,7 @@ mod tests {
         )
     }
 
-    fn observation_request(
+    fn managed_observation_request(
         principal: &crate::vortix_core::privileged::TrustedDaemonPrincipal,
         helper_epoch: HelperEpoch,
         sequence: u64,
@@ -3147,7 +3212,7 @@ mod tests {
             principal,
             helper_epoch,
             RequestSequence::new(sequence).unwrap(),
-            PrivilegedOperation::Observe(targets),
+            PrivilegedOperation::ObserveManaged(targets),
         )
         .unwrap()
     }
@@ -3197,6 +3262,101 @@ mod tests {
             client.verify_receipt(id, &request, response).unwrap();
         }
         assert_eq!(server.ledger_store.writes.len(), 1);
+    }
+
+    #[test]
+    fn managed_observation_requires_root_ledger_accounting_before_platform_readback() {
+        let (root, principal, claim, helper_epoch, baseline) = fixture();
+        let mut server = EnrolledHelperSession::resume(
+            root,
+            helper_epoch,
+            baseline,
+            FakeExecutor::default(),
+            MemoryHelperLedgerStore::default(),
+        )
+        .unwrap();
+        let handshake = server.handle(HelperRequest {
+            id: 1,
+            op: HelperOp::Handshake(HelperClientHello::current(
+                501,
+                claim,
+                vec![HelperCapability::Observe],
+            )),
+        });
+        let HelperResult::Handshake(server_hello) = handshake.result.unwrap() else {
+            panic!("expected handshake");
+        };
+        let client = AuthenticatedHelperSession::from_handshake(
+            &principal,
+            &verified_helper_peer(),
+            &server_hello,
+        )
+        .unwrap();
+        let request = PrivilegedRequest::new(
+            &principal,
+            helper_epoch,
+            RequestSequence::new(1).unwrap(),
+            PrivilegedOperation::ObserveManaged(vec![wireguard_target(resource())]),
+        )
+        .unwrap();
+
+        let response = server.handle(HelperRequest {
+            id: 2,
+            op: HelperOp::Execute(Box::new(request.clone())),
+        });
+        let receipt = client.verify_receipt(2, &request, response).unwrap();
+
+        assert!(receipt.is_rejected());
+        assert_eq!(server.executor.observations, 0);
+    }
+
+    #[test]
+    fn managed_observation_accepts_exact_wireguard_ledger_resource() {
+        let mut harness = LifecycleHarness::new(FakeExecutor::default());
+        let start = harness.request(1, PrivilegedOperation::StartTunnel(wireguard_plan(1)));
+        assert!(!harness.execute(2, &start).is_ambiguous());
+        let observe = harness.request(
+            2,
+            PrivilegedOperation::ObserveManaged(vec![wireguard_target(resource())]),
+        );
+
+        let receipt = harness.execute(3, &observe);
+
+        assert!(receipt.observes(&resource(), ObservationState::Present));
+        assert_eq!(harness.server.executor.observations, 1);
+    }
+
+    #[test]
+    fn managed_openvpn_observation_requires_closed_tunnel_and_group_set() {
+        let mut harness = LifecycleHarness::new(FakeExecutor {
+            foreground_start: true,
+            ..FakeExecutor::default()
+        });
+        let start = harness.request(1, PrivilegedOperation::StartTunnel(openvpn_plan(1)));
+        assert!(!harness.execute(2, &start).is_ambiguous());
+        let tunnel = resource();
+        let group = process_group_for_tunnel(&tunnel).unwrap();
+        let incomplete = harness.request(
+            2,
+            PrivilegedOperation::ObserveManaged(vec![openvpn_target(tunnel.clone())]),
+        );
+
+        let rejected = harness.execute(3, &incomplete);
+
+        assert!(rejected.is_rejected());
+        assert_eq!(harness.server.executor.observations, 0);
+
+        let complete = harness.request(
+            3,
+            PrivilegedOperation::ObserveManaged(vec![
+                openvpn_target(tunnel.clone()),
+                openvpn_target(group.clone()),
+            ]),
+        );
+        let accepted = harness.execute(4, &complete);
+        assert!(accepted.observes(&tunnel, ObservationState::Present));
+        assert!(accepted.observes(&group, ObservationState::Present));
+        assert_eq!(harness.server.executor.observations, 1);
     }
 
     #[test]
@@ -3438,6 +3598,51 @@ mod tests {
     }
 
     #[test]
+    fn schema_v4_session_rejects_managed_observation_before_admission() {
+        let (root, principal, claim, helper_epoch, baseline) = fixture();
+        let mut server = EnrolledHelperSession::resume(
+            root,
+            helper_epoch,
+            baseline,
+            FakeExecutor::default(),
+            MemoryHelperLedgerStore::default(),
+        )
+        .unwrap();
+        let mut hello = HelperClientHello::current(
+            501,
+            claim,
+            vec![HelperCapability::Handshake, HelperCapability::Observe],
+        );
+        hello.schema.max = 4;
+        assert!(server
+            .handle(HelperRequest {
+                id: 1,
+                op: HelperOp::Handshake(hello),
+            })
+            .result
+            .is_ok());
+        let request = PrivilegedRequest::new(
+            &principal,
+            helper_epoch,
+            RequestSequence::new(1).unwrap(),
+            PrivilegedOperation::ObserveManaged(vec![wireguard_target(resource())]),
+        )
+        .unwrap();
+
+        let response = server.handle(HelperRequest {
+            id: 2,
+            op: HelperOp::Execute(Box::new(request)),
+        });
+
+        assert!(matches!(
+            response.result,
+            Err(HelperError::Incompatible { .. })
+        ));
+        assert_eq!(server.executor.observations, 0);
+        assert!(server.ledger_store.writes.is_empty());
+    }
+
+    #[test]
     fn forged_receipt_binding_never_authenticates() {
         let (root, principal, claim, helper_epoch, baseline) = fixture();
         let mut server = EnrolledHelperSession::resume(
@@ -3625,7 +3830,7 @@ mod tests {
         );
         assert!(!recovered.owns_tunnel(&resource()));
 
-        let observe = observation_request(
+        let observe = managed_observation_request(
             &principal,
             helper_epoch,
             2,
@@ -3654,7 +3859,7 @@ mod tests {
         );
         let tunnel = resource();
         let group = process_group_for_tunnel(&tunnel).unwrap();
-        let observe = observation_request(
+        let observe = managed_observation_request(
             &principal,
             helper_epoch,
             2,
@@ -3683,7 +3888,7 @@ mod tests {
             },
             HelperCapability::Observe,
         );
-        let observe = observation_request(
+        let observe = managed_observation_request(
             &principal,
             helper_epoch,
             2,
@@ -3722,7 +3927,7 @@ mod tests {
         );
         let tunnel = resource();
         let group = process_group_for_tunnel(&tunnel).unwrap();
-        let observe = observation_request(
+        let observe = managed_observation_request(
             &principal,
             helper_epoch,
             2,
@@ -3770,7 +3975,7 @@ mod tests {
             .flat_map(|tunnel| [tunnel.clone(), process_group_for_tunnel(tunnel).unwrap()])
             .map(openvpn_target)
             .collect();
-        let observe = observation_request(&principal, helper_epoch, 3, targets);
+        let observe = managed_observation_request(&principal, helper_epoch, 3, targets);
 
         assert!(recovered
             .handle(HelperRequest {
@@ -3797,7 +4002,7 @@ mod tests {
             HelperCapability::Observe,
         );
         recovered.ledger_store.fail_on_write = Some(2);
-        let observe = observation_request(
+        let observe = managed_observation_request(
             &principal,
             helper_epoch,
             2,
@@ -3834,7 +4039,7 @@ mod tests {
             },
             HelperCapability::Observe,
         );
-        let observe = observation_request(
+        let observe = managed_observation_request(
             &principal,
             helper_epoch,
             2,
@@ -3897,7 +4102,7 @@ mod tests {
                 },
                 HelperCapability::Observe,
             );
-            let observe = observation_request(&principal, helper_epoch, 3, targets);
+            let observe = managed_observation_request(&principal, helper_epoch, 3, targets);
 
             assert!(recovered
                 .handle(HelperRequest {
