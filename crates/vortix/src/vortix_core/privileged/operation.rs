@@ -1495,6 +1495,14 @@ pub enum PrivilegedOperation {
         #[serde(deserialize_with = "deserialize_observation_target_vec")]
         Vec<ResourceObservationTarget>,
     ),
+    /// Read back only exact tunnel resources already accounted for by the
+    /// authenticated root ledger. Unlike [`Self::Observe`], this operation is
+    /// suitable for restart reconciliation because a successful receipt proves
+    /// that user-owned desired state did not invent the managed resource tag.
+    ObserveManaged(
+        #[serde(deserialize_with = "deserialize_observation_target_vec")]
+        Vec<ResourceObservationTarget>,
+    ),
     CleanupOwned(#[serde(deserialize_with = "deserialize_resource_vec")] Vec<ResourceTag>),
 }
 
@@ -1550,20 +1558,8 @@ impl PrivilegedOperation {
             Self::StartTunnel(_) => Ok(()),
             Self::StopTunnel(resource) => require_profile_kind(resource, ResourceKind::Tunnel),
             Self::NetworkPolicy(operation) => operation.validate(authority),
-            Self::Observe(targets) => {
-                bounded(targets)?;
-                if has_duplicates(targets.iter().map(ResourceObservationTarget::resource))
-                    || targets.iter().any(|target| {
-                        let resource = target.resource();
-                        resource.authority_epoch().is_some()
-                            && resource.authority_epoch() != Some(authority)
-                    })
-                {
-                    Err(OperationError::ResourceScopeMismatch)
-                } else {
-                    Ok(())
-                }
-            }
+            Self::Observe(targets) => validate_observation_targets(targets, authority, false),
+            Self::ObserveManaged(targets) => validate_observation_targets(targets, authority, true),
             Self::CleanupOwned(resources) => {
                 bounded(resources)?;
                 if has_duplicates(resources)
@@ -1601,9 +1597,35 @@ impl PrivilegedOperation {
                 resource == operation.policy()
                     || matches!(operation, NetworkPolicyOperation::ReleaseObsolete { resources, .. } if resources.contains(resource))
             }
-            Self::Observe(targets) => targets.iter().any(|target| target.resource() == resource),
+            Self::Observe(targets) | Self::ObserveManaged(targets) => {
+                targets.iter().any(|target| target.resource() == resource)
+            }
             Self::CleanupOwned(resources) => resources.contains(resource),
         }
+    }
+}
+
+fn validate_observation_targets(
+    targets: &[ResourceObservationTarget],
+    authority: AuthorityEpoch,
+    require_managed_scope: bool,
+) -> Result<(), OperationError> {
+    bounded(targets)?;
+    if (require_managed_scope && targets.is_empty())
+        || has_duplicates(targets.iter().map(ResourceObservationTarget::resource))
+        || targets.iter().any(|target| {
+            let resource = target.resource();
+            (resource.authority_epoch().is_some() && resource.authority_epoch() != Some(authority))
+                || (require_managed_scope
+                    && !matches!(
+                        resource.kind(),
+                        ResourceKind::Tunnel | ResourceKind::ProcessGroup
+                    ))
+        })
+    {
+        Err(OperationError::ResourceScopeMismatch)
+    } else {
+        Ok(())
     }
 }
 
@@ -2547,6 +2569,38 @@ mod tests {
                 HelperEpoch::new(3).unwrap(),
                 RequestSequence::new(1).unwrap(),
                 PrivilegedOperation::Observe(targets),
+            )
+            .unwrap_err(),
+            OperationError::ResourceScopeMismatch
+        );
+    }
+
+    #[test]
+    fn managed_observation_is_nonempty_and_tunnel_scoped() {
+        let (_root, principal) = authority();
+        let helper = HelperEpoch::new(3).unwrap();
+        let sequence = RequestSequence::new(1).unwrap();
+
+        assert_eq!(
+            PrivilegedRequest::new(
+                &principal,
+                helper,
+                sequence,
+                PrivilegedOperation::ObserveManaged(Vec::new()),
+            )
+            .unwrap_err(),
+            OperationError::ResourceScopeMismatch
+        );
+
+        let firewall =
+            ResourceTag::topology(principal.authority_epoch(), 1, ResourceKind::Firewall).unwrap();
+        let target = ResourceObservationTarget::new(firewall, None).unwrap();
+        assert_eq!(
+            PrivilegedRequest::new(
+                &principal,
+                helper,
+                sequence,
+                PrivilegedOperation::ObserveManaged(vec![target]),
             )
             .unwrap_err(),
             OperationError::ResourceScopeMismatch

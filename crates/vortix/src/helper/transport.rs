@@ -558,7 +558,8 @@ impl From<super::descriptor_transport::DescriptorTransportError> for HelperTrans
 mod tests {
     use super::*;
     use crate::daemon::helper_client::{
-        AuthenticatedHelperTransport, HelperConnectBudget, SharedAuthenticatedHelper,
+        AuthenticatedHelperTransport, HelperClientError, HelperConnectBudget,
+        SharedAuthenticatedHelper,
     };
     use crate::helper::protocol::{
         decode_response_frame, encode_request_frame, HelperCapability, HelperClientHello,
@@ -572,10 +573,10 @@ mod tests {
     use crate::vortix_core::privileged::{
         AuthorityBinding, BootScope, HelperEpoch, LeaseId, OperationDigest, PrivilegedOperation,
         PrivilegedRequest, ProtocolPlan, ReceiptLedger, RejectionCode, RequestSequence,
-        RootAuthorityLedger, ServiceInstanceClaim, ServiceManager, WireGuardInterfaceOptions,
-        WireGuardPeerPlan, WireGuardPlan,
+        ResourceObservationTarget, ResourceTag, RootAuthorityLedger, ServiceInstanceClaim,
+        ServiceManager, WireGuardInterfaceOptions, WireGuardPeerPlan, WireGuardPlan,
     };
-    use crate::vortix_core::profile::ProfileId;
+    use crate::vortix_core::profile::{ProfileId, ProtocolKind};
     use std::io::{Seek as _, SeekFrom};
     use std::time::Instant;
 
@@ -935,6 +936,69 @@ mod tests {
                 .unwrap();
             assert!(receipt.is_rejected());
         }
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn schema_v4_transport_rejects_managed_observation_before_transmission() {
+        let (_root, authority, service) = authority_fixture();
+        let helper_epoch = HelperEpoch::new(8).unwrap();
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let server = std::thread::spawn(move || {
+            let handshake = read_request(&mut server_stream);
+            let mut hello = enrolled_hello(
+                authority,
+                helper_epoch,
+                RequestSequence::new(1).unwrap(),
+                vec![HelperCapability::Handshake, HelperCapability::Observe],
+            );
+            hello.schema = 4;
+            write_response(
+                &mut server_stream,
+                &HelperResponse {
+                    id: handshake.id,
+                    result: Ok(HelperResult::Handshake(hello)),
+                },
+            )
+            .unwrap();
+            server_stream
+                .set_read_timeout(Some(Duration::from_millis(250)))
+                .unwrap();
+            assert!(receive_request(&server_stream).is_err());
+        });
+        let mut transport = AuthenticatedHelperTransport::open_verified(
+            client_stream,
+            &verified_helper_peer(),
+            501,
+            authority,
+            &service,
+            &[HelperCapability::Handshake, HelperCapability::Observe],
+            HelperConnectBudget::new(
+                RequestSequence::new(1).unwrap(),
+                Instant::now() + Duration::from_secs(1),
+            ),
+        )
+        .unwrap();
+        let target = ResourceObservationTarget::new(
+            ResourceTag::tunnel(ProfileId::parse("a".repeat(ProfileId::HEX_LEN)).unwrap(), 1)
+                .unwrap(),
+            Some(ProtocolKind::WireGuard),
+        )
+        .unwrap();
+
+        let failure = transport
+            .execute(
+                PrivilegedOperation::ObserveManaged(vec![target]),
+                &[],
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            failure.source(),
+            HelperClientError::SchemaMismatch
+        ));
+        drop(transport);
         server.join().unwrap();
     }
 

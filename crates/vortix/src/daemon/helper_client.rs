@@ -22,7 +22,7 @@ use std::time::Instant;
 
 use thiserror::Error;
 
-use crate::helper::protocol::capability_for_operation;
+use crate::helper::protocol::{capability_for_operation, minimum_schema_for_operation};
 use crate::helper::validate::VerifiedHelperPeer;
 use crate::helper::{
     connect_verified_helper, decode_response_frame, expected_descriptor_count_for_operation,
@@ -42,6 +42,7 @@ pub(crate) struct AuthenticatedHelperSession {
     principal: TrustedDaemonPrincipal,
     helper_epoch: crate::vortix_core::privileged::HelperEpoch,
     next_sequence: Option<RequestSequence>,
+    negotiated_schema: u16,
     enabled_capabilities: Vec<HelperCapability>,
 }
 
@@ -73,7 +74,8 @@ impl AuthenticatedHelperSession {
             || binding.authority_epoch() != principal.authority_epoch()
             || binding.lease_id() != principal.lease_id()
             || (hello.schema == 3 && !matches!(binding, crate::helper::HelperSessionBinding::V3(_)))
-            || (hello.schema == 4 && !matches!(binding, crate::helper::HelperSessionBinding::V4(_)))
+            || ((hello.schema == 4 || hello.schema == 5)
+                && !matches!(binding, crate::helper::HelperSessionBinding::V4(_)))
         {
             return Err(HelperClientError::AuthorityMismatch);
         }
@@ -86,6 +88,7 @@ impl AuthenticatedHelperSession {
             principal: principal.clone(),
             helper_epoch: binding.helper_epoch(),
             next_sequence: binding.next_sequence(),
+            negotiated_schema: hello.schema,
             enabled_capabilities: hello.enabled_capabilities.clone(),
         })
     }
@@ -100,7 +103,7 @@ impl AuthenticatedHelperSession {
     ) -> Result<Self, HelperClientError> {
         let binding = hello.session.ok_or(HelperClientError::NotEnrolled)?;
         match (hello.schema, binding.authority()) {
-            (4, Some(authority)) if authority == expected_authority => {}
+            (4 | 5, Some(authority)) if authority == expected_authority => {}
             (3, None)
                 if binding.authority_epoch() == expected_authority.authority_epoch()
                     && binding.lease_id() == expected_authority.lease_id() => {}
@@ -265,6 +268,12 @@ impl AuthenticatedHelperTransport {
             return Err(HelperExecutionFailure::new(
                 RecoveryAction::ReconcileRequired,
                 HelperClientError::SessionPoisoned,
+            ));
+        }
+        if self.session.negotiated_schema < minimum_schema_for_operation(&operation) {
+            return Err(HelperExecutionFailure::new(
+                RecoveryAction::Unavailable,
+                HelperClientError::SchemaMismatch,
             ));
         }
         if !self
@@ -624,6 +633,8 @@ pub(crate) enum HelperClientError {
     AuthorityMismatch,
     #[error("helper capability negotiation does not satisfy the bounded request set")]
     CapabilityMismatch,
+    #[error("helper schema does not support the requested operation")]
+    SchemaMismatch,
     #[error("helper response ID does not match request")]
     ResponseIdMismatch,
     #[error("helper returned an unexpected response variant")]
