@@ -9,6 +9,7 @@ pub mod dns;
 pub mod interface;
 pub mod killswitch;
 pub mod network_stats;
+pub(crate) mod owned_dns;
 pub(crate) mod owned_firewall;
 pub mod process;
 pub mod route_table;

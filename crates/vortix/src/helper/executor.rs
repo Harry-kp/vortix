@@ -13,6 +13,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::child_evidence::{AttestedChildState, ChildEvidenceError, ChildEvidenceStore};
+use super::dns::{HelperDnsExecutor, RecoveredDnsState};
 use super::firewall::HelperFirewallExecutor;
 use super::material::{
     OpenVpnRuntimeStager, StagedOpenVpnRuntime, StagedWireGuardRuntime, TunnelMaterialSet,
@@ -70,6 +71,7 @@ pub(crate) struct ProductionHelperExecutor {
     observation: SystemObservationExecutor,
     layout: PlatformLayout,
     lease_id: LeaseId,
+    dns: HelperDnsExecutor,
     firewall: HelperFirewallExecutor,
     wireguard: BTreeMap<ResourceTag, StagedWireGuardRuntime>,
     openvpn: BTreeMap<ResourceTag, ActiveOpenVpnRuntime>,
@@ -96,6 +98,7 @@ impl ProductionHelperExecutor {
             observation: SystemObservationExecutor::new(layout, lease_id)?,
             layout,
             lease_id,
+            dns: HelperDnsExecutor::new(lease_id),
             firewall: HelperFirewallExecutor::new(lease_id),
             wireguard: BTreeMap::new(),
             openvpn: BTreeMap::new(),
@@ -819,19 +822,87 @@ impl NetworkPolicyExecutor for ProductionHelperExecutor {
         self.firewall.validate_recovered(firewalls, policy_enabled)
     }
 
+    fn validate_recovered_dns(
+        &mut self,
+        states: &[RecoveredDnsState],
+        policy_enabled: bool,
+    ) -> Result<(), PrivilegedExecutionError> {
+        self.dns.validate_recovered(states, policy_enabled)
+    }
+
     fn prepare_network_policy(
         &mut self,
         plan: &NetworkPolicyExecutionPlan,
     ) -> Result<PreparedNetworkPolicyExecutionPlan, NetworkPolicyPreparationError> {
-        self.firewall.prepare(plan)
+        match plan.operation() {
+            crate::vortix_core::privileged::NetworkPolicyOperation::ApplyDns { .. } => {
+                self.dns.prepare(plan)
+            }
+            crate::vortix_core::privileged::NetworkPolicyOperation::ObserveBarrier {
+                policy,
+                ..
+            } if policy.kind() == crate::vortix_core::privileged::ResourceKind::Dns => {
+                self.dns.prepare(plan)
+            }
+            crate::vortix_core::privileged::NetworkPolicyOperation::ReleaseObsolete {
+                policy,
+                resources,
+                ..
+            } if release_is_exact_dns_family(policy, resources) => self.dns.prepare(plan),
+            crate::vortix_core::privileged::NetworkPolicyOperation::ReleaseObsolete {
+                policy,
+                resources,
+                ..
+            } if release_requires_unimplemented_policy_adapter(policy, resources) => {
+                Err(NetworkPolicyPreparationError::InvalidPlan)
+            }
+            _ => self.firewall.prepare(plan),
+        }
     }
 
     fn execute_network_policy(
         &mut self,
         plan: &PreparedNetworkPolicyExecutionPlan,
     ) -> Result<NetworkPolicyOutcome, PrivilegedExecutionError> {
-        self.firewall.execute(plan)
+        match plan.execution().operation() {
+            crate::vortix_core::privileged::NetworkPolicyOperation::ApplyDns { .. } => {
+                self.dns.execute(plan)
+            }
+            crate::vortix_core::privileged::NetworkPolicyOperation::ObserveBarrier {
+                policy,
+                ..
+            } if policy.kind() == crate::vortix_core::privileged::ResourceKind::Dns => {
+                self.dns.execute(plan)
+            }
+            crate::vortix_core::privileged::NetworkPolicyOperation::ReleaseObsolete {
+                policy,
+                resources,
+                ..
+            } if release_is_exact_dns_family(policy, resources) => self.dns.execute(plan),
+            _ => self.firewall.execute(plan),
+        }
     }
+}
+
+fn release_is_exact_dns_family(policy: &ResourceTag, resources: &[ResourceTag]) -> bool {
+    policy.kind() == crate::vortix_core::privileged::ResourceKind::Dns
+        && !resources.is_empty()
+        && resources
+            .iter()
+            .all(|resource| resource.kind() == crate::vortix_core::privileged::ResourceKind::Dns)
+}
+
+fn release_requires_unimplemented_policy_adapter(
+    policy: &ResourceTag,
+    resources: &[ResourceTag],
+) -> bool {
+    let exact_firewall_family = policy.kind()
+        == crate::vortix_core::privileged::ResourceKind::Firewall
+        && !resources.is_empty()
+        && resources.iter().all(|resource| {
+            resource.kind() == crate::vortix_core::privileged::ResourceKind::Firewall
+        });
+    !exact_firewall_family && !release_is_exact_dns_family(policy, resources)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -951,8 +1022,8 @@ mod tests {
     use crate::vortix_core::profile::ProfileId;
 
     use super::{
-        helper_process_group_has_live_members, plan_cleanup_actions, CleanupAction,
-        HelperGroupSignal,
+        helper_process_group_has_live_members, plan_cleanup_actions, release_is_exact_dns_family,
+        release_requires_unimplemented_policy_adapter, CleanupAction, HelperGroupSignal,
     };
 
     fn tunnel(byte: char, generation: u64) -> ResourceTag {
@@ -1018,5 +1089,34 @@ mod tests {
         super::signal_helper_process_group(group, HelperGroupSignal::Kill).unwrap();
         child.wait().unwrap();
         assert!(!helper_process_group_has_live_members(group).unwrap());
+    }
+
+    #[test]
+    fn mixed_release_fails_closed_until_dns_release_is_exact() {
+        let firewall = ResourceTag::topology(
+            crate::vortix_core::control::AuthorityEpoch(3),
+            8,
+            ResourceKind::Firewall,
+        )
+        .unwrap();
+        let dns = ResourceTag::topology(
+            crate::vortix_core::control::AuthorityEpoch(3),
+            7,
+            ResourceKind::Dns,
+        )
+        .unwrap();
+
+        assert!(release_is_exact_dns_family(
+            &dns,
+            std::slice::from_ref(&dns)
+        ));
+        assert!(!release_requires_unimplemented_policy_adapter(
+            &dns,
+            std::slice::from_ref(&dns)
+        ));
+        assert!(release_requires_unimplemented_policy_adapter(
+            &firewall,
+            &[firewall.clone(), dns]
+        ));
     }
 }
