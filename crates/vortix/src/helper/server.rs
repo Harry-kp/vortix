@@ -19,13 +19,13 @@ use crate::helper::protocol::{
     HelperResponse, HelperResult, HelperSessionBinding,
 };
 use crate::vortix_core::privileged::{
-    AmbiguousPhase, ChildOwner, ChildSpawnAuthority, HelperEpoch, HelperLedgerFirewall,
-    HelperLedgerPolicy, HelperLedgerRecord, HelperLedgerResource, HelperResourceState,
-    NetworkPolicyOperation, ObservationState, ObservedChildIdentity, OperationAdmission,
-    OperationError, OperationGuard, OwnedChild, PhysicalFirewallStage, PolicyProjection,
-    PrivilegedOperation, ProtocolPlan, ReceiptError, ReceiptLedger, RejectionCode, ResourceKind,
-    ResourceObservation, ResourceObservationTarget, ResourceTag, RootAuthorityLedger,
-    VerifiedReceipt,
+    AmbiguousPhase, ChildOwner, ChildSpawnAuthority, HelperEpoch, HelperLedgerDns,
+    HelperLedgerFirewall, HelperLedgerPolicy, HelperLedgerRecord, HelperLedgerResource,
+    HelperResourceState, NetworkPolicyOperation, ObservationState, ObservedChildIdentity,
+    OperationAdmission, OperationError, OperationGuard, OwnedChild, PhysicalFirewallStage,
+    PolicyProjection, PrivilegedOperation, ProtocolPlan, ReceiptError, ReceiptLedger,
+    RejectionCode, ResourceKind, ResourceObservation, ResourceObservationTarget, ResourceTag,
+    RootAuthorityLedger, VerifiedReceipt,
 };
 
 const ENABLED_CAPABILITIES: [HelperCapability; 5] = [
@@ -323,6 +323,7 @@ pub(crate) struct EnrolledHelperSession<E, S> {
     resource_states: BTreeMap<ResourceTag, HelperResourceState>,
     policy_projections: BTreeMap<ResourceTag, PolicyRecoveryState>,
     physical_firewalls: BTreeMap<ResourceTag, HelperLedgerFirewall>,
+    physical_dns: BTreeMap<ResourceTag, HelperLedgerDns>,
     children: BTreeMap<ResourceTag, ChildEvidence>,
     last_receipt: Option<VerifiedReceipt>,
     enabled_capabilities: Vec<HelperCapability>,
@@ -374,6 +375,7 @@ where
             resource_states: BTreeMap::new(),
             policy_projections: BTreeMap::new(),
             physical_firewalls: BTreeMap::new(),
+            physical_dns: BTreeMap::new(),
             children: BTreeMap::new(),
             last_receipt: None,
             enabled_capabilities,
@@ -411,8 +413,14 @@ where
         enabled_capabilities: Vec<HelperCapability>,
     ) -> Result<Self, OperationError> {
         let principal = root.principal();
-        let (replay, resources, policy_projections, physical_firewalls, child_observations) =
-            ledger.into_parts();
+        let (
+            replay,
+            resources,
+            policy_projections,
+            physical_firewalls,
+            physical_dns,
+            child_observations,
+        ) = ledger.into_parts();
         let baseline = root.loaded_replay_baseline(&principal, replay)?;
         let recovered_firewall_states = physical_firewalls
             .iter()
@@ -479,6 +487,10 @@ where
         session.physical_firewalls = physical_firewalls
             .into_iter()
             .map(|firewall| (firewall.resource().clone(), firewall))
+            .collect();
+        session.physical_dns = physical_dns
+            .into_iter()
+            .map(|dns| (dns.resource().clone(), dns))
             .collect();
         session.children = child_observations
             .into_iter()
@@ -1586,11 +1598,13 @@ where
             .map(|child| child.1.identity().clone())
             .collect();
         let physical_firewalls = self.physical_firewalls.values().cloned().collect();
-        let Ok(ledger) = HelperLedgerRecord::new_with_physical_firewalls(
+        let physical_dns = self.physical_dns.values().cloned().collect();
+        let Ok(ledger) = HelperLedgerRecord::new_with_physical_ownership(
             checkpoint,
             resources,
             policy_projections,
             physical_firewalls,
+            physical_dns,
             child_observations,
         ) else {
             self.poisoned = true;
