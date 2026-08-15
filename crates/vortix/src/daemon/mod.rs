@@ -23,6 +23,7 @@ pub(crate) mod helper_client;
 pub mod passive;
 mod server;
 pub mod service;
+mod tunnel_executor;
 
 pub use server::DaemonServer;
 

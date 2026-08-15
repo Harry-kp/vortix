@@ -40,6 +40,8 @@ pub use protocol::{
     HelperSessionBinding, HELPER_PROTOCOL_MAX, HELPER_PROTOCOL_MIN, HELPER_SCHEMA_MAX,
     HELPER_SCHEMA_MIN, MAX_HELPER_FRAME_BYTES,
 };
+pub(crate) use runtime::HelperRuntimeIdentity;
+pub(crate) use server::process_group_for_tunnel;
 pub(crate) use transport::connect_verified_helper;
 pub use transport::{serve_staged_helper, HelperTransportError};
 pub use validate::{

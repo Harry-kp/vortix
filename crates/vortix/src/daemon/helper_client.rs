@@ -264,6 +264,16 @@ impl AuthenticatedHelperTransport {
         descriptors: &[RawFd],
         deadline: Instant,
     ) -> Result<VerifiedReceipt, HelperExecutionFailure> {
+        self.execute_bound(operation, descriptors, deadline)
+            .map(AuthenticatedHelperOutcome::into_receipt)
+    }
+
+    fn execute_bound(
+        &mut self,
+        operation: PrivilegedOperation,
+        descriptors: &[RawFd],
+        deadline: Instant,
+    ) -> Result<AuthenticatedHelperOutcome, HelperExecutionFailure> {
         if self.poisoned {
             return Err(HelperExecutionFailure::new(
                 RecoveryAction::ReconcileRequired,
@@ -360,7 +370,10 @@ impl AuthenticatedHelperTransport {
             Err(error) => return Err(self.fail_after_send(&delivery, error)),
         };
         self.next_id = self.next_id.checked_add(1).unwrap_or(0);
-        Ok(receipt)
+        Ok(AuthenticatedHelperOutcome {
+            request: delivery.into_request(),
+            receipt,
+        })
     }
 
     pub(crate) const fn reconnect_floor(&self) -> RequestSequence {
@@ -419,6 +432,37 @@ pub(crate) struct SharedAuthenticatedHelper {
     transport: Mutex<AuthenticatedHelperTransport>,
 }
 
+/// One helper result kept inseparable from the exact typed operation that the
+/// authenticated transport submitted. Receipt consumers use this capability
+/// instead of accepting a standalone receipt that could be paired with a
+/// different same-resource plan by ordinary daemon code.
+pub(super) struct AuthenticatedHelperOutcome {
+    request: PrivilegedRequest,
+    receipt: VerifiedReceipt,
+}
+
+impl AuthenticatedHelperOutcome {
+    pub(super) const fn operation(&self) -> &PrivilegedOperation {
+        self.request.operation()
+    }
+
+    pub(super) const fn receipt(&self) -> &VerifiedReceipt {
+        &self.receipt
+    }
+
+    #[cfg(test)]
+    pub(super) const fn from_verified_for_test(
+        request: PrivilegedRequest,
+        receipt: VerifiedReceipt,
+    ) -> Self {
+        Self { request, receipt }
+    }
+
+    fn into_receipt(self) -> VerifiedReceipt {
+        self.receipt
+    }
+}
+
 impl SharedAuthenticatedHelper {
     pub(crate) fn new(transport: AuthenticatedHelperTransport) -> Self {
         Self {
@@ -442,13 +486,23 @@ impl SharedAuthenticatedHelper {
         descriptors: &[RawFd],
         deadline: Instant,
     ) -> Result<VerifiedReceipt, HelperExecutionFailure> {
+        self.execute_bound(operation, descriptors, deadline)
+            .map(AuthenticatedHelperOutcome::into_receipt)
+    }
+
+    pub(super) fn execute_bound(
+        &self,
+        operation: PrivilegedOperation,
+        descriptors: &[RawFd],
+        deadline: Instant,
+    ) -> Result<AuthenticatedHelperOutcome, HelperExecutionFailure> {
         let mut transport = self.transport.lock().map_err(|_| {
             HelperExecutionFailure::new(
                 RecoveryAction::ReconcileRequired,
                 HelperClientError::SessionPoisoned,
             )
         })?;
-        transport.execute(operation, descriptors, deadline)
+        transport.execute_bound(operation, descriptors, deadline)
     }
 }
 
@@ -587,6 +641,10 @@ impl DeliveryState {
 
     pub(crate) const fn request(&self) -> &PrivilegedRequest {
         &self.request
+    }
+
+    fn into_request(self) -> PrivilegedRequest {
+        self.request
     }
 
     pub(crate) const fn transport_lost(&self) -> RecoveryAction {
