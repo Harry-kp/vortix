@@ -29,6 +29,7 @@ pub mod vortix_platform_windows;
 
 // Application modules
 pub mod app;
+pub(crate) mod authority_lock;
 pub mod background;
 pub mod cli;
 pub mod config;
