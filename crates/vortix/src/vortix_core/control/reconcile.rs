@@ -62,6 +62,8 @@ pub struct InFlightMutation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DisconnectTombstone {
     pub revision: TunnelRevision,
+    /// Exact resource generation whose teardown remains unconfirmed.
+    pub resource_revision: TunnelRevision,
     /// A failed or ambiguous teardown remains retry eligible while the
     /// tombstone continues to suppress scanner adoption.
     pub teardown_failed: bool,
@@ -91,6 +93,7 @@ pub enum ReconcileAction {
     Disconnect {
         profile_id: ProfileId,
         revision: TunnelRevision,
+        resource_revision: TunnelRevision,
     },
     CleanupStaleManaged {
         profile_id: ProfileId,
@@ -154,6 +157,7 @@ pub fn plan_reconciliation(input: &ReconcileInput) -> ReconcilePlan {
                 actions.push(ReconcileAction::Disconnect {
                     profile_id,
                     revision: target_revision,
+                    resource_revision: tombstone.resource_revision,
                 });
             }
             continue;
@@ -186,6 +190,9 @@ pub fn plan_reconciliation(input: &ReconcileInput) -> ReconcilePlan {
                     actions.push(ReconcileAction::Disconnect {
                         profile_id,
                         revision: target_revision,
+                        resource_revision: fact
+                            .revision
+                            .expect("exact managed observation has a revision"),
                     });
                 } else if !exact_managed {
                     if let Some(evidence) = fact.adoption.clone().filter(|evidence| {

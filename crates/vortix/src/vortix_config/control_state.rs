@@ -83,6 +83,7 @@ impl PersistedControlState {
             })
             || self.tombstones.values().any(|tombstone| {
                 !tombstone.policy_digest.is_valid()
+                    || tombstone.resource_generation == Some(0)
                     || tombstone.authority_epoch != self.desired.authority_epoch
                     || tombstone.operation_id.authority_epoch() != Some(tombstone.authority_epoch)
             })

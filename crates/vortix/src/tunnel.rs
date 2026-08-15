@@ -421,6 +421,7 @@ impl CanonicalTunnelExecutor {
             profile_id: profile_id.clone(),
             operation_id: operation_id.clone(),
             revision,
+            resource_revision: revision,
             mutation: crate::vortix_core::control::worker::TunnelMutation::Connect,
             protocol,
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
@@ -999,6 +1000,10 @@ mod canonical_tests {
             )
             .unwrap(),
             revision: TunnelRevision {
+                authority_epoch: AuthorityEpoch(1),
+                generation,
+            },
+            resource_revision: TunnelRevision {
                 authority_epoch: AuthorityEpoch(1),
                 generation,
             },
