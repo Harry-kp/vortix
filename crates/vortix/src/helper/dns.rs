@@ -194,31 +194,6 @@ impl HelperDnsExecutor {
                     plan.recovered_dns().to_vec(),
                 ))
             }
-            NetworkPolicyOperation::ReleaseObsolete {
-                policy, resources, ..
-            } if policy.kind() == crate::vortix_core::privileged::ResourceKind::Dns
-                && !resources.is_empty()
-                && resources.iter().all(|resource| {
-                    resource.kind() == crate::vortix_core::privileged::ResourceKind::Dns
-                })
-                && plan.obsolete_effective().len() == resources.len() =>
-            {
-                let intended = dns_policy(self.layout, self.lease_id, plan.intended())
-                    .map_err(|_| NetworkPolicyPreparationError::InvalidPlan)?;
-                self.audit_intended(plan, &intended)
-                    .map_err(|_| NetworkPolicyPreparationError::FailedBeforeEffect)?;
-                if plan.obsolete_effective().iter().any(|projection| {
-                    !resources.contains(projection.policy())
-                        || dns_policy(self.layout, self.lease_id, projection).is_err()
-                }) {
-                    return Err(NetworkPolicyPreparationError::InvalidPlan);
-                }
-                Ok(PreparedNetworkPolicyExecutionPlan::with_physical_ownership(
-                    plan.clone(),
-                    Vec::new(),
-                    plan.recovered_dns().to_vec(),
-                ))
-            }
             _ => Err(NetworkPolicyPreparationError::InvalidPlan),
         }
     }
@@ -353,42 +328,63 @@ impl HelperDnsExecutor {
                         .map_err(|_| PrivilegedExecutionError::InvalidPlan)?,
                 ]))
             }
-            NetworkPolicyOperation::ReleaseObsolete {
-                policy, resources, ..
-            } => {
-                let desired = dns_policy(self.layout, self.lease_id, plan.intended())?;
-                self.audit_intended(plan, &desired)?;
-                let mut observations =
-                    vec![
-                        ResourceObservation::new(policy.clone(), ObservationState::Present, 1)
-                            .map_err(|_| PrivilegedExecutionError::InvalidPlan)?,
-                    ];
-                observations.extend(resources.iter().cloned().map(|resource| {
-                    ResourceObservation::new(resource, ObservationState::Absent, 1)
-                        .expect("validated DNS resources produce observations")
-                }));
-                Ok(NetworkPolicyOutcome::Observed(observations))
-            }
             _ => Err(PrivilegedExecutionError::InvalidPlan),
         }
     }
 
-    fn audit_intended(
+    pub(crate) fn prepare_release(
         &mut self,
         plan: &NetworkPolicyExecutionPlan,
-        desired: &DnsPolicy,
+    ) -> Result<(), NetworkPolicyPreparationError> {
+        self.audit_release(plan).map_err(|error| match error {
+            PrivilegedExecutionError::InvalidPlan => NetworkPolicyPreparationError::InvalidPlan,
+            PrivilegedExecutionError::Overloaded
+            | PrivilegedExecutionError::FailedBeforeEffect
+            | PrivilegedExecutionError::EffectMayHaveApplied => {
+                NetworkPolicyPreparationError::FailedBeforeEffect
+            }
+        })
+    }
+
+    pub(crate) fn execute_release(
+        &mut self,
+        prepared: &PreparedNetworkPolicyExecutionPlan,
     ) -> Result<(), PrivilegedExecutionError> {
-        let Some(physical) = plan
+        self.audit_release(prepared.execution())
+    }
+
+    fn audit_release(
+        &mut self,
+        plan: &NetworkPolicyExecutionPlan,
+    ) -> Result<(), PrivilegedExecutionError> {
+        let (current, obsolete) = plan
+            .release_family(crate::vortix_core::privileged::ResourceKind::Dns)
+            .ok_or(PrivilegedExecutionError::InvalidPlan)?;
+        let retained = self.release_candidate(plan, current)?;
+        let obsolete = obsolete
+            .into_iter()
+            .map(|projection| self.release_candidate(plan, projection))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.platform
+            .audit_release_physical(&retained, &obsolete)
+            .map_err(map_execution_error)
+    }
+
+    fn release_candidate(
+        &self,
+        plan: &NetworkPolicyExecutionPlan,
+        projection: &PolicyProjection,
+    ) -> Result<OwnedDnsRecoveryCandidate, PrivilegedExecutionError> {
+        let policy = dns_policy(self.layout, self.lease_id, projection)?;
+        let physical = plan
             .recovered_dns()
             .iter()
-            .find(|physical| physical.resource() == plan.operation().policy_resource())
-        else {
-            return self.platform.audit(desired).map_err(map_execution_error);
-        };
-        let prepared = physical_preparation(self.layout, self.lease_id, physical)?;
-        self.platform
-            .audit_physical(desired, &prepared)
-            .map_err(map_execution_error)
+            .find(|physical| physical.resource() == projection.policy())
+            .map(|physical| physical_preparation(self.layout, self.lease_id, physical))
+            .transpose()?
+            .or_else(|| legacy_physical(self.platform.backend()))
+            .ok_or(PrivilegedExecutionError::InvalidPlan)?;
+        Ok(OwnedDnsRecoveryCandidate::new(policy, physical))
     }
 }
 
@@ -578,7 +574,10 @@ mod tests {
     use crate::vortix_core::control::AuthorityEpoch;
     use crate::vortix_core::ports::owned_dns::OwnedDnsBackend;
     use crate::vortix_core::privileged::DnsHostname;
-    use crate::vortix_core::privileged::{PrivilegedDnsAssignment, ResourceKind, ResourceTag};
+    use crate::vortix_core::privileged::{
+        NetworkPolicyOperation, PolicyPhase, PolicyPredecessor, PrivilegedDnsAssignment,
+        ResourceKind, ResourceTag,
+    };
     use crate::vortix_core::profile::ProfileId;
 
     #[derive(Default)]
@@ -586,6 +585,8 @@ mod tests {
         candidates: Vec<DnsPolicy>,
         allow_absent: bool,
         recovered: Option<(DnsPolicy, Option<DnsPolicy>)>,
+        audited: Vec<DnsPolicy>,
+        released: Vec<DnsPolicy>,
     }
 
     struct CaptureDns(Arc<Mutex<AuditCapture>>);
@@ -603,8 +604,9 @@ mod tests {
             unreachable!()
         }
 
-        fn audit(&mut self, _desired: &DnsPolicy) -> Result<(), OwnedDnsError> {
-            unreachable!()
+        fn audit(&mut self, desired: &DnsPolicy) -> Result<(), OwnedDnsError> {
+            self.0.lock().unwrap().audited.push(desired.clone());
+            Ok(())
         }
 
         fn audit_absent(&mut self) -> Result<(), OwnedDnsError> {
@@ -628,6 +630,19 @@ mod tests {
             let mut capture = self.0.lock().unwrap();
             capture.candidates = candidates.to_vec();
             capture.allow_absent = allow_absent;
+            Ok(())
+        }
+
+        fn audit_release_physical(
+            &mut self,
+            retained: &OwnedDnsRecoveryCandidate,
+            obsolete: &[OwnedDnsRecoveryCandidate],
+        ) -> Result<(), OwnedDnsError> {
+            self.0.lock().unwrap().released = std::iter::once(retained)
+                .chain(obsolete)
+                .map(OwnedDnsRecoveryCandidate::policy)
+                .cloned()
+                .collect();
             Ok(())
         }
     }
@@ -690,5 +705,99 @@ mod tests {
         assert_eq!(desired.generation, 8);
         assert_eq!(prior.as_ref().unwrap().generation, 7);
         assert!(capture.candidates.is_empty());
+    }
+
+    #[test]
+    fn release_rejects_missing_linux_physical_ownership_records() {
+        let capture = Arc::new(Mutex::new(AuditCapture::default()));
+        let mut subject = HelperDnsExecutor::with_platform(
+            LeaseId::new([7; 32]),
+            CaptureDns(Arc::clone(&capture)),
+        );
+        let current = projection(8, "9.9.9.9");
+        let obsolete = projection(7, "1.1.1.1");
+        let plan = NetworkPolicyExecutionPlan::release_for_test(
+            NetworkPolicyOperation::ReleaseObsolete {
+                policy: current.policy().clone(),
+                resources: vec![obsolete.policy().clone()],
+                predecessor: PolicyPredecessor::for_test(current.digest(), PolicyPhase::Firewall),
+            },
+            vec![current],
+            vec![obsolete],
+            Vec::new(),
+            Vec::new(),
+        );
+
+        assert_eq!(
+            subject.prepare_release(&plan),
+            Err(NetworkPolicyPreparationError::InvalidPlan)
+        );
+        assert!(capture.lock().unwrap().audited.is_empty());
+    }
+
+    #[test]
+    fn release_audits_retained_and_obsolete_physical_dns_records() {
+        let capture = Arc::new(Mutex::new(AuditCapture::default()));
+        let mut subject = HelperDnsExecutor::with_platform(
+            LeaseId::new([7; 32]),
+            CaptureDns(Arc::clone(&capture)),
+        );
+        let current = projection(8, "9.9.9.9");
+        let obsolete = projection(7, "1.1.1.1");
+        let physical = [&current, &obsolete]
+            .into_iter()
+            .enumerate()
+            .map(|(index, projection)| {
+                let PolicyProjection::Dns { assignments, .. } = projection else {
+                    unreachable!();
+                };
+                HelperLedgerDns::prepared(
+                    projection.policy().clone(),
+                    PhysicalDnsBackend::LinuxResolved,
+                    DnsTransactionId::new([u8::try_from(index + 1).unwrap(); 32]).unwrap(),
+                    projection.digest(),
+                    vec![crate::vortix_core::privileged::PhysicalDnsLink::new(
+                        assignments[0].tunnel().clone(),
+                        crate::vortix_core::privileged::PhysicalDnsPrior::Resolved {
+                            servers: Vec::new(),
+                            domains: Vec::new(),
+                            default_route: None,
+                        },
+                    )
+                    .unwrap()],
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let plan = NetworkPolicyExecutionPlan::release_for_test(
+            NetworkPolicyOperation::ReleaseObsolete {
+                policy: current.policy().clone(),
+                resources: vec![obsolete.policy().clone()],
+                predecessor: PolicyPredecessor::for_test(current.digest(), PolicyPhase::Firewall),
+            },
+            vec![current],
+            vec![obsolete],
+            Vec::new(),
+            physical,
+        );
+
+        subject.prepare_release(&plan).unwrap();
+        let prepared = PreparedNetworkPolicyExecutionPlan::with_physical_ownership(
+            plan,
+            Vec::new(),
+            Vec::new(),
+        );
+        subject.execute_release(&prepared).unwrap();
+
+        assert_eq!(
+            capture
+                .lock()
+                .unwrap()
+                .released
+                .iter()
+                .map(|policy| policy.generation)
+                .collect::<Vec<_>>(),
+            vec![8, 7]
+        );
     }
 }

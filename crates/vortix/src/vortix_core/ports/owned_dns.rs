@@ -208,4 +208,22 @@ pub(crate) trait OwnedDns: Send {
             .collect::<Vec<_>>();
         self.audit_recovery(&policies, allow_absent)
     }
+
+    /// Prove that the retained generation is effective and every obsolete
+    /// backend artifact is either subsumed by it or restored to its captured
+    /// prior state before logical ownership is released.
+    fn audit_release_physical(
+        &mut self,
+        retained: &OwnedDnsRecoveryCandidate,
+        obsolete: &[OwnedDnsRecoveryCandidate],
+    ) -> Result<(), OwnedDnsError> {
+        if std::iter::once(retained).chain(obsolete).any(|candidate| {
+            candidate.physical().backend() != PhysicalDnsBackend::MacOsResolverFiles
+                || !candidate.physical().links().is_empty()
+        }) {
+            return Err(OwnedDnsError::FailedBeforeEffect);
+        }
+        self.audit(retained.policy())
+            .map_err(|_| OwnedDnsError::FailedBeforeEffect)
+    }
 }

@@ -10,7 +10,7 @@
     reason = "U12 execution slice remains unreachable until U13 enrollment gates it"
 )]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::dns::RecoveredDnsState;
 use crate::helper::material::TunnelMaterialSet;
@@ -35,6 +35,18 @@ const ENABLED_CAPABILITIES: [HelperCapability; 5] = [
     HelperCapability::NetworkPolicy,
     HelperCapability::CleanupOwned,
 ];
+
+fn release_families(operation: &NetworkPolicyOperation) -> BTreeSet<ResourceKind> {
+    let NetworkPolicyOperation::ReleaseObsolete {
+        policy, resources, ..
+    } = operation
+    else {
+        return BTreeSet::new();
+    };
+    std::iter::once(policy.kind())
+        .chain(resources.iter().map(ResourceTag::kind))
+        .collect()
+}
 
 /// Typed platform seam for read-back. Implementations may inspect only the
 /// exact canonical resource identities supplied by the admitted request.
@@ -153,6 +165,8 @@ pub(crate) struct NetworkPolicyExecutionPlan {
     operation: NetworkPolicyOperation,
     intended: PolicyProjection,
     prior_effective: Option<PolicyProjection>,
+    release_families: BTreeSet<ResourceKind>,
+    retained_effective: Vec<PolicyProjection>,
     obsolete_effective: Vec<PolicyProjection>,
     recovered_firewalls: Vec<HelperLedgerFirewall>,
     recovered_dns: Vec<HelperLedgerDns>,
@@ -171,6 +185,50 @@ impl NetworkPolicyExecutionPlan {
         self.prior_effective.as_ref()
     }
 
+    pub(crate) fn retained_effective(&self, kind: ResourceKind) -> Option<&PolicyProjection> {
+        self.retained_effective
+            .iter()
+            .find(|projection| projection.policy().kind() == kind)
+    }
+
+    pub(crate) fn release_involves(&self, kind: ResourceKind) -> bool {
+        self.release_families.contains(&kind)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_effective_all(&self) -> &[PolicyProjection] {
+        &self.retained_effective
+    }
+
+    pub(crate) fn release_family(
+        &self,
+        kind: ResourceKind,
+    ) -> Option<(&PolicyProjection, Vec<&PolicyProjection>)> {
+        let NetworkPolicyOperation::ReleaseObsolete { resources, .. } = &self.operation else {
+            return None;
+        };
+        if !self.release_involves(kind) {
+            return None;
+        }
+        let current = self.retained_effective(kind)?;
+        let obsolete = self
+            .obsolete_effective
+            .iter()
+            .filter(|projection| projection.policy().kind() == kind)
+            .collect::<Vec<_>>();
+        let family_resources = resources
+            .iter()
+            .filter(|resource| resource.kind() == kind)
+            .collect::<Vec<_>>();
+        (obsolete.len() == family_resources.len()
+            && family_resources.iter().all(|resource| {
+                obsolete
+                    .iter()
+                    .any(|projection| projection.policy() == *resource)
+            }))
+        .then_some((current, obsolete))
+    }
+
     pub(crate) fn obsolete_effective(&self) -> &[PolicyProjection] {
         &self.obsolete_effective
     }
@@ -181,6 +239,32 @@ impl NetworkPolicyExecutionPlan {
 
     pub(crate) fn recovered_dns(&self) -> &[HelperLedgerDns] {
         &self.recovered_dns
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release_for_test(
+        operation: NetworkPolicyOperation,
+        retained_effective: Vec<PolicyProjection>,
+        obsolete_effective: Vec<PolicyProjection>,
+        recovered_firewalls: Vec<HelperLedgerFirewall>,
+        recovered_dns: Vec<HelperLedgerDns>,
+    ) -> Self {
+        let release_families = release_families(&operation);
+        let intended = retained_effective
+            .iter()
+            .find(|projection| projection.policy() == operation.policy_resource())
+            .expect("release test operation policy must be retained")
+            .clone();
+        Self {
+            operation,
+            intended,
+            prior_effective: None,
+            release_families,
+            retained_effective,
+            obsolete_effective,
+            recovered_firewalls,
+            recovered_dns,
+        }
     }
 }
 
@@ -1414,18 +1498,78 @@ where
             _ => Vec::new(),
         };
 
-        let recovered_firewalls =
-            self.recovered_firewalls_for(operation, policy, prior_effective.as_ref())?;
-        let recovered_dns = self.recovered_dns_for(operation, policy, prior_effective.as_ref());
+        let (release_families, retained_effective) =
+            self.retained_effective_for_release(operation, policy);
+
+        let recovered_firewalls = self.recovered_firewalls_for(
+            operation,
+            policy,
+            prior_effective.as_ref(),
+            &retained_effective,
+        )?;
+        let recovered_dns = self.recovered_dns_for(
+            operation,
+            policy,
+            prior_effective.as_ref(),
+            &retained_effective,
+        )?;
 
         Some(NetworkPolicyExecutionPlan {
             operation: operation.clone(),
             intended: intended.clone(),
             prior_effective,
+            release_families,
+            retained_effective,
             obsolete_effective,
             recovered_firewalls,
             recovered_dns,
         })
+    }
+
+    fn retained_effective_for_release(
+        &self,
+        operation: &NetworkPolicyOperation,
+        policy: &ResourceTag,
+    ) -> (BTreeSet<ResourceKind>, Vec<PolicyProjection>) {
+        let families = release_families(operation);
+        let NetworkPolicyOperation::ReleaseObsolete { resources, .. } = operation else {
+            return (families, Vec::new());
+        };
+        let obsolete_resources = resources.iter().cloned().collect::<BTreeSet<_>>();
+        let mut latest = BTreeMap::<ResourceKind, (&ResourceTag, &PolicyProjection)>::new();
+        for (resource, state) in &self.policy_projections {
+            let kind = resource.kind();
+            let Some(effective) = state.effective.as_ref() else {
+                continue;
+            };
+            if !families.contains(&kind)
+                || resource.authority_epoch() != policy.authority_epoch()
+                || resource.generation() > policy.generation()
+                || obsolete_resources.contains(resource)
+                || self.resource_states.get(resource) != Some(&HelperResourceState::Owned)
+            {
+                continue;
+            }
+            if latest
+                .get(&kind)
+                .is_none_or(|(current, _)| resource.generation() > current.generation())
+            {
+                latest.insert(kind, (resource, effective));
+            }
+        }
+        let retained = [
+            ResourceKind::Firewall,
+            ResourceKind::Routes,
+            ResourceKind::Dns,
+        ]
+        .into_iter()
+        .filter_map(|kind| {
+            latest
+                .get(&kind)
+                .map(|(_, projection)| (*projection).clone())
+        })
+        .collect();
+        (families, retained)
     }
 
     fn recovered_firewalls_for(
@@ -1433,6 +1577,7 @@ where
         operation: &NetworkPolicyOperation,
         policy: &ResourceTag,
         prior_effective: Option<&PolicyProjection>,
+        retained_effective: &[PolicyProjection],
     ) -> Option<Vec<HelperLedgerFirewall>> {
         Some(match operation {
             NetworkPolicyOperation::EstablishBlocking { .. }
@@ -1461,12 +1606,21 @@ where
                     .filter(|resource| resource.kind() == ResourceKind::Firewall)
                     .map(|resource| self.physical_firewalls.get(resource).cloned())
                     .collect::<Option<Vec<_>>>()?;
-                if policy.kind() == ResourceKind::Firewall
-                    && !firewalls
-                        .iter()
-                        .any(|physical| physical.resource() == policy)
+                let retained = retained_effective
+                    .iter()
+                    .find(|projection| projection.policy().kind() == ResourceKind::Firewall);
+                if resources
+                    .iter()
+                    .any(|resource| resource.kind() == ResourceKind::Firewall)
+                    || policy.kind() == ResourceKind::Firewall
                 {
-                    firewalls.push(self.physical_firewalls.get(policy)?.clone());
+                    let retained = retained?;
+                    if !firewalls
+                        .iter()
+                        .any(|physical| physical.resource() == retained.policy())
+                    {
+                        firewalls.push(self.physical_firewalls.get(retained.policy())?.clone());
+                    }
                 }
                 firewalls
             }
@@ -1481,8 +1635,9 @@ where
         operation: &NetworkPolicyOperation,
         policy: &ResourceTag,
         prior_effective: Option<&PolicyProjection>,
-    ) -> Vec<HelperLedgerDns> {
-        match operation {
+        retained_effective: &[PolicyProjection],
+    ) -> Option<Vec<HelperLedgerDns>> {
+        Some(match operation {
             NetworkPolicyOperation::ApplyDns { .. } => {
                 let mut resources = Vec::new();
                 if let Some(current) = self.physical_dns.get(policy) {
@@ -1508,10 +1663,21 @@ where
                     .filter(|resource| resource.kind() == ResourceKind::Dns)
                     .filter_map(|resource| self.physical_dns.get(resource).cloned())
                     .collect::<Vec<_>>();
-                if policy.kind() == ResourceKind::Dns
-                    && !dns.iter().any(|physical| physical.resource() == policy)
+                let retained = retained_effective
+                    .iter()
+                    .find(|projection| projection.policy().kind() == ResourceKind::Dns);
+                if resources
+                    .iter()
+                    .any(|resource| resource.kind() == ResourceKind::Dns)
+                    || policy.kind() == ResourceKind::Dns
                 {
-                    dns.extend(self.physical_dns.get(policy).cloned());
+                    let retained = retained?;
+                    if !dns
+                        .iter()
+                        .any(|physical| physical.resource() == retained.policy())
+                    {
+                        dns.extend(self.physical_dns.get(retained.policy()).cloned());
+                    }
                 }
                 dns
             }
@@ -1519,7 +1685,7 @@ where
             | NetworkPolicyOperation::ApplyRoutes { .. }
             | NetworkPolicyOperation::ApplyFirewall { .. }
             | NetworkPolicyOperation::ObserveBarrier { .. } => Vec::new(),
-        }
+        })
     }
 
     fn accept_prepared_network_policy(
@@ -1573,9 +1739,15 @@ where
                     .ok_or(HelperError::LedgerUnavailable)?;
                 self.physical_dns.insert(policy.clone(), physical);
             }
-            NetworkPolicyOperation::ReleaseObsolete {
-                policy, resources, ..
-            } => {
+            NetworkPolicyOperation::ReleaseObsolete { resources, .. } => {
+                let retained_firewall = prepared
+                    .execution()
+                    .retained_effective(ResourceKind::Firewall)
+                    .map(PolicyProjection::policy);
+                let retained_dns = prepared
+                    .execution()
+                    .retained_effective(ResourceKind::Dns)
+                    .map(PolicyProjection::policy);
                 for physical in prepared.prepared_firewalls() {
                     if resources.contains(physical.resource()) {
                         if !matches!(
@@ -1588,13 +1760,13 @@ where
                         }
                         self.physical_firewalls
                             .insert(physical.resource().clone(), physical.clone());
-                    } else if physical.resource() != policy
+                    } else if Some(physical.resource()) != retained_firewall
                         || !matches!(
                             physical.stage(),
                             PhysicalFirewallStage::ObservedOwned
                                 | PhysicalFirewallStage::ObservedAbsent
                         )
-                        || self.physical_firewalls.get(policy) != Some(physical)
+                        || self.physical_firewalls.get(physical.resource()) != Some(physical)
                     {
                         return Err(HelperError::LedgerUnavailable);
                     }
@@ -1611,12 +1783,12 @@ where
                         }
                         self.physical_dns
                             .insert(physical.resource().clone(), physical.clone());
-                    } else if physical.resource() != policy
+                    } else if Some(physical.resource()) != retained_dns
                         || !matches!(
                             physical.stage(),
                             PhysicalDnsStage::ObservedOwned | PhysicalDnsStage::ObservedAbsent
                         )
-                        || self.physical_dns.get(policy) != Some(physical)
+                        || self.physical_dns.get(physical.resource()) != Some(physical)
                     {
                         return Err(HelperError::LedgerUnavailable);
                     }
@@ -4293,7 +4465,7 @@ mod tests {
     fn release_execution_plan_carries_every_obsolete_effective_projection() {
         let mut harness = LifecycleHarness::for_policy(FakeExecutor::default());
         let (firewall_1, routes_1, dns_1) = install_policy_generation(&mut harness, 1, 1);
-        let (firewall_2, _, _) = install_policy_generation(&mut harness, 2, 9);
+        let (firewall_2, routes_2, dns_2) = install_policy_generation(&mut harness, 2, 9);
 
         let obsolete = vec![firewall_1.clone(), routes_1.clone(), dns_1.clone()];
         let release = harness.request(
@@ -4320,6 +4492,17 @@ mod tests {
                 .collect::<Vec<_>>(),
             obsolete.iter().collect::<Vec<_>>()
         );
+        assert_eq!(
+            plan.retained_effective_all()
+                .iter()
+                .map(PolicyProjection::policy)
+                .collect::<Vec<_>>(),
+            vec![&firewall_2, &routes_2, &dns_2]
+        );
+        assert!(plan.release_involves(ResourceKind::Firewall));
+        assert!(plan.release_involves(ResourceKind::Routes));
+        assert!(plan.release_involves(ResourceKind::Dns));
+        assert!(!plan.release_involves(ResourceKind::Tunnel));
         assert_eq!(plan.recovered_firewalls().len(), 2);
         assert_eq!(plan.recovered_firewalls()[0].resource(), &firewall_1);
         assert_eq!(

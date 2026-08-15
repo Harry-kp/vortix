@@ -95,7 +95,7 @@ impl HelperRouteExecutor {
     }
 
     pub(crate) fn prepare(
-        &self,
+        &mut self,
         plan: &NetworkPolicyExecutionPlan,
     ) -> Result<PreparedNetworkPolicyExecutionPlan, NetworkPolicyPreparationError> {
         match plan.operation() {
@@ -150,6 +150,105 @@ impl HelperRouteExecutor {
         }
     }
 
+    pub(crate) fn prepare_release(
+        &mut self,
+        plan: &NetworkPolicyExecutionPlan,
+    ) -> Result<(), NetworkPolicyPreparationError> {
+        self.verify_release(plan).map_err(|error| match error {
+            PrivilegedExecutionError::InvalidPlan => NetworkPolicyPreparationError::InvalidPlan,
+            PrivilegedExecutionError::Overloaded
+            | PrivilegedExecutionError::FailedBeforeEffect
+            | PrivilegedExecutionError::EffectMayHaveApplied => {
+                NetworkPolicyPreparationError::FailedBeforeEffect
+            }
+        })
+    }
+
+    pub(crate) fn execute_release(
+        &mut self,
+        prepared: &PreparedNetworkPolicyExecutionPlan,
+    ) -> Result<(), PrivilegedExecutionError> {
+        self.verify_release(prepared.execution())
+    }
+
+    fn verify_release(
+        &mut self,
+        plan: &NetworkPolicyExecutionPlan,
+    ) -> Result<(), PrivilegedExecutionError> {
+        let (current, obsolete) = plan
+            .release_family(crate::vortix_core::privileged::ResourceKind::Routes)
+            .ok_or(PrivilegedExecutionError::InvalidPlan)?;
+        let current_claims = self.route_probes(current)?;
+        let current_probes = probe_map(&current_claims)?;
+        let deadline = Instant::now() + ROUTE_AUDIT_BUDGET;
+        for (target, expected) in &current_probes {
+            let interface = self.observe_route(*target, deadline)?;
+            if interface != *expected {
+                return Err(PrivilegedExecutionError::FailedBeforeEffect);
+            }
+        }
+        let mut exact_observations = Vec::<(Cidr, Vec<String>)>::new();
+        for projection in obsolete {
+            for old in self.route_probes(projection)? {
+                if current_claims.iter().any(|current| {
+                    current.destination == old.destination && current.interface == old.interface
+                }) {
+                    continue;
+                }
+                let interfaces = if let Some((_, interfaces)) = exact_observations
+                    .iter()
+                    .find(|(destination, _)| *destination == old.destination)
+                {
+                    interfaces.clone()
+                } else {
+                    let interfaces = self.observe_exact_route(old.destination, deadline)?;
+                    exact_observations.push((old.destination, interfaces.clone()));
+                    interfaces
+                };
+                if interfaces.contains(&old.interface) {
+                    return Err(PrivilegedExecutionError::FailedBeforeEffect);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn observe_route(
+        &mut self,
+        target: IpAddr,
+        deadline: Instant,
+    ) -> Result<String, PrivilegedExecutionError> {
+        if Instant::now() >= deadline {
+            return Err(PrivilegedExecutionError::FailedBeforeEffect);
+        }
+        let observed = self
+            .platform
+            .route_interface_for(target)
+            .map_err(|_| PrivilegedExecutionError::FailedBeforeEffect)?;
+        if Instant::now() >= deadline {
+            return Err(PrivilegedExecutionError::FailedBeforeEffect);
+        }
+        Ok(observed)
+    }
+
+    fn observe_exact_route(
+        &mut self,
+        destination: Cidr,
+        deadline: Instant,
+    ) -> Result<Vec<String>, PrivilegedExecutionError> {
+        if Instant::now() >= deadline {
+            return Err(PrivilegedExecutionError::FailedBeforeEffect);
+        }
+        let observed = self
+            .platform
+            .exact_route_interfaces(destination)
+            .map_err(|_| PrivilegedExecutionError::FailedBeforeEffect)?;
+        if Instant::now() >= deadline {
+            return Err(PrivilegedExecutionError::FailedBeforeEffect);
+        }
+        Ok(observed)
+    }
+
     fn classify(
         &mut self,
         projection: &PolicyProjection,
@@ -184,6 +283,13 @@ impl HelperRouteExecutor {
         &self,
         projection: &PolicyProjection,
     ) -> Result<BTreeMap<IpAddr, String>, PrivilegedExecutionError> {
+        probe_map(&self.route_probes(projection)?)
+    }
+
+    fn route_probes(
+        &self,
+        projection: &PolicyProjection,
+    ) -> Result<Vec<RouteProbe>, PrivilegedExecutionError> {
         let (routes, tunnels) = projection
             .route_inputs()
             .ok_or(PrivilegedExecutionError::InvalidPlan)?;
@@ -192,7 +298,7 @@ impl HelperRouteExecutor {
             .flat_map(PrivilegedFirewallTunnel::endpoint_ips)
             .copied()
             .collect::<Vec<_>>();
-        let mut probes = BTreeMap::new();
+        let mut probes = Vec::with_capacity(routes.len());
         for route in routes {
             if !tunnels
                 .iter()
@@ -203,15 +309,33 @@ impl HelperRouteExecutor {
             let target = probe_address(route, &transport_endpoints)?;
             let interface = authority_interface_name(self.layout, self.lease_id, route.tunnel())
                 .map_err(|()| PrivilegedExecutionError::InvalidPlan)?;
-            if probes
-                .insert(target, interface.clone())
-                .is_some_and(|prior| prior != interface)
-            {
-                return Err(PrivilegedExecutionError::InvalidPlan);
-            }
+            probes.push(RouteProbe {
+                destination: route.destination(),
+                target,
+                interface,
+            });
         }
         Ok(probes)
     }
+}
+
+struct RouteProbe {
+    destination: Cidr,
+    target: IpAddr,
+    interface: String,
+}
+
+fn probe_map(probes: &[RouteProbe]) -> Result<BTreeMap<IpAddr, String>, PrivilegedExecutionError> {
+    let mut mapped = BTreeMap::new();
+    for probe in probes {
+        if mapped
+            .insert(probe.target, probe.interface.clone())
+            .is_some_and(|prior| prior != probe.interface)
+        {
+            return Err(PrivilegedExecutionError::InvalidPlan);
+        }
+    }
+    Ok(mapped)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -291,20 +415,52 @@ mod tests {
     use super::*;
     use crate::vortix_core::control::AuthorityEpoch;
     use crate::vortix_core::ports::owned_routes::OwnedRouteError;
-    use crate::vortix_core::privileged::{PrivilegedFirewallRole, ResourceKind, ResourceTag};
+    use crate::vortix_core::privileged::{
+        NetworkPolicyOperation, PolicyPhase, PolicyPredecessor, PrivilegedFirewallRole,
+        ResourceKind, ResourceTag,
+    };
     use crate::vortix_core::profile::ProfileId;
 
     #[derive(Clone)]
-    struct FakeRoutes(Arc<Mutex<BTreeMap<IpAddr, String>>>);
+    struct FakeRoutes {
+        decisions: Arc<Mutex<BTreeMap<IpAddr, String>>>,
+        exact: Vec<(Cidr, Vec<String>)>,
+    }
+
+    impl FakeRoutes {
+        fn new(decisions: Arc<Mutex<BTreeMap<IpAddr, String>>>) -> Self {
+            Self {
+                decisions,
+                exact: Vec::new(),
+            }
+        }
+
+        fn with_exact(mut self, destination: Cidr, interfaces: Vec<String>) -> Self {
+            self.exact.push((destination, interfaces));
+            self
+        }
+    }
 
     impl OwnedRoutes for FakeRoutes {
         fn route_interface_for(&mut self, target: IpAddr) -> Result<String, OwnedRouteError> {
-            self.0
+            self.decisions
                 .lock()
                 .unwrap()
                 .get(&target)
                 .cloned()
                 .ok_or(OwnedRouteError::Unknown)
+        }
+
+        fn exact_route_interfaces(
+            &mut self,
+            destination: Cidr,
+        ) -> Result<Vec<String>, OwnedRouteError> {
+            Ok(self
+                .exact
+                .iter()
+                .find(|(candidate, _)| *candidate == destination)
+                .map(|(_, interfaces)| interfaces.clone())
+                .unwrap_or_default())
         }
     }
 
@@ -349,6 +505,106 @@ mod tests {
         )
     }
 
+    fn with_policy_generation(projection: PolicyProjection, generation: u64) -> PolicyProjection {
+        let PolicyProjection::Routes {
+            routes, tunnels, ..
+        } = projection
+        else {
+            unreachable!();
+        };
+        PolicyProjection::Routes {
+            policy: ResourceTag::topology(AuthorityEpoch(3), generation, ResourceKind::Routes)
+                .unwrap(),
+            routes,
+            tunnels,
+        }
+    }
+
+    fn with_transport_endpoints(
+        projection: PolicyProjection,
+        endpoints: &[IpAddr],
+    ) -> PolicyProjection {
+        let PolicyProjection::Routes {
+            policy,
+            routes,
+            tunnels,
+        } = projection
+        else {
+            unreachable!();
+        };
+        let tunnels = tunnels
+            .into_iter()
+            .map(|tunnel| {
+                PrivilegedFirewallTunnel::new(
+                    tunnel.tunnel().clone(),
+                    endpoints.to_vec(),
+                    tunnel.declared_cidrs().to_vec(),
+                    tunnel.role(),
+                )
+                .unwrap()
+            })
+            .collect();
+        PolicyProjection::Routes {
+            policy,
+            routes,
+            tunnels,
+        }
+    }
+
+    fn with_tunnel_profile(projection: PolicyProjection, profile_seed: usize) -> PolicyProjection {
+        let PolicyProjection::Routes {
+            policy,
+            routes,
+            tunnels,
+        } = projection
+        else {
+            unreachable!();
+        };
+        assert_eq!(routes.len(), 1);
+        assert_eq!(tunnels.len(), 1);
+        let tunnel = ResourceTag::tunnel(
+            ProfileId::parse(format!("{profile_seed:064x}")).unwrap(),
+            routes[0].tunnel().generation(),
+        )
+        .unwrap();
+        let routes = vec![ScopedRoute::new(routes[0].destination(), tunnel.clone()).unwrap()];
+        let subject = &tunnels[0];
+        let tunnels = vec![PrivilegedFirewallTunnel::new(
+            tunnel,
+            subject.endpoint_ips().to_vec(),
+            subject.declared_cidrs().to_vec(),
+            subject.role(),
+        )
+        .unwrap()];
+        PolicyProjection::Routes {
+            policy,
+            routes,
+            tunnels,
+        }
+    }
+
+    fn release_plan(
+        current: PolicyProjection,
+        obsolete: Vec<PolicyProjection>,
+    ) -> NetworkPolicyExecutionPlan {
+        let resources = obsolete
+            .iter()
+            .map(PolicyProjection::policy)
+            .cloned()
+            .collect();
+        NetworkPolicyExecutionPlan::release_for_test(
+            NetworkPolicyOperation::ReleaseObsolete {
+                policy: current.policy().clone(),
+                resources,
+                predecessor: PolicyPredecessor::for_test(current.digest(), PolicyPhase::Firewall),
+            },
+            vec![current],
+            obsolete,
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
     #[test]
     fn default_probe_avoids_the_authenticated_transport_endpoint() {
         let lease = LeaseId::new([7; 32]);
@@ -358,7 +614,7 @@ mod tests {
             Some(&"8.8.8.8".parse().unwrap())
         );
 
-        let platform = FakeRoutes(Arc::new(Mutex::new(observations)));
+        let platform = FakeRoutes::new(Arc::new(Mutex::new(observations)));
         let mut routes = HelperRouteExecutor::with_platform(PlatformLayout::Linux, lease, platform);
         assert_eq!(
             routes.classify(&projection).unwrap(),
@@ -393,7 +649,7 @@ mod tests {
         let probes = HelperRouteExecutor::with_platform(
             PlatformLayout::Linux,
             lease,
-            FakeRoutes(Arc::new(Mutex::new(BTreeMap::new()))),
+            FakeRoutes::new(Arc::new(Mutex::new(BTreeMap::new()))),
         )
         .probes(&projection)
         .unwrap();
@@ -413,7 +669,7 @@ mod tests {
         for interface in observations.values_mut() {
             *interface = "eth0".into();
         }
-        let platform = FakeRoutes(Arc::new(Mutex::new(observations)));
+        let platform = FakeRoutes::new(Arc::new(Mutex::new(observations)));
         let mut routes = HelperRouteExecutor::with_platform(PlatformLayout::Linux, lease, platform);
         assert_eq!(
             routes.classify(&projection).unwrap(),
@@ -432,7 +688,7 @@ mod tests {
             ],
         );
         *observations.values_mut().next().unwrap() = "eth0".into();
-        let platform = FakeRoutes(Arc::new(Mutex::new(observations)));
+        let platform = FakeRoutes::new(Arc::new(Mutex::new(observations)));
         let mut routes = HelperRouteExecutor::with_platform(PlatformLayout::Linux, lease, platform);
         assert_eq!(
             routes.classify(&projection),
@@ -453,7 +709,7 @@ mod tests {
         let mut routes = HelperRouteExecutor::with_platform(
             PlatformLayout::Linux,
             lease,
-            FakeRoutes(Arc::clone(&shared)),
+            FakeRoutes::new(Arc::clone(&shared)),
         );
         routes
             .validate_recovered(std::slice::from_ref(&state), true)
@@ -469,6 +725,146 @@ mod tests {
         assert_eq!(
             routes.validate_recovered(&[state], false),
             Err(PrivilegedExecutionError::InvalidPlan)
+        );
+    }
+
+    #[test]
+    fn release_accepts_an_obsolete_route_only_when_current_truth_supersedes_it() {
+        let lease = LeaseId::new([12; 32]);
+        let (base, observations) = projection(lease, &[("10.0.0.0/8", "198.51.100.7", &[])]);
+        let obsolete = with_policy_generation(base.clone(), 1);
+        let current = with_policy_generation(base, 2);
+        let plan = release_plan(current, vec![obsolete]);
+        let mut routes = HelperRouteExecutor::with_platform(
+            PlatformLayout::Linux,
+            lease,
+            FakeRoutes::new(Arc::new(Mutex::new(observations))),
+        );
+
+        routes.prepare_release(&plan).unwrap();
+        let prepared = PreparedNetworkPolicyExecutionPlan::with_physical_ownership(
+            plan,
+            Vec::new(),
+            Vec::new(),
+        );
+        routes.execute_release(&prepared).unwrap();
+    }
+
+    #[test]
+    fn semantic_route_supersession_does_not_depend_on_the_probe_address() {
+        let lease = LeaseId::new([14; 32]);
+        let (base, _) = projection(lease, &[("0.0.0.0/0", "1.1.1.1", &[])]);
+        let obsolete = with_policy_generation(base.clone(), 1);
+        let current = with_transport_endpoints(
+            with_policy_generation(base, 2),
+            &["1.1.1.1".parse().unwrap(), "8.8.8.8".parse().unwrap()],
+        );
+        let probe_builder = HelperRouteExecutor::with_platform(
+            PlatformLayout::Linux,
+            lease,
+            FakeRoutes::new(Arc::new(Mutex::new(BTreeMap::new()))),
+        );
+        let mut observations = probe_builder.probes(&obsolete).unwrap();
+        observations.extend(probe_builder.probes(&current).unwrap());
+        assert_eq!(observations.len(), 2);
+        let plan = release_plan(current, vec![obsolete]);
+        let mut routes = HelperRouteExecutor::with_platform(
+            PlatformLayout::Linux,
+            lease,
+            FakeRoutes::new(Arc::new(Mutex::new(observations))),
+        );
+
+        routes.prepare_release(&plan).unwrap();
+    }
+
+    #[test]
+    fn release_rejects_an_obsolete_route_that_still_selects_its_old_interface() {
+        let lease = LeaseId::new([13; 32]);
+        let (current, mut observations) = projection(lease, &[("10.0.0.0/8", "198.51.100.7", &[])]);
+        let (obsolete, obsolete_observations) =
+            projection(lease, &[("192.168.0.0/16", "198.51.100.7", &[])]);
+        let obsolete_interface = obsolete_observations.values().next().unwrap().clone();
+        observations.extend(obsolete_observations);
+        let plan = release_plan(
+            with_policy_generation(current, 2),
+            vec![with_policy_generation(obsolete, 1)],
+        );
+        let mut routes = HelperRouteExecutor::with_platform(
+            PlatformLayout::Linux,
+            lease,
+            FakeRoutes::new(Arc::new(Mutex::new(observations)))
+                .with_exact("192.168.0.0/16".parse().unwrap(), vec![obsolete_interface]),
+        );
+
+        assert_eq!(
+            routes.prepare_release(&plan),
+            Err(NetworkPolicyPreparationError::FailedBeforeEffect)
+        );
+        let prepared = PreparedNetworkPolicyExecutionPlan::with_physical_ownership(
+            plan,
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(
+            routes.execute_release(&prepared),
+            Err(PrivilegedExecutionError::FailedBeforeEffect)
+        );
+    }
+
+    #[test]
+    fn release_accepts_removed_narrower_route_covered_by_retained_broader_route() {
+        let lease = LeaseId::new([15; 32]);
+        let (current, observations) = projection(lease, &[("10.0.0.0/8", "198.51.100.7", &[])]);
+        let (obsolete, _) = projection(lease, &[("10.0.0.0/9", "198.51.100.7", &[])]);
+        let plan = release_plan(
+            with_policy_generation(current, 2),
+            vec![with_policy_generation(obsolete, 1)],
+        );
+        let mut routes = HelperRouteExecutor::with_platform(
+            PlatformLayout::Linux,
+            lease,
+            FakeRoutes::new(Arc::new(Mutex::new(observations))),
+        );
+
+        routes.prepare_release(&plan).unwrap();
+    }
+
+    #[test]
+    fn release_rejects_hidden_obsolete_broader_route_from_another_tunnel() {
+        let lease = LeaseId::new([16; 32]);
+        let (current, _) = projection(lease, &[("10.0.0.0/9", "198.51.100.7", &[])]);
+        let current = with_tunnel_profile(with_policy_generation(current, 2), 1);
+        let current_builder = HelperRouteExecutor::with_platform(
+            PlatformLayout::Linux,
+            lease,
+            FakeRoutes::new(Arc::new(Mutex::new(BTreeMap::new()))),
+        );
+        let current_observations = current_builder.probes(&current).unwrap();
+        let (obsolete, _) = projection(lease, &[("10.0.0.0/8", "198.51.100.8", &[])]);
+        let obsolete = with_tunnel_profile(with_policy_generation(obsolete, 1), 2);
+        let obsolete_builder = HelperRouteExecutor::with_platform(
+            PlatformLayout::Linux,
+            lease,
+            FakeRoutes::new(Arc::new(Mutex::new(BTreeMap::new()))),
+        );
+        let obsolete_interface = obsolete_builder
+            .route_probes(&obsolete)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .interface;
+        let plan = release_plan(current, vec![obsolete]);
+        let mut routes = HelperRouteExecutor::with_platform(
+            PlatformLayout::Linux,
+            lease,
+            FakeRoutes::new(Arc::new(Mutex::new(current_observations)))
+                .with_exact("10.0.0.0/8".parse().unwrap(), vec![obsolete_interface]),
+        );
+
+        assert_eq!(
+            routes.prepare_release(&plan),
+            Err(NetworkPolicyPreparationError::FailedBeforeEffect)
         );
     }
 }

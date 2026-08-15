@@ -641,6 +641,17 @@ pub struct PolicyPredecessor {
     observed: bool,
 }
 
+impl PolicyPredecessor {
+    #[cfg(test)]
+    pub(crate) const fn for_test(digest: PolicyDigest, phase: PolicyPhase) -> Self {
+        Self {
+            digest,
+            phase,
+            observed: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PolicyCursor {
@@ -971,7 +982,8 @@ impl NetworkPolicyOperation {
                 policy, resources, ..
             } => {
                 bounded(resources)?;
-                if has_duplicates(resources)
+                if resources.is_empty()
+                    || has_duplicates(resources)
                     || resources.iter().any(|resource| {
                         !matches!(
                             resource.kind(),
@@ -2772,6 +2784,20 @@ mod tests {
         guard
             .confirm_observation(&observe, &observed, &root)
             .unwrap();
+        assert_eq!(
+            PrivilegedRequest::new(
+                &principal,
+                helper,
+                RequestSequence::new(3).unwrap(),
+                PrivilegedOperation::NetworkPolicy(NetworkPolicyOperation::ReleaseObsolete {
+                    policy: current.clone(),
+                    resources: Vec::new(),
+                    predecessor: guard.policy_predecessor().unwrap(),
+                }),
+            )
+            .unwrap_err(),
+            OperationError::ResourceScopeMismatch
+        );
         let release = PrivilegedRequest::new(
             &principal,
             helper,

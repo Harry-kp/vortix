@@ -157,16 +157,9 @@ impl HelperFirewallExecutor {
                     plan.recovered_firewalls().to_vec(),
                 ))
             }
-            NetworkPolicyOperation::ReleaseObsolete { .. } => {
-                self.audit_projection(plan.intended())
-                    .map_err(|_| NetworkPolicyPreparationError::FailedBeforeEffect)?;
-                Ok(PreparedNetworkPolicyExecutionPlan::new(
-                    plan.clone(),
-                    plan.recovered_firewalls().to_vec(),
-                ))
-            }
             NetworkPolicyOperation::ApplyRoutes { .. }
-            | NetworkPolicyOperation::ApplyDns { .. } => {
+            | NetworkPolicyOperation::ApplyDns { .. }
+            | NetworkPolicyOperation::ReleaseObsolete { .. } => {
                 Err(NetworkPolicyPreparationError::InvalidPlan)
             }
         }
@@ -196,25 +189,38 @@ impl HelperFirewallExecutor {
                         .map_err(|_| PrivilegedExecutionError::InvalidPlan)?,
                 ]))
             }
-            NetworkPolicyOperation::ReleaseObsolete {
-                policy, resources, ..
-            } => {
-                self.release_obsolete(prepared, resources)?;
-                self.audit_projection(plan.intended())?;
-                let mut observations =
-                    vec![
-                        ResourceObservation::new(policy.clone(), ObservationState::Present, 1)
-                            .map_err(|_| PrivilegedExecutionError::InvalidPlan)?,
-                    ];
-                observations.extend(resources.iter().cloned().map(|resource| {
-                    ResourceObservation::new(resource, ObservationState::Absent, 1)
-                        .expect("validated policy resources produce observations")
-                }));
-                Ok(NetworkPolicyOutcome::Observed(observations))
-            }
             NetworkPolicyOperation::ApplyRoutes { .. }
-            | NetworkPolicyOperation::ApplyDns { .. } => Err(PrivilegedExecutionError::InvalidPlan),
+            | NetworkPolicyOperation::ApplyDns { .. }
+            | NetworkPolicyOperation::ReleaseObsolete { .. } => {
+                Err(PrivilegedExecutionError::InvalidPlan)
+            }
         }
+    }
+
+    pub(crate) fn prepare_release(
+        &mut self,
+        plan: &NetworkPolicyExecutionPlan,
+    ) -> Result<(), NetworkPolicyPreparationError> {
+        let (current, _) = plan
+            .release_family(crate::vortix_core::privileged::ResourceKind::Firewall)
+            .ok_or(NetworkPolicyPreparationError::InvalidPlan)?;
+        self.audit_projection(current)
+            .map_err(|_| NetworkPolicyPreparationError::FailedBeforeEffect)
+    }
+
+    pub(crate) fn execute_release(
+        &mut self,
+        prepared: &PreparedNetworkPolicyExecutionPlan,
+    ) -> Result<(), PrivilegedExecutionError> {
+        let plan = prepared.execution();
+        let NetworkPolicyOperation::ReleaseObsolete { resources, .. } = plan.operation() else {
+            return Err(PrivilegedExecutionError::InvalidPlan);
+        };
+        self.release_obsolete(prepared, resources)?;
+        let (current, _) = plan
+            .release_family(crate::vortix_core::privileged::ResourceKind::Firewall)
+            .ok_or(PrivilegedExecutionError::InvalidPlan)?;
+        self.audit_projection(current)
     }
 
     fn audit_before_mutation(
@@ -296,7 +302,7 @@ impl HelperFirewallExecutor {
         prepared: &PreparedNetworkPolicyExecutionPlan,
         resources: &[crate::vortix_core::privileged::ResourceTag],
     ) -> Result<(), PrivilegedExecutionError> {
-        let releasing_owner = prepared.prepared_firewalls().iter().any(|physical| {
+        let releasing_owner = prepared.prepared_firewalls().iter().find(|physical| {
             resources.contains(physical.resource())
                 && physical.stage() == PhysicalFirewallStage::OwnedReleasePending
         });
@@ -304,7 +310,7 @@ impl HelperFirewallExecutor {
             !resources.contains(physical.resource())
                 && physical.stage() == PhysicalFirewallStage::ObservedOwned
         });
-        if releasing_owner {
+        if let Some(releasing_owner) = releasing_owner {
             if retained_owner {
                 return Err(PrivilegedExecutionError::InvalidPlan);
             }
@@ -312,7 +318,7 @@ impl HelperFirewallExecutor {
                 .execution()
                 .obsolete_effective()
                 .iter()
-                .find(|projection| resources.contains(projection.policy()))
+                .find(|projection| projection.policy() == releasing_owner.resource())
                 .ok_or(PrivilegedExecutionError::InvalidPlan)?;
             let prior_active = firewall_tunnels(self.layout, self.lease_id, prior)?;
             self.platform
@@ -387,8 +393,12 @@ mod tests {
     use super::*;
     use crate::vortix_core::control::AuthorityEpoch;
     use crate::vortix_core::privileged::PhysicalFirewallBackend;
-    use crate::vortix_core::privileged::{PrivilegedFirewallTunnel, ResourceKind, ResourceTag};
+    use crate::vortix_core::privileged::{
+        NetworkPolicyOperation, PolicyPhase, PolicyPredecessor, PrivilegedFirewallTunnel,
+        ResourceKind, ResourceTag,
+    };
     use crate::vortix_core::profile::ProfileId;
+    use crate::vortix_core::state::killswitch::KillSwitchMode;
 
     struct RecoveryAuditCounter(Arc<AtomicUsize>);
 
@@ -420,7 +430,8 @@ mod tests {
         }
 
         fn audit_absent(&mut self) -> Result<(), OwnedFirewallError> {
-            unreachable!()
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(())
         }
 
         fn audit_recovery(
@@ -443,6 +454,15 @@ mod tests {
         PolicyProjection::Blocking {
             policy: ResourceTag::topology(AuthorityEpoch(3), 7, ResourceKind::Firewall).unwrap(),
             tunnels,
+        }
+    }
+
+    fn nonblocking_policy(generation: u64) -> PolicyProjection {
+        PolicyProjection::Firewall {
+            policy: ResourceTag::topology(AuthorityEpoch(3), generation, ResourceKind::Firewall)
+                .unwrap(),
+            mode: KillSwitchMode::Off,
+            tunnels: Vec::new(),
         }
     }
 
@@ -511,5 +531,37 @@ mod tests {
         assert_eq!(calls.load(Ordering::Relaxed), 0);
         subject.validate_recovered(&[], true).unwrap();
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn release_audits_only_the_retained_firewall_projection() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut subject = HelperFirewallExecutor::with_platform(
+            PlatformLayout::MacOs,
+            LeaseId::new([7; 32]),
+            RecoveryAuditCounter(Arc::clone(&calls)),
+        );
+        let current = nonblocking_policy(8);
+        let obsolete = nonblocking_policy(7);
+        let plan = NetworkPolicyExecutionPlan::release_for_test(
+            NetworkPolicyOperation::ReleaseObsolete {
+                policy: current.policy().clone(),
+                resources: vec![obsolete.policy().clone()],
+                predecessor: PolicyPredecessor::for_test(current.digest(), PolicyPhase::Firewall),
+            },
+            vec![current],
+            vec![obsolete],
+            Vec::new(),
+            Vec::new(),
+        );
+
+        subject.prepare_release(&plan).unwrap();
+        let prepared = PreparedNetworkPolicyExecutionPlan::with_physical_ownership(
+            plan,
+            Vec::new(),
+            Vec::new(),
+        );
+        subject.execute_release(&prepared).unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 }
