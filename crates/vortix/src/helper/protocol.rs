@@ -14,7 +14,8 @@ use crate::vortix_core::privileged::{
 pub const HELPER_PROTOCOL_MIN: u16 = 1;
 pub const HELPER_PROTOCOL_MAX: u16 = 1;
 pub const HELPER_SCHEMA_MIN: u16 = 3;
-pub const HELPER_SCHEMA_MAX: u16 = 4;
+pub const HELPER_SCHEMA_MAX: u16 = 5;
+pub(crate) const MANAGED_OBSERVATION_SCHEMA_MIN: u16 = 5;
 pub const MAX_HELPER_FRAME_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,13 +39,26 @@ pub const CONTRACT_CAPABILITIES: [HelperCapability; 5] = [
 pub const STAGED_CAPABILITIES: [HelperCapability; 1] = [HelperCapability::Handshake];
 
 pub(crate) const fn capability_for_operation(operation: &PrivilegedOperation) -> HelperCapability {
+    operation_contract(operation).0
+}
+
+pub(crate) const fn minimum_schema_for_operation(operation: &PrivilegedOperation) -> u16 {
+    operation_contract(operation).1
+}
+
+const fn operation_contract(operation: &PrivilegedOperation) -> (HelperCapability, u16) {
     match operation {
         PrivilegedOperation::StartTunnel(_) | PrivilegedOperation::StopTunnel(_) => {
-            HelperCapability::TunnelLifecycle
+            (HelperCapability::TunnelLifecycle, HELPER_SCHEMA_MIN)
         }
-        PrivilegedOperation::NetworkPolicy(_) => HelperCapability::NetworkPolicy,
-        PrivilegedOperation::Observe(_) => HelperCapability::Observe,
-        PrivilegedOperation::CleanupOwned(_) => HelperCapability::CleanupOwned,
+        PrivilegedOperation::NetworkPolicy(_) => {
+            (HelperCapability::NetworkPolicy, HELPER_SCHEMA_MIN)
+        }
+        PrivilegedOperation::Observe(_) => (HelperCapability::Observe, HELPER_SCHEMA_MIN),
+        PrivilegedOperation::ObserveManaged(_) => {
+            (HelperCapability::Observe, MANAGED_OBSERVATION_SCHEMA_MIN)
+        }
+        PrivilegedOperation::CleanupOwned(_) => (HelperCapability::CleanupOwned, HELPER_SCHEMA_MIN),
     }
 }
 
@@ -169,8 +183,8 @@ impl HelperSessionBinding {
                 authority.lease_id(),
                 helper_epoch,
             ),
-            4 => Self::v4(authority, helper_epoch, next_sequence),
-            _ => unreachable!("negotiation accepts only helper schemas 3 and 4"),
+            4 | 5 => Self::v4(authority, helper_epoch, next_sequence),
+            _ => unreachable!("negotiation accepts only helper schemas 3 through 5"),
         }
     }
 
@@ -443,6 +457,24 @@ mod tests {
         BootScope, LeaseId, OperationDigest, ServiceInstanceClaim,
     };
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum V3HelperCapability {
+        Handshake,
+        Observe,
+        TunnelLifecycle,
+        NetworkPolicy,
+        CleanupOwned,
+    }
+
+    const V3_CONTRACT_CAPABILITIES: [V3HelperCapability; 5] = [
+        V3HelperCapability::Handshake,
+        V3HelperCapability::Observe,
+        V3HelperCapability::TunnelLifecycle,
+        V3HelperCapability::NetworkPolicy,
+        V3HelperCapability::CleanupOwned,
+    ];
+
     #[derive(Debug, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     struct V3ClientHello {
@@ -450,7 +482,7 @@ mod tests {
         product_version: String,
         protocol: CompatibilityRange,
         schema: CompatibilityRange,
-        required_capabilities: Vec<HelperCapability>,
+        required_capabilities: Vec<V3HelperCapability>,
         owner_uid: u32,
         service: ServiceInstanceClaim,
     }
@@ -471,8 +503,8 @@ mod tests {
         protocol: u16,
         schema: u16,
         authority_mode: HelperAuthorityMode,
-        contract_capabilities: Vec<HelperCapability>,
-        enabled_capabilities: Vec<HelperCapability>,
+        contract_capabilities: Vec<V3HelperCapability>,
+        enabled_capabilities: Vec<V3HelperCapability>,
         session: Option<V3SessionBinding>,
     }
 
@@ -495,7 +527,7 @@ mod tests {
         let hello = HelperClientHello::current(501, service(), vec![HelperCapability::Handshake]);
         let encoded = serde_json::to_vec(&hello).unwrap();
         let legacy: V3ClientHello = serde_json::from_slice(&encoded).unwrap();
-        assert_eq!(legacy.schema, CompatibilityRange { min: 3, max: 4 });
+        assert_eq!(legacy.schema, CompatibilityRange { min: 3, max: 5 });
         assert!(!serde_json::to_value(hello)
             .unwrap()
             .as_object()
@@ -508,8 +540,8 @@ mod tests {
             protocol: 1,
             schema: 3,
             authority_mode: HelperAuthorityMode::Enrolled,
-            contract_capabilities: CONTRACT_CAPABILITIES.to_vec(),
-            enabled_capabilities: vec![HelperCapability::Handshake, HelperCapability::Observe],
+            contract_capabilities: V3_CONTRACT_CAPABILITIES.to_vec(),
+            enabled_capabilities: vec![V3HelperCapability::Handshake, V3HelperCapability::Observe],
             session: Some(V3SessionBinding {
                 authority_epoch: AuthorityEpoch(3),
                 lease_id: LeaseId::new([5; 32]),
@@ -528,7 +560,7 @@ mod tests {
             product_version: env!("CARGO_PKG_VERSION").into(),
             protocol: CompatibilityRange { min: 1, max: 1 },
             schema: CompatibilityRange { min: 3, max: 3 },
-            required_capabilities: vec![HelperCapability::Handshake],
+            required_capabilities: vec![V3HelperCapability::Handshake],
             owner_uid: 501,
             service: service(),
         };
@@ -550,7 +582,7 @@ mod tests {
     }
 
     #[test]
-    fn new_peers_negotiate_v4_full_authority_and_replay_cursor() {
+    fn new_peers_negotiate_v5_full_authority_and_replay_cursor() {
         let hello = HelperClientHello::current(501, service(), vec![HelperCapability::Handshake]);
         let response = negotiate_enrolled(
             &hello,
@@ -560,7 +592,7 @@ mod tests {
             &STAGED_CAPABILITIES,
         )
         .unwrap();
-        assert_eq!(response.schema, 4);
+        assert_eq!(response.schema, 5);
         let encoded = serde_json::to_vec(&response).unwrap();
         let decoded: HelperServerHello = serde_json::from_slice(&encoded).unwrap();
         let binding = decoded.session.unwrap();

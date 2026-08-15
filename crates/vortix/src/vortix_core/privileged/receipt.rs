@@ -449,55 +449,7 @@ fn validate_outcome(
     match outcome {
         ReceiptOutcome::Rejected(_) | ReceiptOutcome::Ambiguous(_) => Ok(()),
         ReceiptOutcome::Applied(ownership) => {
-            bounded(ownership.len())?;
-            if has_duplicates(ownership.iter().map(ResourceOwnership::resource))
-                || ownership.iter().any(|item| {
-                    item.authority_epoch != authority
-                        || item.lease_id != lease_id
-                        || item.acquired_sequence != sequence
-                        || !operation.relates_to(&item.resource)
-                })
-            {
-                return Err(ReceiptError::UnrelatedResource);
-            }
-            match operation {
-                PrivilegedOperation::StartTunnel(plan) => {
-                    let tunnel = ResourceTag::tunnel(plan.profile_id().clone(), plan.generation())
-                        .map_err(|_| ReceiptError::UnrelatedResource)?;
-                    let group = ResourceTag::profile(
-                        plan.profile_id().clone(),
-                        plan.generation(),
-                        ResourceKind::ProcessGroup,
-                    )
-                    .map_err(|_| ReceiptError::UnrelatedResource)?;
-                    match plan {
-                        crate::vortix_core::privileged::ProtocolPlan::WireGuard(_) => {
-                            if ownership.len() != 1 || ownership[0].resource != tunnel {
-                                return Err(ReceiptError::MissingRequiredResource);
-                            }
-                        }
-                        crate::vortix_core::privileged::ProtocolPlan::OpenVpn(_) => {
-                            if ownership.len() != 2
-                                || !ownership.iter().any(|item| item.resource == tunnel)
-                                || !ownership.iter().any(|item| item.resource == group)
-                            {
-                                return Err(ReceiptError::MissingRequiredResource);
-                            }
-                        }
-                    }
-                }
-                PrivilegedOperation::StopTunnel(_)
-                | PrivilegedOperation::Observe(_)
-                | PrivilegedOperation::CleanupOwned(_) => {
-                    return Err(ReceiptError::OutcomeMismatch);
-                }
-                PrivilegedOperation::NetworkPolicy(policy) => {
-                    if ownership.len() != 1 || ownership[0].resource != *policy.policy_resource() {
-                        return Err(ReceiptError::OutcomeMismatch);
-                    }
-                }
-            }
-            Ok(())
+            validate_applied(operation, ownership, authority, lease_id, sequence)
         }
         ReceiptOutcome::Observed(observations) => {
             bounded(observations.len())?;
@@ -510,7 +462,8 @@ fn validate_outcome(
                 return Err(ReceiptError::UnrelatedResource);
             }
             match operation {
-                PrivilegedOperation::Observe(targets) => {
+                PrivilegedOperation::Observe(targets)
+                | PrivilegedOperation::ObserveManaged(targets) => {
                     exact_target_observations(targets, observations)
                 }
                 PrivilegedOperation::StopTunnel(resource) => exact_observation_state(
@@ -546,6 +499,63 @@ fn validate_outcome(
             }
         }
     }
+}
+
+fn validate_applied(
+    operation: &PrivilegedOperation,
+    ownership: &[ResourceOwnership],
+    authority: AuthorityEpoch,
+    lease_id: LeaseId,
+    sequence: RequestSequence,
+) -> Result<(), ReceiptError> {
+    bounded(ownership.len())?;
+    if has_duplicates(ownership.iter().map(ResourceOwnership::resource))
+        || ownership.iter().any(|item| {
+            item.authority_epoch != authority
+                || item.lease_id != lease_id
+                || item.acquired_sequence != sequence
+                || !operation.relates_to(&item.resource)
+        })
+    {
+        return Err(ReceiptError::UnrelatedResource);
+    }
+    match operation {
+        PrivilegedOperation::StartTunnel(plan) => {
+            let tunnel = ResourceTag::tunnel(plan.profile_id().clone(), plan.generation())
+                .map_err(|_| ReceiptError::UnrelatedResource)?;
+            let group = ResourceTag::profile(
+                plan.profile_id().clone(),
+                plan.generation(),
+                ResourceKind::ProcessGroup,
+            )
+            .map_err(|_| ReceiptError::UnrelatedResource)?;
+            match plan {
+                crate::vortix_core::privileged::ProtocolPlan::WireGuard(_) => {
+                    if ownership.len() != 1 || ownership[0].resource != tunnel {
+                        return Err(ReceiptError::MissingRequiredResource);
+                    }
+                }
+                crate::vortix_core::privileged::ProtocolPlan::OpenVpn(_) => {
+                    if ownership.len() != 2
+                        || !ownership.iter().any(|item| item.resource == tunnel)
+                        || !ownership.iter().any(|item| item.resource == group)
+                    {
+                        return Err(ReceiptError::MissingRequiredResource);
+                    }
+                }
+            }
+        }
+        PrivilegedOperation::StopTunnel(_)
+        | PrivilegedOperation::Observe(_)
+        | PrivilegedOperation::ObserveManaged(_)
+        | PrivilegedOperation::CleanupOwned(_) => return Err(ReceiptError::OutcomeMismatch),
+        PrivilegedOperation::NetworkPolicy(policy) => {
+            if ownership.len() != 1 || ownership[0].resource != *policy.policy_resource() {
+                return Err(ReceiptError::OutcomeMismatch);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn exact_observations(
