@@ -12,7 +12,9 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::helper::runtime::HelperRuntimeIdentity;
-use crate::helper::server::{ObservationError, ObservationExecutor, ObservationOutcome};
+use crate::helper::server::{
+    ObservationError, ObservationExecutor, ObservationOutcome, ObservationScope,
+};
 use crate::helper::validate::PlatformLayout;
 use crate::vortix_core::ports::process::KernelProcessIdentity;
 use crate::vortix_core::privileged::{
@@ -48,6 +50,7 @@ impl ObservationExecutor for SystemObservationExecutor {
     fn observe(
         &mut self,
         targets: &[ResourceObservationTarget],
+        _scope: ObservationScope,
     ) -> Result<ObservationOutcome, ObservationError> {
         let observed_at_millis = OsObservationProbe.now_millis().max(1);
         let mut observations = Vec::with_capacity(targets.len());

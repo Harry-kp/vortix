@@ -2361,6 +2361,7 @@ mod tests {
     };
     use crate::vortix_core::privileged::receipt::{
         AuthenticatedReceiptVerifier, ReceiptError, ReceiptLedger, ResourceObservation,
+        WireGuardPeerObservation,
     };
     use crate::vortix_core::profile::{ProfileId, ProtocolKind};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -2840,6 +2841,160 @@ mod tests {
             receipts.applied(&observe, Vec::new()).unwrap_err(),
             ReceiptError::OutcomeMismatch
         );
+    }
+
+    #[test]
+    fn managed_wireguard_receipt_authenticates_bounded_peer_evidence() {
+        let (root, principal) = authority();
+        let helper = HelperEpoch::new(3).unwrap();
+        let tunnel = ResourceTag::tunnel(profile('a'), 4).unwrap();
+        let request = PrivilegedRequest::new(
+            &principal,
+            helper,
+            RequestSequence::new(1).unwrap(),
+            PrivilegedOperation::ObserveManaged(vec![ResourceObservationTarget::new(
+                tunnel.clone(),
+                Some(ProtocolKind::WireGuard),
+            )
+            .unwrap()]),
+        )
+        .unwrap();
+        let peer = WireGuardPeerObservation::new(
+            [7; 32],
+            vec!["10.0.0.0/24".parse().unwrap()],
+            Some(1_700_000_000_000),
+            Some(25),
+            42,
+            84,
+        )
+        .unwrap();
+        let observation = ResourceObservation::with_wireguard_peers(
+            tunnel.clone(),
+            ObservationState::Present,
+            1_700_000_000_500,
+            vec![peer],
+        )
+        .unwrap();
+        let receipt = ReceiptLedger::new(&root, &principal)
+            .unwrap()
+            .observed(&request, vec![observation])
+            .unwrap();
+        let wire = serde_json::from_value(serde_json::to_value(receipt).unwrap()).unwrap();
+        let verified = AuthenticatedReceiptVerifier::from_authenticated_helper(
+            root.authority_epoch(),
+            root.lease_id(),
+            helper,
+        )
+        .verify(&request, wire)
+        .unwrap();
+
+        let peers = verified
+            .observation(&tunnel)
+            .unwrap()
+            .wireguard_peers()
+            .unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].public_key(), [7; 32]);
+        assert_eq!(
+            peers[0].latest_handshake_at_millis(),
+            Some(1_700_000_000_000)
+        );
+    }
+
+    #[test]
+    fn peer_evidence_rejects_unmanaged_scope_and_malformed_facts() {
+        let (root, principal) = authority();
+        let helper = HelperEpoch::new(3).unwrap();
+        let tunnel = ResourceTag::tunnel(profile('a'), 4).unwrap();
+        let peer = WireGuardPeerObservation::new(
+            [7; 32],
+            vec!["10.0.0.0/24".parse().unwrap()],
+            Some(1_700_000_000_000),
+            None,
+            0,
+            0,
+        )
+        .unwrap();
+        let observation = ResourceObservation::with_wireguard_peers(
+            tunnel.clone(),
+            ObservationState::Present,
+            1_700_000_000_500,
+            vec![peer.clone()],
+        )
+        .unwrap();
+        let unmanaged = PrivilegedRequest::new(
+            &principal,
+            helper,
+            RequestSequence::new(1).unwrap(),
+            PrivilegedOperation::Observe(vec![ResourceObservationTarget::new(
+                tunnel.clone(),
+                Some(ProtocolKind::WireGuard),
+            )
+            .unwrap()]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            ReceiptLedger::new(&root, &principal)
+                .unwrap()
+                .observed(&unmanaged, vec![observation])
+                .unwrap_err(),
+            ReceiptError::OutcomeMismatch
+        );
+        let managed = PrivilegedRequest::new(
+            &principal,
+            helper,
+            RequestSequence::new(2).unwrap(),
+            PrivilegedOperation::ObserveManaged(vec![ResourceObservationTarget::new(
+                tunnel.clone(),
+                Some(ProtocolKind::WireGuard),
+            )
+            .unwrap()]),
+        )
+        .unwrap();
+        assert_eq!(
+            ReceiptLedger::new(&root, &principal)
+                .unwrap()
+                .observed(
+                    &managed,
+                    vec![ResourceObservation::new(
+                        tunnel.clone(),
+                        ObservationState::Present,
+                        1_700_000_000_500,
+                    )
+                    .unwrap()],
+                )
+                .unwrap_err(),
+            ReceiptError::OutcomeMismatch
+        );
+        assert_eq!(
+            WireGuardPeerObservation::new([0; 32], Vec::new(), None, None, 0, 0).unwrap_err(),
+            ReceiptError::InvalidPeerEvidence
+        );
+        assert_eq!(
+            ResourceObservation::with_wireguard_peers(
+                tunnel,
+                ObservationState::Present,
+                1_000,
+                vec![
+                    WireGuardPeerObservation::new([8; 32], Vec::new(), Some(301_001), None, 0, 0,)
+                        .unwrap()
+                ],
+            )
+            .unwrap_err(),
+            ReceiptError::InvalidPeerEvidence
+        );
+
+        let legacy = serde_json::to_value(
+            ResourceObservation::new(
+                ResourceTag::tunnel(profile('b'), 1).unwrap(),
+                ObservationState::Present,
+                1,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(legacy.get("wireguard_peers").is_none());
     }
 
     #[test]

@@ -16,7 +16,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use base64::engine::{general_purpose::STANDARD as BASE64, Engine as _};
 use thiserror::Error;
@@ -30,6 +30,7 @@ use crate::vortix_core::privileged::{ProtocolEndpoint, WireGuardPlan};
 const KEY_BYTES: usize = 32;
 const ENCODED_KEY_BYTES: usize = 44;
 const WAIT_INTERVAL: Duration = Duration::from_millis(25);
+const WG_CANDIDATES: &[&str] = &["/usr/bin/wg"];
 
 pub(crate) struct WireGuardMaterial<'a> {
     private_key: &'a [u8],
@@ -185,6 +186,62 @@ pub(crate) fn run_wg_quick(
     )
 }
 
+/// Read one helper-derived interface using only the fixed `wg` vocabulary.
+/// The dump contains the interface private key in its first field, so the
+/// complete buffer is zeroized immediately after the typed parser returns.
+pub(crate) fn observe_helper_interface(
+    interface_name: &str,
+    generation: u64,
+    timeout: Duration,
+) -> Result<
+    (
+        crate::vortix_protocol_wireguard::tunnel::WgStatus,
+        SystemTime,
+    ),
+    WireGuardCommandError,
+> {
+    if generation == 0 || !valid_interface_name(interface_name) || timeout.is_zero() {
+        return Err(WireGuardCommandError::InvalidInvocation);
+    }
+    let output = crate::platform::fixed_root_command::run_with_timeout(
+        WG_CANDIDATES,
+        &["show", interface_name, "dump"],
+        None,
+        0,
+        timeout,
+    )
+    .map_err(|error| match error {
+        crate::platform::fixed_root_command::FixedCommandError::FailedBeforeSpawn => {
+            WireGuardCommandError::Spawn
+        }
+        crate::platform::fixed_root_command::FixedCommandError::OutcomeUnknown => {
+            WireGuardCommandError::Wait
+        }
+    })?;
+    if !output.status.success() {
+        return Err(WireGuardCommandError::NonZeroExit);
+    }
+    let observed_at = SystemTime::now();
+    let dump = Zeroizing::new(output.stdout);
+    let status = crate::vortix_protocol_wireguard::tunnel::parse_wg_dump(
+        interface_name,
+        &dump,
+        observed_at,
+        generation,
+    )
+    .map_err(|_| WireGuardCommandError::InvalidOutput)?;
+    Ok((status, observed_at))
+}
+
+fn valid_interface_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 15
+        && value.as_bytes()[0].is_ascii_alphanumeric()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
 fn run_bounded(
     binary: &Path,
     arguments: &[std::ffi::OsString],
@@ -235,6 +292,10 @@ fn terminate_process_group(child: &mut std::process::Child) {
 }
 
 fn canonical_key(bytes: &[u8]) -> Result<&str, WireGuardExecutionError> {
+    canonical_key_parts(bytes).map(|(value, _)| value)
+}
+
+fn canonical_key_parts(bytes: &[u8]) -> Result<(&str, [u8; 32]), WireGuardExecutionError> {
     let value = std::str::from_utf8(bytes)
         .map_err(|_| WireGuardExecutionError::InvalidKeyMaterial)?
         .trim_ascii();
@@ -244,10 +305,17 @@ fn canonical_key(bytes: &[u8]) -> Result<&str, WireGuardExecutionError> {
     let decoded = BASE64
         .decode(value)
         .map_err(|_| WireGuardExecutionError::InvalidKeyMaterial)?;
-    if decoded.len() != KEY_BYTES || BASE64.encode(decoded) != value {
+    let key: [u8; KEY_BYTES] = decoded
+        .try_into()
+        .map_err(|_| WireGuardExecutionError::InvalidKeyMaterial)?;
+    if BASE64.encode(key) != value {
         return Err(WireGuardExecutionError::InvalidKeyMaterial);
     }
-    Ok(value)
+    Ok((value, key))
+}
+
+pub(crate) fn decode_public_key(value: &str) -> Result<[u8; 32], WireGuardExecutionError> {
+    canonical_key_parts(value.as_bytes()).map(|(_, key)| key)
 }
 
 fn write_endpoint(
@@ -308,6 +376,8 @@ pub(crate) enum WireGuardCommandError {
     Timeout,
     #[error("WireGuard helper child could not be reaped")]
     Wait,
+    #[error("WireGuard helper returned malformed status")]
+    InvalidOutput,
 }
 
 #[cfg(test)]
@@ -406,6 +476,7 @@ mod tests {
             .unwrap_err(),
             WireGuardExecutionError::InvalidKeyMaterial
         );
+        assert_eq!(decode_public_key(&key(7)).unwrap(), [7; 32]);
     }
 
     #[test]
@@ -431,5 +502,23 @@ mod tests {
 
         assert_eq!(result, Err(WireGuardCommandError::Timeout));
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn helper_status_rejects_option_shaped_or_oversized_interface_names() {
+        for interface in ["-all", "vx/interface", "abcdefghijklmnop"] {
+            assert_eq!(
+                observe_helper_interface(interface, 4, Duration::from_secs(1)).unwrap_err(),
+                WireGuardCommandError::InvalidInvocation
+            );
+        }
+        assert_eq!(
+            observe_helper_interface("vx-safe", 0, Duration::from_secs(1)).unwrap_err(),
+            WireGuardCommandError::InvalidInvocation
+        );
+        assert_eq!(
+            observe_helper_interface("vx-safe", 4, Duration::ZERO).unwrap_err(),
+            WireGuardCommandError::InvalidInvocation
+        );
     }
 }
