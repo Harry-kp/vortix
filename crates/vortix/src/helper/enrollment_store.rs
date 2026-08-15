@@ -14,10 +14,11 @@ use thiserror::Error;
 use super::root_store::{RootOwnedJsonStore, RootStoreError};
 use super::validate::{InstallManifest, InstallRequest, PackageChannel, PlatformLayout};
 use crate::vortix_core::control::AuthorityEpoch;
-use crate::vortix_core::privileged::{BootScope, LeaseId, OperationDigest};
+use crate::vortix_core::privileged::{AuthorityBinding, BootScope, LeaseId, OperationDigest};
 
 const ENROLLMENT_SCHEMA_VERSION: u16 = 1;
 const MAX_ENROLLMENT_BYTES: u64 = 16 * 1024;
+const AUTHORITY_BINDING_DOMAIN: &[u8] = b"vortix-manager-instance-v1\0";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -197,6 +198,20 @@ impl AuthorityReservation {
 
     pub(crate) const fn manager_instance_nonce(self) -> [u8; 32] {
         self.manager_instance_nonce
+    }
+
+    pub(crate) fn binding(self) -> AuthorityBinding {
+        let mut material =
+            Vec::with_capacity(AUTHORITY_BINDING_DOMAIN.len() + self.manager_instance_nonce.len());
+        material.extend_from_slice(AUTHORITY_BINDING_DOMAIN);
+        material.extend_from_slice(&self.manager_instance_nonce);
+        AuthorityBinding::new(
+            self.authority_epoch,
+            self.boot_scope,
+            self.lease_id,
+            OperationDigest::of_bytes(&material),
+        )
+        .expect("validated root reservation always produces a valid public binding")
     }
 }
 
@@ -581,6 +596,32 @@ mod tests {
             .unwrap();
         assert_eq!(second.authority_epoch(), AuthorityEpoch(2));
         assert_ne!(first.lease_id(), second.lease_id());
+    }
+
+    #[test]
+    fn public_authority_binding_is_deterministic_per_reservation() {
+        let reservation = AuthorityReservation::test_fixture(
+            AuthorityEpoch(7),
+            BootScope::new([1; 16]),
+            LeaseId::new([2; 32]),
+            [3; 32],
+        );
+        let same = AuthorityReservation::test_fixture(
+            AuthorityEpoch(7),
+            BootScope::new([1; 16]),
+            LeaseId::new([2; 32]),
+            [3; 32],
+        );
+        let different_nonce = AuthorityReservation::test_fixture(
+            AuthorityEpoch(7),
+            BootScope::new([1; 16]),
+            LeaseId::new([2; 32]),
+            [4; 32],
+        );
+
+        assert_eq!(reservation.binding(), same.binding());
+        assert_ne!(reservation.binding(), different_nonce.binding());
+        assert_eq!(reservation.binding().authority_epoch(), AuthorityEpoch(7));
     }
 
     #[test]

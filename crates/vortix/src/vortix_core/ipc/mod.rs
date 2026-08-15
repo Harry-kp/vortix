@@ -39,6 +39,7 @@ use crate::vortix_core::control::{
 use crate::vortix_core::engine::input::UserCommand;
 use crate::vortix_core::engine::registry::{Conflict, TunnelSnapshot};
 use crate::vortix_core::engine::state::Connection;
+use crate::vortix_core::privileged::AuthorityBinding;
 use crate::vortix_core::profile::ProfileId;
 use crate::vortix_core::state::KillSwitchState;
 
@@ -239,6 +240,10 @@ pub struct ServerHello {
     pub capabilities: Vec<IpcCapability>,
     /// This candidate is observational only and can never own mutations.
     pub passive: bool,
+    /// Exact enrolled authority identity. Passive and legacy servers omit it;
+    /// a control-mutation handshake is invalid unless this binding is present.
+    #[serde(default)]
+    pub authority_binding: Option<AuthorityBinding>,
 }
 
 /// Opaque daemon-issued session identity. It names one canonical
@@ -557,6 +562,7 @@ pub fn negotiate_passive(hello: &ClientHello) -> Result<ServerHello, IpcError> {
         schema,
         capabilities: capabilities.to_vec(),
         passive: true,
+        authority_binding: None,
     })
 }
 
