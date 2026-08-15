@@ -21,6 +21,12 @@ pub(super) const CONTRACT_SCHEMA_VERSION: u16 = 3;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct BoundedVec<T, const LIMIT: usize>(Vec<T>);
 
+impl<T, const LIMIT: usize> Default for BoundedVec<T, LIMIT> {
+    fn default() -> Self {
+        Self(Vec::new())
+    }
+}
+
 impl<T, const LIMIT: usize> BoundedVec<T, LIMIT> {
     pub(super) fn into_vec(self) -> Vec<T> {
         self.0
@@ -101,8 +107,10 @@ pub use child_owner::{
     reason = "the typed transaction minter remains dormant until the firewall adapter lands"
 )]
 pub(crate) use ledger::{
-    FirewallTransactionId, HelperLedgerFirewall, HelperLedgerPolicy, HelperLedgerRecord,
-    HelperLedgerResource, HelperResourceState, PhysicalFirewallBackend, PhysicalFirewallStage,
+    DnsTransactionId, FirewallTransactionId, HelperLedgerDns, HelperLedgerFirewall,
+    HelperLedgerPolicy, HelperLedgerRecord, HelperLedgerResource, HelperResourceState,
+    PhysicalDnsBackend, PhysicalDnsLink, PhysicalDnsPrior, PhysicalDnsStage, PhysicalDnsValue,
+    PhysicalFirewallBackend, PhysicalFirewallStage,
 };
 pub use operation::{
     BootScope, HelperEpoch, LeaseId, NetworkPolicyOperation, OperationAdmission, OperationDigest,
