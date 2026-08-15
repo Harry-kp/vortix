@@ -6,6 +6,7 @@
 //! over to the `Platform` aggregate.
 
 pub mod aggregate;
+pub(crate) mod fixed_root_command;
 pub(crate) mod route_probe;
 
 #[cfg(target_os = "linux")]
@@ -43,7 +44,7 @@ pub(crate) const fn current_platform_family() -> PlatformFamily {
 pub(crate) fn helper_owned_firewall() -> Box<dyn OwnedFirewall> {
     #[cfg(target_os = "linux")]
     {
-        Box::new(crate::vortix_platform_linux::owned_firewall::LinuxOwnedFirewall)
+        Box::new(crate::vortix_platform_linux::owned_firewall::LinuxOwnedFirewall::new())
     }
     #[cfg(target_os = "macos")]
     {

@@ -68,16 +68,6 @@ impl PfFirewall {
             .collect()
     }
 
-    pub(crate) fn pf_snapshot_matches(expected: &str, observed: &str) -> bool {
-        let expected = Self::canonical_pf_rules(expected);
-        let observed = Self::canonical_pf_rules(observed);
-        expected.len() == observed.len()
-            && expected
-                .iter()
-                .zip(observed)
-                .all(|(expected, observed)| observed.starts_with(expected))
-    }
-
     /// Synthesise the pf ruleset for the given active tunnel set.
     ///
     /// Shape:
@@ -181,13 +171,20 @@ impl PfFirewall {
     }
 
     pub(crate) fn snapshot_matches_policy(active: &[ActiveTunnelInfo], observed: &str) -> bool {
+        Self::canonical_snapshot_matches(active, &Self::canonical_pf_rules(observed))
+    }
+
+    pub(crate) fn canonical_snapshot_matches(
+        active: &[ActiveTunnelInfo],
+        observed: &[&str],
+    ) -> bool {
         let expected = Self::generate_pf_rules(active);
-        let digest = crate::core::killswitch::policy_digest(active);
-        let terminal = format!("block drop out quick all label \"{POLICY_LABEL_PREFIX}{digest}\"");
-        Self::pf_snapshot_matches(&expected, observed)
-            && Self::canonical_pf_rules(observed)
-                .last()
-                .is_some_and(|line| line.starts_with(&terminal))
+        let expected = Self::canonical_pf_rules(&expected);
+        expected.len() == observed.len()
+            && expected
+                .iter()
+                .zip(observed)
+                .all(|(expected, observed)| observed.starts_with(expected))
     }
 
     /// Best-effort write of the ruleset to `PF_CONF_PATH` for diagnostic

@@ -5,6 +5,7 @@
 //! policy object and must classify failures around the first possible effect.
 
 use super::killswitch::ActiveTunnelInfo;
+use crate::vortix_core::privileged::PhysicalFirewallBackend;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OwnedFirewallError {
@@ -12,10 +13,22 @@ pub(crate) enum OwnedFirewallError {
     EffectMayHaveApplied,
 }
 
-pub(crate) trait OwnedFirewall: Send {
-    fn apply_blocking(&mut self, active: &[ActiveTunnelInfo]) -> Result<(), OwnedFirewallError>;
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ExpectedFirewallState<'a> {
+    Absent,
+    Blocking(&'a [ActiveTunnelInfo]),
+}
 
-    fn clear(&mut self) -> Result<(), OwnedFirewallError>;
+pub(crate) trait OwnedFirewall: Send {
+    fn backend(&self) -> PhysicalFirewallBackend;
+
+    fn apply_blocking(
+        &mut self,
+        active: &[ActiveTunnelInfo],
+        expected: ExpectedFirewallState<'_>,
+    ) -> Result<(), OwnedFirewallError>;
+
+    fn clear(&mut self, expected: ExpectedFirewallState<'_>) -> Result<(), OwnedFirewallError>;
 
     fn audit_blocking(&mut self, active: &[ActiveTunnelInfo]) -> Result<(), OwnedFirewallError>;
 
