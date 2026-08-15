@@ -7,7 +7,7 @@ use super::{
     ReplayRecord, ResourceKind, ResourceTag, MAX_RESOURCE_ITEMS,
 };
 
-const HELPER_LEDGER_SCHEMA_VERSION: u16 = 7;
+const HELPER_LEDGER_SCHEMA_VERSION: u16 = 8;
 const MAX_PHYSICAL_DNS_VALUE_BYTES: usize = 253;
 const MAX_PHYSICAL_DNS_RECORD_BYTES: usize = 64 * 1024;
 

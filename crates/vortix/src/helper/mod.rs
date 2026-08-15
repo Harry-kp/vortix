@@ -19,6 +19,7 @@ mod private_fs;
 pub mod protocol;
 mod replay_store;
 mod root_store;
+mod routes;
 mod runtime;
 mod server;
 mod transport;

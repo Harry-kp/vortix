@@ -11,6 +11,7 @@ pub mod killswitch;
 pub mod network_stats;
 pub(crate) mod owned_dns;
 pub(crate) mod owned_firewall;
+pub(crate) mod owned_routes;
 pub mod process;
 pub mod route_table;
 pub mod socket_audit;
