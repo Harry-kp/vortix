@@ -56,7 +56,7 @@ pub(crate) fn helper_owned_firewall() -> Box<dyn OwnedFirewall> {
 pub(crate) fn helper_owned_dns() -> Box<dyn OwnedDns> {
     #[cfg(target_os = "linux")]
     {
-        Box::new(crate::vortix_platform_linux::dns::LinuxDns)
+        Box::new(crate::vortix_platform_linux::owned_dns::LinuxOwnedDns::new())
     }
     #[cfg(target_os = "macos")]
     {
