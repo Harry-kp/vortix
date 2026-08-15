@@ -29,6 +29,8 @@ pub(crate) struct ReceivedHelperRequest {
     pub(crate) descriptors: Vec<File>,
 }
 
+pub(crate) struct PreparedHelperRequest(Vec<u8>);
+
 pub(crate) fn receive_request(
     stream: &UnixStream,
 ) -> Result<ReceivedHelperRequest, DescriptorTransportError> {
@@ -54,21 +56,50 @@ pub(crate) fn send_request(
     request: &HelperRequest,
     descriptors: &[RawFd],
 ) -> Result<(), DescriptorTransportError> {
+    let prepared = prepare_request(request, descriptors)?;
+    send_prepared_request(stream, &prepared, descriptors)
+}
+
+pub(crate) fn prepare_request(
+    request: &HelperRequest,
+    descriptors: &[RawFd],
+) -> Result<PreparedHelperRequest, DescriptorTransportError> {
     if descriptors.len() != expected_descriptor_count(request) {
         return Err(DescriptorTransportError::DescriptorCountMismatch);
     }
+    if descriptors.len() > MAX_TUNNEL_DESCRIPTORS {
+        return Err(DescriptorTransportError::TooManyDescriptors);
+    }
     let frame = encode_request_frame(request)?;
-    send_frame(stream, &frame, descriptors)
+    let descriptor_chunks = descriptors.len().div_ceil(MAX_FDS_PER_MESSAGE);
+    if frame.len() < descriptor_chunks {
+        return Err(DescriptorTransportError::MalformedRequest);
+    }
+    Ok(PreparedHelperRequest(frame))
+}
+
+pub(crate) fn send_prepared_request(
+    stream: &mut UnixStream,
+    request: &PreparedHelperRequest,
+    descriptors: &[RawFd],
+) -> Result<(), DescriptorTransportError> {
+    send_frame(stream, &request.0, descriptors)
+}
+
+pub(crate) fn expected_descriptor_count_for_operation(
+    operation: Option<&PrivilegedOperation>,
+) -> usize {
+    match operation {
+        Some(PrivilegedOperation::StartTunnel(plan)) => plan.descriptor_count(),
+        Some(_) | None => 0,
+    }
 }
 
 fn expected_descriptor_count(request: &HelperRequest) -> usize {
-    match &request.op {
-        HelperOp::Execute(boxed) => match boxed.operation() {
-            PrivilegedOperation::StartTunnel(plan) => plan.descriptor_count(),
-            _ => 0,
-        },
-        HelperOp::Handshake(_) => 0,
-    }
+    expected_descriptor_count_for_operation(match &request.op {
+        HelperOp::Execute(request) => Some(request.operation()),
+        HelperOp::Handshake(_) => None,
+    })
 }
 
 fn receive_frame(stream: &UnixStream) -> Result<(Vec<u8>, Vec<File>), DescriptorTransportError> {
@@ -190,14 +221,14 @@ fn send_frame(
         stream.write_all(frame)?;
         return Ok(());
     }
-    let chunks = descriptors.chunks(MAX_FDS_PER_MESSAGE).collect::<Vec<_>>();
-    if frame.len() < chunks.len() {
+    let chunk_count = descriptors.len().div_ceil(MAX_FDS_PER_MESSAGE);
+    if frame.len() < chunk_count {
         return Err(DescriptorTransportError::MalformedRequest);
     }
-    for (index, chunk) in chunks.iter().enumerate() {
+    for (index, chunk) in descriptors.chunks(MAX_FDS_PER_MESSAGE).enumerate() {
         send_chunk(stream, &frame[index..=index], chunk)?;
     }
-    stream.write_all(&frame[chunks.len()..])?;
+    stream.write_all(&frame[chunk_count..])?;
     Ok(())
 }
 

@@ -7,13 +7,14 @@ use crate::vortix_core::control::AuthorityEpoch;
 use crate::vortix_core::ipc::frame::{decode_frame_bounded, encode_frame_bounded};
 use crate::vortix_core::ipc::{CompatibilityRange, FrameError};
 use crate::vortix_core::privileged::{
-    HelperEpoch, LeaseId, PrivilegedRequest, ServiceInstanceClaim,
+    AuthorityBinding, HelperEpoch, LeaseId, PrivilegedOperation, PrivilegedRequest,
+    RequestSequence, ServiceInstanceClaim,
 };
 
 pub const HELPER_PROTOCOL_MIN: u16 = 1;
 pub const HELPER_PROTOCOL_MAX: u16 = 1;
 pub const HELPER_SCHEMA_MIN: u16 = 3;
-pub const HELPER_SCHEMA_MAX: u16 = 3;
+pub const HELPER_SCHEMA_MAX: u16 = 4;
 pub const MAX_HELPER_FRAME_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,6 +36,17 @@ pub const CONTRACT_CAPABILITIES: [HelperCapability; 5] = [
 ];
 
 pub const STAGED_CAPABILITIES: [HelperCapability; 1] = [HelperCapability::Handshake];
+
+pub(crate) const fn capability_for_operation(operation: &PrivilegedOperation) -> HelperCapability {
+    match operation {
+        PrivilegedOperation::StartTunnel(_) | PrivilegedOperation::StopTunnel(_) => {
+            HelperCapability::TunnelLifecycle
+        }
+        PrivilegedOperation::NetworkPolicy(_) => HelperCapability::NetworkPolicy,
+        PrivilegedOperation::Observe(_) => HelperCapability::Observe,
+        PrivilegedOperation::CleanupOwned(_) => HelperCapability::CleanupOwned,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -98,11 +110,109 @@ pub struct HelperServerHello {
 /// still treats these scalars as untrusted until the peer socket and installed
 /// helper identity have been verified by the platform boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum HelperSessionBinding {
+    V4(HelperSessionBindingV4),
+    V3(HelperSessionBindingV3),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct HelperSessionBinding {
-    pub authority_epoch: AuthorityEpoch,
-    pub lease_id: LeaseId,
-    pub helper_epoch: HelperEpoch,
+pub struct HelperSessionBindingV3 {
+    authority_epoch: AuthorityEpoch,
+    lease_id: LeaseId,
+    helper_epoch: HelperEpoch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HelperSessionBindingV4 {
+    authority: AuthorityBinding,
+    helper_epoch: HelperEpoch,
+    next_sequence: RequestSequence,
+}
+
+impl HelperSessionBinding {
+    pub(crate) const fn v3(
+        authority_epoch: AuthorityEpoch,
+        lease_id: LeaseId,
+        helper_epoch: HelperEpoch,
+    ) -> Self {
+        Self::V3(HelperSessionBindingV3 {
+            authority_epoch,
+            lease_id,
+            helper_epoch,
+        })
+    }
+
+    pub(crate) const fn v4(
+        authority: AuthorityBinding,
+        helper_epoch: HelperEpoch,
+        next_sequence: RequestSequence,
+    ) -> Self {
+        Self::V4(HelperSessionBindingV4 {
+            authority,
+            helper_epoch,
+            next_sequence,
+        })
+    }
+
+    fn negotiated(
+        schema: u16,
+        authority: AuthorityBinding,
+        helper_epoch: HelperEpoch,
+        next_sequence: RequestSequence,
+    ) -> Self {
+        match schema {
+            3 => Self::v3(
+                authority.authority_epoch(),
+                authority.lease_id(),
+                helper_epoch,
+            ),
+            4 => Self::v4(authority, helper_epoch, next_sequence),
+            _ => unreachable!("negotiation accepts only helper schemas 3 and 4"),
+        }
+    }
+
+    #[must_use]
+    pub const fn authority(self) -> Option<AuthorityBinding> {
+        match self {
+            Self::V4(binding) => Some(binding.authority),
+            Self::V3(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn authority_epoch(self) -> AuthorityEpoch {
+        match self {
+            Self::V4(binding) => binding.authority.authority_epoch(),
+            Self::V3(binding) => binding.authority_epoch,
+        }
+    }
+
+    #[must_use]
+    pub const fn lease_id(self) -> LeaseId {
+        match self {
+            Self::V4(binding) => binding.authority.lease_id(),
+            Self::V3(binding) => binding.lease_id,
+        }
+    }
+
+    #[must_use]
+    pub const fn helper_epoch(self) -> HelperEpoch {
+        match self {
+            Self::V4(binding) => binding.helper_epoch,
+            Self::V3(binding) => binding.helper_epoch,
+        }
+    }
+
+    #[must_use]
+    pub const fn next_sequence(self) -> Option<RequestSequence> {
+        match self {
+            Self::V4(binding) => Some(binding.next_sequence),
+            Self::V3(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,6 +221,10 @@ pub struct HelperSessionBinding {
     content = "payload",
     rename_all = "snake_case",
     deny_unknown_fields
+)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the bounded handshake occurs once per connection; boxing it would add heap churn and mechanical caller complexity"
 )]
 pub enum HelperOp {
     Handshake(HelperClientHello),
@@ -176,22 +290,35 @@ pub fn negotiate_staged(hello: &HelperClientHello) -> Result<HelperServerHello, 
 )]
 pub(crate) fn negotiate_enrolled(
     hello: &HelperClientHello,
-    binding: HelperSessionBinding,
+    authority: AuthorityBinding,
+    helper_epoch: HelperEpoch,
+    next_sequence: RequestSequence,
     enabled_capabilities: &[HelperCapability],
 ) -> Result<HelperServerHello, HelperError> {
     let mut negotiated = negotiate_common(hello, enabled_capabilities)?;
     negotiated.authority_mode = HelperAuthorityMode::Enrolled;
-    negotiated.session = Some(binding);
+    negotiated.session = Some(HelperSessionBinding::negotiated(
+        negotiated.schema,
+        authority,
+        helper_epoch,
+        next_sequence,
+    ));
     Ok(negotiated)
 }
 
 pub(crate) fn negotiate_candidate(
     hello: &HelperClientHello,
-    binding: HelperSessionBinding,
+    authority: AuthorityBinding,
+    helper_epoch: HelperEpoch,
 ) -> Result<HelperServerHello, HelperError> {
     let mut negotiated = negotiate_common(hello, &STAGED_CAPABILITIES)?;
     negotiated.authority_mode = HelperAuthorityMode::Candidate;
-    negotiated.session = Some(binding);
+    negotiated.session = Some(HelperSessionBinding::negotiated(
+        negotiated.schema,
+        authority,
+        helper_epoch,
+        RequestSequence::new(1).expect("one is a valid request sequence"),
+    ));
     Ok(negotiated)
 }
 
@@ -306,4 +433,142 @@ pub fn encode_response_frame(response: &HelperResponse) -> Result<Vec<u8>, Frame
 /// Decode at most one helper-to-daemon response frame under the helper cap.
 pub fn decode_response_frame(bytes: &[u8]) -> Result<Option<(HelperResponse, usize)>, FrameError> {
     decode_frame_bounded::<_, MAX_HELPER_FRAME_BYTES>(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vortix_core::control::AuthorityEpoch;
+    use crate::vortix_core::privileged::{
+        BootScope, LeaseId, OperationDigest, ServiceInstanceClaim,
+    };
+
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct V3ClientHello {
+        product: String,
+        product_version: String,
+        protocol: CompatibilityRange,
+        schema: CompatibilityRange,
+        required_capabilities: Vec<HelperCapability>,
+        owner_uid: u32,
+        service: ServiceInstanceClaim,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct V3SessionBinding {
+        authority_epoch: AuthorityEpoch,
+        lease_id: LeaseId,
+        helper_epoch: HelperEpoch,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct V3ServerHello {
+        product: String,
+        product_version: String,
+        protocol: u16,
+        schema: u16,
+        authority_mode: HelperAuthorityMode,
+        contract_capabilities: Vec<HelperCapability>,
+        enabled_capabilities: Vec<HelperCapability>,
+        session: Option<V3SessionBinding>,
+    }
+
+    fn service() -> ServiceInstanceClaim {
+        ServiceInstanceClaim::systemd(42, 9, OperationDigest::of_bytes(b"daemon"), [7; 32]).unwrap()
+    }
+
+    fn authority() -> AuthorityBinding {
+        AuthorityBinding::for_service(
+            AuthorityEpoch(3),
+            BootScope::new([4; 16]),
+            LeaseId::new([5; 32]),
+            &service(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn new_daemon_hello_is_strictly_decodable_by_v3_helper() {
+        let hello = HelperClientHello::current(501, service(), vec![HelperCapability::Handshake]);
+        let encoded = serde_json::to_vec(&hello).unwrap();
+        let legacy: V3ClientHello = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(legacy.schema, CompatibilityRange { min: 3, max: 4 });
+        assert!(!serde_json::to_value(hello)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("expected_authority"));
+
+        let old_response = V3ServerHello {
+            product: "vortix-helper".into(),
+            product_version: env!("CARGO_PKG_VERSION").into(),
+            protocol: 1,
+            schema: 3,
+            authority_mode: HelperAuthorityMode::Enrolled,
+            contract_capabilities: CONTRACT_CAPABILITIES.to_vec(),
+            enabled_capabilities: vec![HelperCapability::Handshake, HelperCapability::Observe],
+            session: Some(V3SessionBinding {
+                authority_epoch: AuthorityEpoch(3),
+                lease_id: LeaseId::new([5; 32]),
+                helper_epoch: HelperEpoch::new(8).unwrap(),
+            }),
+        };
+        let current: HelperServerHello =
+            serde_json::from_slice(&serde_json::to_vec(&old_response).unwrap()).unwrap();
+        assert!(matches!(current.session, Some(HelperSessionBinding::V3(_))));
+    }
+
+    #[test]
+    fn old_daemon_and_new_helper_negotiate_exact_v3_binding_before_commands() {
+        let old = V3ClientHello {
+            product: "vortix".into(),
+            product_version: env!("CARGO_PKG_VERSION").into(),
+            protocol: CompatibilityRange { min: 1, max: 1 },
+            schema: CompatibilityRange { min: 3, max: 3 },
+            required_capabilities: vec![HelperCapability::Handshake],
+            owner_uid: 501,
+            service: service(),
+        };
+        let current: HelperClientHello =
+            serde_json::from_slice(&serde_json::to_vec(&old).unwrap()).unwrap();
+        let response =
+            negotiate_candidate(&current, authority(), HelperEpoch::new(8).unwrap()).unwrap();
+        assert_eq!(response.schema, 3);
+        assert!(matches!(
+            response.session,
+            Some(HelperSessionBinding::V3(_))
+        ));
+        let legacy: V3ServerHello =
+            serde_json::from_slice(&serde_json::to_vec(&response).unwrap()).unwrap();
+        let session = legacy.session.unwrap();
+        assert_eq!(session.authority_epoch, AuthorityEpoch(3));
+        assert_eq!(session.lease_id, LeaseId::new([5; 32]));
+        assert_eq!(session.helper_epoch, HelperEpoch::new(8).unwrap());
+    }
+
+    #[test]
+    fn new_peers_negotiate_v4_full_authority_and_replay_cursor() {
+        let hello = HelperClientHello::current(501, service(), vec![HelperCapability::Handshake]);
+        let response = negotiate_enrolled(
+            &hello,
+            authority(),
+            HelperEpoch::new(9).unwrap(),
+            RequestSequence::new(17).unwrap(),
+            &STAGED_CAPABILITIES,
+        )
+        .unwrap();
+        assert_eq!(response.schema, 4);
+        let encoded = serde_json::to_vec(&response).unwrap();
+        let decoded: HelperServerHello = serde_json::from_slice(&encoded).unwrap();
+        let binding = decoded.session.unwrap();
+        assert_eq!(binding.authority(), Some(authority()));
+        assert_eq!(binding.helper_epoch(), HelperEpoch::new(9).unwrap());
+        assert_eq!(
+            binding.next_sequence(),
+            Some(RequestSequence::new(17).unwrap())
+        );
+    }
 }

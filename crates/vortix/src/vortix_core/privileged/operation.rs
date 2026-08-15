@@ -314,6 +314,10 @@ impl ServiceInstanceClaim {
     fn binding_digest(&self) -> OperationDigest {
         OperationDigest::semantic(b"service-instance", self)
     }
+
+    fn authority_binding_digest(&self) -> OperationDigest {
+        authority_binding_digest(self.manager_instance_nonce)
+    }
 }
 
 /// Untrusted peer credential claim. Scalar construction never grants trust;
@@ -426,6 +430,40 @@ impl AuthorityBinding {
     pub const fn service_instance_digest(self) -> OperationDigest {
         self.service_instance_digest
     }
+
+    pub(crate) fn for_service(
+        authority_epoch: AuthorityEpoch,
+        boot_scope: BootScope,
+        lease_id: LeaseId,
+        service: &ServiceInstanceClaim,
+    ) -> Result<Self, OperationError> {
+        Self::for_manager_nonce(
+            authority_epoch,
+            boot_scope,
+            lease_id,
+            service.manager_instance_nonce(),
+        )
+    }
+
+    pub(crate) fn for_manager_nonce(
+        authority_epoch: AuthorityEpoch,
+        boot_scope: BootScope,
+        lease_id: LeaseId,
+        manager_instance_nonce: [u8; 32],
+    ) -> Result<Self, OperationError> {
+        Self::new(
+            authority_epoch,
+            boot_scope,
+            lease_id,
+            authority_binding_digest(manager_instance_nonce),
+        )
+    }
+}
+
+fn authority_binding_digest(manager_instance_nonce: [u8; 32]) -> OperationDigest {
+    let mut material = b"vortix-manager-instance-v1\0".to_vec();
+    material.extend_from_slice(&manager_instance_nonce);
+    OperationDigest::of_bytes(&material)
 }
 
 /// Opaque result of U11's platform verifier. Construction is crate-private so
@@ -546,6 +584,16 @@ impl RootAuthorityLedger {
         }
     }
 
+    pub(crate) fn authority_binding(&self) -> AuthorityBinding {
+        AuthorityBinding::for_service(
+            self.authority_epoch,
+            self.boot_scope,
+            self.lease_id,
+            &self.service,
+        )
+        .expect("validated root authority always has a valid public binding")
+    }
+
     #[must_use]
     pub const fn authority_epoch(&self) -> AuthorityEpoch {
         self.authority_epoch
@@ -622,6 +670,24 @@ pub struct TrustedDaemonPrincipal {
 }
 
 impl TrustedDaemonPrincipal {
+    pub(crate) fn from_authenticated_binding(
+        owner_uid: u32,
+        binding: AuthorityBinding,
+        service: &ServiceInstanceClaim,
+    ) -> Result<Self, OperationError> {
+        if owner_uid == 0 || binding.service_instance_digest() != service.authority_binding_digest()
+        {
+            return Err(OperationError::PrincipalMismatch);
+        }
+        Ok(Self {
+            owner_uid,
+            authority_epoch: binding.authority_epoch(),
+            boot_scope: binding.boot_scope(),
+            lease_id: binding.lease_id(),
+            service_binding: service.binding_digest(),
+        })
+    }
+
     #[must_use]
     pub const fn authority_epoch(&self) -> AuthorityEpoch {
         self.authority_epoch
@@ -1777,6 +1843,31 @@ impl ReplayRecord {
             Self::HighWater(record) => record.authority_epoch,
         }
     }
+
+    pub(crate) fn next_helper_session(
+        &self,
+    ) -> Result<(HelperEpoch, RequestSequence), OperationError> {
+        match self {
+            Self::Unused(record) => Ok((record.initial_helper_epoch, RequestSequence::new(1)?)),
+            Self::HighWater(record) => {
+                let helper_epoch = record
+                    .helper_epoch
+                    .get()
+                    .checked_add(1)
+                    .ok_or(OperationError::InvalidReplayState)?;
+                let next_sequence = record
+                    .highest_id
+                    .sequence
+                    .get()
+                    .checked_add(1)
+                    .ok_or(OperationError::InvalidReplayState)?;
+                Ok((
+                    HelperEpoch::new(helper_epoch)?,
+                    RequestSequence::new(next_sequence)?,
+                ))
+            }
+        }
+    }
 }
 
 /// Non-serializable replay capability authenticated by the root ledger.
@@ -1914,6 +2005,17 @@ impl OperationGuard {
             .clone()
             .map(Box::new)
             .map(ReplayRecord::HighWater)
+    }
+
+    /// First sequence that cannot alias any request durably admitted by this
+    /// authority. The helper authenticates this cursor in the v4 handshake so
+    /// a reconnecting daemon cannot reset its local counter.
+    pub(crate) fn next_sequence(&self) -> Result<RequestSequence, OperationError> {
+        let next = self.highest.as_ref().map_or(Some(1), |state| {
+            state.highest_id.sequence.get().checked_add(1)
+        });
+        let next = next.ok_or(OperationError::InvalidReplayState)?;
+        RequestSequence::new(next).map_err(|_| OperationError::InvalidReplayState)
     }
 
     #[must_use]

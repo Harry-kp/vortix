@@ -3,8 +3,8 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::{
-    has_duplicates, BoundedVec, ObservedChildIdentity, PolicyDigest, PolicyProjection,
-    ReplayRecord, ResourceKind, ResourceTag, MAX_RESOURCE_ITEMS,
+    has_duplicates, BoundedVec, HelperEpoch, ObservedChildIdentity, OperationError, PolicyDigest,
+    PolicyProjection, ReplayRecord, RequestSequence, ResourceKind, ResourceTag, MAX_RESOURCE_ITEMS,
 };
 
 const HELPER_LEDGER_SCHEMA_VERSION: u16 = 8;
@@ -797,6 +797,12 @@ impl HelperLedgerRecord {
             physical_dns: Vec::new(),
             child_observations: Vec::new(),
         }
+    }
+
+    pub(crate) fn next_helper_session(
+        &self,
+    ) -> Result<(HelperEpoch, RequestSequence), OperationError> {
+        self.replay.next_helper_session()
     }
 
     #[cfg(test)]

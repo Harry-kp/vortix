@@ -15,8 +15,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::dns::RecoveredDnsState;
 use crate::helper::material::TunnelMaterialSet;
 use crate::helper::protocol::{
-    negotiate_enrolled, HelperCapability, HelperClientHello, HelperError, HelperOp, HelperRequest,
-    HelperResponse, HelperResult, HelperSessionBinding,
+    capability_for_operation, negotiate_enrolled, HelperCapability, HelperClientHello, HelperError,
+    HelperOp, HelperRequest, HelperResponse, HelperResult,
 };
 use crate::vortix_core::privileged::{
     AmbiguousPhase, ChildOwner, ChildSpawnAuthority, HelperEpoch, HelperLedgerDns,
@@ -749,11 +749,11 @@ where
         }
         let response = negotiate_enrolled(
             hello,
-            HelperSessionBinding {
-                authority_epoch: self.root.authority_epoch(),
-                lease_id: self.root.lease_id(),
-                helper_epoch: self.helper_epoch,
-            },
+            self.root.authority_binding(),
+            self.helper_epoch,
+            self.guard
+                .next_sequence()
+                .map_err(|_| HelperError::LedgerUnavailable)?,
             &self.enabled_capabilities,
         )?;
         self.handshaken = true;
@@ -773,10 +773,10 @@ where
         }
         if !self
             .enabled_capabilities
-            .contains(&capability_for(request.operation()))
+            .contains(&capability_for_operation(request.operation()))
         {
             return Err(HelperError::CapabilityUnavailable {
-                capability: capability_for(request.operation()),
+                capability: capability_for_operation(request.operation()),
             });
         }
 
@@ -2290,17 +2290,6 @@ fn observation_state(
         .map(ResourceObservation::state)
 }
 
-fn capability_for(operation: &PrivilegedOperation) -> HelperCapability {
-    match operation {
-        PrivilegedOperation::StartTunnel(_) | PrivilegedOperation::StopTunnel(_) => {
-            HelperCapability::TunnelLifecycle
-        }
-        PrivilegedOperation::NetworkPolicy(_) => HelperCapability::NetworkPolicy,
-        PrivilegedOperation::Observe(_) => HelperCapability::Observe,
-        PrivilegedOperation::CleanupOwned(_) => HelperCapability::CleanupOwned,
-    }
-}
-
 fn receipt_result(receipt: VerifiedReceipt) -> Result<HelperResult, HelperError> {
     serde_json::to_value(receipt)
         .map(HelperResult::Receipt)
@@ -2331,6 +2320,7 @@ fn map_receipt_error(_error: ReceiptError) -> HelperError {
 mod tests {
     use super::*;
     use crate::daemon::helper_client::{AuthenticatedHelperSession, DeliveryState, RecoveryAction};
+    use crate::helper::replay_store::FsHelperLedgerStore;
     use crate::helper::validate::{
         verify_helper_peer, verify_service_instance, ArtifactFact, HelperPeerFacts,
         InstallManifest, PlatformLayout, VerifiedServiceFacts,
@@ -2348,6 +2338,7 @@ mod tests {
     use crate::vortix_core::profile::{ProfileId, ProtocolKind};
     use crate::vortix_core::state::killswitch::KillSwitchMode;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::os::unix::fs::PermissionsExt as _;
 
     #[derive(Default)]
     struct MemoryHelperLedgerStore {
@@ -2978,6 +2969,99 @@ mod tests {
             });
             self.client.verify_receipt(id, request, response).unwrap()
         }
+    }
+
+    #[test]
+    fn persistent_ledger_reconnect_advances_epoch_and_authenticated_sequence_cursor() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            directory.path(),
+            std::fs::Permissions::from_mode(crate::helper::HELPER_RUNTIME_DIR_MODE),
+        )
+        .unwrap();
+        let path = directory.path().join("helper-ledger.json");
+        let uid = crate::utils::effective_user_group_ids().0;
+        let (root, principal, claim, first_epoch, baseline) = fixture();
+        let mut initial_store = FsHelperLedgerStore::for_test(&path, uid);
+        initial_store.initialize(baseline.clone()).unwrap();
+        let mut first = EnrolledHelperSession::resume(
+            root.clone(),
+            first_epoch,
+            baseline,
+            FakeExecutor::default(),
+            initial_store,
+        )
+        .unwrap();
+        assert!(first
+            .handle(HelperRequest {
+                id: 1,
+                op: HelperOp::Handshake(HelperClientHello::current(
+                    501,
+                    claim.clone(),
+                    vec![HelperCapability::Observe],
+                )),
+            })
+            .result
+            .is_ok());
+        let first_request = PrivilegedRequest::new(
+            &principal,
+            first_epoch,
+            RequestSequence::new(1).unwrap(),
+            PrivilegedOperation::Observe(vec![wireguard_target(resource())]),
+        )
+        .unwrap();
+        let first_result = first.handle(HelperRequest {
+            id: 2,
+            op: HelperOp::Execute(Box::new(first_request)),
+        });
+        assert!(
+            first_result.result.is_ok(),
+            "{:?}",
+            first_result.result.err()
+        );
+        drop(first);
+
+        let recovered_store = FsHelperLedgerStore::for_test(&path, uid);
+        let ledger = recovered_store.load().unwrap();
+        let (second_epoch, next_sequence) = ledger.next_helper_session().unwrap();
+        assert_eq!(second_epoch, HelperEpoch::new(9).unwrap());
+        assert_eq!(next_sequence, RequestSequence::new(2).unwrap());
+        let mut second = EnrolledHelperSession::recover(
+            root,
+            second_epoch,
+            ledger,
+            FakeExecutor::default(),
+            recovered_store,
+        )
+        .unwrap();
+        let handshake = second.handle(HelperRequest {
+            id: 1,
+            op: HelperOp::Handshake(HelperClientHello::current(
+                501,
+                claim,
+                vec![HelperCapability::Observe],
+            )),
+        });
+        let HelperResult::Handshake(hello) = handshake.result.unwrap() else {
+            panic!("expected enrolled handshake");
+        };
+        let binding = hello.session.unwrap();
+        assert_eq!(binding.helper_epoch(), second_epoch);
+        assert_eq!(binding.next_sequence(), Some(next_sequence));
+        let second_request = PrivilegedRequest::new(
+            &principal,
+            second_epoch,
+            next_sequence,
+            PrivilegedOperation::Observe(vec![wireguard_target(resource())]),
+        )
+        .unwrap();
+        assert!(second
+            .handle(HelperRequest {
+                id: 2,
+                op: HelperOp::Execute(Box::new(second_request)),
+            })
+            .result
+            .is_ok());
     }
 
     fn recover_session(

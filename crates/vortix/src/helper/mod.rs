@@ -30,6 +30,9 @@ pub use bootstrap::{
     BootstrapCommitReceipt, BootstrapError, BootstrapReserveReceipt, BootstrapStageReceipt,
     MAX_INSTALL_REQUEST_BYTES,
 };
+pub(crate) use descriptor_transport::{
+    expected_descriptor_count_for_operation, prepare_request, send_prepared_request,
+};
 pub use protocol::{
     decode_request_frame, decode_response_frame, encode_request_frame, encode_response_frame,
     negotiate_staged, parse_request, HelperAuthorityMode, HelperCapability, HelperClientHello,
@@ -37,6 +40,7 @@ pub use protocol::{
     HelperSessionBinding, HELPER_PROTOCOL_MAX, HELPER_PROTOCOL_MIN, HELPER_SCHEMA_MAX,
     HELPER_SCHEMA_MIN, MAX_HELPER_FRAME_BYTES,
 };
+pub(crate) use transport::connect_verified_helper;
 pub use transport::{serve_staged_helper, HelperTransportError};
 pub use validate::{
     ArtifactKind, EnrollmentSupport, InstallError, InstallManifest, InstallPlan, InstallRequest,
