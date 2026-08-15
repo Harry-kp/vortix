@@ -1,5 +1,8 @@
 //! Helper-owned DNS policy orchestration.
 
+use std::fs::File;
+use std::io::Read as _;
+
 use super::observe::authority_interface_name;
 use super::server::{
     NetworkPolicyExecutionPlan, NetworkPolicyOutcome, NetworkPolicyPreparationError,
@@ -11,8 +14,9 @@ use crate::vortix_core::ports::owned_dns::{
     ExpectedDnsState, OwnedDns, OwnedDnsBackend, OwnedDnsError,
 };
 use crate::vortix_core::privileged::{
-    HelperResourceState, LeaseId, NetworkPolicyOperation, ObservationState, PolicyProjection,
-    PrivilegedDnsScope, ResourceObservation,
+    DnsTransactionId, HelperLedgerDns, HelperResourceState, LeaseId, NetworkPolicyOperation,
+    ObservationState, PhysicalDnsBackend, PhysicalDnsStage, PolicyProjection, PrivilegedDnsScope,
+    ResourceObservation,
 };
 
 #[derive(Clone)]
@@ -20,6 +24,7 @@ pub(crate) struct RecoveredDnsState {
     state: HelperResourceState,
     intended: PolicyProjection,
     effective: Option<PolicyProjection>,
+    physical: Option<HelperLedgerDns>,
 }
 
 impl RecoveredDnsState {
@@ -32,6 +37,21 @@ impl RecoveredDnsState {
             state,
             intended,
             effective,
+            physical: None,
+        }
+    }
+
+    pub(crate) fn with_physical(
+        state: HelperResourceState,
+        intended: PolicyProjection,
+        effective: Option<PolicyProjection>,
+        physical: HelperLedgerDns,
+    ) -> Self {
+        Self {
+            state,
+            intended,
+            effective,
+            physical: Some(physical),
         }
     }
 
@@ -48,6 +68,10 @@ impl RecoveredDnsState {
     #[cfg(test)]
     pub(crate) const fn effective(&self) -> Option<&PolicyProjection> {
         self.effective.as_ref()
+    }
+
+    pub(crate) const fn physical(&self) -> Option<&HelperLedgerDns> {
+        self.physical.as_ref()
     }
 }
 
@@ -91,6 +115,14 @@ impl HelperDnsExecutor {
                 Ok(())
             };
         }
+        if states.iter().any(|state| {
+            state.physical().is_some_and(|physical| {
+                Some(physical.backend()) != physical_backend(self.platform.backend())
+                    || physical.intended_digest() != state.intended.digest()
+            })
+        }) {
+            return Err(PrivilegedExecutionError::InvalidPlan);
+        }
         let pending = states
             .iter()
             .filter(|state| state.state == HelperResourceState::PendingEffect)
@@ -100,9 +132,7 @@ impl HelperDnsExecutor {
         }
         if let Some(state) = pending.first() {
             let desired = dns_policy(self.layout, self.lease_id, &state.intended)?;
-            let prior = state
-                .effective
-                .as_ref()
+            let prior = recovery_prior(states, state)
                 .map(|projection| dns_policy(self.layout, self.lease_id, projection))
                 .transpose()?;
             return self
@@ -136,17 +166,45 @@ impl HelperDnsExecutor {
         match plan.operation() {
             NetworkPolicyOperation::ApplyDns { .. } => {
                 self.audit_before_mutation(plan)?;
-                Ok(PreparedNetworkPolicyExecutionPlan::new(
+                let backend = physical_backend(self.platform.backend())
+                    .ok_or(NetworkPolicyPreparationError::FailedBeforeEffect)?;
+                let policy = plan.operation().policy_resource();
+                let mut dns = plan.recovered_dns().to_vec();
+                let prepared = match dns.iter().find(|physical| physical.resource() == policy) {
+                    Some(existing) => existing
+                        .prepare_for(plan.intended())
+                        .map_err(|_| NetworkPolicyPreparationError::InvalidPlan)?,
+                    None => HelperLedgerDns::prepared(
+                        policy.clone(),
+                        backend,
+                        new_transaction_id()
+                            .map_err(|_| NetworkPolicyPreparationError::FailedBeforeEffect)?,
+                        plan.intended().digest(),
+                        Vec::new(),
+                    )
+                    .map_err(|_| NetworkPolicyPreparationError::InvalidPlan)?,
+                };
+                if let Some(existing) = dns
+                    .iter_mut()
+                    .find(|physical| physical.resource() == policy)
+                {
+                    *existing = prepared;
+                } else {
+                    dns.push(prepared);
+                }
+                Ok(PreparedNetworkPolicyExecutionPlan::with_physical_ownership(
                     plan.clone(),
                     Vec::new(),
+                    dns,
                 ))
             }
             NetworkPolicyOperation::ObserveBarrier { policy, .. }
                 if policy.kind() == crate::vortix_core::privileged::ResourceKind::Dns =>
             {
-                Ok(PreparedNetworkPolicyExecutionPlan::new(
+                Ok(PreparedNetworkPolicyExecutionPlan::with_physical_ownership(
                     plan.clone(),
                     Vec::new(),
+                    plan.recovered_dns().to_vec(),
                 ))
             }
             NetworkPolicyOperation::ReleaseObsolete {
@@ -169,9 +227,10 @@ impl HelperDnsExecutor {
                 }) {
                     return Err(NetworkPolicyPreparationError::InvalidPlan);
                 }
-                Ok(PreparedNetworkPolicyExecutionPlan::new(
+                Ok(PreparedNetworkPolicyExecutionPlan::with_physical_ownership(
                     plan.clone(),
                     Vec::new(),
+                    plan.recovered_dns().to_vec(),
                 ))
             }
             _ => Err(NetworkPolicyPreparationError::InvalidPlan),
@@ -185,6 +244,12 @@ impl HelperDnsExecutor {
         let plan = prepared.execution();
         match plan.operation() {
             NetworkPolicyOperation::ApplyDns { .. } => {
+                if !prepared.prepared_dns().iter().any(|physical| {
+                    physical.resource() == plan.operation().policy_resource()
+                        && physical.stage() == PhysicalDnsStage::EffectPendingObservation
+                }) {
+                    return Err(PrivilegedExecutionError::InvalidPlan);
+                }
                 let desired = dns_policy(self.layout, self.lease_id, plan.intended())?;
                 let prior = plan
                     .prior_effective()
@@ -239,6 +304,27 @@ impl HelperDnsExecutor {
         };
         result.map_err(|_| NetworkPolicyPreparationError::FailedBeforeEffect)
     }
+}
+
+fn recovery_prior<'a>(
+    states: &'a [RecoveredDnsState],
+    pending: &'a RecoveredDnsState,
+) -> Option<&'a PolicyProjection> {
+    pending.effective.as_ref().or_else(|| {
+        let policy = pending.intended.policy();
+        states
+            .iter()
+            .filter(|candidate| {
+                matches!(
+                    candidate.state,
+                    HelperResourceState::Owned | HelperResourceState::PendingRelease
+                ) && candidate.intended.policy().authority_epoch() == policy.authority_epoch()
+                    && candidate.intended.policy().generation() < policy.generation()
+                    && candidate.effective.is_some()
+            })
+            .max_by_key(|candidate| candidate.intended.policy().generation())
+            .and_then(|candidate| candidate.effective.as_ref())
+    })
 }
 
 fn dns_policy(
@@ -299,6 +385,20 @@ const fn layout_for_backend(backend: OwnedDnsBackend) -> PlatformLayout {
         OwnedDnsBackend::LinuxPendingPhysicalLedger => PlatformLayout::Linux,
         OwnedDnsBackend::MacOsResolverFiles => PlatformLayout::MacOs,
     }
+}
+
+const fn physical_backend(backend: OwnedDnsBackend) -> Option<PhysicalDnsBackend> {
+    match backend {
+        OwnedDnsBackend::LinuxPendingPhysicalLedger => None,
+        OwnedDnsBackend::MacOsResolverFiles => Some(PhysicalDnsBackend::MacOsResolverFiles),
+    }
+}
+
+fn new_transaction_id() -> std::io::Result<DnsTransactionId> {
+    let mut bytes = [0; 32];
+    File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    DnsTransactionId::new(bytes)
+        .map_err(|reason| std::io::Error::new(std::io::ErrorKind::InvalidData, reason))
 }
 
 const fn map_execution_error(error: OwnedDnsError) -> PrivilegedExecutionError {
@@ -415,11 +515,10 @@ mod tests {
 
         subject
             .validate_recovered(
-                &[RecoveredDnsState::new(
-                    HelperResourceState::PendingEffect,
-                    intended,
-                    Some(prior),
-                )],
+                &[
+                    RecoveredDnsState::new(HelperResourceState::Owned, prior.clone(), Some(prior)),
+                    RecoveredDnsState::new(HelperResourceState::PendingEffect, intended, None),
+                ],
                 true,
             )
             .unwrap();
