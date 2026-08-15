@@ -373,6 +373,61 @@ impl LeaseId {
     }
 }
 
+/// Non-secret cross-store identity for one enrolled authority generation.
+/// The service-manager nonce is represented only by a domain-separated
+/// digest; the root capability itself never enters user-owned state or IPC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorityBinding {
+    authority_epoch: AuthorityEpoch,
+    boot_scope: BootScope,
+    lease_id: LeaseId,
+    service_instance_digest: OperationDigest,
+}
+
+impl AuthorityBinding {
+    pub fn new(
+        authority_epoch: AuthorityEpoch,
+        boot_scope: BootScope,
+        lease_id: LeaseId,
+        service_instance_digest: OperationDigest,
+    ) -> Result<Self, OperationError> {
+        if authority_epoch.0 == 0
+            || boot_scope == BootScope::new([0; 16])
+            || lease_id == LeaseId::new([0; 32])
+            || service_instance_digest.is_zero()
+        {
+            return Err(OperationError::InvalidLease);
+        }
+        Ok(Self {
+            authority_epoch,
+            boot_scope,
+            lease_id,
+            service_instance_digest,
+        })
+    }
+
+    #[must_use]
+    pub const fn authority_epoch(self) -> AuthorityEpoch {
+        self.authority_epoch
+    }
+
+    #[must_use]
+    pub const fn boot_scope(self) -> BootScope {
+        self.boot_scope
+    }
+
+    #[must_use]
+    pub const fn lease_id(self) -> LeaseId {
+        self.lease_id
+    }
+
+    #[must_use]
+    pub const fn service_instance_digest(self) -> OperationDigest {
+        self.service_instance_digest
+    }
+}
+
 /// Opaque result of U11's platform verifier. Construction is crate-private so
 /// no ordinary wire or public scalar API can bless daemon authority.
 #[allow(dead_code, reason = "U11 platform verifier seam")]

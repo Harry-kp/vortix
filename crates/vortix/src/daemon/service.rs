@@ -17,12 +17,14 @@ use crate::vortix_core::control::{
     UserCommand,
 };
 use crate::vortix_core::ipc::{IpcError, IpcOp, IpcResult, RemoteSessionId, SensitiveBytes};
+use crate::vortix_core::privileged::AuthorityBinding;
 
 /// Production activation is deliberately one-state in the preparatory
 /// release. U13 replaces this closed gate only after enrollment is verified.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoteMutationGate {
     Disabled,
+    Enrolled(AuthorityBinding),
 }
 
 impl RemoteMutationGate {
@@ -31,9 +33,10 @@ impl RemoteMutationGate {
         Self::Disabled
     }
 
-    pub const fn require_enabled(self) -> Result<(), RemoteControlError> {
+    pub const fn require_enabled(self) -> Result<AuthorityBinding, RemoteControlError> {
         match self {
             Self::Disabled => Err(RemoteControlError::MutationDisabled),
+            Self::Enrolled(binding) => Ok(binding),
         }
     }
 }
@@ -42,6 +45,8 @@ impl RemoteMutationGate {
 pub enum RemoteControlError {
     #[error("remote mutation is unavailable until Background enrollment is atomically activated")]
     MutationDisabled,
+    #[error("remote control daemon does not match the enrolled authority binding")]
+    AuthorityMismatch,
     #[error("remote control daemon is unavailable: {0}")]
     Unavailable(String),
     #[error("remote control daemon is incompatible: {0}")]
@@ -103,12 +108,35 @@ pub trait RemoteControlSubscription: Send {
 /// It carries only the public client capability: no observation, completion,
 /// readiness, helper, or privileged mutation handle crosses this boundary.
 pub trait RemoteControlTransport: Send + Sync + 'static {
+    fn open_authorized(
+        &self,
+        _expected: AuthorityBinding,
+    ) -> Result<IpcResult, RemoteControlError> {
+        Err(RemoteControlError::AuthorityMismatch)
+    }
+
     fn exchange(&self, op: IpcOp) -> Result<IpcResult, RemoteControlError>;
+
+    fn exchange_authorized(
+        &self,
+        _op: IpcOp,
+        _expected: AuthorityBinding,
+    ) -> Result<IpcResult, RemoteControlError> {
+        Err(RemoteControlError::AuthorityMismatch)
+    }
 
     fn subscribe(
         &self,
         session_id: &RemoteSessionId,
     ) -> Result<(Box<dyn RemoteControlSubscription>, ControlSnapshot), RemoteControlError>;
+
+    fn subscribe_authorized(
+        &self,
+        _session_id: &RemoteSessionId,
+        _expected: AuthorityBinding,
+    ) -> Result<(Box<dyn RemoteControlSubscription>, ControlSnapshot), RemoteControlError> {
+        Err(RemoteControlError::AuthorityMismatch)
+    }
 }
 
 /// Remote counterpart of a local `ControlHandle`. Its constructor is exposed
@@ -118,6 +146,7 @@ pub struct RemoteControlSession {
     transport: Arc<dyn RemoteControlTransport>,
     session_id: RemoteSessionId,
     client_id: ClientId,
+    authority_binding: Option<AuthorityBinding>,
     snapshot: Mutex<ControlSnapshot>,
     subscription: Mutex<Box<dyn RemoteControlSubscription>>,
     profile_stage: Mutex<()>,
@@ -151,8 +180,9 @@ impl RemoteControlSession {
         gate: RemoteMutationGate,
         transport: Arc<dyn RemoteControlTransport>,
     ) -> Result<Self, RemoteControlError> {
-        gate.require_enabled()?;
-        Self::open(transport)
+        let binding = gate.require_enabled()?;
+        let opened = transport.open_authorized(binding)?;
+        Self::from_opened(transport, opened, Some(binding))
     }
 
     /// Fixture entry point used to prove local/remote parity without enabling
@@ -165,24 +195,44 @@ impl RemoteControlSession {
     }
 
     fn open(transport: Arc<dyn RemoteControlTransport>) -> Result<Self, RemoteControlError> {
+        let opened = transport.exchange(IpcOp::ControlOpen)?;
+        Self::from_opened(transport, opened, None)
+    }
+
+    fn from_opened(
+        transport: Arc<dyn RemoteControlTransport>,
+        opened: IpcResult,
+        authority_binding: Option<AuthorityBinding>,
+    ) -> Result<Self, RemoteControlError> {
         let IpcResult::ControlOpened {
             session_id,
             client_id,
-        } = transport.exchange(IpcOp::ControlOpen)?
+        } = opened
         else {
             return Err(RemoteControlError::Protocol(
                 "daemon returned a non-control open response".into(),
             ));
         };
-        let (subscription, snapshot) = transport.subscribe(&session_id)?;
+        let (subscription, snapshot) = match authority_binding {
+            Some(binding) => transport.subscribe_authorized(&session_id, binding)?,
+            None => transport.subscribe(&session_id)?,
+        };
         Ok(Self {
             transport,
             session_id,
             client_id,
+            authority_binding,
             snapshot: Mutex::new(snapshot),
             subscription: Mutex::new(subscription),
             profile_stage: Mutex::new(()),
         })
+    }
+
+    fn exchange(&self, op: IpcOp) -> Result<IpcResult, RemoteControlError> {
+        match self.authority_binding {
+            Some(binding) => self.transport.exchange_authorized(op, binding),
+            None => self.transport.exchange(op),
+        }
     }
 
     #[must_use]
@@ -197,7 +247,7 @@ impl RemoteControlSession {
         idempotency_key: impl Into<String>,
     ) -> Result<AdmittedOperation, RemoteControlError> {
         let timeout_millis = timeout.as_millis().try_into().unwrap_or(u64::MAX);
-        let result = self.transport.exchange(IpcOp::ControlSubmit {
+        let result = self.exchange(IpcOp::ControlSubmit {
             session_id: self.session_id.clone(),
             command,
             idempotency_key: IdempotencyKey::new(idempotency_key),
@@ -212,7 +262,7 @@ impl RemoteControlSession {
     }
 
     pub fn refresh_snapshot(&self) -> Result<ControlSnapshot, RemoteControlError> {
-        let result = self.transport.exchange(IpcOp::ControlSnapshot {
+        let result = self.exchange(IpcOp::ControlSnapshot {
             session_id: self.session_id.clone(),
         })?;
         let IpcResult::ControlSnapshot { snapshot } = result else {
@@ -239,7 +289,12 @@ impl RemoteControlSession {
                 Ok(Some(update)) => newest = Some(update.snapshot),
                 Ok(None) => break,
                 Err(RemoteControlError::ResyncRequired { .. }) => {
-                    let resubscribed = self.transport.subscribe(&self.session_id);
+                    let resubscribed = match self.authority_binding {
+                        Some(binding) => self
+                            .transport
+                            .subscribe_authorized(&self.session_id, binding),
+                        None => self.transport.subscribe(&self.session_id),
+                    };
                     match resubscribed {
                         Ok((replacement, boundary)) => {
                             if let Some(drained) = newest
@@ -283,7 +338,7 @@ impl RemoteControlSession {
         challenge_id: ChallengeId,
         answer: Secret,
     ) -> Result<(), RemoteControlError> {
-        let result = self.transport.exchange(IpcOp::ControlRespondChallenge {
+        let result = self.exchange(IpcOp::ControlRespondChallenge {
             session_id: self.session_id.clone(),
             challenge_id,
             answer: SensitiveBytes::new(answer.into_vec()),
@@ -297,7 +352,7 @@ impl RemoteControlSession {
     }
 
     pub fn cancel_challenge(&self, challenge_id: ChallengeId) -> Result<(), RemoteControlError> {
-        let result = self.transport.exchange(IpcOp::ControlCancelChallenge {
+        let result = self.exchange(IpcOp::ControlCancelChallenge {
             session_id: self.session_id.clone(),
             challenge_id,
         })?;
@@ -385,7 +440,7 @@ impl RemoteControlSession {
                     }
                 }
             }
-            let result = self.transport.exchange(IpcOp::ControlStageProfileImport {
+            let result = self.exchange(IpcOp::ControlStageProfileImport {
                 session_id: self.session_id.clone(),
                 file_name: file_name.to_owned(),
                 offset,
@@ -418,7 +473,7 @@ impl RemoteControlSession {
     }
 
     fn cancel_profile_stage(&self) {
-        let _ = self.transport.exchange(IpcOp::ControlCancelProfileImport {
+        let _ = self.exchange(IpcOp::ControlCancelProfileImport {
             session_id: self.session_id.clone(),
         });
     }
@@ -511,6 +566,102 @@ mod tests {
         cancelled: AtomicBool,
     }
 
+    struct ResyncOnce(bool);
+
+    impl RemoteControlSubscription for ResyncOnce {
+        fn try_recv(&mut self) -> Result<Option<RemoteControlUpdate>, RemoteControlError> {
+            if std::mem::take(&mut self.0) {
+                Err(RemoteControlError::ResyncRequired {
+                    newest_generation: 1,
+                })
+            } else {
+                Ok(None)
+            }
+        }
+    }
+
+    struct AuthorizedPathTransport {
+        binding: AuthorityBinding,
+        generic_exchanges: AtomicUsize,
+        generic_subscriptions: AtomicUsize,
+        authorized_subscriptions: AtomicUsize,
+        authorized_operations: Mutex<Vec<&'static str>>,
+    }
+
+    impl AuthorizedPathTransport {
+        fn record_authorized(&self, op: &IpcOp) {
+            let operation = match op {
+                IpcOp::ControlSubmit { .. } => "submit",
+                IpcOp::ControlSnapshot { .. } => "snapshot",
+                IpcOp::ControlRespondChallenge { .. } => "respond_challenge",
+                IpcOp::ControlCancelChallenge { .. } => "cancel_challenge",
+                IpcOp::ControlStageProfileImport { .. } => "stage_profile",
+                IpcOp::ControlCancelProfileImport { .. } => "cancel_profile",
+                _ => "other",
+            };
+            self.authorized_operations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(operation);
+        }
+    }
+
+    impl RemoteControlTransport for AuthorizedPathTransport {
+        fn open_authorized(
+            &self,
+            expected: AuthorityBinding,
+        ) -> Result<IpcResult, RemoteControlError> {
+            assert_eq!(expected, self.binding);
+            Ok(IpcResult::ControlOpened {
+                session_id: RemoteSessionId::parse(format!("session-{}", "c".repeat(32))).unwrap(),
+                client_id: serde_json::from_str("\"client-0000000000000000-0000000000000001\"")
+                    .unwrap(),
+            })
+        }
+
+        fn exchange(&self, _op: IpcOp) -> Result<IpcResult, RemoteControlError> {
+            self.generic_exchanges.fetch_add(1, Ordering::SeqCst);
+            Err(RemoteControlError::Protocol(
+                "production session used generic exchange".into(),
+            ))
+        }
+
+        fn exchange_authorized(
+            &self,
+            op: IpcOp,
+            expected: AuthorityBinding,
+        ) -> Result<IpcResult, RemoteControlError> {
+            assert_eq!(expected, self.binding);
+            self.record_authorized(&op);
+            Err(RemoteControlError::AuthorityMismatch)
+        }
+
+        fn subscribe(
+            &self,
+            _session_id: &RemoteSessionId,
+        ) -> Result<(Box<dyn RemoteControlSubscription>, ControlSnapshot), RemoteControlError>
+        {
+            self.generic_subscriptions.fetch_add(1, Ordering::SeqCst);
+            Err(RemoteControlError::Protocol(
+                "production session used generic subscription".into(),
+            ))
+        }
+
+        fn subscribe_authorized(
+            &self,
+            _session_id: &RemoteSessionId,
+            expected: AuthorityBinding,
+        ) -> Result<(Box<dyn RemoteControlSubscription>, ControlSnapshot), RemoteControlError>
+        {
+            assert_eq!(expected, self.binding);
+            let attempt = self.authorized_subscriptions.fetch_add(1, Ordering::SeqCst);
+            Ok((
+                Box::new(ResyncOnce(attempt == 0)),
+                ControlSnapshot::default(),
+            ))
+        }
+    }
+
     impl RemoteControlTransport for ProfileChunkTransport {
         fn exchange(&self, op: IpcOp) -> Result<IpcResult, RemoteControlError> {
             match op {
@@ -557,6 +708,77 @@ mod tests {
         {
             Ok((Box::new(EmptySubscription), ControlSnapshot::default()))
         }
+    }
+
+    #[test]
+    fn production_session_authorizes_every_fresh_control_connection() {
+        let binding = AuthorityBinding::new(
+            crate::vortix_core::control::AuthorityEpoch(7),
+            crate::vortix_core::privileged::BootScope::new([1; 16]),
+            crate::vortix_core::privileged::LeaseId::new([2; 32]),
+            crate::vortix_core::privileged::OperationDigest::of_bytes(b"service instance"),
+        )
+        .unwrap();
+        let transport = Arc::new(AuthorizedPathTransport {
+            binding,
+            generic_exchanges: AtomicUsize::new(0),
+            generic_subscriptions: AtomicUsize::new(0),
+            authorized_subscriptions: AtomicUsize::new(0),
+            authorized_operations: Mutex::new(Vec::new()),
+        });
+        let session = RemoteControlSession::connect_production(
+            RemoteMutationGate::Enrolled(binding),
+            transport.clone(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            session.submit(
+                UserCommand::Disconnect { profile_id: None },
+                Duration::from_secs(1),
+                "authorized-submit"
+            ),
+            Err(RemoteControlError::AuthorityMismatch)
+        ));
+        assert!(matches!(
+            session.refresh_snapshot(),
+            Err(RemoteControlError::AuthorityMismatch)
+        ));
+        let challenge_id = ChallengeId::from_counter(1);
+        assert!(matches!(
+            session.respond_challenge(challenge_id, Secret::new(b"answer".to_vec())),
+            Err(RemoteControlError::AuthorityMismatch)
+        ));
+        assert!(matches!(
+            session.cancel_challenge(challenge_id),
+            Err(RemoteControlError::AuthorityMismatch)
+        ));
+        let mut profile = std::io::Cursor::new(b"profile".to_vec());
+        assert!(matches!(
+            session.stage_profile_reader("profile.conf", 7, &mut profile),
+            Err(RemoteControlError::AuthorityMismatch)
+        ));
+        session.cancel_profile_stage();
+        assert!(session.take_changed_snapshot().is_ok());
+
+        assert_eq!(transport.generic_exchanges.load(Ordering::SeqCst), 0);
+        assert_eq!(transport.generic_subscriptions.load(Ordering::SeqCst), 0);
+        assert_eq!(transport.authorized_subscriptions.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *transport
+                .authorized_operations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            [
+                "submit",
+                "snapshot",
+                "respond_challenge",
+                "cancel_challenge",
+                "stage_profile",
+                "cancel_profile",
+                "cancel_profile",
+            ]
+        );
     }
 
     struct ScriptedReader {

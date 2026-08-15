@@ -23,8 +23,7 @@ use super::validate::{
     ArtifactFact, ArtifactKind, InstallManifest, InstallRequest, PlatformLayout,
 };
 use super::INSTALL_SCHEMA_VERSION;
-use crate::vortix_core::privileged::OperationDigest;
-use crate::vortix_core::privileged::{BootScope, LeaseId};
+use crate::vortix_core::privileged::{AuthorityBinding, BootScope, LeaseId, OperationDigest};
 
 pub const MAX_INSTALL_REQUEST_BYTES: u64 = 16 * 1024;
 const MAX_INSTALL_MANIFEST_BYTES: u64 = 64 * 1024;
@@ -49,6 +48,7 @@ pub struct BootstrapReserveReceipt {
     pub manifest_generation: u64,
     pub manifest_digest: OperationDigest,
     pub authority_epoch: crate::vortix_core::control::AuthorityEpoch,
+    pub authority_binding: AuthorityBinding,
     pub candidate_ready: bool,
 }
 
@@ -60,6 +60,7 @@ pub struct BootstrapCommitReceipt {
     pub manifest_generation: u64,
     pub manifest_digest: OperationDigest,
     pub authority_epoch: crate::vortix_core::control::AuthorityEpoch,
+    pub authority_binding: AuthorityBinding,
     pub authority_enrolled: bool,
 }
 
@@ -107,6 +108,7 @@ pub fn reserve_package_from_reader(
         manifest_generation: manifest.generation(),
         manifest_digest: manifest.digest(),
         authority_epoch: reservation.authority_epoch(),
+        authority_binding: reservation.binding(),
         candidate_ready: true,
     })
 }
@@ -133,6 +135,7 @@ pub fn commit_package_from_reader(
         manifest_generation: manifest.generation(),
         manifest_digest: manifest.digest(),
         authority_epoch,
+        authority_binding: reservation.binding(),
         authority_enrolled: true,
     })
 }
@@ -433,6 +436,54 @@ pub enum BootstrapError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn authority_binding() -> AuthorityBinding {
+        AuthorityBinding::new(
+            crate::vortix_core::control::AuthorityEpoch(9),
+            BootScope::new([1; 16]),
+            LeaseId::new([2; 32]),
+            OperationDigest::of_bytes(b"service-instance"),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn reserve_receipt_keeps_schema_v1_epoch_alongside_binding() {
+        let binding = authority_binding();
+        let receipt = BootstrapReserveReceipt {
+            schema_version: 1,
+            owner_uid: 501,
+            layout: PlatformLayout::Linux,
+            manifest_generation: 7,
+            manifest_digest: OperationDigest::of_bytes(b"manifest"),
+            authority_epoch: binding.authority_epoch(),
+            authority_binding: binding,
+            candidate_ready: true,
+        };
+
+        let value = serde_json::to_value(receipt).unwrap();
+        assert_eq!(value["authority_epoch"], 9);
+        assert_eq!(value["authority_binding"]["authority_epoch"], 9);
+    }
+
+    #[test]
+    fn commit_receipt_keeps_schema_v1_epoch_alongside_binding() {
+        let binding = authority_binding();
+        let receipt = BootstrapCommitReceipt {
+            schema_version: 1,
+            owner_uid: 501,
+            layout: PlatformLayout::Linux,
+            manifest_generation: 7,
+            manifest_digest: OperationDigest::of_bytes(b"manifest"),
+            authority_epoch: binding.authority_epoch(),
+            authority_binding: binding,
+            authority_enrolled: true,
+        };
+
+        let value = serde_json::to_value(receipt).unwrap();
+        assert_eq!(value["authority_epoch"], 9);
+        assert_eq!(value["authority_binding"]["authority_epoch"], 9);
+    }
 
     #[test]
     fn bounded_reader_rejects_empty_and_oversized_input() {
