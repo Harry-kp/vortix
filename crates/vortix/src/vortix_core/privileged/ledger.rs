@@ -535,6 +535,23 @@ impl HelperLedgerDns {
         &self.links
     }
 
+    pub(crate) fn prepare_for(&self, projection: &PolicyProjection) -> Result<Self, &'static str> {
+        if !matches!(
+            self.stage,
+            PhysicalDnsStage::ObservedOwned | PhysicalDnsStage::ObservedAbsent
+        ) || projection.policy() != &self.resource
+        {
+            return Err("DNS projection does not match settled physical state");
+        }
+        Self::prepared(
+            self.resource.clone(),
+            self.backend,
+            self.transaction_id,
+            projection.digest(),
+            self.links.clone(),
+        )
+    }
+
     pub(crate) fn mark_effect_pending(mut self) -> Result<Self, &'static str> {
         if self.stage != PhysicalDnsStage::Prepared {
             return Err("DNS effect requires prepared ownership");

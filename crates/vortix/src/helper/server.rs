@@ -22,10 +22,10 @@ use crate::vortix_core::privileged::{
     AmbiguousPhase, ChildOwner, ChildSpawnAuthority, HelperEpoch, HelperLedgerDns,
     HelperLedgerFirewall, HelperLedgerPolicy, HelperLedgerRecord, HelperLedgerResource,
     HelperResourceState, NetworkPolicyOperation, ObservationState, ObservedChildIdentity,
-    OperationAdmission, OperationError, OperationGuard, OwnedChild, PhysicalFirewallStage,
-    PolicyProjection, PrivilegedOperation, ProtocolPlan, ReceiptError, ReceiptLedger,
-    RejectionCode, ResourceKind, ResourceObservation, ResourceObservationTarget, ResourceTag,
-    RootAuthorityLedger, VerifiedReceipt,
+    OperationAdmission, OperationError, OperationGuard, OwnedChild, PhysicalDnsStage,
+    PhysicalFirewallStage, PolicyProjection, PrivilegedOperation, ProtocolPlan, ReceiptError,
+    ReceiptLedger, RejectionCode, ResourceKind, ResourceObservation, ResourceObservationTarget,
+    ResourceTag, RootAuthorityLedger, VerifiedReceipt,
 };
 
 const ENABLED_CAPABILITIES: [HelperCapability; 5] = [
@@ -155,6 +155,7 @@ pub(crate) struct NetworkPolicyExecutionPlan {
     prior_effective: Option<PolicyProjection>,
     obsolete_effective: Vec<PolicyProjection>,
     recovered_firewalls: Vec<HelperLedgerFirewall>,
+    recovered_dns: Vec<HelperLedgerDns>,
 }
 
 impl NetworkPolicyExecutionPlan {
@@ -176,6 +177,10 @@ impl NetworkPolicyExecutionPlan {
 
     pub(crate) fn recovered_firewalls(&self) -> &[HelperLedgerFirewall] {
         &self.recovered_firewalls
+    }
+
+    pub(crate) fn recovered_dns(&self) -> &[HelperLedgerDns] {
+        &self.recovered_dns
     }
 }
 
@@ -203,6 +208,64 @@ impl RecoveredFirewallState {
     }
 }
 
+fn recovered_firewall_states(
+    physical_firewalls: &[HelperLedgerFirewall],
+    policy_projections: &[HelperLedgerPolicy],
+) -> Result<Vec<RecoveredFirewallState>, OperationError> {
+    physical_firewalls
+        .iter()
+        .map(|physical| {
+            let policy = policy_projections
+                .iter()
+                .find(|policy| policy.resource() == physical.resource())
+                .ok_or(OperationError::InvalidReplayState)?;
+            Ok(RecoveredFirewallState {
+                physical: physical.clone(),
+                intended: policy.intended().clone(),
+                effective: policy.effective().cloned(),
+            })
+        })
+        .collect()
+}
+
+fn recovered_dns_states(
+    physical_dns: &[HelperLedgerDns],
+    resources: &[HelperLedgerResource],
+    policy_projections: &[HelperLedgerPolicy],
+) -> Vec<RecoveredDnsState> {
+    policy_projections
+        .iter()
+        .filter(|policy| policy.resource().kind() == ResourceKind::Dns)
+        .filter_map(|policy| {
+            let state = resources
+                .iter()
+                .find(|resource| resource.resource() == policy.resource())
+                .map(HelperLedgerResource::state)?;
+            let physical = physical_dns
+                .iter()
+                .find(|physical| physical.resource() == policy.resource())
+                .cloned();
+            Some(physical.map_or_else(
+                || {
+                    RecoveredDnsState::new(
+                        state,
+                        policy.intended().clone(),
+                        policy.effective().cloned(),
+                    )
+                },
+                |physical| {
+                    RecoveredDnsState::with_physical(
+                        state,
+                        policy.intended().clone(),
+                        policy.effective().cloned(),
+                        physical,
+                    )
+                },
+            ))
+        })
+        .collect()
+}
+
 /// Side-effect-free executor preparation result. The server validates this
 /// against its closed logical plan, durably records physical ownership, then
 /// alone permits the corresponding effect method to run.
@@ -210,6 +273,7 @@ impl RecoveredFirewallState {
 pub(crate) struct PreparedNetworkPolicyExecutionPlan {
     execution: NetworkPolicyExecutionPlan,
     prepared_firewalls: Vec<HelperLedgerFirewall>,
+    prepared_dns: Vec<HelperLedgerDns>,
 }
 
 impl PreparedNetworkPolicyExecutionPlan {
@@ -220,6 +284,19 @@ impl PreparedNetworkPolicyExecutionPlan {
         Self {
             execution,
             prepared_firewalls,
+            prepared_dns: Vec::new(),
+        }
+    }
+
+    pub(crate) const fn with_physical_ownership(
+        execution: NetworkPolicyExecutionPlan,
+        prepared_firewalls: Vec<HelperLedgerFirewall>,
+        prepared_dns: Vec<HelperLedgerDns>,
+    ) -> Self {
+        Self {
+            execution,
+            prepared_firewalls,
+            prepared_dns,
         }
     }
 
@@ -231,8 +308,18 @@ impl PreparedNetworkPolicyExecutionPlan {
         &self.prepared_firewalls
     }
 
-    fn into_parts(self) -> (NetworkPolicyExecutionPlan, Vec<HelperLedgerFirewall>) {
-        (self.execution, self.prepared_firewalls)
+    pub(crate) fn prepared_dns(&self) -> &[HelperLedgerDns] {
+        &self.prepared_dns
+    }
+
+    fn into_parts(
+        self,
+    ) -> (
+        NetworkPolicyExecutionPlan,
+        Vec<HelperLedgerFirewall>,
+        Vec<HelperLedgerDns>,
+    ) {
+        (self.execution, self.prepared_firewalls, self.prepared_dns)
     }
 }
 
@@ -422,35 +509,10 @@ where
             child_observations,
         ) = ledger.into_parts();
         let baseline = root.loaded_replay_baseline(&principal, replay)?;
-        let recovered_firewall_states = physical_firewalls
-            .iter()
-            .map(|physical| {
-                let policy = policy_projections
-                    .iter()
-                    .find(|policy| policy.resource() == physical.resource())
-                    .ok_or(OperationError::InvalidReplayState)?;
-                Ok(RecoveredFirewallState {
-                    physical: physical.clone(),
-                    intended: policy.intended().clone(),
-                    effective: policy.effective().cloned(),
-                })
-            })
-            .collect::<Result<Vec<_>, OperationError>>()?;
-        let recovered_dns_states = policy_projections
-            .iter()
-            .filter(|policy| policy.resource().kind() == ResourceKind::Dns)
-            .filter_map(|policy| {
-                let state = resources
-                    .iter()
-                    .find(|resource| resource.resource() == policy.resource())
-                    .map(HelperLedgerResource::state)?;
-                Some(RecoveredDnsState::new(
-                    state,
-                    policy.intended().clone(),
-                    policy.effective().cloned(),
-                ))
-            })
-            .collect::<Vec<_>>();
+        let recovered_firewall_states =
+            recovered_firewall_states(&physical_firewalls, &policy_projections)?;
+        let recovered_dns_states =
+            recovered_dns_states(&physical_dns, &resources, &policy_projections);
         let policy_enabled = enabled_capabilities.contains(&HelperCapability::NetworkPolicy);
         executor
             .validate_recovered_firewalls(&recovered_firewall_states, policy_enabled)
@@ -1024,7 +1086,7 @@ where
         let operation = prepared.execution().operation().clone();
         let prepared = if let NetworkPolicyOperation::ReleaseObsolete { resources, .. } = &operation
         {
-            let (execution, firewalls) = prepared.into_parts();
+            let (execution, firewalls, dns) = prepared.into_parts();
             let prepared_firewalls = firewalls
                 .into_iter()
                 .map(|physical| {
@@ -1037,7 +1099,23 @@ where
                     }
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            PreparedNetworkPolicyExecutionPlan::new(execution, prepared_firewalls)
+            let prepared_dns = dns
+                .into_iter()
+                .map(|physical| {
+                    if resources.contains(physical.resource()) {
+                        physical
+                            .mark_release_pending()
+                            .map_err(|_| HelperError::LedgerUnavailable)
+                    } else {
+                        Ok(physical)
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            PreparedNetworkPolicyExecutionPlan::with_physical_ownership(
+                execution,
+                prepared_firewalls,
+                prepared_dns,
+            )
         } else {
             prepared
         };
@@ -1047,13 +1125,14 @@ where
             operation,
             NetworkPolicyOperation::EstablishBlocking { .. }
                 | NetworkPolicyOperation::ApplyFirewall { .. }
+                | NetworkPolicyOperation::ApplyDns { .. }
         ) {
             return Ok(prepared);
         }
 
         let policy = operation.policy_resource();
-        let (execution, firewalls) = prepared.into_parts();
-        let mut pending_for_ledger = None;
+        let (execution, firewalls, dns) = prepared.into_parts();
+        let mut pending_firewall = None;
         let prepared_firewalls = firewalls
             .into_iter()
             .map(|physical| {
@@ -1063,16 +1142,45 @@ where
                 let pending = physical
                     .mark_effect_pending()
                     .map_err(|_| HelperError::LedgerUnavailable)?;
-                pending_for_ledger = Some(pending.clone());
+                pending_firewall = Some(pending.clone());
                 Ok(pending)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let Some(pending) = pending_for_ledger else {
+        let mut pending_dns = None;
+        let prepared_dns = dns
+            .into_iter()
+            .map(|physical| {
+                if physical.resource() != policy {
+                    return Ok(physical);
+                }
+                let pending = physical
+                    .mark_effect_pending()
+                    .map_err(|_| HelperError::LedgerUnavailable)?;
+                pending_dns = Some(pending.clone());
+                Ok(pending)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let has_required_pending = match &operation {
+            NetworkPolicyOperation::EstablishBlocking { .. }
+            | NetworkPolicyOperation::ApplyFirewall { .. } => pending_firewall.is_some(),
+            NetworkPolicyOperation::ApplyDns { .. } => pending_dns.is_some(),
+            _ => false,
+        };
+        if !has_required_pending {
             self.poisoned = true;
             return Err(HelperError::LedgerUnavailable);
-        };
-        self.physical_firewalls.insert(policy.clone(), pending);
-        let effect_plan = PreparedNetworkPolicyExecutionPlan::new(execution, prepared_firewalls);
+        }
+        if let Some(pending) = pending_firewall {
+            self.physical_firewalls.insert(policy.clone(), pending);
+        }
+        if let Some(pending) = pending_dns {
+            self.physical_dns.insert(policy.clone(), pending);
+        }
+        let effect_plan = PreparedNetworkPolicyExecutionPlan::with_physical_ownership(
+            execution,
+            prepared_firewalls,
+            prepared_dns,
+        );
         self.persist_ledger()?;
         Ok(effect_plan)
     }
@@ -1139,6 +1247,26 @@ where
                             }
                             self.physical_firewalls.insert(policy.clone(), observed);
                         }
+                        if policy.kind() == ResourceKind::Dns {
+                            let Some(physical) = self.physical_dns.get(policy).cloned() else {
+                                self.poisoned = true;
+                                return Err(HelperError::LedgerUnavailable);
+                            };
+                            let observed = physical
+                                .confirm_observed(&state.intended)
+                                .map_err(|_| HelperError::LedgerUnavailable)?;
+                            for (resource, prior) in &mut self.physical_dns {
+                                if resource != policy
+                                    && prior.stage() == PhysicalDnsStage::ObservedOwned
+                                {
+                                    *prior = prior
+                                        .clone()
+                                        .supersede()
+                                        .map_err(|_| HelperError::LedgerUnavailable)?;
+                                }
+                            }
+                            self.physical_dns.insert(policy.clone(), observed);
+                        }
                     }
                     confirmation
                 }
@@ -1149,6 +1277,7 @@ where
                             self.resource_states.remove(resource);
                             self.policy_projections.remove(resource);
                             self.physical_firewalls.remove(resource);
+                            self.physical_dns.remove(resource);
                         }
                     }
                     confirmation
@@ -1202,14 +1331,34 @@ where
             _ => Vec::new(),
         };
 
-        let recovered_firewalls = match operation {
+        let recovered_firewalls =
+            self.recovered_firewalls_for(operation, policy, prior_effective.as_ref())?;
+        let recovered_dns = self.recovered_dns_for(operation, policy, prior_effective.as_ref());
+
+        Some(NetworkPolicyExecutionPlan {
+            operation: operation.clone(),
+            intended: intended.clone(),
+            prior_effective,
+            obsolete_effective,
+            recovered_firewalls,
+            recovered_dns,
+        })
+    }
+
+    fn recovered_firewalls_for(
+        &self,
+        operation: &NetworkPolicyOperation,
+        policy: &ResourceTag,
+        prior_effective: Option<&PolicyProjection>,
+    ) -> Option<Vec<HelperLedgerFirewall>> {
+        Some(match operation {
             NetworkPolicyOperation::EstablishBlocking { .. }
             | NetworkPolicyOperation::ApplyFirewall { .. } => {
                 let mut resources = Vec::new();
                 if let Some(current) = self.physical_firewalls.get(policy) {
                     resources.push(current.clone());
                 }
-                if let Some(prior) = prior_effective.as_ref().map(PolicyProjection::policy) {
+                if let Some(prior) = prior_effective.map(PolicyProjection::policy) {
                     if prior != policy {
                         resources.push(self.physical_firewalls.get(prior)?.clone());
                     }
@@ -1241,15 +1390,53 @@ where
             NetworkPolicyOperation::ApplyRoutes { .. }
             | NetworkPolicyOperation::ApplyDns { .. }
             | NetworkPolicyOperation::ObserveBarrier { .. } => Vec::new(),
-        };
-
-        Some(NetworkPolicyExecutionPlan {
-            operation: operation.clone(),
-            intended: intended.clone(),
-            prior_effective,
-            obsolete_effective,
-            recovered_firewalls,
         })
+    }
+
+    fn recovered_dns_for(
+        &self,
+        operation: &NetworkPolicyOperation,
+        policy: &ResourceTag,
+        prior_effective: Option<&PolicyProjection>,
+    ) -> Vec<HelperLedgerDns> {
+        match operation {
+            NetworkPolicyOperation::ApplyDns { .. } => {
+                let mut resources = Vec::new();
+                if let Some(current) = self.physical_dns.get(policy) {
+                    resources.push(current.clone());
+                }
+                if let Some(prior) = prior_effective.map(PolicyProjection::policy) {
+                    if prior != policy {
+                        if let Some(physical) = self.physical_dns.get(prior) {
+                            resources.push(physical.clone());
+                        }
+                    }
+                }
+                resources
+            }
+            NetworkPolicyOperation::ObserveBarrier { .. } if policy.kind() == ResourceKind::Dns => {
+                self.physical_dns.get(policy).cloned().into_iter().collect()
+            }
+            NetworkPolicyOperation::ReleaseObsolete {
+                policy, resources, ..
+            } => {
+                let mut dns = resources
+                    .iter()
+                    .filter(|resource| resource.kind() == ResourceKind::Dns)
+                    .filter_map(|resource| self.physical_dns.get(resource).cloned())
+                    .collect::<Vec<_>>();
+                if policy.kind() == ResourceKind::Dns
+                    && !dns.iter().any(|physical| physical.resource() == policy)
+                {
+                    dns.extend(self.physical_dns.get(policy).cloned());
+                }
+                dns
+            }
+            NetworkPolicyOperation::EstablishBlocking { .. }
+            | NetworkPolicyOperation::ApplyRoutes { .. }
+            | NetworkPolicyOperation::ApplyFirewall { .. }
+            | NetworkPolicyOperation::ObserveBarrier { .. } => Vec::new(),
+        }
     }
 
     fn accept_prepared_network_policy(
@@ -1262,57 +1449,19 @@ where
         match plan.operation() {
             NetworkPolicyOperation::EstablishBlocking { policy, .. }
             | NetworkPolicyOperation::ApplyFirewall { policy, .. } => {
-                let candidates = prepared.prepared_firewalls();
-                if candidates.len()
-                    != plan.recovered_firewalls().len()
-                        + usize::from(
-                            !plan
-                                .recovered_firewalls()
-                                .iter()
-                                .any(|physical| physical.resource() == policy),
-                        )
-                {
-                    return false;
-                }
-                let Some(current) = candidates
-                    .iter()
-                    .find(|physical| physical.resource() == policy)
-                else {
-                    return false;
-                };
-                if current.stage() != PhysicalFirewallStage::Prepared
-                    || current.intended_digest() != plan.intended().digest()
-                {
-                    return false;
-                }
-                if let Some(existing) = plan
-                    .recovered_firewalls()
-                    .iter()
-                    .find(|physical| physical.resource() == policy)
-                {
-                    if current.backend() != existing.backend()
-                        || current.transaction_id() != existing.transaction_id()
-                    {
-                        return false;
-                    }
-                }
-                candidates.iter().enumerate().all(|(index, candidate)| {
-                    !candidates[..index]
-                        .iter()
-                        .any(|prior| prior.resource() == candidate.resource())
-                        && (candidate.resource() == policy
-                            || plan
-                                .recovered_firewalls()
-                                .iter()
-                                .any(|expected| expected == candidate))
-                })
+                prepared.prepared_dns() == plan.recovered_dns()
+                    && accepts_prepared_firewall(plan, prepared, policy)
+            }
+            NetworkPolicyOperation::ApplyDns { policy, .. } => {
+                prepared.prepared_firewalls() == plan.recovered_firewalls()
+                    && accepts_prepared_dns(plan, prepared, policy)
             }
             NetworkPolicyOperation::ReleaseObsolete { .. }
-            | NetworkPolicyOperation::ObserveBarrier { .. } => {
+            | NetworkPolicyOperation::ObserveBarrier { .. }
+            | NetworkPolicyOperation::ApplyRoutes { .. } => {
                 prepared.prepared_firewalls() == plan.recovered_firewalls()
+                    && prepared.prepared_dns() == plan.recovered_dns()
             }
-            NetworkPolicyOperation::ApplyRoutes { .. }
-            | NetworkPolicyOperation::ApplyDns { .. } => prepared.prepared_firewalls().is_empty(),
         }
     }
 
@@ -1331,6 +1480,15 @@ where
                     .cloned()
                     .ok_or(HelperError::LedgerUnavailable)?;
                 self.physical_firewalls.insert(policy.clone(), physical);
+            }
+            NetworkPolicyOperation::ApplyDns { policy, .. } => {
+                let physical = prepared
+                    .prepared_dns()
+                    .iter()
+                    .find(|physical| physical.resource() == policy)
+                    .cloned()
+                    .ok_or(HelperError::LedgerUnavailable)?;
+                self.physical_dns.insert(policy.clone(), physical);
             }
             NetworkPolicyOperation::ReleaseObsolete {
                 policy, resources, ..
@@ -1358,9 +1516,30 @@ where
                         return Err(HelperError::LedgerUnavailable);
                     }
                 }
+                for physical in prepared.prepared_dns() {
+                    if resources.contains(physical.resource()) {
+                        if !matches!(
+                            physical.stage(),
+                            PhysicalDnsStage::OwnedReleasePending
+                                | PhysicalDnsStage::AbsentReleasePending
+                                | PhysicalDnsStage::SupersededReleasePending
+                        ) {
+                            return Err(HelperError::LedgerUnavailable);
+                        }
+                        self.physical_dns
+                            .insert(physical.resource().clone(), physical.clone());
+                    } else if physical.resource() != policy
+                        || !matches!(
+                            physical.stage(),
+                            PhysicalDnsStage::ObservedOwned | PhysicalDnsStage::ObservedAbsent
+                        )
+                        || self.physical_dns.get(policy) != Some(physical)
+                    {
+                        return Err(HelperError::LedgerUnavailable);
+                    }
+                }
             }
             NetworkPolicyOperation::ApplyRoutes { .. }
-            | NetworkPolicyOperation::ApplyDns { .. }
             | NetworkPolicyOperation::ObserveBarrier { .. } => {}
         }
         Ok(())
@@ -1378,75 +1557,126 @@ where
                 | NetworkPolicyOperation::ApplyRoutes { policy, .. }
                 | NetworkPolicyOperation::ApplyDns { policy, .. }
                 | NetworkPolicyOperation::ApplyFirewall { policy, .. } => {
-                    self.guard
-                        .rollback_policy_before_effect(request)
-                        .map_err(|_| HelperError::LedgerUnavailable)?;
-                    if let Some(effective) = self
-                        .policy_projections
-                        .get(policy)
-                        .and_then(|state| state.effective.clone())
-                    {
-                        if policy.kind() == ResourceKind::Firewall {
-                            let physical = self
-                                .physical_firewalls
-                                .get(policy)
-                                .cloned()
-                                .and_then(|physical| {
-                                    physical.restore_after_failed_mutation(&effective).ok()
-                                })
-                                .ok_or(HelperError::LedgerUnavailable)?;
-                            self.physical_firewalls.insert(policy.clone(), physical);
-                        }
-                        self.policy_projections.insert(
-                            policy.clone(),
-                            PolicyRecoveryState {
-                                intended: effective.clone(),
-                                effective: Some(effective),
-                            },
-                        );
-                        self.resource_states
-                            .insert(policy.clone(), HelperResourceState::Owned);
-                    } else {
-                        self.policy_projections.remove(policy);
-                        self.resource_states.remove(policy);
-                        self.physical_firewalls.remove(policy);
-                    }
-                    self.persist_ledger()?;
+                    self.rollback_policy_mutation(request, policy)?;
                 }
                 NetworkPolicyOperation::ReleaseObsolete { resources, .. } => {
-                    self.guard
-                        .rollback_policy_before_effect(request)
-                        .map_err(|_| HelperError::LedgerUnavailable)?;
-                    for resource in resources {
-                        self.resource_states
-                            .insert(resource.clone(), HelperResourceState::Owned);
-                        if resource.kind() == ResourceKind::Firewall {
-                            let effective = self
-                                .policy_projections
-                                .get(resource)
-                                .and_then(|state| state.effective.as_ref())
-                                .ok_or(HelperError::LedgerUnavailable)?;
-                            let physical = self
-                                .physical_firewalls
-                                .get(resource)
-                                .cloned()
-                                .and_then(|physical| {
-                                    if physical.intended_digest() != effective.digest() {
-                                        return None;
-                                    }
-                                    physical.restore_after_failed_release().ok()
-                                })
-                                .ok_or(HelperError::LedgerUnavailable)?;
-                            self.physical_firewalls.insert(resource.clone(), physical);
-                        }
-                    }
-                    self.persist_ledger()?;
+                    self.rollback_policy_release(request, resources)?;
                 }
                 NetworkPolicyOperation::ObserveBarrier { .. } => self.persist_ledger()?,
             }
         }
         self.execution_error_receipt(request, error)
             .map_err(map_receipt_error)
+    }
+
+    fn rollback_policy_mutation(
+        &mut self,
+        request: &crate::vortix_core::privileged::PrivilegedRequest,
+        policy: &ResourceTag,
+    ) -> Result<(), HelperError> {
+        self.guard
+            .rollback_policy_before_effect(request)
+            .map_err(|_| HelperError::LedgerUnavailable)?;
+        let effective = self
+            .policy_projections
+            .get(policy)
+            .and_then(|state| state.effective.clone());
+        if let Some(effective) = effective {
+            self.restore_physical_after_failed_mutation(policy, &effective)?;
+            self.policy_projections.insert(
+                policy.clone(),
+                PolicyRecoveryState {
+                    intended: effective.clone(),
+                    effective: Some(effective),
+                },
+            );
+            self.resource_states
+                .insert(policy.clone(), HelperResourceState::Owned);
+        } else {
+            self.policy_projections.remove(policy);
+            self.resource_states.remove(policy);
+            self.physical_firewalls.remove(policy);
+            self.physical_dns.remove(policy);
+        }
+        self.persist_ledger()
+    }
+
+    fn restore_physical_after_failed_mutation(
+        &mut self,
+        policy: &ResourceTag,
+        effective: &PolicyProjection,
+    ) -> Result<(), HelperError> {
+        match policy.kind() {
+            ResourceKind::Firewall => {
+                let physical = self
+                    .physical_firewalls
+                    .get(policy)
+                    .cloned()
+                    .and_then(|physical| physical.restore_after_failed_mutation(effective).ok())
+                    .ok_or(HelperError::LedgerUnavailable)?;
+                self.physical_firewalls.insert(policy.clone(), physical);
+            }
+            ResourceKind::Dns => {
+                let physical = self
+                    .physical_dns
+                    .get(policy)
+                    .cloned()
+                    .and_then(|physical| physical.restore_after_failed_mutation(effective).ok())
+                    .ok_or(HelperError::LedgerUnavailable)?;
+                self.physical_dns.insert(policy.clone(), physical);
+            }
+            ResourceKind::Routes => {}
+            ResourceKind::Tunnel | ResourceKind::ProcessGroup | ResourceKind::RuntimeSecret => {
+                return Err(HelperError::LedgerUnavailable);
+            }
+        }
+        Ok(())
+    }
+
+    fn rollback_policy_release(
+        &mut self,
+        request: &crate::vortix_core::privileged::PrivilegedRequest,
+        resources: &[ResourceTag],
+    ) -> Result<(), HelperError> {
+        self.guard
+            .rollback_policy_before_effect(request)
+            .map_err(|_| HelperError::LedgerUnavailable)?;
+        for resource in resources {
+            self.resource_states
+                .insert(resource.clone(), HelperResourceState::Owned);
+            let effective = self
+                .policy_projections
+                .get(resource)
+                .and_then(|state| state.effective.as_ref())
+                .ok_or(HelperError::LedgerUnavailable)?;
+            match resource.kind() {
+                ResourceKind::Firewall => {
+                    let physical = self
+                        .physical_firewalls
+                        .get(resource)
+                        .cloned()
+                        .filter(|physical| physical.intended_digest() == effective.digest())
+                        .and_then(|physical| physical.restore_after_failed_release().ok())
+                        .ok_or(HelperError::LedgerUnavailable)?;
+                    self.physical_firewalls.insert(resource.clone(), physical);
+                }
+                ResourceKind::Dns => {
+                    let physical = self
+                        .physical_dns
+                        .get(resource)
+                        .cloned()
+                        .filter(|physical| physical.intended_digest() == effective.digest())
+                        .and_then(|physical| physical.restore_after_failed_release().ok())
+                        .ok_or(HelperError::LedgerUnavailable)?;
+                    self.physical_dns.insert(resource.clone(), physical);
+                }
+                ResourceKind::Routes => {}
+                ResourceKind::Tunnel | ResourceKind::ProcessGroup | ResourceKind::RuntimeSecret => {
+                    return Err(HelperError::LedgerUnavailable)
+                }
+            }
+        }
+        self.persist_ledger()
     }
 
     fn cleanup_owned(
@@ -1676,6 +1906,109 @@ where
     }
 }
 
+fn accepts_prepared_firewall(
+    plan: &NetworkPolicyExecutionPlan,
+    prepared: &PreparedNetworkPolicyExecutionPlan,
+    policy: &ResourceTag,
+) -> bool {
+    let candidates = prepared.prepared_firewalls();
+    if candidates.len()
+        != plan.recovered_firewalls().len()
+            + usize::from(
+                !plan
+                    .recovered_firewalls()
+                    .iter()
+                    .any(|physical| physical.resource() == policy),
+            )
+    {
+        return false;
+    }
+    let Some(current) = candidates
+        .iter()
+        .find(|physical| physical.resource() == policy)
+    else {
+        return false;
+    };
+    if current.stage() != PhysicalFirewallStage::Prepared
+        || current.intended_digest() != plan.intended().digest()
+    {
+        return false;
+    }
+    if let Some(existing) = plan
+        .recovered_firewalls()
+        .iter()
+        .find(|physical| physical.resource() == policy)
+    {
+        if current.backend() != existing.backend()
+            || current.transaction_id() != existing.transaction_id()
+        {
+            return false;
+        }
+    }
+    candidates.iter().enumerate().all(|(index, candidate)| {
+        !candidates[..index]
+            .iter()
+            .any(|prior| prior.resource() == candidate.resource())
+            && (candidate.resource() == policy
+                || plan
+                    .recovered_firewalls()
+                    .iter()
+                    .any(|expected| expected == candidate))
+    })
+}
+
+fn accepts_prepared_dns(
+    plan: &NetworkPolicyExecutionPlan,
+    prepared: &PreparedNetworkPolicyExecutionPlan,
+    policy: &ResourceTag,
+) -> bool {
+    let candidates = prepared.prepared_dns();
+    if candidates.len()
+        != plan.recovered_dns().len()
+            + usize::from(
+                !plan
+                    .recovered_dns()
+                    .iter()
+                    .any(|physical| physical.resource() == policy),
+            )
+    {
+        return false;
+    }
+    let Some(current) = candidates
+        .iter()
+        .find(|physical| physical.resource() == policy)
+    else {
+        return false;
+    };
+    if current.stage() != PhysicalDnsStage::Prepared
+        || current.intended_digest() != plan.intended().digest()
+    {
+        return false;
+    }
+    if let Some(existing) = plan
+        .recovered_dns()
+        .iter()
+        .find(|physical| physical.resource() == policy)
+    {
+        if current.backend() != existing.backend()
+            || current.transaction_id() != existing.transaction_id()
+            || current.links() != existing.links()
+        {
+            return false;
+        }
+    }
+    candidates.iter().enumerate().all(|(index, candidate)| {
+        !candidates[..index]
+            .iter()
+            .any(|prior| prior.resource() == candidate.resource())
+            && (candidate.resource() == policy
+                || plan
+                    .recovered_dns()
+                    .iter()
+                    .any(|expected| expected == candidate))
+    })
+}
+
 pub(super) fn tunnel_for_profile_resource(resource: &ResourceTag) -> Option<ResourceTag> {
     ResourceTag::tunnel(resource.profile_id()?.clone(), resource.generation()).ok()
 }
@@ -1750,11 +2083,12 @@ mod tests {
     use crate::vortix_core::cidr::Cidr;
     use crate::vortix_core::control::AuthorityEpoch;
     use crate::vortix_core::privileged::{
-        BootScope, ContainmentId, FirewallTransactionId, LeaseId, ObservationState,
-        OpenVpnAuthFactors, OpenVpnPlan, OpenVpnRemote, OpenVpnRemoteSelection, OpenVpnTransport,
-        OperationDigest, PeerProcessIdentity, PhysicalFirewallBackend, PrivilegedRequest,
-        ProtocolEndpoint, RequestSequence, ServiceInstanceClaim, ServiceManager,
-        WireGuardInterfaceOptions, WireGuardPeerPlan, WireGuardPlan,
+        BootScope, ContainmentId, DnsTransactionId, FirewallTransactionId, LeaseId,
+        ObservationState, OpenVpnAuthFactors, OpenVpnPlan, OpenVpnRemote, OpenVpnRemoteSelection,
+        OpenVpnTransport, OperationDigest, PeerProcessIdentity, PhysicalDnsBackend,
+        PhysicalFirewallBackend, PrivilegedRequest, ProtocolEndpoint, RequestSequence,
+        ServiceInstanceClaim, ServiceManager, WireGuardInterfaceOptions, WireGuardPeerPlan,
+        WireGuardPlan,
     };
     use crate::vortix_core::profile::{ProfileId, ProtocolKind};
     use crate::vortix_core::state::killswitch::KillSwitchMode;
@@ -1980,9 +2314,41 @@ mod tests {
                     firewalls.push(prepared);
                 }
             }
-            Ok(PreparedNetworkPolicyExecutionPlan::new(
+            let mut dns = plan.recovered_dns().to_vec();
+            if matches!(plan.operation(), NetworkPolicyOperation::ApplyDns { .. }) {
+                let resource = plan.operation().policy_resource();
+                let prepared = if let Some(existing) =
+                    dns.iter().find(|physical| physical.resource() == resource)
+                {
+                    existing
+                        .prepare_for(plan.intended())
+                        .map_err(|_| NetworkPolicyPreparationError::InvalidPlan)?
+                } else {
+                    let mut transaction = [0; 32];
+                    transaction[..8].copy_from_slice(&resource.generation().to_be_bytes());
+                    HelperLedgerDns::prepared(
+                        resource.clone(),
+                        PhysicalDnsBackend::MacOsResolverFiles,
+                        DnsTransactionId::new(transaction)
+                            .map_err(|_| NetworkPolicyPreparationError::InvalidPlan)?,
+                        plan.intended().digest(),
+                        Vec::new(),
+                    )
+                    .map_err(|_| NetworkPolicyPreparationError::InvalidPlan)?
+                };
+                if let Some(existing) = dns
+                    .iter_mut()
+                    .find(|physical| physical.resource() == resource)
+                {
+                    *existing = prepared;
+                } else {
+                    dns.push(prepared);
+                }
+            }
+            Ok(PreparedNetworkPolicyExecutionPlan::with_physical_ownership(
                 plan.clone(),
                 firewalls,
+                dns,
             ))
         }
 
@@ -3410,6 +3776,64 @@ mod tests {
     }
 
     #[test]
+    fn physical_dns_is_durable_before_effect_and_write_failure_prevents_mutation() {
+        for failed_checkpoint in [1, 2] {
+            let mut harness = LifecycleHarness::for_policy(FakeExecutor::default());
+            let firewall =
+                ResourceTag::topology(AuthorityEpoch(3), 1, ResourceKind::Firewall).unwrap();
+            execute_policy_phase(
+                &mut harness,
+                1,
+                NetworkPolicyOperation::EstablishBlocking {
+                    policy: firewall,
+                    tunnels: Vec::new(),
+                },
+            );
+            let routes = ResourceTag::topology(AuthorityEpoch(3), 1, ResourceKind::Routes).unwrap();
+            let predecessor = harness.server.guard.policy_predecessor().unwrap();
+            execute_policy_phase(
+                &mut harness,
+                3,
+                NetworkPolicyOperation::ApplyRoutes {
+                    policy: routes,
+                    routes: Vec::new(),
+                    predecessor,
+                },
+            );
+            let writes_before = harness.server.ledger_store.writes.len();
+            let calls_before = harness.server.executor.policy_calls;
+            harness.server.ledger_store.fail_on_write = Some(writes_before + failed_checkpoint);
+            let dns = ResourceTag::topology(AuthorityEpoch(3), 1, ResourceKind::Dns).unwrap();
+            let apply = harness.request(
+                5,
+                PrivilegedOperation::NetworkPolicy(NetworkPolicyOperation::ApplyDns {
+                    policy: dns,
+                    assignments: Vec::new(),
+                    predecessor: harness.server.guard.policy_predecessor().unwrap(),
+                }),
+            );
+
+            let response = harness.server.handle(HelperRequest {
+                id: 6,
+                op: HelperOp::Execute(Box::new(apply)),
+            });
+
+            assert!(matches!(
+                response.result,
+                Err(HelperError::LedgerUnavailable)
+            ));
+            assert_eq!(harness.server.executor.policy_calls, calls_before);
+            assert!(harness.server.poisoned);
+            if failed_checkpoint == 2 {
+                assert_eq!(
+                    harness.server.ledger_store.writes[writes_before].physical_dns()[0].stage(),
+                    PhysicalDnsStage::Prepared
+                );
+            }
+        }
+    }
+
+    #[test]
     fn release_rejects_obsolete_policy_without_root_ledger_ownership() {
         let mut harness = LifecycleHarness::for_policy(FakeExecutor::default());
         let firewall = ResourceTag::topology(AuthorityEpoch(3), 2, ResourceKind::Firewall).unwrap();
@@ -3528,6 +3952,14 @@ mod tests {
         assert_eq!(
             states[0].effective().map(PolicyProjection::policy),
             Some(&dns)
+        );
+        assert_eq!(
+            states[0].physical().map(HelperLedgerDns::resource),
+            Some(&dns)
+        );
+        assert_eq!(
+            states[0].physical().map(HelperLedgerDns::stage),
+            Some(PhysicalDnsStage::ObservedAbsent)
         );
     }
 
