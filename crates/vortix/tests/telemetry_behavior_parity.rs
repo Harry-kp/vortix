@@ -7,49 +7,31 @@
 //! the request line and writes a crafted HTTP/1.1 response per path —
 //! no external mock framework dep.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use vortix::core::telemetry_http;
 
-/// Bind ephemeral port + spawn a thread that handles connections until
-/// `shutdown` flips. Returns the bound port + a `Drop` guard that flips
-/// the shutdown flag (so each test releases its server).
+/// Bind an ephemeral port and serve the test's single expected request.
+/// The guard joins that exact connection handler, so no detached fixture
+/// thread can bleed into another parallel test.
 fn spawn_mock_server() -> MockServer {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
     let port = listener.local_addr().unwrap().port();
-    listener
-        .set_nonblocking(true)
-        .expect("set listener non-blocking");
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown_clone = shutdown.clone();
     let handle = thread::spawn(move || {
-        while !shutdown_clone.load(Ordering::Relaxed) {
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    thread::spawn(move || handle_connection(stream));
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(10));
-                }
-                Err(_) => break,
-            }
-        }
+        let (stream, _) = listener.accept().expect("accept mock HTTP request");
+        handle_connection(stream);
     });
     MockServer {
         port,
-        shutdown,
         join: Some(handle),
     }
 }
 
 struct MockServer {
     port: u16,
-    shutdown: Arc<AtomicBool>,
     join: Option<thread::JoinHandle<()>>,
 }
 
@@ -61,7 +43,6 @@ impl MockServer {
 
 impl Drop for MockServer {
     fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::Relaxed);
         if let Some(j) = self.join.take() {
             let _ = j.join();
         }
@@ -138,9 +119,6 @@ fn write_response(stream: &mut TcpStream, path: &str) {
         }
     }
     let _ = stream.flush();
-    // Read-then-discard whatever the client sends to clean shutdown.
-    let mut sink = [0u8; 64];
-    let _ = stream.read(&mut sink);
 }
 
 #[derive(Debug, serde::Deserialize)]
