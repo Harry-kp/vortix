@@ -236,6 +236,10 @@ fn wg_work() -> TunnelWork {
             authority_epoch: AuthorityEpoch(1),
             generation: 9,
         },
+        resource_revision: TunnelRevision {
+            authority_epoch: AuthorityEpoch(1),
+            generation: 9,
+        },
         mutation: TunnelMutation::Connect,
         protocol: TunnelKindTag::WireGuard,
         deadline: Instant::now() + Duration::from_secs(1),

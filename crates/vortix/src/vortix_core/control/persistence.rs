@@ -41,6 +41,11 @@ pub struct RequestedResources {
 pub struct PersistedTombstone {
     pub authority_epoch: AuthorityEpoch,
     pub generation: u64,
+    /// Exact owned tunnel generation. Older Standard-mode state omitted this
+    /// field and falls back to `generation`; Background activation requires
+    /// newly persisted exact ownership.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_generation: Option<u64>,
     pub policy_digest: PolicyDigest,
     pub operation_id: OperationId,
     pub teardown_failed: bool,

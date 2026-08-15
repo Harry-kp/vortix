@@ -457,6 +457,7 @@ fn real_tunnel_scoped_custodians_handoff_authenticate_and_contain_groups() {
                 profile_id: recovered_identity.profile_id.clone(),
                 operation_id: operation,
                 revision,
+                resource_revision: revision,
                 mutation: TunnelMutation::Disconnect,
                 protocol: TunnelKindTag::OpenVpn,
                 deadline: Instant::now() + Duration::from_secs(3),
