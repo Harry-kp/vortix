@@ -31,6 +31,7 @@ pub(crate) enum PlatformFamily {
 
 use crate::vortix_core::ports::owned_dns::OwnedDns;
 use crate::vortix_core::ports::owned_firewall::OwnedFirewall;
+use crate::vortix_core::ports::owned_routes::OwnedRoutes;
 
 #[cfg(target_os = "linux")]
 pub(crate) const fn current_platform_family() -> PlatformFamily {
@@ -61,6 +62,17 @@ pub(crate) fn helper_owned_dns() -> Box<dyn OwnedDns> {
     #[cfg(target_os = "macos")]
     {
         Box::new(crate::vortix_platform_macos::dns::MacDnsPolicy::system())
+    }
+}
+
+pub(crate) fn helper_owned_routes() -> Box<dyn OwnedRoutes> {
+    #[cfg(target_os = "linux")]
+    {
+        Box::new(crate::vortix_platform_linux::owned_routes::LinuxOwnedRoutes)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Box::new(crate::vortix_platform_macos::owned_routes::MacOsOwnedRoutes)
     }
 }
 

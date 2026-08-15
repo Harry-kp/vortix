@@ -20,13 +20,14 @@ use super::material::{
     WireGuardRuntimeStager,
 };
 use super::observe::SystemObservationExecutor;
+use super::routes::HelperRouteExecutor;
 use super::runtime::HelperRuntimeIdentity;
 use super::server::{
     process_group_for_tunnel, tunnel_for_profile_resource, CleanupExecutor,
     NetworkPolicyExecutionPlan, NetworkPolicyExecutor, NetworkPolicyOutcome,
     NetworkPolicyPreparationError, ObservationError, ObservationExecutor, ObservationOutcome,
     PreparedNetworkPolicyExecutionPlan, PrivilegedExecutionError, RecoveredFirewallState,
-    TunnelLifecycleExecutor, TunnelStartOutcome,
+    RecoveredRouteState, TunnelLifecycleExecutor, TunnelStartOutcome,
 };
 use super::validate::PlatformLayout;
 use crate::vortix_core::openvpn_credentials::DecodedOpenVpnCredentials;
@@ -73,6 +74,7 @@ pub(crate) struct ProductionHelperExecutor {
     lease_id: LeaseId,
     dns: HelperDnsExecutor,
     firewall: HelperFirewallExecutor,
+    routes: HelperRouteExecutor,
     wireguard: BTreeMap<ResourceTag, StagedWireGuardRuntime>,
     openvpn: BTreeMap<ResourceTag, ActiveOpenVpnRuntime>,
 }
@@ -100,6 +102,7 @@ impl ProductionHelperExecutor {
             lease_id,
             dns: HelperDnsExecutor::new(lease_id),
             firewall: HelperFirewallExecutor::new(lease_id),
+            routes: HelperRouteExecutor::new(layout, lease_id),
             wireguard: BTreeMap::new(),
             openvpn: BTreeMap::new(),
         })
@@ -830,11 +833,28 @@ impl NetworkPolicyExecutor for ProductionHelperExecutor {
         self.dns.validate_recovered(states, policy_enabled)
     }
 
+    fn validate_recovered_routes(
+        &mut self,
+        states: &[RecoveredRouteState],
+        policy_enabled: bool,
+    ) -> Result<(), PrivilegedExecutionError> {
+        self.routes.validate_recovered(states, policy_enabled)
+    }
+
     fn prepare_network_policy(
         &mut self,
         plan: &NetworkPolicyExecutionPlan,
     ) -> Result<PreparedNetworkPolicyExecutionPlan, NetworkPolicyPreparationError> {
         match plan.operation() {
+            crate::vortix_core::privileged::NetworkPolicyOperation::ApplyRoutes { .. } => {
+                self.routes.prepare(plan)
+            }
+            crate::vortix_core::privileged::NetworkPolicyOperation::ObserveBarrier {
+                policy,
+                ..
+            } if policy.kind() == crate::vortix_core::privileged::ResourceKind::Routes => {
+                self.routes.prepare(plan)
+            }
             crate::vortix_core::privileged::NetworkPolicyOperation::ApplyDns { .. } => {
                 self.dns.prepare(plan)
             }
@@ -865,6 +885,15 @@ impl NetworkPolicyExecutor for ProductionHelperExecutor {
         plan: &PreparedNetworkPolicyExecutionPlan,
     ) -> Result<NetworkPolicyOutcome, PrivilegedExecutionError> {
         match plan.execution().operation() {
+            crate::vortix_core::privileged::NetworkPolicyOperation::ApplyRoutes { .. } => {
+                self.routes.execute(plan)
+            }
+            crate::vortix_core::privileged::NetworkPolicyOperation::ObserveBarrier {
+                policy,
+                ..
+            } if policy.kind() == crate::vortix_core::privileged::ResourceKind::Routes => {
+                self.routes.execute(plan)
+            }
             crate::vortix_core::privileged::NetworkPolicyOperation::ApplyDns { .. } => {
                 self.dns.execute(plan)
             }

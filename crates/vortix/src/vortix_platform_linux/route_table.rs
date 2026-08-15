@@ -138,7 +138,7 @@ fn parse_gateway(text: &str) -> Option<String> {
 /// Same shape rationale as [`parse_gateway`]: `ip route get <ip>` and
 /// `ip route show default` differ in their line prefix but share the
 /// `dev <name>` token pair somewhere in the line.
-fn parse_interface(text: &str) -> Option<String> {
+pub(crate) fn parse_interface(text: &str) -> Option<String> {
     for line in text.lines() {
         let mut iter = line.split_whitespace();
         while let Some(tok) = iter.next() {

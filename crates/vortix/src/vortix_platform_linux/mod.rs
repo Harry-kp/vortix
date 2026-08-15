@@ -17,6 +17,7 @@ pub mod network_stats;
 mod nft_policy;
 pub(crate) mod owned_dns;
 pub(crate) mod owned_firewall;
+pub(crate) mod owned_routes;
 pub mod process_identity;
 pub mod route_table;
 pub mod socket_audit;

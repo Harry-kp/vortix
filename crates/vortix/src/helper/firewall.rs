@@ -477,7 +477,7 @@ mod tests {
         let subject = PrivilegedFirewallTunnel::new(
             tunnel(),
             vec!["198.51.100.7".parse().unwrap()],
-            Vec::new(),
+            vec!["10.0.0.0/8".parse().unwrap()],
             PrivilegedFirewallRole::PendingEndpoint,
         )
         .unwrap();
@@ -491,6 +491,7 @@ mod tests {
 
         assert_eq!(active.len(), 1);
         assert!(active[0].is_endpoint_allowlist());
+        assert!(active[0].declared_cidrs.is_empty());
         assert_eq!(
             active[0].server_ips,
             vec!["198.51.100.7".parse::<std::net::IpAddr>().unwrap()]
