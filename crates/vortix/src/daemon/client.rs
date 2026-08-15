@@ -108,7 +108,7 @@ fn request_with_authority(
     op: IpcOp,
     expected: Option<AuthorityBinding>,
 ) -> Result<IpcResult, ClientError> {
-    let required = required_capability(&op);
+    let required = op.required_capability();
     let (mut stream, mut buffered, hello) =
         connect_handshaken(socket_path, required, Some(Duration::from_secs(2)))?;
     if expected.is_some() && hello.authority_binding != expected {
@@ -516,26 +516,6 @@ fn validate_passive_snapshot(snapshot: &PassiveSnapshot) -> Result<(), ClientErr
         ));
     }
     Ok(())
-}
-
-fn required_capability(op: &IpcOp) -> IpcCapability {
-    match op {
-        IpcOp::Handshake { .. } | IpcOp::PassiveSnapshot => IpcCapability::PassiveSnapshot,
-        IpcOp::Execute(_)
-        | IpcOp::ControlOpen
-        | IpcOp::ControlSubmit { .. }
-        | IpcOp::ControlSnapshot { .. }
-        | IpcOp::ControlSubscribe { .. }
-        | IpcOp::ControlRespondChallenge { .. }
-        | IpcOp::ControlCancelChallenge { .. }
-        | IpcOp::ControlStageProfileImport { .. }
-        | IpcOp::ControlCancelProfileImport { .. } => IpcCapability::ControlMutation,
-        IpcOp::Snapshot => IpcCapability::LegacySnapshot,
-        IpcOp::Subscribe | IpcOp::PassiveSubscribe => IpcCapability::PassiveSubscribe,
-        IpcOp::Diagnostics => IpcCapability::Diagnostics,
-        IpcOp::DiagnosticsSubscribe => IpcCapability::DiagnosticsSubscribe,
-        IpcOp::Shutdown => IpcCapability::Shutdown,
-    }
 }
 
 fn validate_socket_owner(path: &Path) -> Result<(), ClientError> {

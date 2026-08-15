@@ -16,7 +16,9 @@ use crate::vortix_core::control::{
     ControlSnapshot, IdempotencyKey, OperationId, OperationResult, OperationStatus, Secret,
     UserCommand,
 };
-use crate::vortix_core::ipc::{IpcError, IpcOp, IpcResult, RemoteSessionId, SensitiveBytes};
+use crate::vortix_core::ipc::{
+    ControlAvailability, IpcError, IpcOp, IpcResult, RemoteSessionId, SensitiveBytes,
+};
 use crate::vortix_core::privileged::AuthorityBinding;
 
 /// Production activation is deliberately one-state in the preparatory
@@ -49,6 +51,8 @@ pub enum RemoteControlError {
     AuthorityMismatch,
     #[error("remote control daemon is unavailable: {0}")]
     Unavailable(String),
+    #[error("remote control authority is unavailable: {0:?}")]
+    ControlUnavailable(ControlAvailability),
     #[error("remote control daemon is incompatible: {0}")]
     Incompatible(String),
     #[error("remote control protocol failed: {0}")]
@@ -71,6 +75,7 @@ impl RemoteControlError {
             IpcError::CapabilityUnavailable { .. } => {
                 Self::Incompatible("daemon does not advertise canonical control".into())
             }
+            IpcError::ControlUnavailable { state } => Self::ControlUnavailable(state),
             IpcError::ControlAdmission { error } => Self::Admission(error),
             IpcError::ControlChallenge { error } => Self::Challenge(error),
             IpcError::ControlSessionNotFound => Self::SessionNotFound,
@@ -546,6 +551,16 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use super::*;
+
+    #[test]
+    fn control_availability_remains_typed_at_the_client_boundary() {
+        assert_eq!(
+            RemoteControlError::from_ipc(IpcError::ControlUnavailable {
+                state: ControlAvailability::RecoveryRequired,
+            }),
+            RemoteControlError::ControlUnavailable(ControlAvailability::RecoveryRequired)
+        );
+    }
 
     struct EmptySubscription;
 
