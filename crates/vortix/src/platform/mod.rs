@@ -28,6 +28,8 @@ pub(crate) enum PlatformFamily {
     MacOs,
 }
 
+use crate::vortix_core::ports::owned_firewall::OwnedFirewall;
+
 #[cfg(target_os = "linux")]
 pub(crate) const fn current_platform_family() -> PlatformFamily {
     PlatformFamily::Linux
@@ -36,6 +38,17 @@ pub(crate) const fn current_platform_family() -> PlatformFamily {
 #[cfg(target_os = "macos")]
 pub(crate) const fn current_platform_family() -> PlatformFamily {
     PlatformFamily::MacOs
+}
+
+pub(crate) fn helper_owned_firewall() -> Box<dyn OwnedFirewall> {
+    #[cfg(target_os = "linux")]
+    {
+        Box::new(crate::vortix_platform_linux::owned_firewall::LinuxOwnedFirewall)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Box::new(crate::vortix_platform_macos::owned_firewall::MacOsOwnedFirewall::new())
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────────────
