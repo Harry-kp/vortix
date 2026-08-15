@@ -969,7 +969,7 @@ mod tests {
                 "list".into(),
                 "table".into(),
                 "inet".into(),
-                nft_policy::TABLE.into(),
+                crate::constants::NFT_TABLE_NAME.into(),
             ])
             .args,
             [
