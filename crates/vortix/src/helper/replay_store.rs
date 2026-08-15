@@ -36,7 +36,7 @@ impl FsHelperLedgerStore {
     }
 
     #[cfg(test)]
-    fn for_test(path: impl Into<std::path::PathBuf>, expected_owner_uid: u32) -> Self {
+    pub(crate) fn for_test(path: impl Into<std::path::PathBuf>, expected_owner_uid: u32) -> Self {
         Self {
             store: RootOwnedJsonStore::new(
                 path,

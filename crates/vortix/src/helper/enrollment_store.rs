@@ -18,7 +18,6 @@ use crate::vortix_core::privileged::{AuthorityBinding, BootScope, LeaseId, Opera
 
 const ENROLLMENT_SCHEMA_VERSION: u16 = 1;
 const MAX_ENROLLMENT_BYTES: u64 = 16 * 1024;
-const AUTHORITY_BINDING_DOMAIN: &[u8] = b"vortix-manager-instance-v1\0";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -201,15 +200,11 @@ impl AuthorityReservation {
     }
 
     pub(crate) fn binding(self) -> AuthorityBinding {
-        let mut material =
-            Vec::with_capacity(AUTHORITY_BINDING_DOMAIN.len() + self.manager_instance_nonce.len());
-        material.extend_from_slice(AUTHORITY_BINDING_DOMAIN);
-        material.extend_from_slice(&self.manager_instance_nonce);
-        AuthorityBinding::new(
+        AuthorityBinding::for_manager_nonce(
             self.authority_epoch,
             self.boot_scope,
             self.lease_id,
-            OperationDigest::of_bytes(&material),
+            self.manager_instance_nonce,
         )
         .expect("validated root reservation always produces a valid public binding")
     }
