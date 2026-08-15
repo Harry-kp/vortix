@@ -13,7 +13,9 @@ use super::server::{
 };
 use super::validate::PlatformLayout;
 use crate::vortix_core::ports::killswitch::ActiveTunnelInfo;
-use crate::vortix_core::ports::owned_firewall::{OwnedFirewall, OwnedFirewallError};
+use crate::vortix_core::ports::owned_firewall::{
+    ExpectedFirewallState, OwnedFirewall, OwnedFirewallError,
+};
 use crate::vortix_core::privileged::{
     FirewallTransactionId, HelperLedgerFirewall, LeaseId, NetworkPolicyOperation, ObservationState,
     PhysicalFirewallBackend, PhysicalFirewallStage, PolicyProjection, PrivilegedFirewallRole,
@@ -27,11 +29,12 @@ pub(crate) struct HelperFirewallExecutor {
 }
 
 impl HelperFirewallExecutor {
-    pub(crate) fn new(layout: PlatformLayout, lease_id: LeaseId) -> Self {
+    pub(crate) fn new(lease_id: LeaseId) -> Self {
+        let platform = crate::platform::helper_owned_firewall();
         Self {
-            layout,
+            layout: layout_for_backend(platform.backend()),
             lease_id,
-            platform: crate::platform::helper_owned_firewall(),
+            platform,
         }
     }
 
@@ -41,10 +44,12 @@ impl HelperFirewallExecutor {
         lease_id: LeaseId,
         platform: impl OwnedFirewall + 'static,
     ) -> Self {
+        let platform = Box::new(platform);
+        assert_eq!(layout, layout_for_backend(platform.backend()));
         Self {
-            layout,
+            layout: layout_for_backend(platform.backend()),
             lease_id,
-            platform: Box::new(platform),
+            platform,
         }
     }
 
@@ -63,7 +68,7 @@ impl HelperFirewallExecutor {
             };
         }
         if firewalls.iter().any(|state| {
-            !backend_matches_layout(self.layout, state.physical().backend())
+            state.physical().backend() != self.platform.backend()
                 || state.physical().intended_digest() != state.intended().digest()
         }) {
             return Err(PrivilegedExecutionError::InvalidPlan);
@@ -127,7 +132,7 @@ impl HelperFirewallExecutor {
                         .map_err(|_| NetworkPolicyPreparationError::InvalidPlan)?,
                     None => HelperLedgerFirewall::prepared(
                         policy.clone(),
-                        backend_for_layout(self.layout),
+                        self.platform.backend(),
                         new_transaction_id()
                             .map_err(|_| NetworkPolicyPreparationError::FailedBeforeEffect)?,
                         plan.intended().digest(),
@@ -181,7 +186,7 @@ impl HelperFirewallExecutor {
                 }) {
                     return Err(PrivilegedExecutionError::InvalidPlan);
                 }
-                self.apply_projection(plan.intended())?;
+                self.apply_projection(plan.intended(), plan.prior_effective())?;
                 Ok(NetworkPolicyOutcome::Applied)
             }
             NetworkPolicyOperation::ObserveBarrier { policy, .. } => {
@@ -227,14 +232,23 @@ impl HelperFirewallExecutor {
     fn apply_projection(
         &mut self,
         projection: &PolicyProjection,
+        prior: Option<&PolicyProjection>,
     ) -> Result<(), PrivilegedExecutionError> {
+        let prior_active = prior
+            .filter(|projection| projection.firewall_blocks() == Some(true))
+            .map(|projection| firewall_tunnels(self.layout, self.lease_id, projection))
+            .transpose()?;
+        let expected = prior_active.as_deref().map_or(
+            ExpectedFirewallState::Absent,
+            ExpectedFirewallState::Blocking,
+        );
         if projection.firewall_blocks() != Some(true) {
-            self.platform.clear().map_err(map_execution_error)?;
+            self.platform.clear(expected).map_err(map_execution_error)?;
             return Ok(());
         }
         let active = firewall_tunnels(self.layout, self.lease_id, projection)?;
         self.platform
-            .apply_blocking(&active)
+            .apply_blocking(&active, expected)
             .map_err(map_execution_error)
     }
 
@@ -294,9 +308,27 @@ impl HelperFirewallExecutor {
             if retained_owner {
                 return Err(PrivilegedExecutionError::InvalidPlan);
             }
-            self.platform.clear().map_err(map_execution_error)?;
+            let prior = prepared
+                .execution()
+                .obsolete_effective()
+                .iter()
+                .find(|projection| resources.contains(projection.policy()))
+                .ok_or(PrivilegedExecutionError::InvalidPlan)?;
+            let prior_active = firewall_tunnels(self.layout, self.lease_id, prior)?;
+            self.platform
+                .clear(ExpectedFirewallState::Blocking(&prior_active))
+                .map_err(map_execution_error)?;
         }
         Ok(())
+    }
+}
+
+const fn layout_for_backend(backend: PhysicalFirewallBackend) -> PlatformLayout {
+    match backend {
+        PhysicalFirewallBackend::LinuxNft | PhysicalFirewallBackend::LinuxIptablesDualFamily => {
+            PlatformLayout::Linux
+        }
+        PhysicalFirewallBackend::MacOsPf => PlatformLayout::MacOs,
     }
 }
 
@@ -304,23 +336,6 @@ const fn map_execution_error(error: OwnedFirewallError) -> PrivilegedExecutionEr
     match error {
         OwnedFirewallError::FailedBeforeEffect => PrivilegedExecutionError::FailedBeforeEffect,
         OwnedFirewallError::EffectMayHaveApplied => PrivilegedExecutionError::EffectMayHaveApplied,
-    }
-}
-
-fn backend_matches_layout(layout: PlatformLayout, backend: PhysicalFirewallBackend) -> bool {
-    matches!(
-        (layout, backend),
-        (
-            PlatformLayout::Linux,
-            PhysicalFirewallBackend::LinuxNft | PhysicalFirewallBackend::LinuxIptablesDualFamily
-        ) | (PlatformLayout::MacOs, PhysicalFirewallBackend::MacOsPf)
-    )
-}
-
-const fn backend_for_layout(layout: PlatformLayout) -> PhysicalFirewallBackend {
-    match layout {
-        PlatformLayout::Linux => PhysicalFirewallBackend::LinuxNft,
-        PlatformLayout::MacOs => PhysicalFirewallBackend::MacOsPf,
     }
 }
 
@@ -371,20 +386,29 @@ mod tests {
 
     use super::*;
     use crate::vortix_core::control::AuthorityEpoch;
+    use crate::vortix_core::privileged::PhysicalFirewallBackend;
     use crate::vortix_core::privileged::{PrivilegedFirewallTunnel, ResourceKind, ResourceTag};
     use crate::vortix_core::profile::ProfileId;
 
     struct RecoveryAuditCounter(Arc<AtomicUsize>);
 
     impl OwnedFirewall for RecoveryAuditCounter {
+        fn backend(&self) -> PhysicalFirewallBackend {
+            PhysicalFirewallBackend::MacOsPf
+        }
+
         fn apply_blocking(
             &mut self,
             _active: &[ActiveTunnelInfo],
+            _expected: ExpectedFirewallState<'_>,
         ) -> Result<(), OwnedFirewallError> {
             unreachable!()
         }
 
-        fn clear(&mut self) -> Result<(), OwnedFirewallError> {
+        fn clear(
+            &mut self,
+            _expected: ExpectedFirewallState<'_>,
+        ) -> Result<(), OwnedFirewallError> {
             unreachable!()
         }
 
