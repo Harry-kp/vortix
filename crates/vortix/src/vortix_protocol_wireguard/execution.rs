@@ -302,13 +302,17 @@ fn canonical_key_parts(bytes: &[u8]) -> Result<(&str, [u8; 32]), WireGuardExecut
     if value.len() != ENCODED_KEY_BYTES {
         return Err(WireGuardExecutionError::InvalidKeyMaterial);
     }
-    let decoded = BASE64
-        .decode(value)
-        .map_err(|_| WireGuardExecutionError::InvalidKeyMaterial)?;
+    let decoded = Zeroizing::new(
+        BASE64
+            .decode(value)
+            .map_err(|_| WireGuardExecutionError::InvalidKeyMaterial)?,
+    );
     let key: [u8; KEY_BYTES] = decoded
+        .as_slice()
         .try_into()
         .map_err(|_| WireGuardExecutionError::InvalidKeyMaterial)?;
-    if BASE64.encode(key) != value {
+    let canonical = Zeroizing::new(BASE64.encode(key));
+    if canonical.as_str() != value {
         return Err(WireGuardExecutionError::InvalidKeyMaterial);
     }
     Ok((value, key))
