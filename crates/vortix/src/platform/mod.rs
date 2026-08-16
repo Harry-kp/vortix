@@ -6,6 +6,7 @@
 //! over to the `Platform` aggregate.
 
 pub mod aggregate;
+pub(crate) mod anonymous_material;
 pub(crate) mod fixed_root_command;
 pub(crate) mod route_probe;
 
