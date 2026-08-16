@@ -24,6 +24,7 @@ pub mod passive;
 mod server;
 pub mod service;
 mod tunnel_executor;
+mod tunnel_material;
 
 pub use server::DaemonServer;
 

@@ -7,6 +7,7 @@
 
 pub(crate) mod execution;
 pub mod parser;
+pub(crate) mod profile_plan;
 pub mod tunnel;
 
 pub use parser::WgParsedProfile;
