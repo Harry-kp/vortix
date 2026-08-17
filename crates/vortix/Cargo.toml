@@ -114,7 +114,7 @@ libc = "0.2"
 # import `CFDictionary` / `CFArray` / `CFString` etc. through that re-export
 # rather than depending on `core-foundation` directly so the two versions
 # can't drift apart.
-system-configuration = "0.7"
+system-configuration = "0.8"
 
 [dev-dependencies]
 tempfile = { workspace = true }
