@@ -558,8 +558,8 @@ impl From<super::descriptor_transport::DescriptorTransportError> for HelperTrans
 mod tests {
     use super::*;
     use crate::daemon::helper_client::{
-        AuthenticatedHelperTransport, HelperClientError, HelperConnectBudget,
-        SharedAuthenticatedHelper,
+        AuthenticatedHelperSession, AuthenticatedHelperTransport, HelperClientError,
+        HelperConnectBudget, SharedAuthenticatedHelper,
     };
     use crate::helper::protocol::{
         decode_response_frame, encode_request_frame, HelperCapability, HelperClientHello,
@@ -568,11 +568,12 @@ mod tests {
         verify_helper_peer, verify_service_instance, ArtifactFact, HelperPeerFacts,
         InstallManifest, VerifiedServiceFacts,
     };
-    use crate::helper::HelperServerHello;
+    use crate::helper::{HelperPolicyInventory, HelperPolicyResource, HelperServerHello};
     use crate::vortix_core::control::AuthorityEpoch;
     use crate::vortix_core::privileged::{
-        AuthorityBinding, BootScope, HelperEpoch, LeaseId, OperationDigest, PrivilegedOperation,
-        PrivilegedRequest, ProtocolPlan, ReceiptLedger, RejectionCode, RequestSequence,
+        AuthorityBinding, BootScope, HelperEpoch, HelperResourceState, LeaseId, OperationDigest,
+        PolicyDigest, PolicyPhase, PolicyPredecessor, PrivilegedOperation, PrivilegedRequest,
+        ProtocolPlan, ReceiptLedger, RejectionCode, RequestSequence, ResourceKind,
         ResourceObservationTarget, ResourceTag, RootAuthorityLedger, ServiceInstanceClaim,
         ServiceManager, WireGuardInterfaceOptions, WireGuardPeerPlan, WireGuardPlan,
     };
@@ -666,6 +667,11 @@ mod tests {
         next_sequence: RequestSequence,
         enabled_capabilities: Vec<HelperCapability>,
     ) -> HelperServerHello {
+        let policy_inventory = enabled_capabilities
+            .contains(&HelperCapability::NetworkPolicy)
+            .then(|| {
+                Box::new(super::super::HelperPolicyInventory::new(None, None, Vec::new()).unwrap())
+            });
         HelperServerHello {
             product: "vortix-helper".into(),
             product_version: env!("CARGO_PKG_VERSION").into(),
@@ -679,6 +685,7 @@ mod tests {
                 helper_epoch,
                 next_sequence,
             )),
+            policy_inventory,
         }
     }
 
@@ -1206,6 +1213,119 @@ mod tests {
     }
 
     #[test]
+    fn schema_six_network_policy_requires_authenticated_inventory() {
+        let (_root, authority, service) = authority_fixture();
+        let helper_epoch = HelperEpoch::new(8).unwrap();
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let enabled = vec![
+            HelperCapability::Handshake,
+            HelperCapability::Observe,
+            HelperCapability::NetworkPolicy,
+        ];
+        let server = std::thread::spawn(move || {
+            let request = read_request(&mut server_stream);
+            let mut hello = enrolled_hello(
+                authority,
+                helper_epoch,
+                RequestSequence::new(1).unwrap(),
+                enabled,
+            );
+            hello.policy_inventory = None;
+            write_response(
+                &mut server_stream,
+                &HelperResponse {
+                    id: request.id,
+                    result: Ok(HelperResult::Handshake(hello)),
+                },
+            )
+            .unwrap();
+        });
+        let error = AuthenticatedHelperTransport::open_verified(
+            client_stream,
+            &verified_helper_peer(),
+            501,
+            authority,
+            &service,
+            &[
+                HelperCapability::Handshake,
+                HelperCapability::Observe,
+                HelperCapability::NetworkPolicy,
+            ],
+            HelperConnectBudget::new(
+                RequestSequence::new(1).unwrap(),
+                Instant::now() + Duration::from_secs(1),
+            ),
+        )
+        .err()
+        .unwrap();
+        assert!(matches!(
+            error,
+            crate::daemon::helper_client::HelperClientError::PolicyInventoryMismatch
+        ));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn authenticated_session_rejects_foreign_or_legacy_policy_inventory() {
+        let (root, authority, _) = authority_fixture();
+        let principal = root.principal();
+        let helper_epoch = HelperEpoch::new(8).unwrap();
+        let enabled = vec![
+            HelperCapability::Handshake,
+            HelperCapability::Observe,
+            HelperCapability::NetworkPolicy,
+        ];
+        let foreign = ResourceTag::topology(AuthorityEpoch(4), 1, ResourceKind::Firewall).unwrap();
+        let digest = PolicyDigest::for_test(OperationDigest::of_bytes(b"foreign policy"));
+        let record = HelperPolicyResource::new(
+            foreign.clone(),
+            HelperResourceState::Owned,
+            digest,
+            Some(digest),
+        )
+        .unwrap();
+        let mut foreign_inventory = enrolled_hello(
+            authority,
+            helper_epoch,
+            RequestSequence::new(1).unwrap(),
+            enabled.clone(),
+        );
+        foreign_inventory.policy_inventory = Some(Box::new(
+            HelperPolicyInventory::new(
+                Some(foreign),
+                Some(PolicyPredecessor::for_test(digest, PolicyPhase::Firewall)),
+                vec![record],
+            )
+            .unwrap(),
+        ));
+        assert!(matches!(
+            AuthenticatedHelperSession::from_handshake(
+                &principal,
+                &verified_helper_peer(),
+                &foreign_inventory,
+            ),
+            Err(HelperClientError::PolicyInventoryMismatch)
+        ));
+
+        let mut legacy_inventory = enrolled_hello(
+            authority,
+            helper_epoch,
+            RequestSequence::new(1).unwrap(),
+            enabled,
+        );
+        legacy_inventory.schema = 5;
+        assert!(legacy_inventory.policy_inventory.is_some());
+        assert!(matches!(
+            AuthenticatedHelperSession::from_handshake(
+                &principal,
+                &verified_helper_peer(),
+                &legacy_inventory,
+            ),
+            Err(HelperClientError::PolicyInventoryMismatch)
+        ));
+    }
+
+    #[test]
     fn authenticated_transport_rejects_v3_authority_mismatch_at_response_boundary() {
         let (_root, authority, service) = authority_fixture();
         let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
@@ -1232,6 +1352,7 @@ mod tests {
                             authority.lease_id(),
                             HelperEpoch::new(8).unwrap(),
                         )),
+                        policy_inventory: None,
                     })),
                 },
             )
@@ -1285,6 +1406,7 @@ mod tests {
                             authority.lease_id(),
                             HelperEpoch::new(8).unwrap(),
                         )),
+                        policy_inventory: None,
                     })),
                 },
             )

@@ -725,6 +725,11 @@ impl TrustedDaemonPrincipal {
 pub struct PolicyDigest(OperationDigest);
 
 impl PolicyDigest {
+    #[cfg(test)]
+    pub(crate) const fn for_test(digest: OperationDigest) -> Self {
+        Self(digest)
+    }
+
     fn of(operation: &NetworkPolicyOperation) -> Self {
         Self(OperationDigest::semantic(
             b"network-policy-transition",
@@ -732,7 +737,7 @@ impl PolicyDigest {
         ))
     }
 
-    fn is_zero(self) -> bool {
+    pub(crate) fn is_zero(self) -> bool {
         self.0.is_zero()
     }
 
@@ -763,6 +768,29 @@ pub struct PolicyPredecessor {
 }
 
 impl PolicyPredecessor {
+    #[allow(
+        dead_code,
+        reason = "daemon policy adapter consumes these authenticated fields"
+    )]
+    #[must_use]
+    pub(crate) const fn digest(self) -> PolicyDigest {
+        self.digest
+    }
+
+    #[must_use]
+    pub(crate) const fn phase(self) -> PolicyPhase {
+        self.phase
+    }
+
+    #[must_use]
+    pub(crate) const fn observed(self) -> bool {
+        self.observed
+    }
+
+    pub(crate) fn is_valid(self) -> bool {
+        !self.digest.is_zero()
+    }
+
     #[cfg(test)]
     pub(crate) const fn for_test(digest: PolicyDigest, phase: PolicyPhase) -> Self {
         Self {
