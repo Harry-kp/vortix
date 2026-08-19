@@ -15,8 +15,9 @@ use crate::vortix_core::privileged::{
 pub const HELPER_PROTOCOL_MIN: u16 = 1;
 pub const HELPER_PROTOCOL_MAX: u16 = 1;
 pub const HELPER_SCHEMA_MIN: u16 = 3;
-pub const HELPER_SCHEMA_MAX: u16 = 6;
+pub const HELPER_SCHEMA_MAX: u16 = 7;
 pub(crate) const MANAGED_OBSERVATION_SCHEMA_MIN: u16 = 5;
+pub(crate) const FIREWALL_BASELINE_SCHEMA_MIN: u16 = 7;
 pub const MAX_HELPER_FRAME_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,6 +53,12 @@ const fn operation_contract(operation: &PrivilegedOperation) -> (HelperCapabilit
         PrivilegedOperation::StartTunnel(_) | PrivilegedOperation::StopTunnel(_) => {
             (HelperCapability::TunnelLifecycle, HELPER_SCHEMA_MIN)
         }
+        PrivilegedOperation::NetworkPolicy(
+            crate::vortix_core::privileged::NetworkPolicyOperation::EstablishFirewall { .. },
+        ) => (
+            HelperCapability::NetworkPolicy,
+            FIREWALL_BASELINE_SCHEMA_MIN,
+        ),
         PrivilegedOperation::NetworkPolicy(_) => {
             (HelperCapability::NetworkPolicy, HELPER_SCHEMA_MIN)
         }
@@ -305,7 +312,9 @@ impl HelperPolicyResource {
 
 fn phase_matches_kind(phase: PolicyPhase, kind: ResourceKind) -> bool {
     match phase {
-        PolicyPhase::Blocking | PolicyPhase::Firewall => kind == ResourceKind::Firewall,
+        PolicyPhase::FirewallBaseline | PolicyPhase::Blocking | PolicyPhase::Firewall => {
+            kind == ResourceKind::Firewall
+        }
         PolicyPhase::Routes => kind == ResourceKind::Routes,
         PolicyPhase::Dns => kind == ResourceKind::Dns,
         PolicyPhase::Released => matches!(
@@ -385,8 +394,8 @@ impl HelperSessionBinding {
                 authority.lease_id(),
                 helper_epoch,
             ),
-            4..=6 => Self::v4(authority, helper_epoch, next_sequence),
-            _ => unreachable!("negotiation accepts only helper schemas 3 through 6"),
+            4..=7 => Self::v4(authority, helper_epoch, next_sequence),
+            _ => unreachable!("negotiation accepts only helper schemas 3 through 7"),
         }
     }
 
@@ -730,7 +739,7 @@ mod tests {
         let hello = HelperClientHello::current(501, service(), vec![HelperCapability::Handshake]);
         let encoded = serde_json::to_vec(&hello).unwrap();
         let legacy: V3ClientHello = serde_json::from_slice(&encoded).unwrap();
-        assert_eq!(legacy.schema, CompatibilityRange { min: 3, max: 6 });
+        assert_eq!(legacy.schema, CompatibilityRange { min: 3, max: 7 });
         assert!(!serde_json::to_value(hello)
             .unwrap()
             .as_object()
@@ -785,7 +794,7 @@ mod tests {
     }
 
     #[test]
-    fn new_peers_negotiate_v6_full_authority_and_replay_cursor() {
+    fn new_peers_negotiate_v7_full_authority_and_replay_cursor() {
         let hello = HelperClientHello::current(501, service(), vec![HelperCapability::Handshake]);
         let response = negotiate_enrolled(
             &hello,
@@ -795,7 +804,7 @@ mod tests {
             &STAGED_CAPABILITIES,
         )
         .unwrap();
-        assert_eq!(response.schema, 6);
+        assert_eq!(response.schema, 7);
         let encoded = serde_json::to_vec(&response).unwrap();
         let decoded: HelperServerHello = serde_json::from_slice(&encoded).unwrap();
         let binding = decoded.session.unwrap();
@@ -806,6 +815,27 @@ mod tests {
             Some(RequestSequence::new(17).unwrap())
         );
         assert!(decoded.policy_inventory.is_none());
+    }
+
+    #[test]
+    fn nonblocking_firewall_baseline_requires_schema_seven() {
+        let policy = ResourceTag::topology(AuthorityEpoch(3), 1, ResourceKind::Firewall).unwrap();
+        let baseline = PrivilegedOperation::NetworkPolicy(
+            crate::vortix_core::privileged::NetworkPolicyOperation::EstablishFirewall {
+                policy: policy.clone(),
+                mode: crate::vortix_core::state::killswitch::KillSwitchMode::Off,
+                tunnels: Vec::new(),
+            },
+        );
+        let blocking = PrivilegedOperation::NetworkPolicy(
+            crate::vortix_core::privileged::NetworkPolicyOperation::EstablishBlocking {
+                policy,
+                tunnels: Vec::new(),
+            },
+        );
+
+        assert_eq!(minimum_schema_for_operation(&baseline), 7);
+        assert_eq!(minimum_schema_for_operation(&blocking), HELPER_SCHEMA_MIN);
     }
 
     #[test]

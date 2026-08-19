@@ -3468,23 +3468,34 @@ fn capture_topology_policy(
     // `TopologyState::firewall_blocking` is effective final truth, so it must
     // not inherit the pre-barrier requirement.
     target.firewall_blocking = final_firewall_blocks(snapshot.desired.kill_switch);
+    let prior = supervisor.applied_topology().unwrap_or_else(|| {
+        // A fresh one-shot client has no supervisor history; its initial
+        // mode is the persisted firewall baseline, never an implicit Off.
+        build_topology_state(
+            prior_profiles,
+            &snapshot.observed.tunnels,
+            config,
+            config.initial_kill_switch_mode,
+        )
+    });
+    let prior_tunnel_revisions = prior
+        .profiles
+        .iter()
+        .filter_map(|profile| {
+            supervisor
+                .resource_revision(profile)
+                .map(|revision| (profile.clone(), revision))
+        })
+        .collect();
     Some(TopologyPolicy {
         generation: revision.generation,
         authority_epoch: revision.authority_epoch,
         digest: revision.digest,
         operation_id: operation.id.clone(),
         deadline,
-        prior: supervisor.applied_topology().unwrap_or_else(|| {
-            // A fresh one-shot client has no supervisor history; its initial
-            // mode is the persisted firewall baseline, never an implicit Off.
-            build_topology_state(
-                prior_profiles,
-                &snapshot.observed.tunnels,
-                config,
-                config.initial_kill_switch_mode,
-            )
-        }),
+        prior,
         target,
+        prior_tunnel_revisions,
         tunnel_revisions: target_profiles
             .iter()
             .filter_map(|profile| {
@@ -6111,7 +6122,9 @@ mod target_profiles_tests {
             Ok(())
         }
 
-        fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) {}
+        fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) -> Result<(), String> {
+            Ok(())
+        }
     }
 
     #[derive(Debug)]

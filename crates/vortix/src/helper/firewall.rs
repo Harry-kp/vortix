@@ -119,7 +119,8 @@ impl HelperFirewallExecutor {
         plan: &NetworkPolicyExecutionPlan,
     ) -> Result<PreparedNetworkPolicyExecutionPlan, NetworkPolicyPreparationError> {
         match plan.operation() {
-            NetworkPolicyOperation::EstablishBlocking { policy, .. }
+            NetworkPolicyOperation::EstablishFirewall { policy, .. }
+            | NetworkPolicyOperation::EstablishBlocking { policy, .. }
             | NetworkPolicyOperation::ApplyFirewall { policy, .. } => {
                 self.audit_before_mutation(plan)?;
                 let mut firewalls = plan.recovered_firewalls().to_vec();
@@ -171,7 +172,8 @@ impl HelperFirewallExecutor {
     ) -> Result<NetworkPolicyOutcome, PrivilegedExecutionError> {
         let plan = prepared.execution();
         match plan.operation() {
-            NetworkPolicyOperation::EstablishBlocking { policy, .. }
+            NetworkPolicyOperation::EstablishFirewall { policy, .. }
+            | NetworkPolicyOperation::EstablishBlocking { policy, .. }
             | NetworkPolicyOperation::ApplyFirewall { policy, .. } => {
                 if !prepared.prepared_firewalls().iter().any(|physical| {
                     physical.resource() == policy
@@ -351,9 +353,9 @@ fn firewall_tunnels(
     projection: &PolicyProjection,
 ) -> Result<Vec<ActiveTunnelInfo>, PrivilegedExecutionError> {
     let tunnels = match projection {
-        PolicyProjection::Blocking { tunnels, .. } | PolicyProjection::Firewall { tunnels, .. } => {
-            tunnels
-        }
+        PolicyProjection::FirewallBaseline { tunnels, .. }
+        | PolicyProjection::Blocking { tunnels, .. }
+        | PolicyProjection::Firewall { tunnels, .. } => tunnels,
         PolicyProjection::Routes { .. } | PolicyProjection::Dns { .. } => {
             return Err(PrivilegedExecutionError::InvalidPlan);
         }

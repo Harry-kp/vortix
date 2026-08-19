@@ -374,7 +374,9 @@ fn real_tunnel_scoped_custodians_handoff_authenticate_and_contain_groups() {
             fn apply(&self, _: &TopologyPolicy, _: PolicyBarrier) -> Result<(), String> {
                 Ok(())
             }
-            fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) {}
+            fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) -> Result<(), String> {
+                Ok(())
+            }
         }
 
         let config = temp.path().join("owned.ovpn");

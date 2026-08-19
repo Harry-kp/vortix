@@ -752,6 +752,7 @@ impl PolicyDigest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyPhase {
+    FirewallBaseline,
     Blocking,
     Routes,
     Dns,
@@ -1078,6 +1079,13 @@ impl PrivilegedDnsAssignment {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "phase", rename_all = "snake_case", deny_unknown_fields)]
 pub enum NetworkPolicyOperation {
+    EstablishFirewall {
+        policy: ResourceTag,
+        #[serde(with = "crate::vortix_core::state::killswitch::serde_mode_slug")]
+        mode: KillSwitchMode,
+        #[serde(deserialize_with = "deserialize_firewall_tunnel_vec")]
+        tunnels: Vec<PrivilegedFirewallTunnel>,
+    },
     EstablishBlocking {
         policy: ResourceTag,
         #[serde(deserialize_with = "deserialize_firewall_tunnel_vec")]
@@ -1121,7 +1129,8 @@ impl NetworkPolicyOperation {
         validate_policy_tag(policy, authority, self.expected_policy_kind())?;
         match self {
             Self::EstablishBlocking { tunnels, .. } => validate_firewall_tunnels(tunnels, true),
-            Self::ApplyFirewall { mode, tunnels, .. } => {
+            Self::EstablishFirewall { mode, tunnels, .. }
+            | Self::ApplyFirewall { mode, tunnels, .. } => {
                 validate_firewall_tunnels(tunnels, matches!(mode, KillSwitchMode::AlwaysOn))
             }
             Self::ApplyRoutes { routes, .. } => validate_routes(routes),
@@ -1151,7 +1160,8 @@ impl NetworkPolicyOperation {
 
     const fn policy(&self) -> &ResourceTag {
         match self {
-            Self::EstablishBlocking { policy, .. }
+            Self::EstablishFirewall { policy, .. }
+            | Self::EstablishBlocking { policy, .. }
             | Self::ApplyRoutes { policy, .. }
             | Self::ApplyDns { policy, .. }
             | Self::ApplyFirewall { policy, .. }
@@ -1166,7 +1176,9 @@ impl NetworkPolicyOperation {
 
     const fn expected_policy_kind(&self) -> ResourceKind {
         match self {
-            Self::EstablishBlocking { .. } | Self::ApplyFirewall { .. } => ResourceKind::Firewall,
+            Self::EstablishFirewall { .. }
+            | Self::EstablishBlocking { .. }
+            | Self::ApplyFirewall { .. } => ResourceKind::Firewall,
             Self::ApplyRoutes { .. } => ResourceKind::Routes,
             Self::ApplyDns { .. } => ResourceKind::Dns,
             Self::ObserveBarrier { policy, .. } | Self::ReleaseObsolete { policy, .. } => {
@@ -1177,7 +1189,7 @@ impl NetworkPolicyOperation {
 
     const fn predecessor(&self) -> Option<PolicyPredecessor> {
         match self {
-            Self::EstablishBlocking { .. } => None,
+            Self::EstablishFirewall { .. } | Self::EstablishBlocking { .. } => None,
             Self::ApplyRoutes { predecessor, .. }
             | Self::ApplyDns { predecessor, .. }
             | Self::ApplyFirewall { predecessor, .. }
@@ -1188,6 +1200,7 @@ impl NetworkPolicyOperation {
 
     const fn target_phase(&self) -> PolicyPhase {
         match self {
+            Self::EstablishFirewall { .. } => PolicyPhase::FirewallBaseline,
             Self::EstablishBlocking { .. } => PolicyPhase::Blocking,
             Self::ApplyRoutes { .. } => PolicyPhase::Routes,
             Self::ApplyDns { .. } => PolicyPhase::Dns,
@@ -1335,6 +1348,13 @@ impl<'de> Deserialize<'de> for ScopedRoute {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum PolicyProjection {
+    FirewallBaseline {
+        policy: ResourceTag,
+        #[serde(with = "crate::vortix_core::state::killswitch::serde_mode_slug")]
+        mode: KillSwitchMode,
+        #[serde(deserialize_with = "deserialize_firewall_tunnel_vec")]
+        tunnels: Vec<PrivilegedFirewallTunnel>,
+    },
     Blocking {
         policy: ResourceTag,
         #[serde(deserialize_with = "deserialize_firewall_tunnel_vec")]
@@ -1367,12 +1387,23 @@ impl PolicyProjection {
         predecessor: Option<&Self>,
     ) -> Result<Option<Self>, OperationError> {
         Ok(match operation {
+            NetworkPolicyOperation::EstablishFirewall {
+                policy,
+                mode,
+                tunnels,
+            } => Some(Self::FirewallBaseline {
+                policy: policy.clone(),
+                mode: *mode,
+                tunnels: tunnels.clone(),
+            }),
             NetworkPolicyOperation::EstablishBlocking { policy, tunnels } => Some(Self::Blocking {
                 policy: policy.clone(),
                 tunnels: tunnels.clone(),
             }),
             NetworkPolicyOperation::ApplyRoutes { policy, routes, .. } => {
-                let Some(Self::Blocking { tunnels, .. }) = predecessor else {
+                let Some(Self::FirewallBaseline { tunnels, .. } | Self::Blocking { tunnels, .. }) =
+                    predecessor
+                else {
                     return Err(OperationError::PolicyTransition);
                 };
                 validate_route_projection(routes, tunnels)?;
@@ -1407,7 +1438,8 @@ impl PolicyProjection {
 
     pub(crate) const fn policy(&self) -> &ResourceTag {
         match self {
-            Self::Blocking { policy, .. }
+            Self::FirewallBaseline { policy, .. }
+            | Self::Blocking { policy, .. }
             | Self::Routes { policy, .. }
             | Self::Dns { policy, .. }
             | Self::Firewall { policy, .. } => policy,
@@ -1423,7 +1455,10 @@ impl PolicyProjection {
             Self::Routes {
                 routes, tunnels, ..
             } => Some((routes, tunnels)),
-            Self::Blocking { .. } | Self::Dns { .. } | Self::Firewall { .. } => None,
+            Self::FirewallBaseline { .. }
+            | Self::Blocking { .. }
+            | Self::Dns { .. }
+            | Self::Firewall { .. } => None,
         }
     }
 
@@ -1432,13 +1467,16 @@ impl PolicyProjection {
     pub(crate) const fn firewall_blocks(&self) -> Option<bool> {
         match self {
             Self::Blocking { .. } => Some(true),
-            Self::Firewall { mode, .. } => Some(matches!(mode, KillSwitchMode::AlwaysOn)),
+            Self::FirewallBaseline { mode, .. } | Self::Firewall { mode, .. } => {
+                Some(matches!(mode, KillSwitchMode::AlwaysOn))
+            }
             Self::Routes { .. } | Self::Dns { .. } => None,
         }
     }
 
     const fn phase(&self) -> PolicyPhase {
         match self {
+            Self::FirewallBaseline { .. } => PolicyPhase::FirewallBaseline,
             Self::Blocking { .. } => PolicyPhase::Blocking,
             Self::Routes { .. } => PolicyPhase::Routes,
             Self::Dns { .. } => PolicyPhase::Dns,
@@ -1470,7 +1508,12 @@ impl PolicyProjection {
                 ResourceKind::Dns,
                 validate_dns_assignments(assignments),
             ),
-            Self::Firewall {
+            Self::FirewallBaseline {
+                policy,
+                mode,
+                tunnels,
+            }
+            | Self::Firewall {
                 policy,
                 mode,
                 tunnels,
@@ -2152,12 +2195,20 @@ impl OperationGuard {
             .as_ref()
             .and_then(|state| state.policy.as_ref());
         match (operation, current) {
-            (NetworkPolicyOperation::EstablishBlocking { policy, .. }, None) => {
+            (
+                NetworkPolicyOperation::EstablishFirewall { policy, .. }
+                | NetworkPolicyOperation::EstablishBlocking { policy, .. },
+                None,
+            ) => {
                 if policy.generation() == 0 {
                     return Err(OperationError::PolicyTransition);
                 }
             }
-            (NetworkPolicyOperation::EstablishBlocking { policy, .. }, Some(cursor)) => {
+            (
+                NetworkPolicyOperation::EstablishFirewall { policy, .. }
+                | NetworkPolicyOperation::EstablishBlocking { policy, .. },
+                Some(cursor),
+            ) => {
                 if policy.generation() <= cursor.generation || !cursor.observed {
                     return Err(OperationError::PolicyTransition);
                 }
@@ -2328,7 +2379,7 @@ impl OperationGuard {
 
 const fn phase_rank(phase: PolicyPhase) -> u8 {
     match phase {
-        PolicyPhase::Blocking => 0,
+        PolicyPhase::FirewallBaseline | PolicyPhase::Blocking => 0,
         PolicyPhase::Routes => 1,
         PolicyPhase::Dns => 2,
         PolicyPhase::Firewall => 3,
@@ -2338,9 +2389,10 @@ const fn phase_rank(phase: PolicyPhase) -> u8 {
 
 const fn policy_kind_for_phase(phase: PolicyPhase) -> ResourceKind {
     match phase {
-        PolicyPhase::Blocking | PolicyPhase::Firewall | PolicyPhase::Released => {
-            ResourceKind::Firewall
-        }
+        PolicyPhase::FirewallBaseline
+        | PolicyPhase::Blocking
+        | PolicyPhase::Firewall
+        | PolicyPhase::Released => ResourceKind::Firewall,
         PolicyPhase::Routes => ResourceKind::Routes,
         PolicyPhase::Dns => ResourceKind::Dns,
     }
@@ -2683,6 +2735,21 @@ mod tests {
         let mut wire = serde_json::to_value(request).unwrap();
         wire["operation"]["payload"]["tunnels"][0]["interface"] = serde_json::json!("foreign0");
         assert!(serde_json::from_value::<PrivilegedRequest>(wire).is_err());
+    }
+
+    #[test]
+    fn policy_generation_can_begin_without_inventing_a_blocking_transition() {
+        let policy = ResourceTag::topology(AuthorityEpoch(7), 1, ResourceKind::Firewall).unwrap();
+        let operation = NetworkPolicyOperation::EstablishFirewall {
+            policy,
+            mode: KillSwitchMode::Off,
+            tunnels: Vec::new(),
+        };
+
+        assert_eq!(operation.target_phase(), PolicyPhase::FirewallBaseline);
+        assert!(PolicyProjection::from_mutation(&operation, None)
+            .unwrap()
+            .is_some_and(|projection| projection.firewall_blocks() == Some(false)));
     }
 
     #[test]

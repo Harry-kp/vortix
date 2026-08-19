@@ -111,7 +111,8 @@ impl HelperRouteExecutor {
                     plan.recovered_dns().to_vec(),
                 ))
             }
-            NetworkPolicyOperation::EstablishBlocking { .. }
+            NetworkPolicyOperation::EstablishFirewall { .. }
+            | NetworkPolicyOperation::EstablishBlocking { .. }
             | NetworkPolicyOperation::ApplyRoutes { .. }
             | NetworkPolicyOperation::ApplyDns { .. }
             | NetworkPolicyOperation::ApplyFirewall { .. }
@@ -140,7 +141,8 @@ impl HelperRouteExecutor {
                         .map_err(|_| PrivilegedExecutionError::InvalidPlan)?,
                 ]))
             }
-            NetworkPolicyOperation::EstablishBlocking { .. }
+            NetworkPolicyOperation::EstablishFirewall { .. }
+            | NetworkPolicyOperation::EstablishBlocking { .. }
             | NetworkPolicyOperation::ApplyDns { .. }
             | NetworkPolicyOperation::ApplyFirewall { .. }
             | NetworkPolicyOperation::ObserveBarrier { .. }

@@ -138,7 +138,9 @@ impl PolicyExecutor for OkPolicy {
     fn apply(&self, _: &TopologyPolicy, _: PolicyBarrier) -> Result<(), String> {
         Ok(())
     }
-    fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) {}
+    fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 #[tokio::test]
@@ -482,6 +484,23 @@ fn observation(
 }
 
 #[test]
+fn supervisor_exposes_owned_resource_revision_not_teardown_revision() {
+    let id = profile("owned-resource-revision");
+    let supervisor = Supervisor::new(
+        AuthorityEpoch(1),
+        Arc::new(OkExecutor),
+        Arc::new(OkPolicy),
+        2,
+        4,
+    );
+    let mut teardown = work(id.clone(), 5, 4, TunnelMutation::Disconnect);
+    teardown.resource_revision = tunnel_revision(4);
+    supervisor.dispatch_tunnel(teardown, Vec::new()).unwrap();
+
+    assert_eq!(supervisor.resource_revision(&id), Some(tunnel_revision(4)));
+}
+
+#[test]
 fn stale_tunnel_generation_never_converges() {
     let id = profile("corp");
     let target = revision(4, "new");
@@ -625,6 +644,7 @@ struct PolicyRecorder {
     fail_at: Mutex<Option<PolicyBarrier>>,
     compensations: Mutex<Vec<PolicyBarrier>>,
     panic_compensation: Mutex<bool>,
+    fail_compensation: Mutex<bool>,
 }
 impl PolicyExecutor for PolicyRecorder {
     fn apply(&self, policy: &TopologyPolicy, barrier: PolicyBarrier) -> Result<(), String> {
@@ -638,12 +658,17 @@ impl PolicyExecutor for PolicyRecorder {
             Ok(())
         }
     }
-    fn compensate(&self, _: &TopologyPolicy, barrier: PolicyBarrier) {
+    fn compensate(&self, _: &TopologyPolicy, barrier: PolicyBarrier) -> Result<(), String> {
         self.compensations.lock().unwrap().push(barrier);
         assert!(
             !*self.panic_compensation.lock().unwrap(),
             "injected compensation panic"
         );
+        if *self.fail_compensation.lock().unwrap() {
+            Err("injected compensation failure".into())
+        } else {
+            Ok(())
+        }
     }
 }
 fn policy(generation: u64, digest: &str) -> TopologyPolicy {
@@ -658,6 +683,7 @@ fn policy(generation: u64, digest: &str) -> TopologyPolicy {
             profiles: BTreeSet::from([profile("corp")]),
             ..TopologyState::default()
         },
+        prior_tunnel_revisions: BTreeMap::new(),
         tunnel_revisions: BTreeMap::from([(profile("corp"), tunnel_revision(generation))]),
         transition: TopologyTransitionKind::Connect,
         required_blocking: true,
@@ -741,13 +767,32 @@ fn compensation_panic_is_a_structured_policy_result() {
 }
 
 #[test]
+fn compensation_failure_is_not_reported_as_compensated() {
+    let recorder = Arc::new(PolicyRecorder::default());
+    *recorder.fail_at.lock().unwrap() = Some(PolicyBarrier::Route);
+    *recorder.fail_compensation.lock().unwrap() = true;
+    let worker = PolicyWorker::start(recorder, 4);
+    worker.submit(policy(1, "one")).unwrap();
+    let result = wait_until(Duration::from_secs(1), || worker.try_result()).unwrap();
+
+    assert_eq!(result.outcome, PolicyOutcome::Failed);
+    assert!(result
+        .receipts
+        .iter()
+        .filter(|receipt| receipt.applied)
+        .all(|receipt| !receipt.compensated));
+}
+
+#[test]
 fn cooperative_policy_apply_is_cancelled_and_joined() {
     struct CooperativePolicy;
     impl PolicyExecutor for CooperativePolicy {
         fn apply(&self, _: &TopologyPolicy, _: PolicyBarrier) -> Result<(), String> {
             Ok(())
         }
-        fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) {}
+        fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) -> Result<(), String> {
+            Ok(())
+        }
         fn apply_cancellable(
             &self,
             _: &TopologyPolicy,
@@ -776,7 +821,9 @@ fn timed_out_policy_shutdown_retains_the_owned_join_for_a_later_drain() {
         fn apply(&self, _: &TopologyPolicy, _: PolicyBarrier) -> Result<(), String> {
             Ok(())
         }
-        fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) {}
+        fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) -> Result<(), String> {
+            Ok(())
+        }
         fn apply_cancellable(
             &self,
             _: &TopologyPolicy,
@@ -820,7 +867,9 @@ fn pending_coalescing_emits_superseded_receipt() {
             }
             Ok(())
         }
-        fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) {}
+        fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) -> Result<(), String> {
+            Ok(())
+        }
     }
     let entered = Arc::new(Barrier::new(2));
     let release = Arc::new(Barrier::new(2));
@@ -1251,7 +1300,9 @@ impl PolicyExecutor for TopologyCapture {
         Ok(())
     }
 
-    fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) {}
+    fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) -> Result<(), String> {
+        Ok(())
+    }
 
     fn verification(&self, policy: &TopologyPolicy) -> Option<PolicyExecutionEvidence> {
         (policy.stage == PolicyStage::Final && self.publish_readback.load(Ordering::SeqCst))
@@ -2215,7 +2266,9 @@ async fn later_policy_command_drives_retry_for_older_tunnel_revision() {
             Ok(())
         }
 
-        fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) {}
+        fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) -> Result<(), String> {
+            Ok(())
+        }
     }
 
     let target = profile("retry-after-policy");
@@ -2364,7 +2417,9 @@ async fn opposite_profile_intent_cancels_older_pending_operation() {
             Ok(())
         }
 
-        fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) {}
+        fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) -> Result<(), String> {
+            Ok(())
+        }
     }
 
     let target = profile("opposite-intent");
@@ -3200,7 +3255,9 @@ async fn policy_waits_for_attested_tunnel_and_carries_complete_topology() {
             }
             Ok(())
         }
-        fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) {}
+        fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) -> Result<(), String> {
+            Ok(())
+        }
     }
     let target = profile("complete-policy");
     let capture = Arc::new(Capture::default());

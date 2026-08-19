@@ -78,12 +78,12 @@ impl AuthenticatedHelperSession {
             || binding.authority_epoch() != principal.authority_epoch()
             || binding.lease_id() != principal.lease_id()
             || (hello.schema == 3 && !matches!(binding, crate::helper::HelperSessionBinding::V3(_)))
-            || ((4..=6).contains(&hello.schema)
+            || ((4..=7).contains(&hello.schema)
                 && !matches!(binding, crate::helper::HelperSessionBinding::V4(_)))
         {
             return Err(HelperClientError::AuthorityMismatch);
         }
-        if (hello.schema == 6 && policy_capability) != hello.policy_inventory.is_some()
+        if (hello.schema >= 6 && policy_capability) != hello.policy_inventory.is_some()
             || (hello.schema < 6 && hello.policy_inventory.is_some())
             || hello
                 .policy_inventory
@@ -117,7 +117,7 @@ impl AuthenticatedHelperSession {
     ) -> Result<Self, HelperClientError> {
         let binding = hello.session.ok_or(HelperClientError::NotEnrolled)?;
         match (hello.schema, binding.authority()) {
-            (4..=6, Some(authority)) if authority == expected_authority => {}
+            (4..=7, Some(authority)) if authority == expected_authority => {}
             (3, None)
                 if binding.authority_epoch() == expected_authority.authority_epoch()
                     && binding.lease_id() == expected_authority.lease_id() => {}
