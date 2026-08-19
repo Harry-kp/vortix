@@ -780,19 +780,20 @@ impl WgTunnel {
             if self.cancellation_requested() {
                 return Err(TunnelError::Cancelled);
             }
-            Self::ensure_probe_route(probe.target, &handle.interface_name)?;
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(TunnelError::Timeout(self.handshake_timeout));
             }
-            send_handshake_probe(probe.target, self.probe_timeout.min(remaining)).map_err(
-                |error| TunnelError::Other(format!("WireGuard handshake probe failed: {error}")),
+            let issued_at = issue_handshake_probe(
+                probe.target,
+                &handle.interface_name,
+                self.probe_timeout.min(remaining),
             )?;
             receipts.push(ProbeReceipt {
                 peer_public_key: probe.peer_public_key.clone(),
                 target: probe.target,
                 allowed_routes: probe.allowed_routes.clone(),
-                issued_at: SystemTime::now(),
+                issued_at,
             });
         }
         loop {
@@ -938,12 +939,44 @@ fn peer_covers_target(
     target: IpAddr,
 ) -> bool {
     peer.allowed_ips.iter().any(|route| {
-        crate::vortix_core::cidr::Cidr::new(route.addr, route.prefix_len).is_some_and(|route| {
-            let target_prefix = if target.is_ipv4() { 32 } else { 128 };
-            crate::vortix_core::cidr::Cidr::new(target, target_prefix)
-                .is_some_and(|target| route.intersects(&target))
-        })
+        crate::vortix_core::cidr::Cidr::new(route.addr, route.prefix_len)
+            .is_some_and(|route| route_covers_target(route, target))
     })
+}
+
+fn route_covers_target(route: crate::vortix_core::cidr::Cidr, target: IpAddr) -> bool {
+    let prefix = if target.is_ipv4() { 32 } else { 128 };
+    crate::vortix_core::cidr::Cidr::new(target, prefix)
+        .is_some_and(|target| route.intersects(&target))
+}
+
+/// Select the first configured health target covered by canonical peer routes.
+#[must_use]
+pub(crate) fn select_health_probe_for_allowed_routes(
+    routes: &[crate::vortix_core::cidr::Cidr],
+    health_targets: &[IpAddr],
+) -> Option<IpAddr> {
+    health_targets.iter().copied().find(|target| {
+        routes
+            .iter()
+            .any(|route| route_covers_target(*route, *target))
+    })
+}
+
+/// Verify that a configured health target is currently routed through the
+/// exact owned `WireGuard` interface, then issue one UDP packet to elicit a
+/// handshake. The route proof and packet emission stay inside the protocol
+/// adapter even when lifecycle execution is delegated to the root helper.
+pub(crate) fn issue_handshake_probe(
+    target: IpAddr,
+    owned_interface: &str,
+    timeout: Duration,
+) -> Result<SystemTime, TunnelError> {
+    WgTunnel::ensure_probe_route(target, owned_interface)?;
+    send_handshake_probe(target, timeout).map_err(|error| {
+        TunnelError::Other(format!("WireGuard handshake probe failed: {error}"))
+    })?;
+    Ok(SystemTime::now())
 }
 
 fn send_handshake_probe(target: IpAddr, timeout: Duration) -> std::io::Result<()> {
