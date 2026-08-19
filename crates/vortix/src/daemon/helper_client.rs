@@ -268,7 +268,7 @@ impl AuthenticatedHelperTransport {
             .map(AuthenticatedHelperOutcome::into_receipt)
     }
 
-    fn execute_bound(
+    pub(super) fn execute_bound(
         &mut self,
         operation: PrivilegedOperation,
         descriptors: &[RawFd],
@@ -430,6 +430,61 @@ pub(crate) struct SharedAuthenticatedHelper {
     authority_binding: AuthorityBinding,
     enabled_capabilities: Vec<HelperCapability>,
     transport: Mutex<AuthenticatedHelperTransport>,
+}
+
+/// Immutable authority material capable of opening a fresh authenticated
+/// helper session for each effect attempt or recovery operation.
+///
+/// A transport whose request may have crossed the helper boundary is poisoned
+/// deliberately. Recovery must therefore return to this connector instead of
+/// attempting reconciliation through that same transport.
+pub(crate) struct AuthenticatedHelperConnector {
+    owner_uid: u32,
+    authority_binding: AuthorityBinding,
+    service: ServiceInstanceClaim,
+    required_capabilities: Vec<HelperCapability>,
+}
+
+impl AuthenticatedHelperConnector {
+    pub(crate) fn new(
+        owner_uid: u32,
+        authority_binding: AuthorityBinding,
+        service: ServiceInstanceClaim,
+        required_capabilities: Vec<HelperCapability>,
+    ) -> Result<Self, HelperClientError> {
+        validate_required_capabilities(&required_capabilities)?;
+        Ok(Self {
+            owner_uid,
+            authority_binding,
+            service,
+            required_capabilities,
+        })
+    }
+
+    pub(crate) const fn authority_binding(&self) -> AuthorityBinding {
+        self.authority_binding
+    }
+
+    pub(crate) fn enables(&self, capability: HelperCapability) -> bool {
+        self.required_capabilities.contains(&capability)
+    }
+
+    pub(crate) fn connect(
+        &self,
+        deadline: Instant,
+    ) -> Result<AuthenticatedHelperTransport, HelperExecutionFailure> {
+        AuthenticatedHelperTransport::connect(
+            self.owner_uid,
+            self.authority_binding,
+            &self.service,
+            &self.required_capabilities,
+            HelperConnectBudget::new(
+                RequestSequence::new(1).expect("one is a valid request-sequence floor"),
+                deadline,
+            ),
+        )
+        .map_err(|error| HelperExecutionFailure::new(RecoveryAction::Unavailable, error))
+    }
 }
 
 /// One helper result kept inseparable from the exact typed operation that the
