@@ -66,6 +66,10 @@ impl PreparedTunnelStart {
         self.descriptors.iter().map(AsRawFd::as_raw_fd).collect()
     }
 
+    pub(super) fn into_parts(self) -> (ProtocolPlan, Vec<File>) {
+        (self.plan, self.descriptors)
+    }
+
     #[cfg(test)]
     fn descriptors_mut_for_test(&mut self) -> &mut [File] {
         &mut self.descriptors
