@@ -917,7 +917,8 @@ where
             return Err(());
         }
         match operation {
-            NetworkPolicyOperation::EstablishBlocking { .. }
+            NetworkPolicyOperation::EstablishFirewall { .. }
+            | NetworkPolicyOperation::EstablishBlocking { .. }
             | NetworkPolicyOperation::ApplyRoutes { .. }
             | NetworkPolicyOperation::ApplyDns { .. }
             | NetworkPolicyOperation::ApplyFirewall { .. } => {
@@ -1371,6 +1372,10 @@ where
         self.record_network_policy_outcome(request, operation, outcome)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "durable prepare/effect checkpoints form one crash-safety transaction"
+    )]
     fn persist_prepared_network_policy(
         &mut self,
         prepared: PreparedNetworkPolicyExecutionPlan,
@@ -1415,7 +1420,8 @@ where
         self.persist_ledger()?;
         if !matches!(
             operation,
-            NetworkPolicyOperation::EstablishBlocking { .. }
+            NetworkPolicyOperation::EstablishFirewall { .. }
+                | NetworkPolicyOperation::EstablishBlocking { .. }
                 | NetworkPolicyOperation::ApplyFirewall { .. }
                 | NetworkPolicyOperation::ApplyDns { .. }
         ) {
@@ -1453,7 +1459,8 @@ where
             })
             .collect::<Result<Vec<_>, _>>()?;
         let has_required_pending = match &operation {
-            NetworkPolicyOperation::EstablishBlocking { .. }
+            NetworkPolicyOperation::EstablishFirewall { .. }
+            | NetworkPolicyOperation::EstablishBlocking { .. }
             | NetworkPolicyOperation::ApplyFirewall { .. } => pending_firewall.is_some(),
             NetworkPolicyOperation::ApplyDns { .. } => pending_dns.is_some(),
             _ => false,
@@ -1485,7 +1492,8 @@ where
     ) -> Result<VerifiedReceipt, HelperError> {
         let receipt = match (operation, outcome) {
             (
-                NetworkPolicyOperation::EstablishBlocking { .. }
+                NetworkPolicyOperation::EstablishFirewall { .. }
+                | NetworkPolicyOperation::EstablishBlocking { .. }
                 | NetworkPolicyOperation::ApplyRoutes { .. }
                 | NetworkPolicyOperation::ApplyDns { .. }
                 | NetworkPolicyOperation::ApplyFirewall { .. },
@@ -1712,7 +1720,8 @@ where
         retained_effective: &[PolicyProjection],
     ) -> Option<Vec<HelperLedgerFirewall>> {
         Some(match operation {
-            NetworkPolicyOperation::EstablishBlocking { .. }
+            NetworkPolicyOperation::EstablishFirewall { .. }
+            | NetworkPolicyOperation::EstablishBlocking { .. }
             | NetworkPolicyOperation::ApplyFirewall { .. } => {
                 let mut resources = Vec::new();
                 if let Some(current) = self.physical_firewalls.get(policy) {
@@ -1813,7 +1822,8 @@ where
                 }
                 dns
             }
-            NetworkPolicyOperation::EstablishBlocking { .. }
+            NetworkPolicyOperation::EstablishFirewall { .. }
+            | NetworkPolicyOperation::EstablishBlocking { .. }
             | NetworkPolicyOperation::ApplyRoutes { .. }
             | NetworkPolicyOperation::ApplyFirewall { .. }
             | NetworkPolicyOperation::ObserveBarrier { .. } => Vec::new(),
@@ -1828,7 +1838,8 @@ where
             return false;
         }
         match plan.operation() {
-            NetworkPolicyOperation::EstablishBlocking { policy, .. }
+            NetworkPolicyOperation::EstablishFirewall { policy, .. }
+            | NetworkPolicyOperation::EstablishBlocking { policy, .. }
             | NetworkPolicyOperation::ApplyFirewall { policy, .. } => {
                 prepared.prepared_dns() == plan.recovered_dns()
                     && accepts_prepared_firewall(plan, prepared, policy)
@@ -1852,7 +1863,8 @@ where
         prepared: &PreparedNetworkPolicyExecutionPlan,
     ) -> Result<(), HelperError> {
         match operation {
-            NetworkPolicyOperation::EstablishBlocking { policy, .. }
+            NetworkPolicyOperation::EstablishFirewall { policy, .. }
+            | NetworkPolicyOperation::EstablishBlocking { policy, .. }
             | NetworkPolicyOperation::ApplyFirewall { policy, .. } => {
                 let physical = prepared
                     .prepared_firewalls()
@@ -1940,7 +1952,8 @@ where
     ) -> Result<VerifiedReceipt, HelperError> {
         if !matches!(error, PrivilegedExecutionError::EffectMayHaveApplied) {
             match operation {
-                NetworkPolicyOperation::EstablishBlocking { policy, .. }
+                NetworkPolicyOperation::EstablishFirewall { policy, .. }
+                | NetworkPolicyOperation::EstablishBlocking { policy, .. }
                 | NetworkPolicyOperation::ApplyRoutes { policy, .. }
                 | NetworkPolicyOperation::ApplyDns { policy, .. }
                 | NetworkPolicyOperation::ApplyFirewall { policy, .. } => {
@@ -2704,7 +2717,8 @@ mod tests {
             let mut firewalls = plan.recovered_firewalls().to_vec();
             if matches!(
                 plan.operation(),
-                NetworkPolicyOperation::EstablishBlocking { .. }
+                NetworkPolicyOperation::EstablishFirewall { .. }
+                    | NetworkPolicyOperation::EstablishBlocking { .. }
                     | NetworkPolicyOperation::ApplyFirewall { .. }
             ) {
                 let resource = plan.operation().policy_resource();
@@ -2805,7 +2819,8 @@ mod tests {
                     }));
                     Ok(NetworkPolicyOutcome::Observed(observations))
                 }
-                NetworkPolicyOperation::EstablishBlocking { .. }
+                NetworkPolicyOperation::EstablishFirewall { .. }
+                | NetworkPolicyOperation::EstablishBlocking { .. }
                 | NetworkPolicyOperation::ApplyRoutes { .. }
                 | NetworkPolicyOperation::ApplyDns { .. }
                 | NetworkPolicyOperation::ApplyFirewall { .. } => Ok(NetworkPolicyOutcome::Applied),
@@ -3005,14 +3020,19 @@ mod tests {
         let routes =
             ResourceTag::topology(AuthorityEpoch(3), generation, ResourceKind::Routes).unwrap();
         let dns = ResourceTag::topology(AuthorityEpoch(3), generation, ResourceKind::Dns).unwrap();
-        execute_policy_phase(
-            harness,
-            first_sequence,
+        let establish = if mode == KillSwitchMode::AlwaysOn {
             NetworkPolicyOperation::EstablishBlocking {
                 policy: firewall.clone(),
                 tunnels: Vec::new(),
-            },
-        );
+            }
+        } else {
+            NetworkPolicyOperation::EstablishFirewall {
+                policy: firewall.clone(),
+                mode,
+                tunnels: Vec::new(),
+            }
+        };
+        execute_policy_phase(harness, first_sequence, establish);
         let predecessor = harness.server.guard.policy_predecessor().unwrap();
         execute_policy_phase(
             harness,
@@ -3053,6 +3073,15 @@ mod tests {
         let (firewall, _, _) =
             install_policy_generation_with_mode(&mut harness, 1, 1, KillSwitchMode::Auto);
 
+        assert!(matches!(
+            harness.server.executor.policy_plans[0]
+                .execution()
+                .intended(),
+            PolicyProjection::FirewallBaseline {
+                mode: KillSwitchMode::Auto,
+                ..
+            }
+        ));
         assert_eq!(
             harness.server.physical_firewalls[&firewall].stage(),
             PhysicalFirewallStage::ObservedAbsent

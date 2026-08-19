@@ -956,15 +956,13 @@ impl PolicyExecutor for CanonicalPolicyExecutor {
         }
     }
 
-    fn compensate(&self, policy: &TopologyPolicy, barrier: PolicyBarrier) {
+    fn compensate(&self, policy: &TopologyPolicy, barrier: PolicyBarrier) -> Result<(), String> {
         match barrier {
-            PolicyBarrier::Dns => {
-                let _ = self.reconcile_dns(&policy.prior, false);
-            }
+            PolicyBarrier::Dns => self.reconcile_dns(&policy.prior, false),
             PolicyBarrier::Blocking | PolicyBarrier::EffectivePublication => {
-                let _ = self.restore_firewall(&policy.prior);
+                self.restore_firewall(&policy.prior)
             }
-            PolicyBarrier::Tunnel | PolicyBarrier::Route | PolicyBarrier::Observation => {}
+            PolicyBarrier::Tunnel | PolicyBarrier::Route | PolicyBarrier::Observation => Ok(()),
         }
     }
 
@@ -1002,6 +1000,7 @@ mod tests {
             deadline: Instant::now() + Duration::from_secs(1),
             prior,
             target,
+            prior_tunnel_revisions: BTreeMap::new(),
             tunnel_revisions: BTreeMap::new(),
             transition: TopologyTransitionKind::Connect,
             required_blocking: true,

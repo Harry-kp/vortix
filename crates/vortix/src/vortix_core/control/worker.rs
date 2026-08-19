@@ -979,6 +979,8 @@ pub struct TopologyPolicy {
     pub deadline: Instant,
     pub prior: TopologyState,
     pub target: TopologyState,
+    /// Exact helper-owned identity of every managed tunnel in `prior`.
+    pub prior_tunnel_revisions: BTreeMap<ProfileId, TunnelRevision>,
     /// Expected identity of every managed tunnel in `target`.
     pub tunnel_revisions: BTreeMap<ProfileId, TunnelRevision>,
     pub transition: TopologyTransitionKind,
@@ -1015,7 +1017,7 @@ impl TopologyPolicy {
 
 pub trait PolicyExecutor: Send + Sync + 'static {
     fn apply(&self, policy: &TopologyPolicy, barrier: PolicyBarrier) -> Result<(), String>;
-    fn compensate(&self, policy: &TopologyPolicy, barrier: PolicyBarrier);
+    fn compensate(&self, policy: &TopologyPolicy, barrier: PolicyBarrier) -> Result<(), String>;
     fn apply_cancellable(
         &self,
         policy: &TopologyPolicy,
@@ -1029,8 +1031,8 @@ pub trait PolicyExecutor: Send + Sync + 'static {
         policy: &TopologyPolicy,
         barrier: PolicyBarrier,
         _cancellation: &CancellationToken,
-    ) {
-        self.compensate(policy, barrier);
+    ) -> Result<(), String> {
+        self.compensate(policy, barrier)
     }
 
     /// Return fresh platform read-back produced by the exact final policy.
@@ -1441,9 +1443,20 @@ fn run_policy_compensation(
 ) -> Result<(), WorkFailure> {
     let cancellation = CancellationToken::default();
     panic::catch_unwind(AssertUnwindSafe(|| {
-        executor.compensate_cancellable(policy, barrier, &cancellation);
+        executor.compensate_cancellable(policy, barrier, &cancellation)
     }))
-    .map_err(|_| WorkFailure::Panicked)
+    .map_err(|_| WorkFailure::Panicked)?
+    .map_err(|error| {
+        tracing::warn!(
+            target: "vortix::control::policy",
+            operation = %policy.operation_id,
+            generation = policy.generation,
+            ?barrier,
+            reason = %error,
+            "policy compensation failed"
+        );
+        WorkFailure::EffectFailed
+    })
 }
 
 /// Poll a bounded result without introducing a runtime-specific clock.
