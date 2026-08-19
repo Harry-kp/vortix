@@ -16,7 +16,8 @@ use super::dns::RecoveredDnsState;
 use crate::helper::material::TunnelMaterialSet;
 use crate::helper::protocol::{
     capability_for_operation, minimum_schema_for_operation, negotiate_enrolled, HelperCapability,
-    HelperClientHello, HelperError, HelperOp, HelperRequest, HelperResponse, HelperResult,
+    HelperClientHello, HelperError, HelperOp, HelperPolicyInventory, HelperPolicyResource,
+    HelperRequest, HelperResponse, HelperResult,
 };
 use crate::vortix_core::privileged::{
     AmbiguousPhase, ChildOwner, ChildSpawnAuthority, HelperEpoch, HelperLedgerDns,
@@ -758,7 +759,7 @@ where
         {
             return Err(HelperError::AuthenticationFailed);
         }
-        let response = negotiate_enrolled(
+        let mut response = negotiate_enrolled(
             hello,
             self.root.authority_binding(),
             self.helper_epoch,
@@ -767,9 +768,46 @@ where
                 .map_err(|_| HelperError::LedgerUnavailable)?,
             &self.enabled_capabilities,
         )?;
+        if response.schema >= 6
+            && self
+                .enabled_capabilities
+                .contains(&HelperCapability::NetworkPolicy)
+        {
+            response.policy_inventory = Some(Box::new(self.policy_inventory()?));
+        }
         self.negotiated_schema = Some(response.schema);
         self.handshaken = true;
         Ok(response)
+    }
+
+    fn policy_inventory(&self) -> Result<HelperPolicyInventory, HelperError> {
+        let resources = self
+            .policy_projections
+            .iter()
+            .map(|(resource, projection)| {
+                let state = self
+                    .resource_states
+                    .get(resource)
+                    .copied()
+                    .ok_or(HelperError::LedgerUnavailable)?;
+                HelperPolicyResource::new(
+                    resource.clone(),
+                    state,
+                    projection.intended.digest(),
+                    projection.effective.as_ref().map(PolicyProjection::digest),
+                )
+                .map_err(|_| HelperError::LedgerUnavailable)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        HelperPolicyInventory::new(
+            self.guard
+                .policy_projection()
+                .map(PolicyProjection::policy)
+                .cloned(),
+            self.guard.policy_predecessor(),
+            resources,
+        )
+        .map_err(|_| HelperError::LedgerUnavailable)
     }
 
     fn execute(
@@ -2446,9 +2484,9 @@ mod tests {
         BootScope, ContainmentId, DnsTransactionId, FirewallTransactionId, LeaseId,
         ObservationState, OpenVpnAuthFactors, OpenVpnPlan, OpenVpnRemote, OpenVpnRemoteSelection,
         OpenVpnTransport, OperationDigest, PeerProcessIdentity, PhysicalDnsBackend,
-        PhysicalFirewallBackend, PrivilegedRequest, ProtocolEndpoint, RequestSequence, ScopedRoute,
-        ServiceInstanceClaim, ServiceManager, WireGuardInterfaceOptions, WireGuardPeerPlan,
-        WireGuardPlan,
+        PhysicalFirewallBackend, PolicyPhase, PrivilegedRequest, ProtocolEndpoint, RequestSequence,
+        ScopedRoute, ServiceInstanceClaim, ServiceManager, WireGuardInterfaceOptions,
+        WireGuardPeerPlan, WireGuardPlan,
     };
     use crate::vortix_core::profile::{ProfileId, ProtocolKind};
     use crate::vortix_core::state::killswitch::KillSwitchMode;
@@ -3026,6 +3064,202 @@ mod tests {
         );
         let encoded = serde_json::to_vec(persisted).unwrap();
         assert!(serde_json::from_slice::<HelperLedgerRecord>(&encoded).is_ok());
+    }
+
+    fn recover_policy_inventory(
+        root: RootAuthorityLedger,
+        ledger: HelperLedgerRecord,
+    ) -> HelperPolicyInventory {
+        let (helper_epoch, _) = ledger.next_helper_session().unwrap();
+        let (_, principal, claim, _, _) = fixture();
+        let mut recovered = EnrolledHelperSession::recover(
+            root,
+            helper_epoch,
+            ledger,
+            FakeExecutor::default(),
+            MemoryHelperLedgerStore::default(),
+        )
+        .unwrap();
+        let response = recovered.handle(HelperRequest {
+            id: 1,
+            op: HelperOp::Handshake(HelperClientHello::current(
+                501,
+                claim,
+                vec![HelperCapability::NetworkPolicy],
+            )),
+        });
+        let HelperResult::Handshake(hello) = response.result.unwrap() else {
+            panic!("expected enrolled handshake");
+        };
+        AuthenticatedHelperSession::from_handshake(&principal, &verified_helper_peer(), &hello)
+            .unwrap();
+        *hello.policy_inventory.unwrap()
+    }
+
+    #[test]
+    fn recovered_schema_six_handshake_exposes_exact_policy_inventory() {
+        let mut harness = LifecycleHarness::for_policy(FakeExecutor::default());
+        let (firewall, routes, dns) = install_policy_generation(&mut harness, 1, 1);
+        let ledger = harness.server.ledger_store.writes.last().unwrap().clone();
+        let legacy_ledger = ledger.clone();
+        let (helper_epoch, _) = ledger.next_helper_session().unwrap();
+        let (root, principal, claim, _, _) = fixture();
+        let mut recovered = EnrolledHelperSession::recover(
+            root,
+            helper_epoch,
+            ledger,
+            FakeExecutor::default(),
+            MemoryHelperLedgerStore::default(),
+        )
+        .unwrap();
+
+        let response = recovered.handle(HelperRequest {
+            id: 1,
+            op: HelperOp::Handshake(HelperClientHello::current(
+                501,
+                claim,
+                vec![HelperCapability::NetworkPolicy],
+            )),
+        });
+        let HelperResult::Handshake(hello) = response.result.unwrap() else {
+            panic!("expected enrolled handshake");
+        };
+        let inventory = hello.policy_inventory.as_ref().unwrap();
+        assert_eq!(inventory.current(), Some(&firewall));
+        let predecessor = inventory.predecessor().unwrap();
+        assert_eq!(
+            predecessor.phase(),
+            crate::vortix_core::privileged::PolicyPhase::Firewall
+        );
+        assert!(predecessor.observed());
+        assert_eq!(inventory.resources().len(), 3);
+        for resource in [&firewall, &routes, &dns] {
+            let record = inventory
+                .resources()
+                .iter()
+                .find(|record| record.resource() == resource)
+                .unwrap();
+            assert_eq!(record.state(), HelperResourceState::Owned);
+            assert_eq!(record.effective(), Some(record.intended()));
+        }
+        AuthenticatedHelperSession::from_handshake(&principal, &verified_helper_peer(), &hello)
+            .unwrap();
+
+        let (legacy_epoch, _) = legacy_ledger.next_helper_session().unwrap();
+        let (root, _, claim, _, _) = fixture();
+        let mut legacy = EnrolledHelperSession::recover(
+            root,
+            legacy_epoch,
+            legacy_ledger,
+            FakeExecutor::default(),
+            MemoryHelperLedgerStore::default(),
+        )
+        .unwrap();
+        let mut client_hello =
+            HelperClientHello::current(501, claim, vec![HelperCapability::NetworkPolicy]);
+        client_hello.schema.max = 5;
+        let response = legacy.handle(HelperRequest {
+            id: 1,
+            op: HelperOp::Handshake(client_hello),
+        });
+        let HelperResult::Handshake(legacy_hello) = response.result.unwrap() else {
+            panic!("expected legacy enrolled handshake");
+        };
+        assert_eq!(legacy_hello.schema, 5);
+        assert!(legacy_hello.policy_inventory.is_none());
+        assert!(!serde_json::to_value(legacy_hello)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("policy_inventory"));
+    }
+
+    #[test]
+    fn recovered_schema_six_inventory_preserves_interrupted_policy_states() {
+        let mut pending_effect = LifecycleHarness::for_policy(FakeExecutor::default());
+        let firewall = ResourceTag::topology(AuthorityEpoch(3), 1, ResourceKind::Firewall).unwrap();
+        let blocking = pending_effect.request(
+            1,
+            PrivilegedOperation::NetworkPolicy(NetworkPolicyOperation::EstablishBlocking {
+                policy: firewall.clone(),
+                tunnels: Vec::new(),
+            }),
+        );
+        assert!(!pending_effect.execute(2, &blocking).is_ambiguous());
+        let inventory = recover_policy_inventory(
+            pending_effect.server.root.clone(),
+            pending_effect
+                .server
+                .ledger_store
+                .writes
+                .last()
+                .unwrap()
+                .clone(),
+        );
+        let predecessor = inventory.predecessor().unwrap();
+        assert_eq!(predecessor.phase(), PolicyPhase::Blocking);
+        assert!(!predecessor.observed());
+        assert_eq!(inventory.current(), Some(&firewall));
+        assert_eq!(inventory.resources().len(), 1);
+        assert_eq!(
+            inventory.resources()[0].state(),
+            HelperResourceState::PendingEffect
+        );
+
+        let mut pending_release = LifecycleHarness::for_policy(FakeExecutor::default());
+        let (firewall_1, routes_1, dns_1) = install_policy_generation(&mut pending_release, 1, 1);
+        let (firewall_2, _, _) = install_policy_generation(&mut pending_release, 2, 9);
+        let obsolete = [firewall_1, routes_1, dns_1];
+        let release = pending_release.request(
+            17,
+            PrivilegedOperation::NetworkPolicy(NetworkPolicyOperation::ReleaseObsolete {
+                policy: firewall_2.clone(),
+                resources: obsolete.to_vec(),
+                predecessor: pending_release.server.guard.policy_predecessor().unwrap(),
+            }),
+        );
+        assert!(!pending_release.execute(18, &release).is_ambiguous());
+        let ledger = pending_release
+            .server
+            .ledger_store
+            .writes
+            .iter()
+            .rev()
+            .find(|ledger| {
+                obsolete.iter().all(|resource| {
+                    ledger.resources().iter().any(|entry| {
+                        entry.resource() == resource
+                            && entry.state() == HelperResourceState::PendingRelease
+                    })
+                })
+            })
+            .unwrap()
+            .clone();
+        let inventory = recover_policy_inventory(pending_release.server.root.clone(), ledger);
+        let predecessor = inventory.predecessor().unwrap();
+        assert_eq!(predecessor.phase(), PolicyPhase::Released);
+        assert!(!predecessor.observed());
+        assert_eq!(inventory.current(), Some(&firewall_2));
+        assert_eq!(
+            inventory
+                .resources()
+                .iter()
+                .find(|record| record.resource() == &firewall_2)
+                .unwrap()
+                .state(),
+            HelperResourceState::Owned
+        );
+        for resource in &obsolete {
+            assert_eq!(
+                inventory
+                    .resources()
+                    .iter()
+                    .find(|record| record.resource() == resource)
+                    .unwrap()
+                    .state(),
+                HelperResourceState::PendingRelease
+            );
+        }
     }
 
     struct LifecycleHarness {

@@ -36,9 +36,9 @@ pub(crate) use descriptor_transport::{
 pub use protocol::{
     decode_request_frame, decode_response_frame, encode_request_frame, encode_response_frame,
     negotiate_staged, parse_request, HelperAuthorityMode, HelperCapability, HelperClientHello,
-    HelperError, HelperOp, HelperRequest, HelperResponse, HelperResult, HelperServerHello,
-    HelperSessionBinding, HELPER_PROTOCOL_MAX, HELPER_PROTOCOL_MIN, HELPER_SCHEMA_MAX,
-    HELPER_SCHEMA_MIN, MAX_HELPER_FRAME_BYTES,
+    HelperError, HelperOp, HelperPolicyInventory, HelperPolicyResource, HelperRequest,
+    HelperResponse, HelperResult, HelperServerHello, HelperSessionBinding, HELPER_PROTOCOL_MAX,
+    HELPER_PROTOCOL_MIN, HELPER_SCHEMA_MAX, HELPER_SCHEMA_MIN, MAX_HELPER_FRAME_BYTES,
 };
 pub(crate) use runtime::HelperRuntimeIdentity;
 pub(crate) use server::process_group_for_tunnel;

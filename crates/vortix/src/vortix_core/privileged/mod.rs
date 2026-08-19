@@ -12,14 +12,14 @@ use std::net::IpAddr;
 use serde::de::{SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
-pub(super) const MAX_RESOURCE_ITEMS: usize = 256;
+pub(crate) const MAX_RESOURCE_ITEMS: usize = 256;
 pub(super) const CONTRACT_SCHEMA_VERSION: u16 = 3;
 
 /// Allocation-bounded sequence decoder for every collection crossing the
 /// untrusted privileged wire. It rejects the first element beyond `LIMIT`
 /// instead of first allocating an attacker-sized `Vec` and validating later.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct BoundedVec<T, const LIMIT: usize>(Vec<T>);
+pub(crate) struct BoundedVec<T, const LIMIT: usize>(Vec<T>);
 
 impl<T, const LIMIT: usize> Default for BoundedVec<T, LIMIT> {
     fn default() -> Self {
@@ -28,7 +28,7 @@ impl<T, const LIMIT: usize> Default for BoundedVec<T, LIMIT> {
 }
 
 impl<T, const LIMIT: usize> BoundedVec<T, LIMIT> {
-    pub(super) fn into_vec(self) -> Vec<T> {
+    pub(crate) fn into_vec(self) -> Vec<T> {
         self.0
     }
 }
@@ -76,7 +76,7 @@ where
     }
 }
 
-pub(super) fn has_duplicates<'a, T: Ord + 'a>(values: impl IntoIterator<Item = &'a T>) -> bool {
+pub(crate) fn has_duplicates<'a, T: Ord + 'a>(values: impl IntoIterator<Item = &'a T>) -> bool {
     let mut unique = BTreeSet::new();
     values.into_iter().any(|value| !unique.insert(value))
 }
