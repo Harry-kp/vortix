@@ -699,6 +699,18 @@ impl Supervisor {
                 (*stage == PolicyStage::Final).then(|| (revision.clone(), operation.clone()))
             })
     }
+
+    /// Return the exact resource generation currently owned for one profile.
+    /// A disconnect work revision may be newer than the tunnel it tears down,
+    /// so policy planning must not infer this from desired state.
+    pub fn resource_revision(&self, profile_id: &ProfileId) -> Option<TunnelRevision> {
+        let state = self.state.lock().expect("supervisor mutex poisoned");
+        state
+            .profiles
+            .get(profile_id)
+            .or_else(|| state.tombstones.get(profile_id))
+            .map(|entry| entry.resource_revision)
+    }
     #[must_use]
     pub fn applied_topology(&self) -> Option<TopologyState> {
         self.state

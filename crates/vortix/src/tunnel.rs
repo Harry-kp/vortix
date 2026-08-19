@@ -988,7 +988,8 @@ mod canonical_tests {
             &self,
             _: &crate::vortix_core::control::worker::TopologyPolicy,
             _: crate::vortix_core::control::worker::PolicyBarrier,
-        ) {
+        ) -> Result<(), String> {
+            Ok(())
         }
     }
 
