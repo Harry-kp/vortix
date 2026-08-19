@@ -27,9 +27,9 @@ use crate::helper::validate::VerifiedHelperPeer;
 use crate::helper::{
     connect_verified_helper, decode_response_frame, expected_descriptor_count_for_operation,
     prepare_request, send_prepared_request, HelperAuthorityMode, HelperCapability, HelperOp,
-    HelperRequest, HelperResponse, HelperResult, HelperServerHello, HelperTransportError,
-    HELPER_PROTOCOL_MAX, HELPER_PROTOCOL_MIN, HELPER_SCHEMA_MAX, HELPER_SCHEMA_MIN,
-    MAX_HELPER_FRAME_BYTES,
+    HelperPolicyInventory, HelperRequest, HelperResponse, HelperResult, HelperServerHello,
+    HelperTransportError, HELPER_PROTOCOL_MAX, HELPER_PROTOCOL_MIN, HELPER_SCHEMA_MAX,
+    HELPER_SCHEMA_MIN, MAX_HELPER_FRAME_BYTES,
 };
 use crate::vortix_core::privileged::{
     AuthenticatedReceiptVerifier, AuthorityBinding, OperationError, PrivilegedOperation,
@@ -44,6 +44,7 @@ pub(crate) struct AuthenticatedHelperSession {
     next_sequence: Option<RequestSequence>,
     negotiated_schema: u16,
     enabled_capabilities: Vec<HelperCapability>,
+    policy_inventory: Option<Box<HelperPolicyInventory>>,
 }
 
 impl AuthenticatedHelperSession {
@@ -55,6 +56,9 @@ impl AuthenticatedHelperSession {
         let Some(binding) = hello.session else {
             return Err(HelperClientError::NotEnrolled);
         };
+        let policy_capability = hello
+            .enabled_capabilities
+            .contains(&HelperCapability::NetworkPolicy);
         if hello.product != "vortix-helper"
             || hello.authority_mode != HelperAuthorityMode::Enrolled
             || !(HELPER_PROTOCOL_MIN..=HELPER_PROTOCOL_MAX).contains(&hello.protocol)
@@ -74,10 +78,19 @@ impl AuthenticatedHelperSession {
             || binding.authority_epoch() != principal.authority_epoch()
             || binding.lease_id() != principal.lease_id()
             || (hello.schema == 3 && !matches!(binding, crate::helper::HelperSessionBinding::V3(_)))
-            || ((hello.schema == 4 || hello.schema == 5)
+            || ((4..=6).contains(&hello.schema)
                 && !matches!(binding, crate::helper::HelperSessionBinding::V4(_)))
         {
             return Err(HelperClientError::AuthorityMismatch);
+        }
+        if (hello.schema == 6 && policy_capability) != hello.policy_inventory.is_some()
+            || (hello.schema < 6 && hello.policy_inventory.is_some())
+            || hello
+                .policy_inventory
+                .as_ref()
+                .is_some_and(|inventory| !inventory.matches_authority(binding.authority_epoch()))
+        {
+            return Err(HelperClientError::PolicyInventoryMismatch);
         }
         Ok(Self {
             verifier: AuthenticatedReceiptVerifier::from_authenticated_helper(
@@ -90,6 +103,7 @@ impl AuthenticatedHelperSession {
             next_sequence: binding.next_sequence(),
             negotiated_schema: hello.schema,
             enabled_capabilities: hello.enabled_capabilities.clone(),
+            policy_inventory: hello.policy_inventory.clone(),
         })
     }
 
@@ -103,7 +117,7 @@ impl AuthenticatedHelperSession {
     ) -> Result<Self, HelperClientError> {
         let binding = hello.session.ok_or(HelperClientError::NotEnrolled)?;
         match (hello.schema, binding.authority()) {
-            (4 | 5, Some(authority)) if authority == expected_authority => {}
+            (4..=6, Some(authority)) if authority == expected_authority => {}
             (3, None)
                 if binding.authority_epoch() == expected_authority.authority_epoch()
                     && binding.lease_id() == expected_authority.lease_id() => {}
@@ -191,6 +205,10 @@ impl AuthenticatedHelperTransport {
             required_capabilities,
             budget,
         )
+    }
+
+    pub(crate) fn policy_inventory(&self) -> Option<&HelperPolicyInventory> {
+        self.session.policy_inventory.as_deref()
     }
 
     pub(crate) fn open_verified(
@@ -744,6 +762,8 @@ pub(crate) enum HelperClientError {
     NotEnrolled,
     #[error("helper session does not match daemon authority")]
     AuthorityMismatch,
+    #[error("helper policy inventory does not match the negotiated authority or schema")]
+    PolicyInventoryMismatch,
     #[error("helper capability negotiation does not satisfy the bounded request set")]
     CapabilityMismatch,
     #[error("helper schema does not support the requested operation")]

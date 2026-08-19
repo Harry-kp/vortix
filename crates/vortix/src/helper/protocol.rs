@@ -7,14 +7,15 @@ use crate::vortix_core::control::AuthorityEpoch;
 use crate::vortix_core::ipc::frame::{decode_frame_bounded, encode_frame_bounded};
 use crate::vortix_core::ipc::{CompatibilityRange, FrameError};
 use crate::vortix_core::privileged::{
-    AuthorityBinding, HelperEpoch, LeaseId, PrivilegedOperation, PrivilegedRequest,
-    RequestSequence, ServiceInstanceClaim,
+    has_duplicates, AuthorityBinding, BoundedVec, HelperEpoch, HelperResourceState, LeaseId,
+    PolicyDigest, PolicyPhase, PolicyPredecessor, PrivilegedOperation, PrivilegedRequest,
+    RequestSequence, ResourceKind, ResourceTag, ServiceInstanceClaim, MAX_RESOURCE_ITEMS,
 };
 
 pub const HELPER_PROTOCOL_MIN: u16 = 1;
 pub const HELPER_PROTOCOL_MAX: u16 = 1;
 pub const HELPER_SCHEMA_MIN: u16 = 3;
-pub const HELPER_SCHEMA_MAX: u16 = 5;
+pub const HELPER_SCHEMA_MAX: u16 = 6;
 pub(crate) const MANAGED_OBSERVATION_SCHEMA_MIN: u16 = 5;
 pub const MAX_HELPER_FRAME_BYTES: usize = 256 * 1024;
 
@@ -118,6 +119,207 @@ pub struct HelperServerHello {
     pub contract_capabilities: Vec<HelperCapability>,
     pub enabled_capabilities: Vec<HelperCapability>,
     pub session: Option<HelperSessionBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_inventory: Option<Box<HelperPolicyInventory>>,
+}
+
+/// Authenticated root-ledger policy state returned only by an enrolled
+/// schema-6 helper. Projection digests let the daemon resume or compensate an
+/// exact helper generation without exposing policy contents in the handshake.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HelperPolicyInventory {
+    current: Option<ResourceTag>,
+    predecessor: Option<PolicyPredecessor>,
+    resources: Vec<HelperPolicyResource>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HelperPolicyInventoryWire {
+    current: Option<ResourceTag>,
+    predecessor: Option<PolicyPredecessor>,
+    resources: BoundedVec<HelperPolicyResource, MAX_RESOURCE_ITEMS>,
+}
+
+impl<'de> Deserialize<'de> for HelperPolicyInventory {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = HelperPolicyInventoryWire::deserialize(deserializer)?;
+        Self::new(wire.current, wire.predecessor, wire.resources.into_vec())
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+impl HelperPolicyInventory {
+    pub(crate) fn new(
+        current: Option<ResourceTag>,
+        predecessor: Option<PolicyPredecessor>,
+        resources: Vec<HelperPolicyResource>,
+    ) -> Result<Self, &'static str> {
+        if resources.len() > MAX_RESOURCE_ITEMS
+            || has_duplicates(resources.iter().map(HelperPolicyResource::resource))
+            || resources.iter().any(|resource| !resource.is_valid())
+            || predecessor.is_some_and(|value| !value.is_valid())
+        {
+            return Err("invalid helper policy inventory");
+        }
+        match (&current, predecessor) {
+            (None, None) if resources.is_empty() => {}
+            (Some(current), Some(predecessor))
+                if current.authority_epoch().is_some()
+                    && phase_matches_kind(predecessor.phase(), current.kind())
+                    && resources
+                        .iter()
+                        .find(|resource| &resource.resource == current)
+                        .is_some_and(|resource| {
+                            cursor_state_matches(predecessor, resource.state)
+                        }) => {}
+            _ => return Err("invalid helper policy inventory cursor"),
+        }
+        Ok(Self {
+            current,
+            predecessor,
+            resources,
+        })
+    }
+
+    pub(crate) fn matches_authority(&self, authority: AuthorityEpoch) -> bool {
+        self.current
+            .as_ref()
+            .is_none_or(|resource| resource.authority_epoch() == Some(authority))
+            && self
+                .resources
+                .iter()
+                .all(|resource| resource.resource.authority_epoch() == Some(authority))
+    }
+
+    #[allow(
+        dead_code,
+        reason = "daemon policy adapter consumes the authenticated inventory"
+    )]
+    #[must_use]
+    pub(crate) const fn current(&self) -> Option<&ResourceTag> {
+        self.current.as_ref()
+    }
+
+    #[allow(
+        dead_code,
+        reason = "daemon policy adapter consumes the authenticated inventory"
+    )]
+    #[must_use]
+    pub(crate) const fn predecessor(&self) -> Option<PolicyPredecessor> {
+        self.predecessor
+    }
+
+    #[allow(
+        dead_code,
+        reason = "daemon policy adapter consumes the authenticated inventory"
+    )]
+    #[must_use]
+    pub(crate) fn resources(&self) -> &[HelperPolicyResource] {
+        &self.resources
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HelperPolicyResource {
+    resource: ResourceTag,
+    state: HelperResourceState,
+    intended: PolicyDigest,
+    effective: Option<PolicyDigest>,
+}
+
+impl HelperPolicyResource {
+    pub(crate) fn new(
+        resource: ResourceTag,
+        state: HelperResourceState,
+        intended: PolicyDigest,
+        effective: Option<PolicyDigest>,
+    ) -> Result<Self, &'static str> {
+        let candidate = Self {
+            resource,
+            state,
+            intended,
+            effective,
+        };
+        candidate
+            .is_valid()
+            .then_some(candidate)
+            .ok_or("invalid helper policy resource")
+    }
+
+    fn is_valid(&self) -> bool {
+        let topology_resource = matches!(
+            self.resource.kind(),
+            ResourceKind::Firewall | ResourceKind::Dns | ResourceKind::Routes
+        ) && self.resource.authority_epoch().is_some();
+        let settled_has_effective = !matches!(
+            self.state,
+            HelperResourceState::Owned | HelperResourceState::PendingRelease
+        ) || self.effective.is_some();
+        topology_resource
+            && !self.intended.is_zero()
+            && self.effective.is_none_or(|digest| !digest.is_zero())
+            && settled_has_effective
+    }
+
+    #[allow(
+        dead_code,
+        reason = "daemon policy adapter consumes the authenticated inventory"
+    )]
+    #[must_use]
+    pub(crate) const fn resource(&self) -> &ResourceTag {
+        &self.resource
+    }
+
+    #[allow(
+        dead_code,
+        reason = "daemon policy adapter consumes the authenticated inventory"
+    )]
+    #[must_use]
+    pub(crate) const fn state(&self) -> HelperResourceState {
+        self.state
+    }
+
+    #[allow(
+        dead_code,
+        reason = "daemon policy adapter consumes the authenticated inventory"
+    )]
+    #[must_use]
+    pub(crate) const fn intended(&self) -> PolicyDigest {
+        self.intended
+    }
+
+    #[allow(
+        dead_code,
+        reason = "daemon policy adapter consumes the authenticated inventory"
+    )]
+    #[must_use]
+    pub(crate) const fn effective(&self) -> Option<PolicyDigest> {
+        self.effective
+    }
+}
+
+fn phase_matches_kind(phase: PolicyPhase, kind: ResourceKind) -> bool {
+    match phase {
+        PolicyPhase::Blocking | PolicyPhase::Firewall => kind == ResourceKind::Firewall,
+        PolicyPhase::Routes => kind == ResourceKind::Routes,
+        PolicyPhase::Dns => kind == ResourceKind::Dns,
+        PolicyPhase::Released => matches!(
+            kind,
+            ResourceKind::Firewall | ResourceKind::Dns | ResourceKind::Routes
+        ),
+    }
+}
+
+fn cursor_state_matches(predecessor: PolicyPredecessor, state: HelperResourceState) -> bool {
+    match (predecessor.observed(), predecessor.phase()) {
+        (true, _) | (false, PolicyPhase::Released) => state == HelperResourceState::Owned,
+        (false, _) => state == HelperResourceState::PendingEffect,
+    }
 }
 
 /// Authenticated incarnation expected on every enrolled receipt. The daemon
@@ -183,8 +385,8 @@ impl HelperSessionBinding {
                 authority.lease_id(),
                 helper_epoch,
             ),
-            4 | 5 => Self::v4(authority, helper_epoch, next_sequence),
-            _ => unreachable!("negotiation accepts only helper schemas 3 through 5"),
+            4..=6 => Self::v4(authority, helper_epoch, next_sequence),
+            _ => unreachable!("negotiation accepts only helper schemas 3 through 6"),
         }
     }
 
@@ -412,6 +614,7 @@ fn negotiate_common(
         contract_capabilities: CONTRACT_CAPABILITIES.to_vec(),
         enabled_capabilities: enabled_capabilities.to_vec(),
         session: None,
+        policy_inventory: None,
     })
 }
 
@@ -527,7 +730,7 @@ mod tests {
         let hello = HelperClientHello::current(501, service(), vec![HelperCapability::Handshake]);
         let encoded = serde_json::to_vec(&hello).unwrap();
         let legacy: V3ClientHello = serde_json::from_slice(&encoded).unwrap();
-        assert_eq!(legacy.schema, CompatibilityRange { min: 3, max: 5 });
+        assert_eq!(legacy.schema, CompatibilityRange { min: 3, max: 6 });
         assert!(!serde_json::to_value(hello)
             .unwrap()
             .as_object()
@@ -582,7 +785,7 @@ mod tests {
     }
 
     #[test]
-    fn new_peers_negotiate_v5_full_authority_and_replay_cursor() {
+    fn new_peers_negotiate_v6_full_authority_and_replay_cursor() {
         let hello = HelperClientHello::current(501, service(), vec![HelperCapability::Handshake]);
         let response = negotiate_enrolled(
             &hello,
@@ -592,7 +795,7 @@ mod tests {
             &STAGED_CAPABILITIES,
         )
         .unwrap();
-        assert_eq!(response.schema, 5);
+        assert_eq!(response.schema, 6);
         let encoded = serde_json::to_vec(&response).unwrap();
         let decoded: HelperServerHello = serde_json::from_slice(&encoded).unwrap();
         let binding = decoded.session.unwrap();
@@ -602,5 +805,88 @@ mod tests {
             binding.next_sequence(),
             Some(RequestSequence::new(17).unwrap())
         );
+        assert!(decoded.policy_inventory.is_none());
+    }
+
+    #[test]
+    fn policy_inventory_is_bounded_and_authority_scoped() {
+        let firewall = ResourceTag::topology(AuthorityEpoch(3), 7, ResourceKind::Firewall).unwrap();
+        let digest = PolicyDigest::for_test(OperationDigest::of_bytes(b"policy"));
+        let predecessor = PolicyPredecessor::for_test(digest, PolicyPhase::Firewall);
+        let record = HelperPolicyResource::new(
+            firewall.clone(),
+            HelperResourceState::Owned,
+            digest,
+            Some(digest),
+        )
+        .unwrap();
+        let inventory =
+            HelperPolicyInventory::new(Some(firewall.clone()), Some(predecessor), vec![record])
+                .unwrap();
+        assert!(inventory.matches_authority(AuthorityEpoch(3)));
+        assert!(!inventory.matches_authority(AuthorityEpoch(4)));
+
+        let mut encoded = serde_json::to_value(&inventory).unwrap();
+        let resources = encoded["resources"].as_array_mut().unwrap();
+        resources.extend((0..MAX_RESOURCE_ITEMS).map(|offset| {
+            let generation = u64::try_from(offset).unwrap() + 8;
+            let resource =
+                ResourceTag::topology(AuthorityEpoch(3), generation, ResourceKind::Firewall)
+                    .unwrap();
+            serde_json::to_value(
+                HelperPolicyResource::new(
+                    resource,
+                    HelperResourceState::Owned,
+                    digest,
+                    Some(digest),
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        }));
+        assert!(serde_json::from_value::<HelperPolicyInventory>(encoded).is_err());
+    }
+
+    #[test]
+    fn settled_policy_inventory_requires_effective_digest() {
+        let firewall = ResourceTag::topology(AuthorityEpoch(3), 7, ResourceKind::Firewall).unwrap();
+        let digest = PolicyDigest::for_test(OperationDigest::of_bytes(b"policy"));
+        assert!(
+            HelperPolicyResource::new(firewall, HelperResourceState::Owned, digest, None,).is_err()
+        );
+    }
+
+    #[test]
+    fn policy_inventory_cursor_state_must_match_predecessor() {
+        let firewall = ResourceTag::topology(AuthorityEpoch(3), 7, ResourceKind::Firewall).unwrap();
+        let digest = PolicyDigest::for_test(OperationDigest::of_bytes(b"policy"));
+        let predecessor = PolicyPredecessor::for_test(digest, PolicyPhase::Firewall);
+        let record = HelperPolicyResource::new(
+            firewall.clone(),
+            HelperResourceState::Owned,
+            digest,
+            Some(digest),
+        )
+        .unwrap();
+        let inventory =
+            HelperPolicyInventory::new(Some(firewall), Some(predecessor), vec![record]).unwrap();
+
+        let mut pending_resource = serde_json::to_value(&inventory).unwrap();
+        pending_resource["resources"][0]["state"] = serde_json::json!("pending_effect");
+        assert!(serde_json::from_value::<HelperPolicyInventory>(pending_resource).is_err());
+
+        let mut unobserved_cursor = serde_json::to_value(&inventory).unwrap();
+        unobserved_cursor["predecessor"]["observed"] = serde_json::json!(false);
+        assert!(serde_json::from_value::<HelperPolicyInventory>(unobserved_cursor).is_err());
+
+        let mut pending_effect = serde_json::to_value(&inventory).unwrap();
+        pending_effect["predecessor"]["observed"] = serde_json::json!(false);
+        pending_effect["resources"][0]["state"] = serde_json::json!("pending_effect");
+        assert!(serde_json::from_value::<HelperPolicyInventory>(pending_effect).is_ok());
+
+        let mut pending_release = serde_json::to_value(&inventory).unwrap();
+        pending_release["predecessor"]["phase"] = serde_json::json!("released");
+        pending_release["predecessor"]["observed"] = serde_json::json!(false);
+        assert!(serde_json::from_value::<HelperPolicyInventory>(pending_release).is_ok());
     }
 }
