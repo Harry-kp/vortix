@@ -805,4 +805,4 @@ nix develop
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=Harry-kp/vortix&type=Date)](https://star-history.com/#Harry-kp/vortix&Date)
+[![Star History Chart](https://star-history.dera.page/svg?repos=Harry-kp/vortix&type=Date)](https://star-history.dera.page/#Harry-kp/vortix&Date)
