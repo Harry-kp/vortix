@@ -399,7 +399,7 @@ fn parse_exact_route_entries_batch(
         let route_kind = *tokens.first()?;
         let offset = usize::from(route_kind == "unicast");
         let destination =
-            parse_linux_route_destination(*tokens.get(offset)?, destinations[0].is_v4())?;
+            parse_linux_route_destination(tokens.get(offset)?, destinations[0].is_v4())?;
         let Some(destination_routes) = routes.get_mut(&destination) else {
             continue;
         };
@@ -424,11 +424,13 @@ fn parse_exact_route_entries_batch(
             return None;
         }
         let interface = unique_value(&tokens, "dev")?.to_owned();
-        let gateway = optional_unique_value(&tokens, "via")?
+        let gateway = optional_unique_value(&tokens, "via")
+            .ok()?
             .map(str::parse::<IpAddr>)
             .transpose()
             .ok()?;
-        let metric = optional_unique_value(&tokens, "metric")?
+        let metric = optional_unique_value(&tokens, "metric")
+            .ok()?
             .map(str::parse::<u32>)
             .transpose()
             .ok()?;
@@ -519,12 +521,16 @@ fn unique_value<'a>(tokens: &'a [&str], key: &str) -> Option<&'a str> {
     values.next().is_none().then_some(value)
 }
 
-fn optional_unique_value<'a>(tokens: &'a [&str], key: &str) -> Option<Option<&'a str>> {
+fn optional_unique_value<'a>(tokens: &'a [&str], key: &str) -> Result<Option<&'a str>, ()> {
     let mut values = tokens
         .windows(2)
         .filter_map(|pair| (pair[0] == key).then_some(pair[1]));
     let value = values.next();
-    values.next().is_none().then_some(value)
+    if values.next().is_some() {
+        Err(())
+    } else {
+        Ok(value)
+    }
 }
 
 #[cfg(test)]
