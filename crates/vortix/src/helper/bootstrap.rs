@@ -10,7 +10,7 @@ use std::fs::File;
 use std::io::Read as _;
 use std::os::fd::FromRawFd as _;
 use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::Path;
 
 use serde::Serialize;
@@ -18,17 +18,15 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use super::enrollment_store::RootEnrollmentStore;
-use super::root_store::RootOwnedJsonStore;
 use super::validate::{
     ArtifactFact, ArtifactKind, InstallManifest, InstallRequest, PlatformLayout,
 };
 use super::INSTALL_SCHEMA_VERSION;
-use crate::vortix_core::privileged::{AuthorityBinding, BootScope, LeaseId, OperationDigest};
+use crate::vortix_core::privileged::OperationDigest;
 
 pub const MAX_INSTALL_REQUEST_BYTES: u64 = 16 * 1024;
 const MAX_INSTALL_MANIFEST_BYTES: u64 = 64 * 1024;
 const MAX_INSTALLED_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
-const MAX_DAEMON_ENVIRONMENT_BYTES: u64 = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BootstrapStageReceipt {
@@ -38,30 +36,6 @@ pub struct BootstrapStageReceipt {
     pub manifest_generation: u64,
     pub manifest_digest: OperationDigest,
     pub staged_unenrolled: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct BootstrapReserveReceipt {
-    pub schema_version: u16,
-    pub owner_uid: u32,
-    pub layout: PlatformLayout,
-    pub manifest_generation: u64,
-    pub manifest_digest: OperationDigest,
-    pub authority_epoch: crate::vortix_core::control::AuthorityEpoch,
-    pub authority_binding: AuthorityBinding,
-    pub candidate_ready: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct BootstrapCommitReceipt {
-    pub schema_version: u16,
-    pub owner_uid: u32,
-    pub layout: PlatformLayout,
-    pub manifest_generation: u64,
-    pub manifest_digest: OperationDigest,
-    pub authority_epoch: crate::vortix_core::control::AuthorityEpoch,
-    pub authority_binding: AuthorityBinding,
-    pub authority_enrolled: bool,
 }
 
 /// Verify one package-supplied installation and persist only staged authority.
@@ -86,60 +60,6 @@ pub fn stage_package_from_reader(
         manifest_generation: manifest.generation(),
         manifest_digest: manifest.digest(),
         staged_unenrolled: true,
-    })
-}
-
-pub fn reserve_package_from_reader(
-    reader: impl std::io::Read,
-) -> Result<BootstrapReserveReceipt, BootstrapError> {
-    let (request, current_layout, manifest) = verify_package_request(reader)?;
-    ensure_root_state_directory(current_layout)?;
-    let _authority_lock = acquire_authority_lock(current_layout, request.owner_uid())?;
-    let boot_scope = current_boot_scope()?;
-    let lease_id = LeaseId::new(random_array()?);
-    let manager_instance_nonce = random_array()?;
-    let reservation = RootEnrollmentStore::root_owned(current_layout)
-        .reserve(&request, boot_scope, lease_id, manager_instance_nonce)
-        .map_err(|_| BootstrapError::EnrollmentState)?;
-    persist_daemon_environment(current_layout, reservation)?;
-
-    Ok(BootstrapReserveReceipt {
-        schema_version: INSTALL_SCHEMA_VERSION,
-        owner_uid: request.owner_uid(),
-        layout: current_layout,
-        manifest_generation: manifest.generation(),
-        manifest_digest: manifest.digest(),
-        authority_epoch: reservation.authority_epoch(),
-        authority_binding: reservation.binding(),
-        candidate_ready: true,
-    })
-}
-
-pub fn commit_package_from_reader(
-    reader: impl std::io::Read,
-    expected_epoch: u64,
-) -> Result<BootstrapCommitReceipt, BootstrapError> {
-    let authority_epoch = crate::vortix_core::control::AuthorityEpoch(expected_epoch);
-    if expected_epoch == 0 {
-        return Err(BootstrapError::InvalidAuthorityEpoch);
-    }
-    let (request, current_layout, manifest) = verify_package_request(reader)?;
-    ensure_root_state_directory(current_layout)?;
-    let _authority_lock = acquire_authority_lock(current_layout, request.owner_uid())?;
-    let reservation = RootEnrollmentStore::root_owned(current_layout)
-        .commit_epoch(&request, authority_epoch)
-        .map_err(|_| BootstrapError::EnrollmentState)?;
-    persist_daemon_environment(current_layout, reservation)?;
-
-    Ok(BootstrapCommitReceipt {
-        schema_version: INSTALL_SCHEMA_VERSION,
-        owner_uid: request.owner_uid(),
-        layout: current_layout,
-        manifest_generation: manifest.generation(),
-        manifest_digest: manifest.digest(),
-        authority_epoch,
-        authority_binding: reservation.binding(),
-        authority_enrolled: true,
     })
 }
 
@@ -177,54 +97,6 @@ fn acquire_authority_lock(layout: PlatformLayout, owner_uid: u32) -> Result<File
             BootstrapError::AuthorityLock
         }
     })
-}
-
-fn current_boot_scope() -> Result<BootScope, BootstrapError> {
-    let identity = crate::utils::boot_identity().ok_or(BootstrapError::MissingBootIdentity)?;
-    let mut material = Vec::with_capacity(identity.len() + 24);
-    material.extend_from_slice(b"vortix-helper-boot-v1\0");
-    material.extend_from_slice(identity.as_bytes());
-    let digest = OperationDigest::of_bytes(&material).as_bytes();
-    let mut scope = [0_u8; 16];
-    scope.copy_from_slice(&digest[..16]);
-    Ok(BootScope::new(scope))
-}
-
-fn random_array<const N: usize>() -> Result<[u8; N], BootstrapError> {
-    let mut source = File::open("/dev/urandom")?;
-    let metadata = source.metadata()?;
-    if !metadata.file_type().is_char_device() || metadata.uid() != 0 {
-        return Err(BootstrapError::Randomness);
-    }
-    let mut bytes = [0_u8; N];
-    source.read_exact(&mut bytes)?;
-    if bytes.iter().all(|byte| *byte == 0) {
-        return Err(BootstrapError::Randomness);
-    }
-    Ok(bytes)
-}
-
-fn persist_daemon_environment(
-    layout: PlatformLayout,
-    reservation: super::enrollment_store::AuthorityReservation,
-) -> Result<(), BootstrapError> {
-    let mut nonce = String::with_capacity(64);
-    for byte in reservation.manager_instance_nonce() {
-        use std::fmt::Write as _;
-        let _ = write!(&mut nonce, "{byte:02x}");
-    }
-    let contents = format!("VORTIX_MANAGER_NONCE_HEX={nonce}\n");
-    RootOwnedJsonStore::new(
-        layout.daemon_environment(),
-        0,
-        layout.root_state_dir_mode(),
-        MAX_DAEMON_ENVIRONMENT_BYTES,
-        "daemon-env",
-    )
-    .expect("fixed daemon environment path is absolute and valid")
-    .write(contents.as_bytes())
-    .map_err(|_| BootstrapError::RootStore)?;
-    Ok(())
 }
 
 fn verify_root_and_original_caller(owner_uid: u32) -> Result<(), BootstrapError> {
@@ -436,14 +308,6 @@ pub enum BootstrapError {
     AuthorityLock,
     #[error("another Vortix authority transition is in progress; retry after it completes")]
     AuthorityLockBusy,
-    #[error("OS boot identity is unavailable")]
-    MissingBootIdentity,
-    #[error("authority epoch must be non-zero")]
-    InvalidAuthorityEpoch,
-    #[error("the package bootstrap could not obtain kernel randomness")]
-    Randomness,
-    #[error("the package bootstrap could not persist the service environment")]
-    RootStore,
     #[error("package validation failed: {0}")]
     Install(#[from] super::validate::InstallError),
     #[error("package bootstrap I/O failed: {0}")]
@@ -453,54 +317,6 @@ pub enum BootstrapError {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn authority_binding() -> AuthorityBinding {
-        AuthorityBinding::new(
-            crate::vortix_core::control::AuthorityEpoch(9),
-            BootScope::new([1; 16]),
-            LeaseId::new([2; 32]),
-            OperationDigest::of_bytes(b"service-instance"),
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn reserve_receipt_keeps_schema_v1_epoch_alongside_binding() {
-        let binding = authority_binding();
-        let receipt = BootstrapReserveReceipt {
-            schema_version: 1,
-            owner_uid: 501,
-            layout: PlatformLayout::Linux,
-            manifest_generation: 7,
-            manifest_digest: OperationDigest::of_bytes(b"manifest"),
-            authority_epoch: binding.authority_epoch(),
-            authority_binding: binding,
-            candidate_ready: true,
-        };
-
-        let value = serde_json::to_value(receipt).unwrap();
-        assert_eq!(value["authority_epoch"], 9);
-        assert_eq!(value["authority_binding"]["authority_epoch"], 9);
-    }
-
-    #[test]
-    fn commit_receipt_keeps_schema_v1_epoch_alongside_binding() {
-        let binding = authority_binding();
-        let receipt = BootstrapCommitReceipt {
-            schema_version: 1,
-            owner_uid: 501,
-            layout: PlatformLayout::Linux,
-            manifest_generation: 7,
-            manifest_digest: OperationDigest::of_bytes(b"manifest"),
-            authority_epoch: binding.authority_epoch(),
-            authority_binding: binding,
-            authority_enrolled: true,
-        };
-
-        let value = serde_json::to_value(receipt).unwrap();
-        assert_eq!(value["authority_epoch"], 9);
-        assert_eq!(value["authority_binding"]["authority_epoch"], 9);
-    }
 
     #[test]
     fn bounded_reader_rejects_empty_and_oversized_input() {

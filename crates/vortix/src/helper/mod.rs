@@ -26,9 +26,7 @@ mod transport;
 pub mod validate;
 
 pub use bootstrap::{
-    commit_package_from_reader, reserve_package_from_reader, stage_package_from_reader,
-    BootstrapCommitReceipt, BootstrapError, BootstrapReserveReceipt, BootstrapStageReceipt,
-    MAX_INSTALL_REQUEST_BYTES,
+    stage_package_from_reader, BootstrapError, BootstrapStageReceipt, MAX_INSTALL_REQUEST_BYTES,
 };
 pub(crate) use descriptor_transport::{
     expected_descriptor_count_for_operation, prepare_request, send_prepared_request,

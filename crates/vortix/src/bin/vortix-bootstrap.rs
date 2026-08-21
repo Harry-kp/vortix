@@ -25,50 +25,8 @@ fn main() {
                 }
             }
         }
-        [arg] if arg == "reserve" => {
-            match vortix::helper::reserve_package_from_reader(std::io::stdin().lock()) {
-                Ok(receipt) => {
-                    let mut output = std::io::stdout().lock();
-                    if serde_json::to_writer(&mut output, &receipt).is_err()
-                        || output.write_all(b"\n").is_err()
-                    {
-                        eprintln!("vortix-bootstrap could not write its candidate receipt");
-                        std::process::exit(74);
-                    }
-                }
-                Err(error) => {
-                    eprintln!("vortix-bootstrap refused reservation: {error}");
-                    std::process::exit(77);
-                }
-            }
-        }
-        [arg, epoch] if arg == "commit" => {
-            let epoch = epoch
-                .to_str()
-                .and_then(|value| value.parse::<u64>().ok())
-                .filter(|epoch| *epoch != 0);
-            let Some(epoch) = epoch else {
-                eprintln!("vortix-bootstrap refused commit: authority epoch must be non-zero");
-                std::process::exit(64);
-            };
-            match vortix::helper::commit_package_from_reader(std::io::stdin().lock(), epoch) {
-                Ok(receipt) => {
-                    let mut output = std::io::stdout().lock();
-                    if serde_json::to_writer(&mut output, &receipt).is_err()
-                        || output.write_all(b"\n").is_err()
-                    {
-                        eprintln!("vortix-bootstrap could not write its enrollment receipt");
-                        std::process::exit(74);
-                    }
-                }
-                Err(error) => {
-                    eprintln!("vortix-bootstrap refused commit: {error}");
-                    std::process::exit(77);
-                }
-            }
-        }
         _ => {
-            eprintln!("usage: vortix-bootstrap --version|stage|reserve|commit EPOCH");
+            eprintln!("usage: vortix-bootstrap --version|stage");
             std::process::exit(64);
         }
     }
