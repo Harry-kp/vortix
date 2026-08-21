@@ -787,6 +787,21 @@ impl LocalControlSession {
         profiles: Vec<VpnProfile>,
         persistence: Option<ControlPersistenceConfig>,
     ) -> Result<Self, LocalControlError> {
+        Self::start_profile_test_with_persistence_and_clock(
+            config_dir,
+            profiles,
+            persistence,
+            Arc::new(RealClock),
+        )
+    }
+
+    #[cfg(test)]
+    fn start_profile_test_with_persistence_and_clock(
+        config_dir: &Path,
+        profiles: Vec<VpnProfile>,
+        persistence: Option<ControlPersistenceConfig>,
+        clock: Arc<dyn crate::vortix_core::control::Clock>,
+    ) -> Result<Self, LocalControlError> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("vortix-local-control-test")
@@ -815,7 +830,7 @@ impl LocalControlSession {
                     persistence,
                     ..ControlServiceConfig::default()
                 },
-                Arc::new(RealClock),
+                clock,
             )
         };
         let challenge_issuer = Arc::new(service.completer());
@@ -826,7 +841,17 @@ impl LocalControlSession {
                     .set_readiness(STANDARD_AUTHORITY_EPOCH, true, true),
             )
             .map_err(|error| LocalControlError::Persistence(error.to_string()))?;
-        let subscription = service.client().subscribe();
+        let mut subscription = service.client().subscribe();
+        runtime.block_on(async {
+            while !subscription.snapshot().readiness.reconciliation_complete {
+                subscription.changed().await.map_err(|error| {
+                    LocalControlError::Observation(format!(
+                        "test control readiness was not published: {error}"
+                    ))
+                })?;
+            }
+            Ok::<(), LocalControlError>(())
+        })?;
         let tui_admission =
             start_tui_admission_queue(&runtime, service.client(), Arc::clone(&profile_mutations));
         Ok(Self {
@@ -1908,6 +1933,15 @@ pub(crate) fn config_owner(_config_dir: &Path) -> Result<(u32, u32), LocalContro
 mod tests {
     use super::*;
 
+    #[derive(Debug)]
+    struct FrozenClock(u64);
+
+    impl crate::vortix_core::control::Clock for FrozenClock {
+        fn now_millis(&self) -> u64 {
+            self.0
+        }
+    }
+
     #[derive(Debug, Default)]
     struct BlockingNextSaveStore {
         armed: std::sync::atomic::AtomicBool,
@@ -2224,7 +2258,16 @@ mod tests {
             config_path,
             last_used: None,
         };
-        let session = LocalControlSession::start_profile_test(temp.path(), vec![profile]).unwrap();
+        // Snapshot generation is the assertion subject here. Freeze the
+        // service clock so independent freshness ticks cannot create a second
+        // publication while the scanner batch is being observed.
+        let session = LocalControlSession::start_profile_test_with_persistence_and_clock(
+            temp.path(),
+            vec![profile],
+            None,
+            Arc::new(FrozenClock(1)),
+        )
+        .unwrap();
         let scan = || crate::core::scanner::ScannerResult {
             sessions: vec![ActiveSession {
                 name: "corp".into(),
