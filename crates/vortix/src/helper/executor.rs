@@ -23,11 +23,11 @@ use super::observe::SystemObservationExecutor;
 use super::routes::HelperRouteExecutor;
 use super::runtime::HelperRuntimeIdentity;
 use super::server::{
-    process_group_for_tunnel, tunnel_for_profile_resource, CleanupExecutor,
-    NetworkPolicyExecutionPlan, NetworkPolicyExecutor, NetworkPolicyOutcome,
-    NetworkPolicyPreparationError, ObservationError, ObservationExecutor, ObservationOutcome,
-    ObservationScope, PreparedNetworkPolicyExecutionPlan, PrivilegedExecutionError,
-    RecoveredFirewallState, RecoveredRouteState, TunnelLifecycleExecutor, TunnelStartOutcome,
+    process_group_for_tunnel, CleanupExecutor, NetworkPolicyExecutionPlan, NetworkPolicyExecutor,
+    NetworkPolicyOutcome, NetworkPolicyPreparationError, ObservationError, ObservationExecutor,
+    ObservationOutcome, ObservationScope, PreparedNetworkPolicyExecutionPlan,
+    PrivilegedExecutionError, RecoveredFirewallState, RecoveredRouteState, TunnelLifecycleExecutor,
+    TunnelStartOutcome,
 };
 use super::validate::PlatformLayout;
 use crate::vortix_core::openvpn_credentials::DecodedOpenVpnCredentials;
@@ -105,7 +105,7 @@ impl ProductionHelperExecutor {
             lease_id,
             dns: HelperDnsExecutor::new(lease_id),
             firewall: HelperFirewallExecutor::new(lease_id),
-            routes: HelperRouteExecutor::new(layout, lease_id),
+            routes: HelperRouteExecutor::new(layout, lease_id)?,
             wireguard: BTreeMap::new(),
             openvpn: BTreeMap::new(),
         })
@@ -765,7 +765,7 @@ impl ObservationExecutor for ProductionHelperExecutor {
     ) -> Result<ObservationOutcome, ObservationError> {
         let outcome = self.observation.observe(targets, scope)?;
         if scope == ObservationScope::Managed {
-            self.attach_managed_wireguard_evidence(targets, outcome)
+            self.attach_managed_protocol_evidence(targets, outcome)
         } else {
             Ok(outcome)
         }
@@ -773,7 +773,7 @@ impl ObservationExecutor for ProductionHelperExecutor {
 }
 
 impl ProductionHelperExecutor {
-    fn attach_managed_wireguard_evidence(
+    fn attach_managed_protocol_evidence(
         &self,
         targets: &[ResourceObservationTarget],
         outcome: ObservationOutcome,
@@ -788,39 +788,72 @@ impl ProductionHelperExecutor {
             let Some(target) = targets_by_resource.get(observation.resource()).copied() else {
                 return Err(ObservationError::InvalidResource);
             };
-            if target.protocol() != Some(ProtocolKind::WireGuard)
-                || observation.state() != ObservationState::Present
+            if observation.state() != ObservationState::Present
+                || target.resource().kind() != ResourceKind::Tunnel
             {
                 continue;
             }
-            if self.layout != PlatformLayout::Linux {
-                return Err(ObservationError::Unavailable);
-            }
-            let runtime =
-                HelperRuntimeIdentity::derive(self.layout, self.lease_id, target.resource())
+            match target.protocol() {
+                Some(ProtocolKind::WireGuard) => {
+                    if self.layout != PlatformLayout::Linux {
+                        return Err(ObservationError::Unavailable);
+                    }
+                    let runtime = HelperRuntimeIdentity::derive(
+                        self.layout,
+                        self.lease_id,
+                        target.resource(),
+                    )
                     .map_err(|_| ObservationError::InvalidResource)?;
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .ok_or(ObservationError::Unavailable)?;
-            let (status, observed_at) = observe_helper_interface(
-                runtime.kernel_alias(),
-                target.resource().generation(),
-                remaining,
-            )
-            .map_err(|_| ObservationError::Unavailable)?;
-            if status.peers.iter().any(|peer| {
-                peer.evidence_generation != target.resource().generation()
-                    || peer.evidence_observed_at != observed_at
-            }) {
-                return Err(ObservationError::InvalidResource);
+                    let remaining = deadline
+                        .checked_duration_since(Instant::now())
+                        .ok_or(ObservationError::Unavailable)?;
+                    let (status, observed_at) = observe_helper_interface(
+                        runtime.kernel_alias(),
+                        target.resource().generation(),
+                        remaining,
+                    )
+                    .map_err(|_| ObservationError::Unavailable)?;
+                    if status.peers.iter().any(|peer| {
+                        peer.evidence_generation != target.resource().generation()
+                            || peer.evidence_observed_at != observed_at
+                    }) {
+                        return Err(ObservationError::InvalidResource);
+                    }
+                    *observation = ResourceObservation::with_wireguard_peers(
+                        target.resource().clone(),
+                        ObservationState::Present,
+                        system_time_millis(observed_at)?,
+                        wireguard_peer_observations(&status)?,
+                    )
+                    .map_err(|_| ObservationError::InvalidResource)?;
+                }
+                Some(ProtocolKind::OpenVpn) => {
+                    let routes = if let Some(active) = self.openvpn.get(target.resource()) {
+                        active.runtime.openvpn_route_evidence()
+                    } else {
+                        let identity = HelperRuntimeIdentity::derive(
+                            self.layout,
+                            self.lease_id,
+                            target.resource(),
+                        )
+                        .map_err(|_| ObservationError::InvalidResource)?;
+                        OpenVpnRuntimeStager::root_owned(self.layout, &identity)
+                            .recover_for_cleanup_if_present()
+                            .map_err(|_| ObservationError::Unavailable)?
+                            .ok_or(ObservationError::Unavailable)?
+                            .openvpn_route_evidence()
+                    }
+                    .map_err(|_| ObservationError::Unavailable)?;
+                    *observation = ResourceObservation::with_openvpn_routes(
+                        target.resource().clone(),
+                        ObservationState::Present,
+                        observation.observed_at_millis(),
+                        routes,
+                    )
+                    .map_err(|_| ObservationError::InvalidResource)?;
+                }
+                None => return Err(ObservationError::InvalidResource),
             }
-            *observation = ResourceObservation::with_wireguard_peers(
-                target.resource().clone(),
-                ObservationState::Present,
-                system_time_millis(observed_at)?,
-                wireguard_peer_observations(&status)?,
-            )
-            .map_err(|_| ObservationError::InvalidResource)?;
         }
         Ok(ObservationOutcome::new(observations, children))
     }
@@ -954,7 +987,10 @@ impl ProductionHelperExecutor {
     ) -> Result<NetworkPolicyOutcome, PrivilegedExecutionError> {
         let plan = prepared.execution();
         let NetworkPolicyOperation::ReleaseObsolete {
-            policy, resources, ..
+            policy,
+            resources,
+            retained_state,
+            ..
         } = plan.operation()
         else {
             return Err(PrivilegedExecutionError::InvalidPlan);
@@ -974,7 +1010,7 @@ impl ProductionHelperExecutor {
 
         let mut observations = Vec::with_capacity(resources.len() + 1);
         observations.push(
-            ResourceObservation::new(policy.clone(), ObservationState::Present, 1)
+            ResourceObservation::new(policy.clone(), *retained_state, 1)
                 .map_err(|_| PrivilegedExecutionError::InvalidPlan)?,
         );
         observations.extend(resources.iter().cloned().map(|resource| {
@@ -1017,13 +1053,13 @@ impl NetworkPolicyExecutor for ProductionHelperExecutor {
         match plan.operation() {
             NetworkPolicyOperation::ReleaseObsolete { .. } => self.prepare_policy_release(plan),
             crate::vortix_core::privileged::NetworkPolicyOperation::ApplyRoutes { .. } => {
-                self.routes.prepare(plan)
+                self.routes.prepare_owned(plan)
             }
             crate::vortix_core::privileged::NetworkPolicyOperation::ObserveBarrier {
                 policy,
                 ..
             } if policy.kind() == crate::vortix_core::privileged::ResourceKind::Routes => {
-                self.routes.prepare(plan)
+                self.routes.prepare_owned(plan)
             }
             crate::vortix_core::privileged::NetworkPolicyOperation::ApplyDns { .. } => {
                 self.dns.prepare(plan)
@@ -1045,13 +1081,13 @@ impl NetworkPolicyExecutor for ProductionHelperExecutor {
         match plan.execution().operation() {
             NetworkPolicyOperation::ReleaseObsolete { .. } => self.execute_policy_release(plan),
             crate::vortix_core::privileged::NetworkPolicyOperation::ApplyRoutes { .. } => {
-                self.routes.execute(plan)
+                self.routes.execute_owned(plan)
             }
             crate::vortix_core::privileged::NetworkPolicyOperation::ObserveBarrier {
                 policy,
                 ..
             } if policy.kind() == crate::vortix_core::privileged::ResourceKind::Routes => {
-                self.routes.execute(plan)
+                self.routes.execute_owned(plan)
             }
             crate::vortix_core::privileged::NetworkPolicyOperation::ApplyDns { .. } => {
                 self.dns.execute(plan)
@@ -1110,7 +1146,7 @@ fn plan_cleanup_actions(
     for resource in resources.iter().filter(|resource| {
         resource.kind() == crate::vortix_core::privileged::ResourceKind::ProcessGroup
     }) {
-        let tunnel = tunnel_for_profile_resource(resource).ok_or(())?;
+        let tunnel = resource.corresponding_tunnel().ok_or(())?;
         if !children_by_tunnel.contains_key(&tunnel) || !resource_set.contains(&tunnel) {
             return Err(());
         }

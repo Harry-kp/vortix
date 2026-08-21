@@ -27,8 +27,8 @@ use thiserror::Error;
 use std::os::unix::process::CommandExt as _;
 
 use crate::vortix_core::privileged::{
-    OpenVpnChallengeKind, OpenVpnPlan, OpenVpnRemoteSelection, OpenVpnTransport,
-    ProfileMaterialSlot,
+    OpenVpnChallengeKind, OpenVpnDefaultGateway, OpenVpnPlan, OpenVpnRemoteSelection, OpenVpnRoute,
+    OpenVpnRouteDefaults, OpenVpnRouteGateway, OpenVpnTransport, ProfileMaterialSlot,
 };
 
 pub(crate) const CONFIG_FILE: &str = "openvpn.conf";
@@ -360,6 +360,8 @@ fn render_validated_execution(
         writeln!(config, "static-challenge \"{STATIC_CHALLENGE_PROMPT}\" 0")
             .expect("writing to String cannot fail");
     }
+    append_route_defaults(&mut config, plan.route_defaults());
+    append_requested_routes(&mut config, plan.requested_routes());
 
     let mut arguments = vec![
         "--config".to_owned(),
@@ -386,6 +388,56 @@ fn render_validated_execution(
         material_paths,
         config,
         arguments,
+    }
+}
+
+fn append_requested_routes(config: &mut String, routes: &[OpenVpnRoute]) {
+    for route in routes {
+        let destination = route.destination();
+        let directive = if destination.addr.is_ipv4() {
+            "route"
+        } else {
+            "route-ipv6"
+        };
+        write!(
+            config,
+            "{directive} {}/{}",
+            destination.addr, destination.prefix_len
+        )
+        .expect("writing to String cannot fail");
+        match route.gateway() {
+            OpenVpnRouteGateway::VpnDefault if route.metric().is_none() => {}
+            OpenVpnRouteGateway::VpnDefault => config.push_str(" default"),
+            OpenVpnRouteGateway::NetGateway => config.push_str(" net_gateway"),
+            OpenVpnRouteGateway::RemoteHost => config.push_str(" remote_host"),
+            OpenVpnRouteGateway::Address(gateway) => {
+                write!(config, " {gateway}").expect("writing to String cannot fail");
+            }
+        }
+        if let Some(metric) = route.metric() {
+            write!(config, " {metric}").expect("writing to String cannot fail");
+        }
+        config.push('\n');
+    }
+}
+
+fn append_route_defaults(config: &mut String, defaults: OpenVpnRouteDefaults) {
+    let gateways = defaults.gateways();
+    if let Some(gateway) = gateways.ipv4() {
+        config.push_str("route-gateway ");
+        match gateway {
+            OpenVpnDefaultGateway::Address(address) => {
+                write!(config, "{address}").expect("writing to String cannot fail");
+            }
+            OpenVpnDefaultGateway::Dhcp => config.push_str("dhcp"),
+        }
+        config.push('\n');
+    }
+    if let Some(gateway) = gateways.ipv6() {
+        writeln!(config, "route-ipv6-gateway {gateway}").expect("writing to String cannot fail");
+    }
+    if let Some(metric) = defaults.metric() {
+        writeln!(config, "route-metric {metric}").expect("writing to String cannot fail");
     }
 }
 
@@ -459,8 +511,9 @@ mod tests {
 
     use crate::vortix_core::cidr::Cidr;
     use crate::vortix_core::privileged::{
-        OpenVpnAuthFactors, OpenVpnChallengeKind, OpenVpnKeyDirection, OpenVpnPlan, OpenVpnRemote,
-        OpenVpnRemoteSelection, OpenVpnRoute, OpenVpnTransport, ProfileMaterialSlot,
+        OpenVpnAuthFactors, OpenVpnChallengeKind, OpenVpnDefaultGateway, OpenVpnDefaultGateways,
+        OpenVpnKeyDirection, OpenVpnPlan, OpenVpnRemote, OpenVpnRemoteSelection, OpenVpnRoute,
+        OpenVpnRouteDefaults, OpenVpnRouteGateway, OpenVpnTransport, ProfileMaterialSlot,
     };
     use crate::vortix_core::profile::ProfileId;
 
@@ -475,6 +528,17 @@ mod tests {
 
     fn runtime(root: &str, digit: char) -> String {
         format!("{root}/{}", digit.to_string().repeat(64))
+    }
+
+    fn route_defaults() -> OpenVpnRouteDefaults {
+        OpenVpnRouteDefaults::new(
+            OpenVpnDefaultGateways::new(
+                Some(OpenVpnDefaultGateway::Address("10.8.0.1".parse().unwrap())),
+                Some("2001:db8::1".parse().unwrap()),
+            )
+            .unwrap(),
+            Some(11),
+        )
     }
 
     #[test]
@@ -498,15 +562,30 @@ mod tests {
             ],
             OpenVpnRemoteSelection::Randomized,
             OpenVpnAuthFactors::certificate(),
-            vec![OpenVpnRoute::new(
-                Cidr::new(Ipv4Addr::new(10, 0, 0, 0).into(), 8).unwrap(),
-                None,
-                None,
-            )
-            .unwrap()],
+            vec![
+                OpenVpnRoute::new(
+                    Cidr::new(Ipv4Addr::new(10, 0, 0, 0).into(), 8).unwrap(),
+                    None,
+                    None,
+                )
+                .unwrap(),
+                OpenVpnRoute::with_gateway(
+                    Cidr::new(Ipv4Addr::new(192, 0, 2, 0).into(), 24).unwrap(),
+                    OpenVpnRouteGateway::NetGateway,
+                    Some(7),
+                )
+                .unwrap(),
+                OpenVpnRoute::with_gateway(
+                    Cidr::new(Ipv4Addr::new(198, 51, 100, 0).into(), 24).unwrap(),
+                    OpenVpnRouteGateway::RemoteHost,
+                    None,
+                )
+                .unwrap(),
+            ],
             materials,
         )
         .unwrap()
+        .with_route_defaults(route_defaults())
         .with_tls_auth_direction(OpenVpnKeyDirection::One)
         .unwrap();
         let encoded = serde_json::to_value(&plan).unwrap();
@@ -537,6 +616,12 @@ mod tests {
                     "cert {runtime}/secrets/client.crt\n",
                     "key {runtime}/secrets/client.key\n",
                     "tls-auth {runtime}/secrets/tls-auth.key 1\n",
+                    "route-gateway 10.8.0.1\n",
+                    "route-ipv6-gateway 2001:db8::1\n",
+                    "route-metric 11\n",
+                    "route 10.0.0.0/8\n",
+                    "route 192.0.2.0/24 net_gateway 7\n",
+                    "route 198.51.100.0/24 remote_host\n",
                 ),
                 runtime = runtime
             )
@@ -552,7 +637,7 @@ mod tests {
                 "3".to_owned(),
             ]
         );
-        assert!(!execution.config().contains("route 10."));
+        assert!(execution.config().contains("route 10.0.0.0/8\n"));
         assert!(!execution.arguments().iter().any(|arg| arg == "--daemon"));
         assert!(!execution.arguments().iter().any(|arg| arg == "--writepid"));
         let debug = format!("{execution:?}");

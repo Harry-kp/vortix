@@ -102,6 +102,9 @@ pub(crate) fn render_helper_execution(
     config.push_str("[Interface]\nPrivateKey = ");
     config.push_str(private_key);
     config.push('\n');
+    // Canonical helper mode gives one writer—the root-owned policy route
+    // transaction—exclusive ownership of every AllowedIPs route.
+    config.push_str("Table = off\n");
     if !plan.addresses().is_empty() {
         config.push_str("Address = ");
         write_joined(&mut config, plan.addresses().iter())?;
@@ -447,11 +450,11 @@ mod tests {
         assert_eq!(
             rendered,
             format!(
-                "[Interface]\nPrivateKey = {private}\nAddress = 10.0.0.2/24\nMTU = 1420\nListenPort = 51821\nFwMark = 42\n\n[Peer]\nPublicKey = {}\nPresharedKey = {psk}\nEndpoint = [::1]:51820\nAllowedIPs = 0.0.0.0/0\nPersistentKeepalive = 25\n",
+                "[Interface]\nPrivateKey = {private}\nTable = off\nAddress = 10.0.0.2/24\nMTU = 1420\nListenPort = 51821\nFwMark = 42\n\n[Peer]\nPublicKey = {}\nPresharedKey = {psk}\nEndpoint = [::1]:51820\nAllowedIPs = 0.0.0.0/0\nPersistentKeepalive = 25\n",
                 key(2)
             )
         );
-        for forbidden in ["DNS", "PreUp", "PostUp", "PreDown", "PostDown", "Table"] {
+        for forbidden in ["DNS", "PreUp", "PostUp", "PreDown", "PostDown"] {
             assert!(!rendered.contains(forbidden));
         }
     }

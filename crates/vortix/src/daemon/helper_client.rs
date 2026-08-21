@@ -22,14 +22,16 @@ use std::time::Instant;
 
 use thiserror::Error;
 
-use crate::helper::protocol::{capability_for_operation, minimum_schema_for_operation};
+use crate::helper::protocol::{
+    capability_for_operation, minimum_schema_for_operation, RELEASE_ACK_SCHEMA_MIN,
+};
 use crate::helper::validate::VerifiedHelperPeer;
 use crate::helper::{
     connect_verified_helper, decode_response_frame, expected_descriptor_count_for_operation,
     prepare_request, send_prepared_request, HelperAuthorityMode, HelperCapability, HelperOp,
-    HelperPolicyInventory, HelperRequest, HelperResponse, HelperResult, HelperServerHello,
-    HelperTransportError, HELPER_PROTOCOL_MAX, HELPER_PROTOCOL_MIN, HELPER_SCHEMA_MAX,
-    HELPER_SCHEMA_MIN, MAX_HELPER_FRAME_BYTES,
+    HelperPolicyInventory, HelperReleasedInventory, HelperRequest, HelperResponse, HelperResult,
+    HelperServerHello, HelperTransportError, HELPER_PROTOCOL_MAX, HELPER_PROTOCOL_MIN,
+    HELPER_SCHEMA_MAX, HELPER_SCHEMA_MIN, MAX_HELPER_FRAME_BYTES,
 };
 use crate::vortix_core::privileged::{
     AuthenticatedReceiptVerifier, AuthorityBinding, OperationError, PrivilegedOperation,
@@ -45,6 +47,7 @@ pub(crate) struct AuthenticatedHelperSession {
     negotiated_schema: u16,
     enabled_capabilities: Vec<HelperCapability>,
     policy_inventory: Option<Box<HelperPolicyInventory>>,
+    released_resources: Option<Box<HelperReleasedInventory>>,
 }
 
 impl AuthenticatedHelperSession {
@@ -78,7 +81,7 @@ impl AuthenticatedHelperSession {
             || binding.authority_epoch() != principal.authority_epoch()
             || binding.lease_id() != principal.lease_id()
             || (hello.schema == 3 && !matches!(binding, crate::helper::HelperSessionBinding::V3(_)))
-            || ((4..=7).contains(&hello.schema)
+            || ((4..=HELPER_SCHEMA_MAX).contains(&hello.schema)
                 && !matches!(binding, crate::helper::HelperSessionBinding::V4(_)))
         {
             return Err(HelperClientError::AuthorityMismatch);
@@ -92,6 +95,13 @@ impl AuthenticatedHelperSession {
         {
             return Err(HelperClientError::PolicyInventoryMismatch);
         }
+        let released_inventory_expected = hello.schema >= RELEASE_ACK_SCHEMA_MIN
+            && hello
+                .enabled_capabilities
+                .contains(&HelperCapability::Observe);
+        if released_inventory_expected != hello.released_resources.is_some() {
+            return Err(HelperClientError::ReleasedInventoryMismatch);
+        }
         Ok(Self {
             verifier: AuthenticatedReceiptVerifier::from_authenticated_helper(
                 binding.authority_epoch(),
@@ -104,6 +114,7 @@ impl AuthenticatedHelperSession {
             negotiated_schema: hello.schema,
             enabled_capabilities: hello.enabled_capabilities.clone(),
             policy_inventory: hello.policy_inventory.clone(),
+            released_resources: hello.released_resources.clone(),
         })
     }
 
@@ -117,7 +128,7 @@ impl AuthenticatedHelperSession {
     ) -> Result<Self, HelperClientError> {
         let binding = hello.session.ok_or(HelperClientError::NotEnrolled)?;
         match (hello.schema, binding.authority()) {
-            (4..=7, Some(authority)) if authority == expected_authority => {}
+            (4..=HELPER_SCHEMA_MAX, Some(authority)) if authority == expected_authority => {}
             (3, None)
                 if binding.authority_epoch() == expected_authority.authority_epoch()
                     && binding.lease_id() == expected_authority.lease_id() => {}
@@ -209,6 +220,15 @@ impl AuthenticatedHelperTransport {
 
     pub(crate) fn policy_inventory(&self) -> Option<&HelperPolicyInventory> {
         self.session.policy_inventory.as_deref()
+    }
+
+    pub(crate) fn released_resources(
+        &self,
+    ) -> Option<&[crate::vortix_core::privileged::ResourceTag]> {
+        self.session
+            .released_resources
+            .as_deref()
+            .map(HelperReleasedInventory::resources)
     }
 
     pub(crate) fn open_verified(
@@ -764,6 +784,8 @@ pub(crate) enum HelperClientError {
     AuthorityMismatch,
     #[error("helper policy inventory does not match the negotiated authority or schema")]
     PolicyInventoryMismatch,
+    #[error("helper released-resource inventory does not match the negotiated schema")]
+    ReleasedInventoryMismatch,
     #[error("helper capability negotiation does not satisfy the bounded request set")]
     CapabilityMismatch,
     #[error("helper schema does not support the requested operation")]
