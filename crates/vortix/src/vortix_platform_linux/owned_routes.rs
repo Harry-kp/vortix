@@ -425,11 +425,13 @@ fn parse_exact_route_entries_batch(
         }
         let interface = unique_value(&tokens, "dev")?.to_owned();
         let gateway = optional_unique_value(&tokens, "via")?
-            .map(|value| value.parse::<IpAddr>().ok())
-            .transpose()?;
+            .map(str::parse::<IpAddr>)
+            .transpose()
+            .ok()?;
         let metric = optional_unique_value(&tokens, "metric")?
-            .map(|value| value.parse::<u32>().ok())
-            .transpose()?;
+            .map(str::parse::<u32>)
+            .transpose()
+            .ok()?;
         destination_routes.push(RouteEntry::new(destination, interface, gateway, metric).ok()?);
     }
     Some(routes)
@@ -585,6 +587,14 @@ mod tests {
             &[destination],
         )
         .is_none());
+        for malformed in [
+            "10.0.0.0/8 via invalid dev vxroute0 proto 196 metric 7\n",
+            "10.0.0.0/8 via 10.1.0.1 dev vxroute0 proto 196 metric invalid\n",
+            "10.0.0.0/8 via 10.1.0.1 via 10.2.0.1 dev vxroute0 proto 196\n",
+            "10.0.0.0/8 dev vxroute0 proto 196 metric 7 metric 8\n",
+        ] {
+            assert!(parse_exact_route_entries_batch(malformed, &[destination]).is_none());
+        }
     }
 
     #[test]
