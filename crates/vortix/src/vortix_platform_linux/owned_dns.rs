@@ -301,9 +301,7 @@ impl<R: DnsRunner> LinuxOwnedDns<R> {
                 None => self.read_state(backend, interface)?,
             };
             let prior = if let Some(prior) = inherited.get(interface) {
-                let expected = expected_states
-                    .get(interface)
-                    .ok_or(AdapterError::Invalid)?;
+                let expected = expected_states.get(interface).unwrap_or(prior);
                 if !state_eq(&current, expected) {
                     return Err(AdapterError::Invalid);
                 }
