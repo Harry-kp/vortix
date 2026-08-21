@@ -13,7 +13,7 @@ use std::os::fd::{AsRawFd as _, FromRawFd as _};
 pub(crate) fn create(material: &[u8]) -> std::io::Result<File> {
     let descriptor = unsafe {
         libc::memfd_create(
-            b"vortix-material\0".as_ptr().cast(),
+            c"vortix-material".as_ptr(),
             libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
         )
     };
