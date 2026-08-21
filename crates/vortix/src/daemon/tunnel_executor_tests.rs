@@ -49,6 +49,7 @@ struct FakeHelperState {
     operations: Mutex<Vec<PrivilegedOperation>>,
     connections: Mutex<usize>,
     observations: Mutex<usize>,
+    observation_started: Option<std::sync::mpsc::SyncSender<()>>,
     start_outcome: FakeStartOutcome,
     handshake_after_observations: usize,
     stop_fails: bool,
@@ -85,6 +86,7 @@ impl FakeHelper {
                 operations: Mutex::new(Vec::new()),
                 connections: Mutex::new(0),
                 observations: Mutex::new(0),
+                observation_started: None,
                 start_outcome,
                 handshake_after_observations: if handshake_present { 0 } else { usize::MAX },
                 stop_fails: false,
@@ -101,6 +103,14 @@ impl FakeHelper {
         Arc::get_mut(&mut self.state)
             .unwrap()
             .handshake_after_observations = observations;
+        self
+    }
+
+    fn with_observation_signal(
+        mut self,
+        observation_started: std::sync::mpsc::SyncSender<()>,
+    ) -> Self {
+        Arc::get_mut(&mut self.state).unwrap().observation_started = Some(observation_started);
         self
     }
 
@@ -261,6 +271,11 @@ impl super::HelperTunnelSession for FakeHelperSession {
             .lock()
             .unwrap()
             .push(operation.clone());
+        if matches!(operation, PrivilegedOperation::ObserveManaged(_)) {
+            if let Some(sender) = &self.state.observation_started {
+                let _ = sender.try_send(());
+            }
+        }
         if self.state.stop_fails && matches!(operation, PrivilegedOperation::StopTunnel(_)) {
             return Err(HelperTunnelTransportFailure::OutcomeUnknown);
         }
@@ -792,12 +807,16 @@ fn cancelled_handshake_poll_is_torn_down_before_cancelled_failure() {
     use crate::vortix_core::control::worker::TunnelExecutor as _;
 
     let (_directory, profile) = stored_profile();
-    let helper = Arc::new(FakeHelper::new(FakeStartOutcome::Applied, false));
+    let (observation_started, observation_receiver) = std::sync::mpsc::sync_channel(1);
+    let helper = Arc::new(
+        FakeHelper::new(FakeStartOutcome::Applied, false)
+            .with_observation_signal(observation_started),
+    );
     let executor = executor_for(helper.clone(), &profile);
     let cancellation = crate::vortix_core::ports::tunnel::TunnelCancellation::default();
     let cancel = cancellation.clone();
     let canceller = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(5));
+        observation_receiver.recv().unwrap();
         cancel.cancel();
     });
 
