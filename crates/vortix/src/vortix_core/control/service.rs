@@ -1666,7 +1666,7 @@ enum UnexpectedRecoveryPhase {
 
 #[derive(Debug)]
 struct UnexpectedRecovery {
-    profile_id: ProfileId,
+    profiles: BTreeSet<ProfileId>,
     phase: UnexpectedRecoveryPhase,
     next_attempt_millis: u64,
     backoff_millis: u64,
@@ -2631,14 +2631,7 @@ fn drive_supervision(
     }
     let supervised = supervisor.profiles();
     let tombstones = supervisor.tombstones();
-    let desired_connected = snapshot
-        .desired
-        .tunnels
-        .iter()
-        .filter_map(|(profile, state)| {
-            (*state == RequestedTunnelState::Connected).then_some(profile.clone())
-        })
-        .collect::<BTreeSet<_>>();
+    let desired_connected = desired_connected_profiles(snapshot);
     let mut observations = snapshot
         .observed
         .tunnels
@@ -3357,7 +3350,7 @@ fn schedule_unexpected_recovery_backoff(
     let Some(recovery) = owner
         .unexpected_recoveries
         .get_mut(operation_id)
-        .filter(|recovery| recovery.profile_id == *profile_id)
+        .filter(|recovery| recovery.profiles.contains(profile_id))
     else {
         return false;
     };
@@ -5380,7 +5373,7 @@ fn admit_unexpected_loss_recovery(
         .observed
         .tunnels
         .iter()
-        .find_map(|(profile_id, observed)| {
+        .filter_map(|(profile_id, observed)| {
             let was_present = before
                 .observed
                 .tunnels
@@ -5393,10 +5386,15 @@ fn admit_unexpected_loss_recovery(
             });
             (was_present && !observed.active && desired_connected && canonically_owned)
                 .then_some(profile_id.clone())
-        });
-    let Some(profile_id) = dropped else {
+        })
+        .collect::<BTreeSet<_>>();
+    let Some(profile_id) = dropped.first().cloned() else {
         return;
     };
+    // The operation intent reconciles the complete desired topology. Own all
+    // connected profiles for its lifetime so a later loss cannot race a user
+    // command or escape the same level-triggered retry loop.
+    let recovery_profiles = desired_connected_profiles(snapshot);
 
     let recovery_id = {
         let mut state = admission.lock().expect("admission mutex poisoned");
@@ -5406,11 +5404,13 @@ fn admit_unexpected_loss_recovery(
             snapshot.readiness.reconciliation_complete = false;
             return;
         };
-        state
-            .active_profile_operations
-            .entry(profile_id.clone())
-            .or_default()
-            .insert(operation_id.clone(), ProfileOperationKind::Lifecycle);
+        for owned_profile in &recovery_profiles {
+            state
+                .active_profile_operations
+                .entry(owned_profile.clone())
+                .or_default()
+                .insert(operation_id.clone(), ProfileOperationKind::Lifecycle);
+        }
         operation_id
     };
     let retry_budget = u64::try_from(config.retry_budget.as_millis()).unwrap_or(u64::MAX);
@@ -5443,7 +5443,7 @@ fn admit_unexpected_loss_recovery(
     owner.unexpected_recoveries.insert(
         recovery_id.clone(),
         UnexpectedRecovery {
-            profile_id,
+            profiles: recovery_profiles,
             phase: if snapshot.desired.kill_switch
                 == crate::vortix_core::state::killswitch::KillSwitchMode::Auto
             {
@@ -5478,14 +5478,27 @@ fn restored_unexpected_recoveries(
             {
                 return None;
             }
-            let OperationIntent::UnexpectedRecovery { profile_id, .. } = &operation.intent else {
+            let OperationIntent::UnexpectedRecovery {
+                profile_id,
+                tunnels,
+                ..
+            } = &operation.intent
+            else {
                 return None;
             };
+            let mut profiles = tunnels
+                .iter()
+                .filter(|(_, requested)| **requested == RequestedTunnelState::Connected)
+                .map(|(profile_id, _)| profile_id.clone())
+                .collect::<BTreeSet<_>>();
+            if profiles.is_empty() {
+                profiles.insert(profile_id.clone());
+            }
             let remaining = operation.deadline_millis.saturating_sub(now);
             Some((
                 operation_id.clone(),
                 UnexpectedRecovery {
-                    profile_id: profile_id.clone(),
+                    profiles,
                     phase: if snapshot.desired.kill_switch
                         == crate::vortix_core::state::killswitch::KillSwitchMode::Auto
                     {
@@ -5707,6 +5720,16 @@ fn record_challenge_terminal(
     terminals.insert(id, terminal);
 }
 
+fn desired_connected_profiles(snapshot: &ControlSnapshot) -> BTreeSet<ProfileId> {
+    snapshot
+        .desired
+        .tunnels
+        .iter()
+        .filter(|(_, requested)| **requested == RequestedTunnelState::Connected)
+        .map(|(profile_id, _)| profile_id.clone())
+        .collect()
+}
+
 fn tunnel_details_exceed_bounds(
     details: &crate::vortix_core::engine::state::DetailedConnectionInfo,
 ) -> bool {
@@ -5725,13 +5748,31 @@ fn tunnel_details_exceed_bounds(
     .any(|value| value.len() > 4_096)
 }
 
-fn topology_routes(config: &ControlServiceConfig, profile_id: &ProfileId) -> Vec<Cidr> {
-    config
+fn topology_routes(
+    snapshot: &ControlSnapshot,
+    config: &ControlServiceConfig,
+    profile_id: &ProfileId,
+) -> Vec<Cidr> {
+    let mut routes = config
         .profile_topologies
         .get(profile_id)
         .into_iter()
         .flat_map(|topology| &topology.routes)
-        .filter_map(|route| route.parse::<Cidr>().ok())
+        .filter_map(|route| RouteClaim::parse(route).ok())
+        .collect::<BTreeSet<_>>();
+    if let Some(observed) = snapshot
+        .observed
+        .openvpn_routes
+        .get(profile_id)
+        .filter(|observed| observed.desired_generation == snapshot.desired.generation)
+    {
+        routes.extend(crate::vortix_core::control::worker::openvpn_route_claims(
+            &observed.evidence,
+        ));
+    }
+    routes
+        .into_iter()
+        .filter_map(|route| Cidr::new(route.network(), route.prefix_len()))
         .collect()
 }
 
@@ -5807,7 +5848,12 @@ fn derive_tunnel_projections(
     );
     let routes_by_profile = profiles
         .iter()
-        .map(|profile_id| (profile_id.clone(), topology_routes(config, profile_id)))
+        .map(|profile_id| {
+            (
+                profile_id.clone(),
+                topology_routes(snapshot, config, profile_id),
+            )
+        })
         .collect::<BTreeMap<_, _>>();
     let challenges_by_profile = snapshot
         .challenges

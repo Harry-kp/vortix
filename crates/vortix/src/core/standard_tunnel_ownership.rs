@@ -263,7 +263,7 @@ impl StandardTunnelOwnershipStore {
         #[cfg(not(unix))]
         let _ = created;
         let metadata = std::fs::symlink_metadata(&self.root)?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        if !metadata.is_dir() {
             return Err(StandardOwnershipError::UnsafePath);
         }
         #[cfg(unix)]
@@ -391,8 +391,7 @@ fn record_key(profile_id: &ProfileId) -> String {
 
 fn read_managed_config(path: &Path, expected_uid: u32) -> Result<Vec<u8>, StandardOwnershipError> {
     let metadata = std::fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > MAX_CONFIG_BYTES
-    {
+    if !metadata.is_file() || metadata.len() > MAX_CONFIG_BYTES {
         return Err(StandardOwnershipError::UnsafePath);
     }
     #[cfg(unix)]

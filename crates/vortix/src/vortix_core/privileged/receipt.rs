@@ -527,7 +527,7 @@ impl<'de> Deserialize<'de> for UntrustedReceipt {
     {
         let wire = UntrustedReceiptWire::deserialize(deserializer)?;
         if wire.schema_version != CONTRACT_SCHEMA_VERSION
-            || wire.digest.as_bytes() == [0; 32]
+            || wire.digest.is_zero()
             || wire.operation_id.authority_epoch() != wire.authority_epoch
             || wire.operation_id.sequence() != wire.sequence
         {

@@ -1024,8 +1024,7 @@ impl StagedOpenVpnRuntime {
             } else {
                 metadata.is_file() && metadata.nlink() == 1
             };
-            if metadata.file_type().is_symlink()
-                || !valid_type
+            if !valid_type
                 || metadata.uid() != self.expected_owner_uid
                 || metadata.mode() & 0o077 != 0
             {
@@ -1367,8 +1366,7 @@ fn created_path_is_safe(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error.into()),
         Ok(metadata)
-            if !metadata.file_type().is_symlink()
-                && metadata.is_file()
+            if metadata.is_file()
                 && metadata.uid() == expected_owner_uid
                 && metadata.mode() & 0o777 == 0o600
                 && metadata.nlink() == 1
@@ -1388,8 +1386,7 @@ fn created_directory_is_safe(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error.into()),
         Ok(metadata)
-            if !metadata.file_type().is_symlink()
-                && metadata.is_dir()
+            if metadata.is_dir()
                 && metadata.uid() == expected_owner_uid
                 && metadata.mode() & 0o777 == HELPER_RUNTIME_DIR_MODE
                 && metadata.dev() == created.device
@@ -1407,8 +1404,7 @@ fn validate_private_regular(
     max_bytes: Option<u64>,
 ) -> Result<(), OpenVpnStagingError> {
     let metadata = std::fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
+    if !metadata.is_file()
         || metadata.uid() != expected_owner_uid
         || metadata.mode() & 0o777 != 0o600
         || metadata.nlink() != 1
@@ -1432,8 +1428,7 @@ fn validate_private_socket_metadata(
     metadata: &std::fs::Metadata,
     expected_owner_uid: u32,
 ) -> Result<(), OpenVpnStagingError> {
-    if metadata.file_type().is_symlink()
-        || !metadata.file_type().is_socket()
+    if !metadata.file_type().is_socket()
         || metadata.uid() != expected_owner_uid
         || metadata.mode() & 0o077 != 0
     {

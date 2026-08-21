@@ -100,7 +100,7 @@ impl OperationDigest {
         self.0
     }
 
-    fn is_zero(self) -> bool {
+    pub(crate) fn is_zero(self) -> bool {
         self.0 == [0; 32]
     }
 }
@@ -375,7 +375,7 @@ impl LeaseId {
         self.0
     }
 
-    fn is_zero(self) -> bool {
+    pub(crate) fn is_zero(self) -> bool {
         self.0 == [0; 32]
     }
 }
@@ -401,7 +401,7 @@ impl AuthorityBinding {
     ) -> Result<Self, OperationError> {
         if authority_epoch.0 == 0
             || boot_scope == BootScope::new([0; 16])
-            || lease_id == LeaseId::new([0; 32])
+            || lease_id.is_zero()
             || service_instance_digest.is_zero()
         {
             return Err(OperationError::InvalidLease);

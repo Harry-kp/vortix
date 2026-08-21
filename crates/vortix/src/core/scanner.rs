@@ -84,6 +84,9 @@ impl Default for ActiveSession {
 pub struct ScannerResult {
     pub sessions: Vec<ActiveSession>,
     pub default_route: crate::vortix_core::ports::route_table::DefaultRouteObservation,
+    /// `false` means at least one protocol-wide probe failed, so missing
+    /// sessions are unknown rather than proof of absence.
+    pub tunnel_observation_complete: bool,
 }
 
 /// Gather both active VPN sessions and the kernel default-route
@@ -93,11 +96,13 @@ pub struct ScannerResult {
 /// platform-specific 1s timeout in place (see `route_table.rs`).
 #[must_use]
 pub fn gather_system_state(profiles: &[VpnProfile]) -> ScannerResult {
+    let (sessions, tunnel_observation_complete) = scan_active_profiles(profiles);
     ScannerResult {
-        sessions: get_active_profiles(profiles),
+        sessions,
         default_route: crate::platform::current_platform()
             .route_table
             .default_route_observation(),
+        tunnel_observation_complete,
     }
 }
 
@@ -112,31 +117,40 @@ pub fn gather_system_state(profiles: &[VpnProfile]) -> ScannerResult {
 ///
 /// # Returns
 ///
-/// A vector of [`ActiveSession`] structs for each detected active connection.
+/// A best-effort vector of [`ActiveSession`] structs for each detected active
+/// connection. Authority paths must use [`gather_system_state`] and require
+/// `tunnel_observation_complete` before treating a missing session as absent.
 #[must_use]
 pub fn get_active_profiles(profiles: &[VpnProfile]) -> Vec<ActiveSession> {
+    scan_active_profiles(profiles).0
+}
+
+fn scan_active_profiles(profiles: &[VpnProfile]) -> (Vec<ActiveSession>, bool) {
     let mut active = Vec::new();
 
     // One protocol-owned, bounded `wg show all dump` replaces one subprocess
     // per WireGuard profile. Interface resolution remains platform-owned; the
     // exact resolved interface selects its typed status from this snapshot.
-    let wireguard_statuses = if profiles
+    let (wireguard_statuses, wireguard_observation_complete) = if profiles
         .iter()
         .any(|profile| matches!(profile.protocol, Protocol::WireGuard))
     {
-        crate::vortix_protocol_wireguard::WgTunnel::observe_all_interfaces().unwrap_or_default()
+        match crate::vortix_protocol_wireguard::WgTunnel::observe_all_interfaces() {
+            Ok(statuses) => (statuses, true),
+            Err(_) => (std::collections::BTreeMap::new(), false),
+        }
     } else {
-        std::collections::BTreeMap::new()
+        (std::collections::BTreeMap::new(), true)
     };
 
     // 1. Batch lookup for OpenVPN
-    let openvpn_pids = if profiles
+    let (openvpn_pids, openvpn_observation_complete) = if profiles
         .iter()
         .any(|profile| matches!(profile.protocol, Protocol::OpenVPN))
     {
-        get_all_openvpn_pids()
+        get_all_openvpn_pids().map_or_else(|| (Vec::new(), false), |pids| (pids, true))
     } else {
-        Vec::new()
+        (Vec::new(), true)
     };
     for profile in profiles {
         let session_info = match profile.protocol {
@@ -167,7 +181,10 @@ pub fn get_active_profiles(profiles: &[VpnProfile]) -> Vec<ActiveSession> {
         }
     }
 
-    active
+    (
+        active,
+        wireguard_observation_complete && openvpn_observation_complete,
+    )
 }
 
 fn openvpn_config_matches_profile(
@@ -247,29 +264,31 @@ fn shell_words(command: &str) -> Vec<String> {
     words
 }
 
-fn get_all_openvpn_pids() -> Vec<(PathBuf, u32)> {
+fn get_all_openvpn_pids() -> Option<Vec<(PathBuf, u32)>> {
     let mut processes = Vec::new();
     // Use ps -ax -o pid,args to get PID and full command line
-    if let Some(output) = cmd_output("ps", &["-ax", "-o", "pid,command"]) {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines().skip(1) {
-            // Skip header
-            let line = line.trim();
-            // Parse each process command once; profile matching below stays
-            // allocation-free even with many profiles and processes.
-            let mut fields = line.splitn(2, char::is_whitespace);
-            let Some(pid) = fields.next().and_then(|value| value.parse::<u32>().ok()) else {
-                continue;
-            };
-            let command = fields.next().map(str::trim).unwrap_or_default();
-            if command.contains("openvpn") {
-                if let Some(config) = openvpn_config_argument(command) {
-                    processes.push((PathBuf::from(config), pid));
-                }
+    let output = cmd_output("ps", &["-ax", "-o", "pid,command"])?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines().skip(1) {
+        // Skip header
+        let line = line.trim();
+        // Parse each process command once; profile matching below stays
+        // allocation-free even with many profiles and processes.
+        let mut fields = line.splitn(2, char::is_whitespace);
+        let Some(pid) = fields.next().and_then(|value| value.parse::<u32>().ok()) else {
+            continue;
+        };
+        let command = fields.next().map(str::trim).unwrap_or_default();
+        if command.contains("openvpn") {
+            if let Some(config) = openvpn_config_argument(command) {
+                processes.push((PathBuf::from(config), pid));
             }
         }
     }
-    processes
+    Some(processes)
 }
 
 /// Checks if a `WireGuard` interface exists and returns session details.

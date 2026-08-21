@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::vortix_core::cidr::Cidr;
-use crate::vortix_core::privileged::{invalid_unicast_ip, BoundedVec};
+use crate::vortix_core::privileged::{has_duplicates, invalid_unicast_ip, BoundedVec};
 use crate::vortix_core::profile::{ProfileId, ProtocolKind};
 
 const MAX_ADDRESSES: usize = 32;
@@ -334,11 +334,7 @@ impl WireGuardPlan {
         }
         validate_count("WireGuard address", addresses.len(), 0, MAX_ADDRESSES)?;
         validate_count("WireGuard peer", peers.len(), 1, MAX_PEERS)?;
-        let mut public_keys = BTreeSet::new();
-        if peers
-            .iter()
-            .any(|peer| !public_keys.insert(peer.public_key))
-        {
+        if has_duplicates(peers.iter().map(|peer| &peer.public_key)) {
             return Err(ProtocolPlanError::DuplicatePublicKey);
         }
         Ok(Self {
@@ -1127,7 +1123,7 @@ impl OpenVpnDefaultGateways {
     ) -> Result<Self, ProtocolPlanError> {
         if matches!(ipv4, Some(OpenVpnDefaultGateway::Address(address)) if {
             !address.is_ipv4() || invalid_unicast_ip(&address)
-        }) || ipv6.is_some_and(|address| address.is_unspecified() || address.is_multicast())
+        }) || ipv6.is_some_and(|address| invalid_unicast_ip(&IpAddr::V6(address)))
         {
             return Err(ProtocolPlanError::InvalidRouteGateway);
         }

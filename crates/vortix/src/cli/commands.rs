@@ -1028,12 +1028,12 @@ fn local_control_error_category(
 
 fn operation_failure(
     action: &str,
-    outcome: &impl crate::cli::control::ControlOperationOutcomeView,
+    outcome: &crate::cli::control::ClientOperationOutcome,
 ) -> (&'static str, ExitCode, String) {
     use crate::vortix_core::control::{OperationFailure, OperationResult, OperationStatus};
 
-    let operation = outcome.operation_id();
-    match (outcome.status(), outcome.result()) {
+    let operation = &outcome.operation_id;
+    match (outcome.status, outcome.result.as_ref()) {
         (_, Some(OperationResult::ProfileMutationAppliedAfterDeadline)) => (
             "completed_after_deadline",
             ExitCode::Timeout,
@@ -3425,7 +3425,7 @@ mod tests {
 
     #[test]
     fn late_profile_mutation_cli_result_forbids_a_blind_retry() {
-        let outcome = crate::cli::control::LocalOperationOutcome {
+        let outcome = crate::cli::control::ClientOperationOutcome {
             operation_id: serde_json::from_str("\"op-0000000000000001-0000000000000001\"").unwrap(),
             status: crate::vortix_core::control::OperationStatus::Expired,
             result: Some(

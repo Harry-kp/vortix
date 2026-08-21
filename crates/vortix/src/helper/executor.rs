@@ -943,8 +943,7 @@ fn verified_protocol_binary(
     };
     let metadata = std::fs::symlink_metadata(path)
         .map_err(|_| PrivilegedExecutionError::FailedBeforeEffect)?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
+    if !metadata.is_file()
         || metadata.uid() != 0
         || metadata.permissions().mode() & 0o022 != 0
         || metadata.permissions().mode() & 0o111 == 0

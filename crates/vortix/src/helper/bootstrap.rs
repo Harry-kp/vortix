@@ -150,7 +150,6 @@ fn ensure_root_state_directory(layout: PlatformLayout) -> Result<(), BootstrapEr
     }
     let metadata = std::fs::symlink_metadata(directory)?;
     if !metadata.is_dir()
-        || metadata.file_type().is_symlink()
         || metadata.uid() != 0
         || metadata.permissions().mode() & 0o777 != layout.root_state_dir_mode()
     {

@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::broadcast;
 
@@ -18,6 +18,8 @@ use crate::vortix_core::control::{
 };
 
 const EVENT_CAPACITY: usize = 64;
+const FALLBACK_RETRY_INITIAL: Duration = Duration::from_millis(100);
+const FALLBACK_RETRY_MAX: Duration = Duration::from_secs(5);
 
 pub trait DiagnosticQueryProvider: Send + Sync + 'static {
     fn snapshot(&self) -> DiagnosticSnapshot;
@@ -28,7 +30,7 @@ pub trait DiagnosticQueryProvider: Send + Sync + 'static {
 /// verify the exact ownership contract the descriptor-relative writer uses.
 pub fn prepare_fallback_directory(path: &Path) -> std::io::Result<()> {
     match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+        Ok(metadata) if !metadata.is_dir() => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "diagnostic fallback directory is not a real directory",
@@ -45,7 +47,6 @@ pub fn prepare_fallback_directory(path: &Path) -> std::io::Result<()> {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
         let metadata = std::fs::symlink_metadata(path)?;
         if !metadata.is_dir()
-            || metadata.file_type().is_symlink()
             || metadata.uid() != diagnostic_owner_uid()
             || metadata.permissions().mode() & 0o077 != 0
         {
@@ -98,6 +99,13 @@ impl DiagnosticHub {
         fallback_path: Option<PathBuf>,
         stale_after: std::time::Duration,
     ) -> std::io::Result<Self> {
+        Self::start_with_fallback_store(fallback_path.map(FallbackStore::new), stale_after)
+    }
+
+    fn start_with_fallback_store(
+        fallback_store: Option<FallbackStore>,
+        stale_after: std::time::Duration,
+    ) -> std::io::Result<Self> {
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
         let started = Instant::now();
         let stale_after_millis: u64 = stale_after
@@ -120,8 +128,8 @@ impl DiagnosticHub {
             events,
             stale_after_millis,
         }));
-        let fallback = fallback_path
-            .map(|path| FallbackWriter::start(FallbackStore::new(path), Arc::clone(&state)))
+        let fallback = fallback_store
+            .map(|store| FallbackWriter::start(store, Arc::clone(&state)))
             .transpose()?;
         let hub = Self {
             state,
@@ -252,6 +260,8 @@ impl DiagnosticQueryProvider for DiagnosticHub {
 pub struct FallbackStore {
     path: PathBuf,
     expected_uid: u32,
+    #[cfg(test)]
+    fail_writes: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl FallbackStore {
@@ -260,10 +270,32 @@ impl FallbackStore {
         Self {
             path,
             expected_uid: diagnostic_owner_uid(),
+            #[cfg(test)]
+            fail_writes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
+    #[cfg(test)]
+    fn fail_next_writes_for_test(mut self, failures: usize) -> Self {
+        self.fail_writes = Arc::new(std::sync::atomic::AtomicUsize::new(failures));
+        self
+    }
+
     pub fn write(&self, snapshot: &DiagnosticSnapshot) -> std::io::Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_writes
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Err(std::io::Error::other(
+                "injected diagnostic fallback write failure",
+            ));
+        }
         let body = serde_json::to_vec(snapshot).map_err(std::io::Error::other)?;
         if snapshot.records.len() > MAX_FALLBACK_RECORDS || body.len() > MAX_FALLBACK_BYTES {
             return Err(std::io::Error::new(
@@ -297,6 +329,8 @@ impl FallbackStore {
 struct FallbackQueue {
     dirty: bool,
     stopping: bool,
+    retry_at: Option<Instant>,
+    retry_delay: Duration,
 }
 
 struct FallbackWriter {
@@ -310,6 +344,8 @@ impl FallbackWriter {
             Mutex::new(FallbackQueue {
                 dirty: false,
                 stopping: false,
+                retry_at: None,
+                retry_delay: FALLBACK_RETRY_INITIAL,
             }),
             Condvar::new(),
         ));
@@ -327,6 +363,10 @@ impl FallbackWriter {
         let (queue, ready) = &*self.queue;
         let mut queue = queue.lock().expect("diagnostic fallback mutex poisoned");
         queue.dirty = true;
+        // A fresh diagnostic update supersedes a delayed retry. It is safe to
+        // coalesce both into one immediate snapshot because the writer always
+        // captures state only after it owns the queue slot.
+        queue.retry_at = None;
         ready.notify_one();
     }
 }
@@ -334,10 +374,10 @@ impl FallbackWriter {
 impl Drop for FallbackWriter {
     fn drop(&mut self) {
         let (queue, ready) = &*self.queue;
-        queue
-            .lock()
-            .expect("diagnostic fallback mutex poisoned")
-            .stopping = true;
+        let mut queue = queue.lock().expect("diagnostic fallback mutex poisoned");
+        queue.stopping = true;
+        queue.retry_at = None;
+        drop(queue);
         ready.notify_one();
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
@@ -354,15 +394,30 @@ fn fallback_loop(
         {
             let (queue, ready) = queue;
             let mut queue = queue.lock().expect("diagnostic fallback mutex poisoned");
-            while !queue.dirty && !queue.stopping {
-                queue = ready
-                    .wait(queue)
+            while !queue.stopping {
+                if !queue.dirty {
+                    queue = ready
+                        .wait(queue)
+                        .expect("diagnostic fallback mutex poisoned");
+                    continue;
+                }
+                let Some(retry_at) = queue.retry_at else {
+                    break;
+                };
+                let now = Instant::now();
+                if now >= retry_at {
+                    break;
+                }
+                let (next, _) = ready
+                    .wait_timeout(queue, retry_at.saturating_duration_since(now))
                     .expect("diagnostic fallback mutex poisoned");
+                queue = next;
             }
             if queue.stopping && !queue.dirty {
                 return;
             }
             queue.dirty = false;
+            queue.retry_at = None;
         }
         let snapshot = {
             let state = state
@@ -376,7 +431,7 @@ fn fallback_loop(
             )
         };
         let write_succeeded = store.write(&snapshot).is_ok();
-        let mut queue_again = false;
+        let mut status_changed = false;
         {
             let mut state = state
                 .lock()
@@ -411,17 +466,32 @@ fn fallback_loop(
                     let snapshot = state.snapshot();
                     let _ = state.events.send(snapshot);
                 }
-                queue_again = write_succeeded;
+                status_changed = true;
             }
         }
-        if queue_again {
-            let (queue, ready) = queue;
-            queue
-                .lock()
-                .expect("diagnostic fallback mutex poisoned")
-                .dirty = true;
-            ready.notify_one();
+        let (queue, ready) = queue;
+        let mut queue = queue.lock().expect("diagnostic fallback mutex poisoned");
+        if queue.stopping {
+            continue;
         }
+        if write_succeeded {
+            queue.retry_delay = FALLBACK_RETRY_INITIAL;
+            if !status_changed {
+                continue;
+            }
+            // Persist the newly healthy/degraded status and its typed record.
+            queue.dirty = true;
+            queue.retry_at = None;
+        } else {
+            // Keep retry ownership inside this one worker. The deadline grows
+            // exponentially and is capped, so a quiet daemon eventually
+            // recovers from transient storage failures without a busy loop.
+            queue.dirty = true;
+            queue.retry_at = Some(Instant::now() + queue.retry_delay);
+            queue.retry_delay = queue.retry_delay.saturating_mul(2).min(FALLBACK_RETRY_MAX);
+        }
+        drop(queue);
+        ready.notify_one();
     }
 }
 
@@ -848,46 +918,34 @@ mod tests {
     }
 
     #[test]
-    fn fallback_failure_status_is_sticky_and_recovers_after_disk_recovers() {
-        let directory = tempfile::tempdir().unwrap();
-        let parent = directory.path().join("control");
-        let hub = DiagnosticHub::start(Some(parent.join("diagnostics.json"))).unwrap();
-        for _ in 0..100 {
-            if hub.snapshot().status.fallback == FallbackDiagnosticState::Degraded {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert_eq!(
-            hub.snapshot().status.fallback,
-            FallbackDiagnosticState::Degraded
-        );
-        for _ in 0..600 {
-            hub.record(
-                DiagnosticComponent::Control,
-                DiagnosticSeverity::Info,
-                DiagnosticCode::DesiredStateChanged,
-                DiagnosticFields::None,
-            );
-        }
-        assert_eq!(
-            hub.snapshot().status.fallback,
-            FallbackDiagnosticState::Degraded
-        );
+    fn fallback_retries_quietly_after_injected_write_failures() {
+        let directory = private_tempdir();
+        let store = FallbackStore::new(directory.path().join("diagnostics.json"))
+            .fail_next_writes_for_test(2);
+        let hub = DiagnosticHub::start_with_fallback_store(
+            Some(store),
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap();
 
-        prepare_fallback_directory(&parent).unwrap();
-        hub.record(
-            DiagnosticComponent::Daemon,
-            DiagnosticSeverity::Info,
-            DiagnosticCode::DaemonStarted,
-            DiagnosticFields::None,
-        );
-        for _ in 0..100 {
-            if hub.snapshot().status.fallback == FallbackDiagnosticState::Healthy {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+        let deadline = Instant::now() + std::time::Duration::from_secs(3);
+        while hub.snapshot().status.fallback != FallbackDiagnosticState::Degraded {
+            assert!(
+                Instant::now() < deadline,
+                "injected failure was not published"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        // Do not publish another record here: recovery must come from the
+        // fallback worker's bounded retry, not an unrelated state change.
+        while hub.snapshot().status.fallback != FallbackDiagnosticState::Healthy {
+            assert!(
+                Instant::now() < deadline,
+                "quiet fallback retry did not recover"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
         let recovered = hub.snapshot();
         assert_eq!(recovered.status.fallback, FallbackDiagnosticState::Healthy);
         assert!(recovered

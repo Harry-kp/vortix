@@ -986,7 +986,7 @@ fn killswitch_visuals(
     use KillSwitchMode::{AlwaysOn, Auto, Off};
     use KillSwitchState::{Blocking, Degraded};
     match (mode, state) {
-        (_, Degraded) => (Sigil::AlarmError, Some("firewall policy unverified")),
+        (_, Degraded) => (Sigil::AlarmError, Degraded.status_detail()),
         (Off, _) => (Sigil::AlarmError, Some("off — not protecting")),
         (Auto, Blocking) => (Sigil::AlarmWarn, Some("press r to reconnect")),
         (AlwaysOn | Auto, _) => (Sigil::OkMuted, None),

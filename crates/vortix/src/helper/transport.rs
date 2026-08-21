@@ -125,7 +125,7 @@ fn wait_writable(
 }
 
 pub fn serve_staged_helper() -> Result<(), HelperTransportError> {
-    if unsafe { libc::geteuid() } != 0 {
+    if !crate::utils::is_root() {
         return Err(HelperTransportError::RequiresRoot);
     }
     let layout = PlatformLayout::current().ok_or(HelperTransportError::UnsupportedPlatform)?;
@@ -422,7 +422,6 @@ fn ensure_runtime_root(path: &Path) -> Result<(), HelperTransportError> {
     }
     let metadata = std::fs::symlink_metadata(path)?;
     if !metadata.is_dir()
-        || metadata.file_type().is_symlink()
         || metadata.uid() != 0
         || metadata.permissions().mode() & 0o777 != HELPER_SOCKET_DIR_MODE
     {

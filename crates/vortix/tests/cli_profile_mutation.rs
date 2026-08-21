@@ -24,13 +24,13 @@ fn cli_rename_and_delete_keep_profile_inventory_coherent_across_processes() {
     let profile = Profile::new(
         profile_id.clone(),
         "corp",
-        ProtocolKind::WireGuard,
+        ProtocolKind::OpenVpn,
         profiles_dir.join("corp.conf"),
     );
     store
         .insert(
             &profile,
-            b"[Interface]\nPrivateKey = abc=\nAddress = 10.0.0.1/24\n\n[Peer]\nPublicKey = xyz=\nEndpoint = 1.2.3.4:51820\nAllowedIPs = 0.0.0.0/0\n",
+            b"client\ndev tun\nproto udp\nremote 1.2.3.4 1194\n",
         )
         .unwrap();
 

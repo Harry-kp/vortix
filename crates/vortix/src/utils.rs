@@ -378,11 +378,7 @@ pub fn sweep_orphan_temp_configs(config_dir: &std::path::Path, current_session_i
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        if name == current_session_id
-            || !entry
-                .file_type()
-                .is_ok_and(|kind| kind.is_dir() && !kind.is_symlink())
-        {
+        if name == current_session_id || !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
             continue;
         }
         let lease = std::fs::OpenOptions::new()
@@ -1495,7 +1491,7 @@ fn acquire_lifecycle_lock_at(
     use std::os::unix::fs::MetadataExt as _;
 
     let metadata = std::fs::symlink_metadata(root)?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() || metadata.uid() != owner_uid {
+    if !metadata.is_dir() || metadata.uid() != owner_uid {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "the Vortix config directory is not owned by the invoking user",

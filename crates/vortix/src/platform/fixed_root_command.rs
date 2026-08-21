@@ -72,8 +72,7 @@ fn verified_fixed_binary(candidates: &[&str]) -> Result<PathBuf, FixedCommandErr
         .map(Path::new)
         .find_map(|candidate| {
             let metadata = std::fs::symlink_metadata(candidate).ok()?;
-            if metadata.file_type().is_symlink()
-                || !metadata.is_file()
+            if !metadata.is_file()
                 || metadata.uid() != 0
                 || metadata.permissions().mode() & 0o022 != 0
                 || metadata.permissions().mode() & 0o111 == 0
@@ -91,7 +90,6 @@ fn verified_fixed_binary(candidates: &[&str]) -> Result<PathBuf, FixedCommandErr
 fn root_owned_nonwritable_directory(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|metadata| {
         metadata.file_type().is_dir()
-            && !metadata.file_type().is_symlink()
             && metadata.uid() == 0
             && metadata.permissions().mode() & 0o022 == 0
     })

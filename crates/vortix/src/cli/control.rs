@@ -88,15 +88,6 @@ fn map_challenge_response_error(
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct LocalOperationOutcome {
-    pub operation_id: OperationId,
-    pub status: OperationStatus,
-    pub result: Option<OperationResult>,
-    pub snapshot: ControlSnapshot,
-    pub profile_mutation: Option<Result<LocalProfileMutationReceipt, ProfileMutationFailure>>,
-}
-
 /// Transport-neutral terminal command result consumed by CLI commands.
 ///
 /// Keeping this shape at the CLI boundary means U13 can change only the
@@ -110,68 +101,6 @@ pub struct ClientOperationOutcome {
     pub result: Option<OperationResult>,
     pub snapshot: ControlSnapshot,
     pub profile_mutation: Option<Result<LocalProfileMutationReceipt, ProfileMutationFailure>>,
-}
-
-impl From<LocalOperationOutcome> for ClientOperationOutcome {
-    fn from(outcome: LocalOperationOutcome) -> Self {
-        Self {
-            operation_id: outcome.operation_id,
-            status: outcome.status,
-            result: outcome.result,
-            snapshot: outcome.snapshot,
-            profile_mutation: outcome.profile_mutation,
-        }
-    }
-}
-
-/// Canonical operation fields consumed by CLI renderers, independent of
-/// whether Standard or remote transport admitted the command.
-pub trait ControlOperationOutcomeView {
-    fn operation_id(&self) -> &OperationId;
-    fn status(&self) -> OperationStatus;
-    fn result(&self) -> Option<&OperationResult>;
-}
-
-impl ControlOperationOutcomeView for LocalOperationOutcome {
-    fn operation_id(&self) -> &OperationId {
-        &self.operation_id
-    }
-
-    fn status(&self) -> OperationStatus {
-        self.status
-    }
-
-    fn result(&self) -> Option<&OperationResult> {
-        self.result.as_ref()
-    }
-}
-
-impl ControlOperationOutcomeView for ClientOperationOutcome {
-    fn operation_id(&self) -> &OperationId {
-        &self.operation_id
-    }
-
-    fn status(&self) -> OperationStatus {
-        self.status
-    }
-
-    fn result(&self) -> Option<&OperationResult> {
-        self.result.as_ref()
-    }
-}
-
-impl ControlOperationOutcomeView for crate::daemon::service::RemoteOperationOutcome {
-    fn operation_id(&self) -> &OperationId {
-        &self.operation_id
-    }
-
-    fn status(&self) -> OperationStatus {
-        self.status
-    }
-
-    fn result(&self) -> Option<&OperationResult> {
-        self.result.as_ref()
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -316,14 +245,18 @@ impl From<&ActiveSession> for PublishedTunnelDetails {
 struct StandardProfileMutationExecutor {
     profiles_dir: std::path::PathBuf,
     profiles: Mutex<BTreeMap<ProfileId, VpnProfile>>,
-    prepared_imports: Mutex<BTreeMap<ProfileId, crate::vpn::PreparedProfileImport>>,
+    prepared_imports: Mutex<BTreeMap<ProfileId, PreparedImportState>>,
     topologies: Mutex<BTreeMap<ProfileId, ProfileTopology>>,
-    prepared_topologies: Mutex<BTreeMap<ProfileId, Option<ProfileTopology>>>,
     results:
         Mutex<BTreeMap<OperationId, Result<LocalProfileMutationReceipt, ProfileMutationFailure>>>,
     catalog_revision: AtomicU64,
     #[cfg(test)]
     next_execution_delay: Mutex<Option<Duration>>,
+}
+
+struct PreparedImportState {
+    prepared: crate::vpn::PreparedProfileImport,
+    topology: Option<ProfileTopology>,
 }
 
 impl std::fmt::Debug for StandardProfileMutationExecutor {
@@ -340,9 +273,8 @@ impl StandardProfileMutationExecutor {
     fn new(
         profiles_dir: std::path::PathBuf,
         profiles: &[VpnProfile],
-        prepared_imports: Vec<crate::vpn::PreparedProfileImport>,
+        prepared_imports: Vec<PreparedImportState>,
         topologies: BTreeMap<ProfileId, ProfileTopology>,
-        prepared_topologies: BTreeMap<ProfileId, Option<ProfileTopology>>,
     ) -> Self {
         Self {
             profiles_dir,
@@ -356,11 +288,10 @@ impl StandardProfileMutationExecutor {
             prepared_imports: Mutex::new(
                 prepared_imports
                     .into_iter()
-                    .map(|prepared| (prepared.profile().id.clone(), prepared))
+                    .map(|state| (state.prepared.profile().id.clone(), state))
                     .collect(),
             ),
             topologies: Mutex::new(topologies),
-            prepared_topologies: Mutex::new(prepared_topologies),
             results: Mutex::new(BTreeMap::new()),
             catalog_revision: AtomicU64::new(0),
             #[cfg(test)]
@@ -375,6 +306,14 @@ impl StandardProfileMutationExecutor {
             .values()
             .cloned()
             .collect()
+    }
+
+    fn profile_snapshot(&self, profile_id: &ProfileId) -> Option<VpnProfile> {
+        self.profiles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(profile_id)
+            .cloned()
     }
 
     fn core_profile(&self, profile_id: &ProfileId) -> Option<Profile> {
@@ -398,15 +337,29 @@ impl StandardProfileMutationExecutor {
         )
     }
 
-    fn core_profiles_snapshot(&self) -> BTreeMap<ProfileId, Profile> {
-        self.profiles_snapshot()
-            .into_iter()
-            .filter_map(|profile| {
-                let profile_id = profile.id.clone();
-                self.core_profile(&profile_id)
-                    .map(|core| (profile_id, core))
+    fn profiles_and_core_snapshot(&self) -> (Vec<VpnProfile>, BTreeMap<ProfileId, Profile>) {
+        let profiles = self
+            .profiles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let topologies = self
+            .topologies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let core = profiles
+            .iter()
+            .map(|(profile_id, profile)| {
+                let resolved = topologies
+                    .get(profile_id)
+                    .map(|topology| topology.resolved_endpoints.clone())
+                    .unwrap_or_default();
+                let core = crate::tunnel::profile_view(profile)
+                    .with_endpoint_resolutions(resolved)
+                    .require_managed_endpoint_resolution();
+                (profile_id.clone(), core)
             })
-            .collect()
+            .collect();
+        (profiles.values().cloned().collect(), core)
     }
 
     fn take_result(
@@ -428,20 +381,15 @@ impl StandardProfileMutationExecutor {
         self.prepared_imports
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(profile_id.clone(), prepared);
-        self.prepared_topologies
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(profile_id.clone(), topology);
+            .insert(
+                profile_id.clone(),
+                PreparedImportState { prepared, topology },
+            );
         profile_id
     }
 
     fn discard_prepared_import(&self, profile_id: &ProfileId) {
         self.prepared_imports
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(profile_id);
-        self.prepared_topologies
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(profile_id);
@@ -520,19 +468,14 @@ impl ProfileMutationExecutor for StandardProfileMutationExecutor {
         let operation_id = work.operation_id.clone();
         let result = (|| match work.mutation {
             ProfileMutation::Import { profile_id } => {
-                let prepared = self
+                let state = self
                     .prepared_imports
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .remove(&profile_id)
                     .ok_or(ProfileMutationFailure::NotFound)?;
-                let topology = self
-                    .prepared_topologies
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&profile_id)
-                    .ok_or(ProfileMutationFailure::Internal)?;
-                let profile = crate::vpn::commit_profile_import(prepared, &self.profiles_dir)
+                let topology = state.topology;
+                let profile = crate::vpn::commit_profile_import(state.prepared, &self.profiles_dir)
                     .map_err(|_| ProfileMutationFailure::Storage)?;
                 self.profiles
                     .lock()
@@ -1166,12 +1109,12 @@ impl ClientControlSession {
     {
         let idempotency_key = idempotency_key.into();
         match self.0 {
-            ClientControlSessionKind::StandardLifecycle(session) => session
-                .run_with_challenges(command, wait, idempotency_key, answer_challenge)
-                .map(ClientOperationOutcome::from),
-            ClientControlSessionKind::StandardProfile(session) => session
-                .run(command, wait, idempotency_key)
-                .map(ClientOperationOutcome::from),
+            ClientControlSessionKind::StandardLifecycle(session) => {
+                session.run_with_challenges(command, wait, idempotency_key, answer_challenge)
+            }
+            ClientControlSessionKind::StandardProfile(session) => {
+                session.run(command, wait, idempotency_key)
+            }
             ClientControlSessionKind::Remote { session, queue } => run_remote_cli_command(
                 &session,
                 &queue,
@@ -1608,12 +1551,12 @@ impl LocalProfileMutationSession {
         endpoint_cache
             .retain_profiles(&profiles.iter().map(|profile| profile.id.clone()).collect());
         let (topologies, _) = load_profile_topologies(profiles, &mut endpoint_cache);
-        let prepared_topologies = prepared_imports
-            .iter()
+        let prepared_imports = prepared_imports
+            .into_iter()
             .map(|prepared| {
                 let profile = prepared.topology_profile();
                 let topology = topology_for_profile(&profile, &mut endpoint_cache).ok();
-                (profile.id, topology)
+                PreparedImportState { prepared, topology }
             })
             .collect();
         persist_endpoint_cache_if_changed(&state_store, cache_bytes.as_deref(), &endpoint_cache)?;
@@ -1622,7 +1565,6 @@ impl LocalProfileMutationSession {
             profiles,
             prepared_imports,
             topologies.clone(),
-            prepared_topologies,
         ));
         let service = ControlService::start_with_clock(
             ControlServiceConfig {
@@ -1636,7 +1578,13 @@ impl LocalProfileMutationSession {
             },
             Arc::new(RealClock),
         );
-        let sessions = crate::core::scanner::get_active_profiles(profiles);
+        let scan = crate::core::scanner::gather_system_state(profiles);
+        if !scan.tunnel_observation_complete {
+            return Err(LocalControlError::Observation(
+                "tunnel observation failed; active-profile safety is unverified".into(),
+            ));
+        }
+        let sessions = scan.sessions;
         runtime.block_on(async {
             let observer = service.observer();
             let observed_at_millis = observer.now_millis();
@@ -1671,7 +1619,7 @@ impl LocalProfileMutationSession {
         command: UserCommand,
         wait: Duration,
         idempotency_key: impl Into<String>,
-    ) -> Result<LocalOperationOutcome, LocalControlError> {
+    ) -> Result<ClientOperationOutcome, LocalControlError> {
         let result = self.runtime.block_on(async {
             let client = self.service.client();
             let admitted = client
@@ -1688,7 +1636,7 @@ impl LocalProfileMutationSession {
                     let snapshot = subscription.snapshot();
                     if let Some(operation) = snapshot.operations.get(&admitted.operation_id) {
                         if operation.status.is_terminal() {
-                            return Ok(LocalOperationOutcome {
+                            return Ok(ClientOperationOutcome {
                                 profile_mutation: self
                                     .profile_mutations
                                     .take_result(&admitted.operation_id),
@@ -1793,7 +1741,6 @@ impl LocalControlSession {
             &profiles,
             Vec::new(),
             topologies.clone(),
-            BTreeMap::new(),
         ));
         let service = {
             let _runtime_guard = runtime.enter();
@@ -1886,6 +1833,11 @@ impl LocalControlSession {
                 .map_err(|error| LocalControlError::Ownership(error.to_string()))?,
         );
         let initial_scan = crate::core::scanner::gather_system_state(&profiles);
+        if !initial_scan.tunnel_observation_complete {
+            return Err(LocalControlError::Observation(
+                "tunnel observation failed; tunnel absence is unverified".into(),
+            ));
+        }
         let initial_sessions = initial_scan.sessions.clone();
         let sessions = Arc::new(Mutex::new(initial_sessions.clone()));
 
@@ -1903,7 +1855,6 @@ impl LocalControlSession {
             &profiles,
             Vec::new(),
             topologies.clone(),
-            BTreeMap::new(),
         ));
         let core_profiles = Arc::new(
             profiles
@@ -1925,11 +1876,8 @@ impl LocalControlSession {
         let scanner_catalog = Arc::clone(&profile_mutations);
         let executor_sessions = Arc::clone(&sessions);
         let session_resolver = move |profile_id: &ProfileId| {
-            current_session(
-                &scanner_catalog.profiles_snapshot(),
-                &executor_sessions,
-                profile_id,
-            )
+            let profile = scanner_catalog.profile_snapshot(profile_id)?;
+            current_session(&profile, &executor_sessions)
         };
         let executor = Arc::new(CanonicalTunnelExecutor::new_standard(
             CanonicalTunnelSettings {
@@ -1959,18 +1907,14 @@ impl LocalControlSession {
         let policy = Arc::new(CanonicalPolicyExecutor::new(
             config_dir.to_path_buf(),
             move |profile_id| {
-                current_session(
-                    &policy_catalog.profiles_snapshot(),
-                    &policy_sessions,
-                    profile_id,
-                )
+                let profile = policy_catalog.profile_snapshot(profile_id)?;
+                current_session(&profile, &policy_sessions)
             },
             move || {
                 let sessions = external_sessions
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let profiles = external_catalog.profiles_snapshot();
-                let core_profiles = external_catalog.core_profiles_snapshot();
+                let (profiles, core_profiles) = external_catalog.profiles_and_core_snapshot();
                 external_session_profiles(&sessions, &profiles, &core_profiles, &external_ownership)
                     .len()
             },
@@ -2072,7 +2016,7 @@ impl LocalControlSession {
         command: UserCommand,
         wait: Duration,
         idempotency_key: impl Into<String>,
-    ) -> Result<LocalOperationOutcome, LocalControlError> {
+    ) -> Result<ClientOperationOutcome, LocalControlError> {
         self.run_with_challenges(command, wait, idempotency_key, |_| {
             Err(LocalControlError::ChallengeNonInteractive {
                 profile: "unknown".into(),
@@ -2271,6 +2215,7 @@ impl LocalControlSession {
     ) -> Option<LocalCatalogUpdate> {
         let mut outcomes = Vec::new();
         let mut reported = self.reported_profile_operations.borrow_mut();
+        reported.retain(|operation_id| snapshot.operations.contains_key(operation_id));
         for (operation_id, operation) in &snapshot.operations {
             if !operation.status.is_terminal()
                 || !matches!(operation.intent, OperationIntent::ProfileMutation { .. })
@@ -2329,7 +2274,7 @@ impl LocalControlSession {
         wait: Duration,
         idempotency_key: impl Into<String>,
         answer_challenge: F,
-    ) -> Result<LocalOperationOutcome, LocalControlError>
+    ) -> Result<ClientOperationOutcome, LocalControlError>
     where
         F: FnMut(
                 &crate::vortix_core::control::ChallengeRecord,
@@ -2417,7 +2362,7 @@ impl LocalControlSession {
                         if let Some(error) = challenge_input_error {
                             return Err(error);
                         }
-                        return Ok(LocalOperationOutcome {
+                        return Ok(ClientOperationOutcome {
                             profile_mutation: None,
                             operation_id: admitted.operation_id,
                             status: operation.status,
@@ -2518,6 +2463,11 @@ impl LocalControlSession {
         &self,
         scan: crate::core::scanner::ScannerResult,
     ) -> Result<(), LocalControlError> {
+        if !scan.tunnel_observation_complete {
+            return Err(LocalControlError::Observation(
+                "tunnel observation failed; preserving the last verified tunnel state".into(),
+            ));
+        }
         let sessions = scan.sessions;
         let profiles = self.profile_mutations.profiles_snapshot();
         self.sessions
@@ -2603,6 +2553,13 @@ impl LocalControlSession {
                 .borrow_mut()
                 .insert(profile_id, state);
         }
+        let profile_ids = profiles
+            .iter()
+            .map(|profile| &profile.id)
+            .collect::<std::collections::BTreeSet<_>>();
+        self.published_observations
+            .borrow_mut()
+            .retain(|profile_id, _| profile_ids.contains(profile_id));
         Ok(())
     }
 }
@@ -2741,11 +2698,9 @@ fn observation_changes(
 }
 
 fn current_session(
-    profiles: &[VpnProfile],
+    profile: &VpnProfile,
     sessions: &Mutex<Vec<ActiveSession>>,
-    profile_id: &ProfileId,
 ) -> Option<ActiveSession> {
-    let profile = profiles.iter().find(|profile| &profile.id == profile_id)?;
     sessions
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3729,6 +3684,7 @@ mod tests {
                 crate::vortix_core::ports::route_table::DefaultRouteObservation::Interface(
                     "wg0".into(),
                 ),
+            tunnel_observation_complete: true,
         };
         let profile_id = profile_id('c');
         let baseline_generation = session.current_snapshot().generation;
@@ -3794,6 +3750,68 @@ mod tests {
     }
 
     #[test]
+    fn local_session_prunes_compacted_operations_and_deleted_profile_observations() {
+        let temp = tempfile::tempdir().unwrap();
+        let session = LocalControlSession::start_profile_test(temp.path(), Vec::new()).unwrap();
+        let stale_operation = operation_id(99);
+        session
+            .reported_profile_operations
+            .borrow_mut()
+            .insert(stale_operation);
+        session
+            .published_observations
+            .borrow_mut()
+            .insert(profile_id('e'), (true, Some("wg9".into())));
+
+        assert!(session
+            .take_catalog_update(&ControlSnapshot::default())
+            .is_none());
+        session
+            .runtime()
+            .block_on(session.publish_observations_from(
+                crate::core::scanner::ScannerResult {
+                    sessions: Vec::new(),
+                    default_route:
+                        crate::vortix_core::ports::route_table::DefaultRouteObservation::ProbeFailed,
+                    tunnel_observation_complete: true,
+                },
+            ))
+            .unwrap();
+
+        assert!(session.reported_profile_operations.borrow().is_empty());
+        assert!(session.published_observations.borrow().is_empty());
+    }
+
+    #[test]
+    fn failed_wireguard_sweep_never_publishes_absence() {
+        let temp = tempfile::tempdir().unwrap();
+        let session = LocalControlSession::start_profile_test(temp.path(), Vec::new()).unwrap();
+        let profile = profile_id('f');
+        session
+            .published_observations
+            .borrow_mut()
+            .insert(profile.clone(), (true, Some("wg0".into())));
+
+        let error = session
+            .runtime()
+            .block_on(session.publish_observations_from(
+                crate::core::scanner::ScannerResult {
+                    sessions: Vec::new(),
+                    default_route:
+                        crate::vortix_core::ports::route_table::DefaultRouteObservation::ProbeFailed,
+                    tunnel_observation_complete: false,
+                },
+            ))
+            .unwrap_err();
+
+        assert!(matches!(error, LocalControlError::Observation(_)));
+        assert_eq!(
+            session.published_observations.borrow().get(&profile),
+            Some(&(true, Some("wg0".into())))
+        );
+    }
+
+    #[test]
     fn admitted_import_expiry_discards_prepared_body_and_topology() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir(temp.path().join(crate::constants::PROFILES_DIR_NAME)).unwrap();
@@ -3844,7 +3862,7 @@ mod tests {
         assert_eq!(session.prepared_import_count(), 0);
         assert!(session
             .profile_mutations
-            .prepared_topologies
+            .prepared_imports
             .lock()
             .unwrap()
             .is_empty());

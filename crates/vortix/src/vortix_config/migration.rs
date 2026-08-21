@@ -194,6 +194,12 @@ pub fn migrate_legacy_profiles(profiles_dir: &Path) -> std::io::Result<Migration
         inventory
     };
 
+    // A saved inventory is the authority for every identity-bearing move.
+    // Revalidate its config set before migrating auth so a stale inventory
+    // cannot mutate credentials and only then fail closed.
+    let (current_configs, _) = scan_profile_files(profiles_dir)?;
+    validate_saved_configs_and_sidecars(profiles_dir, &inventory, &current_configs)?;
+
     migrate_legacy_auth_files(profiles_dir, &inventory)
         .map_err(|error| invalid_data(format!("legacy auth migration failed: {error}")))?;
 
@@ -1276,6 +1282,35 @@ mod tests {
         );
         assert!(!profiles.join("my vpn.meta.toml").exists());
         assert!(!profiles.join("my_vpn.meta.toml").exists());
+    }
+
+    #[test]
+    fn stale_inventory_rejects_catalog_change_before_moving_auth() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profiles = tmp.path().join("profiles");
+        let auth = tmp.path().join("auth");
+        std::fs::create_dir_all(&profiles).unwrap();
+        std::fs::create_dir_all(&auth).unwrap();
+        std::fs::write(profiles.join("corp.ovpn"), b"client\n").unwrap();
+        migrate_legacy_profiles(&profiles).unwrap();
+        let sidecar = FsProfileStore::read_sidecar(&profiles.join("corp.meta.toml")).unwrap();
+
+        std::fs::remove_file(profiles.join("corp.ovpn")).unwrap();
+        std::fs::write(profiles.join("replacement.ovpn"), b"client\n").unwrap();
+        std::fs::write(auth.join("corp.auth"), b"user\nsecret\n").unwrap();
+
+        let error = migrate_legacy_profiles(&profiles).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("profile config inventory changed"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(auth.join("corp.auth")).unwrap(),
+            b"user\nsecret\n"
+        );
+        assert!(!auth.join(format!("{}.auth", sidecar.profile_id)).exists());
     }
 
     #[test]

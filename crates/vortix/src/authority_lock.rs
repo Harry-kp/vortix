@@ -90,10 +90,7 @@ impl AuthorityLockStore {
         }
 
         let parent_metadata = std::fs::symlink_metadata(parent)?;
-        if !parent_metadata.is_dir()
-            || parent_metadata.file_type().is_symlink()
-            || parent_metadata.uid() != self.expected_parent_owner_uid
-        {
+        if !parent_metadata.is_dir() || parent_metadata.uid() != self.expected_parent_owner_uid {
             return Err(unsafe_path());
         }
         std::fs::set_permissions(
