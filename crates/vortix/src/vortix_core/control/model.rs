@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::vortix_core::engine::registry::Conflict;
 use crate::vortix_core::engine::state::{ConnectionHealth, DegradedReason, FailureReason};
+use crate::vortix_core::privileged::OpenVpnRouteEvidence;
 use crate::vortix_core::profile::{ProfileId, ProtocolKind};
 use crate::vortix_core::state::killswitch::KillSwitchMode;
 use crate::vortix_core::state::KillSwitchState;
@@ -251,10 +252,19 @@ pub struct ObservedState {
     #[serde(default)]
     pub wireguard_probe_receipts:
         BTreeMap<ProfileId, Vec<crate::vortix_core::ports::tunnel::ProbeReceipt>>,
+    /// Authenticated `OpenVPN` route truth fenced to the successful tunnel generation.
+    #[serde(default)]
+    pub openvpn_routes: BTreeMap<ProfileId, ObservedOpenVpnRoutes>,
     /// Ongoing typed health fenced to the successful desired generation.
     /// Snapshot subscribers consume this same record as CLI/TUI projections.
     #[serde(default)]
     pub connection_health: BTreeMap<ProfileId, ObservedConnectionHealth>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservedOpenVpnRoutes {
+    pub desired_generation: u64,
+    pub evidence: OpenVpnRouteEvidence,
 }
 
 /// Generation-consistent ongoing health published by the control owner.

@@ -555,7 +555,7 @@ impl TunnelExecutor for HelperBackedTunnelExecutor {
         }
     }
 
-    fn compensate_late_success(&self, work: &TunnelWork) -> Result<(), String> {
+    fn compensate_unaccepted_success(&self, work: &TunnelWork) -> Result<(), String> {
         if work.mutation == TunnelMutation::Disconnect {
             Ok(())
         } else {
@@ -719,14 +719,23 @@ impl HelperTunnelReceiptAdapter {
             )
             .map(|receipt| receipt.with_probe_receipts(probe_receipts.to_vec()))
             .map_err(|_| HelperTunnelReceiptError::EvidenceMismatch),
-            ProtocolPlan::OpenVpn(_) => TunnelExecutionReceipt::attested(
-                work.profile_id.clone(),
-                runtime.kernel_alias(),
-                TunnelKindTag::OpenVpn,
-                None,
-                attestation,
-            )
-            .map_err(|_| HelperTunnelReceiptError::EvidenceMismatch),
+            ProtocolPlan::OpenVpn(_) => {
+                let routes = observation
+                    .receipt()
+                    .observation(&tunnel)
+                    .and_then(crate::vortix_core::privileged::ResourceObservation::openvpn_routes)
+                    .cloned()
+                    .ok_or(HelperTunnelReceiptError::EvidenceMismatch)?;
+                TunnelExecutionReceipt::attested(
+                    work.profile_id.clone(),
+                    runtime.kernel_alias(),
+                    TunnelKindTag::OpenVpn,
+                    None,
+                    attestation,
+                )
+                .map(|receipt| receipt.with_openvpn_routes(routes))
+                .map_err(|_| HelperTunnelReceiptError::EvidenceMismatch)
+            }
         }
     }
 

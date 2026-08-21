@@ -21,6 +21,7 @@ pub(crate) mod control_host;
 pub mod diagnostics;
 pub(crate) mod helper_client;
 pub mod passive;
+mod policy_executor;
 mod server;
 pub mod service;
 mod tunnel_executor;

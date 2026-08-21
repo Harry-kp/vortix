@@ -29,7 +29,10 @@ use crate::helper::validate::{PlatformLayout, HELPER_RUNTIME_DIR_MODE, HELPER_SO
 use crate::vortix_core::openvpn_credentials::{
     DecodedOpenVpnCredentials, MAX_CREDENTIAL_FRAME_BYTES,
 };
-use crate::vortix_core::privileged::{OpenVpnPlan, ProfileMaterialSlot, ResourceKind, ResourceTag};
+use crate::vortix_core::privileged::{
+    OpenVpnPlan, OpenVpnRoute, OpenVpnRouteEvidence, OpenVpnRouteGateway, OpenVpnRouteSetEvidence,
+    ProfileMaterialSlot, ResourceKind, ResourceTag,
+};
 use crate::vortix_core::privileged::{ProfileMaterialRef, TunnelDescriptorRef, WireGuardPlan};
 use crate::vortix_core::profile::ProtocolKind;
 use crate::vortix_core::secret_file::{
@@ -44,6 +47,7 @@ use crate::vortix_protocol_wireguard::execution::{
 };
 
 pub(crate) const MAX_MATERIAL_BYTES: usize = 1024 * 1024;
+const MAX_OPENVPN_LOG_EVIDENCE_BYTES: usize = 1024 * 1024;
 
 pub(crate) enum TunnelMaterialSet {
     WireGuard(WireGuardMaterialSet),
@@ -800,6 +804,12 @@ impl Debug for RecoveredOpenVpnRuntime {
 }
 
 impl RecoveredOpenVpnRuntime {
+    pub(crate) fn openvpn_route_evidence(
+        &self,
+    ) -> Result<OpenVpnRouteEvidence, OpenVpnStagingError> {
+        read_openvpn_route_evidence(&self.runtime_directory, self.expected_owner_uid)
+    }
+
     pub(crate) fn is_drained(&self) -> Result<bool, OpenVpnStagingError> {
         self.validate().map(|state| !state.payload_present)
     }
@@ -953,6 +963,12 @@ impl StagedOpenVpnRuntime {
         &self.runtime_directory
     }
 
+    pub(crate) fn openvpn_route_evidence(
+        &self,
+    ) -> Result<OpenVpnRouteEvidence, OpenVpnStagingError> {
+        read_openvpn_route_evidence(&self.runtime_directory, self.expected_owner_uid)
+    }
+
     pub(crate) fn material_path(&self, slot: ProfileMaterialSlot) -> Option<&Path> {
         self.execution.material_path(slot)
     }
@@ -1102,6 +1118,8 @@ pub(crate) enum OpenVpnStagingError {
     StaleRuntime,
     #[error("OpenVPN material staging I/O failed")]
     Io(#[from] std::io::Error),
+    #[error("OpenVPN route negotiation evidence is incomplete or invalid")]
+    InvalidRouteEvidence,
 }
 
 impl OpenVpnStagingError {
@@ -1128,6 +1146,142 @@ fn read_openvpn_credential_descriptor(
     )?;
     crate::vortix_core::openvpn_credentials::decode(&bytes)
         .ok_or(OpenVpnStagingError::InvalidCredentials)
+}
+
+fn read_openvpn_route_evidence(
+    runtime_directory: &Path,
+    expected_owner_uid: u32,
+) -> Result<OpenVpnRouteEvidence, OpenVpnStagingError> {
+    let config = read_private_text_snapshot(
+        &runtime_directory.join(CONFIG_FILE),
+        expected_owner_uid,
+        MAX_MATERIAL_BYTES,
+        false,
+    )?;
+    let parsed = crate::vortix_protocol_openvpn::parser::parse_ovpn_conf(&config.text)
+        .map_err(|_| OpenVpnStagingError::InvalidRouteEvidence)?;
+    if parsed.unsupported_route_semantics {
+        return Err(OpenVpnStagingError::InvalidRouteEvidence);
+    }
+    let configured = parsed
+        .routes
+        .iter()
+        .map(canonical_openvpn_route)
+        .collect::<Result<Vec<_>, _>>()?;
+    let log = read_private_text_snapshot(
+        &runtime_directory.join(LOG_FILE),
+        expected_owner_uid,
+        MAX_OPENVPN_LOG_EVIDENCE_BYTES,
+        true,
+    )?;
+    let pushed = crate::vortix_protocol_openvpn::push::pushed_route_evidence(&log.text)
+        .map_err(|_| OpenVpnStagingError::InvalidRouteEvidence)?;
+    if log.truncated && !pushed.push_reply_present() {
+        return Err(OpenVpnStagingError::InvalidRouteEvidence);
+    }
+    let pushed_routes = pushed
+        .routes()
+        .iter()
+        .map(canonical_openvpn_route)
+        .collect::<Result<Vec<_>, _>>()?;
+    let selected_remote_required = configured
+        .iter()
+        .chain(&pushed_routes)
+        .any(|route| route.gateway() == OpenVpnRouteGateway::RemoteHost);
+    let selected_remote = if selected_remote_required {
+        Some(
+            crate::vortix_protocol_openvpn::push::selected_remote_address(&log.text)
+                .map_err(|_| OpenVpnStagingError::InvalidRouteEvidence)?
+                .ok_or(OpenVpnStagingError::InvalidRouteEvidence)?,
+        )
+    } else {
+        None
+    };
+    OpenVpnRouteEvidence::new(
+        OpenVpnRouteSetEvidence::with_route_defaults(
+            configured,
+            parsed.redirect_gateway,
+            parsed.route_defaults,
+        )
+        .map_err(|_| OpenVpnStagingError::InvalidRouteEvidence)?,
+        OpenVpnRouteSetEvidence::with_route_defaults(
+            pushed_routes,
+            pushed.redirect_gateway().cloned(),
+            pushed.route_defaults(),
+        )
+        .map_err(|_| OpenVpnStagingError::InvalidRouteEvidence)?,
+    )
+    .and_then(|evidence| evidence.with_selected_remote(selected_remote))
+    .map_err(|_| OpenVpnStagingError::InvalidRouteEvidence)
+}
+
+fn canonical_openvpn_route(
+    route: &crate::vortix_protocol_openvpn::parser::OvpnRoute,
+) -> Result<OpenVpnRoute, OpenVpnStagingError> {
+    let destination =
+        crate::vortix_core::cidr::Cidr::new(route.destination.addr, route.destination.prefix_len)
+            .ok_or(OpenVpnStagingError::InvalidRouteEvidence)?;
+    OpenVpnRoute::with_gateway(destination, route.gateway, route.metric)
+        .map_err(|_| OpenVpnStagingError::InvalidRouteEvidence)
+}
+
+struct PrivateTextSnapshot {
+    text: String,
+    truncated: bool,
+}
+
+fn read_private_text_snapshot(
+    path: &Path,
+    expected_owner_uid: u32,
+    max_bytes: usize,
+    tail: bool,
+) -> Result<PrivateTextSnapshot, OpenVpnStagingError> {
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)?;
+    let before = file.metadata()?;
+    if !before.is_file()
+        || before.uid() != expected_owner_uid
+        || before.mode() & 0o777 != 0o600
+        || before.nlink() != 1
+        || before.len() == 0
+        || (!tail && before.len() > max_bytes as u64)
+    {
+        return Err(OpenVpnStagingError::UnsafeRuntime);
+    }
+    let identity = SecretFileIdentity::from_metadata(&before);
+    let start = if tail {
+        before.len().saturating_sub(max_bytes as u64)
+    } else {
+        0
+    };
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(before.len().saturating_sub(start)).unwrap_or(max_bytes),
+    );
+    (&mut file)
+        .take(u64::try_from(max_bytes).unwrap_or(u64::MAX))
+        .read_to_end(&mut bytes)?;
+    let after = file.metadata()?;
+    if !identity.matches_metadata(&after)
+        || before.len() != after.len()
+        || bytes.len() != usize::try_from(before.len().saturating_sub(start)).unwrap_or(usize::MAX)
+    {
+        return Err(OpenVpnStagingError::InvalidRouteEvidence);
+    }
+    if start != 0 {
+        let newline = bytes
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .ok_or(OpenVpnStagingError::InvalidRouteEvidence)?;
+        bytes.drain(..=newline);
+    }
+    let text = String::from_utf8(bytes).map_err(|_| OpenVpnStagingError::InvalidRouteEvidence)?;
+    Ok(PrivateTextSnapshot {
+        text,
+        truncated: start != 0,
+    })
 }
 
 fn validate_directory(
@@ -1313,19 +1467,22 @@ fn validate_recovered_secret_directory(
 mod tests {
     use std::fs::File;
     use std::io::{Seek as _, SeekFrom, Write as _};
-    use std::os::unix::fs::{symlink, PermissionsExt as _};
+    use std::os::unix::fs::{symlink, OpenOptionsExt as _, PermissionsExt as _};
 
     use crate::helper::HELPER_SOCKET_DIR_MODE;
     use crate::vortix_core::privileged::{
-        OpenVpnAuthFactors, OpenVpnPlan, OpenVpnRemote, OpenVpnRemoteSelection, OpenVpnTransport,
-        ProfileMaterialRef, ProfileMaterialSlot, ProtocolPlan, ResourceTag,
-        WireGuardInterfaceOptions, WireGuardPeerPlan, WireGuardPlan, WireGuardPresharedKeyRef,
+        OpenVpnAuthFactors, OpenVpnDefaultGateway, OpenVpnDefaultGateways, OpenVpnPlan,
+        OpenVpnRemote, OpenVpnRemoteSelection, OpenVpnRoute, OpenVpnRouteDefaults,
+        OpenVpnRouteGateway, OpenVpnTransport, ProfileMaterialRef, ProfileMaterialSlot,
+        ProtocolPlan, ResourceTag, WireGuardInterfaceOptions, WireGuardPeerPlan, WireGuardPlan,
+        WireGuardPresharedKeyRef,
     };
     use crate::vortix_core::profile::ProfileId;
 
     use super::{
         OpenVpnDescriptorSet, OpenVpnRuntimeStager, OpenVpnStagingError, TunnelMaterialError,
         TunnelMaterialSet, WireGuardMaterialSet, WireGuardRuntimeStager, WireGuardStagingError,
+        MAX_OPENVPN_LOG_EVIDENCE_BYTES,
     };
     use base64::engine::{general_purpose::STANDARD as BASE64, Engine as _};
 
@@ -1348,13 +1505,43 @@ mod tests {
             vec![OpenVpnRemote::dns("vpn.example.com", 1194, OpenVpnTransport::Udp).unwrap()],
             OpenVpnRemoteSelection::Ordered,
             OpenVpnAuthFactors::certificate(),
-            Vec::new(),
+            vec![OpenVpnRoute::new(
+                crate::vortix_core::cidr::Cidr::new("10.40.0.0".parse().unwrap(), 16).unwrap(),
+                Some("10.8.0.1".parse().unwrap()),
+                Some(4),
+            )
+            .unwrap()],
         )
         .unwrap()
+        .with_route_defaults(OpenVpnRouteDefaults::new(
+            OpenVpnDefaultGateways::new(
+                Some(OpenVpnDefaultGateway::Address("10.8.0.1".parse().unwrap())),
+                Some("2001:db8::1".parse().unwrap()),
+            )
+            .unwrap(),
+            Some(12),
+        ))
     }
 
     fn plan() -> OpenVpnPlan {
         plan_for(profile('a'), 7)
+    }
+
+    fn remote_host_plan() -> OpenVpnPlan {
+        OpenVpnPlan::new(
+            profile('a'),
+            7,
+            vec![OpenVpnRemote::dns("vpn.example.com", 1194, OpenVpnTransport::Udp).unwrap()],
+            OpenVpnRemoteSelection::Ordered,
+            OpenVpnAuthFactors::certificate(),
+            vec![OpenVpnRoute::with_gateway(
+                "10.40.0.0/16".parse().unwrap(),
+                OpenVpnRouteGateway::RemoteHost,
+                None,
+            )
+            .unwrap()],
+        )
+        .unwrap()
     }
 
     fn descriptor(contents: &[u8]) -> (tempfile::NamedTempFile, File) {
@@ -1384,6 +1571,136 @@ mod tests {
             current_uid(),
         );
         (root, stager)
+    }
+
+    #[test]
+    fn staged_and_recovered_openvpn_runtime_reconstruct_complete_route_evidence() {
+        let (_root, runtime_stager) = fixture();
+        let (_sources, materials) = certificate_materials();
+        let prepared = runtime_stager.stage(&plan(), materials).unwrap();
+        let runtime = prepared.into_runtime();
+        let log_path = runtime.execution().log_path();
+        let mut log = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(log_path)
+            .unwrap();
+        log.write_all(
+            b"PUSH_REPLY,route 10.50.0.0 255.255.0.0 vpn_gateway 5,route-gateway 10.9.0.1,route-ipv6-gateway 2001:db8:1::1,route-metric 13,redirect-gateway def1\nInitialization Sequence Completed\n",
+        )
+        .unwrap();
+        log.sync_all().unwrap();
+
+        let active = runtime.openvpn_route_evidence().unwrap();
+        assert_eq!(active.configured().routes()[0].metric(), Some(4));
+        assert_eq!(active.pushed().routes()[0].metric(), Some(5));
+        assert_eq!(
+            active.configured().route_defaults().gateways().ipv4(),
+            Some(OpenVpnDefaultGateway::Address("10.8.0.1".parse().unwrap()))
+        );
+        assert_eq!(
+            active.pushed().route_defaults().gateways().ipv4(),
+            Some(OpenVpnDefaultGateway::Address("10.9.0.1".parse().unwrap()))
+        );
+        assert_eq!(
+            active.pushed().route_defaults().gateways().ipv6(),
+            Some("2001:db8:1::1".parse().unwrap())
+        );
+        assert_eq!(active.configured().route_defaults().metric(), Some(12));
+        assert_eq!(active.pushed().route_defaults().metric(), Some(13));
+        assert!(active.pushed().redirect_gateway().unwrap().ipv4());
+
+        std::mem::forget(runtime);
+        let recovered = runtime_stager.recover_for_cleanup().unwrap();
+        assert_eq!(recovered.openvpn_route_evidence().unwrap(), active);
+    }
+
+    #[test]
+    fn openvpn_remote_host_evidence_uses_the_selected_successful_remote() {
+        let (_root, runtime_stager) = fixture();
+        let (_sources, materials) = certificate_materials();
+        let runtime = runtime_stager
+            .stage(&remote_host_plan(), materials)
+            .unwrap()
+            .into_runtime();
+        let mut log = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(runtime.execution().log_path())
+            .unwrap();
+        log.write_all(
+            b"UDPv4 link remote: [AF_INET]198.51.100.7:1194\nPUSH_REPLY,ping 10\nInitialization Sequence Completed\n",
+        )
+        .unwrap();
+        log.sync_all().unwrap();
+
+        assert_eq!(
+            runtime.openvpn_route_evidence().unwrap().selected_remote(),
+            Some("198.51.100.7".parse().unwrap())
+        );
+
+        drop(log);
+        let mut log = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(runtime.execution().log_path())
+            .unwrap();
+        log.write_all(b"PUSH_REPLY,ping 10\nInitialization Sequence Completed\n")
+            .unwrap();
+        log.sync_all().unwrap();
+        assert!(matches!(
+            runtime.openvpn_route_evidence(),
+            Err(OpenVpnStagingError::InvalidRouteEvidence)
+        ));
+    }
+
+    #[test]
+    fn openvpn_route_evidence_rejects_truncated_or_malformed_authority() {
+        let (_root, runtime_stager) = fixture();
+        let (_sources, materials) = certificate_materials();
+        let runtime = runtime_stager
+            .stage(&plan(), materials)
+            .unwrap()
+            .into_runtime();
+        let mut log = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(runtime.execution().log_path())
+            .unwrap();
+        log.write_all(b"PUSH_REPLY,route 10.60.0.0 255.255.0.0\n")
+            .unwrap();
+        log.write_all(&vec![b'x'; MAX_OPENVPN_LOG_EVIDENCE_BYTES + 64])
+            .unwrap();
+        log.write_all(b"\nInitialization Sequence Completed\n")
+            .unwrap();
+        log.sync_all().unwrap();
+        assert!(matches!(
+            runtime.openvpn_route_evidence(),
+            Err(OpenVpnStagingError::InvalidRouteEvidence)
+        ));
+
+        drop(log);
+        let mut log = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(runtime.execution().log_path())
+            .unwrap();
+        log.write_all(b"PUSH_REPLY,ping 10\nInitialization Sequence Completed\n")
+            .unwrap();
+        log.sync_all().unwrap();
+        let mut config = std::fs::OpenOptions::new()
+            .append(true)
+            .open(runtime.execution().config_path())
+            .unwrap();
+        config.write_all(b"route malformed\n").unwrap();
+        config.sync_all().unwrap();
+        assert!(matches!(
+            runtime.openvpn_route_evidence(),
+            Err(OpenVpnStagingError::InvalidRouteEvidence)
+        ));
     }
 
     fn wireguard_plan() -> WireGuardPlan {

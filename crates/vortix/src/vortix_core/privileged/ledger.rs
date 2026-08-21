@@ -1,15 +1,44 @@
 //! Strict, bounded root-owned helper ledger envelope.
 
+use std::net::IpAddr;
+
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::vortix_core::cidr::Cidr;
+
 use super::{
-    has_duplicates, BoundedVec, HelperEpoch, ObservedChildIdentity, OperationError, PolicyDigest,
-    PolicyProjection, ReplayRecord, RequestSequence, ResourceKind, ResourceTag, MAX_RESOURCE_ITEMS,
+    has_duplicates, invalid_unicast_ip, BoundedVec, HelperEpoch, ObservedChildIdentity,
+    OperationError, PolicyDigest, PolicyProjection, ReplayRecord, RequestSequence, ResourceKind,
+    ResourceTag, MAX_RESOURCE_ITEMS,
 };
 
-const HELPER_LEDGER_SCHEMA_VERSION: u16 = 8;
+const HELPER_LEDGER_SCHEMA_VERSION: u16 = 12;
 const MAX_PHYSICAL_DNS_VALUE_BYTES: usize = 253;
 const MAX_PHYSICAL_DNS_RECORD_BYTES: usize = 64 * 1024;
+const MAX_ROUTE_INTERFACE_BYTES: usize = 15;
+pub(crate) const MAX_HELPER_LEDGER_BYTES: u64 = 64 * 1024;
+
+#[derive(Default)]
+struct BoundedLedgerWriter {
+    encoded_bytes: u64,
+}
+
+impl std::io::Write for BoundedLedgerWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let encoded_bytes = self
+            .encoded_bytes
+            .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+        if encoded_bytes > MAX_HELPER_LEDGER_BYTES {
+            return Err(std::io::Error::other("helper ledger capacity exceeded"));
+        }
+        self.encoded_bytes = encoded_bytes;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 /// Durable lifecycle phase for one exact helper-managed resource. Intent is
 /// written before an external effect; release intent is written before
@@ -21,6 +50,405 @@ pub(crate) enum HelperResourceState {
     PendingEffect,
     Owned,
     PendingRelease,
+}
+
+/// Fixed kernel route backends selected by the helper. Callers cannot supply
+/// a table, command, executable, or platform handle through this type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PhysicalRouteBackend {
+    /// Legacy protocol-owned Linux routes. Never valid as helper ownership.
+    LinuxIpMain,
+    /// Fixed Vortix policy table, packet mark, and rule set (schema v1).
+    LinuxPolicyV1,
+    /// Legacy protocol-owned macOS routes. Never valid as helper ownership.
+    MacOsRouteTable,
+    /// Fixed Vortix-scoped macOS route set (schema v1).
+    MacOsScopedV1,
+}
+
+impl PhysicalRouteBackend {
+    const fn supports_helper_ownership(self) -> bool {
+        matches!(self, Self::LinuxPolicyV1 | Self::MacOsScopedV1)
+    }
+}
+
+/// Helper-minted identity for one durable route replacement transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct RouteTransactionId([u8; 32]);
+
+impl RouteTransactionId {
+    #[allow(
+        dead_code,
+        reason = "minted only after the atomic protocol-to-policy route ownership cutover"
+    )]
+    pub(crate) fn new(bytes: [u8; 32]) -> Result<Self, &'static str> {
+        if bytes == [0; 32] {
+            Err("route transaction identity must be non-zero")
+        } else {
+            Ok(Self(bytes))
+        }
+    }
+
+    fn is_zero(self) -> bool {
+        self.0 == [0; 32]
+    }
+}
+
+/// One fully resolved route persisted before the helper mutates the kernel.
+/// Symbolic protocol gateways are resolved before this boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PhysicalRouteEntry {
+    destination: Cidr,
+    interface: String,
+    gateway: Option<IpAddr>,
+    metric: Option<u32>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PhysicalRouteEntryWire {
+    destination: Cidr,
+    interface: String,
+    gateway: Option<IpAddr>,
+    metric: Option<u32>,
+}
+
+impl<'de> Deserialize<'de> for PhysicalRouteEntry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = PhysicalRouteEntryWire::deserialize(deserializer)?;
+        Self::new(wire.destination, wire.interface, wire.gateway, wire.metric)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+impl PhysicalRouteEntry {
+    pub(crate) fn new(
+        destination: Cidr,
+        interface: String,
+        gateway: Option<IpAddr>,
+        metric: Option<u32>,
+    ) -> Result<Self, &'static str> {
+        if !destination.is_valid()
+            || destination.canonical_network() != destination
+            || !valid_route_interface(&interface)
+            || gateway.is_some_and(|gateway| {
+                invalid_unicast_ip(&gateway) || gateway.is_ipv4() != destination.is_v4()
+            })
+        {
+            return Err("physical route entry is invalid");
+        }
+        Ok(Self {
+            destination,
+            interface,
+            gateway,
+            metric,
+        })
+    }
+
+    pub(crate) const fn destination(&self) -> Cidr {
+        self.destination
+    }
+
+    pub(crate) fn interface(&self) -> &str {
+        &self.interface
+    }
+
+    pub(crate) const fn gateway(&self) -> Option<IpAddr> {
+        self.gateway
+    }
+
+    pub(crate) const fn metric(&self) -> Option<u32> {
+        self.metric
+    }
+}
+
+fn valid_route_interface(interface: &str) -> bool {
+    !interface.is_empty()
+        && interface.len() <= MAX_ROUTE_INTERFACE_BYTES
+        && interface
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+/// Durable phase of an exact route transaction. The route writer is not
+/// activated merely by the presence of this type; activation separately
+/// requires the network-policy capability and the protocol ownership cutover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PhysicalRouteStage {
+    Prepared,
+    EffectPendingObservation,
+    ObservedOwned,
+    ObservedAbsent,
+    Superseded,
+    OwnedReleasePending,
+    AbsentReleasePending,
+    SupersededReleasePending,
+}
+
+/// Root-owned binding between one logical route projection and the exact
+/// platform entries that must be observed, rolled back, or released.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct HelperLedgerRoutes {
+    resource: ResourceTag,
+    backend: PhysicalRouteBackend,
+    transaction_id: RouteTransactionId,
+    intended_digest: PolicyDigest,
+    stage: PhysicalRouteStage,
+    entries: Vec<PhysicalRouteEntry>,
+    transport_bypass_targets: Vec<IpAddr>,
+    transport_bypass_entries: Vec<PhysicalRouteEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HelperLedgerRoutesWire {
+    resource: ResourceTag,
+    backend: PhysicalRouteBackend,
+    transaction_id: RouteTransactionId,
+    intended_digest: PolicyDigest,
+    stage: PhysicalRouteStage,
+    entries: BoundedVec<PhysicalRouteEntry, MAX_RESOURCE_ITEMS>,
+    transport_bypass_targets: BoundedVec<IpAddr, MAX_RESOURCE_ITEMS>,
+    transport_bypass_entries: BoundedVec<PhysicalRouteEntry, MAX_RESOURCE_ITEMS>,
+}
+
+impl<'de> Deserialize<'de> for HelperLedgerRoutes {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = HelperLedgerRoutesWire::deserialize(deserializer)?;
+        let value = Self {
+            resource: wire.resource,
+            backend: wire.backend,
+            transaction_id: wire.transaction_id,
+            intended_digest: wire.intended_digest,
+            stage: wire.stage,
+            entries: wire.entries.into_vec(),
+            transport_bypass_targets: wire.transport_bypass_targets.into_vec(),
+            transport_bypass_entries: wire.transport_bypass_entries.into_vec(),
+        };
+        value.validate().map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
+}
+
+impl HelperLedgerRoutes {
+    #[allow(
+        dead_code,
+        reason = "persisted only after the atomic protocol-to-policy route ownership cutover"
+    )]
+    pub(crate) fn prepared(
+        resource: ResourceTag,
+        backend: PhysicalRouteBackend,
+        transaction_id: RouteTransactionId,
+        intended_digest: PolicyDigest,
+        entries: Vec<PhysicalRouteEntry>,
+        transport_bypass_targets: Vec<IpAddr>,
+        transport_bypass_entries: Vec<PhysicalRouteEntry>,
+    ) -> Result<Self, &'static str> {
+        let value = Self {
+            resource,
+            backend,
+            transaction_id,
+            intended_digest,
+            stage: PhysicalRouteStage::Prepared,
+            entries,
+            transport_bypass_targets,
+            transport_bypass_entries,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    fn validate(&self) -> Result<(), &'static str> {
+        let mut destinations = std::collections::HashSet::with_capacity(self.entries.len());
+        let mut bypass_targets =
+            std::collections::HashSet::with_capacity(self.transport_bypass_targets.len());
+        let mut bypass_destinations =
+            std::collections::HashSet::with_capacity(self.transport_bypass_entries.len());
+        let host_destination = |target: IpAddr| {
+            Cidr::new(target, if target.is_ipv4() { 32 } else { 128 })
+                .expect("an IP address always forms a host CIDR")
+        };
+        if self.resource.kind() != ResourceKind::Routes
+            || !self.backend.supports_helper_ownership()
+            || self.transaction_id.is_zero()
+            || self.entries.len() > MAX_RESOURCE_ITEMS
+            || self.transport_bypass_targets.len() > MAX_RESOURCE_ITEMS
+            || self.transport_bypass_entries.len() > MAX_RESOURCE_ITEMS
+            || self
+                .entries
+                .iter()
+                .any(|entry| !destinations.insert(entry.destination()))
+            || self
+                .transport_bypass_targets
+                .iter()
+                .any(|target| invalid_unicast_ip(target) || !bypass_targets.insert(*target))
+            || self.transport_bypass_entries.iter().any(|entry| {
+                !bypass_destinations.insert(entry.destination())
+                    || !bypass_targets.contains(&entry.destination().addr)
+                    || entry.destination() != host_destination(entry.destination().addr)
+            })
+            || match self.backend {
+                PhysicalRouteBackend::LinuxPolicyV1 => !self.transport_bypass_entries.is_empty(),
+                PhysicalRouteBackend::MacOsScopedV1 => {
+                    self.transport_bypass_entries.len() != self.transport_bypass_targets.len()
+                }
+                PhysicalRouteBackend::LinuxIpMain | PhysicalRouteBackend::MacOsRouteTable => true,
+            }
+        {
+            return Err("physical route ownership is invalid");
+        }
+        Ok(())
+    }
+
+    pub(crate) const fn resource(&self) -> &ResourceTag {
+        &self.resource
+    }
+
+    pub(crate) const fn backend(&self) -> PhysicalRouteBackend {
+        self.backend
+    }
+
+    pub(crate) const fn transaction_id(&self) -> RouteTransactionId {
+        self.transaction_id
+    }
+
+    const fn transaction_id_ref(&self) -> &RouteTransactionId {
+        &self.transaction_id
+    }
+
+    pub(crate) const fn intended_digest(&self) -> PolicyDigest {
+        self.intended_digest
+    }
+
+    pub(crate) const fn stage(&self) -> PhysicalRouteStage {
+        self.stage
+    }
+
+    pub(crate) fn entries(&self) -> &[PhysicalRouteEntry] {
+        &self.entries
+    }
+
+    pub(crate) fn transport_bypass_targets(&self) -> &[IpAddr] {
+        &self.transport_bypass_targets
+    }
+
+    pub(crate) fn transport_bypass_entries(&self) -> &[PhysicalRouteEntry] {
+        &self.transport_bypass_entries
+    }
+
+    pub(crate) fn prepare_for(
+        &self,
+        projection: &PolicyProjection,
+        entries: Vec<PhysicalRouteEntry>,
+        transport_bypass_targets: Vec<IpAddr>,
+        transport_bypass_entries: Vec<PhysicalRouteEntry>,
+    ) -> Result<Self, &'static str> {
+        if !matches!(
+            self.stage,
+            PhysicalRouteStage::ObservedOwned | PhysicalRouteStage::ObservedAbsent
+        ) || projection.policy() != &self.resource
+        {
+            return Err("route projection does not match settled physical state");
+        }
+        Self::prepared(
+            self.resource.clone(),
+            self.backend,
+            self.transaction_id,
+            projection.digest(),
+            entries,
+            transport_bypass_targets,
+            transport_bypass_entries,
+        )
+    }
+
+    pub(crate) fn mark_effect_pending(mut self) -> Result<Self, &'static str> {
+        if self.stage != PhysicalRouteStage::Prepared {
+            return Err("route effect requires prepared ownership");
+        }
+        self.stage = PhysicalRouteStage::EffectPendingObservation;
+        Ok(self)
+    }
+
+    pub(crate) fn confirm_observed(
+        mut self,
+        projection: &PolicyProjection,
+    ) -> Result<Self, &'static str> {
+        if self.stage != PhysicalRouteStage::EffectPendingObservation
+            || projection.policy() != &self.resource
+            || projection.digest() != self.intended_digest
+        {
+            return Err("route observation requires a pending exact effect");
+        }
+        self.stage = settled_route_stage(projection)?;
+        Ok(self)
+    }
+
+    pub(crate) fn mark_release_pending(mut self) -> Result<Self, &'static str> {
+        self.stage = match self.stage {
+            PhysicalRouteStage::ObservedOwned => PhysicalRouteStage::OwnedReleasePending,
+            PhysicalRouteStage::ObservedAbsent => PhysicalRouteStage::AbsentReleasePending,
+            PhysicalRouteStage::Superseded => PhysicalRouteStage::SupersededReleasePending,
+            _ => return Err("route release requires settled ownership"),
+        };
+        Ok(self)
+    }
+
+    pub(crate) fn supersede(mut self) -> Result<Self, &'static str> {
+        if self.stage != PhysicalRouteStage::ObservedOwned {
+            return Err("only observed route ownership can be superseded");
+        }
+        self.stage = PhysicalRouteStage::Superseded;
+        Ok(self)
+    }
+
+    pub(crate) fn restore_after_failed_mutation(
+        mut self,
+        projection: &PolicyProjection,
+    ) -> Result<Self, &'static str> {
+        if !matches!(
+            self.stage,
+            PhysicalRouteStage::EffectPendingObservation
+                | PhysicalRouteStage::ObservedOwned
+                | PhysicalRouteStage::ObservedAbsent
+        ) || projection.policy() != &self.resource
+        {
+            return Err("route rollback projection does not match physical state");
+        }
+        self.intended_digest = projection.digest();
+        self.stage = settled_route_stage(projection)?;
+        Ok(self)
+    }
+
+    pub(crate) fn restore_after_failed_release(mut self) -> Result<Self, &'static str> {
+        self.stage = match self.stage {
+            PhysicalRouteStage::OwnedReleasePending => PhysicalRouteStage::ObservedOwned,
+            PhysicalRouteStage::AbsentReleasePending => PhysicalRouteStage::ObservedAbsent,
+            PhysicalRouteStage::SupersededReleasePending => PhysicalRouteStage::Superseded,
+            _ => return Err("route release rollback requires pending release ownership"),
+        };
+        Ok(self)
+    }
+}
+
+fn settled_route_stage(projection: &PolicyProjection) -> Result<PhysicalRouteStage, &'static str> {
+    let PolicyProjection::Routes { routes, .. } = projection else {
+        return Err("physical route state requires a route projection");
+    };
+    if routes.is_empty() {
+        Ok(PhysicalRouteStage::ObservedAbsent)
+    } else {
+        Ok(PhysicalRouteStage::ObservedOwned)
+    }
 }
 
 /// Physical firewall engines that the root helper may select. The daemon can
@@ -742,6 +1170,8 @@ pub(crate) struct HelperLedgerRecord {
     policy_projections: Vec<HelperLedgerPolicy>,
     physical_firewalls: Vec<HelperLedgerFirewall>,
     physical_dns: Vec<HelperLedgerDns>,
+    physical_routes: Vec<HelperLedgerRoutes>,
+    released_resources: Vec<ResourceTag>,
     child_observations: Vec<ObservedChildIdentity>,
 }
 
@@ -755,6 +1185,9 @@ struct HelperLedgerWire {
     physical_firewalls: BoundedVec<HelperLedgerFirewall, MAX_RESOURCE_ITEMS>,
     #[serde(default)]
     physical_dns: BoundedVec<HelperLedgerDns, MAX_RESOURCE_ITEMS>,
+    #[serde(default)]
+    physical_routes: BoundedVec<HelperLedgerRoutes, MAX_RESOURCE_ITEMS>,
+    released_resources: BoundedVec<ResourceTag, MAX_RESOURCE_ITEMS>,
     child_observations: BoundedVec<ObservedChildIdentity, MAX_RESOURCE_ITEMS>,
 }
 
@@ -764,8 +1197,26 @@ type HelperLedgerParts = (
     Vec<HelperLedgerPolicy>,
     Vec<HelperLedgerFirewall>,
     Vec<HelperLedgerDns>,
+    Vec<HelperLedgerRoutes>,
+    Vec<ResourceTag>,
     Vec<ObservedChildIdentity>,
 );
+
+struct HelperLedgerInventory {
+    resources: Vec<HelperLedgerResource>,
+    policy_projections: Vec<HelperLedgerPolicy>,
+    physical_firewalls: Vec<HelperLedgerFirewall>,
+    physical_dns: Vec<HelperLedgerDns>,
+    physical_routes: Vec<HelperLedgerRoutes>,
+    released_resources: Vec<ResourceTag>,
+    child_observations: Vec<ObservedChildIdentity>,
+}
+
+pub(crate) struct HelperLedgerPhysicalOwnership {
+    pub(crate) firewalls: Vec<HelperLedgerFirewall>,
+    pub(crate) dns: Vec<HelperLedgerDns>,
+    pub(crate) routes: Vec<HelperLedgerRoutes>,
+}
 
 impl<'de> Deserialize<'de> for HelperLedgerRecord {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -776,11 +1227,15 @@ impl<'de> Deserialize<'de> for HelperLedgerRecord {
         Self::new_with_schema(
             wire.schema_version,
             wire.replay,
-            wire.resources.into_vec(),
-            wire.policy_projections.into_vec(),
-            wire.physical_firewalls.into_vec(),
-            wire.physical_dns.into_vec(),
-            wire.child_observations.into_vec(),
+            HelperLedgerInventory {
+                resources: wire.resources.into_vec(),
+                policy_projections: wire.policy_projections.into_vec(),
+                physical_firewalls: wire.physical_firewalls.into_vec(),
+                physical_dns: wire.physical_dns.into_vec(),
+                physical_routes: wire.physical_routes.into_vec(),
+                released_resources: wire.released_resources.into_vec(),
+                child_observations: wire.child_observations.into_vec(),
+            },
         )
         .map_err(serde::de::Error::custom)
     }
@@ -795,6 +1250,8 @@ impl HelperLedgerRecord {
             policy_projections: Vec::new(),
             physical_firewalls: Vec::new(),
             physical_dns: Vec::new(),
+            physical_routes: Vec::new(),
+            released_resources: Vec::new(),
             child_observations: Vec::new(),
         }
     }
@@ -841,14 +1298,19 @@ impl HelperLedgerRecord {
         Self::new_with_schema(
             HELPER_LEDGER_SCHEMA_VERSION,
             replay,
-            resources,
-            policy_projections,
-            physical_firewalls,
-            Vec::new(),
-            child_observations,
+            HelperLedgerInventory {
+                resources,
+                policy_projections,
+                physical_firewalls,
+                physical_dns: Vec::new(),
+                physical_routes: Vec::new(),
+                released_resources: Vec::new(),
+                child_observations,
+            },
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_physical_ownership(
         replay: ReplayRecord,
         resources: Vec<HelperLedgerResource>,
@@ -857,14 +1319,83 @@ impl HelperLedgerRecord {
         physical_dns: Vec<HelperLedgerDns>,
         child_observations: Vec<ObservedChildIdentity>,
     ) -> Result<Self, &'static str> {
-        Self::new_with_schema(
-            HELPER_LEDGER_SCHEMA_VERSION,
+        Self::new_with_physical_ownership_and_released(
             replay,
             resources,
             policy_projections,
             physical_firewalls,
             physical_dns,
+            Vec::new(),
             child_observations,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_physical_routes(
+        replay: ReplayRecord,
+        resources: Vec<HelperLedgerResource>,
+        policy_projections: Vec<HelperLedgerPolicy>,
+        physical_routes: Vec<HelperLedgerRoutes>,
+        child_observations: Vec<ObservedChildIdentity>,
+    ) -> Result<Self, &'static str> {
+        Self::new_with_complete_physical_ownership_and_released(
+            replay,
+            resources,
+            policy_projections,
+            HelperLedgerPhysicalOwnership {
+                firewalls: Vec::new(),
+                dns: Vec::new(),
+                routes: physical_routes,
+            },
+            Vec::new(),
+            child_observations,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_physical_ownership_and_released(
+        replay: ReplayRecord,
+        resources: Vec<HelperLedgerResource>,
+        policy_projections: Vec<HelperLedgerPolicy>,
+        physical_firewalls: Vec<HelperLedgerFirewall>,
+        physical_dns: Vec<HelperLedgerDns>,
+        released_resources: Vec<ResourceTag>,
+        child_observations: Vec<ObservedChildIdentity>,
+    ) -> Result<Self, &'static str> {
+        Self::new_with_complete_physical_ownership_and_released(
+            replay,
+            resources,
+            policy_projections,
+            HelperLedgerPhysicalOwnership {
+                firewalls: physical_firewalls,
+                dns: physical_dns,
+                routes: Vec::new(),
+            },
+            released_resources,
+            child_observations,
+        )
+    }
+
+    pub(crate) fn new_with_complete_physical_ownership_and_released(
+        replay: ReplayRecord,
+        resources: Vec<HelperLedgerResource>,
+        policy_projections: Vec<HelperLedgerPolicy>,
+        physical: HelperLedgerPhysicalOwnership,
+        released_resources: Vec<ResourceTag>,
+        child_observations: Vec<ObservedChildIdentity>,
+    ) -> Result<Self, &'static str> {
+        Self::new_with_schema(
+            HELPER_LEDGER_SCHEMA_VERSION,
+            replay,
+            HelperLedgerInventory {
+                resources,
+                policy_projections,
+                physical_firewalls: physical.firewalls,
+                physical_dns: physical.dns,
+                physical_routes: physical.routes,
+                released_resources,
+                child_observations,
+            },
         )
     }
 
@@ -875,17 +1406,24 @@ impl HelperLedgerRecord {
     fn new_with_schema(
         schema_version: u16,
         replay: ReplayRecord,
-        resources: Vec<HelperLedgerResource>,
-        policy_projections: Vec<HelperLedgerPolicy>,
-        physical_firewalls: Vec<HelperLedgerFirewall>,
-        physical_dns: Vec<HelperLedgerDns>,
-        child_observations: Vec<ObservedChildIdentity>,
+        inventory: HelperLedgerInventory,
     ) -> Result<Self, &'static str> {
+        let HelperLedgerInventory {
+            resources,
+            policy_projections,
+            physical_firewalls,
+            physical_dns,
+            physical_routes,
+            released_resources,
+            child_observations,
+        } = inventory;
         if schema_version != HELPER_LEDGER_SCHEMA_VERSION
             || resources.len() > MAX_RESOURCE_ITEMS
             || policy_projections.len() > MAX_RESOURCE_ITEMS
             || physical_firewalls.len() > MAX_RESOURCE_ITEMS
             || physical_dns.len() > MAX_RESOURCE_ITEMS
+            || physical_routes.len() > MAX_RESOURCE_ITEMS
+            || released_resources.len() > MAX_RESOURCE_ITEMS
             || child_observations.len() > MAX_RESOURCE_ITEMS
             || has_duplicates(resources.iter().map(HelperLedgerResource::resource))
             || resources.iter().any(|entry| {
@@ -952,6 +1490,20 @@ impl HelperLedgerRecord {
                     || !physical_dns_matches_logical(physical, &resources, &policy_projections)
             })
             || physical_dns_inventory_is_ambiguous(&physical_dns)
+            || has_duplicates(physical_routes.iter().map(HelperLedgerRoutes::resource))
+            || has_duplicates(
+                physical_routes
+                    .iter()
+                    .map(HelperLedgerRoutes::transaction_id_ref),
+            )
+            || physical_routes.iter().any(|physical| {
+                physical.transaction_id().is_zero()
+                    || physical.validate().is_err()
+                    || physical.resource().authority_epoch() != Some(replay.authority_epoch())
+                    || !physical_routes_match_logical(physical, &resources, &policy_projections)
+            })
+            || physical_routes_inventory_is_ambiguous(&physical_routes)
+            || released_resources_are_invalid(&released_resources, &resources)
             || has_duplicates(
                 child_observations
                     .iter()
@@ -975,15 +1527,21 @@ impl HelperLedgerRecord {
         {
             return Err("invalid helper ownership ledger");
         }
-        Ok(Self {
+        let record = Self {
             schema_version,
             replay,
             resources,
             policy_projections,
             physical_firewalls,
             physical_dns,
+            physical_routes,
+            released_resources,
             child_observations,
-        })
+        };
+        let mut writer = BoundedLedgerWriter::default();
+        serde_json::to_writer(&mut writer, &record)
+            .map_err(|_| "helper ownership ledger exceeds its durable capacity")?;
+        Ok(record)
     }
 
     #[cfg(test)]
@@ -998,6 +1556,8 @@ impl HelperLedgerRecord {
             self.policy_projections,
             self.physical_firewalls,
             self.physical_dns,
+            self.physical_routes,
+            self.released_resources,
             self.child_observations,
         )
     }
@@ -1011,6 +1571,209 @@ impl HelperLedgerRecord {
     pub(crate) fn physical_dns(&self) -> &[HelperLedgerDns] {
         &self.physical_dns
     }
+
+    #[cfg(test)]
+    pub(crate) fn physical_routes(&self) -> &[HelperLedgerRoutes] {
+        &self.physical_routes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn released_resources(&self) -> &[ResourceTag] {
+        &self.released_resources
+    }
+}
+
+fn released_resources_are_invalid(
+    released: &[ResourceTag],
+    active: &[HelperLedgerResource],
+) -> bool {
+    let active_resources = active
+        .iter()
+        .map(HelperLedgerResource::resource)
+        .collect::<std::collections::BTreeSet<_>>();
+    released_identity_set_is_invalid(released)
+        || released
+            .iter()
+            .any(|resource| active_resources.contains(resource))
+}
+
+fn physical_routes_match_logical(
+    physical: &HelperLedgerRoutes,
+    resources: &[HelperLedgerResource],
+    policies: &[HelperLedgerPolicy],
+) -> bool {
+    let Some(resource) = resources
+        .iter()
+        .find(|entry| entry.resource() == physical.resource())
+    else {
+        return false;
+    };
+    let Some(policy) = policies
+        .iter()
+        .find(|entry| entry.resource() == physical.resource())
+    else {
+        return false;
+    };
+    let projection = match physical.stage() {
+        PhysicalRouteStage::Prepared | PhysicalRouteStage::EffectPendingObservation => {
+            if resource.state() != HelperResourceState::PendingEffect
+                || physical.intended_digest() != policy.intended().digest()
+            {
+                return false;
+            }
+            policy.intended()
+        }
+        PhysicalRouteStage::ObservedOwned
+        | PhysicalRouteStage::ObservedAbsent
+        | PhysicalRouteStage::Superseded => {
+            if resource.state() != HelperResourceState::Owned {
+                return false;
+            }
+            let Some(effective) = policy.effective() else {
+                return false;
+            };
+            if physical.intended_digest() != effective.digest() {
+                return false;
+            }
+            effective
+        }
+        PhysicalRouteStage::OwnedReleasePending
+        | PhysicalRouteStage::AbsentReleasePending
+        | PhysicalRouteStage::SupersededReleasePending => {
+            if resource.state() != HelperResourceState::PendingRelease {
+                return false;
+            }
+            let Some(effective) = policy.effective() else {
+                return false;
+            };
+            if physical.intended_digest() != effective.digest() {
+                return false;
+            }
+            effective
+        }
+    };
+    let Some(recorded_is_empty) = physical_route_payload_matches(physical, projection) else {
+        return false;
+    };
+    matches!(
+        (recorded_is_empty, physical.stage()),
+        (
+            false,
+            PhysicalRouteStage::Prepared
+                | PhysicalRouteStage::EffectPendingObservation
+                | PhysicalRouteStage::ObservedOwned
+                | PhysicalRouteStage::Superseded
+                | PhysicalRouteStage::OwnedReleasePending
+                | PhysicalRouteStage::SupersededReleasePending
+        ) | (
+            true,
+            PhysicalRouteStage::Prepared
+                | PhysicalRouteStage::EffectPendingObservation
+                | PhysicalRouteStage::ObservedAbsent
+                | PhysicalRouteStage::AbsentReleasePending
+        )
+    )
+}
+
+fn physical_route_payload_matches(
+    physical: &HelperLedgerRoutes,
+    projection: &PolicyProjection,
+) -> Option<bool> {
+    let PolicyProjection::Routes {
+        routes,
+        redirects,
+        tunnels,
+        ..
+    } = projection
+    else {
+        return None;
+    };
+    let mut expected = routes
+        .iter()
+        .map(super::ScopedRoute::destination)
+        .collect::<std::collections::HashSet<_>>();
+    if expected.len() != routes.len() {
+        return None;
+    }
+    for redirect in redirects {
+        for destination in redirect.destinations().ok()? {
+            if !expected.insert(destination) {
+                return None;
+            }
+        }
+    }
+    let recorded = physical
+        .entries()
+        .iter()
+        .map(PhysicalRouteEntry::destination)
+        .collect::<std::collections::HashSet<_>>();
+    let expected_bypass = if expected.is_empty() {
+        std::collections::HashSet::new()
+    } else {
+        tunnels
+            .iter()
+            .flat_map(super::PrivilegedFirewallTunnel::endpoint_ips)
+            .copied()
+            .collect::<std::collections::HashSet<_>>()
+    };
+    let recorded_bypass = physical
+        .transport_bypass_targets()
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    if expected != recorded
+        || expected_bypass.len() != physical.transport_bypass_targets().len()
+        || expected_bypass != recorded_bypass
+    {
+        return None;
+    }
+    Some(recorded.is_empty())
+}
+
+fn physical_routes_inventory_is_ambiguous(records: &[HelperLedgerRoutes]) -> bool {
+    let current_owners = records
+        .iter()
+        .filter(|physical| {
+            matches!(
+                physical.stage(),
+                PhysicalRouteStage::ObservedOwned | PhysicalRouteStage::OwnedReleasePending
+            )
+        })
+        .count();
+    let pending_replacements = records
+        .iter()
+        .filter(|physical| {
+            matches!(
+                physical.stage(),
+                PhysicalRouteStage::Prepared | PhysicalRouteStage::EffectPendingObservation
+            )
+        })
+        .count();
+    let backend = records.first().map(HelperLedgerRoutes::backend);
+    current_owners > 1
+        || pending_replacements > 1
+        || records
+            .iter()
+            .any(|physical| Some(physical.backend()) != backend)
+}
+
+pub(crate) fn released_identity_set_is_invalid(released: &[ResourceTag]) -> bool {
+    let released_resources = released.iter().collect::<std::collections::BTreeSet<_>>();
+    let mut identities = std::collections::BTreeSet::new();
+    if released.iter().any(|resource| {
+        let Some(profile) = resource.profile_id() else {
+            return true;
+        };
+        !resource.is_tunnel_scoped() || !identities.insert((profile, resource.kind()))
+    }) {
+        return true;
+    }
+    released.iter().any(|resource| {
+        resource.kind() == ResourceKind::ProcessGroup
+            && resource
+                .corresponding_tunnel()
+                .is_none_or(|tunnel| !released_resources.contains(&tunnel))
+    })
 }
 
 fn physical_dns_matches_logical(
@@ -1252,6 +2015,80 @@ mod tests {
     }
 
     #[test]
+    fn released_tunnel_inventory_is_closed_bounded_and_not_live_ownership() {
+        let replay = || {
+            serde_json::from_value::<ReplayRecord>(serde_json::json!({
+                "state": "unused",
+                "record": {
+                    "schema_version": crate::vortix_core::privileged::CONTRACT_SCHEMA_VERSION,
+                    "authority_epoch": 3,
+                    "lease_id": vec![5; 32],
+                    "principal_binding": vec![7; 32],
+                    "initial_helper_epoch": 8
+                }
+            }))
+            .unwrap()
+        };
+        let tunnel = tunnel();
+        let group = ResourceTag::profile(
+            tunnel.profile_id().unwrap().clone(),
+            tunnel.generation(),
+            ResourceKind::ProcessGroup,
+        )
+        .unwrap();
+        let record = HelperLedgerRecord::new_with_physical_ownership_and_released(
+            replay(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![tunnel.clone(), group.clone()],
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            record.released_resources(),
+            &[tunnel.clone(), group.clone()]
+        );
+        assert!(
+            HelperLedgerRecord::new_with_physical_ownership_and_released(
+                replay(),
+                vec![HelperLedgerResource::owned(tunnel.clone())],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![tunnel.clone()],
+                Vec::new(),
+            )
+            .is_err()
+        );
+        assert!(
+            HelperLedgerRecord::new_with_physical_ownership_and_released(
+                replay(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![group],
+                Vec::new(),
+            )
+            .is_err()
+        );
+        assert!(
+            HelperLedgerRecord::new_with_physical_ownership_and_released(
+                replay(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![tunnel, tunnel_at(8)],
+                Vec::new(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn duplicate_resources_and_child_evidence_without_owned_topology_are_rejected() {
         let replay: ReplayRecord = serde_json::from_value(serde_json::json!({
             "state": "unused",
@@ -1453,6 +2290,270 @@ mod tests {
         let mut missing = serde_json::to_value(&record).unwrap();
         missing["physical_firewalls"] = serde_json::json!([]);
         assert!(serde_json::from_value::<HelperLedgerRecord>(missing).is_err());
+    }
+
+    #[test]
+    fn physical_route_plan_is_bounded_and_bound_to_the_exact_projection() {
+        let replay: ReplayRecord = serde_json::from_value(serde_json::json!({
+            "state": "unused",
+            "record": {
+                "schema_version": crate::vortix_core::privileged::CONTRACT_SCHEMA_VERSION,
+                "authority_epoch": 3,
+                "lease_id": vec![5; 32],
+                "principal_binding": vec![7; 32],
+                "initial_helper_epoch": 8
+            }
+        }))
+        .unwrap();
+        let resource = ResourceTag::topology(
+            crate::vortix_core::control::AuthorityEpoch(3),
+            1,
+            ResourceKind::Routes,
+        )
+        .unwrap();
+        let tunnel = tunnel();
+        let route =
+            super::super::ScopedRoute::new("10.0.0.0/8".parse().unwrap(), tunnel.clone()).unwrap();
+        let subject = super::super::PrivilegedFirewallTunnel::new(
+            tunnel,
+            vec!["198.51.100.1".parse().unwrap()],
+            vec!["10.0.0.0/8".parse().unwrap()],
+            super::super::PrivilegedFirewallRole::Primary,
+        )
+        .unwrap();
+        let projection = PolicyProjection::Routes {
+            policy: resource.clone(),
+            routes: vec![route],
+            redirects: Vec::new(),
+            tunnels: vec![subject],
+        };
+        let physical = HelperLedgerRoutes::prepared(
+            resource.clone(),
+            PhysicalRouteBackend::LinuxPolicyV1,
+            RouteTransactionId::new([11; 32]).unwrap(),
+            projection.digest(),
+            vec![PhysicalRouteEntry::new(
+                "10.0.0.0/8".parse().unwrap(),
+                "vxroute0".into(),
+                Some("10.0.0.1".parse().unwrap()),
+                Some(20),
+            )
+            .unwrap()],
+            vec!["198.51.100.1".parse().unwrap()],
+            Vec::new(),
+        )
+        .unwrap();
+
+        let record = HelperLedgerRecord::new_with_physical_routes(
+            replay,
+            vec![HelperLedgerResource::pending(resource.clone())],
+            vec![HelperLedgerPolicy::new(resource, projection, None).unwrap()],
+            vec![physical],
+            Vec::new(),
+        )
+        .unwrap();
+        let encoded = serde_json::to_value(&record).unwrap();
+        let decoded: HelperLedgerRecord = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(decoded.physical_routes().len(), 1);
+        assert_eq!(
+            decoded.physical_routes()[0].transport_bypass_targets(),
+            &["198.51.100.1".parse::<IpAddr>().unwrap()]
+        );
+
+        let mut wrong_digest = encoded.clone();
+        wrong_digest["physical_routes"][0]["intended_digest"] = serde_json::json!(vec![9; 32]);
+        assert!(serde_json::from_value::<HelperLedgerRecord>(wrong_digest).is_err());
+
+        let mut duplicate_destination = encoded.clone();
+        let duplicate = duplicate_destination["physical_routes"][0]["entries"][0].clone();
+        duplicate_destination["physical_routes"][0]["entries"]
+            .as_array_mut()
+            .unwrap()
+            .push(duplicate);
+        assert!(serde_json::from_value::<HelperLedgerRecord>(duplicate_destination).is_err());
+
+        let mut duplicate_bypass = encoded.clone();
+        let duplicate =
+            duplicate_bypass["physical_routes"][0]["transport_bypass_targets"][0].clone();
+        duplicate_bypass["physical_routes"][0]["transport_bypass_targets"]
+            .as_array_mut()
+            .unwrap()
+            .push(duplicate);
+        assert!(serde_json::from_value::<HelperLedgerRecord>(duplicate_bypass).is_err());
+
+        let mut wrong_bypass = encoded;
+        wrong_bypass["physical_routes"][0]["transport_bypass_targets"] =
+            serde_json::json!(["203.0.113.9"]);
+        assert!(serde_json::from_value::<HelperLedgerRecord>(wrong_bypass).is_err());
+    }
+
+    #[test]
+    fn physical_route_ownership_rejects_legacy_protocol_route_domains() {
+        let resource = ResourceTag::topology(
+            crate::vortix_core::control::AuthorityEpoch(3),
+            1,
+            ResourceKind::Routes,
+        )
+        .unwrap();
+        let destination = "10.0.0.0/8".parse().unwrap();
+        let entry = PhysicalRouteEntry::new(destination, "vxroute0".into(), None, None).unwrap();
+        let intended = PolicyProjection::Routes {
+            policy: resource.clone(),
+            routes: vec![super::super::ScopedRoute::new(destination, tunnel()).unwrap()],
+            redirects: Vec::new(),
+            tunnels: vec![super::super::PrivilegedFirewallTunnel::new(
+                tunnel(),
+                vec!["198.51.100.1".parse().unwrap()],
+                vec![destination],
+                super::super::PrivilegedFirewallRole::Primary,
+            )
+            .unwrap()],
+        };
+        assert!(HelperLedgerRoutes::prepared(
+            resource.clone(),
+            PhysicalRouteBackend::LinuxIpMain,
+            RouteTransactionId::new([11; 32]).unwrap(),
+            intended.digest(),
+            vec![entry.clone()],
+            Vec::new(),
+            Vec::new(),
+        )
+        .is_err());
+        assert!(HelperLedgerRoutes::prepared(
+            resource,
+            PhysicalRouteBackend::LinuxPolicyV1,
+            RouteTransactionId::new([12; 32]).unwrap(),
+            intended.digest(),
+            vec![entry],
+            vec!["198.51.100.1".parse().unwrap()],
+            Vec::new(),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn macos_route_ownership_binds_every_endpoint_to_one_exact_host_route() {
+        let resource = ResourceTag::topology(
+            crate::vortix_core::control::AuthorityEpoch(3),
+            1,
+            ResourceKind::Routes,
+        )
+        .unwrap();
+        let endpoint = "198.51.100.1".parse::<IpAddr>().unwrap();
+        let bypass = PhysicalRouteEntry::new(
+            "198.51.100.1/32".parse().unwrap(),
+            "en0".into(),
+            Some("192.0.2.1".parse().unwrap()),
+            None,
+        )
+        .unwrap();
+        assert!(HelperLedgerRoutes::prepared(
+            resource.clone(),
+            PhysicalRouteBackend::MacOsScopedV1,
+            RouteTransactionId::new([13; 32]).unwrap(),
+            PolicyDigest::for_test(super::super::OperationDigest::of_bytes(b"macos-route-plan")),
+            Vec::new(),
+            vec![endpoint],
+            vec![bypass.clone()],
+        )
+        .is_ok());
+        assert!(HelperLedgerRoutes::prepared(
+            resource.clone(),
+            PhysicalRouteBackend::MacOsScopedV1,
+            RouteTransactionId::new([14; 32]).unwrap(),
+            PolicyDigest::for_test(super::super::OperationDigest::of_bytes(
+                b"missing-bypass-route",
+            )),
+            Vec::new(),
+            vec![endpoint],
+            Vec::new(),
+        )
+        .is_err());
+        assert!(HelperLedgerRoutes::prepared(
+            resource,
+            PhysicalRouteBackend::LinuxPolicyV1,
+            RouteTransactionId::new([15; 32]).unwrap(),
+            PolicyDigest::for_test(super::super::OperationDigest::of_bytes(
+                b"linux-cannot-carry-macos-route",
+            )),
+            Vec::new(),
+            vec![endpoint],
+            vec![bypass],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn physical_route_inventory_cannot_exceed_the_durable_ledger_budget() {
+        let replay: ReplayRecord = serde_json::from_value(serde_json::json!({
+            "state": "unused",
+            "record": {
+                "schema_version": crate::vortix_core::privileged::CONTRACT_SCHEMA_VERSION,
+                "authority_epoch": 3,
+                "lease_id": vec![5; 32],
+                "principal_binding": vec![7; 32],
+                "initial_helper_epoch": 8
+            }
+        }))
+        .unwrap();
+        let resource = ResourceTag::topology(
+            crate::vortix_core::control::AuthorityEpoch(3),
+            1,
+            ResourceKind::Routes,
+        )
+        .unwrap();
+        let tunnel = tunnel();
+        let destinations = (0_u16..256)
+            .map(|index| {
+                format!("10.0.{}.0/24", u8::try_from(index).unwrap())
+                    .parse::<Cidr>()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let routes = destinations
+            .iter()
+            .map(|destination| {
+                super::super::ScopedRoute::new(*destination, tunnel.clone()).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let subject = super::super::PrivilegedFirewallTunnel::new(
+            tunnel,
+            vec!["198.51.100.1".parse().unwrap()],
+            destinations.clone(),
+            super::super::PrivilegedFirewallRole::Primary,
+        )
+        .unwrap();
+        let projection = PolicyProjection::Routes {
+            policy: resource.clone(),
+            routes,
+            redirects: Vec::new(),
+            tunnels: vec![subject],
+        };
+        let entries = destinations
+            .into_iter()
+            .map(|destination| {
+                PhysicalRouteEntry::new(destination, "vxroute0".into(), None, None).unwrap()
+            })
+            .collect();
+        let physical = HelperLedgerRoutes::prepared(
+            resource.clone(),
+            PhysicalRouteBackend::LinuxPolicyV1,
+            RouteTransactionId::new([11; 32]).unwrap(),
+            projection.digest(),
+            entries,
+            vec!["198.51.100.1".parse().unwrap()],
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert!(HelperLedgerRecord::new_with_physical_routes(
+            replay,
+            vec![HelperLedgerResource::pending(resource.clone())],
+            vec![HelperLedgerPolicy::new(resource, projection, None).unwrap()],
+            vec![physical],
+            Vec::new(),
+        )
+        .is_err());
     }
 
     #[test]

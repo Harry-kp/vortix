@@ -1174,6 +1174,8 @@ On helper loss, the daemon preserves desired state, marks operations unavailable
 
 **Execution note:** Implement one typed operation family at a time and keep it unreachable from enrolled clients until its Linux and macOS failure matrix passes.
 
+**Route ownership cutover:** Treat protocol-installed routes as a distinct legacy owner until the fixed helper route writer is complete. In particular, helper-backed WireGuard currently reaches `wg-quick` with `AllowedIPs`; a route-policy ledger must not claim those routes while `wg-quick` still creates them. First implement dormant fixed Linux/macOS route mutation with exact read-back and rollback, and preserve OpenVPN gateway, metric, configured/pushed origin, and `redirect-gateway` semantics through the canonical policy contract. Then atomically switch WireGuard rendering to `Table = off`, persist the helper-derived physical route plan before effect, and enable the policy writer. Never ship an intermediate state with two route writers, no route writer, or a ledger claiming protocol-owned routes.
+
 **Patterns to follow:** Existing protocol adapters and platform ports for behavior, but not their generic root `CommandSpec` transport.
 
 **Test scenarios:**

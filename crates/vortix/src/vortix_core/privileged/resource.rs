@@ -67,6 +67,10 @@ impl ResourceTag {
         Self::profile(profile_id, generation, ResourceKind::Tunnel)
     }
 
+    pub(crate) fn corresponding_tunnel(&self) -> Option<Self> {
+        Self::tunnel(self.profile_id()?.clone(), self.generation).ok()
+    }
+
     pub fn profile(
         profile_id: ProfileId,
         generation: u64,

@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use vortix::vortix_core::cidr::Cidr;
 use vortix::vortix_core::control::model::{AuthorityEpoch, OperationId, PolicyDigest};
 use vortix::vortix_core::control::reconcile::{
     merge_observation, plan_reconciliation, DisconnectTombstone, InFlightMutation,
@@ -11,9 +12,9 @@ use vortix::vortix_core::control::reconcile::{
 use vortix::vortix_core::control::supervisor::{PolicyVerification, SupervisedTruth, Supervisor};
 use vortix::vortix_core::control::worker::{
     wait_until, CancellationToken, ControlRevision, PolicyBarrier, PolicyExecutionEvidence,
-    PolicyExecutor, PolicyOutcome, PolicyStage, PolicyWorker, ProfileWorkerPool, TopologyPolicy,
-    TopologyState, TopologyTransitionKind, TunnelExecutionReceipt, TunnelExecutor, TunnelMutation,
-    TunnelRevision, TunnelWork, WorkFailure,
+    PolicyExecutor, PolicyOutcome, PolicyStage, PolicyWorker, ProfileWorkerPool, RouteClaim,
+    TopologyPolicy, TopologyState, TopologyTransitionKind, TunnelExecutionReceipt, TunnelExecutor,
+    TunnelMutation, TunnelRevision, TunnelWork, WorkFailure,
 };
 use vortix::vortix_core::control::{
     Clock, CommandRequest, CompletionOutcome, CompletionResult, ControlEvent, ControlService,
@@ -22,6 +23,9 @@ use vortix::vortix_core::control::{
     ProfileTopology, ProtectionEvidence, ProtectionStatus, RequestedTunnelState, UserCommand,
 };
 use vortix::vortix_core::ports::tunnel::{HandshakeEvidence, TunnelKindTag};
+use vortix::vortix_core::privileged::{
+    OpenVpnRoute, OpenVpnRouteEvidence, OpenVpnRouteGateway, OpenVpnRouteSetEvidence,
+};
 use vortix::vortix_core::profile::{ProfileId, ProtocolKind};
 
 fn profile(value: &str) -> ProfileId {
@@ -67,11 +71,70 @@ fn execution_receipt(work: &TunnelWork) -> TunnelExecutionReceipt {
         TunnelExecutionReceipt::attested(
             work.profile_id.clone(),
             format!("tun-{}", work.profile_id.as_str()),
-            TunnelKindTag::Mock,
+            work.protocol,
             None,
             "test-attestation-0001",
         )
         .unwrap()
+    }
+}
+
+fn openvpn_route_evidence(configured: &[&str], pushed: &[&str]) -> OpenVpnRouteEvidence {
+    let route_set = |routes: &[&str]| {
+        OpenVpnRouteSetEvidence::new(
+            routes
+                .iter()
+                .map(|route| {
+                    OpenVpnRoute::with_gateway(
+                        route.parse::<Cidr>().unwrap(),
+                        OpenVpnRouteGateway::VpnDefault,
+                        None,
+                    )
+                    .unwrap()
+                })
+                .collect(),
+            None,
+        )
+        .unwrap()
+    };
+    OpenVpnRouteEvidence::new(route_set(configured), route_set(pushed)).unwrap()
+}
+
+struct OpenVpnRouteExecutor {
+    pushed_conflict_profile: ProfileId,
+    compensations: Arc<AtomicU64>,
+}
+
+impl TunnelExecutor for OpenVpnRouteExecutor {
+    fn execute(
+        &self,
+        work: &TunnelWork,
+        _: &CancellationToken,
+    ) -> Result<TunnelExecutionReceipt, String> {
+        let receipt = TunnelExecutionReceipt::attested(
+            work.profile_id.clone(),
+            format!("tun-{}", work.profile_id.as_str()),
+            TunnelKindTag::OpenVpn,
+            Some(123),
+            "openvpn-route-attestation-0001",
+        )
+        .unwrap();
+        let evidence = if work.profile_id == self.pushed_conflict_profile {
+            openvpn_route_evidence(&["10.1.0.0/24"], &["10.0.0.128/25"])
+        } else {
+            openvpn_route_evidence(&["10.0.0.0/24"], &[])
+        };
+        Ok(receipt.with_openvpn_routes(evidence))
+    }
+
+    fn compensate_unaccepted_success(&self, _: &TunnelWork) -> Result<(), String> {
+        self.compensations.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn compensate_uncertain(&self, _: &TunnelWork) -> Result<(), String> {
+        self.compensations.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 }
 
@@ -376,6 +439,71 @@ fn cidr_overlap_is_normalized_and_active_lease_lives_until_disconnect() {
         .result
         .is_ok());
     assert!(!pool.reservations().is_reserved(&profile("a")));
+}
+
+#[test]
+fn pushed_openvpn_route_conflict_is_compensated_before_lease_promotion() {
+    let first = profile("openvpn-first");
+    let second = profile("openvpn-pushed-conflict");
+    let compensations = Arc::new(AtomicU64::new(0));
+    let pool = ProfileWorkerPool::new(
+        Arc::new(OpenVpnRouteExecutor {
+            pushed_conflict_profile: second.clone(),
+            compensations: Arc::clone(&compensations),
+        }),
+        2,
+        8,
+    );
+
+    let mut first_work = work(first.clone(), 1, 1, TunnelMutation::Connect);
+    first_work.protocol = TunnelKindTag::OpenVpn;
+    pool.dispatch(first_work, ["10.0.0.0/24".into()]).unwrap();
+    assert!(wait_until(Duration::from_secs(1), || pool.try_result())
+        .unwrap()
+        .result
+        .is_ok());
+
+    let mut second_work = work(second.clone(), 1, 2, TunnelMutation::Connect);
+    second_work.protocol = TunnelKindTag::OpenVpn;
+    pool.dispatch(second_work, ["10.1.0.0/24".into()]).unwrap();
+    let completion = wait_until(Duration::from_secs(1), || pool.try_result()).unwrap();
+
+    assert_eq!(completion.result, Err(WorkFailure::RouteConflict));
+    assert_eq!(compensations.load(Ordering::SeqCst), 1);
+    assert!(pool.reservations().active_lease(&first).is_some());
+    assert!(!pool.reservations().is_reserved(&second));
+}
+
+#[test]
+fn successful_openvpn_connect_retains_pushed_route_reservation() {
+    let target = profile("openvpn-pushed-route-owner");
+    let compensations = Arc::new(AtomicU64::new(0));
+    let pool = ProfileWorkerPool::new(
+        Arc::new(OpenVpnRouteExecutor {
+            pushed_conflict_profile: target.clone(),
+            compensations: Arc::clone(&compensations),
+        }),
+        2,
+        8,
+    );
+    let mut target_work = work(target.clone(), 1, 1, TunnelMutation::Connect);
+    target_work.protocol = TunnelKindTag::OpenVpn;
+    pool.dispatch(target_work, ["10.1.0.0/24".into()]).unwrap();
+    assert!(wait_until(Duration::from_secs(1), || pool.try_result())
+        .unwrap()
+        .result
+        .is_ok());
+
+    assert_eq!(
+        pool.dispatch(
+            work(profile("later-overlap"), 1, 2, TunnelMutation::Connect),
+            ["10.0.0.0/24".into()],
+        )
+        .unwrap_err(),
+        WorkFailure::RouteConflict
+    );
+    assert_eq!(compensations.load(Ordering::SeqCst), 0);
+    assert!(pool.reservations().active_lease(&target).is_some());
 }
 
 #[test]
@@ -1211,6 +1339,7 @@ struct TopologyCapture {
     pre_block: (Mutex<PreBlockGate>, Condvar),
     failed_final: Mutex<BTreeSet<u64>>,
     publish_readback: AtomicBool,
+    openvpn_evidence: Mutex<BTreeMap<ProfileId, OpenVpnRouteEvidence>>,
 }
 
 impl TopologyCapture {
@@ -1262,7 +1391,16 @@ impl TunnelExecutor for TopologyCapture {
             work.mutation,
             work.resource_revision.generation,
         ));
-        Ok(execution_receipt(work))
+        let receipt = execution_receipt(work);
+        Ok(self
+            .openvpn_evidence
+            .lock()
+            .unwrap()
+            .get(&work.profile_id)
+            .cloned()
+            .map_or(receipt.clone(), |routes| {
+                receipt.with_openvpn_routes(routes)
+            }))
     }
 }
 
@@ -1841,6 +1979,123 @@ async fn reconnect_teardown_waits_for_pre_block_and_final_policy_waits_for_obser
         "reconnect final policy did not wait for the connected observation",
     )
     .await;
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one end-to-end pre-block, tunnel receipt, observation, and final-policy proof"
+)]
+async fn openvpn_final_policy_is_sealed_from_current_generation_route_evidence() {
+    use vortix::vortix_core::state::killswitch::KillSwitchMode;
+
+    let target = profile("sealed-openvpn-routes");
+    let capture = Arc::new(TopologyCapture::default());
+    capture.openvpn_evidence.lock().unwrap().insert(
+        target.clone(),
+        openvpn_route_evidence(&["10.1.0.0/24"], &["10.2.0.0/24"]),
+    );
+    let supervisor = Arc::new(Supervisor::new(
+        AuthorityEpoch(1),
+        capture.clone(),
+        capture.clone(),
+        1,
+        8,
+    ));
+    let service = ControlService::start_supervised(
+        ControlServiceConfig {
+            authority_epoch: AuthorityEpoch(1),
+            known_profiles: BTreeSet::from([target.clone()]),
+            profile_topologies: BTreeMap::from([(
+                target.clone(),
+                ProfileTopology {
+                    protocol: Some(ProtocolKind::OpenVpn),
+                    routes: BTreeSet::from(["10.1.0.0/24".into()]),
+                    ..ProfileTopology::default()
+                },
+            )]),
+            initial_kill_switch_mode: KillSwitchMode::AlwaysOn,
+            freshness_poll_interval: Duration::from_millis(5),
+            ..ControlServiceConfig::default()
+        },
+        Arc::new(TestClock::default()),
+        ExecutionSelection::CanonicalAuthority,
+        supervisor,
+    );
+    let generation = service
+        .client()
+        .snapshot()
+        .desired
+        .generation
+        .saturating_add(1);
+    service
+        .client()
+        .submit(CommandRequest {
+            command: UserCommand::Connect {
+                profile_id: target.clone(),
+                conflict_acknowledgement: None,
+            },
+            idempotency_key: IdempotencyKey::new("seal-openvpn-routes"),
+            deadline: Deadline(1_000),
+        })
+        .await
+        .expect("OpenVPN connect admitted");
+
+    wait_for_condition(
+        || {
+            capture.policies.lock().unwrap().iter().any(|policy| {
+                policy.generation == generation && policy.stage == PolicyStage::PreTunnelBlocking
+            }) && capture.tunnel_calls.lock().unwrap().iter().any(
+                |(profile_id, mutation, call_generation)| {
+                    profile_id == &target
+                        && *mutation == TunnelMutation::Connect
+                        && *call_generation == generation
+                },
+            )
+        },
+        "OpenVPN pre-block and tunnel connect did not complete",
+    )
+    .await;
+    observe_connected(&service, &target, "tun-sealed-openvpn-routes").await;
+    wait_for_condition(
+        || {
+            capture
+                .policies
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|policy| policy.generation == generation && policy.stage == PolicyStage::Final)
+        },
+        "OpenVPN final policy was not submitted",
+    )
+    .await;
+
+    let policies = capture.policies.lock().unwrap();
+    let pre = policies
+        .iter()
+        .find(|policy| {
+            policy.generation == generation && policy.stage == PolicyStage::PreTunnelBlocking
+        })
+        .unwrap();
+    let final_policy = policies
+        .iter()
+        .find(|policy| policy.generation == generation && policy.stage == PolicyStage::Final)
+        .unwrap();
+    assert_eq!(
+        pre.target.routes[&target],
+        BTreeSet::from([RouteClaim::parse("10.1.0.0/24").unwrap()])
+    );
+    assert_eq!(
+        final_policy.target.routes[&target],
+        BTreeSet::from([
+            RouteClaim::parse("10.1.0.0/24").unwrap(),
+            RouteClaim::parse("10.2.0.0/24").unwrap(),
+        ])
+    );
+    assert_eq!(
+        final_policy.target.openvpn_routes.get(&target),
+        capture.openvpn_evidence.lock().unwrap().get(&target)
+    );
 }
 
 #[tokio::test]

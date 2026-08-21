@@ -23,6 +23,7 @@ use crate::vortix_process::{CommandSpec, PrivilegeReq};
 use tracing::{debug, info, warn};
 
 use crate::vortix_protocol_openvpn::parser::{forbidden_effective_directive, parse_ovpn_conf};
+use crate::vortix_protocol_openvpn::push::{latest_completed_push_reply, PushReplySelectionError};
 
 /// Quality of the DNS intent recovered from an `OpenVPN` session log.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -754,32 +755,22 @@ fn pushed_dns_evidence(
     mut request: crate::vortix_core::ports::dns::DnsRequest,
     log: &str,
 ) -> OvpnDnsEvidence {
-    const COMPLETED: &str = "Initialization Sequence Completed";
-    let Some(completed_at) = log.rfind(COMPLETED) else {
-        return OvpnDnsEvidence::Unavailable {
-            configured: request,
-            reason: "OpenVPN log has no completed negotiation marker".into(),
-        };
+    let push_reply = match latest_completed_push_reply(log) {
+        Ok(Some(push_reply)) => push_reply,
+        Ok(None) => return OvpnDnsEvidence::ExplicitlyEmpty(request),
+        Err(PushReplySelectionError::NoCompletedNegotiation) => {
+            return OvpnDnsEvidence::Unavailable {
+                configured: request,
+                reason: "OpenVPN log has no completed negotiation marker".into(),
+            };
+        }
+        Err(PushReplySelectionError::NewerIncompleteNegotiation) => {
+            return OvpnDnsEvidence::Unavailable {
+                configured: request,
+                reason: "OpenVPN log contains a newer incomplete negotiation".into(),
+            };
+        }
     };
-    if log[completed_at + COMPLETED.len()..].contains("PUSH_REPLY") {
-        return OvpnDnsEvidence::Unavailable {
-            configured: request,
-            reason: "OpenVPN log contains a newer incomplete negotiation".into(),
-        };
-    }
-    let completed_log = &log[..completed_at];
-    let session_start = completed_log
-        .rfind(COMPLETED)
-        .map_or(0, |previous| previous + COMPLETED.len());
-    let session_log = &completed_log[session_start..];
-    let Some(push_at) = session_log.rfind("PUSH_REPLY") else {
-        return OvpnDnsEvidence::ExplicitlyEmpty(request);
-    };
-
-    let push_reply = session_log[push_at + "PUSH_REPLY".len()..]
-        .lines()
-        .next()
-        .unwrap_or_default();
     let mut observed = false;
     for option in push_reply.split(',') {
         let option = option.trim().trim_matches('\'');

@@ -846,7 +846,7 @@ impl crate::vortix_core::control::worker::TunnelExecutor for CanonicalTunnelExec
         }
     }
 
-    fn compensate_late_success(
+    fn compensate_unaccepted_success(
         &self,
         work: &crate::vortix_core::control::worker::TunnelWork,
     ) -> Result<(), String> {
@@ -875,7 +875,7 @@ impl crate::vortix_core::control::worker::TunnelExecutor for CanonicalTunnelExec
         &self,
         work: &crate::vortix_core::control::worker::TunnelWork,
     ) -> Result<(), String> {
-        self.compensate_late_success(work)
+        self.compensate_unaccepted_success(work)
     }
 }
 

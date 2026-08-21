@@ -13,10 +13,12 @@ use std::time::{Duration, Instant};
 
 use crate::vortix_core::cidr::Cidr;
 use crate::vortix_core::control::model::{AuthorityEpoch, OperationId, PolicyDigest};
+use crate::vortix_core::ports::owned_routes::canonical_route_destination;
 pub use crate::vortix_core::ports::tunnel::TunnelCancellation as CancellationToken;
 use crate::vortix_core::ports::tunnel::{
     AdoptionEvidence, HandshakeEvidence, ProbeReceipt, TunnelKindTag,
 };
+use crate::vortix_core::privileged::OpenVpnRouteEvidence;
 use crate::vortix_core::profile::ProfileId;
 use crate::vortix_core::state::killswitch::KillSwitchMode;
 
@@ -88,6 +90,7 @@ pub struct TunnelWorkResult {
     /// connect call. Scanner presence alone can never manufacture this.
     pub adoption: Option<AdoptionEvidence>,
     pub handshake: Option<HandshakeEvidence>,
+    pub openvpn_routes: Option<OpenVpnRouteEvidence>,
     pub probe_receipts: Vec<ProbeReceipt>,
     pub result: Result<(), WorkFailure>,
 }
@@ -96,6 +99,7 @@ pub struct TunnelWorkResult {
 pub struct TunnelExecutionReceipt {
     pub adoption: Option<AdoptionEvidence>,
     pub handshake: Option<HandshakeEvidence>,
+    pub openvpn_routes: Option<OpenVpnRouteEvidence>,
     pub probe_receipts: Vec<ProbeReceipt>,
 }
 
@@ -112,6 +116,7 @@ impl TunnelExecutionReceipt {
             .map(|adoption| Self {
                 adoption: Some(adoption),
                 handshake: None,
+                openvpn_routes: None,
                 probe_receipts: Vec::new(),
             })
             .map_err(|error| error.to_string())
@@ -135,6 +140,7 @@ impl TunnelExecutionReceipt {
         .map(|adoption| Self {
             adoption: Some(adoption),
             handshake: Some(handshake),
+            openvpn_routes: None,
             probe_receipts: Vec::new(),
         })
         .map_err(|error| error.to_string())
@@ -143,6 +149,12 @@ impl TunnelExecutionReceipt {
     #[must_use]
     pub fn with_probe_receipts(mut self, receipts: Vec<ProbeReceipt>) -> Self {
         self.probe_receipts = receipts;
+        self
+    }
+
+    #[must_use]
+    pub fn with_openvpn_routes(mut self, routes: OpenVpnRouteEvidence) -> Self {
+        self.openvpn_routes = Some(routes);
         self
     }
 }
@@ -160,9 +172,9 @@ pub trait TunnelExecutor: Send + Sync + 'static {
         WorkFailure::EffectFailed
     }
 
-    /// Compensate a successful effect that lost the final cancellation or
-    /// deadline race before its receipt could be accepted.
-    fn compensate_late_success(&self, _work: &TunnelWork) -> Result<(), String> {
+    /// Compensate a successful effect whose receipt cannot be accepted due to
+    /// a late cancellation, deadline, or post-effect reservation conflict.
+    fn compensate_unaccepted_success(&self, _work: &TunnelWork) -> Result<(), String> {
         Ok(())
     }
 
@@ -185,24 +197,15 @@ impl RouteClaim {
     /// Parse and normalize a route claim.
     pub fn parse(value: &str) -> Result<Self, WorkFailure> {
         let cidr: Cidr = value.parse().map_err(|_| WorkFailure::RouteConflict)?;
-        let network = match cidr.addr {
-            std::net::IpAddr::V4(addr) => {
-                let mask = u32::MAX
-                    .checked_shl(u32::from(32 - cidr.prefix_len))
-                    .unwrap_or(0);
-                std::net::IpAddr::V4((u32::from(addr) & mask).into())
-            }
-            std::net::IpAddr::V6(addr) => {
-                let mask = u128::MAX
-                    .checked_shl(u32::from(128 - cidr.prefix_len))
-                    .unwrap_or(0);
-                std::net::IpAddr::V6((u128::from(addr) & mask).into())
-            }
-        };
-        Ok(Self {
-            network,
+        Ok(Self::from_cidr(cidr))
+    }
+
+    fn from_cidr(cidr: Cidr) -> Self {
+        let cidr = canonical_route_destination(cidr);
+        Self {
+            network: cidr.addr,
             prefix_len: cidr.prefix_len,
-        })
+        }
     }
 
     #[must_use]
@@ -295,14 +298,7 @@ impl ReservationBook {
             .map(|route| RouteClaim::parse(&route))
             .collect::<Result<BTreeSet<_>, _>>()?;
         let mut state = self.0.lock().expect("reservation mutex poisoned");
-        if state.leases.values().any(|lease| {
-            lease.profile_id != *profile_id
-                && lease
-                    .routes
-                    .iter()
-                    .any(|existing| routes.iter().any(|route| existing.overlaps(*route)))
-                && !acknowledges_peer(acknowledgement, &lease.profile_id, profile_id)
-        }) {
+        if has_route_conflict(&state, profile_id, &routes, None, acknowledgement) {
             return Err(WorkFailure::RouteConflict);
         }
         if let Some((lease_id, lease)) = state
@@ -404,6 +400,54 @@ impl ReservationBook {
             }
         }
     }
+
+    fn refine_routes(
+        &self,
+        lease_id: LeaseId,
+        routes: &BTreeSet<RouteClaim>,
+    ) -> Result<(), WorkFailure> {
+        let mut state = self.0.lock().expect("reservation mutex poisoned");
+        let lease = state.leases.get(&lease_id).ok_or(WorkFailure::Stale)?;
+        if lease.ambiguous {
+            return Err(WorkFailure::Busy);
+        }
+        let profile_id = lease.profile_id.clone();
+        let additional = routes
+            .difference(&lease.routes)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if additional.is_empty() {
+            return Ok(());
+        }
+        if has_route_conflict(&state, &profile_id, &additional, Some(lease_id), None) {
+            return Err(WorkFailure::RouteConflict);
+        }
+        state
+            .leases
+            .get_mut(&lease_id)
+            .expect("lease identity checked")
+            .routes
+            .extend(additional);
+        Ok(())
+    }
+}
+
+fn has_route_conflict(
+    state: &Reservations,
+    profile_id: &ProfileId,
+    routes: &BTreeSet<RouteClaim>,
+    excluded: Option<LeaseId>,
+    acknowledgement: Option<&crate::vortix_core::engine::registry::Conflict>,
+) -> bool {
+    state.leases.iter().any(|(lease_id, lease)| {
+        Some(*lease_id) != excluded
+            && lease.profile_id != *profile_id
+            && lease
+                .routes
+                .iter()
+                .any(|existing| routes.iter().any(|route| existing.overlaps(*route)))
+            && !acknowledges_peer(acknowledgement, &lease.profile_id, profile_id)
+    })
 }
 
 fn acknowledges_peer(
@@ -434,6 +478,10 @@ impl Reservation {
     #[must_use]
     pub const fn lease_id(&self) -> LeaseId {
         self.lease_id
+    }
+
+    fn refine_routes(&self, routes: &BTreeSet<RouteClaim>) -> Result<(), WorkFailure> {
+        self.book.refine_routes(self.lease_id, routes)
     }
 
     fn finish(mut self, mutation: TunnelMutation, result: Result<(), WorkFailure>) {
@@ -820,12 +868,20 @@ fn spawn_profile_worker(
                     .lock()
                     .expect("active mutex poisoned")
                     .remove(&work.profile_id);
-                let lease_id = envelope.reservation.lease_id();
+                let reservation = envelope.reservation;
+                let execution =
+                    refine_openvpn_reservation(&executor, &work, &reservation, execution);
+                let lease_id = reservation.lease_id();
                 let result = execution.as_ref().map(|_| ()).map_err(|error| *error);
-                envelope.reservation.finish(work.mutation, result);
-                let (adoption, handshake, probe_receipts) = execution
-                    .map_or((None, None, Vec::new()), |receipt| {
-                        (receipt.adoption, receipt.handshake, receipt.probe_receipts)
+                reservation.finish(work.mutation, result);
+                let (adoption, handshake, openvpn_routes, probe_receipts) =
+                    execution.map_or((None, None, None, Vec::new()), |receipt| {
+                        (
+                            receipt.adoption,
+                            receipt.handshake,
+                            receipt.openvpn_routes,
+                            receipt.probe_receipts,
+                        )
                     });
                 let completion = TunnelWorkResult {
                     profile_id: work.profile_id,
@@ -835,6 +891,7 @@ fn spawn_profile_worker(
                     mutation: work.mutation,
                     adoption,
                     handshake,
+                    openvpn_routes,
                     probe_receipts,
                     result,
                 };
@@ -853,6 +910,63 @@ fn spawn_profile_worker(
         join: Some(join),
         last_used: Instant::now(),
     }
+}
+
+fn refine_openvpn_reservation(
+    executor: &Arc<dyn TunnelExecutor>,
+    work: &TunnelWork,
+    reservation: &Reservation,
+    execution: Result<TunnelExecutionReceipt, WorkFailure>,
+) -> Result<TunnelExecutionReceipt, WorkFailure> {
+    let receipt = execution?;
+    if work.mutation != TunnelMutation::Connect || work.protocol != TunnelKindTag::OpenVpn {
+        return Ok(receipt);
+    }
+    let Some(evidence) = receipt.openvpn_routes.as_ref() else {
+        // Standard mode preserves its local configured-route contract until
+        // helper-backed OpenVPN activation makes authenticated evidence
+        // mandatory for this executor path.
+        return Ok(receipt);
+    };
+    let claims = openvpn_route_claims(evidence);
+    if let Err(failure) = reservation.refine_routes(&claims) {
+        return match executor.compensate_unaccepted_success(work) {
+            Ok(()) => Err(failure),
+            Err(_) => Err(WorkFailure::OutcomeUnknown),
+        };
+    }
+    Ok(receipt)
+}
+
+pub(crate) fn openvpn_route_claims(evidence: &OpenVpnRouteEvidence) -> BTreeSet<RouteClaim> {
+    let mut claims = evidence
+        .configured()
+        .routes()
+        .iter()
+        .chain(evidence.pushed().routes())
+        .map(|route| RouteClaim::from_cidr(route.destination()))
+        .collect::<BTreeSet<_>>();
+    for redirect in [
+        evidence.configured().redirect_gateway(),
+        evidence.pushed().redirect_gateway(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if redirect.ipv4() {
+            claims.insert(RouteClaim::from_cidr(
+                Cidr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0)
+                    .expect("IPv4 default route is valid"),
+            ));
+        }
+        if redirect.ipv6() {
+            claims.insert(RouteClaim::from_cidr(
+                Cidr::new(std::net::Ipv6Addr::UNSPECIFIED.into(), 0)
+                    .expect("IPv6 default route is valid"),
+            ));
+        }
+    }
+    claims
 }
 
 fn run_tunnel_effect(
@@ -879,13 +993,13 @@ fn run_tunnel_effect(
             }
         };
     if stopping.load(Ordering::Acquire) || cancellation.is_cancelled() {
-        return match executor.compensate_late_success(work) {
+        return match executor.compensate_unaccepted_success(work) {
             Ok(()) => Err(WorkFailure::Cancelled),
             Err(_) => Err(WorkFailure::OutcomeUnknown),
         };
     }
     if Instant::now() >= work.deadline {
-        return match executor.compensate_late_success(work) {
+        return match executor.compensate_unaccepted_success(work) {
             Ok(()) => Err(WorkFailure::TimedOut),
             Err(_) => Err(WorkFailure::OutcomeUnknown),
         };
@@ -956,8 +1070,14 @@ pub enum TopologyTransitionKind {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TopologyState {
     pub profiles: BTreeSet<ProfileId>,
+    /// Exact protocol identity for each profile in this topology snapshot.
+    pub protocols: BTreeMap<ProfileId, crate::vortix_core::profile::ProtocolKind>,
     pub interfaces: BTreeMap<ProfileId, String>,
     pub routes: BTreeMap<ProfileId, BTreeSet<RouteClaim>>,
+    /// Complete authenticated configured/pushed `OpenVPN` route vocabulary
+    /// for the current tunnel generation. CIDR claims remain the admission
+    /// index; this evidence is the mutation contract.
+    pub openvpn_routes: BTreeMap<ProfileId, OpenVpnRouteEvidence>,
     pub server_ips: BTreeMap<ProfileId, BTreeSet<std::net::IpAddr>>,
     pub dns_requests: BTreeMap<ProfileId, crate::vortix_core::ports::dns::DnsRequest>,
     pub dns_digest: PolicyDigest,

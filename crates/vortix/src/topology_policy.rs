@@ -22,6 +22,7 @@ use crate::vortix_core::ports::dns::{
 use crate::vortix_core::ports::killswitch::ActiveTunnelInfo;
 use crate::vortix_core::ports::route_table::DefaultRouteObservation;
 use crate::vortix_core::ports::tunnel::ParsedProfile as _;
+use crate::vortix_core::privileged::OpenVpnRedirectGateway;
 use crate::vortix_core::profile::ProfileId;
 use crate::vortix_core::profile::ResolvedEndpoint;
 use crate::vortix_core::state::killswitch::{KillSwitchMode, KillSwitchState};
@@ -64,7 +65,11 @@ pub(crate) fn declared_routes(protocol: Protocol, config_path: &std::path::Path)
                         Cidr::new(route.destination.addr, route.destination.prefix_len)
                     })
                     .collect::<Vec<_>>();
-                if parsed.redirect_gateway {
+                if parsed
+                    .redirect_gateway
+                    .as_ref()
+                    .is_some_and(OpenVpnRedirectGateway::ipv4)
+                {
                     routes.push(
                         Cidr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0)
                             .expect("zero prefix is valid"),
@@ -320,7 +325,11 @@ fn build_topology_for_profile(
         Protocol::OpenVPN => {
             let parsed = crate::vortix_protocol_openvpn::parser::parse_ovpn_conf(body)
                 .map_err(|error| error.to_string())?;
-            if parsed.redirect_gateway {
+            if parsed
+                .redirect_gateway
+                .as_ref()
+                .is_some_and(OpenVpnRedirectGateway::ipv4)
+            {
                 routes.insert("0.0.0.0/0".into());
             }
             routes.extend(parsed.routes.iter().map(|route| {

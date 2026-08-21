@@ -672,6 +672,9 @@ mod tests {
             .then(|| {
                 Box::new(super::super::HelperPolicyInventory::new(None, None, Vec::new()).unwrap())
             });
+        let released_resources = enabled_capabilities
+            .contains(&HelperCapability::Observe)
+            .then(|| Box::new(super::super::HelperReleasedInventory::new(Vec::new()).unwrap()));
         HelperServerHello {
             product: "vortix-helper".into(),
             product_version: env!("CARGO_PKG_VERSION").into(),
@@ -686,6 +689,7 @@ mod tests {
                 next_sequence,
             )),
             policy_inventory,
+            released_resources,
         }
     }
 
@@ -960,6 +964,7 @@ mod tests {
                 vec![HelperCapability::Handshake, HelperCapability::Observe],
             );
             hello.schema = 4;
+            hello.released_resources = None;
             write_response(
                 &mut server_stream,
                 &HelperResponse {
@@ -1353,6 +1358,7 @@ mod tests {
                             HelperEpoch::new(8).unwrap(),
                         )),
                         policy_inventory: None,
+                        released_resources: None,
                     })),
                 },
             )
@@ -1407,6 +1413,7 @@ mod tests {
                             HelperEpoch::new(8).unwrap(),
                         )),
                         policy_inventory: None,
+                        released_resources: None,
                     })),
                 },
             )

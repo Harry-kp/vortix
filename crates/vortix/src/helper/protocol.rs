@@ -7,17 +7,22 @@ use crate::vortix_core::control::AuthorityEpoch;
 use crate::vortix_core::ipc::frame::{decode_frame_bounded, encode_frame_bounded};
 use crate::vortix_core::ipc::{CompatibilityRange, FrameError};
 use crate::vortix_core::privileged::{
-    has_duplicates, AuthorityBinding, BoundedVec, HelperEpoch, HelperResourceState, LeaseId,
-    PolicyDigest, PolicyPhase, PolicyPredecessor, PrivilegedOperation, PrivilegedRequest,
-    RequestSequence, ResourceKind, ResourceTag, ServiceInstanceClaim, MAX_RESOURCE_ITEMS,
+    has_duplicates, released_identity_set_is_invalid, AuthorityBinding, BoundedVec, HelperEpoch,
+    HelperResourceState, LeaseId, PolicyDigest, PolicyPhase, PolicyPredecessor,
+    PrivilegedOperation, PrivilegedRequest, RequestSequence, ResourceKind, ResourceTag,
+    ServiceInstanceClaim, MAX_RESOURCE_ITEMS,
 };
 
 pub const HELPER_PROTOCOL_MIN: u16 = 1;
 pub const HELPER_PROTOCOL_MAX: u16 = 1;
 pub const HELPER_SCHEMA_MIN: u16 = 3;
-pub const HELPER_SCHEMA_MAX: u16 = 7;
+pub const HELPER_SCHEMA_MAX: u16 = 13;
 pub(crate) const MANAGED_OBSERVATION_SCHEMA_MIN: u16 = 5;
 pub(crate) const FIREWALL_BASELINE_SCHEMA_MIN: u16 = 7;
+pub(crate) const EXACT_RELEASE_SCHEMA_MIN: u16 = 8;
+pub(crate) const POLICY_AUDIT_SCHEMA_MIN: u16 = 9;
+pub(crate) const RELEASE_ACK_SCHEMA_MIN: u16 = 10;
+pub(crate) const OPENVPN_GATEWAY_EVIDENCE_SCHEMA_MIN: u16 = 13;
 pub const MAX_HELPER_FRAME_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,8 +49,33 @@ pub(crate) const fn capability_for_operation(operation: &PrivilegedOperation) ->
     operation_contract(operation).0
 }
 
-pub(crate) const fn minimum_schema_for_operation(operation: &PrivilegedOperation) -> u16 {
-    operation_contract(operation).1
+pub(crate) fn minimum_schema_for_operation(operation: &PrivilegedOperation) -> u16 {
+    match operation {
+        PrivilegedOperation::StartTunnel(
+            crate::vortix_core::privileged::ProtocolPlan::OpenVpn(_),
+        ) => OPENVPN_GATEWAY_EVIDENCE_SCHEMA_MIN,
+        PrivilegedOperation::ObserveManaged(targets)
+            if targets.iter().any(|target| {
+                target.protocol() == Some(crate::vortix_core::profile::ProtocolKind::OpenVpn)
+            }) =>
+        {
+            OPENVPN_GATEWAY_EVIDENCE_SCHEMA_MIN
+        }
+        PrivilegedOperation::NetworkPolicy(
+            crate::vortix_core::privileged::NetworkPolicyOperation::ApplyRoutes {
+                routes,
+                redirects,
+                ..
+            },
+        ) if !redirects.is_empty()
+            || routes.iter().any(|route| {
+                route.origin() != crate::vortix_core::privileged::ScopedRouteOrigin::WireGuard
+            }) =>
+        {
+            OPENVPN_GATEWAY_EVIDENCE_SCHEMA_MIN
+        }
+        _ => operation_contract(operation).1,
+    }
 }
 
 const fn operation_contract(operation: &PrivilegedOperation) -> (HelperCapability, u16) {
@@ -53,6 +83,12 @@ const fn operation_contract(operation: &PrivilegedOperation) -> (HelperCapabilit
         PrivilegedOperation::StartTunnel(_) | PrivilegedOperation::StopTunnel(_) => {
             (HelperCapability::TunnelLifecycle, HELPER_SCHEMA_MIN)
         }
+        PrivilegedOperation::NetworkPolicy(
+            crate::vortix_core::privileged::NetworkPolicyOperation::ReleaseObsolete {
+                retained_state: crate::vortix_core::privileged::ObservationState::Absent,
+                ..
+            },
+        ) => (HelperCapability::NetworkPolicy, EXACT_RELEASE_SCHEMA_MIN),
         PrivilegedOperation::NetworkPolicy(
             crate::vortix_core::privileged::NetworkPolicyOperation::EstablishFirewall { .. },
         ) => (
@@ -65,6 +101,15 @@ const fn operation_contract(operation: &PrivilegedOperation) -> (HelperCapabilit
         PrivilegedOperation::Observe(_) => (HelperCapability::Observe, HELPER_SCHEMA_MIN),
         PrivilegedOperation::ObserveManaged(_) => {
             (HelperCapability::Observe, MANAGED_OBSERVATION_SCHEMA_MIN)
+        }
+        PrivilegedOperation::ObserveManagedAbsence(_) => {
+            (HelperCapability::Observe, EXACT_RELEASE_SCHEMA_MIN)
+        }
+        PrivilegedOperation::AcknowledgeReleased(_) => {
+            (HelperCapability::Observe, RELEASE_ACK_SCHEMA_MIN)
+        }
+        PrivilegedOperation::AuditPolicy(_) => {
+            (HelperCapability::NetworkPolicy, POLICY_AUDIT_SCHEMA_MIN)
         }
         PrivilegedOperation::CleanupOwned(_) => (HelperCapability::CleanupOwned, HELPER_SCHEMA_MIN),
     }
@@ -128,6 +173,51 @@ pub struct HelperServerHello {
     pub session: Option<HelperSessionBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_inventory: Option<Box<HelperPolicyInventory>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub released_resources: Option<Box<HelperReleasedInventory>>,
+}
+
+/// Exact released tunnel identities retained by the root ledger. The daemon
+/// uses this authenticated inventory to resume acknowledgement after a crash;
+/// it is not live kernel evidence by itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HelperReleasedInventory {
+    resources: Vec<ResourceTag>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HelperReleasedInventoryWire {
+    resources: BoundedVec<ResourceTag, MAX_RESOURCE_ITEMS>,
+}
+
+impl<'de> Deserialize<'de> for HelperReleasedInventory {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = HelperReleasedInventoryWire::deserialize(deserializer)?;
+        Self::new(wire.resources.into_vec()).map_err(serde::de::Error::custom)
+    }
+}
+
+impl HelperReleasedInventory {
+    pub(crate) fn new(resources: Vec<ResourceTag>) -> Result<Self, &'static str> {
+        if resources.len() > MAX_RESOURCE_ITEMS
+            || released_identity_set_is_invalid(&resources)
+            || resources
+                .iter()
+                .any(|resource| resource.authority_epoch().is_some())
+        {
+            return Err("invalid released helper inventory");
+        }
+        Ok(Self { resources })
+    }
+
+    #[must_use]
+    pub(crate) fn resources(&self) -> &[ResourceTag] {
+        &self.resources
+    }
 }
 
 /// Authenticated root-ledger policy state returned only by an enrolled
@@ -394,8 +484,8 @@ impl HelperSessionBinding {
                 authority.lease_id(),
                 helper_epoch,
             ),
-            4..=7 => Self::v4(authority, helper_epoch, next_sequence),
-            _ => unreachable!("negotiation accepts only helper schemas 3 through 7"),
+            4..=HELPER_SCHEMA_MAX => Self::v4(authority, helper_epoch, next_sequence),
+            _ => unreachable!("negotiation accepts only supported helper schemas"),
         }
     }
 
@@ -624,6 +714,7 @@ fn negotiate_common(
         enabled_capabilities: enabled_capabilities.to_vec(),
         session: None,
         policy_inventory: None,
+        released_resources: None,
     })
 }
 
@@ -668,6 +759,7 @@ mod tests {
     use crate::vortix_core::privileged::{
         BootScope, LeaseId, OperationDigest, ServiceInstanceClaim,
     };
+    use crate::vortix_core::profile::{ProfileId, ProtocolKind};
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(rename_all = "snake_case")]
@@ -739,7 +831,7 @@ mod tests {
         let hello = HelperClientHello::current(501, service(), vec![HelperCapability::Handshake]);
         let encoded = serde_json::to_vec(&hello).unwrap();
         let legacy: V3ClientHello = serde_json::from_slice(&encoded).unwrap();
-        assert_eq!(legacy.schema, CompatibilityRange { min: 3, max: 7 });
+        assert_eq!(legacy.schema, CompatibilityRange { min: 3, max: 13 });
         assert!(!serde_json::to_value(hello)
             .unwrap()
             .as_object()
@@ -794,7 +886,7 @@ mod tests {
     }
 
     #[test]
-    fn new_peers_negotiate_v7_full_authority_and_replay_cursor() {
+    fn new_peers_negotiate_v13_full_authority_and_replay_cursor() {
         let hello = HelperClientHello::current(501, service(), vec![HelperCapability::Handshake]);
         let response = negotiate_enrolled(
             &hello,
@@ -804,7 +896,7 @@ mod tests {
             &STAGED_CAPABILITIES,
         )
         .unwrap();
-        assert_eq!(response.schema, 7);
+        assert_eq!(response.schema, 13);
         let encoded = serde_json::to_vec(&response).unwrap();
         let decoded: HelperServerHello = serde_json::from_slice(&encoded).unwrap();
         let binding = decoded.session.unwrap();
@@ -818,7 +910,7 @@ mod tests {
     }
 
     #[test]
-    fn nonblocking_firewall_baseline_requires_schema_seven() {
+    fn exact_nonblocking_baseline_and_exact_release_have_distinct_schema_floors() {
         let policy = ResourceTag::topology(AuthorityEpoch(3), 1, ResourceKind::Firewall).unwrap();
         let baseline = PrivilegedOperation::NetworkPolicy(
             crate::vortix_core::privileged::NetworkPolicyOperation::EstablishFirewall {
@@ -833,9 +925,161 @@ mod tests {
                 tunnels: Vec::new(),
             },
         );
+        let release = PrivilegedOperation::NetworkPolicy(
+            crate::vortix_core::privileged::NetworkPolicyOperation::ReleaseObsolete {
+                policy: ResourceTag::topology(AuthorityEpoch(3), 2, ResourceKind::Firewall)
+                    .unwrap(),
+                resources: vec![ResourceTag::topology(
+                    AuthorityEpoch(3),
+                    1,
+                    ResourceKind::Firewall,
+                )
+                .unwrap()],
+                predecessor: crate::vortix_core::privileged::PolicyPredecessor::for_test(
+                    crate::vortix_core::privileged::PolicyDigest::for_test(
+                        OperationDigest::of_bytes(b"policy"),
+                    ),
+                    crate::vortix_core::privileged::PolicyPhase::Firewall,
+                ),
+                retained_state: crate::vortix_core::privileged::ObservationState::Absent,
+            },
+        );
+        let legacy_release = PrivilegedOperation::NetworkPolicy(
+            crate::vortix_core::privileged::NetworkPolicyOperation::ReleaseObsolete {
+                policy: ResourceTag::topology(AuthorityEpoch(3), 2, ResourceKind::Firewall)
+                    .unwrap(),
+                resources: vec![ResourceTag::topology(
+                    AuthorityEpoch(3),
+                    1,
+                    ResourceKind::Firewall,
+                )
+                .unwrap()],
+                predecessor: crate::vortix_core::privileged::PolicyPredecessor::for_test(
+                    crate::vortix_core::privileged::PolicyDigest::for_test(
+                        OperationDigest::of_bytes(b"legacy-policy"),
+                    ),
+                    crate::vortix_core::privileged::PolicyPhase::Firewall,
+                ),
+                retained_state: crate::vortix_core::privileged::ObservationState::Present,
+            },
+        );
+        let audit = PrivilegedOperation::AuditPolicy(
+            ResourceTag::topology(AuthorityEpoch(3), 2, ResourceKind::Routes).unwrap(),
+        );
 
         assert_eq!(minimum_schema_for_operation(&baseline), 7);
         assert_eq!(minimum_schema_for_operation(&blocking), HELPER_SCHEMA_MIN);
+        assert_eq!(minimum_schema_for_operation(&release), 8);
+        assert_eq!(
+            minimum_schema_for_operation(&legacy_release),
+            HELPER_SCHEMA_MIN
+        );
+        assert_eq!(minimum_schema_for_operation(&audit), 9);
+        let acknowledge = PrivilegedOperation::AcknowledgeReleased(vec![
+            crate::vortix_core::privileged::ResourceObservationTarget::new(
+                ResourceTag::tunnel(ProfileId::parse("a".repeat(64)).unwrap(), 1).unwrap(),
+                Some(ProtocolKind::WireGuard),
+            )
+            .unwrap(),
+        ]);
+        assert_eq!(minimum_schema_for_operation(&acknowledge), 10);
+        assert_eq!(HELPER_SCHEMA_MAX, 13);
+
+        let PrivilegedOperation::NetworkPolicy(release) = release else {
+            unreachable!();
+        };
+        let mut legacy_wire = serde_json::to_value(release).unwrap();
+        legacy_wire
+            .as_object_mut()
+            .unwrap()
+            .remove("retained_state");
+        let decoded = serde_json::from_value::<
+            crate::vortix_core::privileged::NetworkPolicyOperation,
+        >(legacy_wire)
+        .unwrap();
+        assert!(matches!(
+            decoded,
+            crate::vortix_core::privileged::NetworkPolicyOperation::ReleaseObsolete {
+                retained_state: crate::vortix_core::privileged::ObservationState::Present,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn semantic_openvpn_routes_require_schema_thirteen_without_narrowing_wireguard() {
+        let route_policy =
+            ResourceTag::topology(AuthorityEpoch(3), 2, ResourceKind::Routes).unwrap();
+        let tunnel = ResourceTag::tunnel(ProfileId::parse("b".repeat(64)).unwrap(), 2).unwrap();
+        let predecessor = crate::vortix_core::privileged::PolicyPredecessor::for_test(
+            crate::vortix_core::privileged::PolicyDigest::for_test(OperationDigest::of_bytes(
+                b"route-policy",
+            )),
+            crate::vortix_core::privileged::PolicyPhase::Blocking,
+        );
+        let legacy_wireguard_route = PrivilegedOperation::NetworkPolicy(
+            crate::vortix_core::privileged::NetworkPolicyOperation::ApplyRoutes {
+                policy: route_policy.clone(),
+                routes: vec![crate::vortix_core::privileged::ScopedRoute::new(
+                    "10.0.0.0/8".parse().unwrap(),
+                    tunnel.clone(),
+                )
+                .unwrap()],
+                redirects: Vec::new(),
+                predecessor,
+            },
+        );
+        let semantic_openvpn_route = PrivilegedOperation::NetworkPolicy(
+            crate::vortix_core::privileged::NetworkPolicyOperation::ApplyRoutes {
+                policy: route_policy,
+                routes: vec![crate::vortix_core::privileged::ScopedRoute::openvpn(
+                    crate::vortix_core::privileged::OpenVpnRoute::with_gateway(
+                        "10.0.0.0/8".parse().unwrap(),
+                        crate::vortix_core::privileged::OpenVpnRouteGateway::VpnDefault,
+                        Some(7),
+                    )
+                    .unwrap(),
+                    tunnel,
+                    crate::vortix_core::privileged::ScopedRouteOrigin::OpenVpnPushed,
+                    crate::vortix_core::privileged::OpenVpnRouteDefaults::default(),
+                )
+                .unwrap()],
+                redirects: Vec::new(),
+                predecessor,
+            },
+        );
+
+        assert_eq!(
+            minimum_schema_for_operation(&legacy_wireguard_route),
+            HELPER_SCHEMA_MIN
+        );
+        assert_eq!(
+            minimum_schema_for_operation(&semantic_openvpn_route),
+            OPENVPN_GATEWAY_EVIDENCE_SCHEMA_MIN
+        );
+    }
+
+    #[test]
+    fn managed_openvpn_gateway_truth_requires_schema_thirteen() {
+        let target = |seed: &str, protocol| {
+            crate::vortix_core::privileged::ResourceObservationTarget::new(
+                ResourceTag::tunnel(ProfileId::parse(seed.repeat(64)).unwrap(), 1).unwrap(),
+                Some(protocol),
+            )
+            .unwrap()
+        };
+        let wireguard =
+            PrivilegedOperation::ObserveManaged(vec![target("b", ProtocolKind::WireGuard)]);
+        let openvpn = PrivilegedOperation::ObserveManaged(vec![target("c", ProtocolKind::OpenVpn)]);
+
+        assert_eq!(
+            minimum_schema_for_operation(&wireguard),
+            MANAGED_OBSERVATION_SCHEMA_MIN
+        );
+        assert_eq!(
+            minimum_schema_for_operation(&openvpn),
+            OPENVPN_GATEWAY_EVIDENCE_SCHEMA_MIN
+        );
     }
 
     #[test]
@@ -884,6 +1128,24 @@ mod tests {
         assert!(
             HelperPolicyResource::new(firewall, HelperResourceState::Owned, digest, None,).is_err()
         );
+    }
+
+    #[test]
+    fn released_inventory_requires_a_closed_tunnel_identity_set() {
+        let profile = ProfileId::parse("a".repeat(ProfileId::HEX_LEN)).unwrap();
+        let tunnel = ResourceTag::tunnel(profile.clone(), 4).unwrap();
+        let group = ResourceTag::profile(profile, 4, ResourceKind::ProcessGroup).unwrap();
+        let newer_tunnel = ResourceTag::tunnel(tunnel.profile_id().unwrap().clone(), 5).unwrap();
+
+        assert!(HelperReleasedInventory::new(vec![group.clone()]).is_err());
+        assert!(HelperReleasedInventory::new(vec![tunnel.clone(), group]).is_ok());
+        assert!(HelperReleasedInventory::new(vec![tunnel.clone(), tunnel]).is_err());
+        assert!(HelperReleasedInventory::new(vec![
+            newer_tunnel,
+            ResourceTag::tunnel(ProfileId::parse("a".repeat(ProfileId::HEX_LEN)).unwrap(), 4,)
+                .unwrap()
+        ])
+        .is_err());
     }
 
     #[test]

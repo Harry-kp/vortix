@@ -190,7 +190,7 @@ impl TunnelExecutor for LateCancellation {
         receipt
     }
 
-    fn compensate_late_success(&self, _: &TunnelWork) -> Result<(), String> {
+    fn compensate_unaccepted_success(&self, _: &TunnelWork) -> Result<(), String> {
         self.compensated.store(true, Ordering::Release);
         Ok(())
     }

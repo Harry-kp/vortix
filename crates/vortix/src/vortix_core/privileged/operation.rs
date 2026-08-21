@@ -9,7 +9,10 @@ use thiserror::Error;
 
 use crate::vortix_core::cidr::Cidr;
 use crate::vortix_core::control::AuthorityEpoch;
-use crate::vortix_core::privileged::protocol_plan::{DnsHostname, ProtocolPlan};
+use crate::vortix_core::privileged::protocol_plan::{
+    DnsHostname, OpenVpnRedirectFlag, OpenVpnRedirectGateway, OpenVpnRoute, OpenVpnRouteDefaults,
+    OpenVpnRouteGateway, ProtocolPlan,
+};
 use crate::vortix_core::privileged::receipt::{ObservationState, VerifiedReceipt};
 use crate::vortix_core::privileged::resource::{
     ResourceKind, ResourceObservationTarget, ResourceTag,
@@ -730,7 +733,7 @@ impl PolicyDigest {
         Self(digest)
     }
 
-    fn of(operation: &NetworkPolicyOperation) -> Self {
+    pub(crate) fn of(operation: &NetworkPolicyOperation) -> Self {
         Self(OperationDigest::semantic(
             b"network-policy-transition",
             operation,
@@ -769,6 +772,36 @@ pub struct PolicyPredecessor {
 }
 
 impl PolicyPredecessor {
+    pub(crate) fn pending(
+        digest: PolicyDigest,
+        phase: PolicyPhase,
+    ) -> Result<Self, OperationError> {
+        let predecessor = Self {
+            digest,
+            phase,
+            observed: false,
+        };
+        predecessor
+            .is_valid()
+            .then_some(predecessor)
+            .ok_or(OperationError::PolicyTransition)
+    }
+
+    pub(crate) fn settled(
+        digest: PolicyDigest,
+        phase: PolicyPhase,
+    ) -> Result<Self, OperationError> {
+        let predecessor = Self {
+            digest,
+            phase,
+            observed: true,
+        };
+        predecessor
+            .is_valid()
+            .then_some(predecessor)
+            .ok_or(OperationError::PolicyTransition)
+    }
+
     #[allow(
         dead_code,
         reason = "daemon policy adapter consumes these authenticated fields"
@@ -1095,6 +1128,12 @@ pub enum NetworkPolicyOperation {
         policy: ResourceTag,
         #[serde(deserialize_with = "deserialize_route_vec")]
         routes: Vec<ScopedRoute>,
+        #[serde(
+            default,
+            deserialize_with = "deserialize_redirect_vec",
+            skip_serializing_if = "Vec::is_empty"
+        )]
+        redirects: Vec<ScopedOpenVpnRedirect>,
         predecessor: PolicyPredecessor,
     },
     ApplyDns {
@@ -1120,7 +1159,24 @@ pub enum NetworkPolicyOperation {
         #[serde(deserialize_with = "deserialize_resource_vec")]
         resources: Vec<ResourceTag>,
         predecessor: PolicyPredecessor,
+        #[serde(
+            default = "legacy_release_retained_state",
+            skip_serializing_if = "legacy_release_retained_state_is_default"
+        )]
+        retained_state: ObservationState,
     },
+}
+
+const fn legacy_release_retained_state() -> ObservationState {
+    ObservationState::Present
+}
+
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if predicates receive a shared reference"
+)]
+const fn legacy_release_retained_state_is_default(state: &ObservationState) -> bool {
+    matches!(state, ObservationState::Present)
 }
 
 impl NetworkPolicyOperation {
@@ -1133,14 +1189,23 @@ impl NetworkPolicyOperation {
             | Self::ApplyFirewall { mode, tunnels, .. } => {
                 validate_firewall_tunnels(tunnels, matches!(mode, KillSwitchMode::AlwaysOn))
             }
-            Self::ApplyRoutes { routes, .. } => validate_routes(routes),
+            Self::ApplyRoutes {
+                routes, redirects, ..
+            } => validate_routes(routes, redirects),
             Self::ApplyDns { assignments, .. } => validate_dns_assignments(assignments),
             Self::ObserveBarrier { .. } => Ok(()),
             Self::ReleaseObsolete {
-                policy, resources, ..
+                policy,
+                resources,
+                retained_state,
+                ..
             } => {
                 bounded(resources)?;
                 if resources.is_empty()
+                    || !matches!(
+                        retained_state,
+                        ObservationState::Present | ObservationState::Absent
+                    )
                     || has_duplicates(resources)
                     || resources.iter().any(|resource| {
                         !matches!(
@@ -1187,7 +1252,7 @@ impl NetworkPolicyOperation {
         }
     }
 
-    const fn predecessor(&self) -> Option<PolicyPredecessor> {
+    pub(crate) const fn predecessor(&self) -> Option<PolicyPredecessor> {
         match self {
             Self::EstablishFirewall { .. } | Self::EstablishBlocking { .. } => None,
             Self::ApplyRoutes { predecessor, .. }
@@ -1244,11 +1309,22 @@ fn validate_firewall_tunnels(
     }
 }
 
-fn validate_routes(routes: &[ScopedRoute]) -> Result<(), OperationError> {
+fn validate_routes(
+    routes: &[ScopedRoute],
+    redirects: &[ScopedOpenVpnRedirect],
+) -> Result<(), OperationError> {
     bounded(routes)?;
+    bounded(redirects)?;
     if routes
         .iter()
         .any(|route| route.tunnel.kind() != ResourceKind::Tunnel)
+        || redirects.iter().any(|redirect| {
+            redirect.tunnel().kind() != ResourceKind::Tunnel
+                || !matches!(
+                    redirect.origin(),
+                    ScopedRouteOrigin::OpenVpnConfigured | ScopedRouteOrigin::OpenVpnPushed
+                )
+        })
     {
         Err(OperationError::ResourceScopeMismatch)
     } else {
@@ -1258,9 +1334,10 @@ fn validate_routes(routes: &[ScopedRoute]) -> Result<(), OperationError> {
 
 fn validate_route_projection(
     routes: &[ScopedRoute],
+    redirects: &[ScopedOpenVpnRedirect],
     tunnels: &[PrivilegedFirewallTunnel],
 ) -> Result<(), OperationError> {
-    validate_routes(routes)?;
+    validate_routes(routes, redirects)?;
     validate_firewall_tunnels(tunnels, true)?;
     if routes.iter().any(|route| {
         let Some(subject) = tunnels
@@ -1273,6 +1350,13 @@ fn validate_route_projection(
             .declared_cidrs()
             .iter()
             .any(|declared| canonical_cidr(*declared) == canonical_cidr(route.destination()))
+            || route
+                .selected_remote()
+                .is_some_and(|remote| !subject.endpoint_ips().contains(&remote))
+    }) || redirects.iter().any(|redirect| {
+        tunnels
+            .iter()
+            .all(|subject| subject.tunnel() != redirect.tunnel())
     }) {
         Err(OperationError::ResourceScopeMismatch)
     } else {
@@ -1318,11 +1402,36 @@ fn bounded<T>(values: &[T]) -> Result<(), OperationError> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScopedRouteOrigin {
+    WireGuard,
+    OpenVpnConfigured,
+    OpenVpnPushed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScopedRouteGateway {
+    Interface,
+    OpenVpn(OpenVpnRouteGateway),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScopedRoute {
     destination: Cidr,
     tunnel: ResourceTag,
+    #[serde(skip_serializing_if = "scoped_route_gateway_is_default")]
+    gateway: ScopedRouteGateway,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metric: Option<u32>,
+    #[serde(skip_serializing_if = "scoped_route_origin_is_default")]
+    origin: ScopedRouteOrigin,
+    #[serde(default, skip_serializing_if = "OpenVpnRouteDefaults::is_empty")]
+    route_defaults: OpenVpnRouteDefaults,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    selected_remote: Option<IpAddr>,
 }
 
 #[derive(Deserialize)]
@@ -1330,6 +1439,40 @@ pub struct ScopedRoute {
 struct ScopedRouteWire {
     destination: Cidr,
     tunnel: ResourceTag,
+    #[serde(default = "default_scoped_route_gateway")]
+    gateway: ScopedRouteGateway,
+    #[serde(default)]
+    metric: Option<u32>,
+    #[serde(default = "default_scoped_route_origin")]
+    origin: ScopedRouteOrigin,
+    #[serde(default)]
+    route_defaults: OpenVpnRouteDefaults,
+    #[serde(default)]
+    selected_remote: Option<IpAddr>,
+}
+
+const fn default_scoped_route_gateway() -> ScopedRouteGateway {
+    ScopedRouteGateway::Interface
+}
+
+const fn default_scoped_route_origin() -> ScopedRouteOrigin {
+    ScopedRouteOrigin::WireGuard
+}
+
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if predicates receive a shared reference"
+)]
+const fn scoped_route_gateway_is_default(gateway: &ScopedRouteGateway) -> bool {
+    matches!(gateway, ScopedRouteGateway::Interface)
+}
+
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if predicates receive a shared reference"
+)]
+const fn scoped_route_origin_is_default(origin: &ScopedRouteOrigin) -> bool {
+    matches!(origin, ScopedRouteOrigin::WireGuard)
 }
 
 impl<'de> Deserialize<'de> for ScopedRoute {
@@ -1338,7 +1481,98 @@ impl<'de> Deserialize<'de> for ScopedRoute {
         D: serde::Deserializer<'de>,
     {
         let wire = ScopedRouteWire::deserialize(deserializer)?;
-        Self::new(wire.destination, wire.tunnel).map_err(serde::de::Error::custom)
+        Self::validate(
+            wire.destination,
+            wire.tunnel,
+            wire.gateway,
+            wire.metric,
+            wire.origin,
+            wire.route_defaults,
+            wire.selected_remote,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopedOpenVpnRedirect {
+    tunnel: ResourceTag,
+    redirect: OpenVpnRedirectGateway,
+    origin: ScopedRouteOrigin,
+    #[serde(default, skip_serializing_if = "OpenVpnRouteDefaults::is_empty")]
+    route_defaults: OpenVpnRouteDefaults,
+}
+
+impl ScopedOpenVpnRedirect {
+    pub fn new(
+        tunnel: ResourceTag,
+        redirect: OpenVpnRedirectGateway,
+        origin: ScopedRouteOrigin,
+        route_defaults: OpenVpnRouteDefaults,
+    ) -> Result<Self, OperationError> {
+        if tunnel.kind() != ResourceKind::Tunnel
+            || !matches!(
+                origin,
+                ScopedRouteOrigin::OpenVpnConfigured | ScopedRouteOrigin::OpenVpnPushed
+            )
+        {
+            return Err(OperationError::ResourceScopeMismatch);
+        }
+        Ok(Self {
+            tunnel,
+            redirect,
+            origin,
+            route_defaults,
+        })
+    }
+
+    #[must_use]
+    pub const fn tunnel(&self) -> &ResourceTag {
+        &self.tunnel
+    }
+
+    #[must_use]
+    pub const fn redirect(&self) -> &OpenVpnRedirectGateway {
+        &self.redirect
+    }
+
+    #[must_use]
+    pub const fn origin(&self) -> ScopedRouteOrigin {
+        self.origin
+    }
+
+    #[must_use]
+    pub const fn route_defaults(&self) -> OpenVpnRouteDefaults {
+        self.route_defaults
+    }
+
+    pub(crate) fn destinations(&self) -> Result<Vec<Cidr>, OperationError> {
+        let flags = self.redirect.flags();
+        if flags.contains(&OpenVpnRedirectFlag::BypassDhcp)
+            || flags.contains(&OpenVpnRedirectFlag::BypassDns)
+            || flags.contains(&OpenVpnRedirectFlag::BlockLocal)
+        {
+            return Err(OperationError::ResourceScopeMismatch);
+        }
+        let mut destinations = Vec::with_capacity(4);
+        if self.redirect.ipv4() {
+            if flags.contains(&OpenVpnRedirectFlag::Def1) {
+                destinations.extend([
+                    "0.0.0.0/1".parse::<Cidr>().expect("fixed CIDR is valid"),
+                    "128.0.0.0/1".parse::<Cidr>().expect("fixed CIDR is valid"),
+                ]);
+            } else {
+                destinations.push("0.0.0.0/0".parse::<Cidr>().expect("fixed CIDR is valid"));
+            }
+        }
+        if self.redirect.ipv6() {
+            destinations.extend([
+                "2000::/4".parse::<Cidr>().expect("fixed CIDR is valid"),
+                "3000::/4".parse::<Cidr>().expect("fixed CIDR is valid"),
+            ]);
+        }
+        Ok(destinations)
     }
 }
 
@@ -1364,6 +1598,12 @@ pub(crate) enum PolicyProjection {
         policy: ResourceTag,
         #[serde(deserialize_with = "deserialize_route_vec")]
         routes: Vec<ScopedRoute>,
+        #[serde(
+            default,
+            deserialize_with = "deserialize_redirect_vec",
+            skip_serializing_if = "Vec::is_empty"
+        )]
+        redirects: Vec<ScopedOpenVpnRedirect>,
         #[serde(deserialize_with = "deserialize_firewall_tunnel_vec")]
         tunnels: Vec<PrivilegedFirewallTunnel>,
     },
@@ -1382,7 +1622,7 @@ pub(crate) enum PolicyProjection {
 }
 
 impl PolicyProjection {
-    fn from_mutation(
+    pub(crate) fn from_mutation(
         operation: &NetworkPolicyOperation,
         predecessor: Option<&Self>,
     ) -> Result<Option<Self>, OperationError> {
@@ -1400,16 +1640,22 @@ impl PolicyProjection {
                 policy: policy.clone(),
                 tunnels: tunnels.clone(),
             }),
-            NetworkPolicyOperation::ApplyRoutes { policy, routes, .. } => {
+            NetworkPolicyOperation::ApplyRoutes {
+                policy,
+                routes,
+                redirects,
+                ..
+            } => {
                 let Some(Self::FirewallBaseline { tunnels, .. } | Self::Blocking { tunnels, .. }) =
                     predecessor
                 else {
                     return Err(OperationError::PolicyTransition);
                 };
-                validate_route_projection(routes, tunnels)?;
+                validate_route_projection(routes, redirects, tunnels)?;
                 Some(Self::Routes {
                     policy: policy.clone(),
                     routes: routes.clone(),
+                    redirects: redirects.clone(),
                     tunnels: tunnels.clone(),
                 })
             }
@@ -1450,11 +1696,20 @@ impl PolicyProjection {
         PolicyDigest::of_projection(self)
     }
 
-    pub(crate) fn route_inputs(&self) -> Option<(&[ScopedRoute], &[PrivilegedFirewallTunnel])> {
+    pub(crate) fn route_inputs(
+        &self,
+    ) -> Option<(
+        &[ScopedRoute],
+        &[ScopedOpenVpnRedirect],
+        &[PrivilegedFirewallTunnel],
+    )> {
         match self {
             Self::Routes {
-                routes, tunnels, ..
-            } => Some((routes, tunnels)),
+                routes,
+                redirects,
+                tunnels,
+                ..
+            } => Some((routes, redirects, tunnels)),
             Self::FirewallBaseline { .. }
             | Self::Blocking { .. }
             | Self::Dns { .. }
@@ -1474,7 +1729,41 @@ impl PolicyProjection {
         }
     }
 
-    const fn phase(&self) -> PolicyPhase {
+    pub(crate) fn expected_observation_state(&self) -> ObservationState {
+        if let Some(blocks) = self.firewall_blocks() {
+            return if blocks {
+                ObservationState::Present
+            } else {
+                ObservationState::Absent
+            };
+        }
+        match self {
+            Self::Routes {
+                routes, redirects, ..
+            } => {
+                if routes.is_empty() && redirects.is_empty() {
+                    ObservationState::Absent
+                } else {
+                    ObservationState::Present
+                }
+            }
+            Self::Dns { assignments, .. } => {
+                if assignments
+                    .iter()
+                    .all(|assignment| matches!(assignment.scope(), PrivilegedDnsScope::Suppressed))
+                {
+                    ObservationState::Absent
+                } else {
+                    ObservationState::Present
+                }
+            }
+            Self::FirewallBaseline { .. } | Self::Blocking { .. } | Self::Firewall { .. } => {
+                unreachable!("firewall projections returned above")
+            }
+        }
+    }
+
+    pub(crate) const fn phase(&self) -> PolicyPhase {
         match self {
             Self::FirewallBaseline { .. } => PolicyPhase::FirewallBaseline,
             Self::Blocking { .. } => PolicyPhase::Blocking,
@@ -1494,11 +1783,12 @@ impl PolicyProjection {
             Self::Routes {
                 policy,
                 routes,
+                redirects,
                 tunnels,
             } => (
                 policy,
                 ResourceKind::Routes,
-                validate_route_projection(routes, tunnels),
+                validate_route_projection(routes, redirects, tunnels),
             ),
             Self::Dns {
                 policy,
@@ -1531,12 +1821,99 @@ impl PolicyProjection {
 
 impl ScopedRoute {
     pub fn new(destination: Cidr, tunnel: ResourceTag) -> Result<Self, OperationError> {
-        if !destination.is_valid() || tunnel.kind() != ResourceKind::Tunnel {
+        Self::validate(
+            destination,
+            tunnel,
+            ScopedRouteGateway::Interface,
+            None,
+            ScopedRouteOrigin::WireGuard,
+            OpenVpnRouteDefaults::default(),
+            None,
+        )
+    }
+
+    pub fn openvpn(
+        route: OpenVpnRoute,
+        tunnel: ResourceTag,
+        origin: ScopedRouteOrigin,
+        route_defaults: OpenVpnRouteDefaults,
+    ) -> Result<Self, OperationError> {
+        Self::validate(
+            route.destination(),
+            tunnel,
+            ScopedRouteGateway::OpenVpn(route.gateway()),
+            route.metric(),
+            origin,
+            route_defaults,
+            None,
+        )
+    }
+
+    pub fn openvpn_with_selected_remote(
+        route: OpenVpnRoute,
+        tunnel: ResourceTag,
+        origin: ScopedRouteOrigin,
+        route_defaults: OpenVpnRouteDefaults,
+        selected_remote: IpAddr,
+    ) -> Result<Self, OperationError> {
+        Self::validate(
+            route.destination(),
+            tunnel,
+            ScopedRouteGateway::OpenVpn(route.gateway()),
+            route.metric(),
+            origin,
+            route_defaults,
+            Some(selected_remote),
+        )
+    }
+
+    fn validate(
+        destination: Cidr,
+        tunnel: ResourceTag,
+        gateway: ScopedRouteGateway,
+        metric: Option<u32>,
+        origin: ScopedRouteOrigin,
+        route_defaults: OpenVpnRouteDefaults,
+        selected_remote: Option<IpAddr>,
+    ) -> Result<Self, OperationError> {
+        let vocabulary_matches = matches!(
+            (gateway, origin),
+            (ScopedRouteGateway::Interface, ScopedRouteOrigin::WireGuard)
+                | (
+                    ScopedRouteGateway::OpenVpn(_),
+                    ScopedRouteOrigin::OpenVpnConfigured | ScopedRouteOrigin::OpenVpnPushed
+                )
+        );
+        let selected_remote_matches = match gateway {
+            ScopedRouteGateway::OpenVpn(OpenVpnRouteGateway::RemoteHost) => {
+                destination.is_v4()
+                    && selected_remote
+                        .is_some_and(|remote| remote.is_ipv4() && !invalid_unicast_ip(&remote))
+            }
+            ScopedRouteGateway::Interface
+            | ScopedRouteGateway::OpenVpn(
+                OpenVpnRouteGateway::VpnDefault
+                | OpenVpnRouteGateway::NetGateway
+                | OpenVpnRouteGateway::Address(_),
+            ) => selected_remote.is_none(),
+        };
+        if !destination.is_valid()
+            || tunnel.kind() != ResourceKind::Tunnel
+            || !vocabulary_matches
+            || !selected_remote_matches
+            || matches!(origin, ScopedRouteOrigin::WireGuard) && metric.is_some()
+            || matches!(origin, ScopedRouteOrigin::WireGuard) && !route_defaults.is_empty()
+        {
             return Err(OperationError::ResourceScopeMismatch);
         }
         Ok(Self {
             destination: canonical_cidr(destination),
             tunnel,
+            gateway,
+            metric,
+            origin,
+            route_defaults,
+            selected_remote,
         })
     }
 
@@ -1548,6 +1925,31 @@ impl ScopedRoute {
     #[must_use]
     pub const fn tunnel(&self) -> &ResourceTag {
         &self.tunnel
+    }
+
+    #[must_use]
+    pub const fn gateway(&self) -> ScopedRouteGateway {
+        self.gateway
+    }
+
+    #[must_use]
+    pub const fn metric(&self) -> Option<u32> {
+        self.metric
+    }
+
+    #[must_use]
+    pub const fn origin(&self) -> ScopedRouteOrigin {
+        self.origin
+    }
+
+    #[must_use]
+    pub const fn route_defaults(&self) -> OpenVpnRouteDefaults {
+        self.route_defaults
+    }
+
+    #[must_use]
+    pub const fn selected_remote(&self) -> Option<IpAddr> {
+        self.selected_remote
     }
 }
 
@@ -1574,6 +1976,23 @@ pub enum PrivilegedOperation {
         #[serde(deserialize_with = "deserialize_observation_target_vec")]
         Vec<ResourceObservationTarget>,
     ),
+    /// Prove exact kernel absence for tunnel resources whose root-ledger
+    /// ownership was already released after a successful teardown.
+    ObserveManagedAbsence(
+        #[serde(deserialize_with = "deserialize_observation_target_vec")]
+        Vec<ResourceObservationTarget>,
+    ),
+    /// Recheck exact kernel absence and durably forget released tunnel
+    /// identities after the daemon has committed the corresponding canonical
+    /// absence. This is intentionally distinct from observation: collection
+    /// is an authenticated, replay-fenced root-ledger mutation.
+    AcknowledgeReleased(
+        #[serde(deserialize_with = "deserialize_observation_target_vec")]
+        Vec<ResourceObservationTarget>,
+    ),
+    /// Re-read one exact root-ledger-owned effective policy projection without
+    /// advancing or rewriting its mutation cursor.
+    AuditPolicy(ResourceTag),
     CleanupOwned(#[serde(deserialize_with = "deserialize_resource_vec")] Vec<ResourceTag>),
 }
 
@@ -1613,6 +2032,14 @@ where
         .map(BoundedVec::into_vec)
 }
 
+fn deserialize_redirect_vec<'de, D>(deserializer: D) -> Result<Vec<ScopedOpenVpnRedirect>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    BoundedVec::<ScopedOpenVpnRedirect, MAX_RESOURCE_ITEMS>::deserialize(deserializer)
+        .map(BoundedVec::into_vec)
+}
+
 fn deserialize_dns_assignment_vec<'de, D>(
     deserializer: D,
 ) -> Result<Vec<PrivilegedDnsAssignment>, D::Error>
@@ -1630,7 +2057,21 @@ impl PrivilegedOperation {
             Self::StopTunnel(resource) => require_profile_kind(resource, ResourceKind::Tunnel),
             Self::NetworkPolicy(operation) => operation.validate(authority),
             Self::Observe(targets) => validate_observation_targets(targets, authority, false),
-            Self::ObserveManaged(targets) => validate_observation_targets(targets, authority, true),
+            Self::ObserveManaged(targets)
+            | Self::ObserveManagedAbsence(targets)
+            | Self::AcknowledgeReleased(targets) => {
+                validate_observation_targets(targets, authority, true)
+            }
+            Self::AuditPolicy(resource)
+                if resource.authority_epoch() == Some(authority)
+                    && matches!(
+                        resource.kind(),
+                        ResourceKind::Firewall | ResourceKind::Dns | ResourceKind::Routes
+                    ) =>
+            {
+                Ok(())
+            }
+            Self::AuditPolicy(_) => Err(OperationError::ResourceScopeMismatch),
             Self::CleanupOwned(resources) => {
                 bounded(resources)?;
                 if has_duplicates(resources)
@@ -1663,12 +2104,15 @@ impl PrivilegedOperation {
                             | ResourceKind::RuntimeSecret
                     )
             }
-            Self::StopTunnel(expected) => resource == expected,
+            Self::StopTunnel(expected) | Self::AuditPolicy(expected) => resource == expected,
             Self::NetworkPolicy(operation) => {
                 resource == operation.policy()
                     || matches!(operation, NetworkPolicyOperation::ReleaseObsolete { resources, .. } if resources.contains(resource))
             }
-            Self::Observe(targets) | Self::ObserveManaged(targets) => {
+            Self::Observe(targets)
+            | Self::ObserveManaged(targets)
+            | Self::ObserveManagedAbsence(targets)
+            | Self::AcknowledgeReleased(targets) => {
                 targets.iter().any(|target| target.resource() == resource)
             }
             Self::CleanupOwned(resources) => resources.contains(resource),
@@ -1857,6 +2301,7 @@ impl PrivilegedRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperationAdmission {
     Fresh,
+    PendingReleaseContinuation,
     Duplicate,
 }
 
@@ -2179,17 +2624,17 @@ impl OperationGuard {
                 return Err(OperationError::SequenceReplay);
             }
         }
-        self.validate_policy_transition(request)?;
-        Ok(OperationAdmission::Fresh)
+        self.validate_policy_transition(request)
     }
 
     fn validate_policy_transition(
         &self,
         request: &PrivilegedRequest,
-    ) -> Result<(), OperationError> {
+    ) -> Result<OperationAdmission, OperationError> {
         let PrivilegedOperation::NetworkPolicy(operation) = &request.operation else {
-            return Ok(());
+            return Ok(OperationAdmission::Fresh);
         };
+        let mut admission = OperationAdmission::Fresh;
         let current = self
             .highest
             .as_ref()
@@ -2220,6 +2665,13 @@ impl OperationGuard {
                 {
                     return Err(OperationError::PolicyTransition);
                 }
+                if matches!(
+                    operation,
+                    NetworkPolicyOperation::ReleaseObsolete { retained_state, .. }
+                        if *retained_state != cursor.projection.expected_observation_state()
+                ) {
+                    return Err(OperationError::PolicyTransition);
+                }
                 if operation.is_observation() {
                     if cursor.observed
                         || operation.policy().kind() != policy_kind_for_phase(cursor.phase)
@@ -2227,8 +2679,21 @@ impl OperationGuard {
                         return Err(OperationError::PolicyTransition);
                     }
                 } else {
-                    if !cursor.observed {
+                    let resumes_pending_release = matches!(
+                        operation,
+                        NetworkPolicyOperation::ReleaseObsolete {
+                            resources,
+                            retained_state,
+                            ..
+                        } if cursor.phase == PolicyPhase::Released
+                            && cursor.pending_release == *resources
+                            && cursor.projection.expected_observation_state() == *retained_state
+                    );
+                    if !cursor.observed && !resumes_pending_release {
                         return Err(OperationError::ObservationBarrierRequired);
+                    }
+                    if resumes_pending_release {
+                        admission = OperationAdmission::PendingReleaseContinuation;
                     }
                     if operation.target_phase() != PolicyPhase::Released
                         && phase_rank(operation.target_phase()) <= phase_rank(cursor.phase)
@@ -2239,7 +2704,7 @@ impl OperationGuard {
             }
             (_, None) => return Err(OperationError::PolicyTransition),
         }
-        Ok(())
+        Ok(admission)
     }
 
     pub fn admit(
@@ -2247,45 +2712,49 @@ impl OperationGuard {
         request: &PrivilegedRequest,
     ) -> Result<OperationAdmission, OperationError> {
         let admission = self.validate(request)?;
-        if admission == OperationAdmission::Fresh {
+        if admission != OperationAdmission::Duplicate {
             let prior_policy = self.highest.as_ref().and_then(|state| state.policy.clone());
-            let policy = match &request.operation {
-                PrivilegedOperation::NetworkPolicy(operation) => {
-                    let mutation_projection = PolicyProjection::from_mutation(
-                        operation,
-                        prior_policy.as_ref().map(|prior| &prior.projection),
-                    )?;
-                    let previous = if mutation_projection.is_some()
-                        || matches!(operation, NetworkPolicyOperation::ReleaseObsolete { .. })
-                    {
-                        prior_policy
-                            .as_ref()
-                            .and_then(PolicyRollback::from_observed)
-                    } else {
-                        prior_policy
-                            .as_ref()
-                            .and_then(|prior| prior.previous.clone())
-                    };
-                    let projection = mutation_projection
-                        .or_else(|| prior_policy.as_ref().map(|prior| prior.projection.clone()))
-                        .ok_or(OperationError::PolicyTransition)?;
-                    Some(PolicyCursor {
-                        authority_epoch: request.authority_epoch,
-                        generation: operation.policy().generation(),
-                        digest: PolicyDigest::of(operation),
-                        phase: operation.target_phase(),
-                        observed: false,
-                        projection,
-                        previous,
-                        pending_release: match operation {
-                            NetworkPolicyOperation::ReleaseObsolete { resources, .. } => {
-                                resources.clone()
-                            }
-                            _ => Vec::new(),
-                        },
-                    })
+            let policy = if admission == OperationAdmission::PendingReleaseContinuation {
+                prior_policy
+            } else {
+                match &request.operation {
+                    PrivilegedOperation::NetworkPolicy(operation) => {
+                        let mutation_projection = PolicyProjection::from_mutation(
+                            operation,
+                            prior_policy.as_ref().map(|prior| &prior.projection),
+                        )?;
+                        let previous = if mutation_projection.is_some()
+                            || matches!(operation, NetworkPolicyOperation::ReleaseObsolete { .. })
+                        {
+                            prior_policy
+                                .as_ref()
+                                .and_then(PolicyRollback::from_observed)
+                        } else {
+                            prior_policy
+                                .as_ref()
+                                .and_then(|prior| prior.previous.clone())
+                        };
+                        let projection = mutation_projection
+                            .or_else(|| prior_policy.as_ref().map(|prior| prior.projection.clone()))
+                            .ok_or(OperationError::PolicyTransition)?;
+                        Some(PolicyCursor {
+                            authority_epoch: request.authority_epoch,
+                            generation: operation.policy().generation(),
+                            digest: PolicyDigest::of(operation),
+                            phase: operation.target_phase(),
+                            observed: false,
+                            projection,
+                            previous,
+                            pending_release: match operation {
+                                NetworkPolicyOperation::ReleaseObsolete { resources, .. } => {
+                                    resources.clone()
+                                }
+                                _ => Vec::new(),
+                            },
+                        })
+                    }
+                    _ => prior_policy,
                 }
-                _ => prior_policy,
             };
             self.highest = Some(ReplayHighWater {
                 schema_version: CONTRACT_SCHEMA_VERSION,
@@ -2319,24 +2788,24 @@ impl OperationGuard {
         let Some(state) = &mut self.highest else {
             return Err(OperationError::InvalidObservationReceipt);
         };
-        if state.highest_id != *request.operation_id()
-            || state.highest_digest != *request.digest()
-            || receipt.validate_against(request, root).is_err()
-            || !receipt.observes(policy, ObservationState::Present)
-        {
-            return Err(OperationError::InvalidObservationReceipt);
-        }
         let Some(cursor) = &mut state.policy else {
             return Err(OperationError::InvalidObservationReceipt);
         };
+        if state.highest_id != *request.operation_id()
+            || state.highest_digest != *request.digest()
+            || receipt.validate_against(request, root).is_err()
+            || !receipt.observes(policy, cursor.projection.expected_observation_state())
+        {
+            return Err(OperationError::InvalidObservationReceipt);
+        }
         cursor.observed = true;
         cursor.previous = None;
         Ok(())
     }
 
     /// Finish a release only after one authenticated observation proves the
-    /// current protection remains present and every exact obsolete resource
-    /// retained in the persisted cursor is absent.
+    /// current retained projection remains in its exact expected state and
+    /// every obsolete resource retained in the persisted cursor is absent.
     pub fn confirm_release(
         &mut self,
         request: &PrivilegedRequest,
@@ -2346,6 +2815,7 @@ impl OperationGuard {
         let PrivilegedOperation::NetworkPolicy(NetworkPolicyOperation::ReleaseObsolete {
             policy,
             resources,
+            retained_state,
             ..
         }) = request.operation()
         else {
@@ -2361,8 +2831,9 @@ impl OperationGuard {
             || state.highest_digest != *request.digest()
             || cursor.phase != PolicyPhase::Released
             || cursor.pending_release != *resources
+            || cursor.projection.expected_observation_state() != *retained_state
             || receipt.validate_against(request, root).is_err()
-            || !receipt.observes(policy, ObservationState::Present)
+            || !receipt.observes(policy, *retained_state)
             || cursor
                 .pending_release
                 .iter()
@@ -2436,8 +2907,10 @@ pub enum OperationError {
 mod tests {
     use super::*;
     use crate::vortix_core::privileged::protocol_plan::{
-        OpenVpnAuthFactors, OpenVpnPlan, OpenVpnRemote, OpenVpnRemoteSelection, OpenVpnTransport,
-        ProtocolEndpoint, WireGuardInterfaceOptions, WireGuardPeerPlan, WireGuardPlan,
+        OpenVpnAuthFactors, OpenVpnDefaultGateway, OpenVpnDefaultGateways, OpenVpnPlan,
+        OpenVpnRemote, OpenVpnRemoteSelection, OpenVpnRoute, OpenVpnRouteDefaults,
+        OpenVpnRouteGateway, OpenVpnTransport, ProtocolEndpoint, WireGuardInterfaceOptions,
+        WireGuardPeerPlan, WireGuardPlan,
     };
     use crate::vortix_core::privileged::receipt::{
         AuthenticatedReceiptVerifier, ReceiptError, ReceiptLedger, ResourceObservation,
@@ -2634,6 +3107,55 @@ mod tests {
         let mut value = serde_json::to_value(baseline.0).unwrap();
         value["record"]["schema_version"] = serde_json::json!(0);
         assert!(serde_json::from_value::<ReplayRecord>(value).is_err());
+    }
+
+    #[test]
+    fn legacy_release_default_preserves_authenticated_request_digest() {
+        let (_root, principal) = authority();
+        let release = |retained_state| {
+            PrivilegedRequest::new(
+                &principal,
+                HelperEpoch::new(3).unwrap(),
+                RequestSequence::new(if retained_state == ObservationState::Present {
+                    1
+                } else {
+                    2
+                })
+                .unwrap(),
+                PrivilegedOperation::NetworkPolicy(NetworkPolicyOperation::ReleaseObsolete {
+                    policy: ResourceTag::topology(AuthorityEpoch(7), 2, ResourceKind::Firewall)
+                        .unwrap(),
+                    resources: vec![ResourceTag::topology(
+                        AuthorityEpoch(7),
+                        1,
+                        ResourceKind::Routes,
+                    )
+                    .unwrap()],
+                    predecessor: PolicyPredecessor::for_test(
+                        PolicyDigest::for_test(OperationDigest::of_bytes(b"prior policy")),
+                        PolicyPhase::Firewall,
+                    ),
+                    retained_state,
+                }),
+            )
+            .unwrap()
+        };
+
+        let legacy = release(ObservationState::Present);
+        let legacy_wire = serde_json::to_vec(&legacy).unwrap();
+        assert!(!std::str::from_utf8(&legacy_wire)
+            .unwrap()
+            .contains("retained_state"));
+        let decoded: PrivilegedRequest = serde_json::from_slice(&legacy_wire).unwrap();
+        assert_eq!(decoded.digest(), legacy.digest());
+
+        let exact_absence = release(ObservationState::Absent);
+        let exact_wire = serde_json::to_vec(&exact_absence).unwrap();
+        assert!(std::str::from_utf8(&exact_wire)
+            .unwrap()
+            .contains("retained_state"));
+        let decoded: PrivilegedRequest = serde_json::from_slice(&exact_wire).unwrap();
+        assert_eq!(decoded.digest(), exact_absence.digest());
     }
 
     #[test]
@@ -3190,7 +3712,7 @@ mod tests {
         clippy::too_many_lines,
         reason = "one end-to-end release test retains the crash/restart proof chain"
     )]
-    fn release_requires_current_protection_and_every_obsolete_resource_absent() {
+    fn release_requires_exact_retained_state_and_every_obsolete_resource_absent() {
         let (root, principal) = authority();
         let helper = HelperEpoch::new(3).unwrap();
         let mut guard = OperationGuard::resume(
@@ -3199,7 +3721,6 @@ mod tests {
             root.unused_replay_baseline(&principal, helper).unwrap(),
         )
         .unwrap();
-        let tunnel = ResourceTag::tunnel(profile('a'), 2).unwrap();
         let current = ResourceTag::topology(AuthorityEpoch(7), 2, ResourceKind::Firewall).unwrap();
         let obsolete_dns = ResourceTag::topology(AuthorityEpoch(7), 1, ResourceKind::Dns).unwrap();
         let obsolete_routes =
@@ -3208,15 +3729,10 @@ mod tests {
             &principal,
             helper,
             RequestSequence::new(1).unwrap(),
-            PrivilegedOperation::NetworkPolicy(NetworkPolicyOperation::EstablishBlocking {
+            PrivilegedOperation::NetworkPolicy(NetworkPolicyOperation::EstablishFirewall {
                 policy: current.clone(),
-                tunnels: vec![PrivilegedFirewallTunnel::new(
-                    tunnel,
-                    vec!["198.51.100.1".parse().unwrap()],
-                    Vec::new(),
-                    PrivilegedFirewallRole::PendingEndpoint,
-                )
-                .unwrap()],
+                mode: KillSwitchMode::Off,
+                tunnels: Vec::new(),
             }),
         )
         .unwrap();
@@ -3237,8 +3753,7 @@ mod tests {
             .observed(
                 &observe,
                 vec![
-                    ResourceObservation::new(current.clone(), ObservationState::Present, 1)
-                        .unwrap(),
+                    ResourceObservation::new(current.clone(), ObservationState::Absent, 1).unwrap(),
                 ],
             )
             .unwrap();
@@ -3254,6 +3769,7 @@ mod tests {
                     policy: current.clone(),
                     resources: Vec::new(),
                     predecessor: guard.policy_predecessor().unwrap(),
+                    retained_state: ObservationState::Absent,
                 }),
             )
             .unwrap_err(),
@@ -3267,10 +3783,27 @@ mod tests {
                 policy: current.clone(),
                 resources: vec![obsolete_dns.clone(), obsolete_routes.clone()],
                 predecessor: guard.policy_predecessor().unwrap(),
+                retained_state: ObservationState::Absent,
             }),
         )
         .unwrap();
         guard.admit(&release).unwrap();
+        let continuation = PrivilegedRequest::new(
+            &principal,
+            helper,
+            RequestSequence::new(4).unwrap(),
+            PrivilegedOperation::NetworkPolicy(NetworkPolicyOperation::ReleaseObsolete {
+                policy: current.clone(),
+                resources: vec![obsolete_dns.clone(), obsolete_routes.clone()],
+                predecessor: guard.policy_predecessor().unwrap(),
+                retained_state: ObservationState::Absent,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            guard.validate(&continuation),
+            Ok(OperationAdmission::PendingReleaseContinuation)
+        );
         let persisted = serde_json::to_value(guard.checkpoint().unwrap()).unwrap();
         let persisted_text = persisted.to_string();
         assert!(persisted_text.contains("projection"));
@@ -3286,7 +3819,7 @@ mod tests {
                 .observed(
                     &release,
                     vec![
-                        ResourceObservation::new(current.clone(), ObservationState::Present, 2)
+                        ResourceObservation::new(current.clone(), ObservationState::Absent, 2)
                             .unwrap(),
                         ResourceObservation::new(
                             obsolete_dns.clone(),
@@ -3303,7 +3836,7 @@ mod tests {
             .observed(
                 &release,
                 vec![
-                    ResourceObservation::new(current, ObservationState::Present, 3).unwrap(),
+                    ResourceObservation::new(current, ObservationState::Absent, 3).unwrap(),
                     ResourceObservation::new(obsolete_dns, ObservationState::Absent, 3).unwrap(),
                     ResourceObservation::new(obsolete_routes, ObservationState::Absent, 3).unwrap(),
                 ],
@@ -3354,6 +3887,7 @@ mod tests {
         let operation = NetworkPolicyOperation::ApplyRoutes {
             policy: routes.clone(),
             routes: vec![ScopedRoute::new(declared, tunnel.clone()).unwrap()],
+            redirects: Vec::new(),
             predecessor: PolicyPredecessor {
                 digest: blocking.digest(),
                 phase: PolicyPhase::Blocking,
@@ -3369,6 +3903,7 @@ mod tests {
             PolicyProjection::Routes {
                 policy: routes,
                 routes: vec![ScopedRoute::new(declared, tunnel).unwrap()],
+                redirects: Vec::new(),
                 tunnels: subjects,
             }
         );
@@ -3377,6 +3912,7 @@ mod tests {
         let invalid = NetworkPolicyOperation::ApplyRoutes {
             policy: ResourceTag::topology(AuthorityEpoch(7), 1, ResourceKind::Routes).unwrap(),
             routes: vec![ScopedRoute::new(declared, foreign).unwrap()],
+            redirects: Vec::new(),
             predecessor: PolicyPredecessor {
                 digest: blocking.digest(),
                 phase: PolicyPhase::Blocking,
@@ -3399,5 +3935,61 @@ mod tests {
         });
         let decoded: ScopedRoute = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded.destination(), "10.0.0.0/8".parse().unwrap());
+    }
+
+    #[test]
+    fn scoped_openvpn_route_preserves_effective_defaults_and_wireguard_rejects_them() {
+        let tunnel = ResourceTag::tunnel(profile('a'), 1).unwrap();
+        let defaults = OpenVpnRouteDefaults::new(
+            OpenVpnDefaultGateways::new(
+                Some(OpenVpnDefaultGateway::Address("10.8.0.1".parse().unwrap())),
+                None,
+            )
+            .unwrap(),
+            Some(7),
+        );
+        let route = ScopedRoute::openvpn(
+            OpenVpnRoute::with_gateway(
+                "10.20.0.0/16".parse().unwrap(),
+                OpenVpnRouteGateway::VpnDefault,
+                None,
+            )
+            .unwrap(),
+            tunnel.clone(),
+            ScopedRouteOrigin::OpenVpnPushed,
+            defaults,
+        )
+        .unwrap();
+        let decoded: ScopedRoute =
+            serde_json::from_value(serde_json::to_value(route).unwrap()).unwrap();
+        assert_eq!(decoded.route_defaults(), defaults);
+
+        let mut wireguard = serde_json::to_value(
+            ScopedRoute::new("10.30.0.0/16".parse().unwrap(), tunnel).unwrap(),
+        )
+        .unwrap();
+        wireguard["route_defaults"] = serde_json::to_value(defaults).unwrap();
+        assert!(serde_json::from_value::<ScopedRoute>(wireguard).is_err());
+    }
+
+    #[test]
+    fn all_suppressed_dns_assignments_expect_absent_physical_state() {
+        let tunnel = ResourceTag::tunnel(profile('a'), 1).unwrap();
+        let assignment = PrivilegedDnsAssignment::new(
+            tunnel,
+            vec!["192.0.2.53".parse().unwrap()],
+            Vec::new(),
+            PrivilegedDnsScope::Suppressed,
+        )
+        .unwrap();
+        let projection = PolicyProjection::Dns {
+            policy: ResourceTag::topology(AuthorityEpoch(7), 1, ResourceKind::Dns).unwrap(),
+            assignments: vec![assignment],
+        };
+
+        assert_eq!(
+            projection.expected_observation_state(),
+            ObservationState::Absent
+        );
     }
 }
