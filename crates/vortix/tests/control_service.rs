@@ -74,10 +74,10 @@ impl ProfileMutationExecutor for FakeProfileMutations {
                 new_display_name,
             } => ProfileMutationApplied::Renamed {
                 profile_id,
-                topology: ProfileTopology {
+                topology: self.import_has_topology.then(|| ProfileTopology {
                     display_name: Some(new_display_name),
                     ..ProfileTopology::default()
-                },
+                }),
             },
             ProfileMutation::Delete { profile_id } => {
                 ProfileMutationApplied::Deleted { profile_id }
@@ -230,6 +230,46 @@ async fn imported_profile_without_topology_is_known_but_cannot_connect() {
     assert_eq!(
         client
             .submit(request("unsafe-connect", imported, u64::MAX))
+            .await,
+        Err(AdmissionError::InvalidInput {
+            reason: "profile topology is unavailable".to_owned(),
+        })
+    );
+}
+
+#[tokio::test]
+async fn catalog_profile_without_topology_can_rename_but_still_cannot_connect() {
+    let mutations = Arc::new(FakeProfileMutations {
+        delay: Duration::ZERO,
+        import_has_topology: false,
+        calls: Mutex::new(Vec::new()),
+    });
+    let existing = profile('a');
+    let service = ControlService::start(ControlServiceConfig {
+        known_profiles: [existing.clone()].into_iter().collect(),
+        profile_mutations: Some(mutations),
+        ..config()
+    });
+    let client = service.client();
+    let rename = client
+        .submit(CommandRequest {
+            command: UserCommand::RenameProfile {
+                profile_id: existing.clone(),
+                new_display_name: "renamed-broken-profile".to_owned(),
+            },
+            idempotency_key: IdempotencyKey::new("rename-without-topology"),
+            deadline: Deadline(u64::MAX),
+        })
+        .await
+        .expect("catalog mutation must not require execution topology");
+    wait_for_terminal(&client, &rename.operation_id).await;
+    assert_eq!(
+        client.snapshot().operations[&rename.operation_id].status,
+        OperationStatus::Succeeded
+    );
+    assert_eq!(
+        client
+            .submit(request("connect-without-topology", existing, u64::MAX))
             .await,
         Err(AdmissionError::InvalidInput {
             reason: "profile topology is unavailable".to_owned(),

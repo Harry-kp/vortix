@@ -78,6 +78,10 @@ pub struct ControlServiceConfig {
     pub boot_connections:
         BTreeMap<ProfileId, crate::vortix_core::control::persistence::BootConnection>,
     pub freshness_poll_interval: Duration,
+    /// Wall-clock budget for automatic convergence after an unexpected drop.
+    pub retry_budget: Duration,
+    /// Initial reconnect backoff; subsequent failures double it within budget.
+    pub retry_initial_backoff: Duration,
     pub authority_epoch: AuthorityEpoch,
     /// Compatibility seed used only when no durable control state exists.
     pub initial_kill_switch_mode: crate::vortix_core::state::killswitch::KillSwitchMode,
@@ -176,7 +180,9 @@ pub enum ProfileMutationApplied {
     },
     Renamed {
         profile_id: ProfileId,
-        topology: ProfileTopology,
+        /// Missing preserves catalog mutation success while lifecycle
+        /// admission remains fail-closed until topology can be rebuilt.
+        topology: Option<ProfileTopology>,
     },
     Deleted {
         profile_id: ProfileId,
@@ -247,6 +253,8 @@ impl Default for ControlServiceConfig {
             profile_mutations: None,
             boot_connections: BTreeMap::new(),
             freshness_poll_interval: Duration::from_millis(250),
+            retry_budget: Duration::from_secs(300),
+            retry_initial_backoff: Duration::from_secs(2),
             authority_epoch: AuthorityEpoch(0),
             initial_kill_switch_mode: crate::vortix_core::state::killswitch::KillSwitchMode::Off,
             reconciliation_complete: true,
@@ -1536,6 +1544,7 @@ struct OwnerState {
     reconnect_operations: BTreeMap<OperationId, ReconnectOperation>,
     tunnel_revisions: BTreeMap<ProfileId, TunnelRevision>,
     recovery_operations: BTreeSet<OperationId>,
+    unexpected_recoveries: BTreeMap<OperationId, UnexpectedRecovery>,
     lifecycle_operations: BTreeMap<OperationId, LifecycleOperation>,
     topology_transaction: Option<TopologyTransaction>,
     next_lifecycle_event: u64,
@@ -1546,6 +1555,7 @@ impl OwnerState {
         self.work_admissions
             .retain(|(operation, _), _| operation != operation_id);
         self.reconnect_operations.remove(operation_id);
+        self.unexpected_recoveries.remove(operation_id);
         if self
             .topology_transaction
             .as_ref()
@@ -1554,6 +1564,22 @@ impl OwnerState {
             self.topology_transaction = None;
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnexpectedRecoveryPhase {
+    NeedsPreBlock,
+    PreBlockPending,
+    WaitingBackoff,
+    AttemptInFlight,
+}
+
+#[derive(Debug)]
+struct UnexpectedRecovery {
+    profile_id: ProfileId,
+    phase: UnexpectedRecoveryPhase,
+    next_attempt_millis: u64,
+    backoff_millis: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1844,6 +1870,7 @@ async fn run_service(
     supervisor: Option<Arc<Supervisor>>,
     profile_mutations: Option<ProfileMutationDispatcher>,
 ) {
+    let startup_now = clock.now_millis();
     let initial_config = shared_config
         .lock()
         .expect("control config mutex poisoned")
@@ -1865,6 +1892,11 @@ async fn run_service(
             })
             .map(|operation| operation.id.clone())
             .collect(),
+        unexpected_recoveries: restored_unexpected_recoveries(
+            &snapshot,
+            &initial_config,
+            startup_now,
+        ),
         lifecycle_operations: BTreeMap::new(),
         topology_transaction: None,
         next_lifecycle_event: 0,
@@ -1887,6 +1919,17 @@ async fn run_service(
                 expire_operations(&mut snapshot, &mut owner, &admission, now, &config, selection, &mut pending);
                 expire_challenges(&mut snapshot, &mut owner, now, config.max_challenges, &mut pending);
                 handle_envelope(envelope, &mut snapshot, &mut owner, &admission, now, &config, &shared_config, profile_mutations.as_ref(), startup_persistence_fault, &mut readiness_reply, &mut durability_reply, &mut pending);
+                admit_unexpected_loss_recovery(
+                    &before,
+                    &mut snapshot,
+                    &mut owner,
+                    &admission,
+                    now,
+                    &config,
+                    selection,
+                    supervisor.as_deref(),
+                    &mut pending,
+                );
                 if recovered_control_state
                     && !before.readiness.reconciliation_complete
                     && snapshot.readiness.reconciliation_complete
@@ -2105,6 +2148,13 @@ fn drive_supervision(
             });
         }
         if result.result.is_err() {
+            let unexpected_retry = schedule_unexpected_recovery_backoff(
+                owner,
+                snapshot,
+                &result.operation_id,
+                &result.profile_id,
+                now,
+            );
             snapshot
                 .observed
                 .wireguard_handshakes
@@ -2123,12 +2173,23 @@ fn drive_supervision(
                             topology.protocol
                                 == Some(crate::vortix_core::profile::ProtocolKind::WireGuard)
                         }));
-            if result.result == Err(WorkFailure::ChallengeFailed) {
+            if unexpected_retry {
+                if wireguard_handshake_failure {
+                    events.push(ControlEvent::ConnectAttemptFailed {
+                        profile_id: result.profile_id.clone(),
+                        attempt: 1,
+                        reason: crate::vortix_core::engine::state::FailureReason::HandshakeFailed(
+                            "current-generation WireGuard peer evidence was not observed".into(),
+                        ),
+                    });
+                }
+            } else if result.result == Err(WorkFailure::ChallengeFailed) {
                 let rollback_profiles = snapshot
                     .operations
                     .get(&result.operation_id)
                     .and_then(|operation| match &operation.intent {
-                        OperationIntent::DesiredSubset { tunnels, .. } => Some(
+                        OperationIntent::DesiredSubset { tunnels, .. }
+                        | OperationIntent::UnexpectedRecovery { tunnels, .. } => Some(
                             tunnels
                                 .iter()
                                 .filter(|(_, requested)| {
@@ -2307,6 +2368,11 @@ fn drive_supervision(
                     TopologyTransactionPhase::PreBlockPending,
                 ) => {
                     transaction.phase = TopologyTransactionPhase::TunnelsAllowed;
+                    if let Some(recovery) =
+                        owner.unexpected_recoveries.get_mut(&result.operation_id)
+                    {
+                        recovery.phase = UnexpectedRecoveryPhase::WaitingBackoff;
+                    }
                     None
                 }
                 (
@@ -2529,6 +2595,9 @@ fn drive_supervision(
                 if let Some(transaction) = owner.topology_transaction.as_mut() {
                     transaction.phase = TopologyTransactionPhase::PreBlockPending;
                 }
+                if let Some(recovery) = owner.unexpected_recoveries.get_mut(&policy.operation_id) {
+                    recovery.phase = UnexpectedRecoveryPhase::PreBlockPending;
+                }
             }
             Err(WorkFailure::Busy) => {}
             Err(failure) => {
@@ -2549,13 +2618,17 @@ fn drive_supervision(
         }
     }
 
-    let tunnel_actions_allowed = owner
+    let tunnel_action_operation = owner
         .topology_transaction
         .as_ref()
-        .is_some_and(|transaction| {
+        .filter(|transaction| {
             transaction.policy.revision() == revision
                 && transaction.phase == TopologyTransactionPhase::TunnelsAllowed
-        });
+        })
+        .map(|transaction| transaction.policy.operation_id.clone());
+    let tunnel_actions_allowed = tunnel_action_operation
+        .as_ref()
+        .is_some_and(|operation_id| unexpected_recovery_actions_allowed(owner, operation_id, now));
 
     for action in plan.actions.iter().filter(|_| tunnel_actions_allowed) {
         match action {
@@ -2704,6 +2777,15 @@ fn drive_supervision(
                             now,
                             now,
                         );
+                        if schedule_unexpected_recovery_backoff(
+                            owner,
+                            snapshot,
+                            &operation_id,
+                            profile_id,
+                            now,
+                        ) {
+                            continue;
+                        }
                         if reconnect_target || level_triggered_readmission {
                             fail_tunnel_dispatch_operation(
                                 &operation_id,
@@ -2744,6 +2826,15 @@ fn drive_supervision(
                             now,
                             now,
                         );
+                        if schedule_unexpected_recovery_backoff(
+                            owner,
+                            snapshot,
+                            &operation_id,
+                            profile_id,
+                            now,
+                        ) {
+                            continue;
+                        }
                         if reconnect_target || level_triggered_readmission {
                             fail_tunnel_dispatch_operation(
                                 &operation_id,
@@ -2961,6 +3052,11 @@ fn operation_intent_is_compatible(operation: &OperationRecord, snapshot: &Contro
         OperationIntent::DesiredSubset {
             tunnels,
             kill_switch,
+        }
+        | OperationIntent::UnexpectedRecovery {
+            tunnels,
+            kill_switch,
+            ..
         } => {
             tunnels.iter().all(|(profile_id, requested)| {
                 let desired = snapshot.desired.tunnels.get(profile_id);
@@ -2990,6 +3086,51 @@ fn invalidate_all_gates(snapshot: &mut ControlSnapshot, now: u64) {
         now,
         now,
     );
+}
+
+fn schedule_unexpected_recovery_backoff(
+    owner: &mut OwnerState,
+    snapshot: &ControlSnapshot,
+    operation_id: &OperationId,
+    profile_id: &ProfileId,
+    now: u64,
+) -> bool {
+    let Some(recovery) = owner
+        .unexpected_recoveries
+        .get_mut(operation_id)
+        .filter(|recovery| recovery.profile_id == *profile_id)
+    else {
+        return false;
+    };
+    let remaining = snapshot
+        .operations
+        .get(operation_id)
+        .map_or(0, |operation| operation.deadline_millis.saturating_sub(now));
+    let delay = recovery.backoff_millis.min(remaining);
+    recovery.phase = UnexpectedRecoveryPhase::WaitingBackoff;
+    recovery.next_attempt_millis = now.saturating_add(delay);
+    recovery.backoff_millis = recovery.backoff_millis.saturating_mul(2).min(remaining);
+    true
+}
+
+fn unexpected_recovery_actions_allowed(
+    owner: &mut OwnerState,
+    operation_id: &OperationId,
+    now: u64,
+) -> bool {
+    let Some(recovery) = owner.unexpected_recoveries.get_mut(operation_id) else {
+        return true;
+    };
+    match recovery.phase {
+        UnexpectedRecoveryPhase::WaitingBackoff if now >= recovery.next_attempt_millis => {
+            recovery.phase = UnexpectedRecoveryPhase::AttemptInFlight;
+            true
+        }
+        UnexpectedRecoveryPhase::NeedsPreBlock
+        | UnexpectedRecoveryPhase::PreBlockPending
+        | UnexpectedRecoveryPhase::WaitingBackoff => false,
+        UnexpectedRecoveryPhase::AttemptInFlight => true,
+    }
 }
 
 #[allow(clippy::too_many_arguments)] // Failure closes one admitted effect and starts owned recovery.
@@ -3622,9 +3763,13 @@ fn apply_profile_mutation_completion(
                     .get(profile_id)
                     .and_then(|existing| existing.display_name.clone());
                 config.known_profiles.insert(profile_id.clone());
-                config
-                    .profile_topologies
-                    .insert(profile_id.clone(), topology.clone());
+                if let Some(topology) = topology {
+                    config
+                        .profile_topologies
+                        .insert(profile_id.clone(), topology.clone());
+                } else {
+                    config.profile_topologies.remove(profile_id);
+                }
             }
             ProfileMutationApplied::Deleted { profile_id } => {
                 config.known_profiles.remove(profile_id);
@@ -3669,9 +3814,10 @@ fn apply_profile_mutation_completion(
                 profile_id,
                 topology,
             }) => {
-                if let (Some(old_display_name), Some(new_display_name)) =
-                    (old_display_name, topology.display_name)
-                {
+                if let (Some(old_display_name), Some(new_display_name)) = (
+                    old_display_name,
+                    topology.and_then(|value| value.display_name),
+                ) {
                     events.push(ControlEvent::ProfileRenamed {
                         profile_id,
                         old_display_name,
@@ -4388,6 +4534,7 @@ fn complete_operation(
         let was_recovery = owner.recovery_operations.remove(&completion.operation_id);
         owner.release_operation_admission(&completion.operation_id);
         if was_recovery {
+            release_active_profile_operations(admission, &completion.operation_id);
             snapshot.operations.remove(&completion.operation_id);
         } else {
             mark_terminal(admission, &completion.operation_id);
@@ -4443,6 +4590,7 @@ fn complete_operation(
     );
     owner.release_operation_admission(&completion.operation_id);
     if owner.recovery_operations.remove(&completion.operation_id) {
+        release_active_profile_operations(admission, &completion.operation_id);
         snapshot.operations.remove(&completion.operation_id);
     } else {
         mark_terminal(admission, &completion.operation_id);
@@ -4482,6 +4630,7 @@ fn expire_operations(
         cancel_operation_challenges(&id, snapshot, owner, config.max_challenges, events);
         owner.release_operation_admission(&id);
         if was_recovery {
+            release_active_profile_operations(admission, &id);
             snapshot.operations.remove(&id);
         } else {
             mark_terminal(admission, &id);
@@ -4638,6 +4787,154 @@ fn start_recovery_operation(
     register_recovery_lifecycle(owner, snapshot, config, &recovery_id, now, events);
 }
 
+#[allow(clippy::too_many_arguments)]
+fn admit_unexpected_loss_recovery(
+    before: &ControlSnapshot,
+    snapshot: &mut ControlSnapshot,
+    owner: &mut OwnerState,
+    admission: &Arc<Mutex<AdmissionState>>,
+    now: u64,
+    config: &ControlServiceConfig,
+    selection: ExecutionSelection,
+    supervisor: Option<&Supervisor>,
+    events: &mut Vec<ControlEvent>,
+) {
+    if selection != ExecutionSelection::CanonicalAuthority
+        || snapshot.operations.values().any(|operation| {
+            operation.desired_generation == snapshot.desired.generation
+                && !operation.status.is_terminal()
+        })
+    {
+        return;
+    }
+    let Some(supervisor) = supervisor else {
+        return;
+    };
+    let dropped = snapshot
+        .observed
+        .tunnels
+        .iter()
+        .find_map(|(profile_id, observed)| {
+            let was_present = before
+                .observed
+                .tunnels
+                .get(profile_id)
+                .is_some_and(|prior| prior.active);
+            let desired_connected =
+                snapshot.desired.tunnels.get(profile_id) == Some(&RequestedTunnelState::Connected);
+            let canonically_owned = supervisor.profile_truth(profile_id).is_some_and(|entry| {
+                entry.truth == SupervisedTruth::ObservedPresent && entry.adoption.is_some()
+            });
+            (was_present && !observed.active && desired_connected && canonically_owned)
+                .then_some(profile_id.clone())
+        });
+    let Some(profile_id) = dropped else {
+        return;
+    };
+
+    let recovery_id = {
+        let mut state = admission.lock().expect("admission mutex poisoned");
+        let Some(operation_id) = next_operation_id(&mut state, snapshot.desired.authority_epoch)
+        else {
+            state.readiness.reconciliation_complete = false;
+            snapshot.readiness.reconciliation_complete = false;
+            return;
+        };
+        state
+            .active_profile_operations
+            .entry(profile_id.clone())
+            .or_default()
+            .insert(operation_id.clone(), ProfileOperationKind::Lifecycle);
+        operation_id
+    };
+    let retry_budget = u64::try_from(config.retry_budget.as_millis()).unwrap_or(u64::MAX);
+    let retry_backoff = u64::try_from(config.retry_initial_backoff.as_millis()).unwrap_or(u64::MAX);
+    let generation = snapshot.desired.generation;
+    snapshot.operations.insert(
+        recovery_id.clone(),
+        OperationRecord {
+            id: recovery_id.clone(),
+            idempotency_key: IdempotencyKey::new(format!(
+                "unexpected-loss-recovery-{}-{generation}-{now}",
+                profile_id.as_str()
+            )),
+            client_id: ClientId::from_parts(snapshot.desired.authority_epoch, 0),
+            command_digest: snapshot.desired.policy_digest.clone(),
+            authority_epoch: snapshot.desired.authority_epoch,
+            desired_generation: generation,
+            admitted_at_millis: now,
+            deadline_millis: now.saturating_add(retry_budget),
+            intent: OperationIntent::UnexpectedRecovery {
+                profile_id: profile_id.clone(),
+                tunnels: snapshot.desired.tunnels.clone(),
+                kill_switch: Some(snapshot.desired.kill_switch),
+            },
+            status: OperationStatus::WaitingForObservation,
+            result: None,
+        },
+    );
+    owner.recovery_operations.insert(recovery_id.clone());
+    owner.unexpected_recoveries.insert(
+        recovery_id.clone(),
+        UnexpectedRecovery {
+            profile_id,
+            phase: if snapshot.desired.kill_switch
+                == crate::vortix_core::state::killswitch::KillSwitchMode::Auto
+            {
+                UnexpectedRecoveryPhase::NeedsPreBlock
+            } else {
+                UnexpectedRecoveryPhase::WaitingBackoff
+            },
+            next_attempt_millis: now.saturating_add(retry_backoff),
+            backoff_millis: retry_backoff,
+        },
+    );
+    events.push(ControlEvent::OperationAdmitted {
+        operation_id: recovery_id.clone(),
+        desired_generation: generation,
+    });
+    register_recovery_lifecycle(owner, snapshot, config, &recovery_id, now, events);
+}
+
+fn restored_unexpected_recoveries(
+    snapshot: &ControlSnapshot,
+    config: &ControlServiceConfig,
+    now: u64,
+) -> BTreeMap<OperationId, UnexpectedRecovery> {
+    let initial_backoff =
+        u64::try_from(config.retry_initial_backoff.as_millis()).unwrap_or(u64::MAX);
+    snapshot
+        .operations
+        .iter()
+        .filter_map(|(operation_id, operation)| {
+            if operation.status.is_terminal()
+                || operation.desired_generation != snapshot.desired.generation
+            {
+                return None;
+            }
+            let OperationIntent::UnexpectedRecovery { profile_id, .. } = &operation.intent else {
+                return None;
+            };
+            let remaining = operation.deadline_millis.saturating_sub(now);
+            Some((
+                operation_id.clone(),
+                UnexpectedRecovery {
+                    profile_id: profile_id.clone(),
+                    phase: if snapshot.desired.kill_switch
+                        == crate::vortix_core::state::killswitch::KillSwitchMode::Auto
+                    {
+                        UnexpectedRecoveryPhase::NeedsPreBlock
+                    } else {
+                        UnexpectedRecoveryPhase::WaitingBackoff
+                    },
+                    next_attempt_millis: now.saturating_add(initial_backoff.min(remaining)),
+                    backoff_millis: initial_backoff.min(remaining),
+                },
+            ))
+        })
+        .collect()
+}
+
 fn intent_for_desired_state(snapshot: &ControlSnapshot) -> OperationIntent {
     OperationIntent::DesiredSubset {
         tunnels: snapshot.desired.tunnels.clone(),
@@ -4682,6 +4979,21 @@ fn register_recovery_lifecycle(
 fn mark_terminal(admission: &Arc<Mutex<AdmissionState>>, operation_id: &OperationId) {
     let mut admission = admission.lock().expect("admission mutex poisoned");
     admission.terminal_operations.insert(operation_id.clone());
+    release_active_profile_operations_locked(&mut admission, operation_id);
+}
+
+fn release_active_profile_operations(
+    admission: &Arc<Mutex<AdmissionState>>,
+    operation_id: &OperationId,
+) {
+    let mut admission = admission.lock().expect("admission mutex poisoned");
+    release_active_profile_operations_locked(&mut admission, operation_id);
+}
+
+fn release_active_profile_operations_locked(
+    admission: &mut AdmissionState,
+    operation_id: &OperationId,
+) {
     admission.active_profile_operations.retain(|_, operations| {
         operations.remove(operation_id);
         !operations.is_empty()
@@ -4691,7 +5003,8 @@ fn mark_terminal(admission: &Arc<Mutex<AdmissionState>>, operation_id: &Operatio
 fn operation_intent_profiles(intent: &OperationIntent) -> Vec<ProfileId> {
     match intent {
         OperationIntent::GenerationScoped => Vec::new(),
-        OperationIntent::DesiredSubset { tunnels, .. } => tunnels.keys().cloned().collect(),
+        OperationIntent::DesiredSubset { tunnels, .. }
+        | OperationIntent::UnexpectedRecovery { tunnels, .. } => tunnels.keys().cloned().collect(),
         OperationIntent::ProfileMutation { profile_id } => vec![profile_id.clone()],
     }
 }

@@ -1,7 +1,7 @@
 //! Standard-mode CLI adapter for the canonical in-process control service.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -246,23 +246,29 @@ impl ProfileMutationExecutor for StandardProfileMutationExecutor {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .get(&profile_id)
-                    .cloned()
-                    .ok_or(ProfileMutationFailure::Internal)?;
+                    .cloned();
                 let store = FsProfileStore::new(self.profiles_dir.clone());
                 let renamed = store
                     .rename(&profile_id, &new_display_name)
                     .map_err(|error| Self::map_store_error(&error))?;
                 profile.name = renamed.display_name;
                 profile.config_path = renamed.config_path;
-                topology.display_name = Some(profile.name.clone());
+                if let Some(topology) = &mut topology {
+                    topology.display_name = Some(profile.name.clone());
+                }
                 self.profiles
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .insert(profile_id.clone(), profile.clone());
-                self.topologies
+                let mut topologies = self
+                    .topologies
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(profile_id.clone(), topology.clone());
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(topology) = &topology {
+                    topologies.insert(profile_id.clone(), topology.clone());
+                } else {
+                    topologies.remove(&profile_id);
+                }
                 self.record(
                     operation_id.clone(),
                     Ok(LocalProfileMutationReceipt::Renamed(profile)),
@@ -1208,6 +1214,35 @@ pub(crate) fn config_owner(_config_dir: &Path) -> Result<(u32, u32), LocalContro
     ))
 }
 
+/// Read durable canonical intent without starting protocol or policy workers.
+/// This keeps an already-disconnected `down` unprivileged while ensuring a
+/// missing kernel tunnel cannot hide a still-connected desired state.
+pub(crate) fn durable_disconnect_required(
+    config_dir: &Path,
+    target_profiles: &BTreeSet<ProfileId>,
+) -> Result<bool, LocalControlError> {
+    let boot_id = crate::utils::boot_identity()
+        .ok_or_else(|| LocalControlError::Persistence("OS boot identity is unavailable".into()))?;
+    let owner = config_owner(config_dir)?;
+    let store = FsControlStateStore::for_owner(config_dir.join("control"), owner.0, owner.1);
+    let recovered = store
+        .load(&boot_id)
+        .map_err(|error| LocalControlError::Persistence(error.to_string()))?;
+    Ok(recovered.is_some_and(|recovered| {
+        desired_disconnect_required(&recovered.state.desired.tunnels, target_profiles)
+    }))
+}
+
+fn desired_disconnect_required(
+    desired: &BTreeMap<ProfileId, RequestedTunnelState>,
+    target_profiles: &BTreeSet<ProfileId>,
+) -> bool {
+    desired.iter().any(|(profile, state)| {
+        *state == RequestedTunnelState::Connected
+            && (target_profiles.is_empty() || target_profiles.contains(profile))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1235,6 +1270,26 @@ mod tests {
             started + SCANNER_REFRESH_CEILING
         ));
         assert!(SCANNER_REFRESH_CEILING > CONTROL_PROGRESS_INTERVAL);
+    }
+
+    #[test]
+    fn inactive_down_still_requires_control_when_durable_intent_is_connected() {
+        let connected = profile_id('a');
+        let disconnected = profile_id('b');
+        let desired = BTreeMap::from([
+            (connected.clone(), RequestedTunnelState::Connected),
+            (disconnected.clone(), RequestedTunnelState::Disconnected),
+        ]);
+
+        assert!(desired_disconnect_required(&desired, &BTreeSet::new()));
+        assert!(desired_disconnect_required(
+            &desired,
+            &BTreeSet::from([connected])
+        ));
+        assert!(!desired_disconnect_required(
+            &desired,
+            &BTreeSet::from([disconnected])
+        ));
     }
 
     #[test]

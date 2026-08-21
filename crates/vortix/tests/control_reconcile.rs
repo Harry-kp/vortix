@@ -18,8 +18,8 @@ use vortix::vortix_core::control::worker::{
 use vortix::vortix_core::control::{
     Clock, CommandRequest, CompletionOutcome, CompletionResult, ControlEvent, ControlService,
     ControlServiceConfig, Deadline, ExecutionSelection, GateEvidence, HookEvent, IdempotencyKey,
-    Observation, OperationCompletion, OperationStatus, PersistedTombstone, ProfileTopology,
-    ProtectionEvidence, ProtectionStatus, RequestedTunnelState, UserCommand,
+    Observation, OperationCompletion, OperationIntent, OperationStatus, PersistedTombstone,
+    ProfileTopology, ProtectionEvidence, ProtectionStatus, RequestedTunnelState, UserCommand,
 };
 use vortix::vortix_core::ports::tunnel::{HandshakeEvidence, TunnelKindTag};
 use vortix::vortix_core::profile::{ProfileId, ProtocolKind};
@@ -1457,6 +1457,99 @@ async fn connect_and_settle(
                 .is_some_and(|entry| entry.truth == SupervisedTruth::ObservedPresent)
         },
         "tunnel did not settle",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn unexpected_managed_absence_preblocks_then_runs_bounded_recovery() {
+    let target = profile("unexpected-drop");
+    let capture = Arc::new(TopologyCapture::default());
+    let supervisor = Arc::new(Supervisor::new(
+        AuthorityEpoch(1),
+        capture.clone(),
+        capture.clone(),
+        2,
+        8,
+    ));
+    let clock = Arc::new(TestClock::default());
+    let service = ControlService::start_supervised(
+        ControlServiceConfig {
+            authority_epoch: AuthorityEpoch(1),
+            known_profiles: BTreeSet::from([target.clone()]),
+            profile_topologies: BTreeMap::from([(target.clone(), ProfileTopology::default())]),
+            freshness_poll_interval: Duration::from_millis(5),
+            retry_budget: Duration::from_secs(6),
+            retry_initial_backoff: Duration::from_secs(2),
+            ..ControlServiceConfig::default()
+        },
+        clock.clone(),
+        ExecutionSelection::CanonicalAuthority,
+        supervisor.clone(),
+    );
+    connect_and_settle(
+        &service,
+        &supervisor,
+        &capture,
+        &target,
+        "unexpected-drop-connect",
+    )
+    .await;
+    set_killswitch_and_settle(
+        &service,
+        &capture,
+        vortix::vortix_core::state::killswitch::KillSwitchMode::Auto,
+        "unexpected-drop-block-on-drop",
+    )
+    .await;
+    let generation = service.client().snapshot().desired.generation;
+    capture.hold_pre_block(generation);
+    capture.tunnel_calls.lock().unwrap().clear();
+
+    service
+        .observer()
+        .observe(Observation::Tunnel {
+            profile_id: target.clone(),
+            active: false,
+            interface_name: None,
+            observed_at_millis: 0,
+            protection: None,
+        })
+        .await
+        .unwrap();
+    wait_for_condition(
+        || capture.pre_block_entered(generation),
+        "unexpected loss did not enter recovery pre-block",
+    )
+    .await;
+    let dropped = service.client().snapshot();
+    let recovery = dropped
+        .operations
+        .values()
+        .find(|operation| {
+            matches!(operation.intent, OperationIntent::UnexpectedRecovery { .. })
+                && !operation.status.is_terminal()
+        })
+        .expect("drop must durably admit typed recovery");
+    assert_eq!(recovery.deadline_millis, 6_000);
+    assert!(capture.tunnel_calls.lock().unwrap().is_empty());
+
+    capture.release_pre_block(generation);
+    clock.0.store(2_000, Ordering::Release);
+    service.client().refresh().unwrap();
+    wait_for_condition(
+        || {
+            capture
+                .tunnel_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(profile_id, mutation, _)| {
+                    profile_id == &target && *mutation == TunnelMutation::Connect
+                })
+        },
+        "configured recovery backoff did not admit reconnect",
     )
     .await;
 }

@@ -408,6 +408,17 @@ pub enum OperationIntent {
         #[serde(default, with = "serde_optional_killswitch_slug")]
         kill_switch: Option<KillSwitchMode>,
     },
+    /// Service-owned recovery after a canonically managed tunnel vanished.
+    /// Persisting this distinction ensures a same-boot restart re-enters the
+    /// pre-block phase instead of treating the operation as an ordinary
+    /// reconnect.
+    UnexpectedRecovery {
+        profile_id: ProfileId,
+        #[serde(default)]
+        tunnels: BTreeMap<ProfileId, RequestedTunnelState>,
+        #[serde(default, with = "serde_optional_killswitch_slug")]
+        kill_switch: Option<KillSwitchMode>,
+    },
     /// Filesystem/catalog mutation. The prepared import body remains in the
     /// injected executor and is never serialized here.
     ProfileMutation { profile_id: ProfileId },

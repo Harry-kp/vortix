@@ -3,6 +3,7 @@
 //! Each handler operates headlessly via `VpnRuntime` (no TUI), produces
 //! structured output via [`OutputMode`], and exits with semantic exit codes.
 
+use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
@@ -851,7 +852,18 @@ fn handle_down(
         targets.retain(|s| s.name == name);
     }
 
-    if targets.is_empty() {
+    let requested_profiles = profile_filter
+        .and_then(|name| engine.profiles.iter().find(|profile| profile.name == name))
+        .map(|profile| BTreeSet::from([profile.id.clone()]))
+        .unwrap_or_default();
+    let durable_disconnect_required = if targets.is_empty() {
+        crate::cli::control::durable_disconnect_required(config_dir, &requested_profiles)
+            .unwrap_or_else(|error| local_control_error_or_exit(mode, "down", &error))
+    } else {
+        false
+    };
+
+    if targets.is_empty() && !durable_disconnect_required {
         // Idempotent: already disconnected = success. Matches the
         // scenario "vortix down corp with corp not active → exit 0".
         let data = DownData {
@@ -932,7 +944,9 @@ fn handle_down(
     };
     match mode {
         OutputMode::Human => {
-            if disconnected.len() == 1 {
+            if disconnected.is_empty() {
+                println!("Already disconnected");
+            } else if disconnected.len() == 1 {
                 println!("Disconnected {}", disconnected[0]);
             } else {
                 println!("Disconnected {} tunnels:", disconnected.len());
