@@ -12,12 +12,13 @@ use crate::vortix_core::control::AuthorityEpoch;
 use crate::vortix_core::ports::tunnel::TunnelKindTag;
 use crate::vortix_core::privileged::{
     AmbiguousPhase, BootScope, HelperEpoch, LeaseId, ObservationState, OpenVpnAuthFactors,
-    OpenVpnPlan, OpenVpnRemote, OpenVpnRemoteSelection, OpenVpnTransport, OperationDigest,
-    PeerProcessIdentity, PlatformVerifiedAuthority, PrivilegedOperation, PrivilegedRequest,
-    ProtocolEndpoint, ProtocolPlan, ReceiptLedger, RequestSequence, ResourceKind,
-    ResourceObservation, ResourceObservationTarget, ResourceTag, RootAuthorityLedger,
-    ServiceInstanceClaim, TrustedDaemonPrincipal, VerifiedReceipt, WireGuardInterfaceOptions,
-    WireGuardPeerObservation, WireGuardPeerPlan, WireGuardPlan,
+    OpenVpnPlan, OpenVpnRemote, OpenVpnRemoteSelection, OpenVpnRouteEvidence,
+    OpenVpnRouteSetEvidence, OpenVpnTransport, OperationDigest, PeerProcessIdentity,
+    PlatformVerifiedAuthority, PrivilegedOperation, PrivilegedRequest, ProtocolEndpoint,
+    ProtocolPlan, ReceiptLedger, RequestSequence, ResourceKind, ResourceObservation,
+    ResourceObservationTarget, ResourceTag, RootAuthorityLedger, ServiceInstanceClaim,
+    TrustedDaemonPrincipal, VerifiedReceipt, WireGuardInterfaceOptions, WireGuardPeerObservation,
+    WireGuardPeerPlan, WireGuardPlan,
 };
 use crate::vortix_core::profile::{Profile, ProfileId, ProtocolKind};
 
@@ -590,7 +591,17 @@ fn openvpn_connect_keeps_process_identity_inside_the_helper_boundary() {
         .observed(
             &observe_request,
             vec![
-                ResourceObservation::new(tunnel, ObservationState::Present, 10).unwrap(),
+                ResourceObservation::with_openvpn_routes(
+                    tunnel,
+                    ObservationState::Present,
+                    10,
+                    OpenVpnRouteEvidence::new(
+                        OpenVpnRouteSetEvidence::new(Vec::new(), None).unwrap(),
+                        OpenVpnRouteSetEvidence::new(Vec::new(), None).unwrap(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
                 ResourceObservation::new(group, ObservationState::Present, 10).unwrap(),
             ],
         )
@@ -611,6 +622,7 @@ fn openvpn_connect_keeps_process_identity_inside_the_helper_boundary() {
         )
         .unwrap();
 
+    assert!(receipt.openvpn_routes.is_some());
     let adoption = receipt.adoption.unwrap();
     assert_eq!(adoption.kind(), TunnelKindTag::OpenVpn);
     assert!(adoption.interface_name().starts_with("vx"));

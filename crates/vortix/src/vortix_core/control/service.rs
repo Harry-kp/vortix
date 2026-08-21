@@ -1603,7 +1603,7 @@ impl OwnerState {
         if self
             .topology_transaction
             .as_ref()
-            .is_some_and(|transaction| &transaction.policy.operation_id == operation_id)
+            .is_some_and(|transaction| &transaction.pre_policy.operation_id == operation_id)
         {
             self.topology_transaction = None;
         }
@@ -1621,8 +1621,10 @@ enum TopologyTransactionPhase {
 
 #[derive(Debug, Clone)]
 struct TopologyTransaction {
-    /// Immutable final topology captured before the first tunnel mutation.
-    policy: TopologyPolicy,
+    /// Immutable safety policy captured before the first tunnel mutation.
+    pre_policy: TopologyPolicy,
+    /// Current-generation topology sealed once after tunnel observation.
+    final_policy: Option<TopologyPolicy>,
     phase: TopologyTransactionPhase,
 }
 
@@ -2214,6 +2216,19 @@ fn drive_supervision(
     }
 
     while let Some(result) = supervisor.poll_tunnel() {
+        if let Some(routes) = result
+            .openvpn_routes
+            .as_ref()
+            .filter(|_| result.result.is_ok())
+        {
+            snapshot.observed.openvpn_routes.insert(
+                result.profile_id.clone(),
+                crate::vortix_core::control::model::ObservedOpenVpnRoutes {
+                    desired_generation: result.revision.generation,
+                    evidence: routes.clone(),
+                },
+            );
+        }
         if let Some(handshake) = result.handshake.as_ref().filter(|handshake| {
             result.result.is_ok() && handshake.generation == result.revision.generation
         }) {
@@ -2233,6 +2248,7 @@ fn drive_supervision(
             });
         }
         if result.result.is_err() {
+            snapshot.observed.openvpn_routes.remove(&result.profile_id);
             snapshot
                 .observed
                 .wireguard_handshakes
@@ -2369,10 +2385,10 @@ fn drive_supervision(
                     TopologyTransactionPhase::FinalPending => Some(PolicyStage::Final),
                     _ => None,
                 };
-                transaction.policy.authority_epoch == result.authority_epoch
-                    && transaction.policy.generation == result.generation
-                    && transaction.policy.digest == result.digest
-                    && transaction.policy.operation_id == result.operation_id
+                transaction.pre_policy.authority_epoch == result.authority_epoch
+                    && transaction.pre_policy.generation == result.generation
+                    && transaction.pre_policy.digest == result.digest
+                    && transaction.pre_policy.operation_id == result.operation_id
                     && expected_stage == Some(result.stage)
             });
         let mut effective_outcome = result.outcome;
@@ -2447,8 +2463,8 @@ fn drive_supervision(
                 }
                 (_, PolicyOutcome::Applied, _) => None,
                 (_, outcome, _) => Some((
-                    transaction.policy.operation_id.clone(),
-                    transaction.policy.generation,
+                    transaction.pre_policy.operation_id.clone(),
+                    transaction.pre_policy.generation,
                     policy_outcome_failure(outcome),
                 )),
             }
@@ -2621,8 +2637,8 @@ fn drive_supervision(
                 .topology_transaction
                 .as_ref()
                 .is_some_and(|transaction| {
-                    transaction.policy.revision() == revision
-                        && transaction.policy.operation_id == operation.id
+                    transaction.pre_policy.revision() == revision
+                        && transaction.pre_policy.operation_id == operation.id
                 });
         if !transaction_is_current {
             let transition = transition_for_plan(
@@ -2641,7 +2657,11 @@ fn drive_supervision(
                 } else {
                     TopologyTransactionPhase::TunnelsAllowed
                 };
-                owner.topology_transaction = Some(TopologyTransaction { policy, phase });
+                owner.topology_transaction = Some(TopologyTransaction {
+                    pre_policy: policy,
+                    final_policy: None,
+                    phase,
+                });
             } else {
                 invalidate_all_gates(snapshot, now);
             }
@@ -2650,7 +2670,7 @@ fn drive_supervision(
 
     let pre_block_submission = owner.topology_transaction.as_ref().and_then(|transaction| {
         (transaction.phase == TopologyTransactionPhase::NeedsPreBlock).then(|| {
-            let mut policy = transaction.policy.clone();
+            let mut policy = transaction.pre_policy.clone();
             policy.stage = PolicyStage::PreTunnelBlocking;
             policy
         })
@@ -2685,7 +2705,7 @@ fn drive_supervision(
         .topology_transaction
         .as_ref()
         .is_some_and(|transaction| {
-            transaction.policy.revision() == revision
+            transaction.pre_policy.revision() == revision
                 && transaction.phase == TopologyTransactionPhase::TunnelsAllowed
         });
 
@@ -2974,16 +2994,32 @@ fn drive_supervision(
             }
         });
 
-    let final_submission = tunnel_barrier_ready
-        .then_some(owner.topology_transaction.as_ref())
-        .flatten()
-        .filter(|transaction| {
-            transaction.policy.revision() == revision
-                && transaction.phase == TopologyTransactionPhase::TunnelsAllowed
-        })
-        .map(|transaction| transaction.policy.clone());
-    if let Some(policy) = final_submission {
-        match supervisor.submit_policy(&policy) {
+    let final_submission = if tunnel_barrier_ready {
+        owner
+            .topology_transaction
+            .as_mut()
+            .filter(|transaction| {
+                transaction.pre_policy.revision() == revision
+                    && transaction.phase == TopologyTransactionPhase::TunnelsAllowed
+            })
+            .map(|transaction| {
+                let pre_policy = &transaction.pre_policy;
+                let policy = transaction
+                    .final_policy
+                    .get_or_insert_with(|| seal_final_topology_policy(pre_policy, snapshot));
+                let result = supervisor.submit_policy(policy);
+                let failure_context = result
+                    .as_ref()
+                    .err()
+                    .filter(|failure| **failure != WorkFailure::Busy)
+                    .map(|_| (policy.operation_id.clone(), policy.generation));
+                (result, failure_context)
+            })
+    } else {
+        None
+    };
+    if let Some((submission, failure_context)) = final_submission {
+        match submission {
             Ok(()) => {
                 if let Some(transaction) = owner.topology_transaction.as_mut() {
                     transaction.phase = TopologyTransactionPhase::FinalPending;
@@ -2991,10 +3027,11 @@ fn drive_supervision(
             }
             Err(WorkFailure::Busy) => {}
             Err(failure) => {
-                let operation_id = policy.operation_id.clone();
+                let (operation_id, generation) =
+                    failure_context.expect("non-busy policy failure captured");
                 fail_tunnel_dispatch_operation(
                     &operation_id,
-                    policy.generation,
+                    generation,
                     failure,
                     snapshot,
                     owner,
@@ -3246,6 +3283,42 @@ fn policy_outcome_failure(outcome: PolicyOutcome) -> WorkFailure {
     }
 }
 
+fn seal_final_topology_policy(
+    pre_policy: &TopologyPolicy,
+    snapshot: &ControlSnapshot,
+) -> TopologyPolicy {
+    let mut final_policy = pre_policy.clone();
+    final_policy.stage = PolicyStage::Final;
+    for (profile_id, protocol) in &final_policy.target.protocols {
+        if *protocol != crate::vortix_core::profile::ProtocolKind::OpenVpn {
+            continue;
+        }
+        let Some(observed) = snapshot
+            .observed
+            .openvpn_routes
+            .get(profile_id)
+            .filter(|observed| observed.desired_generation == final_policy.generation)
+        else {
+            // Standard mode has no helper-authenticated negotiated evidence
+            // yet, so its existing configured-route contract remains intact.
+            continue;
+        };
+        final_policy
+            .target
+            .routes
+            .entry(profile_id.clone())
+            .or_default()
+            .extend(crate::vortix_core::control::worker::openvpn_route_claims(
+                &observed.evidence,
+            ));
+        final_policy
+            .target
+            .openvpn_routes
+            .insert(profile_id.clone(), observed.evidence.clone());
+    }
+    final_policy
+}
+
 #[allow(clippy::too_many_arguments)] // Captures one immutable cross-barrier transaction.
 fn capture_topology_policy(
     snapshot: &ControlSnapshot,
@@ -3396,6 +3469,7 @@ fn build_topology_state(
     config: &ControlServiceConfig,
     kill_switch: crate::vortix_core::state::killswitch::KillSwitchMode,
 ) -> TopologyState {
+    let mut protocols = BTreeMap::new();
     let mut interfaces = BTreeMap::new();
     let mut routes = BTreeMap::new();
     let mut server_ips = BTreeMap::new();
@@ -3416,6 +3490,9 @@ fn build_topology_state(
             interfaces.insert(profile.clone(), interface);
         }
         if let Some(topology) = configured {
+            if let Some(protocol) = topology.protocol {
+                protocols.insert(profile.clone(), protocol);
+            }
             let claims = topology
                 .routes
                 .iter()
@@ -3433,8 +3510,10 @@ fn build_topology_state(
     }
     TopologyState {
         profiles,
+        protocols,
         interfaces,
         routes,
+        openvpn_routes: BTreeMap::new(),
         server_ips,
         dns_requests,
         dns_digest: PolicyDigest::sha256(&dns_material),
@@ -3735,6 +3814,7 @@ fn apply_desired(
             profile_id: Some(profile_id),
         } => {
             snapshot.observed.wireguard_handshakes.remove(profile_id);
+            snapshot.observed.openvpn_routes.remove(profile_id);
             snapshot
                 .observed
                 .wireguard_probe_receipts
@@ -3744,12 +3824,14 @@ fn apply_desired(
         UserCommand::Disconnect { profile_id: None }
         | UserCommand::ForceDisconnect { profile_id: None } => {
             snapshot.observed.wireguard_handshakes.clear();
+            snapshot.observed.openvpn_routes.clear();
             snapshot.observed.wireguard_probe_receipts.clear();
             snapshot.observed.connection_health.clear();
         }
         UserCommand::Reconnect { profile_id: None } => {
             for profile_id in target_profiles {
                 snapshot.observed.wireguard_handshakes.remove(profile_id);
+                snapshot.observed.openvpn_routes.remove(profile_id);
                 snapshot
                     .observed
                     .wireguard_probe_receipts
@@ -3909,6 +3991,7 @@ fn apply_profile_mutation_completion(
                 snapshot.observed.tunnels.remove(profile_id);
                 snapshot.observed.tunnel_details.remove(profile_id);
                 snapshot.observed.wireguard_handshakes.remove(profile_id);
+                snapshot.observed.openvpn_routes.remove(profile_id);
                 snapshot
                     .observed
                     .wireguard_probe_receipts

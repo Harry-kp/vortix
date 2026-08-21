@@ -16,7 +16,7 @@ use crate::vortix_core::ports::owned_dns::{
 };
 use crate::vortix_core::privileged::{
     DnsTransactionId, HelperLedgerDns, HelperResourceState, LeaseId, NetworkPolicyOperation,
-    ObservationState, PhysicalDnsBackend, PhysicalDnsStage, PolicyProjection, PrivilegedDnsScope,
+    PhysicalDnsBackend, PhysicalDnsStage, PolicyProjection, PrivilegedDnsScope,
     ResourceObservation,
 };
 
@@ -324,8 +324,12 @@ impl HelperDnsExecutor {
                     .audit_physical(&desired, &physical)
                     .map_err(map_execution_error)?;
                 Ok(NetworkPolicyOutcome::Observed(vec![
-                    ResourceObservation::new(policy.clone(), ObservationState::Present, 1)
-                        .map_err(|_| PrivilegedExecutionError::InvalidPlan)?,
+                    ResourceObservation::new(
+                        policy.clone(),
+                        plan.intended().expected_observation_state(),
+                        1,
+                    )
+                    .map_err(|_| PrivilegedExecutionError::InvalidPlan)?,
                 ]))
             }
             _ => Err(PrivilegedExecutionError::InvalidPlan),
@@ -721,6 +725,7 @@ mod tests {
                 policy: current.policy().clone(),
                 resources: vec![obsolete.policy().clone()],
                 predecessor: PolicyPredecessor::for_test(current.digest(), PolicyPhase::Firewall),
+                retained_state: crate::vortix_core::privileged::ObservationState::Present,
             },
             vec![current],
             vec![obsolete],
@@ -774,6 +779,7 @@ mod tests {
                 policy: current.policy().clone(),
                 resources: vec![obsolete.policy().clone()],
                 predecessor: PolicyPredecessor::for_test(current.digest(), PolicyPhase::Firewall),
+                retained_state: crate::vortix_core::privileged::ObservationState::Present,
             },
             vec![current],
             vec![obsolete],

@@ -5,7 +5,7 @@
 //! plugin, include, or arbitrary option vocabulary.
 
 use std::collections::BTreeSet;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -685,6 +685,8 @@ pub struct OpenVpnPlan {
     remote_selection: OpenVpnRemoteSelection,
     authentication: OpenVpnAuthFactors,
     requested_routes: Vec<OpenVpnRoute>,
+    #[serde(default, skip_serializing_if = "OpenVpnRouteDefaults::is_empty")]
+    route_defaults: OpenVpnRouteDefaults,
     materials: BTreeSet<ProfileMaterialSlot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tls_auth_direction: Option<OpenVpnKeyDirection>,
@@ -699,6 +701,8 @@ struct OpenVpnPlanWire {
     remote_selection: OpenVpnRemoteSelection,
     authentication: OpenVpnAuthFactors,
     requested_routes: BoundedVec<OpenVpnRoute, MAX_ALLOWED_ROUTES>,
+    #[serde(default)]
+    route_defaults: OpenVpnRouteDefaults,
     materials: BoundedVec<ProfileMaterialSlot, 8>,
     #[serde(default)]
     tls_auth_direction: Option<OpenVpnKeyDirection>,
@@ -717,6 +721,7 @@ impl TryFrom<OpenVpnPlanWire> for OpenVpnPlan {
             wire.requested_routes.into_vec(),
             wire.materials.into_vec().into_iter().collect(),
         )?;
+        let plan = plan.with_route_defaults(wire.route_defaults);
         match wire.tls_auth_direction {
             Some(direction) => plan.with_tls_auth_direction(direction),
             None => Ok(plan),
@@ -794,6 +799,7 @@ impl OpenVpnPlan {
             remote_selection,
             authentication,
             requested_routes,
+            route_defaults: OpenVpnRouteDefaults::default(),
             materials,
             tls_auth_direction: None,
         })
@@ -811,6 +817,12 @@ impl OpenVpnPlan {
         }
         self.tls_auth_direction = Some(direction);
         Ok(self)
+    }
+
+    #[must_use]
+    pub const fn with_route_defaults(mut self, route_defaults: OpenVpnRouteDefaults) -> Self {
+        self.route_defaults = route_defaults;
+        self
     }
 
     #[must_use]
@@ -836,6 +848,16 @@ impl OpenVpnPlan {
     #[must_use]
     pub const fn authentication(&self) -> OpenVpnAuthFactors {
         self.authentication
+    }
+
+    #[must_use]
+    pub fn requested_routes(&self) -> &[OpenVpnRoute] {
+        &self.requested_routes
+    }
+
+    #[must_use]
+    pub const fn route_defaults(&self) -> OpenVpnRouteDefaults {
+        self.route_defaults
     }
 
     #[must_use]
@@ -1045,11 +1067,184 @@ impl OpenVpnAuthFactors {
     }
 }
 
+/// Gateway semantics carried by one `OpenVPN` route directive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenVpnRouteGateway {
+    /// The gateway assigned by the VPN server (`default`/`vpn_gateway`).
+    VpnDefault,
+    /// The pre-tunnel system gateway (`net_gateway`).
+    NetGateway,
+    /// The resolved remote-server gateway (`remote_host`).
+    RemoteHost,
+    /// One explicit gateway address.
+    Address(IpAddr),
+}
+
+/// One explicit IPv4 `route-gateway` value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenVpnDefaultGateway {
+    /// A literal gateway address. Hostname resolution stays outside the helper
+    /// contract because it cannot be authenticated as route truth.
+    Address(IpAddr),
+    /// Obtain the IPv4 gateway from the `OpenVPN` TAP DHCP negotiation.
+    Dhcp,
+}
+
+/// Reviewed default gateway directives for one configured or pushed origin.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub struct OpenVpnDefaultGateways {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ipv4: Option<OpenVpnDefaultGateway>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ipv6: Option<Ipv6Addr>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OpenVpnDefaultGatewaysWire {
+    #[serde(default)]
+    ipv4: Option<OpenVpnDefaultGateway>,
+    #[serde(default)]
+    ipv6: Option<Ipv6Addr>,
+}
+
+impl<'de> Deserialize<'de> for OpenVpnDefaultGateways {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = OpenVpnDefaultGatewaysWire::deserialize(deserializer)?;
+        Self::new(wire.ipv4, wire.ipv6).map_err(serde::de::Error::custom)
+    }
+}
+
+impl OpenVpnDefaultGateways {
+    pub fn new(
+        ipv4: Option<OpenVpnDefaultGateway>,
+        ipv6: Option<Ipv6Addr>,
+    ) -> Result<Self, ProtocolPlanError> {
+        if matches!(ipv4, Some(OpenVpnDefaultGateway::Address(address)) if {
+            !address.is_ipv4() || invalid_unicast_ip(&address)
+        }) || ipv6.is_some_and(|address| address.is_unspecified() || address.is_multicast())
+        {
+            return Err(ProtocolPlanError::InvalidRouteGateway);
+        }
+        Ok(Self { ipv4, ipv6 })
+    }
+
+    #[must_use]
+    pub const fn ipv4(self) -> Option<OpenVpnDefaultGateway> {
+        self.ipv4
+    }
+
+    #[must_use]
+    pub const fn ipv6(self) -> Option<Ipv6Addr> {
+        self.ipv6
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.ipv4.is_none() && self.ipv6.is_none()
+    }
+}
+
+/// Default gateway and metric values applied to `OpenVPN` routes that omit
+/// an explicit value.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenVpnRouteDefaults {
+    #[serde(default, skip_serializing_if = "OpenVpnDefaultGateways::is_empty")]
+    gateways: OpenVpnDefaultGateways,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    metric: Option<u32>,
+}
+
+impl OpenVpnRouteDefaults {
+    #[must_use]
+    pub const fn new(gateways: OpenVpnDefaultGateways, metric: Option<u32>) -> Self {
+        Self { gateways, metric }
+    }
+
+    #[must_use]
+    pub const fn gateways(self) -> OpenVpnDefaultGateways {
+        self.gateways
+    }
+
+    #[must_use]
+    pub const fn metric(self) -> Option<u32> {
+        self.metric
+    }
+
+    #[must_use]
+    pub fn merged(configured: Self, pushed: Self) -> Self {
+        let configured_gateways = configured.gateways();
+        let pushed_gateways = pushed.gateways();
+        let gateways = OpenVpnDefaultGateways::new(
+            pushed_gateways.ipv4().or(configured_gateways.ipv4()),
+            pushed_gateways.ipv6().or(configured_gateways.ipv6()),
+        )
+        .expect("merging validated gateway families remains valid");
+        Self::new(gateways, pushed.metric().or(configured.metric()))
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.gateways.is_empty() && self.metric.is_none()
+    }
+}
+
+/// One reviewed `redirect-gateway` flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenVpnRedirectFlag {
+    Local,
+    AutoLocal,
+    Def1,
+    BypassDhcp,
+    BypassDns,
+    BlockLocal,
+    Ipv6,
+    DisableIpv4,
+}
+
+/// Exact reviewed flags from one `redirect-gateway` directive.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct OpenVpnRedirectGateway(BTreeSet<OpenVpnRedirectFlag>);
+
+impl OpenVpnRedirectGateway {
+    pub fn new(flags: Vec<OpenVpnRedirectFlag>) -> Result<Self, ProtocolPlanError> {
+        let count = flags.len();
+        let flags = flags.into_iter().collect::<BTreeSet<_>>();
+        if flags.len() != count {
+            return Err(ProtocolPlanError::InvalidRouteGateway);
+        }
+        Ok(Self(flags))
+    }
+
+    #[must_use]
+    pub fn flags(&self) -> &BTreeSet<OpenVpnRedirectFlag> {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn ipv4(&self) -> bool {
+        !self.0.contains(&OpenVpnRedirectFlag::DisableIpv4)
+    }
+
+    #[must_use]
+    pub fn ipv6(&self) -> bool {
+        self.0.contains(&OpenVpnRedirectFlag::Ipv6)
+    }
+}
+
 /// One bounded `OpenVPN` route directive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub struct OpenVpnRoute {
     destination: Cidr,
-    gateway: Option<IpAddr>,
+    gateway: OpenVpnRouteGateway,
     metric: Option<u32>,
 }
 
@@ -1057,8 +1252,15 @@ pub struct OpenVpnRoute {
 #[serde(deny_unknown_fields)]
 struct OpenVpnRouteWire {
     destination: Cidr,
-    gateway: Option<IpAddr>,
+    gateway: OpenVpnRouteGatewayWire,
     metric: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+enum OpenVpnRouteGatewayWire {
+    Current(OpenVpnRouteGateway),
+    Legacy(Option<IpAddr>),
 }
 
 impl<'de> Deserialize<'de> for OpenVpnRoute {
@@ -1067,7 +1269,14 @@ impl<'de> Deserialize<'de> for OpenVpnRoute {
         D: serde::Deserializer<'de>,
     {
         let wire = OpenVpnRouteWire::deserialize(deserializer)?;
-        Self::new(wire.destination, wire.gateway, wire.metric).map_err(serde::de::Error::custom)
+        let gateway = match wire.gateway {
+            OpenVpnRouteGatewayWire::Current(gateway) => gateway,
+            OpenVpnRouteGatewayWire::Legacy(gateway) => gateway.map_or(
+                OpenVpnRouteGateway::VpnDefault,
+                OpenVpnRouteGateway::Address,
+            ),
+        };
+        Self::with_gateway(wire.destination, gateway, wire.metric).map_err(serde::de::Error::custom)
     }
 }
 
@@ -1077,8 +1286,23 @@ impl OpenVpnRoute {
         gateway: Option<IpAddr>,
         metric: Option<u32>,
     ) -> Result<Self, ProtocolPlanError> {
+        Self::with_gateway(
+            destination,
+            gateway.map_or(
+                OpenVpnRouteGateway::VpnDefault,
+                OpenVpnRouteGateway::Address,
+            ),
+            metric,
+        )
+    }
+
+    pub fn with_gateway(
+        destination: Cidr,
+        gateway: OpenVpnRouteGateway,
+        metric: Option<u32>,
+    ) -> Result<Self, ProtocolPlanError> {
         if !destination.is_valid()
-            || gateway.is_some_and(|address| {
+            || matches!(gateway, OpenVpnRouteGateway::Address(address) if {
                 invalid_unicast_ip(&address) || address.is_ipv4() != destination.addr.is_ipv4()
             })
         {
@@ -1092,6 +1316,21 @@ impl OpenVpnRoute {
             gateway,
             metric,
         })
+    }
+
+    #[must_use]
+    pub const fn destination(self) -> Cidr {
+        self.destination
+    }
+
+    #[must_use]
+    pub const fn gateway(self) -> OpenVpnRouteGateway {
+        self.gateway
+    }
+
+    #[must_use]
+    pub const fn metric(self) -> Option<u32> {
+        self.metric
     }
 }
 
