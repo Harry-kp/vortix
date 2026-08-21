@@ -184,6 +184,7 @@ async fn same_boot_unexpected_recovery_reconstructs_preblock_before_reconnect() 
     let desired = DesiredState {
         generation: 7,
         tunnels: BTreeMap::from([(profile_id.clone(), RequestedTunnelState::Connected)]),
+        conflict_acknowledgements: BTreeMap::new(),
         kill_switch: vortix::vortix_core::state::killswitch::KillSwitchMode::Auto,
         authority_epoch: AuthorityEpoch(11),
         policy_digest: PolicyDigest("restart-recovery-policy".into()),

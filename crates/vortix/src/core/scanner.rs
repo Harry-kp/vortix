@@ -117,6 +117,18 @@ pub fn gather_system_state(profiles: &[VpnProfile]) -> ScannerResult {
 pub fn get_active_profiles(profiles: &[VpnProfile]) -> Vec<ActiveSession> {
     let mut active = Vec::new();
 
+    // One protocol-owned, bounded `wg show all dump` replaces one subprocess
+    // per WireGuard profile. Interface resolution remains platform-owned; the
+    // exact resolved interface selects its typed status from this snapshot.
+    let wireguard_statuses = if profiles
+        .iter()
+        .any(|profile| matches!(profile.protocol, Protocol::WireGuard))
+    {
+        crate::vortix_protocol_wireguard::WgTunnel::observe_all_interfaces().unwrap_or_default()
+    } else {
+        std::collections::BTreeMap::new()
+    };
+
     // 1. Batch lookup for OpenVPN
     let openvpn_pids = if profiles
         .iter()
@@ -128,7 +140,7 @@ pub fn get_active_profiles(profiles: &[VpnProfile]) -> Vec<ActiveSession> {
     };
     for profile in profiles {
         let session_info = match profile.protocol {
-            Protocol::WireGuard => check_wireguard_by_name(&profile.name),
+            Protocol::WireGuard => check_wireguard_by_name(&profile.name, &wireguard_statuses),
             Protocol::OpenVPN => {
                 let path_str = profile.config_path.to_str().unwrap_or("");
                 // Match either the exact source config argument or Vortix's
@@ -265,7 +277,13 @@ fn get_all_openvpn_pids() -> Vec<(PathBuf, u32)> {
 /// Uses platform-specific interface detection:
 /// - macOS: /var/run/wireguard/*.name + ifconfig
 /// - Linux: kernel interface lookup + typed `WireGuard` protocol observation
-fn check_wireguard_by_name(name: &str) -> Option<ActiveSession> {
+fn check_wireguard_by_name(
+    name: &str,
+    statuses: &std::collections::BTreeMap<
+        String,
+        crate::vortix_protocol_wireguard::tunnel::WgStatus,
+    >,
+) -> Option<ActiveSession> {
     // Platform-dispatched interface check via the platform aggregate.
     let platform = crate::platform::current_platform();
 
@@ -320,9 +338,8 @@ fn check_wireguard_by_name(name: &str) -> Option<ActiveSession> {
 
     // Protocol-owned machine-readable observation. The scanner projects
     // display metadata but cannot manufacture connection truth.
-    let status =
-        crate::vortix_protocol_wireguard::WgTunnel::observe_interface(&interface_name).ok()?;
-    session.public_key = status.interface_public_key;
+    let status = statuses.get(&interface_name)?;
+    session.public_key.clone_from(&status.interface_public_key);
     session.listen_port = status
         .listen_port
         .map_or_else(String::new, |port| port.to_string());
@@ -350,7 +367,7 @@ fn check_wireguard_by_name(name: &str) -> Option<ActiveSession> {
         .max()
         .and_then(|handshake| SystemTime::now().duration_since(handshake).ok())
         .map_or_else(String::new, |age| format!("{}s ago", age.as_secs()));
-    session.wireguard_peers = status.peers;
+    session.wireguard_peers.clone_from(&status.peers);
 
     // 4. Get IP and MTU using platform-specific interface info
     let (ip, mtu) = platform.interface.get_interface_info(&interface_name);

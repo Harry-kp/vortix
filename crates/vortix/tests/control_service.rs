@@ -652,6 +652,68 @@ async fn observations_use_owner_receipt_time_and_reject_future_or_older_evidence
 }
 
 #[tokio::test]
+async fn observation_batch_is_atomic_and_publishes_one_snapshot() {
+    let known = profile('a');
+    let clock = Arc::new(FakeClock::default());
+    clock.set(10);
+    let service = ControlService::start_with_clock(
+        ControlServiceConfig {
+            known_profiles: [known.clone()].into_iter().collect(),
+            ..config()
+        },
+        clock,
+    );
+    let client = service.client();
+    let observer = service.observer();
+    let mut subscription = client.subscribe();
+    let baseline = subscription.snapshot().generation;
+
+    observer
+        .observe_batch(vec![
+            Observation::TunnelDetails {
+                profile_id: known.clone(),
+                details: Box::default(),
+                started_at: None,
+                observed_at_millis: 9,
+            },
+            Observation::Tunnel {
+                profile_id: known.clone(),
+                active: true,
+                interface_name: Some("wg0".to_owned()),
+                observed_at_millis: 9,
+                protection: None,
+            },
+        ])
+        .await
+        .expect("valid scan batch");
+    let published = subscription.changed().await.expect("batch publication");
+    assert_eq!(published.generation, baseline + 1);
+    assert!(published.observed.tunnel_details.contains_key(&known));
+    assert!(published.observed.tunnels[&known].active);
+
+    let before_rejection = client.snapshot();
+    assert_eq!(
+        observer
+            .observe_batch(vec![
+                Observation::DefaultRoute {
+                    interface_name: Some("en0".to_owned()),
+                    observed_at_millis: 9,
+                },
+                Observation::Tunnel {
+                    profile_id: profile('f'),
+                    active: true,
+                    interface_name: Some("wg9".to_owned()),
+                    observed_at_millis: 9,
+                    protection: None,
+                },
+            ])
+            .await,
+        Err(ObservationError::UnknownProfile)
+    );
+    assert_eq!(client.snapshot(), before_rejection);
+}
+
+#[tokio::test]
 async fn connection_health_is_generation_fenced_and_published_to_snapshot_subscribers() {
     let clock = Arc::new(FakeClock::default());
     clock.set(10);
