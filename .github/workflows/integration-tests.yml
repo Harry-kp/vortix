@@ -16,7 +16,6 @@ on:
   # affect kernel behavior. Cron + workflow_dispatch are unaffected
   # by paths-ignore so nightly runs continue regardless of PR shape.
   pull_request:
-    branches: [main]
     paths-ignore:
       - "**/*.md"
       - "LICENSE"

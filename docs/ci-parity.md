@@ -2,6 +2,8 @@
 
 Single source of truth for "what CI runs". Run this exact set before pushing to avoid the *"green locally, red in CI"* trap. Authoritative reference is the workflow files under `.github/workflows/`; update both together.
 
+Pull-request workflows intentionally do not filter on a base branch. This gives stacked PRs targeting their immediate parent the same checks as PRs targeting `main`; only `push` workflows remain restricted to `main`.
+
 ## Doc-only PR convention
 
 PRs that only touch `**/*.md`, `LICENSE`, or `CHANGELOG.md` skip every heavy CI workflow (`test.yml`, `lint.yml`, `boundary.yml`, `security.yml`, `integration-tests.yml`). The result: a doc-only PR shows no green check rows except `Release / plan` (cargo-dist-owned, fires on every PR). This is intentional — the saving is real CI minutes; the cost is that a reviewer sees an "empty" check list and has to trust the rule.
