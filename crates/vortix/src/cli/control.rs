@@ -1,7 +1,7 @@
 //! Standard-mode CLI adapter for the canonical in-process control service.
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -291,6 +291,28 @@ struct PublishedTunnelDetails {
     started_at: Option<std::time::SystemTime>,
 }
 
+impl From<&ActiveSession> for PublishedTunnelDetails {
+    fn from(session: &ActiveSession) -> Self {
+        Self {
+            details: crate::vortix_core::engine::state::DetailedConnectionInfo {
+                interface: session.interface.clone(),
+                interface_authoritative: session.interface_authoritative,
+                internal_ip: session.internal_ip.clone(),
+                endpoint: session.endpoint.clone(),
+                mtu: session.mtu.clone(),
+                public_key: session.public_key.clone(),
+                listen_port: session.listen_port.clone(),
+                transfer_rx: session.transfer_rx.clone(),
+                transfer_tx: session.transfer_tx.clone(),
+                latest_handshake: session.latest_handshake.clone(),
+                pid: session.pid,
+                ..crate::vortix_core::engine::state::DetailedConnectionInfo::default()
+            },
+            started_at: session.started_at,
+        }
+    }
+}
+
 struct StandardProfileMutationExecutor {
     profiles_dir: std::path::PathBuf,
     profiles: Mutex<BTreeMap<ProfileId, VpnProfile>>,
@@ -548,23 +570,26 @@ impl ProfileMutationExecutor for StandardProfileMutationExecutor {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .get(&profile_id)
-                    .cloned()
-                    .ok_or(ProfileMutationFailure::Internal)?;
+                    .cloned();
                 let store = FsProfileStore::new(self.profiles_dir.clone());
                 let renamed = store
                     .rename(&profile_id, &new_display_name)
                     .map_err(|error| Self::map_store_error(&error))?;
                 profile.name = renamed.display_name;
                 profile.config_path = renamed.config_path;
-                topology.display_name = Some(profile.name.clone());
+                if let Some(topology) = &mut topology {
+                    topology.display_name = Some(profile.name.clone());
+                }
                 self.profiles
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .insert(profile_id.clone(), profile.clone());
-                self.topologies
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(profile_id.clone(), topology.clone());
+                if let Some(topology) = &topology {
+                    self.topologies
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(profile_id.clone(), topology.clone());
+                }
                 self.advance_catalog_revision();
                 self.record(
                     operation_id.clone(),
@@ -616,6 +641,35 @@ impl ProfileMutationExecutor for StandardProfileMutationExecutor {
         }
         result
     }
+}
+
+/// Read durable canonical intent without starting protocol or policy workers.
+/// This keeps an already-disconnected `down` unprivileged while ensuring a
+/// missing kernel tunnel cannot hide a still-connected desired state.
+pub(crate) fn durable_disconnect_required(
+    config_dir: &Path,
+    target_profiles: &BTreeSet<ProfileId>,
+) -> Result<bool, LocalControlError> {
+    let boot_id = crate::utils::boot_identity()
+        .ok_or_else(|| LocalControlError::Persistence("OS boot identity is unavailable".into()))?;
+    let owner = config_owner(config_dir)?;
+    let store = FsControlStateStore::for_owner(config_dir.join("control"), owner.0, owner.1);
+    let recovered = store
+        .load(&boot_id)
+        .map_err(|error| LocalControlError::Persistence(error.to_string()))?;
+    Ok(recovered.is_some_and(|recovered| {
+        desired_disconnect_required(&recovered.state.desired.tunnels, target_profiles)
+    }))
+}
+
+fn desired_disconnect_required(
+    desired: &BTreeMap<ProfileId, RequestedTunnelState>,
+    target_profiles: &BTreeSet<ProfileId>,
+) -> bool {
+    desired.iter().any(|(profile, state)| {
+        *state == RequestedTunnelState::Connected
+            && (target_profiles.is_empty() || target_profiles.contains(profile))
+    })
 }
 
 enum RemoteTuiWork {
@@ -2477,6 +2531,7 @@ impl LocalControlSession {
             default_route,
             crate::vortix_core::ports::route_table::DefaultRouteObservation::ProbeFailed
         ) && *self.published_default_route.borrow() != default_route;
+        let mut observations = Vec::new();
         if default_route_changed {
             let interface_name = match &default_route {
                 crate::vortix_core::ports::route_table::DefaultRouteObservation::Interface(
@@ -2489,71 +2544,61 @@ impl LocalControlSession {
                     unreachable!("probe failures are filtered before publication")
                 }
             };
-            observer
-                .observe(Observation::DefaultRoute {
-                    interface_name,
-                    observed_at_millis,
-                })
-                .await
-                .map_err(|error| LocalControlError::Observation(error.to_string()))?;
-            self.published_default_route.replace(default_route);
+            observations.push(Observation::DefaultRoute {
+                interface_name,
+                observed_at_millis,
+            });
         }
         let mut observed_detail_profiles = std::collections::BTreeSet::new();
+        let mut detail_updates = Vec::new();
         for session in &sessions {
             let Some(profile) = profiles.iter().find(|profile| profile.name == session.name) else {
                 continue;
             };
             observed_detail_profiles.insert(profile.id.clone());
-            let published = PublishedTunnelDetails {
-                details: crate::vortix_core::engine::state::DetailedConnectionInfo {
-                    interface: session.interface.clone(),
-                    interface_authoritative: session.interface_authoritative,
-                    internal_ip: session.internal_ip.clone(),
-                    endpoint: session.endpoint.clone(),
-                    mtu: session.mtu.clone(),
-                    public_key: session.public_key.clone(),
-                    listen_port: session.listen_port.clone(),
-                    transfer_rx: session.transfer_rx.clone(),
-                    transfer_tx: session.transfer_tx.clone(),
-                    latest_handshake: session.latest_handshake.clone(),
-                    pid: session.pid,
-                    ..crate::vortix_core::engine::state::DetailedConnectionInfo::default()
-                },
-                started_at: session.started_at,
-            };
+            let published = PublishedTunnelDetails::from(session);
             let changed =
                 self.published_tunnel_details.borrow().get(&profile.id) != Some(&published);
             if changed {
-                observer
-                    .observe(Observation::TunnelDetails {
-                        profile_id: profile.id.clone(),
-                        details: Box::new(published.details.clone()),
-                        started_at: published.started_at,
-                        observed_at_millis,
-                    })
-                    .await
-                    .map_err(|error| LocalControlError::Observation(error.to_string()))?;
-                self.published_tunnel_details
-                    .borrow_mut()
-                    .insert(profile.id.clone(), published);
+                observations.push(Observation::TunnelDetails {
+                    profile_id: profile.id.clone(),
+                    details: Box::new(published.details.clone()),
+                    started_at: published.started_at,
+                    observed_at_millis,
+                });
+                detail_updates.push((profile.id.clone(), published));
             }
         }
-        self.published_tunnel_details
-            .borrow_mut()
-            .retain(|profile_id, _| observed_detail_profiles.contains(profile_id));
         let changed =
             observation_changes(&profiles, &sessions, &self.published_observations.borrow());
-        for (profile_id, state) in changed {
-            observer
-                .observe(Observation::Tunnel {
+        observations.extend(
+            changed
+                .iter()
+                .map(|(profile_id, state)| Observation::Tunnel {
                     profile_id: profile_id.clone(),
                     active: state.0,
                     interface_name: state.1.clone(),
                     observed_at_millis,
                     protection: None,
-                })
+                }),
+        );
+        if !observations.is_empty() {
+            observer
+                .observe_batch(observations)
                 .await
                 .map_err(|error| LocalControlError::Observation(error.to_string()))?;
+        }
+        if default_route_changed {
+            self.published_default_route.replace(default_route);
+        }
+        {
+            let mut published = self.published_tunnel_details.borrow_mut();
+            for (profile_id, details) in detail_updates {
+                published.insert(profile_id, details);
+            }
+            published.retain(|profile_id, _| observed_detail_profiles.contains(profile_id));
+        }
+        for (profile_id, state) in changed {
             self.published_observations
                 .borrow_mut()
                 .insert(profile_id, state);
@@ -3430,6 +3475,26 @@ mod tests {
     }
 
     #[test]
+    fn inactive_down_still_requires_control_when_durable_intent_is_connected() {
+        let connected = profile_id('a');
+        let disconnected = profile_id('b');
+        let desired = BTreeMap::from([
+            (connected.clone(), RequestedTunnelState::Connected),
+            (disconnected.clone(), RequestedTunnelState::Disconnected),
+        ]);
+
+        assert!(desired_disconnect_required(&desired, &BTreeSet::new()));
+        assert!(desired_disconnect_required(
+            &desired,
+            &BTreeSet::from([connected])
+        ));
+        assert!(!desired_disconnect_required(
+            &desired,
+            &BTreeSet::from([disconnected])
+        ));
+    }
+
+    #[test]
     fn scanner_cache_publishes_only_presence_or_interface_changes() {
         let profile = VpnProfile {
             id: profile_id('a'),
@@ -3666,7 +3731,7 @@ mod tests {
                 ),
         };
         let profile_id = profile_id('c');
-        session.current_snapshot();
+        let baseline_generation = session.current_snapshot().generation;
         session
             .runtime()
             .block_on(session.publish_observations_from(scan()))
@@ -3676,7 +3741,7 @@ mod tests {
         // scan are visible. A generation count can be satisfied by unrelated
         // actor publications and would leave a scan publication in flight.
         let settle_deadline = Instant::now() + Duration::from_secs(1);
-        loop {
+        let settled_generation = loop {
             let snapshot = session.current_snapshot();
             let route_visible = snapshot
                 .observed
@@ -3692,14 +3757,19 @@ mod tests {
                     tunnel.active && tunnel.interface_name.as_deref() == Some("wg0")
                 });
             if route_visible && details_visible && tunnel_visible {
-                break;
+                break snapshot.generation;
             }
             assert!(
                 Instant::now() < settle_deadline,
                 "first scanner publication did not settle"
             );
             std::thread::sleep(Duration::from_millis(1));
-        }
+        };
+        assert_eq!(
+            settled_generation,
+            baseline_generation + 1,
+            "one scanner result must publish one atomic control snapshot"
+        );
         while session.take_changed_snapshot().unwrap().is_some() {}
         let published_default_route = session.published_default_route.borrow().clone();
         let published_tunnel_details = session.published_tunnel_details.borrow().clone();
