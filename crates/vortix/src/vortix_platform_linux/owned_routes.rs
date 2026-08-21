@@ -608,7 +608,7 @@ mod tests {
         let first = "10.0.0.0/8".parse().unwrap();
         let second = "192.168.0.0/16".parse().unwrap();
         let parsed = parse_exact_route_entries_batch(
-            "default via 192.0.2.1 dev en0\n10.0.0.0/8 dev vx0 proto 196\n192.168.0.0/16 via 192.168.1.1 dev vx1 metric 4\n",
+            "default via 192.0.2.1 dev en0\n10.0.0.0/8 dev vx0 proto 196\n192.168.0.0/16 via 192.168.1.1 dev vx1 proto 196 metric 4\n",
             &[first, second],
         )
         .unwrap();
