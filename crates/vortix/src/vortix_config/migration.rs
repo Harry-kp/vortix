@@ -4,7 +4,7 @@
 //! legacy configs. Only then does it create sidecars. A crash can therefore
 //! resume without deriving a second identity from a name or path.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::io::Read as _;
 use std::path::Path;
 use std::time::SystemTime;
@@ -193,6 +193,9 @@ pub fn migrate_legacy_profiles(profiles_dir: &Path) -> std::io::Result<Migration
         write_atomic(&inventory_path, body.as_bytes())?;
         inventory
     };
+
+    migrate_legacy_auth_files(profiles_dir, &inventory)
+        .map_err(|error| invalid_data(format!("legacy auth migration failed: {error}")))?;
 
     // Inventories written before the archive phase existed deserialize with
     // `completed = false`. Discover their legacy sidecars once, validate the
@@ -383,11 +386,10 @@ fn build_initial_inventory(
         let auth_file = format!("{}.auth", profile_id.as_str());
         let legacy_auth = sanitize_profile_name(&display_name);
         let auth_associated = root.join("auth").join(&auth_file).exists()
-            || (legacy_auth == display_name
-                && root
-                    .join("auth")
-                    .join(format!("{legacy_auth}.auth"))
-                    .exists());
+            || root
+                .join("auth")
+                .join(format!("{legacy_auth}.auth"))
+                .exists();
         if !associated_auth.insert(auth_file.clone()) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -426,6 +428,73 @@ fn build_initial_inventory(
         },
         legacy_orphans,
     ))
+}
+
+fn migrate_legacy_auth_files(
+    profiles_dir: &Path,
+    inventory: &MigrationInventory,
+) -> std::io::Result<()> {
+    let root = profiles_dir.parent().unwrap_or(profiles_dir);
+    let auth_dir = root.join("auth");
+    if !auth_dir.exists() {
+        return Ok(());
+    }
+    reject_symlink_path(&auth_dir)?;
+
+    let mut candidates = BTreeMap::<String, Vec<&InventoryEntry>>::new();
+    for entry in inventory
+        .entries
+        .iter()
+        .filter(|entry| entry.protocol == ProtocolKind::OpenVpn)
+    {
+        candidates
+            .entry(sanitize_profile_name(&entry.display_name))
+            .or_default()
+            .push(entry);
+    }
+
+    // Validate every legacy source before moving any of them. Ambiguous keys
+    // and existing stable-ID destinations retain the legacy file unchanged.
+    let mut moves = Vec::new();
+    for (legacy_key, matches) in candidates {
+        let source = auth_dir.join(format!("{legacy_key}.auth"));
+        if !source.exists() {
+            continue;
+        }
+        reject_symlink_path(&source)?;
+        if matches.len() != 1 {
+            return Err(invalid_data(format!(
+                "legacy auth collision for {legacy_key}: {} profiles map to the same sanitized key",
+                matches.len()
+            )));
+        }
+        let destination = auth_dir.join(&matches[0].auth_file);
+        if source == destination {
+            continue;
+        }
+        if destination.exists() {
+            reject_symlink_path(&destination)?;
+            return Err(invalid_data(format!(
+                "legacy auth collision: both {} and {} exist",
+                source.display(),
+                destination.display()
+            )));
+        }
+        moves.push((source, destination));
+    }
+
+    for (source, destination) in moves {
+        std::fs::rename(&source, &destination).map_err(|error| {
+            invalid_data(format!(
+                "could not move {} to {}: {error}",
+                source.display(),
+                destination.display()
+            ))
+        })?;
+    }
+    std::fs::File::open(&auth_dir)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| invalid_data(format!("could not sync {}: {error}", auth_dir.display())))
 }
 
 fn legacy_archive_entry(
@@ -1164,6 +1233,49 @@ mod tests {
         let second_sidecar =
             FsProfileStore::read_sidecar(&tmp.path().join("corp.meta.toml")).unwrap();
         assert_eq!(first_sidecar.profile_id, second_sidecar.profile_id);
+    }
+
+    #[test]
+    fn sanitized_legacy_auth_moves_to_the_unique_stable_profile_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profiles = tmp.path().join("profiles");
+        let auth = tmp.path().join("auth");
+        std::fs::create_dir_all(&profiles).unwrap();
+        std::fs::create_dir_all(&auth).unwrap();
+        std::fs::write(profiles.join("my vpn.ovpn"), b"client\n").unwrap();
+        std::fs::write(auth.join("my_vpn.auth"), b"user\nsecret\n").unwrap();
+
+        migrate_legacy_profiles(&profiles).unwrap();
+
+        let sidecar = FsProfileStore::read_sidecar(&profiles.join("my vpn.meta.toml")).unwrap();
+        let stable_auth = auth.join(format!("{}.auth", sidecar.profile_id));
+        assert_eq!(std::fs::read(stable_auth).unwrap(), b"user\nsecret\n");
+        assert!(!auth.join("my_vpn.auth").exists());
+    }
+
+    #[test]
+    fn sanitized_legacy_auth_collision_fails_closed_and_retains_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profiles = tmp.path().join("profiles");
+        let auth = tmp.path().join("auth");
+        std::fs::create_dir_all(&profiles).unwrap();
+        std::fs::create_dir_all(&auth).unwrap();
+        std::fs::write(profiles.join("my vpn.ovpn"), b"client\n").unwrap();
+        std::fs::write(profiles.join("my_vpn.ovpn"), b"client\n").unwrap();
+        std::fs::write(auth.join("my_vpn.auth"), b"user\nsecret\n").unwrap();
+
+        let error = migrate_legacy_profiles(&profiles).unwrap_err();
+
+        assert!(
+            error.to_string().contains("legacy auth collision"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(auth.join("my_vpn.auth")).unwrap(),
+            b"user\nsecret\n"
+        );
+        assert!(!profiles.join("my vpn.meta.toml").exists());
+        assert!(!profiles.join("my_vpn.meta.toml").exists());
     }
 
     #[test]

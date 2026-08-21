@@ -1409,6 +1409,7 @@ mod tests {
     fn managed_config_rejects_effective_privileged_aliases() {
         for directive in [
             "setenv opt plugin malicious.so",
+            "--setenv opt up ./up.sh",
             "SeTeNv OpT providers legacy default",
             "setenv opt --config nested.ovpn",
             "\"up\" ./up.sh",

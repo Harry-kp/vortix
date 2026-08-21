@@ -279,6 +279,7 @@ async fn handle_client(
     result
 }
 
+#[allow(clippy::too_many_lines)] // Handshake, replay, and dispatch ordering form one wire audit unit.
 async fn connection_loop<R: AsyncRead + Unpin>(
     reader: &mut R,
     output: &mpsc::Sender<Outbound>,
@@ -286,19 +287,38 @@ async fn connection_loop<R: AsyncRead + Unpin>(
     shutdown: watch::Sender<bool>,
 ) -> Result<(), DaemonError> {
     let first = read_request(reader).await?;
-    let IpcOp::Handshake { hello } = &first.op else {
-        send_response(
-            output,
-            IpcResponse {
-                id: first.id,
-                result: Err(IpcError::HandshakeRequired),
-            },
-        )
-        .await?;
-        return Ok(());
+    let hello = match &first.op {
+        IpcOp::Handshake { hello } => hello,
+        // Protocol v1 predates the handshake and its base client performs a
+        // one-shot legacy Snapshot exchange. Keep that exact read-only seam
+        // during the N-1 window without granting any other pre-handshake op.
+        IpcOp::Snapshot => {
+            send_response(output, dispatch(&first, provider.as_ref(), &shutdown)).await?;
+            return Ok(());
+        }
+        _ => {
+            send_response(
+                output,
+                IpcResponse {
+                    id: first.id,
+                    result: Err(IpcError::HandshakeRequired),
+                },
+            )
+            .await?;
+            return Ok(());
+        }
     };
     let negotiated = negotiate_passive(hello);
-    let handshake_ok = negotiated.is_ok();
+    let negotiated_contract = negotiated.as_ref().ok().map(|server_hello| {
+        (
+            server_hello.schema,
+            hello
+                .required_capabilities
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+        )
+    });
     send_response(
         output,
         IpcResponse {
@@ -307,9 +327,9 @@ async fn connection_loop<R: AsyncRead + Unpin>(
         },
     )
     .await?;
-    if !handshake_ok {
+    let Some((negotiated_schema, negotiated_capabilities)) = negotiated_contract else {
         return Ok(());
-    }
+    };
 
     let mut requests = ReplayCache::<MAX_REPLAY_RESPONSE_BYTES>::default();
     let mut shutdown_receiver = shutdown.subscribe();
@@ -333,6 +353,22 @@ async fn connection_loop<R: AsyncRead + Unpin>(
         }
         let digest = request_digest(&request.op)?;
         if respond_to_replay(&requests, output, request.id, &digest).await? {
+            continue;
+        }
+        let required = request.op.required_capability();
+        if !required.is_available_in_schema(negotiated_schema)
+            || !negotiated_capabilities.contains(&required)
+        {
+            send_response(
+                output,
+                IpcResponse {
+                    id: request.id,
+                    result: Err(IpcError::CapabilityUnavailable {
+                        capability: required,
+                    }),
+                },
+            )
+            .await?;
             continue;
         }
         if requests.len() >= MAX_REQUEST_IDS {
@@ -738,8 +774,17 @@ mod tests {
         }
     }
 
+    async fn read_test_response(client: &mut tokio::io::DuplexStream) -> IpcResponse {
+        let mut response_bytes = vec![0_u8; 4096];
+        let read = client.read(&mut response_bytes).await.unwrap();
+        crate::vortix_core::ipc::decode_frame::<IpcResponse>(&response_bytes[..read])
+            .unwrap()
+            .unwrap()
+            .0
+    }
+
     #[tokio::test]
-    async fn first_non_handshake_request_is_rejected() {
+    async fn pre_handshake_v1_snapshot_keeps_the_base_wire_shape() {
         let (mut client, server) = tokio::io::duplex(4096);
         let provider: Arc<dyn PassiveQueryProvider> = Arc::new(EmptyQueryProvider::new());
         let shutdown = watch::channel(false).0;
@@ -754,18 +799,59 @@ mod tests {
         });
         let request = IpcRequest {
             id: 1,
-            op: IpcOp::PassiveSnapshot,
+            op: IpcOp::Snapshot,
         };
         let frame = crate::vortix_core::ipc::encode_frame(&request).unwrap();
         client.write_all(&frame).await.unwrap();
-        let mut response_bytes = vec![0_u8; 4096];
-        let read = client.read(&mut response_bytes).await.unwrap();
-        let (response, _) =
-            crate::vortix_core::ipc::decode_frame::<IpcResponse>(&response_bytes[..read])
-                .unwrap()
-                .unwrap();
-        assert!(matches!(response.result, Err(IpcError::HandshakeRequired)));
+        let response = read_test_response(&mut client).await;
+        assert!(matches!(response.result, Ok(IpcResult::Snapshot { .. })));
         task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn negotiated_capabilities_reject_an_undeclared_operation() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        let provider: Arc<dyn PassiveQueryProvider> = Arc::new(EmptyQueryProvider::new());
+        let shutdown = watch::channel(false).0;
+        let task = tokio::spawn(async move {
+            let (mut reader, writer_half) = tokio::io::split(server);
+            let (output, output_rx) = mpsc::channel(2);
+            let writer = tokio::spawn(writer_loop(writer_half, output_rx));
+            let result = connection_loop(&mut reader, &output, provider, shutdown).await;
+            drop(output);
+            let _ = writer.await;
+            result
+        });
+        let handshake = IpcRequest {
+            id: 1,
+            op: IpcOp::Handshake {
+                hello: ClientHello::current(vec![IpcCapability::LegacySnapshot]),
+            },
+        };
+        client
+            .write_all(&crate::vortix_core::ipc::encode_frame(&handshake).unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(
+            read_test_response(&mut client).await.result,
+            Ok(IpcResult::Handshake { .. })
+        ));
+
+        let undeclared = IpcRequest {
+            id: 2,
+            op: IpcOp::PassiveSnapshot,
+        };
+        client
+            .write_all(&crate::vortix_core::ipc::encode_frame(&undeclared).unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(
+            read_test_response(&mut client).await.result,
+            Err(IpcError::CapabilityUnavailable {
+                capability: IpcCapability::PassiveSnapshot
+            })
+        ));
+        task.abort();
     }
 
     #[test]

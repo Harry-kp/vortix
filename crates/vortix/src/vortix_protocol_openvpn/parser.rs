@@ -241,7 +241,10 @@ pub(super) fn forbidden_effective_directive(line: &str) -> Option<String> {
     let tokens = openvpn_option_tokens(line, 3)?;
     let effective = match tokens.as_slice() {
         [setenv, opt, directive]
-            if setenv.eq_ignore_ascii_case("setenv") && opt.eq_ignore_ascii_case("opt") =>
+            if setenv
+                .trim_start_matches('-')
+                .eq_ignore_ascii_case("setenv")
+                && opt.eq_ignore_ascii_case("opt") =>
         {
             directive
         }
@@ -442,6 +445,7 @@ mod tests {
     fn effective_privileged_aliases_fail_unprivileged_parsing() {
         for directive in [
             "setenv opt plugin malicious.so",
+            "--setenv opt up ./up.sh",
             "SeTeNv OpT providers legacy default",
             "setenv opt --config nested.ovpn",
             "\"up\" ./up.sh",

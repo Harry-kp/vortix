@@ -7,9 +7,9 @@ use std::time::Duration;
 use crate::vortix_core::control::model::{AuthorityEpoch, OperationId, MAX_PROTECTION_AGE_MILLIS};
 use crate::vortix_core::control::persistence::PersistedTombstone;
 use crate::vortix_core::control::worker::{
-    CancellationToken, ControlRevision, PolicyExecutor, PolicyOutcome, PolicyResult, PolicyWorker,
-    ProfileAdmission, ProfileWorkerPool, TopologyPolicy, TopologyState, TunnelExecutor,
-    TunnelMutation, TunnelRevision, TunnelWork, TunnelWorkResult, WorkFailure,
+    CancellationToken, ControlRevision, PolicyExecutor, PolicyOutcome, PolicyResult, PolicyStage,
+    PolicyWorker, ProfileAdmission, ProfileWorkerPool, TopologyPolicy, TopologyState,
+    TunnelExecutor, TunnelMutation, TunnelRevision, TunnelWork, TunnelWorkResult, WorkFailure,
 };
 use crate::vortix_core::ports::tunnel::{
     AdoptionEvidence, HandshakeEvidence, ProbeReceipt, TunnelKindTag,
@@ -68,7 +68,8 @@ impl PolicyVerification {
 #[derive(Debug)]
 struct State {
     authority_epoch: AuthorityEpoch,
-    latest_policy: Option<(ControlRevision, OperationId)>,
+    latest_policy: Option<(ControlRevision, OperationId, PolicyStage)>,
+    pre_tunnel_blocking: Option<(ControlRevision, OperationId)>,
     latest_topology: Option<TopologyPolicy>,
     applied_policy: Option<(ControlRevision, OperationId)>,
     applied_topology: Option<TopologyState>,
@@ -83,6 +84,7 @@ impl State {
         Self {
             authority_epoch,
             latest_policy: None,
+            pre_tunnel_blocking: None,
             latest_topology: None,
             applied_policy: None,
             applied_topology: None,
@@ -279,18 +281,25 @@ impl Supervisor {
         let mut state = self.state.lock().expect("supervisor mutex poisoned");
         let revision = policy.revision();
         if revision.authority_epoch != state.authority_epoch
-            || state.latest_policy.as_ref().is_some_and(|(current, _)| {
-                current.generation > revision.generation
-                    || current.generation == revision.generation
-                        && current.digest == revision.digest
-            })
+            || state
+                .latest_policy
+                .as_ref()
+                .is_some_and(|(current, operation, stage)| {
+                    current.generation > revision.generation
+                        || current.generation == revision.generation
+                            && current.digest == revision.digest
+                            && operation == &policy.operation_id
+                            && *stage >= policy.stage
+                })
         {
             return Err(WorkFailure::Stale);
         }
         self.policy.submit(policy.clone())?;
-        state.latest_policy = Some((revision, policy.operation_id.clone()));
-        state.latest_topology = Some(policy.clone());
-        state.applied_policy = None;
+        state.latest_policy = Some((revision, policy.operation_id.clone(), policy.stage));
+        if policy.stage.is_final() {
+            state.latest_topology = Some(policy.clone());
+            state.applied_policy = None;
+        }
         state.protected = None;
         state.policy_degraded = None;
         Ok(())
@@ -335,13 +344,26 @@ impl Supervisor {
         let exact = state
             .latest_policy
             .as_ref()
-            .is_some_and(|(revision, operation)| {
+            .is_some_and(|(revision, operation, stage)| {
                 revision.authority_epoch == result.authority_epoch
                     && revision.generation == result.generation
                     && revision.digest == result.digest
                     && operation == &result.operation_id
+                    && *stage == result.stage
             });
-        if exact && result.outcome == PolicyOutcome::Applied {
+        if exact
+            && result.stage == PolicyStage::PreTunnelBlocking
+            && result.outcome == PolicyOutcome::Applied
+        {
+            state.pre_tunnel_blocking = Some((
+                ControlRevision {
+                    authority_epoch: result.authority_epoch,
+                    generation: result.generation,
+                    digest: result.digest.clone(),
+                },
+                result.operation_id.clone(),
+            ));
+        } else if exact && result.stage.is_final() && result.outcome == PolicyOutcome::Applied {
             state.applied_policy = Some((
                 ControlRevision {
                     authority_epoch: result.authority_epoch,
@@ -378,7 +400,9 @@ impl Supervisor {
             .is_some_and(|(latest, applied)| {
                 latest.0 == evidence.revision
                     && latest.1 == evidence.operation_id
-                    && applied == latest
+                    && latest.2.is_final()
+                    && applied.0 == latest.0
+                    && applied.1 == latest.1
             });
         let tunnel_truth_exact = state.latest_topology.as_ref().is_some_and(|policy| {
             policy.target.profiles.iter().all(|profile| {
@@ -555,7 +579,22 @@ impl Supervisor {
             .lock()
             .expect("supervisor mutex poisoned")
             .latest_policy
-            .clone()
+            .as_ref()
+            .filter(|(_, _, stage)| stage.is_final())
+            .map(|(revision, operation, _)| (revision.clone(), operation.clone()))
+    }
+    #[must_use]
+    pub fn pre_tunnel_blocking_matches(
+        &self,
+        revision: &ControlRevision,
+        operation: &OperationId,
+    ) -> bool {
+        self.state
+            .lock()
+            .expect("supervisor mutex poisoned")
+            .pre_tunnel_blocking
+            .as_ref()
+            .is_some_and(|(blocked, owner)| blocked == revision && owner == operation)
     }
     #[must_use]
     pub fn applied_topology(&self) -> Option<TopologyState> {

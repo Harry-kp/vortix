@@ -12,7 +12,7 @@ use crate::vortix_core::control::{
     BootConnection, ControlPersistenceConfig, ControlStateStore, ControlStateStoreError,
     DesiredState, DurableControlState, OperationId, OperationIntent, OperationRecord,
     OperationResult, OperationStatus, PersistedTombstone, RecoveredControlState,
-    RequestedResources, RetentionMetadata,
+    RequestedResources, RequestedTunnelState, RetentionMetadata,
 };
 use crate::vortix_core::profile::ProfileId;
 
@@ -99,7 +99,16 @@ impl PersistedControlState {
                     || matches!(
                         &operation.intent,
                         OperationIntent::DesiredSubset { tunnels, .. }
+                            | OperationIntent::UnexpectedRecovery { tunnels, .. }
                             if tunnels.len() > MAX_PROFILES
+                    )
+                    || matches!(
+                        &operation.intent,
+                        OperationIntent::UnexpectedRecovery {
+                            profile_id,
+                            tunnels,
+                            ..
+                        } if tunnels.get(profile_id) != Some(&RequestedTunnelState::Connected)
                     )
                     || !operation_result_matches_status(operation)
             })

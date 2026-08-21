@@ -684,53 +684,7 @@ fn scan_control_boundaries_at(
         for item in scan_public_control_items(&content) {
             public_control_items.push((relative.clone(), item));
         }
-        let mut pending_test_cfg = false;
-        let mut skipping_test_item = false;
-        let mut test_item_indent = 0usize;
-        for (index, line) in content.lines().enumerate() {
-            let trimmed = line.trim_start();
-
-            if skipping_test_item {
-                let indent = line.len() - trimmed.len();
-                if indent == test_item_indent && (trimmed == "}" || trimmed == "};") {
-                    skipping_test_item = false;
-                }
-                continue;
-            }
-
-            if trimmed == "#[cfg(test)]" {
-                pending_test_cfg = true;
-                test_item_indent = line.len() - trimmed.len();
-                continue;
-            }
-
-            if pending_test_cfg && trimmed.starts_with("#[") {
-                continue;
-            }
-
-            if pending_test_cfg {
-                if trimmed.ends_with(';') {
-                    pending_test_cfg = false;
-                } else if let Some(open) = line.find('{') {
-                    pending_test_cfg = false;
-                    skipping_test_item = line[open + 1..].find('}').is_none();
-                }
-                continue;
-            }
-
-            if trimmed.starts_with("//") {
-                continue;
-            }
-            let kind = control_boundary_kind(&relative, line);
-            if let Some(kind) = kind {
-                candidates.push(ControlBoundaryViolation {
-                    kind,
-                    path: relative.clone(),
-                    line: index + 1,
-                    source: trimmed.to_string(),
-                });
-            }
-        }
+        candidates.extend(scan_token_control_boundaries(&relative, &content));
     }
 
     candidates.extend(duplicate_control_violations(root, public_control_items));
@@ -1016,6 +970,103 @@ fn rust_tokens(content: &str) -> Vec<RustToken> {
     tokens
 }
 
+fn scan_token_control_boundaries(path: &str, content: &str) -> Vec<ControlBoundaryViolation> {
+    use std::collections::HashSet;
+
+    let production = production_source_without_test_items(content);
+    let tokens = rust_tokens(&production);
+    let is_client = path.starts_with("crates/vortix/src/app/")
+        || path.starts_with("crates/vortix/src/cli/")
+        || path.starts_with("crates/vortix/src/ui/");
+    let mut violations = Vec::new();
+    let mut seen_lines = HashSet::new();
+
+    for (index, token) in tokens.iter().enumerate() {
+        let kind = if is_client
+            && (token.text.starts_with("vortix_protocol_")
+                || token.text.starts_with("vortix_platform_")
+                || token.text == "vortix_process")
+        {
+            Some(ControlBoundaryKind::ClientMutationImport)
+        } else if token.text.starts_with("seed_") || token.text.starts_with("mirror_") {
+            Some(ControlBoundaryKind::SeedOrMirrorWriter)
+        } else if token.text == "privilege"
+            && !is_privilege_owner(path)
+            && tokens[index + 1..tokens.len().min(index + 9)]
+                .windows(3)
+                .any(|window| {
+                    window[0].text == "PrivilegeReq"
+                        && window[1].text == ":"
+                        && window[2].text == ":"
+                })
+            && tokens[index + 1..tokens.len().min(index + 11)]
+                .iter()
+                .any(|candidate| candidate.text == "Root")
+        {
+            Some(ControlBoundaryKind::RootPrivilegeRequest)
+        } else if matches!(
+            token.text.as_str(),
+            "unbounded_channel" | "UnboundedSender" | "UnboundedReceiver" | "unbounded"
+        ) {
+            Some(ControlBoundaryKind::UnboundedChannel)
+        } else {
+            None
+        };
+        if let Some(kind) = kind.filter(|kind| seen_lines.insert((*kind, token.line))) {
+            let source = content
+                .lines()
+                .nth(token.line.saturating_sub(1))
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_string();
+            violations.push(ControlBoundaryViolation {
+                kind,
+                path: path.to_string(),
+                line: token.line,
+                source,
+            });
+        }
+    }
+    violations
+}
+
+fn production_source_without_test_items(content: &str) -> String {
+    let mut output = String::with_capacity(content.len());
+    let mut pending_test_cfg = false;
+    let mut skipping_test_item = false;
+    let mut test_item_indent = 0usize;
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        let mut retain = true;
+        if skipping_test_item {
+            retain = false;
+            let indent = line.len() - trimmed.len();
+            if indent == test_item_indent && (trimmed == "}" || trimmed == "};") {
+                skipping_test_item = false;
+            }
+        } else if trimmed == "#[cfg(test)]" {
+            retain = false;
+            pending_test_cfg = true;
+            test_item_indent = line.len() - trimmed.len();
+        } else if pending_test_cfg && trimmed.starts_with("#[") {
+            retain = false;
+        } else if pending_test_cfg {
+            retain = false;
+            if trimmed.ends_with(';') {
+                pending_test_cfg = false;
+            } else if let Some(open) = line.find('{') {
+                pending_test_cfg = false;
+                skipping_test_item = line[open + 1..].find('}').is_none();
+            }
+        }
+        if retain {
+            output.push_str(line);
+        }
+        output.push('\n');
+    }
+    output
+}
+
 fn skip_quoted(bytes: &[u8], index: &mut usize, line: &mut usize, quote: u8) {
     *index += 1;
     while *index < bytes.len() {
@@ -1072,42 +1123,6 @@ fn skip_raw_string(bytes: &[u8], index: &mut usize, line: &mut usize) {
         }
         *index += 1;
     }
-}
-
-fn control_boundary_kind(path: &str, line: &str) -> Option<ControlBoundaryKind> {
-    let is_client = path.starts_with("crates/vortix/src/app/")
-        || path.starts_with("crates/vortix/src/cli/")
-        || path.starts_with("crates/vortix/src/ui/");
-    let direct_mutation_layer = line.contains("crate::vortix_protocol_")
-        || line.contains("crate::vortix_platform_")
-        || line.contains("crate::vortix_process::");
-    if is_client && direct_mutation_layer {
-        return Some(ControlBoundaryKind::ClientMutationImport);
-    }
-
-    let seed_or_mirror = line.contains(".seed_")
-        || line.contains(".mirror_")
-        || line.contains("fn seed_")
-        || line.contains("fn mirror_");
-    if seed_or_mirror {
-        return Some(ControlBoundaryKind::SeedOrMirrorWriter);
-    }
-
-    if line.contains(".privilege(PrivilegeReq::Root)") && !is_privilege_owner(path) {
-        return Some(ControlBoundaryKind::RootPrivilegeRequest);
-    }
-
-    let unbounded = line.contains("unbounded_channel")
-        || line.contains("UnboundedSender")
-        || line.contains("UnboundedReceiver")
-        || line.contains("async_channel::unbounded")
-        || line.contains("crossbeam_channel::unbounded")
-        || line.contains("flume::unbounded");
-    if unbounded {
-        return Some(ControlBoundaryKind::UnboundedChannel);
-    }
-
-    None
 }
 
 fn is_privilege_owner(path: &str) -> bool {
@@ -1219,6 +1234,27 @@ mod control_boundary_tests {
                 "missing {kind:?} violation: {violations:?}"
             );
         }
+    }
+
+    #[test]
+    fn rejects_grouped_imports_and_multiline_privilege_requests() {
+        let fixture = Fixture::new("multiline-boundary-leaks");
+        fixture.write(
+            "crates/vortix/src/cli/grouped.rs",
+            "use crate::{\n    vortix_protocol_wireguard::WgTunnel,\n    vortix_core::profile::ProfileId,\n};\n",
+        );
+        fixture.write(
+            "crates/vortix/src/core/root.rs",
+            "let spec = spec.privilege(\n    PrivilegeReq::Root,\n);\n",
+        );
+
+        let violations = scan_control_boundaries_at(fixture.root()).unwrap();
+        assert!(violations
+            .iter()
+            .any(|violation| violation.kind == ControlBoundaryKind::ClientMutationImport));
+        assert!(violations
+            .iter()
+            .any(|violation| violation.kind == ControlBoundaryKind::RootPrivilegeRequest));
     }
 
     #[test]

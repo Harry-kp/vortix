@@ -846,6 +846,20 @@ impl PolicyBarrier {
     ];
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PolicyStage {
+    Full,
+    PreTunnelBlocking,
+    FinalAfterPreBlock,
+}
+
+impl PolicyStage {
+    #[must_use]
+    pub const fn is_final(self) -> bool {
+        matches!(self, Self::Full | Self::FinalAfterPreBlock)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TopologyTransitionKind {
     Connect,
@@ -881,6 +895,7 @@ pub struct TopologyPolicy {
     pub tunnel_revisions: BTreeMap<ProfileId, TunnelRevision>,
     pub transition: TopologyTransitionKind,
     pub required_blocking: bool,
+    pub stage: PolicyStage,
 }
 
 impl TopologyPolicy {
@@ -890,6 +905,22 @@ impl TopologyPolicy {
             authority_epoch: self.authority_epoch,
             generation: self.generation,
             digest: self.digest.clone(),
+        }
+    }
+
+    fn barriers(&self) -> &'static [PolicyBarrier] {
+        const PRE_TUNNEL: &[PolicyBarrier] = &[PolicyBarrier::Blocking];
+        const FINAL_AFTER_PRE_BLOCK: &[PolicyBarrier] = &[
+            PolicyBarrier::Tunnel,
+            PolicyBarrier::Route,
+            PolicyBarrier::Dns,
+            PolicyBarrier::Observation,
+            PolicyBarrier::EffectivePublication,
+        ];
+        match self.stage {
+            PolicyStage::Full => &PolicyBarrier::ORDERED,
+            PolicyStage::PreTunnelBlocking => PRE_TUNNEL,
+            PolicyStage::FinalAfterPreBlock => FINAL_AFTER_PRE_BLOCK,
         }
     }
 }
@@ -939,6 +970,7 @@ pub struct PolicyResult {
     pub authority_epoch: AuthorityEpoch,
     pub digest: PolicyDigest,
     pub operation_id: OperationId,
+    pub stage: PolicyStage,
     pub outcome: PolicyOutcome,
     pub superseded_by: Option<ControlRevision>,
     pub receipts: Vec<PolicyBarrierReceipt>,
@@ -1131,6 +1163,7 @@ fn superseded_result(old: &TopologyPolicy, next: &TopologyPolicy) -> PolicyResul
         authority_epoch: old.authority_epoch,
         digest: old.digest.clone(),
         operation_id: old.operation_id.clone(),
+        stage: old.stage,
         outcome: PolicyOutcome::Superseded,
         superseded_by: Some(next.revision()),
         receipts: Vec::new(),
@@ -1150,7 +1183,7 @@ fn run_policy(
     let mut completed = Vec::new();
     let mut failed_at = None;
     let mut outcome = PolicyOutcome::Applied;
-    for barrier in PolicyBarrier::ORDERED {
+    for &barrier in policy.barriers() {
         if stopping.load(Ordering::Acquire) || cancellation.is_cancelled() {
             outcome = PolicyOutcome::Cancelled;
             failed_at = Some(barrier);
@@ -1240,6 +1273,7 @@ fn run_policy(
         authority_epoch: policy.authority_epoch,
         digest: policy.digest,
         operation_id: policy.operation_id,
+        stage: policy.stage,
         outcome,
         superseded_by: None,
         receipts,

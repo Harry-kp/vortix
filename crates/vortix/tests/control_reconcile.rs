@@ -11,9 +11,9 @@ use vortix::vortix_core::control::reconcile::{
 use vortix::vortix_core::control::supervisor::{PolicyVerification, SupervisedTruth, Supervisor};
 use vortix::vortix_core::control::worker::{
     wait_until, CancellationToken, ControlRevision, PolicyBarrier, PolicyExecutor, PolicyOutcome,
-    PolicyWorker, ProfileWorkerPool, TopologyPolicy, TopologyState, TopologyTransitionKind,
-    TunnelExecutionReceipt, TunnelExecutor, TunnelMutation, TunnelRevision, TunnelWork,
-    WorkFailure,
+    PolicyStage, PolicyWorker, ProfileWorkerPool, TopologyPolicy, TopologyState,
+    TopologyTransitionKind, TunnelExecutionReceipt, TunnelExecutor, TunnelMutation, TunnelRevision,
+    TunnelWork, WorkFailure,
 };
 use vortix::vortix_core::control::{
     Clock, CommandRequest, CompletionOutcome, CompletionResult, ControlEvent, ControlService,
@@ -417,6 +417,7 @@ fn policy(generation: u64, digest: &str) -> TopologyPolicy {
         tunnel_revisions: BTreeMap::from([(profile("corp"), tunnel_revision(generation))]),
         transition: TopologyTransitionKind::Connect,
         required_blocking: true,
+        stage: PolicyStage::Full,
     }
 }
 
@@ -818,6 +819,197 @@ async fn connect_and_settle(
                 .is_some_and(|entry| entry.truth == SupervisedTruth::ObservedPresent)
         },
         "tunnel did not settle",
+    )
+    .await;
+}
+
+#[derive(Default)]
+struct DropRecoveryCapture {
+    tunnel_calls: Mutex<Vec<TunnelMutation>>,
+    pre_block: (Mutex<bool>, Condvar),
+    release_pre_block: (Mutex<bool>, Condvar),
+}
+
+impl DropRecoveryCapture {
+    fn release_pre_block(&self) {
+        *self.release_pre_block.0.lock().unwrap() = true;
+        self.release_pre_block.1.notify_all();
+    }
+}
+
+impl Drop for DropRecoveryCapture {
+    fn drop(&mut self) {
+        self.release_pre_block();
+    }
+}
+
+impl TunnelExecutor for DropRecoveryCapture {
+    fn execute(
+        &self,
+        work: &TunnelWork,
+        _: &CancellationToken,
+    ) -> Result<TunnelExecutionReceipt, String> {
+        self.tunnel_calls.lock().unwrap().push(work.mutation);
+        Ok(execution_receipt(work))
+    }
+}
+
+impl PolicyExecutor for DropRecoveryCapture {
+    fn apply(&self, policy: &TopologyPolicy, barrier: PolicyBarrier) -> Result<(), String> {
+        if policy.transition == TopologyTransitionKind::Recovery
+            && barrier == PolicyBarrier::Blocking
+        {
+            *self.pre_block.0.lock().unwrap() = true;
+            self.pre_block.1.notify_all();
+            let (released, wake) = &self.release_pre_block;
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+        }
+        Ok(())
+    }
+
+    fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) {}
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // The full drop-to-preblock-to-reconnect sequence is one regression.
+async fn unexpected_managed_absence_preblocks_then_runs_bounded_recovery() {
+    let target = profile("unexpected-drop");
+    let capture = Arc::new(DropRecoveryCapture::default());
+    let supervisor = Arc::new(Supervisor::new(
+        AuthorityEpoch(1),
+        capture.clone(),
+        capture.clone(),
+        2,
+        8,
+    ));
+    let clock = Arc::new(TestClock::default());
+    let service = ControlService::start_supervised(
+        ControlServiceConfig {
+            authority_epoch: AuthorityEpoch(1),
+            known_profiles: BTreeSet::from([target.clone()]),
+            freshness_poll_interval: Duration::from_millis(5),
+            retry_budget: Duration::from_secs(6),
+            retry_initial_backoff: Duration::from_secs(2),
+            ..ControlServiceConfig::default()
+        },
+        clock.clone(),
+        ExecutionSelection::CanonicalAuthority,
+        supervisor.clone(),
+    );
+
+    service
+        .client()
+        .submit(CommandRequest {
+            command: UserCommand::Connect {
+                profile_id: target.clone(),
+            },
+            idempotency_key: IdempotencyKey::new("unexpected-drop-connect"),
+            deadline: Deadline(10_000),
+        })
+        .await
+        .unwrap();
+    wait_for_condition(
+        || !capture.tunnel_calls.lock().unwrap().is_empty(),
+        "initial connect was not dispatched",
+    )
+    .await;
+    observe_connected(&service, &target, "tun-unexpected-drop").await;
+    wait_for_condition(
+        || {
+            supervisor
+                .profile_truth(&target)
+                .is_some_and(|entry| entry.truth == SupervisedTruth::ObservedPresent)
+        },
+        "initial connect did not settle",
+    )
+    .await;
+
+    service
+        .client()
+        .submit(CommandRequest {
+            command: UserCommand::SetKillSwitch {
+                mode: vortix::vortix_core::state::killswitch::KillSwitchMode::Auto,
+            },
+            idempotency_key: IdempotencyKey::new("unexpected-drop-block-on-drop"),
+            deadline: Deadline(10_000),
+        })
+        .await
+        .unwrap();
+    let desired = service.client().snapshot().desired;
+    service
+        .observer()
+        .observe(Observation::Protection(ProtectionEvidence {
+            desired_generation: desired.generation,
+            authority_epoch: desired.authority_epoch,
+            policy_digest: desired.policy_digest,
+            observed_at_millis: 0,
+            interface: GateEvidence::Verified,
+            route: GateEvidence::Verified,
+            dns: GateEvidence::Verified,
+            firewall: GateEvidence::Verified,
+        }))
+        .await
+        .unwrap();
+    wait_for_condition(
+        || {
+            service
+                .client()
+                .snapshot()
+                .operations
+                .values()
+                .all(|operation| {
+                    operation.desired_generation != desired.generation
+                        || operation.status.is_terminal()
+                })
+        },
+        "kill-switch operation did not settle",
+    )
+    .await;
+    capture.tunnel_calls.lock().unwrap().clear();
+
+    service
+        .observer()
+        .observe(Observation::Tunnel {
+            profile_id: target.clone(),
+            active: false,
+            interface_name: None,
+            observed_at_millis: 0,
+            protection: None,
+        })
+        .await
+        .unwrap();
+    wait_for_condition(
+        || *capture.pre_block.0.lock().unwrap(),
+        "unexpected loss did not enter the recovery pre-block",
+    )
+    .await;
+    let dropped = service.client().snapshot();
+    let recovery = dropped
+        .operations
+        .values()
+        .find(|operation| {
+            operation.desired_generation == dropped.desired.generation
+                && !operation.status.is_terminal()
+        })
+        .expect("drop must durably admit recovery");
+    assert_eq!(recovery.deadline_millis, 6_000);
+    assert!(capture.tunnel_calls.lock().unwrap().is_empty());
+
+    capture.release_pre_block();
+    clock.0.store(2_000, Ordering::Release);
+    service.client().refresh().unwrap();
+    wait_for_condition(
+        || {
+            capture
+                .tunnel_calls
+                .lock()
+                .unwrap()
+                .contains(&TunnelMutation::Connect)
+        },
+        "configured recovery backoff did not admit reconnect",
     )
     .await;
 }

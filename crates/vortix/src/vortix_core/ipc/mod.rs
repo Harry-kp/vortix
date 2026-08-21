@@ -60,6 +60,20 @@ pub enum IpcOp {
     Shutdown,
 }
 
+impl IpcOp {
+    /// Capability negotiated before this operation may be dispatched.
+    #[must_use]
+    pub const fn required_capability(&self) -> IpcCapability {
+        match self {
+            Self::Handshake { .. } | Self::PassiveSnapshot => IpcCapability::PassiveSnapshot,
+            Self::Execute(_) => IpcCapability::ControlMutation,
+            Self::Snapshot => IpcCapability::LegacySnapshot,
+            Self::Subscribe | Self::PassiveSubscribe => IpcCapability::PassiveSubscribe,
+            Self::Shutdown => IpcCapability::Shutdown,
+        }
+    }
+}
+
 /// Wrapper for the client→server direction. `id` is opaque to the
 /// daemon; the client correlates response IDs back to outstanding
 /// requests.
@@ -110,6 +124,21 @@ pub enum IpcCapability {
     /// Reserved for the future enrolled control authority. Never advertised
     /// by the passive candidate.
     ControlMutation,
+}
+
+impl IpcCapability {
+    /// Whether this capability has a wire representation in `schema`.
+    #[must_use]
+    pub const fn is_available_in_schema(self, schema: u16) -> bool {
+        schema == 1
+            && matches!(
+                self,
+                Self::LegacySnapshot
+                    | Self::PassiveSnapshot
+                    | Self::PassiveSubscribe
+                    | Self::Shutdown
+            )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -297,7 +326,8 @@ pub fn negotiate_passive(hello: &ClientHello) -> Result<ServerHello, IpcError> {
             ),
         })?;
     for capability in &hello.required_capabilities {
-        if !PASSIVE_CAPABILITIES.contains(capability) {
+        if !PASSIVE_CAPABILITIES.contains(capability) || !capability.is_available_in_schema(schema)
+        {
             return Err(IpcError::CapabilityUnavailable {
                 capability: *capability,
             });
