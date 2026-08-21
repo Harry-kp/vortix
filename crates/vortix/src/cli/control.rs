@@ -2173,20 +2173,33 @@ mod tests {
                     "wg0".into(),
                 ),
         };
-        let initial_generation = session.current_snapshot().generation;
+        let profile_id = profile_id('c');
+        session.current_snapshot();
         session
             .runtime()
             .block_on(session.publish_observations_from(scan()))
             .unwrap();
-        // Default route, tunnel details, and tunnel presence each publish.
         // `observe` acknowledges actor receipt before the final publication,
-        // so wait for the known scan generation instead of consuming only the
-        // first watch notification and racing the tail publication.
-        let expected_generation = initial_generation.saturating_add(3);
+        // so consume snapshots until all three semantic facts from the first
+        // scan are visible. A generation count can be satisfied by unrelated
+        // actor publications and would leave a scan publication in flight.
         let settle_deadline = Instant::now() + Duration::from_secs(1);
         loop {
             let snapshot = session.current_snapshot();
-            if snapshot.generation >= expected_generation {
+            let route_visible = snapshot
+                .observed
+                .default_route
+                .as_ref()
+                .is_some_and(|route| route.interface_name.as_deref() == Some("wg0"));
+            let details_visible = snapshot.observed.tunnel_details.contains_key(&profile_id);
+            let tunnel_visible = snapshot
+                .observed
+                .tunnels
+                .get(&profile_id)
+                .is_some_and(|tunnel| {
+                    tunnel.active && tunnel.interface_name.as_deref() == Some("wg0")
+                });
+            if route_visible && details_visible && tunnel_visible {
                 break;
             }
             assert!(
@@ -2195,13 +2208,27 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(1));
         }
+        while session.take_changed_snapshot().unwrap().is_some() {}
+        let published_default_route = session.published_default_route.borrow().clone();
+        let published_tunnel_details = session.published_tunnel_details.borrow().clone();
+        let published_observations = session.published_observations.borrow().clone();
 
         session
             .runtime()
             .block_on(session.publish_observations_from(scan()))
             .unwrap();
-        session.runtime().block_on(tokio::task::yield_now());
-        assert!(session.take_changed_snapshot().unwrap().is_none());
+        assert_eq!(
+            *session.published_default_route.borrow(),
+            published_default_route
+        );
+        assert_eq!(
+            *session.published_tunnel_details.borrow(),
+            published_tunnel_details
+        );
+        assert_eq!(
+            *session.published_observations.borrow(),
+            published_observations
+        );
     }
 
     #[test]

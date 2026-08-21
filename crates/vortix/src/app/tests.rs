@@ -1962,6 +1962,18 @@ fn canonical_profile_commands_preserve_identity_and_reject_active_mutation() {
         }
     }
 
+    fn process_until(app: &mut App, condition: impl Fn(&App) -> bool, failure: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            app.process_external();
+            if condition(app) {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "{failure}");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
     let config_dir = tempfile::tempdir().unwrap();
     let profiles_dir = config_dir.path().join("profiles");
     let store = FsProfileStore::new(profiles_dir.clone());
@@ -2003,18 +2015,16 @@ fn canonical_profile_commands_preserve_identity_and_reject_active_mutation() {
     let initial_generation = app.control_snapshot.generation;
 
     app.rename_profile(0, "work");
-    for _ in 0..200 {
-        app.process_external();
-        if app
-            .runtime
-            .profiles
-            .first()
-            .is_some_and(|profile| profile.name == "work")
-        {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
+    process_until(
+        &mut app,
+        |app| {
+            app.runtime
+                .profiles
+                .first()
+                .is_some_and(|profile| profile.name == "work")
+        },
+        "renamed profile did not reach the App catalog",
+    );
     let renamed = list_after_worker_release(&store);
     assert_eq!(renamed.len(), 1);
     assert_eq!(renamed[0].display_name, "work");
@@ -2060,13 +2070,11 @@ fn canonical_profile_commands_preserve_identity_and_reject_active_mutation() {
     app.registry
         .replace_control_projection(&std::collections::BTreeMap::new(), None);
     app.confirm_delete(0);
-    for _ in 0..200 {
-        app.process_external();
-        if app.runtime.profiles.is_empty() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
+    process_until(
+        &mut app,
+        |app| app.runtime.profiles.is_empty(),
+        "deleted profile did not leave the App catalog",
+    );
     assert!(list_after_worker_release(&store).is_empty());
     assert!(app.control_snapshot.generation > rename_generation);
     let delete_generation = app.control_snapshot.generation;
@@ -2082,13 +2090,11 @@ fn canonical_profile_commands_preserve_identity_and_reject_active_mutation() {
     )
     .unwrap();
     app.import_profile_from_path(source.to_str().unwrap());
-    for _ in 0..200 {
-        app.process_external();
-        if app.runtime.profiles.len() == 1 {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
+    process_until(
+        &mut app,
+        |app| app.runtime.profiles.len() == 1,
+        "imported profile did not reach the App catalog",
+    );
     let imported = list_after_worker_release(&store);
     assert_eq!(imported.len(), 1);
     assert_eq!(app.runtime.profiles[0].id, imported[0].id);
