@@ -17,7 +17,7 @@ use crate::vortix_core::ports::owned_firewall::{
     ExpectedFirewallState, OwnedFirewall, OwnedFirewallError,
 };
 use crate::vortix_core::privileged::{
-    FirewallTransactionId, HelperLedgerFirewall, LeaseId, NetworkPolicyOperation, ObservationState,
+    FirewallTransactionId, HelperLedgerFirewall, LeaseId, NetworkPolicyOperation,
     PhysicalFirewallBackend, PhysicalFirewallStage, PolicyProjection, PrivilegedFirewallRole,
     ResourceObservation,
 };
@@ -187,8 +187,12 @@ impl HelperFirewallExecutor {
             NetworkPolicyOperation::ObserveBarrier { policy, .. } => {
                 self.audit_projection(plan.intended())?;
                 Ok(NetworkPolicyOutcome::Observed(vec![
-                    ResourceObservation::new(policy.clone(), ObservationState::Present, 1)
-                        .map_err(|_| PrivilegedExecutionError::InvalidPlan)?,
+                    ResourceObservation::new(
+                        policy.clone(),
+                        plan.intended().expected_observation_state(),
+                        1,
+                    )
+                    .map_err(|_| PrivilegedExecutionError::InvalidPlan)?,
                 ]))
             }
             NetworkPolicyOperation::ApplyRoutes { .. }
@@ -550,6 +554,7 @@ mod tests {
                 policy: current.policy().clone(),
                 resources: vec![obsolete.policy().clone()],
                 predecessor: PolicyPredecessor::for_test(current.digest(), PolicyPhase::Firewall),
+                retained_state: crate::vortix_core::privileged::ObservationState::Absent,
             },
             vec![current],
             vec![obsolete],
