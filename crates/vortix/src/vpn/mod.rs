@@ -8,6 +8,7 @@ use crate::vortix_core::profile::{Profile, ProfileId, ProtocolKind};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use zeroize::Zeroizing;
 
 /// Import a VPN profile from a file
 pub fn import_profile(path: &Path) -> Result<VpnProfile, String> {
@@ -21,7 +22,7 @@ pub fn import_profile(path: &Path) -> Result<VpnProfile, String> {
 pub(crate) struct PreparedProfileImport {
     profile: VpnProfile,
     stored: Profile,
-    raw_body: Box<[u8]>,
+    raw_body: Zeroizing<Box<[u8]>>,
     source_path: PathBuf,
 }
 
@@ -136,7 +137,7 @@ pub(crate) fn prepare_profile_import(
     );
     Ok(PreparedProfileImport {
         stored,
-        raw_body: content.into_bytes().into_boxed_slice(),
+        raw_body: Zeroizing::new(content.into_bytes().into_boxed_slice()),
         source_path: path.to_path_buf(),
         profile: VpnProfile {
             id,
@@ -154,7 +155,7 @@ pub(crate) fn commit_profile_import(
     profiles_dir: &Path,
 ) -> Result<VpnProfile, String> {
     FsProfileStore::new(profiles_dir.to_path_buf())
-        .insert(&prepared.stored, &prepared.raw_body)
+        .insert(&prepared.stored, prepared.raw_body.as_ref())
         .map_err(|error| format!("Failed to persist profile identity: {error}"))?;
     logger::log(
         LogLevel::Info,
