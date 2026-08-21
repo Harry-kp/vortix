@@ -17,16 +17,17 @@ use crate::helper::material::TunnelMaterialSet;
 use crate::helper::protocol::{
     capability_for_operation, minimum_schema_for_operation, negotiate_enrolled, HelperCapability,
     HelperClientHello, HelperError, HelperOp, HelperPolicyInventory, HelperPolicyResource,
-    HelperRequest, HelperResponse, HelperResult,
+    HelperReleasedInventory, HelperRequest, HelperResponse, HelperResult, RELEASE_ACK_SCHEMA_MIN,
 };
 use crate::vortix_core::privileged::{
     AmbiguousPhase, ChildOwner, ChildSpawnAuthority, HelperEpoch, HelperLedgerDns,
-    HelperLedgerFirewall, HelperLedgerPolicy, HelperLedgerRecord, HelperLedgerResource,
-    HelperResourceState, NetworkPolicyOperation, ObservationState, ObservedChildIdentity,
-    OperationAdmission, OperationError, OperationGuard, OwnedChild, PhysicalDnsStage,
-    PhysicalFirewallStage, PolicyProjection, PrivilegedOperation, ProtocolPlan, ReceiptError,
-    ReceiptLedger, RejectionCode, ResourceKind, ResourceObservation, ResourceObservationTarget,
-    ResourceTag, RootAuthorityLedger, VerifiedReceipt,
+    HelperLedgerFirewall, HelperLedgerPhysicalOwnership, HelperLedgerPolicy, HelperLedgerRecord,
+    HelperLedgerResource, HelperLedgerRoutes, HelperResourceState, NetworkPolicyOperation,
+    ObservationState, ObservedChildIdentity, OperationAdmission, OperationError, OperationGuard,
+    OwnedChild, PhysicalDnsStage, PhysicalFirewallStage, PhysicalRouteStage, PolicyPredecessor,
+    PolicyProjection, PrivilegedOperation, ProtocolPlan, ReceiptError, ReceiptLedger,
+    RejectionCode, ResourceKind, ResourceObservation, ResourceObservationTarget, ResourceTag,
+    RootAuthorityLedger, VerifiedReceipt, MAX_RESOURCE_ITEMS,
 };
 use crate::vortix_core::profile::ProtocolKind;
 
@@ -64,6 +65,12 @@ pub(crate) trait ObservationExecutor {
 pub(crate) enum ObservationScope {
     External,
     Managed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReleasedAcknowledgementMode {
+    Fresh,
+    ReplayDuplicate,
 }
 
 pub(crate) struct ObservationOutcome {
@@ -180,6 +187,7 @@ pub(crate) struct NetworkPolicyExecutionPlan {
     obsolete_effective: Vec<PolicyProjection>,
     recovered_firewalls: Vec<HelperLedgerFirewall>,
     recovered_dns: Vec<HelperLedgerDns>,
+    recovered_routes: Vec<HelperLedgerRoutes>,
 }
 
 impl NetworkPolicyExecutionPlan {
@@ -251,6 +259,10 @@ impl NetworkPolicyExecutionPlan {
         &self.recovered_dns
     }
 
+    pub(crate) fn recovered_routes(&self) -> &[HelperLedgerRoutes] {
+        &self.recovered_routes
+    }
+
     #[cfg(test)]
     pub(crate) fn release_for_test(
         operation: NetworkPolicyOperation,
@@ -274,6 +286,28 @@ impl NetworkPolicyExecutionPlan {
             obsolete_effective,
             recovered_firewalls,
             recovered_dns,
+            recovered_routes: Vec::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mutation_for_test(
+        operation: NetworkPolicyOperation,
+        intended: PolicyProjection,
+        prior_effective: Option<PolicyProjection>,
+        recovered_routes: Vec<HelperLedgerRoutes>,
+    ) -> Self {
+        assert_eq!(operation.policy_resource(), intended.policy());
+        Self {
+            operation,
+            intended,
+            prior_effective,
+            release_families: BTreeSet::new(),
+            retained_effective: Vec::new(),
+            obsolete_effective: Vec::new(),
+            recovered_firewalls: Vec::new(),
+            recovered_dns: Vec::new(),
+            recovered_routes,
         }
     }
 }
@@ -293,6 +327,7 @@ pub(crate) struct RecoveredRouteState {
     state: HelperResourceState,
     intended: PolicyProjection,
     effective: Option<PolicyProjection>,
+    physical: Option<HelperLedgerRoutes>,
 }
 
 impl RecoveredRouteState {
@@ -305,6 +340,21 @@ impl RecoveredRouteState {
             state,
             intended,
             effective,
+            physical: None,
+        }
+    }
+
+    pub(crate) const fn with_physical(
+        state: HelperResourceState,
+        intended: PolicyProjection,
+        effective: Option<PolicyProjection>,
+        physical: HelperLedgerRoutes,
+    ) -> Self {
+        Self {
+            state,
+            intended,
+            effective,
+            physical: Some(physical),
         }
     }
 
@@ -318,6 +368,10 @@ impl RecoveredRouteState {
 
     pub(crate) const fn effective(&self) -> Option<&PolicyProjection> {
         self.effective.as_ref()
+    }
+
+    pub(crate) const fn physical(&self) -> Option<&HelperLedgerRoutes> {
+        self.physical.as_ref()
     }
 }
 
@@ -394,6 +448,7 @@ fn recovered_dns_states(
 }
 
 fn recovered_route_states(
+    physical_routes: &[HelperLedgerRoutes],
     resources: &[HelperLedgerResource],
     policy_projections: &[HelperLedgerPolicy],
 ) -> Vec<RecoveredRouteState> {
@@ -405,10 +460,26 @@ fn recovered_route_states(
                 .iter()
                 .find(|resource| resource.resource() == policy.resource())
                 .map(HelperLedgerResource::state)?;
-            Some(RecoveredRouteState::new(
-                state,
-                policy.intended().clone(),
-                policy.effective().cloned(),
+            let physical = physical_routes
+                .iter()
+                .find(|physical| physical.resource() == policy.resource())
+                .cloned();
+            Some(physical.map_or_else(
+                || {
+                    RecoveredRouteState::new(
+                        state,
+                        policy.intended().clone(),
+                        policy.effective().cloned(),
+                    )
+                },
+                |physical| {
+                    RecoveredRouteState::with_physical(
+                        state,
+                        policy.intended().clone(),
+                        policy.effective().cloned(),
+                        physical,
+                    )
+                },
             ))
         })
         .collect()
@@ -422,29 +493,73 @@ pub(crate) struct PreparedNetworkPolicyExecutionPlan {
     execution: NetworkPolicyExecutionPlan,
     prepared_firewalls: Vec<HelperLedgerFirewall>,
     prepared_dns: Vec<HelperLedgerDns>,
+    prepared_routes: Vec<HelperLedgerRoutes>,
+    route_writer: PreparedRouteWriter,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreparedRouteWriter {
+    ProtocolOwned,
+    HelperOwned,
 }
 
 impl PreparedNetworkPolicyExecutionPlan {
-    pub(crate) const fn new(
+    pub(crate) fn new(
         execution: NetworkPolicyExecutionPlan,
         prepared_firewalls: Vec<HelperLedgerFirewall>,
     ) -> Self {
+        let prepared_routes = execution.recovered_routes.clone();
         Self {
             execution,
             prepared_firewalls,
             prepared_dns: Vec::new(),
+            prepared_routes,
+            route_writer: PreparedRouteWriter::ProtocolOwned,
         }
     }
 
-    pub(crate) const fn with_physical_ownership(
+    pub(crate) fn with_physical_ownership(
         execution: NetworkPolicyExecutionPlan,
         prepared_firewalls: Vec<HelperLedgerFirewall>,
         prepared_dns: Vec<HelperLedgerDns>,
+    ) -> Self {
+        let prepared_routes = execution.recovered_routes.clone();
+        Self {
+            execution,
+            prepared_firewalls,
+            prepared_dns,
+            prepared_routes,
+            route_writer: PreparedRouteWriter::ProtocolOwned,
+        }
+    }
+
+    pub(crate) const fn with_complete_physical_ownership(
+        execution: NetworkPolicyExecutionPlan,
+        prepared_firewalls: Vec<HelperLedgerFirewall>,
+        prepared_dns: Vec<HelperLedgerDns>,
+        prepared_routes: Vec<HelperLedgerRoutes>,
     ) -> Self {
         Self {
             execution,
             prepared_firewalls,
             prepared_dns,
+            prepared_routes,
+            route_writer: PreparedRouteWriter::ProtocolOwned,
+        }
+    }
+
+    pub(crate) const fn with_helper_owned_routes(
+        execution: NetworkPolicyExecutionPlan,
+        prepared_firewalls: Vec<HelperLedgerFirewall>,
+        prepared_dns: Vec<HelperLedgerDns>,
+        prepared_routes: Vec<HelperLedgerRoutes>,
+    ) -> Self {
+        Self {
+            execution,
+            prepared_firewalls,
+            prepared_dns,
+            prepared_routes,
+            route_writer: PreparedRouteWriter::HelperOwned,
         }
     }
 
@@ -460,14 +575,30 @@ impl PreparedNetworkPolicyExecutionPlan {
         &self.prepared_dns
     }
 
+    pub(crate) fn prepared_routes(&self) -> &[HelperLedgerRoutes] {
+        &self.prepared_routes
+    }
+
+    pub(crate) const fn route_writer(&self) -> PreparedRouteWriter {
+        self.route_writer
+    }
+
     fn into_parts(
         self,
     ) -> (
         NetworkPolicyExecutionPlan,
         Vec<HelperLedgerFirewall>,
         Vec<HelperLedgerDns>,
+        Vec<HelperLedgerRoutes>,
+        PreparedRouteWriter,
     ) {
-        (self.execution, self.prepared_firewalls, self.prepared_dns)
+        (
+            self.execution,
+            self.prepared_firewalls,
+            self.prepared_dns,
+            self.prepared_routes,
+            self.route_writer,
+        )
     }
 }
 
@@ -565,6 +696,8 @@ pub(crate) struct EnrolledHelperSession<E, S> {
     policy_projections: BTreeMap<ResourceTag, PolicyRecoveryState>,
     physical_firewalls: BTreeMap<ResourceTag, HelperLedgerFirewall>,
     physical_dns: BTreeMap<ResourceTag, HelperLedgerDns>,
+    physical_routes: BTreeMap<ResourceTag, HelperLedgerRoutes>,
+    released_resources: BTreeSet<ResourceTag>,
     children: BTreeMap<ResourceTag, ChildEvidence>,
     last_receipt: Option<VerifiedReceipt>,
     enabled_capabilities: Vec<HelperCapability>,
@@ -618,6 +751,8 @@ where
             policy_projections: BTreeMap::new(),
             physical_firewalls: BTreeMap::new(),
             physical_dns: BTreeMap::new(),
+            physical_routes: BTreeMap::new(),
+            released_resources: BTreeSet::new(),
             children: BTreeMap::new(),
             last_receipt: None,
             enabled_capabilities,
@@ -662,6 +797,8 @@ where
             policy_projections,
             physical_firewalls,
             physical_dns,
+            physical_routes,
+            released_resources,
             child_observations,
         ) = ledger.into_parts();
         let baseline = root.loaded_replay_baseline(&principal, replay)?;
@@ -669,7 +806,8 @@ where
             recovered_firewall_states(&physical_firewalls, &policy_projections)?;
         let recovered_dns_states =
             recovered_dns_states(&physical_dns, &resources, &policy_projections);
-        let recovered_route_states = recovered_route_states(&resources, &policy_projections);
+        let recovered_route_states =
+            recovered_route_states(&physical_routes, &resources, &policy_projections);
         let policy_enabled = enabled_capabilities.contains(&HelperCapability::NetworkPolicy);
         executor
             .validate_recovered_firewalls(&recovered_firewall_states, policy_enabled)
@@ -714,6 +852,11 @@ where
             .into_iter()
             .map(|dns| (dns.resource().clone(), dns))
             .collect();
+        session.physical_routes = physical_routes
+            .into_iter()
+            .map(|routes| (routes.resource().clone(), routes))
+            .collect();
+        session.released_resources = released_resources.into_iter().collect();
         session.children = child_observations
             .into_iter()
             .map(|identity| {
@@ -774,6 +917,16 @@ where
                 .contains(&HelperCapability::NetworkPolicy)
         {
             response.policy_inventory = Some(Box::new(self.policy_inventory()?));
+        }
+        if response.schema >= RELEASE_ACK_SCHEMA_MIN
+            && self
+                .enabled_capabilities
+                .contains(&HelperCapability::Observe)
+        {
+            response.released_resources = Some(Box::new(
+                HelperReleasedInventory::new(self.released_resources.iter().cloned().collect())
+                    .map_err(|_| HelperError::LedgerUnavailable)?,
+            ));
         }
         self.negotiated_schema = Some(response.schema);
         self.handshaken = true;
@@ -843,58 +996,54 @@ where
             .admit(request)
             .map_err(|error| map_operation_error(&error))?;
         if admission == OperationAdmission::Duplicate {
-            let receipt = if let Some(receipt) = &self.last_receipt {
-                receipt
-                    .validate_against(request, &self.root)
-                    .map_err(map_receipt_error)?;
-                receipt.clone()
-            } else {
-                self.receipts
-                    .ambiguous(request, AmbiguousPhase::ReplyLost)
-                    .map_err(map_receipt_error)?
-            };
-            self.last_receipt = Some(receipt.clone());
-            return receipt_result(receipt);
+            return self.replay_duplicate(request);
         }
 
-        if admission == OperationAdmission::Fresh {
-            // A later duplicate must never inherit the prior operation's
-            // receipt if this fresh execution loses its terminal result.
-            self.last_receipt = None;
-            if let PrivilegedOperation::NetworkPolicy(operation) = request.operation() {
-                if self.prepare_network_policy(operation).is_err() {
-                    if !matches!(operation, NetworkPolicyOperation::ObserveBarrier { .. }) {
-                        self.guard
-                            .rollback_policy_before_effect(request)
-                            .map_err(|_| HelperError::LedgerUnavailable)?;
-                    }
-                    self.persist_ledger()?;
-                    let receipt = self
-                        .receipts
-                        .rejected(request, RejectionCode::InvalidResource)
-                        .map_err(map_receipt_error)?;
-                    self.last_receipt = Some(receipt.clone());
-                    return receipt_result(receipt);
+        // A later duplicate must never inherit the prior operation's receipt
+        // if this fresh execution loses its terminal result.
+        self.last_receipt = None;
+        if let PrivilegedOperation::NetworkPolicy(operation) = request.operation() {
+            if self.prepare_network_policy(operation, admission).is_err() {
+                if !matches!(operation, NetworkPolicyOperation::ObserveBarrier { .. })
+                    && admission != OperationAdmission::PendingReleaseContinuation
+                {
+                    self.guard
+                        .rollback_policy_before_effect(request)
+                        .map_err(|_| HelperError::LedgerUnavailable)?;
                 }
-            }
-            if !matches!(
-                request.operation(),
-                PrivilegedOperation::StartTunnel(_)
-                    | PrivilegedOperation::StopTunnel(_)
-                    | PrivilegedOperation::NetworkPolicy(_)
-                    | PrivilegedOperation::CleanupOwned(_)
-            ) {
                 self.persist_ledger()?;
+                let receipt = self
+                    .receipts
+                    .rejected(request, RejectionCode::InvalidResource)
+                    .map_err(map_receipt_error)?;
+                self.last_receipt = Some(receipt.clone());
+                return receipt_result(receipt);
             }
+        }
+        if !matches!(
+            request.operation(),
+            PrivilegedOperation::StartTunnel(_)
+                | PrivilegedOperation::StopTunnel(_)
+                | PrivilegedOperation::NetworkPolicy(_)
+                | PrivilegedOperation::CleanupOwned(_)
+        ) {
+            self.persist_ledger()?;
         }
 
         let receipt = match request.operation() {
             PrivilegedOperation::Observe(targets) => self.observe(request, targets),
             PrivilegedOperation::ObserveManaged(targets) => self.observe_managed(request, targets),
+            PrivilegedOperation::ObserveManagedAbsence(targets) => {
+                self.observe_managed_absence(request, targets)
+            }
+            PrivilegedOperation::AcknowledgeReleased(targets) => {
+                self.acknowledge_released(request, targets, ReleasedAcknowledgementMode::Fresh)
+            }
+            PrivilegedOperation::AuditPolicy(policy) => self.audit_policy(request, policy),
             PrivilegedOperation::StartTunnel(plan) => self.start_tunnel(request, plan, materials),
             PrivilegedOperation::StopTunnel(resource) => self.stop_tunnel(request, resource),
             PrivilegedOperation::NetworkPolicy(operation) => {
-                self.execute_network_policy(request, operation)
+                self.execute_network_policy(request, operation, admission)
             }
             PrivilegedOperation::CleanupOwned(resources) => self.cleanup_owned(request, resources),
         }?;
@@ -902,11 +1051,44 @@ where
         receipt_result(receipt)
     }
 
-    fn prepare_network_policy(&mut self, operation: &NetworkPolicyOperation) -> Result<(), ()> {
+    fn replay_duplicate(
+        &mut self,
+        request: &crate::vortix_core::privileged::PrivilegedRequest,
+    ) -> Result<HelperResult, HelperError> {
+        if self.last_receipt.is_none() {
+            if let PrivilegedOperation::AcknowledgeReleased(targets) = request.operation() {
+                let receipt = self.acknowledge_released(
+                    request,
+                    targets,
+                    ReleasedAcknowledgementMode::ReplayDuplicate,
+                )?;
+                self.last_receipt = Some(receipt.clone());
+                return receipt_result(receipt);
+            }
+        }
+        let receipt = if let Some(receipt) = &self.last_receipt {
+            receipt
+                .validate_against(request, &self.root)
+                .map_err(map_receipt_error)?;
+            receipt.clone()
+        } else {
+            self.receipts
+                .ambiguous(request, AmbiguousPhase::ReplyLost)
+                .map_err(map_receipt_error)?
+        };
+        self.last_receipt = Some(receipt.clone());
+        receipt_result(receipt)
+    }
+
+    fn prepare_network_policy(
+        &mut self,
+        operation: &NetworkPolicyOperation,
+        admission: OperationAdmission,
+    ) -> Result<(), ()> {
         let resource = operation.policy_resource().clone();
-        if matches!(operation, NetworkPolicyOperation::ApplyRoutes { .. })
+        if matches!(&operation, NetworkPolicyOperation::ApplyRoutes { .. })
             && self.guard.policy_projection().is_some_and(|projection| {
-                projection.route_inputs().is_none_or(|(_, tunnels)| {
+                projection.route_inputs().is_none_or(|(_, _, tunnels)| {
                     tunnels.iter().any(|tunnel| {
                         self.resource_states.get(tunnel.tunnel())
                             != Some(&HelperResourceState::Owned)
@@ -954,15 +1136,24 @@ where
             NetworkPolicyOperation::ReleaseObsolete { resources, .. } => {
                 if self.resource_states.get(&resource) != Some(&HelperResourceState::Owned)
                     || resources.iter().any(|obsolete| {
-                        self.resource_states.get(obsolete) != Some(&HelperResourceState::Owned)
+                        self.resource_states.get(obsolete)
+                            != Some(
+                                &if admission == OperationAdmission::PendingReleaseContinuation {
+                                    HelperResourceState::PendingRelease
+                                } else {
+                                    HelperResourceState::Owned
+                                },
+                            )
                             || !self.policy_projections.contains_key(obsolete)
                     })
                 {
                     return Err(());
                 }
-                for obsolete in resources {
-                    self.resource_states
-                        .insert(obsolete.clone(), HelperResourceState::PendingRelease);
+                if admission != OperationAdmission::PendingReleaseContinuation {
+                    for obsolete in resources {
+                        self.resource_states
+                            .insert(obsolete.clone(), HelperResourceState::PendingRelease);
+                    }
                 }
             }
         }
@@ -974,7 +1165,7 @@ where
         request: &crate::vortix_core::privileged::PrivilegedRequest,
         targets: &[ResourceObservationTarget],
     ) -> Result<VerifiedReceipt, HelperError> {
-        self.execute_observation(request, targets, ObservationScope::External)
+        self.execute_observation(request, targets, ObservationScope::External, None)
     }
 
     fn execute_observation(
@@ -982,6 +1173,7 @@ where
         request: &crate::vortix_core::privileged::PrivilegedRequest,
         targets: &[ResourceObservationTarget],
         scope: ObservationScope,
+        required_state: Option<ObservationState>,
     ) -> Result<VerifiedReceipt, HelperError> {
         let outcome = match self.executor.observe(targets, scope) {
             Ok(outcome) => outcome,
@@ -1018,6 +1210,16 @@ where
                 .rejected(request, RejectionCode::InvalidResource)
                 .map_err(map_receipt_error);
         }
+        if required_state.is_some_and(|required| {
+            targets.iter().any(|target| {
+                observation_state(&outcome.observations, target.resource()) != Some(required)
+            })
+        }) {
+            return self
+                .receipts
+                .rejected(request, RejectionCode::InvalidResource)
+                .map_err(map_receipt_error);
+        }
         let receipt = self
             .receipts
             .observed(request, outcome.observations.clone())
@@ -1039,42 +1241,160 @@ where
                 .rejected(request, RejectionCode::InvalidResource)
                 .map_err(map_receipt_error);
         }
-        self.execute_observation(request, targets, ObservationScope::Managed)
+        self.execute_observation(request, targets, ObservationScope::Managed, None)
+    }
+
+    fn observe_managed_absence(
+        &mut self,
+        request: &crate::vortix_core::privileged::PrivilegedRequest,
+        targets: &[ResourceObservationTarget],
+    ) -> Result<VerifiedReceipt, HelperError> {
+        if !self.released_observation_is_closed(targets) {
+            return self
+                .receipts
+                .rejected(request, RejectionCode::InvalidResource)
+                .map_err(map_receipt_error);
+        }
+        self.execute_observation(
+            request,
+            targets,
+            ObservationScope::Managed,
+            Some(ObservationState::Absent),
+        )
+    }
+
+    fn acknowledge_released(
+        &mut self,
+        request: &crate::vortix_core::privileged::PrivilegedRequest,
+        targets: &[ResourceObservationTarget],
+        mode: ReleasedAcknowledgementMode,
+    ) -> Result<VerifiedReceipt, HelperError> {
+        let requested = targets
+            .iter()
+            .map(ResourceObservationTarget::resource)
+            .collect::<BTreeSet<_>>();
+        let closed =
+            managed_observation_is_closed(targets, |resource| requested.contains(resource));
+        let retained = targets
+            .iter()
+            .all(|target| self.released_resources.contains(target.resource()));
+        let already_collected = mode == ReleasedAcknowledgementMode::ReplayDuplicate
+            && targets.iter().all(|target| {
+                !self.released_resources.contains(target.resource())
+                    && !self.resource_states.contains_key(target.resource())
+            });
+        if !closed || (!retained && !already_collected) {
+            return self
+                .receipts
+                .rejected(request, RejectionCode::InvalidResource)
+                .map_err(map_receipt_error);
+        }
+        let receipt = self.execute_observation(
+            request,
+            targets,
+            ObservationScope::Managed,
+            Some(ObservationState::Absent),
+        )?;
+        if retained {
+            for target in targets {
+                self.released_resources.remove(target.resource());
+            }
+            self.persist_ledger()?;
+        }
+        Ok(receipt)
+    }
+
+    fn released_observation_is_closed(&self, targets: &[ResourceObservationTarget]) -> bool {
+        managed_observation_is_closed(targets, |resource| {
+            self.released_resources.contains(resource)
+                && !self.resource_states.contains_key(resource)
+        })
+    }
+
+    fn audit_policy(
+        &mut self,
+        request: &crate::vortix_core::privileged::PrivilegedRequest,
+        policy: &ResourceTag,
+    ) -> Result<VerifiedReceipt, HelperError> {
+        let effective = self
+            .policy_projections
+            .get(policy)
+            .filter(|state| {
+                self.resource_states.get(policy) == Some(&HelperResourceState::Owned)
+                    && state.effective.as_ref() == Some(&state.intended)
+            })
+            .and_then(|state| state.effective.clone());
+        let Some(effective) = effective else {
+            return self
+                .receipts
+                .rejected(request, RejectionCode::InvalidResource)
+                .map_err(map_receipt_error);
+        };
+        let predecessor = PolicyPredecessor::settled(effective.digest(), effective.phase())
+            .map_err(|_| HelperError::LedgerUnavailable)?;
+        let operation = NetworkPolicyOperation::ObserveBarrier {
+            policy: policy.clone(),
+            predecessor,
+        };
+        let plan = NetworkPolicyExecutionPlan {
+            operation,
+            intended: effective.clone(),
+            prior_effective: None,
+            release_families: BTreeSet::new(),
+            retained_effective: Vec::new(),
+            obsolete_effective: Vec::new(),
+            recovered_firewalls: self
+                .physical_firewalls
+                .get(policy)
+                .cloned()
+                .into_iter()
+                .collect(),
+            recovered_dns: self.physical_dns.get(policy).cloned().into_iter().collect(),
+            recovered_routes: self
+                .physical_routes
+                .get(policy)
+                .cloned()
+                .into_iter()
+                .collect(),
+        };
+        let prepared = self
+            .executor
+            .prepare_network_policy(&plan)
+            .map_err(PrivilegedExecutionError::from)
+            .and_then(|prepared| {
+                Self::accept_prepared_network_policy(&plan, &prepared)
+                    .then_some(prepared)
+                    .ok_or(PrivilegedExecutionError::InvalidPlan)
+            });
+        let outcome =
+            match prepared.and_then(|prepared| self.executor.execute_network_policy(&prepared)) {
+                Ok(NetworkPolicyOutcome::Observed(observations))
+                    if observations.len() == 1
+                        && observations[0].resource() == policy
+                        && observations[0].state() == effective.expected_observation_state() =>
+                {
+                    observations
+                }
+                Ok(_) => {
+                    return self
+                        .receipts
+                        .rejected(request, RejectionCode::InvalidResource)
+                        .map_err(map_receipt_error);
+                }
+                Err(error) => {
+                    return self
+                        .execution_error_receipt(request, error)
+                        .map_err(map_receipt_error);
+                }
+            };
+        self.receipts
+            .observed(request, outcome)
+            .map_err(map_receipt_error)
     }
 
     fn managed_observation_is_closed(&self, targets: &[ResourceObservationTarget]) -> bool {
-        let requested = targets
-            .iter()
-            .map(|target| (target.resource(), target.protocol()))
-            .collect::<BTreeMap<_, _>>();
-        targets.iter().all(|target| {
-            let resource = target.resource();
-            if !self.resource_states.contains_key(resource) {
-                return false;
-            }
-            match resource.kind() {
-                ResourceKind::Tunnel => {
-                    let Ok(group) = process_group_for_tunnel(resource) else {
-                        return false;
-                    };
-                    if self.resource_states.contains_key(&group) {
-                        target.protocol() == Some(ProtocolKind::OpenVpn)
-                            && requested.get(&group) == Some(&Some(ProtocolKind::OpenVpn))
-                    } else {
-                        target.protocol() == Some(ProtocolKind::WireGuard)
-                    }
-                }
-                ResourceKind::ProcessGroup => {
-                    tunnel_for_profile_resource(resource).is_some_and(|tunnel| {
-                        self.resource_states.contains_key(&tunnel)
-                            && requested.get(&tunnel) == Some(&Some(ProtocolKind::OpenVpn))
-                    })
-                }
-                ResourceKind::Firewall
-                | ResourceKind::Dns
-                | ResourceKind::Routes
-                | ResourceKind::RuntimeSecret => false,
-            }
+        managed_observation_is_closed(targets, |resource| {
+            self.resource_states.contains_key(resource)
         })
     }
 
@@ -1099,8 +1419,10 @@ where
                 (HelperResourceState::PendingRelease, None)
                     if observation.state() == ObservationState::Absent =>
                 {
-                    self.resource_states.remove(resource);
-                    changed = true;
+                    if self.record_released_resources(std::slice::from_ref(resource)) {
+                        self.resource_states.remove(resource);
+                        changed = true;
+                    }
                 }
                 (HelperResourceState::PendingEffect, Some(HelperResourceState::PendingEffect)) => {
                     let Some(group) = process_group.as_ref() else {
@@ -1123,6 +1445,7 @@ where
                     if observation.state() == ObservationState::Absent
                         && observation_state(&outcome.observations, group)
                             == Some(ObservationState::Absent)
+                        && self.record_released_resources(&[resource.clone(), group.clone()])
                     {
                         self.resource_states.remove(resource);
                         self.resource_states.remove(group);
@@ -1314,6 +1637,13 @@ where
                 process_group_for_tunnel(tunnel).map_err(|()| HelperError::LedgerUnavailable)?,
             );
         }
+        if !self.can_record_released_resources(&releasing) {
+            self.persist_ledger()?;
+            return self
+                .receipts
+                .rejected(request, RejectionCode::Overloaded)
+                .map_err(map_receipt_error);
+        }
         for resource in &releasing {
             self.resource_states
                 .insert(resource.clone(), HelperResourceState::PendingRelease);
@@ -1331,6 +1661,10 @@ where
                 .map_err(map_receipt_error)?,
         };
         if !receipt.is_ambiguous() {
+            if !self.record_released_resources(&releasing) {
+                self.poisoned = true;
+                return Err(HelperError::LedgerUnavailable);
+            }
             for resource in &releasing {
                 self.resource_states.remove(resource);
             }
@@ -1344,6 +1678,7 @@ where
         &mut self,
         request: &crate::vortix_core::privileged::PrivilegedRequest,
         operation: &NetworkPolicyOperation,
+        admission: OperationAdmission,
     ) -> Result<VerifiedReceipt, HelperError> {
         let Some(plan) = self.network_policy_execution_plan(operation) else {
             self.poisoned = true;
@@ -1352,7 +1687,12 @@ where
         let prepared = match self.executor.prepare_network_policy(&plan) {
             Ok(prepared) => prepared,
             Err(error) => {
-                return self.network_policy_error_receipt(request, operation, error.into());
+                return self.network_policy_error_receipt(
+                    request,
+                    operation,
+                    error.into(),
+                    admission,
+                );
             }
         };
         if !Self::accept_prepared_network_policy(&plan, &prepared) {
@@ -1360,13 +1700,14 @@ where
                 request,
                 operation,
                 PrivilegedExecutionError::InvalidPlan,
+                admission,
             );
         }
-        let effect_plan = self.persist_prepared_network_policy(prepared)?;
+        let effect_plan = self.persist_prepared_network_policy(prepared, admission)?;
         let outcome = match self.executor.execute_network_policy(&effect_plan) {
             Ok(outcome) => outcome,
             Err(error) => {
-                return self.network_policy_error_receipt(request, operation, error);
+                return self.network_policy_error_receipt(request, operation, error, admission);
             }
         };
         self.record_network_policy_outcome(request, operation, outcome)
@@ -1379,15 +1720,18 @@ where
     fn persist_prepared_network_policy(
         &mut self,
         prepared: PreparedNetworkPolicyExecutionPlan,
+        admission: OperationAdmission,
     ) -> Result<PreparedNetworkPolicyExecutionPlan, HelperError> {
         let operation = prepared.execution().operation().clone();
         let prepared = if let NetworkPolicyOperation::ReleaseObsolete { resources, .. } = &operation
         {
-            let (execution, firewalls, dns) = prepared.into_parts();
+            let (execution, firewalls, dns, routes, route_writer) = prepared.into_parts();
             let prepared_firewalls = firewalls
                 .into_iter()
                 .map(|physical| {
-                    if resources.contains(physical.resource()) {
+                    if resources.contains(physical.resource())
+                        && admission != OperationAdmission::PendingReleaseContinuation
+                    {
                         physical
                             .mark_release_pending()
                             .map_err(|_| HelperError::LedgerUnavailable)
@@ -1399,7 +1743,9 @@ where
             let prepared_dns = dns
                 .into_iter()
                 .map(|physical| {
-                    if resources.contains(physical.resource()) {
+                    if resources.contains(physical.resource())
+                        && admission != OperationAdmission::PendingReleaseContinuation
+                    {
                         physical
                             .mark_release_pending()
                             .map_err(|_| HelperError::LedgerUnavailable)
@@ -1408,28 +1754,61 @@ where
                     }
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            PreparedNetworkPolicyExecutionPlan::with_physical_ownership(
-                execution,
-                prepared_firewalls,
-                prepared_dns,
-            )
+            let prepared_routes = routes
+                .into_iter()
+                .map(|physical| {
+                    if resources.contains(physical.resource())
+                        && admission != OperationAdmission::PendingReleaseContinuation
+                    {
+                        physical
+                            .mark_release_pending()
+                            .map_err(|_| HelperError::LedgerUnavailable)
+                    } else {
+                        Ok(physical)
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            match route_writer {
+                PreparedRouteWriter::ProtocolOwned => {
+                    PreparedNetworkPolicyExecutionPlan::with_complete_physical_ownership(
+                        execution,
+                        prepared_firewalls,
+                        prepared_dns,
+                        prepared_routes,
+                    )
+                }
+                PreparedRouteWriter::HelperOwned => {
+                    PreparedNetworkPolicyExecutionPlan::with_helper_owned_routes(
+                        execution,
+                        prepared_firewalls,
+                        prepared_dns,
+                        prepared_routes,
+                    )
+                }
+            }
         } else {
             prepared
         };
         self.record_prepared_network_policy(&operation, &prepared)?;
         self.persist_ledger()?;
+        if matches!(operation, NetworkPolicyOperation::ApplyRoutes { .. })
+            && prepared.route_writer() == PreparedRouteWriter::ProtocolOwned
+        {
+            return Ok(prepared);
+        }
         if !matches!(
             operation,
             NetworkPolicyOperation::EstablishFirewall { .. }
                 | NetworkPolicyOperation::EstablishBlocking { .. }
                 | NetworkPolicyOperation::ApplyFirewall { .. }
+                | NetworkPolicyOperation::ApplyRoutes { .. }
                 | NetworkPolicyOperation::ApplyDns { .. }
         ) {
             return Ok(prepared);
         }
 
         let policy = operation.policy_resource();
-        let (execution, firewalls, dns) = prepared.into_parts();
+        let (execution, firewalls, dns, routes, route_writer) = prepared.into_parts();
         let mut pending_firewall = None;
         let prepared_firewalls = firewalls
             .into_iter()
@@ -1458,11 +1837,26 @@ where
                 Ok(pending)
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let mut pending_routes = None;
+        let prepared_routes = routes
+            .into_iter()
+            .map(|physical| {
+                if physical.resource() != policy {
+                    return Ok(physical);
+                }
+                let pending = physical
+                    .mark_effect_pending()
+                    .map_err(|_| HelperError::LedgerUnavailable)?;
+                pending_routes = Some(pending.clone());
+                Ok(pending)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let has_required_pending = match &operation {
             NetworkPolicyOperation::EstablishFirewall { .. }
             | NetworkPolicyOperation::EstablishBlocking { .. }
             | NetworkPolicyOperation::ApplyFirewall { .. } => pending_firewall.is_some(),
             NetworkPolicyOperation::ApplyDns { .. } => pending_dns.is_some(),
+            NetworkPolicyOperation::ApplyRoutes { .. } => pending_routes.is_some(),
             _ => false,
         };
         if !has_required_pending {
@@ -1475,11 +1869,27 @@ where
         if let Some(pending) = pending_dns {
             self.physical_dns.insert(policy.clone(), pending);
         }
-        let effect_plan = PreparedNetworkPolicyExecutionPlan::with_physical_ownership(
-            execution,
-            prepared_firewalls,
-            prepared_dns,
-        );
+        if let Some(pending) = pending_routes {
+            self.physical_routes.insert(policy.clone(), pending);
+        }
+        let effect_plan = match route_writer {
+            PreparedRouteWriter::ProtocolOwned => {
+                PreparedNetworkPolicyExecutionPlan::with_complete_physical_ownership(
+                    execution,
+                    prepared_firewalls,
+                    prepared_dns,
+                    prepared_routes,
+                )
+            }
+            PreparedRouteWriter::HelperOwned => {
+                PreparedNetworkPolicyExecutionPlan::with_helper_owned_routes(
+                    execution,
+                    prepared_firewalls,
+                    prepared_dns,
+                    prepared_routes,
+                )
+            }
+        };
         self.persist_ledger()?;
         Ok(effect_plan)
     }
@@ -1519,54 +1929,7 @@ where
                         .guard
                         .confirm_observation(request, &receipt, &self.root);
                     if confirmation.is_ok() {
-                        let Some(state) = self.policy_projections.get_mut(policy) else {
-                            self.poisoned = true;
-                            return Err(HelperError::LedgerUnavailable);
-                        };
-                        state.effective = Some(state.intended.clone());
-                        self.resource_states
-                            .insert(policy.clone(), HelperResourceState::Owned);
-                        if policy.kind() == ResourceKind::Firewall {
-                            let Some(physical) = self.physical_firewalls.get(policy).cloned()
-                            else {
-                                self.poisoned = true;
-                                return Err(HelperError::LedgerUnavailable);
-                            };
-                            let observed = physical
-                                .confirm_observed(&state.intended)
-                                .map_err(|_| HelperError::LedgerUnavailable)?;
-                            for (resource, prior) in &mut self.physical_firewalls {
-                                if resource != policy
-                                    && prior.stage() == PhysicalFirewallStage::ObservedOwned
-                                {
-                                    *prior = prior
-                                        .clone()
-                                        .supersede()
-                                        .map_err(|_| HelperError::LedgerUnavailable)?;
-                                }
-                            }
-                            self.physical_firewalls.insert(policy.clone(), observed);
-                        }
-                        if policy.kind() == ResourceKind::Dns {
-                            let Some(physical) = self.physical_dns.get(policy).cloned() else {
-                                self.poisoned = true;
-                                return Err(HelperError::LedgerUnavailable);
-                            };
-                            let observed = physical
-                                .confirm_observed(&state.intended)
-                                .map_err(|_| HelperError::LedgerUnavailable)?;
-                            for (resource, prior) in &mut self.physical_dns {
-                                if resource != policy
-                                    && prior.stage() == PhysicalDnsStage::ObservedOwned
-                                {
-                                    *prior = prior
-                                        .clone()
-                                        .supersede()
-                                        .map_err(|_| HelperError::LedgerUnavailable)?;
-                                }
-                            }
-                            self.physical_dns.insert(policy.clone(), observed);
-                        }
+                        self.record_confirmed_policy_observation(policy)?;
                     }
                     confirmation
                 }
@@ -1578,6 +1941,7 @@ where
                             self.policy_projections.remove(resource);
                             self.physical_firewalls.remove(resource);
                             self.physical_dns.remove(resource);
+                            self.physical_routes.remove(resource);
                         }
                     }
                     confirmation
@@ -1592,6 +1956,80 @@ where
         Ok(receipt)
     }
 
+    fn record_confirmed_policy_observation(
+        &mut self,
+        policy: &ResourceTag,
+    ) -> Result<(), HelperError> {
+        let Some(state) = self.policy_projections.get_mut(policy) else {
+            self.poisoned = true;
+            return Err(HelperError::LedgerUnavailable);
+        };
+        state.effective = Some(state.intended.clone());
+        self.resource_states
+            .insert(policy.clone(), HelperResourceState::Owned);
+        match policy.kind() {
+            ResourceKind::Firewall => {
+                let physical = self
+                    .physical_firewalls
+                    .get(policy)
+                    .cloned()
+                    .ok_or(HelperError::LedgerUnavailable)?;
+                let observed = physical
+                    .confirm_observed(&state.intended)
+                    .map_err(|_| HelperError::LedgerUnavailable)?;
+                for (resource, prior) in &mut self.physical_firewalls {
+                    if resource != policy && prior.stage() == PhysicalFirewallStage::ObservedOwned {
+                        *prior = prior
+                            .clone()
+                            .supersede()
+                            .map_err(|_| HelperError::LedgerUnavailable)?;
+                    }
+                }
+                self.physical_firewalls.insert(policy.clone(), observed);
+            }
+            ResourceKind::Dns => {
+                let physical = self
+                    .physical_dns
+                    .get(policy)
+                    .cloned()
+                    .ok_or(HelperError::LedgerUnavailable)?;
+                let observed = physical
+                    .confirm_observed(&state.intended)
+                    .map_err(|_| HelperError::LedgerUnavailable)?;
+                for (resource, prior) in &mut self.physical_dns {
+                    if resource != policy && prior.stage() == PhysicalDnsStage::ObservedOwned {
+                        *prior = prior
+                            .clone()
+                            .supersede()
+                            .map_err(|_| HelperError::LedgerUnavailable)?;
+                    }
+                }
+                self.physical_dns.insert(policy.clone(), observed);
+            }
+            ResourceKind::Routes => {
+                if let Some(physical) = self.physical_routes.get(policy).cloned() {
+                    let observed = physical
+                        .confirm_observed(&state.intended)
+                        .map_err(|_| HelperError::LedgerUnavailable)?;
+                    for (resource, prior) in &mut self.physical_routes {
+                        if resource != policy && prior.stage() == PhysicalRouteStage::ObservedOwned
+                        {
+                            *prior = prior
+                                .clone()
+                                .supersede()
+                                .map_err(|_| HelperError::LedgerUnavailable)?;
+                        }
+                    }
+                    self.physical_routes.insert(policy.clone(), observed);
+                }
+            }
+            ResourceKind::Tunnel | ResourceKind::ProcessGroup | ResourceKind::RuntimeSecret => {
+                return Err(HelperError::LedgerUnavailable);
+            }
+        }
+        Ok(())
+    }
+
     fn network_policy_execution_plan(
         &self,
         operation: &NetworkPolicyOperation,
@@ -1602,7 +2040,7 @@ where
         if intended != &state.intended || intended.policy() != policy || !intended.is_valid() {
             return None;
         }
-        if intended.route_inputs().is_some_and(|(_, tunnels)| {
+        if intended.route_inputs().is_some_and(|(_, _, tunnels)| {
             tunnels.iter().any(|tunnel| {
                 self.resource_states.get(tunnel.tunnel()) != Some(&HelperResourceState::Owned)
             })
@@ -1653,6 +2091,12 @@ where
             prior_effective.as_ref(),
             &retained_effective,
         )?;
+        let recovered_routes = self.recovered_routes_for(
+            operation,
+            policy,
+            prior_effective.as_ref(),
+            &retained_effective,
+        )?;
 
         Some(NetworkPolicyExecutionPlan {
             operation: operation.clone(),
@@ -1663,6 +2107,7 @@ where
             obsolete_effective,
             recovered_firewalls,
             recovered_dns,
+            recovered_routes,
         })
     }
 
@@ -1830,6 +2275,71 @@ where
         })
     }
 
+    fn recovered_routes_for(
+        &self,
+        operation: &NetworkPolicyOperation,
+        policy: &ResourceTag,
+        prior_effective: Option<&PolicyProjection>,
+        retained_effective: &[PolicyProjection],
+    ) -> Option<Vec<HelperLedgerRoutes>> {
+        Some(match operation {
+            NetworkPolicyOperation::ApplyRoutes { .. } => {
+                let mut resources = Vec::new();
+                if let Some(current) = self.physical_routes.get(policy) {
+                    resources.push(current.clone());
+                }
+                if let Some(prior) = prior_effective.map(PolicyProjection::policy) {
+                    if prior != policy {
+                        if let Some(physical) = self.physical_routes.get(prior) {
+                            resources.push(physical.clone());
+                        }
+                    }
+                }
+                resources
+            }
+            NetworkPolicyOperation::ObserveBarrier { .. }
+                if policy.kind() == ResourceKind::Routes =>
+            {
+                self.physical_routes
+                    .get(policy)
+                    .cloned()
+                    .into_iter()
+                    .collect()
+            }
+            NetworkPolicyOperation::ReleaseObsolete {
+                policy, resources, ..
+            } => {
+                let mut routes = resources
+                    .iter()
+                    .filter(|resource| resource.kind() == ResourceKind::Routes)
+                    .filter_map(|resource| self.physical_routes.get(resource).cloned())
+                    .collect::<Vec<_>>();
+                let retained = retained_effective
+                    .iter()
+                    .find(|projection| projection.policy().kind() == ResourceKind::Routes);
+                if resources
+                    .iter()
+                    .any(|resource| resource.kind() == ResourceKind::Routes)
+                    || policy.kind() == ResourceKind::Routes
+                {
+                    let retained = retained?;
+                    if !routes
+                        .iter()
+                        .any(|physical| physical.resource() == retained.policy())
+                    {
+                        routes.extend(self.physical_routes.get(retained.policy()).cloned());
+                    }
+                }
+                routes
+            }
+            NetworkPolicyOperation::EstablishFirewall { .. }
+            | NetworkPolicyOperation::EstablishBlocking { .. }
+            | NetworkPolicyOperation::ApplyDns { .. }
+            | NetworkPolicyOperation::ApplyFirewall { .. }
+            | NetworkPolicyOperation::ObserveBarrier { .. } => Vec::new(),
+        })
+    }
+
     fn accept_prepared_network_policy(
         plan: &NetworkPolicyExecutionPlan,
         prepared: &PreparedNetworkPolicyExecutionPlan,
@@ -1842,17 +2352,28 @@ where
             | NetworkPolicyOperation::EstablishBlocking { policy, .. }
             | NetworkPolicyOperation::ApplyFirewall { policy, .. } => {
                 prepared.prepared_dns() == plan.recovered_dns()
+                    && prepared.prepared_routes() == plan.recovered_routes()
                     && accepts_prepared_firewall(plan, prepared, policy)
             }
             NetworkPolicyOperation::ApplyDns { policy, .. } => {
                 prepared.prepared_firewalls() == plan.recovered_firewalls()
+                    && prepared.prepared_routes() == plan.recovered_routes()
                     && accepts_prepared_dns(plan, prepared, policy)
             }
-            NetworkPolicyOperation::ReleaseObsolete { .. }
-            | NetworkPolicyOperation::ObserveBarrier { .. }
-            | NetworkPolicyOperation::ApplyRoutes { .. } => {
+            NetworkPolicyOperation::ApplyRoutes { policy, .. } => {
                 prepared.prepared_firewalls() == plan.recovered_firewalls()
                     && prepared.prepared_dns() == plan.recovered_dns()
+                    && ((prepared.route_writer() == PreparedRouteWriter::ProtocolOwned
+                        && plan.recovered_routes().is_empty()
+                        && prepared.prepared_routes().is_empty())
+                        || (prepared.route_writer() == PreparedRouteWriter::HelperOwned
+                            && accepts_prepared_routes(plan, prepared, policy)))
+            }
+            NetworkPolicyOperation::ReleaseObsolete { .. }
+            | NetworkPolicyOperation::ObserveBarrier { .. } => {
+                prepared.prepared_firewalls() == plan.recovered_firewalls()
+                    && prepared.prepared_dns() == plan.recovered_dns()
+                    && prepared.prepared_routes() == plan.recovered_routes()
             }
         }
     }
@@ -1883,63 +2404,112 @@ where
                     .ok_or(HelperError::LedgerUnavailable)?;
                 self.physical_dns.insert(policy.clone(), physical);
             }
-            NetworkPolicyOperation::ReleaseObsolete { resources, .. } => {
-                let retained_firewall = prepared
-                    .execution()
-                    .retained_effective(ResourceKind::Firewall)
-                    .map(PolicyProjection::policy);
-                let retained_dns = prepared
-                    .execution()
-                    .retained_effective(ResourceKind::Dns)
-                    .map(PolicyProjection::policy);
-                for physical in prepared.prepared_firewalls() {
-                    if resources.contains(physical.resource()) {
-                        if !matches!(
-                            physical.stage(),
-                            PhysicalFirewallStage::OwnedReleasePending
-                                | PhysicalFirewallStage::AbsentReleasePending
-                                | PhysicalFirewallStage::SupersededReleasePending
-                        ) {
-                            return Err(HelperError::LedgerUnavailable);
-                        }
-                        self.physical_firewalls
-                            .insert(physical.resource().clone(), physical.clone());
-                    } else if Some(physical.resource()) != retained_firewall
-                        || !matches!(
-                            physical.stage(),
-                            PhysicalFirewallStage::ObservedOwned
-                                | PhysicalFirewallStage::ObservedAbsent
-                        )
-                        || self.physical_firewalls.get(physical.resource()) != Some(physical)
-                    {
-                        return Err(HelperError::LedgerUnavailable);
-                    }
-                }
-                for physical in prepared.prepared_dns() {
-                    if resources.contains(physical.resource()) {
-                        if !matches!(
-                            physical.stage(),
-                            PhysicalDnsStage::OwnedReleasePending
-                                | PhysicalDnsStage::AbsentReleasePending
-                                | PhysicalDnsStage::SupersededReleasePending
-                        ) {
-                            return Err(HelperError::LedgerUnavailable);
-                        }
-                        self.physical_dns
-                            .insert(physical.resource().clone(), physical.clone());
-                    } else if Some(physical.resource()) != retained_dns
-                        || !matches!(
-                            physical.stage(),
-                            PhysicalDnsStage::ObservedOwned | PhysicalDnsStage::ObservedAbsent
-                        )
-                        || self.physical_dns.get(physical.resource()) != Some(physical)
-                    {
-                        return Err(HelperError::LedgerUnavailable);
-                    }
+            NetworkPolicyOperation::ApplyRoutes { policy, .. } => {
+                let physical = prepared
+                    .prepared_routes()
+                    .iter()
+                    .find(|physical| physical.resource() == policy)
+                    .cloned();
+                if let Some(physical) = physical {
+                    self.physical_routes.insert(policy.clone(), physical);
+                } else if !prepared.prepared_routes().is_empty() {
+                    return Err(HelperError::LedgerUnavailable);
                 }
             }
-            NetworkPolicyOperation::ApplyRoutes { .. }
-            | NetworkPolicyOperation::ObserveBarrier { .. } => {}
+            NetworkPolicyOperation::ReleaseObsolete { resources, .. } => {
+                self.record_prepared_policy_release(resources, prepared)?;
+            }
+            NetworkPolicyOperation::ObserveBarrier { .. } => {}
+        }
+        Ok(())
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the release checkpoint validates three distinct backend stage vocabularies"
+    )]
+    fn record_prepared_policy_release(
+        &mut self,
+        resources: &[ResourceTag],
+        prepared: &PreparedNetworkPolicyExecutionPlan,
+    ) -> Result<(), HelperError> {
+        let retained_firewall = prepared
+            .execution()
+            .retained_effective(ResourceKind::Firewall)
+            .map(PolicyProjection::policy);
+        let retained_dns = prepared
+            .execution()
+            .retained_effective(ResourceKind::Dns)
+            .map(PolicyProjection::policy);
+        let retained_routes = prepared
+            .execution()
+            .retained_effective(ResourceKind::Routes)
+            .map(PolicyProjection::policy);
+        for physical in prepared.prepared_firewalls() {
+            if resources.contains(physical.resource()) {
+                if !matches!(
+                    physical.stage(),
+                    PhysicalFirewallStage::OwnedReleasePending
+                        | PhysicalFirewallStage::AbsentReleasePending
+                        | PhysicalFirewallStage::SupersededReleasePending
+                ) {
+                    return Err(HelperError::LedgerUnavailable);
+                }
+                self.physical_firewalls
+                    .insert(physical.resource().clone(), physical.clone());
+            } else if Some(physical.resource()) != retained_firewall
+                || !matches!(
+                    physical.stage(),
+                    PhysicalFirewallStage::ObservedOwned | PhysicalFirewallStage::ObservedAbsent
+                )
+                || self.physical_firewalls.get(physical.resource()) != Some(physical)
+            {
+                return Err(HelperError::LedgerUnavailable);
+            }
+        }
+        for physical in prepared.prepared_dns() {
+            if resources.contains(physical.resource()) {
+                if !matches!(
+                    physical.stage(),
+                    PhysicalDnsStage::OwnedReleasePending
+                        | PhysicalDnsStage::AbsentReleasePending
+                        | PhysicalDnsStage::SupersededReleasePending
+                ) {
+                    return Err(HelperError::LedgerUnavailable);
+                }
+                self.physical_dns
+                    .insert(physical.resource().clone(), physical.clone());
+            } else if Some(physical.resource()) != retained_dns
+                || !matches!(
+                    physical.stage(),
+                    PhysicalDnsStage::ObservedOwned | PhysicalDnsStage::ObservedAbsent
+                )
+                || self.physical_dns.get(physical.resource()) != Some(physical)
+            {
+                return Err(HelperError::LedgerUnavailable);
+            }
+        }
+        for physical in prepared.prepared_routes() {
+            if resources.contains(physical.resource()) {
+                if !matches!(
+                    physical.stage(),
+                    PhysicalRouteStage::OwnedReleasePending
+                        | PhysicalRouteStage::AbsentReleasePending
+                        | PhysicalRouteStage::SupersededReleasePending
+                ) {
+                    return Err(HelperError::LedgerUnavailable);
+                }
+                self.physical_routes
+                    .insert(physical.resource().clone(), physical.clone());
+            } else if Some(physical.resource()) != retained_routes
+                || !matches!(
+                    physical.stage(),
+                    PhysicalRouteStage::ObservedOwned | PhysicalRouteStage::ObservedAbsent
+                )
+                || self.physical_routes.get(physical.resource()) != Some(physical)
+            {
+                return Err(HelperError::LedgerUnavailable);
+            }
         }
         Ok(())
     }
@@ -1949,7 +2519,14 @@ where
         request: &crate::vortix_core::privileged::PrivilegedRequest,
         operation: &NetworkPolicyOperation,
         error: PrivilegedExecutionError,
+        admission: OperationAdmission,
     ) -> Result<VerifiedReceipt, HelperError> {
+        if admission == OperationAdmission::PendingReleaseContinuation {
+            self.persist_ledger()?;
+            return self
+                .execution_error_receipt(request, PrivilegedExecutionError::EffectMayHaveApplied)
+                .map_err(map_receipt_error);
+        }
         if !matches!(error, PrivilegedExecutionError::EffectMayHaveApplied) {
             match operation {
                 NetworkPolicyOperation::EstablishFirewall { policy, .. }
@@ -1997,6 +2574,7 @@ where
             self.resource_states.remove(policy);
             self.physical_firewalls.remove(policy);
             self.physical_dns.remove(policy);
+            self.physical_routes.remove(policy);
         }
         self.persist_ledger()
     }
@@ -2025,7 +2603,15 @@ where
                     .ok_or(HelperError::LedgerUnavailable)?;
                 self.physical_dns.insert(policy.clone(), physical);
             }
-            ResourceKind::Routes => {}
+            ResourceKind::Routes => {
+                let physical = self
+                    .physical_routes
+                    .get(policy)
+                    .cloned()
+                    .and_then(|physical| physical.restore_after_failed_mutation(effective).ok())
+                    .ok_or(HelperError::LedgerUnavailable)?;
+                self.physical_routes.insert(policy.clone(), physical);
+            }
             ResourceKind::Tunnel | ResourceKind::ProcessGroup | ResourceKind::RuntimeSecret => {
                 return Err(HelperError::LedgerUnavailable);
             }
@@ -2070,7 +2656,16 @@ where
                         .ok_or(HelperError::LedgerUnavailable)?;
                     self.physical_dns.insert(resource.clone(), physical);
                 }
-                ResourceKind::Routes => {}
+                ResourceKind::Routes => {
+                    let physical = self
+                        .physical_routes
+                        .get(resource)
+                        .cloned()
+                        .filter(|physical| physical.intended_digest() == effective.digest())
+                        .and_then(|physical| physical.restore_after_failed_release().ok())
+                        .ok_or(HelperError::LedgerUnavailable)?;
+                    self.physical_routes.insert(resource.clone(), physical);
+                }
                 ResourceKind::Tunnel | ResourceKind::ProcessGroup | ResourceKind::RuntimeSecret => {
                     return Err(HelperError::LedgerUnavailable)
                 }
@@ -2096,6 +2691,13 @@ where
                 .rejected(request, RejectionCode::InvalidResource)
                 .map_err(map_receipt_error);
         }
+        if !self.can_record_released_resources(resources) {
+            self.persist_ledger()?;
+            return self
+                .receipts
+                .rejected(request, RejectionCode::Overloaded)
+                .map_err(map_receipt_error);
+        }
 
         let children = self.cleanup_children(resources);
         for resource in resources {
@@ -2115,11 +2717,15 @@ where
                 .map_err(map_receipt_error)?,
         };
         if !receipt.is_ambiguous() {
+            if !self.record_released_resources(resources) {
+                self.poisoned = true;
+                return Err(HelperError::LedgerUnavailable);
+            }
             for resource in resources {
                 self.resource_states.remove(resource);
                 match resource.kind() {
                     ResourceKind::ProcessGroup => {
-                        if let Some(tunnel) = tunnel_for_profile_resource(resource) {
+                        if let Some(tunnel) = resource.corresponding_tunnel() {
                             self.children.remove(&tunnel);
                         }
                     }
@@ -2156,7 +2762,8 @@ where
     fn owns_cleanup_resource(&self, resource: &ResourceTag) -> bool {
         match resource.kind() {
             ResourceKind::Tunnel => self.owns_tunnel(resource),
-            ResourceKind::ProcessGroup => tunnel_for_profile_resource(resource)
+            ResourceKind::ProcessGroup => resource
+                .corresponding_tunnel()
                 .is_some_and(|tunnel| self.child_identity(&tunnel).is_some()),
             ResourceKind::RuntimeSecret
             | ResourceKind::Firewall
@@ -2170,7 +2777,7 @@ where
         for resource in resources {
             let tunnel = match resource.kind() {
                 ResourceKind::Tunnel => Some(resource.clone()),
-                ResourceKind::ProcessGroup => tunnel_for_profile_resource(resource),
+                ResourceKind::ProcessGroup => resource.corresponding_tunnel(),
                 ResourceKind::RuntimeSecret
                 | ResourceKind::Firewall
                 | ResourceKind::Dns
@@ -2229,12 +2836,17 @@ where
             .collect();
         let physical_firewalls = self.physical_firewalls.values().cloned().collect();
         let physical_dns = self.physical_dns.values().cloned().collect();
-        let Ok(ledger) = HelperLedgerRecord::new_with_physical_ownership(
+        let physical_routes = self.physical_routes.values().cloned().collect();
+        let Ok(ledger) = HelperLedgerRecord::new_with_complete_physical_ownership_and_released(
             checkpoint,
             resources,
             policy_projections,
-            physical_firewalls,
-            physical_dns,
+            HelperLedgerPhysicalOwnership {
+                firewalls: physical_firewalls,
+                dns: physical_dns,
+                routes: physical_routes,
+            },
+            self.released_resources.iter().cloned().collect(),
             child_observations,
         ) else {
             self.poisoned = true;
@@ -2245,6 +2857,37 @@ where
             return Err(HelperError::LedgerUnavailable);
         }
         Ok(())
+    }
+
+    fn can_record_released_resources(&self, resources: &[ResourceTag]) -> bool {
+        self.released_resources_after(resources).is_some()
+    }
+
+    fn record_released_resources(&mut self, resources: &[ResourceTag]) -> bool {
+        let Some(projected) = self.released_resources_after(resources) else {
+            return false;
+        };
+        self.released_resources = projected;
+        true
+    }
+
+    fn released_resources_after(&self, resources: &[ResourceTag]) -> Option<BTreeSet<ResourceTag>> {
+        let profiles = resources
+            .iter()
+            .map(ResourceTag::profile_id)
+            .collect::<Option<BTreeSet<_>>>()?;
+        let mut projected = self
+            .released_resources
+            .iter()
+            .filter(|existing| {
+                existing
+                    .profile_id()
+                    .is_none_or(|profile| !profiles.contains(profile))
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        projected.extend(resources.iter().cloned());
+        (projected.len() <= MAX_RESOURCE_ITEMS).then_some(projected)
     }
 
     fn clear_resources(&mut self, resources: &[ResourceTag]) -> Result<(), HelperError> {
@@ -2430,8 +3073,93 @@ fn accepts_prepared_dns(
     })
 }
 
-pub(super) fn tunnel_for_profile_resource(resource: &ResourceTag) -> Option<ResourceTag> {
-    ResourceTag::tunnel(resource.profile_id()?.clone(), resource.generation()).ok()
+fn accepts_prepared_routes(
+    plan: &NetworkPolicyExecutionPlan,
+    prepared: &PreparedNetworkPolicyExecutionPlan,
+    policy: &ResourceTag,
+) -> bool {
+    let candidates = prepared.prepared_routes();
+    if candidates.len()
+        != plan.recovered_routes().len()
+            + usize::from(
+                !plan
+                    .recovered_routes()
+                    .iter()
+                    .any(|physical| physical.resource() == policy),
+            )
+    {
+        return false;
+    }
+    let Some(current) = candidates
+        .iter()
+        .find(|physical| physical.resource() == policy)
+    else {
+        return false;
+    };
+    if current.stage() != PhysicalRouteStage::Prepared
+        || current.intended_digest() != plan.intended().digest()
+    {
+        return false;
+    }
+    if let Some(existing) = plan
+        .recovered_routes()
+        .iter()
+        .find(|physical| physical.resource() == policy)
+    {
+        if current.backend() != existing.backend()
+            || current.transaction_id() != existing.transaction_id()
+        {
+            return false;
+        }
+    }
+    candidates.iter().enumerate().all(|(index, candidate)| {
+        !candidates[..index]
+            .iter()
+            .any(|prior| prior.resource() == candidate.resource())
+            && (candidate.resource() == policy
+                || plan
+                    .recovered_routes()
+                    .iter()
+                    .any(|expected| expected == candidate))
+    })
+}
+
+fn managed_observation_is_closed(
+    targets: &[ResourceObservationTarget],
+    owns: impl Fn(&ResourceTag) -> bool,
+) -> bool {
+    let requested = targets
+        .iter()
+        .map(|target| (target.resource(), target.protocol()))
+        .collect::<BTreeMap<_, _>>();
+    targets.iter().all(|target| {
+        let resource = target.resource();
+        if !owns(resource) {
+            return false;
+        }
+        match resource.kind() {
+            ResourceKind::Tunnel => {
+                let Ok(group) = process_group_for_tunnel(resource) else {
+                    return false;
+                };
+                if owns(&group) {
+                    target.protocol() == Some(ProtocolKind::OpenVpn)
+                        && requested.get(&group) == Some(&Some(ProtocolKind::OpenVpn))
+                } else {
+                    target.protocol() == Some(ProtocolKind::WireGuard)
+                }
+            }
+            ResourceKind::ProcessGroup => resource.corresponding_tunnel().is_some_and(|tunnel| {
+                owns(&tunnel)
+                    && requested.get(&tunnel) == Some(&Some(ProtocolKind::OpenVpn))
+                    && target.protocol() == Some(ProtocolKind::OpenVpn)
+            }),
+            ResourceKind::Firewall
+            | ResourceKind::Dns
+            | ResourceKind::Routes
+            | ResourceKind::RuntimeSecret => false,
+        }
+    })
 }
 
 pub(crate) fn process_group_for_tunnel(tunnel: &ResourceTag) -> Result<ResourceTag, ()> {
@@ -2496,8 +3224,9 @@ mod tests {
     use crate::vortix_core::privileged::{
         BootScope, ContainmentId, DnsTransactionId, FirewallTransactionId, LeaseId,
         ObservationState, OpenVpnAuthFactors, OpenVpnPlan, OpenVpnRemote, OpenVpnRemoteSelection,
-        OpenVpnTransport, OperationDigest, PeerProcessIdentity, PhysicalDnsBackend,
-        PhysicalFirewallBackend, PolicyPhase, PrivilegedRequest, ProtocolEndpoint, RequestSequence,
+        OpenVpnRouteEvidence, OpenVpnRouteSetEvidence, OpenVpnTransport, OperationDigest,
+        PeerProcessIdentity, PhysicalDnsBackend, PhysicalFirewallBackend, PhysicalRouteBackend,
+        PolicyPhase, PrivilegedRequest, ProtocolEndpoint, RequestSequence, RouteTransactionId,
         ScopedRoute, ServiceInstanceClaim, ServiceManager, WireGuardInterfaceOptions,
         WireGuardPeerPlan, WireGuardPlan,
     };
@@ -2540,6 +3269,17 @@ mod tests {
     }
 
     #[derive(Default)]
+    enum FakeOpenVpnRouteEvidence {
+        #[default]
+        Complete,
+        Missing,
+    }
+
+    #[derive(Default)]
+    #[allow(
+        clippy::struct_excessive_bools,
+        reason = "the test fake independently injects each privileged failure boundary"
+    )]
     struct FakeExecutor {
         observations: usize,
         starts: usize,
@@ -2548,6 +3288,7 @@ mod tests {
         policy_calls: usize,
         policy_prepares: usize,
         policy_prepare_error: Option<NetworkPolicyPreparationError>,
+        prepare_physical_routes: bool,
         policy_plans: Vec<PreparedNetworkPolicyExecutionPlan>,
         recovered_dns_validations: Vec<Vec<RecoveredDnsState>>,
         recovered_firewall_validations: Vec<Vec<RecoveredFirewallState>>,
@@ -2565,6 +3306,7 @@ mod tests {
         cleanup_evidence: FakeCleanupEvidence,
         observation_state: Option<ObservationState>,
         child_observation: FakeChildObservation,
+        openvpn_route_evidence: FakeOpenVpnRouteEvidence,
     }
 
     impl ObservationExecutor for FakeExecutor {
@@ -2587,6 +3329,27 @@ mod tests {
                             state,
                             1,
                             Vec::new(),
+                        )
+                    } else if scope == ObservationScope::Managed
+                        && target.protocol() == Some(ProtocolKind::OpenVpn)
+                        && target.resource().kind() == ResourceKind::Tunnel
+                        && state == ObservationState::Present
+                        && matches!(
+                            self.openvpn_route_evidence,
+                            FakeOpenVpnRouteEvidence::Complete
+                        )
+                    {
+                        ResourceObservation::with_openvpn_routes(
+                            target.resource().clone(),
+                            state,
+                            1,
+                            OpenVpnRouteEvidence::new(
+                                OpenVpnRouteSetEvidence::new(Vec::new(), None)
+                                    .expect("empty configured routes are complete"),
+                                OpenVpnRouteSetEvidence::new(Vec::new(), None)
+                                    .expect("empty pushed routes are complete"),
+                            )
+                            .expect("empty route evidence is complete"),
                         )
                     } else {
                         ResourceObservation::new(target.resource().clone(), state, 1)
@@ -2706,6 +3469,10 @@ mod tests {
             Ok(())
         }
 
+        #[allow(
+            clippy::too_many_lines,
+            reason = "the test fake constructs each family-specific prepared policy payload"
+        )]
         fn prepare_network_policy(
             &mut self,
             plan: &NetworkPolicyExecutionPlan,
@@ -2780,11 +3547,80 @@ mod tests {
                     dns.push(prepared);
                 }
             }
-            Ok(PreparedNetworkPolicyExecutionPlan::with_physical_ownership(
-                plan.clone(),
-                firewalls,
-                dns,
-            ))
+            let mut routes = plan.recovered_routes().to_vec();
+            if self.prepare_physical_routes
+                && matches!(plan.operation(), NetworkPolicyOperation::ApplyRoutes { .. })
+            {
+                let resource = plan.operation().policy_resource();
+                let (_, redirects, _) = plan
+                    .intended()
+                    .route_inputs()
+                    .ok_or(NetworkPolicyPreparationError::InvalidPlan)?;
+                if !redirects.is_empty() {
+                    return Err(NetworkPolicyPreparationError::InvalidPlan);
+                }
+                let entries = plan
+                    .intended()
+                    .route_inputs()
+                    .ok_or(NetworkPolicyPreparationError::InvalidPlan)?
+                    .0
+                    .iter()
+                    .map(|route| {
+                        crate::vortix_core::privileged::PhysicalRouteEntry::new(
+                            route.destination(),
+                            "vxroute0".into(),
+                            None,
+                            route.metric(),
+                        )
+                        .map_err(|_| NetworkPolicyPreparationError::InvalidPlan)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut transaction = [0; 32];
+                transaction[..8].copy_from_slice(&resource.generation().to_be_bytes());
+                let prepared = HelperLedgerRoutes::prepared(
+                    resource.clone(),
+                    PhysicalRouteBackend::LinuxPolicyV1,
+                    RouteTransactionId::new(transaction)
+                        .map_err(|_| NetworkPolicyPreparationError::InvalidPlan)?,
+                    plan.intended().digest(),
+                    entries,
+                    plan.intended()
+                        .route_inputs()
+                        .into_iter()
+                        .flat_map(|(_, _, tunnels)| tunnels)
+                        .flat_map(
+                            crate::vortix_core::privileged::PrivilegedFirewallTunnel::endpoint_ips,
+                        )
+                        .copied()
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .into_iter()
+                        .collect(),
+                    Vec::new(),
+                )
+                .map_err(|_| NetworkPolicyPreparationError::InvalidPlan)?;
+                routes.push(prepared);
+            }
+            if self.prepare_physical_routes
+                && matches!(plan.operation(), NetworkPolicyOperation::ApplyRoutes { .. })
+            {
+                Ok(
+                    PreparedNetworkPolicyExecutionPlan::with_helper_owned_routes(
+                        plan.clone(),
+                        firewalls,
+                        dns,
+                        routes,
+                    ),
+                )
+            } else {
+                Ok(
+                    PreparedNetworkPolicyExecutionPlan::with_complete_physical_ownership(
+                        plan.clone(),
+                        firewalls,
+                        dns,
+                        routes,
+                    ),
+                )
+            }
         }
 
         fn execute_network_policy(
@@ -2801,19 +3637,22 @@ mod tests {
             match plan.operation() {
                 NetworkPolicyOperation::ObserveBarrier { policy, .. } => {
                     Ok(NetworkPolicyOutcome::Observed(vec![
-                        ResourceObservation::new(policy.clone(), ObservationState::Present, 3)
-                            .unwrap(),
+                        ResourceObservation::new(
+                            policy.clone(),
+                            plan.intended().expected_observation_state(),
+                            3,
+                        )
+                        .unwrap(),
                     ]))
                 }
                 NetworkPolicyOperation::ReleaseObsolete {
-                    policy, resources, ..
+                    policy,
+                    resources,
+                    retained_state,
+                    ..
                 } => {
-                    let mut observations = vec![ResourceObservation::new(
-                        policy.clone(),
-                        ObservationState::Present,
-                        3,
-                    )
-                    .unwrap()];
+                    let mut observations =
+                        vec![ResourceObservation::new(policy.clone(), *retained_state, 3).unwrap()];
                     observations.extend(resources.iter().cloned().map(|resource| {
                         ResourceObservation::new(resource, ObservationState::Absent, 3).unwrap()
                     }));
@@ -3040,6 +3879,7 @@ mod tests {
             NetworkPolicyOperation::ApplyRoutes {
                 policy: routes.clone(),
                 routes: Vec::new(),
+                redirects: Vec::new(),
                 predecessor,
             },
         );
@@ -3093,6 +3933,28 @@ mod tests {
         );
         let encoded = serde_json::to_vec(persisted).unwrap();
         assert!(serde_json::from_slice::<HelperLedgerRecord>(&encoded).is_ok());
+    }
+
+    #[test]
+    fn policy_audit_rechecks_exact_root_owned_effective_projection() {
+        let mut harness = LifecycleHarness::for_policy(FakeExecutor::default());
+        let (_, routes, _) = install_policy_generation(&mut harness, 1, 1);
+        let audit = harness.request(9, PrivilegedOperation::AuditPolicy(routes.clone()));
+
+        let receipt = harness.execute(10, &audit);
+
+        assert!(receipt.observes(&routes, ObservationState::Absent));
+        assert!(matches!(
+            harness
+                .server
+                .executor
+                .policy_plans
+                .last()
+                .unwrap()
+                .execution()
+                .operation(),
+            NetworkPolicyOperation::ObserveBarrier { policy, .. } if policy == &routes
+        ));
     }
 
     fn recover_policy_inventory(
@@ -3245,6 +4107,7 @@ mod tests {
                 policy: firewall_2.clone(),
                 resources: obsolete.to_vec(),
                 predecessor: pending_release.server.guard.policy_predecessor().unwrap(),
+                retained_state: ObservationState::Present,
             }),
         );
         assert!(!pending_release.execute(18, &release).is_ambiguous());
@@ -3312,6 +4175,10 @@ mod tests {
         }
 
         fn with_capability(executor: FakeExecutor, capability: HelperCapability) -> Self {
+            Self::with_capabilities(executor, vec![capability])
+        }
+
+        fn with_capabilities(executor: FakeExecutor, capabilities: Vec<HelperCapability>) -> Self {
             let (root, principal, claim, helper_epoch, baseline) = fixture();
             let mut server = EnrolledHelperSession::resume(
                 root,
@@ -3323,7 +4190,7 @@ mod tests {
             .unwrap();
             let handshake = server.handle(HelperRequest {
                 id: 1,
-                op: HelperOp::Handshake(HelperClientHello::current(501, claim, vec![capability])),
+                op: HelperOp::Handshake(HelperClientHello::current(501, claim, capabilities)),
             });
             let HelperResult::Handshake(server_hello) = handshake.result.unwrap() else {
                 panic!("expected handshake");
@@ -3478,7 +4345,7 @@ mod tests {
             id: 1,
             op: HelperOp::Handshake(HelperClientHello::current(501, claim, vec![capability])),
         });
-        assert!(response.result.is_ok());
+        assert!(response.result.is_ok(), "{:?}", response.result);
         (recovered, principal, helper_epoch)
     }
 
@@ -3636,6 +4503,366 @@ mod tests {
     }
 
     #[test]
+    fn managed_absence_rejects_never_owned_wireguard_resources() {
+        let (root, principal, claim, helper_epoch, baseline) = fixture();
+        let mut server = EnrolledHelperSession::resume(
+            root,
+            helper_epoch,
+            baseline,
+            FakeExecutor {
+                observation_state: Some(ObservationState::Absent),
+                ..FakeExecutor::default()
+            },
+            MemoryHelperLedgerStore::default(),
+        )
+        .unwrap();
+        let handshake = server.handle(HelperRequest {
+            id: 1,
+            op: HelperOp::Handshake(HelperClientHello::current(
+                501,
+                claim,
+                vec![HelperCapability::Observe],
+            )),
+        });
+        let HelperResult::Handshake(server_hello) = handshake.result.unwrap() else {
+            panic!("expected handshake");
+        };
+        let client = AuthenticatedHelperSession::from_handshake(
+            &principal,
+            &verified_helper_peer(),
+            &server_hello,
+        )
+        .unwrap();
+        let request = PrivilegedRequest::new(
+            &principal,
+            helper_epoch,
+            RequestSequence::new(1).unwrap(),
+            PrivilegedOperation::ObserveManagedAbsence(vec![wireguard_target(resource())]),
+        )
+        .unwrap();
+
+        let response = server.handle(HelperRequest {
+            id: 2,
+            op: HelperOp::Execute(Box::new(request.clone())),
+        });
+        let receipt = client.verify_receipt(2, &request, response).unwrap();
+
+        assert!(receipt.is_rejected());
+        assert_eq!(server.executor.observations, 0);
+    }
+
+    #[test]
+    fn managed_absence_requires_durable_released_wireguard_identity() {
+        let mut harness = LifecycleHarness::with_capabilities(
+            FakeExecutor {
+                observation_state: Some(ObservationState::Absent),
+                ..FakeExecutor::default()
+            },
+            vec![HelperCapability::TunnelLifecycle, HelperCapability::Observe],
+        );
+        let start = harness.request(1, PrivilegedOperation::StartTunnel(wireguard_plan(1)));
+        assert!(!harness.execute(2, &start).is_ambiguous());
+        let stop = harness.request(2, PrivilegedOperation::StopTunnel(resource()));
+        assert!(!harness.execute(3, &stop).is_ambiguous());
+        let observe = harness.request(
+            3,
+            PrivilegedOperation::ObserveManagedAbsence(vec![wireguard_target(resource())]),
+        );
+
+        let receipt = harness.execute(4, &observe);
+
+        assert!(receipt.observes(&resource(), ObservationState::Absent));
+        assert_eq!(harness.server.executor.observations, 1);
+        assert_eq!(
+            harness
+                .server
+                .ledger_store
+                .writes
+                .last()
+                .unwrap()
+                .released_resources(),
+            &[resource()]
+        );
+    }
+
+    #[test]
+    fn released_identity_capacity_rejects_before_tunnel_teardown() {
+        let mut harness = LifecycleHarness::with_capabilities(
+            FakeExecutor::default(),
+            vec![HelperCapability::TunnelLifecycle],
+        );
+        let start = harness.request(1, PrivilegedOperation::StartTunnel(wireguard_plan(1)));
+        assert!(!harness.execute(2, &start).is_ambiguous());
+        harness.server.released_resources = (1..=MAX_RESOURCE_ITEMS)
+            .map(|seed| {
+                ResourceTag::tunnel(ProfileId::parse(format!("{seed:064x}")).unwrap(), 1).unwrap()
+            })
+            .collect();
+        let stop = harness.request(2, PrivilegedOperation::StopTunnel(resource()));
+
+        let receipt = harness.execute(3, &stop);
+
+        assert!(receipt.is_rejected());
+        assert_eq!(harness.server.executor.stops, 0);
+        assert!(harness.server.owns_tunnel(&resource()));
+    }
+
+    #[test]
+    fn released_identity_acknowledgement_rechecks_absence_and_persists_collection() {
+        let mut harness = LifecycleHarness::with_capabilities(
+            FakeExecutor {
+                observation_state: Some(ObservationState::Absent),
+                ..FakeExecutor::default()
+            },
+            vec![HelperCapability::TunnelLifecycle, HelperCapability::Observe],
+        );
+        let start = harness.request(1, PrivilegedOperation::StartTunnel(wireguard_plan(1)));
+        assert!(!harness.execute(2, &start).is_ambiguous());
+        let stop = harness.request(2, PrivilegedOperation::StopTunnel(resource()));
+        assert!(!harness.execute(3, &stop).is_ambiguous());
+        let acknowledge = harness.request(
+            3,
+            PrivilegedOperation::AcknowledgeReleased(vec![wireguard_target(resource())]),
+        );
+
+        let receipt = harness.execute(4, &acknowledge);
+
+        assert!(receipt.observes(&resource(), ObservationState::Absent));
+        assert_eq!(harness.server.executor.observations, 1);
+        assert!(harness
+            .server
+            .ledger_store
+            .writes
+            .last()
+            .unwrap()
+            .released_resources()
+            .is_empty());
+    }
+
+    #[test]
+    fn released_identity_acknowledgement_rejects_unowned_identity_before_observation() {
+        let mut harness = LifecycleHarness::with_capability(
+            FakeExecutor {
+                observation_state: Some(ObservationState::Absent),
+                ..FakeExecutor::default()
+            },
+            HelperCapability::Observe,
+        );
+        let acknowledge = harness.request(
+            1,
+            PrivilegedOperation::AcknowledgeReleased(vec![wireguard_target(resource())]),
+        );
+
+        let receipt = harness.execute(2, &acknowledge);
+
+        assert!(receipt.is_rejected());
+        assert_eq!(harness.server.executor.observations, 0);
+    }
+
+    #[test]
+    fn released_identity_acknowledgement_recovers_after_collection_checkpoint_failure() {
+        let mut harness = LifecycleHarness::with_capabilities(
+            FakeExecutor {
+                observation_state: Some(ObservationState::Absent),
+                ..FakeExecutor::default()
+            },
+            vec![HelperCapability::TunnelLifecycle, HelperCapability::Observe],
+        );
+        let start = harness.request(1, PrivilegedOperation::StartTunnel(wireguard_plan(1)));
+        assert!(!harness.execute(2, &start).is_ambiguous());
+        let stop = harness.request(2, PrivilegedOperation::StopTunnel(resource()));
+        assert!(!harness.execute(3, &stop).is_ambiguous());
+        let writes_before = harness.server.ledger_store.writes.len();
+        harness.server.ledger_store.fail_on_write = Some(writes_before + 2);
+        let acknowledge = harness.request(
+            3,
+            PrivilegedOperation::AcknowledgeReleased(vec![wireguard_target(resource())]),
+        );
+
+        let failed = harness.server.handle(HelperRequest {
+            id: 4,
+            op: HelperOp::Execute(Box::new(acknowledge)),
+        });
+
+        assert!(matches!(failed.result, Err(HelperError::LedgerUnavailable)));
+        assert!(harness.server.poisoned);
+        let ledger = harness.server.ledger_store.writes.last().unwrap().clone();
+        assert_eq!(ledger.released_resources(), &[resource()]);
+        let (_, next_sequence) = ledger.next_helper_session().unwrap();
+        let root = harness.server.root.clone();
+        let (mut recovered, principal, helper_epoch) = recover_session(
+            root,
+            ledger,
+            FakeExecutor {
+                observation_state: Some(ObservationState::Absent),
+                ..FakeExecutor::default()
+            },
+            HelperCapability::Observe,
+        );
+        let retry = PrivilegedRequest::new(
+            &principal,
+            helper_epoch,
+            next_sequence,
+            PrivilegedOperation::AcknowledgeReleased(vec![wireguard_target(resource())]),
+        )
+        .unwrap();
+
+        let response = recovered.handle(HelperRequest {
+            id: 5,
+            op: HelperOp::Execute(Box::new(retry)),
+        });
+
+        assert!(response.result.is_ok(), "{:?}", response.result);
+        assert!(recovered
+            .ledger_store
+            .writes
+            .last()
+            .unwrap()
+            .released_resources()
+            .is_empty());
+    }
+
+    #[test]
+    fn released_inventory_is_exposed_only_from_the_authenticated_ledger() {
+        let mut harness = LifecycleHarness::with_capabilities(
+            FakeExecutor::default(),
+            vec![HelperCapability::TunnelLifecycle, HelperCapability::Observe],
+        );
+        let start = harness.request(1, PrivilegedOperation::StartTunnel(wireguard_plan(1)));
+        assert!(!harness.execute(2, &start).is_ambiguous());
+        let stop = harness.request(2, PrivilegedOperation::StopTunnel(resource()));
+        assert!(!harness.execute(3, &stop).is_ambiguous());
+        let ledger = harness.server.ledger_store.writes.last().unwrap().clone();
+        let (helper_epoch, _) = ledger.next_helper_session().unwrap();
+        let root = harness.server.root.clone();
+        let (_fixture_root, _principal, claim, _old_epoch, _baseline) = fixture();
+        let mut recovered = EnrolledHelperSession::recover(
+            root,
+            helper_epoch,
+            ledger,
+            FakeExecutor::default(),
+            MemoryHelperLedgerStore::default(),
+        )
+        .unwrap();
+
+        let response = recovered.handle(HelperRequest {
+            id: 1,
+            op: HelperOp::Handshake(HelperClientHello::current(
+                501,
+                claim,
+                vec![HelperCapability::Observe],
+            )),
+        });
+        let HelperResult::Handshake(hello) = response.result.unwrap() else {
+            panic!("expected enrolled helper handshake");
+        };
+
+        assert_eq!(hello.released_resources.unwrap().resources(), &[resource()]);
+    }
+
+    #[test]
+    fn schema_nine_handshake_omits_released_inventory_for_rollback_compatibility() {
+        let (root, _principal, claim, helper_epoch, baseline) = fixture();
+        let mut server = EnrolledHelperSession::resume(
+            root,
+            helper_epoch,
+            baseline,
+            FakeExecutor::default(),
+            MemoryHelperLedgerStore::default(),
+        )
+        .unwrap();
+        let mut hello = HelperClientHello::current(501, claim, vec![HelperCapability::Observe]);
+        hello.schema.max = 9;
+
+        let response = server.handle(HelperRequest {
+            id: 1,
+            op: HelperOp::Handshake(hello),
+        });
+        let HelperResult::Handshake(hello) = response.result.unwrap() else {
+            panic!("expected enrolled helper handshake");
+        };
+
+        assert_eq!(hello.schema, 9);
+        assert!(hello.released_resources.is_none());
+    }
+
+    #[test]
+    fn managed_openvpn_absence_requires_released_tunnel_and_group_set() {
+        let mut harness = LifecycleHarness::with_capabilities(
+            FakeExecutor {
+                foreground_start: true,
+                observation_state: Some(ObservationState::Absent),
+                ..FakeExecutor::default()
+            },
+            vec![HelperCapability::TunnelLifecycle, HelperCapability::Observe],
+        );
+        let start = harness.request(1, PrivilegedOperation::StartTunnel(openvpn_plan(1)));
+        assert!(!harness.execute(2, &start).is_ambiguous());
+        let tunnel = resource();
+        let group = process_group_for_tunnel(&tunnel).unwrap();
+        let stop = harness.request(2, PrivilegedOperation::StopTunnel(tunnel.clone()));
+        assert!(!harness.execute(3, &stop).is_ambiguous());
+        let incomplete = harness.request(
+            3,
+            PrivilegedOperation::ObserveManagedAbsence(vec![openvpn_target(tunnel.clone())]),
+        );
+        assert!(harness.execute(4, &incomplete).is_rejected());
+        assert_eq!(harness.server.executor.observations, 0);
+        let complete = harness.request(
+            4,
+            PrivilegedOperation::ObserveManagedAbsence(vec![
+                openvpn_target(tunnel.clone()),
+                openvpn_target(group.clone()),
+            ]),
+        );
+
+        let receipt = harness.execute(5, &complete);
+
+        assert!(receipt.observes(&tunnel, ObservationState::Absent));
+        assert!(receipt.observes(&group, ObservationState::Absent));
+        assert_eq!(harness.server.executor.observations, 1);
+    }
+
+    #[test]
+    fn released_tunnel_identity_survives_helper_restart() {
+        let mut harness = LifecycleHarness::with_capabilities(
+            FakeExecutor::default(),
+            vec![HelperCapability::TunnelLifecycle],
+        );
+        let start = harness.request(1, PrivilegedOperation::StartTunnel(wireguard_plan(1)));
+        assert!(!harness.execute(2, &start).is_ambiguous());
+        let stop = harness.request(2, PrivilegedOperation::StopTunnel(resource()));
+        assert!(!harness.execute(3, &stop).is_ambiguous());
+        let ledger = harness.server.ledger_store.writes.last().unwrap().clone();
+        let (_, next_sequence) = ledger.next_helper_session().unwrap();
+        let root = harness.server.root.clone();
+        let (mut recovered, principal, helper_epoch) = recover_session(
+            root,
+            ledger,
+            FakeExecutor {
+                observation_state: Some(ObservationState::Absent),
+                ..FakeExecutor::default()
+            },
+            HelperCapability::Observe,
+        );
+        let request = PrivilegedRequest::new(
+            &principal,
+            helper_epoch,
+            next_sequence,
+            PrivilegedOperation::ObserveManagedAbsence(vec![wireguard_target(resource())]),
+        )
+        .unwrap();
+
+        let response = recovered.handle(HelperRequest {
+            id: 2,
+            op: HelperOp::Execute(Box::new(request)),
+        });
+
+        assert!(response.result.is_ok(), "{:?}", response.result);
+        assert_eq!(recovered.executor.observations, 1);
+    }
+
+    #[test]
     fn managed_observation_accepts_exact_wireguard_ledger_resource() {
         let mut harness = LifecycleHarness::new(FakeExecutor::default());
         let start = harness.request(1, PrivilegedOperation::StartTunnel(wireguard_plan(1)));
@@ -3685,6 +4912,37 @@ mod tests {
         let accepted = harness.execute(4, &complete);
         assert!(accepted.observes(&tunnel, ObservationState::Present));
         assert!(accepted.observes(&group, ObservationState::Present));
+        assert_eq!(harness.server.executor.observations, 1);
+    }
+
+    #[test]
+    fn managed_openvpn_observation_rejects_missing_route_evidence() {
+        let mut harness = LifecycleHarness::new(FakeExecutor {
+            foreground_start: true,
+            openvpn_route_evidence: FakeOpenVpnRouteEvidence::Missing,
+            ..FakeExecutor::default()
+        });
+        let start = harness.request(1, PrivilegedOperation::StartTunnel(openvpn_plan(1)));
+        assert!(!harness.execute(2, &start).is_ambiguous());
+        let tunnel = resource();
+        let group = process_group_for_tunnel(&tunnel).unwrap();
+        let observe = harness.request(
+            2,
+            PrivilegedOperation::ObserveManaged(vec![
+                openvpn_target(tunnel),
+                openvpn_target(group),
+            ]),
+        );
+
+        let rejected = harness.server.handle(HelperRequest {
+            id: 3,
+            op: HelperOp::Execute(Box::new(observe)),
+        });
+
+        assert!(matches!(
+            rejected.result,
+            Err(HelperError::LedgerUnavailable)
+        ));
         assert_eq!(harness.server.executor.observations, 1);
     }
 
@@ -4094,6 +5352,48 @@ mod tests {
         assert_eq!(harness.server.executor.stops_with_child, 1);
         assert!(!harness.server.owns_tunnel(&resource()));
         assert!(harness.server.children.is_empty());
+    }
+
+    #[test]
+    fn released_identity_replacement_is_atomic_across_protocol_changes() {
+        let mut harness = LifecycleHarness::new(FakeExecutor {
+            foreground_start: true,
+            ..FakeExecutor::default()
+        });
+        let profile = resource().profile_id().unwrap().clone();
+        let first = resource();
+        let second = ResourceTag::tunnel(profile, 2).unwrap();
+
+        let start = harness.request(1, PrivilegedOperation::StartTunnel(openvpn_plan(1)));
+        let receipt = harness.execute(2, &start);
+        assert_eq!(receipt.rejection_code(), None);
+        assert!(!receipt.is_ambiguous());
+        let stop = harness.request(2, PrivilegedOperation::StopTunnel(first));
+        let receipt = harness.execute(3, &stop);
+        assert_eq!(receipt.rejection_code(), None);
+        assert!(!receipt.is_ambiguous());
+
+        harness.server.executor.foreground_start = false;
+        let start = harness.request(3, PrivilegedOperation::StartTunnel(wireguard_plan(2)));
+        let receipt = harness.execute(4, &start);
+        assert_eq!(receipt.rejection_code(), None);
+        assert!(!receipt.is_ambiguous());
+        let stop = harness.request(4, PrivilegedOperation::StopTunnel(second.clone()));
+        let receipt = harness.execute(5, &stop);
+        assert_eq!(receipt.rejection_code(), None);
+        assert!(!receipt.is_ambiguous());
+
+        assert!(!harness.server.poisoned);
+        assert_eq!(
+            harness
+                .server
+                .ledger_store
+                .writes
+                .last()
+                .unwrap()
+                .released_resources(),
+            &[second]
+        );
     }
 
     #[test]
@@ -4604,6 +5904,7 @@ mod tests {
             PrivilegedOperation::NetworkPolicy(NetworkPolicyOperation::ApplyRoutes {
                 policy: routes,
                 routes: Vec::new(),
+                redirects: Vec::new(),
                 predecessor: observed,
             }),
         );
@@ -4661,6 +5962,7 @@ mod tests {
             PrivilegedOperation::NetworkPolicy(NetworkPolicyOperation::ApplyRoutes {
                 policy: ResourceTag::topology(AuthorityEpoch(3), 1, ResourceKind::Routes).unwrap(),
                 routes: vec![ScopedRoute::new(destination, tunnel).unwrap()],
+                redirects: Vec::new(),
                 predecessor: rejected.server.guard.policy_predecessor().unwrap(),
             }),
         );
@@ -4682,6 +5984,7 @@ mod tests {
             NetworkPolicyOperation::ApplyRoutes {
                 policy: ResourceTag::topology(AuthorityEpoch(3), 1, ResourceKind::Routes).unwrap(),
                 routes: vec![ScopedRoute::new(destination, tunnel).unwrap()],
+                redirects: Vec::new(),
                 predecessor,
             },
         );
@@ -4740,6 +6043,7 @@ mod tests {
                 NetworkPolicyOperation::ApplyRoutes {
                     policy: routes,
                     routes: Vec::new(),
+                    redirects: Vec::new(),
                     predecessor,
                 },
             );
@@ -4777,6 +6081,71 @@ mod tests {
     }
 
     #[test]
+    fn physical_routes_are_durable_before_effect_and_write_failure_prevents_mutation() {
+        for failed_checkpoint in [1, 2] {
+            let mut harness = LifecycleHarness::for_policy(FakeExecutor {
+                prepare_physical_routes: true,
+                ..FakeExecutor::default()
+            });
+            let tunnel = resource();
+            let destination: Cidr = "10.0.0.0/8".parse().unwrap();
+            let firewall =
+                ResourceTag::topology(AuthorityEpoch(3), 1, ResourceKind::Firewall).unwrap();
+            execute_policy_phase(
+                &mut harness,
+                1,
+                NetworkPolicyOperation::EstablishBlocking {
+                    policy: firewall,
+                    tunnels: vec![
+                        crate::vortix_core::privileged::PrivilegedFirewallTunnel::new(
+                            tunnel.clone(),
+                            vec!["198.51.100.7".parse().unwrap()],
+                            vec![destination],
+                            crate::vortix_core::privileged::PrivilegedFirewallRole::Primary,
+                        )
+                        .unwrap(),
+                    ],
+                },
+            );
+            harness
+                .server
+                .resource_states
+                .insert(tunnel.clone(), HelperResourceState::Owned);
+            let writes_before = harness.server.ledger_store.writes.len();
+            let calls_before = harness.server.executor.policy_calls;
+            harness.server.ledger_store.fail_on_write = Some(writes_before + failed_checkpoint);
+            let routes = ResourceTag::topology(AuthorityEpoch(3), 1, ResourceKind::Routes).unwrap();
+            let apply = harness.request(
+                3,
+                PrivilegedOperation::NetworkPolicy(NetworkPolicyOperation::ApplyRoutes {
+                    policy: routes,
+                    routes: vec![ScopedRoute::new(destination, tunnel).unwrap()],
+                    redirects: Vec::new(),
+                    predecessor: harness.server.guard.policy_predecessor().unwrap(),
+                }),
+            );
+
+            let response = harness.server.handle(HelperRequest {
+                id: 4,
+                op: HelperOp::Execute(Box::new(apply)),
+            });
+
+            assert!(matches!(
+                response.result,
+                Err(HelperError::LedgerUnavailable)
+            ));
+            assert_eq!(harness.server.executor.policy_calls, calls_before);
+            assert!(harness.server.poisoned);
+            if failed_checkpoint == 2 {
+                assert_eq!(
+                    harness.server.ledger_store.writes[writes_before].physical_routes()[0].stage(),
+                    PhysicalRouteStage::Prepared
+                );
+            }
+        }
+    }
+
+    #[test]
     fn release_rejects_obsolete_policy_without_root_ledger_ownership() {
         let mut harness = LifecycleHarness::for_policy(FakeExecutor::default());
         let firewall = ResourceTag::topology(AuthorityEpoch(3), 2, ResourceKind::Firewall).unwrap();
@@ -4804,6 +6173,7 @@ mod tests {
                 policy: firewall,
                 resources: vec![foreign],
                 predecessor: before_release,
+                retained_state: ObservationState::Present,
             }),
         );
 
@@ -4927,6 +6297,37 @@ mod tests {
         assert_eq!(states[0].intended().policy(), &routes);
         assert_eq!(
             states[0].effective().map(PolicyProjection::policy),
+            Some(&routes)
+        );
+    }
+
+    #[test]
+    fn restart_restores_physical_route_ownership_and_validates_the_exact_record() {
+        let mut harness = LifecycleHarness::for_policy(FakeExecutor {
+            prepare_physical_routes: true,
+            ..FakeExecutor::default()
+        });
+        let (_, routes, _) =
+            install_policy_generation_with_mode(&mut harness, 1, 1, KillSwitchMode::Auto);
+        let root = harness.server.root.clone();
+        let ledger = harness.server.ledger_store.writes.last().unwrap().clone();
+
+        let recovered = EnrolledHelperSession::recover(
+            root,
+            HelperEpoch::new(9).unwrap(),
+            ledger,
+            FakeExecutor::default(),
+            MemoryHelperLedgerStore::default(),
+        )
+        .unwrap();
+
+        let physical = recovered.physical_routes.get(&routes).unwrap();
+        assert_eq!(physical.stage(), PhysicalRouteStage::ObservedAbsent);
+        assert!(physical.entries().is_empty());
+        assert_eq!(
+            recovered.executor.recovered_route_validations[0][0]
+                .physical()
+                .map(HelperLedgerRoutes::resource),
             Some(&routes)
         );
     }
@@ -5092,6 +6493,7 @@ mod tests {
                 policy: firewall_2.clone(),
                 resources: obsolete.clone(),
                 predecessor: harness.server.guard.policy_predecessor().unwrap(),
+                retained_state: ObservationState::Present,
             }),
         );
         assert!(!harness.execute(18, &release).is_ambiguous());
