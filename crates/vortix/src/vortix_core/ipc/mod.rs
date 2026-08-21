@@ -65,6 +65,23 @@ pub enum IpcOp {
     Shutdown,
 }
 
+impl IpcOp {
+    /// Capability that must have been declared and negotiated before this
+    /// operation may be dispatched.
+    #[must_use]
+    pub const fn required_capability(&self) -> IpcCapability {
+        match self {
+            Self::Handshake { .. } | Self::PassiveSnapshot => IpcCapability::PassiveSnapshot,
+            Self::Execute(_) => IpcCapability::ControlMutation,
+            Self::Snapshot => IpcCapability::LegacySnapshot,
+            Self::Subscribe | Self::PassiveSubscribe => IpcCapability::PassiveSubscribe,
+            Self::Diagnostics => IpcCapability::Diagnostics,
+            Self::DiagnosticsSubscribe => IpcCapability::DiagnosticsSubscribe,
+            Self::Shutdown => IpcCapability::Shutdown,
+        }
+    }
+}
+
 /// Wrapper for the client→server direction. `id` is opaque to the
 /// daemon; the client correlates response IDs back to outstanding
 /// requests.
@@ -117,6 +134,21 @@ pub enum IpcCapability {
     /// Reserved for the future enrolled control authority. Never advertised
     /// by the passive candidate.
     ControlMutation,
+}
+
+impl IpcCapability {
+    /// Whether this capability has a wire representation in `schema`.
+    #[must_use]
+    pub const fn is_available_in_schema(self, schema: u16) -> bool {
+        match self {
+            Self::Diagnostics | Self::DiagnosticsSubscribe => schema >= 2,
+            Self::LegacySnapshot
+            | Self::PassiveSnapshot
+            | Self::PassiveSubscribe
+            | Self::Shutdown
+            | Self::ControlMutation => schema >= 1,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -297,6 +329,18 @@ const PASSIVE_CAPABILITIES_V1: [IpcCapability; 4] = [
     IpcCapability::Shutdown,
 ];
 
+/// Passive capabilities whose result shapes exist in the negotiated schema.
+#[must_use]
+pub const fn capabilities_for_schema(schema: u16) -> &'static [IpcCapability] {
+    if schema >= 2 {
+        &PASSIVE_CAPABILITIES
+    } else if schema == 1 {
+        &PASSIVE_CAPABILITIES_V1
+    } else {
+        &[]
+    }
+}
+
 /// Negotiate one client hello against this passive daemon build.
 pub fn negotiate_passive(hello: &ClientHello) -> Result<ServerHello, IpcError> {
     if hello.product != "vortix" {
@@ -333,13 +377,9 @@ pub fn negotiate_passive(hello: &ClientHello) -> Result<ServerHello, IpcError> {
                 hello.schema.min, hello.schema.max, IPC_SCHEMA_MIN, IPC_SCHEMA_MAX
             ),
         })?;
-    let capabilities: &[IpcCapability] = if schema >= 2 {
-        &PASSIVE_CAPABILITIES
-    } else {
-        &PASSIVE_CAPABILITIES_V1
-    };
+    let capabilities = capabilities_for_schema(schema);
     for capability in &hello.required_capabilities {
-        if !capabilities.contains(capability) {
+        if !capability.is_available_in_schema(schema) || !capabilities.contains(capability) {
             return Err(IpcError::CapabilityUnavailable {
                 capability: *capability,
             });
@@ -411,6 +451,21 @@ mod handshake_tests {
                 capability: IpcCapability::Diagnostics
             })
         ));
+    }
+
+    #[test]
+    fn operation_contract_centralizes_capability_and_schema_requirements() {
+        assert_eq!(
+            IpcOp::Diagnostics.required_capability(),
+            IpcCapability::Diagnostics
+        );
+        assert!(!IpcCapability::Diagnostics.is_available_in_schema(1));
+        assert!(IpcCapability::Diagnostics.is_available_in_schema(2));
+        assert_eq!(
+            capabilities_for_schema(1),
+            PASSIVE_CAPABILITIES_V1.as_slice()
+        );
+        assert_eq!(capabilities_for_schema(2), PASSIVE_CAPABILITIES.as_slice());
     }
 
     #[test]

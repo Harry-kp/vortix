@@ -12,14 +12,18 @@
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use socket2::{Domain, SockAddr, Socket, Type};
 
 use crate::vortix_core::control::{DiagnosticSnapshot, DiagnosticSource, DiagnosticView};
 use crate::vortix_core::ipc::{
-    decode_frame, encode_frame, ClientHello, FrameError, IpcCapability, IpcError, IpcOp,
-    IpcRequest, IpcResponse, IpcResult, PassiveSnapshot, ServerHello, IPC_PROTOCOL_MAX,
-    IPC_PROTOCOL_MIN, IPC_SCHEMA_MAX, IPC_SCHEMA_MIN,
+    capabilities_for_schema, decode_frame, encode_frame, ClientHello, FrameError, IpcCapability,
+    IpcError, IpcOp, IpcRequest, IpcResponse, IpcResult, PassiveSnapshot, ServerHello,
+    IPC_PROTOCOL_MAX, IPC_PROTOCOL_MIN, IPC_SCHEMA_MAX, IPC_SCHEMA_MIN,
 };
+
+const IPC_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// IPC client error surface visible to CLI handlers. Captures the
 /// transport, framing, compatibility, server, and subscription failure
@@ -82,13 +86,18 @@ impl From<FrameError> for ClientError {
 /// handlers treat any error here as "bypass: read directly from
 /// disk + scanner instead".
 pub fn request(socket_path: &Path, op: IpcOp) -> Result<IpcResult, ClientError> {
-    let required = required_capability(&op);
+    let required = op.required_capability();
     let (mut stream, mut buffered) =
-        connect_handshaken(socket_path, required, Some(Duration::from_secs(2)))?;
+        connect_handshaken(socket_path, required, Instant::now() + IPC_EXCHANGE_TIMEOUT)?;
     let request = IpcRequest { id: 2, op };
-    let result = exchange(&mut stream, &mut buffered, &request)?
-        .result
-        .map_err(ClientError::Daemon)?;
+    let result = exchange_until(
+        &mut stream,
+        &mut buffered,
+        &request,
+        Instant::now() + IPC_EXCHANGE_TIMEOUT,
+    )?
+    .result
+    .map_err(ClientError::Daemon)?;
     validate_result(&result)?;
     Ok(result)
 }
@@ -96,12 +105,10 @@ pub fn request(socket_path: &Path, op: IpcOp) -> Result<IpcResult, ClientError> 
 fn connect_handshaken(
     socket_path: &Path,
     required: IpcCapability,
-    read_timeout: Option<Duration>,
+    deadline: Instant,
 ) -> Result<(UnixStream, Vec<u8>), ClientError> {
     validate_socket_owner(socket_path)?;
-    let mut stream = UnixStream::connect(socket_path)?;
-    stream.set_read_timeout(read_timeout)?;
-    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    let mut stream = connect_with_deadline(socket_path, deadline)?;
     let mut buffered = Vec::with_capacity(4096);
     let handshake = IpcRequest {
         id: 1,
@@ -109,7 +116,7 @@ fn connect_handshaken(
             hello: ClientHello::current(vec![required]),
         },
     };
-    match exchange(&mut stream, &mut buffered, &handshake)?
+    match exchange_until(&mut stream, &mut buffered, &handshake, deadline)?
         .result
         .map_err(ClientError::Daemon)?
     {
@@ -123,13 +130,15 @@ fn connect_handshaken(
     Ok((stream, buffered))
 }
 
-fn exchange(
+fn exchange_until(
     stream: &mut UnixStream,
     buffered: &mut Vec<u8>,
     request: &IpcRequest,
+    deadline: Instant,
 ) -> Result<IpcResponse, ClientError> {
+    set_deadline_timeouts(stream, deadline)?;
     stream.write_all(&encode_frame(request)?)?;
-    let response = read_response(stream, buffered)?;
+    let response = read_response_until(stream, buffered, Some(deadline))?;
     if response.id != request.id {
         return Err(ClientError::Unexpected(format!(
             "response id {} did not match request {}",
@@ -143,11 +152,22 @@ fn read_response(
     stream: &mut UnixStream,
     buffered: &mut Vec<u8>,
 ) -> Result<IpcResponse, ClientError> {
+    read_response_until(stream, buffered, None)
+}
+
+fn read_response_until(
+    stream: &mut UnixStream,
+    buffered: &mut Vec<u8>,
+    deadline: Option<Instant>,
+) -> Result<IpcResponse, ClientError> {
     let mut chunk = [0u8; 4096];
     loop {
         if let Some((resp, consumed)) = decode_frame::<IpcResponse>(buffered)? {
             buffered.drain(..consumed);
             return Ok(resp);
+        }
+        if let Some(deadline) = deadline {
+            set_deadline_timeouts(stream, deadline)?;
         }
         let n = stream.read(&mut chunk)?;
         if n == 0 {
@@ -276,14 +296,42 @@ fn open_subscription(
     capability: IpcCapability,
     op: IpcOp,
 ) -> Result<(UnixStream, Vec<u8>, IpcResult), ClientError> {
-    let (mut stream, mut buffered) =
-        connect_handshaken(socket_path, capability, Some(Duration::from_secs(30)))?;
-    let result = exchange(&mut stream, &mut buffered, &IpcRequest { id: 2, op })?
-        .result
-        .map_err(ClientError::Daemon)?;
+    let (mut stream, mut buffered) = connect_handshaken(
+        socket_path,
+        capability,
+        Instant::now() + IPC_EXCHANGE_TIMEOUT,
+    )?;
+    let result = exchange_until(
+        &mut stream,
+        &mut buffered,
+        &IpcRequest { id: 2, op },
+        Instant::now() + IPC_EXCHANGE_TIMEOUT,
+    )?
+    .result
+    .map_err(ClientError::Daemon)?;
     // Snapshot streams are intentionally quiet when source truth is stable.
     stream.set_read_timeout(None)?;
     Ok((stream, buffered, result))
+}
+
+fn connect_with_deadline(path: &Path, deadline: Instant) -> std::io::Result<UnixStream> {
+    let timeout = remaining(deadline)?;
+    let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
+    socket.connect_timeout(&SockAddr::unix(path)?, timeout)?;
+    Ok(socket.into())
+}
+
+fn set_deadline_timeouts(stream: &UnixStream, deadline: Instant) -> std::io::Result<()> {
+    let timeout = remaining(deadline)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))
+}
+
+fn remaining(deadline: Instant) -> std::io::Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "IPC deadline elapsed"))
 }
 
 fn validate_handshake(hello: &ServerHello, required: IpcCapability) -> Result<(), ClientError> {
@@ -291,7 +339,9 @@ fn validate_handshake(hello: &ServerHello, required: IpcCapability) -> Result<()
         || !hello.passive
         || !(IPC_PROTOCOL_MIN..=IPC_PROTOCOL_MAX).contains(&hello.protocol)
         || !(IPC_SCHEMA_MIN..=IPC_SCHEMA_MAX).contains(&hello.schema)
+        || hello.capabilities.as_slice() != capabilities_for_schema(hello.schema)
         || !hello.capabilities.contains(&required)
+        || !required.is_available_in_schema(hello.schema)
         || hello.capabilities.contains(&IpcCapability::ControlMutation)
     {
         return Err(ClientError::Unexpected(format!(
@@ -338,18 +388,6 @@ fn validate_passive_snapshot(snapshot: &PassiveSnapshot) -> Result<(), ClientErr
         ));
     }
     Ok(())
-}
-
-fn required_capability(op: &IpcOp) -> IpcCapability {
-    match op {
-        IpcOp::Handshake { .. } | IpcOp::PassiveSnapshot => IpcCapability::PassiveSnapshot,
-        IpcOp::Execute(_) => IpcCapability::ControlMutation,
-        IpcOp::Snapshot => IpcCapability::LegacySnapshot,
-        IpcOp::Subscribe | IpcOp::PassiveSubscribe => IpcCapability::PassiveSubscribe,
-        IpcOp::Diagnostics => IpcCapability::Diagnostics,
-        IpcOp::DiagnosticsSubscribe => IpcCapability::DiagnosticsSubscribe,
-        IpcOp::Shutdown => IpcCapability::Shutdown,
-    }
 }
 
 fn validate_socket_owner(path: &Path) -> Result<(), ClientError> {
@@ -462,5 +500,16 @@ mod tests {
             }
         );
         assert_eq!(hello.protocol.min, 2);
+    }
+
+    #[test]
+    fn expired_deadline_prevents_socket_connect() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket_path = directory.path().join("deadline.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+
+        let error = connect_with_deadline(&socket_path, Instant::now()).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
     }
 }

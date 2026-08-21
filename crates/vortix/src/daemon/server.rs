@@ -1,6 +1,6 @@
 //! Bounded, authenticated IPC for the passive daemon candidate.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -306,19 +306,41 @@ async fn connection_loop<R: AsyncRead + Unpin>(
     shutdown: watch::Sender<bool>,
 ) -> Result<(), DaemonError> {
     let first = read_request(reader).await?;
-    let IpcOp::Handshake { hello } = &first.op else {
-        send_response(
-            output,
-            IpcResponse {
-                id: first.id,
-                result: Err(IpcError::HandshakeRequired),
-            },
-        )
-        .await?;
-        return Ok(());
+    let hello = match &first.op {
+        IpcOp::Handshake { hello } => hello,
+        // Protocol v1 predates the handshake and performs one base-shape,
+        // read-only Snapshot exchange. Keep only that N-1 compatibility seam.
+        IpcOp::Snapshot => {
+            send_response(
+                output,
+                dispatch(&first, provider.as_ref(), diagnostics.as_ref(), &shutdown),
+            )
+            .await?;
+            return Ok(());
+        }
+        _ => {
+            send_response(
+                output,
+                IpcResponse {
+                    id: first.id,
+                    result: Err(IpcError::HandshakeRequired),
+                },
+            )
+            .await?;
+            return Ok(());
+        }
     };
     let negotiated = negotiate_passive(hello);
-    let handshake_ok = negotiated.is_ok();
+    let negotiated_contract = negotiated.as_ref().ok().map(|server_hello| {
+        (
+            server_hello.schema,
+            hello
+                .required_capabilities
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>(),
+        )
+    });
     send_response(
         output,
         IpcResponse {
@@ -327,9 +349,9 @@ async fn connection_loop<R: AsyncRead + Unpin>(
         },
     )
     .await?;
-    if !handshake_ok {
+    let Some((negotiated_schema, negotiated_capabilities)) = negotiated_contract else {
         return Ok(());
-    }
+    };
 
     let mut requests = ReplayCache::<MAX_REPLAY_RESPONSE_BYTES>::default();
     let mut shutdown_receiver = shutdown.subscribe();
@@ -353,6 +375,22 @@ async fn connection_loop<R: AsyncRead + Unpin>(
         }
         let digest = request_digest(&request.op)?;
         if respond_to_replay(&requests, output, request.id, &digest).await? {
+            continue;
+        }
+        let required = request.op.required_capability();
+        if !required.is_available_in_schema(negotiated_schema)
+            || !negotiated_capabilities.contains(&required)
+        {
+            send_response(
+                output,
+                IpcResponse {
+                    id: request.id,
+                    result: Err(IpcError::CapabilityUnavailable {
+                        capability: required,
+                    }),
+                },
+            )
+            .await?;
             continue;
         }
         if requests.len() >= MAX_REQUEST_IDS {
@@ -826,9 +864,20 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn first_non_handshake_request_is_rejected() {
-        let (mut client, server) = tokio::io::duplex(4096);
+    async fn read_test_response(client: &mut tokio::io::DuplexStream) -> IpcResponse {
+        let mut response_bytes = vec![0_u8; 4096];
+        let read = client.read(&mut response_bytes).await.unwrap();
+        crate::vortix_core::ipc::decode_frame::<IpcResponse>(&response_bytes[..read])
+            .unwrap()
+            .unwrap()
+            .0
+    }
+
+    fn test_connection() -> (
+        tokio::io::DuplexStream,
+        tokio::task::JoinHandle<Result<(), DaemonError>>,
+    ) {
+        let (client, server) = tokio::io::duplex(4096);
         let provider: Arc<dyn PassiveQueryProvider> = Arc::new(EmptyQueryProvider::new());
         let diagnostics: Arc<dyn DiagnosticQueryProvider> =
             Arc::new(DiagnosticHub::start(None).unwrap());
@@ -843,18 +892,93 @@ mod tests {
             let _ = writer.await;
             result
         });
+        (client, task)
+    }
+
+    async fn exchange_test(
+        client: &mut tokio::io::DuplexStream,
+        request: &IpcRequest,
+    ) -> IpcResponse {
+        client
+            .write_all(&crate::vortix_core::ipc::encode_frame(request).unwrap())
+            .await
+            .unwrap();
+        read_test_response(client).await
+    }
+
+    #[tokio::test]
+    async fn pre_handshake_v1_snapshot_keeps_the_base_wire_shape() {
+        let (mut client, task) = test_connection();
+        let request = IpcRequest {
+            id: 1,
+            op: IpcOp::Snapshot,
+        };
+        let response = exchange_test(&mut client, &request).await;
+        assert!(matches!(response.result, Ok(IpcResult::Snapshot { .. })));
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn negotiated_capabilities_reject_undeclared_diagnostics() {
+        let (mut client, task) = test_connection();
+        let handshake = IpcRequest {
+            id: 1,
+            op: IpcOp::Handshake {
+                hello: ClientHello::current(vec![IpcCapability::LegacySnapshot]),
+            },
+        };
+        assert!(matches!(
+            exchange_test(&mut client, &handshake).await.result,
+            Ok(IpcResult::Handshake { .. })
+        ));
+
+        let undeclared = IpcRequest {
+            id: 2,
+            op: IpcOp::Diagnostics,
+        };
+        assert!(matches!(
+            exchange_test(&mut client, &undeclared).await.result,
+            Err(IpcError::CapabilityUnavailable {
+                capability: IpcCapability::Diagnostics
+            })
+        ));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn schema_one_connection_rejects_diagnostics() {
+        let (mut client, task) = test_connection();
+        let mut hello = ClientHello::current(vec![IpcCapability::LegacySnapshot]);
+        hello.schema = crate::vortix_core::ipc::CompatibilityRange { min: 1, max: 1 };
+        let handshake = IpcRequest {
+            id: 1,
+            op: IpcOp::Handshake { hello },
+        };
+        assert!(matches!(
+            exchange_test(&mut client, &handshake).await.result,
+            Ok(IpcResult::Handshake { .. })
+        ));
+        let diagnostics = IpcRequest {
+            id: 2,
+            op: IpcOp::Diagnostics,
+        };
+        assert!(matches!(
+            exchange_test(&mut client, &diagnostics).await.result,
+            Err(IpcError::CapabilityUnavailable {
+                capability: IpcCapability::Diagnostics
+            })
+        ));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn first_non_handshake_request_is_rejected() {
+        let (mut client, task) = test_connection();
         let request = IpcRequest {
             id: 1,
             op: IpcOp::PassiveSnapshot,
         };
-        let frame = crate::vortix_core::ipc::encode_frame(&request).unwrap();
-        client.write_all(&frame).await.unwrap();
-        let mut response_bytes = vec![0_u8; 4096];
-        let read = client.read(&mut response_bytes).await.unwrap();
-        let (response, _) =
-            crate::vortix_core::ipc::decode_frame::<IpcResponse>(&response_bytes[..read])
-                .unwrap()
-                .unwrap();
+        let response = exchange_test(&mut client, &request).await;
         assert!(matches!(response.result, Err(IpcError::HandshakeRequired)));
         task.await.unwrap().unwrap();
     }
