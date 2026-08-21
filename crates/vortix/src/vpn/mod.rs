@@ -441,7 +441,6 @@ pub fn get_profiles_dir() -> Result<PathBuf, String> {
 
 /// Load all profiles from the profiles directory
 #[must_use]
-#[allow(clippy::too_many_lines)] // one catalog scan keeps sidecar validation and config parsing visibly paired
 pub fn load_profiles() -> Vec<VpnProfile> {
     logger::log(LogLevel::Debug, "PROFILE", "Loading profiles from disk...");
 
@@ -454,7 +453,12 @@ pub fn load_profiles() -> Vec<VpnProfile> {
         return Vec::new();
     };
 
-    let store = FsProfileStore::new(profiles_dir.clone());
+    load_profiles_from_dir(&profiles_dir)
+}
+
+#[allow(clippy::too_many_lines)] // one catalog scan keeps sidecar validation and config parsing visibly paired
+fn load_profiles_from_dir(profiles_dir: &Path) -> Vec<VpnProfile> {
+    let store = FsProfileStore::new(profiles_dir.to_path_buf());
     let summaries = match store.list() {
         Ok(summaries) => summaries,
         Err(error) => {
@@ -473,14 +477,7 @@ pub fn load_profiles() -> Vec<VpnProfile> {
             ProtocolKind::WireGuard => Protocol::WireGuard,
             ProtocolKind::OpenVpn => Protocol::OpenVPN,
         };
-        let path = profiles_dir.join(format!(
-            "{}.{}",
-            summary.display_name,
-            match protocol {
-                Protocol::WireGuard => "conf",
-                Protocol::OpenVPN => "ovpn",
-            }
-        ));
+        let path = profiles_dir.join(&summary.config_file);
         if let Ok(content) = fs::read_to_string(&path) {
             let result = match protocol {
                 Protocol::WireGuard => parse_wireguard_config(&content, &path),
@@ -556,6 +553,31 @@ pub fn load_profiles() -> Vec<VpnProfile> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn profile_id(byte: u8) -> ProfileId {
+        ProfileId::parse(format!("{byte:02x}").repeat(32)).unwrap()
+    }
+
+    #[test]
+    fn load_profiles_uses_the_sidecar_config_file() {
+        let profiles_dir = tempfile::tempdir().unwrap();
+        let config_path = profiles_dir.path().join("corp.conf");
+        let profile = Profile::new(
+            profile_id(1),
+            "corp",
+            ProtocolKind::OpenVpn,
+            config_path.clone(),
+        );
+        FsProfileStore::new(profiles_dir.path().to_path_buf())
+            .insert(&profile, b"client\ndev tun\nremote vpn.example.com 1194\n")
+            .unwrap();
+
+        let loaded = load_profiles_from_dir(profiles_dir.path());
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].protocol, Protocol::OpenVPN);
+        assert_eq!(loaded[0].config_path, config_path);
+    }
 
     #[test]
     fn test_derive_location_us() {
