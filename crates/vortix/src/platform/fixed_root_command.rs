@@ -147,7 +147,6 @@ fn run_bounded(
                 }
             }
         };
-        kill_process_group(child.id());
         let input_ok = input_writer.is_none_or(|writer| writer.join().ok() == Some(true));
         let stdout = join_output(stdout_reader);
         let stderr = join_output(stderr_reader);
