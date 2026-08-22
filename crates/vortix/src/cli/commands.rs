@@ -294,7 +294,7 @@ fn require_boot_eligible(profile: &crate::state::VpnProfile, mode: OutputMode) {
         crate::vortix_core::control::BootEligibility::InteractiveCredentials => (
             "boot_profile_interactive",
             format!(
-                "Profile '{}' requires an interactive password, OTP, challenge, or key prompt and cannot connect at boot",
+                "Profile '{}' depends on credentials (a password file, prompt, OTP, challenge, or key) and cannot connect unattended at boot",
                 profile.name
             ),
             "Leave it out of --boot and connect it after login; no credential or boot intent was saved.",
