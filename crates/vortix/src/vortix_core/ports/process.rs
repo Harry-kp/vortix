@@ -310,7 +310,9 @@ impl ManagedProcessId {
     }
 }
 
-/// Child ownership receipt. It contains no command arguments or credentials.
+/// Managed process-group ownership receipt. It contains no command arguments
+/// or credentials. Concrete backends may return a containment guardian PID
+/// rather than the protocol process PID.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessOwnership {
     pub identity: ManagedProcessId,

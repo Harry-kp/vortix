@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::time::SystemTime;
 
 use thiserror::Error;
 
@@ -63,6 +64,7 @@ pub struct DurableControlState {
     pub operations: BTreeMap<OperationId, OperationRecord>,
     pub boot_connections: BTreeMap<ProfileId, BootConnection>,
     pub requested_resources: BTreeMap<ProfileId, RequestedResources>,
+    pub last_connected_at: BTreeMap<ProfileId, SystemTime>,
     pub tombstones: BTreeMap<ProfileId, PersistedTombstone>,
     pub retention: RetentionMetadata,
     pub reconciliation_required: bool,

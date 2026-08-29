@@ -37,6 +37,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(25);
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CustodianHandshake {
     pub identity: ManagedProcessId,
+    /// PID of the private guardian and process-group leader. The protocol
+    /// process is a distinct child within this authenticated group.
     pub pid: u32,
     /// Canonical connect operation that created this child. Legacy receipts
     /// omit it and remain readable, but cannot outlive operation retention.
@@ -381,6 +383,15 @@ pub fn load_handshake(
         pid: receipt.child_pid,
         operation_id: receipt.operation_id,
     }))
+}
+
+/// Prove that an observed protocol PID is contained by this custodian's
+/// private process group. The guardian itself is not a protocol process.
+pub(crate) fn contains_protocol_pid(
+    handshake: &CustodianHandshake,
+    process_id: u32,
+) -> Result<bool, CustodianError> {
+    Ok(crate::vortix_process::real::process_is_nonleader_group_member(process_id, handshake.pid)?)
 }
 
 fn load_receipt(profile_id: &ProfileId) -> Result<Option<OwnershipReceipt>, CustodianError> {

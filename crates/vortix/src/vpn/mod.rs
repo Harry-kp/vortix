@@ -546,7 +546,7 @@ pub(crate) fn load_profiles_from(profiles_dir: &Path) -> Vec<VpnProfile> {
                         protocol,
                         location,
                         config_path: path.clone(),
-                        last_used: None,
+                        last_used: summary.last_used,
                     });
                 }
                 Err(e) => {
@@ -609,15 +609,21 @@ mod tests {
             ProtocolKind::OpenVpn,
             config_path.clone(),
         );
-        FsProfileStore::new(profiles_dir.path().to_path_buf())
+        let store = FsProfileStore::new(profiles_dir.path().to_path_buf());
+        store
             .insert(&profile, b"client\ndev tun\nremote vpn.example.com 1194\n")
             .unwrap();
+        store.touch(&profile.id).unwrap();
 
         let loaded = load_profiles_from(profiles_dir.path());
 
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].protocol, Protocol::OpenVPN);
         assert_eq!(loaded[0].config_path, config_path);
+        assert!(
+            loaded[0].last_used.is_some(),
+            "the stable-ID sidecar timestamp must survive catalog loading"
+        );
     }
 
     #[test]

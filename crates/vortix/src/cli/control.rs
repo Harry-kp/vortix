@@ -259,6 +259,19 @@ struct PreparedImportState {
     topology: Option<ProfileTopology>,
 }
 
+fn initial_last_connected_at(
+    profiles: &[VpnProfile],
+) -> BTreeMap<ProfileId, std::time::SystemTime> {
+    profiles
+        .iter()
+        .filter_map(|profile| {
+            profile
+                .last_used
+                .map(|connected_at| (profile.id.clone(), connected_at))
+        })
+        .collect()
+}
+
 impl std::fmt::Debug for StandardProfileMutationExecutor {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -1570,6 +1583,7 @@ impl LocalProfileMutationSession {
             ControlServiceConfig {
                 known_profiles: profiles.iter().map(|profile| profile.id.clone()).collect(),
                 profile_topologies: topologies,
+                initial_last_connected_at: initial_last_connected_at(profiles),
                 profile_mutations: Some(profile_mutations.clone()),
                 authority_epoch: STANDARD_AUTHORITY_EPOCH,
                 persistence: Some(ControlPersistenceConfig::new(boot_id, state_store)),
@@ -1748,6 +1762,7 @@ impl LocalControlSession {
                 ControlServiceConfig {
                     known_profiles: profiles.iter().map(|profile| profile.id.clone()).collect(),
                     profile_topologies: topologies,
+                    initial_last_connected_at: initial_last_connected_at(&profiles),
                     profile_mutations: Some(profile_mutations.clone()),
                     authority_epoch: STANDARD_AUTHORITY_EPOCH,
                     freshness_poll_interval: CONTROL_PROGRESS_INTERVAL,
@@ -1958,6 +1973,7 @@ impl LocalControlSession {
             ControlServiceConfig {
                 known_profiles: profiles.iter().map(|profile| profile.id.clone()).collect(),
                 profile_topologies: topologies,
+                initial_last_connected_at: initial_last_connected_at(&profiles),
                 profile_mutations: Some(profile_mutations.clone()),
                 authority_epoch: STANDARD_AUTHORITY_EPOCH,
                 initial_kill_switch_mode,
@@ -3944,20 +3960,6 @@ mod tests {
         );
         assert_eq!(connected_operation(&operations, &target, 8), None);
         assert_eq!(connected_operation(&operations, &other, 7), None);
-    }
-
-    #[test]
-    fn openvpn_recovery_rejects_a_scanner_pid_that_is_not_the_custodian_child() {
-        let session = ActiveSession {
-            pid: Some(43),
-            interface: "tun0".into(),
-            interface_authoritative: true,
-            ..ActiveSession::default()
-        };
-        assert!(!crate::tunnel::standard_openvpn_scanner_pid_matches(
-            session.pid,
-            42,
-        ));
     }
 
     #[test]

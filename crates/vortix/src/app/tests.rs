@@ -36,6 +36,7 @@ fn test_app() -> App {
         logs_auto_scroll: true,
         logs_max_scroll: 0,
         log_level_filter: None,
+        last_logged_network_quality: crate::state::QualityLevel::Unknown,
         focused_panel: FocusedPanel::Sidebar,
         zoomed_panel: None,
         flip_states: std::collections::HashMap::new(),
@@ -2217,6 +2218,71 @@ fn canonical_snapshot_retains_last_connected_identity_after_projection_empties()
     app.apply_control_snapshot(crate::vortix_core::control::ControlSnapshot::default());
 
     assert_eq!(app.last_control_connected_profile, Some(profile_id));
+}
+
+#[test]
+fn canonical_snapshot_updates_profile_last_connected_time() {
+    let mut app = test_app();
+    add_profiles(&mut app, &["corp"]);
+    let profile_id = app.runtime.profiles[0].id.clone();
+    let connected_at = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_234);
+    app.runtime.profiles[0].last_used = Some(connected_at + std::time::Duration::from_secs(1));
+    let mut snapshot = app.control_snapshot.clone();
+    snapshot.last_connected_at.insert(profile_id, connected_at);
+
+    app.apply_control_snapshot(snapshot);
+
+    assert_eq!(app.runtime.profiles[0].last_used, Some(connected_at));
+}
+
+#[test]
+fn routine_packet_loss_and_jitter_samples_do_not_flood_the_event_log() {
+    use crate::core::telemetry::TelemetryUpdate;
+
+    crate::logger::clear_logs();
+    let mut app = test_app();
+    app.handle_message(Message::Telemetry(TelemetryUpdate::NetworkQuality {
+        latency_ms: 400,
+        packet_loss: 12.3,
+        jitter_ms: 77,
+    }));
+    app.handle_message(Message::Telemetry(TelemetryUpdate::NetworkQuality {
+        latency_ms: 420,
+        packet_loss: 15.0,
+        jitter_ms: 80,
+    }));
+    app.handle_message(Message::Telemetry(TelemetryUpdate::NetworkQuality {
+        latency_ms: 30,
+        packet_loss: 0.0,
+        jitter_ms: 2,
+    }));
+    app.handle_message(Message::Telemetry(TelemetryUpdate::NetworkQuality {
+        latency_ms: 35,
+        packet_loss: 0.0,
+        jitter_ms: 3,
+    }));
+
+    assert!(app.runtime.packet_loss.abs() < f32::EPSILON);
+    assert_eq!(app.runtime.jitter_ms, 3);
+    assert!(crate::logger::get_logs().iter().all(|entry| {
+        !entry.message.contains("Packet loss: 12.3%") && !entry.message.contains("Jitter: 77ms")
+    }));
+    assert_eq!(
+        crate::logger::get_logs()
+            .iter()
+            .filter(|entry| entry.message.contains("Network quality degraded: poor"))
+            .count(),
+        1,
+        "unchanged quality categories must emit at most one log entry"
+    );
+    assert_eq!(
+        crate::logger::get_logs()
+            .iter()
+            .filter(|entry| entry.message.contains("Network quality: excellent"))
+            .count(),
+        1,
+        "recovery and subsequent healthy samples must emit one transition"
+    );
 }
 
 #[test]

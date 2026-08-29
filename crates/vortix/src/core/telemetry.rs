@@ -54,12 +54,17 @@ impl From<&crate::config::AppConfig> for TelemetryConfig {
 pub enum TelemetryUpdate {
     /// Updated public IP address.
     PublicIp(String),
-    /// Updated latency measurement in milliseconds.
-    Latency(u64),
-    /// Packet loss percentage (0.0-100.0).
-    PacketLoss(f32),
-    /// Jitter (latency standard deviation) in milliseconds.
-    Jitter(u64),
+    /// One coherent network-quality sample. Keeping the related measurements
+    /// together prevents consumers from classifying a mixture of old and new
+    /// values while the three fields are delivered.
+    NetworkQuality {
+        /// Round-trip latency in milliseconds.
+        latency_ms: u64,
+        /// Packet loss percentage (0.0-100.0).
+        packet_loss: f32,
+        /// Latency standard deviation in milliseconds.
+        jitter_ms: u64,
+    },
     /// Updated ISP/organization name.
     Isp(String),
     /// Updated DNS server address.
@@ -543,8 +548,7 @@ pub fn parse_ping_output(output: &str) -> PingStats {
 /// replaced the `ping -c 3 -i 0.2 -W <timeout>` shell-out
 /// with `core::icmp::measure_latency`. Same outputs (`latency_ms`,
 /// `packet_loss` %, `jitter_ms`); same retry-across-targets behavior;
-/// same `Latency(0) + PacketLoss(100) + Jitter(0)` final message when
-/// every target fails.
+/// same zero-latency, total-loss quality sample when every target fails.
 fn fetch_latency(tx: &Sender<TelemetryUpdate>, cfg: &std::sync::Arc<TelemetryConfig>) {
     // 3 probes, matching the prior `ping -c 3 -i 0.2` cadence.
     const PROBES_PER_TARGET: u32 = 3;
@@ -562,9 +566,11 @@ fn fetch_latency(tx: &Sender<TelemetryUpdate>, cfg: &std::sync::Arc<TelemetryCon
                     per_attempt_timeout,
                 ) {
                     if stats.latency_ms > 0 {
-                        let _ = tx_clone.send(TelemetryUpdate::Latency(stats.latency_ms));
-                        let _ = tx_clone.send(TelemetryUpdate::PacketLoss(stats.packet_loss));
-                        let _ = tx_clone.send(TelemetryUpdate::Jitter(stats.jitter_ms));
+                        let _ = tx_clone.send(TelemetryUpdate::NetworkQuality {
+                            latency_ms: stats.latency_ms,
+                            packet_loss: stats.packet_loss,
+                            jitter_ms: stats.jitter_ms,
+                        });
                         return;
                     }
                 }
@@ -575,9 +581,11 @@ fn fetch_latency(tx: &Sender<TelemetryUpdate>, cfg: &std::sync::Arc<TelemetryCon
             }
         }
 
-        let _ = tx_clone.send(TelemetryUpdate::Latency(0));
-        let _ = tx_clone.send(TelemetryUpdate::PacketLoss(100.0));
-        let _ = tx_clone.send(TelemetryUpdate::Jitter(0));
+        let _ = tx_clone.send(TelemetryUpdate::NetworkQuality {
+            latency_ms: 0,
+            packet_loss: 100.0,
+            jitter_ms: 0,
+        });
     });
 }
 

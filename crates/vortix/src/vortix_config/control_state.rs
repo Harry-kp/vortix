@@ -16,7 +16,7 @@ use crate::vortix_core::control::{
 use crate::vortix_core::profile::ProfileId;
 
 const MIN_STATE_SCHEMA_VERSION: u16 = 1;
-const STATE_SCHEMA_VERSION: u16 = 2;
+const STATE_SCHEMA_VERSION: u16 = 3;
 const STATE_FILE: &str = "control-state.json";
 const PREVIOUS_STATE_FILE: &str = "control-state.previous.json";
 const ENDPOINT_CACHE_FILE: &str = "endpoint-resolutions.json";
@@ -34,6 +34,8 @@ pub(crate) struct PersistedControlState {
     pub(crate) operations: BTreeMap<OperationId, OperationRecord>,
     pub(crate) boot_connections: BTreeMap<ProfileId, BootConnection>,
     pub(crate) requested_resources: BTreeMap<ProfileId, RequestedResources>,
+    #[serde(default)]
+    pub(crate) last_connected_at: BTreeMap<ProfileId, std::time::SystemTime>,
     pub(crate) tombstones: BTreeMap<ProfileId, PersistedTombstone>,
     pub(crate) retention: RetentionMetadata,
     pub(crate) reconciliation_required: bool,
@@ -48,6 +50,7 @@ impl PersistedControlState {
             operations: BTreeMap::new(),
             boot_connections: BTreeMap::new(),
             requested_resources: BTreeMap::new(),
+            last_connected_at: BTreeMap::new(),
             tombstones: BTreeMap::new(),
             retention: RetentionMetadata::default(),
             reconciliation_required: true,
@@ -66,6 +69,7 @@ impl PersistedControlState {
         if self.desired.tunnels.len() > MAX_PROFILES
             || self.boot_connections.len() > MAX_PROFILES
             || self.requested_resources.len() > MAX_PROFILES
+            || self.last_connected_at.len() > MAX_PROFILES
             || self.tombstones.len() > MAX_PROFILES
             || self.operations.len() > MAX_OPERATIONS
         {
@@ -344,6 +348,9 @@ impl ControlStateStore for FsControlStateStore {
         state
             .requested_resources
             .clone_from(&durable.requested_resources);
+        state
+            .last_connected_at
+            .clone_from(&durable.last_connected_at);
         state.tombstones.clone_from(&durable.tombstones);
         state.retention = durable.retention;
         state.reconciliation_required = durable.reconciliation_required;
@@ -360,6 +367,7 @@ fn recovered_state(state: PersistedControlState, current_boot_id: &str) -> Recov
             operations: state.operations,
             boot_connections: state.boot_connections,
             requested_resources: state.requested_resources,
+            last_connected_at: state.last_connected_at,
             tombstones: state.tombstones,
             retention: state.retention,
             reconciliation_required: true,
@@ -887,6 +895,38 @@ mod tests {
             OperationIntent::GenerationScoped
         ));
         decoded.validate().unwrap();
+    }
+
+    #[test]
+    fn schema_two_defaults_missing_last_connected_activity() {
+        let persisted = state("schema-two-activity");
+        let mut encoded = serde_json::to_value(&persisted).unwrap();
+        encoded["schema_version"] = serde_json::json!(2);
+        encoded.as_object_mut().unwrap().remove("last_connected_at");
+
+        let decoded: PersistedControlState = serde_json::from_value(encoded).unwrap();
+
+        assert!(decoded.last_connected_at.is_empty());
+        decoded.validate().unwrap();
+    }
+
+    #[test]
+    fn canonical_last_connected_activity_round_trips_atomically() {
+        let temp = tempdir().unwrap();
+        let store = FsControlStateStore::new(temp.path());
+        let profile_id = profile('a');
+        let connected_at = std::time::UNIX_EPOCH + Duration::from_secs(42);
+        let mut persisted = state("activity-roundtrip");
+        persisted
+            .last_connected_at
+            .insert(profile_id.clone(), connected_at);
+
+        store.save_state(&persisted).unwrap();
+
+        let LoadedControlState::Current(loaded) = store.load_state().unwrap() else {
+            panic!("current activity state must remain readable");
+        };
+        assert_eq!(loaded.last_connected_at[&profile_id], connected_at);
     }
 
     #[test]

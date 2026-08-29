@@ -78,6 +78,10 @@ pub struct ControlServiceConfig {
     pub known_profiles: BTreeSet<ProfileId>,
     /// Canonical resources parsed from real profiles before authority starts.
     pub profile_topologies: BTreeMap<ProfileId, ProfileTopology>,
+    /// Compatibility seed for activity recorded before canonical control
+    /// became the single owner. Durable control state wins per profile when
+    /// it contains a newer timestamp.
+    pub initial_last_connected_at: BTreeMap<ProfileId, SystemTime>,
     /// Optional injected owner of crash-safe profile storage effects.
     pub profile_mutations: Option<Arc<dyn ProfileMutationExecutor>>,
     /// Explicit boot intent and prevalidated credential eligibility.
@@ -256,6 +260,7 @@ impl Default for ControlServiceConfig {
             max_observed_profiles: 512,
             known_profiles: BTreeSet::new(),
             profile_topologies: BTreeMap::new(),
+            initial_last_connected_at: BTreeMap::new(),
             profile_mutations: None,
             boot_connections: BTreeMap::new(),
             freshness_poll_interval: Duration::from_millis(250),
@@ -780,6 +785,7 @@ impl ControlService {
         let (tx, rx) = mpsc::channel(config.command_capacity);
         let mut initial = ControlSnapshot {
             readiness,
+            last_connected_at: config.initial_last_connected_at.clone(),
             ..ControlSnapshot::default()
         };
         initial.desired.authority_epoch = config.authority_epoch;
@@ -1875,6 +1881,13 @@ fn recover_control_state(
             }
             snapshot.desired.clone_from(&durable.desired);
             snapshot.operations.clone_from(&durable.operations);
+            for (profile_id, connected_at) in &durable.last_connected_at {
+                snapshot
+                    .last_connected_at
+                    .entry(profile_id.clone())
+                    .and_modify(|current| *current = (*current).max(*connected_at))
+                    .or_insert(*connected_at);
+            }
             RecoveryOutcome {
                 durable,
                 startup_persistence_fault: false,
@@ -1915,6 +1928,7 @@ fn durable_state(config: &ControlServiceConfig, snapshot: &ControlSnapshot) -> D
         operations: snapshot.operations.clone(),
         boot_connections: config.boot_connections.clone(),
         requested_resources: requested_resources(config),
+        last_connected_at: snapshot.last_connected_at.clone(),
         tombstones: BTreeMap::new(),
         retention: RetentionMetadata::default(),
         reconciliation_required: !snapshot.readiness.reconciliation_complete,
@@ -2222,6 +2236,7 @@ async fn persist_control_state_if_changed(
         && durable.operations == snapshot.operations
         && durable.reconciliation_required != snapshot.readiness.reconciliation_complete
         && durable.tombstones == tombstones
+        && durable.last_connected_at == snapshot.last_connected_at
         && durable.requested_resources == requested_resources
     {
         return true;
@@ -2238,6 +2253,9 @@ async fn persist_control_state_if_changed(
     candidate.desired.clone_from(&snapshot.desired);
     candidate.operations.clone_from(&snapshot.operations);
     candidate.tombstones = tombstones;
+    candidate
+        .last_connected_at
+        .clone_from(&snapshot.last_connected_at);
     candidate.requested_resources = requested_resources;
     candidate.reconciliation_required = !snapshot.readiness.reconciliation_complete;
     let store = Arc::clone(&persistence.store);
@@ -2250,6 +2268,9 @@ async fn persist_control_state_if_changed(
         *durable = candidate;
         return true;
     }
+    snapshot
+        .last_connected_at
+        .clone_from(&before.last_connected_at);
     snapshot.readiness.reconciliation_complete = false;
     admission
         .lock()
@@ -4178,6 +4199,7 @@ fn apply_profile_mutation_completion(
                     .wireguard_probe_receipts
                     .remove(profile_id);
                 snapshot.observed.connection_health.remove(profile_id);
+                snapshot.last_connected_at.remove(profile_id);
                 recompute_policy_digest(snapshot);
             }
         }
@@ -5142,6 +5164,21 @@ fn complete_operation(
         }
     }
     let status = record.status;
+    if status == OperationStatus::Succeeded {
+        let connected_profiles = snapshot
+            .operations
+            .get(&completion.operation_id)
+            .map_or_else(Vec::new, |operation| {
+                successful_connection_times(operation, snapshot)
+            });
+        for (profile_id, connected_at) in connected_profiles {
+            snapshot
+                .last_connected_at
+                .entry(profile_id)
+                .and_modify(|current| *current = (*current).max(connected_at))
+                .or_insert(connected_at);
+        }
+    }
     cancel_operation_challenges(
         &completion.operation_id,
         snapshot,
@@ -5162,6 +5199,37 @@ fn complete_operation(
     });
     finish_lifecycle_operation(owner, config, &operation_id, status, now, events);
     Ok(CompletionResult::Terminal(status))
+}
+
+fn successful_connection_times(
+    operation: &OperationRecord,
+    snapshot: &ControlSnapshot,
+) -> Vec<(ProfileId, SystemTime)> {
+    let tunnels = match &operation.intent {
+        OperationIntent::DesiredSubset { tunnels, .. }
+        | OperationIntent::UnexpectedRecovery { tunnels, .. } => tunnels,
+        OperationIntent::GenerationScoped | OperationIntent::ProfileMutation { .. } => {
+            return Vec::new();
+        }
+    };
+    tunnels
+        .iter()
+        .filter(|(_, requested)| **requested == RequestedTunnelState::Connected)
+        .filter_map(|(profile_id, _)| {
+            let active = snapshot
+                .observed
+                .tunnels
+                .get(profile_id)
+                .is_some_and(|tunnel| tunnel.active);
+            active.then_some(())?;
+            let connected_at = snapshot
+                .observed
+                .tunnel_details
+                .get(profile_id)?
+                .started_at?;
+            Some((profile_id.clone(), connected_at))
+        })
+        .collect()
 }
 
 fn expire_operations(

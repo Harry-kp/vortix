@@ -14,10 +14,10 @@ use vortix::vortix_core::control::{
     AdmissionError, AuthorityEpoch, BootConnection, BootEligibility, CommandRequest,
     CompletionError, CompletionOutcome, ControlPersistenceConfig, ControlService,
     ControlServiceConfig, ControlStateStore, ControlStateStoreError, Deadline, DesiredState,
-    DurableControlState, ExecutionSelection, IdempotencyKey, Observation, OperationCompletion,
-    OperationFailure, OperationId, OperationIntent, OperationRecord, OperationStatus, PolicyDigest,
-    ProfileTopology, ReadinessError, RecoveredControlState, RequestedTunnelState,
-    RetentionMetadata, UserCommand,
+    DurableControlState, ExecutionSelection, GateEvidence, IdempotencyKey, Observation,
+    OperationCompletion, OperationFailure, OperationId, OperationIntent, OperationRecord,
+    OperationStatus, PolicyDigest, ProfileTopology, ProtectionEvidence, ReadinessError,
+    RecoveredControlState, RequestedTunnelState, RetentionMetadata, UserCommand,
 };
 use vortix::vortix_core::ports::tunnel::TunnelKindTag;
 use vortix::vortix_core::profile::ProfileId;
@@ -216,6 +216,7 @@ async fn same_boot_unexpected_recovery_reconstructs_preblock_before_reconnect() 
             operations: BTreeMap::from([(operation_id, operation)]),
             boot_connections: BTreeMap::new(),
             requested_resources: BTreeMap::new(),
+            last_connected_at: BTreeMap::new(),
             tombstones: BTreeMap::new(),
             retention: RetentionMetadata::default(),
             reconciliation_required: true,
@@ -266,6 +267,42 @@ async fn same_boot_unexpected_recovery_reconstructs_preblock_before_reconnect() 
         tokio::task::yield_now().await;
     }
     assert_eq!(&*order.0.lock().unwrap(), &["preblock", "tunnel"]);
+}
+
+#[tokio::test]
+async fn restart_restores_canonical_last_connected_time() {
+    let profile_id = ProfileId::new("last-connected-recovery");
+    let connected_at = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(9_876);
+    let desired = DesiredState {
+        authority_epoch: AuthorityEpoch(15),
+        ..DesiredState::default()
+    };
+    let store = Arc::new(RecordingStore {
+        state: Mutex::new(Some(DurableControlState {
+            desired,
+            operations: BTreeMap::new(),
+            boot_connections: BTreeMap::new(),
+            requested_resources: BTreeMap::new(),
+            last_connected_at: BTreeMap::from([(profile_id.clone(), connected_at)]),
+            tombstones: BTreeMap::new(),
+            retention: RetentionMetadata::default(),
+            reconciliation_required: true,
+        })),
+        ..RecordingStore::default()
+    });
+
+    let service = ControlService::start(ControlServiceConfig {
+        authority_epoch: AuthorityEpoch(15),
+        known_profiles: BTreeSet::from([profile_id.clone()]),
+        profile_topologies: topology_catalog(&profile_id),
+        persistence: Some(ControlPersistenceConfig::new("boot-a", store)),
+        ..ControlServiceConfig::default()
+    });
+
+    assert_eq!(
+        service.client().snapshot().last_connected_at[&profile_id],
+        connected_at
+    );
 }
 
 #[tokio::test]
@@ -523,6 +560,88 @@ async fn terminal_reply_waits_for_durable_operation_result() {
     assert_eq!(
         store.state.lock().unwrap().as_ref().unwrap().operations[&admitted.operation_id].status,
         OperationStatus::WaitingForObservation
+    );
+}
+
+#[tokio::test]
+async fn failed_terminal_persistence_does_not_publish_last_connected_activity() {
+    let store = Arc::new(RecordingStore::default());
+    let profile_id = ProfileId::new("failed-activity-persistence");
+    let service = ControlService::start(ControlServiceConfig {
+        authority_epoch: AuthorityEpoch(16),
+        known_profiles: BTreeSet::from([profile_id.clone()]),
+        profile_topologies: topology_catalog(&profile_id),
+        persistence: Some(ControlPersistenceConfig::new("boot-a", store.clone())),
+        ..ControlServiceConfig::default()
+    });
+    service
+        .completer()
+        .set_readiness(AuthorityEpoch(16), true, true)
+        .await
+        .unwrap();
+    let admitted = service
+        .client()
+        .submit(CommandRequest {
+            command: UserCommand::Connect {
+                profile_id: profile_id.clone(),
+                conflict_acknowledgement: None,
+            },
+            idempotency_key: IdempotencyKey::new("activity-persistence-failure"),
+            deadline: Deadline(u64::MAX),
+        })
+        .await
+        .unwrap();
+    let connected_at = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(123);
+    let observed_at_millis = service.observer().now_millis();
+    service
+        .observer()
+        .observe_batch(vec![
+            Observation::TunnelDetails {
+                profile_id: profile_id.clone(),
+                details: Box::default(),
+                started_at: Some(connected_at),
+                observed_at_millis,
+            },
+            Observation::Tunnel {
+                profile_id: profile_id.clone(),
+                active: true,
+                interface_name: Some("utun9".into()),
+                observed_at_millis,
+                protection: None,
+            },
+        ])
+        .await
+        .unwrap();
+    let desired = service.client().snapshot().desired;
+    store.fail.store(true, Ordering::Release);
+
+    assert_eq!(
+        service
+            .completer()
+            .complete(OperationCompletion {
+                operation_id: admitted.operation_id,
+                desired_generation: desired.generation,
+                outcome: CompletionOutcome::ObservedSuccess(ProtectionEvidence {
+                    desired_generation: desired.generation,
+                    authority_epoch: desired.authority_epoch,
+                    policy_digest: desired.policy_digest,
+                    observed_at_millis,
+                    interface: GateEvidence::Verified,
+                    route: GateEvidence::Verified,
+                    dns: GateEvidence::Verified,
+                    firewall: GateEvidence::Verified,
+                }),
+            })
+            .await,
+        Err(CompletionError::Persistence)
+    );
+    assert!(
+        !service
+            .client()
+            .snapshot()
+            .last_connected_at
+            .contains_key(&profile_id),
+        "activity must not become visible when its durable transaction fails"
     );
 }
 

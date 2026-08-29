@@ -716,14 +716,15 @@ impl App {
                 self.runtime.public_ip = ip;
                 self.runtime.last_security_check = Some(Instant::now());
             }
-            TelemetryUpdate::Latency(ms) => self.runtime.latency_ms = ms,
-            TelemetryUpdate::PacketLoss(loss) => {
-                self.runtime.packet_loss = loss;
-                self.log(&format!("NET: Packet loss: {loss:.1}%"));
-            }
-            TelemetryUpdate::Jitter(jitter) => {
-                self.runtime.jitter_ms = jitter;
-                self.log(&format!("NET: Jitter: {jitter}ms"));
+            TelemetryUpdate::NetworkQuality {
+                latency_ms,
+                packet_loss,
+                jitter_ms,
+            } => {
+                self.runtime.latency_ms = latency_ms;
+                self.runtime.packet_loss = packet_loss;
+                self.runtime.jitter_ms = jitter_ms;
+                self.log_network_quality_transition();
             }
             TelemetryUpdate::Location(loc) => {
                 if self.runtime.location != loc && self.runtime.location != constants::MSG_DETECTING
@@ -809,6 +810,26 @@ impl App {
             TelemetryUpdate::Log(level, msg) => {
                 logger::log(level, "TELEMETRY", msg);
             }
+        }
+    }
+
+    fn log_network_quality_transition(&mut self) {
+        use crate::state::QualityLevel;
+
+        let quality = QualityLevel::from_metrics(
+            self.runtime.latency_ms,
+            self.runtime.packet_loss,
+            self.runtime.jitter_ms,
+        );
+        if quality == self.last_logged_network_quality {
+            return;
+        }
+        self.last_logged_network_quality = quality;
+        match quality {
+            QualityLevel::Unknown => self.log("WARN: Network quality unavailable"),
+            QualityLevel::Excellent => self.log("NET: Network quality: excellent"),
+            QualityLevel::Fair => self.log("WARN: Network quality degraded: fair"),
+            QualityLevel::Poor => self.log("WARN: Network quality degraded: poor"),
         }
     }
 

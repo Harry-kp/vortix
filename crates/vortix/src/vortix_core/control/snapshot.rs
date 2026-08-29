@@ -1,6 +1,7 @@
 //! Immutable state published by the canonical control owner.
 
 use std::collections::BTreeMap;
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
@@ -52,6 +53,11 @@ pub struct ControlSnapshot {
     /// for preflight overlays and never parse protocol configuration.
     #[serde(default)]
     pub profile_routes: BTreeMap<ProfileId, Vec<Cidr>>,
+    /// Most recent authenticated, successfully completed connection for each
+    /// stable profile identity. Clients render this projection but never
+    /// derive or persist it themselves.
+    #[serde(default)]
+    pub last_connected_at: BTreeMap<ProfileId, SystemTime>,
     pub operations: BTreeMap<OperationId, OperationRecord>,
     pub challenges: BTreeMap<ChallengeId, ChallengeRecord>,
     /// Redacted, bounded troubleshooting evidence. It is never an authority,

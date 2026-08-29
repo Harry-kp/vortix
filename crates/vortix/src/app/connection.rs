@@ -207,6 +207,29 @@ impl App {
     ) {
         use crate::state::KillSwitchState;
 
+        if self.control_snapshot.last_connected_at != snapshot.last_connected_at {
+            let mut activity_changed = false;
+            for profile in &mut self.runtime.profiles {
+                let Some(connected_at) = snapshot.last_connected_at.get(&profile.id).copied()
+                else {
+                    continue;
+                };
+                if profile.last_used != Some(connected_at) {
+                    profile.last_used = Some(connected_at);
+                    activity_changed = true;
+                }
+            }
+            if activity_changed
+                && self.runtime.sort_order == crate::state::ProfileSortOrder::LastUsed
+            {
+                let selected_profile = self.selected_profile_id();
+                self.runtime.sort_profiles();
+                self.profile_list_state.select(
+                    selected_profile.and_then(|profile_id| self.profile_index(&profile_id)),
+                );
+            }
+        }
+
         let tunnel_projection_changed = self.control_snapshot.tunnels != snapshot.tunnels
             || self.control_snapshot.primary != snapshot.primary;
         let egress_path_changed =
@@ -316,22 +339,13 @@ impl App {
         &mut self,
         update: crate::cli::control::LocalCatalogUpdate,
     ) {
-        let selected_id = self
-            .profile_list_state
-            .selected()
-            .and_then(|index| self.runtime.profiles.get(index))
-            .map(|profile| profile.id.clone());
+        let selected_id = self.selected_profile_id();
         if let Some(profiles) = update.profiles {
             self.runtime.profiles = profiles;
             self.runtime.sort_profiles();
             self.profile_list_state.select(
                 selected_id
-                    .and_then(|profile_id| {
-                        self.runtime
-                            .profiles
-                            .iter()
-                            .position(|profile| profile.id == profile_id)
-                    })
+                    .and_then(|profile_id| self.profile_index(&profile_id))
                     .or_else(|| (!self.runtime.profiles.is_empty()).then_some(0)),
             );
         }
@@ -364,6 +378,20 @@ impl App {
                 }
             }
         }
+    }
+
+    fn selected_profile_id(&self) -> Option<ProfileId> {
+        self.profile_list_state
+            .selected()
+            .and_then(|index| self.runtime.profiles.get(index))
+            .map(|profile| profile.id.clone())
+    }
+
+    fn profile_index(&self, profile_id: &ProfileId) -> Option<usize> {
+        self.runtime
+            .profiles
+            .iter()
+            .position(|profile| &profile.id == profile_id)
     }
 
     fn control_connect_profile(&mut self, idx: usize, acknowledge_conflict: bool) {

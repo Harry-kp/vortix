@@ -581,12 +581,18 @@ mod message_routing {
     }
 
     #[test]
-    fn telemetry_latency_update() {
+    fn telemetry_network_quality_update_is_atomic() {
         use vortix::core::telemetry::TelemetryUpdate;
 
         let mut app = test_app();
-        app.handle_message(Message::Telemetry(TelemetryUpdate::Latency(42)));
+        app.handle_message(Message::Telemetry(TelemetryUpdate::NetworkQuality {
+            latency_ms: 42,
+            packet_loss: 1.5,
+            jitter_ms: 7,
+        }));
         assert_eq!(app.runtime.latency_ms, 42);
+        assert!((app.runtime.packet_loss - 1.5).abs() < f32::EPSILON);
+        assert_eq!(app.runtime.jitter_ms, 7);
     }
 
     #[test]

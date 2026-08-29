@@ -152,6 +152,7 @@ type CanonicalSessionResolver =
 
 pub(crate) struct StandardOpenVpnOwner {
     custody: crate::vortix_process::CustodianHandshake,
+    protocol_pid: u32,
 }
 
 impl StandardOpenVpnOwner {
@@ -166,14 +167,6 @@ impl StandardOpenVpnOwner {
     }
 }
 
-#[must_use]
-pub(crate) fn standard_openvpn_scanner_pid_matches(
-    scanner_pid: Option<u32>,
-    custodian_pid: u32,
-) -> bool {
-    scanner_pid == Some(custodian_pid)
-}
-
 pub(crate) fn standard_openvpn_owner(
     profile_id: &ProfileId,
     session: &crate::core::scanner::ActiveSession,
@@ -183,12 +176,25 @@ pub(crate) fn standard_openvpn_owner(
     else {
         return Ok(None);
     };
-    if !standard_openvpn_scanner_pid_matches(session.pid, custody.pid) {
-        return Err("OpenVPN scanner PID does not match authenticated custodian child".into());
-    }
     let alive = crate::vortix_process::custodian::remote_status(&custody.identity)
         .map_err(|error| format!("OpenVPN custodian status failed: {error}"))?;
-    Ok(alive.then_some(StandardOpenVpnOwner { custody }))
+    if !alive {
+        return Ok(None);
+    }
+    let scanner_pid = session
+        .pid
+        .ok_or_else(|| "active OpenVPN target has no scanner process PID".to_string())?;
+    if !crate::vortix_process::custodian::contains_protocol_pid(&custody, scanner_pid)
+        .map_err(|error| format!("OpenVPN process-group ownership check failed: {error}"))?
+    {
+        return Err(
+            "OpenVPN scanner PID is not contained by the authenticated custodian group".into(),
+        );
+    }
+    Ok(Some(StandardOpenVpnOwner {
+        custody,
+        protocol_pid: scanner_pid,
+    }))
 }
 
 /// Production adapter from bounded canonical work to the concrete protocol
@@ -769,6 +775,7 @@ impl CanonicalTunnelExecutor {
         let owner = standard_openvpn_owner(&work.profile_id, &session)?.ok_or_else(|| {
             "active OpenVPN target has no live PID-matched custodian receipt".to_string()
         })?;
+        let protocol_pid = owner.protocol_pid;
         let custody = owner.custody;
         if custody.identity.generation != work.revision.generation {
             return Err(
@@ -786,7 +793,7 @@ impl CanonicalTunnelExecutor {
             profile_id: work.profile_id.clone(),
             display_name: profile.display_name,
             interface_name: session.interface,
-            pid: Some(custody.pid),
+            pid: Some(protocol_pid),
             started_at: std::time::SystemTime::now(),
             kind: TunnelKindTag::OpenVpn,
             generation: custody.identity.generation,
