@@ -80,20 +80,19 @@ impl App {
     }
 
     pub(crate) fn issue_control_import(&mut self, path: &std::path::Path) -> Option<String> {
+        let result = self.try_issue_control_import(path);
+        self.report_control_enqueue(result)
+    }
+
+    pub(crate) fn try_issue_control_import(
+        &mut self,
+        path: &std::path::Path,
+    ) -> Result<String, crate::cli::control::LocalControlError> {
         let (wait, idempotency_key) = self.next_control_request();
-        let result = self
-            .control_session
+        self.control_session
             .as_ref()
             .expect("control import requires an attached session")
-            .enqueue_tui_profile_import(path, wait, idempotency_key);
-        match result {
-            Ok(display_name) => Some(display_name),
-            Err(error) => {
-                self.log(&format!("ERR: Control command refused: {error}"));
-                self.show_toast(format!("Control command failed: {error}"), ToastType::Error);
-                None
-            }
-        }
+            .enqueue_tui_profile_import(path, wait, idempotency_key)
     }
 
     fn next_control_request(&mut self) -> (std::time::Duration, String) {
@@ -113,12 +112,12 @@ impl App {
         (wait, idempotency_key)
     }
 
-    fn report_control_enqueue(
+    fn report_control_enqueue<T>(
         &mut self,
-        result: Result<(), crate::cli::control::LocalControlError>,
-    ) -> Option<()> {
+        result: Result<T, crate::cli::control::LocalControlError>,
+    ) -> Option<T> {
         match result {
-            Ok(()) => Some(()),
+            Ok(value) => Some(value),
             Err(error) => {
                 self.log(&format!("ERR: Control command refused: {error}"));
                 self.show_toast(format!("Control command failed: {error}"), ToastType::Error);

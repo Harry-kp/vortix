@@ -79,6 +79,13 @@ impl CachedConfigView {
         }
     }
 }
+
+pub(crate) struct PendingProfileImports {
+    source: std::path::PathBuf,
+    remaining: std::collections::VecDeque<std::path::PathBuf>,
+    queued: usize,
+    failed: usize,
+}
 use std::collections::HashMap;
 
 use crate::constants;
@@ -144,6 +151,11 @@ pub struct App {
     pub(crate) pending_control_killswitch_mode: Option<crate::state::KillSwitchMode>,
 
     control_request_sequence: u64,
+
+    /// Directory imports feed the bounded TUI admission queue over multiple
+    /// event-loop turns. This keeps the eight-command safety budget without
+    /// misclassifying temporary backpressure as profile validation failure.
+    pub(crate) pending_profile_imports: Option<PendingProfileImports>,
 
     /// Flag indicating the application should exit.
     pub should_quit: bool,
@@ -214,6 +226,7 @@ impl App {
             last_control_connected_profile: None,
             pending_control_killswitch_mode: None,
             control_request_sequence: 0,
+            pending_profile_imports: None,
 
             should_quit: false,
 
@@ -295,6 +308,7 @@ impl App {
         match control_update {
             Some(Ok((admissions, snapshot, catalog))) => {
                 self.handle_control_admission_results(admissions);
+                self.pump_pending_profile_imports();
                 if let Some(catalog) = catalog {
                     self.apply_local_catalog_update(catalog);
                 }
@@ -394,6 +408,7 @@ impl App {
             last_control_connected_profile: None,
             pending_control_killswitch_mode: None,
             control_request_sequence: 0,
+            pending_profile_imports: None,
 
             should_quit: false,
 

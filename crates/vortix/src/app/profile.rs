@@ -7,6 +7,24 @@ use crate::constants;
 use crate::utils;
 use crate::vortix_config::profile_store::{FsProfileStore, ProfileStore};
 
+/// Bounds synchronous parsing/logging when a directory contains invalid files.
+const PROFILE_IMPORT_ATTEMPTS_PER_TURN: usize = 8;
+
+fn importable_profile_paths(dir_path: &Path) -> std::io::Result<Vec<std::path::PathBuf>> {
+    let mut paths = std::fs::read_dir(dir_path)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|ext| ext == "conf" || ext == "ovpn")
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    Ok(paths)
+}
+
 impl App {
     pub(crate) fn profile_next(&mut self) {
         let i = match self.profile_list_state.selected() {
@@ -304,29 +322,26 @@ impl App {
         }
     }
 
-    /// Bulk import all .conf and .ovpn files from a directory.
-    /// Returns the number of successfully imported profiles.
+    /// Import all `.conf` and `.ovpn` files from a directory.
+    ///
+    /// Returns the number imported synchronously in legacy mode or scheduled
+    /// for bounded canonical admission.
     fn import_from_directory(&mut self, dir_path: &Path) -> usize {
+        if self.control_session.is_some() {
+            return self.queue_directory_import(dir_path);
+        }
+
         let mut imported = 0;
         let mut failed = 0;
 
-        match std::fs::read_dir(dir_path) {
-            Ok(entries) => {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-
-                    // Only process .conf and .ovpn files
-                    if path.is_file()
-                        && path
-                            .extension()
-                            .is_some_and(|ext| ext == "conf" || ext == "ovpn")
-                    {
-                        if self.import_single_file(&path).is_some() {
-                            imported += 1;
-                        } else {
-                            self.log(&format!("ERR: Failed to import {}", path.display()));
-                            failed += 1;
-                        }
+        match importable_profile_paths(dir_path) {
+            Ok(paths) => {
+                for path in paths {
+                    if self.import_single_file(&path).is_some() {
+                        imported += 1;
+                    } else {
+                        self.log(&format!("ERR: Failed to import {}", path.display()));
+                        failed += 1;
                     }
                 }
 
@@ -371,5 +386,96 @@ impl App {
             }
         }
         imported
+    }
+
+    fn queue_directory_import(&mut self, dir_path: &Path) -> usize {
+        if self.pending_profile_imports.is_some() {
+            self.show_toast(
+                "A profile batch is already being queued".to_string(),
+                ToastType::Warning,
+            );
+            return 0;
+        }
+
+        let paths = match importable_profile_paths(dir_path) {
+            Ok(paths) => paths,
+            Err(error) => {
+                self.log(&format!("ERR: Failed to read directory: {error}"));
+                self.show_toast(
+                    format!("Error reading directory: {error}"),
+                    ToastType::Error,
+                );
+                return 0;
+            }
+        };
+        let count = paths.len();
+        if count == 0 {
+            self.show_toast(
+                constants::MSG_NO_FILES_FOUND.to_string(),
+                ToastType::Warning,
+            );
+            return 0;
+        }
+
+        self.pending_profile_imports = Some(super::PendingProfileImports {
+            source: dir_path.to_path_buf(),
+            remaining: paths.into(),
+            queued: 0,
+            failed: 0,
+        });
+        self.pump_pending_profile_imports();
+        count
+    }
+
+    pub(crate) fn pump_pending_profile_imports(&mut self) {
+        let Some(mut batch) = self.pending_profile_imports.take() else {
+            return;
+        };
+
+        for _ in 0..PROFILE_IMPORT_ATTEMPTS_PER_TURN {
+            let Some(path) = batch.remaining.pop_front() else {
+                break;
+            };
+            match self.try_issue_control_import(&path) {
+                Ok(name) => {
+                    batch.queued += 1;
+                    self.show_toast(format!("Import queued: {name}"), ToastType::Info);
+                }
+                Err(crate::cli::control::LocalControlError::Busy) => {
+                    batch.remaining.push_front(path);
+                    break;
+                }
+                Err(error) => {
+                    batch.failed += 1;
+                    self.log(&format!(
+                        "ERR: Failed to import {}: {error}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+
+        if !batch.remaining.is_empty() {
+            self.pending_profile_imports = Some(batch);
+            return;
+        }
+
+        let summary = if batch.failed == 0 {
+            format!("Queued {} profile import(s)", batch.queued)
+        } else {
+            format!(
+                "Queued {} profile import(s), {} rejected",
+                batch.queued, batch.failed
+            )
+        };
+        self.show_toast(
+            summary.clone(),
+            if batch.failed == 0 {
+                ToastType::Success
+            } else {
+                ToastType::Warning
+            },
+        );
+        self.log(&format!("INFO: {summary} from {}", batch.source.display()));
     }
 }

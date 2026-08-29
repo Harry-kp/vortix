@@ -31,6 +31,7 @@ fn test_app() -> App {
         last_control_connected_profile: None,
         pending_control_killswitch_mode: None,
         control_request_sequence: 0,
+        pending_profile_imports: None,
         should_quit: false,
         logs_scroll: 0,
         logs_auto_scroll: true,
@@ -2362,6 +2363,73 @@ fn connect_selected_on_active_profile_enqueues_one_typed_reconnect() {
         );
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
+}
+
+#[test]
+fn canonical_directory_import_drains_more_than_tui_admission_capacity() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_dir = temp.path().join("config");
+    let profiles_dir = config_dir.join(crate::constants::PROFILES_DIR_NAME);
+    let source_dir = temp.path().join("imports");
+    std::fs::create_dir_all(&profiles_dir).unwrap();
+    std::fs::create_dir(&source_dir).unwrap();
+    for index in 0..13 {
+        std::fs::write(
+            source_dir.join(format!("profile-{index:02}.conf")),
+            format!(
+                "[Interface]\nPrivateKey = abc=\nAddress = 10.0.{index}.2/32\n\n\
+                 [Peer]\nPublicKey = xyz=\nEndpoint = 192.0.2.1:51820\n\
+                 AllowedIPs = 10.{index}.0.0/16\n"
+            ),
+        )
+        .unwrap();
+    }
+    std::fs::write(source_dir.join("invalid.conf"), "not a VPN profile\n").unwrap();
+
+    let control =
+        crate::cli::control::LocalControlSession::start_profile_test(&config_dir, Vec::new())
+            .unwrap();
+    let mut app = test_app();
+    app.runtime.config_dir = config_dir;
+    app.attach_control_session(control).unwrap();
+
+    for _ in 0..8 {
+        assert!(app
+            .issue_control_command(crate::vortix_core::control::UserCommand::SetKillSwitch {
+                mode: crate::state::KillSwitchMode::Off,
+            })
+            .is_some());
+    }
+
+    app.import_profile_from_path(&source_dir.to_string_lossy());
+    assert_eq!(
+        app.pending_profile_imports.as_ref().map(|batch| (
+            batch.remaining.len(),
+            batch.queued,
+            batch.failed
+        )),
+        Some((14, 0, 0))
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.runtime.profiles.len() < 13 && std::time::Instant::now() < deadline {
+        app.process_external();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert_eq!(app.runtime.profiles.len(), 13);
+    for index in 0..13 {
+        assert!(app
+            .runtime
+            .profiles
+            .iter()
+            .any(|profile| profile.name == format!("profile-{index:02}")));
+    }
+    assert!(!app
+        .runtime
+        .profiles
+        .iter()
+        .any(|profile| profile.name == "invalid"));
+    assert!(app.pending_profile_imports.is_none());
 }
 
 #[test]
