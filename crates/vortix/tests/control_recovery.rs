@@ -16,8 +16,10 @@ use vortix::vortix_core::control::{
     ControlServiceConfig, ControlStateStore, ControlStateStoreError, Deadline, DesiredState,
     DurableControlState, ExecutionSelection, GateEvidence, IdempotencyKey, Observation,
     OperationCompletion, OperationFailure, OperationId, OperationIntent, OperationRecord,
-    OperationStatus, PolicyDigest, ProfileTopology, ProtectionEvidence, ReadinessError,
-    RecoveredControlState, RequestedTunnelState, RetentionMetadata, UserCommand,
+    OperationStatus, PolicyDigest, ProfileMutation, ProfileMutationApplied,
+    ProfileMutationExecutor, ProfileMutationFailure, ProfileMutationWork, ProfileTopology,
+    ProtectionEvidence, ReadinessError, RecoveredControlState, RequestedTunnelState,
+    RetentionMetadata, UserCommand,
 };
 use vortix::vortix_core::ports::tunnel::TunnelKindTag;
 use vortix::vortix_core::profile::ProfileId;
@@ -136,6 +138,21 @@ impl TunnelExecutor for SaveOrderedExecutor {
 }
 
 struct OkPolicy;
+
+#[derive(Debug)]
+struct DeleteProfile;
+
+impl ProfileMutationExecutor for DeleteProfile {
+    fn execute(
+        &self,
+        work: ProfileMutationWork,
+    ) -> Result<ProfileMutationApplied, ProfileMutationFailure> {
+        let ProfileMutation::Delete { profile_id } = work.mutation else {
+            return Err(ProfileMutationFailure::Internal);
+        };
+        Ok(ProfileMutationApplied::Deleted { profile_id })
+    }
+}
 
 impl PolicyExecutor for OkPolicy {
     fn apply(&self, _policy: &TopologyPolicy, _barrier: PolicyBarrier) -> Result<(), String> {
@@ -741,6 +758,94 @@ async fn same_boot_restart_scans_before_resuming_one_nonterminal_operation() {
         .snapshot()
         .operations
         .contains_key(&original_operation));
+}
+
+#[tokio::test]
+async fn completed_restarted_disconnect_releases_profile_for_deletion() {
+    let store = Arc::new(RecordingStore::default());
+    let profile_id = ProfileId::new("restart-disconnect-release");
+    let operation_id: OperationId =
+        serde_json::from_str("\"op-0000000000000009-0000000000000001\"").unwrap();
+    let desired = DesiredState {
+        generation: 1,
+        tunnels: BTreeMap::from([(profile_id.clone(), RequestedTunnelState::Disconnected)]),
+        conflict_acknowledgements: BTreeMap::new(),
+        kill_switch: vortix::vortix_core::state::killswitch::KillSwitchMode::Off,
+        authority_epoch: AuthorityEpoch(9),
+        policy_digest: PolicyDigest("restart-disconnect-policy".into()),
+    };
+    store.state.lock().unwrap().replace(DurableControlState {
+        desired: desired.clone(),
+        operations: BTreeMap::from([(
+            operation_id.clone(),
+            OperationRecord {
+                id: operation_id.clone(),
+                idempotency_key: IdempotencyKey::new("restart-disconnect"),
+                client_id: serde_json::from_str("\"client-0000000000000009-0000000000000001\"")
+                    .unwrap(),
+                command_digest: desired.policy_digest.clone(),
+                authority_epoch: AuthorityEpoch(9),
+                desired_generation: desired.generation,
+                admitted_at_millis: 0,
+                deadline_millis: u64::MAX,
+                intent: OperationIntent::DesiredSubset {
+                    tunnels: desired.tunnels.clone(),
+                    kill_switch: None,
+                },
+                status: OperationStatus::WaitingForObservation,
+                result: None,
+            },
+        )]),
+        boot_connections: BTreeMap::new(),
+        requested_resources: BTreeMap::new(),
+        last_connected_at: BTreeMap::new(),
+        tombstones: BTreeMap::new(),
+        retention: RetentionMetadata::default(),
+        reconciliation_required: true,
+    });
+    let service = ControlService::start(ControlServiceConfig {
+        authority_epoch: AuthorityEpoch(9),
+        known_profiles: BTreeSet::from([profile_id.clone()]),
+        profile_topologies: topology_catalog(&profile_id),
+        persistence: Some(ControlPersistenceConfig::new("boot-a", store)),
+        profile_mutations: Some(Arc::new(DeleteProfile)),
+        ..ControlServiceConfig::default()
+    });
+    service
+        .completer()
+        .set_readiness(AuthorityEpoch(9), true, true)
+        .await
+        .unwrap();
+
+    service
+        .completer()
+        .complete(OperationCompletion {
+            operation_id: operation_id.clone(),
+            desired_generation: desired.generation,
+            outcome: CompletionOutcome::Failed(OperationFailure::ObservationFailed),
+        })
+        .await
+        .expect("restarted disconnect terminalized");
+    assert!(!service
+        .client()
+        .snapshot()
+        .operations
+        .contains_key(&operation_id));
+
+    let deletion = service
+        .client()
+        .submit(CommandRequest {
+            command: UserCommand::DeleteProfile {
+                profile_id: profile_id.clone(),
+            },
+            idempotency_key: IdempotencyKey::new("delete-after-restart-disconnect"),
+            deadline: Deadline(u64::MAX),
+        })
+        .await;
+    assert!(
+        deletion.is_ok(),
+        "completed recovery must release {profile_id} for deletion: {deletion:?}"
+    );
 }
 
 #[tokio::test]

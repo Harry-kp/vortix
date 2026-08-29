@@ -5119,6 +5119,7 @@ fn complete_operation(
         owner.release_operation_admission(&completion.operation_id);
         if was_recovery {
             snapshot.operations.remove(&completion.operation_id);
+            forget_operation(admission, &completion.operation_id);
         } else {
             mark_terminal(admission, &completion.operation_id);
         }
@@ -5189,6 +5190,7 @@ fn complete_operation(
     owner.release_operation_admission(&completion.operation_id);
     if owner.recovery_operations.remove(&completion.operation_id) {
         snapshot.operations.remove(&completion.operation_id);
+        forget_operation(admission, &completion.operation_id);
     } else {
         mark_terminal(admission, &completion.operation_id);
     }
@@ -5205,12 +5207,8 @@ fn successful_connection_times(
     operation: &OperationRecord,
     snapshot: &ControlSnapshot,
 ) -> Vec<(ProfileId, SystemTime)> {
-    let tunnels = match &operation.intent {
-        OperationIntent::DesiredSubset { tunnels, .. }
-        | OperationIntent::UnexpectedRecovery { tunnels, .. } => tunnels,
-        OperationIntent::GenerationScoped | OperationIntent::ProfileMutation { .. } => {
-            return Vec::new();
-        }
+    let Some(tunnels) = operation_intent_tunnels(&operation.intent) else {
+        return Vec::new();
     };
     tunnels
         .iter()
@@ -5259,6 +5257,7 @@ fn expire_operations(
         owner.release_operation_admission(&id);
         if was_recovery {
             snapshot.operations.remove(&id);
+            forget_operation(admission, &id);
         } else {
             mark_terminal(admission, &id);
         }
@@ -5628,6 +5627,26 @@ fn register_recovery_lifecycle(
 fn mark_terminal(admission: &Arc<Mutex<AdmissionState>>, operation_id: &OperationId) {
     let mut admission = admission.lock().expect("admission mutex poisoned");
     admission.terminal_operations.insert(operation_id.clone());
+    release_profile_operation(&mut admission, operation_id);
+}
+
+fn forget_operation(admission: &Arc<Mutex<AdmissionState>>, operation_id: &OperationId) {
+    let mut admission = admission.lock().expect("admission mutex poisoned");
+    let was_retained = admission
+        .idempotency
+        .values()
+        .any(|binding| &binding.operation_id == operation_id);
+    admission
+        .idempotency
+        .retain(|_, binding| &binding.operation_id != operation_id);
+    admission.terminal_operations.remove(operation_id);
+    if was_retained {
+        admission.retained_operations = admission.retained_operations.saturating_sub(1);
+    }
+    release_profile_operation(&mut admission, operation_id);
+}
+
+fn release_profile_operation(admission: &mut AdmissionState, operation_id: &OperationId) {
     admission.active_profile_operations.retain(|_, operations| {
         operations.remove(operation_id);
         !operations.is_empty()
@@ -5635,12 +5654,37 @@ fn mark_terminal(admission: &Arc<Mutex<AdmissionState>>, operation_id: &Operatio
 }
 
 fn operation_intent_profiles(intent: &OperationIntent) -> Vec<ProfileId> {
+    operation_intent_tunnels(intent).map_or_else(
+        || match intent {
+            OperationIntent::ProfileMutation { profile_id } => vec![profile_id.clone()],
+            OperationIntent::GenerationScoped
+            | OperationIntent::DesiredSubset { .. }
+            | OperationIntent::UnexpectedRecovery { .. } => Vec::new(),
+        },
+        |tunnels| tunnels.keys().cloned().collect(),
+    )
+}
+
+fn operation_intent_tunnels(
+    intent: &OperationIntent,
+) -> Option<&BTreeMap<ProfileId, RequestedTunnelState>> {
     match intent {
-        OperationIntent::GenerationScoped => Vec::new(),
         OperationIntent::DesiredSubset { tunnels, .. }
-        | OperationIntent::UnexpectedRecovery { tunnels, .. } => tunnels.keys().cloned().collect(),
-        OperationIntent::ProfileMutation { profile_id } => vec![profile_id.clone()],
+        | OperationIntent::UnexpectedRecovery { tunnels, .. } => Some(tunnels),
+        OperationIntent::GenerationScoped | OperationIntent::ProfileMutation { .. } => None,
     }
+}
+
+fn client_desired_tunnels(
+    operation: &OperationRecord,
+) -> Option<&BTreeMap<ProfileId, RequestedTunnelState>> {
+    if operation.client_id.sequence()? == 0 {
+        return None;
+    }
+    let OperationIntent::DesiredSubset { tunnels, .. } = &operation.intent else {
+        return None;
+    };
+    Some(tunnels)
 }
 
 #[allow(clippy::too_many_arguments)] // Challenge resolution is a single atomic owner transition.
@@ -5933,6 +5977,18 @@ fn derive_tunnel_projections(
         .flat_map(|owner| owner.reconnect_operations.values())
         .flat_map(|reconnect| reconnect.targets.iter().cloned())
         .collect::<BTreeSet<_>>();
+    let disconnecting_profiles = snapshot
+        .operations
+        .values()
+        .filter(|operation| !operation.status.is_terminal())
+        .filter_map(client_desired_tunnels)
+        .flat_map(|tunnels| {
+            tunnels
+                .iter()
+                .filter(|(_, requested)| **requested == RequestedTunnelState::Disconnected)
+                .map(|(profile_id, _)| profile_id.clone())
+        })
+        .collect::<BTreeSet<_>>();
 
     let mut projections = BTreeMap::new();
     for profile_id in profiles {
@@ -5991,7 +6047,9 @@ fn derive_tunnel_projections(
                 None,
                 Some(started),
             )
-        } else if active && matches!(requested, Some(RequestedTunnelState::Disconnected)) {
+        } else if matches!(requested, Some(RequestedTunnelState::Disconnected))
+            && (active || disconnecting_profiles.contains(&profile_id))
+        {
             let started = prior_started_at(old, |state| {
                 matches!(state, Connection::Disconnecting { .. })
             });
@@ -6233,6 +6291,94 @@ mod target_profiles_tests {
 
         assert_eq!(recovered[&operation_id].target, target);
         assert_eq!(recovered[&operation_id].teardown, BTreeSet::from([first]));
+    }
+
+    #[test]
+    fn absent_tunnel_remains_disconnecting_until_its_operation_is_terminal() {
+        let profile_id = ProfileId::new("corp");
+        let operation_id = OperationId::from_parts(AuthorityEpoch(7), 4);
+        let mut snapshot = ControlSnapshot::default();
+        snapshot.desired.generation = 9;
+        snapshot
+            .desired
+            .tunnels
+            .insert(profile_id.clone(), RequestedTunnelState::Disconnected);
+        snapshot.operations.insert(
+            operation_id.clone(),
+            OperationRecord {
+                id: operation_id,
+                idempotency_key: IdempotencyKey::new("disconnect-corp"),
+                client_id: ClientId::from_parts(AuthorityEpoch(7), 1),
+                command_digest: PolicyDigest::default(),
+                authority_epoch: AuthorityEpoch(7),
+                desired_generation: 9,
+                admitted_at_millis: 1,
+                deadline_millis: u64::MAX,
+                intent: OperationIntent::DesiredSubset {
+                    tunnels: BTreeMap::from([(
+                        profile_id.clone(),
+                        RequestedTunnelState::Disconnected,
+                    )]),
+                    kill_switch: None,
+                },
+                status: OperationStatus::WaitingForObservation,
+                result: None,
+            },
+        );
+        let config = ControlServiceConfig {
+            known_profiles: BTreeSet::from([profile_id.clone()]),
+            ..ControlServiceConfig::default()
+        };
+
+        derive_tunnel_projections(&mut snapshot, None, &config);
+
+        assert!(matches!(
+            snapshot.tunnels[&profile_id].state,
+            Connection::Disconnecting { .. }
+        ));
+
+        snapshot
+            .operations
+            .values_mut()
+            .next()
+            .expect("disconnect operation")
+            .status = OperationStatus::Succeeded;
+        derive_tunnel_projections(&mut snapshot, None, &config);
+
+        assert!(!snapshot.tunnels.contains_key(&profile_id));
+
+        let operation = snapshot
+            .operations
+            .values_mut()
+            .next()
+            .expect("disconnect operation");
+        operation.status = OperationStatus::WaitingForObservation;
+        operation.intent = OperationIntent::UnexpectedRecovery {
+            profile_id: ProfileId::new("recovering"),
+            tunnels: BTreeMap::from([(profile_id.clone(), RequestedTunnelState::Disconnected)]),
+            kill_switch: None,
+        };
+        derive_tunnel_projections(&mut snapshot, None, &config);
+        assert!(
+            !snapshot.tunnels.contains_key(&profile_id),
+            "recovery context is not a client disconnect request"
+        );
+
+        let operation = snapshot
+            .operations
+            .values_mut()
+            .next()
+            .expect("disconnect operation");
+        operation.client_id = ClientId::from_parts(AuthorityEpoch(7), 0);
+        operation.intent = OperationIntent::DesiredSubset {
+            tunnels: BTreeMap::from([(profile_id.clone(), RequestedTunnelState::Disconnected)]),
+            kill_switch: None,
+        };
+        derive_tunnel_projections(&mut snapshot, None, &config);
+        assert!(
+            !snapshot.tunnels.contains_key(&profile_id),
+            "service recovery context is not a client disconnect request"
+        );
     }
 
     #[test]
