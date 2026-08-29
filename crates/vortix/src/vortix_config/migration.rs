@@ -282,10 +282,7 @@ fn count_ignored_files(profiles_dir: &Path) -> std::io::Result<u32> {
             || name == ".vortix-profile-insert.config"
             || name == ".vortix-profile-delete.toml"
             || name.ends_with(".meta.toml");
-        let config = matches!(
-            path.extension().and_then(|extension| extension.to_str()),
-            Some("conf" | "ovpn")
-        );
+        let config = is_profile_config_name(name);
         if !internal && !config {
             ignored = ignored.saturating_add(1);
         }
@@ -316,6 +313,9 @@ fn build_initial_inventory(
             })?;
         if file_name.ends_with(".meta.toml") {
             sidecar_names.insert(file_name.to_string());
+            continue;
+        }
+        if !is_profile_config_name(file_name) {
             continue;
         }
         let protocol = match path.extension().and_then(|extension| extension.to_str()) {
@@ -1055,10 +1055,7 @@ fn scan_profile_files(profiles_dir: &Path) -> std::io::Result<(HashSet<String>, 
         let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if matches!(
-            path.extension().and_then(|extension| extension.to_str()),
-            Some("conf" | "ovpn")
-        ) {
+        if is_profile_config_name(file_name) {
             configs.insert(file_name.to_string());
         }
         if file_name.ends_with(".meta.toml") {
@@ -1066,6 +1063,16 @@ fn scan_profile_files(profiles_dir: &Path) -> std::io::Result<(HashSet<String>, 
         }
     }
     Ok((configs, sidecars))
+}
+
+fn is_profile_config_name(file_name: &str) -> bool {
+    !file_name.starts_with('.')
+        && matches!(
+            Path::new(file_name)
+                .extension()
+                .and_then(|extension| extension.to_str()),
+            Some("conf" | "ovpn")
+        )
 }
 
 fn validate_saved_configs_and_sidecars(
@@ -1239,6 +1246,42 @@ mod tests {
         let second_sidecar =
             FsProfileStore::read_sidecar(&tmp.path().join("corp.meta.toml")).unwrap();
         assert_eq!(first_sidecar.profile_id, second_sidecar.profile_id);
+    }
+
+    #[test]
+    fn managed_openvpn_runtime_copy_does_not_change_saved_inventory() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("corp.ovpn"), b"client\n").unwrap();
+        migrate_legacy_profiles(tmp.path()).unwrap();
+        let sidecar = FsProfileStore::read_sidecar(&tmp.path().join("corp.meta.toml")).unwrap();
+        let managed = format!(
+            ".vortix-{}-0000000000000007-bbbbbbbbbbbbbbbb.ovpn",
+            sidecar.profile_id
+        );
+        std::fs::write(tmp.path().join(managed), b"client\n").unwrap();
+
+        let stats = migrate_legacy_profiles(tmp.path()).unwrap();
+
+        assert_eq!(stats.already_migrated, 1);
+    }
+
+    #[test]
+    fn hidden_openvpn_runtime_copy_never_receives_profile_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("corp.ovpn"), b"client\n").unwrap();
+        let managed = ".vortix-1111111111111111111111111111111111111111111111111111111111111111-0000000000000007-bbbbbbbbbbbbbbbb.ovpn";
+        std::fs::write(tmp.path().join(managed), b"client\n").unwrap();
+
+        let stats = migrate_legacy_profiles(tmp.path()).unwrap();
+
+        assert_eq!(stats.created, 1);
+        assert!(!tmp
+            .path()
+            .join(Path::new(managed).with_extension("meta.toml"))
+            .exists());
+        let inventory = read_inventory(&tmp.path().join(INVENTORY_FILE)).unwrap();
+        assert_eq!(inventory.entries.len(), 1);
+        assert_eq!(inventory.entries[0].config_file, "corp.ovpn");
     }
 
     #[test]
