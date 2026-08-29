@@ -130,6 +130,82 @@ fn canonical_snapshot_is_the_only_source_of_renderer_registry_truth() {
         snapshot.tunnels.into_values().collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn scanner_statistics_refresh_registry_without_nudging_egress_telemetry() {
+    use crate::vortix_core::engine::{Connection, Role};
+    use std::sync::mpsc;
+
+    let mut app = test_app();
+    let (nudge_tx, nudge_rx) = mpsc::channel();
+    app.runtime.telemetry_nudge = Some(nudge_tx);
+    set_connected(&mut app, "primary");
+    nudge_rx
+        .try_recv()
+        .expect("initial connection must refresh egress telemetry");
+
+    let profile_id = crate::vortix_core::profile::ProfileId::new("primary");
+    let mut statistics = app.control_snapshot.clone();
+    let tunnel = statistics.tunnels.get_mut(&profile_id).unwrap();
+    let Connection::Connected { details, .. } = &mut tunnel.state else {
+        panic!("test fixture must be connected");
+    };
+    details.transfer_rx = "12.0 MiB".to_string();
+    details.transfer_tx = "3.0 MiB".to_string();
+    statistics.generation += 1;
+
+    app.apply_control_snapshot(statistics);
+
+    assert_eq!(
+        nudge_rx.try_recv(),
+        Err(mpsc::TryRecvError::Empty),
+        "presentation-only transfer counters must not wake public-IP probes"
+    );
+    let rendered = app.registry.snapshot(&profile_id).unwrap();
+    let Connection::Connected { details, .. } = rendered.state else {
+        panic!("renderer projection must remain connected");
+    };
+    assert_eq!(details.transfer_rx, "12.0 MiB");
+
+    let mut new_path = app.control_snapshot.clone();
+    let tunnel = new_path.tunnels.get_mut(&profile_id).unwrap();
+    tunnel.interface_name = Some("utun8".to_string());
+    let Connection::Connected { details, .. } = &mut tunnel.state else {
+        panic!("test fixture must be connected");
+    };
+    details.interface = "utun8".to_string();
+    new_path.generation += 1;
+
+    app.apply_control_snapshot(new_path);
+
+    nudge_rx
+        .try_recv()
+        .expect("an interface change must refresh egress telemetry");
+
+    set_connected(&mut app, "secondary");
+    nudge_rx
+        .try_recv()
+        .expect("a new active tunnel must refresh egress telemetry");
+
+    let mut primary_handoff = app.control_snapshot.clone();
+    primary_handoff.primary = Some(profile_id.clone());
+    primary_handoff.generation += 1;
+    app.apply_control_snapshot(primary_handoff);
+    nudge_rx
+        .try_recv()
+        .expect("a primary handoff must refresh egress telemetry");
+
+    let mut route_change = app.control_snapshot.clone();
+    route_change.tunnels.get_mut(&profile_id).unwrap().role = Role::Primary {
+        allowed_ips: Vec::new(),
+    };
+    route_change.generation += 1;
+    app.apply_control_snapshot(route_change);
+    nudge_rx
+        .try_recv()
+        .expect("an active route-role change must refresh egress telemetry");
+}
+
 fn set_connected(app: &mut App, name: &str) {
     use crate::vortix_core::control::RequestedTunnelState;
     use crate::vortix_core::engine::{Connection, ConnectionHealth, Role, TunnelSnapshot};

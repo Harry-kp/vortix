@@ -7,6 +7,26 @@ use crate::utils;
 use crate::vortix_core::engine::Conflict;
 use crate::vortix_core::profile::ProfileId;
 
+fn active_egress_paths(
+    snapshot: &crate::vortix_core::control::ControlSnapshot,
+) -> impl Iterator<Item = (&ProfileId, &crate::vortix_core::engine::Role, Option<&str>)> {
+    snapshot.tunnels.iter().filter_map(|(profile_id, tunnel)| {
+        matches!(
+            tunnel.state,
+            crate::vortix_core::engine::Connection::Connected { .. }
+                | crate::vortix_core::engine::Connection::Disconnecting { .. }
+        )
+        .then_some((profile_id, &tunnel.role, tunnel.interface_name.as_deref()))
+    })
+}
+
+fn egress_path_changed(
+    current: &crate::vortix_core::control::ControlSnapshot,
+    next: &crate::vortix_core::control::ControlSnapshot,
+) -> bool {
+    current.primary != next.primary || active_egress_paths(current).ne(active_egress_paths(next))
+}
+
 impl App {
     /// Attach the one Standard-mode control owner used for the entire TUI
     /// session and immediately render its current immutable publication.
@@ -189,6 +209,8 @@ impl App {
 
         let tunnel_projection_changed = self.control_snapshot.tunnels != snapshot.tunnels
             || self.control_snapshot.primary != snapshot.primary;
+        let egress_path_changed =
+            tunnel_projection_changed && egress_path_changed(&self.control_snapshot, &snapshot);
         if tunnel_projection_changed {
             self.registry
                 .replace_control_projection(&snapshot.tunnels, snapshot.primary.clone());
@@ -285,7 +307,7 @@ impl App {
             _ => {}
         }
         self.control_snapshot = snapshot;
-        if tunnel_projection_changed {
+        if egress_path_changed {
             self.refresh_telemetry();
         }
     }

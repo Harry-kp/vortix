@@ -8,6 +8,7 @@
 //! updates via an MPSC channel to the main application.
 
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
@@ -72,6 +73,36 @@ pub enum TelemetryUpdate {
     Log(LogLevel, String),
 }
 
+#[derive(Default)]
+struct IpSuccessLog {
+    last_message: Mutex<Option<String>>,
+}
+
+impl IpSuccessLog {
+    fn publish(&self, tx: &Sender<TelemetryUpdate>, message: String) {
+        let mut last_message = self
+            .last_message
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if last_message.as_deref() == Some(message.as_str()) {
+            return;
+        }
+        if tx
+            .send(TelemetryUpdate::Log(LogLevel::Info, message.clone()))
+            .is_ok()
+        {
+            *last_message = Some(message);
+        }
+    }
+
+    fn reset(&self) {
+        *self
+            .last_message
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+}
+
 /// Spawns a background telemetry worker that periodically fetches network information.
 ///
 /// # Returns
@@ -88,9 +119,10 @@ pub fn spawn_telemetry_worker(config: TelemetryConfig) -> (Receiver<TelemetryUpd
     let (tx, rx) = mpsc::channel();
     let (nudge_tx, nudge_rx) = mpsc::channel::<()>();
     let config = std::sync::Arc::new(config);
+    let ip_success_log = std::sync::Arc::new(IpSuccessLog::default());
 
     thread::spawn(move || loop {
-        fetch_ip_and_isp(&tx, &config);
+        fetch_ip_and_isp(&tx, &config, &ip_success_log);
         fetch_latency(&tx, &config);
         fetch_security_info(&tx, &config);
 
@@ -104,9 +136,14 @@ pub fn spawn_telemetry_worker(config: TelemetryConfig) -> (Receiver<TelemetryUpd
 }
 
 /// Fetches public IP address and ISP information with fallback APIs.
-fn fetch_ip_and_isp(tx: &Sender<TelemetryUpdate>, cfg: &std::sync::Arc<TelemetryConfig>) {
+fn fetch_ip_and_isp(
+    tx: &Sender<TelemetryUpdate>,
+    cfg: &std::sync::Arc<TelemetryConfig>,
+    ip_success_log: &std::sync::Arc<IpSuccessLog>,
+) {
     let tx_clone = tx.clone();
     let cfg = std::sync::Arc::clone(cfg);
+    let ip_success_log = std::sync::Arc::clone(ip_success_log);
     thread::spawn(move || {
         // Log start of fetch
         let _ = tx_clone.send(TelemetryUpdate::Log(
@@ -121,15 +158,15 @@ fn fetch_ip_and_isp(tx: &Sender<TelemetryUpdate>, cfg: &std::sync::Arc<Telemetry
         ));
 
         if let Some((ip, isp, loc)) = try_ipinfo_api(&tx_clone, &cfg) {
-            let _ = tx_clone.send(TelemetryUpdate::Log(
-                LogLevel::Info,
+            ip_success_log.publish(
+                &tx_clone,
                 format!(
                     "✓ ipinfo.io: IP={}, ISP={}, Location={}",
                     ip,
-                    isp.as_ref().unwrap_or(&"Unknown".to_string()),
-                    loc.as_ref().unwrap_or(&"Unknown".to_string())
+                    isp.as_deref().unwrap_or("Unknown"),
+                    loc.as_deref().unwrap_or("Unknown")
                 ),
-            ));
+            );
             let _ = tx_clone.send(TelemetryUpdate::PublicIp(ip));
             if let Some(org) = isp {
                 let _ = tx_clone.send(TelemetryUpdate::Isp(org));
@@ -152,10 +189,7 @@ fn fetch_ip_and_isp(tx: &Sender<TelemetryUpdate>, cfg: &std::sync::Arc<Telemetry
         ));
 
         if let Some(ip) = try_ipify_api(&tx_clone, &cfg) {
-            let _ = tx_clone.send(TelemetryUpdate::Log(
-                LogLevel::Info,
-                format!("✓ ipify.org: IP={ip} (no ISP/location)"),
-            ));
+            ip_success_log.publish(&tx_clone, format!("✓ ipify.org: IP={ip} (no ISP/location)"));
             let _ = tx_clone.send(TelemetryUpdate::PublicIp(ip));
             let _ = tx_clone.send(TelemetryUpdate::Isp("Unknown".to_string()));
             let _ = tx_clone.send(TelemetryUpdate::Location("Unknown".to_string()));
@@ -174,10 +208,7 @@ fn fetch_ip_and_isp(tx: &Sender<TelemetryUpdate>, cfg: &std::sync::Arc<Telemetry
         ));
 
         if let Some(ip) = try_icanhazip_api(&tx_clone, &cfg) {
-            let _ = tx_clone.send(TelemetryUpdate::Log(
-                LogLevel::Info,
-                format!("✓ icanhazip.com: IP={ip}"),
-            ));
+            ip_success_log.publish(&tx_clone, format!("✓ icanhazip.com: IP={ip}"));
             let _ = tx_clone.send(TelemetryUpdate::PublicIp(ip));
             let _ = tx_clone.send(TelemetryUpdate::Isp("Unknown".to_string()));
             let _ = tx_clone.send(TelemetryUpdate::Location("Unknown".to_string()));
@@ -191,10 +222,7 @@ fn fetch_ip_and_isp(tx: &Sender<TelemetryUpdate>, cfg: &std::sync::Arc<Telemetry
 
         // Fallback 3: ifconfig.me (IP only)
         if let Some(ip) = try_ifconfig_api(&tx_clone, &cfg) {
-            let _ = tx_clone.send(TelemetryUpdate::Log(
-                LogLevel::Info,
-                format!("✓ ifconfig.me: IP={ip}"),
-            ));
+            ip_success_log.publish(&tx_clone, format!("✓ ifconfig.me: IP={ip}"));
             let _ = tx_clone.send(TelemetryUpdate::PublicIp(ip));
             let _ = tx_clone.send(TelemetryUpdate::Isp("Unknown".to_string()));
             let _ = tx_clone.send(TelemetryUpdate::Location("Unknown".to_string()));
@@ -202,6 +230,7 @@ fn fetch_ip_and_isp(tx: &Sender<TelemetryUpdate>, cfg: &std::sync::Arc<Telemetry
         }
 
         // All APIs failed - report error
+        ip_success_log.reset();
         let _ = tx_clone.send(TelemetryUpdate::Log(
             LogLevel::Error,
             "✗ ALL IP APIs FAILED! Check: 1) Network 2) curl installed 3) VPN routing 4) Firewall"
@@ -580,6 +609,41 @@ fn fetch_security_info(tx: &Sender<TelemetryUpdate>, cfg: &std::sync::Arc<Teleme
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ip_success_log_emits_changes_and_recovery_only_once() {
+        let (tx, rx) = mpsc::channel();
+        let log = IpSuccessLog::default();
+        let message = "✓ ipinfo.io: IP=192.0.2.1, ISP=Example, Location=Test";
+        let changed = "✓ ipinfo.io: IP=192.0.2.2, ISP=Example, Location=Test";
+
+        log.publish(&tx, message.to_string());
+        log.publish(&tx, message.to_string());
+
+        let first_pass = rx.try_iter().collect::<Vec<_>>();
+        assert_eq!(first_pass.len(), 1);
+        assert!(matches!(
+            &first_pass[0],
+            TelemetryUpdate::Log(LogLevel::Info, emitted) if emitted == message
+        ));
+
+        log.publish(&tx, changed.to_string());
+        log.publish(&tx, changed.to_string());
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(TelemetryUpdate::Log(LogLevel::Info, emitted)) if emitted == changed
+        ));
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+
+        log.reset();
+        log.publish(&tx, changed.to_string());
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(TelemetryUpdate::Log(LogLevel::Info, emitted)) if emitted == changed
+        ));
+    }
 
     #[test]
     fn test_extract_json_string_ip() {
