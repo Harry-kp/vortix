@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::vortix_config::profile_store::{
-    acquire_profile_lock, write_atomic, FsProfileStore, Sidecar,
+    acquire_profile_lock, is_profile_config_name, write_atomic, FsProfileStore, Sidecar,
 };
 use crate::vortix_core::profile::{sanitize_profile_name, ProfileId, ProtocolKind};
 
@@ -1063,16 +1063,6 @@ fn scan_profile_files(profiles_dir: &Path) -> std::io::Result<(HashSet<String>, 
         }
     }
     Ok((configs, sidecars))
-}
-
-fn is_profile_config_name(file_name: &str) -> bool {
-    !file_name.starts_with('.')
-        && matches!(
-            Path::new(file_name)
-                .extension()
-                .and_then(|extension| extension.to_str()),
-            Some("conf" | "ovpn")
-        )
 }
 
 fn validate_saved_configs_and_sidecars(
