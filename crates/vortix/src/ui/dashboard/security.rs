@@ -239,21 +239,16 @@ fn audit_row(label: &str, value: &str, sigil: Sigil, inner_width: usize) -> Line
 }
 
 fn push_dns_rows(lines: &mut Vec<Line<'static>>, s: &PanelState, w: usize) {
-    use crate::core::dns_leak::DnsLeakStatus;
+    use crate::core::dns_protection::DnsProtectionStatus;
     let dns_value = format_value_with_tag(&s.dns_server, s.dns_provider);
-    let sigil = match &s.dns_leak {
-        DnsLeakStatus::Leaking { .. } => Sigil::AlarmError,
-        DnsLeakStatus::ProbeFailed => Sigil::NotApplicable,
-        DnsLeakStatus::Protected { .. } | DnsLeakStatus::Unknown => Sigil::OkMuted,
+    let sigil = match s.dns_protection {
+        DnsProtectionStatus::Verified => Sigil::OkMuted,
+        DnsProtectionStatus::Unverified => Sigil::AlarmWarn,
+        DnsProtectionStatus::NotActive => Sigil::NotApplicable,
     };
     lines.push(audit_row("DNS", &dns_value, sigil, w));
-    if let DnsLeakStatus::Leaking {
-        recursor,
-        configured,
-    } = &s.dns_leak
-    {
-        let msg = format!("leaking — queries answered by {recursor}, not configured {configured}");
-        lines.push(alarm_subline(&msg, w));
+    if s.dns_protection == DnsProtectionStatus::Unverified {
+        lines.push(alarm_subline("DNS policy has not been verified", w));
     }
 }
 
@@ -365,7 +360,7 @@ struct PanelState {
     ipv6_status: Ipv6RowStatus,
     dns_server: String,
     dns_provider: Option<&'static str>,
-    dns_leak: crate::core::dns_leak::DnsLeakStatus,
+    dns_protection: crate::core::dns_protection::DnsProtectionStatus,
 
     // Defense
     killswitch_mode: KillSwitchMode,
@@ -504,10 +499,8 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
 /// degraded so the title doesn't claim full protection while a row is red.
 fn verdict_for_protected(app: &App, primary_snap: Option<&TunnelSnapshot>) -> Verdict {
     let ip_leaking = matches!(&app.runtime.real_ip, Some(real) if &app.runtime.public_ip == real);
-    let dns_leaking = matches!(
-        app.runtime.dns_leak,
-        crate::core::dns_leak::DnsLeakStatus::Leaking { .. }
-    );
+    let dns_unverified =
+        app.runtime.dns_protection == crate::core::dns_protection::DnsProtectionStatus::Unverified;
     let ks_alarm = matches!(
         (app.runtime.killswitch_mode, app.runtime.killswitch_state),
         (
@@ -523,7 +516,7 @@ fn verdict_for_protected(app: &App, primary_snap: Option<&TunnelSnapshot>) -> Ve
         CipherStrength::Insecure
     );
 
-    if ip_leaking || dns_leaking || ks_alarm || cipher_insecure {
+    if ip_leaking || dns_unverified || ks_alarm || cipher_insecure {
         Verdict::Partial
     } else {
         Verdict::Protected
@@ -617,7 +610,7 @@ fn collect_protected_state(
         ipv6_status: derive_ipv6_row_status(app),
         dns_server: app.runtime.dns_server.clone(),
         dns_provider,
-        dns_leak: app.runtime.dns_leak.clone(),
+        dns_protection: app.runtime.dns_protection,
         killswitch_mode: app.runtime.killswitch_mode,
         killswitch_state: app.runtime.killswitch_state,
         encryption,
@@ -649,7 +642,7 @@ fn collect_partial_state(
     };
 
     // When a primary IS present (Partial fired from a degraded-defense
-    // signal — killswitch off, weak cipher, IP/DNS leak), the IP row
+    // signal — killswitch off, weak cipher, IP leak, or unverified DNS), the IP row
     // should reflect the real exit IP, just like Protected does. Only
     // when no primary owns the default route does "split-route — no
     // exit" become the truthful rendering.
@@ -695,7 +688,7 @@ fn collect_partial_state(
         ipv6_status: derive_ipv6_row_status(app),
         dns_server: app.runtime.dns_server.clone(),
         dns_provider: dns_provider_label(&app.runtime.dns_server),
-        dns_leak: app.runtime.dns_leak.clone(),
+        dns_protection: app.runtime.dns_protection,
         killswitch_mode: app.runtime.killswitch_mode,
         killswitch_state: app.runtime.killswitch_state,
         encryption,
@@ -1163,10 +1156,7 @@ mod tests {
             ipv6_status: Ipv6RowStatus::Absent,
             dns_server: "1.1.1.1".to_string(),
             dns_provider: Some("Cloudflare"),
-            dns_leak: crate::core::dns_leak::DnsLeakStatus::Protected {
-                recursor: "1.1.1.1".parse().unwrap(),
-                configured: "1.1.1.1".parse().unwrap(),
-            },
+            dns_protection: crate::core::dns_protection::DnsProtectionStatus::Verified,
             killswitch_mode: KillSwitchMode::AlwaysOn,
             killswitch_state: KillSwitchState::Blocking,
             encryption: "ChaCha20-Poly1305".to_string(),
@@ -1393,13 +1383,10 @@ mod tests {
     }
 
     #[test]
-    fn protected_dns_leak_brightens_dns_sigil_and_adds_subline() {
-        use crate::core::dns_leak::DnsLeakStatus;
+    fn unverified_dns_policy_warns_without_claiming_a_leak() {
+        use crate::core::dns_protection::DnsProtectionStatus;
         let mut s = baseline_protected_state(40);
-        s.dns_leak = DnsLeakStatus::Leaking {
-            configured: "1.1.1.1".parse().unwrap(),
-            recursor: "218.248.42.7".parse().unwrap(),
-        };
+        s.dns_protection = DnsProtectionStatus::Unverified;
         let lines = build_protected_audit(&s);
 
         let dns_idx = lines
@@ -1408,20 +1395,21 @@ mod tests {
             .expect("DNS row missing");
         let dns_sigil = lines[dns_idx].spans.last().expect("non-empty DNS row");
         assert!(
-            dns_sigil.content.trim_end() == "✗",
-            "leaking DNS sigil must be ✗ (got {:?})",
+            dns_sigil.content.trim_end() == "⚠",
+            "unverified DNS sigil must be a warning (got {:?})",
             dns_sigil.content
         );
         assert!(
             dns_sigil.style.add_modifier.contains(Modifier::BOLD),
-            "leaking DNS sigil must be BOLD"
+            "unverified DNS sigil must be BOLD"
         );
 
         let subline_text = line_text(&lines[dns_idx + 1]);
         assert!(
-            subline_text.contains("leaking"),
-            "leaking DNS must render an alarm sub-line (got {subline_text:?})"
+            subline_text.contains("DNS policy"),
+            "unverified DNS must render an explanatory sub-line (got {subline_text:?})"
         );
+        assert!(!subline_text.contains("leak"));
 
         // Exit IP row stays calm.
         let ip_idx = lines
@@ -1431,7 +1419,7 @@ mod tests {
         for span in &lines[ip_idx].spans {
             assert!(
                 !span.style.add_modifier.contains(Modifier::BOLD),
-                "Exit IP row must stay muted while DNS alarms: {:?}",
+                "Exit IP row must stay muted while DNS warns: {:?}",
                 span.content
             );
         }

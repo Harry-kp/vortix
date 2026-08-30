@@ -466,6 +466,38 @@ pub fn remote_stop(identity: &ManagedProcessId) -> Result<(), CustodianError> {
     )))
 }
 
+/// Stop an attempt for which the caller still owns the original handshake.
+///
+/// A short-lived protocol child can exit and let its custodian remove the
+/// receipt before startup polling observes the failure. In that case the
+/// handshake's process-group identity lets the startup owner prove exact
+/// absence instead of misclassifying the already-clean attempt as ambiguous.
+pub(crate) fn remote_stop_after_startup(
+    handshake: &CustodianHandshake,
+) -> Result<(), CustodianError> {
+    match load_receipt(&handshake.identity.profile_id)? {
+        Some(receipt) if constant_time_identity_eq(&receipt.identity, &handshake.identity) => {
+            remote_stop(&handshake.identity)
+        }
+        Some(_) => Err(CustodianError::NotOwned),
+        None => {
+            let deadline = Instant::now() + IPC_TIMEOUT;
+            while Instant::now() < deadline {
+                if !socket_path(&handshake.identity).exists()
+                    && process_group_absent(handshake.pid)?
+                {
+                    return Ok(());
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            Err(CustodianError::Ambiguous(
+                "startup receipt disappeared but exact socket/process-group absence was not proven"
+                    .into(),
+            ))
+        }
+    }
+}
+
 fn process_group_absent(pid: u32) -> Result<bool, CustodianError> {
     Ok(!crate::vortix_process::real::process_group_has_live_members(pid)?)
 }

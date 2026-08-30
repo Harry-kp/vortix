@@ -1068,7 +1068,7 @@ impl Tunnel for OvpnTunnel {
             })();
             let _ = std::fs::remove_file(&sock_path);
             if let Err(error) = mgmt_result {
-                return Err(cleanup_startup_failure(&ownership_id, error));
+                return Err(cleanup_startup_failure(&handshake, error));
             }
         }
 
@@ -1131,13 +1131,13 @@ impl Tunnel for OvpnTunnel {
                 generation: ownership_id.generation,
                 handshake: None,
                 probe_receipts: Vec::new(),
-                process_ownership: Some(handshake.identity),
+                process_ownership: Some(handshake.identity.clone()),
                 teardown_config: None,
                 dns_request,
                 openvpn_routes,
             })
         })();
-        startup.map_err(|error| cleanup_startup_failure(&ownership_id, error))
+        startup.map_err(|error| cleanup_startup_failure(&handshake, error))
     }
 
     fn down(&mut self, handle: TunnelHandle) -> Result<(), TunnelError> {
@@ -1223,12 +1223,15 @@ impl Tunnel for OvpnTunnel {
     }
 }
 
-fn cleanup_startup_failure(identity: &ManagedProcessId, startup: TunnelError) -> TunnelError {
-    match crate::vortix_process::stop_managed_foreground(identity) {
+fn cleanup_startup_failure(
+    handshake: &crate::vortix_process::CustodianHandshake,
+    startup: TunnelError,
+) -> TunnelError {
+    match crate::vortix_process::stop_failed_managed_foreground_startup(handshake) {
         Ok(()) => startup,
         Err(teardown) => TunnelError::Subprocess(format!(
             "{startup}; OpenVPN startup teardown failed and ownership is ambiguous for generation {}: {teardown}",
-            identity.generation
+            handshake.identity.generation
         )),
     }
 }
@@ -1678,7 +1681,7 @@ mod tests {
             );
         }
 
-        let safe = "client\nsetenv opt block-outside-dns\n";
+        let safe = "client\nsetenv opt block-outside-dns\nmssfix 1300 mtu\n";
         assert_eq!(sanitize_managed_config(safe).unwrap(), safe);
     }
 

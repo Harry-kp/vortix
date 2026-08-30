@@ -1056,6 +1056,13 @@ fn operation_failure(
             ExitCode::GeneralError,
             format!("WireGuard handshake failed for operation {operation}"),
         ),
+        (_, Some(OperationResult::Failed(OperationFailure::AuthenticationFailed))) => (
+            "authentication_failed",
+            ExitCode::GeneralError,
+            format!(
+                "The VPN server rejected this profile's authentication for operation {operation}"
+            ),
+        ),
         (OperationStatus::Cancelled, _) | (_, Some(OperationResult::Cancelled)) => (
             "user_cancelled",
             ExitCode::GeneralError,

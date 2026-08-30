@@ -190,11 +190,11 @@ const GUARD_GLOSSARY: &[(&str, &str)] = &[
     ),
     (
         "PARTIAL",
-        "At least one tunnel is Connected, but none owns the default route (split-only topology), OR a primary IS up but a defense row is degraded (killswitch off, cipher weak, DNS leak). Declared subnets tunnel correctly; general internet traffic posture depends on which signal demoted the panel.",
+        "At least one tunnel is Connected, but none owns the default route (split-only topology), OR a primary IS up but a defense row is degraded (killswitch off, cipher weak, or DNS policy not verified). Declared subnets tunnel correctly; general internet traffic posture depends on which signal demoted the panel.",
     ),
     (
         "PROTECTED",
-        "A tunnel owns your kernel default route, the cipher is modern AEAD, killswitch is engaged, and neither IP nor DNS is leaking. New outbound connections flow through the tunnel. This is the goal state for a full-tunnel VPN.",
+        "A tunnel owns your kernel default route, the cipher is modern AEAD, the kill switch is engaged, and the current DNS policy has been applied and read back. New outbound connections flow through the tunnel. This is the goal state for a full-tunnel VPN.",
     ),
     (
         "Identity → Real IPv4 / Real IPv6",
@@ -210,7 +210,7 @@ const GUARD_GLOSSARY: &[(&str, &str)] = &[
     ),
     (
         "Identity → DNS",
-        "Configured resolver IP with the provider tag inlined when recognised (Cloudflare/Google/Quad9/OpenDNS). The ✓/✗ verdict is a recursor-IP echo probe: vortix resolves `o-o.myaddr.l.google.com` TXT through the configured DNS, and Google's authoritative server returns the IP of the recursor that actually walked the chain. If the recursor IP is in the same provider as the configured DNS → ✓ Protected (the resolver you set IS the one answering). If it's a different provider → ✗ leaking, sub-line names the foreign recursor (e.g. `leaking — queries answered by 208.67.222.222, not configured 9.9.9.9`). This is the same mechanism dnsleaktest.com and ipleak.net use.",
+        "Configured resolver IP with the provider tag inlined when recognised (Cloudflare/Google/Quad9/OpenDNS). ✓ means the canonical control owner applied the exact current-generation DNS policy and read it back from the operating system. ⚠ means that readback is absent or stale. Vortix does not label a different recursive-server egress address as a leak: private DNS forwarders normally recurse through another public address, so that comparison is not proof of a bypass.",
     ),
     (
         "Defense → Killswitch",

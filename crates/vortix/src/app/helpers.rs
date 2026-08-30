@@ -104,30 +104,6 @@ impl App {
             },
         }
     }
-    /// Off-thread DNS leak probe (3s UDP timeout). Result returns via
-    /// `TelemetryUpdate::DnsLeak`. See [`crate::core::dns_leak`].
-    pub(crate) fn spawn_dns_leak_probe(&self) {
-        use crate::core::dns_leak::DnsLeakStatus;
-        if self.registry.primary().is_none() {
-            let _ = self.runtime.cmd_tx.send(crate::message::Message::Telemetry(
-                crate::core::telemetry::TelemetryUpdate::DnsLeak(DnsLeakStatus::Unknown),
-            ));
-            return;
-        }
-        let configured = self
-            .runtime
-            .dns_server
-            .split([',', ' '])
-            .find_map(|s| s.trim().parse::<std::net::IpAddr>().ok());
-        let tx = self.runtime.cmd_tx.clone();
-        std::thread::spawn(move || {
-            let status = crate::core::dns_leak::check(configured);
-            let _ = tx.send(crate::message::Message::Telemetry(
-                crate::core::telemetry::TelemetryUpdate::DnsLeak(status),
-            ));
-        });
-    }
-
     /// Whether the registry currently has at least one Connected tunnel.
     #[must_use]
     pub(crate) fn has_active_connection(&self) -> bool {

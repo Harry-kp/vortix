@@ -2399,6 +2399,64 @@ fn drive_supervision(
                         ),
                     });
                 }
+            } else if result.result == Err(WorkFailure::AuthenticationFailed) {
+                let rollback_profiles = snapshot
+                    .operations
+                    .get(&result.operation_id)
+                    .and_then(|operation| operation_intent_tunnels(&operation.intent))
+                    .map_or_else(
+                        || vec![result.profile_id.clone()],
+                        |tunnels| {
+                            tunnels
+                                .iter()
+                                .filter(|(_, requested)| {
+                                    **requested == RequestedTunnelState::Connected
+                                })
+                                .map(|(profile_id, _)| profile_id.clone())
+                                .collect::<Vec<_>>()
+                        },
+                    );
+                let retired = result.mutation == TunnelMutation::Connect
+                    && supervisor
+                        .retire_definitive_connect_failure(
+                            &result.profile_id,
+                            &result.revision,
+                            &result.operation_id,
+                        )
+                        .is_ok();
+                if retired {
+                    let completion = complete_operation(
+                        OperationCompletion {
+                            operation_id: result.operation_id.clone(),
+                            desired_generation: result.revision.generation,
+                            outcome: CompletionOutcome::Failed(
+                                OperationFailure::AuthenticationFailed,
+                            ),
+                        },
+                        snapshot,
+                        owner,
+                        admission,
+                        now,
+                        config,
+                        events,
+                    );
+                    if matches!(completion, Ok(CompletionResult::Terminal(_))) {
+                        rollback_connect_intent(&rollback_profiles, snapshot, owner, now, events);
+                    }
+                } else {
+                    fail_tunnel_dispatch_operation(
+                        &result.operation_id,
+                        result.revision.generation,
+                        WorkFailure::AuthenticationFailed,
+                        snapshot,
+                        owner,
+                        admission,
+                        now,
+                        selection,
+                        config,
+                        events,
+                    );
+                }
             } else if result.result == Err(WorkFailure::ChallengeFailed) {
                 let rollback_profiles = snapshot
                     .operations
@@ -2432,13 +2490,7 @@ fn drive_supervision(
                     events,
                 );
                 if matches!(completion, Ok(CompletionResult::Terminal(_))) {
-                    rollback_interactive_connect_intent(
-                        &rollback_profiles,
-                        snapshot,
-                        owner,
-                        now,
-                        events,
-                    );
+                    rollback_connect_intent(&rollback_profiles, snapshot, owner, now, events);
                 }
             } else if wireguard_handshake_failure {
                 let was_recovery = owner.recovery_operations.contains(&result.operation_id);
@@ -2498,7 +2550,7 @@ fn drive_supervision(
                     .get(&result.operation_id)
                     .map(|operation| interactive_connected_profiles(operation, config))
                     .unwrap_or_default();
-                if result.mutation == TunnelMutation::Connect
+                let retired = result.mutation == TunnelMutation::Connect
                     && !rollback_profiles.is_empty()
                     && supervisor
                         .retire_definitive_connect_failure(
@@ -2506,8 +2558,8 @@ fn drive_supervision(
                             &result.revision,
                             &result.operation_id,
                         )
-                        .is_ok()
-                {
+                        .is_ok();
+                if retired {
                     let completion = complete_operation(
                         OperationCompletion {
                             operation_id: result.operation_id.clone(),
@@ -2522,13 +2574,7 @@ fn drive_supervision(
                         events,
                     );
                     if matches!(completion, Ok(CompletionResult::Terminal(_))) {
-                        rollback_interactive_connect_intent(
-                            &rollback_profiles,
-                            snapshot,
-                            owner,
-                            now,
-                            events,
-                        );
+                        rollback_connect_intent(&rollback_profiles, snapshot, owner, now, events);
                     }
                 }
             }
@@ -3312,7 +3358,7 @@ fn drive_supervision(
     }
 }
 
-fn rollback_interactive_connect_intent(
+fn rollback_connect_intent(
     profiles: &[ProfileId],
     snapshot: &mut ControlSnapshot,
     owner: &mut OwnerState,
@@ -3514,6 +3560,7 @@ const fn operation_failure_for_work(failure: WorkFailure) -> OperationFailure {
     match failure {
         WorkFailure::TimedOut => OperationFailure::Timeout,
         WorkFailure::Busy | WorkFailure::RouteConflict => OperationFailure::Rejected,
+        WorkFailure::AuthenticationFailed => OperationFailure::AuthenticationFailed,
         WorkFailure::Cancelled
         | WorkFailure::Panicked
         | WorkFailure::EffectFailed
@@ -5344,7 +5391,7 @@ fn complete_operation(
             now,
             events,
         );
-        rollback_interactive_connect_intent(&interactive_profiles, snapshot, owner, now, events);
+        rollback_connect_intent(&interactive_profiles, snapshot, owner, now, events);
         return Err(CompletionError::DeadlineExpired);
     }
     if completion.desired_generation != record.desired_generation {
@@ -5487,13 +5534,7 @@ fn expire_operations(
         };
         let interactive_profiles = interactive_connected_profiles(&expired_record, config);
         if !interactive_profiles.is_empty() {
-            rollback_interactive_connect_intent(
-                &interactive_profiles,
-                snapshot,
-                owner,
-                now,
-                events,
-            );
+            rollback_connect_intent(&interactive_profiles, snapshot, owner, now, events);
             continue;
         }
         if selection != ExecutionSelection::CanonicalAuthority

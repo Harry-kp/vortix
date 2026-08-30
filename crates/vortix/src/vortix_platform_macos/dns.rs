@@ -41,9 +41,6 @@ const VORTIX_PRIMARY_DNS_BACKUP_KEY: &str = "State:/Network/Service/vortix/DnsBa
 const VORTIX_PRIMARY_DNS_OWNER_KEY: &str = "State:/Network/Service/vortix/DnsOwner";
 const VORTIX_PRIMARY_DNS_RESOURCE_ID: &str = "macos:system-configuration:primary-dns";
 const MAX_DYNAMIC_STORE_VALUE_BYTES: usize = 128 * 1024;
-const MANAGED_DNS_PREFERENCES_DOMAIN: &str = "com.apple.dnsSettings.managed";
-const MANAGED_DNS_SETTINGS_KEY: &str = "DNSSettings";
-const MANAGED_DNS_PROTOCOL_KEY: &str = "DNSProtocol";
 
 /// macOS DNS resolution via `SCDynamicStore` + `/etc/resolv.conf`.
 pub struct MacDns;
@@ -99,16 +96,8 @@ pub struct MacDnsPolicy {
     resolver_dir: std::path::PathBuf,
     expected_owner_uid: u32,
     dynamic_store: MacDynamicStore,
-    managed_dns: ManagedDnsSource,
     #[cfg(test)]
     fail_readback_at: Option<usize>,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum ManagedDnsSource {
-    SystemPreferences,
-    #[cfg(test)]
-    Fixed(bool),
 }
 
 #[derive(Debug, Clone)]
@@ -116,78 +105,6 @@ enum MacDynamicStore {
     System,
     #[cfg(test)]
     Memory(std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>>),
-}
-
-#[allow(
-    unsafe_code,
-    reason = "CoreFoundation exposes managed preference ownership through its C API"
-)]
-#[link(name = "CoreFoundation", kind = "framework")]
-unsafe extern "C" {
-    fn CFPreferencesAppValueIsForced(
-        key: *const std::ffi::c_void,
-        application_id: *const std::ffi::c_void,
-    ) -> u8;
-    fn CFPreferencesCopyAppValue(
-        key: *const std::ffi::c_void,
-        application_id: *const std::ffi::c_void,
-    ) -> *const std::ffi::c_void;
-}
-
-impl ManagedDnsSource {
-    fn forced_encrypted_dns(self) -> Result<bool, String> {
-        match self {
-            Self::SystemPreferences => system_forced_encrypted_dns(),
-            #[cfg(test)]
-            Self::Fixed(value) => Ok(value),
-        }
-    }
-}
-
-#[allow(
-    unsafe_code,
-    reason = "the copied CoreFoundation preference is transferred into a retained safe wrapper"
-)]
-fn system_forced_encrypted_dns() -> Result<bool, String> {
-    let key = CFString::new(MANAGED_DNS_SETTINGS_KEY);
-    let domain = CFString::new(MANAGED_DNS_PREFERENCES_DOMAIN);
-    // SAFETY: both pointers are retained CFStrings for the duration of each
-    // CoreFoundation call.
-    let forced = unsafe { CFPreferencesAppValueIsForced(key.to_void(), domain.to_void()) != 0 };
-    if !forced {
-        return Ok(false);
-    }
-    // SAFETY: CopyAppValue follows the create rule. A non-null result is one
-    // owned property-list reference transferred into the safe wrapper.
-    let raw = unsafe { CFPreferencesCopyAppValue(key.to_void(), domain.to_void()) };
-    if raw.is_null() {
-        return Err("managed DNS ownership is forced but its settings are unavailable".into());
-    }
-    let settings = unsafe { CFPropertyList::wrap_under_create_rule(raw.cast()) };
-    managed_dns_protocol(&settings).map(|protocol| {
-        protocol.eq_ignore_ascii_case("HTTPS") || protocol.eq_ignore_ascii_case("TLS")
-    })
-}
-
-#[allow(
-    unsafe_code,
-    reason = "the typed wrapper validates a value borrowed from a CoreFoundation dictionary"
-)]
-fn managed_dns_protocol(settings: &CFPropertyList) -> Result<String, String> {
-    let dictionary = settings
-        .clone()
-        .downcast_into::<CFDictionary>()
-        .ok_or_else(|| "managed DNS settings are not a dictionary".to_string())?;
-    let key = CFString::new(MANAGED_DNS_PROTOCOL_KEY);
-    let value = dictionary
-        .find(key.to_void())
-        .ok_or_else(|| "managed DNS settings have no DNSProtocol".to_string())?;
-    // SAFETY: the dictionary retains the borrowed value while the wrapper is
-    // constructed, and downcast validates that it is a CFString.
-    unsafe { CFPropertyList::wrap_under_get_rule((*value).cast()) }
-        .downcast_into::<CFString>()
-        .map(|value| value.to_string())
-        .ok_or_else(|| "managed DNS protocol is not a string".to_string())
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -497,7 +414,6 @@ impl MacDnsPolicy {
             resolver_dir: std::path::PathBuf::from("/private/etc/resolver"),
             expected_owner_uid: 0,
             dynamic_store: MacDynamicStore::System,
-            managed_dns: ManagedDnsSource::SystemPreferences,
             #[cfg(test)]
             fail_readback_at: None,
         }
@@ -510,16 +426,8 @@ impl MacDnsPolicy {
             resolver_dir,
             expected_owner_uid: crate::utils::effective_user_group_ids().0,
             dynamic_store: MacDynamicStore::memory(),
-            managed_dns: ManagedDnsSource::Fixed(false),
             fail_readback_at: None,
         }
-    }
-
-    #[cfg(test)]
-    fn at_with_managed_encrypted_dns(resolver_dir: std::path::PathBuf) -> Self {
-        let mut policy = Self::at(resolver_dir);
-        policy.managed_dns = ManagedDnsSource::Fixed(true);
-        policy
     }
 
     #[cfg(test)]
@@ -529,21 +437,7 @@ impl MacDnsPolicy {
             resolver_dir,
             expected_owner_uid: crate::utils::effective_user_group_ids().0,
             dynamic_store: MacDynamicStore::memory(),
-            managed_dns: ManagedDnsSource::Fixed(false),
             fail_readback_at: Some(write_number),
-        }
-    }
-
-    fn ensure_catch_all_dns_is_available(&self) -> Result<(), String> {
-        match self.managed_dns.forced_encrypted_dns() {
-            Ok(false) => Ok(()),
-            Ok(true) => Err(
-                "macOS managed encrypted DNS owns system resolution; refusing catch-all DNS because overriding device-management policy can leave networking unusable"
-                    .to_string(),
-            ),
-            Err(error) => Err(format!(
-                "cannot prove macOS managed DNS ownership before applying catch-all DNS: {error}"
-            )),
         }
     }
 
@@ -1312,17 +1206,6 @@ impl DnsPolicyAdapter for MacDnsPolicy {
                 };
             }
         };
-        if desired_primary.is_some() {
-            if let Err(error) = self.ensure_catch_all_dns_is_available() {
-                return DnsEffectiveState {
-                    requested_generation: desired.generation,
-                    applied_generation: previous_effective.applied_generation,
-                    status: DnsEffectiveStatus::Degraded,
-                    owned: self.actual_owned(&previous_effective.owned),
-                    errors: vec![error],
-                };
-            }
-        }
         let planned = match self.plan(desired) {
             Ok(planned) => planned,
             Err(error) => {
@@ -1498,9 +1381,6 @@ impl DnsPolicyAdapter for MacDnsPolicy {
         }
         match Self::primary_assignment(desired) {
             Ok(Some(primary)) => {
-                if let Err(error) = self.ensure_catch_all_dns_is_available() {
-                    errors.push(error);
-                }
                 if let Err(error) = self.verify_primary(desired.generation, primary) {
                     errors.push(error);
                 }
@@ -2108,24 +1988,6 @@ mod policy_tests {
         assert!(!temp.path().join("resolver/default").exists());
         let repeated_release = adapter.apply(&released_policy, Some(&released_policy), &released);
         assert_eq!(repeated_release.status, DnsEffectiveStatus::Released);
-    }
-
-    #[test]
-    fn managed_encrypted_dns_refuses_catch_all_before_mutating_primary_dns() {
-        let temp = tempfile::tempdir().unwrap();
-        let adapter = MacDnsPolicy::at_with_managed_encrypted_dns(temp.path().join("resolver"));
-        let original = adapter.test_primary_dns_servers();
-
-        let effective = adapter.apply(&policy(1, "10.80.0.1"), None, &DnsEffectiveState::default());
-
-        assert_eq!(effective.status, DnsEffectiveStatus::Degraded);
-        assert!(effective.owned.is_empty());
-        assert!(effective.errors.iter().any(|error| {
-            error.contains("managed encrypted DNS") && error.contains("refusing catch-all DNS")
-        }));
-        assert_eq!(adapter.test_primary_dns_servers(), original);
-        assert!(adapter.primary_owner_state().unwrap().is_none());
-        assert!(adapter.primary_backup_state().unwrap().is_none());
     }
 
     #[test]

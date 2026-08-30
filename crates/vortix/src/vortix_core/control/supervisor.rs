@@ -455,7 +455,12 @@ impl Supervisor {
             entry.revision == *revision
                 && entry.operation_id == *operation_id
                 && entry.mutation == TunnelMutation::Connect
-                && entry.truth == SupervisedTruth::Degraded(WorkFailure::EffectFailed)
+                && matches!(
+                    entry.truth,
+                    SupervisedTruth::Degraded(
+                        WorkFailure::EffectFailed | WorkFailure::AuthenticationFailed
+                    )
+                )
         });
         if !exact {
             return Err(WorkFailure::Stale);

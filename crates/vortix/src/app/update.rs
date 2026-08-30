@@ -801,21 +801,7 @@ impl App {
                     self.log(&format!("SEC: DNS server: {dns}"));
                 }
                 self.runtime.dns_server = dns;
-                self.spawn_dns_leak_probe();
                 self.runtime.last_security_check = Some(Instant::now());
-            }
-            TelemetryUpdate::DnsLeak(status) => {
-                use crate::core::dns_leak::DnsLeakStatus;
-                if let DnsLeakStatus::Leaking {
-                    recursor,
-                    configured,
-                } = &status
-                {
-                    self.log(&format!(
-                        "WARN: DNS leak — recursor {recursor} answered, expected {configured}"
-                    ));
-                }
-                self.runtime.dns_leak = status;
             }
             TelemetryUpdate::PublicIpv6(observed) => {
                 let is_connected = self.has_active_connection();

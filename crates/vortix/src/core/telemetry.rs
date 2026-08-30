@@ -79,7 +79,6 @@ pub enum TelemetryUpdate {
     Dns(String),
     /// Public IPv6 observed by the probe, `None` if unreachable.
     PublicIpv6(Option<String>),
-    DnsLeak(crate::core::dns_leak::DnsLeakStatus),
     /// Log message with level for production logging (uses centralized logger)
     Log(LogLevel, String),
 }

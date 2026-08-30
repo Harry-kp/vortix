@@ -889,6 +889,8 @@ impl crate::vortix_core::control::worker::TunnelExecutor for CanonicalTunnelExec
             || error.contains("ambiguous-owned")
         {
             WorkFailure::OutcomeUnknown
+        } else if error.starts_with("authentication failed:") {
+            WorkFailure::AuthenticationFailed
         } else if error.contains("interactive challenge") {
             WorkFailure::ChallengeFailed
         } else if error.contains("panicked") {
@@ -1261,6 +1263,10 @@ mod canonical_tests {
             executor
                 .classify_failure("OpenVPN startup teardown is ambiguous-owned for generation 7"),
             WorkFailure::OutcomeUnknown
+        );
+        assert_eq!(
+            executor.classify_failure("authentication failed: AUTH_FAILED"),
+            WorkFailure::AuthenticationFailed
         );
     }
 

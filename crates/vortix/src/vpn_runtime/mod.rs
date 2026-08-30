@@ -90,7 +90,7 @@ pub struct VpnRuntime {
     pub location: String,
     pub isp: String,
     pub dns_server: String,
-    pub dns_leak: crate::core::dns_leak::DnsLeakStatus,
+    pub dns_protection: crate::core::dns_protection::DnsProtectionStatus,
 
     // === System Info ===
     pub public_ip: String,
@@ -183,7 +183,7 @@ impl VpnRuntime {
             location: constants::MSG_DETECTING.to_string(),
             isp: constants::MSG_DETECTING.to_string(),
             dns_server: constants::MSG_DETECTING.to_string(),
-            dns_leak: crate::core::dns_leak::DnsLeakStatus::Unknown,
+            dns_protection: crate::core::dns_protection::DnsProtectionStatus::NotActive,
 
             public_ip: constants::MSG_DETECTING.to_string(),
             real_ip: None,
@@ -279,7 +279,7 @@ impl VpnRuntime {
             location: String::new(),
             isp: String::new(),
             dns_server: String::new(),
-            dns_leak: crate::core::dns_leak::DnsLeakStatus::Unknown,
+            dns_protection: crate::core::dns_protection::DnsProtectionStatus::NotActive,
 
             public_ip: String::new(),
             real_ip: None,
@@ -354,7 +354,7 @@ impl VpnRuntime {
             location: String::new(),
             isp: String::new(),
             dns_server: String::new(),
-            dns_leak: crate::core::dns_leak::DnsLeakStatus::Unknown,
+            dns_protection: crate::core::dns_protection::DnsProtectionStatus::NotActive,
             public_ip: String::new(),
             real_ip: None,
             public_ipv6: None,

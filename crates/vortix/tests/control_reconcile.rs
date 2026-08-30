@@ -4347,3 +4347,83 @@ async fn cleaned_wireguard_connect_timeout_is_a_terminal_handshake_failure() {
         tokio::task::yield_now().await;
     }
 }
+
+#[tokio::test]
+async fn definitive_openvpn_auth_failure_terminalizes_and_rolls_back_connect_intent() {
+    struct AuthenticationRejected;
+    impl TunnelExecutor for AuthenticationRejected {
+        fn execute(
+            &self,
+            _: &TunnelWork,
+            _: &CancellationToken,
+        ) -> Result<TunnelExecutionReceipt, String> {
+            Err("authentication failed: AUTH_FAILED".into())
+        }
+
+        fn classify_failure(&self, _: &str) -> WorkFailure {
+            WorkFailure::AuthenticationFailed
+        }
+    }
+
+    let target = profile("openvpn-auth-terminal");
+    let service = ControlService::start_supervised(
+        ControlServiceConfig {
+            authority_epoch: AuthorityEpoch(1),
+            known_profiles: BTreeSet::from([target.clone()]),
+            profile_topologies: BTreeMap::from([(
+                target.clone(),
+                ProfileTopology {
+                    protocol: Some(ProtocolKind::OpenVpn),
+                    ..ProfileTopology::default()
+                },
+            )]),
+            freshness_poll_interval: Duration::from_millis(5),
+            ..ControlServiceConfig::default()
+        },
+        Arc::new(TestClock::default()),
+        ExecutionSelection::CanonicalAuthority,
+        Arc::new(Supervisor::new(
+            AuthorityEpoch(1),
+            Arc::new(AuthenticationRejected),
+            Arc::new(OkPolicy),
+            2,
+            4,
+        )),
+    );
+    let admitted = service
+        .client()
+        .submit(CommandRequest {
+            command: UserCommand::Connect {
+                profile_id: target.clone(),
+                conflict_acknowledgement: None,
+            },
+            idempotency_key: IdempotencyKey::new("openvpn-auth-terminal"),
+            deadline: Deadline(1_000),
+        })
+        .await
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        let snapshot = service.client().snapshot();
+        let operation = &snapshot.operations[&admitted.operation_id];
+        if operation.status.is_terminal() {
+            assert_eq!(
+                operation.result,
+                Some(vortix::vortix_core::control::OperationResult::Failed(
+                    vortix::vortix_core::control::OperationFailure::AuthenticationFailed
+                ))
+            );
+            assert_eq!(
+                snapshot.desired.tunnels.get(&target),
+                Some(&RequestedTunnelState::Disconnected)
+            );
+            assert!(!snapshot.operations.values().any(|operation| {
+                operation.id != admitted.operation_id && !operation.status.is_terminal()
+            }));
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::task::yield_now().await;
+    }
+}

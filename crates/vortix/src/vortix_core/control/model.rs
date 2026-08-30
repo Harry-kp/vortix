@@ -384,6 +384,8 @@ pub enum OperationStatus {
 pub enum OperationFailure {
     Timeout,
     Rejected,
+    /// The VPN server definitively rejected this profile's authentication.
+    AuthenticationFailed,
     /// System DNS ownership could not be established, so the control owner
     /// restored the prior topology instead of leaving networking unusable.
     DnsPolicyFailed,

@@ -69,6 +69,8 @@ pub enum WorkFailure {
     Cancelled,
     Panicked,
     EffectFailed,
+    /// The VPN server definitively rejected the profile's authentication.
+    AuthenticationFailed,
     /// `WireGuard` connect returned without exact current-generation peer proof.
     HandshakeFailed,
     /// An interactive credential was not delivered to the admitted operation.

@@ -560,7 +560,7 @@ fn real_tunnel_scoped_custodians_handoff_authenticate_and_contain_groups() {
 
     // Natural exit releases the exact receipt and permits reconnect.
     let natural = real_identity('e');
-    vortix::vortix_process::start_managed_foreground(
+    let natural_handshake = vortix::vortix_process::start_managed_foreground(
         natural.clone(),
         CommandSpec::oneshot("/bin/sleep", vec!["1".into()]),
         Vec::new(),
@@ -580,6 +580,8 @@ fn real_tunnel_scoped_custodians_handoff_authenticate_and_contain_groups() {
             .unwrap()
             .is_none()
     );
+    vortix::vortix_process::stop_failed_managed_foreground_startup(&natural_handshake)
+        .expect("the startup owner can prove an already-clean natural exit");
 
     // Spawn failure is fully cleaned and does not poison a later attempt.
     let failed = real_identity('f');

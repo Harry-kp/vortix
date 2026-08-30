@@ -28,13 +28,24 @@ impl PendingControlSubject {
     const fn dns_failure_message(self) -> &'static str {
         match self {
             Self::Connection | Self::Reconnection => {
-                "Couldn't connect safely. This VPN's DNS settings conflict with your system settings, so Vortix disconnected and restored your previous connection."
+                "Couldn't finish connecting because the VPN's DNS settings could not be applied safely. Vortix disconnected and restored your previous connection."
             }
             Self::Disconnection => {
                 "Couldn't finish disconnecting safely because your system rejected the network change. Vortix restored your previous connection."
             }
             Self::KillSwitch => {
                 "Couldn't change the kill switch safely because your system rejected the network change. Vortix restored your previous connection."
+            }
+        }
+    }
+
+    const fn authentication_failure_message(self) -> &'static str {
+        match self {
+            Self::Connection | Self::Reconnection => {
+                "The VPN server rejected this profile. Check its certificate or username and password; if they are correct, the server may not authorize this profile."
+            }
+            Self::Disconnection | Self::KillSwitch => {
+                "The VPN server rejected the requested authentication."
             }
         }
     }
@@ -321,6 +332,30 @@ impl App {
         self.runtime.killswitch_state = kill_switch_state;
         self.registry.set_killswitch_state(kill_switch_state);
 
+        let has_connected_tunnel = snapshot.tunnels.values().any(|tunnel| {
+            matches!(
+                tunnel.state,
+                crate::vortix_core::engine::state::Connection::Connected { .. }
+            )
+        });
+        let dns_policy_verified = snapshot.observed.evidence.as_ref().is_some_and(|evidence| {
+            evidence.desired_generation == snapshot.desired.generation
+                && evidence.authority_epoch == snapshot.desired.authority_epoch
+                && evidence.policy_digest == snapshot.desired.policy_digest
+                && matches!(
+                    evidence.dns,
+                    crate::vortix_core::control::GateEvidence::Verified
+                )
+                && snapshot.effective.freshness.current
+        });
+        self.runtime.dns_protection = if !has_connected_tunnel {
+            crate::core::dns_protection::DnsProtectionStatus::NotActive
+        } else if dns_policy_verified {
+            crate::core::dns_protection::DnsProtectionStatus::Verified
+        } else {
+            crate::core::dns_protection::DnsProtectionStatus::Unverified
+        };
+
         let pending_challenge = snapshot.challenges.values().next().cloned();
         match pending_challenge {
             Some(challenge) if self.control_challenge != Some(challenge.id) => {
@@ -474,6 +509,10 @@ impl App {
                     OperationStatus::Failed,
                     Some(OperationResult::Failed(OperationFailure::DnsPolicyFailed)),
                 ) => Some(subject.dns_failure_message().to_string()),
+                (
+                    OperationStatus::Failed,
+                    Some(OperationResult::Failed(OperationFailure::AuthenticationFailed)),
+                ) => Some(subject.authentication_failure_message().to_string()),
                 (OperationStatus::Failed, Some(OperationResult::Failed(failure))) => {
                     Some(format!("{} failed: {failure:?}", subject.label()))
                 }

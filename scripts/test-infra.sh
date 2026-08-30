@@ -558,10 +558,7 @@ write_files:
       persist-key
       persist-tun
       verb 3
-      mssfix 1400
-      tun-mtu 1400
-      push "mssfix 1400"
-      push "tun-mtu 1400"
+      mssfix 1300 mtu
       status /var/log/openvpn-status.log
       EOF
 
@@ -586,6 +583,7 @@ write_files:
       cipher AES-256-GCM
       auth SHA256
       key-direction 1
+      mssfix 1300 mtu
       verb 3
 
       <ca>
@@ -709,10 +707,7 @@ write_files:
       verify-client-cert optional
       username-as-common-name
       verb 3
-      mssfix 1400
-      tun-mtu 1400
-      push "mssfix 1400"
-      push "tun-mtu 1400"
+      mssfix 1300 mtu
       status /var/log/openvpn-status.log
       EOF
 
@@ -738,6 +733,7 @@ write_files:
       auth SHA256
       key-direction 1
       auth-user-pass
+      mssfix 1300 mtu
       verb 3
 
       <ca>
@@ -901,10 +897,7 @@ write_files:
       verify-client-cert optional
       username-as-common-name
       verb 3
-      mssfix 1400
-      tun-mtu 1400
-      push "mssfix 1400"
-      push "tun-mtu 1400"
+      mssfix 1300 mtu
       status /var/log/openvpn-status.log
       EOF
 
@@ -931,6 +924,7 @@ write_files:
       key-direction 1
       auth-user-pass
       static-challenge "Enter TOTP code" 1
+      mssfix 1300 mtu
       verb 3
 
       <ca>

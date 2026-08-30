@@ -135,6 +135,34 @@ fn canonical_snapshot_is_the_only_source_of_renderer_registry_truth() {
 }
 
 #[test]
+fn security_dns_status_uses_canonical_policy_readback_not_recursor_identity() {
+    use crate::core::dns_protection::DnsProtectionStatus;
+    use crate::vortix_core::control::{GateEvidence, ProtectionEvidence};
+
+    let mut app = test_app();
+    set_connected(&mut app, "dns-policy");
+    assert_eq!(app.runtime.dns_protection, DnsProtectionStatus::Unverified);
+
+    let mut verified = app.control_snapshot.clone();
+    verified.effective.freshness.current = true;
+    verified.observed.evidence = Some(ProtectionEvidence {
+        desired_generation: verified.desired.generation,
+        authority_epoch: verified.desired.authority_epoch,
+        policy_digest: verified.desired.policy_digest.clone(),
+        observed_at_millis: 1,
+        interface: GateEvidence::Verified,
+        route: GateEvidence::Verified,
+        dns: GateEvidence::Verified,
+        firewall: GateEvidence::Verified,
+    });
+    app.apply_control_snapshot(verified);
+    assert_eq!(app.runtime.dns_protection, DnsProtectionStatus::Verified);
+
+    app.apply_control_snapshot(crate::vortix_core::control::ControlSnapshot::default());
+    assert_eq!(app.runtime.dns_protection, DnsProtectionStatus::NotActive);
+}
+
+#[test]
 fn scanner_statistics_refresh_registry_without_nudging_egress_telemetry() {
     use crate::vortix_core::engine::{Connection, Role};
     use std::sync::mpsc;
@@ -641,12 +669,6 @@ fn test_auth_delete_profile_cleans_auth_file() {
 // ====================================================================
 // v0.3.0 — "Trustworthy & Alive" tests
 // ====================================================================
-
-// --- Phase 1: DNS leak detection (#46) ---
-//
-// Path-based detection lives in `crate::core::dns_leak::check`; behaviour
-// is covered there. The App-side glue is verified by the panel tests in
-// `crate::ui::dashboard::security` which set `runtime.dns_leak` directly.
 
 // --- Phase 1: Last security check timestamp (#47) ---
 
@@ -3130,7 +3152,10 @@ fn terminal_dns_policy_failure_is_shown_to_tui_user() {
         .as_ref()
         .expect("terminal failure must be visible");
     assert_eq!(toast.toast_type, ToastType::Error);
-    assert!(toast.message.starts_with("Couldn't connect safely."));
+    assert!(toast.message.starts_with("Couldn't finish connecting"));
+    assert!(toast
+        .message
+        .contains("DNS settings could not be applied safely"));
     assert!(toast.message.contains("restored your previous connection"));
 
     app.toast = None;
@@ -3139,6 +3164,52 @@ fn terminal_dns_policy_failure_is_shown_to_tui_user() {
         app.toast.is_none(),
         "terminal failure must be reported once"
     );
+}
+
+#[test]
+fn terminal_authentication_failure_is_shown_to_tui_user() {
+    use crate::vortix_core::control::{
+        AuthorityEpoch, ClientId, IdempotencyKey, OperationFailure, OperationId, OperationIntent,
+        OperationRecord, OperationResult, OperationStatus, PolicyDigest,
+    };
+
+    let mut app = test_app();
+    let operation_id = OperationId::from_parts(AuthorityEpoch(1), 43);
+    app.track_control_operation(
+        operation_id.clone(),
+        super::connection::PendingControlSubject::Connection,
+    );
+    let mut snapshot = app.control_snapshot.clone();
+    snapshot.operations.insert(
+        operation_id.clone(),
+        OperationRecord {
+            id: operation_id,
+            idempotency_key: IdempotencyKey::new("rejected-openvpn-auth"),
+            client_id: ClientId::from_parts(AuthorityEpoch(1), 1),
+            command_digest: PolicyDigest::default(),
+            authority_epoch: AuthorityEpoch(1),
+            desired_generation: 1,
+            admitted_at_millis: 1,
+            deadline_millis: 2,
+            intent: OperationIntent::default(),
+            status: OperationStatus::Failed,
+            result: Some(OperationResult::Failed(
+                OperationFailure::AuthenticationFailed,
+            )),
+        },
+    );
+
+    app.apply_control_snapshot(snapshot);
+
+    let toast = app
+        .toast
+        .as_ref()
+        .expect("authentication failure must be visible");
+    assert_eq!(toast.toast_type, ToastType::Error);
+    assert!(toast.message.contains("VPN server rejected this profile"));
+    assert!(toast
+        .message
+        .contains("certificate or username and password"));
 }
 
 #[test]
