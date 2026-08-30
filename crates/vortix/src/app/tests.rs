@@ -707,6 +707,7 @@ fn test_last_security_check_updated_on_ipv6_telemetry() {
     app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIpv6(None)));
 
     assert!(app.runtime.last_security_check.is_some());
+    assert!(app.runtime.last_ipv6_check.is_some());
 }
 
 #[test]
@@ -1378,24 +1379,36 @@ fn test_rename_on_active_profile_is_refused_at_overlay() {
     );
 }
 #[test]
-fn test_ip_unchanged_warning_fires_once() {
+fn repeated_vpn_exit_ip_does_not_report_a_leak() {
     use crate::core::telemetry::TelemetryUpdate;
     let mut app = test_app();
     set_connected(&mut app, "test");
-    app.runtime.public_ip = "1.2.3.4".to_string();
+    app.runtime.real_ip = Some("1.2.3.4".to_string());
+    app.runtime.public_ip = "5.6.7.8".to_string();
 
     app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIp(
-        "1.2.3.4".to_string(),
+        "5.6.7.8".to_string(),
     )));
-    assert!(app.runtime.ip_unchanged_warned, "First warning should fire");
+    assert!(
+        !app.runtime.ip_unchanged_warned,
+        "an unchanged VPN exit is not evidence of an IPv4 leak"
+    );
+}
 
-    let warned_before = app.runtime.ip_unchanged_warned;
+#[test]
+fn public_ip_matching_pre_vpn_ip_reports_a_leak() {
+    use crate::core::telemetry::TelemetryUpdate;
+    let mut app = test_app();
+    set_connected(&mut app, "test");
+    app.runtime.real_ip = Some("1.2.3.4".to_string());
+    app.runtime.public_ip = "5.6.7.8".to_string();
+
     app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIp(
         "1.2.3.4".to_string(),
     )));
     assert!(
-        warned_before && app.runtime.ip_unchanged_warned,
-        "Second identical IP should not change the warning state"
+        app.runtime.ip_unchanged_warned,
+        "a current IPv4 matching the pre-VPN baseline must report a leak"
     );
 }
 

@@ -1803,6 +1803,27 @@ impl PolicyExecutor for HelperBackedPolicyExecutor {
         }
     }
 
+    fn audit(&self, policy: &TopologyPolicy) -> Result<PolicyExecutionEvidence, String> {
+        if policy.stage != PolicyStage::Final {
+            return Err("only a final topology policy can be audited".into());
+        }
+        self.update_readback(policy, |_| {});
+        let plan = self
+            .forward_plan(policy)
+            .map_err(|error| error.to_string())?;
+        self.audit_final_publication(policy, &plan)
+            .map_err(|error| error.to_string())?;
+        let observed_at_millis = crate::utils::boot_elapsed_millis()
+            .ok_or_else(|| "OS boot clock is unavailable for policy evidence".to_string())?;
+        Ok(PolicyExecutionEvidence {
+            observed_at_millis,
+            interface_verified: true,
+            route_verified: true,
+            dns_verified: true,
+            firewall_verified: true,
+        })
+    }
+
     fn verification(&self, policy: &TopologyPolicy) -> Option<PolicyExecutionEvidence> {
         let readback = self.readback.lock().ok()?;
         let state = readback.as_ref()?;

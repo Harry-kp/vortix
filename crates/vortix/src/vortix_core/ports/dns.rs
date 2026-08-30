@@ -293,6 +293,31 @@ impl DnsPolicyCoordinator {
         self.clear_verification();
     }
 
+    /// Read back an already-applied policy without changing resolver state.
+    /// The requested intents must still describe the coordinator's exact
+    /// current policy; otherwise an old proof cannot be refreshed.
+    pub fn verify_current<A: DnsPolicyAdapter>(
+        &self,
+        intents: &[DnsTunnelIntent],
+        adapter: &A,
+    ) -> Result<(), Vec<String>> {
+        if !self.runtime_authority {
+            return Err(vec!["DNS runtime authority is unavailable".into()]);
+        }
+        let desired = self
+            .desired
+            .as_ref()
+            .ok_or_else(|| vec!["DNS desired policy is unavailable".into()])?;
+        let candidate = DnsPolicy::compute(desired.generation, intents, adapter.capabilities())
+            .map_err(|error| vec![error.to_string()])?;
+        if !desired.same_content(&candidate) {
+            return Err(vec![
+                "DNS desired policy no longer matches the applied topology".into(),
+            ]);
+        }
+        adapter.verify(desired, &self.effective)
+    }
+
     /// Recompute and apply the entire policy. Identical effective content is
     /// a no-op; degraded content is retried without inventing a generation.
     pub fn reconcile<A: DnsPolicyAdapter>(

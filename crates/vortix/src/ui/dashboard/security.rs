@@ -302,6 +302,7 @@ fn push_exit_ipv6_row(lines: &mut Vec<Line<'static>>, s: &PanelState, w: usize) 
             Sigil::AlarmError,
             true,
         ),
+        Ipv6RowStatus::Unavailable => ("not detected".to_string(), Sigil::NotApplicable, false),
         Ipv6RowStatus::Pending | Ipv6RowStatus::Absent => (
             s.public_ipv6.clone().unwrap_or_else(|| "checking…".into()),
             Sigil::NotApplicable,
@@ -384,6 +385,7 @@ enum Ipv6RowStatus {
     Masked,
     Leaking,
     Pending,
+    Unavailable,
 }
 
 impl PanelState {
@@ -561,6 +563,7 @@ fn derive_ipv6_row_status(app: &App) -> Ipv6RowStatus {
     match (public, real) {
         (Some(p), Some(r)) if p == r => Ipv6RowStatus::Leaking,
         (Some(_), Some(_)) => Ipv6RowStatus::Masked,
+        (None, Some(_)) if app.runtime.last_ipv6_check.is_some() => Ipv6RowStatus::Unavailable,
         _ => Ipv6RowStatus::Pending,
     }
 }
@@ -1526,6 +1529,23 @@ mod tests {
             text.contains("checking…"),
             "Real IPv6 must show checking…: {text:?}"
         );
+    }
+
+    #[test]
+    fn completed_v6_probe_without_exit_renders_not_detected() {
+        let mut s = baseline_protected_state(60);
+        s.real_ipv6 = Some("2401:4900::abcd".to_string());
+        s.public_ipv6 = None;
+        s.ipv6_status = Ipv6RowStatus::Unavailable;
+
+        let lines = build_protected_audit(&s);
+        let exit_v6 = lines
+            .iter()
+            .find(|line| line_text(line).starts_with("Exit IPv6"))
+            .expect("Exit IPv6 row missing");
+
+        assert!(line_text(exit_v6).contains("not detected"));
+        assert!(!line_text(exit_v6).contains("checking"));
     }
 
     #[test]

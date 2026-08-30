@@ -115,4 +115,20 @@ pub trait Killswitch {
     /// Returns [`KillswitchError`] when the firewall command fails or the
     /// caller is not root.
     fn disable_blocking() -> Result<()>;
+
+    /// Read back the platform-owned blocking policy without changing it.
+    fn verify_blocking(active: &[ActiveTunnelInfo]) -> Result<()> {
+        let _ = active;
+        Err(KillswitchError::CommandFailed(
+            "kill-switch read-back is unavailable on this platform".into(),
+        ))
+    }
+
+    /// Prove that the Vortix-owned firewall policy is absent without
+    /// changing host firewall state.
+    fn verify_disabled() -> Result<()> {
+        Err(KillswitchError::CommandFailed(
+            "kill-switch read-back is unavailable on this platform".into(),
+        ))
+    }
 }

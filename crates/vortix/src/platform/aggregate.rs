@@ -116,6 +116,28 @@ impl MockKillswitch {
         s.disabled = true;
         Ok(())
     }
+
+    fn verify_blocking(&self, active: &[ActiveTunnelInfo]) -> KsResult<()> {
+        let state = self.state.lock().unwrap();
+        if state.enabled && state.last_active_count == active.len() {
+            Ok(())
+        } else {
+            Err(KillswitchError::CommandFailed(
+                "mock blocking policy does not match".into(),
+            ))
+        }
+    }
+
+    fn verify_disabled(&self) -> KsResult<()> {
+        let state = self.state.lock().unwrap();
+        if state.disabled {
+            Ok(())
+        } else {
+            Err(KillswitchError::CommandFailed(
+                "mock policy has not been disabled".into(),
+            ))
+        }
+    }
 }
 
 /// Scriptable mock for the `DnsResolver` port.
@@ -215,6 +237,34 @@ impl KillswitchKind {
             #[cfg(target_os = "windows")]
             Self::Windows => platform_impl::WindowsFirewall::disable_blocking(),
             Self::Mock(m) => m.disable_blocking(),
+        }
+    }
+
+    /// Read back an exact blocking policy without mutating it.
+    pub fn verify_blocking(&self, active: &[ActiveTunnelInfo]) -> KsResult<()> {
+        use crate::vortix_core::ports::killswitch::Killswitch;
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Macos => platform_impl::PfFirewall::verify_blocking(active),
+            #[cfg(target_os = "linux")]
+            Self::Linux => platform_impl::IptablesFirewall::verify_blocking(active),
+            #[cfg(target_os = "windows")]
+            Self::Windows => platform_impl::WindowsFirewall::verify_blocking(active),
+            Self::Mock(mock) => mock.verify_blocking(active),
+        }
+    }
+
+    /// Prove that Vortix-owned firewall state is absent without mutating it.
+    pub fn verify_disabled(&self) -> KsResult<()> {
+        use crate::vortix_core::ports::killswitch::Killswitch;
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Macos => platform_impl::PfFirewall::verify_disabled(),
+            #[cfg(target_os = "linux")]
+            Self::Linux => platform_impl::IptablesFirewall::verify_disabled(),
+            #[cfg(target_os = "windows")]
+            Self::Windows => platform_impl::WindowsFirewall::verify_disabled(),
+            Self::Mock(mock) => mock.verify_disabled(),
         }
     }
 }

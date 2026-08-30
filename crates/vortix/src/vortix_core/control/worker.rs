@@ -1171,6 +1171,20 @@ pub trait PolicyExecutor: Send + Sync + 'static {
         self.compensate(policy, barrier)
     }
 
+    /// Re-read the already-applied final policy without mutating platform
+    /// state. Implementations must bind every returned gate to `policy`.
+    fn audit(&self, _policy: &TopologyPolicy) -> Result<PolicyExecutionEvidence, String> {
+        Err("policy audit is unavailable".to_string())
+    }
+
+    fn audit_cancellable(
+        &self,
+        policy: &TopologyPolicy,
+        _cancellation: &CancellationToken,
+    ) -> Result<PolicyExecutionEvidence, String> {
+        self.audit(policy)
+    }
+
     /// Return fresh platform read-back produced by the exact final policy.
     /// Implementations that cannot prove every gate return `None`; worker
     /// completion alone is never protection truth.
@@ -1224,11 +1238,25 @@ pub struct PolicyResult {
     pub failed_at: Option<PolicyBarrier>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyAuditResult {
+    pub revision: ControlRevision,
+    pub operation_id: OperationId,
+    pub result: Result<PolicyExecutionEvidence, WorkFailure>,
+}
+
 struct PolicyState {
     pending: Option<TopologyPolicy>,
+    pending_audit: Option<TopologyPolicy>,
     superseded: VecDeque<PolicyResult>,
     max_superseded: usize,
     active_cancel: Option<CancellationToken>,
+    active_audit: bool,
+}
+
+enum PolicyJob {
+    Apply(TopologyPolicy),
+    Audit(TopologyPolicy),
 }
 
 /// Latest-complete coalescing worker. Replaced policies get explicit receipts;
@@ -1237,6 +1265,7 @@ pub struct PolicyWorker {
     state: Arc<Mutex<PolicyState>>,
     nudge_tx: Mutex<Option<mpsc::SyncSender<()>>>,
     result_rx: Mutex<mpsc::Receiver<PolicyResult>>,
+    audit_result_rx: Mutex<mpsc::Receiver<PolicyAuditResult>>,
     stopping: Arc<AtomicBool>,
     join: Mutex<Option<JoinHandle<()>>>,
 }
@@ -1247,13 +1276,16 @@ impl PolicyWorker {
         assert!(result_capacity > 0);
         let state = Arc::new(Mutex::new(PolicyState {
             pending: None,
+            pending_audit: None,
             superseded: VecDeque::new(),
             max_superseded: result_capacity,
             active_cancel: None,
+            active_audit: false,
         }));
         let stopping = Arc::new(AtomicBool::new(false));
         let (nudge_tx, nudge_rx) = mpsc::sync_channel(1);
         let (result_tx, result_rx) = mpsc::sync_channel(result_capacity);
+        let (audit_result_tx, audit_result_rx) = mpsc::sync_channel(result_capacity);
         let thread_state = Arc::clone(&state);
         let thread_stopping = Arc::clone(&stopping);
         let join = thread::Builder::new()
@@ -1264,28 +1296,47 @@ impl PolicyWorker {
                         break;
                     }
                     loop {
-                        let policy = {
+                        let job = {
                             let mut state =
                                 thread_state.lock().expect("policy state mutex poisoned");
-                            let policy = state.pending.take();
-                            if policy.is_some() {
+                            let job = state
+                                .pending
+                                .take()
+                                .map(PolicyJob::Apply)
+                                .or_else(|| state.pending_audit.take().map(PolicyJob::Audit));
+                            if let Some(job) = &job {
                                 state.active_cancel = Some(CancellationToken::default());
+                                state.active_audit = matches!(job, PolicyJob::Audit(_));
                             }
-                            policy
+                            job
                         };
-                        let Some(policy) = policy else { break };
+                        let Some(job) = job else { break };
                         let token = thread_state
                             .lock()
                             .expect("policy state mutex poisoned")
                             .active_cancel
                             .clone()
                             .expect("token installed");
-                        let result = run_policy(&executor, policy, &token, &thread_stopping);
-                        thread_state
-                            .lock()
-                            .expect("policy state mutex poisoned")
-                            .active_cancel = None;
-                        if result_tx.send(result).is_err() {
+                        let delivered = match job {
+                            PolicyJob::Apply(policy) => result_tx
+                                .send(run_policy(&executor, policy, &token, &thread_stopping))
+                                .is_ok(),
+                            PolicyJob::Audit(policy) => audit_result_tx
+                                .send(run_policy_audit(
+                                    &executor,
+                                    &policy,
+                                    &token,
+                                    &thread_stopping,
+                                ))
+                                .is_ok(),
+                        };
+                        {
+                            let mut state =
+                                thread_state.lock().expect("policy state mutex poisoned");
+                            state.active_cancel = None;
+                            state.active_audit = false;
+                        }
+                        if !delivered {
                             break;
                         }
                         if thread_stopping.load(Ordering::Acquire) {
@@ -1299,6 +1350,7 @@ impl PolicyWorker {
             state,
             nudge_tx: Mutex::new(Some(nudge_tx)),
             result_rx: Mutex::new(result_rx),
+            audit_result_rx: Mutex::new(audit_result_rx),
             stopping,
             join: Mutex::new(Some(join)),
         }
@@ -1309,6 +1361,12 @@ impl PolicyWorker {
             return Err(WorkFailure::Stopped);
         }
         let mut state = self.state.lock().expect("policy state mutex poisoned");
+        if state.active_audit {
+            if let Some(token) = state.active_cancel.as_ref() {
+                token.cancel();
+            }
+        }
+        state.pending_audit = None;
         if let Some(current) = &state.pending {
             if current.authority_epoch != policy.authority_epoch
                 || current.generation > policy.generation
@@ -1337,6 +1395,27 @@ impl PolicyWorker {
         }
     }
 
+    pub fn submit_audit(&self, policy: TopologyPolicy) -> Result<(), WorkFailure> {
+        if self.stopping.load(Ordering::Acquire) {
+            return Err(WorkFailure::Stopped);
+        }
+        let mut state = self.state.lock().expect("policy state mutex poisoned");
+        if state.pending.is_some() || state.pending_audit.is_some() || state.active_cancel.is_some()
+        {
+            return Err(WorkFailure::Busy);
+        }
+        state.pending_audit = Some(policy);
+        drop(state);
+        let guard = self.nudge_tx.lock().expect("nudge mutex poisoned");
+        let Some(tx) = guard.as_ref() else {
+            return Err(WorkFailure::Stopped);
+        };
+        match tx.try_send(()) {
+            Ok(()) | Err(mpsc::TrySendError::Full(())) => Ok(()),
+            Err(mpsc::TrySendError::Disconnected(())) => Err(WorkFailure::Stopped),
+        }
+    }
+
     pub fn try_result(&self) -> Option<PolicyResult> {
         if let Some(result) = self
             .state
@@ -1350,6 +1429,14 @@ impl PolicyWorker {
         self.result_rx
             .lock()
             .expect("policy result mutex poisoned")
+            .try_recv()
+            .ok()
+    }
+
+    pub fn try_audit_result(&self) -> Option<PolicyAuditResult> {
+        self.audit_result_rx
+            .lock()
+            .expect("policy audit result mutex poisoned")
             .try_recv()
             .ok()
     }
@@ -1390,6 +1477,13 @@ impl PolicyWorker {
                 .try_recv()
                 .is_ok()
             {}
+            while self
+                .audit_result_rx
+                .lock()
+                .expect("policy audit result mutex poisoned")
+                .try_recv()
+                .is_ok()
+            {}
             thread::yield_now();
         }
         if join.is_finished() {
@@ -1403,6 +1497,41 @@ impl PolicyWorker {
 
     pub fn shutdown(&self) {
         let _ = self.shutdown_bounded(Duration::from_millis(100));
+    }
+}
+
+fn run_policy_audit(
+    executor: &Arc<dyn PolicyExecutor>,
+    policy: &TopologyPolicy,
+    cancellation: &CancellationToken,
+    stopping: &AtomicBool,
+) -> PolicyAuditResult {
+    let revision = policy.revision();
+    let operation_id = policy.operation_id.clone();
+    let result = if stopping.load(Ordering::Acquire) || cancellation.is_cancelled() {
+        Err(WorkFailure::Cancelled)
+    } else if Instant::now() >= policy.deadline {
+        Err(WorkFailure::TimedOut)
+    } else {
+        panic::catch_unwind(AssertUnwindSafe(|| {
+            executor.audit_cancellable(policy, cancellation)
+        }))
+        .map_err(|_| WorkFailure::Panicked)
+        .and_then(|result| result.map_err(|_| WorkFailure::EffectFailed))
+        .and_then(|evidence| {
+            if cancellation.is_cancelled() {
+                Err(WorkFailure::Cancelled)
+            } else if Instant::now() >= policy.deadline {
+                Err(WorkFailure::TimedOut)
+            } else {
+                Ok(evidence)
+            }
+        })
+    };
+    PolicyAuditResult {
+        revision,
+        operation_id,
+        result,
     }
 }
 

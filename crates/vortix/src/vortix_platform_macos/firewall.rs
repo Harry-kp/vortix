@@ -347,6 +347,46 @@ impl Killswitch for PfFirewall {
         info!(target: "vortix::killswitch", "kill switch DISABLED — normal traffic restored");
         Ok(())
     }
+
+    fn verify_blocking(active: &[ActiveTunnelInfo]) -> Result<()> {
+        let root = pfctl(&["-sr"])?;
+        let anchor = pfctl(&["-a", PF_ANCHOR, "-sr"])?;
+        let status = pfctl(&["-s", "info"])?;
+        if root.status.success()
+            && anchor.status.success()
+            && status.status.success()
+            && Self::root_traverses_anchor(&String::from_utf8_lossy(&root.stdout))
+            && pf_is_enabled(&String::from_utf8_lossy(&status.stdout))
+            && Self::snapshot_matches_policy(active, &String::from_utf8_lossy(&anchor.stdout))
+        {
+            Ok(())
+        } else {
+            Err(KillswitchError::CommandFailed(
+                "pf read-back did not match the requested Vortix policy".into(),
+            ))
+        }
+    }
+
+    fn verify_disabled() -> Result<()> {
+        let anchor = pfctl(&["-a", PF_ANCHOR, "-sr"])?;
+        if anchor.status.success()
+            && Self::canonical_pf_rules(&String::from_utf8_lossy(&anchor.stdout)).is_empty()
+        {
+            Ok(())
+        } else {
+            Err(KillswitchError::CommandFailed(
+                "pf read-back still contains Vortix-owned rules".into(),
+            ))
+        }
+    }
+}
+
+fn pf_is_enabled(status: &str) -> bool {
+    status.lines().any(|line| {
+        line.split_once(':').is_some_and(|(key, value)| {
+            key.trim() == "Status" && value.split_ascii_whitespace().next() == Some("Enabled")
+        })
+    })
 }
 
 #[cfg(test)]

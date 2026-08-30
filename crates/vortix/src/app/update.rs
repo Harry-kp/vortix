@@ -845,7 +845,9 @@ impl App {
                     }
                 }
                 self.runtime.public_ipv6 = observed;
-                self.runtime.last_security_check = Some(Instant::now());
+                let checked_at = Instant::now();
+                self.runtime.last_ipv6_check = Some(checked_at);
+                self.runtime.last_security_check = Some(checked_at);
             }
             TelemetryUpdate::Log(level, msg) => {
                 logger::log(level, "TELEMETRY", msg);
@@ -929,20 +931,15 @@ impl App {
         {
             self.runtime.ip_unchanged_warned = false;
             self.log(&format!("NET: Public IPv4 changed {old_ip} -> {ip}"));
-        } else if is_connected
-            && self.runtime.public_ip == ip
-            && self.runtime.public_ip != constants::MSG_FETCHING
+        }
+        if is_connected
+            && self.runtime.real_ip.as_deref() == Some(ip.as_str())
             && !self.runtime.ip_unchanged_warned
         {
             self.runtime.ip_unchanged_warned = true;
             self.log(&format!(
-                "WARN: Public IPv4 unchanged ({ip}) while connected — possible leak or split-tunnel"
+                "WARN: Public IPv4 matches the pre-VPN address ({ip}) — possible leak or split-tunnel"
             ));
-            if let Some(ref real) = self.runtime.real_ip {
-                if real == &ip {
-                    self.log(&format!("ERR: IPv4 leak detected — current IPv4 ({ip}) matches pre-VPN IPv4 ({real})"));
-                }
-            }
         }
         self.runtime.public_ip = ip;
         self.runtime.last_security_check = Some(Instant::now());

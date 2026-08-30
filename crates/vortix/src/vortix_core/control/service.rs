@@ -2613,49 +2613,23 @@ fn drive_supervision(
         if exact_transaction
             && result.stage == PolicyStage::Final
             && result.outcome == PolicyOutcome::Applied
+            && result.verification.is_some_and(|readback| {
+                !accept_policy_readback(
+                    supervisor,
+                    snapshot,
+                    owner,
+                    ControlRevision {
+                        authority_epoch: result.authority_epoch,
+                        generation: result.generation,
+                        digest: result.digest.clone(),
+                    },
+                    result.operation_id.clone(),
+                    readback,
+                    now,
+                )
+            })
         {
-            if let Some(readback) = result.verification {
-                let revision = ControlRevision {
-                    authority_epoch: result.authority_epoch,
-                    generation: result.generation,
-                    digest: result.digest.clone(),
-                };
-                let verification = PolicyVerification {
-                    revision: revision.clone(),
-                    operation_id: result.operation_id.clone(),
-                    observed_at_millis: readback.observed_at_millis,
-                    received_at_millis: now,
-                    interface_verified: readback.interface_verified,
-                    route_verified: readback.route_verified,
-                    dns_verified: readback.dns_verified,
-                    firewall_verified: readback.firewall_verified,
-                };
-                if supervisor.verify_policy(&verification, now).is_ok() {
-                    snapshot.observed.evidence = Some(ProtectionEvidence {
-                        desired_generation: revision.generation,
-                        authority_epoch: revision.authority_epoch,
-                        policy_digest: revision.digest,
-                        observed_at_millis: readback.observed_at_millis,
-                        interface: GateEvidence::Verified,
-                        route: GateEvidence::Verified,
-                        dns: GateEvidence::Verified,
-                        firewall: GateEvidence::Verified,
-                    });
-                    snapshot.observed.evidence_received_at_millis = Some(now);
-                    for scope in [
-                        ObservationScope::Protection,
-                        ObservationScope::Route,
-                        ObservationScope::Dns,
-                        ObservationScope::Firewall,
-                    ] {
-                        owner
-                            .observation_clocks
-                            .insert(scope, readback.observed_at_millis);
-                    }
-                } else {
-                    effective_outcome = PolicyOutcome::Failed;
-                }
-            }
+            effective_outcome = PolicyOutcome::Failed;
         }
         let failed_transaction = if exact_transaction {
             let transaction = owner
@@ -2727,6 +2701,21 @@ fn drive_supervision(
             );
         }
     }
+
+    while let Some(result) = supervisor.poll_policy_audit() {
+        if let Ok(readback) = result.result {
+            let _ = accept_policy_readback(
+                supervisor,
+                snapshot,
+                owner,
+                result.revision,
+                result.operation_id,
+                readback,
+                now,
+            );
+        }
+    }
+    let _ = supervisor.submit_policy_audit_if_due(now);
 
     let revision = ControlRevision {
         authority_epoch: snapshot.desired.authority_epoch,
@@ -3356,6 +3345,52 @@ fn drive_supervision(
             }
         }
     }
+}
+
+fn accept_policy_readback(
+    supervisor: &Supervisor,
+    snapshot: &mut ControlSnapshot,
+    owner: &mut OwnerState,
+    revision: ControlRevision,
+    operation_id: OperationId,
+    readback: crate::vortix_core::control::worker::PolicyExecutionEvidence,
+    now: u64,
+) -> bool {
+    let verification = PolicyVerification {
+        revision: revision.clone(),
+        operation_id,
+        observed_at_millis: readback.observed_at_millis,
+        received_at_millis: now,
+        interface_verified: readback.interface_verified,
+        route_verified: readback.route_verified,
+        dns_verified: readback.dns_verified,
+        firewall_verified: readback.firewall_verified,
+    };
+    if supervisor.verify_policy(&verification, now).is_err() {
+        return false;
+    }
+    snapshot.observed.evidence = Some(ProtectionEvidence {
+        desired_generation: revision.generation,
+        authority_epoch: revision.authority_epoch,
+        policy_digest: revision.digest,
+        observed_at_millis: readback.observed_at_millis,
+        interface: GateEvidence::Verified,
+        route: GateEvidence::Verified,
+        dns: GateEvidence::Verified,
+        firewall: GateEvidence::Verified,
+    });
+    snapshot.observed.evidence_received_at_millis = Some(now);
+    for scope in [
+        ObservationScope::Protection,
+        ObservationScope::Route,
+        ObservationScope::Dns,
+        ObservationScope::Firewall,
+    ] {
+        owner
+            .observation_clocks
+            .insert(scope, readback.observed_at_millis);
+    }
+    true
 }
 
 fn rollback_connect_intent(

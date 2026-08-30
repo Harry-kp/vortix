@@ -860,6 +860,47 @@ struct PolicyRecorder {
     panic_compensation: Mutex<bool>,
     fail_compensation: Mutex<bool>,
 }
+
+#[derive(Default)]
+struct AuditPolicyRecorder {
+    apply_calls: AtomicU64,
+    audit_calls: AtomicU64,
+}
+
+impl PolicyExecutor for AuditPolicyRecorder {
+    fn apply(&self, _: &TopologyPolicy, _: PolicyBarrier) -> Result<(), String> {
+        self.apply_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn audit(&self, _: &TopologyPolicy) -> Result<PolicyExecutionEvidence, String> {
+        self.audit_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(PolicyExecutionEvidence {
+            observed_at_millis: 10,
+            interface_verified: true,
+            route_verified: true,
+            dns_verified: true,
+            firewall_verified: true,
+        })
+    }
+}
+
+#[test]
+fn policy_worker_audit_does_not_replay_mutation_barriers() {
+    let recorder = Arc::new(AuditPolicyRecorder::default());
+    let worker = PolicyWorker::start(recorder.clone(), 4);
+
+    worker.submit_audit(policy(1, "audit-only")).unwrap();
+    let result = wait_until(Duration::from_secs(1), || worker.try_audit_result()).unwrap();
+
+    assert!(result.result.is_ok());
+    assert_eq!(recorder.audit_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(recorder.apply_calls.load(Ordering::SeqCst), 0);
+}
 impl PolicyExecutor for PolicyRecorder {
     fn apply(&self, policy: &TopologyPolicy, barrier: PolicyBarrier) -> Result<(), String> {
         self.calls
@@ -1749,6 +1790,134 @@ async fn exact_policy_readback_publishes_protection_without_external_proof() {
                     == vortix::vortix_core::control::ProtectionStatus::Protected
         },
         "typed policy readback was not published",
+    )
+    .await;
+}
+
+struct RefreshingPolicy {
+    clock: Arc<TestClock>,
+    audit_calls: AtomicU64,
+}
+
+impl RefreshingPolicy {
+    fn evidence(&self) -> PolicyExecutionEvidence {
+        PolicyExecutionEvidence {
+            observed_at_millis: self.clock.now_millis(),
+            interface_verified: true,
+            route_verified: true,
+            dns_verified: true,
+            firewall_verified: true,
+        }
+    }
+}
+
+impl PolicyExecutor for RefreshingPolicy {
+    fn apply(&self, _: &TopologyPolicy, _: PolicyBarrier) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn audit(&self, _: &TopologyPolicy) -> Result<PolicyExecutionEvidence, String> {
+        self.audit_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(self.evidence())
+    }
+
+    fn verification(&self, policy: &TopologyPolicy) -> Option<PolicyExecutionEvidence> {
+        (policy.stage == PolicyStage::Final).then(|| self.evidence())
+    }
+}
+
+#[tokio::test]
+async fn terminal_policy_is_reaudited_before_dns_proof_expires() {
+    let target = profile("reaudited-policy");
+    let clock = Arc::new(TestClock::default());
+    let policy = Arc::new(RefreshingPolicy {
+        clock: clock.clone(),
+        audit_calls: AtomicU64::new(0),
+    });
+    let supervisor = Arc::new(Supervisor::new(
+        AuthorityEpoch(1),
+        Arc::new(OkExecutor),
+        policy.clone(),
+        1,
+        4,
+    ));
+    let service = ControlService::start_supervised(
+        ControlServiceConfig {
+            authority_epoch: AuthorityEpoch(1),
+            known_profiles: BTreeSet::from([target.clone()]),
+            profile_topologies: BTreeMap::from([(target.clone(), ProfileTopology::default())]),
+            freshness_poll_interval: Duration::from_millis(5),
+            ..ControlServiceConfig::default()
+        },
+        clock.clone(),
+        ExecutionSelection::CanonicalAuthority,
+        supervisor.clone(),
+    );
+    service
+        .client()
+        .submit(CommandRequest {
+            command: UserCommand::Connect {
+                profile_id: target.clone(),
+                conflict_acknowledgement: None,
+            },
+            idempotency_key: IdempotencyKey::new("reaudited-policy"),
+            deadline: Deadline(1_000),
+        })
+        .await
+        .unwrap();
+    wait_for_condition(
+        || {
+            supervisor
+                .profile_truth(&target)
+                .is_some_and(|entry| entry.truth == SupervisedTruth::WaitingForObservation)
+        },
+        "connect did not reach the observation barrier",
+    )
+    .await;
+    service
+        .observer()
+        .observe(Observation::Tunnel {
+            profile_id: target,
+            active: true,
+            interface_name: Some("tun-reaudited-policy".into()),
+            observed_at_millis: 0,
+            protection: None,
+        })
+        .await
+        .unwrap();
+    wait_for_condition(
+        || service.client().snapshot().effective.protection == ProtectionStatus::Protected,
+        "initial policy verification was not published",
+    )
+    .await;
+
+    clock.0.store(3_000, Ordering::Release);
+    wait_for_condition(
+        || policy.audit_calls.load(Ordering::SeqCst) >= 1,
+        "current policy was not audited before its proof expired",
+    )
+    .await;
+    wait_for_condition(
+        || {
+            service
+                .client()
+                .snapshot()
+                .observed
+                .evidence
+                .is_some_and(|evidence| evidence.observed_at_millis == 3_000)
+        },
+        "fresh audit evidence was not published",
+    )
+    .await;
+
+    clock.0.store(5_500, Ordering::Release);
+    wait_for_condition(
+        || service.client().snapshot().effective.protection == ProtectionStatus::Protected,
+        "policy degraded at the original proof expiry despite a fresh audit",
     )
     .await;
 }
