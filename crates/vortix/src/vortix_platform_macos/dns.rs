@@ -568,6 +568,47 @@ impl MacDnsPolicy {
         )
     }
 
+    fn should_adopt_current_primary_baseline(
+        previous_is_absent: bool,
+        current: &[u8],
+        owner: Option<&PrimaryDnsOwner>,
+        backup: Option<&PrimaryDnsBackup>,
+    ) -> Result<bool, String> {
+        if !previous_is_absent {
+            return Ok(false);
+        }
+        let Some(stale_value) = owner
+            .map(Self::owner_dns_value)
+            .or_else(|| backup.map(Self::backup_value))
+            .transpose()?
+        else {
+            return Ok(false);
+        };
+        Ok(!plist_values_equal(current, &stale_value)?)
+    }
+
+    fn validate_owned_primary_replacement(
+        current: &[u8],
+        desired: &[u8],
+        desired_owner: &PrimaryDnsOwner,
+        current_owner: &PrimaryDnsOwner,
+        previous: Option<(u64, &DnsAssignment)>,
+    ) -> Result<(), String> {
+        let owner_is_prior = previous.is_some_and(|(generation, assignment)| {
+            current_owner
+                == &Self::primary_owner(generation, assignment, desired_owner.service_key.clone())
+        });
+        if current_owner != desired_owner && !owner_is_prior {
+            return Err("macOS primary DNS is owned by another generation".to_string());
+        }
+        let owned_value = Self::owner_dns_value(current_owner)?;
+        if plist_values_equal(current, &owned_value)? || plist_values_equal(current, desired)? {
+            Ok(())
+        } else {
+            Err("macOS primary DNS changed during replacement".to_string())
+        }
+    }
+
     fn apply_primary(
         &self,
         generation: u64,
@@ -599,33 +640,36 @@ impl MacDnsPolicy {
         let owner = Self::primary_owner(generation, assignment, service_key.clone());
         let desired = Self::owner_dns_value(&owner)?;
 
-        let needs_backup = parsed_owner.is_none() && parsed_backup.is_none();
-        if let Some(current_owner) = parsed_owner.as_ref() {
-            let owner_is_desired = current_owner == &owner;
-            let owner_is_prior = previous.is_some_and(|(prior_generation, prior_assignment)| {
-                current_owner
-                    == &Self::primary_owner(prior_generation, prior_assignment, service_key.clone())
-            });
-            if !owner_is_desired && !owner_is_prior {
-                return Err("macOS primary DNS is owned by another generation".to_string());
-            }
-            let current_expected = Self::owner_dns_value(current_owner)?;
-            if !plist_values_equal(&old_service, &current_expected)?
-                && !plist_values_equal(&old_service, &desired)?
-            {
-                return Err("macOS primary DNS changed during replacement".to_string());
-            }
-        } else if parsed_backup.is_some() {
-            let backup = parsed_backup
-                .as_ref()
-                .ok_or_else(|| "macOS primary DNS backup disappeared".to_string())?;
-            let prior = Self::backup_value(backup)?;
-            let desired_owner = Self::primary_owner(generation, assignment, service_key.clone());
-            let desired = Self::owner_dns_value(&desired_owner)?;
-            if !plist_values_equal(&old_service, &prior)?
-                && !plist_values_equal(&old_service, &desired)?
-            {
-                return Err("macOS primary DNS changed during interrupted apply".to_string());
+        let adopt_current_baseline = Self::should_adopt_current_primary_baseline(
+            previous.is_none(),
+            &old_service,
+            parsed_owner.as_ref(),
+            parsed_backup.as_ref(),
+        )?;
+        let needs_backup =
+            (parsed_owner.is_none() && parsed_backup.is_none()) || adopt_current_baseline;
+        if !adopt_current_baseline {
+            if let Some(current_owner) = parsed_owner.as_ref() {
+                Self::validate_owned_primary_replacement(
+                    &old_service,
+                    &desired,
+                    &owner,
+                    current_owner,
+                    previous,
+                )?;
+            } else if parsed_backup.is_some() {
+                let backup = parsed_backup
+                    .as_ref()
+                    .ok_or_else(|| "macOS primary DNS backup disappeared".to_string())?;
+                let prior = Self::backup_value(backup)?;
+                let desired_owner =
+                    Self::primary_owner(generation, assignment, service_key.clone());
+                let desired = Self::owner_dns_value(&desired_owner)?;
+                if !plist_values_equal(&old_service, &prior)?
+                    && !plist_values_equal(&old_service, &desired)?
+                {
+                    return Err("macOS primary DNS changed during interrupted apply".to_string());
+                }
             }
         }
 
@@ -2091,6 +2135,45 @@ mod policy_tests {
         assert_eq!(adapter.test_primary_dns_servers(), vec!["9.9.9.9"]);
         assert!(adapter.primary_owner_state().unwrap().is_some());
         assert!(adapter.primary_backup_state().unwrap().is_some());
+    }
+
+    #[test]
+    fn fresh_apply_adopts_external_dns_after_stale_owner_release() {
+        let temp = tempfile::tempdir().unwrap();
+        let adapter = MacDnsPolicy::at(temp.path().join("resolver"));
+        let stale = policy(3, "1.1.1.1");
+        let stale_effective = adapter.apply(&stale, None, &DnsEffectiveState::default());
+        assert_eq!(stale_effective.status, DnsEffectiveStatus::Applied);
+        let service_key = adapter.primary_service_key().unwrap();
+        adapter
+            .dynamic_store
+            .set(
+                &service_key,
+                &primary_dns_value(&["9.9.9.9".to_string()], &[]).unwrap(),
+            )
+            .unwrap();
+        assert!(adapter.release(&stale_effective.owned[0]).is_err());
+
+        let released = DnsPolicy {
+            generation: 4,
+            assignments: Vec::new(),
+        };
+        let released_effective = DnsEffectiveState {
+            requested_generation: 4,
+            applied_generation: Some(4),
+            status: DnsEffectiveStatus::Released,
+            owned: Vec::new(),
+            errors: Vec::new(),
+        };
+        let desired = policy(5, "8.8.8.8");
+        let applied = adapter.apply(&desired, Some(&released), &released_effective);
+
+        assert_eq!(applied.status, DnsEffectiveStatus::Applied);
+        assert_eq!(adapter.test_primary_dns_servers(), vec!["8.8.8.8"]);
+        adapter.release(&applied.owned[0]).unwrap();
+        assert_eq!(adapter.test_primary_dns_servers(), vec!["9.9.9.9"]);
+        assert!(adapter.primary_owner_state().unwrap().is_none());
+        assert!(adapter.primary_backup_state().unwrap().is_none());
     }
 
     #[test]
