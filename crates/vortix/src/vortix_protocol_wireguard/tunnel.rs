@@ -699,6 +699,7 @@ impl WgTunnel {
                 managed: true,
             }),
             dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
+            openvpn_routes: None,
         };
         self.down(handle)?;
         if wait_for_interface_absence(&interface_name, Duration::from_secs(2)) {
@@ -864,6 +865,7 @@ impl WgTunnel {
                 managed: true,
             }),
             dns_request,
+            openvpn_routes: None,
         };
         settle_failed_attempt(
             original,
@@ -1316,6 +1318,7 @@ impl Tunnel for WgTunnel {
                 managed: true,
             }),
             dns_request,
+            openvpn_routes: None,
         };
         let attempt = HandshakeAttempt {
             generation,
@@ -1689,6 +1692,7 @@ mod tests {
             process_ownership: None,
             teardown_config,
             dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
+            openvpn_routes: None,
         }
     }
 

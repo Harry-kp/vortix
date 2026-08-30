@@ -105,6 +105,9 @@ pub struct TunnelHandle {
     /// available, its negotiated runtime options. Platform mutation is not
     /// performed by the protocol adapter.
     pub dns_request: crate::vortix_core::ports::dns::DnsRequest,
+    /// Complete configured and negotiated `OpenVPN` route truth from the
+    /// same live generation. Other protocols carry `None`.
+    pub openvpn_routes: Option<crate::vortix_core::privileged::OpenVpnRouteEvidence>,
 }
 
 /// Protocol-attested record of one `WireGuard` peer probe.

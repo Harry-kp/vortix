@@ -22,9 +22,11 @@ use vortix::vortix_core::control::{
     Observation, OperationCompletion, OperationIntent, OperationStatus, PersistedTombstone,
     ProfileTopology, ProtectionEvidence, ProtectionStatus, RequestedTunnelState, UserCommand,
 };
+use vortix::vortix_core::ports::dns::DnsRequest;
 use vortix::vortix_core::ports::tunnel::{HandshakeEvidence, TunnelKindTag};
 use vortix::vortix_core::privileged::{
-    OpenVpnRoute, OpenVpnRouteEvidence, OpenVpnRouteGateway, OpenVpnRouteSetEvidence,
+    OpenVpnRedirectFlag, OpenVpnRedirectGateway, OpenVpnRoute, OpenVpnRouteEvidence,
+    OpenVpnRouteGateway, OpenVpnRouteSetEvidence,
 };
 use vortix::vortix_core::profile::{ProfileId, ProtocolKind};
 
@@ -80,7 +82,15 @@ fn execution_receipt(work: &TunnelWork) -> TunnelExecutionReceipt {
 }
 
 fn openvpn_route_evidence(configured: &[&str], pushed: &[&str]) -> OpenVpnRouteEvidence {
-    let route_set = |routes: &[&str]| {
+    openvpn_route_evidence_with_redirect(configured, pushed, None)
+}
+
+fn openvpn_route_evidence_with_redirect(
+    configured: &[&str],
+    pushed: &[&str],
+    pushed_redirect: Option<OpenVpnRedirectGateway>,
+) -> OpenVpnRouteEvidence {
+    let route_set = |routes: &[&str], redirect| {
         OpenVpnRouteSetEvidence::new(
             routes
                 .iter()
@@ -93,11 +103,15 @@ fn openvpn_route_evidence(configured: &[&str], pushed: &[&str]) -> OpenVpnRouteE
                     .unwrap()
                 })
                 .collect(),
-            None,
+            redirect,
         )
         .unwrap()
     };
-    OpenVpnRouteEvidence::new(route_set(configured), route_set(pushed)).unwrap()
+    OpenVpnRouteEvidence::new(
+        route_set(configured, None),
+        route_set(pushed, pushed_redirect),
+    )
+    .unwrap()
 }
 
 struct OpenVpnRouteExecutor {
@@ -169,6 +183,75 @@ fn restart_restores_only_disconnect_tombstone_fences() {
     assert!(restored.handshake.is_none());
     assert!(restored.probe_receipts.is_empty());
     assert_eq!(restored.truth, SupervisedTruth::OutcomeUnknown);
+}
+
+#[test]
+fn exact_absence_clears_every_restart_restored_disconnect_tombstone() {
+    for (index, teardown_failed) in [false, true].into_iter().enumerate() {
+        let target = profile(&format!("restored-tombstone-{index}"));
+        let supervisor = Supervisor::new(
+            AuthorityEpoch(1),
+            Arc::new(OkExecutor),
+            Arc::new(OkPolicy),
+            1,
+            4,
+        );
+        supervisor
+            .restore_tombstones(&BTreeMap::from([(
+                target.clone(),
+                PersistedTombstone {
+                    authority_epoch: AuthorityEpoch(1),
+                    generation: 4,
+                    resource_generation: Some(3),
+                    policy_digest: PolicyDigest("persisted-policy".into()),
+                    operation_id: operation(9),
+                    teardown_failed,
+                },
+            )]))
+            .unwrap();
+
+        supervisor
+            .confirm_tombstone_absence(&target, &tunnel_revision(4))
+            .expect("exact observed absence clears a restart-restored teardown fence");
+        assert!(supervisor.profile_truth(&target).is_none());
+        assert!(!supervisor.is_tombstoned(&target));
+    }
+}
+
+#[test]
+fn live_disconnect_tombstone_waits_for_worker_completion_before_clearing() {
+    let target = profile("live-disconnect-tombstone");
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let supervisor = Supervisor::new(
+        AuthorityEpoch(1),
+        Arc::new(BarrierExecutor {
+            entered: entered.clone(),
+            release: release.clone(),
+        }),
+        Arc::new(OkPolicy),
+        1,
+        4,
+    );
+    supervisor
+        .dispatch_tunnel(
+            work(target.clone(), 4, 9, TunnelMutation::Disconnect),
+            std::iter::empty::<String>(),
+        )
+        .unwrap();
+    entered.wait();
+
+    assert_eq!(
+        supervisor.confirm_tombstone_absence(&target, &tunnel_revision(4)),
+        Err(WorkFailure::Busy),
+        "scanner absence cannot release a fence while its worker is still active"
+    );
+
+    release.wait();
+    assert!(wait_until(Duration::from_secs(1), || supervisor.poll_tunnel()).is_some());
+    supervisor
+        .confirm_tombstone_absence(&target, &tunnel_revision(4))
+        .expect("completed teardown fence clears from exact absence");
 }
 
 struct BarrierExecutor {
@@ -729,7 +812,9 @@ fn failed_teardown_retries_and_probe_failure_does_not_clear_tombstone() {
             ..
         }] if revision.generation == 5 && resource_revision.generation == 4
     ));
+    let advanced_revision = tunnel_revision(6);
     let absent = ReconcileInput {
+        tunnel_revisions: BTreeMap::from([(id.clone(), advanced_revision)]),
         observations: BTreeMap::from([(
             id.clone(),
             observation(
@@ -742,7 +827,8 @@ fn failed_teardown_retries_and_probe_failure_does_not_clear_tombstone() {
     };
     assert!(matches!(
         plan_reconciliation(&absent).actions.as_slice(),
-        [ReconcileAction::ClearTombstone { .. }]
+        [ReconcileAction::ClearTombstone { revision, .. }]
+            if *revision == tunnel_rev && *revision != advanced_revision
     ));
 }
 
@@ -1340,6 +1426,7 @@ struct TopologyCapture {
     failed_final: Mutex<BTreeSet<u64>>,
     publish_readback: AtomicBool,
     openvpn_evidence: Mutex<BTreeMap<ProfileId, OpenVpnRouteEvidence>>,
+    openvpn_dns: Mutex<BTreeMap<ProfileId, DnsRequest>>,
     fail_next_tunnel: Mutex<BTreeSet<ProfileId>>,
 }
 
@@ -1405,7 +1492,7 @@ impl TunnelExecutor for TopologyCapture {
             return Err("injected retryable tunnel failure".into());
         }
         let receipt = execution_receipt(work);
-        Ok(self
+        let receipt = self
             .openvpn_evidence
             .lock()
             .unwrap()
@@ -1413,7 +1500,14 @@ impl TunnelExecutor for TopologyCapture {
             .cloned()
             .map_or(receipt.clone(), |routes| {
                 receipt.with_openvpn_routes(routes)
-            }))
+            });
+        Ok(self
+            .openvpn_dns
+            .lock()
+            .unwrap()
+            .get(&work.profile_id)
+            .cloned()
+            .map_or(receipt.clone(), |dns| receipt.with_openvpn_dns(dns)))
     }
 }
 
@@ -2158,15 +2252,28 @@ async fn reconnect_teardown_waits_for_pre_block_and_final_policy_waits_for_obser
     clippy::too_many_lines,
     reason = "one end-to-end pre-block, tunnel receipt, observation, and final-policy proof"
 )]
-async fn openvpn_final_policy_is_sealed_from_current_generation_route_evidence() {
+async fn openvpn_final_policy_is_sealed_from_current_generation_runtime_evidence() {
     use vortix::vortix_core::state::killswitch::KillSwitchMode;
 
     let target = profile("sealed-openvpn-routes");
     let capture = Arc::new(TopologyCapture::default());
     capture.openvpn_evidence.lock().unwrap().insert(
         target.clone(),
-        openvpn_route_evidence(&["10.1.0.0/24"], &["10.2.0.0/24"]),
+        openvpn_route_evidence_with_redirect(
+            &["10.1.0.0/24"],
+            &["10.2.0.0/24"],
+            Some(OpenVpnRedirectGateway::new(vec![OpenVpnRedirectFlag::Def1]).unwrap()),
+        ),
     );
+    let pushed_dns = DnsRequest {
+        servers: vec!["1.1.1.1".parse().unwrap(), "1.0.0.1".parse().unwrap()],
+        ..DnsRequest::default()
+    };
+    capture
+        .openvpn_dns
+        .lock()
+        .unwrap()
+        .insert(target.clone(), pushed_dns.clone());
     let supervisor = Arc::new(Supervisor::new(
         AuthorityEpoch(1),
         capture.clone(),
@@ -2260,6 +2367,7 @@ async fn openvpn_final_policy_is_sealed_from_current_generation_route_evidence()
     assert_eq!(
         final_policy.target.routes[&target],
         BTreeSet::from([
+            RouteClaim::parse("0.0.0.0/0").unwrap(),
             RouteClaim::parse("10.1.0.0/24").unwrap(),
             RouteClaim::parse("10.2.0.0/24").unwrap(),
         ])
@@ -2267,6 +2375,10 @@ async fn openvpn_final_policy_is_sealed_from_current_generation_route_evidence()
     assert_eq!(
         final_policy.target.openvpn_routes.get(&target),
         capture.openvpn_evidence.lock().unwrap().get(&target)
+    );
+    assert_eq!(
+        final_policy.target.dns_requests.get(&target),
+        Some(&pushed_dns)
     );
 }
 
@@ -2510,6 +2622,74 @@ async fn failed_final_policy_never_publishes_terminal_success() {
         service.client().snapshot().operations[&admitted.operation_id].status,
         OperationStatus::Succeeded
     );
+}
+
+#[tokio::test]
+async fn failed_final_policy_restores_prior_disconnected_topology() {
+    let target = profile("failed-connect-final-policy");
+    let (service, _, capture) = topology_service(BTreeSet::from([target.clone()]));
+    let generation = service
+        .client()
+        .snapshot()
+        .desired
+        .generation
+        .saturating_add(1);
+    capture.fail_final(generation);
+    let admitted = service
+        .client()
+        .submit(CommandRequest {
+            command: UserCommand::Connect {
+                profile_id: target.clone(),
+                conflict_acknowledgement: None,
+            },
+            idempotency_key: IdempotencyKey::new("failed-connect-final-policy"),
+            deadline: Deadline(1_000),
+        })
+        .await
+        .expect("connect admitted");
+    wait_for_condition(
+        || {
+            capture.tunnel_calls.lock().unwrap().iter().any(
+                |(profile_id, mutation, call_generation)| {
+                    profile_id == &target
+                        && *mutation == TunnelMutation::Connect
+                        && *call_generation == generation
+                },
+            )
+        },
+        "connect did not dispatch",
+    )
+    .await;
+    observe_connected(&service, &target, "tun-failed-connect-final-policy").await;
+    wait_for_condition(
+        || {
+            service.client().snapshot().operations[&admitted.operation_id].status
+                == OperationStatus::Failed
+        },
+        "final policy failure did not terminalize visibly",
+    )
+    .await;
+    wait_for_condition(
+        || {
+            service.client().snapshot().desired.tunnels.get(&target)
+                == Some(&RequestedTunnelState::Disconnected)
+        },
+        "failed final policy did not restore the prior disconnected intent",
+    )
+    .await;
+    wait_for_condition(
+        || {
+            capture.tunnel_calls.lock().unwrap().iter().any(
+                |(profile_id, mutation, call_generation)| {
+                    profile_id == &target
+                        && *mutation == TunnelMutation::Disconnect
+                        && *call_generation > generation
+                },
+            )
+        },
+        "failed final policy did not compensate the newly connected tunnel",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -3245,6 +3425,76 @@ async fn unanswered_interactive_challenge_fails_closed_without_recovery_connect(
                     .all(|operation| operation.status.is_terminal())
         },
         "challenge failure did not roll back connected intent",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn definitive_interactive_connect_failure_releases_ownership_and_rolls_back() {
+    struct DefinitiveFailure;
+    impl TunnelExecutor for DefinitiveFailure {
+        fn execute(
+            &self,
+            _: &TunnelWork,
+            _: &CancellationToken,
+        ) -> Result<TunnelExecutionReceipt, String> {
+            Err("OpenVPN management socket was not reachable".into())
+        }
+
+        fn classify_failure(&self, _: &str) -> WorkFailure {
+            WorkFailure::EffectFailed
+        }
+    }
+
+    let target = profile("interactive-startup-failure");
+    let supervisor = Arc::new(Supervisor::new(
+        AuthorityEpoch(1),
+        Arc::new(DefinitiveFailure),
+        Arc::new(OkPolicy),
+        2,
+        4,
+    ));
+    let service = ControlService::start_supervised(
+        ControlServiceConfig {
+            authority_epoch: AuthorityEpoch(1),
+            known_profiles: BTreeSet::from([target.clone()]),
+            profile_topologies: BTreeMap::from([(
+                target.clone(),
+                ProfileTopology {
+                    interactive_credentials: true,
+                    ..ProfileTopology::default()
+                },
+            )]),
+            freshness_poll_interval: Duration::from_millis(5),
+            ..ControlServiceConfig::default()
+        },
+        Arc::new(TestClock::default()),
+        ExecutionSelection::CanonicalAuthority,
+        supervisor.clone(),
+    );
+    let client = service.client();
+    let admitted = client
+        .submit(CommandRequest {
+            command: UserCommand::Connect {
+                profile_id: target.clone(),
+                conflict_acknowledgement: None,
+            },
+            idempotency_key: IdempotencyKey::new("interactive-startup-failure"),
+            deadline: Deadline(1_000),
+        })
+        .await
+        .expect("connect admitted");
+
+    wait_for_condition(
+        || {
+            let snapshot = client.snapshot();
+            snapshot.operations[&admitted.operation_id].status == OperationStatus::Failed
+                && snapshot.desired.tunnels.get(&target)
+                    == Some(&RequestedTunnelState::Disconnected)
+                && supervisor.profile_truth(&target).is_none()
+                && snapshot.operations.len() == 1
+        },
+        "definitive startup failure retained the operation, intent, or supervisor ownership",
     )
     .await;
 }

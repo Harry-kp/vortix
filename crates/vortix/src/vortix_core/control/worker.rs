@@ -91,6 +91,7 @@ pub struct TunnelWorkResult {
     pub adoption: Option<AdoptionEvidence>,
     pub handshake: Option<HandshakeEvidence>,
     pub openvpn_routes: Option<OpenVpnRouteEvidence>,
+    pub openvpn_dns: Option<crate::vortix_core::ports::dns::DnsRequest>,
     pub probe_receipts: Vec<ProbeReceipt>,
     pub result: Result<(), WorkFailure>,
 }
@@ -100,6 +101,7 @@ pub struct TunnelExecutionReceipt {
     pub adoption: Option<AdoptionEvidence>,
     pub handshake: Option<HandshakeEvidence>,
     pub openvpn_routes: Option<OpenVpnRouteEvidence>,
+    pub openvpn_dns: Option<crate::vortix_core::ports::dns::DnsRequest>,
     pub probe_receipts: Vec<ProbeReceipt>,
 }
 
@@ -117,6 +119,7 @@ impl TunnelExecutionReceipt {
                 adoption: Some(adoption),
                 handshake: None,
                 openvpn_routes: None,
+                openvpn_dns: None,
                 probe_receipts: Vec::new(),
             })
             .map_err(|error| error.to_string())
@@ -141,6 +144,7 @@ impl TunnelExecutionReceipt {
             adoption: Some(adoption),
             handshake: Some(handshake),
             openvpn_routes: None,
+            openvpn_dns: None,
             probe_receipts: Vec::new(),
         })
         .map_err(|error| error.to_string())
@@ -155,6 +159,14 @@ impl TunnelExecutionReceipt {
     #[must_use]
     pub fn with_openvpn_routes(mut self, routes: OpenVpnRouteEvidence) -> Self {
         self.openvpn_routes = Some(routes);
+        self
+    }
+
+    /// Attach the DNS request authenticated by the same completed `OpenVPN`
+    /// negotiation as this tunnel receipt.
+    #[must_use]
+    pub fn with_openvpn_dns(mut self, dns: crate::vortix_core::ports::dns::DnsRequest) -> Self {
+        self.openvpn_dns = Some(dns);
         self
     }
 }
@@ -874,12 +886,13 @@ fn spawn_profile_worker(
                 let lease_id = reservation.lease_id();
                 let result = execution.as_ref().map(|_| ()).map_err(|error| *error);
                 reservation.finish(work.mutation, result);
-                let (adoption, handshake, openvpn_routes, probe_receipts) =
-                    execution.map_or((None, None, None, Vec::new()), |receipt| {
+                let (adoption, handshake, openvpn_routes, openvpn_dns, probe_receipts) = execution
+                    .map_or((None, None, None, None, Vec::new()), |receipt| {
                         (
                             receipt.adoption,
                             receipt.handshake,
                             receipt.openvpn_routes,
+                            receipt.openvpn_dns,
                             receipt.probe_receipts,
                         )
                     });
@@ -892,6 +905,7 @@ fn spawn_profile_worker(
                     adoption,
                     handshake,
                     openvpn_routes,
+                    openvpn_dns,
                     probe_receipts,
                     result,
                 };

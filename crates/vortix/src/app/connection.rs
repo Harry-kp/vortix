@@ -7,6 +7,63 @@ use crate::utils;
 use crate::vortix_core::engine::Conflict;
 use crate::vortix_core::profile::ProfileId;
 
+#[derive(Clone, Copy)]
+pub(crate) enum PendingControlSubject {
+    Connection,
+    Reconnection,
+    Disconnection,
+    KillSwitch,
+}
+
+impl PendingControlSubject {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Connection => "connection",
+            Self::Reconnection => "reconnection",
+            Self::Disconnection => "disconnection",
+            Self::KillSwitch => "kill-switch change",
+        }
+    }
+
+    const fn dns_failure_message(self) -> &'static str {
+        match self {
+            Self::Connection | Self::Reconnection => {
+                "Couldn't connect safely. This VPN's DNS settings conflict with your system settings, so Vortix disconnected and restored your previous connection."
+            }
+            Self::Disconnection => {
+                "Couldn't finish disconnecting safely because your system rejected the network change. Vortix restored your previous connection."
+            }
+            Self::KillSwitch => {
+                "Couldn't change the kill switch safely because your system rejected the network change. Vortix restored your previous connection."
+            }
+        }
+    }
+}
+
+pub(crate) struct PendingControlOperation {
+    subject: PendingControlSubject,
+    admitted_after_generation: u64,
+}
+
+fn control_command_subject(
+    command: Option<&crate::vortix_core::control::UserCommand>,
+) -> Option<PendingControlSubject> {
+    use crate::vortix_core::control::UserCommand;
+    match command? {
+        UserCommand::Connect { .. } | UserCommand::ConnectExclusive { .. } => {
+            Some(PendingControlSubject::Connection)
+        }
+        UserCommand::Reconnect { .. } => Some(PendingControlSubject::Reconnection),
+        UserCommand::Disconnect { .. } | UserCommand::ForceDisconnect { .. } => {
+            Some(PendingControlSubject::Disconnection)
+        }
+        UserCommand::SetKillSwitch { .. } => Some(PendingControlSubject::KillSwitch),
+        UserCommand::ImportProfile { .. }
+        | UserCommand::RenameProfile { .. }
+        | UserCommand::DeleteProfile { .. } => None,
+    }
+}
+
 fn active_egress_paths(
     snapshot: &crate::vortix_core::control::ControlSnapshot,
 ) -> impl Iterator<Item = (&ProfileId, &crate::vortix_core::engine::Role, Option<&str>)> {
@@ -140,6 +197,9 @@ impl App {
                     self.log(&format!(
                         "CONTROL: Durable {subject} admitted as {operation_id:?}"
                     ));
+                    if let Some(subject) = control_command_subject(result.command.as_ref()) {
+                        self.track_control_operation(operation_id, subject);
+                    }
                 }
                 crate::cli::control::TuiControlCompletion::Admission(Err(error)) => {
                     if let Some(crate::vortix_core::control::UserCommand::SetKillSwitch { mode }) =
@@ -328,10 +388,90 @@ impl App {
             }
             _ => {}
         }
+        self.report_terminal_control_operations(&snapshot);
         self.control_snapshot = snapshot;
         if egress_path_changed {
             self.refresh_telemetry();
         }
+    }
+
+    pub(crate) fn track_control_operation(
+        &mut self,
+        operation_id: crate::vortix_core::control::OperationId,
+        subject: PendingControlSubject,
+    ) {
+        let already_terminal = self
+            .control_snapshot
+            .operations
+            .get(&operation_id)
+            .is_some_and(|operation| operation.status.is_terminal());
+        self.pending_control_operations.insert(
+            operation_id,
+            PendingControlOperation {
+                subject,
+                admitted_after_generation: self.control_snapshot.generation,
+            },
+        );
+        // The actor may reach terminal truth before the admission worker's
+        // result is drained. Recheck the already-held publication so that
+        // notification does not depend on channel scheduling order.
+        if already_terminal {
+            let current = self.control_snapshot.clone();
+            self.report_terminal_control_operations(&current);
+        }
+    }
+
+    fn report_terminal_control_operations(
+        &mut self,
+        snapshot: &crate::vortix_core::control::ControlSnapshot,
+    ) {
+        use crate::vortix_core::control::{OperationFailure, OperationResult, OperationStatus};
+
+        let completed = self
+            .pending_control_operations
+            .iter()
+            .filter_map(|(operation_id, pending)| {
+                snapshot
+                    .operations
+                    .get(operation_id)
+                    .filter(|operation| operation.status.is_terminal())
+                    .map(|operation| {
+                        (
+                            operation_id.clone(),
+                            pending.subject,
+                            operation.status,
+                            operation.result,
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+
+        for (operation_id, subject, status, result) in completed {
+            self.pending_control_operations.remove(&operation_id);
+            let message = match (status, result) {
+                (
+                    OperationStatus::Failed,
+                    Some(OperationResult::Failed(OperationFailure::DnsPolicyFailed)),
+                ) => Some(subject.dns_failure_message().to_string()),
+                (OperationStatus::Failed, Some(OperationResult::Failed(failure))) => {
+                    Some(format!("{} failed: {failure:?}", subject.label()))
+                }
+                (OperationStatus::Cancelled, _) => {
+                    Some(format!("{} was cancelled", subject.label()))
+                }
+                (OperationStatus::Expired, _) => Some(format!("{} timed out", subject.label())),
+                _ => None,
+            };
+            if let Some(message) = message {
+                self.show_toast(message, ToastType::Error);
+            }
+        }
+
+        self.pending_control_operations
+            .retain(|operation_id, pending| {
+                snapshot.operations.contains_key(operation_id)
+                    || snapshot.generation <= pending.admitted_after_generation
+            });
     }
 
     pub(crate) fn apply_local_catalog_update(

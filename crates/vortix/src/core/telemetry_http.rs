@@ -55,17 +55,39 @@ fn build_agent(family: IpFamily) -> Agent {
 /// `output.status.success()` + `stdout` semantics.
 #[must_use]
 pub fn get_text(url: &str, timeout: Duration) -> Option<String> {
-    let mut response = agent()
+    get_text_result(url, timeout).ok()
+}
+
+/// Failure returned by [`get_text_result`]. HTTP status is retained so a
+/// caller can distinguish a provider quota from a transient transport error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GetTextError {
+    /// The server returned a non-success HTTP status.
+    HttpStatus(u16),
+    /// DNS, TLS, timeout, redirect, or response-body failure.
+    Transport,
+}
+
+/// GET `url` while preserving a non-success HTTP status for provider policy.
+pub fn get_text_result(url: &str, timeout: Duration) -> Result<String, GetTextError> {
+    let response = agent()
         .get(url)
         .config()
         .timeout_global(Some(timeout))
         .build()
-        .call()
-        .ok()?;
+        .call();
+    let mut response = match response {
+        Ok(response) => response,
+        Err(ureq::Error::StatusCode(status)) => return Err(GetTextError::HttpStatus(status)),
+        Err(_) => return Err(GetTextError::Transport),
+    };
     if !response.status().is_success() {
-        return None;
+        return Err(GetTextError::HttpStatus(response.status().as_u16()));
     }
-    response.body_mut().read_to_string().ok()
+    response
+        .body_mut()
+        .read_to_string()
+        .map_err(|_| GetTextError::Transport)
 }
 
 /// GET `url` with the given per-call timeout and deserialize the
@@ -110,5 +132,35 @@ pub fn probe_ipv6(url: &str, timeout: Duration) -> Option<String> {
         None
     } else {
         Some(trimmed.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    use super::*;
+
+    #[test]
+    fn text_request_preserves_rate_limit_status() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+
+        let result = get_text_result(&format!("http://{address}/limited"), Duration::from_secs(1));
+        server.join().unwrap();
+
+        assert_eq!(result, Err(GetTextError::HttpStatus(429)));
     }
 }

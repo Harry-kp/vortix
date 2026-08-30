@@ -150,6 +150,14 @@ pub struct App {
     /// presses compose from this value until the snapshot acknowledges it.
     pub(crate) pending_control_killswitch_mode: Option<crate::state::KillSwitchMode>,
 
+    /// TUI-originated durable operations awaiting terminal truth. This is
+    /// client presentation state only; the control snapshot remains the
+    /// authority for completion and failure.
+    pub(crate) pending_control_operations: std::collections::BTreeMap<
+        crate::vortix_core::control::OperationId,
+        connection::PendingControlOperation,
+    >,
+
     control_request_sequence: u64,
 
     /// Directory imports feed the bounded TUI admission queue over multiple
@@ -225,6 +233,7 @@ impl App {
             control_challenge: None,
             last_control_connected_profile: None,
             pending_control_killswitch_mode: None,
+            pending_control_operations: std::collections::BTreeMap::new(),
             control_request_sequence: 0,
             pending_profile_imports: None,
 
@@ -407,6 +416,7 @@ impl App {
             control_challenge: None,
             last_control_connected_profile: None,
             pending_control_killswitch_mode: None,
+            pending_control_operations: std::collections::BTreeMap::new(),
             control_request_sequence: 0,
             pending_profile_imports: None,
 

@@ -255,6 +255,10 @@ pub struct ObservedState {
     /// Authenticated `OpenVPN` route truth fenced to the successful tunnel generation.
     #[serde(default)]
     pub openvpn_routes: BTreeMap<ProfileId, ObservedOpenVpnRoutes>,
+    /// DNS request authenticated by the completed `OpenVPN` negotiation and
+    /// fenced to the exact successful desired generation.
+    #[serde(default)]
+    pub openvpn_dns: BTreeMap<ProfileId, ObservedOpenVpnDns>,
     /// Ongoing typed health fenced to the successful desired generation.
     /// Snapshot subscribers consume this same record as CLI/TUI projections.
     #[serde(default)]
@@ -265,6 +269,12 @@ pub struct ObservedState {
 pub struct ObservedOpenVpnRoutes {
     pub desired_generation: u64,
     pub evidence: OpenVpnRouteEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservedOpenVpnDns {
+    pub desired_generation: u64,
+    pub request: crate::vortix_core::ports::dns::DnsRequest,
 }
 
 /// Generation-consistent ongoing health published by the control owner.
@@ -374,6 +384,9 @@ pub enum OperationStatus {
 pub enum OperationFailure {
     Timeout,
     Rejected,
+    /// System DNS ownership could not be established, so the control owner
+    /// restored the prior topology instead of leaving networking unusable.
+    DnsPolicyFailed,
     /// A managed `WireGuard` attempt failed its cryptographic liveness gate
     /// after exact-attempt cleanup was confirmed.
     HandshakeFailed,

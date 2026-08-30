@@ -30,8 +30,7 @@ use crate::vortix_core::openvpn_credentials::{
     DecodedOpenVpnCredentials, MAX_CREDENTIAL_FRAME_BYTES,
 };
 use crate::vortix_core::privileged::{
-    OpenVpnPlan, OpenVpnRoute, OpenVpnRouteEvidence, OpenVpnRouteGateway, OpenVpnRouteSetEvidence,
-    ProfileMaterialSlot, ResourceKind, ResourceTag,
+    OpenVpnPlan, OpenVpnRouteEvidence, ProfileMaterialSlot, ResourceKind, ResourceTag,
 };
 use crate::vortix_core::privileged::{ProfileMaterialRef, TunnelDescriptorRef, WireGuardPlan};
 use crate::vortix_core::profile::ProtocolKind;
@@ -1159,68 +1158,13 @@ fn read_openvpn_route_evidence(
     )?;
     let parsed = crate::vortix_protocol_openvpn::parser::parse_ovpn_conf(&config.text)
         .map_err(|_| OpenVpnStagingError::InvalidRouteEvidence)?;
-    if parsed.unsupported_route_semantics {
-        return Err(OpenVpnStagingError::InvalidRouteEvidence);
-    }
-    let configured = parsed
-        .routes
-        .iter()
-        .map(canonical_openvpn_route)
-        .collect::<Result<Vec<_>, _>>()?;
     let log = read_private_text_snapshot(
         &runtime_directory.join(LOG_FILE),
         expected_owner_uid,
         MAX_OPENVPN_LOG_EVIDENCE_BYTES,
         true,
     )?;
-    let pushed = crate::vortix_protocol_openvpn::push::pushed_route_evidence(&log.text)
-        .map_err(|_| OpenVpnStagingError::InvalidRouteEvidence)?;
-    if log.truncated && !pushed.push_reply_present() {
-        return Err(OpenVpnStagingError::InvalidRouteEvidence);
-    }
-    let pushed_routes = pushed
-        .routes()
-        .iter()
-        .map(canonical_openvpn_route)
-        .collect::<Result<Vec<_>, _>>()?;
-    let selected_remote_required = configured
-        .iter()
-        .chain(&pushed_routes)
-        .any(|route| route.gateway() == OpenVpnRouteGateway::RemoteHost);
-    let selected_remote = if selected_remote_required {
-        Some(
-            crate::vortix_protocol_openvpn::push::selected_remote_address(&log.text)
-                .map_err(|_| OpenVpnStagingError::InvalidRouteEvidence)?
-                .ok_or(OpenVpnStagingError::InvalidRouteEvidence)?,
-        )
-    } else {
-        None
-    };
-    OpenVpnRouteEvidence::new(
-        OpenVpnRouteSetEvidence::with_route_defaults(
-            configured,
-            parsed.redirect_gateway,
-            parsed.route_defaults,
-        )
-        .map_err(|_| OpenVpnStagingError::InvalidRouteEvidence)?,
-        OpenVpnRouteSetEvidence::with_route_defaults(
-            pushed_routes,
-            pushed.redirect_gateway().cloned(),
-            pushed.route_defaults(),
-        )
-        .map_err(|_| OpenVpnStagingError::InvalidRouteEvidence)?,
-    )
-    .and_then(|evidence| evidence.with_selected_remote(selected_remote))
-    .map_err(|_| OpenVpnStagingError::InvalidRouteEvidence)
-}
-
-fn canonical_openvpn_route(
-    route: &crate::vortix_protocol_openvpn::parser::OvpnRoute,
-) -> Result<OpenVpnRoute, OpenVpnStagingError> {
-    let destination =
-        crate::vortix_core::cidr::Cidr::new(route.destination.addr, route.destination.prefix_len)
-            .ok_or(OpenVpnStagingError::InvalidRouteEvidence)?;
-    OpenVpnRoute::with_gateway(destination, route.gateway, route.metric)
+    crate::vortix_protocol_openvpn::push::openvpn_route_evidence(&parsed, &log.text, log.truncated)
         .map_err(|_| OpenVpnStagingError::InvalidRouteEvidence)
 }
 

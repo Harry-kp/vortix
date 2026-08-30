@@ -1,4 +1,5 @@
-//! macOS DNS resolver via the `SystemConfiguration` framework.
+//! macOS DNS policy via the `SystemConfiguration` framework and scoped
+//! `/private/etc/resolver` files.
 //!
 //! replaced `scutil --dns` and `networksetup -getdnsservers`
 //! shell-outs with direct queries against `SCDynamicStore`. Both shell-outs
@@ -7,12 +8,20 @@
 //! string-parsing of their stdout is gone.
 
 use system_configuration::core_foundation::array::CFArray;
-use system_configuration::core_foundation::base::{TCFType, ToVoid};
+use system_configuration::core_foundation::base::{CFType, TCFType, ToVoid};
+use system_configuration::core_foundation::data::CFData;
 use system_configuration::core_foundation::dictionary::CFDictionary;
-use system_configuration::core_foundation::propertylist::CFPropertyList;
+use system_configuration::core_foundation::number::CFNumber;
+use system_configuration::core_foundation::propertylist::{
+    create_data, create_with_data, kCFPropertyListBinaryFormat_v1_0, kCFPropertyListImmutable,
+    CFPropertyList, CFPropertyListSubClass,
+};
 use system_configuration::core_foundation::string::CFString;
 use system_configuration::dynamic_store::{SCDynamicStore, SCDynamicStoreBuilder};
-use system_configuration::sys::schema_definitions::kSCPropNetDNSServerAddresses;
+use system_configuration::sys::schema_definitions::{
+    kSCDynamicStorePropNetPrimaryService, kSCPropNetDNSSearchDomains, kSCPropNetDNSSearchOrder,
+    kSCPropNetDNSServerAddresses,
+};
 
 use crate::vortix_core::ports::dns::DnsResolver;
 use crate::vortix_core::ports::dns::{
@@ -26,7 +35,15 @@ use crate::vortix_core::ports::owned_dns::{
 const RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
 const SC_STORE_NAME: &str = "vortix.dns";
 const GLOBAL_DNS_KEY: &str = "State:/Network/Global/DNS";
+const GLOBAL_IPV4_KEY: &str = "State:/Network/Global/IPv4";
 const SETUP_SERVICES_PATTERN: &str = "Setup:/Network/Service/.*/DNS";
+const VORTIX_PRIMARY_DNS_BACKUP_KEY: &str = "State:/Network/Service/vortix/DnsBackup";
+const VORTIX_PRIMARY_DNS_OWNER_KEY: &str = "State:/Network/Service/vortix/DnsOwner";
+const VORTIX_PRIMARY_DNS_RESOURCE_ID: &str = "macos:system-configuration:primary-dns";
+const MAX_DYNAMIC_STORE_VALUE_BYTES: usize = 128 * 1024;
+const MANAGED_DNS_PREFERENCES_DOMAIN: &str = "com.apple.dnsSettings.managed";
+const MANAGED_DNS_SETTINGS_KEY: &str = "DNSSettings";
+const MANAGED_DNS_PROTOCOL_KEY: &str = "DNSProtocol";
 
 /// macOS DNS resolution via `SCDynamicStore` + `/etc/resolv.conf`.
 pub struct MacDns;
@@ -73,15 +90,122 @@ impl DnsPolicyAdapter for MacDns {
     }
 }
 
-/// Vortix-owned `/etc/resolver` adapter. A configurable root keeps ownership,
-/// idempotency, and partial-failure behavior testable without touching the
-/// developer's resolver configuration.
+/// Vortix-owned macOS DNS adapter. Catch-all policy follows the active primary
+/// service with an exact dynamic-store backup; scoped domains use resolver
+/// files. A configurable test backend exercises ownership and crash recovery
+/// without touching the developer's resolver configuration.
 #[derive(Debug, Clone)]
 pub struct MacDnsPolicy {
     resolver_dir: std::path::PathBuf,
     expected_owner_uid: u32,
+    dynamic_store: MacDynamicStore,
+    managed_dns: ManagedDnsSource,
     #[cfg(test)]
     fail_readback_at: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ManagedDnsSource {
+    SystemPreferences,
+    #[cfg(test)]
+    Fixed(bool),
+}
+
+#[derive(Debug, Clone)]
+enum MacDynamicStore {
+    System,
+    #[cfg(test)]
+    Memory(std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>>),
+}
+
+#[allow(
+    unsafe_code,
+    reason = "CoreFoundation exposes managed preference ownership through its C API"
+)]
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFPreferencesAppValueIsForced(
+        key: *const std::ffi::c_void,
+        application_id: *const std::ffi::c_void,
+    ) -> u8;
+    fn CFPreferencesCopyAppValue(
+        key: *const std::ffi::c_void,
+        application_id: *const std::ffi::c_void,
+    ) -> *const std::ffi::c_void;
+}
+
+impl ManagedDnsSource {
+    fn forced_encrypted_dns(self) -> Result<bool, String> {
+        match self {
+            Self::SystemPreferences => system_forced_encrypted_dns(),
+            #[cfg(test)]
+            Self::Fixed(value) => Ok(value),
+        }
+    }
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the copied CoreFoundation preference is transferred into a retained safe wrapper"
+)]
+fn system_forced_encrypted_dns() -> Result<bool, String> {
+    let key = CFString::new(MANAGED_DNS_SETTINGS_KEY);
+    let domain = CFString::new(MANAGED_DNS_PREFERENCES_DOMAIN);
+    // SAFETY: both pointers are retained CFStrings for the duration of each
+    // CoreFoundation call.
+    let forced = unsafe { CFPreferencesAppValueIsForced(key.to_void(), domain.to_void()) != 0 };
+    if !forced {
+        return Ok(false);
+    }
+    // SAFETY: CopyAppValue follows the create rule. A non-null result is one
+    // owned property-list reference transferred into the safe wrapper.
+    let raw = unsafe { CFPreferencesCopyAppValue(key.to_void(), domain.to_void()) };
+    if raw.is_null() {
+        return Err("managed DNS ownership is forced but its settings are unavailable".into());
+    }
+    let settings = unsafe { CFPropertyList::wrap_under_create_rule(raw.cast()) };
+    managed_dns_protocol(&settings).map(|protocol| {
+        protocol.eq_ignore_ascii_case("HTTPS") || protocol.eq_ignore_ascii_case("TLS")
+    })
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the typed wrapper validates a value borrowed from a CoreFoundation dictionary"
+)]
+fn managed_dns_protocol(settings: &CFPropertyList) -> Result<String, String> {
+    let dictionary = settings
+        .clone()
+        .downcast_into::<CFDictionary>()
+        .ok_or_else(|| "managed DNS settings are not a dictionary".to_string())?;
+    let key = CFString::new(MANAGED_DNS_PROTOCOL_KEY);
+    let value = dictionary
+        .find(key.to_void())
+        .ok_or_else(|| "managed DNS settings have no DNSProtocol".to_string())?;
+    // SAFETY: the dictionary retains the borrowed value while the wrapper is
+    // constructed, and downcast validates that it is a CFString.
+    unsafe { CFPropertyList::wrap_under_get_rule((*value).cast()) }
+        .downcast_into::<CFString>()
+        .map(|value| value.to_string())
+        .ok_or_else(|| "managed DNS protocol is not a string".to_string())
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct PrimaryDnsOwner {
+    generation: u64,
+    profile_id: String,
+    interface: String,
+    service_key: String,
+    servers: Vec<String>,
+    search_domains: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct PrimaryDnsBackup {
+    service_key: String,
+    encoded_value: String,
 }
 
 #[derive(Debug)]
@@ -91,6 +215,241 @@ struct PlannedResolver {
     name: std::ffi::CString,
     body: String,
     original: Option<Vec<u8>>,
+}
+
+impl MacDynamicStore {
+    fn get(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
+        match self {
+            Self::System => {
+                let store = SCDynamicStoreBuilder::new(SC_STORE_NAME)
+                    .build()
+                    .ok_or_else(|| "cannot open the macOS dynamic store".to_string())?;
+                store.get(key).map(|value| encode_plist(&value)).transpose()
+            }
+            #[cfg(test)]
+            Self::Memory(values) => values
+                .lock()
+                .map_err(|_| "test dynamic store lock poisoned".to_string())
+                .map(|values| values.get(key).cloned()),
+        }
+    }
+
+    fn set(&self, key: &str, value: &[u8]) -> Result<(), String> {
+        if value.is_empty() || value.len() > MAX_DYNAMIC_STORE_VALUE_BYTES {
+            return Err("macOS dynamic-store value is empty or too large".to_string());
+        }
+        match self {
+            Self::System => {
+                let store = SCDynamicStoreBuilder::new(SC_STORE_NAME)
+                    .build()
+                    .ok_or_else(|| "cannot open the macOS dynamic store".to_string())?;
+                let value = decode_plist(value)?;
+                if store.set_raw(key, &value) {
+                    Ok(())
+                } else {
+                    Err(format!("cannot set macOS dynamic-store key {key}"))
+                }
+            }
+            #[cfg(test)]
+            Self::Memory(values) => values
+                .lock()
+                .map_err(|_| "test dynamic store lock poisoned".to_string())
+                .map(|mut values| {
+                    values.insert(key.to_string(), value.to_vec());
+                }),
+        }
+    }
+
+    fn remove(&self, key: &str) -> Result<(), String> {
+        match self {
+            Self::System => {
+                let store = SCDynamicStoreBuilder::new(SC_STORE_NAME)
+                    .build()
+                    .ok_or_else(|| "cannot open the macOS dynamic store".to_string())?;
+                if store.get(key).is_none() || store.remove(key) {
+                    Ok(())
+                } else {
+                    Err(format!("cannot remove macOS dynamic-store key {key}"))
+                }
+            }
+            #[cfg(test)]
+            Self::Memory(values) => values
+                .lock()
+                .map_err(|_| "test dynamic store lock poisoned".to_string())
+                .map(|mut values| {
+                    values.remove(key);
+                }),
+        }
+    }
+
+    fn flush_dns_cache(&self) -> Result<(), String> {
+        match self {
+            Self::System => {
+                let output = crate::platform::fixed_root_command::run(
+                    &["/usr/bin/dscacheutil"],
+                    &["-flushcache"],
+                    None,
+                    0,
+                )
+                .map_err(|_| "cannot run the macOS DNS cache flush".to_string())?;
+                if output.status.success() {
+                    Ok(())
+                } else {
+                    Err("macOS DNS cache flush failed".to_string())
+                }
+            }
+            #[cfg(test)]
+            Self::Memory(_) => Ok(()),
+        }
+    }
+
+    #[cfg(test)]
+    fn memory() -> Self {
+        let service_id = "test-primary-service";
+        let service_key = format!("Setup:/Network/Service/{service_id}/DNS");
+        let values = std::collections::BTreeMap::from([
+            (
+                GLOBAL_IPV4_KEY.to_string(),
+                primary_service_value(service_id).expect("test primary service value is valid"),
+            ),
+            (
+                service_key,
+                primary_dns_value(&["192.0.2.53".to_string()], &[])
+                    .expect("test DNS value is valid"),
+            ),
+        ]);
+        Self::Memory(std::sync::Arc::new(std::sync::Mutex::new(values)))
+    }
+}
+
+fn encode_plist(value: &CFPropertyList) -> Result<Vec<u8>, String> {
+    let data = create_data(value.as_CFTypeRef(), kCFPropertyListBinaryFormat_v1_0)
+        .map_err(|error| format!("cannot encode macOS dynamic-store value: {error:?}"))?;
+    let length = usize::try_from(data.len())
+        .map_err(|_| "macOS dynamic-store value has a negative length".to_string())?;
+    if length > MAX_DYNAMIC_STORE_VALUE_BYTES {
+        return Err("macOS dynamic-store value exceeds its fixed limit".to_string());
+    }
+    Ok(data.bytes().to_vec())
+}
+
+#[allow(
+    unsafe_code,
+    reason = "CoreFoundation create-rule ownership must be transferred into the safe wrapper"
+)]
+fn decode_plist(value: &[u8]) -> Result<CFPropertyList, String> {
+    if value.is_empty() || value.len() > MAX_DYNAMIC_STORE_VALUE_BYTES {
+        return Err("macOS dynamic-store value is empty or too large".to_string());
+    }
+    let (value, _) = create_with_data(CFData::from_buffer(value), kCFPropertyListImmutable)
+        .map_err(|error| format!("cannot decode macOS dynamic-store value: {error:?}"))?;
+    // SAFETY: `create_with_data` returned one retained property-list object.
+    Ok(unsafe { CFPropertyList::wrap_under_create_rule(value.cast()) })
+}
+
+fn encode_cf_value(value: impl CFPropertyListSubClass) -> Result<Vec<u8>, String> {
+    encode_plist(&value.into_CFPropertyList())
+}
+
+#[allow(
+    unsafe_code,
+    reason = "SystemConfiguration exports process-lifetime CoreFoundation string symbols"
+)]
+#[cfg(test)]
+fn primary_service_value(service_id: &str) -> Result<Vec<u8>, String> {
+    // SAFETY: the SystemConfiguration symbol is a process-lifetime CFString.
+    let key = unsafe { CFString::wrap_under_get_rule(kSCDynamicStorePropNetPrimaryService) };
+    let value = CFString::new(service_id);
+    let typed = CFDictionary::from_CFType_pairs(&[(key, value)]);
+    let value = unsafe { CFDictionary::wrap_under_get_rule(typed.as_concrete_TypeRef()) };
+    encode_cf_value(value)
+}
+
+#[allow(
+    unsafe_code,
+    reason = "SystemConfiguration exports process-lifetime CoreFoundation string symbols"
+)]
+fn primary_dns_value(servers: &[String], search_domains: &[String]) -> Result<Vec<u8>, String> {
+    // SAFETY: the SystemConfiguration symbols are process-lifetime CFStrings.
+    let server_key = unsafe { CFString::wrap_under_get_rule(kSCPropNetDNSServerAddresses) };
+    let search_key = unsafe { CFString::wrap_under_get_rule(kSCPropNetDNSSearchDomains) };
+    let order_key = unsafe { CFString::wrap_under_get_rule(kSCPropNetDNSSearchOrder) };
+    let servers = CFArray::from_CFTypes(
+        &servers
+            .iter()
+            .map(|server| CFString::new(server))
+            .collect::<Vec<_>>(),
+    );
+    let search_domains = CFArray::from_CFTypes(
+        &search_domains
+            .iter()
+            .map(|domain| CFString::new(domain))
+            .collect::<Vec<_>>(),
+    );
+    let order = CFNumber::from(5000_i32);
+    let mut pairs: Vec<(CFType, CFType)> = vec![
+        (server_key.as_CFType(), servers.as_CFType()),
+        (order_key.as_CFType(), order.as_CFType()),
+    ];
+    if !search_domains.is_empty() {
+        pairs.push((search_key.as_CFType(), search_domains.as_CFType()));
+    }
+    let typed = CFDictionary::from_CFType_pairs(&pairs);
+    let value = unsafe { CFDictionary::wrap_under_get_rule(typed.as_concrete_TypeRef()) };
+    encode_cf_value(value)
+}
+
+fn encode_json_string(value: &impl serde::Serialize) -> Result<Vec<u8>, String> {
+    let json = serde_json::to_string(value)
+        .map_err(|error| format!("cannot encode Vortix DNS ownership: {error}"))?;
+    encode_cf_value(CFString::new(&json))
+}
+
+fn decode_json_string<T: serde::de::DeserializeOwned>(value: &[u8]) -> Result<T, String> {
+    let value = decode_plist(value)?
+        .downcast_into::<CFString>()
+        .ok_or_else(|| "Vortix DNS ownership value is not a string".to_string())?;
+    serde_json::from_str(&value.to_string())
+        .map_err(|error| format!("cannot decode Vortix DNS ownership: {error}"))
+}
+
+fn plist_values_equal(left: &[u8], right: &[u8]) -> Result<bool, String> {
+    Ok(decode_plist(left)? == decode_plist(right)?)
+}
+
+#[allow(
+    unsafe_code,
+    reason = "typed wrappers validate values obtained through CoreFoundation dictionary pointers"
+)]
+#[cfg(test)]
+fn dns_server_addresses(value: &[u8]) -> Result<Vec<String>, String> {
+    let dictionary = decode_plist(value)?
+        .downcast_into::<CFDictionary>()
+        .ok_or_else(|| "macOS DNS value is not a dictionary".to_string())?;
+    // SAFETY: the SystemConfiguration symbol is a process-lifetime CFString.
+    let key = unsafe { kSCPropNetDNSServerAddresses };
+    let value = dictionary
+        .find(key.to_void())
+        .ok_or_else(|| "macOS DNS value has no ServerAddresses".to_string())?;
+    // SAFETY: this value was validated as an array by `downcast_into`; the
+    // dictionary retains it for the lifetime of this wrapper.
+    let array = unsafe {
+        CFPropertyList::wrap_under_get_rule((*value).cast())
+            .downcast_into::<CFArray>()
+            .ok_or_else(|| "macOS DNS ServerAddresses is not an array".to_string())?
+    };
+    let capacity = usize::try_from(array.len())
+        .map_err(|_| "macOS DNS ServerAddresses has a negative length".to_string())?;
+    let mut addresses = Vec::with_capacity(capacity);
+    for index in 0..array.len() {
+        let value = array
+            .get(index)
+            .ok_or_else(|| "macOS DNS ServerAddresses changed while reading".to_string())?;
+        // SAFETY: the DNS dictionary contract requires string array entries.
+        let value = unsafe { CFString::wrap_under_get_rule((*value).cast()) };
+        addresses.push(value.to_string());
+    }
+    Ok(addresses)
 }
 
 impl MacDnsPolicy {
@@ -137,6 +496,8 @@ impl MacDnsPolicy {
             // canonical root-owned location directly.
             resolver_dir: std::path::PathBuf::from("/private/etc/resolver"),
             expected_owner_uid: 0,
+            dynamic_store: MacDynamicStore::System,
+            managed_dns: ManagedDnsSource::SystemPreferences,
             #[cfg(test)]
             fail_readback_at: None,
         }
@@ -148,8 +509,17 @@ impl MacDnsPolicy {
         Self {
             resolver_dir,
             expected_owner_uid: crate::utils::effective_user_group_ids().0,
+            dynamic_store: MacDynamicStore::memory(),
+            managed_dns: ManagedDnsSource::Fixed(false),
             fail_readback_at: None,
         }
+    }
+
+    #[cfg(test)]
+    fn at_with_managed_encrypted_dns(resolver_dir: std::path::PathBuf) -> Self {
+        let mut policy = Self::at(resolver_dir);
+        policy.managed_dns = ManagedDnsSource::Fixed(true);
+        policy
     }
 
     #[cfg(test)]
@@ -158,8 +528,361 @@ impl MacDnsPolicy {
         Self {
             resolver_dir,
             expected_owner_uid: crate::utils::effective_user_group_ids().0,
+            dynamic_store: MacDynamicStore::memory(),
+            managed_dns: ManagedDnsSource::Fixed(false),
             fail_readback_at: Some(write_number),
         }
+    }
+
+    fn ensure_catch_all_dns_is_available(&self) -> Result<(), String> {
+        match self.managed_dns.forced_encrypted_dns() {
+            Ok(false) => Ok(()),
+            Ok(true) => Err(
+                "macOS managed encrypted DNS owns system resolution; refusing catch-all DNS because overriding device-management policy can leave networking unusable"
+                    .to_string(),
+            ),
+            Err(error) => Err(format!(
+                "cannot prove macOS managed DNS ownership before applying catch-all DNS: {error}"
+            )),
+        }
+    }
+
+    fn primary_assignment(policy: &DnsPolicy) -> Result<Option<&DnsAssignment>, String> {
+        let mut assignments = policy
+            .assignments
+            .iter()
+            .filter(|assignment| matches!(assignment.scope, DnsScope::CatchAll));
+        let assignment = assignments.next();
+        if assignments.next().is_some() {
+            return Err("macOS DNS policy contains more than one catch-all owner".to_string());
+        }
+        Ok(assignment)
+    }
+
+    fn primary_resource(generation: u64, assignment: &DnsAssignment) -> DnsOwnedResource {
+        DnsOwnedResource {
+            generation,
+            id: VORTIX_PRIMARY_DNS_RESOURCE_ID.to_string(),
+            profile_id: assignment.profile_id.clone(),
+            interface: assignment.interface.clone(),
+        }
+    }
+
+    fn primary_owner(
+        generation: u64,
+        assignment: &DnsAssignment,
+        service_key: String,
+    ) -> PrimaryDnsOwner {
+        PrimaryDnsOwner {
+            generation,
+            profile_id: assignment.profile_id.as_str().to_string(),
+            interface: assignment.interface.clone(),
+            service_key,
+            servers: assignment.servers.iter().map(ToString::to_string).collect(),
+            search_domains: assignment.search_domains.clone(),
+        }
+    }
+
+    #[allow(
+        unsafe_code,
+        reason = "typed wrapper validates the process-lifetime SystemConfiguration dictionary value"
+    )]
+    fn primary_service_key(&self) -> Result<String, String> {
+        let value = self
+            .dynamic_store
+            .get(GLOBAL_IPV4_KEY)?
+            .ok_or_else(|| "macOS has no active primary network service".to_string())?;
+        let dictionary = decode_plist(&value)?
+            .downcast_into::<CFDictionary>()
+            .ok_or_else(|| "macOS primary-service state is not a dictionary".to_string())?;
+        // SAFETY: the SystemConfiguration symbol is a process-lifetime CFString.
+        let key = unsafe { kSCDynamicStorePropNetPrimaryService };
+        let service = dictionary
+            .find(key.to_void())
+            .map(|value| unsafe { CFString::wrap_under_get_rule((*value).cast()) })
+            .ok_or_else(|| "macOS primary-service state has no PrimaryService".to_string())?;
+        let service = service.to_string();
+        if service.is_empty() || service.contains('/') || service.contains('\0') {
+            return Err("macOS primary service identifier is unsafe".to_string());
+        }
+        Ok(format!("Setup:/Network/Service/{service}/DNS"))
+    }
+
+    fn primary_owner_state(&self) -> Result<Option<PrimaryDnsOwner>, String> {
+        self.dynamic_store
+            .get(VORTIX_PRIMARY_DNS_OWNER_KEY)?
+            .map(|value| decode_json_string(&value))
+            .transpose()
+    }
+
+    fn primary_backup_state(&self) -> Result<Option<PrimaryDnsBackup>, String> {
+        self.dynamic_store
+            .get(VORTIX_PRIMARY_DNS_BACKUP_KEY)?
+            .map(|value| decode_json_string(&value))
+            .transpose()
+    }
+
+    fn set_primary_owner(&self, owner: &PrimaryDnsOwner) -> Result<(), String> {
+        let encoded = encode_json_string(owner)?;
+        self.dynamic_store
+            .set(VORTIX_PRIMARY_DNS_OWNER_KEY, &encoded)?;
+        match self.primary_owner_state()? {
+            Some(read_back) if read_back == *owner => Ok(()),
+            _ => Err("macOS primary DNS ownership read-back mismatch".to_string()),
+        }
+    }
+
+    fn set_primary_backup(&self, backup: &PrimaryDnsBackup) -> Result<(), String> {
+        let encoded = encode_json_string(backup)?;
+        self.dynamic_store
+            .set(VORTIX_PRIMARY_DNS_BACKUP_KEY, &encoded)?;
+        match self.primary_backup_state()? {
+            Some(read_back) if read_back == *backup => Ok(()),
+            _ => Err("macOS primary DNS backup read-back mismatch".to_string()),
+        }
+    }
+
+    fn owner_dns_value(owner: &PrimaryDnsOwner) -> Result<Vec<u8>, String> {
+        primary_dns_value(&owner.servers, &owner.search_domains)
+    }
+
+    fn backup_value(backup: &PrimaryDnsBackup) -> Result<Vec<u8>, String> {
+        use base64::Engine as _;
+
+        base64::engine::general_purpose::STANDARD
+            .decode(&backup.encoded_value)
+            .map_err(|_| "macOS primary DNS backup is not valid base64".to_string())
+            .and_then(|value| {
+                decode_plist(&value)?;
+                Ok(value)
+            })
+    }
+
+    fn new_backup(service_key: String, value: &[u8]) -> PrimaryDnsBackup {
+        use base64::Engine as _;
+
+        PrimaryDnsBackup {
+            service_key,
+            encoded_value: base64::engine::general_purpose::STANDARD.encode(value),
+        }
+    }
+
+    fn restore_dynamic_value(&self, key: &str, value: Option<&[u8]>) -> Result<(), String> {
+        value.map_or_else(
+            || self.dynamic_store.remove(key),
+            |value| self.dynamic_store.set(key, value),
+        )
+    }
+
+    fn apply_primary(
+        &self,
+        generation: u64,
+        assignment: &DnsAssignment,
+        previous: Option<(u64, &DnsAssignment)>,
+    ) -> Result<(), String> {
+        let old_owner = self.dynamic_store.get(VORTIX_PRIMARY_DNS_OWNER_KEY)?;
+        let old_backup = self.dynamic_store.get(VORTIX_PRIMARY_DNS_BACKUP_KEY)?;
+        let parsed_owner = old_owner
+            .as_deref()
+            .map(decode_json_string::<PrimaryDnsOwner>)
+            .transpose()?;
+        let parsed_backup = old_backup
+            .as_deref()
+            .map(decode_json_string::<PrimaryDnsBackup>)
+            .transpose()?;
+
+        let service_key = match (&parsed_owner, &parsed_backup) {
+            (Some(owner), Some(backup)) if owner.service_key == backup.service_key => {
+                owner.service_key.clone()
+            }
+            (None, Some(backup)) => backup.service_key.clone(),
+            (None, None) => self.primary_service_key()?,
+            _ => return Err("macOS primary DNS ownership and backup disagree".to_string()),
+        };
+        let old_service = self.dynamic_store.get(&service_key)?;
+        let old_service = old_service
+            .ok_or_else(|| "macOS primary network service has no DNS configuration".to_string())?;
+        let owner = Self::primary_owner(generation, assignment, service_key.clone());
+        let desired = Self::owner_dns_value(&owner)?;
+
+        let needs_backup = parsed_owner.is_none() && parsed_backup.is_none();
+        if let Some(current_owner) = parsed_owner.as_ref() {
+            let owner_is_desired = current_owner == &owner;
+            let owner_is_prior = previous.is_some_and(|(prior_generation, prior_assignment)| {
+                current_owner
+                    == &Self::primary_owner(prior_generation, prior_assignment, service_key.clone())
+            });
+            if !owner_is_desired && !owner_is_prior {
+                return Err("macOS primary DNS is owned by another generation".to_string());
+            }
+            let current_expected = Self::owner_dns_value(current_owner)?;
+            if !plist_values_equal(&old_service, &current_expected)?
+                && !plist_values_equal(&old_service, &desired)?
+            {
+                return Err("macOS primary DNS changed during replacement".to_string());
+            }
+        } else if parsed_backup.is_some() {
+            let backup = parsed_backup
+                .as_ref()
+                .ok_or_else(|| "macOS primary DNS backup disappeared".to_string())?;
+            let prior = Self::backup_value(backup)?;
+            let desired_owner = Self::primary_owner(generation, assignment, service_key.clone());
+            let desired = Self::owner_dns_value(&desired_owner)?;
+            if !plist_values_equal(&old_service, &prior)?
+                && !plist_values_equal(&old_service, &desired)?
+            {
+                return Err("macOS primary DNS changed during interrupted apply".to_string());
+            }
+        }
+
+        let result = (|| {
+            if needs_backup {
+                self.set_primary_backup(&Self::new_backup(service_key.clone(), &old_service))?;
+            }
+            self.dynamic_store.set(&service_key, &desired)?;
+            let read_back = self
+                .dynamic_store
+                .get(&service_key)?
+                .ok_or_else(|| "macOS primary DNS disappeared after apply".to_string())?;
+            if !plist_values_equal(&read_back, &desired)? {
+                return Err("macOS primary DNS read-back mismatch".to_string());
+            }
+            self.set_primary_owner(&owner)?;
+            self.dynamic_store.flush_dns_cache()
+        })();
+        if let Err(error) = result {
+            let mut rollback_errors = Vec::new();
+            if let Err(rollback) = self.restore_dynamic_value(&service_key, Some(&old_service)) {
+                rollback_errors.push(rollback);
+            }
+            if let Err(rollback) =
+                self.restore_dynamic_value(VORTIX_PRIMARY_DNS_OWNER_KEY, old_owner.as_deref())
+            {
+                rollback_errors.push(rollback);
+            }
+            if let Err(rollback) =
+                self.restore_dynamic_value(VORTIX_PRIMARY_DNS_BACKUP_KEY, old_backup.as_deref())
+            {
+                rollback_errors.push(rollback);
+            }
+            if let Err(rollback) = self.dynamic_store.flush_dns_cache() {
+                rollback_errors.push(rollback);
+            }
+            return if rollback_errors.is_empty() {
+                Err(error)
+            } else {
+                Err(format!(
+                    "{error}; primary DNS rollback failed: {}",
+                    rollback_errors.join("; ")
+                ))
+            };
+        }
+        Ok(())
+    }
+
+    fn verify_primary(&self, generation: u64, assignment: &DnsAssignment) -> Result<(), String> {
+        let owner = self
+            .primary_owner_state()?
+            .ok_or_else(|| "macOS primary DNS has no Vortix owner".to_string())?;
+        let expected = Self::primary_owner(generation, assignment, owner.service_key.clone());
+        if owner != expected {
+            return Err("macOS primary DNS ownership does not match policy".to_string());
+        }
+        let backup = self
+            .primary_backup_state()?
+            .ok_or_else(|| "macOS primary DNS has no Vortix backup".to_string())?;
+        if backup.service_key != owner.service_key {
+            return Err("macOS primary DNS ownership and backup disagree".to_string());
+        }
+        let actual = self
+            .dynamic_store
+            .get(&owner.service_key)?
+            .ok_or_else(|| "macOS primary DNS configuration is absent".to_string())?;
+        if plist_values_equal(&actual, &Self::owner_dns_value(&owner)?)? {
+            Ok(())
+        } else {
+            Err("macOS primary DNS configuration does not match policy".to_string())
+        }
+    }
+
+    fn release_primary(&self, resource: &DnsOwnedResource) -> Result<(), String> {
+        let owner = self.primary_owner_state()?;
+        let backup = self.primary_backup_state()?;
+        let Some(backup) = backup else {
+            return if owner.is_none() {
+                Ok(())
+            } else {
+                Err("macOS primary DNS backup is absent".to_string())
+            };
+        };
+        let prior = Self::backup_value(&backup)?;
+
+        let Some(owner) = owner else {
+            let actual = self
+                .dynamic_store
+                .get(&backup.service_key)?
+                .ok_or_else(|| "macOS primary DNS configuration is absent".to_string())?;
+            if !plist_values_equal(&actual, &prior)? {
+                return Err("macOS primary DNS changed during interrupted release".to_string());
+            }
+            return self.dynamic_store.remove(VORTIX_PRIMARY_DNS_BACKUP_KEY);
+        };
+        if owner.service_key != backup.service_key {
+            return Err("macOS primary DNS ownership and backup disagree".to_string());
+        }
+        if owner.generation != resource.generation
+            || owner.profile_id != resource.profile_id.as_str()
+            || owner.interface != resource.interface
+        {
+            return Ok(());
+        }
+        let actual = self
+            .dynamic_store
+            .get(&owner.service_key)?
+            .ok_or_else(|| "macOS primary DNS configuration is absent".to_string())?;
+        if !plist_values_equal(&actual, &Self::owner_dns_value(&owner)?)? {
+            return Err("refusing to overwrite externally changed macOS DNS".to_string());
+        }
+        self.dynamic_store.set(&owner.service_key, &prior)?;
+        let restored = self
+            .dynamic_store
+            .get(&owner.service_key)?
+            .ok_or_else(|| "restored macOS primary DNS disappeared".to_string())?;
+        if !plist_values_equal(&restored, &prior)? {
+            return Err("macOS primary DNS restoration read-back mismatch".to_string());
+        }
+        self.dynamic_store.flush_dns_cache()?;
+        self.dynamic_store.remove(VORTIX_PRIMARY_DNS_OWNER_KEY)?;
+        self.dynamic_store.remove(VORTIX_PRIMARY_DNS_BACKUP_KEY)
+    }
+
+    fn primary_resource_is_present(&self, resource: &DnsOwnedResource) -> bool {
+        self.primary_owner_state()
+            .ok()
+            .flatten()
+            .is_some_and(|owner| {
+                owner.generation == resource.generation
+                    && owner.profile_id == resource.profile_id.as_str()
+                    && owner.interface == resource.interface
+                    && self
+                        .dynamic_store
+                        .get(&owner.service_key)
+                        .ok()
+                        .flatten()
+                        .and_then(|actual| {
+                            Self::owner_dns_value(&owner)
+                                .ok()
+                                .and_then(|expected| plist_values_equal(&actual, &expected).ok())
+                        })
+                        == Some(true)
+            })
+    }
+
+    #[cfg(test)]
+    fn test_primary_dns_servers(&self) -> Vec<String> {
+        let service_key = self.primary_service_key().unwrap();
+        let value = self.dynamic_store.get(&service_key).unwrap().unwrap();
+        dns_server_addresses(&value).unwrap()
     }
 
     fn resources_for(
@@ -168,21 +891,15 @@ impl MacDnsPolicy {
         assignment: &DnsAssignment,
     ) -> Result<Vec<(DnsOwnedResource, std::path::PathBuf)>, String> {
         let names = match &assignment.scope {
-            DnsScope::CatchAll => vec![("default".to_string(), false)],
+            DnsScope::CatchAll | DnsScope::Suppressed => Vec::new(),
             DnsScope::Scoped { domains } => domains
                 .iter()
-                .map(|domain| {
-                    (
-                        domain.trim().trim_end_matches('.').to_ascii_lowercase(),
-                        true,
-                    )
-                })
+                .map(|domain| domain.trim().trim_end_matches('.').to_ascii_lowercase())
                 .collect(),
-            DnsScope::Suppressed => Vec::new(),
         };
         names
             .into_iter()
-            .map(|(name, is_scoped)| {
+            .map(|name| {
                 if name.is_empty()
                     || name == "."
                     || name == ".."
@@ -191,7 +908,7 @@ impl MacDnsPolicy {
                 {
                     return Err(format!("unsafe DNS resolver scope {name:?}"));
                 }
-                if is_scoped && name == "default" {
+                if name == "default" {
                     return Err(
                         "scoped DNS domain \"default\" collides with the catch-all resolver"
                             .to_string(),
@@ -212,12 +929,13 @@ impl MacDnsPolicy {
     }
 
     fn plan(&self, desired: &DnsPolicy) -> Result<Vec<PlannedResolver>, String> {
+        Self::primary_assignment(desired)?;
         let mut planned = Vec::new();
         let mut ids = std::collections::HashSet::new();
         for assignment in desired
             .assignments
             .iter()
-            .filter(|assignment| !matches!(assignment.scope, DnsScope::Suppressed))
+            .filter(|assignment| matches!(assignment.scope, DnsScope::Scoped { .. }))
         {
             let body = resolver_body(desired.generation, assignment);
             for (resource, path) in self.resources_for(desired.generation, assignment)? {
@@ -262,11 +980,8 @@ impl MacDnsPolicy {
         &self,
         policy: &DnsPolicy,
     ) -> Result<DnsEffectiveState, String> {
-        let owned = self
-            .plan(policy)?
-            .into_iter()
-            .map(|resolver| resolver.resource)
-            .collect::<Vec<_>>();
+        self.plan(policy)?;
+        let owned = self.resources_for_policy(policy)?;
         Ok(DnsEffectiveState {
             requested_generation: policy.generation,
             applied_generation: Some(policy.generation),
@@ -305,10 +1020,10 @@ impl MacDnsPolicy {
     }
 
     fn resources_for_policy(&self, policy: &DnsPolicy) -> Result<Vec<DnsOwnedResource>, String> {
-        policy
+        let mut resources: Vec<DnsOwnedResource> = policy
             .assignments
             .iter()
-            .filter(|assignment| !matches!(assignment.scope, DnsScope::Suppressed))
+            .filter(|assignment| matches!(assignment.scope, DnsScope::Scoped { .. }))
             .map(|assignment| self.resources_for(policy.generation, assignment))
             .collect::<Result<Vec<_>, _>>()
             .map(|groups| {
@@ -317,25 +1032,40 @@ impl MacDnsPolicy {
                     .flatten()
                     .map(|(resource, _)| resource)
                     .collect()
-            })
+            })?;
+        if let Some(primary) = Self::primary_assignment(policy)? {
+            resources.push(Self::primary_resource(policy.generation, primary));
+        }
+        Ok(resources)
     }
 
     fn managed_resource_ids(&self) -> Result<std::collections::BTreeSet<String>, String> {
         use std::os::unix::ffi::OsStrExt as _;
 
-        let Some(directory) = self.directory(false)? else {
-            return Ok(std::collections::BTreeSet::new());
-        };
         let mut managed = std::collections::BTreeSet::new();
-        for name in directory.entry_names()? {
-            let Some(body) = directory.read_managed(&name)? else {
-                continue;
-            };
-            debug_assert!(body.starts_with(VORTIX_RESOLVER_MARKER.as_bytes()));
-            let path = self
-                .resolver_dir
-                .join(std::ffi::OsStr::from_bytes(name.to_bytes()));
-            managed.insert(format!("macos:{}", path.display()));
+        if let Some(directory) = self.directory(false)? {
+            for name in directory.entry_names()? {
+                let Some(body) = directory.read_managed(&name)? else {
+                    continue;
+                };
+                debug_assert!(body.starts_with(VORTIX_RESOLVER_MARKER.as_bytes()));
+                let path = self
+                    .resolver_dir
+                    .join(std::ffi::OsStr::from_bytes(name.to_bytes()));
+                managed.insert(format!("macos:{}", path.display()));
+            }
+        }
+        match (self.primary_owner_state()?, self.primary_backup_state()?) {
+            (None, None) => {}
+            (Some(owner), Some(backup)) if owner.service_key == backup.service_key => {
+                managed.insert(VORTIX_PRIMARY_DNS_RESOURCE_ID.to_string());
+            }
+            (None, Some(_)) => {
+                // A crash after the backup write still represents owned state
+                // and must not be treated as an absent platform.
+                managed.insert(VORTIX_PRIMARY_DNS_RESOURCE_ID.to_string());
+            }
+            _ => return Err("macOS primary DNS ownership and backup disagree".to_string()),
         }
         Ok(managed)
     }
@@ -372,6 +1102,9 @@ impl MacDnsPolicy {
     }
 
     fn release(&self, resource: &DnsOwnedResource) -> Result<(), String> {
+        if resource.id == VORTIX_PRIMARY_DNS_RESOURCE_ID {
+            return self.release_primary(resource);
+        }
         let Some(path) = resource.id.strip_prefix("macos:") else {
             return Ok(());
         };
@@ -392,6 +1125,9 @@ impl MacDnsPolicy {
     }
 
     fn resource_is_present(&self, resource: &DnsOwnedResource) -> bool {
+        if resource.id == VORTIX_PRIMARY_DNS_RESOURCE_ID {
+            return self.primary_resource_is_present(resource);
+        }
         let Some(path) = resource.id.strip_prefix("macos:") else {
             return false;
         };
@@ -409,7 +1145,7 @@ impl MacDnsPolicy {
         for assignment in policy
             .assignments
             .iter()
-            .filter(|assignment| !matches!(assignment.scope, DnsScope::Suppressed))
+            .filter(|assignment| matches!(assignment.scope, DnsScope::Scoped { .. }))
         {
             let body = resolver_body(policy.generation, assignment).into_bytes();
             for (_, path) in self.resources_for(policy.generation, assignment)? {
@@ -427,6 +1163,7 @@ impl MacDnsPolicy {
         desired: &DnsPolicy,
         prior: Option<&DnsPolicy>,
     ) -> Result<(), String> {
+        self.validate_pending_primary(desired, prior)?;
         let desired = self.expected_resolver_bodies(desired)?;
         let prior = prior
             .map(|policy| self.expected_resolver_bodies(policy))
@@ -446,6 +1183,87 @@ impl MacDnsPolicy {
                 return Err(
                     "managed DNS inventory is not an exact intended/prior generation member"
                         .to_string(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_pending_primary(
+        &self,
+        desired: &DnsPolicy,
+        prior: Option<&DnsPolicy>,
+    ) -> Result<(), String> {
+        let owner = self.primary_owner_state()?;
+        let backup = self.primary_backup_state()?;
+        let (owner, backup) = match (owner, backup) {
+            (None, None) => return Ok(()),
+            (owner, Some(backup)) => (owner, backup),
+            (Some(_), None) => {
+                return Err("macOS primary DNS owner has no recovery backup".to_string())
+            }
+        };
+        if owner
+            .as_ref()
+            .is_some_and(|owner| owner.service_key != backup.service_key)
+        {
+            return Err("macOS primary DNS ownership and backup disagree".to_string());
+        }
+        let actual = self
+            .dynamic_store
+            .get(&backup.service_key)?
+            .ok_or_else(|| "macOS primary DNS configuration is absent".to_string())?;
+        let mut allowed = vec![Self::backup_value(&backup)?];
+        if let Some(assignment) = Self::primary_assignment(desired)? {
+            allowed.push(Self::owner_dns_value(&Self::primary_owner(
+                desired.generation,
+                assignment,
+                backup.service_key.clone(),
+            ))?);
+        }
+        if let Some(prior) = prior {
+            if let Some(assignment) = Self::primary_assignment(prior)? {
+                allowed.push(Self::owner_dns_value(&Self::primary_owner(
+                    prior.generation,
+                    assignment,
+                    backup.service_key.clone(),
+                ))?);
+            }
+        }
+        if !allowed
+            .iter()
+            .any(|candidate| plist_values_equal(&actual, candidate).unwrap_or(false))
+        {
+            return Err(
+                "macOS primary DNS is not an exact intended/prior/backup value".to_string(),
+            );
+        }
+        if let Some(owner) = owner {
+            let owner_matches_desired =
+                Self::primary_assignment(desired)?.is_some_and(|assignment| {
+                    owner
+                        == Self::primary_owner(
+                            desired.generation,
+                            assignment,
+                            backup.service_key.clone(),
+                        )
+                });
+            let owner_matches_prior = prior.is_some_and(|prior| {
+                Self::primary_assignment(prior)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|assignment| {
+                        owner
+                            == Self::primary_owner(
+                                prior.generation,
+                                assignment,
+                                backup.service_key.clone(),
+                            )
+                    })
+            });
+            if !owner_matches_desired && !owner_matches_prior {
+                return Err(
+                    "macOS primary DNS owner is not an intended/prior generation".to_string(),
                 );
             }
         }
@@ -472,12 +1290,39 @@ impl DnsPolicyAdapter for MacDnsPolicy {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the DNS transaction keeps preflight, ordered effects, rollback, and ownership publication together"
+    )]
     fn apply(
         &self,
         desired: &DnsPolicy,
-        _previous_desired: Option<&DnsPolicy>,
+        previous_desired: Option<&DnsPolicy>,
         previous_effective: &DnsEffectiveState,
     ) -> DnsEffectiveState {
+        let desired_primary = match Self::primary_assignment(desired) {
+            Ok(primary) => primary,
+            Err(error) => {
+                return DnsEffectiveState {
+                    requested_generation: desired.generation,
+                    applied_generation: previous_effective.applied_generation,
+                    status: DnsEffectiveStatus::Degraded,
+                    owned: self.actual_owned(&previous_effective.owned),
+                    errors: vec![error],
+                };
+            }
+        };
+        if desired_primary.is_some() {
+            if let Err(error) = self.ensure_catch_all_dns_is_available() {
+                return DnsEffectiveState {
+                    requested_generation: desired.generation,
+                    applied_generation: previous_effective.applied_generation,
+                    status: DnsEffectiveStatus::Degraded,
+                    owned: self.actual_owned(&previous_effective.owned),
+                    errors: vec![error],
+                };
+            }
+        }
         let planned = match self.plan(desired) {
             Ok(planned) => planned,
             Err(error) => {
@@ -494,6 +1339,25 @@ impl DnsPolicyAdapter for MacDnsPolicy {
                 };
             }
         };
+        let previous_primary = previous_desired
+            .and_then(|policy| Self::primary_assignment(policy).ok().flatten())
+            .map(|assignment| {
+                (
+                    previous_desired.expect("policy exists").generation,
+                    assignment,
+                )
+            });
+        if let Some(primary) = desired_primary {
+            if let Err(error) = self.apply_primary(desired.generation, primary, previous_primary) {
+                return DnsEffectiveState {
+                    requested_generation: desired.generation,
+                    applied_generation: previous_effective.applied_generation,
+                    status: DnsEffectiveStatus::Degraded,
+                    owned: self.actual_owned(&previous_effective.owned),
+                    errors: vec![error],
+                };
+            }
+        }
         let mut written = Vec::new();
         let apply_error = planned.iter().enumerate().find_map(|(index, resolver)| {
             #[cfg(not(test))]
@@ -525,6 +1389,21 @@ impl DnsPolicyAdapter for MacDnsPolicy {
         if let Some(error) = apply_error {
             let mut errors = vec![error];
             errors.extend(self.rollback(&written));
+            if let Some(primary) = desired_primary {
+                let primary_rollback = previous_primary.map_or_else(
+                    || self.release_primary(&Self::primary_resource(desired.generation, primary)),
+                    |(generation, assignment)| {
+                        self.apply_primary(
+                            generation,
+                            assignment,
+                            Some((desired.generation, primary)),
+                        )
+                    },
+                );
+                if let Err(error) = primary_rollback {
+                    errors.push(format!("failed to roll back macOS primary DNS: {error}"));
+                }
+            }
             let desired_resources = planned.iter().map(|resolver| &resolver.resource);
             let actual =
                 self.actual_owned(desired_resources.chain(previous_effective.owned.iter()));
@@ -541,10 +1420,13 @@ impl DnsPolicyAdapter for MacDnsPolicy {
             };
         }
 
-        let owned = planned
+        let mut owned = planned
             .iter()
             .map(|resolver| resolver.resource.clone())
             .collect::<Vec<_>>();
+        if let Some(primary) = desired_primary {
+            owned.push(Self::primary_resource(desired.generation, primary));
+        }
 
         let desired_ids = owned
             .iter()
@@ -588,7 +1470,7 @@ impl DnsPolicyAdapter for MacDnsPolicy {
         for assignment in desired
             .assignments
             .iter()
-            .filter(|assignment| !matches!(assignment.scope, DnsScope::Suppressed))
+            .filter(|assignment| matches!(assignment.scope, DnsScope::Scoped { .. }))
         {
             let expected = resolver_body(desired.generation, assignment);
             match self.resources_for(desired.generation, assignment) {
@@ -613,6 +1495,18 @@ impl DnsPolicyAdapter for MacDnsPolicy {
                 }
                 Err(error) => errors.push(error),
             }
+        }
+        match Self::primary_assignment(desired) {
+            Ok(Some(primary)) => {
+                if let Err(error) = self.ensure_catch_all_dns_is_available() {
+                    errors.push(error);
+                }
+                if let Err(error) = self.verify_primary(desired.generation, primary) {
+                    errors.push(error);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => errors.push(error),
         }
         if errors.is_empty() {
             Ok(())
@@ -1192,12 +2086,15 @@ mod policy_tests {
     }
 
     #[test]
-    fn repeated_apply_and_release_are_idempotent_and_generation_owned() {
+    fn catch_all_uses_primary_service_and_restores_it_on_release() {
         let temp = tempfile::tempdir().unwrap();
         let adapter = MacDnsPolicy::at(temp.path().join("resolver"));
+        let original = adapter.test_primary_dns_servers();
         let first = policy(1, "1.1.1.1");
         let applied = adapter.apply(&first, None, &DnsEffectiveState::default());
         assert_eq!(applied.status, DnsEffectiveStatus::Applied);
+        assert_eq!(adapter.test_primary_dns_servers(), vec!["1.1.1.1"]);
+        assert!(!temp.path().join("resolver/default").exists());
         let repeated = adapter.apply(&first, Some(&first), &applied);
         assert_eq!(repeated.status, DnsEffectiveStatus::Applied);
 
@@ -1207,9 +2104,28 @@ mod policy_tests {
         };
         let released = adapter.apply(&released_policy, Some(&first), &repeated);
         assert_eq!(released.status, DnsEffectiveStatus::Released);
+        assert_eq!(adapter.test_primary_dns_servers(), original);
         assert!(!temp.path().join("resolver/default").exists());
         let repeated_release = adapter.apply(&released_policy, Some(&released_policy), &released);
         assert_eq!(repeated_release.status, DnsEffectiveStatus::Released);
+    }
+
+    #[test]
+    fn managed_encrypted_dns_refuses_catch_all_before_mutating_primary_dns() {
+        let temp = tempfile::tempdir().unwrap();
+        let adapter = MacDnsPolicy::at_with_managed_encrypted_dns(temp.path().join("resolver"));
+        let original = adapter.test_primary_dns_servers();
+
+        let effective = adapter.apply(&policy(1, "10.80.0.1"), None, &DnsEffectiveState::default());
+
+        assert_eq!(effective.status, DnsEffectiveStatus::Degraded);
+        assert!(effective.owned.is_empty());
+        assert!(effective.errors.iter().any(|error| {
+            error.contains("managed encrypted DNS") && error.contains("refusing catch-all DNS")
+        }));
+        assert_eq!(adapter.test_primary_dns_servers(), original);
+        assert!(adapter.primary_owner_state().unwrap().is_none());
+        assert!(adapter.primary_backup_state().unwrap().is_none());
     }
 
     #[test]
@@ -1228,7 +2144,8 @@ mod policy_tests {
         let mut adapter = MacDnsPolicy::at(resolver_dir.clone());
         assert_eq!(OwnedDns::audit_absent(&mut adapter), Ok(()));
         let effective = adapter.apply(&policy(1, "1.1.1.1"), None, &DnsEffectiveState::default());
-        assert_eq!(effective.status, DnsEffectiveStatus::Degraded);
+        assert_eq!(effective.status, DnsEffectiveStatus::Applied);
+        assert_eq!(adapter.test_primary_dns_servers(), vec!["1.1.1.1"]);
         assert_eq!(
             std::fs::read_to_string(resolver_dir.join("default")).unwrap(),
             "nameserver 9.9.9.9\n"
@@ -1245,9 +2162,73 @@ mod policy_tests {
         let second = adapter.apply(&second_policy, Some(&first_policy), &first);
         assert_eq!(second.status, DnsEffectiveStatus::Applied);
         adapter.release(&first.owned[0]).unwrap();
-        let body = std::fs::read_to_string(temp.path().join("resolver/default")).unwrap();
-        assert!(body.contains("generation: 2"));
-        assert!(body.contains("nameserver 8.8.8.8"));
+        assert_eq!(adapter.test_primary_dns_servers(), vec!["8.8.8.8"]);
+    }
+
+    #[test]
+    fn interrupted_primary_apply_resumes_from_the_exact_backup() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut adapter = MacDnsPolicy::at(temp.path().join("resolver"));
+        let service_key = adapter.primary_service_key().unwrap();
+        let original = adapter.dynamic_store.get(&service_key).unwrap().unwrap();
+        adapter
+            .set_primary_backup(&MacDnsPolicy::new_backup(service_key, &original))
+            .unwrap();
+
+        let desired = policy(7, "1.1.1.1");
+        OwnedDns::recover_pending(&mut adapter, &desired, None).unwrap();
+        assert_eq!(OwnedDns::audit(&mut adapter, &desired), Ok(()));
+        assert_eq!(adapter.test_primary_dns_servers(), vec!["1.1.1.1"]);
+
+        let resource = MacDnsPolicy::primary_resource(7, &desired.assignments[0]);
+        adapter.release(&resource).unwrap();
+        assert_eq!(adapter.test_primary_dns_servers(), vec!["192.0.2.53"]);
+    }
+
+    #[test]
+    fn interrupted_primary_replacement_accepts_only_the_intended_next_value() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut adapter = MacDnsPolicy::at(temp.path().join("resolver"));
+        let prior = policy(4, "1.1.1.1");
+        OwnedDns::apply(&mut adapter, &prior, ExpectedDnsState::Absent).unwrap();
+        let desired = policy(5, "8.8.8.8");
+        let service_key = adapter.primary_service_key().unwrap();
+
+        // Model a crash after replacing the service DNS but before advancing
+        // the Vortix owner marker from generation 4 to generation 5.
+        adapter
+            .dynamic_store
+            .set(
+                &service_key,
+                &primary_dns_value(&["8.8.8.8".to_string()], &[]).unwrap(),
+            )
+            .unwrap();
+
+        OwnedDns::recover_pending(&mut adapter, &desired, Some(&prior)).unwrap();
+        assert_eq!(OwnedDns::audit(&mut adapter, &desired), Ok(()));
+        assert_eq!(adapter.test_primary_dns_servers(), vec!["8.8.8.8"]);
+    }
+
+    #[test]
+    fn external_primary_dns_change_is_never_overwritten_on_release() {
+        let temp = tempfile::tempdir().unwrap();
+        let adapter = MacDnsPolicy::at(temp.path().join("resolver"));
+        let desired = policy(3, "1.1.1.1");
+        let effective = adapter.apply(&desired, None, &DnsEffectiveState::default());
+        assert_eq!(effective.status, DnsEffectiveStatus::Applied);
+        let service_key = adapter.primary_service_key().unwrap();
+        adapter
+            .dynamic_store
+            .set(
+                &service_key,
+                &primary_dns_value(&["9.9.9.9".to_string()], &[]).unwrap(),
+            )
+            .unwrap();
+
+        assert!(adapter.release(&effective.owned[0]).is_err());
+        assert_eq!(adapter.test_primary_dns_servers(), vec!["9.9.9.9"]);
+        assert!(adapter.primary_owner_state().unwrap().is_some());
+        assert!(adapter.primary_backup_state().unwrap().is_some());
     }
 
     #[test]
@@ -1324,6 +2305,7 @@ mod policy_tests {
         let mut adapter = MacDnsPolicy::at(resolver_dir.clone());
         let expected = policy(1, "1.1.1.1");
         OwnedDns::apply(&mut adapter, &expected, ExpectedDnsState::Absent).unwrap();
+        std::fs::create_dir_all(&resolver_dir).unwrap();
         std::fs::write(
             resolver_dir.join("stale.example"),
             "# managed-by: vortix dns\n# generation: 9\nnameserver 8.8.8.8\n",
@@ -1379,7 +2361,7 @@ mod policy_tests {
         assert_eq!(
             OwnedDns::apply(
                 &mut linked_directory,
-                &policy(1, "1.1.1.1"),
+                &scoped_policy(1, "1.1.1.1", &["a.example"]),
                 ExpectedDnsState::Absent
             ),
             Err(OwnedDnsError::FailedBeforeEffect)
@@ -1390,12 +2372,12 @@ mod policy_tests {
         std::fs::create_dir_all(&resolver_dir).unwrap();
         let foreign = temp.path().join("foreign-resolver");
         std::fs::write(&foreign, "nameserver 9.9.9.9\n").unwrap();
-        symlink(&foreign, resolver_dir.join("default")).unwrap();
+        symlink(&foreign, resolver_dir.join("a.example")).unwrap();
         let mut linked_entry = MacDnsPolicy::at(resolver_dir.clone());
         assert_eq!(
             OwnedDns::apply(
                 &mut linked_entry,
-                &policy(1, "1.1.1.1"),
+                &scoped_policy(1, "1.1.1.1", &["a.example"]),
                 ExpectedDnsState::Absent
             ),
             Err(OwnedDnsError::FailedBeforeEffect)
@@ -1405,16 +2387,23 @@ mod policy_tests {
             "nameserver 9.9.9.9\n"
         );
 
-        std::fs::remove_file(resolver_dir.join("default")).unwrap();
+        std::fs::remove_file(resolver_dir.join("a.example")).unwrap();
         std::fs::write(
-            resolver_dir.join("default"),
+            resolver_dir.join("a.example"),
             "# managed-by: vortix dns\n# generation: 1\nnameserver 1.1.1.1\n",
         )
         .unwrap();
-        std::fs::hard_link(resolver_dir.join("default"), resolver_dir.join("duplicate")).unwrap();
+        std::fs::hard_link(
+            resolver_dir.join("a.example"),
+            resolver_dir.join("duplicate"),
+        )
+        .unwrap();
         let mut hardlinked = MacDnsPolicy::at(resolver_dir);
         assert_eq!(
-            OwnedDns::audit(&mut hardlinked, &policy(1, "1.1.1.1")),
+            OwnedDns::audit(
+                &mut hardlinked,
+                &scoped_policy(1, "1.1.1.1", &["a.example"])
+            ),
             Err(OwnedDnsError::EffectMayHaveApplied)
         );
     }

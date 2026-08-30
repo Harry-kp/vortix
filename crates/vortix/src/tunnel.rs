@@ -554,13 +554,18 @@ impl CanonicalTunnelExecutor {
     ) -> Result<crate::vortix_core::control::worker::TunnelExecutionReceipt, String> {
         use crate::vortix_core::control::worker::TunnelExecutionReceipt;
         if work.protocol != TunnelKindTag::WireGuard {
-            return TunnelExecutionReceipt::attested(
+            let receipt = TunnelExecutionReceipt::attested(
                 work.profile_id.clone(),
                 handle.interface_name.clone(),
                 work.protocol,
                 handle.pid,
                 format!("openvpn-generation:{}", work.revision.generation),
-            );
+            )
+            .map(|receipt| receipt.with_openvpn_dns(handle.dns_request.clone()))?;
+            return Ok(match handle.openvpn_routes.clone() {
+                Some(routes) => receipt.with_openvpn_routes(routes),
+                None => receipt,
+            });
         }
         let handshake = handle
             .handshake
@@ -746,6 +751,7 @@ impl CanonicalTunnelExecutor {
                     process_ownership: None,
                     teardown_config: Some(owned.teardown_config),
                     dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
+                    openvpn_routes: None,
                 };
                 Ok(Some((
                     tunnel_for(
@@ -789,6 +795,27 @@ impl CanonicalTunnelExecutor {
         {
             return Err("OpenVPN custodian operation does not match durable control intent".into());
         }
+        let tunnel = tunnel_for(
+            Protocol::OpenVPN,
+            &self.settings.config_dir,
+            &self.settings.openvpn_verbosity,
+            self.settings.connect_timeout_secs,
+        );
+        let runtime_evidence = match &tunnel {
+            TunnelKind::OpenVpn(openvpn) => openvpn
+                .requested_runtime_evidence(&profile)
+                .map_err(|error| error.to_string())?,
+            _ => return Err("OpenVPN recovery constructed the wrong protocol adapter".into()),
+        };
+        let dns_request = match runtime_evidence.dns {
+            crate::vortix_protocol_openvpn::OvpnDnsEvidence::Observed(request)
+            | crate::vortix_protocol_openvpn::OvpnDnsEvidence::ExplicitlyEmpty(request) => request,
+            crate::vortix_protocol_openvpn::OvpnDnsEvidence::Unavailable { reason, .. } => {
+                return Err(format!(
+                    "recovered OpenVPN DNS negotiation evidence is unavailable: {reason}"
+                ));
+            }
+        };
         let handle = TunnelHandle {
             profile_id: work.profile_id.clone(),
             display_name: profile.display_name,
@@ -801,17 +828,10 @@ impl CanonicalTunnelExecutor {
             probe_receipts: Vec::new(),
             process_ownership: Some(custody.identity),
             teardown_config: None,
-            dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
+            dns_request,
+            openvpn_routes: Some(runtime_evidence.routes),
         };
-        Ok((
-            tunnel_for(
-                Protocol::OpenVPN,
-                &self.settings.config_dir,
-                &self.settings.openvpn_verbosity,
-                self.settings.connect_timeout_secs,
-            ),
-            handle,
-        ))
+        Ok((tunnel, handle))
     }
 }
 
@@ -833,7 +853,10 @@ impl crate::vortix_core::control::worker::TunnelExecutor for CanonicalTunnelExec
 
     fn classify_failure(&self, error: &str) -> crate::vortix_core::control::worker::WorkFailure {
         use crate::vortix_core::control::worker::WorkFailure;
-        if error.contains("ownership is ambiguous") || error.contains("outcome is ambiguous") {
+        if error.contains("ownership is ambiguous")
+            || error.contains("outcome is ambiguous")
+            || error.contains("ambiguous-owned")
+        {
             WorkFailure::OutcomeUnknown
         } else if error.contains("interactive challenge") {
             WorkFailure::ChallengeFailed
@@ -1041,6 +1064,7 @@ mod canonical_tests {
             process_ownership: None,
             teardown_config: None::<TunnelTeardownConfig>,
             dns_request: DnsRequest::default(),
+            openvpn_routes: None,
         }
     }
 
@@ -1049,6 +1073,33 @@ mod canonical_tests {
         let exact = CanonicalTunnelExecutor::receipt_for(&work(7), &handle(7)).unwrap();
         assert_eq!(exact.handshake.unwrap().generation, 7);
         assert!(CanonicalTunnelExecutor::receipt_for(&work(8), &handle(7)).is_err());
+    }
+
+    #[test]
+    fn canonical_openvpn_receipt_retains_negotiated_runtime_evidence() {
+        let mut work = work(7);
+        work.protocol = TunnelKindTag::OpenVpn;
+        let mut handle = handle(7);
+        handle.kind = TunnelKindTag::OpenVpn;
+        handle.handshake = None;
+        handle.pid = Some(123);
+        handle.dns_request = DnsRequest {
+            servers: vec!["1.1.1.1".parse().unwrap()],
+            ..DnsRequest::default()
+        };
+        handle.openvpn_routes = Some(
+            crate::vortix_protocol_openvpn::push::openvpn_route_evidence(
+                &crate::vortix_protocol_openvpn::parser::parse_ovpn_conf("client\n").unwrap(),
+                "PUSH_REPLY,redirect-gateway def1\nInitialization Sequence Completed\n",
+                false,
+            )
+            .unwrap(),
+        );
+
+        let receipt = CanonicalTunnelExecutor::receipt_for(&work, &handle).unwrap();
+
+        assert_eq!(receipt.openvpn_dns, Some(handle.dns_request));
+        assert_eq!(receipt.openvpn_routes, handle.openvpn_routes);
     }
 
     #[test]
@@ -1118,6 +1169,11 @@ mod canonical_tests {
         assert_eq!(
             executor.classify_failure("interactive challenge was cancelled or expired"),
             WorkFailure::ChallengeFailed
+        );
+        assert_eq!(
+            executor
+                .classify_failure("OpenVPN startup teardown is ambiguous-owned for generation 7"),
+            WorkFailure::OutcomeUnknown
         );
     }
 

@@ -111,6 +111,7 @@ pub enum ReconcileAction {
     },
     ClearTombstone {
         profile_id: ProfileId,
+        revision: TunnelRevision,
     },
 }
 
@@ -131,20 +132,22 @@ fn target_tunnel_revision(input: &ReconcileInput, profile_id: &ProfileId) -> Tun
         })
 }
 
-/// Compute a complete reconciliation plan without performing side effects.
-#[must_use]
-pub fn plan_reconciliation(input: &ReconcileInput) -> ReconcilePlan {
-    let mut actions = Vec::new();
-    let profiles = input
+fn reconciliation_profiles(input: &ReconcileInput) -> BTreeSet<ProfileId> {
+    input
         .desired_connected
         .iter()
         .chain(input.observations.keys())
         .chain(input.disconnect_tombstones.keys())
         .chain(input.in_flight.keys())
         .cloned()
-        .collect::<BTreeSet<_>>();
+        .collect()
+}
 
-    for profile_id in profiles {
+/// Compute a complete reconciliation plan without performing side effects.
+#[must_use]
+pub fn plan_reconciliation(input: &ReconcileInput) -> ReconcilePlan {
+    let mut actions = Vec::new();
+    for profile_id in reconciliation_profiles(input) {
         let desired = input.desired_connected.contains(&profile_id);
         let observed = input.observations.get(&profile_id);
         let in_flight = input.in_flight.get(&profile_id);
@@ -152,7 +155,10 @@ pub fn plan_reconciliation(input: &ReconcileInput) -> ReconcilePlan {
 
         if let Some(tombstone) = input.disconnect_tombstones.get(&profile_id) {
             if observed.is_some_and(|fact| fact.evidence.is_fresh_absence()) {
-                actions.push(ReconcileAction::ClearTombstone { profile_id });
+                actions.push(ReconcileAction::ClearTombstone {
+                    profile_id,
+                    revision: tombstone.revision,
+                });
             } else if tombstone.teardown_failed && in_flight.is_none() {
                 actions.push(ReconcileAction::Disconnect {
                     profile_id,

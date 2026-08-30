@@ -61,6 +61,7 @@ fn status(generation: u64, peers: Vec<TunnelPeerStatus>) -> TunnelStatus {
             process_ownership: None,
             teardown_config: None,
             dns_request: DnsRequest::default(),
+            openvpn_routes: None,
         },
         bytes_rx: 0,
         bytes_tx: 0,

@@ -30,6 +30,7 @@ fn test_app() -> App {
         control_challenge: None,
         last_control_connected_profile: None,
         pending_control_killswitch_mode: None,
+        pending_control_operations: std::collections::BTreeMap::new(),
         control_request_sequence: 0,
         pending_profile_imports: None,
         should_quit: false,
@@ -2931,6 +2932,112 @@ fn remote_profile_terminal_failure_is_reported_to_the_user() {
     let toast = app.toast.as_ref().expect("profile failure must be visible");
     assert_eq!(toast.toast_type, ToastType::Error);
     assert!(toast.message.contains("Failed(Rejected)"));
+}
+
+#[test]
+fn ip_only_refresh_for_same_exit_keeps_known_location() {
+    let mut app = test_app();
+    app.runtime.public_ip = "203.0.113.7".to_string();
+    app.runtime.isp = "Example ISP".to_string();
+    app.runtime.location = "Agra, IN".to_string();
+
+    app.handle_message(Message::Telemetry(
+        crate::core::telemetry::TelemetryUpdate::EgressIdentity(
+            crate::core::telemetry::EgressIdentity {
+                public_ip: "203.0.113.7".to_string(),
+                isp: None,
+                location: None,
+            },
+        ),
+    ));
+
+    assert_eq!(app.runtime.isp, "Example ISP");
+    assert_eq!(app.runtime.location, "Agra, IN");
+}
+
+#[test]
+fn ip_only_refresh_for_changed_exit_clears_stale_location() {
+    let mut app = test_app();
+    app.runtime.public_ip = "203.0.113.7".to_string();
+    app.runtime.isp = "Old ISP".to_string();
+    app.runtime.location = "Agra, IN".to_string();
+
+    app.handle_message(Message::Telemetry(
+        crate::core::telemetry::TelemetryUpdate::EgressIdentity(
+            crate::core::telemetry::EgressIdentity {
+                public_ip: "198.51.100.9".to_string(),
+                isp: None,
+                location: None,
+            },
+        ),
+    ));
+
+    assert_eq!(app.runtime.isp, "Unknown");
+    assert_eq!(app.runtime.location, "Unknown");
+}
+
+#[test]
+fn unavailable_egress_probe_never_replaces_the_real_ip_cache() {
+    let mut app = test_app();
+    app.runtime.scanner_first_tick_done = true;
+    app.runtime.last_kernel_session_count = 0;
+    app.runtime.real_ip = Some("203.0.113.7".to_string());
+
+    app.handle_message(Message::Telemetry(
+        crate::core::telemetry::TelemetryUpdate::EgressUnavailable,
+    ));
+
+    assert_eq!(app.runtime.public_ip, "Unavailable");
+    assert_eq!(app.runtime.real_ip.as_deref(), Some("203.0.113.7"));
+}
+
+#[test]
+fn terminal_dns_policy_failure_is_shown_to_tui_user() {
+    use crate::vortix_core::control::{
+        AuthorityEpoch, ClientId, IdempotencyKey, OperationFailure, OperationId, OperationIntent,
+        OperationRecord, OperationResult, OperationStatus, PolicyDigest,
+    };
+
+    let mut app = test_app();
+    let operation_id = OperationId::from_parts(AuthorityEpoch(1), 42);
+    app.track_control_operation(
+        operation_id.clone(),
+        super::connection::PendingControlSubject::Connection,
+    );
+    let mut snapshot = app.control_snapshot.clone();
+    snapshot.operations.insert(
+        operation_id.clone(),
+        OperationRecord {
+            id: operation_id,
+            idempotency_key: IdempotencyKey::new("managed-dns-connect"),
+            client_id: ClientId::from_parts(AuthorityEpoch(1), 1),
+            command_digest: PolicyDigest::default(),
+            authority_epoch: AuthorityEpoch(1),
+            desired_generation: 1,
+            admitted_at_millis: 1,
+            deadline_millis: 2,
+            intent: OperationIntent::default(),
+            status: OperationStatus::Failed,
+            result: Some(OperationResult::Failed(OperationFailure::DnsPolicyFailed)),
+        },
+    );
+
+    app.apply_control_snapshot(snapshot);
+
+    let toast = app
+        .toast
+        .as_ref()
+        .expect("terminal failure must be visible");
+    assert_eq!(toast.toast_type, ToastType::Error);
+    assert!(toast.message.starts_with("Couldn't connect safely."));
+    assert!(toast.message.contains("restored your previous connection"));
+
+    app.toast = None;
+    app.apply_control_snapshot(app.control_snapshot.clone());
+    assert!(
+        app.toast.is_none(),
+        "terminal failure must be reported once"
+    );
 }
 
 #[test]

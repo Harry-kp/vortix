@@ -4,13 +4,14 @@ use std::collections::HashSet;
 use std::net::IpAddr;
 
 use crate::vortix_core::privileged::{
-    OpenVpnDefaultGateways, OpenVpnRedirectFlag, OpenVpnRedirectGateway, OpenVpnRouteDefaults,
+    OpenVpnDefaultGateways, OpenVpnRedirectFlag, OpenVpnRedirectGateway, OpenVpnRoute,
+    OpenVpnRouteDefaults, OpenVpnRouteEvidence, OpenVpnRouteGateway, OpenVpnRouteSetEvidence,
     MAX_RESOURCE_ITEMS,
 };
 
 use super::parser::{
     merge_redirect_gateways, parse_default_route_metric, parse_ipv4_default_gateway,
-    parse_ipv6_default_gateway, parse_redirect_gateway, parse_route, OvpnRoute,
+    parse_ipv6_default_gateway, parse_redirect_gateway, parse_route, OvpnParsedProfile, OvpnRoute,
 };
 
 const COMPLETED: &str = "Initialization Sequence Completed";
@@ -71,6 +72,79 @@ pub(crate) enum SelectedRemoteEvidenceError {
     Selection(#[from] PushReplySelectionError),
     #[error("OpenVPN log contained malformed selected-remote evidence")]
     MalformedRemote,
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum OpenVpnRouteEvidenceError {
+    #[error("OpenVPN profile contains unsupported route semantics")]
+    UnsupportedConfiguredRoute,
+    #[error(transparent)]
+    Pushed(#[from] PushedRouteEvidenceError),
+    #[error(transparent)]
+    SelectedRemote(#[from] SelectedRemoteEvidenceError),
+    #[error("OpenVPN route evidence was truncated before a PUSH_REPLY was retained")]
+    Truncated,
+    #[error("OpenVPN route evidence is invalid")]
+    Invalid,
+}
+
+/// Build complete configured and negotiated route truth from one validated
+/// profile parse and one stable runtime-log snapshot.
+pub(crate) fn openvpn_route_evidence(
+    parsed: &OvpnParsedProfile,
+    log: &str,
+    log_truncated: bool,
+) -> Result<OpenVpnRouteEvidence, OpenVpnRouteEvidenceError> {
+    if parsed.unsupported_route_semantics {
+        return Err(OpenVpnRouteEvidenceError::UnsupportedConfiguredRoute);
+    }
+    let configured = parsed
+        .routes
+        .iter()
+        .map(canonical_openvpn_route)
+        .collect::<Result<Vec<_>, _>>()?;
+    let pushed = pushed_route_evidence(log)?;
+    if log_truncated && !pushed.push_reply_present() {
+        return Err(OpenVpnRouteEvidenceError::Truncated);
+    }
+    let pushed_routes = pushed
+        .routes()
+        .iter()
+        .map(canonical_openvpn_route)
+        .collect::<Result<Vec<_>, _>>()?;
+    let selected_remote_required = configured
+        .iter()
+        .chain(&pushed_routes)
+        .any(|route| route.gateway() == OpenVpnRouteGateway::RemoteHost);
+    let selected_remote = if selected_remote_required {
+        Some(selected_remote_address(log)?.ok_or(OpenVpnRouteEvidenceError::Invalid)?)
+    } else {
+        None
+    };
+    OpenVpnRouteEvidence::new(
+        OpenVpnRouteSetEvidence::with_route_defaults(
+            configured,
+            parsed.redirect_gateway.clone(),
+            parsed.route_defaults,
+        )
+        .map_err(|_| OpenVpnRouteEvidenceError::Invalid)?,
+        OpenVpnRouteSetEvidence::with_route_defaults(
+            pushed_routes,
+            pushed.redirect_gateway().cloned(),
+            pushed.route_defaults(),
+        )
+        .map_err(|_| OpenVpnRouteEvidenceError::Invalid)?,
+    )
+    .and_then(|evidence| evidence.with_selected_remote(selected_remote))
+    .map_err(|_| OpenVpnRouteEvidenceError::Invalid)
+}
+
+fn canonical_openvpn_route(route: &OvpnRoute) -> Result<OpenVpnRoute, OpenVpnRouteEvidenceError> {
+    let destination =
+        crate::vortix_core::cidr::Cidr::new(route.destination.addr, route.destination.prefix_len)
+            .ok_or(OpenVpnRouteEvidenceError::Invalid)?;
+    OpenVpnRoute::with_gateway(destination, route.gateway, route.metric)
+        .map_err(|_| OpenVpnRouteEvidenceError::Invalid)
 }
 
 /// Parse route intent from only the latest completed `OpenVPN` negotiation.
@@ -265,12 +339,32 @@ fn parse_selected_remote(remote: &str) -> Option<IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::{
-        pushed_route_evidence, selected_remote_address, PushReplySelectionError,
-        PushedRouteEvidenceError, SelectedRemoteEvidenceError,
+        openvpn_route_evidence, pushed_route_evidence, selected_remote_address,
+        PushReplySelectionError, PushedRouteEvidenceError, SelectedRemoteEvidenceError,
     };
     use crate::vortix_core::privileged::{
         OpenVpnDefaultGateway, OpenVpnRedirectFlag, OpenVpnRouteGateway,
     };
+
+    #[test]
+    fn standard_runtime_evidence_preserves_server_pushed_default_route() {
+        let parsed = crate::vortix_protocol_openvpn::parser::parse_ovpn_conf(
+            "client\nremote 198.51.100.7 1194 udp\n",
+        )
+        .unwrap();
+        let evidence = openvpn_route_evidence(
+            &parsed,
+            "UDPv4 link remote: [AF_INET]198.51.100.7:1194\n\
+             PUSH_REPLY,redirect-gateway def1,dhcp-option DNS 1.1.1.1\n\
+             Initialization Sequence Completed\n",
+            false,
+        )
+        .unwrap();
+
+        let redirect = evidence.pushed().redirect_gateway().unwrap();
+        assert!(redirect.ipv4());
+        assert!(redirect.flags().contains(&OpenVpnRedirectFlag::Def1));
+    }
 
     #[test]
     fn completed_push_reply_preserves_routes_gateways_metrics_and_redirects() {

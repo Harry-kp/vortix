@@ -671,6 +671,7 @@ impl VpnRuntime {
                     }
                 }),
                 dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
+                openvpn_routes: None,
             };
 
             tunnel.down(handle)?;

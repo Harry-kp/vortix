@@ -441,6 +441,29 @@ impl Supervisor {
         Some(result)
     }
 
+    /// Retire only the exact failed connect whose worker proved that no
+    /// accepted tunnel effect remains. Ambiguous outcomes keep their ownership
+    /// fence until observation or recovery resolves them.
+    pub(crate) fn retire_definitive_connect_failure(
+        &self,
+        profile_id: &ProfileId,
+        revision: &TunnelRevision,
+        operation_id: &OperationId,
+    ) -> Result<(), WorkFailure> {
+        let mut state = self.state.lock().expect("supervisor mutex poisoned");
+        let exact = state.profiles.get(profile_id).is_some_and(|entry| {
+            entry.revision == *revision
+                && entry.operation_id == *operation_id
+                && entry.mutation == TunnelMutation::Connect
+                && entry.truth == SupervisedTruth::Degraded(WorkFailure::EffectFailed)
+        });
+        if !exact {
+            return Err(WorkFailure::Stale);
+        }
+        state.profiles.remove(profile_id);
+        Ok(())
+    }
+
     pub fn poll_policy(&self) -> Option<PolicyResult> {
         let result = self.policy.try_result()?;
         let mut state = self.state.lock().expect("supervisor mutex poisoned");
@@ -606,6 +629,39 @@ impl Supervisor {
             state.tombstones.remove(profile_id);
             self.tunnels.confirm_absence(profile_id);
         }
+        Ok(())
+    }
+
+    /// Clear an exact disconnect fence after current observation proves the
+    /// managed tunnel absent. Restored tombstones have no live profile entry;
+    /// an in-process teardown must first finish before its fence can clear.
+    pub fn confirm_tombstone_absence(
+        &self,
+        profile_id: &ProfileId,
+        revision: &TunnelRevision,
+    ) -> Result<(), WorkFailure> {
+        let mut state = self.state.lock().expect("supervisor mutex poisoned");
+        let exact_tombstone = state
+            .tombstones
+            .get(profile_id)
+            .is_some_and(|entry| entry.revision == *revision);
+        if !exact_tombstone {
+            return Err(WorkFailure::Stale);
+        }
+        if state.profiles.get(profile_id).is_some_and(|entry| {
+            entry.revision != *revision
+                || !matches!(
+                    entry.truth,
+                    SupervisedTruth::WaitingForObservation
+                        | SupervisedTruth::OutcomeUnknown
+                        | SupervisedTruth::Degraded(_)
+                )
+        }) {
+            return Err(WorkFailure::Busy);
+        }
+        state.profiles.remove(profile_id);
+        state.tombstones.remove(profile_id);
+        self.tunnels.confirm_absence(profile_id);
         Ok(())
     }
 

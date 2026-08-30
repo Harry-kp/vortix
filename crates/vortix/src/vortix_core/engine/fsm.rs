@@ -574,6 +574,7 @@ impl<T: Tunnel> Engine<T> {
             process_ownership,
             teardown_config,
             dns_request,
+            openvpn_routes: None,
         }
     }
 }

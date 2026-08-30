@@ -401,6 +401,16 @@ fn real_tunnel_scoped_custodians_handoff_authenticate_and_contain_groups() {
             ProtocolKind::OpenVpn,
             config,
         );
+        let run_dir = temp.path().join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(
+            run_dir.join(format!("{}.log", profile.id.as_str())),
+            format!(
+                "PUSH_REPLY,ping 10\n{}\n",
+                vortix::constants::OVPN_LOG_SUCCESS
+            ),
+        )
+        .unwrap();
         // SAFETY: geteuid returns one scalar credential without side effects.
         #[allow(unsafe_code)]
         let uid = unsafe { libc::geteuid() };

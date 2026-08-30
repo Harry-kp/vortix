@@ -503,8 +503,9 @@ ipv6_check_apis = ["https://ipv6.icanhazip.com", "https://v6.ident.me", "https:/
 # Primary IP/ISP API
 ip_api_primary = "https://ipinfo.io/json"
 
-# Fallback IP APIs
+# Fallback IP APIs and exact-IP geolocation fallback
 ip_api_fallbacks = ["https://api.ipify.org", "https://icanhazip.com", "https://ifconfig.me/ip"]
+geolocation_api_fallback = "https://ipwho.is"
 ```
 
 ## How It Works

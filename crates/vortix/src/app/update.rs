@@ -19,6 +19,13 @@ use crate::utils;
 /// threshold via `RUST_LOG=vortix::app=warn`; the value is silent otherwise.
 const UI_HANDLER_SLOW_THRESHOLD: Duration = Duration::from_millis(50);
 
+fn is_unknown_identity_value(value: &str) -> bool {
+    value.is_empty()
+        || value == "Unknown"
+        || value == constants::MSG_DETECTING
+        || value == constants::MSG_FETCHING
+}
+
 /// Extract the variant name (without the payload) from a `Message` for
 /// observability. `format!("{msg:?}")` produces `"NextPanel"` for unit
 /// variants, `"ConnectResult { ... }"` for struct variants, etc. — we
@@ -641,81 +648,11 @@ impl App {
     #[allow(clippy::too_many_lines)] // TEA-style dispatch — every arm is one telemetry variant; splitting would obscure the handler shape without simplifying it
     fn handle_telemetry(&mut self, update: TelemetryUpdate) {
         match update {
-            TelemetryUpdate::PublicIp(ip) => {
-                let is_connected = self.has_active_connection();
-                let old_ip = self.runtime.public_ip.clone();
-
-                // emit IpChanged into the journal so the
-                // bug-report and downstream subscribers see the trail.
-                // Only fires on actual changes, not initial detection.
-                if old_ip != ip
-                    && old_ip != constants::MSG_FETCHING
-                    && old_ip != constants::MSG_DETECTING
-                {
-                    if let Some(journal) = crate::vortix_core::journal::global_journal() {
-                        let _ =
-                            journal.append(crate::vortix_core::engine::EngineEvent::IpChanged {
-                                old: Some(old_ip.clone()),
-                                new: ip.clone(),
-                            });
-                    }
-                }
-
-                // Store as real_ip ONLY when we have positive proof
-                // there's no VPN active. Three conditions must hold:
-                //
-                // 1. Scanner has completed at least one tick — without
-                //    this, telemetry-on-startup races and we'd cache
-                //    the wrong IP before the scanner reports kernel
-                //    state.
-                // 2. Kernel reports zero VPN sessions — using raw
-                //    scanner state (not the registry) catches tunnels
-                //    that are kernel-visible but not yet adopted
-                //    (e.g. external openvpn awaiting lsof Method A on
-                //    macOS).
-                // 3. Registry has no Connected tunnel — defensive belt
-                //    against the scanner race; cheap so include it.
-                //
-                // Without ALL three, withhold caching. real_ip stays
-                // None and the UI shows "detecting…" — honest about
-                // not knowing rather than fabricating the VPN's exit
-                // IP as the user's real IP.
-                let safe_to_cache = self.runtime.scanner_first_tick_done
-                    && self.runtime.last_kernel_session_count == 0
-                    && !is_connected;
-                if safe_to_cache {
-                    let first_detection = self.runtime.real_ip.is_none();
-                    let changed = self.runtime.real_ip.as_deref() != Some(ip.as_str());
-                    if first_detection {
-                        self.log(&format!("NET: Real IPv4 detected: {ip}"));
-                    }
-                    self.runtime.real_ip = Some(ip.clone());
-                    if first_detection || changed {
-                        crate::core::real_ip_cache::save(&self.runtime.config_dir, &ip);
-                    }
-                } else if self.runtime.public_ip != ip
-                    && self.runtime.public_ip != constants::MSG_FETCHING
-                {
-                    self.runtime.ip_unchanged_warned = false;
-                    self.log(&format!("NET: Public IPv4 changed {old_ip} -> {ip}"));
-                } else if is_connected
-                    && self.runtime.public_ip == ip
-                    && self.runtime.public_ip != constants::MSG_FETCHING
-                    && !self.runtime.ip_unchanged_warned
-                {
-                    self.runtime.ip_unchanged_warned = true;
-                    self.log(&format!(
-                        "WARN: Public IPv4 unchanged ({ip}) while connected — possible leak or split-tunnel"
-                    ));
-                    if let Some(ref real) = self.runtime.real_ip {
-                        if real == &ip {
-                            self.log(&format!("ERR: IPv4 leak detected — current IPv4 ({ip}) matches pre-VPN IPv4 ({real})"));
-                        }
-                    }
-                }
-                self.runtime.public_ip = ip;
-                self.runtime.last_security_check = Some(Instant::now());
+            TelemetryUpdate::PublicIp(ip) => self.apply_public_ipv4(ip),
+            TelemetryUpdate::EgressIdentity(identity) => {
+                self.apply_egress_identity(identity);
             }
+            TelemetryUpdate::EgressUnavailable => self.apply_egress_unavailable(),
             TelemetryUpdate::NetworkQuality {
                 latency_ms,
                 packet_loss,
@@ -725,19 +662,6 @@ impl App {
                 self.runtime.packet_loss = packet_loss;
                 self.runtime.jitter_ms = jitter_ms;
                 self.log_network_quality_transition();
-            }
-            TelemetryUpdate::Location(loc) => {
-                if self.runtime.location != loc && self.runtime.location != constants::MSG_DETECTING
-                {
-                    self.log(&format!("NET: Location: {loc}"));
-                }
-                self.runtime.location = loc;
-            }
-            TelemetryUpdate::Isp(isp) => {
-                if self.runtime.isp != isp && self.runtime.isp != constants::MSG_DETECTING {
-                    self.log(&format!("NET: Exit node: {isp}"));
-                }
-                self.runtime.isp = isp;
             }
             TelemetryUpdate::Dns(dns) => {
                 if self.runtime.dns_server != dns
@@ -811,6 +735,101 @@ impl App {
                 logger::log(level, "TELEMETRY", msg);
             }
         }
+    }
+
+    fn apply_egress_identity(&mut self, identity: crate::core::telemetry::EgressIdentity) {
+        let same_exit = self.runtime.public_ip == identity.public_ip;
+        self.apply_public_ipv4(identity.public_ip);
+
+        let next_isp = identity.isp.unwrap_or_else(|| {
+            if same_exit && !is_unknown_identity_value(&self.runtime.isp) {
+                self.runtime.isp.clone()
+            } else {
+                "Unknown".to_string()
+            }
+        });
+        if self.runtime.isp != next_isp && self.runtime.isp != constants::MSG_DETECTING {
+            self.log(&format!("NET: Exit node: {next_isp}"));
+        }
+        self.runtime.isp = next_isp;
+
+        let next_location = identity.location.unwrap_or_else(|| {
+            if same_exit && !is_unknown_identity_value(&self.runtime.location) {
+                self.runtime.location.clone()
+            } else {
+                "Unknown".to_string()
+            }
+        });
+        if self.runtime.location != next_location
+            && self.runtime.location != constants::MSG_DETECTING
+        {
+            self.log(&format!("NET: Location: {next_location}"));
+        }
+        self.runtime.location = next_location;
+    }
+
+    fn apply_egress_unavailable(&mut self) {
+        if !is_unknown_identity_value(&self.runtime.isp) {
+            self.log("NET: Exit node: Unknown");
+        }
+        if !is_unknown_identity_value(&self.runtime.location) {
+            self.log("NET: Location: Unknown");
+        }
+        self.runtime.public_ip = "Unavailable".to_string();
+        self.runtime.isp = "Unknown".to_string();
+        self.runtime.location = "Unknown".to_string();
+        self.runtime.last_security_check = Some(Instant::now());
+    }
+
+    fn apply_public_ipv4(&mut self, ip: String) {
+        let is_connected = self.has_active_connection();
+        let old_ip = self.runtime.public_ip.clone();
+
+        if old_ip != ip && old_ip != constants::MSG_FETCHING && old_ip != constants::MSG_DETECTING {
+            if let Some(journal) = crate::vortix_core::journal::global_journal() {
+                let _ = journal.append(crate::vortix_core::engine::EngineEvent::IpChanged {
+                    old: Some(old_ip.clone()),
+                    new: ip.clone(),
+                });
+            }
+        }
+
+        // Cache the real address only after both scanner and registry prove
+        // that no tunnel owns the egress path.
+        let safe_to_cache = self.runtime.scanner_first_tick_done
+            && self.runtime.last_kernel_session_count == 0
+            && !is_connected;
+        if safe_to_cache {
+            let first_detection = self.runtime.real_ip.is_none();
+            let changed = self.runtime.real_ip.as_deref() != Some(ip.as_str());
+            if first_detection {
+                self.log(&format!("NET: Real IPv4 detected: {ip}"));
+            }
+            self.runtime.real_ip = Some(ip.clone());
+            if first_detection || changed {
+                crate::core::real_ip_cache::save(&self.runtime.config_dir, &ip);
+            }
+        } else if self.runtime.public_ip != ip && self.runtime.public_ip != constants::MSG_FETCHING
+        {
+            self.runtime.ip_unchanged_warned = false;
+            self.log(&format!("NET: Public IPv4 changed {old_ip} -> {ip}"));
+        } else if is_connected
+            && self.runtime.public_ip == ip
+            && self.runtime.public_ip != constants::MSG_FETCHING
+            && !self.runtime.ip_unchanged_warned
+        {
+            self.runtime.ip_unchanged_warned = true;
+            self.log(&format!(
+                "WARN: Public IPv4 unchanged ({ip}) while connected — possible leak or split-tunnel"
+            ));
+            if let Some(ref real) = self.runtime.real_ip {
+                if real == &ip {
+                    self.log(&format!("ERR: IPv4 leak detected — current IPv4 ({ip}) matches pre-VPN IPv4 ({real})"));
+                }
+            }
+        }
+        self.runtime.public_ip = ip;
+        self.runtime.last_security_check = Some(Instant::now());
     }
 
     fn log_network_quality_transition(&mut self) {

@@ -33,8 +33,9 @@ use crate::vortix_core::control::reconcile::{
 use crate::vortix_core::control::snapshot::{ControlSnapshot, ServiceReadiness};
 use crate::vortix_core::control::supervisor::{PolicyVerification, SupervisedTruth, Supervisor};
 use crate::vortix_core::control::worker::{
-    ControlRevision, PolicyOutcome, PolicyStage, ProfileAdmission, RouteClaim, TopologyPolicy,
-    TopologyState, TopologyTransitionKind, TunnelMutation, TunnelRevision, TunnelWork, WorkFailure,
+    ControlRevision, PolicyBarrier, PolicyOutcome, PolicyStage, ProfileAdmission, RouteClaim,
+    TopologyPolicy, TopologyState, TopologyTransitionKind, TunnelMutation, TunnelRevision,
+    TunnelWork, WorkFailure,
 };
 use crate::vortix_core::engine::registry::{Conflict, Role, TunnelSnapshot};
 use crate::vortix_core::engine::state::{Connection, ConnectionHealth};
@@ -2329,6 +2330,19 @@ fn drive_supervision(
                 },
             );
         }
+        if let Some(dns) = result
+            .openvpn_dns
+            .as_ref()
+            .filter(|_| result.result.is_ok())
+        {
+            snapshot.observed.openvpn_dns.insert(
+                result.profile_id.clone(),
+                crate::vortix_core::control::model::ObservedOpenVpnDns {
+                    desired_generation: result.revision.generation,
+                    request: dns.clone(),
+                },
+            );
+        }
         if let Some(handshake) = result.handshake.as_ref().filter(|handshake| {
             result.result.is_ok() && handshake.generation == result.revision.generation
         }) {
@@ -2356,6 +2370,7 @@ fn drive_supervision(
                 now,
             );
             snapshot.observed.openvpn_routes.remove(&result.profile_id);
+            snapshot.observed.openvpn_dns.remove(&result.profile_id);
             snapshot
                 .observed
                 .wireguard_handshakes
@@ -2477,6 +2492,45 @@ fn drive_supervision(
                     config,
                     events,
                 );
+            } else if result.result == Err(WorkFailure::EffectFailed) {
+                let rollback_profiles = snapshot
+                    .operations
+                    .get(&result.operation_id)
+                    .map(|operation| interactive_connected_profiles(operation, config))
+                    .unwrap_or_default();
+                if result.mutation == TunnelMutation::Connect
+                    && !rollback_profiles.is_empty()
+                    && supervisor
+                        .retire_definitive_connect_failure(
+                            &result.profile_id,
+                            &result.revision,
+                            &result.operation_id,
+                        )
+                        .is_ok()
+                {
+                    let completion = complete_operation(
+                        OperationCompletion {
+                            operation_id: result.operation_id.clone(),
+                            desired_generation: result.revision.generation,
+                            outcome: CompletionOutcome::Failed(OperationFailure::Internal),
+                        },
+                        snapshot,
+                        owner,
+                        admission,
+                        now,
+                        config,
+                        events,
+                    );
+                    if matches!(completion, Ok(CompletionResult::Terminal(_))) {
+                        rollback_interactive_connect_intent(
+                            &rollback_profiles,
+                            snapshot,
+                            owner,
+                            now,
+                            events,
+                        );
+                    }
+                }
             }
             invalidate_gates(
                 snapshot,
@@ -2588,17 +2642,19 @@ fn drive_supervision(
                 (_, outcome, _) => Some((
                     transaction.pre_policy.operation_id.clone(),
                     transaction.pre_policy.generation,
-                    policy_outcome_failure(outcome),
+                    operation_failure_for_policy_result(outcome, result.failed_at),
+                    transaction.pre_policy.clone(),
                 )),
             }
         } else {
             None
         };
-        if let Some((operation_id, generation, failure)) = failed_transaction {
-            fail_tunnel_dispatch_operation(
+        if let Some((operation_id, generation, failure, policy)) = failed_transaction {
+            fail_policy_transaction(
                 &operation_id,
                 generation,
                 failure,
+                &policy,
                 snapshot,
                 owner,
                 admission,
@@ -2834,10 +2890,11 @@ fn drive_supervision(
 
     for action in plan.actions.iter().filter(|_| tunnel_actions_allowed) {
         match action {
-            ReconcileAction::ClearTombstone { profile_id } => {
-                if let Some(tunnel_revision) = owner.tunnel_revisions.get(profile_id) {
-                    let _ = supervisor.confirm_tunnel(profile_id, tunnel_revision, false, None);
-                }
+            ReconcileAction::ClearTombstone {
+                profile_id,
+                revision,
+            } => {
+                let _ = supervisor.confirm_tombstone_absence(profile_id, revision);
             }
             ReconcileAction::AdoptAttested {
                 evidence,
@@ -3420,18 +3477,7 @@ fn fail_tunnel_dispatch_operation(
     events: &mut Vec<ControlEvent>,
 ) {
     let was_recovery = owner.recovery_operations.contains(operation_id);
-    let operation_failure = match failure {
-        WorkFailure::TimedOut => OperationFailure::Timeout,
-        WorkFailure::Busy | WorkFailure::RouteConflict => OperationFailure::Rejected,
-        WorkFailure::Cancelled
-        | WorkFailure::Panicked
-        | WorkFailure::EffectFailed
-        | WorkFailure::HandshakeFailed
-        | WorkFailure::ChallengeFailed
-        | WorkFailure::OutcomeUnknown
-        | WorkFailure::Stale
-        | WorkFailure::Stopped => OperationFailure::Internal,
-    };
+    let operation_failure = operation_failure_for_work(failure);
     let completion = complete_operation(
         OperationCompletion {
             operation_id: operation_id.clone(),
@@ -3464,7 +3510,130 @@ fn fail_tunnel_dispatch_operation(
     }
 }
 
-fn policy_outcome_failure(outcome: PolicyOutcome) -> WorkFailure {
+const fn operation_failure_for_work(failure: WorkFailure) -> OperationFailure {
+    match failure {
+        WorkFailure::TimedOut => OperationFailure::Timeout,
+        WorkFailure::Busy | WorkFailure::RouteConflict => OperationFailure::Rejected,
+        WorkFailure::Cancelled
+        | WorkFailure::Panicked
+        | WorkFailure::EffectFailed
+        | WorkFailure::HandshakeFailed
+        | WorkFailure::ChallengeFailed
+        | WorkFailure::OutcomeUnknown
+        | WorkFailure::Stale
+        | WorkFailure::Stopped => OperationFailure::Internal,
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a failed policy atomically terminalizes its operation and restores prior topology"
+)]
+fn fail_policy_transaction(
+    operation_id: &OperationId,
+    desired_generation: u64,
+    failure: OperationFailure,
+    policy: &TopologyPolicy,
+    snapshot: &mut ControlSnapshot,
+    owner: &mut OwnerState,
+    admission: &Arc<Mutex<AdmissionState>>,
+    now: u64,
+    selection: ExecutionSelection,
+    config: &ControlServiceConfig,
+    events: &mut Vec<ControlEvent>,
+) {
+    let was_recovery = owner.recovery_operations.contains(operation_id);
+    let completion = complete_operation(
+        OperationCompletion {
+            operation_id: operation_id.clone(),
+            desired_generation,
+            outcome: CompletionOutcome::Failed(failure),
+        },
+        snapshot,
+        owner,
+        admission,
+        now,
+        config,
+        events,
+    );
+    if matches!(
+        completion,
+        Ok(CompletionResult::Terminal(OperationStatus::Failed))
+    ) {
+        restore_prior_topology_intent(policy, snapshot, owner, now, events);
+    }
+    if !was_recovery
+        && matches!(
+            completion,
+            Ok(CompletionResult::Terminal(OperationStatus::Failed))
+        )
+    {
+        start_recovery_operation(
+            snapshot,
+            owner,
+            admission,
+            now,
+            selection,
+            snapshot.desired.generation,
+            config,
+            events,
+        );
+    }
+}
+
+fn restore_prior_topology_intent(
+    policy: &TopologyPolicy,
+    snapshot: &mut ControlSnapshot,
+    owner: &mut OwnerState,
+    now: u64,
+    events: &mut Vec<ControlEvent>,
+) {
+    snapshot.desired.generation = snapshot.desired.generation.saturating_add(1);
+    let revision = TunnelRevision {
+        authority_epoch: snapshot.desired.authority_epoch,
+        generation: snapshot.desired.generation,
+    };
+    let affected = policy
+        .prior_tunnel_revisions
+        .keys()
+        .chain(policy.tunnel_revisions.keys())
+        .filter(|profile_id| {
+            policy.prior_tunnel_revisions.get(*profile_id)
+                != policy.tunnel_revisions.get(*profile_id)
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for profile_id in snapshot
+        .desired
+        .tunnels
+        .keys()
+        .chain(policy.prior.profiles.iter())
+        .cloned()
+        .collect::<BTreeSet<_>>()
+    {
+        let state = if policy.prior.profiles.contains(&profile_id) {
+            RequestedTunnelState::Connected
+        } else {
+            RequestedTunnelState::Disconnected
+        };
+        snapshot.desired.tunnels.insert(profile_id, state);
+    }
+    for profile_id in affected {
+        owner.tunnel_revisions.insert(profile_id.clone(), revision);
+        snapshot
+            .desired
+            .conflict_acknowledgements
+            .remove(&profile_id);
+    }
+    snapshot.desired.kill_switch = policy.prior.kill_switch;
+    recompute_policy_digest(snapshot);
+    invalidate_all_gates(snapshot, now);
+    events.push(ControlEvent::DesiredStateChanged {
+        desired_generation: snapshot.desired.generation,
+    });
+}
+
+const fn policy_outcome_failure(outcome: PolicyOutcome) -> WorkFailure {
     match outcome {
         PolicyOutcome::TimedOut => WorkFailure::TimedOut,
         PolicyOutcome::Cancelled => WorkFailure::Cancelled,
@@ -3474,11 +3643,23 @@ fn policy_outcome_failure(outcome: PolicyOutcome) -> WorkFailure {
     }
 }
 
+const fn operation_failure_for_policy_result(
+    outcome: PolicyOutcome,
+    failed_at: Option<PolicyBarrier>,
+) -> OperationFailure {
+    if matches!(outcome, PolicyOutcome::Failed) && matches!(failed_at, Some(PolicyBarrier::Dns)) {
+        OperationFailure::DnsPolicyFailed
+    } else {
+        operation_failure_for_work(policy_outcome_failure(outcome))
+    }
+}
+
 fn seal_final_topology_policy(
     pre_policy: &TopologyPolicy,
     snapshot: &ControlSnapshot,
 ) -> TopologyPolicy {
     let mut final_policy = pre_policy.clone();
+    let mut dns_changed = false;
     final_policy.stage = PolicyStage::Final;
     for (profile_id, protocol) in &final_policy.target.protocols {
         if *protocol != crate::vortix_core::profile::ProtocolKind::OpenVpn {
@@ -3506,8 +3687,31 @@ fn seal_final_topology_policy(
             .target
             .openvpn_routes
             .insert(profile_id.clone(), observed.evidence.clone());
+
+        if let Some(observed_dns) = snapshot
+            .observed
+            .openvpn_dns
+            .get(profile_id)
+            .filter(|observed| observed.desired_generation == final_policy.generation)
+        {
+            final_policy
+                .target
+                .dns_requests
+                .insert(profile_id.clone(), observed_dns.request.clone());
+            dns_changed = true;
+        }
+    }
+    if dns_changed {
+        final_policy.target.dns_digest = topology_dns_digest(&final_policy.target.dns_requests);
     }
     final_policy
+}
+
+fn topology_dns_digest(
+    requests: &BTreeMap<ProfileId, crate::vortix_core::ports::dns::DnsRequest>,
+) -> PolicyDigest {
+    let encoded = serde_json::to_vec(requests).expect("typed DNS requests serialize");
+    PolicyDigest::sha256(&encoded)
 }
 
 #[allow(clippy::too_many_arguments)] // Captures one immutable cross-barrier transaction.
@@ -4013,6 +4217,7 @@ fn apply_desired(
         } => {
             snapshot.observed.wireguard_handshakes.remove(profile_id);
             snapshot.observed.openvpn_routes.remove(profile_id);
+            snapshot.observed.openvpn_dns.remove(profile_id);
             snapshot
                 .observed
                 .wireguard_probe_receipts
@@ -4023,6 +4228,7 @@ fn apply_desired(
         | UserCommand::ForceDisconnect { profile_id: None } => {
             snapshot.observed.wireguard_handshakes.clear();
             snapshot.observed.openvpn_routes.clear();
+            snapshot.observed.openvpn_dns.clear();
             snapshot.observed.wireguard_probe_receipts.clear();
             snapshot.observed.connection_health.clear();
         }
@@ -4030,6 +4236,7 @@ fn apply_desired(
             for profile_id in target_profiles {
                 snapshot.observed.wireguard_handshakes.remove(profile_id);
                 snapshot.observed.openvpn_routes.remove(profile_id);
+                snapshot.observed.openvpn_dns.remove(profile_id);
                 snapshot
                     .observed
                     .wireguard_probe_receipts
@@ -4194,6 +4401,7 @@ fn apply_profile_mutation_completion(
                 snapshot.observed.tunnel_details.remove(profile_id);
                 snapshot.observed.wireguard_handshakes.remove(profile_id);
                 snapshot.observed.openvpn_routes.remove(profile_id);
+                snapshot.observed.openvpn_dns.remove(profile_id);
                 snapshot
                     .observed
                     .wireguard_probe_receipts
@@ -6252,6 +6460,14 @@ mod target_profiles_tests {
         CancellationToken, PolicyBarrier, PolicyExecutor, TunnelExecutionReceipt, TunnelExecutor,
     };
     use crate::vortix_core::state::{KillSwitchMode, KillSwitchState};
+
+    #[test]
+    fn dns_barrier_failure_remains_actionable_at_the_operation_boundary() {
+        assert_eq!(
+            operation_failure_for_policy_result(PolicyOutcome::Failed, Some(PolicyBarrier::Dns),),
+            OperationFailure::DnsPolicyFailed
+        );
+    }
 
     struct NoopTunnel;
 
