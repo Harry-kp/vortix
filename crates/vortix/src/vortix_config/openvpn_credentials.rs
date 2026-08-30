@@ -281,9 +281,13 @@ impl FsOpenVpnCredentialStore {
                 CredentialArtifactIssue::UnsafeDirectory,
             ))?;
         let name = format!("{}.auth", profile_id.as_str());
-        let expected = self
-            .open_entry(&directory, profile_id.as_str(), true)?
-            .map(|entry| entry.identity);
+        // Keep the validated descriptor alive until publication completes. If
+        // the destination is unlinked concurrently, the open descriptor keeps
+        // its inode allocated so an attacker cannot recreate the path with an
+        // immediately reused `(device, inode)` pair and evade the identity
+        // check below.
+        let existing = self.open_entry(&directory, profile_id.as_str(), true)?;
+        let expected = existing.as_ref().map(|entry| entry.identity);
         let body = credentials.encode();
         let changed = std::cell::Cell::new(false);
         let result = write_owned_atomic_with_hook(
@@ -303,6 +307,7 @@ impl FsOpenVpnCredentialStore {
                 Ok(())
             },
         );
+        drop(existing);
         if changed.get() {
             return Err(CredentialStoreError::UnsafeArtifact(
                 CredentialArtifactIssue::ChangedEntry,
