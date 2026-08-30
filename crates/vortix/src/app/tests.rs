@@ -619,10 +619,13 @@ fn test_auth_delete_profile_cleans_auth_file() {
         .unwrap();
 
     app.confirm_delete(0);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    // Canonical profile mutations are crash-safe filesystem operations whose
+    // TUI deadline is at least 30 seconds. The test must verify eventual
+    // durable completion, not impose a one-second filesystem performance SLA.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(35);
     while !app.runtime.profiles.is_empty() && std::time::Instant::now() < deadline {
         app.process_external();
-        std::thread::yield_now();
+        std::thread::sleep(std::time::Duration::from_millis(2));
     }
 
     assert!(app.runtime.profiles.is_empty());
@@ -2274,13 +2277,15 @@ fn connect_selected_on_active_profile_enqueues_one_typed_reconnect() {
 
 #[test]
 fn canonical_directory_import_drains_more_than_tui_admission_capacity() {
+    const PROFILE_COUNT: usize = 9;
+
     let temp = tempfile::tempdir().unwrap();
     let config_dir = temp.path().join("config");
     let profiles_dir = config_dir.join(crate::constants::PROFILES_DIR_NAME);
     let source_dir = temp.path().join("imports");
     std::fs::create_dir_all(&profiles_dir).unwrap();
     std::fs::create_dir(&source_dir).unwrap();
-    for index in 0..13 {
+    for index in 0..PROFILE_COUNT {
         std::fs::write(
             source_dir.join(format!("profile-{index:02}.conf")),
             format!(
@@ -2315,16 +2320,19 @@ fn canonical_directory_import_drains_more_than_tui_admission_capacity() {
             batch.queued,
             batch.failed
         )),
-        Some((14, 0, 0))
+        Some((PROFILE_COUNT + 1, 0, 0))
     );
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while app.runtime.profiles.len() < 13 && std::time::Instant::now() < deadline {
+    // Nine valid profiles plus the invalid entry exceed the eight-slot TUI
+    // admission bound while keeping the fixture focused on backpressure. Give
+    // the real crash-safe mutation path its documented command-time budget.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(35);
+    while app.runtime.profiles.len() < PROFILE_COUNT && std::time::Instant::now() < deadline {
         app.process_external();
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
-    assert_eq!(app.runtime.profiles.len(), 13);
-    for index in 0..13 {
+    assert_eq!(app.runtime.profiles.len(), PROFILE_COUNT);
+    for index in 0..PROFILE_COUNT {
         assert!(app
             .runtime
             .profiles
