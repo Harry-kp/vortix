@@ -488,120 +488,6 @@ fn test_toggle_while_connecting_is_rejected() {
 // Auth prompt tests
 // ====================================================================
 
-/// Helper: add `OpenVPN` profiles with a temp config file containing auth-user-pass.
-fn add_openvpn_profiles_with_auth(app: &mut App, names: &[&str], dir: &std::path::Path) {
-    let _ = std::fs::create_dir_all(dir);
-    for name in names {
-        let config_path = dir.join(format!("{name}.ovpn"));
-        std::fs::write(
-            &config_path,
-            "client\nremote example.com 1194\nauth-user-pass\ndev tun\nproto udp\n",
-        )
-        .unwrap();
-        app.runtime.profiles.push(VpnProfile {
-            id: crate::vortix_core::profile::ProfileId::new(*name),
-            name: (*name).to_string(),
-            protocol: Protocol::OpenVPN,
-            config_path,
-            location: "Test".to_string(),
-            last_used: None,
-        });
-    }
-}
-
-/// Helper: add `OpenVPN` profiles with a `static-challenge` directive
-/// alongside auth-user-pass.
-fn add_openvpn_profiles_with_static_challenge(
-    app: &mut App,
-    names: &[&str],
-    dir: &std::path::Path,
-) {
-    let _ = std::fs::create_dir_all(dir);
-    for name in names {
-        let config_path = dir.join(format!("{name}.ovpn"));
-        std::fs::write(
-            &config_path,
-            "client\nremote example.com 1194\nauth-user-pass\nstatic-challenge \"Enter TOTP code\" 1\ndev tun\nproto udp\n",
-        )
-        .unwrap();
-        app.runtime.profiles.push(VpnProfile {
-            id: crate::vortix_core::profile::ProfileId::new(*name),
-            name: (*name).to_string(),
-            protocol: Protocol::OpenVPN,
-            config_path,
-            location: "Test".to_string(),
-            last_used: None,
-        });
-    }
-}
-#[test]
-fn test_auth_submit_does_not_reopen_overlay_for_static_challenge_profile() {
-    // Regression for the submit-loop bug discovered after daemon-routed writes landed:
-    // handle_auth_submit calls connect_profile, which (via the
-    // overlay-fires-fix) used to see static_challenge.is_some() and
-    // re-open the auth overlay with an empty OTP — so pressing Enter
-    // appeared to do nothing because the freshly-opened overlay was
-    // then overwritten by the pre-submit values. The fix routes the
-    // post-submit connect through connect_profile_after_auth, which
-    // skips the overlay gate. This test asserts input_mode lands on
-    // Normal (or Connecting) — never on a re-opened AuthPrompt.
-    let mut app = test_app();
-    let tmp = tempfile::Builder::new()
-        .prefix("vortix_auth_")
-        .tempdir()
-        .unwrap();
-    add_openvpn_profiles_with_static_challenge(&mut app, &["mfa-resubmit"], tmp.path());
-    app.runtime.is_root = true;
-    crate::utils::delete_openvpn_auth_file("mfa-resubmit");
-
-    app.handle_message(Message::AuthSubmit {
-        idx: 0,
-        username: "u".to_string(),
-        password: "p".to_string(),
-        otp: Some("123456".to_string()),
-        save: true,
-        connect_after: true,
-    });
-
-    assert!(
-        !matches!(app.input_mode, InputMode::AuthPrompt { .. }),
-        "AuthSubmit must NOT re-open the AuthPrompt overlay for a static-challenge profile; got {:?}",
-        app.input_mode
-    );
-
-    crate::utils::delete_openvpn_auth_file("mfa-resubmit");
-}
-
-#[test]
-fn test_auth_submit_with_otp_no_save_deletes_file() {
-    // : when `save=false` AND `otp=Some(...)`,
-    // the auth file must be deleted after the connect call returns —
-    // OTP is single-use and the user explicitly chose not to persist
-    // credentials.
-    let mut app = test_app();
-    let tmp = tempfile::Builder::new()
-        .prefix("vortix_auth_")
-        .tempdir()
-        .unwrap();
-    add_openvpn_profiles_with_auth(&mut app, &["mfa-no-save-vpn"], tmp.path());
-    app.runtime.is_root = true;
-    crate::utils::delete_openvpn_auth_file("mfa-no-save-vpn");
-
-    app.handle_message(Message::AuthSubmit {
-        idx: 0,
-        username: "u".to_string(),
-        password: "p".to_string(),
-        otp: Some("123456".to_string()),
-        save: false,
-        connect_after: true,
-    });
-
-    assert!(
-        crate::utils::read_openvpn_saved_auth("mfa-no-save-vpn").is_none(),
-        "auth file must be deleted after one-time MFA connect"
-    );
-}
-
 #[test]
 fn test_auth_field_otp_appears_in_tab_cycle_for_static_challenge_profile() {
     // : tab cycle becomes a 4-stop cycle when
@@ -610,13 +496,13 @@ fn test_auth_field_otp_appears_in_tab_cycle_for_static_challenge_profile() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     let mut app = test_app();
     app.input_mode = InputMode::AuthPrompt {
-        profile_idx: 0,
+        profile_id: crate::vortix_core::profile::ProfileId::new("mfa"),
         profile_name: "mfa".to_string(),
-        username: String::new(),
+        username: String::new().into(),
         username_cursor: 0,
-        password: String::new(),
+        password: String::new().into(),
         password_cursor: 0,
-        otp: String::new(),
+        otp: String::new().into(),
         otp_cursor: 0,
         focused_field: AuthField::Username,
         save_credentials: true,
@@ -647,13 +533,13 @@ fn test_auth_field_switching() {
 
     let mut app = test_app();
     app.input_mode = InputMode::AuthPrompt {
-        profile_idx: 0,
+        profile_id: crate::vortix_core::profile::ProfileId::new("test"),
         profile_name: "test".to_string(),
-        username: String::new(),
+        username: String::new().into(),
         username_cursor: 0,
-        password: String::new(),
+        password: String::new().into(),
         password_cursor: 0,
-        otp: String::new(),
+        otp: String::new().into(),
         otp_cursor: 0,
         focused_field: AuthField::Username,
         save_credentials: true,
@@ -693,8 +579,10 @@ fn test_auth_delete_profile_cleans_auth_file() {
         .prefix("vortix_auth_")
         .tempdir()
         .unwrap();
+    let profiles_dir = tmp.path().join(crate::constants::PROFILES_DIR_NAME);
+    std::fs::create_dir(&profiles_dir).unwrap();
     let stable_id = crate::vortix_core::profile::ProfileId::parse("11".repeat(32)).unwrap();
-    let config_path = tmp.path().join("del-vpn.ovpn");
+    let config_path = profiles_dir.join("del-vpn.ovpn");
     let stored = crate::vortix_core::profile::Profile::new(
         stable_id.clone(),
         "del-vpn",
@@ -702,7 +590,7 @@ fn test_auth_delete_profile_cleans_auth_file() {
         config_path.clone(),
     );
     crate::vortix_config::profile_store::ProfileStore::insert(
-        &crate::vortix_config::profile_store::FsProfileStore::new(tmp.path().to_path_buf()),
+        &crate::vortix_config::profile_store::FsProfileStore::new(profiles_dir),
         &stored,
         b"client\nremote example.com 1194\nauth-user-pass\ndev tun\nproto udp\n",
     )
@@ -715,18 +603,36 @@ fn test_auth_delete_profile_cleans_auth_file() {
         location: "Test".to_string(),
         last_used: None,
     });
+    app.runtime.config_dir = tmp.path().to_path_buf();
+    let control = crate::cli::control::LocalControlSession::start_profile_test(
+        tmp.path(),
+        app.runtime.profiles.clone(),
+    )
+    .unwrap();
+    app.attach_control_session(control).unwrap();
     app.profile_list_state.select(Some(0));
 
-    let auth_path =
-        crate::utils::write_openvpn_auth_file(stable_id.as_str(), "user", "pass").unwrap();
-    assert!(auth_path.exists());
+    app.control_session
+        .as_ref()
+        .unwrap()
+        .remember_openvpn_credentials(&stable_id, "user", "pass")
+        .unwrap();
 
     app.confirm_delete(0);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while !app.runtime.profiles.is_empty() && std::time::Instant::now() < deadline {
+        app.process_external();
+        std::thread::yield_now();
+    }
 
-    assert!(
-        !auth_path.exists(),
-        "Auth file should be deleted when profile is deleted"
-    );
+    assert!(app.runtime.profiles.is_empty());
+    assert!(app
+        .control_session
+        .as_ref()
+        .unwrap()
+        .load_openvpn_credentials(&stable_id, "del-vpn")
+        .unwrap()
+        .is_none());
 }
 
 // ====================================================================
@@ -2562,13 +2468,13 @@ fn blank_challenge_input_keeps_overlay_and_challenge_for_retry() {
     let challenge_id = serde_json::from_str("1").unwrap();
     app.control_challenge = Some(challenge_id);
     app.input_mode = InputMode::AuthPrompt {
-        profile_idx: 0,
+        profile_id: crate::vortix_core::profile::ProfileId::new("corp"),
         profile_name: "corp".to_string(),
-        username: "alice".to_string(),
+        username: "alice".into(),
         username_cursor: 5,
-        password: "secret".to_string(),
+        password: "secret".into(),
         password_cursor: 6,
-        otp: String::new(),
+        otp: String::new().into(),
         otp_cursor: 0,
         focused_field: crate::state::AuthField::Otp,
         save_credentials: false,
@@ -2633,13 +2539,13 @@ fn failed_challenge_response_keeps_prompt_for_retry() {
     let challenge_id = serde_json::from_str("1").unwrap();
     app.control_challenge = Some(challenge_id);
     app.input_mode = InputMode::AuthPrompt {
-        profile_idx: 0,
+        profile_id: crate::vortix_core::profile::ProfileId::new("corp"),
         profile_name: "corp".to_string(),
-        username: "alice".to_string(),
+        username: "alice".into(),
         username_cursor: 5,
-        password: "secret".to_string(),
+        password: "secret".into(),
         password_cursor: 6,
-        otp: "123456".to_string(),
+        otp: "123456".into(),
         otp_cursor: 6,
         focused_field: crate::state::AuthField::Otp,
         save_credentials: false,
@@ -2648,16 +2554,95 @@ fn failed_challenge_response_keeps_prompt_for_retry() {
     };
 
     app.handle_message(Message::AuthSubmit {
-        idx: 0,
-        username: "alice".to_string(),
-        password: "secret".to_string(),
-        otp: Some("123456".to_string()),
+        profile_id: crate::vortix_core::profile::ProfileId::new("corp"),
+        username: "alice".into(),
+        password: "secret".into(),
+        otp: Some("123456".into()),
         save: false,
         connect_after: true,
     });
 
     assert_eq!(app.control_challenge, Some(challenge_id));
     assert!(matches!(app.input_mode, InputMode::AuthPrompt { .. }));
+}
+
+#[test]
+fn auth_manager_uses_stable_profile_identity_through_control_session() {
+    let temp = tempfile::tempdir().unwrap();
+    let profiles_dir = temp.path().join(crate::constants::PROFILES_DIR_NAME);
+    std::fs::create_dir(&profiles_dir).unwrap();
+    let profile_id = crate::vortix_core::profile::ProfileId::new("stable-corp");
+    let profile = VpnProfile {
+        id: profile_id.clone(),
+        name: "corp".into(),
+        protocol: Protocol::OpenVPN,
+        config_path: profiles_dir.join("corp.ovpn"),
+        location: String::new(),
+        last_used: None,
+    };
+    std::fs::write(&profile.config_path, "client\nauth-user-pass\n").unwrap();
+    let control = crate::cli::control::LocalControlSession::start_profile_test(
+        temp.path(),
+        vec![profile.clone()],
+    )
+    .unwrap();
+    control
+        .remember_openvpn_credentials(&profile_id, "old-user", "old-password")
+        .unwrap();
+
+    let mut app = test_app();
+    app.runtime.config_dir = temp.path().to_path_buf();
+    app.runtime.profiles = vec![profile.clone()];
+    app.attach_control_session(control).unwrap();
+    app.profile_list_state.select(Some(0));
+    app.handle_message(Message::ManageAuth);
+
+    assert!(matches!(
+        &app.input_mode,
+        InputMode::AuthPrompt {
+            profile_id: prompt_profile_id,
+            username,
+            password,
+            connect_after: false,
+            static_challenge_prompt: None,
+            ..
+        } if prompt_profile_id == &profile_id
+            && username.expose() == "old-user"
+            && password.expose() == "old-password"
+    ));
+
+    let mut other = profile.clone();
+    other.id = crate::vortix_core::profile::ProfileId::new("other-profile");
+    other.name = "other".into();
+    app.runtime.profiles.insert(0, other);
+    app.handle_message(Message::AuthSubmit {
+        profile_id: profile_id.clone(),
+        username: "new-user".into(),
+        password: "new-password".into(),
+        otp: None,
+        save: true,
+        connect_after: false,
+    });
+
+    let loaded = app
+        .control_session
+        .as_ref()
+        .unwrap()
+        .load_openvpn_credentials(&profile_id, "corp")
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded.username(), "new-user");
+    assert_eq!(loaded.password(), "new-password");
+
+    app.profile_list_state.select(Some(1));
+    app.handle_message(Message::ClearAuth);
+    assert!(app
+        .control_session
+        .as_ref()
+        .unwrap()
+        .load_openvpn_credentials(&profile_id, "corp")
+        .unwrap()
+        .is_none());
 }
 
 struct DormantRemoteSubscription;
@@ -2676,6 +2661,114 @@ impl crate::daemon::service::RemoteControlSubscription for DormantRemoteSubscrip
 #[derive(Default)]
 struct RecordingRemoteTransport {
     submitted: std::sync::atomic::AtomicUsize,
+}
+
+#[derive(Default)]
+struct ChallengeAcceptingRemoteTransport {
+    answered: std::sync::atomic::AtomicUsize,
+}
+
+impl crate::daemon::service::RemoteControlTransport for ChallengeAcceptingRemoteTransport {
+    fn exchange(
+        &self,
+        op: crate::vortix_core::ipc::IpcOp,
+    ) -> Result<crate::vortix_core::ipc::IpcResult, crate::daemon::service::RemoteControlError>
+    {
+        match op {
+            crate::vortix_core::ipc::IpcOp::ControlOpen => {
+                Ok(crate::vortix_core::ipc::IpcResult::ControlOpened {
+                    session_id: crate::vortix_core::ipc::RemoteSessionId::parse(format!(
+                        "session-{}",
+                        "3".repeat(32)
+                    ))
+                    .unwrap(),
+                    client_id: serde_json::from_str("\"client-0000000000000001-0000000000000001\"")
+                        .unwrap(),
+                })
+            }
+            crate::vortix_core::ipc::IpcOp::ControlRespondChallenge { .. } => {
+                self.answered
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(crate::vortix_core::ipc::IpcResult::ChallengeAccepted)
+            }
+            other => Err(crate::daemon::service::RemoteControlError::Protocol(
+                format!("unexpected challenge operation: {other:?}"),
+            )),
+        }
+    }
+
+    fn subscribe(
+        &self,
+        _session_id: &crate::vortix_core::ipc::RemoteSessionId,
+    ) -> Result<
+        (
+            Box<dyn crate::daemon::service::RemoteControlSubscription>,
+            crate::vortix_core::control::ControlSnapshot,
+        ),
+        crate::daemon::service::RemoteControlError,
+    > {
+        let challenge_id = serde_json::from_str("9").unwrap();
+        let mut snapshot = crate::vortix_core::control::ControlSnapshot::default();
+        snapshot.challenges.insert(
+            challenge_id,
+            crate::vortix_core::control::ChallengeRecord {
+                id: challenge_id,
+                profile_id: crate::vortix_core::profile::ProfileId::new("challenge-profile"),
+                operation_id: crate::vortix_core::control::OperationId::parse(
+                    "op-0000000000000001-0000000000000009",
+                )
+                .unwrap(),
+                kind: crate::vortix_core::control::ChallengeKind::TwoFactorCode,
+                label: "OTP".into(),
+                authorized_client: serde_json::from_str(
+                    "\"client-0000000000000001-0000000000000001\"",
+                )
+                .unwrap(),
+                created_at_millis: 1,
+                expires_at_millis: u64::MAX,
+            },
+        );
+        Ok((Box::new(DormantRemoteSubscription), snapshot))
+    }
+}
+
+#[test]
+fn challenge_answer_continues_when_remembering_is_unavailable() {
+    let transport = std::sync::Arc::new(ChallengeAcceptingRemoteTransport::default());
+    let remote =
+        crate::daemon::service::RemoteControlSession::open_for_parity(transport.clone()).unwrap();
+    let profile_id = crate::vortix_core::profile::ProfileId::new("challenge-profile");
+    let mut app = test_app();
+    app.runtime.profiles.push(VpnProfile {
+        id: profile_id.clone(),
+        name: "challenge profile".into(),
+        protocol: Protocol::OpenVPN,
+        config_path: std::path::PathBuf::from("challenge-profile.ovpn"),
+        location: String::new(),
+        last_used: None,
+    });
+    app.attach_remote_control_session(remote).unwrap();
+    assert!(matches!(app.input_mode, InputMode::AuthPrompt { .. }));
+
+    app.handle_message(Message::AuthSubmit {
+        profile_id,
+        username: "alice".into(),
+        password: "correct horse".into(),
+        otp: Some("123456".into()),
+        save: true,
+        connect_after: true,
+    });
+
+    assert!(app.control_challenge.is_none());
+    assert!(matches!(app.input_mode, InputMode::Normal));
+    assert!(app.toast.as_ref().is_some_and(|toast| {
+        toast.message.contains("connection can continue") && !toast.message.contains("Internal")
+    }));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while transport.answered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
 }
 
 impl crate::daemon::service::RemoteControlTransport for RecordingRemoteTransport {

@@ -83,11 +83,6 @@ pub struct StandardTunnelOwnershipStore {
 }
 
 impl StandardTunnelOwnershipStore {
-    #[must_use]
-    pub(crate) const fn owner_uid(&self) -> u32 {
-        self.owner_uid
-    }
-
     /// Construct the production root-owned store for the invoking sudo owner.
     pub fn production(owner_uid: u32) -> Result<Self, StandardOwnershipError> {
         if !crate::utils::is_root() {

@@ -9,7 +9,6 @@ use std::path::Path;
 use std::time::Duration;
 
 use serde::Serialize;
-use zeroize::Zeroize;
 
 use crate::cli::args::{BackgroundCommands, Commands};
 use crate::cli::output::{
@@ -874,7 +873,7 @@ fn handle_up(
         .validate(&command)
         .unwrap_or_else(|error| local_control_error_or_exit(mode, "up", &error));
 
-    validate_openvpn_static_challenge_credentials(&target)
+    validate_openvpn_static_challenge_credentials(&control, &target)
         .unwrap_or_else(|(error, exit)| print_error_and_exit(mode, "up", error, exit));
 
     let challenge_profiles = engine.profiles.clone();
@@ -1125,6 +1124,7 @@ fn detect_conflict_for_cli(
 }
 
 fn validate_openvpn_static_challenge_credentials(
+    control: &crate::cli::control::ClientControlSession,
     profile: &crate::state::VpnProfile,
 ) -> Result<(), (CliError, ExitCode)> {
     let Some(prompt_text) =
@@ -1132,9 +1132,22 @@ fn validate_openvpn_static_challenge_credentials(
     else {
         return Ok(());
     };
-    let Some((mut user, mut pass)) =
-        crate::utils::read_openvpn_saved_auth_compat(profile.id.as_str(), &profile.name)
-    else {
+    let credentials = control
+        .load_openvpn_credentials(&profile.id, &profile.name)
+        .map_err(|error| {
+            (
+                CliError {
+                    code: "credential_unavailable",
+                    message: format!(
+                        "Saved credentials for '{}' couldn't be used: {error}",
+                        profile.name
+                    ),
+                    hint: Some("Open the TUI Auth Manager and enter the credentials again.".into()),
+                },
+                ExitCode::PermissionDenied,
+            )
+        })?;
+    let Some(_credentials) = credentials else {
         return Err((
             CliError {
                 code: "auth_required",
@@ -1149,8 +1162,6 @@ fn validate_openvpn_static_challenge_credentials(
             ExitCode::PermissionDenied,
         ));
     };
-    user.zeroize();
-    pass.zeroize();
     Ok(())
 }
 
@@ -1458,7 +1469,7 @@ fn handle_reconnect(
             .iter()
             .find(|profile| &profile.name == name)
             .expect("reconnect target exists");
-        validate_openvpn_static_challenge_credentials(profile)
+        validate_openvpn_static_challenge_credentials(&control, profile)
             .unwrap_or_else(|(error, exit)| print_error_and_exit(mode, "reconnect", error, exit));
     }
     let challenge_profiles = engine.profiles.clone();
@@ -3481,6 +3492,41 @@ mod tests {
         let (code, exit) = local_control_error_category(&unauthorized);
         assert_eq!(code, "control_failed");
         assert_eq!(exit.code(), ExitCode::GeneralError.code());
+    }
+
+    #[test]
+    fn static_challenge_preflight_uses_live_credential_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let profiles_dir = temp.path().join(constants::PROFILES_DIR_NAME);
+        std::fs::create_dir(&profiles_dir).unwrap();
+        let profile = crate::state::VpnProfile {
+            id: crate::vortix_core::profile::ProfileId::new("cli-static-challenge"),
+            name: "CLI MFA".into(),
+            protocol: crate::state::Protocol::OpenVPN,
+            config_path: profiles_dir.join("cli-mfa.ovpn"),
+            location: String::new(),
+            last_used: None,
+        };
+        std::fs::write(
+            &profile.config_path,
+            "client\nauth-user-pass\nstatic-challenge \"Enter OTP\" 1\n",
+        )
+        .unwrap();
+        let local = crate::cli::control::LocalControlSession::start_profile_test(
+            temp.path(),
+            vec![profile.clone()],
+        )
+        .unwrap();
+        let control = crate::cli::control::ClientControlSession::standard(local);
+
+        let missing = validate_openvpn_static_challenge_credentials(&control, &profile)
+            .expect_err("missing reusable credentials must require Auth Manager");
+        assert_eq!(missing.0.code, "auth_required");
+
+        control
+            .remember_openvpn_credentials(&profile.id, "alice", "base-password")
+            .unwrap();
+        validate_openvpn_static_challenge_credentials(&control, &profile).unwrap();
     }
 
     #[test]

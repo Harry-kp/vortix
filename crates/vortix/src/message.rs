@@ -167,17 +167,17 @@ pub enum Message {
     // === Authentication ===
     /// Submit credentials from the auth prompt overlay
     AuthSubmit {
-        /// Profile index to connect after saving credentials
-        idx: usize,
+        /// Stable profile identity captured when the prompt opened.
+        profile_id: crate::vortix_core::profile::ProfileId,
         /// Username entered by the user
-        username: String,
+        username: crate::state::SecretText,
         /// Password entered by the user
-        password: String,
+        password: crate::state::SecretText,
         /// 2FA code from the static-challenge OTP field, when the profile
         /// declares a `static-challenge` directive.
         /// `None` for non-MFA profiles; the connect path embeds `Some(otp)`
         /// in the SCRV1 envelope and the save path always writes plain.
-        otp: Option<String>,
+        otp: Option<crate::state::SecretText>,
         /// Whether to persist credentials for future sessions
         save: bool,
         /// Whether to auto-connect after saving (false = save-only from manage flow)
@@ -525,5 +525,21 @@ mod tests {
         assert_eq!(ScrollMove::Up, ScrollMove::Up);
         assert_ne!(ScrollMove::Up, ScrollMove::Down);
         assert_ne!(ScrollMove::Top, ScrollMove::Bottom);
+    }
+
+    #[test]
+    fn auth_submit_debug_redacts_all_credential_fields() {
+        let message = Message::AuthSubmit {
+            profile_id: crate::vortix_core::profile::ProfileId::new("debug-redaction"),
+            username: "private-user".into(),
+            password: "private-password".into(),
+            otp: Some("private-otp".into()),
+            save: true,
+            connect_after: true,
+        };
+        let rendered = format!("{message:?}");
+        for marker in ["private-user", "private-password", "private-otp"] {
+            assert!(!rendered.contains(marker));
+        }
     }
 }

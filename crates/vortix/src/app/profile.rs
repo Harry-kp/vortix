@@ -124,9 +124,10 @@ impl App {
 
         self.runtime.profiles.remove(idx);
 
-        // Clean up OpenVPN auth and runtime files
+        // The profile store owns remembered-credential cleanup as part of its
+        // crash-safe delete transaction. The App only clears transient run
+        // artifacts in this detached compatibility path.
         if matches!(protocol, Protocol::OpenVPN) {
-            utils::delete_openvpn_auth_file_compat(profile_id.as_str(), &profile_name);
             utils::cleanup_openvpn_run_files_compat(profile_id.as_str(), &profile_name);
         }
 

@@ -345,13 +345,13 @@ impl App {
             },
 
             Message::AuthSubmit {
-                idx,
+                profile_id,
                 username,
                 password,
                 otp,
                 save,
                 connect_after,
-            } => self.handle_auth_submit(idx, username, password, otp, save, connect_after),
+            } => self.handle_auth_submit(profile_id, username, password, otp, save, connect_after),
 
             Message::CycleSortOrder => {
                 let selected_name = self
@@ -466,31 +466,48 @@ impl App {
                         ToastType::Info,
                     );
                 } else {
-                    // Pre-fill with existing credentials if saved. ManageAuth
-                    // is save-only (`connect_after: false`) so we DO NOT
-                    // surface the OTP field even on static-challenge profiles:
-                    // (1) the OTP is single-use and expires in ~30s, so
-                    // pre-saving has no value; (2) the submit handler writes
-                    // a `.scrv1.auth` bundle whenever `otp.is_some()`, and
-                    // without a connect path consuming it that bundle would
-                    // persist on disk with the plaintext OTP until the next
-                    // startup scrub -- a real leak window. Setting
-                    // static_challenge_prompt=None here keeps the overlay at
-                    // 2 fields (Username/Password) and forces `otp = None`
-                    // in the AuthSubmit message.
-                    let (username, password) =
-                        utils::read_openvpn_saved_auth_compat(profile.id.as_str(), &profile.name)
-                            .unwrap_or_default();
+                    // Manage mode persists only reusable username/password.
+                    // OTP and static-challenge answers are one-shot values, so
+                    // this save-only overlay intentionally omits that field.
+                    let profile_id = profile.id.clone();
+                    let profile_name = profile.name.clone();
+                    let Some(control) = self.control_session.as_ref() else {
+                        self.show_toast(
+                            "Credential service is unavailable".to_string(),
+                            ToastType::Error,
+                        );
+                        return;
+                    };
+                    let (username, password) = match control
+                        .load_openvpn_credentials(&profile_id, &profile_name)
+                    {
+                        Ok(Some(credentials)) => (
+                            crate::state::SecretText::from(credentials.username()),
+                            crate::state::SecretText::from(credentials.password()),
+                        ),
+                        Ok(None) => Default::default(),
+                        Err(error) => {
+                            self.log(&format!(
+                                "WARN: Remembered OpenVPN credentials are unavailable: {error}"
+                            ));
+                            self.show_toast(
+                                "Saved credentials couldn't be used. Enter new credentials to replace them."
+                                    .to_string(),
+                                ToastType::Warning,
+                            );
+                            Default::default()
+                        }
+                    };
                     let username_cursor = username.len();
                     let password_cursor = password.len();
                     self.input_mode = InputMode::AuthPrompt {
-                        profile_idx: idx,
-                        profile_name: profile.name.clone(),
+                        profile_id,
+                        profile_name,
                         username,
                         username_cursor,
                         password,
                         password_cursor,
-                        otp: String::new(),
+                        otp: crate::state::SecretText::default(),
                         otp_cursor: 0,
                         focused_field: crate::state::AuthField::Username,
                         save_credentials: true,
@@ -519,80 +536,82 @@ impl App {
                         "This profile does not use auth-user-pass".to_string(),
                         ToastType::Info,
                     );
-                } else if utils::read_openvpn_saved_auth_compat(profile_id.as_str(), &name)
-                    .is_none()
-                {
-                    self.show_toast(
-                        format!("No saved credentials for '{name}'"),
-                        ToastType::Info,
-                    );
                 } else {
-                    utils::delete_openvpn_auth_file_compat(profile_id.as_str(), &name);
-                    self.log(&format!("AUTH: Cleared saved credentials for '{name}'"));
-                    self.show_toast(
-                        format!("Credentials cleared for '{name}'"),
-                        ToastType::Success,
-                    );
+                    let Some(control) = self.control_session.as_ref() else {
+                        self.show_toast(
+                            "Credential service is unavailable".to_string(),
+                            ToastType::Error,
+                        );
+                        return;
+                    };
+                    match control.clear_openvpn_credentials(&profile_id, &name) {
+                        Ok(crate::cli::control::CredentialClearOutcome::NotFound) => self
+                            .show_toast(
+                                format!("No saved credentials for '{name}'"),
+                                ToastType::Info,
+                            ),
+                        Ok(crate::cli::control::CredentialClearOutcome::Cleared) => {
+                            self.log(&format!("AUTH: Cleared saved credentials for '{name}'"));
+                            self.show_toast(
+                                format!("Credentials cleared for '{name}'"),
+                                ToastType::Success,
+                            );
+                        }
+                        Err(
+                            crate::cli::control::LocalControlError::CredentialDurabilityUncertain,
+                        ) => {
+                            self.log(&format!(
+                                "WARN: Credentials for '{name}' were removed but disk durability is uncertain"
+                            ));
+                            self.show_toast(
+                                "Credentials were cleared, but disk confirmation failed. Verify after restarting."
+                                    .to_string(),
+                                ToastType::Warning,
+                            );
+                        }
+                        Err(error) => {
+                            self.log(&format!(
+                                "ERR: Remembered OpenVPN credentials could not be cleared: {error}"
+                            ));
+                            self.show_toast(
+                                "Saved credentials couldn't be cleared. Check permissions and try again."
+                                    .to_string(),
+                                ToastType::Error,
+                            );
+                        }
+                    }
                 }
             }
         }
     }
     fn handle_auth_submit(
         &mut self,
-        idx: usize,
-        username: String,
-        password: String,
-        otp: Option<String>,
+        profile_id: crate::vortix_core::profile::ProfileId,
+        username: crate::state::SecretText,
+        password: crate::state::SecretText,
+        otp: Option<crate::state::SecretText>,
         save: bool,
         connect_after: bool,
     ) {
         if let Some(challenge_id) = self.control_challenge {
-            if save {
-                let Some(profile) = self.runtime.profiles.get(idx) else {
-                    self.show_toast(
-                        "Challenge profile is unavailable".to_string(),
-                        ToastType::Error,
-                    );
-                    return;
-                };
-                if let Err(error) =
-                    utils::write_openvpn_auth_file(profile.id.as_str(), &username, &password)
-                {
-                    self.show_toast(
-                        format!("Failed to save credentials: {error}"),
-                        ToastType::Error,
-                    );
-                    return;
-                }
-            }
-            let answer = otp.filter(|answer| !answer.trim().is_empty());
-            let payload = crate::vortix_core::control::Secret::openvpn_credentials(
-                &username,
-                &password,
-                answer.as_deref(),
-            )
-            .into_vec();
-            let result = self
-                .control_session
-                .as_ref()
-                .expect("service challenge requires attached control session")
-                .respond_challenge(challenge_id, payload);
-            match result {
-                Ok(()) => {
-                    self.control_challenge = None;
-                    self.input_mode = InputMode::Normal;
-                    self.log("AUTH: Submitted service-owned challenge response");
-                }
-                Err(error) => self.show_toast(
-                    format!("Challenge response failed: {error}"),
-                    ToastType::Error,
-                ),
-            }
+            self.handle_control_auth_submit(
+                challenge_id,
+                profile_id,
+                username,
+                password,
+                otp,
+                save,
+            );
             return;
         }
 
-        let Some(profile) = self.runtime.profiles.get(idx) else {
-            self.show_toast("Invalid profile index".to_string(), ToastType::Error);
+        let Some(profile) = self
+            .runtime
+            .profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+        else {
+            self.show_toast("Profile is unavailable".to_string(), ToastType::Error);
             return;
         };
         if connect_after {
@@ -603,23 +622,134 @@ impl App {
             self.input_mode = InputMode::Normal;
             return;
         }
-        if let Err(error) =
-            utils::write_openvpn_auth_file(profile.id.as_str(), &username, &password)
-        {
+        let profile_name = profile.name.clone();
+        let Some(control) = self.control_session.as_ref() else {
             self.show_toast(
-                format!("Failed to save credentials: {error}"),
+                "Credential service is unavailable".to_string(),
+                ToastType::Error,
+            );
+            return;
+        };
+        match control.remember_openvpn_credentials(
+            &profile_id,
+            username.expose(),
+            password.expose(),
+        ) {
+            Ok(()) => {
+                self.input_mode = InputMode::Normal;
+                self.log(&format!("AUTH: Saved credentials for '{profile_name}'"));
+                self.show_toast(
+                    format!("Credentials updated for '{profile_name}'"),
+                    ToastType::Success,
+                );
+            }
+            Err(crate::cli::control::LocalControlError::CredentialDurabilityUncertain) => {
+                self.input_mode = InputMode::Normal;
+                self.log(&format!(
+                    "WARN: Credential update for '{profile_name}' is visible but disk durability is uncertain"
+                ));
+                self.show_toast(
+                    "Credentials were updated, but disk confirmation failed. You may be asked again after a restart."
+                        .to_string(),
+                    ToastType::Warning,
+                );
+            }
+            Err(error) => {
+                self.log(&format!(
+                    "ERR: Remembered OpenVPN credentials could not be saved: {error}"
+                ));
+                self.show_toast(
+                    "Credentials weren't saved. Check permissions and try again.".to_string(),
+                    ToastType::Error,
+                );
+            }
+        }
+    }
+
+    fn handle_control_auth_submit(
+        &mut self,
+        challenge_id: crate::vortix_core::control::ChallengeId,
+        profile_id: crate::vortix_core::profile::ProfileId,
+        username: crate::state::SecretText,
+        password: crate::state::SecretText,
+        otp: Option<crate::state::SecretText>,
+        save: bool,
+    ) {
+        let challenge_matches_profile = self
+            .control_snapshot
+            .challenges
+            .get(&challenge_id)
+            .is_some_and(|challenge| challenge.profile_id == profile_id);
+        if !challenge_matches_profile {
+            self.show_toast(
+                "The connection prompt expired; start the connection again".to_string(),
+                ToastType::Warning,
+            );
+            return;
+        }
+        let answer = otp.filter(|answer| !answer.trim().is_empty());
+        let payload = crate::vortix_core::control::Secret::openvpn_credentials(
+            username.expose(),
+            password.expose(),
+            answer.as_deref(),
+        )
+        .into_vec();
+        let control = self
+            .control_session
+            .as_ref()
+            .expect("service challenge requires attached control session");
+        if let Err(error) = control.respond_challenge(challenge_id, payload) {
+            self.show_toast(
+                format!("Challenge response failed: {error}"),
                 ToastType::Error,
             );
             return;
         }
-        let profile_name = profile.name.clone();
+
+        self.control_challenge = None;
         self.input_mode = InputMode::Normal;
-        self.log(&format!("AUTH: Saved credentials for '{profile_name}'"));
-        self.show_toast(
-            format!("Credentials updated for '{profile_name}'"),
-            ToastType::Success,
-        );
+        self.log("AUTH: Submitted service-owned challenge response");
+        if !save {
+            return;
+        }
+        let profile_name = self
+            .runtime
+            .profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .map_or_else(|| profile_id.to_string(), |profile| profile.name.clone());
+        let remember = self
+            .control_session
+            .as_ref()
+            .expect("service challenge requires attached control session")
+            .remember_openvpn_credentials(&profile_id, username.expose(), password.expose());
+        match remember {
+            Ok(()) => self.log(&format!(
+                "AUTH: Remembered credentials for '{profile_name}'"
+            )),
+            Err(crate::cli::control::LocalControlError::CredentialDurabilityUncertain) => {
+                self.log(&format!(
+                    "WARN: OpenVPN credentials for '{profile_name}' are visible but disk durability is uncertain"
+                ));
+                self.show_toast(
+                    "Credentials were submitted and updated, but disk confirmation failed. This connection can continue."
+                        .to_string(),
+                    ToastType::Warning,
+                );
+            }
+            Err(error) => {
+                self.log(&format!(
+                    "WARN: OpenVPN credentials were submitted but not remembered: {error}"
+                ));
+                self.show_toast(
+                    "Credentials were submitted, but they weren't saved. This connection can continue; you'll be asked again next time."
+                        .to_string(),
+                    ToastType::Warning,
+                );
+            }
+        }
     }
+
     fn handle_toggle_killswitch(&mut self) {
         if self.control_session.is_none() {
             self.show_toast(

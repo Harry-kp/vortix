@@ -23,6 +23,10 @@ use crate::vortix_protocol_wireguard::WgTunnel;
 
 use crate::state::{Protocol, VpnProfile};
 
+type RememberedOpenVpnCredentialResolver = dyn Fn(&ProfileId, &str) -> Result<Option<crate::vortix_core::control::Secret>, String>
+    + Send
+    + Sync;
+
 /// Runtime-selectable carrier over the closed protocol set.
 ///
 /// Mock variant uses `crate::vortix_core::ports::tunnel::mock::MockTunnel` so tests
@@ -207,6 +211,7 @@ pub struct CanonicalTunnelExecutor {
     standard_ownership:
         Option<Arc<crate::core::standard_tunnel_ownership::StandardTunnelOwnershipStore>>,
     sessions: Option<Arc<CanonicalSessionResolver>>,
+    remembered_openvpn_credentials: Option<Arc<RememberedOpenVpnCredentialResolver>>,
     challenge_issuer: Mutex<Option<std::sync::Weak<crate::vortix_core::control::CompleterHandle>>>,
 }
 
@@ -222,6 +227,7 @@ impl CanonicalTunnelExecutor {
             active: Mutex::new(BTreeMap::new()),
             standard_ownership: None,
             sessions: None,
+            remembered_openvpn_credentials: None,
             challenge_issuer: Mutex::new(None),
         }
     }
@@ -244,8 +250,24 @@ impl CanonicalTunnelExecutor {
             active: Mutex::new(BTreeMap::new()),
             standard_ownership: Some(ownership),
             sessions: Some(Arc::new(sessions)),
+            remembered_openvpn_credentials: None,
             challenge_issuer: Mutex::new(None),
         }
+    }
+
+    /// Supply the session-owned live resolver for reusable `OpenVPN`
+    /// credentials. The executor receives one memory-only value per attempt
+    /// and never opens the remembered-credential store itself.
+    #[must_use]
+    pub fn with_remembered_openvpn_credentials(
+        mut self,
+        resolver: impl Fn(&ProfileId, &str) -> Result<Option<crate::vortix_core::control::Secret>, String>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.remembered_openvpn_credentials = Some(Arc::new(resolver));
+        self
     }
 
     /// Install the service-owned challenge capability after the cyclic
@@ -286,19 +308,28 @@ impl CanonicalTunnelExecutor {
         }
         let static_prompt =
             crate::utils::read_openvpn_static_challenge_prompt(&profile.config_path);
-        let owner_uid = self.standard_ownership.as_ref().map_or_else(
-            || crate::utils::effective_user_group_ids().0,
-            |store| store.owner_uid(),
-        );
-        let saved_credentials = crate::utils::read_openvpn_saved_auth_compat_owned(
-            &self.settings.config_dir,
-            owner_uid,
-            profile.id.as_str(),
-            &profile.display_name,
-        )
-        .map_err(|error| format!("saved OpenVPN credentials were rejected: {error}"))?;
-        if static_prompt.is_none() && saved_credentials.is_some() {
-            return Ok(None);
+        let saved_credentials = self
+            .remembered_openvpn_credentials
+            .as_ref()
+            .map(|resolver| resolver(&profile.id, &profile.display_name))
+            .transpose()?
+            .flatten()
+            .map(|secret| {
+                secret.decode_openvpn_credentials().ok_or_else(|| {
+                    "remembered OpenVPN credential authority returned an invalid value".to_string()
+                })
+            })
+            .transpose()?;
+        if static_prompt.is_none() {
+            if let Some((username, password, answer)) = saved_credentials {
+                return Ok(Some(
+                    crate::vortix_protocol_openvpn::tunnel::OpenVpnStaticChallengeCredentials::new(
+                        username.to_string(),
+                        password.to_string(),
+                        answer,
+                    ),
+                ));
+            }
         }
         let challenge_capability = self
             .challenge_issuer
@@ -359,7 +390,7 @@ impl CanonicalTunnelExecutor {
                             ),
                         ));
                     }
-                    let Some((username, password)) = saved_credentials.as_ref() else {
+                    let Some((username, password, _)) = saved_credentials.as_ref() else {
                         return Err(
                             "interactive credential response did not contain username/password"
                                 .to_string(),
@@ -1100,6 +1131,62 @@ mod canonical_tests {
 
         assert_eq!(receipt.openvpn_dns, Some(handle.dns_request));
         assert_eq!(receipt.openvpn_routes, handle.openvpn_routes);
+    }
+
+    #[test]
+    fn canonical_openvpn_resolves_remembered_credentials_through_injected_authority() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("corp.ovpn");
+        std::fs::write(&config_path, "client\nauth-user-pass\n").unwrap();
+        let profile = Profile::new(
+            ProfileId::new("corp"),
+            "renamed corp",
+            ProtocolKind::OpenVpn,
+            config_path,
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolver_calls = Arc::clone(&calls);
+        let executor = CanonicalTunnelExecutor::new(
+            CanonicalTunnelSettings {
+                config_dir: temp.path().to_path_buf(),
+                openvpn_verbosity: "3".into(),
+                connect_timeout_secs: 1,
+                wireguard_handshake_timeout_secs: 1,
+                wireguard_health_targets: Vec::new(),
+            },
+            |_| None,
+        )
+        .with_remembered_openvpn_credentials(move |profile_id, legacy_display_name| {
+            resolver_calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(profile_id, &ProfileId::new("corp"));
+            assert_eq!(legacy_display_name, "renamed corp");
+            Ok(Some(
+                crate::vortix_core::control::Secret::openvpn_credentials(
+                    "alice",
+                    "correct horse",
+                    None,
+                ),
+            ))
+        });
+        let mut connect = work(7);
+        connect.protocol = TunnelKindTag::OpenVpn;
+
+        let credentials = executor
+            .openvpn_interactive_credentials(
+                &connect,
+                &profile,
+                &crate::vortix_core::control::worker::CancellationToken::default(),
+            )
+            .unwrap();
+
+        let credentials = credentials.expect("remembered credentials should be resolved");
+        assert_eq!(
+            credentials.username_password_for_test(),
+            ("alice", "correct horse")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

@@ -177,34 +177,37 @@ configured, read your own `settings.toml`.
 
 ---
 
-## OpenVPN auth: nothing changes unless you want it to
+## OpenVPN remembered credentials and sudo upgrades
 
-Existing `${XDG_CONFIG_HOME}/vortix/auth/<profile>.auth` files keep
-working exactly as before. The `OvpnTunnel` honors them on every
-`vortix up`.
+Existing owner-written `${XDG_CONFIG_HOME}/vortix/auth/<profile>.auth`
+records remain compatible. Vortix can resolve an unambiguous legacy name, while
+all new writes use the profile's stable ID. Profile rename therefore no
+longer changes which remembered username/password belongs to the profile.
 
-To optionally move credentials into the encrypted store:
+Standard mode now owns remembered credentials through the live control
+session. The TUI, CLI, and OpenVPN executor do not independently read or write
+credential paths. Only the reusable username/password pair may be remembered;
+OTP and static- or remote-challenge answers remain memory-only.
 
-```sh
-echo -n 'username:password' | vortix secrets set creds/corp
-rm ~/.config/vortix/auth/corp.auth
-vortix up corp                # tunnel pulls from the secret store now
-```
+Older builds run through `sudo` could create the stable-ID `.auth` file as
+root even though the Vortix configuration belongs to the invoking user. A
+root-capable Standard session automatically transfers only that exact record
+after proving it is a regular, single-link, mode-0600 file in the authenticated
+owner's directory. Symlinks, loose permissions, unexpected owners, ambiguous
+legacy names, malformed contents, and changed entries are left untouched and
+Vortix asks for credentials again instead of guessing.
 
-When both exist, the secret store takes precedence; the legacy `.auth`
-file is the fallback.
+Choosing **Remember** is independent of the current connection attempt.
+Vortix submits the in-memory answer first. If the owner-safe atomic save then
+fails before publication, the connection may continue and the TUI reports that
+credentials were not saved; the next connection will ask again. If publication
+succeeds but directory durability cannot be confirmed, the TUI says the change
+is visible but may need verification after restart. Auth Manager uses the same
+truthful distinction for edit and clear operations.
 
-To share a profile with credentials inlined for one-shot use (be
-careful — this writes the password into the export):
-
-```sh
-vortix show corp --raw --inline-secrets > corp-with-creds.ovpn
-# Recipient: cat corp-with-creds.ovpn | vortix import - && vortix up corp
-```
-
-The inlined form appears as a `# vortix-secret:<base64>` trailing
-comment that v0.3.x picks up on import. v0.2.x silently ignores it as
-a comment, so the file is forward-compatible.
+Run the application normally after building it. Only the installed privileged
+boundary or an explicit manual compatibility test should run as root; avoid
+`sudo cargo` because it makes the Cargo target directory root-owned.
 
 ---
 

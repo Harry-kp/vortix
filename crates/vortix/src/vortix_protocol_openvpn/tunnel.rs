@@ -303,6 +303,11 @@ impl OpenVpnStaticChallengeCredentials {
             answer,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn username_password_for_test(&self) -> (&str, &str) {
+        (&self.username, &self.password)
+    }
 }
 
 /// `OpenVPN` tunnel implementation.

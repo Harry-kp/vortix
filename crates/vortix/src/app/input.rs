@@ -145,7 +145,7 @@ impl App {
                 }
             }
             InputMode::AuthPrompt {
-                profile_idx,
+                profile_id,
                 profile_name,
                 mut username,
                 mut username_cursor,
@@ -160,7 +160,7 @@ impl App {
             } => {
                 self.handle_input_auth(
                     key,
-                    profile_idx,
+                    &profile_id,
                     &profile_name,
                     &mut username,
                     &mut username_cursor,
@@ -176,7 +176,7 @@ impl App {
                 // Update state if still in AuthPrompt mode
                 if let InputMode::AuthPrompt { .. } = self.input_mode {
                     self.input_mode = InputMode::AuthPrompt {
-                        profile_idx,
+                        profile_id,
                         profile_name,
                         username,
                         username_cursor,
@@ -536,13 +536,13 @@ impl crate::app::App {
     fn handle_input_auth(
         &mut self,
         key: KeyEvent,
-        profile_idx: usize,
+        profile_id: &crate::vortix_core::profile::ProfileId,
         _profile_name: &str,
-        username: &mut String,
+        username: &mut crate::state::SecretText,
         username_cursor: &mut usize,
-        password: &mut String,
+        password: &mut crate::state::SecretText,
         password_cursor: &mut usize,
-        otp: &mut String,
+        otp: &mut crate::state::SecretText,
         otp_cursor: &mut usize,
         focused_field: &mut AuthField,
         save_credentials: &mut bool,
@@ -576,13 +576,13 @@ impl crate::app::App {
                 }
                 // When this profile declares static-challenge, require OTP.
                 // Trim the OTP at submit (covers paste-with-newline).
-                let trimmed_otp = otp.trim().to_string();
+                let trimmed_otp = crate::state::SecretText::from(otp.trim());
                 if has_otp_field && trimmed_otp.is_empty() {
                     self.show_toast("OTP required".to_string(), ToastType::Warning);
                     return;
                 }
                 self.handle_message(Message::AuthSubmit {
-                    idx: profile_idx,
+                    profile_id: profile_id.clone(),
                     username: username.clone(),
                     password: password.clone(),
                     otp: if has_otp_field {
@@ -600,9 +600,9 @@ impl crate::app::App {
             _ => {
                 // Route text editing to the focused field
                 let (text, cursor) = match focused_field {
-                    AuthField::Username => (username, username_cursor),
-                    AuthField::Password => (password, password_cursor),
-                    AuthField::Otp => (otp, otp_cursor),
+                    AuthField::Username => (username.expose_mut(), username_cursor),
+                    AuthField::Password => (password.expose_mut(), password_cursor),
+                    AuthField::Otp => (otp.expose_mut(), otp_cursor),
                     AuthField::SaveCheckbox => return, // No text editing on checkbox
                 };
                 Self::handle_text_field_input(key, text, cursor);

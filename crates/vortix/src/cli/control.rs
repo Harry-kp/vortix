@@ -17,6 +17,10 @@ use crate::topology_policy::{
 };
 use crate::tunnel::{CanonicalTunnelExecutor, CanonicalTunnelSettings};
 use crate::vortix_config::control_state::FsControlStateStore;
+pub use crate::vortix_config::openvpn_credentials::CredentialClearOutcome;
+use crate::vortix_config::openvpn_credentials::{
+    CredentialStoreError, FsOpenVpnCredentialStore, RememberedOpenVpnCredentials,
+};
 use crate::vortix_config::profile_store::{FsProfileStore, ProfileStore, ProfileStoreError};
 use crate::vortix_core::control::worker::TunnelRevision;
 use crate::vortix_core::control::{
@@ -54,6 +58,20 @@ pub enum LocalControlError {
     Persistence(String),
     #[error("cannot open Standard-mode tunnel ownership: {0}")]
     Ownership(String),
+    #[error("cannot load remembered OpenVPN credentials: {0}")]
+    CredentialLoad(#[source] CredentialStoreError),
+    #[error("cannot remember OpenVPN credentials: {0}")]
+    CredentialRemember(#[source] CredentialStoreError),
+    #[error("cannot clear remembered OpenVPN credentials: {0}")]
+    CredentialClear(#[source] CredentialStoreError),
+    #[error("the credential change is visible, but disk durability could not be confirmed")]
+    CredentialDurabilityUncertain,
+    #[error(
+        "remembered OpenVPN credential management is unavailable through this control session"
+    )]
+    CredentialManagementUnsupported,
+    #[error("remembered OpenVPN credential authority is unavailable")]
+    CredentialAuthorityUnavailable,
     #[error("cannot recover active profile '{profile}': {reason}")]
     Recovery { profile: String, reason: String },
     #[error("local control observation failed: {0}")]
@@ -1327,6 +1345,62 @@ impl ClientControlSession {
         }
     }
 
+    /// Load reusable `OpenVPN` credentials through the selected live
+    /// authority. This operation is intentionally absent from `UserCommand`
+    /// and every durable control projection.
+    pub fn load_openvpn_credentials(
+        &self,
+        profile_id: &ProfileId,
+        legacy_display_name: &str,
+    ) -> Result<Option<RememberedOpenVpnCredentials>, LocalControlError> {
+        match &self.0 {
+            ClientControlSessionKind::StandardLifecycle(session) => {
+                session.load_openvpn_credentials(profile_id, legacy_display_name)
+            }
+            ClientControlSessionKind::StandardProfile(_)
+            | ClientControlSessionKind::Remote { .. } => {
+                Err(LocalControlError::CredentialManagementUnsupported)
+            }
+        }
+    }
+
+    /// Atomically remember a reusable username/password pair for one stable
+    /// profile identity through the selected live authority.
+    pub fn remember_openvpn_credentials(
+        &self,
+        profile_id: &ProfileId,
+        username: &str,
+        password: &str,
+    ) -> Result<(), LocalControlError> {
+        match &self.0 {
+            ClientControlSessionKind::StandardLifecycle(session) => {
+                session.remember_openvpn_credentials(profile_id, username, password)
+            }
+            ClientControlSessionKind::StandardProfile(_)
+            | ClientControlSessionKind::Remote { .. } => {
+                Err(LocalControlError::CredentialManagementUnsupported)
+            }
+        }
+    }
+
+    /// Clear stable and unambiguous legacy credentials through the selected
+    /// live authority.
+    pub fn clear_openvpn_credentials(
+        &self,
+        profile_id: &ProfileId,
+        legacy_display_name: &str,
+    ) -> Result<CredentialClearOutcome, LocalControlError> {
+        match &self.0 {
+            ClientControlSessionKind::StandardLifecycle(session) => {
+                session.clear_openvpn_credentials(profile_id, legacy_display_name)
+            }
+            ClientControlSessionKind::StandardProfile(_)
+            | ClientControlSessionKind::Remote { .. } => {
+                Err(LocalControlError::CredentialManagementUnsupported)
+            }
+        }
+    }
+
     pub fn cancel_challenge(
         &self,
         challenge_id: crate::vortix_core::control::ChallengeId,
@@ -1502,6 +1576,7 @@ pub struct LocalControlSession {
     service: Option<ControlService>,
     // The executor holds only a Weak edge, avoiding a service/supervisor cycle.
     _challenge_issuer: Arc<crate::vortix_core::control::CompleterHandle>,
+    openvpn_credentials: Arc<Mutex<FsOpenVpnCredentialStore>>,
     hooks: Option<crate::hooks::HookRunner>,
     runtime: Option<tokio::runtime::Runtime>,
     subscription: RefCell<ControlSubscription>,
@@ -1747,6 +1822,10 @@ impl LocalControlSession {
             .enable_all()
             .build()
             .map_err(|error| LocalControlError::Runtime(error.to_string()))?;
+        let owner = config_owner(config_dir)?;
+        let openvpn_credentials = Arc::new(Mutex::new(
+            FsOpenVpnCredentialStore::for_standard_owner(config_dir, owner.0, owner.1),
+        ));
         let profiles = Arc::new(profiles);
         let mut cache = EndpointResolutionCache::default();
         let (topologies, topology_errors) = load_profile_topologies(&profiles, &mut cache);
@@ -1796,6 +1875,7 @@ impl LocalControlSession {
         Ok(Self {
             service: Some(service),
             _challenge_issuer: challenge_issuer,
+            openvpn_credentials,
             hooks: None,
             runtime: Some(runtime),
             subscription: RefCell::new(subscription),
@@ -1832,6 +1912,9 @@ impl LocalControlSession {
         let _runtime_guard = runtime.enter();
         let profiles = Arc::new(profiles);
         let owner = config_owner(config_dir)?;
+        let openvpn_credentials = Arc::new(Mutex::new(
+            FsOpenVpnCredentialStore::for_standard_owner(config_dir, owner.0, owner.1),
+        ));
         let boot_id = crate::utils::boot_identity().ok_or_else(|| {
             LocalControlError::Persistence("OS boot identity is unavailable".into())
         })?;
@@ -1894,18 +1977,43 @@ impl LocalControlSession {
             let profile = scanner_catalog.profile_snapshot(profile_id)?;
             current_session(&profile, &executor_sessions)
         };
-        let executor = Arc::new(CanonicalTunnelExecutor::new_standard(
-            CanonicalTunnelSettings {
-                config_dir: config_dir.to_path_buf(),
-                openvpn_verbosity: config.openvpn_verbosity.clone(),
-                connect_timeout_secs: config.connect_timeout,
-                wireguard_handshake_timeout_secs: config.wireguard_handshake_timeout_secs,
-                wireguard_health_targets: config.ping_targets.clone(),
-            },
-            move |profile_id| executor_catalog.core_profile(profile_id),
-            Arc::clone(&ownership),
-            session_resolver,
-        ));
+        let executor_credential_store = Arc::clone(&openvpn_credentials);
+        let executor = Arc::new(
+            CanonicalTunnelExecutor::new_standard(
+                CanonicalTunnelSettings {
+                    config_dir: config_dir.to_path_buf(),
+                    openvpn_verbosity: config.openvpn_verbosity.clone(),
+                    connect_timeout_secs: config.connect_timeout,
+                    wireguard_handshake_timeout_secs: config.wireguard_handshake_timeout_secs,
+                    wireguard_health_targets: config.ping_targets.clone(),
+                },
+                move |profile_id| executor_catalog.core_profile(profile_id),
+                Arc::clone(&ownership),
+                session_resolver,
+            )
+            .with_remembered_openvpn_credentials(
+                move |profile_id, legacy_display_name| {
+                    let store = executor_credential_store.lock().map_err(|_| {
+                        "remembered OpenVPN credential authority is unavailable".to_string()
+                    })?;
+                    // A rejected or unavailable remembered record is never consumed
+                    // by tunnel execution. Fall back to the admitted memory-only
+                    // challenge; the client-side load operation owns user-facing
+                    // credential diagnostics.
+                    Ok(store
+                        .load(profile_id, legacy_display_name)
+                        .ok()
+                        .flatten()
+                        .map(|credentials| {
+                            crate::vortix_core::control::Secret::openvpn_credentials(
+                                credentials.username(),
+                                credentials.password(),
+                                None,
+                            )
+                        }))
+                },
+            ),
+        );
 
         let policy_profiles = Arc::clone(&profiles);
         let policy_catalog = Arc::clone(&profile_mutations);
@@ -1996,6 +2104,7 @@ impl LocalControlSession {
         let session = Self {
             service: Some(service),
             _challenge_issuer: challenge_issuer,
+            openvpn_credentials,
             hooks,
             runtime: Some(runtime),
             subscription: RefCell::new(subscription),
@@ -2269,6 +2378,61 @@ impl LocalControlSession {
                 crate::vortix_core::control::Secret::new(answer),
             ))
             .map_err(map_challenge_response_error)
+    }
+
+    /// Resolve reusable credentials from the one owner-bound store retained
+    /// by this Standard-mode session.
+    pub fn load_openvpn_credentials(
+        &self,
+        profile_id: &ProfileId,
+        legacy_display_name: &str,
+    ) -> Result<Option<RememberedOpenVpnCredentials>, LocalControlError> {
+        self.openvpn_credentials
+            .lock()
+            .map_err(|_| LocalControlError::CredentialAuthorityUnavailable)?
+            .load(profile_id, legacy_display_name)
+            .map_err(LocalControlError::CredentialLoad)
+    }
+
+    /// Replace the reusable username/password for one stable profile. The
+    /// legacy name is accepted as part of the transport-neutral identity
+    /// contract; new writes are always stable-ID keyed.
+    pub fn remember_openvpn_credentials(
+        &self,
+        profile_id: &ProfileId,
+        username: &str,
+        password: &str,
+    ) -> Result<(), LocalControlError> {
+        let credentials = RememberedOpenVpnCredentials::new(username, password)
+            .map_err(LocalControlError::CredentialRemember)?;
+        self.openvpn_credentials
+            .lock()
+            .map_err(|_| LocalControlError::CredentialAuthorityUnavailable)?
+            .replace(profile_id, &credentials)
+            .map_err(|error| match error {
+                CredentialStoreError::DurabilityUncertain => {
+                    LocalControlError::CredentialDurabilityUncertain
+                }
+                other => LocalControlError::CredentialRemember(other),
+            })
+    }
+
+    /// Clear stable and unambiguous legacy credentials for one profile.
+    pub fn clear_openvpn_credentials(
+        &self,
+        profile_id: &ProfileId,
+        legacy_display_name: &str,
+    ) -> Result<CredentialClearOutcome, LocalControlError> {
+        self.openvpn_credentials
+            .lock()
+            .map_err(|_| LocalControlError::CredentialAuthorityUnavailable)?
+            .clear(profile_id, legacy_display_name)
+            .map_err(|error| match error {
+                CredentialStoreError::DurabilityUncertain => {
+                    LocalControlError::CredentialDurabilityUncertain
+                }
+                other => LocalControlError::CredentialClear(other),
+            })
     }
 
     pub fn cancel_challenge(
@@ -3516,6 +3680,89 @@ mod tests {
 
         assert!(session.take_changed_snapshot().unwrap().is_none());
         assert!(session.take_changed_snapshot().unwrap().is_none());
+    }
+
+    #[test]
+    fn standard_session_manages_credentials_outside_durable_control_shapes() {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join(crate::constants::PROFILES_DIR_NAME)).unwrap();
+        let profile_id = profile_id('a');
+        let session = LocalControlSession::start_profile_test(temp.path(), Vec::new()).unwrap();
+
+        session
+            .remember_openvpn_credentials(
+                &profile_id,
+                "u2-session-marker-user",
+                "u2-session-marker-password",
+            )
+            .unwrap();
+        let loaded = session
+            .load_openvpn_credentials(&profile_id, "renamed-corp")
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.username(), "u2-session-marker-user");
+        assert_eq!(loaded.password(), "u2-session-marker-password");
+
+        let command = serde_json::to_vec(&UserCommand::Connect {
+            profile_id: profile_id.clone(),
+            conflict_acknowledgement: None,
+        })
+        .unwrap();
+        let snapshot = serde_json::to_vec(&session.current_snapshot()).unwrap();
+        for durable in [&command[..], &snapshot[..]] {
+            assert!(!durable
+                .windows(b"u2-session-marker-user".len())
+                .any(|window| window == b"u2-session-marker-user"));
+            assert!(!durable
+                .windows(b"u2-session-marker-password".len())
+                .any(|window| window == b"u2-session-marker-password"));
+        }
+
+        let auth_path = temp
+            .path()
+            .join(crate::constants::OPENVPN_AUTH_DIR)
+            .join(format!("{}.auth", profile_id.as_str()));
+        #[cfg(unix)]
+        {
+            let owner = config_owner(temp.path()).unwrap();
+            let metadata = std::fs::metadata(&auth_path).unwrap();
+            assert_eq!((metadata.uid(), metadata.gid()), owner);
+        }
+
+        session
+            .clear_openvpn_credentials(&profile_id, "renamed-corp")
+            .unwrap();
+        assert!(session
+            .load_openvpn_credentials(&profile_id, "renamed-corp")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn remote_credential_management_is_explicitly_unsupported_without_local_fallback() {
+        let session = ClientControlSession::remote_for_parity(
+            crate::daemon::service::RemoteControlSession::open_for_parity(Arc::new(
+                SnapshotRemoteTransport::new(ControlSnapshot::default()),
+            ))
+            .unwrap(),
+        );
+        let profile_id = profile_id('a');
+
+        assert!(matches!(
+            session.load_openvpn_credentials(&profile_id, "corp"),
+            Err(LocalControlError::CredentialManagementUnsupported)
+        ));
+        assert!(matches!(
+            session.remember_openvpn_credentials(&profile_id, "alice", "secret"),
+            Err(LocalControlError::CredentialManagementUnsupported)
+        ));
+        assert!(matches!(
+            session.clear_openvpn_credentials(&profile_id, "corp"),
+            Err(LocalControlError::CredentialManagementUnsupported)
+        ));
     }
 
     #[test]

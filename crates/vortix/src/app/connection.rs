@@ -324,25 +324,46 @@ impl App {
         let pending_challenge = snapshot.challenges.values().next().cloned();
         match pending_challenge {
             Some(challenge) if self.control_challenge != Some(challenge.id) => {
-                if let Some((idx, profile)) = self
+                if let Some(profile) = self
                     .runtime
                     .profiles
                     .iter()
-                    .enumerate()
-                    .find(|(_, profile)| profile.id == challenge.profile_id)
+                    .find(|profile| profile.id == challenge.profile_id)
                 {
                     self.control_challenge = Some(challenge.id);
-                    let (username, password) =
-                        utils::read_openvpn_saved_auth_compat(profile.id.as_str(), &profile.name)
-                            .unwrap_or_default();
+                    let profile_id = profile.id.clone();
+                    let profile_name = profile.name.clone();
+                    let credentials = self
+                        .control_session
+                        .as_ref()
+                        .expect("snapshot challenge requires attached control session")
+                        .load_openvpn_credentials(&profile_id, &profile_name);
+                    let (username, password) = match credentials {
+                        Ok(Some(credentials)) => (
+                            crate::state::SecretText::from(credentials.username()),
+                            crate::state::SecretText::from(credentials.password()),
+                        ),
+                        Ok(None) => Default::default(),
+                        Err(error) => {
+                            self.log(&format!(
+                                "WARN: Remembered OpenVPN credentials are unavailable: {error}"
+                            ));
+                            self.show_toast(
+                                "Saved credentials couldn't be used. Enter them again to continue."
+                                    .to_string(),
+                                ToastType::Warning,
+                            );
+                            Default::default()
+                        }
+                    };
                     self.input_mode = InputMode::AuthPrompt {
-                        profile_idx: idx,
-                        profile_name: profile.name.clone(),
+                        profile_id,
+                        profile_name,
                         username_cursor: username.chars().count(),
                         password_cursor: password.chars().count(),
                         username,
                         password,
-                        otp: String::new(),
+                        otp: crate::state::SecretText::default(),
                         otp_cursor: 0,
                         focused_field: if matches!(
                             &challenge.kind,

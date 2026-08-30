@@ -409,15 +409,57 @@ fn decode_state(bytes: &[u8]) -> Result<DecodedState, ControlStateError> {
 }
 
 #[cfg(unix)]
-type ControlDirectory = std::fs::File;
+pub(crate) type ControlDirectory = std::fs::File;
 
 #[cfg(not(unix))]
-type ControlDirectory = PathBuf;
+pub(crate) type ControlDirectory = PathBuf;
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AtomicWriteStage {
+    Create,
+    Write,
+    FirstFileSync,
+    OwnerPreparation,
+    SecondFileSync,
+    Publish,
+    DirectorySync,
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+pub(crate) enum AtomicWriteError {
+    NotPublished(ControlStateError),
+    PublishedButDirectoryUnsynced(ControlStateError),
+}
+
+#[cfg(unix)]
+impl AtomicWriteError {
+    pub(crate) fn into_control_state(self) -> ControlStateError {
+        match self {
+            Self::NotPublished(error) | Self::PublishedButDirectoryUnsynced(error) => error,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl From<ControlStateError> for AtomicWriteError {
+    fn from(error: ControlStateError) -> Self {
+        Self::NotPublished(error)
+    }
+}
+
+#[cfg(unix)]
+impl From<std::io::Error> for AtomicWriteError {
+    fn from(error: std::io::Error) -> Self {
+        Self::NotPublished(ControlStateError::Io(error))
+    }
+}
 
 #[cfg(unix)]
 #[allow(unsafe_code)]
 #[allow(clippy::similar_names)]
-fn open_control_directory(
+pub(crate) fn open_control_directory(
     path: &Path,
     create: bool,
     expected_uid: u32,
@@ -476,6 +518,81 @@ fn open_control_directory(
     if created {
         prepare_created_descriptor(&directory, expected_uid, expected_gid, 0o700)?;
         parent.sync_all()?;
+    }
+    validate_directory_descriptor(&directory, expected_uid)?;
+    Ok(Some(directory))
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+#[allow(clippy::similar_names)]
+pub(crate) fn open_owned_directory_at(
+    parent: &ControlDirectory,
+    name: &str,
+    create: bool,
+    expected_uid: u32,
+    expected_gid: u32,
+) -> Result<Option<ControlDirectory>, ControlStateError> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+    validate_directory_descriptor(parent, expected_uid)?;
+    let name = CString::new(name).map_err(|_| ControlStateError::UnsafeFile)?;
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let mut fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+    let mut created = false;
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        if is_unsafe_path_error(&error) {
+            return Err(ControlStateError::UnsafeFile);
+        }
+        if error.raw_os_error() != Some(libc::ENOENT) {
+            return Err(error.into());
+        }
+        if !create {
+            return Ok(None);
+        }
+        if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EEXIST) {
+                return Err(error.into());
+            }
+        } else {
+            created = true;
+        }
+        fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            return if is_unsafe_path_error(&error) {
+                Err(ControlStateError::UnsafeFile)
+            } else {
+                Err(error.into())
+            };
+        }
+    }
+    let directory = unsafe { std::fs::File::from_raw_fd(fd) };
+    if created {
+        if let Err(error) =
+            prepare_created_descriptor(&directory, expected_uid, expected_gid, 0o700)
+        {
+            let _ =
+                unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
+            return Err(error);
+        }
+        parent.sync_all()?;
+    } else {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let metadata = directory.metadata()?;
+        let effective_uid = crate::utils::effective_user_group_ids().0;
+        if effective_uid == 0
+            && expected_uid != 0
+            && metadata.uid() == 0
+            && metadata.permissions().mode() & 0o777 == 0o700
+        {
+            prepare_created_descriptor(&directory, expected_uid, expected_gid, 0o700)?;
+            parent.sync_all()?;
+        }
     }
     validate_directory_descriptor(&directory, expected_uid)?;
     Ok(Some(directory))
@@ -636,26 +753,32 @@ fn write_owned_atomic(
     uid: u32,
     gid: u32,
 ) -> Result<(), ControlStateError> {
-    write_owned_atomic_with_hook(directory, name, body, uid, gid, |_| {})
+    write_owned_atomic_with_hook(directory, name, body, uid, gid, |_, _| Ok(()))
+        .map_err(AtomicWriteError::into_control_state)
 }
 
 #[cfg(unix)]
 #[allow(unsafe_code)]
-fn write_owned_atomic_with_hook(
+pub(crate) fn write_owned_atomic_with_hook(
     directory: &ControlDirectory,
     name: &str,
     body: &[u8],
     uid: u32,
     gid: u32,
-    before_publish: impl FnOnce(&std::fs::File),
-) -> Result<(), ControlStateError> {
+    mut stage_hook: impl FnMut(
+        AtomicWriteStage,
+        Option<&std::fs::File>,
+    ) -> Result<(), ControlStateError>,
+) -> Result<(), AtomicWriteError> {
     use std::ffi::CString;
     use std::io::Write as _;
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-    let destination = CString::new(name).map_err(|_| ControlStateError::UnsafeFile)?;
+    let destination = CString::new(name)
+        .map_err(|_| AtomicWriteError::NotPublished(ControlStateError::UnsafeFile))?;
+    stage_hook(AtomicWriteStage::Create, None).map_err(AtomicWriteError::NotPublished)?;
     let mut allocated = None;
     for _ in 0..128 {
         let candidate = format!(
@@ -663,8 +786,8 @@ fn write_owned_atomic_with_hook(
             std::process::id(),
             TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         );
-        let candidate_c =
-            CString::new(candidate.as_str()).map_err(|_| ControlStateError::UnsafeFile)?;
+        let candidate_c = CString::new(candidate.as_str())
+            .map_err(|_| AtomicWriteError::NotPublished(ControlStateError::UnsafeFile))?;
         let fd = unsafe {
             libc::openat(
                 directory.as_raw_fd(),
@@ -679,23 +802,32 @@ fn write_owned_atomic_with_hook(
         }
         let error = std::io::Error::last_os_error();
         if error.kind() != std::io::ErrorKind::AlreadyExists {
-            return Err(error.into());
+            return Err(AtomicWriteError::NotPublished(error.into()));
         }
     }
     let (temporary_name, mut temporary) = allocated.ok_or_else(|| {
-        ControlStateError::Io(std::io::Error::new(
+        AtomicWriteError::NotPublished(ControlStateError::Io(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
             "could not allocate a private control-state temp file",
-        ))
+        )))
     })?;
-    let temporary_name_c =
-        CString::new(temporary_name.as_str()).map_err(|_| ControlStateError::UnsafeFile)?;
-    let result = (|| {
+    let temporary_name_c = CString::new(temporary_name.as_str())
+        .map_err(|_| AtomicWriteError::NotPublished(ControlStateError::UnsafeFile))?;
+    let result: Result<(), AtomicWriteError> = (|| {
+        stage_hook(AtomicWriteStage::Write, Some(&temporary))
+            .map_err(AtomicWriteError::NotPublished)?;
         temporary.write_all(body)?;
+        stage_hook(AtomicWriteStage::FirstFileSync, Some(&temporary))
+            .map_err(AtomicWriteError::NotPublished)?;
         temporary.sync_all()?;
+        stage_hook(AtomicWriteStage::OwnerPreparation, Some(&temporary))
+            .map_err(AtomicWriteError::NotPublished)?;
         prepare_created_descriptor(&temporary, uid, gid, 0o600)?;
+        stage_hook(AtomicWriteStage::SecondFileSync, Some(&temporary))
+            .map_err(AtomicWriteError::NotPublished)?;
         temporary.sync_all()?;
-        before_publish(&temporary);
+        stage_hook(AtomicWriteStage::Publish, Some(&temporary))
+            .map_err(AtomicWriteError::NotPublished)?;
         if unsafe {
             libc::renameat(
                 directory.as_raw_fd(),
@@ -705,9 +837,16 @@ fn write_owned_atomic_with_hook(
             )
         } != 0
         {
-            return Err(std::io::Error::last_os_error().into());
+            return Err(AtomicWriteError::NotPublished(
+                std::io::Error::last_os_error().into(),
+            ));
         }
-        directory.sync_all()?;
+        stage_hook(AtomicWriteStage::DirectorySync, Some(&temporary))
+            .map_err(AtomicWriteError::PublishedButDirectoryUnsynced)?;
+        directory
+            .sync_all()
+            .map_err(ControlStateError::from)
+            .map_err(AtomicWriteError::PublishedButDirectoryUnsynced)?;
         Ok(())
     })();
     if result.is_err() {
@@ -717,7 +856,7 @@ fn write_owned_atomic_with_hook(
 }
 
 #[cfg(not(unix))]
-fn open_control_directory(
+pub(crate) fn open_control_directory(
     path: &Path,
     create: bool,
     _expected_uid: u32,
@@ -733,6 +872,17 @@ fn open_control_directory(
         .then(|| path.to_path_buf())
         .map(Some)
         .ok_or(ControlStateError::UnsafeFile)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn open_owned_directory_at(
+    parent: &ControlDirectory,
+    name: &str,
+    create: bool,
+    expected_uid: u32,
+    expected_gid: u32,
+) -> Result<Option<ControlDirectory>, ControlStateError> {
+    open_control_directory(&parent.join(name), create, expected_uid, expected_gid)
 }
 
 #[cfg(not(unix))]
@@ -1038,7 +1188,11 @@ mod tests {
             br#"{"schema_version":1}"#,
             uid,
             gid,
-            |temporary| {
+            |stage, temporary| {
+                if stage != AtomicWriteStage::Publish {
+                    return Ok(());
+                }
+                let temporary = temporary.expect("temporary exists before publication");
                 assert!(read_owned_entry(&pinned, STATE_FILE, uid)
                     .unwrap()
                     .is_none());
@@ -1046,6 +1200,7 @@ mod tests {
                 assert_eq!(metadata.uid(), uid);
                 assert_eq!(metadata.gid(), gid);
                 assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+                Ok(())
             },
         )
         .unwrap();
@@ -1054,6 +1209,20 @@ mod tests {
             read_owned_entry(&pinned, STATE_FILE, uid).unwrap(),
             Some(br#"{"schema_version":1}"#.to_vec())
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_owned_directory_preparation_removes_new_empty_directory() {
+        let parent_path = tempdir().unwrap();
+        let (uid, gid) = crate::utils::effective_user_group_ids();
+        let parent = open_control_directory(parent_path.path(), false, uid, gid)
+            .unwrap()
+            .expect("temporary directory is pinned");
+        let impossible_gid = gid.wrapping_add(1);
+
+        assert!(open_owned_directory_at(&parent, "auth", true, uid, impossible_gid).is_err());
+        assert!(!parent_path.path().join("auth").exists());
     }
 
     #[cfg(unix)]

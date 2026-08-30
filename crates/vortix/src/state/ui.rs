@@ -3,7 +3,10 @@
 use super::Protocol;
 use crate::vortix_core::cidr::Cidr;
 use crate::vortix_core::profile::ProfileId;
+use std::fmt;
+use std::ops::Deref;
 use std::time::{Duration, Instant};
+use zeroize::Zeroizing;
 
 /// Duration for toast notifications to remain visible.
 pub const DISMISS_DURATION: Duration = Duration::from_secs(4);
@@ -89,10 +92,52 @@ pub enum AuthField {
     /// Password text input (masked).
     Password,
     /// OTP / 2FA code text input (always masked). Only rendered when the
-    /// profile declares an `OpenVPN` `static-challenge` directive — plan
+    /// profile declares an `OpenVPN` `static-challenge` directive.
     Otp,
     /// "Save credentials" checkbox.
     SaveCheckbox,
+}
+
+/// Editable credential text whose allocation is cleared on drop and never
+/// exposed through debug output.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct SecretText(Zeroizing<String>);
+
+impl SecretText {
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        self.0.as_str()
+    }
+
+    pub fn expose_mut(&mut self) -> &mut String {
+        &mut self.0
+    }
+}
+
+impl From<String> for SecretText {
+    fn from(value: String) -> Self {
+        Self(Zeroizing::new(value))
+    }
+}
+
+impl From<&str> for SecretText {
+    fn from(value: &str) -> Self {
+        value.to_owned().into()
+    }
+}
+
+impl Deref for SecretText {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.expose()
+    }
+}
+
+impl fmt::Debug for SecretText {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
 }
 
 /// Current input mode determining keyboard behavior.
@@ -203,23 +248,22 @@ pub enum InputMode {
     },
     /// `OpenVPN` authentication credentials dialog.
     AuthPrompt {
-        /// Index of the profile requiring auth.
-        profile_idx: usize,
+        /// Stable identity of the profile requiring auth.
+        profile_id: ProfileId,
         /// Name of the profile (for display).
         profile_name: String,
         /// Username input.
-        username: String,
+        username: SecretText,
         /// Cursor position in the username field.
         username_cursor: usize,
         /// Password input.
-        password: String,
+        password: SecretText,
         /// Cursor position in the password field.
         password_cursor: usize,
-        /// OTP / 2FA code input (always initialized to an empty string at
-        /// overlay-open so the field cannot inherit prior state — plan
-        /// ). Only used when
+        /// OTP / 2FA code input (always initialized empty when the overlay
+        /// opens so the field cannot inherit prior state). Only used when
         /// `static_challenge_prompt.is_some()`.
-        otp: String,
+        otp: SecretText,
         /// Cursor position in the OTP field.
         otp_cursor: usize,
         /// Which field is currently focused.
@@ -399,6 +443,14 @@ mod tests {
     #[test]
     fn help_scroll_is_zero_when_terminal_height_unknown() {
         assert_eq!(help_max_scroll_for_terminal_height(0, 44), 0);
+    }
+
+    #[test]
+    fn secret_text_debug_never_exposes_credential_material() {
+        let secret = SecretText::from("credential-marker");
+        assert_eq!(secret.expose(), "credential-marker");
+        assert_eq!(format!("{secret:?}"), "[REDACTED]");
+        assert!(!format!("{:?}", secret.clone()).contains("credential-marker"));
     }
 
     // FlipState behavior is tested in the `ratatui-flip-panel` crate.

@@ -25,7 +25,7 @@ pub fn set_config_dir(dir: PathBuf) {
 
 /// Returns the config directory set at startup, or falls back to default resolution.
 ///
-/// All utility functions (`get_profiles_dir`, `get_openvpn_auth_path`, etc.)
+/// All utility functions (profile, runtime, and transient artifact paths)
 /// go through this, so the `--config-dir` flag is respected everywhere.
 ///
 /// Resolution order: `set_config_dir()` > `VORTIX_CONFIG_DIR` env var > default.
