@@ -101,6 +101,11 @@ pub enum InputMode {
     /// Normal navigation mode.
     #[default]
     Normal,
+    /// Guided Background setup/status/recovery/disable overlay.
+    BackgroundSetup {
+        /// Keyboard focus, scrolling, and confirmation boundary.
+        state: crate::background::BackgroundOverlayState,
+    },
     /// File path import dialog is active.
     Import {
         /// Current input path string.

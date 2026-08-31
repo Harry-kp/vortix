@@ -80,12 +80,25 @@ pub struct StaticChallenge {
     pub echo: bool,
 }
 
+/// Credential behavior relevant to unattended boot connection.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum BootCredentialRequirement {
+    #[default]
+    NonInteractive,
+    Interactive,
+    UnsupportedKeyProvider,
+}
+
 /// Parsed `OpenVPN` profile body.
 #[derive(Debug, Default, Clone)]
 pub struct OvpnParsedProfile {
     /// Whether the profile expects interactive auth (`auth-user-pass` directive
     /// without a file path).
     pub interactive_auth: bool,
+    /// Conservative boot-time credential requirement. Unlike
+    /// `interactive_auth`, this treats file-backed username/password auth as
+    /// password-dependent and therefore ineligible for pre-login startup.
+    pub boot_credentials: BootCredentialRequirement,
     /// `static-challenge` directive when present. Drives the conditional OTP
     /// field in the auth overlay and the masked prompt in the CLI.
     pub static_challenge: Option<StaticChallenge>,
@@ -137,20 +150,28 @@ pub fn parse_ovpn_conf(text: &str) -> Result<OvpnParsedProfile, ParseError> {
             continue;
         }
 
-        // `auth-user-pass` alone (no file path) triggers interactive auth.
-        if line == "auth-user-pass" {
-            profile.interactive_auth = true;
-            continue;
-        }
-
         reject_privileged_directive(line)?;
 
-        let mut tokens = line.split_whitespace();
-        let Some(directive) = tokens.next() else {
+        let Some(tokens) = effective_option_tokens(line, 128) else {
             continue;
         };
+        let Some((directive, arguments)) = tokens.split_first() else {
+            continue;
+        };
+        let directive = directive.trim_start_matches('-').to_ascii_lowercase();
+        let mut tokens = arguments.iter().map(String::as_str);
 
-        match directive {
+        match directive.as_str() {
+            "auth-user-pass" => {
+                profile.interactive_auth = tokens.next().is_none();
+                profile.boot_credentials = BootCredentialRequirement::Interactive;
+            }
+            "askpass" | "management-query-passwords" => {
+                profile.boot_credentials = BootCredentialRequirement::Interactive;
+            }
+            "pkcs11-id" | "pkcs11-id-management" | "cryptoapicert" | "pkcs12" => {
+                profile.boot_credentials = BootCredentialRequirement::UnsupportedKeyProvider;
+            }
             "remote" => {
                 if let Some(spec) = parse_remote(&mut tokens) {
                     profile.remotes.push(spec);
@@ -190,14 +211,33 @@ pub fn parse_ovpn_conf(text: &str) -> Result<OvpnParsedProfile, ParseError> {
                 _ => {}
             },
             "static-challenge" => {
-                if let Some(sc) = parse_static_challenge(line) {
+                profile.boot_credentials = BootCredentialRequirement::Interactive;
+                if let Some(sc) = parse_static_challenge_tokens(&mut tokens) {
                     profile.static_challenge = Some(sc);
                 } else {
                     warn!(line = %line, "ovpn: malformed static-challenge directive — skipping");
                 }
             }
+            "key" => {
+                if !tokens
+                    .next()
+                    .is_some_and(|path| path.eq_ignore_ascii_case("[inline]"))
+                {
+                    // File-backed or malformed key material may require a
+                    // prompt. Boot fails closed until the enrolled service
+                    // can attest and inspect that file.
+                    profile.boot_credentials = BootCredentialRequirement::UnsupportedKeyProvider;
+                }
+            }
             _ => {}
         }
+    }
+
+    if profile.boot_credentials != BootCredentialRequirement::UnsupportedKeyProvider
+        && (text.contains("-----BEGIN ENCRYPTED PRIVATE KEY-----")
+            || text.contains("Proc-Type: 4,ENCRYPTED"))
+    {
+        profile.boot_credentials = BootCredentialRequirement::Interactive;
     }
 
     Ok(profile)
@@ -238,28 +278,31 @@ fn is_forbidden_privileged_directive(directive: &str) -> bool {
 /// token therefore leaves privileged aliases such as `"up"` and
 /// `setenv opt plugin` unchecked.
 pub(super) fn forbidden_effective_directive(line: &str) -> Option<String> {
-    let tokens = openvpn_option_tokens(line, 3)?;
-    let effective = match tokens.as_slice() {
-        [setenv, opt, directive]
-            if setenv
-                .trim_start_matches('-')
-                .eq_ignore_ascii_case("setenv")
-                && opt.eq_ignore_ascii_case("opt") =>
-        {
-            directive
-        }
-        [directive, ..] => directive,
-        [] => return None,
-    };
-    let directive = effective.trim_start_matches('-');
+    let tokens = effective_option_tokens(line, 3)?;
+    let directive = tokens.first()?.trim_start_matches('-');
     is_forbidden_privileged_directive(directive).then(|| directive.to_ascii_lowercase())
+}
+
+/// Return the option tokens `OpenVPN` dispatches after dequoting aliases.
+fn effective_option_tokens(line: &str, limit: usize) -> Option<Vec<String>> {
+    let mut tokens = openvpn_option_tokens(line, limit.saturating_add(2))?;
+    if tokens.len() >= 2
+        && tokens[0]
+            .trim_start_matches('-')
+            .eq_ignore_ascii_case("setenv")
+        && tokens[1].eq_ignore_ascii_case("opt")
+    {
+        tokens.drain(..2);
+    }
+    tokens.truncate(limit);
+    Some(tokens)
 }
 
 /// Tokenize the security-relevant prefix using `OpenVPN`'s config-file quoting
 /// rules. `None` means `OpenVPN` would reject the malformed line itself.
 fn openvpn_option_tokens(line: &str, limit: usize) -> Option<Vec<String>> {
     let mut chars = line.chars().peekable();
-    let mut tokens = Vec::with_capacity(limit);
+    let mut tokens = Vec::with_capacity(limit.min(8));
 
     while tokens.len() < limit {
         while chars.next_if(|ch| ch.is_whitespace()).is_some() {}
@@ -306,58 +349,15 @@ fn reject_privileged_directive(line: &str) -> Result<(), ParseError> {
     Ok(())
 }
 
-/// Parse `static-challenge "<prompt>" <echo>` from a trimmed config line.
-///
-/// The prompt may be double-quoted (with backslash-escaped `\"` and `\\`) and
-/// commonly contains spaces, so `split_whitespace` cannot tokenize it. We
-/// re-parse the line after the `static-challenge` prefix:
-///
-/// 1. Strip the directive name and surrounding whitespace.
-/// 2. If the remainder begins with `"`, extract the quoted span (honouring
-///    escapes) as the prompt; otherwise take the next whitespace-delimited
-///    token.
-/// 3. Parse the next token as the echo bit (`1` → true, `0`/anything else →
-///    false).
-///
-/// Returns `None` when the prompt is empty or absent. An unparseable echo bit
-/// is degraded to `false` rather than rejected — most servers send `1`, but a
-/// missing or malformed echo should not prevent the prompt from rendering.
-fn parse_static_challenge(line: &str) -> Option<StaticChallenge> {
-    let rest = line.strip_prefix("static-challenge")?.trim_start();
-    let (prompt, after_prompt) = if let Some(after_quote) = rest.strip_prefix('"') {
-        // Quoted: scan until the matching `"`, handling `\\` and `\"` escapes.
-        let mut prompt = String::new();
-        let mut chars = after_quote.char_indices();
-        let mut closed_at: Option<usize> = None;
-        while let Some((idx, ch)) = chars.next() {
-            match ch {
-                '\\' => {
-                    if let Some((_, escaped)) = chars.next() {
-                        prompt.push(escaped);
-                    }
-                }
-                '"' => {
-                    closed_at = Some(idx);
-                    break;
-                }
-                _ => prompt.push(ch),
-            }
-        }
-        let closed = closed_at?;
-        let remainder = &after_quote[closed + 1..];
-        (prompt, remainder)
-    } else {
-        // Unquoted: take next whitespace-delimited token.
-        let mut tokens = rest.split_whitespace();
-        let prompt = tokens.next()?.to_string();
-        let remainder_start = rest.find(&prompt).map(|i| i + prompt.len())?;
-        (prompt, &rest[remainder_start..])
-    };
+fn parse_static_challenge_tokens<'a, I>(tokens: &mut I) -> Option<StaticChallenge>
+where
+    I: Iterator<Item = &'a str>,
+{
+    let prompt = tokens.next()?.to_string();
     if prompt.is_empty() {
         return None;
     }
-    let echo_token = after_prompt.split_whitespace().next();
-    let echo = matches!(echo_token, Some("1"));
+    let echo = matches!(tokens.next(), Some("1"));
     Some(StaticChallenge { prompt, echo })
 }
 
@@ -488,6 +488,68 @@ mod tests {
         let text = "client\nauth-user-pass /etc/openvpn/creds.txt\n";
         let p = parse_ovpn_conf(text).unwrap();
         assert!(!p.interactive_auth);
+        assert_eq!(p.boot_credentials, BootCredentialRequirement::Interactive);
+    }
+
+    #[test]
+    fn boot_credentials_reject_prompts_and_unsupported_key_providers() {
+        for text in [
+            "client\naskpass\n",
+            "client\nmanagement-query-passwords\n",
+            "client\n<key>\n-----BEGIN ENCRYPTED PRIVATE KEY-----\n</key>\n",
+            "client\n<key>\nProc-Type: 4,ENCRYPTED\n</key>\n",
+        ] {
+            assert_eq!(
+                parse_ovpn_conf(text).unwrap().boot_credentials,
+                BootCredentialRequirement::Interactive,
+                "{text}"
+            );
+        }
+        assert_eq!(
+            parse_ovpn_conf("client\npkcs11-id token\n")
+                .unwrap()
+                .boot_credentials,
+            BootCredentialRequirement::UnsupportedKeyProvider
+        );
+    }
+
+    #[test]
+    fn boot_credentials_reject_effective_alias_forms() {
+        for text in [
+            "client\n\"auth-user-pass\" credentials.txt\n",
+            "client\n--AsKpAsS secret.txt\n",
+            "client\nsetenv opt management-query-passwords\n",
+            "client\nsetenv opt static-challenge \"OTP code\" 1\n",
+            "client\nsetenv opt cryptoapicert THUMB:abc\n",
+        ] {
+            assert_ne!(
+                parse_ovpn_conf(text).unwrap().boot_credentials,
+                BootCredentialRequirement::NonInteractive,
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn boot_credentials_fail_closed_for_external_key_material() {
+        for text in [
+            "client\nkey client.key\n",
+            "client\nkey\n",
+            "client\npkcs12 client.p12\n",
+            "client\nsetenv opt key encrypted.key\n",
+        ] {
+            assert_eq!(
+                parse_ovpn_conf(text).unwrap().boot_credentials,
+                BootCredentialRequirement::UnsupportedKeyProvider,
+                "{text}"
+            );
+        }
+        assert_eq!(
+            parse_ovpn_conf("client\nkey [inline]\n<key>\n-----BEGIN PRIVATE KEY-----\n</key>\n")
+                .unwrap()
+                .boot_credentials,
+            BootCredentialRequirement::NonInteractive
+        );
     }
 
     #[test]

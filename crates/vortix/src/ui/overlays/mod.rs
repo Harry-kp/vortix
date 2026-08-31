@@ -2,6 +2,7 @@
 
 pub mod action_menu;
 pub mod auth;
+pub mod background_setup;
 pub mod config_viewer;
 pub mod confirm_dialog;
 pub mod dependency_alert;

@@ -74,6 +74,28 @@ EXIT CODES:
 /// Available CLI commands.
 #[derive(Subcommand, Debug)]
 pub enum Commands {
+    /// Explain and prepare optional Background mode
+    ///
+    /// Background mode adds live CLI/TUI synchronization, automatic drop
+    /// recovery, boot connections, and continuous policy verification by
+    /// running persistent Vortix processes. Standard mode remains available
+    /// when setup is declined.
+    Setup {
+        /// Profiles requested for boot connection (repeatable)
+        #[arg(long, value_name = "PROFILE")]
+        boot: Vec<String>,
+
+        /// Confirm setup after reviewing its persistent-process cost
+        #[arg(short, long)]
+        yes: bool,
+    },
+
+    /// Inspect or manage optional Background mode
+    Background {
+        #[command(subcommand)]
+        command: BackgroundCommands,
+    },
+
     /// Connect to a VPN profile
     ///
     /// Connects to the specified profile, or reconnects to the last used
@@ -411,6 +433,31 @@ pub enum Commands {
     },
 }
 
+/// Background-mode status, recovery, diagnostics, and disable actions.
+#[derive(Subcommand, Debug)]
+pub enum BackgroundCommands {
+    /// Show the shared Background/Standard mode and health record
+    Status,
+    /// Safely recover an incomplete setup or disable operation
+    Recover {
+        /// Confirm the previewed cleanup boundary
+        #[arg(short, long)]
+        yes: bool,
+    },
+    /// Show bounded redacted diagnostics without service-manager logs
+    Diagnostics {
+        /// Follow authenticated live diagnostics when available
+        #[arg(short, long)]
+        follow: bool,
+    },
+    /// Return to Standard mode after an explicit preview
+    Disable {
+        /// Confirm the previewed disable boundary
+        #[arg(short, long)]
+        yes: bool,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     //! CLI grammar additions for the
@@ -564,5 +611,41 @@ mod tests {
             panic!("expected Up");
         };
         assert_eq!(timeout, Some(60));
+    }
+
+    #[test]
+    fn background_setup_and_recovery_grammar_is_explicit() {
+        let args = parse(&["vortix", "setup", "--boot", "corp", "--yes"]);
+        assert!(matches!(
+            args.command,
+            Some(Commands::Setup { boot, yes }) if boot == vec!["corp"] && yes
+        ));
+
+        let args = parse(&["vortix", "background", "recover", "--yes"]);
+        assert!(matches!(
+            args.command,
+            Some(Commands::Background {
+                command: super::BackgroundCommands::Recover { yes: true }
+            })
+        ));
+    }
+
+    #[test]
+    fn background_diagnostics_follow_and_disable_parse() {
+        let args = parse(&["vortix", "background", "diagnostics", "--follow"]);
+        assert!(matches!(
+            args.command,
+            Some(Commands::Background {
+                command: super::BackgroundCommands::Diagnostics { follow: true }
+            })
+        ));
+
+        let args = parse(&["vortix", "background", "disable"]);
+        assert!(matches!(
+            args.command,
+            Some(Commands::Background {
+                command: super::BackgroundCommands::Disable { yes: false }
+            })
+        ));
     }
 }
