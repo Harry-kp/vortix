@@ -16,10 +16,11 @@ use std::time::{Duration, Instant};
 
 use socket2::{Domain, SockAddr, Socket, Type};
 
+use crate::vortix_core::control::{DiagnosticSnapshot, DiagnosticSource, DiagnosticView};
 use crate::vortix_core::ipc::{
-    decode_frame, encode_frame, ClientHello, FrameError, IpcCapability, IpcError, IpcOp,
-    IpcRequest, IpcResponse, IpcResult, PassiveSnapshot, ServerHello, IPC_PROTOCOL_MAX,
-    IPC_PROTOCOL_MIN, IPC_SCHEMA_MAX, IPC_SCHEMA_MIN,
+    capabilities_for_schema, decode_frame, encode_frame, ClientHello, FrameError, IpcCapability,
+    IpcError, IpcOp, IpcRequest, IpcResponse, IpcResult, PassiveSnapshot, ServerHello,
+    IPC_PROTOCOL_MAX, IPC_PROTOCOL_MIN, IPC_SCHEMA_MAX, IPC_SCHEMA_MIN,
 };
 
 const IPC_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -85,28 +86,9 @@ impl From<FrameError> for ClientError {
 /// handlers treat any error here as "bypass: read directly from
 /// disk + scanner instead".
 pub fn request(socket_path: &Path, op: IpcOp) -> Result<IpcResult, ClientError> {
-    let handshake_deadline = Instant::now() + IPC_EXCHANGE_TIMEOUT;
-    validate_socket_owner(socket_path)?;
-    let mut stream = connect_with_deadline(socket_path, handshake_deadline)?;
-    let mut buffered = Vec::with_capacity(4096);
-
     let required = op.required_capability();
-    let handshake = IpcRequest {
-        id: 1,
-        op: IpcOp::Handshake {
-            hello: ClientHello::current(vec![required]),
-        },
-    };
-    let handshake = exchange_until(&mut stream, &mut buffered, &handshake, handshake_deadline)?;
-    match handshake.result.map_err(ClientError::Daemon)? {
-        IpcResult::Handshake { hello } => validate_handshake(&hello, required)?,
-        other => {
-            return Err(ClientError::Unexpected(format!(
-                "invalid handshake response: {other:?}"
-            )));
-        }
-    }
-
+    let (mut stream, mut buffered) =
+        connect_handshaken(socket_path, required, Instant::now() + IPC_EXCHANGE_TIMEOUT)?;
     let request = IpcRequest { id: 2, op };
     let result = exchange_until(
         &mut stream,
@@ -116,8 +98,36 @@ pub fn request(socket_path: &Path, op: IpcOp) -> Result<IpcResult, ClientError> 
     )?
     .result
     .map_err(ClientError::Daemon)?;
-    validate_passive_result(&result)?;
+    validate_result(&result)?;
     Ok(result)
+}
+
+fn connect_handshaken(
+    socket_path: &Path,
+    required: IpcCapability,
+    deadline: Instant,
+) -> Result<(UnixStream, Vec<u8>), ClientError> {
+    validate_socket_owner(socket_path)?;
+    let mut stream = connect_with_deadline(socket_path, deadline)?;
+    let mut buffered = Vec::with_capacity(4096);
+    let handshake = IpcRequest {
+        id: 1,
+        op: IpcOp::Handshake {
+            hello: ClientHello::current(vec![required]),
+        },
+    };
+    match exchange_until(&mut stream, &mut buffered, &handshake, deadline)?
+        .result
+        .map_err(ClientError::Daemon)?
+    {
+        IpcResult::Handshake { hello } => validate_handshake(&hello, required)?,
+        other => {
+            return Err(ClientError::Unexpected(format!(
+                "invalid handshake response: {other:?}"
+            )));
+        }
+    }
+    Ok((stream, buffered))
 }
 
 fn exchange_until(
@@ -179,6 +189,35 @@ pub struct PassiveSubscription {
     initial: crate::vortix_core::ipc::PassiveSnapshot,
 }
 
+pub struct DiagnosticSubscription {
+    stream: UnixStream,
+    buffered: Vec<u8>,
+    initial: DiagnosticView,
+}
+
+impl DiagnosticSubscription {
+    #[must_use]
+    pub const fn initial(&self) -> &DiagnosticView {
+        &self.initial
+    }
+
+    pub fn recv(&mut self) -> Result<DiagnosticView, ClientError> {
+        match read_response(&mut self.stream, &mut self.buffered)?.result {
+            Ok(IpcResult::DiagnosticEvent { snapshot }) => {
+                validate_diagnostic_snapshot(&snapshot)?;
+                Ok(authenticated_diagnostic_view(snapshot))
+            }
+            Ok(IpcResult::ResyncRequired { newest_generation }) => {
+                Err(ClientError::ResyncRequired { newest_generation })
+            }
+            Ok(other) => Err(ClientError::Unexpected(format!(
+                "unexpected diagnostic subscription result: {other:?}"
+            ))),
+            Err(error) => Err(ClientError::Daemon(error)),
+        }
+    }
+}
+
 impl PassiveSubscription {
     #[must_use]
     pub fn initial(&self) -> &crate::vortix_core::ipc::PassiveSnapshot {
@@ -205,41 +244,12 @@ impl PassiveSubscription {
 
 /// Open a passive snapshot stream with a race-free initial boundary.
 pub fn subscribe(socket_path: &Path) -> Result<PassiveSubscription, ClientError> {
-    let handshake_deadline = Instant::now() + IPC_EXCHANGE_TIMEOUT;
-    validate_socket_owner(socket_path)?;
-    let mut stream = connect_with_deadline(socket_path, handshake_deadline)?;
-    let mut buffered = Vec::with_capacity(4096);
-    let required = IpcCapability::PassiveSubscribe;
-    let handshake = IpcRequest {
-        id: 1,
-        op: IpcOp::Handshake {
-            hello: ClientHello::current(vec![required]),
-        },
-    };
-    match exchange_until(&mut stream, &mut buffered, &handshake, handshake_deadline)?
-        .result
-        .map_err(ClientError::Daemon)?
-    {
-        IpcResult::Handshake { hello } => validate_handshake(&hello, required)?,
-        other => {
-            return Err(ClientError::Unexpected(format!(
-                "invalid handshake response: {other:?}"
-            )));
-        }
-    }
-    let request = IpcRequest {
-        id: 2,
-        op: IpcOp::PassiveSubscribe,
-    };
-    let initial = match exchange_until(
-        &mut stream,
-        &mut buffered,
-        &request,
-        Instant::now() + IPC_EXCHANGE_TIMEOUT,
-    )?
-    .result
-    .map_err(ClientError::Daemon)?
-    {
+    let (stream, buffered, result) = open_subscription(
+        socket_path,
+        IpcCapability::PassiveSubscribe,
+        IpcOp::PassiveSubscribe,
+    )?;
+    let initial = match result {
         IpcResult::PassiveSubscribed { snapshot } => {
             validate_passive_snapshot(&snapshot)?;
             snapshot
@@ -250,15 +260,58 @@ pub fn subscribe(socket_path: &Path) -> Result<PassiveSubscription, ClientError>
             )));
         }
     };
-    // Snapshot streams are intentionally quiet when scanner truth is stable.
-    // Once the bounded handshake finishes, a fixed idle timeout would turn a
-    // healthy connection into a false failure.
-    stream.set_read_timeout(None)?;
     Ok(PassiveSubscription {
         stream,
         buffered,
         initial,
     })
+}
+
+pub fn subscribe_diagnostics(socket_path: &Path) -> Result<DiagnosticSubscription, ClientError> {
+    let (stream, buffered, result) = open_subscription(
+        socket_path,
+        IpcCapability::DiagnosticsSubscribe,
+        IpcOp::DiagnosticsSubscribe,
+    )?;
+    let initial = match result {
+        IpcResult::DiagnosticSubscribed { snapshot } => {
+            validate_diagnostic_snapshot(&snapshot)?;
+            authenticated_diagnostic_view(snapshot)
+        }
+        other => {
+            return Err(ClientError::Unexpected(format!(
+                "invalid diagnostic subscribe response: {other:?}"
+            )));
+        }
+    };
+    Ok(DiagnosticSubscription {
+        stream,
+        buffered,
+        initial,
+    })
+}
+
+fn open_subscription(
+    socket_path: &Path,
+    capability: IpcCapability,
+    op: IpcOp,
+) -> Result<(UnixStream, Vec<u8>, IpcResult), ClientError> {
+    let (mut stream, mut buffered) = connect_handshaken(
+        socket_path,
+        capability,
+        Instant::now() + IPC_EXCHANGE_TIMEOUT,
+    )?;
+    let result = exchange_until(
+        &mut stream,
+        &mut buffered,
+        &IpcRequest { id: 2, op },
+        Instant::now() + IPC_EXCHANGE_TIMEOUT,
+    )?
+    .result
+    .map_err(ClientError::Daemon)?;
+    // Snapshot streams are intentionally quiet when source truth is stable.
+    stream.set_read_timeout(None)?;
+    Ok((stream, buffered, result))
 }
 
 fn connect_with_deadline(path: &Path, deadline: Instant) -> std::io::Result<UnixStream> {
@@ -286,7 +339,9 @@ fn validate_handshake(hello: &ServerHello, required: IpcCapability) -> Result<()
         || !hello.passive
         || !(IPC_PROTOCOL_MIN..=IPC_PROTOCOL_MAX).contains(&hello.protocol)
         || !(IPC_SCHEMA_MIN..=IPC_SCHEMA_MAX).contains(&hello.schema)
+        || hello.capabilities.as_slice() != capabilities_for_schema(hello.schema)
         || !hello.capabilities.contains(&required)
+        || !required.is_available_in_schema(hello.schema)
         || hello.capabilities.contains(&IpcCapability::ControlMutation)
     {
         return Err(ClientError::Unexpected(format!(
@@ -296,12 +351,33 @@ fn validate_handshake(hello: &ServerHello, required: IpcCapability) -> Result<()
     Ok(())
 }
 
-fn validate_passive_result(result: &IpcResult) -> Result<(), ClientError> {
+fn validate_result(result: &IpcResult) -> Result<(), ClientError> {
     match result {
         IpcResult::PassiveSnapshot { snapshot }
         | IpcResult::PassiveSubscribed { snapshot }
         | IpcResult::PassiveEvent { snapshot } => validate_passive_snapshot(snapshot),
+        IpcResult::DiagnosticSnapshot { snapshot }
+        | IpcResult::DiagnosticSubscribed { snapshot }
+        | IpcResult::DiagnosticEvent { snapshot } => validate_diagnostic_snapshot(snapshot),
         _ => Ok(()),
+    }
+}
+
+fn validate_diagnostic_snapshot(snapshot: &DiagnosticSnapshot) -> Result<(), ClientError> {
+    if !snapshot.is_compatible() {
+        return Err(ClientError::Unexpected(
+            "daemon returned an incompatible diagnostic snapshot".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn authenticated_diagnostic_view(snapshot: DiagnosticSnapshot) -> DiagnosticView {
+    DiagnosticView {
+        source: DiagnosticSource::AuthenticatedLive,
+        stale: false,
+        age_millis: 0,
+        snapshot,
     }
 }
 
@@ -349,6 +425,33 @@ pub fn snapshot(
     match request(socket_path, IpcOp::Snapshot)? {
         IpcResult::Snapshot { state } => Ok(state),
         other => Err(ClientError::Unexpected(format!("{other:?}"))),
+    }
+}
+
+pub fn diagnostics(socket_path: &Path) -> Result<DiagnosticView, ClientError> {
+    match request(socket_path, IpcOp::Diagnostics)? {
+        IpcResult::DiagnosticSnapshot { snapshot } => Ok(authenticated_diagnostic_view(snapshot)),
+        other => Err(ClientError::Unexpected(format!("{other:?}"))),
+    }
+}
+
+/// Read authenticated live diagnostics, or the latest owner-private advisory
+/// snapshot when the daemon cannot be reached or negotiated.
+pub fn diagnostics_or_fallback(
+    socket_path: &Path,
+    fallback_path: &Path,
+    now_unix_millis: u64,
+) -> Result<DiagnosticView, ClientError> {
+    match diagnostics(socket_path) {
+        Ok(view) => Ok(view),
+        Err(live_error) => {
+            match super::diagnostics::FallbackStore::new(fallback_path.to_path_buf())
+                .read(now_unix_millis)
+            {
+                Ok(view) => Ok(view),
+                Err(_) => Err(live_error),
+            }
+        }
     }
 }
 

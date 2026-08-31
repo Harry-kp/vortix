@@ -28,8 +28,9 @@ pub const IPC_PROTOCOL_MIN: u16 = 2;
 pub const IPC_PROTOCOL_MAX: u16 = 2;
 /// Inclusive snapshot schema range supported by this build.
 pub const IPC_SCHEMA_MIN: u16 = 1;
-pub const IPC_SCHEMA_MAX: u16 = 1;
+pub const IPC_SCHEMA_MAX: u16 = 2;
 
+use crate::vortix_core::control::DiagnosticSnapshot;
 use crate::vortix_core::engine::input::UserCommand;
 use crate::vortix_core::engine::registry::{Conflict, TunnelSnapshot};
 use crate::vortix_core::engine::state::Connection;
@@ -55,13 +56,18 @@ pub enum IpcOp {
     Subscribe,
     /// Subscribe to complete scanner-only replacement snapshots.
     PassiveSubscribe,
+    /// Read the current bounded, redacted diagnostic snapshot.
+    Diagnostics,
+    /// Subscribe to full diagnostic replacement snapshots.
+    DiagnosticsSubscribe,
     /// Graceful daemon shutdown. Authorized client only (UID-matching
     /// per `SO_PEERCRED`; see peer-credential auth).
     Shutdown,
 }
 
 impl IpcOp {
-    /// Capability negotiated before this operation may be dispatched.
+    /// Capability that must have been declared and negotiated before this
+    /// operation may be dispatched.
     #[must_use]
     pub const fn required_capability(&self) -> IpcCapability {
         match self {
@@ -69,6 +75,8 @@ impl IpcOp {
             Self::Execute(_) => IpcCapability::ControlMutation,
             Self::Snapshot => IpcCapability::LegacySnapshot,
             Self::Subscribe | Self::PassiveSubscribe => IpcCapability::PassiveSubscribe,
+            Self::Diagnostics => IpcCapability::Diagnostics,
+            Self::DiagnosticsSubscribe => IpcCapability::DiagnosticsSubscribe,
             Self::Shutdown => IpcCapability::Shutdown,
         }
     }
@@ -120,6 +128,8 @@ pub enum IpcCapability {
     LegacySnapshot,
     PassiveSnapshot,
     PassiveSubscribe,
+    Diagnostics,
+    DiagnosticsSubscribe,
     Shutdown,
     /// Reserved for the future enrolled control authority. Never advertised
     /// by the passive candidate.
@@ -130,14 +140,14 @@ impl IpcCapability {
     /// Whether this capability has a wire representation in `schema`.
     #[must_use]
     pub const fn is_available_in_schema(self, schema: u16) -> bool {
-        schema == 1
-            && matches!(
-                self,
-                Self::LegacySnapshot
-                    | Self::PassiveSnapshot
-                    | Self::PassiveSubscribe
-                    | Self::Shutdown
-            )
+        match self {
+            Self::Diagnostics | Self::DiagnosticsSubscribe => schema >= 2,
+            Self::LegacySnapshot
+            | Self::PassiveSnapshot
+            | Self::PassiveSubscribe
+            | Self::Shutdown
+            | Self::ControlMutation => schema >= 1,
+        }
     }
 }
 
@@ -208,13 +218,17 @@ pub struct PassiveSnapshot {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum IpcResult {
     /// Successful mandatory connection handshake.
-    Handshake { hello: ServerHello },
+    Handshake {
+        hello: ServerHello,
+    },
     /// Reserved response for a future enrolled mutation authority.
     Accepted,
     /// `Snapshot` payload — legacy primary-only view. When the
     /// registry has no primary, `state` is `Connection::Disconnected`.
     /// Multi-tunnel-aware clients should prefer [`Self::RegistrySnapshot`].
-    Snapshot { state: Connection },
+    Snapshot {
+        state: Connection,
+    },
     /// Multi-tunnel snapshot. Carries the full set of
     /// active tunnels plus the derived primary and global killswitch
     /// state. New clients query this; transitional protocol-2 clients that
@@ -226,15 +240,32 @@ pub enum IpcResult {
         killswitch: KillSwitchState,
     },
     /// Scanner-only daemon candidate view.
-    PassiveSnapshot { snapshot: PassiveSnapshot },
+    PassiveSnapshot {
+        snapshot: PassiveSnapshot,
+    },
     /// Subscription acknowledgement includes the subscribe-before-snapshot
     /// boundary. Later events are strictly newer than this generation.
-    PassiveSubscribed { snapshot: PassiveSnapshot },
+    PassiveSubscribed {
+        snapshot: PassiveSnapshot,
+    },
     /// Full replacement view; bounded consumers never reconstruct state from
     /// an unbounded delta stream.
-    PassiveEvent { snapshot: PassiveSnapshot },
+    PassiveEvent {
+        snapshot: PassiveSnapshot,
+    },
+    DiagnosticSnapshot {
+        snapshot: DiagnosticSnapshot,
+    },
+    DiagnosticSubscribed {
+        snapshot: DiagnosticSnapshot,
+    },
+    DiagnosticEvent {
+        snapshot: DiagnosticSnapshot,
+    },
     /// The client lagged and must issue a fresh subscribe operation.
-    ResyncRequired { newest_generation: u64 },
+    ResyncRequired {
+        newest_generation: u64,
+    },
     /// Reserved legacy subscription acknowledgement.
     Subscribed,
     /// `Shutdown` acknowledged; daemon will terminate after draining.
@@ -282,12 +313,33 @@ pub enum IpcError {
 }
 
 /// Capabilities of the passive candidate. Mutation is absent by construction.
-pub const PASSIVE_CAPABILITIES: [IpcCapability; 4] = [
+pub const PASSIVE_CAPABILITIES: [IpcCapability; 6] = [
+    IpcCapability::LegacySnapshot,
+    IpcCapability::PassiveSnapshot,
+    IpcCapability::PassiveSubscribe,
+    IpcCapability::Diagnostics,
+    IpcCapability::DiagnosticsSubscribe,
+    IpcCapability::Shutdown,
+];
+
+const PASSIVE_CAPABILITIES_V1: [IpcCapability; 4] = [
     IpcCapability::LegacySnapshot,
     IpcCapability::PassiveSnapshot,
     IpcCapability::PassiveSubscribe,
     IpcCapability::Shutdown,
 ];
+
+/// Passive capabilities whose result shapes exist in the negotiated schema.
+#[must_use]
+pub const fn capabilities_for_schema(schema: u16) -> &'static [IpcCapability] {
+    if schema >= 2 {
+        &PASSIVE_CAPABILITIES
+    } else if schema == 1 {
+        &PASSIVE_CAPABILITIES_V1
+    } else {
+        &[]
+    }
+}
 
 /// Negotiate one client hello against this passive daemon build.
 pub fn negotiate_passive(hello: &ClientHello) -> Result<ServerHello, IpcError> {
@@ -325,9 +377,9 @@ pub fn negotiate_passive(hello: &ClientHello) -> Result<ServerHello, IpcError> {
                 hello.schema.min, hello.schema.max, IPC_SCHEMA_MIN, IPC_SCHEMA_MAX
             ),
         })?;
+    let capabilities = capabilities_for_schema(schema);
     for capability in &hello.required_capabilities {
-        if !PASSIVE_CAPABILITIES.contains(capability) || !capability.is_available_in_schema(schema)
-        {
+        if !capability.is_available_in_schema(schema) || !capabilities.contains(capability) {
             return Err(IpcError::CapabilityUnavailable {
                 capability: *capability,
             });
@@ -338,7 +390,7 @@ pub fn negotiate_passive(hello: &ClientHello) -> Result<ServerHello, IpcError> {
         product_version: env!("CARGO_PKG_VERSION").into(),
         protocol,
         schema,
-        capabilities: PASSIVE_CAPABILITIES.to_vec(),
+        capabilities: capabilities.to_vec(),
         passive: true,
     })
 }
@@ -382,6 +434,38 @@ mod handshake_tests {
         let selected = negotiate_passive(&ClientHello::current(Vec::new())).unwrap();
         assert_eq!(selected.capabilities, PASSIVE_CAPABILITIES);
         assert!(selected.passive);
+    }
+
+    #[test]
+    fn schema_one_peer_receives_only_pre_diagnostics_capabilities() {
+        let mut hello = ClientHello::current(vec![IpcCapability::PassiveSnapshot]);
+        hello.schema = CompatibilityRange { min: 1, max: 1 };
+        let selected = negotiate_passive(&hello).unwrap();
+        assert_eq!(selected.schema, 1);
+        assert_eq!(selected.capabilities, PASSIVE_CAPABILITIES_V1);
+
+        hello.required_capabilities = vec![IpcCapability::Diagnostics];
+        assert!(matches!(
+            negotiate_passive(&hello),
+            Err(IpcError::CapabilityUnavailable {
+                capability: IpcCapability::Diagnostics
+            })
+        ));
+    }
+
+    #[test]
+    fn operation_contract_centralizes_capability_and_schema_requirements() {
+        assert_eq!(
+            IpcOp::Diagnostics.required_capability(),
+            IpcCapability::Diagnostics
+        );
+        assert!(!IpcCapability::Diagnostics.is_available_in_schema(1));
+        assert!(IpcCapability::Diagnostics.is_available_in_schema(2));
+        assert_eq!(
+            capabilities_for_schema(1),
+            PASSIVE_CAPABILITIES_V1.as_slice()
+        );
+        assert_eq!(capabilities_for_schema(2), PASSIVE_CAPABILITIES.as_slice());
     }
 
     #[test]
