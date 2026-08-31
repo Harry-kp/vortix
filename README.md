@@ -202,7 +202,7 @@ Development starts with `cargo build`, `cargo test`, and the full [CI parity](ht
 
 ## Featured in
 
-[awesome-rust](https://github.com/rust-unofficial/awesome-rust) · [awesome-ratatui](https://github.com/ratatui/awesome-ratatui) · [awesome-tuis](https://github.com/rothgar/awesome-tuis) · [Arch Linux extra](https://archlinux.org/packages/extra/x86_64/vortix/) · [Terminal Trove](https://terminaltrove.com/vortix/)
+[awesome-rust](https://github.com/rust-unofficial/awesome-rust) · [awesome-ratatui](https://github.com/ratatui/awesome-ratatui) · [awesome-tuis](https://github.com/rothgar/awesome-tuis) · [Arch Linux extra](https://archlinux.org/packages/extra/x86_64/vortix/) · [Terminal Trove](https://terminaltrove.com/vortix/) · [LinuxLinks](https://www.linuxlinks.com/vortix-terminal-ui-wireguard-openvpn/) · [Orhun Parmaksız's spotlight](https://bsky.app/profile/orhun.dev/post/3medp5icbf22y) · [RustNation UK talk deck](https://github.com/orhun/rat-tools/blob/main/ratdeck/intro.md#L213-L219) · [JustTUI](https://github.com/musichen/justtuit/blob/main/README.md#L610)
 
 ## Star history
 
