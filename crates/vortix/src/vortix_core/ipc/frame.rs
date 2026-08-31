@@ -43,7 +43,7 @@ pub fn encode_frame<T: Serialize>(value: &T) -> Result<Vec<u8>, FrameError> {
 pub(crate) fn encode_frame_bounded<T: Serialize, const LIMIT: usize>(
     value: &T,
 ) -> Result<Vec<u8>, FrameError> {
-    let body = serde_json::to_vec(value)?;
+    let body = serialize_zeroizing(value)?;
     if body.len() > LIMIT {
         return Err(FrameError::TooLarge {
             got: body.len(),
@@ -58,6 +58,17 @@ pub(crate) fn encode_frame_bounded<T: Serialize, const LIMIT: usize>(
     out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(&body);
     Ok(out)
+}
+
+/// Serialize a live IPC value into scratch storage that is cleared on every
+/// exit path. Request values may contain base64-encoded challenge answers or
+/// profile chunks even though the public frame codec is otherwise generic.
+pub(crate) fn serialize_zeroizing<T: Serialize>(
+    value: &T,
+) -> Result<zeroize::Zeroizing<Vec<u8>>, FrameError> {
+    serde_json::to_vec(value)
+        .map(zeroize::Zeroizing::new)
+        .map_err(FrameError::Serialize)
 }
 
 /// Decode a single length-prefixed frame from `buf`. Returns
@@ -128,6 +139,21 @@ mod tests {
         let (decoded, consumed): (Msg, usize) = decode_frame(&bytes).unwrap().unwrap();
         assert_eq!(decoded, m);
         assert_eq!(consumed, bytes.len());
+    }
+
+    #[test]
+    fn encoder_json_scratch_is_zeroized_on_drop() {
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>(_: &T) {}
+
+        let scratch = serialize_zeroizing(&Msg {
+            kind: "secret-shaped".into(),
+            value: 42,
+        })
+        .unwrap();
+        assert_zeroize_on_drop(&scratch);
+        assert!(scratch
+            .windows("secret-shaped".len())
+            .any(|window| { window == "secret-shaped".as_bytes() }));
     }
 
     #[test]

@@ -2199,12 +2199,15 @@ fn connect_selected_on_active_profile_enqueues_one_typed_reconnect() {
             .unwrap()
             .take_tui_admission_results();
         if let Some(result) = results.into_iter().next() {
-            assert!(result.operation_id.is_ok());
+            assert!(matches!(
+                result.completion,
+                crate::cli::control::TuiControlCompletion::Admission(Ok(_))
+            ));
             assert!(matches!(
                 result.command,
-                crate::vortix_core::control::UserCommand::Reconnect {
+                Some(crate::vortix_core::control::UserCommand::Reconnect {
                     profile_id: Some(ref profile_id)
-                } if profile_id == &profile.id
+                }) if profile_id == &profile.id
             ));
             break;
         }
@@ -2366,7 +2369,7 @@ fn blank_challenge_input_keeps_overlay_and_challenge_for_retry() {
 }
 
 #[test]
-fn challenge_for_missing_profile_is_cancelled_without_latching_invisible_prompt() {
+fn challenge_for_missing_profile_is_marked_without_opening_invisible_prompt() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::create_dir(temp.path().join(crate::constants::PROFILES_DIR_NAME)).unwrap();
     let control =
@@ -2398,7 +2401,9 @@ fn challenge_for_missing_profile_is_cancelled_without_latching_invisible_prompt(
 
     app.apply_control_snapshot(snapshot);
 
-    assert_eq!(app.control_challenge, None);
+    // Retain only the challenge ID while asynchronous cancellation is in
+    // flight so repeated snapshots cannot enqueue duplicate cancellations.
+    assert_eq!(app.control_challenge, Some(challenge_id));
     assert!(matches!(app.input_mode, InputMode::Normal));
 }
 
@@ -2439,4 +2444,278 @@ fn failed_challenge_response_keeps_prompt_for_retry() {
 
     assert_eq!(app.control_challenge, Some(challenge_id));
     assert!(matches!(app.input_mode, InputMode::AuthPrompt { .. }));
+}
+
+struct DormantRemoteSubscription;
+
+impl crate::daemon::service::RemoteControlSubscription for DormantRemoteSubscription {
+    fn try_recv(
+        &mut self,
+    ) -> Result<
+        Option<crate::daemon::service::RemoteControlUpdate>,
+        crate::daemon::service::RemoteControlError,
+    > {
+        Ok(None)
+    }
+}
+
+#[derive(Default)]
+struct RecordingRemoteTransport {
+    submitted: std::sync::atomic::AtomicUsize,
+}
+
+impl crate::daemon::service::RemoteControlTransport for RecordingRemoteTransport {
+    fn exchange(
+        &self,
+        op: crate::vortix_core::ipc::IpcOp,
+    ) -> Result<crate::vortix_core::ipc::IpcResult, crate::daemon::service::RemoteControlError>
+    {
+        match op {
+            crate::vortix_core::ipc::IpcOp::ControlOpen => {
+                let session_id = crate::vortix_core::ipc::RemoteSessionId::parse(format!(
+                    "session-{}",
+                    "1".repeat(32)
+                ))
+                .unwrap();
+                let client_id =
+                    serde_json::from_str("\"client-0000000000000001-0000000000000001\"").unwrap();
+                Ok(crate::vortix_core::ipc::IpcResult::ControlOpened {
+                    session_id,
+                    client_id,
+                })
+            }
+            crate::vortix_core::ipc::IpcOp::ControlSubmit { .. } => {
+                self.submitted
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(crate::vortix_core::ipc::IpcResult::ControlAccepted {
+                    admitted: crate::vortix_core::control::AdmittedOperation {
+                        operation_id: crate::vortix_core::control::OperationId::parse(
+                            "op-0000000000000001-0000000000000001",
+                        )
+                        .unwrap(),
+                    },
+                })
+            }
+            other => Err(crate::daemon::service::RemoteControlError::Protocol(
+                format!("unexpected test operation: {other:?}"),
+            )),
+        }
+    }
+
+    fn subscribe(
+        &self,
+        _session_id: &crate::vortix_core::ipc::RemoteSessionId,
+    ) -> Result<
+        (
+            Box<dyn crate::daemon::service::RemoteControlSubscription>,
+            crate::vortix_core::control::ControlSnapshot,
+        ),
+        crate::daemon::service::RemoteControlError,
+    > {
+        Ok((
+            Box::new(DormantRemoteSubscription),
+            crate::vortix_core::control::ControlSnapshot::default(),
+        ))
+    }
+}
+
+#[derive(Default)]
+struct MissingProfileChallengeTransport {
+    cancellations: std::sync::atomic::AtomicUsize,
+}
+
+impl crate::daemon::service::RemoteControlTransport for MissingProfileChallengeTransport {
+    fn exchange(
+        &self,
+        op: crate::vortix_core::ipc::IpcOp,
+    ) -> Result<crate::vortix_core::ipc::IpcResult, crate::daemon::service::RemoteControlError>
+    {
+        match op {
+            crate::vortix_core::ipc::IpcOp::ControlOpen => {
+                Ok(crate::vortix_core::ipc::IpcResult::ControlOpened {
+                    session_id: crate::vortix_core::ipc::RemoteSessionId::parse(format!(
+                        "session-{}",
+                        "2".repeat(32)
+                    ))
+                    .unwrap(),
+                    client_id: serde_json::from_str("\"client-0000000000000001-0000000000000001\"")
+                        .unwrap(),
+                })
+            }
+            crate::vortix_core::ipc::IpcOp::ControlCancelChallenge { .. } => {
+                self.cancellations
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(crate::vortix_core::ipc::IpcResult::ChallengeAccepted)
+            }
+            other => Err(crate::daemon::service::RemoteControlError::Protocol(
+                format!("unexpected missing-profile operation: {other:?}"),
+            )),
+        }
+    }
+
+    fn subscribe(
+        &self,
+        _session_id: &crate::vortix_core::ipc::RemoteSessionId,
+    ) -> Result<
+        (
+            Box<dyn crate::daemon::service::RemoteControlSubscription>,
+            crate::vortix_core::control::ControlSnapshot,
+        ),
+        crate::daemon::service::RemoteControlError,
+    > {
+        let challenge_id = serde_json::from_str("7").unwrap();
+        let mut snapshot = crate::vortix_core::control::ControlSnapshot::default();
+        snapshot.challenges.insert(
+            challenge_id,
+            crate::vortix_core::control::ChallengeRecord {
+                id: challenge_id,
+                profile_id: crate::vortix_core::profile::ProfileId::parse(
+                    "f".repeat(crate::vortix_core::profile::ProfileId::HEX_LEN),
+                )
+                .unwrap(),
+                operation_id: crate::vortix_core::control::OperationId::parse(
+                    "op-0000000000000001-0000000000000007",
+                )
+                .unwrap(),
+                kind: crate::vortix_core::control::ChallengeKind::TwoFactorCode,
+                label: "OTP".into(),
+                authorized_client: serde_json::from_str(
+                    "\"client-0000000000000001-0000000000000001\"",
+                )
+                .unwrap(),
+                created_at_millis: 1,
+                expires_at_millis: 10,
+            },
+        );
+        Ok((Box::new(DormantRemoteSubscription), snapshot))
+    }
+}
+
+#[test]
+fn tui_command_surface_can_attach_remote_without_starting_a_local_writer() {
+    let transport = std::sync::Arc::new(RecordingRemoteTransport::default());
+    let remote =
+        crate::daemon::service::RemoteControlSession::open_for_parity(transport.clone()).unwrap();
+    let mut app = test_app();
+    app.attach_remote_control_session(remote).unwrap();
+    assert!(app
+        .control_session
+        .as_ref()
+        .is_some_and(crate::cli::control::ClientControlSession::is_remote));
+
+    app.issue_control_command(crate::vortix_core::control::UserCommand::SetKillSwitch {
+        mode: crate::state::KillSwitchMode::Auto,
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while transport
+        .submitted
+        .load(std::sync::atomic::Ordering::SeqCst)
+        == 0
+    {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        transport
+            .submitted
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+}
+
+#[test]
+fn remote_tui_capacity_includes_completed_but_undrained_results() {
+    let transport = std::sync::Arc::new(RecordingRemoteTransport::default());
+    let remote =
+        crate::daemon::service::RemoteControlSession::open_for_parity(transport.clone()).unwrap();
+    let session = crate::cli::control::ClientControlSession::remote_for_parity(remote);
+    for sequence in 0..8 {
+        session
+            .enqueue_tui_command(
+                crate::vortix_core::control::UserCommand::Disconnect { profile_id: None },
+                std::time::Duration::from_secs(1),
+                format!("remote-capacity-{sequence}"),
+            )
+            .unwrap();
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while transport
+        .submitted
+        .load(std::sync::atomic::Ordering::SeqCst)
+        < 8
+    {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    assert!(matches!(
+        session.enqueue_tui_command(
+            crate::vortix_core::control::UserCommand::Disconnect { profile_id: None },
+            std::time::Duration::from_secs(1),
+            "remote-capacity-overflow",
+        ),
+        Err(crate::cli::control::LocalControlError::Busy)
+    ));
+
+    let completed = session.take_tui_admission_results();
+    assert_eq!(completed.len(), 8);
+    drop(completed);
+    session
+        .enqueue_tui_command(
+            crate::vortix_core::control::UserCommand::Disconnect { profile_id: None },
+            std::time::Duration::from_secs(1),
+            "remote-capacity-released",
+        )
+        .unwrap();
+}
+
+#[test]
+fn missing_profile_remote_challenge_is_cancelled_only_once() {
+    let transport = std::sync::Arc::new(MissingProfileChallengeTransport::default());
+    let remote =
+        crate::daemon::service::RemoteControlSession::open_for_parity(transport.clone()).unwrap();
+    let mut app = test_app();
+    app.attach_remote_control_session(remote).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while transport
+        .cancellations
+        .load(std::sync::atomic::Ordering::SeqCst)
+        == 0
+    {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        transport
+            .cancellations
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+
+    app.apply_control_snapshot(app.control_snapshot.clone());
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    assert_eq!(
+        transport
+            .cancellations
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+}
+
+#[test]
+fn remote_profile_terminal_failure_is_reported_to_the_user() {
+    let mut app = test_app();
+    app.apply_local_catalog_update(crate::cli::control::LocalCatalogUpdate {
+        revision: 9,
+        profiles: None,
+        outcomes: vec![crate::cli::control::LocalCatalogOutcome::RemoteTerminal {
+            status: crate::vortix_core::control::OperationStatus::Failed,
+            result: Some(crate::vortix_core::control::OperationResult::Failed(
+                crate::vortix_core::control::OperationFailure::Rejected,
+            )),
+        }],
+    });
+
+    let toast = app.toast.as_ref().expect("profile failure must be visible");
+    assert_eq!(toast.toast_type, ToastType::Error);
+    assert!(toast.message.contains("Failed(Rejected)"));
 }

@@ -26,11 +26,16 @@ use thiserror::Error;
 /// compatible with this server.
 pub const IPC_PROTOCOL_MIN: u16 = 2;
 pub const IPC_PROTOCOL_MAX: u16 = 2;
-/// Inclusive snapshot schema range supported by this build.
+/// Inclusive snapshot schema range supported by this build. Schema 3 reserves
+/// the canonical control session/command/challenge shapes while the passive
+/// candidate continues to advertise no mutation capability.
 pub const IPC_SCHEMA_MIN: u16 = 1;
-pub const IPC_SCHEMA_MAX: u16 = 2;
+pub const IPC_SCHEMA_MAX: u16 = 3;
 
-use crate::vortix_core::control::DiagnosticSnapshot;
+use crate::vortix_core::control::{
+    AdmissionError, AdmittedOperation, ChallengeError, ChallengeId, ClientId, ControlEventEnvelope,
+    ControlSnapshot, DiagnosticSnapshot, IdempotencyKey,
+};
 use crate::vortix_core::engine::input::UserCommand;
 use crate::vortix_core::engine::registry::{Conflict, TunnelSnapshot};
 use crate::vortix_core::engine::state::Connection;
@@ -60,6 +65,44 @@ pub enum IpcOp {
     Diagnostics,
     /// Subscribe to full diagnostic replacement snapshots.
     DiagnosticsSubscribe,
+    /// Open one same-owner control client session. The passive candidate
+    /// never advertises the required capability, so production cannot reach
+    /// this operation until enrollment activation lands.
+    ControlOpen,
+    /// Submit one canonical command under a server-issued client identity.
+    ControlSubmit {
+        session_id: RemoteSessionId,
+        command: crate::vortix_core::control::UserCommand,
+        idempotency_key: IdempotencyKey,
+        timeout_millis: u64,
+    },
+    /// Read the complete canonical snapshot without reconstructing state in
+    /// the adapter.
+    ControlSnapshot { session_id: RemoteSessionId },
+    /// Subscribe to canonical events with a full snapshot resync boundary.
+    ControlSubscribe { session_id: RemoteSessionId },
+    /// Deliver one memory-only challenge answer to its authorized client.
+    ControlRespondChallenge {
+        session_id: RemoteSessionId,
+        challenge_id: ChallengeId,
+        answer: SensitiveBytes,
+    },
+    /// Cancel one challenge through its authorized client identity.
+    ControlCancelChallenge {
+        session_id: RemoteSessionId,
+        challenge_id: ChallengeId,
+    },
+    /// Stage one bounded profile body in the daemon's memory-only import
+    /// executor before submitting the durable identity-only command.
+    ControlStageProfileImport {
+        session_id: RemoteSessionId,
+        file_name: String,
+        offset: u64,
+        final_chunk: bool,
+        contents: SensitiveBytes,
+    },
+    /// Discard an interrupted memory-only profile upload.
+    ControlCancelProfileImport { session_id: RemoteSessionId },
     /// Graceful daemon shutdown. Authorized client only (UID-matching
     /// per `SO_PEERCRED`; see peer-credential auth).
     Shutdown,
@@ -72,7 +115,15 @@ impl IpcOp {
     pub const fn required_capability(&self) -> IpcCapability {
         match self {
             Self::Handshake { .. } | Self::PassiveSnapshot => IpcCapability::PassiveSnapshot,
-            Self::Execute(_) => IpcCapability::ControlMutation,
+            Self::Execute(_)
+            | Self::ControlOpen
+            | Self::ControlSubmit { .. }
+            | Self::ControlSnapshot { .. }
+            | Self::ControlSubscribe { .. }
+            | Self::ControlRespondChallenge { .. }
+            | Self::ControlCancelChallenge { .. }
+            | Self::ControlStageProfileImport { .. }
+            | Self::ControlCancelProfileImport { .. } => IpcCapability::ControlMutation,
             Self::Snapshot => IpcCapability::LegacySnapshot,
             Self::Subscribe | Self::PassiveSubscribe => IpcCapability::PassiveSubscribe,
             Self::Diagnostics => IpcCapability::Diagnostics,
@@ -145,8 +196,8 @@ impl IpcCapability {
             Self::LegacySnapshot
             | Self::PassiveSnapshot
             | Self::PassiveSubscribe
-            | Self::Shutdown
-            | Self::ControlMutation => schema >= 1,
+            | Self::Shutdown => schema >= 1,
+            Self::ControlMutation => schema >= 3,
         }
     }
 }
@@ -188,6 +239,87 @@ pub struct ServerHello {
     pub capabilities: Vec<IpcCapability>,
     /// This candidate is observational only and can never own mutations.
     pub passive: bool,
+}
+
+/// Opaque daemon-issued session identity. It names one canonical
+/// [`ClientId`] without granting observation or completion authority.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct RemoteSessionId(String);
+
+impl RemoteSessionId {
+    #[must_use]
+    pub fn parse(value: impl Into<String>) -> Option<Self> {
+        let value = value.into();
+        let suffix = value.strip_prefix("session-")?;
+        (suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .then_some(Self(value))
+    }
+}
+
+impl<'de> Deserialize<'de> for RemoteSessionId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::parse(String::deserialize(deserializer)?)
+            .ok_or_else(|| serde::de::Error::custom("invalid remote control session ID"))
+    }
+}
+
+/// Secret-bearing IPC bytes. The value is serialized only for the live
+/// same-owner socket exchange, is always redacted from `Debug`, and is
+/// overwritten when dropped. It never enters snapshots, events, replay
+/// caches, diagnostics, or persistence.
+#[derive(Clone)]
+pub struct SensitiveBytes(std::sync::Arc<zeroize::Zeroizing<Vec<u8>>>);
+
+impl SensitiveBytes {
+    #[must_use]
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self(std::sync::Arc::new(zeroize::Zeroizing::new(bytes)))
+    }
+
+    #[must_use]
+    pub fn into_vec(self) -> Vec<u8> {
+        match std::sync::Arc::try_unwrap(self.0) {
+            Ok(mut bytes) => std::mem::take(&mut *bytes),
+            Err(bytes) => bytes.as_ref().to_vec(),
+        }
+    }
+}
+
+impl std::fmt::Debug for SensitiveBytes {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
+}
+
+impl Serialize for SensitiveBytes {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use base64::Engine as _;
+        let encoded = zeroize::Zeroizing::new(
+            base64::engine::general_purpose::STANDARD.encode(self.0.as_slice()),
+        );
+        serializer.serialize_str(encoded.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for SensitiveBytes {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use base64::Engine as _;
+        let encoded = zeroize::Zeroizing::new(String::deserialize(deserializer)?);
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded.as_bytes())
+            .map(Self::new)
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 /// One scanner-derived tunnel fact. It is intentionally unable to carry an
@@ -262,6 +394,33 @@ pub enum IpcResult {
     DiagnosticEvent {
         snapshot: DiagnosticSnapshot,
     },
+    ControlOpened {
+        session_id: RemoteSessionId,
+        client_id: ClientId,
+    },
+    ControlAccepted {
+        admitted: AdmittedOperation,
+    },
+    ControlSnapshot {
+        snapshot: ControlSnapshot,
+    },
+    ControlSubscribed {
+        snapshot: ControlSnapshot,
+    },
+    ControlEvent {
+        /// Some canonical publications (notably fresh observations) change
+        /// the snapshot without emitting a control event.
+        event: Option<ControlEventEnvelope>,
+        snapshot: ControlSnapshot,
+    },
+    ChallengeAccepted,
+    ControlProfileImportStaged {
+        profile_id: ProfileId,
+        display_name: String,
+    },
+    ControlProfileImportChunkAccepted {
+        next_offset: u64,
+    },
     /// The client lagged and must issue a fresh subscribe operation.
     ResyncRequired {
         newest_generation: u64,
@@ -296,6 +455,12 @@ pub enum IpcError {
     DuplicateRequestId,
     #[error("daemon connection capacity is saturated")]
     ServerBusy,
+    #[error("control admission failed: {error}")]
+    ControlAdmission { error: AdmissionError },
+    #[error("control challenge failed: {error}")]
+    ControlChallenge { error: ChallengeError },
+    #[error("remote control session was not found")]
+    ControlSessionNotFound,
     /// A connect attempt was blocked by a registry conflict. Carries
     /// the typed `Conflict` so CLI thin-clients can map to
     /// `ExitCode::StateConflict` (4) with the same hint text as the
@@ -477,5 +642,62 @@ mod handshake_tests {
         let mut hello = ClientHello::current(Vec::new());
         hello.product = "not-vortix".into();
         assert!(negotiate_passive(&hello).is_err());
+    }
+
+    #[test]
+    fn challenge_bytes_are_redacted_from_debug_but_cross_the_live_frame() {
+        let session_id = RemoteSessionId::parse(format!("session-{}", "a".repeat(32))).unwrap();
+        let challenge_id = serde_json::from_str("1").unwrap();
+        let request = IpcRequest {
+            id: 7,
+            op: IpcOp::ControlRespondChallenge {
+                session_id,
+                challenge_id,
+                answer: SensitiveBytes::new(b"single-use-secret".to_vec()),
+            },
+        };
+        assert!(!format!("{request:?}").contains("single-use-secret"));
+        let frame = encode_frame(&request).unwrap();
+        let (decoded, _) = decode_frame::<IpcRequest>(&frame).unwrap().unwrap();
+        let IpcOp::ControlRespondChallenge { answer, .. } = decoded.op else {
+            panic!("challenge response must round-trip as its dedicated wire shape");
+        };
+        assert_eq!(answer.into_vec(), b"single-use-secret");
+    }
+
+    #[test]
+    fn public_requests_remain_cloneable_without_copying_secret_storage() {
+        let answer = SensitiveBytes::new(b"single-use-secret".to_vec());
+        let shared = answer.clone();
+        assert!(std::sync::Arc::ptr_eq(&answer.0, &shared.0));
+        let request = IpcRequest {
+            id: 7,
+            op: IpcOp::ControlRespondChallenge {
+                session_id: RemoteSessionId::parse(format!("session-{}", "a".repeat(32))).unwrap(),
+                challenge_id: serde_json::from_str("1").unwrap(),
+                answer,
+            },
+        };
+
+        let cloned = request.clone();
+        let IpcOp::ControlRespondChallenge { answer, .. } = cloned.op else {
+            panic!("cloned request must preserve its operation");
+        };
+        assert_eq!(answer.into_vec(), b"single-use-secret");
+    }
+
+    #[test]
+    fn maximum_profile_chunk_fits_the_bounded_live_frame() {
+        let request = IpcRequest {
+            id: 2,
+            op: IpcOp::ControlStageProfileImport {
+                session_id: RemoteSessionId::parse(format!("session-{}", "b".repeat(32))).unwrap(),
+                file_name: "bounded.ovpn".into(),
+                offset: 0,
+                final_chunk: false,
+                contents: SensitiveBytes::new(vec![b'x'; 64 * 1024]),
+            },
+        };
+        assert!(encode_frame(&request).is_ok());
     }
 }
