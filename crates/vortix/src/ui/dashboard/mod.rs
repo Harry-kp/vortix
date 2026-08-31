@@ -498,10 +498,7 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
 
     if app.show_action_menu || app.show_bulk_menu {
         let (actions, title) = if app.show_bulk_menu {
-            (
-                message::get_bulk_actions_for(&app.background_mode.permitted_actions),
-                " Bulk Actions ",
-            )
+            (message::get_bulk_actions(), " Bulk Actions ")
         } else {
             (message::get_single_actions(&app.focused_panel), " Actions ")
         };

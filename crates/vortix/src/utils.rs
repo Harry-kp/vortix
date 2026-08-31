@@ -1180,6 +1180,16 @@ pub struct LifecycleLock {
     _legacy: std::fs::File,
 }
 
+/// Turn a lifecycle-lock failure into concise, actionable user-facing copy.
+#[must_use]
+pub fn lifecycle_lock_user_message(error: &std::io::Error) -> String {
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        return "Another Vortix process is managing VPN state. Close the running Vortix session or wait for its command to finish, then try again."
+            .to_string();
+    }
+    format!("Vortix could not open its session lock: {error}")
+}
+
 #[cfg(unix)]
 pub fn acquire_lifecycle_lock() -> std::io::Result<LifecycleLock> {
     let root = get_app_config_dir()?;
@@ -1398,6 +1408,19 @@ mod tests {
         );
         assert!(invoking_owner_uid_from(0, Some(std::ffi::OsStr::new("0"))).is_err());
         assert!(invoking_owner_uid_from(0, Some(std::ffi::OsStr::new("invalid"))).is_err());
+    }
+
+    #[test]
+    fn busy_lifecycle_lock_has_a_plain_user_message() {
+        let error = std::io::Error::from(std::io::ErrorKind::WouldBlock);
+
+        let message = lifecycle_lock_user_message(&error);
+
+        assert_eq!(
+            message,
+            "Another Vortix process is managing VPN state. Close the running Vortix session or wait for its command to finish, then try again."
+        );
+        assert!(!message.contains("Resource temporarily unavailable"));
     }
 
     // ───── binary_exists ─────────────────────────────────────────────────

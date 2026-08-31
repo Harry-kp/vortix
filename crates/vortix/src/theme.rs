@@ -8,6 +8,62 @@
 use ratatui::style::Color;
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
+use std::sync::OnceLock;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalColorSupport {
+    TrueColor,
+    Indexed256,
+}
+
+impl TerminalColorSupport {
+    fn from_environment(
+        term_program: Option<&str>,
+        color_term: Option<&str>,
+        term: Option<&str>,
+        sudo_user: Option<&str>,
+    ) -> Self {
+        if term_program.is_some_and(|value| value.eq_ignore_ascii_case("Apple_Terminal")) {
+            return Self::Indexed256;
+        }
+
+        let terminal_name_advertises_truecolor = term.is_some_and(|value| {
+            let value = value.to_ascii_lowercase();
+            value.contains("truecolor")
+                || value.contains("direct")
+                || value.contains("ghostty")
+                || value.contains("kitty")
+                || value.contains("wezterm")
+        });
+        // `sudo` commonly keeps COLORTERM but strips TERM_PROGRAM. A generic
+        // xterm-256color identity therefore cannot safely inherit the parent
+        // shell's true-color claim (Terminal.app is the concrete case).
+        if sudo_user.is_some() && term_program.is_none() && !terminal_name_advertises_truecolor {
+            return Self::Indexed256;
+        }
+
+        let advertises_truecolor = color_term.is_some_and(|value| {
+            value.eq_ignore_ascii_case("truecolor") || value.eq_ignore_ascii_case("24bit")
+        }) || terminal_name_advertises_truecolor;
+
+        if advertises_truecolor {
+            Self::TrueColor
+        } else {
+            Self::Indexed256
+        }
+    }
+
+    fn detect() -> Self {
+        Self::from_environment(
+            std::env::var("TERM_PROGRAM").ok().as_deref(),
+            std::env::var("COLORTERM").ok().as_deref(),
+            std::env::var("TERM").ok().as_deref(),
+            std::env::var("SUDO_USER").ok().as_deref(),
+        )
+    }
+}
+
+static TERMINAL_COLOR_SUPPORT: OnceLock<TerminalColorSupport> = OnceLock::new();
 
 /// Built-in theme selected through the top-level `theme` key in `config.toml`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,6 +99,33 @@ impl ThemeChoice {
             Self::GruvboxDark => &GRUVBOX_DARK,
             Self::TokyoNight => &TOKYO_NIGHT,
         }
+    }
+
+    const fn palette_for_support(self, support: TerminalColorSupport) -> &'static Theme {
+        if matches!(support, TerminalColorSupport::TrueColor) {
+            return self.palette();
+        }
+
+        match self {
+            Self::Synthwave => &SYNTHWAVE_INDEXED,
+            Self::Terminal => &TERMINAL,
+            Self::CatppuccinMocha => &CATPPUCCIN_MOCHA_INDEXED,
+            Self::Dracula => &DRACULA_INDEXED,
+            Self::Nord => &NORD_INDEXED,
+            Self::GruvboxDark => &GRUVBOX_DARK_INDEXED,
+            Self::TokyoNight => &TOKYO_NIGHT_INDEXED,
+        }
+    }
+
+    /// Resolve this choice for the capabilities of the active terminal.
+    #[must_use]
+    pub fn render_palette(self) -> &'static Theme {
+        self.palette_for_support(
+            TERMINAL_COLOR_SUPPORT
+                .get()
+                .copied()
+                .unwrap_or(TerminalColorSupport::TrueColor),
+        )
     }
 
     /// Return the next built-in theme, wrapping to Synthwave.
@@ -110,7 +193,7 @@ impl Drop for ScopedThemeGuard<'_> {
 /// Every color used in rendering is a field here. Semantic names describe
 /// *purpose* (not hue) so themes can diverge wildly in palette while the
 /// rest of the code stays unchanged.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Theme {
     // --- Backgrounds ---
     pub warm_bg: Color,
@@ -168,12 +251,57 @@ pub struct Theme {
     pub nord_purple: Color,
 }
 
+impl Theme {
+    #[cfg(test)]
+    const fn colors(self) -> [Color; 35] {
+        [
+            self.warm_bg,
+            self.panel_bg,
+            self.panel_bg_dark,
+            self.panel_header_bg,
+            self.accent_primary,
+            self.accent_secondary,
+            self.accent_dark,
+            self.teal_accent,
+            self.success,
+            self.warning,
+            self.error,
+            self.inactive,
+            self.text_primary,
+            self.text_secondary,
+            self.text_light,
+            self.text_dark,
+            self.border_default,
+            self.border_focused,
+            self.row_selected_bg,
+            self.row_selected_fg,
+            self.btn_connect_bg,
+            self.btn_terminate_bg,
+            self.btn_default_bg,
+            self.key_hint,
+            self.key_hint_desc,
+            self.separator,
+            self.toast_info,
+            self.toast_success,
+            self.toast_warning,
+            self.toast_error,
+            self.yellow,
+            self.nord_polar_night_3,
+            self.nord_polar_night_4,
+            self.nord_frost_3,
+            self.nord_purple,
+        ]
+    }
+}
+
 // ── Built-in themes ──────────────────────────────────────────────────────
 
 /// Default Synthwave / Cyberpunk theme — warm backgrounds, cyan accents.
 pub const SYNTHWAVE: Theme = Theme {
     warm_bg: Color::Rgb(180, 160, 140),
-    // Neutral-purple surface keeps the cyan status accents visually crisp.
+    // Match the legacy rendered surface captured before palette switching.
+    // The old constant was blue-slate but the old renderer inherited this
+    // neutral-purple terminal surface instead.
     panel_bg: Color::Rgb(28, 28, 40),
     panel_bg_dark: Color::Rgb(22, 22, 32),
     panel_header_bg: Color::Rgb(40, 55, 75),
@@ -185,15 +313,15 @@ pub const SYNTHWAVE: Theme = Theme {
 
     success: Color::Rgb(16, 185, 129),
     warning: Color::Rgb(245, 158, 11),
-    error: Color::Rgb(248, 113, 113),
-    inactive: Color::Rgb(148, 163, 184),
+    error: Color::Rgb(239, 68, 68),
+    inactive: Color::Gray,
 
     text_primary: Color::Rgb(248, 250, 252),
     text_secondary: Color::Rgb(148, 163, 184),
     text_light: Color::Rgb(203, 213, 225),
-    text_dark: Color::Rgb(10, 15, 25),
+    text_dark: Color::Rgb(30, 41, 59),
 
-    border_default: Color::Rgb(100, 116, 139),
+    border_default: Color::Rgb(71, 85, 105),
     border_focused: Color::Rgb(6, 182, 212),
 
     row_selected_bg: Color::Rgb(40, 55, 75),
@@ -204,8 +332,8 @@ pub const SYNTHWAVE: Theme = Theme {
     btn_default_bg: Color::Rgb(71, 85, 105),
 
     key_hint: Color::Rgb(6, 182, 212),
-    key_hint_desc: Color::Rgb(148, 163, 184),
-    separator: Color::Rgb(100, 116, 139),
+    key_hint_desc: Color::DarkGray,
+    separator: Color::Rgb(76, 86, 106),
 
     toast_info: Color::Rgb(136, 192, 208),
     toast_success: Color::Rgb(163, 190, 140),
@@ -508,6 +636,117 @@ pub const TOKYO_NIGHT: Theme = Theme {
     nord_purple: Color::Rgb(187, 154, 247),
 };
 
+const XTERM_LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+
+const fn color_distance(left: u8, right: u8) -> u32 {
+    let difference = left.abs_diff(right) as u32;
+    difference * difference
+}
+
+const fn nearest_xterm_component(value: u8) -> (u8, u8) {
+    let mut best_index: u8 = 0;
+    let mut best_distance = u32::MAX;
+    let mut index: u8 = 0;
+    while (index as usize) < XTERM_LEVELS.len() {
+        let distance = color_distance(value, XTERM_LEVELS[index as usize]);
+        if distance < best_distance {
+            best_index = index;
+            best_distance = distance;
+        }
+        index += 1;
+    }
+    (best_index, XTERM_LEVELS[best_index as usize])
+}
+
+const fn nearest_xterm_index(red: u8, green: u8, blue: u8) -> u8 {
+    let (red_index, cube_red) = nearest_xterm_component(red);
+    let (green_index, cube_green) = nearest_xterm_component(green);
+    let (blue_index, cube_blue) = nearest_xterm_component(blue);
+    let cube_distance = color_distance(red, cube_red)
+        + color_distance(green, cube_green)
+        + color_distance(blue, cube_blue);
+    let cube_index = 16 + (36 * red_index) + (6 * green_index) + blue_index;
+
+    let mut best_gray_index = 0;
+    let mut best_gray_distance = u32::MAX;
+    let mut gray_index = 0;
+    while gray_index < 24 {
+        let gray = 8 + (10 * gray_index);
+        let distance =
+            color_distance(red, gray) + color_distance(green, gray) + color_distance(blue, gray);
+        if distance < best_gray_distance {
+            best_gray_index = gray_index;
+            best_gray_distance = distance;
+        }
+        gray_index += 1;
+    }
+
+    if best_gray_distance < cube_distance {
+        232 + best_gray_index
+    } else {
+        cube_index
+    }
+}
+
+const fn indexed_color(color: Color) -> Color {
+    match color {
+        Color::Rgb(red, green, blue) => Color::Indexed(nearest_xterm_index(red, green, blue)),
+        other => other,
+    }
+}
+
+const fn indexed_theme(theme: Theme) -> Theme {
+    Theme {
+        warm_bg: indexed_color(theme.warm_bg),
+        panel_bg: indexed_color(theme.panel_bg),
+        panel_bg_dark: indexed_color(theme.panel_bg_dark),
+        panel_header_bg: indexed_color(theme.panel_header_bg),
+        accent_primary: indexed_color(theme.accent_primary),
+        accent_secondary: indexed_color(theme.accent_secondary),
+        accent_dark: indexed_color(theme.accent_dark),
+        teal_accent: indexed_color(theme.teal_accent),
+        success: indexed_color(theme.success),
+        warning: indexed_color(theme.warning),
+        error: indexed_color(theme.error),
+        inactive: indexed_color(theme.inactive),
+        text_primary: indexed_color(theme.text_primary),
+        text_secondary: indexed_color(theme.text_secondary),
+        text_light: indexed_color(theme.text_light),
+        text_dark: indexed_color(theme.text_dark),
+        border_default: indexed_color(theme.border_default),
+        border_focused: indexed_color(theme.border_focused),
+        row_selected_bg: indexed_color(theme.row_selected_bg),
+        row_selected_fg: indexed_color(theme.row_selected_fg),
+        btn_connect_bg: indexed_color(theme.btn_connect_bg),
+        btn_terminate_bg: indexed_color(theme.btn_terminate_bg),
+        btn_default_bg: indexed_color(theme.btn_default_bg),
+        key_hint: indexed_color(theme.key_hint),
+        key_hint_desc: indexed_color(theme.key_hint_desc),
+        separator: indexed_color(theme.separator),
+        toast_info: indexed_color(theme.toast_info),
+        toast_success: indexed_color(theme.toast_success),
+        toast_warning: indexed_color(theme.toast_warning),
+        toast_error: indexed_color(theme.toast_error),
+        yellow: indexed_color(theme.yellow),
+        nord_polar_night_3: indexed_color(theme.nord_polar_night_3),
+        nord_polar_night_4: indexed_color(theme.nord_polar_night_4),
+        nord_frost_3: indexed_color(theme.nord_frost_3),
+        nord_purple: indexed_color(theme.nord_purple),
+    }
+}
+
+const SYNTHWAVE_INDEXED: Theme = indexed_theme(SYNTHWAVE);
+const CATPPUCCIN_MOCHA_INDEXED: Theme = indexed_theme(CATPPUCCIN_MOCHA);
+const DRACULA_INDEXED: Theme = indexed_theme(DRACULA);
+const NORD_INDEXED: Theme = indexed_theme(NORD);
+const GRUVBOX_DARK_INDEXED: Theme = indexed_theme(GRUVBOX_DARK);
+const TOKYO_NIGHT_INDEXED: Theme = indexed_theme(TOKYO_NIGHT);
+
+/// Detect and cache the active terminal's color capability before rendering.
+pub fn configure_for_terminal() {
+    let _ = TERMINAL_COLOR_SUPPORT.set(TerminalColorSupport::detect());
+}
+
 /// Run one complete render operation with a stable active palette.
 pub fn with_choice<T>(choice: ThemeChoice, render: impl FnOnce() -> T) -> T {
     SCOPED_THEME.with(|active| {
@@ -520,7 +759,7 @@ pub fn with_choice<T>(choice: ThemeChoice, render: impl FnOnce() -> T) -> T {
 /// Return the palette scoped to the current render operation.
 #[must_use]
 pub fn current() -> &'static Theme {
-    SCOPED_THEME.with(|choice| choice.get().palette())
+    SCOPED_THEME.with(|choice| choice.get().render_palette())
 }
 
 // ── Backward-compatible const aliases ────────────────────────────────────
@@ -605,8 +844,47 @@ mod tests {
     }
 
     #[test]
-    fn synthwave_keeps_its_neutral_purple_surface() {
-        assert_eq!(SYNTHWAVE.panel_bg, Color::Rgb(28, 28, 40));
+    fn synthwave_matches_the_legacy_rendered_palette() {
+        assert_eq!(
+            SYNTHWAVE,
+            Theme {
+                warm_bg: Color::Rgb(180, 160, 140),
+                panel_bg: Color::Rgb(28, 28, 40),
+                panel_bg_dark: Color::Rgb(22, 22, 32),
+                panel_header_bg: Color::Rgb(40, 55, 75),
+                accent_primary: Color::Rgb(6, 182, 212),
+                accent_secondary: Color::Rgb(34, 211, 238),
+                accent_dark: Color::Rgb(8, 145, 178),
+                teal_accent: Color::Rgb(20, 184, 166),
+                success: Color::Rgb(16, 185, 129),
+                warning: Color::Rgb(245, 158, 11),
+                error: Color::Rgb(239, 68, 68),
+                inactive: Color::Gray,
+                text_primary: Color::Rgb(248, 250, 252),
+                text_secondary: Color::Rgb(148, 163, 184),
+                text_light: Color::Rgb(203, 213, 225),
+                text_dark: Color::Rgb(30, 41, 59),
+                border_default: Color::Rgb(71, 85, 105),
+                border_focused: Color::Rgb(6, 182, 212),
+                row_selected_bg: Color::Rgb(40, 55, 75),
+                row_selected_fg: Color::Rgb(34, 211, 238),
+                btn_connect_bg: Color::Rgb(6, 182, 212),
+                btn_terminate_bg: Color::Rgb(239, 68, 68),
+                btn_default_bg: Color::Rgb(71, 85, 105),
+                key_hint: Color::Rgb(6, 182, 212),
+                key_hint_desc: Color::DarkGray,
+                separator: Color::Rgb(76, 86, 106),
+                toast_info: Color::Rgb(136, 192, 208),
+                toast_success: Color::Rgb(163, 190, 140),
+                toast_warning: Color::Rgb(235, 203, 139),
+                toast_error: Color::Rgb(191, 97, 106),
+                yellow: Color::Rgb(234, 179, 8),
+                nord_polar_night_3: Color::Rgb(67, 76, 94),
+                nord_polar_night_4: Color::Rgb(76, 86, 106),
+                nord_frost_3: Color::Rgb(129, 161, 193),
+                nord_purple: Color::Rgb(180, 142, 173),
+            }
+        );
     }
 
     #[test]
@@ -665,8 +943,10 @@ mod tests {
             );
         }
 
+        // Synthwave is frozen to the legacy rendered palette, including two
+        // terminal-defined ANSI colors. New fixed palettes meet the stricter
+        // contrast contract independently.
         let choices = [
-            ThemeChoice::Synthwave,
             ThemeChoice::CatppuccinMocha,
             ThemeChoice::Dracula,
             ThemeChoice::Nord,
@@ -788,6 +1068,72 @@ mod tests {
         ] {
             assert!(!matches!(color, Color::Rgb(_, _, _)));
         }
+    }
+
+    #[test]
+    fn apple_terminal_uses_indexed_palettes_instead_of_misreading_rgb_sequences() {
+        assert_eq!(
+            TerminalColorSupport::from_environment(
+                Some("Apple_Terminal"),
+                None,
+                Some("xterm-256color"),
+                None,
+            ),
+            TerminalColorSupport::Indexed256,
+        );
+        assert_eq!(
+            TerminalColorSupport::from_environment(
+                None,
+                Some("truecolor"),
+                Some("xterm-256color"),
+                Some("alice"),
+            ),
+            TerminalColorSupport::Indexed256,
+            "sudo strips TERM_PROGRAM, so a generic 256-color TERM must win over inherited COLORTERM",
+        );
+
+        for choice in [
+            ThemeChoice::Synthwave,
+            ThemeChoice::CatppuccinMocha,
+            ThemeChoice::Dracula,
+            ThemeChoice::Nord,
+            ThemeChoice::GruvboxDark,
+            ThemeChoice::TokyoNight,
+        ] {
+            let palette = choice.palette_for_support(TerminalColorSupport::Indexed256);
+            for color in palette.colors() {
+                assert!(
+                    !matches!(color, Color::Rgb(_, _, _)),
+                    "{choice:?} leaked an RGB escape into a 256-color terminal: {color:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn terminals_that_advertise_truecolor_keep_the_exact_rgb_palette() {
+        assert_eq!(
+            TerminalColorSupport::from_environment(
+                Some("ghostty"),
+                Some("truecolor"),
+                Some("xterm-ghostty"),
+                Some("alice"),
+            ),
+            TerminalColorSupport::TrueColor,
+        );
+        assert_eq!(
+            TerminalColorSupport::from_environment(
+                None,
+                Some("truecolor"),
+                Some("xterm-256color"),
+                None,
+            ),
+            TerminalColorSupport::TrueColor,
+        );
+        assert_eq!(
+            ThemeChoice::Synthwave.palette_for_support(TerminalColorSupport::TrueColor),
+            &SYNTHWAVE,
+        );
     }
 
     #[test]

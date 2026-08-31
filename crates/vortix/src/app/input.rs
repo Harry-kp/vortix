@@ -879,7 +879,7 @@ impl crate::app::App {
     /// Handle keys when the action menu is open
     fn handle_action_menu_keys(&mut self, key: KeyEvent) {
         let actions = if self.show_bulk_menu {
-            message::get_bulk_actions_for(&self.background_mode.permitted_actions)
+            message::get_bulk_actions()
         } else {
             message::get_single_actions(&self.focused_panel)
         };

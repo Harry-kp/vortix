@@ -24,11 +24,7 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
         None | Some(_) => "",
     };
 
-    let title = if app.logs_auto_scroll {
-        format!(" Event Log [Live{filter_label}] · Background diagnostics: b→G ")
-    } else {
-        format!(" Event Log [Paused{filter_label}] · Background diagnostics: b→G ")
-    };
+    let title = event_log_title(app.logs_auto_scroll, filter_label);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -140,4 +136,21 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
         }),
         &mut scrollbar_state,
     );
+}
+
+fn event_log_title(auto_scroll: bool, filter_label: &str) -> String {
+    let state = if auto_scroll { "Live" } else { "Paused" };
+    format!(" Event Log [{state}{filter_label}] ")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn event_log_title_does_not_advertise_dormant_background_actions() {
+        let title = super::event_log_title(true, "");
+
+        assert_eq!(title, " Event Log [Live] ");
+        assert!(!title.contains("Background"));
+        assert!(!title.contains("b→G"));
+    }
 }
