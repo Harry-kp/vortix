@@ -10,7 +10,6 @@ on:
       - "LICENSE"
       - "CHANGELOG.md"
   pull_request:
-    branches: [main]
     paths-ignore:
       - "**/*.md"
       - "LICENSE"
@@ -38,3 +37,5 @@ jobs:
         run: cargo xtask check-protocol-leak
       - name: Shell-regression guard (plan 002 U11)
         run: cargo xtask check-no-shell-regressions
+      - name: Canonical control boundaries (control-plane U1)
+        run: cargo xtask check-control-boundaries

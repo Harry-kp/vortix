@@ -1,4 +1,4 @@
-//! Linux VPN interface detection via `libc::getifaddrs` + `/sys/class/net` + `wg show`.
+//! Linux VPN interface detection via `libc::getifaddrs` + `/sys/class/net`.
 //!
 //! replaced the `ip addr show <iface>` shell-out with a direct
 //! `libc::getifaddrs` walk for IPv4 address discovery and a `/sys/class/net/<iface>/mtu`
@@ -6,34 +6,19 @@
 //! on iproute2 for read-only interface inspection.
 
 use crate::vortix_core::ports::interface::Interface;
-use crate::vortix_process::simple_output as cmd_output;
 
-/// Linux interface detection using `libc::getifaddrs`, `/sys/class/net`, and `wg show`.
+/// Linux interface detection using `libc::getifaddrs` and `/sys/class/net`.
 pub struct LinuxInterface;
 
 impl Interface for LinuxInterface {
     fn resolve_wireguard_interface(name: &str) -> Option<String> {
-        // Linux doesn't use /var/run/wireguard/*.name mapping files
-        // The interface name IS the WireGuard interface
-        if check_wg_interface_exists(name) {
-            return Some(name.to_string());
-        }
-
-        // Fallback: try to find any active WireGuard interface via `wg show`
-        // and match against the profile name
-        if let Some(output) = cmd_output("wg", &["show"]) {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                if line.starts_with("interface: ") {
-                    let iface = line.trim_start_matches("interface: ").trim();
-                    if iface == name {
-                        return Some(iface.to_string());
-                    }
-                }
-            }
-        }
-
-        None
+        // Protocol identity is verified by the WireGuard adapter. This port
+        // answers only the platform question: does a kernel interface with
+        // this basename exist?
+        std::path::Path::new("/sys/class/net")
+            .join(name)
+            .exists()
+            .then(|| name.to_string())
     }
 
     fn get_wireguard_pid(interface: &str) -> Option<u32> {
@@ -54,10 +39,6 @@ impl Interface for LinuxInterface {
     }
 }
 
-fn check_wg_interface_exists(name: &str) -> bool {
-    cmd_output("wg", &["show", name, "public-key"]).is_some_and(|o| o.status.success())
-}
-
 /// Walk `/proc/[pid]/cmdline` and return the first PID whose cmdline
 /// contains ALL of the given substring needles (case-insensitive).
 ///
@@ -67,16 +48,6 @@ fn check_wg_interface_exists(name: &str) -> bool {
 ///
 pub(crate) fn find_pid_with_cmdline_substrings(needles: &[&str]) -> Option<u32> {
     matching_pids(needles, Some(1)).into_iter().next()
-}
-
-/// Walk `/proc/[pid]/cmdline` and return EVERY PID whose cmdline contains
-/// the given substring needle (case-insensitive).
-///
-/// Used by the OVPN tunnel teardown to replace `pkill -f`. Same /proc
-/// walk as the single-PID variant but collects all matches.
-///
-pub(crate) fn find_all_pids_with_cmdline_substring(needle: &str) -> Vec<u32> {
-    matching_pids(&[needle], None)
 }
 
 fn matching_pids(needles: &[&str], limit: Option<usize>) -> Vec<u32> {

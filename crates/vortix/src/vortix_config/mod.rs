@@ -8,12 +8,15 @@
 
 #![allow(clippy::missing_errors_doc)]
 
+pub mod control_state;
 pub mod error;
+pub mod hooks_config;
 pub mod migration;
 pub mod profile_store;
 pub mod settings;
 
 pub use error::ConfigError;
+pub use hooks_config::{HookConfigError, HookSpec};
 pub use migration::{migrate_legacy_profiles, MigrationStats};
 pub use profile_store::{ProfileStore, ProfileStoreError, ProfileSummary};
 pub use settings::{EngineSettings, JournalSettings, Settings, SettingsError, UiSettings};

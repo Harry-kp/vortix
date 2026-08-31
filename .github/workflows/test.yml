@@ -12,7 +12,6 @@ on:
       - "LICENSE"
       - "CHANGELOG.md"
   pull_request:
-    branches: [main]
     paths-ignore:
       - "**/*.md"
       - "LICENSE"
@@ -52,7 +51,7 @@ jobs:
     steps:
       - name: Bootstrap Fedora container
         run: |
-          dnf install -y ca-certificates curl gcc gcc-c++ git make nftables openvpn pkgconf-pkg-config shadow-utils which wireguard-tools
+          dnf install -y ca-certificates curl gcc gcc-c++ git make nftables openvpn pkgconf-pkg-config procps-ng shadow-utils which wireguard-tools
           useradd -m tester
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master

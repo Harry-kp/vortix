@@ -3,7 +3,6 @@ use crate::state::{Protocol, QualityLevel};
 use crate::vortix_core::cidr::Cidr;
 use crate::vortix_core::engine::registry::{Role, TunnelSnapshot};
 use crate::vortix_core::engine::state::Connection;
-use crate::vortix_core::profile::ProfileId;
 use crate::{constants, theme, utils};
 use ratatui::{
     layout::Rect,
@@ -51,7 +50,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
         .profile_list_state
         .selected()
         .and_then(|idx| app.runtime.profiles.get(idx))
-        .map(|p| ProfileId::new(&p.name))
+        .map(|p| p.id.clone())
         .or_else(|| app.registry.primary().cloned());
 
     let focused_snap = focused_profile_id
@@ -89,11 +88,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
         // the runtime profile catalogue carries it — typically a delete-
         // mid-render race. Surface an explicit hint rather than a stale
         // placeholder so the user notices.
-        let in_catalogue = app
-            .runtime
-            .profiles
-            .iter()
-            .any(|p| ProfileId::new(&p.name) == *id);
+        let in_catalogue = app.runtime.profiles.iter().any(|p| p.id == *id);
         if !in_catalogue {
             render_profile_unavailable(frame, inner);
             return;
@@ -208,6 +203,25 @@ fn render_connected(
             Style::default().fg(proto_color),
         ),
     ]));
+
+    if let crate::vortix_core::engine::state::ConnectionHealth::Degraded {
+        reason:
+            crate::vortix_core::engine::state::DegradedReason::WireGuardPeerStale {
+                allowed_routes,
+                seconds_since_last_handshake,
+                ..
+            },
+    } = &snap.health
+    {
+        let route = allowed_routes.first().map_or("route", String::as_str);
+        text.push(Line::from(vec![
+            Span::styled("Health  : ", Style::default().fg(theme::TEXT_SECONDARY)),
+            Span::styled(
+                format!("Handshake stale {seconds_since_last_handshake}s ({route})"),
+                Style::default().fg(theme::WARNING),
+            ),
+        ]));
+    }
 
     text.push(Line::from(vec![
         Span::styled("Transfer: ", Style::default().fg(theme::TEXT_SECONDARY)),
@@ -372,10 +386,25 @@ fn render_transitional(frame: &mut Frame, app: &App, inner: Rect, snap: &TunnelS
     let mut text: Vec<Line> = Vec::new();
 
     let (headline, headline_color) = match &snap.state {
-        Connection::Connecting { attempt, .. } => (
-            format!("Connecting (attempt {attempt})"),
-            theme::NORD_YELLOW,
-        ),
+        Connection::Connecting { attempt, .. } => {
+            let wireguard = app
+                .runtime
+                .profiles
+                .iter()
+                .find(|profile| profile.id == snap.profile_id)
+                .is_some_and(|profile| profile.protocol == Protocol::WireGuard);
+            (
+                format!(
+                    "{} (attempt {attempt})",
+                    if wireguard {
+                        "Handshaking"
+                    } else {
+                        "Connecting"
+                    }
+                ),
+                theme::NORD_YELLOW,
+            )
+        }
         Connection::Reconnecting { attempt, .. } => (
             format!("Reconnecting (attempt {attempt})"),
             theme::NORD_YELLOW,
@@ -671,7 +700,7 @@ fn fwmark_warning_line(app: &App, snap: &TunnelSnapshot) -> Option<Line<'static>
         .runtime
         .profiles
         .iter()
-        .find(|p| ProfileId::new(&p.name) == snap.profile_id)?;
+        .find(|p| p.id == snap.profile_id)?;
     if profile.protocol != Protocol::WireGuard {
         return None;
     }
@@ -820,6 +849,7 @@ mod tests {
 
     fn make_profile(name: &str, config_path: PathBuf) -> VpnProfile {
         VpnProfile {
+            id: crate::vortix_core::profile::ProfileId::new(name),
             name: name.to_string(),
             protocol: Protocol::WireGuard,
             location: String::new(),
@@ -902,6 +932,29 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    #[test]
+    fn compact_details_use_protocol_specific_connect_label() {
+        for (protocol, expected, forbidden) in [
+            (Protocol::WireGuard, "Handshaking", "Connecting"),
+            (Protocol::OpenVPN, "Connecting", "Handshaking"),
+        ] {
+            let mut app = App::new_test();
+            app.runtime.profiles.push(VpnProfile {
+                id: ProfileId::new("corp"),
+                name: "corp".into(),
+                protocol,
+                location: String::new(),
+                config_path: PathBuf::from("/tmp/corp.conf"),
+                last_used: None,
+            });
+            app.profile_list_state.select(Some(0));
+            app.mirror_connecting_into_registry("corp");
+            let out = render_to_string(&mut app, 80, 10);
+            assert!(out.contains(expected), "{out}");
+            assert!(!out.contains(forbidden), "{out}");
+        }
     }
 
     // ───────────── role_line: pure-function variants ─────────────

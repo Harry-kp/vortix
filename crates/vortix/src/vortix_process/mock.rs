@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::vortix_core::ports::process::{
     CommandOutcome, CommandRunner as Trait, CommandSpec, DetachedHandle, ExitStatusInfo,
-    ProcessError,
+    ProcessCredentials, ProcessError,
 };
 
 /// What a recorded invocation looks like.
@@ -21,6 +21,11 @@ pub struct RecordedInvocation {
     pub program: String,
     pub args: Vec<String>,
     pub kind: crate::vortix_core::ports::process::Kind,
+    pub env: std::collections::HashMap<String, String>,
+    pub env_clear: bool,
+    pub run_as: Option<ProcessCredentials>,
+    pub terminate_process_group: bool,
+    pub redact_in_audit: Vec<usize>,
 }
 
 /// Matches a `CommandSpec` against expected criteria.
@@ -191,17 +196,27 @@ impl MockRunner {
                 stdout,
                 stderr,
                 exit_code,
-            } => Ok(CommandOutcome {
-                stdout,
-                stderr,
-                exit_status: ExitStatusInfo {
-                    code: Some(exit_code),
-                    signal: None,
-                    success: exit_code == 0,
-                },
-                duration: Duration::from_millis(1),
-                started_at: SystemTime::now(),
-            }),
+            } => {
+                if let Some(limit) = spec.output_limit {
+                    if stdout.len() > limit || stderr.len() > limit {
+                        return Err(ProcessError::OutputLimitExceeded {
+                            program: spec.program,
+                            limit,
+                        });
+                    }
+                }
+                Ok(CommandOutcome {
+                    stdout,
+                    stderr,
+                    exit_status: ExitStatusInfo {
+                        code: Some(exit_code),
+                        signal: None,
+                        success: exit_code == 0,
+                    },
+                    duration: Duration::from_millis(1),
+                    started_at: SystemTime::now(),
+                })
+            }
             ScriptedOutcome::Failure(stderr) => Err(ProcessError::NonZeroExit {
                 program: spec.program,
                 code: Some(1),
@@ -260,6 +275,11 @@ impl MockRunner {
             program: spec.program.clone(),
             args: spec.args.clone(),
             kind: spec.kind,
+            env: spec.env.clone(),
+            env_clear: spec.env_clear,
+            run_as: spec.run_as.clone(),
+            terminate_process_group: spec.terminate_process_group,
+            redact_in_audit: spec.redact_in_audit.clone(),
         });
 
         if inner.default_success {
@@ -355,6 +375,27 @@ mod tests {
             .run(CommandSpec::oneshot("wg-quick", vec!["up".into()]))
             .await;
         assert!(matches!(result, Err(ProcessError::NonZeroExit { .. })));
+    }
+
+    #[tokio::test]
+    async fn explicit_output_limit_rejects_oversized_capture() {
+        let runner = MockRunner::new();
+        runner.expect(
+            SpecMatcher::ExactProgram("wg".into()),
+            ScriptedOutcome::Success {
+                stdout: vec![b'x'; 17],
+                stderr: Vec::new(),
+                exit_code: 0,
+            },
+        );
+        // xtask:allow-protocol-leak: mock-runner bound test, not a real wg invocation
+        let result = runner
+            .run(CommandSpec::oneshot("wg", Vec::new()).output_limit(16))
+            .await;
+        assert!(matches!(
+            result,
+            Err(ProcessError::OutputLimitExceeded { limit: 16, .. })
+        ));
     }
 
     #[tokio::test]

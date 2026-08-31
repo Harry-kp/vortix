@@ -2,12 +2,11 @@
 //!
 //! The ruleset synthesiser now consumes a slice
 //! of [`ActiveTunnelInfo`] and emits per-tunnel allow rules in a single
-//! ruleset. The ruleset is fed to `pfctl -f -` via stdin, which performs
+//! ruleset. The ruleset is fed to Vortix's PF anchor via stdin, which performs
 //! an atomic in-kernel replace — so transitions from one active set to
 //! another (refresh) never go through `pfctl -F all` + `pfctl -d`, which
-//! would otherwise open a non-atomic leak window. `disable_blocking` is
-//! preserved unchanged for the explicit "killswitch off" path where the
-//! user actively disarms.
+//! would otherwise open a non-atomic leak window. Explicit release flushes
+//! only that anchor and never disables or clears the host's global PF state.
 
 use std::fmt::Write as FmtWrite;
 use std::fs;
@@ -30,6 +29,11 @@ use tracing::{debug, error, info};
 const PF_CONF_PATH: &str = "/var/run/vortix/killswitch.conf";
 /// Legacy pf configuration path cleaned up after migration.
 const PF_CONF_PATH_LEGACY: &str = "/tmp/vortix_killswitch.conf";
+/// macOS' stock pf.conf traverses the `com.apple/*` wildcard anchor. Keeping
+/// Vortix policy below that existing hook lets us own and replace only this
+/// anchor without rewriting the host's global ruleset.
+const PF_ANCHOR: &str = "com.apple/vortix.killswitch";
+const POLICY_LABEL_PREFIX: &str = "vortix-policy:";
 
 fn pfctl(args: &[&str]) -> std::io::Result<std::process::Output> {
     let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
@@ -38,15 +42,18 @@ fn pfctl(args: &[&str]) -> std::io::Result<std::process::Output> {
     )
 }
 
-/// Invoke `pfctl -f -` with the given ruleset on stdin. pfctl's stdin-load
+/// Invoke anchor-scoped `pfctl -f -` with the given ruleset on stdin.
 /// is atomic: the in-kernel ruleset is replaced in a single operation. No
 /// leak window — earlier rules stay live until the new set parses and
 /// commits.
 fn pfctl_load_stdin(ruleset: &[u8]) -> std::io::Result<std::process::Output> {
     crate::vortix_process::run_to_output(
-        CommandSpec::oneshot("pfctl", vec!["-f".to_string(), "-".to_string()])
-            .privilege(PrivilegeReq::Root)
-            .stdin(ruleset.to_vec()),
+        CommandSpec::oneshot(
+            "pfctl",
+            PfFirewall::apply_args().map(str::to_string).to_vec(),
+        )
+        .privilege(PrivilegeReq::Root)
+        .stdin(ruleset.to_vec()),
     )
 }
 
@@ -54,18 +61,46 @@ fn pfctl_load_stdin(ruleset: &[u8]) -> std::io::Result<std::process::Output> {
 pub struct PfFirewall;
 
 impl PfFirewall {
+    #[must_use]
+    const fn apply_args() -> [&'static str; 4] {
+        ["-a", PF_ANCHOR, "-f", "-"]
+    }
+
+    #[must_use]
+    const fn release_args() -> [&'static str; 4] {
+        ["-a", PF_ANCHOR, "-F", "rules"]
+    }
+
+    fn canonical_pf_rules(rules: &str) -> Vec<&str> {
+        rules
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect()
+    }
+
+    fn pf_snapshot_matches(expected: &str, observed: &str) -> bool {
+        let expected = Self::canonical_pf_rules(expected);
+        let observed = Self::canonical_pf_rules(observed);
+        expected.len() == observed.len()
+            && expected
+                .iter()
+                .zip(observed)
+                .all(|(expected, observed)| observed.starts_with(expected))
+    }
+
     /// Synthesise the pf ruleset for the given active tunnel set.
     ///
     /// Shape:
-    ///   1. `block out all` — default-deny egress
-    ///   2. `pass out quick on lo0` — loopback always allowed
-    ///   3. RFC1918 pass-out rules, with secondaries' declared CIDRs
+    ///   1. `pass out quick on lo0` — loopback always allowed
+    ///   2. RFC1918 pass-out rules, with secondaries' declared CIDRs
     ///      carved out so traffic claimed by a secondary cannot escape
     ///      onto the underlay
-    ///   4. DHCP pass rules
-    ///   5. Per-tunnel: `pass out quick on <interface>` + one
+    ///   3. DHCP pass rules
+    ///   4. Per-tunnel: `pass out quick on <interface>` + one
     ///      `pass out quick to <server_ip>` per server IP, so the tunnel
     ///      can reconnect after a transport drop
+    ///   5. A terminal `block drop out quick all` carrying the policy digest
     ///
     /// An empty `active` slice yields rules 1-4 only — the base block-all
     /// posture with no per-tunnel egress.
@@ -74,9 +109,6 @@ impl PfFirewall {
         let mut rules = String::new();
         writeln!(rules, "# Vortix Kill Switch Rules - Auto-generated").unwrap();
         writeln!(rules, "# DO NOT EDIT - Will be overwritten").unwrap();
-        writeln!(rules).unwrap();
-        writeln!(rules, "# Default: block all egress").unwrap();
-        writeln!(rules, "block out all").unwrap();
         writeln!(rules).unwrap();
         writeln!(rules, "# Allow loopback").unwrap();
         writeln!(rules, "pass out quick on lo0 all").unwrap();
@@ -131,6 +163,18 @@ impl PfFirewall {
             }
         }
 
+        // PF evaluates the last matching rule. All allow exceptions must
+        // precede a terminal quick block so later root rules cannot override
+        // the Vortix anchor, while the block cannot shadow our own allows.
+        let digest = crate::core::killswitch::policy_digest(active);
+        writeln!(rules).unwrap();
+        writeln!(rules, "# Default: block all remaining egress").unwrap();
+        writeln!(
+            rules,
+            "block drop out quick all label \"{POLICY_LABEL_PREFIX}{digest}\""
+        )
+        .unwrap();
+
         rules
     }
 
@@ -175,7 +219,7 @@ fn fmt_ip(ip: &IpAddr) -> String {
 
 impl Killswitch for PfFirewall {
     /// Engage the killswitch with a ruleset covering every tunnel in
-    /// `active`. The ruleset is loaded via `pfctl -f -` (stdin), which
+    /// `active`. The ruleset is loaded into the Vortix anchor via stdin, which
     /// performs an atomic in-kernel replace — both fresh enable and
     /// refresh-with-different-active-set go through this single path, so
     /// there's never a window where the previous rules are gone but the
@@ -196,6 +240,21 @@ impl Killswitch for PfFirewall {
             return Err(KillswitchError::NotRoot);
         }
 
+        crate::core::killswitch::validate_policy(active)?;
+
+        // Preflight traversal before loading an anchor or enabling PF. A
+        // populated but inert anchor must not mutate global PF state.
+        let output = pfctl(&["-sr"])?;
+        let root_rules = String::from_utf8_lossy(&output.stdout);
+        if !output.status.success()
+            || (!root_rules.contains("anchor \"com.apple/*\"")
+                && !root_rules.contains(&format!("anchor \"{PF_ANCHOR}\"")))
+        {
+            return Err(KillswitchError::CommandFailed(
+                "root pf ruleset does not traverse the Vortix anchor".to_string(),
+            ));
+        }
+
         let rules = Self::generate_pf_rules(active);
 
         // Diagnostic snapshot — best-effort, never gates the engage.
@@ -207,7 +266,7 @@ impl Killswitch for PfFirewall {
             "loading pf ruleset via stdin"
         );
 
-        // Authoritative path: pfctl -f - reads ruleset from stdin and
+        // Authoritative path: anchor-scoped pfctl reads ruleset from stdin and
         // atomically replaces the in-kernel rules. If parsing fails the
         // prior ruleset stays in force.
         let output = pfctl_load_stdin(rules.as_bytes())?;
@@ -228,6 +287,21 @@ impl Killswitch for PfFirewall {
             }
         }
 
+        let output = pfctl(&["-a", PF_ANCHOR, "-sr"])?;
+        let snapshot = String::from_utf8_lossy(&output.stdout);
+        let digest = crate::core::killswitch::policy_digest(active);
+        let terminal = format!("block drop out quick all label \"{POLICY_LABEL_PREFIX}{digest}\"");
+        if !output.status.success()
+            || !Self::pf_snapshot_matches(&rules, &snapshot)
+            || !Self::canonical_pf_rules(&snapshot)
+                .last()
+                .is_some_and(|line| line.starts_with(&terminal))
+        {
+            return Err(KillswitchError::CommandFailed(
+                "pf anchor read-back did not match the requested policy".to_string(),
+            ));
+        }
+
         info!(
             target: "vortix::killswitch",
             tunnels = active.len(),
@@ -236,10 +310,9 @@ impl Killswitch for PfFirewall {
         Ok(())
     }
 
-    /// Disable the killswitch entirely — flush all rules and turn pf off.
-    /// This is the explicit "killswitch off" path; refresh between two
-    /// active sets goes through `enable_blocking_multi` directly so it
-    /// never visits the non-atomic flush+disable sequence here.
+    /// Disable only Vortix's anchor. pf may have been enabled before Vortix
+    /// and may protect unrelated host policy, so global flush/disable is
+    /// never an owned operation.
     fn disable_blocking() -> Result<()> {
         info!(target: "vortix::killswitch", "disabling kill switch");
 
@@ -248,16 +321,27 @@ impl Killswitch for PfFirewall {
             return Err(KillswitchError::NotRoot);
         }
 
-        let output = pfctl(&["-F", "all"])?;
+        let output = pfctl(&Self::release_args())?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            if !stderr.contains("not enabled") {
-                error!(target: "vortix::killswitch", stderr = %stderr, "pfctl -F failed");
+            if !stderr.contains("not enabled") && !stderr.contains("does not exist") {
+                error!(target: "vortix::killswitch", stderr = %stderr, "pf anchor flush failed");
                 return Err(KillswitchError::CommandFailed(stderr.to_string()));
             }
         }
 
-        let _ = pfctl(&["-d"])?;
+        let output = pfctl(&["-a", PF_ANCHOR, "-sr"])?;
+        if !output.status.success() {
+            return Err(KillswitchError::CommandFailed(format!(
+                "pf anchor read-back failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+        if !String::from_utf8_lossy(&output.stdout).trim().is_empty() {
+            return Err(KillswitchError::CommandFailed(
+                "pf anchor read-back still contains Vortix rules".to_string(),
+            ));
+        }
         let _ = fs::remove_file(PF_CONF_PATH);
         let _ = fs::remove_file(PF_CONF_PATH_LEGACY);
 
@@ -294,10 +378,32 @@ mod tests {
         }
     }
 
+    fn without_policy_label(rules: &str) -> String {
+        let mut normalized = rules
+            .lines()
+            .map(|line| {
+                if line.starts_with("block drop out quick all label ") {
+                    "block drop out quick all"
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        normalized.push('\n');
+        normalized
+    }
+
+    #[test]
+    fn pf_mutations_are_scoped_to_the_vortix_anchor() {
+        assert_eq!(PfFirewall::apply_args(), ["-a", PF_ANCHOR, "-f", "-"]);
+        assert_eq!(PfFirewall::release_args(), ["-a", PF_ANCHOR, "-F", "rules"]);
+    }
+
     #[test]
     fn empty_active_set_yields_base_blockall() {
         let rules = PfFirewall::generate_pf_rules(&[]);
-        assert!(rules.contains("block out all"));
+        assert!(rules.contains("block drop out quick all"));
         assert!(rules.contains("pass out quick on lo0"));
         // Full RFC1918 base intact.
         assert!(rules.contains("pass out quick to 10.0.0.0/8"));
@@ -415,16 +521,31 @@ mod tests {
         assert!(rules.contains("pass out quick to 2001:db8::1"));
     }
 
+    #[test]
+    fn terminal_quick_block_follows_every_allow_rule() {
+        let t = tunnel("utun3", &["1.2.3.4"], &["0.0.0.0/0"], true);
+        let rules = PfFirewall::generate_pf_rules(&[t]);
+        let last = rules
+            .lines()
+            .filter(|line| !line.is_empty())
+            .next_back()
+            .unwrap();
+        assert!(last.starts_with("block drop out quick all label \"vortix-policy:"));
+        assert!(rules.find("pass out quick on utun3").unwrap() < rules.find(last).unwrap());
+        let missing_allow = rules.replace("pass out quick on utun3 all\n", "");
+        assert_ne!(
+            PfFirewall::canonical_pf_rules(&missing_allow),
+            PfFirewall::canonical_pf_rules(&rules)
+        );
+    }
+
     /// Snapshot — empty active set. Pins the base block-all ruleset.
     #[test]
     fn snapshot_empty_active_set() {
-        let rules = PfFirewall::generate_pf_rules(&[]);
+        let rules = without_policy_label(&PfFirewall::generate_pf_rules(&[]));
         let expected = "\
 # Vortix Kill Switch Rules - Auto-generated
 # DO NOT EDIT - Will be overwritten
-
-# Default: block all egress
-block out all
 
 # Allow loopback
 pass out quick on lo0 all
@@ -437,6 +558,9 @@ pass out quick to 192.168.0.0/16
 # Allow DHCP
 pass out quick proto udp from any port 68 to any port 67
 pass in quick proto udp from any port 67 to any port 68
+
+# Default: block all remaining egress
+block drop out quick all
 ";
         assert_eq!(rules, expected);
     }
@@ -450,13 +574,10 @@ pass in quick proto udp from any port 67 to any port 68
             declared_cidrs: vec![cidr("0.0.0.0/0")],
             is_primary: true,
         };
-        let rules = PfFirewall::generate_pf_rules(&[t]);
+        let rules = without_policy_label(&PfFirewall::generate_pf_rules(&[t]));
         let expected = "\
 # Vortix Kill Switch Rules - Auto-generated
 # DO NOT EDIT - Will be overwritten
-
-# Default: block all egress
-block out all
 
 # Allow loopback
 pass out quick on lo0 all
@@ -473,6 +594,9 @@ pass in quick proto udp from any port 67 to any port 68
 # Tunnel: utun3 (primary=true)
 pass out quick on utun3 all
 pass out quick to 1.2.3.4
+
+# Default: block all remaining egress
+block drop out quick all
 ";
         assert_eq!(rules, expected);
     }
@@ -492,13 +616,10 @@ pass out quick to 1.2.3.4
             declared_cidrs: vec![cidr("10.0.0.0/8")],
             is_primary: false,
         };
-        let rules = PfFirewall::generate_pf_rules(&[prim, sec]);
+        let rules = without_policy_label(&PfFirewall::generate_pf_rules(&[prim, sec]));
         let expected = "\
 # Vortix Kill Switch Rules - Auto-generated
 # DO NOT EDIT - Will be overwritten
-
-# Default: block all egress
-block out all
 
 # Allow loopback
 pass out quick on lo0 all
@@ -518,6 +639,9 @@ pass out quick to 1.2.3.4
 # Tunnel: utun4 (primary=false)
 pass out quick on utun4 all
 pass out quick to 5.6.7.8
+
+# Default: block all remaining egress
+block drop out quick all
 ";
         assert_eq!(rules, expected);
     }

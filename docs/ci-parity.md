@@ -2,6 +2,8 @@
 
 Single source of truth for "what CI runs". Run this exact set before pushing to avoid the *"green locally, red in CI"* trap. Authoritative reference is the workflow files under `.github/workflows/`; update both together.
 
+Pull-request workflows intentionally do not filter on a base branch. This gives stacked PRs targeting their immediate parent the same checks as PRs targeting `main`; only `push` workflows remain restricted to `main`.
+
 ## Doc-only PR convention
 
 PRs that only touch `**/*.md`, `LICENSE`, or `CHANGELOG.md` skip every heavy CI workflow (`test.yml`, `lint.yml`, `boundary.yml`, `security.yml`, `integration-tests.yml`). The result: a doc-only PR shows no green check rows except `Release / plan` (cargo-dist-owned, fires on every PR). This is intentional — the saving is real CI minutes; the cost is that a reviewer sees an "empty" check list and has to trust the rule.
@@ -31,6 +33,7 @@ cargo xtask check-subprocess
 cargo xtask check-platform-leak
 cargo xtask check-protocol-leak
 cargo xtask check-no-shell-regressions
+cargo xtask check-control-boundaries
 ```
 
 ## Common traps
@@ -81,7 +84,7 @@ cargo fmt --all -- --check
 
 ### Trap 5 — Forgetting the boundary checks
 
-`cargo xtask check-{subprocess,platform,protocol}-leak` enforce architectural boundaries (no platform imports from `vortix_core`, no protocol imports from `vortix_platform_*`, etc.). They are NOT part of `cargo test`. CI runs them as separate jobs (plans 002 / 003 / 004).
+`cargo xtask check-{subprocess,platform,protocol}-leak`, `check-no-shell-regressions`, and `check-control-boundaries` enforce architectural boundaries (no platform imports from `vortix_core`, no protocol imports from `vortix_platform_*`, no new client-side mutation imports, seed/mirror writers, misplaced root requests, or unbounded production channels). They are NOT part of `cargo test`. CI runs them as separate jobs.
 
 ## When to run what
 

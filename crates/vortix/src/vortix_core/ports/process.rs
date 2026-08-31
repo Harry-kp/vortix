@@ -5,11 +5,16 @@
 //!
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
+use std::fs::File;
+use std::io::Read as _;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use crate::vortix_core::profile::ProfileId;
 
 /// What privilege level a `CommandSpec` requires.
 ///
@@ -38,6 +43,18 @@ pub enum Kind {
     DetachedSpawn,
 }
 
+/// Explicit non-root identity for an owner-run subprocess.
+///
+/// Supplying this never grants privilege: a non-root caller may name only
+/// its current identity, while a root caller must drop all three credential
+/// sets before `exec`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessCredentials {
+    pub uid: u32,
+    pub gid: u32,
+    pub supplementary_groups: Vec<u32>,
+}
+
 /// The full specification of a subprocess invocation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandSpec {
@@ -50,6 +67,10 @@ pub struct CommandSpec {
     pub cwd: Option<PathBuf>,
     pub stdin_bytes: Option<Vec<u8>>,
     pub timeout: Option<Duration>,
+    /// Maximum bytes retained from each captured output stream. The runner
+    /// continues draining the child after the limit so a noisy process cannot
+    /// deadlock on a full pipe, then returns a typed overflow error.
+    pub output_limit: Option<usize>,
     pub requires_privilege: PrivilegeReq,
     pub kind: Kind,
     /// Arg indices to redact in `tracing` audit logs. Used by callers that pass
@@ -71,6 +92,13 @@ pub struct CommandSpec {
     /// EOFs. Callers using `daemonizes` are responsible for surfacing errors
     /// via an alternate channel (e.g., the daemon's own `--log` file).
     pub daemonizes: bool,
+    /// Verified non-root credentials applied before `exec`.
+    #[serde(default)]
+    pub run_as: Option<ProcessCredentials>,
+    /// Put the child in a new process group and contain descendants on
+    /// timeout/cancellation. Required for lifecycle hooks.
+    #[serde(default)]
+    pub terminate_process_group: bool,
 }
 
 impl CommandSpec {
@@ -84,10 +112,13 @@ impl CommandSpec {
             cwd: None,
             stdin_bytes: None,
             timeout: None,
+            output_limit: None,
             requires_privilege: PrivilegeReq::None,
             kind: Kind::OneShot,
             redact_in_audit: Vec::new(),
             daemonizes: false,
+            run_as: None,
+            terminate_process_group: false,
         }
     }
 
@@ -113,6 +144,13 @@ impl CommandSpec {
         self
     }
 
+    /// Builder: bound each captured stdout/stderr stream.
+    #[must_use]
+    pub fn output_limit(mut self, bytes: usize) -> Self {
+        self.output_limit = Some(bytes);
+        self
+    }
+
     /// Builder: feed stdin bytes.
     #[must_use]
     pub fn stdin(mut self, bytes: Vec<u8>) -> Self {
@@ -135,6 +173,20 @@ impl CommandSpec {
     #[must_use]
     pub fn daemonizes(mut self) -> Self {
         self.daemonizes = true;
+        self
+    }
+
+    /// Builder: execute under an already-verified non-root identity.
+    #[must_use]
+    pub fn run_as(mut self, credentials: ProcessCredentials) -> Self {
+        self.run_as = Some(credentials);
+        self
+    }
+
+    /// Builder: contain the child and descendants in a dedicated process group.
+    #[must_use]
+    pub fn contain_process_group(mut self) -> Self {
+        self.terminate_process_group = true;
         self
     }
 }
@@ -184,6 +236,107 @@ pub struct DetachedHandle {
     pub spawned_at: SystemTime,
 }
 
+/// Kernel-observed identity for one live process. The start token prevents PID
+/// reuse from authenticating a later process; group leadership proves the PID
+/// names the private containment group rather than an arbitrary member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KernelProcessIdentity {
+    start_token: u64,
+    process_group_leader: bool,
+}
+
+impl KernelProcessIdentity {
+    pub(crate) const fn new(start_token: u64, process_group_leader: bool) -> Option<Self> {
+        if start_token == 0 {
+            None
+        } else {
+            Some(Self {
+                start_token,
+                process_group_leader,
+            })
+        }
+    }
+
+    #[must_use]
+    pub const fn start_token(self) -> u64 {
+        self.start_token
+    }
+
+    #[must_use]
+    pub const fn is_process_group_leader(self) -> bool {
+        self.process_group_leader
+    }
+}
+
+/// Stable ownership key for a foreground protocol child.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ManagedProcessId {
+    pub profile_id: ProfileId,
+    /// Non-zero per-attempt generation. It is useful for diagnostics, but is
+    /// never accepted as authentication on its own.
+    pub generation: u64,
+    /// Cryptographically opaque ownership capability. A stale handle cannot
+    /// address a later child for the same stable profile identity.
+    pub ownership_token: String,
+}
+
+impl ManagedProcessId {
+    /// Allocate an identity before spawning the child so every cleanup path,
+    /// including partial startup, is bound to the exact attempt.
+    pub fn generate(profile_id: ProfileId) -> std::io::Result<Self> {
+        let mut bytes = [0_u8; 32];
+        File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+        let mut ownership_token = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            let _ = write!(ownership_token, "{byte:02x}");
+        }
+        let generation =
+            u64::from_be_bytes(bytes[..8].try_into().expect("fixed-size prefix")).max(1);
+        Ok(Self {
+            profile_id,
+            generation,
+            ownership_token,
+        })
+    }
+
+    #[must_use]
+    pub fn has_valid_token(&self) -> bool {
+        self.generation != 0
+            && self.ownership_token.len() == 64
+            && self
+                .ownership_token
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+}
+
+/// Child ownership receipt. It contains no command arguments or credentials.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessOwnership {
+    pub identity: ManagedProcessId,
+    pub pid: u32,
+}
+
+/// Process-lifecycle port used by the Standard-mode custodian. Protocol
+/// adapters build the command specification; only the process layer spawns,
+/// signals, waits for, and reaps the child.
+pub trait ProcessLifecycle: Send + 'static {
+    fn spawn_foreground(
+        &mut self,
+        identity: ManagedProcessId,
+        spec: CommandSpec,
+    ) -> Result<ProcessOwnership, ProcessError>;
+    fn is_alive(&mut self, identity: &ManagedProcessId) -> Result<bool, ProcessError>;
+    fn graceful_stop(&mut self, identity: &ManagedProcessId) -> Result<(), ProcessError>;
+    fn wait_for_exit(
+        &mut self,
+        identity: &ManagedProcessId,
+        timeout: Duration,
+    ) -> Result<bool, ProcessError>;
+    fn force_kill(&mut self, identity: &ManagedProcessId) -> Result<(), ProcessError>;
+    fn reap(&mut self, identity: &ManagedProcessId) -> Result<(), ProcessError>;
+}
+
 /// What failed when invoking a subprocess.
 ///
 /// Each variant carries enough context to populate the JSON envelope's `next_actions`
@@ -193,12 +346,18 @@ pub enum ProcessError {
     /// The spec required root but the running uid is not zero.
     #[error("subprocess `{program}` requires root but current uid is not 0")]
     PrivilegeDenied { program: String },
+    /// Requested credential transition is unsafe or unavailable.
+    #[error("subprocess `{program}` has invalid owner credentials: {reason}")]
+    InvalidCredentials { program: String, reason: String },
     /// The program could not be found on PATH (`exec` returned ENOENT).
     #[error("subprocess `{program}` not found on PATH")]
     ProgramNotFound { program: String },
     /// The subprocess did not complete within the configured timeout.
     #[error("subprocess `{program}` timed out after {duration:?}")]
     Timeout { program: String, duration: Duration },
+    /// A captured stream exceeded the caller's explicit memory bound.
+    #[error("subprocess `{program}` output exceeded {limit} bytes")]
+    OutputLimitExceeded { program: String, limit: usize },
     /// The subprocess exited non-zero.
     #[error("subprocess `{program}` exited with code {code:?}")]
     NonZeroExit {

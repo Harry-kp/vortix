@@ -13,6 +13,9 @@
 //! a process-spawn integration layer; deferred to a follow-up unit.
 //!
 
+#[path = "support/control_scenarios.rs"]
+mod control_scenarios;
+
 use serde::Serialize;
 use vortix::cli::output::{CliResponse, ConnectionEntry, SCHEMA_VERSION};
 
@@ -41,6 +44,8 @@ fn make_connection_entry(profile: &str, protocol: &str) -> ConnectionEntry {
         profile: Some(profile.into()),
         protocol: Some(protocol.into()),
         uptime_secs: Some(120),
+        health: None,
+        generation: None,
     }
 }
 
@@ -189,4 +194,26 @@ fn json_v2_envelope_optional_fields_skip_when_none() {
         !json.contains("\"error\":"),
         "CliResponse.error should skip when None; got: {json}"
     );
+}
+
+#[test]
+fn every_shared_json_scenario_uses_the_v2_envelope() {
+    use control_scenarios::{OutputSurface, CONTROL_SCENARIOS};
+
+    for scenario in CONTROL_SCENARIOS.iter().filter(|scenario| {
+        matches!(
+            scenario.output,
+            OutputSurface::Json | OutputSurface::JsonWatch
+        )
+    }) {
+        let response = CliResponse::success(scenario.command, serde_json::json!({}), vec![]);
+        let value = serde_json::to_value(response).unwrap();
+        assert_eq!(value["schema_version"], 2, "{} schema drift", scenario.id);
+        assert_eq!(
+            value["command"], scenario.command,
+            "{} command drift",
+            scenario.id
+        );
+        assert_eq!(value["ok"], true, "{} success drift", scenario.id);
+    }
 }

@@ -7,6 +7,13 @@ use vortix::{cli, config, constants, event, ui};
 
 #[allow(clippy::too_many_lines)] // main() carries the whole bootstrap sequence
 fn main() -> Result<()> {
+    // Private Standard-mode lifecycle actor. Handle this before error hooks,
+    // configuration migration, argument parsing, or any user-facing startup
+    // work: the custodian has exactly one child and only status/stop IPC.
+    if let Some(exit_code) = vortix::vortix_process::custodian::maybe_run_hidden_entrypoint() {
+        std::process::exit(exit_code);
+    }
+
     // Initialize error handling first — color_eyre::install() sets its own
     // panic hook, so we must call it before installing ours.
     color_eyre::install()?;
@@ -21,43 +28,6 @@ fn main() -> Result<()> {
     // consumers reach for `crate::platform::current_platform()` instead of
     // branching on `cfg(target_os)`.
     vortix::platform::set_global_platform(vortix::platform::Platform::detect_current());
-
-    // Settings — figment-layered: defaults → user file →
-    // VORTIX_* env. CLI overrides currently bypass settings.
-    let settings = match vortix::vortix_config::Settings::load() {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("warning: failed to load settings ({e}); using defaults");
-            vortix::vortix_config::Settings::default()
-        }
-    };
-
-    // Journal — open the per-session JSONL writer using
-    // the runner's own tokio runtime (writer task is spawn'd on it). We
-    // borrow the runtime via Handle so the Journal stays alive after main()
-    // exits to the TUI loop.
-    let runtime_handle = vortix::vortix_process::global_runner()
-        .as_real()
-        .map(|r| r.runtime().handle().clone());
-    if let Some(handle) = runtime_handle.clone() {
-        let _guard = handle.enter();
-        match vortix::vortix_core::journal::Journal::open(
-            vortix::vortix_core::journal::JournalConfig {
-                disk: settings.journal.disk,
-                retention_days: settings.journal.retention_days,
-                retention_count: settings.journal.retention_count,
-                ..Default::default()
-            },
-        ) {
-            Ok(journal) => {
-                vortix::vortix_core::journal::set_global_journal(journal);
-            }
-            Err(e) => {
-                eprintln!("warning: failed to open journal ({e}); diagnostics will be limited");
-            }
-        }
-    }
-    let _ = runtime_handle; // suppress unused warning when no real runner installed
 
     // Now capture color_eyre's hook and wrap it with terminal restoration
     // and recovery instructions. Drop glue on App will still run to release
@@ -114,6 +84,43 @@ fn main() -> Result<()> {
     // Store the resolved config dir globally so all utility functions use it
     config::set_config_dir(config_dir.clone());
 
+    // Settings use the same authoritative directory as profiles and
+    // config.toml. Resolve this only after clap/env/sudo-user selection so an
+    // old default-path settings file can never silently override
+    // `--config-dir` or `VORTIX_CONFIG_DIR`.
+    let settings = match vortix::vortix_config::Settings::load_from_config_dir(&config_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("warning: failed to load settings ({e}); using defaults");
+            vortix::vortix_config::Settings::default()
+        }
+    };
+
+    // Journal — open the per-session JSONL writer using the runner's own
+    // tokio runtime after the authoritative settings path is known.
+    let runtime_handle = vortix::vortix_process::global_runner()
+        .as_real()
+        .map(|r| r.runtime().handle().clone());
+    if let Some(handle) = runtime_handle.clone() {
+        let _guard = handle.enter();
+        match vortix::vortix_core::journal::Journal::open(
+            vortix::vortix_core::journal::JournalConfig {
+                disk: settings.journal.disk,
+                retention_days: settings.journal.retention_days,
+                retention_count: settings.journal.retention_count,
+                ..Default::default()
+            },
+        ) {
+            Ok(journal) => {
+                vortix::vortix_core::journal::set_global_journal(journal);
+            }
+            Err(e) => {
+                eprintln!("warning: failed to open journal ({e}); diagnostics will be limited");
+            }
+        }
+    }
+    let _ = runtime_handle;
+
     // Clear any SCRV1 envelopes left on
     // disk by a previous crash mid-connect. Runs once at startup before
     // the CLI/TUI fork so both paths see a clean auth dir. Cheap O(N)
@@ -136,8 +143,11 @@ fn main() -> Result<()> {
 
     // backfill profile sidecars for `.conf` / `.ovpn` files
     // imported before the sidecar scheme existed. Idempotent — no-ops once
-    // every profile has a `.meta.toml`. Failures are logged + non-fatal:
-    // startup MUST never abort because of migration trouble.
+    // every profile has a `.meta.toml`. The first canonical migration records
+    // config-less sidecars left by legacy delete paths in its durable inventory,
+    // archives those exact bytes, then marks the phase complete. Interrupted
+    // archival resumes from that record. Identity ambiguity is still fatal
+    // before any lifecycle path starts.
     //
     // VORTIX_SKIP_MIGRATION=<anything> bypasses the startup backfill for
     // users who need to disable it (see docs/MIGRATION.md).
@@ -153,17 +163,23 @@ fn main() -> Result<()> {
                         stats.created
                     );
                 }
+                if stats.archived_legacy_sidecars > 0 {
+                    eprintln!(
+                        "Archived {} stale legacy profile metadata file(s) under profiles/.vortix-legacy-sidecars-v1.",
+                        stats.archived_legacy_sidecars
+                    );
+                }
                 if stats.failed > 0 {
                     eprintln!(
-                        "Warning: {} profile(s) failed to migrate; existing files untouched. Run `vortix migrate` to retry.",
+                        "Warning: {} profile(s) failed to migrate; existing files untouched. Repair the profile files and restart vortix to retry.",
                         stats.failed
                     );
                 }
             }
             Err(e) => {
-                eprintln!(
-                    "Warning: profile sidecar migration skipped — {e}. Startup continues; run `vortix migrate` once the issue is resolved."
-                );
+                return Err(color_eyre::eyre::eyre!(
+                    "profile identity migration refused startup: {e}. Restore the managed profile directory to its saved inventory before managing tunnels; add new profiles from outside that directory with `vortix import <path>`"
+                ));
             }
         }
     }
@@ -197,7 +213,7 @@ fn main() -> Result<()> {
     }
 
     // Load config.toml (or use defaults)
-    let app_config = match config::load_config(&config_dir) {
+    let app_config = match config::load_effective_config(&config_dir) {
         Ok(cfg) => cfg,
         Err(e) => {
             eprintln!("Error: {e}");

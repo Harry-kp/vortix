@@ -8,6 +8,8 @@
 //! Phase B daemon work (idea 4) adds a `Remote(RemoteHandle)` variant
 //! additively (the enum is `#[non_exhaustive]`).
 
+use std::sync::{Arc, RwLock};
+
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::vortix_core::engine::error::EngineError;
@@ -27,9 +29,6 @@ enum Envelope {
     Input {
         input: Input,
         reply: oneshot::Sender<Result<CommandAck, EngineError>>,
-    },
-    Snapshot {
-        reply: oneshot::Sender<Snapshot>,
     },
 }
 
@@ -63,6 +62,7 @@ pub struct EngineSubscription {
 pub struct LocalHandle {
     command_tx: mpsc::Sender<Envelope>,
     journal: Journal,
+    state: Arc<RwLock<Connection>>,
 }
 
 impl std::fmt::Debug for LocalHandle {
@@ -85,10 +85,15 @@ impl EngineHandle {
     pub fn local<T: Tunnel + Send + 'static>(engine: Engine<T>, journal: Journal) -> Self {
         let (tx, rx) = mpsc::channel::<Envelope>(64);
         let journal_for_actor = journal.clone();
-        tokio::task::spawn_blocking(move || actor_loop(engine, journal_for_actor, rx));
+        let state = Arc::new(RwLock::new(engine.state().clone()));
+        let state_for_actor = Arc::clone(&state);
+        tokio::task::spawn_blocking(move || {
+            actor_loop(engine, journal_for_actor, state_for_actor, rx);
+        });
         Self::Local(LocalHandle {
             command_tx: tx,
             journal,
+            state,
         })
     }
 
@@ -118,9 +123,10 @@ impl EngineHandle {
     /// # Errors
     ///
     /// Returns [`EngineError::Other`] when the actor task has terminated.
+    #[allow(clippy::unused_async)] // public shape stays async for the future remote handle
     pub async fn snapshot(&self) -> Result<Snapshot, EngineError> {
         match self {
-            Self::Local(h) => h.snapshot().await,
+            Self::Local(h) => h.snapshot(),
         }
     }
 
@@ -131,9 +137,10 @@ impl EngineHandle {
     /// # Errors
     ///
     /// Returns [`EngineError::Other`] when the actor task has terminated.
+    #[allow(clippy::unused_async)] // public shape stays async for the future remote handle
     pub async fn subscribe(&self) -> Result<EngineSubscription, EngineError> {
         match self {
-            Self::Local(h) => h.subscribe().await,
+            Self::Local(h) => h.subscribe(),
         }
     }
 
@@ -163,22 +170,22 @@ impl LocalHandle {
             .map_err(|_| EngineError::Other("engine actor dropped reply".into()))?
     }
 
-    async fn snapshot(&self) -> Result<Snapshot, EngineError> {
-        let (reply, rx) = oneshot::channel();
-        self.command_tx
-            .send(Envelope::Snapshot { reply })
-            .await
-            .map_err(|_| EngineError::Other("engine actor terminated".into()))?;
-        rx.await
-            .map_err(|_| EngineError::Other("engine actor dropped reply".into()))
+    fn snapshot(&self) -> Result<Snapshot, EngineError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| EngineError::Other("engine state snapshot poisoned".into()))?
+            .clone();
+        Ok(Snapshot {
+            state,
+            journal_tail: self.journal.tail(),
+        })
     }
 
-    async fn subscribe(&self) -> Result<EngineSubscription, EngineError> {
-        let snapshot = self.snapshot().await?;
-        Ok(EngineSubscription {
-            snapshot,
-            receiver: self.journal.subscribe(),
-        })
+    fn subscribe(&self) -> Result<EngineSubscription, EngineError> {
+        let receiver = self.journal.subscribe();
+        let snapshot = self.snapshot()?;
+        Ok(EngineSubscription { snapshot, receiver })
     }
 
     /// Build a fully-mocked handle for tests. The actor is spawned on the
@@ -211,10 +218,15 @@ impl LocalHandle {
 
         let (tx, rx) = mpsc::channel::<Envelope>(64);
         let journal_for_actor = journal.clone();
-        tokio::task::spawn_blocking(move || actor_loop(engine, journal_for_actor, rx));
+        let state = Arc::new(RwLock::new(engine.state().clone()));
+        let state_for_actor = Arc::clone(&state);
+        tokio::task::spawn_blocking(move || {
+            actor_loop(engine, journal_for_actor, state_for_actor, rx);
+        });
         Self {
             command_tx: tx,
             journal,
+            state,
         }
     }
 }
@@ -227,6 +239,7 @@ impl LocalHandle {
 fn actor_loop<T: Tunnel>(
     mut engine: Engine<T>,
     journal: Journal,
+    state: Arc<RwLock<Connection>>,
     mut rx: mpsc::Receiver<Envelope>,
 ) {
     // Blocking loop — runs on a tokio blocking thread. The FSM is sync, so
@@ -235,22 +248,27 @@ fn actor_loop<T: Tunnel>(
     while let Some(env) = rx.blocking_recv() {
         match env {
             Envelope::Input { input, reply } => {
-                let events = engine.handle(input);
+                let mut published = 0;
+                let events = engine.handle_with_transition_observer(input, |connection, events| {
+                    if let Ok(mut current) = state.write() {
+                        current.clone_from(connection);
+                    }
+                    for event in events.iter().skip(published) {
+                        let _ = journal.append(event.clone());
+                    }
+                    published = events.len();
+                });
                 let count = events.len();
                 // Best-effort journal append — failures are non-fatal.
-                for ev in events {
+                for ev in events.into_iter().skip(published) {
                     let _ = journal.append(ev);
+                }
+                if let Ok(mut current) = state.write() {
+                    current.clone_from(engine.state());
                 }
                 let _ = reply.send(Ok(CommandAck {
                     events_emitted: count,
                 }));
-            }
-            Envelope::Snapshot { reply } => {
-                let snapshot = Snapshot {
-                    state: engine.state().clone(),
-                    journal_tail: journal.tail(),
-                };
-                let _ = reply.send(snapshot);
             }
         }
     }
@@ -289,5 +307,52 @@ mod tests {
         ));
         // Receiver is alive (no events yet).
         let _ = sub.receiver;
+    }
+
+    #[tokio::test]
+    async fn snapshot_publishes_connecting_while_protocol_effect_is_running() {
+        use crate::vortix_core::ports::tunnel::mock::{MockTunnel, ScriptedTunnelOutcome};
+        use crate::vortix_core::profile::{Profile, ProtocolKind};
+
+        let tunnel = MockTunnel::new();
+        tunnel.script_up(ScriptedTunnelOutcome::DelayedSuccess(
+            std::time::Duration::from_millis(200),
+        ));
+        let journal = Journal::open(crate::vortix_core::journal::JournalConfig {
+            disk: false,
+            ..Default::default()
+        })
+        .unwrap();
+        let engine = Engine::new(tunnel, |id: &ProfileId| {
+            Some(Profile::new(
+                id.clone(),
+                id.as_str(),
+                ProtocolKind::WireGuard,
+                std::path::PathBuf::from("/tmp/corp.conf"),
+            ))
+        });
+        let handle = EngineHandle::local(engine, journal);
+        let connect = {
+            let handle = handle.clone();
+            tokio::spawn(async move {
+                handle
+                    .execute_command(UserCommand::Connect {
+                        profile_id: ProfileId::new("corp"),
+                    })
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        let snapshot = handle.snapshot().await.unwrap();
+        assert!(matches!(snapshot.state, Connection::Connecting { .. }));
+        assert!(snapshot.journal_tail.iter().any(|envelope| matches!(
+            envelope.event,
+            crate::vortix_core::control::model::ControlEvent::ConnectAttemptStarted { .. }
+        )));
+        connect.await.unwrap().unwrap();
+        assert!(matches!(
+            handle.snapshot().await.unwrap().state,
+            Connection::Connected { .. }
+        ));
     }
 }

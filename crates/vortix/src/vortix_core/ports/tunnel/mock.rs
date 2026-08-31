@@ -24,6 +24,8 @@ pub enum ScriptedTunnelOutcome {
         interface_name: String,
         pid: Option<u32>,
     },
+    /// Sleep before returning a successful handle (actor responsiveness tests).
+    DelayedSuccess(Duration),
     /// Fail with the given error message (mapped to `TunnelError::Subprocess`).
     Failure(String),
     /// Fail with `TunnelError::HandshakeFailed`.
@@ -40,6 +42,7 @@ struct MockState {
     next_down: Option<ScriptedTunnelOutcome>,
     next_status: Option<ScriptedTunnelOutcome>,
     last_handle: Option<TunnelHandle>,
+    status_peers: Vec<super::TunnelPeerStatus>,
 }
 
 /// Scriptable mock implementation of [`Tunnel`].
@@ -89,6 +92,11 @@ impl MockTunnel {
         self.state.lock().unwrap().next_status = Some(outcome);
     }
 
+    /// Set typed peer observations returned by subsequent status calls.
+    pub fn script_status_peers(&self, peers: Vec<super::TunnelPeerStatus>) {
+        self.state.lock().unwrap().status_peers = peers;
+    }
+
     /// Override the capabilities this mock reports.
     pub fn set_capabilities(&mut self, caps: TunnelCapabilities) {
         self.capabilities = caps;
@@ -133,21 +141,39 @@ fn outcome_to_handle(
     match outcome {
         ScriptedTunnelOutcome::DefaultSuccess => Ok(TunnelHandle {
             profile_id: profile.id.clone(),
+            display_name: profile.display_name.clone(),
             interface_name: "mock0".to_string(),
             pid: None,
             started_at: SystemTime::now(),
             kind: TunnelKindTag::Mock,
+            generation: 0,
+            handshake: None,
+            probe_receipts: Vec::new(),
+            process_ownership: None,
+            teardown_config: None,
+            dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
         }),
         ScriptedTunnelOutcome::UpSuccess {
             interface_name,
             pid,
         } => Ok(TunnelHandle {
             profile_id: profile.id.clone(),
+            display_name: profile.display_name.clone(),
             interface_name,
             pid,
             started_at: SystemTime::now(),
             kind: TunnelKindTag::Mock,
+            generation: 0,
+            handshake: None,
+            probe_receipts: Vec::new(),
+            process_ownership: None,
+            teardown_config: None,
+            dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
         }),
+        ScriptedTunnelOutcome::DelayedSuccess(delay) => {
+            std::thread::sleep(delay);
+            outcome_to_handle(profile, ScriptedTunnelOutcome::DefaultSuccess)
+        }
         ScriptedTunnelOutcome::Failure(msg) => Err(TunnelError::Subprocess(msg)),
         ScriptedTunnelOutcome::HandshakeFailed(msg) => Err(TunnelError::HandshakeFailed(msg)),
         ScriptedTunnelOutcome::AuthFailed(msg) => Err(TunnelError::AuthFailed(msg)),
@@ -158,6 +184,10 @@ fn outcome_to_handle(
 fn outcome_to_unit(outcome: ScriptedTunnelOutcome) -> Result<(), TunnelError> {
     match outcome {
         ScriptedTunnelOutcome::DefaultSuccess | ScriptedTunnelOutcome::UpSuccess { .. } => Ok(()),
+        ScriptedTunnelOutcome::DelayedSuccess(delay) => {
+            std::thread::sleep(delay);
+            Ok(())
+        }
         ScriptedTunnelOutcome::Failure(msg) => Err(TunnelError::Subprocess(msg)),
         ScriptedTunnelOutcome::HandshakeFailed(msg) => Err(TunnelError::HandshakeFailed(msg)),
         ScriptedTunnelOutcome::AuthFailed(msg) => Err(TunnelError::AuthFailed(msg)),
@@ -202,12 +232,14 @@ impl Tunnel for MockTunnel {
             .take()
             .unwrap_or(ScriptedTunnelOutcome::DefaultSuccess);
         outcome_to_unit(outcome.clone())?;
+        let peers = self.state.lock().unwrap().status_peers.clone();
         Ok(TunnelStatus {
             handle: handle.clone(),
             bytes_rx: 0,
             bytes_tx: 0,
             last_handshake: None,
             observed_at: SystemTime::now(),
+            peers,
             detail: Box::new(MockProtocolStatus),
         })
     }

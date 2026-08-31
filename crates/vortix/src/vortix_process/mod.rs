@@ -7,19 +7,22 @@
 
 #![allow(clippy::missing_errors_doc)]
 
+pub mod custodian;
 pub mod mock;
 pub mod orphan_scan;
 pub mod real;
 
+pub use custodian::{CustodianError, CustodianHandshake, StandardCustodian};
 pub use mock::MockRunner;
 pub use orphan_scan::{filter_untracked, scan_orphans, OrphanProcess};
-pub use real::RealRunner;
+pub use real::{RealProcessLifecycle, RealRunner};
 
 // Re-export the port types so callers don't have to depend on vortix-core directly
 // just to construct specs.
 pub use crate::vortix_core::ports::process::{
     CommandOutcome, CommandRunner as CommandRunnerTrait, CommandSpec, DetachedHandle,
-    ExitStatusInfo, Kind, PrivilegeReq, ProcessError,
+    ExitStatusInfo, Kind, ManagedProcessId, PrivilegeReq, ProcessCredentials, ProcessError,
+    ProcessLifecycle, ProcessOwnership,
 };
 
 /// The enum carrier — held by value, dispatched statically.
@@ -112,6 +115,39 @@ use std::sync::OnceLock;
 
 static GLOBAL_RUNNER: OnceLock<CommandRunner> = OnceLock::new();
 
+/// Start a foreground protocol child and return only after lifecycle ownership
+/// is established. This remains a Standard-mode implementation detail.
+pub fn start_managed_foreground(
+    identity: ManagedProcessId,
+    spec: CommandSpec,
+    cleanup_paths: Vec<std::path::PathBuf>,
+) -> Result<CustodianHandshake, CustodianError> {
+    custodian::spawn_custodian(
+        identity,
+        spec,
+        cleanup_paths,
+        std::time::Duration::from_secs(5),
+    )
+}
+
+/// Stop and reap a foreground protocol child by stable identity.
+pub fn stop_managed_foreground(identity: &ManagedProcessId) -> Result<(), CustodianError> {
+    custodian::remote_stop(identity)
+}
+
+/// Probe an exact foreground child capability through its tunnel-scoped
+/// custodian.
+pub fn status_managed_foreground(identity: &ManagedProcessId) -> Result<bool, CustodianError> {
+    custodian::remote_status(identity)
+}
+
+/// Recover the current exact receipt for a stable profile identity.
+pub fn managed_identity_for_profile(
+    profile_id: &crate::vortix_core::profile::ProfileId,
+) -> Result<Option<ManagedProcessId>, CustodianError> {
+    custodian::load_identity(profile_id)
+}
+
 /// Set the process-wide runner. First call wins; subsequent calls are ignored.
 ///
 /// `main()` calls this at startup with `CommandRunner::real()`. Test harnesses
@@ -154,6 +190,10 @@ pub fn run_to_output(spec: CommandSpec) -> std::io::Result<std::process::Output>
             std::io::ErrorKind::TimedOut,
             format!("`{program}` timed out after {duration:?}"),
         )),
+        Err(ProcessError::OutputLimitExceeded { program, limit }) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("`{program}` output exceeded {limit} bytes"),
+        )),
         Err(ProcessError::ProgramNotFound { program }) => Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             format!("`{program}` not found on PATH"),
@@ -161,6 +201,10 @@ pub fn run_to_output(spec: CommandSpec) -> std::io::Result<std::process::Output>
         Err(ProcessError::PrivilegeDenied { program }) => Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             format!("`{program}` requires root"),
+        )),
+        Err(ProcessError::InvalidCredentials { program, reason }) => Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("`{program}` has invalid owner credentials: {reason}"),
         )),
         Err(ProcessError::Killed { program, signal }) => Err(std::io::Error::other(format!(
             "`{program}` killed by signal {signal}"

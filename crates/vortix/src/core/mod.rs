@@ -8,10 +8,12 @@
 #![allow(unused_imports)]
 
 pub mod dns_leak;
+pub mod dns_policy;
 pub mod downloader;
 pub mod icmp;
 pub mod importer;
 pub mod killswitch;
+pub mod managed_wireguard;
 pub mod network_monitor;
 pub mod real_ip_cache;
 pub mod scanner;

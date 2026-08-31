@@ -40,6 +40,15 @@ impl App {
         let Some(snap) = snap else {
             return ConnectionState::Disconnected;
         };
+        let display_name = self
+            .runtime
+            .profiles
+            .iter()
+            .find(|profile| profile.id == snap.profile_id)
+            .map_or_else(
+                || format!("ProfileMissing:{}", snap.profile_id),
+                |profile| profile.name.clone(),
+            );
 
         let now = std::time::SystemTime::now();
         let to_instant = |t: std::time::SystemTime| {
@@ -54,22 +63,22 @@ impl App {
             Connection::Connecting { started_at, .. }
             | Connection::Reconnecting { started_at, .. } => ConnectionState::Connecting {
                 started: to_instant(started_at),
-                profile: snap.profile_id.as_str().to_string(),
+                profile: display_name.clone(),
             },
             Connection::AwaitingUserInput { since, .. } => ConnectionState::Connecting {
                 started: to_instant(since),
-                profile: snap.profile_id.as_str().to_string(),
+                profile: display_name.clone(),
             },
             Connection::Connected { since, details, .. } => {
                 let server_location = self
                     .runtime
                     .profiles
                     .iter()
-                    .find(|p| p.name == snap.profile_id.as_str())
+                    .find(|p| p.id == snap.profile_id)
                     .map_or_else(|| "Unknown".to_string(), |p| p.location.clone());
                 ConnectionState::Connected {
                     since: to_instant(since),
-                    profile: snap.profile_id.as_str().to_string(),
+                    profile: display_name,
                     server_location,
                     latency_ms: 0,
                     details: Box::new(DetailedConnectionInfo {
@@ -82,13 +91,16 @@ impl App {
                         transfer_rx: details.transfer_rx.clone(),
                         transfer_tx: details.transfer_tx.clone(),
                         latest_handshake: details.latest_handshake.clone(),
+                        generation: details.generation,
+                        handshake: details.handshake.clone(),
+                        probe_receipts: details.probe_receipts.clone(),
                         pid: details.pid,
                     }),
                 }
             }
             Connection::Disconnecting { started_at, .. } => ConnectionState::Disconnecting {
                 started: to_instant(started_at),
-                profile: snap.profile_id.as_str().to_string(),
+                profile: display_name,
             },
         }
     }
@@ -231,18 +243,31 @@ impl App {
         out
     }
 
+    /// Resolve a user/scanner-facing display name at the App boundary.
+    /// Internal registry and lifecycle code carries the returned stable ID.
+    #[must_use]
+    pub(crate) fn profile_id_for_name(
+        &self,
+        display_name: &str,
+    ) -> Option<crate::vortix_core::profile::ProfileId> {
+        self.runtime
+            .profiles
+            .iter()
+            .find(|profile| profile.name == display_name)
+            .map(|profile| profile.id.clone())
+    }
+
     /// Whether the profile at `idx` is currently in a Connected state. Used
     /// by the `d` / `Enter` keybindings to decide between connect and
     /// disconnect routing ().
     #[must_use]
     pub(crate) fn is_profile_connected(&self, idx: usize) -> bool {
         use crate::vortix_core::engine::state::Connection;
-        use crate::vortix_core::profile::ProfileId;
         let Some(profile) = self.runtime.profiles.get(idx) else {
             return false;
         };
         self.registry
-            .snapshot(&ProfileId::new(&profile.name))
+            .snapshot(&profile.id)
             .is_some_and(|snap| matches!(snap.state, Connection::Connected { .. }))
     }
 
@@ -254,9 +279,8 @@ impl App {
     #[must_use]
     pub(crate) fn is_profile_active(&self, profile_name: &str) -> bool {
         use crate::vortix_core::engine::state::Connection;
-        use crate::vortix_core::profile::ProfileId;
-        self.registry
-            .snapshot(&ProfileId::new(profile_name))
+        self.profile_id_for_name(profile_name)
+            .and_then(|id| self.registry.snapshot(&id))
             .is_some_and(|snap| !matches!(snap.state, Connection::Disconnected { .. }))
     }
 
@@ -265,12 +289,11 @@ impl App {
     #[must_use]
     pub(crate) fn is_profile_connecting(&self, idx: usize) -> bool {
         use crate::vortix_core::engine::state::Connection;
-        use crate::vortix_core::profile::ProfileId;
         let Some(profile) = self.runtime.profiles.get(idx) else {
             return false;
         };
         self.registry
-            .snapshot(&ProfileId::new(&profile.name))
+            .snapshot(&profile.id)
             .is_some_and(|snap| matches!(snap.state, Connection::Connecting { .. }))
     }
 

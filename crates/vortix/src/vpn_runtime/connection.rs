@@ -26,6 +26,12 @@ pub struct ConnectResult {
 #[derive(Debug)]
 pub struct StatusSnapshot {
     pub connection_state: String,
+    /// Typed health for a Vortix-issued connected generation. Scanner-only
+    /// observations intentionally leave this absent.
+    pub health: Option<crate::vortix_core::engine::state::ConnectionHealth>,
+    /// Exact successful attempt generation when durable managed evidence is
+    /// available.
+    pub generation: Option<u64>,
     pub profile: Option<String>,
     pub protocol: Option<String>,
     pub uptime_secs: Option<u64>,
@@ -61,7 +67,15 @@ impl VpnRuntime {
     fn validate_connect(
         &self,
         profile_name: &str,
-    ) -> Result<(String, Protocol, std::path::PathBuf), String> {
+    ) -> Result<
+        (
+            crate::vortix_core::profile::ProfileId,
+            String,
+            Protocol,
+            std::path::PathBuf,
+        ),
+        String,
+    > {
         let idx = self
             .find_profile(profile_name)
             .ok_or_else(|| format!("Profile '{profile_name}' not found"))?;
@@ -92,7 +106,7 @@ impl VpnRuntime {
 
         if matches!(protocol, Protocol::OpenVPN)
             && utils::openvpn_config_needs_auth(&config_path)
-            && utils::read_openvpn_saved_auth(&name).is_none()
+            && utils::read_openvpn_saved_auth_compat(profile.id.as_str(), &name).is_none()
         {
             return Err(format!(
                 "OpenVPN profile '{name}' requires auth credentials. \
@@ -100,7 +114,7 @@ impl VpnRuntime {
             ));
         }
 
-        Ok((name, protocol, config_path))
+        Ok((profile.id.clone(), name, protocol, config_path))
     }
 
     /// Blocking connect for CLI — waits until connected or timeout.
@@ -115,19 +129,24 @@ impl VpnRuntime {
         profile_name: &str,
         timeout: Duration,
     ) -> Result<ConnectResult, String> {
-        let (name, protocol, config_path) = self.validate_connect(profile_name)?;
+        let (profile_id, name, protocol, config_path) = self.validate_connect(profile_name)?;
 
         let cmd_tx = self.cmd_tx.clone();
         let connect_timeout_secs = timeout.as_secs();
+        let wireguard_handshake_timeout_secs = self.config.wireguard_handshake_timeout_secs;
+        let wireguard_health_targets = self.config.ping_targets.clone();
         let ovpn_verbosity = self.config.openvpn_verbosity.clone();
         let name_for_thread = name.clone();
 
         std::thread::spawn(move || {
             Self::run_connect(
+                profile_id,
                 &name_for_thread,
                 protocol,
                 &config_path,
                 connect_timeout_secs,
+                wireguard_handshake_timeout_secs,
+                &wireguard_health_targets,
                 &ovpn_verbosity,
                 &cmd_tx,
             );
@@ -139,10 +158,13 @@ impl VpnRuntime {
                 Ok(Message::ConnectResult {
                     profile,
                     success,
-                    error,
+                    mut error,
+                    interface: _,
+                    dns_request,
                     ..
                 }) => {
                     if success {
+                        self.remember_dns_request(&profile, dns_request);
                         self.session_start = Some(Instant::now());
                         self.last_connected_profile = Some(profile.clone());
 
@@ -158,8 +180,12 @@ impl VpnRuntime {
                         // tunnel a concurrent TUI session was tracking.
                         let (is_connected, active) = self.killswitch_view_from_scanner();
                         self.sync_killswitch(is_connected, &active);
-                    } else {
-                        self.cleanup_vpn_resources(&profile);
+                        self.reconcile_dns_from_scanner();
+                    } else if let Err(cleanup) = self.cleanup_vpn_resources(&profile) {
+                        let original = error.unwrap_or_else(|| "connection failed".into());
+                        error = Some(format!(
+                            "{original}; teardown remains ambiguous-owned: {cleanup}"
+                        ));
                     }
 
                     return Ok(ConnectResult {
@@ -172,13 +198,14 @@ impl VpnRuntime {
                 Ok(_) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     if Instant::now() >= deadline {
-                        self.cleanup_vpn_resources(&name);
+                        let cleanup = self.cleanup_vpn_resources(&name).err();
                         return Ok(ConnectResult {
                             profile: name,
                             protocol,
                             success: false,
-                            error: Some(format!(
-                                "Connection timed out after {connect_timeout_secs}s"
+                            error: Some(cleanup.map_or_else(
+                                || format!("Connection timed out after {connect_timeout_secs}s; teardown requested and awaiting kernel confirmation"),
+                                |error| format!("Connection timed out after {connect_timeout_secs}s; teardown remains ambiguous-owned: {error}"),
                             )),
                         });
                     }
@@ -212,31 +239,43 @@ impl VpnRuntime {
             .iter()
             .find(|p| p.name == profile_name)
             .ok_or_else(|| format!("Profile '{profile_name}' not found in loaded profiles"))?;
-        let (protocol, config_path) = (prof.protocol, prof.config_path.clone());
+        let (profile_id, protocol, config_path) =
+            (prof.id.clone(), prof.protocol, prof.config_path.clone());
+        let receipt_profile_id = profile_id.clone();
 
         let cmd_tx = self.cmd_tx.clone();
         let pn = profile_name.clone();
 
-        // a single Tunnel::down call replaces the previous
-        // ~80-line per-protocol match arm. The interface name carried on the
-        // synthetic handle preserves the existing wg-quick semantics
-        // (config-path-based lookup) for WireGuard.
+        // A single Tunnel::down call replaces the previous ~80-line
+        // per-protocol match arm. WireGuard carries the source config
+        // separately so its adapter can sanitize DNS before invoking
+        // `wg-quick down`.
         let iface_for_handle = match protocol {
-            Protocol::WireGuard => config_path.to_string_lossy().into_owned(),
+            Protocol::WireGuard => config_path
+                .file_stem()
+                .and_then(std::ffi::OsStr::to_str)
+                .unwrap_or("wg0")
+                .to_string(),
             Protocol::OpenVPN => format!("openvpn-{}", utils::sanitize_profile_name(&pn)),
         };
+        let teardown_config = matches!(protocol, Protocol::WireGuard).then(|| {
+            crate::vortix_core::ports::tunnel::TunnelTeardownConfig {
+                path: config_path,
+                managed: false,
+            }
+        });
         let pid_for_handle = match protocol {
-            Protocol::OpenVPN => utils::read_openvpn_pid(&pn).or(pid),
+            Protocol::OpenVPN => utils::read_openvpn_pid_compat(profile_id.as_str(), &pn).or(pid),
             Protocol::WireGuard => None,
         };
         let _ = force; // SIGTERM vs SIGKILL handled inside OvpnTunnel::down today.
 
         std::thread::spawn(move || {
             use crate::vortix_core::ports::tunnel::{TunnelHandle, TunnelKindTag};
-            use crate::vortix_core::profile::ProfileId;
-
+            let cleanup_profile_id = profile_id.clone();
             let handle = TunnelHandle {
-                profile_id: ProfileId::new(&pn),
+                profile_id,
+                display_name: pn.clone(),
                 interface_name: iface_for_handle,
                 pid: pid_for_handle,
                 started_at: std::time::SystemTime::now(),
@@ -244,6 +283,12 @@ impl VpnRuntime {
                     Protocol::WireGuard => TunnelKindTag::WireGuard,
                     Protocol::OpenVPN => TunnelKindTag::OpenVpn,
                 },
+                generation: 0,
+                handshake: None,
+                probe_receipts: Vec::new(),
+                process_ownership: None,
+                teardown_config,
+                dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
             };
 
             let config_dir = crate::utils::get_app_config_dir()
@@ -253,7 +298,7 @@ impl VpnRuntime {
             match tunnel.down(handle) {
                 Ok(()) => {
                     if matches!(protocol, Protocol::OpenVPN) {
-                        utils::cleanup_openvpn_run_files(&pn);
+                        utils::cleanup_openvpn_run_files_compat(cleanup_profile_id.as_str(), &pn);
                     }
                     let _ = cmd_tx.send(Message::DisconnectResult {
                         profile: pn,
@@ -288,6 +333,14 @@ impl VpnRuntime {
                     self.sync_killswitch(is_connected, &active);
 
                     if success {
+                        self.forget_dns_request(&profile_name);
+                        self.reconcile_dns_from_scanner();
+                        let active = scanner::get_active_profiles(&self.profiles);
+                        let _ = crate::core::managed_wireguard::remove_after_absence(
+                            &self.config_dir,
+                            &receipt_profile_id,
+                            &active,
+                        );
                         return Ok(());
                     }
                     return Err(error.unwrap_or_else(|| "Disconnect failed".into()));
@@ -295,9 +348,15 @@ impl VpnRuntime {
                 Ok(_) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     if Instant::now() >= deadline {
-                        self.cleanup_vpn_resources(&profile_name);
-                        self.session_start = None;
-                        return Err("Disconnect timed out".into());
+                        return match self.cleanup_vpn_resources(&profile_name) {
+                            Ok(()) => Err(
+                                "Disconnect timed out; teardown requested and awaiting kernel confirmation"
+                                    .into(),
+                            ),
+                            Err(error) => Err(format!(
+                                "Disconnect timed out; teardown remains ambiguous-owned: {error}"
+                            )),
+                        };
                     }
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -309,80 +368,139 @@ impl VpnRuntime {
 
     /// One-shot status scan for CLI.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn scan_status(&self) -> StatusSnapshot {
         let active = scanner::get_active_profiles(&self.profiles);
         let session = active.first();
+        let (
+            mut state,
+            profile,
+            protocol,
+            uptime,
+            server,
+            interface,
+            internal_ip,
+            dl,
+            ul,
+            encryption,
+        ) = if let Some(s) = session {
+            let proto = self
+                .profiles
+                .iter()
+                .find(|p| p.name == s.name)
+                .map(|p| p.protocol);
 
-        let (state, profile, protocol, uptime, server, interface, internal_ip, dl, ul, encryption) =
-            if let Some(s) = session {
-                let proto = self
-                    .profiles
-                    .iter()
-                    .find(|p| p.name == s.name)
-                    .map(|p| p.protocol);
-
-                let enc = match proto {
-                    Some(Protocol::WireGuard) => Some("ChaCha20-Poly1305".into()),
-                    Some(Protocol::OpenVPN) => Some("AES-256-GCM".into()),
-                    None => None,
-                };
-
-                let uptime = s.started_at.and_then(|started| {
-                    std::time::SystemTime::now()
-                        .duration_since(started)
-                        .ok()
-                        .map(|d| d.as_secs())
-                });
-
-                (
-                    "connected".to_string(),
-                    Some(s.name.clone()),
-                    proto.map(|p| format!("{p}")),
-                    uptime,
-                    if s.endpoint.is_empty() {
-                        None
-                    } else {
-                        Some(s.endpoint.clone())
-                    },
-                    if s.interface.is_empty() {
-                        None
-                    } else {
-                        Some(s.interface.clone())
-                    },
-                    if s.internal_ip.is_empty() {
-                        None
-                    } else {
-                        Some(s.internal_ip.clone())
-                    },
-                    if s.transfer_rx.is_empty() {
-                        None
-                    } else {
-                        Some(s.transfer_rx.clone())
-                    },
-                    if s.transfer_tx.is_empty() {
-                        None
-                    } else {
-                        Some(s.transfer_tx.clone())
-                    },
-                    enc,
-                )
-            } else {
-                (
-                    "disconnected".to_string(),
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                )
+            let enc = match proto {
+                Some(Protocol::WireGuard) => Some("ChaCha20-Poly1305".into()),
+                Some(Protocol::OpenVPN) => Some("AES-256-GCM".into()),
+                None => None,
             };
+            // Direct scanner state is observation-only. Even a fresh or
+            // historically non-zero handshake timestamp cannot recreate
+            // the current attempt generation and ownership receipt.
+            let observed_state = if matches!(proto, Some(Protocol::WireGuard)) {
+                "handshaking"
+            } else {
+                "connected"
+            };
+
+            let uptime = s.started_at.and_then(|started| {
+                std::time::SystemTime::now()
+                    .duration_since(started)
+                    .ok()
+                    .map(|d| d.as_secs())
+            });
+
+            (
+                observed_state.to_string(),
+                Some(s.name.clone()),
+                proto.map(|p| format!("{p}")),
+                uptime,
+                if s.endpoint.is_empty() {
+                    None
+                } else {
+                    Some(s.endpoint.clone())
+                },
+                if s.interface.is_empty() {
+                    None
+                } else {
+                    Some(s.interface.clone())
+                },
+                if s.internal_ip.is_empty() {
+                    None
+                } else {
+                    Some(s.internal_ip.clone())
+                },
+                if s.transfer_rx.is_empty() {
+                    None
+                } else {
+                    Some(s.transfer_rx.clone())
+                },
+                if s.transfer_tx.is_empty() {
+                    None
+                } else {
+                    Some(s.transfer_tx.clone())
+                },
+                enc,
+            )
+        } else {
+            (
+                "disconnected".to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+
+        let mut health = None;
+        let mut generation = None;
+        if let Some(session) = session {
+            if let Some(profile) = self.profiles.iter().find(|profile| {
+                profile.name == session.name && profile.protocol == Protocol::WireGuard
+            }) {
+                if let Some(mut receipt) =
+                    crate::core::managed_wireguard::load(&self.config_dir, &profile.id)
+                        .filter(|receipt| receipt.validates(&profile.id, session))
+                {
+                    let mut activity = std::collections::HashMap::new();
+                    let current = crate::app::connection::wireguard_health_from_session(
+                        &session.wireguard_peers,
+                        &mut activity,
+                        &receipt.probe_receipts,
+                        Duration::from_secs(self.config.wireguard_handshake_stale_secs),
+                    );
+                    if let Ok(Some(old)) = crate::core::managed_wireguard::update_health(
+                        &self.config_dir,
+                        &mut receipt,
+                        current.clone(),
+                    ) {
+                        if let Some(journal) = crate::vortix_core::journal::global_journal() {
+                            let _ = journal.append(
+                                crate::vortix_core::engine::EngineEvent::ConnectionHealthChanged {
+                                    profile_id: profile.id.clone(),
+                                    old,
+                                    new: current.clone(),
+                                },
+                            );
+                        }
+                    }
+                    state = "connected".into();
+                    generation = Some(receipt.generation);
+                    health = Some(current);
+                }
+            }
+        }
 
         StatusSnapshot {
             connection_state: state,
+            health,
+            generation,
             profile,
             protocol,
             uptime_secs: uptime,
@@ -410,15 +528,19 @@ impl VpnRuntime {
     /// a single call to `TunnelKind::up` replaces the previous
     /// 200-line per-protocol match arm. Routing happens once in
     /// [`crate::tunnel::tunnel_for`].
+    #[allow(clippy::too_many_arguments)]
     fn run_connect(
+        profile_id: crate::vortix_core::profile::ProfileId,
         name: &str,
         protocol: Protocol,
         config_path: &std::path::Path,
         connect_timeout_secs: u64,
+        wireguard_handshake_timeout_secs: u64,
+        wireguard_health_targets: &[String],
         ovpn_verbosity: &str,
         cmd_tx: &std::sync::mpsc::Sender<Message>,
     ) {
-        use crate::vortix_core::profile::{ProfileId, ProtocolKind};
+        use crate::vortix_core::profile::ProtocolKind;
 
         let name = name.to_string();
         let cmd_tx = cmd_tx.clone();
@@ -426,7 +548,7 @@ impl VpnRuntime {
             crate::utils::get_app_config_dir().unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
 
         let profile = crate::vortix_core::profile::Profile::new(
-            ProfileId::new(&name),
+            profile_id,
             &name,
             match protocol {
                 Protocol::WireGuard => ProtocolKind::WireGuard,
@@ -435,17 +557,68 @@ impl VpnRuntime {
             config_path.to_path_buf(),
         );
 
-        let mut tunnel =
-            crate::tunnel::tunnel_for(protocol, &config_dir, ovpn_verbosity, connect_timeout_secs);
+        let mut tunnel = crate::tunnel::tunnel_for_with_wireguard_policy(
+            protocol,
+            &config_dir,
+            ovpn_verbosity,
+            connect_timeout_secs,
+            wireguard_handshake_timeout_secs,
+            wireguard_health_targets,
+        );
 
         match tunnel.up(&profile) {
             Ok(handle) => {
+                if matches!(protocol, Protocol::WireGuard) {
+                    let receipt_result = handle.handshake.clone().map_or_else(
+                        || {
+                            Err(std::io::Error::other(
+                                "WireGuard connected without handshake evidence",
+                            ))
+                        },
+                        |handshake| {
+                            crate::core::managed_wireguard::issue(
+                                &config_dir,
+                                &handle.profile_id,
+                                handle.interface_name.clone(),
+                                handle.generation,
+                                handshake,
+                                handle.probe_receipts.clone(),
+                            )
+                            .map(|_| ())
+                        },
+                    );
+                    if let Err(error) = receipt_result {
+                        let cleanup = tunnel.down(handle);
+                        let detail = cleanup.map_or_else(
+                            |cleanup| format!("; teardown remains ambiguous: {cleanup}"),
+                            |()| String::new(),
+                        );
+                        let _ = cmd_tx.send(Message::ConnectResult {
+                            profile: name,
+                            success: false,
+                            error: Some(format!(
+                                "WireGuard connected but its durable receipt failed: {error}{detail}"
+                            )),
+                            interface: None,
+                            pid: None,
+                            generation: 0,
+                            handshake: None,
+                            probe_receipts: Vec::new(),
+                            dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
+                        });
+                        return;
+                    }
+                }
                 let _ = cmd_tx.send(Message::ConnectResult {
                     profile: name,
                     success: true,
                     error: None,
                     interface: Some(handle.interface_name),
                     pid: handle.pid,
+                    generation: handle.generation,
+                    handshake: handle.handshake,
+                    probe_receipts: handle.probe_receipts,
+                    dns_request: handle.dns_request,
                 });
             }
             Err(err) => {
@@ -455,6 +628,10 @@ impl VpnRuntime {
                     error: Some(format!("{protocol}: {err}")),
                     interface: None,
                     pid: None,
+                    generation: 0,
+                    handshake: None,
+                    probe_receipts: Vec::new(),
+                    dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
                 });
             }
         }

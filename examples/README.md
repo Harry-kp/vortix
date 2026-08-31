@@ -1,26 +1,44 @@
-# vortix daemon — deployment examples
+# Vortix service templates
 
-Reference unit files for running `vortix daemon` as a system service.
-Use these as starting points; review the `SECURITY.md` notes about
-the v0.3.0 auth posture before deploying.
+These files are packaging references for the passive daemon candidate and the
+future Background-mode privilege boundary. Packages may stage them, but must
+not enable or start them during a normal installation.
 
-- [`systemd/vortix-daemon.service`](systemd/vortix-daemon.service) — Linux
-- [`launchd/com.vortix.daemon.plist`](launchd/com.vortix.daemon.plist) — macOS
+Linux/systemd:
 
-## Quick local test
+- [`systemd/vortix-daemon.service`](systemd/vortix-daemon.service) — optional
+  per-user passive candidate.
+- [`systemd/vortix-daemon@.service`](systemd/vortix-daemon@.service) — inactive
+  enrolled-owner system-service template; U13 creates an instance.
+- [`systemd/vortix-helper.service`](systemd/vortix-helper.service) — inactive
+  root helper template. The U11 helper rejects `--serve` until U12.
+
+macOS/launchd:
+
+- [`launchd/com.vortix.agent.plist`](launchd/com.vortix.agent.plist) — optional
+  per-user passive candidate.
+- [`launchd/com.vortix.daemon.plist`](launchd/com.vortix.daemon.plist) —
+  disabled enrolled-owner template with a package-time user placeholder.
+- [`launchd/com.vortix.helper.plist`](launchd/com.vortix.helper.plist) —
+  disabled root-helper template.
+
+The canonical trust model, fixed paths, package-channel classification, and
+upgrade/uninstall order live in
+[`docs/security/privileged-helper-threat-model.md`](../docs/security/privileged-helper-threat-model.md).
+
+## Passive candidate smoke test
 
 ```sh
-# Build vortix first
 cargo build --release -p vortix
-
-# Run the daemon in one terminal
 ./target/release/vortix daemon
-
-# In another terminal, observe the socket
-ls -la "${XDG_RUNTIME_DIR:-/tmp}/vortix.sock"
 ```
 
-The frontend (TUI/CLI) checks `VORTIX_DAEMON_SOCKET` env var at
-startup and routes through the daemon when set. v0.3.0 ships the
-daemon skeleton + IPC contract; full engine routing through the
-daemon is post-v0.3 hardening (see the daemon commit history for background).
+The ready line prints the effective socket. In another terminal, point a
+read-only status query at it:
+
+```sh
+VORTIX_DAEMON_SOCKET=/path/from/ready/line ./target/release/vortix status
+```
+
+The candidate is unprivileged and observational. It does not own tunnels,
+desired state, retries, firewall, DNS, or routes.

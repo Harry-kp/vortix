@@ -12,10 +12,11 @@ use serde::Serialize;
 use crate::cli::args::Commands;
 use crate::cli::output::{
     err_not_found, err_permission_denied, print_error_and_exit, print_success, CliError,
-    ConnectionEntry, ExitCode, OutputMode,
+    ConnectionEntry, ConnectionHealthEntry, ExitCode, OutputMode,
 };
 use crate::config::AppConfig;
 use crate::constants;
+use crate::vortix_config::profile_store::{FsProfileStore, ProfileStore, ProfileStoreError};
 use crate::vpn_runtime::VpnRuntime;
 
 /// Prompt for a 2FA code on the controlling tty with masked echo (each
@@ -241,8 +242,7 @@ fn handle_audit(pid_filter: Option<u32>, vpn_only: bool, mode: OutputMode) -> i3
     }
 }
 
-/// `vortix daemon` — host the engine as a long-running IPC server
-///.
+/// `vortix daemon` — run the bounded, read-only IPC candidate.
 fn handle_daemon(socket_override: Option<std::path::PathBuf>, mode: OutputMode) -> i32 {
     let socket_path = socket_override.unwrap_or_else(crate::daemon::default_socket_path);
 
@@ -283,28 +283,24 @@ fn handle_daemon(socket_override: Option<std::path::PathBuf>, mode: OutputMode) 
     };
 
     eprintln!(
-        "vortix daemon: ready. Set VORTIX_DAEMON_SOCKET={} in your shell to route through the daemon.",
+        "vortix daemon: passive read-only candidate ready at {}. Set VORTIX_DAEMON_SOCKET to this path to use snapshot queries.",
         server.socket_path().display()
     );
 
-    // Build the `EngineHandle::Local` inside the daemon's runtime context
-    // (the actor task spawn lands on this runtime, not the runner's). The
-    // factory reads the resolved global config dir for profile sidecars.
-    let profiles_dir = crate::utils::get_app_config_dir().map_or_else(
-        |_| std::path::PathBuf::from("/tmp/vortix-profiles"),
-        |d| d.join(constants::PROFILES_DIR_NAME),
-    );
-
-    let server = runtime.block_on(async move {
-        if let Some(handle) = crate::daemon::build_engine_handle(&profiles_dir) {
-            server.with_engine_handle(handle)
-        } else {
-            eprintln!(
-                "vortix daemon: engine handle unavailable (journal or runner not installed) — Execute/Snapshot/Subscribe will return Internal errors"
-            );
-            server
+    // The candidate is deliberately passive: it polls scanner truth for
+    // queries/subscriptions but never constructs an engine, loads desired
+    // intent, acquires lifecycle authority, or exposes mutation capability.
+    let provider = match crate::daemon::passive::ScannerQueryProvider::start(
+        crate::vpn::load_profiles(),
+        std::time::Duration::from_secs(1),
+    ) {
+        Ok(provider) => std::sync::Arc::new(provider),
+        Err(error) => {
+            eprintln!("vortix daemon: failed to start passive observer: {error}");
+            return 1;
         }
-    });
+    };
+    let server = server.with_query_provider(provider);
 
     runtime.block_on(async {
         if let Err(e) = server.run().await {
@@ -496,14 +492,20 @@ fn handle_up(
     // auth file, run the connect, and restore plain text on every exit
     // path. Non-tty stdin and missing saved credentials produce
     // actionable non-zero exits.
-    let static_challenge_prompt = engine
+    let openvpn_identity = engine
         .profiles
         .iter()
         .find(|p| p.name == profile_name)
-        .and_then(|p| crate::utils::read_openvpn_static_challenge_prompt(&p.config_path));
-    let mut scrv1_restore_needed: Option<String> = None;
-    if let Some(prompt_text) = static_challenge_prompt {
-        let saved = crate::utils::read_openvpn_saved_auth(&profile_name);
+        .map(|p| {
+            (
+                p.id.clone(),
+                crate::utils::read_openvpn_static_challenge_prompt(&p.config_path),
+            )
+        });
+    let mut scrv1_restore_needed = None;
+    if let Some((profile_id, Some(prompt_text))) = openvpn_identity {
+        let saved =
+            crate::utils::read_openvpn_saved_auth_compat(profile_id.as_str(), &profile_name);
         let Some((user, pass)) = saved else {
             print_error_and_exit(
                 mode,
@@ -563,7 +565,7 @@ fn handle_up(
             }
         };
         if let Err(e) =
-            crate::utils::write_openvpn_scrv1_auth_file(&profile_name, &user, &pass, &otp)
+            crate::utils::write_openvpn_scrv1_auth_file(profile_id.as_str(), &user, &pass, &otp)
         {
             print_error_and_exit(
                 mode,
@@ -576,7 +578,7 @@ fn handle_up(
                 ExitCode::GeneralError,
             );
         }
-        scrv1_restore_needed = Some(profile_name.clone());
+        scrv1_restore_needed = Some(profile_id);
     }
 
     let result = engine.connect_and_wait(&profile_name, Duration::from_secs(timeout_secs));
@@ -584,8 +586,8 @@ fn handle_up(
     //. Belt-and-braces: if the connect
     // never reached spawn (early-failure path), clear the envelope
     // here so it doesn't linger.
-    if let Some(name) = scrv1_restore_needed {
-        crate::utils::delete_openvpn_scrv1_auth_file(&name);
+    if let Some(profile_id) = scrv1_restore_needed {
+        crate::utils::delete_openvpn_scrv1_auth_file(profile_id.as_str());
     }
 
     match result {
@@ -694,8 +696,6 @@ fn detect_conflict_for_cli(
         claims_default_route_v4, claims_default_route_v6, overlapping_cidrs,
     };
     use crate::vortix_core::engine::Conflict;
-    use crate::vortix_core::profile::ProfileId;
-
     let target_profile = engine.profiles.iter().find(|p| p.name == target_name)?;
     let target_allowed = extract_allowed_ips(target_profile.protocol, &target_profile.config_path);
     let target_claims_default =
@@ -718,14 +718,14 @@ fn detect_conflict_for_cli(
 
         if target_claims_default && active_claims_default {
             return Some(Conflict::DefaultRouteTakeover {
-                current: ProfileId::new(&session.name),
-                new: ProfileId::new(target_name),
+                current: active_profile.id.clone(),
+                new: target_profile.id.clone(),
             });
         }
         let overlap = overlapping_cidrs(&target_allowed, &active_allowed);
         if !overlap.is_empty() {
             return Some(Conflict::RouteOverlap {
-                with: ProfileId::new(&session.name),
+                with: active_profile.id.clone(),
                 overlapping_cidrs: overlap,
             });
         }
@@ -1009,39 +1009,48 @@ fn handle_status(
     };
 
     let engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
-    let mut snap = engine.scan_status();
-    // When the daemon socket is connectable, overlay its authoritative
-    // view of the FSM (which profile is connecting/connected, since
-    // when) onto the scanner-derived snapshot. The scanner still owns
-    // live counters and kill-switch state. On any daemon error we
-    // silently keep the scanner-only view — bypass-on-error keeps
-    // `vortix status` reliable during partial daemon rollout. Once
-    // This lands the schema_version=2 multi-tunnel payload, this
-    // branch will pull richer data from the daemon directly.
+    let snap = engine.scan_status();
+    // The candidate is shadow-only: compare its passive observation with the
+    // local scanner but never let it override local control or status truth.
+    // Any error or rollout mismatch leaves user-visible output unchanged.
     if let Some(socket) = daemon_socket {
-        if let Ok(state) = crate::daemon::client::snapshot(&socket) {
-            overlay_daemon_state(&mut snap, &state);
+        if let Ok(crate::vortix_core::ipc::IpcResult::PassiveSnapshot { snapshot }) =
+            crate::daemon::client::request(&socket, crate::vortix_core::ipc::IpcOp::PassiveSnapshot)
+        {
+            if !passive_projection_matches(&snap, &snapshot) {
+                tracing::debug!(
+                    local_state = %snap.connection_state,
+                    local_profile = ?snap.profile,
+                    local_interface = ?snap.interface,
+                    remote_generation = snapshot.generation,
+                    remote_tunnels = snapshot.tunnels.len(),
+                    "passive daemon shadow projection differs from local scanner"
+                );
+            }
         }
     }
 
     let is_connected = snap.connection_state == "connected";
+    let is_present = snap.connection_state != "disconnected";
 
     // Transitional shape: the registry-driven multi-tunnel snapshot
     // lands later. Until then, "primary" is the single active tunnel
     // (when connected), and `connections` is a one-element vec mirroring
     // it. When disconnected, `connections` is empty and `primary` /
     // `connection` are both `null`.
-    let primary_entry = if is_connected {
+    let visible_entry = if is_present {
         Some(ConnectionEntry {
             state: snap.connection_state.clone(),
             profile: snap.profile.clone(),
             protocol: snap.protocol.clone(),
             uptime_secs: snap.uptime_secs,
+            health: snap.health.as_ref().map(connection_health_entry),
+            generation: snap.generation,
         })
     } else {
         None
     };
-    let connections: Vec<ConnectionEntry> = primary_entry.iter().cloned().collect();
+    let connections: Vec<ConnectionEntry> = visible_entry.iter().cloned().collect();
     let primary: Option<String> = if is_connected {
         snap.profile.clone()
     } else {
@@ -1051,7 +1060,11 @@ fn handle_status(
     let data = StatusData {
         connections,
         primary,
-        connection: primary_entry,
+        connection: if is_connected {
+            visible_entry.clone()
+        } else {
+            None
+        },
         network: if is_connected {
             Some(StatusNetwork {
                 server: snap.server.clone(),
@@ -1072,17 +1085,11 @@ fn handle_status(
     match mode {
         OutputMode::Human => {
             if brief {
-                if is_connected {
-                    let profile = snap.profile.as_deref().unwrap_or("unknown");
-                    let proto = snap.protocol.as_deref().unwrap_or("");
-                    println!("● Connected to {profile} ({proto})");
-                } else {
-                    println!("○ Disconnected");
-                }
+                println!("{}", human_status_headline(&snap));
             } else if is_connected {
                 let profile = snap.profile.as_deref().unwrap_or("unknown");
-                let proto = snap.protocol.as_deref().unwrap_or("");
-                println!("● Connected to {profile} ({proto})");
+                let protocol = snap.protocol.as_deref().unwrap_or("");
+                println!("● Connected to {profile} ({protocol})");
                 println!();
                 if let Some(s) = &snap.server {
                     println!("  Server       {s}");
@@ -1110,8 +1117,11 @@ fn handle_status(
                     snap.killswitch_mode.display_name(),
                     snap.killswitch_state.display_status()
                 );
+                if let Some(health) = &snap.health {
+                    println!("  Health       {}", connection_health_human(health));
+                }
             } else {
-                println!("○ Disconnected");
+                println!("{}", human_status_headline(&snap));
                 println!();
                 println!(
                     "  Kill Switch  {} ({})",
@@ -1121,7 +1131,7 @@ fn handle_status(
             }
         }
         OutputMode::Json => {
-            let next = if is_connected {
+            let next = if is_present {
                 vec![
                     "sudo vortix down --json".into(),
                     "vortix list --json".into(),
@@ -1136,49 +1146,23 @@ fn handle_status(
         }
         OutputMode::Quiet => {}
     }
-    0
+    ExitCode::Success.code()
 }
 
-/// Merge an authoritative `Connection` from the daemon onto a
-/// scanner-derived `StatusSnapshot`. The daemon owns the FSM state
-/// (which profile is connecting/connected, since when, retry budget);
-/// the scanner owns the live counters (transfer bytes, kill-switch
-/// state). Today we overlay just the connection-state vocabulary so
-/// the daemon's view of "what's the active profile" beats whatever
-/// the scanner inferred from sockets — relevant when the daemon is
-/// driving a tunnel the local-engine scanner doesn't recognize.
-fn overlay_daemon_state(
-    snap: &mut crate::vpn_runtime::connection::StatusSnapshot,
-    state: &crate::vortix_core::engine::state::Connection,
-) {
-    use crate::vortix_core::engine::state::Connection;
-    match state {
-        Connection::Disconnected { .. } => {
-            snap.connection_state = "disconnected".into();
-            snap.profile = None;
-            snap.protocol = None;
-            snap.uptime_secs = None;
-        }
-        Connection::Connecting { profile_id, .. }
-        | Connection::Reconnecting { profile_id, .. }
-        | Connection::AwaitingUserInput { profile_id, .. } => {
-            snap.connection_state = "connecting".into();
-            snap.profile = Some(profile_id.as_str().to_string());
-        }
-        Connection::Disconnecting { profile_id, .. } => {
-            snap.connection_state = "disconnecting".into();
-            snap.profile = Some(profile_id.as_str().to_string());
-        }
-        Connection::Connected {
-            profile_id, since, ..
-        } => {
-            snap.connection_state = "connected".into();
-            snap.profile = Some(profile_id.as_str().to_string());
-            if let Ok(elapsed) = std::time::SystemTime::now().duration_since(*since) {
-                snap.uptime_secs = Some(elapsed.as_secs());
-            }
-        }
+fn passive_projection_matches(
+    local: &crate::vpn_runtime::connection::StatusSnapshot,
+    remote: &crate::vortix_core::ipc::PassiveSnapshot,
+) -> bool {
+    if local.connection_state == "disconnected" {
+        return remote.tunnels.is_empty();
     }
+    remote.tunnels.iter().any(|tunnel| {
+        local.profile.as_deref() == Some(tunnel.display_name.as_str())
+            && local
+                .interface
+                .as_deref()
+                .is_none_or(|name| name == tunnel.interface_name)
+    })
 }
 
 fn run_watch(interval: u64, config: &AppConfig, config_dir: &Path, mode: OutputMode) -> i32 {
@@ -1196,20 +1180,25 @@ fn run_watch(interval: u64, config: &AppConfig, config_dir: &Path, mode: OutputM
                     profile: Option<String>,
                     #[serde(skip_serializing_if = "Option::is_none")]
                     uptime_secs: Option<u64>,
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    health: Option<ConnectionHealthEntry>,
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    generation: Option<u64>,
                 }
                 let line = WatchLine {
                     ts: chrono_now(),
                     state: snap.connection_state,
                     profile: snap.profile,
                     uptime_secs: snap.uptime_secs,
+                    health: snap.health.as_ref().map(connection_health_entry),
+                    generation: snap.generation,
                 };
                 println!("{}", serde_json::to_string(&line).unwrap_or_default());
             }
             OutputMode::Human => {
                 use std::io::Write;
                 if snap.connection_state == "connected" {
-                    let profile = snap.profile.as_deref().unwrap_or("?");
-                    print!("\r● {profile}");
+                    print!("\r{}", human_status_headline(&snap));
                     if let Some(up) = snap.uptime_secs {
                         let m = up / 60;
                         let s = up % 60;
@@ -1217,7 +1206,7 @@ fn run_watch(interval: u64, config: &AppConfig, config_dir: &Path, mode: OutputM
                     }
                     print!("    ");
                 } else {
-                    print!("\r○ Disconnected    ");
+                    print!("\r{}    ", human_status_headline(&snap));
                 }
                 let _ = std::io::stdout().flush();
             }
@@ -1225,6 +1214,213 @@ fn run_watch(interval: u64, config: &AppConfig, config_dir: &Path, mode: OutputM
         }
 
         std::thread::sleep(Duration::from_secs(interval));
+    }
+}
+
+fn human_status_headline(snap: &crate::vpn_runtime::connection::StatusSnapshot) -> String {
+    let profile = snap.profile.as_deref().unwrap_or("unknown");
+    let protocol = snap.protocol.as_deref().unwrap_or("");
+    match snap.connection_state.as_str() {
+        "connected" => snap.health.as_ref().map_or_else(
+            || format!("● Connected to {profile} ({protocol})"),
+            |health| match health {
+                crate::vortix_core::engine::state::ConnectionHealth::Degraded { .. } => format!(
+                    "⚠ Connected to {profile} ({protocol}) — {}",
+                    connection_health_human(health)
+                ),
+                _ => format!("● Connected to {profile} ({protocol})"),
+            },
+        ),
+        "handshaking" => format!("◐ Handshaking with {profile} (WireGuard)"),
+        "connecting" => format!("◐ Connecting to {profile} (OpenVPN)"),
+        "reconnecting" => format!("↻ Reconnecting to {profile} ({protocol})"),
+        "disconnecting" => format!("◑ Disconnecting {profile} ({protocol})"),
+        "awaiting_input" => format!("? Awaiting input for {profile} ({protocol})"),
+        _ => "○ Disconnected".to_string(),
+    }
+}
+
+fn connection_health_entry(
+    health: &crate::vortix_core::engine::state::ConnectionHealth,
+) -> ConnectionHealthEntry {
+    use crate::vortix_core::engine::state::ConnectionHealth;
+    match health {
+        ConnectionHealth::Unknown => ConnectionHealthEntry {
+            status: "unknown".into(),
+            reason: None,
+        },
+        ConnectionHealth::Healthy => ConnectionHealthEntry {
+            status: "healthy".into(),
+            reason: None,
+        },
+        ConnectionHealth::Degraded { reason } => ConnectionHealthEntry {
+            status: "degraded".into(),
+            reason: Some(degraded_reason_human(reason)),
+        },
+    }
+}
+
+fn connection_health_human(health: &crate::vortix_core::engine::state::ConnectionHealth) -> String {
+    use crate::vortix_core::engine::state::ConnectionHealth;
+    match health {
+        ConnectionHealth::Unknown => "Unknown (measuring)".into(),
+        ConnectionHealth::Healthy => "Healthy".into(),
+        ConnectionHealth::Degraded { reason } => {
+            format!("Degraded: {}", degraded_reason_human(reason))
+        }
+    }
+}
+
+fn degraded_reason_human(reason: &crate::vortix_core::engine::state::DegradedReason) -> String {
+    use crate::vortix_core::engine::state::DegradedReason;
+    match reason {
+        DegradedReason::HandshakeStale {
+            seconds_since_last_handshake,
+        } => format!("handshake stale for {seconds_since_last_handshake}s"),
+        DegradedReason::WireGuardPeerStale {
+            peer_public_key,
+            allowed_routes,
+            seconds_since_last_handshake,
+        } => format!(
+            "peer {} stale for {}s on {}",
+            short_peer(peer_public_key),
+            seconds_since_last_handshake,
+            allowed_routes.join(",")
+        ),
+        DegradedReason::WireGuardPeerNeverObserved {
+            peer_public_key,
+            allowed_routes,
+        } => format!(
+            "peer {} has no handshake on {}",
+            short_peer(peer_public_key),
+            allowed_routes.join(",")
+        ),
+        DegradedReason::HighPacketLoss { loss_percent } => {
+            format!("{loss_percent:.1}% packet loss")
+        }
+        DegradedReason::HighLatency { latency_ms } => format!("{latency_ms}ms latency"),
+    }
+}
+
+fn short_peer(peer: &str) -> &str {
+    peer.get(..peer.len().min(8)).unwrap_or(peer)
+}
+
+#[cfg(test)]
+mod handshake_status_tests {
+    use super::*;
+    use crate::state::{KillSwitchMode, KillSwitchState};
+    use crate::vortix_core::ipc::{PassiveSnapshot, PassiveTunnel};
+    use crate::vortix_core::profile::ProfileId;
+
+    fn snapshot(state: &str, protocol: &str) -> crate::vpn_runtime::connection::StatusSnapshot {
+        crate::vpn_runtime::connection::StatusSnapshot {
+            connection_state: state.into(),
+            health: None,
+            generation: None,
+            profile: Some("corp".into()),
+            protocol: Some(protocol.into()),
+            uptime_secs: None,
+            public_ip: None,
+            server: None,
+            interface: None,
+            internal_ip: None,
+            latency_ms: None,
+            jitter_ms: None,
+            packet_loss_pct: None,
+            quality: None,
+            download_bytes: None,
+            upload_bytes: None,
+            killswitch_mode: KillSwitchMode::Off,
+            killswitch_state: KillSwitchState::Disabled,
+            dns_leak: None,
+            encryption: None,
+            location: None,
+            isp: None,
+        }
+    }
+
+    #[test]
+    fn human_and_watch_headline_distinguish_wireguard_from_openvpn() {
+        assert_eq!(
+            human_status_headline(&snapshot("handshaking", "WireGuard")),
+            "◐ Handshaking with corp (WireGuard)"
+        );
+        assert_eq!(
+            human_status_headline(&snapshot("connecting", "OpenVPN")),
+            "◐ Connecting to corp (OpenVPN)"
+        );
+    }
+
+    #[test]
+    fn human_projection_preserves_typed_health_generation() {
+        let degraded = crate::vortix_core::engine::state::ConnectionHealth::Degraded {
+            reason: crate::vortix_core::engine::state::DegradedReason::WireGuardPeerStale {
+                peer_public_key: "peer-public-key".into(),
+                allowed_routes: vec!["10.0.0.0/24".into()],
+                seconds_since_last_handshake: 181,
+            },
+        };
+        let mut snap = snapshot("connected", "WireGuard");
+        snap.health = Some(degraded.clone());
+        snap.generation = Some(7);
+        assert!(human_status_headline(&snap).contains("stale for 181s"));
+        let projected = connection_health_entry(snap.health.as_ref().unwrap());
+        assert_eq!(projected.status, "degraded");
+        assert!(projected.reason.unwrap().contains("peer-pub"));
+        snap.health = Some(crate::vortix_core::engine::state::ConnectionHealth::Healthy);
+        assert_eq!(
+            connection_health_entry(snap.health.as_ref().unwrap()).status,
+            "healthy"
+        );
+    }
+
+    #[test]
+    fn passive_shadow_comparison_never_requires_authority() {
+        let tunnel = PassiveTunnel {
+            profile_id: ProfileId::new("corp"),
+            display_name: "corp".into(),
+            protocol: crate::vortix_core::profile::ProtocolKind::WireGuard,
+            interface_name: "wg0".into(),
+            observed_at_millis: 1,
+        };
+        let remote = PassiveSnapshot {
+            generation: 1,
+            observed_at_millis: 1,
+            tunnels: vec![tunnel],
+            authoritative: false,
+        };
+        let mut local = snapshot("connected", "WireGuard");
+        local.interface = Some("wg0".into());
+        assert!(passive_projection_matches(&local, &remote));
+        local.interface = Some("wg1".into());
+        assert!(!passive_projection_matches(&local, &remote));
+    }
+
+    #[test]
+    fn json_v2_adds_handshaking_without_claiming_a_primary() {
+        let entry = ConnectionEntry {
+            state: "handshaking".into(),
+            profile: Some("corp".into()),
+            protocol: Some("WireGuard".into()),
+            uptime_secs: None,
+            health: None,
+            generation: None,
+        };
+        let data = StatusData {
+            connections: vec![entry],
+            primary: None,
+            connection: None,
+            network: None,
+            security: StatusSecurity {
+                killswitch_mode: "off".into(),
+                killswitch_state: "disabled".into(),
+            },
+        };
+        let value = serde_json::to_value(data).unwrap();
+        assert_eq!(value["connections"][0]["state"], "handshaking");
+        assert!(value["primary"].is_null());
+        assert!(value["connection"].is_null());
     }
 }
 
@@ -1358,7 +1554,6 @@ fn handle_list(
     // stable profile_id + group label. The lookup is
     // O(N + M) which is fine for the typical handful of profiles.
     let sidecars_by_name: std::collections::HashMap<String, _> = {
-        use crate::vortix_config::profile_store::{FsProfileStore, ProfileStore};
         let store = FsProfileStore::new(config_dir.join(constants::PROFILES_DIR_NAME));
         store
             .list()
@@ -1503,6 +1698,7 @@ mod list_tests {
 
     fn profile(name: &str) -> VpnProfile {
         VpnProfile {
+            id: crate::vortix_core::profile::ProfileId::new(name),
             name: name.to_string(),
             protocol: Protocol::WireGuard,
             config_path: std::path::PathBuf::from(format!("/tmp/{name}.conf")),
@@ -1857,6 +2053,31 @@ struct DeleteData {
     deleted: String,
 }
 
+fn require_profile_inactive(
+    engine: &VpnRuntime,
+    active_name: &str,
+    requested_name: &str,
+    command: &str,
+    retry_command: &str,
+    mode: OutputMode,
+) {
+    let active = crate::core::scanner::get_active_profiles(&engine.profiles);
+    if active.iter().any(|session| session.name == active_name) {
+        print_error_and_exit(
+            mode,
+            command,
+            CliError {
+                code: "state_conflict",
+                message: format!(
+                    "Cannot {command} active profile '{requested_name}' — disconnect first"
+                ),
+                hint: Some(format!("sudo vortix down && {retry_command}")),
+            },
+            ExitCode::StateConflict,
+        );
+    }
+}
+
 fn handle_delete(
     profile_name: &str,
     yes: bool,
@@ -1864,7 +2085,7 @@ fn handle_delete(
     config_dir: &Path,
     mode: OutputMode,
 ) -> i32 {
-    let mut engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
+    let engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
 
     let Some(idx) = engine.find_profile(profile_name) else {
         print_error_and_exit(
@@ -1874,23 +2095,16 @@ fn handle_delete(
             ExitCode::NotFound,
         );
     };
+    let profile_id = engine.profiles[idx].id.clone();
 
-    // Check if profile is active
-    let active = crate::core::scanner::get_active_profiles(&engine.profiles);
-    if active.iter().any(|s| s.name == profile_name) {
-        print_error_and_exit(
-            mode,
-            "delete",
-            CliError {
-                code: "state_conflict",
-                message: format!(
-                    "Cannot delete active profile '{profile_name}' — disconnect first"
-                ),
-                hint: Some(format!("sudo vortix down && vortix delete {profile_name}")),
-            },
-            ExitCode::StateConflict,
-        );
-    }
+    require_profile_inactive(
+        &engine,
+        profile_name,
+        profile_name,
+        "delete",
+        &format!("vortix delete {profile_name}"),
+        mode,
+    );
 
     if !yes && !matches!(mode, OutputMode::Json | OutputMode::Quiet) {
         use std::io::Write;
@@ -1905,15 +2119,50 @@ fn handle_delete(
         }
     }
 
-    let config_path = engine.profiles[idx].config_path.clone();
-    let protocol = engine.profiles[idx].protocol;
-    engine.profiles.remove(idx);
-    if config_path.exists() {
-        let _ = std::fs::remove_file(&config_path);
+    // Profile mutation shares the same cross-process lifecycle authority as
+    // up/down. Reload under the lock and re-check kernel state immediately
+    // before deleting so a tunnel started while the prompt was open cannot
+    // lose its profile.
+    let _lifecycle_lock = acquire_lifecycle_lock_or_exit(mode, "delete");
+    let fresh_engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
+    let Some(fresh_profile) = fresh_engine
+        .profiles
+        .iter()
+        .find(|profile| profile.id == profile_id)
+    else {
+        print_error_and_exit(
+            mode,
+            "delete",
+            err_not_found(profile_name),
+            ExitCode::NotFound,
+        );
+    };
+    let fresh_name = fresh_profile.name.clone();
+    require_profile_inactive(
+        &fresh_engine,
+        &fresh_name,
+        profile_name,
+        "delete",
+        &format!("vortix delete {profile_name}"),
+        mode,
+    );
+
+    let store = FsProfileStore::new(config_dir.join(constants::PROFILES_DIR_NAME));
+    if let Err(error) = store.delete(&profile_id) {
+        print_error_and_exit(
+            mode,
+            "delete",
+            CliError {
+                code: "io_error",
+                message: format!("Delete failed: {error}"),
+                hint: None,
+            },
+            ExitCode::GeneralError,
+        );
     }
-    if matches!(protocol, crate::state::Protocol::OpenVPN) {
-        crate::utils::delete_openvpn_auth_file(profile_name);
-        crate::utils::cleanup_openvpn_run_files(profile_name);
+    if matches!(fresh_profile.protocol, crate::state::Protocol::OpenVPN) {
+        crate::utils::delete_openvpn_auth_file_compat(profile_id.as_str(), &fresh_name);
+        crate::utils::cleanup_openvpn_run_files_compat(profile_id.as_str(), &fresh_name);
     }
 
     let data = DeleteData {
@@ -1941,25 +2190,21 @@ fn handle_rename(
     config_dir: &Path,
     mode: OutputMode,
 ) -> i32 {
-    let mut engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
+    let engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
 
     let Some(idx) = engine.find_profile(old) else {
         print_error_and_exit(mode, "rename", err_not_found(old), ExitCode::NotFound);
     };
+    let profile_id = engine.profiles[idx].id.clone();
 
-    let active = crate::core::scanner::get_active_profiles(&engine.profiles);
-    if active.iter().any(|s| s.name == old) {
-        print_error_and_exit(
-            mode,
-            "rename",
-            CliError {
-                code: "state_conflict",
-                message: format!("Cannot rename active profile '{old}' — disconnect first"),
-                hint: Some(format!("sudo vortix down && vortix rename {old} {new}")),
-            },
-            ExitCode::StateConflict,
-        );
-    }
+    require_profile_inactive(
+        &engine,
+        old,
+        old,
+        "rename",
+        &format!("vortix rename {old} {new}"),
+        mode,
+    );
 
     let trimmed = new.trim();
     if trimmed.is_empty()
@@ -1979,15 +2224,44 @@ fn handle_rename(
             ExitCode::GeneralError,
         );
     }
+    // Preserve the established CLI contract: renaming a profile to its
+    // current display name is reported as the same collision as any other
+    // occupied target, even though the storage port treats it as idempotent.
+    if trimmed == old {
+        print_error_and_exit(
+            mode,
+            "rename",
+            CliError {
+                code: "already_exists",
+                message: format!("A profile named '{trimmed}' already exists"),
+                hint: None,
+            },
+            ExitCode::StateConflict,
+        );
+    }
 
-    let old_path = engine.profiles[idx].config_path.clone();
-    if let Some(parent) = old_path.parent() {
-        let ext = old_path
-            .extension()
-            .map_or("conf", |e| e.to_str().unwrap_or("conf"));
-        let new_file = parent.join(format!("{trimmed}.{ext}"));
+    let _lifecycle_lock = acquire_lifecycle_lock_or_exit(mode, "rename");
+    let fresh_engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
+    let Some(fresh_profile) = fresh_engine
+        .profiles
+        .iter()
+        .find(|profile| profile.id == profile_id)
+    else {
+        print_error_and_exit(mode, "rename", err_not_found(old), ExitCode::NotFound);
+    };
+    require_profile_inactive(
+        &fresh_engine,
+        &fresh_profile.name,
+        old,
+        "rename",
+        &format!("vortix rename {old} {new}"),
+        mode,
+    );
 
-        if new_file.exists() {
+    let store = FsProfileStore::new(config_dir.join(constants::PROFILES_DIR_NAME));
+    match store.rename(&profile_id, trimmed) {
+        Ok(_) => {}
+        Err(ProfileStoreError::NameCollision { .. }) => {
             print_error_and_exit(
                 mode,
                 "rename",
@@ -1999,34 +2273,16 @@ fn handle_rename(
                 ExitCode::StateConflict,
             );
         }
-
-        if let Err(e) = std::fs::rename(&old_path, &new_file) {
-            print_error_and_exit(
-                mode,
-                "rename",
-                CliError {
-                    code: "io_error",
-                    message: format!("Rename failed: {e}"),
-                    hint: None,
-                },
-                ExitCode::GeneralError,
-            );
-        }
-
-        engine.profiles[idx].name = trimmed.to_string();
-        engine.profiles[idx].config_path = new_file;
-        engine.save_metadata();
-    } else {
-        print_error_and_exit(
+        Err(error) => print_error_and_exit(
             mode,
             "rename",
             CliError {
-                code: "invalid_path",
-                message: "Cannot determine parent directory for profile config path".into(),
+                code: "io_error",
+                message: format!("Rename failed: {error}"),
                 hint: None,
             },
             ExitCode::GeneralError,
-        );
+        ),
     }
 
     let data = RenameData {
@@ -2085,7 +2341,22 @@ fn handle_killswitch(
 
         engine.killswitch_mode = ks_mode;
         let (is_connected, active_tunnels) = engine.killswitch_view_from_scanner();
-        engine.sync_killswitch(is_connected, &active_tunnels);
+        if !engine.sync_killswitch(is_connected, &active_tunnels) {
+            print_error_and_exit(
+                output_mode,
+                "killswitch",
+                CliError {
+                    code: "protection_degraded",
+                    message: "Kill-switch policy could not be verified; protection is degraded"
+                        .to_string(),
+                    hint: Some(
+                        "Inspect firewall permissions/backend health, then retry the command"
+                            .to_string(),
+                    ),
+                },
+                ExitCode::GeneralError,
+            );
+        }
     }
 
     // JSON envelope carries the canonical slug — the same string
@@ -2157,8 +2428,16 @@ fn handle_release_killswitch(mode: OutputMode) {
             }
         }
         Err(e) => {
-            eprintln!("Warning: {e}");
-            eprintln!("{}", crate::platform::KILLSWITCH_EMERGENCY_MSG);
+            print_error_and_exit(
+                mode,
+                "release-killswitch",
+                CliError {
+                    code: "release_failed",
+                    message: format!("Kill switch release could not be verified: {e}"),
+                    hint: Some(crate::platform::KILLSWITCH_EMERGENCY_MSG.to_string()),
+                },
+                ExitCode::GeneralError,
+            );
         }
     }
 }

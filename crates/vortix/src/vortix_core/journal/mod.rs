@@ -1,9 +1,9 @@
 //! Engine event journal — JSONL persistence + broadcast channel.
 //!
 //! Two output paths in parallel:
-//! - **Non-lossy mpsc to a writer task** that appends to
+//! - **Bounded mpsc to a writer task** that appends to
 //!   `${XDG_DATA_HOME}/vortix/sessions/<ISO>-<pid>.jsonl`. Each line is one
-//!   [`EventEnvelope`] serialised as JSON.
+//!   [`EventEnvelope`] serialised as JSON. Saturation is returned and counted.
 //! - **Lossy broadcast** (`tokio::sync::broadcast`, capacity 1024). Slow
 //!   subscribers get `Lagged(N)`; they re-sync via [`Journal::tail`].
 //!
@@ -18,9 +18,10 @@ mod retention;
 mod writer;
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::vortix_core::engine::event::{EngineEvent, EventEnvelope};
 
@@ -32,6 +33,7 @@ pub const DEFAULT_RETENTION_DAYS: u32 = 30;
 pub const DEFAULT_RETENTION_COUNT: u32 = 30;
 pub const DEFAULT_BROADCAST_CAPACITY: usize = 1024;
 pub const DEFAULT_TAIL_BUFFER_CAPACITY: usize = 1000;
+pub const DEFAULT_WRITER_CAPACITY: usize = 256;
 
 // ───────────────────────────────────────────────────────────────────────────
 // Process-global journal — installed by `main.rs`, read by bug-report and
@@ -68,6 +70,9 @@ pub struct JournalConfig {
     pub tail_capacity: usize,
     /// Capacity of the broadcast channel.
     pub broadcast_capacity: usize,
+    /// Bounded writer queue. Saturation is returned to the producer and
+    /// counted; records are never silently accepted and lost.
+    pub writer_capacity: usize,
 }
 
 impl Default for JournalConfig {
@@ -79,6 +84,7 @@ impl Default for JournalConfig {
             journal_dir: None,
             tail_capacity: DEFAULT_TAIL_BUFFER_CAPACITY,
             broadcast_capacity: DEFAULT_BROADCAST_CAPACITY,
+            writer_capacity: DEFAULT_WRITER_CAPACITY,
         }
     }
 }
@@ -89,11 +95,14 @@ impl Default for JournalConfig {
 /// Cheap to clone; all clones share the same broadcast / writer.
 #[derive(Clone)]
 pub struct Journal {
-    sender: mpsc::UnboundedSender<EventEnvelope>,
+    sender: mpsc::Sender<EventEnvelope>,
     broadcaster: broadcast::Sender<EventEnvelope>,
     tail: Arc<Mutex<TailBuffer>>,
     /// `Some(path)` when disk persistence is active.
     pub session_path: Option<PathBuf>,
+    overflow_count: Arc<AtomicU64>,
+    writer_failure_count: Arc<AtomicU64>,
+    writer_failure_events: watch::Receiver<u64>,
 }
 
 impl std::fmt::Debug for Journal {
@@ -146,9 +155,17 @@ impl Journal {
     /// when `config.disk` is true.
     #[allow(clippy::needless_pass_by_value)] // borrows would force callers to keep the config alive
     pub fn open(config: JournalConfig) -> std::io::Result<Self> {
-        let (mpsc_tx, mpsc_rx) = mpsc::unbounded_channel::<EventEnvelope>();
+        if config.writer_capacity == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "journal writer capacity must be non-zero",
+            ));
+        }
+        let (mpsc_tx, mpsc_rx) = mpsc::channel::<EventEnvelope>(config.writer_capacity);
         let (bcast_tx, _) = broadcast::channel::<EventEnvelope>(config.broadcast_capacity);
         let tail = Arc::new(Mutex::new(TailBuffer::new(config.tail_capacity)));
+        let writer_failure_count = Arc::new(AtomicU64::new(0));
+        let (writer_failure_tx, writer_failure_events) = watch::channel(0);
 
         let mut session_path = None;
 
@@ -187,6 +204,8 @@ impl Journal {
                 mpsc_rx,
                 bcast_tx.clone(),
                 Arc::clone(&tail),
+                Arc::clone(&writer_failure_count),
+                writer_failure_tx,
             ));
         } else {
             // Disk-disabled mode: still drain the mpsc into broadcast + tail.
@@ -204,6 +223,9 @@ impl Journal {
             broadcaster: bcast_tx,
             tail,
             session_path,
+            overflow_count: Arc::new(AtomicU64::new(0)),
+            writer_failure_count,
+            writer_failure_events,
         };
 
         // Emit the retention-applied event as the first record of the new
@@ -215,14 +237,17 @@ impl Journal {
         Ok(journal)
     }
 
-    /// Enqueue an event for the journal. Returns `Err` only if the writer
-    /// task has terminated (typically only at shutdown).
+    /// Enqueue an event for the journal. Saturation and writer termination are
+    /// explicit errors; an accepted record is never silently discarded.
     pub fn append(&self, event: EngineEvent) -> Result<(), JournalError> {
         let env = EventEnvelope::new(event);
-        self.sender
-            .send(env)
-            .map_err(|_| JournalError::WriterGone)?;
-        Ok(())
+        self.sender.try_send(env).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => {
+                self.overflow_count.fetch_add(1, Ordering::AcqRel);
+                JournalError::Saturated
+            }
+            mpsc::error::TrySendError::Closed(_) => JournalError::WriterGone,
+        })
     }
 
     /// Subscribe to live events. New subscribers receive only events emitted
@@ -241,6 +266,46 @@ impl Journal {
     #[must_use]
     pub fn tail(&self) -> Vec<EventEnvelope> {
         self.tail.lock().unwrap().snapshot()
+    }
+
+    /// Number of records rejected due to bounded-queue saturation.
+    #[must_use]
+    pub fn overflow_count(&self) -> u64 {
+        self.overflow_count.load(Ordering::Acquire)
+    }
+
+    /// Number of disk-open, serialization, write, or flush failures observed
+    /// by the asynchronous writer.
+    #[must_use]
+    pub fn writer_failure_count(&self) -> u64 {
+        self.writer_failure_count.load(Ordering::Acquire)
+    }
+
+    /// Wait until the disk writer reports its first asynchronous failure.
+    ///
+    /// This is an acknowledgment primitive for diagnostics and shutdown
+    /// checks; event producers remain bounded and nonblocking.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JournalError::WriterGone`] if the writer closes without
+    /// publishing a failure receipt.
+    pub async fn wait_for_writer_failure(&self) -> Result<u64, JournalError> {
+        let current = self.writer_failure_count();
+        if current > 0 {
+            return Ok(current);
+        }
+        let mut events = self.writer_failure_events.clone();
+        events
+            .changed()
+            .await
+            .map_err(|_| JournalError::WriterGone)?;
+        let count = *events.borrow_and_update();
+        if count == 0 {
+            Err(JournalError::WriterGone)
+        } else {
+            Ok(count)
+        }
     }
 
     /// Returns the per-session identifier — the `{ISO-timestamp}-{pid}` stem of
@@ -264,6 +329,8 @@ impl Journal {
 
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
+    #[error("journal writer queue is saturated; event was not accepted")]
+    Saturated,
     #[error("journal writer task has terminated")]
     WriterGone,
 }
@@ -292,7 +359,7 @@ mod tests {
 
     fn sample_event() -> EngineEvent {
         EngineEvent::TunnelUp {
-            profile_id: ProfileId::new("corp"),
+            profile_id: ProfileId::parse("c".repeat(ProfileId::HEX_LEN)).unwrap(),
             protocol: ProtocolKind::WireGuard,
             interface_name: "wg0".into(),
             pid: None,
@@ -313,8 +380,16 @@ mod tests {
             journal.append(sample_event()).unwrap();
         }
 
-        // Let the writer drain.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // The tail is updated only after each record has been written and
+        // flushed, so it is the deterministic completion signal for this
+        // asynchronous writer.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while journal.tail().len() < 6 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("journal writer should flush all accepted records");
 
         let path = journal.session_path.clone().expect("session path");
         let content = std::fs::read_to_string(&path).unwrap();
@@ -379,5 +454,49 @@ mod tests {
             saw_tunnel_up,
             "subscriber should have received the TunnelUp event"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn bounded_writer_reports_saturation_without_silent_loss() {
+        let journal = Journal::open(JournalConfig {
+            disk: false,
+            writer_capacity: 1,
+            ..Default::default()
+        })
+        .unwrap();
+
+        // `open` synchronously accepts the retention event before this
+        // current-thread runtime lets the writer drain its sole queue slot.
+        assert!(matches!(
+            journal.append(sample_event()),
+            Err(JournalError::Saturated)
+        ));
+        assert_eq!(journal.overflow_count(), 1);
+
+        tokio::task::yield_now().await;
+        journal
+            .append(sample_event())
+            .expect("writer drained after yielding");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn writer_open_failure_closes_transport_and_reports_loss() {
+        let tmp = tempfile::tempdir().unwrap();
+        let journal_dir = tmp.path().join("journal");
+        let journal = Journal::open(JournalConfig {
+            disk: true,
+            journal_dir: Some(journal_dir.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        // The current-thread writer has not run yet. Removing its parent
+        // deterministically injects an asynchronous open failure.
+        std::fs::remove_dir_all(journal_dir).unwrap();
+        assert_eq!(journal.wait_for_writer_failure().await.unwrap(), 1);
+        assert!(matches!(
+            journal.append(sample_event()),
+            Err(JournalError::WriterGone)
+        ));
     }
 }

@@ -29,6 +29,37 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Serde adapter for public wire fields that must use the canonical CLI
+/// slugs instead of Rust variant names.
+///
+/// Apply with `#[serde(with = "...::serde_mode_slug")]`. Keeping this
+/// opt-in avoids silently changing older on-disk formats while ensuring new
+/// control-plane contracts cannot expose `Auto` or `AlwaysOn`.
+pub mod serde_mode_slug {
+    use serde::{de::Error as _, Deserialize, Deserializer, Serializer};
+
+    use super::KillSwitchMode;
+
+    pub fn serialize<S>(mode: &KillSwitchMode, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(mode.cli_verb())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<KillSwitchMode, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let slug = String::deserialize(deserializer)?;
+        KillSwitchMode::from_cli_verb(&slug).ok_or_else(|| {
+            D::Error::custom(format_args!(
+                "invalid kill-switch mode `{slug}`; use off, block-on-drop, vpn-only"
+            ))
+        })
+    }
+}
+
 /// Kill switch operating mode.
 ///
 /// Determines when the kill switch should activate. See the module
@@ -106,8 +137,8 @@ impl KillSwitchMode {
     /// |------------|----------------|---------------|------------|
     /// | `Off`      | (any)          | (any)         | `Disabled` |
     /// | `Auto`     | true           | (any)         | `Armed`    |
-    /// | `Auto`     | false          | `Blocking`    | `Blocking` |
-    /// | `Auto`     | false          | not Blocking  | `Armed`    |
+    /// | `Auto`     | false          | Blocking/Degraded | `Blocking` |
+    /// | `Auto`     | false          | Disabled/Armed | `Armed`    |
     /// | `AlwaysOn` | (any)          | (any)         | `Blocking` |
     ///
     /// `AlwaysOn` always resolves to `Blocking` — the firewall stays
@@ -125,7 +156,10 @@ impl KillSwitchMode {
             Self::Auto => {
                 if is_connected {
                     KillSwitchState::Armed
-                } else if matches!(old_state, KillSwitchState::Blocking) {
+                } else if matches!(
+                    old_state,
+                    KillSwitchState::Blocking | KillSwitchState::Degraded
+                ) {
                     KillSwitchState::Blocking
                 } else {
                     KillSwitchState::Armed
@@ -170,7 +204,8 @@ impl KillSwitchMode {
     }
 }
 
-/// Current kill switch operational state.
+/// Current kill switch operational state. `Degraded` is the explicit
+/// no-claim state when policy application or read-back cannot be proven.
 ///
 /// Like [`KillSwitchMode`], renders through helper methods rather
 /// than the variant name. [`Self::display_status`] is the prose form
@@ -189,6 +224,10 @@ pub enum KillSwitchState {
     /// (steady state) or by `Auto` mode after detecting a VPN drop.
     /// Slug: `blocking`.
     Blocking,
+    /// A firewall mutation or ownership read-back failed, or previously
+    /// verified evidence became stale. No protection claim is valid until a
+    /// fresh synchronization succeeds. Slug: `degraded`.
+    Degraded,
 }
 
 impl KillSwitchState {
@@ -198,8 +237,8 @@ impl KillSwitchState {
         matches!(self, Self::Blocking)
     }
 
-    /// Prose form shown to humans (`Inactive` / `Watching` /
-    /// `Blocking`). One vocabulary across TUI, CLI, and JSON — same
+    /// Prose form shown to humans (`Inactive` / `Watching` / `Blocking` /
+    /// `Degraded`). One vocabulary across TUI, CLI, and JSON — same
     /// letters as [`Self::cli_verb`], just capitalised.
     #[must_use]
     pub const fn display_status(self) -> &'static str {
@@ -207,6 +246,7 @@ impl KillSwitchState {
             Self::Disabled => "Inactive",
             Self::Armed => "Watching",
             Self::Blocking => "Blocking",
+            Self::Degraded => "Degraded",
         }
     }
 
@@ -218,6 +258,7 @@ impl KillSwitchState {
             Self::Disabled => "inactive",
             Self::Armed => "watching",
             Self::Blocking => "blocking",
+            Self::Degraded => "degraded",
         }
     }
 }
@@ -238,6 +279,7 @@ mod tests {
         assert!(!KillSwitchState::Disabled.is_blocking());
         assert!(!KillSwitchState::Armed.is_blocking());
         assert!(KillSwitchState::Blocking.is_blocking());
+        assert!(!KillSwitchState::Degraded.is_blocking());
     }
 
     #[test]
@@ -246,6 +288,7 @@ mod tests {
             KillSwitchState::Disabled,
             KillSwitchState::Armed,
             KillSwitchState::Blocking,
+            KillSwitchState::Degraded,
         ] {
             for is_connected in [false, true] {
                 assert_eq!(
@@ -279,6 +322,11 @@ mod tests {
             KillSwitchMode::Auto.desired_state(KillSwitchState::Blocking, false),
             KillSwitchState::Blocking
         );
+        assert_eq!(
+            KillSwitchMode::Auto.desired_state(KillSwitchState::Degraded, false),
+            KillSwitchState::Blocking,
+            "degraded prior blocking intent must retry verification"
+        );
     }
 
     /// Regression for the `AlwaysOn` killswitch semantic fix (commit
@@ -294,6 +342,7 @@ mod tests {
             KillSwitchState::Disabled,
             KillSwitchState::Armed,
             KillSwitchState::Blocking,
+            KillSwitchState::Degraded,
         ] {
             for is_connected in [false, true] {
                 assert_eq!(

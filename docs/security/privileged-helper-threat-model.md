@@ -1,0 +1,254 @@
+# Privileged helper threat model
+
+Status: U11 contract foundation frozen; U12 authenticated observation/recovery, tunnel
+lifecycle, ordered network-policy, and exact-owned cleanup admission cores are
+implemented but dormant; helper staged and **unenrolled**. No privileged
+operation is reachable in this release. U12 enables remaining execution
+backends behind the dormant boundary; U13 alone may enroll authority.
+
+## Security objective
+
+Background mode reduces the privileged computing base to a root helper that
+accepts only validated, typed Vortix operations. The helper is not a generic
+command runner. It never accepts profile text, shell text, executable names,
+arguments, environment variables, client paths, or client-selected service
+files.
+
+This boundary protects root-owned network state and Vortix-owned tunnel
+processes from malformed or replayed daemon requests. It does not attempt to
+isolate applications running as the same Unix user from one another.
+
+## Trust assumptions
+
+- The kernel, service manager, root account, package manager, and platform
+  signature verifier are trusted.
+- The installed helper, bootstrap, daemon, release manifest, service template,
+  and root ledger are root-owned and not group/world writable.
+- The enrolled owner is one non-root UID. Any process with that UID can use the
+  client-to-daemon socket and answer that user's Vortix challenges. Vortix does
+  not claim same-UID application isolation.
+- The daemon is unprivileged and may be compromised. Its scalar identity claims
+  are untrusted until matched against kernel and service-manager facts.
+- Imported VPN profiles, protocol servers, local clients, environment, IPC
+  bytes, filesystem names outside fixed roots, PIDs, and scanner observations
+  are attacker-controlled.
+- Standard mode intentionally retains the existing `sudo vortix` full-client
+  trust boundary for compatibility. It is not equivalent to Background mode's
+  narrow helper. Users seeking a smaller privileged computing base should use
+  Background mode once enrollment ships.
+
+## Components and boundaries
+
+1. CLI/TUI clients authenticate to the unprivileged daemon as the enrolled UID.
+2. The daemon converts already-validated profiles into the canonical
+   `vortix_core::privileged` plan. It cannot construct root authority.
+3. The root helper authenticates the daemon using peer UID/PID, process start
+   token, service-manager instance/containment, root-owned executable digest,
+   manager nonce, current boot scope, authority epoch, and lease.
+4. The helper independently decodes and validates the canonical plan, admits it
+   through the replay ledger, executes only its fixed operation family, and
+   returns an untrusted receipt. The daemon trusts a receipt only after binding
+   it back to the authenticated helper, request digest, epoch, lease, and
+   sequence.
+
+U11 implements step 2's wire vocabulary and step 3's verification seam. U12's
+first typed slices add replay-before-effect admission, authenticated receipts,
+post-delivery loss classification, bounded symmetric framing, an opaque
+root-peer/fixed-socket/package-artifact proof, and protocol-specific tunnel
+ownership with duplicate-safe lifecycle receipts. No listener or production
+platform executor exists yet. The `vortix-helper` binary exits with code 78 for
+every entrypoint except `--version`.
+
+## Admitted operation family
+
+The contract is closed and typed:
+
+- start one WireGuard or OpenVPN tunnel from a canonical protocol plan;
+- stop one exact Vortix-owned tunnel resource;
+- establish, apply, observe, or release one generation-owned network policy;
+- observe an explicit bounded resource set;
+- clean up explicit tunnel/process-group/runtime-secret resources owned by the
+  current authority.
+
+Protocol plans use fixed material slots and validated addresses, CIDRs,
+hostnames, routes, DNS assignments, generations, and stable profile IDs. The
+OpenVPN directive allowlist is documented in
+`docs/security/openvpn-privileged-directive-inventory.md`. Unknown variants,
+fields, protocols, directives, resources, duplicates, and over-bound
+collections fail during strict deserialization.
+
+There is deliberately no operation for arbitrary process execution, arbitrary
+file access, arbitrary firewall/DNS/route commands, service installation,
+profile parsing, hooks, or arbitrary cleanup.
+
+## Wire and authorization
+
+- Helper frames are capped at 256 KiB before JSON allocation.
+- Strict serde shapes reject unknown fields and unknown enum variants.
+- A mandatory first handshake negotiates product, protocol range, schema range,
+  and required capabilities.
+- The U11 staged helper enables only `handshake`. Advertising the future
+  contract does not enable it; requests for operational capabilities fail.
+- The service claim alone grants nothing. The helper compares every claim field
+  to OS-owned facts before an opaque root-authority capability can exist.
+- Operation IDs bind authority epoch, lease, helper epoch, sequence, principal,
+  and canonical semantic digest. Same-ID/different-digest requests fail.
+- The root replay high-water record is monotonic, boot/lease bound, and written
+  atomically before an effect is admitted.
+- A WireGuard start owns only the exact present interface after its bounded
+  setup process exits. An OpenVPN start additionally owns the exact foreground
+  containment identity for the admitted profile/generation. A duplicate of the
+  current operation returns the cached receipt instead of executing again.
+- Stop reaches the executor only for an exact tunnel owned by the current
+  helper incarnation and completes only on an exact absent observation after
+  any foreground child has been reaped.
+- Network policy advances through blocking, routes, DNS, firewall, and release
+  under the persisted predecessor cursor. Observation barriers and release
+  absence proofs update that cursor only after their authenticated receipt is
+  durably persisted; failure poisons the helper session.
+- Cleanup reaches the platform executor only for exact resources already owned
+  by this helper incarnation. Ownership survives ambiguous/mismatched results
+  and is forgotten only after authenticated exact-absence observations.
+- Replay high-water state uses the fixed package layout and a bounded,
+  strict-decoded, root-owned `0600` file in a root-owned `0700` directory.
+  Updates use same-directory create-exclusive temporary files, file and
+  directory fsync, atomic rename, no-follow opens, and reject hard links.
+  The versioned envelope already bounds exact owned-resource and child-
+  observation slots; loading a child identity never recreates `OwnedChild`.
+- Each tunnel's physical runtime identity is derived from the root-ledger lease
+  plus the exact profile/generation tag. The derivation yields a full-digest
+  root-runtime directory and a 15-byte kernel-safe alias; no caller-supplied
+  path or interface name participates. Same-lease helper restarts therefore
+  scan the same artifacts, while a new authority lease cannot silently adopt
+  stale physical state.
+- OpenVPN certificate/key material crosses the dormant helper seam only as an
+  inherited, non-serializable regular-file descriptor set keyed by the plan's
+  fixed slots. The helper binds the plan to the runtime profile/generation,
+  requires an exact slot match, rewinds and length-checks each descriptor,
+  bounds it to 1 MiB, zeroizes its read buffer, and creates the minimal
+  configuration plus material files at `0600` inside lease-derived root-owned
+  `0700` directories using exclusive no-follow writes. Partial staging rolls
+  back through an owning guard; terminal cleanup authenticates the created
+  device/inode and leaves shared lifecycle directories or replaced artifacts
+  untouched rather than recursively deleting them. No profile path or material
+  byte enters the helper request, debug output, or error text.
+- Privileged contract schema v2 binds each observation target to its validated
+  protocol when OS evidence is protocol-specific. Tunnel observations require
+  a protocol, process-group observations require OpenVPN, and topology or
+  runtime-secret observations reject one. The executor therefore never guesses
+  a backend from mutable files, processes, or interface names.
+- Tunnel read-back proves Linux state only against the authority-derived kernel
+  alias and proves macOS dynamic state only through a bounded fixed-path
+  interface-name artifact. OpenVPN process-group read-back requires a bounded
+  fixed-path child record whose tunnel resource and containment ID match the
+  authenticated lease, then revalidates the live kernel PID start token and
+  private process-group leadership through `/proc/<pid>/stat` on Linux or
+  `proc_pidinfo` on macOS. Child records are installed by an atomic,
+  no-overwrite hard-link handoff beneath lease-derived `0700` directories and
+  removed only when their strict content still matches the reaped child. The
+  store obtains the start token and private-group proof directly from the
+  kernel after spawn containment; it cannot persist a numeric PID or a
+  caller-constructed start token.
+  Evidence opens are no-follow and accept only root-owned, single-link regular
+  files that are not group/world writable.
+  Missing or unreadable evidence remains `unknown`; stale, relabelled, or
+  malformed evidence is `drifted`. Policy evidence remains `unknown` until its
+  OS-specific verifier lands; absence is never inferred from an unsupported
+  probe.
+- PID identity always includes a process start token and containment identity;
+  a numeric PID alone is never ownership evidence.
+
+After a framing timeout, authentication mismatch, helper restart, reply loss,
+or mid-operation disconnect, the connection is discarded. The daemon marks the
+operation unavailable or ambiguous, reconnects with a new handshake, scans, and
+reconciles before any retry. It never assumes that a missing reply means an
+effect did not happen.
+
+## Installation and enrollment
+
+The guided CLI/TUI setup and advanced service-install command must consume the
+same immutable `InstallPlan`; they may not implement separate privileged copy
+logic. The guided client never re-executes itself as root. It may invoke system
+`sudo` directly, without a shell, only for an absolute package-supplied
+bootstrap after preflight.
+
+The bootstrap accepts a sanitized `InstallRequest` containing only owner UID,
+target platform layout, package channel, manifest generation/digest, and a nonce. It rejects root as an
+owner, unknown fields, unsafe environment, replay, changed manifest, and every
+unsupported channel. It re-verifies its own root-owned/immutable or signed
+identity and the canonical manifest before staging fixed paths.
+
+| Platform | Artifact | Fixed path |
+|---|---|---|
+| Linux | daemon | `/usr/libexec/vortix/vortix` |
+| Linux | helper | `/usr/libexec/vortix/vortix-helper` |
+| Linux | bootstrap | `/usr/libexec/vortix/vortix-bootstrap` |
+| Linux | helper socket | `/run/vortix/helper.sock` |
+| Linux | helper runtime root | `/run/vortix` |
+| Linux | root ledger | `/var/lib/vortix/helper-ledger.json` |
+| macOS | daemon | `/Library/Application Support/Vortix/bin/vortix` |
+| macOS | helper | `/Library/PrivilegedHelperTools/com.vortix.helper` |
+| macOS | bootstrap | `/Library/PrivilegedHelperTools/com.vortix.bootstrap` |
+| macOS | helper socket | `/var/run/vortix/helper.sock` |
+| macOS | helper runtime root | `/var/run/vortix` |
+| macOS | root ledger | `/Library/Application Support/Vortix/helper-ledger.json` |
+
+Package-channel classification is fail closed:
+
+| Channel | Background enrollment |
+|---|---|
+| Linux distro/system package | supported after artifact verification |
+| Signed macOS installer package | supported after signature verification |
+| Homebrew | unsupported; Standard mode plus signed-package guidance |
+| `cargo install` | unsupported; user-writable layout remains Standard mode |
+| source build | unsupported unless a trusted administrator creates a system package |
+
+Installing files or cancelling setup does not enroll, enable, or start a daemon
+or helper. Service examples are disabled templates. U13 must transactionally
+create the enrollment marker, lease, socket metadata, and service enablement.
+Failure or cancellation revokes setup-created leases and metadata, stops jobs,
+and removes setup-created staged artifacts. Package-owned inactive files may
+remain only when verified, disclosed, and safe for retry.
+
+## Upgrade and uninstall
+
+Upgrade is expand-first:
+
+1. verify and stage the new daemon/helper/bootstrap and manifest beside the
+   current generation;
+2. preserve the prior manifest digest and binary generation;
+3. negotiate overlapping protocol/schema capabilities;
+4. stop admission, drain bounded work, and reconcile ambiguous effects;
+5. switch the service-manager identity atomically;
+6. retain rollback artifacts until the new generation completes a handshake
+   and read-only health check;
+7. revoke the old lease before deleting prior artifacts.
+
+Uninstall first disables admission and boot policy, preserves fail-closed
+network protection while owned tunnels are reconciled, stops/reaps owned
+children, removes only ledger-owned policy resources, revokes leases and
+sockets, then removes service definitions and artifacts. If ownership or
+read-back is ambiguous, uninstall stops and reports recovery instructions
+instead of broadly flushing firewall, DNS, routes, or foreign processes.
+
+## Threat review
+
+| Threat | Control | Residual severity |
+|---|---|---|
+| Malformed/oversized/deep wire | frame cap, strict bounded decoding, closed enums | low |
+| Generic command/path/environment injection | no such contract fields; fixed roots/material slots | low |
+| Same-user daemon impostor | service-manager instance, peer PID/start token, executable digest, nonce, containment | low after U12 OS verifier |
+| Cross-user/root-owner enrollment | non-root owner rule plus peer credentials | low |
+| PID reuse or stale process observation | start token, containment ID, generation-owned resource | low |
+| Replay or duplicate ID mutation | boot/lease/epoch/sequence/digest ledger | low |
+| Symlink/path substitution | fixed root-owned paths; `openat`/`O_NOFOLLOW`; inode recheck | low after installer implementation |
+| Replaced package/bootstrap/manifest | digest/signature and root ownership verification | low after installer implementation |
+| Reply/helper loss after effect | ambiguous result, scan-before-retry reconciliation | medium availability; low integrity |
+| Compromised enrolled UID answers challenges | explicit Unix same-UID assumption | accepted model limitation |
+| Compromised root/kernel/package manager | outside Vortix's threat boundary | accepted platform limitation |
+| Standard mode runs full client as root | explicit compatibility tradeoff; recommend Background | accepted until user opts in |
+
+No unresolved high-severity finding is accepted for implementation. Controls
+marked “after U12” or “after installer implementation” are represented by
+non-constructible/dormant seams in U11; authority remains unreachable until
+those controls and their Linux/macOS adversarial tests are complete.

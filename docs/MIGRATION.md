@@ -38,18 +38,38 @@ and creates a sibling `.meta.toml` next to each existing `.conf` /
 └── home.meta.toml            ← new sidecar
 ```
 
-Each sidecar carries a stable `profile_id` (SHA-256 of the name + first
-4 KiB of the config), the original `display_name`, and the protocol.
+Each sidecar carries a stable `profile_id` assigned once during import or
+migration, the original `display_name`, and the protocol.
 v0.2.x ignores `.meta.toml` files entirely, so rollback is safe.
 
-The migration is **idempotent** — it re-runs at every startup and only
-touches profiles that don't have a sidecar yet. There is no explicit
-`vortix migrate` command; if you need to re-trigger after fixing
-something (e.g., a permissions issue), just restart vortix.
+The migration is **idempotent** — it re-runs at every startup and creates
+sidecars only for profiles that lack one. There is no explicit `vortix migrate`
+command; if you need to re-trigger after fixing something (e.g., a permissions
+issue), just restart vortix.
+
+Older Vortix releases could leave a `.meta.toml` behind after deleting its
+profile config. During the one-time archive phase, Vortix first saves the
+active profile IDs plus a size and SHA-256 record for each config-less legacy
+sidecar. It then moves those exact files into
+`profiles/.vortix-legacy-sidecars-v1/` and atomically marks the phase complete.
+If startup is interrupted, the next run revalidates the active catalog and
+resumes from the durable record before moving anything else. The archived files
+remain available to the invoking user for rollback and inspection, but no
+longer participate in the active profile catalog. Active configs and their
+matching sidecars are unchanged.
+
+To restore an archived identity, stop Vortix, restore the matching `.conf` or
+`.ovpn`, move its `.meta.toml` from `.vortix-legacy-sidecars-v1/` back beside
+the config, back up and remove `.vortix-profile-inventory-v1.toml`, then restart
+Vortix. The rebuilt inventory reads the restored sidecar and keeps its existing
+profile ID. Do this only while Vortix is stopped; a config-set change against a
+saved inventory intentionally fails closed.
 
 If migration ever fails (read-only profile dir, unusual perms, etc.),
-startup continues and the warning is logged to stderr. No panic, no
-data loss.
+startup fails before any tunnel lifecycle mutation. No profile is silently
+adopted or assigned a replacement identity. If the managed profile inventory
+changed unexpectedly, restore that directory to its saved inventory first;
+then add new profiles from outside it with `vortix import <path>`.
 
 ### Override
 
@@ -274,6 +294,39 @@ v0.3.x ("V1"), follow this procedure.
 No data destructively rewritten by V2 — every change is
 read-then-write-new-file, so the worst-case rollback is "delete
 `killswitch-state.json` and re-arm."
+
+---
+
+## Migrate profile scripts to lifecycle hooks
+
+Vortix no longer permits executable directives inside WireGuard or OpenVPN
+profiles. In particular, WireGuard `PreUp`, `PostUp`, `PreDown`, and
+`PostDown`, and OpenVPN script/plugin directives are rejected before the
+profile can reach a privileged protocol process. This closes the historical
+path where `sudo vortix` could cause profile text to execute as root.
+
+Move observational automation into `settings.toml` as a global hook:
+
+```toml
+[[hooks]]
+event = "connected"
+executable = "/usr/local/bin/vpn-notify"
+args = ["connected"]
+timeout_secs = 5
+```
+
+Supported events are `connect_started`, `connected`, `disconnect_started`,
+`disconnected`, `connect_failed`, and `reconnecting`. The executable must be
+an absolute path and arguments must be separate array entries; Vortix never
+passes this through a shell. Hooks run asynchronously as the proved non-root
+owner with a clean, allowlisted environment. They cannot veto or delay a VPN
+transition, are attempted at most once, and may be lost if Vortix crashes.
+
+There is no automatic conversion from a profile command string: shell syntax
+cannot be translated safely into an executable/argv boundary. Split the old
+command manually and choose the lifecycle fact that matches its observational
+purpose. Firewall, route, DNS, and other privileged policy changes should use
+Vortix's managed policy instead of a hook.
 
 ---
 

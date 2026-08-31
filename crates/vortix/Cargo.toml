@@ -40,6 +40,10 @@ exclude = [
 name = "vortix"
 path = "src/main.rs"
 
+[[bin]]
+name = "vortix-helper"
+path = "src/bin/vortix-helper.rs"
+
 [dependencies]
 # TUI Framework
 ratatui = { workspace = true }
@@ -78,6 +82,10 @@ thiserror = { workspace = true }
 directories = { workspace = true }
 figment = { workspace = true }
 sha2 = "0.11"
+# Compiler-resistant clearing for in-memory challenge answers. This is already
+# present transitively through rustls; declaring it directly makes the secret
+# handling contract explicit without adding another package to the graph.
+zeroize = "1.8"
 # Plan 2026-06-02-001 U2 (#191): base64 envelope for OpenVPN SCRV1
 # static-challenge auth files. STANDARD alphabet only — see
 # `vortix_protocol_openvpn::tunnel` consumers and the plan's Key Tech

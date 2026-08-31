@@ -50,6 +50,23 @@ fn test_app() -> App {
     }
 }
 
+fn wait_for_dns_policy_result(app: &mut App) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let message = app
+            .runtime
+            .cmd_rx
+            .recv_timeout(remaining)
+            .expect("DNS policy worker did not complete");
+        let is_dns_result = matches!(message, Message::DnsPolicyResult { .. });
+        app.handle_message(message);
+        if is_dns_result {
+            return;
+        }
+    }
+}
+
 /// Helper: put app into a Connected state for a given profile name.
 ///
 /// Mirrors into the registry so helpers/renderers (which read
@@ -69,6 +86,25 @@ fn set_connected(app: &mut App, name: &str) {
     app.mirror_connect_into_registry(name, &details, Instant::now());
 }
 
+#[test]
+fn u1_multi_tunnel_no_primary_projection_is_stable_and_sorted() {
+    let mut app = test_app();
+    set_connected(&mut app, "zeta");
+    set_connected(&mut app, "alpha");
+
+    let snapshots = app.registry.snapshot_all();
+    let names: Vec<&str> = snapshots
+        .iter()
+        .map(|snapshot| snapshot.profile_id.as_str())
+        .collect();
+    assert_eq!(names, ["alpha", "zeta"]);
+    assert!(app.registry.primary().is_none());
+    let ConnectionState::Connected { profile, .. } = app.legacy_state() else {
+        panic!("legacy no-primary projection must choose the first active snapshot");
+    };
+    assert_eq!(profile, "alpha");
+}
+
 /// Helper: put app into a Disconnecting state for a given profile name.
 ///
 /// Production semantics: a profile only reaches Disconnecting via
@@ -83,7 +119,7 @@ fn set_disconnecting(app: &mut App, name: &str) {
     if app.registry.snapshot(&ProfileId::new(name)).is_none() {
         set_connected(app, name);
     }
-    app.mirror_disconnecting_into_registry(name);
+    app.mark_teardown_pending(name);
 }
 
 /// Helper: create a fake `ActiveSession` for scanner results.
@@ -100,9 +136,187 @@ fn fake_session(name: &str) -> ActiveSession {
         transfer_rx: "100 KiB".to_string(),
         transfer_tx: "50 KiB".to_string(),
         latest_handshake: "5 seconds ago".to_string(),
+        wireguard_peers: Vec::new(),
         pid: Some(12345),
         started_at: None,
     }
+}
+
+fn wg_peer(
+    key: &str,
+    observed_at: std::time::SystemTime,
+    handshake: Option<std::time::SystemTime>,
+    bytes: u64,
+    keepalive: bool,
+) -> crate::vortix_core::ports::tunnel::TunnelPeerStatus {
+    crate::vortix_core::ports::tunnel::TunnelPeerStatus {
+        public_key: key.into(),
+        endpoint: None,
+        allowed_routes: vec!["10.0.0.0/24".into()],
+        latest_handshake: handshake,
+        evidence_observed_at: observed_at,
+        evidence_generation: 0,
+        persistent_keepalive: keepalive.then(|| std::time::Duration::from_secs(25)),
+        bytes_rx: bytes,
+        bytes_tx: 0,
+    }
+}
+
+#[test]
+fn scanner_only_wireguard_is_unmanaged_handshaking_even_with_history() {
+    use crate::vortix_core::engine::state::Connection;
+    use crate::vortix_core::profile::ProfileId;
+
+    let mut app = test_app();
+    add_profiles(&mut app, &["vpn-a"]);
+    let mut session = fake_session("vpn-a");
+    session.wireguard_peers = vec![wg_peer(
+        "peer-a",
+        std::time::SystemTime::now(),
+        Some(std::time::SystemTime::now()),
+        10_000,
+        true,
+    )];
+    app.handle_message(Message::SyncSystemState {
+        sessions: vec![session],
+        default_route: crate::vortix_core::ports::route_table::DefaultRouteObservation::Interface(
+            "wg0".into(),
+        ),
+    });
+    let id = ProfileId::new("vpn-a");
+    let snap = app.registry.snapshot(&id).unwrap();
+    assert!(matches!(
+        snap.state,
+        Connection::Connecting { attempt: 0, .. }
+    ));
+    assert!(app.runtime.scanner_observed_wireguard.contains(&id));
+    assert!(app.registry.primary().is_none());
+}
+
+#[test]
+fn cumulative_bytes_without_a_recent_delta_leave_peer_informational() {
+    let now = std::time::SystemTime::now();
+    let old = now
+        .checked_sub(std::time::Duration::from_secs(600))
+        .unwrap();
+    let mut activity = std::collections::HashMap::new();
+    let health = super::connection::wireguard_health_from_session(
+        &[wg_peer("peer-a", now, Some(old), 50_000, false)],
+        &mut activity,
+        &[],
+        std::time::Duration::from_secs(180),
+    );
+    assert_eq!(
+        health,
+        crate::vortix_core::engine::state::ConnectionHealth::Unknown
+    );
+}
+
+#[test]
+fn recent_per_peer_delta_establishes_expectation_and_stale_health() {
+    use crate::vortix_core::engine::state::{ConnectionHealth, DegradedReason};
+    let now = std::time::SystemTime::now();
+    let prior = now.checked_sub(std::time::Duration::from_secs(1)).unwrap();
+    let old_handshake = now
+        .checked_sub(std::time::Duration::from_secs(600))
+        .unwrap();
+    let mut activity = std::collections::HashMap::new();
+    let _ = super::connection::wireguard_health_from_session(
+        &[wg_peer("peer-a", prior, Some(old_handshake), 100, false)],
+        &mut activity,
+        &[],
+        std::time::Duration::from_secs(180),
+    );
+    let health = super::connection::wireguard_health_from_session(
+        &[wg_peer("peer-a", now, Some(old_handshake), 101, false)],
+        &mut activity,
+        &[],
+        std::time::Duration::from_secs(180),
+    );
+    assert!(matches!(
+        health,
+        ConnectionHealth::Degraded {
+            reason: DegradedReason::WireGuardPeerStale { peer_public_key, .. }
+        } if peer_public_key == "peer-a"
+    ));
+}
+
+#[test]
+fn expected_never_observed_peer_prevents_aggregate_healthy() {
+    use crate::vortix_core::engine::state::{ConnectionHealth, DegradedReason};
+    let now = std::time::SystemTime::now();
+    let mut activity = std::collections::HashMap::new();
+    let health = super::connection::wireguard_health_from_session(
+        &[
+            wg_peer("healthy", now, Some(now), 0, true),
+            wg_peer("missing", now, None, 0, true),
+        ],
+        &mut activity,
+        &[],
+        std::time::Duration::from_secs(180),
+    );
+    assert!(matches!(
+        health,
+        ConnectionHealth::Degraded {
+            reason: DegradedReason::WireGuardPeerNeverObserved { peer_public_key, .. }
+        } if peer_public_key == "missing"
+    ));
+}
+
+#[test]
+fn recorded_probe_not_config_presence_establishes_route_expectation() {
+    use crate::vortix_core::engine::state::ConnectionHealth;
+    let now = std::time::SystemTime::now();
+    let old = now
+        .checked_sub(std::time::Duration::from_secs(600))
+        .unwrap();
+    let peer = wg_peer("peer-a", now, Some(old), 0, false);
+    let mut activity = std::collections::HashMap::new();
+    let no_probe = super::connection::wireguard_health_from_session(
+        std::slice::from_ref(&peer),
+        &mut activity,
+        &[],
+        std::time::Duration::from_secs(180),
+    );
+    assert_eq!(no_probe, ConnectionHealth::Unknown);
+
+    let probe = crate::vortix_core::ports::tunnel::ProbeReceipt {
+        peer_public_key: "peer-a".into(),
+        target: "10.0.0.1".parse().unwrap(),
+        allowed_routes: peer.allowed_routes.clone(),
+        issued_at: now,
+    };
+    let with_probe = super::connection::wireguard_health_from_session(
+        &[peer],
+        &mut activity,
+        &[probe],
+        std::time::Duration::from_secs(180),
+    );
+    assert!(matches!(with_probe, ConnectionHealth::Degraded { .. }));
+}
+
+#[test]
+fn issued_probe_expectation_does_not_expire_into_unknown() {
+    use crate::vortix_core::engine::state::ConnectionHealth;
+    let now = std::time::SystemTime::now();
+    let old = now
+        .checked_sub(std::time::Duration::from_secs(900))
+        .unwrap();
+    let peer = wg_peer("peer-a", now, Some(old), 0, false);
+    let probe = crate::vortix_core::ports::tunnel::ProbeReceipt {
+        peer_public_key: "peer-a".into(),
+        target: "10.0.0.1".parse().unwrap(),
+        allowed_routes: peer.allowed_routes.clone(),
+        issued_at: old,
+    };
+    let mut activity = std::collections::HashMap::new();
+    let health = super::connection::wireguard_health_from_session(
+        &[peer],
+        &mut activity,
+        &[probe],
+        std::time::Duration::from_secs(180),
+    );
+    assert!(matches!(health, ConnectionHealth::Degraded { .. }));
 }
 
 // ====================================================================
@@ -124,7 +338,8 @@ fn test_disconnect_result_success_transitions_to_disconnected() {
     // session gone, which finishes the disconnect.
     app.handle_message(Message::SyncSystemState {
         sessions: vec![],
-        default_route_interface: None,
+        default_route:
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
     });
 
     assert!(
@@ -169,6 +384,23 @@ fn test_disconnect_result_success_from_non_disconnecting_state() {
     assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
 }
 
+#[test]
+fn connection_timeout_retains_nonterminal_state_when_teardown_is_unconfirmed() {
+    let mut app = test_app();
+    set_connecting(&mut app, "test-vpn");
+
+    app.handle_message(Message::ConnectionTimeout("test-vpn".to_string()));
+
+    assert!(matches!(
+        app.legacy_state(),
+        ConnectionState::Disconnecting { .. }
+    ));
+    assert!(app
+        .toast
+        .as_ref()
+        .is_some_and(|toast| toast.message.contains("teardown")));
+}
+
 // ====================================================================
 // Scanner debounce guard tests (SyncSystemState while Disconnecting)
 // ====================================================================
@@ -181,7 +413,8 @@ fn test_scanner_never_overrides_disconnecting_to_connected() {
     let sessions = vec![fake_session("test-vpn")];
     app.handle_message(Message::SyncSystemState {
         sessions,
-        default_route_interface: None,
+        default_route:
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
     });
 
     assert!(
@@ -198,7 +431,8 @@ fn test_scanner_confirms_disconnect_when_interface_gone() {
 
     app.handle_message(Message::SyncSystemState {
         sessions: vec![],
-        default_route_interface: None,
+        default_route:
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
     });
 
     assert!(
@@ -224,16 +458,20 @@ fn test_scanner_safety_timeout_after_30s() {
     let sessions = vec![fake_session("test-vpn")];
     app.handle_message(Message::SyncSystemState {
         sessions,
-        default_route_interface: None,
+        default_route:
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
     });
 
-    assert!(
-        matches!(app.legacy_state(), ConnectionState::Disconnected),
-        "Should time out to Disconnected after 30s"
-    );
+    assert!(matches!(
+        app.legacy_state(),
+        ConnectionState::Disconnecting { .. }
+    ));
     let toast = app.toast.as_ref().expect("timeout should show toast");
-    assert_eq!(toast.toast_type, ToastType::Warning);
-    assert!(toast.message.contains("timed out"));
+    assert!(matches!(
+        toast.toast_type,
+        ToastType::Warning | ToastType::Error
+    ));
+    assert!(toast.message.contains("teardown"));
 }
 
 #[test]
@@ -244,7 +482,8 @@ fn test_scanner_disconnecting_does_not_affect_other_profiles() {
     let sessions = vec![fake_session("vpn-b")];
     app.handle_message(Message::SyncSystemState {
         sessions,
-        default_route_interface: None,
+        default_route:
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
     });
 
     assert!(
@@ -313,6 +552,7 @@ fn set_connecting(app: &mut App, name: &str) {
 fn add_profiles(app: &mut App, names: &[&str]) {
     for name in names {
         app.runtime.profiles.push(VpnProfile {
+            id: crate::vortix_core::profile::ProfileId::new(*name),
             name: (*name).to_string(),
             protocol: Protocol::WireGuard,
             config_path: std::path::PathBuf::from(format!("/tmp/{name}.conf")),
@@ -320,6 +560,18 @@ fn add_profiles(app: &mut App, names: &[&str]) {
             last_used: None,
         });
     }
+}
+
+fn attach_confirmable_cleanup_config(app: &mut App, name: &str) -> tempfile::NamedTempFile {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), "[Interface]\nPrivateKey = test\n").unwrap();
+    app.runtime
+        .profiles
+        .iter_mut()
+        .find(|profile| profile.name == name)
+        .unwrap()
+        .config_path = file.path().to_path_buf();
+    file
 }
 
 // ====================================================================
@@ -435,7 +687,7 @@ fn mirror_disconnecting_transitions_existing_connected_entry() {
     ));
 
     // Now trigger Disconnecting mirror.
-    app.mirror_disconnecting_into_registry("vpn-a");
+    app.mark_teardown_pending("vpn-a");
 
     let snap = app
         .registry
@@ -455,7 +707,7 @@ fn mirror_disconnecting_no_op_when_registry_has_no_entry() {
     // insert a phantom entry.
     let mut app = test_app();
     add_profiles(&mut app, &["vpn-a"]);
-    app.mirror_disconnecting_into_registry("vpn-a");
+    app.mark_teardown_pending("vpn-a");
     assert_eq!(
         app.registry.tunnel_count(),
         0,
@@ -474,6 +726,7 @@ fn mirror_failed_makes_registry_hold_disconnected_with_failure() {
     // overwrites with Connecting) or explicitly clears.
     let mut app = test_app();
     add_profiles(&mut app, &["vpn-a"]);
+    let _config = attach_confirmable_cleanup_config(&mut app, "vpn-a");
     set_connecting(&mut app, "vpn-a");
 
     // Worker thread reports failure.
@@ -483,6 +736,10 @@ fn mirror_failed_makes_registry_hold_disconnected_with_failure() {
         error: Some("handshake timeout".to_string()),
         interface: None,
         pid: None,
+        generation: 0,
+        handshake: None,
+        probe_receipts: Vec::new(),
+        dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
     });
 
     let snap = app
@@ -620,7 +877,8 @@ fn switch_path_disconnect_completion_removes_old_profile_from_registry() {
     // session gone, which finishes the disconnect.
     app.handle_message(Message::SyncSystemState {
         sessions: vec![],
-        default_route_interface: None,
+        default_route:
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
     });
 
     // vpn-a must be gone from the registry — the switch flow drained
@@ -717,7 +975,8 @@ fn test_pending_connect_drained_on_disconnect_success() {
     // session gone, which finishes the disconnect.
     app.handle_message(Message::SyncSystemState {
         sessions: vec![],
-        default_route_interface: None,
+        default_route:
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
     });
 
     assert_eq!(app.runtime.pending_connect, None);
@@ -738,7 +997,8 @@ fn test_pending_connect_drained_on_scanner_interface_gone() {
 
     app.handle_message(Message::SyncSystemState {
         sessions: vec![],
-        default_route_interface: None,
+        default_route:
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
     });
 
     assert_eq!(app.runtime.pending_connect, None);
@@ -786,11 +1046,15 @@ fn test_pending_cleared_on_30s_timeout() {
     let sessions = vec![fake_session("vpn-a")];
     app.handle_message(Message::SyncSystemState {
         sessions,
-        default_route_interface: None,
+        default_route:
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
     });
 
     assert_eq!(app.runtime.pending_connect, None);
-    assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
+    assert!(matches!(
+        app.legacy_state(),
+        ConnectionState::Disconnecting { .. }
+    ));
 }
 
 // ====================================================================
@@ -809,11 +1073,98 @@ fn test_connect_result_success_transitions_to_connected() {
         error: None,
         interface: None,
         pid: None,
+        generation: 0,
+        handshake: None,
+        probe_receipts: Vec::new(),
+        dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
     });
 
     assert!(
         matches!(app.legacy_state(), ConnectionState::Connected { ref profile, .. } if profile == "test-vpn"),
         "Successful ConnectResult should transition to Connected"
+    );
+}
+
+#[test]
+fn connect_result_preserves_wireguard_receipt_in_canonical_details() {
+    use crate::vortix_core::engine::state::Connection;
+    use crate::vortix_core::ports::tunnel::HandshakeEvidence;
+    use crate::vortix_core::profile::ProfileId;
+
+    let mut app = test_app();
+    add_profiles(&mut app, &["receipt-vpn"]);
+    set_connecting(&mut app, "receipt-vpn");
+    let now = std::time::SystemTime::now();
+    let handshake = HandshakeEvidence {
+        generation: 42,
+        peer_public_key: "peer-a".into(),
+        handshake_at: now,
+        observed_at: now,
+        allowed_routes: vec!["10.0.0.0/24".into()],
+    };
+    app.handle_message(Message::ConnectResult {
+        profile: "receipt-vpn".into(),
+        success: true,
+        error: None,
+        interface: Some("wg0".into()),
+        pid: None,
+        generation: 42,
+        handshake: Some(handshake.clone()),
+        probe_receipts: vec![crate::vortix_core::ports::tunnel::ProbeReceipt {
+            peer_public_key: "peer-a".into(),
+            target: "10.0.0.1".parse().unwrap(),
+            allowed_routes: vec!["10.0.0.0/24".into()],
+            issued_at: now,
+        }],
+        dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
+    });
+    let snap = app
+        .registry
+        .snapshot(&ProfileId::new("receipt-vpn"))
+        .unwrap();
+    let Connection::Connected { details, .. } = snap.state else {
+        panic!("receipt must produce Connected")
+    };
+    assert_eq!(details.generation, 42);
+    assert_eq!(details.handshake, Some(handshake));
+    assert_eq!(details.probe_receipts.len(), 1);
+    assert_eq!(details.probe_receipts[0].peer_public_key, "peer-a");
+}
+
+#[test]
+fn connect_result_dns_request_reaches_registry_role_policy() {
+    let mut app = test_app();
+    app.runtime.start_dns_policy_worker_for_test();
+    add_profiles(&mut app, &["dns-vpn"]);
+    app.registry
+        .feed_default_route_interface(Some("wg0".to_string()));
+    set_connecting(&mut app, "dns-vpn");
+
+    app.handle_message(Message::ConnectResult {
+        profile: "dns-vpn".to_string(),
+        success: true,
+        error: None,
+        interface: Some("wg0".to_string()),
+        pid: None,
+        generation: 0,
+        handshake: None,
+        probe_receipts: Vec::new(),
+        dns_request: crate::vortix_core::ports::dns::DnsRequest {
+            servers: vec!["1.1.1.1".parse().unwrap()],
+            search_domains: Vec::new(),
+        },
+    });
+    wait_for_dns_policy_result(&mut app);
+
+    let desired = app.runtime.dns_policy.desired().unwrap();
+    assert_eq!(desired.assignments.len(), 1);
+    assert!(matches!(
+        desired.assignments[0].scope,
+        crate::vortix_core::ports::dns::DnsScope::CatchAll
+    ));
+    assert_eq!(
+        app.runtime.dns_policy.effective().status,
+        crate::vortix_core::ports::dns::DnsEffectiveStatus::Applied
     );
 }
 
@@ -825,6 +1176,7 @@ fn test_connect_result_failure_transitions_to_disconnected() {
     // behavior this test was originally written to exercise.
     app.runtime.config.connect_max_retries = 0;
     set_connecting(&mut app, "test-vpn");
+    let _config = attach_confirmable_cleanup_config(&mut app, "test-vpn");
 
     app.handle_message(Message::ConnectResult {
         profile: "test-vpn".to_string(),
@@ -832,6 +1184,10 @@ fn test_connect_result_failure_transitions_to_disconnected() {
         error: Some("wg-quick: already exists".to_string()),
         interface: None,
         pid: None,
+        generation: 0,
+        handshake: None,
+        probe_receipts: Vec::new(),
+        dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
     });
 
     assert!(
@@ -855,6 +1211,10 @@ fn test_connect_result_failure_clears_pending() {
         error: Some("error".to_string()),
         interface: None,
         pid: None,
+        generation: 0,
+        handshake: None,
+        probe_receipts: Vec::new(),
+        dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
     });
 
     assert_eq!(
@@ -933,7 +1293,8 @@ fn test_reconnect_auto_connects_after_disconnect_completes() {
     // session gone, which finishes the disconnect.
     app.handle_message(Message::SyncSystemState {
         sessions: vec![],
-        default_route_interface: None,
+        default_route:
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
     });
 
     assert_eq!(app.runtime.pending_connect, None);
@@ -1012,6 +1373,7 @@ fn add_openvpn_profiles_with_auth(app: &mut App, names: &[&str], dir: &std::path
         )
         .unwrap();
         app.runtime.profiles.push(VpnProfile {
+            id: crate::vortix_core::profile::ProfileId::new(*name),
             name: (*name).to_string(),
             protocol: Protocol::OpenVPN,
             config_path,
@@ -1037,6 +1399,7 @@ fn add_openvpn_profiles_with_static_challenge(
         )
         .unwrap();
         app.runtime.profiles.push(VpnProfile {
+            id: crate::vortix_core::profile::ProfileId::new(*name),
             name: (*name).to_string(),
             protocol: Protocol::OpenVPN,
             config_path,
@@ -1057,6 +1420,7 @@ fn add_openvpn_profiles_no_auth(app: &mut App, names: &[&str], dir: &std::path::
         )
         .unwrap();
         app.runtime.profiles.push(VpnProfile {
+            id: crate::vortix_core::profile::ProfileId::new(*name),
             name: (*name).to_string(),
             protocol: Protocol::OpenVPN,
             config_path,
@@ -1495,10 +1859,32 @@ fn test_auth_delete_profile_cleans_auth_file() {
         .prefix("vortix_auth_")
         .tempdir()
         .unwrap();
-    add_openvpn_profiles_with_auth(&mut app, &["del-vpn"], tmp.path());
+    let stable_id = crate::vortix_core::profile::ProfileId::parse("11".repeat(32)).unwrap();
+    let config_path = tmp.path().join("del-vpn.ovpn");
+    let stored = crate::vortix_core::profile::Profile::new(
+        stable_id.clone(),
+        "del-vpn",
+        crate::vortix_core::profile::ProtocolKind::OpenVpn,
+        config_path.clone(),
+    );
+    crate::vortix_config::profile_store::ProfileStore::insert(
+        &crate::vortix_config::profile_store::FsProfileStore::new(tmp.path().to_path_buf()),
+        &stored,
+        b"client\nremote example.com 1194\nauth-user-pass\ndev tun\nproto udp\n",
+    )
+    .unwrap();
+    app.runtime.profiles.push(VpnProfile {
+        id: stable_id.clone(),
+        name: "del-vpn".to_string(),
+        protocol: Protocol::OpenVPN,
+        config_path,
+        location: "Test".to_string(),
+        last_used: None,
+    });
     app.profile_list_state.select(Some(0));
 
-    let auth_path = crate::utils::write_openvpn_auth_file("del-vpn", "user", "pass").unwrap();
+    let auth_path =
+        crate::utils::write_openvpn_auth_file(stable_id.as_str(), "user", "pass").unwrap();
     assert!(auth_path.exists());
 
     app.confirm_delete(0);
@@ -1658,6 +2044,10 @@ fn test_last_connected_profile_set_on_connect_success() {
         error: None,
         interface: None,
         pid: None,
+        generation: 0,
+        handshake: None,
+        probe_receipts: Vec::new(),
+        dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
     });
 
     assert_eq!(
@@ -1778,6 +2168,7 @@ fn test_open_config_caches_content_and_close_clears() {
     let tmp = tempfile::Builder::new().suffix(".conf").tempfile().unwrap();
     std::fs::write(tmp.path(), "[Interface]\nAddress = 10.0.0.1/24").unwrap();
     app.runtime.profiles.push(VpnProfile {
+        id: crate::vortix_core::profile::ProfileId::new("test-vpn"),
         name: "test-vpn".to_string(),
         protocol: Protocol::WireGuard,
         config_path: tmp.path().to_path_buf(),
@@ -2241,8 +2632,21 @@ fn test_rename_updates_last_connected_profile() {
     let mut app = test_app();
     let dir = tempfile::tempdir().unwrap();
     let conf_path = dir.path().join("old-name.conf");
-    std::fs::write(&conf_path, "dummy").unwrap();
+    let stable_id = crate::vortix_core::profile::ProfileId::parse("22".repeat(32)).unwrap();
+    let stored = crate::vortix_core::profile::Profile::new(
+        stable_id.clone(),
+        "old-name",
+        crate::vortix_core::profile::ProtocolKind::WireGuard,
+        conf_path.clone(),
+    );
+    crate::vortix_config::profile_store::ProfileStore::insert(
+        &crate::vortix_config::profile_store::FsProfileStore::new(dir.path().to_path_buf()),
+        &stored,
+        b"dummy",
+    )
+    .unwrap();
     app.runtime.profiles.push(VpnProfile {
+        id: stable_id.clone(),
         name: "old-name".to_string(),
         protocol: Protocol::WireGuard,
         config_path: conf_path,
@@ -2272,6 +2676,7 @@ fn test_rename_on_active_profile_is_refused_at_overlay() {
     let conf_path = dir.path().join("active-vpn.conf");
     std::fs::write(&conf_path, "dummy").unwrap();
     app.runtime.profiles.push(VpnProfile {
+        id: crate::vortix_core::profile::ProfileId::new("active-vpn"),
         name: "active-vpn".to_string(),
         protocol: Protocol::WireGuard,
         config_path: conf_path,
@@ -2286,6 +2691,46 @@ fn test_rename_on_active_profile_is_refused_at_overlay() {
         !matches!(app.input_mode, InputMode::Rename { .. }),
         "Rename overlay must refuse to open for an active profile"
     );
+}
+
+#[test]
+fn rename_rechecks_stable_identity_after_overlay_opens() {
+    let mut app = test_app();
+    let dir = tempfile::tempdir().unwrap();
+    let profile_id = crate::vortix_core::profile::ProfileId::parse("33".repeat(32)).unwrap();
+    let config_path = dir.path().join("race-vpn.conf");
+    let stored = crate::vortix_core::profile::Profile::new(
+        profile_id.clone(),
+        "race-vpn",
+        crate::vortix_core::profile::ProtocolKind::WireGuard,
+        config_path.clone(),
+    );
+    crate::vortix_config::profile_store::ProfileStore::insert(
+        &crate::vortix_config::profile_store::FsProfileStore::new(dir.path().to_path_buf()),
+        &stored,
+        b"[Interface]\n",
+    )
+    .unwrap();
+    app.runtime.profiles.push(VpnProfile {
+        id: profile_id,
+        name: "race-vpn".to_string(),
+        protocol: Protocol::WireGuard,
+        config_path: config_path.clone(),
+        location: String::new(),
+        last_used: None,
+    });
+    app.profile_list_state.select(Some(0));
+
+    app.handle_message(Message::OpenRename);
+    assert!(matches!(app.input_mode, InputMode::Rename { .. }));
+
+    // A connection starts while the rename dialog remains open.
+    set_connected(&mut app, "race-vpn");
+    app.rename_profile(0, "must-not-rename");
+
+    assert!(config_path.exists());
+    assert!(!dir.path().join("must-not-rename.conf").exists());
+    assert_eq!(app.runtime.profiles[0].name, "race-vpn");
 }
 
 #[test]
@@ -2865,6 +3310,39 @@ fn u19_confirm_disconnect_all_closes_overlay() {
 }
 
 #[test]
+fn delayed_retry_follows_stable_id_across_reorder_and_rename() {
+    use crate::vortix_core::profile::ProfileId;
+
+    let mut app = test_app();
+    add_profiles(&mut app, &["first", "target"]);
+    let target_id = ProfileId::parse("44".repeat(32)).unwrap();
+    app.runtime.profiles[1].id = target_id.clone();
+    app.runtime.retry_state.insert(
+        target_id.clone(),
+        crate::state::RetryState {
+            profile_id: target_id.clone(),
+            attempt: 1,
+            auto_reconnect: false,
+        },
+    );
+
+    // Mutations after scheduling must not redirect the delayed retry to the
+    // profile that happens to occupy the old index.
+    app.runtime.profiles[1].name = "renamed-target".to_string();
+    app.runtime.profiles.swap(0, 1);
+    app.handle_message(Message::RetryConnect {
+        profile_id: target_id,
+        attempt: 1,
+    });
+
+    assert!(crate::logger::get_logs().iter().any(|entry| {
+        entry
+            .message
+            .contains("Attempting reconnect to 'renamed-target'")
+    }));
+}
+
+#[test]
 fn shift_d_disconnect_all_processes_every_active_tunnel() {
     // Regression for the Shift+D bug where only one of N active
     // tunnels was actually torn down. The pre-fix path only called
@@ -2898,11 +3376,12 @@ fn shift_d_disconnect_all_processes_every_active_tunnel() {
     // later assert got cleared. (Imagine they had failed before and
     // were in a retry sequence.)
     for name in ["alpha", "beta"] {
+        let profile_id = ProfileId::new(name);
         app.runtime.retry_state.insert(
-            ProfileId::new(name),
+            profile_id.clone(),
             crate::state::RetryState {
+                profile_id,
                 attempt: 1,
-                profile_idx: 0,
                 auto_reconnect: true,
             },
         );
@@ -2957,11 +3436,12 @@ fn shift_d_disconnect_profile_by_idx_works_for_secondary() {
     add_profiles(&mut app, &["alpha", "beta"]);
     set_connected(&mut app, "alpha");
     set_connected(&mut app, "beta");
+    let beta_id = ProfileId::new("beta");
     app.runtime.retry_state.insert(
-        ProfileId::new("beta"),
+        beta_id.clone(),
         crate::state::RetryState {
+            profile_id: beta_id,
             attempt: 1,
-            profile_idx: 1,
             auto_reconnect: true,
         },
     );
@@ -3132,6 +3612,10 @@ fn connect_result_success_mirrors_into_registry() {
         error: None,
         interface: None,
         pid: None,
+        generation: 0,
+        handshake: None,
+        probe_receipts: Vec::new(),
+        dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
     });
 
     // Renderer-facing state: panels read these exact accessors.
@@ -3177,7 +3661,8 @@ fn scanner_promotion_from_connecting_to_connected_mirrors_into_registry() {
     // the protocol-layer success has not yet arrived.
     app.handle_message(Message::SyncSystemState {
         sessions: vec![fake_session("AWS_VPN")],
-        default_route_interface: None,
+        default_route:
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
     });
 
     // Registry must stay Connecting — scanner can't drive the
@@ -3220,7 +3705,8 @@ fn scanner_drop_from_connected_clears_registry() {
     // Scanner now reports no active sessions — the VPN went away.
     app.handle_message(Message::SyncSystemState {
         sessions: vec![],
-        default_route_interface: None,
+        default_route:
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
     });
 
     assert_eq!(
@@ -3298,7 +3784,8 @@ fn mirrored_registry_entry_carries_full_rich_details_not_just_interface_and_pid(
     let session = fake_session("AWS_VPN");
     app.handle_message(Message::SyncSystemState {
         sessions: vec![session],
-        default_route_interface: None,
+        default_route:
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
     });
 
     let snap = app
@@ -3368,7 +3855,8 @@ fn mirror_refresh_updates_registry_when_details_change() {
     session.interface = "utun99-wrong-from-scanner".to_string();
     app.handle_message(Message::SyncSystemState {
         sessions: vec![session],
-        default_route_interface: None,
+        default_route:
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
     });
 
     // Post-refresh: iface MUST still be the protocol-layer's "wg0".
@@ -3403,13 +3891,17 @@ fn disconnect_result_success_removes_from_registry() {
         error: None,
         interface: None,
         pid: None,
+        generation: 0,
+        handshake: None,
+        probe_receipts: Vec::new(),
+        dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
     });
     assert_eq!(app.registry.tunnel_count(), 1, "setup precondition");
 
     // Now disconnect: registry path goes Connected -> Disconnecting ->
     // (worker thread tears down kernel state) -> DisconnectResult ->
     // complete_disconnect.
-    app.mirror_disconnecting_into_registry("mirror-test");
+    app.mark_teardown_pending("mirror-test");
     app.handle_message(Message::DisconnectResult {
         profile: "mirror-test".to_string(),
         success: true,
@@ -3419,7 +3911,8 @@ fn disconnect_result_success_removes_from_registry() {
     // session gone, which finishes the disconnect.
     app.handle_message(Message::SyncSystemState {
         sessions: vec![],
-        default_route_interface: None,
+        default_route:
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
     });
 
     assert_eq!(
@@ -3457,7 +3950,8 @@ fn connect_result_success_arrives_after_scanner_observes_kernel_session() {
     set_connecting(&mut app, "race-test");
     app.handle_message(Message::SyncSystemState {
         sessions: vec![fake_session("race-test")],
-        default_route_interface: None,
+        default_route:
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
     });
     assert!(
         matches!(
@@ -3475,6 +3969,10 @@ fn connect_result_success_arrives_after_scanner_observes_kernel_session() {
         error: None,
         interface: None,
         pid: None,
+        generation: 0,
+        handshake: None,
+        probe_receipts: Vec::new(),
+        dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
     });
 
     // Bookkeeping that the success handler is responsible for:
@@ -3519,6 +4017,10 @@ fn connect_result_success_seeds_authoritative_iface_into_registry() {
         error: None,
         interface: Some("utun8".to_string()),
         pid: Some(7155),
+        generation: 0,
+        handshake: None,
+        probe_receipts: Vec::new(),
+        dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
     });
 
     let snap = app
@@ -3573,6 +4075,10 @@ fn connect_result_for_secondary_profile_during_takeover_is_not_stale() {
         error: None,
         interface: Some("utun9".to_string()),
         pid: Some(8888),
+        generation: 0,
+        handshake: None,
+        probe_receipts: Vec::new(),
+        dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
     });
 
     let snap = app
@@ -3732,7 +4238,9 @@ fn real_ip_not_cached_when_kernel_has_active_sessions() {
     // Scanner sees a kernel session but registry hasn't adopted yet.
     app.handle_message(Message::SyncSystemState {
         sessions: vec![fake_session("vpn-a")],
-        default_route_interface: Some("wg0".to_string()),
+        default_route: crate::vortix_core::ports::route_table::DefaultRouteObservation::Interface(
+            "wg0".to_string(),
+        ),
     });
     assert!(app.runtime.scanner_first_tick_done);
     assert_eq!(app.runtime.last_kernel_session_count, 1);
@@ -3765,7 +4273,8 @@ fn real_ip_cached_after_clean_scanner_tick_with_zero_sessions() {
 
     app.handle_message(Message::SyncSystemState {
         sessions: vec![],
-        default_route_interface: None,
+        default_route:
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
     });
     assert!(app.runtime.scanner_first_tick_done);
     assert_eq!(app.runtime.last_kernel_session_count, 0);
@@ -3790,7 +4299,8 @@ fn real_ip_overwrites_on_disconnected_telemetry_samples() {
 
     app.handle_message(Message::SyncSystemState {
         sessions: vec![],
-        default_route_interface: None,
+        default_route:
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
     });
 
     app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIp(
@@ -3827,7 +4337,8 @@ fn real_ip_telemetry_persists_to_disk_cache() {
 
     app.handle_message(Message::SyncSystemState {
         sessions: vec![],
-        default_route_interface: None,
+        default_route:
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
     });
     app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIp(
         "203.0.113.42".to_string(),
@@ -3856,7 +4367,8 @@ fn real_ip_frozen_once_connected_then_thaws_on_disconnect() {
     // Clean tick → cache real IP.
     app.handle_message(Message::SyncSystemState {
         sessions: vec![],
-        default_route_interface: None,
+        default_route:
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
     });
     app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIp(
         "203.0.113.5".to_string(),
@@ -3867,7 +4379,9 @@ fn real_ip_frozen_once_connected_then_thaws_on_disconnect() {
     add_profiles(&mut app, &["vpn-a"]);
     app.handle_message(Message::SyncSystemState {
         sessions: vec![fake_session("vpn-a")],
-        default_route_interface: Some("wg0".to_string()),
+        default_route: crate::vortix_core::ports::route_table::DefaultRouteObservation::Interface(
+            "wg0".to_string(),
+        ),
     });
 
     // Telemetry while connected (VPN exit IP) — must NOT overwrite.
@@ -3885,7 +4399,8 @@ fn real_ip_frozen_once_connected_then_thaws_on_disconnect() {
     app.registry.set_disconnected(&pid);
     app.handle_message(Message::SyncSystemState {
         sessions: vec![],
-        default_route_interface: None,
+        default_route:
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
     });
 
     // Now telemetry can re-cache (user may have moved networks).
@@ -3900,6 +4415,41 @@ fn real_ip_frozen_once_connected_then_thaws_on_disconnect() {
 }
 
 #[test]
+fn route_probe_failure_retains_prior_primary_and_marks_observation_stale() {
+    use crate::vortix_core::ports::route_table::DefaultRouteObservation;
+
+    let mut app = test_app();
+    add_profiles(&mut app, &["vpn-a"]);
+    set_connected(&mut app, "vpn-a");
+    let session = fake_session("vpn-a");
+    app.handle_message(Message::SyncSystemState {
+        sessions: vec![session.clone()],
+        default_route: DefaultRouteObservation::Interface("wg0".into()),
+    });
+    assert_eq!(
+        app.registry
+            .primary()
+            .map(crate::vortix_core::profile::ProfileId::as_str),
+        Some("vpn-a")
+    );
+    assert!(app.runtime.route_observation_fresh);
+
+    app.handle_message(Message::SyncSystemState {
+        sessions: vec![session],
+        default_route: DefaultRouteObservation::ProbeFailed,
+    });
+
+    assert_eq!(
+        app.registry
+            .primary()
+            .map(crate::vortix_core::profile::ProfileId::as_str),
+        Some("vpn-a"),
+        "probe failure must not be interpreted as a route removal"
+    );
+    assert!(!app.runtime.route_observation_fresh);
+}
+
+#[test]
 fn disconnect_result_defers_completion_until_kernel_confirms() {
     // Regression for the disconnect→reconnect loop: after `down()`
     // reports success the VPN process can stay alive for another
@@ -3911,7 +4461,7 @@ fn disconnect_result_defers_completion_until_kernel_confirms() {
     let mut app = test_app();
     add_profiles(&mut app, &["vpn-a"]);
     set_connected(&mut app, "vpn-a");
-    app.mirror_disconnecting_into_registry("vpn-a");
+    app.mark_teardown_pending("vpn-a");
 
     // Worker reports success while the kernel session is still visible:
     // the entry must stay Disconnecting.
@@ -3930,7 +4480,8 @@ fn disconnect_result_defers_completion_until_kernel_confirms() {
     // A stale scan still lists the dying session: no re-adoption, no drop.
     app.handle_message(Message::SyncSystemState {
         sessions: vec![fake_session("vpn-a")],
-        default_route_interface: None,
+        default_route:
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
     });
     let snap = app.registry.snapshot(&id).expect("still tracked");
     assert!(
@@ -3946,7 +4497,8 @@ fn disconnect_result_defers_completion_until_kernel_confirms() {
     // exit is NOT an unexpected drop, and no auto-reconnect is queued.
     app.handle_message(Message::SyncSystemState {
         sessions: vec![],
-        default_route_interface: None,
+        default_route:
+            crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
     });
     assert!(app.registry.snapshot(&id).is_none());
     assert_eq!(app.runtime.connection_drops, 0);

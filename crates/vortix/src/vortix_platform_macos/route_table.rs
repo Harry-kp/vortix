@@ -18,10 +18,11 @@
 //! probe return their physical interface even while the VPN is up; that
 //! case is rare enough to accept as a known limitation.
 
+use std::net::IpAddr;
 use std::time::Duration;
 
 use crate::platform::route_probe::{ProbeOutcome, RouteProbe};
-use crate::vortix_core::ports::route_table::RouteTable;
+use crate::vortix_core::ports::route_table::{DefaultRouteObservation, RouteTable};
 use crate::vortix_process::CommandSpec;
 
 /// Upper bound on the `route get default` subprocess. The query goes
@@ -55,9 +56,32 @@ impl RouteTable for MacRouteTable {
         parse_gateway(&text)
     }
 
-    fn default_route_interface() -> Option<String> {
-        let text = run_route_get_default()?;
-        parse_interface(&text)
+    fn default_route_observation() -> DefaultRouteObservation {
+        let Some(text) = run_route_get_default() else {
+            return DefaultRouteObservation::ProbeFailed;
+        };
+        parse_interface(&text).map_or(
+            DefaultRouteObservation::NoDefaultRoute,
+            DefaultRouteObservation::Interface,
+        )
+    }
+
+    fn route_interface_for(target: IpAddr) -> DefaultRouteObservation {
+        let spec =
+            CommandSpec::oneshot("route", vec!["-n".into(), "get".into(), target.to_string()])
+                .timeout(ROUTE_QUERY_TIMEOUT)
+                .output_limit(64 * 1024);
+        let Ok(output) = crate::vortix_process::run_to_output(spec) else {
+            return DefaultRouteObservation::ProbeFailed;
+        };
+        if !output.status.success() {
+            return DefaultRouteObservation::ProbeFailed;
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        parse_interface(&text).map_or(
+            DefaultRouteObservation::NoDefaultRoute,
+            DefaultRouteObservation::Interface,
+        )
     }
 }
 

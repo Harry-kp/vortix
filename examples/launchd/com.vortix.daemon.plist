@@ -4,15 +4,25 @@
 <dict>
     <key>Label</key>
     <string>com.vortix.daemon</string>
+    <key>Disabled</key>
+    <true/>
+    <!-- Package tooling replaces this placeholder only after validating the
+         non-root enrollment owner. Never load this example verbatim. -->
+    <key>UserName</key>
+    <string>VORTIX_ENROLLED_USER</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/vortix</string>
+        <string>/Library/Application Support/Vortix/bin/vortix</string>
         <string>daemon</string>
+        <string>--socket</string>
+        <string>/var/run/vortix/daemon.sock</string>
     </array>
-    <key>KeepAlive</key>
-    <true/>
     <key>RunAtLoad</key>
-    <true/>
+    <false/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>ProcessType</key>
+    <string>Background</string>
     <key>StandardOutPath</key>
     <string>/var/log/vortix-daemon.log</string>
     <key>StandardErrorPath</key>

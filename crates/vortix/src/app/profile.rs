@@ -5,6 +5,7 @@ use std::path::Path;
 use super::{App, InputMode, Protocol, ToastType};
 use crate::constants;
 use crate::utils;
+use crate::vortix_config::profile_store::{FsProfileStore, ProfileStore};
 
 impl App {
     pub(crate) fn profile_next(&mut self) {
@@ -74,22 +75,29 @@ impl App {
         }
 
         // Get profile info before removing
+        let profile_id = self.runtime.profiles[idx].id.clone();
         let config_path = self.runtime.profiles[idx].config_path.clone();
         let profile_name = self.runtime.profiles[idx].name.clone();
         let protocol = self.runtime.profiles[idx].protocol;
 
-        // Remove from profiles
-        self.runtime.profiles.remove(idx);
-
-        // Try to delete from disk
-        if config_path.exists() {
-            let _ = std::fs::remove_file(&config_path);
+        let Some(profiles_dir) = config_path.parent().map(Path::to_path_buf) else {
+            self.show_toast(
+                "Profile delete failed: invalid path".to_string(),
+                ToastType::Error,
+            );
+            return;
+        };
+        if let Err(error) = FsProfileStore::new(profiles_dir).delete(&profile_id) {
+            self.show_toast(format!("Profile delete failed: {error}"), ToastType::Error);
+            return;
         }
+
+        self.runtime.profiles.remove(idx);
 
         // Clean up OpenVPN auth and runtime files
         if matches!(protocol, Protocol::OpenVPN) {
-            utils::delete_openvpn_auth_file(&profile_name);
-            utils::cleanup_openvpn_run_files(&profile_name);
+            utils::delete_openvpn_auth_file_compat(profile_id.as_str(), &profile_name);
+            utils::cleanup_openvpn_run_files_compat(profile_id.as_str(), &profile_name);
         }
 
         // Adjust selection
@@ -127,61 +135,54 @@ impl App {
 
         let old_name = self.runtime.profiles[idx].name.clone();
         let old_path = self.runtime.profiles[idx].config_path.clone();
+        let stable_id = self.runtime.profiles[idx].id.clone();
 
         if let Some(parent) = old_path.parent() {
-            let ext = old_path
-                .extension()
-                .map_or("conf", |e| e.to_str().unwrap_or("conf"));
-            let new_file = parent.join(format!("{new_name}.{ext}"));
-
-            if new_file.exists() {
+            // The rename overlay may have been open while a connection
+            // started. Re-check the stable identity at the mutation point;
+            // an index or display-name check can be invalidated by sorting or
+            // another rename while the dialog is open.
+            use crate::vortix_core::engine::state::Connection;
+            if self
+                .registry
+                .snapshot(&stable_id)
+                .is_some_and(|snapshot| !matches!(snapshot.state, Connection::Disconnected { .. }))
+            {
                 self.show_toast(
-                    format!("A profile named '{new_name}' already exists"),
+                    "Cannot rename an active profile — disconnect first".to_string(),
                     ToastType::Warning,
                 );
                 return;
             }
 
-            if let Err(e) = std::fs::rename(&old_path, &new_file) {
-                self.show_toast(format!("Rename failed: {e}"), ToastType::Error);
-                return;
-            }
+            let store = FsProfileStore::new(parent.to_path_buf());
+            let renamed = match store.rename(&stable_id, trimmed) {
+                Ok(renamed) => renamed,
+                Err(error) => {
+                    self.show_toast(format!("Rename failed: {error}"), ToastType::Error);
+                    return;
+                }
+            };
 
-            self.runtime.profiles[idx].name = new_name.to_string();
-            self.runtime.profiles[idx].config_path = new_file;
+            self.runtime.profiles[idx].name = renamed.display_name;
+            self.runtime.profiles[idx].config_path = renamed.config_path;
 
             if self.runtime.last_connected_profile.as_deref() == Some(&old_name) {
-                self.runtime.last_connected_profile = Some(new_name.to_string());
+                self.runtime.last_connected_profile = Some(trimmed.to_string());
             }
 
-            // Profile renames during active tunnels are blocked at the
-            // overlay open path (`is_profile_active` guard); no
-            // legacy-state mutation needed here post-P5d. The registry
-            // keys by ProfileId derived from name; an active rename
-            // would require re-keying that entry, but rename of an
-            // active profile is refused upstream.
-
-            if matches!(self.runtime.profiles[idx].protocol, Protocol::OpenVPN) {
-                if let Some(auth) = utils::read_openvpn_saved_auth(&old_name) {
-                    let _ = utils::write_openvpn_auth_file(new_name, &auth.0, &auth.1);
-                    utils::delete_openvpn_auth_file(&old_name);
-                }
-            }
+            // Registry/retry state is keyed by stable ProfileId, so no
+            // in-memory re-keying is required for a display-name change.
 
             self.runtime.save_metadata();
             self.runtime.sort_profiles();
 
-            if let Some(new_idx) = self
-                .runtime
-                .profiles
-                .iter()
-                .position(|p| p.name == new_name)
-            {
+            if let Some(new_idx) = self.runtime.profiles.iter().position(|p| p.name == trimmed) {
                 self.profile_list_state.select(Some(new_idx));
             }
 
             self.show_toast(
-                format!("Renamed '{old_name}' → '{new_name}'"),
+                format!("Renamed '{old_name}' → '{trimmed}'"),
                 ToastType::Success,
             );
         }

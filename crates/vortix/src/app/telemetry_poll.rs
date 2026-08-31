@@ -74,7 +74,11 @@ impl App {
                                 "NET",
                                 format!(
                                     "Scanner still running for '{}' ({elapsed}s elapsed)",
-                                    profile_id.as_str()
+                                    self.runtime
+                                        .profiles
+                                        .iter()
+                                        .find(|profile| profile.id == profile_id)
+                                        .map_or("missing profile", |profile| profile.name.as_str())
                                 ),
                             );
                         }
@@ -91,7 +95,7 @@ impl App {
         if let Some(result) = result {
             self.handle_message(Message::SyncSystemState {
                 sessions: result.sessions,
-                default_route_interface: result.default_route_interface,
+                default_route: result.default_route,
             });
         }
 

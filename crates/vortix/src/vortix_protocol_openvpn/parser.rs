@@ -97,6 +97,10 @@ pub struct OvpnParsedProfile {
     pub redirect_gateway: bool,
     /// Explicit `route` directives.
     pub routes: Vec<OvpnRoute>,
+    /// Resolver addresses requested with `dhcp-option DNS`.
+    pub dns_servers: Vec<IpAddr>,
+    /// Suffixes requested with `dhcp-option DOMAIN` / `DOMAIN-SEARCH`.
+    pub dns_search_domains: Vec<String>,
     /// The raw config text — `openvpn` consumes the on-disk file, so this is
     /// retained for introspection only.
     pub raw: String,
@@ -105,6 +109,13 @@ pub struct OvpnParsedProfile {
 impl ParsedProfile for OvpnParsedProfile {
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn dns_request(&self) -> crate::vortix_core::ports::dns::DnsRequest {
+        crate::vortix_core::ports::dns::DnsRequest {
+            servers: self.dns_servers.clone(),
+            search_domains: self.dns_search_domains.clone(),
+        }
     }
 }
 
@@ -131,6 +142,8 @@ pub fn parse_ovpn_conf(text: &str) -> Result<OvpnParsedProfile, ParseError> {
             profile.interactive_auth = true;
             continue;
         }
+
+        reject_privileged_directive(line)?;
 
         let mut tokens = line.split_whitespace();
         let Some(directive) = tokens.next() else {
@@ -160,6 +173,22 @@ pub fn parse_ovpn_conf(text: &str) -> Result<OvpnParsedProfile, ParseError> {
                     warn!(line = %line, "ovpn: malformed route directive — skipping");
                 }
             }
+            "dhcp-option" => match tokens.next() {
+                Some(kind) if kind.eq_ignore_ascii_case("DNS") => {
+                    if let Some(server) = tokens.next().and_then(|value| value.parse().ok()) {
+                        profile.dns_servers.push(server);
+                    }
+                }
+                Some(kind)
+                    if kind.eq_ignore_ascii_case("DOMAIN")
+                        || kind.eq_ignore_ascii_case("DOMAIN-SEARCH") =>
+                {
+                    profile
+                        .dns_search_domains
+                        .extend(tokens.map(str::to_string));
+                }
+                _ => {}
+            },
             "static-challenge" => {
                 if let Some(sc) = parse_static_challenge(line) {
                     profile.static_challenge = Some(sc);
@@ -172,6 +201,109 @@ pub fn parse_ovpn_conf(text: &str) -> Result<OvpnParsedProfile, ParseError> {
     }
 
     Ok(profile)
+}
+
+fn is_forbidden_privileged_directive(directive: &str) -> bool {
+    const FORBIDDEN: &[&str] = &[
+        "daemon",
+        "config",
+        "include",
+        "plugin",
+        "up",
+        "down",
+        "route-up",
+        "route-pre-down",
+        "ipchange",
+        "client-connect",
+        "client-connect-deferred",
+        "client-disconnect",
+        "learn-address",
+        "tls-verify",
+        "tls-crypt-v2-verify",
+        "auth-user-pass-verify",
+        "iproute",
+        "engine",
+        "providers",
+        "pkcs11-providers",
+    ];
+    FORBIDDEN
+        .iter()
+        .any(|forbidden| directive.eq_ignore_ascii_case(forbidden))
+}
+
+/// Return the privileged directive that `OpenVPN` would effectively parse.
+///
+/// `OpenVPN` dequotes option tokens before dispatch and treats `setenv opt X`
+/// as though `X` were the directive. Inspecting only the first whitespace
+/// token therefore leaves privileged aliases such as `"up"` and
+/// `setenv opt plugin` unchecked.
+pub(super) fn forbidden_effective_directive(line: &str) -> Option<String> {
+    let tokens = openvpn_option_tokens(line, 3)?;
+    let effective = match tokens.as_slice() {
+        [setenv, opt, directive]
+            if setenv
+                .trim_start_matches('-')
+                .eq_ignore_ascii_case("setenv")
+                && opt.eq_ignore_ascii_case("opt") =>
+        {
+            directive
+        }
+        [directive, ..] => directive,
+        [] => return None,
+    };
+    let directive = effective.trim_start_matches('-');
+    is_forbidden_privileged_directive(directive).then(|| directive.to_ascii_lowercase())
+}
+
+/// Tokenize the security-relevant prefix using `OpenVPN`'s config-file quoting
+/// rules. `None` means `OpenVPN` would reject the malformed line itself.
+fn openvpn_option_tokens(line: &str, limit: usize) -> Option<Vec<String>> {
+    let mut chars = line.chars().peekable();
+    let mut tokens = Vec::with_capacity(limit);
+
+    while tokens.len() < limit {
+        while chars.next_if(|ch| ch.is_whitespace()).is_some() {}
+        if chars.peek().is_none_or(|ch| matches!(ch, '#' | ';')) {
+            break;
+        }
+
+        let quote = chars.next_if(|ch| matches!(ch, '\'' | '"'));
+        let mut token = String::new();
+        let mut closed = quote.is_none();
+        while let Some(ch) = chars.next() {
+            if quote == Some('\'') {
+                if ch == '\'' {
+                    closed = true;
+                    break;
+                }
+                token.push(ch);
+            } else if ch == '"' && quote == Some('"') {
+                closed = true;
+                break;
+            } else if ch == '\\' {
+                token.push(chars.next()?);
+            } else if quote.is_none() && ch.is_whitespace() {
+                break;
+            } else {
+                token.push(ch);
+            }
+        }
+        if !closed {
+            return None;
+        }
+        tokens.push(token);
+    }
+
+    Some(tokens)
+}
+
+fn reject_privileged_directive(line: &str) -> Result<(), ParseError> {
+    if let Some(directive) = forbidden_effective_directive(line) {
+        return Err(ParseError::Unsupported(format!(
+            "OpenVPN `{directive}` privileged directive is not allowed: Vortix never runs profile commands as root or loads profile-selected crypto providers; migrate lifecycle automation to a global hook using an absolute executable plus argv"
+        )));
+    }
+    Ok(())
 }
 
 /// Parse `static-challenge "<prompt>" <echo>` from a trimmed config line.
@@ -282,10 +414,73 @@ mod tests {
     use std::net::Ipv4Addr;
 
     #[test]
+    fn executable_directives_fail_unprivileged_parsing_with_migration_guidance() {
+        for directive in ["up ./up.sh", "--route-up ./route.sh", "plugin evil.so"] {
+            let error = parse_ovpn_conf(&format!("client\n{directive}\n"))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("never runs profile commands as root"));
+            assert!(error.contains("global hook"));
+        }
+    }
+
+    #[test]
+    fn external_crypto_provider_directives_fail_unprivileged_parsing() {
+        for directive in [
+            "providers legacy default",
+            "--EnGiNe pkcs11",
+            "pkcs11-providers /tmp/evil.so",
+        ] {
+            let error = parse_ovpn_conf(&format!("client\n{directive}\n"))
+                .expect_err("provider-loading directives must not reach privileged OpenVPN")
+                .to_string();
+            assert!(
+                error.contains("not allowed"),
+                "unexpected error for {directive}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn effective_privileged_aliases_fail_unprivileged_parsing() {
+        for directive in [
+            "setenv opt plugin malicious.so",
+            "--setenv opt up ./up.sh",
+            "SeTeNv OpT providers legacy default",
+            "setenv opt --config nested.ovpn",
+            "\"up\" ./up.sh",
+        ] {
+            let error = parse_ovpn_conf(&format!("client\n{directive}\n"))
+                .expect_err("effective privileged aliases must be rejected")
+                .to_string();
+            assert!(error.contains("not allowed"), "unexpected error: {error}");
+        }
+
+        parse_ovpn_conf("client\nsetenv opt block-outside-dns\n")
+            .expect("safe forward-compatibility directives must remain supported");
+    }
+
+    #[test]
     fn detects_interactive_auth() {
         let text = "client\nproto udp\nauth-user-pass\nremote example.com 1194\n";
         let p = parse_ovpn_conf(text).unwrap();
         assert!(p.interactive_auth);
+    }
+
+    #[test]
+    fn parses_dns_intent_without_applying_it() {
+        let p = parse_ovpn_conf(
+            "dhcp-option DNS 10.8.0.1\ndhcp-option DOMAIN corp.example\ndhcp-option DOMAIN-SEARCH dev.example lab.example\n",
+        )
+        .unwrap();
+        assert_eq!(
+            p.dns_servers,
+            vec!["10.8.0.1".parse::<std::net::IpAddr>().unwrap()]
+        );
+        assert_eq!(
+            p.dns_search_domains,
+            vec!["corp.example", "dev.example", "lab.example"]
+        );
     }
 
     #[test]

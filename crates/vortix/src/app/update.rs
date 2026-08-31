@@ -215,7 +215,21 @@ impl App {
                 error,
                 interface,
                 pid,
-            } => self.handle_connect_result(profile, success, error, interface, pid),
+                generation,
+                handshake,
+                probe_receipts,
+                dns_request,
+            } => self.handle_connect_result(
+                profile,
+                success,
+                error,
+                interface,
+                pid,
+                generation,
+                handshake,
+                probe_receipts,
+                dns_request,
+            ),
 
             // UI Toggles
             Message::ToggleZoom => {
@@ -335,22 +349,74 @@ impl App {
             Message::Telemetry(update) => self.handle_telemetry(update),
             Message::SyncSystemState {
                 sessions,
-                default_route_interface,
+                default_route,
             } => {
                 // Pre-feed the scanner's route-iface probe into the
                 // registry's cache BEFORE processing sessions. Every
                 // downstream `set_connected` / `set_disconnected` calls
                 // `recompute_primary`, which now reads this cached value
                 // instead of shelling out from the main thread.
-                self.registry
-                    .feed_default_route_interface(default_route_interface);
+                let route_changed = match default_route {
+                    crate::vortix_core::ports::route_table::DefaultRouteObservation::Interface(
+                        interface,
+                    ) => {
+                        self.registry.feed_default_route_interface(Some(interface));
+                        self.runtime.route_observation_fresh = true;
+                        true
+                    }
+                    crate::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute => {
+                        self.registry.feed_default_route_interface(None);
+                        self.runtime.route_observation_fresh = true;
+                        true
+                    }
+                    crate::vortix_core::ports::route_table::DefaultRouteObservation::ProbeFailed => {
+                        let was_fresh = self.runtime.route_observation_fresh;
+                        self.runtime.route_observation_fresh = false;
+                        if was_fresh || !self.runtime.scanner_first_tick_done {
+                            self.log("WARN: Default-route observation failed; retaining the last known primary");
+                        }
+                        false
+                    }
+                };
                 self.handle_sync_system_state(sessions);
+                if route_changed {
+                    self.reconcile_dns_policy();
+                }
+            }
+            Message::DnsPolicyResult {
+                revision,
+                coordinator,
+                external_sessions,
+                error,
+            } => {
+                let previous_external_sessions = self.runtime.dns_external_sessions;
+                let was_degraded = self.runtime.dns_policy.effective().status
+                    == crate::vortix_core::ports::dns::DnsEffectiveStatus::Degraded;
+                if self
+                    .runtime
+                    .complete_dns_policy(revision, coordinator, external_sessions)
+                {
+                    if let Some(error) = error {
+                        if !(external_sessions > 0 && previous_external_sessions > 0) {
+                            self.log(&format!("WARN: {error}"));
+                        }
+                    }
+                    if self.runtime.dns_policy.effective().status
+                        == crate::vortix_core::ports::dns::DnsEffectiveStatus::Degraded
+                        && !was_degraded
+                    {
+                        self.log("WARN: DNS policy is degraded; tunnel routing remains active");
+                    }
+                }
             }
             Message::ConnectionTimeout(profile_name) => {
                 self.handle_connection_timeout(profile_name);
             }
-            Message::RetryConnect { idx, attempt } => {
-                self.handle_retry_connect(idx, attempt);
+            Message::RetryConnect {
+                profile_id,
+                attempt,
+            } => {
+                self.handle_retry_connect(profile_id, attempt);
             }
             Message::NetworkChanged => {
                 self.handle_network_changed();
@@ -398,7 +464,8 @@ impl App {
                     // 2 fields (Username/Password) and forces `otp = None`
                     // in the AuthSubmit message.
                     let (username, password) =
-                        utils::read_openvpn_saved_auth(&profile.name).unwrap_or_default();
+                        utils::read_openvpn_saved_auth_compat(profile.id.as_str(), &profile.name)
+                            .unwrap_or_default();
                     let username_cursor = username.len();
                     let password_cursor = password.len();
                     self.input_mode = InputMode::AuthPrompt {
@@ -426,6 +493,7 @@ impl App {
                 let is_openvpn = matches!(profile.protocol, Protocol::OpenVPN);
                 let has_auth = utils::openvpn_config_needs_auth(&profile.config_path);
                 let name = profile.name.clone();
+                let profile_id = profile.id.clone();
                 if !is_openvpn {
                     self.show_toast(
                         "Auth credentials only apply to OpenVPN profiles".to_string(),
@@ -436,13 +504,15 @@ impl App {
                         "This profile does not use auth-user-pass".to_string(),
                         ToastType::Info,
                     );
-                } else if utils::read_openvpn_saved_auth(&name).is_none() {
+                } else if utils::read_openvpn_saved_auth_compat(profile_id.as_str(), &name)
+                    .is_none()
+                {
                     self.show_toast(
                         format!("No saved credentials for '{name}'"),
                         ToastType::Info,
                     );
                 } else {
-                    utils::delete_openvpn_auth_file(&name);
+                    utils::delete_openvpn_auth_file_compat(profile_id.as_str(), &name);
                     self.log(&format!("AUTH: Cleared saved credentials for '{name}'"));
                     self.show_toast(
                         format!("Credentials cleared for '{name}'"),
@@ -462,17 +532,14 @@ impl App {
         // and leaving the entry as Disconnecting forever. Same pattern
         // as the prior ConnectResult fix.
         use crate::vortix_core::engine::state::Connection;
-        use crate::vortix_core::profile::ProfileId;
         let still_disconnecting = self
-            .registry
-            .snapshot(&ProfileId::new(&profile))
+            .profile_id_for_name(&profile)
+            .and_then(|id| self.registry.snapshot(&id))
             .is_some_and(|snap| matches!(snap.state, Connection::Disconnecting { .. }));
         if !still_disconnecting {
             self.log(&format!(
                 "INFO: Ignoring stale DisconnectResult for '{profile}' (state changed)"
             ));
-            // Still clean up files — the disconnect thread likely did kill the process
-            utils::cleanup_openvpn_run_files(&profile);
         } else if success {
             // The worker's exit status is not kernel truth: openvpn can
             // take another second or two to die after `down()` returns.
@@ -505,7 +572,7 @@ impl App {
         }
     }
 
-    #[allow(clippy::too_many_lines)] // single linear sequence of stale-check, success bookkeeping, failure logging; splitting would obscure the flow
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // one message payload + linear stale-check/bookkeeping flow
     fn handle_connect_result(
         &mut self,
         profile: String,
@@ -513,6 +580,10 @@ impl App {
         error: Option<String>,
         interface: Option<String>,
         pid: Option<u32>,
+        generation: u64,
+        handshake: Option<crate::vortix_core::ports::tunnel::HandshakeEvidence>,
+        probe_receipts: Vec<crate::vortix_core::ports::tunnel::ProbeReceipt>,
+        dns_request: crate::vortix_core::ports::dns::DnsRequest,
     ) {
         // Stale-arrival check. A `ConnectResult` is stale ONLY when the
         // user cancelled / changed context before the spawn thread's
@@ -526,10 +597,9 @@ impl App {
         // the tunnel stuck in Connecting forever now (the scanner
         // can no longer promote on its own).
         use crate::vortix_core::engine::state::Connection;
-        use crate::vortix_core::profile::ProfileId;
         let still_relevant = self
-            .registry
-            .snapshot(&ProfileId::new(&profile))
+            .profile_id_for_name(&profile)
+            .and_then(|id| self.registry.snapshot(&id))
             .is_some_and(|snap| {
                 matches!(
                     snap.state,
@@ -541,12 +611,14 @@ impl App {
                 "INFO: Ignoring stale ConnectResult for '{profile}' (state changed)"
             ));
         } else if success {
+            self.runtime.remember_dns_request(&profile, dns_request);
+            self.record_wireguard_probe_activity(&profile, probe_receipts.clone());
             // Reset this profile's retry / auto-reconnect bookkeeping on
             // success. Other profiles' retry state is untouched (P5b
             // per-profile retry).
-            self.runtime
-                .retry_state
-                .remove(&crate::vortix_core::profile::ProfileId::new(&profile));
+            if let Some(profile_id) = self.profile_id_for_name(&profile) {
+                self.runtime.retry_state.remove(&profile_id);
+            }
 
             let location = self
                 .runtime
@@ -573,7 +645,11 @@ impl App {
             if let Some(p) = pid {
                 details_seed.pid = Some(p);
             }
+            details_seed.generation = generation;
+            details_seed.handshake = handshake;
+            details_seed.probe_receipts = probe_receipts;
             self.mirror_connect_into_registry(&profile, &details_seed, now);
+            self.reconcile_dns_policy();
 
             if let Some(p) = self.runtime.profiles.iter_mut().find(|p| p.name == profile) {
                 p.last_used = Some(std::time::SystemTime::now());
@@ -597,8 +673,19 @@ impl App {
             // (which the Connecting mirror will overwrite) or
             // dismisses. Before this, failed connects left no trace
             // in the registry and the sidebar reverted to blank.
-            self.mirror_failed_into_registry(&profile, &err_msg);
-            self.runtime.cleanup_vpn_resources(&profile);
+            let cleanup_confirmed = match self.runtime.cleanup_vpn_resources(&profile) {
+                Ok(()) => {
+                    self.mirror_failed_into_registry(&profile, &err_msg);
+                    true
+                }
+                Err(cleanup) => {
+                    self.mark_teardown_pending(&profile);
+                    self.log(&format!(
+                        "ERR: Failed connection teardown for '{profile}' remains ambiguous-owned: {cleanup}"
+                    ));
+                    false
+                }
+            };
 
             // Attempt retry with exponential backoff if configured.
             // Per-profile retry (): each profile's attempt
@@ -608,8 +695,13 @@ impl App {
             // drop-recovery retries keep their identity through their
             // retry budget.
             let max_retries = self.runtime.config.connect_max_retries;
-            let profile_id = crate::vortix_core::profile::ProfileId::new(&profile);
             let profile_idx = self.runtime.profiles.iter().position(|p| p.name == profile);
+            let Some(profile_id) = profile_idx
+                .and_then(|idx| self.runtime.profiles.get(idx))
+                .map(|profile| profile.id.clone())
+            else {
+                return;
+            };
             let current_attempt = self
                 .runtime
                 .retry_state
@@ -621,17 +713,18 @@ impl App {
                 .get(&profile_id)
                 .is_some_and(|r| r.auto_reconnect);
 
-            if let Some(idx) = profile_idx.filter(|_| {
-                max_retries > 0
-                    && current_attempt < max_retries
-                    && self.runtime.pending_connect.is_none()
-            }) {
+            if cleanup_confirmed
+                && profile_idx.is_some()
+                && max_retries > 0
+                && current_attempt < max_retries
+                && self.runtime.pending_connect.is_none()
+            {
                 let attempt = current_attempt + 1;
                 self.runtime.retry_state.insert(
                     profile_id.clone(),
                     crate::state::RetryState {
+                        profile_id: profile_id.clone(),
                         attempt,
-                        profile_idx: idx,
                         auto_reconnect: prior_auto,
                     },
                 );
@@ -653,9 +746,13 @@ impl App {
                 self.runtime.session_start = None;
 
                 let cmd_tx = self.runtime.cmd_tx.clone();
+                let retry_profile_id = profile_id.clone();
                 std::thread::spawn(move || {
                     std::thread::sleep(std::time::Duration::from_secs(delay_secs));
-                    let _ = cmd_tx.send(crate::message::Message::RetryConnect { idx, attempt });
+                    let _ = cmd_tx.send(crate::message::Message::RetryConnect {
+                        profile_id: retry_profile_id,
+                        attempt,
+                    });
                 });
             } else {
                 // No retry: final failure for this profile.
@@ -679,18 +776,17 @@ impl App {
         // Close the overlay first
         self.input_mode = InputMode::Normal;
 
-        // Get profile name for file path
-        let profile_name = self
+        // Resolve the opaque ID used for every OpenVPN artifact path.
+        let profile_identity = self
             .runtime
             .profiles
             .get(idx)
-            .map(|p| p.name.clone())
-            .unwrap_or_default();
+            .map(|p| (p.id.clone(), p.name.clone()));
 
-        if profile_name.is_empty() {
+        let Some((profile_id, profile_name)) = profile_identity else {
             self.show_toast("Invalid profile index".to_string(), ToastType::Error);
             return;
-        }
+        };
 
         // (#191): write the canonical
         // `<safe>.auth` exactly once with plain credentials (when
@@ -702,11 +798,11 @@ impl App {
         // async connect-worker thread.
         let result = (|| -> std::io::Result<()> {
             if save || otp.is_none() {
-                utils::write_openvpn_auth_file(&profile_name, &username, &password)?;
+                utils::write_openvpn_auth_file(profile_id.as_str(), &username, &password)?;
             }
             if let Some(ref code) = otp {
                 utils::write_openvpn_scrv1_auth_file(
-                    &profile_name,
+                    profile_id.as_str(),
                     &username,
                     &password,
                     code.as_str(),
@@ -739,7 +835,7 @@ impl App {
                     // The SCRV1 envelope cleanup happens in the
                     // protocol layer after openvpn forks.
                     if otp.is_none() && !save {
-                        utils::delete_openvpn_auth_file(&profile_name);
+                        utils::delete_openvpn_auth_file(profile_id.as_str());
                     }
                 } else {
                     // Save-only mode (from ManageAuth)
@@ -771,7 +867,13 @@ impl App {
             && !self.runtime.is_root
             && !self.runtime.killswitch_state.is_blocking();
 
-        if !blocking_refused {
+        if self.runtime.killswitch_state == crate::state::KillSwitchState::Degraded {
+            self.log("ERR: Kill-switch policy could not be verified; protection is degraded");
+            self.show_toast(
+                "Kill-switch policy could not be verified — protection degraded".to_string(),
+                ToastType::Error,
+            );
+        } else if !blocking_refused {
             // Toast / log strings use the user-facing UI labels
             // (`KillSwitchMode::display_name`). Log lines keep the
             // enum variant name in parens so on-disk logs stay
@@ -818,8 +920,8 @@ impl App {
     }
 
     fn handle_quit(&mut self) {
-        // VPN connections are independent OS processes (wg-quick configures the
-        // kernel; openvpn runs as a daemon). They should persist after the TUI
+        // VPN connections are independent OS resources (wg-quick configures the
+        // kernel; OpenVPN is a custodian-owned foreground child). They should persist after the TUI
         // exits so the user can reopen the TUI or run `vortix status` later.
         // Only explicit disconnect actions (`vortix down`, disconnect button)
         // should tear them down.
@@ -1021,6 +1123,7 @@ impl App {
     /// / `set_failed` here. The few residual single-tunnel-shaped reads
     /// (kill-switch sync, scanner-dispatch helpers) consult
     /// [`App::legacy_state`], a derived view from the registry primary.
+    #[allow(clippy::too_many_lines)]
     fn handle_sync_system_state(&mut self, active: Vec<ActiveSession>) {
         use crate::vortix_core::engine::state::Connection;
         use crate::vortix_core::profile::ProfileId;
@@ -1034,15 +1137,48 @@ impl App {
         // kernel state.
         self.runtime.scanner_first_tick_done = true;
         self.runtime.last_kernel_session_count = active.len();
+        self.observe_profile_files();
 
         let snapshots = self.registry.snapshot_all();
         let session_count = active.len();
         let mut handled: HashSet<ProfileId> = HashSet::new();
 
         for snap in &snapshots {
-            let profile_name = snap.profile_id.as_str().to_string();
+            let Some(profile_name) = self
+                .runtime
+                .profiles
+                .iter()
+                .find(|profile| profile.id == snap.profile_id)
+                .map(|profile| profile.name.clone())
+            else {
+                self.log(&format!(
+                    "WARN: ProfileMissing: stable profile {} is no longer in the catalog",
+                    snap.profile_id
+                ));
+                continue;
+            };
             handled.insert(snap.profile_id.clone());
             let matching_session = active.iter().find(|s| s.name == profile_name);
+
+            if self
+                .runtime
+                .scanner_observed_wireguard
+                .contains(&snap.profile_id)
+            {
+                // An unmanaged scanner observation stays Handshaking for as
+                // long as the kernel device exists. It is neither promoted by
+                // peer timestamps nor driven through managed timeout/cleanup.
+                if matching_session.is_none() {
+                    self.runtime
+                        .scanner_observed_wireguard
+                        .remove(&snap.profile_id);
+                    self.runtime
+                        .wireguard_peer_activity
+                        .remove(&snap.profile_id);
+                    self.registry.set_disconnected(&snap.profile_id);
+                }
+                continue;
+            }
 
             match (&snap.state, matching_session) {
                 (Connection::Disconnecting { .. }, None) => {
@@ -1131,36 +1267,87 @@ impl App {
         // (`wg-quick up X` outside vortix) get registered here on the
         // next scanner tick so the TUI shows them.
         for session in &active {
-            let pid = ProfileId::new(&session.name);
-            if !handled.contains(&pid)
-                && self.runtime.profiles.iter().any(|p| p.name == session.name)
-            {
-                self.scanner_adopt_session(session);
+            if let Some(pid) = self.profile_id_for_name(&session.name) {
+                if !handled.contains(&pid) {
+                    self.scanner_adopt_session(session);
+                }
+            }
+        }
+    }
+
+    fn observe_profile_files(&mut self) {
+        const PROFILE_RENAME_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(2);
+        let now = Instant::now();
+        let observations = self
+            .runtime
+            .profiles
+            .iter()
+            .map(|profile| {
+                (
+                    profile.id.clone(),
+                    profile.name.clone(),
+                    profile.config_path.clone(),
+                    profile.config_path.exists(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (id, name, path, exists) in observations {
+            let tracker = self
+                .runtime
+                .profile_presence
+                .entry(id.clone())
+                .or_insert_with(|| {
+                    crate::state::ProfilePresenceTracker::new(path.clone(), PROFILE_RENAME_DEBOUNCE)
+                });
+            let was_missing = matches!(tracker.state(), crate::state::ProfilePresence::Missing);
+            if exists {
+                tracker.observe_path(path);
+            } else {
+                tracker.observe_missing(now);
+                tracker.settle(now);
+            }
+            let became_missing =
+                !was_missing && matches!(tracker.state(), crate::state::ProfilePresence::Missing);
+            if became_missing {
+                self.log(&format!(
+                    "WARN: ProfileMissing: '{name}' ({id}) disappeared; retaining stable identity"
+                ));
             }
         }
     }
 
     /// Scanner helper (): force-cleanup a profile stuck in
     /// the Disconnecting state past `disconnect_timeout`. The kernel
-    /// interface is still up but the teardown isn't returning;
-    /// surface a forced-cleanup toast and drop the entry from the
-    /// registry. Mirrors the legacy timeout path.
+    /// interface is still up but the teardown isn't returning. Request an
+    /// authenticated teardown, but retain the nonterminal registry entry until
+    /// a later scanner observation proves kernel absence.
     fn scanner_force_disconnect(&mut self, profile_name: &str) {
         self.log(&format!(
             "WARN: Disconnect timed out for '{profile_name}' after {}s, forcing cleanup",
             self.runtime.config.disconnect_timeout
         ));
-        self.runtime.cleanup_vpn_resources(profile_name);
+        let cleanup = self.runtime.cleanup_vpn_resources(profile_name);
         self.runtime.pending_connect = None;
-        if self.legacy_matches(profile_name) {
-            self.runtime.session_start = None;
+        match cleanup {
+            Ok(()) => {
+                self.log(&format!(
+                    "STATUS: Forced teardown requested for '{profile_name}' — awaiting kernel confirmation"
+                ));
+                self.show_toast(
+                    "Forced teardown requested — awaiting kernel confirmation".to_string(),
+                    ToastType::Warning,
+                );
+            }
+            Err(error) => {
+                self.log(&format!(
+                    "ERR: Forced teardown for '{profile_name}' remains ambiguous-owned: {error}"
+                ));
+                self.show_toast(
+                    "Forced teardown unconfirmed — ownership retained".to_string(),
+                    ToastType::Error,
+                );
+            }
         }
-        self.mirror_disconnect_into_registry(profile_name);
-        self.show_toast(
-            "Disconnect timed out — forced cleanup".to_string(),
-            ToastType::Warning,
-        );
-        self.sync_killswitch();
     }
 
     // Removed by the state-authority rework: `scanner_promote_to_connected`. The scanner can no
@@ -1207,6 +1394,9 @@ impl App {
     /// legacy drop path including `connection_drops` counter, kill
     /// switch activation, and per-profile auto-reconnect scheduling.
     fn scanner_handle_drop(&mut self, profile_name: &str, was_connected: bool) {
+        let managed_by_this_process = self
+            .profile_id_for_name(profile_name)
+            .is_some_and(|profile_id| self.runtime.owns_dns_session(&profile_id));
         if was_connected {
             self.runtime.connection_drops += 1;
             self.log(&format!(
@@ -1226,7 +1416,14 @@ impl App {
             ));
         }
 
-        utils::cleanup_openvpn_run_files(profile_name);
+        if let Some(profile_id) = self.profile_id_for_name(profile_name) {
+            utils::cleanup_openvpn_run_files_compat(profile_id.as_str(), profile_name);
+            let _ = crate::core::managed_wireguard::remove_after_kernel_absence(
+                &self.runtime.config_dir,
+                &profile_id,
+                profile_name,
+            );
+        }
 
         if self.legacy_matches(profile_name) {
             self.runtime.session_start = None;
@@ -1252,7 +1449,7 @@ impl App {
         // AUTO-RECONNECT: per-profile (). Each dropped
         // Connected tunnel schedules its own retry; multiple drops can
         // recover concurrently.
-        if was_connected && self.runtime.config.auto_reconnect {
+        if was_connected && managed_by_this_process && self.runtime.config.auto_reconnect {
             if let Some(idx) = self
                 .runtime
                 .profiles
@@ -1269,12 +1466,12 @@ impl App {
                     ToastType::Warning,
                 );
 
-                let profile_id = crate::vortix_core::profile::ProfileId::new(profile_name);
+                let profile_id = self.runtime.profiles[idx].id.clone();
                 self.runtime.retry_state.insert(
-                    profile_id,
+                    profile_id.clone(),
                     crate::state::RetryState {
+                        profile_id: profile_id.clone(),
                         attempt: 1,
-                        profile_idx: idx,
                         auto_reconnect: true,
                     },
                 );
@@ -1282,7 +1479,10 @@ impl App {
                 let cmd_tx = self.runtime.cmd_tx.clone();
                 std::thread::spawn(move || {
                     std::thread::sleep(std::time::Duration::from_secs(delay));
-                    let _ = cmd_tx.send(crate::message::Message::RetryConnect { idx, attempt: 1 });
+                    let _ = cmd_tx.send(crate::message::Message::RetryConnect {
+                        profile_id,
+                        attempt: 1,
+                    });
                 });
             }
         }
@@ -1295,6 +1495,27 @@ impl App {
     /// or vortix restarted while a tunnel was already up.
     fn scanner_adopt_session(&mut self, session: &ActiveSession) {
         let profile_name = session.name.clone();
+
+        if let Some(profile) =
+            self.runtime.profiles.iter().find(|profile| {
+                profile.name == profile_name && profile.protocol == Protocol::WireGuard
+            })
+        {
+            let recovered =
+                crate::core::managed_wireguard::load(&self.runtime.config_dir, &profile.id)
+                    .is_some_and(|receipt| receipt.validates(&profile.id, session));
+            if recovered {
+                self.log(&format!(
+                    "STATUS: Recovered managed WireGuard connection '{profile_name}'"
+                ));
+            } else {
+                self.log(&format!(
+                    "INFO: Observed unmanaged WireGuard tunnel '{profile_name}' — awaiting an ownership receipt"
+                ));
+            }
+            self.adopt_registry_from_session(&profile_name, session);
+            return;
+        }
 
         let start_time = if let Some(real) = session.started_at {
             if let Ok(duration) = std::time::SystemTime::now().duration_since(real) {
@@ -1330,11 +1551,10 @@ impl App {
                 "INFO: Adopting externally-started tunnel '{profile_name}' as a secondary"
             ));
         }
-        // Adoption goes through the dedicated entry-creation path,
-        // NOT refresh_registry_from_session (which is metadata-only on
-        // existing Connected entries). The new entry's
-        // interface_authoritative flag is read from
-        // session.interface_authoritative.
+        // Adoption goes through the dedicated entry-creation path, not the
+        // metadata-only refresh. WireGuard scanner observations stay
+        // read-only Handshaking/non-primary; only a protocol-correct ownership
+        // receipt may promote one.
         self.adopt_registry_from_session(&profile_name, session);
     }
 
@@ -1369,45 +1589,43 @@ impl App {
         matches!(self.legacy_state(), ConnectionState::Disconnected)
     }
 
-    fn handle_retry_connect(&mut self, idx: usize, attempt: u32) {
-        // Per-profile retry (): stale check by profile_id.
-        // The message carries `idx` for backwards compatibility; we
-        // resolve it to the profile's id and verify the retry_state
-        // entry still matches before firing.
-        let profile_id_for_idx = self
+    fn handle_retry_connect(
+        &mut self,
+        profile_id: crate::vortix_core::profile::ProfileId,
+        attempt: u32,
+    ) {
+        let entry_matches = self
             .runtime
-            .profiles
-            .get(idx)
-            .map(|p| crate::vortix_core::profile::ProfileId::new(&p.name));
-
-        let entry_matches = profile_id_for_idx
-            .as_ref()
-            .and_then(|pid| self.runtime.retry_state.get(pid))
-            .is_some_and(|r| r.profile_idx == idx && r.attempt == attempt);
+            .retry_state
+            .get(&profile_id)
+            .is_some_and(|retry| retry.profile_id == profile_id && retry.attempt == attempt);
 
         if !entry_matches {
             self.log(&format!(
-                "INFO: Ignoring stale RetryConnect (attempt {attempt}, idx {idx})"
+                "INFO: Ignoring stale RetryConnect (attempt {attempt}, profile {profile_id})"
             ));
             return;
         }
         // Don't retry if a tunnel is now in-flight on any profile.
         if self.active_tunnel_count() > 0 {
             self.log("INFO: Skipping retry — connection state changed");
-            if let Some(pid) = &profile_id_for_idx {
-                self.runtime.retry_state.remove(pid);
-            }
+            self.runtime.retry_state.remove(&profile_id);
             return;
         }
-        if let Some(profile) = self.runtime.profiles.get(idx) {
+        if let Some(idx) = self
+            .runtime
+            .profiles
+            .iter()
+            .position(|profile| profile.id == profile_id)
+        {
+            let profile_name = self.runtime.profiles[idx].name.clone();
             let max = self.runtime.config.connect_max_retries;
             self.log(&format!(
-                "RETRY: Attempting reconnect to '{}' ({attempt}/{max})",
-                profile.name
+                "RETRY: Attempting reconnect to '{profile_name}' ({attempt}/{max})"
             ));
             self.connect_profile(idx);
-        } else if let Some(pid) = &profile_id_for_idx {
-            self.runtime.retry_state.remove(pid);
+        } else {
+            self.runtime.retry_state.remove(&profile_id);
         }
     }
 
@@ -1430,21 +1648,25 @@ impl App {
                 if !self.runtime.config.auto_reconnect {
                     return;
                 }
-                let to_retry: Vec<(usize, String)> = self
+                let to_retry: Vec<crate::vortix_core::profile::ProfileId> = self
                     .runtime
                     .retry_state
                     .values()
                     .filter(|r| r.auto_reconnect)
-                    .filter_map(|r| {
-                        self.runtime
-                            .profiles
-                            .get(r.profile_idx)
-                            .map(|p| (r.profile_idx, p.name.clone()))
-                    })
+                    .map(|retry| retry.profile_id.clone())
                     .collect();
                 let delay = self.runtime.config.auto_reconnect_delay_secs;
-                for (idx, name) in to_retry {
-                    let pid = crate::vortix_core::profile::ProfileId::new(&name);
+                for profile_id in to_retry {
+                    let Some(name) = self
+                        .runtime
+                        .profiles
+                        .iter()
+                        .find(|profile| profile.id == profile_id)
+                        .map(|profile| profile.name.clone())
+                    else {
+                        self.runtime.retry_state.remove(&profile_id);
+                        continue;
+                    };
                     self.log(&format!(
                         "NET: Network available — auto-reconnecting to '{name}' in {delay}s"
                     ));
@@ -1454,17 +1676,20 @@ impl App {
                     );
 
                     let cmd_tx = self.runtime.cmd_tx.clone();
+                    let retry_profile_id = profile_id.clone();
                     std::thread::spawn(move || {
                         std::thread::sleep(std::time::Duration::from_secs(delay));
-                        let _ =
-                            cmd_tx.send(crate::message::Message::RetryConnect { idx, attempt: 1 });
+                        let _ = cmd_tx.send(crate::message::Message::RetryConnect {
+                            profile_id: retry_profile_id,
+                            attempt: 1,
+                        });
                     });
 
                     self.runtime.retry_state.insert(
-                        pid,
+                        profile_id.clone(),
                         crate::state::RetryState {
+                            profile_id,
                             attempt: 1,
-                            profile_idx: idx,
                             auto_reconnect: true,
                         },
                     );
@@ -1475,17 +1700,22 @@ impl App {
     }
 
     fn handle_connection_timeout(&mut self, profile_name: String) {
-        self.runtime.cleanup_vpn_resources(&profile_name);
-        let profile_id = crate::vortix_core::profile::ProfileId::new(&profile_name);
-        self.runtime.session_start = None;
+        let Some(profile_id) = self.profile_id_for_name(&profile_name) else {
+            return;
+        };
+        self.mark_teardown_pending(&profile_name);
+        let cleanup = self.runtime.cleanup_vpn_resources(&profile_name);
         self.runtime.pending_connect = None;
         self.runtime.retry_state.remove(&profile_id);
-        // Drop the in-flight registry entry so the renderers stop
-        // showing the phantom Connecting state.
-        self.registry.set_disconnected(&profile_id);
-        self.log(&format!("ERR: Connection timed out for '{profile_name}'"));
+        let detail = cleanup.map_or_else(
+            |error| format!("teardown remains ambiguous-owned: {error}"),
+            |()| "teardown requested; awaiting kernel confirmation".into(),
+        );
+        self.log(&format!(
+            "ERR: Connection timed out for '{profile_name}'; {detail}"
+        ));
         self.show_toast(
-            format!("Connection timed out for '{profile_name}'"),
+            format!("Connection timed out for '{profile_name}' — {detail}"),
             ToastType::Error,
         );
         self.sync_killswitch();
@@ -1493,10 +1723,21 @@ impl App {
     }
 
     fn handle_tick(&mut self) {
+        if self.runtime.killswitch_verification_needs_refresh() {
+            self.sync_killswitch();
+        }
         // 1. Connection Timeout Safeguard
         if let ConnectionState::Connecting { started, profile } = self.legacy_state() {
-            if started.elapsed()
-                > std::time::Duration::from_secs(self.runtime.config.connect_timeout)
+            let scanner_observed = self
+                .profile_id_for_name(&profile)
+                .is_some_and(|profile_id| {
+                    self.runtime
+                        .scanner_observed_wireguard
+                        .contains(&profile_id)
+                });
+            if !scanner_observed
+                && started.elapsed()
+                    > std::time::Duration::from_secs(self.runtime.config.connect_timeout)
             {
                 self.handle_message(Message::ConnectionTimeout(profile));
             }

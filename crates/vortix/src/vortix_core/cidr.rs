@@ -20,10 +20,28 @@ use serde::{Deserialize, Serialize};
 /// The address is stored verbatim — callers may pass non-canonical inputs
 /// such as `10.0.0.5/8`; aggregation masks the host bits away before
 /// computing the numeric range, so the result is unaffected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub struct Cidr {
     pub addr: IpAddr,
     pub prefix_len: u8,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CidrWire {
+    addr: IpAddr,
+    prefix_len: u8,
+}
+
+impl<'de> Deserialize<'de> for Cidr {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = CidrWire::deserialize(deserializer)?;
+        Self::new(wire.addr, wire.prefix_len)
+            .ok_or_else(|| serde::de::Error::custom(CidrParseError::PrefixOutOfRange))
+    }
 }
 
 impl Cidr {
@@ -39,6 +57,17 @@ impl Cidr {
             return None;
         }
         Some(Self { addr, prefix_len })
+    }
+
+    /// Revalidate a literal `Cidr`. Public fields remain available for
+    /// backwards compatibility, so security boundaries must call this before
+    /// accepting caller-constructed values.
+    #[must_use]
+    pub const fn is_valid(&self) -> bool {
+        match self.addr {
+            IpAddr::V4(_) => self.prefix_len <= 32,
+            IpAddr::V6(_) => self.prefix_len <= 128,
+        }
     }
 
     #[must_use]
@@ -415,6 +444,21 @@ mod tests {
             "::/129".parse::<Cidr>().unwrap_err(),
             CidrParseError::PrefixOutOfRange
         );
+    }
+
+    #[test]
+    fn deserialize_rejects_out_of_range_prefix_and_unknown_fields() {
+        for malformed in [
+            serde_json::json!({"addr": "10.0.0.0", "prefix_len": 33}),
+            serde_json::json!({"addr": "::", "prefix_len": 129}),
+            serde_json::json!({
+                "addr": "10.0.0.0",
+                "prefix_len": 8,
+                "injected": true
+            }),
+        ] {
+            assert!(serde_json::from_value::<Cidr>(malformed).is_err());
+        }
     }
 
     #[test]

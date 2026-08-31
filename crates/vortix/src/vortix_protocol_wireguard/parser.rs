@@ -4,14 +4,19 @@
 //! `resolvconf` dependency hinting), peer routing data (`AllowedIPs`,
 //! `Endpoint`, `FwMark`) used by the multi-tunnel registry's conflict
 //! detector and killswitch synthesis, a `has_hooks` flag derived from
-//! the presence of `PreUp`/`PostUp`/`PreDown`/`PostDown` directives in
-//! the `[Interface]` section, and a passthrough of the raw text. The
+//! rejection of `PreUp`/`PostUp`/`PreDown`/`PostDown` executable directives
+//! in the `[Interface]` section, and a passthrough of the raw text. The
 //! binary still hands `wg-quick` the on-disk path; this parser is only
 //! used for pre-flight inspection.
 
 use std::net::{IpAddr, SocketAddr};
 
 use crate::vortix_core::ports::tunnel::{ParseError, ParsedProfile};
+
+const MAX_CONFIG_BYTES: usize = 1024 * 1024;
+const MAX_CONFIG_PEERS: usize = 256;
+const MAX_CONFIG_ROUTES_PER_PEER: usize = 256;
+const MAX_CONFIG_FIELD_BYTES: usize = 4096;
 
 /// CIDR block: an IP address paired with a prefix length.
 ///
@@ -54,18 +59,17 @@ pub struct WgPeer {
     pub allowed_ips: Vec<Cidr>,
     pub endpoint: Option<SocketAddr>,
     pub fwmark: Option<u32>,
+    pub persistent_keepalive: Option<u16>,
 }
 
 /// Parsed `WireGuard` profile body.
 #[derive(Debug, Default, Clone)]
 pub struct WgParsedProfile {
     pub dns_servers: Vec<String>,
+    pub dns_search_domains: Vec<String>,
     pub address: Option<String>,
     pub mtu: Option<u32>,
     pub peers: Vec<WgPeer>,
-    /// True if the `[Interface]` section declares any of
-    /// `PreUp`/`PostUp`/`PreDown`/`PostDown` (matched case-insensitively).
-    pub has_hooks: bool,
     pub raw: String,
 }
 
@@ -84,6 +88,17 @@ impl ParsedProfile for WgParsedProfile {
     fn dns_servers(&self) -> Vec<String> {
         self.dns_servers.clone()
     }
+
+    fn dns_request(&self) -> crate::vortix_core::ports::dns::DnsRequest {
+        crate::vortix_core::ports::dns::DnsRequest {
+            servers: self
+                .dns_servers
+                .iter()
+                .filter_map(|server| server.parse().ok())
+                .collect(),
+            search_domains: self.dns_search_domains.clone(),
+        }
+    }
 }
 
 /// Parse a `.conf` (INI-style) body into [`WgParsedProfile`].
@@ -95,6 +110,12 @@ impl ParsedProfile for WgParsedProfile {
 /// expand the error set.
 #[allow(clippy::too_many_lines)]
 pub fn parse_wg_conf(text: &str) -> Result<WgParsedProfile, ParseError> {
+    if text.len() > MAX_CONFIG_BYTES {
+        return Err(ParseError::MalformedField {
+            field: "profile",
+            detail: format!("exceeds {MAX_CONFIG_BYTES} bytes"),
+        });
+    }
     let mut profile = WgParsedProfile {
         raw: text.to_string(),
         ..Default::default()
@@ -110,6 +131,12 @@ pub fn parse_wg_conf(text: &str) -> Result<WgParsedProfile, ParseError> {
         if let Some(header) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
             // Finalize any in-flight peer before switching section.
             if let Some(peer) = current_peer.take() {
+                if profile.peers.len() >= MAX_CONFIG_PEERS {
+                    return Err(ParseError::MalformedField {
+                        field: "Peer",
+                        detail: format!("exceeds {MAX_CONFIG_PEERS} entries"),
+                    });
+                }
                 profile.peers.push(peer);
             }
             let header = header.trim();
@@ -129,14 +156,30 @@ pub fn parse_wg_conf(text: &str) -> Result<WgParsedProfile, ParseError> {
         };
         let key = key.trim();
         let value = value.trim();
+        if key.len() > MAX_CONFIG_FIELD_BYTES || value.len() > MAX_CONFIG_FIELD_BYTES {
+            return Err(ParseError::MalformedField {
+                field: "WireGuard directive",
+                detail: format!("field exceeds {MAX_CONFIG_FIELD_BYTES} bytes"),
+            });
+        }
 
         match section {
             Section::Interface => {
                 if key.eq_ignore_ascii_case("DNS") {
+                    // Strip valid trailing comments before comma
+                    // tokenization. Otherwise `1.1.1.1 # note` is no
+                    // longer an IP and is misclassified as a search domain.
+                    let value = value
+                        .find(['#', ';'])
+                        .map_or(value, |comment| &value[..comment]);
                     for entry in value.split(',') {
                         let entry = entry.trim();
                         if !entry.is_empty() {
-                            profile.dns_servers.push(entry.to_string());
+                            if entry.parse::<std::net::IpAddr>().is_ok() {
+                                profile.dns_servers.push(entry.to_string());
+                            } else {
+                                profile.dns_search_domains.push(entry.to_string());
+                            }
                         }
                     }
                 } else if key.eq_ignore_ascii_case("Address") {
@@ -148,7 +191,9 @@ pub fn parse_wg_conf(text: &str) -> Result<WgParsedProfile, ParseError> {
                     || key.eq_ignore_ascii_case("PreDown")
                     || key.eq_ignore_ascii_case("PostDown")
                 {
-                    profile.has_hooks = true;
+                    return Err(ParseError::Unsupported(format!(
+                        "WireGuard `{key}` executable directives are not allowed: Vortix never runs profile commands as root; migrate this automation to a global lifecycle hook using an absolute executable plus argv"
+                    )));
                 }
             }
             Section::Peer => {
@@ -162,7 +207,17 @@ pub fn parse_wg_conf(text: &str) -> Result<WgParsedProfile, ParseError> {
                                 continue;
                             }
                             match Cidr::parse(entry) {
-                                Some(cidr) => peer.allowed_ips.push(cidr),
+                                Some(cidr) => {
+                                    if peer.allowed_ips.len() >= MAX_CONFIG_ROUTES_PER_PEER {
+                                        return Err(ParseError::MalformedField {
+                                            field: "AllowedIPs",
+                                            detail: format!(
+                                                "peer exceeds {MAX_CONFIG_ROUTES_PER_PEER} routes"
+                                            ),
+                                        });
+                                    }
+                                    peer.allowed_ips.push(cidr);
+                                }
                                 None => {
                                     tracing::warn!(
                                         cidr = entry,
@@ -197,6 +252,12 @@ pub fn parse_wg_conf(text: &str) -> Result<WgParsedProfile, ParseError> {
                                 tracing::warn!(value, "ignoring malformed FwMark value in [Peer]");
                             }
                         }
+                    } else if key.eq_ignore_ascii_case("PersistentKeepalive") {
+                        peer.persistent_keepalive = value
+                            .split(['#', ';'])
+                            .next()
+                            .and_then(|seconds| seconds.trim().parse::<u16>().ok())
+                            .filter(|seconds| *seconds > 0);
                     }
                 }
             }
@@ -205,6 +266,12 @@ pub fn parse_wg_conf(text: &str) -> Result<WgParsedProfile, ParseError> {
     }
 
     if let Some(peer) = current_peer.take() {
+        if profile.peers.len() >= MAX_CONFIG_PEERS {
+            return Err(ParseError::MalformedField {
+                field: "Peer",
+                detail: format!("exceeds {MAX_CONFIG_PEERS} entries"),
+            });
+        }
         profile.peers.push(peer);
     }
 
@@ -233,6 +300,42 @@ Endpoint = 203.0.113.5:51820
         assert_eq!(p.dns_servers, vec!["1.1.1.1", "8.8.8.8"]);
         assert_eq!(p.address.as_deref(), Some("10.0.0.2/32"));
         assert_eq!(p.mtu, Some(1420));
+    }
+
+    #[test]
+    fn parses_persistent_keepalive_as_peer_expectation() {
+        let parsed = parse_wg_conf(
+            "[Interface]\nPrivateKey = private\n[Peer]\nPublicKey = peer\nAllowedIPs = 10.0.0.0/24\nPersistentKeepalive = 25 # seconds\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.peers[0].persistent_keepalive, Some(25));
+    }
+
+    #[test]
+    fn separates_resolver_addresses_from_search_domains() {
+        let p = parse_wg_conf("[Interface]\nDNS = 1.1.1.1, corp.example\n").unwrap();
+        assert_eq!(p.dns_servers, vec!["1.1.1.1"]);
+        assert_eq!(p.dns_search_domains, vec!["corp.example"]);
+    }
+
+    #[test]
+    fn strips_hash_comment_from_dns_value_before_classification() {
+        let p = parse_wg_conf(
+            "[Interface]\nDNS = 1.1.1.1, corp.example # primary resolver and search\n",
+        )
+        .unwrap();
+        assert_eq!(p.dns_servers, vec!["1.1.1.1"]);
+        assert_eq!(p.dns_search_domains, vec!["corp.example"]);
+    }
+
+    #[test]
+    fn strips_semicolon_comment_from_dns_value_before_classification() {
+        let p = parse_wg_conf(
+            "[Interface]\nDNS = 2606:4700:4700::1111, internal.example ; office DNS\n",
+        )
+        .unwrap();
+        assert_eq!(p.dns_servers, vec!["2606:4700:4700::1111"]);
+        assert_eq!(p.dns_search_domains, vec!["internal.example"]);
     }
 
     #[test]
@@ -442,30 +545,31 @@ FwMark = 0xca6c
     }
 
     #[test]
-    fn postup_sets_has_hooks() {
+    fn postup_is_rejected_with_owner_hook_migration_guidance() {
         let text = "\
 [Interface]
 PrivateKey = AAAA
 Address = 10.0.0.2/32
 PostUp = iptables -A FORWARD -i %i -j ACCEPT
 ";
-        let p = parse_wg_conf(text).unwrap();
-        assert!(p.has_hooks);
+        let error = parse_wg_conf(text).unwrap_err().to_string();
+        assert!(error.contains("PostUp"));
+        assert!(error.contains("never runs profile commands as root"));
+        assert!(error.contains("lifecycle hook"));
     }
 
     #[test]
-    fn lowercase_postup_sets_has_hooks() {
+    fn lowercase_postup_is_rejected() {
         let text = "\
 [Interface]
 PrivateKey = AAAA
 postup = iptables -A FORWARD -i %i -j ACCEPT
 ";
-        let p = parse_wg_conf(text).unwrap();
-        assert!(p.has_hooks);
+        assert!(parse_wg_conf(text).is_err());
     }
 
     #[test]
-    fn comment_mentioning_preup_does_not_set_has_hooks() {
+    fn comment_mentioning_preup_remains_valid() {
         let text = "\
 [Interface]
 PrivateKey = AAAA
@@ -473,11 +577,11 @@ PrivateKey = AAAA
 Address = 10.0.0.2/32
 ";
         let p = parse_wg_conf(text).unwrap();
-        assert!(!p.has_hooks);
+        assert_eq!(p.address.as_deref(), Some("10.0.0.2/32"));
     }
 
     #[test]
-    fn profile_without_hooks_reports_false() {
+    fn profile_without_executable_directives_remains_valid() {
         let text = "\
 [Interface]
 PrivateKey = AAAA
@@ -488,7 +592,7 @@ PublicKey = BBBB
 AllowedIPs = 10.0.0.0/8
 ";
         let p = parse_wg_conf(text).unwrap();
-        assert!(!p.has_hooks);
+        assert_eq!(p.peers.len(), 1);
     }
 
     #[test]
@@ -507,11 +611,14 @@ AllowedIPs = 10.0.0.0/8
     }
 
     #[test]
-    fn all_four_hook_directives_detected() {
+    fn all_four_executable_directives_are_rejected() {
         for directive in ["PreUp", "PostUp", "PreDown", "PostDown"] {
             let text = format!("[Interface]\n{directive} = echo hi\n");
-            let p = parse_wg_conf(&text).unwrap();
-            assert!(p.has_hooks, "directive {directive} should set has_hooks");
+            let error = parse_wg_conf(&text).unwrap_err().to_string();
+            assert!(
+                error.contains(directive),
+                "directive {directive} should be named in the error"
+            );
         }
     }
 }

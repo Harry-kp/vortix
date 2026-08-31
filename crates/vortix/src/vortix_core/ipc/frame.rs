@@ -36,21 +36,25 @@ pub enum FrameError {
 /// Returns [`FrameError::TooLarge`] when the body would exceed
 /// [`MAX_FRAME_BYTES`] or [`FrameError::Serialize`] when serde fails.
 ///
-/// # Panics
-///
-/// Panics if the body length cannot be converted to `u32` — only
-/// reachable if [`MAX_FRAME_BYTES`] is bumped above `u32::MAX`, which
-/// no realistic IPC payload would hit.
 pub fn encode_frame<T: Serialize>(value: &T) -> Result<Vec<u8>, FrameError> {
+    encode_frame_bounded::<T, MAX_FRAME_BYTES>(value)
+}
+
+pub(crate) fn encode_frame_bounded<T: Serialize, const LIMIT: usize>(
+    value: &T,
+) -> Result<Vec<u8>, FrameError> {
     let body = serde_json::to_vec(value)?;
-    if body.len() > MAX_FRAME_BYTES {
+    if body.len() > LIMIT {
         return Err(FrameError::TooLarge {
             got: body.len(),
-            max: MAX_FRAME_BYTES,
+            max: LIMIT,
         });
     }
     let mut out = Vec::with_capacity(4 + body.len());
-    let len = u32::try_from(body.len()).expect("MAX_FRAME_BYTES fits in u32");
+    let len = u32::try_from(body.len()).map_err(|_| FrameError::TooLarge {
+        got: body.len(),
+        max: LIMIT.min(u32::MAX as usize),
+    })?;
     out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(&body);
     Ok(out)
@@ -74,23 +78,33 @@ pub fn encode_frame<T: Serialize>(value: &T) -> Result<Vec<u8>, FrameError> {
 /// Cannot panic — the `buf[0..4].try_into()` cast checks length
 /// before; the assertion message inside is dead code in practice.
 pub fn decode_frame<T: DeserializeOwned>(buf: &[u8]) -> Result<Option<(T, usize)>, FrameError> {
+    decode_frame_bounded::<T, MAX_FRAME_BYTES>(buf)
+}
+
+pub(crate) fn decode_frame_bounded<T: DeserializeOwned, const LIMIT: usize>(
+    buf: &[u8],
+) -> Result<Option<(T, usize)>, FrameError> {
     if buf.len() < 4 {
         return Ok(None);
     }
     let len_bytes: [u8; 4] = buf[0..4].try_into().expect("4 bytes");
     let body_len = u32::from_be_bytes(len_bytes) as usize;
-    if body_len > MAX_FRAME_BYTES {
+    if body_len > LIMIT {
         return Err(FrameError::TooLarge {
             got: body_len,
-            max: MAX_FRAME_BYTES,
+            max: LIMIT,
         });
     }
-    if buf.len() < 4 + body_len {
+    let total_len = 4usize.checked_add(body_len).ok_or(FrameError::TooLarge {
+        got: body_len,
+        max: LIMIT,
+    })?;
+    if buf.len() < total_len {
         return Ok(None);
     }
-    let body = &buf[4..4 + body_len];
+    let body = &buf[4..total_len];
     let value: T = serde_json::from_slice(body)?;
-    Ok(Some((value, 4 + body_len)))
+    Ok(Some((value, total_len)))
 }
 
 #[cfg(test)]

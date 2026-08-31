@@ -3,6 +3,9 @@
 //! These tests verify the CLI output layer, `VpnRuntime` headless mode, and
 //! command handlers without requiring root, VPN tools, or network access.
 
+#[path = "support/control_scenarios.rs"]
+mod control_scenarios;
+
 use vortix::cli::output::{error_response, CliError, CliResponse, ExitCode, OutputMode};
 use vortix::state::{KillSwitchMode, KillSwitchState, Protocol, VpnProfile};
 use vortix::vpn_runtime::VpnRuntime;
@@ -37,6 +40,7 @@ fn engine_new_test_has_empty_profiles() {
 fn engine_find_profile_by_name() {
     let mut engine = VpnRuntime::new_test();
     engine.profiles.push(VpnProfile {
+        id: vortix::vortix_core::profile::ProfileId::new("work-vpn"),
         name: "work-vpn".into(),
         protocol: Protocol::WireGuard,
         config_path: "/tmp/work.conf".into(),
@@ -44,6 +48,7 @@ fn engine_find_profile_by_name() {
         last_used: None,
     });
     engine.profiles.push(VpnProfile {
+        id: vortix::vortix_core::profile::ProfileId::new("personal"),
         name: "personal".into(),
         protocol: Protocol::OpenVPN,
         config_path: "/tmp/personal.ovpn".into(),
@@ -61,6 +66,7 @@ fn engine_sort_profiles_by_name() {
     let mut engine = VpnRuntime::new_test();
     for name in &["charlie", "alpha", "bravo"] {
         engine.profiles.push(VpnProfile {
+            id: vortix::vortix_core::profile::ProfileId::new(*name),
             name: (*name).into(),
             protocol: Protocol::WireGuard,
             config_path: format!("/tmp/{name}.conf").into(),
@@ -84,6 +90,7 @@ fn engine_sort_profiles_by_name() {
 fn engine_sort_profiles_by_protocol() {
     let mut engine = VpnRuntime::new_test();
     engine.profiles.push(VpnProfile {
+        id: vortix::vortix_core::profile::ProfileId::new("ovpn-profile"),
         name: "ovpn-profile".into(),
         protocol: Protocol::OpenVPN,
         config_path: "/tmp/a.ovpn".into(),
@@ -91,6 +98,7 @@ fn engine_sort_profiles_by_protocol() {
         last_used: None,
     });
     engine.profiles.push(VpnProfile {
+        id: vortix::vortix_core::profile::ProfileId::new("wg-profile"),
         name: "wg-profile".into(),
         protocol: Protocol::WireGuard,
         config_path: "/tmp/b.conf".into(),
@@ -621,5 +629,53 @@ fn clap_parses_up_yes_defaults_false() {
         assert!(!yes, "yes should default to false when --yes/-y absent");
     } else {
         panic!("Expected Up command");
+    }
+}
+
+#[test]
+fn shared_control_scenarios_preserve_cli_grammar_and_output_modes() {
+    use clap::Parser;
+    use control_scenarios::{OutputSurface, CONTROL_SCENARIOS};
+    use vortix::cli::args::{Args, Commands};
+
+    for scenario in CONTROL_SCENARIOS {
+        let parsed = Args::try_parse_from(scenario.argv)
+            .unwrap_or_else(|error| panic!("{} failed to parse: {error}", scenario.id));
+        let command = match parsed.command.as_ref() {
+            None => "tui",
+            Some(Commands::Up { .. }) => "up",
+            Some(Commands::Down { .. }) => "down",
+            Some(Commands::Reconnect { .. }) => "reconnect",
+            Some(Commands::Status { .. }) => "status",
+            Some(Commands::List { .. }) => "list",
+            Some(Commands::Import { .. }) => "import",
+            Some(Commands::Show { .. }) => "show",
+            Some(Commands::Delete { .. }) => "delete",
+            Some(Commands::Rename { .. }) => "rename",
+            Some(Commands::KillSwitch { .. }) => "killswitch",
+            Some(Commands::ReleaseKillSwitch) => "release-killswitch",
+            Some(Commands::Info) => "info",
+            Some(Commands::Update) => "update",
+            Some(Commands::Report) => "report",
+            Some(Commands::Daemon { .. }) => "daemon",
+            Some(Commands::Audit { .. }) => "audit",
+            Some(Commands::Completions { .. }) => "completions",
+        };
+        assert_eq!(command, scenario.command, "{} command drift", scenario.id);
+
+        let output = if parsed.command.is_none() {
+            OutputSurface::Tui
+        } else if parsed.quiet {
+            OutputSurface::Quiet
+        } else if parsed.json
+            && matches!(parsed.command, Some(Commands::Status { watch: true, .. }))
+        {
+            OutputSurface::JsonWatch
+        } else if parsed.json {
+            OutputSurface::Json
+        } else {
+            OutputSurface::Human
+        };
+        assert_eq!(output, scenario.output, "{} output drift", scenario.id);
     }
 }

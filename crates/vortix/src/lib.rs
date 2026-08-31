@@ -35,6 +35,8 @@ pub mod constants;
 pub mod core;
 pub mod daemon;
 pub mod event;
+pub mod helper;
+pub mod hooks;
 pub mod logger;
 pub mod message;
 pub mod platform;
