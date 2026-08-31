@@ -2379,7 +2379,7 @@ fn theme_toggle_persists_restyles_cached_content_and_reports_success() {
         crate::theme::ThemeChoice::Synthwave,
     ));
 
-    app.handle_message(Message::ToggleTheme);
+    app.handle_key(key_char('p'));
 
     // The palette changes immediately; durable config I/O finishes on the
     // command worker so it cannot stall input or rendering.
@@ -2387,6 +2387,7 @@ fn theme_toggle_persists_restyles_cached_content_and_reports_success() {
         app.runtime.config.theme,
         crate::theme::ThemeChoice::Terminal
     );
+    assert!(!app.show_bulk_menu);
     assert!(app.pending_theme_change.is_some());
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     while app.pending_theme_change.is_some() && std::time::Instant::now() < deadline {

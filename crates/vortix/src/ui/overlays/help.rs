@@ -51,6 +51,7 @@ const HELP_TEXT: &[(&str, &[(&str, &str)])] = &[
             ("z", "Zoom focused panel"),
             ("x", "Action menu"),
             ("b", "Bulk action menu"),
+            ("p", "Switch color theme"),
             ("/", "Search profiles"),
             ("?", "Toggle this help"),
             ("q", "Quit"),
@@ -504,6 +505,16 @@ mod tests {
             });
         assert!(blob.contains("Disconnect ALL"));
         assert!(blob.contains("Connect both"));
+    }
+
+    #[test]
+    fn palette_key_is_documented() {
+        let global = HELP_TEXT
+            .iter()
+            .find(|(section, _)| *section == "Global")
+            .map(|(_, bindings)| *bindings)
+            .expect("Global help section must exist");
+        assert!(global.contains(&("p", "Switch color theme")));
     }
 
     #[test]

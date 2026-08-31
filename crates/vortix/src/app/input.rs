@@ -709,6 +709,7 @@ impl crate::app::App {
             }
             KeyCode::Char('x') => self.handle_message(Message::OpenActionMenu),
             KeyCode::Char('b') => self.handle_message(Message::OpenBulkMenu),
+            KeyCode::Char('p') => self.handle_message(Message::ToggleTheme),
             KeyCode::Esc => {
                 if self.zoomed_panel.is_some() {
                     self.zoomed_panel = None;
