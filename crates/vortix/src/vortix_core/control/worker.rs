@@ -64,6 +64,8 @@ pub enum WorkFailure {
     EffectFailed,
     /// `WireGuard` connect returned without exact current-generation peer proof.
     HandshakeFailed,
+    /// An interactive credential was not delivered to the admitted operation.
+    ChallengeFailed,
     /// The effect may have happened but no trustworthy receipt was obtained.
     OutcomeUnknown,
     Stale,
@@ -203,6 +205,39 @@ impl RouteClaim {
         Cidr::new(self.network, self.prefix_len)
             .zip(Cidr::new(other.network, other.prefix_len))
             .is_some_and(|(left, right)| left.intersects(&right))
+    }
+
+    #[must_use]
+    pub const fn network(self) -> std::net::IpAddr {
+        self.network
+    }
+
+    #[must_use]
+    pub const fn prefix_len(self) -> u8 {
+        self.prefix_len
+    }
+
+    #[must_use]
+    pub const fn is_default(self) -> bool {
+        self.prefix_len == 0
+    }
+
+    /// Stable address used for kernel route read-back of this claim.
+    #[must_use]
+    pub fn probe_address(self) -> std::net::IpAddr {
+        match (self.network, self.prefix_len) {
+            (std::net::IpAddr::V4(_), 0) => "1.1.1.1".parse().expect("fixed IPv4 address"),
+            (std::net::IpAddr::V6(_), 0) => {
+                "2606:4700:4700::1111".parse().expect("fixed IPv6 address")
+            }
+            (std::net::IpAddr::V4(address), prefix) if prefix < 32 => {
+                std::net::IpAddr::V4((u32::from(address).saturating_add(1)).into())
+            }
+            (std::net::IpAddr::V6(address), prefix) if prefix < 128 => {
+                std::net::IpAddr::V6((u128::from(address).saturating_add(1)).into())
+            }
+            (address, _) => address,
+        }
     }
 }
 
@@ -846,18 +881,15 @@ impl PolicyBarrier {
     ];
 }
 
+/// One bounded phase of a topology transaction.
+///
+/// Required blocking is installed and confirmed before tunnel workers are
+/// admitted. The final stage deliberately excludes that barrier so failure
+/// compensation cannot undo the safety fence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PolicyStage {
-    Full,
     PreTunnelBlocking,
-    FinalAfterPreBlock,
-}
-
-impl PolicyStage {
-    #[must_use]
-    pub const fn is_final(self) -> bool {
-        matches!(self, Self::Full | Self::FinalAfterPreBlock)
-    }
+    Final,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -875,6 +907,8 @@ pub struct TopologyState {
     pub profiles: BTreeSet<ProfileId>,
     pub interfaces: BTreeMap<ProfileId, String>,
     pub routes: BTreeMap<ProfileId, BTreeSet<RouteClaim>>,
+    pub server_ips: BTreeMap<ProfileId, BTreeSet<std::net::IpAddr>>,
+    pub dns_requests: BTreeMap<ProfileId, crate::vortix_core::ports::dns::DnsRequest>,
     pub dns_digest: PolicyDigest,
     pub kill_switch: KillSwitchMode,
     pub firewall_digest: PolicyDigest,
@@ -910,7 +944,7 @@ impl TopologyPolicy {
 
     fn barriers(&self) -> &'static [PolicyBarrier] {
         const PRE_TUNNEL: &[PolicyBarrier] = &[PolicyBarrier::Blocking];
-        const FINAL_AFTER_PRE_BLOCK: &[PolicyBarrier] = &[
+        const FINAL_AFTER_PRE: &[PolicyBarrier] = &[
             PolicyBarrier::Tunnel,
             PolicyBarrier::Route,
             PolicyBarrier::Dns,
@@ -918,9 +952,9 @@ impl TopologyPolicy {
             PolicyBarrier::EffectivePublication,
         ];
         match self.stage {
-            PolicyStage::Full => &PolicyBarrier::ORDERED,
             PolicyStage::PreTunnelBlocking => PRE_TUNNEL,
-            PolicyStage::FinalAfterPreBlock => FINAL_AFTER_PRE_BLOCK,
+            PolicyStage::Final if self.required_blocking => FINAL_AFTER_PRE,
+            PolicyStage::Final => &PolicyBarrier::ORDERED,
         }
     }
 }
@@ -944,6 +978,24 @@ pub trait PolicyExecutor: Send + Sync + 'static {
     ) {
         self.compensate(policy, barrier);
     }
+
+    /// Return fresh platform read-back produced by the exact final policy.
+    /// Implementations that cannot prove every gate return `None`; worker
+    /// completion alone is never protection truth.
+    fn verification(&self, _policy: &TopologyPolicy) -> Option<PolicyExecutionEvidence> {
+        None
+    }
+}
+
+/// Platform read-back attached only to an exact successful final policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // Explicit gates are an auditable proof bit-set.
+pub struct PolicyExecutionEvidence {
+    pub observed_at_millis: u64,
+    pub interface_verified: bool,
+    pub route_verified: bool,
+    pub dns_verified: bool,
+    pub firewall_verified: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -971,6 +1023,7 @@ pub struct PolicyResult {
     pub digest: PolicyDigest,
     pub operation_id: OperationId,
     pub stage: PolicyStage,
+    pub verification: Option<PolicyExecutionEvidence>,
     pub outcome: PolicyOutcome,
     pub superseded_by: Option<ControlRevision>,
     pub receipts: Vec<PolicyBarrierReceipt>,
@@ -1067,7 +1120,10 @@ impl PolicyWorker {
         if let Some(current) = &state.pending {
             if current.authority_epoch != policy.authority_epoch
                 || current.generation > policy.generation
-                || (current.generation == policy.generation && current.digest == policy.digest)
+                || (current.generation == policy.generation
+                    && current.digest == policy.digest
+                    && current.operation_id == policy.operation_id
+                    && current.stage >= policy.stage)
             {
                 return Err(WorkFailure::Stale);
             }
@@ -1148,6 +1204,7 @@ impl PolicyWorker {
             let _ = join.join();
             true
         } else {
+            *guard = Some(join);
             false
         }
     }
@@ -1164,6 +1221,7 @@ fn superseded_result(old: &TopologyPolicy, next: &TopologyPolicy) -> PolicyResul
         digest: old.digest.clone(),
         operation_id: old.operation_id.clone(),
         stage: old.stage,
+        verification: None,
         outcome: PolicyOutcome::Superseded,
         superseded_by: Some(next.revision()),
         receipts: Vec::new(),
@@ -1254,7 +1312,10 @@ fn run_policy(
     }
     if outcome != PolicyOutcome::Applied {
         for receipt in receipts.iter_mut().rev() {
-            if receipt.barrier == PolicyBarrier::Blocking && policy.required_blocking {
+            if receipt.barrier == PolicyBarrier::Blocking
+                && policy.required_blocking
+                && receipt.applied
+            {
                 receipt.preserved_for_safety = true;
                 continue;
             }
@@ -1268,12 +1329,16 @@ fn run_policy(
             }
         }
     }
+    let verification = (outcome == PolicyOutcome::Applied && policy.stage == PolicyStage::Final)
+        .then(|| executor.verification(&policy))
+        .flatten();
     PolicyResult {
         generation: policy.generation,
         authority_epoch: policy.authority_epoch,
         digest: policy.digest,
         operation_id: policy.operation_id,
         stage: policy.stage,
+        verification,
         outcome,
         superseded_by: None,
         receipts,
@@ -1295,7 +1360,17 @@ fn run_policy_call(
         executor.apply_cancellable(policy, barrier, cancellation)
     }))
     .map_err(|_| WorkFailure::Panicked)?
-    .map_err(|_| WorkFailure::EffectFailed);
+    .map_err(|error| {
+        tracing::warn!(
+            target: "vortix::control::policy",
+            operation = %policy.operation_id,
+            generation = policy.generation,
+            ?barrier,
+            reason = %error,
+            "policy barrier failed"
+        );
+        WorkFailure::EffectFailed
+    });
     if cancellation.is_cancelled() {
         return Err(WorkFailure::Cancelled);
     }

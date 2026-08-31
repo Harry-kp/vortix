@@ -127,19 +127,21 @@ fn main() -> Result<()> {
     // scan; failures are swallowed.
     vortix::utils::scrub_stale_scrv1_auth_files();
 
-    // session-liveness sweep of `${config_dir}/tmp/`. Any
-    // per-session subdir whose name does not match the current journal
-    // `session_id` is, by construction, a crash orphan — every session has a
-    // unique `{ISO}-{pid}` ID. This is correct regardless of file age (a
-    // crashed session 30 seconds ago is still definitively orphaned because
-    // the pid differs from ours), so no time-based heuristic is used.
-    // Best-effort: failures are swallowed; the temp dir is rebuildable from
-    // the user's profiles on the next connect.
-    if let Some(j) = vortix::vortix_core::journal::global_journal() {
-        if let Some(sid) = j.session_id() {
-            sweep_orphan_temp_configs(&config_dir, &sid);
-        }
-    }
+    // Hold a process-lifetime scratch lease before sweeping. Concurrent CLI
+    // and TUI processes intentionally have different journal session IDs;
+    // only an acquirable lease proves that another session crashed.
+    let temp_session_id = vortix::utils::temp_session_id();
+    let _temp_session_lease =
+        match vortix::utils::acquire_temp_session_lease(&config_dir, &temp_session_id) {
+            Ok(lease) => {
+                vortix::utils::sweep_orphan_temp_configs(&config_dir, &temp_session_id);
+                Some(lease)
+            }
+            Err(error) => {
+                eprintln!("warning: failed to lease temporary tunnel state ({error})");
+                None
+            }
+        };
 
     // backfill profile sidecars for `.conf` / `.ovpn` files
     // imported before the sidecar scheme existed. Idempotent — no-ops once
@@ -246,43 +248,22 @@ fn main() -> Result<()> {
         std::process::exit(exit_code);
     }
 
+    // The legacy TUI still owns its lifecycle actor until U8 cuts it over to
+    // the canonical control service. Hold the same cross-process writer lock
+    // as the CLI so the two authorities can never mutate one tunnel at once.
+    // Acquisition is fail-fast because a TUI session has no bounded duration.
+    let _lifecycle_lock = vortix::utils::acquire_lifecycle_lock().map_err(|error| {
+        color_eyre::eyre::eyre!(
+            "another vortix lifecycle writer is active; close it or wait for its command to finish ({error})"
+        )
+    })?;
+
     // Run the TUI application
     let terminal = init_terminal()?;
     let result = run_tui(terminal, app_config, config_dir);
     restore_terminal();
 
     result
-}
-
-/// Sweep crash-orphaned per-session subdirs under `${config_dir}/tmp/`
-///.
-///
-/// Session IDs are `{ISO-timestamp}-{pid}` — guaranteed unique per process —
-/// so any subdir whose name does not match the *current* session's ID is an
-/// orphan from a previous (possibly crashed) run. This is session-liveness,
-/// not age-based: a crash 30 seconds ago still leaves a definitively-orphan
-/// directory, and an age threshold would incorrectly preserve it.
-///
-/// Best-effort: any I/O failure aborts the sweep for the failing entry but
-/// does not prevent startup. The temp dir is fully rebuildable from the
-/// user's profiles on the next secondary connect.
-fn sweep_orphan_temp_configs(config_dir: &std::path::Path, current_session_id: &str) {
-    let tmp_dir = config_dir.join(vortix::constants::TMP_CONFIG_DIR);
-    if !tmp_dir.exists() {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(&tmp_dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        if name == current_session_id {
-            continue;
-        }
-        let _ = std::fs::remove_dir_all(entry.path());
-    }
 }
 
 /// Prompts the user to migrate data from an old config directory.

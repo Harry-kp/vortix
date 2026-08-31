@@ -40,6 +40,15 @@ impl TunnelKind {
     pub fn for_generation(self, generation: u64) -> Self {
         match self {
             Self::WireGuard(tunnel) => Self::WireGuard(tunnel.for_generation(generation)),
+            Self::OpenVpn(tunnel) => Self::OpenVpn(tunnel.for_generation(generation)),
+            other => other,
+        }
+    }
+
+    #[must_use]
+    pub fn for_operation(self, operation_id: crate::vortix_core::control::OperationId) -> Self {
+        match self {
+            Self::OpenVpn(tunnel) => Self::OpenVpn(tunnel.for_operation(operation_id)),
             other => other,
         }
     }
@@ -48,6 +57,19 @@ impl TunnelKind {
     pub fn with_execution_context(self, context: TunnelExecutionContext) -> Self {
         match self {
             Self::WireGuard(tunnel) => Self::WireGuard(tunnel.with_execution_context(context)),
+            other => other,
+        }
+    }
+
+    #[must_use]
+    pub fn with_openvpn_static_challenge(
+        self,
+        credentials: crate::vortix_protocol_openvpn::tunnel::OpenVpnStaticChallengeCredentials,
+    ) -> Self {
+        match self {
+            Self::OpenVpn(tunnel) => {
+                Self::OpenVpn(tunnel.with_static_challenge_credentials(credentials))
+            }
             other => other,
         }
     }
@@ -125,6 +147,49 @@ pub struct CanonicalTunnelSettings {
 }
 
 type CanonicalProfileResolver = dyn Fn(&ProfileId) -> Option<Profile> + Send + Sync;
+type CanonicalSessionResolver =
+    dyn Fn(&ProfileId) -> Option<crate::core::scanner::ActiveSession> + Send + Sync;
+
+pub(crate) struct StandardOpenVpnOwner {
+    custody: crate::vortix_process::CustodianHandshake,
+}
+
+impl StandardOpenVpnOwner {
+    #[must_use]
+    pub(crate) const fn generation(&self) -> u64 {
+        self.custody.identity.generation
+    }
+
+    #[must_use]
+    pub(crate) fn operation_id(&self) -> Option<&crate::vortix_core::control::OperationId> {
+        self.custody.operation_id.as_ref()
+    }
+}
+
+#[must_use]
+pub(crate) fn standard_openvpn_scanner_pid_matches(
+    scanner_pid: Option<u32>,
+    custodian_pid: u32,
+) -> bool {
+    scanner_pid == Some(custodian_pid)
+}
+
+pub(crate) fn standard_openvpn_owner(
+    profile_id: &ProfileId,
+    session: &crate::core::scanner::ActiveSession,
+) -> Result<Option<StandardOpenVpnOwner>, String> {
+    let Some(custody) = crate::vortix_process::custodian::load_handshake(profile_id)
+        .map_err(|error| format!("OpenVPN ownership receipt rejected: {error}"))?
+    else {
+        return Ok(None);
+    };
+    if !standard_openvpn_scanner_pid_matches(session.pid, custody.pid) {
+        return Err("OpenVPN scanner PID does not match authenticated custodian child".into());
+    }
+    let alive = crate::vortix_process::custodian::remote_status(&custody.identity)
+        .map_err(|error| format!("OpenVPN custodian status failed: {error}"))?;
+    Ok(alive.then_some(StandardOpenVpnOwner { custody }))
+}
 
 /// Production adapter from bounded canonical work to the concrete protocol
 /// implementations. Successful `WireGuard` receipts are generated only from
@@ -133,6 +198,10 @@ pub struct CanonicalTunnelExecutor {
     settings: CanonicalTunnelSettings,
     profiles: Arc<CanonicalProfileResolver>,
     active: Mutex<BTreeMap<ProfileId, (TunnelKind, TunnelHandle)>>,
+    standard_ownership:
+        Option<Arc<crate::core::standard_tunnel_ownership::StandardTunnelOwnershipStore>>,
+    sessions: Option<Arc<CanonicalSessionResolver>>,
+    challenge_issuer: Mutex<Option<std::sync::Weak<crate::vortix_core::control::CompleterHandle>>>,
 }
 
 impl CanonicalTunnelExecutor {
@@ -145,7 +214,198 @@ impl CanonicalTunnelExecutor {
             settings,
             profiles: Arc::new(profiles),
             active: Mutex::new(BTreeMap::new()),
+            standard_ownership: None,
+            sessions: None,
+            challenge_issuer: Mutex::new(None),
         }
+    }
+
+    /// Construct the short-lived Standard-mode executor with durable local
+    /// ownership recovery. Background/helper composition must use [`Self::new`].
+    #[must_use]
+    pub fn new_standard(
+        settings: CanonicalTunnelSettings,
+        profiles: impl Fn(&ProfileId) -> Option<Profile> + Send + Sync + 'static,
+        ownership: Arc<crate::core::standard_tunnel_ownership::StandardTunnelOwnershipStore>,
+        sessions: impl Fn(&ProfileId) -> Option<crate::core::scanner::ActiveSession>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        Self {
+            settings,
+            profiles: Arc::new(profiles),
+            active: Mutex::new(BTreeMap::new()),
+            standard_ownership: Some(ownership),
+            sessions: Some(Arc::new(sessions)),
+            challenge_issuer: Mutex::new(None),
+        }
+    }
+
+    /// Install the service-owned challenge capability after the cyclic
+    /// service/supervisor/executor graph has been constructed.
+    pub fn install_challenge_issuer(
+        &self,
+        issuer: &Arc<crate::vortix_core::control::CompleterHandle>,
+    ) -> Result<(), String> {
+        let mut slot = self
+            .challenge_issuer
+            .lock()
+            .map_err(|_| "challenge issuer slot poisoned".to_string())?;
+        if slot.is_some() {
+            return Err("challenge issuer was already installed".into());
+        }
+        *slot = Some(Arc::downgrade(issuer));
+        Ok(())
+    }
+
+    fn openvpn_static_challenge_credentials(
+        &self,
+        work: &crate::vortix_core::control::worker::TunnelWork,
+        profile: &Profile,
+        cancellation: &crate::vortix_core::control::worker::CancellationToken,
+    ) -> Result<
+        Option<crate::vortix_protocol_openvpn::tunnel::OpenVpnStaticChallengeCredentials>,
+        String,
+    > {
+        if work.protocol != TunnelKindTag::OpenVpn {
+            return Ok(None);
+        }
+        let Some(prompt) = crate::utils::read_openvpn_static_challenge_prompt(&profile.config_path)
+        else {
+            return Ok(None);
+        };
+        let owner_uid = self.standard_ownership.as_ref().map_or_else(
+            || crate::utils::effective_user_group_ids().0,
+            |store| store.owner_uid(),
+        );
+        let (username, password) = crate::utils::read_openvpn_saved_auth_compat_owned(
+            &self.settings.config_dir,
+            owner_uid,
+            profile.id.as_str(),
+            &profile.display_name,
+        )
+        .map_err(|error| format!("saved OpenVPN credentials were rejected: {error}"))?
+        .ok_or_else(|| {
+            "interactive challenge requires saved OpenVPN username/password".to_string()
+        })?;
+        let challenge_capability = self
+            .challenge_issuer
+            .lock()
+            .map_err(|_| "interactive challenge issuer slot poisoned".to_string())?
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or_else(|| {
+                "interactive challenge is unavailable outside an admitted control operation"
+                    .to_string()
+            })?;
+        let remaining = work
+            .deadline
+            .saturating_duration_since(std::time::Instant::now());
+        let remaining_millis: u64 = remaining.as_millis().try_into().unwrap_or(u64::MAX);
+        let expires_at = challenge_capability
+            .now_millis()
+            .saturating_add(remaining_millis);
+        let issued_challenge = challenge_capability
+            .issue_challenge_blocking(
+                work.operation_id.clone(),
+                work.profile_id.clone(),
+                crate::vortix_core::control::ChallengeKind::TwoFactorCode,
+                prompt,
+                expires_at,
+            )
+            .map_err(|error| format!("interactive challenge issuance failed: {error}"))?;
+        loop {
+            if cancellation.is_cancelled() {
+                return Err("interactive challenge was cancelled".into());
+            }
+            if std::time::Instant::now() >= work.deadline {
+                return Err("interactive challenge timed out".into());
+            }
+            match issued_challenge
+                .response
+                .receive_timeout(std::time::Duration::from_millis(50))
+            {
+                Ok(Some(answer)) => {
+                    return Ok(Some(
+                        crate::vortix_protocol_openvpn::tunnel::OpenVpnStaticChallengeCredentials::new(
+                            username.to_string(), password.to_string(), answer,
+                        ),
+                    ));
+                }
+                Ok(None) => {}
+                Err(_) => return Err("interactive challenge was cancelled or expired".into()),
+            }
+        }
+    }
+
+    /// Restore one persisted Standard-mode owner into both the executor and
+    /// supervisor before the local service admits mutations. The caller
+    /// supplies the durable control revision/operation; `WireGuard`'s private
+    /// record must match both, while `OpenVPN`'s custodian capability supplies
+    /// exact child ownership for that durable control intent.
+    pub fn restore_standard_profile(
+        &self,
+        supervisor: &crate::vortix_core::control::supervisor::Supervisor,
+        profile_id: &ProfileId,
+        revision: crate::vortix_core::control::worker::TunnelRevision,
+        operation_id: crate::vortix_core::control::OperationId,
+    ) -> Result<bool, String> {
+        let Some(resolve_session) = &self.sessions else {
+            return Err("Standard-mode session resolver is unavailable".into());
+        };
+        let Some(session) = resolve_session(profile_id) else {
+            return Ok(false);
+        };
+        let profile = (self.profiles)(profile_id)
+            .ok_or_else(|| format!("profile {profile_id} no longer exists"))?;
+        let protocol = match profile.protocol {
+            ProtocolKind::WireGuard => TunnelKindTag::WireGuard,
+            ProtocolKind::OpenVpn => TunnelKindTag::OpenVpn,
+        };
+        if protocol == TunnelKindTag::WireGuard {
+            let store = self.standard_ownership.as_ref().ok_or_else(|| {
+                "active WireGuard target has no Standard-mode ownership store".to_string()
+            })?;
+            let owned = store
+                .validate_wireguard(&profile, &session)
+                .map_err(|error| format!("active WireGuard ownership refused: {error}"))?;
+            if owned.authority_epoch != revision.authority_epoch
+                || owned.tunnel_generation != revision.generation
+                || owned.operation_id != operation_id
+            {
+                return Err("WireGuard ownership does not match durable control intent".into());
+            }
+        }
+        let recovery_work = crate::vortix_core::control::worker::TunnelWork {
+            profile_id: profile_id.clone(),
+            operation_id: operation_id.clone(),
+            revision,
+            mutation: crate::vortix_core::control::worker::TunnelMutation::Connect,
+            protocol,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+        };
+        let Some((tunnel, handle)) = self.recover_standard_handle(&recovery_work)? else {
+            return Ok(false);
+        };
+        let receipt = Self::receipt_for(&recovery_work, &handle)?;
+        supervisor
+            .restore_owned_tunnel(
+                receipt
+                    .adoption
+                    .ok_or_else(|| "recovered owner has no adoption evidence".to_string())?,
+                receipt.handshake,
+                receipt.probe_receipts,
+                handle.process_ownership.as_ref(),
+                revision,
+                operation_id,
+            )
+            .map_err(|error| format!("supervisor refused recovered ownership: {error:?}"))?;
+        self.active
+            .lock()
+            .map_err(|_| "canonical active-tunnel ledger poisoned".to_string())?
+            .insert(profile_id.clone(), (tunnel, handle));
+        Ok(true)
     }
 
     fn protocol_for(kind: TunnelKindTag) -> Result<Protocol, String> {
@@ -175,6 +435,8 @@ impl CanonicalTunnelExecutor {
             cancellation: cancellation.clone(),
             deadline: work.deadline,
         };
+        let static_challenge =
+            self.openvpn_static_challenge_credentials(work, &profile, cancellation)?;
         let mut tunnel = tunnel_for_with_wireguard_policy(
             protocol,
             &self.settings.config_dir,
@@ -184,8 +446,12 @@ impl CanonicalTunnelExecutor {
             &self.settings.wireguard_health_targets,
         )
         .for_generation(work.revision.generation)
+        .for_operation(work.operation_id.clone())
         .with_execution_context(context);
-        let handle = match panic::catch_unwind(AssertUnwindSafe(|| tunnel.up(&profile))) {
+        if let Some(credentials) = static_challenge {
+            tunnel = tunnel.with_openvpn_static_challenge(credentials);
+        }
+        let mut handle = match panic::catch_unwind(AssertUnwindSafe(|| tunnel.up(&profile))) {
             Ok(result) => result.map_err(|error| error.to_string())?,
             Err(_) => {
                 return Err(match tunnel.compensate_inflight() {
@@ -218,6 +484,16 @@ impl CanonicalTunnelExecutor {
                 });
             }
         };
+        if let Err(error) = self.persist_standard_wireguard_ownership(work, &mut handle) {
+            let cleanup = tunnel.down(handle);
+            if cleanup.is_ok() {
+                self.remove_standard_wireguard_ownership(&work.profile_id);
+            }
+            return Err(match cleanup {
+                Ok(()) => format!("{error}; owned attempt removed"),
+                Err(cleanup) => format!("{error}; ownership is ambiguous: {cleanup}"),
+            });
+        }
         self.active
             .lock()
             .map_err(|_| "canonical active-tunnel ledger poisoned".to_string())?
@@ -268,11 +544,44 @@ impl CanonicalTunnelExecutor {
             .lock()
             .map_err(|_| "canonical active-tunnel ledger poisoned".to_string())?
             .remove(&work.profile_id);
-        let Some((mut tunnel, handle)) = owned else {
-            return Ok(TunnelExecutionReceipt::default());
+        let (mut tunnel, handle) = if let Some(owned) = owned {
+            owned
+        } else {
+            let Some(recovered) = self.recover_standard_handle(work)? else {
+                if let Some(store) = &self.standard_ownership {
+                    store
+                        .remove_after_confirmed_absence(&work.profile_id, &[])
+                        .map_err(|error| error.to_string())?;
+                    crate::core::managed_wireguard::remove_after_confirmed_absence(
+                        &self.settings.config_dir,
+                        &work.profile_id,
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
+                return Ok(TunnelExecutionReceipt::default());
+            };
+            recovered
         };
         match tunnel.down(handle.clone()) {
-            Ok(()) => Ok(TunnelExecutionReceipt::default()),
+            Ok(()) => {
+                if handle.kind == TunnelKindTag::WireGuard {
+                    if let Some(store) = &self.standard_ownership {
+                        // `WgTunnel::down` returns success only after its own
+                        // exact interface-absence probe. A cached scanner
+                        // snapshot may still contain the just-removed
+                        // interface, so it cannot veto ownership cleanup.
+                        store
+                            .remove_after_confirmed_absence(&work.profile_id, &[])
+                            .map_err(|error| error.to_string())?;
+                        crate::core::managed_wireguard::remove_after_confirmed_absence(
+                            &self.settings.config_dir,
+                            &work.profile_id,
+                        )
+                        .map_err(|error| error.to_string())?;
+                    }
+                }
+                Ok(TunnelExecutionReceipt::default())
+            }
             Err(error) => {
                 self.active
                     .lock()
@@ -281,6 +590,180 @@ impl CanonicalTunnelExecutor {
                 Err(error.to_string())
             }
         }
+    }
+
+    fn persist_standard_wireguard_ownership(
+        &self,
+        work: &crate::vortix_core::control::worker::TunnelWork,
+        handle: &mut TunnelHandle,
+    ) -> Result<(), String> {
+        if work.protocol != TunnelKindTag::WireGuard {
+            return Ok(());
+        }
+        let Some(store) = &self.standard_ownership else {
+            return Ok(());
+        };
+        let profile = (self.profiles)(&work.profile_id)
+            .ok_or_else(|| format!("profile {} no longer exists", work.profile_id))?;
+        let handshake = handle.handshake.clone().ok_or_else(|| {
+            "WireGuard connected without exact handshake ownership evidence".to_string()
+        })?;
+        let teardown_config = handle.teardown_config.as_ref().ok_or_else(|| {
+            "WireGuard connected without an exact managed teardown config".to_string()
+        })?;
+        let original_teardown_path = teardown_config.path.clone();
+        let ownership = store
+            .issue_wireguard(
+                &profile,
+                work.revision,
+                work.operation_id.clone(),
+                &handle.interface_name,
+                teardown_config,
+                handshake.clone(),
+                handle.probe_receipts.clone(),
+            )
+            .map_err(|error| {
+                format!("WireGuard ownership capability could not be persisted: {error}")
+            })?;
+        handle.teardown_config = Some(ownership.teardown_config);
+        if original_teardown_path
+            != handle
+                .teardown_config
+                .as_ref()
+                .expect("installed teardown config")
+                .path
+        {
+            let _ = std::fs::remove_file(original_teardown_path);
+        }
+        crate::core::managed_wireguard::issue(
+            &self.settings.config_dir,
+            &work.profile_id,
+            handle.interface_name.clone(),
+            work.revision.generation,
+            handshake,
+            handle.probe_receipts.clone(),
+        )
+        .map(|_| ())
+        .map_err(|error| format!("WireGuard display receipt could not be persisted: {error}"))
+    }
+
+    fn remove_standard_wireguard_ownership(&self, profile_id: &ProfileId) {
+        if let Some(store) = &self.standard_ownership {
+            let _ = store.remove_after_confirmed_absence(profile_id, &[]);
+            let _ = crate::core::managed_wireguard::remove_after_confirmed_absence(
+                &self.settings.config_dir,
+                profile_id,
+            );
+        }
+    }
+
+    fn recover_standard_handle(
+        &self,
+        work: &crate::vortix_core::control::worker::TunnelWork,
+    ) -> Result<Option<(TunnelKind, TunnelHandle)>, String> {
+        let Some(resolve_session) = &self.sessions else {
+            return Err("canonical disconnect has no active ownership ledger".into());
+        };
+        let Some(session) = resolve_session(&work.profile_id) else {
+            // A fresh protocol observation proved the requested target absent.
+            return Ok(None);
+        };
+        let profile = (self.profiles)(&work.profile_id)
+            .ok_or_else(|| format!("profile {} no longer exists", work.profile_id))?;
+        let protocol = Self::protocol_for(work.protocol)?;
+        let profile_protocol = match profile.protocol {
+            ProtocolKind::WireGuard => Protocol::WireGuard,
+            ProtocolKind::OpenVpn => Protocol::OpenVPN,
+        };
+        if protocol != profile_protocol {
+            return Err("canonical work protocol did not match recovered profile".into());
+        }
+        match protocol {
+            Protocol::WireGuard => {
+                let store = self.standard_ownership.as_ref().ok_or_else(|| {
+                    "active WireGuard target has no Standard-mode ownership store".to_string()
+                })?;
+                let owned = store
+                    .validate_wireguard(&profile, &session)
+                    .map_err(|error| format!("active WireGuard ownership refused: {error}"))?;
+                let handle = TunnelHandle {
+                    profile_id: work.profile_id.clone(),
+                    display_name: profile.display_name.clone(),
+                    interface_name: owned.interface_name,
+                    pid: None,
+                    started_at: std::time::SystemTime::now(),
+                    kind: TunnelKindTag::WireGuard,
+                    generation: owned.tunnel_generation,
+                    handshake: Some(owned.handshake),
+                    probe_receipts: owned.probe_receipts,
+                    process_ownership: None,
+                    teardown_config: Some(owned.teardown_config),
+                    dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
+                };
+                Ok(Some((
+                    tunnel_for(
+                        protocol,
+                        &self.settings.config_dir,
+                        &self.settings.openvpn_verbosity,
+                        self.settings.connect_timeout_secs,
+                    ),
+                    handle,
+                )))
+            }
+            Protocol::OpenVPN => self
+                .recover_standard_openvpn_handle(work, profile, session)
+                .map(Some),
+        }
+    }
+
+    fn recover_standard_openvpn_handle(
+        &self,
+        work: &crate::vortix_core::control::worker::TunnelWork,
+        profile: Profile,
+        session: crate::core::scanner::ActiveSession,
+    ) -> Result<(TunnelKind, TunnelHandle), String> {
+        if !session.interface_authoritative {
+            return Err("active OpenVPN target has no authoritative interface observation".into());
+        }
+        let owner = standard_openvpn_owner(&work.profile_id, &session)?.ok_or_else(|| {
+            "active OpenVPN target has no live PID-matched custodian receipt".to_string()
+        })?;
+        let custody = owner.custody;
+        if custody.identity.generation != work.revision.generation {
+            return Err(
+                "OpenVPN custodian generation does not match durable control intent".into(),
+            );
+        }
+        if custody
+            .operation_id
+            .as_ref()
+            .is_some_and(|operation| operation != &work.operation_id)
+        {
+            return Err("OpenVPN custodian operation does not match durable control intent".into());
+        }
+        let handle = TunnelHandle {
+            profile_id: work.profile_id.clone(),
+            display_name: profile.display_name,
+            interface_name: session.interface,
+            pid: Some(custody.pid),
+            started_at: std::time::SystemTime::now(),
+            kind: TunnelKindTag::OpenVpn,
+            generation: custody.identity.generation,
+            handshake: None,
+            probe_receipts: Vec::new(),
+            process_ownership: Some(custody.identity),
+            teardown_config: None,
+            dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
+        };
+        Ok((
+            tunnel_for(
+                Protocol::OpenVPN,
+                &self.settings.config_dir,
+                &self.settings.openvpn_verbosity,
+                self.settings.connect_timeout_secs,
+            ),
+            handle,
+        ))
     }
 }
 
@@ -304,14 +787,19 @@ impl crate::vortix_core::control::worker::TunnelExecutor for CanonicalTunnelExec
         use crate::vortix_core::control::worker::WorkFailure;
         if error.contains("ownership is ambiguous") || error.contains("outcome is ambiguous") {
             WorkFailure::OutcomeUnknown
+        } else if error.contains("interactive challenge") {
+            WorkFailure::ChallengeFailed
         } else if error.contains("panicked") {
             WorkFailure::Panicked
         } else if error.contains("cancelled") {
             WorkFailure::Cancelled
+        } else if error.contains("handshake") || error.contains("Handshake") {
+            // A bounded health probe can report a transport timeout while the
+            // semantic failure is still an exact WireGuard handshake gate.
+            // This check must precede the generic operation-timeout fallback.
+            WorkFailure::HandshakeFailed
         } else if error.contains("expired") || error.contains("timed out") {
             WorkFailure::TimedOut
-        } else if error.contains("handshake") || error.contains("Handshake") {
-            WorkFailure::HandshakeFailed
         } else {
             WorkFailure::EffectFailed
         }
@@ -445,6 +933,24 @@ mod canonical_tests {
     use crate::vortix_core::ports::tunnel::{HandshakeEvidence, TunnelTeardownConfig};
     use std::time::{Duration, Instant, SystemTime};
 
+    struct NoopPolicy;
+    impl crate::vortix_core::control::worker::PolicyExecutor for NoopPolicy {
+        fn apply(
+            &self,
+            _: &crate::vortix_core::control::worker::TopologyPolicy,
+            _: crate::vortix_core::control::worker::PolicyBarrier,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn compensate(
+            &self,
+            _: &crate::vortix_core::control::worker::TopologyPolicy,
+            _: crate::vortix_core::control::worker::PolicyBarrier,
+        ) {
+        }
+    }
+
     fn work(generation: u64) -> TunnelWork {
         TunnelWork {
             profile_id: ProfileId::new("corp"),
@@ -490,5 +996,290 @@ mod canonical_tests {
         let exact = CanonicalTunnelExecutor::receipt_for(&work(7), &handle(7)).unwrap();
         assert_eq!(exact.handshake.unwrap().generation, 7);
         assert!(CanonicalTunnelExecutor::receipt_for(&work(8), &handle(7)).is_err());
+    }
+
+    #[test]
+    fn successful_wireguard_down_does_not_trust_a_stale_scanner_snapshot() {
+        use crate::core::standard_tunnel_ownership::StandardTunnelOwnershipStore;
+        use crate::vortix_core::ports::tunnel::mock::MockTunnel;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let temp = tempfile::tempdir().unwrap();
+        let uid = crate::utils::effective_user_group_ids().0;
+        let store = Arc::new(
+            StandardTunnelOwnershipStore::new(temp.path().join("runtime"), uid, uid, "boot-a")
+                .unwrap(),
+        );
+        let resolver_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&resolver_calls);
+        let executor = CanonicalTunnelExecutor::new_standard(
+            CanonicalTunnelSettings {
+                config_dir: temp.path().to_path_buf(),
+                openvpn_verbosity: "3".into(),
+                connect_timeout_secs: 1,
+                wireguard_handshake_timeout_secs: 1,
+                wireguard_health_targets: Vec::new(),
+            },
+            |_| None,
+            store,
+            move |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Some(crate::core::scanner::ActiveSession {
+                    name: "corp".into(),
+                    interface: "wg0".into(),
+                    interface_authoritative: true,
+                    ..crate::core::scanner::ActiveSession::default()
+                })
+            },
+        );
+        executor.active.lock().unwrap().insert(
+            ProfileId::new("corp"),
+            (TunnelKind::Mock(MockTunnel::new()), handle(7)),
+        );
+        let mut disconnect = work(7);
+        disconnect.mutation = TunnelMutation::Disconnect;
+
+        executor.execute_disconnect(&disconnect).unwrap();
+
+        assert_eq!(
+            resolver_calls.load(Ordering::SeqCst),
+            0,
+            "a successful protocol-owned teardown is exact absence evidence"
+        );
+    }
+
+    #[test]
+    fn service_challenge_failure_has_a_distinct_supervisor_outcome() {
+        use crate::vortix_core::control::worker::{TunnelExecutor as _, WorkFailure};
+
+        let executor = CanonicalTunnelExecutor::new(
+            CanonicalTunnelSettings {
+                config_dir: PathBuf::new(),
+                openvpn_verbosity: "3".into(),
+                connect_timeout_secs: 1,
+                wireguard_handshake_timeout_secs: 1,
+                wireguard_health_targets: Vec::new(),
+            },
+            |_| None,
+        );
+        assert_eq!(
+            executor.classify_failure("interactive challenge was cancelled or expired"),
+            WorkFailure::ChallengeFailed
+        );
+    }
+
+    #[test]
+    fn wireguard_handshake_context_outranks_generic_probe_timeout_wording() {
+        use crate::vortix_core::control::worker::{TunnelExecutor as _, WorkFailure};
+
+        let executor = CanonicalTunnelExecutor::new(
+            CanonicalTunnelSettings {
+                config_dir: PathBuf::new(),
+                openvpn_verbosity: "3".into(),
+                connect_timeout_secs: 1,
+                wireguard_handshake_timeout_secs: 1,
+                wireguard_health_targets: Vec::new(),
+            },
+            |_| None,
+        );
+
+        assert_eq!(
+            executor.classify_failure(
+                "WireGuard handshake probe failed: ping timed out before peer response"
+            ),
+            WorkFailure::HandshakeFailed
+        );
+        assert_eq!(
+            executor.classify_failure("canonical tunnel operation timed out"),
+            WorkFailure::TimedOut
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the cross-process fixture keeps the private record, typed scan, restore, and assertions together"
+    )]
+    fn standard_executor_recovers_exact_wireguard_handle_across_processes() {
+        use crate::core::scanner::ActiveSession;
+        use crate::core::standard_tunnel_ownership::StandardTunnelOwnershipStore;
+        use crate::vortix_core::ports::tunnel::TunnelPeerStatus;
+
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("corp.conf");
+        std::fs::write(&config, "[Interface]\nPrivateKey = redacted\n").unwrap();
+        let managed_config = temp.path().join("managed-corp.conf");
+        std::fs::write(
+            &managed_config,
+            "[Interface]\nPrivateKey = lifecycle-copy\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&managed_config, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
+        let profile = Profile::new(
+            ProfileId::parse("a".repeat(ProfileId::HEX_LEN)).unwrap(),
+            "corp",
+            ProtocolKind::WireGuard,
+            config,
+        );
+        let profile_id = profile.id.clone();
+        let evidence = HandshakeEvidence {
+            generation: 7,
+            peer_public_key: "peer".into(),
+            handshake_at: SystemTime::now(),
+            observed_at: SystemTime::now(),
+            allowed_routes: vec!["10.0.0.0/24".into()],
+        };
+        let uid = crate::utils::effective_user_group_ids().0;
+        let store = Arc::new(
+            StandardTunnelOwnershipStore::new(temp.path().join("runtime"), uid, 0, "boot-a")
+                .unwrap(),
+        );
+        store
+            .issue_wireguard(
+                &profile,
+                TunnelRevision {
+                    authority_epoch: AuthorityEpoch(1),
+                    generation: 7,
+                },
+                work(7).operation_id,
+                "wg0",
+                &TunnelTeardownConfig {
+                    path: managed_config,
+                    managed: true,
+                },
+                evidence.clone(),
+                Vec::new(),
+            )
+            .unwrap();
+        let session = ActiveSession {
+            name: "corp".into(),
+            interface: "wg0".into(),
+            interface_authoritative: true,
+            wireguard_peers: vec![TunnelPeerStatus {
+                public_key: "peer".into(),
+                endpoint: None,
+                allowed_routes: vec!["10.0.0.0/24".into()],
+                latest_handshake: Some(evidence.handshake_at),
+                evidence_observed_at: SystemTime::now(),
+                evidence_generation: 7,
+                persistent_keepalive: None,
+                bytes_rx: 0,
+                bytes_tx: 0,
+            }],
+            ..ActiveSession::default()
+        };
+        let profile_for_resolver = profile.clone();
+        let session_for_resolver = session.clone();
+        let executor = Arc::new(CanonicalTunnelExecutor::new_standard(
+            CanonicalTunnelSettings {
+                config_dir: temp.path().to_path_buf(),
+                openvpn_verbosity: "3".into(),
+                connect_timeout_secs: 1,
+                wireguard_handshake_timeout_secs: 1,
+                wireguard_health_targets: Vec::new(),
+            },
+            move |id| (id == &profile_for_resolver.id).then(|| profile_for_resolver.clone()),
+            store,
+            move |id| (id == &profile.id).then(|| session_for_resolver.clone()),
+        ));
+        let mut disconnect = work(7);
+        disconnect.profile_id = profile_id;
+        disconnect.mutation = TunnelMutation::Disconnect;
+        let supervisor = crate::vortix_core::control::supervisor::Supervisor::new(
+            AuthorityEpoch(1),
+            executor.clone(),
+            Arc::new(NoopPolicy),
+            1,
+            4,
+        );
+        let wrong_operation =
+            serde_json::from_str::<OperationId>("\"op-0000000000000001-0000000000000002\"")
+                .unwrap();
+        assert!(executor
+            .restore_standard_profile(
+                &supervisor,
+                &disconnect.profile_id,
+                disconnect.revision,
+                wrong_operation,
+            )
+            .is_err());
+        assert!(executor
+            .restore_standard_profile(
+                &supervisor,
+                &disconnect.profile_id,
+                disconnect.revision,
+                disconnect.operation_id.clone(),
+            )
+            .unwrap());
+        let recovered = executor
+            .active
+            .lock()
+            .unwrap()
+            .get(&disconnect.profile_id)
+            .unwrap()
+            .1
+            .clone();
+        assert_eq!(recovered.profile_id, disconnect.profile_id);
+        assert_eq!(recovered.interface_name, "wg0");
+        assert_eq!(recovered.generation, 7);
+        assert_eq!(recovered.handshake.unwrap().generation, 7);
+        let recovered_teardown = recovered.teardown_config.unwrap();
+        assert!(recovered_teardown.managed);
+        assert_eq!(
+            std::fs::read_to_string(recovered_teardown.path).unwrap(),
+            "[Interface]\nPrivateKey = lifecycle-copy\n"
+        );
+    }
+
+    #[test]
+    fn standard_executor_refuses_active_wireguard_without_private_ownership() {
+        use crate::core::scanner::ActiveSession;
+        use crate::core::standard_tunnel_ownership::StandardTunnelOwnershipStore;
+
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("corp.conf");
+        std::fs::write(&config, "[Interface]\nPrivateKey = redacted\n").unwrap();
+        let profile = Profile::new(
+            ProfileId::parse("a".repeat(ProfileId::HEX_LEN)).unwrap(),
+            "corp",
+            ProtocolKind::WireGuard,
+            config,
+        );
+        let profile_id = profile.id.clone();
+        let uid = crate::utils::effective_user_group_ids().0;
+        let store = Arc::new(
+            StandardTunnelOwnershipStore::new(temp.path().join("runtime"), uid, 0, "boot-a")
+                .unwrap(),
+        );
+        let profile_for_session = profile.clone();
+        let profile_for_resolver = profile.clone();
+        let executor = CanonicalTunnelExecutor::new_standard(
+            CanonicalTunnelSettings {
+                config_dir: temp.path().to_path_buf(),
+                openvpn_verbosity: "3".into(),
+                connect_timeout_secs: 1,
+                wireguard_handshake_timeout_secs: 1,
+                wireguard_health_targets: Vec::new(),
+            },
+            move |id| (id == &profile_for_resolver.id).then(|| profile_for_resolver.clone()),
+            store,
+            move |id| {
+                (id == &profile_for_session.id).then(|| ActiveSession {
+                    name: "corp".into(),
+                    interface: "wg0".into(),
+                    interface_authoritative: true,
+                    ..ActiveSession::default()
+                })
+            },
+        );
+        let mut disconnect = work(7);
+        disconnect.profile_id = profile_id;
+        disconnect.mutation = TunnelMutation::Disconnect;
+        assert!(executor.recover_standard_handle(&disconnect).is_err());
     }
 }

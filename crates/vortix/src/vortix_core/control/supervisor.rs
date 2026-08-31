@@ -69,8 +69,8 @@ impl PolicyVerification {
 struct State {
     authority_epoch: AuthorityEpoch,
     latest_policy: Option<(ControlRevision, OperationId, PolicyStage)>,
-    pre_tunnel_blocking: Option<(ControlRevision, OperationId)>,
     latest_topology: Option<TopologyPolicy>,
+    pre_tunnel_blocking: Option<(ControlRevision, OperationId)>,
     applied_policy: Option<(ControlRevision, OperationId)>,
     applied_topology: Option<TopologyState>,
     profiles: BTreeMap<ProfileId, ProfileSupervision>,
@@ -84,8 +84,8 @@ impl State {
         Self {
             authority_epoch,
             latest_policy: None,
-            pre_tunnel_blocking: None,
             latest_topology: None,
+            pre_tunnel_blocking: None,
             applied_policy: None,
             applied_topology: None,
             profiles: BTreeMap::new(),
@@ -201,6 +201,16 @@ impl Supervisor {
         self.tunnels.reserve(profile_id, routes)
     }
 
+    /// Reserve teardown capacity without claiming connect-only routes or
+    /// rejecting the exact managed tunnel that the work will remove.
+    pub fn reserve_disconnect(
+        &self,
+        profile_id: &ProfileId,
+    ) -> Result<ProfileAdmission, WorkFailure> {
+        self.tunnels
+            .reserve(profile_id, std::iter::empty::<String>())
+    }
+
     pub fn dispatch_reserved_tunnel(
         &self,
         work: TunnelWork,
@@ -277,6 +287,76 @@ impl Supervisor {
         Ok(())
     }
 
+    /// Restore an exact protocol-owned Standard-mode capability after a
+    /// one-shot client process exits. Scanner evidence alone cannot call this
+    /// seam: `WireGuard` requires its generation-bound handshake, while
+    /// `OpenVPN` requires the authenticated custodian identity.
+    pub fn restore_owned_tunnel(
+        &self,
+        evidence: AdoptionEvidence,
+        handshake: Option<HandshakeEvidence>,
+        probe_receipts: Vec<ProbeReceipt>,
+        process_ownership: Option<&crate::vortix_core::ports::process::ManagedProcessId>,
+        revision: TunnelRevision,
+        operation_id: OperationId,
+    ) -> Result<(), WorkFailure> {
+        if revision.authority_epoch
+            != self
+                .state
+                .lock()
+                .expect("supervisor mutex poisoned")
+                .authority_epoch
+        {
+            return Err(WorkFailure::Stale);
+        }
+        let profile_id = evidence.profile_id().clone();
+        let protocol_correct = match evidence.kind() {
+            TunnelKindTag::WireGuard => {
+                process_ownership.is_none()
+                    && handshake.as_ref().is_some_and(|handshake| {
+                        handshake.generation == revision.generation
+                            && !handshake.peer_public_key.is_empty()
+                    })
+            }
+            TunnelKindTag::OpenVpn => {
+                handshake.is_none()
+                    && process_ownership.as_ref().is_some_and(|identity| {
+                        identity.profile_id == profile_id
+                            && identity.generation == revision.generation
+                            && identity.has_valid_token()
+                    })
+            }
+            TunnelKindTag::Mock => false,
+        };
+        if !protocol_correct {
+            return Err(WorkFailure::EffectFailed);
+        }
+        let mut state = self.state.lock().expect("supervisor mutex poisoned");
+        if state.profiles.get(&profile_id).is_some_and(|entry| {
+            matches!(
+                entry.truth,
+                SupervisedTruth::Reserved
+                    | SupervisedTruth::OutcomeUnknown
+                    | SupervisedTruth::DisconnectedTombstone
+            )
+        }) {
+            return Err(WorkFailure::Busy);
+        }
+        state.profiles.insert(
+            profile_id,
+            ProfileSupervision {
+                revision,
+                operation_id,
+                mutation: TunnelMutation::Connect,
+                adoption: Some(evidence),
+                handshake,
+                probe_receipts,
+                truth: SupervisedTruth::ObservedPresent,
+            },
+        );
+        Ok(())
+    }
+
     pub fn submit_policy(&self, policy: &TopologyPolicy) -> Result<(), WorkFailure> {
         let mut state = self.state.lock().expect("supervisor mutex poisoned");
         let revision = policy.revision();
@@ -294,10 +374,20 @@ impl Supervisor {
         {
             return Err(WorkFailure::Stale);
         }
+        if policy.stage == PolicyStage::Final
+            && policy.required_blocking
+            && state.pre_tunnel_blocking.as_ref()
+                != Some(&(revision.clone(), policy.operation_id.clone()))
+        {
+            return Err(WorkFailure::Busy);
+        }
         self.policy.submit(policy.clone())?;
+        if policy.stage == PolicyStage::PreTunnelBlocking {
+            state.pre_tunnel_blocking = None;
+        }
         state.latest_policy = Some((revision, policy.operation_id.clone(), policy.stage));
-        if policy.stage.is_final() {
-            state.latest_topology = Some(policy.clone());
+        state.latest_topology = Some(policy.clone());
+        if policy.stage == PolicyStage::Final {
             state.applied_policy = None;
         }
         state.protected = None;
@@ -319,9 +409,7 @@ impl Supervisor {
         }
         let truth = match result.result {
             Ok(()) => SupervisedTruth::WaitingForObservation,
-            Err(WorkFailure::OutcomeUnknown | WorkFailure::TimedOut) => {
-                SupervisedTruth::OutcomeUnknown
-            }
+            Err(WorkFailure::OutcomeUnknown) => SupervisedTruth::OutcomeUnknown,
             Err(error) => SupervisedTruth::Degraded(error),
         };
         if let Some(entry) = state.profiles.get_mut(&result.profile_id) {
@@ -363,7 +451,10 @@ impl Supervisor {
                 },
                 result.operation_id.clone(),
             ));
-        } else if exact && result.stage.is_final() && result.outcome == PolicyOutcome::Applied {
+        } else if exact
+            && result.stage == PolicyStage::Final
+            && result.outcome == PolicyOutcome::Applied
+        {
             state.applied_policy = Some((
                 ControlRevision {
                     authority_epoch: result.authority_epoch,
@@ -377,6 +468,9 @@ impl Supervisor {
                 .as_ref()
                 .map(|policy| policy.target.clone());
         } else {
+            if exact && result.stage == PolicyStage::PreTunnelBlocking {
+                state.pre_tunnel_blocking = None;
+            }
             state.policy_degraded = Some(if exact {
                 WorkFailure::EffectFailed
             } else {
@@ -400,7 +494,7 @@ impl Supervisor {
             .is_some_and(|(latest, applied)| {
                 latest.0 == evidence.revision
                     && latest.1 == evidence.operation_id
-                    && latest.2.is_final()
+                    && latest.2 == PolicyStage::Final
                     && applied.0 == latest.0
                     && applied.1 == latest.1
             });
@@ -580,21 +674,9 @@ impl Supervisor {
             .expect("supervisor mutex poisoned")
             .latest_policy
             .as_ref()
-            .filter(|(_, _, stage)| stage.is_final())
-            .map(|(revision, operation, _)| (revision.clone(), operation.clone()))
-    }
-    #[must_use]
-    pub fn pre_tunnel_blocking_matches(
-        &self,
-        revision: &ControlRevision,
-        operation: &OperationId,
-    ) -> bool {
-        self.state
-            .lock()
-            .expect("supervisor mutex poisoned")
-            .pre_tunnel_blocking
-            .as_ref()
-            .is_some_and(|(blocked, owner)| blocked == revision && owner == operation)
+            .and_then(|(revision, operation, stage)| {
+                (*stage == PolicyStage::Final).then(|| (revision.clone(), operation.clone()))
+            })
     }
     #[must_use]
     pub fn applied_topology(&self) -> Option<TopologyState> {
@@ -645,9 +727,12 @@ impl Supervisor {
     }
 
     pub fn shutdown_bounded(&self, timeout: Duration) -> bool {
-        let half = timeout / 2;
-        self.tunnels.shutdown_bounded(half)
-            & self.policy.shutdown_bounded(timeout.saturating_sub(half))
+        std::thread::scope(|scope| {
+            let policy = scope.spawn(|| self.policy.shutdown_bounded(timeout));
+            let tunnels_stopped = self.tunnels.shutdown_bounded(timeout);
+            let policy_stopped = policy.join().unwrap_or(false);
+            tunnels_stopped & policy_stopped
+        })
     }
     pub fn shutdown(&self) {
         let _ = self.shutdown_bounded(Duration::from_millis(200));

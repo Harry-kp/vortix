@@ -8,28 +8,59 @@ use crate::vortix_core::profile::{Profile, ProfileId, ProtocolKind};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use zeroize::Zeroizing;
 
 /// Import a VPN profile from a file
-#[allow(clippy::too_many_lines)] // validation, secure copy and identity-sidecar commit form one rollback sequence
 pub fn import_profile(path: &Path) -> Result<VpnProfile, String> {
+    let profiles_dir = get_profiles_dir()?;
+    let prepared = prepare_profile_import(path, &profiles_dir)?;
+    commit_profile_import(prepared, &profiles_dir)
+}
+
+/// Memory-only validated import. The private body is intentionally not
+/// serializable and crosses only the injected profile-mutation boundary.
+pub(crate) struct PreparedProfileImport {
+    profile: VpnProfile,
+    stored: Profile,
+    raw_body: Zeroizing<Box<[u8]>>,
+    source_path: PathBuf,
+}
+
+impl PreparedProfileImport {
+    #[must_use]
+    pub(crate) fn profile(&self) -> &VpnProfile {
+        &self.profile
+    }
+
+    #[must_use]
+    pub(crate) fn topology_profile(&self) -> VpnProfile {
+        let mut profile = self.profile.clone();
+        profile.config_path.clone_from(&self.source_path);
+        profile
+    }
+}
+
+#[allow(clippy::too_many_lines)] // validation and identity preparation are one bounded read
+pub(crate) fn prepare_profile_import(
+    path: &Path,
+    profiles_dir: &Path,
+) -> Result<PreparedProfileImport, String> {
     logger::log(
         LogLevel::Debug,
         "IMPORT",
         format!("Importing profile from: {}", path.display()),
     );
 
-    // Check file exists
-    if !path.exists() {
-        logger::log(
-            LogLevel::Error,
-            "IMPORT",
-            format!("File not found: {}", path.display()),
-        );
-        return Err(format!("File not found: {}", path.display()));
-    }
-
     // Check file size before reading
-    let metadata = fs::metadata(path).map_err(|e| format!("Cannot read file metadata: {e}"))?;
+    let metadata = fs::metadata(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            let message = format!("File not found: {}", path.display());
+            logger::log(LogLevel::Error, "IMPORT", message.as_str());
+            message
+        } else {
+            format!("Cannot read file metadata: {error}")
+        }
+    })?;
     if metadata.len() > constants::MAX_CONFIG_SIZE_BYTES {
         return Err(format!(
             "File too large ({} bytes). VPN configs should be under 1 MB",
@@ -81,12 +112,10 @@ pub fn import_profile(path: &Path) -> Result<VpnProfile, String> {
         Protocol::OpenVPN => parse_openvpn_config(&content, path)?,
     };
 
-    // Copy to profiles directory
-    let profiles_dir = get_profiles_dir()?;
     let dest_filename = format!("{name}.{extension}");
 
     // Ensure unique destination path to avoid overwriting existing profiles
-    let dest_path = crate::utils::get_unique_path(&profiles_dir, &dest_filename);
+    let dest_path = crate::utils::get_unique_path(profiles_dir, &dest_filename);
 
     // Update name if filename changed (e.g. from "client" to "client(1)")
     let name = dest_path
@@ -106,27 +135,44 @@ pub fn import_profile(path: &Path) -> Result<VpnProfile, String> {
         },
         dest_path.clone(),
     );
-    FsProfileStore::new(profiles_dir)
-        .insert(&stored, content.as_bytes())
-        .map_err(|error| format!("Failed to persist profile identity: {error}"))?;
+    Ok(PreparedProfileImport {
+        stored,
+        raw_body: Zeroizing::new(content.into_bytes().into_boxed_slice()),
+        source_path: path.to_path_buf(),
+        profile: VpnProfile {
+            id,
+            name,
+            protocol,
+            location,
+            config_path: dest_path,
+            last_used: None,
+        },
+    })
+}
 
+pub(crate) fn commit_profile_import(
+    prepared: PreparedProfileImport,
+    profiles_dir: &Path,
+) -> Result<VpnProfile, String> {
+    FsProfileStore::new(profiles_dir.to_path_buf())
+        .insert(&prepared.stored, prepared.raw_body.as_ref())
+        .map_err(|error| format!("Failed to persist profile identity: {error}"))?;
     logger::log(
         LogLevel::Info,
         "IMPORT",
         format!(
             "✓ Imported '{}' ({:?}) → {}",
-            name,
-            protocol,
-            dest_path.display()
+            prepared.profile.name,
+            prepared.profile.protocol,
+            prepared.profile.config_path.display()
         ),
     );
-
     Ok(VpnProfile {
-        id,
-        name,
-        protocol,
-        location,
-        config_path: dest_path,
+        id: prepared.profile.id,
+        name: prepared.profile.name,
+        protocol: prepared.profile.protocol,
+        location: prepared.profile.location,
+        config_path: prepared.profile.config_path,
         last_used: None,
     })
 }

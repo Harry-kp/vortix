@@ -312,11 +312,9 @@ impl Journal {
     /// the session log filename. `None` when journal disk persistence is
     /// disabled (no session file exists).
     ///
-    /// Used by per-session scratch directories (e.g. `WireGuard` secondary
-    /// temp configs ) so that crash-orphaned subdirs can be
-    /// distinguished from the live session purely by name: every process gets
-    /// a unique `{pid}` component, so a non-matching subdir is unambiguously
-    /// an orphan regardless of file age.
+    /// Used to namespace per-session scratch directories (for example,
+    /// `WireGuard` managed configs). Liveness is established separately by a
+    /// process-held lease; distinct session names may legitimately coexist.
     #[must_use]
     pub fn session_id(&self) -> Option<String> {
         self.session_path

@@ -7,7 +7,6 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::vortix_config::profile_store::write_atomic;
 use crate::vortix_core::control::{
     BootConnection, ControlPersistenceConfig, ControlStateStore, ControlStateStoreError,
     DesiredState, DurableControlState, OperationId, OperationIntent, OperationRecord,
@@ -16,9 +15,11 @@ use crate::vortix_core::control::{
 };
 use crate::vortix_core::profile::ProfileId;
 
-const STATE_SCHEMA_VERSION: u16 = 1;
+const MIN_STATE_SCHEMA_VERSION: u16 = 1;
+const STATE_SCHEMA_VERSION: u16 = 2;
 const STATE_FILE: &str = "control-state.json";
 const PREVIOUS_STATE_FILE: &str = "control-state.previous.json";
+const ENDPOINT_CACHE_FILE: &str = "endpoint-resolutions.json";
 const MAX_STATE_BYTES: u64 = 1024 * 1024;
 const MAX_PROFILES: usize = 512;
 const MAX_OPERATIONS: usize = 512;
@@ -54,7 +55,7 @@ impl PersistedControlState {
     }
 
     fn validate(&self) -> Result<(), ControlStateError> {
-        if self.schema_version != STATE_SCHEMA_VERSION {
+        if !(MIN_STATE_SCHEMA_VERSION..=STATE_SCHEMA_VERSION).contains(&self.schema_version) {
             return Err(ControlStateError::UnsupportedSchema(self.schema_version));
         }
         if self.boot_id.is_empty() || self.boot_id.len() > 128 {
@@ -111,6 +112,15 @@ impl PersistedControlState {
                         } if tunnels.get(profile_id) != Some(&RequestedTunnelState::Connected)
                     )
                     || !operation_result_matches_status(operation)
+                    || (self.schema_version == 1
+                        && (matches!(operation.intent, OperationIntent::ProfileMutation { .. })
+                            || matches!(
+                                operation.result,
+                                Some(
+                                    OperationResult::ProfileMutationApplied
+                                        | OperationResult::ProfileMutationAppliedAfterDeadline
+                                )
+                            )))
             })
         {
             return Err(ControlStateError::Invalid("invalid persisted control fact"));
@@ -127,10 +137,15 @@ fn operation_result_matches_status(operation: &OperationRecord) -> bool {
             None
         ) | (
             OperationStatus::Succeeded,
-            Some(OperationResult::ObservedConvergence)
+            Some(OperationResult::ObservedConvergence | OperationResult::ProfileMutationApplied)
         ) | (OperationStatus::Failed, Some(OperationResult::Failed(_)))
             | (OperationStatus::Cancelled, Some(OperationResult::Cancelled))
-            | (OperationStatus::Expired, Some(OperationResult::Expired))
+            | (
+                OperationStatus::Expired,
+                Some(
+                    OperationResult::Expired | OperationResult::ProfileMutationAppliedAfterDeadline
+                )
+            )
     )
 }
 
@@ -145,13 +160,29 @@ pub(crate) enum LoadedControlState {
 #[derive(Debug, Clone)]
 pub struct FsControlStateStore {
     directory: PathBuf,
+    expected_uid: u32,
+    expected_gid: u32,
 }
 
 impl FsControlStateStore {
     #[must_use]
     pub fn new(directory: impl Into<PathBuf>) -> Self {
+        let expected = crate::utils::effective_user_group_ids();
         Self {
             directory: directory.into(),
+            expected_uid: expected.0,
+            expected_gid: expected.1,
+        }
+    }
+
+    /// Construct a store for the authenticated invoking owner while the
+    /// Standard-mode control process itself remains root.
+    #[must_use]
+    pub fn for_owner(directory: impl Into<PathBuf>, uid: u32, gid: u32) -> Self {
+        Self {
+            directory: directory.into(),
+            expected_uid: uid,
+            expected_gid: gid,
         }
     }
 
@@ -169,28 +200,74 @@ impl FsControlStateStore {
         ))
     }
 
-    fn load_state(&self) -> Result<LoadedControlState, ControlStateError> {
-        if !validate_directory(&self.directory)? {
-            return Ok(LoadedControlState::Missing);
+    /// Read one durable operation without starting a control authority.
+    pub fn operation(
+        &self,
+        current_boot_id: &str,
+        operation_id: &OperationId,
+    ) -> Result<Option<OperationRecord>, ControlStateStoreError> {
+        Ok(self
+            .load(current_boot_id)?
+            .and_then(|recovered| recovered.state.operations.get(operation_id).cloned()))
+    }
+
+    /// Read the bounded owner-authenticated endpoint-resolution cache.
+    pub fn endpoint_resolution_cache(&self) -> Result<Option<Vec<u8>>, ControlStateStoreError> {
+        let Some(directory) =
+            open_control_directory(&self.directory, false, self.expected_uid, self.expected_gid)
+                .map_err(ControlStateStoreError::from)?
+        else {
+            return Ok(None);
+        };
+        read_owned_entry(&directory, ENDPOINT_CACHE_FILE, self.expected_uid)
+            .map_err(ControlStateStoreError::from)
+    }
+
+    /// Atomically replace the bounded owner-authenticated endpoint cache.
+    pub fn save_endpoint_resolution_cache(
+        &self,
+        body: &[u8],
+    ) -> Result<(), ControlStateStoreError> {
+        if body.len() as u64 > MAX_STATE_BYTES {
+            return Err(ControlStateStoreError::Capacity);
         }
-        let current_path = self.directory.join(STATE_FILE);
-        match read_state(&current_path) {
+        let directory =
+            open_control_directory(&self.directory, true, self.expected_uid, self.expected_gid)
+                .map_err(ControlStateStoreError::from)?
+                .ok_or(ControlStateStoreError::UnsafeFile)?;
+        write_owned_atomic(
+            &directory,
+            ENDPOINT_CACHE_FILE,
+            body,
+            self.expected_uid,
+            self.expected_gid,
+        )
+        .map_err(ControlStateStoreError::from)
+    }
+
+    fn load_state(&self) -> Result<LoadedControlState, ControlStateError> {
+        let Some(directory) =
+            open_control_directory(&self.directory, false, self.expected_uid, self.expected_gid)?
+        else {
+            return Ok(LoadedControlState::Missing);
+        };
+        match read_state(&directory, STATE_FILE, self.expected_uid) {
             Ok(Some(DecodedState::Current(state))) => Ok(LoadedControlState::Current(*state)),
             Ok(Some(DecodedState::Future(version))) => {
                 Ok(LoadedControlState::FutureSchema(version))
             }
-            Ok(None) => self.load_previous(false),
-            Err(ControlStateError::Corrupt) => self.load_previous(true),
+            Ok(None) => self.load_previous(&directory, false),
+            Err(ControlStateError::Corrupt) => self.load_previous(&directory, true),
             Err(error) => Err(error),
         }
     }
 
     fn load_previous(
         &self,
+        directory: &ControlDirectory,
         current_was_corrupt: bool,
     ) -> Result<LoadedControlState, ControlStateError> {
-        let previous_path = self.directory.join(PREVIOUS_STATE_FILE);
-        match read_state(&previous_path)? {
+        match read_state(directory, PREVIOUS_STATE_FILE, self.expected_uid)? {
             Some(DecodedState::Current(state)) => Ok(LoadedControlState::RecoveredPrevious(*state)),
             Some(DecodedState::Future(version)) => Ok(LoadedControlState::FutureSchema(version)),
             None if current_was_corrupt => Err(ControlStateError::Corrupt),
@@ -199,7 +276,9 @@ impl FsControlStateStore {
     }
 
     fn save_state(&self, state: &PersistedControlState) -> Result<(), ControlStateError> {
-        ensure_directory(&self.directory)?;
+        let directory =
+            open_control_directory(&self.directory, true, self.expected_uid, self.expected_gid)?
+                .ok_or(ControlStateError::UnsafeFile)?;
         state.validate()?;
         let body = serde_json::to_vec_pretty(state)?;
         if body.len() as u64 > MAX_STATE_BYTES {
@@ -208,11 +287,16 @@ impl FsControlStateStore {
         if !matches!(decode_state(&body)?, DecodedState::Current(_)) {
             return Err(ControlStateError::Corrupt);
         }
-        let current_path = self.directory.join(STATE_FILE);
-        if let Some(bytes) = read_bytes(&current_path)? {
+        if let Some(bytes) = read_owned_entry(&directory, STATE_FILE, self.expected_uid)? {
             match decode_state(&bytes) {
                 Ok(DecodedState::Current(_)) => {
-                    write_atomic(&self.directory.join(PREVIOUS_STATE_FILE), &bytes)?;
+                    write_owned_atomic(
+                        &directory,
+                        PREVIOUS_STATE_FILE,
+                        &bytes,
+                        self.expected_uid,
+                        self.expected_gid,
+                    )?;
                 }
                 Ok(DecodedState::Future(version)) => {
                     return Err(ControlStateError::UnsupportedSchema(version));
@@ -221,43 +305,15 @@ impl FsControlStateStore {
                 Err(error) => return Err(error),
             }
         }
-        write_atomic(&current_path, &body)?;
+        write_owned_atomic(
+            &directory,
+            STATE_FILE,
+            &body,
+            self.expected_uid,
+            self.expected_gid,
+        )?;
         Ok(())
     }
-}
-
-fn ensure_directory(path: &Path) -> Result<(), ControlStateError> {
-    if !validate_directory(path)? {
-        std::fs::create_dir_all(path)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
-        }
-    }
-    validate_directory(path)?
-        .then_some(())
-        .ok_or(ControlStateError::UnsafeFile)
-}
-
-fn validate_directory(path: &Path) -> Result<bool, ControlStateError> {
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error.into()),
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(ControlStateError::UnsafeFile);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-        let effective_uid = crate::utils::effective_user_group_ids().0;
-        if metadata.uid() != effective_uid || metadata.permissions().mode() & 0o022 != 0 {
-            return Err(ControlStateError::UnsafeFile);
-        }
-    }
-    Ok(true)
 }
 
 impl ControlStateStore for FsControlStateStore {
@@ -316,8 +372,12 @@ enum DecodedState {
     Future(u16),
 }
 
-fn read_state(path: &Path) -> Result<Option<DecodedState>, ControlStateError> {
-    read_bytes(path)?
+fn read_state(
+    directory: &ControlDirectory,
+    name: &str,
+    expected_uid: u32,
+) -> Result<Option<DecodedState>, ControlStateError> {
+    read_owned_entry(directory, name, expected_uid)?
         .map(|bytes| decode_state(&bytes))
         .transpose()
 }
@@ -339,27 +399,358 @@ fn decode_state(bytes: &[u8]) -> Result<DecodedState, ControlStateError> {
     Ok(DecodedState::Current(Box::new(state)))
 }
 
-fn read_bytes(path: &Path) -> Result<Option<Vec<u8>>, ControlStateError> {
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
+#[cfg(unix)]
+type ControlDirectory = std::fs::File;
+
+#[cfg(not(unix))]
+type ControlDirectory = PathBuf;
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+#[allow(clippy::similar_names)]
+fn open_control_directory(
+    path: &Path,
+    create: bool,
+    expected_uid: u32,
+    expected_gid: u32,
+) -> Result<Option<ControlDirectory>, ControlStateError> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
     };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+    let leaf = absolute.file_name().ok_or(ControlStateError::UnsafeFile)?;
+    let parent_path = absolute
+        .parent()
+        .ok_or(ControlStateError::UnsafeFile)?
+        .canonicalize()?;
+    let parent = open_absolute_directory(&parent_path)?;
+    let leaf = CString::new(leaf.as_bytes()).map_err(|_| ControlStateError::UnsafeFile)?;
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let mut fd = unsafe { libc::openat(parent.as_raw_fd(), leaf.as_ptr(), flags) };
+    let mut created = false;
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        if is_unsafe_path_error(&error) {
+            return Err(ControlStateError::UnsafeFile);
+        }
+        if error.raw_os_error() != Some(libc::ENOENT) {
+            return Err(error.into());
+        }
+        if !create {
+            return Ok(None);
+        }
+        validate_directory_descriptor(&parent, expected_uid)?;
+        if unsafe { libc::mkdirat(parent.as_raw_fd(), leaf.as_ptr(), 0o700) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EEXIST) {
+                return Err(error.into());
+            }
+        } else {
+            created = true;
+        }
+        fd = unsafe { libc::openat(parent.as_raw_fd(), leaf.as_ptr(), flags) };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            return if is_unsafe_path_error(&error) {
+                Err(ControlStateError::UnsafeFile)
+            } else {
+                Err(error.into())
+            };
+        }
+    }
+    let directory = unsafe { std::fs::File::from_raw_fd(fd) };
+    if created {
+        prepare_created_descriptor(&directory, expected_uid, expected_gid, 0o700)?;
+        parent.sync_all()?;
+    }
+    validate_directory_descriptor(&directory, expected_uid)?;
+    Ok(Some(directory))
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn open_absolute_directory(path: &Path) -> Result<std::fs::File, ControlStateError> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::path::Component;
+
+    let root = CString::new("/").expect("static path");
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let fd = unsafe { libc::open(root.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut directory = unsafe { std::fs::File::from_raw_fd(fd) };
+    for component in path.components() {
+        let Component::Normal(component) = component else {
+            if matches!(component, Component::RootDir | Component::CurDir) {
+                continue;
+            }
+            return Err(ControlStateError::UnsafeFile);
+        };
+        let name = CString::new(component.as_bytes()).map_err(|_| ControlStateError::UnsafeFile)?;
+        let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            return if is_unsafe_path_error(&error) {
+                Err(ControlStateError::UnsafeFile)
+            } else {
+                Err(error.into())
+            };
+        }
+        directory = unsafe { std::fs::File::from_raw_fd(fd) };
+    }
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn validate_directory_descriptor(
+    directory: &std::fs::File,
+    expected_uid: u32,
+) -> Result<(), ControlStateError> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let metadata = directory.metadata()?;
+    if !metadata.is_dir()
+        || metadata.uid() != expected_uid
+        || metadata.permissions().mode() & 0o022 != 0
+    {
+        return Err(ControlStateError::UnsafeFile);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn is_unsafe_path_error(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(code) if code == libc::ELOOP || code == libc::ENOTDIR)
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn prepare_created_descriptor(
+    descriptor: &std::fs::File,
+    uid: u32,
+    gid: u32,
+    mode: libc::mode_t,
+) -> Result<(), ControlStateError> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let effective = crate::utils::effective_user_group_ids();
+    let metadata = descriptor.metadata()?;
+    if metadata.uid() != effective.0 && metadata.uid() != uid {
+        return Err(ControlStateError::UnsafeFile);
+    }
+    if unsafe { libc::fchmod(descriptor.as_raw_fd(), mode) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    if effective.0 == 0 {
+        if unsafe { libc::fchown(descriptor.as_raw_fd(), uid, gid) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    } else if effective != (uid, gid) {
+        return Err(ControlStateError::UnsafeFile);
+    }
+    let metadata = descriptor.metadata()?;
+    if metadata.uid() != uid
+        || metadata.gid() != gid
+        || u64::from(metadata.permissions().mode() & 0o777) != u64::from(mode)
+    {
+        return Err(ControlStateError::UnsafeFile);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn read_owned_entry(
+    directory: &ControlDirectory,
+    name: &str,
+    expected_uid: u32,
+) -> Result<Option<Vec<u8>>, ControlStateError> {
+    use std::ffi::CString;
+    use std::io::Read as _;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let name = CString::new(name).map_err(|_| ControlStateError::UnsafeFile)?;
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ENOENT) {
+            Ok(None)
+        } else if is_unsafe_path_error(&error) {
+            Err(ControlStateError::UnsafeFile)
+        } else {
+            Err(error.into())
+        };
+    }
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.uid() != expected_uid
+        || metadata.permissions().mode() & 0o077 != 0
+    {
         return Err(ControlStateError::UnsafeFile);
     }
     if metadata.len() > MAX_STATE_BYTES {
         return Err(ControlStateError::Capacity);
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-        let effective_uid = crate::utils::effective_user_group_ids().0;
-        if metadata.uid() != effective_uid || metadata.permissions().mode() & 0o077 != 0 {
-            return Err(ControlStateError::UnsafeFile);
+    let capacity = usize::try_from(metadata.len()).map_err(|_| ControlStateError::Capacity)?;
+    let mut bytes = Vec::with_capacity(capacity);
+    file.by_ref()
+        .take(MAX_STATE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_STATE_BYTES {
+        return Err(ControlStateError::Capacity);
+    }
+    Ok(Some(bytes))
+}
+
+#[cfg(unix)]
+fn write_owned_atomic(
+    directory: &ControlDirectory,
+    name: &str,
+    body: &[u8],
+    uid: u32,
+    gid: u32,
+) -> Result<(), ControlStateError> {
+    write_owned_atomic_with_hook(directory, name, body, uid, gid, |_| {})
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn write_owned_atomic_with_hook(
+    directory: &ControlDirectory,
+    name: &str,
+    body: &[u8],
+    uid: u32,
+    gid: u32,
+    before_publish: impl FnOnce(&std::fs::File),
+) -> Result<(), ControlStateError> {
+    use std::ffi::CString;
+    use std::io::Write as _;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let destination = CString::new(name).map_err(|_| ControlStateError::UnsafeFile)?;
+    let mut allocated = None;
+    for _ in 0..128 {
+        let candidate = format!(
+            ".{name}.{}.{}.tmp",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        );
+        let candidate_c =
+            CString::new(candidate.as_str()).map_err(|_| ControlStateError::UnsafeFile)?;
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                candidate_c.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd >= 0 {
+            allocated = Some((candidate, unsafe { std::fs::File::from_raw_fd(fd) }));
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(error.into());
         }
     }
-    Ok(Some(std::fs::read(path)?))
+    let (temporary_name, mut temporary) = allocated.ok_or_else(|| {
+        ControlStateError::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not allocate a private control-state temp file",
+        ))
+    })?;
+    let temporary_name_c =
+        CString::new(temporary_name.as_str()).map_err(|_| ControlStateError::UnsafeFile)?;
+    let result = (|| {
+        temporary.write_all(body)?;
+        temporary.sync_all()?;
+        prepare_created_descriptor(&temporary, uid, gid, 0o600)?;
+        temporary.sync_all()?;
+        before_publish(&temporary);
+        if unsafe {
+            libc::renameat(
+                directory.as_raw_fd(),
+                temporary_name_c.as_ptr(),
+                directory.as_raw_fd(),
+                destination.as_ptr(),
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        directory.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = unsafe { libc::unlinkat(directory.as_raw_fd(), temporary_name_c.as_ptr(), 0) };
+    }
+    result
+}
+
+#[cfg(not(unix))]
+fn open_control_directory(
+    path: &Path,
+    create: bool,
+    _expected_uid: u32,
+    _expected_gid: u32,
+) -> Result<Option<ControlDirectory>, ControlStateError> {
+    if !path.exists() {
+        if !create {
+            return Ok(None);
+        }
+        std::fs::create_dir_all(path)?;
+    }
+    path.is_dir()
+        .then(|| path.to_path_buf())
+        .map(Some)
+        .ok_or(ControlStateError::UnsafeFile)
+}
+
+#[cfg(not(unix))]
+fn read_owned_entry(
+    directory: &ControlDirectory,
+    name: &str,
+    _expected_uid: u32,
+) -> Result<Option<Vec<u8>>, ControlStateError> {
+    let path = directory.join(name);
+    match std::fs::read(path) {
+        Ok(bytes) if bytes.len() as u64 <= MAX_STATE_BYTES => Ok(Some(bytes)),
+        Ok(_) => Err(ControlStateError::Capacity),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(not(unix))]
+fn write_owned_atomic(
+    directory: &ControlDirectory,
+    name: &str,
+    body: &[u8],
+    _uid: u32,
+    _gid: u32,
+) -> Result<(), ControlStateError> {
+    crate::vortix_config::profile_store::write_atomic(&directory.join(name), body)?;
+    Ok(())
 }
 
 #[derive(Debug, Error)]
@@ -400,7 +791,8 @@ mod tests {
     use crate::vortix_core::control::{
         AdmissionError, AuthorityEpoch, BootEligibility, ClientId, CommandRequest,
         ControlPersistenceConfig, ControlService, ControlServiceConfig, IdempotencyKey,
-        PolicyDigest, ProtectionStatus, ReadinessError, RequestedTunnelState, UserCommand,
+        PolicyDigest, ProfileTopology, ProtectionStatus, ReadinessError, RequestedTunnelState,
+        UserCommand,
     };
     use std::collections::BTreeSet;
     use std::sync::Arc;
@@ -442,11 +834,44 @@ mod tests {
     }
 
     #[test]
+    fn durable_operation_is_queryable_without_starting_an_authority() {
+        let temp = tempdir().unwrap();
+        let store = FsControlStateStore::new(temp.path());
+        let mut persisted = state("query-boot");
+        let operation = operation(7, 3, 2);
+        let operation_id = operation.id.clone();
+        persisted.operations.insert(operation_id.clone(), operation);
+        store.save_state(&persisted).unwrap();
+
+        let loaded = store
+            .operation("query-boot", &operation_id)
+            .unwrap()
+            .expect("operation remains queryable");
+
+        assert_eq!(loaded.id, operation_id);
+        assert_eq!(loaded.status, OperationStatus::WaitingForObservation);
+    }
+
+    #[test]
+    fn endpoint_resolution_cache_round_trips_through_owned_atomic_entry() {
+        let temp = tempdir().unwrap();
+        let store = FsControlStateStore::new(temp.path());
+        let body = br#"{"schema_version":1,"profiles":{}}"#;
+        assert!(store.endpoint_resolution_cache().unwrap().is_none());
+        store.save_endpoint_resolution_cache(body).unwrap();
+        assert_eq!(
+            store.endpoint_resolution_cache().unwrap().as_deref(),
+            Some(body.as_slice())
+        );
+    }
+
+    #[test]
     fn operation_intent_defaults_to_generation_scope_for_older_state() {
         let mut persisted = state("legacy-intent");
         let operation = operation(7, 1, 1);
         persisted.operations.insert(operation.id.clone(), operation);
         let mut encoded = serde_json::to_value(&persisted).unwrap();
+        encoded["schema_version"] = serde_json::json!(1);
         encoded["operations"]
             .as_object_mut()
             .unwrap()
@@ -461,6 +886,37 @@ mod tests {
             OperationIntent::GenerationScoped
         ));
         decoded.validate().unwrap();
+    }
+
+    #[test]
+    fn schema_one_loads_but_cannot_claim_profile_mutation_facts() {
+        let mut persisted = state("schema-one");
+        let operation = operation(7, 1, 1);
+        persisted.operations.insert(operation.id.clone(), operation);
+        let mut encoded = serde_json::to_value(&persisted).unwrap();
+        encoded["schema_version"] = serde_json::json!(1);
+
+        assert!(matches!(
+            decode_state(&serde_json::to_vec(&encoded).unwrap()).unwrap(),
+            DecodedState::Current(_)
+        ));
+
+        let operation = encoded["operations"]
+            .as_object_mut()
+            .unwrap()
+            .values_mut()
+            .next()
+            .unwrap();
+        operation["intent"] = serde_json::json!({
+            "kind": "profile_mutation",
+            "profile_id": profile('a')
+        });
+        operation["status"] = serde_json::json!("succeeded");
+        operation["result"] = serde_json::json!("profile_mutation_applied");
+        assert!(matches!(
+            decode_state(&serde_json::to_vec(&encoded).unwrap()),
+            Err(ControlStateError::Invalid(_))
+        ));
     }
 
     #[test]
@@ -500,7 +956,11 @@ mod tests {
             store.load_state().unwrap(),
             LoadedControlState::Current(second)
         );
-        let previous = read_state(&state_directory.join(PREVIOUS_STATE_FILE)).unwrap();
+        let (uid, gid) = crate::utils::effective_user_group_ids();
+        let pinned = open_control_directory(&state_directory, false, uid, gid)
+            .unwrap()
+            .expect("state directory exists");
+        let previous = read_state(&pinned, PREVIOUS_STATE_FILE, uid).unwrap();
         assert!(matches!(previous, Some(DecodedState::Current(state)) if *state == first));
         #[cfg(unix)]
         {
@@ -518,6 +978,65 @@ mod tests {
                 & 0o777;
             assert_eq!(directory_mode, 0o700);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_publish_owns_private_temp_before_visibility() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let directory = tempdir().unwrap();
+        let (uid, gid) = crate::utils::effective_user_group_ids();
+        let pinned = open_control_directory(directory.path(), false, uid, gid)
+            .unwrap()
+            .expect("existing directory is pinned");
+
+        write_owned_atomic_with_hook(
+            &pinned,
+            STATE_FILE,
+            br#"{"schema_version":1}"#,
+            uid,
+            gid,
+            |temporary| {
+                assert!(read_owned_entry(&pinned, STATE_FILE, uid)
+                    .unwrap()
+                    .is_none());
+                let metadata = temporary.metadata().unwrap();
+                assert_eq!(metadata.uid(), uid);
+                assert_eq!(metadata.gid(), gid);
+                assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_owned_entry(&pinned, STATE_FILE, uid).unwrap(),
+            Some(br#"{"schema_version":1}"#.to_vec())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_directory_cannot_be_redirected_after_open() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempdir().unwrap();
+        let state_directory = parent.path().join("control");
+        let redirected = parent.path().join("redirected");
+        let moved = parent.path().join("moved-control");
+        std::fs::create_dir(&state_directory).unwrap();
+        std::fs::create_dir(&redirected).unwrap();
+        let (uid, gid) = crate::utils::effective_user_group_ids();
+        let pinned = open_control_directory(&state_directory, false, uid, gid)
+            .unwrap()
+            .expect("state directory is pinned");
+
+        std::fs::rename(&state_directory, &moved).unwrap();
+        symlink(&redirected, &state_directory).unwrap();
+        write_owned_atomic(&pinned, STATE_FILE, b"pinned", uid, gid).unwrap();
+
+        assert_eq!(std::fs::read(moved.join(STATE_FILE)).unwrap(), b"pinned");
+        assert!(!redirected.join(STATE_FILE).exists());
     }
 
     #[cfg(unix)]
@@ -564,7 +1083,8 @@ mod tests {
         let directory = tempdir().unwrap();
         let store = FsControlStateStore::new(directory.path());
         let path = directory.path().join(STATE_FILE);
-        write_atomic(&path, br#"{"schema_version":99}"#).unwrap();
+        crate::vortix_config::profile_store::write_atomic(&path, br#"{"schema_version":99}"#)
+            .unwrap();
 
         assert!(matches!(
             store.load_state().unwrap(),
@@ -678,6 +1198,10 @@ mod tests {
         let config = ControlServiceConfig {
             authority_epoch: AuthorityEpoch(7),
             known_profiles: BTreeSet::from([profile_id.clone()]),
+            profile_topologies: std::collections::BTreeMap::from([(
+                profile_id.clone(),
+                ProfileTopology::default(),
+            )]),
             persistence: Some(ControlPersistenceConfig::new("boot-a", store.clone())),
             ..ControlServiceConfig::default()
         };

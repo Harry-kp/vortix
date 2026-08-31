@@ -33,6 +33,11 @@ cat >"$CONFIG_DIR/config.toml" <<'EOF'
 ping_targets = ["10.99.99.1"]
 wireguard_handshake_timeout_secs = 4
 EOF
+cat >"$CONFIG_DIR/settings.toml" <<'EOF'
+[engine]
+wireguard_handshake_timeout_secs = 4
+wireguard_health_targets = ["10.99.99.1"]
+EOF
 
 # vortix needs root for kill switch / iface manipulation; the container
 # runs as root so just invoke directly.
@@ -56,7 +61,8 @@ ip netns exec "$NS_B" target/release/vortix down
 # Handshaking, fail the bounded gate, and leave no owned interface behind.
 ip netns exec "$NS_A" wg-quick down "$FIXTURE_DIR/wg-a.conf"
 set +e
-ip netns exec "$NS_B" target/release/vortix up unreachable >"$CONFIG_DIR/unreachable.log" 2>&1 &
+RUST_LOG="vortix::process=info,vortix::tunnel::wireguard=info" \
+  ip netns exec "$NS_B" target/release/vortix up unreachable >"$CONFIG_DIR/unreachable.log" 2>&1 &
 UP_PID=$!
 sleep 1
 if ! ip netns exec "$NS_B" target/release/vortix status --brief | grep -qi handshaking; then
@@ -72,9 +78,16 @@ if [[ "$UP_STATUS" -eq 0 ]]; then
   echo "unreachable WireGuard peer was reported connected" >&2
   exit 1
 fi
-grep -qi "current-generation peer handshake" "$CONFIG_DIR/unreachable.log"
+if ! grep -Eqi \
+  "current-generation peer handshake|WireGuard handshake failed" \
+  "$CONFIG_DIR/unreachable.log"; then
+  echo "unreachable WireGuard failure did not report the handshake gate" >&2
+  cat "$CONFIG_DIR/unreachable.log" >&2
+  exit 1
+fi
 if ip netns exec "$NS_B" ip link show unreachable >/dev/null 2>&1; then
   echo "attempt-owned unreachable interface leaked after timeout" >&2
+  cat "$CONFIG_DIR/unreachable.log" >&2
   exit 1
 fi
 

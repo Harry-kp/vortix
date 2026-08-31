@@ -234,12 +234,11 @@ pub fn get_profiles_dir() -> std::io::Result<std::path::PathBuf> {
 /// `WireGuard` secondary connect-time DNS scoping: the
 /// secondary's rewritten `.conf` (with `DNS =` stripped) is written under
 /// this subdir so crashed disconnects leave isolated orphans that the
-/// startup sweep cleans by session-liveness check (subdir name ≠ current
-/// `session_id`).
+/// startup sweep cleans only after acquiring their process-lifetime lease.
 ///
 /// The subdir name matches the journal's `session_id` (`{ISO}-{pid}`), so a
-/// new vortix process is guaranteed a fresh subdir name; the prior session's
-/// subdir is unambiguously an orphan regardless of age.
+/// new Vortix process is guaranteed a fresh namespace without mistaking a
+/// concurrently running session for a crash orphan.
 ///
 /// # Errors
 ///
@@ -275,6 +274,142 @@ pub fn get_tmp_config_dir(session_id: &str) -> std::io::Result<std::path::PathBu
     }
 
     Ok(session_dir)
+}
+
+/// Process-lifetime lease for one per-session scratch directory.
+///
+/// The kernel releases the advisory lock on every process exit path,
+/// including crashes and [`std::process::exit`]. Keeping this value alive is
+/// what distinguishes a concurrently running Vortix session from a crash
+/// orphan; a different journal session ID alone is not proof of death.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct TempSessionLease {
+    _file: std::fs::File,
+}
+
+/// Resolve the scratch-session identity used by protocol-owned temporary
+/// files, including when journal disk persistence is disabled.
+#[must_use]
+pub fn temp_session_id() -> String {
+    crate::vortix_core::journal::global_journal()
+        .and_then(crate::vortix_core::journal::Journal::session_id)
+        .unwrap_or_else(|| format!("nojournal-{}", std::process::id()))
+}
+
+/// Create and exclusively lease this process's scratch-session directory.
+///
+/// # Errors
+///
+/// Returns an I/O error when the private directory or its no-follow lease
+/// file cannot be created, or when another process already holds the same
+/// session identity.
+#[cfg(unix)]
+pub fn acquire_temp_session_lease(
+    config_dir: &std::path::Path,
+    session_id: &str,
+) -> std::io::Result<TempSessionLease> {
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+    use std::os::unix::io::AsRawFd as _;
+
+    let tmp_root = config_dir.join(crate::constants::TMP_CONFIG_DIR);
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .recursive(true)
+        .create(&tmp_root)?;
+    let session_dir = tmp_root.join(session_id);
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .recursive(true)
+        .create(&session_dir)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(session_dir.join(".lease"))?;
+    // SAFETY: `file` owns a valid descriptor for the lifetime of the lease;
+    // flock changes only the kernel lock associated with that descriptor.
+    #[allow(unsafe_code)]
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    crate::config::fix_ownership(&tmp_root);
+    crate::config::fix_ownership(&session_dir);
+    crate::config::fix_ownership(&session_dir.join(".lease"));
+    Ok(TempSessionLease { _file: file })
+}
+
+#[cfg(unix)]
+fn legacy_temp_session_process_is_live(session_id: &str) -> bool {
+    let Some(pid) = session_id
+        .rsplit_once('-')
+        .and_then(|(_, pid)| pid.parse::<i32>().ok())
+        .filter(|pid| *pid > 0)
+    else {
+        return false;
+    };
+    // SAFETY: signal zero is a side-effect-free existence probe. Permission
+    // denial also proves that a process currently owns the PID.
+    #[allow(unsafe_code)]
+    let result = unsafe { libc::kill(pid, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+/// Remove only scratch sessions proven not to have a live process lease.
+///
+/// Directories from older Vortix releases have no `.lease`; during the
+/// upgrade window their PID suffix remains a conservative liveness fallback.
+/// Unknown or inaccessible entries are retained rather than risking deletion
+/// of a live tunnel's teardown capability.
+#[cfg(unix)]
+pub fn sweep_orphan_temp_configs(config_dir: &std::path::Path, current_session_id: &str) {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::os::unix::io::AsRawFd as _;
+
+    let tmp_dir = config_dir.join(crate::constants::TMP_CONFIG_DIR);
+    let Ok(entries) = std::fs::read_dir(&tmp_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if name == current_session_id
+            || !entry
+                .file_type()
+                .is_ok_and(|kind| kind.is_dir() && !kind.is_symlink())
+        {
+            continue;
+        }
+        let lease = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(entry.path().join(".lease"));
+        match lease {
+            Ok(file) => {
+                // SAFETY: `file` is an owned valid descriptor. A failed
+                // nonblocking lock means a live process still owns it.
+                #[allow(unsafe_code)]
+                let result =
+                    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                if result != 0 {
+                    continue;
+                }
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !legacy_temp_session_process_is_live(&name) {
+                    let _ = std::fs::remove_dir_all(entry.path());
+                }
+            }
+            Err(_) => {}
+        }
+    }
 }
 
 /// Non-Unix fallback: no `chmod`, just `create_dir_all` via `create_user_dir`.
@@ -603,6 +738,163 @@ pub fn read_openvpn_saved_auth_compat(
     read_openvpn_saved_auth(profile_id).or_else(|| {
         unambiguous_legacy_artifact_key(legacy_display_name).and_then(read_openvpn_saved_auth)
     })
+}
+
+/// Read saved `OpenVPN` credentials through a pinned, owner-checked directory.
+///
+/// This is the privileged Standard-mode read boundary. It never follows the
+/// configuration directory, auth directory, or credential-file symlink, and
+/// it rejects credentials that are not an owner-only regular file.
+#[cfg(unix)]
+fn unsafe_openvpn_auth_file(reason: &str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::PermissionDenied, reason)
+}
+
+#[cfg(unix)]
+fn validate_openvpn_auth_directory(
+    file: &std::fs::File,
+    expected_owner_uid: u32,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = file.metadata()?;
+    if !metadata.is_dir() || metadata.uid() != expected_owner_uid {
+        return Err(unsafe_openvpn_auth_file(
+            "unsafe OpenVPN auth directory owner",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_openvpn_auth_directory_at(
+    parent: &std::fs::File,
+    name: &std::ffi::CStr,
+) -> std::io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+    // SAFETY: the parent descriptor is live, `name` is NUL-terminated,
+    // and a successful descriptor is transferred into `File` exactly once.
+    #[allow(unsafe_code)]
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `openat` returned a new descriptor owned by this call.
+    #[allow(unsafe_code)]
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn read_openvpn_auth_entry_owned(
+    auth_dir: &std::fs::File,
+    profile_key: &str,
+    expected_owner_uid: u32,
+) -> std::io::Result<Option<(zeroize::Zeroizing<String>, zeroize::Zeroizing<String>)>> {
+    use std::ffi::CString;
+    use std::io::Read as _;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::fs::MetadataExt as _;
+
+    const MAX_AUTH_BYTES: u64 = 16 * 1024;
+
+    validate_openvpn_artifact_key(profile_key)?;
+    let basename = CString::new(format!("{profile_key}.auth")).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid auth filename")
+    })?;
+    // SAFETY: the directory descriptor and C string are valid for the call;
+    // the returned descriptor is checked below.
+    #[allow(unsafe_code)]
+    let fd = unsafe {
+        libc::openat(
+            auth_dir.as_raw_fd(),
+            basename.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        return if error.kind() == std::io::ErrorKind::NotFound {
+            Ok(None)
+        } else {
+            Err(error)
+        };
+    }
+    // SAFETY: `openat` returned a new descriptor owned by this call.
+    #[allow(unsafe_code)]
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.uid() != expected_owner_uid
+        || metadata.mode() & 0o777 != 0o600
+        || metadata.len() == 0
+        || metadata.len() > MAX_AUTH_BYTES
+    {
+        return Err(unsafe_openvpn_auth_file(
+            "unsafe OpenVPN auth credential file",
+        ));
+    }
+    let mut content = zeroize::Zeroizing::new(String::new());
+    file.take(MAX_AUTH_BYTES + 1).read_to_string(&mut content)?;
+    if content.len() as u64 > MAX_AUTH_BYTES {
+        return Err(unsafe_openvpn_auth_file(
+            "OpenVPN auth credential file is too large",
+        ));
+    }
+    let mut lines = content.lines();
+    let username = zeroize::Zeroizing::new(lines.next().unwrap_or_default().to_owned());
+    let password = zeroize::Zeroizing::new(lines.next().unwrap_or_default().to_owned());
+    if username.is_empty() || password.is_empty() {
+        return Err(unsafe_openvpn_auth_file(
+            "OpenVPN auth credentials are incomplete",
+        ));
+    }
+    Ok(Some((username, password)))
+}
+
+#[cfg(unix)]
+pub(crate) fn read_openvpn_saved_auth_compat_owned(
+    config_dir: &std::path::Path,
+    expected_owner_uid: u32,
+    profile_id: &str,
+    legacy_display_name: &str,
+) -> std::io::Result<Option<(zeroize::Zeroizing<String>, zeroize::Zeroizing<String>)>> {
+    use std::ffi::CString;
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let config = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(config_dir)?;
+    validate_openvpn_auth_directory(&config, expected_owner_uid)?;
+    let auth_name = CString::new(crate::constants::OPENVPN_AUTH_DIR)
+        .expect("OpenVPN auth directory constant contains no NUL");
+    let auth_dir = match open_openvpn_auth_directory_at(&config, &auth_name) {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    validate_openvpn_auth_directory(&auth_dir, expected_owner_uid)?;
+
+    if let Some(credentials) =
+        read_openvpn_auth_entry_owned(&auth_dir, profile_id, expected_owner_uid)?
+    {
+        return Ok(Some(credentials));
+    }
+    let Some(legacy_key) = unambiguous_legacy_artifact_key(legacy_display_name) else {
+        return Ok(None);
+    };
+    if legacy_key == profile_id {
+        return Ok(None);
+    }
+    read_openvpn_auth_entry_owned(&auth_dir, legacy_key, expected_owner_uid)
 }
 
 /// Deletes the saved `OpenVPN` auth credentials file for a profile.
@@ -1162,8 +1454,9 @@ pub(crate) fn host_ipv6_disabled() -> bool {
 /// first's pidfile, orphaning it.
 ///
 /// The lock is held for the returned `File`'s lifetime and released by
-/// the OS on process exit — safe across `std::process::exit` paths.
-/// Blocks (with a stderr note) when another invocation holds the lock.
+/// the OS on process exit — safe across `std::process::exit` paths. It fails
+/// with [`std::io::ErrorKind::WouldBlock`] when another writer owns the lock;
+/// a TUI may hold it for its entire session, so waiting would be unbounded.
 ///
 /// Unix-only mutual exclusion: the non-Unix build opens the lockfile
 /// without locking (a placeholder — vortix tunnels are unsupported on
@@ -1186,12 +1479,7 @@ pub fn acquire_lifecycle_lock() -> std::io::Result<std::fs::File> {
     #[allow(unsafe_code)]
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc != 0 {
-        eprintln!("Another vortix lifecycle operation is in progress — waiting…");
-        #[allow(unsafe_code)]
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-        if rc != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
+        return Err(std::io::Error::last_os_error());
     }
     Ok(file)
 }
@@ -1627,6 +1915,49 @@ mod tests {
         assert_eq!(perms.mode() & 0o777, 0o600);
 
         delete_openvpn_auth_file(name);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn privileged_auth_read_rejects_symlinks_and_loose_modes() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let _tmp = set_temp_config_dir();
+        let config_dir = get_app_config_dir().unwrap();
+        let owner_uid = effective_user_group_ids().0;
+
+        let safe = write_openvpn_auth_file("owned-safe", "user", "pass").unwrap();
+        let credentials = read_openvpn_saved_auth_compat_owned(
+            &config_dir,
+            owner_uid,
+            "owned-safe",
+            "owned-safe",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(credentials.0.as_str(), "user");
+        assert_eq!(credentials.1.as_str(), "pass");
+
+        std::fs::set_permissions(&safe, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_openvpn_saved_auth_compat_owned(
+            &config_dir,
+            owner_uid,
+            "owned-safe",
+            "owned-safe",
+        )
+        .is_err());
+
+        let target = config_dir.join("root-readable-decoy");
+        std::fs::write(&target, "secret-user\nsecret-pass\n").unwrap();
+        let link = get_openvpn_auth_path("owned-link").unwrap();
+        symlink(&target, &link).unwrap();
+        assert!(read_openvpn_saved_auth_compat_owned(
+            &config_dir,
+            owner_uid,
+            "owned-link",
+            "owned-link",
+        )
+        .is_err());
     }
 
     #[test]

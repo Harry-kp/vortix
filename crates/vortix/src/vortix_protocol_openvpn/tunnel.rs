@@ -4,6 +4,7 @@
 //! custodian, then polls the log for protocol readiness. `OpenVPN` never
 //! self-daemonizes, so Vortix retains a reapable process-group owner.
 
+use std::fmt::Write as FmtWrite;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -11,13 +12,15 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use base64::engine::{general_purpose::STANDARD as BASE64, Engine as _};
+use zeroize::Zeroizing;
 
+use crate::vortix_core::control::{OperationId, Secret};
 use crate::vortix_core::ports::process::ManagedProcessId;
 use crate::vortix_core::ports::tunnel::{
     ParseError, ParsedProfile, ProtocolStatus, Tunnel, TunnelCapabilities, TunnelError,
     TunnelHandle, TunnelKindTag, TunnelStatus,
 };
-use crate::vortix_core::profile::{unambiguous_legacy_artifact_key, Profile};
+use crate::vortix_core::profile::{unambiguous_legacy_artifact_key, Profile, ProfileId};
 use crate::vortix_process::{CommandSpec, PrivilegeReq};
 use tracing::{debug, info, warn};
 
@@ -84,9 +87,58 @@ fn validate_managed_config(path: &Path) -> Result<String, TunnelError> {
     sanitize_managed_config(&body)
 }
 
+fn resolve_managed_endpoints(profile: &Profile, text: &str) -> Result<String, TunnelError> {
+    if !profile.require_managed_endpoint_resolution {
+        return Ok(text.to_owned());
+    }
+    let mut output = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let directive = line.split(['#', ';']).next().unwrap_or_default();
+        let mut tokens = directive.split_whitespace();
+        if !matches!(tokens.next(), Some(value) if value.eq_ignore_ascii_case("remote")) {
+            output.push_str(line);
+            continue;
+        }
+        let Some(host) = tokens.next() else {
+            return Err(TunnelError::Subprocess(
+                "managed OpenVPN remote is malformed".into(),
+            ));
+        };
+        if host.parse::<std::net::IpAddr>().is_ok() {
+            output.push_str(line);
+            continue;
+        }
+        let port = tokens
+            .next()
+            .map_or(Ok(1194_u16), str::parse)
+            .map_err(|_| {
+                TunnelError::Subprocess("managed OpenVPN remote port is invalid".into())
+            })?;
+        let transport = tokens.next();
+        let Some(address) = profile.resolved_endpoint(host, port) else {
+            return Err(TunnelError::Subprocess(format!(
+                "managed OpenVPN endpoint {host}:{port} has no unambiguous profile-bound resolution"
+            )));
+        };
+        write!(output, "remote {address} {port}").expect("writing to String cannot fail");
+        if let Some(transport) = transport {
+            write!(output, " {transport}").expect("writing to String cannot fail");
+        }
+        if line.ends_with('\n') {
+            output.push('\n');
+        }
+    }
+    Ok(output)
+}
+
+fn prepare_managed_config(profile: &Profile) -> Result<String, TunnelError> {
+    let sanitized = validate_managed_config(&profile.config_path)?;
+    resolve_managed_endpoints(profile, &sanitized)
+}
+
 #[cfg(test)]
 fn managed_config(profile: &Profile, identity: &ManagedProcessId) -> Result<PathBuf, TunnelError> {
-    let stripped = validate_managed_config(&profile.config_path)?;
+    let stripped = prepare_managed_config(profile)?;
     write_managed_config(profile, identity, &stripped)
 }
 
@@ -164,7 +216,7 @@ fn drive_mgmt_auth(
     stream: UnixStream,
     user: &str,
     pass: &str,
-    otp: &str,
+    otp: &[u8],
     profile_id: &str,
     connect_timeout_secs: u64,
 ) -> Result<(), TunnelError> {
@@ -235,24 +287,25 @@ fn drive_mgmt_auth(
             // round-trip alongside the static-challenge.)
             // We don't parse echo/prompt -- vortix already showed the
             // overlay; here we just send the SCRV1 envelope.
-            send(
-                &mut writer,
-                &format!("username \"Auth\" \"{}\"", escape_mgmt(user)),
-            )?;
-            let pw_b64 = BASE64.encode(pass);
-            let otp_b64 = BASE64.encode(otp);
-            let password_cmd = format!("password \"Auth\" \"SCRV1:{pw_b64}:{otp_b64}\"");
-            send(&mut writer, &password_cmd)?;
+            let username_cmd =
+                Zeroizing::new(format!("username \"Auth\" \"{}\"", escape_mgmt(user)));
+            send(&mut writer, username_cmd.as_str())?;
+            let pw_b64 = Zeroizing::new(BASE64.encode(pass));
+            let otp_b64 = Zeroizing::new(BASE64.encode(otp));
+            let password_cmd = Zeroizing::new(format!(
+                "password \"Auth\" \"SCRV1:{}:{}\"",
+                pw_b64.as_str(),
+                otp_b64.as_str()
+            ));
+            send(&mut writer, password_cmd.as_str())?;
         } else if trimmed.starts_with(">PASSWORD:Need 'Auth'") {
             // Non-static-challenge auth-user-pass query — plain creds.
-            send(
-                &mut writer,
-                &format!("username \"Auth\" \"{}\"", escape_mgmt(user)),
-            )?;
-            send(
-                &mut writer,
-                &format!("password \"Auth\" \"{}\"", escape_mgmt(pass)),
-            )?;
+            let username_cmd =
+                Zeroizing::new(format!("username \"Auth\" \"{}\"", escape_mgmt(user)));
+            let password_cmd =
+                Zeroizing::new(format!("password \"Auth\" \"{}\"", escape_mgmt(pass)));
+            send(&mut writer, username_cmd.as_str())?;
+            send(&mut writer, password_cmd.as_str())?;
         } else if trimmed.starts_with(">PASSWORD:Verification Failed") {
             return Err(TunnelError::AuthFailed(trimmed.to_string()));
         } else if trimmed.starts_with(">PASSWORD:Need 'Private Key'") {
@@ -343,6 +396,25 @@ pub const OVPN_ERROR_LOG_TAIL_LINES: usize = 5;
 /// Default `--verb` level.
 pub const DEFAULT_OVPN_VERBOSITY: &str = "3";
 
+/// One-shot in-memory credentials for a service-owned static challenge.
+/// Debug, clone, and serde are deliberately unavailable.
+pub struct OpenVpnStaticChallengeCredentials {
+    username: Zeroizing<String>,
+    password: Zeroizing<String>,
+    answer: Secret,
+}
+
+impl OpenVpnStaticChallengeCredentials {
+    #[must_use]
+    pub fn new(username: String, password: String, answer: Secret) -> Self {
+        Self {
+            username: Zeroizing::new(username),
+            password: Zeroizing::new(password),
+            answer,
+        }
+    }
+}
+
 /// `OpenVPN` tunnel implementation.
 ///
 /// Construct with the run-files directory (where the protocol writes
@@ -359,6 +431,17 @@ pub struct OvpnTunnel {
     pub verbosity: String,
     /// Overall connect timeout in seconds.
     pub connect_timeout_secs: u64,
+    /// Canonical control revision assigned before the custodian capability is
+    /// created. Legacy callers leave this unset and retain a random attempt
+    /// generation.
+    generation: Option<u64>,
+    /// Canonical connect operation persisted into the custodian receipt.
+    /// Legacy engine/TUI callers leave this unset.
+    operation_id: Option<OperationId>,
+    /// Shared only to preserve the tunnel carrier's historical `Clone`
+    /// contract; the credential value itself can be taken exactly once.
+    static_challenge_credentials:
+        Option<std::sync::Arc<std::sync::Mutex<Option<OpenVpnStaticChallengeCredentials>>>>,
 }
 
 impl std::fmt::Debug for OvpnTunnel {
@@ -368,6 +451,15 @@ impl std::fmt::Debug for OvpnTunnel {
             .field("auth_dir", &self.auth_dir)
             .field("verbosity", &self.verbosity)
             .field("connect_timeout_secs", &self.connect_timeout_secs)
+            .field("generation", &self.generation)
+            .field("operation_id", &self.operation_id)
+            .field(
+                "static_challenge_credentials",
+                &self
+                    .static_challenge_credentials
+                    .as_ref()
+                    .map(|_| "[REDACTED]"),
+            )
             .finish()
     }
 }
@@ -379,6 +471,9 @@ impl Default for OvpnTunnel {
             auth_dir: None,
             verbosity: DEFAULT_OVPN_VERBOSITY.to_string(),
             connect_timeout_secs: 30,
+            generation: None,
+            operation_id: None,
+            static_challenge_credentials: None,
         }
     }
 }
@@ -411,6 +506,47 @@ impl OvpnTunnel {
     pub fn with_connect_timeout(mut self, secs: u64) -> Self {
         self.connect_timeout_secs = secs;
         self
+    }
+
+    /// Fence the Standard-mode custodian capability to one control revision.
+    #[must_use]
+    pub fn for_generation(mut self, generation: u64) -> Self {
+        self.generation = Some(generation);
+        self
+    }
+
+    /// Bind the managed child to the canonical operation that created it.
+    #[must_use]
+    pub fn for_operation(mut self, operation_id: OperationId) -> Self {
+        self.operation_id = Some(operation_id);
+        self
+    }
+
+    /// Supply the exact one-shot answer delivered by the canonical service.
+    #[must_use]
+    pub fn with_static_challenge_credentials(
+        mut self,
+        credentials: OpenVpnStaticChallengeCredentials,
+    ) -> Self {
+        self.static_challenge_credentials = Some(std::sync::Arc::new(std::sync::Mutex::new(Some(
+            credentials,
+        ))));
+        self
+    }
+
+    fn ownership_id(&self, profile_id: &ProfileId) -> Result<ManagedProcessId, TunnelError> {
+        let mut ownership_id = ManagedProcessId::generate(profile_id.clone()).map_err(|error| {
+            TunnelError::Subprocess(format!("allocate OpenVPN ownership token: {error}"))
+        })?;
+        if let Some(generation) = self.generation {
+            if generation == 0 {
+                return Err(TunnelError::Other(
+                    "canonical OpenVPN generation must be non-zero".into(),
+                ));
+            }
+            ownership_id.generation = generation;
+        }
+        Ok(ownership_id)
     }
 
     /// Recover configured and negotiated DNS intent without conflating an
@@ -821,7 +957,7 @@ impl Tunnel for OvpnTunnel {
 
         // Reject recursive configuration and executable hooks before creating
         // runtime artifacts or spawning any privileged process.
-        let validated_config = validate_managed_config(&profile.config_path)?;
+        let validated_config = prepare_managed_config(profile)?;
         let openvpn_binary = resolve_standard_openvpn_binary()?;
 
         if let Some(parent) = pid_path.parent() {
@@ -871,9 +1007,7 @@ impl Tunnel for OvpnTunnel {
             "ovpn.up"
         );
 
-        let ownership_id = ManagedProcessId::generate(profile.id.clone()).map_err(|error| {
-            TunnelError::Subprocess(format!("allocate OpenVPN ownership token: {error}"))
-        })?;
+        let ownership_id = self.ownership_id(&profile.id)?;
         let effective_config = write_managed_config(profile, &ownership_id, &validated_config)?;
         let mut args = build_ovpn_args(&effective_config, &pid_path, &log_path, &self.verbosity);
         debug!(
@@ -893,13 +1027,43 @@ impl Tunnel for OvpnTunnel {
         //
         // Non-MFA profiles take the existing --auth-user-pass file
         // path unchanged.
-        let bundle_path = self.existing_scrv1_auth_path(profile);
-        let mgmt_creds = if let Some(p) = &bundle_path {
+        let service_creds = self
+            .static_challenge_credentials
+            .as_ref()
+            .map(|slot| {
+                slot.lock()
+                    .map_err(|_| {
+                        TunnelError::Subprocess(
+                            "static-challenge credential slot was poisoned".into(),
+                        )
+                    })?
+                    .take()
+                    .ok_or_else(|| {
+                        TunnelError::Subprocess(
+                            "static-challenge credentials were already consumed".into(),
+                        )
+                    })
+            })
+            .transpose()?;
+        let bundle_path = service_creds
+            .is_none()
+            .then(|| self.existing_scrv1_auth_path(profile))
+            .flatten();
+        let file_creds = if let Some(p) = &bundle_path {
             read_mgmt_credentials_bundle(p)
                 .map_err(|e| TunnelError::Subprocess(format!("mgmt creds bundle: {e}")))?
         } else {
             None
         };
+        let mgmt_creds = service_creds.or_else(|| {
+            file_creds.map(|(username, password, answer)| {
+                OpenVpnStaticChallengeCredentials::new(
+                    username,
+                    password,
+                    Secret::new(answer.into_bytes()),
+                )
+            })
+        });
 
         let mgmt_sock_path = if mgmt_creds.is_some() {
             let path = self.management_socket_path(artifact_key);
@@ -924,14 +1088,24 @@ impl Tunnel for OvpnTunnel {
             }
         }
 
-        let handshake = crate::vortix_process::start_managed_foreground(
-            ownership_id.clone(),
-            privileged_openvpn_command(&openvpn_binary, args),
-            vec![
-                effective_config.clone(),
-                self.management_socket_path(artifact_key),
-            ],
-        );
+        let cleanup_paths = vec![
+            effective_config.clone(),
+            self.management_socket_path(artifact_key),
+        ];
+        let command = privileged_openvpn_command(&openvpn_binary, args);
+        let handshake = match self.operation_id.clone() {
+            Some(operation_id) => crate::vortix_process::start_managed_foreground_for_operation(
+                ownership_id.clone(),
+                command,
+                cleanup_paths,
+                operation_id,
+            ),
+            None => crate::vortix_process::start_managed_foreground(
+                ownership_id.clone(),
+                command,
+                cleanup_paths,
+            ),
+        };
         let handshake = match handshake {
             Ok(handshake) => handshake,
             Err(error) => {
@@ -941,7 +1115,6 @@ impl Tunnel for OvpnTunnel {
         };
 
         if let (Some(creds), Some(sock_path)) = (mgmt_creds, mgmt_sock_path) {
-            let (user, pass, otp) = creds;
             let profile_id_for_log = profile.id.to_string();
             let mgmt_timeout = self.connect_timeout_secs;
             let mgmt_result = (|| -> Result<(), TunnelError> {
@@ -954,9 +1127,9 @@ impl Tunnel for OvpnTunnel {
                 })?;
                 drive_mgmt_auth(
                     stream,
-                    &user,
-                    &pass,
-                    &otp,
+                    creds.username.as_str(),
+                    creds.password.as_str(),
+                    creds.answer.expose(),
                     &profile_id_for_log,
                     mgmt_timeout,
                 )
@@ -1021,7 +1194,7 @@ impl Tunnel for OvpnTunnel {
                 pid: Some(pid),
                 started_at: SystemTime::now(),
                 kind: TunnelKindTag::OpenVpn,
-                generation: 0,
+                generation: ownership_id.generation,
                 handshake: None,
                 probe_receipts: Vec::new(),
                 process_ownership: Some(handshake.identity),
@@ -1138,6 +1311,28 @@ mod tests {
     }
 
     #[test]
+    fn canonical_generation_and_operation_fence_standard_custodian_identity() {
+        let operation: OperationId =
+            serde_json::from_str("\"op-0000000000000001-0000000000000001\"").unwrap();
+        let tunnel = OvpnTunnel::default()
+            .for_generation(41)
+            .for_operation(operation.clone());
+        assert_eq!(tunnel.generation, Some(41));
+        assert_eq!(tunnel.operation_id, Some(operation));
+        assert_eq!(
+            tunnel
+                .ownership_id(&ProfileId::new("corp"))
+                .unwrap()
+                .generation,
+            41
+        );
+        assert!(OvpnTunnel::default()
+            .for_generation(0)
+            .ownership_id(&ProfileId::new("corp"))
+            .is_err());
+    }
+
+    #[test]
     fn sanitize_replaces_unsafe_chars() {
         assert_eq!(
             crate::vortix_core::profile::sanitize_profile_name("hello world"),
@@ -1183,6 +1378,22 @@ mod tests {
         );
         assert!(first_args.contains(&tunnel.pid_path(&first).to_string_lossy().into_owned()));
         assert!(second_args.contains(&tunnel.pid_path(&second).to_string_lossy().into_owned()));
+    }
+
+    #[test]
+    fn in_memory_static_challenge_is_redacted_from_debug() {
+        let tunnel = OvpnTunnel::new(PathBuf::from("/tmp/vortix-test"))
+            .with_static_challenge_credentials(OpenVpnStaticChallengeCredentials::new(
+                "secret-user".into(),
+                "secret-password".into(),
+                Secret::new(b"654321".to_vec()),
+            ));
+
+        let debug = format!("{tunnel:?}");
+        for secret in ["secret-user", "secret-password", "654321"] {
+            assert!(!debug.contains(secret));
+        }
+        assert!(debug.contains("[REDACTED]"));
     }
 
     #[test]
@@ -1333,6 +1544,103 @@ mod tests {
         assert!(!body.contains("dhcp-option DNS"));
         assert!(body.contains("# profile-id: corp"));
         assert!(body.contains(&format!("# ownership-token: {}", "a".repeat(64))));
+    }
+
+    #[test]
+    fn managed_config_rewrites_cached_remote_without_dns() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("corp.ovpn");
+        std::fs::write(&path, "client\nremote vpn.example 1194 udp\n").unwrap();
+        let profile = Profile::new(
+            crate::vortix_core::profile::ProfileId::new("corp"),
+            "corp",
+            crate::vortix_core::profile::ProtocolKind::OpenVpn,
+            path,
+        )
+        .with_endpoint_resolutions([crate::vortix_core::profile::ResolvedEndpoint::new(
+            "vpn.example",
+            1194,
+            "203.0.113.19".parse().unwrap(),
+        )])
+        .require_managed_endpoint_resolution();
+        let identity = ManagedProcessId {
+            profile_id: profile.id.clone(),
+            generation: 7,
+            ownership_token: "a".repeat(64),
+        };
+        let managed = managed_config(&profile, &identity).unwrap();
+        let body = std::fs::read_to_string(&managed).unwrap();
+        assert!(body.contains("remote 203.0.113.19 1194 udp"));
+        assert!(!body.contains("vpn.example"));
+    }
+
+    #[test]
+    fn managed_config_refuses_unresolved_hostname_remote() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("corp.ovpn");
+        std::fs::write(&path, "client\nremote vpn.example 1194 udp\n").unwrap();
+        let profile = Profile::new(
+            crate::vortix_core::profile::ProfileId::new("corp"),
+            "corp",
+            crate::vortix_core::profile::ProtocolKind::OpenVpn,
+            path,
+        )
+        .require_managed_endpoint_resolution();
+        let identity = ManagedProcessId {
+            profile_id: profile.id.clone(),
+            generation: 7,
+            ownership_token: "a".repeat(64),
+        };
+        let error =
+            managed_config(&profile, &identity).expect_err("missing cache must fail closed");
+        assert!(error.to_string().contains("vpn.example:1194"));
+    }
+
+    #[test]
+    fn cached_profile_resolution_reaches_openvpn_managed_config_without_dns() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("corp.ovpn");
+        let body = "client\nremote endpoint.invalid 1194 udp\n";
+        std::fs::write(&path, body).unwrap();
+        let vpn_profile = crate::state::VpnProfile {
+            id: crate::vortix_core::profile::ProfileId::new("corp"),
+            name: "Corporate".into(),
+            protocol: crate::state::Protocol::OpenVPN,
+            location: String::new(),
+            config_path: path,
+            last_used: None,
+        };
+        let digest = crate::vortix_core::control::PolicyDigest::sha256(body.as_bytes()).0;
+        let cache_json = serde_json::json!({
+            "schema_version": 1,
+            "profiles": {
+                "corp": {
+                    "profile_digest": digest,
+                    "endpoints": [{
+                        "hostname": "endpoint.invalid",
+                        "port": 1194,
+                        "address": "203.0.113.19"
+                    }]
+                }
+            }
+        });
+        let encoded = serde_json::to_vec(&cache_json).unwrap();
+        let mut cache =
+            crate::topology_policy::EndpointResolutionCache::decode(Some(&encoded)).unwrap();
+        let topology = crate::topology_policy::topology_for_profile(&vpn_profile, &mut cache)
+            .expect("exact cache entry resolves topology without DNS");
+        let profile = crate::tunnel::profile_view(&vpn_profile)
+            .with_endpoint_resolutions(topology.resolved_endpoints)
+            .require_managed_endpoint_resolution();
+        let identity = ManagedProcessId {
+            profile_id: profile.id.clone(),
+            generation: 7,
+            ownership_token: "a".repeat(64),
+        };
+        let managed = managed_config(&profile, &identity).unwrap();
+        let managed_body = std::fs::read_to_string(managed).unwrap();
+        assert!(managed_body.contains("remote 203.0.113.19 1194 udp"));
+        assert!(!managed_body.contains("endpoint.invalid"));
     }
 
     #[test]

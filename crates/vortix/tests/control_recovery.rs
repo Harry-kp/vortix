@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -7,18 +7,24 @@ use tempfile::tempdir;
 use vortix::vortix_config::control_state::FsControlStateStore;
 use vortix::vortix_core::control::supervisor::Supervisor;
 use vortix::vortix_core::control::worker::{
-    CancellationToken, PolicyBarrier, PolicyExecutor, TopologyPolicy, TunnelExecutionReceipt,
-    TunnelExecutor, TunnelWork,
+    CancellationToken, PolicyBarrier, PolicyExecutor, PolicyStage, TopologyPolicy,
+    TunnelExecutionReceipt, TunnelExecutor, TunnelWork,
 };
 use vortix::vortix_core::control::{
     AdmissionError, AuthorityEpoch, BootConnection, BootEligibility, CommandRequest,
     CompletionError, CompletionOutcome, ControlPersistenceConfig, ControlService,
-    ControlServiceConfig, ControlStateStore, ControlStateStoreError, Deadline, DurableControlState,
-    ExecutionSelection, IdempotencyKey, Observation, OperationCompletion, OperationFailure,
-    OperationStatus, ReadinessError, RecoveredControlState, RequestedTunnelState, UserCommand,
+    ControlServiceConfig, ControlStateStore, ControlStateStoreError, Deadline, DesiredState,
+    DurableControlState, ExecutionSelection, IdempotencyKey, Observation, OperationCompletion,
+    OperationFailure, OperationId, OperationIntent, OperationRecord, OperationStatus, PolicyDigest,
+    ProfileTopology, ReadinessError, RecoveredControlState, RequestedTunnelState,
+    RetentionMetadata, UserCommand,
 };
 use vortix::vortix_core::ports::tunnel::TunnelKindTag;
 use vortix::vortix_core::profile::ProfileId;
+
+fn topology_catalog(profile_id: &ProfileId) -> BTreeMap<ProfileId, ProfileTopology> {
+    BTreeMap::from([(profile_id.clone(), ProfileTopology::default())])
+}
 
 #[derive(Debug, Default)]
 struct RecordingStore {
@@ -139,6 +145,124 @@ impl PolicyExecutor for OkPolicy {
     fn compensate(&self, _policy: &TopologyPolicy, _barrier: PolicyBarrier) {}
 }
 
+#[derive(Default)]
+struct RestartOrder(Mutex<Vec<&'static str>>);
+
+impl TunnelExecutor for RestartOrder {
+    fn execute(
+        &self,
+        work: &TunnelWork,
+        _cancel: &CancellationToken,
+    ) -> Result<TunnelExecutionReceipt, String> {
+        self.0.lock().unwrap().push("tunnel");
+        TunnelExecutionReceipt::attested(
+            work.profile_id.clone(),
+            "tun-restarted-recovery",
+            TunnelKindTag::Mock,
+            None,
+            "restart-recovery-attestation-1",
+        )
+    }
+}
+
+impl PolicyExecutor for RestartOrder {
+    fn apply(&self, policy: &TopologyPolicy, barrier: PolicyBarrier) -> Result<(), String> {
+        if policy.stage == PolicyStage::PreTunnelBlocking && barrier == PolicyBarrier::Blocking {
+            self.0.lock().unwrap().push("preblock");
+        }
+        Ok(())
+    }
+
+    fn compensate(&self, _policy: &TopologyPolicy, _barrier: PolicyBarrier) {}
+}
+
+#[tokio::test]
+async fn same_boot_unexpected_recovery_reconstructs_preblock_before_reconnect() {
+    let profile_id = ProfileId::parse("d".repeat(ProfileId::HEX_LEN)).unwrap();
+    let operation_id: OperationId =
+        serde_json::from_str("\"op-000000000000000b-0000000000000001\"").unwrap();
+    let desired = DesiredState {
+        generation: 7,
+        tunnels: BTreeMap::from([(profile_id.clone(), RequestedTunnelState::Connected)]),
+        kill_switch: vortix::vortix_core::state::killswitch::KillSwitchMode::Auto,
+        authority_epoch: AuthorityEpoch(11),
+        policy_digest: PolicyDigest("restart-recovery-policy".into()),
+    };
+    let operation = OperationRecord {
+        id: operation_id.clone(),
+        idempotency_key: IdempotencyKey::new("persisted-unexpected-recovery"),
+        client_id: serde_json::from_str("\"client-000000000000000b-0000000000000001\"").unwrap(),
+        command_digest: desired.policy_digest.clone(),
+        authority_epoch: AuthorityEpoch(11),
+        desired_generation: desired.generation,
+        admitted_at_millis: 0,
+        deadline_millis: u64::MAX,
+        intent: OperationIntent::UnexpectedRecovery {
+            profile_id: profile_id.clone(),
+            tunnels: desired.tunnels.clone(),
+            kill_switch: Some(desired.kill_switch),
+        },
+        status: OperationStatus::WaitingForObservation,
+        result: None,
+    };
+    let store = Arc::new(RecordingStore {
+        state: Mutex::new(Some(DurableControlState {
+            desired,
+            operations: BTreeMap::from([(operation_id, operation)]),
+            boot_connections: BTreeMap::new(),
+            requested_resources: BTreeMap::new(),
+            tombstones: BTreeMap::new(),
+            retention: RetentionMetadata::default(),
+            reconciliation_required: true,
+        })),
+        ..RecordingStore::default()
+    });
+    let order = Arc::new(RestartOrder::default());
+    let service = ControlService::start_supervised(
+        ControlServiceConfig {
+            authority_epoch: AuthorityEpoch(11),
+            known_profiles: BTreeSet::from([profile_id.clone()]),
+            profile_topologies: topology_catalog(&profile_id),
+            persistence: Some(ControlPersistenceConfig::new("boot-a", store)),
+            retry_initial_backoff: Duration::ZERO,
+            freshness_poll_interval: Duration::from_millis(5),
+            ..ControlServiceConfig::default()
+        },
+        Arc::new(vortix::vortix_core::control::RealClock),
+        ExecutionSelection::CanonicalAuthority,
+        Arc::new(Supervisor::new(
+            AuthorityEpoch(11),
+            order.clone(),
+            order.clone(),
+            1,
+            4,
+        )),
+    );
+    service
+        .observer()
+        .observe(Observation::Tunnel {
+            profile_id,
+            active: false,
+            interface_name: None,
+            observed_at_millis: 0,
+            protection: None,
+        })
+        .await
+        .unwrap();
+    service
+        .completer()
+        .set_readiness(AuthorityEpoch(11), true, true)
+        .await
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while order.0.lock().unwrap().len() < 2 {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(&*order.0.lock().unwrap(), &["preblock", "tunnel"]);
+}
+
 #[tokio::test]
 async fn persistence_failure_keeps_startup_non_admitting() {
     let store = Arc::new(RecordingStore::default());
@@ -243,6 +367,7 @@ async fn desired_intent_is_saved_before_supervised_effect_dispatch() {
         ControlServiceConfig {
             authority_epoch: AuthorityEpoch(8),
             known_profiles: BTreeSet::from([profile_id.clone()]),
+            profile_topologies: topology_catalog(&profile_id),
             persistence: Some(ControlPersistenceConfig::new("boot-a", store.clone())),
             freshness_poll_interval: Duration::from_millis(5),
             ..ControlServiceConfig::default()
@@ -289,6 +414,7 @@ async fn failed_mutation_save_is_retried_before_effect_dispatch() {
         ControlServiceConfig {
             authority_epoch: AuthorityEpoch(11),
             known_profiles: BTreeSet::from([profile_id.clone()]),
+            profile_topologies: topology_catalog(&profile_id),
             persistence: Some(ControlPersistenceConfig::new("boot-a", store.clone())),
             freshness_poll_interval: Duration::from_millis(5),
             ..ControlServiceConfig::default()
@@ -353,6 +479,7 @@ async fn terminal_reply_waits_for_durable_operation_result() {
     let service = ControlService::start(ControlServiceConfig {
         authority_epoch: AuthorityEpoch(12),
         known_profiles: BTreeSet::from([profile_id.clone()]),
+        profile_topologies: topology_catalog(&profile_id),
         persistence: Some(ControlPersistenceConfig::new("boot-a", store.clone())),
         ..ControlServiceConfig::default()
     });
@@ -396,6 +523,7 @@ async fn same_boot_restart_scans_before_resuming_one_nonterminal_operation() {
     let config = ControlServiceConfig {
         authority_epoch: AuthorityEpoch(9),
         known_profiles: BTreeSet::from([profile_id.clone()]),
+        profile_topologies: topology_catalog(&profile_id),
         persistence: Some(ControlPersistenceConfig::new("boot-a", store.clone())),
         freshness_poll_interval: Duration::from_millis(5),
         ..ControlServiceConfig::default()
@@ -493,6 +621,7 @@ async fn new_boot_creates_one_recovery_operation_only_for_eligible_intent() {
     let base_config = ControlServiceConfig {
         authority_epoch: AuthorityEpoch(10),
         known_profiles: BTreeSet::from([profile_id.clone()]),
+        profile_topologies: topology_catalog(&profile_id),
         boot_connections: std::collections::BTreeMap::from([(
             profile_id.clone(),
             BootConnection {
@@ -602,6 +731,7 @@ async fn reboot_uses_current_boot_policy_instead_of_persisted_eligibility() {
     let base = ControlServiceConfig {
         authority_epoch: AuthorityEpoch(13),
         known_profiles: BTreeSet::from([profile_id.clone()]),
+        profile_topologies: topology_catalog(&profile_id),
         boot_connections: std::collections::BTreeMap::from([(profile_id.clone(), enabled)]),
         persistence: Some(ControlPersistenceConfig::new("boot-a", store.clone())),
         ..ControlServiceConfig::default()
@@ -629,6 +759,7 @@ async fn reboot_uses_current_boot_policy_instead_of_persisted_eligibility() {
     let rebooted = ControlService::start(ControlServiceConfig {
         authority_epoch: AuthorityEpoch(13),
         known_profiles: BTreeSet::from([profile_id.clone()]),
+        profile_topologies: topology_catalog(&profile_id),
         boot_connections: std::collections::BTreeMap::from([(
             profile_id.clone(),
             BootConnection {
