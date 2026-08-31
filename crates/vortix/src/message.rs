@@ -196,6 +196,18 @@ pub enum Message {
     /// Toggle kill switch mode (Off → Auto → `AlwaysOn` → Off)
     ToggleKillSwitch,
 
+    /// Switch to the other built-in color theme and persist the choice.
+    ToggleTheme,
+    /// Completion of the background theme-persistence transaction.
+    ThemePersisted {
+        /// Theme active before the user requested the switch.
+        previous: crate::theme::ThemeChoice,
+        /// Theme painted optimistically while the config write runs.
+        selected: crate::theme::ThemeChoice,
+        /// Durable config-write result.
+        result: Result<crate::config::ThemePersistOutcome, String>,
+    },
+
     // === Overlay / Inline-mode Actions (keyboard + action menus) ===
     /// Open profile rename overlay for the selected profile
     OpenRename,
@@ -351,31 +363,6 @@ pub fn get_bulk_actions() -> Vec<ActionMenuItem> {
             message: Message::ToggleKillSwitch,
         },
         ActionMenuItem {
-            key: "S",
-            label: "Background Setup",
-            message: Message::OpenBackgroundSetup,
-        },
-        ActionMenuItem {
-            key: "T",
-            label: "Background Status",
-            message: Message::OpenBackgroundStatus,
-        },
-        ActionMenuItem {
-            key: "E",
-            label: "Background Recover",
-            message: Message::OpenBackgroundRecover,
-        },
-        ActionMenuItem {
-            key: "X",
-            label: "Disable Background",
-            message: Message::OpenBackgroundDisable,
-        },
-        ActionMenuItem {
-            key: "G",
-            label: "Background Diagnostics",
-            message: Message::OpenBackgroundDiagnostics,
-        },
-        ActionMenuItem {
             key: "/",
             label: "Search Profiles",
             message: Message::OpenSearch,
@@ -401,33 +388,6 @@ pub fn get_bulk_actions() -> Vec<ActionMenuItem> {
             message: Message::Quit,
         },
     ]
-}
-
-/// Return global actions admitted by the current typed Background-mode record.
-#[must_use]
-pub fn get_bulk_actions_for(
-    permitted: &[crate::background::BackgroundAction],
-) -> Vec<ActionMenuItem> {
-    get_bulk_actions()
-        .into_iter()
-        .filter(|item| {
-            let required = match &item.message {
-                Message::OpenBackgroundSetup => Some(crate::background::BackgroundAction::Setup),
-                Message::OpenBackgroundStatus => Some(crate::background::BackgroundAction::Status),
-                Message::OpenBackgroundRecover => {
-                    Some(crate::background::BackgroundAction::Recover)
-                }
-                Message::OpenBackgroundDiagnostics => {
-                    Some(crate::background::BackgroundAction::Diagnostics)
-                }
-                Message::OpenBackgroundDisable => {
-                    Some(crate::background::BackgroundAction::Disable)
-                }
-                _ => None,
-            };
-            required.is_none_or(|required| permitted.contains(&required))
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -487,20 +447,19 @@ mod tests {
         assert!(actions.iter().any(|a| a.key == "q")); // quit
         assert!(actions.iter().any(|a| a.key == "y")); // copy IP
         assert!(actions.iter().any(|a| a.key == "K")); // kill switch
+        assert!(!actions
+            .iter()
+            .any(|a| { matches!(a.message, Message::ToggleTheme) }));
         assert!(actions.iter().any(|a| a.key == "/")); // search
         assert!(actions.iter().any(|a| a.key == "?")); // help
-    }
-
-    #[test]
-    fn typed_mode_actions_filter_background_entries_only() {
-        let actions = get_bulk_actions_for(&[
-            crate::background::BackgroundAction::Status,
-            crate::background::BackgroundAction::Diagnostics,
-        ]);
-        assert!(actions.iter().any(|action| action.key == "T"));
-        assert!(actions.iter().any(|action| action.key == "G"));
-        assert!(!actions.iter().any(|action| action.key == "S"));
-        assert!(actions.iter().any(|action| action.key == "i"));
+        assert!(!actions.iter().any(|action| matches!(
+            action.message,
+            Message::OpenBackgroundSetup
+                | Message::OpenBackgroundStatus
+                | Message::OpenBackgroundRecover
+                | Message::OpenBackgroundDisable
+                | Message::OpenBackgroundDiagnostics
+        )));
     }
 
     #[test]
@@ -511,6 +470,7 @@ mod tests {
             .map(|action| action.key)
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(keys.len(), actions.len());
+        assert!(actions.len() <= 16, "bulk menu must fit at 80x24");
     }
 
     #[test]

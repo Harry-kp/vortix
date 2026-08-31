@@ -830,6 +830,119 @@ fn confirmed_prepared_background_mutations_have_nonzero_refusal_contract() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+#[allow(
+    unsafe_code,
+    reason = "the test must hold the same advisory lock as a running Vortix process"
+)]
+fn second_tui_reports_an_actionable_already_running_message() {
+    use std::io::Read as _;
+    use std::os::fd::AsRawFd as _;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let config = tempfile::tempdir().unwrap();
+    // The lock refusal must win before config parsing or startup mutation.
+    std::fs::write(config.path().join("config.toml"), b"not valid toml = [").unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(config.path().join("lifecycle.lock"))
+        .unwrap();
+    // SAFETY: `lock` owns a valid open descriptor for the duration of the
+    // child process. `flock` neither aliases nor dereferences Rust memory.
+    let result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(result, 0);
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_vortix")) // xtask:allow-subprocess: black-box second-instance UX contract
+        .arg("--config-dir")
+        .arg(config.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("second Vortix instance did not refuse the lock within 5 seconds");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_end(&mut stdout)
+        .unwrap();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_end(&mut stderr)
+        .unwrap();
+
+    assert_eq!(status.code(), Some(ExitCode::StateConflict.code()));
+    assert!(
+        stdout.is_empty(),
+        "unexpected stdout: {}",
+        String::from_utf8_lossy(&stdout)
+    );
+    let stderr = String::from_utf8_lossy(&stderr);
+    assert_eq!(
+        stderr.trim(),
+        "Another Vortix process is managing VPN state. Close the running Vortix session or wait for its command to finish, then try again.",
+        "unexpected stderr: {stderr}"
+    );
+    assert!(!stderr.contains("Resource temporarily unavailable"));
+    assert!(!stderr.contains("Backtrace"));
+    assert!(!stderr.contains("Location:"));
+}
+
+#[cfg(unix)]
+#[test]
+fn tui_without_administrator_access_fails_before_terminal_startup() {
+    if vortix::utils::is_root() {
+        // The production contract is exercised by non-root macOS and Linux CI
+        // runners. A root-only test environment cannot reproduce this entry
+        // condition without changing process credentials.
+        return;
+    }
+
+    let config = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_vortix")) // xtask:allow-subprocess: black-box non-root TUI startup UX contract
+        .arg("--config-dir")
+        .arg(config.path())
+        .env("VORTIX_SKIP_MIGRATION", "1")
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(ExitCode::PermissionDenied.code())
+    );
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.trim(),
+        "Vortix needs administrator access to manage VPN connections.\nTry again with: sudo vortix"
+    );
+    assert!(!stderr.contains("Standard-mode"));
+    assert!(!stderr.contains("invalid invoking owner"));
+    assert!(!stderr.contains("Backtrace"));
+    assert!(!stderr.contains("Location:"));
+}
+
 fn walk_file_names(root: &std::path::Path) -> Vec<String> {
     let mut pending = vec![root.to_path_buf()];
     let mut names = Vec::new();

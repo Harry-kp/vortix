@@ -5,9 +5,9 @@ use crate::theme;
 use crate::ui::helpers::centered_rect;
 use ratatui::{
     layout::{Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
+    widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
     Frame,
 };
 use std::path::PathBuf;
@@ -17,7 +17,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     let area = centered_rect(85, 85, frame.area());
 
     // Clear the background
-    frame.render_widget(Clear, area);
+    crate::ui::helpers::clear_area(frame, area);
 
     // Read directly from the cached view; if the user opened the viewer
     // with no profile selected (or read failed in OpenConfig and stashed
@@ -43,7 +43,7 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::BORDER_FOCUSED))
+        .border_style(Style::default().fg(theme::current().border_focused))
         .title(title)
         .title_bottom(Line::from(" [Esc] Close  [↑/↓] Scroll ").centered());
 
@@ -51,7 +51,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     frame.render_widget(block, area);
 
     // Show the file path at the top
-    let path_style = Style::default().fg(Color::DarkGray);
+    let path_style = Style::default().fg(theme::current().key_hint_desc);
 
     // Lines + count come straight from the cache built in `OpenConfig`.
     // No file re-read, no per-line re-highlighting per frame.
@@ -63,7 +63,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         None => (vec![highlight_config_line("No config loaded")], 1),
     };
     let paragraph = Paragraph::new(lines)
-        .style(Style::default().fg(theme::TEXT_PRIMARY))
+        .style(Style::default().fg(theme::current().text_primary))
         .scroll((app.config_scroll, 0));
 
     // Add path hint at bottom
@@ -79,8 +79,14 @@ pub fn render(frame: &mut Frame, app: &App) {
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("Path: ", path_style),
-            Span::styled(path_display, Style::default().fg(theme::TEXT_SECONDARY)),
-            Span::styled(scroll_info, Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                path_display,
+                Style::default().fg(theme::current().text_secondary),
+            ),
+            Span::styled(
+                scroll_info,
+                Style::default().fg(theme::current().key_hint_desc),
+            ),
         ])),
         content_area[0],
     );
@@ -93,8 +99,8 @@ pub fn render(frame: &mut Frame, app: &App) {
         .orientation(ScrollbarOrientation::VerticalRight)
         .begin_symbol(Some("↑"))
         .end_symbol(Some("↓"))
-        .style(Style::default().fg(theme::NORD_POLAR_NIGHT_4))
-        .thumb_style(Style::default().fg(theme::ACCENT_PRIMARY));
+        .style(Style::default().fg(theme::current().nord_polar_night_4))
+        .thumb_style(Style::default().fg(theme::current().accent_primary));
 
     let mut scrollbar_state =
         ScrollbarState::new(total_lines.saturating_sub(content_area[1].height as usize))
@@ -123,7 +129,10 @@ pub(crate) fn highlight_config_line(line: &str) -> Line<'static> {
 
     // Comments
     if trimmed.starts_with('#') || trimmed.starts_with(';') {
-        return Line::from(Span::styled(line, Style::default().fg(Color::DarkGray)));
+        return Line::from(Span::styled(
+            line,
+            Style::default().fg(theme::current().inactive),
+        ));
     }
 
     // Section headers [Interface], [Peer], etc.
@@ -131,7 +140,7 @@ pub(crate) fn highlight_config_line(line: &str) -> Line<'static> {
         return Line::from(Span::styled(
             line,
             Style::default()
-                .fg(theme::NORD_YELLOW)
+                .fg(theme::current().yellow)
                 .add_modifier(Modifier::BOLD),
         ));
     }
@@ -145,9 +154,15 @@ pub(crate) fn highlight_config_line(line: &str) -> Line<'static> {
         let masked_value = mask_sensitive_value(key.trim(), value.trim());
 
         return Line::from(vec![
-            Span::styled(key.to_string(), Style::default().fg(theme::NORD_FROST_2)),
-            Span::styled("=", Style::default().fg(Color::DarkGray)),
-            Span::styled(masked_value, Style::default().fg(theme::TEXT_PRIMARY)),
+            Span::styled(
+                key.to_string(),
+                Style::default().fg(theme::current().accent_primary),
+            ),
+            Span::styled("=", Style::default().fg(theme::current().separator)),
+            Span::styled(
+                masked_value,
+                Style::default().fg(theme::current().text_primary),
+            ),
         ]);
     }
 
@@ -186,21 +201,27 @@ pub(crate) fn highlight_config_line(line: &str) -> Line<'static> {
                 return Line::from(vec![
                     Span::styled(
                         directive.to_string(),
-                        Style::default().fg(theme::NORD_FROST_2),
+                        Style::default().fg(theme::current().accent_primary),
                     ),
                     Span::styled(" ", Style::default()),
                     Span::styled(
                         parts[1].to_string(),
-                        Style::default().fg(theme::TEXT_PRIMARY),
+                        Style::default().fg(theme::current().text_primary),
                     ),
                 ]);
             }
-            return Line::from(Span::styled(line, Style::default().fg(theme::NORD_FROST_2)));
+            return Line::from(Span::styled(
+                line,
+                Style::default().fg(theme::current().accent_primary),
+            ));
         }
     }
 
     // Default: just return the line
-    Line::from(Span::styled(line, Style::default().fg(theme::TEXT_PRIMARY)))
+    Line::from(Span::styled(
+        line,
+        Style::default().fg(theme::current().text_primary),
+    ))
 }
 
 /// Mask sensitive values like private keys

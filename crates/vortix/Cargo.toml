@@ -70,6 +70,7 @@ serde_json = { workspace = true }
 
 # Configuration
 toml = { workspace = true }
+toml_edit = { workspace = true }
 
 # Unicode display-width (for footer hint budgeting with multi-byte glyphs)
 unicode-width = { workspace = true }

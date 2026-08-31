@@ -8,7 +8,7 @@ use crate::ui::helpers::centered_rect_fixed;
 use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState},
+    widgets::{Block, Borders, List, ListItem, ListState},
     Frame,
 };
 
@@ -29,12 +29,12 @@ pub fn render(
     let area = centered_rect_fixed(menu_width, menu_height, frame.area());
 
     // Clear background
-    frame.render_widget(Clear, area);
+    crate::ui::helpers::clear_area(frame, area);
 
     // Build the block
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::BORDER_FOCUSED))
+        .border_style(Style::default().fg(theme::current().border_focused))
         .title(format!(" {title} "));
 
     let inner = block.inner(area);
@@ -44,7 +44,7 @@ pub fn render(
     let list_items: Vec<ListItem> = if items.is_empty() {
         vec![ListItem::new(Line::from(vec![Span::styled(
             " No actions available ",
-            Style::default().fg(theme::NORD_POLAR_NIGHT_4),
+            Style::default().fg(theme::current().nord_polar_night_4),
         )]))]
     } else {
         items
@@ -54,11 +54,14 @@ pub fn render(
                     Span::styled(
                         format!(" {} ", item.key),
                         Style::default()
-                            .fg(theme::ACCENT_PRIMARY)
+                            .fg(theme::current().accent_primary)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::raw(" "),
-                    Span::styled(item.label, Style::default().fg(theme::TEXT_PRIMARY)),
+                    Span::styled(
+                        item.label,
+                        Style::default().fg(theme::current().text_primary),
+                    ),
                 ]);
                 ListItem::new(line)
             })
@@ -73,8 +76,8 @@ pub fn render(
         let list = list
             .highlight_style(
                 Style::default()
-                    .bg(theme::ROW_SELECTED_BG)
-                    .fg(theme::ROW_SELECTED_FG)
+                    .bg(theme::current().row_selected_bg)
+                    .fg(theme::current().row_selected_fg)
                     .add_modifier(Modifier::BOLD),
             )
             .highlight_symbol("▶ ");

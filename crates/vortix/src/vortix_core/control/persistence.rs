@@ -14,6 +14,8 @@ use crate::vortix_core::control::model::{
 };
 use crate::vortix_core::profile::ProfileId;
 
+pub(crate) const MAX_DURABLE_OPERATIONS: usize = 512;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BootEligibility {

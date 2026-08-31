@@ -78,7 +78,10 @@ impl App {
                         // once here; aggressive scrolling later reads from
                         // this cache instead of re-parsing the file every
                         // keystroke (see `CachedConfigView` doc).
-                        self.cached_config = Some(super::CachedConfigView::from_content(content));
+                        self.cached_config = Some(super::CachedConfigView::from_content(
+                            content,
+                            self.runtime.config.theme,
+                        ));
                     }
                     self.show_config = true;
                     self.config_scroll = 0;
@@ -381,6 +384,12 @@ impl App {
             }
 
             Message::ToggleKillSwitch => self.handle_toggle_killswitch(),
+            Message::ToggleTheme => self.handle_toggle_theme(),
+            Message::ThemePersisted {
+                previous,
+                selected,
+                result,
+            } => self.handle_theme_persisted(previous, selected, result),
 
             Message::OpenRename => self.handle_open_rename(),
             Message::OpenSearch => {
@@ -457,6 +466,106 @@ impl App {
             .map_err(|error| error.to_string());
             let _ = tx.send(Message::BackgroundDiagnosticsLoaded(result));
         });
+    }
+
+    fn handle_toggle_theme(&mut self) {
+        if self.pending_theme_change.is_some() {
+            self.show_toast(
+                "The color theme is still being saved".into(),
+                ToastType::Info,
+            );
+            return;
+        }
+        let current = self.runtime.config.theme;
+        let next = current.next();
+        self.runtime.config.theme = next;
+        self.pending_theme_change = Some(super::PendingThemeChange {
+            previous: current,
+            selected: next,
+            quit_after: false,
+        });
+        if let Some(cached) = self.cached_config.take() {
+            self.cached_config = Some(super::CachedConfigView::from_content(cached.content, next));
+        }
+
+        let config_dir = self.runtime.config_dir.clone();
+        let tx = self.runtime.cmd_tx.clone();
+        let worker = std::thread::Builder::new()
+            .name("vortix-theme-persist".into())
+            .spawn(move || {
+                let result = crate::config::persist_theme_choice(&config_dir, next);
+                let _ = tx.send(Message::ThemePersisted {
+                    previous: current,
+                    selected: next,
+                    result,
+                });
+            });
+        if let Err(error) = worker {
+            self.pending_theme_change = None;
+            self.runtime.config.theme = current;
+            if let Some(cached) = self.cached_config.take() {
+                self.cached_config = Some(super::CachedConfigView::from_content(
+                    cached.content,
+                    current,
+                ));
+            }
+            self.show_toast(
+                format!(
+                    "Couldn't start the color-theme save; restored {}: {error}",
+                    current.display_name()
+                ),
+                ToastType::Error,
+            );
+        }
+    }
+
+    fn handle_theme_persisted(
+        &mut self,
+        previous: crate::theme::ThemeChoice,
+        selected: crate::theme::ThemeChoice,
+        result: Result<crate::config::ThemePersistOutcome, String>,
+    ) {
+        let Some(pending) = self.pending_theme_change else {
+            return;
+        };
+        if pending.previous != previous || pending.selected != selected {
+            return;
+        }
+        self.pending_theme_change = None;
+        match result {
+            Ok(crate::config::ThemePersistOutcome::Durable) => self.show_toast(
+                format!("Color theme: {}", selected.display_name()),
+                ToastType::Success,
+            ),
+            Ok(crate::config::ThemePersistOutcome::PublishedDurabilityUncertain(error)) => {
+                self.show_toast(
+                    format!(
+                        "Color theme changed to {}, but crash-safe disk confirmation failed: {error}",
+                        selected.display_name()
+                    ),
+                    ToastType::Warning,
+                );
+            }
+            Err(error) => {
+                self.runtime.config.theme = previous;
+                if let Some(cached) = self.cached_config.take() {
+                    self.cached_config = Some(super::CachedConfigView::from_content(
+                        cached.content,
+                        previous,
+                    ));
+                }
+                self.show_toast(
+                    format!(
+                        "Couldn't save the color theme; restored {}: {error}",
+                        previous.display_name()
+                    ),
+                    ToastType::Error,
+                );
+            }
+        }
+        if pending.quit_after {
+            self.should_quit = true;
+        }
     }
 
     fn handle_manage_auth(&mut self) {
@@ -779,7 +888,20 @@ impl App {
         }
     }
     fn handle_quit(&mut self) {
-        self.should_quit = true;
+        if let Some(pending) = &mut self.pending_theme_change {
+            if pending.quit_after {
+                self.should_quit = true;
+                return;
+            }
+            pending.quit_after = true;
+            self.show_toast(
+                "Finishing the color-theme save before quitting; press Ctrl-C again to quit now"
+                    .into(),
+                ToastType::Info,
+            );
+        } else {
+            self.should_quit = true;
+        }
     }
 
     #[allow(clippy::too_many_lines)] // TEA-style dispatch — every arm is one telemetry variant; splitting would obscure the handler shape without simplifying it

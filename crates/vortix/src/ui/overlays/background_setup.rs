@@ -9,7 +9,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Block, Borders, Paragraph, Wrap},
     Frame,
 };
 
@@ -67,10 +67,10 @@ pub fn render(frame: &mut Frame, mode: &BackgroundModeRecord, state: &Background
     let width = outer.width.saturating_sub(2).min(74);
     let height = outer.height.saturating_sub(2).min(22);
     let area = centered_rect_fixed(width.max(30), height.max(10), outer);
-    frame.render_widget(Clear, area);
+    crate::ui::helpers::clear_area(frame, area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::BORDER_FOCUSED))
+        .border_style(Style::default().fg(theme::current().border_focused))
         .title(format!(" {} ", state.workflow.title()));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -91,8 +91,8 @@ pub fn render(frame: &mut Frame, mode: &BackgroundModeRecord, state: &Background
             Span::styled(
                 format!("[ {label} ]"),
                 Style::default()
-                    .fg(theme::ROW_SELECTED_FG)
-                    .bg(theme::ROW_SELECTED_BG)
+                    .fg(theme::current().row_selected_fg)
+                    .bg(theme::current().row_selected_bg)
                     .add_modifier(Modifier::BOLD),
             )
         } else {

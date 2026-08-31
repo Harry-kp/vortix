@@ -5,7 +5,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, Borders, Paragraph},
     Frame,
 };
 
@@ -31,7 +31,7 @@ pub fn render(frame: &mut Frame, config: ConfirmDialogConfig) {
         height,
     };
 
-    frame.render_widget(Clear, overlay);
+    crate::ui::helpers::clear_area(frame, overlay);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -48,18 +48,18 @@ pub fn render(frame: &mut Frame, config: ConfirmDialogConfig) {
 
     let yes_style = if config.confirm_selected {
         Style::default()
-            .fg(Color::Black)
+            .fg(theme::current().text_dark)
             .bg(config.border_color)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(theme::TEXT_SECONDARY)
+        Style::default().fg(theme::current().text_secondary)
     };
     let no_style = if config.confirm_selected {
-        Style::default().fg(theme::TEXT_SECONDARY)
+        Style::default().fg(theme::current().text_secondary)
     } else {
         Style::default()
-            .fg(Color::Black)
-            .bg(theme::ACCENT_PRIMARY)
+            .fg(theme::current().text_dark)
+            .bg(theme::current().accent_primary)
             .add_modifier(Modifier::BOLD)
     };
 

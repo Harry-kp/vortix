@@ -52,6 +52,7 @@ fn test_app() -> App {
         action_menu_state: ratatui::widgets::ListState::default(),
         config_scroll: 0,
         cached_config: None,
+        pending_theme_change: None,
         search_match_count: 0,
         profile_list_state: ratatui::widgets::TableState::default(),
         panel_areas: std::collections::HashMap::new(),
@@ -2006,7 +2007,8 @@ fn cached_config_view_precomputes_total_lines_and_highlighted_vec() {
     use crate::app::CachedConfigView;
 
     let content = "[Interface]\nAddress = 10.0.0.2/24\nPrivateKey = abc\n\n[Peer]\nPublicKey = def\nAllowedIPs = 0.0.0.0/0\n";
-    let view = CachedConfigView::from_content(content.to_string());
+    let view =
+        CachedConfigView::from_content(content.to_string(), crate::theme::ThemeChoice::Synthwave);
 
     assert_eq!(view.total_lines, 7, "total_lines must be pre-computed");
     assert_eq!(
@@ -2032,7 +2034,10 @@ fn get_config_max_scroll_reads_from_cache() {
         let _ = writeln!(content, "line {i}");
     }
     app.terminal_size = (120, 40);
-    app.cached_config = Some(CachedConfigView::from_content(content));
+    app.cached_config = Some(CachedConfigView::from_content(
+        content,
+        crate::theme::ThemeChoice::Synthwave,
+    ));
 
     let max = app.get_config_max_scroll();
     assert!(
@@ -2361,6 +2366,146 @@ fn rapid_canonical_killswitch_toggles_compose_from_pending_intent() {
         app.pending_control_killswitch_mode,
         Some(crate::state::KillSwitchMode::AlwaysOn)
     );
+}
+
+#[test]
+fn theme_toggle_persists_restyles_cached_content_and_reports_success() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = test_app();
+    app.runtime.config_dir = temp.path().to_path_buf();
+    app.runtime.config.theme = crate::theme::ThemeChoice::Synthwave;
+    app.cached_config = Some(CachedConfigView::from_content(
+        "[Interface]\nAddress = 10.0.0.2/24\n".to_string(),
+        crate::theme::ThemeChoice::Synthwave,
+    ));
+
+    app.handle_key(key_char('p'));
+
+    // The palette changes immediately; durable config I/O finishes on the
+    // command worker so it cannot stall input or rendering.
+    assert_eq!(
+        app.runtime.config.theme,
+        crate::theme::ThemeChoice::Terminal
+    );
+    assert!(!app.show_bulk_menu);
+    assert!(app.pending_theme_change.is_some());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while app.pending_theme_change.is_some() && std::time::Instant::now() < deadline {
+        app.process_external();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(app.pending_theme_change.is_none());
+    assert_eq!(
+        crate::config::load_config(temp.path()).unwrap().theme,
+        crate::theme::ThemeChoice::Terminal
+    );
+    assert_eq!(
+        app.cached_config.as_ref().unwrap().highlighted_lines[0].spans[0]
+            .style
+            .fg,
+        Some(crate::theme::TERMINAL.yellow)
+    );
+    let toast = app.toast.as_ref().unwrap();
+    assert_eq!(toast.toast_type, ToastType::Success);
+    assert_eq!(toast.message, "Color theme: Terminal");
+}
+
+#[test]
+fn theme_toggle_failure_keeps_the_current_theme() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = test_app();
+    app.runtime.config_dir = temp.path().join("missing");
+    app.runtime.config.theme = crate::theme::ThemeChoice::Synthwave;
+
+    app.handle_message(Message::ToggleTheme);
+
+    assert_eq!(
+        app.runtime.config.theme,
+        crate::theme::ThemeChoice::Terminal
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while app.pending_theme_change.is_some() && std::time::Instant::now() < deadline {
+        app.process_external();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(app.pending_theme_change.is_none());
+    assert_eq!(
+        app.runtime.config.theme,
+        crate::theme::ThemeChoice::Synthwave
+    );
+    assert_eq!(app.toast.as_ref().unwrap().toast_type, ToastType::Error);
+}
+
+#[test]
+fn second_theme_toggle_waits_for_the_pending_save() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = test_app();
+    app.runtime.config_dir = temp.path().to_path_buf();
+    app.runtime.config.theme = crate::theme::ThemeChoice::Synthwave;
+
+    app.handle_message(Message::ToggleTheme);
+    let pending = app.pending_theme_change;
+    app.handle_message(Message::ToggleTheme);
+
+    assert_eq!(
+        app.runtime.config.theme,
+        crate::theme::ThemeChoice::Terminal
+    );
+    assert_eq!(app.pending_theme_change, pending);
+    assert_eq!(app.toast.as_ref().unwrap().toast_type, ToastType::Info);
+    assert_eq!(
+        app.toast.as_ref().unwrap().message,
+        "The color theme is still being saved"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while app.pending_theme_change.is_some() && std::time::Instant::now() < deadline {
+        app.process_external();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(app.pending_theme_change.is_none());
+}
+
+#[test]
+fn quit_waits_for_in_flight_theme_persistence() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = test_app();
+    app.runtime.config_dir = temp.path().to_path_buf();
+    app.runtime.config.theme = crate::theme::ThemeChoice::Synthwave;
+
+    app.handle_message(Message::ToggleTheme);
+    app.handle_message(Message::Quit);
+
+    assert!(!app.should_quit);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !app.should_quit && std::time::Instant::now() < deadline {
+        app.process_external();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(app.should_quit);
+    assert_eq!(
+        crate::config::load_config(temp.path()).unwrap().theme,
+        crate::theme::ThemeChoice::Terminal
+    );
+}
+
+#[test]
+fn second_quit_does_not_wait_for_theme_persistence() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut app = test_app();
+    app.runtime.config_dir = temp.path().to_path_buf();
+
+    app.handle_message(Message::ToggleTheme);
+    app.handle_message(Message::Quit);
+    assert!(!app.should_quit);
+
+    app.handle_message(Message::Quit);
+    assert!(app.should_quit);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while app.pending_theme_change.is_some() && std::time::Instant::now() < deadline {
+        app.process_external();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
 }
 
 #[test]

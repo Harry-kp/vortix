@@ -82,7 +82,7 @@ impl Sigil {
     }
 
     fn value_color(self) -> Color {
-        crate::ui::sigils::sigil(self.id()).color
+        crate::ui::sigils::sigil(self.id()).color()
     }
 }
 
@@ -212,7 +212,7 @@ fn classify_cipher(cipher: &str) -> CipherStrength {
 fn section_header(name: &'static str) -> Line<'static> {
     Line::from(Span::styled(
         name.to_string(),
-        Style::default().fg(theme::ACCENT_PRIMARY),
+        Style::default().fg(theme::current().accent_primary),
     ))
 }
 
@@ -231,7 +231,10 @@ fn audit_row(label: &str, value: &str, sigil: Sigil, inner_width: usize) -> Line
     let sigil_col = format!("{} ", sigil.glyph());
 
     Line::from(vec![
-        Span::styled(label_col, Style::default().fg(theme::TEXT_SECONDARY)),
+        Span::styled(
+            label_col,
+            Style::default().fg(theme::current().text_secondary),
+        ),
         Span::styled(value_truncated, Style::default().fg(sigil.value_color())),
         Span::raw(padding),
         Span::styled(sigil_col, sigil.style()),
@@ -325,7 +328,10 @@ fn alarm_subline(text: &str, inner_width: usize) -> Line<'static> {
     let truncated = utils::truncate(text, budget);
     Line::from(vec![
         Span::raw(indent),
-        Span::styled(truncated, Style::default().fg(theme::TEXT_SECONDARY)),
+        Span::styled(
+            truncated,
+            Style::default().fg(theme::current().text_secondary),
+        ),
     ])
 }
 
@@ -337,7 +343,10 @@ fn footer_line(secs: Option<u64>) -> Line<'static> {
         Some(s) => format!("Updated {}m ago", s / 60),
         None => "Updated pending…".to_string(),
     };
-    Line::from(Span::styled(text, Style::default().fg(Color::DarkGray)))
+    Line::from(Span::styled(
+        text,
+        Style::default().fg(theme::current().key_hint_desc),
+    ))
 }
 
 // ── PanelState: the polished panel's read-only input ────────────────────────
@@ -415,20 +424,20 @@ impl Verdict {
             Self::Protected => Line::from(Span::styled(
                 "  PROTECTED",
                 Style::default()
-                    .fg(theme::SUCCESS)
+                    .fg(theme::current().success)
                     .add_modifier(Modifier::BOLD),
             )),
             Self::Partial => Line::from(Span::styled(
                 "  PARTIAL",
                 Style::default()
-                    .fg(theme::WARNING)
+                    .fg(theme::current().warning)
                     .add_modifier(Modifier::BOLD),
             )),
             Self::Exposed => Line::from(Span::styled(
                 " ⚠ EXPOSED ",
                 Style::default()
-                    .bg(theme::WARNING)
-                    .fg(Color::Black)
+                    .bg(theme::current().warning)
+                    .fg(theme::current().text_dark)
                     .add_modifier(Modifier::BOLD),
             )),
         }
@@ -439,9 +448,9 @@ impl Verdict {
 pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     let is_focused = app.should_draw_focus(&crate::app::FocusedPanel::Security);
     let border_style = if is_focused {
-        Style::default().fg(theme::BORDER_FOCUSED)
+        Style::default().fg(theme::current().border_focused)
     } else {
-        Style::default().fg(theme::BORDER_DEFAULT)
+        Style::default().fg(theme::current().border_default)
     };
 
     if app.effective_flipped(&crate::app::FocusedPanel::Security) {
@@ -965,7 +974,7 @@ fn build_exposed_audit(app: &App, inner_width: u16) -> Vec<Line<'static>> {
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "Connect to a profile to protect this traffic.",
-        Style::default().fg(theme::TEXT_SECONDARY),
+        Style::default().fg(theme::current().text_secondary),
     )));
 
     lines
@@ -1043,7 +1052,7 @@ fn render_back(frame: &mut Frame, app: &App, area: Rect, border_style: Style) {
         .title_bottom(
             Line::from(Span::styled(
                 constants::FLIP_BACK_HINT,
-                Style::default().fg(theme::KEY_HINT_DESC),
+                Style::default().fg(theme::current().key_hint_desc),
             ))
             .right_aligned(),
         );
@@ -1058,35 +1067,35 @@ fn render_back(frame: &mut Frame, app: &App, area: Rect, border_style: Style) {
             Line::from(Span::styled(
                 "Active Connections Audit",
                 Style::default()
-                    .fg(theme::ACCENT_PRIMARY)
+                    .fg(theme::current().accent_primary)
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
             Line::from(Span::styled(
                 "  Per-socket VPN routing verification",
-                Style::default().fg(theme::TEXT_SECONDARY),
+                Style::default().fg(theme::current().text_secondary),
             )),
             Line::from(Span::styled(
                 "  will be available in a future release.",
-                Style::default().fg(theme::TEXT_SECONDARY),
+                Style::default().fg(theme::current().text_secondary),
             )),
             Line::from(""),
             Line::from(Span::styled(
                 "  This view will show which connections",
-                Style::default().fg(theme::TEXT_SECONDARY),
+                Style::default().fg(theme::current().text_secondary),
             )),
             Line::from(Span::styled(
                 "  are routed through the VPN tunnel vs",
-                Style::default().fg(theme::TEXT_SECONDARY),
+                Style::default().fg(theme::current().text_secondary),
             )),
             Line::from(Span::styled(
                 "  bypassing it (split-tunnel detection).",
-                Style::default().fg(theme::TEXT_SECONDARY),
+                Style::default().fg(theme::current().text_secondary),
             )),
             Line::from(""),
             Line::from(Span::styled(
                 "  See: github.com/Harry-kp/vortix/issues/168",
-                Style::default().fg(theme::NORD_POLAR_NIGHT_4),
+                Style::default().fg(theme::current().nord_polar_night_4),
             )),
         ]
     } else {
@@ -1094,17 +1103,17 @@ fn render_back(frame: &mut Frame, app: &App, area: Rect, border_style: Style) {
             Line::from(Span::styled(
                 "Active Connections Audit",
                 Style::default()
-                    .fg(theme::INACTIVE)
+                    .fg(theme::current().inactive)
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
             Line::from(Span::styled(
                 "  Connect to a VPN to see",
-                Style::default().fg(theme::TEXT_SECONDARY),
+                Style::default().fg(theme::current().text_secondary),
             )),
             Line::from(Span::styled(
                 "  connection routing details.",
-                Style::default().fg(theme::TEXT_SECONDARY),
+                Style::default().fg(theme::current().text_secondary),
             )),
         ]
     };

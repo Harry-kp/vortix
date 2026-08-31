@@ -24,7 +24,7 @@ use crate::vortix_core::control::model::{
 };
 use crate::vortix_core::control::persistence::{
     ControlStateStore, DurableControlState, PersistedTombstone, RequestedResources,
-    RetentionMetadata,
+    RetentionMetadata, MAX_DURABLE_OPERATIONS,
 };
 use crate::vortix_core::control::reconcile::{
     plan_reconciliation, DisconnectTombstone, InFlightMutation, ObservationOwnership,
@@ -255,8 +255,8 @@ impl Default for ControlServiceConfig {
         Self {
             command_capacity: 64,
             event_capacity: 128,
-            max_operations: 512,
-            max_idempotency_keys: 512,
+            max_operations: MAX_DURABLE_OPERATIONS,
+            max_idempotency_keys: MAX_DURABLE_OPERATIONS,
             max_challenges: 16,
             max_observed_profiles: 512,
             known_profiles: BTreeSet::new(),
@@ -433,6 +433,12 @@ struct AdmissionState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OperationReservationError {
+    RetentionFull,
+    IdentifierExhausted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProfileOperationKind {
     Lifecycle,
     Mutation,
@@ -503,17 +509,65 @@ impl AdmissionState {
         self.retained_operations = self.retained_operations.saturating_sub(1);
         Some(operation_id)
     }
-}
 
-fn next_operation_id(
-    admission: &mut AdmissionState,
-    authority_epoch: AuthorityEpoch,
-) -> Option<OperationId> {
-    admission.next_operation = admission.next_operation.checked_add(1)?;
-    Some(OperationId::from_parts(
-        authority_epoch,
-        admission.next_operation,
-    ))
+    fn compact_to_fit(
+        &mut self,
+        max_operations: usize,
+        max_idempotency_keys: usize,
+    ) -> Option<Vec<OperationId>> {
+        let operation_slots = self
+            .retained_operations
+            .saturating_add(1)
+            .saturating_sub(max_operations);
+        let idempotency_slots = self
+            .idempotency
+            .len()
+            .saturating_add(1)
+            .saturating_sub(max_idempotency_keys);
+        let required = operation_slots.max(idempotency_slots);
+        (self.terminal_operations.len() >= required).then(|| {
+            (0..required)
+                .map(|_| {
+                    self.compact_one()
+                        .expect("terminal operation count was checked")
+                })
+                .collect()
+        })
+    }
+
+    fn reserve_operation<'a>(
+        &mut self,
+        scope: IdempotencyScope,
+        command_digest: PolicyDigest,
+        active_profiles: impl IntoIterator<Item = &'a ProfileId>,
+        operation_kind: ProfileOperationKind,
+        config: &ControlServiceConfig,
+    ) -> Result<(OperationId, Vec<OperationId>), OperationReservationError> {
+        let sequence = self
+            .next_operation
+            .checked_add(1)
+            .ok_or(OperationReservationError::IdentifierExhausted)?;
+        let evicted = self
+            .compact_to_fit(config.max_operations, config.max_idempotency_keys)
+            .ok_or(OperationReservationError::RetentionFull)?;
+        self.next_operation = sequence;
+        let operation_id = OperationId::from_parts(scope.authority_epoch, sequence);
+        self.retained_operations = self.retained_operations.saturating_add(1);
+        self.idempotency.insert(
+            scope,
+            IdempotencyBinding {
+                operation_id: operation_id.clone(),
+                command_digest,
+            },
+        );
+        for profile_id in active_profiles {
+            self.active_profile_operations
+                .entry(profile_id.clone())
+                .or_default()
+                .insert(operation_id.clone(), operation_kind);
+        }
+        Ok((operation_id, evicted))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1199,36 +1253,24 @@ impl ControlHandle {
                     });
                 }
             }
-            let mut evicted = Vec::new();
-            while admission.retained_operations >= config.max_operations
-                || admission.idempotency.len() >= config.max_idempotency_keys
-            {
-                let Some(operation_id) = admission.compact_one() else {
-                    return Err(AdmissionError::RetentionFull);
-                };
-                evicted.push(operation_id);
-            }
-            let operation_id = next_operation_id(&mut admission, config.authority_epoch)
-                .ok_or(AdmissionError::IdentifierExhausted)?;
+            let (operation_id, evicted) = admission
+                .reserve_operation(
+                    scope,
+                    command_digest.clone(),
+                    &target_profiles,
+                    operation_kind,
+                    &config,
+                )
+                .map_err(|error| match error {
+                    OperationReservationError::RetentionFull => AdmissionError::RetentionFull,
+                    OperationReservationError::IdentifierExhausted => {
+                        AdmissionError::IdentifierExhausted
+                    }
+                })?;
             if let Some(profile_id) = command_profile(&request.command) {
                 if profile_mutation_for_command(&request.command).is_none() {
                     config.known_profiles.insert(profile_id.clone());
                 }
-            }
-            admission.retained_operations = admission.retained_operations.saturating_add(1);
-            admission.idempotency.insert(
-                scope,
-                IdempotencyBinding {
-                    operation_id: operation_id.clone(),
-                    command_digest: command_digest.clone(),
-                },
-            );
-            for profile_id in &target_profiles {
-                admission
-                    .active_profile_operations
-                    .entry(profile_id.clone())
-                    .or_default()
-                    .insert(operation_id.clone(), operation_kind);
             }
             (
                 operation_id,
@@ -2266,9 +2308,29 @@ async fn persist_control_state_if_changed(
     let store = Arc::clone(&persistence.store);
     let boot_id = persistence.boot_id.clone();
     let state = candidate.clone();
-    let saved = tokio::task::spawn_blocking(move || store.save(&boot_id, &state))
-        .await
-        .is_ok_and(|result| result.is_ok());
+    let saved = match tokio::task::spawn_blocking(move || store.save(&boot_id, &state)).await {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            tracing::error!(
+                target: "vortix::control::persistence",
+                %error,
+                operation_count = candidate.operations.len(),
+                max_operations = config.max_operations,
+                "durable control state persistence failed"
+            );
+            false
+        }
+        Err(error) => {
+            tracing::error!(
+                target: "vortix::control::persistence",
+                %error,
+                operation_count = candidate.operations.len(),
+                max_operations = config.max_operations,
+                "durable control state persistence task failed"
+            );
+            false
+        }
+    };
     if saved {
         *durable = candidate;
         return true;
@@ -5781,32 +5843,34 @@ fn expire_operations(
         {
             continue;
         }
-        let recovery_id = {
-            let mut state = admission.lock().expect("admission mutex poisoned");
-            let Some(operation_id) =
-                next_operation_id(&mut state, snapshot.desired.authority_epoch)
-            else {
-                state.readiness.reconciliation_complete = false;
-                snapshot.readiness.reconciliation_complete = false;
-                return;
-            };
-            operation_id
+        let idempotency_key = IdempotencyKey::new(format!(
+            "service-recovery-{}-{now}",
+            snapshot.desired.generation
+        ));
+        let command_digest = snapshot.desired.policy_digest.clone();
+        let Some(recovery_id) = reserve_service_operation(
+            snapshot,
+            owner,
+            admission,
+            config,
+            &idempotency_key,
+            &command_digest,
+            None,
+        ) else {
+            mark_reconciliation_incomplete(snapshot, admission);
+            return;
         };
-        let recovery_deadline = now.saturating_add(30_000);
         snapshot.operations.insert(
             recovery_id.clone(),
             OperationRecord {
                 id: recovery_id.clone(),
-                idempotency_key: IdempotencyKey::new(format!(
-                    "service-recovery-{}-{now}",
-                    snapshot.desired.generation
-                )),
+                idempotency_key,
                 client_id: ClientId::from_parts(snapshot.desired.authority_epoch, 0),
-                command_digest: snapshot.desired.policy_digest.clone(),
+                command_digest,
                 authority_epoch: snapshot.desired.authority_epoch,
                 desired_generation: snapshot.desired.generation,
                 admitted_at_millis: now,
-                deadline_millis: recovery_deadline,
+                deadline_millis: now.saturating_add(30_000),
                 intent: intent_for_desired_state(snapshot),
                 status: OperationStatus::WaitingForObservation,
                 result: None,
@@ -5842,6 +5906,52 @@ fn interactive_connected_profiles(
         .collect()
 }
 
+fn reserve_service_operation(
+    snapshot: &mut ControlSnapshot,
+    owner: &mut OwnerState,
+    admission: &Arc<Mutex<AdmissionState>>,
+    config: &ControlServiceConfig,
+    idempotency_key: &IdempotencyKey,
+    command_digest: &PolicyDigest,
+    active_profiles: Option<&BTreeSet<ProfileId>>,
+) -> Option<OperationId> {
+    let authority_epoch = snapshot.desired.authority_epoch;
+    let client_id = ClientId::from_parts(authority_epoch, 0);
+    let (operation_id, evicted) = {
+        let mut state = admission.lock().expect("admission mutex poisoned");
+        state
+            .reserve_operation(
+                IdempotencyScope {
+                    client_id,
+                    authority_epoch,
+                    key: idempotency_key.clone(),
+                },
+                command_digest.clone(),
+                active_profiles.into_iter().flatten(),
+                ProfileOperationKind::Lifecycle,
+                config,
+            )
+            .ok()?
+    };
+    for evicted_id in evicted {
+        snapshot.operations.remove(&evicted_id);
+        owner.release_operation_admission(&evicted_id);
+    }
+    Some(operation_id)
+}
+
+fn mark_reconciliation_incomplete(
+    snapshot: &mut ControlSnapshot,
+    admission: &Arc<Mutex<AdmissionState>>,
+) {
+    admission
+        .lock()
+        .expect("admission mutex poisoned")
+        .readiness
+        .reconciliation_complete = false;
+    snapshot.readiness.reconciliation_complete = false;
+}
+
 /// Start a policy-owned retry only after the user-visible operation reached a
 /// typed terminal. This keeps idempotent callers from waiting until expiry,
 /// while preserving level-triggered convergence for unchanged desired state.
@@ -5864,23 +5974,27 @@ fn start_recovery_operation(
     {
         return;
     }
-    let recovery_id = {
-        let mut state = admission.lock().expect("admission mutex poisoned");
-        let Some(operation_id) = next_operation_id(&mut state, snapshot.desired.authority_epoch)
-        else {
-            state.readiness.reconciliation_complete = false;
-            snapshot.readiness.reconciliation_complete = false;
-            return;
-        };
-        operation_id
+    let idempotency_key = IdempotencyKey::new(format!("service-recovery-{generation}-{now}"));
+    let command_digest = snapshot.desired.policy_digest.clone();
+    let Some(recovery_id) = reserve_service_operation(
+        snapshot,
+        owner,
+        admission,
+        config,
+        &idempotency_key,
+        &command_digest,
+        None,
+    ) else {
+        mark_reconciliation_incomplete(snapshot, admission);
+        return;
     };
     snapshot.operations.insert(
         recovery_id.clone(),
         OperationRecord {
             id: recovery_id.clone(),
-            idempotency_key: IdempotencyKey::new(format!("service-recovery-{generation}-{now}")),
+            idempotency_key,
             client_id: ClientId::from_parts(snapshot.desired.authority_epoch, 0),
-            command_digest: snapshot.desired.policy_digest.clone(),
+            command_digest,
             authority_epoch: snapshot.desired.authority_epoch,
             desired_generation: generation,
             admitted_at_millis: now,
@@ -5949,36 +6063,33 @@ fn admit_unexpected_loss_recovery(
     // command or escape the same level-triggered retry loop.
     let recovery_profiles = desired_connected_profiles(snapshot);
 
-    let recovery_id = {
-        let mut state = admission.lock().expect("admission mutex poisoned");
-        let Some(operation_id) = next_operation_id(&mut state, snapshot.desired.authority_epoch)
-        else {
-            state.readiness.reconciliation_complete = false;
-            snapshot.readiness.reconciliation_complete = false;
-            return;
-        };
-        for owned_profile in &recovery_profiles {
-            state
-                .active_profile_operations
-                .entry(owned_profile.clone())
-                .or_default()
-                .insert(operation_id.clone(), ProfileOperationKind::Lifecycle);
-        }
-        operation_id
+    let generation = snapshot.desired.generation;
+    let idempotency_key = IdempotencyKey::new(format!(
+        "unexpected-loss-recovery-{}-{generation}-{now}",
+        profile_id.as_str()
+    ));
+    let command_digest = snapshot.desired.policy_digest.clone();
+    let Some(recovery_id) = reserve_service_operation(
+        snapshot,
+        owner,
+        admission,
+        config,
+        &idempotency_key,
+        &command_digest,
+        Some(&recovery_profiles),
+    ) else {
+        mark_reconciliation_incomplete(snapshot, admission);
+        return;
     };
     let retry_budget = u64::try_from(config.retry_budget.as_millis()).unwrap_or(u64::MAX);
     let retry_backoff = u64::try_from(config.retry_initial_backoff.as_millis()).unwrap_or(u64::MAX);
-    let generation = snapshot.desired.generation;
     snapshot.operations.insert(
         recovery_id.clone(),
         OperationRecord {
             id: recovery_id.clone(),
-            idempotency_key: IdempotencyKey::new(format!(
-                "unexpected-loss-recovery-{}-{generation}-{now}",
-                profile_id.as_str()
-            )),
+            idempotency_key,
             client_id: ClientId::from_parts(snapshot.desired.authority_epoch, 0),
-            command_digest: snapshot.desired.policy_digest.clone(),
+            command_digest,
             authority_epoch: snapshot.desired.authority_epoch,
             desired_generation: generation,
             admitted_at_millis: now,

@@ -84,6 +84,39 @@ fn main() -> Result<()> {
     // Store the resolved config dir globally so all utility functions use it
     config::set_config_dir(config_dir.clone());
 
+    // A no-command invocation owns the canonical local control service. Take
+    // its writer lock at the first safe point after resolving the authoritative
+    // config directory, before migration, journals, or other shared-state work.
+    let _tui_lifecycle_lock = if args.command.is_none() {
+        Some(match vortix::utils::acquire_lifecycle_lock() {
+            Ok(lock) => lock,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                eprintln!("{}", vortix::utils::lifecycle_lock_user_message(&error));
+                std::process::exit(cli::output::ExitCode::StateConflict.code());
+            }
+            Err(error) => {
+                return Err(color_eyre::eyre::eyre!(
+                    "{}",
+                    vortix::utils::lifecycle_lock_user_message(&error)
+                ));
+            }
+        })
+    } else {
+        None
+    };
+
+    // The foreground TUI owns the privileged local control service in this
+    // release. Refuse before profile migration or terminal setup so an
+    // ordinary launch cannot flash a screen and then expose an internal
+    // root-ownership error. The lifecycle-lock check deliberately wins when
+    // another Vortix session is already active; read-only CLI commands remain
+    // available without administrator access.
+    if args.command.is_none() && !vortix::utils::is_root() {
+        eprintln!("Vortix needs administrator access to manage VPN connections.");
+        eprintln!("Try again with: sudo vortix");
+        std::process::exit(cli::output::ExitCode::PermissionDenied.code());
+    }
+
     // Settings use the same authoritative directory as profiles and
     // config.toml. Resolve this only after clap/env/sudo-user selection so an
     // old default-path settings file can never silently override
@@ -229,7 +262,6 @@ fn main() -> Result<()> {
             std::process::exit(1);
         }
     };
-
     // Determine output mode from global flags
     let output_mode = if args.json {
         cli::output::OutputMode::Json
@@ -251,15 +283,6 @@ fn main() -> Result<()> {
         );
         std::process::exit(exit_code);
     }
-
-    // Standard-mode TUI and CLI share the same cross-process writer lock. The
-    // TUI holds it for the lifetime of its one canonical in-process service.
-    // Acquisition is fail-fast because a TUI session has no bounded duration.
-    let _lifecycle_lock = vortix::utils::acquire_lifecycle_lock().map_err(|error| {
-        color_eyre::eyre::eyre!(
-            "another vortix lifecycle writer is active; close it or wait for its command to finish ({error})"
-        )
-    })?;
 
     // Run the TUI application
     let terminal = init_terminal()?;
@@ -360,7 +383,7 @@ fn run_tui(
         use ratatui::text::{Line, Span};
         use ratatui::widgets::{Block, Borders, Paragraph};
 
-        let theme = vortix::theme::current();
+        let theme = config.theme.render_palette();
         let content = vec![
             Line::from(Span::styled(
                 format!("{} v{}", constants::APP_NAME, constants::APP_VERSION),
@@ -505,6 +528,7 @@ fn init_tracing() {
 }
 
 fn init_terminal() -> Result<ratatui::DefaultTerminal> {
+    vortix::theme::configure_for_terminal();
     let mut terminal = ratatui::init();
     crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
     terminal.clear()?;

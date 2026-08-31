@@ -340,6 +340,10 @@ impl StagedWireGuardRuntime {
         &self.config_path
     }
 
+    pub(crate) fn interface_name(&self) -> Option<&str> {
+        self.config_path.file_stem()?.to_str()
+    }
+
     pub(crate) fn cleanup(&mut self) -> Result<(), WireGuardStagingError> {
         self.remove_checked()
     }

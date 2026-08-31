@@ -205,6 +205,17 @@ impl ProductionHelperExecutor {
                 !matches!(error, WireGuardCommandError::Spawn),
             );
         }
+        let interface = runtime
+            .interface_name()
+            .ok_or(PrivilegedExecutionError::InvalidPlan)?;
+        if let Err(error) = crate::platform::detach_helper_interface_from_desktop_manager(interface)
+        {
+            tracing::warn!(
+                ?error,
+                interface,
+                "NetworkManager retained a helper-created WireGuard interface"
+            );
+        }
         let observation = match self.observe_tunnel(&tunnel, ProtocolKind::WireGuard) {
             Ok(observation) => observation,
             Err(error) => {

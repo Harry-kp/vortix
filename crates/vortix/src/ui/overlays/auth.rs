@@ -4,7 +4,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, Borders, Paragraph},
     Frame,
 };
 
@@ -77,7 +77,7 @@ pub fn render(
     ])
     .split(popup_layout[1])[1];
 
-    frame.render_widget(Clear, popup_area);
+    crate::ui::helpers::clear_area(frame, popup_area);
 
     let (title, footer) = if connect_after {
         (constants::TITLE_AUTH_PROMPT, constants::TITLE_AUTH_FOOTER)
@@ -90,7 +90,7 @@ pub fn render(
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::ACCENT_PRIMARY))
+        .border_style(Style::default().fg(theme::current().accent_primary))
         .title(format!(" {title} "))
         .title_bottom(Line::from(format!(" {footer} ")).centered());
 
@@ -117,10 +117,10 @@ pub fn render(
 
             let label_style = if focused {
                 Style::default()
-                    .fg(theme::ACCENT_PRIMARY)
+                    .fg(theme::current().accent_primary)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(theme::TEXT_SECONDARY)
+                Style::default().fg(theme::current().text_secondary)
             };
 
             // Truncate over-long labels to keep the value column aligned;
@@ -140,7 +140,7 @@ pub fn render(
             let mut spans: Vec<Span<'static>> = vec![
                 Span::styled(
                     format!("   {marker} "),
-                    Style::default().fg(theme::ACCENT_PRIMARY),
+                    Style::default().fg(theme::current().accent_primary),
                 ),
                 Span::styled(label_text, label_style),
                 Span::raw("  "),
@@ -158,18 +158,18 @@ pub fn render(
                 let after: String = display_text.chars().skip(cursor + 1).collect();
                 spans.push(Span::styled(
                     before,
-                    Style::default().fg(theme::TEXT_PRIMARY),
+                    Style::default().fg(theme::current().text_primary),
                 ));
                 spans.push(Span::styled(
                     cursor_char,
                     Style::default()
-                        .fg(theme::ACCENT_SECONDARY)
+                        .fg(theme::current().accent_secondary)
                         .add_modifier(Modifier::REVERSED)
                         .add_modifier(Modifier::SLOW_BLINK),
                 ));
                 spans.push(Span::styled(
                     after,
-                    Style::default().fg(theme::TEXT_PRIMARY),
+                    Style::default().fg(theme::current().text_primary),
                 ));
             } else {
                 // Non-focused rows: show the value muted; empty values
@@ -180,7 +180,10 @@ pub fn render(
                 } else {
                     display_text
                 };
-                spans.push(Span::styled(shown, Style::default().fg(theme::INACTIVE)));
+                spans.push(Span::styled(
+                    shown,
+                    Style::default().fg(theme::current().inactive),
+                ));
             }
             Line::from(spans)
         };
@@ -194,11 +197,14 @@ pub fn render(
         Span::styled(
             profile_name.to_string(),
             Style::default()
-                .fg(theme::ACCENT_PRIMARY)
+                .fg(theme::current().accent_primary)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled("  ·  ", Style::default().fg(theme::INACTIVE)),
-        Span::styled("OpenVPN", Style::default().fg(theme::TEXT_SECONDARY)),
+        Span::styled("  ·  ", Style::default().fg(theme::current().inactive)),
+        Span::styled(
+            "OpenVPN",
+            Style::default().fg(theme::current().text_secondary),
+        ),
     ]));
     text.push(Line::from(""));
 
@@ -235,16 +241,19 @@ pub fn render(
         "\u{2610}" // ☐
     };
     let (marker, marker_style) = if checkbox_focused {
-        ("\u{25B8}", Style::default().fg(theme::ACCENT_PRIMARY))
+        (
+            "\u{25B8}",
+            Style::default().fg(theme::current().accent_primary),
+        )
     } else {
-        (" ", Style::default().fg(theme::ACCENT_PRIMARY))
+        (" ", Style::default().fg(theme::current().accent_primary))
     };
     let checkbox_style = if checkbox_focused {
         Style::default()
-            .fg(theme::ACCENT_PRIMARY)
+            .fg(theme::current().accent_primary)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(theme::TEXT_SECONDARY)
+        Style::default().fg(theme::current().text_secondary)
     };
     text.push(Line::from(vec![
         Span::styled(format!("   {marker} "), marker_style),

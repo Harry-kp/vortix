@@ -1,9 +1,10 @@
 use crate::constants;
+use crate::theme;
 use ratatui::{
     layout::{Alignment, Constraint, Layout},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, Borders, Paragraph},
     Frame,
 };
 
@@ -23,11 +24,11 @@ pub fn render(frame: &mut Frame, action: &str) {
     ])
     .split(popup_layout[1])[1];
 
-    frame.render_widget(Clear, popup_area);
+    crate::ui::helpers::clear_area(frame, popup_area);
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Red))
+        .border_style(Style::default().fg(theme::current().error))
         .title(" Elevated Privileges Required ");
 
     let inner = block.inner(popup_area);
@@ -45,7 +46,9 @@ pub fn render(frame: &mut Frame, action: &str) {
         Line::from(vec![
             Span::styled(
                 " ACCESS DENIED: ",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme::current().error)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw(format!(
                 "{} needs root privileges to {action}.",
@@ -66,7 +69,7 @@ pub fn render(frame: &mut Frame, action: &str) {
             Span::styled(
                 format!("sudo {}", constants::APP_NAME),
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(theme::current().key_hint)
                     .add_modifier(Modifier::BOLD),
             ),
         ]),
@@ -76,7 +79,7 @@ pub fn render(frame: &mut Frame, action: &str) {
             Span::styled(
                 "[Esc]",
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(theme::current().key_hint)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" to return to dashboard."),

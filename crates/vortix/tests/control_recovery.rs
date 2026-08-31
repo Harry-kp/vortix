@@ -16,7 +16,7 @@ use vortix::vortix_core::control::{
     ControlServiceConfig, ControlStateStore, ControlStateStoreError, Deadline, DesiredState,
     DurableControlState, ExecutionSelection, GateEvidence, IdempotencyKey, Observation,
     OperationCompletion, OperationFailure, OperationId, OperationIntent, OperationRecord,
-    OperationStatus, PolicyDigest, ProfileMutation, ProfileMutationApplied,
+    OperationResult, OperationStatus, PolicyDigest, ProfileMutation, ProfileMutationApplied,
     ProfileMutationExecutor, ProfileMutationFailure, ProfileMutationWork, ProfileTopology,
     ProtectionEvidence, ReadinessError, RecoveredControlState, RequestedTunnelState,
     RetentionMetadata, UserCommand,
@@ -26,6 +26,38 @@ use vortix::vortix_core::profile::ProfileId;
 
 fn topology_catalog(profile_id: &ProfileId) -> BTreeMap<ProfileId, ProfileTopology> {
     BTreeMap::from([(profile_id.clone(), ProfileTopology::default())])
+}
+
+fn retained_terminal_operation(
+    authority_epoch: AuthorityEpoch,
+    desired_generation: u64,
+    command_digest: &PolicyDigest,
+    sequence: u64,
+) -> (OperationId, OperationRecord) {
+    let operation_id =
+        OperationId::parse(format!("op-{:016x}-{sequence:016x}", authority_epoch.0)).unwrap();
+    let client_id = serde_json::from_str(&format!(
+        "\"client-{:016x}-{sequence:016x}\"",
+        authority_epoch.0
+    ))
+    .unwrap();
+    (
+        operation_id.clone(),
+        OperationRecord {
+            id: operation_id,
+            idempotency_key: IdempotencyKey::new(format!("retained-{sequence}")),
+            client_id,
+            command_digest: command_digest.clone(),
+            authority_epoch,
+            desired_generation,
+            admitted_at_millis: 0,
+            deadline_millis: u64::MAX,
+            intent: OperationIntent::GenerationScoped,
+            status: OperationStatus::Succeeded,
+            result: Some(OperationResult::ObservedConvergence),
+            failure_detail: None,
+        },
+    )
 }
 
 #[derive(Debug, Default)]
@@ -360,6 +392,93 @@ async fn persistence_failure_keeps_startup_non_admitting() {
             .unwrap_err(),
         AdmissionError::NotReady
     );
+}
+
+#[tokio::test]
+async fn full_durable_history_compacts_before_startup_recovery_is_persisted() {
+    let directory = tempdir().unwrap();
+    let store = Arc::new(FsControlStateStore::new(directory.path().join("control")));
+    let authority_epoch = AuthorityEpoch(19);
+    let desired = DesiredState {
+        generation: 1,
+        authority_epoch,
+        policy_digest: PolicyDigest(format!("sha256:{}", "a".repeat(64))),
+        ..DesiredState::default()
+    };
+    let oldest_operation_id = OperationId::parse("op-0000000000000013-0000000000000001").unwrap();
+    let live_operation_id = OperationId::parse("op-0000000000000013-0000000000000200").unwrap();
+    let mut operations: BTreeMap<OperationId, OperationRecord> = (1_u64..=511)
+        .map(|sequence| {
+            retained_terminal_operation(
+                authority_epoch,
+                desired.generation,
+                &desired.policy_digest,
+                sequence,
+            )
+        })
+        .collect();
+    operations.insert(
+        live_operation_id.clone(),
+        OperationRecord {
+            id: live_operation_id.clone(),
+            idempotency_key: IdempotencyKey::new("live-operation"),
+            client_id: serde_json::from_str("\"client-0000000000000013-0000000000000200\"")
+                .unwrap(),
+            command_digest: desired.policy_digest.clone(),
+            authority_epoch,
+            desired_generation: 0,
+            admitted_at_millis: 0,
+            deadline_millis: u64::MAX,
+            intent: OperationIntent::GenerationScoped,
+            status: OperationStatus::WaitingForObservation,
+            result: None,
+            failure_detail: None,
+        },
+    );
+    store
+        .save(
+            "boot-a",
+            &DurableControlState {
+                desired,
+                operations,
+                boot_connections: BTreeMap::new(),
+                requested_resources: BTreeMap::new(),
+                last_connected_at: BTreeMap::new(),
+                tombstones: BTreeMap::new(),
+                retention: RetentionMetadata::default(),
+                reconciliation_required: true,
+            },
+        )
+        .unwrap();
+    let service = ControlService::start_supervised(
+        ControlServiceConfig {
+            authority_epoch,
+            persistence: Some(ControlPersistenceConfig::new("boot-a", store.clone())),
+            ..ControlServiceConfig::default()
+        },
+        Arc::new(vortix::vortix_core::control::RealClock),
+        ExecutionSelection::CanonicalAuthority,
+        Arc::new(Supervisor::new(
+            authority_epoch,
+            Arc::new(CountingExecutor(Arc::new(AtomicUsize::new(0)))),
+            Arc::new(OkPolicy),
+            1,
+            4,
+        )),
+    );
+
+    service
+        .completer()
+        .set_readiness(authority_epoch, true, true)
+        .await
+        .expect("startup recovery must compact terminal history before persisting");
+    let snapshot = service.client().snapshot();
+    assert_eq!(snapshot.operations.len(), 512);
+    assert!(!snapshot.operations.contains_key(&oldest_operation_id));
+    assert!(snapshot.operations.contains_key(&live_operation_id));
+    let recovered = store.load("boot-a").unwrap().unwrap();
+    assert_eq!(recovered.state.operations.len(), 512);
+    assert_eq!(recovered.state.retention.compacted_operations, 1);
 }
 
 #[tokio::test]

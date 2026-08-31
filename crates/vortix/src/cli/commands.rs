@@ -977,16 +977,27 @@ fn handle_up(
 fn acquire_lifecycle_lock_or_exit(mode: OutputMode, command: &str) -> crate::utils::LifecycleLock {
     match crate::utils::acquire_lifecycle_lock() {
         Ok(file) => file,
-        Err(e) => print_error_and_exit(
-            mode,
-            command,
-            CliError {
-                code: "lock_failed",
-                message: format!("Could not acquire the vortix lifecycle lock: {e}"),
-                hint: Some("Check permissions on the vortix config directory.".into()),
-            },
-            ExitCode::GeneralError,
-        ),
+        Err(error) => {
+            let busy = error.kind() == std::io::ErrorKind::WouldBlock;
+            print_error_and_exit(
+                mode,
+                command,
+                CliError {
+                    code: if busy {
+                        "already_running"
+                    } else {
+                        "lock_failed"
+                    },
+                    message: crate::utils::lifecycle_lock_user_message(&error),
+                    hint: (!busy).then(|| "Check ownership of the Vortix config directory.".into()),
+                },
+                if busy {
+                    ExitCode::StateConflict
+                } else {
+                    ExitCode::GeneralError
+                },
+            )
+        }
     }
 }
 

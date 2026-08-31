@@ -12,7 +12,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Clear, Paragraph},
+    widgets::Paragraph,
     Frame,
 };
 
@@ -31,7 +31,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         frame.render_widget(
             Paragraph::new(msg)
                 .alignment(Alignment::Center)
-                .style(Style::default().fg(theme::ACCENT_PRIMARY)),
+                .style(Style::default().fg(theme::current().accent_primary)),
             centered_rect(80, 30, area),
         );
         return;
@@ -123,7 +123,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     // Render Zoomed Panel Overlay (if active)
     if let Some(panel) = &app.zoomed_panel {
         let zoom_area = centered_rect(90, 90, frame.area());
-        frame.render_widget(Clear, zoom_area);
+        crate::ui::helpers::clear_area(frame, zoom_area);
 
         match panel {
             FocusedPanel::Sidebar => sidebar::render(frame, app, zoom_area),
@@ -171,7 +171,7 @@ fn render_animated_panel(
 ) {
     if let Some(state) = app.flip_states.get(panel) {
         if state.is_animating() {
-            frame.render_widget(Clear, area);
+            crate::ui::helpers::clear_area(frame, area);
             let narrow = animated_rect(area, state.width_ratio());
             if narrow.width >= constants::FLIP_ANIMATION_MIN_WIDTH {
                 render_fn(frame, app, narrow);
@@ -225,13 +225,13 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
                             Span::styled(
                                 truncated,
                                 Style::default()
-                                    .fg(theme::ACCENT_PRIMARY)
+                                    .fg(theme::current().accent_primary)
                                     .add_modifier(Modifier::BOLD),
                             ),
                             Span::raw("?"),
                         ]),
                     ],
-                    border_color: theme::ERROR,
+                    border_color: theme::current().error,
                     confirm_selected: *confirm_selected,
                     width: dialog_w,
                     height: 7,
@@ -304,65 +304,74 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
                     title: " Already connected ",
                     body: vec![
                         Line::from(vec![
-                            Span::styled(to_t1, Style::default().fg(theme::SUCCESS)),
+                            Span::styled(to_t1, Style::default().fg(theme::current().success)),
                             Span::styled(
                                 " also wants to handle all",
-                                Style::default().fg(theme::TEXT_SECONDARY),
+                                Style::default().fg(theme::current().text_secondary),
                             ),
                         ]),
                         Line::from(vec![Span::styled(
                             "your internet traffic.",
-                            Style::default().fg(theme::TEXT_SECONDARY),
+                            Style::default().fg(theme::current().text_secondary),
                         )]),
                         Line::from(""),
                         Line::from(vec![
                             Span::styled(
                                 "[Y] Switch ",
                                 Style::default()
-                                    .fg(theme::SUCCESS)
+                                    .fg(theme::current().success)
                                     .add_modifier(ratatui::style::Modifier::BOLD),
                             ),
                             Span::styled(
                                 "— disconnect ",
-                                Style::default().fg(theme::TEXT_SECONDARY),
+                                Style::default().fg(theme::current().text_secondary),
                             ),
-                            Span::styled(from_t1, Style::default().fg(theme::ACCENT_PRIMARY)),
+                            Span::styled(
+                                from_t1,
+                                Style::default().fg(theme::current().accent_primary),
+                            ),
                             Span::styled(
                                 ", then connect ",
-                                Style::default().fg(theme::TEXT_SECONDARY),
+                                Style::default().fg(theme::current().text_secondary),
                             ),
-                            Span::styled(to_t2, Style::default().fg(theme::SUCCESS)),
+                            Span::styled(to_t2, Style::default().fg(theme::current().success)),
                         ]),
                         Line::from(vec![
                             Span::styled(
                                 "[B] Connect both ",
                                 Style::default()
-                                    .fg(theme::ACCENT_PRIMARY)
+                                    .fg(theme::current().accent_primary)
                                     .add_modifier(ratatui::style::Modifier::BOLD),
                             ),
-                            Span::styled("— ", Style::default().fg(theme::TEXT_SECONDARY)),
-                            Span::styled(to_t3, Style::default().fg(theme::SUCCESS)),
+                            Span::styled(
+                                "— ",
+                                Style::default().fg(theme::current().text_secondary),
+                            ),
+                            Span::styled(to_t3, Style::default().fg(theme::current().success)),
                             Span::styled(
                                 " becomes active;",
-                                Style::default().fg(theme::TEXT_SECONDARY),
+                                Style::default().fg(theme::current().text_secondary),
                             ),
                         ]),
                         Line::from(vec![
                             Span::styled("    ", Style::default()),
-                            Span::styled(from_t2, Style::default().fg(theme::ACCENT_PRIMARY)),
+                            Span::styled(
+                                from_t2,
+                                Style::default().fg(theme::current().accent_primary),
+                            ),
                             Span::styled(
                                 " stays connected as split tunnel",
-                                Style::default().fg(theme::TEXT_SECONDARY),
+                                Style::default().fg(theme::current().text_secondary),
                             ),
                         ]),
                         Line::from(vec![Span::styled(
                             "[N] Cancel",
                             Style::default()
-                                .fg(theme::TEXT_SECONDARY)
+                                .fg(theme::current().text_secondary)
                                 .add_modifier(ratatui::style::Modifier::BOLD),
                         )]),
                     ],
-                    border_color: theme::WARNING,
+                    border_color: theme::current().warning,
                     confirm_selected: *confirm_selected,
                     width: 64,
                     height: 12,
@@ -410,21 +419,33 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
                     title: " Route Overlap ",
                     body: vec![
                         Line::from(vec![
-                            Span::styled("Connect ", Style::default().fg(theme::TEXT_SECONDARY)),
-                            Span::styled(to_t, Style::default().fg(theme::SUCCESS)),
+                            Span::styled(
+                                "Connect ",
+                                Style::default().fg(theme::current().text_secondary),
+                            ),
+                            Span::styled(to_t, Style::default().fg(theme::current().success)),
                             Span::styled(
                                 " — overlaps with ",
-                                Style::default().fg(theme::TEXT_SECONDARY),
+                                Style::default().fg(theme::current().text_secondary),
                             ),
-                            Span::styled(with_t, Style::default().fg(theme::ACCENT_PRIMARY)),
+                            Span::styled(
+                                with_t,
+                                Style::default().fg(theme::current().accent_primary),
+                            ),
                         ]),
                         Line::from(vec![
-                            Span::styled("on ", Style::default().fg(theme::TEXT_SECONDARY)),
-                            Span::styled(cidr_summary, Style::default().fg(theme::WARNING)),
-                            Span::styled("?", Style::default().fg(theme::TEXT_SECONDARY)),
+                            Span::styled(
+                                "on ",
+                                Style::default().fg(theme::current().text_secondary),
+                            ),
+                            Span::styled(
+                                cidr_summary,
+                                Style::default().fg(theme::current().warning),
+                            ),
+                            Span::styled("?", Style::default().fg(theme::current().text_secondary)),
                         ]),
                     ],
-                    border_color: theme::WARNING,
+                    border_color: theme::current().warning,
                     confirm_selected: *confirm_selected,
                     width: 56,
                     height: 7,
@@ -447,18 +468,21 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
                         Line::from(vec![
                             Span::styled(
                                 "Disconnect all ",
-                                Style::default().fg(theme::TEXT_SECONDARY),
+                                Style::default().fg(theme::current().text_secondary),
                             ),
                             Span::styled(
                                 count.to_string(),
                                 Style::default()
-                                    .fg(theme::WARNING)
+                                    .fg(theme::current().warning)
                                     .add_modifier(Modifier::BOLD),
                             ),
-                            Span::styled(" tunnels?", Style::default().fg(theme::TEXT_SECONDARY)),
+                            Span::styled(
+                                " tunnels?",
+                                Style::default().fg(theme::current().text_secondary),
+                            ),
                         ]),
                     ],
-                    border_color: theme::WARNING,
+                    border_color: theme::current().warning,
                     confirm_selected: *confirm_selected,
                     width: 50,
                     height: 7,
@@ -474,10 +498,7 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
 
     if app.show_action_menu || app.show_bulk_menu {
         let (actions, title) = if app.show_bulk_menu {
-            (
-                message::get_bulk_actions_for(&app.background_mode.permitted_actions),
-                " Bulk Actions ",
-            )
+            (message::get_bulk_actions(), " Bulk Actions ")
         } else {
             (message::get_single_actions(&app.focused_panel), " Actions ")
         };

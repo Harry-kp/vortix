@@ -3147,38 +3147,12 @@ fn connected_operation(
 
 #[cfg(unix)]
 pub(crate) fn config_owner(config_dir: &Path) -> Result<(u32, u32), LocalControlError> {
-    use std::os::unix::fs::MetadataExt as _;
-    let metadata = std::fs::symlink_metadata(config_dir)
-        .map_err(|error| LocalControlError::Owner(error.to_string()))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(LocalControlError::Owner(
-            "configuration path is not a real directory".into(),
-        ));
-    }
-    let effective = crate::utils::effective_user_group_ids();
-    if effective.0 != 0 {
-        return (metadata.uid() == effective.0)
-            .then_some(effective)
-            .ok_or_else(|| LocalControlError::Owner("configuration owner mismatch".into()));
-    }
-    let uid = std::env::var("SUDO_UID")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(metadata.uid());
-    let gid = std::env::var("SUDO_GID")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(metadata.gid());
-    (metadata.uid() == uid)
-        .then_some((uid, gid))
-        .ok_or_else(|| LocalControlError::Owner("sudo owner does not own configuration".into()))
+    crate::config::config_owner(config_dir).map_err(LocalControlError::Owner)
 }
 
 #[cfg(not(unix))]
 pub(crate) fn config_owner(_config_dir: &Path) -> Result<(u32, u32), LocalControlError> {
-    Err(LocalControlError::Owner(
-        "Standard-mode canonical control is unsupported on this platform".into(),
-    ))
+    crate::config::config_owner(_config_dir).map_err(LocalControlError::Owner)
 }
 
 #[cfg(test)]

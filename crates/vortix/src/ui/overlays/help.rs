@@ -29,7 +29,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Tabs, Wrap},
+    widgets::{Block, Borders, Paragraph, Tabs, Wrap},
     Frame,
 };
 
@@ -51,6 +51,7 @@ const HELP_TEXT: &[(&str, &[(&str, &str)])] = &[
             ("z", "Zoom focused panel"),
             ("x", "Action menu"),
             ("b", "Bulk action menu"),
+            ("p", "Switch color theme"),
             ("/", "Search profiles"),
             ("?", "Toggle this help"),
             ("q", "Quit"),
@@ -274,20 +275,20 @@ pub fn render(frame: &mut Frame, scroll: u16, tab: HelpTab) {
         height,
     };
 
-    frame.render_widget(Clear, overlay);
+    crate::ui::helpers::clear_area(frame, overlay);
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::ACCENT_PRIMARY))
+        .border_style(Style::default().fg(theme::current().accent_primary))
         .title(Span::styled(
             " Help ",
             Style::default()
-                .fg(theme::ACCENT_PRIMARY)
+                .fg(theme::current().accent_primary)
                 .add_modifier(Modifier::BOLD),
         ))
         .title_bottom(Span::styled(
             " Tab next · Shift+Tab prev · ↑↓ j/k scroll · ? close ",
-            Style::default().fg(theme::KEY_HINT_DESC),
+            Style::default().fg(theme::current().key_hint_desc),
         ));
 
     let inner = block.inner(overlay);
@@ -341,15 +342,15 @@ fn render_tab_strip(frame: &mut Frame, area: Rect, active: HelpTab) {
     let active_idx = HelpTab::ALL.iter().position(|t| *t == active).unwrap_or(0);
     let tabs = Tabs::new(titles)
         .select(active_idx)
-        .style(Style::default().fg(theme::TEXT_SECONDARY))
+        .style(Style::default().fg(theme::current().text_secondary))
         .highlight_style(
             Style::default()
-                .fg(theme::ACCENT_PRIMARY)
+                .fg(theme::current().accent_primary)
                 .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
         )
         .divider(Span::styled(
             " │ ",
-            Style::default().fg(theme::NORD_POLAR_NIGHT_4),
+            Style::default().fg(theme::current().nord_polar_night_4),
         ));
     frame.render_widget(tabs, area);
 }
@@ -357,7 +358,7 @@ fn render_tab_strip(frame: &mut Frame, area: Rect, active: HelpTab) {
 fn render_divider(frame: &mut Frame, area: Rect) {
     let line = Line::from(Span::styled(
         "─".repeat(area.width as usize),
-        Style::default().fg(theme::NORD_POLAR_NIGHT_4),
+        Style::default().fg(theme::current().nord_polar_night_4),
     ));
     frame.render_widget(Paragraph::new(line), area);
 }
@@ -371,7 +372,7 @@ fn build_keys_lines() -> Vec<Line<'static>> {
         lines.push(Line::from(Span::styled(
             format!("  {section}"),
             Style::default()
-                .fg(theme::ACCENT_PRIMARY)
+                .fg(theme::current().accent_primary)
                 .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
         )));
         lines.push(Line::from(""));
@@ -381,10 +382,10 @@ fn build_keys_lines() -> Vec<Line<'static>> {
                 Span::styled(
                     format!("    {key:<14}"),
                     Style::default()
-                        .fg(theme::KEY_HINT)
+                        .fg(theme::current().key_hint)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(*desc, Style::default().fg(theme::TEXT_SECONDARY)),
+                Span::styled(*desc, Style::default().fg(theme::current().text_secondary)),
             ]));
         }
     }
@@ -406,19 +407,19 @@ fn build_glossary_lines(
             Span::styled(
                 "  \u{25cf}  ",
                 Style::default()
-                    .fg(theme::ACCENT_PRIMARY)
+                    .fg(theme::current().accent_primary)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 *label,
                 Style::default()
-                    .fg(theme::ACCENT_PRIMARY)
+                    .fg(theme::current().accent_primary)
                     .add_modifier(Modifier::BOLD),
             ),
         ]));
         lines.push(Line::from(Span::styled(
             format!("     {desc}"),
-            Style::default().fg(theme::TEXT_SECONDARY),
+            Style::default().fg(theme::current().text_secondary),
         )));
         lines.push(Line::from(""));
     }
@@ -426,7 +427,7 @@ fn build_glossary_lines(
         lines.push(Line::from(Span::styled(
             format!("  {footer}"),
             Style::default()
-                .fg(theme::KEY_HINT_DESC)
+                .fg(theme::current().key_hint_desc)
                 .add_modifier(Modifier::ITALIC),
         )));
     }
@@ -444,7 +445,7 @@ fn build_sigils_lines() -> Vec<Line<'static>> {
         lines.push(Line::from(Span::styled(
             format!("  {}", category_title(category)),
             Style::default()
-                .fg(theme::ACCENT_PRIMARY)
+                .fg(theme::current().accent_primary)
                 .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
         )));
         lines.push(Line::from(""));
@@ -476,12 +477,12 @@ fn sigil_row(entry: &'static Sigil) -> Line<'static> {
         Span::styled(
             format!("{:<22}", entry.label),
             Style::default()
-                .fg(theme::TEXT_PRIMARY)
+                .fg(theme::current().text_primary)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             entry.description,
-            Style::default().fg(theme::TEXT_SECONDARY),
+            Style::default().fg(theme::current().text_secondary),
         ),
     ])
 }
@@ -504,6 +505,16 @@ mod tests {
             });
         assert!(blob.contains("Disconnect ALL"));
         assert!(blob.contains("Connect both"));
+    }
+
+    #[test]
+    fn palette_key_is_documented() {
+        let global = HELP_TEXT
+            .iter()
+            .find(|(section, _)| *section == "Global")
+            .map(|(_, bindings)| *bindings)
+            .expect("Global help section must exist");
+        assert!(global.contains(&("p", "Switch color theme")));
     }
 
     #[test]

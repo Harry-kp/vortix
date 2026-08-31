@@ -3,9 +3,9 @@
 use crate::app::App;
 use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::Span,
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, Borders, Paragraph},
     Frame,
 };
 use unicode_width::UnicodeWidthStr;
@@ -46,7 +46,7 @@ pub fn render(frame: &mut Frame, app: &App) {
             return;
         };
 
-        frame.render_widget(Clear, toast_area);
+        crate::ui::helpers::clear_area(frame, toast_area);
 
         let t = crate::theme::current();
         let (title, bg_color, border_color) = match toast.toast_type {
@@ -62,13 +62,13 @@ pub fn render(frame: &mut Frame, app: &App) {
             .title(Span::styled(
                 title,
                 Style::default()
-                    .fg(Color::Black)
+                    .fg(t.text_dark)
                     .bg(bg_color)
                     .add_modifier(Modifier::BOLD),
             ))
             .title_bottom(Span::styled(
                 " Esc dismiss ",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(t.key_hint_desc),
             ));
 
         let inner_area = block.inner(toast_area);

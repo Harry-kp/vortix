@@ -150,6 +150,24 @@ pub struct LegacySidecarArchiveEntry {
     pub sha256: String,
 }
 
+/// Exact sidecar wire shape emitted by the pre-inventory migration.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyV1Sidecar {
+    schema_version: u32,
+    profile_id: String,
+    display_name: String,
+    protocol: ProtocolKind,
+    #[serde(default)]
+    group: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    imported_at: Option<SystemTime>,
+    #[serde(default)]
+    last_used: Option<SystemTime>,
+}
+
 /// One config and every identity-bearing association known at migration time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(clippy::struct_excessive_bools)] // explicit inventory facts must remain independently rollback-readable
@@ -197,7 +215,7 @@ pub fn migrate_legacy_profiles(profiles_dir: &Path) -> std::io::Result<Migration
     // A saved inventory is the authority for every identity-bearing move.
     // Revalidate its config set before migrating auth so a stale inventory
     // cannot mutate credentials and only then fail closed.
-    let (current_configs, _) = scan_profile_files(profiles_dir)?;
+    let (current_configs, current_sidecars) = scan_profile_files(profiles_dir)?;
     validate_saved_configs_and_sidecars(profiles_dir, &inventory, &current_configs)?;
 
     migrate_legacy_auth_files(profiles_dir, &inventory)
@@ -213,6 +231,20 @@ pub fn migrate_legacy_profiles(profiles_dir: &Path) -> std::io::Result<Migration
             discover_legacy_sidecars(profiles_dir, &inventory)?;
         inventory.legacy_sidecar_archive_completed =
             inventory.legacy_sidecars_pending_archive.is_empty();
+        let body = toml::to_string_pretty(&inventory).map_err(invalid_data)?;
+        write_atomic(&inventory_path, body.as_bytes())?;
+    }
+
+    let downgrade_sidecars =
+        discover_downgrade_runtime_sidecars(profiles_dir, &inventory, &current_sidecars)?;
+    if !downgrade_sidecars.is_empty() {
+        inventory
+            .legacy_sidecars_pending_archive
+            .extend(downgrade_sidecars);
+        inventory
+            .legacy_sidecars_pending_archive
+            .sort_by(|left, right| left.file_name.cmp(&right.file_name));
+        inventory.legacy_sidecar_archive_completed = false;
         let body = toml::to_string_pretty(&inventory).map_err(invalid_data)?;
         write_atomic(&inventory_path, body.as_bytes())?;
     }
@@ -551,6 +583,18 @@ fn legacy_archive_entry_from_file(
     file: &std::fs::File,
     file_name: String,
 ) -> std::io::Result<LegacySidecarArchiveEntry> {
+    let (size_bytes, bytes) = read_legacy_sidecar_bytes(file, &file_name)?;
+    Ok(LegacySidecarArchiveEntry {
+        file_name,
+        size_bytes,
+        sha256: sha256_hex(&bytes),
+    })
+}
+
+fn read_legacy_sidecar_bytes(
+    file: &std::fs::File,
+    file_name: &str,
+) -> std::io::Result<(u64, Vec<u8>)> {
     let metadata = file.metadata()?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(invalid_data(format!(
@@ -580,22 +624,23 @@ fn legacy_archive_entry_from_file(
             "legacy sidecar changed while it was inventoried: {file_name}"
         )));
     }
-    Ok(LegacySidecarArchiveEntry {
-        file_name,
-        size_bytes: metadata.len(),
-        sha256: sha256_hex(&bytes),
-    })
+    Ok((metadata.len(), bytes))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
+    lower_hex(&Sha256::digest(bytes))
+}
+
+fn lower_hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
 
-    Sha256::digest(bytes)
-        .iter()
-        .fold(String::with_capacity(64), |mut output, byte| {
+    bytes.iter().fold(
+        String::with_capacity(bytes.len() * 2),
+        |mut output, byte| {
             write!(output, "{byte:02x}").expect("writing to String cannot fail");
             output
-        })
+        },
+    )
 }
 
 fn archive_legacy_sidecars(
@@ -958,6 +1003,127 @@ fn discover_legacy_sidecars(
     Ok(legacy)
 }
 
+/// Find only the metadata pollution produced when a pre-inventory release is
+/// run after this release has left an owned `OpenVPN` runtime copy behind.
+fn discover_downgrade_runtime_sidecars(
+    profiles_dir: &Path,
+    inventory: &MigrationInventory,
+    sidecars: &HashSet<String>,
+) -> std::io::Result<Vec<LegacySidecarArchiveEntry>> {
+    let active = inventory
+        .entries
+        .iter()
+        .map(|entry| entry.sidecar_file.as_str())
+        .collect::<HashSet<_>>();
+    let pending = inventory
+        .legacy_sidecars_pending_archive
+        .iter()
+        .map(|entry| entry.file_name.as_str())
+        .collect::<HashSet<_>>();
+    let known_profile_ids = inventory
+        .entries
+        .iter()
+        .map(|entry| entry.profile_id.as_str())
+        .collect::<HashSet<_>>();
+    let mut unexplained = sidecars
+        .iter()
+        .filter(|name| !active.contains(name.as_str()) && !pending.contains(name.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    unexplained.sort();
+
+    let mut recovered = Vec::with_capacity(unexplained.len());
+    for name in unexplained {
+        let Some(runtime_stem) = managed_openvpn_runtime_stem(&name, &known_profile_ids) else {
+            return Err(invalid_data(format!("unexplained sidecar {name}")));
+        };
+        let path = profiles_dir.join(&name);
+        let file = open_legacy_sidecar(&path)?;
+        let (size_bytes, bytes) = read_legacy_sidecar_bytes(&file, &name)?;
+        let sidecar: LegacyV1Sidecar =
+            toml::from_str(std::str::from_utf8(&bytes).map_err(|error| {
+                invalid_data(format!("invalid legacy sidecar {name}: {error}"))
+            })?)
+            .map_err(|error| invalid_data(format!("invalid legacy sidecar {name}: {error}")))?;
+        let runtime_config = profiles_dir.join(format!("{runtime_stem}.ovpn"));
+        let expected_id = legacy_v1_profile_id(&runtime_config, runtime_stem)?;
+        let exact_v1_shape = sidecar.schema_version == Sidecar::SCHEMA_VERSION
+            && sidecar.profile_id == expected_id
+            && sidecar.display_name == runtime_stem
+            && sidecar.protocol == ProtocolKind::OpenVpn
+            && sidecar.group.is_none()
+            && sidecar.source.as_deref() == Some("migration:v1")
+            && sidecar.imported_at.is_some()
+            && sidecar.last_used.is_none();
+        if !exact_v1_shape {
+            return Err(invalid_data(format!("unexplained sidecar {name}")));
+        }
+        recovered.push(LegacySidecarArchiveEntry {
+            file_name: name,
+            size_bytes,
+            sha256: sha256_hex(&bytes),
+        });
+    }
+    Ok(recovered)
+}
+
+fn managed_openvpn_runtime_stem<'a>(
+    sidecar_name: &'a str,
+    known_profile_ids: &HashSet<&str>,
+) -> Option<&'a str> {
+    let stem = sidecar_name.strip_suffix(".meta.toml")?;
+    let suffix = stem.strip_prefix(".vortix-")?;
+    let mut parts = suffix.split('-');
+    let profile_id = parts.next()?;
+    let generation = parts.next()?;
+    let token = parts.next()?;
+    if parts.next().is_some()
+        || ProfileId::parse(profile_id.to_string()).is_err()
+        || generation.len() != 16
+        || generation == "0000000000000000"
+        || token.len() != 16
+        || ![generation, token].into_iter().all(is_lower_hex)
+        || !known_profile_ids.contains(profile_id)
+    {
+        return None;
+    }
+    Some(stem)
+}
+
+fn is_lower_hex(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn legacy_v1_profile_id(config_path: &Path, display_name: &str) -> std::io::Result<String> {
+    let mut file = open_legacy_sidecar(config_path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(invalid_data(format!(
+            "legacy runtime config is not a regular file: {}",
+            config_path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if metadata.nlink() != 1 {
+            return Err(invalid_data(format!(
+                "legacy runtime config has an unsafe hard-link count: {}",
+                config_path.display()
+            )));
+        }
+    }
+    let mut prefix = [0_u8; 4096];
+    let read = file.read(&mut prefix)?;
+    let mut hasher = Sha256::new();
+    hasher.update(display_name.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(&prefix[..read]);
+    Ok(lower_hex(&hasher.finalize()))
+}
+
 fn validate_pending_archive(
     profiles_dir: &Path,
     inventory: &MigrationInventory,
@@ -1272,6 +1438,102 @@ mod tests {
         let inventory = read_inventory(&tmp.path().join(INVENTORY_FILE)).unwrap();
         assert_eq!(inventory.entries.len(), 1);
         assert_eq!(inventory.entries[0].config_file, "corp.ovpn");
+    }
+
+    #[test]
+    fn legacy_v1_profile_id_matches_deployed_release_fixture() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime_stem = ".vortix-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef-0000000000000007-bbbbbbbbbbbbbbbb";
+        let runtime_config = tmp.path().join(format!("{runtime_stem}.ovpn"));
+        std::fs::write(&runtime_config, b"client\n").unwrap();
+
+        assert_eq!(
+            legacy_v1_profile_id(&runtime_config, runtime_stem).unwrap(),
+            "4e43d97caa0b45533255fa7c15f763e4186f3a4698e7274f50c28b8c091bcd2c"
+        );
+    }
+
+    #[test]
+    fn downgrade_sidecar_for_managed_openvpn_copy_is_archived_on_upgrade() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("corp.ovpn"), b"client\n").unwrap();
+        migrate_legacy_profiles(tmp.path()).unwrap();
+        let canonical = FsProfileStore::read_sidecar(&tmp.path().join("corp.meta.toml")).unwrap();
+        let runtime_stem = format!(
+            ".vortix-{}-0000000000000007-bbbbbbbbbbbbbbbb",
+            canonical.profile_id
+        );
+        let runtime_config = tmp.path().join(format!("{runtime_stem}.ovpn"));
+        std::fs::write(
+            &runtime_config,
+            format!(
+                "# managed-by: vortix openvpn custodian\n# profile-id: {}\n# ownership-token: {}\nclient\n",
+                canonical.profile_id,
+                "b".repeat(64)
+            ),
+        )
+        .unwrap();
+        let downgrade_sidecar_path = tmp.path().join(format!("{runtime_stem}.meta.toml"));
+        std::fs::write(
+            &downgrade_sidecar_path,
+            format!(
+                "schema_version = 1\nprofile_id = \"{}\"\ndisplay_name = \"{runtime_stem}\"\nprotocol = \"OpenVpn\"\nsource = \"migration:v1\"\n\n[imported_at]\nsecs_since_epoch = 1\nnanos_since_epoch = 0\n",
+                legacy_v1_profile_id(&runtime_config, &runtime_stem).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let stats = migrate_legacy_profiles(tmp.path()).unwrap();
+
+        assert_eq!(stats.archived_legacy_sidecars, 1);
+        assert!(
+            runtime_config.exists(),
+            "migration must not remove runtime material"
+        );
+        assert!(!downgrade_sidecar_path.exists());
+        assert!(tmp
+            .path()
+            .join(LEGACY_SIDECAR_ARCHIVE_DIR)
+            .join(format!("{runtime_stem}.meta.toml"))
+            .is_file());
+        assert_eq!(
+            read_inventory(&tmp.path().join(INVENTORY_FILE))
+                .unwrap()
+                .entries
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn runtime_shaped_sidecar_without_v1_identity_remains_unexplained() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("corp.ovpn"), b"client\n").unwrap();
+        migrate_legacy_profiles(tmp.path()).unwrap();
+        let canonical = FsProfileStore::read_sidecar(&tmp.path().join("corp.meta.toml")).unwrap();
+        let runtime_stem = format!(
+            ".vortix-{}-0000000000000007-bbbbbbbbbbbbbbbb",
+            canonical.profile_id
+        );
+        std::fs::write(tmp.path().join(format!("{runtime_stem}.ovpn")), b"client\n").unwrap();
+        let unverified = Sidecar {
+            schema_version: Sidecar::SCHEMA_VERSION,
+            profile_id: "ff".repeat(32),
+            display_name: runtime_stem.clone(),
+            protocol: ProtocolKind::OpenVpn,
+            config_file: None,
+            group: None,
+            source: Some("migration:v1".to_string()),
+            imported_at: Some(SystemTime::now()),
+            last_used: None,
+        };
+        let unverified_path = tmp.path().join(format!("{runtime_stem}.meta.toml"));
+        FsProfileStore::write_sidecar(&unverified_path, &unverified).unwrap();
+
+        let error = migrate_legacy_profiles(tmp.path()).unwrap_err();
+
+        assert!(error.to_string().contains("unexplained sidecar"), "{error}");
+        assert!(unverified_path.exists());
     }
 
     #[test]

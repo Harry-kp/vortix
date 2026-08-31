@@ -12,6 +12,18 @@ use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
+const CONFIG_FILE: &str = "config.toml";
+const MAX_CONFIG_BYTES: u64 = 256 * 1024;
+
+/// Result of publishing a live theme preference.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ThemePersistOutcome {
+    /// The file and containing directory were durably synchronized.
+    Durable,
+    /// The replacement is visible, but the final directory sync failed.
+    PublishedDurabilityUncertain(String),
+}
+
 /// Process-wide resolved config directory, set once at startup.
 static CONFIG_DIR: OnceLock<PathBuf> = OnceLock::new();
 
@@ -51,6 +63,8 @@ pub fn get_config_dir() -> std::io::Result<PathBuf> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AppConfig {
+    /// Built-in TUI color palette; `"terminal"` inherits terminal colors.
+    pub theme: crate::theme::ThemeChoice,
     /// UI refresh rate in milliseconds.
     pub tick_rate: u64,
     /// Telemetry polling interval in seconds.
@@ -111,6 +125,7 @@ impl Default for AppConfig {
         use crate::constants;
 
         Self {
+            theme: crate::theme::ThemeChoice::default(),
             tick_rate: constants::DEFAULT_TICK_RATE,
             telemetry_poll_rate: constants::DEFAULT_TELEMETRY_POLL_RATE,
             api_timeout: constants::DEFAULT_API_TIMEOUT,
@@ -260,7 +275,7 @@ fn home_dir_for_user(_username: &str) -> Option<PathBuf> {
 ///
 /// Returns an error if the file exists but cannot be read or parsed.
 pub fn load_config(config_dir: &Path) -> Result<AppConfig, String> {
-    let config_path = config_dir.join("config.toml");
+    let config_path = config_dir.join(CONFIG_FILE);
 
     if !config_path.exists() {
         return Ok(AppConfig::default());
@@ -271,6 +286,125 @@ pub fn load_config(config_dir: &Path) -> Result<AppConfig, String> {
 
     toml::from_str(&content)
         .map_err(|e| format!("Invalid config at {}: {e}", config_path.display()))
+}
+
+/// Persist only the selected TUI theme while preserving all other config
+/// keys, comments, and ordering.
+pub(crate) fn persist_theme_choice(
+    config_dir: &Path,
+    choice: crate::theme::ThemeChoice,
+) -> Result<ThemePersistOutcome, String> {
+    use std::str::FromStr as _;
+
+    let owner = config_owner(config_dir)?;
+    let directory = crate::vortix_config::control_state::open_control_directory(
+        config_dir, false, owner.0, owner.1,
+    )
+    .map_err(|error| format!("cannot safely open the config directory: {error}"))?
+    .ok_or_else(|| "the config directory no longer exists".to_string())?;
+    let bytes = crate::vortix_config::control_state::read_owned_user_entry(
+        &directory,
+        CONFIG_FILE,
+        owner.0,
+        MAX_CONFIG_BYTES,
+    )
+    .map_err(|error| format!("cannot safely read config.toml: {error}"))?;
+    let source = bytes
+        .map(|bytes| {
+            String::from_utf8(bytes)
+                .map_err(|_| "config.toml is not valid UTF-8 and was not changed".to_string())
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let mut document = if source.trim().is_empty() {
+        toml_edit::DocumentMut::new()
+    } else {
+        toml_edit::DocumentMut::from_str(&source)
+            .map_err(|error| format!("config.toml is invalid and was not changed: {error}"))?
+    };
+    document["theme"] = toml_edit::value(choice.config_value());
+    let body = document.to_string();
+    if body.len() as u64 > MAX_CONFIG_BYTES {
+        return Err(format!(
+            "config.toml would exceed the {MAX_CONFIG_BYTES}-byte safety limit"
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        classify_theme_write(
+            crate::vortix_config::control_state::write_owned_atomic_with_hook(
+                &directory,
+                CONFIG_FILE,
+                body.as_bytes(),
+                owner.0,
+                owner.1,
+                |_, _| Ok(()),
+            ),
+        )
+    }
+
+    #[cfg(not(unix))]
+    crate::vortix_config::control_state::write_owned_atomic(
+        &directory,
+        CONFIG_FILE,
+        body.as_bytes(),
+        owner.0,
+        owner.1,
+    )
+    .map(|()| ThemePersistOutcome::Durable)
+    .map_err(|error| format!("could not save config.toml: {error}"))
+}
+
+#[cfg(unix)]
+fn classify_theme_write(
+    result: Result<(), crate::vortix_config::control_state::AtomicWriteError>,
+) -> Result<ThemePersistOutcome, String> {
+    use crate::vortix_config::control_state::AtomicWriteError;
+
+    match result {
+        Ok(()) => Ok(ThemePersistOutcome::Durable),
+        Err(AtomicWriteError::NotPublished(error)) => {
+            Err(format!("could not save config.toml: {error}"))
+        }
+        Err(AtomicWriteError::PublishedButDirectoryUnsynced(error)) => Ok(
+            ThemePersistOutcome::PublishedDurabilityUncertain(error.to_string()),
+        ),
+    }
+}
+
+/// Resolve the principal that owns user configuration, including when the
+/// process was launched through `sudo`.
+#[cfg(unix)]
+pub(crate) fn config_owner(config_dir: &Path) -> Result<(u32, u32), String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = std::fs::symlink_metadata(config_dir).map_err(|error| error.to_string())?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("configuration path is not a real directory".into());
+    }
+    let effective = crate::utils::effective_user_group_ids();
+    if effective.0 != 0 {
+        return (metadata.uid() == effective.0)
+            .then_some(effective)
+            .ok_or_else(|| "configuration owner mismatch".into());
+    }
+    let uid = std::env::var("SUDO_UID")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(metadata.uid());
+    let gid = std::env::var("SUDO_GID")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(metadata.gid());
+    (metadata.uid() == uid)
+        .then_some((uid, gid))
+        .ok_or_else(|| "sudo owner does not own configuration".into())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn config_owner(_config_dir: &Path) -> Result<(u32, u32), String> {
+    Err("Standard-mode canonical control is unsupported on this platform".into())
 }
 
 /// Load the effective application configuration.
@@ -695,6 +829,172 @@ mod tests {
         let config = load_config(dir.path()).unwrap();
         assert_eq!(config.tick_rate, 500);
         assert_eq!(config.telemetry_poll_rate, 30); // default preserved
+    }
+
+    #[test]
+    fn test_load_config_builtin_themes() {
+        let dir = tempfile::Builder::new()
+            .prefix("vortix_test_")
+            .tempdir()
+            .unwrap();
+        for (value, expected) in [
+            ("synthwave", crate::theme::ThemeChoice::Synthwave),
+            ("terminal", crate::theme::ThemeChoice::Terminal),
+            (
+                "catppuccin-mocha",
+                crate::theme::ThemeChoice::CatppuccinMocha,
+            ),
+            ("dracula", crate::theme::ThemeChoice::Dracula),
+            ("nord", crate::theme::ThemeChoice::Nord),
+            ("gruvbox-dark", crate::theme::ThemeChoice::GruvboxDark),
+            ("tokyo-night", crate::theme::ThemeChoice::TokyoNight),
+        ] {
+            std::fs::write(
+                dir.path().join("config.toml"),
+                format!("theme = \"{value}\"\n"),
+            )
+            .unwrap();
+
+            assert_eq!(load_config(dir.path()).unwrap().theme, expected);
+        }
+    }
+
+    #[test]
+    fn persist_theme_preserves_unrelated_config_and_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join(CONFIG_FILE);
+        std::fs::write(
+            &config_path,
+            "# keep this comment\ntick_rate = 500\ntheme = \"synthwave\"\n",
+        )
+        .unwrap();
+        persist_theme_choice(dir.path(), crate::theme::ThemeChoice::Terminal).unwrap();
+
+        let saved = std::fs::read_to_string(&config_path).unwrap();
+        assert!(saved.contains("# keep this comment"));
+        assert!(saved.contains("tick_rate = 500"));
+        assert!(saved.contains("theme = \"terminal\""));
+        assert_eq!(
+            load_config(dir.path()).unwrap().theme,
+            crate::theme::ThemeChoice::Terminal
+        );
+    }
+
+    #[test]
+    fn persist_theme_creates_a_minimal_config() {
+        let dir = tempfile::tempdir().unwrap();
+        persist_theme_choice(dir.path(), crate::theme::ThemeChoice::Terminal).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(CONFIG_FILE)).unwrap(),
+            "theme = \"terminal\"\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persist_theme_refuses_a_symlinked_config() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), "theme = \"synthwave\"\n").unwrap();
+        symlink(outside.path(), dir.path().join(CONFIG_FILE)).unwrap();
+        let error =
+            persist_theme_choice(dir.path(), crate::theme::ThemeChoice::Terminal).unwrap_err();
+
+        assert!(error.contains("safely read"));
+        assert_eq!(
+            std::fs::read_to_string(outside.path()).unwrap(),
+            "theme = \"synthwave\"\n"
+        );
+    }
+
+    #[test]
+    fn persist_theme_leaves_invalid_config_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join(CONFIG_FILE);
+        let malformed = b"theme = [not valid toml";
+        std::fs::write(&config_path, malformed).unwrap();
+
+        let error =
+            persist_theme_choice(dir.path(), crate::theme::ThemeChoice::Terminal).unwrap_err();
+
+        assert!(error.contains("invalid"));
+        assert_eq!(std::fs::read(&config_path).unwrap(), malformed);
+    }
+
+    #[test]
+    fn persist_theme_leaves_non_utf8_config_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join(CONFIG_FILE);
+        let invalid_utf8 = [0xff, 0xfe, 0xfd];
+        std::fs::write(&config_path, invalid_utf8).unwrap();
+
+        let error =
+            persist_theme_choice(dir.path(), crate::theme::ThemeChoice::Terminal).unwrap_err();
+
+        assert!(error.contains("UTF-8"));
+        assert_eq!(std::fs::read(&config_path).unwrap(), invalid_utf8);
+    }
+
+    #[test]
+    fn persist_theme_refuses_to_publish_an_oversized_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join(CONFIG_FILE);
+        let framing = "note = \"\"\n";
+        let payload_len = usize::try_from(MAX_CONFIG_BYTES).unwrap() - framing.len();
+        let source = format!("note = \"{}\"\n", "a".repeat(payload_len));
+        assert_eq!(source.len() as u64, MAX_CONFIG_BYTES);
+        std::fs::write(&config_path, &source).unwrap();
+
+        let error =
+            persist_theme_choice(dir.path(), crate::theme::ThemeChoice::Terminal).unwrap_err();
+
+        assert!(error.contains("would exceed"));
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), source);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn published_theme_is_kept_when_directory_sync_is_uncertain() {
+        let outcome = classify_theme_write(Err(
+            crate::vortix_config::control_state::AtomicWriteError::PublishedButDirectoryUnsynced(
+                crate::vortix_config::control_state::ControlStateError::Capacity,
+            ),
+        ))
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            ThemePersistOutcome::PublishedDurabilityUncertain(_)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persist_theme_refuses_writable_or_multiply_linked_config() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let writable_dir = tempfile::tempdir().unwrap();
+        let writable = writable_dir.path().join(CONFIG_FILE);
+        std::fs::write(&writable, "theme = \"synthwave\"\n").unwrap();
+        std::fs::set_permissions(&writable, std::fs::Permissions::from_mode(0o664)).unwrap();
+        assert!(
+            persist_theme_choice(writable_dir.path(), crate::theme::ThemeChoice::Terminal)
+                .unwrap_err()
+                .contains("safely read")
+        );
+
+        let linked_dir = tempfile::tempdir().unwrap();
+        let linked = linked_dir.path().join(CONFIG_FILE);
+        std::fs::write(&linked, "theme = \"synthwave\"\n").unwrap();
+        std::fs::hard_link(&linked, linked_dir.path().join("config.backup")).unwrap();
+        assert!(
+            persist_theme_choice(linked_dir.path(), crate::theme::ThemeChoice::Terminal)
+                .unwrap_err()
+                .contains("safely read")
+        );
     }
 
     #[test]
