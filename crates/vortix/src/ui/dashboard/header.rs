@@ -146,7 +146,7 @@ fn with_mode_signal(label: &'static str, mut line: Line<'static>) -> Line<'stati
         Span::styled(
             format!("{label} │ "),
             Style::default()
-                .fg(theme::ACCENT_PRIMARY)
+                .fg(theme::current().accent_primary)
                 .add_modifier(Modifier::BOLD),
         ),
     );
@@ -165,16 +165,25 @@ fn render_no_exit_line(app: &App, ks_indicator: Span<'static>) -> Line<'static> 
         Span::styled(
             "\u{25cb} NO EXIT",
             Style::default()
-                .fg(theme::WARNING)
+                .fg(theme::current().warning)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" │ ", Style::default().fg(theme::NORD_POLAR_NIGHT_4)),
-        Span::styled("Real: ", Style::default().fg(theme::TEXT_SECONDARY)),
+        Span::styled(
+            " │ ",
+            Style::default().fg(theme::current().nord_polar_night_4),
+        ),
+        Span::styled(
+            "Real: ",
+            Style::default().fg(theme::current().text_secondary),
+        ),
         Span::styled(
             app.runtime.public_ip.clone(),
-            Style::default().fg(theme::TEXT_PRIMARY),
+            Style::default().fg(theme::current().text_primary),
         ),
-        Span::styled(" │", Style::default().fg(theme::NORD_POLAR_NIGHT_4)),
+        Span::styled(
+            " │",
+            Style::default().fg(theme::current().nord_polar_night_4),
+        ),
         ks_indicator,
     ])
 }
@@ -190,16 +199,25 @@ fn render_disconnected_line(app: &App, ks_indicator: Span<'static>) -> Line<'sta
         Span::styled(
             "\u{25cb} DISCONNECTED",
             Style::default()
-                .fg(theme::ERROR)
+                .fg(theme::current().error)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" │ ", Style::default().fg(theme::NORD_POLAR_NIGHT_4)),
-        Span::styled("Real: ", Style::default().fg(theme::TEXT_SECONDARY)),
+        Span::styled(
+            " │ ",
+            Style::default().fg(theme::current().nord_polar_night_4),
+        ),
+        Span::styled(
+            "Real: ",
+            Style::default().fg(theme::current().text_secondary),
+        ),
         Span::styled(
             app.runtime.public_ip.clone(),
-            Style::default().fg(theme::TEXT_PRIMARY),
+            Style::default().fg(theme::current().text_primary),
         ),
-        Span::styled(" │", Style::default().fg(theme::NORD_POLAR_NIGHT_4)),
+        Span::styled(
+            " │",
+            Style::default().fg(theme::current().nord_polar_night_4),
+        ),
         ks_indicator,
     ])
 }
@@ -253,18 +271,21 @@ fn render_primary_line(
                 Span::styled(
                     format!("{spinner} {action}"),
                     Style::default()
-                        .fg(theme::WARNING)
+                        .fg(theme::current().warning)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     format!(" ({profile_name})"),
-                    Style::default().fg(theme::TEXT_SECONDARY),
+                    Style::default().fg(theme::current().text_secondary),
                 ),
                 Span::styled(
                     format!(" {elapsed}s"),
-                    Style::default().fg(theme::ACCENT_SECONDARY),
+                    Style::default().fg(theme::current().accent_secondary),
                 ),
-                Span::styled(" │", Style::default().fg(theme::NORD_POLAR_NIGHT_4)),
+                Span::styled(
+                    " │",
+                    Style::default().fg(theme::current().nord_polar_night_4),
+                ),
                 ks_indicator,
             ])
         }
@@ -272,10 +293,13 @@ fn render_primary_line(
             Span::styled(
                 "? AWAITING INPUT",
                 Style::default()
-                    .fg(theme::WARNING)
+                    .fg(theme::current().warning)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" │", Style::default().fg(theme::NORD_POLAR_NIGHT_4)),
+            Span::styled(
+                " │",
+                Style::default().fg(theme::current().nord_polar_night_4),
+            ),
             ks_indicator,
         ]),
         Connection::Connected { details, since, .. } => {
@@ -312,10 +336,10 @@ fn render_primary_line(
                 app.runtime.packet_loss,
                 app.runtime.jitter_ms,
             ) {
-                QualityLevel::Unknown => ("─────", theme::TEXT_SECONDARY),
-                QualityLevel::Poor => ("●●○○○", theme::NORD_RED),
-                QualityLevel::Fair => ("●●●○○", theme::NORD_YELLOW),
-                QualityLevel::Excellent => ("●●●●●", theme::NORD_GREEN),
+                QualityLevel::Unknown => ("─────", theme::current().text_secondary),
+                QualityLevel::Poor => ("●●○○○", theme::current().error),
+                QualityLevel::Fair => ("●●●○○", theme::current().yellow),
+                QualityLevel::Excellent => ("●●●●●", theme::current().success),
             };
 
             let proto_tag = app
@@ -338,19 +362,28 @@ fn render_primary_line(
                 Span::styled(
                     "● CONNECTED",
                     Style::default()
-                        .fg(theme::SUCCESS)
+                        .fg(theme::current().success)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     format!(" ({profile_name}"),
-                    Style::default().fg(theme::TEXT_SECONDARY),
+                    Style::default().fg(theme::current().text_secondary),
                 ),
-                Span::styled(proto_suffix, Style::default().fg(theme::NORD_FROST_2)),
-                Span::styled(" │ ", Style::default().fg(theme::NORD_POLAR_NIGHT_4)),
-                Span::styled("VPN: ", Style::default().fg(theme::TEXT_SECONDARY)),
+                Span::styled(
+                    proto_suffix,
+                    Style::default().fg(theme::current().accent_primary),
+                ),
+                Span::styled(
+                    " │ ",
+                    Style::default().fg(theme::current().nord_polar_night_4),
+                ),
+                Span::styled(
+                    "VPN: ",
+                    Style::default().fg(theme::current().text_secondary),
+                ),
                 Span::styled(
                     app.runtime.public_ip.clone(),
-                    Style::default().fg(theme::SUCCESS),
+                    Style::default().fg(theme::current().success),
                 ),
             ];
 
@@ -362,28 +395,37 @@ fn render_primary_line(
                 let loc_budget = (area_width as usize / 4).max(10);
                 header_spans.push(Span::styled(
                     " @ ",
-                    Style::default().fg(theme::TEXT_SECONDARY),
+                    Style::default().fg(theme::current().text_secondary),
                 ));
                 header_spans.push(Span::styled(
                     utils::truncate(&app.runtime.location, loc_budget),
-                    Style::default().fg(theme::ACCENT_PRIMARY),
+                    Style::default().fg(theme::current().accent_primary),
                 ));
             }
 
             if !compact && !details.interface.is_empty() {
                 header_spans.push(Span::styled(
                     format!(" [{}]", details.interface),
-                    Style::default().fg(theme::TEXT_SECONDARY),
+                    Style::default().fg(theme::current().text_secondary),
                 ));
             }
 
             header_spans.extend_from_slice(&[
-                Span::styled(" │ ", Style::default().fg(theme::NORD_POLAR_NIGHT_4)),
-                Span::styled(uptime, Style::default().fg(theme::ACCENT_SECONDARY)),
+                Span::styled(
+                    " │ ",
+                    Style::default().fg(theme::current().nord_polar_night_4),
+                ),
+                Span::styled(
+                    uptime,
+                    Style::default().fg(theme::current().accent_secondary),
+                ),
             ]);
             if !compact {
                 header_spans.extend_from_slice(&[
-                    Span::styled(" │ ", Style::default().fg(theme::NORD_POLAR_NIGHT_4)),
+                    Span::styled(
+                        " │ ",
+                        Style::default().fg(theme::current().nord_polar_night_4),
+                    ),
                     Span::styled(
                         quality_indicator.0,
                         Style::default().fg(quality_indicator.1),
@@ -391,7 +433,10 @@ fn render_primary_line(
                 ]);
             }
             header_spans.extend_from_slice(&[
-                Span::styled(" │", Style::default().fg(theme::NORD_POLAR_NIGHT_4)),
+                Span::styled(
+                    " │",
+                    Style::default().fg(theme::current().nord_polar_night_4),
+                ),
                 ks_indicator,
             ]);
 
@@ -406,11 +451,11 @@ fn render_primary_line(
 /// is registered but truly disconnected, it doesn't belong on the strip.
 fn strip_badge(state: &Connection) -> Option<(&'static str, Color)> {
     match state {
-        Connection::Connected { .. } => Some(("●", theme::SUCCESS)),
-        Connection::Connecting { .. } => Some(("…", theme::WARNING)),
-        Connection::Reconnecting { .. } => Some(("↻", theme::WARNING)),
-        Connection::Disconnecting { .. } => Some(("⏻", theme::WARNING)),
-        Connection::AwaitingUserInput { .. } => Some(("?", theme::WARNING)),
+        Connection::Connected { .. } => Some(("●", theme::current().success)),
+        Connection::Connecting { .. } => Some(("…", theme::current().warning)),
+        Connection::Reconnecting { .. } => Some(("↻", theme::current().warning)),
+        Connection::Disconnecting { .. } => Some(("⏻", theme::current().warning)),
+        Connection::AwaitingUserInput { .. } => Some(("?", theme::current().warning)),
         Connection::Disconnected { .. } => None,
     }
 }
@@ -517,7 +562,7 @@ fn build_strip_inner(
         if idx > 0 {
             spans.push(Span::styled(
                 " ",
-                Style::default().fg(theme::TEXT_SECONDARY),
+                Style::default().fg(theme::current().text_secondary),
             ));
             width += 1;
         }
@@ -532,7 +577,10 @@ fn build_strip_inner(
         );
         if !name.is_empty() {
             width += name.width();
-            spans.push(Span::styled(name, Style::default().fg(theme::TEXT_PRIMARY)));
+            spans.push(Span::styled(
+                name,
+                Style::default().fg(theme::current().text_primary),
+            ));
         }
     }
     (width, spans)
@@ -577,7 +625,7 @@ fn build_narrow_strip(
         if idx > 0 {
             spans.push(Span::styled(
                 " ",
-                Style::default().fg(theme::TEXT_SECONDARY),
+                Style::default().fg(theme::current().text_secondary),
             ));
         }
         spans.push(Span::styled(
@@ -587,7 +635,7 @@ fn build_narrow_strip(
         if !first_char.is_empty() {
             spans.push(Span::styled(
                 first_char,
-                Style::default().fg(theme::TEXT_PRIMARY),
+                Style::default().fg(theme::current().text_primary),
             ));
         }
         width += cost;
@@ -602,7 +650,7 @@ fn build_narrow_strip(
     if omitted > 0 {
         spans.push(Span::styled(
             format!(" +{omitted}"),
-            Style::default().fg(theme::TEXT_SECONDARY),
+            Style::default().fg(theme::current().text_secondary),
         ));
     }
     Some(spans)
@@ -647,7 +695,7 @@ fn build_dotrow(
     if omitted > 0 {
         spans.push(Span::styled(
             format!(" +{omitted}"),
-            Style::default().fg(theme::TEXT_SECONDARY),
+            Style::default().fg(theme::current().text_secondary),
         ));
     }
     Some(spans)
@@ -657,24 +705,24 @@ fn build_dotrow(
 fn push_strip(line: &mut Line<'static>, with_label: bool, inner: &[Span<'static>]) {
     line.spans.push(Span::styled(
         " │ ",
-        Style::default().fg(theme::NORD_POLAR_NIGHT_4),
+        Style::default().fg(theme::current().nord_polar_night_4),
     ));
     if with_label {
         line.spans.push(Span::styled(
             "Tunnels: ",
-            Style::default().fg(theme::TEXT_SECONDARY),
+            Style::default().fg(theme::current().text_secondary),
         ));
     }
     line.spans.push(Span::styled(
         "[",
-        Style::default().fg(theme::TEXT_SECONDARY),
+        Style::default().fg(theme::current().text_secondary),
     ));
     for s in inner {
         line.spans.push(s.clone());
     }
     line.spans.push(Span::styled(
         "]",
-        Style::default().fg(theme::TEXT_SECONDARY),
+        Style::default().fg(theme::current().text_secondary),
     ));
 }
 
@@ -699,35 +747,36 @@ fn get_killswitch_indicator(app: &App) -> Span<'static> {
             KillSwitchMode::Auto => " KS:Watch… ",
             KillSwitchMode::AlwaysOn => " KS:VPN-only… ",
         };
-        return Span::styled(label, Style::default().fg(theme::WARNING));
+        return Span::styled(label, Style::default().fg(theme::current().warning));
     }
 
     match (app.runtime.killswitch_mode, app.runtime.killswitch_state) {
         (_, KillSwitchState::Degraded) => Span::styled(
             " KS:DEGRADED ",
             Style::default()
-                .fg(theme::ERROR)
+                .fg(theme::current().error)
                 .add_modifier(Modifier::BOLD),
         ),
         (KillSwitchMode::Off, _) | (_, KillSwitchState::Disabled) => {
-            Span::styled(" KS:Off ", Style::default().fg(theme::INACTIVE))
+            Span::styled(" KS:Off ", Style::default().fg(theme::current().inactive))
         }
         // AlwaysOn + Blocking is the steady state for VPN-only mode —
         // green/by-design, not an alarm. Caught before the generic
         // `(_, Blocking)` arm so it doesn't get the red alarm treatment.
-        (KillSwitchMode::AlwaysOn, KillSwitchState::Blocking) => {
-            Span::styled(" KS:VPN-only ", Style::default().fg(theme::SUCCESS))
-        }
+        (KillSwitchMode::AlwaysOn, KillSwitchState::Blocking) => Span::styled(
+            " KS:VPN-only ",
+            Style::default().fg(theme::current().success),
+        ),
         // Auto + Blocking means the VPN actually dropped and the
         // firewall engaged in response — that IS the alarm condition.
         (_, KillSwitchState::Blocking) => Span::styled(
             " KS:DROPPED ",
             Style::default()
-                .fg(theme::ERROR)
+                .fg(theme::current().error)
                 .add_modifier(Modifier::BOLD),
         ),
         (_, KillSwitchState::Armed) => {
-            Span::styled(" KS:Watch ", Style::default().fg(theme::SUCCESS))
+            Span::styled(" KS:Watch ", Style::default().fg(theme::current().success))
         }
     }
 }
@@ -971,7 +1020,7 @@ mod tests {
         // situation is suboptimal but tunnels ARE up, unlike the
         // genuine no-VPN state.
         let title_span = &line.spans[0];
-        assert_eq!(title_span.style.fg, Some(theme::WARNING));
+        assert_eq!(title_span.style.fg, Some(theme::current().warning));
         assert!(title_span.style.add_modifier.contains(Modifier::BOLD));
     }
 
@@ -987,8 +1036,8 @@ mod tests {
         let disc = render_disconnected_line(&app, ks.clone());
         let no_exit = render_no_exit_line(&app, ks);
 
-        assert_eq!(disc.spans[0].style.fg, Some(theme::ERROR));
-        assert_eq!(no_exit.spans[0].style.fg, Some(theme::WARNING));
+        assert_eq!(disc.spans[0].style.fg, Some(theme::current().error));
+        assert_eq!(no_exit.spans[0].style.fg, Some(theme::current().warning));
     }
 
     #[test]

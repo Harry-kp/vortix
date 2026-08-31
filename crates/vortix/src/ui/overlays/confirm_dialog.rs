@@ -52,14 +52,14 @@ pub fn render(frame: &mut Frame, config: ConfirmDialogConfig) {
             .bg(config.border_color)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(theme::TEXT_SECONDARY)
+        Style::default().fg(theme::current().text_secondary)
     };
     let no_style = if config.confirm_selected {
-        Style::default().fg(theme::TEXT_SECONDARY)
+        Style::default().fg(theme::current().text_secondary)
     } else {
         Style::default()
             .fg(Color::Black)
-            .bg(theme::ACCENT_PRIMARY)
+            .bg(theme::current().accent_primary)
             .add_modifier(Modifier::BOLD)
     };
 

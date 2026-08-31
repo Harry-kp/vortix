@@ -27,7 +27,7 @@ pub fn render(frame: &mut Frame, path: &str, cursor: usize) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::ACCENT_PRIMARY))
+        .border_style(Style::default().fg(theme::current().accent_primary))
         .title(constants::TITLE_IMPORT_PROFILE)
         .title_bottom(Line::from(constants::TITLE_IMPORT_FOOTER).centered());
 
@@ -45,49 +45,49 @@ pub fn render(frame: &mut Frame, path: &str, cursor: usize) {
         Line::from(""),
         Line::from(Span::styled(
             constants::PROMPT_IMPORT_PATH,
-            Style::default().fg(theme::TEXT_PRIMARY),
+            Style::default().fg(theme::current().text_primary),
         )),
         Line::from(""),
         Line::from(vec![
-            Span::styled(" > ", Style::default().fg(theme::TEXT_SECONDARY)),
-            Span::styled(before, Style::default().fg(theme::TEXT_PRIMARY)),
+            Span::styled(" > ", Style::default().fg(theme::current().text_secondary)),
+            Span::styled(before, Style::default().fg(theme::current().text_primary)),
             Span::styled(
                 cursor_char,
                 Style::default()
-                    .fg(theme::ACCENT_SECONDARY)
+                    .fg(theme::current().accent_secondary)
                     .add_modifier(Modifier::REVERSED)
                     .add_modifier(Modifier::SLOW_BLINK),
             ),
-            Span::styled(after, Style::default().fg(theme::TEXT_PRIMARY)),
+            Span::styled(after, Style::default().fg(theme::current().text_primary)),
         ]),
         Line::from(""),
         Line::from(Span::styled(
             constants::HINT_IMPORT_BULK,
-            Style::default().fg(theme::ACCENT_SECONDARY),
+            Style::default().fg(theme::current().accent_secondary),
         )),
         Line::from(""),
         Line::from(Span::styled(
             constants::LABEL_SUPPORTED_FORMATS,
-            Style::default().fg(theme::TEXT_SECONDARY),
+            Style::default().fg(theme::current().text_secondary),
         )),
         Line::from(vec![
             Span::styled(
                 format!("  {}", constants::EXT_CONF),
-                Style::default().fg(theme::NORD_PURPLE),
+                Style::default().fg(theme::current().nord_purple),
             ),
             Span::styled(
                 format!(" → {}", constants::PROTO_WIREGUARD),
-                Style::default().fg(theme::TEXT_SECONDARY),
+                Style::default().fg(theme::current().text_secondary),
             ),
         ]),
         Line::from(vec![
             Span::styled(
                 format!("  {}", constants::EXT_OVPN),
-                Style::default().fg(theme::WARNING),
+                Style::default().fg(theme::current().warning),
             ),
             Span::styled(
                 format!(" → {}", constants::PROTO_OPENVPN),
-                Style::default().fg(theme::TEXT_SECONDARY),
+                Style::default().fg(theme::current().text_secondary),
             ),
         ]),
     ];

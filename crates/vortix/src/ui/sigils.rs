@@ -55,8 +55,8 @@ pub enum SigilId {
     SgAlarmError,
 }
 
-/// A single sigil's visual + textual identity. Fields are `const`-
-/// initializable so the entire [`CATALOG`] can be a `const`.
+/// A single sigil's visual + textual identity. Theme colors are resolved when
+/// rendered so the immutable catalog remains shared by every built-in theme.
 #[derive(Clone, Copy, Debug)]
 pub struct Sigil {
     /// Stable identifier used by renderers + tests.
@@ -71,7 +71,7 @@ pub struct Sigil {
     pub description: &'static str,
     /// Foreground color. Renderers + help BOTH use this — guarantees
     /// the help-overlay swatch matches the on-screen sigil.
-    pub color: Color,
+    color: fn() -> Color,
     /// Whether to apply `Modifier::BOLD`.
     pub bold: bool,
     /// Whether to apply `Modifier::DIM`.
@@ -90,11 +90,17 @@ pub enum SigilCategory {
 }
 
 impl Sigil {
+    /// Resolve this sigil's semantic color through the active theme.
+    #[must_use]
+    pub fn color(&self) -> Color {
+        (self.color)()
+    }
+
     /// Build the [`Style`] a renderer applies to the glyph. Includes
     /// fg color + any BOLD/DIM modifiers declared in the catalog.
     #[must_use]
     pub fn style(&self) -> Style {
-        let mut s = Style::default().fg(self.color);
+        let mut s = Style::default().fg(self.color());
         if self.bold {
             s = s.add_modifier(Modifier::BOLD);
         }
@@ -103,6 +109,22 @@ impl Sigil {
         }
         s
     }
+}
+
+fn success_color() -> Color {
+    theme::current().success
+}
+
+fn warning_color() -> Color {
+    theme::current().warning
+}
+
+fn error_color() -> Color {
+    theme::current().error
+}
+
+fn inactive_color() -> Color {
+    theme::current().inactive
 }
 
 /// Look up a sigil by its [`SigilId`]. Panics if the catalog is
@@ -126,7 +148,7 @@ pub const CATALOG: &[Sigil] = &[
         glyph: "\u{25cf}",
         label: "Connected",
         description: "Tunnel is up and authoritatively tracked by vortix.",
-        color: theme::SUCCESS,
+        color: success_color,
         bold: false,
         dim: false,
         category: SigilCategory::Sidebar,
@@ -136,7 +158,7 @@ pub const CATALOG: &[Sigil] = &[
         glyph: "\u{25cf}",
         label: "Connected (external)",
         description: "Up but vortix can't reliably attribute the kernel interface to a PID — won't be elected as your exit.",
-        color: theme::INACTIVE,
+        color: inactive_color,
         bold: false,
         dim: true,
         category: SigilCategory::Sidebar,
@@ -146,7 +168,7 @@ pub const CATALOG: &[Sigil] = &[
         glyph: "\u{25d0}",
         label: "Connecting (OpenVPN)",
         description: "OpenVPN process startup and authentication are still in progress.",
-        color: theme::WARNING,
+        color: warning_color,
         bold: false,
         dim: false,
         category: SigilCategory::Sidebar,
@@ -156,7 +178,7 @@ pub const CATALOG: &[Sigil] = &[
         glyph: "\u{25d0}",
         label: "Handshaking (WireGuard)",
         description: "WireGuard waits for current-attempt peer evidence and cleans up after the configured handshake timeout.",
-        color: theme::WARNING,
+        color: warning_color,
         bold: false,
         dim: false,
         category: SigilCategory::Sidebar,
@@ -166,7 +188,7 @@ pub const CATALOG: &[Sigil] = &[
         glyph: "\u{21bb}",
         label: "Reconnecting",
         description: "Tunnel dropped; vortix is auto-retrying per the configured retry budget.",
-        color: theme::WARNING,
+        color: warning_color,
         bold: false,
         dim: true,
         category: SigilCategory::Sidebar,
@@ -176,7 +198,7 @@ pub const CATALOG: &[Sigil] = &[
         glyph: "\u{25d1}",
         label: "Disconnecting",
         description: "Teardown in flight (wg-quick / openvpn finishing up).",
-        color: theme::WARNING,
+        color: warning_color,
         bold: false,
         dim: false,
         category: SigilCategory::Sidebar,
@@ -186,7 +208,7 @@ pub const CATALOG: &[Sigil] = &[
         glyph: "?",
         label: "Awaiting input",
         description: "Waiting for you to type a 2FA code, passphrase, or similar. Focus Connection Details and press Enter.",
-        color: theme::WARNING,
+        color: warning_color,
         bold: false,
         dim: false,
         category: SigilCategory::Sidebar,
@@ -196,7 +218,7 @@ pub const CATALOG: &[Sigil] = &[
         glyph: "\u{2717}",
         label: "Failed",
         description: "Last connect attempt failed. The badge persists until you retry or dismiss the row.",
-        color: theme::ERROR,
+        color: error_color,
         bold: false,
         dim: false,
         category: SigilCategory::Sidebar,
@@ -206,7 +228,7 @@ pub const CATALOG: &[Sigil] = &[
         glyph: "*",
         label: "Primary marker",
         description: "Sidebar suffix on the current Primary tunnel. Cross-correlates with the header's CONNECTED-name and Connection Details' Role: Primary line.",
-        color: theme::SUCCESS,
+        color: success_color,
         bold: true,
         dim: false,
         category: SigilCategory::Sidebar,
@@ -216,7 +238,7 @@ pub const CATALOG: &[Sigil] = &[
         glyph: "!",
         label: "Risk annotation",
         description: "Side-suffix flagging a per-tunnel risk worth attention. Today: appears on Split tunnel (yielded) to flag the mode-mismatch.",
-        color: theme::WARNING,
+        color: warning_color,
         bold: true,
         dim: false,
         category: SigilCategory::Sidebar,
@@ -227,7 +249,7 @@ pub const CATALOG: &[Sigil] = &[
         glyph: "\u{2713}",
         label: "OK",
         description: "This row's check passes. Muted green so it fades into the all-OK state without competing for attention.",
-        color: theme::SUCCESS,
+        color: success_color,
         bold: false,
         dim: false,
         category: SigilCategory::SecurityGuard,
@@ -237,7 +259,7 @@ pub const CATALOG: &[Sigil] = &[
         glyph: "\u{2500}",
         label: "Not applicable",
         description: "This row's check doesn't apply on the current platform or in the current state. E.g., IPv6 when there's no v6 traffic to evaluate (host has no v6, or no Connected tunnel covers ::/0), or IP when no primary owns the default route.",
-        color: theme::INACTIVE,
+        color: inactive_color,
         bold: false,
         dim: false,
         category: SigilCategory::SecurityGuard,
@@ -247,7 +269,7 @@ pub const CATALOG: &[Sigil] = &[
         glyph: "\u{26a0}",
         label: "Warning",
         description: "Action recommended but not strictly broken. E.g., the kill switch is in Auto mode and the VPN is up but not yet armed in DROP state.",
-        color: theme::WARNING,
+        color: warning_color,
         bold: true,
         dim: false,
         category: SigilCategory::SecurityGuard,
@@ -257,7 +279,7 @@ pub const CATALOG: &[Sigil] = &[
         glyph: "\u{2717}",
         label: "Alarm",
         description: "Real problem the panel can quantify — IP leak, DNS leak, blocked egress. Always bold; typically has a sub-line explaining what to do.",
-        color: theme::ERROR,
+        color: error_color,
         bold: true,
         dim: false,
         category: SigilCategory::SecurityGuard,
@@ -363,12 +385,16 @@ mod tests {
     fn style_combines_color_and_modifiers() {
         // Sanity check on `Sigil::style()` — bold/dim flags compose
         // with the fg color.
+        fn red() -> Color {
+            Color::Red
+        }
+
         let bold_alarm = Sigil {
             id: SigilId::SgAlarmError,
             glyph: "x",
             label: "x",
             description: "x",
-            color: Color::Red,
+            color: red,
             bold: true,
             dim: false,
             category: SigilCategory::SecurityGuard,

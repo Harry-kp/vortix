@@ -70,7 +70,7 @@ pub fn render(frame: &mut Frame, mode: &BackgroundModeRecord, state: &Background
     frame.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::BORDER_FOCUSED))
+        .border_style(Style::default().fg(theme::current().border_focused))
         .title(format!(" {} ", state.workflow.title()));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -91,8 +91,8 @@ pub fn render(frame: &mut Frame, mode: &BackgroundModeRecord, state: &Background
             Span::styled(
                 format!("[ {label} ]"),
                 Style::default()
-                    .fg(theme::ROW_SELECTED_FG)
-                    .bg(theme::ROW_SELECTED_BG)
+                    .fg(theme::current().row_selected_fg)
+                    .bg(theme::current().row_selected_bg)
                     .add_modifier(Modifier::BOLD),
             )
         } else {

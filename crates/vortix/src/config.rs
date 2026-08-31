@@ -51,6 +51,8 @@ pub fn get_config_dir() -> std::io::Result<PathBuf> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AppConfig {
+    /// TUI color palette (`"synthwave"` or terminal-adaptive `"terminal"`).
+    pub theme: crate::theme::ThemeChoice,
     /// UI refresh rate in milliseconds.
     pub tick_rate: u64,
     /// Telemetry polling interval in seconds.
@@ -111,6 +113,7 @@ impl Default for AppConfig {
         use crate::constants;
 
         Self {
+            theme: crate::theme::ThemeChoice::default(),
             tick_rate: constants::DEFAULT_TICK_RATE,
             telemetry_poll_rate: constants::DEFAULT_TELEMETRY_POLL_RATE,
             api_timeout: constants::DEFAULT_API_TIMEOUT,
@@ -695,6 +698,18 @@ mod tests {
         let config = load_config(dir.path()).unwrap();
         assert_eq!(config.tick_rate, 500);
         assert_eq!(config.telemetry_poll_rate, 30); // default preserved
+    }
+
+    #[test]
+    fn test_load_config_terminal_theme() {
+        let dir = tempfile::Builder::new()
+            .prefix("vortix_test_")
+            .tempdir()
+            .unwrap();
+        std::fs::write(dir.path().join("config.toml"), "theme = \"terminal\"\n").unwrap();
+
+        let config = load_config(dir.path()).unwrap();
+        assert_eq!(config.theme, crate::theme::ThemeChoice::Terminal);
     }
 
     #[test]

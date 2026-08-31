@@ -12,9 +12,9 @@ use ratatui::{
 pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let is_focused = app.should_draw_focus(&crate::app::FocusedPanel::Logs);
     let border_style = if is_focused {
-        Style::default().fg(theme::BORDER_FOCUSED)
+        Style::default().fg(theme::current().border_focused)
     } else {
-        Style::default().fg(theme::BORDER_DEFAULT)
+        Style::default().fg(theme::current().border_default)
     };
 
     let filter_label = match app.log_level_filter {
@@ -71,20 +71,20 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
             );
 
             let level_style = match entry.level {
-                logger::LogLevel::Error => Style::default().fg(theme::ERROR),
-                logger::LogLevel::Warning => Style::default().fg(theme::WARNING),
-                logger::LogLevel::Info => Style::default().fg(theme::NORD_FROST_3),
+                logger::LogLevel::Error => Style::default().fg(theme::current().error),
+                logger::LogLevel::Warning => Style::default().fg(theme::current().warning),
+                logger::LogLevel::Info => Style::default().fg(theme::current().nord_frost_3),
                 logger::LogLevel::Debug => Style::default().fg(Color::DarkGray),
             };
 
             let msg_style = match entry.level {
-                logger::LogLevel::Error => Style::default().fg(theme::ERROR),
-                logger::LogLevel::Warning => Style::default().fg(theme::WARNING),
+                logger::LogLevel::Error => Style::default().fg(theme::current().error),
+                logger::LogLevel::Warning => Style::default().fg(theme::current().warning),
                 logger::LogLevel::Info => {
                     if entry.message.contains("Connected") || entry.message.contains("secure") {
-                        Style::default().fg(theme::SUCCESS)
+                        Style::default().fg(theme::current().success)
                     } else {
-                        Style::default().fg(theme::INACTIVE)
+                        Style::default().fg(theme::current().inactive)
                     }
                 }
                 logger::LogLevel::Debug => Style::default().fg(Color::DarkGray),
@@ -93,12 +93,12 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
             Line::from(vec![
                 Span::styled(
                     format!("[{time_str}] "),
-                    Style::default().fg(theme::TEXT_SECONDARY),
+                    Style::default().fg(theme::current().text_secondary),
                 ),
                 Span::styled(format!("{level_tag} "), level_style),
                 Span::styled(
                     format!("{cat}  "),
-                    Style::default().fg(theme::NORD_POLAR_NIGHT_4),
+                    Style::default().fg(theme::current().nord_polar_night_4),
                 ),
                 Span::styled(entry.message.clone(), msg_style),
             ])
@@ -127,8 +127,8 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
         .orientation(ScrollbarOrientation::VerticalRight)
         .begin_symbol(Some("↑"))
         .end_symbol(Some("↓"))
-        .style(Style::default().fg(theme::NORD_POLAR_NIGHT_4))
-        .thumb_style(Style::default().fg(theme::ACCENT_PRIMARY));
+        .style(Style::default().fg(theme::current().nord_polar_night_4))
+        .thumb_style(Style::default().fg(theme::current().accent_primary));
 
     let mut scrollbar_state = ScrollbarState::new(max_scroll).position(scroll_pos);
 

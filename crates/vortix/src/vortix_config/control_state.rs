@@ -7,6 +7,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::vortix_core::control::persistence::MAX_DURABLE_OPERATIONS;
 use crate::vortix_core::control::{
     BootConnection, ControlPersistenceConfig, ControlStateStore, ControlStateStoreError,
     DesiredState, DurableControlState, OperationId, OperationIntent, OperationRecord,
@@ -22,7 +23,6 @@ const PREVIOUS_STATE_FILE: &str = "control-state.previous.json";
 const ENDPOINT_CACHE_FILE: &str = "endpoint-resolutions.json";
 const MAX_STATE_BYTES: u64 = 1024 * 1024;
 const MAX_PROFILES: usize = 512;
-const MAX_OPERATIONS: usize = 512;
 const MAX_ROUTES_PER_PROFILE: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,7 +71,7 @@ impl PersistedControlState {
             || self.requested_resources.len() > MAX_PROFILES
             || self.last_connected_at.len() > MAX_PROFILES
             || self.tombstones.len() > MAX_PROFILES
-            || self.operations.len() > MAX_OPERATIONS
+            || self.operations.len() > MAX_DURABLE_OPERATIONS
         {
             return Err(ControlStateError::Capacity);
         }

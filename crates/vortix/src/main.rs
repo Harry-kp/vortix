@@ -229,6 +229,7 @@ fn main() -> Result<()> {
             std::process::exit(1);
         }
     };
+    vortix::theme::configure(app_config.theme);
 
     // Determine output mode from global flags
     let output_mode = if args.json {

@@ -31,11 +31,11 @@ pub fn render(frame: &mut Frame, app: &App, query: &str, cursor: usize, total: u
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::ACCENT_PRIMARY))
+        .border_style(Style::default().fg(theme::current().accent_primary))
         .title(Span::styled(
             " Search ",
             Style::default()
-                .fg(theme::ACCENT_PRIMARY)
+                .fg(theme::current().accent_primary)
                 .add_modifier(Modifier::BOLD),
         ))
         .title_bottom(Line::from(Span::styled(
@@ -54,12 +54,12 @@ pub fn render(frame: &mut Frame, app: &App, query: &str, cursor: usize, total: u
     let after: String = query.chars().skip(cursor + 1).collect();
 
     let mut spans = vec![
-        Span::styled("/", Style::default().fg(theme::ACCENT_PRIMARY)),
-        Span::styled(before, Style::default().fg(theme::TEXT_PRIMARY)),
+        Span::styled("/", Style::default().fg(theme::current().accent_primary)),
+        Span::styled(before, Style::default().fg(theme::current().text_primary)),
         Span::styled(
             cursor_char,
             Style::default()
-                .fg(theme::ACCENT_SECONDARY)
+                .fg(theme::current().accent_secondary)
                 .add_modifier(Modifier::REVERSED)
                 .add_modifier(Modifier::SLOW_BLINK),
         ),
@@ -67,7 +67,7 @@ pub fn render(frame: &mut Frame, app: &App, query: &str, cursor: usize, total: u
     if !after.is_empty() {
         spans.push(Span::styled(
             after,
-            Style::default().fg(theme::TEXT_PRIMARY),
+            Style::default().fg(theme::current().text_primary),
         ));
     }
 

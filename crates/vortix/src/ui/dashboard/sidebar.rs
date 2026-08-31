@@ -7,12 +7,12 @@
 //! states, awaits user input, and surfaces failures:
 //!
 //! ```text
-//!   '●'  Connected               → theme::SUCCESS (bold if primary)
-//!   '◐'  Connecting              → theme::WARNING
-//!   '↻'  Reconnecting            → theme::WARNING + Modifier::DIM
-//!   '◑'  Disconnecting           → theme::WARNING
-//!   '?'  AwaitingUserInput       → theme::WARNING
-//!   '✗'  Disconnected w/ failure → theme::ERROR
+//!   '●'  Connected               → theme::current().success (bold if primary)
+//!   '◐'  Connecting              → theme::current().warning
+//!   '↻'  Reconnecting            → theme::current().warning + Modifier::DIM
+//!   '◑'  Disconnecting           → theme::current().warning
+//!   '?'  AwaitingUserInput       → theme::current().warning
+//!   '✗'  Disconnected w/ failure → theme::current().error
 //!   ' '  Disconnected, no fail   → Color::Reset
 //! ```
 //!
@@ -42,7 +42,7 @@
 //!
 //! ## Accessibility note
 //!
-//! `↻` (U+21BB) and `◐` both render in `theme::WARNING`; the `↻` glyph carries
+//! `↻` (U+21BB) and `◐` both render in `theme::current().warning`; the `↻` glyph carries
 //! `Modifier::DIM` to keep monochrome / color-blind users discriminating by
 //! shape alone. Both glyphs are visually distinct shapes; no monochrome-mode
 //! regression. `unicode-width` reports `↻` as width=1 — verified by unit test
@@ -198,9 +198,9 @@ fn signal_for(
 pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let is_focused = app.should_draw_focus(&crate::app::FocusedPanel::Sidebar);
     let border_style = if is_focused {
-        Style::default().fg(theme::BORDER_FOCUSED)
+        Style::default().fg(theme::current().border_focused)
     } else {
-        Style::default().fg(theme::BORDER_DEFAULT)
+        Style::default().fg(theme::current().border_default)
     };
 
     let sort_label = app.runtime.sort_order.label();
@@ -222,7 +222,7 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
             Line::from(""),
             Line::from(Span::styled(
                 "No profiles yet",
-                Style::default().fg(theme::TEXT_SECONDARY),
+                Style::default().fg(theme::current().text_secondary),
             )),
             Line::from(""),
             Line::from(vec![
@@ -230,7 +230,7 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
                 Span::styled(
                     "[i]",
                     Style::default()
-                        .fg(theme::ACCENT_PRIMARY)
+                        .fg(theme::current().accent_primary)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(" to import", Style::default().fg(Color::DarkGray)),
@@ -271,15 +271,21 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
             let status_cell = if let Some((glyph, style)) = signal.badge {
                 let mut spans = vec![Span::styled(glyph, style)];
                 if signal.risk || profile_missing {
-                    spans.push(Span::styled("!", Style::default().fg(theme::WARNING)));
+                    spans.push(Span::styled(
+                        "!",
+                        Style::default().fg(theme::current().warning),
+                    ));
                 }
                 Cell::from(Line::from(spans))
             } else if profile_missing {
-                Cell::from(Span::styled("!", Style::default().fg(theme::WARNING)))
+                Cell::from(Span::styled(
+                    "!",
+                    Style::default().fg(theme::current().warning),
+                ))
             } else if idx < 9 {
                 Cell::from(Span::styled(
                     format!("{}", idx + 1),
-                    Style::default().fg(theme::TEXT_SECONDARY),
+                    Style::default().fg(theme::current().text_secondary),
                 ))
             } else {
                 Cell::from(Span::styled(" ", Style::default()))
@@ -294,14 +300,14 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
             let name_budget = name_cell_width.saturating_sub(primary_reserve).max(1);
 
             let name_style = if profile_missing {
-                Style::default().fg(theme::WARNING)
+                Style::default().fg(theme::current().warning)
             } else if is_selected && signal.is_active {
                 Style::default()
                     .fg(signal.accent)
                     .add_modifier(Modifier::BOLD)
             } else if is_selected {
                 Style::default()
-                    .fg(theme::ROW_SELECTED_FG)
+                    .fg(theme::current().row_selected_fg)
                     .add_modifier(Modifier::BOLD)
             } else if signal.is_primary {
                 Style::default()
@@ -312,7 +318,7 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
             } else if is_never_used {
                 Style::default().fg(Color::DarkGray)
             } else {
-                Style::default().fg(theme::INACTIVE)
+                Style::default().fg(theme::current().inactive)
             };
 
             let display_name = utils::truncate(&p.name, name_budget);
@@ -334,9 +340,9 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
             let proto_color = if signal.is_active {
                 signal.accent
             } else if is_selected {
-                theme::ACCENT_PRIMARY
+                theme::current().accent_primary
             } else {
-                theme::TEXT_SECONDARY
+                theme::current().text_secondary
             };
 
             let time_str = if let Some(last_used) = p.last_used {
@@ -351,7 +357,7 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
             };
 
             let row_style = if is_selected {
-                Style::default().bg(theme::ROW_SELECTED_BG)
+                Style::default().bg(theme::current().row_selected_bg)
             } else {
                 Style::default()
             };
@@ -380,8 +386,8 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
         .orientation(ScrollbarOrientation::VerticalRight)
         .begin_symbol(Some("↑"))
         .end_symbol(Some("↓"))
-        .style(Style::default().fg(theme::NORD_POLAR_NIGHT_4))
-        .thumb_style(Style::default().fg(theme::ACCENT_PRIMARY));
+        .style(Style::default().fg(theme::current().nord_polar_night_4))
+        .thumb_style(Style::default().fg(theme::current().accent_primary));
 
     let mut scrollbar_state = ScrollbarState::new(
         app.runtime
@@ -616,7 +622,7 @@ mod tests {
         // value/lightness.
         assert_eq!(
             style.fg,
-            Some(theme::INACTIVE),
+            Some(theme::current().inactive),
             "unauthoritative Connected must use the inactive color"
         );
     }
@@ -636,7 +642,7 @@ mod tests {
             status_badge_for(&snap, Some(Protocol::WireGuard)).expect("connected → badge");
         assert_eq!(glyph, "●");
         assert!(!style.add_modifier.contains(Modifier::DIM));
-        assert_eq!(style.fg, Some(theme::SUCCESS));
+        assert_eq!(style.fg, Some(theme::current().success));
     }
 
     #[test]
@@ -684,7 +690,7 @@ mod tests {
         let (glyph, style) =
             status_badge_for(&snap, Some(Protocol::WireGuard)).expect("failure → badge");
         assert_eq!(glyph, "✗");
-        assert_eq!(style.fg, Some(theme::ERROR));
+        assert_eq!(style.fg, Some(theme::current().error));
     }
 
     // ── width discipline ──────────────────────────────────────────────

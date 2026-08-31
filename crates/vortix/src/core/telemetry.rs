@@ -1084,6 +1084,7 @@ rtt min/avg/max/mdev = 1.234/5.678/9.012/3.456 ms";
     #[test]
     fn test_telemetry_config_from_app_config() {
         let app_cfg = crate::config::AppConfig {
+            theme: crate::theme::ThemeChoice::Synthwave,
             tick_rate: 500, // not used by TelemetryConfig
             telemetry_poll_rate: 45,
             api_timeout: 8,

@@ -24,9 +24,9 @@ use ratatui::{
 pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     let is_focused = app.should_draw_focus(&crate::app::FocusedPanel::ConnectionDetails);
     let border_style = if is_focused {
-        Style::default().fg(theme::BORDER_FOCUSED)
+        Style::default().fg(theme::current().border_focused)
     } else {
-        Style::default().fg(theme::BORDER_DEFAULT)
+        Style::default().fg(theme::current().border_default)
     };
 
     if app.effective_flipped(&crate::app::FocusedPanel::ConnectionDetails) {
@@ -124,25 +124,34 @@ fn render_connected(
     };
     let mut text = vec![
         Line::from(vec![
-            Span::styled("VPN IP  : ", Style::default().fg(theme::TEXT_SECONDARY)),
+            Span::styled(
+                "VPN IP  : ",
+                Style::default().fg(theme::current().text_secondary),
+            ),
             Span::styled(
                 &details.internal_ip,
                 Style::default()
-                    .fg(theme::ACCENT_PRIMARY)
+                    .fg(theme::current().accent_primary)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!(" @ {iface_display}"),
                 Style::default().fg(if details.interface_authoritative {
-                    theme::TEXT_SECONDARY
+                    theme::current().text_secondary
                 } else {
-                    theme::INACTIVE
+                    theme::current().inactive
                 }),
             ),
         ]),
         Line::from(vec![
-            Span::styled("Server  : ", Style::default().fg(theme::TEXT_SECONDARY)),
-            Span::styled(&details.endpoint, Style::default().fg(theme::TEXT_PRIMARY)),
+            Span::styled(
+                "Server  : ",
+                Style::default().fg(theme::current().text_secondary),
+            ),
+            Span::styled(
+                &details.endpoint,
+                Style::default().fg(theme::current().text_primary),
+            ),
         ]),
     ];
 
@@ -160,17 +169,20 @@ fn render_connected(
         let isp_budget = (available * 60 / 100).min(available);
         let loc_budget = available.saturating_sub(isp_budget);
         text.push(Line::from(vec![
-            Span::styled("Exit    : ", Style::default().fg(theme::TEXT_SECONDARY)),
+            Span::styled(
+                "Exit    : ",
+                Style::default().fg(theme::current().text_secondary),
+            ),
             Span::styled(
                 utils::truncate(&app.runtime.isp, isp_budget),
-                Style::default().fg(theme::TEXT_PRIMARY),
+                Style::default().fg(theme::current().text_primary),
             ),
-            Span::styled(" (", Style::default().fg(theme::TEXT_SECONDARY)),
+            Span::styled(" (", Style::default().fg(theme::current().text_secondary)),
             Span::styled(
                 utils::truncate(&app.runtime.location, loc_budget),
-                Style::default().fg(theme::TEXT_PRIMARY),
+                Style::default().fg(theme::current().text_primary),
             ),
-            Span::styled(")", Style::default().fg(theme::TEXT_SECONDARY)),
+            Span::styled(")", Style::default().fg(theme::current().text_secondary)),
         ]));
     }
 
@@ -182,18 +194,21 @@ fn render_connected(
         } else {
             details.latest_handshake.clone()
         };
-        ("Crypto  : ", cipher, theme::NORD_YELLOW)
+        ("Crypto  : ", cipher, theme::current().yellow)
     } else {
         let handshake_str = if details.latest_handshake.is_empty() {
             "ChaCha20-Poly1305".to_string()
         } else {
             format!("ChaCha20 ({})", details.latest_handshake)
         };
-        ("Crypto  : ", handshake_str, theme::NORD_YELLOW)
+        ("Crypto  : ", handshake_str, theme::current().yellow)
     };
 
     text.push(Line::from(vec![
-        Span::styled(proto_label, Style::default().fg(theme::TEXT_SECONDARY)),
+        Span::styled(
+            proto_label,
+            Style::default().fg(theme::current().text_secondary),
+        ),
         Span::styled(
             if proto_value.is_empty() {
                 "-"
@@ -215,37 +230,49 @@ fn render_connected(
     {
         let route = allowed_routes.first().map_or("route", String::as_str);
         text.push(Line::from(vec![
-            Span::styled("Health  : ", Style::default().fg(theme::TEXT_SECONDARY)),
+            Span::styled(
+                "Health  : ",
+                Style::default().fg(theme::current().text_secondary),
+            ),
             Span::styled(
                 format!("Handshake stale {seconds_since_last_handshake}s ({route})"),
-                Style::default().fg(theme::WARNING),
+                Style::default().fg(theme::current().warning),
             ),
         ]));
     }
 
     text.push(Line::from(vec![
-        Span::styled("Transfer: ", Style::default().fg(theme::TEXT_SECONDARY)),
-        Span::styled("↓", Style::default().fg(theme::NORD_FROST_3)),
+        Span::styled(
+            "Transfer: ",
+            Style::default().fg(theme::current().text_secondary),
+        ),
+        Span::styled("↓", Style::default().fg(theme::current().nord_frost_3)),
         Span::styled(
             if details.transfer_rx.is_empty() {
                 "0"
             } else {
                 &details.transfer_rx
             },
-            Style::default().fg(theme::TEXT_PRIMARY),
+            Style::default().fg(theme::current().text_primary),
         ),
-        Span::styled(" ↑", Style::default().fg(theme::NORD_GREEN)),
+        Span::styled(" ↑", Style::default().fg(theme::current().success)),
         Span::styled(
             if details.transfer_tx.is_empty() {
                 "0"
             } else {
                 &details.transfer_tx
             },
-            Style::default().fg(theme::TEXT_PRIMARY),
+            Style::default().fg(theme::current().text_primary),
         ),
-        Span::styled(" (MTU:", Style::default().fg(theme::TEXT_SECONDARY)),
-        Span::styled(mtu_str, Style::default().fg(theme::TEXT_SECONDARY)),
-        Span::styled(")", Style::default().fg(theme::TEXT_SECONDARY)),
+        Span::styled(
+            " (MTU:",
+            Style::default().fg(theme::current().text_secondary),
+        ),
+        Span::styled(
+            mtu_str,
+            Style::default().fg(theme::current().text_secondary),
+        ),
+        Span::styled(")", Style::default().fg(theme::current().text_secondary)),
     ]));
 
     text.push(Line::from(""));
@@ -256,14 +283,17 @@ fn render_connected(
             app.runtime.packet_loss,
             app.runtime.jitter_ms,
         ) {
-            QualityLevel::Unknown => ("UNKNOWN", theme::TEXT_SECONDARY),
-            QualityLevel::Poor => ("POOR", theme::NORD_RED),
-            QualityLevel::Fair => ("FAIR", theme::NORD_YELLOW),
-            QualityLevel::Excellent => ("EXCELLENT", theme::NORD_GREEN),
+            QualityLevel::Unknown => ("UNKNOWN", theme::current().text_secondary),
+            QualityLevel::Poor => ("POOR", theme::current().error),
+            QualityLevel::Fair => ("FAIR", theme::current().yellow),
+            QualityLevel::Excellent => ("EXCELLENT", theme::current().success),
         };
 
         text.push(Line::from(vec![
-            Span::styled("Quality: ", Style::default().fg(theme::TEXT_SECONDARY)),
+            Span::styled(
+                "Quality: ",
+                Style::default().fg(theme::current().text_secondary),
+            ),
             Span::styled(
                 quality_status.0,
                 Style::default()
@@ -273,16 +303,16 @@ fn render_connected(
         ]));
 
         let latency_color = if app.runtime.latency_ms < 50 {
-            theme::NORD_GREEN
+            theme::current().success
         } else if app.runtime.latency_ms < 150 {
-            theme::NORD_YELLOW
+            theme::current().yellow
         } else {
-            theme::NORD_RED
+            theme::current().error
         };
         text.push(Line::from(vec![
             Span::styled(
                 "  ├─ Ping (Latency)   : ",
-                Style::default().fg(theme::TEXT_SECONDARY),
+                Style::default().fg(theme::current().text_secondary),
             ),
             Span::styled(
                 format!("{}ms", app.runtime.latency_ms),
@@ -291,16 +321,16 @@ fn render_connected(
         ]));
 
         let jitter_color = if app.runtime.jitter_ms < 5 {
-            theme::NORD_GREEN
+            theme::current().success
         } else if app.runtime.jitter_ms < 15 {
-            theme::NORD_YELLOW
+            theme::current().yellow
         } else {
-            theme::NORD_RED
+            theme::current().error
         };
         text.push(Line::from(vec![
             Span::styled(
                 "  ├─ Stability (Jitter): ",
-                Style::default().fg(theme::TEXT_SECONDARY),
+                Style::default().fg(theme::current().text_secondary),
             ),
             Span::styled(
                 format!("±{}ms", app.runtime.jitter_ms),
@@ -311,14 +341,14 @@ fn render_connected(
         text.push(Line::from(vec![
             Span::styled(
                 "  └─ Reliability (Loss): ",
-                Style::default().fg(theme::TEXT_SECONDARY),
+                Style::default().fg(theme::current().text_secondary),
             ),
             Span::styled(
                 format!("{:.1}%", app.runtime.packet_loss),
                 Style::default().fg(if app.runtime.packet_loss < 1.0 {
-                    theme::NORD_GREEN
+                    theme::current().success
                 } else {
-                    theme::NORD_RED
+                    theme::current().error
                 }),
             ),
         ]));
@@ -330,15 +360,18 @@ fn render_connected(
         // understands why this particular profile doesn't show a
         // value and can pick the active-exit row to see real numbers.
         text.push(Line::from(vec![
-            Span::styled("Latency: ", Style::default().fg(theme::TEXT_SECONDARY)),
-            Span::styled("n/a", Style::default().fg(theme::INACTIVE)),
+            Span::styled(
+                "Latency: ",
+                Style::default().fg(theme::current().text_secondary),
+            ),
+            Span::styled("n/a", Style::default().fg(theme::current().inactive)),
         ]));
         text.push(Line::from(vec![
             Span::styled("         ", Style::default()),
             Span::styled(
                 "only measured on the active exit",
                 Style::default()
-                    .fg(theme::TEXT_SECONDARY)
+                    .fg(theme::current().text_secondary)
                     .add_modifier(Modifier::DIM),
             ),
         ]));
@@ -346,19 +379,25 @@ fn render_connected(
 
     text.push(Line::from(""));
     let rel_spans = vec![
-        Span::styled("Stats   : ", Style::default().fg(theme::TEXT_SECONDARY)),
-        Span::styled("PID ", Style::default().fg(theme::TEXT_SECONDARY)),
+        Span::styled(
+            "Stats   : ",
+            Style::default().fg(theme::current().text_secondary),
+        ),
+        Span::styled("PID ", Style::default().fg(theme::current().text_secondary)),
         Span::styled(
             details.pid.map_or("-".to_string(), |p| p.to_string()),
-            Style::default().fg(theme::TEXT_PRIMARY),
+            Style::default().fg(theme::current().text_primary),
         ),
-        Span::styled(" | Drops ", Style::default().fg(theme::TEXT_SECONDARY)),
+        Span::styled(
+            " | Drops ",
+            Style::default().fg(theme::current().text_secondary),
+        ),
         Span::styled(
             format!("{}", app.runtime.connection_drops),
             Style::default().fg(if app.runtime.connection_drops > 0 {
-                theme::NORD_RED
+                theme::current().error
             } else {
-                theme::TEXT_PRIMARY
+                theme::current().text_primary
             }),
         ),
     ];
@@ -402,18 +441,22 @@ fn render_transitional(frame: &mut Frame, app: &App, inner: Rect, snap: &TunnelS
                         "Connecting"
                     }
                 ),
-                theme::NORD_YELLOW,
+                theme::current().yellow,
             )
         }
         Connection::Reconnecting { attempt, .. } => (
             format!("Reconnecting (attempt {attempt})"),
-            theme::NORD_YELLOW,
+            theme::current().yellow,
         ),
-        Connection::Disconnecting { .. } => ("Disconnecting".to_string(), theme::TEXT_SECONDARY),
-        Connection::AwaitingUserInput { .. } => ("Awaiting input".to_string(), theme::WARNING),
+        Connection::Disconnecting { .. } => {
+            ("Disconnecting".to_string(), theme::current().text_secondary)
+        }
+        Connection::AwaitingUserInput { .. } => {
+            ("Awaiting input".to_string(), theme::current().warning)
+        }
         // Unreachable in practice — render_transitional is only invoked for
         // the four variants above — but the match needs to be exhaustive.
-        _ => ("Pending".to_string(), theme::TEXT_SECONDARY),
+        _ => ("Pending".to_string(), theme::current().text_secondary),
     };
 
     text.push(Line::from(Span::styled(
@@ -427,14 +470,23 @@ fn render_transitional(frame: &mut Frame, app: &App, inner: Rect, snap: &TunnelS
     if let Some(idx) = app.profile_list_state.selected() {
         if let Some(profile) = app.runtime.profiles.get(idx) {
             text.push(Line::from(vec![
-                Span::styled("Profile : ", Style::default().fg(theme::TEXT_SECONDARY)),
-                Span::styled(&profile.name, Style::default().fg(theme::ACCENT_PRIMARY)),
+                Span::styled(
+                    "Profile : ",
+                    Style::default().fg(theme::current().text_secondary),
+                ),
+                Span::styled(
+                    &profile.name,
+                    Style::default().fg(theme::current().accent_primary),
+                ),
             ]));
             text.push(Line::from(vec![
-                Span::styled("Protocol: ", Style::default().fg(theme::TEXT_SECONDARY)),
+                Span::styled(
+                    "Protocol: ",
+                    Style::default().fg(theme::current().text_secondary),
+                ),
                 Span::styled(
                     profile.protocol.to_string(),
-                    Style::default().fg(theme::TEXT_PRIMARY),
+                    Style::default().fg(theme::current().text_primary),
                 ),
             ]));
         }
@@ -453,7 +505,7 @@ fn render_transitional(frame: &mut Frame, app: &App, inner: Rect, snap: &TunnelS
     if app.registry.tunnel_count() > 1 {
         text.push(Line::from(vec![Span::styled(
             "Press [Tab] to cycle focused tunnel",
-            Style::default().fg(theme::TEXT_SECONDARY),
+            Style::default().fg(theme::current().text_secondary),
         )]));
     }
 
@@ -472,25 +524,26 @@ fn render_profile_unavailable(frame: &mut Frame, inner: Rect) {
         Line::from(Span::styled(
             "Profile no longer available",
             Style::default()
-                .fg(theme::INACTIVE)
+                .fg(theme::current().inactive)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from(Span::styled(
             "Select another profile from the sidebar.",
-            Style::default().fg(theme::TEXT_SECONDARY),
+            Style::default().fg(theme::current().text_secondary),
         )),
     ];
     frame.render_widget(Paragraph::new(text), inner);
 }
 
 fn render_disconnected(frame: &mut Frame, app: &App, inner: Rect) {
+    let palette = theme::current();
     let max_lines = inner.height as usize;
     let mut text: Vec<Line> = vec![
         Line::from(Span::styled(
             "Not Connected",
             Style::default()
-                .fg(theme::INACTIVE)
+                .fg(palette.inactive)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
@@ -499,32 +552,32 @@ fn render_disconnected(frame: &mut Frame, app: &App, inner: Rect) {
     if let Some(idx) = app.profile_list_state.selected() {
         if let Some(profile) = app.runtime.profiles.get(idx) {
             text.push(Line::from(vec![
-                Span::styled("Profile : ", Style::default().fg(theme::TEXT_SECONDARY)),
-                Span::styled(&profile.name, Style::default().fg(theme::ACCENT_PRIMARY)),
+                Span::styled("Profile : ", Style::default().fg(palette.text_secondary)),
+                Span::styled(&profile.name, Style::default().fg(palette.accent_primary)),
             ]));
             text.push(Line::from(vec![
-                Span::styled("Protocol: ", Style::default().fg(theme::TEXT_SECONDARY)),
+                Span::styled("Protocol: ", Style::default().fg(palette.text_secondary)),
                 Span::styled(
                     profile.protocol.to_string(),
-                    Style::default().fg(theme::TEXT_PRIMARY),
+                    Style::default().fg(palette.text_primary),
                 ),
             ]));
             text.push(Line::from(vec![
-                Span::styled("Config  : ", Style::default().fg(theme::TEXT_SECONDARY)),
+                Span::styled("Config  : ", Style::default().fg(palette.text_secondary)),
                 Span::styled(
                     utils::truncate(
                         &profile.config_path.display().to_string(),
                         inner.width.saturating_sub(10) as usize,
                     ),
-                    Style::default().fg(theme::TEXT_SECONDARY),
+                    Style::default().fg(palette.text_secondary),
                 ),
             ]));
             if let Some(last_used) = profile.last_used {
                 text.push(Line::from(vec![
-                    Span::styled("Last use: ", Style::default().fg(theme::TEXT_SECONDARY)),
+                    Span::styled("Last use: ", Style::default().fg(palette.text_secondary)),
                     Span::styled(
                         utils::format_relative_time(last_used),
-                        Style::default().fg(theme::TEXT_PRIMARY),
+                        Style::default().fg(palette.text_primary),
                     ),
                 ]));
             }
@@ -533,8 +586,8 @@ fn render_disconnected(frame: &mut Frame, app: &App, inner: Rect) {
 
             if !app.runtime.public_ip.is_empty() {
                 text.push(Line::from(vec![
-                    Span::styled("Your IP : ", Style::default().fg(theme::TEXT_SECONDARY)),
-                    Span::styled(&app.runtime.public_ip, Style::default().fg(theme::WARNING)),
+                    Span::styled("Your IP : ", Style::default().fg(palette.text_secondary)),
+                    Span::styled(&app.runtime.public_ip, Style::default().fg(palette.warning)),
                 ]));
             }
             if !app.runtime.isp.is_empty()
@@ -542,18 +595,18 @@ fn render_disconnected(frame: &mut Frame, app: &App, inner: Rect) {
                 && app.runtime.isp != constants::MSG_DETECTING
             {
                 text.push(Line::from(vec![
-                    Span::styled("ISP     : ", Style::default().fg(theme::TEXT_SECONDARY)),
-                    Span::styled(&app.runtime.isp, Style::default().fg(theme::TEXT_PRIMARY)),
+                    Span::styled("ISP     : ", Style::default().fg(palette.text_secondary)),
+                    Span::styled(&app.runtime.isp, Style::default().fg(palette.text_primary)),
                 ]));
             }
             if !app.runtime.dns_server.is_empty()
                 && app.runtime.dns_server != constants::MSG_DETECTING
             {
                 text.push(Line::from(vec![
-                    Span::styled("DNS     : ", Style::default().fg(theme::TEXT_SECONDARY)),
+                    Span::styled("DNS     : ", Style::default().fg(palette.text_secondary)),
                     Span::styled(
                         &app.runtime.dns_server,
-                        Style::default().fg(theme::TEXT_PRIMARY),
+                        Style::default().fg(palette.text_primary),
                     ),
                 ]));
             }
@@ -561,7 +614,7 @@ fn render_disconnected(frame: &mut Frame, app: &App, inner: Rect) {
     } else {
         text.push(Line::from(vec![Span::styled(
             "Select a profile from the sidebar",
-            Style::default().fg(theme::TEXT_SECONDARY),
+            Style::default().fg(palette.text_secondary),
         )]));
     }
 
@@ -600,7 +653,7 @@ fn role_line(role: &Role) -> Line<'static> {
             } else {
                 format!("Primary ({})", format_role_cidrs(allowed_ips))
             },
-            theme::NORD_GREEN,
+            theme::current().success,
         ),
         Role::Addressable { allowed_ips } => (
             if allowed_ips.is_empty() {
@@ -608,7 +661,7 @@ fn role_line(role: &Role) -> Line<'static> {
             } else {
                 format!("Split tunnel ({})", format_role_cidrs(allowed_ips))
             },
-            theme::ACCENT_PRIMARY,
+            theme::current().accent_primary,
         ),
         Role::AddressableSuppressed { allowed_ips } => (
             if allowed_ips.is_empty() {
@@ -616,16 +669,19 @@ fn role_line(role: &Role) -> Line<'static> {
             } else {
                 format!("Split tunnel ({}, yielded)", format_role_cidrs(allowed_ips))
             },
-            theme::NORD_YELLOW,
+            theme::current().yellow,
         ),
         Role::Reconnecting { prior_role } => (
             format!("Reconnecting via {}", role_kind_label(prior_role)),
-            theme::NORD_YELLOW,
+            theme::current().yellow,
         ),
-        Role::AwaitingInput => ("n/a (awaiting input)".to_string(), theme::WARNING),
+        Role::AwaitingInput => ("n/a (awaiting input)".to_string(), theme::current().warning),
     };
     Line::from(vec![
-        Span::styled("Role    : ", Style::default().fg(theme::TEXT_SECONDARY)),
+        Span::styled(
+            "Role    : ",
+            Style::default().fg(theme::current().text_secondary),
+        ),
         Span::styled(value, Style::default().fg(color)),
     ])
 }
@@ -666,11 +722,11 @@ fn awaiting_user_input_hint(
         PromptKind::Generic { .. } => "input",
     };
     Line::from(vec![
-        Span::styled("⚠ ", Style::default().fg(theme::WARNING)),
+        Span::styled("⚠ ", Style::default().fg(theme::current().warning)),
         Span::styled(
             format!("Press [Enter] to provide {what}"),
             Style::default()
-                .fg(theme::WARNING)
+                .fg(theme::current().warning)
                 .add_modifier(Modifier::BOLD),
         ),
     ])
@@ -713,16 +769,16 @@ fn fwmark_warning_line(app: &App, snap: &TunnelSnapshot) -> Option<Line<'static>
     }
 
     Some(Line::from(vec![
-        Span::styled("⚠ ", Style::default().fg(theme::WARNING)),
+        Span::styled("⚠ ", Style::default().fg(theme::current().warning)),
         Span::styled(
             "Fwmark hijack risk: add 'FwMark = 51820' to your WG config. ",
             Style::default()
-                .fg(theme::WARNING)
+                .fg(theme::current().warning)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             "See docs/multi-tunnel-fwmark.md",
-            Style::default().fg(theme::TEXT_SECONDARY),
+            Style::default().fg(theme::current().text_secondary),
         ),
     ]))
 }
@@ -756,7 +812,7 @@ fn render_back(frame: &mut Frame, app: &App, area: Rect, border_style: Style) {
         .title_bottom(
             Line::from(Span::styled(
                 constants::FLIP_BACK_HINT,
-                Style::default().fg(theme::KEY_HINT_DESC),
+                Style::default().fg(theme::current().key_hint_desc),
             ))
             .right_aligned(),
         );
@@ -765,55 +821,64 @@ fn render_back(frame: &mut Frame, app: &App, area: Rect, border_style: Style) {
     frame.render_widget(block, area);
 
     let latency_color = if app.runtime.latency_ms < 50 {
-        theme::NORD_GREEN
+        theme::current().success
     } else if app.runtime.latency_ms < 150 {
-        theme::NORD_YELLOW
+        theme::current().yellow
     } else {
-        theme::NORD_RED
+        theme::current().error
     };
 
     let text = vec![
         Line::from(Span::styled(
             "Session Quality History",
             Style::default()
-                .fg(theme::ACCENT_PRIMARY)
+                .fg(theme::current().accent_primary)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  Latency : ", Style::default().fg(theme::TEXT_SECONDARY)),
+            Span::styled(
+                "  Latency : ",
+                Style::default().fg(theme::current().text_secondary),
+            ),
             Span::styled(
                 format!("{}ms", app.runtime.latency_ms),
                 Style::default().fg(latency_color),
             ),
         ]),
         Line::from(vec![
-            Span::styled("  Jitter  : ", Style::default().fg(theme::TEXT_SECONDARY)),
+            Span::styled(
+                "  Jitter  : ",
+                Style::default().fg(theme::current().text_secondary),
+            ),
             Span::styled(
                 format!("±{}ms", app.runtime.jitter_ms),
-                Style::default().fg(theme::TEXT_PRIMARY),
+                Style::default().fg(theme::current().text_primary),
             ),
         ]),
         Line::from(vec![
-            Span::styled("  Loss    : ", Style::default().fg(theme::TEXT_SECONDARY)),
+            Span::styled(
+                "  Loss    : ",
+                Style::default().fg(theme::current().text_secondary),
+            ),
             Span::styled(
                 format!("{:.1}%", app.runtime.packet_loss),
-                Style::default().fg(theme::TEXT_PRIMARY),
+                Style::default().fg(theme::current().text_primary),
             ),
         ]),
         Line::from(""),
         Line::from(Span::styled(
             "  Sparkline history & session stats",
-            Style::default().fg(theme::TEXT_SECONDARY),
+            Style::default().fg(theme::current().text_secondary),
         )),
         Line::from(Span::styled(
             "  will be available in a future release.",
-            Style::default().fg(theme::TEXT_SECONDARY),
+            Style::default().fg(theme::current().text_secondary),
         )),
         Line::from(""),
         Line::from(Span::styled(
             "  See: github.com/Harry-kp/vortix/issues/167",
-            Style::default().fg(theme::NORD_POLAR_NIGHT_4),
+            Style::default().fg(theme::current().nord_polar_night_4),
         )),
     ];
 

@@ -1,17 +1,37 @@
 //! Theming infrastructure for the Vortix UI.
 //!
 //! All UI colors are defined in a single [`Theme`] struct. The active theme
-//! is returned by [`current()`]. Adding a new theme is just adding one more
-//! `const Theme` block and wiring it into `current()`.
-//!
-//! ## Phase 1 (v0.1.8): Foundation
-//! All hardcoded colors live in `Theme`. A single built-in theme (`SYNTHWAVE`).
-//!
-//! ## Phase 2 (future): User Selection
-//! `theme` field in `config.toml`, multiple built-in themes, runtime switching.
+//! is returned by [`current()`]. The selected palette is installed once from
+//! `config.toml` before the TUI is rendered.
 
 #![allow(dead_code)]
 use ratatui::style::Color;
+use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
+
+/// Built-in theme selected through the top-level `theme` key in `config.toml`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeChoice {
+    /// Fixed 24-bit palette retained as the default for compatibility.
+    #[default]
+    Synthwave,
+    /// Terminal-native foreground/background plus named ANSI status colors.
+    Terminal,
+}
+
+impl ThemeChoice {
+    /// Resolve this choice to its immutable palette.
+    #[must_use]
+    pub const fn palette(self) -> &'static Theme {
+        match self {
+            Self::Synthwave => &SYNTHWAVE,
+            Self::Terminal => &TERMINAL,
+        }
+    }
+}
+
+static ACTIVE_THEME: OnceLock<&'static Theme> = OnceLock::new();
 
 // ── Theme struct ─────────────────────────────────────────────────────────
 
@@ -128,11 +148,65 @@ pub const SYNTHWAVE: Theme = Theme {
     nord_purple: Color::Rgb(180, 142, 173),
 };
 
-/// Returns the active theme. Phase 1 always returns `SYNTHWAVE`.
-/// Phase 2 will read from user config and support runtime switching.
+/// Terminal-adaptive theme. Ordinary surfaces and text inherit the user's
+/// terminal palette; semantic signals use only the named ANSI colors.
+pub const TERMINAL: Theme = Theme {
+    warm_bg: Color::Reset,
+    panel_bg: Color::Reset,
+    panel_bg_dark: Color::Reset,
+    panel_header_bg: Color::Reset,
+
+    accent_primary: Color::Cyan,
+    accent_secondary: Color::LightCyan,
+    accent_dark: Color::Blue,
+    teal_accent: Color::Cyan,
+
+    success: Color::Green,
+    warning: Color::Yellow,
+    error: Color::Red,
+    inactive: Color::DarkGray,
+
+    text_primary: Color::Reset,
+    text_secondary: Color::Reset,
+    text_light: Color::Reset,
+    text_dark: Color::Black,
+
+    border_default: Color::DarkGray,
+    border_focused: Color::Cyan,
+
+    row_selected_bg: Color::Blue,
+    row_selected_fg: Color::White,
+
+    btn_connect_bg: Color::Cyan,
+    btn_terminate_bg: Color::Red,
+    btn_default_bg: Color::Blue,
+
+    key_hint: Color::Cyan,
+    key_hint_desc: Color::DarkGray,
+    separator: Color::DarkGray,
+
+    toast_info: Color::Cyan,
+    toast_success: Color::Green,
+    toast_warning: Color::Yellow,
+    toast_error: Color::Red,
+
+    yellow: Color::Yellow,
+    nord_polar_night_3: Color::DarkGray,
+    nord_polar_night_4: Color::DarkGray,
+    nord_frost_3: Color::Blue,
+    nord_purple: Color::Magenta,
+};
+
+/// Install the process theme before rendering. The first selection wins for
+/// the lifetime of the process so one frame cannot mix palettes.
+pub fn configure(choice: ThemeChoice) {
+    let _ = ACTIVE_THEME.set(choice.palette());
+}
+
+/// Returns the active theme.
 #[must_use]
 pub fn current() -> &'static Theme {
-    &SYNTHWAVE
+    ACTIVE_THEME.get_or_init(|| &SYNTHWAVE)
 }
 
 // ── Backward-compatible const aliases ────────────────────────────────────
@@ -242,5 +316,25 @@ mod tests {
         assert_eq!(NORD_PURPLE, SYNTHWAVE.nord_purple);
         assert_eq!(NORD_POLAR_NIGHT_3, SYNTHWAVE.nord_polar_night_3);
         assert_eq!(NORD_POLAR_NIGHT_4, SYNTHWAVE.nord_polar_night_4);
+    }
+
+    #[test]
+    fn terminal_theme_uses_terminal_defaults_and_named_ansi_colors() {
+        let theme = ThemeChoice::Terminal.palette();
+
+        assert_eq!(theme.panel_bg, Color::Reset);
+        assert_eq!(theme.panel_bg_dark, Color::Reset);
+        assert_eq!(theme.panel_header_bg, Color::Reset);
+        assert_eq!(theme.text_primary, Color::Reset);
+        assert_eq!(theme.text_secondary, Color::Reset);
+        for color in [
+            theme.accent_primary,
+            theme.accent_secondary,
+            theme.success,
+            theme.warning,
+            theme.error,
+        ] {
+            assert!(!matches!(color, Color::Rgb(_, _, _)));
+        }
     }
 }

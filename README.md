@@ -453,6 +453,12 @@ All files and directories under the config dir are owned by your user account, e
 Create `~/.config/vortix/config.toml` to customize settings. All fields are optional -- missing fields use defaults:
 
 ```toml
+# --- Appearance ---
+
+# "synthwave" keeps Vortix's fixed palette (default). "terminal" inherits
+# your terminal foreground/background and uses named ANSI status colors.
+theme = "synthwave"
+
 # --- Timing ---
 
 # UI refresh rate in milliseconds (default: 1000)

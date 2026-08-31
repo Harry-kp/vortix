@@ -77,6 +77,30 @@ pub(crate) fn helper_owned_routes() -> Box<dyn OwnedRoutes> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DesktopNetworkError;
+
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        clippy::unnecessary_wraps,
+        reason = "the cross-platform helper boundary preserves Linux failure semantics"
+    )
+)]
+pub(crate) fn detach_helper_interface_from_desktop_manager(
+    interface: &str,
+) -> Result<(), DesktopNetworkError> {
+    #[cfg(target_os = "linux")]
+    {
+        crate::vortix_platform_linux::network_manager::detach(interface)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = interface;
+        Ok(())
+    }
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Process-global platform — the consumer-migration seam.
 //
@@ -300,5 +324,14 @@ sudo apt install {pkg}  # Debian/Ubuntu\n\
 sudo pacman -S {pkg}    # Arch\n\
 sudo dnf install {pkg}  # Fedora"
         ),
+    }
+}
+
+#[cfg(test)]
+mod external_interface_tests {
+    #[test]
+    fn non_linux_helper_interface_detach_is_explicitly_not_applicable() {
+        #[cfg(not(target_os = "linux"))]
+        super::detach_helper_interface_from_desktop_manager("vxabcdefghijklm").unwrap();
     }
 }

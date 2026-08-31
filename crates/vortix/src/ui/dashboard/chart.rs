@@ -23,9 +23,9 @@ use ratatui::{
 pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     let is_focused = app.should_draw_focus(&crate::app::FocusedPanel::Chart);
     let border_style = if is_focused {
-        Style::default().fg(theme::BORDER_FOCUSED)
+        Style::default().fg(theme::current().border_focused)
     } else {
-        Style::default().fg(theme::BORDER_DEFAULT)
+        Style::default().fg(theme::current().border_default)
     };
 
     if app.effective_flipped(&crate::app::FocusedPanel::Chart) {
@@ -52,14 +52,14 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
         .title(
             Line::from(Span::styled(
                 peak_label,
-                Style::default().fg(theme::NORD_POLAR_NIGHT_4),
+                Style::default().fg(theme::current().nord_polar_night_4),
             ))
             .right_aligned(),
         )
         .title_bottom(
             Line::from(Span::styled(
                 format!(" Scale: 0 – {scale_val:.1} {scale_unit} "),
-                Style::default().fg(theme::KEY_HINT_DESC),
+                Style::default().fg(theme::current().key_hint_desc),
             ))
             .right_aligned(),
         );
@@ -92,26 +92,44 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     let stats_line = Line::from(vec![
-        Span::styled(" ▲ UP: ", Style::default().fg(theme::NORD_GREEN)),
+        Span::styled(" ▲ UP: ", Style::default().fg(theme::current().success)),
         Span::styled(
             format!("{:<10}", utils::format_bytes_speed(app.runtime.current_up)),
-            Style::default().fg(theme::TEXT_PRIMARY),
+            Style::default().fg(theme::current().text_primary),
         ),
-        Span::styled(" │ ", Style::default().fg(theme::NORD_POLAR_NIGHT_4)),
-        Span::styled(" ▼ DOWN: ", Style::default().fg(theme::NORD_FROST_2)),
+        Span::styled(
+            " │ ",
+            Style::default().fg(theme::current().nord_polar_night_4),
+        ),
+        Span::styled(
+            " ▼ DOWN: ",
+            Style::default().fg(theme::current().accent_primary),
+        ),
         Span::styled(
             format!(
                 "{:<10}",
                 utils::format_bytes_speed(app.runtime.current_down)
             ),
-            Style::default().fg(theme::TEXT_PRIMARY),
+            Style::default().fg(theme::current().text_primary),
         ),
-        Span::styled(" │ ", Style::default().fg(theme::NORD_POLAR_NIGHT_4)),
-        Span::styled(" Session: ", Style::default().fg(theme::TEXT_SECONDARY)),
-        Span::styled("↓", Style::default().fg(theme::NORD_FROST_3)),
-        Span::styled(&session_rx, Style::default().fg(theme::TEXT_PRIMARY)),
-        Span::styled(" ↑", Style::default().fg(theme::NORD_GREEN)),
-        Span::styled(&session_tx, Style::default().fg(theme::TEXT_PRIMARY)),
+        Span::styled(
+            " │ ",
+            Style::default().fg(theme::current().nord_polar_night_4),
+        ),
+        Span::styled(
+            " Session: ",
+            Style::default().fg(theme::current().text_secondary),
+        ),
+        Span::styled("↓", Style::default().fg(theme::current().nord_frost_3)),
+        Span::styled(
+            &session_rx,
+            Style::default().fg(theme::current().text_primary),
+        ),
+        Span::styled(" ↑", Style::default().fg(theme::current().success)),
+        Span::styled(
+            &session_tx,
+            Style::default().fg(theme::current().text_primary),
+        ),
     ]);
     frame.render_widget(
         Paragraph::new(stats_line).alignment(Alignment::Center),
@@ -140,7 +158,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
                             y1: dy1,
                             x2,
                             y2: dy2,
-                            color: theme::ACCENT_PRIMARY,
+                            color: theme::current().accent_primary,
                         });
                     }
 
@@ -152,7 +170,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
                             y1: uy1,
                             x2,
                             y2: uy2,
-                            color: theme::SUCCESS,
+                            color: theme::current().success,
                         });
                     }
                 }
@@ -169,7 +187,7 @@ fn render_back(frame: &mut Frame, app: &App, area: Rect, border_style: Style) {
         .title_bottom(
             Line::from(Span::styled(
                 constants::FLIP_BACK_HINT,
-                Style::default().fg(theme::KEY_HINT_DESC),
+                Style::default().fg(theme::current().key_hint_desc),
             ))
             .right_aligned(),
         );
@@ -185,29 +203,38 @@ fn render_back(frame: &mut Frame, app: &App, area: Rect, border_style: Style) {
         Line::from(Span::styled(
             "Per-Process Network Usage",
             Style::default()
-                .fg(theme::ACCENT_PRIMARY)
+                .fg(theme::current().accent_primary)
                 .add_modifier(ratatui::style::Modifier::BOLD),
         )),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  Total ▼ ", Style::default().fg(theme::NORD_FROST_2)),
-            Span::styled(&current_down_str, Style::default().fg(theme::TEXT_PRIMARY)),
-            Span::styled("  ▲ ", Style::default().fg(theme::NORD_GREEN)),
-            Span::styled(&current_up_str, Style::default().fg(theme::TEXT_PRIMARY)),
+            Span::styled(
+                "  Total ▼ ",
+                Style::default().fg(theme::current().accent_primary),
+            ),
+            Span::styled(
+                &current_down_str,
+                Style::default().fg(theme::current().text_primary),
+            ),
+            Span::styled("  ▲ ", Style::default().fg(theme::current().success)),
+            Span::styled(
+                &current_up_str,
+                Style::default().fg(theme::current().text_primary),
+            ),
         ]),
         Line::from(""),
         Line::from(Span::styled(
             "  Process table with sorting & filtering",
-            Style::default().fg(theme::TEXT_SECONDARY),
+            Style::default().fg(theme::current().text_secondary),
         )),
         Line::from(Span::styled(
             "  will be available in a future release.",
-            Style::default().fg(theme::TEXT_SECONDARY),
+            Style::default().fg(theme::current().text_secondary),
         )),
         Line::from(""),
         Line::from(Span::styled(
             "  See: github.com/Harry-kp/vortix/issues/166",
-            Style::default().fg(theme::NORD_POLAR_NIGHT_4),
+            Style::default().fg(theme::current().nord_polar_night_4),
         )),
     ];
 
