@@ -10,10 +10,8 @@ use std::sync::Once;
 use std::time::Instant;
 
 use vortix::app::{
-    App, ConnectionState, DetailedConnectionInfo, FocusedPanel, InputMode, Protocol, Toast,
-    ToastType, VpnProfile,
+    App, ConnectionState, FocusedPanel, InputMode, Protocol, Toast, ToastType, VpnProfile,
 };
-use vortix::core::scanner::ActiveSession;
 use vortix::message::{Message, ScrollMove, SelectionMove};
 use vortix::state::{KillSwitchMode, KillSwitchState};
 
@@ -60,19 +58,38 @@ fn set_connected(app: &mut App, name: &str) {
         add_wg_profiles(app, &[name]);
     }
     app.runtime.session_start = Some(Instant::now());
-    let details = DetailedConnectionInfo {
+    let details = vortix::vortix_core::engine::DetailedConnectionInfo {
         interface: "wg0".to_string(),
+        interface_authoritative: true,
         pid: Some(12345),
         ..Default::default()
     };
-    app.mirror_connect_into_registry(name, &details, Instant::now());
+    set_projection(
+        app,
+        name,
+        vortix::vortix_core::engine::state::Connection::Connected {
+            profile_id: vortix::vortix_core::profile::ProfileId::new(name),
+            since: std::time::SystemTime::now(),
+            health: vortix::vortix_core::engine::state::ConnectionHealth::Healthy,
+            details: Box::new(details),
+        },
+    );
 }
 
 fn set_connecting(app: &mut App, name: &str) {
     if !app.runtime.profiles.iter().any(|p| p.name == name) {
         add_wg_profiles(app, &[name]);
     }
-    app.mirror_connecting_into_registry(name);
+    set_projection(
+        app,
+        name,
+        vortix::vortix_core::engine::state::Connection::Connecting {
+            profile_id: vortix::vortix_core::profile::ProfileId::new(name),
+            started_at: std::time::SystemTime::now(),
+            attempt: 1,
+            retry_budget_remaining: std::time::Duration::ZERO,
+        },
+    );
 }
 
 fn set_disconnecting(app: &mut App, name: &str) {
@@ -80,461 +97,104 @@ fn set_disconnecting(app: &mut App, name: &str) {
     if app.registry.snapshot(&ProfileId::new(name)).is_none() {
         set_connected(app, name);
     }
-    app.mark_teardown_pending(name);
+    set_projection(
+        app,
+        name,
+        vortix::vortix_core::engine::state::Connection::Disconnecting {
+            profile_id: vortix::vortix_core::profile::ProfileId::new(name),
+            started_at: std::time::SystemTime::now(),
+        },
+    );
 }
 
-fn fake_session(name: &str) -> ActiveSession {
-    ActiveSession {
-        name: name.to_string(),
-        interface: "wg0".to_string(),
-        interface_authoritative: true,
-        endpoint: "1.2.3.4:51820".to_string(),
-        internal_ip: "10.0.0.2".to_string(),
-        mtu: "1420".to_string(),
-        public_key: String::new(),
-        listen_port: "51820".to_string(),
-        transfer_rx: "100 KiB".to_string(),
-        transfer_tx: "50 KiB".to_string(),
-        latest_handshake: "5 seconds ago".to_string(),
-        wireguard_peers: Vec::new(),
-        pid: Some(12345),
-        started_at: None,
-    }
+fn set_projection(
+    app: &mut App,
+    name: &str,
+    state: vortix::vortix_core::engine::state::Connection,
+) {
+    use vortix::vortix_core::engine::{ConnectionHealth, Role, TunnelSnapshot};
+    use vortix::vortix_core::profile::ProfileId;
+
+    let profile_id = ProfileId::new(name);
+    let mut snapshot = app.control_snapshot.clone();
+    snapshot.generation = snapshot.generation.saturating_add(1);
+    snapshot.primary = Some(profile_id.clone());
+    snapshot.tunnels.insert(
+        profile_id.clone(),
+        TunnelSnapshot {
+            profile_id,
+            state,
+            role: Role::Primary {
+                allowed_ips: Vec::new(),
+            },
+            health: ConnectionHealth::Healthy,
+            interface_name: Some("wg0".into()),
+            started_at: Some(std::time::SystemTime::now()),
+        },
+    );
+    app.handle_message(Message::ControlSnapshot(Box::new(snapshot)));
 }
 
-// ============================================================================
-// Connection State Machine Tests
-// ============================================================================
-
-mod connection_state_machine {
+mod canonical_control_projection {
     use super::*;
-
     #[test]
-    fn disconnected_to_connecting_on_connect() {
+    fn lifecycle_is_rendered_only_from_successive_snapshots() {
         let mut app = test_app();
-        add_wg_profiles(&mut app, &["vpn-a"]);
-
-        // Simulate connect_profile setting state (avoids spawning real wg-quick)
-        set_connecting(&mut app, "vpn-a");
-        assert!(
-            matches!(app.legacy_state(), ConnectionState::Connecting { .. }),
-            "Disconnected -> Connecting on connect"
-        );
-    }
-
-    #[test]
-    fn connecting_to_connected_on_success() {
-        let mut app = test_app();
-        add_wg_profiles(&mut app, &["vpn-a"]);
-        set_connecting(&mut app, "vpn-a");
-
-        app.handle_message(Message::ConnectResult {
-            profile: "vpn-a".to_string(),
-            success: true,
-            error: None,
-            interface: None,
-            pid: None,
-            generation: 0,
-            handshake: None,
-            probe_receipts: Vec::new(),
-            dns_request: vortix::vortix_core::ports::dns::DnsRequest::default(),
-        });
-        assert!(matches!(
-            app.legacy_state(),
-            ConnectionState::Connected { .. }
-        ));
-    }
-
-    #[test]
-    fn connecting_failure_becomes_terminal_when_absence_is_confirmed() {
-        let mut app = test_app();
-        set_connecting(&mut app, "vpn-a");
-
-        app.handle_message(Message::ConnectResult {
-            profile: "vpn-a".to_string(),
-            success: false,
-            error: Some("refused".to_string()),
-            interface: None,
-            pid: None,
-            generation: 0,
-            handshake: None,
-            probe_receipts: Vec::new(),
-            dns_request: vortix::vortix_core::ports::dns::DnsRequest::default(),
-        });
-        assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
-    }
-
-    #[test]
-    fn scanner_does_not_promote_connecting_to_connected() {
-        // State-authority contract: scanner cannot drive Connecting → Connected.
-        // Only the protocol layer's `Tunnel::up()` success result
-        // (delivered via `Message::ConnectResult`) can promote.
-        //
-        // Previously this test asserted the opposite (and was named
-        // `connecting_to_connected_via_scanner`). The dual write was
-        // the source of bugs #3 and #12 in the multi-OpenVPN scenarios.
-        let mut app = test_app();
-        add_wg_profiles(&mut app, &["vpn-a"]);
-        set_connecting(&mut app, "vpn-a");
-
-        app.handle_message(Message::SyncSystemState {
-            sessions: vec![fake_session("vpn-a")],
-            default_route:
-                vortix::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
-        });
-        assert!(
-            matches!(app.legacy_state(), ConnectionState::Connecting { .. }),
-            "scanner-visible session for a Connecting tunnel must NOT promote — only ConnectResult can"
-        );
-    }
-
-    #[test]
-    fn scanner_never_demotes_connecting_to_disconnected() {
-        let mut app = test_app();
-        set_connecting(&mut app, "vpn-a");
-
-        app.handle_message(Message::SyncSystemState {
-            sessions: vec![],
-            default_route:
-                vortix::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
-        });
-        assert!(
-            matches!(app.legacy_state(), ConnectionState::Connecting { .. }),
-            "Scanner must never demote Connecting -> Disconnected"
-        );
-    }
-
-    #[test]
-    fn connected_to_disconnecting_on_disconnect() {
-        let mut app = test_app();
-        add_wg_profiles(&mut app, &["vpn-a"]);
-        set_connected(&mut app, "vpn-a");
-
-        app.handle_message(Message::Disconnect);
-        assert!(matches!(
-            app.legacy_state(),
-            ConnectionState::Disconnecting { .. }
-        ));
-    }
-
-    #[test]
-    fn disconnecting_to_disconnected_on_success() {
-        let mut app = test_app();
-        set_disconnecting(&mut app, "vpn-a");
-
-        app.handle_message(Message::DisconnectResult {
-            profile: "vpn-a".to_string(),
-            success: true,
-            error: None,
-        });
-        // Completion is kernel-confirmed: the worker's success keeps the
-        // entry Disconnecting; the next scan reporting the session gone
-        // finishes the disconnect (guards the re-adopt/reconnect loop).
-        app.handle_message(Message::SyncSystemState {
-            sessions: vec![],
-            default_route:
-                vortix::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
-        });
-        assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
-    }
-
-    #[test]
-    fn disconnecting_to_disconnected_on_interface_gone() {
-        let mut app = test_app();
-        set_disconnecting(&mut app, "vpn-a");
-
-        app.handle_message(Message::SyncSystemState {
-            sessions: vec![],
-            default_route:
-                vortix::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
-        });
-        assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
-    }
-
-    #[test]
-    fn disconnecting_safety_timeout() {
-        use vortix::vortix_core::profile::ProfileId;
-
-        let mut app = test_app();
-        // Seed the registry as Disconnecting with a 31s back-dated
-        // start so the per-profile scanner's timeout branch fires.
-        set_connected(&mut app, "vpn-a");
-        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(31);
-        app.registry
-            .set_disconnecting(&ProfileId::new("vpn-a"), past);
-
-        app.handle_message(Message::SyncSystemState {
-            sessions: vec![fake_session("vpn-a")],
-            default_route:
-                vortix::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
-        });
-        assert!(matches!(
-            app.legacy_state(),
-            ConnectionState::Disconnecting { .. }
-        ));
-    }
-
-    #[test]
-    fn connection_timeout_from_connecting() {
-        let mut app = test_app();
-        set_connecting(&mut app, "vpn-a");
-
-        app.handle_message(Message::ConnectionTimeout("vpn-a".to_string()));
-        assert!(matches!(
-            app.legacy_state(),
-            ConnectionState::Disconnecting { .. }
-        ));
-        assert!(app.runtime.pending_connect.is_none());
-    }
-
-    #[test]
-    fn connected_drop_detected_by_scanner() {
-        let mut app = test_app();
-        set_connected(&mut app, "vpn-a");
-
-        app.handle_message(Message::SyncSystemState {
-            sessions: vec![],
-            default_route:
-                vortix::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
-        });
-        assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
-        assert_eq!(app.runtime.connection_drops, 1);
-    }
-
-    #[test]
-    fn stale_connect_result_ignored() {
-        let mut app = test_app();
-        // No prior Connecting state — the ConnectResult should be ignored.
-        app.handle_message(Message::ConnectResult {
-            profile: "vpn-a".to_string(),
-            success: true,
-            error: None,
-            interface: None,
-            pid: None,
-            generation: 0,
-            handshake: None,
-            probe_receipts: Vec::new(),
-            dns_request: vortix::vortix_core::ports::dns::DnsRequest::default(),
-        });
-        assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
-    }
-
-    #[test]
-    fn full_lifecycle_connect_disconnect() {
-        let mut app = test_app();
-        add_wg_profiles(&mut app, &["vpn-a"]);
-
-        // Disconnected -> Connecting (simulate connect_profile)
         set_connecting(&mut app, "vpn-a");
         assert!(matches!(
             app.legacy_state(),
             ConnectionState::Connecting { .. }
         ));
 
-        // Connecting -> Connected
-        app.handle_message(Message::ConnectResult {
-            profile: "vpn-a".to_string(),
-            success: true,
-            error: None,
-            interface: None,
-            pid: None,
-            generation: 0,
-            handshake: None,
-            probe_receipts: Vec::new(),
-            dns_request: vortix::vortix_core::ports::dns::DnsRequest::default(),
-        });
+        set_connected(&mut app, "vpn-a");
         assert!(matches!(
             app.legacy_state(),
             ConnectionState::Connected { .. }
         ));
 
-        // Connected -> Disconnecting
-        app.handle_message(Message::Disconnect);
+        set_disconnecting(&mut app, "vpn-a");
         assert!(matches!(
             app.legacy_state(),
             ConnectionState::Disconnecting { .. }
         ));
 
-        // Disconnecting -> Disconnected (kernel-confirmed)
-        app.handle_message(Message::DisconnectResult {
-            profile: "vpn-a".to_string(),
-            success: true,
-            error: None,
-        });
-        // Completion is kernel-confirmed: the worker's success keeps the
-        // entry Disconnecting; the next scan reporting the session gone
-        // finishes the disconnect (guards the re-adopt/reconnect loop).
-        app.handle_message(Message::SyncSystemState {
-            sessions: vec![],
-            default_route:
-                vortix::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
-        });
+        let mut snapshot = app.control_snapshot.clone();
+        snapshot.generation = snapshot.generation.saturating_add(1);
+        snapshot.tunnels.clear();
+        snapshot.primary = None;
+        app.handle_message(Message::ControlSnapshot(Box::new(snapshot)));
         assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
     }
 
     #[test]
-    fn profile_switch_via_pending_connect() {
+    fn initial_unknown_policy_does_not_raise_a_false_degraded_alarm() {
         let mut app = test_app();
-        add_wg_profiles(&mut app, &["vpn-a", "vpn-b"]);
-        app.runtime.is_root = true;
-
-        // Manually set up the switch scenario: Disconnecting from vpn-a with
-        // vpn-b queued. This avoids spawning real disconnect/connect commands.
-        set_disconnecting(&mut app, "vpn-a");
-        app.runtime.pending_connect = Some(1);
-
-        // Disconnect completes -> the kernel-confirming scan drains
-        // pending_connect via complete_disconnect.
-        app.handle_message(Message::DisconnectResult {
-            profile: "vpn-a".to_string(),
-            success: true,
-            error: None,
-        });
-        // Completion is kernel-confirmed: the worker's success keeps the
-        // entry Disconnecting; the next scan reporting the session gone
-        // finishes the disconnect (guards the re-adopt/reconnect loop).
-        app.handle_message(Message::SyncSystemState {
-            sessions: vec![],
-            default_route:
-                vortix::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
-        });
-
-        // complete_disconnect calls connect_profile(1) for vpn-b.
-        // If wg tools are available, state becomes Connecting to vpn-b.
-        // If not, state becomes Disconnected with DependencyError mode.
-        let switched = matches!(
-            app.legacy_state(),
-            ConnectionState::Connecting { ref profile, .. } if profile == "vpn-b"
-        );
-        let dep_error = matches!(app.input_mode, InputMode::DependencyError { .. });
-        assert!(
-            switched || dep_error,
-            "Should auto-connect to vpn-b or show dependency error, got {:?}",
-            app.legacy_state()
-        );
-        assert_eq!(app.runtime.pending_connect, None);
-    }
-}
-
-// ============================================================================
-// Kill Switch Lifecycle Tests
-// ============================================================================
-
-mod killswitch_lifecycle {
-    use super::*;
-
-    #[test]
-    fn mode_cycling_off_auto_alwayson() {
-        let mut app = test_app();
-        assert_eq!(app.runtime.killswitch_mode, KillSwitchMode::Off);
-
-        app.handle_message(Message::ToggleKillSwitch);
-        assert_eq!(app.runtime.killswitch_mode, KillSwitchMode::Auto);
-
-        app.handle_message(Message::ToggleKillSwitch);
-        assert_eq!(app.runtime.killswitch_mode, KillSwitchMode::AlwaysOn);
-
-        app.handle_message(Message::ToggleKillSwitch);
-        assert_eq!(app.runtime.killswitch_mode, KillSwitchMode::Off);
+        let mut snapshot = app.control_snapshot.clone();
+        snapshot.generation = 1;
+        snapshot.desired.kill_switch = KillSwitchMode::AlwaysOn;
+        snapshot.effective.kill_switch = None;
+        app.handle_message(Message::ControlSnapshot(Box::new(snapshot)));
+        assert_eq!(app.runtime.killswitch_state, KillSwitchState::Disabled);
     }
 
     #[test]
-    fn auto_mode_arms_when_connected() {
+    fn protected_auto_is_armed_only_while_a_tunnel_is_connected() {
         let mut app = test_app();
-        add_wg_profiles(&mut app, &["vpn-a"]);
         set_connected(&mut app, "vpn-a");
-        app.runtime.killswitch_mode = KillSwitchMode::Off;
-
-        app.handle_message(Message::ToggleKillSwitch); // Off -> Auto
-        assert_eq!(app.runtime.killswitch_mode, KillSwitchMode::Auto);
+        let mut snapshot = app.control_snapshot.clone();
+        snapshot.generation = snapshot.generation.saturating_add(1);
+        snapshot.desired.kill_switch = KillSwitchMode::Auto;
+        snapshot.effective.kill_switch = Some(KillSwitchState::Armed);
+        app.handle_message(Message::ControlSnapshot(Box::new(snapshot)));
         assert_eq!(app.runtime.killswitch_state, KillSwitchState::Armed);
-    }
 
-    #[test]
-    fn alwayson_blocks_when_disconnected() {
-        let mut app = test_app();
-        app.runtime.is_root = true;
-        app.runtime.killswitch_mode = KillSwitchMode::Auto;
-        app.handle_message(Message::ToggleKillSwitch); // Auto -> AlwaysOn
-        assert_eq!(app.runtime.killswitch_mode, KillSwitchMode::AlwaysOn);
+        let mut blocked = app.control_snapshot.clone();
+        blocked.generation = blocked.generation.saturating_add(1);
+        blocked.effective.kill_switch = Some(KillSwitchState::Blocking);
+        blocked.tunnels.clear();
+        blocked.primary = None;
+        app.handle_message(Message::ControlSnapshot(Box::new(blocked)));
         assert_eq!(app.runtime.killswitch_state, KillSwitchState::Blocking);
-    }
-
-    #[test]
-    fn killswitch_activated_on_vpn_drop() {
-        let mut app = test_app();
-        app.runtime.is_root = true;
-        add_wg_profiles(&mut app, &["vpn-a"]);
-        app.runtime.killswitch_mode = KillSwitchMode::Auto;
-        app.runtime.killswitch_state = KillSwitchState::Armed;
-        set_connected(&mut app, "vpn-a");
-
-        // VPN drops
-        app.handle_message(Message::SyncSystemState {
-            sessions: vec![],
-            default_route:
-                vortix::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
-        });
-
-        assert!(matches!(app.legacy_state(), ConnectionState::Disconnected));
-        assert_eq!(app.runtime.killswitch_state, KillSwitchState::Blocking);
-        assert_eq!(app.runtime.connection_drops, 1);
-    }
-
-    #[test]
-    fn killswitch_stays_disabled_when_mode_off() {
-        let mut app = test_app();
-        app.runtime.killswitch_mode = KillSwitchMode::Off;
-        app.runtime.killswitch_state = KillSwitchState::Disabled;
-        set_connected(&mut app, "vpn-a");
-
-        // VPN drops
-        app.handle_message(Message::SyncSystemState {
-            sessions: vec![],
-            default_route:
-                vortix::vortix_core::ports::route_table::DefaultRouteObservation::NoDefaultRoute,
-        });
-
-        assert_eq!(app.runtime.killswitch_state, KillSwitchState::Disabled);
-    }
-
-    #[test]
-    fn off_mode_disables_killswitch() {
-        let mut app = test_app();
-        app.runtime.killswitch_mode = KillSwitchMode::AlwaysOn;
-        app.runtime.killswitch_state = KillSwitchState::Blocking;
-
-        // Toggle to Off
-        app.handle_message(Message::ToggleKillSwitch);
-        assert_eq!(app.runtime.killswitch_mode, KillSwitchMode::Off);
-        assert_eq!(app.runtime.killswitch_state, KillSwitchState::Disabled);
-    }
-
-    #[test]
-    fn quit_cleans_up_killswitch() {
-        let mut app = test_app();
-        app.runtime.killswitch_mode = KillSwitchMode::AlwaysOn;
-        app.runtime.killswitch_state = KillSwitchState::Blocking;
-
-        app.handle_message(Message::Quit);
-        assert!(app.should_quit);
-    }
-
-    #[test]
-    fn non_root_cannot_enter_blocking_state() {
-        let mut app = test_app();
-        assert!(!app.runtime.is_root);
-        app.runtime.killswitch_mode = KillSwitchMode::Auto;
-        app.handle_message(Message::ToggleKillSwitch); // Auto -> AlwaysOn
-        assert_eq!(app.runtime.killswitch_mode, KillSwitchMode::AlwaysOn);
-        assert_eq!(
-            app.runtime.killswitch_state,
-            KillSwitchState::Armed,
-            "Non-root should be refused Blocking state"
-        );
-        let toast = app.toast.as_ref().expect("should show warning toast");
-        assert_eq!(toast.toast_type, ToastType::Warning);
-        assert!(toast.message.contains("root"));
     }
 }
 

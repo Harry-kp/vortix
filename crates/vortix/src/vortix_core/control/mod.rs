@@ -21,10 +21,10 @@ pub use hooks::{HookEvent, HookEventId, LifecycleFact};
 pub use model::{
     AuthorityEpoch, ChallengeId, ChallengeKind, ChallengeRecord, ClientId, CompletionOutcome,
     ControlEvent, ControlEventEnvelope, DesiredState, DriftGates, EffectiveState, EventEnvelope,
-    Freshness, GateEvidence, Observation, ObservedConnectionHealth, ObservedState,
-    OperationCompletion, OperationFailure, OperationId, OperationIntent, OperationRecord,
-    OperationResult, OperationStatus, PolicyDigest, ProtectionEvidence, ProtectionStatus,
-    RequestedTunnelState,
+    Freshness, GateEvidence, Observation, ObservedConnectionHealth, ObservedDefaultRoute,
+    ObservedState, ObservedTunnelDetails, OperationCompletion, OperationFailure, OperationId,
+    OperationIntent, OperationRecord, OperationResult, OperationStatus, PolicyDigest,
+    ProtectionEvidence, ProtectionStatus, RequestedTunnelState,
 };
 pub use persistence::{
     BootConnection, BootEligibility, ControlStateStore, ControlStateStoreError,

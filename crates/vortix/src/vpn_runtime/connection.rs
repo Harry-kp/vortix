@@ -7,6 +7,94 @@ use crate::state::Protocol;
 
 use super::VpnRuntime;
 
+fn wireguard_health_from_session(
+    peers: &[crate::vortix_core::ports::tunnel::TunnelPeerStatus],
+    activity: &mut std::collections::HashMap<String, crate::vpn_runtime::WireGuardPeerActivity>,
+    probe_receipts: &[crate::vortix_core::ports::tunnel::ProbeReceipt],
+    stale_after: std::time::Duration,
+) -> crate::vortix_core::engine::state::ConnectionHealth {
+    use crate::vortix_core::engine::state::{ConnectionHealth, DegradedReason};
+    use crate::vortix_core::ports::tunnel::{
+        classify_peer_handshake_health, PeerHandshakeHealth, PeerTrafficExpectation,
+    };
+
+    let now = std::time::SystemTime::now();
+    let expectation_window = stale_after.saturating_mul(2);
+    let mut expected_peers = 0_usize;
+    for peer in peers {
+        let peer_activity = activity.entry(peer.public_key.clone()).or_insert(
+            crate::vpn_runtime::WireGuardPeerActivity {
+                bytes_rx: peer.bytes_rx,
+                bytes_tx: peer.bytes_tx,
+                observed_at: peer.evidence_observed_at,
+                last_transfer_at: None,
+            },
+        );
+        if peer.evidence_observed_at > peer_activity.observed_at {
+            if peer.bytes_rx > peer_activity.bytes_rx || peer.bytes_tx > peer_activity.bytes_tx {
+                peer_activity.last_transfer_at = Some(peer.evidence_observed_at);
+            }
+            peer_activity.bytes_rx = peer.bytes_rx;
+            peer_activity.bytes_tx = peer.bytes_tx;
+            peer_activity.observed_at = peer.evidence_observed_at;
+        }
+
+        let recent_transfer = peer_activity.last_transfer_at.is_some_and(|at| {
+            now.duration_since(at)
+                .is_ok_and(|age| age <= expectation_window)
+        });
+        // An actually-issued probe is durable connection metadata. Aging the
+        // issue timestamp out would silently turn a stale expected peer into
+        // Unknown even though the connection policy still expects that peer
+        // to remain fresh. Absence/explicit replacement removes the receipt;
+        // a fresh handshake clears the degraded result naturally.
+        let configured_probe = probe_receipts.iter().find(|record| {
+            record.peer_public_key == peer.public_key
+                && record.allowed_routes == peer.allowed_routes
+        });
+        let expectation = if peer.keepalive_expected() {
+            PeerTrafficExpectation::PersistentKeepalive
+        } else if recent_transfer {
+            PeerTrafficExpectation::RoutedTraffic
+        } else if let Some(record) = configured_probe {
+            PeerTrafficExpectation::ConfiguredProbe {
+                target: record.target,
+            }
+        } else {
+            PeerTrafficExpectation::Idle
+        };
+        if !matches!(expectation, PeerTrafficExpectation::Idle) {
+            expected_peers += 1;
+        }
+        match classify_peer_handshake_health(peer, now, &expectation, stale_after) {
+            PeerHandshakeHealth::Stale { age } => {
+                return ConnectionHealth::Degraded {
+                    reason: DegradedReason::WireGuardPeerStale {
+                        peer_public_key: peer.public_key.clone(),
+                        allowed_routes: peer.allowed_routes.clone(),
+                        seconds_since_last_handshake: age.as_secs(),
+                    },
+                };
+            }
+            PeerHandshakeHealth::NeverObserved => {
+                return ConnectionHealth::Degraded {
+                    reason: DegradedReason::WireGuardPeerNeverObserved {
+                        peer_public_key: peer.public_key.clone(),
+                        allowed_routes: peer.allowed_routes.clone(),
+                    },
+                };
+            }
+            PeerHandshakeHealth::Healthy { .. } | PeerHandshakeHealth::InformationalIdle { .. } => {
+            }
+        }
+    }
+    if expected_peers > 0 {
+        ConnectionHealth::Healthy
+    } else {
+        ConnectionHealth::Unknown
+    }
+}
+
 /// Result of a CLI status scan.
 #[derive(Debug)]
 pub struct StatusSnapshot {
@@ -151,7 +239,7 @@ impl VpnRuntime {
                         .filter(|receipt| receipt.validates(&profile.id, session))
                 {
                     let mut activity = std::collections::HashMap::new();
-                    let current = crate::app::connection::wireguard_health_from_session(
+                    let current = wireguard_health_from_session(
                         &session.wireguard_peers,
                         &mut activity,
                         &receipt.probe_receipts,

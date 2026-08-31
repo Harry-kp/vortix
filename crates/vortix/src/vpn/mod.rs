@@ -154,6 +154,7 @@ pub(crate) fn commit_profile_import(
     prepared: PreparedProfileImport,
     profiles_dir: &Path,
 ) -> Result<VpnProfile, String> {
+    let profile = prepared.profile.clone();
     FsProfileStore::new(profiles_dir.to_path_buf())
         .insert(&prepared.stored, prepared.raw_body.as_ref())
         .map_err(|error| format!("Failed to persist profile identity: {error}"))?;
@@ -167,14 +168,8 @@ pub(crate) fn commit_profile_import(
             prepared.profile.config_path.display()
         ),
     );
-    Ok(VpnProfile {
-        id: prepared.profile.id,
-        name: prepared.profile.name,
-        protocol: prepared.profile.protocol,
-        location: prepared.profile.location,
-        config_path: prepared.profile.config_path,
-        last_used: None,
-    })
+    drop(prepared);
+    Ok(profile)
 }
 
 /// Detect protocol by inspecting file content.
@@ -498,12 +493,12 @@ pub fn load_profiles() -> Vec<VpnProfile> {
         );
         return Vec::new();
     };
-
-    load_profiles_from_dir(&profiles_dir)
+    load_profiles_from(&profiles_dir)
 }
 
-#[allow(clippy::too_many_lines)] // one catalog scan keeps sidecar validation and config parsing visibly paired
-fn load_profiles_from_dir(profiles_dir: &Path) -> Vec<VpnProfile> {
+/// Load the authenticated profile catalog from an explicit directory.
+#[must_use]
+pub(crate) fn load_profiles_from(profiles_dir: &Path) -> Vec<VpnProfile> {
     let store = FsProfileStore::new(profiles_dir.to_path_buf());
     let summaries = match store.list() {
         Ok(summaries) => summaries,
@@ -618,7 +613,7 @@ mod tests {
             .insert(&profile, b"client\ndev tun\nremote vpn.example.com 1194\n")
             .unwrap();
 
-        let loaded = load_profiles_from_dir(profiles_dir.path());
+        let loaded = load_profiles_from(profiles_dir.path());
 
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].protocol, Protocol::OpenVPN);

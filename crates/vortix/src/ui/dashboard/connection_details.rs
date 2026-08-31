@@ -950,7 +950,26 @@ mod tests {
                 last_used: None,
             });
             app.profile_list_state.select(Some(0));
-            app.mirror_connecting_into_registry("corp");
+            let profile_id = ProfileId::new("corp");
+            let tunnel = crate::vortix_core::engine::TunnelSnapshot {
+                profile_id: profile_id.clone(),
+                state: crate::vortix_core::engine::Connection::Connecting {
+                    profile_id: profile_id.clone(),
+                    started_at: std::time::SystemTime::UNIX_EPOCH,
+                    attempt: 1,
+                    retry_budget_remaining: std::time::Duration::ZERO,
+                },
+                role: Role::Addressable {
+                    allowed_ips: Vec::new(),
+                },
+                health: crate::vortix_core::engine::ConnectionHealth::Unknown,
+                interface_name: None,
+                started_at: Some(std::time::SystemTime::UNIX_EPOCH),
+            };
+            app.registry.replace_control_projection(
+                &std::collections::BTreeMap::from([(profile_id, tunnel)]),
+                None,
+            );
             let out = render_to_string(&mut app, 80, 10);
             assert!(out.contains(expected), "{out}");
             assert!(!out.contains(forbidden), "{out}");

@@ -37,6 +37,7 @@ const MAX_STATUS_POLL: Duration = Duration::from_secs(5);
 const MAX_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_HEALTH_TARGETS: usize = 64;
 const MAX_WG_DUMP_BYTES: usize = 1024 * 1024;
+const MAX_WG_INTERFACES: usize = 512;
 const MAX_WG_PEERS: usize = 256;
 const MAX_ROUTES_PER_PEER: usize = 256;
 const MAX_WG_FIELD_BYTES: usize = 4096;
@@ -531,6 +532,83 @@ pub fn parse_wg_dump(
     Ok(status)
 }
 
+/// Parse the stable `wg show all dump` format into exact per-interface facts.
+/// The all-interface form prefixes every interface and peer line with the
+/// interface name; converting each bounded block through [`parse_wg_dump`]
+/// keeps the single-interface parser as the one validation authority.
+pub fn parse_wg_all_dump(
+    dump: &str,
+    observed_at: SystemTime,
+    generation: u64,
+) -> Result<BTreeMap<String, WgStatus>, TunnelError> {
+    if dump.len() > MAX_WG_DUMP_BYTES {
+        return Err(TunnelError::ResourceLimit {
+            resource: "WireGuard status bytes",
+            limit: MAX_WG_DUMP_BYTES,
+        });
+    }
+    let mut blocks = BTreeMap::<String, String>::new();
+    let mut current_interface: Option<String> = None;
+    for line in dump.lines() {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.iter().any(|field| field.len() > MAX_WG_FIELD_BYTES) {
+            return Err(TunnelError::MalformedStatus(
+                "WireGuard all-interface field".into(),
+            ));
+        }
+        match fields.as_slice() {
+            [interface, private_key, public_key, listen_port, fwmark] => {
+                if blocks.len() >= MAX_WG_INTERFACES || blocks.contains_key(*interface) {
+                    return Err(TunnelError::ResourceLimit {
+                        resource: "WireGuard interfaces",
+                        limit: MAX_WG_INTERFACES,
+                    });
+                }
+                let block = format!("{private_key}\t{public_key}\t{listen_port}\t{fwmark}\n");
+                blocks.insert((*interface).to_owned(), block);
+                current_interface = Some((*interface).to_owned());
+            }
+            [interface, peer @ ..] if peer.len() == 8 => {
+                if current_interface.as_deref() != Some(*interface) {
+                    return Err(TunnelError::MalformedStatus(
+                        "WireGuard peer appeared outside its interface block".into(),
+                    ));
+                }
+                let block = blocks.get_mut(*interface).ok_or_else(|| {
+                    TunnelError::MalformedStatus("WireGuard peer without interface".into())
+                })?;
+                block.push_str(&peer.join("\t"));
+                block.push('\n');
+            }
+            _ => {
+                return Err(TunnelError::MalformedStatus(
+                    "WireGuard all-interface dump shape".into(),
+                ));
+            }
+        }
+    }
+    blocks
+        .into_iter()
+        .map(|(interface, block)| {
+            parse_wg_dump(&interface, &block, observed_at, generation)
+                .map(|status| (interface, status))
+        })
+        .collect()
+}
+
+fn observe_all_interfaces_with(
+    mut execute: impl FnMut(&CommandSpec) -> Result<Vec<u8>, TunnelError>,
+) -> Result<BTreeMap<String, WgStatus>, TunnelError> {
+    let spec = CommandSpec::oneshot("wg", vec!["show".into(), "all".into(), "dump".into()])
+        .timeout(Duration::from_secs(2))
+        .output_limit(MAX_WG_DUMP_BYTES);
+    let stdout = execute(&spec)?;
+    let observed_at = SystemTime::now();
+    let dump = std::str::from_utf8(&stdout)
+        .map_err(|error| TunnelError::Other(format!("WireGuard status was not UTF-8: {error}")))?;
+    parse_wg_all_dump(dump, observed_at, 0)
+}
+
 fn observe_interface_with_generation(
     interface_name: &str,
     generation: u64,
@@ -561,6 +639,21 @@ fn observe_interface_with_generation(
 }
 
 impl WgTunnel {
+    /// One protocol-owned, bounded observation for every `WireGuard` interface.
+    pub fn observe_all_interfaces() -> Result<BTreeMap<String, WgStatus>, TunnelError> {
+        observe_all_interfaces_with(|spec| {
+            let output = crate::vortix_process::run_to_output(spec.clone())
+                .map_err(|error| TunnelError::Subprocess(format!("wg show all dump: {error}")))?;
+            if !output.status.success() {
+                return Err(TunnelError::Subprocess(format!(
+                    "wg show all dump: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )));
+            }
+            Ok(output.stdout)
+        })
+    }
+
     /// Protocol-owned read-only observation used by the scanner.
     pub fn observe_interface(interface_name: &str) -> Result<WgStatus, TunnelError> {
         observe_interface_with_generation(interface_name, 0, Duration::from_secs(2))
@@ -2024,6 +2117,40 @@ mod tests {
             peer.repeat(MAX_WG_PEERS + 1)
         );
         assert!(parse_wg_dump("wg0", &dump, observed, 1).is_err());
+    }
+
+    #[test]
+    fn all_dump_maps_exact_interfaces_and_uses_one_command() {
+        let dump = concat!(
+            "wg0\tprivate0\tpublic0\t51820\toff\n",
+            "wg0\tpeer0\t(none)\t1.2.3.4:51820\t0.0.0.0/0\t900\t10\t20\t0\n",
+            "wg1\tprivate1\tpublic1\t51821\t0x1\n",
+            "wg1\tpeer1\t(none)\t(none)\t10.0.0.0/8\t0\t30\t40\t25\n",
+        );
+        let mut calls = 0;
+        let statuses = observe_all_interfaces_with(|spec| {
+            calls += 1;
+            assert_eq!(spec.program, "wg");
+            assert_eq!(spec.args, ["show", "all", "dump"]);
+            Ok(dump.as_bytes().to_vec())
+        })
+        .unwrap();
+
+        assert_eq!(calls, 1);
+        assert_eq!(statuses.len(), 2);
+        assert_eq!(statuses["wg0"].interface_public_key, "public0");
+        assert_eq!(statuses["wg0"].peers[0].bytes_tx, 20);
+        assert_eq!(statuses["wg1"].interface_public_key, "public1");
+        assert_eq!(statuses["wg1"].peers[0].bytes_rx, 30);
+    }
+
+    #[test]
+    fn all_dump_rejects_cross_interface_peer_attribution() {
+        let dump = concat!(
+            "wg0\tprivate0\tpublic0\t51820\toff\n",
+            "wg1\tpeer1\t(none)\t(none)\t10.0.0.0/8\t0\t30\t40\t25\n",
+        );
+        assert!(parse_wg_all_dump(dump, SystemTime::now(), 0).is_err());
     }
 
     #[test]

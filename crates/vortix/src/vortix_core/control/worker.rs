@@ -276,6 +276,15 @@ impl ReservationBook {
         profile_id: &ProfileId,
         routes: impl IntoIterator<Item = String>,
     ) -> Result<Reservation, WorkFailure> {
+        self.reserve_with_acknowledgement(profile_id, routes, None)
+    }
+
+    pub fn reserve_with_acknowledgement(
+        &self,
+        profile_id: &ProfileId,
+        routes: impl IntoIterator<Item = String>,
+        acknowledgement: Option<&crate::vortix_core::engine::registry::Conflict>,
+    ) -> Result<Reservation, WorkFailure> {
         let routes = routes
             .into_iter()
             .map(|route| RouteClaim::parse(&route))
@@ -287,6 +296,7 @@ impl ReservationBook {
                     .routes
                     .iter()
                     .any(|existing| routes.iter().any(|route| existing.overlaps(*route)))
+                && !acknowledges_peer(acknowledgement, &lease.profile_id, profile_id)
         }) {
             return Err(WorkFailure::RouteConflict);
         }
@@ -388,6 +398,23 @@ impl ReservationBook {
                 state.leases.remove(&lease_id);
             }
         }
+    }
+}
+
+fn acknowledges_peer(
+    acknowledgement: Option<&crate::vortix_core::engine::registry::Conflict>,
+    existing: &ProfileId,
+    target: &ProfileId,
+) -> bool {
+    match acknowledgement {
+        Some(crate::vortix_core::engine::registry::Conflict::DefaultRouteTakeover {
+            current,
+            new,
+        }) => current == existing && new == target,
+        Some(crate::vortix_core::engine::registry::Conflict::RouteOverlap { with, .. }) => {
+            with == existing
+        }
+        None => false,
     }
 }
 
@@ -558,6 +585,15 @@ impl ProfileWorkerPool {
         profile_id: &ProfileId,
         routes: impl IntoIterator<Item = String>,
     ) -> Result<ProfileAdmission, WorkFailure> {
+        self.reserve_with_acknowledgement(profile_id, routes, None)
+    }
+
+    pub fn reserve_with_acknowledgement(
+        &self,
+        profile_id: &ProfileId,
+        routes: impl IntoIterator<Item = String>,
+        acknowledgement: Option<&crate::vortix_core::engine::registry::Conflict>,
+    ) -> Result<ProfileAdmission, WorkFailure> {
         if self.stopping.load(Ordering::Acquire) {
             return Err(WorkFailure::Stopped);
         }
@@ -590,7 +626,9 @@ impl ProfileWorkerPool {
             slots: Arc::clone(&self.inbox_reservations),
             released: false,
         };
-        let reservation = self.reservations.reserve(profile_id, routes)?;
+        let reservation =
+            self.reservations
+                .reserve_with_acknowledgement(profile_id, routes, acknowledgement)?;
         Ok(ProfileAdmission {
             profile_id: profile_id.clone(),
             inbox,
@@ -911,6 +949,9 @@ pub struct TopologyState {
     pub dns_requests: BTreeMap<ProfileId, crate::vortix_core::ports::dns::DnsRequest>,
     pub dns_digest: PolicyDigest,
     pub kill_switch: KillSwitchMode,
+    /// Whether the policy executor has applied an egress-blocking firewall
+    /// shape for this exact topology revision.
+    pub firewall_blocking: bool,
     pub firewall_digest: PolicyDigest,
     pub ownership_receipts: BTreeSet<String>,
 }

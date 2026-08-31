@@ -1214,6 +1214,7 @@ mod tests {
                     .submit(CommandRequest {
                         command: UserCommand::Connect {
                             profile_id: profile_id.clone(),
+                            conflict_acknowledgement: None,
                         },
                         idempotency_key: IdempotencyKey::new("before-scan"),
                         deadline: client.deadline_after(Duration::from_secs(5)),
@@ -1231,6 +1232,7 @@ mod tests {
                 .submit(CommandRequest {
                     command: UserCommand::Connect {
                         profile_id: profile_id.clone(),
+                        conflict_acknowledgement: None,
                     },
                     idempotency_key: IdempotencyKey::new("connect"),
                     deadline: client.deadline_after(Duration::from_secs(5)),

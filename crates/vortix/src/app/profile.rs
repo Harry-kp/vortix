@@ -80,6 +80,18 @@ impl App {
         let profile_name = self.runtime.profiles[idx].name.clone();
         let protocol = self.runtime.profiles[idx].protocol;
 
+        if self.control_session.is_some() {
+            if self
+                .issue_control_command(crate::vortix_core::control::UserCommand::DeleteProfile {
+                    profile_id,
+                })
+                .is_some()
+            {
+                self.input_mode = InputMode::Normal;
+            }
+            return;
+        }
+
         let Some(profiles_dir) = config_path.parent().map(Path::to_path_buf) else {
             self.show_toast(
                 "Profile delete failed: invalid path".to_string(),
@@ -136,6 +148,26 @@ impl App {
         let old_name = self.runtime.profiles[idx].name.clone();
         let old_path = self.runtime.profiles[idx].config_path.clone();
         let stable_id = self.runtime.profiles[idx].id.clone();
+
+        if self.control_session.is_some() {
+            if self.registry.snapshot(&stable_id).is_some() {
+                self.show_toast(
+                    "Cannot rename an active profile — disconnect first".to_string(),
+                    ToastType::Warning,
+                );
+                return;
+            }
+            if self
+                .issue_control_command(crate::vortix_core::control::UserCommand::RenameProfile {
+                    profile_id: stable_id,
+                    new_display_name: trimmed.to_string(),
+                })
+                .is_some()
+            {
+                self.input_mode = InputMode::Normal;
+            }
+            return;
+        }
 
         if let Some(parent) = old_path.parent() {
             // The rename overlay may have been open while a connection
@@ -246,6 +278,11 @@ impl App {
 
     /// Import a single VPN profile file
     fn import_single_file(&mut self, path: &Path) -> Option<String> {
+        if self.control_session.is_some() {
+            let name = self.issue_control_import(path)?;
+            self.show_toast(format!("Import queued: {name}"), ToastType::Info);
+            return Some(name);
+        }
         match crate::vpn::import_profile(path) {
             Ok(profile) => {
                 let name = profile.name.clone();
@@ -284,19 +321,11 @@ impl App {
                             .extension()
                             .is_some_and(|ext| ext == "conf" || ext == "ovpn")
                     {
-                        match crate::vpn::import_profile(&path) {
-                            Ok(profile) => {
-                                self.runtime.profiles.push(profile);
-                                imported += 1;
-                            }
-                            Err(e) => {
-                                self.log(&format!(
-                                    "ERR: Failed to import {}: {}",
-                                    path.display(),
-                                    e
-                                ));
-                                failed += 1;
-                            }
+                        if self.import_single_file(&path).is_some() {
+                            imported += 1;
+                        } else {
+                            self.log(&format!("ERR: Failed to import {}", path.display()));
+                            failed += 1;
                         }
                     }
                 }
