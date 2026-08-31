@@ -14,9 +14,11 @@ use vortix::vortix_core::control::{
     AdmissionError, AuthorityEpoch, BootConnection, BootEligibility, CommandRequest,
     CompletionError, CompletionOutcome, ControlPersistenceConfig, ControlService,
     ControlServiceConfig, ControlStateStore, ControlStateStoreError, Deadline, DesiredState,
-    DurableControlState, ExecutionSelection, IdempotencyKey, Observation, OperationCompletion,
-    OperationFailure, OperationId, OperationIntent, OperationRecord, OperationStatus, PolicyDigest,
-    ProfileTopology, ReadinessError, RecoveredControlState, RequestedTunnelState,
+    DurableControlState, ExecutionSelection, GateEvidence, IdempotencyKey, Observation,
+    OperationCompletion, OperationFailure, OperationId, OperationIntent, OperationRecord,
+    OperationStatus, PolicyDigest, ProfileMutation, ProfileMutationApplied,
+    ProfileMutationExecutor, ProfileMutationFailure, ProfileMutationWork, ProfileTopology,
+    ProtectionEvidence, ReadinessError, RecoveredControlState, RequestedTunnelState,
     RetentionMetadata, UserCommand,
 };
 use vortix::vortix_core::ports::tunnel::TunnelKindTag;
@@ -137,6 +139,21 @@ impl TunnelExecutor for SaveOrderedExecutor {
 
 struct OkPolicy;
 
+#[derive(Debug)]
+struct DeleteProfile;
+
+impl ProfileMutationExecutor for DeleteProfile {
+    fn execute(
+        &self,
+        work: ProfileMutationWork,
+    ) -> Result<ProfileMutationApplied, ProfileMutationFailure> {
+        let ProfileMutation::Delete { profile_id } = work.mutation else {
+            return Err(ProfileMutationFailure::Internal);
+        };
+        Ok(ProfileMutationApplied::Deleted { profile_id })
+    }
+}
+
 impl PolicyExecutor for OkPolicy {
     fn apply(&self, _policy: &TopologyPolicy, _barrier: PolicyBarrier) -> Result<(), String> {
         Ok(())
@@ -209,6 +226,7 @@ async fn same_boot_unexpected_recovery_reconstructs_preblock_before_reconnect() 
         },
         status: OperationStatus::WaitingForObservation,
         result: None,
+        failure_detail: None,
     };
     let store = Arc::new(RecordingStore {
         state: Mutex::new(Some(DurableControlState {
@@ -216,6 +234,7 @@ async fn same_boot_unexpected_recovery_reconstructs_preblock_before_reconnect() 
             operations: BTreeMap::from([(operation_id, operation)]),
             boot_connections: BTreeMap::new(),
             requested_resources: BTreeMap::new(),
+            last_connected_at: BTreeMap::new(),
             tombstones: BTreeMap::new(),
             retention: RetentionMetadata::default(),
             reconciliation_required: true,
@@ -266,6 +285,42 @@ async fn same_boot_unexpected_recovery_reconstructs_preblock_before_reconnect() 
         tokio::task::yield_now().await;
     }
     assert_eq!(&*order.0.lock().unwrap(), &["preblock", "tunnel"]);
+}
+
+#[tokio::test]
+async fn restart_restores_canonical_last_connected_time() {
+    let profile_id = ProfileId::new("last-connected-recovery");
+    let connected_at = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(9_876);
+    let desired = DesiredState {
+        authority_epoch: AuthorityEpoch(15),
+        ..DesiredState::default()
+    };
+    let store = Arc::new(RecordingStore {
+        state: Mutex::new(Some(DurableControlState {
+            desired,
+            operations: BTreeMap::new(),
+            boot_connections: BTreeMap::new(),
+            requested_resources: BTreeMap::new(),
+            last_connected_at: BTreeMap::from([(profile_id.clone(), connected_at)]),
+            tombstones: BTreeMap::new(),
+            retention: RetentionMetadata::default(),
+            reconciliation_required: true,
+        })),
+        ..RecordingStore::default()
+    });
+
+    let service = ControlService::start(ControlServiceConfig {
+        authority_epoch: AuthorityEpoch(15),
+        known_profiles: BTreeSet::from([profile_id.clone()]),
+        profile_topologies: topology_catalog(&profile_id),
+        persistence: Some(ControlPersistenceConfig::new("boot-a", store)),
+        ..ControlServiceConfig::default()
+    });
+
+    assert_eq!(
+        service.client().snapshot().last_connected_at[&profile_id],
+        connected_at
+    );
 }
 
 #[tokio::test]
@@ -527,6 +582,88 @@ async fn terminal_reply_waits_for_durable_operation_result() {
 }
 
 #[tokio::test]
+async fn failed_terminal_persistence_does_not_publish_last_connected_activity() {
+    let store = Arc::new(RecordingStore::default());
+    let profile_id = ProfileId::new("failed-activity-persistence");
+    let service = ControlService::start(ControlServiceConfig {
+        authority_epoch: AuthorityEpoch(16),
+        known_profiles: BTreeSet::from([profile_id.clone()]),
+        profile_topologies: topology_catalog(&profile_id),
+        persistence: Some(ControlPersistenceConfig::new("boot-a", store.clone())),
+        ..ControlServiceConfig::default()
+    });
+    service
+        .completer()
+        .set_readiness(AuthorityEpoch(16), true, true)
+        .await
+        .unwrap();
+    let admitted = service
+        .client()
+        .submit(CommandRequest {
+            command: UserCommand::Connect {
+                profile_id: profile_id.clone(),
+                conflict_acknowledgement: None,
+            },
+            idempotency_key: IdempotencyKey::new("activity-persistence-failure"),
+            deadline: Deadline(u64::MAX),
+        })
+        .await
+        .unwrap();
+    let connected_at = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(123);
+    let observed_at_millis = service.observer().now_millis();
+    service
+        .observer()
+        .observe_batch(vec![
+            Observation::TunnelDetails {
+                profile_id: profile_id.clone(),
+                details: Box::default(),
+                started_at: Some(connected_at),
+                observed_at_millis,
+            },
+            Observation::Tunnel {
+                profile_id: profile_id.clone(),
+                active: true,
+                interface_name: Some("utun9".into()),
+                observed_at_millis,
+                protection: None,
+            },
+        ])
+        .await
+        .unwrap();
+    let desired = service.client().snapshot().desired;
+    store.fail.store(true, Ordering::Release);
+
+    assert_eq!(
+        service
+            .completer()
+            .complete(OperationCompletion {
+                operation_id: admitted.operation_id,
+                desired_generation: desired.generation,
+                outcome: CompletionOutcome::ObservedSuccess(ProtectionEvidence {
+                    desired_generation: desired.generation,
+                    authority_epoch: desired.authority_epoch,
+                    policy_digest: desired.policy_digest,
+                    observed_at_millis,
+                    interface: GateEvidence::Verified,
+                    route: GateEvidence::Verified,
+                    dns: GateEvidence::Verified,
+                    firewall: GateEvidence::Verified,
+                }),
+            })
+            .await,
+        Err(CompletionError::Persistence)
+    );
+    assert!(
+        !service
+            .client()
+            .snapshot()
+            .last_connected_at
+            .contains_key(&profile_id),
+        "activity must not become visible when its durable transaction fails"
+    );
+}
+
+#[tokio::test]
 async fn same_boot_restart_scans_before_resuming_one_nonterminal_operation() {
     let store = Arc::new(RecordingStore::default());
     let profile_id = ProfileId::new("same-boot-recovery");
@@ -622,6 +759,191 @@ async fn same_boot_restart_scans_before_resuming_one_nonterminal_operation() {
         .snapshot()
         .operations
         .contains_key(&original_operation));
+}
+
+#[tokio::test]
+async fn admitted_connect_does_not_wait_for_deadline_when_dispatch_stops() {
+    let profile_id = ProfileId::new("dispatch-stopped-connect");
+    let save_entered = Arc::new(AtomicBool::new(false));
+    let store = Arc::new(SlowStore {
+        entered: save_entered.clone(),
+    });
+    let supervisor = Arc::new(Supervisor::new(
+        AuthorityEpoch(17),
+        Arc::new(CountingExecutor(Arc::new(AtomicUsize::new(0)))),
+        Arc::new(OkPolicy),
+        1,
+        4,
+    ));
+    let service = ControlService::start_supervised(
+        ControlServiceConfig {
+            authority_epoch: AuthorityEpoch(17),
+            known_profiles: BTreeSet::from([profile_id.clone()]),
+            profile_topologies: topology_catalog(&profile_id),
+            persistence: Some(ControlPersistenceConfig::new("boot-a", store)),
+            freshness_poll_interval: Duration::from_millis(5),
+            ..ControlServiceConfig::default()
+        },
+        Arc::new(vortix::vortix_core::control::RealClock),
+        ExecutionSelection::CanonicalAuthority,
+        supervisor.clone(),
+    );
+    service
+        .observer()
+        .observe(Observation::Tunnel {
+            profile_id: profile_id.clone(),
+            active: false,
+            interface_name: None,
+            observed_at_millis: service.observer().now_millis(),
+            protection: None,
+        })
+        .await
+        .unwrap();
+    service
+        .completer()
+        .set_readiness(AuthorityEpoch(17), true, true)
+        .await
+        .unwrap();
+    save_entered.store(false, Ordering::Release);
+
+    let client = service.client();
+    let submit = tokio::spawn(async move {
+        client
+            .submit(CommandRequest {
+                command: UserCommand::Connect {
+                    profile_id,
+                    conflict_acknowledgement: None,
+                },
+                idempotency_key: IdempotencyKey::new("dispatch-stopped-connect"),
+                deadline: client.deadline_after(Duration::from_secs(10)),
+            })
+            .await
+    });
+    let save_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while !save_entered.load(Ordering::Acquire) {
+        assert!(
+            tokio::time::Instant::now() < save_deadline,
+            "connect intent was not persisted before dispatch"
+        );
+        tokio::task::yield_now().await;
+    }
+    supervisor.shutdown();
+
+    let admitted = submit.await.unwrap().unwrap();
+    let terminal_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        let operation = service
+            .client()
+            .snapshot()
+            .operations
+            .get(&admitted.operation_id)
+            .cloned()
+            .expect("admitted operation remains retained");
+        if operation.status.is_terminal() {
+            assert_eq!(operation.status, OperationStatus::Failed);
+            assert_eq!(
+                operation.result,
+                Some(vortix::vortix_core::control::OperationResult::Failed(
+                    OperationFailure::Internal,
+                ))
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < terminal_deadline,
+            "dispatch failure left the admitted connect waiting for its deadline"
+        );
+        tokio::task::yield_now().await;
+    }
+}
+
+#[tokio::test]
+async fn completed_restarted_disconnect_releases_profile_for_deletion() {
+    let store = Arc::new(RecordingStore::default());
+    let profile_id = ProfileId::new("restart-disconnect-release");
+    let operation_id: OperationId =
+        serde_json::from_str("\"op-0000000000000009-0000000000000001\"").unwrap();
+    let desired = DesiredState {
+        generation: 1,
+        tunnels: BTreeMap::from([(profile_id.clone(), RequestedTunnelState::Disconnected)]),
+        conflict_acknowledgements: BTreeMap::new(),
+        kill_switch: vortix::vortix_core::state::killswitch::KillSwitchMode::Off,
+        authority_epoch: AuthorityEpoch(9),
+        policy_digest: PolicyDigest("restart-disconnect-policy".into()),
+    };
+    store.state.lock().unwrap().replace(DurableControlState {
+        desired: desired.clone(),
+        operations: BTreeMap::from([(
+            operation_id.clone(),
+            OperationRecord {
+                id: operation_id.clone(),
+                idempotency_key: IdempotencyKey::new("restart-disconnect"),
+                client_id: serde_json::from_str("\"client-0000000000000009-0000000000000001\"")
+                    .unwrap(),
+                command_digest: desired.policy_digest.clone(),
+                authority_epoch: AuthorityEpoch(9),
+                desired_generation: desired.generation,
+                admitted_at_millis: 0,
+                deadline_millis: u64::MAX,
+                intent: OperationIntent::DesiredSubset {
+                    tunnels: desired.tunnels.clone(),
+                    kill_switch: None,
+                },
+                status: OperationStatus::WaitingForObservation,
+                result: None,
+                failure_detail: None,
+            },
+        )]),
+        boot_connections: BTreeMap::new(),
+        requested_resources: BTreeMap::new(),
+        last_connected_at: BTreeMap::new(),
+        tombstones: BTreeMap::new(),
+        retention: RetentionMetadata::default(),
+        reconciliation_required: true,
+    });
+    let service = ControlService::start(ControlServiceConfig {
+        authority_epoch: AuthorityEpoch(9),
+        known_profiles: BTreeSet::from([profile_id.clone()]),
+        profile_topologies: topology_catalog(&profile_id),
+        persistence: Some(ControlPersistenceConfig::new("boot-a", store)),
+        profile_mutations: Some(Arc::new(DeleteProfile)),
+        ..ControlServiceConfig::default()
+    });
+    service
+        .completer()
+        .set_readiness(AuthorityEpoch(9), true, true)
+        .await
+        .unwrap();
+
+    service
+        .completer()
+        .complete(OperationCompletion {
+            operation_id: operation_id.clone(),
+            desired_generation: desired.generation,
+            outcome: CompletionOutcome::Failed(OperationFailure::ObservationFailed),
+        })
+        .await
+        .expect("restarted disconnect terminalized");
+    assert!(!service
+        .client()
+        .snapshot()
+        .operations
+        .contains_key(&operation_id));
+
+    let deletion = service
+        .client()
+        .submit(CommandRequest {
+            command: UserCommand::DeleteProfile {
+                profile_id: profile_id.clone(),
+            },
+            idempotency_key: IdempotencyKey::new("delete-after-restart-disconnect"),
+            deadline: Deadline(u64::MAX),
+        })
+        .await;
+    assert!(
+        deletion.is_ok(),
+        "completed recovery must release {profile_id} for deletion: {deletion:?}"
+    );
 }
 
 #[tokio::test]

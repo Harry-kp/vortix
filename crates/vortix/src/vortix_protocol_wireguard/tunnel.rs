@@ -272,11 +272,25 @@ fn resolve_session_id() -> String {
     crate::utils::temp_session_id()
 }
 
+/// Validate the interface name that `wg-quick` derives from a config basename.
+///
+/// Linux limits interface names to 15 bytes and `wg-quick` applies this same
+/// portable contract on macOS. Keeping the name explicit avoids a second,
+/// hidden identity between profile storage, observation, and teardown.
+/// Return and validate the exact interface name derived from a config path.
+pub(crate) fn interface_name_from_path(path: &Path) -> Result<String, TunnelError> {
+    let name = path
+        .file_stem()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| TunnelError::Subprocess("WireGuard config has no valid name".into()))?;
+    crate::vortix_core::profile::validate_wireguard_interface_name(name)
+        .map_err(TunnelError::Subprocess)?;
+    Ok(name.to_owned())
+}
+
 /// Inner helper: write the sanitized body to `${session_dir}/${basename}` at
-/// mode `0o600`. The basename is preserved verbatim so wg-quick's
-/// `interface = basename(filename)` derivation produces the same interface
-/// name as the user's original profile (relevant for `%i` substitution in
-/// `PostUp`/`PreDown` hooks).
+/// mode `0o600`. The basename is preserved verbatim so every lifecycle layer
+/// uses the same explicit `wg-quick` interface identity.
 ///
 /// If a stale leaf with the same basename exists in the session subdir (very
 /// fast disconnect-reconnect within one session), it is unlinked first —
@@ -293,10 +307,10 @@ fn write_managed_temp_config_at(
 ) -> Result<PathBuf, TunnelError> {
     use crate::vortix_core::secret_file::{write_secret_file, SecretFileError};
 
+    interface_name_from_path(user_conf_path)?;
     let basename = user_conf_path
         .file_name()
-        .ok_or_else(|| TunnelError::Subprocess("WG config has no basename".into()))?;
-
+        .ok_or_else(|| TunnelError::Subprocess("WireGuard config has no basename".into()))?;
     let temp_path = session_dir.join(basename);
 
     // Best-effort unlink of any stale leaf from a same-session reconnect.
@@ -697,8 +711,10 @@ impl WgTunnel {
             teardown_config: Some(TunnelTeardownConfig {
                 path: attempt.temp_path,
                 managed: true,
+                wg_quick_interface: Some(attempt.interface_basename),
             }),
             dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
+            openvpn_routes: None,
         };
         self.down(handle)?;
         if wait_for_interface_absence(&interface_name, Duration::from_secs(2)) {
@@ -862,8 +878,10 @@ impl WgTunnel {
             teardown_config: Some(TunnelTeardownConfig {
                 path: temp_path,
                 managed: true,
+                wg_quick_interface: Some(basename),
             }),
             dns_request,
+            openvpn_routes: None,
         };
         settle_failed_attempt(
             original,
@@ -1099,6 +1117,7 @@ fn prepare_down_target_with(
         looks_like_config_path(&handle.interface_name).then(|| TunnelTeardownConfig {
             path: PathBuf::from(&handle.interface_name),
             managed: false,
+            wg_quick_interface: None,
         })
     });
 
@@ -1111,10 +1130,16 @@ fn prepare_down_target_with(
     };
 
     if config.managed {
-        if interface_from_path(&config.path) != handle.interface_name {
-            if Path::new(&handle.interface_name).components().count() != 1 {
+        let wg_quick_interface = config
+            .wg_quick_interface
+            .as_deref()
+            .unwrap_or(&handle.interface_name);
+        crate::vortix_core::profile::validate_wireguard_interface_name(wg_quick_interface)
+            .map_err(TunnelError::Subprocess)?;
+        if interface_from_path(&config.path) != wg_quick_interface {
+            if Path::new(wg_quick_interface).components().count() != 1 {
                 return Err(TunnelError::Subprocess(
-                    "managed WireGuard interface is not a safe basename".into(),
+                    "managed WireGuard alias is not a safe basename".into(),
                 ));
             }
             let body = read_bounded_profile(&config.path)?;
@@ -1123,7 +1148,7 @@ fn prepare_down_target_with(
                     "validate recovered WireGuard teardown profile: {error}"
                 ))
             })?;
-            let interface_config = PathBuf::from(format!("{}.conf", handle.interface_name));
+            let interface_config = PathBuf::from(format!("{wg_quick_interface}.conf"));
             let temp_path = write_managed(&interface_config, body.as_bytes())?;
             return Ok(PreparedDownTarget {
                 target: temp_path.to_string_lossy().into_owned(),
@@ -1171,6 +1196,9 @@ impl Tunnel for WgTunnel {
     #[allow(clippy::too_many_lines)]
     fn up(&mut self, profile: &Profile) -> Result<TunnelHandle, TunnelError> {
         self.validate_settings()?;
+        // Reject legacy or externally-created invalid names before reading
+        // secrets, spawning `wg-quick`, or entering a Handshaking UI state.
+        let explicit_interface_name = interface_name_from_path(&profile.config_path)?;
         if self.cancellation_requested() {
             return Err(TunnelError::Cancelled);
         }
@@ -1225,11 +1253,13 @@ impl Tunnel for WgTunnel {
         // interface name alone.
         let temp_path = write_managed_temp_config(&profile.config_path, stripped.as_bytes())?;
         let effective_path = temp_path.clone();
+        let interface_basename = interface_from_path(&effective_path);
+        debug_assert_eq!(interface_basename, explicit_interface_name);
 
         self.inflight = Some(Box::new(WgInflightAttempt {
             profile_id: profile.id.clone(),
             display_name: profile.display_name.clone(),
-            interface_basename: interface_from_path(&effective_path),
+            interface_basename,
             started_at: attempt_started,
             generation,
             temp_path: temp_path.clone(),
@@ -1314,8 +1344,10 @@ impl Tunnel for WgTunnel {
             teardown_config: Some(TunnelTeardownConfig {
                 path: temp_path,
                 managed: true,
+                wg_quick_interface: Some(explicit_interface_name),
             }),
             dns_request,
+            openvpn_routes: None,
         };
         let attempt = HandshakeAttempt {
             generation,
@@ -1689,6 +1721,7 @@ mod tests {
             process_ownership: None,
             teardown_config,
             dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
+            openvpn_routes: None,
         }
     }
 
@@ -1707,6 +1740,7 @@ mod tests {
             Some(TunnelTeardownConfig {
                 path: source.clone(),
                 managed: false,
+                wg_quick_interface: Some("corp".into()),
             }),
         );
 
@@ -1734,6 +1768,7 @@ mod tests {
             Some(TunnelTeardownConfig {
                 path: managed.clone(),
                 managed: true,
+                wg_quick_interface: Some("corp".into()),
             }),
         );
 
@@ -1756,16 +1791,17 @@ mod tests {
     }
 
     #[test]
-    fn recovered_managed_down_uses_authoritative_interface_basename() {
+    fn recovered_macos_down_uses_wg_quick_alias_not_kernel_interface() {
         let (_root, session) = fresh_session_dir();
         let scratch = tempfile::tempdir().unwrap();
         let persisted = scratch.path().join("ownership-record-hash.conf");
         std::fs::write(&persisted, "[Interface]\nPrivateKey = SECRET\n").unwrap();
         let handle = wg_handle(
-            "integration",
+            "utun4",
             Some(TunnelTeardownConfig {
                 path: persisted.clone(),
                 managed: true,
+                wg_quick_interface: Some("wg07".into()),
             }),
         );
 
@@ -1778,8 +1814,8 @@ mod tests {
             std::path::Path::new(&prepared.target)
                 .file_name()
                 .and_then(std::ffi::OsStr::to_str),
-            Some("integration.conf"),
-            "wg-quick derives the interface from the managed filename"
+            Some("wg07.conf"),
+            "wg-quick must receive the alias recorded in /var/run/wireguard/wg07.name"
         );
         assert_eq!(
             prepared.cleanup_after_attempt.as_deref(),
@@ -1910,6 +1946,18 @@ mod tests {
         assert!(!written.contains("DNS"));
         assert!(written.contains("PrivateKey = SECRET"));
         assert!(written.contains("[Peer]"));
+    }
+
+    #[test]
+    fn managed_temp_config_rejects_a_wg_quick_invalid_basename() {
+        let (_root, session) = fresh_session_dir();
+        let scratch = tempfile::tempdir().unwrap();
+        let user_conf = scratch.path().join("07-wireguard-split-ip.conf");
+        let body = b"[Interface]\nPrivateKey = SECRET\n";
+
+        let error = write_managed_temp_config_at(&session, &user_conf, body).unwrap_err();
+        assert!(error.to_string().contains("1–15 characters"));
+        assert!(std::fs::read_dir(&session).unwrap().next().is_none());
     }
 
     #[cfg(unix)]

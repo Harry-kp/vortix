@@ -12,6 +12,27 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
+/// Portable maximum for the interface name derived by `wg-quick` from a
+/// `WireGuard` config filename.
+pub const MAX_WIREGUARD_INTERFACE_NAME_BYTES: usize = 15;
+
+/// Validate the one explicit `WireGuard` interface identity shared by profile
+/// storage, protocol execution, observation, and teardown.
+pub fn validate_wireguard_interface_name(name: &str) -> Result<(), String> {
+    let valid = !name.is_empty()
+        && name.len() <= MAX_WIREGUARD_INTERFACE_NAME_BYTES
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_=+.-".contains(&byte));
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "WireGuard name must be 1–{MAX_WIREGUARD_INTERFACE_NAME_BYTES} characters using only letters, numbers, _, =, +, ., or -"
+        ))
+    }
+}
+
 /// Strip a profile name down to ASCII `[A-Za-z0-9_-]` for safe use in
 /// daemon names, filenames, and process-match patterns.
 #[must_use]

@@ -90,13 +90,13 @@ pub struct VpnRuntime {
     pub location: String,
     pub isp: String,
     pub dns_server: String,
-    pub dns_leak: crate::core::dns_leak::DnsLeakStatus,
 
     // === System Info ===
     pub public_ip: String,
     pub real_ip: Option<String>,
     pub public_ipv6: Option<String>,
     pub real_ipv6: Option<String>,
+    pub last_ipv6_check: Option<Instant>,
     pub last_security_check: Option<Instant>,
     pub ip_unchanged_warned: bool,
     pub last_connected_profile: Option<String>,
@@ -183,12 +183,12 @@ impl VpnRuntime {
             location: constants::MSG_DETECTING.to_string(),
             isp: constants::MSG_DETECTING.to_string(),
             dns_server: constants::MSG_DETECTING.to_string(),
-            dns_leak: crate::core::dns_leak::DnsLeakStatus::Unknown,
 
             public_ip: constants::MSG_DETECTING.to_string(),
             real_ip: None,
             public_ipv6: None,
             real_ipv6: None,
+            last_ipv6_check: None,
             last_security_check: None,
             ip_unchanged_warned: false,
             last_connected_profile: None,
@@ -279,12 +279,12 @@ impl VpnRuntime {
             location: String::new(),
             isp: String::new(),
             dns_server: String::new(),
-            dns_leak: crate::core::dns_leak::DnsLeakStatus::Unknown,
 
             public_ip: String::new(),
             real_ip: None,
             public_ipv6: None,
             real_ipv6: None,
+            last_ipv6_check: None,
             last_security_check: None,
             ip_unchanged_warned: false,
             last_connected_profile: None,
@@ -354,11 +354,11 @@ impl VpnRuntime {
             location: String::new(),
             isp: String::new(),
             dns_server: String::new(),
-            dns_leak: crate::core::dns_leak::DnsLeakStatus::Unknown,
             public_ip: String::new(),
             real_ip: None,
             public_ipv6: None,
             real_ipv6: None,
+            last_ipv6_check: None,
             last_security_check: None,
             ip_unchanged_warned: false,
             last_connected_profile: None,
@@ -586,7 +586,7 @@ impl VpnRuntime {
             for profile in &mut self.profiles {
                 let key = profile.config_path.to_string_lossy().to_string();
                 if let Some(meta) = metadata.get(&key) {
-                    profile.last_used = meta.last_used;
+                    profile.last_used = profile.last_used.max(meta.last_used);
                 }
             }
         }
@@ -668,9 +668,15 @@ impl VpnRuntime {
                     crate::vortix_core::ports::tunnel::TunnelTeardownConfig {
                         path: profile.config_path.clone(),
                         managed: false,
+                        wg_quick_interface: profile
+                            .config_path
+                            .file_stem()
+                            .and_then(std::ffi::OsStr::to_str)
+                            .map(str::to_owned),
                     }
                 }),
                 dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
+                openvpn_routes: None,
             };
 
             tunnel.down(handle)?;

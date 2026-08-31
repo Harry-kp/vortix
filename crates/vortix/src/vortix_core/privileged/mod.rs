@@ -81,7 +81,7 @@ pub(crate) fn has_duplicates<'a, T: Ord + 'a>(values: impl IntoIterator<Item = &
     values.into_iter().any(|value| !unique.insert(value))
 }
 
-pub(super) fn invalid_unicast_ip(address: &IpAddr) -> bool {
+pub(crate) fn invalid_unicast_ip(address: &IpAddr) -> bool {
     match address {
         IpAddr::V4(address) => {
             address.is_unspecified() || address.is_multicast() || address.is_broadcast()
@@ -107,10 +107,12 @@ pub use child_owner::{
     reason = "the typed transaction minter remains dormant until the firewall adapter lands"
 )]
 pub(crate) use ledger::{
-    DnsTransactionId, FirewallTransactionId, HelperLedgerDns, HelperLedgerFirewall,
-    HelperLedgerPolicy, HelperLedgerRecord, HelperLedgerResource, HelperResourceState,
-    PhysicalDnsBackend, PhysicalDnsLink, PhysicalDnsPrior, PhysicalDnsStage, PhysicalDnsValue,
-    PhysicalFirewallBackend, PhysicalFirewallStage,
+    released_identity_set_is_invalid, DnsTransactionId, FirewallTransactionId, HelperLedgerDns,
+    HelperLedgerFirewall, HelperLedgerPhysicalOwnership, HelperLedgerPolicy, HelperLedgerRecord,
+    HelperLedgerResource, HelperLedgerRoutes, HelperResourceState, PhysicalDnsBackend,
+    PhysicalDnsLink, PhysicalDnsPrior, PhysicalDnsStage, PhysicalDnsValue, PhysicalFirewallBackend,
+    PhysicalFirewallStage, PhysicalRouteBackend, PhysicalRouteEntry, PhysicalRouteStage,
+    RouteTransactionId, MAX_HELPER_LEDGER_BYTES,
 };
 pub use operation::{
     AuthorityBinding, BootScope, HelperEpoch, LeaseId, NetworkPolicyOperation, OperationAdmission,
@@ -118,21 +120,23 @@ pub use operation::{
     PolicyPhase, PolicyPredecessor, PrivilegedDnsAssignment, PrivilegedDnsScope,
     PrivilegedFirewallRole, PrivilegedFirewallTunnel, PrivilegedOperation, PrivilegedOperationId,
     PrivilegedRequest, ReplayBaseline, ReplayHighWater, ReplayRecord, ReplayUnused,
-    RequestSequence, RootAuthorityLedger, ScopedRoute, ServiceInstanceClaim, ServiceManager,
-    TrustedDaemonPrincipal,
+    RequestSequence, RootAuthorityLedger, ScopedOpenVpnRedirect, ScopedRoute, ScopedRouteGateway,
+    ScopedRouteOrigin, ServiceInstanceClaim, ServiceManager, TrustedDaemonPrincipal,
 };
 pub(crate) use operation::{PlatformVerifiedAuthority, PolicyProjection};
 pub(crate) use protocol_plan::TunnelDescriptorRef;
 pub use protocol_plan::{
-    DnsHostname, OpenVpnAuthFactors, OpenVpnChallengeKind, OpenVpnKeyDirection, OpenVpnPlan,
-    OpenVpnRemote, OpenVpnRemoteSelection, OpenVpnRoute, OpenVpnTransport, ProfileMaterialRef,
+    DnsHostname, OpenVpnAuthFactors, OpenVpnChallengeKind, OpenVpnDefaultGateway,
+    OpenVpnDefaultGateways, OpenVpnKeyDirection, OpenVpnPlan, OpenVpnRedirectFlag,
+    OpenVpnRedirectGateway, OpenVpnRemote, OpenVpnRemoteSelection, OpenVpnRoute,
+    OpenVpnRouteDefaults, OpenVpnRouteGateway, OpenVpnTransport, ProfileMaterialRef,
     ProfileMaterialSlot, ProtocolEndpoint, ProtocolPlan, ProtocolPlanError,
     WireGuardInterfaceOptions, WireGuardPeerPlan, WireGuardPlan, WireGuardPresharedKeyRef,
 };
 pub(crate) use receipt::AuthenticatedReceiptVerifier;
 pub use receipt::{
-    AmbiguousPhase, ObservationState, ReceiptError, ReceiptLedger, ReceiptOutcome, RejectionCode,
-    ResourceObservation, ResourceOwnership, UntrustedReceipt, VerifiedReceipt,
-    WireGuardPeerObservation,
+    AmbiguousPhase, ObservationState, OpenVpnRouteEvidence, OpenVpnRouteSetEvidence, ReceiptError,
+    ReceiptLedger, ReceiptOutcome, RejectionCode, ResourceObservation, ResourceOwnership,
+    UntrustedReceipt, VerifiedReceipt, WireGuardPeerObservation,
 };
 pub use resource::{ResourceError, ResourceKind, ResourceObservationTarget, ResourceTag};

@@ -859,7 +859,7 @@ async fn read_request_with_timeout<R: AsyncRead + Unpin>(
 
 fn prepare_socket_path(path: &Path) -> std::io::Result<()> {
     if std::fs::symlink_metadata(path.parent().unwrap_or_else(|| Path::new(".")))
-        .is_ok_and(|metadata| metadata.file_type().is_symlink() || !metadata.is_dir())
+        .is_ok_and(|metadata| !metadata.is_dir())
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,

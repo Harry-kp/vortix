@@ -468,6 +468,7 @@ fn find_forbidden_oneshot(line: &str) -> Option<&'static str> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum ControlBoundaryKind {
     ClientMutationImport,
+    DirectCredentialFileAccess,
     SeedOrMirrorWriter,
     RootPrivilegeRequest,
     UnboundedChannel,
@@ -478,6 +479,9 @@ impl ControlBoundaryKind {
     const fn label(self) -> &'static str {
         match self {
             Self::ClientMutationImport => "direct client mutation-layer import",
+            Self::DirectCredentialFileAccess => {
+                "direct remembered-credential file access outside its authority"
+            }
             Self::SeedOrMirrorWriter => "production seed/mirror writer",
             Self::RootPrivilegeRequest => "root privilege request outside an owner",
             Self::UnboundedChannel => "unbounded production channel",
@@ -978,6 +982,9 @@ fn scan_token_control_boundaries(path: &str, content: &str) -> Vec<ControlBounda
     let is_client = path.starts_with("crates/vortix/src/app/")
         || path.starts_with("crates/vortix/src/cli/")
         || path.starts_with("crates/vortix/src/ui/");
+    let is_credential_consumer = is_client
+        || path == "crates/vortix/src/tunnel.rs"
+        || path.starts_with("crates/vortix/src/vortix_protocol_openvpn/");
     let mut violations = Vec::new();
     let mut seen_lines = HashSet::new();
 
@@ -988,6 +995,20 @@ fn scan_token_control_boundaries(path: &str, content: &str) -> Vec<ControlBounda
                 || token.text == "vortix_process")
         {
             Some(ControlBoundaryKind::ClientMutationImport)
+        } else if is_credential_consumer
+            && path != "crates/vortix/src/cli/control.rs"
+            && matches!(
+                token.text.as_str(),
+                "get_openvpn_auth_path"
+                    | "write_openvpn_auth_file"
+                    | "read_openvpn_saved_auth"
+                    | "read_openvpn_saved_auth_compat"
+                    | "delete_openvpn_auth_file"
+                    | "delete_openvpn_auth_file_compat"
+                    | "FsOpenVpnCredentialStore"
+            )
+        {
+            Some(ControlBoundaryKind::DirectCredentialFileAccess)
         } else if token.text.starts_with("seed_") || token.text.starts_with("mirror_") {
             Some(ControlBoundaryKind::SeedOrMirrorWriter)
         } else if token.text == "privilege"
@@ -1205,6 +1226,35 @@ mod control_boundary_tests {
         assert!(violations
             .iter()
             .any(|v| v.kind == ControlBoundaryKind::ClientMutationImport));
+    }
+
+    #[test]
+    fn rejects_direct_remembered_credential_file_access() {
+        let fixture = Fixture::new("credential-file-access");
+        fixture.write(
+            "crates/vortix/src/app/connection.rs",
+            "let saved = utils::read_openvpn_saved_auth_compat(id, name);\n",
+        );
+        fixture.write(
+            "crates/vortix/src/vortix_protocol_openvpn/tunnel.rs",
+            "utils::write_openvpn_auth_file(name, user, pass)?;\n",
+        );
+        fixture.write(
+            "crates/vortix/src/ui/credentials.rs",
+            "let store = FsOpenVpnCredentialStore::for_owner(root, uid, gid);\n",
+        );
+
+        let violations = scan_control_boundaries_at(fixture.root()).unwrap();
+        assert_eq!(
+            violations
+                .iter()
+                .filter(|violation| {
+                    violation.kind == ControlBoundaryKind::DirectCredentialFileAccess
+                })
+                .count(),
+            3,
+            "{violations:#?}"
+        );
     }
 
     #[test]

@@ -156,9 +156,6 @@ impl ChildEvidenceStore {
     fn persist(&self, identity: &ObservedChildIdentity) -> Result<(), ChildEvidenceError> {
         self.validate_identity(identity)?;
         self.prepare_runtime_dir()?;
-        if self.path.try_exists()? {
-            return Err(ChildEvidenceError::AlreadyExists);
-        }
         let bytes = serde_json::to_vec(identity)?;
         if bytes.is_empty() || bytes.len() as u64 > MAX_CHILD_EVIDENCE_BYTES {
             return Err(ChildEvidenceError::Capacity);

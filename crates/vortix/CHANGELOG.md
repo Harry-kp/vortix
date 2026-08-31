@@ -53,7 +53,7 @@ All notable changes to this project will be documented in this file.
 
 - `Real IPv6` survives vortix restarts via a new `real-ipv6.cache` (parallel to `real-ip.cache`). Launching vortix with a VPN already up populates the row immediately instead of stalling on `checking…`. The cache also writes when the registry shows the active tunnel's AllowedIPs don't claim `::/0` — the safe one-sided half of the old config-introspection logic, now used only for caching, never for leak verdict.
 - Security Guard `Exit IPv6` row carries a per-family alarm sub-line on leak (`v6 exposed — matches real IPv6`) so the user knows which family escaped.
-- `scripts/test-infra.sh` flavors:
+- Historical test-infrastructure flavors (now consolidated in `scripts/vpn-lab.sh`):
   - `wg-v6` — dual-stack server (v4 + v6 `Address`, ip6_forward + ip6tables MASQUERADE on the egress interface, droplet provisioned with `--enable-ipv6`). Validates the `Exit IPv6 ✓ Protected` path.
   - `wg-dns-leak` — full-tunnel WG that silently DNATs every tunnel-side UDP/53 query to a different DNS provider than the one the client config claims. The same MitM pattern a hostile coffee-shop AP or ISP-side DNS hijacker uses, and exactly what the recursor-IP probe is designed to catch.
 

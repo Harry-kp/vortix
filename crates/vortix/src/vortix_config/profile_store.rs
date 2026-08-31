@@ -20,6 +20,16 @@ const DELETE_INTENT: &str = ".vortix-profile-delete.toml";
 const PROFILE_LOCK: &str = ".vortix-profile.lock";
 const LOCK_TIMEOUT: Duration = Duration::from_millis(500);
 
+pub(crate) fn is_profile_config_name(file_name: &str) -> bool {
+    !file_name.starts_with('.')
+        && matches!(
+            Path::new(file_name)
+                .extension()
+                .and_then(|extension| extension.to_str()),
+            Some("conf" | "ovpn")
+        )
+}
+
 pub(crate) struct ProfileMutationLock(std::fs::File);
 
 impl Drop for ProfileMutationLock {
@@ -766,9 +776,19 @@ impl FsProfileStore {
             if !path.is_file() {
                 continue;
             }
-            if let Some("conf" | "ovpn") = path.extension().and_then(|extension| extension.to_str())
-            {
-                reject_symlink(&path)?;
+            let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+                if matches!(
+                    path.extension().and_then(|extension| extension.to_str()),
+                    Some("conf" | "ovpn")
+                ) {
+                    return Err(ProfileStoreError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("profile filename is not valid UTF-8: {}", path.display()),
+                    )));
+                }
+                continue;
+            };
+            if is_profile_config_name(file_name) {
                 configs.insert(path);
             }
         }
@@ -1199,6 +1219,61 @@ mod tests {
         store.insert(&corp(), b"[Interface]\n").unwrap();
         assert_eq!(store.resolve_display_name("corp").unwrap(), id(1));
         assert_eq!(store.get(&id(1)).unwrap().display_name, "corp");
+    }
+
+    #[test]
+    fn list_ignores_hidden_openvpn_runtime_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FsProfileStore::new(tmp.path().join("profiles"));
+        let profile = Profile::new(
+            id(1),
+            "corp",
+            ProtocolKind::OpenVpn,
+            PathBuf::from("placeholder"),
+        );
+        store.insert(&profile, b"client\n").unwrap();
+        let runtime = format!(
+            ".vortix-{}-0000000000000007-bbbbbbbbbbbbbbbb.ovpn",
+            profile.id
+        );
+        std::fs::write(store.profiles_dir.join(runtime), b"client\n").unwrap();
+
+        let summaries = store.list().unwrap();
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, profile.id);
+    }
+
+    #[test]
+    fn list_rejects_visible_config_without_sidecar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FsProfileStore::new(tmp.path().join("profiles"));
+        std::fs::create_dir_all(&store.profiles_dir).unwrap();
+        let orphan = store.profiles_dir.join("orphan.ovpn");
+        std::fs::write(&orphan, b"client\n").unwrap();
+
+        assert!(matches!(
+            store.list(),
+            Err(ProfileStoreError::MissingSidecar { config }) if config == orphan
+        ));
+    }
+
+    #[cfg(target_os = "linux")] // xtask:allow-platform-cfg: Linux permits the non-UTF-8 filename regression fixture
+    #[test]
+    fn list_rejects_non_utf8_config_name() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FsProfileStore::new(tmp.path().join("profiles"));
+        std::fs::create_dir_all(&store.profiles_dir).unwrap();
+        let name = std::ffi::OsString::from_vec(b"orphan-\xff.ovpn".to_vec());
+        std::fs::write(store.profiles_dir.join(name), b"client\n").unwrap();
+
+        assert!(matches!(
+            store.list(),
+            Err(ProfileStoreError::Io(error))
+                if error.kind() == std::io::ErrorKind::InvalidData
+        ));
     }
 
     #[test]

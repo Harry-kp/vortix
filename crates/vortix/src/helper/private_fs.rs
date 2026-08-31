@@ -28,8 +28,9 @@ pub(crate) fn private_directory_is_valid(
     mode: u32,
 ) -> std::io::Result<bool> {
     let metadata = std::fs::symlink_metadata(path)?;
-    Ok(!metadata.file_type().is_symlink()
-        && metadata.is_dir()
-        && metadata.uid() == expected_owner_uid
-        && metadata.mode() & 0o777 == mode)
+    Ok(
+        metadata.is_dir()
+            && metadata.uid() == expected_owner_uid
+            && metadata.mode() & 0o777 == mode,
+    )
 }

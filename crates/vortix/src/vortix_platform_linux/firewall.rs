@@ -628,6 +628,65 @@ impl Killswitch for IptablesFirewall {
         info!(target: "vortix::killswitch", "kill switch DISABLED — normal traffic restored");
         Ok(())
     }
+
+    fn verify_blocking(active: &[ActiveTunnelInfo]) -> Result<()> {
+        crate::core::killswitch::validate_policy(active)?;
+        match Self::detect_backend() {
+            Some(FirewallBackend::Iptables) => {
+                let digest = crate::core::killswitch::policy_digest(active);
+                Self::verify_iptables_policy(
+                    "iptables-save",
+                    &Self::generate_v4_ruleset(active),
+                    &digest,
+                )
+                .map_err(KillswitchError::CommandFailed)?;
+                Self::verify_iptables_policy(
+                    "ip6tables-save",
+                    &Self::generate_v6_ruleset(active),
+                    &digest,
+                )
+                .map_err(KillswitchError::CommandFailed)?;
+                if Self::has_nft() && Self::nft_table_snapshot()?.is_some() {
+                    return Err(KillswitchError::CommandFailed(
+                        "multiple Vortix firewall backends are active".into(),
+                    ));
+                }
+                Ok(())
+            }
+            Some(FirewallBackend::Nftables) => match Self::nft_table_snapshot()? {
+                Some(snapshot) if nft_policy::snapshot_matches(active, &snapshot) => Ok(()),
+                Some(_) | None => Err(KillswitchError::CommandFailed(
+                    "nft read-back did not match the requested Vortix policy".into(),
+                )),
+            },
+            None => Err(KillswitchError::NoBackendAvailable),
+        }
+    }
+
+    fn verify_disabled() -> Result<()> {
+        let has_iptables = Self::has_iptables();
+        let has_nft = Self::has_nft();
+        if !has_iptables && !has_nft {
+            return Err(KillswitchError::NoBackendAvailable);
+        }
+        if has_iptables {
+            for (program, ipv6) in [("iptables-save", false), ("ip6tables-save", true)] {
+                let snapshot =
+                    Self::iptables_snapshot(program).map_err(KillswitchError::CommandFailed)?;
+                if snapshot.contains(CHAIN_NAME) || Self::is_legacy_global_policy(&snapshot, ipv6) {
+                    return Err(KillswitchError::CommandFailed(format!(
+                        "{program} still contains Vortix-owned rules"
+                    )));
+                }
+            }
+        }
+        if has_nft && Self::nft_table_snapshot()?.is_some() {
+            return Err(KillswitchError::CommandFailed(
+                "nft still contains the Vortix-owned table".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

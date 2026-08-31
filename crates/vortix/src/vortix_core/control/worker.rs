@@ -12,11 +12,16 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::vortix_core::cidr::Cidr;
-use crate::vortix_core::control::model::{AuthorityEpoch, OperationId, PolicyDigest};
+use crate::vortix_core::control::model::{
+    AuthorityEpoch, OperationId, PolicyDigest, MAX_OPERATION_FAILURE_DETAIL_CHARS,
+};
+use crate::vortix_core::engine::registry::Conflict;
+use crate::vortix_core::ports::owned_routes::canonical_route_destination;
 pub use crate::vortix_core::ports::tunnel::TunnelCancellation as CancellationToken;
 use crate::vortix_core::ports::tunnel::{
     AdoptionEvidence, HandshakeEvidence, ProbeReceipt, TunnelKindTag,
 };
+use crate::vortix_core::privileged::OpenVpnRouteEvidence;
 use crate::vortix_core::profile::ProfileId;
 use crate::vortix_core::state::killswitch::KillSwitchMode;
 
@@ -67,8 +72,13 @@ pub enum WorkFailure {
     Cancelled,
     Panicked,
     EffectFailed,
+    /// The VPN server definitively rejected the profile's authentication.
+    AuthenticationFailed,
     /// `WireGuard` connect returned without exact current-generation peer proof.
     HandshakeFailed,
+    /// A profile cannot be represented by the protocol's native interface
+    /// identity contract. This is definitive and safe to correct before retry.
+    InvalidProfile,
     /// An interactive credential was not delivered to the admitted operation.
     ChallengeFailed,
     /// The effect may have happened but no trustworthy receipt was obtained.
@@ -88,7 +98,13 @@ pub struct TunnelWorkResult {
     /// connect call. Scanner presence alone can never manufacture this.
     pub adoption: Option<AdoptionEvidence>,
     pub handshake: Option<HandshakeEvidence>,
+    pub openvpn_routes: Option<OpenVpnRouteEvidence>,
+    pub openvpn_dns: Option<crate::vortix_core::ports::dns::DnsRequest>,
     pub probe_receipts: Vec<ProbeReceipt>,
+    /// Exact late route conflict learned from an authenticated `OpenVPN`
+    /// negotiation after the connect was admitted. Present only when the
+    /// unaccepted tunnel was successfully compensated.
+    pub route_conflict: Option<Conflict>,
     pub result: Result<(), WorkFailure>,
 }
 
@@ -96,6 +112,8 @@ pub struct TunnelWorkResult {
 pub struct TunnelExecutionReceipt {
     pub adoption: Option<AdoptionEvidence>,
     pub handshake: Option<HandshakeEvidence>,
+    pub openvpn_routes: Option<OpenVpnRouteEvidence>,
+    pub openvpn_dns: Option<crate::vortix_core::ports::dns::DnsRequest>,
     pub probe_receipts: Vec<ProbeReceipt>,
 }
 
@@ -112,6 +130,8 @@ impl TunnelExecutionReceipt {
             .map(|adoption| Self {
                 adoption: Some(adoption),
                 handshake: None,
+                openvpn_routes: None,
+                openvpn_dns: None,
                 probe_receipts: Vec::new(),
             })
             .map_err(|error| error.to_string())
@@ -135,6 +155,8 @@ impl TunnelExecutionReceipt {
         .map(|adoption| Self {
             adoption: Some(adoption),
             handshake: Some(handshake),
+            openvpn_routes: None,
+            openvpn_dns: None,
             probe_receipts: Vec::new(),
         })
         .map_err(|error| error.to_string())
@@ -145,9 +167,28 @@ impl TunnelExecutionReceipt {
         self.probe_receipts = receipts;
         self
     }
+
+    #[must_use]
+    pub fn with_openvpn_routes(mut self, routes: OpenVpnRouteEvidence) -> Self {
+        self.openvpn_routes = Some(routes);
+        self
+    }
+
+    /// Attach the DNS request authenticated by the same completed `OpenVPN`
+    /// negotiation as this tunnel receipt.
+    #[must_use]
+    pub fn with_openvpn_dns(mut self, dns: crate::vortix_core::ports::dns::DnsRequest) -> Self {
+        self.openvpn_dns = Some(dns);
+        self
+    }
 }
 
 pub trait TunnelExecutor: Send + Sync + 'static {
+    /// Execute one generation-fenced tunnel mutation.
+    ///
+    /// A successful disconnect is an authoritative absence receipt. An
+    /// adapter that cannot prove the owned process/interface is gone must
+    /// return an error classified as [`WorkFailure::OutcomeUnknown`].
     fn execute(
         &self,
         work: &TunnelWork,
@@ -160,9 +201,9 @@ pub trait TunnelExecutor: Send + Sync + 'static {
         WorkFailure::EffectFailed
     }
 
-    /// Compensate a successful effect that lost the final cancellation or
-    /// deadline race before its receipt could be accepted.
-    fn compensate_late_success(&self, _work: &TunnelWork) -> Result<(), String> {
+    /// Compensate a successful effect whose receipt cannot be accepted due to
+    /// a late cancellation, deadline, or post-effect reservation conflict.
+    fn compensate_unaccepted_success(&self, _work: &TunnelWork) -> Result<(), String> {
         Ok(())
     }
 
@@ -185,24 +226,15 @@ impl RouteClaim {
     /// Parse and normalize a route claim.
     pub fn parse(value: &str) -> Result<Self, WorkFailure> {
         let cidr: Cidr = value.parse().map_err(|_| WorkFailure::RouteConflict)?;
-        let network = match cidr.addr {
-            std::net::IpAddr::V4(addr) => {
-                let mask = u32::MAX
-                    .checked_shl(u32::from(32 - cidr.prefix_len))
-                    .unwrap_or(0);
-                std::net::IpAddr::V4((u32::from(addr) & mask).into())
-            }
-            std::net::IpAddr::V6(addr) => {
-                let mask = u128::MAX
-                    .checked_shl(u32::from(128 - cidr.prefix_len))
-                    .unwrap_or(0);
-                std::net::IpAddr::V6((u128::from(addr) & mask).into())
-            }
-        };
-        Ok(Self {
-            network,
+        Ok(Self::from_cidr(cidr))
+    }
+
+    fn from_cidr(cidr: Cidr) -> Self {
+        let cidr = canonical_route_destination(cidr);
+        Self {
+            network: cidr.addr,
             prefix_len: cidr.prefix_len,
-        })
+        }
     }
 
     #[must_use]
@@ -259,6 +291,7 @@ pub struct LeaseId(u64);
 struct LeaseRecord {
     profile_id: ProfileId,
     routes: BTreeSet<RouteClaim>,
+    acknowledgement: Option<Conflict>,
     refs: usize,
     active: bool,
     ambiguous: bool,
@@ -295,14 +328,7 @@ impl ReservationBook {
             .map(|route| RouteClaim::parse(&route))
             .collect::<Result<BTreeSet<_>, _>>()?;
         let mut state = self.0.lock().expect("reservation mutex poisoned");
-        if state.leases.values().any(|lease| {
-            lease.profile_id != *profile_id
-                && lease
-                    .routes
-                    .iter()
-                    .any(|existing| routes.iter().any(|route| existing.overlaps(*route)))
-                && !acknowledges_peer(acknowledgement, &lease.profile_id, profile_id)
-        }) {
+        if find_route_conflict(&state, profile_id, &routes, None, acknowledgement).is_some() {
             return Err(WorkFailure::RouteConflict);
         }
         if let Some((lease_id, lease)) = state
@@ -313,6 +339,7 @@ impl ReservationBook {
             if lease.ambiguous {
                 return Err(WorkFailure::Busy);
             }
+            lease.acknowledgement = acknowledgement.cloned();
             lease.refs = lease.refs.saturating_add(1);
             return Ok(Reservation {
                 book: self.clone(),
@@ -327,6 +354,7 @@ impl ReservationBook {
             LeaseRecord {
                 profile_id: profile_id.clone(),
                 routes,
+                acknowledgement: acknowledgement.cloned(),
                 refs: 1,
                 active: false,
                 ambiguous: false,
@@ -404,23 +432,102 @@ impl ReservationBook {
             }
         }
     }
+
+    fn refine_routes(
+        &self,
+        lease_id: LeaseId,
+        routes: &BTreeSet<RouteClaim>,
+    ) -> Result<(), RouteRefinementFailure> {
+        let mut state = self.0.lock().expect("reservation mutex poisoned");
+        let lease = state
+            .leases
+            .get(&lease_id)
+            .ok_or(RouteRefinementFailure::Work(WorkFailure::Stale))?;
+        if lease.ambiguous {
+            return Err(RouteRefinementFailure::Work(WorkFailure::Busy));
+        }
+        let profile_id = lease.profile_id.clone();
+        let acknowledgement = lease.acknowledgement.clone();
+        let additional = routes
+            .difference(&lease.routes)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if additional.is_empty() {
+            return Ok(());
+        }
+        if let Some(conflict) = find_route_conflict(
+            &state,
+            &profile_id,
+            &additional,
+            Some(lease_id),
+            acknowledgement.as_ref(),
+        ) {
+            return Err(RouteRefinementFailure::Conflict(conflict));
+        }
+        state
+            .leases
+            .get_mut(&lease_id)
+            .expect("lease identity checked")
+            .routes
+            .extend(additional);
+        Ok(())
+    }
 }
 
-fn acknowledges_peer(
-    acknowledgement: Option<&crate::vortix_core::engine::registry::Conflict>,
-    existing: &ProfileId,
-    target: &ProfileId,
-) -> bool {
-    match acknowledgement {
-        Some(crate::vortix_core::engine::registry::Conflict::DefaultRouteTakeover {
-            current,
-            new,
-        }) => current == existing && new == target,
-        Some(crate::vortix_core::engine::registry::Conflict::RouteOverlap { with, .. }) => {
-            with == existing
+#[derive(Debug)]
+enum RouteRefinementFailure {
+    Work(WorkFailure),
+    Conflict(Conflict),
+}
+
+fn find_route_conflict(
+    state: &Reservations,
+    profile_id: &ProfileId,
+    routes: &BTreeSet<RouteClaim>,
+    excluded: Option<LeaseId>,
+    acknowledgement: Option<&Conflict>,
+) -> Option<Conflict> {
+    for (lease_id, lease) in &state.leases {
+        if Some(*lease_id) == excluded || lease.profile_id == *profile_id {
+            continue;
         }
-        None => false,
+        let overlapping = routes
+            .iter()
+            .filter(|route| {
+                lease
+                    .routes
+                    .iter()
+                    .any(|existing| existing.overlaps(**route))
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        if overlapping.is_empty() {
+            continue;
+        }
+        let conflict = if overlapping.iter().any(|route| route.is_default())
+            && lease.routes.iter().any(|route| route.is_default())
+        {
+            Conflict::DefaultRouteTakeover {
+                current: lease.profile_id.clone(),
+                new: profile_id.clone(),
+            }
+        } else {
+            Conflict::RouteOverlap {
+                with: lease.profile_id.clone(),
+                overlapping_cidrs: overlapping
+                    .into_iter()
+                    .map(|route| {
+                        Cidr::new(route.network(), route.prefix_len())
+                            .expect("normalized route claim is a valid CIDR")
+                    })
+                    .collect(),
+            }
+        };
+        if acknowledgement != Some(&conflict) {
+            return Some(conflict);
+        }
     }
+    None
 }
 
 #[derive(Debug)]
@@ -434,6 +541,10 @@ impl Reservation {
     #[must_use]
     pub const fn lease_id(&self) -> LeaseId {
         self.lease_id
+    }
+
+    fn refine_routes(&self, routes: &BTreeSet<RouteClaim>) -> Result<(), RouteRefinementFailure> {
+        self.book.refine_routes(self.lease_id, routes)
     }
 
     fn finish(mut self, mutation: TunnelMutation, result: Result<(), WorkFailure>) {
@@ -820,12 +931,21 @@ fn spawn_profile_worker(
                     .lock()
                     .expect("active mutex poisoned")
                     .remove(&work.profile_id);
-                let lease_id = envelope.reservation.lease_id();
+                let reservation = envelope.reservation;
+                let (execution, route_conflict) =
+                    refine_openvpn_reservation(&executor, &work, &reservation, execution);
+                let lease_id = reservation.lease_id();
                 let result = execution.as_ref().map(|_| ()).map_err(|error| *error);
-                envelope.reservation.finish(work.mutation, result);
-                let (adoption, handshake, probe_receipts) = execution
-                    .map_or((None, None, Vec::new()), |receipt| {
-                        (receipt.adoption, receipt.handshake, receipt.probe_receipts)
+                reservation.finish(work.mutation, result);
+                let (adoption, handshake, openvpn_routes, openvpn_dns, probe_receipts) = execution
+                    .map_or((None, None, None, None, Vec::new()), |receipt| {
+                        (
+                            receipt.adoption,
+                            receipt.handshake,
+                            receipt.openvpn_routes,
+                            receipt.openvpn_dns,
+                            receipt.probe_receipts,
+                        )
                     });
                 let completion = TunnelWorkResult {
                     profile_id: work.profile_id,
@@ -835,7 +955,10 @@ fn spawn_profile_worker(
                     mutation: work.mutation,
                     adoption,
                     handshake,
+                    openvpn_routes,
+                    openvpn_dns,
                     probe_receipts,
+                    route_conflict,
                     result,
                 };
                 // A per-profile latest terminal slot is bounded by the worker
@@ -855,6 +978,72 @@ fn spawn_profile_worker(
     }
 }
 
+fn refine_openvpn_reservation(
+    executor: &Arc<dyn TunnelExecutor>,
+    work: &TunnelWork,
+    reservation: &Reservation,
+    execution: Result<TunnelExecutionReceipt, WorkFailure>,
+) -> (
+    Result<TunnelExecutionReceipt, WorkFailure>,
+    Option<Conflict>,
+) {
+    let receipt = match execution {
+        Ok(receipt) => receipt,
+        Err(failure) => return (Err(failure), None),
+    };
+    if work.mutation != TunnelMutation::Connect || work.protocol != TunnelKindTag::OpenVpn {
+        return (Ok(receipt), None);
+    }
+    let Some(evidence) = receipt.openvpn_routes.as_ref() else {
+        // Standard mode preserves its local configured-route contract until
+        // helper-backed OpenVPN activation makes authenticated evidence
+        // mandatory for this executor path.
+        return (Ok(receipt), None);
+    };
+    let claims = openvpn_route_claims(evidence);
+    if let Err(failure) = reservation.refine_routes(&claims) {
+        return match (failure, executor.compensate_unaccepted_success(work)) {
+            (RouteRefinementFailure::Conflict(conflict), Ok(())) => {
+                (Err(WorkFailure::RouteConflict), Some(conflict))
+            }
+            (RouteRefinementFailure::Work(failure), Ok(())) => (Err(failure), None),
+            (_, Err(_)) => (Err(WorkFailure::OutcomeUnknown), None),
+        };
+    }
+    (Ok(receipt), None)
+}
+
+pub(crate) fn openvpn_route_claims(evidence: &OpenVpnRouteEvidence) -> BTreeSet<RouteClaim> {
+    let mut claims = evidence
+        .configured()
+        .routes()
+        .iter()
+        .chain(evidence.pushed().routes())
+        .map(|route| RouteClaim::from_cidr(route.destination()))
+        .collect::<BTreeSet<_>>();
+    for redirect in [
+        evidence.configured().redirect_gateway(),
+        evidence.pushed().redirect_gateway(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if redirect.ipv4() {
+            claims.insert(RouteClaim::from_cidr(
+                Cidr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0)
+                    .expect("IPv4 default route is valid"),
+            ));
+        }
+        if redirect.ipv6() {
+            claims.insert(RouteClaim::from_cidr(
+                Cidr::new(std::net::Ipv6Addr::UNSPECIFIED.into(), 0)
+                    .expect("IPv6 default route is valid"),
+            ));
+        }
+    }
+    claims
+}
+
 fn run_tunnel_effect(
     executor: &Arc<dyn TunnelExecutor>,
     work: &TunnelWork,
@@ -870,7 +1059,19 @@ fn run_tunnel_effect(
     let result =
         match panic::catch_unwind(AssertUnwindSafe(|| executor.execute(work, cancellation))) {
             Ok(Ok(receipt)) => receipt,
-            Ok(Err(error)) => return Err(executor.classify_failure(&error)),
+            Ok(Err(error)) => {
+                let failure = executor.classify_failure(&error);
+                tracing::warn!(
+                    target: "vortix::control::tunnel",
+                    operation = %work.operation_id,
+                    profile = %work.profile_id,
+                    mutation = ?work.mutation,
+                    ?failure,
+                    reason = %error,
+                    "tunnel operation failed"
+                );
+                return Err(failure);
+            }
             Err(_) => {
                 return match executor.compensate_uncertain(work) {
                     Ok(()) => Err(WorkFailure::Panicked),
@@ -879,13 +1080,13 @@ fn run_tunnel_effect(
             }
         };
     if stopping.load(Ordering::Acquire) || cancellation.is_cancelled() {
-        return match executor.compensate_late_success(work) {
+        return match executor.compensate_unaccepted_success(work) {
             Ok(()) => Err(WorkFailure::Cancelled),
             Err(_) => Err(WorkFailure::OutcomeUnknown),
         };
     }
     if Instant::now() >= work.deadline {
-        return match executor.compensate_late_success(work) {
+        return match executor.compensate_unaccepted_success(work) {
             Ok(()) => Err(WorkFailure::TimedOut),
             Err(_) => Err(WorkFailure::OutcomeUnknown),
         };
@@ -956,8 +1157,14 @@ pub enum TopologyTransitionKind {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TopologyState {
     pub profiles: BTreeSet<ProfileId>,
+    /// Exact protocol identity for each profile in this topology snapshot.
+    pub protocols: BTreeMap<ProfileId, crate::vortix_core::profile::ProtocolKind>,
     pub interfaces: BTreeMap<ProfileId, String>,
     pub routes: BTreeMap<ProfileId, BTreeSet<RouteClaim>>,
+    /// Complete authenticated configured/pushed `OpenVPN` route vocabulary
+    /// for the current tunnel generation. CIDR claims remain the admission
+    /// index; this evidence is the mutation contract.
+    pub openvpn_routes: BTreeMap<ProfileId, OpenVpnRouteEvidence>,
     pub server_ips: BTreeMap<ProfileId, BTreeSet<std::net::IpAddr>>,
     pub dns_requests: BTreeMap<ProfileId, crate::vortix_core::ports::dns::DnsRequest>,
     pub dns_digest: PolicyDigest,
@@ -1035,6 +1242,20 @@ pub trait PolicyExecutor: Send + Sync + 'static {
         self.compensate(policy, barrier)
     }
 
+    /// Re-read the already-applied final policy without mutating platform
+    /// state. Implementations must bind every returned gate to `policy`.
+    fn audit(&self, _policy: &TopologyPolicy) -> Result<PolicyExecutionEvidence, String> {
+        Err("policy audit is unavailable".to_string())
+    }
+
+    fn audit_cancellable(
+        &self,
+        policy: &TopologyPolicy,
+        _cancellation: &CancellationToken,
+    ) -> Result<PolicyExecutionEvidence, String> {
+        self.audit(policy)
+    }
+
     /// Return fresh platform read-back produced by the exact final policy.
     /// Implementations that cannot prove every gate return `None`; worker
     /// completion alone is never protection truth.
@@ -1081,6 +1302,10 @@ pub struct PolicyResult {
     pub stage: PolicyStage,
     pub verification: Option<PolicyExecutionEvidence>,
     pub outcome: PolicyOutcome,
+    /// Bounded, control-character-free platform reason retained so the
+    /// operation owner can present the real failed invariant instead of only
+    /// the broad policy barrier.
+    pub failure_detail: Option<String>,
     pub superseded_by: Option<ControlRevision>,
     pub receipts: Vec<PolicyBarrierReceipt>,
     // Compatibility projections retained for U5/U6 callers.
@@ -1088,11 +1313,25 @@ pub struct PolicyResult {
     pub failed_at: Option<PolicyBarrier>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyAuditResult {
+    pub revision: ControlRevision,
+    pub operation_id: OperationId,
+    pub result: Result<PolicyExecutionEvidence, WorkFailure>,
+}
+
 struct PolicyState {
     pending: Option<TopologyPolicy>,
+    pending_audit: Option<TopologyPolicy>,
     superseded: VecDeque<PolicyResult>,
     max_superseded: usize,
     active_cancel: Option<CancellationToken>,
+    active_audit: bool,
+}
+
+enum PolicyJob {
+    Apply(TopologyPolicy),
+    Audit(TopologyPolicy),
 }
 
 /// Latest-complete coalescing worker. Replaced policies get explicit receipts;
@@ -1101,6 +1340,7 @@ pub struct PolicyWorker {
     state: Arc<Mutex<PolicyState>>,
     nudge_tx: Mutex<Option<mpsc::SyncSender<()>>>,
     result_rx: Mutex<mpsc::Receiver<PolicyResult>>,
+    audit_result_rx: Mutex<mpsc::Receiver<PolicyAuditResult>>,
     stopping: Arc<AtomicBool>,
     join: Mutex<Option<JoinHandle<()>>>,
 }
@@ -1111,13 +1351,16 @@ impl PolicyWorker {
         assert!(result_capacity > 0);
         let state = Arc::new(Mutex::new(PolicyState {
             pending: None,
+            pending_audit: None,
             superseded: VecDeque::new(),
             max_superseded: result_capacity,
             active_cancel: None,
+            active_audit: false,
         }));
         let stopping = Arc::new(AtomicBool::new(false));
         let (nudge_tx, nudge_rx) = mpsc::sync_channel(1);
         let (result_tx, result_rx) = mpsc::sync_channel(result_capacity);
+        let (audit_result_tx, audit_result_rx) = mpsc::sync_channel(result_capacity);
         let thread_state = Arc::clone(&state);
         let thread_stopping = Arc::clone(&stopping);
         let join = thread::Builder::new()
@@ -1128,28 +1371,47 @@ impl PolicyWorker {
                         break;
                     }
                     loop {
-                        let policy = {
+                        let job = {
                             let mut state =
                                 thread_state.lock().expect("policy state mutex poisoned");
-                            let policy = state.pending.take();
-                            if policy.is_some() {
+                            let job = state
+                                .pending
+                                .take()
+                                .map(PolicyJob::Apply)
+                                .or_else(|| state.pending_audit.take().map(PolicyJob::Audit));
+                            if let Some(job) = &job {
                                 state.active_cancel = Some(CancellationToken::default());
+                                state.active_audit = matches!(job, PolicyJob::Audit(_));
                             }
-                            policy
+                            job
                         };
-                        let Some(policy) = policy else { break };
+                        let Some(job) = job else { break };
                         let token = thread_state
                             .lock()
                             .expect("policy state mutex poisoned")
                             .active_cancel
                             .clone()
                             .expect("token installed");
-                        let result = run_policy(&executor, policy, &token, &thread_stopping);
-                        thread_state
-                            .lock()
-                            .expect("policy state mutex poisoned")
-                            .active_cancel = None;
-                        if result_tx.send(result).is_err() {
+                        let delivered = match job {
+                            PolicyJob::Apply(policy) => result_tx
+                                .send(run_policy(&executor, policy, &token, &thread_stopping))
+                                .is_ok(),
+                            PolicyJob::Audit(policy) => audit_result_tx
+                                .send(run_policy_audit(
+                                    &executor,
+                                    &policy,
+                                    &token,
+                                    &thread_stopping,
+                                ))
+                                .is_ok(),
+                        };
+                        {
+                            let mut state =
+                                thread_state.lock().expect("policy state mutex poisoned");
+                            state.active_cancel = None;
+                            state.active_audit = false;
+                        }
+                        if !delivered {
                             break;
                         }
                         if thread_stopping.load(Ordering::Acquire) {
@@ -1163,6 +1425,7 @@ impl PolicyWorker {
             state,
             nudge_tx: Mutex::new(Some(nudge_tx)),
             result_rx: Mutex::new(result_rx),
+            audit_result_rx: Mutex::new(audit_result_rx),
             stopping,
             join: Mutex::new(Some(join)),
         }
@@ -1173,6 +1436,12 @@ impl PolicyWorker {
             return Err(WorkFailure::Stopped);
         }
         let mut state = self.state.lock().expect("policy state mutex poisoned");
+        if state.active_audit {
+            if let Some(token) = state.active_cancel.as_ref() {
+                token.cancel();
+            }
+        }
+        state.pending_audit = None;
         if let Some(current) = &state.pending {
             if current.authority_epoch != policy.authority_epoch
                 || current.generation > policy.generation
@@ -1201,6 +1470,27 @@ impl PolicyWorker {
         }
     }
 
+    pub fn submit_audit(&self, policy: TopologyPolicy) -> Result<(), WorkFailure> {
+        if self.stopping.load(Ordering::Acquire) {
+            return Err(WorkFailure::Stopped);
+        }
+        let mut state = self.state.lock().expect("policy state mutex poisoned");
+        if state.pending.is_some() || state.pending_audit.is_some() || state.active_cancel.is_some()
+        {
+            return Err(WorkFailure::Busy);
+        }
+        state.pending_audit = Some(policy);
+        drop(state);
+        let guard = self.nudge_tx.lock().expect("nudge mutex poisoned");
+        let Some(tx) = guard.as_ref() else {
+            return Err(WorkFailure::Stopped);
+        };
+        match tx.try_send(()) {
+            Ok(()) | Err(mpsc::TrySendError::Full(())) => Ok(()),
+            Err(mpsc::TrySendError::Disconnected(())) => Err(WorkFailure::Stopped),
+        }
+    }
+
     pub fn try_result(&self) -> Option<PolicyResult> {
         if let Some(result) = self
             .state
@@ -1214,6 +1504,14 @@ impl PolicyWorker {
         self.result_rx
             .lock()
             .expect("policy result mutex poisoned")
+            .try_recv()
+            .ok()
+    }
+
+    pub fn try_audit_result(&self) -> Option<PolicyAuditResult> {
+        self.audit_result_rx
+            .lock()
+            .expect("policy audit result mutex poisoned")
             .try_recv()
             .ok()
     }
@@ -1254,6 +1552,13 @@ impl PolicyWorker {
                 .try_recv()
                 .is_ok()
             {}
+            while self
+                .audit_result_rx
+                .lock()
+                .expect("policy audit result mutex poisoned")
+                .try_recv()
+                .is_ok()
+            {}
             thread::yield_now();
         }
         if join.is_finished() {
@@ -1270,6 +1575,41 @@ impl PolicyWorker {
     }
 }
 
+fn run_policy_audit(
+    executor: &Arc<dyn PolicyExecutor>,
+    policy: &TopologyPolicy,
+    cancellation: &CancellationToken,
+    stopping: &AtomicBool,
+) -> PolicyAuditResult {
+    let revision = policy.revision();
+    let operation_id = policy.operation_id.clone();
+    let result = if stopping.load(Ordering::Acquire) || cancellation.is_cancelled() {
+        Err(WorkFailure::Cancelled)
+    } else if Instant::now() >= policy.deadline {
+        Err(WorkFailure::TimedOut)
+    } else {
+        panic::catch_unwind(AssertUnwindSafe(|| {
+            executor.audit_cancellable(policy, cancellation)
+        }))
+        .map_err(|_| WorkFailure::Panicked)
+        .and_then(|result| result.map_err(|_| WorkFailure::EffectFailed))
+        .and_then(|evidence| {
+            if cancellation.is_cancelled() {
+                Err(WorkFailure::Cancelled)
+            } else if Instant::now() >= policy.deadline {
+                Err(WorkFailure::TimedOut)
+            } else {
+                Ok(evidence)
+            }
+        })
+    };
+    PolicyAuditResult {
+        revision,
+        operation_id,
+        result,
+    }
+}
+
 fn superseded_result(old: &TopologyPolicy, next: &TopologyPolicy) -> PolicyResult {
     PolicyResult {
         generation: old.generation,
@@ -1279,6 +1619,7 @@ fn superseded_result(old: &TopologyPolicy, next: &TopologyPolicy) -> PolicyResul
         stage: old.stage,
         verification: None,
         outcome: PolicyOutcome::Superseded,
+        failure_detail: None,
         superseded_by: Some(next.revision()),
         receipts: Vec::new(),
         completed_barriers: Vec::new(),
@@ -1296,6 +1637,7 @@ fn run_policy(
     let mut receipts = Vec::new();
     let mut completed = Vec::new();
     let mut failed_at = None;
+    let mut failure_detail = None;
     let mut outcome = PolicyOutcome::Applied;
     for &barrier in policy.barriers() {
         if stopping.load(Ordering::Acquire) || cancellation.is_cancelled() {
@@ -1319,9 +1661,10 @@ fn run_policy(
                     preserved_for_safety: false,
                 });
             }
-            Err(WorkFailure::Panicked) => {
+            Err((WorkFailure::Panicked, detail)) => {
                 outcome = PolicyOutcome::Panicked;
                 failed_at = Some(barrier);
+                failure_detail = detail;
                 receipts.push(PolicyBarrierReceipt {
                     barrier,
                     applied: false,
@@ -1330,9 +1673,10 @@ fn run_policy(
                 });
                 break;
             }
-            Err(WorkFailure::TimedOut | WorkFailure::OutcomeUnknown) => {
+            Err((WorkFailure::TimedOut | WorkFailure::OutcomeUnknown, detail)) => {
                 outcome = PolicyOutcome::TimedOut;
                 failed_at = Some(barrier);
+                failure_detail = detail;
                 cancellation.cancel();
                 receipts.push(PolicyBarrierReceipt {
                     barrier,
@@ -1342,9 +1686,10 @@ fn run_policy(
                 });
                 break;
             }
-            Err(WorkFailure::Cancelled) => {
+            Err((WorkFailure::Cancelled, detail)) => {
                 outcome = PolicyOutcome::Cancelled;
                 failed_at = Some(barrier);
+                failure_detail = detail;
                 receipts.push(PolicyBarrierReceipt {
                     barrier,
                     applied: false,
@@ -1353,9 +1698,10 @@ fn run_policy(
                 });
                 break;
             }
-            Err(_) => {
+            Err((_, detail)) => {
                 outcome = PolicyOutcome::Failed;
                 failed_at = Some(barrier);
+                failure_detail = detail;
                 receipts.push(PolicyBarrierReceipt {
                     barrier,
                     applied: false,
@@ -1396,6 +1742,7 @@ fn run_policy(
         stage: policy.stage,
         verification,
         outcome,
+        failure_detail,
         superseded_by: None,
         receipts,
         completed_barriers: completed,
@@ -1408,14 +1755,14 @@ fn run_policy_call(
     policy: &TopologyPolicy,
     barrier: PolicyBarrier,
     cancellation: &CancellationToken,
-) -> Result<(), WorkFailure> {
+) -> Result<(), (WorkFailure, Option<String>)> {
     if cancellation.is_cancelled() || Instant::now() >= policy.deadline {
-        return Err(WorkFailure::Cancelled);
+        return Err((WorkFailure::Cancelled, None));
     }
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
         executor.apply_cancellable(policy, barrier, cancellation)
     }))
-    .map_err(|_| WorkFailure::Panicked)?
+    .map_err(|_| (WorkFailure::Panicked, None))?
     .map_err(|error| {
         tracing::warn!(
             target: "vortix::control::policy",
@@ -1425,15 +1772,27 @@ fn run_policy_call(
             reason = %error,
             "policy barrier failed"
         );
-        WorkFailure::EffectFailed
+        (
+            WorkFailure::EffectFailed,
+            sanitize_policy_failure_detail(&error),
+        )
     });
     if cancellation.is_cancelled() {
-        return Err(WorkFailure::Cancelled);
+        return Err((WorkFailure::Cancelled, None));
     }
     if Instant::now() >= policy.deadline {
-        return Err(WorkFailure::TimedOut);
+        return Err((WorkFailure::TimedOut, None));
     }
     result
+}
+
+fn sanitize_policy_failure_detail(error: &str) -> Option<String> {
+    let detail = error
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(MAX_OPERATION_FAILURE_DETAIL_CHARS)
+        .collect::<String>();
+    (!detail.is_empty()).then_some(detail)
 }
 
 fn run_policy_compensation(

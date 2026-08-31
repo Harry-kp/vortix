@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
+use sha2::{Digest as _, Sha256};
 use zeroize::Zeroizing;
 
 use crate::vortix_core::control::{OperationId, Secret};
@@ -23,6 +24,7 @@ use crate::vortix_process::{CommandSpec, PrivilegeReq};
 use tracing::{debug, info, warn};
 
 use crate::vortix_protocol_openvpn::parser::{forbidden_effective_directive, parse_ovpn_conf};
+use crate::vortix_protocol_openvpn::push::{latest_completed_push_reply, PushReplySelectionError};
 
 /// Quality of the DNS intent recovered from an `OpenVPN` session log.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,11 +42,19 @@ pub enum OvpnDnsEvidence {
     },
 }
 
+/// DNS and route truth parsed from one profile and one completed runtime-log
+/// snapshot, so a renegotiation cannot mix evidence from different sessions.
+pub(crate) struct OvpnRuntimeEvidence {
+    pub(crate) dns: OvpnDnsEvidence,
+    pub(crate) routes: crate::vortix_core::privileged::OpenVpnRouteEvidence,
+}
+
 /// Maximum wall-clock to wait for openvpn to create the unix
 /// management socket after spawn. Typical macOS spawn takes <200ms; 5s gives
 /// loaded systems ample headroom while still surfacing
 /// catastrophic-spawn-failure within the user's attention span.
 const OVPN_MGMT_SOCKET_TIMEOUT_MS: u64 = 5000;
+const MAX_PORTABLE_UNIX_SOCKET_PATH_BYTES: usize = 103;
 const MANAGED_CONFIG_MARKER: &str = "# managed-by: vortix openvpn custodian";
 
 #[derive(Debug, thiserror::Error)]
@@ -293,6 +303,11 @@ impl OpenVpnStaticChallengeCredentials {
             answer,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn username_password_for_test(&self) -> (&str, &str) {
+        (&self.username, &self.password)
+    }
 }
 
 /// `OpenVPN` tunnel implementation.
@@ -442,14 +457,7 @@ impl OvpnTunnel {
         let configured = parse_ovpn_conf(&profile_text)
             .map_err(|error| TunnelError::Subprocess(format!("parse OpenVPN DNS intent: {error}")))?
             .dns_request();
-        let canonical_log = self.log_path(profile.id.as_str());
-        let log_path = if canonical_log.exists() {
-            canonical_log
-        } else if let Some(legacy_key) = unambiguous_legacy_artifact_key(&profile.display_name) {
-            self.log_path(legacy_key)
-        } else {
-            canonical_log
-        };
+        let log_path = self.runtime_log_path(profile);
         let log = match std::fs::read_to_string(&log_path) {
             Ok(log) => log,
             Err(error) => {
@@ -460,6 +468,43 @@ impl OvpnTunnel {
             }
         };
         Ok(pushed_dns_evidence(configured, &log))
+    }
+
+    fn runtime_log_path(&self, profile: &Profile) -> PathBuf {
+        let canonical_log = self.log_path(profile.id.as_str());
+        if canonical_log.exists() {
+            canonical_log
+        } else if let Some(legacy_key) = unambiguous_legacy_artifact_key(&profile.display_name) {
+            self.log_path(legacy_key)
+        } else {
+            canonical_log
+        }
+    }
+
+    pub(crate) fn requested_runtime_evidence(
+        &self,
+        profile: &Profile,
+    ) -> Result<OvpnRuntimeEvidence, TunnelError> {
+        let profile_text = std::fs::read_to_string(&profile.config_path).map_err(|error| {
+            TunnelError::Subprocess(format!("read OpenVPN profile runtime intent: {error}"))
+        })?;
+        let parsed = parse_ovpn_conf(&profile_text).map_err(|error| {
+            TunnelError::Subprocess(format!("parse OpenVPN runtime intent: {error}"))
+        })?;
+        let log_path = self.runtime_log_path(profile);
+        let log = std::fs::read_to_string(&log_path).map_err(|error| {
+            TunnelError::Subprocess(format!(
+                "read OpenVPN runtime evidence from {}: {error}",
+                log_path.display()
+            ))
+        })?;
+        let dns = pushed_dns_evidence(parsed.dns_request(), &log);
+        let routes =
+            crate::vortix_protocol_openvpn::push::openvpn_route_evidence(&parsed, &log, false)
+                .map_err(|error| {
+                    TunnelError::Subprocess(format!("validate OpenVPN route evidence: {error}"))
+                })?;
+        Ok(OvpnRuntimeEvidence { dns, routes })
     }
 
     fn pid_path(&self, profile_id: &str) -> PathBuf {
@@ -489,7 +534,25 @@ impl OvpnTunnel {
     }
 
     fn management_socket_path(&self, profile_id: &str) -> PathBuf {
-        self.run_dir.join(format!("{profile_id}.mgmt.sock"))
+        let digest = Sha256::digest(profile_id.as_bytes());
+        let key = digest
+            .iter()
+            .take(16)
+            .fold(String::with_capacity(32), |mut encoded, byte| {
+                let _ = write!(encoded, "{byte:02x}");
+                encoded
+            });
+        self.run_dir.join(format!("{key}.mgmt.sock"))
+    }
+
+    fn validate_management_socket_path(path: &Path) -> Result<(), TunnelError> {
+        if path.as_os_str().as_encoded_bytes().len() > MAX_PORTABLE_UNIX_SOCKET_PATH_BYTES {
+            return Err(TunnelError::Subprocess(format!(
+                "OpenVPN runtime directory is too long for a portable Unix management socket: {}",
+                path.display()
+            )));
+        }
+        Ok(())
     }
 
     fn cleanup_run_artifacts(&self, handle: &TunnelHandle) {
@@ -754,32 +817,22 @@ fn pushed_dns_evidence(
     mut request: crate::vortix_core::ports::dns::DnsRequest,
     log: &str,
 ) -> OvpnDnsEvidence {
-    const COMPLETED: &str = "Initialization Sequence Completed";
-    let Some(completed_at) = log.rfind(COMPLETED) else {
-        return OvpnDnsEvidence::Unavailable {
-            configured: request,
-            reason: "OpenVPN log has no completed negotiation marker".into(),
-        };
+    let push_reply = match latest_completed_push_reply(log) {
+        Ok(Some(push_reply)) => push_reply,
+        Ok(None) => return OvpnDnsEvidence::ExplicitlyEmpty(request),
+        Err(PushReplySelectionError::NoCompletedNegotiation) => {
+            return OvpnDnsEvidence::Unavailable {
+                configured: request,
+                reason: "OpenVPN log has no completed negotiation marker".into(),
+            };
+        }
+        Err(PushReplySelectionError::NewerIncompleteNegotiation) => {
+            return OvpnDnsEvidence::Unavailable {
+                configured: request,
+                reason: "OpenVPN log contains a newer incomplete negotiation".into(),
+            };
+        }
     };
-    if log[completed_at + COMPLETED.len()..].contains("PUSH_REPLY") {
-        return OvpnDnsEvidence::Unavailable {
-            configured: request,
-            reason: "OpenVPN log contains a newer incomplete negotiation".into(),
-        };
-    }
-    let completed_log = &log[..completed_at];
-    let session_start = completed_log
-        .rfind(COMPLETED)
-        .map_or(0, |previous| previous + COMPLETED.len());
-    let session_log = &completed_log[session_start..];
-    let Some(push_at) = session_log.rfind("PUSH_REPLY") else {
-        return OvpnDnsEvidence::ExplicitlyEmpty(request);
-    };
-
-    let push_reply = session_log[push_at + "PUSH_REPLY".len()..]
-        .lines()
-        .next()
-        .unwrap_or_default();
     let mut observed = false;
     for option in push_reply.split(',') {
         let option = option.trim().trim_matches('\'');
@@ -947,6 +1000,7 @@ impl Tunnel for OvpnTunnel {
 
         let mgmt_sock_path = if mgmt_creds.is_some() {
             let path = self.management_socket_path(artifact_key);
+            Self::validate_management_socket_path(&path)?;
             // Stale socket from a prior crash — delete before spawn
             // so openvpn can bind cleanly.
             let _ = std::fs::remove_file(&path);
@@ -1014,7 +1068,7 @@ impl Tunnel for OvpnTunnel {
             })();
             let _ = std::fs::remove_file(&sock_path);
             if let Err(error) = mgmt_result {
-                return Err(cleanup_startup_failure(&ownership_id, error));
+                return Err(cleanup_startup_failure(&handshake, error));
             }
         }
 
@@ -1054,7 +1108,8 @@ impl Tunnel for OvpnTunnel {
                 )));
             };
 
-            let dns_request = match self.requested_dns_evidence(profile)? {
+            let runtime_evidence = self.requested_runtime_evidence(profile)?;
+            let dns_request = match runtime_evidence.dns {
                 OvpnDnsEvidence::Observed(request) | OvpnDnsEvidence::ExplicitlyEmpty(request) => {
                     request
                 }
@@ -1064,6 +1119,7 @@ impl Tunnel for OvpnTunnel {
                     )));
                 }
             };
+            let openvpn_routes = Some(runtime_evidence.routes);
 
             Ok(TunnelHandle {
                 profile_id: profile.id.clone(),
@@ -1075,12 +1131,13 @@ impl Tunnel for OvpnTunnel {
                 generation: ownership_id.generation,
                 handshake: None,
                 probe_receipts: Vec::new(),
-                process_ownership: Some(handshake.identity),
+                process_ownership: Some(handshake.identity.clone()),
                 teardown_config: None,
                 dns_request,
+                openvpn_routes,
             })
         })();
-        startup.map_err(|error| cleanup_startup_failure(&ownership_id, error))
+        startup.map_err(|error| cleanup_startup_failure(&handshake, error))
     }
 
     fn down(&mut self, handle: TunnelHandle) -> Result<(), TunnelError> {
@@ -1166,12 +1223,15 @@ impl Tunnel for OvpnTunnel {
     }
 }
 
-fn cleanup_startup_failure(identity: &ManagedProcessId, startup: TunnelError) -> TunnelError {
-    match crate::vortix_process::stop_managed_foreground(identity) {
+fn cleanup_startup_failure(
+    handshake: &crate::vortix_process::CustodianHandshake,
+    startup: TunnelError,
+) -> TunnelError {
+    match crate::vortix_process::stop_failed_managed_foreground_startup(handshake) {
         Ok(()) => startup,
         Err(teardown) => TunnelError::Subprocess(format!(
-            "{startup}; OpenVPN startup teardown is ambiguous-owned for generation {}: {teardown}",
-            identity.generation
+            "{startup}; OpenVPN startup teardown failed and ownership is ambiguous for generation {}: {teardown}",
+            handshake.identity.generation
         )),
     }
 }
@@ -1256,6 +1316,19 @@ mod tests {
         );
         assert!(first_args.contains(&tunnel.pid_path(&first).to_string_lossy().into_owned()));
         assert!(second_args.contains(&tunnel.pid_path(&second).to_string_lossy().into_owned()));
+    }
+
+    #[test]
+    fn canonical_profile_id_keeps_management_socket_within_unix_path_limit() {
+        let tunnel = OvpnTunnel::new(PathBuf::from("/Users/vortix/.config/vortix/run"));
+        let profile_id = "a".repeat(crate::vortix_core::profile::ProfileId::HEX_LEN);
+        let socket = tunnel.management_socket_path(&profile_id);
+
+        assert!(
+            socket.as_os_str().as_encoded_bytes().len() <= 103,
+            "management socket path exceeds macOS sockaddr_un.sun_path: {}",
+            socket.display()
+        );
     }
 
     #[test]
@@ -1608,7 +1681,7 @@ mod tests {
             );
         }
 
-        let safe = "client\nsetenv opt block-outside-dns\n";
+        let safe = "client\nsetenv opt block-outside-dns\nmssfix 1300 mtu\n";
         assert_eq!(sanitize_managed_config(safe).unwrap(), safe);
     }
 
@@ -1659,6 +1732,41 @@ mod tests {
         };
         assert_eq!(request.servers.len(), 2);
         assert_eq!(request.search_domains, vec!["corp.example"]);
+    }
+
+    #[test]
+    fn route_evidence_recovers_pushed_default_from_existing_log() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile_path = temp.path().join("corp.ovpn");
+        std::fs::write(
+            &profile_path,
+            "client\nremote 198.51.100.7 1194 udp\nroute 10.20.0.0 255.255.0.0\n",
+        )
+        .unwrap();
+        let profile = Profile::new(
+            crate::vortix_core::profile::ProfileId::new("corp"),
+            "corp",
+            crate::vortix_core::profile::ProtocolKind::OpenVpn,
+            profile_path,
+        );
+        std::fs::write(
+            temp.path().join(format!("{}.log", profile.id)),
+            "UDPv4 link remote: [AF_INET]198.51.100.7:1194\n\
+             PUSH_REPLY,redirect-gateway def1 bypass-dhcp,dhcp-option DNS 1.1.1.1\n\
+             Initialization Sequence Completed\n",
+        )
+        .unwrap();
+
+        let evidence = OvpnTunnel::new(temp.path().to_path_buf())
+            .requested_runtime_evidence(&profile)
+            .unwrap();
+
+        assert_eq!(evidence.routes.configured().routes().len(), 1);
+        let redirect = evidence.routes.pushed().redirect_gateway().unwrap();
+        assert!(redirect.ipv4());
+        assert!(redirect
+            .flags()
+            .contains(&crate::vortix_core::privileged::OpenVpnRedirectFlag::Def1));
     }
 
     #[test]

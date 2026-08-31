@@ -16,7 +16,7 @@ use crate::vortix_core::control::{
 use crate::vortix_core::profile::ProfileId;
 
 const MIN_STATE_SCHEMA_VERSION: u16 = 1;
-const STATE_SCHEMA_VERSION: u16 = 2;
+const STATE_SCHEMA_VERSION: u16 = 3;
 const STATE_FILE: &str = "control-state.json";
 const PREVIOUS_STATE_FILE: &str = "control-state.previous.json";
 const ENDPOINT_CACHE_FILE: &str = "endpoint-resolutions.json";
@@ -34,6 +34,8 @@ pub(crate) struct PersistedControlState {
     pub(crate) operations: BTreeMap<OperationId, OperationRecord>,
     pub(crate) boot_connections: BTreeMap<ProfileId, BootConnection>,
     pub(crate) requested_resources: BTreeMap<ProfileId, RequestedResources>,
+    #[serde(default)]
+    pub(crate) last_connected_at: BTreeMap<ProfileId, std::time::SystemTime>,
     pub(crate) tombstones: BTreeMap<ProfileId, PersistedTombstone>,
     pub(crate) retention: RetentionMetadata,
     pub(crate) reconciliation_required: bool,
@@ -48,6 +50,7 @@ impl PersistedControlState {
             operations: BTreeMap::new(),
             boot_connections: BTreeMap::new(),
             requested_resources: BTreeMap::new(),
+            last_connected_at: BTreeMap::new(),
             tombstones: BTreeMap::new(),
             retention: RetentionMetadata::default(),
             reconciliation_required: true,
@@ -66,6 +69,7 @@ impl PersistedControlState {
         if self.desired.tunnels.len() > MAX_PROFILES
             || self.boot_connections.len() > MAX_PROFILES
             || self.requested_resources.len() > MAX_PROFILES
+            || self.last_connected_at.len() > MAX_PROFILES
             || self.tombstones.len() > MAX_PROFILES
             || self.operations.len() > MAX_OPERATIONS
         {
@@ -96,6 +100,13 @@ impl PersistedControlState {
                     || operation.client_id.sequence() == Some(u64::MAX)
                     || !operation.idempotency_key.is_valid()
                     || !operation.command_digest.is_valid()
+                    || operation.failure_detail.as_ref().is_some_and(|detail| {
+                        operation.status != OperationStatus::Failed
+                        || detail.is_empty()
+                        || detail.chars().count()
+                            > crate::vortix_core::control::model::MAX_OPERATION_FAILURE_DETAIL_CHARS
+                        || detail.chars().any(char::is_control)
+                    })
                     || operation.desired_generation > self.desired.generation
                     || operation.admitted_at_millis > operation.deadline_millis
                     || matches!(
@@ -344,6 +355,9 @@ impl ControlStateStore for FsControlStateStore {
         state
             .requested_resources
             .clone_from(&durable.requested_resources);
+        state
+            .last_connected_at
+            .clone_from(&durable.last_connected_at);
         state.tombstones.clone_from(&durable.tombstones);
         state.retention = durable.retention;
         state.reconciliation_required = durable.reconciliation_required;
@@ -360,6 +374,7 @@ fn recovered_state(state: PersistedControlState, current_boot_id: &str) -> Recov
             operations: state.operations,
             boot_connections: state.boot_connections,
             requested_resources: state.requested_resources,
+            last_connected_at: state.last_connected_at,
             tombstones: state.tombstones,
             retention: state.retention,
             reconciliation_required: true,
@@ -401,15 +416,57 @@ fn decode_state(bytes: &[u8]) -> Result<DecodedState, ControlStateError> {
 }
 
 #[cfg(unix)]
-type ControlDirectory = std::fs::File;
+pub(crate) type ControlDirectory = std::fs::File;
 
 #[cfg(not(unix))]
-type ControlDirectory = PathBuf;
+pub(crate) type ControlDirectory = PathBuf;
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AtomicWriteStage {
+    Create,
+    Write,
+    FirstFileSync,
+    OwnerPreparation,
+    SecondFileSync,
+    Publish,
+    DirectorySync,
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+pub(crate) enum AtomicWriteError {
+    NotPublished(ControlStateError),
+    PublishedButDirectoryUnsynced(ControlStateError),
+}
+
+#[cfg(unix)]
+impl AtomicWriteError {
+    pub(crate) fn into_control_state(self) -> ControlStateError {
+        match self {
+            Self::NotPublished(error) | Self::PublishedButDirectoryUnsynced(error) => error,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl From<ControlStateError> for AtomicWriteError {
+    fn from(error: ControlStateError) -> Self {
+        Self::NotPublished(error)
+    }
+}
+
+#[cfg(unix)]
+impl From<std::io::Error> for AtomicWriteError {
+    fn from(error: std::io::Error) -> Self {
+        Self::NotPublished(ControlStateError::Io(error))
+    }
+}
 
 #[cfg(unix)]
 #[allow(unsafe_code)]
 #[allow(clippy::similar_names)]
-fn open_control_directory(
+pub(crate) fn open_control_directory(
     path: &Path,
     create: bool,
     expected_uid: u32,
@@ -468,6 +525,81 @@ fn open_control_directory(
     if created {
         prepare_created_descriptor(&directory, expected_uid, expected_gid, 0o700)?;
         parent.sync_all()?;
+    }
+    validate_directory_descriptor(&directory, expected_uid)?;
+    Ok(Some(directory))
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+#[allow(clippy::similar_names)]
+pub(crate) fn open_owned_directory_at(
+    parent: &ControlDirectory,
+    name: &str,
+    create: bool,
+    expected_uid: u32,
+    expected_gid: u32,
+) -> Result<Option<ControlDirectory>, ControlStateError> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+    validate_directory_descriptor(parent, expected_uid)?;
+    let name = CString::new(name).map_err(|_| ControlStateError::UnsafeFile)?;
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let mut fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+    let mut created = false;
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        if is_unsafe_path_error(&error) {
+            return Err(ControlStateError::UnsafeFile);
+        }
+        if error.raw_os_error() != Some(libc::ENOENT) {
+            return Err(error.into());
+        }
+        if !create {
+            return Ok(None);
+        }
+        if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EEXIST) {
+                return Err(error.into());
+            }
+        } else {
+            created = true;
+        }
+        fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            return if is_unsafe_path_error(&error) {
+                Err(ControlStateError::UnsafeFile)
+            } else {
+                Err(error.into())
+            };
+        }
+    }
+    let directory = unsafe { std::fs::File::from_raw_fd(fd) };
+    if created {
+        if let Err(error) =
+            prepare_created_descriptor(&directory, expected_uid, expected_gid, 0o700)
+        {
+            let _ =
+                unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
+            return Err(error);
+        }
+        parent.sync_all()?;
+    } else {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let metadata = directory.metadata()?;
+        let effective_uid = crate::utils::effective_user_group_ids().0;
+        if effective_uid == 0
+            && expected_uid != 0
+            && metadata.uid() == 0
+            && metadata.permissions().mode() & 0o777 == 0o700
+        {
+            prepare_created_descriptor(&directory, expected_uid, expected_gid, 0o700)?;
+            parent.sync_all()?;
+        }
     }
     validate_directory_descriptor(&directory, expected_uid)?;
     Ok(Some(directory))
@@ -628,26 +760,32 @@ fn write_owned_atomic(
     uid: u32,
     gid: u32,
 ) -> Result<(), ControlStateError> {
-    write_owned_atomic_with_hook(directory, name, body, uid, gid, |_| {})
+    write_owned_atomic_with_hook(directory, name, body, uid, gid, |_, _| Ok(()))
+        .map_err(AtomicWriteError::into_control_state)
 }
 
 #[cfg(unix)]
 #[allow(unsafe_code)]
-fn write_owned_atomic_with_hook(
+pub(crate) fn write_owned_atomic_with_hook(
     directory: &ControlDirectory,
     name: &str,
     body: &[u8],
     uid: u32,
     gid: u32,
-    before_publish: impl FnOnce(&std::fs::File),
-) -> Result<(), ControlStateError> {
+    mut stage_hook: impl FnMut(
+        AtomicWriteStage,
+        Option<&std::fs::File>,
+    ) -> Result<(), ControlStateError>,
+) -> Result<(), AtomicWriteError> {
     use std::ffi::CString;
     use std::io::Write as _;
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-    let destination = CString::new(name).map_err(|_| ControlStateError::UnsafeFile)?;
+    let destination = CString::new(name)
+        .map_err(|_| AtomicWriteError::NotPublished(ControlStateError::UnsafeFile))?;
+    stage_hook(AtomicWriteStage::Create, None).map_err(AtomicWriteError::NotPublished)?;
     let mut allocated = None;
     for _ in 0..128 {
         let candidate = format!(
@@ -655,8 +793,8 @@ fn write_owned_atomic_with_hook(
             std::process::id(),
             TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         );
-        let candidate_c =
-            CString::new(candidate.as_str()).map_err(|_| ControlStateError::UnsafeFile)?;
+        let candidate_c = CString::new(candidate.as_str())
+            .map_err(|_| AtomicWriteError::NotPublished(ControlStateError::UnsafeFile))?;
         let fd = unsafe {
             libc::openat(
                 directory.as_raw_fd(),
@@ -671,23 +809,32 @@ fn write_owned_atomic_with_hook(
         }
         let error = std::io::Error::last_os_error();
         if error.kind() != std::io::ErrorKind::AlreadyExists {
-            return Err(error.into());
+            return Err(AtomicWriteError::NotPublished(error.into()));
         }
     }
     let (temporary_name, mut temporary) = allocated.ok_or_else(|| {
-        ControlStateError::Io(std::io::Error::new(
+        AtomicWriteError::NotPublished(ControlStateError::Io(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
             "could not allocate a private control-state temp file",
-        ))
+        )))
     })?;
-    let temporary_name_c =
-        CString::new(temporary_name.as_str()).map_err(|_| ControlStateError::UnsafeFile)?;
-    let result = (|| {
+    let temporary_name_c = CString::new(temporary_name.as_str())
+        .map_err(|_| AtomicWriteError::NotPublished(ControlStateError::UnsafeFile))?;
+    let result: Result<(), AtomicWriteError> = (|| {
+        stage_hook(AtomicWriteStage::Write, Some(&temporary))
+            .map_err(AtomicWriteError::NotPublished)?;
         temporary.write_all(body)?;
+        stage_hook(AtomicWriteStage::FirstFileSync, Some(&temporary))
+            .map_err(AtomicWriteError::NotPublished)?;
         temporary.sync_all()?;
+        stage_hook(AtomicWriteStage::OwnerPreparation, Some(&temporary))
+            .map_err(AtomicWriteError::NotPublished)?;
         prepare_created_descriptor(&temporary, uid, gid, 0o600)?;
+        stage_hook(AtomicWriteStage::SecondFileSync, Some(&temporary))
+            .map_err(AtomicWriteError::NotPublished)?;
         temporary.sync_all()?;
-        before_publish(&temporary);
+        stage_hook(AtomicWriteStage::Publish, Some(&temporary))
+            .map_err(AtomicWriteError::NotPublished)?;
         if unsafe {
             libc::renameat(
                 directory.as_raw_fd(),
@@ -697,9 +844,16 @@ fn write_owned_atomic_with_hook(
             )
         } != 0
         {
-            return Err(std::io::Error::last_os_error().into());
+            return Err(AtomicWriteError::NotPublished(
+                std::io::Error::last_os_error().into(),
+            ));
         }
-        directory.sync_all()?;
+        stage_hook(AtomicWriteStage::DirectorySync, Some(&temporary))
+            .map_err(AtomicWriteError::PublishedButDirectoryUnsynced)?;
+        directory
+            .sync_all()
+            .map_err(ControlStateError::from)
+            .map_err(AtomicWriteError::PublishedButDirectoryUnsynced)?;
         Ok(())
     })();
     if result.is_err() {
@@ -709,7 +863,7 @@ fn write_owned_atomic_with_hook(
 }
 
 #[cfg(not(unix))]
-fn open_control_directory(
+pub(crate) fn open_control_directory(
     path: &Path,
     create: bool,
     _expected_uid: u32,
@@ -725,6 +879,17 @@ fn open_control_directory(
         .then(|| path.to_path_buf())
         .map(Some)
         .ok_or(ControlStateError::UnsafeFile)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn open_owned_directory_at(
+    parent: &ControlDirectory,
+    name: &str,
+    create: bool,
+    expected_uid: u32,
+    expected_gid: u32,
+) -> Result<Option<ControlDirectory>, ControlStateError> {
+    open_control_directory(&parent.join(name), create, expected_uid, expected_gid)
 }
 
 #[cfg(not(unix))]
@@ -792,8 +957,8 @@ mod tests {
     use crate::vortix_core::control::{
         AdmissionError, AuthorityEpoch, BootEligibility, ClientId, CommandRequest,
         ControlPersistenceConfig, ControlService, ControlServiceConfig, IdempotencyKey,
-        PolicyDigest, ProfileTopology, ProtectionStatus, ReadinessError, RequestedTunnelState,
-        UserCommand,
+        OperationFailure, PolicyDigest, ProfileTopology, ProtectionStatus, ReadinessError,
+        RequestedTunnelState, UserCommand,
     };
     use std::collections::BTreeSet;
     use std::sync::Arc;
@@ -831,6 +996,7 @@ mod tests {
             intent: OperationIntent::GenerationScoped,
             status: OperationStatus::WaitingForObservation,
             result: None,
+            failure_detail: None,
         }
     }
 
@@ -851,6 +1017,48 @@ mod tests {
 
         assert_eq!(loaded.id, operation_id);
         assert_eq!(loaded.status, OperationStatus::WaitingForObservation);
+    }
+
+    #[test]
+    fn persisted_policy_failure_detail_is_bounded_and_terminal_only() {
+        let mut persisted = state("failure-detail");
+        let mut failed = operation(7, 3, 2);
+        failed.status = OperationStatus::Failed;
+        failed.result = Some(OperationResult::Failed(OperationFailure::DnsPolicyFailed));
+        failed.failure_detail = Some("macOS primary DNS ownership mismatch".to_string());
+        persisted
+            .operations
+            .insert(failed.id.clone(), failed.clone());
+        persisted.validate().unwrap();
+
+        failed.failure_detail = Some(
+            "x".repeat(crate::vortix_core::control::model::MAX_OPERATION_FAILURE_DETAIL_CHARS + 1),
+        );
+        persisted
+            .operations
+            .insert(failed.id.clone(), failed.clone());
+        assert!(matches!(
+            persisted.validate(),
+            Err(ControlStateError::Invalid("invalid persisted control fact"))
+        ));
+
+        failed.failure_detail = Some("unsafe\nline".to_string());
+        persisted.operations.insert(failed.id.clone(), failed);
+        assert!(matches!(
+            persisted.validate(),
+            Err(ControlStateError::Invalid("invalid persisted control fact"))
+        ));
+
+        let mut nonterminal_state = state("nonterminal-failure-detail");
+        let mut nonterminal = operation(7, 4, 2);
+        nonterminal.failure_detail = Some("detail without terminal failure".to_string());
+        nonterminal_state
+            .operations
+            .insert(nonterminal.id.clone(), nonterminal);
+        assert!(matches!(
+            nonterminal_state.validate(),
+            Err(ControlStateError::Invalid("invalid persisted control fact"))
+        ));
     }
 
     #[test]
@@ -887,6 +1095,38 @@ mod tests {
             OperationIntent::GenerationScoped
         ));
         decoded.validate().unwrap();
+    }
+
+    #[test]
+    fn schema_two_defaults_missing_last_connected_activity() {
+        let persisted = state("schema-two-activity");
+        let mut encoded = serde_json::to_value(&persisted).unwrap();
+        encoded["schema_version"] = serde_json::json!(2);
+        encoded.as_object_mut().unwrap().remove("last_connected_at");
+
+        let decoded: PersistedControlState = serde_json::from_value(encoded).unwrap();
+
+        assert!(decoded.last_connected_at.is_empty());
+        decoded.validate().unwrap();
+    }
+
+    #[test]
+    fn canonical_last_connected_activity_round_trips_atomically() {
+        let temp = tempdir().unwrap();
+        let store = FsControlStateStore::new(temp.path());
+        let profile_id = profile('a');
+        let connected_at = std::time::UNIX_EPOCH + Duration::from_secs(42);
+        let mut persisted = state("activity-roundtrip");
+        persisted
+            .last_connected_at
+            .insert(profile_id.clone(), connected_at);
+
+        store.save_state(&persisted).unwrap();
+
+        let LoadedControlState::Current(loaded) = store.load_state().unwrap() else {
+            panic!("current activity state must remain readable");
+        };
+        assert_eq!(loaded.last_connected_at[&profile_id], connected_at);
     }
 
     #[test]
@@ -998,7 +1238,11 @@ mod tests {
             br#"{"schema_version":1}"#,
             uid,
             gid,
-            |temporary| {
+            |stage, temporary| {
+                if stage != AtomicWriteStage::Publish {
+                    return Ok(());
+                }
+                let temporary = temporary.expect("temporary exists before publication");
                 assert!(read_owned_entry(&pinned, STATE_FILE, uid)
                     .unwrap()
                     .is_none());
@@ -1006,6 +1250,7 @@ mod tests {
                 assert_eq!(metadata.uid(), uid);
                 assert_eq!(metadata.gid(), gid);
                 assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+                Ok(())
             },
         )
         .unwrap();
@@ -1014,6 +1259,20 @@ mod tests {
             read_owned_entry(&pinned, STATE_FILE, uid).unwrap(),
             Some(br#"{"schema_version":1}"#.to_vec())
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_owned_directory_preparation_removes_new_empty_directory() {
+        let parent_path = tempdir().unwrap();
+        let (uid, gid) = crate::utils::effective_user_group_ids();
+        let parent = open_control_directory(parent_path.path(), false, uid, gid)
+            .unwrap()
+            .expect("temporary directory is pinned");
+        let impossible_gid = gid.wrapping_add(1);
+
+        assert!(open_owned_directory_at(&parent, "auth", true, uid, impossible_gid).is_err());
+        assert!(!parent_path.path().join("auth").exists());
     }
 
     #[cfg(unix)]

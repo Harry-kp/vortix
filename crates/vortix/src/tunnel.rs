@@ -23,6 +23,10 @@ use crate::vortix_protocol_wireguard::WgTunnel;
 
 use crate::state::{Protocol, VpnProfile};
 
+type RememberedOpenVpnCredentialResolver = dyn Fn(&ProfileId, &str) -> Result<Option<crate::vortix_core::control::Secret>, String>
+    + Send
+    + Sync;
+
 /// Runtime-selectable carrier over the closed protocol set.
 ///
 /// Mock variant uses `crate::vortix_core::ports::tunnel::mock::MockTunnel` so tests
@@ -149,9 +153,11 @@ pub struct CanonicalTunnelSettings {
 type CanonicalProfileResolver = dyn Fn(&ProfileId) -> Option<Profile> + Send + Sync;
 type CanonicalSessionResolver =
     dyn Fn(&ProfileId) -> Option<crate::core::scanner::ActiveSession> + Send + Sync;
+type CanonicalOwnedLifecycleObserver = dyn Fn(&ProfileId, bool) + Send + Sync;
 
 pub(crate) struct StandardOpenVpnOwner {
     custody: crate::vortix_process::CustodianHandshake,
+    protocol_pid: u32,
 }
 
 impl StandardOpenVpnOwner {
@@ -166,14 +172,6 @@ impl StandardOpenVpnOwner {
     }
 }
 
-#[must_use]
-pub(crate) fn standard_openvpn_scanner_pid_matches(
-    scanner_pid: Option<u32>,
-    custodian_pid: u32,
-) -> bool {
-    scanner_pid == Some(custodian_pid)
-}
-
 pub(crate) fn standard_openvpn_owner(
     profile_id: &ProfileId,
     session: &crate::core::scanner::ActiveSession,
@@ -183,12 +181,25 @@ pub(crate) fn standard_openvpn_owner(
     else {
         return Ok(None);
     };
-    if !standard_openvpn_scanner_pid_matches(session.pid, custody.pid) {
-        return Err("OpenVPN scanner PID does not match authenticated custodian child".into());
-    }
     let alive = crate::vortix_process::custodian::remote_status(&custody.identity)
         .map_err(|error| format!("OpenVPN custodian status failed: {error}"))?;
-    Ok(alive.then_some(StandardOpenVpnOwner { custody }))
+    if !alive {
+        return Ok(None);
+    }
+    let scanner_pid = session
+        .pid
+        .ok_or_else(|| "active OpenVPN target has no scanner process PID".to_string())?;
+    if !crate::vortix_process::custodian::contains_protocol_pid(&custody, scanner_pid)
+        .map_err(|error| format!("OpenVPN process-group ownership check failed: {error}"))?
+    {
+        return Err(
+            "OpenVPN scanner PID is not contained by the authenticated custodian group".into(),
+        );
+    }
+    Ok(Some(StandardOpenVpnOwner {
+        custody,
+        protocol_pid: scanner_pid,
+    }))
 }
 
 /// Production adapter from bounded canonical work to the concrete protocol
@@ -201,6 +212,8 @@ pub struct CanonicalTunnelExecutor {
     standard_ownership:
         Option<Arc<crate::core::standard_tunnel_ownership::StandardTunnelOwnershipStore>>,
     sessions: Option<Arc<CanonicalSessionResolver>>,
+    owned_lifecycle_observer: Option<Arc<CanonicalOwnedLifecycleObserver>>,
+    remembered_openvpn_credentials: Option<Arc<RememberedOpenVpnCredentialResolver>>,
     challenge_issuer: Mutex<Option<std::sync::Weak<crate::vortix_core::control::CompleterHandle>>>,
 }
 
@@ -216,6 +229,8 @@ impl CanonicalTunnelExecutor {
             active: Mutex::new(BTreeMap::new()),
             standard_ownership: None,
             sessions: None,
+            owned_lifecycle_observer: None,
+            remembered_openvpn_credentials: None,
             challenge_issuer: Mutex::new(None),
         }
     }
@@ -238,8 +253,78 @@ impl CanonicalTunnelExecutor {
             active: Mutex::new(BTreeMap::new()),
             standard_ownership: Some(ownership),
             sessions: Some(Arc::new(sessions)),
+            owned_lifecycle_observer: None,
+            remembered_openvpn_credentials: None,
             challenge_issuer: Mutex::new(None),
         }
+    }
+
+    /// Observe exact changes to the executor-owned live-tunnel ledger. The
+    /// Standard-mode scanner uses this boundary to invalidate snapshots that
+    /// began before a protocol-owned connect or teardown completed.
+    #[must_use]
+    pub(crate) fn with_owned_lifecycle_observer(
+        mut self,
+        observer: impl Fn(&ProfileId, bool) + Send + Sync + 'static,
+    ) -> Self {
+        self.owned_lifecycle_observer = Some(Arc::new(observer));
+        self
+    }
+
+    fn notify_owned_lifecycle(&self, profile_id: &ProfileId, active: bool) {
+        if let Some(observer) = &self.owned_lifecycle_observer {
+            observer(profile_id, active);
+        }
+    }
+
+    /// Return whether the session is the exact live handle owned by this
+    /// executor process. This is stronger than a scanner-only classification:
+    /// the handle enters this ledger only after protocol success and durable
+    /// Standard-mode ownership have both completed.
+    pub(crate) fn owns_live_session(
+        &self,
+        profile_id: &ProfileId,
+        session: &crate::core::scanner::ActiveSession,
+    ) -> Result<bool, String> {
+        let active = self
+            .active
+            .lock()
+            .map_err(|_| "canonical active-tunnel ledger poisoned".to_string())?;
+        let Some((_, handle)) = active.get(profile_id) else {
+            return Ok(false);
+        };
+        if handle.profile_id != *profile_id
+            || !session.interface_authoritative
+            || handle.interface_name != session.interface
+        {
+            return Ok(false);
+        }
+        Ok(match handle.kind {
+            // On macOS WireGuard runs in userspace, so the scanner reports
+            // the `wireguard-go` PID. The canonical ownership proof is this
+            // executor's exact profile/interface-bound live handle; unlike
+            // OpenVPN, `TunnelHandle::pid` is intentionally absent for
+            // WireGuard and the scanner PID must not make the session look
+            // external.
+            TunnelKindTag::WireGuard => true,
+            TunnelKindTag::OpenVpn => handle.pid.is_some() && handle.pid == session.pid,
+            TunnelKindTag::Mock => false,
+        })
+    }
+
+    /// Supply the session-owned live resolver for reusable `OpenVPN`
+    /// credentials. The executor receives one memory-only value per attempt
+    /// and never opens the remembered-credential store itself.
+    #[must_use]
+    pub fn with_remembered_openvpn_credentials(
+        mut self,
+        resolver: impl Fn(&ProfileId, &str) -> Result<Option<crate::vortix_core::control::Secret>, String>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.remembered_openvpn_credentials = Some(Arc::new(resolver));
+        self
     }
 
     /// Install the service-owned challenge capability after the cyclic
@@ -280,19 +365,28 @@ impl CanonicalTunnelExecutor {
         }
         let static_prompt =
             crate::utils::read_openvpn_static_challenge_prompt(&profile.config_path);
-        let owner_uid = self.standard_ownership.as_ref().map_or_else(
-            || crate::utils::effective_user_group_ids().0,
-            |store| store.owner_uid(),
-        );
-        let saved_credentials = crate::utils::read_openvpn_saved_auth_compat_owned(
-            &self.settings.config_dir,
-            owner_uid,
-            profile.id.as_str(),
-            &profile.display_name,
-        )
-        .map_err(|error| format!("saved OpenVPN credentials were rejected: {error}"))?;
-        if static_prompt.is_none() && saved_credentials.is_some() {
-            return Ok(None);
+        let saved_credentials = self
+            .remembered_openvpn_credentials
+            .as_ref()
+            .map(|resolver| resolver(&profile.id, &profile.display_name))
+            .transpose()?
+            .flatten()
+            .map(|secret| {
+                secret.decode_openvpn_credentials().ok_or_else(|| {
+                    "remembered OpenVPN credential authority returned an invalid value".to_string()
+                })
+            })
+            .transpose()?;
+        if static_prompt.is_none() {
+            if let Some((username, password, answer)) = saved_credentials {
+                return Ok(Some(
+                    crate::vortix_protocol_openvpn::tunnel::OpenVpnStaticChallengeCredentials::new(
+                        username.to_string(),
+                        password.to_string(),
+                        answer,
+                    ),
+                ));
+            }
         }
         let challenge_capability = self
             .challenge_issuer
@@ -353,7 +447,7 @@ impl CanonicalTunnelExecutor {
                             ),
                         ));
                     }
-                    let Some((username, password)) = saved_credentials.as_ref() else {
+                    let Some((username, password, _)) = saved_credentials.as_ref() else {
                         return Err(
                             "interactive credential response did not contain username/password"
                                 .to_string(),
@@ -539,6 +633,7 @@ impl CanonicalTunnelExecutor {
             .lock()
             .map_err(|_| "canonical active-tunnel ledger poisoned".to_string())?
             .insert(work.profile_id.clone(), (tunnel, handle));
+        self.notify_owned_lifecycle(&work.profile_id, true);
         Ok(receipt)
     }
 
@@ -548,13 +643,18 @@ impl CanonicalTunnelExecutor {
     ) -> Result<crate::vortix_core::control::worker::TunnelExecutionReceipt, String> {
         use crate::vortix_core::control::worker::TunnelExecutionReceipt;
         if work.protocol != TunnelKindTag::WireGuard {
-            return TunnelExecutionReceipt::attested(
+            let receipt = TunnelExecutionReceipt::attested(
                 work.profile_id.clone(),
                 handle.interface_name.clone(),
                 work.protocol,
                 handle.pid,
                 format!("openvpn-generation:{}", work.revision.generation),
-            );
+            )
+            .map(|receipt| receipt.with_openvpn_dns(handle.dns_request.clone()))?;
+            return Ok(match handle.openvpn_routes.clone() {
+                Some(routes) => receipt.with_openvpn_routes(routes),
+                None => receipt,
+            });
         }
         let handshake = handle
             .handshake
@@ -599,6 +699,7 @@ impl CanonicalTunnelExecutor {
                     )
                     .map_err(|error| error.to_string())?;
                 }
+                self.notify_owned_lifecycle(&work.profile_id, false);
                 return Ok(TunnelExecutionReceipt::default());
             };
             recovered
@@ -621,6 +722,7 @@ impl CanonicalTunnelExecutor {
                         .map_err(|error| error.to_string())?;
                     }
                 }
+                self.notify_owned_lifecycle(&work.profile_id, false);
                 Ok(TunnelExecutionReceipt::default())
             }
             Err(error) => {
@@ -740,6 +842,7 @@ impl CanonicalTunnelExecutor {
                     process_ownership: None,
                     teardown_config: Some(owned.teardown_config),
                     dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
+                    openvpn_routes: None,
                 };
                 Ok(Some((
                     tunnel_for(
@@ -769,6 +872,7 @@ impl CanonicalTunnelExecutor {
         let owner = standard_openvpn_owner(&work.profile_id, &session)?.ok_or_else(|| {
             "active OpenVPN target has no live PID-matched custodian receipt".to_string()
         })?;
+        let protocol_pid = owner.protocol_pid;
         let custody = owner.custody;
         if custody.identity.generation != work.revision.generation {
             return Err(
@@ -782,11 +886,32 @@ impl CanonicalTunnelExecutor {
         {
             return Err("OpenVPN custodian operation does not match durable control intent".into());
         }
+        let tunnel = tunnel_for(
+            Protocol::OpenVPN,
+            &self.settings.config_dir,
+            &self.settings.openvpn_verbosity,
+            self.settings.connect_timeout_secs,
+        );
+        let runtime_evidence = match &tunnel {
+            TunnelKind::OpenVpn(openvpn) => openvpn
+                .requested_runtime_evidence(&profile)
+                .map_err(|error| error.to_string())?,
+            _ => return Err("OpenVPN recovery constructed the wrong protocol adapter".into()),
+        };
+        let dns_request = match runtime_evidence.dns {
+            crate::vortix_protocol_openvpn::OvpnDnsEvidence::Observed(request)
+            | crate::vortix_protocol_openvpn::OvpnDnsEvidence::ExplicitlyEmpty(request) => request,
+            crate::vortix_protocol_openvpn::OvpnDnsEvidence::Unavailable { reason, .. } => {
+                return Err(format!(
+                    "recovered OpenVPN DNS negotiation evidence is unavailable: {reason}"
+                ));
+            }
+        };
         let handle = TunnelHandle {
             profile_id: work.profile_id.clone(),
             display_name: profile.display_name,
             interface_name: session.interface,
-            pid: Some(custody.pid),
+            pid: Some(protocol_pid),
             started_at: std::time::SystemTime::now(),
             kind: TunnelKindTag::OpenVpn,
             generation: custody.identity.generation,
@@ -794,17 +919,10 @@ impl CanonicalTunnelExecutor {
             probe_receipts: Vec::new(),
             process_ownership: Some(custody.identity),
             teardown_config: None,
-            dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
+            dns_request,
+            openvpn_routes: Some(runtime_evidence.routes),
         };
-        Ok((
-            tunnel_for(
-                Protocol::OpenVPN,
-                &self.settings.config_dir,
-                &self.settings.openvpn_verbosity,
-                self.settings.connect_timeout_secs,
-            ),
-            handle,
-        ))
+        Ok((tunnel, handle))
     }
 }
 
@@ -826,8 +944,13 @@ impl crate::vortix_core::control::worker::TunnelExecutor for CanonicalTunnelExec
 
     fn classify_failure(&self, error: &str) -> crate::vortix_core::control::worker::WorkFailure {
         use crate::vortix_core::control::worker::WorkFailure;
-        if error.contains("ownership is ambiguous") || error.contains("outcome is ambiguous") {
+        if error.contains("ownership is ambiguous")
+            || error.contains("outcome is ambiguous")
+            || error.contains("ambiguous-owned")
+        {
             WorkFailure::OutcomeUnknown
+        } else if error.starts_with("authentication failed:") {
+            WorkFailure::AuthenticationFailed
         } else if error.contains("interactive challenge") {
             WorkFailure::ChallengeFailed
         } else if error.contains("panicked") {
@@ -839,6 +962,10 @@ impl crate::vortix_core::control::worker::TunnelExecutor for CanonicalTunnelExec
             // semantic failure is still an exact WireGuard handshake gate.
             // This check must precede the generic operation-timeout fallback.
             WorkFailure::HandshakeFailed
+        } else if error.contains("WireGuard name must be")
+            || error.contains("WireGuard config has no valid name")
+        {
+            WorkFailure::InvalidProfile
         } else if error.contains("expired") || error.contains("timed out") {
             WorkFailure::TimedOut
         } else {
@@ -846,7 +973,7 @@ impl crate::vortix_core::control::worker::TunnelExecutor for CanonicalTunnelExec
         }
     }
 
-    fn compensate_late_success(
+    fn compensate_unaccepted_success(
         &self,
         work: &crate::vortix_core::control::worker::TunnelWork,
     ) -> Result<(), String> {
@@ -868,14 +995,16 @@ impl crate::vortix_core::control::worker::TunnelExecutor for CanonicalTunnelExec
                 .insert(work.profile_id.clone(), (tunnel, handle));
             return Err("late completion did not own the active generation".into());
         }
-        tunnel.down(handle).map_err(|error| error.to_string())
+        tunnel.down(handle).map_err(|error| error.to_string())?;
+        self.notify_owned_lifecycle(&work.profile_id, false);
+        Ok(())
     }
 
     fn compensate_uncertain(
         &self,
         work: &crate::vortix_core::control::worker::TunnelWork,
     ) -> Result<(), String> {
-        self.compensate_late_success(work)
+        self.compensate_unaccepted_success(work)
     }
 }
 
@@ -971,6 +1100,7 @@ mod canonical_tests {
     use crate::vortix_core::control::model::{AuthorityEpoch, OperationId};
     use crate::vortix_core::control::worker::{TunnelMutation, TunnelRevision, TunnelWork};
     use crate::vortix_core::ports::dns::DnsRequest;
+    use crate::vortix_core::ports::tunnel::mock::MockTunnel;
     use crate::vortix_core::ports::tunnel::{HandshakeEvidence, TunnelTeardownConfig};
     use std::time::{Duration, Instant, SystemTime};
 
@@ -1034,6 +1164,7 @@ mod canonical_tests {
             process_ownership: None,
             teardown_config: None::<TunnelTeardownConfig>,
             dns_request: DnsRequest::default(),
+            openvpn_routes: None,
         }
     }
 
@@ -1042,6 +1173,131 @@ mod canonical_tests {
         let exact = CanonicalTunnelExecutor::receipt_for(&work(7), &handle(7)).unwrap();
         assert_eq!(exact.handshake.unwrap().generation, 7);
         assert!(CanonicalTunnelExecutor::receipt_for(&work(8), &handle(7)).is_err());
+    }
+
+    #[test]
+    fn canonical_executor_owns_kernel_and_userspace_wireguard_sessions() {
+        let executor = CanonicalTunnelExecutor::new(
+            CanonicalTunnelSettings {
+                config_dir: std::env::temp_dir(),
+                openvpn_verbosity: "3".into(),
+                connect_timeout_secs: 1,
+                wireguard_handshake_timeout_secs: 1,
+                wireguard_health_targets: Vec::new(),
+            },
+            |_| None,
+        );
+        let profile_id = ProfileId::new("corp");
+        let live_handle = handle(7);
+        executor.active.lock().unwrap().insert(
+            profile_id.clone(),
+            (TunnelKind::Mock(MockTunnel::new()), live_handle),
+        );
+        let kernel_session = crate::core::scanner::ActiveSession {
+            name: "corp".into(),
+            interface: "wg0".into(),
+            interface_authoritative: true,
+            wireguard_peers: Vec::new(),
+            ..crate::core::scanner::ActiveSession::default()
+        };
+
+        assert!(executor
+            .owns_live_session(&profile_id, &kernel_session)
+            .unwrap());
+
+        // macOS userspace WireGuard is represented by a live
+        // `wireguard-go` process. Its PID is scanner metadata, not a
+        // contradiction of this executor's in-memory ownership.
+        let userspace_session = crate::core::scanner::ActiveSession {
+            pid: Some(12_345),
+            ..kernel_session
+        };
+        assert!(executor
+            .owns_live_session(&profile_id, &userspace_session)
+            .unwrap());
+    }
+
+    #[test]
+    fn canonical_openvpn_receipt_retains_negotiated_runtime_evidence() {
+        let mut work = work(7);
+        work.protocol = TunnelKindTag::OpenVpn;
+        let mut handle = handle(7);
+        handle.kind = TunnelKindTag::OpenVpn;
+        handle.handshake = None;
+        handle.pid = Some(123);
+        handle.dns_request = DnsRequest {
+            servers: vec!["1.1.1.1".parse().unwrap()],
+            ..DnsRequest::default()
+        };
+        handle.openvpn_routes = Some(
+            crate::vortix_protocol_openvpn::push::openvpn_route_evidence(
+                &crate::vortix_protocol_openvpn::parser::parse_ovpn_conf("client\n").unwrap(),
+                "PUSH_REPLY,redirect-gateway def1\nInitialization Sequence Completed\n",
+                false,
+            )
+            .unwrap(),
+        );
+
+        let receipt = CanonicalTunnelExecutor::receipt_for(&work, &handle).unwrap();
+
+        assert_eq!(receipt.openvpn_dns, Some(handle.dns_request));
+        assert_eq!(receipt.openvpn_routes, handle.openvpn_routes);
+    }
+
+    #[test]
+    fn canonical_openvpn_resolves_remembered_credentials_through_injected_authority() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("corp.ovpn");
+        std::fs::write(&config_path, "client\nauth-user-pass\n").unwrap();
+        let profile = Profile::new(
+            ProfileId::new("corp"),
+            "renamed corp",
+            ProtocolKind::OpenVpn,
+            config_path,
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolver_calls = Arc::clone(&calls);
+        let executor = CanonicalTunnelExecutor::new(
+            CanonicalTunnelSettings {
+                config_dir: temp.path().to_path_buf(),
+                openvpn_verbosity: "3".into(),
+                connect_timeout_secs: 1,
+                wireguard_handshake_timeout_secs: 1,
+                wireguard_health_targets: Vec::new(),
+            },
+            |_| None,
+        )
+        .with_remembered_openvpn_credentials(move |profile_id, legacy_display_name| {
+            resolver_calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(profile_id, &ProfileId::new("corp"));
+            assert_eq!(legacy_display_name, "renamed corp");
+            Ok(Some(
+                crate::vortix_core::control::Secret::openvpn_credentials(
+                    "alice",
+                    "correct horse",
+                    None,
+                ),
+            ))
+        });
+        let mut connect = work(7);
+        connect.protocol = TunnelKindTag::OpenVpn;
+
+        let credentials = executor
+            .openvpn_interactive_credentials(
+                &connect,
+                &profile,
+                &crate::vortix_core::control::worker::CancellationToken::default(),
+            )
+            .unwrap();
+
+        let credentials = credentials.expect("remembered credentials should be resolved");
+        assert_eq!(
+            credentials.username_password_for_test(),
+            ("alice", "correct horse")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -1058,6 +1314,8 @@ mod canonical_tests {
         );
         let resolver_calls = Arc::new(AtomicUsize::new(0));
         let calls = Arc::clone(&resolver_calls);
+        let lifecycle_changes = Arc::new(Mutex::new(Vec::new()));
+        let recorded_changes = Arc::clone(&lifecycle_changes);
         let executor = CanonicalTunnelExecutor::new_standard(
             CanonicalTunnelSettings {
                 config_dir: temp.path().to_path_buf(),
@@ -1077,7 +1335,13 @@ mod canonical_tests {
                     ..crate::core::scanner::ActiveSession::default()
                 })
             },
-        );
+        )
+        .with_owned_lifecycle_observer(move |profile_id, active| {
+            recorded_changes
+                .lock()
+                .unwrap()
+                .push((profile_id.clone(), active));
+        });
         executor.active.lock().unwrap().insert(
             ProfileId::new("corp"),
             (TunnelKind::Mock(MockTunnel::new()), handle(7)),
@@ -1091,6 +1355,11 @@ mod canonical_tests {
             resolver_calls.load(Ordering::SeqCst),
             0,
             "a successful protocol-owned teardown is exact absence evidence"
+        );
+        assert_eq!(
+            *lifecycle_changes.lock().unwrap(),
+            vec![(ProfileId::new("corp"), false)],
+            "the exact teardown must invalidate scanner state before policy verification"
         );
     }
 
@@ -1111,6 +1380,15 @@ mod canonical_tests {
         assert_eq!(
             executor.classify_failure("interactive challenge was cancelled or expired"),
             WorkFailure::ChallengeFailed
+        );
+        assert_eq!(
+            executor
+                .classify_failure("OpenVPN startup teardown is ambiguous-owned for generation 7"),
+            WorkFailure::OutcomeUnknown
+        );
+        assert_eq!(
+            executor.classify_failure("authentication failed: AUTH_FAILED"),
+            WorkFailure::AuthenticationFailed
         );
     }
 
@@ -1139,6 +1417,10 @@ mod canonical_tests {
             executor.classify_failure("canonical tunnel operation timed out"),
             WorkFailure::TimedOut
         );
+        assert_eq!(
+            executor.classify_failure("subprocess failure: WireGuard name must be 1–15 characters"),
+            WorkFailure::InvalidProfile
+        );
     }
 
     #[test]
@@ -1152,9 +1434,11 @@ mod canonical_tests {
         use crate::vortix_core::ports::tunnel::TunnelPeerStatus;
 
         let temp = tempfile::tempdir().unwrap();
-        let config = temp.path().join("corp.conf");
+        let config = temp.path().join("wg0.conf");
         std::fs::write(&config, "[Interface]\nPrivateKey = redacted\n").unwrap();
-        let managed_config = temp.path().join("managed-corp.conf");
+        let lifecycle = temp.path().join("lifecycle");
+        std::fs::create_dir(&lifecycle).unwrap();
+        let managed_config = lifecycle.join("wg0.conf");
         std::fs::write(
             &managed_config,
             "[Interface]\nPrivateKey = lifecycle-copy\n",
@@ -1197,6 +1481,7 @@ mod canonical_tests {
                 &TunnelTeardownConfig {
                     path: managed_config,
                     managed: true,
+                    wg_quick_interface: Some("wg0".into()),
                 },
                 evidence.clone(),
                 Vec::new(),

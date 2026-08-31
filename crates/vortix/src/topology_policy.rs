@@ -5,6 +5,7 @@ use std::io::Read as _;
 use std::net::ToSocketAddrs as _;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use crate::core::scanner::ActiveSession;
 use crate::state::{Protocol, VpnProfile};
@@ -22,6 +23,7 @@ use crate::vortix_core::ports::dns::{
 use crate::vortix_core::ports::killswitch::ActiveTunnelInfo;
 use crate::vortix_core::ports::route_table::DefaultRouteObservation;
 use crate::vortix_core::ports::tunnel::ParsedProfile as _;
+use crate::vortix_core::privileged::OpenVpnRedirectGateway;
 use crate::vortix_core::profile::ProfileId;
 use crate::vortix_core::profile::ResolvedEndpoint;
 use crate::vortix_core::state::killswitch::{KillSwitchMode, KillSwitchState};
@@ -64,7 +66,11 @@ pub(crate) fn declared_routes(protocol: Protocol, config_path: &std::path::Path)
                         Cidr::new(route.destination.addr, route.destination.prefix_len)
                     })
                     .collect::<Vec<_>>();
-                if parsed.redirect_gateway {
+                if parsed
+                    .redirect_gateway
+                    .as_ref()
+                    .is_some_and(OpenVpnRedirectGateway::ipv4)
+                {
                     routes.push(
                         Cidr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0)
                             .expect("zero prefix is valid"),
@@ -320,7 +326,11 @@ fn build_topology_for_profile(
         Protocol::OpenVPN => {
             let parsed = crate::vortix_protocol_openvpn::parser::parse_ovpn_conf(body)
                 .map_err(|error| error.to_string())?;
-            if parsed.redirect_gateway {
+            if parsed
+                .redirect_gateway
+                .as_ref()
+                .is_some_and(OpenVpnRedirectGateway::ipv4)
+            {
                 routes.insert("0.0.0.0/0".into());
             }
             routes.extend(parsed.routes.iter().map(|route| {
@@ -679,6 +689,33 @@ impl CanonicalPolicyExecutor {
         }
     }
 
+    fn verify_dns(&self, policy: &TopologyPolicy) -> Result<(), String> {
+        self.require_global_authority()?;
+        let intents = self.dns_intents(&policy.target)?;
+        let dns_policy = {
+            let coordinator = self.dns.lock().map_err(|_| "DNS policy mutex poisoned")?;
+            coordinator
+                .verify_current(&intents, &crate::platform::current_platform().dns)
+                .map_err(|errors| format!("DNS read-back is degraded: {}", errors.join("; ")))?;
+            coordinator
+                .desired()
+                .cloned()
+                .ok_or_else(|| "DNS desired policy is unavailable".to_string())?
+        };
+        crate::core::dns_protection::verify_dns_routes(&dns_policy, policy.deadline)
+    }
+
+    fn verify_current_dns_routes(&self, deadline: Instant) -> Result<(), String> {
+        let policy = self
+            .dns
+            .lock()
+            .map_err(|_| "DNS policy mutex poisoned")?
+            .desired()
+            .cloned()
+            .ok_or_else(|| "DNS desired policy is unavailable".to_string())?;
+        crate::core::dns_protection::verify_dns_routes(&policy, deadline)
+    }
+
     fn active_tunnels(
         &self,
         state: &TopologyState,
@@ -882,6 +919,21 @@ impl CanonicalPolicyExecutor {
         .map_err(|error| error.to_string())
     }
 
+    fn verify_final_firewall(&self, policy: &TopologyPolicy) -> Result<(), String> {
+        if firewall_transition_requires_authority(policy.target.kill_switch) {
+            self.require_global_authority()?;
+        }
+        match policy.target.kill_switch {
+            KillSwitchMode::AlwaysOn => {
+                let active = self.final_firewall_tunnels(policy)?;
+                crate::core::killswitch::verify_blocking(&active).map_err(|error| error.to_string())
+            }
+            KillSwitchMode::Auto | KillSwitchMode::Off => {
+                crate::core::killswitch::verify_disabled().map_err(|error| error.to_string())
+            }
+        }
+    }
+
     fn restore_firewall(&self, state: &TopologyState) -> Result<(), String> {
         let active = self.active_tunnels(state, state.kill_switch == KillSwitchMode::AlwaysOn)?;
         if firewall_transition_requires_authority(state.kill_switch) {
@@ -928,6 +980,7 @@ impl PolicyExecutor for CanonicalPolicyExecutor {
             }
             PolicyBarrier::Dns => {
                 self.reconcile_dns(&policy.target, false)?;
+                self.verify_current_dns_routes(policy.deadline)?;
                 self.with_readback(policy, |evidence| evidence.dns_verified = true);
                 Ok(())
             }
@@ -935,6 +988,7 @@ impl PolicyExecutor for CanonicalPolicyExecutor {
                 self.verify_tunnels(policy)?;
                 self.verify_routes(policy)?;
                 self.reconcile_dns(&policy.target, true)?;
+                self.verify_current_dns_routes(policy.deadline)?;
                 self.with_readback(policy, |evidence| {
                     evidence.interface_verified = true;
                     evidence.route_verified = true;
@@ -964,6 +1018,25 @@ impl PolicyExecutor for CanonicalPolicyExecutor {
             }
             PolicyBarrier::Tunnel | PolicyBarrier::Route | PolicyBarrier::Observation => Ok(()),
         }
+    }
+
+    fn audit(&self, policy: &TopologyPolicy) -> Result<PolicyExecutionEvidence, String> {
+        if policy.stage != PolicyStage::Final {
+            return Err("only a final topology policy can be audited".into());
+        }
+        self.verify_tunnels(policy)?;
+        self.verify_routes(policy)?;
+        self.verify_dns(policy)?;
+        self.verify_final_firewall(policy)?;
+        let observed_at_millis = crate::utils::boot_elapsed_millis()
+            .ok_or_else(|| "OS boot clock is unavailable for policy evidence".to_string())?;
+        Ok(PolicyExecutionEvidence {
+            observed_at_millis,
+            interface_verified: true,
+            route_verified: true,
+            dns_verified: true,
+            firewall_verified: true,
+        })
     }
 
     fn verification(&self, policy: &TopologyPolicy) -> Option<PolicyExecutionEvidence> {

@@ -17,6 +17,10 @@ use crate::topology_policy::{
 };
 use crate::tunnel::{CanonicalTunnelExecutor, CanonicalTunnelSettings};
 use crate::vortix_config::control_state::FsControlStateStore;
+pub use crate::vortix_config::openvpn_credentials::CredentialClearOutcome;
+use crate::vortix_config::openvpn_credentials::{
+    CredentialStoreError, FsOpenVpnCredentialStore, RememberedOpenVpnCredentials,
+};
 use crate::vortix_config::profile_store::{FsProfileStore, ProfileStore, ProfileStoreError};
 use crate::vortix_core::control::worker::TunnelRevision;
 use crate::vortix_core::control::{
@@ -38,6 +42,10 @@ const SCANNER_REFRESH_CEILING: Duration = Duration::from_millis(250);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 const SUPERVISED_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const HOOK_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
+/// A recovered operation has a 30-second service-owned deadline. One-shot
+/// commands wait for that prior authority work to settle before starting the
+/// caller's own deadline, with a small publication margin.
+const CLI_STARTUP_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(32);
 const TUI_ADMISSION_CAPACITY: usize = 8;
 
 #[derive(Debug, Error)]
@@ -54,6 +62,20 @@ pub enum LocalControlError {
     Persistence(String),
     #[error("cannot open Standard-mode tunnel ownership: {0}")]
     Ownership(String),
+    #[error("cannot load remembered OpenVPN credentials: {0}")]
+    CredentialLoad(#[source] CredentialStoreError),
+    #[error("cannot remember OpenVPN credentials: {0}")]
+    CredentialRemember(#[source] CredentialStoreError),
+    #[error("cannot clear remembered OpenVPN credentials: {0}")]
+    CredentialClear(#[source] CredentialStoreError),
+    #[error("the credential change is visible, but disk durability could not be confirmed")]
+    CredentialDurabilityUncertain,
+    #[error(
+        "remembered OpenVPN credential management is unavailable through this control session"
+    )]
+    CredentialManagementUnsupported,
+    #[error("remembered OpenVPN credential authority is unavailable")]
+    CredentialAuthorityUnavailable,
     #[error("cannot recover active profile '{profile}': {reason}")]
     Recovery { profile: String, reason: String },
     #[error("local control observation failed: {0}")]
@@ -88,15 +110,6 @@ fn map_challenge_response_error(
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct LocalOperationOutcome {
-    pub operation_id: OperationId,
-    pub status: OperationStatus,
-    pub result: Option<OperationResult>,
-    pub snapshot: ControlSnapshot,
-    pub profile_mutation: Option<Result<LocalProfileMutationReceipt, ProfileMutationFailure>>,
-}
-
 /// Transport-neutral terminal command result consumed by CLI commands.
 ///
 /// Keeping this shape at the CLI boundary means U13 can change only the
@@ -110,68 +123,6 @@ pub struct ClientOperationOutcome {
     pub result: Option<OperationResult>,
     pub snapshot: ControlSnapshot,
     pub profile_mutation: Option<Result<LocalProfileMutationReceipt, ProfileMutationFailure>>,
-}
-
-impl From<LocalOperationOutcome> for ClientOperationOutcome {
-    fn from(outcome: LocalOperationOutcome) -> Self {
-        Self {
-            operation_id: outcome.operation_id,
-            status: outcome.status,
-            result: outcome.result,
-            snapshot: outcome.snapshot,
-            profile_mutation: outcome.profile_mutation,
-        }
-    }
-}
-
-/// Canonical operation fields consumed by CLI renderers, independent of
-/// whether Standard or remote transport admitted the command.
-pub trait ControlOperationOutcomeView {
-    fn operation_id(&self) -> &OperationId;
-    fn status(&self) -> OperationStatus;
-    fn result(&self) -> Option<&OperationResult>;
-}
-
-impl ControlOperationOutcomeView for LocalOperationOutcome {
-    fn operation_id(&self) -> &OperationId {
-        &self.operation_id
-    }
-
-    fn status(&self) -> OperationStatus {
-        self.status
-    }
-
-    fn result(&self) -> Option<&OperationResult> {
-        self.result.as_ref()
-    }
-}
-
-impl ControlOperationOutcomeView for ClientOperationOutcome {
-    fn operation_id(&self) -> &OperationId {
-        &self.operation_id
-    }
-
-    fn status(&self) -> OperationStatus {
-        self.status
-    }
-
-    fn result(&self) -> Option<&OperationResult> {
-        self.result.as_ref()
-    }
-}
-
-impl ControlOperationOutcomeView for crate::daemon::service::RemoteOperationOutcome {
-    fn operation_id(&self) -> &OperationId {
-        &self.operation_id
-    }
-
-    fn status(&self) -> OperationStatus {
-        self.status
-    }
-
-    fn result(&self) -> Option<&OperationResult> {
-        self.result.as_ref()
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -316,14 +267,31 @@ impl From<&ActiveSession> for PublishedTunnelDetails {
 struct StandardProfileMutationExecutor {
     profiles_dir: std::path::PathBuf,
     profiles: Mutex<BTreeMap<ProfileId, VpnProfile>>,
-    prepared_imports: Mutex<BTreeMap<ProfileId, crate::vpn::PreparedProfileImport>>,
+    prepared_imports: Mutex<BTreeMap<ProfileId, PreparedImportState>>,
     topologies: Mutex<BTreeMap<ProfileId, ProfileTopology>>,
-    prepared_topologies: Mutex<BTreeMap<ProfileId, Option<ProfileTopology>>>,
     results:
         Mutex<BTreeMap<OperationId, Result<LocalProfileMutationReceipt, ProfileMutationFailure>>>,
     catalog_revision: AtomicU64,
     #[cfg(test)]
     next_execution_delay: Mutex<Option<Duration>>,
+}
+
+struct PreparedImportState {
+    prepared: crate::vpn::PreparedProfileImport,
+    topology: Option<ProfileTopology>,
+}
+
+fn initial_last_connected_at(
+    profiles: &[VpnProfile],
+) -> BTreeMap<ProfileId, std::time::SystemTime> {
+    profiles
+        .iter()
+        .filter_map(|profile| {
+            profile
+                .last_used
+                .map(|connected_at| (profile.id.clone(), connected_at))
+        })
+        .collect()
 }
 
 impl std::fmt::Debug for StandardProfileMutationExecutor {
@@ -340,9 +308,8 @@ impl StandardProfileMutationExecutor {
     fn new(
         profiles_dir: std::path::PathBuf,
         profiles: &[VpnProfile],
-        prepared_imports: Vec<crate::vpn::PreparedProfileImport>,
+        prepared_imports: Vec<PreparedImportState>,
         topologies: BTreeMap<ProfileId, ProfileTopology>,
-        prepared_topologies: BTreeMap<ProfileId, Option<ProfileTopology>>,
     ) -> Self {
         Self {
             profiles_dir,
@@ -356,11 +323,10 @@ impl StandardProfileMutationExecutor {
             prepared_imports: Mutex::new(
                 prepared_imports
                     .into_iter()
-                    .map(|prepared| (prepared.profile().id.clone(), prepared))
+                    .map(|state| (state.prepared.profile().id.clone(), state))
                     .collect(),
             ),
             topologies: Mutex::new(topologies),
-            prepared_topologies: Mutex::new(prepared_topologies),
             results: Mutex::new(BTreeMap::new()),
             catalog_revision: AtomicU64::new(0),
             #[cfg(test)]
@@ -375,6 +341,14 @@ impl StandardProfileMutationExecutor {
             .values()
             .cloned()
             .collect()
+    }
+
+    fn profile_snapshot(&self, profile_id: &ProfileId) -> Option<VpnProfile> {
+        self.profiles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(profile_id)
+            .cloned()
     }
 
     fn core_profile(&self, profile_id: &ProfileId) -> Option<Profile> {
@@ -398,15 +372,29 @@ impl StandardProfileMutationExecutor {
         )
     }
 
-    fn core_profiles_snapshot(&self) -> BTreeMap<ProfileId, Profile> {
-        self.profiles_snapshot()
-            .into_iter()
-            .filter_map(|profile| {
-                let profile_id = profile.id.clone();
-                self.core_profile(&profile_id)
-                    .map(|core| (profile_id, core))
+    fn profiles_and_core_snapshot(&self) -> (Vec<VpnProfile>, BTreeMap<ProfileId, Profile>) {
+        let profiles = self
+            .profiles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let topologies = self
+            .topologies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let core = profiles
+            .iter()
+            .map(|(profile_id, profile)| {
+                let resolved = topologies
+                    .get(profile_id)
+                    .map(|topology| topology.resolved_endpoints.clone())
+                    .unwrap_or_default();
+                let core = crate::tunnel::profile_view(profile)
+                    .with_endpoint_resolutions(resolved)
+                    .require_managed_endpoint_resolution();
+                (profile_id.clone(), core)
             })
-            .collect()
+            .collect();
+        (profiles.values().cloned().collect(), core)
     }
 
     fn take_result(
@@ -428,20 +416,15 @@ impl StandardProfileMutationExecutor {
         self.prepared_imports
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(profile_id.clone(), prepared);
-        self.prepared_topologies
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(profile_id.clone(), topology);
+            .insert(
+                profile_id.clone(),
+                PreparedImportState { prepared, topology },
+            );
         profile_id
     }
 
     fn discard_prepared_import(&self, profile_id: &ProfileId) {
         self.prepared_imports
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(profile_id);
-        self.prepared_topologies
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(profile_id);
@@ -520,19 +503,14 @@ impl ProfileMutationExecutor for StandardProfileMutationExecutor {
         let operation_id = work.operation_id.clone();
         let result = (|| match work.mutation {
             ProfileMutation::Import { profile_id } => {
-                let prepared = self
+                let state = self
                     .prepared_imports
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .remove(&profile_id)
                     .ok_or(ProfileMutationFailure::NotFound)?;
-                let topology = self
-                    .prepared_topologies
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&profile_id)
-                    .ok_or(ProfileMutationFailure::Internal)?;
-                let profile = crate::vpn::commit_profile_import(prepared, &self.profiles_dir)
+                let topology = state.topology;
+                let profile = crate::vpn::commit_profile_import(state.prepared, &self.profiles_dir)
                     .map_err(|_| ProfileMutationFailure::Storage)?;
                 self.profiles
                     .lock()
@@ -565,6 +543,14 @@ impl ProfileMutationExecutor for StandardProfileMutationExecutor {
                     .get(&profile_id)
                     .cloned()
                     .ok_or(ProfileMutationFailure::NotFound)?;
+                if profile.protocol == crate::state::Protocol::WireGuard
+                    && crate::vortix_core::profile::validate_wireguard_interface_name(
+                        &new_display_name,
+                    )
+                    .is_err()
+                {
+                    return Err(ProfileMutationFailure::InvalidName);
+                }
                 let mut topology = self
                     .topologies
                     .lock()
@@ -1166,12 +1152,12 @@ impl ClientControlSession {
     {
         let idempotency_key = idempotency_key.into();
         match self.0 {
-            ClientControlSessionKind::StandardLifecycle(session) => session
-                .run_with_challenges(command, wait, idempotency_key, answer_challenge)
-                .map(ClientOperationOutcome::from),
-            ClientControlSessionKind::StandardProfile(session) => session
-                .run(command, wait, idempotency_key)
-                .map(ClientOperationOutcome::from),
+            ClientControlSessionKind::StandardLifecycle(session) => {
+                session.run_with_challenges(command, wait, idempotency_key, answer_challenge)
+            }
+            ClientControlSessionKind::StandardProfile(session) => {
+                session.run(command, wait, idempotency_key)
+            }
             ClientControlSessionKind::Remote { session, queue } => run_remote_cli_command(
                 &session,
                 &queue,
@@ -1371,6 +1357,62 @@ impl ClientControlSession {
         }
     }
 
+    /// Load reusable `OpenVPN` credentials through the selected live
+    /// authority. This operation is intentionally absent from `UserCommand`
+    /// and every durable control projection.
+    pub fn load_openvpn_credentials(
+        &self,
+        profile_id: &ProfileId,
+        legacy_display_name: &str,
+    ) -> Result<Option<RememberedOpenVpnCredentials>, LocalControlError> {
+        match &self.0 {
+            ClientControlSessionKind::StandardLifecycle(session) => {
+                session.load_openvpn_credentials(profile_id, legacy_display_name)
+            }
+            ClientControlSessionKind::StandardProfile(_)
+            | ClientControlSessionKind::Remote { .. } => {
+                Err(LocalControlError::CredentialManagementUnsupported)
+            }
+        }
+    }
+
+    /// Atomically remember a reusable username/password pair for one stable
+    /// profile identity through the selected live authority.
+    pub fn remember_openvpn_credentials(
+        &self,
+        profile_id: &ProfileId,
+        username: &str,
+        password: &str,
+    ) -> Result<(), LocalControlError> {
+        match &self.0 {
+            ClientControlSessionKind::StandardLifecycle(session) => {
+                session.remember_openvpn_credentials(profile_id, username, password)
+            }
+            ClientControlSessionKind::StandardProfile(_)
+            | ClientControlSessionKind::Remote { .. } => {
+                Err(LocalControlError::CredentialManagementUnsupported)
+            }
+        }
+    }
+
+    /// Clear stable and unambiguous legacy credentials through the selected
+    /// live authority.
+    pub fn clear_openvpn_credentials(
+        &self,
+        profile_id: &ProfileId,
+        legacy_display_name: &str,
+    ) -> Result<CredentialClearOutcome, LocalControlError> {
+        match &self.0 {
+            ClientControlSessionKind::StandardLifecycle(session) => {
+                session.clear_openvpn_credentials(profile_id, legacy_display_name)
+            }
+            ClientControlSessionKind::StandardProfile(_)
+            | ClientControlSessionKind::Remote { .. } => {
+                Err(LocalControlError::CredentialManagementUnsupported)
+            }
+        }
+    }
+
     pub fn cancel_challenge(
         &self,
         challenge_id: crate::vortix_core::control::ChallengeId,
@@ -1546,6 +1588,7 @@ pub struct LocalControlSession {
     service: Option<ControlService>,
     // The executor holds only a Weak edge, avoiding a service/supervisor cycle.
     _challenge_issuer: Arc<crate::vortix_core::control::CompleterHandle>,
+    openvpn_credentials: Arc<Mutex<FsOpenVpnCredentialStore>>,
     hooks: Option<crate::hooks::HookRunner>,
     runtime: Option<tokio::runtime::Runtime>,
     subscription: RefCell<ControlSubscription>,
@@ -1553,6 +1596,7 @@ pub struct LocalControlSession {
     owned_active_profiles: std::collections::BTreeSet<ProfileId>,
     unowned_active_profiles: Vec<String>,
     sessions: Arc<Mutex<Vec<ActiveSession>>>,
+    scanner_lifecycle_revision: Arc<AtomicU64>,
     published_observations: RefCell<BTreeMap<ProfileId, (bool, Option<String>)>>,
     published_default_route:
         RefCell<crate::vortix_core::ports::route_table::DefaultRouteObservation>,
@@ -1561,13 +1605,15 @@ pub struct LocalControlSession {
     tui_admission: TuiAdmissionQueue,
     last_catalog_revision: Cell<u64>,
     reported_profile_operations: RefCell<std::collections::BTreeSet<OperationId>>,
-    pending_scan: RefCell<
-        Option<(
-            u64,
-            tokio::task::JoinHandle<crate::core::scanner::ScannerResult>,
-        )>,
-    >,
+    pending_scan: RefCell<Option<PendingScanner>>,
     last_scan_started: Cell<Instant>,
+}
+
+struct PendingScanner {
+    catalog_revision: u64,
+    lifecycle_revision: u64,
+    observed_at_millis: u64,
+    task: tokio::task::JoinHandle<crate::core::scanner::ScannerResult>,
 }
 
 /// Lightweight Standard-mode authority for profile catalog mutations. It
@@ -1608,12 +1654,12 @@ impl LocalProfileMutationSession {
         endpoint_cache
             .retain_profiles(&profiles.iter().map(|profile| profile.id.clone()).collect());
         let (topologies, _) = load_profile_topologies(profiles, &mut endpoint_cache);
-        let prepared_topologies = prepared_imports
-            .iter()
+        let prepared_imports = prepared_imports
+            .into_iter()
             .map(|prepared| {
                 let profile = prepared.topology_profile();
                 let topology = topology_for_profile(&profile, &mut endpoint_cache).ok();
-                (profile.id, topology)
+                PreparedImportState { prepared, topology }
             })
             .collect();
         persist_endpoint_cache_if_changed(&state_store, cache_bytes.as_deref(), &endpoint_cache)?;
@@ -1622,12 +1668,12 @@ impl LocalProfileMutationSession {
             profiles,
             prepared_imports,
             topologies.clone(),
-            prepared_topologies,
         ));
         let service = ControlService::start_with_clock(
             ControlServiceConfig {
                 known_profiles: profiles.iter().map(|profile| profile.id.clone()).collect(),
                 profile_topologies: topologies,
+                initial_last_connected_at: initial_last_connected_at(profiles),
                 profile_mutations: Some(profile_mutations.clone()),
                 authority_epoch: STANDARD_AUTHORITY_EPOCH,
                 persistence: Some(ControlPersistenceConfig::new(boot_id, state_store)),
@@ -1636,7 +1682,13 @@ impl LocalProfileMutationSession {
             },
             Arc::new(RealClock),
         );
-        let sessions = crate::core::scanner::get_active_profiles(profiles);
+        let scan = crate::core::scanner::gather_system_state(profiles);
+        if !scan.tunnel_observation_complete {
+            return Err(LocalControlError::Observation(
+                "tunnel observation failed; active-profile safety is unverified".into(),
+            ));
+        }
+        let sessions = scan.sessions;
         runtime.block_on(async {
             let observer = service.observer();
             let observed_at_millis = observer.now_millis();
@@ -1671,7 +1723,7 @@ impl LocalProfileMutationSession {
         command: UserCommand,
         wait: Duration,
         idempotency_key: impl Into<String>,
-    ) -> Result<LocalOperationOutcome, LocalControlError> {
+    ) -> Result<ClientOperationOutcome, LocalControlError> {
         let result = self.runtime.block_on(async {
             let client = self.service.client();
             let admitted = client
@@ -1688,7 +1740,7 @@ impl LocalProfileMutationSession {
                     let snapshot = subscription.snapshot();
                     if let Some(operation) = snapshot.operations.get(&admitted.operation_id) {
                         if operation.status.is_terminal() {
-                            return Ok(LocalOperationOutcome {
+                            return Ok(ClientOperationOutcome {
                                 profile_mutation: self
                                     .profile_mutations
                                     .take_result(&admitted.operation_id),
@@ -1785,6 +1837,10 @@ impl LocalControlSession {
             .enable_all()
             .build()
             .map_err(|error| LocalControlError::Runtime(error.to_string()))?;
+        let owner = config_owner(config_dir)?;
+        let openvpn_credentials = Arc::new(Mutex::new(
+            FsOpenVpnCredentialStore::for_standard_owner(config_dir, owner.0, owner.1),
+        ));
         let profiles = Arc::new(profiles);
         let mut cache = EndpointResolutionCache::default();
         let (topologies, topology_errors) = load_profile_topologies(&profiles, &mut cache);
@@ -1793,7 +1849,6 @@ impl LocalControlSession {
             &profiles,
             Vec::new(),
             topologies.clone(),
-            BTreeMap::new(),
         ));
         let service = {
             let _runtime_guard = runtime.enter();
@@ -1801,6 +1856,7 @@ impl LocalControlSession {
                 ControlServiceConfig {
                     known_profiles: profiles.iter().map(|profile| profile.id.clone()).collect(),
                     profile_topologies: topologies,
+                    initial_last_connected_at: initial_last_connected_at(&profiles),
                     profile_mutations: Some(profile_mutations.clone()),
                     authority_epoch: STANDARD_AUTHORITY_EPOCH,
                     freshness_poll_interval: CONTROL_PROGRESS_INTERVAL,
@@ -1834,6 +1890,7 @@ impl LocalControlSession {
         Ok(Self {
             service: Some(service),
             _challenge_issuer: challenge_issuer,
+            openvpn_credentials,
             hooks: None,
             runtime: Some(runtime),
             subscription: RefCell::new(subscription),
@@ -1841,6 +1898,7 @@ impl LocalControlSession {
             owned_active_profiles: std::collections::BTreeSet::new(),
             unowned_active_profiles: Vec::new(),
             sessions: Arc::new(Mutex::new(Vec::new())),
+            scanner_lifecycle_revision: Arc::new(AtomicU64::new(0)),
             published_observations: RefCell::new(BTreeMap::new()),
             published_default_route: RefCell::new(
                 crate::vortix_core::ports::route_table::DefaultRouteObservation::ProbeFailed,
@@ -1870,6 +1928,9 @@ impl LocalControlSession {
         let _runtime_guard = runtime.enter();
         let profiles = Arc::new(profiles);
         let owner = config_owner(config_dir)?;
+        let openvpn_credentials = Arc::new(Mutex::new(
+            FsOpenVpnCredentialStore::for_standard_owner(config_dir, owner.0, owner.1),
+        ));
         let boot_id = crate::utils::boot_identity().ok_or_else(|| {
             LocalControlError::Persistence("OS boot identity is unavailable".into())
         })?;
@@ -1886,8 +1947,14 @@ impl LocalControlSession {
                 .map_err(|error| LocalControlError::Ownership(error.to_string()))?,
         );
         let initial_scan = crate::core::scanner::gather_system_state(&profiles);
+        if !initial_scan.tunnel_observation_complete {
+            return Err(LocalControlError::Observation(
+                "tunnel observation failed; tunnel absence is unverified".into(),
+            ));
+        }
         let initial_sessions = initial_scan.sessions.clone();
         let sessions = Arc::new(Mutex::new(initial_sessions.clone()));
+        let scanner_lifecycle_revision = Arc::new(AtomicU64::new(0));
 
         let cache_bytes = state_store
             .endpoint_resolution_cache()
@@ -1903,7 +1970,6 @@ impl LocalControlSession {
             &profiles,
             Vec::new(),
             topologies.clone(),
-            BTreeMap::new(),
         ));
         let core_profiles = Arc::new(
             profiles
@@ -1925,54 +1991,97 @@ impl LocalControlSession {
         let scanner_catalog = Arc::clone(&profile_mutations);
         let executor_sessions = Arc::clone(&sessions);
         let session_resolver = move |profile_id: &ProfileId| {
-            current_session(
-                &scanner_catalog.profiles_snapshot(),
-                &executor_sessions,
-                profile_id,
-            )
+            let profile = scanner_catalog.profile_snapshot(profile_id)?;
+            current_session(&profile, &executor_sessions)
         };
-        let executor = Arc::new(CanonicalTunnelExecutor::new_standard(
-            CanonicalTunnelSettings {
-                config_dir: config_dir.to_path_buf(),
-                openvpn_verbosity: config.openvpn_verbosity.clone(),
-                connect_timeout_secs: config.connect_timeout,
-                wireguard_handshake_timeout_secs: config.wireguard_handshake_timeout_secs,
-                wireguard_health_targets: config.ping_targets.clone(),
-            },
-            move |profile_id| executor_catalog.core_profile(profile_id),
-            Arc::clone(&ownership),
-            session_resolver,
-        ));
+        let executor_credential_store = Arc::clone(&openvpn_credentials);
+        let lifecycle_catalog = Arc::clone(&profile_mutations);
+        let lifecycle_sessions = Arc::clone(&sessions);
+        let lifecycle_revision = Arc::clone(&scanner_lifecycle_revision);
+        let executor = Arc::new(
+            CanonicalTunnelExecutor::new_standard(
+                CanonicalTunnelSettings {
+                    config_dir: config_dir.to_path_buf(),
+                    openvpn_verbosity: config.openvpn_verbosity.clone(),
+                    connect_timeout_secs: config.connect_timeout,
+                    wireguard_handshake_timeout_secs: config.wireguard_handshake_timeout_secs,
+                    wireguard_health_targets: config.ping_targets.clone(),
+                },
+                move |profile_id| executor_catalog.core_profile(profile_id),
+                Arc::clone(&ownership),
+                session_resolver,
+            )
+            .with_owned_lifecycle_observer(move |profile_id, active| {
+                let disconnected_name = (!active)
+                    .then(|| lifecycle_catalog.profile_snapshot(profile_id))
+                    .flatten()
+                    .map(|profile| profile.name);
+                let mut sessions = lifecycle_sessions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                lifecycle_revision.fetch_add(1, Ordering::SeqCst);
+                if let Some(name) = disconnected_name {
+                    sessions.retain(|session| session.name != name);
+                }
+            })
+            .with_remembered_openvpn_credentials(
+                move |profile_id, legacy_display_name| {
+                    let store = executor_credential_store.lock().map_err(|_| {
+                        "remembered OpenVPN credential authority is unavailable".to_string()
+                    })?;
+                    // A rejected or unavailable remembered record is never consumed
+                    // by tunnel execution. Fall back to the admitted memory-only
+                    // challenge; the client-side load operation owns user-facing
+                    // credential diagnostics.
+                    Ok(store
+                        .load(profile_id, legacy_display_name)
+                        .ok()
+                        .flatten()
+                        .map(|credentials| {
+                            crate::vortix_core::control::Secret::openvpn_credentials(
+                                credentials.username(),
+                                credentials.password(),
+                                None,
+                            )
+                        }))
+                },
+            ),
+        );
 
         let policy_profiles = Arc::clone(&profiles);
         let policy_catalog = Arc::clone(&profile_mutations);
         let policy_sessions = Arc::clone(&sessions);
+        let policy_executor = Arc::clone(&executor);
         let external_catalog = Arc::clone(&profile_mutations);
         let external_ownership = Arc::clone(&ownership);
         let external_sessions = Arc::clone(&sessions);
+        let external_executor = Arc::clone(&executor);
         let external_active_profiles = external_session_profiles(
             &initial_sessions,
             &policy_profiles,
             &core_profiles,
             &external_ownership,
+            None,
         );
         let policy = Arc::new(CanonicalPolicyExecutor::new(
             config_dir.to_path_buf(),
             move |profile_id| {
-                current_session(
-                    &policy_catalog.profiles_snapshot(),
-                    &policy_sessions,
-                    profile_id,
-                )
+                let profile = policy_catalog.profile_snapshot(profile_id)?;
+                current_owned_session(&profile, &policy_sessions, &policy_executor)
             },
             move || {
                 let sessions = external_sessions
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let profiles = external_catalog.profiles_snapshot();
-                let core_profiles = external_catalog.core_profiles_snapshot();
-                external_session_profiles(&sessions, &profiles, &core_profiles, &external_ownership)
-                    .len()
+                let (profiles, core_profiles) = external_catalog.profiles_and_core_snapshot();
+                external_session_profiles(
+                    &sessions,
+                    &profiles,
+                    &core_profiles,
+                    &external_ownership,
+                    Some(&external_executor),
+                )
+                .len()
             },
         ));
         let supervisor = Arc::new(crate::vortix_core::control::supervisor::Supervisor::new(
@@ -2014,6 +2123,7 @@ impl LocalControlSession {
             ControlServiceConfig {
                 known_profiles: profiles.iter().map(|profile| profile.id.clone()).collect(),
                 profile_topologies: topologies,
+                initial_last_connected_at: initial_last_connected_at(&profiles),
                 profile_mutations: Some(profile_mutations.clone()),
                 authority_epoch: STANDARD_AUTHORITY_EPOCH,
                 initial_kill_switch_mode,
@@ -2036,6 +2146,7 @@ impl LocalControlSession {
         let session = Self {
             service: Some(service),
             _challenge_issuer: challenge_issuer,
+            openvpn_credentials,
             hooks,
             runtime: Some(runtime),
             subscription: RefCell::new(subscription),
@@ -2043,6 +2154,7 @@ impl LocalControlSession {
             owned_active_profiles,
             unowned_active_profiles,
             sessions,
+            scanner_lifecycle_revision,
             published_observations: RefCell::new(BTreeMap::new()),
             published_default_route: RefCell::new(
                 crate::vortix_core::ports::route_table::DefaultRouteObservation::ProbeFailed,
@@ -2055,8 +2167,12 @@ impl LocalControlSession {
             pending_scan: RefCell::new(None),
             last_scan_started: Cell::new(Instant::now()),
         };
+        let startup_generation = session.current_snapshot().generation;
+        let initial_observed_at_millis = session.service().observer().now_millis();
         session.runtime().block_on(async {
-            session.publish_observations_from(initial_scan).await?;
+            session
+                .publish_observations_from(initial_scan, initial_observed_at_millis)
+                .await?;
             session
                 .service()
                 .completer()
@@ -2064,6 +2180,7 @@ impl LocalControlSession {
                 .await
                 .map_err(|error| LocalControlError::Persistence(error.to_string()))
         })?;
+        session.wait_for_startup_settlement(startup_generation, CLI_STARTUP_SETTLEMENT_TIMEOUT)?;
         Ok(session)
     }
 
@@ -2072,7 +2189,7 @@ impl LocalControlSession {
         command: UserCommand,
         wait: Duration,
         idempotency_key: impl Into<String>,
-    ) -> Result<LocalOperationOutcome, LocalControlError> {
+    ) -> Result<ClientOperationOutcome, LocalControlError> {
         self.run_with_challenges(command, wait, idempotency_key, |_| {
             Err(LocalControlError::ChallengeNonInteractive {
                 profile: "unknown".into(),
@@ -2206,17 +2323,21 @@ impl LocalControlSession {
     pub fn progress(&self) -> Result<(), LocalControlError> {
         let completed = {
             let pending = self.pending_scan.borrow();
-            pending.as_ref().is_some_and(|(_, scan)| scan.is_finished())
+            pending.as_ref().is_some_and(|scan| scan.task.is_finished())
         }
         .then(|| self.pending_scan.borrow_mut().take())
         .flatten();
-        if let Some((catalog_revision, completed)) = completed {
-            let scan = self.runtime().block_on(completed).map_err(|error| {
+        if let Some(completed) = completed {
+            let scan = self.runtime().block_on(completed.task).map_err(|error| {
                 LocalControlError::Observation(format!("scanner worker did not complete: {error}"))
             })?;
-            if catalog_revision == self.profile_mutations.catalog_revision() {
+            if completed.catalog_revision == self.profile_mutations.catalog_revision() {
                 self.runtime()
-                    .block_on(self.publish_observations_from(scan))?;
+                    .block_on(self.publish_observations_from_revision(
+                        scan,
+                        completed.observed_at_millis,
+                        Some(completed.lifecycle_revision),
+                    ))?;
             }
         }
 
@@ -2225,16 +2346,53 @@ impl LocalControlSession {
             && scanner_refresh_due(self.last_scan_started.get(), now)
         {
             let profiles = self.profile_mutations.profiles_snapshot();
+            let observed_at_millis = self.service().observer().now_millis();
             let scan = self
                 .runtime()
                 .handle()
                 .spawn_blocking(move || crate::core::scanner::gather_system_state(&profiles));
-            self.pending_scan
-                .replace(Some((self.profile_mutations.catalog_revision(), scan)));
+            self.pending_scan.replace(Some(PendingScanner {
+                catalog_revision: self.profile_mutations.catalog_revision(),
+                lifecycle_revision: self.scanner_lifecycle_revision.load(Ordering::SeqCst),
+                observed_at_millis,
+                task: scan,
+            }));
             self.last_scan_started.set(now);
         }
         self.runtime().block_on(tokio::task::yield_now());
         Ok(())
+    }
+
+    /// Let durable work recovered by this short-lived authority settle before
+    /// a one-shot CLI command starts its own deadline. TUI startup invokes
+    /// this on its background control thread, so terminal rendering and input
+    /// remain responsive while recovery settles.
+    fn wait_for_startup_settlement(
+        &self,
+        previous_generation: u64,
+        limit: Duration,
+    ) -> Result<(), LocalControlError> {
+        let deadline = Instant::now()
+            .checked_add(limit)
+            .ok_or_else(|| LocalControlError::Observation("startup deadline overflowed".into()))?;
+        loop {
+            let snapshot = self.current_snapshot();
+            if snapshot.generation > previous_generation
+                && snapshot
+                    .operations
+                    .values()
+                    .all(|operation| operation.status.is_terminal())
+            {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(LocalControlError::Observation(
+                    "recovered VPN work did not settle before a new command could start".into(),
+                ));
+            }
+            self.progress()?;
+            std::thread::sleep(CONTROL_PROGRESS_INTERVAL);
+        }
     }
 
     /// Return a changed immutable publication without cloning on idle turns.
@@ -2271,6 +2429,7 @@ impl LocalControlSession {
     ) -> Option<LocalCatalogUpdate> {
         let mut outcomes = Vec::new();
         let mut reported = self.reported_profile_operations.borrow_mut();
+        reported.retain(|operation_id| snapshot.operations.contains_key(operation_id));
         for (operation_id, operation) in &snapshot.operations {
             if !operation.status.is_terminal()
                 || !matches!(operation.intent, OperationIntent::ProfileMutation { .. })
@@ -2310,6 +2469,61 @@ impl LocalControlSession {
             .map_err(map_challenge_response_error)
     }
 
+    /// Resolve reusable credentials from the one owner-bound store retained
+    /// by this Standard-mode session.
+    pub fn load_openvpn_credentials(
+        &self,
+        profile_id: &ProfileId,
+        legacy_display_name: &str,
+    ) -> Result<Option<RememberedOpenVpnCredentials>, LocalControlError> {
+        self.openvpn_credentials
+            .lock()
+            .map_err(|_| LocalControlError::CredentialAuthorityUnavailable)?
+            .load(profile_id, legacy_display_name)
+            .map_err(LocalControlError::CredentialLoad)
+    }
+
+    /// Replace the reusable username/password for one stable profile. The
+    /// legacy name is accepted as part of the transport-neutral identity
+    /// contract; new writes are always stable-ID keyed.
+    pub fn remember_openvpn_credentials(
+        &self,
+        profile_id: &ProfileId,
+        username: &str,
+        password: &str,
+    ) -> Result<(), LocalControlError> {
+        let credentials = RememberedOpenVpnCredentials::new(username, password)
+            .map_err(LocalControlError::CredentialRemember)?;
+        self.openvpn_credentials
+            .lock()
+            .map_err(|_| LocalControlError::CredentialAuthorityUnavailable)?
+            .replace(profile_id, &credentials)
+            .map_err(|error| match error {
+                CredentialStoreError::DurabilityUncertain => {
+                    LocalControlError::CredentialDurabilityUncertain
+                }
+                other => LocalControlError::CredentialRemember(other),
+            })
+    }
+
+    /// Clear stable and unambiguous legacy credentials for one profile.
+    pub fn clear_openvpn_credentials(
+        &self,
+        profile_id: &ProfileId,
+        legacy_display_name: &str,
+    ) -> Result<CredentialClearOutcome, LocalControlError> {
+        self.openvpn_credentials
+            .lock()
+            .map_err(|_| LocalControlError::CredentialAuthorityUnavailable)?
+            .clear(profile_id, legacy_display_name)
+            .map_err(|error| match error {
+                CredentialStoreError::DurabilityUncertain => {
+                    LocalControlError::CredentialDurabilityUncertain
+                }
+                other => LocalControlError::CredentialClear(other),
+            })
+    }
+
     pub fn cancel_challenge(
         &self,
         challenge_id: crate::vortix_core::control::ChallengeId,
@@ -2319,17 +2533,13 @@ impl LocalControlSession {
             .map_err(map_challenge_response_error)
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "one bounded admission/challenge/observation wait loop"
-    )]
     pub(crate) fn run_with_challenges<F>(
         mut self,
         command: UserCommand,
         wait: Duration,
         idempotency_key: impl Into<String>,
         answer_challenge: F,
-    ) -> Result<LocalOperationOutcome, LocalControlError>
+    ) -> Result<ClientOperationOutcome, LocalControlError>
     where
         F: FnMut(
                 &crate::vortix_core::control::ChallengeRecord,
@@ -2338,108 +2548,82 @@ impl LocalControlSession {
             + 'static,
     {
         self.validate(&command)?;
+        let client = self.service().client();
+        let admitted = self
+            .runtime()
+            .block_on(client.submit(CommandRequest {
+                command,
+                idempotency_key: IdempotencyKey::new(idempotency_key),
+                deadline: client.deadline_after(wait),
+            }))
+            .map_err(LocalControlError::Admission)?;
         let challenge_responder = Arc::new(Mutex::new(answer_challenge));
-        let result = self.runtime().block_on(async {
-            let client = self.service().client();
-            let admitted = client
-                .submit(CommandRequest {
-                    command,
-                    idempotency_key: IdempotencyKey::new(idempotency_key),
-                    deadline: client.deadline_after(wait),
-                })
-                .await
-                .map_err(LocalControlError::Admission)?;
-            let wall_deadline = Instant::now() + wait + SHUTDOWN_GRACE;
-            // Startup already performed and published one immediate scan.
-            // Start the first post-admission refresh immediately so a fast
-            // tunnel effect is observed without waiting for a cadence tick.
-            let mut last_scan_started = Instant::now()
+        let wall_deadline = Instant::now()
+            .checked_add(wait + SHUTDOWN_GRACE)
+            .ok_or_else(|| LocalControlError::Observation("command deadline overflowed".into()))?;
+        // Drive one-shot commands through the same scanner, observation cache,
+        // and subscription path used by the TUI. Presentation and blocking
+        // policy differ between clients; canonical progress must not.
+        self.last_scan_started.set(
+            Instant::now()
                 .checked_sub(SCANNER_REFRESH_CEILING)
-                .unwrap_or_else(Instant::now);
-            let mut pending_scan = None;
-            let mut handled_challenges = std::collections::BTreeSet::new();
-            let mut challenge_input_error = None;
-            loop {
-                if pending_scan
-                    .as_ref()
-                    .is_some_and(tokio::task::JoinHandle::is_finished)
-                {
-                    let completed = pending_scan.take().expect("finished scan checked");
-                    let scan = completed.await.map_err(|error| {
-                        LocalControlError::Observation(format!(
-                            "scanner worker did not complete: {error}"
-                        ))
-                    })?;
-                    self.publish_observations_from(scan).await?;
-                }
-                let snapshot = client.snapshot();
-                let pending_challenges = snapshot
-                    .challenges
-                    .values()
-                    .filter(|challenge| {
-                        challenge.operation_id == admitted.operation_id
-                            && &challenge.authorized_client == client.client_id()
-                            && !handled_challenges.contains(&challenge.id)
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>();
-                let mut handled_challenge_this_tick = false;
-                for challenge in &pending_challenges {
-                    handled_challenges.insert(challenge.id);
-                    handled_challenge_this_tick = true;
-                    let answer = invoke_challenge_responder(
-                        Arc::clone(&challenge_responder),
-                        challenge.clone(),
-                    )
-                    .await;
-                    match answer {
-                        Ok(answer) => client
-                            .respond_challenge(challenge.id, answer)
-                            .await
-                            .map_err(map_challenge_response_error)?,
-                        Err(error) => {
-                            let _ = client.cancel_challenge(challenge.id).await;
-                            if challenge_input_error.is_none() {
-                                challenge_input_error = Some(error);
-                            }
+                .unwrap_or_else(Instant::now),
+        );
+        let mut handled_challenges = std::collections::BTreeSet::new();
+        let mut challenge_input_error = None;
+        let result = loop {
+            self.progress()?;
+            let snapshot = self.current_snapshot();
+            let pending_challenges = snapshot
+                .challenges
+                .values()
+                .filter(|challenge| {
+                    challenge.operation_id == admitted.operation_id
+                        && challenge.authorized_client == *client.client_id()
+                        && !handled_challenges.contains(&challenge.id)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut handled_challenge_this_tick = false;
+            for challenge in &pending_challenges {
+                handled_challenges.insert(challenge.id);
+                handled_challenge_this_tick = true;
+                let answer = self.runtime().block_on(invoke_challenge_responder(
+                    Arc::clone(&challenge_responder),
+                    challenge.clone(),
+                ));
+                match answer {
+                    Ok(answer) => self.respond_challenge(challenge.id, answer.into_vec())?,
+                    Err(error) => {
+                        let _ = self.cancel_challenge(challenge.id);
+                        if challenge_input_error.is_none() {
+                            challenge_input_error = Some(error);
                         }
                     }
                 }
-                if handled_challenge_this_tick {
-                    // `respond_challenge` acknowledges inside the actor before
-                    // the resulting snapshot publication. Never decide from
-                    // the older snapshot captured above.
-                    tokio::task::yield_now().await;
-                    continue;
-                }
-                if let Some(operation) = snapshot.operations.get(&admitted.operation_id) {
-                    if operation.status.is_terminal() {
-                        if let Some(error) = challenge_input_error {
-                            return Err(error);
-                        }
-                        return Ok(LocalOperationOutcome {
-                            profile_mutation: None,
-                            operation_id: admitted.operation_id,
-                            status: operation.status,
-                            result: operation.result,
-                            snapshot,
-                        });
-                    }
-                }
-                if Instant::now() >= wall_deadline {
-                    return Err(LocalControlError::Stopped);
-                }
-                let now = Instant::now();
-                if pending_scan.is_none() && scanner_refresh_due(last_scan_started, now) {
-                    let profiles = self.profile_mutations.profiles_snapshot();
-                    pending_scan = Some(tokio::task::spawn_blocking(move || {
-                        crate::core::scanner::gather_system_state(&profiles)
-                    }));
-                    last_scan_started = now;
-                }
-                tokio::time::sleep(CONTROL_PROGRESS_INTERVAL).await;
             }
-        });
+            if handled_challenge_this_tick {
+                continue;
+            }
+            if let Some(operation) = snapshot.operations.get(&admitted.operation_id) {
+                if operation.status.is_terminal() {
+                    if let Some(error) = challenge_input_error {
+                        break Err(error);
+                    }
+                    break Ok(ClientOperationOutcome {
+                        profile_mutation: None,
+                        operation_id: admitted.operation_id,
+                        status: operation.status,
+                        result: operation.result,
+                        snapshot,
+                    });
+                }
+            }
+            if Instant::now() >= wall_deadline {
+                break Err(LocalControlError::Stopped);
+            }
+            std::thread::sleep(CONTROL_PROGRESS_INTERVAL);
+        };
         if let Some(hooks) = self.hooks.take() {
             self.runtime()
                 .block_on(hooks.shutdown_bounded(HOOK_SHUTDOWN_GRACE));
@@ -2517,15 +2701,29 @@ impl LocalControlSession {
     async fn publish_observations_from(
         &self,
         scan: crate::core::scanner::ScannerResult,
+        observed_at_millis: u64,
     ) -> Result<(), LocalControlError> {
+        self.publish_observations_from_revision(scan, observed_at_millis, None)
+            .await
+    }
+
+    async fn publish_observations_from_revision(
+        &self,
+        scan: crate::core::scanner::ScannerResult,
+        observed_at_millis: u64,
+        expected_lifecycle_revision: Option<u64>,
+    ) -> Result<(), LocalControlError> {
+        if !scan.tunnel_observation_complete {
+            return Err(LocalControlError::Observation(
+                "tunnel observation failed; preserving the last verified tunnel state".into(),
+            ));
+        }
         let sessions = scan.sessions;
         let profiles = self.profile_mutations.profiles_snapshot();
-        self.sessions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone_from(&sessions);
+        if !self.accept_scanner_sessions(&sessions, expected_lifecycle_revision) {
+            return Ok(());
+        }
         let observer = self.service().observer();
-        let observed_at_millis = observer.now_millis();
         let default_route = scan.default_route;
         let default_route_changed = !matches!(
             default_route,
@@ -2603,7 +2801,33 @@ impl LocalControlSession {
                 .borrow_mut()
                 .insert(profile_id, state);
         }
+        let profile_ids = profiles
+            .iter()
+            .map(|profile| &profile.id)
+            .collect::<std::collections::BTreeSet<_>>();
+        self.published_observations
+            .borrow_mut()
+            .retain(|profile_id, _| profile_ids.contains(profile_id));
         Ok(())
+    }
+
+    fn accept_scanner_sessions(
+        &self,
+        sessions: &[ActiveSession],
+        expected_lifecycle_revision: Option<u64>,
+    ) -> bool {
+        let mut current = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if expected_lifecycle_revision.is_some_and(|expected| {
+            self.scanner_lifecycle_revision.load(Ordering::SeqCst) != expected
+        }) {
+            return false;
+        }
+        current.clear();
+        current.extend_from_slice(sessions);
+        true
     }
 }
 
@@ -2698,6 +2922,35 @@ fn validate_command_target(
     let Some(profile_id) = target else {
         return Ok(());
     };
+    let starts_wireguard = matches!(
+        command,
+        UserCommand::Connect { .. }
+            | UserCommand::ConnectExclusive { .. }
+            | UserCommand::Reconnect {
+                profile_id: Some(_)
+            }
+    );
+    if starts_wireguard {
+        if let Some(profile) = profiles.iter().find(|profile| &profile.id == profile_id) {
+            if profile.protocol == crate::state::Protocol::WireGuard {
+                let interface_name = profile
+                    .config_path
+                    .file_stem()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .unwrap_or_default();
+                if let Err(reason) =
+                    crate::vortix_core::profile::validate_wireguard_interface_name(interface_name)
+                {
+                    return Err(LocalControlError::Profile {
+                        profile: profile.name.clone(),
+                        reason: format!(
+                            "{reason}. Delete this profile, rename the original file (for example, to wg07.conf), and import it again"
+                        ),
+                    });
+                }
+            }
+        }
+    }
     if let Some(reason) = topology_errors.get(profile_id) {
         let profile = profiles
             .iter()
@@ -2741,11 +2994,9 @@ fn observation_changes(
 }
 
 fn current_session(
-    profiles: &[VpnProfile],
+    profile: &VpnProfile,
     sessions: &Mutex<Vec<ActiveSession>>,
-    profile_id: &ProfileId,
 ) -> Option<ActiveSession> {
-    let profile = profiles.iter().find(|profile| &profile.id == profile_id)?;
     sessions
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2754,11 +3005,25 @@ fn current_session(
         .cloned()
 }
 
+fn current_owned_session(
+    profile: &VpnProfile,
+    sessions: &Mutex<Vec<ActiveSession>>,
+    executor: &CanonicalTunnelExecutor,
+) -> Option<ActiveSession> {
+    let session = current_session(profile, sessions)?;
+    executor
+        .owns_live_session(&profile.id, &session)
+        .ok()
+        .filter(|owned| *owned)
+        .map(|_| session)
+}
+
 fn external_session_profiles(
     sessions: &[ActiveSession],
     profiles: &[VpnProfile],
     canonical: &BTreeMap<ProfileId, Profile>,
     ownership: &StandardTunnelOwnershipStore,
+    live_executor: Option<&CanonicalTunnelExecutor>,
 ) -> Vec<String> {
     sessions
         .iter()
@@ -2769,6 +3034,13 @@ fn external_session_profiles(
             let Some(canonical) = canonical.get(&profile.id) else {
                 return true;
             };
+            if live_executor.is_some_and(|executor| {
+                executor
+                    .owns_live_session(&profile.id, session)
+                    .unwrap_or(false)
+            }) {
+                return false;
+            }
             match profile.protocol {
                 Protocol::WireGuard => ownership.validate_wireguard(canonical, session).is_err(),
                 Protocol::OpenVPN => crate::tunnel::standard_openvpn_owner(&profile.id, session)
@@ -3217,6 +3489,7 @@ mod tests {
             intent: OperationIntent::ProfileMutation { profile_id },
             status,
             result,
+            failure_detail: None,
         }
     }
 
@@ -3548,6 +3821,89 @@ mod tests {
     }
 
     #[test]
+    fn standard_session_manages_credentials_outside_durable_control_shapes() {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join(crate::constants::PROFILES_DIR_NAME)).unwrap();
+        let profile_id = profile_id('a');
+        let session = LocalControlSession::start_profile_test(temp.path(), Vec::new()).unwrap();
+
+        session
+            .remember_openvpn_credentials(
+                &profile_id,
+                "u2-session-marker-user",
+                "u2-session-marker-password",
+            )
+            .unwrap();
+        let loaded = session
+            .load_openvpn_credentials(&profile_id, "renamed-corp")
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.username(), "u2-session-marker-user");
+        assert_eq!(loaded.password(), "u2-session-marker-password");
+
+        let command = serde_json::to_vec(&UserCommand::Connect {
+            profile_id: profile_id.clone(),
+            conflict_acknowledgement: None,
+        })
+        .unwrap();
+        let snapshot = serde_json::to_vec(&session.current_snapshot()).unwrap();
+        for durable in [&command[..], &snapshot[..]] {
+            assert!(!durable
+                .windows(b"u2-session-marker-user".len())
+                .any(|window| window == b"u2-session-marker-user"));
+            assert!(!durable
+                .windows(b"u2-session-marker-password".len())
+                .any(|window| window == b"u2-session-marker-password"));
+        }
+
+        let auth_path = temp
+            .path()
+            .join(crate::constants::OPENVPN_AUTH_DIR)
+            .join(format!("{}.auth", profile_id.as_str()));
+        #[cfg(unix)]
+        {
+            let owner = config_owner(temp.path()).unwrap();
+            let metadata = std::fs::metadata(&auth_path).unwrap();
+            assert_eq!((metadata.uid(), metadata.gid()), owner);
+        }
+
+        session
+            .clear_openvpn_credentials(&profile_id, "renamed-corp")
+            .unwrap();
+        assert!(session
+            .load_openvpn_credentials(&profile_id, "renamed-corp")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn remote_credential_management_is_explicitly_unsupported_without_local_fallback() {
+        let session = ClientControlSession::remote_for_parity(
+            crate::daemon::service::RemoteControlSession::open_for_parity(Arc::new(
+                SnapshotRemoteTransport::new(ControlSnapshot::default()),
+            ))
+            .unwrap(),
+        );
+        let profile_id = profile_id('a');
+
+        assert!(matches!(
+            session.load_openvpn_credentials(&profile_id, "corp"),
+            Err(LocalControlError::CredentialManagementUnsupported)
+        ));
+        assert!(matches!(
+            session.remember_openvpn_credentials(&profile_id, "alice", "secret"),
+            Err(LocalControlError::CredentialManagementUnsupported)
+        ));
+        assert!(matches!(
+            session.clear_openvpn_credentials(&profile_id, "corp"),
+            Err(LocalControlError::CredentialManagementUnsupported)
+        ));
+    }
+
+    #[test]
     fn tui_enqueue_stays_prompt_while_durable_admission_is_blocked() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir(temp.path().join(crate::constants::PROFILES_DIR_NAME)).unwrap();
@@ -3689,6 +4045,46 @@ mod tests {
     }
 
     #[test]
+    fn cli_startup_settlement_waits_for_recovered_work_before_new_deadline() {
+        let temp = tempfile::tempdir().unwrap();
+        let profiles_dir = temp.path().join(crate::constants::PROFILES_DIR_NAME);
+        std::fs::create_dir(&profiles_dir).unwrap();
+        let config_path = profiles_dir.join("corp.conf");
+        write_test_wireguard_config(&config_path);
+        let profile = VpnProfile {
+            id: profile_id('b'),
+            name: "corp".into(),
+            protocol: Protocol::WireGuard,
+            location: String::new(),
+            config_path,
+            last_used: None,
+        };
+        let session =
+            LocalControlSession::start_profile_test(temp.path(), vec![profile.clone()]).unwrap();
+        let before_generation = session.current_snapshot().generation;
+        let recovered_operation = session
+            .submit(
+                UserCommand::Connect {
+                    profile_id: profile.id,
+                    conflict_acknowledgement: None,
+                },
+                Duration::from_millis(20),
+                "recovered-before-cli",
+            )
+            .unwrap();
+
+        session
+            .wait_for_startup_settlement(before_generation, Duration::from_secs(1))
+            .unwrap();
+
+        let snapshot = session.current_snapshot();
+        assert!(snapshot
+            .operations
+            .get(&recovered_operation)
+            .is_some_and(|operation| operation.status.is_terminal()));
+    }
+
+    #[test]
     fn unchanged_scanner_payload_does_not_publish_again() {
         let temp = tempfile::tempdir().unwrap();
         let profiles_dir = temp.path().join(crate::constants::PROFILES_DIR_NAME);
@@ -3729,12 +4125,13 @@ mod tests {
                 crate::vortix_core::ports::route_table::DefaultRouteObservation::Interface(
                     "wg0".into(),
                 ),
+            tunnel_observation_complete: true,
         };
         let profile_id = profile_id('c');
         let baseline_generation = session.current_snapshot().generation;
         session
             .runtime()
-            .block_on(session.publish_observations_from(scan()))
+            .block_on(session.publish_observations_from(scan(), 1))
             .unwrap();
         // `observe` acknowledges actor receipt before the final publication,
         // so consume snapshots until all three semantic facts from the first
@@ -3777,7 +4174,7 @@ mod tests {
 
         session
             .runtime()
-            .block_on(session.publish_observations_from(scan()))
+            .block_on(session.publish_observations_from(scan(), 1))
             .unwrap();
         assert_eq!(
             *session.published_default_route.borrow(),
@@ -3790,6 +4187,162 @@ mod tests {
         assert_eq!(
             *session.published_observations.borrow(),
             published_observations
+        );
+    }
+
+    #[test]
+    fn scan_captured_before_owned_absence_cannot_restore_stale_presence() {
+        let temp = tempfile::tempdir().unwrap();
+        let profiles_dir = temp.path().join(crate::constants::PROFILES_DIR_NAME);
+        std::fs::create_dir(&profiles_dir).unwrap();
+        let config_path = profiles_dir.join("corp.conf");
+        write_test_wireguard_config(&config_path);
+        let profile = VpnProfile {
+            id: profile_id('d'),
+            name: "corp".into(),
+            protocol: Protocol::WireGuard,
+            location: String::new(),
+            config_path,
+            last_used: None,
+        };
+        let session =
+            LocalControlSession::start_profile_test(temp.path(), vec![profile.clone()]).unwrap();
+        let observer = session.service().observer();
+        let absence_at = observer.now_millis();
+        session
+            .runtime()
+            .block_on(observer.observe(Observation::Tunnel {
+                profile_id: profile.id.clone(),
+                active: false,
+                interface_name: None,
+                observed_at_millis: absence_at,
+                protection: None,
+            }))
+            .unwrap();
+        let scan_lifecycle_revision = session.scanner_lifecycle_revision.load(Ordering::SeqCst);
+        session
+            .scanner_lifecycle_revision
+            .fetch_add(1, Ordering::SeqCst);
+
+        session
+            .runtime()
+            .block_on(session.publish_observations_from_revision(
+                crate::core::scanner::ScannerResult {
+                    sessions: vec![ActiveSession {
+                        name: profile.name,
+                        interface: "wg0".into(),
+                        ..ActiveSession::default()
+                    }],
+                    default_route:
+                        crate::vortix_core::ports::route_table::DefaultRouteObservation::ProbeFailed,
+                    tunnel_observation_complete: true,
+                },
+                absence_at.saturating_sub(1),
+                Some(scan_lifecycle_revision),
+            ))
+            .unwrap();
+
+        assert!(session.sessions.lock().unwrap().is_empty());
+        assert!(!session
+            .current_snapshot()
+            .observed
+            .tunnels
+            .get(&profile.id)
+            .is_some_and(|tunnel| tunnel.active));
+    }
+
+    #[test]
+    fn stale_scanner_session_is_not_policy_authority_after_owned_teardown() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = VpnProfile {
+            id: profile_id('d'),
+            name: "corp".into(),
+            protocol: Protocol::WireGuard,
+            location: String::new(),
+            config_path: temp.path().join("corp.conf"),
+            last_used: None,
+        };
+        let sessions = Mutex::new(vec![ActiveSession {
+            name: profile.name.clone(),
+            interface: "wg0".into(),
+            interface_authoritative: true,
+            ..ActiveSession::default()
+        }]);
+        let executor = CanonicalTunnelExecutor::new(
+            CanonicalTunnelSettings {
+                config_dir: temp.path().to_path_buf(),
+                openvpn_verbosity: "3".into(),
+                connect_timeout_secs: 1,
+                wireguard_handshake_timeout_secs: 1,
+                wireguard_health_targets: Vec::new(),
+            },
+            |_| None,
+        );
+
+        assert!(current_owned_session(&profile, &sessions, &executor).is_none());
+    }
+
+    #[test]
+    fn local_session_prunes_compacted_operations_and_deleted_profile_observations() {
+        let temp = tempfile::tempdir().unwrap();
+        let session = LocalControlSession::start_profile_test(temp.path(), Vec::new()).unwrap();
+        let stale_operation = operation_id(99);
+        session
+            .reported_profile_operations
+            .borrow_mut()
+            .insert(stale_operation);
+        session
+            .published_observations
+            .borrow_mut()
+            .insert(profile_id('e'), (true, Some("wg9".into())));
+
+        assert!(session
+            .take_catalog_update(&ControlSnapshot::default())
+            .is_none());
+        session
+            .runtime()
+            .block_on(session.publish_observations_from(
+                crate::core::scanner::ScannerResult {
+                    sessions: Vec::new(),
+                    default_route:
+                        crate::vortix_core::ports::route_table::DefaultRouteObservation::ProbeFailed,
+                    tunnel_observation_complete: true,
+                },
+                0,
+            ))
+            .unwrap();
+
+        assert!(session.reported_profile_operations.borrow().is_empty());
+        assert!(session.published_observations.borrow().is_empty());
+    }
+
+    #[test]
+    fn failed_wireguard_sweep_never_publishes_absence() {
+        let temp = tempfile::tempdir().unwrap();
+        let session = LocalControlSession::start_profile_test(temp.path(), Vec::new()).unwrap();
+        let profile = profile_id('f');
+        session
+            .published_observations
+            .borrow_mut()
+            .insert(profile.clone(), (true, Some("wg0".into())));
+
+        let error = session
+            .runtime()
+            .block_on(session.publish_observations_from(
+                crate::core::scanner::ScannerResult {
+                    sessions: Vec::new(),
+                    default_route:
+                        crate::vortix_core::ports::route_table::DefaultRouteObservation::ProbeFailed,
+                    tunnel_observation_complete: false,
+                },
+                0,
+            ))
+            .unwrap_err();
+
+        assert!(matches!(error, LocalControlError::Observation(_)));
+        assert_eq!(
+            session.published_observations.borrow().get(&profile),
+            Some(&(true, Some("wg0".into())))
         );
     }
 
@@ -3844,7 +4397,7 @@ mod tests {
         assert_eq!(session.prepared_import_count(), 0);
         assert!(session
             .profile_mutations
-            .prepared_topologies
+            .prepared_imports
             .lock()
             .unwrap()
             .is_empty());
@@ -3918,6 +4471,7 @@ mod tests {
             },
             status: OperationStatus::Succeeded,
             result: Some(OperationResult::ObservedConvergence),
+            failure_detail: None,
         };
         let operations = BTreeMap::from([(operation_id.clone(), operation)]);
         assert_eq!(
@@ -3926,20 +4480,6 @@ mod tests {
         );
         assert_eq!(connected_operation(&operations, &target, 8), None);
         assert_eq!(connected_operation(&operations, &other, 7), None);
-    }
-
-    #[test]
-    fn openvpn_recovery_rejects_a_scanner_pid_that_is_not_the_custodian_child() {
-        let session = ActiveSession {
-            pid: Some(43),
-            interface: "tun0".into(),
-            interface_authoritative: true,
-            ..ActiveSession::default()
-        };
-        assert!(!crate::tunnel::standard_openvpn_scanner_pid_matches(
-            session.pid,
-            42,
-        ));
     }
 
     #[test]
@@ -3981,6 +4521,41 @@ mod tests {
             &[],
             &UserCommand::SetKillSwitch {
                 mode: crate::state::KillSwitchMode::Off,
+            },
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn invalid_wireguard_filename_is_rejected_before_control_admission() {
+        let profile = VpnProfile {
+            id: profile_id('a'),
+            name: "07-wireguard-split-ip".into(),
+            protocol: Protocol::WireGuard,
+            location: String::new(),
+            config_path: "/profiles/07-wireguard-split-ip.conf".into(),
+            last_used: None,
+        };
+
+        let error = validate_command_target(
+            std::slice::from_ref(&profile),
+            &BTreeMap::new(),
+            &[],
+            &UserCommand::Connect {
+                profile_id: profile.id.clone(),
+                conflict_acknowledgement: None,
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("1–15 characters"));
+        assert!(error.to_string().contains("import it again"));
+        assert!(validate_command_target(
+            &[profile],
+            &BTreeMap::new(),
+            &[],
+            &UserCommand::Disconnect {
+                profile_id: Some(profile_id('a')),
             },
         )
         .is_ok());

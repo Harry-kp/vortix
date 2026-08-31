@@ -37,6 +37,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(25);
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CustodianHandshake {
     pub identity: ManagedProcessId,
+    /// PID of the private guardian and process-group leader. The protocol
+    /// process is a distinct child within this authenticated group.
     pub pid: u32,
     /// Canonical connect operation that created this child. Legacy receipts
     /// omit it and remain readable, but cannot outlive operation retention.
@@ -383,6 +385,15 @@ pub fn load_handshake(
     }))
 }
 
+/// Prove that an observed protocol PID is contained by this custodian's
+/// private process group. The guardian itself is not a protocol process.
+pub(crate) fn contains_protocol_pid(
+    handshake: &CustodianHandshake,
+    process_id: u32,
+) -> Result<bool, CustodianError> {
+    Ok(crate::vortix_process::real::process_is_nonleader_group_member(process_id, handshake.pid)?)
+}
+
 fn load_receipt(profile_id: &ProfileId) -> Result<Option<OwnershipReceipt>, CustodianError> {
     ensure_runtime_dir()?;
     let path = receipt_path(profile_id);
@@ -453,6 +464,38 @@ pub fn remote_stop(identity: &ManagedProcessId) -> Result<(), CustodianError> {
     Err(CustodianError::Ambiguous(format!(
         "{request}; exact receipt/socket/process-group absence was not proven"
     )))
+}
+
+/// Stop an attempt for which the caller still owns the original handshake.
+///
+/// A short-lived protocol child can exit and let its custodian remove the
+/// receipt before startup polling observes the failure. In that case the
+/// handshake's process-group identity lets the startup owner prove exact
+/// absence instead of misclassifying the already-clean attempt as ambiguous.
+pub(crate) fn remote_stop_after_startup(
+    handshake: &CustodianHandshake,
+) -> Result<(), CustodianError> {
+    match load_receipt(&handshake.identity.profile_id)? {
+        Some(receipt) if constant_time_identity_eq(&receipt.identity, &handshake.identity) => {
+            remote_stop(&handshake.identity)
+        }
+        Some(_) => Err(CustodianError::NotOwned),
+        None => {
+            let deadline = Instant::now() + IPC_TIMEOUT;
+            while Instant::now() < deadline {
+                if !socket_path(&handshake.identity).exists()
+                    && process_group_absent(handshake.pid)?
+                {
+                    return Ok(());
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            Err(CustodianError::Ambiguous(
+                "startup receipt disappeared but exact socket/process-group absence was not proven"
+                    .into(),
+            ))
+        }
+    }
 }
 
 fn process_group_absent(pid: u32) -> Result<bool, CustodianError> {

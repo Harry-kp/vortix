@@ -574,6 +574,7 @@ impl<T: Tunnel> Engine<T> {
             process_ownership,
             teardown_config,
             dns_request,
+            openvpn_routes: None,
         }
     }
 }
@@ -656,6 +657,7 @@ mod tests {
         let teardown = crate::vortix_core::ports::tunnel::TunnelTeardownConfig {
             path: PathBuf::from("/private/tmp/vortix/corp.conf"),
             managed: true,
+            wg_quick_interface: Some("corp".into()),
         };
         engine.seed_connected_state(
             ProfileId::new("corp"),

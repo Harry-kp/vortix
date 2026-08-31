@@ -1,6 +1,7 @@
 //! Strict untrusted receipt wire and authenticated helper-ledger receipts.
 
 use std::collections::HashSet;
+use std::net::IpAddr;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -16,7 +17,8 @@ use crate::vortix_core::privileged::resource::{
     ResourceKind, ResourceObservationTarget, ResourceTag,
 };
 use crate::vortix_core::privileged::{
-    has_duplicates, BoundedVec, CONTRACT_SCHEMA_VERSION, MAX_RESOURCE_ITEMS,
+    has_duplicates, invalid_unicast_ip, BoundedVec, OpenVpnRedirectGateway, OpenVpnRoute,
+    OpenVpnRouteDefaults, OpenVpnRouteGateway, CONTRACT_SCHEMA_VERSION, MAX_RESOURCE_ITEMS,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,6 +72,8 @@ pub struct ResourceObservation {
     observed_at_millis: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     wireguard_peers: Option<Vec<WireGuardPeerObservation>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    openvpn_routes: Option<Box<OpenVpnRouteEvidence>>,
 }
 
 #[derive(Deserialize)]
@@ -80,6 +84,8 @@ struct ResourceObservationWire {
     observed_at_millis: u64,
     #[serde(default)]
     wireguard_peers: Option<BoundedVec<WireGuardPeerObservation, MAX_RESOURCE_ITEMS>>,
+    #[serde(default)]
+    openvpn_routes: Option<OpenVpnRouteEvidence>,
 }
 
 impl<'de> Deserialize<'de> for ResourceObservation {
@@ -93,6 +99,7 @@ impl<'de> Deserialize<'de> for ResourceObservation {
             wire.state,
             wire.observed_at_millis,
             wire.wireguard_peers.map(BoundedVec::into_vec),
+            wire.openvpn_routes,
         )
         .map_err(serde::de::Error::custom)
     }
@@ -104,7 +111,7 @@ impl ResourceObservation {
         state: ObservationState,
         observed_at_millis: u64,
     ) -> Result<Self, ReceiptError> {
-        Self::validate(resource, state, observed_at_millis, None)
+        Self::validate(resource, state, observed_at_millis, None, None)
     }
 
     pub fn with_wireguard_peers(
@@ -113,7 +120,16 @@ impl ResourceObservation {
         observed_at_millis: u64,
         peers: Vec<WireGuardPeerObservation>,
     ) -> Result<Self, ReceiptError> {
-        Self::validate(resource, state, observed_at_millis, Some(peers))
+        Self::validate(resource, state, observed_at_millis, Some(peers), None)
+    }
+
+    pub fn with_openvpn_routes(
+        resource: ResourceTag,
+        state: ObservationState,
+        observed_at_millis: u64,
+        routes: OpenVpnRouteEvidence,
+    ) -> Result<Self, ReceiptError> {
+        Self::validate(resource, state, observed_at_millis, None, Some(routes))
     }
 
     fn validate(
@@ -121,6 +137,7 @@ impl ResourceObservation {
         state: ObservationState,
         observed_at_millis: u64,
         wireguard_peers: Option<Vec<WireGuardPeerObservation>>,
+        openvpn_routes: Option<OpenVpnRouteEvidence>,
     ) -> Result<Self, ReceiptError> {
         if observed_at_millis == 0 {
             return Err(ReceiptError::InvalidObservationTime);
@@ -139,11 +156,19 @@ impl ResourceObservation {
                 return Err(ReceiptError::InvalidPeerEvidence);
             }
         }
+        if openvpn_routes.is_some()
+            && (resource.kind() != ResourceKind::Tunnel
+                || state != ObservationState::Present
+                || wireguard_peers.is_some())
+        {
+            return Err(ReceiptError::InvalidOpenVpnRouteEvidence);
+        }
         Ok(Self {
             resource,
             state,
             observed_at_millis,
             wireguard_peers,
+            openvpn_routes: openvpn_routes.map(Box::new),
         })
     }
 
@@ -165,6 +190,173 @@ impl ResourceObservation {
     #[must_use]
     pub fn wireguard_peers(&self) -> Option<&[WireGuardPeerObservation]> {
         self.wireguard_peers.as_deref()
+    }
+
+    #[must_use]
+    pub fn openvpn_routes(&self) -> Option<&OpenVpnRouteEvidence> {
+        self.openvpn_routes.as_deref()
+    }
+}
+
+/// Complete configured and negotiated `OpenVPN` route evidence for one live
+/// helper-owned tunnel generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OpenVpnRouteEvidence {
+    configured: OpenVpnRouteSetEvidence,
+    pushed: OpenVpnRouteSetEvidence,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    selected_remote: Option<IpAddr>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OpenVpnRouteEvidenceWire {
+    configured: OpenVpnRouteSetEvidence,
+    pushed: OpenVpnRouteSetEvidence,
+    #[serde(default)]
+    selected_remote: Option<IpAddr>,
+}
+
+impl<'de> Deserialize<'de> for OpenVpnRouteEvidence {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = OpenVpnRouteEvidenceWire::deserialize(deserializer)?;
+        Self::new(wire.configured, wire.pushed)
+            .and_then(|evidence| evidence.with_selected_remote(wire.selected_remote))
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+impl OpenVpnRouteEvidence {
+    pub fn new(
+        configured: OpenVpnRouteSetEvidence,
+        pushed: OpenVpnRouteSetEvidence,
+    ) -> Result<Self, ReceiptError> {
+        if configured
+            .routes()
+            .len()
+            .saturating_add(pushed.routes().len())
+            > MAX_RESOURCE_ITEMS
+        {
+            return Err(ReceiptError::CollectionLimit);
+        }
+        Ok(Self {
+            configured,
+            pushed,
+            selected_remote: None,
+        })
+    }
+
+    pub fn with_selected_remote(
+        mut self,
+        selected_remote: Option<IpAddr>,
+    ) -> Result<Self, ReceiptError> {
+        let requires_selected_remote = self
+            .configured
+            .routes()
+            .iter()
+            .chain(self.pushed.routes())
+            .any(|route| route.gateway() == OpenVpnRouteGateway::RemoteHost);
+        if requires_selected_remote != selected_remote.is_some()
+            || selected_remote.as_ref().is_some_and(invalid_unicast_ip)
+        {
+            return Err(ReceiptError::InvalidOpenVpnRouteEvidence);
+        }
+        self.selected_remote = selected_remote;
+        Ok(self)
+    }
+
+    #[must_use]
+    pub const fn configured(&self) -> &OpenVpnRouteSetEvidence {
+        &self.configured
+    }
+
+    #[must_use]
+    pub const fn pushed(&self) -> &OpenVpnRouteSetEvidence {
+        &self.pushed
+    }
+
+    #[must_use]
+    pub const fn selected_remote(&self) -> Option<IpAddr> {
+        self.selected_remote
+    }
+}
+
+/// Route evidence from one explicit origin (configured or negotiated).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OpenVpnRouteSetEvidence {
+    routes: Vec<OpenVpnRoute>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    redirect_gateway: Option<OpenVpnRedirectGateway>,
+    #[serde(default, skip_serializing_if = "OpenVpnRouteDefaults::is_empty")]
+    route_defaults: OpenVpnRouteDefaults,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OpenVpnRouteSetEvidenceWire {
+    routes: BoundedVec<OpenVpnRoute, MAX_RESOURCE_ITEMS>,
+    #[serde(default)]
+    redirect_gateway: Option<OpenVpnRedirectGateway>,
+    #[serde(default)]
+    route_defaults: OpenVpnRouteDefaults,
+}
+
+impl<'de> Deserialize<'de> for OpenVpnRouteSetEvidence {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = OpenVpnRouteSetEvidenceWire::deserialize(deserializer)?;
+        Self::with_route_defaults(
+            wire.routes.into_vec(),
+            wire.redirect_gateway,
+            wire.route_defaults,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+impl OpenVpnRouteSetEvidence {
+    pub fn new(
+        routes: Vec<OpenVpnRoute>,
+        redirect_gateway: Option<OpenVpnRedirectGateway>,
+    ) -> Result<Self, ReceiptError> {
+        Self::with_route_defaults(routes, redirect_gateway, OpenVpnRouteDefaults::default())
+    }
+
+    pub fn with_route_defaults(
+        routes: Vec<OpenVpnRoute>,
+        redirect_gateway: Option<OpenVpnRedirectGateway>,
+        route_defaults: OpenVpnRouteDefaults,
+    ) -> Result<Self, ReceiptError> {
+        bounded(routes.len())?;
+        let mut unique = HashSet::with_capacity(routes.len());
+        if routes.iter().any(|route| !unique.insert(route)) {
+            return Err(ReceiptError::InvalidOpenVpnRouteEvidence);
+        }
+        Ok(Self {
+            routes,
+            redirect_gateway,
+            route_defaults,
+        })
+    }
+
+    #[must_use]
+    pub fn routes(&self) -> &[OpenVpnRoute] {
+        &self.routes
+    }
+
+    #[must_use]
+    pub const fn redirect_gateway(&self) -> Option<&OpenVpnRedirectGateway> {
+        self.redirect_gateway.as_ref()
+    }
+
+    #[must_use]
+    pub const fn route_defaults(&self) -> OpenVpnRouteDefaults {
+        self.route_defaults
     }
 }
 
@@ -335,7 +527,7 @@ impl<'de> Deserialize<'de> for UntrustedReceipt {
     {
         let wire = UntrustedReceiptWire::deserialize(deserializer)?;
         if wire.schema_version != CONTRACT_SCHEMA_VERSION
-            || wire.digest.as_bytes() == [0; 32]
+            || wire.digest.is_zero()
             || wire.operation_id.authority_epoch() != wire.authority_epoch
             || wire.operation_id.sequence() != wire.sequence
         {
@@ -652,6 +844,10 @@ fn validate_outcome(
                 | PrivilegedOperation::ObserveManaged(targets) => {
                     exact_target_observations(targets, observations)
                 }
+                PrivilegedOperation::ObserveManagedAbsence(targets)
+                | PrivilegedOperation::AcknowledgeReleased(targets) => {
+                    exact_target_observation_state(targets, observations, ObservationState::Absent)
+                }
                 PrivilegedOperation::StopTunnel(resource) => exact_observation_state(
                     std::slice::from_ref(resource),
                     observations,
@@ -664,18 +860,24 @@ fn validate_outcome(
                     policy,
                     ..
                 }) => exact_observations(std::slice::from_ref(policy), observations),
+                PrivilegedOperation::AuditPolicy(policy) => {
+                    exact_observations(std::slice::from_ref(policy), observations)
+                }
                 PrivilegedOperation::NetworkPolicy(NetworkPolicyOperation::ReleaseObsolete {
                     policy,
                     resources,
+                    retained_state,
                     ..
                 }) => {
-                    if !observations.iter().any(|item| {
-                        item.resource == *policy && item.state == ObservationState::Present
-                    }) || resources.iter().any(|resource| {
-                        !observations.iter().any(|item| {
-                            item.resource == *resource && item.state == ObservationState::Absent
+                    if !observations
+                        .iter()
+                        .any(|item| item.resource == *policy && item.state == *retained_state)
+                        || resources.iter().any(|resource| {
+                            !observations.iter().any(|item| {
+                                item.resource == *resource && item.state == ObservationState::Absent
+                            })
                         })
-                    }) {
+                    {
                         Err(ReceiptError::MissingRequiredResource)
                     } else {
                         Ok(())
@@ -692,17 +894,28 @@ fn validate_observation_evidence(
     observations: &[ResourceObservation],
 ) -> Result<(), ReceiptError> {
     for observation in observations {
-        let expected = if let PrivilegedOperation::ObserveManaged(targets) = operation {
-            targets.iter().any(|target| {
-                target.resource() == observation.resource()
-                    && target.protocol()
-                        == Some(crate::vortix_core::profile::ProtocolKind::WireGuard)
-                    && observation.state() == ObservationState::Present
-            })
+        let managed_protocol = if let PrivilegedOperation::ObserveManaged(targets) = operation {
+            targets
+                .iter()
+                .find(|target| target.resource() == observation.resource())
+                .filter(|target| target.resource().kind() == ResourceKind::Tunnel)
+                .and_then(ResourceObservationTarget::protocol)
+                .filter(|_| observation.state() == ObservationState::Present)
         } else {
-            false
+            None
         };
-        if observation.wireguard_peers().is_some() != expected {
+        let valid = match managed_protocol {
+            Some(crate::vortix_core::profile::ProtocolKind::WireGuard) => {
+                observation.wireguard_peers().is_some() && observation.openvpn_routes().is_none()
+            }
+            Some(crate::vortix_core::profile::ProtocolKind::OpenVpn) => {
+                observation.wireguard_peers().is_none() && observation.openvpn_routes().is_some()
+            }
+            None => {
+                observation.wireguard_peers().is_none() && observation.openvpn_routes().is_none()
+            }
+        };
+        if !valid {
             return Err(ReceiptError::OutcomeMismatch);
         }
     }
@@ -756,6 +969,9 @@ fn validate_applied(
         PrivilegedOperation::StopTunnel(_)
         | PrivilegedOperation::Observe(_)
         | PrivilegedOperation::ObserveManaged(_)
+        | PrivilegedOperation::ObserveManagedAbsence(_)
+        | PrivilegedOperation::AcknowledgeReleased(_)
+        | PrivilegedOperation::AuditPolicy(_)
         | PrivilegedOperation::CleanupOwned(_) => return Err(ReceiptError::OutcomeMismatch),
         PrivilegedOperation::NetworkPolicy(policy) => {
             if ownership.len() != 1 || ownership[0].resource != *policy.policy_resource() {
@@ -798,6 +1014,19 @@ fn exact_target_observations(
     }
 }
 
+fn exact_target_observation_state(
+    expected: &[ResourceObservationTarget],
+    actual: &[ResourceObservation],
+    state: ObservationState,
+) -> Result<(), ReceiptError> {
+    exact_target_observations(expected, actual)?;
+    if actual.iter().all(|item| item.state == state) {
+        Ok(())
+    } else {
+        Err(ReceiptError::OutcomeMismatch)
+    }
+}
+
 fn exact_observation_state(
     expected: &[ResourceTag],
     actual: &[ResourceObservation],
@@ -835,6 +1064,8 @@ pub enum ReceiptError {
     InvalidObservationTime,
     #[error("WireGuard peer observation evidence is malformed or out of scope")]
     InvalidPeerEvidence,
+    #[error("OpenVPN route observation evidence is malformed or out of scope")]
+    InvalidOpenVpnRouteEvidence,
     #[error("unsupported privileged contract schema version")]
     UnsupportedSchema,
 }

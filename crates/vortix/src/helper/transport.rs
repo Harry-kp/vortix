@@ -125,7 +125,7 @@ fn wait_writable(
 }
 
 pub fn serve_staged_helper() -> Result<(), HelperTransportError> {
-    if unsafe { libc::geteuid() } != 0 {
+    if !crate::utils::is_root() {
         return Err(HelperTransportError::RequiresRoot);
     }
     let layout = PlatformLayout::current().ok_or(HelperTransportError::UnsupportedPlatform)?;
@@ -422,7 +422,6 @@ fn ensure_runtime_root(path: &Path) -> Result<(), HelperTransportError> {
     }
     let metadata = std::fs::symlink_metadata(path)?;
     if !metadata.is_dir()
-        || metadata.file_type().is_symlink()
         || metadata.uid() != 0
         || metadata.permissions().mode() & 0o777 != HELPER_SOCKET_DIR_MODE
     {
@@ -672,6 +671,9 @@ mod tests {
             .then(|| {
                 Box::new(super::super::HelperPolicyInventory::new(None, None, Vec::new()).unwrap())
             });
+        let released_resources = enabled_capabilities
+            .contains(&HelperCapability::Observe)
+            .then(|| Box::new(super::super::HelperReleasedInventory::new(Vec::new()).unwrap()));
         HelperServerHello {
             product: "vortix-helper".into(),
             product_version: env!("CARGO_PKG_VERSION").into(),
@@ -686,6 +688,7 @@ mod tests {
                 next_sequence,
             )),
             policy_inventory,
+            released_resources,
         }
     }
 
@@ -960,6 +963,7 @@ mod tests {
                 vec![HelperCapability::Handshake, HelperCapability::Observe],
             );
             hello.schema = 4;
+            hello.released_resources = None;
             write_response(
                 &mut server_stream,
                 &HelperResponse {
@@ -1353,6 +1357,7 @@ mod tests {
                             HelperEpoch::new(8).unwrap(),
                         )),
                         policy_inventory: None,
+                        released_resources: None,
                     })),
                 },
             )
@@ -1407,6 +1412,7 @@ mod tests {
                             HelperEpoch::new(8).unwrap(),
                         )),
                         policy_inventory: None,
+                        released_resources: None,
                     })),
                 },
             )

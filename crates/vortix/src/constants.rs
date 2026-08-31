@@ -64,6 +64,8 @@ pub const FLIP_ANIMATION_FRAME_MS: u64 = 25;
 
 /// Default primary API endpoint for IP address and ISP lookup.
 pub const DEFAULT_IP_API_PRIMARY: &str = "https://ipinfo.io/json";
+/// HTTPS geolocation fallback queried only when the exact public IP changes.
+pub const DEFAULT_GEOLOCATION_API_FALLBACK: &str = "https://ipwho.is";
 /// Default fallback API 1: ipify.org (IP only, very reliable).
 pub const DEFAULT_IP_API_FALLBACK_1: &str = "https://api.ipify.org";
 /// Default fallback API 2: icanhazip.com (IP only).

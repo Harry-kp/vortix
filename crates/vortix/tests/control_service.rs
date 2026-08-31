@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::Duration;
+use std::time::UNIX_EPOCH;
 
 use vortix::vortix_core::control::{
     AdmissionError, AuthorityEpoch, ChallengeError, Clock, CommandRequest, CompletionError,
@@ -909,6 +910,127 @@ async fn success_requires_every_gate_and_accepts_compatible_newer_evidence() {
     assert_eq!(
         client.snapshot().operations[&third.operation_id].status,
         OperationStatus::WaitingForObservation
+    );
+}
+
+#[tokio::test]
+async fn verified_connect_publishes_the_canonical_last_connected_time() {
+    let clock = Arc::new(FakeClock::default());
+    let connected = profile('a');
+    let started_at = UNIX_EPOCH + Duration::from_secs(80);
+    let service = ControlService::start_with_clock(
+        ControlServiceConfig {
+            known_profiles: [connected.clone()].into_iter().collect(),
+            profile_topologies: [(connected.clone(), ProfileTopology::default())]
+                .into_iter()
+                .collect(),
+            ..config()
+        },
+        clock,
+    );
+    let client = service.client();
+    let observer = service.observer();
+    let completer = service.completer();
+    let admitted = client
+        .submit(request("last-connected", connected.clone(), 100))
+        .await
+        .expect("connect admitted");
+    wait_for_generation(&client, 1).await;
+    observer
+        .observe_batch(vec![
+            Observation::TunnelDetails {
+                profile_id: connected.clone(),
+                details: Box::default(),
+                started_at: Some(started_at),
+                observed_at_millis: 0,
+            },
+            Observation::Tunnel {
+                profile_id: connected.clone(),
+                active: true,
+                interface_name: Some("utun7".to_owned()),
+                observed_at_millis: 0,
+                protection: None,
+            },
+        ])
+        .await
+        .expect("authenticated tunnel observation");
+    assert!(
+        !client.snapshot().last_connected_at.contains_key(&connected),
+        "admission and presence alone must not claim successful use"
+    );
+
+    assert_eq!(
+        completer
+            .complete(OperationCompletion {
+                operation_id: admitted.operation_id,
+                desired_generation: 1,
+                outcome: CompletionOutcome::ObservedSuccess(current_evidence(&client, 0)),
+            })
+            .await,
+        Ok(CompletionResult::Terminal(OperationStatus::Succeeded))
+    );
+    assert_eq!(
+        client.snapshot().last_connected_at.get(&connected),
+        Some(&started_at)
+    );
+}
+
+#[tokio::test]
+async fn failed_connect_does_not_publish_last_connected_time() {
+    let clock = Arc::new(FakeClock::default());
+    let profile_id = profile('b');
+    let service = ControlService::start_with_clock(
+        ControlServiceConfig {
+            known_profiles: [profile_id.clone()].into_iter().collect(),
+            profile_topologies: [(profile_id.clone(), ProfileTopology::default())]
+                .into_iter()
+                .collect(),
+            ..config()
+        },
+        clock,
+    );
+    let admitted = service
+        .client()
+        .submit(request("failed-last-connected", profile_id.clone(), 100))
+        .await
+        .expect("connect admitted");
+    service
+        .observer()
+        .observe_batch(vec![
+            Observation::TunnelDetails {
+                profile_id: profile_id.clone(),
+                details: Box::default(),
+                started_at: Some(UNIX_EPOCH + Duration::from_secs(90)),
+                observed_at_millis: 0,
+            },
+            Observation::Tunnel {
+                profile_id: profile_id.clone(),
+                active: true,
+                interface_name: Some("utun8".to_owned()),
+                observed_at_millis: 0,
+                protection: None,
+            },
+        ])
+        .await
+        .expect("presence observed");
+
+    service
+        .completer()
+        .complete(OperationCompletion {
+            operation_id: admitted.operation_id,
+            desired_generation: 1,
+            outcome: CompletionOutcome::Failed(OperationFailure::ObservationFailed),
+        })
+        .await
+        .expect("failure terminalized");
+
+    assert!(
+        !service
+            .client()
+            .snapshot()
+            .last_connected_at
+            .contains_key(&profile_id),
+        "presence from a failed attempt must not become usage history"
     );
 }
 

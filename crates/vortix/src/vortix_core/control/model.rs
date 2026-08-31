@@ -5,8 +5,11 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
+pub(crate) const MAX_OPERATION_FAILURE_DETAIL_CHARS: usize = 320;
+
 use crate::vortix_core::engine::registry::Conflict;
 use crate::vortix_core::engine::state::{ConnectionHealth, DegradedReason, FailureReason};
+use crate::vortix_core::privileged::OpenVpnRouteEvidence;
 use crate::vortix_core::profile::{ProfileId, ProtocolKind};
 use crate::vortix_core::state::killswitch::KillSwitchMode;
 use crate::vortix_core::state::KillSwitchState;
@@ -251,10 +254,29 @@ pub struct ObservedState {
     #[serde(default)]
     pub wireguard_probe_receipts:
         BTreeMap<ProfileId, Vec<crate::vortix_core::ports::tunnel::ProbeReceipt>>,
+    /// Authenticated `OpenVPN` route truth fenced to the successful tunnel generation.
+    #[serde(default)]
+    pub openvpn_routes: BTreeMap<ProfileId, ObservedOpenVpnRoutes>,
+    /// DNS request authenticated by the completed `OpenVPN` negotiation and
+    /// fenced to the exact successful desired generation.
+    #[serde(default)]
+    pub openvpn_dns: BTreeMap<ProfileId, ObservedOpenVpnDns>,
     /// Ongoing typed health fenced to the successful desired generation.
     /// Snapshot subscribers consume this same record as CLI/TUI projections.
     #[serde(default)]
     pub connection_health: BTreeMap<ProfileId, ObservedConnectionHealth>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservedOpenVpnRoutes {
+    pub desired_generation: u64,
+    pub evidence: OpenVpnRouteEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservedOpenVpnDns {
+    pub desired_generation: u64,
+    pub request: crate::vortix_core::ports::dns::DnsRequest,
 }
 
 /// Generation-consistent ongoing health published by the control owner.
@@ -364,9 +386,16 @@ pub enum OperationStatus {
 pub enum OperationFailure {
     Timeout,
     Rejected,
+    /// The VPN server definitively rejected this profile's authentication.
+    AuthenticationFailed,
+    /// System DNS ownership could not be established, so the control owner
+    /// restored the prior topology instead of leaving networking unusable.
+    DnsPolicyFailed,
     /// A managed `WireGuard` attempt failed its cryptographic liveness gate
     /// after exact-attempt cleanup was confirmed.
     HandshakeFailed,
+    /// The profile cannot be represented safely by its native protocol.
+    InvalidProfile,
     ObservationFailed,
     Internal,
 }
@@ -426,6 +455,10 @@ pub struct OperationRecord {
     pub intent: OperationIntent,
     pub status: OperationStatus,
     pub result: Option<OperationResult>,
+    /// Sanitized platform detail for a failed policy operation. Older
+    /// records omit it; callers must continue to handle the typed result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_detail: Option<String>,
 }
 
 /// Durable completion scope for an admitted operation.

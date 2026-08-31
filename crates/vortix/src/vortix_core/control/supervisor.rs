@@ -2,14 +2,15 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::vortix_core::control::model::{AuthorityEpoch, OperationId, MAX_PROTECTION_AGE_MILLIS};
 use crate::vortix_core::control::persistence::PersistedTombstone;
 use crate::vortix_core::control::worker::{
-    CancellationToken, ControlRevision, PolicyExecutor, PolicyOutcome, PolicyResult, PolicyStage,
-    PolicyWorker, ProfileAdmission, ProfileWorkerPool, TopologyPolicy, TopologyState,
-    TunnelExecutor, TunnelMutation, TunnelRevision, TunnelWork, TunnelWorkResult, WorkFailure,
+    CancellationToken, ControlRevision, PolicyAuditResult, PolicyExecutor, PolicyOutcome,
+    PolicyResult, PolicyStage, PolicyWorker, ProfileAdmission, ProfileWorkerPool, TopologyPolicy,
+    TopologyState, TunnelExecutor, TunnelMutation, TunnelRevision, TunnelWork, TunnelWorkResult,
+    WorkFailure,
 };
 use crate::vortix_core::ports::tunnel::{
     AdoptionEvidence, HandshakeEvidence, ProbeReceipt, TunnelKindTag,
@@ -78,6 +79,7 @@ struct State {
     tombstones: BTreeMap<ProfileId, ProfileSupervision>,
     policy_degraded: Option<WorkFailure>,
     protected: Option<(ControlRevision, OperationId, u64)>,
+    last_policy_audit: Option<(ControlRevision, OperationId, u64)>,
 }
 
 impl State {
@@ -93,6 +95,7 @@ impl State {
             tombstones: BTreeMap::new(),
             policy_degraded: None,
             protected: None,
+            last_policy_audit: None,
         }
     }
 }
@@ -406,6 +409,7 @@ impl Supervisor {
             state.applied_policy = None;
         }
         state.protected = None;
+        state.last_policy_audit = None;
         state.policy_degraded = None;
         Ok(())
     }
@@ -439,6 +443,38 @@ impl Supervisor {
             entry.truth = truth;
         }
         Some(result)
+    }
+
+    /// Retire only the exact failed connect whose worker proved that no
+    /// accepted tunnel effect remains. Ambiguous outcomes keep their ownership
+    /// fence until observation or recovery resolves them.
+    pub(crate) fn retire_definitive_connect_failure(
+        &self,
+        profile_id: &ProfileId,
+        revision: &TunnelRevision,
+        operation_id: &OperationId,
+    ) -> Result<(), WorkFailure> {
+        let mut state = self.state.lock().expect("supervisor mutex poisoned");
+        let exact = state.profiles.get(profile_id).is_some_and(|entry| {
+            entry.revision == *revision
+                && entry.operation_id == *operation_id
+                && entry.mutation == TunnelMutation::Connect
+                && matches!(
+                    entry.truth,
+                    SupervisedTruth::Degraded(
+                        WorkFailure::EffectFailed
+                            | WorkFailure::AuthenticationFailed
+                            | WorkFailure::HandshakeFailed
+                            | WorkFailure::InvalidProfile
+                            | WorkFailure::RouteConflict
+                    )
+                )
+        });
+        if !exact {
+            return Err(WorkFailure::Stale);
+        }
+        state.profiles.remove(profile_id);
+        Ok(())
     }
 
     pub fn poll_policy(&self) -> Option<PolicyResult> {
@@ -493,6 +529,79 @@ impl Supervisor {
             });
         }
         // Worker completion is never protection truth. Only verify_policy can publish.
+        Some(result)
+    }
+
+    /// Queue a read-only refresh before the current protection proof expires.
+    /// Policy mutation work always has priority in the shared worker.
+    pub fn submit_policy_audit_if_due(&self, now_millis: u64) -> Result<bool, WorkFailure> {
+        let mut policy = {
+            let state = self.state.lock().expect("supervisor mutex poisoned");
+            let Some((revision, operation_id, verified_at)) = state.protected.as_ref() else {
+                return Ok(false);
+            };
+            let last_attempt = state
+                .last_policy_audit
+                .as_ref()
+                .filter(|(attempt_revision, attempt_operation, _)| {
+                    attempt_revision == revision && attempt_operation == operation_id
+                })
+                .map_or(*verified_at, |(_, _, attempted_at)| *attempted_at)
+                .max(*verified_at);
+            if last_attempt > now_millis
+                || now_millis.saturating_sub(last_attempt) < MAX_PROTECTION_AGE_MILLIS / 2
+            {
+                return Ok(false);
+            }
+            let policy = state
+                .latest_topology
+                .as_ref()
+                .filter(|policy| {
+                    policy.stage == PolicyStage::Final
+                        && policy.revision() == *revision
+                        && policy.operation_id == *operation_id
+                        && state.applied_policy.as_ref()
+                            == Some(&(revision.clone(), operation_id.clone()))
+                })
+                .cloned()
+                .ok_or(WorkFailure::Stale)?;
+            policy
+        };
+        policy.deadline = Instant::now()
+            .checked_add(Duration::from_millis(MAX_PROTECTION_AGE_MILLIS / 2))
+            .ok_or(WorkFailure::TimedOut)?;
+        let revision = policy.revision();
+        let operation_id = policy.operation_id.clone();
+        match self.policy.submit_audit(policy) {
+            Ok(()) => {
+                self.state
+                    .lock()
+                    .expect("supervisor mutex poisoned")
+                    .last_policy_audit = Some((revision, operation_id, now_millis));
+                Ok(true)
+            }
+            Err(WorkFailure::Busy) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn poll_policy_audit(&self) -> Option<PolicyAuditResult> {
+        let mut result = self.policy.try_audit_result()?;
+        let state = self.state.lock().expect("supervisor mutex poisoned");
+        let exact = state
+            .latest_policy
+            .as_ref()
+            .zip(state.applied_policy.as_ref())
+            .is_some_and(|(latest, applied)| {
+                latest.0 == result.revision
+                    && latest.1 == result.operation_id
+                    && latest.2 == PolicyStage::Final
+                    && applied.0 == result.revision
+                    && applied.1 == result.operation_id
+            });
+        if !exact {
+            result.result = Err(WorkFailure::Stale);
+        }
         Some(result)
     }
 
@@ -606,6 +715,39 @@ impl Supervisor {
             state.tombstones.remove(profile_id);
             self.tunnels.confirm_absence(profile_id);
         }
+        Ok(())
+    }
+
+    /// Clear an exact disconnect fence after current observation proves the
+    /// managed tunnel absent. Restored tombstones have no live profile entry;
+    /// an in-process teardown must first finish before its fence can clear.
+    pub fn confirm_tombstone_absence(
+        &self,
+        profile_id: &ProfileId,
+        revision: &TunnelRevision,
+    ) -> Result<(), WorkFailure> {
+        let mut state = self.state.lock().expect("supervisor mutex poisoned");
+        let exact_tombstone = state
+            .tombstones
+            .get(profile_id)
+            .is_some_and(|entry| entry.revision == *revision);
+        if !exact_tombstone {
+            return Err(WorkFailure::Stale);
+        }
+        if state.profiles.get(profile_id).is_some_and(|entry| {
+            entry.revision != *revision
+                || !matches!(
+                    entry.truth,
+                    SupervisedTruth::WaitingForObservation
+                        | SupervisedTruth::OutcomeUnknown
+                        | SupervisedTruth::Degraded(_)
+                )
+        }) {
+            return Err(WorkFailure::Busy);
+        }
+        state.profiles.remove(profile_id);
+        state.tombstones.remove(profile_id);
+        self.tunnels.confirm_absence(profile_id);
         Ok(())
     }
 

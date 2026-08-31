@@ -26,16 +26,22 @@ fn test_app() -> App {
         engine_handle: None,
         registry: crate::vortix_core::engine::TunnelRegistry::new(),
         control_session: None,
+        control_starting: false,
         control_snapshot: crate::vortix_core::control::ControlSnapshot::default(),
         control_challenge: None,
         last_control_connected_profile: None,
         pending_control_killswitch_mode: None,
+        pending_control_operations: std::collections::BTreeMap::new(),
         control_request_sequence: 0,
+        pending_profile_imports: None,
+        catalog_feedback: None,
+        presented_catalog_revision: None,
         should_quit: false,
         logs_scroll: 0,
         logs_auto_scroll: true,
         logs_max_scroll: 0,
         log_level_filter: None,
+        last_logged_network_quality: crate::state::QualityLevel::Unknown,
         focused_panel: FocusedPanel::Sidebar,
         zoomed_panel: None,
         flip_states: std::collections::HashMap::new(),
@@ -130,6 +136,122 @@ fn canonical_snapshot_is_the_only_source_of_renderer_registry_truth() {
         snapshot.tunnels.into_values().collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn security_dns_status_uses_canonical_policy_readback_not_recursor_identity() {
+    use crate::vortix_core::control::{DnsSecurityStatus, GateEvidence, ProtectionEvidence};
+
+    let mut app = test_app();
+    set_connected(&mut app, "dns-policy");
+    let mut unverified = app.control_snapshot.clone();
+    unverified.dns.status = DnsSecurityStatus::Unverified;
+    app.apply_control_snapshot(unverified);
+    assert_eq!(
+        app.control_snapshot.dns.status,
+        DnsSecurityStatus::Unverified
+    );
+
+    let mut verified = app.control_snapshot.clone();
+    verified.effective.freshness.current = true;
+    verified.observed.evidence = Some(ProtectionEvidence {
+        desired_generation: verified.desired.generation,
+        authority_epoch: verified.desired.authority_epoch,
+        policy_digest: verified.desired.policy_digest.clone(),
+        observed_at_millis: 1,
+        interface: GateEvidence::Verified,
+        route: GateEvidence::Verified,
+        dns: GateEvidence::Verified,
+        firewall: GateEvidence::Verified,
+    });
+    verified.dns.status = DnsSecurityStatus::Protected;
+    app.apply_control_snapshot(verified);
+    assert_eq!(
+        app.control_snapshot.dns.status,
+        DnsSecurityStatus::Protected
+    );
+
+    app.apply_control_snapshot(crate::vortix_core::control::ControlSnapshot::default());
+    assert_eq!(
+        app.control_snapshot.dns.status,
+        DnsSecurityStatus::NotActive
+    );
+}
+
+#[test]
+fn scanner_statistics_refresh_registry_without_nudging_egress_telemetry() {
+    use crate::vortix_core::engine::{Connection, Role};
+    use std::sync::mpsc;
+
+    let mut app = test_app();
+    let (nudge_tx, nudge_rx) = mpsc::channel();
+    app.runtime.telemetry_nudge = Some(nudge_tx);
+    set_connected(&mut app, "primary");
+    nudge_rx
+        .try_recv()
+        .expect("initial connection must refresh egress telemetry");
+
+    let profile_id = crate::vortix_core::profile::ProfileId::new("primary");
+    let mut statistics = app.control_snapshot.clone();
+    let tunnel = statistics.tunnels.get_mut(&profile_id).unwrap();
+    let Connection::Connected { details, .. } = &mut tunnel.state else {
+        panic!("test fixture must be connected");
+    };
+    details.transfer_rx = "12.0 MiB".to_string();
+    details.transfer_tx = "3.0 MiB".to_string();
+    statistics.generation += 1;
+
+    app.apply_control_snapshot(statistics);
+
+    assert_eq!(
+        nudge_rx.try_recv(),
+        Err(mpsc::TryRecvError::Empty),
+        "presentation-only transfer counters must not wake public-IP probes"
+    );
+    let rendered = app.registry.snapshot(&profile_id).unwrap();
+    let Connection::Connected { details, .. } = rendered.state else {
+        panic!("renderer projection must remain connected");
+    };
+    assert_eq!(details.transfer_rx, "12.0 MiB");
+
+    let mut new_path = app.control_snapshot.clone();
+    let tunnel = new_path.tunnels.get_mut(&profile_id).unwrap();
+    tunnel.interface_name = Some("utun8".to_string());
+    let Connection::Connected { details, .. } = &mut tunnel.state else {
+        panic!("test fixture must be connected");
+    };
+    details.interface = "utun8".to_string();
+    new_path.generation += 1;
+
+    app.apply_control_snapshot(new_path);
+
+    nudge_rx
+        .try_recv()
+        .expect("an interface change must refresh egress telemetry");
+
+    set_connected(&mut app, "secondary");
+    nudge_rx
+        .try_recv()
+        .expect("a new active tunnel must refresh egress telemetry");
+
+    let mut primary_handoff = app.control_snapshot.clone();
+    primary_handoff.primary = Some(profile_id.clone());
+    primary_handoff.generation += 1;
+    app.apply_control_snapshot(primary_handoff);
+    nudge_rx
+        .try_recv()
+        .expect("a primary handoff must refresh egress telemetry");
+
+    let mut route_change = app.control_snapshot.clone();
+    route_change.tunnels.get_mut(&profile_id).unwrap().role = Role::Primary {
+        allowed_ips: Vec::new(),
+    };
+    route_change.generation += 1;
+    app.apply_control_snapshot(route_change);
+    nudge_rx
+        .try_recv()
+        .expect("an active route-role change must refresh egress telemetry");
+}
+
 fn set_connected(app: &mut App, name: &str) {
     use crate::vortix_core::control::RequestedTunnelState;
     use crate::vortix_core::engine::{Connection, ConnectionHealth, Role, TunnelSnapshot};
@@ -306,6 +428,36 @@ fn add_profiles(app: &mut App, names: &[&str]) {
         });
     }
 }
+
+fn add_stored_profile(
+    app: &mut App,
+    store: &crate::vortix_config::profile_store::FsProfileStore,
+    directory: &std::path::Path,
+    name: &str,
+) -> crate::vortix_core::profile::ProfileId {
+    static NEXT_TEST_PROFILE_ID: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(1);
+    let sequence = NEXT_TEST_PROFILE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let profile_id = crate::vortix_core::profile::ProfileId::parse(format!("{sequence:064x}"))
+        .expect("test profile ID must be valid");
+    let config_path = directory.join(format!("{name}.conf"));
+    let profile = crate::vortix_core::profile::Profile::new(
+        profile_id.clone(),
+        name,
+        crate::vortix_core::profile::ProtocolKind::WireGuard,
+        config_path.clone(),
+    );
+    crate::vortix_config::profile_store::ProfileStore::insert(store, &profile, b"dummy").unwrap();
+    app.runtime.profiles.push(VpnProfile {
+        id: profile_id.clone(),
+        name: name.to_string(),
+        protocol: Protocol::WireGuard,
+        config_path,
+        location: "Test".to_string(),
+        last_used: None,
+    });
+    profile_id
+}
 // ====================================================================
 // VPN switching tests
 // ====================================================================
@@ -409,120 +561,6 @@ fn test_toggle_while_connecting_is_rejected() {
 // Auth prompt tests
 // ====================================================================
 
-/// Helper: add `OpenVPN` profiles with a temp config file containing auth-user-pass.
-fn add_openvpn_profiles_with_auth(app: &mut App, names: &[&str], dir: &std::path::Path) {
-    let _ = std::fs::create_dir_all(dir);
-    for name in names {
-        let config_path = dir.join(format!("{name}.ovpn"));
-        std::fs::write(
-            &config_path,
-            "client\nremote example.com 1194\nauth-user-pass\ndev tun\nproto udp\n",
-        )
-        .unwrap();
-        app.runtime.profiles.push(VpnProfile {
-            id: crate::vortix_core::profile::ProfileId::new(*name),
-            name: (*name).to_string(),
-            protocol: Protocol::OpenVPN,
-            config_path,
-            location: "Test".to_string(),
-            last_used: None,
-        });
-    }
-}
-
-/// Helper: add `OpenVPN` profiles with a `static-challenge` directive
-/// alongside auth-user-pass.
-fn add_openvpn_profiles_with_static_challenge(
-    app: &mut App,
-    names: &[&str],
-    dir: &std::path::Path,
-) {
-    let _ = std::fs::create_dir_all(dir);
-    for name in names {
-        let config_path = dir.join(format!("{name}.ovpn"));
-        std::fs::write(
-            &config_path,
-            "client\nremote example.com 1194\nauth-user-pass\nstatic-challenge \"Enter TOTP code\" 1\ndev tun\nproto udp\n",
-        )
-        .unwrap();
-        app.runtime.profiles.push(VpnProfile {
-            id: crate::vortix_core::profile::ProfileId::new(*name),
-            name: (*name).to_string(),
-            protocol: Protocol::OpenVPN,
-            config_path,
-            location: "Test".to_string(),
-            last_used: None,
-        });
-    }
-}
-#[test]
-fn test_auth_submit_does_not_reopen_overlay_for_static_challenge_profile() {
-    // Regression for the submit-loop bug discovered after daemon-routed writes landed:
-    // handle_auth_submit calls connect_profile, which (via the
-    // overlay-fires-fix) used to see static_challenge.is_some() and
-    // re-open the auth overlay with an empty OTP — so pressing Enter
-    // appeared to do nothing because the freshly-opened overlay was
-    // then overwritten by the pre-submit values. The fix routes the
-    // post-submit connect through connect_profile_after_auth, which
-    // skips the overlay gate. This test asserts input_mode lands on
-    // Normal (or Connecting) — never on a re-opened AuthPrompt.
-    let mut app = test_app();
-    let tmp = tempfile::Builder::new()
-        .prefix("vortix_auth_")
-        .tempdir()
-        .unwrap();
-    add_openvpn_profiles_with_static_challenge(&mut app, &["mfa-resubmit"], tmp.path());
-    app.runtime.is_root = true;
-    crate::utils::delete_openvpn_auth_file("mfa-resubmit");
-
-    app.handle_message(Message::AuthSubmit {
-        idx: 0,
-        username: "u".to_string(),
-        password: "p".to_string(),
-        otp: Some("123456".to_string()),
-        save: true,
-        connect_after: true,
-    });
-
-    assert!(
-        !matches!(app.input_mode, InputMode::AuthPrompt { .. }),
-        "AuthSubmit must NOT re-open the AuthPrompt overlay for a static-challenge profile; got {:?}",
-        app.input_mode
-    );
-
-    crate::utils::delete_openvpn_auth_file("mfa-resubmit");
-}
-
-#[test]
-fn test_auth_submit_with_otp_no_save_deletes_file() {
-    // : when `save=false` AND `otp=Some(...)`,
-    // the auth file must be deleted after the connect call returns —
-    // OTP is single-use and the user explicitly chose not to persist
-    // credentials.
-    let mut app = test_app();
-    let tmp = tempfile::Builder::new()
-        .prefix("vortix_auth_")
-        .tempdir()
-        .unwrap();
-    add_openvpn_profiles_with_auth(&mut app, &["mfa-no-save-vpn"], tmp.path());
-    app.runtime.is_root = true;
-    crate::utils::delete_openvpn_auth_file("mfa-no-save-vpn");
-
-    app.handle_message(Message::AuthSubmit {
-        idx: 0,
-        username: "u".to_string(),
-        password: "p".to_string(),
-        otp: Some("123456".to_string()),
-        save: false,
-        connect_after: true,
-    });
-
-    assert!(
-        crate::utils::read_openvpn_saved_auth("mfa-no-save-vpn").is_none(),
-        "auth file must be deleted after one-time MFA connect"
-    );
-}
-
 #[test]
 fn test_auth_field_otp_appears_in_tab_cycle_for_static_challenge_profile() {
     // : tab cycle becomes a 4-stop cycle when
@@ -531,13 +569,13 @@ fn test_auth_field_otp_appears_in_tab_cycle_for_static_challenge_profile() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     let mut app = test_app();
     app.input_mode = InputMode::AuthPrompt {
-        profile_idx: 0,
+        profile_id: crate::vortix_core::profile::ProfileId::new("mfa"),
         profile_name: "mfa".to_string(),
-        username: String::new(),
+        username: String::new().into(),
         username_cursor: 0,
-        password: String::new(),
+        password: String::new().into(),
         password_cursor: 0,
-        otp: String::new(),
+        otp: String::new().into(),
         otp_cursor: 0,
         focused_field: AuthField::Username,
         save_credentials: true,
@@ -568,13 +606,13 @@ fn test_auth_field_switching() {
 
     let mut app = test_app();
     app.input_mode = InputMode::AuthPrompt {
-        profile_idx: 0,
+        profile_id: crate::vortix_core::profile::ProfileId::new("test"),
         profile_name: "test".to_string(),
-        username: String::new(),
+        username: String::new().into(),
         username_cursor: 0,
-        password: String::new(),
+        password: String::new().into(),
         password_cursor: 0,
-        otp: String::new(),
+        otp: String::new().into(),
         otp_cursor: 0,
         focused_field: AuthField::Username,
         save_credentials: true,
@@ -614,8 +652,10 @@ fn test_auth_delete_profile_cleans_auth_file() {
         .prefix("vortix_auth_")
         .tempdir()
         .unwrap();
+    let profiles_dir = tmp.path().join(crate::constants::PROFILES_DIR_NAME);
+    std::fs::create_dir(&profiles_dir).unwrap();
     let stable_id = crate::vortix_core::profile::ProfileId::parse("11".repeat(32)).unwrap();
-    let config_path = tmp.path().join("del-vpn.ovpn");
+    let config_path = profiles_dir.join("del-vpn.ovpn");
     let stored = crate::vortix_core::profile::Profile::new(
         stable_id.clone(),
         "del-vpn",
@@ -623,7 +663,7 @@ fn test_auth_delete_profile_cleans_auth_file() {
         config_path.clone(),
     );
     crate::vortix_config::profile_store::ProfileStore::insert(
-        &crate::vortix_config::profile_store::FsProfileStore::new(tmp.path().to_path_buf()),
+        &crate::vortix_config::profile_store::FsProfileStore::new(profiles_dir),
         &stored,
         b"client\nremote example.com 1194\nauth-user-pass\ndev tun\nproto udp\n",
     )
@@ -636,29 +676,44 @@ fn test_auth_delete_profile_cleans_auth_file() {
         location: "Test".to_string(),
         last_used: None,
     });
+    app.runtime.config_dir = tmp.path().to_path_buf();
+    let control = crate::cli::control::LocalControlSession::start_profile_test(
+        tmp.path(),
+        app.runtime.profiles.clone(),
+    )
+    .unwrap();
+    app.attach_control_session(control).unwrap();
     app.profile_list_state.select(Some(0));
 
-    let auth_path =
-        crate::utils::write_openvpn_auth_file(stable_id.as_str(), "user", "pass").unwrap();
-    assert!(auth_path.exists());
+    app.control_session
+        .as_ref()
+        .unwrap()
+        .remember_openvpn_credentials(&stable_id, "user", "pass")
+        .unwrap();
 
     app.confirm_delete(0);
+    // Canonical profile mutations are crash-safe filesystem operations whose
+    // TUI deadline is at least 30 seconds. The test must verify eventual
+    // durable completion, not impose a one-second filesystem performance SLA.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(35);
+    while !app.runtime.profiles.is_empty() && std::time::Instant::now() < deadline {
+        app.process_external();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
 
-    assert!(
-        !auth_path.exists(),
-        "Auth file should be deleted when profile is deleted"
-    );
+    assert!(app.runtime.profiles.is_empty());
+    assert!(app
+        .control_session
+        .as_ref()
+        .unwrap()
+        .load_openvpn_credentials(&stable_id, "del-vpn")
+        .unwrap()
+        .is_none());
 }
 
 // ====================================================================
 // v0.3.0 — "Trustworthy & Alive" tests
 // ====================================================================
-
-// --- Phase 1: DNS leak detection (#46) ---
-//
-// Path-based detection lives in `crate::core::dns_leak::check`; behaviour
-// is covered there. The App-side glue is verified by the panel tests in
-// `crate::ui::dashboard::security` which set `runtime.dns_leak` directly.
 
 // --- Phase 1: Last security check timestamp (#47) ---
 
@@ -697,6 +752,7 @@ fn test_last_security_check_updated_on_ipv6_telemetry() {
     app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIpv6(None)));
 
     assert!(app.runtime.last_security_check.is_some());
+    assert!(app.runtime.last_ipv6_check.is_some());
 }
 
 #[test]
@@ -1340,6 +1396,74 @@ fn test_rename_updates_last_connected_profile() {
 }
 
 #[test]
+fn rename_dialog_keeps_its_profile_when_background_sorting_reorders_the_list() {
+    let mut app = test_app();
+    let directory = tempfile::tempdir().unwrap();
+    let store =
+        crate::vortix_config::profile_store::FsProfileStore::new(directory.path().to_path_buf());
+    let target_id = add_stored_profile(&mut app, &store, directory.path(), "target");
+    let other_id = add_stored_profile(&mut app, &store, directory.path(), "other");
+    app.profile_list_state.select(Some(0));
+
+    app.handle_message(Message::OpenRename);
+    let InputMode::Rename { profile_id, .. } = app.input_mode.clone() else {
+        panic!("rename dialog did not open");
+    };
+    assert_eq!(profile_id, target_id);
+
+    app.runtime.profiles.swap(0, 1);
+    app.rename_profile_by_id(&profile_id, "renamed-target");
+
+    assert_eq!(
+        app.runtime
+            .profiles
+            .iter()
+            .find(|profile| profile.id == target_id)
+            .map(|profile| profile.name.as_str()),
+        Some("renamed-target")
+    );
+    assert_eq!(
+        app.runtime
+            .profiles
+            .iter()
+            .find(|profile| profile.id == other_id)
+            .map(|profile| profile.name.as_str()),
+        Some("other")
+    );
+}
+
+#[test]
+fn delete_dialog_keeps_its_profile_when_background_sorting_reorders_the_list() {
+    let mut app = test_app();
+    let directory = tempfile::tempdir().unwrap();
+    let store =
+        crate::vortix_config::profile_store::FsProfileStore::new(directory.path().to_path_buf());
+    let target_id = add_stored_profile(&mut app, &store, directory.path(), "target-delete");
+    let other_id = add_stored_profile(&mut app, &store, directory.path(), "other-delete");
+    app.profile_list_state.select(Some(0));
+
+    app.request_delete(0);
+    let InputMode::ConfirmDelete { profile_id, .. } = app.input_mode.clone() else {
+        panic!("delete dialog did not open");
+    };
+    assert_eq!(profile_id, target_id);
+
+    app.runtime.profiles.swap(0, 1);
+    app.handle_message(Message::ConfirmDelete);
+
+    assert!(app
+        .runtime
+        .profiles
+        .iter()
+        .all(|profile| profile.id != target_id));
+    assert!(app
+        .runtime
+        .profiles
+        .iter()
+        .any(|profile| profile.id == other_id));
+}
+
+#[test]
 fn test_rename_on_active_profile_is_refused_at_overlay() {
     // Post-P5d the legacy connection_state field is gone, and the
     // rename path no longer mutates an in-flight state. Active
@@ -1368,24 +1492,36 @@ fn test_rename_on_active_profile_is_refused_at_overlay() {
     );
 }
 #[test]
-fn test_ip_unchanged_warning_fires_once() {
+fn repeated_vpn_exit_ip_does_not_report_a_leak() {
     use crate::core::telemetry::TelemetryUpdate;
     let mut app = test_app();
     set_connected(&mut app, "test");
-    app.runtime.public_ip = "1.2.3.4".to_string();
+    app.runtime.real_ip = Some("1.2.3.4".to_string());
+    app.runtime.public_ip = "5.6.7.8".to_string();
 
     app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIp(
-        "1.2.3.4".to_string(),
+        "5.6.7.8".to_string(),
     )));
-    assert!(app.runtime.ip_unchanged_warned, "First warning should fire");
+    assert!(
+        !app.runtime.ip_unchanged_warned,
+        "an unchanged VPN exit is not evidence of an IPv4 leak"
+    );
+}
 
-    let warned_before = app.runtime.ip_unchanged_warned;
+#[test]
+fn public_ip_matching_pre_vpn_ip_reports_a_leak() {
+    use crate::core::telemetry::TelemetryUpdate;
+    let mut app = test_app();
+    set_connected(&mut app, "test");
+    app.runtime.real_ip = Some("1.2.3.4".to_string());
+    app.runtime.public_ip = "5.6.7.8".to_string();
+
     app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIp(
         "1.2.3.4".to_string(),
     )));
     assert!(
-        warned_before && app.runtime.ip_unchanged_warned,
-        "Second identical IP should not change the warning state"
+        app.runtime.ip_unchanged_warned,
+        "a current IPv4 matching the pre-VPN baseline must report a leak"
     );
 }
 
@@ -2144,6 +2280,71 @@ fn canonical_snapshot_retains_last_connected_identity_after_projection_empties()
 }
 
 #[test]
+fn canonical_snapshot_updates_profile_last_connected_time() {
+    let mut app = test_app();
+    add_profiles(&mut app, &["corp"]);
+    let profile_id = app.runtime.profiles[0].id.clone();
+    let connected_at = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_234);
+    app.runtime.profiles[0].last_used = Some(connected_at + std::time::Duration::from_secs(1));
+    let mut snapshot = app.control_snapshot.clone();
+    snapshot.last_connected_at.insert(profile_id, connected_at);
+
+    app.apply_control_snapshot(snapshot);
+
+    assert_eq!(app.runtime.profiles[0].last_used, Some(connected_at));
+}
+
+#[test]
+fn routine_packet_loss_and_jitter_samples_do_not_flood_the_event_log() {
+    use crate::core::telemetry::TelemetryUpdate;
+
+    crate::logger::clear_logs();
+    let mut app = test_app();
+    app.handle_message(Message::Telemetry(TelemetryUpdate::NetworkQuality {
+        latency_ms: 400,
+        packet_loss: 12.3,
+        jitter_ms: 77,
+    }));
+    app.handle_message(Message::Telemetry(TelemetryUpdate::NetworkQuality {
+        latency_ms: 420,
+        packet_loss: 15.0,
+        jitter_ms: 80,
+    }));
+    app.handle_message(Message::Telemetry(TelemetryUpdate::NetworkQuality {
+        latency_ms: 30,
+        packet_loss: 0.0,
+        jitter_ms: 2,
+    }));
+    app.handle_message(Message::Telemetry(TelemetryUpdate::NetworkQuality {
+        latency_ms: 35,
+        packet_loss: 0.0,
+        jitter_ms: 3,
+    }));
+
+    assert!(app.runtime.packet_loss.abs() < f32::EPSILON);
+    assert_eq!(app.runtime.jitter_ms, 3);
+    assert!(crate::logger::get_logs().iter().all(|entry| {
+        !entry.message.contains("Packet loss: 12.3%") && !entry.message.contains("Jitter: 77ms")
+    }));
+    assert_eq!(
+        crate::logger::get_logs()
+            .iter()
+            .filter(|entry| entry.message.contains("Network quality degraded: poor"))
+            .count(),
+        1,
+        "unchanged quality categories must emit at most one log entry"
+    );
+    assert_eq!(
+        crate::logger::get_logs()
+            .iter()
+            .filter(|entry| entry.message.contains("Network quality: excellent"))
+            .count(),
+        1,
+        "recovery and subsequent healthy samples must emit one transition"
+    );
+}
+
+#[test]
 fn rapid_canonical_killswitch_toggles_compose_from_pending_intent() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::create_dir(temp.path().join(crate::constants::PROFILES_DIR_NAME)).unwrap();
@@ -2220,6 +2421,78 @@ fn connect_selected_on_active_profile_enqueues_one_typed_reconnect() {
         );
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
+}
+
+#[test]
+fn canonical_directory_import_drains_more_than_tui_admission_capacity() {
+    const PROFILE_COUNT: usize = 9;
+
+    let temp = tempfile::tempdir().unwrap();
+    let config_dir = temp.path().join("config");
+    let profiles_dir = config_dir.join(crate::constants::PROFILES_DIR_NAME);
+    let source_dir = temp.path().join("imports");
+    std::fs::create_dir_all(&profiles_dir).unwrap();
+    std::fs::create_dir(&source_dir).unwrap();
+    for index in 0..PROFILE_COUNT {
+        std::fs::write(
+            source_dir.join(format!("profile-{index:02}.conf")),
+            format!(
+                "[Interface]\nPrivateKey = abc=\nAddress = 10.0.{index}.2/32\n\n\
+                 [Peer]\nPublicKey = xyz=\nEndpoint = 192.0.2.1:51820\n\
+                 AllowedIPs = 10.{index}.0.0/16\n"
+            ),
+        )
+        .unwrap();
+    }
+    std::fs::write(source_dir.join("invalid.conf"), "not a VPN profile\n").unwrap();
+
+    let control =
+        crate::cli::control::LocalControlSession::start_profile_test(&config_dir, Vec::new())
+            .unwrap();
+    let mut app = test_app();
+    app.runtime.config_dir = config_dir;
+    app.attach_control_session(control).unwrap();
+
+    for _ in 0..8 {
+        assert!(app
+            .issue_control_command(crate::vortix_core::control::UserCommand::SetKillSwitch {
+                mode: crate::state::KillSwitchMode::Off,
+            })
+            .is_some());
+    }
+
+    app.import_profile_from_path(&source_dir.to_string_lossy());
+    assert_eq!(
+        app.pending_profile_imports.as_ref().map(|batch| (
+            batch.remaining.len(),
+            batch.queued,
+            batch.failed
+        )),
+        Some((PROFILE_COUNT + 1, 0, 0))
+    );
+
+    // Nine valid profiles plus the invalid entry exceed the eight-slot TUI
+    // admission bound while keeping the fixture focused on backpressure. Give
+    // the real crash-safe mutation path its documented command-time budget.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(35);
+    while app.runtime.profiles.len() < PROFILE_COUNT && std::time::Instant::now() < deadline {
+        app.process_external();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert_eq!(app.runtime.profiles.len(), PROFILE_COUNT);
+    for index in 0..PROFILE_COUNT {
+        assert!(app
+            .runtime
+            .profiles
+            .iter()
+            .any(|profile| profile.name == format!("profile-{index:02}")));
+    }
+    assert!(!app
+        .runtime
+        .profiles
+        .iter()
+        .any(|profile| profile.name == "invalid"));
+    assert!(app.pending_profile_imports.is_none());
 }
 
 #[test]
@@ -2351,13 +2624,13 @@ fn blank_challenge_input_keeps_overlay_and_challenge_for_retry() {
     let challenge_id = serde_json::from_str("1").unwrap();
     app.control_challenge = Some(challenge_id);
     app.input_mode = InputMode::AuthPrompt {
-        profile_idx: 0,
+        profile_id: crate::vortix_core::profile::ProfileId::new("corp"),
         profile_name: "corp".to_string(),
-        username: "alice".to_string(),
+        username: "alice".into(),
         username_cursor: 5,
-        password: "secret".to_string(),
+        password: "secret".into(),
         password_cursor: 6,
-        otp: String::new(),
+        otp: String::new().into(),
         otp_cursor: 0,
         focused_field: crate::state::AuthField::Otp,
         save_credentials: false,
@@ -2422,13 +2695,13 @@ fn failed_challenge_response_keeps_prompt_for_retry() {
     let challenge_id = serde_json::from_str("1").unwrap();
     app.control_challenge = Some(challenge_id);
     app.input_mode = InputMode::AuthPrompt {
-        profile_idx: 0,
+        profile_id: crate::vortix_core::profile::ProfileId::new("corp"),
         profile_name: "corp".to_string(),
-        username: "alice".to_string(),
+        username: "alice".into(),
         username_cursor: 5,
-        password: "secret".to_string(),
+        password: "secret".into(),
         password_cursor: 6,
-        otp: "123456".to_string(),
+        otp: "123456".into(),
         otp_cursor: 6,
         focused_field: crate::state::AuthField::Otp,
         save_credentials: false,
@@ -2437,16 +2710,95 @@ fn failed_challenge_response_keeps_prompt_for_retry() {
     };
 
     app.handle_message(Message::AuthSubmit {
-        idx: 0,
-        username: "alice".to_string(),
-        password: "secret".to_string(),
-        otp: Some("123456".to_string()),
+        profile_id: crate::vortix_core::profile::ProfileId::new("corp"),
+        username: "alice".into(),
+        password: "secret".into(),
+        otp: Some("123456".into()),
         save: false,
         connect_after: true,
     });
 
     assert_eq!(app.control_challenge, Some(challenge_id));
     assert!(matches!(app.input_mode, InputMode::AuthPrompt { .. }));
+}
+
+#[test]
+fn auth_manager_uses_stable_profile_identity_through_control_session() {
+    let temp = tempfile::tempdir().unwrap();
+    let profiles_dir = temp.path().join(crate::constants::PROFILES_DIR_NAME);
+    std::fs::create_dir(&profiles_dir).unwrap();
+    let profile_id = crate::vortix_core::profile::ProfileId::new("stable-corp");
+    let profile = VpnProfile {
+        id: profile_id.clone(),
+        name: "corp".into(),
+        protocol: Protocol::OpenVPN,
+        config_path: profiles_dir.join("corp.ovpn"),
+        location: String::new(),
+        last_used: None,
+    };
+    std::fs::write(&profile.config_path, "client\nauth-user-pass\n").unwrap();
+    let control = crate::cli::control::LocalControlSession::start_profile_test(
+        temp.path(),
+        vec![profile.clone()],
+    )
+    .unwrap();
+    control
+        .remember_openvpn_credentials(&profile_id, "old-user", "old-password")
+        .unwrap();
+
+    let mut app = test_app();
+    app.runtime.config_dir = temp.path().to_path_buf();
+    app.runtime.profiles = vec![profile.clone()];
+    app.attach_control_session(control).unwrap();
+    app.profile_list_state.select(Some(0));
+    app.handle_message(Message::ManageAuth);
+
+    assert!(matches!(
+        &app.input_mode,
+        InputMode::AuthPrompt {
+            profile_id: prompt_profile_id,
+            username,
+            password,
+            connect_after: false,
+            static_challenge_prompt: None,
+            ..
+        } if prompt_profile_id == &profile_id
+            && username.expose() == "old-user"
+            && password.expose() == "old-password"
+    ));
+
+    let mut other = profile.clone();
+    other.id = crate::vortix_core::profile::ProfileId::new("other-profile");
+    other.name = "other".into();
+    app.runtime.profiles.insert(0, other);
+    app.handle_message(Message::AuthSubmit {
+        profile_id: profile_id.clone(),
+        username: "new-user".into(),
+        password: "new-password".into(),
+        otp: None,
+        save: true,
+        connect_after: false,
+    });
+
+    let loaded = app
+        .control_session
+        .as_ref()
+        .unwrap()
+        .load_openvpn_credentials(&profile_id, "corp")
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded.username(), "new-user");
+    assert_eq!(loaded.password(), "new-password");
+
+    app.profile_list_state.select(Some(1));
+    app.handle_message(Message::ClearAuth);
+    assert!(app
+        .control_session
+        .as_ref()
+        .unwrap()
+        .load_openvpn_credentials(&profile_id, "corp")
+        .unwrap()
+        .is_none());
 }
 
 struct DormantRemoteSubscription;
@@ -2465,6 +2817,114 @@ impl crate::daemon::service::RemoteControlSubscription for DormantRemoteSubscrip
 #[derive(Default)]
 struct RecordingRemoteTransport {
     submitted: std::sync::atomic::AtomicUsize,
+}
+
+#[derive(Default)]
+struct ChallengeAcceptingRemoteTransport {
+    answered: std::sync::atomic::AtomicUsize,
+}
+
+impl crate::daemon::service::RemoteControlTransport for ChallengeAcceptingRemoteTransport {
+    fn exchange(
+        &self,
+        op: crate::vortix_core::ipc::IpcOp,
+    ) -> Result<crate::vortix_core::ipc::IpcResult, crate::daemon::service::RemoteControlError>
+    {
+        match op {
+            crate::vortix_core::ipc::IpcOp::ControlOpen => {
+                Ok(crate::vortix_core::ipc::IpcResult::ControlOpened {
+                    session_id: crate::vortix_core::ipc::RemoteSessionId::parse(format!(
+                        "session-{}",
+                        "3".repeat(32)
+                    ))
+                    .unwrap(),
+                    client_id: serde_json::from_str("\"client-0000000000000001-0000000000000001\"")
+                        .unwrap(),
+                })
+            }
+            crate::vortix_core::ipc::IpcOp::ControlRespondChallenge { .. } => {
+                self.answered
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(crate::vortix_core::ipc::IpcResult::ChallengeAccepted)
+            }
+            other => Err(crate::daemon::service::RemoteControlError::Protocol(
+                format!("unexpected challenge operation: {other:?}"),
+            )),
+        }
+    }
+
+    fn subscribe(
+        &self,
+        _session_id: &crate::vortix_core::ipc::RemoteSessionId,
+    ) -> Result<
+        (
+            Box<dyn crate::daemon::service::RemoteControlSubscription>,
+            crate::vortix_core::control::ControlSnapshot,
+        ),
+        crate::daemon::service::RemoteControlError,
+    > {
+        let challenge_id = serde_json::from_str("9").unwrap();
+        let mut snapshot = crate::vortix_core::control::ControlSnapshot::default();
+        snapshot.challenges.insert(
+            challenge_id,
+            crate::vortix_core::control::ChallengeRecord {
+                id: challenge_id,
+                profile_id: crate::vortix_core::profile::ProfileId::new("challenge-profile"),
+                operation_id: crate::vortix_core::control::OperationId::parse(
+                    "op-0000000000000001-0000000000000009",
+                )
+                .unwrap(),
+                kind: crate::vortix_core::control::ChallengeKind::TwoFactorCode,
+                label: "OTP".into(),
+                authorized_client: serde_json::from_str(
+                    "\"client-0000000000000001-0000000000000001\"",
+                )
+                .unwrap(),
+                created_at_millis: 1,
+                expires_at_millis: u64::MAX,
+            },
+        );
+        Ok((Box::new(DormantRemoteSubscription), snapshot))
+    }
+}
+
+#[test]
+fn challenge_answer_continues_when_remembering_is_unavailable() {
+    let transport = std::sync::Arc::new(ChallengeAcceptingRemoteTransport::default());
+    let remote =
+        crate::daemon::service::RemoteControlSession::open_for_parity(transport.clone()).unwrap();
+    let profile_id = crate::vortix_core::profile::ProfileId::new("challenge-profile");
+    let mut app = test_app();
+    app.runtime.profiles.push(VpnProfile {
+        id: profile_id.clone(),
+        name: "challenge profile".into(),
+        protocol: Protocol::OpenVPN,
+        config_path: std::path::PathBuf::from("challenge-profile.ovpn"),
+        location: String::new(),
+        last_used: None,
+    });
+    app.attach_remote_control_session(remote).unwrap();
+    assert!(matches!(app.input_mode, InputMode::AuthPrompt { .. }));
+
+    app.handle_message(Message::AuthSubmit {
+        profile_id,
+        username: "alice".into(),
+        password: "correct horse".into(),
+        otp: Some("123456".into()),
+        save: true,
+        connect_after: true,
+    });
+
+    assert!(app.control_challenge.is_none());
+    assert!(matches!(app.input_mode, InputMode::Normal));
+    assert!(app.toast.as_ref().is_some_and(|toast| {
+        toast.message.contains("connection can continue") && !toast.message.contains("Internal")
+    }));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while transport.answered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
 }
 
 impl crate::daemon::service::RemoteControlTransport for RecordingRemoteTransport {
@@ -2717,10 +3177,427 @@ fn remote_profile_terminal_failure_is_reported_to_the_user() {
             )),
         }],
     });
+    app.flush_catalog_feedback(true);
 
     let toast = app.toast.as_ref().expect("profile failure must be visible");
     assert_eq!(toast.toast_type, ToastType::Error);
-    assert!(toast.message.contains("Failed(Rejected)"));
+    assert!(toast.message.contains("profile is busy"));
+    assert!(!toast.message.contains("Rejected"));
+}
+
+#[test]
+fn profile_mutation_burst_ends_with_one_aggregate_result() {
+    let mut app = test_app();
+    for revision in 1..=3 {
+        app.apply_local_catalog_update(crate::cli::control::LocalCatalogUpdate {
+            revision,
+            profiles: None,
+            outcomes: vec![if revision == 2 {
+                crate::cli::control::LocalCatalogOutcome::Failed(
+                    crate::vortix_core::control::ProfileMutationFailure::Storage,
+                )
+            } else {
+                crate::cli::control::LocalCatalogOutcome::Applied(
+                    crate::cli::control::LocalProfileMutationReceipt::RemoteApplied {
+                        display_name: Some(format!("profile-{revision}")),
+                    },
+                )
+            }],
+        });
+    }
+    assert!(
+        app.toast.is_none(),
+        "burst should wait for its quiet window"
+    );
+
+    app.flush_catalog_feedback(true);
+
+    let toast = app.toast.as_ref().expect("aggregate result missing");
+    assert_eq!(toast.toast_type, ToastType::Error);
+    assert_eq!(
+        toast.message,
+        "2 profile updates completed; 1 failed. See Event Log."
+    );
+}
+
+#[test]
+fn actions_during_control_startup_explain_the_wait_without_an_error_alarm() {
+    let mut app = test_app();
+    add_profiles(&mut app, &["vpn"]);
+    app.profile_list_state.select(Some(0));
+    app.control_starting = true;
+
+    app.handle_message(Message::ToggleConnect(None));
+
+    let toast = app
+        .toast
+        .as_ref()
+        .expect("startup action must have feedback");
+    assert_eq!(toast.toast_type, ToastType::Info);
+    assert!(toast.message.contains("still starting"));
+}
+
+#[test]
+fn ip_only_refresh_for_same_exit_keeps_known_location() {
+    let mut app = test_app();
+    app.runtime.public_ip = "203.0.113.7".to_string();
+    app.runtime.isp = "Example ISP".to_string();
+    app.runtime.location = "Agra, IN".to_string();
+
+    app.handle_message(Message::Telemetry(
+        crate::core::telemetry::TelemetryUpdate::EgressIdentity(
+            crate::core::telemetry::EgressIdentity {
+                public_ip: "203.0.113.7".to_string(),
+                isp: None,
+                location: None,
+            },
+        ),
+    ));
+
+    assert_eq!(app.runtime.isp, "Example ISP");
+    assert_eq!(app.runtime.location, "Agra, IN");
+}
+
+#[test]
+fn ip_only_refresh_for_changed_exit_clears_stale_location() {
+    let mut app = test_app();
+    app.runtime.public_ip = "203.0.113.7".to_string();
+    app.runtime.isp = "Old ISP".to_string();
+    app.runtime.location = "Agra, IN".to_string();
+
+    app.handle_message(Message::Telemetry(
+        crate::core::telemetry::TelemetryUpdate::EgressIdentity(
+            crate::core::telemetry::EgressIdentity {
+                public_ip: "198.51.100.9".to_string(),
+                isp: None,
+                location: None,
+            },
+        ),
+    ));
+
+    assert_eq!(app.runtime.isp, "Unknown");
+    assert_eq!(app.runtime.location, "Unknown");
+}
+
+#[test]
+fn unavailable_egress_probe_never_replaces_the_real_ip_cache() {
+    let mut app = test_app();
+    app.runtime.scanner_first_tick_done = true;
+    app.runtime.last_kernel_session_count = 0;
+    app.runtime.real_ip = Some("203.0.113.7".to_string());
+
+    app.handle_message(Message::Telemetry(
+        crate::core::telemetry::TelemetryUpdate::EgressUnavailable,
+    ));
+
+    assert_eq!(app.runtime.public_ip, "Unavailable");
+    assert_eq!(app.runtime.real_ip.as_deref(), Some("203.0.113.7"));
+}
+
+#[test]
+fn terminal_dns_policy_failure_is_shown_to_tui_user() {
+    use crate::vortix_core::control::{
+        AuthorityEpoch, ClientId, IdempotencyKey, OperationFailure, OperationId, OperationIntent,
+        OperationRecord, OperationResult, OperationStatus, PolicyDigest,
+    };
+
+    let mut app = test_app();
+    let operation_id = OperationId::from_parts(AuthorityEpoch(1), 4_242);
+    app.track_control_operation(
+        operation_id.clone(),
+        super::connection::PendingControlSubject::Connection,
+    );
+    assert!(
+        app.toast.is_none(),
+        "tracking must not report a stale operation"
+    );
+    let mut snapshot = app.control_snapshot.clone();
+    snapshot.operations.insert(
+        operation_id.clone(),
+        OperationRecord {
+            id: operation_id.clone(),
+            idempotency_key: IdempotencyKey::new("managed-dns-connect"),
+            client_id: ClientId::from_parts(AuthorityEpoch(1), 1),
+            command_digest: PolicyDigest::default(),
+            authority_epoch: AuthorityEpoch(1),
+            desired_generation: 1,
+            admitted_at_millis: 1,
+            deadline_millis: 2,
+            intent: OperationIntent::default(),
+            status: OperationStatus::Failed,
+            result: Some(OperationResult::Failed(OperationFailure::DnsPolicyFailed)),
+            failure_detail: Some("macOS primary DNS is owned by another generation".to_string()),
+        },
+    );
+    assert_eq!(
+        snapshot.operations[&operation_id].failure_detail.as_deref(),
+        Some("macOS primary DNS is owned by another generation")
+    );
+
+    app.apply_control_snapshot(snapshot);
+
+    let toast = app
+        .toast
+        .as_ref()
+        .expect("terminal failure must be visible");
+    assert_eq!(toast.toast_type, ToastType::Error);
+    assert!(toast
+        .message
+        .starts_with("VPN DNS could not be applied safely"));
+    assert!(toast
+        .message
+        .contains("previous network settings were restored"));
+    assert!(
+        toast
+            .message
+            .contains("unfinished DNS state from an earlier connection"),
+        "{}",
+        toast.message
+    );
+
+    app.toast = None;
+    app.apply_control_snapshot(app.control_snapshot.clone());
+    assert!(
+        app.toast.is_none(),
+        "terminal failure must be reported once"
+    );
+}
+
+#[test]
+fn terminal_late_route_conflict_opens_the_existing_confirmation_dialog() {
+    use crate::vortix_core::control::{
+        AuthorityEpoch, ClientId, IdempotencyKey, OperationFailure, OperationId, OperationIntent,
+        OperationRecord, OperationResult, OperationStatus, PolicyDigest, RequestedTunnelState,
+    };
+    use crate::vortix_core::engine::Conflict;
+    use crate::vortix_core::profile::ProfileId;
+
+    let mut app = test_app();
+    add_profiles(&mut app, &["existing", "candidate"]);
+    let existing = ProfileId::new("existing");
+    let candidate = ProfileId::new("candidate");
+    let operation_id = OperationId::from_parts(AuthorityEpoch(1), 47);
+    app.track_control_operation(
+        operation_id.clone(),
+        super::connection::PendingControlSubject::Connection,
+    );
+    let mut snapshot = app.control_snapshot.clone();
+    snapshot.pending_route_conflicts.insert(
+        candidate.clone(),
+        Conflict::DefaultRouteTakeover {
+            current: existing.clone(),
+            new: candidate.clone(),
+        },
+    );
+    snapshot.operations.insert(
+        operation_id.clone(),
+        OperationRecord {
+            id: operation_id,
+            idempotency_key: IdempotencyKey::new("late-route-conflict"),
+            client_id: ClientId::from_parts(AuthorityEpoch(1), 1),
+            command_digest: PolicyDigest::default(),
+            authority_epoch: AuthorityEpoch(1),
+            desired_generation: 1,
+            admitted_at_millis: 1,
+            deadline_millis: 2,
+            intent: OperationIntent::DesiredSubset {
+                tunnels: std::collections::BTreeMap::from([(
+                    candidate.clone(),
+                    RequestedTunnelState::Connected,
+                )]),
+                kill_switch: None,
+            },
+            status: OperationStatus::Failed,
+            result: Some(OperationResult::Failed(OperationFailure::Rejected)),
+            failure_detail: None,
+        },
+    );
+
+    app.apply_control_snapshot(snapshot);
+
+    assert!(matches!(
+        app.input_mode,
+        InputMode::ConfirmDefaultRouteTakeover {
+            ref from,
+            ref to_profile_id,
+            ref to_name,
+            ..
+        } if from == "existing" && to_profile_id == &candidate && to_name == "candidate"
+    ));
+    assert!(
+        app.toast.is_none(),
+        "the dialog replaces a generic failure toast"
+    );
+}
+
+#[test]
+fn terminal_authentication_failure_is_shown_to_tui_user() {
+    use crate::vortix_core::control::{
+        AuthorityEpoch, ClientId, IdempotencyKey, OperationFailure, OperationId, OperationIntent,
+        OperationRecord, OperationResult, OperationStatus, PolicyDigest,
+    };
+
+    let mut app = test_app();
+    let operation_id = OperationId::from_parts(AuthorityEpoch(1), 43);
+    app.track_control_operation(
+        operation_id.clone(),
+        super::connection::PendingControlSubject::Connection,
+    );
+    let mut snapshot = app.control_snapshot.clone();
+    snapshot.operations.insert(
+        operation_id.clone(),
+        OperationRecord {
+            id: operation_id,
+            idempotency_key: IdempotencyKey::new("rejected-openvpn-auth"),
+            client_id: ClientId::from_parts(AuthorityEpoch(1), 1),
+            command_digest: PolicyDigest::default(),
+            authority_epoch: AuthorityEpoch(1),
+            desired_generation: 1,
+            admitted_at_millis: 1,
+            deadline_millis: 2,
+            intent: OperationIntent::default(),
+            status: OperationStatus::Failed,
+            result: Some(OperationResult::Failed(
+                OperationFailure::AuthenticationFailed,
+            )),
+            failure_detail: None,
+        },
+    );
+
+    app.apply_control_snapshot(snapshot);
+
+    let toast = app
+        .toast
+        .as_ref()
+        .expect("authentication failure must be visible");
+    assert_eq!(toast.toast_type, ToastType::Error);
+    assert!(toast.message.contains("VPN server rejected this profile"));
+    assert!(toast
+        .message
+        .contains("certificate or username and password"));
+}
+
+#[test]
+fn invalid_wireguard_name_is_shown_as_an_actionable_terminal_error() {
+    use crate::vortix_core::control::{
+        AuthorityEpoch, ClientId, IdempotencyKey, OperationFailure, OperationId, OperationIntent,
+        OperationRecord, OperationResult, OperationStatus, PolicyDigest,
+    };
+
+    let mut app = test_app();
+    let operation_id = OperationId::from_parts(AuthorityEpoch(1), 44);
+    app.track_control_operation(
+        operation_id.clone(),
+        super::connection::PendingControlSubject::Connection,
+    );
+    let mut snapshot = app.control_snapshot.clone();
+    snapshot.operations.insert(
+        operation_id.clone(),
+        OperationRecord {
+            id: operation_id,
+            idempotency_key: IdempotencyKey::new("invalid-wireguard-name"),
+            client_id: ClientId::from_parts(AuthorityEpoch(1), 1),
+            command_digest: PolicyDigest::default(),
+            authority_epoch: AuthorityEpoch(1),
+            desired_generation: 1,
+            admitted_at_millis: 1,
+            deadline_millis: 2,
+            intent: OperationIntent::default(),
+            status: OperationStatus::Failed,
+            result: Some(OperationResult::Failed(OperationFailure::InvalidProfile)),
+            failure_detail: None,
+        },
+    );
+
+    app.apply_control_snapshot(snapshot);
+
+    let toast = app.toast.as_ref().expect("invalid profile must be visible");
+    assert_eq!(toast.toast_type, ToastType::Error);
+    assert!(toast.message.contains("invalid filename"));
+    assert!(toast.message.contains("1–15 characters"));
+    assert!(toast.message.contains("import it again"));
+}
+
+#[test]
+fn terminal_wireguard_handshake_failure_explains_the_owned_retry() {
+    use crate::vortix_core::control::{
+        AuthorityEpoch, ClientId, IdempotencyKey, OperationFailure, OperationId, OperationIntent,
+        OperationRecord, OperationResult, OperationStatus, PolicyDigest,
+    };
+
+    let mut app = test_app();
+    let operation_id = OperationId::from_parts(AuthorityEpoch(1), 45);
+    app.track_control_operation(
+        operation_id.clone(),
+        super::connection::PendingControlSubject::Connection,
+    );
+    let mut snapshot = app.control_snapshot.clone();
+    snapshot.operations.insert(
+        operation_id.clone(),
+        OperationRecord {
+            id: operation_id,
+            idempotency_key: IdempotencyKey::new("wireguard-handshake-failed"),
+            client_id: ClientId::from_parts(AuthorityEpoch(1), 1),
+            command_digest: PolicyDigest::default(),
+            authority_epoch: AuthorityEpoch(1),
+            desired_generation: 7,
+            admitted_at_millis: 1,
+            deadline_millis: 2,
+            intent: OperationIntent::default(),
+            status: OperationStatus::Failed,
+            result: Some(OperationResult::Failed(OperationFailure::HandshakeFailed)),
+            failure_detail: None,
+        },
+    );
+    let recovery_id = OperationId::from_parts(AuthorityEpoch(1), 46);
+    snapshot.operations.insert(
+        recovery_id.clone(),
+        OperationRecord {
+            id: recovery_id.clone(),
+            idempotency_key: IdempotencyKey::new("service-recovery-7-2"),
+            client_id: ClientId::from_parts(AuthorityEpoch(1), 0),
+            command_digest: PolicyDigest::default(),
+            authority_epoch: AuthorityEpoch(1),
+            desired_generation: 7,
+            admitted_at_millis: 2,
+            deadline_millis: 30_002,
+            intent: OperationIntent::default(),
+            status: OperationStatus::WaitingForObservation,
+            result: None,
+            failure_detail: None,
+        },
+    );
+
+    app.apply_control_snapshot(snapshot);
+
+    let toast = app
+        .toast
+        .as_ref()
+        .expect("the user must be told that a retry is in progress");
+    assert_eq!(toast.toast_type, ToastType::Warning);
+    assert!(toast
+        .message
+        .contains("No WireGuard handshake was received"));
+    assert!(toast.message.contains("retrying once"));
+
+    let mut retry_failed = app.control_snapshot.clone();
+    let recovery = retry_failed
+        .operations
+        .get_mut(&recovery_id)
+        .expect("recovery operation missing");
+    recovery.status = OperationStatus::Failed;
+    recovery.result = Some(OperationResult::Failed(OperationFailure::HandshakeFailed));
+    app.apply_control_snapshot(retry_failed);
+
+    let toast = app
+        .toast
+        .as_ref()
+        .expect("terminal recovery failure must be visible");
+    assert_eq!(toast.toast_type, ToastType::Error);
+    assert!(toast
+        .message
+        .contains("No WireGuard handshake was received"));
+    assert!(!toast.message.contains("retrying once"));
 }
 
 #[test]

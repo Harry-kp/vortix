@@ -9,7 +9,6 @@ use std::path::Path;
 use std::time::Duration;
 
 use serde::Serialize;
-use zeroize::Zeroize;
 
 use crate::cli::args::{BackgroundCommands, Commands};
 use crate::cli::output::{
@@ -26,6 +25,34 @@ use crate::vpn_runtime::VpnRuntime;
 /// Leaves the actor enough time to persist and publish a settled protocol
 /// result after the protocol gate and its configured teardown budget.
 const CONTROL_COMPLETION_GRACE_SECS: u64 = 5;
+fn lifecycle_progress_message(
+    mode: OutputMode,
+    action: &str,
+    profile: &str,
+    protocol: Option<&str>,
+    timeout_secs: u64,
+) -> Option<String> {
+    if mode != OutputMode::Human {
+        return None;
+    }
+    let protocol = protocol.map_or_else(String::new, |value| format!(" ({value})"));
+    Some(format!(
+        "◐ {action} {profile}{protocol} — verifying the tunnel and network policy; this may take up to {timeout_secs}s (Ctrl-C cancels)…"
+    ))
+}
+
+fn show_lifecycle_progress(
+    mode: OutputMode,
+    action: &str,
+    profile: &str,
+    protocol: Option<&str>,
+    timeout_secs: u64,
+) {
+    if let Some(message) = lifecycle_progress_message(mode, action, profile, protocol, timeout_secs)
+    {
+        eprintln!("{message}");
+    }
+}
 
 fn connect_operation_timeout_secs(
     explicit: Option<u64>,
@@ -874,10 +901,18 @@ fn handle_up(
         .validate(&command)
         .unwrap_or_else(|error| local_control_error_or_exit(mode, "up", &error));
 
-    validate_openvpn_static_challenge_credentials(&target)
+    validate_openvpn_static_challenge_credentials(&control, &target)
         .unwrap_or_else(|(error, exit)| print_error_and_exit(mode, "up", error, exit));
 
     let challenge_profiles = engine.profiles.clone();
+    let protocol = target.protocol.to_string();
+    show_lifecycle_progress(
+        mode,
+        "Connecting",
+        &target.name,
+        Some(&protocol),
+        timeout_secs,
+    );
     let result = control.run_with_challenges(
         command,
         Duration::from_secs(timeout_secs),
@@ -1028,12 +1063,12 @@ fn local_control_error_category(
 
 fn operation_failure(
     action: &str,
-    outcome: &impl crate::cli::control::ControlOperationOutcomeView,
+    outcome: &crate::cli::control::ClientOperationOutcome,
 ) -> (&'static str, ExitCode, String) {
     use crate::vortix_core::control::{OperationFailure, OperationResult, OperationStatus};
 
-    let operation = outcome.operation_id();
-    match (outcome.status(), outcome.result()) {
+    let operation = &outcome.operation_id;
+    match (outcome.status, outcome.result.as_ref()) {
         (_, Some(OperationResult::ProfileMutationAppliedAfterDeadline)) => (
             "completed_after_deadline",
             ExitCode::Timeout,
@@ -1056,6 +1091,13 @@ fn operation_failure(
             "connect_failed",
             ExitCode::GeneralError,
             format!("WireGuard handshake failed for operation {operation}"),
+        ),
+        (_, Some(OperationResult::Failed(OperationFailure::AuthenticationFailed))) => (
+            "authentication_failed",
+            ExitCode::GeneralError,
+            format!(
+                "The VPN server rejected this profile's authentication for operation {operation}"
+            ),
         ),
         (OperationStatus::Cancelled, _) | (_, Some(OperationResult::Cancelled)) => (
             "user_cancelled",
@@ -1125,6 +1167,7 @@ fn detect_conflict_for_cli(
 }
 
 fn validate_openvpn_static_challenge_credentials(
+    control: &crate::cli::control::ClientControlSession,
     profile: &crate::state::VpnProfile,
 ) -> Result<(), (CliError, ExitCode)> {
     let Some(prompt_text) =
@@ -1132,9 +1175,22 @@ fn validate_openvpn_static_challenge_credentials(
     else {
         return Ok(());
     };
-    let Some((mut user, mut pass)) =
-        crate::utils::read_openvpn_saved_auth_compat(profile.id.as_str(), &profile.name)
-    else {
+    let credentials = control
+        .load_openvpn_credentials(&profile.id, &profile.name)
+        .map_err(|error| {
+            (
+                CliError {
+                    code: "credential_unavailable",
+                    message: format!(
+                        "Saved credentials for '{}' couldn't be used: {error}",
+                        profile.name
+                    ),
+                    hint: Some("Open the TUI Auth Manager and enter the credentials again.".into()),
+                },
+                ExitCode::PermissionDenied,
+            )
+        })?;
+    let Some(_credentials) = credentials else {
         return Err((
             CliError {
                 code: "auth_required",
@@ -1149,8 +1205,6 @@ fn validate_openvpn_static_challenge_credentials(
             ExitCode::PermissionDenied,
         ));
     };
-    user.zeroize();
-    pass.zeroize();
     Ok(())
 }
 
@@ -1279,6 +1333,13 @@ fn handle_down(
             profile_id: profile_id.clone(),
         }
     };
+    show_lifecycle_progress(
+        mode,
+        "Disconnecting",
+        profile_filter.unwrap_or("active VPNs"),
+        None,
+        config.disconnect_timeout,
+    );
     let result = control.run(
         command,
         Duration::from_secs(config.disconnect_timeout),
@@ -1458,7 +1519,7 @@ fn handle_reconnect(
             .iter()
             .find(|profile| &profile.name == name)
             .expect("reconnect target exists");
-        validate_openvpn_static_challenge_credentials(profile)
+        validate_openvpn_static_challenge_credentials(&control, profile)
             .unwrap_or_else(|(error, exit)| print_error_and_exit(mode, "reconnect", error, exit));
     }
     let challenge_profiles = engine.profiles.clone();
@@ -2015,6 +2076,46 @@ mod handshake_status_tests {
             human_status_headline(&snapshot("connecting", "OpenVPN")),
             "◐ Connecting to corp (OpenVPN)"
         );
+    }
+
+    #[test]
+    fn lifecycle_progress_explains_silent_verification_without_spamming() {
+        assert_eq!(
+            lifecycle_progress_message(
+                OutputMode::Human,
+                "Connecting",
+                "wg13",
+                Some("WireGuard"),
+                60,
+            ),
+            Some("◐ Connecting wg13 (WireGuard) — verifying the tunnel and network policy; this may take up to 60s (Ctrl-C cancels)…".into())
+        );
+        assert_eq!(
+            lifecycle_progress_message(
+                OutputMode::Human,
+                "Disconnecting",
+                "wg12",
+                None,
+                30,
+            ),
+            Some("◐ Disconnecting wg12 — verifying the tunnel and network policy; this may take up to 30s (Ctrl-C cancels)…".into())
+        );
+        assert!(lifecycle_progress_message(
+            OutputMode::Json,
+            "Connecting",
+            "wg13",
+            Some("WireGuard"),
+            60,
+        )
+        .is_none());
+        assert!(lifecycle_progress_message(
+            OutputMode::Quiet,
+            "Connecting",
+            "wg13",
+            Some("WireGuard"),
+            60,
+        )
+        .is_none());
     }
 
     #[test]
@@ -3425,7 +3526,7 @@ mod tests {
 
     #[test]
     fn late_profile_mutation_cli_result_forbids_a_blind_retry() {
-        let outcome = crate::cli::control::LocalOperationOutcome {
+        let outcome = crate::cli::control::ClientOperationOutcome {
             operation_id: serde_json::from_str("\"op-0000000000000001-0000000000000001\"").unwrap(),
             status: crate::vortix_core::control::OperationStatus::Expired,
             result: Some(
@@ -3481,6 +3582,41 @@ mod tests {
         let (code, exit) = local_control_error_category(&unauthorized);
         assert_eq!(code, "control_failed");
         assert_eq!(exit.code(), ExitCode::GeneralError.code());
+    }
+
+    #[test]
+    fn static_challenge_preflight_uses_live_credential_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let profiles_dir = temp.path().join(constants::PROFILES_DIR_NAME);
+        std::fs::create_dir(&profiles_dir).unwrap();
+        let profile = crate::state::VpnProfile {
+            id: crate::vortix_core::profile::ProfileId::new("cli-static-challenge"),
+            name: "CLI MFA".into(),
+            protocol: crate::state::Protocol::OpenVPN,
+            config_path: profiles_dir.join("cli-mfa.ovpn"),
+            location: String::new(),
+            last_used: None,
+        };
+        std::fs::write(
+            &profile.config_path,
+            "client\nauth-user-pass\nstatic-challenge \"Enter OTP\" 1\n",
+        )
+        .unwrap();
+        let local = crate::cli::control::LocalControlSession::start_profile_test(
+            temp.path(),
+            vec![profile.clone()],
+        )
+        .unwrap();
+        let control = crate::cli::control::ClientControlSession::standard(local);
+
+        let missing = validate_openvpn_static_challenge_credentials(&control, &profile)
+            .expect_err("missing reusable credentials must require Auth Manager");
+        assert_eq!(missing.0.code, "auth_required");
+
+        control
+            .remember_openvpn_credentials(&profile.id, "alice", "base-password")
+            .unwrap();
+        validate_openvpn_static_challenge_credentials(&control, &profile).unwrap();
     }
 
     #[test]

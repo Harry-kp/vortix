@@ -11,6 +11,7 @@ use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::helper::child_evidence::MAX_CHILD_EVIDENCE_BYTES;
 use crate::helper::runtime::HelperRuntimeIdentity;
 use crate::helper::server::{
     ObservationError, ObservationExecutor, ObservationOutcome, ObservationScope,
@@ -24,7 +25,6 @@ use crate::vortix_core::privileged::{
 use crate::vortix_core::profile::ProtocolKind;
 
 pub(crate) const MAX_INTERFACE_EVIDENCE_BYTES: u64 = 64;
-const MAX_CHILD_EVIDENCE_BYTES: u64 = 4 * 1024;
 
 /// Production read-back executor. It accepts only fixed identities derived
 /// from the authenticated lease and resource tag.

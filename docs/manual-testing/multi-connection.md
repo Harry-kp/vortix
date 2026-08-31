@@ -3,9 +3,9 @@
 12 scenarios that exercise every branch of the multi-tunnel state-authority contract
 (see `docs/brainstorms/2026-06-01-multi-tunnel-state-authority-requirements.md`).
 Each row names the setup and the per-surface expected output. Run them on a real
-macOS host with at least two openvpn test droplets available (via
-`scripts/test-infra.sh up ovpn-cert ovpn-auth`) and one split-only profile (a
-WireGuard `wg-split` or an OpenVPN profile with explicit non-default routes only).
+macOS host with the one-droplet compatibility lab available (run
+`scripts/vpn-lab.sh up`) and import its profiles. Use `01`/`03`/`05` or `wg08`/`wg11`
+as full-tunnel profiles and `02`/`04`/`06`/`wg07` as split-only profiles.
 
 **Terminology**:
 - **F1**, **F2**, **F1'** — full-tunnel profiles (client config has `redirect-gateway`

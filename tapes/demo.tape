@@ -8,14 +8,17 @@
 # Records ~70 s; output lands at assets/demo.gif.
 #
 # Prerequisites (one-time setup before recording):
-#   1. Spin up at least one test VPN:        ./scripts/test-infra.sh up wg-full
-#   2. Import the profile(s) into vortix:    ./scripts/test-infra.sh import
+#   1. Create the one-droplet lab:            ./scripts/vpn-lab.sh up
+#   2. From its printed profile directory, copy wg08.conf to wg-full.conf,
+#      wg07.conf to wg-split.conf, wg14.conf to wg-dns-leak.conf, and
+#      04-openvpn-tcp-static-challenge.ovpn to ovpn-totp.ovpn in the clean
+#      demo profile directory, then import that directory into vortix.
 #   3. Configure sudo NOPASSWD for vortix    (see README "Linux: setting up sudo access")
 #      — without this the tape stalls at the password prompt.
 #   4. Render the tape:                      vhs tapes/demo.tape
 #
 # After recording, optionally tear the test infra back down:
-#   ./scripts/test-infra.sh down
+#   ./scripts/vpn-lab.sh down
 
 Output assets/demo.gif
 

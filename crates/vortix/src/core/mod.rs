@@ -7,8 +7,8 @@
 
 #![allow(unused_imports)]
 
-pub mod dns_leak;
 pub mod dns_policy;
+pub mod dns_protection;
 pub mod downloader;
 pub mod icmp;
 pub mod importer;

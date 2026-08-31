@@ -244,11 +244,11 @@ fn systemd_containment_matches(bytes: &[u8], owner_uid: u32) -> bool {
     let Ok(text) = std::str::from_utf8(bytes) else {
         return false;
     };
-    let expected = format!("/vortix-daemon@{owner_uid}.service");
+    let expected = format!("/system.slice/vortix-daemon@{owner_uid}.service");
     text.lines().any(|line| {
         line.split_once(':')
             .and_then(|(_, rest)| rest.split_once(':'))
-            .is_some_and(|(_, path)| path.ends_with(&expected))
+            .is_some_and(|(_, path)| path == expected)
     })
 }
 
@@ -286,7 +286,6 @@ const fn decode_hex(byte: u8) -> Option<u8> {
 fn verify_root_owned_service_definition(path: &Path) -> Result<(), PlatformIdentityError> {
     let metadata = std::fs::symlink_metadata(path)?;
     if !metadata.is_file()
-        || metadata.file_type().is_symlink()
         || metadata.uid() != 0
         || metadata.mode() & 0o022 != 0
         || metadata.nlink() != 1
@@ -341,6 +340,10 @@ mod tests {
         ));
         assert!(!systemd_containment_matches(
             b"0::/user.slice/vortix-daemon@501.service.evil\n",
+            501
+        ));
+        assert!(!systemd_containment_matches(
+            b"0::/user.slice/user-501.slice/user@501.service/app.slice/vortix-daemon@501.service\n",
             501
         ));
         assert!(!systemd_containment_matches(

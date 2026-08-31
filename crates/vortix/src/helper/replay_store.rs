@@ -10,9 +10,7 @@ use thiserror::Error;
 use super::root_store::{RootOwnedJsonStore, RootStoreError};
 use super::server::HelperLedgerStore;
 use super::PlatformLayout;
-use crate::vortix_core::privileged::{HelperLedgerRecord, ReplayBaseline};
-
-const MAX_HELPER_LEDGER_BYTES: u64 = 64 * 1024;
+use crate::vortix_core::privileged::{HelperLedgerRecord, ReplayBaseline, MAX_HELPER_LEDGER_BYTES};
 
 /// Filesystem-backed replay store rooted in the package-created helper data
 /// directory. Production construction requires UID 0; tests can exercise the

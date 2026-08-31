@@ -80,6 +80,32 @@ impl Cidr {
         matches!(self.addr, IpAddr::V6(_))
     }
 
+    /// Return this CIDR with every host bit cleared.
+    ///
+    /// Security boundaries use this to reject aliases such as
+    /// `10.1.2.3/8` when an exact kernel-network identity is required.
+    #[must_use]
+    pub fn canonical_network(self) -> Self {
+        let addr = match self.addr {
+            IpAddr::V4(address) => {
+                let mask = u32::MAX
+                    .checked_shl(u32::from(32 - self.prefix_len))
+                    .unwrap_or(0);
+                IpAddr::V4((u32::from(address) & mask).into())
+            }
+            IpAddr::V6(address) => {
+                let mask = u128::MAX
+                    .checked_shl(u32::from(128 - self.prefix_len))
+                    .unwrap_or(0);
+                IpAddr::V6((u128::from(address) & mask).into())
+            }
+        };
+        Self {
+            addr,
+            prefix_len: self.prefix_len,
+        }
+    }
+
     /// Whether this CIDR block intersects (shares any addresses with)
     /// `other`. Two blocks intersect when their common-prefix bits
     /// match — every address in the smaller block is contained in the
@@ -474,6 +500,11 @@ mod tests {
         // 10.0.0.5/8 should be treated identically to 10.0.0.0/8 — the host
         // bits don't affect aggregation.
         assert!(!claims_default_route_v4(&[v4("10.0.0.5/8")]));
+        assert_eq!(v4("10.1.2.3/8").canonical_network(), v4("10.0.0.0/8"));
+        assert_eq!(
+            v6("2001:db8::beef/32").canonical_network(),
+            v6("2001:db8::/32")
+        );
     }
 
     #[test]

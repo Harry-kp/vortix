@@ -185,6 +185,20 @@ pub fn disable_blocking() -> Result<()> {
         .disable_blocking()
 }
 
+/// Read back the exact requested blocking policy without mutating it.
+pub fn verify_blocking(active: &[ActiveTunnelInfo]) -> Result<()> {
+    crate::platform::current_platform()
+        .killswitch
+        .verify_blocking(active)
+}
+
+/// Prove that no Vortix-owned firewall policy remains without mutating it.
+pub fn verify_disabled() -> Result<()> {
+    crate::platform::current_platform()
+        .killswitch
+        .verify_disabled()
+}
+
 /// Get the state file path.
 fn get_state_path() -> Option<PathBuf> {
     utils::get_app_config_dir()

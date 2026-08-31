@@ -82,8 +82,8 @@ impl RootEnrollmentRecord {
             || self.generation == 0
             || self.owner_uid == 0
             || self.manifest_generation == 0
-            || self.manifest_digest.as_bytes() == [0; 32]
-            || self.request_nonce_digest.as_bytes() == [0; 32]
+            || self.manifest_digest.is_zero()
+            || self.request_nonce_digest.is_zero()
             || !matches!(
                 (self.layout, self.channel),
                 (PlatformLayout::Linux, PackageChannel::DistroPackage)
@@ -109,7 +109,7 @@ impl RootEnrollmentRecord {
                 if authority_epoch.0 == 0
                     || authority_epoch != self.last_authority_epoch
                     || boot_scope == BootScope::new([0; 16])
-                    || lease_id == LeaseId::new([0; 32])
+                    || lease_id.is_zero()
                     || manager_instance_nonce == [0; 32]
                 {
                     return Err(EnrollmentStoreError::Corrupt);
@@ -291,7 +291,7 @@ impl RootEnrollmentStore {
         manager_instance_nonce: [u8; 32],
     ) -> Result<AuthorityReservation, EnrollmentStoreError> {
         if boot_scope == BootScope::new([0; 16])
-            || lease_id == LeaseId::new([0; 32])
+            || lease_id.is_zero()
             || manager_instance_nonce == [0; 32]
         {
             return Err(EnrollmentStoreError::InvalidLease);
@@ -396,7 +396,7 @@ impl RootEnrollmentStore {
         manager_instance_nonce: [u8; 32],
     ) -> Result<AuthorityReservation, EnrollmentStoreError> {
         if boot_scope == BootScope::new([0; 16])
-            || lease_id == LeaseId::new([0; 32])
+            || lease_id.is_zero()
             || manager_instance_nonce == [0; 32]
         {
             return Err(EnrollmentStoreError::InvalidLease);

@@ -6,8 +6,9 @@
 # Records ~40 s; output lands at assets/multi-connection.gif.
 #
 # Prerequisites:
-#   ./scripts/test-infra.sh up wg-full wg-split
-#   ./scripts/test-infra.sh import
+#   ./scripts/vpn-lab.sh up
+#   Copy wg08.conf to wg-full.conf and wg07.conf to wg-split.conf in the clean
+#   demo profile directory, then import those two profiles into vortix.
 #   sudo NOPASSWD configured for vortix (see README).
 #   vhs tapes/multi-connection.tape
 

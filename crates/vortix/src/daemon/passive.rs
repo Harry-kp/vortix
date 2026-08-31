@@ -1,9 +1,10 @@
 //! Scanner-only query source for the passive daemon candidate.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use tokio::sync::broadcast;
 
@@ -79,18 +80,18 @@ impl ScannerQueryProvider {
                     if worker_stopping.load(Ordering::Acquire) {
                         break;
                     }
-                    let prior = worker_snapshot
+                    let mut next = scan(&profiles, 0);
+                    let mut current = worker_snapshot
                         .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .clone();
-                    let mut next = scan(&profiles, prior.generation);
-                    let changed = !same_tunnels(&prior.tunnels, &next.tunnels);
-                    if changed {
-                        next.generation = prior.generation.saturating_add(1);
-                    }
-                    *worker_snapshot
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = next.clone();
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let changed = !same_tunnels(&current.tunnels, &next.tunnels);
+                    next.generation = if changed {
+                        current.generation.saturating_add(1)
+                    } else {
+                        current.generation
+                    };
+                    *current = next.clone();
+                    drop(current);
                     if changed {
                         if let Some(diagnostics) = &worker_diagnostics {
                             diagnostics.observation_changed(
@@ -134,13 +135,15 @@ impl Drop for ScannerQueryProvider {
 }
 
 fn scan(profiles: &[VpnProfile], generation: u64) -> PassiveSnapshot {
-    let observed_at_millis = unix_millis();
+    let observed_at_millis = super::diagnostics::unix_millis();
+    let profiles_by_name = profiles.iter().fold(BTreeMap::new(), |mut index, profile| {
+        index.entry(profile.name.as_str()).or_insert(profile);
+        index
+    });
     let mut tunnels = crate::core::scanner::get_active_profiles(profiles)
         .into_iter()
         .filter_map(|session| {
-            let profile = profiles
-                .iter()
-                .find(|profile| profile.name == session.name)?;
+            let profile = profiles_by_name.get(session.name.as_str())?;
             Some(PassiveTunnel {
                 profile_id: profile.id.clone(),
                 display_name: profile.name.clone(),
@@ -170,15 +173,6 @@ fn same_tunnels(left: &[PassiveTunnel], right: &[PassiveTunnel]) -> bool {
                 && left.protocol == right.protocol
                 && left.interface_name == right.interface_name
         })
-}
-
-fn unix_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX)
 }
 
 /// Compatibility projection for existing read-only clients. The projection

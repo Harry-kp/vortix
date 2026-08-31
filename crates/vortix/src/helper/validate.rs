@@ -288,7 +288,7 @@ impl InstallManifest {
         bootstrap_digest: OperationDigest,
         prior_manifest_digest: Option<OperationDigest>,
     ) -> Result<Self, InstallError> {
-        let invalid_digest = |digest: OperationDigest| digest.as_bytes() == [0; 32];
+        let invalid_digest = OperationDigest::is_zero;
         if release_version.is_empty()
             || release_version.len() > 64
             || !release_version
@@ -415,7 +415,7 @@ impl InstallRequest {
     ) -> Result<Self, InstallError> {
         if owner_uid == 0
             || manifest_generation == 0
-            || manifest_digest.as_bytes() == [0; 32]
+            || manifest_digest.is_zero()
             || request_nonce == [0; 32]
         {
             return Err(InstallError::InvalidRequest);

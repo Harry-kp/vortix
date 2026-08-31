@@ -25,7 +25,7 @@ pub fn set_config_dir(dir: PathBuf) {
 
 /// Returns the config directory set at startup, or falls back to default resolution.
 ///
-/// All utility functions (`get_profiles_dir`, `get_openvpn_auth_path`, etc.)
+/// All utility functions (profile, runtime, and transient artifact paths)
 /// go through this, so the `--config-dir` flag is respected everywhere.
 ///
 /// Resolution order: `set_config_dir()` > `VORTIX_CONFIG_DIR` env var > default.
@@ -78,6 +78,8 @@ pub struct AppConfig {
     pub ip_api_primary: String,
     /// Fallback API endpoints for IP lookup (tried in order).
     pub ip_api_fallbacks: Vec<String>,
+    /// Fallback API endpoint for metadata about an exact public IP.
+    pub geolocation_api_fallback: String,
     /// Maximum number of log entries kept in the TUI event log.
     pub max_log_entries: usize,
     /// Minimum log level shown in the event log (`"debug"`, `"info"`, `"warning"`, `"error"`).
@@ -130,6 +132,7 @@ impl Default for AppConfig {
                 constants::DEFAULT_IP_API_FALLBACK_2.to_string(),
                 constants::DEFAULT_IP_API_FALLBACK_3.to_string(),
             ],
+            geolocation_api_fallback: constants::DEFAULT_GEOLOCATION_API_FALLBACK.to_string(),
             max_log_entries: constants::DEFAULT_MAX_LOG_ENTRIES,
             log_level: constants::DEFAULT_LOG_LEVEL.to_string(),
             log_rotation_size: constants::DEFAULT_LOG_ROTATION_SIZE,
@@ -597,6 +600,10 @@ mod tests {
         assert_eq!(config.ping_targets.len(), 4);
         assert_eq!(config.ipv6_check_apis.len(), 3);
         assert_eq!(config.ip_api_fallbacks.len(), 3);
+        assert_eq!(
+            config.geolocation_api_fallback,
+            crate::constants::DEFAULT_GEOLOCATION_API_FALLBACK
+        );
     }
 
     #[test]
@@ -722,6 +729,11 @@ ip_api_fallbacks = ["https://fallback1.example.com"]
         assert_eq!(
             config.ip_api_fallbacks,
             vec!["https://fallback1.example.com"]
+        );
+        assert_eq!(
+            config.geolocation_api_fallback,
+            crate::constants::DEFAULT_GEOLOCATION_API_FALLBACK,
+            "existing configs must inherit the location fallback without migration"
         );
     }
 

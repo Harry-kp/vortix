@@ -19,7 +19,7 @@ for program in bash cat nft wg wg-quick ip resolvectl resolvconf openvpn; do
 done
 
 ip netns exec "$NS_B" env PATH="$PATH_DIR" target/release/vortix killswitch vpn-only
-nft_before="$(ip netns exec "$NS_B" "$REAL_NFT" list table inet vortix_killswitch)"
+nft_before="$(ip netns exec "$NS_B" "$REAL_NFT" --stateless list table inet vortix_killswitch)"
 grep -q 'policy drop' <<<"$nft_before"
 grep -q 'vortix-policy:' <<<"$nft_before"
 
@@ -30,7 +30,7 @@ ip netns exec "$NS_B" "$REAL_NFT" add rule inet vortix_killswitch output \
 stale_snapshot="$(ip netns exec "$NS_B" "$REAL_NFT" list table inet vortix_killswitch)"
 grep -q 'vortix-stale' <<<"$stale_snapshot"
 ip netns exec "$NS_B" env PATH="$PATH_DIR" target/release/vortix killswitch vpn-only
-nft_before="$(ip netns exec "$NS_B" "$REAL_NFT" list table inet vortix_killswitch)"
+nft_before="$(ip netns exec "$NS_B" "$REAL_NFT" --stateless list table inet vortix_killswitch)"
 if grep -q 'vortix-stale' <<<"$nft_before"; then
     echo "FAIL: successful nft replacement preserved stale owned-table state"
     exit 1
@@ -68,7 +68,7 @@ if ip netns exec "$NS_B" env PATH="$PATH_DIR" target/release/vortix --quiet kill
     exit 1
 fi
 
-nft_after="$(ip netns exec "$NS_B" "$REAL_NFT" list table inet vortix_killswitch)"
+nft_after="$(ip netns exec "$NS_B" "$REAL_NFT" --stateless list table inet vortix_killswitch)"
 [[ "$nft_after" == "$nft_before" ]] || {
     echo "FAIL: failed nft replacement changed the prior owned table"
     exit 1

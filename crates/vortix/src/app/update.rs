@@ -19,6 +19,13 @@ use crate::utils;
 /// threshold via `RUST_LOG=vortix::app=warn`; the value is silent otherwise.
 const UI_HANDLER_SLOW_THRESHOLD: Duration = Duration::from_millis(50);
 
+fn is_unknown_identity_value(value: &str) -> bool {
+    value.is_empty()
+        || value == "Unknown"
+        || value == constants::MSG_DETECTING
+        || value == constants::MSG_FETCHING
+}
+
 /// Extract the variant name (without the payload) from a `Message` for
 /// observability. `format!("{msg:?}")` produces `"NextPanel"` for unit
 /// variants, `"ConnectResult { ... }"` for struct variants, etc. — we
@@ -86,8 +93,8 @@ impl App {
                 }
             }
             Message::ConfirmDelete => {
-                if let InputMode::ConfirmDelete { index, .. } = self.input_mode {
-                    self.confirm_delete(index);
+                if let InputMode::ConfirmDelete { profile_id, .. } = self.input_mode.clone() {
+                    self.confirm_delete_profile(&profile_id);
                 }
             }
             Message::ConfirmDefaultRouteTakeover { idx } => {
@@ -270,9 +277,16 @@ impl App {
                 self.background_diagnostics_loading = false;
                 match result {
                     Ok(view) => self.log_batch(&background_diagnostic_log_lines(&view)),
-                    Err(error) => self.log(&format!(
-                        "BACKGROUND: diagnostics unavailable ({error}); status remains Standard and no authority claim was made"
-                    )),
+                    Err(error) => {
+                        self.log(&format!(
+                            "BACKGROUND: diagnostics unavailable ({error}); status remains Standard and no authority claim was made"
+                        ));
+                        self.show_toast(
+                            "Background diagnostics are unavailable. Standard mode is unchanged."
+                                .to_string(),
+                            ToastType::Warning,
+                        );
+                    }
                 }
             }
             Message::ConfirmBackgroundAction => {
@@ -338,13 +352,13 @@ impl App {
             },
 
             Message::AuthSubmit {
-                idx,
+                profile_id,
                 username,
                 password,
                 otp,
                 save,
                 connect_after,
-            } => self.handle_auth_submit(idx, username, password, otp, save, connect_after),
+            } => self.handle_auth_submit(profile_id, username, password, otp, save, connect_after),
 
             Message::CycleSortOrder => {
                 let selected_name = self
@@ -459,31 +473,48 @@ impl App {
                         ToastType::Info,
                     );
                 } else {
-                    // Pre-fill with existing credentials if saved. ManageAuth
-                    // is save-only (`connect_after: false`) so we DO NOT
-                    // surface the OTP field even on static-challenge profiles:
-                    // (1) the OTP is single-use and expires in ~30s, so
-                    // pre-saving has no value; (2) the submit handler writes
-                    // a `.scrv1.auth` bundle whenever `otp.is_some()`, and
-                    // without a connect path consuming it that bundle would
-                    // persist on disk with the plaintext OTP until the next
-                    // startup scrub -- a real leak window. Setting
-                    // static_challenge_prompt=None here keeps the overlay at
-                    // 2 fields (Username/Password) and forces `otp = None`
-                    // in the AuthSubmit message.
-                    let (username, password) =
-                        utils::read_openvpn_saved_auth_compat(profile.id.as_str(), &profile.name)
-                            .unwrap_or_default();
+                    // Manage mode persists only reusable username/password.
+                    // OTP and static-challenge answers are one-shot values, so
+                    // this save-only overlay intentionally omits that field.
+                    let profile_id = profile.id.clone();
+                    let profile_name = profile.name.clone();
+                    let Some(control) = self.control_session.as_ref() else {
+                        self.show_toast(
+                            "Credential service is unavailable".to_string(),
+                            ToastType::Error,
+                        );
+                        return;
+                    };
+                    let (username, password) = match control
+                        .load_openvpn_credentials(&profile_id, &profile_name)
+                    {
+                        Ok(Some(credentials)) => (
+                            crate::state::SecretText::from(credentials.username()),
+                            crate::state::SecretText::from(credentials.password()),
+                        ),
+                        Ok(None) => Default::default(),
+                        Err(error) => {
+                            self.log(&format!(
+                                "WARN: Remembered OpenVPN credentials are unavailable: {error}"
+                            ));
+                            self.show_toast(
+                                "Saved credentials couldn't be used. Enter new credentials to replace them."
+                                    .to_string(),
+                                ToastType::Warning,
+                            );
+                            Default::default()
+                        }
+                    };
                     let username_cursor = username.len();
                     let password_cursor = password.len();
                     self.input_mode = InputMode::AuthPrompt {
-                        profile_idx: idx,
-                        profile_name: profile.name.clone(),
+                        profile_id,
+                        profile_name,
                         username,
                         username_cursor,
                         password,
                         password_cursor,
-                        otp: String::new(),
+                        otp: crate::state::SecretText::default(),
                         otp_cursor: 0,
                         focused_field: crate::state::AuthField::Username,
                         save_credentials: true,
@@ -512,80 +543,82 @@ impl App {
                         "This profile does not use auth-user-pass".to_string(),
                         ToastType::Info,
                     );
-                } else if utils::read_openvpn_saved_auth_compat(profile_id.as_str(), &name)
-                    .is_none()
-                {
-                    self.show_toast(
-                        format!("No saved credentials for '{name}'"),
-                        ToastType::Info,
-                    );
                 } else {
-                    utils::delete_openvpn_auth_file_compat(profile_id.as_str(), &name);
-                    self.log(&format!("AUTH: Cleared saved credentials for '{name}'"));
-                    self.show_toast(
-                        format!("Credentials cleared for '{name}'"),
-                        ToastType::Success,
-                    );
+                    let Some(control) = self.control_session.as_ref() else {
+                        self.show_toast(
+                            "Credential service is unavailable".to_string(),
+                            ToastType::Error,
+                        );
+                        return;
+                    };
+                    match control.clear_openvpn_credentials(&profile_id, &name) {
+                        Ok(crate::cli::control::CredentialClearOutcome::NotFound) => self
+                            .show_toast(
+                                format!("No saved credentials for '{name}'"),
+                                ToastType::Info,
+                            ),
+                        Ok(crate::cli::control::CredentialClearOutcome::Cleared) => {
+                            self.log(&format!("AUTH: Cleared saved credentials for '{name}'"));
+                            self.show_toast(
+                                format!("Credentials cleared for '{name}'"),
+                                ToastType::Success,
+                            );
+                        }
+                        Err(
+                            crate::cli::control::LocalControlError::CredentialDurabilityUncertain,
+                        ) => {
+                            self.log(&format!(
+                                "WARN: Credentials for '{name}' were removed but disk durability is uncertain"
+                            ));
+                            self.show_toast(
+                                "Credentials were cleared, but disk confirmation failed. Verify after restarting."
+                                    .to_string(),
+                                ToastType::Warning,
+                            );
+                        }
+                        Err(error) => {
+                            self.log(&format!(
+                                "ERR: Remembered OpenVPN credentials could not be cleared: {error}"
+                            ));
+                            self.show_toast(
+                                "Saved credentials couldn't be cleared. Check permissions and try again."
+                                    .to_string(),
+                                ToastType::Error,
+                            );
+                        }
+                    }
                 }
             }
         }
     }
     fn handle_auth_submit(
         &mut self,
-        idx: usize,
-        username: String,
-        password: String,
-        otp: Option<String>,
+        profile_id: crate::vortix_core::profile::ProfileId,
+        username: crate::state::SecretText,
+        password: crate::state::SecretText,
+        otp: Option<crate::state::SecretText>,
         save: bool,
         connect_after: bool,
     ) {
         if let Some(challenge_id) = self.control_challenge {
-            if save {
-                let Some(profile) = self.runtime.profiles.get(idx) else {
-                    self.show_toast(
-                        "Challenge profile is unavailable".to_string(),
-                        ToastType::Error,
-                    );
-                    return;
-                };
-                if let Err(error) =
-                    utils::write_openvpn_auth_file(profile.id.as_str(), &username, &password)
-                {
-                    self.show_toast(
-                        format!("Failed to save credentials: {error}"),
-                        ToastType::Error,
-                    );
-                    return;
-                }
-            }
-            let answer = otp.filter(|answer| !answer.trim().is_empty());
-            let payload = crate::vortix_core::control::Secret::openvpn_credentials(
-                &username,
-                &password,
-                answer.as_deref(),
-            )
-            .into_vec();
-            let result = self
-                .control_session
-                .as_ref()
-                .expect("service challenge requires attached control session")
-                .respond_challenge(challenge_id, payload);
-            match result {
-                Ok(()) => {
-                    self.control_challenge = None;
-                    self.input_mode = InputMode::Normal;
-                    self.log("AUTH: Submitted service-owned challenge response");
-                }
-                Err(error) => self.show_toast(
-                    format!("Challenge response failed: {error}"),
-                    ToastType::Error,
-                ),
-            }
+            self.handle_control_auth_submit(
+                challenge_id,
+                profile_id,
+                username,
+                password,
+                otp,
+                save,
+            );
             return;
         }
 
-        let Some(profile) = self.runtime.profiles.get(idx) else {
-            self.show_toast("Invalid profile index".to_string(), ToastType::Error);
+        let Some(profile) = self
+            .runtime
+            .profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+        else {
+            self.show_toast("Profile is unavailable".to_string(), ToastType::Error);
             return;
         };
         if connect_after {
@@ -596,28 +629,139 @@ impl App {
             self.input_mode = InputMode::Normal;
             return;
         }
-        if let Err(error) =
-            utils::write_openvpn_auth_file(profile.id.as_str(), &username, &password)
-        {
+        let profile_name = profile.name.clone();
+        let Some(control) = self.control_session.as_ref() else {
             self.show_toast(
-                format!("Failed to save credentials: {error}"),
+                "Credential service is unavailable".to_string(),
+                ToastType::Error,
+            );
+            return;
+        };
+        match control.remember_openvpn_credentials(
+            &profile_id,
+            username.expose(),
+            password.expose(),
+        ) {
+            Ok(()) => {
+                self.input_mode = InputMode::Normal;
+                self.log(&format!("AUTH: Saved credentials for '{profile_name}'"));
+                self.show_toast(
+                    format!("Credentials updated for '{profile_name}'"),
+                    ToastType::Success,
+                );
+            }
+            Err(crate::cli::control::LocalControlError::CredentialDurabilityUncertain) => {
+                self.input_mode = InputMode::Normal;
+                self.log(&format!(
+                    "WARN: Credential update for '{profile_name}' is visible but disk durability is uncertain"
+                ));
+                self.show_toast(
+                    "Credentials were updated, but disk confirmation failed. You may be asked again after a restart."
+                        .to_string(),
+                    ToastType::Warning,
+                );
+            }
+            Err(error) => {
+                self.log(&format!(
+                    "ERR: Remembered OpenVPN credentials could not be saved: {error}"
+                ));
+                self.show_toast(
+                    "Credentials weren't saved. Check permissions and try again.".to_string(),
+                    ToastType::Error,
+                );
+            }
+        }
+    }
+
+    fn handle_control_auth_submit(
+        &mut self,
+        challenge_id: crate::vortix_core::control::ChallengeId,
+        profile_id: crate::vortix_core::profile::ProfileId,
+        username: crate::state::SecretText,
+        password: crate::state::SecretText,
+        otp: Option<crate::state::SecretText>,
+        save: bool,
+    ) {
+        let challenge_matches_profile = self
+            .control_snapshot
+            .challenges
+            .get(&challenge_id)
+            .is_some_and(|challenge| challenge.profile_id == profile_id);
+        if !challenge_matches_profile {
+            self.show_toast(
+                "The connection prompt expired; start the connection again".to_string(),
+                ToastType::Warning,
+            );
+            return;
+        }
+        let answer = otp.filter(|answer| !answer.trim().is_empty());
+        let payload = crate::vortix_core::control::Secret::openvpn_credentials(
+            username.expose(),
+            password.expose(),
+            answer.as_deref(),
+        )
+        .into_vec();
+        let control = self
+            .control_session
+            .as_ref()
+            .expect("service challenge requires attached control session");
+        if let Err(error) = control.respond_challenge(challenge_id, payload) {
+            self.show_toast(
+                format!("Challenge response failed: {error}"),
                 ToastType::Error,
             );
             return;
         }
-        let profile_name = profile.name.clone();
+
+        self.control_challenge = None;
         self.input_mode = InputMode::Normal;
-        self.log(&format!("AUTH: Saved credentials for '{profile_name}'"));
-        self.show_toast(
-            format!("Credentials updated for '{profile_name}'"),
-            ToastType::Success,
-        );
+        self.log("AUTH: Submitted service-owned challenge response");
+        if !save {
+            return;
+        }
+        let profile_name = self
+            .runtime
+            .profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .map_or_else(|| profile_id.to_string(), |profile| profile.name.clone());
+        let remember = self
+            .control_session
+            .as_ref()
+            .expect("service challenge requires attached control session")
+            .remember_openvpn_credentials(&profile_id, username.expose(), password.expose());
+        match remember {
+            Ok(()) => self.log(&format!(
+                "AUTH: Remembered credentials for '{profile_name}'"
+            )),
+            Err(crate::cli::control::LocalControlError::CredentialDurabilityUncertain) => {
+                self.log(&format!(
+                    "WARN: OpenVPN credentials for '{profile_name}' are visible but disk durability is uncertain"
+                ));
+                self.show_toast(
+                    "Credentials were submitted and updated, but disk confirmation failed. This connection can continue."
+                        .to_string(),
+                    ToastType::Warning,
+                );
+            }
+            Err(error) => {
+                self.log(&format!(
+                    "WARN: OpenVPN credentials were submitted but not remembered: {error}"
+                ));
+                self.show_toast(
+                    "Credentials were submitted, but they weren't saved. This connection can continue; you'll be asked again next time."
+                        .to_string(),
+                    ToastType::Warning,
+                );
+            }
+        }
     }
+
     fn handle_toggle_killswitch(&mut self) {
         if self.control_session.is_none() {
             self.show_toast(
-                "Control service is not attached".to_string(),
-                ToastType::Error,
+                super::connection::CONTROL_STARTING_MESSAGE.to_string(),
+                ToastType::Info,
             );
             return;
         }
@@ -641,102 +785,20 @@ impl App {
     #[allow(clippy::too_many_lines)] // TEA-style dispatch — every arm is one telemetry variant; splitting would obscure the handler shape without simplifying it
     fn handle_telemetry(&mut self, update: TelemetryUpdate) {
         match update {
-            TelemetryUpdate::PublicIp(ip) => {
-                let is_connected = self.has_active_connection();
-                let old_ip = self.runtime.public_ip.clone();
-
-                // emit IpChanged into the journal so the
-                // bug-report and downstream subscribers see the trail.
-                // Only fires on actual changes, not initial detection.
-                if old_ip != ip
-                    && old_ip != constants::MSG_FETCHING
-                    && old_ip != constants::MSG_DETECTING
-                {
-                    if let Some(journal) = crate::vortix_core::journal::global_journal() {
-                        let _ =
-                            journal.append(crate::vortix_core::engine::EngineEvent::IpChanged {
-                                old: Some(old_ip.clone()),
-                                new: ip.clone(),
-                            });
-                    }
-                }
-
-                // Store as real_ip ONLY when we have positive proof
-                // there's no VPN active. Three conditions must hold:
-                //
-                // 1. Scanner has completed at least one tick — without
-                //    this, telemetry-on-startup races and we'd cache
-                //    the wrong IP before the scanner reports kernel
-                //    state.
-                // 2. Kernel reports zero VPN sessions — using raw
-                //    scanner state (not the registry) catches tunnels
-                //    that are kernel-visible but not yet adopted
-                //    (e.g. external openvpn awaiting lsof Method A on
-                //    macOS).
-                // 3. Registry has no Connected tunnel — defensive belt
-                //    against the scanner race; cheap so include it.
-                //
-                // Without ALL three, withhold caching. real_ip stays
-                // None and the UI shows "detecting…" — honest about
-                // not knowing rather than fabricating the VPN's exit
-                // IP as the user's real IP.
-                let safe_to_cache = self.runtime.scanner_first_tick_done
-                    && self.runtime.last_kernel_session_count == 0
-                    && !is_connected;
-                if safe_to_cache {
-                    let first_detection = self.runtime.real_ip.is_none();
-                    let changed = self.runtime.real_ip.as_deref() != Some(ip.as_str());
-                    if first_detection {
-                        self.log(&format!("NET: Real IPv4 detected: {ip}"));
-                    }
-                    self.runtime.real_ip = Some(ip.clone());
-                    if first_detection || changed {
-                        crate::core::real_ip_cache::save(&self.runtime.config_dir, &ip);
-                    }
-                } else if self.runtime.public_ip != ip
-                    && self.runtime.public_ip != constants::MSG_FETCHING
-                {
-                    self.runtime.ip_unchanged_warned = false;
-                    self.log(&format!("NET: Public IPv4 changed {old_ip} -> {ip}"));
-                } else if is_connected
-                    && self.runtime.public_ip == ip
-                    && self.runtime.public_ip != constants::MSG_FETCHING
-                    && !self.runtime.ip_unchanged_warned
-                {
-                    self.runtime.ip_unchanged_warned = true;
-                    self.log(&format!(
-                        "WARN: Public IPv4 unchanged ({ip}) while connected — possible leak or split-tunnel"
-                    ));
-                    if let Some(ref real) = self.runtime.real_ip {
-                        if real == &ip {
-                            self.log(&format!("ERR: IPv4 leak detected — current IPv4 ({ip}) matches pre-VPN IPv4 ({real})"));
-                        }
-                    }
-                }
-                self.runtime.public_ip = ip;
-                self.runtime.last_security_check = Some(Instant::now());
+            TelemetryUpdate::PublicIp(ip) => self.apply_public_ipv4(ip),
+            TelemetryUpdate::EgressIdentity(identity) => {
+                self.apply_egress_identity(identity);
             }
-            TelemetryUpdate::Latency(ms) => self.runtime.latency_ms = ms,
-            TelemetryUpdate::PacketLoss(loss) => {
-                self.runtime.packet_loss = loss;
-                self.log(&format!("NET: Packet loss: {loss:.1}%"));
-            }
-            TelemetryUpdate::Jitter(jitter) => {
-                self.runtime.jitter_ms = jitter;
-                self.log(&format!("NET: Jitter: {jitter}ms"));
-            }
-            TelemetryUpdate::Location(loc) => {
-                if self.runtime.location != loc && self.runtime.location != constants::MSG_DETECTING
-                {
-                    self.log(&format!("NET: Location: {loc}"));
-                }
-                self.runtime.location = loc;
-            }
-            TelemetryUpdate::Isp(isp) => {
-                if self.runtime.isp != isp && self.runtime.isp != constants::MSG_DETECTING {
-                    self.log(&format!("NET: Exit node: {isp}"));
-                }
-                self.runtime.isp = isp;
+            TelemetryUpdate::EgressUnavailable => self.apply_egress_unavailable(),
+            TelemetryUpdate::NetworkQuality {
+                latency_ms,
+                packet_loss,
+                jitter_ms,
+            } => {
+                self.runtime.latency_ms = latency_ms;
+                self.runtime.packet_loss = packet_loss;
+                self.runtime.jitter_ms = jitter_ms;
+                self.log_network_quality_transition();
             }
             TelemetryUpdate::Dns(dns) => {
                 if self.runtime.dns_server != dns
@@ -746,21 +808,7 @@ impl App {
                     self.log(&format!("SEC: DNS server: {dns}"));
                 }
                 self.runtime.dns_server = dns;
-                self.spawn_dns_leak_probe();
                 self.runtime.last_security_check = Some(Instant::now());
-            }
-            TelemetryUpdate::DnsLeak(status) => {
-                use crate::core::dns_leak::DnsLeakStatus;
-                if let DnsLeakStatus::Leaking {
-                    recursor,
-                    configured,
-                } = &status
-                {
-                    self.log(&format!(
-                        "WARN: DNS leak — recursor {recursor} answered, expected {configured}"
-                    ));
-                }
-                self.runtime.dns_leak = status;
             }
             TelemetryUpdate::PublicIpv6(observed) => {
                 let is_connected = self.has_active_connection();
@@ -804,11 +852,123 @@ impl App {
                     }
                 }
                 self.runtime.public_ipv6 = observed;
-                self.runtime.last_security_check = Some(Instant::now());
+                let checked_at = Instant::now();
+                self.runtime.last_ipv6_check = Some(checked_at);
+                self.runtime.last_security_check = Some(checked_at);
             }
             TelemetryUpdate::Log(level, msg) => {
                 logger::log(level, "TELEMETRY", msg);
             }
+        }
+    }
+
+    fn apply_egress_identity(&mut self, identity: crate::core::telemetry::EgressIdentity) {
+        let same_exit = self.runtime.public_ip == identity.public_ip;
+        self.apply_public_ipv4(identity.public_ip);
+
+        let next_isp = identity.isp.unwrap_or_else(|| {
+            if same_exit && !is_unknown_identity_value(&self.runtime.isp) {
+                self.runtime.isp.clone()
+            } else {
+                "Unknown".to_string()
+            }
+        });
+        if self.runtime.isp != next_isp && self.runtime.isp != constants::MSG_DETECTING {
+            self.log(&format!("NET: Exit node: {next_isp}"));
+        }
+        self.runtime.isp = next_isp;
+
+        let next_location = identity.location.unwrap_or_else(|| {
+            if same_exit && !is_unknown_identity_value(&self.runtime.location) {
+                self.runtime.location.clone()
+            } else {
+                "Unknown".to_string()
+            }
+        });
+        if self.runtime.location != next_location
+            && self.runtime.location != constants::MSG_DETECTING
+        {
+            self.log(&format!("NET: Location: {next_location}"));
+        }
+        self.runtime.location = next_location;
+    }
+
+    fn apply_egress_unavailable(&mut self) {
+        if !is_unknown_identity_value(&self.runtime.isp) {
+            self.log("NET: Exit node: Unknown");
+        }
+        if !is_unknown_identity_value(&self.runtime.location) {
+            self.log("NET: Location: Unknown");
+        }
+        self.runtime.public_ip = "Unavailable".to_string();
+        self.runtime.isp = "Unknown".to_string();
+        self.runtime.location = "Unknown".to_string();
+        self.runtime.last_security_check = Some(Instant::now());
+    }
+
+    fn apply_public_ipv4(&mut self, ip: String) {
+        let is_connected = self.has_active_connection();
+        let old_ip = self.runtime.public_ip.clone();
+
+        if old_ip != ip && old_ip != constants::MSG_FETCHING && old_ip != constants::MSG_DETECTING {
+            if let Some(journal) = crate::vortix_core::journal::global_journal() {
+                let _ = journal.append(crate::vortix_core::engine::EngineEvent::IpChanged {
+                    old: Some(old_ip.clone()),
+                    new: ip.clone(),
+                });
+            }
+        }
+
+        // Cache the real address only after both scanner and registry prove
+        // that no tunnel owns the egress path.
+        let safe_to_cache = self.runtime.scanner_first_tick_done
+            && self.runtime.last_kernel_session_count == 0
+            && !is_connected;
+        if safe_to_cache {
+            let first_detection = self.runtime.real_ip.is_none();
+            let changed = self.runtime.real_ip.as_deref() != Some(ip.as_str());
+            if first_detection {
+                self.log(&format!("NET: Real IPv4 detected: {ip}"));
+            }
+            self.runtime.real_ip = Some(ip.clone());
+            if first_detection || changed {
+                crate::core::real_ip_cache::save(&self.runtime.config_dir, &ip);
+            }
+        } else if self.runtime.public_ip != ip && self.runtime.public_ip != constants::MSG_FETCHING
+        {
+            self.runtime.ip_unchanged_warned = false;
+            self.log(&format!("NET: Public IPv4 changed {old_ip} -> {ip}"));
+        }
+        if is_connected
+            && self.runtime.real_ip.as_deref() == Some(ip.as_str())
+            && !self.runtime.ip_unchanged_warned
+        {
+            self.runtime.ip_unchanged_warned = true;
+            self.log(&format!(
+                "WARN: Public IPv4 matches the pre-VPN address ({ip}) — possible leak or split-tunnel"
+            ));
+        }
+        self.runtime.public_ip = ip;
+        self.runtime.last_security_check = Some(Instant::now());
+    }
+
+    fn log_network_quality_transition(&mut self) {
+        use crate::state::QualityLevel;
+
+        let quality = QualityLevel::from_metrics(
+            self.runtime.latency_ms,
+            self.runtime.packet_loss,
+            self.runtime.jitter_ms,
+        );
+        if quality == self.last_logged_network_quality {
+            return;
+        }
+        self.last_logged_network_quality = quality;
+        match quality {
+            QualityLevel::Unknown => self.log("WARN: Network quality unavailable"),
+            QualityLevel::Excellent => self.log("NET: Network quality: excellent"),
+            QualityLevel::Fair => self.log("WARN: Network quality degraded: fair"),
+            QualityLevel::Poor => self.log("WARN: Network quality degraded: poor"),
         }
     }
 
@@ -825,6 +985,7 @@ impl App {
     }
 
     fn tick_presentation(&mut self) {
+        self.flush_catalog_feedback(false);
         if self
             .toast
             .as_ref()
@@ -859,7 +1020,7 @@ impl App {
                 } else {
                     let char_len = profile_name.chars().count();
                     self.input_mode = InputMode::Rename {
-                        index: idx,
+                        profile_id: profile.id.clone(),
                         new_name: profile_name,
                         cursor: char_len,
                     };

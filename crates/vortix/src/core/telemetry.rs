@@ -7,13 +7,16 @@
 //! The telemetry worker runs in a background thread and communicates
 //! updates via an MPSC channel to the main application.
 
+use std::collections::VecDeque;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::constants;
 use crate::logger::LogLevel;
 use serde::Deserialize;
+
+const MAX_CACHED_EGRESS_IDENTITIES: usize = 8;
 
 /// Configuration subset needed by the telemetry worker thread.
 #[derive(Debug, Clone)]
@@ -30,8 +33,10 @@ pub struct TelemetryConfig {
     pub ipv6_check_apis: Vec<String>,
     /// Primary API endpoint for IP lookup.
     pub ip_api_primary: String,
-    /// Fallback API endpoints for IP lookup.
+    /// Fallback API endpoints for IP lookup followed by geolocation.
     pub ip_api_fallbacks: Vec<String>,
+    /// Fallback API endpoint for metadata about an exact public IP.
+    pub geolocation_api_fallback: String,
 }
 
 impl From<&crate::config::AppConfig> for TelemetryConfig {
@@ -44,6 +49,7 @@ impl From<&crate::config::AppConfig> for TelemetryConfig {
             ipv6_check_apis: config.ipv6_check_apis.clone(),
             ip_api_primary: config.ip_api_primary.clone(),
             ip_api_fallbacks: config.ip_api_fallbacks.clone(),
+            geolocation_api_fallback: config.geolocation_api_fallback.clone(),
         }
     }
 }
@@ -53,23 +59,108 @@ impl From<&crate::config::AppConfig> for TelemetryConfig {
 pub enum TelemetryUpdate {
     /// Updated public IP address.
     PublicIp(String),
-    /// Updated latency measurement in milliseconds.
-    Latency(u64),
-    /// Packet loss percentage (0.0-100.0).
-    PacketLoss(f32),
-    /// Jitter (latency standard deviation) in milliseconds.
-    Jitter(u64),
-    /// Updated ISP/organization name.
-    Isp(String),
+    /// One coherent observation of the current public egress identity.
+    /// Optional metadata is absent for IP-only fallback providers.
+    EgressIdentity(EgressIdentity),
+    /// Every bounded public-egress provider failed.
+    EgressUnavailable,
+    /// One coherent network-quality sample. Keeping the related measurements
+    /// together prevents consumers from classifying a mixture of old and new
+    /// values while the three fields are delivered.
+    NetworkQuality {
+        /// Round-trip latency in milliseconds.
+        latency_ms: u64,
+        /// Packet loss percentage (0.0-100.0).
+        packet_loss: f32,
+        /// Latency standard deviation in milliseconds.
+        jitter_ms: u64,
+    },
     /// Updated DNS server address.
     Dns(String),
-    /// Updated physical location (City, Country).
-    Location(String),
     /// Public IPv6 observed by the probe, `None` if unreachable.
     PublicIpv6(Option<String>),
-    DnsLeak(crate::core::dns_leak::DnsLeakStatus),
     /// Log message with level for production logging (uses centralized logger)
     Log(LogLevel, String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EgressIdentity {
+    pub public_ip: String,
+    pub isp: Option<String>,
+    pub location: Option<String>,
+}
+
+#[derive(Default)]
+struct IpSuccessLog {
+    last_identity: Option<EgressIdentity>,
+}
+
+#[derive(Default)]
+struct EgressIdentityState {
+    located: VecDeque<EgressIdentity>,
+    primary_retry_at: Option<Instant>,
+}
+
+impl EgressIdentityState {
+    fn complete_for(&self, public_ip: &str) -> Option<&EgressIdentity> {
+        self.located
+            .iter()
+            .find(|identity| identity.public_ip == public_ip)
+    }
+
+    fn remember(&mut self, identity: EgressIdentity) {
+        if identity.is_location_capable() {
+            self.located
+                .retain(|cached| cached.public_ip != identity.public_ip);
+            self.located.push_front(identity);
+            self.located.truncate(MAX_CACHED_EGRESS_IDENTITIES);
+        }
+    }
+
+    fn primary_is_available(&self, now: Instant) -> bool {
+        self.primary_retry_at.is_none_or(|retry_at| now >= retry_at)
+    }
+
+    fn suppress_rate_limited_primary(&mut self, now: Instant) {
+        self.primary_retry_at = now.checked_add(Duration::from_secs(24 * 60 * 60));
+    }
+}
+
+impl EgressIdentity {
+    fn is_location_capable(&self) -> bool {
+        self.location.is_some()
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PrimaryLookup {
+    Found(EgressIdentity),
+    RateLimited,
+    Unavailable,
+}
+
+impl IpSuccessLog {
+    fn publish(&mut self, tx: &Sender<TelemetryUpdate>, identity: &EgressIdentity) {
+        if self.last_identity.as_ref() == Some(identity) {
+            return;
+        }
+        let message = format!(
+            "✓ Egress identity: IP={}, ISP={}, Location={}",
+            identity.public_ip,
+            identity.isp.as_deref().unwrap_or("Unknown"),
+            identity.location.as_deref().unwrap_or("Unknown")
+        );
+        if tx
+            .send(TelemetryUpdate::Log(LogLevel::Info, message))
+            .is_ok()
+        {
+            self.last_identity = Some(identity.clone());
+        }
+    }
+
+    fn reset(&mut self) {
+        self.last_identity = None;
+    }
 }
 
 /// Spawns a background telemetry worker that periodically fetches network information.
@@ -88,11 +179,15 @@ pub fn spawn_telemetry_worker(config: TelemetryConfig) -> (Receiver<TelemetryUpd
     let (tx, rx) = mpsc::channel();
     let (nudge_tx, nudge_rx) = mpsc::channel::<()>();
     let config = std::sync::Arc::new(config);
+    let mut ip_success_log = IpSuccessLog::default();
+    let mut identity_state = EgressIdentityState::default();
 
     thread::spawn(move || loop {
-        fetch_ip_and_isp(&tx, &config);
+        // These probes spawn their own bounded workers, so start them without
+        // waiting for the serialized identity lookup's network timeouts.
         fetch_latency(&tx, &config);
         fetch_security_info(&tx, &config);
+        fetch_ip_and_isp(&tx, &config, &mut ip_success_log, &mut identity_state);
 
         // Wait for the poll interval, but wake up immediately if nudged.
         // Drain any extra nudges that accumulated while we were fetching.
@@ -104,150 +199,214 @@ pub fn spawn_telemetry_worker(config: TelemetryConfig) -> (Receiver<TelemetryUpd
 }
 
 /// Fetches public IP address and ISP information with fallback APIs.
-fn fetch_ip_and_isp(tx: &Sender<TelemetryUpdate>, cfg: &std::sync::Arc<TelemetryConfig>) {
-    let tx_clone = tx.clone();
-    let cfg = std::sync::Arc::clone(cfg);
-    thread::spawn(move || {
-        // Log start of fetch
-        let _ = tx_clone.send(TelemetryUpdate::Log(
-            LogLevel::Debug,
-            "Starting IP/Location fetch...".to_string(),
-        ));
+fn fetch_ip_and_isp(
+    tx: &Sender<TelemetryUpdate>,
+    cfg: &std::sync::Arc<TelemetryConfig>,
+    ip_success_log: &mut IpSuccessLog,
+    identity_state: &mut EgressIdentityState,
+) {
+    // This function deliberately runs on the telemetry coordinator thread.
+    // A refresh nudge is coalesced while it is in flight, so two providers can
+    // never race separate pieces of egress identity into the UI.
+    let _ = tx.send(TelemetryUpdate::Log(
+        LogLevel::Debug,
+        "Starting IP/Location fetch...".to_string(),
+    ));
 
-        // Primary: ipinfo.io (provides IP + ISP + Location)
-        let _ = tx_clone.send(TelemetryUpdate::Log(
-            LogLevel::Debug,
-            "Trying ipinfo.io (primary API with location data)...".to_string(),
-        ));
+    // Query an IP-only endpoint on every poll. Geolocation providers have
+    // strict daily quotas, so metadata is refreshed only for a new exit IP.
+    let _ = tx.send(TelemetryUpdate::Log(
+        LogLevel::Debug,
+        "Checking the current public IP...".to_string(),
+    ));
 
-        if let Some((ip, isp, loc)) = try_ipinfo_api(&tx_clone, &cfg) {
-            let _ = tx_clone.send(TelemetryUpdate::Log(
-                LogLevel::Info,
-                format!(
-                    "✓ ipinfo.io: IP={}, ISP={}, Location={}",
-                    ip,
-                    isp.as_ref().unwrap_or(&"Unknown".to_string()),
-                    loc.as_ref().unwrap_or(&"Unknown".to_string())
-                ),
-            ));
-            let _ = tx_clone.send(TelemetryUpdate::PublicIp(ip));
-            if let Some(org) = isp {
-                let _ = tx_clone.send(TelemetryUpdate::Isp(org));
-            }
-            if let Some(location) = loc {
-                let _ = tx_clone.send(TelemetryUpdate::Location(location));
-            }
-            return;
-        }
+    if let Some(ip) = try_ipify_api(tx, cfg) {
+        publish_observed_ip(tx, cfg, ip_success_log, identity_state, ip);
+        return;
+    }
 
-        let _ = tx_clone.send(TelemetryUpdate::Log(
-            LogLevel::Warning,
-            "ipinfo.io failed, trying fallback APIs (no location data)...".to_string(),
-        ));
+    let _ = tx.send(TelemetryUpdate::Log(
+        LogLevel::Warning,
+        "Primary public-IP check failed; trying provider fallbacks...".to_string(),
+    ));
 
-        // Fallback 1: ipify.org (IP only, very reliable)
-        let _ = tx_clone.send(TelemetryUpdate::Log(
-            LogLevel::Debug,
-            "Trying ipify.org (fallback 1, IP only)...".to_string(),
-        ));
+    // Fallback 2: icanhazip.com (IP only)
+    let _ = tx.send(TelemetryUpdate::Log(
+        LogLevel::Debug,
+        "Trying icanhazip.com (fallback 2)...".to_string(),
+    ));
 
-        if let Some(ip) = try_ipify_api(&tx_clone, &cfg) {
-            let _ = tx_clone.send(TelemetryUpdate::Log(
-                LogLevel::Info,
-                format!("✓ ipify.org: IP={ip} (no ISP/location)"),
-            ));
-            let _ = tx_clone.send(TelemetryUpdate::PublicIp(ip));
-            let _ = tx_clone.send(TelemetryUpdate::Isp("Unknown".to_string()));
-            let _ = tx_clone.send(TelemetryUpdate::Location("Unknown".to_string()));
-            return;
-        }
+    if let Some(ip) = try_icanhazip_api(tx, cfg) {
+        publish_observed_ip(tx, cfg, ip_success_log, identity_state, ip);
+        return;
+    }
 
-        let _ = tx_clone.send(TelemetryUpdate::Log(
-            LogLevel::Warning,
-            "ipify.org failed, trying icanhazip.com...".to_string(),
-        ));
+    let _ = tx.send(TelemetryUpdate::Log(
+        LogLevel::Warning,
+        "icanhazip.com failed, trying ifconfig.me (last resort)...".to_string(),
+    ));
 
-        // Fallback 2: icanhazip.com (IP only)
-        let _ = tx_clone.send(TelemetryUpdate::Log(
-            LogLevel::Debug,
-            "Trying icanhazip.com (fallback 2)...".to_string(),
-        ));
+    // Fallback 3: ifconfig.me (IP only)
+    if let Some(ip) = try_ifconfig_api(tx, cfg) {
+        publish_observed_ip(tx, cfg, ip_success_log, identity_state, ip);
+        return;
+    }
 
-        if let Some(ip) = try_icanhazip_api(&tx_clone, &cfg) {
-            let _ = tx_clone.send(TelemetryUpdate::Log(
-                LogLevel::Info,
-                format!("✓ icanhazip.com: IP={ip}"),
-            ));
-            let _ = tx_clone.send(TelemetryUpdate::PublicIp(ip));
-            let _ = tx_clone.send(TelemetryUpdate::Isp("Unknown".to_string()));
-            let _ = tx_clone.send(TelemetryUpdate::Location("Unknown".to_string()));
-            return;
-        }
+    if let Some(identity) = lookup_location_identity(tx, cfg, identity_state, None) {
+        identity_state.remember(identity.clone());
+        publish_identity(tx, ip_success_log, identity);
+        return;
+    }
 
-        let _ = tx_clone.send(TelemetryUpdate::Log(
-            LogLevel::Warning,
-            "icanhazip.com failed, trying ifconfig.me (last resort)...".to_string(),
-        ));
-
-        // Fallback 3: ifconfig.me (IP only)
-        if let Some(ip) = try_ifconfig_api(&tx_clone, &cfg) {
-            let _ = tx_clone.send(TelemetryUpdate::Log(
-                LogLevel::Info,
-                format!("✓ ifconfig.me: IP={ip}"),
-            ));
-            let _ = tx_clone.send(TelemetryUpdate::PublicIp(ip));
-            let _ = tx_clone.send(TelemetryUpdate::Isp("Unknown".to_string()));
-            let _ = tx_clone.send(TelemetryUpdate::Location("Unknown".to_string()));
-            return;
-        }
-
-        // All APIs failed - report error
-        let _ = tx_clone.send(TelemetryUpdate::Log(
-            LogLevel::Error,
-            "✗ ALL IP APIs FAILED! Check: 1) Network 2) curl installed 3) VPN routing 4) Firewall"
-                .to_string(),
-        ));
-        let _ = tx_clone.send(TelemetryUpdate::PublicIp("Unavailable".to_string()));
-    });
+    // All APIs failed - report error
+    ip_success_log.reset();
+    let _ = tx.send(TelemetryUpdate::Log(
+        LogLevel::Error,
+        "All public-egress APIs failed; check network, VPN routing, firewall, or provider availability"
+            .to_string(),
+    ));
+    let _ = tx.send(TelemetryUpdate::EgressUnavailable);
 }
 
-/// Try ipinfo.io API (returns IP and optionally ISP + Location) with retry
-fn try_ipinfo_api(
+fn publish_observed_ip(
     tx: &Sender<TelemetryUpdate>,
     cfg: &TelemetryConfig,
-) -> Option<(String, Option<String>, Option<String>)> {
+    ip_success_log: &mut IpSuccessLog,
+    identity_state: &mut EgressIdentityState,
+    public_ip: String,
+) {
+    let identity = identity_state
+        .complete_for(&public_ip)
+        .cloned()
+        .or_else(|| lookup_location_identity(tx, cfg, identity_state, Some(&public_ip)))
+        .unwrap_or(EgressIdentity {
+            public_ip,
+            isp: None,
+            location: None,
+        });
+    identity_state.remember(identity.clone());
+    publish_identity(tx, ip_success_log, identity);
+}
+
+fn publish_identity(
+    tx: &Sender<TelemetryUpdate>,
+    ip_success_log: &mut IpSuccessLog,
+    identity: EgressIdentity,
+) {
+    ip_success_log.publish(tx, &identity);
+    let _ = tx.send(TelemetryUpdate::EgressIdentity(identity));
+}
+
+fn lookup_location_identity(
+    tx: &Sender<TelemetryUpdate>,
+    cfg: &TelemetryConfig,
+    state: &mut EgressIdentityState,
+    public_ip: Option<&str>,
+) -> Option<EgressIdentity> {
+    let now = Instant::now();
+    let mut partial_primary = None;
+    if state.primary_is_available(now) {
+        match try_primary_geolocation(tx, cfg) {
+            PrimaryLookup::Found(identity)
+                if public_ip.is_none_or(|expected| identity.public_ip == expected) =>
+            {
+                if identity.is_location_capable() {
+                    return Some(identity);
+                }
+                partial_primary = Some(identity);
+            }
+            PrimaryLookup::Found(_) => {
+                let _ = tx.send(TelemetryUpdate::Log(
+                    LogLevel::Debug,
+                    "Geolocation response described a stale public IP; ignoring it".to_string(),
+                ));
+            }
+            PrimaryLookup::RateLimited => {
+                state.suppress_rate_limited_primary(now);
+                let _ = tx.send(TelemetryUpdate::Log(
+                    LogLevel::Warning,
+                    "Primary geolocation provider rate-limited requests; pausing it for 24 hours"
+                        .to_string(),
+                ));
+            }
+            PrimaryLookup::Unavailable => {}
+        }
+    }
+
+    let fallback = {
+        let fallback_ip = public_ip.or_else(|| {
+            partial_primary
+                .as_ref()
+                .map(|identity| identity.public_ip.as_str())
+        });
+        try_geolocation_fallback(tx, cfg, fallback_ip)
+    };
+    match (partial_primary, fallback) {
+        (Some(primary), Some(fallback)) => Some(EgressIdentity {
+            public_ip: fallback.public_ip,
+            isp: fallback.isp.or(primary.isp),
+            location: fallback.location.or(primary.location),
+        }),
+        (Some(primary), None) => Some(primary),
+        (None, fallback) => fallback,
+    }
+}
+
+/// Try the configured primary geolocation API with bounded retry.
+fn try_primary_geolocation(tx: &Sender<TelemetryUpdate>, cfg: &TelemetryConfig) -> PrimaryLookup {
     let timeout = Duration::from_secs(cfg.api_timeout);
 
     for attempt in 0..constants::RETRY_ATTEMPTS {
-        let Some(text) = crate::core::telemetry_http::get_text(&cfg.ip_api_primary, timeout) else {
-            let _ = tx.send(TelemetryUpdate::Log(
-                LogLevel::Debug,
-                format!(
-                    "ipinfo.io attempt {}: HTTP request failed (timeout / non-2xx / network)",
-                    attempt + 1
-                ),
-            ));
-            if attempt == 0 {
-                thread::sleep(Duration::from_millis(constants::RETRY_DELAY_MS));
+        let text = match crate::core::telemetry_http::get_text_result(&cfg.ip_api_primary, timeout)
+        {
+            Ok(text) => text,
+            Err(crate::core::telemetry_http::GetTextError::HttpStatus(429)) => {
+                return PrimaryLookup::RateLimited;
             }
-            continue;
+            Err(crate::core::telemetry_http::GetTextError::HttpStatus(status))
+                if (400..500).contains(&status) =>
+            {
+                let _ = tx.send(TelemetryUpdate::Log(
+                    LogLevel::Warning,
+                    format!("Primary geolocation API rejected the request (HTTP {status})"),
+                ));
+                return PrimaryLookup::Unavailable;
+            }
+            Err(_) => {
+                let _ = tx.send(TelemetryUpdate::Log(
+                    LogLevel::Debug,
+                    format!("Primary geolocation attempt {} failed", attempt + 1),
+                ));
+                if attempt == 0 {
+                    thread::sleep(Duration::from_millis(constants::RETRY_DELAY_MS));
+                }
+                continue;
+            }
         };
 
         let _ = tx.send(TelemetryUpdate::Log(
             LogLevel::Debug,
             format!(
-                "ipinfo.io attempt {}: received {} bytes",
+                "Primary geolocation attempt {}: received {} bytes",
                 attempt + 1,
                 text.len()
             ),
         ));
 
         if let Some(result) = parse_ip_api_response(&text) {
-            return Some(result);
+            let (public_ip, isp, location) = result;
+            return PrimaryLookup::Found(EgressIdentity {
+                public_ip,
+                isp,
+                location,
+            });
         }
         let _ = tx.send(TelemetryUpdate::Log(
             LogLevel::Warning,
-            format!("ipinfo.io attempt {}: failed to parse JSON", attempt + 1),
+            format!(
+                "Primary geolocation attempt {}: failed to parse JSON",
+                attempt + 1
+            ),
         ));
 
         if attempt == 0 {
@@ -258,11 +417,44 @@ fn try_ipinfo_api(
     let _ = tx.send(TelemetryUpdate::Log(
         LogLevel::Warning,
         format!(
-            "ipinfo.io: all {} attempts exhausted",
+            "Primary geolocation provider: all {} attempts exhausted",
             constants::RETRY_ATTEMPTS
         ),
     ));
-    None
+    PrimaryLookup::Unavailable
+}
+
+fn try_geolocation_fallback(
+    tx: &Sender<TelemetryUpdate>,
+    cfg: &TelemetryConfig,
+    public_ip: Option<&str>,
+) -> Option<EgressIdentity> {
+    let base = cfg.geolocation_api_fallback.trim_end_matches('/');
+    if base.is_empty() {
+        return None;
+    }
+    let url = public_ip.map_or_else(|| base.to_string(), |ip| format!("{base}/{ip}"));
+    let timeout = Duration::from_secs(cfg.api_timeout);
+    let text = match crate::core::telemetry_http::get_text_result(&url, timeout) {
+        Ok(text) => text,
+        Err(crate::core::telemetry_http::GetTextError::HttpStatus(status)) => {
+            let _ = tx.send(TelemetryUpdate::Log(
+                LogLevel::Debug,
+                format!("Location fallback returned HTTP {status}"),
+            ));
+            return None;
+        }
+        Err(crate::core::telemetry_http::GetTextError::Transport) => return None,
+    };
+    let (returned_ip, isp, location) = parse_ipwho_response(&text)?;
+    if public_ip.is_some_and(|expected| returned_ip != expected) {
+        return None;
+    }
+    Some(EgressIdentity {
+        public_ip: returned_ip,
+        isp,
+        location,
+    })
 }
 
 /// Validates if a string is a valid IPv4 address
@@ -394,6 +586,42 @@ struct IpApiResponse {
     status: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct IpWhoResponse {
+    success: bool,
+    ip: Option<String>,
+    city: Option<String>,
+    country_code: Option<String>,
+    connection: Option<IpWhoConnection>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IpWhoConnection {
+    isp: Option<String>,
+    org: Option<String>,
+}
+
+fn parse_ipwho_response(json: &str) -> Option<(String, Option<String>, Option<String>)> {
+    let response: IpWhoResponse = serde_json::from_str(json).ok()?;
+    if !response.success {
+        return None;
+    }
+    let ip = response.ip?;
+    if !is_valid_ipv4(&ip) {
+        return None;
+    }
+    let isp = response
+        .connection
+        .and_then(|connection| connection.isp.or(connection.org));
+    let location = match (response.city, response.country_code) {
+        (Some(city), Some(country)) => Some(format!("{city}, {country}")),
+        (Some(city), None) => Some(city),
+        (None, Some(country)) => Some(country),
+        (None, None) => None,
+    };
+    Some((ip, isp, location))
+}
+
 /// Parse IP API JSON response using proper JSON deserialization
 /// This replaces the unsafe string-matching approach with proper parsing
 /// that handles escaped quotes, unicode, and nested JSON correctly.
@@ -514,8 +742,7 @@ pub fn parse_ping_output(output: &str) -> PingStats {
 /// replaced the `ping -c 3 -i 0.2 -W <timeout>` shell-out
 /// with `core::icmp::measure_latency`. Same outputs (`latency_ms`,
 /// `packet_loss` %, `jitter_ms`); same retry-across-targets behavior;
-/// same `Latency(0) + PacketLoss(100) + Jitter(0)` final message when
-/// every target fails.
+/// same zero-latency, total-loss quality sample when every target fails.
 fn fetch_latency(tx: &Sender<TelemetryUpdate>, cfg: &std::sync::Arc<TelemetryConfig>) {
     // 3 probes, matching the prior `ping -c 3 -i 0.2` cadence.
     const PROBES_PER_TARGET: u32 = 3;
@@ -533,9 +760,11 @@ fn fetch_latency(tx: &Sender<TelemetryUpdate>, cfg: &std::sync::Arc<TelemetryCon
                     per_attempt_timeout,
                 ) {
                     if stats.latency_ms > 0 {
-                        let _ = tx_clone.send(TelemetryUpdate::Latency(stats.latency_ms));
-                        let _ = tx_clone.send(TelemetryUpdate::PacketLoss(stats.packet_loss));
-                        let _ = tx_clone.send(TelemetryUpdate::Jitter(stats.jitter_ms));
+                        let _ = tx_clone.send(TelemetryUpdate::NetworkQuality {
+                            latency_ms: stats.latency_ms,
+                            packet_loss: stats.packet_loss,
+                            jitter_ms: stats.jitter_ms,
+                        });
                         return;
                     }
                 }
@@ -546,9 +775,11 @@ fn fetch_latency(tx: &Sender<TelemetryUpdate>, cfg: &std::sync::Arc<TelemetryCon
             }
         }
 
-        let _ = tx_clone.send(TelemetryUpdate::Latency(0));
-        let _ = tx_clone.send(TelemetryUpdate::PacketLoss(100.0));
-        let _ = tx_clone.send(TelemetryUpdate::Jitter(0));
+        let _ = tx_clone.send(TelemetryUpdate::NetworkQuality {
+            latency_ms: 0,
+            packet_loss: 100.0,
+            jitter_ms: 0,
+        });
     });
 }
 
@@ -580,6 +811,48 @@ fn fetch_security_info(tx: &Sender<TelemetryUpdate>, cfg: &std::sync::Arc<Teleme
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ip_success_log_emits_changes_and_recovery_only_once() {
+        let (tx, rx) = mpsc::channel();
+        let mut log = IpSuccessLog::default();
+        let identity = EgressIdentity {
+            public_ip: "192.0.2.1".to_string(),
+            isp: Some("Example".to_string()),
+            location: Some("Test".to_string()),
+        };
+        let changed = EgressIdentity {
+            public_ip: "192.0.2.2".to_string(),
+            ..identity.clone()
+        };
+
+        log.publish(&tx, &identity);
+        log.publish(&tx, &identity);
+
+        let first_pass = rx.try_iter().collect::<Vec<_>>();
+        assert_eq!(first_pass.len(), 1);
+        assert!(matches!(
+            &first_pass[0],
+            TelemetryUpdate::Log(LogLevel::Info, emitted) if emitted.contains("192.0.2.1")
+        ));
+
+        log.publish(&tx, &changed);
+        log.publish(&tx, &changed);
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(TelemetryUpdate::Log(LogLevel::Info, emitted)) if emitted.contains("192.0.2.2")
+        ));
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+
+        log.reset();
+        log.publish(&tx, &changed);
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(TelemetryUpdate::Log(LogLevel::Info, emitted)) if emitted.contains("192.0.2.2")
+        ));
+    }
 
     #[test]
     fn test_extract_json_string_ip() {
@@ -721,6 +994,91 @@ rtt min/avg/max/mdev = 1.234/5.678/9.012/3.456 ms";
         assert!(parse_ip_api_response(r#"{"ip": "not_an_ip"}"#).is_none());
     }
 
+    #[test]
+    fn parses_location_capable_fallback_response() {
+        let json = r#"{
+            "success": true,
+            "ip": "171.61.17.181",
+            "city": "Agra",
+            "country_code": "IN",
+            "connection": {"isp": "Bharti Airtel Ltd."}
+        }"#;
+
+        assert_eq!(
+            parse_ipwho_response(json),
+            Some((
+                "171.61.17.181".to_string(),
+                Some("Bharti Airtel Ltd.".to_string()),
+                Some("Agra, IN".to_string()),
+            ))
+        );
+    }
+
+    #[test]
+    fn complete_identity_cache_is_bound_to_exact_public_ip() {
+        let mut state = EgressIdentityState {
+            located: VecDeque::from([EgressIdentity {
+                public_ip: "192.0.2.1".to_string(),
+                isp: Some("Example ISP".to_string()),
+                location: Some("Test, ZZ".to_string()),
+            }]),
+            primary_retry_at: None,
+        };
+
+        assert!(state.complete_for("192.0.2.1").is_some());
+        assert!(state.complete_for("192.0.2.2").is_none());
+
+        state.remember(EgressIdentity {
+            public_ip: "192.0.2.2".to_string(),
+            isp: Some("ISP without location".to_string()),
+            location: None,
+        });
+        assert!(
+            state.complete_for("192.0.2.2").is_none(),
+            "ISP-only metadata must not suppress a later location lookup"
+        );
+        assert!(
+            state.complete_for("192.0.2.1").is_some(),
+            "switching exits must retain a bounded prior location"
+        );
+    }
+
+    #[test]
+    fn primary_rate_limit_is_not_retried() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+        let cfg = TelemetryConfig {
+            poll_rate: Duration::from_secs(30),
+            api_timeout: 1,
+            ping_timeout: 1,
+            ping_targets: Vec::new(),
+            ipv6_check_apis: Vec::new(),
+            ip_api_primary: format!("http://{address}/limited"),
+            ip_api_fallbacks: Vec::new(),
+            geolocation_api_fallback: String::new(),
+        };
+        let (tx, _rx) = mpsc::channel();
+
+        assert_eq!(
+            try_primary_geolocation(&tx, &cfg),
+            PrimaryLookup::RateLimited
+        );
+        server.join().unwrap();
+    }
+
     // === TelemetryConfig conversion ===
 
     #[test]
@@ -740,6 +1098,7 @@ rtt min/avg/max/mdev = 1.234/5.678/9.012/3.456 ms";
                 "https://fb1.example.com".to_string(),
                 "https://fb2.example.com".to_string(),
             ],
+            geolocation_api_fallback: "https://geo.example.com".to_string(),
             max_log_entries: 1000,
             log_level: "info".to_string(),
             log_rotation_size: 5 * 1024 * 1024,
@@ -764,6 +1123,7 @@ rtt min/avg/max/mdev = 1.234/5.678/9.012/3.456 ms";
         assert_eq!(tel_cfg.ip_api_fallbacks.len(), 2);
         assert_eq!(tel_cfg.ip_api_fallbacks[0], "https://fb1.example.com");
         assert_eq!(tel_cfg.ip_api_fallbacks[1], "https://fb2.example.com");
+        assert_eq!(tel_cfg.geolocation_api_fallback, "https://geo.example.com");
     }
 
     #[test]
@@ -777,5 +1137,9 @@ rtt min/avg/max/mdev = 1.234/5.678/9.012/3.456 ms";
         assert_eq!(tel_cfg.ping_targets.len(), 4);
         assert_eq!(tel_cfg.ipv6_check_apis.len(), 3);
         assert_eq!(tel_cfg.ip_api_fallbacks.len(), 3);
+        assert_eq!(
+            tel_cfg.geolocation_api_fallback,
+            crate::constants::DEFAULT_GEOLOCATION_API_FALLBACK
+        );
     }
 }

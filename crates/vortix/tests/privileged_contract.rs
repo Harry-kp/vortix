@@ -6,12 +6,15 @@ use vortix::vortix_core::cidr::Cidr;
 use vortix::vortix_core::control::AuthorityEpoch;
 use vortix::vortix_core::privileged::{
     ChildObservation, ChildOwner, ContainmentId, CustodianAction, DnsHostname, HelperEpoch,
-    ObservedChildIdentity, OpenVpnAuthFactors, OpenVpnChallengeKind, OpenVpnPlan, OpenVpnRemote,
-    OpenVpnRemoteSelection, OpenVpnRoute, OpenVpnTransport, OperationDigest,
-    PrivilegedDnsAssignment, PrivilegedDnsScope, ProfileMaterialRef, ProfileMaterialSlot,
-    ProtocolEndpoint, ProtocolPlan, ProtocolPlanError, ResourceKind, ResourceObservationTarget,
-    ResourceTag, ServiceInstanceClaim, StandardCustodianContract, WireGuardInterfaceOptions,
-    WireGuardPeerPlan, WireGuardPlan, WireGuardPresharedKeyRef,
+    ObservationState, ObservedChildIdentity, OpenVpnAuthFactors, OpenVpnChallengeKind,
+    OpenVpnDefaultGateway, OpenVpnDefaultGateways, OpenVpnPlan, OpenVpnRedirectFlag,
+    OpenVpnRedirectGateway, OpenVpnRemote, OpenVpnRemoteSelection, OpenVpnRoute,
+    OpenVpnRouteDefaults, OpenVpnRouteEvidence, OpenVpnRouteGateway, OpenVpnRouteSetEvidence,
+    OpenVpnTransport, OperationDigest, PrivilegedDnsAssignment, PrivilegedDnsScope,
+    ProfileMaterialRef, ProfileMaterialSlot, ProtocolEndpoint, ProtocolPlan, ProtocolPlanError,
+    ResourceKind, ResourceObservation, ResourceObservationTarget, ResourceTag,
+    ServiceInstanceClaim, StandardCustodianContract, WireGuardInterfaceOptions, WireGuardPeerPlan,
+    WireGuardPlan, WireGuardPresharedKeyRef,
 };
 use vortix::vortix_core::profile::{ProfileId, ProtocolKind};
 
@@ -153,6 +156,108 @@ fn protocol_semantics_preserve_composite_openvpn_and_sparse_wireguard() {
         WireGuardInterfaceOptions::default(),
     )
     .is_err());
+}
+
+#[test]
+fn managed_openvpn_route_evidence_preserves_configured_and_pushed_semantics() {
+    let configured =
+        OpenVpnRoute::with_gateway(cidr(4), OpenVpnRouteGateway::RemoteHost, Some(5)).unwrap();
+    let pushed = OpenVpnRoute::new(cidr(5), None, Some(9)).unwrap();
+    let redirect = OpenVpnRedirectGateway::new(vec![OpenVpnRedirectFlag::Def1]).unwrap();
+    let evidence = OpenVpnRouteEvidence::new(
+        OpenVpnRouteSetEvidence::new(vec![configured], None).unwrap(),
+        OpenVpnRouteSetEvidence::new(vec![pushed], Some(redirect)).unwrap(),
+    )
+    .unwrap()
+    .with_selected_remote(Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7))))
+    .unwrap();
+    let tunnel = ResourceTag::tunnel(profile('b'), 4).unwrap();
+    let observation =
+        ResourceObservation::with_openvpn_routes(tunnel, ObservationState::Present, 7, evidence)
+            .unwrap();
+
+    let encoded = serde_json::to_value(&observation).unwrap();
+    let mut missing_selected = encoded.clone();
+    missing_selected
+        .get_mut("openvpn_routes")
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .remove("selected_remote");
+    assert!(serde_json::from_value::<ResourceObservation>(missing_selected).is_err());
+    let mut invalid_selected = encoded.clone();
+    invalid_selected["openvpn_routes"]["selected_remote"] = serde_json::json!("0.0.0.0");
+    assert!(serde_json::from_value::<ResourceObservation>(invalid_selected).is_err());
+    let round_trip: ResourceObservation = serde_json::from_value(encoded).unwrap();
+    let evidence = round_trip.openvpn_routes().unwrap();
+    assert_eq!(
+        evidence.configured().routes()[0].gateway(),
+        configured.gateway()
+    );
+    assert_eq!(evidence.configured().routes()[0].metric(), Some(5));
+    assert_eq!(
+        evidence.pushed().routes()[0].destination(),
+        pushed.destination()
+    );
+    assert!(evidence.pushed().redirect_gateway().unwrap().ipv4());
+    assert!(!evidence.pushed().redirect_gateway().unwrap().ipv6());
+    assert_eq!(
+        evidence.selected_remote(),
+        Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)))
+    );
+}
+
+#[test]
+fn managed_openvpn_route_evidence_preserves_default_gateway_directives_by_origin() {
+    let configured_gateways = OpenVpnDefaultGateways::new(
+        Some(OpenVpnDefaultGateway::Address("10.8.0.1".parse().unwrap())),
+        Some("2001:db8::1".parse().unwrap()),
+    )
+    .unwrap();
+    let pushed_gateways =
+        OpenVpnDefaultGateways::new(Some(OpenVpnDefaultGateway::Dhcp), None).unwrap();
+    let evidence = OpenVpnRouteEvidence::new(
+        OpenVpnRouteSetEvidence::with_route_defaults(
+            Vec::new(),
+            None,
+            OpenVpnRouteDefaults::new(configured_gateways, Some(7)),
+        )
+        .unwrap(),
+        OpenVpnRouteSetEvidence::with_route_defaults(
+            Vec::new(),
+            None,
+            OpenVpnRouteDefaults::new(pushed_gateways, Some(9)),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+    let round_trip: OpenVpnRouteEvidence =
+        serde_json::from_value(serde_json::to_value(evidence).unwrap()).unwrap();
+    assert_eq!(
+        round_trip.configured().route_defaults().gateways(),
+        configured_gateways
+    );
+    assert_eq!(
+        round_trip.pushed().route_defaults().gateways(),
+        pushed_gateways
+    );
+    assert_eq!(round_trip.configured().route_defaults().metric(), Some(7));
+    assert_eq!(round_trip.pushed().route_defaults().metric(), Some(9));
+}
+
+#[test]
+fn openvpn_route_gateway_wire_preserves_roles_and_reads_legacy_null() {
+    let route =
+        OpenVpnRoute::with_gateway(cidr(4), OpenVpnRouteGateway::NetGateway, Some(5)).unwrap();
+    let encoded = serde_json::to_value(route).unwrap();
+    let decoded: OpenVpnRoute = serde_json::from_value(encoded.clone()).unwrap();
+    assert_eq!(decoded.gateway(), OpenVpnRouteGateway::NetGateway);
+
+    let mut legacy = encoded;
+    legacy["gateway"] = serde_json::Value::Null;
+    let decoded: OpenVpnRoute = serde_json::from_value(legacy).unwrap();
+    assert_eq!(decoded.gateway(), OpenVpnRouteGateway::VpnDefault);
 }
 
 #[test]

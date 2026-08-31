@@ -106,6 +106,18 @@ pub(crate) fn prepare_profile_import(
         }
     };
 
+    if protocol == Protocol::WireGuard {
+        let interface_name = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .ok_or_else(|| "WireGuard profile filename is not valid UTF-8".to_string())?;
+        crate::vortix_core::profile::validate_wireguard_interface_name(interface_name).map_err(
+            |reason| {
+                format!("{reason}. Rename the file (for example, to wg07.conf) and import it again")
+            },
+        )?;
+    }
+
     // Extract and validate profile info
     let (name, location) = match protocol {
         Protocol::WireGuard => parse_wireguard_config(&content, path)?,
@@ -546,7 +558,7 @@ pub(crate) fn load_profiles_from(profiles_dir: &Path) -> Vec<VpnProfile> {
                         protocol,
                         location,
                         config_path: path.clone(),
-                        last_used: None,
+                        last_used: summary.last_used,
                     });
                 }
                 Err(e) => {
@@ -609,15 +621,21 @@ mod tests {
             ProtocolKind::OpenVpn,
             config_path.clone(),
         );
-        FsProfileStore::new(profiles_dir.path().to_path_buf())
+        let store = FsProfileStore::new(profiles_dir.path().to_path_buf());
+        store
             .insert(&profile, b"client\ndev tun\nremote vpn.example.com 1194\n")
             .unwrap();
+        store.touch(&profile.id).unwrap();
 
         let loaded = load_profiles_from(profiles_dir.path());
 
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].protocol, Protocol::OpenVPN);
         assert_eq!(loaded[0].config_path, config_path);
+        assert!(
+            loaded[0].last_used.is_some(),
+            "the stable-ID sidecar timestamp must survive catalog loading"
+        );
     }
 
     #[test]
@@ -748,6 +766,27 @@ proto udp
         let result = import_profile(&path);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Unsupported file type"));
+    }
+
+    #[test]
+    fn prepare_import_rejects_wireguard_filename_that_wg_quick_cannot_use() {
+        let source = tempfile::tempdir().unwrap();
+        let profiles = tempfile::tempdir().unwrap();
+        let path = source.path().join("07-wireguard-split-ip.conf");
+        std::fs::write(
+            &path,
+            "[Interface]\nPrivateKey = abc\nAddress = 10.0.0.2/32\n\n[Peer]\nPublicKey = xyz\nEndpoint = 192.0.2.1:51820\n",
+        )
+        .unwrap();
+
+        let Err(error) = prepare_profile_import(&path, profiles.path()) else {
+            panic!("invalid WireGuard filename must be rejected");
+        };
+
+        assert!(error.contains("1–15 characters"));
+        assert!(error.contains("Rename the file"));
+        assert!(error.contains("wg07.conf"));
+        assert!(std::fs::read_dir(profiles.path()).unwrap().next().is_none());
     }
 
     // === Extended config parsing edge cases ===

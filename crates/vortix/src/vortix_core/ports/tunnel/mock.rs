@@ -152,6 +152,7 @@ fn outcome_to_handle(
             process_ownership: None,
             teardown_config: None,
             dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
+            openvpn_routes: None,
         }),
         ScriptedTunnelOutcome::UpSuccess {
             interface_name,
@@ -169,6 +170,7 @@ fn outcome_to_handle(
             process_ownership: None,
             teardown_config: None,
             dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),
+            openvpn_routes: None,
         }),
         ScriptedTunnelOutcome::DelayedSuccess(delay) => {
             std::thread::sleep(delay);

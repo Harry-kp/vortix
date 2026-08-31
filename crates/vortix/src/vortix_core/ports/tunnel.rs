@@ -70,6 +70,10 @@ pub enum TunnelKindTag {
 pub struct TunnelTeardownConfig {
     pub path: PathBuf,
     pub managed: bool,
+    /// Stable basename passed to `wg-quick`. On macOS this differs from the
+    /// kernel-assigned `utunN` interface and is required to resolve the
+    /// `/var/run/wireguard/<name>.name` ownership mapping during teardown.
+    pub wg_quick_interface: Option<String>,
 }
 
 /// Lifecycle handle returned by [`Tunnel::up`] and consumed by `down` / `status`.
@@ -105,6 +109,9 @@ pub struct TunnelHandle {
     /// available, its negotiated runtime options. Platform mutation is not
     /// performed by the protocol adapter.
     pub dns_request: crate::vortix_core::ports::dns::DnsRequest,
+    /// Complete configured and negotiated `OpenVPN` route truth from the
+    /// same live generation. Other protocols carry `None`.
+    pub openvpn_routes: Option<crate::vortix_core::privileged::OpenVpnRouteEvidence>,
 }
 
 /// Protocol-attested record of one `WireGuard` peer probe.

@@ -261,6 +261,16 @@ impl KillSwitchState {
             Self::Degraded => "degraded",
         }
     }
+
+    /// Optional detail paired with [`Self::display_status`] on compact human
+    /// surfaces. Keeping this copy here prevents TUI/CLI wording drift.
+    #[must_use]
+    pub const fn status_detail(self) -> Option<&'static str> {
+        match self {
+            Self::Degraded => Some("firewall policy unverified"),
+            Self::Disabled | Self::Armed | Self::Blocking => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -280,6 +290,10 @@ mod tests {
         assert!(!KillSwitchState::Armed.is_blocking());
         assert!(KillSwitchState::Blocking.is_blocking());
         assert!(!KillSwitchState::Degraded.is_blocking());
+        assert_eq!(
+            KillSwitchState::Degraded.status_detail(),
+            Some("firewall policy unverified")
+        );
     }
 
     #[test]

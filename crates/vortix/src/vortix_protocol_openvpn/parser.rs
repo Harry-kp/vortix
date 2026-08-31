@@ -2,15 +2,21 @@
 //! the directives required by the multi-tunnel registry (remotes, default
 //! route claim, explicit routes).
 
-use std::net::IpAddr;
+use std::collections::BTreeSet;
+use std::net::{IpAddr, Ipv6Addr};
 use std::str::FromStr;
+
+use crate::vortix_core::privileged::{
+    OpenVpnDefaultGateway, OpenVpnDefaultGateways, OpenVpnRedirectFlag, OpenVpnRedirectGateway,
+    OpenVpnRouteDefaults, OpenVpnRouteGateway,
+};
 
 use tracing::warn;
 
 use crate::vortix_core::ports::tunnel::{ParseError, ParsedProfile};
 
 /// IP-family CIDR. Local until a shared helper introduces `vortix_core::cidr`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Cidr {
     pub addr: IpAddr,
     pub prefix_len: u8,
@@ -62,10 +68,10 @@ pub struct RemoteSpec {
 }
 
 /// One `route` directive entry.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct OvpnRoute {
     pub destination: Cidr,
-    pub gateway: Option<IpAddr>,
+    pub gateway: OpenVpnRouteGateway,
     pub metric: Option<u32>,
 }
 
@@ -106,9 +112,13 @@ pub struct OvpnParsedProfile {
     pub remotes: Vec<RemoteSpec>,
     /// `remote-random` flag — caller may shuffle `remotes` when true.
     pub remote_random: bool,
-    /// `redirect-gateway` presence (any flag form: `def1`, `bypass-dhcp`, …).
-    pub redirect_gateway: bool,
-    /// Explicit `route` directives.
+    /// Exact reviewed `redirect-gateway` flags.
+    pub redirect_gateway: Option<OpenVpnRedirectGateway>,
+    /// Exact configured `route-gateway` and `route-ipv6-gateway` directives.
+    pub route_defaults: OpenVpnRouteDefaults,
+    /// Whether a route-related directive could not be represented exactly.
+    pub unsupported_route_semantics: bool,
+    /// Explicit `route` and `route-ipv6` directives.
     pub routes: Vec<OvpnRoute>,
     /// Resolver addresses requested with `dhcp-option DNS`.
     pub dns_servers: Vec<IpAddr>,
@@ -182,18 +192,14 @@ pub fn parse_ovpn_conf(text: &str) -> Result<OvpnParsedProfile, ParseError> {
             "remote-random" => {
                 profile.remote_random = true;
             }
-            "redirect-gateway" | "redirect-private" => {
-                // Presence-only: any flag form (def1, bypass-dhcp, autolocal, …)
-                // means the tunnel claims the default route.
-                profile.redirect_gateway = true;
-            }
-            "route" => {
-                if let Some(route) = parse_route(&mut tokens) {
-                    profile.routes.push(route);
-                } else {
-                    warn!(line = %line, "ovpn: malformed route directive — skipping");
-                }
-            }
+            "redirect-gateway"
+            | "redirect-gateway-ipv6"
+            | "redirect-private"
+            | "route-gateway"
+            | "route-ipv6-gateway"
+            | "route-metric"
+            | "route"
+            | "route-ipv6" => apply_route_directive(&mut profile, &directive, &mut tokens, line),
             "dhcp-option" => match tokens.next() {
                 Some(kind) if kind.eq_ignore_ascii_case("DNS") => {
                     if let Some(server) = tokens.next().and_then(|value| value.parse().ok()) {
@@ -241,6 +247,123 @@ pub fn parse_ovpn_conf(text: &str) -> Result<OvpnParsedProfile, ParseError> {
     }
 
     Ok(profile)
+}
+
+fn apply_route_directive<'a, I>(
+    profile: &mut OvpnParsedProfile,
+    directive: &str,
+    tokens: &mut I,
+    line: &str,
+) where
+    I: Iterator<Item = &'a str>,
+{
+    match directive {
+        "redirect-gateway" => {
+            if let Some(parsed) = parse_redirect_gateway(tokens) {
+                profile.redirect_gateway = Some(merge_redirect_gateways(
+                    profile.redirect_gateway.as_ref(),
+                    &parsed,
+                ));
+            } else {
+                profile.unsupported_route_semantics = true;
+            }
+        }
+        "redirect-gateway-ipv6" => {
+            if tokens.next().is_some() {
+                profile.unsupported_route_semantics = true;
+                return;
+            }
+            let parsed = OpenVpnRedirectGateway::new(vec![
+                OpenVpnRedirectFlag::Ipv6,
+                OpenVpnRedirectFlag::DisableIpv4,
+            ])
+            .expect("distinct reviewed flags are valid");
+            profile.redirect_gateway = Some(merge_redirect_gateways(
+                profile.redirect_gateway.as_ref(),
+                &parsed,
+            ));
+        }
+        "redirect-private" => profile.unsupported_route_semantics = true,
+        "route-gateway" => {
+            let Some(gateway) = parse_ipv4_default_gateway(tokens) else {
+                profile.unsupported_route_semantics = true;
+                return;
+            };
+            let current = profile.route_defaults;
+            let gateways = OpenVpnDefaultGateways::new(Some(gateway), current.gateways().ipv6())
+                .expect("reviewed IPv4 gateway is valid");
+            profile.route_defaults = OpenVpnRouteDefaults::new(gateways, current.metric());
+        }
+        "route-ipv6-gateway" => {
+            let Some(gateway) = parse_ipv6_default_gateway(tokens) else {
+                profile.unsupported_route_semantics = true;
+                return;
+            };
+            let current = profile.route_defaults;
+            let gateways = OpenVpnDefaultGateways::new(current.gateways().ipv4(), Some(gateway))
+                .expect("reviewed IPv6 gateway is valid");
+            profile.route_defaults = OpenVpnRouteDefaults::new(gateways, current.metric());
+        }
+        "route-metric" => {
+            let Some(metric) = parse_default_route_metric(tokens) else {
+                profile.unsupported_route_semantics = true;
+                return;
+            };
+            profile.route_defaults =
+                OpenVpnRouteDefaults::new(profile.route_defaults.gateways(), Some(metric));
+        }
+        "route" | "route-ipv6" => match parse_route(tokens) {
+            Some(route) if route.destination.addr.is_ipv6() == (directive == "route-ipv6") => {
+                profile.routes.push(route);
+            }
+            _ => {
+                profile.unsupported_route_semantics = true;
+                warn!(line = %line, "ovpn: malformed route directive — skipping");
+            }
+        },
+        _ => unreachable!("caller filters route directives"),
+    }
+}
+
+pub(super) fn parse_ipv4_default_gateway<'a, I>(tokens: &mut I) -> Option<OpenVpnDefaultGateway>
+where
+    I: Iterator<Item = &'a str>,
+{
+    let value = tokens.next()?;
+    if tokens.next().is_some() {
+        return None;
+    }
+    if value.eq_ignore_ascii_case("dhcp") {
+        return Some(OpenVpnDefaultGateway::Dhcp);
+    }
+    let address = value.parse::<IpAddr>().ok()?;
+    let gateways =
+        OpenVpnDefaultGateways::new(Some(OpenVpnDefaultGateway::Address(address)), None).ok()?;
+    gateways.ipv4()
+}
+
+pub(super) fn parse_ipv6_default_gateway<'a, I>(tokens: &mut I) -> Option<Ipv6Addr>
+where
+    I: Iterator<Item = &'a str>,
+{
+    let address = tokens.next()?.parse::<Ipv6Addr>().ok()?;
+    if tokens.next().is_some() {
+        return None;
+    }
+    OpenVpnDefaultGateways::new(None, Some(address))
+        .ok()?
+        .ipv6()
+}
+
+pub(super) fn parse_default_route_metric<'a, I>(tokens: &mut I) -> Option<u32>
+where
+    I: Iterator<Item = &'a str>,
+{
+    let metric = tokens.next()?.parse().ok()?;
+    if tokens.next().is_some() {
+        return None;
+    }
+    Some(metric)
 }
 
 fn is_forbidden_privileged_directive(directive: &str) -> bool {
@@ -374,7 +497,7 @@ where
     Some(RemoteSpec { host, port, proto })
 }
 
-fn parse_route<'a, I>(tokens: &mut I) -> Option<OvpnRoute>
+pub(super) fn parse_route<'a, I>(tokens: &mut I) -> Option<OvpnRoute>
 where
     I: Iterator<Item = &'a str>,
 {
@@ -390,22 +513,70 @@ where
         (Cidr::parse_netmask_v4(dest_tok, mask)?, tokens.next())
     };
 
-    // Gateway is optional. OpenVPN accepts the literal `default`, which we
-    // model as "no explicit gateway" so callers fall back to the tunnel's
-    // assigned gateway.
+    // Preserve OpenVPN gateway roles until the helper can resolve them at the
+    // authenticated OS-effect boundary.
     let gateway = match gateway_tok {
-        Some(tok) if tok.eq_ignore_ascii_case("default") => None,
-        Some(tok) => Some(IpAddr::from_str(tok).ok()?),
-        None => None,
+        Some(tok)
+            if tok.eq_ignore_ascii_case("default") || tok.eq_ignore_ascii_case("vpn_gateway") =>
+        {
+            OpenVpnRouteGateway::VpnDefault
+        }
+        Some(tok) if tok.eq_ignore_ascii_case("net_gateway") => OpenVpnRouteGateway::NetGateway,
+        Some(tok) if tok.eq_ignore_ascii_case("remote_host") => OpenVpnRouteGateway::RemoteHost,
+        Some(tok) => OpenVpnRouteGateway::Address(IpAddr::from_str(tok).ok()?),
+        None => OpenVpnRouteGateway::VpnDefault,
     };
 
-    let metric = tokens.next().and_then(|m| m.parse::<u32>().ok());
+    let metric = match tokens.next() {
+        Some(metric) => Some(metric.parse::<u32>().ok()?),
+        None => None,
+    };
+    if tokens.next().is_some() {
+        return None;
+    }
 
     Some(OvpnRoute {
         destination,
         gateway,
         metric,
     })
+}
+
+pub(super) fn parse_redirect_gateway<'a, I>(tokens: &mut I) -> Option<OpenVpnRedirectGateway>
+where
+    I: Iterator<Item = &'a str>,
+{
+    let flags = tokens
+        .map(|token| match token.to_ascii_lowercase().as_str() {
+            "local" => Some(OpenVpnRedirectFlag::Local),
+            "autolocal" => Some(OpenVpnRedirectFlag::AutoLocal),
+            "def1" => Some(OpenVpnRedirectFlag::Def1),
+            "bypass-dhcp" => Some(OpenVpnRedirectFlag::BypassDhcp),
+            "bypass-dns" => Some(OpenVpnRedirectFlag::BypassDns),
+            "block-local" => Some(OpenVpnRedirectFlag::BlockLocal),
+            "ipv6" => Some(OpenVpnRedirectFlag::Ipv6),
+            "!ipv4" => Some(OpenVpnRedirectFlag::DisableIpv4),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    OpenVpnRedirectGateway::new(flags).ok()
+}
+
+pub(super) fn merge_redirect_gateways(
+    current: Option<&OpenVpnRedirectGateway>,
+    added: &OpenVpnRedirectGateway,
+) -> OpenVpnRedirectGateway {
+    let mut flags = current
+        .into_iter()
+        .flat_map(OpenVpnRedirectGateway::flags)
+        .copied()
+        .chain(added.flags().iter().copied())
+        .collect::<BTreeSet<_>>();
+    if current.is_some_and(OpenVpnRedirectGateway::ipv4) || added.ipv4() {
+        flags.remove(&OpenVpnRedirectFlag::DisableIpv4);
+    }
+    OpenVpnRedirectGateway::new(flags.into_iter().collect())
+        .expect("set union contains only distinct reviewed flags")
 }
 
 #[cfg(test)]
@@ -586,21 +757,32 @@ mod tests {
     fn redirect_gateway_def1_sets_flag() {
         let text = "client\nredirect-gateway def1\n";
         let p = parse_ovpn_conf(text).unwrap();
-        assert!(p.redirect_gateway);
+        let redirect = p.redirect_gateway.unwrap();
+        assert!(redirect.ipv4());
+        assert!(redirect.flags().contains(&OpenVpnRedirectFlag::Def1));
     }
 
     #[test]
     fn redirect_gateway_bare_also_sets_flag() {
         let text = "client\nredirect-gateway\n";
         let p = parse_ovpn_conf(text).unwrap();
-        assert!(p.redirect_gateway);
+        assert!(p.redirect_gateway.unwrap().ipv4());
+    }
+
+    #[test]
+    fn redirect_private_is_not_a_default_route_and_ipv6_is_distinct() {
+        let p = parse_ovpn_conf("redirect-private def1\nredirect-gateway-ipv6\n").unwrap();
+        let redirect = p.redirect_gateway.unwrap();
+        assert!(!redirect.ipv4());
+        assert!(redirect.ipv6());
+        assert!(p.unsupported_route_semantics);
     }
 
     #[test]
     fn no_redirect_with_two_routes() {
         let text = "client\nroute 10.0.0.0 255.0.0.0\nroute 192.168.1.0 255.255.255.0\n";
         let p = parse_ovpn_conf(text).unwrap();
-        assert!(!p.redirect_gateway);
+        assert!(p.redirect_gateway.is_none());
         assert_eq!(p.routes.len(), 2);
         assert_eq!(p.routes[0].destination.prefix_len, 8);
         assert_eq!(p.routes[1].destination.prefix_len, 24);
@@ -641,6 +823,7 @@ mod tests {
         let text = "client\nroute\nroute 10.0.0.0/8\nremote vpn.example.com 1194 udp\n";
         let p = parse_ovpn_conf(text).unwrap();
         assert_eq!(p.routes.len(), 1);
+        assert!(p.unsupported_route_semantics);
         assert_eq!(p.routes[0].destination.prefix_len, 8);
         assert_eq!(p.remotes.len(), 1);
     }
@@ -652,17 +835,57 @@ mod tests {
         assert_eq!(p.routes.len(), 1);
         assert_eq!(
             p.routes[0].gateway,
-            Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)))
+            OpenVpnRouteGateway::Address(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)))
         );
         assert_eq!(p.routes[0].metric, Some(100));
     }
 
     #[test]
-    fn route_default_keyword_yields_no_gateway() {
-        let text = "route 10.0.0.0 255.0.0.0 default\n";
+    fn route_gateway_roles_are_preserved() {
+        let text = "route 10.0.0.0 255.0.0.0 default\nroute 192.0.2.0 255.255.255.0 net_gateway\nroute 198.51.100.0 255.255.255.0 remote_host\n";
         let p = parse_ovpn_conf(text).unwrap();
-        assert_eq!(p.routes.len(), 1);
-        assert!(p.routes[0].gateway.is_none());
+        assert_eq!(p.routes.len(), 3);
+        assert_eq!(p.routes[0].gateway, OpenVpnRouteGateway::VpnDefault);
+        assert_eq!(p.routes[1].gateway, OpenVpnRouteGateway::NetGateway);
+        assert_eq!(p.routes[2].gateway, OpenVpnRouteGateway::RemoteHost);
+    }
+
+    #[test]
+    fn route_default_gateway_directives_are_preserved_and_validated() {
+        let parsed = parse_ovpn_conf(
+            "route-gateway 10.8.0.1\nroute-ipv6-gateway 2001:db8::1\nroute-metric 23\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.route_defaults.gateways().ipv4(),
+            Some(OpenVpnDefaultGateway::Address("10.8.0.1".parse().unwrap()))
+        );
+        assert_eq!(
+            parsed.route_defaults.gateways().ipv6(),
+            Some("2001:db8::1".parse().unwrap())
+        );
+        assert_eq!(parsed.route_defaults.metric(), Some(23));
+
+        let dhcp = parse_ovpn_conf("route-gateway dhcp\n").unwrap();
+        assert_eq!(
+            dhcp.route_defaults.gateways().ipv4(),
+            Some(OpenVpnDefaultGateway::Dhcp)
+        );
+
+        for malformed in [
+            "route-gateway\n",
+            "route-gateway vpn.example.test\n",
+            "route-gateway 10.8.0.1 trailing\n",
+            "route-ipv6-gateway 10.8.0.1\n",
+            "route-metric invalid\n",
+        ] {
+            assert!(
+                parse_ovpn_conf(malformed)
+                    .unwrap()
+                    .unsupported_route_semantics,
+                "{malformed:?} must fail closed"
+            );
+        }
     }
 
     #[test]

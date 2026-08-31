@@ -380,6 +380,39 @@ pub(super) fn process_group_has_live_members(group_id: u32) -> Result<bool, Proc
 }
 
 #[cfg(unix)]
+pub(super) fn process_is_nonleader_group_member(
+    process_id: u32,
+    group_id: u32,
+) -> Result<bool, ProcessError> {
+    if process_id == group_id {
+        return Ok(false);
+    }
+    let process_id = i32::try_from(process_id).map_err(|_| ProcessError::IoError {
+        program: "managed-child".into(),
+        source: std::io::Error::other("process ID exceeds pid_t"),
+    })?;
+    let group_id = i32::try_from(group_id).map_err(|_| ProcessError::IoError {
+        program: "managed-child".into(),
+        source: std::io::Error::other("process-group ID exceeds pid_t"),
+    })?;
+    // SAFETY: getpgid reads one kernel process attribute and does not touch
+    // Rust memory. ESRCH is authoritative absence; other errors fail closed.
+    #[allow(unsafe_code)]
+    let observed_group = unsafe { libc::getpgid(process_id) };
+    if observed_group >= 0 {
+        return Ok(observed_group == group_id);
+    }
+    let source = std::io::Error::last_os_error();
+    match source.raw_os_error() {
+        Some(libc::ESRCH) => Ok(false),
+        _ => Err(ProcessError::IoError {
+            program: "managed-child".into(),
+            source,
+        }),
+    }
+}
+
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProcessGroupProbe {
     Absent,

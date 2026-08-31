@@ -378,11 +378,7 @@ pub fn sweep_orphan_temp_configs(config_dir: &std::path::Path, current_session_i
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        if name == current_session_id
-            || !entry
-                .file_type()
-                .is_ok_and(|kind| kind.is_dir() && !kind.is_symlink())
-        {
+        if name == current_session_id || !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
             continue;
         }
         let lease = std::fs::OpenOptions::new()
@@ -433,7 +429,7 @@ pub fn get_tmp_config_dir(session_id: &str) -> std::io::Result<std::path::PathBu
 pub use crate::vortix_core::profile::sanitize_profile_name;
 use crate::vortix_core::profile::unambiguous_legacy_artifact_key;
 
-fn validate_openvpn_artifact_key(key: &str) -> std::io::Result<()> {
+pub(crate) fn validate_openvpn_artifact_key(key: &str) -> std::io::Result<()> {
     if !key.is_empty()
         && key
             .bytes()
@@ -529,37 +525,6 @@ pub fn cleanup_openvpn_run_files_compat(profile_id: &str, legacy_display_name: &
     }
 }
 
-/// Returns the path for an `OpenVPN` auth credentials file.
-///
-/// Creates `~/.config/vortix/auth/` if it doesn't exist.
-///
-/// # Errors
-///
-/// Returns an error if directory creation fails.
-pub fn get_openvpn_auth_path(profile_key: &str) -> std::io::Result<std::path::PathBuf> {
-    validate_openvpn_artifact_key(profile_key)?;
-    let root = get_app_config_dir()?;
-    let auth_dir = root.join(crate::constants::OPENVPN_AUTH_DIR);
-
-    if !auth_dir.exists() {
-        create_user_dir(&auth_dir)?;
-    }
-
-    Ok(auth_dir.join(format!("{profile_key}.auth")))
-}
-
-/// Build the auth-file body. Line 1 is the username; line 2 is the
-/// plain password. The canonical `<safe>.auth` file is reserved for
-/// non-MFA `auth-user-pass` flows — `OpenVPN` 2.7's static-challenge
-/// path does NOT consume SCRV1 envelopes from this file (the OTP
-/// prompt fires before the file is read.
-/// MFA credentials flow through the transient sibling file (see
-/// [`write_openvpn_scrv1_auth_file`]) and reach openvpn via the
-/// management socket.
-fn format_openvpn_auth_body(username: &str, password: &str) -> String {
-    format!("{username}\n{password}\n")
-}
-
 /// Path of the transient SCRV1 envelope auth file used for
 /// static-challenge connects.
 ///
@@ -648,270 +613,6 @@ pub fn write_openvpn_scrv1_auth_file(
 pub fn delete_openvpn_scrv1_auth_file(profile_name: &str) {
     if let Ok(auth_path) = get_openvpn_scrv1_auth_path(profile_name) {
         let _ = std::fs::remove_file(&auth_path);
-    }
-}
-
-/// Write the canonical `<safe>.auth` credentials file: line 1 username,
-/// line 2 password, both in plain text.
-///
-/// Reserved for non-MFA `auth-user-pass` profiles. Static-challenge
-/// (MFA) profiles route credentials through a transient sibling file
-/// (see [`write_openvpn_scrv1_auth_file`]) and reach openvpn via the
-/// management socket -- the canonical `.auth` file is never used for
-/// SCRV1 envelopes because `OpenVPN` 2.7's static-challenge path
-/// prompts stdin for the OTP before reading the file (see the spike outcome in
-///
-/// The file is created with `chmod 600` (owner read/write only) in a
-/// single step via [`crate::vortix_core::secret_file::write_secret_file`],
-/// which uses `openat(2)` against a held parent-directory fd to close
-/// the parent-directory TOCTOU window. If the auth file already
-/// exists from a previous run, it is removed first so the credential
-/// rewrite succeeds.
-///
-/// # Errors
-///
-/// Returns an error if file write fails.
-#[cfg(unix)]
-pub fn write_openvpn_auth_file(
-    profile_name: &str,
-    username: &str,
-    password: &str,
-) -> std::io::Result<std::path::PathBuf> {
-    use crate::vortix_core::secret_file::{write_secret_file, SecretFileError};
-
-    let auth_path = get_openvpn_auth_path(profile_name)?;
-
-    // The credential-safe helper refuses to overwrite. Remove any stale
-    // file from a prior run so a credential rotation still lands. Ignore
-    // NotFound — the file simply doesn't exist yet on first use.
-    match std::fs::remove_file(&auth_path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
-
-    let body = format_openvpn_auth_body(username, password);
-    write_secret_file(&auth_path, body.as_bytes()).map_err(|e| match e {
-        SecretFileError::Io(io) => io,
-        other => std::io::Error::other(other.to_string()),
-    })?;
-
-    Ok(auth_path)
-}
-
-/// Writes `OpenVPN` credentials to a file (non-Unix fallback, no chmod).
-#[cfg(not(unix))]
-pub fn write_openvpn_auth_file(
-    profile_name: &str,
-    username: &str,
-    password: &str,
-) -> std::io::Result<std::path::PathBuf> {
-    let auth_path = get_openvpn_auth_path(profile_name)?;
-    let body = format_openvpn_auth_body(username, password);
-    write_user_file(&auth_path, body)?;
-    Ok(auth_path)
-}
-
-/// Reads saved `OpenVPN` credentials from the auth file.
-///
-/// Returns `Some((username, password))` if a valid auth file exists.
-#[must_use]
-pub fn read_openvpn_saved_auth(profile_name: &str) -> Option<(String, String)> {
-    let auth_path = get_openvpn_auth_path(profile_name).ok()?;
-    let content = std::fs::read_to_string(&auth_path).ok()?;
-    let mut lines = content.lines();
-    let username = lines.next()?.to_string();
-    let password = lines.next()?.to_string();
-    if username.is_empty() || password.is_empty() {
-        return None;
-    }
-    Some((username, password))
-}
-
-/// Read canonical ID-keyed credentials with a collision-free compatibility
-/// fallback for legacy name-keyed files.
-#[must_use]
-pub fn read_openvpn_saved_auth_compat(
-    profile_id: &str,
-    legacy_display_name: &str,
-) -> Option<(String, String)> {
-    read_openvpn_saved_auth(profile_id).or_else(|| {
-        unambiguous_legacy_artifact_key(legacy_display_name).and_then(read_openvpn_saved_auth)
-    })
-}
-
-/// Read saved `OpenVPN` credentials through a pinned, owner-checked directory.
-///
-/// This is the privileged Standard-mode read boundary. It never follows the
-/// configuration directory, auth directory, or credential-file symlink, and
-/// it rejects credentials that are not an owner-only regular file.
-#[cfg(unix)]
-fn unsafe_openvpn_auth_file(reason: &str) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::PermissionDenied, reason)
-}
-
-#[cfg(unix)]
-fn validate_openvpn_auth_directory(
-    file: &std::fs::File,
-    expected_owner_uid: u32,
-) -> std::io::Result<()> {
-    use std::os::unix::fs::MetadataExt as _;
-
-    let metadata = file.metadata()?;
-    if !metadata.is_dir() || metadata.uid() != expected_owner_uid {
-        return Err(unsafe_openvpn_auth_file(
-            "unsafe OpenVPN auth directory owner",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn open_openvpn_auth_directory_at(
-    parent: &std::fs::File,
-    name: &std::ffi::CStr,
-) -> std::io::Result<std::fs::File> {
-    use std::os::fd::{AsRawFd as _, FromRawFd as _};
-
-    // SAFETY: the parent descriptor is live, `name` is NUL-terminated,
-    // and a successful descriptor is transferred into `File` exactly once.
-    #[allow(unsafe_code)]
-    let fd = unsafe {
-        libc::openat(
-            parent.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: `openat` returned a new descriptor owned by this call.
-    #[allow(unsafe_code)]
-    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
-}
-
-#[cfg(unix)]
-fn read_openvpn_auth_entry_owned(
-    auth_dir: &std::fs::File,
-    profile_key: &str,
-    expected_owner_uid: u32,
-) -> std::io::Result<Option<(zeroize::Zeroizing<String>, zeroize::Zeroizing<String>)>> {
-    use std::ffi::CString;
-    use std::io::Read as _;
-    use std::os::fd::{AsRawFd as _, FromRawFd as _};
-    use std::os::unix::fs::MetadataExt as _;
-
-    const MAX_AUTH_BYTES: u64 = 16 * 1024;
-
-    validate_openvpn_artifact_key(profile_key)?;
-    let basename = CString::new(format!("{profile_key}.auth")).map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid auth filename")
-    })?;
-    // SAFETY: the directory descriptor and C string are valid for the call;
-    // the returned descriptor is checked below.
-    #[allow(unsafe_code)]
-    let fd = unsafe {
-        libc::openat(
-            auth_dir.as_raw_fd(),
-            basename.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        let error = std::io::Error::last_os_error();
-        return if error.kind() == std::io::ErrorKind::NotFound {
-            Ok(None)
-        } else {
-            Err(error)
-        };
-    }
-    // SAFETY: `openat` returned a new descriptor owned by this call.
-    #[allow(unsafe_code)]
-    let file = unsafe { std::fs::File::from_raw_fd(fd) };
-    let metadata = file.metadata()?;
-    if !metadata.is_file()
-        || metadata.uid() != expected_owner_uid
-        || metadata.mode() & 0o777 != 0o600
-        || metadata.len() == 0
-        || metadata.len() > MAX_AUTH_BYTES
-    {
-        return Err(unsafe_openvpn_auth_file(
-            "unsafe OpenVPN auth credential file",
-        ));
-    }
-    let mut content = zeroize::Zeroizing::new(String::new());
-    file.take(MAX_AUTH_BYTES + 1).read_to_string(&mut content)?;
-    if content.len() as u64 > MAX_AUTH_BYTES {
-        return Err(unsafe_openvpn_auth_file(
-            "OpenVPN auth credential file is too large",
-        ));
-    }
-    let mut lines = content.lines();
-    let username = zeroize::Zeroizing::new(lines.next().unwrap_or_default().to_owned());
-    let password = zeroize::Zeroizing::new(lines.next().unwrap_or_default().to_owned());
-    if username.is_empty() || password.is_empty() {
-        return Err(unsafe_openvpn_auth_file(
-            "OpenVPN auth credentials are incomplete",
-        ));
-    }
-    Ok(Some((username, password)))
-}
-
-#[cfg(unix)]
-pub(crate) fn read_openvpn_saved_auth_compat_owned(
-    config_dir: &std::path::Path,
-    expected_owner_uid: u32,
-    profile_id: &str,
-    legacy_display_name: &str,
-) -> std::io::Result<Option<(zeroize::Zeroizing<String>, zeroize::Zeroizing<String>)>> {
-    use std::ffi::CString;
-    use std::fs::OpenOptions;
-    use std::os::unix::fs::OpenOptionsExt as _;
-
-    let config = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(config_dir)?;
-    validate_openvpn_auth_directory(&config, expected_owner_uid)?;
-    let auth_name = CString::new(crate::constants::OPENVPN_AUTH_DIR)
-        .expect("OpenVPN auth directory constant contains no NUL");
-    let auth_dir = match open_openvpn_auth_directory_at(&config, &auth_name) {
-        Ok(directory) => directory,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    validate_openvpn_auth_directory(&auth_dir, expected_owner_uid)?;
-
-    if let Some(credentials) =
-        read_openvpn_auth_entry_owned(&auth_dir, profile_id, expected_owner_uid)?
-    {
-        return Ok(Some(credentials));
-    }
-    let Some(legacy_key) = unambiguous_legacy_artifact_key(legacy_display_name) else {
-        return Ok(None);
-    };
-    if legacy_key == profile_id {
-        return Ok(None);
-    }
-    read_openvpn_auth_entry_owned(&auth_dir, legacy_key, expected_owner_uid)
-}
-
-/// Deletes the saved `OpenVPN` auth credentials file for a profile.
-pub fn delete_openvpn_auth_file(profile_name: &str) {
-    if let Ok(auth_path) = get_openvpn_auth_path(profile_name) {
-        let _ = std::fs::remove_file(&auth_path);
-    }
-}
-
-/// Delete canonical ID-keyed credentials and an unambiguous legacy file.
-pub fn delete_openvpn_auth_file_compat(profile_id: &str, legacy_display_name: &str) {
-    delete_openvpn_auth_file(profile_id);
-    if let Some(legacy_key) = unambiguous_legacy_artifact_key(legacy_display_name) {
-        if legacy_key != profile_id {
-            delete_openvpn_auth_file(legacy_key);
-            delete_openvpn_scrv1_auth_file(legacy_key);
-        }
     }
 }
 
@@ -1495,7 +1196,7 @@ fn acquire_lifecycle_lock_at(
     use std::os::unix::fs::MetadataExt as _;
 
     let metadata = std::fs::symlink_metadata(root)?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() || metadata.uid() != owner_uid {
+    if !metadata.is_dir() || metadata.uid() != owner_uid {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "the Vortix config directory is not owned by the invoking user",
@@ -2031,122 +1732,16 @@ mod tests {
     }
 
     #[test]
-    fn test_write_read_openvpn_auth_file() {
-        let _tmp = set_temp_config_dir();
-        let name = "test_auth_roundtrip";
-        let result = write_openvpn_auth_file(name, "myuser", "mypass");
-        assert!(result.is_ok());
-        let path = result.unwrap();
-        assert!(path.exists());
-
-        let creds = read_openvpn_saved_auth(name);
-        assert!(creds.is_some());
-        let (user, pass) = creds.unwrap();
-        assert_eq!(user, "myuser");
-        assert_eq!(pass, "mypass");
-
-        delete_openvpn_auth_file(name);
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn ambiguous_legacy_name_never_crosses_profile_identity() {
-        let _tmp = set_temp_config_dir();
-        let first = "1".repeat(crate::vortix_core::profile::ProfileId::HEX_LEN);
-        let second = "2".repeat(crate::vortix_core::profile::ProfileId::HEX_LEN);
-        let first_path = write_openvpn_auth_file(&first, "one", "secret").unwrap();
-        let second_path = write_openvpn_auth_file(&second, "two", "secret").unwrap();
-        let legacy_collision = write_openvpn_auth_file("team_a", "legacy", "secret").unwrap();
-
-        delete_openvpn_auth_file_compat(&first, "team/a");
-
-        assert!(!first_path.exists());
-        assert!(second_path.exists());
-        assert!(
-            legacy_collision.exists(),
-            "ambiguous legacy artifact must be left untouched"
-        );
-        assert_eq!(
-            read_openvpn_saved_auth_compat(&second, "team?a").map(|credentials| credentials.0),
-            Some("two".to_string())
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_auth_file_permissions() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let _tmp = set_temp_config_dir();
-        let name = "test_auth_perms";
-        let result = write_openvpn_auth_file(name, "user", "pass");
-        assert!(result.is_ok());
-        let path = result.unwrap();
-
-        let perms = std::fs::metadata(&path).unwrap().permissions();
-        assert_eq!(perms.mode() & 0o777, 0o600);
-
-        delete_openvpn_auth_file(name);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn privileged_auth_read_rejects_symlinks_and_loose_modes() {
-        use std::os::unix::fs::{symlink, PermissionsExt as _};
-
-        let _tmp = set_temp_config_dir();
-        let config_dir = get_app_config_dir().unwrap();
-        let owner_uid = effective_user_group_ids().0;
-
-        let safe = write_openvpn_auth_file("owned-safe", "user", "pass").unwrap();
-        let credentials = read_openvpn_saved_auth_compat_owned(
-            &config_dir,
-            owner_uid,
-            "owned-safe",
-            "owned-safe",
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(credentials.0.as_str(), "user");
-        assert_eq!(credentials.1.as_str(), "pass");
-
-        std::fs::set_permissions(&safe, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(read_openvpn_saved_auth_compat_owned(
-            &config_dir,
-            owner_uid,
-            "owned-safe",
-            "owned-safe",
-        )
-        .is_err());
-
-        let target = config_dir.join("root-readable-decoy");
-        std::fs::write(&target, "secret-user\nsecret-pass\n").unwrap();
-        let link = get_openvpn_auth_path("owned-link").unwrap();
-        symlink(&target, &link).unwrap();
-        assert!(read_openvpn_saved_auth_compat_owned(
-            &config_dir,
-            owner_uid,
-            "owned-link",
-            "owned-link",
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn auth_file_format_is_username_then_password() {
-        // Byte-for-byte: canonical `<safe>.auth` is always plain
-        // `username\npassword\n`. Static-challenge OTPs go via the
-        // transient sibling file + management socket -- never here.
-        let body = format_openvpn_auth_body("u", "p");
-        assert_eq!(body, "u\np\n");
-    }
-
-    #[test]
     fn scrub_deletes_scrv1_bundle_and_leaves_canonical_auth_alone() {
         let _tmp = set_temp_config_dir();
         // Plain canonical `<safe>.auth` (should survive scrub) and a
         // transient `<safe>.scrv1.auth` bundle (should be deleted).
-        let plain = write_openvpn_auth_file("scrub-plain", "u", "p").unwrap();
+        let auth_dir = get_app_config_dir()
+            .unwrap()
+            .join(crate::constants::OPENVPN_AUTH_DIR);
+        create_user_dir(&auth_dir).unwrap();
+        let plain = auth_dir.join("scrub-plain.auth");
+        std::fs::write(&plain, "u\np\n").unwrap();
         let bundle = write_openvpn_scrv1_auth_file("scrub-bundle", "u", "p", "123456").unwrap();
         assert!(plain.exists());
         assert!(bundle.exists());
@@ -2158,8 +1753,7 @@ mod tests {
             !bundle.exists(),
             ".scrv1.auth bundle must be deleted by scrub"
         );
-
-        delete_openvpn_auth_file("scrub-plain");
+        std::fs::remove_file(plain).unwrap();
     }
 
     #[test]
@@ -2207,26 +1801,6 @@ mod tests {
         assert_eq!(truncate("hello world", 3), "...");
         assert_eq!(truncate("hello world", 2), "...");
         assert_eq!(truncate("hello world", 0), "...");
-    }
-
-    #[test]
-    fn test_read_openvpn_saved_auth_missing_file() {
-        let creds = read_openvpn_saved_auth("nonexistent_profile_xyz_12345");
-        assert!(creds.is_none());
-    }
-
-    #[test]
-    fn test_read_openvpn_saved_auth_empty_creds() {
-        let _tmp = set_temp_config_dir();
-        let name = "test_auth_empty_creds";
-        let path = get_openvpn_auth_path(name).unwrap();
-        std::fs::write(&path, "\npassword\n").unwrap();
-        assert!(read_openvpn_saved_auth(name).is_none());
-
-        std::fs::write(&path, "username\n\n").unwrap();
-        assert!(read_openvpn_saved_auth(name).is_none());
-
-        delete_openvpn_auth_file(name);
     }
 
     // --- wireguard_config_has_dns tests ---

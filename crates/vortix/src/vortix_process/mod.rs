@@ -152,6 +152,14 @@ pub fn stop_managed_foreground(identity: &ManagedProcessId) -> Result<(), Custod
     custodian::remote_stop(identity)
 }
 
+/// Contain a failed startup using the exact handshake retained by its owner.
+#[doc(hidden)]
+pub fn stop_failed_managed_foreground_startup(
+    handshake: &CustodianHandshake,
+) -> Result<(), CustodianError> {
+    custodian::remote_stop_after_startup(handshake)
+}
+
 /// Probe an exact foreground child capability through its tunnel-scoped
 /// custodian.
 pub fn status_managed_foreground(identity: &ManagedProcessId) -> Result<bool, CustodianError> {

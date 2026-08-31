@@ -666,6 +666,7 @@ impl CliFacadeTransport {
             intent,
             status,
             result,
+            failure_detail: None,
         }
     }
 

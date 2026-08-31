@@ -226,6 +226,18 @@ fn wait_for_pid_file(path: &std::path::Path) -> u32 {
     panic!("child pid file was not populated: {}", path.display());
 }
 
+fn pid_recording_sleep(path: &std::path::Path) -> CommandSpec {
+    CommandSpec::oneshot(
+        "/bin/sh",
+        vec![
+            "-c".into(),
+            "echo $$ > \"$1\"; exec sleep 30".into(),
+            "vortix-test-child".into(),
+            path.to_string_lossy().into_owned(),
+        ],
+    )
+}
+
 struct EnvGuard;
 
 impl Drop for EnvGuard {
@@ -341,13 +353,15 @@ fn real_tunnel_scoped_custodians_handoff_authenticate_and_contain_groups() {
     let recovered_identity = real_identity('0');
     let operation: vortix::vortix_core::control::OperationId =
         serde_json::from_str("\"op-0000000000000001-0000000000000001\"").unwrap();
+    let recovered_child_pid_path = temp.path().join("recovered-openvpn-child.pid");
     let recovered_handshake = vortix::vortix_process::start_managed_foreground_for_operation(
         recovered_identity.clone(),
-        CommandSpec::oneshot("/bin/sleep", vec!["30".into()]),
+        pid_recording_sleep(&recovered_child_pid_path),
         Vec::new(),
         operation.clone(),
     )
     .unwrap();
+    let recovered_child_pid = wait_for_pid_file(&recovered_child_pid_path);
     assert_eq!(
         vortix::vortix_process::custodian::load_handshake(&recovered_identity.profile_id)
             .unwrap()
@@ -387,6 +401,16 @@ fn real_tunnel_scoped_custodians_handoff_authenticate_and_contain_groups() {
             ProtocolKind::OpenVpn,
             config,
         );
+        let run_dir = temp.path().join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(
+            run_dir.join(format!("{}.log", profile.id.as_str())),
+            format!(
+                "PUSH_REPLY,ping 10\n{}\n",
+                vortix::constants::OVPN_LOG_SUCCESS
+            ),
+        )
+        .unwrap();
         // SAFETY: geteuid returns one scalar credential without side effects.
         #[allow(unsafe_code)]
         let uid = unsafe { libc::geteuid() };
@@ -401,8 +425,7 @@ fn real_tunnel_scoped_custodians_handoff_authenticate_and_contain_groups() {
         );
         let profile_for_lookup = profile.clone();
         let profile_for_scan = profile.clone();
-        let recovered_pid = recovered_handshake.pid;
-        let scanner_pid = Arc::new(AtomicU32::new(recovered_pid.saturating_add(1)));
+        let scanner_pid = Arc::new(AtomicU32::new(1));
         let scanner_pid_for_lookup = Arc::clone(&scanner_pid);
         let executor = Arc::new(CanonicalTunnelExecutor::new_standard(
             CanonicalTunnelSettings {
@@ -442,9 +465,12 @@ fn real_tunnel_scoped_custodians_handoff_authenticate_and_contain_groups() {
                 revision,
                 operation.clone(),
             )
-            .expect_err("scanner PID must be bound to the authenticated child");
-        assert!(mismatch.contains("scanner PID does not match"));
-        scanner_pid.store(recovered_pid, Ordering::Relaxed);
+            .expect_err("scanner PID must belong to the authenticated process group");
+        assert!(
+            mismatch.contains("not contained by the authenticated custodian group"),
+            "unexpected recovery error: {mismatch}"
+        );
+        scanner_pid.store(recovered_child_pid, Ordering::Relaxed);
         assert!(executor
             .restore_standard_profile(
                 &supervisor,
@@ -534,7 +560,7 @@ fn real_tunnel_scoped_custodians_handoff_authenticate_and_contain_groups() {
 
     // Natural exit releases the exact receipt and permits reconnect.
     let natural = real_identity('e');
-    vortix::vortix_process::start_managed_foreground(
+    let natural_handshake = vortix::vortix_process::start_managed_foreground(
         natural.clone(),
         CommandSpec::oneshot("/bin/sleep", vec!["1".into()]),
         Vec::new(),
@@ -554,6 +580,8 @@ fn real_tunnel_scoped_custodians_handoff_authenticate_and_contain_groups() {
             .unwrap()
             .is_none()
     );
+    vortix::vortix_process::stop_failed_managed_foreground_startup(&natural_handshake)
+        .expect("the startup owner can prove an already-clean natural exit");
 
     // Spawn failure is fully cleaned and does not poison a later attempt.
     let failed = real_identity('f');
@@ -575,10 +603,9 @@ fn real_tunnel_scoped_custodians_handoff_authenticate_and_contain_groups() {
     // makes the hidden custodian contain and reap its already-spawned child.
     let pre_handoff = real_identity('1');
     let child_pid_path = temp.path().join("pre-handoff-child.pid");
-    let script = format!("echo $$ > '{}'; exec sleep 30", child_pid_path.display());
     let request = TestLaunchRequest {
         identity: pre_handoff,
-        spec: CommandSpec::oneshot("/bin/sh", vec!["-c".into(), script]),
+        spec: pid_recording_sleep(&child_pid_path),
         cleanup_paths: Vec::new(),
         graceful_timeout_ms: 100,
     };

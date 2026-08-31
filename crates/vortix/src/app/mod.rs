@@ -79,6 +79,13 @@ impl CachedConfigView {
         }
     }
 }
+
+pub(crate) struct PendingProfileImports {
+    source: std::path::PathBuf,
+    remaining: std::collections::VecDeque<std::path::PathBuf>,
+    queued: usize,
+    failed: usize,
+}
 use std::collections::HashMap;
 
 use crate::constants;
@@ -127,6 +134,11 @@ pub struct App {
     /// that characterize presentation-only helpers may leave it detached.
     pub(crate) control_session: Option<crate::cli::control::ClientControlSession>,
 
+    /// True while production is preparing the canonical control owner. This
+    /// is presentation-only: the control session remains the authority once
+    /// attached.
+    pub(crate) control_starting: bool,
+
     /// Last complete immutable publication received from the control owner.
     pub control_snapshot: crate::vortix_core::control::ControlSnapshot,
 
@@ -143,7 +155,30 @@ pub struct App {
     /// presses compose from this value until the snapshot acknowledges it.
     pub(crate) pending_control_killswitch_mode: Option<crate::state::KillSwitchMode>,
 
+    /// TUI-originated durable operations awaiting terminal truth. This is
+    /// client presentation state only; the control snapshot remains the
+    /// authority for completion and failure.
+    pub(crate) pending_control_operations: std::collections::BTreeMap<
+        crate::vortix_core::control::OperationId,
+        connection::PendingControlOperation,
+    >,
+
     control_request_sequence: u64,
+
+    /// Directory imports feed the bounded TUI admission queue over multiple
+    /// event-loop turns. This keeps the eight-command safety budget without
+    /// misclassifying temporary backpressure as profile validation failure.
+    pub(crate) pending_profile_imports: Option<PendingProfileImports>,
+
+    /// Short quiet-window aggregation for profile mutations. Directory
+    /// imports can complete over several control publications; presenting
+    /// one truthful summary is calmer than replacing the toast per file.
+    pub(crate) catalog_feedback: Option<connection::CatalogFeedback>,
+
+    /// Last catalog revision presented in the Event Log. Terminal mutation
+    /// outcomes may arrive in separate snapshots without changing the
+    /// catalog, so logging only revision changes preserves a no-change signal.
+    pub(crate) presented_catalog_revision: Option<u64>,
 
     /// Flag indicating the application should exit.
     pub should_quit: bool,
@@ -153,6 +188,9 @@ pub struct App {
     pub logs_auto_scroll: bool,
     pub logs_max_scroll: u16,
     pub log_level_filter: Option<crate::logger::LogLevel>,
+    /// Last network-quality category emitted to the Event Log. Raw telemetry
+    /// remains dashboard state and only semantic transitions are logged.
+    pub(crate) last_logged_network_quality: crate::state::QualityLevel,
 
     // === UI State (Panel-based) ===
     pub focused_panel: FocusedPanel,
@@ -206,11 +244,16 @@ impl App {
             engine_handle: None,
             registry: TunnelRegistry::new(),
             control_session: None,
+            control_starting: true,
             control_snapshot: crate::vortix_core::control::ControlSnapshot::default(),
             control_challenge: None,
             last_control_connected_profile: None,
             pending_control_killswitch_mode: None,
+            pending_control_operations: std::collections::BTreeMap::new(),
             control_request_sequence: 0,
+            pending_profile_imports: None,
+            catalog_feedback: None,
+            presented_catalog_revision: None,
 
             should_quit: false,
 
@@ -218,6 +261,7 @@ impl App {
             logs_auto_scroll: true,
             logs_max_scroll: 0,
             log_level_filter: None,
+            last_logged_network_quality: crate::state::QualityLevel::Unknown,
 
             focused_panel: FocusedPanel::Sidebar,
             zoomed_panel: None,
@@ -262,7 +306,7 @@ impl App {
             // Check if we recovered from crash — the engine already handled this
         }
 
-        app.log("SUCCESS: System active. Press [x] for actions.");
+        app.log("INIT: Interface ready; VPN service starting in the background");
 
         app.check_system_dependencies();
 
@@ -291,6 +335,7 @@ impl App {
         match control_update {
             Some(Ok((admissions, snapshot, catalog))) => {
                 self.handle_control_admission_results(admissions);
+                self.pump_pending_profile_imports();
                 if let Some(catalog) = catalog {
                     self.apply_local_catalog_update(catalog);
                 }
@@ -385,11 +430,16 @@ impl App {
             engine_handle: None,
             registry: TunnelRegistry::new(),
             control_session: None,
+            control_starting: false,
             control_snapshot: crate::vortix_core::control::ControlSnapshot::default(),
             control_challenge: None,
             last_control_connected_profile: None,
             pending_control_killswitch_mode: None,
+            pending_control_operations: std::collections::BTreeMap::new(),
             control_request_sequence: 0,
+            pending_profile_imports: None,
+            catalog_feedback: None,
+            presented_catalog_revision: None,
 
             should_quit: false,
 
@@ -397,6 +447,7 @@ impl App {
             logs_auto_scroll: true,
             logs_max_scroll: 0,
             log_level_filter: None,
+            last_logged_network_quality: crate::state::QualityLevel::Unknown,
 
             focused_panel: FocusedPanel::Sidebar,
             zoomed_panel: None,
