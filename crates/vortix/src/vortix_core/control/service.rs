@@ -2322,27 +2322,23 @@ fn drive_supervision(
 
     while let Some(result) = supervisor.poll_tunnel() {
         if result.result.is_ok() {
-            snapshot.pending_route_conflicts.remove(&result.profile_id);
             if result.mutation == TunnelMutation::Disconnect {
                 // A successful disconnect is already an exact protocol-owned
                 // absence receipt: OpenVPN proves the custodian receipt,
                 // socket, and process group are gone; WireGuard proves the
-                // interface is absent. Do not make terminal control truth
-                // depend on a later best-effort scanner sweep.
-                apply_observation(
-                    Observation::Tunnel {
-                        profile_id: result.profile_id.clone(),
-                        active: false,
-                        interface_name: None,
-                        observed_at_millis: now,
-                        protection: None,
-                    },
-                    snapshot,
-                    owner,
-                    now,
-                    config,
-                )
-                .expect("successful disconnect receipt is a valid owned observation");
+                // interface is absent. Settle only the exact supervised
+                // revision, and do not route this trusted receipt through the
+                // scanner-drift reducer, which invalidates unrelated policy
+                // gates.
+                if supervisor
+                    .confirm_tunnel(&result.profile_id, &result.revision, false, None)
+                    .is_ok()
+                {
+                    snapshot.pending_route_conflicts.remove(&result.profile_id);
+                    record_owned_disconnect(&result.profile_id, snapshot, owner, now);
+                }
+            } else {
+                snapshot.pending_route_conflicts.remove(&result.profile_id);
             }
         }
         if let Some(routes) = result
@@ -5204,6 +5200,28 @@ fn apply_observation(
     )
 }
 
+fn record_owned_disconnect(
+    profile_id: &ProfileId,
+    snapshot: &mut ControlSnapshot,
+    owner: &mut OwnerState,
+    now: u64,
+) {
+    owner
+        .observation_clocks
+        .insert(ObservationScope::Profile(profile_id.clone()), now);
+    snapshot.observed.connection_health.remove(profile_id);
+    snapshot.observed.tunnel_details.remove(profile_id);
+    snapshot.observed.tunnels.insert(
+        profile_id.clone(),
+        ObservedTunnel {
+            active: false,
+            interface_name: None,
+            observed_at_millis: now,
+            received_at_millis: now,
+        },
+    );
+}
+
 fn apply_observation_batch(
     observations: Vec<Observation>,
     snapshot: &mut ControlSnapshot,
@@ -6971,6 +6989,64 @@ mod target_profiles_tests {
             Some(&RequestedTunnelState::Disconnected)
         );
         assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn owned_disconnect_receipt_updates_only_the_profile_observation() {
+        let profile_id = ProfileId::new("owned-disconnect");
+        let mut snapshot = ControlSnapshot::default();
+        snapshot.observed.tunnels.insert(
+            profile_id.clone(),
+            ObservedTunnel {
+                active: true,
+                interface_name: Some("wg-owned".into()),
+                observed_at_millis: 4,
+                received_at_millis: 4,
+            },
+        );
+        snapshot.observed.evidence = Some(ProtectionEvidence {
+            desired_generation: 3,
+            authority_epoch: AuthorityEpoch(7),
+            policy_digest: PolicyDigest("settled-policy".into()),
+            observed_at_millis: 4,
+            interface: GateEvidence::Verified,
+            route: GateEvidence::Verified,
+            dns: GateEvidence::Verified,
+            firewall: GateEvidence::Verified,
+        });
+        let mut owner = OwnerState {
+            observation_clocks: BTreeMap::from([
+                (ObservationScope::Protection, 4),
+                (ObservationScope::Route, 4),
+                (ObservationScope::Dns, 4),
+                (ObservationScope::Firewall, 4),
+            ]),
+            ..OwnerState::default()
+        };
+
+        record_owned_disconnect(&profile_id, &mut snapshot, &mut owner, 5);
+
+        assert_eq!(
+            snapshot.observed.tunnels.get(&profile_id),
+            Some(&ObservedTunnel {
+                active: false,
+                interface_name: None,
+                observed_at_millis: 5,
+                received_at_millis: 5,
+            })
+        );
+        let evidence = snapshot.observed.evidence.as_ref().unwrap();
+        assert_eq!(evidence.interface, GateEvidence::Verified);
+        assert_eq!(evidence.route, GateEvidence::Verified);
+        assert_eq!(evidence.dns, GateEvidence::Verified);
+        assert_eq!(evidence.firewall, GateEvidence::Verified);
+        assert_eq!(
+            owner.observation_clocks[&ObservationScope::Profile(profile_id)],
+            5
+        );
+        assert_eq!(owner.observation_clocks[&ObservationScope::Route], 4);
+        assert_eq!(owner.observation_clocks[&ObservationScope::Dns], 4);
+        assert_eq!(owner.observation_clocks[&ObservationScope::Firewall], 4);
     }
 
     #[test]
