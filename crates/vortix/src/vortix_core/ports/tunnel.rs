@@ -70,6 +70,10 @@ pub enum TunnelKindTag {
 pub struct TunnelTeardownConfig {
     pub path: PathBuf,
     pub managed: bool,
+    /// Stable basename passed to `wg-quick`. On macOS this differs from the
+    /// kernel-assigned `utunN` interface and is required to resolve the
+    /// `/var/run/wireguard/<name>.name` ownership mapping during teardown.
+    pub wg_quick_interface: Option<String>,
 }
 
 /// Lifecycle handle returned by [`Tunnel::up`] and consumed by `down` / `status`.

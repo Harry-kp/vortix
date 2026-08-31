@@ -5,6 +5,8 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
+pub(crate) const MAX_OPERATION_FAILURE_DETAIL_CHARS: usize = 320;
+
 use crate::vortix_core::engine::registry::Conflict;
 use crate::vortix_core::engine::state::{ConnectionHealth, DegradedReason, FailureReason};
 use crate::vortix_core::privileged::OpenVpnRouteEvidence;
@@ -392,6 +394,8 @@ pub enum OperationFailure {
     /// A managed `WireGuard` attempt failed its cryptographic liveness gate
     /// after exact-attempt cleanup was confirmed.
     HandshakeFailed,
+    /// The profile cannot be represented safely by its native protocol.
+    InvalidProfile,
     ObservationFailed,
     Internal,
 }
@@ -451,6 +455,10 @@ pub struct OperationRecord {
     pub intent: OperationIntent,
     pub status: OperationStatus,
     pub result: Option<OperationResult>,
+    /// Sanitized platform detail for a failed policy operation. Older
+    /// records omit it; callers must continue to handle the typed result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_detail: Option<String>,
 }
 
 /// Durable completion scope for an admitted operation.

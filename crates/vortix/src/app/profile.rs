@@ -6,6 +6,7 @@ use super::{App, InputMode, Protocol, ToastType};
 use crate::constants;
 use crate::utils;
 use crate::vortix_config::profile_store::{FsProfileStore, ProfileStore};
+use crate::vortix_core::profile::ProfileId;
 
 /// Bounds synchronous parsing/logging when a directory contains invalid files.
 const PROFILE_IMPORT_ATTEMPTS_PER_TURN: usize = 8;
@@ -67,7 +68,7 @@ impl App {
 
             // 2. Switch to confirm mode
             self.input_mode = InputMode::ConfirmDelete {
-                index: idx,
+                profile_id: profile.id.clone(),
                 name: profile.name.clone(),
                 confirm_selected: false, // Default to "No" for safety
             };
@@ -75,10 +76,15 @@ impl App {
     }
 
     /// Execute deletion after confirmation
-    pub(crate) fn confirm_delete(&mut self, idx: usize) {
-        if idx >= self.runtime.profiles.len() {
+    pub(crate) fn confirm_delete_profile(&mut self, profile_id: &ProfileId) {
+        let Some(idx) = self.profile_index(profile_id) else {
+            self.show_toast(
+                "This profile no longer exists".to_string(),
+                ToastType::Warning,
+            );
+            self.input_mode = InputMode::Normal;
             return;
-        }
+        };
 
         // Safety net: state may have changed since the confirm dialog opened
         if let Some(profile) = self.runtime.profiles.get(idx) {
@@ -106,6 +112,7 @@ impl App {
                 .is_some()
             {
                 self.input_mode = InputMode::Normal;
+                self.show_toast(format!("Deleting '{profile_name}'…"), ToastType::Info);
             }
             return;
         }
@@ -145,10 +152,28 @@ impl App {
         self.input_mode = InputMode::Normal;
     }
 
-    pub(crate) fn rename_profile(&mut self, idx: usize, new_name: &str) {
-        if idx >= self.runtime.profiles.len() {
+    #[cfg(test)]
+    pub(crate) fn confirm_delete(&mut self, idx: usize) {
+        let Some(profile_id) = self
+            .runtime
+            .profiles
+            .get(idx)
+            .map(|profile| profile.id.clone())
+        else {
             return;
-        }
+        };
+        self.confirm_delete_profile(&profile_id);
+    }
+
+    pub(crate) fn rename_profile_by_id(&mut self, profile_id: &ProfileId, new_name: &str) {
+        let Some(idx) = self.profile_index(profile_id) else {
+            self.show_toast(
+                "This profile no longer exists".to_string(),
+                ToastType::Warning,
+            );
+            self.input_mode = InputMode::Normal;
+            return;
+        };
 
         let trimmed = new_name.trim();
         if trimmed.is_empty()
@@ -184,6 +209,7 @@ impl App {
                 .is_some()
             {
                 self.input_mode = InputMode::Normal;
+                self.show_toast(format!("Renaming '{old_name}'…"), ToastType::Info);
             }
             return;
         }
@@ -237,6 +263,19 @@ impl App {
                 ToastType::Success,
             );
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rename_profile(&mut self, idx: usize, new_name: &str) {
+        let Some(profile_id) = self
+            .runtime
+            .profiles
+            .get(idx)
+            .map(|profile| profile.id.clone())
+        else {
+            return;
+        };
+        self.rename_profile_by_id(&profile_id, new_name);
     }
 
     /// Import a profile from a file path or bulk import from directory
@@ -438,9 +477,8 @@ impl App {
                 break;
             };
             match self.try_issue_control_import(&path) {
-                Ok(name) => {
+                Ok(_) => {
                     batch.queued += 1;
-                    self.show_toast(format!("Import queued: {name}"), ToastType::Info);
                 }
                 Err(crate::cli::control::LocalControlError::Busy) => {
                     batch.remaining.push_front(path);

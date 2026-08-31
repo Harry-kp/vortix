@@ -100,6 +100,13 @@ impl PersistedControlState {
                     || operation.client_id.sequence() == Some(u64::MAX)
                     || !operation.idempotency_key.is_valid()
                     || !operation.command_digest.is_valid()
+                    || operation.failure_detail.as_ref().is_some_and(|detail| {
+                        operation.status != OperationStatus::Failed
+                        || detail.is_empty()
+                        || detail.chars().count()
+                            > crate::vortix_core::control::model::MAX_OPERATION_FAILURE_DETAIL_CHARS
+                        || detail.chars().any(char::is_control)
+                    })
                     || operation.desired_generation > self.desired.generation
                     || operation.admitted_at_millis > operation.deadline_millis
                     || matches!(
@@ -950,8 +957,8 @@ mod tests {
     use crate::vortix_core::control::{
         AdmissionError, AuthorityEpoch, BootEligibility, ClientId, CommandRequest,
         ControlPersistenceConfig, ControlService, ControlServiceConfig, IdempotencyKey,
-        PolicyDigest, ProfileTopology, ProtectionStatus, ReadinessError, RequestedTunnelState,
-        UserCommand,
+        OperationFailure, PolicyDigest, ProfileTopology, ProtectionStatus, ReadinessError,
+        RequestedTunnelState, UserCommand,
     };
     use std::collections::BTreeSet;
     use std::sync::Arc;
@@ -989,6 +996,7 @@ mod tests {
             intent: OperationIntent::GenerationScoped,
             status: OperationStatus::WaitingForObservation,
             result: None,
+            failure_detail: None,
         }
     }
 
@@ -1009,6 +1017,48 @@ mod tests {
 
         assert_eq!(loaded.id, operation_id);
         assert_eq!(loaded.status, OperationStatus::WaitingForObservation);
+    }
+
+    #[test]
+    fn persisted_policy_failure_detail_is_bounded_and_terminal_only() {
+        let mut persisted = state("failure-detail");
+        let mut failed = operation(7, 3, 2);
+        failed.status = OperationStatus::Failed;
+        failed.result = Some(OperationResult::Failed(OperationFailure::DnsPolicyFailed));
+        failed.failure_detail = Some("macOS primary DNS ownership mismatch".to_string());
+        persisted
+            .operations
+            .insert(failed.id.clone(), failed.clone());
+        persisted.validate().unwrap();
+
+        failed.failure_detail = Some(
+            "x".repeat(crate::vortix_core::control::model::MAX_OPERATION_FAILURE_DETAIL_CHARS + 1),
+        );
+        persisted
+            .operations
+            .insert(failed.id.clone(), failed.clone());
+        assert!(matches!(
+            persisted.validate(),
+            Err(ControlStateError::Invalid("invalid persisted control fact"))
+        ));
+
+        failed.failure_detail = Some("unsafe\nline".to_string());
+        persisted.operations.insert(failed.id.clone(), failed);
+        assert!(matches!(
+            persisted.validate(),
+            Err(ControlStateError::Invalid("invalid persisted control fact"))
+        ));
+
+        let mut nonterminal_state = state("nonterminal-failure-detail");
+        let mut nonterminal = operation(7, 4, 2);
+        nonterminal.failure_detail = Some("detail without terminal failure".to_string());
+        nonterminal_state
+            .operations
+            .insert(nonterminal.id.clone(), nonterminal);
+        assert!(matches!(
+            nonterminal_state.validate(),
+            Err(ControlStateError::Invalid("invalid persisted control fact"))
+        ));
     }
 
     #[test]

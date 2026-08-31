@@ -90,7 +90,6 @@ pub struct VpnRuntime {
     pub location: String,
     pub isp: String,
     pub dns_server: String,
-    pub dns_protection: crate::core::dns_protection::DnsProtectionStatus,
 
     // === System Info ===
     pub public_ip: String,
@@ -184,7 +183,6 @@ impl VpnRuntime {
             location: constants::MSG_DETECTING.to_string(),
             isp: constants::MSG_DETECTING.to_string(),
             dns_server: constants::MSG_DETECTING.to_string(),
-            dns_protection: crate::core::dns_protection::DnsProtectionStatus::NotActive,
 
             public_ip: constants::MSG_DETECTING.to_string(),
             real_ip: None,
@@ -281,7 +279,6 @@ impl VpnRuntime {
             location: String::new(),
             isp: String::new(),
             dns_server: String::new(),
-            dns_protection: crate::core::dns_protection::DnsProtectionStatus::NotActive,
 
             public_ip: String::new(),
             real_ip: None,
@@ -357,7 +354,6 @@ impl VpnRuntime {
             location: String::new(),
             isp: String::new(),
             dns_server: String::new(),
-            dns_protection: crate::core::dns_protection::DnsProtectionStatus::NotActive,
             public_ip: String::new(),
             real_ip: None,
             public_ipv6: None,
@@ -672,6 +668,11 @@ impl VpnRuntime {
                     crate::vortix_core::ports::tunnel::TunnelTeardownConfig {
                         path: profile.config_path.clone(),
                         managed: false,
+                        wg_quick_interface: profile
+                            .config_path
+                            .file_stem()
+                            .and_then(std::ffi::OsStr::to_str)
+                            .map(str::to_owned),
                     }
                 }),
                 dns_request: crate::vortix_core::ports::dns::DnsRequest::default(),

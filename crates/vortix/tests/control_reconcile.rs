@@ -22,6 +22,7 @@ use vortix::vortix_core::control::{
     Observation, OperationCompletion, OperationIntent, OperationStatus, PersistedTombstone,
     ProfileTopology, ProtectionEvidence, ProtectionStatus, RequestedTunnelState, UserCommand,
 };
+use vortix::vortix_core::engine::state::Connection;
 use vortix::vortix_core::ports::dns::DnsRequest;
 use vortix::vortix_core::ports::tunnel::{HandshakeEvidence, TunnelKindTag};
 use vortix::vortix_core::privileged::{
@@ -552,6 +553,13 @@ fn pushed_openvpn_route_conflict_is_compensated_before_lease_promotion() {
     let completion = wait_until(Duration::from_secs(1), || pool.try_result()).unwrap();
 
     assert_eq!(completion.result, Err(WorkFailure::RouteConflict));
+    assert_eq!(
+        completion.route_conflict,
+        Some(vortix::vortix_core::engine::Conflict::RouteOverlap {
+            with: first.clone(),
+            overlapping_cidrs: vec!["10.0.0.128/25".parse().unwrap()],
+        })
+    );
     assert_eq!(compensations.load(Ordering::SeqCst), 1);
     assert!(pool.reservations().active_lease(&first).is_some());
     assert!(!pool.reservations().is_reserved(&second));
@@ -995,6 +1003,7 @@ fn failed_pre_tunnel_policy_compensates_a_possibly_partial_blocking_apply() {
     worker.submit(pre).unwrap();
     let result = wait_until(Duration::from_secs(1), || worker.try_result()).unwrap();
     assert_eq!(result.outcome, PolicyOutcome::Failed);
+    assert_eq!(result.failure_detail.as_deref(), Some("injected"));
     assert!(result.receipts.iter().any(|receipt| {
         receipt.barrier == PolicyBarrier::Blocking
             && !receipt.preserved_for_safety
@@ -2664,6 +2673,207 @@ async fn pushed_openvpn_routes_project_the_conflict_accepted_by_admission() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // One late-discovery failure and its bounded retry proof.
+async fn late_openvpn_route_conflict_stops_retry_and_surfaces_confirmation() {
+    let owner = profile("late-conflict-owner");
+    let candidate = profile("late-conflict-candidate");
+    let capture = Arc::new(TopologyCapture::default());
+    capture.publish_readback();
+    let default_route =
+        OpenVpnRedirectGateway::new(vec![OpenVpnRedirectFlag::Def1]).expect("valid IPv4 redirect");
+    capture.openvpn_evidence.lock().unwrap().insert(
+        owner.clone(),
+        openvpn_route_evidence_with_redirect(&["10.1.0.0/24"], &[], Some(default_route.clone())),
+    );
+    capture.openvpn_evidence.lock().unwrap().insert(
+        candidate.clone(),
+        openvpn_route_evidence_with_redirect(&["10.2.0.0/24"], &[], Some(default_route)),
+    );
+    let supervisor = Arc::new(Supervisor::new(
+        AuthorityEpoch(1),
+        capture.clone(),
+        capture.clone(),
+        2,
+        8,
+    ));
+    let service = ControlService::start_supervised(
+        ControlServiceConfig {
+            authority_epoch: AuthorityEpoch(1),
+            known_profiles: BTreeSet::from([owner.clone(), candidate.clone()]),
+            profile_topologies: BTreeMap::from([
+                (
+                    owner.clone(),
+                    ProfileTopology {
+                        protocol: Some(ProtocolKind::OpenVpn),
+                        routes: BTreeSet::from(["10.1.0.0/24".into()]),
+                        ..ProfileTopology::default()
+                    },
+                ),
+                (
+                    candidate.clone(),
+                    ProfileTopology {
+                        protocol: Some(ProtocolKind::OpenVpn),
+                        ..ProfileTopology::default()
+                    },
+                ),
+            ]),
+            freshness_poll_interval: Duration::from_millis(5),
+            ..ControlServiceConfig::default()
+        },
+        Arc::new(TestClock::default()),
+        ExecutionSelection::CanonicalAuthority,
+        supervisor.clone(),
+    );
+
+    let owner_operation = service
+        .client()
+        .submit(CommandRequest {
+            command: UserCommand::Connect {
+                profile_id: owner.clone(),
+                conflict_acknowledgement: None,
+            },
+            idempotency_key: IdempotencyKey::new("late-conflict-owner"),
+            deadline: Deadline(1_000),
+        })
+        .await
+        .expect("owner connect admitted");
+    wait_for_condition(
+        || {
+            supervisor
+                .profile_truth(&owner)
+                .is_some_and(|entry| entry.truth == SupervisedTruth::WaitingForObservation)
+        },
+        "owner connect receipt did not reach observation gate",
+    )
+    .await;
+    observe_connected(&service, &owner, "tun-late-conflict-owner").await;
+    wait_for_condition(
+        || {
+            service.client().snapshot().operations[&owner_operation.operation_id].status
+                == OperationStatus::Succeeded
+        },
+        "owner connection did not settle",
+    )
+    .await;
+
+    assert!(service
+        .client()
+        .snapshot()
+        .topology_conflict(&candidate)
+        .is_none());
+    let candidate_operation = service
+        .client()
+        .submit(CommandRequest {
+            command: UserCommand::Connect {
+                profile_id: candidate.clone(),
+                conflict_acknowledgement: None,
+            },
+            idempotency_key: IdempotencyKey::new("late-conflict-candidate"),
+            deadline: Deadline(1_000),
+        })
+        .await
+        .expect("candidate connect admitted before pushed routes are known");
+
+    wait_for_condition(
+        || {
+            service.client().snapshot().operations[&candidate_operation.operation_id].status
+                == OperationStatus::Failed
+        },
+        "late route conflict did not terminalize the connect operation",
+    )
+    .await;
+    let snapshot = service.client().snapshot();
+    assert_eq!(
+        snapshot.operations[&candidate_operation.operation_id].result,
+        Some(vortix::vortix_core::control::OperationResult::Failed(
+            vortix::vortix_core::control::OperationFailure::Rejected,
+        ))
+    );
+    assert_eq!(
+        snapshot.desired.tunnels.get(&candidate),
+        Some(&RequestedTunnelState::Disconnected)
+    );
+    assert_eq!(
+        snapshot.desired.tunnels.get(&owner),
+        Some(&RequestedTunnelState::Connected)
+    );
+    let conflict = vortix::vortix_core::engine::Conflict::DefaultRouteTakeover {
+        current: owner.clone(),
+        new: candidate.clone(),
+    };
+    assert_eq!(
+        snapshot.topology_conflict(&candidate),
+        Some(conflict.clone())
+    );
+    let attempts = capture
+        .tunnel_calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(profile_id, mutation, _)| {
+            profile_id == &candidate && *mutation == TunnelMutation::Connect
+        })
+        .count();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        capture
+            .tunnel_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(profile_id, mutation, _)| {
+                profile_id == &candidate && *mutation == TunnelMutation::Connect
+            })
+            .count(),
+        attempts,
+        "a compensated late conflict must not be relaunched"
+    );
+
+    let confirmed = service
+        .client()
+        .submit(CommandRequest {
+            command: UserCommand::Connect {
+                profile_id: candidate.clone(),
+                conflict_acknowledgement: Some(conflict),
+            },
+            idempotency_key: IdempotencyKey::new("confirm-late-conflict"),
+            deadline: Deadline(1_000),
+        })
+        .await
+        .expect("the exact surfaced conflict acknowledgement must admit");
+    wait_for_condition(
+        || {
+            supervisor
+                .profile_truth(&candidate)
+                .is_some_and(|entry| entry.truth == SupervisedTruth::WaitingForObservation)
+        },
+        "acknowledged late conflict did not reach the observation gate",
+    )
+    .await;
+    observe_connected(&service, &candidate, "tun-late-conflict-candidate").await;
+    wait_for_condition(
+        || {
+            service.client().snapshot().operations[&confirmed.operation_id].status
+                == OperationStatus::Succeeded
+        },
+        "acknowledged late conflict did not converge",
+    )
+    .await;
+    assert_eq!(
+        capture
+            .tunnel_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(profile_id, mutation, _)| {
+                profile_id == &candidate && *mutation == TunnelMutation::Connect
+            })
+            .count(),
+        attempts + 1
+    );
+}
+
+#[tokio::test]
 async fn failed_pre_block_terminalizes_without_dispatching_teardown() {
     let target = profile("failed-preblock");
     let (service, supervisor, capture) = topology_service(BTreeSet::from([target.clone()]));
@@ -2787,6 +2997,12 @@ async fn failed_final_policy_never_publishes_terminal_success() {
         "final policy failure did not terminalize visibly",
     )
     .await;
+    assert_eq!(
+        service.client().snapshot().operations[&admitted.operation_id]
+            .failure_detail
+            .as_deref(),
+        Some("injected final policy failure")
+    );
     assert_ne!(
         service.client().snapshot().operations[&admitted.operation_id].status,
         OperationStatus::Succeeded
@@ -3011,6 +3227,84 @@ async fn connecting_second_profile_preserves_settled_first_tunnel_revision() {
         first_calls,
         "adding a profile must not mutate an already-settled tunnel"
     );
+}
+
+#[tokio::test]
+async fn disconnecting_one_of_two_profiles_reaches_terminal_truth_without_restart() {
+    let first = profile("disconnect-live-first");
+    let second = profile("disconnect-live-second");
+    let (service, supervisor, capture) =
+        topology_service(BTreeSet::from([first.clone(), second.clone()]));
+    capture.publish_readback();
+    connect_and_settle(
+        &service,
+        &supervisor,
+        &capture,
+        &first,
+        "disconnect-live-connect-first",
+    )
+    .await;
+    connect_and_settle(
+        &service,
+        &supervisor,
+        &capture,
+        &second,
+        "disconnect-live-connect-second",
+    )
+    .await;
+    wait_for_condition(
+        || {
+            service
+                .client()
+                .snapshot()
+                .operations
+                .values()
+                .all(|operation| operation.status.is_terminal())
+        },
+        "initial connections did not settle",
+    )
+    .await;
+
+    let disconnect = service
+        .client()
+        .submit(CommandRequest {
+            command: UserCommand::Disconnect {
+                profile_id: Some(first.clone()),
+            },
+            idempotency_key: IdempotencyKey::new("disconnect-live-first-only"),
+            deadline: Deadline(1_000),
+        })
+        .await
+        .expect("disconnect admitted");
+    wait_for_condition(
+        || {
+            capture
+                .tunnel_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(profile_id, mutation, _)| {
+                    profile_id == &first && *mutation == TunnelMutation::Disconnect
+                })
+        },
+        "disconnect effect was not dispatched",
+    )
+    .await;
+
+    wait_for_condition(
+        || {
+            let snapshot = service.client().snapshot();
+            snapshot.operations[&disconnect.operation_id].status == OperationStatus::Succeeded
+                && !snapshot.tunnels.contains_key(&first)
+        },
+        "authenticated teardown absence remained dependent on a scanner refresh",
+    )
+    .await;
+
+    assert!(matches!(
+        service.client().snapshot().tunnels[&second].state,
+        Connection::Connected { .. }
+    ));
 }
 
 #[tokio::test]
@@ -3388,33 +3682,31 @@ async fn opposite_profile_intent_cancels_older_pending_operation() {
     }
     wait_for_condition(
         || {
-            supervisor.profile_truth(&target).is_some_and(|entry| {
-                entry.mutation == TunnelMutation::Disconnect
-                    && entry.truth == SupervisedTruth::WaitingForObservation
-            })
+            supervisor.profile_truth(&target).is_none()
+                && service
+                    .client()
+                    .snapshot()
+                    .observed
+                    .tunnels
+                    .get(&target)
+                    .is_some_and(|tunnel| !tunnel.active)
         },
-        "disconnect did not reach its observation barrier",
+        "authenticated disconnect receipt did not publish absence",
     )
     .await;
     let desired = service.client().snapshot().desired;
     service
         .observer()
-        .observe(Observation::Tunnel {
-            profile_id: target,
-            active: false,
-            interface_name: None,
+        .observe(Observation::Protection(ProtectionEvidence {
+            desired_generation: desired.generation,
+            authority_epoch: desired.authority_epoch,
+            policy_digest: desired.policy_digest,
             observed_at_millis: 0,
-            protection: Some(ProtectionEvidence {
-                desired_generation: desired.generation,
-                authority_epoch: desired.authority_epoch,
-                policy_digest: desired.policy_digest,
-                observed_at_millis: 0,
-                interface: GateEvidence::Verified,
-                route: GateEvidence::Verified,
-                dns: GateEvidence::Verified,
-                firewall: GateEvidence::Verified,
-            }),
-        })
+            interface: GateEvidence::Verified,
+            route: GateEvidence::Verified,
+            dns: GateEvidence::Verified,
+            firewall: GateEvidence::Verified,
+        }))
         .await
         .unwrap();
     wait_for_condition(
@@ -3930,40 +4222,6 @@ async fn reconnect_all_targets_only_currently_managed_profiles() {
 
     wait_for_condition(
         || {
-            supervisor.profile_truth(&connected).is_some_and(|entry| {
-                entry.operation_id == reconnect.operation_id
-                    && entry.revision == reconnect_revision
-                    && entry.mutation == TunnelMutation::Disconnect
-                    && entry.truth == SupervisedTruth::WaitingForObservation
-            })
-        },
-        "reconnect teardown did not reach its observation barrier",
-    )
-    .await;
-    let desired = client.snapshot().desired;
-    service
-        .observer()
-        .observe(Observation::Tunnel {
-            profile_id: connected.clone(),
-            active: false,
-            interface_name: None,
-            observed_at_millis: 0,
-            protection: Some(ProtectionEvidence {
-                desired_generation: desired.generation,
-                authority_epoch: desired.authority_epoch,
-                policy_digest: desired.policy_digest.clone(),
-                observed_at_millis: 0,
-                interface: GateEvidence::Verified,
-                route: GateEvidence::Verified,
-                dns: GateEvidence::Verified,
-                firewall: GateEvidence::Verified,
-            }),
-        })
-        .await
-        .expect("reconnect absence observed");
-
-    wait_for_condition(
-        || {
             executor.0.lock().unwrap()[executions_before..].iter().any(
                 |(profile_id, operation_id, revision, mutation)| {
                     profile_id == &connected
@@ -3976,6 +4234,7 @@ async fn reconnect_all_targets_only_currently_managed_profiles() {
         "reconnect did not dispatch its second-phase connect",
     )
     .await;
+    let desired = client.snapshot().desired;
     wait_for_condition(
         || {
             supervisor.profile_truth(&connected).is_some_and(|entry| {
@@ -4355,6 +4614,110 @@ async fn expired_client_operation_leaves_queryable_record_and_starts_recovery() 
 }
 
 #[tokio::test]
+async fn wireguard_interface_presence_remains_connecting_until_handshake_is_verified() {
+    struct DelayedMissingHandshake {
+        entered: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+    }
+
+    impl TunnelExecutor for DelayedMissingHandshake {
+        fn execute(
+            &self,
+            work: &TunnelWork,
+            cancellation: &CancellationToken,
+        ) -> Result<TunnelExecutionReceipt, String> {
+            self.entered.store(true, Ordering::Release);
+            while !self.release.load(Ordering::Acquire) {
+                if cancellation.is_cancelled() {
+                    return Err("cancelled before handshake".into());
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            TunnelExecutionReceipt::attested(
+                work.profile_id.clone(),
+                "utun-test",
+                TunnelKindTag::WireGuard,
+                None,
+                "wg-interface-without-handshake",
+            )
+        }
+
+        fn compensate_uncertain(&self, _: &TunnelWork) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    let target = profile("interface-before-handshake");
+    let entered = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let service = ControlService::start_supervised(
+        ControlServiceConfig {
+            authority_epoch: AuthorityEpoch(1),
+            known_profiles: BTreeSet::from([target.clone()]),
+            profile_topologies: BTreeMap::from([(
+                target.clone(),
+                ProfileTopology {
+                    protocol: Some(ProtocolKind::WireGuard),
+                    ..ProfileTopology::default()
+                },
+            )]),
+            freshness_poll_interval: Duration::from_millis(5),
+            ..ControlServiceConfig::default()
+        },
+        Arc::new(TestClock::default()),
+        ExecutionSelection::CanonicalAuthority,
+        Arc::new(Supervisor::new(
+            AuthorityEpoch(1),
+            Arc::new(DelayedMissingHandshake {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            }),
+            Arc::new(OkPolicy),
+            2,
+            4,
+        )),
+    );
+    let admitted = service
+        .client()
+        .submit(CommandRequest {
+            command: UserCommand::Connect {
+                profile_id: target.clone(),
+                conflict_acknowledgement: None,
+            },
+            idempotency_key: IdempotencyKey::new("interface-before-handshake"),
+            deadline: Deadline(1_000),
+        })
+        .await
+        .expect("connect admitted");
+    wait_for_condition(
+        || entered.load(Ordering::Acquire),
+        "WireGuard worker did not enter",
+    )
+    .await;
+
+    observe_connected(&service, &target, "utun-test").await;
+    let snapshot = service.client().snapshot();
+    let state = snapshot.tunnels[&target].state.clone();
+    let primary = snapshot.primary.clone();
+    release.store(true, Ordering::Release);
+
+    assert!(matches!(state, Connection::Connecting { .. }));
+    assert_ne!(primary, Some(target));
+    wait_for_condition(
+        || {
+            service
+                .client()
+                .snapshot()
+                .operations
+                .get(&admitted.operation_id)
+                .is_some_and(|operation| operation.status == OperationStatus::Failed)
+        },
+        "missing handshake did not terminalize the connect",
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn cleaned_handshake_failure_terminalizes_original_before_policy_retry() {
     struct MissingHandshake;
     impl TunnelExecutor for MissingHandshake {
@@ -4442,6 +4805,103 @@ async fn cleaned_handshake_failure_terminalizes_original_before_policy_retry() {
         assert!(tokio::time::Instant::now() < deadline);
         tokio::task::yield_now().await;
     }
+}
+
+#[tokio::test]
+async fn exhausted_wireguard_handshake_retry_rolls_back_connected_intent() {
+    struct MissingHandshake {
+        attempts: Arc<AtomicU64>,
+    }
+
+    impl TunnelExecutor for MissingHandshake {
+        fn execute(
+            &self,
+            work: &TunnelWork,
+            _: &CancellationToken,
+        ) -> Result<TunnelExecutionReceipt, String> {
+            self.attempts.fetch_add(1, Ordering::AcqRel);
+            TunnelExecutionReceipt::attested(
+                work.profile_id.clone(),
+                "wg-cleaned",
+                TunnelKindTag::WireGuard,
+                None,
+                "wg-missing-handshake",
+            )
+        }
+
+        fn compensate_uncertain(&self, _: &TunnelWork) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    let target = profile("handshake-retry-exhausted");
+    let attempts = Arc::new(AtomicU64::new(0));
+    let service = ControlService::start_supervised(
+        ControlServiceConfig {
+            authority_epoch: AuthorityEpoch(1),
+            known_profiles: BTreeSet::from([target.clone()]),
+            profile_topologies: BTreeMap::from([(
+                target.clone(),
+                ProfileTopology {
+                    protocol: Some(vortix::vortix_core::profile::ProtocolKind::WireGuard),
+                    ..ProfileTopology::default()
+                },
+            )]),
+            freshness_poll_interval: Duration::from_millis(5),
+            ..ControlServiceConfig::default()
+        },
+        Arc::new(TestClock::default()),
+        ExecutionSelection::CanonicalAuthority,
+        Arc::new(Supervisor::new(
+            AuthorityEpoch(1),
+            Arc::new(MissingHandshake {
+                attempts: attempts.clone(),
+            }),
+            Arc::new(OkPolicy),
+            2,
+            4,
+        )),
+    );
+    let admitted = service
+        .client()
+        .submit(CommandRequest {
+            command: UserCommand::Connect {
+                profile_id: target.clone(),
+                conflict_acknowledgement: None,
+            },
+            idempotency_key: IdempotencyKey::new("handshake-retry-exhausted"),
+            deadline: Deadline(1_000),
+        })
+        .await
+        .unwrap();
+
+    wait_for_condition(
+        || {
+            let snapshot = service.client().snapshot();
+            attempts.load(Ordering::Acquire) >= 2
+                && snapshot.desired.tunnels.get(&target)
+                    == Some(&RequestedTunnelState::Disconnected)
+        },
+        "exhausted WireGuard handshake retry did not roll back connected intent",
+    )
+    .await;
+
+    let snapshot = service.client().snapshot();
+    assert_eq!(attempts.load(Ordering::Acquire), 2);
+    assert_eq!(
+        snapshot.operations[&admitted.operation_id].result,
+        Some(vortix::vortix_core::control::OperationResult::Failed(
+            vortix::vortix_core::control::OperationFailure::HandshakeFailed
+        ))
+    );
+    assert!(snapshot
+        .operations
+        .values()
+        .all(|operation| operation.status.is_terminal()));
+    assert!(!snapshot
+        .tunnels
+        .get(&target)
+        .is_some_and(|tunnel| { matches!(tunnel.state, Connection::Connecting { .. }) }));
 }
 
 #[tokio::test]
@@ -4589,6 +5049,86 @@ async fn definitive_openvpn_auth_failure_terminalizes_and_rolls_back_connect_int
             );
             assert!(!snapshot.operations.values().any(|operation| {
                 operation.id != admitted.operation_id && !operation.status.is_terminal()
+            }));
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::task::yield_now().await;
+    }
+}
+
+#[tokio::test]
+async fn invalid_wireguard_profile_terminalizes_without_remaining_in_handshaking() {
+    struct InvalidProfile;
+    impl TunnelExecutor for InvalidProfile {
+        fn execute(
+            &self,
+            _: &TunnelWork,
+            _: &CancellationToken,
+        ) -> Result<TunnelExecutionReceipt, String> {
+            Err("WireGuard name must be 1–15 characters".into())
+        }
+
+        fn classify_failure(&self, _: &str) -> WorkFailure {
+            WorkFailure::InvalidProfile
+        }
+    }
+
+    let target = profile("invalid-wireguard-name");
+    let service = ControlService::start_supervised(
+        ControlServiceConfig {
+            authority_epoch: AuthorityEpoch(1),
+            known_profiles: BTreeSet::from([target.clone()]),
+            profile_topologies: BTreeMap::from([(
+                target.clone(),
+                ProfileTopology {
+                    protocol: Some(ProtocolKind::WireGuard),
+                    ..ProfileTopology::default()
+                },
+            )]),
+            freshness_poll_interval: Duration::from_millis(5),
+            ..ControlServiceConfig::default()
+        },
+        Arc::new(TestClock::default()),
+        ExecutionSelection::CanonicalAuthority,
+        Arc::new(Supervisor::new(
+            AuthorityEpoch(1),
+            Arc::new(InvalidProfile),
+            Arc::new(OkPolicy),
+            2,
+            4,
+        )),
+    );
+    let admitted = service
+        .client()
+        .submit(CommandRequest {
+            command: UserCommand::Connect {
+                profile_id: target.clone(),
+                conflict_acknowledgement: None,
+            },
+            idempotency_key: IdempotencyKey::new("invalid-wireguard-terminal"),
+            deadline: Deadline(1_000),
+        })
+        .await
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        let snapshot = service.client().snapshot();
+        let operation = &snapshot.operations[&admitted.operation_id];
+        if operation.status.is_terminal() {
+            assert_eq!(
+                operation.result,
+                Some(vortix::vortix_core::control::OperationResult::Failed(
+                    vortix::vortix_core::control::OperationFailure::InvalidProfile
+                ))
+            );
+            assert_eq!(
+                snapshot.desired.tunnels.get(&target),
+                Some(&RequestedTunnelState::Disconnected)
+            );
+            assert!(!snapshot.operations.values().any(|candidate| {
+                candidate.id != admitted.operation_id && !candidate.status.is_terminal()
             }));
             break;
         }

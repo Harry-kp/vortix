@@ -210,7 +210,7 @@ const GUARD_GLOSSARY: &[(&str, &str)] = &[
     ),
     (
         "Identity → DNS",
-        "Configured resolver IP with the provider tag inlined when recognised (Cloudflare/Google/Quad9/OpenDNS). ✓ means the canonical control owner applied the exact current-generation DNS policy and read it back from the operating system. ⚠ means that readback is absent or stale. Vortix does not label a different recursive-server egress address as a leak: private DNS forwarders normally recurse through another public address, so that comparison is not proof of a bypass.",
+        "The active primary VPN's intended system resolver, including DNS learned from an OpenVPN server. ✓ means Vortix read back that exact resolver policy and the kernel routes every resolver through the owning VPN interface. ⚠ means the VPN supplied no system resolver or either proof is unavailable. This covers system DNS, not application-owned encrypted DNS such as browser DoH. A recursive server's public egress address is not compared with the configured server because forwarding and anycast make that comparison unreliable.",
     ),
     (
         "Defense → Killswitch",

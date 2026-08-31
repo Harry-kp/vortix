@@ -55,7 +55,7 @@ Terminal UI for WireGuard and OpenVPN with real-time telemetry and leak guarding
 
 I wanted a single interface to:
 - See connection status, throughput, and latency at a glance
-- Detect IPv6/DNS leaks without running separate tools
+- Detect IPv6 exposure and verify that system DNS is routed through the VPN
 - Switch between VPN profiles without remembering CLI flags
 
 Existing options (`wg show`, NetworkManager, Tunnelblick) either lack real-time telemetry or require a GUI.
@@ -89,7 +89,7 @@ Use the right tool: if you only run one WireGuard tunnel and don't care about te
 - **Multi-tunnel** *(new in v0.4.0)* — Multiple VPN profiles connected simultaneously; the registry tracks primary + addressable secondaries; per-profile retry/auto-reconnect; auto-adopt of externally-started tunnels (`wg-quick up X` from another terminal shows up in the TUI within ~1s)
 - **Advanced Telemetry** — Real-time throughput, latency, **jitter**, and **packet loss**
 - **Geo-Location** — Instant detection of your exit IP's city and country
-- **Leak detection** — Monitors for IPv6 leaks and DNS leaks in real-time
+- **Leak detection** — Monitors IPv4/IPv6 exposure and verifies the active system DNS policy plus each resolver's kernel route
 - **Kill Switch** — Platform-native firewall (PF on macOS; `iptables` or `nftables` on Linux). Three modes — **Off** (no firewall), **Block on drop** (engages only if the VPN drops unexpectedly), **VPN-only** (firewall stays engaged whether the VPN is up or down — closes the gap-between-drop-and-reconnect leak window). Multi-tunnel-aware: every active tunnel's interface is allow-listed. Rules survive vortix restarts and crashes but not an OS reboot — re-arm after boot
 - **Session event journal** *(v0.3.0)* — JSONL event log per session under `${XDG_DATA_HOME}/vortix/sessions/`, 30-day retention; useful for diagnostics and scripting
 - **Per-process socket audit** *(v0.3.0)* — `vortix audit` answers "is this traffic actually routing through the tunnel?" with per-PID socket inventory; Linux + macOS supported
@@ -199,7 +199,7 @@ Vortix asks for root because managing VPN tunnels and firewall state is privileg
 - **What it reads:** profile files (`~/.config/vortix/profiles/*`), kernel network state (`getifaddrs`, `sysctl` route table, `wg show`, `openvpn` management socket).
 - **What it writes:** kernel tunnel interfaces via `wg-quick` / `openvpn`; the platform firewall (`pfctl` on macOS, `iptables` / `nftables` on Linux) for the kill switch; tiny config-dir files (`real-ip.cache`, `real-ipv6.cache`, log + journal under `${XDG_DATA_HOME}/vortix/`, mode 0600).
 - **What it does NOT touch:** the bootloader, system services, package manager state, `/etc/` outside `/etc/wireguard` (managed by `wg-quick`), other users' files, your shell history, your keychain, any cloud account.
-- **Network egress:** ipinfo.io and ifconfig.co for the IP / geo / leak probes; the configured DNS resolver for the recursor-IP echo probe. No telemetry to vortix infrastructure — there is no vortix infrastructure.
+- **Network egress:** ipinfo.io and ifconfig.co for IP / geo probes. DNS protection is checked locally by exact operating-system resolver readback and kernel route inspection; Vortix sends no DNS-test telemetry to its own infrastructure because there is no Vortix infrastructure.
 
 Code that runs as root is in `crates/vortix/src/vortix_platform_*` (per-OS firewall + DNS) and `crates/vortix/src/vortix_protocol_*` (subprocess wrappers for `wg`, `wg-quick`, `openvpn`). Both modules are kept thin so the privileged surface is small and reviewable. Tunnel binaries (`wg-quick`, `openvpn`) are the same ones a hand-rolled `sudo wg-quick up …` would invoke; vortix doesn't ship its own VPN implementation.
 

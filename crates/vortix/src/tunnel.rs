@@ -255,6 +255,41 @@ impl CanonicalTunnelExecutor {
         }
     }
 
+    /// Return whether the session is the exact live handle owned by this
+    /// executor process. This is stronger than a scanner-only classification:
+    /// the handle enters this ledger only after protocol success and durable
+    /// Standard-mode ownership have both completed.
+    pub(crate) fn owns_live_session(
+        &self,
+        profile_id: &ProfileId,
+        session: &crate::core::scanner::ActiveSession,
+    ) -> Result<bool, String> {
+        let active = self
+            .active
+            .lock()
+            .map_err(|_| "canonical active-tunnel ledger poisoned".to_string())?;
+        let Some((_, handle)) = active.get(profile_id) else {
+            return Ok(false);
+        };
+        if handle.profile_id != *profile_id
+            || !session.interface_authoritative
+            || handle.interface_name != session.interface
+        {
+            return Ok(false);
+        }
+        Ok(match handle.kind {
+            // On macOS WireGuard runs in userspace, so the scanner reports
+            // the `wireguard-go` PID. The canonical ownership proof is this
+            // executor's exact profile/interface-bound live handle; unlike
+            // OpenVPN, `TunnelHandle::pid` is intentionally absent for
+            // WireGuard and the scanner PID must not make the session look
+            // external.
+            TunnelKindTag::WireGuard => true,
+            TunnelKindTag::OpenVpn => handle.pid.is_some() && handle.pid == session.pid,
+            TunnelKindTag::Mock => false,
+        })
+    }
+
     /// Supply the session-owned live resolver for reusable `OpenVPN`
     /// credentials. The executor receives one memory-only value per attempt
     /// and never opens the remembered-credential store itself.
@@ -902,6 +937,10 @@ impl crate::vortix_core::control::worker::TunnelExecutor for CanonicalTunnelExec
             // semantic failure is still an exact WireGuard handshake gate.
             // This check must precede the generic operation-timeout fallback.
             WorkFailure::HandshakeFailed
+        } else if error.contains("WireGuard name must be")
+            || error.contains("WireGuard config has no valid name")
+        {
+            WorkFailure::InvalidProfile
         } else if error.contains("expired") || error.contains("timed out") {
             WorkFailure::TimedOut
         } else {
@@ -1034,6 +1073,7 @@ mod canonical_tests {
     use crate::vortix_core::control::model::{AuthorityEpoch, OperationId};
     use crate::vortix_core::control::worker::{TunnelMutation, TunnelRevision, TunnelWork};
     use crate::vortix_core::ports::dns::DnsRequest;
+    use crate::vortix_core::ports::tunnel::mock::MockTunnel;
     use crate::vortix_core::ports::tunnel::{HandshakeEvidence, TunnelTeardownConfig};
     use std::time::{Duration, Instant, SystemTime};
 
@@ -1106,6 +1146,48 @@ mod canonical_tests {
         let exact = CanonicalTunnelExecutor::receipt_for(&work(7), &handle(7)).unwrap();
         assert_eq!(exact.handshake.unwrap().generation, 7);
         assert!(CanonicalTunnelExecutor::receipt_for(&work(8), &handle(7)).is_err());
+    }
+
+    #[test]
+    fn canonical_executor_owns_kernel_and_userspace_wireguard_sessions() {
+        let executor = CanonicalTunnelExecutor::new(
+            CanonicalTunnelSettings {
+                config_dir: std::env::temp_dir(),
+                openvpn_verbosity: "3".into(),
+                connect_timeout_secs: 1,
+                wireguard_handshake_timeout_secs: 1,
+                wireguard_health_targets: Vec::new(),
+            },
+            |_| None,
+        );
+        let profile_id = ProfileId::new("corp");
+        let live_handle = handle(7);
+        executor.active.lock().unwrap().insert(
+            profile_id.clone(),
+            (TunnelKind::Mock(MockTunnel::new()), live_handle),
+        );
+        let kernel_session = crate::core::scanner::ActiveSession {
+            name: "corp".into(),
+            interface: "wg0".into(),
+            interface_authoritative: true,
+            wireguard_peers: Vec::new(),
+            ..crate::core::scanner::ActiveSession::default()
+        };
+
+        assert!(executor
+            .owns_live_session(&profile_id, &kernel_session)
+            .unwrap());
+
+        // macOS userspace WireGuard is represented by a live
+        // `wireguard-go` process. Its PID is scanner metadata, not a
+        // contradiction of this executor's in-memory ownership.
+        let userspace_session = crate::core::scanner::ActiveSession {
+            pid: Some(12_345),
+            ..kernel_session
+        };
+        assert!(executor
+            .owns_live_session(&profile_id, &userspace_session)
+            .unwrap());
     }
 
     #[test]
@@ -1295,6 +1377,10 @@ mod canonical_tests {
             executor.classify_failure("canonical tunnel operation timed out"),
             WorkFailure::TimedOut
         );
+        assert_eq!(
+            executor.classify_failure("subprocess failure: WireGuard name must be 1–15 characters"),
+            WorkFailure::InvalidProfile
+        );
     }
 
     #[test]
@@ -1308,9 +1394,11 @@ mod canonical_tests {
         use crate::vortix_core::ports::tunnel::TunnelPeerStatus;
 
         let temp = tempfile::tempdir().unwrap();
-        let config = temp.path().join("corp.conf");
+        let config = temp.path().join("wg0.conf");
         std::fs::write(&config, "[Interface]\nPrivateKey = redacted\n").unwrap();
-        let managed_config = temp.path().join("managed-corp.conf");
+        let lifecycle = temp.path().join("lifecycle");
+        std::fs::create_dir(&lifecycle).unwrap();
+        let managed_config = lifecycle.join("wg0.conf");
         std::fs::write(
             &managed_config,
             "[Interface]\nPrivateKey = lifecycle-copy\n",
@@ -1353,6 +1441,7 @@ mod canonical_tests {
                 &TunnelTeardownConfig {
                     path: managed_config,
                     managed: true,
+                    wg_quick_interface: Some("wg0".into()),
                 },
                 evidence.clone(),
                 Vec::new(),

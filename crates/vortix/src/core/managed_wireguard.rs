@@ -24,6 +24,7 @@ const DIRECTORY: &str = "managed-wireguard";
 const LOCK_FILE: &str = "managed-wireguard.lock";
 const SCHEMA_VERSION: u8 = 1;
 const MAX_RECEIPT_BYTES: u64 = 64 * 1024;
+const MAX_TRACKED_RECEIPTS: usize = 512;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 /// A successful, generation-bound `WireGuard` connect issued by Vortix.
@@ -101,6 +102,75 @@ pub fn issue(
 #[must_use]
 pub fn load(config_dir: &Path, profile_id: &ProfileId) -> Option<ManagedWireGuardReceipt> {
     let path = receipt_path(config_dir, profile_id);
+    let receipt = load_receipt_path(&path)?;
+    (receipt.profile_id == profile_id.as_str()).then_some(receipt)
+}
+
+/// PIDs backed by a bounded managed receipt and a currently live interface.
+///
+/// This is advisory startup classification only. It does not grant teardown
+/// authority; lifecycle recovery still validates the root-owned ownership
+/// record and fresh protocol evidence before adopting or mutating a tunnel.
+#[must_use]
+pub fn tracked_wireguard_pids(config_dir: &Path) -> Vec<u32> {
+    tracked_wireguard_pids_with(config_dir, |interface| {
+        crate::platform::current_platform()
+            .interface
+            .get_wireguard_pid(interface)
+    })
+}
+
+fn tracked_wireguard_pids_with(
+    config_dir: &Path,
+    resolve_pid: impl Fn(&str) -> Option<u32>,
+) -> Vec<u32> {
+    let directory = config_dir.join(DIRECTORY);
+    let Ok(metadata) = std::fs::symlink_metadata(&directory) else {
+        return Vec::new();
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(&directory) else {
+        return Vec::new();
+    };
+    let entries = entries
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|value| value == "json")
+        })
+        .take(MAX_TRACKED_RECEIPTS + 1)
+        .collect::<Vec<_>>();
+    if entries.len() > MAX_TRACKED_RECEIPTS {
+        return Vec::new();
+    }
+
+    entries
+        .into_iter()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let receipt = load_receipt_path(&path)?;
+            let profile_id = ProfileId::new(&receipt.profile_id);
+            (receipt_path(config_dir, &profile_id).file_name() == path.file_name())
+                .then_some(receipt)
+        })
+        .filter_map(|receipt| resolve_pid(&receipt.interface_name))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn load_receipt_path(path: &Path) -> Option<ManagedWireGuardReceipt> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > MAX_RECEIPT_BYTES
+    {
+        return None;
+    }
     let file = File::open(path).ok()?;
     if file.metadata().ok()?.len() > MAX_RECEIPT_BYTES {
         return None;
@@ -114,7 +184,7 @@ pub fn load(config_dir: &Path, profile_id: &ProfileId) -> Option<ManagedWireGuar
     }
     let receipt: ManagedWireGuardReceipt = serde_json::from_slice(&bytes).ok()?;
     (receipt.schema_version == SCHEMA_VERSION
-        && receipt.profile_id == profile_id.as_str()
+        && !receipt.profile_id.is_empty()
         && receipt.generation > 0
         && receipt.handshake.generation == receipt.generation)
         .then_some(receipt)
@@ -393,5 +463,44 @@ mod tests {
         assert!(load(dir.path(), &profile).is_some());
         assert!(remove_after_absence(dir.path(), &profile, &[]).unwrap());
         assert!(load(dir.path(), &profile).is_none());
+    }
+
+    #[test]
+    fn tracked_pids_include_only_live_interfaces_from_valid_managed_receipts() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = ProfileId::new("stable-profile");
+        let at = SystemTime::now();
+        issue(
+            dir.path(),
+            &profile,
+            "utun4".into(),
+            1,
+            evidence(1, at),
+            Vec::new(),
+        )
+        .unwrap();
+
+        let resolved = std::cell::RefCell::new(Vec::new());
+        let tracked = tracked_wireguard_pids_with(dir.path(), |interface| {
+            resolved.borrow_mut().push(interface.to_owned());
+            (interface == "utun4").then_some(4242)
+        });
+        assert_eq!(tracked, vec![4242]);
+        assert_eq!(*resolved.borrow(), vec!["utun4"]);
+
+        std::fs::write(
+            dir.path()
+                .join(DIRECTORY)
+                .join("not-a-managed-receipt.json"),
+            br#"{"interface_name":"utun9"}"#,
+        )
+        .unwrap();
+        resolved.borrow_mut().clear();
+        let tracked = tracked_wireguard_pids_with(dir.path(), |interface| {
+            resolved.borrow_mut().push(interface.to_owned());
+            Some(9999)
+        });
+        assert_eq!(tracked, vec![9999]);
+        assert_eq!(*resolved.borrow(), vec!["utun4"]);
     }
 }

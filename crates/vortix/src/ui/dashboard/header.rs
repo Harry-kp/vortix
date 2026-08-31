@@ -118,6 +118,9 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn mode_signal(app: &App, width: u16) -> &'static str {
+    if app.control_starting {
+        return if width >= 70 { "S… Starting" } else { "S…" };
+    }
     if width >= 70 {
         app.background_mode.state.header_signal()
     } else {
@@ -690,6 +693,15 @@ fn push_strip(line: &mut Line<'static>, with_label: bool, inner: &[Span<'static>
 fn get_killswitch_indicator(app: &App) -> Span<'static> {
     use crate::state::{KillSwitchMode, KillSwitchState};
 
+    if let Some(mode) = app.pending_control_killswitch_mode {
+        let label = match mode {
+            KillSwitchMode::Off => " KS:Off… ",
+            KillSwitchMode::Auto => " KS:Watch… ",
+            KillSwitchMode::AlwaysOn => " KS:VPN-only… ",
+        };
+        return Span::styled(label, Style::default().fg(theme::WARNING));
+    }
+
     match (app.runtime.killswitch_mode, app.runtime.killswitch_state) {
         (_, KillSwitchState::Degraded) => Span::styled(
             " KS:DEGRADED ",
@@ -838,6 +850,27 @@ mod tests {
         let out = render_to_string(&app, 80, 1);
         assert!(out.contains("S· Standard"), "{out}");
         assert!(out.contains("DISCONNECTED"), "{out}");
+    }
+
+    #[test]
+    fn startup_signal_is_visible_without_delaying_the_first_frame() {
+        let mut app = App::new_test();
+        app.control_starting = true;
+        let wide = render_to_string(&app, 80, 1);
+        assert!(wide.contains("S… Starting"), "{wide}");
+
+        let narrow = render_to_string(&app, 50, 1);
+        assert!(narrow.contains("S…"), "{narrow}");
+    }
+
+    #[test]
+    fn pending_kill_switch_target_is_visible_in_the_header() {
+        let mut app = App::new_test();
+        app.pending_control_killswitch_mode = Some(crate::state::KillSwitchMode::AlwaysOn);
+        assert_eq!(
+            get_killswitch_indicator(&app).content.as_ref(),
+            " KS:VPN-only… "
+        );
     }
 
     #[test]

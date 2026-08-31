@@ -22,7 +22,7 @@ use crate::vortix_core::control::worker::{
     PolicyBarrier, PolicyExecutionEvidence, PolicyExecutor, PolicyStage, TopologyPolicy,
     TopologyState, TunnelRevision,
 };
-use crate::vortix_core::ports::dns::DnsRequest;
+use crate::vortix_core::ports::dns::{DnsPolicyAdapter, DnsRequest};
 use crate::vortix_core::privileged::{
     DnsHostname, HelperResourceState, NetworkPolicyOperation, ObservationState,
     OpenVpnRouteDefaults, OpenVpnRouteGateway, PolicyPhase, PolicyPredecessor, PolicyProjection,
@@ -181,9 +181,12 @@ enum HelperBackedPolicyExecutorError {
     CapabilityMismatch,
 }
 
+type DnsRouteVerifier = dyn Fn(&TopologyPolicy) -> Result<(), HelperPolicyPlanError> + Send + Sync;
+
 struct HelperBackedPolicyExecutor {
     helper: Arc<dyn HelperPolicyTransport>,
     readback: Mutex<Option<PolicyReadback>>,
+    dns_route_verifier: Arc<DnsRouteVerifier>,
 }
 
 impl HelperBackedPolicyExecutor {
@@ -198,7 +201,18 @@ impl HelperBackedPolicyExecutor {
         Ok(Self {
             helper,
             readback: Mutex::new(None),
+            dns_route_verifier: Arc::new(Self::verify_dns_routes),
         })
+    }
+
+    #[cfg(test)]
+    fn with_dns_route_verifier(
+        helper: Arc<dyn HelperPolicyTransport>,
+        verifier: impl Fn(&TopologyPolicy) -> Result<(), HelperPolicyPlanError> + Send + Sync + 'static,
+    ) -> Result<Self, HelperBackedPolicyExecutorError> {
+        let mut executor = Self::new(helper)?;
+        executor.dns_route_verifier = Arc::new(verifier);
+        Ok(executor)
     }
 
     fn readback_key(policy: &TopologyPolicy) -> PolicyReadbackKey {
@@ -239,6 +253,17 @@ impl HelperBackedPolicyExecutor {
                 .expect("readback was initialized")
                 .evidence,
         );
+    }
+
+    fn verify_dns_routes(policy: &TopologyPolicy) -> Result<(), HelperPolicyPlanError> {
+        let dns_policy = crate::core::dns_protection::policy_for_topology(
+            policy.generation,
+            &policy.target,
+            crate::platform::current_platform().dns.capabilities(),
+        )
+        .map_err(|_| HelperPolicyPlanError::InvalidInput)?;
+        crate::core::dns_protection::verify_dns_routes(&dns_policy, policy.deadline)
+            .map_err(|_| HelperPolicyPlanError::HelperUnavailable)
     }
 
     fn forward_plan(
@@ -1763,12 +1788,14 @@ impl PolicyExecutor for HelperBackedPolicyExecutor {
             PolicyBarrier::Observation => {
                 self.observe_dns(policy, &plan)
                     .map_err(|error| error.to_string())?;
+                (self.dns_route_verifier)(policy).map_err(|error| error.to_string())?;
             }
             PolicyBarrier::EffectivePublication => {
                 self.apply_final_firewall(policy, &plan)
                     .map_err(|error| error.to_string())?;
                 self.audit_final_publication(policy, &plan)
                     .map_err(|error| error.to_string())?;
+                (self.dns_route_verifier)(policy).map_err(|error| error.to_string())?;
                 let observed_at_millis = crate::utils::boot_elapsed_millis().ok_or_else(|| {
                     "OS boot clock is unavailable for policy evidence".to_string()
                 })?;
@@ -1813,6 +1840,7 @@ impl PolicyExecutor for HelperBackedPolicyExecutor {
             .map_err(|error| error.to_string())?;
         self.audit_final_publication(policy, &plan)
             .map_err(|error| error.to_string())?;
+        (self.dns_route_verifier)(policy).map_err(|error| error.to_string())?;
         let observed_at_millis = crate::utils::boot_elapsed_millis()
             .ok_or_else(|| "OS boot clock is unavailable for policy evidence".to_string())?;
         Ok(PolicyExecutionEvidence {

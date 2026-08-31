@@ -243,14 +243,14 @@ impl App {
                 }
             }
             InputMode::Rename {
-                index,
+                profile_id,
                 mut new_name,
                 mut cursor,
             } => {
-                self.handle_rename_keys(key, index, &mut new_name, &mut cursor);
+                self.handle_rename_keys(key, &profile_id, &mut new_name, &mut cursor);
                 if let InputMode::Rename { .. } = self.input_mode {
                     self.input_mode = InputMode::Rename {
-                        index,
+                        profile_id,
                         new_name,
                         cursor,
                     };
@@ -953,7 +953,7 @@ impl crate::app::App {
     fn handle_rename_keys(
         &mut self,
         key: KeyEvent,
-        index: usize,
+        profile_id: &crate::vortix_core::profile::ProfileId,
         new_name: &mut String,
         cursor: &mut usize,
     ) {
@@ -964,7 +964,7 @@ impl crate::app::App {
             KeyCode::Enter => {
                 let trimmed = new_name.trim().to_string();
                 if !trimmed.is_empty() {
-                    self.rename_profile(index, &trimmed);
+                    self.rename_profile_by_id(profile_id, &trimmed);
                 }
                 self.input_mode = InputMode::Normal;
             }

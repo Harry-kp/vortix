@@ -25,6 +25,34 @@ use crate::vpn_runtime::VpnRuntime;
 /// Leaves the actor enough time to persist and publish a settled protocol
 /// result after the protocol gate and its configured teardown budget.
 const CONTROL_COMPLETION_GRACE_SECS: u64 = 5;
+fn lifecycle_progress_message(
+    mode: OutputMode,
+    action: &str,
+    profile: &str,
+    protocol: Option<&str>,
+    timeout_secs: u64,
+) -> Option<String> {
+    if mode != OutputMode::Human {
+        return None;
+    }
+    let protocol = protocol.map_or_else(String::new, |value| format!(" ({value})"));
+    Some(format!(
+        "◐ {action} {profile}{protocol} — verifying the tunnel and network policy; this may take up to {timeout_secs}s (Ctrl-C cancels)…"
+    ))
+}
+
+fn show_lifecycle_progress(
+    mode: OutputMode,
+    action: &str,
+    profile: &str,
+    protocol: Option<&str>,
+    timeout_secs: u64,
+) {
+    if let Some(message) = lifecycle_progress_message(mode, action, profile, protocol, timeout_secs)
+    {
+        eprintln!("{message}");
+    }
+}
 
 fn connect_operation_timeout_secs(
     explicit: Option<u64>,
@@ -877,6 +905,14 @@ fn handle_up(
         .unwrap_or_else(|(error, exit)| print_error_and_exit(mode, "up", error, exit));
 
     let challenge_profiles = engine.profiles.clone();
+    let protocol = target.protocol.to_string();
+    show_lifecycle_progress(
+        mode,
+        "Connecting",
+        &target.name,
+        Some(&protocol),
+        timeout_secs,
+    );
     let result = control.run_with_challenges(
         command,
         Duration::from_secs(timeout_secs),
@@ -1297,6 +1333,13 @@ fn handle_down(
             profile_id: profile_id.clone(),
         }
     };
+    show_lifecycle_progress(
+        mode,
+        "Disconnecting",
+        profile_filter.unwrap_or("active VPNs"),
+        None,
+        config.disconnect_timeout,
+    );
     let result = control.run(
         command,
         Duration::from_secs(config.disconnect_timeout),
@@ -2033,6 +2076,46 @@ mod handshake_status_tests {
             human_status_headline(&snapshot("connecting", "OpenVPN")),
             "◐ Connecting to corp (OpenVPN)"
         );
+    }
+
+    #[test]
+    fn lifecycle_progress_explains_silent_verification_without_spamming() {
+        assert_eq!(
+            lifecycle_progress_message(
+                OutputMode::Human,
+                "Connecting",
+                "wg13",
+                Some("WireGuard"),
+                60,
+            ),
+            Some("◐ Connecting wg13 (WireGuard) — verifying the tunnel and network policy; this may take up to 60s (Ctrl-C cancels)…".into())
+        );
+        assert_eq!(
+            lifecycle_progress_message(
+                OutputMode::Human,
+                "Disconnecting",
+                "wg12",
+                None,
+                30,
+            ),
+            Some("◐ Disconnecting wg12 — verifying the tunnel and network policy; this may take up to 30s (Ctrl-C cancels)…".into())
+        );
+        assert!(lifecycle_progress_message(
+            OutputMode::Json,
+            "Connecting",
+            "wg13",
+            Some("WireGuard"),
+            60,
+        )
+        .is_none());
+        assert!(lifecycle_progress_message(
+            OutputMode::Quiet,
+            "Connecting",
+            "wg13",
+            Some("WireGuard"),
+            60,
+        )
+        .is_none());
     }
 
     #[test]

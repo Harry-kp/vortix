@@ -7,6 +7,9 @@ use crate::utils;
 use crate::vortix_core::engine::Conflict;
 use crate::vortix_core::profile::ProfileId;
 
+pub(super) const CONTROL_STARTING_MESSAGE: &str =
+    "The VPN service is still starting. Try again in a moment.";
+
 #[derive(Clone, Copy)]
 pub(crate) enum PendingControlSubject {
     Connection,
@@ -21,22 +24,26 @@ impl PendingControlSubject {
             Self::Connection => "connection",
             Self::Reconnection => "reconnection",
             Self::Disconnection => "disconnection",
-            Self::KillSwitch => "kill-switch change",
+            Self::KillSwitch => "kill switch change",
         }
     }
 
-    const fn dns_failure_message(self) -> &'static str {
-        match self {
+    fn dns_failure_message(self, detail: Option<&str>) -> String {
+        let message = match self {
             Self::Connection | Self::Reconnection => {
-                "Couldn't finish connecting because the VPN's DNS settings could not be applied safely. Vortix disconnected and restored your previous connection."
+                "VPN DNS could not be applied safely. Your previous network settings were restored."
             }
             Self::Disconnection => {
-                "Couldn't finish disconnecting safely because your system rejected the network change. Vortix restored your previous connection."
+                "Disconnect could not finish safely. Your previous network settings were restored."
             }
             Self::KillSwitch => {
-                "Couldn't change the kill switch safely because your system rejected the network change. Vortix restored your previous connection."
+                "The kill switch could not be changed safely. Your previous network settings were restored."
             }
-        }
+        };
+        friendly_dns_failure_explanation(detail).map_or_else(
+            || message.to_string(),
+            |explanation| format!("{message} {explanation}"),
+        )
     }
 
     const fn authentication_failure_message(self) -> &'static str {
@@ -49,12 +56,150 @@ impl PendingControlSubject {
             }
         }
     }
+
+    fn failure_message(self, failure: crate::vortix_core::control::OperationFailure) -> String {
+        use crate::vortix_core::control::OperationFailure;
+        match failure {
+            OperationFailure::Timeout => format!("{} timed out", self.label()),
+            OperationFailure::Rejected => format!(
+                "{} could not start because another action or route conflict is still active. Try again in a moment.",
+                self.label()
+            ),
+            OperationFailure::AuthenticationFailed => {
+                self.authentication_failure_message().to_string()
+            }
+            OperationFailure::DnsPolicyFailed => self.dns_failure_message(None),
+            OperationFailure::HandshakeFailed => {
+                "No WireGuard handshake was received. Check the server endpoint, keys, and network reachability."
+                    .to_string()
+            }
+            OperationFailure::InvalidProfile => {
+                "This WireGuard profile has an invalid filename. Delete it, rename the original file to 1–15 characters (for example, wg07.conf), and import it again."
+                    .to_string()
+            }
+            OperationFailure::ObservationFailed => format!(
+                "Vortix could not verify the system state after the {}. Check the Event Log and try again.",
+                self.label()
+            ),
+            OperationFailure::Internal => format!(
+                "Vortix could not complete the {}. Check the Event Log and try again.",
+                self.label()
+            ),
+        }
+    }
+}
+
+fn friendly_dns_failure_explanation(detail: Option<&str>) -> Option<&'static str> {
+    let detail = detail?.to_ascii_lowercase();
+    if [
+        "owner",
+        "owned",
+        "ownership",
+        "backup",
+        "earlier generation",
+        "interrupted",
+    ]
+    .iter()
+    .any(|needle| detail.contains(needle))
+    {
+        Some("Vortix found unfinished DNS state from an earlier connection.")
+    } else if detail.contains("route") || detail.contains("through tunnel") {
+        Some("The VPN's DNS server could not be verified through the tunnel.")
+    } else if detail.contains("lock") || detail.contains("busy") {
+        Some("Another Vortix process was updating DNS.")
+    } else if detail.contains("restore") || detail.contains("rollback") {
+        Some("Vortix could not verify restoration of the previous DNS settings.")
+    } else {
+        None
+    }
+}
+
+fn profile_mutation_failure_message(
+    failure: crate::vortix_core::control::ProfileMutationFailure,
+) -> &'static str {
+    use crate::vortix_core::control::ProfileMutationFailure;
+    match failure {
+        ProfileMutationFailure::NotFound => "The profile no longer exists",
+        ProfileMutationFailure::AlreadyExists => "A profile with that name already exists",
+        ProfileMutationFailure::InvalidName => "The profile name is invalid",
+        ProfileMutationFailure::Busy => "The profile is busy; try again in a moment",
+        ProfileMutationFailure::DeadlineExpired => "The profile update timed out",
+        ProfileMutationFailure::Storage => "The profile could not be saved safely",
+        ProfileMutationFailure::Internal => "The profile update could not be completed",
+    }
+}
+
+fn remote_profile_failure_message(
+    failure: crate::vortix_core::control::OperationFailure,
+) -> &'static str {
+    use crate::vortix_core::control::OperationFailure;
+    match failure {
+        OperationFailure::Timeout => "The profile update timed out",
+        OperationFailure::Rejected => "The profile update was refused because the profile is busy",
+        OperationFailure::AuthenticationFailed => "The profile update could not be authorized",
+        OperationFailure::InvalidProfile => "The profile is invalid",
+        OperationFailure::ObservationFailed => "Vortix could not verify the profile update",
+        OperationFailure::DnsPolicyFailed
+        | OperationFailure::HandshakeFailed
+        | OperationFailure::Internal => "The profile update could not be completed",
+    }
+}
+
+fn control_error_message(error: &crate::cli::control::LocalControlError) -> String {
+    use crate::cli::control::LocalControlError;
+    use crate::vortix_core::control::AdmissionError;
+    match error {
+        LocalControlError::Busy | LocalControlError::Admission(AdmissionError::Busy) => {
+            "Another action is still finishing. Try again in a moment.".to_string()
+        }
+        LocalControlError::Admission(AdmissionError::NotReady) => {
+            CONTROL_STARTING_MESSAGE.to_string()
+        }
+        LocalControlError::Admission(AdmissionError::RouteConflict) => {
+            "This VPN overlaps an active route. Review the confirmation and try again.".to_string()
+        }
+        LocalControlError::Admission(AdmissionError::ProfileActive) => {
+            "Disconnect this profile before changing it.".to_string()
+        }
+        LocalControlError::Admission(AdmissionError::ProfileBusy) => {
+            "Another action is still using this profile. Try again in a moment.".to_string()
+        }
+        LocalControlError::Admission(AdmissionError::ProfileNotFound) => {
+            "This profile no longer exists.".to_string()
+        }
+        LocalControlError::Admission(AdmissionError::ProfileAlreadyExists) => {
+            "A profile with this identity already exists.".to_string()
+        }
+        LocalControlError::Admission(AdmissionError::DeadlineExpired)
+        | LocalControlError::ChallengeExpired => "The action timed out. Try again.".to_string(),
+        LocalControlError::Stopped | LocalControlError::Admission(AdmissionError::Stopped) => {
+            "The VPN service stopped. Restart Vortix and try again.".to_string()
+        }
+        LocalControlError::Admission(AdmissionError::Persistence) => {
+            "Vortix could not save this change safely. No action was applied.".to_string()
+        }
+        LocalControlError::Profile { reason, .. } | LocalControlError::ProfileImport(reason) => {
+            reason.clone()
+        }
+        _ => "Vortix could not start this action. See Event Log for details.".to_string(),
+    }
 }
 
 pub(crate) struct PendingControlOperation {
     subject: PendingControlSubject,
     admitted_after_generation: u64,
+    recovery_retry: bool,
 }
+
+pub(crate) struct CatalogFeedback {
+    applied_count: usize,
+    first_applied_name: Option<String>,
+    failed_count: usize,
+    first_failure: Option<String>,
+    updated_at: std::time::Instant,
+}
+
+const CATALOG_FEEDBACK_QUIET_WINDOW: std::time::Duration = std::time::Duration::from_millis(300);
 
 fn control_command_subject(
     command: Option<&crate::vortix_core::control::UserCommand>,
@@ -95,6 +240,89 @@ fn egress_path_changed(
     current.primary != next.primary || active_egress_paths(current).ne(active_egress_paths(next))
 }
 
+fn late_route_conflict_for_operation(
+    snapshot: &crate::vortix_core::control::ControlSnapshot,
+    operation: &crate::vortix_core::control::OperationRecord,
+) -> Option<(ProfileId, Conflict)> {
+    use crate::vortix_core::control::{OperationIntent, RequestedTunnelState};
+
+    let tunnels = match &operation.intent {
+        OperationIntent::DesiredSubset { tunnels, .. }
+        | OperationIntent::UnexpectedRecovery { tunnels, .. } => tunnels,
+        OperationIntent::GenerationScoped | OperationIntent::ProfileMutation { .. } => {
+            return None;
+        }
+    };
+    tunnels
+        .iter()
+        .filter(|(_, requested)| **requested == RequestedTunnelState::Connected)
+        .find_map(|(profile_id, _)| {
+            snapshot
+                .pending_route_conflicts
+                .get(profile_id)
+                .cloned()
+                .map(|conflict| (profile_id.clone(), conflict))
+        })
+}
+
+fn terminal_control_notification(
+    subject: PendingControlSubject,
+    recovery_retry: bool,
+    status: crate::vortix_core::control::OperationStatus,
+    result: Option<crate::vortix_core::control::OperationResult>,
+    has_owned_retry: bool,
+    failure_detail: Option<&str>,
+) -> Option<(String, ToastType)> {
+    use crate::vortix_core::control::{OperationFailure, OperationResult, OperationStatus};
+
+    match (status, result) {
+        (
+            OperationStatus::Failed,
+            Some(OperationResult::Failed(OperationFailure::DnsPolicyFailed)),
+        ) => Some((
+            subject.dns_failure_message(failure_detail),
+            ToastType::Error,
+        )),
+        (
+            OperationStatus::Failed,
+            Some(OperationResult::Failed(OperationFailure::AuthenticationFailed)),
+        ) => Some((
+            subject.authentication_failure_message().to_string(),
+            ToastType::Error,
+        )),
+        (
+            OperationStatus::Failed,
+            Some(OperationResult::Failed(OperationFailure::InvalidProfile)),
+        ) => Some((
+            "This WireGuard profile has an invalid filename. Delete it, rename the original file to 1–15 characters (for example, wg07.conf), and import it again."
+                .to_string(),
+            ToastType::Error,
+        )),
+        (
+            OperationStatus::Failed,
+            Some(OperationResult::Failed(OperationFailure::HandshakeFailed)),
+        ) if has_owned_retry => Some((
+            "No WireGuard handshake was received. Vortix is retrying once; if the peer still does not respond, this profile will return to disconnected."
+                .to_string(),
+            ToastType::Warning,
+        )),
+        (OperationStatus::Failed, Some(OperationResult::Failed(failure))) => {
+            Some((subject.failure_message(failure), ToastType::Error))
+        }
+        (OperationStatus::Cancelled, _) => {
+            Some((format!("{} cancelled", subject.label()), ToastType::Info))
+        }
+        (OperationStatus::Expired, _) => {
+            Some((format!("{} timed out", subject.label()), ToastType::Error))
+        }
+        (OperationStatus::Succeeded, _) if recovery_retry => Some((
+            format!("{} succeeded after retry", subject.label()),
+            ToastType::Success,
+        )),
+        _ => None,
+    }
+}
+
 impl App {
     /// Attach the one Standard-mode control owner used for the entire TUI
     /// session and immediately render its current immutable publication.
@@ -117,7 +345,9 @@ impl App {
         control.progress()?;
         let snapshot = control.current_snapshot();
         self.control_session = Some(control);
+        self.control_starting = false;
         self.apply_control_snapshot(snapshot);
+        self.log("SUCCESS: VPN service ready. Press [x] for actions.");
         Ok(())
     }
 
@@ -186,9 +416,18 @@ impl App {
     ) -> Option<T> {
         match result {
             Ok(value) => Some(value),
+            Err(crate::cli::control::LocalControlError::Profile { profile, reason })
+                if reason.contains("WireGuard name must be") =>
+            {
+                self.log(&format!(
+                    "ERR: WireGuard profile '{profile}' was rejected: {reason}"
+                ));
+                self.show_toast(reason, ToastType::Error);
+                None
+            }
             Err(error) => {
                 self.log(&format!("ERR: Control command refused: {error}"));
-                self.show_toast(format!("Control command failed: {error}"), ToastType::Error);
+                self.show_toast(control_error_message(&error), ToastType::Error);
                 None
             }
         }
@@ -225,10 +464,7 @@ impl App {
                         .as_deref()
                         .map_or_else(|| "command".to_owned(), |name| format!("import '{name}'"));
                     self.log(&format!("ERR: Control {subject} refused: {error}"));
-                    self.show_toast(
-                        format!("Control {subject} failed: {error}"),
-                        ToastType::Error,
-                    );
+                    self.show_toast(control_error_message(&error), ToastType::Error);
                 }
                 crate::cli::control::TuiControlCompletion::ChallengeResponse {
                     challenge_id,
@@ -250,7 +486,8 @@ impl App {
                         "ERR: Challenge response {challenge_id:?} failed: {error}"
                     ));
                     self.show_toast(
-                        format!("Challenge response failed: {error}"),
+                        "Credentials could not be submitted. Your entries are still available; try again."
+                            .to_string(),
                         ToastType::Error,
                     );
                 }
@@ -261,10 +498,6 @@ impl App {
                     self.log(&format!(
                         "WARN: Challenge cancellation {challenge_id:?} failed: {error}"
                     ));
-                    self.show_toast(
-                        format!("Challenge cancellation failed: {error}"),
-                        ToastType::Error,
-                    );
                 }
             }
         }
@@ -331,30 +564,6 @@ impl App {
             .unwrap_or(KillSwitchState::Disabled);
         self.runtime.killswitch_state = kill_switch_state;
         self.registry.set_killswitch_state(kill_switch_state);
-
-        let has_connected_tunnel = snapshot.tunnels.values().any(|tunnel| {
-            matches!(
-                tunnel.state,
-                crate::vortix_core::engine::state::Connection::Connected { .. }
-            )
-        });
-        let dns_policy_verified = snapshot.observed.evidence.as_ref().is_some_and(|evidence| {
-            evidence.desired_generation == snapshot.desired.generation
-                && evidence.authority_epoch == snapshot.desired.authority_epoch
-                && evidence.policy_digest == snapshot.desired.policy_digest
-                && matches!(
-                    evidence.dns,
-                    crate::vortix_core::control::GateEvidence::Verified
-                )
-                && snapshot.effective.freshness.current
-        });
-        self.runtime.dns_protection = if !has_connected_tunnel {
-            crate::core::dns_protection::DnsProtectionStatus::NotActive
-        } else if dns_policy_verified {
-            crate::core::dns_protection::DnsProtectionStatus::Verified
-        } else {
-            crate::core::dns_protection::DnsProtectionStatus::Unverified
-        };
 
         let pending_challenge = snapshot.challenges.values().next().cloned();
         match pending_challenge {
@@ -466,6 +675,7 @@ impl App {
             PendingControlOperation {
                 subject,
                 admitted_after_generation: self.control_snapshot.generation,
+                recovery_retry: false,
             },
         );
         // The actor may reach terminal truth before the admission worker's
@@ -477,12 +687,40 @@ impl App {
         }
     }
 
+    fn present_late_route_conflict(
+        &mut self,
+        subject: PendingControlSubject,
+        status: crate::vortix_core::control::OperationStatus,
+        result: Option<crate::vortix_core::control::OperationResult>,
+        late_route_conflict: Option<(ProfileId, Conflict)>,
+    ) -> bool {
+        use crate::vortix_core::control::{OperationFailure, OperationResult, OperationStatus};
+
+        if !matches!(
+            (subject, status, result),
+            (
+                PendingControlSubject::Connection | PendingControlSubject::Reconnection,
+                OperationStatus::Failed,
+                Some(OperationResult::Failed(OperationFailure::Rejected))
+            )
+        ) {
+            return false;
+        }
+        let Some((profile_id, conflict)) = late_route_conflict else {
+            return false;
+        };
+        let Some(idx) = self.profile_index(&profile_id) else {
+            return false;
+        };
+        let target_name = self.runtime.profiles[idx].name.clone();
+        self.fire_conflict_overlay(conflict, idx, profile_id, target_name);
+        true
+    }
+
     fn report_terminal_control_operations(
         &mut self,
         snapshot: &crate::vortix_core::control::ControlSnapshot,
     ) {
-        use crate::vortix_core::control::{OperationFailure, OperationResult, OperationStatus};
-
         let completed = self
             .pending_control_operations
             .iter()
@@ -492,38 +730,70 @@ impl App {
                     .get(operation_id)
                     .filter(|operation| operation.status.is_terminal())
                     .map(|operation| {
+                        let owned_retry = snapshot
+                            .operations
+                            .values()
+                            .find(|candidate| {
+                                candidate.id != operation.id
+                                    && !candidate.status.is_terminal()
+                                    && candidate.desired_generation == operation.desired_generation
+                                    && candidate.client_id.sequence() == Some(0)
+                            })
+                            .map(|candidate| candidate.id.clone());
                         (
                             operation_id.clone(),
                             pending.subject,
+                            pending.recovery_retry,
                             operation.status,
                             operation.result,
+                            operation.failure_detail.clone(),
+                            owned_retry,
+                            late_route_conflict_for_operation(snapshot, operation),
                         )
                     })
             })
             .collect::<Vec<_>>();
 
-        for (operation_id, subject, status, result) in completed {
+        for (
+            operation_id,
+            subject,
+            recovery_retry,
+            status,
+            result,
+            failure_detail,
+            owned_retry,
+            late_route_conflict,
+        ) in completed
+        {
             self.pending_control_operations.remove(&operation_id);
-            let message = match (status, result) {
-                (
-                    OperationStatus::Failed,
-                    Some(OperationResult::Failed(OperationFailure::DnsPolicyFailed)),
-                ) => Some(subject.dns_failure_message().to_string()),
-                (
-                    OperationStatus::Failed,
-                    Some(OperationResult::Failed(OperationFailure::AuthenticationFailed)),
-                ) => Some(subject.authentication_failure_message().to_string()),
-                (OperationStatus::Failed, Some(OperationResult::Failed(failure))) => {
-                    Some(format!("{} failed: {failure:?}", subject.label()))
-                }
-                (OperationStatus::Cancelled, _) => {
-                    Some(format!("{} was cancelled", subject.label()))
-                }
-                (OperationStatus::Expired, _) => Some(format!("{} timed out", subject.label())),
-                _ => None,
-            };
-            if let Some(message) = message {
-                self.show_toast(message, ToastType::Error);
+            if self.present_late_route_conflict(subject, status, result, late_route_conflict) {
+                continue;
+            }
+            let notification = terminal_control_notification(
+                subject,
+                recovery_retry,
+                status,
+                result,
+                owned_retry.is_some(),
+                failure_detail.as_deref(),
+            );
+            if let Some((message, toast_type)) = notification {
+                self.show_toast(message, toast_type);
+            }
+            if let Some(detail) = failure_detail {
+                self.log(&format!(
+                    "ERR: Control operation {operation_id} failed: {detail}"
+                ));
+            }
+            if let Some(retry_id) = owned_retry {
+                self.pending_control_operations.insert(
+                    retry_id,
+                    PendingControlOperation {
+                        subject,
+                        admitted_after_generation: snapshot.generation,
+                        recovery_retry: true,
+                    },
+                );
             }
         }
 
@@ -538,6 +808,7 @@ impl App {
         &mut self,
         update: crate::cli::control::LocalCatalogUpdate,
     ) {
+        let revision = update.revision;
         let selected_id = self.selected_profile_id();
         if let Some(profiles) = update.profiles {
             self.runtime.profiles = profiles;
@@ -547,36 +818,117 @@ impl App {
                     .and_then(|profile_id| self.profile_index(&profile_id))
                     .or_else(|| (!self.runtime.profiles.is_empty()).then_some(0)),
             );
+            if self.presented_catalog_revision != Some(revision) {
+                self.log(&format!(
+                    "APP: Profile catalog updated (revision {revision})"
+                ));
+                self.presented_catalog_revision = Some(revision);
+            }
         }
+        let mut applied_names = Vec::new();
+        let mut applied_count = 0usize;
+        let mut failures = Vec::new();
         for outcome in update.outcomes {
             match outcome {
-                crate::cli::control::LocalCatalogOutcome::Applied(
-                    crate::cli::control::LocalProfileMutationReceipt::RemoteApplied {
-                        display_name: Some(display_name),
-                    },
-                ) => self.show_toast(
-                    format!(
-                        "Profile '{display_name}' updated (revision {})",
-                        update.revision
-                    ),
-                    ToastType::Success,
-                ),
-                crate::cli::control::LocalCatalogOutcome::Applied(_) => self.show_toast(
-                    format!("Profile catalog updated (revision {})", update.revision),
-                    ToastType::Success,
-                ),
-                crate::cli::control::LocalCatalogOutcome::Failed(failure) => self.show_toast(
-                    format!("Profile update failed: {failure:?}"),
-                    ToastType::Error,
-                ),
+                crate::cli::control::LocalCatalogOutcome::Applied(receipt) => {
+                    applied_count += 1;
+                    let display_name = match receipt {
+                        crate::cli::control::LocalProfileMutationReceipt::Imported(profile)
+                        | crate::cli::control::LocalProfileMutationReceipt::Renamed(profile) => {
+                            Some(profile.name)
+                        }
+                        crate::cli::control::LocalProfileMutationReceipt::Deleted {
+                            display_name,
+                            ..
+                        } => Some(display_name),
+                        crate::cli::control::LocalProfileMutationReceipt::RemoteApplied {
+                            display_name,
+                        } => display_name,
+                    };
+                    if let Some(display_name) = display_name {
+                        applied_names.push(display_name);
+                    }
+                }
+                crate::cli::control::LocalCatalogOutcome::Failed(failure) => {
+                    failures.push(profile_mutation_failure_message(failure).to_string());
+                }
                 crate::cli::control::LocalCatalogOutcome::RemoteTerminal { status, result } => {
-                    self.show_toast(
-                        format!("Profile update {status:?}: {result:?}"),
-                        ToastType::Error,
-                    );
+                    let message = match result {
+                        Some(crate::vortix_core::control::OperationResult::Failed(failure)) => {
+                            remote_profile_failure_message(failure).to_string()
+                        }
+                        _ if status == crate::vortix_core::control::OperationStatus::Expired => {
+                            "The profile update timed out".to_string()
+                        }
+                        _ => "The profile update could not be completed".to_string(),
+                    };
+                    failures.push(message);
                 }
             }
         }
+        for failure in &failures {
+            self.log(&format!("ERR: Profile update failed: {failure}"));
+        }
+        if applied_count > 0 || !failures.is_empty() {
+            let feedback = self
+                .catalog_feedback
+                .get_or_insert_with(|| CatalogFeedback {
+                    applied_count: 0,
+                    first_applied_name: None,
+                    failed_count: 0,
+                    first_failure: None,
+                    updated_at: std::time::Instant::now(),
+                });
+            feedback.applied_count = feedback.applied_count.saturating_add(applied_count);
+            feedback.first_applied_name = feedback
+                .first_applied_name
+                .take()
+                .or_else(|| applied_names.into_iter().next());
+            feedback.failed_count = feedback.failed_count.saturating_add(failures.len());
+            feedback.first_failure = feedback
+                .first_failure
+                .take()
+                .or_else(|| failures.into_iter().next());
+            feedback.updated_at = std::time::Instant::now();
+        }
+    }
+
+    pub(crate) fn flush_catalog_feedback(&mut self, force: bool) {
+        let ready = self.catalog_feedback.as_ref().is_some_and(|feedback| {
+            force || feedback.updated_at.elapsed() >= CATALOG_FEEDBACK_QUIET_WINDOW
+        });
+        if !ready {
+            return;
+        }
+        let feedback = self
+            .catalog_feedback
+            .take()
+            .expect("ready catalog feedback must exist");
+        let (message, toast_type) = match (feedback.applied_count, feedback.failed_count) {
+            (1, 0) => (
+                feedback.first_applied_name.map_or_else(
+                    || "Profile updated".to_string(),
+                    |name| format!("Profile '{name}' updated"),
+                ),
+                ToastType::Success,
+            ),
+            (applied, 0) => (format!("{applied} profiles updated"), ToastType::Success),
+            (0, 1) => (
+                feedback
+                    .first_failure
+                    .unwrap_or_else(|| "The profile update failed".to_string()),
+                ToastType::Error,
+            ),
+            (0, failed) => (
+                format!("{failed} profile updates failed. See Event Log."),
+                ToastType::Error,
+            ),
+            (applied, failed) => (
+                format!("{applied} profile updates completed; {failed} failed. See Event Log."),
+                ToastType::Error,
+            ),
+        };
+        self.show_toast(message, toast_type);
     }
 
     fn selected_profile_id(&self) -> Option<ProfileId> {
@@ -586,7 +938,7 @@ impl App {
             .map(|profile| profile.id.clone())
     }
 
-    fn profile_index(&self, profile_id: &ProfileId) -> Option<usize> {
+    pub(crate) fn profile_index(&self, profile_id: &ProfileId) -> Option<usize> {
         self.runtime
             .profiles
             .iter()
@@ -623,10 +975,7 @@ impl App {
         };
         let profile_id = profile.id.clone();
         if self.control_session.is_none() {
-            self.show_toast(
-                "Control service is not attached".to_string(),
-                ToastType::Error,
-            );
+            self.show_toast(CONTROL_STARTING_MESSAGE.to_string(), ToastType::Info);
             return;
         }
         let active = self.registry.snapshot(&profile_id).is_some_and(|snapshot| {
@@ -683,19 +1032,13 @@ impl App {
         if self.control_session.is_some() {
             self.control_connect_profile(idx, true);
         } else {
-            self.show_toast(
-                "Control service is not attached".to_string(),
-                ToastType::Error,
-            );
+            self.show_toast(CONTROL_STARTING_MESSAGE.to_string(), ToastType::Info);
         }
     }
     /// Disconnect the primary canonical tunnel, or the first active tunnel.
     pub(crate) fn disconnect(&mut self) {
         if self.control_session.is_none() {
-            self.show_toast(
-                "Control service is not attached".to_string(),
-                ToastType::Error,
-            );
+            self.show_toast(CONTROL_STARTING_MESSAGE.to_string(), ToastType::Info);
             return;
         }
         let profile_id = self.registry.primary().cloned().or_else(|| {
@@ -713,10 +1056,7 @@ impl App {
     /// Force-disconnect the exact primary canonical tunnel.
     pub(crate) fn force_disconnect(&mut self) {
         if self.control_session.is_none() {
-            self.show_toast(
-                "Control service is not attached".to_string(),
-                ToastType::Error,
-            );
+            self.show_toast(CONTROL_STARTING_MESSAGE.to_string(), ToastType::Info);
             return;
         }
         let profile_id = self.registry.primary().cloned().or_else(|| {
@@ -789,10 +1129,7 @@ impl App {
     /// Disconnect the selected profile through the canonical owner.
     pub(crate) fn disconnect_profile_by_idx(&mut self, idx: usize) {
         if self.control_session.is_none() {
-            self.show_toast(
-                "Control service is not attached".to_string(),
-                ToastType::Error,
-            );
+            self.show_toast(CONTROL_STARTING_MESSAGE.to_string(), ToastType::Info);
             return;
         }
         let Some(profile_id) = self
@@ -816,10 +1153,7 @@ impl App {
                 profile_id: None,
             });
         } else {
-            self.show_toast(
-                "Control service is not attached".to_string(),
-                ToastType::Error,
-            );
+            self.show_toast(CONTROL_STARTING_MESSAGE.to_string(), ToastType::Info);
         }
     }
     /// Cancel the selected in-flight connect through the canonical owner.
@@ -837,19 +1171,13 @@ impl App {
                 profile_id: Some(profile_id),
             });
         } else {
-            self.show_toast(
-                "Control service is not attached".to_string(),
-                ToastType::Error,
-            );
+            self.show_toast(CONTROL_STARTING_MESSAGE.to_string(), ToastType::Info);
         }
     }
     /// Reconnect the primary or most recently connected canonical tunnel.
     pub(crate) fn reconnect(&mut self) {
         if self.control_session.is_none() {
-            self.show_toast(
-                "Control service is not attached".to_string(),
-                ToastType::Error,
-            );
+            self.show_toast(CONTROL_STARTING_MESSAGE.to_string(), ToastType::Info);
             return;
         }
         let profile_id = self

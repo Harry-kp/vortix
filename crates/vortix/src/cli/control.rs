@@ -42,6 +42,10 @@ const SCANNER_REFRESH_CEILING: Duration = Duration::from_millis(250);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 const SUPERVISED_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const HOOK_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
+/// A recovered operation has a 30-second service-owned deadline. One-shot
+/// commands wait for that prior authority work to settle before starting the
+/// caller's own deadline, with a small publication margin.
+const CLI_STARTUP_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(32);
 const TUI_ADMISSION_CAPACITY: usize = 8;
 
 #[derive(Debug, Error)]
@@ -539,6 +543,14 @@ impl ProfileMutationExecutor for StandardProfileMutationExecutor {
                     .get(&profile_id)
                     .cloned()
                     .ok_or(ProfileMutationFailure::NotFound)?;
+                if profile.protocol == crate::state::Protocol::WireGuard
+                    && crate::vortix_core::profile::validate_wireguard_interface_name(
+                        &new_display_name,
+                    )
+                    .is_err()
+                {
+                    return Err(ProfileMutationFailure::InvalidName);
+                }
                 let mut topology = self
                     .topologies
                     .lock()
@@ -1595,6 +1607,7 @@ pub struct LocalControlSession {
     pending_scan: RefCell<
         Option<(
             u64,
+            u64,
             tokio::task::JoinHandle<crate::core::scanner::ScannerResult>,
         )>,
     >,
@@ -2021,11 +2034,13 @@ impl LocalControlSession {
         let external_catalog = Arc::clone(&profile_mutations);
         let external_ownership = Arc::clone(&ownership);
         let external_sessions = Arc::clone(&sessions);
+        let external_executor = Arc::clone(&executor);
         let external_active_profiles = external_session_profiles(
             &initial_sessions,
             &policy_profiles,
             &core_profiles,
             &external_ownership,
+            None,
         );
         let policy = Arc::new(CanonicalPolicyExecutor::new(
             config_dir.to_path_buf(),
@@ -2038,8 +2053,14 @@ impl LocalControlSession {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let (profiles, core_profiles) = external_catalog.profiles_and_core_snapshot();
-                external_session_profiles(&sessions, &profiles, &core_profiles, &external_ownership)
-                    .len()
+                external_session_profiles(
+                    &sessions,
+                    &profiles,
+                    &core_profiles,
+                    &external_ownership,
+                    Some(&external_executor),
+                )
+                .len()
             },
         ));
         let supervisor = Arc::new(crate::vortix_core::control::supervisor::Supervisor::new(
@@ -2124,8 +2145,12 @@ impl LocalControlSession {
             pending_scan: RefCell::new(None),
             last_scan_started: Cell::new(Instant::now()),
         };
+        let startup_generation = session.current_snapshot().generation;
+        let initial_observed_at_millis = session.service().observer().now_millis();
         session.runtime().block_on(async {
-            session.publish_observations_from(initial_scan).await?;
+            session
+                .publish_observations_from(initial_scan, initial_observed_at_millis)
+                .await?;
             session
                 .service()
                 .completer()
@@ -2133,6 +2158,7 @@ impl LocalControlSession {
                 .await
                 .map_err(|error| LocalControlError::Persistence(error.to_string()))
         })?;
+        session.wait_for_startup_settlement(startup_generation, CLI_STARTUP_SETTLEMENT_TIMEOUT)?;
         Ok(session)
     }
 
@@ -2275,17 +2301,19 @@ impl LocalControlSession {
     pub fn progress(&self) -> Result<(), LocalControlError> {
         let completed = {
             let pending = self.pending_scan.borrow();
-            pending.as_ref().is_some_and(|(_, scan)| scan.is_finished())
+            pending
+                .as_ref()
+                .is_some_and(|(_, _, scan)| scan.is_finished())
         }
         .then(|| self.pending_scan.borrow_mut().take())
         .flatten();
-        if let Some((catalog_revision, completed)) = completed {
+        if let Some((catalog_revision, observed_at_millis, completed)) = completed {
             let scan = self.runtime().block_on(completed).map_err(|error| {
                 LocalControlError::Observation(format!("scanner worker did not complete: {error}"))
             })?;
             if catalog_revision == self.profile_mutations.catalog_revision() {
                 self.runtime()
-                    .block_on(self.publish_observations_from(scan))?;
+                    .block_on(self.publish_observations_from(scan, observed_at_millis))?;
             }
         }
 
@@ -2294,16 +2322,52 @@ impl LocalControlSession {
             && scanner_refresh_due(self.last_scan_started.get(), now)
         {
             let profiles = self.profile_mutations.profiles_snapshot();
+            let observed_at_millis = self.service().observer().now_millis();
             let scan = self
                 .runtime()
                 .handle()
                 .spawn_blocking(move || crate::core::scanner::gather_system_state(&profiles));
-            self.pending_scan
-                .replace(Some((self.profile_mutations.catalog_revision(), scan)));
+            self.pending_scan.replace(Some((
+                self.profile_mutations.catalog_revision(),
+                observed_at_millis,
+                scan,
+            )));
             self.last_scan_started.set(now);
         }
         self.runtime().block_on(tokio::task::yield_now());
         Ok(())
+    }
+
+    /// Let durable work recovered by this short-lived authority settle before
+    /// a one-shot CLI command starts its own deadline. TUI startup invokes
+    /// this on its background control thread, so terminal rendering and input
+    /// remain responsive while recovery settles.
+    fn wait_for_startup_settlement(
+        &self,
+        previous_generation: u64,
+        limit: Duration,
+    ) -> Result<(), LocalControlError> {
+        let deadline = Instant::now()
+            .checked_add(limit)
+            .ok_or_else(|| LocalControlError::Observation("startup deadline overflowed".into()))?;
+        loop {
+            let snapshot = self.current_snapshot();
+            if snapshot.generation > previous_generation
+                && snapshot
+                    .operations
+                    .values()
+                    .all(|operation| operation.status.is_terminal())
+            {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(LocalControlError::Observation(
+                    "recovered VPN work did not settle before a new command could start".into(),
+                ));
+            }
+            self.progress()?;
+            std::thread::sleep(CONTROL_PROGRESS_INTERVAL);
+        }
     }
 
     /// Return a changed immutable publication without cloning on idle turns.
@@ -2444,10 +2508,6 @@ impl LocalControlSession {
             .map_err(map_challenge_response_error)
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "one bounded admission/challenge/observation wait loop"
-    )]
     pub(crate) fn run_with_challenges<F>(
         mut self,
         command: UserCommand,
@@ -2463,108 +2523,82 @@ impl LocalControlSession {
             + 'static,
     {
         self.validate(&command)?;
+        let client = self.service().client();
+        let admitted = self
+            .runtime()
+            .block_on(client.submit(CommandRequest {
+                command,
+                idempotency_key: IdempotencyKey::new(idempotency_key),
+                deadline: client.deadline_after(wait),
+            }))
+            .map_err(LocalControlError::Admission)?;
         let challenge_responder = Arc::new(Mutex::new(answer_challenge));
-        let result = self.runtime().block_on(async {
-            let client = self.service().client();
-            let admitted = client
-                .submit(CommandRequest {
-                    command,
-                    idempotency_key: IdempotencyKey::new(idempotency_key),
-                    deadline: client.deadline_after(wait),
-                })
-                .await
-                .map_err(LocalControlError::Admission)?;
-            let wall_deadline = Instant::now() + wait + SHUTDOWN_GRACE;
-            // Startup already performed and published one immediate scan.
-            // Start the first post-admission refresh immediately so a fast
-            // tunnel effect is observed without waiting for a cadence tick.
-            let mut last_scan_started = Instant::now()
+        let wall_deadline = Instant::now()
+            .checked_add(wait + SHUTDOWN_GRACE)
+            .ok_or_else(|| LocalControlError::Observation("command deadline overflowed".into()))?;
+        // Drive one-shot commands through the same scanner, observation cache,
+        // and subscription path used by the TUI. Presentation and blocking
+        // policy differ between clients; canonical progress must not.
+        self.last_scan_started.set(
+            Instant::now()
                 .checked_sub(SCANNER_REFRESH_CEILING)
-                .unwrap_or_else(Instant::now);
-            let mut pending_scan = None;
-            let mut handled_challenges = std::collections::BTreeSet::new();
-            let mut challenge_input_error = None;
-            loop {
-                if pending_scan
-                    .as_ref()
-                    .is_some_and(tokio::task::JoinHandle::is_finished)
-                {
-                    let completed = pending_scan.take().expect("finished scan checked");
-                    let scan = completed.await.map_err(|error| {
-                        LocalControlError::Observation(format!(
-                            "scanner worker did not complete: {error}"
-                        ))
-                    })?;
-                    self.publish_observations_from(scan).await?;
-                }
-                let snapshot = client.snapshot();
-                let pending_challenges = snapshot
-                    .challenges
-                    .values()
-                    .filter(|challenge| {
-                        challenge.operation_id == admitted.operation_id
-                            && &challenge.authorized_client == client.client_id()
-                            && !handled_challenges.contains(&challenge.id)
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>();
-                let mut handled_challenge_this_tick = false;
-                for challenge in &pending_challenges {
-                    handled_challenges.insert(challenge.id);
-                    handled_challenge_this_tick = true;
-                    let answer = invoke_challenge_responder(
-                        Arc::clone(&challenge_responder),
-                        challenge.clone(),
-                    )
-                    .await;
-                    match answer {
-                        Ok(answer) => client
-                            .respond_challenge(challenge.id, answer)
-                            .await
-                            .map_err(map_challenge_response_error)?,
-                        Err(error) => {
-                            let _ = client.cancel_challenge(challenge.id).await;
-                            if challenge_input_error.is_none() {
-                                challenge_input_error = Some(error);
-                            }
+                .unwrap_or_else(Instant::now),
+        );
+        let mut handled_challenges = std::collections::BTreeSet::new();
+        let mut challenge_input_error = None;
+        let result = loop {
+            self.progress()?;
+            let snapshot = self.current_snapshot();
+            let pending_challenges = snapshot
+                .challenges
+                .values()
+                .filter(|challenge| {
+                    challenge.operation_id == admitted.operation_id
+                        && challenge.authorized_client == *client.client_id()
+                        && !handled_challenges.contains(&challenge.id)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut handled_challenge_this_tick = false;
+            for challenge in &pending_challenges {
+                handled_challenges.insert(challenge.id);
+                handled_challenge_this_tick = true;
+                let answer = self.runtime().block_on(invoke_challenge_responder(
+                    Arc::clone(&challenge_responder),
+                    challenge.clone(),
+                ));
+                match answer {
+                    Ok(answer) => self.respond_challenge(challenge.id, answer.into_vec())?,
+                    Err(error) => {
+                        let _ = self.cancel_challenge(challenge.id);
+                        if challenge_input_error.is_none() {
+                            challenge_input_error = Some(error);
                         }
                     }
                 }
-                if handled_challenge_this_tick {
-                    // `respond_challenge` acknowledges inside the actor before
-                    // the resulting snapshot publication. Never decide from
-                    // the older snapshot captured above.
-                    tokio::task::yield_now().await;
-                    continue;
-                }
-                if let Some(operation) = snapshot.operations.get(&admitted.operation_id) {
-                    if operation.status.is_terminal() {
-                        if let Some(error) = challenge_input_error {
-                            return Err(error);
-                        }
-                        return Ok(ClientOperationOutcome {
-                            profile_mutation: None,
-                            operation_id: admitted.operation_id,
-                            status: operation.status,
-                            result: operation.result,
-                            snapshot,
-                        });
-                    }
-                }
-                if Instant::now() >= wall_deadline {
-                    return Err(LocalControlError::Stopped);
-                }
-                let now = Instant::now();
-                if pending_scan.is_none() && scanner_refresh_due(last_scan_started, now) {
-                    let profiles = self.profile_mutations.profiles_snapshot();
-                    pending_scan = Some(tokio::task::spawn_blocking(move || {
-                        crate::core::scanner::gather_system_state(&profiles)
-                    }));
-                    last_scan_started = now;
-                }
-                tokio::time::sleep(CONTROL_PROGRESS_INTERVAL).await;
             }
-        });
+            if handled_challenge_this_tick {
+                continue;
+            }
+            if let Some(operation) = snapshot.operations.get(&admitted.operation_id) {
+                if operation.status.is_terminal() {
+                    if let Some(error) = challenge_input_error {
+                        break Err(error);
+                    }
+                    break Ok(ClientOperationOutcome {
+                        profile_mutation: None,
+                        operation_id: admitted.operation_id,
+                        status: operation.status,
+                        result: operation.result,
+                        snapshot,
+                    });
+                }
+            }
+            if Instant::now() >= wall_deadline {
+                break Err(LocalControlError::Stopped);
+            }
+            std::thread::sleep(CONTROL_PROGRESS_INTERVAL);
+        };
         if let Some(hooks) = self.hooks.take() {
             self.runtime()
                 .block_on(hooks.shutdown_bounded(HOOK_SHUTDOWN_GRACE));
@@ -2642,6 +2676,7 @@ impl LocalControlSession {
     async fn publish_observations_from(
         &self,
         scan: crate::core::scanner::ScannerResult,
+        observed_at_millis: u64,
     ) -> Result<(), LocalControlError> {
         if !scan.tunnel_observation_complete {
             return Err(LocalControlError::Observation(
@@ -2655,7 +2690,6 @@ impl LocalControlSession {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone_from(&sessions);
         let observer = self.service().observer();
-        let observed_at_millis = observer.now_millis();
         let default_route = scan.default_route;
         let default_route_changed = !matches!(
             default_route,
@@ -2835,6 +2869,35 @@ fn validate_command_target(
     let Some(profile_id) = target else {
         return Ok(());
     };
+    let starts_wireguard = matches!(
+        command,
+        UserCommand::Connect { .. }
+            | UserCommand::ConnectExclusive { .. }
+            | UserCommand::Reconnect {
+                profile_id: Some(_)
+            }
+    );
+    if starts_wireguard {
+        if let Some(profile) = profiles.iter().find(|profile| &profile.id == profile_id) {
+            if profile.protocol == crate::state::Protocol::WireGuard {
+                let interface_name = profile
+                    .config_path
+                    .file_stem()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .unwrap_or_default();
+                if let Err(reason) =
+                    crate::vortix_core::profile::validate_wireguard_interface_name(interface_name)
+                {
+                    return Err(LocalControlError::Profile {
+                        profile: profile.name.clone(),
+                        reason: format!(
+                            "{reason}. Delete this profile, rename the original file (for example, to wg07.conf), and import it again"
+                        ),
+                    });
+                }
+            }
+        }
+    }
     if let Some(reason) = topology_errors.get(profile_id) {
         let profile = profiles
             .iter()
@@ -2894,6 +2957,7 @@ fn external_session_profiles(
     profiles: &[VpnProfile],
     canonical: &BTreeMap<ProfileId, Profile>,
     ownership: &StandardTunnelOwnershipStore,
+    live_executor: Option<&CanonicalTunnelExecutor>,
 ) -> Vec<String> {
     sessions
         .iter()
@@ -2904,6 +2968,13 @@ fn external_session_profiles(
             let Some(canonical) = canonical.get(&profile.id) else {
                 return true;
             };
+            if live_executor.is_some_and(|executor| {
+                executor
+                    .owns_live_session(&profile.id, session)
+                    .unwrap_or(false)
+            }) {
+                return false;
+            }
             match profile.protocol {
                 Protocol::WireGuard => ownership.validate_wireguard(canonical, session).is_err(),
                 Protocol::OpenVPN => crate::tunnel::standard_openvpn_owner(&profile.id, session)
@@ -3352,6 +3423,7 @@ mod tests {
             intent: OperationIntent::ProfileMutation { profile_id },
             status,
             result,
+            failure_detail: None,
         }
     }
 
@@ -3907,6 +3979,46 @@ mod tests {
     }
 
     #[test]
+    fn cli_startup_settlement_waits_for_recovered_work_before_new_deadline() {
+        let temp = tempfile::tempdir().unwrap();
+        let profiles_dir = temp.path().join(crate::constants::PROFILES_DIR_NAME);
+        std::fs::create_dir(&profiles_dir).unwrap();
+        let config_path = profiles_dir.join("corp.conf");
+        write_test_wireguard_config(&config_path);
+        let profile = VpnProfile {
+            id: profile_id('b'),
+            name: "corp".into(),
+            protocol: Protocol::WireGuard,
+            location: String::new(),
+            config_path,
+            last_used: None,
+        };
+        let session =
+            LocalControlSession::start_profile_test(temp.path(), vec![profile.clone()]).unwrap();
+        let before_generation = session.current_snapshot().generation;
+        let recovered_operation = session
+            .submit(
+                UserCommand::Connect {
+                    profile_id: profile.id,
+                    conflict_acknowledgement: None,
+                },
+                Duration::from_millis(20),
+                "recovered-before-cli",
+            )
+            .unwrap();
+
+        session
+            .wait_for_startup_settlement(before_generation, Duration::from_secs(1))
+            .unwrap();
+
+        let snapshot = session.current_snapshot();
+        assert!(snapshot
+            .operations
+            .get(&recovered_operation)
+            .is_some_and(|operation| operation.status.is_terminal()));
+    }
+
+    #[test]
     fn unchanged_scanner_payload_does_not_publish_again() {
         let temp = tempfile::tempdir().unwrap();
         let profiles_dir = temp.path().join(crate::constants::PROFILES_DIR_NAME);
@@ -3953,7 +4065,7 @@ mod tests {
         let baseline_generation = session.current_snapshot().generation;
         session
             .runtime()
-            .block_on(session.publish_observations_from(scan()))
+            .block_on(session.publish_observations_from(scan(), 1))
             .unwrap();
         // `observe` acknowledges actor receipt before the final publication,
         // so consume snapshots until all three semantic facts from the first
@@ -3996,7 +4108,7 @@ mod tests {
 
         session
             .runtime()
-            .block_on(session.publish_observations_from(scan()))
+            .block_on(session.publish_observations_from(scan(), 1))
             .unwrap();
         assert_eq!(
             *session.published_default_route.borrow(),
@@ -4010,6 +4122,62 @@ mod tests {
             *session.published_observations.borrow(),
             published_observations
         );
+    }
+
+    #[test]
+    fn scan_captured_before_owned_absence_cannot_restore_stale_presence() {
+        let temp = tempfile::tempdir().unwrap();
+        let profiles_dir = temp.path().join(crate::constants::PROFILES_DIR_NAME);
+        std::fs::create_dir(&profiles_dir).unwrap();
+        let config_path = profiles_dir.join("corp.conf");
+        write_test_wireguard_config(&config_path);
+        let profile = VpnProfile {
+            id: profile_id('d'),
+            name: "corp".into(),
+            protocol: Protocol::WireGuard,
+            location: String::new(),
+            config_path,
+            last_used: None,
+        };
+        let session =
+            LocalControlSession::start_profile_test(temp.path(), vec![profile.clone()]).unwrap();
+        let observer = session.service().observer();
+        let absence_at = observer.now_millis();
+        session
+            .runtime()
+            .block_on(observer.observe(Observation::Tunnel {
+                profile_id: profile.id.clone(),
+                active: false,
+                interface_name: None,
+                observed_at_millis: absence_at,
+                protection: None,
+            }))
+            .unwrap();
+
+        let error = session
+            .runtime()
+            .block_on(session.publish_observations_from(
+                crate::core::scanner::ScannerResult {
+                    sessions: vec![ActiveSession {
+                        name: profile.name,
+                        interface: "wg0".into(),
+                        ..ActiveSession::default()
+                    }],
+                    default_route:
+                        crate::vortix_core::ports::route_table::DefaultRouteObservation::ProbeFailed,
+                    tunnel_observation_complete: true,
+                },
+                absence_at.saturating_sub(1),
+            ))
+            .unwrap_err();
+
+        assert!(matches!(error, LocalControlError::Observation(_)));
+        assert!(session
+            .current_snapshot()
+            .observed
+            .tunnels
+            .get(&profile.id)
+            .is_some_and(|tunnel| !tunnel.active));
     }
 
     #[test]
@@ -4038,6 +4206,7 @@ mod tests {
                         crate::vortix_core::ports::route_table::DefaultRouteObservation::ProbeFailed,
                     tunnel_observation_complete: true,
                 },
+                0,
             ))
             .unwrap();
 
@@ -4064,6 +4233,7 @@ mod tests {
                         crate::vortix_core::ports::route_table::DefaultRouteObservation::ProbeFailed,
                     tunnel_observation_complete: false,
                 },
+                0,
             ))
             .unwrap_err();
 
@@ -4199,6 +4369,7 @@ mod tests {
             },
             status: OperationStatus::Succeeded,
             result: Some(OperationResult::ObservedConvergence),
+            failure_detail: None,
         };
         let operations = BTreeMap::from([(operation_id.clone(), operation)]);
         assert_eq!(
@@ -4248,6 +4419,41 @@ mod tests {
             &[],
             &UserCommand::SetKillSwitch {
                 mode: crate::state::KillSwitchMode::Off,
+            },
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn invalid_wireguard_filename_is_rejected_before_control_admission() {
+        let profile = VpnProfile {
+            id: profile_id('a'),
+            name: "07-wireguard-split-ip".into(),
+            protocol: Protocol::WireGuard,
+            location: String::new(),
+            config_path: "/profiles/07-wireguard-split-ip.conf".into(),
+            last_used: None,
+        };
+
+        let error = validate_command_target(
+            std::slice::from_ref(&profile),
+            &BTreeMap::new(),
+            &[],
+            &UserCommand::Connect {
+                profile_id: profile.id.clone(),
+                conflict_acknowledgement: None,
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("1–15 characters"));
+        assert!(error.to_string().contains("import it again"));
+        assert!(validate_command_target(
+            &[profile],
+            &BTreeMap::new(),
+            &[],
+            &UserCommand::Disconnect {
+                profile_id: Some(profile_id('a')),
             },
         )
         .is_ok());

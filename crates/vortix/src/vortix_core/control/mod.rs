@@ -45,4 +45,4 @@ pub use service::{
     ProfileMutation, ProfileMutationApplied, ProfileMutationExecutor, ProfileMutationFailure,
     ProfileMutationWork, ProfileTopology, ReadinessError, RealClock,
 };
-pub use snapshot::{ControlSnapshot, ServiceReadiness};
+pub use snapshot::{ControlSnapshot, DnsSecurityProjection, DnsSecurityStatus, ServiceReadiness};

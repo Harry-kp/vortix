@@ -56,6 +56,8 @@ struct WireGuardOwnershipRecord {
     operation_id: OperationId,
     profile_id: String,
     interface_name: String,
+    #[serde(default)]
+    wg_quick_interface: Option<String>,
     teardown_config_identity: String,
     handshake: HandshakeEvidence,
     probe_receipts: Vec<ProbeReceipt>,
@@ -137,6 +139,16 @@ impl StandardTunnelOwnershipStore {
         {
             return Err(StandardOwnershipError::Stale);
         }
+        let wg_quick_interface = profile_wg_quick_interface(profile)?;
+        if teardown_config.wg_quick_interface.as_deref() != Some(&wg_quick_interface)
+            || teardown_config
+                .path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                != Some(&wg_quick_interface)
+        {
+            return Err(StandardOwnershipError::Stale);
+        }
         let teardown_bytes = read_managed_config(&teardown_config.path, self.expected_runtime_uid)?;
         let teardown_config_identity = content_identity(&teardown_bytes);
         let profile_id = profile.id.as_str().to_owned();
@@ -150,6 +162,7 @@ impl StandardTunnelOwnershipStore {
             operation_id,
             profile_id,
             interface_name: interface_name.to_owned(),
+            wg_quick_interface: Some(wg_quick_interface.clone()),
             teardown_config_identity,
             handshake,
             probe_receipts,
@@ -162,7 +175,11 @@ impl StandardTunnelOwnershipStore {
             let _ = std::fs::remove_file(self.teardown_path(&profile.id));
             return Err(error);
         }
-        Ok(validated(record, self.teardown_path(&profile.id)))
+        Ok(validated(
+            record,
+            self.teardown_path(&profile.id),
+            wg_quick_interface,
+        ))
     }
 
     /// Load only when disk identity and fresh typed protocol evidence agree.
@@ -172,6 +189,7 @@ impl StandardTunnelOwnershipStore {
         session: &ActiveSession,
     ) -> Result<ValidatedWireGuardOwnership, StandardOwnershipError> {
         let record = self.load(&profile.id)?;
+        let wg_quick_interface = profile_wg_quick_interface(profile)?;
         let teardown_path = self.teardown_path(&profile.id);
         let teardown_bytes = read_managed_config(&teardown_path, self.expected_runtime_uid)?;
         let peer_matches = session.wireguard_peers.iter().any(|peer| {
@@ -190,6 +208,10 @@ impl StandardTunnelOwnershipStore {
             || record.tunnel_generation == 0
             || record.handshake.generation != record.tunnel_generation
             || record.profile_id != profile.id.as_str()
+            || record
+                .wg_quick_interface
+                .as_deref()
+                .is_some_and(|recorded| recorded != wg_quick_interface)
             || record.interface_name != session.interface
             || !session.interface_authoritative
             || !peer_matches
@@ -197,7 +219,7 @@ impl StandardTunnelOwnershipStore {
         {
             return Err(StandardOwnershipError::Stale);
         }
-        Ok(validated(record, teardown_path))
+        Ok(validated(record, teardown_path, wg_quick_interface))
     }
 
     /// Remove only after a fresh scan proves the exact owned interface absent.
@@ -358,6 +380,7 @@ impl StandardTunnelOwnershipStore {
 fn validated(
     record: WireGuardOwnershipRecord,
     teardown_path: PathBuf,
+    wg_quick_interface: String,
 ) -> ValidatedWireGuardOwnership {
     ValidatedWireGuardOwnership {
         authority_epoch: AuthorityEpoch(record.authority_epoch),
@@ -369,8 +392,20 @@ fn validated(
         teardown_config: TunnelTeardownConfig {
             path: teardown_path,
             managed: true,
+            wg_quick_interface: Some(wg_quick_interface),
         },
     }
+}
+
+fn profile_wg_quick_interface(profile: &Profile) -> Result<String, StandardOwnershipError> {
+    let interface = profile
+        .config_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or(StandardOwnershipError::Stale)?;
+    crate::vortix_core::profile::validate_wireguard_interface_name(interface)
+        .map_err(|_| StandardOwnershipError::Stale)?;
+    Ok(interface.to_owned())
 }
 
 fn record_key(profile_id: &ProfileId) -> String {
@@ -477,7 +512,9 @@ mod tests {
     }
 
     fn teardown_config(root: &Path, byte: char) -> TunnelTeardownConfig {
-        let path = root.join(format!("managed-{byte}.conf"));
+        // Production lifecycle copies preserve the reviewed profile basename
+        // because that basename is `wg-quick`'s stable interface identity.
+        let path = root.join(format!("{byte}.conf"));
         std::fs::write(&path, "[Interface]\nPrivateKey = lifecycle-copy\n").unwrap();
         #[cfg(unix)]
         {
@@ -487,6 +524,7 @@ mod tests {
         TunnelTeardownConfig {
             path,
             managed: true,
+            wg_quick_interface: Some(byte.to_string()),
         }
     }
 
@@ -556,6 +594,44 @@ mod tests {
         assert!(store
             .remove_after_confirmed_absence(&profile.id, &[])
             .unwrap());
+    }
+
+    #[test]
+    fn legacy_record_without_alias_recovers_from_the_stable_profile_filename() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = profile(temp.path(), 'a');
+        let store =
+            StandardTunnelOwnershipStore::new(temp.path().join("runtime"), uid(), 501, "boot-a")
+                .unwrap();
+        let evidence = handshake(7);
+        let teardown = teardown_config(temp.path(), 'a');
+        store
+            .issue_wireguard(
+                &profile,
+                TunnelRevision {
+                    authority_epoch: AuthorityEpoch(3),
+                    generation: 7,
+                },
+                serde_json::from_str("\"op-0000000000000003-0000000000000001\"").unwrap(),
+                "utun4",
+                &teardown,
+                evidence.clone(),
+                Vec::new(),
+            )
+            .unwrap();
+        let record_path = store.record_path(&profile.id);
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+        record.as_object_mut().unwrap().remove("wg_quick_interface");
+        std::fs::write(&record_path, serde_json::to_vec(&record).unwrap()).unwrap();
+        let mut active = session(&profile, &evidence);
+        active.interface = "utun4".into();
+
+        let recovered = store.validate_wireguard(&profile, &active).unwrap();
+        assert_eq!(
+            recovered.teardown_config.wg_quick_interface.as_deref(),
+            Some("a")
+        );
     }
 
     #[test]

@@ -239,17 +239,19 @@ fn audit_row(label: &str, value: &str, sigil: Sigil, inner_width: usize) -> Line
 }
 
 fn push_dns_rows(lines: &mut Vec<Line<'static>>, s: &PanelState, w: usize) {
-    use crate::core::dns_protection::DnsProtectionStatus;
+    use crate::vortix_core::control::DnsSecurityStatus;
     let dns_value = format_value_with_tag(&s.dns_server, s.dns_provider);
-    let sigil = match s.dns_protection {
-        DnsProtectionStatus::Verified => Sigil::OkMuted,
-        DnsProtectionStatus::Unverified => Sigil::AlarmWarn,
-        DnsProtectionStatus::NotActive => Sigil::NotApplicable,
+    let dns_value = match s.dns_status {
+        DnsSecurityStatus::Unverified => format!("Unverified · {dns_value}"),
+        DnsSecurityStatus::NotRequested => format!("Not provided · {dns_value}"),
+        DnsSecurityStatus::NotActive | DnsSecurityStatus::Protected => dns_value,
+    };
+    let sigil = match s.dns_status {
+        DnsSecurityStatus::Protected => Sigil::OkMuted,
+        DnsSecurityStatus::Unverified | DnsSecurityStatus::NotRequested => Sigil::AlarmWarn,
+        DnsSecurityStatus::NotActive => Sigil::NotApplicable,
     };
     lines.push(audit_row("DNS", &dns_value, sigil, w));
-    if s.dns_protection == DnsProtectionStatus::Unverified {
-        lines.push(alarm_subline("DNS policy has not been verified", w));
-    }
 }
 
 fn has_v6_signal(s: &PanelState) -> bool {
@@ -361,7 +363,7 @@ struct PanelState {
     ipv6_status: Ipv6RowStatus,
     dns_server: String,
     dns_provider: Option<&'static str>,
-    dns_protection: crate::core::dns_protection::DnsProtectionStatus,
+    dns_status: crate::vortix_core::control::DnsSecurityStatus,
 
     // Defense
     killswitch_mode: KillSwitchMode,
@@ -501,8 +503,8 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
 /// degraded so the title doesn't claim full protection while a row is red.
 fn verdict_for_protected(app: &App, primary_snap: Option<&TunnelSnapshot>) -> Verdict {
     let ip_leaking = matches!(&app.runtime.real_ip, Some(real) if &app.runtime.public_ip == real);
-    let dns_unverified =
-        app.runtime.dns_protection == crate::core::dns_protection::DnsProtectionStatus::Unverified;
+    let dns_unverified = app.control_snapshot.dns.status
+        != crate::vortix_core::control::DnsSecurityStatus::Protected;
     let ks_alarm = matches!(
         (app.runtime.killswitch_mode, app.runtime.killswitch_state),
         (
@@ -589,7 +591,8 @@ fn collect_protected_state(
         _ => IpStatus::Pending,
     };
 
-    let dns_provider = dns_provider_label(&app.runtime.dns_server);
+    let dns_server = dns_display_value(app);
+    let dns_provider = dns_provider_label(&dns_server);
     let encryption = derive_encryption(primary_snap);
 
     let location = if app.runtime.location.is_empty()
@@ -611,9 +614,9 @@ fn collect_protected_state(
         location,
         ip_status,
         ipv6_status: derive_ipv6_row_status(app),
-        dns_server: app.runtime.dns_server.clone(),
+        dns_server,
         dns_provider,
-        dns_protection: app.runtime.dns_protection,
+        dns_status: app.control_snapshot.dns.status,
         killswitch_mode: app.runtime.killswitch_mode,
         killswitch_state: app.runtime.killswitch_state,
         encryption,
@@ -679,6 +682,7 @@ fn collect_partial_state(
         (String::new(), None, IpStatus::Pending)
     };
 
+    let dns_server = dns_display_value(app);
     PanelState {
         inner_width,
         show_section_headers: true,
@@ -689,9 +693,9 @@ fn collect_partial_state(
         location,
         ip_status,
         ipv6_status: derive_ipv6_row_status(app),
-        dns_server: app.runtime.dns_server.clone(),
-        dns_provider: dns_provider_label(&app.runtime.dns_server),
-        dns_protection: app.runtime.dns_protection,
+        dns_provider: dns_provider_label(&dns_server),
+        dns_server,
+        dns_status: app.control_snapshot.dns.status,
         killswitch_mode: app.runtime.killswitch_mode,
         killswitch_state: app.runtime.killswitch_state,
         encryption,
@@ -736,6 +740,19 @@ fn dns_provider_label(dns_server: &str) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+fn dns_display_value(app: &App) -> String {
+    if app.control_snapshot.dns.intended_servers.is_empty() {
+        return app.runtime.dns_server.clone();
+    }
+    app.control_snapshot
+        .dns
+        .intended_servers
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 // ── Builders (pure) ─────────────────────────────────────────────────────────
@@ -1159,7 +1176,7 @@ mod tests {
             ipv6_status: Ipv6RowStatus::Absent,
             dns_server: "1.1.1.1".to_string(),
             dns_provider: Some("Cloudflare"),
-            dns_protection: crate::core::dns_protection::DnsProtectionStatus::Verified,
+            dns_status: crate::vortix_core::control::DnsSecurityStatus::Protected,
             killswitch_mode: KillSwitchMode::AlwaysOn,
             killswitch_state: KillSwitchState::Blocking,
             encryption: "ChaCha20-Poly1305".to_string(),
@@ -1387,9 +1404,9 @@ mod tests {
 
     #[test]
     fn unverified_dns_policy_warns_without_claiming_a_leak() {
-        use crate::core::dns_protection::DnsProtectionStatus;
+        use crate::vortix_core::control::DnsSecurityStatus;
         let mut s = baseline_protected_state(40);
-        s.dns_protection = DnsProtectionStatus::Unverified;
+        s.dns_status = DnsSecurityStatus::Unverified;
         let lines = build_protected_audit(&s);
 
         let dns_idx = lines
@@ -1407,12 +1424,12 @@ mod tests {
             "unverified DNS sigil must be BOLD"
         );
 
-        let subline_text = line_text(&lines[dns_idx + 1]);
+        let dns_text = line_text(&lines[dns_idx]);
         assert!(
-            subline_text.contains("DNS policy"),
-            "unverified DNS must render an explanatory sub-line (got {subline_text:?})"
+            dns_text.contains("Unverified"),
+            "unverified DNS must explain itself on its compact row (got {dns_text:?})"
         );
-        assert!(!subline_text.contains("leak"));
+        assert!(!dns_text.contains("leak"));
 
         // Exit IP row stays calm.
         let ip_idx = lines
@@ -1563,6 +1580,41 @@ mod tests {
             !all_text.contains("Provider:"),
             "no `Provider:` sub-bullet allowed: {all_text}"
         );
+    }
+
+    #[test]
+    fn dns_row_prefers_canonical_vpn_intent_over_stale_telemetry() {
+        let mut app = App::new_test();
+        app.runtime.dns_server = "192.168.1.100".into();
+        app.control_snapshot.dns.intended_servers =
+            vec!["10.80.0.1".parse().unwrap(), "1.1.1.1".parse().unwrap()];
+        app.control_snapshot.dns.status = crate::vortix_core::control::DnsSecurityStatus::Protected;
+
+        assert_eq!(dns_display_value(&app), "10.80.0.1, 1.1.1.1");
+    }
+
+    #[test]
+    fn primary_without_vpn_dns_warns_instead_of_claiming_protection() {
+        use crate::vortix_core::control::DnsSecurityStatus;
+        let mut s = baseline_protected_state(52);
+        s.dns_status = DnsSecurityStatus::NotRequested;
+
+        let lines = build_protected_audit(&s);
+        let dns_idx = lines
+            .iter()
+            .position(|line| line_text(line).starts_with("DNS"))
+            .expect("DNS row missing");
+
+        assert_eq!(
+            lines[dns_idx]
+                .spans
+                .last()
+                .expect("DNS sigil")
+                .content
+                .trim(),
+            "⚠"
+        );
+        assert!(line_text(&lines[dns_idx]).contains("Not provided"));
     }
 
     #[test]

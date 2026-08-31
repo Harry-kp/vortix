@@ -93,8 +93,8 @@ impl App {
                 }
             }
             Message::ConfirmDelete => {
-                if let InputMode::ConfirmDelete { index, .. } = self.input_mode {
-                    self.confirm_delete(index);
+                if let InputMode::ConfirmDelete { profile_id, .. } = self.input_mode.clone() {
+                    self.confirm_delete_profile(&profile_id);
                 }
             }
             Message::ConfirmDefaultRouteTakeover { idx } => {
@@ -277,9 +277,16 @@ impl App {
                 self.background_diagnostics_loading = false;
                 match result {
                     Ok(view) => self.log_batch(&background_diagnostic_log_lines(&view)),
-                    Err(error) => self.log(&format!(
-                        "BACKGROUND: diagnostics unavailable ({error}); status remains Standard and no authority claim was made"
-                    )),
+                    Err(error) => {
+                        self.log(&format!(
+                            "BACKGROUND: diagnostics unavailable ({error}); status remains Standard and no authority claim was made"
+                        ));
+                        self.show_toast(
+                            "Background diagnostics are unavailable. Standard mode is unchanged."
+                                .to_string(),
+                            ToastType::Warning,
+                        );
+                    }
                 }
             }
             Message::ConfirmBackgroundAction => {
@@ -753,8 +760,8 @@ impl App {
     fn handle_toggle_killswitch(&mut self) {
         if self.control_session.is_none() {
             self.show_toast(
-                "Control service is not attached".to_string(),
-                ToastType::Error,
+                super::connection::CONTROL_STARTING_MESSAGE.to_string(),
+                ToastType::Info,
             );
             return;
         }
@@ -978,6 +985,7 @@ impl App {
     }
 
     fn tick_presentation(&mut self) {
+        self.flush_catalog_feedback(false);
         if self
             .toast
             .as_ref()
@@ -1012,7 +1020,7 @@ impl App {
                 } else {
                     let char_len = profile_name.chars().count();
                     self.input_mode = InputMode::Rename {
-                        index: idx,
+                        profile_id: profile.id.clone(),
                         new_name: profile_name,
                         cursor: char_len,
                     };

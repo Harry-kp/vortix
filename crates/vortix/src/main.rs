@@ -189,14 +189,17 @@ fn main() -> Result<()> {
     // orphan-daemon scan. If a previous vortix crashed
     // while a tunnel was up, the user's `wg-quick` / `openvpn` /
     // `wireguard-go` daemon is probably still running. Warn so they
-    // know to clean up (no auto-adopt — adoption arrives with the
-    // daemon IPC layer).
+    // know to clean up. Canonical recovery later decides whether exact
+    // persisted ownership can be resumed; this scan is advisory only.
     //
-    // PIDs recorded in `run/*.pid` belong to a tracked session (openvpn
-    // daemons reparent to init, so the bare scan can't tell "mine" from
-    // "leftover") — exclude them from the warning. Reads only the run
-    // dir; profile files are never parsed here.
-    let tracked_pids = vortix::utils::tracked_openvpn_pids();
+    // OpenVPN PID files and live WireGuard processes backed by a managed
+    // receipt belong to tracked sessions. A one-shot `up` deliberately leaves
+    // those tunnels running, so process reparenting or CLI exit alone is not
+    // evidence that they are orphans.
+    let mut tracked_pids = vortix::utils::tracked_openvpn_pids();
+    tracked_pids.extend(vortix::core::managed_wireguard::tracked_wireguard_pids(
+        &config_dir,
+    ));
     let orphans = vortix::vortix_process::filter_untracked(
         vortix::vortix_process::scan_orphans(),
         &tracked_pids,
@@ -351,19 +354,52 @@ fn run_tui(
     config_dir: std::path::PathBuf,
     diagnostics_fallback: bool,
 ) -> Result<()> {
+    terminal.draw(|frame| {
+        use ratatui::layout::Alignment;
+        use ratatui::style::{Modifier, Style};
+        use ratatui::text::{Line, Span};
+        use ratatui::widgets::{Block, Borders, Paragraph};
+
+        let theme = vortix::theme::current();
+        let content = vec![
+            Line::from(Span::styled(
+                format!("{} v{}", constants::APP_NAME, constants::APP_VERSION),
+                Style::default()
+                    .fg(theme.accent_primary)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Starting…",
+                Style::default().fg(theme.text_secondary),
+            )),
+        ];
+        frame.render_widget(
+            Paragraph::new(content)
+                .alignment(Alignment::Center)
+                .block(Block::default().borders(Borders::ALL).title(" Vortix ")),
+            frame.area(),
+        );
+    })?;
     let tick_rate = config.tick_rate;
     let mut app = App::new(config, config_dir);
     app.set_background_diagnostics_fallback(diagnostics_fallback);
-    let control = vortix::cli::control::LocalControlSession::start(
-        &app.runtime.config,
-        &app.runtime.config_dir,
-        app.runtime.profiles.clone(),
-    )
-    .map_err(|error| color_eyre::eyre::eyre!("cannot start TUI control service: {error}"))?;
-    app.attach_client_control_session(vortix::cli::control::ClientControlSession::standard(
-        control,
-    ))
-    .map_err(|error| color_eyre::eyre::eyre!("cannot attach TUI control service: {error}"))?;
+    let control_config = app.runtime.config.clone();
+    let control_dir = app.runtime.config_dir.clone();
+    let control_profiles = app.runtime.profiles.clone();
+    let (control_tx, control_rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("vortix-control-startup".into())
+        .spawn(move || {
+            let result = vortix::cli::control::LocalControlSession::start(
+                &control_config,
+                &control_dir,
+                control_profiles,
+            );
+            let _ = control_tx.send(result);
+        })
+        .map_err(|error| color_eyre::eyre::eyre!("cannot start control bootstrap: {error}"))?;
+    let mut control_rx = Some(control_rx);
     let events = EventHandler::new(tick_rate);
     let size = terminal.size()?;
     app.on_resize(size.width, size.height);
@@ -394,6 +430,30 @@ fn run_tui(
             }
         }
 
+        if let Some(receiver) = control_rx.as_ref() {
+            match receiver.try_recv() {
+                Ok(Ok(control)) => {
+                    app.attach_client_control_session(
+                        vortix::cli::control::ClientControlSession::standard(control),
+                    )
+                    .map_err(|error| {
+                        color_eyre::eyre::eyre!("cannot attach TUI control service: {error}")
+                    })?;
+                    control_rx = None;
+                }
+                Ok(Err(error)) => {
+                    return Err(color_eyre::eyre::eyre!(
+                        "cannot start TUI control service: {error}"
+                    ));
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    return Err(color_eyre::eyre::eyre!(
+                        "TUI control service stopped during startup"
+                    ));
+                }
+            }
+        }
         app.process_external();
         terminal.draw(|frame| ui::render(frame, &mut app))?;
 

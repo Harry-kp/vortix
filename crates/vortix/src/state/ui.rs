@@ -172,8 +172,9 @@ pub enum InputMode {
     },
     /// Delete confirmation dialog.
     ConfirmDelete {
-        /// Index of the profile to delete.
-        index: usize,
+        /// Stable identity of the profile to delete. The visible list may
+        /// reorder while this confirmation is open.
+        profile_id: ProfileId,
         /// Name of the profile to delete.
         name: String,
         /// Is "Yes" selected?
@@ -192,8 +193,9 @@ pub enum InputMode {
     },
     /// Profile rename dialog.
     Rename {
-        /// Index of the profile being renamed.
-        index: usize,
+        /// Stable identity of the profile being renamed. The visible list may
+        /// reorder while this dialog is open.
+        profile_id: ProfileId,
         /// New name being typed.
         new_name: String,
         /// Cursor position.

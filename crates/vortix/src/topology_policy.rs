@@ -5,6 +5,7 @@ use std::io::Read as _;
 use std::net::ToSocketAddrs as _;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use crate::core::scanner::ActiveSession;
 use crate::state::{Protocol, VpnProfile};
@@ -688,13 +689,31 @@ impl CanonicalPolicyExecutor {
         }
     }
 
-    fn verify_dns(&self, state: &TopologyState) -> Result<(), String> {
+    fn verify_dns(&self, policy: &TopologyPolicy) -> Result<(), String> {
         self.require_global_authority()?;
-        let intents = self.dns_intents(state)?;
-        let coordinator = self.dns.lock().map_err(|_| "DNS policy mutex poisoned")?;
-        coordinator
-            .verify_current(&intents, &crate::platform::current_platform().dns)
-            .map_err(|errors| format!("DNS read-back is degraded: {}", errors.join("; ")))
+        let intents = self.dns_intents(&policy.target)?;
+        let dns_policy = {
+            let coordinator = self.dns.lock().map_err(|_| "DNS policy mutex poisoned")?;
+            coordinator
+                .verify_current(&intents, &crate::platform::current_platform().dns)
+                .map_err(|errors| format!("DNS read-back is degraded: {}", errors.join("; ")))?;
+            coordinator
+                .desired()
+                .cloned()
+                .ok_or_else(|| "DNS desired policy is unavailable".to_string())?
+        };
+        crate::core::dns_protection::verify_dns_routes(&dns_policy, policy.deadline)
+    }
+
+    fn verify_current_dns_routes(&self, deadline: Instant) -> Result<(), String> {
+        let policy = self
+            .dns
+            .lock()
+            .map_err(|_| "DNS policy mutex poisoned")?
+            .desired()
+            .cloned()
+            .ok_or_else(|| "DNS desired policy is unavailable".to_string())?;
+        crate::core::dns_protection::verify_dns_routes(&policy, deadline)
     }
 
     fn active_tunnels(
@@ -961,6 +980,7 @@ impl PolicyExecutor for CanonicalPolicyExecutor {
             }
             PolicyBarrier::Dns => {
                 self.reconcile_dns(&policy.target, false)?;
+                self.verify_current_dns_routes(policy.deadline)?;
                 self.with_readback(policy, |evidence| evidence.dns_verified = true);
                 Ok(())
             }
@@ -968,6 +988,7 @@ impl PolicyExecutor for CanonicalPolicyExecutor {
                 self.verify_tunnels(policy)?;
                 self.verify_routes(policy)?;
                 self.reconcile_dns(&policy.target, true)?;
+                self.verify_current_dns_routes(policy.deadline)?;
                 self.with_readback(policy, |evidence| {
                     evidence.interface_verified = true;
                     evidence.route_verified = true;
@@ -1005,7 +1026,7 @@ impl PolicyExecutor for CanonicalPolicyExecutor {
         }
         self.verify_tunnels(policy)?;
         self.verify_routes(policy)?;
-        self.verify_dns(&policy.target)?;
+        self.verify_dns(policy)?;
         self.verify_final_firewall(policy)?;
         let observed_at_millis = crate::utils::boot_elapsed_millis()
             .ok_or_else(|| "OS boot clock is unavailable for policy evidence".to_string())?;

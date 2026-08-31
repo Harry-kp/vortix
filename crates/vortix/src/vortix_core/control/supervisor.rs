@@ -462,7 +462,11 @@ impl Supervisor {
                 && matches!(
                     entry.truth,
                     SupervisedTruth::Degraded(
-                        WorkFailure::EffectFailed | WorkFailure::AuthenticationFailed
+                        WorkFailure::EffectFailed
+                            | WorkFailure::AuthenticationFailed
+                            | WorkFailure::HandshakeFailed
+                            | WorkFailure::InvalidProfile
+                            | WorkFailure::RouteConflict
                     )
                 )
         });

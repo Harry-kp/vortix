@@ -26,6 +26,7 @@ fn test_app() -> App {
         engine_handle: None,
         registry: crate::vortix_core::engine::TunnelRegistry::new(),
         control_session: None,
+        control_starting: false,
         control_snapshot: crate::vortix_core::control::ControlSnapshot::default(),
         control_challenge: None,
         last_control_connected_profile: None,
@@ -33,6 +34,8 @@ fn test_app() -> App {
         pending_control_operations: std::collections::BTreeMap::new(),
         control_request_sequence: 0,
         pending_profile_imports: None,
+        catalog_feedback: None,
+        presented_catalog_revision: None,
         should_quit: false,
         logs_scroll: 0,
         logs_auto_scroll: true,
@@ -136,12 +139,17 @@ fn canonical_snapshot_is_the_only_source_of_renderer_registry_truth() {
 
 #[test]
 fn security_dns_status_uses_canonical_policy_readback_not_recursor_identity() {
-    use crate::core::dns_protection::DnsProtectionStatus;
-    use crate::vortix_core::control::{GateEvidence, ProtectionEvidence};
+    use crate::vortix_core::control::{DnsSecurityStatus, GateEvidence, ProtectionEvidence};
 
     let mut app = test_app();
     set_connected(&mut app, "dns-policy");
-    assert_eq!(app.runtime.dns_protection, DnsProtectionStatus::Unverified);
+    let mut unverified = app.control_snapshot.clone();
+    unverified.dns.status = DnsSecurityStatus::Unverified;
+    app.apply_control_snapshot(unverified);
+    assert_eq!(
+        app.control_snapshot.dns.status,
+        DnsSecurityStatus::Unverified
+    );
 
     let mut verified = app.control_snapshot.clone();
     verified.effective.freshness.current = true;
@@ -155,11 +163,18 @@ fn security_dns_status_uses_canonical_policy_readback_not_recursor_identity() {
         dns: GateEvidence::Verified,
         firewall: GateEvidence::Verified,
     });
+    verified.dns.status = DnsSecurityStatus::Protected;
     app.apply_control_snapshot(verified);
-    assert_eq!(app.runtime.dns_protection, DnsProtectionStatus::Verified);
+    assert_eq!(
+        app.control_snapshot.dns.status,
+        DnsSecurityStatus::Protected
+    );
 
     app.apply_control_snapshot(crate::vortix_core::control::ControlSnapshot::default());
-    assert_eq!(app.runtime.dns_protection, DnsProtectionStatus::NotActive);
+    assert_eq!(
+        app.control_snapshot.dns.status,
+        DnsSecurityStatus::NotActive
+    );
 }
 
 #[test]
@@ -412,6 +427,36 @@ fn add_profiles(app: &mut App, names: &[&str]) {
             last_used: None,
         });
     }
+}
+
+fn add_stored_profile(
+    app: &mut App,
+    store: &crate::vortix_config::profile_store::FsProfileStore,
+    directory: &std::path::Path,
+    name: &str,
+) -> crate::vortix_core::profile::ProfileId {
+    static NEXT_TEST_PROFILE_ID: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(1);
+    let sequence = NEXT_TEST_PROFILE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let profile_id = crate::vortix_core::profile::ProfileId::parse(format!("{sequence:064x}"))
+        .expect("test profile ID must be valid");
+    let config_path = directory.join(format!("{name}.conf"));
+    let profile = crate::vortix_core::profile::Profile::new(
+        profile_id.clone(),
+        name,
+        crate::vortix_core::profile::ProtocolKind::WireGuard,
+        config_path.clone(),
+    );
+    crate::vortix_config::profile_store::ProfileStore::insert(store, &profile, b"dummy").unwrap();
+    app.runtime.profiles.push(VpnProfile {
+        id: profile_id.clone(),
+        name: name.to_string(),
+        protocol: Protocol::WireGuard,
+        config_path,
+        location: "Test".to_string(),
+        last_used: None,
+    });
+    profile_id
 }
 // ====================================================================
 // VPN switching tests
@@ -1348,6 +1393,74 @@ fn test_rename_updates_last_connected_profile() {
         Some("new-name"),
         "Rename should update last_connected_profile"
     );
+}
+
+#[test]
+fn rename_dialog_keeps_its_profile_when_background_sorting_reorders_the_list() {
+    let mut app = test_app();
+    let directory = tempfile::tempdir().unwrap();
+    let store =
+        crate::vortix_config::profile_store::FsProfileStore::new(directory.path().to_path_buf());
+    let target_id = add_stored_profile(&mut app, &store, directory.path(), "target");
+    let other_id = add_stored_profile(&mut app, &store, directory.path(), "other");
+    app.profile_list_state.select(Some(0));
+
+    app.handle_message(Message::OpenRename);
+    let InputMode::Rename { profile_id, .. } = app.input_mode.clone() else {
+        panic!("rename dialog did not open");
+    };
+    assert_eq!(profile_id, target_id);
+
+    app.runtime.profiles.swap(0, 1);
+    app.rename_profile_by_id(&profile_id, "renamed-target");
+
+    assert_eq!(
+        app.runtime
+            .profiles
+            .iter()
+            .find(|profile| profile.id == target_id)
+            .map(|profile| profile.name.as_str()),
+        Some("renamed-target")
+    );
+    assert_eq!(
+        app.runtime
+            .profiles
+            .iter()
+            .find(|profile| profile.id == other_id)
+            .map(|profile| profile.name.as_str()),
+        Some("other")
+    );
+}
+
+#[test]
+fn delete_dialog_keeps_its_profile_when_background_sorting_reorders_the_list() {
+    let mut app = test_app();
+    let directory = tempfile::tempdir().unwrap();
+    let store =
+        crate::vortix_config::profile_store::FsProfileStore::new(directory.path().to_path_buf());
+    let target_id = add_stored_profile(&mut app, &store, directory.path(), "target-delete");
+    let other_id = add_stored_profile(&mut app, &store, directory.path(), "other-delete");
+    app.profile_list_state.select(Some(0));
+
+    app.request_delete(0);
+    let InputMode::ConfirmDelete { profile_id, .. } = app.input_mode.clone() else {
+        panic!("delete dialog did not open");
+    };
+    assert_eq!(profile_id, target_id);
+
+    app.runtime.profiles.swap(0, 1);
+    app.handle_message(Message::ConfirmDelete);
+
+    assert!(app
+        .runtime
+        .profiles
+        .iter()
+        .all(|profile| profile.id != target_id));
+    assert!(app
+        .runtime
+        .profiles
+        .iter()
+        .any(|profile| profile.id == other_id));
 }
 
 #[test]
@@ -3064,10 +3177,64 @@ fn remote_profile_terminal_failure_is_reported_to_the_user() {
             )),
         }],
     });
+    app.flush_catalog_feedback(true);
 
     let toast = app.toast.as_ref().expect("profile failure must be visible");
     assert_eq!(toast.toast_type, ToastType::Error);
-    assert!(toast.message.contains("Failed(Rejected)"));
+    assert!(toast.message.contains("profile is busy"));
+    assert!(!toast.message.contains("Rejected"));
+}
+
+#[test]
+fn profile_mutation_burst_ends_with_one_aggregate_result() {
+    let mut app = test_app();
+    for revision in 1..=3 {
+        app.apply_local_catalog_update(crate::cli::control::LocalCatalogUpdate {
+            revision,
+            profiles: None,
+            outcomes: vec![if revision == 2 {
+                crate::cli::control::LocalCatalogOutcome::Failed(
+                    crate::vortix_core::control::ProfileMutationFailure::Storage,
+                )
+            } else {
+                crate::cli::control::LocalCatalogOutcome::Applied(
+                    crate::cli::control::LocalProfileMutationReceipt::RemoteApplied {
+                        display_name: Some(format!("profile-{revision}")),
+                    },
+                )
+            }],
+        });
+    }
+    assert!(
+        app.toast.is_none(),
+        "burst should wait for its quiet window"
+    );
+
+    app.flush_catalog_feedback(true);
+
+    let toast = app.toast.as_ref().expect("aggregate result missing");
+    assert_eq!(toast.toast_type, ToastType::Error);
+    assert_eq!(
+        toast.message,
+        "2 profile updates completed; 1 failed. See Event Log."
+    );
+}
+
+#[test]
+fn actions_during_control_startup_explain_the_wait_without_an_error_alarm() {
+    let mut app = test_app();
+    add_profiles(&mut app, &["vpn"]);
+    app.profile_list_state.select(Some(0));
+    app.control_starting = true;
+
+    app.handle_message(Message::ToggleConnect(None));
+
+    let toast = app
+        .toast
+        .as_ref()
+        .expect("startup action must have feedback");
+    assert_eq!(toast.toast_type, ToastType::Info);
+    assert!(toast.message.contains("still starting"));
 }
 
 #[test]
@@ -3135,16 +3302,20 @@ fn terminal_dns_policy_failure_is_shown_to_tui_user() {
     };
 
     let mut app = test_app();
-    let operation_id = OperationId::from_parts(AuthorityEpoch(1), 42);
+    let operation_id = OperationId::from_parts(AuthorityEpoch(1), 4_242);
     app.track_control_operation(
         operation_id.clone(),
         super::connection::PendingControlSubject::Connection,
+    );
+    assert!(
+        app.toast.is_none(),
+        "tracking must not report a stale operation"
     );
     let mut snapshot = app.control_snapshot.clone();
     snapshot.operations.insert(
         operation_id.clone(),
         OperationRecord {
-            id: operation_id,
+            id: operation_id.clone(),
             idempotency_key: IdempotencyKey::new("managed-dns-connect"),
             client_id: ClientId::from_parts(AuthorityEpoch(1), 1),
             command_digest: PolicyDigest::default(),
@@ -3155,7 +3326,12 @@ fn terminal_dns_policy_failure_is_shown_to_tui_user() {
             intent: OperationIntent::default(),
             status: OperationStatus::Failed,
             result: Some(OperationResult::Failed(OperationFailure::DnsPolicyFailed)),
+            failure_detail: Some("macOS primary DNS is owned by another generation".to_string()),
         },
+    );
+    assert_eq!(
+        snapshot.operations[&operation_id].failure_detail.as_deref(),
+        Some("macOS primary DNS is owned by another generation")
     );
 
     app.apply_control_snapshot(snapshot);
@@ -3165,17 +3341,92 @@ fn terminal_dns_policy_failure_is_shown_to_tui_user() {
         .as_ref()
         .expect("terminal failure must be visible");
     assert_eq!(toast.toast_type, ToastType::Error);
-    assert!(toast.message.starts_with("Couldn't finish connecting"));
     assert!(toast
         .message
-        .contains("DNS settings could not be applied safely"));
-    assert!(toast.message.contains("restored your previous connection"));
+        .starts_with("VPN DNS could not be applied safely"));
+    assert!(toast
+        .message
+        .contains("previous network settings were restored"));
+    assert!(
+        toast
+            .message
+            .contains("unfinished DNS state from an earlier connection"),
+        "{}",
+        toast.message
+    );
 
     app.toast = None;
     app.apply_control_snapshot(app.control_snapshot.clone());
     assert!(
         app.toast.is_none(),
         "terminal failure must be reported once"
+    );
+}
+
+#[test]
+fn terminal_late_route_conflict_opens_the_existing_confirmation_dialog() {
+    use crate::vortix_core::control::{
+        AuthorityEpoch, ClientId, IdempotencyKey, OperationFailure, OperationId, OperationIntent,
+        OperationRecord, OperationResult, OperationStatus, PolicyDigest, RequestedTunnelState,
+    };
+    use crate::vortix_core::engine::Conflict;
+    use crate::vortix_core::profile::ProfileId;
+
+    let mut app = test_app();
+    add_profiles(&mut app, &["existing", "candidate"]);
+    let existing = ProfileId::new("existing");
+    let candidate = ProfileId::new("candidate");
+    let operation_id = OperationId::from_parts(AuthorityEpoch(1), 47);
+    app.track_control_operation(
+        operation_id.clone(),
+        super::connection::PendingControlSubject::Connection,
+    );
+    let mut snapshot = app.control_snapshot.clone();
+    snapshot.pending_route_conflicts.insert(
+        candidate.clone(),
+        Conflict::DefaultRouteTakeover {
+            current: existing.clone(),
+            new: candidate.clone(),
+        },
+    );
+    snapshot.operations.insert(
+        operation_id.clone(),
+        OperationRecord {
+            id: operation_id,
+            idempotency_key: IdempotencyKey::new("late-route-conflict"),
+            client_id: ClientId::from_parts(AuthorityEpoch(1), 1),
+            command_digest: PolicyDigest::default(),
+            authority_epoch: AuthorityEpoch(1),
+            desired_generation: 1,
+            admitted_at_millis: 1,
+            deadline_millis: 2,
+            intent: OperationIntent::DesiredSubset {
+                tunnels: std::collections::BTreeMap::from([(
+                    candidate.clone(),
+                    RequestedTunnelState::Connected,
+                )]),
+                kill_switch: None,
+            },
+            status: OperationStatus::Failed,
+            result: Some(OperationResult::Failed(OperationFailure::Rejected)),
+            failure_detail: None,
+        },
+    );
+
+    app.apply_control_snapshot(snapshot);
+
+    assert!(matches!(
+        app.input_mode,
+        InputMode::ConfirmDefaultRouteTakeover {
+            ref from,
+            ref to_profile_id,
+            ref to_name,
+            ..
+        } if from == "existing" && to_profile_id == &candidate && to_name == "candidate"
+    ));
+    assert!(
+        app.toast.is_none(),
+        "the dialog replaces a generic failure toast"
     );
 }
 
@@ -3209,6 +3460,7 @@ fn terminal_authentication_failure_is_shown_to_tui_user() {
             result: Some(OperationResult::Failed(
                 OperationFailure::AuthenticationFailed,
             )),
+            failure_detail: None,
         },
     );
 
@@ -3223,6 +3475,129 @@ fn terminal_authentication_failure_is_shown_to_tui_user() {
     assert!(toast
         .message
         .contains("certificate or username and password"));
+}
+
+#[test]
+fn invalid_wireguard_name_is_shown_as_an_actionable_terminal_error() {
+    use crate::vortix_core::control::{
+        AuthorityEpoch, ClientId, IdempotencyKey, OperationFailure, OperationId, OperationIntent,
+        OperationRecord, OperationResult, OperationStatus, PolicyDigest,
+    };
+
+    let mut app = test_app();
+    let operation_id = OperationId::from_parts(AuthorityEpoch(1), 44);
+    app.track_control_operation(
+        operation_id.clone(),
+        super::connection::PendingControlSubject::Connection,
+    );
+    let mut snapshot = app.control_snapshot.clone();
+    snapshot.operations.insert(
+        operation_id.clone(),
+        OperationRecord {
+            id: operation_id,
+            idempotency_key: IdempotencyKey::new("invalid-wireguard-name"),
+            client_id: ClientId::from_parts(AuthorityEpoch(1), 1),
+            command_digest: PolicyDigest::default(),
+            authority_epoch: AuthorityEpoch(1),
+            desired_generation: 1,
+            admitted_at_millis: 1,
+            deadline_millis: 2,
+            intent: OperationIntent::default(),
+            status: OperationStatus::Failed,
+            result: Some(OperationResult::Failed(OperationFailure::InvalidProfile)),
+            failure_detail: None,
+        },
+    );
+
+    app.apply_control_snapshot(snapshot);
+
+    let toast = app.toast.as_ref().expect("invalid profile must be visible");
+    assert_eq!(toast.toast_type, ToastType::Error);
+    assert!(toast.message.contains("invalid filename"));
+    assert!(toast.message.contains("1–15 characters"));
+    assert!(toast.message.contains("import it again"));
+}
+
+#[test]
+fn terminal_wireguard_handshake_failure_explains_the_owned_retry() {
+    use crate::vortix_core::control::{
+        AuthorityEpoch, ClientId, IdempotencyKey, OperationFailure, OperationId, OperationIntent,
+        OperationRecord, OperationResult, OperationStatus, PolicyDigest,
+    };
+
+    let mut app = test_app();
+    let operation_id = OperationId::from_parts(AuthorityEpoch(1), 45);
+    app.track_control_operation(
+        operation_id.clone(),
+        super::connection::PendingControlSubject::Connection,
+    );
+    let mut snapshot = app.control_snapshot.clone();
+    snapshot.operations.insert(
+        operation_id.clone(),
+        OperationRecord {
+            id: operation_id,
+            idempotency_key: IdempotencyKey::new("wireguard-handshake-failed"),
+            client_id: ClientId::from_parts(AuthorityEpoch(1), 1),
+            command_digest: PolicyDigest::default(),
+            authority_epoch: AuthorityEpoch(1),
+            desired_generation: 7,
+            admitted_at_millis: 1,
+            deadline_millis: 2,
+            intent: OperationIntent::default(),
+            status: OperationStatus::Failed,
+            result: Some(OperationResult::Failed(OperationFailure::HandshakeFailed)),
+            failure_detail: None,
+        },
+    );
+    let recovery_id = OperationId::from_parts(AuthorityEpoch(1), 46);
+    snapshot.operations.insert(
+        recovery_id.clone(),
+        OperationRecord {
+            id: recovery_id.clone(),
+            idempotency_key: IdempotencyKey::new("service-recovery-7-2"),
+            client_id: ClientId::from_parts(AuthorityEpoch(1), 0),
+            command_digest: PolicyDigest::default(),
+            authority_epoch: AuthorityEpoch(1),
+            desired_generation: 7,
+            admitted_at_millis: 2,
+            deadline_millis: 30_002,
+            intent: OperationIntent::default(),
+            status: OperationStatus::WaitingForObservation,
+            result: None,
+            failure_detail: None,
+        },
+    );
+
+    app.apply_control_snapshot(snapshot);
+
+    let toast = app
+        .toast
+        .as_ref()
+        .expect("the user must be told that a retry is in progress");
+    assert_eq!(toast.toast_type, ToastType::Warning);
+    assert!(toast
+        .message
+        .contains("No WireGuard handshake was received"));
+    assert!(toast.message.contains("retrying once"));
+
+    let mut retry_failed = app.control_snapshot.clone();
+    let recovery = retry_failed
+        .operations
+        .get_mut(&recovery_id)
+        .expect("recovery operation missing");
+    recovery.status = OperationStatus::Failed;
+    recovery.result = Some(OperationResult::Failed(OperationFailure::HandshakeFailed));
+    app.apply_control_snapshot(retry_failed);
+
+    let toast = app
+        .toast
+        .as_ref()
+        .expect("terminal recovery failure must be visible");
+    assert_eq!(toast.toast_type, ToastType::Error);
+    assert!(toast
+        .message
+        .contains("No WireGuard handshake was received"));
+    assert!(!toast.message.contains("retrying once"));
 }
 
 #[test]

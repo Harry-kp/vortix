@@ -54,6 +54,12 @@ struct FakeHelperSession {
     state: Arc<FakeHelperState>,
 }
 
+fn test_executor(
+    helper: Arc<dyn HelperPolicyTransport>,
+) -> Result<HelperBackedPolicyExecutor, HelperBackedPolicyExecutorError> {
+    HelperBackedPolicyExecutor::with_dns_route_verifier(helper, |_| Ok(()))
+}
+
 impl FakeHelper {
     fn new() -> Self {
         let (root, principal) = authority();
@@ -783,7 +789,13 @@ fn resume_rejects_same_generation_with_a_different_projection_digest() {
 #[test]
 fn full_policy_sequence_uses_authenticated_observation_at_every_effect_boundary() {
     let helper = Arc::new(FakeHelper::new());
-    let executor = HelperBackedPolicyExecutor::new(helper.clone()).unwrap();
+    let route_verifications = Arc::new(Mutex::new(0_u8));
+    let observed_route_verifications = Arc::clone(&route_verifications);
+    let executor = HelperBackedPolicyExecutor::with_dns_route_verifier(helper.clone(), move |_| {
+        *observed_route_verifications.lock().unwrap() += 1;
+        Ok(())
+    })
+    .unwrap();
     let policy = policy(false);
 
     for barrier in PolicyBarrier::ORDERED {
@@ -791,6 +803,7 @@ fn full_policy_sequence_uses_authenticated_observation_at_every_effect_boundary(
     }
 
     assert!(executor.verification(&policy).is_some());
+    assert_eq!(*route_verifications.lock().unwrap(), 2);
     assert_eq!(
         helper
             .operations()
@@ -847,7 +860,7 @@ fn full_policy_sequence_uses_authenticated_observation_at_every_effect_boundary(
 #[test]
 fn effective_publication_reaudits_every_policy_family_and_live_tunnel() {
     let helper = Arc::new(FakeHelper::new());
-    let executor = HelperBackedPolicyExecutor::new(helper.clone()).unwrap();
+    let executor = test_executor(helper.clone()).unwrap();
     let policy = policy(false);
     for barrier in PolicyBarrier::ORDERED {
         executor.apply(&policy, barrier).unwrap();
@@ -881,7 +894,7 @@ fn effective_publication_reaudits_every_policy_family_and_live_tunnel() {
 
 #[test]
 fn forward_plan_is_reused_for_each_barrier_of_the_same_policy() {
-    let executor = HelperBackedPolicyExecutor::new(Arc::new(FakeHelper::new())).unwrap();
+    let executor = test_executor(Arc::new(FakeHelper::new())).unwrap();
     let policy = policy(false);
     executor.update_readback(&policy, |_| {});
 
@@ -901,7 +914,7 @@ fn forward_plan_is_reused_for_each_barrier_of_the_same_policy() {
 fn tunnel_barrier_requires_a_live_authenticated_managed_observation() {
     let helper = Arc::new(FakeHelper::new());
     helper.observe_tunnels_as(ObservationState::Absent);
-    let executor = HelperBackedPolicyExecutor::new(helper).unwrap();
+    let executor = test_executor(helper).unwrap();
     let policy = policy(false);
 
     let error = executor.apply(&policy, PolicyBarrier::Tunnel).unwrap_err();
@@ -914,7 +927,7 @@ fn tunnel_barrier_requires_a_live_authenticated_managed_observation() {
 fn tunnel_barrier_live_checks_removed_tunnels_after_owned_teardown() {
     let helper = Arc::new(FakeHelper::new());
     helper.observe_tunnels_as(ObservationState::Absent);
-    let executor = HelperBackedPolicyExecutor::new(helper.clone()).unwrap();
+    let executor = test_executor(helper.clone()).unwrap();
     let profile = profile();
     let mut policy = policy(false);
     policy.prior = state(&profile, KillSwitchMode::Auto);
@@ -936,7 +949,7 @@ fn tunnel_barrier_live_checks_removed_tunnels_after_owned_teardown() {
 fn tunnel_barrier_uses_exact_openvpn_tunnel_and_process_group_identity() {
     let helper = Arc::new(FakeHelper::new());
     helper.observe_tunnels_as(ObservationState::Absent);
-    let executor = HelperBackedPolicyExecutor::new(helper.clone()).unwrap();
+    let executor = test_executor(helper.clone()).unwrap();
     let profile = profile();
     let mut policy = policy(false);
     policy.prior = state(&profile, KillSwitchMode::Auto);
@@ -972,7 +985,7 @@ fn tunnel_barrier_uses_exact_openvpn_tunnel_and_process_group_identity() {
 #[test]
 fn tunnel_barrier_reads_back_live_openvpn_as_a_closed_resource_set() {
     let helper = Arc::new(FakeHelper::new());
-    let executor = HelperBackedPolicyExecutor::new(helper.clone()).unwrap();
+    let executor = test_executor(helper.clone()).unwrap();
     let profile = profile();
     let mut policy = policy(false);
     policy
@@ -1007,7 +1020,7 @@ fn tunnel_barrier_reads_back_live_openvpn_as_a_closed_resource_set() {
 #[test]
 fn tunnel_barrier_rejects_changed_openvpn_route_evidence() {
     let helper = Arc::new(FakeHelper::new());
-    let executor = HelperBackedPolicyExecutor::new(helper).unwrap();
+    let executor = test_executor(helper).unwrap();
     let profile = profile();
     let mut policy = policy(false);
     policy
@@ -1041,7 +1054,7 @@ fn tunnel_barrier_rejects_changed_openvpn_route_evidence() {
 fn ambiguous_mutation_reconnects_to_inventory_without_replaying_the_effect() {
     let helper = Arc::new(FakeHelper::new());
     helper.lose_after_first_mutation();
-    let executor = HelperBackedPolicyExecutor::new(helper.clone()).unwrap();
+    let executor = test_executor(helper.clone()).unwrap();
     let policy = policy(false);
 
     executor.apply(&policy, PolicyBarrier::Blocking).unwrap();
@@ -1074,7 +1087,7 @@ fn ambiguous_mutation_reconnects_to_inventory_without_replaying_the_effect() {
 #[test]
 fn final_firewall_recovery_accepts_the_authenticated_prior_effective_projection() {
     let helper = Arc::new(FakeHelper::new());
-    let executor = HelperBackedPolicyExecutor::new(helper.clone()).unwrap();
+    let executor = test_executor(helper.clone()).unwrap();
     let policy = policy(false);
     for barrier in [
         PolicyBarrier::Blocking,
@@ -1108,11 +1121,11 @@ fn final_firewall_recovery_accepts_the_authenticated_prior_effective_projection(
 #[test]
 fn restarted_executor_resumes_from_authenticated_policy_inventory() {
     let helper = Arc::new(FakeHelper::new());
-    let first = HelperBackedPolicyExecutor::new(helper.clone()).unwrap();
+    let first = test_executor(helper.clone()).unwrap();
     let policy = policy(false);
     first.apply(&policy, PolicyBarrier::Blocking).unwrap();
 
-    let restarted = HelperBackedPolicyExecutor::new(helper.clone()).unwrap();
+    let restarted = test_executor(helper.clone()).unwrap();
     for barrier in [
         PolicyBarrier::Tunnel,
         PolicyBarrier::Route,
@@ -1142,7 +1155,7 @@ fn restarted_executor_resumes_from_authenticated_policy_inventory() {
 #[test]
 fn restarted_route_barrier_observes_pending_effect_without_replaying_mutation() {
     let helper = Arc::new(FakeHelper::new());
-    let first = HelperBackedPolicyExecutor::new(helper.clone()).unwrap();
+    let first = test_executor(helper.clone()).unwrap();
     let policy = policy(false);
     first.apply(&policy, PolicyBarrier::Blocking).unwrap();
 
@@ -1155,7 +1168,7 @@ fn restarted_route_barrier_observes_pending_effect_without_replaying_mutation() 
         .unwrap()
         .apply_mutation(&plan.routes_operation(predecessor));
 
-    let restarted = HelperBackedPolicyExecutor::new(helper.clone()).unwrap();
+    let restarted = test_executor(helper.clone()).unwrap();
     restarted.apply(&policy, PolicyBarrier::Route).unwrap();
     let after_first = helper.operations();
     restarted.apply(&policy, PolicyBarrier::Route).unwrap();
@@ -1190,7 +1203,7 @@ fn restarted_route_barrier_observes_pending_effect_without_replaying_mutation() 
 #[test]
 fn restarted_dns_barriers_resume_pending_effect_without_replaying_mutation() {
     let helper = Arc::new(FakeHelper::new());
-    let first = HelperBackedPolicyExecutor::new(helper.clone()).unwrap();
+    let first = test_executor(helper.clone()).unwrap();
     let policy = policy(false);
     first.apply(&policy, PolicyBarrier::Blocking).unwrap();
     first.apply(&policy, PolicyBarrier::Route).unwrap();
@@ -1204,7 +1217,7 @@ fn restarted_dns_barriers_resume_pending_effect_without_replaying_mutation() {
         .unwrap()
         .apply_mutation(&plan.dns_operation(predecessor));
 
-    let restarted = HelperBackedPolicyExecutor::new(helper.clone()).unwrap();
+    let restarted = test_executor(helper.clone()).unwrap();
     restarted.apply(&policy, PolicyBarrier::Dns).unwrap();
     restarted
         .apply(&policy, PolicyBarrier::Observation)
@@ -1239,7 +1252,7 @@ fn restarted_dns_barriers_resume_pending_effect_without_replaying_mutation() {
 #[test]
 fn next_generation_releases_only_exact_older_policy_resources() {
     let helper = Arc::new(FakeHelper::new());
-    let executor = HelperBackedPolicyExecutor::new(helper.clone()).unwrap();
+    let executor = test_executor(helper.clone()).unwrap();
     let first = policy(false);
     for barrier in PolicyBarrier::ORDERED {
         executor.apply(&first, barrier).unwrap();
@@ -1279,7 +1292,7 @@ fn next_generation_releases_only_exact_older_policy_resources() {
 #[test]
 fn compensation_uses_a_distinct_generation_and_is_idempotently_resumable() {
     let helper = Arc::new(FakeHelper::new());
-    let executor = HelperBackedPolicyExecutor::new(helper.clone()).unwrap();
+    let executor = test_executor(helper.clone()).unwrap();
     let policy = policy(true);
     for barrier in PolicyBarrier::ORDERED {
         executor.apply(&policy, barrier).unwrap();
@@ -1316,7 +1329,7 @@ fn compensation_uses_a_distinct_generation_and_is_idempotently_resumable() {
 #[test]
 fn compensation_settles_an_unobserved_forward_generation_before_restoring() {
     let helper = Arc::new(FakeHelper::new());
-    let executor = HelperBackedPolicyExecutor::new(helper.clone()).unwrap();
+    let executor = test_executor(helper.clone()).unwrap();
     let policy = policy(true);
     let forward = HelperPolicyPlan::forward(&policy).unwrap();
     helper
@@ -1349,7 +1362,7 @@ fn compensation_settles_an_unobserved_forward_generation_before_restoring() {
 #[test]
 fn reconnect_verifies_the_superseded_tunnel_revision_is_absent() {
     let helper = Arc::new(FakeHelper::new());
-    let executor = HelperBackedPolicyExecutor::new(helper.clone()).unwrap();
+    let executor = test_executor(helper.clone()).unwrap();
     let policy = policy(true);
 
     executor.apply(&policy, PolicyBarrier::Tunnel).unwrap();
@@ -1364,7 +1377,7 @@ fn reconnect_verifies_the_superseded_tunnel_revision_is_absent() {
 #[test]
 fn final_publication_rejects_fresh_policy_readback_drift() {
     let helper = Arc::new(FakeHelper::new());
-    let executor = HelperBackedPolicyExecutor::new(helper.clone()).unwrap();
+    let executor = test_executor(helper.clone()).unwrap();
     let policy = policy(false);
     for barrier in [
         PolicyBarrier::Blocking,
@@ -1386,7 +1399,7 @@ fn final_publication_rejects_fresh_policy_readback_drift() {
 #[test]
 fn ambiguous_release_accepts_only_inventory_proven_absence_without_replay() {
     let helper = Arc::new(FakeHelper::new());
-    let executor = HelperBackedPolicyExecutor::new(helper.clone()).unwrap();
+    let executor = test_executor(helper.clone()).unwrap();
     let first = policy(false);
     for barrier in PolicyBarrier::ORDERED {
         executor.apply(&first, barrier).unwrap();
@@ -1430,7 +1443,7 @@ fn ambiguous_release_accepts_only_inventory_proven_absence_without_replay() {
 #[test]
 fn pending_release_retries_with_the_authenticated_released_cursor() {
     let helper = Arc::new(FakeHelper::new());
-    let executor = HelperBackedPolicyExecutor::new(helper.clone()).unwrap();
+    let executor = test_executor(helper.clone()).unwrap();
     let first = policy(false);
     for barrier in PolicyBarrier::ORDERED {
         executor.apply(&first, barrier).unwrap();

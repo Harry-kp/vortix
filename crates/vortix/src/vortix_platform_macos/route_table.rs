@@ -67,10 +67,9 @@ impl RouteTable for MacRouteTable {
     }
 
     fn route_interface_for(target: IpAddr) -> DefaultRouteObservation {
-        let spec =
-            CommandSpec::oneshot("route", vec!["-n".into(), "get".into(), target.to_string()])
-                .timeout(ROUTE_QUERY_TIMEOUT)
-                .output_limit(64 * 1024);
+        let spec = CommandSpec::oneshot("route", route_get_args(target))
+            .timeout(ROUTE_QUERY_TIMEOUT)
+            .output_limit(64 * 1024);
         let Ok(output) = crate::vortix_process::run_to_output(spec) else {
             return DefaultRouteObservation::ProbeFailed;
         };
@@ -83,6 +82,11 @@ impl RouteTable for MacRouteTable {
             DefaultRouteObservation::Interface,
         )
     }
+}
+
+pub(crate) fn route_get_args(target: IpAddr) -> Vec<String> {
+    let family = if target.is_ipv4() { "-inet" } else { "-inet6" };
+    vec!["-n".into(), "get".into(), family.into(), target.to_string()]
 }
 
 /// Run `route -n get <ROUTE_PROBE_TARGET>` and return its stdout as
@@ -210,5 +214,17 @@ destination: default
     fn parse_gateway_still_works_on_sample() {
         assert_eq!(parse_gateway(SAMPLE_WIFI), Some("192.168.1.1".into()));
         assert_eq!(parse_gateway(SAMPLE_VPN), Some("10.0.0.1".into()));
+    }
+
+    #[test]
+    fn route_lookup_selects_the_explicit_address_family() {
+        assert_eq!(
+            route_get_args("1.1.1.1".parse().unwrap()),
+            ["-n", "get", "-inet", "1.1.1.1"]
+        );
+        assert_eq!(
+            route_get_args("2606:4700:4700::1111".parse().unwrap()),
+            ["-n", "get", "-inet6", "2606:4700:4700::1111"]
+        );
     }
 }

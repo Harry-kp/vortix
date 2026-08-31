@@ -226,6 +226,7 @@ async fn same_boot_unexpected_recovery_reconstructs_preblock_before_reconnect() 
         },
         status: OperationStatus::WaitingForObservation,
         result: None,
+        failure_detail: None,
     };
     let store = Arc::new(RecordingStore {
         state: Mutex::new(Some(DurableControlState {
@@ -761,6 +762,102 @@ async fn same_boot_restart_scans_before_resuming_one_nonterminal_operation() {
 }
 
 #[tokio::test]
+async fn admitted_connect_does_not_wait_for_deadline_when_dispatch_stops() {
+    let profile_id = ProfileId::new("dispatch-stopped-connect");
+    let save_entered = Arc::new(AtomicBool::new(false));
+    let store = Arc::new(SlowStore {
+        entered: save_entered.clone(),
+    });
+    let supervisor = Arc::new(Supervisor::new(
+        AuthorityEpoch(17),
+        Arc::new(CountingExecutor(Arc::new(AtomicUsize::new(0)))),
+        Arc::new(OkPolicy),
+        1,
+        4,
+    ));
+    let service = ControlService::start_supervised(
+        ControlServiceConfig {
+            authority_epoch: AuthorityEpoch(17),
+            known_profiles: BTreeSet::from([profile_id.clone()]),
+            profile_topologies: topology_catalog(&profile_id),
+            persistence: Some(ControlPersistenceConfig::new("boot-a", store)),
+            freshness_poll_interval: Duration::from_millis(5),
+            ..ControlServiceConfig::default()
+        },
+        Arc::new(vortix::vortix_core::control::RealClock),
+        ExecutionSelection::CanonicalAuthority,
+        supervisor.clone(),
+    );
+    service
+        .observer()
+        .observe(Observation::Tunnel {
+            profile_id: profile_id.clone(),
+            active: false,
+            interface_name: None,
+            observed_at_millis: service.observer().now_millis(),
+            protection: None,
+        })
+        .await
+        .unwrap();
+    service
+        .completer()
+        .set_readiness(AuthorityEpoch(17), true, true)
+        .await
+        .unwrap();
+    save_entered.store(false, Ordering::Release);
+
+    let client = service.client();
+    let submit = tokio::spawn(async move {
+        client
+            .submit(CommandRequest {
+                command: UserCommand::Connect {
+                    profile_id,
+                    conflict_acknowledgement: None,
+                },
+                idempotency_key: IdempotencyKey::new("dispatch-stopped-connect"),
+                deadline: client.deadline_after(Duration::from_secs(10)),
+            })
+            .await
+    });
+    let save_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while !save_entered.load(Ordering::Acquire) {
+        assert!(
+            tokio::time::Instant::now() < save_deadline,
+            "connect intent was not persisted before dispatch"
+        );
+        tokio::task::yield_now().await;
+    }
+    supervisor.shutdown();
+
+    let admitted = submit.await.unwrap().unwrap();
+    let terminal_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        let operation = service
+            .client()
+            .snapshot()
+            .operations
+            .get(&admitted.operation_id)
+            .cloned()
+            .expect("admitted operation remains retained");
+        if operation.status.is_terminal() {
+            assert_eq!(operation.status, OperationStatus::Failed);
+            assert_eq!(
+                operation.result,
+                Some(vortix::vortix_core::control::OperationResult::Failed(
+                    OperationFailure::Internal,
+                ))
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < terminal_deadline,
+            "dispatch failure left the admitted connect waiting for its deadline"
+        );
+        tokio::task::yield_now().await;
+    }
+}
+
+#[tokio::test]
 async fn completed_restarted_disconnect_releases_profile_for_deletion() {
     let store = Arc::new(RecordingStore::default());
     let profile_id = ProfileId::new("restart-disconnect-release");
@@ -794,6 +891,7 @@ async fn completed_restarted_disconnect_releases_profile_for_deletion() {
                 },
                 status: OperationStatus::WaitingForObservation,
                 result: None,
+                failure_detail: None,
             },
         )]),
         boot_connections: BTreeMap::new(),

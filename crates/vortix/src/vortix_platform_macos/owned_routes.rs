@@ -35,10 +35,10 @@ impl OwnedRoutes for MacOsOwnedRoutes {
     }
 
     fn route_interface_for(&mut self, target: IpAddr) -> Result<String, OwnedRouteError> {
-        let target = target.to_string();
-        let output =
-            fixed_root_command::run(ROUTE_CANDIDATES, &["-n", "get", target.as_str()], None, 0)
-                .map_err(|_| OwnedRouteError::Unknown)?;
+        let arguments = super::route_table::route_get_args(target);
+        let borrowed = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+        let output = fixed_root_command::run(ROUTE_CANDIDATES, &borrowed, None, 0)
+            .map_err(|_| OwnedRouteError::Unknown)?;
         if !output.status.success() {
             return Err(OwnedRouteError::Unknown);
         }
@@ -117,14 +117,10 @@ impl OwnedRoutes for MacOsOwnedRoutes {
     }
 
     fn resolve_transport_bypass(&mut self, target: IpAddr) -> Result<RouteEntry, OwnedRouteError> {
-        let target_text = target.to_string();
-        let output = fixed_root_command::run(
-            ROUTE_CANDIDATES,
-            &["-n", "get", target_text.as_str()],
-            None,
-            0,
-        )
-        .map_err(|_| OwnedRouteError::Unknown)?;
+        let arguments = super::route_table::route_get_args(target);
+        let borrowed = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+        let output = fixed_root_command::run(ROUTE_CANDIDATES, &borrowed, None, 0)
+            .map_err(|_| OwnedRouteError::Unknown)?;
         if !output.status.success() {
             return Err(OwnedRouteError::Unknown);
         }

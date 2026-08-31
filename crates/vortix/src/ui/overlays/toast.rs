@@ -8,35 +8,42 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph},
     Frame,
 };
+use unicode_width::UnicodeWidthStr;
+
+fn toast_geometry(area: Rect, message: &str) -> Option<(Rect, u16)> {
+    if area.width < 6 || area.height < 5 {
+        return None;
+    }
+    let width = (area.width / 3)
+        .clamp(28, 50)
+        .min(area.width.saturating_sub(2));
+    let inner_width = usize::from(width.saturating_sub(4)).max(1);
+    let estimated_lines = message.lines().fold(0usize, |total, line| {
+        total.saturating_add(line.width().max(1).div_ceil(inner_width))
+    });
+    let estimated_lines = u16::try_from(estimated_lines).unwrap_or(u16::MAX).max(1);
+    let height = estimated_lines
+        .saturating_add(4)
+        .max(5)
+        .min(area.height.saturating_sub(2));
+    let text_lines = estimated_lines.min(height.saturating_sub(2));
+    Some((
+        Rect {
+            x: area.width.saturating_sub(width + 1),
+            y: 1,
+            width,
+            height,
+        },
+        text_lines,
+    ))
+}
 
 /// Render toast notification (anchored to top-right corner)
 pub fn render(frame: &mut Frame, app: &App) {
     if let Some(ref toast) = app.toast {
         let area = frame.area();
-        let width = (area.width / 3)
-            .clamp(28, 50)
-            .min(area.width.saturating_sub(2));
-
-        let inner_width = width.saturating_sub(4) as usize;
-        let text_len = toast.message.len();
-        #[allow(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            clippy::cast_precision_loss
-        )]
-        let text_lines = if inner_width > 0 {
-            (text_len as f64 / inner_width as f64).ceil() as u16
-        } else {
-            1
-        };
-
-        let height = (text_lines + 4).max(5);
-
-        let toast_area = Rect {
-            x: area.width.saturating_sub(width + 1),
-            y: 1,
-            width,
-            height,
+        let Some((toast_area, text_lines)) = toast_geometry(area, &toast.message) else {
+            return;
         };
 
         frame.render_widget(Clear, toast_area);
@@ -79,5 +86,24 @@ pub fn render(frame: &mut Frame, app: &App) {
             .alignment(Alignment::Center);
 
         frame.render_widget(paragraph, vertical_chunks[1]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn long_toast_never_exceeds_the_terminal() {
+        let area = Rect::new(0, 0, 80, 12);
+        let (toast, text_lines) = toast_geometry(area, &"DNS failure ".repeat(80)).unwrap();
+        assert!(toast.right() <= area.right());
+        assert!(toast.bottom() <= area.bottom());
+        assert!(text_lines <= toast.height.saturating_sub(2));
+    }
+
+    #[test]
+    fn tiny_terminal_suppresses_an_unreadable_toast() {
+        assert!(toast_geometry(Rect::new(0, 0, 5, 4), "error").is_none());
     }
 }
