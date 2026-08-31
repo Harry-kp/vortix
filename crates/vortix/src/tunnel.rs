@@ -153,6 +153,7 @@ pub struct CanonicalTunnelSettings {
 type CanonicalProfileResolver = dyn Fn(&ProfileId) -> Option<Profile> + Send + Sync;
 type CanonicalSessionResolver =
     dyn Fn(&ProfileId) -> Option<crate::core::scanner::ActiveSession> + Send + Sync;
+type CanonicalOwnedLifecycleObserver = dyn Fn(&ProfileId, bool) + Send + Sync;
 
 pub(crate) struct StandardOpenVpnOwner {
     custody: crate::vortix_process::CustodianHandshake,
@@ -211,6 +212,7 @@ pub struct CanonicalTunnelExecutor {
     standard_ownership:
         Option<Arc<crate::core::standard_tunnel_ownership::StandardTunnelOwnershipStore>>,
     sessions: Option<Arc<CanonicalSessionResolver>>,
+    owned_lifecycle_observer: Option<Arc<CanonicalOwnedLifecycleObserver>>,
     remembered_openvpn_credentials: Option<Arc<RememberedOpenVpnCredentialResolver>>,
     challenge_issuer: Mutex<Option<std::sync::Weak<crate::vortix_core::control::CompleterHandle>>>,
 }
@@ -227,6 +229,7 @@ impl CanonicalTunnelExecutor {
             active: Mutex::new(BTreeMap::new()),
             standard_ownership: None,
             sessions: None,
+            owned_lifecycle_observer: None,
             remembered_openvpn_credentials: None,
             challenge_issuer: Mutex::new(None),
         }
@@ -250,8 +253,27 @@ impl CanonicalTunnelExecutor {
             active: Mutex::new(BTreeMap::new()),
             standard_ownership: Some(ownership),
             sessions: Some(Arc::new(sessions)),
+            owned_lifecycle_observer: None,
             remembered_openvpn_credentials: None,
             challenge_issuer: Mutex::new(None),
+        }
+    }
+
+    /// Observe exact changes to the executor-owned live-tunnel ledger. The
+    /// Standard-mode scanner uses this boundary to invalidate snapshots that
+    /// began before a protocol-owned connect or teardown completed.
+    #[must_use]
+    pub(crate) fn with_owned_lifecycle_observer(
+        mut self,
+        observer: impl Fn(&ProfileId, bool) + Send + Sync + 'static,
+    ) -> Self {
+        self.owned_lifecycle_observer = Some(Arc::new(observer));
+        self
+    }
+
+    fn notify_owned_lifecycle(&self, profile_id: &ProfileId, active: bool) {
+        if let Some(observer) = &self.owned_lifecycle_observer {
+            observer(profile_id, active);
         }
     }
 
@@ -611,6 +633,7 @@ impl CanonicalTunnelExecutor {
             .lock()
             .map_err(|_| "canonical active-tunnel ledger poisoned".to_string())?
             .insert(work.profile_id.clone(), (tunnel, handle));
+        self.notify_owned_lifecycle(&work.profile_id, true);
         Ok(receipt)
     }
 
@@ -676,6 +699,7 @@ impl CanonicalTunnelExecutor {
                     )
                     .map_err(|error| error.to_string())?;
                 }
+                self.notify_owned_lifecycle(&work.profile_id, false);
                 return Ok(TunnelExecutionReceipt::default());
             };
             recovered
@@ -698,6 +722,7 @@ impl CanonicalTunnelExecutor {
                         .map_err(|error| error.to_string())?;
                     }
                 }
+                self.notify_owned_lifecycle(&work.profile_id, false);
                 Ok(TunnelExecutionReceipt::default())
             }
             Err(error) => {
@@ -970,7 +995,9 @@ impl crate::vortix_core::control::worker::TunnelExecutor for CanonicalTunnelExec
                 .insert(work.profile_id.clone(), (tunnel, handle));
             return Err("late completion did not own the active generation".into());
         }
-        tunnel.down(handle).map_err(|error| error.to_string())
+        tunnel.down(handle).map_err(|error| error.to_string())?;
+        self.notify_owned_lifecycle(&work.profile_id, false);
+        Ok(())
     }
 
     fn compensate_uncertain(
@@ -1287,6 +1314,8 @@ mod canonical_tests {
         );
         let resolver_calls = Arc::new(AtomicUsize::new(0));
         let calls = Arc::clone(&resolver_calls);
+        let lifecycle_changes = Arc::new(Mutex::new(Vec::new()));
+        let recorded_changes = Arc::clone(&lifecycle_changes);
         let executor = CanonicalTunnelExecutor::new_standard(
             CanonicalTunnelSettings {
                 config_dir: temp.path().to_path_buf(),
@@ -1306,7 +1335,13 @@ mod canonical_tests {
                     ..crate::core::scanner::ActiveSession::default()
                 })
             },
-        );
+        )
+        .with_owned_lifecycle_observer(move |profile_id, active| {
+            recorded_changes
+                .lock()
+                .unwrap()
+                .push((profile_id.clone(), active));
+        });
         executor.active.lock().unwrap().insert(
             ProfileId::new("corp"),
             (TunnelKind::Mock(MockTunnel::new()), handle(7)),
@@ -1320,6 +1355,11 @@ mod canonical_tests {
             resolver_calls.load(Ordering::SeqCst),
             0,
             "a successful protocol-owned teardown is exact absence evidence"
+        );
+        assert_eq!(
+            *lifecycle_changes.lock().unwrap(),
+            vec![(ProfileId::new("corp"), false)],
+            "the exact teardown must invalidate scanner state before policy verification"
         );
     }
 

@@ -1596,6 +1596,7 @@ pub struct LocalControlSession {
     owned_active_profiles: std::collections::BTreeSet<ProfileId>,
     unowned_active_profiles: Vec<String>,
     sessions: Arc<Mutex<Vec<ActiveSession>>>,
+    scanner_lifecycle_revision: Arc<AtomicU64>,
     published_observations: RefCell<BTreeMap<ProfileId, (bool, Option<String>)>>,
     published_default_route:
         RefCell<crate::vortix_core::ports::route_table::DefaultRouteObservation>,
@@ -1604,14 +1605,15 @@ pub struct LocalControlSession {
     tui_admission: TuiAdmissionQueue,
     last_catalog_revision: Cell<u64>,
     reported_profile_operations: RefCell<std::collections::BTreeSet<OperationId>>,
-    pending_scan: RefCell<
-        Option<(
-            u64,
-            u64,
-            tokio::task::JoinHandle<crate::core::scanner::ScannerResult>,
-        )>,
-    >,
+    pending_scan: RefCell<Option<PendingScanner>>,
     last_scan_started: Cell<Instant>,
+}
+
+struct PendingScanner {
+    catalog_revision: u64,
+    lifecycle_revision: u64,
+    observed_at_millis: u64,
+    task: tokio::task::JoinHandle<crate::core::scanner::ScannerResult>,
 }
 
 /// Lightweight Standard-mode authority for profile catalog mutations. It
@@ -1896,6 +1898,7 @@ impl LocalControlSession {
             owned_active_profiles: std::collections::BTreeSet::new(),
             unowned_active_profiles: Vec::new(),
             sessions: Arc::new(Mutex::new(Vec::new())),
+            scanner_lifecycle_revision: Arc::new(AtomicU64::new(0)),
             published_observations: RefCell::new(BTreeMap::new()),
             published_default_route: RefCell::new(
                 crate::vortix_core::ports::route_table::DefaultRouteObservation::ProbeFailed,
@@ -1951,6 +1954,7 @@ impl LocalControlSession {
         }
         let initial_sessions = initial_scan.sessions.clone();
         let sessions = Arc::new(Mutex::new(initial_sessions.clone()));
+        let scanner_lifecycle_revision = Arc::new(AtomicU64::new(0));
 
         let cache_bytes = state_store
             .endpoint_resolution_cache()
@@ -1991,6 +1995,9 @@ impl LocalControlSession {
             current_session(&profile, &executor_sessions)
         };
         let executor_credential_store = Arc::clone(&openvpn_credentials);
+        let lifecycle_catalog = Arc::clone(&profile_mutations);
+        let lifecycle_sessions = Arc::clone(&sessions);
+        let lifecycle_revision = Arc::clone(&scanner_lifecycle_revision);
         let executor = Arc::new(
             CanonicalTunnelExecutor::new_standard(
                 CanonicalTunnelSettings {
@@ -2004,6 +2011,19 @@ impl LocalControlSession {
                 Arc::clone(&ownership),
                 session_resolver,
             )
+            .with_owned_lifecycle_observer(move |profile_id, active| {
+                let disconnected_name = (!active)
+                    .then(|| lifecycle_catalog.profile_snapshot(profile_id))
+                    .flatten()
+                    .map(|profile| profile.name);
+                let mut sessions = lifecycle_sessions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                lifecycle_revision.fetch_add(1, Ordering::SeqCst);
+                if let Some(name) = disconnected_name {
+                    sessions.retain(|session| session.name != name);
+                }
+            })
             .with_remembered_openvpn_credentials(
                 move |profile_id, legacy_display_name| {
                     let store = executor_credential_store.lock().map_err(|_| {
@@ -2031,6 +2051,7 @@ impl LocalControlSession {
         let policy_profiles = Arc::clone(&profiles);
         let policy_catalog = Arc::clone(&profile_mutations);
         let policy_sessions = Arc::clone(&sessions);
+        let policy_executor = Arc::clone(&executor);
         let external_catalog = Arc::clone(&profile_mutations);
         let external_ownership = Arc::clone(&ownership);
         let external_sessions = Arc::clone(&sessions);
@@ -2046,7 +2067,7 @@ impl LocalControlSession {
             config_dir.to_path_buf(),
             move |profile_id| {
                 let profile = policy_catalog.profile_snapshot(profile_id)?;
-                current_session(&profile, &policy_sessions)
+                current_owned_session(&profile, &policy_sessions, &policy_executor)
             },
             move || {
                 let sessions = external_sessions
@@ -2133,6 +2154,7 @@ impl LocalControlSession {
             owned_active_profiles,
             unowned_active_profiles,
             sessions,
+            scanner_lifecycle_revision,
             published_observations: RefCell::new(BTreeMap::new()),
             published_default_route: RefCell::new(
                 crate::vortix_core::ports::route_table::DefaultRouteObservation::ProbeFailed,
@@ -2301,19 +2323,21 @@ impl LocalControlSession {
     pub fn progress(&self) -> Result<(), LocalControlError> {
         let completed = {
             let pending = self.pending_scan.borrow();
-            pending
-                .as_ref()
-                .is_some_and(|(_, _, scan)| scan.is_finished())
+            pending.as_ref().is_some_and(|scan| scan.task.is_finished())
         }
         .then(|| self.pending_scan.borrow_mut().take())
         .flatten();
-        if let Some((catalog_revision, observed_at_millis, completed)) = completed {
-            let scan = self.runtime().block_on(completed).map_err(|error| {
+        if let Some(completed) = completed {
+            let scan = self.runtime().block_on(completed.task).map_err(|error| {
                 LocalControlError::Observation(format!("scanner worker did not complete: {error}"))
             })?;
-            if catalog_revision == self.profile_mutations.catalog_revision() {
+            if completed.catalog_revision == self.profile_mutations.catalog_revision() {
                 self.runtime()
-                    .block_on(self.publish_observations_from(scan, observed_at_millis))?;
+                    .block_on(self.publish_observations_from_revision(
+                        scan,
+                        completed.observed_at_millis,
+                        Some(completed.lifecycle_revision),
+                    ))?;
             }
         }
 
@@ -2327,11 +2351,12 @@ impl LocalControlSession {
                 .runtime()
                 .handle()
                 .spawn_blocking(move || crate::core::scanner::gather_system_state(&profiles));
-            self.pending_scan.replace(Some((
-                self.profile_mutations.catalog_revision(),
+            self.pending_scan.replace(Some(PendingScanner {
+                catalog_revision: self.profile_mutations.catalog_revision(),
+                lifecycle_revision: self.scanner_lifecycle_revision.load(Ordering::SeqCst),
                 observed_at_millis,
-                scan,
-            )));
+                task: scan,
+            }));
             self.last_scan_started.set(now);
         }
         self.runtime().block_on(tokio::task::yield_now());
@@ -2678,6 +2703,16 @@ impl LocalControlSession {
         scan: crate::core::scanner::ScannerResult,
         observed_at_millis: u64,
     ) -> Result<(), LocalControlError> {
+        self.publish_observations_from_revision(scan, observed_at_millis, None)
+            .await
+    }
+
+    async fn publish_observations_from_revision(
+        &self,
+        scan: crate::core::scanner::ScannerResult,
+        observed_at_millis: u64,
+        expected_lifecycle_revision: Option<u64>,
+    ) -> Result<(), LocalControlError> {
         if !scan.tunnel_observation_complete {
             return Err(LocalControlError::Observation(
                 "tunnel observation failed; preserving the last verified tunnel state".into(),
@@ -2685,10 +2720,9 @@ impl LocalControlSession {
         }
         let sessions = scan.sessions;
         let profiles = self.profile_mutations.profiles_snapshot();
-        self.sessions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone_from(&sessions);
+        if !self.accept_scanner_sessions(&sessions, expected_lifecycle_revision) {
+            return Ok(());
+        }
         let observer = self.service().observer();
         let default_route = scan.default_route;
         let default_route_changed = !matches!(
@@ -2775,6 +2809,25 @@ impl LocalControlSession {
             .borrow_mut()
             .retain(|profile_id, _| profile_ids.contains(profile_id));
         Ok(())
+    }
+
+    fn accept_scanner_sessions(
+        &self,
+        sessions: &[ActiveSession],
+        expected_lifecycle_revision: Option<u64>,
+    ) -> bool {
+        let mut current = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if expected_lifecycle_revision.is_some_and(|expected| {
+            self.scanner_lifecycle_revision.load(Ordering::SeqCst) != expected
+        }) {
+            return false;
+        }
+        current.clear();
+        current.extend_from_slice(sessions);
+        true
     }
 }
 
@@ -2950,6 +3003,19 @@ fn current_session(
         .iter()
         .find(|session| session.name == profile.name)
         .cloned()
+}
+
+fn current_owned_session(
+    profile: &VpnProfile,
+    sessions: &Mutex<Vec<ActiveSession>>,
+    executor: &CanonicalTunnelExecutor,
+) -> Option<ActiveSession> {
+    let session = current_session(profile, sessions)?;
+    executor
+        .owns_live_session(&profile.id, &session)
+        .ok()
+        .filter(|owned| *owned)
+        .map(|_| session)
 }
 
 fn external_session_profiles(
@@ -4153,10 +4219,14 @@ mod tests {
                 protection: None,
             }))
             .unwrap();
+        let scan_lifecycle_revision = session.scanner_lifecycle_revision.load(Ordering::SeqCst);
+        session
+            .scanner_lifecycle_revision
+            .fetch_add(1, Ordering::SeqCst);
 
-        let error = session
+        session
             .runtime()
-            .block_on(session.publish_observations_from(
+            .block_on(session.publish_observations_from_revision(
                 crate::core::scanner::ScannerResult {
                     sessions: vec![ActiveSession {
                         name: profile.name,
@@ -4168,16 +4238,48 @@ mod tests {
                     tunnel_observation_complete: true,
                 },
                 absence_at.saturating_sub(1),
+                Some(scan_lifecycle_revision),
             ))
-            .unwrap_err();
+            .unwrap();
 
-        assert!(matches!(error, LocalControlError::Observation(_)));
-        assert!(session
+        assert!(session.sessions.lock().unwrap().is_empty());
+        assert!(!session
             .current_snapshot()
             .observed
             .tunnels
             .get(&profile.id)
-            .is_some_and(|tunnel| !tunnel.active));
+            .is_some_and(|tunnel| tunnel.active));
+    }
+
+    #[test]
+    fn stale_scanner_session_is_not_policy_authority_after_owned_teardown() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = VpnProfile {
+            id: profile_id('d'),
+            name: "corp".into(),
+            protocol: Protocol::WireGuard,
+            location: String::new(),
+            config_path: temp.path().join("corp.conf"),
+            last_used: None,
+        };
+        let sessions = Mutex::new(vec![ActiveSession {
+            name: profile.name.clone(),
+            interface: "wg0".into(),
+            interface_authoritative: true,
+            ..ActiveSession::default()
+        }]);
+        let executor = CanonicalTunnelExecutor::new(
+            CanonicalTunnelSettings {
+                config_dir: temp.path().to_path_buf(),
+                openvpn_verbosity: "3".into(),
+                connect_timeout_secs: 1,
+                wireguard_handshake_timeout_secs: 1,
+                wireguard_health_targets: Vec::new(),
+            },
+            |_| None,
+        );
+
+        assert!(current_owned_session(&profile, &sessions, &executor).is_none());
     }
 
     #[test]
