@@ -6,6 +6,8 @@
 //! over to the `Platform` aggregate.
 
 pub mod aggregate;
+pub(crate) mod anonymous_material;
+pub(crate) mod fixed_root_command;
 pub(crate) mod route_probe;
 
 #[cfg(target_os = "linux")]
@@ -28,6 +30,10 @@ pub(crate) enum PlatformFamily {
     MacOs,
 }
 
+use crate::vortix_core::ports::owned_dns::OwnedDns;
+use crate::vortix_core::ports::owned_firewall::OwnedFirewall;
+use crate::vortix_core::ports::owned_routes::OwnedRoutes;
+
 #[cfg(target_os = "linux")]
 pub(crate) const fn current_platform_family() -> PlatformFamily {
     PlatformFamily::Linux
@@ -36,6 +42,39 @@ pub(crate) const fn current_platform_family() -> PlatformFamily {
 #[cfg(target_os = "macos")]
 pub(crate) const fn current_platform_family() -> PlatformFamily {
     PlatformFamily::MacOs
+}
+
+pub(crate) fn helper_owned_firewall() -> Box<dyn OwnedFirewall> {
+    #[cfg(target_os = "linux")]
+    {
+        Box::new(crate::vortix_platform_linux::owned_firewall::LinuxOwnedFirewall::new())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Box::new(crate::vortix_platform_macos::owned_firewall::MacOsOwnedFirewall::new())
+    }
+}
+
+pub(crate) fn helper_owned_dns() -> Box<dyn OwnedDns> {
+    #[cfg(target_os = "linux")]
+    {
+        Box::new(crate::vortix_platform_linux::owned_dns::LinuxOwnedDns::new())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Box::new(crate::vortix_platform_macos::dns::MacDnsPolicy::system())
+    }
+}
+
+pub(crate) fn helper_owned_routes() -> Box<dyn OwnedRoutes> {
+    #[cfg(target_os = "linux")]
+    {
+        Box::new(crate::vortix_platform_linux::owned_routes::LinuxOwnedRoutes)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Box::new(crate::vortix_platform_macos::owned_routes::MacOsOwnedRoutes)
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────────────

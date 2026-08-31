@@ -48,7 +48,12 @@ pub enum TunnelMutation {
 pub struct TunnelWork {
     pub profile_id: ProfileId,
     pub operation_id: OperationId,
+    /// Revision of the desired state this work is converging toward.
     pub revision: TunnelRevision,
+    /// Exact generation of the helper/protocol resource being affected.
+    /// Connect work creates this revision; teardown may target an older
+    /// generation while remaining fenced by the newer desired revision.
+    pub resource_revision: TunnelRevision,
     pub mutation: TunnelMutation,
     pub protocol: TunnelKindTag,
     pub deadline: Instant,
@@ -656,6 +661,14 @@ impl ProfileWorkerPool {
         if admission.profile_id != work.profile_id {
             return Err(WorkFailure::Stale);
         }
+        if work.resource_revision.authority_epoch != work.revision.authority_epoch {
+            return Err(WorkFailure::Stale);
+        }
+        if work.resource_revision.generation == 0
+            || (work.mutation == TunnelMutation::Connect && work.resource_revision != work.revision)
+        {
+            return Err(WorkFailure::EffectFailed);
+        }
         let cancellation = CancellationToken::default();
         let mut workers = self.workers.lock().expect("worker mutex poisoned");
         retire_idle(&mut workers, self.idle_timeout);
@@ -966,6 +979,8 @@ pub struct TopologyPolicy {
     pub deadline: Instant,
     pub prior: TopologyState,
     pub target: TopologyState,
+    /// Exact helper-owned identity of every managed tunnel in `prior`.
+    pub prior_tunnel_revisions: BTreeMap<ProfileId, TunnelRevision>,
     /// Expected identity of every managed tunnel in `target`.
     pub tunnel_revisions: BTreeMap<ProfileId, TunnelRevision>,
     pub transition: TopologyTransitionKind,
@@ -1002,7 +1017,7 @@ impl TopologyPolicy {
 
 pub trait PolicyExecutor: Send + Sync + 'static {
     fn apply(&self, policy: &TopologyPolicy, barrier: PolicyBarrier) -> Result<(), String>;
-    fn compensate(&self, policy: &TopologyPolicy, barrier: PolicyBarrier);
+    fn compensate(&self, policy: &TopologyPolicy, barrier: PolicyBarrier) -> Result<(), String>;
     fn apply_cancellable(
         &self,
         policy: &TopologyPolicy,
@@ -1016,8 +1031,8 @@ pub trait PolicyExecutor: Send + Sync + 'static {
         policy: &TopologyPolicy,
         barrier: PolicyBarrier,
         _cancellation: &CancellationToken,
-    ) {
-        self.compensate(policy, barrier);
+    ) -> Result<(), String> {
+        self.compensate(policy, barrier)
     }
 
     /// Return fresh platform read-back produced by the exact final policy.
@@ -1428,9 +1443,20 @@ fn run_policy_compensation(
 ) -> Result<(), WorkFailure> {
     let cancellation = CancellationToken::default();
     panic::catch_unwind(AssertUnwindSafe(|| {
-        executor.compensate_cancellable(policy, barrier, &cancellation);
+        executor.compensate_cancellable(policy, barrier, &cancellation)
     }))
-    .map_err(|_| WorkFailure::Panicked)
+    .map_err(|_| WorkFailure::Panicked)?
+    .map_err(|error| {
+        tracing::warn!(
+            target: "vortix::control::policy",
+            operation = %policy.operation_id,
+            generation = policy.generation,
+            ?barrier,
+            reason = %error,
+            "policy compensation failed"
+        );
+        WorkFailure::EffectFailed
+    })
 }
 
 /// Poll a bounded result without introducing a runtime-specific clock.

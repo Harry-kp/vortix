@@ -137,7 +137,7 @@ fn parse_gateway(text: &str) -> Option<String> {
 /// varies). We trim and look for the `interface:` prefix, then take the
 /// first whitespace-delimited token as the interface name. Returns `None`
 /// if no such line exists or the name is empty.
-fn parse_interface(text: &str) -> Option<String> {
+pub(crate) fn parse_interface(text: &str) -> Option<String> {
     for line in text.lines() {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("interface:") {

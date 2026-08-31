@@ -142,7 +142,9 @@ impl PolicyExecutor for OkPolicy {
         Ok(())
     }
 
-    fn compensate(&self, _policy: &TopologyPolicy, _barrier: PolicyBarrier) {}
+    fn compensate(&self, _policy: &TopologyPolicy, _barrier: PolicyBarrier) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -173,7 +175,9 @@ impl PolicyExecutor for RestartOrder {
         Ok(())
     }
 
-    fn compensate(&self, _policy: &TopologyPolicy, _barrier: PolicyBarrier) {}
+    fn compensate(&self, _policy: &TopologyPolicy, _barrier: PolicyBarrier) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 #[tokio::test]

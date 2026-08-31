@@ -122,6 +122,16 @@ fn fixed_layout_and_permissions_are_part_of_the_contract() {
         PlatformLayout::MacOs.helper_runtime_dir(),
         "/var/run/vortix"
     );
+    assert_eq!(
+        PlatformLayout::Linux.authority_lock(),
+        "/var/lib/vortix-public/authority.lock"
+    );
+    assert_eq!(
+        PlatformLayout::MacOs.authority_lock(),
+        "/Library/Application Support/Vortix/Public/authority.lock"
+    );
+    assert_eq!(PlatformLayout::Linux.authority_lock_dir_mode(), 0o755);
+    assert_eq!(PlatformLayout::MacOs.authority_lock_dir_mode(), 0o755);
     assert_eq!(manifest().generation(), 3);
 }
 
@@ -200,7 +210,7 @@ fn install_wire_rejects_unknown_fields_root_owner_and_replay_shape() {
 }
 
 #[test]
-fn staged_binary_has_no_serve_or_operation_entrypoint() {
+fn staged_binary_serves_only_when_root_enrollment_state_exists() {
     let helper = env!("CARGO_BIN_EXE_vortix-helper");
     let version = std::process::Command::new(helper) // xtask:allow-subprocess: black-box staged binary test
         .arg("--version")
@@ -209,11 +219,59 @@ fn staged_binary_has_no_serve_or_operation_entrypoint() {
     assert!(version.status.success());
     assert!(String::from_utf8_lossy(&version.stdout).contains("staged, unenrolled"));
 
-    for argument in ["--serve", "execute", "install"] {
+    let serve = std::process::Command::new(helper) // xtask:allow-subprocess: black-box staged binary test
+        .arg("--serve")
+        .output()
+        .unwrap();
+    assert_eq!(serve.status.code(), Some(78));
+    assert!(String::from_utf8_lossy(&serve.stderr).contains("refused service startup"));
+
+    for argument in ["execute", "install"] {
         let output = std::process::Command::new(helper) // xtask:allow-subprocess: black-box staged binary test
             .arg(argument)
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(78));
     }
+}
+
+#[test]
+fn package_bootstrap_exposes_only_version_and_bounded_stage_entrypoints() {
+    let bootstrap = env!("CARGO_BIN_EXE_vortix-bootstrap");
+    let version = std::process::Command::new(bootstrap) // xtask:allow-subprocess: black-box package bootstrap test
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(version.status.success());
+    assert!(String::from_utf8_lossy(&version.stdout).contains("vortix-bootstrap"));
+
+    let unknown = std::process::Command::new(bootstrap) // xtask:allow-subprocess: black-box package bootstrap test
+        .arg("execute")
+        .output()
+        .unwrap();
+    assert_eq!(unknown.status.code(), Some(64));
+
+    for forbidden in [&["reserve"][..], &["commit", "1"][..]] {
+        let output = std::process::Command::new(bootstrap) // xtask:allow-subprocess: black-box package bootstrap test
+            .args(forbidden)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(64),
+            "preparatory bootstrap exposed {forbidden:?}"
+        );
+    }
+
+    let mut child = std::process::Command::new(bootstrap) // xtask:allow-subprocess: black-box package bootstrap test
+        .arg("stage")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(child.stdin.as_mut().unwrap(), b"{}").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(77));
+    assert!(output.stdout.is_empty());
 }

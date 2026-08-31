@@ -36,109 +36,13 @@ use crate::vortix_process::{CommandSpec, PrivilegeReq};
 use tracing::{debug, error, info};
 
 const CHAIN_NAME: &str = "VORTIX_KILLSWITCH";
-const NFT_TABLE: &str = "vortix_killswitch";
-const POLICY_COMMENT_PREFIX: &str = "vortix-policy:";
-const NFT_MISSING_ERROR: &str = "No such file or directory";
+use super::nft_policy::{self, BatchMode};
+use super::POLICY_COMMENT_PREFIX;
 
 /// Detected firewall backend on this system.
 enum FirewallBackend {
     Iptables,
     Nftables,
-}
-
-#[derive(Clone, Copy)]
-enum NftBatchMode {
-    Create,
-    Replace,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum NftAcceptRule {
-    OutputInterface(String),
-    Destination(Cidr),
-    Dhcp,
-}
-
-fn host_cidr(address: IpAddr) -> Cidr {
-    let prefix_len = if address.is_ipv4() { 32 } else { 128 };
-    Cidr::new(address, prefix_len).expect("a host prefix is valid for its address family")
-}
-
-fn parse_nft_accept_rule(line: &str) -> Option<NftAcceptRule> {
-    if line == "udp sport 68 udp dport 67 accept" {
-        return Some(NftAcceptRule::Dhcp);
-    }
-    if let Some(interface) = line
-        .strip_prefix("oifname \"")
-        .and_then(|rest| rest.strip_suffix("\" accept"))
-    {
-        if interface.is_empty() || interface.contains('"') {
-            return None;
-        }
-        return Some(NftAcceptRule::OutputInterface(interface.to_string()));
-    }
-
-    for (prefix, expect_v4) in [("ip daddr ", true), ("ip6 daddr ", false)] {
-        let Some(address) = line
-            .strip_prefix(prefix)
-            .and_then(|rest| rest.strip_suffix(" accept"))
-        else {
-            continue;
-        };
-        let destination = address
-            .parse::<Cidr>()
-            .ok()
-            .or_else(|| address.parse::<IpAddr>().ok().map(host_cidr))?;
-        if destination.is_v4() != expect_v4 {
-            return None;
-        }
-        return Some(NftAcceptRule::Destination(destination));
-    }
-
-    None
-}
-
-fn has_unquoted_accept_verdict(line: &str) -> bool {
-    const ACCEPT: &[u8] = b"accept";
-
-    let bytes = line.as_bytes();
-    let mut quoted = false;
-    let mut escaped = false;
-    for (index, byte) in bytes.iter().copied().enumerate() {
-        if quoted {
-            if escaped {
-                escaped = false;
-            } else if byte == b'\\' {
-                escaped = true;
-            } else if byte == b'"' {
-                quoted = false;
-            }
-            continue;
-        }
-        if byte == b'"' {
-            quoted = true;
-            continue;
-        }
-
-        let end = index + ACCEPT.len();
-        if end <= bytes.len()
-            && &bytes[index..end] == ACCEPT
-            && (index == 0 || bytes[index - 1].is_ascii_whitespace())
-            && (end == bytes.len() || bytes[end].is_ascii_whitespace())
-        {
-            return true;
-        }
-    }
-    false
-}
-
-fn parse_nft_accept_rules(ruleset: &str) -> Option<Vec<NftAcceptRule>> {
-    ruleset
-        .lines()
-        .map(str::trim)
-        .filter(|line| has_unquoted_accept_verdict(line))
-        .map(parse_nft_accept_rule)
-        .collect()
 }
 
 /// Linux firewall implementation supporting iptables and nftables.
@@ -543,58 +447,6 @@ impl IptablesFirewall {
 
     // ─── nftables backend ───────────────────────────────────────────────
 
-    /// Build an nft transaction that creates the Vortix-owned table or
-    /// atomically deletes and recreates an existing one. `destroy` is avoided
-    /// because supported Ubuntu releases still ship nft clients older than
-    /// 1.0.7, where that command was introduced.
-    #[must_use]
-    fn generate_nft_ruleset(active: &[ActiveTunnelInfo], mode: NftBatchMode) -> String {
-        let secondary_cidrs: Vec<Cidr> = active
-            .iter()
-            .filter(|tunnel| !tunnel.is_primary)
-            .flat_map(|tunnel| tunnel.declared_cidrs.iter().copied())
-            .collect();
-        let local_ranges = cidr_subtract(&rfc1918_ranges(), &secondary_cidrs);
-        let digest = crate::core::killswitch::policy_digest(active);
-
-        let mut ruleset = String::new();
-        if matches!(mode, NftBatchMode::Replace) {
-            writeln!(ruleset, "delete table inet {NFT_TABLE}").unwrap();
-        }
-        write!(
-            ruleset,
-            r#"table inet {NFT_TABLE} {{
-  chain output {{
-    type filter hook output priority 0; policy drop;
-
-    oifname "lo" accept
-"#,
-        )
-        .unwrap();
-        for range in local_ranges {
-            writeln!(ruleset, "    ip daddr {range} accept").unwrap();
-        }
-        writeln!(ruleset, "    udp sport 68 udp dport 67 accept").unwrap();
-        for tunnel in active {
-            if !tunnel.is_endpoint_allowlist() {
-                writeln!(ruleset, "    oifname \"{}\" accept", tunnel.interface).unwrap();
-            }
-            for endpoint in &tunnel.server_ips {
-                match endpoint {
-                    IpAddr::V4(ip) => writeln!(ruleset, "    ip daddr {ip} accept").unwrap(),
-                    IpAddr::V6(ip) => writeln!(ruleset, "    ip6 daddr {ip} accept").unwrap(),
-                }
-            }
-        }
-        writeln!(
-            ruleset,
-            "    counter drop comment \"{POLICY_COMMENT_PREFIX}{digest}\""
-        )
-        .unwrap();
-        ruleset.push_str("  }\n}\n");
-        ruleset
-    }
-
     fn nft_table_snapshot() -> Result<Option<String>> {
         let output = crate::vortix_process::run_to_output(
             Self::nft_command(vec![
@@ -602,7 +454,7 @@ impl IptablesFirewall {
                 "list".into(),
                 "table".into(),
                 "inet".into(),
-                NFT_TABLE.into(),
+                crate::constants::NFT_TABLE_NAME.into(),
             ])
             .privilege(PrivilegeReq::Root),
         )
@@ -612,7 +464,7 @@ impl IptablesFirewall {
         }
 
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains(NFT_MISSING_ERROR) {
+        if stderr.contains(nft_policy::MISSING_ERROR) {
             Ok(None)
         } else {
             Err(KillswitchError::CommandFailed(format!(
@@ -623,9 +475,9 @@ impl IptablesFirewall {
 
     fn apply_nft_batch(
         active: &[ActiveTunnelInfo],
-        mode: NftBatchMode,
+        mode: BatchMode,
     ) -> Result<std::process::Output> {
-        let ruleset = Self::generate_nft_ruleset(active, mode);
+        let ruleset = nft_policy::ruleset(active, mode);
         crate::vortix_process::run_to_output(
             Self::nft_command(vec!["-f".into(), "-".into()])
                 .privilege(PrivilegeReq::Root)
@@ -634,38 +486,20 @@ impl IptablesFirewall {
         .map_err(|error| KillswitchError::CommandFailed(format!("nft spawn: {error}")))
     }
 
-    fn nft_snapshot_matches(active: &[ActiveTunnelInfo], snapshot: &str) -> bool {
-        let expected_rules = Self::generate_nft_ruleset(active, NftBatchMode::Create);
-        let ordered = parse_nft_accept_rules(&expected_rules)
-            .zip(parse_nft_accept_rules(snapshot))
-            .is_some_and(|(expected, observed)| observed == expected);
-        let digest = crate::core::killswitch::policy_digest(active);
-        let terminal_lines: Vec<&str> = snapshot
-            .lines()
-            .map(str::trim)
-            .filter(|line| line.contains(POLICY_COMMENT_PREFIX))
-            .collect();
-        ordered
-            && snapshot.contains("policy drop")
-            && terminal_lines.len() == 1
-            && terminal_lines[0].contains(" drop ")
-            && terminal_lines[0].contains(&format!("{POLICY_COMMENT_PREFIX}{digest}"))
-    }
-
     fn setup_nftables(active: &[ActiveTunnelInfo]) -> Result<()> {
-        let mut output = Self::apply_nft_batch(active, NftBatchMode::Replace)?;
+        let mut output = Self::apply_nft_batch(active, BatchMode::Replace)?;
         let mut verified_snapshot = None;
         if !output.status.success()
-            && String::from_utf8_lossy(&output.stderr).contains(NFT_MISSING_ERROR)
+            && String::from_utf8_lossy(&output.stderr).contains(nft_policy::MISSING_ERROR)
         {
-            output = Self::apply_nft_batch(active, NftBatchMode::Create)?;
+            output = Self::apply_nft_batch(active, BatchMode::Create)?;
             if !output.status.success() {
                 match Self::nft_table_snapshot()? {
-                    Some(snapshot) if Self::nft_snapshot_matches(active, &snapshot) => {
+                    Some(snapshot) if nft_policy::snapshot_matches(active, &snapshot) => {
                         verified_snapshot = Some(snapshot);
                     }
                     Some(_) => {
-                        output = Self::apply_nft_batch(active, NftBatchMode::Replace)?;
+                        output = Self::apply_nft_batch(active, BatchMode::Replace)?;
                     }
                     None => {}
                 }
@@ -687,7 +521,7 @@ impl IptablesFirewall {
                 )
             })?,
         };
-        if !Self::nft_snapshot_matches(active, &snapshot) {
+        if !nft_policy::snapshot_matches(active, &snapshot) {
             return Err(KillswitchError::CommandFailed(
                 "nft read-back did not match the requested policy".to_string(),
             ));
@@ -703,13 +537,13 @@ impl IptablesFirewall {
                 "delete".into(),
                 "table".into(),
                 "inet".into(),
-                NFT_TABLE.into(),
+                crate::constants::NFT_TABLE_NAME.into(),
             ])
             .privilege(PrivilegeReq::Root),
         )
         .map_err(|error| KillswitchError::CommandFailed(format!("nft delete: {error}")))?;
         let delete_error = String::from_utf8_lossy(&delete.stderr);
-        if !delete.status.success() && !delete_error.contains(NFT_MISSING_ERROR) {
+        if !delete.status.success() && !delete_error.contains(nft_policy::MISSING_ERROR) {
             return Err(KillswitchError::CommandFailed(format!(
                 "nft delete failed: {delete_error}"
             )));
@@ -945,7 +779,7 @@ mod tests {
         let v4 = IptablesFirewall::generate_v4_ruleset(std::slice::from_ref(&policy));
         assert!(v4.contains("-A VORTIX_KILLSWITCH -d 1.2.3.4 -j ACCEPT"));
         assert!(!v4.contains("-A VORTIX_KILLSWITCH -o  -j ACCEPT"));
-        let nft = IptablesFirewall::generate_nft_ruleset(&[policy], NftBatchMode::Create);
+        let nft = nft_policy::ruleset(&[policy], BatchMode::Create);
         assert!(nft.contains("ip daddr 1.2.3.4 accept"));
         assert!(!nft.contains("oifname \"\" accept"));
     }
@@ -1096,8 +930,8 @@ mod tests {
         let first = tunnel("wg0", &["1.2.3.4"], &["0.0.0.0/0"], true);
         let second = tunnel("wg1", &["2001:db8::1"], &["10.0.0.0/8"], false);
         let active = [first, second];
-        let fresh = IptablesFirewall::generate_nft_ruleset(&active, NftBatchMode::Create);
-        let replacement = IptablesFirewall::generate_nft_ruleset(&active, NftBatchMode::Replace);
+        let fresh = nft_policy::ruleset(&active, BatchMode::Create);
+        let replacement = nft_policy::ruleset(&active, BatchMode::Replace);
 
         assert!(fresh.starts_with("table inet vortix_killswitch {\n"));
         assert!(!fresh.contains("delete table"));
@@ -1113,12 +947,12 @@ mod tests {
         assert!(fresh.contains("ip daddr 1.2.3.4 accept"));
         assert!(fresh.contains("ip6 daddr 2001:db8::1 accept"));
         assert!(!fresh.contains("ip daddr 10.0.0.0/8 accept"));
-        assert!(IptablesFirewall::nft_snapshot_matches(&active, &fresh));
-        assert!(!IptablesFirewall::nft_snapshot_matches(
+        assert!(nft_policy::snapshot_matches(&active, &fresh));
+        assert!(!nft_policy::snapshot_matches(
             &active,
             &fresh.replace("    oifname \"wg1\" accept\n", "")
         ));
-        assert!(!IptablesFirewall::nft_snapshot_matches(
+        assert!(!nft_policy::snapshot_matches(
             &active,
             &fresh.replace("counter drop comment", "counter accept comment")
         ));
@@ -1135,46 +969,37 @@ mod tests {
                 "list".into(),
                 "table".into(),
                 "inet".into(),
-                NFT_TABLE.into(),
+                crate::constants::NFT_TABLE_NAME.into(),
             ])
             .args,
-            ["-n", "list", "table", "inet", NFT_TABLE]
+            [
+                "-n",
+                "list",
+                "table",
+                "inet",
+                crate::constants::NFT_TABLE_NAME,
+            ]
         );
     }
 
     #[test]
     fn nft_readback_compares_host_destinations_semantically_and_rejects_unknown_rules() {
         let host_route = tunnel("wg2", &[], &["10.0.0.1/32"], false);
-        let host_rules = IptablesFirewall::generate_nft_ruleset(
-            std::slice::from_ref(&host_route),
-            NftBatchMode::Create,
-        );
+        let host_rules = nft_policy::ruleset(std::slice::from_ref(&host_route), BatchMode::Create);
         assert!(host_rules.contains("ip daddr 10.0.0.0/32 accept"));
         let nft_readback =
             host_rules.replace("ip daddr 10.0.0.0/32 accept", "ip daddr 10.0.0.0 accept");
-        assert!(IptablesFirewall::nft_snapshot_matches(
+        assert!(nft_policy::snapshot_matches(
             std::slice::from_ref(&host_route),
             &nft_readback
         ));
-        assert!(!IptablesFirewall::nft_snapshot_matches(
+        assert!(!nft_policy::snapshot_matches(
             std::slice::from_ref(&host_route),
             &nft_readback.replace(
                 "    counter drop comment",
                 "    meta skuid 1000 accept comment \"extra\"\n    counter drop comment",
             )
         ));
-        assert_eq!(
-            parse_nft_accept_rules("counter drop comment \"accept\""),
-            Some(Vec::new())
-        );
-        assert_eq!(
-            parse_nft_accept_rule("ip daddr 10.0.0.1/32 accept"),
-            parse_nft_accept_rule("ip daddr 10.0.0.1 accept")
-        );
-        assert_eq!(
-            parse_nft_accept_rule("ip6 daddr 2001:db8::1/128 accept"),
-            parse_nft_accept_rule("ip6 daddr 2001:db8::1 accept")
-        );
     }
 
     // ─── snapshot tests pinning ruleset shape ───────────────────────────

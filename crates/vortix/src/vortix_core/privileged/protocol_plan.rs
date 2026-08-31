@@ -183,24 +183,67 @@ impl ProtocolPlan {
     #[must_use]
     pub fn material_refs(&self) -> Vec<ProfileMaterialRef> {
         match self {
-            Self::WireGuard(plan) => {
-                let mut refs = vec![ProfileMaterialRef::ProfileSlot {
-                    slot: plan.private_key,
-                }];
-                refs.extend(plan.peers.iter().filter_map(|peer| {
-                    peer.preshared_key
-                        .map(|key| ProfileMaterialRef::WireGuardPresharedKey {
-                            peer_public_key: key.peer_public_key,
-                        })
-                }));
-                refs
-            }
+            Self::WireGuard(plan) => plan.material_refs(),
             Self::OpenVpn(plan) => plan
                 .materials
                 .iter()
                 .copied()
                 .map(|slot| ProfileMaterialRef::ProfileSlot { slot })
                 .collect(),
+        }
+    }
+
+    /// Ordered descriptor identities for one tunnel start request.
+    ///
+    /// Profile material and one-shot runtime credentials share the local
+    /// descriptor transport, but they are deliberately distinct identities:
+    /// credentials are neither serialized in this plan nor persisted as
+    /// profile material.
+    #[must_use]
+    pub(crate) fn descriptor_refs(&self) -> Vec<TunnelDescriptorRef> {
+        let mut descriptors = Vec::with_capacity(self.descriptor_count());
+        match self {
+            Self::WireGuard(plan) => {
+                descriptors.push(TunnelDescriptorRef::ProfileMaterial(
+                    ProfileMaterialRef::ProfileSlot {
+                        slot: plan.private_key,
+                    },
+                ));
+                descriptors.extend(plan.peers.iter().filter_map(|peer| {
+                    peer.preshared_key.map(|key| {
+                        TunnelDescriptorRef::ProfileMaterial(
+                            ProfileMaterialRef::WireGuardPresharedKey {
+                                peer_public_key: key.peer_public_key,
+                            },
+                        )
+                    })
+                }));
+            }
+            Self::OpenVpn(plan) => {
+                descriptors.extend(plan.materials.iter().copied().map(|slot| {
+                    TunnelDescriptorRef::ProfileMaterial(ProfileMaterialRef::ProfileSlot { slot })
+                }));
+                if plan.authentication.uses_username_password() {
+                    descriptors.push(TunnelDescriptorRef::OpenVpnCredentials);
+                }
+            }
+        }
+        descriptors
+    }
+
+    #[must_use]
+    pub(crate) fn descriptor_count(&self) -> usize {
+        match self {
+            Self::WireGuard(plan) => {
+                1 + plan
+                    .peers
+                    .iter()
+                    .filter(|peer| peer.preshared_key.is_some())
+                    .count()
+            }
+            Self::OpenVpn(plan) => {
+                plan.materials.len() + usize::from(plan.authentication.uses_username_password())
+            }
         }
     }
 }
@@ -307,6 +350,45 @@ impl WireGuardPlan {
             private_key,
         })
     }
+
+    #[must_use]
+    pub fn profile_id(&self) -> &ProfileId {
+        &self.profile_id
+    }
+
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    #[must_use]
+    pub fn addresses(&self) -> &[Cidr] {
+        &self.addresses
+    }
+
+    #[must_use]
+    pub fn peers(&self) -> &[WireGuardPeerPlan] {
+        &self.peers
+    }
+
+    #[must_use]
+    pub const fn interface_options(&self) -> WireGuardInterfaceOptions {
+        self.interface_options
+    }
+
+    #[must_use]
+    pub fn material_refs(&self) -> Vec<ProfileMaterialRef> {
+        let mut refs = vec![ProfileMaterialRef::ProfileSlot {
+            slot: self.private_key,
+        }];
+        refs.extend(self.peers.iter().filter_map(|peer| {
+            peer.preshared_key
+                .map(|key| ProfileMaterialRef::WireGuardPresharedKey {
+                    peer_public_key: key.peer_public_key,
+                })
+        }));
+        refs
+    }
 }
 
 /// Fixed profile-owned material slots. During unprivileged parsing, embedded
@@ -331,6 +413,18 @@ pub enum ProfileMaterialSlot {
 pub enum ProfileMaterialRef {
     ProfileSlot { slot: ProfileMaterialSlot },
     WireGuardPresharedKey { peer_public_key: [u8; 32] },
+}
+
+/// Identity of one descriptor accompanying a tunnel start request.
+///
+/// This type is derived locally from [`ProtocolPlan`] and intentionally has no
+/// serde implementation. In particular, `OpenVpnCredentials` identifies a
+/// one-shot secret channel; it never makes credential bytes part of the wire
+/// plan or durable profile inventory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum TunnelDescriptorRef {
+    ProfileMaterial(ProfileMaterialRef),
+    OpenVpnCredentials,
 }
 
 /// Bounded `WireGuard` interface options. `None` delegates to the platform
@@ -386,6 +480,21 @@ impl WireGuardInterfaceOptions {
             fwmark,
         })
     }
+
+    #[must_use]
+    pub const fn mtu(self) -> Option<u16> {
+        self.mtu
+    }
+
+    #[must_use]
+    pub const fn listen_port(self) -> Option<u16> {
+        self.listen_port
+    }
+
+    #[must_use]
+    pub const fn fwmark(self) -> Option<u32> {
+        self.fwmark
+    }
 }
 
 /// Fixed material identity for one peer's preshared key.
@@ -417,6 +526,11 @@ impl WireGuardPresharedKeyRef {
         } else {
             Ok(Self { peer_public_key })
         }
+    }
+
+    #[must_use]
+    pub const fn peer_public_key(self) -> [u8; 32] {
+        self.peer_public_key
     }
 }
 
@@ -533,6 +647,31 @@ impl WireGuardPeerPlan {
             persistent_keepalive_seconds,
             preshared_key,
         })
+    }
+
+    #[must_use]
+    pub const fn public_key(&self) -> [u8; 32] {
+        self.public_key
+    }
+
+    #[must_use]
+    pub const fn endpoint(&self) -> Option<&ProtocolEndpoint> {
+        self.endpoint.as_ref()
+    }
+
+    #[must_use]
+    pub fn allowed_routes(&self) -> &[Cidr] {
+        &self.allowed_routes
+    }
+
+    #[must_use]
+    pub const fn persistent_keepalive_seconds(&self) -> Option<u16> {
+        self.persistent_keepalive_seconds
+    }
+
+    #[must_use]
+    pub const fn preshared_key(&self) -> Option<WireGuardPresharedKeyRef> {
+        self.preshared_key
     }
 }
 

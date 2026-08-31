@@ -1447,9 +1447,12 @@ pub(crate) fn host_ipv6_disabled() -> bool {
     })
 }
 
-/// Serialize tunnel lifecycle mutations (`up` / `down` / `reconnect`)
-/// across concurrent vortix processes via `flock` on a lockfile in the
-/// config dir. Without it, two `vortix up` invocations of the same
+/// Serialize lifecycle mutations across concurrent Vortix writers.
+/// Enrollment-capable packages install an owner-readable lock in a fixed
+/// root-controlled directory. Current clients retain the legacy lock while
+/// also holding the installed lock, which keeps mixed-version writers
+/// serialized during the preparatory release. Without it, two `vortix up`
+/// invocations of the same
 /// `OpenVPN` profile both spawn daemons and the second clobbers the
 /// first's pidfile, orphaning it.
 ///
@@ -1461,17 +1464,91 @@ pub(crate) fn host_ipv6_disabled() -> bool {
 /// Unix-only mutual exclusion: the non-Unix build opens the lockfile
 /// without locking (a placeholder — vortix tunnels are unsupported on
 /// Windows, so there is no lifecycle to serialize there yet).
+/// Process-lifetime guard for the legacy and installed writer locks.
 #[cfg(unix)]
-pub fn acquire_lifecycle_lock() -> std::io::Result<std::fs::File> {
-    use std::os::unix::io::AsRawFd;
+#[derive(Debug)]
+pub struct LifecycleLock {
+    _legacy: std::fs::File,
+    _installed: Option<std::fs::File>,
+}
 
+/// Process-lifetime guard for the legacy writer lock.
+#[cfg(not(unix))]
+#[derive(Debug)]
+pub struct LifecycleLock {
+    _legacy: std::fs::File,
+}
+
+#[cfg(unix)]
+pub fn acquire_lifecycle_lock() -> std::io::Result<LifecycleLock> {
     let root = get_app_config_dir()?;
-    let path = root.join("lifecycle.lock");
+    let owner_uid = invoking_owner_uid()?;
+    acquire_lifecycle_lock_at(&root, owner_uid, crate::authority_lock::acquire_installed)
+}
+
+#[cfg(unix)]
+fn acquire_lifecycle_lock_at(
+    root: &std::path::Path,
+    owner_uid: u32,
+    acquire_installed: impl FnOnce(u32) -> std::io::Result<Option<std::fs::File>>,
+) -> std::io::Result<LifecycleLock> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = std::fs::symlink_metadata(root)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() || metadata.uid() != owner_uid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "the Vortix config directory is not owned by the invoking user",
+        ));
+    }
+    let legacy = acquire_nonblocking_lock(&root.join("lifecycle.lock"))?;
+    let installed = acquire_installed(owner_uid)?;
+    Ok(LifecycleLock {
+        _legacy: legacy,
+        _installed: installed,
+    })
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code, reason = "geteuid returns the scalar effective uid")]
+fn invoking_owner_uid() -> std::io::Result<u32> {
+    let effective_uid = unsafe { libc::geteuid() };
+    invoking_owner_uid_from(effective_uid, std::env::var_os("SUDO_UID").as_deref())
+}
+
+#[cfg(unix)]
+fn invoking_owner_uid_from(
+    effective_uid: u32,
+    sudo_uid: Option<&std::ffi::OsStr>,
+) -> std::io::Result<u32> {
+    if effective_uid != 0 {
+        return Ok(effective_uid);
+    }
+    let Some(sudo_uid) = sudo_uid else {
+        return Ok(0);
+    };
+    sudo_uid
+        .to_string_lossy()
+        .parse::<u32>()
+        .ok()
+        .filter(|uid| *uid != 0)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "SUDO_UID must identify the non-root invoking user",
+            )
+        })
+}
+
+#[cfg(unix)]
+fn acquire_nonblocking_lock(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::io::AsRawFd as _;
+
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(&path)?;
+        .open(path)?;
 
     // SAFETY: flock is a thin syscall wrapper over a valid owned fd; no
     // buffers, no aliasing. Same invariant analysis as libc::kill in the
@@ -1485,13 +1562,14 @@ pub fn acquire_lifecycle_lock() -> std::io::Result<std::fs::File> {
 }
 
 #[cfg(not(unix))]
-pub fn acquire_lifecycle_lock() -> std::io::Result<std::fs::File> {
+pub fn acquire_lifecycle_lock() -> std::io::Result<LifecycleLock> {
     let root = get_app_config_dir()?;
-    std::fs::OpenOptions::new()
+    let legacy = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(root.join("lifecycle.lock"))
+        .open(root.join("lifecycle.lock"))?;
+    Ok(LifecycleLock { _legacy: legacy })
 }
 
 /// Check whether a `WireGuard` config declares an IPv6 entry on an
@@ -1526,6 +1604,100 @@ pub(crate) fn wireguard_config_has_ipv6_address(config_path: &std::path::Path) -
 mod tests {
     use super::*;
     use std::time::{Duration, SystemTime};
+
+    #[cfg(unix)]
+    #[test]
+    fn lifecycle_selector_holds_legacy_and_installed_locks_together() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let installed_path = directory.path().join("installed.lock");
+        std::fs::write(&installed_path, []).unwrap();
+        let owner_uid = directory.path().metadata().unwrap().uid();
+        let _guard = acquire_lifecycle_lock_at(directory.path(), owner_uid, |_| {
+            acquire_nonblocking_lock(&installed_path).map(Some)
+        })
+        .unwrap();
+
+        assert_eq!(
+            acquire_nonblocking_lock(&directory.path().join("lifecycle.lock"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            acquire_nonblocking_lock(&installed_path)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lifecycle_selector_uses_legacy_only_when_package_marker_is_absent() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let owner_uid = directory.path().metadata().unwrap().uid();
+        let _guard = acquire_lifecycle_lock_at(directory.path(), owner_uid, |_| Ok(None)).unwrap();
+
+        assert_eq!(
+            acquire_nonblocking_lock(&directory.path().join("lifecycle.lock"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lifecycle_selector_never_falls_back_after_installed_lock_error() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let owner_uid = directory.path().metadata().unwrap().uid();
+        let result = acquire_lifecycle_lock_at(directory.path(), owner_uid, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "invalid installed lock",
+            ))
+        });
+
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert!(acquire_nonblocking_lock(&directory.path().join("lifecycle.lock")).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lifecycle_selector_rejects_a_config_directory_owned_by_another_uid() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let different_uid = directory.path().metadata().unwrap().uid().wrapping_add(1);
+        let result = acquire_lifecycle_lock_at(directory.path(), different_uid, |_| Ok(None));
+
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert!(!directory.path().join("lifecycle.lock").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invoking_owner_identity_is_independent_of_the_config_path() {
+        assert_eq!(invoking_owner_uid_from(501, None).unwrap(), 501);
+        assert_eq!(
+            invoking_owner_uid_from(0, Some(std::ffi::OsStr::new("502"))).unwrap(),
+            502
+        );
+        assert!(invoking_owner_uid_from(0, Some(std::ffi::OsStr::new("0"))).is_err());
+        assert!(invoking_owner_uid_from(0, Some(std::ffi::OsStr::new("invalid"))).is_err());
+    }
 
     // ───── binary_exists ─────────────────────────────────────────────────
 

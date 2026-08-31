@@ -33,6 +33,16 @@ pub(crate) struct SecretFileIdentity {
 
 impl SecretFileIdentity {
     #[cfg(unix)]
+    pub(crate) fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt as _;
+
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+
+    #[cfg(unix)]
     pub(crate) fn matches_metadata(self, metadata: &std::fs::Metadata) -> bool {
         use std::os::unix::fs::MetadataExt as _;
 

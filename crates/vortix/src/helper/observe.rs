@@ -12,7 +12,9 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::helper::runtime::HelperRuntimeIdentity;
-use crate::helper::server::{ObservationError, ObservationExecutor, ObservationOutcome};
+use crate::helper::server::{
+    ObservationError, ObservationExecutor, ObservationOutcome, ObservationScope,
+};
 use crate::helper::validate::PlatformLayout;
 use crate::vortix_core::ports::process::KernelProcessIdentity;
 use crate::vortix_core::privileged::{
@@ -21,7 +23,7 @@ use crate::vortix_core::privileged::{
 };
 use crate::vortix_core::profile::ProtocolKind;
 
-const MAX_INTERFACE_EVIDENCE_BYTES: u64 = 64;
+pub(crate) const MAX_INTERFACE_EVIDENCE_BYTES: u64 = 64;
 const MAX_CHILD_EVIDENCE_BYTES: u64 = 4 * 1024;
 
 /// Production read-back executor. It accepts only fixed identities derived
@@ -48,6 +50,7 @@ impl ObservationExecutor for SystemObservationExecutor {
     fn observe(
         &mut self,
         targets: &[ResourceObservationTarget],
+        _scope: ObservationScope,
     ) -> Result<ObservationOutcome, ObservationError> {
         let observed_at_millis = OsObservationProbe.now_millis().max(1);
         let mut observations = Vec::with_capacity(targets.len());
@@ -257,6 +260,35 @@ fn read_interface_name_evidence(path: &Path) -> InterfaceNameEvidence {
         return InterfaceNameEvidence::Invalid;
     }
     InterfaceNameEvidence::Name(name.to_owned())
+}
+
+/// Resolve the interface name only from helper-derived identity and
+/// root-owned evidence. Linux uses the deterministic kernel alias; macOS
+/// accepts exactly one protocol-owned evidence file and rejects ambiguity.
+pub(crate) fn authority_interface_name(
+    layout: PlatformLayout,
+    lease_id: LeaseId,
+    tunnel: &ResourceTag,
+) -> Result<String, ()> {
+    let identity = HelperRuntimeIdentity::derive(layout, lease_id, tunnel).map_err(|_| ())?;
+    if layout == PlatformLayout::Linux {
+        return Ok(identity.kernel_alias().to_owned());
+    }
+
+    let mut name = None;
+    for path in [
+        identity.wireguard_name_evidence(),
+        identity.interface_evidence(),
+    ] {
+        match read_interface_name_evidence(&path) {
+            InterfaceNameEvidence::Name(candidate) if name.is_none() => name = Some(candidate),
+            InterfaceNameEvidence::Missing => {}
+            InterfaceNameEvidence::Name(_)
+            | InterfaceNameEvidence::Unavailable
+            | InterfaceNameEvidence::Invalid => return Err(()),
+        }
+    }
+    name.ok_or(())
 }
 
 fn read_child_identity_evidence(path: &Path) -> ChildIdentityEvidence {

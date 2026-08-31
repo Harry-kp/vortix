@@ -12,6 +12,7 @@ use crate::vortix_core::privileged::{
 
 pub const INSTALL_SCHEMA_VERSION: u16 = 1;
 pub const HELPER_SOCKET_MODE: u32 = 0o600;
+pub const HELPER_SOCKET_DIR_MODE: u32 = 0o711;
 pub const HELPER_RUNTIME_DIR_MODE: u32 = 0o700;
 pub const HELPER_LEDGER_MODE: u32 = 0o600;
 
@@ -23,6 +24,22 @@ pub enum PlatformLayout {
 }
 
 impl PlatformLayout {
+    #[must_use]
+    pub const fn current() -> Option<Self> {
+        #[cfg(target_os = "linux")]
+        // xtask:allow-platform-cfg: package layout is selected by the build target
+        {
+            return Some(Self::Linux);
+        }
+        #[cfg(target_os = "macos")]
+        // xtask:allow-platform-cfg: package layout is selected by the build target
+        {
+            return Some(Self::MacOs);
+        }
+        #[allow(unreachable_code)]
+        None
+    }
+
     #[must_use]
     pub const fn helper_path(self) -> &'static str {
         match self {
@@ -68,6 +85,61 @@ impl PlatformLayout {
         match self {
             Self::Linux => "/var/lib/vortix/helper-ledger.json",
             Self::MacOs => "/Library/Application Support/Vortix/helper-ledger.json",
+        }
+    }
+
+    #[must_use]
+    pub const fn root_enrollment(self) -> &'static str {
+        match self {
+            Self::Linux => "/var/lib/vortix/enrollment.json",
+            Self::MacOs => "/Library/Application Support/Vortix/enrollment.json",
+        }
+    }
+
+    #[must_use]
+    pub const fn authority_lock(self) -> &'static str {
+        match self {
+            Self::Linux => "/var/lib/vortix-public/authority.lock",
+            Self::MacOs => "/Library/Application Support/Vortix/Public/authority.lock",
+        }
+    }
+
+    #[must_use]
+    pub const fn authority_lock_dir_mode(self) -> u32 {
+        0o755
+    }
+
+    #[must_use]
+    pub const fn install_manifest(self) -> &'static str {
+        match self {
+            Self::Linux => "/usr/libexec/vortix/install-manifest.json",
+            Self::MacOs => "/Library/Application Support/Vortix/install-manifest.json",
+        }
+    }
+
+    #[must_use]
+    pub const fn daemon_service_definition(self) -> &'static str {
+        match self {
+            Self::Linux => "/usr/lib/systemd/system/vortix-daemon@.service",
+            Self::MacOs => "/Library/LaunchDaemons/com.vortix.daemon.plist",
+        }
+    }
+
+    #[must_use]
+    pub const fn daemon_environment(self) -> &'static str {
+        match self {
+            Self::Linux => "/var/lib/vortix/daemon.env",
+            Self::MacOs => "/Library/Application Support/Vortix/daemon.env",
+        }
+    }
+
+    #[must_use]
+    pub const fn root_state_dir_mode(self) -> u32 {
+        match self {
+            Self::Linux => 0o700,
+            // The signed daemon binary is below this package directory and
+            // must remain traversable by the enrolled unprivileged owner.
+            Self::MacOs => 0o755,
         }
     }
 
@@ -248,11 +320,36 @@ impl InstallManifest {
         self.generation
     }
 
+    #[must_use]
+    pub fn digest(&self) -> OperationDigest {
+        let mut material = Vec::with_capacity(256);
+        material.extend_from_slice(b"vortix-install-manifest-v1\0");
+        material.extend_from_slice(&self.schema_version.to_be_bytes());
+        material.extend_from_slice(&self.generation.to_be_bytes());
+        material.extend_from_slice(
+            &u64::try_from(self.release_version.len())
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
+        material.extend_from_slice(self.release_version.as_bytes());
+        material.extend_from_slice(&self.daemon_digest.as_bytes());
+        material.extend_from_slice(&self.helper_digest.as_bytes());
+        material.extend_from_slice(&self.bootstrap_digest.as_bytes());
+        match self.prior_manifest_digest {
+            Some(digest) => {
+                material.push(1);
+                material.extend_from_slice(&digest.as_bytes());
+            }
+            None => material.push(0),
+        }
+        OperationDigest::of_bytes(&material)
+    }
+
     #[allow(
         dead_code,
         reason = "U12 artifact verifier consumes the signed manifest"
     )]
-    fn digest_for(&self, kind: ArtifactKind) -> OperationDigest {
+    pub(super) fn digest_for(&self, kind: ArtifactKind) -> OperationDigest {
         match kind {
             ArtifactKind::Daemon => self.daemon_digest,
             ArtifactKind::Helper => self.helper_digest,
@@ -333,6 +430,45 @@ impl InstallRequest {
             manifest_digest,
             request_nonce,
         })
+    }
+
+    #[must_use]
+    pub const fn owner_uid(&self) -> u32 {
+        self.owner_uid
+    }
+
+    #[must_use]
+    pub const fn layout(&self) -> PlatformLayout {
+        self.layout
+    }
+
+    #[must_use]
+    pub const fn channel(&self) -> PackageChannel {
+        self.channel
+    }
+
+    #[must_use]
+    pub const fn manifest_generation(&self) -> u64 {
+        self.manifest_generation
+    }
+
+    #[must_use]
+    pub const fn manifest_digest(&self) -> OperationDigest {
+        self.manifest_digest
+    }
+
+    #[must_use]
+    pub const fn request_nonce(&self) -> [u8; 32] {
+        self.request_nonce
+    }
+
+    pub(crate) fn verify_manifest(&self, manifest: &InstallManifest) -> Result<(), InstallError> {
+        if self.manifest_generation != manifest.generation()
+            || self.manifest_digest != manifest.digest()
+        {
+            return Err(InstallError::ManifestMismatch);
+        }
+        Ok(())
     }
 }
 
@@ -577,6 +713,8 @@ pub enum InstallError {
     InvalidManifest,
     #[error("invalid sanitized install request")]
     InvalidRequest,
+    #[error("install request does not match the verified release manifest")]
+    ManifestMismatch,
     #[error("this package channel cannot enroll Background mode: {guidance}")]
     UnsupportedChannel { guidance: &'static str },
     #[error("package channel does not match the platform layout")]

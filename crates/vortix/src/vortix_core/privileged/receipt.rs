@@ -1,8 +1,11 @@
 //! Strict untrusted receipt wire and authenticated helper-ledger receipts.
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::vortix_core::cidr::Cidr;
 use crate::vortix_core::control::AuthorityEpoch;
 use crate::vortix_core::privileged::operation::{
     HelperEpoch, LeaseId, NetworkPolicyOperation, OperationDigest, PrivilegedOperation,
@@ -65,6 +68,8 @@ pub struct ResourceObservation {
     resource: ResourceTag,
     state: ObservationState,
     observed_at_millis: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wireguard_peers: Option<Vec<WireGuardPeerObservation>>,
 }
 
 #[derive(Deserialize)]
@@ -73,6 +78,8 @@ struct ResourceObservationWire {
     resource: ResourceTag,
     state: ObservationState,
     observed_at_millis: u64,
+    #[serde(default)]
+    wireguard_peers: Option<BoundedVec<WireGuardPeerObservation, MAX_RESOURCE_ITEMS>>,
 }
 
 impl<'de> Deserialize<'de> for ResourceObservation {
@@ -81,8 +88,13 @@ impl<'de> Deserialize<'de> for ResourceObservation {
         D: serde::Deserializer<'de>,
     {
         let wire = ResourceObservationWire::deserialize(deserializer)?;
-        Self::new(wire.resource, wire.state, wire.observed_at_millis)
-            .map_err(serde::de::Error::custom)
+        Self::validate(
+            wire.resource,
+            wire.state,
+            wire.observed_at_millis,
+            wire.wireguard_peers.map(BoundedVec::into_vec),
+        )
+        .map_err(serde::de::Error::custom)
     }
 }
 
@@ -92,13 +104,46 @@ impl ResourceObservation {
         state: ObservationState,
         observed_at_millis: u64,
     ) -> Result<Self, ReceiptError> {
+        Self::validate(resource, state, observed_at_millis, None)
+    }
+
+    pub fn with_wireguard_peers(
+        resource: ResourceTag,
+        state: ObservationState,
+        observed_at_millis: u64,
+        peers: Vec<WireGuardPeerObservation>,
+    ) -> Result<Self, ReceiptError> {
+        Self::validate(resource, state, observed_at_millis, Some(peers))
+    }
+
+    fn validate(
+        resource: ResourceTag,
+        state: ObservationState,
+        observed_at_millis: u64,
+        wireguard_peers: Option<Vec<WireGuardPeerObservation>>,
+    ) -> Result<Self, ReceiptError> {
         if observed_at_millis == 0 {
             return Err(ReceiptError::InvalidObservationTime);
+        }
+        if let Some(peers) = wireguard_peers.as_ref() {
+            bounded(peers.len())?;
+            let latest_allowed = observed_at_millis.saturating_add(5 * 60 * 1_000);
+            if resource.kind() != ResourceKind::Tunnel
+                || state != ObservationState::Present
+                || has_duplicates(peers.iter().map(WireGuardPeerObservation::public_key_ref))
+                || peers.iter().any(|peer| {
+                    peer.latest_handshake_at_millis
+                        .is_some_and(|handshake| handshake > latest_allowed)
+                })
+            {
+                return Err(ReceiptError::InvalidPeerEvidence);
+            }
         }
         Ok(Self {
             resource,
             state,
             observed_at_millis,
+            wireguard_peers,
         })
     }
 
@@ -110,6 +155,119 @@ impl ResourceObservation {
     #[must_use]
     pub(crate) const fn state(&self) -> ObservationState {
         self.state
+    }
+
+    #[must_use]
+    pub const fn observed_at_millis(&self) -> u64 {
+        self.observed_at_millis
+    }
+
+    #[must_use]
+    pub fn wireguard_peers(&self) -> Option<&[WireGuardPeerObservation]> {
+        self.wireguard_peers.as_deref()
+    }
+}
+
+/// One bounded, non-secret `wg show ... dump` peer fact authenticated by a
+/// schema-5 managed observation receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WireGuardPeerObservation {
+    public_key: [u8; 32],
+    allowed_routes: Vec<Cidr>,
+    latest_handshake_at_millis: Option<u64>,
+    persistent_keepalive_seconds: Option<u16>,
+    bytes_rx: u64,
+    bytes_tx: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireGuardPeerObservationWire {
+    public_key: [u8; 32],
+    allowed_routes: BoundedVec<Cidr, MAX_RESOURCE_ITEMS>,
+    latest_handshake_at_millis: Option<u64>,
+    persistent_keepalive_seconds: Option<u16>,
+    bytes_rx: u64,
+    bytes_tx: u64,
+}
+
+impl<'de> Deserialize<'de> for WireGuardPeerObservation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = WireGuardPeerObservationWire::deserialize(deserializer)?;
+        Self::new(
+            wire.public_key,
+            wire.allowed_routes.into_vec(),
+            wire.latest_handshake_at_millis,
+            wire.persistent_keepalive_seconds,
+            wire.bytes_rx,
+            wire.bytes_tx,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+impl WireGuardPeerObservation {
+    pub fn new(
+        public_key: [u8; 32],
+        allowed_routes: Vec<Cidr>,
+        latest_handshake_at_millis: Option<u64>,
+        persistent_keepalive_seconds: Option<u16>,
+        bytes_rx: u64,
+        bytes_tx: u64,
+    ) -> Result<Self, ReceiptError> {
+        bounded(allowed_routes.len())?;
+        if public_key == [0; 32]
+            || latest_handshake_at_millis == Some(0)
+            || persistent_keepalive_seconds == Some(0)
+            || allowed_routes.iter().collect::<HashSet<_>>().len() != allowed_routes.len()
+        {
+            return Err(ReceiptError::InvalidPeerEvidence);
+        }
+        Ok(Self {
+            public_key,
+            allowed_routes,
+            latest_handshake_at_millis,
+            persistent_keepalive_seconds,
+            bytes_rx,
+            bytes_tx,
+        })
+    }
+
+    const fn public_key_ref(&self) -> &[u8; 32] {
+        &self.public_key
+    }
+
+    #[must_use]
+    pub const fn public_key(&self) -> [u8; 32] {
+        self.public_key
+    }
+
+    #[must_use]
+    pub fn allowed_routes(&self) -> &[Cidr] {
+        &self.allowed_routes
+    }
+
+    #[must_use]
+    pub const fn latest_handshake_at_millis(&self) -> Option<u64> {
+        self.latest_handshake_at_millis
+    }
+
+    #[must_use]
+    pub const fn persistent_keepalive_seconds(&self) -> Option<u16> {
+        self.persistent_keepalive_seconds
+    }
+
+    #[must_use]
+    pub const fn bytes_rx(&self) -> u64 {
+        self.bytes_rx
+    }
+
+    #[must_use]
+    pub const fn bytes_tx(&self) -> u64 {
+        self.bytes_tx
     }
 }
 
@@ -428,9 +586,41 @@ impl VerifiedReceipt {
         matches!(self.outcome, ReceiptOutcome::Ambiguous(_))
     }
 
+    pub(crate) const fn rejection_code(&self) -> Option<RejectionCode> {
+        match self.outcome {
+            ReceiptOutcome::Rejected(code) => Some(code),
+            ReceiptOutcome::Applied(_)
+            | ReceiptOutcome::Observed(_)
+            | ReceiptOutcome::Ambiguous(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn is_rejected(&self) -> bool {
+        self.rejection_code().is_some()
+    }
+
     pub(crate) fn observes(&self, resource: &ResourceTag, state: ObservationState) -> bool {
         matches!(&self.outcome, ReceiptOutcome::Observed(observations) if observations
             .iter().any(|observation| observation.resource == *resource && observation.state == state))
+    }
+
+    #[must_use]
+    pub fn observation(&self, resource: &ResourceTag) -> Option<&ResourceObservation> {
+        match &self.outcome {
+            ReceiptOutcome::Observed(observations) => observations
+                .iter()
+                .find(|observation| observation.resource() == resource),
+            ReceiptOutcome::Applied(_)
+            | ReceiptOutcome::Rejected(_)
+            | ReceiptOutcome::Ambiguous(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn owns(&self, resource: &ResourceTag) -> bool {
+        matches!(&self.outcome, ReceiptOutcome::Applied(resources) if resources
+            .iter().any(|ownership| ownership.resource() == resource))
     }
 }
 
@@ -444,55 +634,7 @@ fn validate_outcome(
     match outcome {
         ReceiptOutcome::Rejected(_) | ReceiptOutcome::Ambiguous(_) => Ok(()),
         ReceiptOutcome::Applied(ownership) => {
-            bounded(ownership.len())?;
-            if has_duplicates(ownership.iter().map(ResourceOwnership::resource))
-                || ownership.iter().any(|item| {
-                    item.authority_epoch != authority
-                        || item.lease_id != lease_id
-                        || item.acquired_sequence != sequence
-                        || !operation.relates_to(&item.resource)
-                })
-            {
-                return Err(ReceiptError::UnrelatedResource);
-            }
-            match operation {
-                PrivilegedOperation::StartTunnel(plan) => {
-                    let tunnel = ResourceTag::tunnel(plan.profile_id().clone(), plan.generation())
-                        .map_err(|_| ReceiptError::UnrelatedResource)?;
-                    let group = ResourceTag::profile(
-                        plan.profile_id().clone(),
-                        plan.generation(),
-                        ResourceKind::ProcessGroup,
-                    )
-                    .map_err(|_| ReceiptError::UnrelatedResource)?;
-                    match plan {
-                        crate::vortix_core::privileged::ProtocolPlan::WireGuard(_) => {
-                            if ownership.len() != 1 || ownership[0].resource != tunnel {
-                                return Err(ReceiptError::MissingRequiredResource);
-                            }
-                        }
-                        crate::vortix_core::privileged::ProtocolPlan::OpenVpn(_) => {
-                            if ownership.len() != 2
-                                || !ownership.iter().any(|item| item.resource == tunnel)
-                                || !ownership.iter().any(|item| item.resource == group)
-                            {
-                                return Err(ReceiptError::MissingRequiredResource);
-                            }
-                        }
-                    }
-                }
-                PrivilegedOperation::StopTunnel(_)
-                | PrivilegedOperation::Observe(_)
-                | PrivilegedOperation::CleanupOwned(_) => {
-                    return Err(ReceiptError::OutcomeMismatch);
-                }
-                PrivilegedOperation::NetworkPolicy(policy) => {
-                    if ownership.len() != 1 || ownership[0].resource != *policy.policy_resource() {
-                        return Err(ReceiptError::OutcomeMismatch);
-                    }
-                }
-            }
-            Ok(())
+            validate_applied(operation, ownership, authority, lease_id, sequence)
         }
         ReceiptOutcome::Observed(observations) => {
             bounded(observations.len())?;
@@ -504,8 +646,10 @@ fn validate_outcome(
             {
                 return Err(ReceiptError::UnrelatedResource);
             }
+            validate_observation_evidence(operation, observations)?;
             match operation {
-                PrivilegedOperation::Observe(targets) => {
+                PrivilegedOperation::Observe(targets)
+                | PrivilegedOperation::ObserveManaged(targets) => {
                     exact_target_observations(targets, observations)
                 }
                 PrivilegedOperation::StopTunnel(resource) => exact_observation_state(
@@ -541,6 +685,85 @@ fn validate_outcome(
             }
         }
     }
+}
+
+fn validate_observation_evidence(
+    operation: &PrivilegedOperation,
+    observations: &[ResourceObservation],
+) -> Result<(), ReceiptError> {
+    for observation in observations {
+        let expected = if let PrivilegedOperation::ObserveManaged(targets) = operation {
+            targets.iter().any(|target| {
+                target.resource() == observation.resource()
+                    && target.protocol()
+                        == Some(crate::vortix_core::profile::ProtocolKind::WireGuard)
+                    && observation.state() == ObservationState::Present
+            })
+        } else {
+            false
+        };
+        if observation.wireguard_peers().is_some() != expected {
+            return Err(ReceiptError::OutcomeMismatch);
+        }
+    }
+    Ok(())
+}
+
+fn validate_applied(
+    operation: &PrivilegedOperation,
+    ownership: &[ResourceOwnership],
+    authority: AuthorityEpoch,
+    lease_id: LeaseId,
+    sequence: RequestSequence,
+) -> Result<(), ReceiptError> {
+    bounded(ownership.len())?;
+    if has_duplicates(ownership.iter().map(ResourceOwnership::resource))
+        || ownership.iter().any(|item| {
+            item.authority_epoch != authority
+                || item.lease_id != lease_id
+                || item.acquired_sequence != sequence
+                || !operation.relates_to(&item.resource)
+        })
+    {
+        return Err(ReceiptError::UnrelatedResource);
+    }
+    match operation {
+        PrivilegedOperation::StartTunnel(plan) => {
+            let tunnel = ResourceTag::tunnel(plan.profile_id().clone(), plan.generation())
+                .map_err(|_| ReceiptError::UnrelatedResource)?;
+            let group = ResourceTag::profile(
+                plan.profile_id().clone(),
+                plan.generation(),
+                ResourceKind::ProcessGroup,
+            )
+            .map_err(|_| ReceiptError::UnrelatedResource)?;
+            match plan {
+                crate::vortix_core::privileged::ProtocolPlan::WireGuard(_) => {
+                    if ownership.len() != 1 || ownership[0].resource != tunnel {
+                        return Err(ReceiptError::MissingRequiredResource);
+                    }
+                }
+                crate::vortix_core::privileged::ProtocolPlan::OpenVpn(_) => {
+                    if ownership.len() != 2
+                        || !ownership.iter().any(|item| item.resource == tunnel)
+                        || !ownership.iter().any(|item| item.resource == group)
+                    {
+                        return Err(ReceiptError::MissingRequiredResource);
+                    }
+                }
+            }
+        }
+        PrivilegedOperation::StopTunnel(_)
+        | PrivilegedOperation::Observe(_)
+        | PrivilegedOperation::ObserveManaged(_)
+        | PrivilegedOperation::CleanupOwned(_) => return Err(ReceiptError::OutcomeMismatch),
+        PrivilegedOperation::NetworkPolicy(policy) => {
+            if ownership.len() != 1 || ownership[0].resource != *policy.policy_resource() {
+                return Err(ReceiptError::OutcomeMismatch);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn exact_observations(
@@ -610,6 +833,8 @@ pub enum ReceiptError {
     CollectionLimit,
     #[error("resource observation timestamp must be non-zero")]
     InvalidObservationTime,
+    #[error("WireGuard peer observation evidence is malformed or out of scope")]
+    InvalidPeerEvidence,
     #[error("unsupported privileged contract schema version")]
     UnsupportedSchema,
 }

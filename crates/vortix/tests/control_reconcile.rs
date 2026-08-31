@@ -53,6 +53,7 @@ fn work(
         profile_id,
         operation_id: operation(operation_value),
         revision: tunnel_revision(generation),
+        resource_revision: tunnel_revision(generation),
         mutation,
         protocol: TunnelKindTag::Mock,
         deadline: Instant::now() + Duration::from_secs(2),
@@ -90,6 +91,7 @@ fn restart_restores_only_disconnect_tombstone_fences() {
             PersistedTombstone {
                 authority_epoch: AuthorityEpoch(1),
                 generation: 4,
+                resource_generation: Some(3),
                 policy_digest: PolicyDigest("persisted-policy".into()),
                 operation_id: operation(9),
                 teardown_failed: true,
@@ -99,6 +101,7 @@ fn restart_restores_only_disconnect_tombstone_fences() {
 
     let restored = supervisor.tombstones().remove(&target).unwrap();
     assert_eq!(restored.revision.generation, 4);
+    assert_eq!(restored.resource_revision.generation, 3);
     assert!(restored.adoption.is_none());
     assert!(restored.handshake.is_none());
     assert!(restored.probe_receipts.is_empty());
@@ -135,7 +138,9 @@ impl PolicyExecutor for OkPolicy {
     fn apply(&self, _: &TopologyPolicy, _: PolicyBarrier) -> Result<(), String> {
         Ok(())
     }
-    fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) {}
+    fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 #[tokio::test]
@@ -374,6 +379,27 @@ fn cidr_overlap_is_normalized_and_active_lease_lives_until_disconnect() {
 }
 
 #[test]
+fn worker_rejects_resource_revision_drift_before_effect_dispatch() {
+    let pool = ProfileWorkerPool::new(Arc::new(OkExecutor), 1, 2);
+    let mut mismatched_connect = work(profile("connect-drift"), 2, 1, TunnelMutation::Connect);
+    mismatched_connect.resource_revision = tunnel_revision(1);
+    assert_eq!(
+        pool.dispatch(mismatched_connect, Vec::new()).unwrap_err(),
+        WorkFailure::EffectFailed
+    );
+
+    let mut foreign_disconnect = work(profile("foreign-drift"), 3, 2, TunnelMutation::Disconnect);
+    foreign_disconnect.resource_revision = TunnelRevision {
+        authority_epoch: AuthorityEpoch(2),
+        generation: 1,
+    };
+    assert_eq!(
+        pool.dispatch(foreign_disconnect, Vec::new()).unwrap_err(),
+        WorkFailure::Stale
+    );
+}
+
+#[test]
 fn cooperative_effect_is_cancelled_and_joined_without_abandoning_a_thread() {
     struct Cooperative;
     impl TunnelExecutor for Cooperative {
@@ -455,6 +481,23 @@ fn observation(
         adoption: None,
         observed_at_millis: 10,
     }
+}
+
+#[test]
+fn supervisor_exposes_owned_resource_revision_not_teardown_revision() {
+    let id = profile("owned-resource-revision");
+    let supervisor = Supervisor::new(
+        AuthorityEpoch(1),
+        Arc::new(OkExecutor),
+        Arc::new(OkPolicy),
+        2,
+        4,
+    );
+    let mut teardown = work(id.clone(), 5, 4, TunnelMutation::Disconnect);
+    teardown.resource_revision = tunnel_revision(4);
+    supervisor.dispatch_tunnel(teardown, Vec::new()).unwrap();
+
+    assert_eq!(supervisor.resource_revision(&id), Some(tunnel_revision(4)));
 }
 
 #[test]
@@ -545,13 +588,18 @@ fn failed_teardown_retries_and_probe_failure_does_not_clear_tombstone() {
             id.clone(),
             DisconnectTombstone {
                 revision: tunnel_rev,
+                resource_revision: tunnel_revision(4),
                 teardown_failed: true,
             },
         )]),
     };
     assert!(matches!(
         plan_reconciliation(&input).actions.as_slice(),
-        [ReconcileAction::Disconnect { .. }]
+        [ReconcileAction::Disconnect {
+            revision,
+            resource_revision,
+            ..
+        }] if revision.generation == 5 && resource_revision.generation == 4
     ));
     let absent = ReconcileInput {
         observations: BTreeMap::from([(
@@ -596,6 +644,7 @@ struct PolicyRecorder {
     fail_at: Mutex<Option<PolicyBarrier>>,
     compensations: Mutex<Vec<PolicyBarrier>>,
     panic_compensation: Mutex<bool>,
+    fail_compensation: Mutex<bool>,
 }
 impl PolicyExecutor for PolicyRecorder {
     fn apply(&self, policy: &TopologyPolicy, barrier: PolicyBarrier) -> Result<(), String> {
@@ -609,12 +658,17 @@ impl PolicyExecutor for PolicyRecorder {
             Ok(())
         }
     }
-    fn compensate(&self, _: &TopologyPolicy, barrier: PolicyBarrier) {
+    fn compensate(&self, _: &TopologyPolicy, barrier: PolicyBarrier) -> Result<(), String> {
         self.compensations.lock().unwrap().push(barrier);
         assert!(
             !*self.panic_compensation.lock().unwrap(),
             "injected compensation panic"
         );
+        if *self.fail_compensation.lock().unwrap() {
+            Err("injected compensation failure".into())
+        } else {
+            Ok(())
+        }
     }
 }
 fn policy(generation: u64, digest: &str) -> TopologyPolicy {
@@ -629,6 +683,7 @@ fn policy(generation: u64, digest: &str) -> TopologyPolicy {
             profiles: BTreeSet::from([profile("corp")]),
             ..TopologyState::default()
         },
+        prior_tunnel_revisions: BTreeMap::new(),
         tunnel_revisions: BTreeMap::from([(profile("corp"), tunnel_revision(generation))]),
         transition: TopologyTransitionKind::Connect,
         required_blocking: true,
@@ -712,13 +767,32 @@ fn compensation_panic_is_a_structured_policy_result() {
 }
 
 #[test]
+fn compensation_failure_is_not_reported_as_compensated() {
+    let recorder = Arc::new(PolicyRecorder::default());
+    *recorder.fail_at.lock().unwrap() = Some(PolicyBarrier::Route);
+    *recorder.fail_compensation.lock().unwrap() = true;
+    let worker = PolicyWorker::start(recorder, 4);
+    worker.submit(policy(1, "one")).unwrap();
+    let result = wait_until(Duration::from_secs(1), || worker.try_result()).unwrap();
+
+    assert_eq!(result.outcome, PolicyOutcome::Failed);
+    assert!(result
+        .receipts
+        .iter()
+        .filter(|receipt| receipt.applied)
+        .all(|receipt| !receipt.compensated));
+}
+
+#[test]
 fn cooperative_policy_apply_is_cancelled_and_joined() {
     struct CooperativePolicy;
     impl PolicyExecutor for CooperativePolicy {
         fn apply(&self, _: &TopologyPolicy, _: PolicyBarrier) -> Result<(), String> {
             Ok(())
         }
-        fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) {}
+        fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) -> Result<(), String> {
+            Ok(())
+        }
         fn apply_cancellable(
             &self,
             _: &TopologyPolicy,
@@ -747,7 +821,9 @@ fn timed_out_policy_shutdown_retains_the_owned_join_for_a_later_drain() {
         fn apply(&self, _: &TopologyPolicy, _: PolicyBarrier) -> Result<(), String> {
             Ok(())
         }
-        fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) {}
+        fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) -> Result<(), String> {
+            Ok(())
+        }
         fn apply_cancellable(
             &self,
             _: &TopologyPolicy,
@@ -791,7 +867,9 @@ fn pending_coalescing_emits_superseded_receipt() {
             }
             Ok(())
         }
-        fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) {}
+        fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) -> Result<(), String> {
+            Ok(())
+        }
     }
     let entered = Arc::new(Barrier::new(2));
     let release = Arc::new(Barrier::new(2));
@@ -978,7 +1056,11 @@ fn stale_inflight_tuple_plans_cleanup_not_convergence() {
     };
     assert!(matches!(
         plan_reconciliation(&input).actions.as_slice(),
-        [ReconcileAction::CleanupStaleManaged { .. }]
+        [ReconcileAction::CleanupStaleManaged {
+            stale_revision: Some(stale),
+            target_revision: target,
+            ..
+        }] if stale.generation == 1 && target.generation == 2
     ));
 }
 
@@ -1124,6 +1206,7 @@ struct PreBlockGate {
 #[derive(Default)]
 struct TopologyCapture {
     tunnel_calls: Mutex<Vec<(ProfileId, TunnelMutation, u64)>>,
+    resource_calls: Mutex<Vec<(ProfileId, TunnelMutation, u64)>>,
     policies: Mutex<Vec<TopologyPolicy>>,
     pre_block: (Mutex<PreBlockGate>, Condvar),
     failed_final: Mutex<BTreeSet<u64>>,
@@ -1174,6 +1257,11 @@ impl TunnelExecutor for TopologyCapture {
             work.mutation,
             work.revision.generation,
         ));
+        self.resource_calls.lock().unwrap().push((
+            work.profile_id.clone(),
+            work.mutation,
+            work.resource_revision.generation,
+        ));
         Ok(execution_receipt(work))
     }
 }
@@ -1212,7 +1300,9 @@ impl PolicyExecutor for TopologyCapture {
         Ok(())
     }
 
-    fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) {}
+    fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) -> Result<(), String> {
+        Ok(())
+    }
 
     fn verification(&self, policy: &TopologyPolicy) -> Option<PolicyExecutionEvidence> {
         (policy.stage == PolicyStage::Final && self.publish_readback.load(Ordering::SeqCst))
@@ -1585,6 +1675,16 @@ async fn disconnect_waits_for_exact_pre_block_and_keeps_transition_at_final_stag
         "prepare-disconnect",
     )
     .await;
+    let connected_generation = capture
+        .resource_calls
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find_map(|(profile_id, mutation, generation)| {
+            (profile_id == &target && *mutation == TunnelMutation::Connect).then_some(*generation)
+        })
+        .expect("connected resource generation recorded");
     set_killswitch_and_settle(
         &service,
         &capture,
@@ -1629,6 +1729,13 @@ async fn disconnect_waits_for_exact_pre_block_and_keeps_transition_at_final_stag
         "disconnect did not execute after the pre-block receipt",
     )
     .await;
+    assert!(capture.resource_calls.lock().unwrap().iter().any(
+        |(profile_id, mutation, resource_generation)| {
+            profile_id == &target
+                && *mutation == TunnelMutation::Disconnect
+                && *resource_generation == connected_generation
+        }
+    ));
     observe_disconnected(&service, &target).await;
     wait_for_condition(
         || {
@@ -2159,7 +2266,9 @@ async fn later_policy_command_drives_retry_for_older_tunnel_revision() {
             Ok(())
         }
 
-        fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) {}
+        fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) -> Result<(), String> {
+            Ok(())
+        }
     }
 
     let target = profile("retry-after-policy");
@@ -2308,7 +2417,9 @@ async fn opposite_profile_intent_cancels_older_pending_operation() {
             Ok(())
         }
 
-        fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) {}
+        fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) -> Result<(), String> {
+            Ok(())
+        }
     }
 
     let target = profile("opposite-intent");
@@ -3144,7 +3255,9 @@ async fn policy_waits_for_attested_tunnel_and_carries_complete_topology() {
             }
             Ok(())
         }
-        fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) {}
+        fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) -> Result<(), String> {
+            Ok(())
+        }
     }
     let target = profile("complete-policy");
     let capture = Arc::new(Capture::default());

@@ -3,7 +3,7 @@ Description=Vortix enrolled daemon for %i (inactive U11 template)
 Documentation=https://github.com/Harry-kp/vortix
 After=network-online.target
 Wants=network-online.target
-ConditionPathExists=/var/lib/vortix/enrollment/%i/enrolled
+ConditionPathExists=/var/lib/vortix/enrollment.json
 
 [Service]
 Type=simple
@@ -11,6 +11,7 @@ User=%i
 RuntimeDirectory=vortix-%i
 RuntimeDirectoryMode=0700
 Environment=VORTIX_DAEMON_SOCKET=/run/vortix-%i/daemon.sock
+EnvironmentFile=/var/lib/vortix/daemon.env
 ExecStart=/usr/libexec/vortix/vortix daemon
 Restart=on-failure
 RestartSec=5

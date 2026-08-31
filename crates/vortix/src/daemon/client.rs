@@ -22,6 +22,7 @@ use crate::vortix_core::ipc::{
     IpcError, IpcOp, IpcRequest, IpcResponse, IpcResult, PassiveSnapshot, ServerHello,
     IPC_PROTOCOL_MAX, IPC_PROTOCOL_MIN, IPC_SCHEMA_MAX, IPC_SCHEMA_MIN,
 };
+use crate::vortix_core::privileged::AuthorityBinding;
 
 use super::service::{
     RemoteControlError, RemoteControlSubscription, RemoteControlTransport, RemoteControlUpdate,
@@ -43,6 +44,8 @@ pub enum ClientError {
     /// A bounded subscription consumer fell behind. Reconnect to obtain a
     /// fresh subscribe-before-snapshot boundary.
     ResyncRequired { newest_generation: u64 },
+    /// A control-capable daemon did not present the enrolled authority.
+    AuthorityMismatch,
     /// Daemon returned a result variant we weren't expecting for the
     /// op we sent. Carries a description string for diagnostics.
     Unexpected(String),
@@ -58,6 +61,9 @@ impl std::fmt::Display for ClientError {
                 f,
                 "subscription lagged; resubscribe at generation {newest_generation}"
             ),
+            Self::AuthorityMismatch => {
+                write!(f, "daemon authority does not match enrollment")
+            }
             Self::Unexpected(s) => write!(f, "unexpected daemon response: {s}"),
         }
     }
@@ -90,9 +96,28 @@ impl From<FrameError> for ClientError {
 /// handlers treat any error here as "bypass: read directly from
 /// disk + scanner instead".
 pub fn request(socket_path: &Path, op: IpcOp) -> Result<IpcResult, ClientError> {
+    request_with_authority(socket_path, op, None)
+}
+
+fn request_authorized(
+    socket_path: &Path,
+    op: IpcOp,
+    expected: AuthorityBinding,
+) -> Result<IpcResult, ClientError> {
+    request_with_authority(socket_path, op, Some(expected))
+}
+
+fn request_with_authority(
+    socket_path: &Path,
+    op: IpcOp,
+    expected: Option<AuthorityBinding>,
+) -> Result<IpcResult, ClientError> {
     let required = op.required_capability();
-    let (mut stream, mut buffered) =
+    let (mut stream, mut buffered, hello) =
         connect_handshaken(socket_path, required, Instant::now() + IPC_EXCHANGE_TIMEOUT)?;
+    if expected.is_some() && hello.authority_binding != expected {
+        return Err(ClientError::AuthorityMismatch);
+    }
     let request = IpcRequest { id: 2, op };
     let result = exchange_until(
         &mut stream,
@@ -110,7 +135,7 @@ fn connect_handshaken(
     socket_path: &Path,
     required: IpcCapability,
     deadline: Instant,
-) -> Result<(UnixStream, Vec<u8>), ClientError> {
+) -> Result<(UnixStream, Vec<u8>, ServerHello), ClientError> {
     validate_socket_owner(socket_path)?;
     let mut stream = connect_with_deadline(socket_path, deadline)?;
     let mut buffered = Vec::with_capacity(4096);
@@ -120,18 +145,21 @@ fn connect_handshaken(
             hello: ClientHello::current(vec![required]),
         },
     };
-    match exchange_until(&mut stream, &mut buffered, &handshake, deadline)?
+    let hello = match exchange_until(&mut stream, &mut buffered, &handshake, deadline)?
         .result
         .map_err(ClientError::Daemon)?
     {
-        IpcResult::Handshake { hello } => validate_handshake(&hello, required)?,
+        IpcResult::Handshake { hello } => {
+            validate_handshake(&hello, required)?;
+            hello
+        }
         other => {
             return Err(ClientError::Unexpected(format!(
                 "invalid handshake response: {other:?}"
             )));
         }
-    }
-    Ok((stream, buffered))
+    };
+    Ok((stream, buffered, hello))
 }
 
 fn exchange_until(
@@ -245,16 +273,11 @@ impl UnixRemoteControlTransport {
     pub fn new(socket_path: std::path::PathBuf) -> Self {
         Self { socket_path }
     }
-}
 
-impl RemoteControlTransport for UnixRemoteControlTransport {
-    fn exchange(&self, op: IpcOp) -> Result<IpcResult, RemoteControlError> {
-        request(&self.socket_path, op).map_err(remote_error)
-    }
-
-    fn subscribe(
+    fn subscribe_control(
         &self,
         session_id: &crate::vortix_core::ipc::RemoteSessionId,
+        expected_authority: Option<AuthorityBinding>,
     ) -> Result<
         (
             Box<dyn RemoteControlSubscription>,
@@ -268,6 +291,7 @@ impl RemoteControlTransport for UnixRemoteControlTransport {
             IpcOp::ControlSubscribe {
                 session_id: session_id.clone(),
             },
+            expected_authority,
         )
         .map_err(remote_error)?;
         let IpcResult::ControlSubscribed { snapshot } = result else {
@@ -282,6 +306,51 @@ impl RemoteControlTransport for UnixRemoteControlTransport {
     }
 }
 
+impl RemoteControlTransport for UnixRemoteControlTransport {
+    fn open_authorized(&self, expected: AuthorityBinding) -> Result<IpcResult, RemoteControlError> {
+        request_authorized(&self.socket_path, IpcOp::ControlOpen, expected).map_err(remote_error)
+    }
+
+    fn exchange(&self, op: IpcOp) -> Result<IpcResult, RemoteControlError> {
+        request(&self.socket_path, op).map_err(remote_error)
+    }
+
+    fn exchange_authorized(
+        &self,
+        op: IpcOp,
+        expected: AuthorityBinding,
+    ) -> Result<IpcResult, RemoteControlError> {
+        request_authorized(&self.socket_path, op, expected).map_err(remote_error)
+    }
+
+    fn subscribe(
+        &self,
+        session_id: &crate::vortix_core::ipc::RemoteSessionId,
+    ) -> Result<
+        (
+            Box<dyn RemoteControlSubscription>,
+            crate::vortix_core::control::ControlSnapshot,
+        ),
+        RemoteControlError,
+    > {
+        self.subscribe_control(session_id, None)
+    }
+
+    fn subscribe_authorized(
+        &self,
+        session_id: &crate::vortix_core::ipc::RemoteSessionId,
+        expected: AuthorityBinding,
+    ) -> Result<
+        (
+            Box<dyn RemoteControlSubscription>,
+            crate::vortix_core::control::ControlSnapshot,
+        ),
+        RemoteControlError,
+    > {
+        self.subscribe_control(session_id, Some(expected))
+    }
+}
+
 fn remote_error(error: ClientError) -> RemoteControlError {
     match error {
         ClientError::Io(error) => RemoteControlError::Unavailable(error.to_string()),
@@ -290,6 +359,7 @@ fn remote_error(error: ClientError) -> RemoteControlError {
         ClientError::ResyncRequired { newest_generation } => {
             RemoteControlError::ResyncRequired { newest_generation }
         }
+        ClientError::AuthorityMismatch => RemoteControlError::AuthorityMismatch,
         ClientError::Unexpected(error) => RemoteControlError::Protocol(error),
     }
 }
@@ -347,6 +417,7 @@ pub fn subscribe(socket_path: &Path) -> Result<PassiveSubscription, ClientError>
         socket_path,
         IpcCapability::PassiveSubscribe,
         IpcOp::PassiveSubscribe,
+        None,
     )?;
     let initial = match result {
         IpcResult::PassiveSubscribed { snapshot } => {
@@ -371,6 +442,7 @@ pub fn subscribe_diagnostics(socket_path: &Path) -> Result<DiagnosticSubscriptio
         socket_path,
         IpcCapability::DiagnosticsSubscribe,
         IpcOp::DiagnosticsSubscribe,
+        None,
     )?;
     let initial = match result {
         IpcResult::DiagnosticSubscribed { snapshot } => {
@@ -394,12 +466,16 @@ fn open_subscription(
     socket_path: &Path,
     capability: IpcCapability,
     op: IpcOp,
+    expected_authority: Option<AuthorityBinding>,
 ) -> Result<(UnixStream, Vec<u8>, IpcResult), ClientError> {
-    let (mut stream, mut buffered) = connect_handshaken(
+    let (mut stream, mut buffered, hello) = connect_handshaken(
         socket_path,
         capability,
         Instant::now() + IPC_EXCHANGE_TIMEOUT,
     )?;
+    if expected_authority.is_some() && hello.authority_binding != expected_authority {
+        return Err(ClientError::AuthorityMismatch);
+    }
     let result = exchange_until(
         &mut stream,
         &mut buffered,
@@ -444,6 +520,7 @@ fn validate_handshake(hello: &ServerHello, required: IpcCapability) -> Result<()
         || !required.is_available_in_schema(hello.schema)
         || (!control && hello.capabilities.as_slice() != capabilities_for_schema(hello.schema))
         || (!control && hello.capabilities.contains(&IpcCapability::ControlMutation))
+        || (hello.authority_binding.is_some() != control)
     {
         return Err(ClientError::Unexpected(format!(
             "invalid daemon handshake response: {hello:?}"
@@ -558,6 +635,9 @@ pub fn diagnostics_or_fallback(
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::net::UnixListener;
+
     use super::*;
     use crate::vortix_core::ipc::{
         CompatibilityRange, IPC_PROTOCOL_MAX, IPC_SCHEMA_MAX, PASSIVE_CAPABILITIES,
@@ -571,6 +651,30 @@ mod tests {
             schema: IPC_SCHEMA_MAX,
             capabilities: PASSIVE_CAPABILITIES.to_vec(),
             passive: true,
+            authority_binding: None,
+        }
+    }
+
+    fn authority_binding(marker: u8) -> AuthorityBinding {
+        AuthorityBinding::new(
+            crate::vortix_core::control::AuthorityEpoch(u64::from(marker)),
+            crate::vortix_core::privileged::BootScope::new([marker; 16]),
+            crate::vortix_core::privileged::LeaseId::new([marker; 32]),
+            crate::vortix_core::privileged::OperationDigest::of_bytes(&[marker]),
+        )
+        .unwrap()
+    }
+
+    fn read_test_request(stream: &mut UnixStream) -> IpcRequest {
+        let mut buffered = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            if let Some((request, _)) = decode_frame::<IpcRequest>(&buffered).unwrap() {
+                return request;
+            }
+            let count = stream.read(&mut chunk).unwrap();
+            assert_ne!(count, 0, "client closed before sending its handshake");
+            buffered.extend_from_slice(&chunk[..count]);
         }
     }
 
@@ -579,6 +683,71 @@ mod tests {
         let mut hello = passive_hello();
         hello.capabilities.push(IpcCapability::ControlMutation);
         assert!(validate_handshake(&hello, IpcCapability::PassiveSnapshot).is_err());
+    }
+
+    #[test]
+    fn client_rejects_authority_binding_from_passive_peer() {
+        let mut hello = passive_hello();
+        hello.authority_binding = Some(
+            crate::vortix_core::privileged::AuthorityBinding::new(
+                crate::vortix_core::control::AuthorityEpoch(1),
+                crate::vortix_core::privileged::BootScope::new([1; 16]),
+                crate::vortix_core::privileged::LeaseId::new([2; 32]),
+                crate::vortix_core::privileged::OperationDigest::of_bytes(b"service"),
+            )
+            .unwrap(),
+        );
+        assert!(validate_handshake(&hello, IpcCapability::PassiveSnapshot).is_err());
+    }
+
+    #[test]
+    fn authorized_request_rejects_mismatch_before_sending_operation() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket_path = directory.path().join("s");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let actual = authority_binding(1);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let handshake = read_test_request(&mut stream);
+            assert!(matches!(handshake.op, IpcOp::Handshake { .. }));
+            let response = IpcResponse {
+                id: handshake.id,
+                result: Ok(IpcResult::Handshake {
+                    hello: ServerHello {
+                        product: "vortix".into(),
+                        product_version: env!("CARGO_PKG_VERSION").into(),
+                        protocol: IPC_PROTOCOL_MAX,
+                        schema: IPC_SCHEMA_MAX,
+                        capabilities: vec![IpcCapability::ControlMutation],
+                        passive: false,
+                        authority_binding: Some(actual),
+                    },
+                }),
+            };
+            stream.write_all(&encode_frame(&response).unwrap()).unwrap();
+            let mut operation = [0_u8; 1];
+            assert_eq!(
+                stream.read(&mut operation).unwrap(),
+                0,
+                "client sent an operation before rejecting the mismatched authority"
+            );
+        });
+
+        let result = request_authorized(
+            &socket_path,
+            IpcOp::ControlSnapshot {
+                session_id: crate::vortix_core::ipc::RemoteSessionId::parse(format!(
+                    "session-{}",
+                    "a".repeat(32)
+                ))
+                .unwrap(),
+            },
+            authority_binding(2),
+        );
+
+        assert!(matches!(result, Err(ClientError::AuthorityMismatch)));
+        server.join().unwrap();
     }
 
     #[test]

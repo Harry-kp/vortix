@@ -1,8 +1,9 @@
-//! `vortix daemon` — bounded, passive IPC candidate.
+//! `vortix daemon` — bounded IPC candidate.
 //!
 //! The daemon binds an owner-only Unix socket and publishes scanner-derived
-//! snapshots to concurrent clients. It deliberately has no desired-state,
-//! lifecycle-authority, persistence, retry, or mutation capability.
+//! snapshots to concurrent clients. Production remains passive in this
+//! release. A dormant control host exists for parity testing, but it has no
+//! production constructor until enrolled helper-backed execution is complete.
 //!
 //! Filesystem ownership and peer credentials both enforce same-UID access.
 //! A mandatory compatibility handshake precedes all requests. Connections,
@@ -16,11 +17,14 @@
 //! 5. Unlink only the exact socket inode this process created
 
 pub mod client;
+pub(crate) mod control_host;
 pub mod diagnostics;
 pub(crate) mod helper_client;
 pub mod passive;
 mod server;
 pub mod service;
+mod tunnel_executor;
+mod tunnel_material;
 
 pub use server::DaemonServer;
 

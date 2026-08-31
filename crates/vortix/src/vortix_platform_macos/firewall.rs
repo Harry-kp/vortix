@@ -32,7 +32,9 @@ const PF_CONF_PATH_LEGACY: &str = "/tmp/vortix_killswitch.conf";
 /// macOS' stock pf.conf traverses the `com.apple/*` wildcard anchor. Keeping
 /// Vortix policy below that existing hook lets us own and replace only this
 /// anchor without rewriting the host's global ruleset.
-const PF_ANCHOR: &str = "com.apple/vortix.killswitch";
+pub(crate) const PF_ANCHOR: &str = "com.apple/vortix.killswitch";
+pub(crate) const PF_APPLY_ARGS: [&str; 4] = ["-a", PF_ANCHOR, "-f", "-"];
+pub(crate) const PF_RELEASE_ARGS: [&str; 4] = ["-a", PF_ANCHOR, "-F", "rules"];
 const POLICY_LABEL_PREFIX: &str = "vortix-policy:";
 
 fn pfctl(args: &[&str]) -> std::io::Result<std::process::Output> {
@@ -48,12 +50,9 @@ fn pfctl(args: &[&str]) -> std::io::Result<std::process::Output> {
 /// commits.
 fn pfctl_load_stdin(ruleset: &[u8]) -> std::io::Result<std::process::Output> {
     crate::vortix_process::run_to_output(
-        CommandSpec::oneshot(
-            "pfctl",
-            PfFirewall::apply_args().map(str::to_string).to_vec(),
-        )
-        .privilege(PrivilegeReq::Root)
-        .stdin(ruleset.to_vec()),
+        CommandSpec::oneshot("pfctl", PF_APPLY_ARGS.map(str::to_string).to_vec())
+            .privilege(PrivilegeReq::Root)
+            .stdin(ruleset.to_vec()),
     )
 }
 
@@ -61,32 +60,12 @@ fn pfctl_load_stdin(ruleset: &[u8]) -> std::io::Result<std::process::Output> {
 pub struct PfFirewall;
 
 impl PfFirewall {
-    #[must_use]
-    const fn apply_args() -> [&'static str; 4] {
-        ["-a", PF_ANCHOR, "-f", "-"]
-    }
-
-    #[must_use]
-    const fn release_args() -> [&'static str; 4] {
-        ["-a", PF_ANCHOR, "-F", "rules"]
-    }
-
-    fn canonical_pf_rules(rules: &str) -> Vec<&str> {
+    pub(crate) fn canonical_pf_rules(rules: &str) -> Vec<&str> {
         rules
             .lines()
             .map(str::trim)
             .filter(|line| !line.is_empty() && !line.starts_with('#'))
             .collect()
-    }
-
-    fn pf_snapshot_matches(expected: &str, observed: &str) -> bool {
-        let expected = Self::canonical_pf_rules(expected);
-        let observed = Self::canonical_pf_rules(observed);
-        expected.len() == observed.len()
-            && expected
-                .iter()
-                .zip(observed)
-                .all(|(expected, observed)| observed.starts_with(expected))
     }
 
     /// Synthesise the pf ruleset for the given active tunnel set.
@@ -180,6 +159,34 @@ impl PfFirewall {
         rules
     }
 
+    pub(crate) fn root_traverses_anchor(root_rules: &str) -> bool {
+        let exact_anchor = format!("\"{PF_ANCHOR}\"");
+        Self::canonical_pf_rules(root_rules).iter().any(|line| {
+            let mut tokens = line.split_ascii_whitespace();
+            tokens.next() == Some("anchor")
+                && tokens
+                    .next()
+                    .is_some_and(|value| value == "\"com.apple/*\"" || value == exact_anchor)
+        })
+    }
+
+    pub(crate) fn snapshot_matches_policy(active: &[ActiveTunnelInfo], observed: &str) -> bool {
+        Self::canonical_snapshot_matches(active, &Self::canonical_pf_rules(observed))
+    }
+
+    pub(crate) fn canonical_snapshot_matches(
+        active: &[ActiveTunnelInfo],
+        observed: &[&str],
+    ) -> bool {
+        let expected = Self::generate_pf_rules(active);
+        let expected = Self::canonical_pf_rules(&expected);
+        expected.len() == observed.len()
+            && expected
+                .iter()
+                .zip(observed)
+                .all(|(expected, observed)| observed.starts_with(expected))
+    }
+
     /// Best-effort write of the ruleset to `PF_CONF_PATH` for diagnostic
     /// inspection. Failure to write the snapshot is logged but does not
     /// abort the engage — the authoritative ruleset goes to pfctl via
@@ -248,10 +255,7 @@ impl Killswitch for PfFirewall {
         // populated but inert anchor must not mutate global PF state.
         let output = pfctl(&["-sr"])?;
         let root_rules = String::from_utf8_lossy(&output.stdout);
-        if !output.status.success()
-            || (!root_rules.contains("anchor \"com.apple/*\"")
-                && !root_rules.contains(&format!("anchor \"{PF_ANCHOR}\"")))
-        {
+        if !output.status.success() || !Self::root_traverses_anchor(&root_rules) {
             return Err(KillswitchError::CommandFailed(
                 "root pf ruleset does not traverse the Vortix anchor".to_string(),
             ));
@@ -291,14 +295,7 @@ impl Killswitch for PfFirewall {
 
         let output = pfctl(&["-a", PF_ANCHOR, "-sr"])?;
         let snapshot = String::from_utf8_lossy(&output.stdout);
-        let digest = crate::core::killswitch::policy_digest(active);
-        let terminal = format!("block drop out quick all label \"{POLICY_LABEL_PREFIX}{digest}\"");
-        if !output.status.success()
-            || !Self::pf_snapshot_matches(&rules, &snapshot)
-            || !Self::canonical_pf_rules(&snapshot)
-                .last()
-                .is_some_and(|line| line.starts_with(&terminal))
-        {
+        if !output.status.success() || !Self::snapshot_matches_policy(active, &snapshot) {
             return Err(KillswitchError::CommandFailed(
                 "pf anchor read-back did not match the requested policy".to_string(),
             ));
@@ -323,7 +320,7 @@ impl Killswitch for PfFirewall {
             return Err(KillswitchError::NotRoot);
         }
 
-        let output = pfctl(&Self::release_args())?;
+        let output = pfctl(&PF_RELEASE_ARGS)?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             if !stderr.contains("not enabled") && !stderr.contains("does not exist") {
@@ -398,8 +395,24 @@ mod tests {
 
     #[test]
     fn pf_mutations_are_scoped_to_the_vortix_anchor() {
-        assert_eq!(PfFirewall::apply_args(), ["-a", PF_ANCHOR, "-f", "-"]);
-        assert_eq!(PfFirewall::release_args(), ["-a", PF_ANCHOR, "-F", "rules"]);
+        assert_eq!(PF_APPLY_ARGS, ["-a", PF_ANCHOR, "-f", "-"]);
+        assert_eq!(PF_RELEASE_ARGS, ["-a", PF_ANCHOR, "-F", "rules"]);
+    }
+
+    #[test]
+    fn root_anchor_traversal_requires_an_exact_anchor_token() {
+        assert!(PfFirewall::root_traverses_anchor(
+            "anchor \"com.apple/*\" all\n"
+        ));
+        assert!(PfFirewall::root_traverses_anchor(
+            "anchor \"com.apple/vortix.killswitch\"\n"
+        ));
+        assert!(!PfFirewall::root_traverses_anchor(
+            "anchor \"com.apple/*-lookalike\"\n"
+        ));
+        assert!(!PfFirewall::root_traverses_anchor(
+            "pass quick label \"anchor \\\"com.apple/*\\\"\"\n"
+        ));
     }
 
     #[test]
