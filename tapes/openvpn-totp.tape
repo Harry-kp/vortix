@@ -7,15 +7,12 @@
 # Records ~30 s; output lands at assets/openvpn-totp.gif.
 #
 # Prerequisites:
-#   ./scripts/test-infra.sh up ovpn-totp
-#   ./scripts/test-infra.sh import
+#   ./scripts/vpn-lab.sh up
+#   Copy 04-openvpn-tcp-static-challenge.ovpn to ovpn-totp.ovpn in the clean
+#   demo profile directory and import it into vortix.
 #   sudo NOPASSWD configured for vortix (see README).
-#   A working TOTP code for the test profile. The test-infra script provisions
-#   a per-droplet secret; read it from
-#   scripts/test-profiles/ovpn-totp-credentials.txt after `./scripts/test-infra.sh profiles`,
-#   then generate a current code:
-#     oathtool --totp -b "$(awk '/totp_secret:/ {print $2}' scripts/test-profiles/ovpn-totp-credentials.txt)"
-#   Substitute the 6-digit code into the Type "000000" line below before running.
+#   The generated credentials.txt supplies the fixed isolated-lab values:
+#   username `vortix`, password `vortix-pass`, static challenge `123456`.
 #
 #   vhs tapes/openvpn-totp.tape
 
@@ -55,16 +52,13 @@ Tab
 Sleep 300ms
 
 # Password field
-Type "testpass123"
+Type "vortix-pass"
 Sleep 500ms
 Tab
 Sleep 300ms
 
-# OTP / TOTP code — populated at record time by the orchestrator (run
-# `oathtool` against the per-droplet secret extracted from
-# scripts/test-profiles/ovpn-totp-credentials.txt). The literal in the
-# tape is a placeholder; replace with a current code via sed before vhs.
-Type "000000"
+# Static challenge accepted only by the ephemeral lab's profile 04.
+Type "123456"
 Sleep 400ms
 
 # Submit
