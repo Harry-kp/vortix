@@ -508,6 +508,9 @@ struct OpenedCredential {
 struct EntryIdentity {
     device: u64,
     inode: u64,
+    length: u64,
+    ctime_seconds: i64,
+    ctime_nanoseconds: i64,
 }
 
 #[cfg(unix)]
@@ -517,6 +520,9 @@ impl EntryIdentity {
         Self {
             device: metadata.dev(),
             inode: metadata.ino(),
+            length: metadata.len(),
+            ctime_seconds: metadata.ctime(),
+            ctime_nanoseconds: metadata.ctime_nsec(),
         }
     }
 }
@@ -527,6 +533,9 @@ impl EntryIdentity {
         Self {
             device: 0,
             inode: 0,
+            length: 0,
+            ctime_seconds: 0,
+            ctime_nanoseconds: 0,
         }
     }
 }
@@ -734,37 +743,35 @@ fn adopt_descriptor(file: &std::fs::File, uid: u32, gid: u32) -> Result<(), Cred
 
 #[cfg(unix)]
 #[allow(unsafe_code)]
-#[allow(clippy::cast_sign_loss, clippy::unnecessary_cast)]
 fn entry_matches(
     directory: &ControlDirectory,
     name: &str,
     expected: Option<EntryIdentity>,
 ) -> Result<bool, ControlStateError> {
     use std::ffi::CString;
-    use std::os::fd::AsRawFd as _;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
 
     let name = CString::new(name).map_err(|_| ControlStateError::UnsafeFile)?;
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    if unsafe {
-        libc::fstatat(
+    let fd = unsafe {
+        libc::openat(
             directory.as_raw_fd(),
             name.as_ptr(),
-            stat.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         )
-    } != 0
-    {
+    };
+    if fd < 0 {
         let error = std::io::Error::last_os_error();
         return if error.raw_os_error() == Some(libc::ENOENT) {
             Ok(expected.is_none())
+        } else if error.raw_os_error() == Some(libc::ELOOP) {
+            Ok(false)
         } else {
             Err(error.into())
         };
     }
-    let stat = unsafe { stat.assume_init() };
-    Ok(expected.is_some_and(|identity| {
-        stat.st_dev as u64 == identity.device && stat.st_ino as u64 == identity.inode
-    }))
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let actual = EntryIdentity::from_metadata(&file.metadata()?);
+    Ok(expected == Some(actual))
 }
 
 #[cfg(not(unix))]
