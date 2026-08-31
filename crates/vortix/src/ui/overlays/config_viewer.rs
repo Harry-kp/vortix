@@ -5,7 +5,7 @@ use crate::theme;
 use crate::ui::helpers::centered_rect;
 use ratatui::{
     layout::{Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
     Frame,
@@ -51,7 +51,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     frame.render_widget(block, area);
 
     // Show the file path at the top
-    let path_style = Style::default().fg(Color::DarkGray);
+    let path_style = Style::default().fg(theme::current().key_hint_desc);
 
     // Lines + count come straight from the cache built in `OpenConfig`.
     // No file re-read, no per-line re-highlighting per frame.
@@ -83,7 +83,10 @@ pub fn render(frame: &mut Frame, app: &App) {
                 path_display,
                 Style::default().fg(theme::current().text_secondary),
             ),
-            Span::styled(scroll_info, Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                scroll_info,
+                Style::default().fg(theme::current().key_hint_desc),
+            ),
         ])),
         content_area[0],
     );
@@ -126,7 +129,10 @@ pub(crate) fn highlight_config_line(line: &str) -> Line<'static> {
 
     // Comments
     if trimmed.starts_with('#') || trimmed.starts_with(';') {
-        return Line::from(Span::styled(line, Style::default().fg(Color::DarkGray)));
+        return Line::from(Span::styled(
+            line,
+            Style::default().fg(theme::current().inactive),
+        ));
     }
 
     // Section headers [Interface], [Peer], etc.
@@ -152,7 +158,7 @@ pub(crate) fn highlight_config_line(line: &str) -> Line<'static> {
                 key.to_string(),
                 Style::default().fg(theme::current().accent_primary),
             ),
-            Span::styled("=", Style::default().fg(Color::DarkGray)),
+            Span::styled("=", Style::default().fg(theme::current().separator)),
             Span::styled(
                 masked_value,
                 Style::default().fg(theme::current().text_primary),

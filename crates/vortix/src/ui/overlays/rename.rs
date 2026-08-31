@@ -31,7 +31,7 @@ pub fn render(frame: &mut Frame, name: &str, cursor: usize) {
         ))
         .title_bottom(Span::styled(
             " Enter confirm │ Esc cancel ",
-            Style::default().fg(ratatui::style::Color::DarkGray),
+            Style::default().fg(theme::current().key_hint_desc),
         ));
 
     let inner = block.inner(overlay);

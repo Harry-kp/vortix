@@ -385,8 +385,8 @@ mod tests {
     fn style_combines_color_and_modifiers() {
         // Sanity check on `Sigil::style()` — bold/dim flags compose
         // with the fg color.
-        fn red() -> Color {
-            Color::Red
+        fn test_color() -> Color {
+            crate::theme::SYNTHWAVE.error
         }
 
         let bold_alarm = Sigil {
@@ -394,13 +394,13 @@ mod tests {
             glyph: "x",
             label: "x",
             description: "x",
-            color: red,
+            color: test_color,
             bold: true,
             dim: false,
             category: SigilCategory::SecurityGuard,
         };
         let style = bold_alarm.style();
-        assert_eq!(style.fg, Some(Color::Red));
+        assert_eq!(style.fg, Some(crate::theme::SYNTHWAVE.error));
         assert!(style.add_modifier.contains(Modifier::BOLD));
         assert!(!style.add_modifier.contains(Modifier::DIM));
     }

@@ -48,8 +48,8 @@ use ratatui::widgets::TableState;
 /// can re-process the full file, so the TUI wedges. With this cache,
 /// scroll-bound checks are O(1) and the renderer just clones a Vec.
 pub struct CachedConfigView {
-    /// Raw file contents. Stored for completeness (so external code
-    /// reading `app.cached_config` sees what's actually loaded). The
+    /// Raw file contents retained so live theme changes can rebuild the
+    /// highlighted lines without rereading the profile from disk. The
     /// renderer reads from [`Self::highlighted_lines`] instead.
     pub content: String,
     /// Line count computed once at load time. `u16` matches the
@@ -66,11 +66,13 @@ impl CachedConfigView {
     /// pre-highlights them so the open-config keypress pays the cost
     /// once and every subsequent scroll/render frame is constant-time.
     #[must_use]
-    pub fn from_content(content: String) -> Self {
-        let highlighted_lines: Vec<Line<'static>> = content
-            .lines()
-            .map(crate::ui::overlays::config_viewer::highlight_config_line)
-            .collect();
+    pub fn from_content(content: String, choice: crate::theme::ThemeChoice) -> Self {
+        let highlighted_lines = crate::theme::with_choice(choice, || {
+            content
+                .lines()
+                .map(crate::ui::overlays::config_viewer::highlight_config_line)
+                .collect::<Vec<Line<'static>>>()
+        });
         let total_lines = u16::try_from(highlighted_lines.len()).unwrap_or(u16::MAX);
         Self {
             content,
@@ -85,6 +87,13 @@ pub(crate) struct PendingProfileImports {
     remaining: std::collections::VecDeque<std::path::PathBuf>,
     queued: usize,
     failed: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PendingThemeChange {
+    previous: crate::theme::ThemeChoice,
+    selected: crate::theme::ThemeChoice,
+    quit_after: bool,
 }
 use std::collections::HashMap;
 
@@ -209,6 +218,9 @@ pub struct App {
     /// turns aggressive scroll-spam from O(N²) (re-parse on every key)
     /// into O(N) once + O(viewport) per frame.
     pub cached_config: Option<CachedConfigView>,
+    /// The one in-flight theme persistence transaction. The palette changes
+    /// immediately; a failed write restores the previous choice.
+    pub(crate) pending_theme_change: Option<PendingThemeChange>,
     pub search_match_count: usize,
     pub profile_list_state: TableState,
     pub panel_areas: HashMap<FocusedPanel, Rect>,
@@ -273,6 +285,7 @@ impl App {
             action_menu_state: ratatui::widgets::ListState::default(),
             config_scroll: 0,
             cached_config: None,
+            pending_theme_change: None,
             search_match_count: 0,
             profile_list_state: TableState::default(),
             panel_areas: HashMap::new(),
@@ -459,6 +472,7 @@ impl App {
             action_menu_state: ratatui::widgets::ListState::default(),
             config_scroll: 0,
             cached_config: None,
+            pending_theme_change: None,
             search_match_count: 0,
             profile_list_state: TableState::default(),
             panel_areas: HashMap::new(),

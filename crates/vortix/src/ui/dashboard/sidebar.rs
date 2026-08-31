@@ -226,14 +226,20 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
             )),
             Line::from(""),
             Line::from(vec![
-                Span::styled("Press ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    "Press ",
+                    Style::default().fg(theme::current().key_hint_desc),
+                ),
                 Span::styled(
                     "[i]",
                     Style::default()
                         .fg(theme::current().accent_primary)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(" to import", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    " to import",
+                    Style::default().fg(theme::current().key_hint_desc),
+                ),
             ]),
         ];
         frame.render_widget(
@@ -255,7 +261,6 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
         .map(|(idx, p)| {
             let is_selected = app.profile_list_state.selected() == Some(idx);
             let signal = signal_for(&snapshots, primary.as_ref(), &p.id, p.protocol);
-            let is_never_used = p.last_used.is_none();
             let profile_missing = app
                 .runtime
                 .profile_presence
@@ -315,8 +320,6 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
                     .add_modifier(Modifier::BOLD)
             } else if signal.is_active {
                 Style::default().fg(signal.accent)
-            } else if is_never_used {
-                Style::default().fg(Color::DarkGray)
             } else {
                 Style::default().fg(theme::current().inactive)
             };
@@ -363,8 +366,10 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
             };
 
             let proto_cell = Cell::from(Span::styled(proto_icon, Style::default().fg(proto_color)));
-            let time_cell =
-                Cell::from(Span::styled(time_str, Style::default().fg(Color::DarkGray)));
+            let time_cell = Cell::from(Span::styled(
+                time_str,
+                Style::default().fg(theme::current().text_secondary),
+            ));
 
             Row::new(vec![status_cell, name_cell, proto_cell, time_cell]).style(row_style)
         })

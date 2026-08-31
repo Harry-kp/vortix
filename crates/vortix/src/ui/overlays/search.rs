@@ -2,7 +2,7 @@ use crate::app::App;
 use crate::theme;
 use ratatui::{
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
     Frame,
@@ -40,7 +40,7 @@ pub fn render(frame: &mut Frame, app: &App, query: &str, cursor: usize, total: u
         ))
         .title_bottom(Line::from(Span::styled(
             format!(" {count_text} "),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::current().key_hint_desc),
         )));
 
     let inner = block.inner(bar_area);
@@ -74,7 +74,7 @@ pub fn render(frame: &mut Frame, app: &App, query: &str, cursor: usize, total: u
     if query.is_empty() {
         spans.push(Span::styled(
             "type to filter...",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::current().inactive),
         ));
     }
 

@@ -707,6 +707,34 @@ fn read_owned_entry(
     name: &str,
     expected_uid: u32,
 ) -> Result<Option<Vec<u8>>, ControlStateError> {
+    read_owned_entry_with_policy(
+        directory,
+        name,
+        expected_uid,
+        EntryReadPolicy {
+            max_bytes: MAX_STATE_BYTES,
+            forbidden_permission_bits: 0o077,
+            require_single_link: false,
+        },
+    )
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+struct EntryReadPolicy {
+    max_bytes: u64,
+    forbidden_permission_bits: u32,
+    require_single_link: bool,
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn read_owned_entry_with_policy(
+    directory: &ControlDirectory,
+    name: &str,
+    expected_uid: u32,
+    policy: EntryReadPolicy,
+) -> Result<Option<Vec<u8>>, ControlStateError> {
     use std::ffi::CString;
     use std::io::Read as _;
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
@@ -734,26 +762,52 @@ fn read_owned_entry(
     let metadata = file.metadata()?;
     if !metadata.is_file()
         || metadata.uid() != expected_uid
-        || metadata.permissions().mode() & 0o077 != 0
+        || (policy.require_single_link && metadata.nlink() != 1)
+        || metadata.permissions().mode() & policy.forbidden_permission_bits != 0
     {
         return Err(ControlStateError::UnsafeFile);
     }
-    if metadata.len() > MAX_STATE_BYTES {
+    if metadata.len() > policy.max_bytes {
         return Err(ControlStateError::Capacity);
     }
     let capacity = usize::try_from(metadata.len()).map_err(|_| ControlStateError::Capacity)?;
     let mut bytes = Vec::with_capacity(capacity);
     file.by_ref()
-        .take(MAX_STATE_BYTES + 1)
+        .take(policy.max_bytes.saturating_add(1))
         .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_STATE_BYTES {
+    if bytes.len() as u64 > policy.max_bytes {
         return Err(ControlStateError::Capacity);
     }
     Ok(Some(bytes))
 }
 
+/// Read a user configuration entry without following links.
+///
+/// Unlike canonical control state, ordinary user configuration may be
+/// world-readable for compatibility, but it must never be writable by a
+/// different principal.
 #[cfg(unix)]
-fn write_owned_atomic(
+#[allow(unsafe_code)]
+pub(crate) fn read_owned_user_entry(
+    directory: &ControlDirectory,
+    name: &str,
+    expected_uid: u32,
+    max_bytes: u64,
+) -> Result<Option<Vec<u8>>, ControlStateError> {
+    read_owned_entry_with_policy(
+        directory,
+        name,
+        expected_uid,
+        EntryReadPolicy {
+            max_bytes,
+            forbidden_permission_bits: 0o022,
+            require_single_link: true,
+        },
+    )
+}
+
+#[cfg(unix)]
+pub(crate) fn write_owned_atomic(
     directory: &ControlDirectory,
     name: &str,
     body: &[u8],
@@ -815,7 +869,7 @@ pub(crate) fn write_owned_atomic_with_hook(
     let (temporary_name, mut temporary) = allocated.ok_or_else(|| {
         AtomicWriteError::NotPublished(ControlStateError::Io(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
-            "could not allocate a private control-state temp file",
+            "could not allocate a private owned temporary file",
         )))
     })?;
     let temporary_name_c = CString::new(temporary_name.as_str())
@@ -908,7 +962,23 @@ fn read_owned_entry(
 }
 
 #[cfg(not(unix))]
-fn write_owned_atomic(
+pub(crate) fn read_owned_user_entry(
+    directory: &ControlDirectory,
+    name: &str,
+    _expected_uid: u32,
+    max_bytes: u64,
+) -> Result<Option<Vec<u8>>, ControlStateError> {
+    let path = directory.join(name);
+    match std::fs::read(path) {
+        Ok(bytes) if bytes.len() as u64 <= max_bytes => Ok(Some(bytes)),
+        Ok(_) => Err(ControlStateError::Capacity),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn write_owned_atomic(
     directory: &ControlDirectory,
     name: &str,
     body: &[u8],

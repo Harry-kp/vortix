@@ -2,7 +2,7 @@ use crate::app::App;
 use crate::{constants, logger, theme, utils};
 use ratatui::{
     layout::{Alignment, Rect},
-    style::{Color, Style},
+    style::Style,
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
     Frame,
@@ -74,7 +74,7 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
                 logger::LogLevel::Error => Style::default().fg(theme::current().error),
                 logger::LogLevel::Warning => Style::default().fg(theme::current().warning),
                 logger::LogLevel::Info => Style::default().fg(theme::current().nord_frost_3),
-                logger::LogLevel::Debug => Style::default().fg(Color::DarkGray),
+                logger::LogLevel::Debug => Style::default().fg(theme::current().inactive),
             };
 
             let msg_style = match entry.level {
@@ -87,7 +87,7 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
                         Style::default().fg(theme::current().inactive)
                     }
                 }
-                logger::LogLevel::Debug => Style::default().fg(Color::DarkGray),
+                logger::LogLevel::Debug => Style::default().fg(theme::current().inactive),
             };
 
             Line::from(vec![

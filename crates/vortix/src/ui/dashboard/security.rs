@@ -343,7 +343,10 @@ fn footer_line(secs: Option<u64>) -> Line<'static> {
         Some(s) => format!("Updated {}m ago", s / 60),
         None => "Updated pending…".to_string(),
     };
-    Line::from(Span::styled(text, Style::default().fg(Color::DarkGray)))
+    Line::from(Span::styled(
+        text,
+        Style::default().fg(theme::current().key_hint_desc),
+    ))
 }
 
 // ── PanelState: the polished panel's read-only input ────────────────────────
@@ -434,7 +437,7 @@ impl Verdict {
                 " ⚠ EXPOSED ",
                 Style::default()
                     .bg(theme::current().warning)
-                    .fg(Color::Black)
+                    .fg(theme::current().text_dark)
                     .add_modifier(Modifier::BOLD),
             )),
         }

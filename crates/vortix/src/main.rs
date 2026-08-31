@@ -229,8 +229,6 @@ fn main() -> Result<()> {
             std::process::exit(1);
         }
     };
-    vortix::theme::configure(app_config.theme);
-
     // Determine output mode from global flags
     let output_mode = if args.json {
         cli::output::OutputMode::Json
@@ -361,7 +359,7 @@ fn run_tui(
         use ratatui::text::{Line, Span};
         use ratatui::widgets::{Block, Borders, Paragraph};
 
-        let theme = vortix::theme::current();
+        let theme = config.theme.palette();
         let content = vec![
             Line::from(Span::styled(
                 format!("{} v{}", constants::APP_NAME, constants::APP_VERSION),

@@ -196,6 +196,18 @@ pub enum Message {
     /// Toggle kill switch mode (Off → Auto → `AlwaysOn` → Off)
     ToggleKillSwitch,
 
+    /// Switch to the other built-in color theme and persist the choice.
+    ToggleTheme,
+    /// Completion of the background theme-persistence transaction.
+    ThemePersisted {
+        /// Theme active before the user requested the switch.
+        previous: crate::theme::ThemeChoice,
+        /// Theme painted optimistically while the config write runs.
+        selected: crate::theme::ThemeChoice,
+        /// Durable config-write result.
+        result: Result<crate::config::ThemePersistOutcome, String>,
+    },
+
     // === Overlay / Inline-mode Actions (keyboard + action menus) ===
     /// Open profile rename overlay for the selected profile
     OpenRename,
@@ -351,6 +363,11 @@ pub fn get_bulk_actions() -> Vec<ActionMenuItem> {
             message: Message::ToggleKillSwitch,
         },
         ActionMenuItem {
+            key: "p",
+            label: "Switch Color Theme",
+            message: Message::ToggleTheme,
+        },
+        ActionMenuItem {
             key: "S",
             label: "Background Setup",
             message: Message::OpenBackgroundSetup,
@@ -487,6 +504,7 @@ mod tests {
         assert!(actions.iter().any(|a| a.key == "q")); // quit
         assert!(actions.iter().any(|a| a.key == "y")); // copy IP
         assert!(actions.iter().any(|a| a.key == "K")); // kill switch
+        assert!(actions.iter().any(|a| a.key == "p")); // color theme
         assert!(actions.iter().any(|a| a.key == "/")); // search
         assert!(actions.iter().any(|a| a.key == "?")); // help
     }
@@ -511,6 +529,21 @@ mod tests {
             .map(|action| action.key)
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(keys.len(), actions.len());
+        assert!(actions.len() <= 16, "bulk menu must fit at 80x24");
+        assert!(matches!(
+            actions
+                .iter()
+                .find(|action| action.key == "p")
+                .map(|action| &action.message),
+            Some(Message::ToggleTheme)
+        ));
+        assert!(matches!(
+            actions
+                .iter()
+                .find(|action| action.key == "T")
+                .map(|action| &action.message),
+            Some(Message::OpenBackgroundStatus)
+        ));
     }
 
     #[test]

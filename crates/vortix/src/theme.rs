@@ -1,13 +1,13 @@
 //! Theming infrastructure for the Vortix UI.
 //!
 //! All UI colors are defined in a single [`Theme`] struct. The active theme
-//! is returned by [`current()`]. The selected palette is installed once from
-//! `config.toml` before the TUI is rendered.
+//! is returned by [`current()`]. A render frame scopes its configured choice
+//! through [`with_choice`] so live switching cannot mix palettes.
 
 #![allow(dead_code)]
 use ratatui::style::Color;
 use serde::{Deserialize, Serialize};
-use std::sync::OnceLock;
+use std::cell::Cell;
 
 /// Built-in theme selected through the top-level `theme` key in `config.toml`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,9 +29,49 @@ impl ThemeChoice {
             Self::Terminal => &TERMINAL,
         }
     }
+
+    /// Return the other built-in theme.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Synthwave => Self::Terminal,
+            Self::Terminal => Self::Synthwave,
+        }
+    }
+
+    /// Human-readable theme name used by TUI feedback.
+    #[must_use]
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Synthwave => "Synthwave",
+            Self::Terminal => "Terminal",
+        }
+    }
+
+    /// Stable value persisted in `config.toml`.
+    #[must_use]
+    pub const fn config_value(self) -> &'static str {
+        match self {
+            Self::Synthwave => "synthwave",
+            Self::Terminal => "terminal",
+        }
+    }
 }
 
-static ACTIVE_THEME: OnceLock<&'static Theme> = OnceLock::new();
+thread_local! {
+    static SCOPED_THEME: Cell<ThemeChoice> = const { Cell::new(ThemeChoice::Synthwave) };
+}
+
+struct ScopedThemeGuard<'a> {
+    active: &'a Cell<ThemeChoice>,
+    previous: ThemeChoice,
+}
+
+impl Drop for ScopedThemeGuard<'_> {
+    fn drop(&mut self) {
+        self.active.set(self.previous);
+    }
+}
 
 // ── Theme struct ─────────────────────────────────────────────────────────
 
@@ -197,16 +237,19 @@ pub const TERMINAL: Theme = Theme {
     nord_purple: Color::Magenta,
 };
 
-/// Install the process theme before rendering. The first selection wins for
-/// the lifetime of the process so one frame cannot mix palettes.
-pub fn configure(choice: ThemeChoice) {
-    let _ = ACTIVE_THEME.set(choice.palette());
+/// Run one complete render operation with a stable active palette.
+pub fn with_choice<T>(choice: ThemeChoice, render: impl FnOnce() -> T) -> T {
+    SCOPED_THEME.with(|active| {
+        let previous = active.replace(choice);
+        let _restore = ScopedThemeGuard { active, previous };
+        render()
+    })
 }
 
-/// Returns the active theme.
+/// Return the palette scoped to the current render operation.
 #[must_use]
 pub fn current() -> &'static Theme {
-    ACTIVE_THEME.get_or_init(|| &SYNTHWAVE)
+    SCOPED_THEME.with(|choice| choice.get().palette())
 }
 
 // ── Backward-compatible const aliases ────────────────────────────────────
@@ -291,6 +334,19 @@ mod tests {
     }
 
     #[test]
+    fn choice_cycles_and_scopes_without_leaking() {
+        assert_eq!(ThemeChoice::Synthwave.next(), ThemeChoice::Terminal);
+        assert_eq!(ThemeChoice::Terminal.next(), ThemeChoice::Synthwave);
+        assert_eq!(ThemeChoice::Terminal.display_name(), "Terminal");
+        assert_eq!(ThemeChoice::Synthwave.config_value(), "synthwave");
+
+        with_choice(ThemeChoice::Terminal, || {
+            assert_eq!(current().accent_primary, TERMINAL.accent_primary);
+        });
+        assert_eq!(current().accent_primary, SYNTHWAVE.accent_primary);
+    }
+
+    #[test]
     fn const_aliases_match_theme_fields() {
         assert_eq!(ACCENT_PRIMARY, SYNTHWAVE.accent_primary);
         assert_eq!(ACCENT_SECONDARY, SYNTHWAVE.accent_secondary);
@@ -336,5 +392,52 @@ mod tests {
         ] {
             assert!(!matches!(color, Color::Rgb(_, _, _)));
         }
+    }
+
+    #[test]
+    fn production_ui_uses_semantic_theme_colors() {
+        fn inspect(directory: &std::path::Path, leaks: &mut Vec<String>) {
+            for entry in std::fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if path.is_dir() {
+                    inspect(&path, leaks);
+                    continue;
+                }
+                if path.extension().and_then(std::ffi::OsStr::to_str) != Some("rs") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).unwrap();
+                for raw in [
+                    "Color::Black",
+                    "Color::Blue",
+                    "Color::Cyan",
+                    "Color::DarkGray",
+                    "Color::Green",
+                    "Color::Gray",
+                    "Color::Indexed",
+                    "Color::Light",
+                    "Color::Magenta",
+                    "Color::Red",
+                    "Color::Rgb",
+                    "Color::White",
+                    "Color::Yellow",
+                ] {
+                    if source.contains(raw) {
+                        leaks.push(format!("{} uses {raw}", path.display()));
+                    }
+                }
+            }
+        }
+
+        let mut leaks = Vec::new();
+        inspect(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui"),
+            &mut leaks,
+        );
+        assert!(
+            leaks.is_empty(),
+            "production UI colors must come from theme::current(): {leaks:?}"
+        );
     }
 }

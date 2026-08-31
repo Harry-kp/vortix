@@ -1,7 +1,8 @@
 use crate::app::Protocol;
+use crate::theme;
 use ratatui::{
     layout::{Alignment, Constraint, Layout},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
     Frame,
@@ -27,7 +28,7 @@ pub fn render(frame: &mut Frame, protocol: Protocol, missing: &[String]) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Red))
+        .border_style(Style::default().fg(theme::current().error))
         .title(" System Requirement Missing ");
 
     let inner = block.inner(popup_area);
@@ -38,14 +39,19 @@ pub fn render(frame: &mut Frame, protocol: Protocol, missing: &[String]) {
         Line::from(vec![
             Span::styled(
                 " ERROR: ",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme::current().error)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw(format!("Missing requirements for {protocol} sessions.")),
         ]),
         Line::from(""),
         Line::from(vec![
             Span::raw(" Missing: "),
-            Span::styled(missing.join(", "), Style::default().fg(Color::Yellow)),
+            Span::styled(
+                missing.join(", "),
+                Style::default().fg(theme::current().warning),
+            ),
         ]),
         Line::from(""),
         Line::from(vec![Span::raw(
@@ -60,7 +66,7 @@ pub fn render(frame: &mut Frame, protocol: Protocol, missing: &[String]) {
             text.push(Line::from(vec![Span::styled(
                 format!(" {hint_line}"),
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(theme::current().key_hint)
                     .add_modifier(Modifier::BOLD),
             )]));
         }
@@ -72,7 +78,7 @@ pub fn render(frame: &mut Frame, protocol: Protocol, missing: &[String]) {
         Span::styled(
             "[Esc]",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme::current().key_hint)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" to return to dashboard."),

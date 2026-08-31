@@ -48,7 +48,7 @@ pub fn render(frame: &mut Frame, config: ConfirmDialogConfig) {
 
     let yes_style = if config.confirm_selected {
         Style::default()
-            .fg(Color::Black)
+            .fg(theme::current().text_dark)
             .bg(config.border_color)
             .add_modifier(Modifier::BOLD)
     } else {
@@ -58,7 +58,7 @@ pub fn render(frame: &mut Frame, config: ConfirmDialogConfig) {
         Style::default().fg(theme::current().text_secondary)
     } else {
         Style::default()
-            .fg(Color::Black)
+            .fg(theme::current().text_dark)
             .bg(theme::current().accent_primary)
             .add_modifier(Modifier::BOLD)
     };

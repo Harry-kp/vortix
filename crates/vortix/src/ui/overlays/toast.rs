@@ -3,7 +3,7 @@
 use crate::app::App;
 use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::Span,
     widgets::{Block, Borders, Clear, Paragraph},
     Frame,
@@ -62,13 +62,13 @@ pub fn render(frame: &mut Frame, app: &App) {
             .title(Span::styled(
                 title,
                 Style::default()
-                    .fg(Color::Black)
+                    .fg(t.text_dark)
                     .bg(bg_color)
                     .add_modifier(Modifier::BOLD),
             ))
             .title_bottom(Span::styled(
                 " Esc dismiss ",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(t.key_hint_desc),
             ));
 
         let inner_area = block.inner(toast_area);
