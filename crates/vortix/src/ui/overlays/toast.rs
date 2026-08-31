@@ -5,7 +5,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::Span,
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, Borders, Paragraph},
     Frame,
 };
 use unicode_width::UnicodeWidthStr;
@@ -46,7 +46,7 @@ pub fn render(frame: &mut Frame, app: &App) {
             return;
         };
 
-        frame.render_widget(Clear, toast_area);
+        crate::ui::helpers::clear_area(frame, toast_area);
 
         let t = crate::theme::current();
         let (title, bg_color, border_color) = match toast.toast_type {

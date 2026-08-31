@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, Borders, Paragraph},
     Frame,
 };
 
@@ -23,7 +23,7 @@ pub fn render(frame: &mut Frame, path: &str, cursor: usize) {
     ])
     .split(popup_layout[1])[1];
 
-    frame.render_widget(Clear, popup_area);
+    crate::ui::helpers::clear_area(frame, popup_area);
 
     let block = Block::default()
         .borders(Borders::ALL)

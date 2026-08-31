@@ -274,23 +274,40 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
             // quick-select; once a row is active the badge replaces the number
             // so the user sees state, not muscle-memory.
             let status_cell = if let Some((glyph, style)) = signal.badge {
-                let mut spans = vec![Span::styled(glyph, style)];
+                let badge_style = if is_selected {
+                    style.fg(theme::current().row_selected_fg)
+                } else {
+                    style
+                };
+                let mut spans = vec![Span::styled(glyph, badge_style)];
                 if signal.risk || profile_missing {
                     spans.push(Span::styled(
                         "!",
-                        Style::default().fg(theme::current().warning),
+                        Style::default().fg(if is_selected {
+                            theme::current().row_selected_fg
+                        } else {
+                            theme::current().warning
+                        }),
                     ));
                 }
                 Cell::from(Line::from(spans))
             } else if profile_missing {
                 Cell::from(Span::styled(
                     "!",
-                    Style::default().fg(theme::current().warning),
+                    Style::default().fg(if is_selected {
+                        theme::current().row_selected_fg
+                    } else {
+                        theme::current().warning
+                    }),
                 ))
             } else if idx < 9 {
                 Cell::from(Span::styled(
                     format!("{}", idx + 1),
-                    Style::default().fg(theme::current().text_secondary),
+                    Style::default().fg(if is_selected {
+                        theme::current().row_selected_fg
+                    } else {
+                        theme::current().text_secondary
+                    }),
                 ))
             } else {
                 Cell::from(Span::styled(" ", Style::default()))
@@ -304,16 +321,12 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
             let primary_reserve = if show_primary_marker { 2 } else { 0 };
             let name_budget = name_cell_width.saturating_sub(primary_reserve).max(1);
 
-            let name_style = if profile_missing {
-                Style::default().fg(theme::current().warning)
-            } else if is_selected && signal.is_active {
-                Style::default()
-                    .fg(signal.accent)
-                    .add_modifier(Modifier::BOLD)
-            } else if is_selected {
+            let name_style = if is_selected {
                 Style::default()
                     .fg(theme::current().row_selected_fg)
                     .add_modifier(Modifier::BOLD)
+            } else if profile_missing {
+                Style::default().fg(theme::current().warning)
             } else if signal.is_primary {
                 Style::default()
                     .fg(signal.accent)
@@ -330,7 +343,11 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
                 name_spans.push(Span::styled(
                     " *",
                     Style::default()
-                        .fg(signal.accent)
+                        .fg(if is_selected {
+                            theme::current().row_selected_fg
+                        } else {
+                            signal.accent
+                        })
                         .add_modifier(Modifier::BOLD),
                 ));
             }
@@ -340,10 +357,10 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
                 crate::app::Protocol::WireGuard => "WG",
                 crate::app::Protocol::OpenVPN => "OV",
             };
-            let proto_color = if signal.is_active {
+            let proto_color = if is_selected {
+                theme::current().row_selected_fg
+            } else if signal.is_active {
                 signal.accent
-            } else if is_selected {
-                theme::current().accent_primary
             } else {
                 theme::current().text_secondary
             };
@@ -368,7 +385,11 @@ pub(super) fn render(frame: &mut Frame, app: &mut App, area: Rect) {
             let proto_cell = Cell::from(Span::styled(proto_icon, Style::default().fg(proto_color)));
             let time_cell = Cell::from(Span::styled(
                 time_str,
-                Style::default().fg(theme::current().text_secondary),
+                Style::default().fg(if is_selected {
+                    theme::current().row_selected_fg
+                } else {
+                    theme::current().text_secondary
+                }),
             ));
 
             Row::new(vec![status_cell, name_cell, proto_cell, time_cell]).style(row_style)
@@ -542,6 +563,46 @@ mod tests {
         assert!(out.contains("alpha"), "alpha row missing:\n{out}");
         assert!(out.contains("bravo"), "bravo row missing:\n{out}");
         assert!(out.contains("charlie"), "charlie row missing:\n{out}");
+    }
+
+    #[test]
+    fn selected_row_uses_one_contrasting_foreground_in_every_fixed_theme() {
+        for choice in [
+            crate::theme::ThemeChoice::Synthwave,
+            crate::theme::ThemeChoice::CatppuccinMocha,
+            crate::theme::ThemeChoice::Dracula,
+            crate::theme::ThemeChoice::Nord,
+            crate::theme::ThemeChoice::GruvboxDark,
+            crate::theme::ThemeChoice::TokyoNight,
+        ] {
+            let mut app = App::new_test();
+            app.runtime.profiles = vec![make_profile("selected")];
+            app.profile_list_state.select(Some(0));
+            let mut terminal = Terminal::new(TestBackend::new(60, 6)).expect("terminal");
+            crate::theme::with_choice(choice, || {
+                terminal
+                    .draw(|frame| render(frame, &mut app, Rect::new(0, 0, 60, 6)))
+                    .expect("draw");
+            });
+
+            let palette = choice.palette();
+            let selected_cells: Vec<_> = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .filter(|cell| {
+                    cell.bg == palette.row_selected_bg && !cell.symbol().trim().is_empty()
+                })
+                .collect();
+            assert!(!selected_cells.is_empty(), "{choice:?}");
+            assert!(
+                selected_cells
+                    .iter()
+                    .all(|cell| cell.fg == palette.row_selected_fg),
+                "{choice:?} selected row used mixed foregrounds: {selected_cells:?}"
+            );
+        }
     }
 
     #[test]

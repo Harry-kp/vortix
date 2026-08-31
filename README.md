@@ -455,8 +455,9 @@ Create `~/.config/vortix/config.toml` to customize settings. All fields are opti
 ```toml
 # --- Appearance ---
 
-# "synthwave" keeps Vortix's fixed palette (default). "terminal" inherits
-# your terminal foreground/background and uses named ANSI status colors.
+# Built-ins: "synthwave" (default), "terminal", "catppuccin-mocha",
+# "dracula", "nord", "gruvbox-dark", and "tokyo-night". "terminal"
+# inherits your terminal colors; the others are fixed palettes.
 theme = "synthwave"
 
 # --- Timing ---

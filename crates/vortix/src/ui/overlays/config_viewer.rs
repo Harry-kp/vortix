@@ -7,7 +7,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
+    widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
     Frame,
 };
 use std::path::PathBuf;
@@ -17,7 +17,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     let area = centered_rect(85, 85, frame.area());
 
     // Clear the background
-    frame.render_widget(Clear, area);
+    crate::ui::helpers::clear_area(frame, area);
 
     // Read directly from the cached view; if the user opened the viewer
     // with no profile selected (or read failed in OpenConfig and stashed

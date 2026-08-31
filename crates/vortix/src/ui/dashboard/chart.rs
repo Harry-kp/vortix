@@ -141,6 +141,7 @@ pub(super) fn render(frame: &mut Frame, app: &App, area: Rect) {
     let x_max = constants::NETWORK_HISTORY_SIZE as f64;
     let canvas = Canvas::default()
         .block(Block::default())
+        .background_color(theme::current().panel_bg)
         .x_bounds([0.0, x_max])
         .y_bounds([0.0, peak])
         .paint(|ctx| {

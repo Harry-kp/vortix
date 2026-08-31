@@ -12,7 +12,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Clear, Paragraph},
+    widgets::Paragraph,
     Frame,
 };
 
@@ -123,7 +123,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     // Render Zoomed Panel Overlay (if active)
     if let Some(panel) = &app.zoomed_panel {
         let zoom_area = centered_rect(90, 90, frame.area());
-        frame.render_widget(Clear, zoom_area);
+        crate::ui::helpers::clear_area(frame, zoom_area);
 
         match panel {
             FocusedPanel::Sidebar => sidebar::render(frame, app, zoom_area),
@@ -171,7 +171,7 @@ fn render_animated_panel(
 ) {
     if let Some(state) = app.flip_states.get(panel) {
         if state.is_animating() {
-            frame.render_widget(Clear, area);
+            crate::ui::helpers::clear_area(frame, area);
             let narrow = animated_rect(area, state.width_ratio());
             if narrow.width >= constants::FLIP_ANIMATION_MIN_WIDTH {
                 render_fn(frame, app, narrow);

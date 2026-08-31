@@ -4,7 +4,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, Borders, Paragraph},
     Frame,
 };
 
@@ -77,7 +77,7 @@ pub fn render(
     ])
     .split(popup_layout[1])[1];
 
-    frame.render_widget(Clear, popup_area);
+    crate::ui::helpers::clear_area(frame, popup_area);
 
     let (title, footer) = if connect_after {
         (constants::TITLE_AUTH_PROMPT, constants::TITLE_AUTH_FOOTER)

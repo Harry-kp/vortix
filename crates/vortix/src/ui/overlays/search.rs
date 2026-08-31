@@ -4,7 +4,7 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, Borders, Paragraph},
     Frame,
 };
 
@@ -17,7 +17,7 @@ pub fn render(frame: &mut Frame, app: &App, query: &str, cursor: usize, total: u
         height: 3,
     };
 
-    frame.render_widget(Clear, bar_area);
+    crate::ui::helpers::clear_area(frame, bar_area);
 
     let match_count = app.search_match_count;
 

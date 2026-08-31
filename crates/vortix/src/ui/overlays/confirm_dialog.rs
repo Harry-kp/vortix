@@ -5,7 +5,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, Borders, Paragraph},
     Frame,
 };
 
@@ -31,7 +31,7 @@ pub fn render(frame: &mut Frame, config: ConfirmDialogConfig) {
         height,
     };
 
-    frame.render_widget(Clear, overlay);
+    crate::ui::helpers::clear_area(frame, overlay);
 
     let block = Block::default()
         .borders(Borders::ALL)

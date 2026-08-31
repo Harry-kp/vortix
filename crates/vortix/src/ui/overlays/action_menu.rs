@@ -8,7 +8,7 @@ use crate::ui::helpers::centered_rect_fixed;
 use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState},
+    widgets::{Block, Borders, List, ListItem, ListState},
     Frame,
 };
 
@@ -29,7 +29,7 @@ pub fn render(
     let area = centered_rect_fixed(menu_width, menu_height, frame.area());
 
     // Clear background
-    frame.render_widget(Clear, area);
+    crate::ui::helpers::clear_area(frame, area);
 
     // Build the block
     let block = Block::default()

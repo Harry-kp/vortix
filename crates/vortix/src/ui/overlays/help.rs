@@ -29,7 +29,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Tabs, Wrap},
+    widgets::{Block, Borders, Paragraph, Tabs, Wrap},
     Frame,
 };
 
@@ -275,7 +275,7 @@ pub fn render(frame: &mut Frame, scroll: u16, tab: HelpTab) {
         height,
     };
 
-    frame.render_widget(Clear, overlay);
+    crate::ui::helpers::clear_area(frame, overlay);
 
     let block = Block::default()
         .borders(Borders::ALL)

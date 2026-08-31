@@ -63,7 +63,7 @@ pub fn get_config_dir() -> std::io::Result<PathBuf> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AppConfig {
-    /// TUI color palette (`"synthwave"` or terminal-adaptive `"terminal"`).
+    /// Built-in TUI color palette; `"terminal"` inherits terminal colors.
     pub theme: crate::theme::ThemeChoice,
     /// UI refresh rate in milliseconds.
     pub tick_rate: u64,
@@ -832,15 +832,31 @@ mod tests {
     }
 
     #[test]
-    fn test_load_config_terminal_theme() {
+    fn test_load_config_builtin_themes() {
         let dir = tempfile::Builder::new()
             .prefix("vortix_test_")
             .tempdir()
             .unwrap();
-        std::fs::write(dir.path().join("config.toml"), "theme = \"terminal\"\n").unwrap();
+        for (value, expected) in [
+            ("synthwave", crate::theme::ThemeChoice::Synthwave),
+            ("terminal", crate::theme::ThemeChoice::Terminal),
+            (
+                "catppuccin-mocha",
+                crate::theme::ThemeChoice::CatppuccinMocha,
+            ),
+            ("dracula", crate::theme::ThemeChoice::Dracula),
+            ("nord", crate::theme::ThemeChoice::Nord),
+            ("gruvbox-dark", crate::theme::ThemeChoice::GruvboxDark),
+            ("tokyo-night", crate::theme::ThemeChoice::TokyoNight),
+        ] {
+            std::fs::write(
+                dir.path().join("config.toml"),
+                format!("theme = \"{value}\"\n"),
+            )
+            .unwrap();
 
-        let config = load_config(dir.path()).unwrap();
-        assert_eq!(config.theme, crate::theme::ThemeChoice::Terminal);
+            assert_eq!(load_config(dir.path()).unwrap().theme, expected);
+        }
     }
 
     #[test]
