@@ -1932,17 +1932,24 @@ fn focused_lifecycle_states_route_to_the_exact_sidebar_action() {
 }
 
 #[test]
-fn error_toast_survives_expiry_and_routine_follow_up() {
+fn error_toast_expires_and_routine_info_does_not_replace_it_early() {
     let mut app = test_app();
     app.show_toast("Connection failed".to_string(), ToastType::Error);
-    app.toast.as_mut().unwrap().expires = std::time::Instant::now();
-
-    app.handle_message(Message::Tick);
     app.show_toast("Background refresh complete".to_string(), ToastType::Info);
 
-    let toast = app.toast.as_ref().expect("error remains visible");
+    let toast = app.toast.as_ref().expect("error remains visible initially");
     assert_eq!(toast.toast_type, ToastType::Error);
     assert_eq!(toast.message, "Connection failed");
+
+    app.toast.as_mut().unwrap().expires = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_millis(1))
+        .unwrap();
+
+    app.handle_message(Message::Tick);
+    assert!(
+        app.toast.is_none(),
+        "error must expire without requiring Esc"
+    );
 
     app.show_toast("Review the changed route".to_string(), ToastType::Warning);
     assert_eq!(
@@ -1980,7 +1987,7 @@ fn uppercase_d_remains_global_when_the_only_active_tunnel_is_not_focused() {
 }
 
 #[test]
-fn overlay_escape_is_not_consumed_by_a_sticky_error_toast() {
+fn overlay_escape_closes_the_overlay_before_dismissing_a_dashboard_toast() {
     let mut app = test_app();
     app.show_toast("Connection failed".to_string(), ToastType::Error);
     app.input_mode = InputMode::Import {

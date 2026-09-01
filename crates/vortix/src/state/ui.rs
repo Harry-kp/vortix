@@ -10,6 +10,8 @@ use zeroize::Zeroizing;
 
 /// Duration for toast notifications to remain visible.
 pub const DISMISS_DURATION: Duration = Duration::from_secs(4);
+const WARNING_DISMISS_DURATION: Duration = Duration::from_secs(6);
+const ERROR_DISMISS_DURATION: Duration = Duration::from_secs(8);
 pub const HELP_OVERLAY_MAX_HEIGHT: u16 = 40;
 
 /// Currently focused UI panel for keyboard navigation.
@@ -360,6 +362,18 @@ pub enum ToastType {
     Error,
 }
 
+impl ToastType {
+    /// How long this notification remains visible without user dismissal.
+    #[must_use]
+    pub const fn dismiss_duration(self) -> Duration {
+        match self {
+            Self::Info | Self::Success => DISMISS_DURATION,
+            Self::Warning => WARNING_DISMISS_DURATION,
+            Self::Error => ERROR_DISMISS_DURATION,
+        }
+    }
+}
+
 /// Toast notification for temporary messages.
 #[derive(Clone)]
 pub struct Toast {
@@ -401,7 +415,7 @@ impl Toast {
     /// Check if the toast notification has expired
     #[must_use]
     pub fn is_expired(&self) -> bool {
-        self.toast_type != ToastType::Error && Instant::now() > self.expires
+        Instant::now() > self.expires
     }
 }
 
@@ -412,6 +426,20 @@ mod tests {
     #[test]
     fn quality_unknown_when_all_zero() {
         assert_eq!(QualityLevel::from_metrics(0, 0.0, 0), QualityLevel::Unknown);
+    }
+
+    #[test]
+    fn actionable_toasts_stay_longer_but_every_type_expires() {
+        assert_eq!(ToastType::Info.dismiss_duration(), Duration::from_secs(4));
+        assert_eq!(
+            ToastType::Success.dismiss_duration(),
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            ToastType::Warning.dismiss_duration(),
+            Duration::from_secs(6)
+        );
+        assert_eq!(ToastType::Error.dismiss_duration(), Duration::from_secs(8));
     }
 
     #[test]

@@ -4,7 +4,7 @@ use std::path::Path;
 use std::time::Instant;
 use time::OffsetDateTime;
 
-use super::{App, FocusedPanel, Toast, ToastType, DISMISS_DURATION};
+use super::{App, FocusedPanel, Toast, ToastType};
 use crate::constants;
 use crate::logger::{self, LogLevel};
 use crate::utils;
@@ -239,10 +239,11 @@ impl App {
         {
             return;
         }
+        let expires = Instant::now() + toast_type.dismiss_duration();
         self.toast = Some(Toast {
             message,
             toast_type,
-            expires: Instant::now() + DISMISS_DURATION,
+            expires,
         });
     }
 
