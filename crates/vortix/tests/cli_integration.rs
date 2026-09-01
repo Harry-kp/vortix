@@ -294,14 +294,63 @@ fn cli_killswitch_show_mode() {
 }
 
 #[test]
-fn cli_release_killswitch() {
-    use clap::Parser;
+fn cli_release_killswitch_accepts_canonical_command_and_compatibility_alias() {
+    use clap::{CommandFactory, Parser};
     use vortix::cli::args::Args;
     use vortix::cli::args::Commands;
 
-    let args = Args::try_parse_from(["vortix", "release-kill-switch"])
-        .expect("emergency release command parses");
-    assert!(matches!(args.command, Some(Commands::ReleaseKillSwitch)));
+    for command in ["release-killswitch", "release-kill-switch"] {
+        let args = Args::try_parse_from(["vortix", command])
+            .unwrap_or_else(|error| panic!("emergency release command {command} parses: {error}"));
+        assert!(matches!(args.command, Some(Commands::ReleaseKillSwitch)));
+    }
+
+    let help = Args::command().render_long_help().to_string();
+    assert!(help.contains("release-killswitch"));
+    assert!(
+        !help.contains("release-kill-switch"),
+        "the compatibility alias must not replace or accompany the canonical command in help"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn emergency_release_reaches_root_gate_before_normal_startup() {
+    if vortix::utils::is_root() {
+        // Non-root CI exercises the proof that emergency dispatch precedes
+        // normal startup. Root environments would proceed to real firewall
+        // mutation, which this test must never attempt.
+        return;
+    }
+
+    let config = tempfile::tempdir().unwrap();
+    std::fs::write(config.path().join("config.toml"), b"not valid toml = [").unwrap();
+    std::fs::write(config.path().join("settings.toml"), b"not valid toml = [").unwrap();
+    std::fs::create_dir(config.path().join("profiles")).unwrap();
+    std::fs::write(
+        config.path().join("profiles/broken.conf"),
+        b"not a valid managed profile",
+    )
+    .unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_vortix")) // xtask:allow-subprocess: black-box emergency-release startup boundary
+        .arg("--config-dir")
+        .arg(config.path())
+        .arg("release-killswitch")
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(ExitCode::PermissionDenied.code())
+    );
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("VPN operations require root privileges"));
+    assert!(stderr.contains("sudo vortix release-killswitch"));
+    assert!(!stderr.contains("failed to load settings"));
+    assert!(!stderr.contains("profile identity migration"));
+    assert!(!stderr.contains("Fix the file or remove it"));
 }
 
 #[test]

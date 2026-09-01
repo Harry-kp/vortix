@@ -1,7 +1,7 @@
 //! `vortix-platform-linux`: Linux platform adapters.
 //!
 //! Implements the capability ports defined in `vortix-core::ports::*`:
-//! - `Killswitch` via iptables (preferred) → nftables fallback.
+//! - `Killswitch` via one atomic nftables `inet` transaction.
 //! - `DnsResolver` via resolvectl → nmcli → /etc/resolv.conf.
 //! - `Interface` via direct kernel/sysfs observation.
 //! - `NetworkStats` via /proc/net/dev.

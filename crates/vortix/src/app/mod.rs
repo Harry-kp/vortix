@@ -251,10 +251,17 @@ impl App {
         // Apply user's logging preferences
         logger::configure(&runtime.config.log_level, runtime.config.max_log_entries);
 
+        // Registry is the TUI's protection truth from the first frame. Seed
+        // it from recovered runtime state so startup cannot briefly render
+        // Off while a persisted firewall is still present.
+        let mut registry = TunnelRegistry::new();
+        registry.set_killswitch_mode(runtime.killswitch_mode);
+        registry.set_killswitch_state(runtime.killswitch_state);
+
         let mut app = Self {
             runtime,
             engine_handle: None,
-            registry: TunnelRegistry::new(),
+            registry,
             control_session: None,
             control_starting: true,
             control_snapshot: crate::vortix_core::control::ControlSnapshot::default(),

@@ -515,7 +515,10 @@ fn verdict_for_protected(app: &App, primary_snap: Option<&TunnelSnapshot>) -> Ve
     let dns_unverified = app.control_snapshot.dns.status
         != crate::vortix_core::control::DnsSecurityStatus::Protected;
     let ks_alarm = matches!(
-        (app.runtime.killswitch_mode, app.runtime.killswitch_state),
+        (
+            app.registry.killswitch_mode(),
+            app.registry.killswitch_state()
+        ),
         (
             crate::state::KillSwitchMode::Auto,
             crate::state::KillSwitchState::Blocking
@@ -626,8 +629,8 @@ fn collect_protected_state(
         dns_server,
         dns_provider,
         dns_status: app.control_snapshot.dns.status,
-        killswitch_mode: app.runtime.killswitch_mode,
-        killswitch_state: app.runtime.killswitch_state,
+        killswitch_mode: app.registry.killswitch_mode(),
+        killswitch_state: app.registry.killswitch_state(),
         encryption,
         last_check_secs: app
             .runtime
@@ -705,8 +708,8 @@ fn collect_partial_state(
         dns_provider: dns_provider_label(&dns_server),
         dns_server,
         dns_status: app.control_snapshot.dns.status,
-        killswitch_mode: app.runtime.killswitch_mode,
-        killswitch_state: app.runtime.killswitch_state,
+        killswitch_mode: app.registry.killswitch_mode(),
+        killswitch_state: app.registry.killswitch_state(),
         encryption,
         last_check_secs: app
             .runtime
@@ -964,8 +967,8 @@ fn build_exposed_audit(app: &App, inner_width: u16) -> Vec<Line<'static>> {
 
     lines.push(audit_row(
         "Killswitch",
-        killswitch_mode_label(app.runtime.killswitch_mode),
-        match app.runtime.killswitch_mode {
+        killswitch_mode_label(app.registry.killswitch_mode()),
+        match app.registry.killswitch_mode() {
             KillSwitchMode::Off => Sigil::AlarmError,
             _ => Sigil::OkMuted,
         },
@@ -1783,7 +1786,12 @@ mod tests {
         // right-column layout.
         let mut app = App::new_test();
         insert_idle_tunnel(&mut app, "alpha");
-        app.runtime.killswitch_mode = KillSwitchMode::AlwaysOn;
+        // Deliberately diverge the obsolete runtime mirror: renderers must
+        // follow the registry's canonical policy projection exclusively.
+        app.runtime.killswitch_mode = KillSwitchMode::Off;
+        app.runtime.killswitch_state = KillSwitchState::Disabled;
+        app.registry.set_killswitch_mode(KillSwitchMode::AlwaysOn);
+        app.registry.set_killswitch_state(KillSwitchState::Blocking);
 
         let out = render_to_string(&app, 60, 20);
         assert!(out.contains("PARTIAL"), "PARTIAL banner missing:\n{out}");
@@ -1798,7 +1806,8 @@ mod tests {
     fn partial_killswitch_off_renders_off_with_alarm() {
         let mut app = App::new_test();
         insert_idle_tunnel(&mut app, "alpha");
-        app.runtime.killswitch_mode = KillSwitchMode::Off;
+        app.registry.set_killswitch_mode(KillSwitchMode::Off);
+        app.registry.set_killswitch_state(KillSwitchState::Disabled);
 
         let out = render_to_string(&app, 70, 20);
         assert!(
@@ -1815,7 +1824,8 @@ mod tests {
     fn partial_killswitch_auto_renders_block_on_drop() {
         let mut app = App::new_test();
         insert_idle_tunnel(&mut app, "alpha");
-        app.runtime.killswitch_mode = KillSwitchMode::Auto;
+        app.registry.set_killswitch_mode(KillSwitchMode::Auto);
+        app.registry.set_killswitch_state(KillSwitchState::Armed);
 
         let out = render_to_string(&app, 70, 20);
         assert!(

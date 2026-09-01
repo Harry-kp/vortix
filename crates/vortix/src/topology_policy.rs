@@ -875,14 +875,14 @@ impl CanonicalPolicyExecutor {
             &active,
             true,
         ) {
-            return match self.restore_firewall(&policy.prior) {
-                Ok(()) => Err(format!(
-                    "pre-tunnel blocking state persistence failed ({persist_error}); prior firewall restored"
-                )),
-                Err(restore_error) => Err(format!(
-                    "pre-tunnel blocking state persistence failed ({persist_error}); prior firewall restoration failed ({restore_error}); blocking remains fail-closed"
-                )),
-            };
+            // The kernel has already accepted and read back the emergency
+            // barrier. A disk failure must not turn that verified protection
+            // into a fail-open rollback. The control operation remains failed
+            // and reconciliation can retry persistence while blocking stays
+            // in force.
+            return Err(format!(
+                "pre-tunnel blocking state persistence failed ({persist_error}); verified blocking remains fail-closed"
+            ));
         }
         Ok(())
     }
@@ -1014,7 +1014,12 @@ impl PolicyExecutor for CanonicalPolicyExecutor {
         match barrier {
             PolicyBarrier::Dns => self.reconcile_dns(&policy.prior, false),
             PolicyBarrier::Blocking | PolicyBarrier::EffectivePublication => {
-                self.restore_firewall(&policy.prior)
+                match firewall_compensation_target(policy, barrier) {
+                    FirewallCompensationTarget::Prior => self.restore_firewall(&policy.prior),
+                    FirewallCompensationTarget::PreTunnelBlocking => {
+                        self.install_pre_tunnel_blocking(policy)
+                    }
+                }
             }
             PolicyBarrier::Tunnel | PolicyBarrier::Route | PolicyBarrier::Observation => Ok(()),
         }
@@ -1048,6 +1053,26 @@ impl PolicyExecutor for CanonicalPolicyExecutor {
             && readback.evidence.dns_verified
             && readback.evidence.firewall_verified)
             .then_some(readback.evidence)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FirewallCompensationTarget {
+    Prior,
+    PreTunnelBlocking,
+}
+
+fn firewall_compensation_target(
+    policy: &TopologyPolicy,
+    barrier: PolicyBarrier,
+) -> FirewallCompensationTarget {
+    if policy.stage == PolicyStage::Final
+        && policy.required_blocking
+        && matches!(barrier, PolicyBarrier::EffectivePublication)
+    {
+        FirewallCompensationTarget::PreTunnelBlocking
+    } else {
+        FirewallCompensationTarget::Prior
     }
 }
 
@@ -1127,6 +1152,20 @@ mod tests {
         assert!(firewall_transition_requires_authority(
             KillSwitchMode::AlwaysOn
         ));
+    }
+
+    #[test]
+    fn failed_final_publication_preserves_required_pre_tunnel_blocking() {
+        let profile = ProfileId::new("corp");
+        let mut final_policy = policy(TopologyState::default(), target(&profile));
+        final_policy.stage = PolicyStage::Final;
+        final_policy.transition = TopologyTransitionKind::Recovery;
+        final_policy.required_blocking = true;
+
+        assert_eq!(
+            firewall_compensation_target(&final_policy, PolicyBarrier::EffectivePublication),
+            FirewallCompensationTarget::PreTunnelBlocking
+        );
     }
 
     #[test]

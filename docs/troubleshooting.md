@@ -19,8 +19,8 @@ vortix report
 | Connect stays transitional | The durable operation has not reached a terminal observation | Use `vortix status` and query the reported operation ID |
 | Connected split tunnel does not change public IP | The profile does not own the default route | Test a destination included in its declared routes |
 | Connected tunnel cannot resolve names | DNS application, read-back, or resolver routing failed | Inspect the DNS section below |
-| Kill switch blocks all traffic | `vpn-only` is active without an effective tunnel | Connect a VPN or use `release-kill-switch` in an emergency |
-| Full-tunnel WireGuard fails on Linux | Missing kernel networking/firewall capability | Check nftables/iptables and kernel support |
+| Kill switch blocks all traffic | `vpn-only` is active without an effective tunnel | Connect a VPN or use `release-killswitch` in an emergency |
+| Full-tunnel WireGuard fails on Linux | Missing kernel networking/firewall capability | Check nftables and kernel support |
 
 ## Installation and privileges
 
@@ -157,7 +157,7 @@ AllowedIPs = 10.0.0.0/8            # split tunnel
 AllowedIPs = 10.0.0.0/8, 192.168.0.0/16
 ```
 
-Full-tunnel setup may require nftables/iptables support on Linux. Restricted containers or custom kernels may not expose the required capabilities; use a normal host kernel or a split-route profile appropriate to the environment.
+Full-tunnel setup may require nftables support on Linux. Restricted containers or custom kernels may not expose the required capabilities; use a normal host kernel or a split-route profile appropriate to the environment.
 
 ## OpenVPN
 
@@ -179,13 +179,17 @@ To isolate orchestration from a provider/server problem, test the same profile w
 
 ## Firewall and kill switch
 
-Vortix uses PF on macOS and nftables or iptables on Linux. If `vpn-only` leaves you without connectivity after a crash:
+Vortix uses PF on macOS and an atomic nftables `inet` transaction on Linux. If `vpn-only` leaves you without connectivity after a crash:
 
 ```bash
-sudo vortix release-kill-switch
+sudo vortix release-killswitch
 ```
 
-On Linux, verify the chosen backend is present and supported by the running kernel. An error from `iptables-restore` or nft does not imply every cloud VM is unsupported; inspect that host's modules, capabilities, and container restrictions.
+The legacy spelling `release-kill-switch` remains accepted for compatibility.
+The release command removes only Vortix-owned firewall rules, verifies their
+absence, and saves mode `off` so a later startup cannot restore `vpn-only`.
+
+On Linux, verify `nft` is present and supported by the running kernel. Vortix still removes legacy Vortix-owned iptables chains during emergency cleanup, but it does not engage a new split-family iptables policy because IPv4 and IPv6 cannot be replaced atomically together.
 
 Kill-switch rules may be flushed by reboot. Check and re-arm the desired mode after boot.
 

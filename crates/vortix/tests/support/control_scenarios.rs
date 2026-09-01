@@ -146,7 +146,7 @@ pub const CONTROL_SCENARIOS: &[ControlScenario] = &[
     scenario(
         "killswitch-release",
         ContractArea::KillSwitch,
-        &["vortix", "release-kill-switch"],
+        &["vortix", "release-killswitch"],
         "release-killswitch",
         OutputSurface::Human,
     ),

@@ -10,9 +10,10 @@
 
 use std::fmt::Write as FmtWrite;
 use std::fs;
-use std::io::Write as IoWrite;
+use std::io::{self, Write as IoWrite};
 use std::net::IpAddr;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::time::Duration;
 
 use crate::vortix_core::cidr::{rfc1918_ranges, Cidr};
 use crate::vortix_core::cidr_subtract::cidr_subtract;
@@ -36,12 +37,12 @@ pub(crate) const PF_ANCHOR: &str = "com.apple/vortix.killswitch";
 pub(crate) const PF_APPLY_ARGS: [&str; 4] = ["-a", PF_ANCHOR, "-f", "-"];
 pub(crate) const PF_RELEASE_ARGS: [&str; 4] = ["-a", PF_ANCHOR, "-F", "rules"];
 const POLICY_LABEL_PREFIX: &str = "vortix-policy:";
+const FIREWALL_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+const FIREWALL_OUTPUT_LIMIT: usize = 1024 * 1024;
 
 fn pfctl(args: &[&str]) -> std::io::Result<std::process::Output> {
     let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
-    crate::vortix_process::run_to_output(
-        CommandSpec::oneshot("pfctl", owned).privilege(PrivilegeReq::Root),
-    )
+    crate::vortix_process::run_to_output(PfFirewall::pfctl_command(owned))
 }
 
 /// Invoke anchor-scoped `pfctl -f -` with the given ruleset on stdin.
@@ -50,16 +51,45 @@ fn pfctl(args: &[&str]) -> std::io::Result<std::process::Output> {
 /// commits.
 fn pfctl_load_stdin(ruleset: &[u8]) -> std::io::Result<std::process::Output> {
     crate::vortix_process::run_to_output(
-        CommandSpec::oneshot("pfctl", PF_APPLY_ARGS.map(str::to_string).to_vec())
-            .privilege(PrivilegeReq::Root)
+        PfFirewall::pfctl_command(PF_APPLY_ARGS.map(str::to_string).to_vec())
             .stdin(ruleset.to_vec()),
     )
+}
+
+fn read_pf_state() -> io::Result<(
+    std::process::Output,
+    std::process::Output,
+    std::process::Output,
+)> {
+    std::thread::scope(|scope| {
+        let root = scope.spawn(|| pfctl(&["-sr"]));
+        let anchor = scope.spawn(|| pfctl(&["-a", PF_ANCHOR, "-sr"]));
+        let status = scope.spawn(|| pfctl(&["-s", "info"]));
+        let root = root
+            .join()
+            .map_err(|_| io::Error::other("PF root read-back worker panicked"))??;
+        let anchor = anchor
+            .join()
+            .map_err(|_| io::Error::other("PF anchor read-back worker panicked"))??;
+        let status = status
+            .join()
+            .map_err(|_| io::Error::other("PF status read-back worker panicked"))??;
+        Ok((root, anchor, status))
+    })
 }
 
 /// macOS pf-based firewall implementation.
 pub struct PfFirewall;
 
 impl PfFirewall {
+    fn pfctl_command(args: Vec<String>) -> CommandSpec {
+        CommandSpec::oneshot("pfctl", args)
+            .privilege(PrivilegeReq::Root)
+            .timeout(FIREWALL_COMMAND_TIMEOUT)
+            .output_limit(FIREWALL_OUTPUT_LIMIT)
+            .contain_process_group()
+    }
+
     pub(crate) fn canonical_pf_rules(rules: &str) -> Vec<&str> {
         rules
             .lines()
@@ -161,13 +191,35 @@ impl PfFirewall {
 
     pub(crate) fn root_traverses_anchor(root_rules: &str) -> bool {
         let exact_anchor = format!("\"{PF_ANCHOR}\"");
-        Self::canonical_pf_rules(root_rules).iter().any(|line| {
+        let mut preceding_quick_outbound_pass = false;
+        for line in Self::canonical_pf_rules(root_rules) {
             let mut tokens = line.split_ascii_whitespace();
-            tokens.next() == Some("anchor")
-                && tokens
-                    .next()
-                    .is_some_and(|value| value == "\"com.apple/*\"" || value == exact_anchor)
-        })
+            let first = tokens.next();
+            let second = tokens.next();
+            if first == Some("anchor")
+                && second.is_some_and(|value| value == "\"com.apple/*\"" || value == exact_anchor)
+            {
+                let qualifier = tokens.next();
+                let trailing = tokens.next();
+                let unconditional = qualifier.is_none() || qualifier == Some("all");
+                if unconditional && trailing.is_none() {
+                    return !preceding_quick_outbound_pass;
+                }
+            }
+
+            if first == Some("pass") {
+                let mut quick = second == Some("quick");
+                let mut inbound = second == Some("in");
+                let mut outbound = second == Some("out");
+                for token in tokens {
+                    quick |= token == "quick";
+                    inbound |= token == "in";
+                    outbound |= token == "out";
+                }
+                preceding_quick_outbound_pass |= quick && (!inbound || outbound);
+            }
+        }
+        false
     }
 
     pub(crate) fn snapshot_matches_policy(active: &[ActiveTunnelInfo], observed: &str) -> bool {
@@ -181,10 +233,33 @@ impl PfFirewall {
         let expected = Self::generate_pf_rules(active);
         let expected = Self::canonical_pf_rules(&expected);
         expected.len() == observed.len()
-            && expected
-                .iter()
-                .zip(observed)
-                .all(|(expected, observed)| observed.starts_with(expected))
+            && expected.iter().zip(observed).all(|(expected, observed)| {
+                *observed == *expected
+                    || pfctl_normalized_generated_rule(expected).as_deref() == Some(*observed)
+            })
+    }
+
+    fn state_matches_policy(
+        active: &[ActiveTunnelInfo],
+        root_rules: &str,
+        anchor_rules: &str,
+        status: &str,
+    ) -> bool {
+        Self::verified_state(
+            active,
+            Self::root_traverses_anchor(root_rules),
+            pf_is_enabled(status),
+            anchor_rules,
+        )
+    }
+
+    pub(crate) fn verified_state(
+        active: &[ActiveTunnelInfo],
+        root_traverses_anchor: bool,
+        enabled: bool,
+        anchor_rules: &str,
+    ) -> bool {
+        root_traverses_anchor && enabled && Self::snapshot_matches_policy(active, anchor_rules)
     }
 
     /// Best-effort write of the ruleset to `PF_CONF_PATH` for diagnostic
@@ -220,6 +295,48 @@ impl PfFirewall {
         }
         let _ = fs::remove_file(PF_CONF_PATH_LEGACY);
     }
+}
+
+/// Normalize only the small rule vocabulary emitted by
+/// [`PfFirewall::generate_pf_rules`] into the form printed by macOS `pfctl`.
+/// Unknown syntax is not accepted, and comparison remains exact after
+/// normalization so an appended label/state/action cannot hide drift.
+fn pfctl_normalized_generated_rule(rule: &str) -> Option<String> {
+    if rule == "pass out quick proto udp from any port 68 to any port 67" {
+        return Some(
+            "pass out quick proto udp from any port = 68 to any port = 67 keep state".into(),
+        );
+    }
+    if rule == "pass in quick proto udp from any port 67 to any port 68" {
+        return Some(
+            "pass in quick proto udp from any port = 67 to any port = 68 keep state".into(),
+        );
+    }
+    if let Some(interface) = rule
+        .strip_prefix("pass out quick on ")
+        .and_then(|rest| rest.strip_suffix(" all"))
+    {
+        return Some(format!(
+            "pass out quick on {interface} all flags S/SA keep state"
+        ));
+    }
+    if let Some(destination) = rule.strip_prefix("pass out quick to ") {
+        let family = if destination
+            .split_once('/')
+            .map_or(destination, |(address, _)| address)
+            .parse::<IpAddr>()
+            .ok()?
+            .is_ipv4()
+        {
+            "inet"
+        } else {
+            "inet6"
+        };
+        return Some(format!(
+            "pass out quick {family} from any to {destination} flags S/SA keep state"
+        ));
+    }
+    Some(rule.to_string())
 }
 
 fn fmt_ip(ip: &IpAddr) -> String {
@@ -293,13 +410,10 @@ impl Killswitch for PfFirewall {
             }
         }
 
-        let output = pfctl(&["-a", PF_ANCHOR, "-sr"])?;
-        let snapshot = String::from_utf8_lossy(&output.stdout);
-        if !output.status.success() || !Self::snapshot_matches_policy(active, &snapshot) {
-            return Err(KillswitchError::CommandFailed(
-                "pf anchor read-back did not match the requested policy".to_string(),
-            ));
-        }
+        // Success is the complete effective-state postcondition, not merely
+        // the content of the owned anchor. Root traversal or PF enabled state
+        // can drift between the preflight/load and this read-back.
+        Self::verify_blocking(active)?;
 
         info!(
             target: "vortix::killswitch",
@@ -349,15 +463,16 @@ impl Killswitch for PfFirewall {
     }
 
     fn verify_blocking(active: &[ActiveTunnelInfo]) -> Result<()> {
-        let root = pfctl(&["-sr"])?;
-        let anchor = pfctl(&["-a", PF_ANCHOR, "-sr"])?;
-        let status = pfctl(&["-s", "info"])?;
+        let (root, anchor, status) = read_pf_state()?;
         if root.status.success()
             && anchor.status.success()
             && status.status.success()
-            && Self::root_traverses_anchor(&String::from_utf8_lossy(&root.stdout))
-            && pf_is_enabled(&String::from_utf8_lossy(&status.stdout))
-            && Self::snapshot_matches_policy(active, &String::from_utf8_lossy(&anchor.stdout))
+            && Self::state_matches_policy(
+                active,
+                &String::from_utf8_lossy(&root.stdout),
+                &String::from_utf8_lossy(&anchor.stdout),
+                &String::from_utf8_lossy(&status.stdout),
+            )
         {
             Ok(())
         } else {
@@ -381,7 +496,7 @@ impl Killswitch for PfFirewall {
     }
 }
 
-fn pf_is_enabled(status: &str) -> bool {
+pub(crate) fn pf_is_enabled(status: &str) -> bool {
     status.lines().any(|line| {
         line.split_once(':').is_some_and(|(key, value)| {
             key.trim() == "Status" && value.split_ascii_whitespace().next() == Some("Enabled")
@@ -453,6 +568,107 @@ mod tests {
         assert!(!PfFirewall::root_traverses_anchor(
             "pass quick label \"anchor \\\"com.apple/*\\\"\"\n"
         ));
+    }
+
+    #[test]
+    fn root_anchor_traversal_rejects_a_preceding_quick_outbound_pass() {
+        assert!(!PfFirewall::root_traverses_anchor(
+            "pass out quick all\nanchor \"com.apple/*\" all\n"
+        ));
+        assert!(!PfFirewall::root_traverses_anchor(
+            "pass quick out on en0 all\nanchor \"com.apple/vortix.killswitch\" all\n"
+        ));
+        assert!(PfFirewall::root_traverses_anchor(
+            "anchor \"com.apple/*\" all\npass out quick all\n"
+        ));
+    }
+
+    #[test]
+    fn root_anchor_traversal_rejects_restricted_anchor_rules() {
+        for rule in [
+            "anchor \"com.apple/*\" in all\n",
+            "anchor \"com.apple/*\" out on en0 all\n",
+            "anchor \"com.apple/*\" on lo0 all\n",
+            "anchor \"com.apple/*\" inet6 all\n",
+            "anchor \"com.apple/*\" proto tcp\n",
+            "anchor \"com.apple/vortix.killswitch\" all on en0\n",
+        ] {
+            assert!(
+                !PfFirewall::root_traverses_anchor(rule),
+                "restricted traversal must not verify: {rule}"
+            );
+        }
+    }
+
+    #[test]
+    fn pfctl_commands_are_bounded_and_contain_descendants() {
+        let command = PfFirewall::pfctl_command(vec!["-sr".into()]);
+        assert_eq!(command.timeout, Some(FIREWALL_COMMAND_TIMEOUT));
+        assert_eq!(command.output_limit, Some(FIREWALL_OUTPUT_LIMIT));
+        assert!(command.terminate_process_group);
+    }
+
+    #[test]
+    fn effective_state_requires_traversal_enabled_pf_and_exact_anchor_policy() {
+        let active = vec![ActiveTunnelInfo::endpoint_allowlist(vec!["198.51.100.7"
+            .parse()
+            .unwrap()])];
+        let anchor = PfFirewall::generate_pf_rules(&active);
+        let root = "anchor \"com.apple/*\" all\n";
+        let enabled = "Status: Enabled for 0 days\n";
+        assert!(PfFirewall::state_matches_policy(
+            &active, root, &anchor, enabled
+        ));
+        assert!(!PfFirewall::state_matches_policy(
+            &active,
+            "pass out quick all\nanchor \"com.apple/*\" all\n",
+            &anchor,
+            enabled,
+        ));
+        assert!(!PfFirewall::state_matches_policy(
+            &active,
+            root,
+            &anchor,
+            "Status: Disabled\n",
+        ));
+        assert!(!PfFirewall::state_matches_policy(
+            &active,
+            root,
+            &anchor.replace("198.51.100.7", "203.0.113.9"),
+            enabled,
+        ));
+    }
+
+    #[test]
+    fn pfctl_normalization_is_exact_and_rejects_semantic_suffixes() {
+        let active = vec![ActiveTunnelInfo {
+            interface: "utun4".into(),
+            server_ips: vec!["198.51.100.7".parse().unwrap()],
+            declared_cidrs: Vec::new(),
+            is_primary: true,
+        }];
+        let normalized = [
+            "pass out quick on lo0 all flags S/SA keep state",
+            "pass out quick inet from any to 10.0.0.0/8 flags S/SA keep state",
+            "pass out quick inet from any to 172.16.0.0/12 flags S/SA keep state",
+            "pass out quick inet from any to 192.168.0.0/16 flags S/SA keep state",
+            "pass out quick proto udp from any port = 68 to any port = 67 keep state",
+            "pass in quick proto udp from any port = 67 to any port = 68 keep state",
+            "pass out quick on utun4 all flags S/SA keep state",
+            "pass out quick inet from any to 198.51.100.7 flags S/SA keep state",
+        ];
+        let generated = PfFirewall::generate_pf_rules(&active);
+        let mut observed = normalized.to_vec();
+        observed.push(
+            PfFirewall::canonical_pf_rules(&generated)
+                .last()
+                .copied()
+                .unwrap(),
+        );
+        assert!(PfFirewall::canonical_snapshot_matches(&active, &observed));
+
+        observed[0] = "pass out quick on lo0 all flags S/SA keep state label \"foreign\"";
+        assert!(!PfFirewall::canonical_snapshot_matches(&active, &observed));
     }
 
     #[test]

@@ -213,10 +213,7 @@ pub fn handle_command(
         Commands::KillSwitch { mode: ks_mode } => {
             handle_killswitch(ks_mode.as_deref(), config, config_dir, mode)
         }
-        Commands::ReleaseKillSwitch => {
-            handle_release_killswitch(config, config_dir, mode);
-            0
-        }
+        Commands::ReleaseKillSwitch => handle_release_killswitch(config_dir, mode),
         Commands::Info => {
             handle_info(config_dir, config_source, mode);
             0
@@ -3238,12 +3235,7 @@ fn handle_killswitch(
                 exit,
             );
         }
-        if let Some(persisted) = crate::core::killswitch::load_state() {
-            engine.killswitch_mode = persisted.mode;
-            engine.killswitch_state = persisted.effective_state.unwrap_or(persisted.state);
-        } else {
-            engine.killswitch_mode = outcome.snapshot.desired.kill_switch;
-        }
+        refresh_killswitch_after_operation(&mut engine, &outcome);
     }
 
     // JSON envelope carries the canonical slug — the same string
@@ -3290,15 +3282,43 @@ fn handle_killswitch(
     0
 }
 
+fn refresh_killswitch_after_operation(
+    engine: &mut VpnRuntime,
+    outcome: &crate::cli::control::ClientOperationOutcome,
+) {
+    match crate::core::killswitch::load_state_checked() {
+        Ok(Some(persisted)) => {
+            engine.killswitch_mode = persisted.mode;
+            engine.killswitch_state = persisted.effective_state.unwrap_or(persisted.state);
+        }
+        Ok(None) => {
+            engine.killswitch_mode = outcome.snapshot.desired.kill_switch;
+        }
+        Err(error) => {
+            engine.killswitch_mode = outcome.snapshot.desired.kill_switch;
+            engine.killswitch_state = crate::state::KillSwitchState::Degraded;
+            tracing::warn!(
+                target: "vortix::killswitch",
+                %error,
+                "post-operation kill-switch state could not be verified"
+            );
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct ReleaseData {
     released: bool,
 }
 
-fn handle_release_killswitch(config: &AppConfig, config_dir: &Path, mode: OutputMode) {
-    let _lifecycle_lock = acquire_lifecycle_lock_or_exit(mode, "release-killswitch");
-    let engine = VpnRuntime::new_headless(config.clone(), config_dir.to_path_buf());
-    if !engine.is_root {
+/// Run the emergency kill-switch release without normal application startup.
+///
+/// This path requires root, durably records mode `off`, removes only
+/// Vortix-owned firewall state, and verifies that state is absent before
+/// reporting success.
+#[must_use]
+pub fn handle_release_killswitch(config_dir: &Path, mode: OutputMode) -> i32 {
+    if !crate::utils::is_root() {
         print_error_and_exit(
             mode,
             "release-killswitch",
@@ -3306,34 +3326,41 @@ fn handle_release_killswitch(config: &AppConfig, config_dir: &Path, mode: Output
             ExitCode::PermissionDenied,
         );
     }
-    let control = crate::cli::control::ClientControlSession::start_production(
-        config,
-        config_dir,
-        engine.profiles.clone(),
-    )
-    .unwrap_or_else(|error| local_control_error_or_exit(mode, "release-killswitch", &error));
-    let outcome = control
-        .run(
-            crate::vortix_core::control::UserCommand::SetKillSwitch {
-                mode: crate::state::KillSwitchMode::Off,
-            },
-            Duration::from_secs(config.disconnect_timeout),
-            local_idempotency_key("release-killswitch", None),
-        )
-        .unwrap_or_else(|error| local_control_error_or_exit(mode, "release-killswitch", &error));
-    if outcome.status != crate::vortix_core::control::OperationStatus::Succeeded {
-        let (_, exit, message) = operation_failure("kill-switch release", &outcome);
+
+    // Emergency release is still a global mutation. Refuse to race a live
+    // canonical authority that could immediately reconcile the old policy
+    // back into the kernel or overwrite the durable `off` intent.
+    let _lifecycle_lock = acquire_lifecycle_lock_or_exit(mode, "release-killswitch");
+
+    // Persist the emergency intent before touching the kernel. If the
+    // process is interrupted after firewall release, the next startup must
+    // not recover an older vpn-only intent and re-engage blocking.
+    persist_emergency_release_off(config_dir).unwrap_or_else(|error| {
         print_error_and_exit(
             mode,
             "release-killswitch",
             CliError {
-                code: "release_failed",
-                message,
+                code: "persistence_failed",
+                message: format!("Could not durably save kill switch mode off: {error}"),
                 hint: Some(crate::platform::KILLSWITCH_EMERGENCY_MSG.to_string()),
             },
-            exit,
-        );
-    }
+            ExitCode::GeneralError,
+        )
+    });
+
+    crate::core::killswitch::disable_blocking().unwrap_or_else(|error| {
+        emergency_release_failed(
+            mode,
+            format!("Could not remove Vortix firewall state: {error}"),
+        )
+    });
+    crate::core::killswitch::verify_disabled().unwrap_or_else(|error| {
+        emergency_release_failed(
+            mode,
+            format!("Vortix firewall state was not proven absent: {error}"),
+        )
+    });
+
     match mode {
         OutputMode::Human => {
             println!("Kill switch released. Internet access restored.");
@@ -3348,6 +3375,72 @@ fn handle_release_killswitch(config: &AppConfig, config_dir: &Path, mode: Output
         }
         OutputMode::Quiet => {}
     }
+    0
+}
+
+fn persist_emergency_release_off(config_dir: &Path) -> Result<(), String> {
+    persist_control_release_off(config_dir)?;
+
+    crate::core::killswitch::save_emergency_release_state(config_dir)
+        .map_err(|error| error.to_string())
+}
+
+fn persist_control_release_off(config_dir: &Path) -> Result<(), String> {
+    use crate::vortix_core::control::ControlStateStore as _;
+
+    let boot_id = crate::utils::boot_identity()
+        .unwrap_or_else(|| "emergency-release-boot-identity-unavailable".to_string());
+    let owner = crate::config::config_owner(config_dir)?;
+    let store = crate::vortix_config::control_state::FsControlStateStore::for_owner(
+        config_dir.join("control"),
+        owner.0,
+        owner.1,
+    );
+    let recovered = match store.load(&boot_id) {
+        Ok(recovered) => recovered,
+        Err(error) => {
+            // An unreadable control journal already prevents canonical
+            // startup from obtaining mutation authority, so it cannot
+            // re-engage an old vpn-only intent. Emergency release must still
+            // restore networking. Durable write failures below remain fatal.
+            tracing::warn!(
+                target: "vortix::killswitch",
+                %error,
+                "control history could not be read during emergency release"
+            );
+            return Ok(());
+        }
+    };
+    if let Some(mut recovered) = recovered {
+        recovered.state.desired.kill_switch = crate::state::KillSwitchMode::Off;
+        recovered.state.desired.generation = recovered.state.desired.generation.saturating_add(1);
+        recovered.state.desired.refresh_policy_digest();
+        recovered.state.reconciliation_required = true;
+
+        // Save twice so both the current file and its corruption-recovery
+        // predecessor carry off. A single save intentionally rotates the old
+        // current file to `control-state.previous.json`.
+        store
+            .save(&boot_id, &recovered.state)
+            .map_err(|error| error.to_string())?;
+        store
+            .save(&boot_id, &recovered.state)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn emergency_release_failed(mode: OutputMode, message: String) -> ! {
+    print_error_and_exit(
+        mode,
+        "release-killswitch",
+        CliError {
+            code: "release_failed",
+            message,
+            hint: Some(crate::platform::KILLSWITCH_EMERGENCY_MSG.to_string()),
+        },
+        ExitCode::GeneralError,
+    )
 }
 
 // ── System ──────────────────────────────────────────────────────────────
@@ -3503,6 +3596,64 @@ pub(crate) fn count_profiles(profiles_dir: &Path) -> (u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn emergency_release_rewrites_current_and_recovery_control_intent_to_off() {
+        use crate::vortix_core::control::{
+            ControlStateStore as _, DurableControlState, RecoveredControlState,
+        };
+
+        let config = tempfile::tempdir().unwrap();
+        let control_dir = config.path().join("control");
+        let store = crate::vortix_config::control_state::FsControlStateStore::new(&control_dir);
+        let boot_id = crate::utils::boot_identity()
+            .unwrap_or_else(|| "emergency-release-test-boot".to_string());
+        let mut durable = DurableControlState {
+            desired: crate::vortix_core::control::DesiredState::default(),
+            operations: std::collections::BTreeMap::new(),
+            boot_connections: std::collections::BTreeMap::new(),
+            requested_resources: std::collections::BTreeMap::new(),
+            last_connected_at: std::collections::BTreeMap::new(),
+            tombstones: std::collections::BTreeMap::new(),
+            retention: crate::vortix_core::control::RetentionMetadata::default(),
+            reconciliation_required: false,
+        };
+        durable.desired.kill_switch = crate::state::KillSwitchMode::AlwaysOn;
+        store.save(&boot_id, &durable).unwrap();
+
+        persist_control_release_off(config.path()).unwrap();
+        let current = store.load(&boot_id).unwrap().unwrap();
+        assert_eq!(
+            current.state.desired.kill_switch,
+            crate::state::KillSwitchMode::Off
+        );
+        assert!(current.state.reconciliation_required);
+
+        // Corrupt the current copy so loading must use the rotated recovery
+        // file. It must also contain off rather than the pre-release vpn-only.
+        std::fs::write(control_dir.join("control-state.json"), b"corrupt").unwrap();
+        let RecoveredControlState { state, .. } = store.load(&boot_id).unwrap().unwrap();
+        assert_eq!(state.desired.kill_switch, crate::state::KillSwitchMode::Off);
+    }
+
+    #[test]
+    fn unreadable_control_history_does_not_block_emergency_release_persistence() {
+        let config = tempfile::tempdir().unwrap();
+        let control_dir = config.path().join("control");
+        std::fs::create_dir(&control_dir).unwrap();
+        std::fs::write(control_dir.join("control-state.json"), b"corrupt").unwrap();
+        std::fs::write(control_dir.join("control-state.previous.json"), b"corrupt").unwrap();
+
+        persist_emergency_release_off(config.path()).unwrap();
+
+        let saved =
+            std::fs::read_to_string(config.path().join(crate::constants::KILLSWITCH_STATE_FILE))
+                .unwrap();
+        let state: crate::core::killswitch::PersistedState = serde_json::from_str(&saved).unwrap();
+        assert_eq!(state.mode, crate::state::KillSwitchMode::Off);
+        assert_eq!(state.state, crate::state::KillSwitchState::Disabled);
+        assert!(state.emergency_release_fence);
+    }
 
     #[test]
     fn default_connect_budget_covers_protocol_cleanup_and_control_settlement() {

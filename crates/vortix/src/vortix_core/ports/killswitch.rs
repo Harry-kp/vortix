@@ -34,8 +34,8 @@ pub enum KillswitchError {
     /// The caller is not running as root and the operation requires root.
     #[error("kill switch requires root privileges")]
     NotRoot,
-    /// No firewall backend is available on this host (Linux only — neither
-    /// `iptables` nor `nft` is on PATH).
+    /// No safe firewall backend is available on this host (Linux requires
+    /// `nft`; split-family iptables replacement cannot be atomic).
     #[error("no firewall backend available on this host")]
     NoBackendAvailable,
 }

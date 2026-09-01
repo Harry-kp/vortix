@@ -200,6 +200,28 @@ impl Default for DesiredState {
     }
 }
 
+impl DesiredState {
+    /// Recompute the digest that binds every durable policy input.
+    pub(crate) fn refresh_policy_digest(&mut self) {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(self.kill_switch.cli_verb().as_bytes());
+        for (profile_id, state) in &self.tunnels {
+            bytes.extend_from_slice(profile_id.as_str().as_bytes());
+            bytes.extend_from_slice(match state {
+                RequestedTunnelState::Connected => b"connected",
+                RequestedTunnelState::Disconnected => b"disconnected",
+            });
+        }
+        for (profile_id, conflict) in &self.conflict_acknowledgements {
+            bytes.extend_from_slice(profile_id.as_str().as_bytes());
+            bytes.extend_from_slice(
+                &serde_json::to_vec(conflict).expect("topology conflicts are serializable"),
+            );
+        }
+        self.policy_digest = PolicyDigest::sha256(&bytes);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtectionEvidence {
     pub desired_generation: u64,

@@ -1,6 +1,6 @@
 //! Fixed-vocabulary PF adapter used by the root helper.
 
-use super::firewall::{PfFirewall, PF_ANCHOR, PF_APPLY_ARGS, PF_RELEASE_ARGS};
+use super::firewall::{pf_is_enabled, PfFirewall, PF_ANCHOR, PF_APPLY_ARGS, PF_RELEASE_ARGS};
 use crate::platform::fixed_root_command::{self, FixedCommandError, FixedCommandOutput};
 use crate::vortix_core::ports::killswitch::ActiveTunnelInfo;
 use crate::vortix_core::ports::owned_firewall::{
@@ -112,10 +112,12 @@ impl OwnedFirewall for MacOsOwnedFirewall {
 
     fn audit_blocking(&mut self, active: &[ActiveTunnelInfo]) -> Result<(), OwnedFirewallError> {
         let state = self.read_state()?;
-        if state.root_traverses_anchor
-            && state.enabled
-            && PfFirewall::snapshot_matches_policy(active, &state.anchor_rules)
-        {
+        if PfFirewall::verified_state(
+            active,
+            state.root_traverses_anchor,
+            state.enabled,
+            &state.anchor_rules,
+        ) {
             Ok(())
         } else {
             Err(OwnedFirewallError::EffectMayHaveApplied)
@@ -140,12 +142,15 @@ impl OwnedFirewall for MacOsOwnedFirewall {
         if allow_absent && PfFirewall::canonical_pf_rules(&state.anchor_rules).is_empty() {
             return Ok(());
         }
-        if state.root_traverses_anchor && state.enabled && {
+        let matches_candidate = {
             let observed = PfFirewall::canonical_pf_rules(&state.anchor_rules);
-            blocking_candidates
-                .iter()
-                .any(|active| PfFirewall::canonical_snapshot_matches(active, &observed))
-        } {
+            state.root_traverses_anchor
+                && state.enabled
+                && blocking_candidates
+                    .iter()
+                    .any(|active| PfFirewall::canonical_snapshot_matches(active, &observed))
+        };
+        if matches_candidate {
             Ok(())
         } else {
             Err(OwnedFirewallError::EffectMayHaveApplied)
@@ -157,14 +162,6 @@ struct PfState {
     root_traverses_anchor: bool,
     enabled: bool,
     anchor_rules: String,
-}
-
-fn pf_is_enabled(status: &str) -> bool {
-    status.lines().any(|line| {
-        line.split_once(':').is_some_and(|(key, value)| {
-            key.trim() == "Status" && value.split_ascii_whitespace().next() == Some("Enabled")
-        })
-    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

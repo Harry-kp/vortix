@@ -1837,6 +1837,16 @@ impl ControlRuntime<'_> {
         now: u64,
         events: &mut Vec<ControlEvent>,
     ) -> bool {
+        submit_emergency_pre_block_before_persistence(
+            self.supervisor,
+            snapshot,
+            owner,
+            self.admission,
+            now,
+            self.selection,
+            self.config,
+            events,
+        );
         let persisted_before_effects = persist_control_state_if_changed(
             self.config,
             before,
@@ -1883,6 +1893,42 @@ impl ControlRuntime<'_> {
             derive_dns_security_projection(snapshot, self.config);
         }
         persisted_before_effects
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn submit_emergency_pre_block_before_persistence(
+    supervisor: Option<&Supervisor>,
+    snapshot: &mut ControlSnapshot,
+    owner: &mut OwnerState,
+    admission: &Arc<Mutex<AdmissionState>>,
+    now: u64,
+    selection: ExecutionSelection,
+    config: &ControlServiceConfig,
+    events: &mut Vec<ControlEvent>,
+) {
+    let Some(supervisor) = supervisor else {
+        return;
+    };
+    let is_unexpected_recovery = owner
+        .topology_transaction
+        .as_ref()
+        .filter(|transaction| transaction.phase == TopologyTransactionPhase::NeedsPreBlock)
+        .and_then(|transaction| {
+            snapshot
+                .operations
+                .get(&transaction.pre_policy.operation_id)
+        })
+        .is_some_and(|operation| {
+            matches!(operation.intent, OperationIntent::UnexpectedRecovery { .. })
+        });
+    if is_unexpected_recovery
+        && snapshot.desired.kill_switch
+            == crate::vortix_core::state::killswitch::KillSwitchMode::Auto
+    {
+        submit_required_pre_block(
+            supervisor, snapshot, owner, admission, now, selection, config, events,
+        );
     }
 }
 
@@ -3076,41 +3122,9 @@ fn drive_supervision(
         }
     }
 
-    let pre_block_submission = owner.topology_transaction.as_ref().and_then(|transaction| {
-        (transaction.phase == TopologyTransactionPhase::NeedsPreBlock).then(|| {
-            let mut policy = transaction.pre_policy.clone();
-            policy.stage = PolicyStage::PreTunnelBlocking;
-            policy
-        })
-    });
-    if let Some(policy) = pre_block_submission {
-        match supervisor.submit_policy(&policy) {
-            Ok(()) => {
-                if let Some(transaction) = owner.topology_transaction.as_mut() {
-                    transaction.phase = TopologyTransactionPhase::PreBlockPending;
-                }
-                if let Some(recovery) = owner.unexpected_recoveries.get_mut(&policy.operation_id) {
-                    recovery.phase = UnexpectedRecoveryPhase::PreBlockPending;
-                }
-            }
-            Err(WorkFailure::Busy) => {}
-            Err(failure) => {
-                let operation_id = policy.operation_id.clone();
-                fail_tunnel_dispatch_operation(
-                    &operation_id,
-                    policy.generation,
-                    failure,
-                    snapshot,
-                    owner,
-                    admission,
-                    now,
-                    selection,
-                    config,
-                    events,
-                );
-            }
-        }
-    }
+    submit_required_pre_block(
+        supervisor, snapshot, owner, admission, now, selection, config, events,
+    );
 
     let tunnel_action_operation = owner
         .topology_transaction
@@ -3538,6 +3552,55 @@ fn drive_supervision(
                     );
                 }
             }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn submit_required_pre_block(
+    supervisor: &Supervisor,
+    snapshot: &mut ControlSnapshot,
+    owner: &mut OwnerState,
+    admission: &Arc<Mutex<AdmissionState>>,
+    now: u64,
+    selection: ExecutionSelection,
+    config: &ControlServiceConfig,
+    events: &mut Vec<ControlEvent>,
+) {
+    let pre_block_submission = owner.topology_transaction.as_ref().and_then(|transaction| {
+        (transaction.phase == TopologyTransactionPhase::NeedsPreBlock).then(|| {
+            let mut policy = transaction.pre_policy.clone();
+            policy.stage = PolicyStage::PreTunnelBlocking;
+            policy
+        })
+    });
+    let Some(policy) = pre_block_submission else {
+        return;
+    };
+    match supervisor.submit_policy(&policy) {
+        Ok(()) => {
+            if let Some(transaction) = owner.topology_transaction.as_mut() {
+                transaction.phase = TopologyTransactionPhase::PreBlockPending;
+            }
+            if let Some(recovery) = owner.unexpected_recoveries.get_mut(&policy.operation_id) {
+                recovery.phase = UnexpectedRecoveryPhase::PreBlockPending;
+            }
+        }
+        Err(WorkFailure::Busy) => {}
+        Err(failure) => {
+            let operation_id = policy.operation_id.clone();
+            fail_tunnel_dispatch_operation(
+                &operation_id,
+                policy.generation,
+                failure,
+                snapshot,
+                owner,
+                admission,
+                now,
+                selection,
+                config,
+                events,
+            );
         }
     }
 }
@@ -5208,22 +5271,7 @@ fn finish_lifecycle_operation(
 }
 
 fn recompute_policy_digest(snapshot: &mut ControlSnapshot) {
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(snapshot.desired.kill_switch.cli_verb().as_bytes());
-    for (profile_id, state) in &snapshot.desired.tunnels {
-        bytes.extend_from_slice(profile_id.as_str().as_bytes());
-        bytes.extend_from_slice(match state {
-            RequestedTunnelState::Connected => b"connected",
-            RequestedTunnelState::Disconnected => b"disconnected",
-        });
-    }
-    for (profile_id, conflict) in &snapshot.desired.conflict_acknowledgements {
-        bytes.extend_from_slice(profile_id.as_str().as_bytes());
-        bytes.extend_from_slice(
-            &serde_json::to_vec(conflict).expect("topology conflicts are serializable"),
-        );
-    }
-    snapshot.desired.policy_digest = PolicyDigest::sha256(&bytes);
+    snapshot.desired.refresh_policy_digest();
 }
 
 fn observation_evidence(observation: &Observation) -> Option<&ProtectionEvidence> {
@@ -6125,6 +6173,41 @@ fn admit_unexpected_loss_recovery(
         desired_generation: generation,
     });
     register_recovery_lifecycle(owner, snapshot, config, &recovery_id, now, events);
+
+    prepare_unexpected_recovery_preblock(snapshot, owner, supervisor, config, &recovery_id, now);
+}
+
+fn prepare_unexpected_recovery_preblock(
+    snapshot: &ControlSnapshot,
+    owner: &mut OwnerState,
+    supervisor: &Supervisor,
+    config: &ControlServiceConfig,
+    recovery_id: &OperationId,
+    now: u64,
+) {
+    if snapshot.desired.kill_switch != crate::vortix_core::state::killswitch::KillSwitchMode::Auto {
+        return;
+    }
+    let recovery_operation = snapshot
+        .operations
+        .get(recovery_id)
+        .cloned()
+        .expect("unexpected recovery operation was just inserted");
+    if let Some(policy) = capture_topology_policy(
+        snapshot,
+        owner,
+        supervisor,
+        config,
+        &recovery_operation,
+        TopologyTransitionKind::Recovery,
+        now,
+    ) {
+        owner.topology_transaction = Some(TopologyTransaction {
+            pre_policy: policy,
+            final_policy: None,
+            phase: TopologyTransactionPhase::NeedsPreBlock,
+        });
+    }
 }
 
 fn restored_unexpected_recoveries(

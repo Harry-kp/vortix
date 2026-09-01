@@ -129,9 +129,9 @@ impl KillSwitchMode {
     }
 
     /// The desired `KillSwitchState` for this mode given the current
-    /// connection status and the previous state. Pure function —
-    /// `sync_killswitch` adds a `!is_root` downgrade (Blocking →
-    /// Armed) on top of this, but the policy decision lives here.
+    /// connection status and the previous state. The canonical control
+    /// service combines this policy decision with authenticated platform
+    /// read-back before publishing effective protection truth.
     ///
     /// | Mode       | `is_connected` | `old_state`   | result     |
     /// |------------|----------------|---------------|------------|
