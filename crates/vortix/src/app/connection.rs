@@ -15,6 +15,7 @@ pub(crate) enum PendingControlSubject {
     Connection,
     Reconnection,
     Disconnection,
+    DisconnectAll,
     KillSwitch,
 }
 
@@ -30,6 +31,7 @@ impl PendingControlSubject {
             Self::Connection => "connection",
             Self::Reconnection => "reconnection",
             Self::Disconnection => "disconnection",
+            Self::DisconnectAll => "disconnect all",
             Self::KillSwitch => "kill switch change",
         }
     }
@@ -39,6 +41,7 @@ impl PendingControlSubject {
             Self::Connection => "Connection queued",
             Self::Reconnection => "Reconnection queued",
             Self::Disconnection => "Disconnection queued",
+            Self::DisconnectAll => "Disconnecting all VPNs",
             Self::KillSwitch => "Kill switch change queued",
         }
     }
@@ -48,7 +51,7 @@ impl PendingControlSubject {
             Self::Connection | Self::Reconnection => {
                 "VPN DNS could not be applied safely. Your previous network settings were restored."
             }
-            Self::Disconnection => {
+            Self::Disconnection | Self::DisconnectAll => {
                 "Disconnect could not finish safely. Your previous network settings were restored."
             }
             Self::KillSwitch => {
@@ -66,7 +69,7 @@ impl PendingControlSubject {
             Self::Connection | Self::Reconnection => {
                 "The VPN server rejected this profile. Check its certificate or username and password; if they are correct, the server may not authorize this profile."
             }
-            Self::Disconnection | Self::KillSwitch => {
+            Self::Disconnection | Self::DisconnectAll | Self::KillSwitch => {
                 "The VPN server rejected the requested authentication."
             }
         }
@@ -106,7 +109,11 @@ impl PendingControlSubject {
 
 fn friendly_dns_failure_explanation(detail: Option<&str>) -> Option<&'static str> {
     let detail = detail?.to_ascii_lowercase();
-    if [
+    if detail.contains("another vpn or network service") || detail.contains("instead of this vpn") {
+        Some(
+            "Another VPN or network service is routing this profile's DNS traffic. Disconnect it and try again. The Event Log shows the conflicting interface and a command to inspect it.",
+        )
+    } else if [
         "owner",
         "owned",
         "ownership",
@@ -226,13 +233,41 @@ fn control_command_subject(
             Some(PendingControlSubject::Connection)
         }
         UserCommand::Reconnect { .. } => Some(PendingControlSubject::Reconnection),
-        UserCommand::Disconnect { .. } | UserCommand::ForceDisconnect { .. } => {
-            Some(PendingControlSubject::Disconnection)
+        UserCommand::Disconnect { profile_id: None }
+        | UserCommand::ForceDisconnect { profile_id: None } => {
+            Some(PendingControlSubject::DisconnectAll)
         }
+        UserCommand::Disconnect {
+            profile_id: Some(_),
+        }
+        | UserCommand::ForceDisconnect {
+            profile_id: Some(_),
+        } => Some(PendingControlSubject::Disconnection),
         UserCommand::SetKillSwitch { .. } => Some(PendingControlSubject::KillSwitch),
         UserCommand::ImportProfile { .. }
         | UserCommand::RenameProfile { .. }
         | UserCommand::DeleteProfile { .. } => None,
+    }
+}
+
+#[cfg(test)]
+mod control_command_subject_tests {
+    use super::{control_command_subject, PendingControlSubject};
+    use crate::vortix_core::control::UserCommand;
+    use crate::vortix_core::profile::ProfileId;
+
+    #[test]
+    fn distinguishes_bulk_from_profile_disconnects() {
+        assert!(matches!(
+            control_command_subject(Some(&UserCommand::Disconnect { profile_id: None })),
+            Some(PendingControlSubject::DisconnectAll)
+        ));
+        assert!(matches!(
+            control_command_subject(Some(&UserCommand::Disconnect {
+                profile_id: Some(ProfileId::new("profile")),
+            })),
+            Some(PendingControlSubject::Disconnection)
+        ));
     }
 }
 
@@ -356,6 +391,14 @@ fn terminal_control_notification(
         }
         (OperationStatus::Expired, _) => {
             Some((format!("{} timed out", subject.label()), ToastType::Error))
+        }
+        (OperationStatus::Succeeded, _)
+            if matches!(subject, PendingControlSubject::DisconnectAll) =>
+        {
+            Some((
+                "All VPN connections disconnected".to_string(),
+                ToastType::Success,
+            ))
         }
         (OperationStatus::Succeeded, _) if recovery_retry => Some((
             format!("{} succeeded after retry", subject.label()),
@@ -789,6 +832,10 @@ impl App {
         &mut self,
         snapshot: &crate::vortix_core::control::ControlSnapshot,
     ) {
+        let disconnect_all_in_flight = self
+            .pending_control_operations
+            .values()
+            .any(|pending| matches!(pending.subject, PendingControlSubject::DisconnectAll));
         let completed = self
             .pending_control_operations
             .iter()
@@ -839,14 +886,24 @@ impl App {
             if self.present_late_route_conflict(subject, status, result, late_route_conflict) {
                 continue;
             }
-            let notification = terminal_control_notification(
-                subject,
-                recovery_retry,
-                status,
-                result,
-                owned_retry.is_some(),
-                failure_detail.as_deref(),
-            );
+            let superseded_connection_cancellation = disconnect_all_in_flight
+                && status == crate::vortix_core::control::OperationStatus::Cancelled
+                && matches!(
+                    subject,
+                    PendingControlSubject::Connection | PendingControlSubject::Reconnection
+                );
+            let notification = if superseded_connection_cancellation {
+                None
+            } else {
+                terminal_control_notification(
+                    subject,
+                    recovery_retry,
+                    status,
+                    result,
+                    owned_retry.is_some(),
+                    failure_detail.as_deref(),
+                )
+            };
             if let Some((message, toast_type)) = notification {
                 self.show_toast(message, toast_type);
             }

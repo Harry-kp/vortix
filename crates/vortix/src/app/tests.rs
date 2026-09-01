@@ -3626,6 +3626,120 @@ fn terminal_dns_policy_failure_is_shown_to_tui_user() {
 }
 
 #[test]
+fn competing_vpn_dns_route_has_actionable_tui_copy() {
+    use crate::vortix_core::control::{
+        AuthorityEpoch, ClientId, IdempotencyKey, OperationFailure, OperationId, OperationIntent,
+        OperationRecord, OperationResult, OperationStatus, PolicyDigest,
+    };
+
+    let mut app = test_app();
+    let operation_id = OperationId::from_parts(AuthorityEpoch(1), 4_243);
+    app.track_control_operation_with_profile(
+        operation_id.clone(),
+        super::connection::PendingControlSubject::Connection,
+        Some("AWS_VPN".to_string()),
+    );
+    let mut snapshot = app.control_snapshot.clone();
+    snapshot.operations.insert(
+        operation_id.clone(),
+        OperationRecord {
+            id: operation_id,
+            idempotency_key: IdempotencyKey::new("competing-vpn-dns-route"),
+            client_id: ClientId::from_parts(AuthorityEpoch(1), 1),
+            command_digest: PolicyDigest::default(),
+            authority_epoch: AuthorityEpoch(1),
+            desired_generation: 1,
+            admitted_at_millis: 1,
+            deadline_millis: 2,
+            intent: OperationIntent::default(),
+            status: OperationStatus::Failed,
+            result: Some(OperationResult::Failed(OperationFailure::DnsPolicyFailed)),
+            failure_detail: Some(
+                "DNS resolver 10.64.0.2 currently routes through utun100 instead of this VPN (utun4). Another VPN or network service may own that route."
+                    .to_string(),
+            ),
+        },
+    );
+
+    app.apply_control_snapshot(snapshot);
+
+    let toast = app.toast.as_ref().expect("DNS failure must be visible");
+    assert!(toast
+        .message
+        .contains("Another VPN or network service is routing this profile's DNS traffic"));
+    assert!(toast.message.contains("Disconnect it and try again"));
+    assert!(toast
+        .message
+        .contains("Event Log shows the conflicting interface"));
+    assert!(!toast.message.contains("utun100"));
+}
+
+#[test]
+fn successful_disconnect_all_replaces_superseded_connection_cancellation() {
+    use crate::vortix_core::control::{
+        AuthorityEpoch, ClientId, IdempotencyKey, OperationId, OperationIntent, OperationRecord,
+        OperationResult, OperationStatus, PolicyDigest,
+    };
+
+    let mut app = test_app();
+    let connection_id = OperationId::from_parts(AuthorityEpoch(1), 4_244);
+    let disconnect_all_id = OperationId::from_parts(AuthorityEpoch(1), 4_245);
+    app.track_control_operation_with_profile(
+        connection_id.clone(),
+        super::connection::PendingControlSubject::Connection,
+        Some("AWS_VPN".to_string()),
+    );
+    app.track_control_operation_with_profile(
+        disconnect_all_id.clone(),
+        super::connection::PendingControlSubject::DisconnectAll,
+        None,
+    );
+
+    let mut snapshot = app.control_snapshot.clone();
+    for (id, key, status, result) in [
+        (
+            connection_id,
+            "superseded-connect",
+            OperationStatus::Cancelled,
+            Some(OperationResult::Cancelled),
+        ),
+        (
+            disconnect_all_id,
+            "disconnect-all",
+            OperationStatus::Succeeded,
+            Some(OperationResult::ObservedConvergence),
+        ),
+    ] {
+        snapshot.operations.insert(
+            id.clone(),
+            OperationRecord {
+                id,
+                idempotency_key: IdempotencyKey::new(key),
+                client_id: ClientId::from_parts(AuthorityEpoch(1), 1),
+                command_digest: PolicyDigest::default(),
+                authority_epoch: AuthorityEpoch(1),
+                desired_generation: 1,
+                admitted_at_millis: 1,
+                deadline_millis: 2,
+                intent: OperationIntent::default(),
+                status,
+                result,
+                failure_detail: None,
+            },
+        );
+    }
+
+    app.apply_control_snapshot(snapshot);
+
+    let toast = app
+        .toast
+        .as_ref()
+        .expect("disconnect all success must be visible");
+    assert_eq!(toast.toast_type, ToastType::Success);
+    assert_eq!(toast.message, "All VPN connections disconnected");
+}
+
+#[test]
 fn terminal_late_route_conflict_opens_the_existing_confirmation_dialog() {
     use crate::vortix_core::control::{
         AuthorityEpoch, ClientId, IdempotencyKey, OperationFailure, OperationId, OperationIntent,

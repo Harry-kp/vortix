@@ -103,17 +103,31 @@ fn verify_dns_routes_with(
                 index + 1
             ));
         }
-        if !matches!(
-            observation,
-            DefaultRouteObservation::Interface(ref interface)
-                if interface == expected_interface
-        ) {
+        if let DefaultRouteObservation::Interface(interface) = &observation {
+            if interface == expected_interface {
+                continue;
+            }
             return Err(format!(
-                "DNS resolver {server} routes outside tunnel {expected_interface}: {observation:?}"
+                "DNS resolver {server} currently routes through {interface} instead of this VPN ({expected_interface}). Another VPN or network service may own that route. Check active VPN apps, then run `{}`.",
+                route_diagnostic_command(server)
             ));
         }
+        return Err(format!(
+            "DNS resolver {server} could not be verified through this VPN ({expected_interface}): {observation:?}"
+        ));
     }
     Ok(())
+}
+
+fn route_diagnostic_command(server: IpAddr) -> String {
+    match std::env::consts::OS {
+        "macos" => {
+            let family = if server.is_ipv4() { "-inet" } else { "-inet6" };
+            format!("route -n get {family} {server}")
+        }
+        "linux" => format!("ip route get {server}"),
+        _ => format!("inspect the system route to {server}"),
+    }
 }
 
 #[cfg(test)]
@@ -146,8 +160,9 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("192.168.1.100"));
-        assert!(error.contains("outside tunnel utun4"));
-        assert!(error.contains("en0"));
+        assert!(error.contains("currently routes through en0 instead of this VPN (utun4)"));
+        assert!(error.contains("Another VPN or network service may own that route"));
+        assert!(error.contains(&route_diagnostic_command("192.168.1.100".parse().unwrap())));
     }
 
     #[test]
