@@ -4,7 +4,7 @@ use ratatui::{
     widgets::{Block, Clear},
     Frame,
 };
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthChar;
 
 /// Clear an area and repaint the active theme's owned surface.
 pub(crate) fn clear_area(frame: &mut Frame, area: Rect) {
@@ -41,8 +41,23 @@ pub(crate) fn centered_rect_fixed(width: u16, height: u16, area: Rect) -> Rect {
 
 /// Truncate text to a terminal-column budget, including the ellipsis.
 pub(crate) fn truncate_to_width(text: &str, max_width: usize) -> String {
-    if text.width() <= max_width {
-        return text.to_string();
+    let sanitized: String = text
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                '\u{FFFD}'
+            } else {
+                character
+            }
+        })
+        .collect();
+    let sanitized_width = sanitized
+        .chars()
+        .map(|character| character.width().unwrap_or(1))
+        .sum::<usize>();
+
+    if sanitized_width <= max_width {
+        return sanitized;
     }
     if max_width <= 3 {
         return ".".repeat(max_width);
@@ -51,8 +66,8 @@ pub(crate) fn truncate_to_width(text: &str, max_width: usize) -> String {
     let content_width = max_width - 3;
     let mut width = 0;
     let mut truncated = String::new();
-    for character in text.chars() {
-        let character_width = character.width().unwrap_or(0);
+    for character in sanitized.chars() {
+        let character_width = character.width().unwrap_or(1);
         if width + character_width > content_width {
             break;
         }
@@ -67,6 +82,7 @@ pub(crate) fn truncate_to_width(text: &str, max_width: usize) -> String {
 mod tests {
     use super::*;
     use ratatui::{backend::TestBackend, Terminal};
+    use unicode_width::UnicodeWidthStr;
 
     #[test]
     fn centered_rect_fixed_centers_within_area() {
@@ -99,6 +115,21 @@ mod tests {
         let truncated = truncate_to_width("office-世界-network", 12);
         assert!(truncated.width() <= 12);
         assert!(truncated.ends_with("..."));
+    }
+
+    #[test]
+    fn truncation_sanitizes_terminal_controls_even_when_text_fits() {
+        assert_eq!(
+            truncate_to_width("profile\u{1b}[31m\n", 32),
+            "profile�[31m�"
+        );
+    }
+
+    #[test]
+    fn sanitized_controls_consume_terminal_width_when_truncated() {
+        let truncated = truncate_to_width("\u{1b}abcdef", 5);
+        assert_eq!(truncated, "�a...");
+        assert_eq!(truncated.width(), 5);
     }
 
     #[test]
