@@ -61,7 +61,7 @@ impl IptablesFirewall {
             .contain_process_group()
     }
 
-    fn backend_error(context: &str, error: std::io::Error) -> KillswitchError {
+    fn backend_error(context: &str, error: &std::io::Error) -> KillswitchError {
         if error.kind() == std::io::ErrorKind::NotFound {
             KillswitchError::NoBackendAvailable
         } else {
@@ -448,7 +448,7 @@ impl IptablesFirewall {
             ])
             .privilege(PrivilegeReq::Root),
         )
-        .map_err(|error| Self::backend_error("nft read-back", error))?;
+        .map_err(|error| Self::backend_error("nft read-back", &error))?;
         if output.status.success() {
             return Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()));
         }
@@ -473,7 +473,7 @@ impl IptablesFirewall {
                 .privilege(PrivilegeReq::Root)
                 .stdin(ruleset.into_bytes()),
         )
-        .map_err(|error| Self::backend_error("nft spawn", error))
+        .map_err(|error| Self::backend_error("nft spawn", &error))
     }
 
     fn setup_nftables(active: &[ActiveTunnelInfo]) -> Result<()> {
@@ -531,7 +531,7 @@ impl IptablesFirewall {
             ])
             .privilege(PrivilegeReq::Root),
         )
-        .map_err(|error| Self::backend_error("nft delete", error))?;
+        .map_err(|error| Self::backend_error("nft delete", &error))?;
         let delete_error = String::from_utf8_lossy(&delete.stderr);
         if !delete.status.success() && !delete_error.contains(nft_policy::MISSING_ERROR) {
             return Err(KillswitchError::CommandFailed(format!(
