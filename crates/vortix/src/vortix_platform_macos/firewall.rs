@@ -35,7 +35,7 @@ const PF_CONF_PATH_LEGACY: &str = "/tmp/vortix_killswitch.conf";
 /// Vortix policy below that existing hook lets us own and replace only this
 /// anchor without rewriting the host's global ruleset.
 pub(crate) const PF_ANCHOR: &str = "com.apple/vortix.killswitch";
-pub(crate) const PF_APPLY_ARGS: [&str; 4] = ["-a", PF_ANCHOR, "-f", "-"];
+pub(crate) const PF_APPLY_ARGS: [&str; 6] = ["-o", "none", "-a", PF_ANCHOR, "-f", "-"];
 pub(crate) const PF_RELEASE_ARGS: [&str; 4] = ["-a", PF_ANCHOR, "-F", "rules"];
 const POLICY_LABEL_PREFIX: &str = "vortix-policy:";
 const PF_RULE_LABEL_MAX_BYTES: usize = 63;
@@ -553,8 +553,33 @@ mod tests {
 
     #[test]
     fn pf_mutations_are_scoped_to_the_vortix_anchor() {
-        assert_eq!(PF_APPLY_ARGS, ["-a", PF_ANCHOR, "-f", "-"]);
+        assert_eq!(&PF_APPLY_ARGS[2..], ["-a", PF_ANCHOR, "-f", "-"]);
         assert_eq!(PF_RELEASE_ARGS, ["-a", PF_ANCHOR, "-F", "rules"]);
+    }
+
+    #[test]
+    fn pf_load_disables_optimizer_that_reorders_exact_policy() {
+        let generated = PfFirewall::generate_pf_rules(&[]);
+        let mut default_optimizer_output = vec![
+            "pass out quick inet from any to 10.0.0.0/8 flags S/SA keep state",
+            "pass out quick inet from any to 172.16.0.0/12 flags S/SA keep state",
+            "pass out quick inet from any to 192.168.0.0/16 flags S/SA keep state",
+            "pass out quick on lo0 all flags S/SA keep state",
+            "pass out quick proto udp from any port = 68 to any port = 67 keep state",
+            "pass in quick proto udp from any port = 67 to any port = 68 keep state",
+        ];
+        default_optimizer_output.push(
+            PfFirewall::canonical_pf_rules(&generated)
+                .last()
+                .copied()
+                .unwrap(),
+        );
+
+        assert!(!PfFirewall::canonical_snapshot_matches(
+            &[],
+            &default_optimizer_output
+        ));
+        assert_eq!(&PF_APPLY_ARGS[..2], ["-o", "none"]);
     }
 
     #[test]
