@@ -184,20 +184,6 @@ impl App {
             .map(|profile| profile.id.clone())
     }
 
-    /// Whether the profile at `idx` is currently in a Connected state. Used
-    /// by the `d` / `Enter` keybindings to decide between connect and
-    /// disconnect routing ().
-    #[must_use]
-    pub(crate) fn is_profile_connected(&self, idx: usize) -> bool {
-        use crate::vortix_core::engine::state::Connection;
-        let Some(profile) = self.runtime.profiles.get(idx) else {
-            return false;
-        };
-        self.registry
-            .snapshot(&profile.id)
-            .is_some_and(|snap| matches!(snap.state, Connection::Connected { .. }))
-    }
-
     /// Whether the named profile is currently in any non-`Disconnected` state
     /// (`Connecting` / `Connected` / `Disconnecting` / `Reconnecting` /
     /// `AwaitingUserInput`). Used by deletion-safety checks where we need
@@ -245,6 +231,14 @@ impl App {
             ToastType::Success | ToastType::Info => "APP",
         };
         self.log(&format!("{level_prefix}: {message}"));
+        if self
+            .toast
+            .as_ref()
+            .is_some_and(|toast| toast.toast_type == ToastType::Error)
+            && toast_type == ToastType::Info
+        {
+            return;
+        }
         self.toast = Some(Toast {
             message,
             toast_type,

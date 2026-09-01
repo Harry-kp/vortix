@@ -18,6 +18,12 @@ pub(crate) enum PendingControlSubject {
     KillSwitch,
 }
 
+#[derive(Clone, Copy)]
+enum ProfileDisconnectKind {
+    Normal,
+    Force,
+}
+
 impl PendingControlSubject {
     const fn label(self) -> &'static str {
         match self {
@@ -25,6 +31,15 @@ impl PendingControlSubject {
             Self::Reconnection => "reconnection",
             Self::Disconnection => "disconnection",
             Self::KillSwitch => "kill switch change",
+        }
+    }
+
+    const fn queued_message(self) -> &'static str {
+        match self {
+            Self::Connection => "Connection queued",
+            Self::Reconnection => "Reconnection queued",
+            Self::Disconnection => "Disconnection queued",
+            Self::KillSwitch => "Kill switch change queued",
         }
     }
 
@@ -187,6 +202,7 @@ fn control_error_message(error: &crate::cli::control::LocalControlError) -> Stri
 
 pub(crate) struct PendingControlOperation {
     subject: PendingControlSubject,
+    profile_name: Option<String>,
     admitted_after_generation: u64,
     recovery_retry: bool,
 }
@@ -215,6 +231,32 @@ fn control_command_subject(
         }
         UserCommand::SetKillSwitch { .. } => Some(PendingControlSubject::KillSwitch),
         UserCommand::ImportProfile { .. }
+        | UserCommand::RenameProfile { .. }
+        | UserCommand::DeleteProfile { .. } => None,
+    }
+}
+
+fn lifecycle_command_profile_id(
+    command: Option<&crate::vortix_core::control::UserCommand>,
+) -> Option<&ProfileId> {
+    use crate::vortix_core::control::UserCommand;
+    match command? {
+        UserCommand::Connect { profile_id, .. }
+        | UserCommand::ConnectExclusive { profile_id }
+        | UserCommand::Reconnect {
+            profile_id: Some(profile_id),
+        }
+        | UserCommand::Disconnect {
+            profile_id: Some(profile_id),
+        }
+        | UserCommand::ForceDisconnect {
+            profile_id: Some(profile_id),
+        } => Some(profile_id),
+        UserCommand::Reconnect { profile_id: None }
+        | UserCommand::Disconnect { profile_id: None }
+        | UserCommand::ForceDisconnect { profile_id: None }
+        | UserCommand::SetKillSwitch { .. }
+        | UserCommand::ImportProfile { .. }
         | UserCommand::RenameProfile { .. }
         | UserCommand::DeleteProfile { .. } => None,
     }
@@ -440,15 +482,36 @@ impl App {
         for result in results {
             match result.completion {
                 crate::cli::control::TuiControlCompletion::Admission(Ok(operation_id)) => {
-                    let subject = result
-                        .import_display_name
-                        .as_deref()
-                        .map_or_else(|| "command".to_owned(), |name| format!("import '{name}'"));
-                    self.log(&format!(
-                        "CONTROL: Durable {subject} admitted as {operation_id:?}"
-                    ));
-                    if let Some(subject) = control_command_subject(result.command.as_ref()) {
-                        self.track_control_operation(operation_id, subject);
+                    let control_subject = control_command_subject(result.command.as_ref());
+                    let profile_name = lifecycle_command_profile_id(result.command.as_ref())
+                        .and_then(|profile_id| {
+                            self.runtime
+                                .profiles
+                                .iter()
+                                .find(|profile| profile.id == *profile_id)
+                                .map(|profile| profile.name.clone())
+                        });
+                    let activity = result.import_display_name.as_deref().map_or_else(
+                        || {
+                            control_subject.map_or_else(
+                                || "Profile update queued".to_string(),
+                                |subject| {
+                                    profile_name.as_deref().map_or_else(
+                                        || subject.queued_message().to_string(),
+                                        |name| format!("{} for '{name}'", subject.queued_message()),
+                                    )
+                                },
+                            )
+                        },
+                        |name| format!("Profile import queued: '{name}'"),
+                    );
+                    self.log(&format!("CONTROL: {activity}"));
+                    if let Some(subject) = control_subject {
+                        self.track_control_operation_with_profile(
+                            operation_id,
+                            subject,
+                            profile_name,
+                        );
                     }
                 }
                 crate::cli::control::TuiControlCompletion::Admission(Err(error)) => {
@@ -663,10 +726,11 @@ impl App {
         }
     }
 
-    pub(crate) fn track_control_operation(
+    pub(crate) fn track_control_operation_with_profile(
         &mut self,
         operation_id: crate::vortix_core::control::OperationId,
         subject: PendingControlSubject,
+        profile_name: Option<String>,
     ) {
         let already_terminal = self
             .control_snapshot
@@ -677,6 +741,7 @@ impl App {
             operation_id,
             PendingControlOperation {
                 subject,
+                profile_name,
                 admitted_after_generation: self.control_snapshot.generation,
                 recovery_retry: false,
             },
@@ -746,6 +811,7 @@ impl App {
                         (
                             operation_id.clone(),
                             pending.subject,
+                            pending.profile_name.clone(),
                             pending.recovery_retry,
                             operation.status,
                             operation.result,
@@ -760,6 +826,7 @@ impl App {
         for (
             operation_id,
             subject,
+            profile_name,
             recovery_retry,
             status,
             result,
@@ -784,8 +851,12 @@ impl App {
                 self.show_toast(message, toast_type);
             }
             if let Some(detail) = failure_detail {
+                let profile = profile_name
+                    .as_deref()
+                    .map_or_else(String::new, |name| format!(" for '{name}'"));
                 self.log(&format!(
-                    "ERR: Control operation {operation_id} failed: {detail}"
+                    "ERR: Control {} failed{profile}: {detail}",
+                    subject.label(),
                 ));
             }
             if let Some(retry_id) = owned_retry {
@@ -793,6 +864,7 @@ impl App {
                     retry_id,
                     PendingControlOperation {
                         subject,
+                        profile_name,
                         admitted_after_generation: snapshot.generation,
                         recovery_retry: true,
                     },
@@ -1131,6 +1203,10 @@ impl App {
     }
     /// Disconnect the selected profile through the canonical owner.
     pub(crate) fn disconnect_profile_by_idx(&mut self, idx: usize) {
+        self.disconnect_profile_by_idx_with_kind(idx, ProfileDisconnectKind::Normal);
+    }
+
+    fn disconnect_profile_by_idx_with_kind(&mut self, idx: usize, kind: ProfileDisconnectKind) {
         if self.control_session.is_none() {
             self.show_toast(CONTROL_STARTING_MESSAGE.to_string(), ToastType::Info);
             return;
@@ -1144,10 +1220,25 @@ impl App {
             return;
         };
         if self.registry.snapshot(&profile_id).is_some() {
-            self.issue_control_command(crate::vortix_core::control::UserCommand::Disconnect {
-                profile_id: Some(profile_id),
-            });
+            let command = match kind {
+                ProfileDisconnectKind::Normal => {
+                    crate::vortix_core::control::UserCommand::Disconnect {
+                        profile_id: Some(profile_id),
+                    }
+                }
+                ProfileDisconnectKind::Force => {
+                    crate::vortix_core::control::UserCommand::ForceDisconnect {
+                        profile_id: Some(profile_id),
+                    }
+                }
+            };
+            self.issue_control_command(command);
         }
+    }
+    /// Force-disconnect the exact selected profile without falling back to a
+    /// different primary tunnel.
+    pub(crate) fn force_disconnect_profile_by_idx(&mut self, idx: usize) {
+        self.disconnect_profile_by_idx_with_kind(idx, ProfileDisconnectKind::Force);
     }
     /// Disconnect every active tunnel through the canonical owner.
     pub(crate) fn disconnect_all_active(&mut self) {

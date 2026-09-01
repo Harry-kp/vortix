@@ -4,6 +4,7 @@ use ratatui::{
     widgets::{Block, Clear},
     Frame,
 };
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Clear an area and repaint the active theme's owned surface.
 pub(crate) fn clear_area(frame: &mut Frame, area: Rect) {
@@ -38,6 +39,30 @@ pub(crate) fn centered_rect_fixed(width: u16, height: u16, area: Rect) -> Rect {
     area
 }
 
+/// Truncate text to a terminal-column budget, including the ellipsis.
+pub(crate) fn truncate_to_width(text: &str, max_width: usize) -> String {
+    if text.width() <= max_width {
+        return text.to_string();
+    }
+    if max_width <= 3 {
+        return ".".repeat(max_width);
+    }
+
+    let content_width = max_width - 3;
+    let mut width = 0;
+    let mut truncated = String::new();
+    for character in text.chars() {
+        let character_width = character.width().unwrap_or(0);
+        if width + character_width > content_width {
+            break;
+        }
+        truncated.push(character);
+        width += character_width;
+    }
+    truncated.push_str("...");
+    truncated
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67,6 +92,13 @@ mod tests {
         let r = centered_rect(50, 50, area);
         assert_eq!(r.width, 50);
         assert_eq!(r.height, 50);
+    }
+
+    #[test]
+    fn truncates_wide_text_to_terminal_column_budget() {
+        let truncated = truncate_to_width("office-世界-network", 12);
+        assert!(truncated.width() <= 12);
+        assert!(truncated.ends_with("..."));
     }
 
     #[test]

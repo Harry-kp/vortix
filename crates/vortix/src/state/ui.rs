@@ -401,7 +401,7 @@ impl Toast {
     /// Check if the toast notification has expired
     #[must_use]
     pub fn is_expired(&self) -> bool {
-        Instant::now() > self.expires
+        self.toast_type != ToastType::Error && Instant::now() > self.expires
     }
 }
 

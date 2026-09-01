@@ -95,8 +95,8 @@ pub enum Message {
     },
     /// User chose the legacy single-tunnel "switch" path on the
     /// default-route takeover overlay: disconnect the current tunnel
-    /// first, then connect the new one. Fired by the `[S]` hotkey on
-    /// the overlay (distinct from `[Y]es` which keeps both tunnels up).
+    /// first, then connect the new one. Fired by the `[Y] Switch` choice on
+    /// the overlay (distinct from `[B] Keep both`).
     SwitchExclusiveAndConnect {
         idx: usize,
     },
@@ -111,6 +111,12 @@ pub enum Message {
     /// the global `Disconnect` message which targets the legacy single-
     /// tunnel active profile.
     DisconnectProfile {
+        idx: usize,
+    },
+    /// Force-disconnect one exact profile when its teardown is already in
+    /// progress. This is the profile-scoped counterpart to the legacy global
+    /// `Disconnect` fallback.
+    ForceDisconnectProfile {
         idx: usize,
     },
     /// open the "Disconnect all N tunnels?"
@@ -333,7 +339,7 @@ pub fn get_single_actions(focused_panel: &FocusedPanel) -> Vec<ActionMenuItem> {
     actions
 }
 
-/// Get bulk/global actions (triggered by 'b')
+/// Get operations that can affect more than one profile (triggered by `b`).
 #[must_use]
 pub fn get_bulk_actions() -> Vec<ActionMenuItem> {
     vec![
@@ -343,49 +349,9 @@ pub fn get_bulk_actions() -> Vec<ActionMenuItem> {
             message: Message::OpenImport,
         },
         ActionMenuItem {
-            key: "r",
-            label: "Reconnect Last",
-            message: Message::Reconnect,
-        },
-        ActionMenuItem {
             key: "D",
             label: "Disconnect All",
-            message: Message::Disconnect,
-        },
-        ActionMenuItem {
-            key: "y",
-            label: "Copy Public IPv4",
-            message: Message::CopyIp,
-        },
-        ActionMenuItem {
-            key: "K",
-            label: "Toggle Kill Switch",
-            message: Message::ToggleKillSwitch,
-        },
-        ActionMenuItem {
-            key: "/",
-            label: "Search Profiles",
-            message: Message::OpenSearch,
-        },
-        ActionMenuItem {
-            key: "?",
-            label: "Help",
-            message: Message::OpenHelp,
-        },
-        ActionMenuItem {
-            key: "l",
-            label: "Next Panel",
-            message: Message::NextPanel,
-        },
-        ActionMenuItem {
-            key: "h",
-            label: "Previous Panel",
-            message: Message::PreviousPanel,
-        },
-        ActionMenuItem {
-            key: "q",
-            label: "Quit Vortix",
-            message: Message::Quit,
+            message: Message::RequestDisconnectAll,
         },
     ]
 }
@@ -443,15 +409,17 @@ mod tests {
     fn test_bulk_actions_contains_essentials() {
         let actions = get_bulk_actions();
         assert!(actions.iter().any(|a| a.key == "i")); // import
-        assert!(actions.iter().any(|a| a.key == "D")); // disconnect all
-        assert!(actions.iter().any(|a| a.key == "q")); // quit
-        assert!(actions.iter().any(|a| a.key == "y")); // copy IP
-        assert!(actions.iter().any(|a| a.key == "K")); // kill switch
+        assert!(actions.iter().any(|action| {
+            action.key == "D" && matches!(action.message, Message::RequestDisconnectAll)
+        }));
+        assert_eq!(
+            actions.iter().map(|action| action.key).collect::<Vec<_>>(),
+            ["i", "D"],
+            "the Bulk Actions menu must contain only genuinely bulk operations"
+        );
         assert!(!actions
             .iter()
             .any(|a| { matches!(a.message, Message::ToggleTheme) }));
-        assert!(actions.iter().any(|a| a.key == "/")); // search
-        assert!(actions.iter().any(|a| a.key == "?")); // help
         assert!(!actions.iter().any(|action| matches!(
             action.message,
             Message::OpenBackgroundSetup

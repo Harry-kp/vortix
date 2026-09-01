@@ -286,7 +286,6 @@ pub const TITLE_FLIP_CONNECTIONS_AUDIT: &str = " ◀ Connections Audit ";
 pub const FLIP_BACK_HINT: &str = " [f] flip back ";
 /// Minimum panel width (columns) to render content during flip animation.
 pub const FLIP_ANIMATION_MIN_WIDTH: u16 = 3;
-pub const HINT_IMPORT_BULK: &str = "💡 Tip: Enter a directory to bulk import all profiles";
 pub const LABEL_SUPPORTED_FORMATS: &str = "Supported formats:";
 pub const EXT_CONF: &str = ".conf";
 pub const EXT_OVPN: &str = ".ovpn";

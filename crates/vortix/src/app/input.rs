@@ -6,11 +6,36 @@ use super::{App, AuthField, FocusedPanel, InputMode, ToastType};
 use crate::constants;
 use crate::message::{self, Message, ScrollMove, SelectionMove};
 use crate::state::help_max_scroll_for_terminal_height;
+use crate::vortix_core::engine::state::Connection;
 
 enum ConfirmAction {
     Confirmed,
     Cancelled,
     None,
+}
+
+/// The lifecycle action that profile-scoped shortcuts apply to the focused
+/// sidebar row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FocusedTunnelAction {
+    Connect,
+    Cancel,
+    Disconnect,
+    ForceDisconnect,
+}
+
+/// Classify one focused tunnel without falling back to another active tunnel.
+pub(crate) const fn focused_tunnel_action(state: Option<&Connection>) -> FocusedTunnelAction {
+    match state {
+        Some(Connection::Disconnecting { .. }) => FocusedTunnelAction::ForceDisconnect,
+        Some(
+            Connection::Connecting { .. }
+            | Connection::Reconnecting { .. }
+            | Connection::AwaitingUserInput { .. },
+        ) => FocusedTunnelAction::Cancel,
+        Some(Connection::Connected { .. }) => FocusedTunnelAction::Disconnect,
+        Some(Connection::Disconnected { .. }) | None => FocusedTunnelAction::Connect,
+    }
 }
 
 /// Shared logic for all Yes/No confirmation dialogs.
@@ -42,6 +67,32 @@ fn handle_confirm_keys(key: KeyEvent, confirm_selected: &mut bool) -> ConfirmAct
 }
 
 impl App {
+    /// Apply the sidebar disconnect shortcut to the focused profile only.
+    ///
+    /// An inactive row is deliberately a no-op: falling back to the registry
+    /// primary here would disconnect a different profile than the one the user
+    /// selected.
+    fn handle_focused_profile_disconnect(&mut self) {
+        let Some(idx) = self.profile_list_state.selected() else {
+            return;
+        };
+        let state = self.runtime.profiles.get(idx).and_then(|profile| {
+            self.registry
+                .snapshot(&profile.id)
+                .map(|snapshot| snapshot.state)
+        });
+        match focused_tunnel_action(state.as_ref()) {
+            FocusedTunnelAction::Disconnect => {
+                self.handle_message(Message::DisconnectProfile { idx });
+            }
+            FocusedTunnelAction::ForceDisconnect => {
+                self.handle_message(Message::ForceDisconnectProfile { idx });
+            }
+            FocusedTunnelAction::Cancel => self.handle_message(Message::CancelConnect { idx }),
+            FocusedTunnelAction::Connect => {}
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     pub fn handle_key(&mut self, key: KeyEvent) {
         // 1. Global: Quit
@@ -56,8 +107,15 @@ impl App {
             return;
         }
 
-        // 2. Dismiss toast on Esc
-        if key.code == KeyCode::Esc && self.toast.is_some() {
+        // 2. Dismiss a dashboard toast on Esc. Active overlays own Esc so one
+        // keypress always closes the interaction the user is looking at.
+        if key.code == KeyCode::Esc
+            && self.toast.is_some()
+            && self.input_mode == InputMode::Normal
+            && !self.show_config
+            && !self.show_action_menu
+            && !self.show_bulk_menu
+        {
             self.toast = None;
             return;
         }
@@ -744,37 +802,22 @@ impl crate::app::App {
             KeyCode::Char('7') => self.handle_message(Message::QuickConnect(6)),
             KeyCode::Char('8') => self.handle_message(Message::QuickConnect(7)),
             KeyCode::Char('9') => self.handle_message(Message::QuickConnect(8)),
-            // `d` on a Connected sidebar
-            // row disconnects that one tunnel; from any other panel `d`
-            // preserves the legacy global Disconnect path (the primary or
-            // sole active tunnel goes down).
+            // On the sidebar, `d` always applies to the focused row. It must
+            // never fall through and disconnect a different primary tunnel.
+            // Other panels retain the primary/global shortcut.
             KeyCode::Char('d') => {
                 if self.focused_panel == FocusedPanel::Sidebar {
-                    if let Some(idx) = self.profile_list_state.selected() {
-                        if self.is_profile_connected(idx) {
-                            self.handle_message(Message::DisconnectProfile { idx });
-                            return;
-                        }
-                    }
+                    self.handle_focused_profile_disconnect();
+                    return;
                 }
                 self.handle_message(Message::Disconnect);
             }
-            // Shift+`D` on the sidebar
-            // opens the "Disconnect all N tunnels?" confirm when N>1; with
-            // N≤1 it acts identically to plain `d` (backwards-compatible).
+            // Uppercase `D` is the global Disconnect All action. The message
+            // layer skips confirmation when zero or one tunnel is active.
             KeyCode::Char('D') => {
                 if self.focused_panel == FocusedPanel::Sidebar {
-                    let n = self.active_tunnel_count();
-                    if n > 1 {
-                        self.handle_message(Message::RequestDisconnectAll);
-                        return;
-                    }
-                    if let Some(idx) = self.profile_list_state.selected() {
-                        if self.is_profile_connected(idx) {
-                            self.handle_message(Message::DisconnectProfile { idx });
-                            return;
-                        }
-                    }
+                    self.handle_message(Message::RequestDisconnectAll);
+                    return;
                 }
                 self.handle_message(Message::Disconnect);
             }
@@ -820,7 +863,28 @@ impl crate::app::App {
                     self.handle_message(Message::OpenDelete(None));
                 }
                 KeyCode::Char('c') | KeyCode::Enter => {
-                    self.handle_message(Message::ToggleConnect(None));
+                    let Some(idx) = self.profile_list_state.selected() else {
+                        return;
+                    };
+                    let state = self.runtime.profiles.get(idx).and_then(|profile| {
+                        self.registry
+                            .snapshot(&profile.id)
+                            .map(|snapshot| snapshot.state)
+                    });
+                    match focused_tunnel_action(state.as_ref()) {
+                        FocusedTunnelAction::Connect => {
+                            self.handle_message(Message::ToggleConnect(Some(idx)));
+                        }
+                        FocusedTunnelAction::Cancel => {
+                            self.handle_message(Message::CancelConnect { idx });
+                        }
+                        FocusedTunnelAction::Disconnect => {
+                            self.handle_message(Message::DisconnectProfile { idx });
+                        }
+                        FocusedTunnelAction::ForceDisconnect => {
+                            self.handle_message(Message::ForceDisconnectProfile { idx });
+                        }
+                    }
                 }
                 KeyCode::Char('v') => {
                     if self.profile_list_state.selected().is_some() {

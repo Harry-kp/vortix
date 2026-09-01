@@ -30,6 +30,8 @@ mod profile;
 mod telemetry_poll;
 mod update;
 
+pub(crate) use input::{focused_tunnel_action, FocusedTunnelAction};
+
 #[cfg(test)]
 mod tests;
 
