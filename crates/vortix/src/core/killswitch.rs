@@ -80,11 +80,22 @@ fn local_executor_epoch() -> &'static str {
 /// Stable digest of the complete requested firewall policy.
 ///
 /// The digest is independent of caller iteration order: tunnels, endpoints,
-/// and declared CIDRs are sorted before hashing. Platform adapters stamp this
-/// value into their owned rules and require the same value during read-back,
-/// so a successful command alone can never promote protection truth.
+/// and declared CIDRs are sorted before hashing. Platform adapters stamp a
+/// platform-safe encoding of this digest identity into their owned rules and
+/// require the same value during read-back, so a successful command alone can
+/// never promote protection truth.
 #[must_use]
 pub fn policy_digest(active: &[ActiveTunnelInfo]) -> String {
+    let digest = policy_digest_bytes(active);
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
+}
+
+/// Raw policy digest for platform formats with constrained encodings.
+pub(crate) fn policy_digest_bytes(active: &[ActiveTunnelInfo]) -> [u8; 32] {
     let mut tunnels: Vec<String> = active
         .iter()
         .map(|tunnel| {
@@ -108,12 +119,7 @@ pub fn policy_digest(active: &[ActiveTunnelInfo]) -> String {
         .collect();
     tunnels.sort_unstable();
 
-    let digest = Sha256::digest(tunnels.join("\n").as_bytes());
-    let mut encoded = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        write!(encoded, "{byte:02x}").expect("writing to a String cannot fail");
-    }
-    encoded
+    Sha256::digest(tunnels.join("\n").as_bytes()).into()
 }
 
 /// Validate values that platform adapters interpolate into firewall syntax.

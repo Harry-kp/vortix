@@ -21,6 +21,7 @@ use crate::vortix_core::ports::killswitch::{
     ActiveTunnelInfo, Killswitch, KillswitchError, Result,
 };
 use crate::vortix_process::{CommandSpec, PrivilegeReq};
+use base64::engine::{general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use tracing::{debug, error, info};
 
 /// On-disk pf configuration written for diagnostic inspection. The
@@ -37,6 +38,7 @@ pub(crate) const PF_ANCHOR: &str = "com.apple/vortix.killswitch";
 pub(crate) const PF_APPLY_ARGS: [&str; 4] = ["-a", PF_ANCHOR, "-f", "-"];
 pub(crate) const PF_RELEASE_ARGS: [&str; 4] = ["-a", PF_ANCHOR, "-F", "rules"];
 const POLICY_LABEL_PREFIX: &str = "vortix-policy:";
+const PF_RULE_LABEL_MAX_BYTES: usize = 63;
 const FIREWALL_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const FIREWALL_OUTPUT_LIMIT: usize = 1024 * 1024;
 
@@ -177,7 +179,8 @@ impl PfFirewall {
         // PF evaluates the last matching rule. All allow exceptions must
         // precede a terminal quick block so later root rules cannot override
         // the Vortix anchor, while the block cannot shadow our own allows.
-        let digest = crate::core::killswitch::policy_digest(active);
+        let digest = URL_SAFE_NO_PAD.encode(crate::core::killswitch::policy_digest_bytes(active));
+        debug_assert!(POLICY_LABEL_PREFIX.len() + digest.len() <= PF_RULE_LABEL_MAX_BYTES);
         writeln!(rules).unwrap();
         writeln!(rules, "# Default: block all remaining egress").unwrap();
         writeln!(
@@ -816,6 +819,48 @@ mod tests {
             PfFirewall::canonical_pf_rules(&missing_allow),
             PfFirewall::canonical_pf_rules(&rules)
         );
+    }
+
+    #[test]
+    fn terminal_policy_label_fits_pf_limit() {
+        let policy = vec![tunnel("utun3", &["198.51.100.7"], &["0.0.0.0/0"], true)];
+        let rules = PfFirewall::generate_pf_rules(&policy);
+        let terminal = rules.lines().next_back().unwrap();
+        let label = terminal
+            .strip_prefix("block drop out quick all label \"")
+            .and_then(|value| value.strip_suffix('"'))
+            .unwrap();
+
+        assert_eq!(PF_RULE_LABEL_MAX_BYTES, 63);
+        assert!(
+            label.len() <= 63,
+            "PF rule labels are limited to 63 bytes, got {}",
+            label.len()
+        );
+        let encoded_digest = label.strip_prefix(POLICY_LABEL_PREFIX).unwrap();
+        let decoded_digest = URL_SAFE_NO_PAD.decode(encoded_digest).unwrap();
+        let decoded_hex = decoded_digest.iter().fold(
+            String::with_capacity(decoded_digest.len() * 2),
+            |mut encoded, byte| {
+                write!(encoded, "{byte:02x}").unwrap();
+                encoded
+            },
+        );
+        assert_eq!(decoded_hex, crate::core::killswitch::policy_digest(&policy));
+    }
+
+    #[test]
+    fn readback_rejects_a_different_policy_label() {
+        let expected = vec![tunnel("utun3", &["198.51.100.7"], &["0.0.0.0/0"], true)];
+        let different = vec![tunnel("utun3", &["198.51.100.7"], &["10.0.0.0/8"], true)];
+        let observed = PfFirewall::generate_pf_rules(&different);
+
+        assert_eq!(
+            without_policy_label(&PfFirewall::generate_pf_rules(&expected)),
+            without_policy_label(&observed),
+            "the label must be the only generated-rule difference"
+        );
+        assert!(!PfFirewall::snapshot_matches_policy(&expected, &observed));
     }
 
     /// Snapshot — empty active set. Pins the base block-all ruleset.
