@@ -523,18 +523,30 @@ pub fn persisted_from_active(active: &[ActiveTunnelInfo]) -> Vec<PersistedTunnel
 /// silently rejects. The temp+rename pattern preserves the prior valid
 /// file across any failure point.
 fn atomic_write(path: &std::path::Path, contents: &[u8]) -> io::Result<()> {
-    let tmp_path = path.with_extension("json.tmp");
-    crate::utils::write_user_file(&tmp_path, contents)?;
-    // fsync the temp file so its data hits disk before we rename. On
-    // platforms where `sync_all` is unsupported (rare), the write is
-    // still atomic at the rename step — sync_all just narrows the
-    // window during which a post-rename crash could lose data.
-    {
-        let file = std::fs::OpenOptions::new().read(true).open(&tmp_path)?;
-        let _ = file.sync_all();
-    }
-    fs::rename(&tmp_path, path)?;
-    Ok(())
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "kill-switch state has no parent",
+        )
+    })?;
+    let name = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "kill-switch state name is not valid UTF-8",
+            )
+        })?;
+    let (uid, gid) = crate::config::config_owner(parent).map_err(io::Error::other)?;
+    let directory =
+        crate::vortix_config::control_state::open_control_directory(parent, false, uid, gid)
+            .map_err(io::Error::other)?
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "config directory is missing")
+            })?;
+    crate::vortix_config::control_state::write_owned_atomic(&directory, name, contents, uid, gid)
+        .map_err(io::Error::other)
 }
 
 /// Clear the persisted state file.
@@ -828,23 +840,21 @@ mod tests {
     }
 
     #[test]
-    fn atomic_write_creates_target_and_no_tmp_left_behind() {
-        let tmp_dir = std::env::temp_dir();
-        let path = tmp_dir.join(format!(
-            "vortix-killswitch-atomic-write-{}.json",
-            std::process::id()
-        ));
-        let _ = fs::remove_file(&path);
-        let tmp = path.with_extension("json.tmp");
-        let _ = fs::remove_file(&tmp);
+    fn atomic_write_does_not_follow_the_legacy_predictable_temp_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(constants::KILLSWITCH_STATE_FILE);
+        let victim = directory.path().join("victim");
+        fs::write(&victim, b"must survive").unwrap();
+        let legacy_temp = path.with_extension("json.tmp");
+        symlink(&victim, &legacy_temp).unwrap();
 
         atomic_write(&path, b"hello").unwrap();
 
-        assert!(path.exists(), "target file must exist after atomic_write");
         assert_eq!(fs::read(&path).unwrap(), b"hello");
-        assert!(!tmp.exists(), "temp file must be renamed away");
-
-        let _ = fs::remove_file(&path);
+        assert_eq!(fs::read(&victim).unwrap(), b"must survive");
+        assert!(legacy_temp.is_symlink());
     }
 
     #[test]
