@@ -1204,7 +1204,7 @@ impl ControlHandle {
                     .supervisor
                     .as_ref()
                     .ok_or(AdmissionError::Stopped)?;
-                for profile_id in &target_profiles {
+                for profile_id in &lifecycle_profiles {
                     // An exclusive switch reserves teardown capacity now, but
                     // deliberately reserves the target connect only after all
                     // competing tunnels are absent. That prevents the old
@@ -1257,7 +1257,7 @@ impl ControlHandle {
                 .reserve_operation(
                     scope,
                     command_digest.clone(),
-                    &target_profiles,
+                    &lifecycle_profiles,
                     operation_kind,
                     &config,
                 )
@@ -2766,6 +2766,81 @@ fn drive_supervision(
                             events,
                         );
                     }
+                }
+            } else if result.result == Err(WorkFailure::TimedOut)
+                && result.mutation == TunnelMutation::Connect
+                && config
+                    .profile_topologies
+                    .get(&result.profile_id)
+                    .is_some_and(|topology| {
+                        topology.protocol
+                            == Some(crate::vortix_core::profile::ProtocolKind::OpenVpn)
+                    })
+            {
+                // The canonical OpenVPN adapter stops its owned custodian and
+                // proves teardown before it reports a timeout. Do not preserve
+                // Connected intent and silently launch another attempt after
+                // telling the user that this one reached its terminal bound.
+                let rollback_profiles = snapshot
+                    .operations
+                    .get(&result.operation_id)
+                    .and_then(|operation| operation_intent_tunnels(&operation.intent))
+                    .map_or_else(
+                        || vec![result.profile_id.clone()],
+                        |tunnels| {
+                            tunnels
+                                .iter()
+                                .filter(|(_, requested)| {
+                                    **requested == RequestedTunnelState::Connected
+                                })
+                                .map(|(profile_id, _)| profile_id.clone())
+                                .collect::<Vec<_>>()
+                        },
+                    );
+                let retired = supervisor
+                    .retire_cleaned_connect_timeout(
+                        &result.profile_id,
+                        &result.revision,
+                        &result.operation_id,
+                    )
+                    .is_ok();
+                if retired {
+                    let completion = complete_operation(
+                        OperationCompletion {
+                            operation_id: result.operation_id.clone(),
+                            desired_generation: result.revision.generation,
+                            outcome: CompletionOutcome::Failed(OperationFailure::Timeout),
+                        },
+                        snapshot,
+                        owner,
+                        admission,
+                        now,
+                        config,
+                        events,
+                    );
+                    if matches!(completion, Ok(CompletionResult::Terminal(_))) {
+                        rollback_connect_intent(
+                            &rollback_profiles,
+                            result.revision.generation,
+                            snapshot,
+                            owner,
+                            now,
+                            events,
+                        );
+                    }
+                } else {
+                    fail_tunnel_dispatch_operation(
+                        &result.operation_id,
+                        result.revision.generation,
+                        WorkFailure::TimedOut,
+                        snapshot,
+                        owner,
+                        admission,
+                        now,
+                        selection,
+                        config,
+                        events,
+                    );
                 }
             } else if result.result == Err(WorkFailure::TimedOut) {
                 fail_tunnel_dispatch_operation(
@@ -4350,7 +4425,7 @@ fn handle_envelope(
                     desired_generation,
                     admitted_at_millis: admitted_at,
                     deadline_millis: request.deadline.0,
-                    intent: intent_for_command(&request.command, &target_profiles),
+                    intent: intent_for_command(&request.command, &lifecycle_profiles),
                     status,
                     result: expired.then_some(OperationResult::Expired),
                     failure_detail: None,
@@ -4861,7 +4936,7 @@ fn command_digest(command: &UserCommand) -> PolicyDigest {
     PolicyDigest::sha256(&bytes)
 }
 
-fn intent_for_command(command: &UserCommand, target_profiles: &[ProfileId]) -> OperationIntent {
+fn intent_for_command(command: &UserCommand, operation_profiles: &[ProfileId]) -> OperationIntent {
     let requested = match command {
         UserCommand::Connect { .. }
         | UserCommand::ConnectExclusive { .. }
@@ -4875,7 +4950,7 @@ fn intent_for_command(command: &UserCommand, target_profiles: &[ProfileId]) -> O
         | UserCommand::DeleteProfile { .. } => None,
     };
     let tunnels = if let UserCommand::ConnectExclusive { profile_id } = command {
-        target_profiles
+        operation_profiles
             .iter()
             .cloned()
             .map(|candidate| {
@@ -4889,7 +4964,7 @@ fn intent_for_command(command: &UserCommand, target_profiles: &[ProfileId]) -> O
             .collect()
     } else {
         requested.map_or_else(BTreeMap::new, |state| {
-            target_profiles
+            operation_profiles
                 .iter()
                 .cloned()
                 .map(|profile_id| (profile_id, state))
@@ -7812,6 +7887,7 @@ mod target_profiles_tests {
     fn disconnect_all_lifecycle_targets_only_exact_managed_presence() {
         let connected = ProfileId::new("connected");
         let disconnected = ProfileId::new("disconnected");
+        let command = UserCommand::Disconnect { profile_id: None };
         let supervisor = Supervisor::new(
             AuthorityEpoch(1),
             Arc::new(NoopTunnel),
@@ -7837,9 +7913,9 @@ mod target_profiles_tests {
                 OperationId::from_parts(AuthorityEpoch(1), 7),
             )
             .unwrap();
-        let catalog = BTreeSet::from([connected.clone(), disconnected]);
+        let catalog = BTreeSet::from([connected.clone(), disconnected.clone()]);
         let targets = target_profiles_for_command(
-            &UserCommand::Disconnect { profile_id: None },
+            &command,
             &catalog,
             &BTreeMap::new(),
             ExecutionSelection::CanonicalAuthority,
@@ -7847,7 +7923,7 @@ mod target_profiles_tests {
         )
         .unwrap();
         let lifecycle = lifecycle_profiles_for_command(
-            &UserCommand::Disconnect { profile_id: None },
+            &command,
             &targets,
             ExecutionSelection::CanonicalAuthority,
             Some(&supervisor),
@@ -7855,7 +7931,60 @@ mod target_profiles_tests {
         .unwrap();
 
         assert_eq!(targets.len(), 2, "desired-state target remains the catalog");
-        assert_eq!(lifecycle, vec![connected]);
+        assert_eq!(lifecycle, vec![connected.clone()]);
+
+        let intent = intent_for_command(&command, &lifecycle);
+        assert_eq!(operation_intent_profiles(&intent), vec![connected.clone()]);
+
+        let operation_id = OperationId::from_parts(AuthorityEpoch(1), 8);
+        let mut snapshot = ControlSnapshot::default();
+        snapshot.desired.generation = 8;
+        snapshot.desired.tunnels = targets
+            .iter()
+            .cloned()
+            .map(|profile_id| (profile_id, RequestedTunnelState::Disconnected))
+            .collect();
+        snapshot.observed.tunnels.insert(
+            connected.clone(),
+            ObservedTunnel {
+                active: true,
+                interface_name: Some("tun0".into()),
+                observed_at_millis: 1,
+                received_at_millis: 1,
+            },
+        );
+        snapshot.operations.insert(
+            operation_id.clone(),
+            OperationRecord {
+                id: operation_id,
+                idempotency_key: IdempotencyKey::new("disconnect-all"),
+                client_id: ClientId::from_parts(AuthorityEpoch(1), 1),
+                command_digest: PolicyDigest::default(),
+                authority_epoch: AuthorityEpoch(1),
+                desired_generation: 8,
+                admitted_at_millis: 1,
+                deadline_millis: u64::MAX,
+                intent,
+                status: OperationStatus::WaitingForObservation,
+                result: None,
+                failure_detail: None,
+            },
+        );
+        let config = ControlServiceConfig {
+            known_profiles: catalog,
+            ..ControlServiceConfig::default()
+        };
+
+        derive_tunnel_projections(&mut snapshot, None, &config);
+
+        assert!(matches!(
+            snapshot.tunnels[&connected].state,
+            Connection::Disconnecting { .. }
+        ));
+        assert!(
+            !snapshot.tunnels.contains_key(&disconnected),
+            "an already-absent profile must not appear to be disconnecting"
+        );
     }
 
     #[test]

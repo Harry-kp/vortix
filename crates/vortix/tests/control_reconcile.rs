@@ -5066,6 +5066,103 @@ async fn cleaned_wireguard_connect_timeout_is_a_terminal_handshake_failure() {
 }
 
 #[tokio::test]
+async fn cleaned_openvpn_connect_timeout_terminalizes_and_rolls_back_connect_intent() {
+    struct CleanedTimeout;
+    impl TunnelExecutor for CleanedTimeout {
+        fn execute(
+            &self,
+            _: &TunnelWork,
+            _: &CancellationToken,
+        ) -> Result<TunnelExecutionReceipt, String> {
+            Err("OpenVPN connection timed out after exact startup cleanup".into())
+        }
+
+        fn classify_failure(&self, _: &str) -> WorkFailure {
+            WorkFailure::TimedOut
+        }
+    }
+
+    let target = profile("openvpn-timeout-terminal");
+    let service = ControlService::start_supervised(
+        ControlServiceConfig {
+            authority_epoch: AuthorityEpoch(1),
+            known_profiles: BTreeSet::from([target.clone()]),
+            profile_topologies: BTreeMap::from([(
+                target.clone(),
+                ProfileTopology {
+                    protocol: Some(ProtocolKind::OpenVpn),
+                    ..ProfileTopology::default()
+                },
+            )]),
+            freshness_poll_interval: Duration::from_millis(5),
+            ..ControlServiceConfig::default()
+        },
+        Arc::new(TestClock::default()),
+        ExecutionSelection::CanonicalAuthority,
+        Arc::new(Supervisor::new(
+            AuthorityEpoch(1),
+            Arc::new(CleanedTimeout),
+            Arc::new(OkPolicy),
+            2,
+            4,
+        )),
+    );
+    let admitted = service
+        .client()
+        .submit(CommandRequest {
+            command: UserCommand::Connect {
+                profile_id: target.clone(),
+                conflict_acknowledgement: None,
+            },
+            idempotency_key: IdempotencyKey::new("openvpn-timeout-terminal"),
+            deadline: Deadline(1_000),
+        })
+        .await
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        let snapshot = service.client().snapshot();
+        let operation = &snapshot.operations[&admitted.operation_id];
+        if operation.status.is_terminal() {
+            assert_eq!(
+                operation.result,
+                Some(vortix::vortix_core::control::OperationResult::Failed(
+                    vortix::vortix_core::control::OperationFailure::Timeout
+                ))
+            );
+            assert_eq!(
+                snapshot.desired.tunnels.get(&target),
+                Some(&RequestedTunnelState::Disconnected)
+            );
+            assert!(!snapshot.operations.values().any(|operation| {
+                operation.id != admitted.operation_id && !operation.status.is_terminal()
+            }));
+            assert!(!snapshot
+                .tunnels
+                .get(&target)
+                .is_some_and(|tunnel| matches!(tunnel.state, Connection::Connecting { .. })));
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::task::yield_now().await;
+    }
+
+    service
+        .client()
+        .submit(CommandRequest {
+            command: UserCommand::Connect {
+                profile_id: target,
+                conflict_acknowledgement: None,
+            },
+            idempotency_key: IdempotencyKey::new("openvpn-timeout-immediate-retry"),
+            deadline: Deadline(2_000),
+        })
+        .await
+        .expect("exact timeout cleanup must release admission and route ownership");
+}
+
+#[tokio::test]
 async fn definitive_openvpn_auth_failure_terminalizes_and_rolls_back_connect_intent() {
     struct AuthenticationRejected;
     impl TunnelExecutor for AuthenticationRejected {
