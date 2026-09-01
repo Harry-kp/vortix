@@ -558,10 +558,13 @@ impl App {
         }
         self.registry
             .set_killswitch_mode(snapshot.desired.kill_switch);
-        let kill_switch_state = snapshot
-            .effective
-            .kill_switch
-            .unwrap_or(KillSwitchState::Disabled);
+        let kill_switch_state = snapshot.effective.kill_switch.unwrap_or_else(|| {
+            if snapshot.desired.kill_switch == crate::state::KillSwitchMode::Off {
+                KillSwitchState::Disabled
+            } else {
+                KillSwitchState::Degraded
+            }
+        });
         self.runtime.killswitch_state = kill_switch_state;
         self.registry.set_killswitch_state(kill_switch_state);
 

@@ -215,7 +215,7 @@ const GUARD_GLOSSARY: &[(&str, &str)] = &[
     ),
     (
         "Defense → Killswitch",
-        "Current killswitch mode and runtime state. Modes: Off (no firewall), Block-on-drop (firewall armed but quiet while VPN is up; engages default-DROP egress the moment VPN drops — also reads 'VPN dropped' with 'press r to reconnect' sub-line during the drop window), VPN-only (firewall always engaged with per-tunnel ACCEPT rules — closes the gap-between-drop-and-reconnect leak window). Cycle modes with Shift+K.",
+        "Current killswitch mode and runtime state. Modes: {off} (no firewall), {block_on_drop} (firewall armed but quiet while VPN is up; engages default-DROP egress the moment VPN drops — also reads 'VPN dropped' with 'press r to reconnect' sub-line during the drop window), {vpn_only} (firewall always engaged with per-tunnel ACCEPT rules — closes the gap-between-drop-and-reconnect leak window). Cycle modes with Shift+K.",
     ),
     (
         "Defense → Encryption",
@@ -322,7 +322,7 @@ pub fn render(frame: &mut Frame, scroll: u16, tab: HelpTab) {
         HelpTab::Keys => build_keys_lines(),
         HelpTab::Roles => build_glossary_lines(ROLE_GLOSSARY, Some(ROLE_GLOSSARY_FOOTER)),
         HelpTab::Sigils => build_sigils_lines(),
-        HelpTab::Guard => build_glossary_lines(GUARD_GLOSSARY, Some(GUARD_GLOSSARY_FOOTER)),
+        HelpTab::Guard => build_guard_glossary_lines(),
     };
     let paragraph = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
@@ -400,6 +400,14 @@ fn build_glossary_lines(
     entries: &'static [(&'static str, &'static str)],
     footer: Option<&'static str>,
 ) -> Vec<Line<'static>> {
+    build_glossary_lines_with(entries, footer, |_, description| description.to_string())
+}
+
+fn build_glossary_lines_with(
+    entries: &'static [(&'static str, &'static str)],
+    footer: Option<&'static str>,
+    description_for: impl Fn(&str, &str) -> String,
+) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::with_capacity(entries.len() * 6 + 2);
     lines.push(Line::from(""));
     for (label, desc) in entries {
@@ -418,7 +426,7 @@ fn build_glossary_lines(
             ),
         ]));
         lines.push(Line::from(Span::styled(
-            format!("     {desc}"),
+            format!("     {}", description_for(label, desc)),
             Style::default().fg(theme::current().text_secondary),
         )));
         lines.push(Line::from(""));
@@ -432,6 +440,28 @@ fn build_glossary_lines(
         )));
     }
     lines
+}
+
+fn build_guard_glossary_lines() -> Vec<Line<'static>> {
+    build_glossary_lines_with(
+        GUARD_GLOSSARY,
+        Some(GUARD_GLOSSARY_FOOTER),
+        |label, template| {
+            if label != "Defense → Killswitch" {
+                return template.to_string();
+            }
+            template
+                .replace("{off}", crate::state::KillSwitchMode::Off.display_name())
+                .replace(
+                    "{block_on_drop}",
+                    crate::state::KillSwitchMode::Auto.display_name(),
+                )
+                .replace(
+                    "{vpn_only}",
+                    crate::state::KillSwitchMode::AlwaysOn.display_name(),
+                )
+        },
+    )
 }
 
 /// 3-column grid for the Sigils tab. Each row:
@@ -607,5 +637,22 @@ mod tests {
                 "Guard tab must document `{expected}`; found: {labels:?}"
             );
         }
+    }
+
+    #[test]
+    fn guard_glossary_uses_the_canonical_long_form_killswitch_label() {
+        let rendered = build_guard_glossary_lines()
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for mode in [
+            crate::state::KillSwitchMode::Off,
+            crate::state::KillSwitchMode::Auto,
+            crate::state::KillSwitchMode::AlwaysOn,
+        ] {
+            assert!(rendered.contains(mode.display_name()));
+        }
+        assert!(!rendered.contains("{block_on_drop}"));
     }
 }

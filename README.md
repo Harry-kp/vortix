@@ -107,7 +107,7 @@ See the [usage guide](https://github.com/Harry-kp/vortix/blob/main/docs/usage.md
 | Multi-tunnel | Concurrent tunnels, default-route ownership, split routes, conflict checks, and per-profile state |
 | Telemetry | Throughput, latency, jitter, packet loss, public IP, ISP, and location |
 | Security Guard | IPv4/IPv6 exposure, active DNS policy, encryption posture, and kill-switch state |
-| Kill switch | `off`, `block-on-drop`, and `vpn-only`, using PF on macOS or nftables/iptables on Linux |
+| Kill switch | `off`, `block-on-drop`, and `vpn-only`, using PF on macOS or atomic nftables on Linux |
 | Automation | Human output, a versioned JSON envelope, NDJSON watch streams, and shell completions |
 | Diagnostics | Event logs, session journals, per-process socket audit, and `vortix report` |
 | Appearance | Seven built-in themes, including terminal-native light/dark colors |
@@ -117,7 +117,7 @@ See the [usage guide](https://github.com/Harry-kp/vortix/blob/main/docs/usage.md
 | | macOS | Linux |
 |---|---|---|
 | VPN tools | Homebrew `wireguard-tools`, `openvpn` | Distribution `wireguard-tools`, `openvpn` |
-| Kill switch | PF (`pfctl`) | nftables or iptables |
+| Kill switch | PF (`pfctl`) | nftables (`nft`) |
 | DNS integration | System Configuration | systemd-resolved, NetworkManager, resolvconf, or `/etc/resolv.conf` fallback |
 | CI coverage | macOS | Ubuntu and Fedora |
 

@@ -358,6 +358,7 @@ pub enum Commands {
     ///
     /// EXAMPLES:
     ///     sudo vortix release-killswitch
+    #[command(name = "release-killswitch", alias = "release-kill-switch")]
     ReleaseKillSwitch,
 
     /// Show config directory, profile count, and runtime info

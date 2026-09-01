@@ -658,6 +658,34 @@ fn desired_disconnect_required(
     })
 }
 
+fn honor_emergency_release_fence(
+    active: bool,
+    state_store: &dyn ControlStateStore,
+    boot_id: &str,
+    recovered: &mut Option<crate::vortix_core::control::RecoveredControlState>,
+) -> Result<(), LocalControlError> {
+    if !active {
+        return Ok(());
+    }
+    let Some(recovered) = recovered else {
+        return Ok(());
+    };
+
+    recovered.state.desired.kill_switch = crate::state::KillSwitchMode::Off;
+    recovered.state.desired.generation = recovered.state.desired.generation.saturating_add(1);
+    recovered.state.desired.refresh_policy_digest();
+    recovered.state.reconciliation_required = true;
+
+    // Replace both current and recovery copies before any tunnel or policy
+    // restoration can observe the older blocking mode.
+    state_store
+        .save(boot_id, &recovered.state)
+        .map_err(|error| LocalControlError::Persistence(error.to_string()))?;
+    state_store
+        .save(boot_id, &recovered.state)
+        .map_err(|error| LocalControlError::Persistence(error.to_string()))
+}
+
 enum RemoteTuiWork {
     Command {
         command: UserCommand,
@@ -1939,9 +1967,24 @@ impl LocalControlSession {
             owner.0,
             owner.1,
         ));
-        let recovered = state_store
+        let persisted_kill_switch = crate::core::killswitch::load_state_checked().map_err(
+            |error| {
+                LocalControlError::Persistence(format!(
+                    "kill-switch state is unavailable ({error}); run `sudo vortix release-killswitch` to restore networking safely"
+                ))
+            },
+        )?;
+        let mut recovered = state_store
             .load(&boot_id)
             .map_err(|error| LocalControlError::Persistence(error.to_string()))?;
+        honor_emergency_release_fence(
+            persisted_kill_switch
+                .as_ref()
+                .is_some_and(|state| state.emergency_release_fence),
+            state_store.as_ref(),
+            &boot_id,
+            &mut recovered,
+        )?;
         let ownership = Arc::new(
             StandardTunnelOwnershipStore::production(owner.0)
                 .map_err(|error| LocalControlError::Ownership(error.to_string()))?,
@@ -2117,8 +2160,8 @@ impl LocalControlSession {
             .into_iter()
             .collect();
 
-        let initial_kill_switch_mode = crate::core::killswitch::load_state()
-            .map_or(crate::state::KillSwitchMode::Off, |state| state.mode);
+        let initial_kill_switch_mode =
+            persisted_kill_switch.map_or(crate::state::KillSwitchMode::Off, |state| state.mode);
         let service = ControlService::start_supervised(
             ControlServiceConfig {
                 known_profiles: profiles.iter().map(|profile| profile.id.clone()).collect(),
@@ -3158,6 +3201,46 @@ pub(crate) fn config_owner(_config_dir: &Path) -> Result<(u32, u32), LocalContro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn emergency_release_fence_replaces_both_recovery_copies_before_startup() {
+        let temp = tempfile::tempdir().unwrap();
+        let control_dir = temp.path().join("control");
+        let store = FsControlStateStore::new(&control_dir);
+        let boot_id = crate::utils::boot_identity()
+            .unwrap_or_else(|| "emergency-release-fence-test".to_string());
+        let mut durable = crate::vortix_core::control::DurableControlState {
+            desired: crate::vortix_core::control::DesiredState::default(),
+            operations: BTreeMap::new(),
+            boot_connections: BTreeMap::new(),
+            requested_resources: BTreeMap::new(),
+            last_connected_at: BTreeMap::new(),
+            tombstones: BTreeMap::new(),
+            retention: crate::vortix_core::control::RetentionMetadata::default(),
+            reconciliation_required: false,
+        };
+        durable.desired.kill_switch = crate::state::KillSwitchMode::AlwaysOn;
+        durable.desired.refresh_policy_digest();
+        let mut recovered = Some(crate::vortix_core::control::RecoveredControlState {
+            state: durable,
+            same_boot: true,
+        });
+
+        honor_emergency_release_fence(true, &store, &boot_id, &mut recovered).unwrap();
+
+        let current = store.load(&boot_id).unwrap().unwrap();
+        assert_eq!(
+            current.state.desired.kill_switch,
+            crate::state::KillSwitchMode::Off
+        );
+        assert!(current.state.reconciliation_required);
+        std::fs::write(control_dir.join("control-state.json"), b"corrupt").unwrap();
+        let recovery = store.load(&boot_id).unwrap().unwrap();
+        assert_eq!(
+            recovery.state.desired.kill_switch,
+            crate::state::KillSwitchMode::Off
+        );
+    }
 
     #[derive(Debug)]
     struct FrozenClock(u64);

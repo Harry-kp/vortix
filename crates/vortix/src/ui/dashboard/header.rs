@@ -749,7 +749,10 @@ fn get_killswitch_indicator(app: &App) -> Span<'static> {
         return Span::styled(label, Style::default().fg(theme::current().warning));
     }
 
-    match (app.runtime.killswitch_mode, app.runtime.killswitch_state) {
+    match (
+        app.registry.killswitch_mode(),
+        app.registry.killswitch_state(),
+    ) {
         (_, KillSwitchState::Degraded) => Span::styled(
             " KS:DEGRADED ",
             Style::default()
@@ -959,10 +962,14 @@ mod tests {
     }
 
     #[test]
-    fn degraded_firewall_truth_overrides_mode_success_label() {
+    fn kill_switch_indicator_reads_registry_when_runtime_mirror_diverges() {
         let mut app = App::new_test();
-        app.runtime.killswitch_mode = crate::state::KillSwitchMode::AlwaysOn;
-        app.runtime.killswitch_state = crate::state::KillSwitchState::Degraded;
+        app.runtime.killswitch_mode = crate::state::KillSwitchMode::Off;
+        app.runtime.killswitch_state = crate::state::KillSwitchState::Disabled;
+        app.registry
+            .set_killswitch_mode(crate::state::KillSwitchMode::AlwaysOn);
+        app.registry
+            .set_killswitch_state(crate::state::KillSwitchState::Degraded);
         assert_eq!(
             get_killswitch_indicator(&app).content.as_ref(),
             " KS:DEGRADED "

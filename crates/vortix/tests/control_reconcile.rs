@@ -17,10 +17,12 @@ use vortix::vortix_core::control::worker::{
     TunnelMutation, TunnelRevision, TunnelWork, WorkFailure,
 };
 use vortix::vortix_core::control::{
-    Clock, CommandRequest, CompletionOutcome, CompletionResult, ControlEvent, ControlService,
-    ControlServiceConfig, Deadline, ExecutionSelection, GateEvidence, HookEvent, IdempotencyKey,
-    Observation, OperationCompletion, OperationIntent, OperationStatus, PersistedTombstone,
-    ProfileTopology, ProtectionEvidence, ProtectionStatus, RequestedTunnelState, UserCommand,
+    Clock, CommandRequest, CompletionOutcome, CompletionResult, ControlEvent,
+    ControlPersistenceConfig, ControlService, ControlServiceConfig, ControlStateStore,
+    ControlStateStoreError, Deadline, DurableControlState, ExecutionSelection, GateEvidence,
+    HookEvent, IdempotencyKey, Observation, OperationCompletion, OperationIntent, OperationStatus,
+    PersistedTombstone, ProfileTopology, ProtectionEvidence, ProtectionStatus,
+    RecoveredControlState, RequestedTunnelState, UserCommand,
 };
 use vortix::vortix_core::engine::state::Connection;
 use vortix::vortix_core::ports::dns::DnsRequest;
@@ -2067,6 +2069,92 @@ async fn unexpected_managed_absence_preblocks_then_runs_bounded_recovery() {
         "configured recovery backoff did not admit reconnect",
     )
     .await;
+}
+
+#[derive(Debug, Default)]
+struct ToggleFailStore(AtomicBool);
+
+impl ControlStateStore for ToggleFailStore {
+    fn load(&self, _: &str) -> Result<Option<RecoveredControlState>, ControlStateStoreError> {
+        Ok(None)
+    }
+
+    fn save(&self, _: &str, _: &DurableControlState) -> Result<(), ControlStateStoreError> {
+        if self.0.load(Ordering::Acquire) {
+            Err(ControlStateStoreError::Io("injected disk failure".into()))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[tokio::test]
+async fn persistence_failure_does_not_suppress_unexpected_drop_preblock() {
+    let target = profile("unexpected-drop-persistence-failure");
+    let capture = Arc::new(TopologyCapture::default());
+    let supervisor = Arc::new(Supervisor::new(
+        AuthorityEpoch(1),
+        capture.clone(),
+        capture.clone(),
+        1,
+        8,
+    ));
+    let store = Arc::new(ToggleFailStore::default());
+    let service = ControlService::start_supervised(
+        ControlServiceConfig {
+            authority_epoch: AuthorityEpoch(1),
+            known_profiles: BTreeSet::from([target.clone()]),
+            profile_topologies: BTreeMap::from([(target.clone(), ProfileTopology::default())]),
+            freshness_poll_interval: Duration::from_millis(5),
+            persistence: Some(ControlPersistenceConfig::new("boot-a", store.clone())),
+            ..ControlServiceConfig::default()
+        },
+        Arc::new(TestClock::default()),
+        ExecutionSelection::CanonicalAuthority,
+        supervisor.clone(),
+    );
+    service
+        .completer()
+        .set_readiness(AuthorityEpoch(1), true, true)
+        .await
+        .expect("persistent control service becomes ready");
+    connect_and_settle(
+        &service,
+        &supervisor,
+        &capture,
+        &target,
+        "unexpected-drop-persistence-connect",
+    )
+    .await;
+    set_killswitch_and_settle(
+        &service,
+        &capture,
+        vortix::vortix_core::state::killswitch::KillSwitchMode::Auto,
+        "unexpected-drop-persistence-auto",
+    )
+    .await;
+    let generation = service.client().snapshot().desired.generation;
+    capture.hold_pre_block(generation);
+    store.0.store(true, Ordering::Release);
+
+    service
+        .observer()
+        .observe(Observation::Tunnel {
+            profile_id: target,
+            active: false,
+            interface_name: None,
+            observed_at_millis: 0,
+            protection: None,
+        })
+        .await
+        .unwrap();
+
+    wait_for_condition(
+        || capture.pre_block_entered(generation),
+        "durable block-on-drop intent did not install its safety fence after persistence failed",
+    )
+    .await;
+    capture.release_pre_block(generation);
 }
 
 #[tokio::test]

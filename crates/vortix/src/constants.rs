@@ -200,10 +200,11 @@ pub const DEFAULT_VPN_INTERFACE: &str = "wg0";
 
 /// Emergency instructions for the user if the kill switch cannot be disabled normally.
 #[cfg(target_os = "macos")]
-pub const KILLSWITCH_EMERGENCY_MSG: &str = "You may need to run: sudo pfctl -F all";
+pub const KILLSWITCH_EMERGENCY_MSG: &str =
+    "You may need to run: sudo pfctl -a com.apple/vortix.killswitch -F rules";
 #[cfg(target_os = "linux")]
 pub const KILLSWITCH_EMERGENCY_MSG: &str =
-    "You may need to run: sudo iptables -F VORTIX_KILLSWITCH && sudo iptables -X VORTIX_KILLSWITCH (or: sudo nft delete table inet vortix_killswitch)";
+    "Remove only Vortix-owned state: sudo nft delete table inet vortix_killswitch; while sudo iptables -C OUTPUT -j VORTIX_KILLSWITCH 2>/dev/null; do sudo iptables -D OUTPUT -j VORTIX_KILLSWITCH; done; sudo iptables -F VORTIX_KILLSWITCH; sudo iptables -X VORTIX_KILLSWITCH; while sudo ip6tables -C OUTPUT -j VORTIX_KILLSWITCH 2>/dev/null; do sudo ip6tables -D OUTPUT -j VORTIX_KILLSWITCH; done; sudo ip6tables -F VORTIX_KILLSWITCH; sudo ip6tables -X VORTIX_KILLSWITCH";
 
 // === OpenVPN Runtime Configuration ===
 

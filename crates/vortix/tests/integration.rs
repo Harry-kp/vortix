@@ -167,14 +167,23 @@ mod canonical_control_projection {
     }
 
     #[test]
-    fn initial_unknown_policy_does_not_raise_a_false_degraded_alarm() {
+    fn unknown_effective_policy_is_degraded_unless_the_desired_mode_is_off() {
         let mut app = test_app();
         let mut snapshot = app.control_snapshot.clone();
         snapshot.generation = 1;
         snapshot.desired.kill_switch = KillSwitchMode::AlwaysOn;
         snapshot.effective.kill_switch = None;
         app.handle_message(Message::ControlSnapshot(Box::new(snapshot)));
-        assert_eq!(app.runtime.killswitch_state, KillSwitchState::Disabled);
+        assert_eq!(app.registry.killswitch_mode(), KillSwitchMode::AlwaysOn);
+        assert_eq!(app.registry.killswitch_state(), KillSwitchState::Degraded);
+
+        let mut off = app.control_snapshot.clone();
+        off.generation = off.generation.saturating_add(1);
+        off.desired.kill_switch = KillSwitchMode::Off;
+        off.effective.kill_switch = None;
+        app.handle_message(Message::ControlSnapshot(Box::new(off)));
+        assert_eq!(app.registry.killswitch_mode(), KillSwitchMode::Off);
+        assert_eq!(app.registry.killswitch_state(), KillSwitchState::Disabled);
     }
 
     #[test]

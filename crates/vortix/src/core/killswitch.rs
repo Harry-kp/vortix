@@ -8,7 +8,7 @@ use crate::logger::{self, LogLevel};
 use crate::state::{KillSwitchMode, KillSwitchState};
 use crate::utils;
 use sha2::{Digest, Sha256};
-use std::fmt::Write as _;
+use std::fmt::{self, Write as _};
 use std::fs;
 use std::io;
 use std::path::PathBuf;
@@ -80,11 +80,22 @@ fn local_executor_epoch() -> &'static str {
 /// Stable digest of the complete requested firewall policy.
 ///
 /// The digest is independent of caller iteration order: tunnels, endpoints,
-/// and declared CIDRs are sorted before hashing. Platform adapters stamp this
-/// value into their owned rules and require the same value during read-back,
-/// so a successful command alone can never promote protection truth.
+/// and declared CIDRs are sorted before hashing. Platform adapters stamp a
+/// platform-safe encoding of this digest identity into their owned rules and
+/// require the same value during read-back, so a successful command alone can
+/// never promote protection truth.
 #[must_use]
 pub fn policy_digest(active: &[ActiveTunnelInfo]) -> String {
+    let digest = policy_digest_bytes(active);
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
+}
+
+/// Raw policy digest for platform formats with constrained encodings.
+pub(crate) fn policy_digest_bytes(active: &[ActiveTunnelInfo]) -> [u8; 32] {
     let mut tunnels: Vec<String> = active
         .iter()
         .map(|tunnel| {
@@ -108,12 +119,7 @@ pub fn policy_digest(active: &[ActiveTunnelInfo]) -> String {
         .collect();
     tunnels.sort_unstable();
 
-    let digest = Sha256::digest(tunnels.join("\n").as_bytes());
-    let mut encoded = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        write!(encoded, "{byte:02x}").expect("writing to a String cannot fail");
-    }
-    encoded
+    Sha256::digest(tunnels.join("\n").as_bytes()).into()
 }
 
 /// Validate values that platform adapters interpolate into firewall syntax.
@@ -249,12 +255,12 @@ pub struct PersistedTunnelInfo {
 ///
 /// The V1 legacy fields remain on the struct for two reasons:
 /// 1. Direct deserialization of V1 files without a separate type.
-/// 2. Forward compatibility — V2 writes currently leave them as `None`,
-///    but if a future schema needs them again the field is still there.
+/// 2. Downgrade compatibility — V2 writes currently leave them as `None`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PersistedState {
     /// On-disk schema version. Missing or `1` means V1; `2` means V2.
-    /// Unknown future values are treated as V1 fallback with a warning.
+    /// Unknown future values are rejected rather than destructively
+    /// reinterpreted as an older shape.
     #[serde(default = "default_schema_version")]
     pub schema_version: u8,
     pub mode: KillSwitchMode,
@@ -278,6 +284,60 @@ pub struct PersistedState {
     /// stale evidence makes the next process start explicitly Degraded.
     #[serde(default)]
     pub firewall_verification: Option<FirewallVerification>,
+    /// Durable fence written by `release-killswitch`. Canonical startup must
+    /// honor this even when the control journal was temporarily unreadable
+    /// during the emergency release.
+    #[serde(default)]
+    pub emergency_release_fence: bool,
+}
+
+/// Why persisted kill-switch truth could not be loaded safely.
+#[derive(Debug)]
+pub enum PersistedStateLoadError {
+    ConfigDirectory(io::Error),
+    Read {
+        path: PathBuf,
+        source: io::Error,
+    },
+    Parse {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
+    UnsupportedSchema(u8),
+}
+
+impl fmt::Display for PersistedStateLoadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ConfigDirectory(error) => {
+                write!(
+                    formatter,
+                    "cannot resolve the kill-switch state directory: {error}"
+                )
+            }
+            Self::Read { path, source } => {
+                write!(formatter, "cannot read {}: {source}", path.display())
+            }
+            Self::Parse { path, source } => {
+                write!(formatter, "cannot parse {}: {source}", path.display())
+            }
+            Self::UnsupportedSchema(schema) => write!(
+                formatter,
+                "kill-switch state uses unsupported schema version {schema}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PersistedStateLoadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ConfigDirectory(error) => Some(error),
+            Self::Read { source, .. } => Some(source),
+            Self::Parse { source, .. } => Some(source),
+            Self::UnsupportedSchema(_) => None,
+        }
+    }
 }
 
 /// Coerce a V1 (or unknown-version-fallback) `PersistedState` into V2
@@ -295,6 +355,17 @@ fn coerce_v1_to_v2(state: &mut PersistedState) {
         }
     }
     state.schema_version = PERSISTED_STATE_SCHEMA_V2;
+}
+
+fn migrate_supported_schema(state: &mut PersistedState) -> std::result::Result<(), u8> {
+    match state.schema_version {
+        0 | 1 => {
+            coerce_v1_to_v2(state);
+            Ok(())
+        }
+        PERSISTED_STATE_SCHEMA_V2 => Ok(()),
+        unsupported => Err(unsupported),
+    }
 }
 
 /// Drop entries from `active_tunnels` whose interface no longer exists
@@ -331,21 +402,37 @@ fn filter_phantom_tunnels(state: &mut PersistedState, live: &[String]) {
 /// memory to V2 (the next `save_state` call rewrites them on disk).
 /// Phantom interfaces — entries naming a kernel interface that no
 /// longer exists — are dropped with a warning.
-#[must_use]
-pub fn load_state() -> Option<PersistedState> {
-    let path = get_state_path()?;
-    let content = fs::read_to_string(&path).ok()?;
-    let mut persisted: PersistedState = match serde_json::from_str(&content) {
-        Ok(p) => p,
-        Err(e) => {
-            logger::log(
-                LogLevel::Warning,
-                "FIREWALL",
-                format!("Failed to parse persisted state: {e}"),
-            );
-            return None;
-        }
+///
+/// # Errors
+///
+/// Returns an error when the state path cannot be resolved/read, the JSON is
+/// invalid, or a newer schema cannot be interpreted safely.
+pub fn load_state_checked() -> std::result::Result<Option<PersistedState>, PersistedStateLoadError>
+{
+    let path = utils::get_app_config_dir()
+        .map_err(PersistedStateLoadError::ConfigDirectory)?
+        .join(constants::KILLSWITCH_STATE_FILE);
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(PersistedStateLoadError::Read { path, source }),
     };
+    let mut persisted = decode_persisted_state(&content, &path)?;
+    let live = crate::platform::current_platform().available_network_interfaces();
+    filter_phantom_tunnels(&mut persisted, &live);
+
+    Ok(Some(persisted))
+}
+
+fn decode_persisted_state(
+    content: &str,
+    path: &std::path::Path,
+) -> std::result::Result<PersistedState, PersistedStateLoadError> {
+    let mut persisted: PersistedState =
+        serde_json::from_str(content).map_err(|source| PersistedStateLoadError::Parse {
+            path: path.to_path_buf(),
+            source,
+        })?;
     if let Some(effective) = persisted.effective_state {
         persisted.state = effective;
     }
@@ -360,35 +447,46 @@ pub fn load_state() -> Option<PersistedState> {
         ),
     );
 
-    match persisted.schema_version {
-        0 | 1 => {
-            if !persisted.active_tunnels.is_empty()
-                || persisted.vpn_interface.is_some()
-                || persisted.vpn_server_ip.is_some()
-            {
-                logger::log(
-                    LogLevel::Info,
-                    "FIREWALL",
-                    "Migrating persisted killswitch state V1 → V2".to_string(),
-                );
-            }
-            coerce_v1_to_v2(&mut persisted);
-        }
-        PERSISTED_STATE_SCHEMA_V2 => {}
-        other => {
-            tracing::warn!(
-                target: "FIREWALL",
-                schema = other,
-                "Unknown PersistedState schema version; falling back to V1 coercion"
-            );
-            coerce_v1_to_v2(&mut persisted);
-        }
+    let legacy_schema = matches!(persisted.schema_version, 0 | 1);
+    if legacy_schema
+        && (!persisted.active_tunnels.is_empty()
+            || persisted.vpn_interface.is_some()
+            || persisted.vpn_server_ip.is_some())
+    {
+        logger::log(
+            LogLevel::Info,
+            "FIREWALL",
+            "Migrating persisted killswitch state V1 → V2".to_string(),
+        );
+    }
+    if let Err(other) = migrate_supported_schema(&mut persisted) {
+        tracing::warn!(
+            target: "FIREWALL",
+            schema = other,
+            "Unknown PersistedState schema version; refusing to reinterpret future state"
+        );
+        return Err(PersistedStateLoadError::UnsupportedSchema(other));
     }
 
-    let live = crate::platform::current_platform().available_network_interfaces();
-    filter_phantom_tunnels(&mut persisted, &live);
+    Ok(persisted)
+}
 
-    Some(persisted)
+/// Compatibility loader for callers that cannot surface persistence errors.
+/// New authority and UI code must use [`load_state_checked`] so unreadable or
+/// future state is never confused with an intentional `off` state.
+#[must_use]
+pub fn load_state() -> Option<PersistedState> {
+    match load_state_checked() {
+        Ok(state) => state,
+        Err(error) => {
+            logger::log(
+                LogLevel::Warning,
+                "FIREWALL",
+                format!("Persisted kill-switch state is unavailable: {error}"),
+            );
+            None
+        }
+    }
 }
 
 /// Save kill switch state to persistence file.
@@ -419,10 +517,54 @@ pub fn save_state_with_verification(
     active_tunnels: Vec<PersistedTunnelInfo>,
     firewall_verification: Option<FirewallVerification>,
 ) -> Result<()> {
+    save_state_with_options(mode, state, active_tunnels, firewall_verification, false)
+}
+
+/// Persist an emergency `off` intent that fences any temporarily unreadable
+/// control journal from re-engaging an older blocking mode later.
+///
+/// # Errors
+///
+/// Returns [`KillswitchError::Io`] when the state cannot be durably replaced.
+pub(crate) fn save_emergency_release_state(config_dir: &std::path::Path) -> Result<()> {
+    save_state_with_options_at(
+        &config_dir.join(constants::KILLSWITCH_STATE_FILE),
+        KillSwitchMode::Off,
+        KillSwitchState::Disabled,
+        Vec::new(),
+        None,
+        true,
+    )
+}
+
+fn save_state_with_options(
+    mode: KillSwitchMode,
+    state: KillSwitchState,
+    active_tunnels: Vec<PersistedTunnelInfo>,
+    firewall_verification: Option<FirewallVerification>,
+    emergency_release_fence: bool,
+) -> Result<()> {
     let Some(path) = get_state_path() else {
         return Ok(()); // Silently skip if no home dir
     };
+    save_state_with_options_at(
+        &path,
+        mode,
+        state,
+        active_tunnels,
+        firewall_verification,
+        emergency_release_fence,
+    )
+}
 
+fn save_state_with_options_at(
+    path: &std::path::Path,
+    mode: KillSwitchMode,
+    state: KillSwitchState,
+    active_tunnels: Vec<PersistedTunnelInfo>,
+    firewall_verification: Option<FirewallVerification>,
+    emergency_release_fence: bool,
+) -> Result<()> {
     // Ensure parent directory exists
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -432,7 +574,7 @@ pub fn save_state_with_verification(
         if state != KillSwitchState::Blocking {
             return None;
         }
-        let content = fs::read_to_string(&path).ok()?;
+        let content = fs::read_to_string(path).ok()?;
         let existing: PersistedState = serde_json::from_str(&content).ok()?;
         let verification = existing.firewall_verification?;
         let expected = policy_digest_from_persisted(&active_tunnels)?;
@@ -465,11 +607,12 @@ pub fn save_state_with_verification(
         vpn_server_ip: None,
         active_tunnels,
         firewall_verification,
+        emergency_release_fence,
     };
 
     let content = serde_json::to_string_pretty(&persisted).map_err(io::Error::other)?;
 
-    atomic_write(&path, content.as_bytes())?;
+    atomic_write(path, content.as_bytes())?;
     Ok(())
 }
 
@@ -523,18 +666,30 @@ pub fn persisted_from_active(active: &[ActiveTunnelInfo]) -> Vec<PersistedTunnel
 /// silently rejects. The temp+rename pattern preserves the prior valid
 /// file across any failure point.
 fn atomic_write(path: &std::path::Path, contents: &[u8]) -> io::Result<()> {
-    let tmp_path = path.with_extension("json.tmp");
-    crate::utils::write_user_file(&tmp_path, contents)?;
-    // fsync the temp file so its data hits disk before we rename. On
-    // platforms where `sync_all` is unsupported (rare), the write is
-    // still atomic at the rename step — sync_all just narrows the
-    // window during which a post-rename crash could lose data.
-    {
-        let file = std::fs::OpenOptions::new().read(true).open(&tmp_path)?;
-        let _ = file.sync_all();
-    }
-    fs::rename(&tmp_path, path)?;
-    Ok(())
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "kill-switch state has no parent",
+        )
+    })?;
+    let name = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "kill-switch state name is not valid UTF-8",
+            )
+        })?;
+    let (uid, gid) = crate::config::config_owner(parent).map_err(io::Error::other)?;
+    let directory =
+        crate::vortix_config::control_state::open_control_directory(parent, false, uid, gid)
+            .map_err(io::Error::other)?
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "config directory is missing")
+            })?;
+    crate::vortix_config::control_state::write_owned_atomic(&directory, name, contents, uid, gid)
+        .map_err(io::Error::other)
 }
 
 /// Clear the persisted state file.
@@ -661,6 +816,7 @@ mod tests {
                 is_primary: true,
             }],
             firewall_verification: None,
+            emergency_release_fence: false,
         };
 
         let json = serde_json::to_string_pretty(&state).unwrap();
@@ -775,6 +931,7 @@ mod tests {
                 },
             ],
             firewall_verification: None,
+            emergency_release_fence: false,
         };
         let live = vec!["lo".to_string(), "eth0".to_string()];
         filter_phantom_tunnels(&mut state, &live);
@@ -800,16 +957,14 @@ mod tests {
                 is_primary: true,
             }],
             firewall_verification: None,
+            emergency_release_fence: false,
         };
         filter_phantom_tunnels(&mut state, &[]);
         assert_eq!(state.active_tunnels.len(), 1);
     }
 
     #[test]
-    fn unknown_future_schema_falls_back_to_v1_coercion() {
-        // schema_version=99 should be tolerated: coerce_v1_to_v2 runs.
-        // In this case active_tunnels is already populated, so nothing
-        // changes — but schema_version flips to V2.
+    fn unknown_future_schema_is_rejected_without_rewriting_it() {
         let json = r#"{
             "schema_version": 99,
             "mode": "Auto",
@@ -822,29 +977,31 @@ mod tests {
         }"#;
         let mut state: PersistedState = serde_json::from_str(json).unwrap();
         assert_eq!(state.schema_version, 99);
-        coerce_v1_to_v2(&mut state);
-        assert_eq!(state.schema_version, PERSISTED_STATE_SCHEMA_V2);
+        assert_eq!(migrate_supported_schema(&mut state), Err(99));
+        assert_eq!(state.schema_version, 99);
         assert_eq!(state.active_tunnels.len(), 1);
+        assert!(matches!(
+            decode_persisted_state(json, std::path::Path::new("killswitch.state")),
+            Err(PersistedStateLoadError::UnsupportedSchema(99))
+        ));
     }
 
     #[test]
-    fn atomic_write_creates_target_and_no_tmp_left_behind() {
-        let tmp_dir = std::env::temp_dir();
-        let path = tmp_dir.join(format!(
-            "vortix-killswitch-atomic-write-{}.json",
-            std::process::id()
-        ));
-        let _ = fs::remove_file(&path);
-        let tmp = path.with_extension("json.tmp");
-        let _ = fs::remove_file(&tmp);
+    fn atomic_write_does_not_follow_the_legacy_predictable_temp_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(constants::KILLSWITCH_STATE_FILE);
+        let victim = directory.path().join("victim");
+        fs::write(&victim, b"must survive").unwrap();
+        let legacy_temp = path.with_extension("json.tmp");
+        symlink(&victim, &legacy_temp).unwrap();
 
         atomic_write(&path, b"hello").unwrap();
 
-        assert!(path.exists(), "target file must exist after atomic_write");
         assert_eq!(fs::read(&path).unwrap(), b"hello");
-        assert!(!tmp.exists(), "temp file must be renamed away");
-
-        let _ = fs::remove_file(&path);
+        assert_eq!(fs::read(&victim).unwrap(), b"must survive");
+        assert!(legacy_temp.is_symlink());
     }
 
     #[test]
@@ -913,6 +1070,7 @@ mod tests {
             vpn_server_ip: None,
             active_tunnels: Vec::new(),
             firewall_verification: None,
+            emergency_release_fence: false,
         };
         let json = serde_json::to_string(&state).unwrap();
         let old: V1PersistedState = serde_json::from_str(&json).unwrap();

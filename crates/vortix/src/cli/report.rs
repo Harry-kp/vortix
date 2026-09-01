@@ -141,14 +141,7 @@ fn collect_report(config_dir: &Path, config_source: &str) -> ReportInfo {
     let profiles_dir = config_dir.join(constants::PROFILES_DIR_NAME);
     let profile_counts = super::commands::count_profiles(&profiles_dir);
 
-    let ks_state = match crate::core::killswitch::load_state() {
-        Some(persisted) => format!(
-            "{} ({})",
-            persisted.mode.display_name(),
-            persisted.state.display_status()
-        ),
-        None => crate::state::KillSwitchMode::Off.display_name().to_string(),
-    };
+    let ks_state = loaded_killswitch_summary(crate::core::killswitch::load_state_checked());
 
     let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((0, 0));
     let terminal_size = if term_cols > 0 {
@@ -173,6 +166,35 @@ fn collect_report(config_dir: &Path, config_source: &str) -> ReportInfo {
         profile_counts,
         killswitch_state: ks_state,
     }
+}
+
+fn loaded_killswitch_summary(
+    loaded: Result<
+        Option<crate::core::killswitch::PersistedState>,
+        crate::core::killswitch::PersistedStateLoadError,
+    >,
+) -> String {
+    match loaded {
+        Ok(Some(persisted)) => persisted_killswitch_summary(persisted.mode, persisted.state),
+        Ok(None) => crate::state::KillSwitchMode::Off.display_name().to_string(),
+        Err(error) => format!("Unknown — state could not be verified ({error})"),
+    }
+}
+
+fn persisted_killswitch_summary(
+    mode: crate::state::KillSwitchMode,
+    state: crate::state::KillSwitchState,
+) -> String {
+    let recovered_state = if state == crate::state::KillSwitchState::Blocking {
+        crate::state::KillSwitchState::Degraded
+    } else {
+        state
+    };
+    format!(
+        "{} ({})",
+        mode.display_name(),
+        recovered_state.display_status()
+    )
 }
 
 // ── Install method detection ────────────────────────────────────────────────
@@ -709,6 +731,33 @@ fn redact_home_prefix(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persisted_blocking_state_is_reported_as_unverified_after_restart() {
+        assert_eq!(
+            persisted_killswitch_summary(
+                crate::state::KillSwitchMode::AlwaysOn,
+                crate::state::KillSwitchState::Blocking,
+            ),
+            "VPN-only (Degraded)"
+        );
+        assert_eq!(
+            persisted_killswitch_summary(
+                crate::state::KillSwitchMode::Auto,
+                crate::state::KillSwitchState::Armed,
+            ),
+            "Block on drop (Watching)"
+        );
+    }
+
+    #[test]
+    fn unsupported_persisted_state_is_never_reported_as_off() {
+        let summary = loaded_killswitch_summary(Err(
+            crate::core::killswitch::PersistedStateLoadError::UnsupportedSchema(99),
+        ));
+        assert!(summary.starts_with("Unknown"));
+        assert!(!summary.starts_with("Off"));
+    }
 
     #[test]
     fn test_parse_version_curl() {

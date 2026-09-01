@@ -74,6 +74,24 @@ fn main() -> Result<()> {
     let mut config_dir = config::resolve_config_dir(args.config_dir.as_ref())
         .map_err(|e| color_eyre::eyre::eyre!("Failed to resolve config directory: {e}"))?;
 
+    // Emergency release must remain available when settings, journals,
+    // profile migrations, or the normal control service cannot start. The
+    // authoritative config directory is the only startup input it needs.
+    if matches!(args.command, Some(cli::args::Commands::ReleaseKillSwitch)) {
+        config::set_config_dir(config_dir.clone());
+        let output_mode = if args.json {
+            cli::output::OutputMode::Json
+        } else if args.quiet {
+            cli::output::OutputMode::Quiet
+        } else {
+            cli::output::OutputMode::Human
+        };
+        std::process::exit(cli::commands::handle_release_killswitch(
+            &config_dir,
+            output_mode,
+        ));
+    }
+
     // Migration check -- only when using default resolution (not explicit --config-dir)
     if !explicit_override {
         if let Some(old_dir) = config::check_migration(&config_dir) {

@@ -127,7 +127,7 @@ vortix killswitch
 sudo vortix killswitch off
 sudo vortix killswitch block-on-drop
 sudo vortix killswitch vpn-only
-sudo vortix release-kill-switch      # emergency firewall release
+sudo vortix release-killswitch       # emergency firewall release
 ```
 
 The OS may flush firewall state on reboot. Re-arm `vpn-only` after each boot.
