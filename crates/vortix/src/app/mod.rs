@@ -89,6 +89,12 @@ pub(crate) struct PendingProfileImports {
     remaining: std::collections::VecDeque<std::path::PathBuf>,
     queued: usize,
     failed: usize,
+    active: Option<PendingProfileImport>,
+}
+
+pub(crate) enum PendingProfileImport {
+    AwaitingAdmission(String),
+    Admitted(crate::vortix_core::control::OperationId),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -176,9 +182,9 @@ pub struct App {
 
     control_request_sequence: u64,
 
-    /// Directory imports feed the bounded TUI admission queue over multiple
-    /// event-loop turns. This keeps the eight-command safety budget without
-    /// misclassifying temporary backpressure as profile validation failure.
+    /// Directory imports advance after each serial profile mutation settles.
+    /// This gives every durable write its own execution deadline without
+    /// blocking unrelated TUI commands.
     pub(crate) pending_profile_imports: Option<PendingProfileImports>,
 
     /// Short quiet-window aggregation for profile mutations. Directory
@@ -357,10 +363,10 @@ impl App {
         match control_update {
             Some(Ok((admissions, snapshot, catalog))) => {
                 self.handle_control_admission_results(admissions);
-                self.pump_pending_profile_imports();
                 if let Some(catalog) = catalog {
                     self.apply_local_catalog_update(catalog);
                 }
+                self.pump_pending_profile_imports();
                 if let Some(snapshot) = snapshot {
                     self.handle_message(Message::ControlSnapshot(Box::new(snapshot)));
                 }

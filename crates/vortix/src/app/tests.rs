@@ -2719,12 +2719,12 @@ fn canonical_directory_import_drains_more_than_tui_admission_capacity() {
             batch.queued,
             batch.failed
         )),
-        Some((2, 8, 0))
+        Some((9, 1, 0))
     );
 
-    // The first eight valid profiles fill the TUI admission bound. The ninth
-    // valid profile and trailing invalid file prove that draining results
-    // resumes the batch without an unrelated operation backlog in the fixture.
+    // Profile storage is intentionally serial and each admitted mutation owns
+    // a finite execution deadline. Keep only one batch import in flight so
+    // queued entries receive a fresh deadline when their predecessor settles.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(35);
     while app.runtime.profiles.len() < PROFILE_COUNT && std::time::Instant::now() < deadline {
         app.process_external();
@@ -3421,7 +3421,11 @@ fn remote_profile_terminal_failure_is_reported_to_the_user() {
     app.apply_local_catalog_update(crate::cli::control::LocalCatalogUpdate {
         revision: 9,
         profiles: None,
-        outcomes: vec![crate::cli::control::LocalCatalogOutcome::RemoteTerminal {
+        outcomes: vec![crate::cli::control::LocalCatalogOutcome::Terminal {
+            operation_id: crate::vortix_core::control::OperationId::parse(
+                "op-0000000000000001-0000000000000001",
+            )
+            .unwrap(),
             status: crate::vortix_core::control::OperationStatus::Failed,
             result: Some(crate::vortix_core::control::OperationResult::Failed(
                 crate::vortix_core::control::OperationFailure::Rejected,
@@ -3444,15 +3448,23 @@ fn profile_mutation_burst_ends_with_one_aggregate_result() {
             revision,
             profiles: None,
             outcomes: vec![if revision == 2 {
-                crate::cli::control::LocalCatalogOutcome::Failed(
-                    crate::vortix_core::control::ProfileMutationFailure::Storage,
-                )
+                crate::cli::control::LocalCatalogOutcome::Failed {
+                    operation_id: crate::vortix_core::control::OperationId::parse(format!(
+                        "op-0000000000000001-{revision:016x}"
+                    ))
+                    .unwrap(),
+                    failure: crate::vortix_core::control::ProfileMutationFailure::Storage,
+                }
             } else {
-                crate::cli::control::LocalCatalogOutcome::Applied(
-                    crate::cli::control::LocalProfileMutationReceipt::RemoteApplied {
+                crate::cli::control::LocalCatalogOutcome::Applied {
+                    operation_id: crate::vortix_core::control::OperationId::parse(format!(
+                        "op-0000000000000001-{revision:016x}"
+                    ))
+                    .unwrap(),
+                    receipt: crate::cli::control::LocalProfileMutationReceipt::RemoteApplied {
                         display_name: Some(format!("profile-{revision}")),
                     },
-                )
+                }
             }],
         });
     }

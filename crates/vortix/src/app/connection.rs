@@ -464,21 +464,25 @@ impl App {
     }
 
     pub(crate) fn issue_control_import(&mut self, path: &std::path::Path) -> Option<String> {
-        let result = self.try_issue_control_import(path);
+        let result = self
+            .try_issue_control_import(path)
+            .map(|(display_name, _)| display_name);
         self.report_control_enqueue(result)
     }
 
     pub(crate) fn try_issue_control_import(
         &mut self,
         path: &std::path::Path,
-    ) -> Result<String, crate::cli::control::LocalControlError> {
+    ) -> Result<(String, String), crate::cli::control::LocalControlError> {
         let wait =
             std::time::Duration::from_secs(crate::constants::DEFAULT_CONTROL_COMMAND_TIMEOUT_SECS);
         let idempotency_key = self.next_control_request_key();
-        self.control_session
+        let display_name = self
+            .control_session
             .as_ref()
             .expect("control import requires an attached session")
-            .enqueue_tui_profile_import(path, wait, idempotency_key)
+            .enqueue_tui_profile_import(path, wait, idempotency_key.clone())?;
+        Ok((display_name, idempotency_key))
     }
 
     fn next_control_request_key(&mut self) -> String {
@@ -576,8 +580,12 @@ impl App {
         results: Vec<crate::cli::control::LocalTuiAdmissionResult>,
     ) {
         for result in results {
+            let import_request_key = result.import_request_key.clone();
             match result.completion {
                 crate::cli::control::TuiControlCompletion::Admission(Ok(operation_id)) => {
+                    if let Some(request_key) = import_request_key.as_deref() {
+                        self.admit_pending_profile_import(request_key, operation_id.clone());
+                    }
                     let control_subject = control_command_subject(result.command.as_ref());
                     let profile_name = lifecycle_command_profile_id(result.command.as_ref())
                         .and_then(|profile_id| {
@@ -611,6 +619,9 @@ impl App {
                     }
                 }
                 crate::cli::control::TuiControlCompletion::Admission(Err(error)) => {
+                    if let Some(request_key) = import_request_key.as_deref() {
+                        self.reject_pending_profile_import(request_key);
+                    }
                     if let Some(crate::vortix_core::control::UserCommand::SetKillSwitch { mode }) =
                         result.command
                     {
@@ -1015,7 +1026,11 @@ impl App {
         let mut failures = Vec::new();
         for outcome in update.outcomes {
             match outcome {
-                crate::cli::control::LocalCatalogOutcome::Applied(receipt) => {
+                crate::cli::control::LocalCatalogOutcome::Applied {
+                    operation_id,
+                    receipt,
+                } => {
+                    self.settle_pending_profile_import(&operation_id, true);
                     applied_count += 1;
                     let display_name = match receipt {
                         crate::cli::control::LocalProfileMutationReceipt::Imported(profile)
@@ -1034,10 +1049,19 @@ impl App {
                         applied_names.push(display_name);
                     }
                 }
-                crate::cli::control::LocalCatalogOutcome::Failed(failure) => {
+                crate::cli::control::LocalCatalogOutcome::Failed {
+                    operation_id,
+                    failure,
+                } => {
+                    self.settle_pending_profile_import(&operation_id, false);
                     failures.push(profile_mutation_failure_message(failure).to_string());
                 }
-                crate::cli::control::LocalCatalogOutcome::RemoteTerminal { status, result } => {
+                crate::cli::control::LocalCatalogOutcome::Terminal {
+                    operation_id,
+                    status,
+                    result,
+                } => {
+                    self.settle_pending_profile_import(&operation_id, false);
                     let message = match result {
                         Some(crate::vortix_core::control::OperationResult::Failed(failure)) => {
                             remote_profile_failure_message(failure).to_string()

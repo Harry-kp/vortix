@@ -148,11 +148,18 @@ pub enum LocalProfileMutationReceipt {
 
 #[derive(Debug, Clone)]
 pub(crate) enum LocalCatalogOutcome {
-    Applied(LocalProfileMutationReceipt),
-    Failed(ProfileMutationFailure),
-    /// The remote snapshot cannot recover the daemon executor's private
-    /// storage error, so preserve its exact canonical terminal fields.
-    RemoteTerminal {
+    Applied {
+        operation_id: OperationId,
+        receipt: LocalProfileMutationReceipt,
+    },
+    Failed {
+        operation_id: OperationId,
+        failure: ProfileMutationFailure,
+    },
+    /// No executor-private receipt is available, so preserve the canonical
+    /// terminal fields for remote-private errors and pre-worker failures.
+    Terminal {
+        operation_id: OperationId,
         status: OperationStatus,
         result: Option<OperationResult>,
     },
@@ -184,13 +191,14 @@ pub(crate) struct LocalTuiAdmissionResult {
     pub command: Option<UserCommand>,
     pub completion: TuiControlCompletion,
     pub import_display_name: Option<String>,
+    pub import_request_key: Option<String>,
     _permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 struct TuiAdmissionJob {
     request: CommandRequest,
     command: UserCommand,
-    import: Option<(ProfileId, String)>,
+    import: Option<(ProfileId, String, String)>,
     permit: tokio::sync::OwnedSemaphorePermit,
 }
 
@@ -216,16 +224,21 @@ fn start_tui_admission_queue(
                 .map(|admitted| admitted.operation_id)
                 .map_err(LocalControlError::Admission);
             if result.is_err() {
-                if let Some((profile_id, _)) = &job.import {
+                if let Some((profile_id, _, _)) = &job.import {
                     profile_mutations.discard_prepared_import(profile_id);
                 }
             }
-            let import_display_name = job.import.map(|(_, display_name)| display_name);
+            let (import_display_name, import_request_key) = job
+                .import
+                .map_or((None, None), |(_, display_name, request_key)| {
+                    (Some(display_name), Some(request_key))
+                });
             if result_sender
                 .send(LocalTuiAdmissionResult {
                     command: Some(job.command),
                     completion: TuiControlCompletion::Admission(result),
                     import_display_name,
+                    import_request_key,
                     _permit: Some(job.permit),
                 })
                 .await
@@ -797,7 +810,12 @@ fn execute_remote_tui_work(
     pending_challenges: &Mutex<
         std::collections::BTreeSet<crate::vortix_core::control::ChallengeId>,
     >,
-) -> (Option<UserCommand>, Option<String>, TuiControlCompletion) {
+) -> (
+    Option<UserCommand>,
+    Option<String>,
+    Option<String>,
+    TuiControlCompletion,
+) {
     match work {
         RemoteTuiWork::Command {
             command,
@@ -815,6 +833,7 @@ fn execute_remote_tui_work(
             (
                 Some(command),
                 None,
+                None,
                 TuiControlCompletion::Admission(operation_id),
             )
         }
@@ -822,31 +841,36 @@ fn execute_remote_tui_work(
             path,
             wait,
             idempotency_key,
-        } => match session.stage_profile_import(&path) {
-            Ok((profile_id, display_name)) => {
-                let command = UserCommand::ImportProfile { profile_id };
-                let operation_id = submit_remote_tui_command(
-                    session,
-                    &command,
-                    wait,
-                    idempotency_key,
-                    Some(&display_name),
-                    profile_operations,
-                );
-                (
-                    Some(command),
-                    Some(display_name),
-                    TuiControlCompletion::Admission(operation_id),
-                )
+        } => {
+            let import_request_key = idempotency_key.clone();
+            match session.stage_profile_import(&path) {
+                Ok((profile_id, display_name)) => {
+                    let command = UserCommand::ImportProfile { profile_id };
+                    let operation_id = submit_remote_tui_command(
+                        session,
+                        &command,
+                        wait,
+                        idempotency_key,
+                        Some(&display_name),
+                        profile_operations,
+                    );
+                    (
+                        Some(command),
+                        Some(display_name),
+                        Some(import_request_key),
+                        TuiControlCompletion::Admission(operation_id),
+                    )
+                }
+                Err(error) => (
+                    None,
+                    path.file_stem()
+                        .and_then(std::ffi::OsStr::to_str)
+                        .map(str::to_owned),
+                    Some(import_request_key),
+                    TuiControlCompletion::Admission(Err(LocalControlError::Remote(error))),
+                ),
             }
-            Err(error) => (
-                None,
-                path.file_stem()
-                    .and_then(std::ffi::OsStr::to_str)
-                    .map(str::to_owned),
-                TuiControlCompletion::Admission(Err(LocalControlError::Remote(error))),
-            ),
-        },
+        }
         RemoteTuiWork::RespondChallenge {
             challenge_id,
             answer,
@@ -861,6 +885,7 @@ fn execute_remote_tui_work(
                     .remove(&challenge_id);
             }
             (
+                None,
                 None,
                 None,
                 TuiControlCompletion::ChallengeResponse {
@@ -880,6 +905,7 @@ fn execute_remote_tui_work(
                     .remove(&challenge_id);
             }
             (
+                None,
                 None,
                 None,
                 TuiControlCompletion::ChallengeCancellation {
@@ -904,17 +930,19 @@ fn start_remote_tui_worker(
         .name("vortix-remote-control".into())
         .spawn(move || {
             while let Ok(job) = receiver.recv() {
-                let (command, import_display_name, completion) = execute_remote_tui_work(
-                    &session,
-                    job.work,
-                    &profile_operations,
-                    &pending_challenges,
-                );
+                let (command, import_display_name, import_request_key, completion) =
+                    execute_remote_tui_work(
+                        &session,
+                        job.work,
+                        &profile_operations,
+                        &pending_challenges,
+                    );
                 if result_sender
                     .send(LocalTuiAdmissionResult {
                         command,
                         completion,
                         import_display_name,
+                        import_request_key,
                         _permit: Some(job.permit),
                     })
                     .is_err()
@@ -1327,13 +1355,15 @@ impl ClientControlSession {
                                 | OperationResult::ProfileMutationAppliedAfterDeadline
                         )
                     ) {
-                        outcomes.push(LocalCatalogOutcome::Applied(
-                            LocalProfileMutationReceipt::RemoteApplied {
+                        outcomes.push(LocalCatalogOutcome::Applied {
+                            operation_id,
+                            receipt: LocalProfileMutationReceipt::RemoteApplied {
                                 display_name: context.display_name,
                             },
-                        ));
+                        });
                     } else {
-                        outcomes.push(LocalCatalogOutcome::RemoteTerminal {
+                        outcomes.push(LocalCatalogOutcome::Terminal {
+                            operation_id,
                             status: operation.status,
                             result: operation.result,
                         });
@@ -2359,15 +2389,16 @@ impl LocalControlSession {
             profile_id: profile_id.clone(),
         };
         let client = self.service().client();
+        let idempotency_key = idempotency_key.into();
         let request = CommandRequest {
             command: command.clone(),
-            idempotency_key: IdempotencyKey::new(idempotency_key),
+            idempotency_key: IdempotencyKey::new(idempotency_key.clone()),
             deadline: client.deadline_after(wait),
         };
         let queued = self.tui_admission.sender.try_send(TuiAdmissionJob {
             request,
             command,
-            import: Some((profile_id.clone(), display_name.clone())),
+            import: Some((profile_id.clone(), display_name.clone(), idempotency_key)),
             permit,
         });
         if let Err(error) = queued {
@@ -2515,12 +2546,26 @@ impl LocalControlSession {
             {
                 continue;
             }
-            if let Some(result) = self.profile_mutations.take_result(operation_id) {
-                outcomes.push(match result {
-                    Ok(receipt) => LocalCatalogOutcome::Applied(receipt),
-                    Err(failure) => LocalCatalogOutcome::Failed(failure),
-                });
-            }
+            outcomes.push(
+                if let Some(result) = self.profile_mutations.take_result(operation_id) {
+                    match result {
+                        Ok(receipt) => LocalCatalogOutcome::Applied {
+                            operation_id: operation_id.clone(),
+                            receipt,
+                        },
+                        Err(failure) => LocalCatalogOutcome::Failed {
+                            operation_id: operation_id.clone(),
+                            failure,
+                        },
+                    }
+                } else {
+                    LocalCatalogOutcome::Terminal {
+                        operation_id: operation_id.clone(),
+                        status: operation.status,
+                        result: operation.result,
+                    }
+                },
+            );
         }
         let revision = self.profile_mutations.catalog_revision();
         if revision == self.last_catalog_revision.get() && outcomes.is_empty() {
@@ -3674,7 +3719,8 @@ mod tests {
         assert_eq!(update.outcomes.len(), 1);
         assert!(matches!(
             update.outcomes.as_slice(),
-            [LocalCatalogOutcome::RemoteTerminal {
+            [LocalCatalogOutcome::Terminal {
+                operation_id: _,
                 status: OperationStatus::Failed,
                 result: Some(OperationResult::Failed(
                     crate::vortix_core::control::OperationFailure::Rejected
@@ -3730,11 +3776,12 @@ mod tests {
         let update = session.take_catalog_update(&snapshot).unwrap();
         assert!(matches!(
             update.outcomes.as_slice(),
-            [LocalCatalogOutcome::Applied(
-                LocalProfileMutationReceipt::RemoteApplied {
+            [LocalCatalogOutcome::Applied {
+                operation_id: _,
+                receipt: LocalProfileMutationReceipt::RemoteApplied {
                     display_name: Some(display_name),
-                }
-            )] if display_name == "daemon-canonical"
+                },
+            }] if display_name == "daemon-canonical"
         ));
     }
 
@@ -4493,6 +4540,15 @@ mod tests {
             .lock()
             .unwrap()
             .is_empty());
+        let catalog = session.take_catalog_update(&snapshot).unwrap();
+        assert!(catalog.outcomes.iter().any(|outcome| matches!(
+            outcome,
+            LocalCatalogOutcome::Terminal {
+                operation_id,
+                status: OperationStatus::Expired,
+                result: Some(OperationResult::Expired),
+            } if operation_id == &expiring_id
+        )));
     }
 
     #[test]
