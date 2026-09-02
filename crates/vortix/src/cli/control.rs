@@ -156,8 +156,8 @@ pub(crate) enum LocalCatalogOutcome {
         operation_id: OperationId,
         failure: ProfileMutationFailure,
     },
-    /// No executor-private receipt exists, so preserve the canonical terminal
-    /// fields for failures that occur before a profile worker runs.
+    /// No executor-private receipt is available, so preserve the canonical
+    /// terminal fields for remote-private errors and pre-worker failures.
     Terminal {
         operation_id: OperationId,
         status: OperationStatus,
