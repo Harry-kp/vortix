@@ -462,6 +462,7 @@ impl App {
             remaining: paths.into(),
             queued: 0,
             failed: 0,
+            active: None,
         });
         self.pump_pending_profile_imports();
         count
@@ -471,14 +472,21 @@ impl App {
         let Some(mut batch) = self.pending_profile_imports.take() else {
             return;
         };
+        if batch.active.is_some() {
+            self.pending_profile_imports = Some(batch);
+            return;
+        }
 
         for _ in 0..PROFILE_IMPORT_ATTEMPTS_PER_TURN {
             let Some(path) = batch.remaining.pop_front() else {
                 break;
             };
             match self.try_issue_control_import(&path) {
-                Ok(_) => {
+                Ok((_, request_key)) => {
                     batch.queued += 1;
+                    batch.active =
+                        Some(super::PendingProfileImport::AwaitingAdmission(request_key));
+                    break;
                 }
                 Err(crate::cli::control::LocalControlError::Busy) => {
                     batch.remaining.push_front(path);
@@ -494,7 +502,7 @@ impl App {
             }
         }
 
-        if !batch.remaining.is_empty() {
+        if !batch.remaining.is_empty() || batch.active.is_some() {
             self.pending_profile_imports = Some(batch);
             return;
         }
@@ -516,5 +524,55 @@ impl App {
             },
         );
         self.log(&format!("INFO: {summary} from {}", batch.source.display()));
+    }
+
+    pub(crate) fn admit_pending_profile_import(
+        &mut self,
+        request_key: &str,
+        operation_id: crate::vortix_core::control::OperationId,
+    ) {
+        let Some(batch) = self.pending_profile_imports.as_mut() else {
+            return;
+        };
+        if matches!(
+            &batch.active,
+            Some(super::PendingProfileImport::AwaitingAdmission(expected))
+                if expected == request_key
+        ) {
+            batch.active = Some(super::PendingProfileImport::Admitted(operation_id));
+        }
+    }
+
+    pub(crate) fn reject_pending_profile_import(&mut self, request_key: &str) {
+        let Some(batch) = self.pending_profile_imports.as_mut() else {
+            return;
+        };
+        if matches!(
+            &batch.active,
+            Some(super::PendingProfileImport::AwaitingAdmission(expected))
+                if expected == request_key
+        ) {
+            batch.active = None;
+            batch.failed = batch.failed.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn settle_pending_profile_import(
+        &mut self,
+        operation_id: &crate::vortix_core::control::OperationId,
+        succeeded: bool,
+    ) {
+        let Some(batch) = self.pending_profile_imports.as_mut() else {
+            return;
+        };
+        if matches!(
+            &batch.active,
+            Some(super::PendingProfileImport::Admitted(expected)) if expected == operation_id
+        ) {
+            batch.active = None;
+            if !succeeded {
+                batch.failed = batch.failed.saturating_add(1);
+            }
+        }
     }
 }
