@@ -2703,7 +2703,7 @@ fn canonical_directory_import_drains_more_than_tui_admission_capacity() {
         )
         .unwrap();
     }
-    std::fs::write(source_dir.join("invalid.conf"), "not a VPN profile\n").unwrap();
+    std::fs::write(source_dir.join("z-invalid.conf"), "not a VPN profile\n").unwrap();
 
     let control =
         crate::cli::control::LocalControlSession::start_profile_test(&config_dir, Vec::new())
@@ -2712,14 +2712,6 @@ fn canonical_directory_import_drains_more_than_tui_admission_capacity() {
     app.runtime.config_dir = config_dir;
     app.attach_control_session(control).unwrap();
 
-    for _ in 0..8 {
-        assert!(app
-            .issue_control_command(crate::vortix_core::control::UserCommand::SetKillSwitch {
-                mode: crate::state::KillSwitchMode::Off,
-            })
-            .is_some());
-    }
-
     app.import_profile_from_path(&source_dir.to_string_lossy());
     assert_eq!(
         app.pending_profile_imports.as_ref().map(|batch| (
@@ -2727,12 +2719,12 @@ fn canonical_directory_import_drains_more_than_tui_admission_capacity() {
             batch.queued,
             batch.failed
         )),
-        Some((PROFILE_COUNT + 1, 0, 0))
+        Some((2, 8, 0))
     );
 
-    // Nine valid profiles plus the invalid entry exceed the eight-slot TUI
-    // admission bound while keeping the fixture focused on backpressure. Give
-    // the real crash-safe mutation path its documented command-time budget.
+    // The first eight valid profiles fill the TUI admission bound. The ninth
+    // valid profile and trailing invalid file prove that draining results
+    // resumes the batch without an unrelated operation backlog in the fixture.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(35);
     while app.runtime.profiles.len() < PROFILE_COUNT && std::time::Instant::now() < deadline {
         app.process_external();
