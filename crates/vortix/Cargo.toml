@@ -134,3 +134,13 @@ tempfile = { workspace = true }
 
 [lints]
 workspace = true
+
+# Duplicated from the workspace root so `cargo install vortix` gets the same
+# ~6 MB binary as the shell/Homebrew/npm/musl artifacts — the published crate
+# does not carry the root manifest. Cargo ignores this block (and says so) when
+# building inside the workspace; keep the two in sync.
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = "z"

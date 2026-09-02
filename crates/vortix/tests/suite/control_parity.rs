@@ -1,8 +1,5 @@
 //! State/topology characterization shared by future local and remote adapters.
 
-#[path = "support/control_scenarios.rs"]
-mod control_scenarios;
-
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicU64, Ordering};

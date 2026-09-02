@@ -1,11 +1,8 @@
 //! Frozen public control-surface inventory for the local-to-remote migration.
 
-#[path = "support/control_scenarios.rs"]
-mod control_scenarios;
-
 use std::collections::BTreeSet;
 
-use control_scenarios::{
+use crate::control_scenarios::{
     ContractArea, BACKGROUND_CAPABILITY_COPY, BOOT_INELIGIBLE_CREDENTIALS, CONTROL_SCENARIOS,
     DIAGNOSTIC_FALLBACK_LABELS, ERROR_CONTRACTS, LIFECYCLE_EVENT_HOOKS, MODE_STATUS_LABELS,
     RECOVERY_ACTIONS, TRUST_BOUNDARY_COPY,

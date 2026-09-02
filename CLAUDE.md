@@ -29,6 +29,20 @@ User's explicit guidance from session memory: density via signaling, not duplica
 - Multi-tunnel views fit in the existing 6-row dashboard layout via overflow ladders, not new panels
 - See `docs/manual-testing/multi-connection.md` for what "fits cleanly at 80×24" means in practice
 
+## Build budget and test-target layout
+
+Binary size, build time and the profile knobs behind them live in
+[`docs/performance.md`](docs/performance.md); `scripts/bench-build.sh` re-measures the table.
+Two rules from it that bite silently:
+
+- `[profile.release]` sets `opt-level = "z"`. `panic = "abort"` is **not** set and must not be —
+  `catch_unwind` carries panic isolation for tunnels, hooks, the control worker and background
+  tasks.
+- Integration tests live in `crates/vortix/tests/suite/` behind one `main.rs`. A file dropped in
+  that directory with no `mod` line compiles into nothing and its tests stop running with no
+  diagnostic. A suite that mutates process-global state or asserts wall-clock duration stays a
+  top-level `tests/*.rs` instead.
+
 ## Manual testing convention
 
 Automated tests cover FSM, parsers, CIDR math, JSON shapes, render builders. They cannot cover real kernels, real `wg-quick`/`openvpn` subprocesses, real terminals, real adversaries. Manual scenarios live in [`docs/manual-testing/backlog.md`](docs/manual-testing/backlog.md) — one table of rows ordered by risk. When you ship a feature with observable runtime behavior, add a row that names the scenario, the setup, and the pass/fail signal.

@@ -1,40 +1,103 @@
 //! `cargo xtask <task>` — workspace build chores.
 
-use clap::{Parser, Subcommand};
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
-#[derive(Parser)]
-#[command(name = "xtask")]
-#[command(about = "vortix workspace build chores", long_about = None)]
-struct Cli {
-    #[command(subcommand)]
-    command: Command,
-}
+type Task = fn() -> Result<(), Box<dyn std::error::Error>>;
 
-#[derive(Subcommand)]
-#[allow(clippy::enum_variant_names)]
-enum Command {
-    /// Verify no raw `Command::new` outside `vortix-process`.
-    CheckSubprocess,
-    /// Verify no `cfg(target_os)` outside `vortix-platform-*`.
-    CheckPlatformLeak,
-    /// Verify no protocol-specific subprocess names outside their protocol crates.
-    CheckProtocolLeak,
-    /// Verify no shell-outs to system binaries that the `CommandRunner` port replaced.
-    CheckNoShellRegressions,
-    /// Freeze control-plane ownership while the canonical service replaces legacy writers.
-    CheckControlBoundaries,
-}
+/// Name, one-line description, handler. Dispatch and `--help` both read this.
+const TASKS: &[(&str, &str, Task)] = &[
+    (
+        "check-subprocess",
+        "Verify no raw `Command::new` outside `vortix-process`.",
+        check_subprocess,
+    ),
+    (
+        "check-platform-leak",
+        "Verify no `cfg(target_os)` outside `vortix-platform-*`.",
+        check_platform_leak,
+    ),
+    (
+        "check-protocol-leak",
+        "Verify no protocol-specific subprocess names outside their protocol crates.",
+        check_protocol_leak,
+    ),
+    (
+        "check-no-shell-regressions",
+        "Verify no shell-outs to system binaries that the `CommandRunner` port replaced.",
+        check_no_shell_regressions,
+    ),
+    (
+        "check-control-boundaries",
+        "Freeze control-plane ownership while the canonical service replaces legacy writers.",
+        check_control_boundaries,
+    ),
+];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
-    match cli.command {
-        Command::CheckSubprocess => check_subprocess(),
-        Command::CheckPlatformLeak => check_platform_leak(),
-        Command::CheckProtocolLeak => check_protocol_leak(),
-        Command::CheckNoShellRegressions => check_no_shell_regressions(),
-        Command::CheckControlBoundaries => check_control_boundaries(),
+    // args_os, not args: a non-UTF-8 argv is a usage error, not a panic.
+    let task = std::env::args_os().nth(1);
+    let task = task.as_deref().and_then(std::ffi::OsStr::to_str);
+    match task {
+        Some("--help" | "-h" | "help") => {
+            print_usage(&mut std::io::stdout());
+            Ok(())
+        }
+        Some(name) => {
+            if let Some((_, _, run)) = TASKS.iter().find(|(task, _, _)| *task == name) {
+                run()
+            } else {
+                eprintln!("xtask: unknown task `{name}`\n");
+                print_usage(&mut std::io::stderr());
+                std::process::exit(2);
+            }
+        }
+        None => {
+            print_usage(&mut std::io::stderr());
+            std::process::exit(2);
+        }
     }
+}
+
+fn print_usage(out: &mut impl Write) {
+    let width = TASKS
+        .iter()
+        .map(|(name, _, _)| name.len())
+        .max()
+        .unwrap_or(0);
+    let _ = writeln!(out, "vortix workspace build chores\n");
+    let _ = writeln!(out, "Usage: cargo xtask <task>\n");
+    let _ = writeln!(out, "Tasks:");
+    for (name, about, _) in TASKS {
+        let _ = writeln!(out, "  {name:<width$}  {about}");
+    }
+}
+
+/// Every `.rs` file under `dir`, skipping build output and the local-only
+/// profile fixtures — the two things `.gitignore` hides inside the workspace.
+fn rust_sources(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // is_dir/is_file, not entry.file_type(): these follow symlinks, so a
+            // symlinked source file is still scanned, as it was before.
+            if path.is_dir() {
+                let name = entry.file_name();
+                if name != "target" && name != "test-profiles" {
+                    stack.push(path);
+                }
+            } else if path.is_file() && path.extension().is_some_and(|ext| ext == "rs") {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    files
 }
 
 /// Scan the workspace for raw `Command::new` use outside `vortix-process`.
@@ -50,20 +113,8 @@ fn check_subprocess() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut violations = Vec::new();
 
-    let walker = ignore::WalkBuilder::new(&crates_dir)
-        .hidden(false)
-        .git_ignore(true)
-        .build();
-
-    for result in walker {
-        let Ok(entry) = result else { continue };
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-            continue;
-        }
+    for path in rust_sources(&crates_dir) {
+        let path = path.as_path();
         if is_allowlisted_file(path, &workspace_root) {
             continue;
         }
@@ -147,21 +198,8 @@ fn check_platform_leak() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut violations = Vec::new();
 
-    let walker = ignore::WalkBuilder::new(&crates_dir)
-        .hidden(false)
-        .git_ignore(true)
-        .build();
-
-    for result in walker {
-        let Ok(entry) = result else { continue };
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        // Only Rust source files participate in this lint.
-        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-            continue;
-        }
+    for path in rust_sources(&crates_dir) {
+        let path = path.as_path();
         if is_platform_leak_allowlisted(path, &workspace_root) {
             continue;
         }
@@ -250,20 +288,8 @@ fn check_protocol_leak() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut violations = Vec::new();
 
-    let walker = ignore::WalkBuilder::new(&crates_dir)
-        .hidden(false)
-        .git_ignore(true)
-        .build();
-
-    for result in walker {
-        let Ok(entry) = result else { continue };
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-            continue;
-        }
+    for path in rust_sources(&crates_dir) {
+        let path = path.as_path();
         let Some(rel_str) = path
             .strip_prefix(&workspace_root)
             .ok()
@@ -384,20 +410,8 @@ fn check_no_shell_regressions() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut violations = Vec::new();
 
-    let walker = ignore::WalkBuilder::new(&crates_dir)
-        .hidden(false)
-        .git_ignore(true)
-        .build();
-
-    for result in walker {
-        let Ok(entry) = result else { continue };
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-            continue;
-        }
+    for path in rust_sources(&crates_dir) {
+        let path = path.as_path();
         // Self-exclude: the lint mentions every forbidden name in its
         // own source.
         let rel = path.strip_prefix(&workspace_root).unwrap_or(path);
@@ -663,17 +677,8 @@ fn scan_control_boundaries_at(
     let crates_dir = root.join("crates");
     let mut candidates = Vec::new();
     let mut public_control_items = Vec::new();
-    let walker = ignore::WalkBuilder::new(&crates_dir)
-        .hidden(false)
-        .git_ignore(true)
-        .build();
-
-    for result in walker {
-        let Ok(entry) = result else { continue };
-        let path = entry.path();
-        if !path.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
-            continue;
-        }
+    for path in rust_sources(&crates_dir) {
+        let path = path.as_path();
         let Ok(relative) = path.strip_prefix(root) else {
             continue;
         };

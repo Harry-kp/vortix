@@ -95,7 +95,22 @@ cargo fmt --all -- --check
 | Before declaring a unit done (per-unit verification in plan docs) | Full set above |
 | After dependency bumps (rand, sha2, libc, tokio) | Full set above + manual smoke per `docs/manual-testing/<feature>.md` |
 | After cross-platform code touches | Full set, plus cross-compile-check (`--target`) where possible |
+| Checking a build-time or binary-size regression | `scripts/bench-build.sh` — see [`docs/performance.md`](performance.md) |
+
+## Caching
+
+Every workflow except `Format` restores a cargo cache through `.github/actions/rust-setup`
+(`Swatinem/rust-cache`). `Format` passes `cache: 'false'` — `cargo fmt` compiles nothing, so the
+restore/save round trip bought nothing.
+
+`Integration Tests` cannot use that action: the build runs inside a privileged container that
+cannot see the runner's cargo home. It instead layer-caches the harness image (buildx + `type=gha`)
+and caches `.ci-cargo-home` + `target` with `actions/cache`, keyed on `Cargo.lock`. The container
+gets `CARGO_HOME=/workspace/.ci-cargo-home`; `CARGO_TARGET_DIR` is deliberately left alone because
+`tests/integration/*.sh` invoke `target/release/vortix` by path. A step after the run chowns both
+directories back to the runner user so `actions/cache` can save them.
 
 ## Updating CI
 
-When you change `.github/workflows/ci.yml`, update this file in the **same commit**. Reviewers should reject CI changes that don't update the local-parity guide.
+When you change anything under `.github/workflows/` or `.github/actions/`, update this file in the
+**same commit**. Reviewers should reject CI changes that don't update the local-parity guide.

@@ -63,12 +63,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: docker/setup-buildx-action@v3
+
+      # The harness image installs a full apt/dnf set plus a rustup toolchain.
+      # Without a layer cache every run pays for that download again.
       - name: Build integration harness image (${{ matrix.distro.label }})
-        run: |
-          docker build \
-              -t ${{ matrix.distro.image_tag }} \
-              -f tests/integration/${{ matrix.distro.dockerfile }} \
-              tests/integration/
+        uses: docker/build-push-action@v6
+        with:
+          context: tests/integration
+          file: tests/integration/${{ matrix.distro.dockerfile }}
+          tags: ${{ matrix.distro.image_tag }}
+          load: true
+          cache-from: type=gha,scope=integration-${{ matrix.distro.label }}
+          cache-to: type=gha,mode=max,scope=integration-${{ matrix.distro.label }}
+
+      # The container has no access to the runner's cargo cache, so the
+      # release build starts from zero unless we hand it one through the
+      # mounted workspace.
+      - name: Cargo cache (${{ matrix.distro.label }})
+        uses: actions/cache@v4
+        with:
+          path: |
+            .ci-cargo-home
+            target
+          key: integration-cargo-${{ matrix.distro.label }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            integration-cargo-${{ matrix.distro.label }}-
 
       - name: Run integration tests (${{ matrix.distro.label }})
         # --privileged: required for `ip netns` + iptables manipulation
@@ -77,6 +97,7 @@ jobs:
           docker run --privileged --network host --rm \
               -v "$PWD:/workspace" \
               -w /workspace \
+              -e CARGO_HOME=/workspace/.ci-cargo-home \
               ${{ matrix.distro.image_tag }} \
               bash -c '
                 set -euo pipefail
@@ -86,3 +107,13 @@ jobs:
                 bash tests/integration/killswitch.sh
                 bash tests/integration/teardown-netns.sh
               '
+
+      # The container writes as root; actions/cache saves as the runner user.
+      # Either directory is absent if the run failed before cargo wrote it.
+      - name: Hand the cache directories back to the runner
+        if: always()
+        run: |
+          for dir in .ci-cargo-home target; do
+            [ -e "$dir" ] && sudo chown -R "$(id -u):$(id -g)" "$dir"
+          done
+          exit 0
