@@ -15,6 +15,7 @@ use ratatui::{
     widgets::Paragraph,
     Frame,
 };
+use unicode_width::UnicodeWidthStr;
 
 /// Render the dashboard view
 pub fn render(frame: &mut Frame, app: &mut App) {
@@ -233,6 +234,7 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
                     ],
                     border_color: theme::current().error,
                     confirm_selected: *confirm_selected,
+                    confirm_label: "Delete",
                     width: dialog_w,
                     height: 7,
                 },
@@ -292,19 +294,26 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
             // (Switch or Both) acknowledges that constraint; Both
             // keeps the demoted VPN connected as a split tunnel for
             // failover or per-subnet routing.
-            let max = 22;
-            let from_t1 = utils::truncate(from, max);
-            let from_t2 = utils::truncate(from, max);
-            let to_t1 = utils::truncate(to_name, max);
-            let to_t2 = utils::truncate(to_name, max);
-            let to_t3 = utils::truncate(to_name, max);
+            let inner_width = usize::from(
+                64_u16
+                    .min(frame.area().width.saturating_sub(4))
+                    .saturating_sub(2),
+            );
+            let to_width = inner_width
+                .saturating_sub("[B] Keep both — use ".width() + " as the active exit".width());
+            let from_width = inner_width
+                .saturating_sub("    ".width() + " stays connected as split tunnel".width());
+            let switch_from_width = inner_width.saturating_sub("[Y] Switch — disconnect ".width());
+            let to = crate::ui::helpers::truncate_to_width(to_name, to_width);
+            let split_from = crate::ui::helpers::truncate_to_width(from, from_width);
+            let switch_from = crate::ui::helpers::truncate_to_width(from, switch_from_width);
             confirm_dialog::render(
                 frame,
                 ConfirmDialogConfig {
                     title: " Already connected ",
                     body: vec![
                         Line::from(vec![
-                            Span::styled(to_t1, Style::default().fg(theme::current().success)),
+                            Span::styled(to.clone(), Style::default().fg(theme::current().success)),
                             Span::styled(
                                 " also wants to handle all",
                                 Style::default().fg(theme::current().text_secondary),
@@ -317,46 +326,37 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
                         Line::from(""),
                         Line::from(vec![
                             Span::styled(
-                                "[Y] Switch ",
+                                "[Y] Switch — disconnect ",
                                 Style::default()
-                                    .fg(theme::current().success)
+                                    .fg(theme::current().warning)
                                     .add_modifier(ratatui::style::Modifier::BOLD),
                             ),
                             Span::styled(
-                                "— disconnect ",
-                                Style::default().fg(theme::current().text_secondary),
-                            ),
-                            Span::styled(
-                                from_t1,
+                                switch_from,
                                 Style::default().fg(theme::current().accent_primary),
                             ),
-                            Span::styled(
-                                ", then connect ",
-                                Style::default().fg(theme::current().text_secondary),
-                            ),
-                            Span::styled(to_t2, Style::default().fg(theme::current().success)),
                         ]),
                         Line::from(vec![
                             Span::styled(
-                                "[B] Connect both ",
+                                "[B] Keep both ",
                                 Style::default()
                                     .fg(theme::current().accent_primary)
                                     .add_modifier(ratatui::style::Modifier::BOLD),
                             ),
                             Span::styled(
-                                "— ",
+                                "— use ",
                                 Style::default().fg(theme::current().text_secondary),
                             ),
-                            Span::styled(to_t3, Style::default().fg(theme::current().success)),
+                            Span::styled(to, Style::default().fg(theme::current().success)),
                             Span::styled(
-                                " becomes active;",
+                                " as the active exit",
                                 Style::default().fg(theme::current().text_secondary),
                             ),
                         ]),
                         Line::from(vec![
                             Span::styled("    ", Style::default()),
                             Span::styled(
-                                from_t2,
+                                split_from,
                                 Style::default().fg(theme::current().accent_primary),
                             ),
                             Span::styled(
@@ -364,15 +364,10 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
                                 Style::default().fg(theme::current().text_secondary),
                             ),
                         ]),
-                        Line::from(vec![Span::styled(
-                            "[N] Cancel",
-                            Style::default()
-                                .fg(theme::current().text_secondary)
-                                .add_modifier(ratatui::style::Modifier::BOLD),
-                        )]),
                     ],
                     border_color: theme::current().warning,
                     confirm_selected: *confirm_selected,
+                    confirm_label: "Switch",
                     width: 64,
                     height: 12,
                 },
@@ -385,7 +380,11 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
             confirm_selected,
             ..
         } => {
-            let max = 28;
+            let inner_width = usize::from(
+                56_u16
+                    .min(frame.area().width.saturating_sub(4))
+                    .saturating_sub(2),
+            );
             let with_name = app
                 .runtime
                 .profiles
@@ -395,23 +394,43 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
                     || format!("ProfileMissing:{with_profile_id}"),
                     |profile| profile.name.clone(),
                 );
-            let with_t = utils::truncate(&with_name, max);
-            let to_t = utils::truncate(to_name, max);
+            let with_t = crate::ui::helpers::truncate_to_width(
+                &with_name,
+                inner_width.saturating_sub("Overlaps with ".width()),
+            );
+            let to_t = crate::ui::helpers::truncate_to_width(
+                to_name,
+                inner_width.saturating_sub("Connect ".width()),
+            );
             // Display up to two overlapping CIDRs inline; the rest collapse
             // into a "+N more" tail so a wide AllowedIPs set doesn't blow
             // the dialog height.
+            let cidr_budget = inner_width.saturating_sub("on ".width() + "?".width());
             let cidr_summary = if overlapping_cidrs.is_empty() {
                 String::from("(unknown)")
-            } else {
-                let mut parts: Vec<String> = overlapping_cidrs
+            } else if overlapping_cidrs.len() > 2 {
+                let head = overlapping_cidrs
                     .iter()
                     .take(2)
-                    .map(|c| format!("{}/{}", c.addr, c.prefix_len))
-                    .collect();
-                if overlapping_cidrs.len() > 2 {
-                    parts.push(format!("+{} more", overlapping_cidrs.len() - 2));
-                }
-                parts.join(", ")
+                    .map(|cidr| format!("{}/{}", cidr.addr, cidr.prefix_len))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let tail = format!(", +{} more", overlapping_cidrs.len() - 2);
+                format!(
+                    "{}{}",
+                    crate::ui::helpers::truncate_to_width(
+                        &head,
+                        cidr_budget.saturating_sub(tail.width())
+                    ),
+                    tail
+                )
+            } else {
+                let summary = overlapping_cidrs
+                    .iter()
+                    .map(|cidr| format!("{}/{}", cidr.addr, cidr.prefix_len))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                crate::ui::helpers::truncate_to_width(&summary, cidr_budget)
             };
             confirm_dialog::render(
                 frame,
@@ -424,8 +443,10 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
                                 Style::default().fg(theme::current().text_secondary),
                             ),
                             Span::styled(to_t, Style::default().fg(theme::current().success)),
+                        ]),
+                        Line::from(vec![
                             Span::styled(
-                                " — overlaps with ",
+                                "Overlaps with ",
                                 Style::default().fg(theme::current().text_secondary),
                             ),
                             Span::styled(
@@ -447,8 +468,9 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
                     ],
                     border_color: theme::current().warning,
                     confirm_selected: *confirm_selected,
+                    confirm_label: "Connect",
                     width: 56,
-                    height: 7,
+                    height: 8,
                 },
             );
         }
@@ -484,6 +506,7 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
                     ],
                     border_color: theme::current().warning,
                     confirm_selected: *confirm_selected,
+                    confirm_label: "Disconnect all",
                     width: 50,
                     height: 7,
                 },
@@ -504,5 +527,79 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
         };
 
         super::overlays::action_menu::render(frame, &actions, &mut app.action_menu_state, title);
+    }
+}
+
+#[cfg(test)]
+mod overlay_tests {
+    use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    #[test]
+    fn takeover_dialog_keeps_both_profile_names_and_choices_visible() {
+        let mut app = App::new_test();
+        app.input_mode = InputMode::ConfirmDefaultRouteTakeover {
+            from: "existing-primary-profile-with-a-deliberately-long-name".to_string(),
+            to_profile_id: crate::vortix_core::profile::ProfileId::new(
+                "incoming-primary-profile-with-a-deliberately-long-name",
+            ),
+            to_name: "incoming-primary-profile-with-a-deliberately-long-name".to_string(),
+            confirm_selected: true,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| render_overlays(frame, &mut app))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let output = buffer
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(output.contains("existing-primary-profile"), "{output}");
+        assert!(output.contains("incoming-primary-pro..."), "{output}");
+        assert!(output.contains("[Y] Switch — disconnect"), "{output}");
+        assert!(output.contains("[B] Keep both"), "{output}");
+        assert!(output.contains("[N] Cancel"), "{output}");
+    }
+
+    #[test]
+    fn overlap_dialog_keeps_long_ipv6_details_and_choices_within_bounds() {
+        let mut app = App::new_test();
+        let existing = crate::vortix_core::profile::ProfileId::new(
+            "existing-profile-with-a-name-that-is-far-too-long-for-the-dialog",
+        );
+        app.input_mode = InputMode::ConfirmRouteOverlap {
+            with_profile_id: existing,
+            overlapping_cidrs: vec![
+                "2001:db8:1234:5678:90ab:cdef:1234:5678/128"
+                    .parse()
+                    .unwrap(),
+                "2001:db8:ffff:eeee:dddd:cccc:bbbb:aaaa/128"
+                    .parse()
+                    .unwrap(),
+                "2001:db8:1::/64".parse().unwrap(),
+                "2001:db8:2::/64".parse().unwrap(),
+                "2001:db8:3::/64".parse().unwrap(),
+            ],
+            to_profile_id: crate::vortix_core::profile::ProfileId::new("incoming"),
+            to_name: "incoming-profile-with-an-equally-long-human-readable-name".to_string(),
+            confirm_selected: true,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| render_overlays(frame, &mut app))
+            .unwrap();
+        let output = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(output.contains("..."), "{output}");
+        assert!(output.contains("+3 more"), "{output}");
+        assert!(output.contains("[Y] Connect"), "{output}");
+        assert!(output.contains("[N] Cancel"), "{output}");
     }
 }

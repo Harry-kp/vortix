@@ -158,6 +158,9 @@ impl App {
                 self.connect_profile_forced(idx);
             }
             Message::DisconnectProfile { idx } => self.disconnect_profile_by_idx(idx),
+            Message::ForceDisconnectProfile { idx } => {
+                self.force_disconnect_profile_by_idx(idx);
+            }
             Message::RequestDisconnectAll => {
                 let count = self.active_tunnel_count();
                 if count > 1 {

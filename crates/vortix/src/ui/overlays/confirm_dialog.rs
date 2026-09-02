@@ -15,11 +15,12 @@ pub struct ConfirmDialogConfig<'a> {
     pub body: Vec<Line<'a>>,
     pub border_color: Color,
     pub confirm_selected: bool,
+    pub confirm_label: &'a str,
     pub width: u16,
     pub height: u16,
 }
 
-/// Render a centered confirmation dialog with [Y]es / [N]o buttons.
+/// Render a centered confirmation dialog with an action and Cancel choice.
 pub fn render(frame: &mut Frame, config: ConfirmDialogConfig) {
     let area = frame.area();
     let width = config.width.min(area.width.saturating_sub(4));
@@ -63,25 +64,35 @@ pub fn render(frame: &mut Frame, config: ConfirmDialogConfig) {
             .add_modifier(Modifier::BOLD)
     };
 
-    let yes_label = if config.confirm_selected {
-        "▸ [Y]es "
-    } else {
-        "  [Y]es "
-    };
-    let no_label = if config.confirm_selected {
-        "  [N]o "
-    } else {
-        "▸ [N]o "
-    };
+    let yes_label = format!(
+        "{}[Y] {} ",
+        if config.confirm_selected {
+            "▸ "
+        } else {
+            "  "
+        },
+        config.confirm_label
+    );
+    let no_label = format!(
+        "{}[N] {} ",
+        if config.confirm_selected {
+            "  "
+        } else {
+            "▸ "
+        },
+        "Cancel"
+    );
 
     let mut lines = config.body;
     lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled("     ", Style::default()),
-        Span::styled(yes_label, yes_style),
-        Span::styled("  ", Style::default()),
-        Span::styled(no_label, no_style),
-    ]));
+    lines.push(
+        Line::from(vec![
+            Span::styled(yes_label, yes_style),
+            Span::styled("  ", Style::default()),
+            Span::styled(no_label, no_style),
+        ])
+        .centered(),
+    );
 
     frame.render_widget(Paragraph::new(lines), inner);
 }

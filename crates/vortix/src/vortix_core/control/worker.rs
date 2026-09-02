@@ -776,6 +776,7 @@ impl ProfileWorkerPool {
             return Err(WorkFailure::Stale);
         }
         if work.resource_revision.generation == 0
+            || work.resource_revision.generation > work.revision.generation
             || (work.mutation == TunnelMutation::Connect && work.resource_revision != work.revision)
         {
             return Err(WorkFailure::EffectFailed);

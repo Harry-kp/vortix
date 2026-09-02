@@ -17,7 +17,7 @@ use crate::vortix_core::control::{OperationId, Secret};
 use crate::vortix_core::ports::process::ManagedProcessId;
 use crate::vortix_core::ports::tunnel::{
     ParseError, ParsedProfile, ProtocolStatus, Tunnel, TunnelCapabilities, TunnelError,
-    TunnelHandle, TunnelKindTag, TunnelStatus,
+    TunnelExecutionContext, TunnelHandle, TunnelKindTag, TunnelStatus,
 };
 use crate::vortix_core::profile::{unambiguous_legacy_artifact_key, Profile, ProfileId};
 use crate::vortix_process::{CommandSpec, PrivilegeReq};
@@ -216,17 +216,12 @@ fn drive_mgmt_auth(
     user: &str,
     pass: &str,
     answer: &[u8],
-    connect_timeout_secs: u64,
+    timeout: Duration,
 ) -> Result<(), TunnelError> {
     let challenge = (!answer.is_empty())
         .then_some(crate::vortix_core::privileged::OpenVpnChallengeKind::Static);
     crate::vortix_protocol_openvpn::management::authenticate(
-        stream,
-        user,
-        pass,
-        answer,
-        challenge,
-        Duration::from_secs(connect_timeout_secs),
+        stream, user, pass, answer, challenge, timeout,
     )
     .map_err(|error| match error {
         crate::vortix_protocol_openvpn::management::ManagementAuthError::AuthenticationRejected
@@ -337,6 +332,8 @@ pub struct OvpnTunnel {
     /// contract; the credential value itself can be taken exactly once.
     static_challenge_credentials:
         Option<std::sync::Arc<std::sync::Mutex<Option<OpenVpnStaticChallengeCredentials>>>>,
+    /// Canonical cancellation and absolute operation deadline.
+    execution_context: Option<TunnelExecutionContext>,
 }
 
 impl std::fmt::Debug for OvpnTunnel {
@@ -355,6 +352,7 @@ impl std::fmt::Debug for OvpnTunnel {
                     .as_ref()
                     .map(|_| "[REDACTED]"),
             )
+            .field("execution_context", &self.execution_context)
             .finish()
     }
 }
@@ -369,6 +367,7 @@ impl Default for OvpnTunnel {
             generation: None,
             operation_id: None,
             static_challenge_credentials: None,
+            execution_context: None,
         }
     }
 }
@@ -401,6 +400,37 @@ impl OvpnTunnel {
     pub fn with_connect_timeout(mut self, secs: u64) -> Self {
         self.connect_timeout_secs = secs;
         self
+    }
+
+    /// Bind this protocol attempt to the canonical worker lifetime.
+    #[must_use]
+    pub fn with_execution_context(mut self, context: TunnelExecutionContext) -> Self {
+        self.execution_context = Some(context);
+        self
+    }
+
+    fn cancellation_requested(&self) -> bool {
+        self.execution_context
+            .as_ref()
+            .is_some_and(|context| context.cancellation.is_cancelled())
+    }
+
+    fn remaining_connect_timeout(&self) -> Result<Duration, TunnelError> {
+        if self.cancellation_requested() {
+            return Err(TunnelError::Cancelled);
+        }
+        let configured = Duration::from_secs(self.connect_timeout_secs);
+        let remaining = self
+            .execution_context
+            .as_ref()
+            .map_or(configured, |context| {
+                configured.min(context.deadline.saturating_duration_since(Instant::now()))
+            });
+        if remaining.is_zero() {
+            Err(TunnelError::Timeout(Duration::ZERO))
+        } else {
+            Ok(remaining)
+        }
     }
 
     /// Fence the Standard-mode custodian capability to one control revision.
@@ -662,13 +692,16 @@ pub(crate) fn parse_kernel_interface(log: &str) -> Option<String> {
 fn poll_log_until_ready(
     log_path: &std::path::Path,
     pid_path: &std::path::Path,
-    timeout_secs: u64,
+    timeout: Duration,
+    execution_context: Option<&TunnelExecutionContext>,
 ) -> Result<(u32, Option<String>), TunnelError> {
-    let timeout = Duration::from_secs(timeout_secs);
     let poll_interval = Duration::from_millis(OVPN_LOG_POLL_MS);
     let start = Instant::now();
 
     loop {
+        if execution_context.is_some_and(|context| context.cancellation.is_cancelled()) {
+            return Err(TunnelError::Cancelled);
+        }
         thread::sleep(poll_interval);
 
         // After OVPN_HEALTH_CHECK_DELAY_SECS, check whether the daemon is
@@ -884,6 +917,7 @@ fn pushed_dns_evidence(
 impl Tunnel for OvpnTunnel {
     #[allow(clippy::too_many_lines)] // single linear sequence of pid/log/auth setup + daemon spawn + log-poll; splitting would obscure the connect flow without simplifying it
     fn up(&mut self, profile: &Profile) -> Result<TunnelHandle, TunnelError> {
+        self.remaining_connect_timeout()?;
         let artifact_key = profile.id.as_str();
         let pid_path = self.pid_path(artifact_key);
         let log_path = self.log_path(artifact_key);
@@ -892,6 +926,7 @@ impl Tunnel for OvpnTunnel {
         // runtime artifacts or spawning any privileged process.
         let validated_config = prepare_managed_config(profile)?;
         let openvpn_binary = resolve_standard_openvpn_binary()?;
+        self.remaining_connect_timeout()?;
 
         if let Some(parent) = pid_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -1027,6 +1062,7 @@ impl Tunnel for OvpnTunnel {
             self.management_socket_path(artifact_key),
         ];
         let command = privileged_openvpn_command(&openvpn_binary, args);
+        self.remaining_connect_timeout()?;
         let handshake = match self.operation_id.clone() {
             Some(operation_id) => crate::vortix_process::start_managed_foreground_for_operation(
                 ownership_id.clone(),
@@ -1049,11 +1085,11 @@ impl Tunnel for OvpnTunnel {
         };
 
         if let (Some(creds), Some(sock_path)) = (mgmt_creds, mgmt_sock_path) {
-            let mgmt_timeout = self.connect_timeout_secs;
             let mgmt_result = (|| -> Result<(), TunnelError> {
+                let remaining = self.remaining_connect_timeout()?;
                 wait_for_mgmt_socket(
                     &sock_path,
-                    Duration::from_millis(OVPN_MGMT_SOCKET_TIMEOUT_MS),
+                    remaining.min(Duration::from_millis(OVPN_MGMT_SOCKET_TIMEOUT_MS)),
                 )?;
                 let stream = UnixStream::connect(&sock_path).map_err(|e| {
                     TunnelError::Subprocess(format!("mgmt: connect {}: {e}", sock_path.display()))
@@ -1063,7 +1099,7 @@ impl Tunnel for OvpnTunnel {
                     creds.username.as_str(),
                     creds.password.as_str(),
                     creds.answer.expose(),
-                    mgmt_timeout,
+                    self.remaining_connect_timeout()?,
                 )
             })();
             let _ = std::fs::remove_file(&sock_path);
@@ -1077,8 +1113,12 @@ impl Tunnel for OvpnTunnel {
             // then wait for the success marker in the log.
             thread::sleep(Duration::from_millis(OVPN_CHOWN_DELAY_MS));
             debug!(target: "vortix::tunnel::openvpn", "polling log for ready");
-            let (pid, kernel_iface) =
-                poll_log_until_ready(&log_path, &pid_path, self.connect_timeout_secs)?;
+            let (pid, kernel_iface) = poll_log_until_ready(
+                &log_path,
+                &pid_path,
+                self.remaining_connect_timeout()?,
+                self.execution_context.as_ref(),
+            )?;
 
             // The kernel interface name must come from the log scrape. The
             // multi-tunnel state-authority contract requires `details.interface` to be byte-
@@ -1268,6 +1308,29 @@ mod tests {
             .for_generation(0)
             .ownership_id(&ProfileId::new("corp"))
             .is_err());
+    }
+
+    #[test]
+    fn canonical_execution_context_bounds_and_cancels_openvpn_waits() {
+        let expired = OvpnTunnel::default().with_execution_context(TunnelExecutionContext {
+            cancellation: crate::vortix_core::ports::tunnel::TunnelCancellation::default(),
+            deadline: Instant::now(),
+        });
+        assert!(matches!(
+            expired.remaining_connect_timeout(),
+            Err(TunnelError::Timeout(_))
+        ));
+
+        let cancellation = crate::vortix_core::ports::tunnel::TunnelCancellation::default();
+        cancellation.cancel();
+        let cancelled = OvpnTunnel::default().with_execution_context(TunnelExecutionContext {
+            cancellation,
+            deadline: Instant::now() + Duration::from_secs(30),
+        });
+        assert!(matches!(
+            cancelled.remaining_connect_timeout(),
+            Err(TunnelError::Cancelled)
+        ));
     }
 
     #[test]

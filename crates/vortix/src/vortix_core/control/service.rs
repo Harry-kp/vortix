@@ -42,6 +42,12 @@ use crate::vortix_core::engine::state::{Connection, ConnectionHealth};
 use crate::vortix_core::profile::ProfileId;
 
 const MAX_OBSERVATIONS_PER_BATCH: usize = 1_025;
+/// A restarted authority may briefly resume a client command whose process
+/// disappeared, but it must not inherit a long UI/client deadline.
+const RECOVERED_CLIENT_OPERATION_GRACE_MILLIS: u64 = 10_000;
+/// Internal convergence work is bounded independently from foreground
+/// command deadlines. The TUI never waits for this budget before opening.
+const SERVICE_RECOVERY_OPERATION_TIMEOUT_MILLIS: u64 = 30_000;
 
 /// Injectable authority-local service clock.
 pub trait Clock: Send + Sync + 'static {
@@ -265,7 +271,9 @@ impl Default for ControlServiceConfig {
             profile_mutations: None,
             boot_connections: BTreeMap::new(),
             freshness_poll_interval: Duration::from_millis(250),
-            retry_budget: Duration::from_secs(300),
+            retry_budget: Duration::from_secs(
+                crate::vortix_core::engine::state::DEFAULT_RETRY_BUDGET_SECS,
+            ),
             retry_initial_backoff: Duration::from_secs(2),
             authority_epoch: AuthorityEpoch(0),
             initial_kill_switch_mode: crate::vortix_core::state::killswitch::KillSwitchMode::Off,
@@ -845,19 +853,16 @@ impl ControlService {
         };
         initial.desired.authority_epoch = config.authority_epoch;
         initial.desired.kill_switch = config.initial_kill_switch_mode;
-        let recovery = recover_control_state(&config, &mut initial);
+        let recovery = recover_control_state(&config, &mut initial, clock.now_millis());
         let mut durable = recovery.durable;
         let startup_persistence_fault = recovery.startup_persistence_fault;
         let recovered_control_state = recovery.recovered_control_state;
         durable.requested_resources = requested_resources(&config);
+        if let Some(supervisor) = supervisor.as_deref() {
+            restore_supervised_state(&mut initial, &mut durable, supervisor);
+        }
         recompute_policy_digest(&mut initial);
         durable.desired.clone_from(&initial.desired);
-        if let Some(supervisor) = supervisor.as_deref() {
-            if supervisor.restore_tombstones(&durable.tombstones).is_err() {
-                durable.tombstones.clear();
-            }
-            restore_supervised_wireguard_evidence(&mut initial, supervisor);
-        }
         let admission = Arc::new(Mutex::new(AdmissionState::recover(
             initial.readiness,
             &initial.operations,
@@ -1204,7 +1209,7 @@ impl ControlHandle {
                     .supervisor
                     .as_ref()
                     .ok_or(AdmissionError::Stopped)?;
-                for profile_id in &target_profiles {
+                for profile_id in &lifecycle_profiles {
                     // An exclusive switch reserves teardown capacity now, but
                     // deliberately reserves the target connect only after all
                     // competing tunnels are absent. That prevents the old
@@ -1257,7 +1262,7 @@ impl ControlHandle {
                 .reserve_operation(
                     scope,
                     command_digest.clone(),
-                    &target_profiles,
+                    &lifecycle_profiles,
                     operation_kind,
                     &config,
                 )
@@ -1950,6 +1955,7 @@ struct RecoveryOutcome {
 fn recover_control_state(
     config: &ControlServiceConfig,
     snapshot: &mut ControlSnapshot,
+    now: u64,
 ) -> RecoveryOutcome {
     let mut durable = durable_state(config, snapshot);
     let Some(persistence) = &config.persistence else {
@@ -1974,6 +1980,7 @@ fn recover_control_state(
             }
             snapshot.desired.clone_from(&durable.desired);
             snapshot.operations.clone_from(&durable.operations);
+            cap_recovered_client_operation_deadlines(snapshot, now);
             for (profile_id, connected_at) in &durable.last_connected_at {
                 snapshot
                     .last_connected_at
@@ -2306,6 +2313,41 @@ fn initial_tunnel_revisions(
         );
     }
     revisions
+}
+
+fn highest_supervised_generation(supervisor: &Supervisor) -> u64 {
+    supervisor
+        .profiles()
+        .into_values()
+        .map(|state| state.revision.generation)
+        .chain(
+            supervisor
+                .tombstones()
+                .into_iter()
+                .flat_map(|(_, tombstone)| {
+                    [
+                        tombstone.revision.generation,
+                        tombstone.resource_revision.generation,
+                    ]
+                }),
+        )
+        .max()
+        .unwrap_or(0)
+}
+
+fn restore_supervised_state(
+    snapshot: &mut ControlSnapshot,
+    durable: &mut DurableControlState,
+    supervisor: &Supervisor,
+) {
+    if supervisor.restore_tombstones(&durable.tombstones).is_err() {
+        durable.tombstones.clear();
+    }
+    restore_supervised_wireguard_evidence(snapshot, supervisor);
+    snapshot.desired.generation = snapshot
+        .desired
+        .generation
+        .max(highest_supervised_generation(supervisor));
 }
 
 async fn persist_control_state_if_changed(
@@ -2766,6 +2808,81 @@ fn drive_supervision(
                             events,
                         );
                     }
+                }
+            } else if result.result == Err(WorkFailure::TimedOut)
+                && result.mutation == TunnelMutation::Connect
+                && config
+                    .profile_topologies
+                    .get(&result.profile_id)
+                    .is_some_and(|topology| {
+                        topology.protocol
+                            == Some(crate::vortix_core::profile::ProtocolKind::OpenVpn)
+                    })
+            {
+                // The canonical OpenVPN adapter stops its owned custodian and
+                // proves teardown before it reports a timeout. Do not preserve
+                // Connected intent and silently launch another attempt after
+                // telling the user that this one reached its terminal bound.
+                let rollback_profiles = snapshot
+                    .operations
+                    .get(&result.operation_id)
+                    .and_then(|operation| operation_intent_tunnels(&operation.intent))
+                    .map_or_else(
+                        || vec![result.profile_id.clone()],
+                        |tunnels| {
+                            tunnels
+                                .iter()
+                                .filter(|(_, requested)| {
+                                    **requested == RequestedTunnelState::Connected
+                                })
+                                .map(|(profile_id, _)| profile_id.clone())
+                                .collect::<Vec<_>>()
+                        },
+                    );
+                let retired = supervisor
+                    .retire_cleaned_connect_timeout(
+                        &result.profile_id,
+                        &result.revision,
+                        &result.operation_id,
+                    )
+                    .is_ok();
+                if retired {
+                    let completion = complete_operation(
+                        OperationCompletion {
+                            operation_id: result.operation_id.clone(),
+                            desired_generation: result.revision.generation,
+                            outcome: CompletionOutcome::Failed(OperationFailure::Timeout),
+                        },
+                        snapshot,
+                        owner,
+                        admission,
+                        now,
+                        config,
+                        events,
+                    );
+                    if matches!(completion, Ok(CompletionResult::Terminal(_))) {
+                        rollback_connect_intent(
+                            &rollback_profiles,
+                            result.revision.generation,
+                            snapshot,
+                            owner,
+                            now,
+                            events,
+                        );
+                    }
+                } else {
+                    fail_tunnel_dispatch_operation(
+                        &result.operation_id,
+                        result.revision.generation,
+                        WorkFailure::TimedOut,
+                        snapshot,
+                        owner,
+                        admission,
+                        now,
+                        selection,
+                        config,
+                        events,
+                    );
                 }
             } else if result.result == Err(WorkFailure::TimedOut) {
                 fail_tunnel_dispatch_operation(
@@ -3659,15 +3776,13 @@ fn rollback_connect_intent(
     now: u64,
     events: &mut Vec<ControlEvent>,
 ) {
-    let expected_revision = TunnelRevision {
-        authority_epoch: snapshot.desired.authority_epoch,
-        generation: expected_generation,
-    };
+    if snapshot.desired.generation != expected_generation {
+        return;
+    }
     let profiles = profiles
         .iter()
         .filter(|profile_id| {
             snapshot.desired.tunnels.get(*profile_id) == Some(&RequestedTunnelState::Connected)
-                && owner.tunnel_revisions.get(*profile_id) == Some(&expected_revision)
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -4350,7 +4465,7 @@ fn handle_envelope(
                     desired_generation,
                     admitted_at_millis: admitted_at,
                     deadline_millis: request.deadline.0,
-                    intent: intent_for_command(&request.command, &target_profiles),
+                    intent: intent_for_command(&request.command, &lifecycle_profiles),
                     status,
                     result: expired.then_some(OperationResult::Expired),
                     failure_detail: None,
@@ -4861,7 +4976,7 @@ fn command_digest(command: &UserCommand) -> PolicyDigest {
     PolicyDigest::sha256(&bytes)
 }
 
-fn intent_for_command(command: &UserCommand, target_profiles: &[ProfileId]) -> OperationIntent {
+fn intent_for_command(command: &UserCommand, operation_profiles: &[ProfileId]) -> OperationIntent {
     let requested = match command {
         UserCommand::Connect { .. }
         | UserCommand::ConnectExclusive { .. }
@@ -4875,7 +4990,7 @@ fn intent_for_command(command: &UserCommand, target_profiles: &[ProfileId]) -> O
         | UserCommand::DeleteProfile { .. } => None,
     };
     let tunnels = if let UserCommand::ConnectExclusive { profile_id } = command {
-        target_profiles
+        operation_profiles
             .iter()
             .cloned()
             .map(|candidate| {
@@ -4889,7 +5004,7 @@ fn intent_for_command(command: &UserCommand, target_profiles: &[ProfileId]) -> O
             .collect()
     } else {
         requested.map_or_else(BTreeMap::new, |state| {
-            target_profiles
+            operation_profiles
                 .iter()
                 .cloned()
                 .map(|profile_id| (profile_id, state))
@@ -5667,12 +5782,10 @@ fn complete_operation(
     config: &ControlServiceConfig,
     events: &mut Vec<ControlEvent>,
 ) -> Result<CompletionResult, CompletionError> {
-    let interactive_profiles = snapshot
+    let client_connects = snapshot
         .operations
         .get(&completion.operation_id)
-        .map_or_else(Vec::new, |operation| {
-            interactive_connected_profiles(operation, config)
-        });
+        .map_or_else(Vec::new, client_connected_profiles);
     let success_is_current = match &completion.outcome {
         CompletionOutcome::ObservedSuccess(evidence) => evidence_matches(evidence, snapshot, now),
         CompletionOutcome::Failed(_) | CompletionOutcome::Cancelled => true,
@@ -5723,7 +5836,7 @@ fn complete_operation(
             events,
         );
         rollback_connect_intent(
-            &interactive_profiles,
+            &client_connects,
             completion.desired_generation,
             snapshot,
             owner,
@@ -5823,6 +5936,25 @@ fn successful_connection_times(
         .collect()
 }
 
+fn cap_recovered_client_operation_deadlines(snapshot: &mut ControlSnapshot, now: u64) {
+    let deadline = now.saturating_add(RECOVERED_CLIENT_OPERATION_GRACE_MILLIS);
+    for operation in snapshot.operations.values_mut().filter(|operation| {
+        !operation.status.is_terminal() && operation.client_id.sequence().is_some_and(|id| id > 0)
+    }) {
+        operation.deadline_millis = operation.deadline_millis.min(deadline);
+    }
+}
+
+fn client_connected_profiles(operation: &OperationRecord) -> Vec<ProfileId> {
+    client_desired_tunnels(operation).map_or_else(Vec::new, |tunnels| {
+        tunnels
+            .iter()
+            .filter(|(_, requested)| **requested == RequestedTunnelState::Connected)
+            .map(|(profile_id, _)| profile_id.clone())
+            .collect()
+    })
+}
+
 fn expire_operations(
     snapshot: &mut ControlSnapshot,
     owner: &mut OwnerState,
@@ -5870,67 +6002,34 @@ fn expire_operations(
         let Some(expired_record) = expired_record else {
             continue;
         };
-        let interactive_profiles = interactive_connected_profiles(&expired_record, config);
-        if !interactive_profiles.is_empty() {
+        let client_connects = client_connected_profiles(&expired_record);
+        let generation_before_rollback = snapshot.desired.generation;
+        if !client_connects.is_empty() {
             rollback_connect_intent(
-                &interactive_profiles,
+                &client_connects,
                 expired_record.desired_generation,
                 snapshot,
                 owner,
                 now,
                 events,
             );
-            continue;
         }
-        if selection != ExecutionSelection::CanonicalAuthority
-            || expired_record.desired_generation != snapshot.desired.generation
-            || snapshot.operations.values().any(|operation| {
-                operation.desired_generation == snapshot.desired.generation
-                    && !operation.status.is_terminal()
-            })
-        {
-            continue;
-        }
-        let idempotency_key = IdempotencyKey::new(format!(
-            "service-recovery-{}-{now}",
+        let rolled_back_connect = snapshot.desired.generation != generation_before_rollback;
+        let recovery_generation = if rolled_back_connect {
             snapshot.desired.generation
-        ));
-        let command_digest = snapshot.desired.policy_digest.clone();
-        let Some(recovery_id) = reserve_service_operation(
+        } else {
+            expired_record.desired_generation
+        };
+        start_recovery_operation(
             snapshot,
             owner,
             admission,
+            now,
+            selection,
+            recovery_generation,
             config,
-            &idempotency_key,
-            &command_digest,
-            None,
-        ) else {
-            mark_reconciliation_incomplete(snapshot, admission);
-            return;
-        };
-        snapshot.operations.insert(
-            recovery_id.clone(),
-            OperationRecord {
-                id: recovery_id.clone(),
-                idempotency_key,
-                client_id: ClientId::from_parts(snapshot.desired.authority_epoch, 0),
-                command_digest,
-                authority_epoch: snapshot.desired.authority_epoch,
-                desired_generation: snapshot.desired.generation,
-                admitted_at_millis: now,
-                deadline_millis: now.saturating_add(30_000),
-                intent: intent_for_desired_state(snapshot),
-                status: OperationStatus::WaitingForObservation,
-                result: None,
-                failure_detail: None,
-            },
+            events,
         );
-        owner.recovery_operations.insert(recovery_id.clone());
-        events.push(ControlEvent::OperationAdmitted {
-            operation_id: recovery_id.clone(),
-            desired_generation: snapshot.desired.generation,
-        });
-        register_recovery_lifecycle(owner, snapshot, config, &recovery_id, now, events);
     }
 }
 
@@ -6046,7 +6145,7 @@ fn start_recovery_operation(
             authority_epoch: snapshot.desired.authority_epoch,
             desired_generation: generation,
             admitted_at_millis: now,
-            deadline_millis: now.saturating_add(30_000),
+            deadline_millis: now.saturating_add(SERVICE_RECOVERY_OPERATION_TIMEOUT_MILLIS),
             intent: intent_for_desired_state(snapshot),
             status: OperationStatus::WaitingForObservation,
             result: None,
@@ -7043,6 +7142,48 @@ mod target_profiles_tests {
     use crate::vortix_core::state::{KillSwitchMode, KillSwitchState};
 
     #[test]
+    fn restart_caps_client_deadline_without_shortening_service_recovery() {
+        let profile_id = ProfileId::new("corp");
+        let operation = |sequence, deadline| OperationRecord {
+            id: OperationId::from_parts(AuthorityEpoch(7), sequence),
+            idempotency_key: IdempotencyKey::new(format!("operation-{sequence}")),
+            client_id: ClientId::from_parts(AuthorityEpoch(7), sequence),
+            command_digest: PolicyDigest::default(),
+            authority_epoch: AuthorityEpoch(7),
+            desired_generation: 9,
+            admitted_at_millis: 1,
+            deadline_millis: deadline,
+            intent: OperationIntent::DesiredSubset {
+                tunnels: BTreeMap::from([(profile_id.clone(), RequestedTunnelState::Connected)]),
+                kill_switch: None,
+            },
+            status: OperationStatus::WaitingForObservation,
+            result: None,
+            failure_detail: None,
+        };
+        let mut snapshot = ControlSnapshot::default();
+        snapshot.operations.insert(
+            OperationId::from_parts(AuthorityEpoch(7), 1),
+            operation(1, 500_000),
+        );
+        snapshot.operations.insert(
+            OperationId::from_parts(AuthorityEpoch(7), 0),
+            operation(0, 500_000),
+        );
+
+        cap_recovered_client_operation_deadlines(&mut snapshot, 20_000);
+
+        assert_eq!(
+            snapshot.operations[&OperationId::from_parts(AuthorityEpoch(7), 1)].deadline_millis,
+            30_000
+        );
+        assert_eq!(
+            snapshot.operations[&OperationId::from_parts(AuthorityEpoch(7), 0)].deadline_millis,
+            500_000
+        );
+    }
+
+    #[test]
     fn stale_connect_failure_cannot_roll_back_newer_profile_intent() {
         let profile_id = ProfileId::new("newer-connect");
         let mut snapshot = ControlSnapshot::default();
@@ -7812,6 +7953,7 @@ mod target_profiles_tests {
     fn disconnect_all_lifecycle_targets_only_exact_managed_presence() {
         let connected = ProfileId::new("connected");
         let disconnected = ProfileId::new("disconnected");
+        let command = UserCommand::Disconnect { profile_id: None };
         let supervisor = Supervisor::new(
             AuthorityEpoch(1),
             Arc::new(NoopTunnel),
@@ -7837,9 +7979,9 @@ mod target_profiles_tests {
                 OperationId::from_parts(AuthorityEpoch(1), 7),
             )
             .unwrap();
-        let catalog = BTreeSet::from([connected.clone(), disconnected]);
+        let catalog = BTreeSet::from([connected.clone(), disconnected.clone()]);
         let targets = target_profiles_for_command(
-            &UserCommand::Disconnect { profile_id: None },
+            &command,
             &catalog,
             &BTreeMap::new(),
             ExecutionSelection::CanonicalAuthority,
@@ -7847,7 +7989,7 @@ mod target_profiles_tests {
         )
         .unwrap();
         let lifecycle = lifecycle_profiles_for_command(
-            &UserCommand::Disconnect { profile_id: None },
+            &command,
             &targets,
             ExecutionSelection::CanonicalAuthority,
             Some(&supervisor),
@@ -7855,7 +7997,60 @@ mod target_profiles_tests {
         .unwrap();
 
         assert_eq!(targets.len(), 2, "desired-state target remains the catalog");
-        assert_eq!(lifecycle, vec![connected]);
+        assert_eq!(lifecycle, vec![connected.clone()]);
+
+        let intent = intent_for_command(&command, &lifecycle);
+        assert_eq!(operation_intent_profiles(&intent), vec![connected.clone()]);
+
+        let operation_id = OperationId::from_parts(AuthorityEpoch(1), 8);
+        let mut snapshot = ControlSnapshot::default();
+        snapshot.desired.generation = 8;
+        snapshot.desired.tunnels = targets
+            .iter()
+            .cloned()
+            .map(|profile_id| (profile_id, RequestedTunnelState::Disconnected))
+            .collect();
+        snapshot.observed.tunnels.insert(
+            connected.clone(),
+            ObservedTunnel {
+                active: true,
+                interface_name: Some("tun0".into()),
+                observed_at_millis: 1,
+                received_at_millis: 1,
+            },
+        );
+        snapshot.operations.insert(
+            operation_id.clone(),
+            OperationRecord {
+                id: operation_id,
+                idempotency_key: IdempotencyKey::new("disconnect-all"),
+                client_id: ClientId::from_parts(AuthorityEpoch(1), 1),
+                command_digest: PolicyDigest::default(),
+                authority_epoch: AuthorityEpoch(1),
+                desired_generation: 8,
+                admitted_at_millis: 1,
+                deadline_millis: u64::MAX,
+                intent,
+                status: OperationStatus::WaitingForObservation,
+                result: None,
+                failure_detail: None,
+            },
+        );
+        let config = ControlServiceConfig {
+            known_profiles: catalog,
+            ..ControlServiceConfig::default()
+        };
+
+        derive_tunnel_projections(&mut snapshot, None, &config);
+
+        assert!(matches!(
+            snapshot.tunnels[&connected].state,
+            Connection::Disconnecting { .. }
+        ));
+        assert!(
+            !snapshot.tunnels.contains_key(&disconnected),
+            "an already-absent profile must not appear to be disconnecting"
+        );
     }
 
     #[test]

@@ -15,7 +15,14 @@ pub(crate) enum PendingControlSubject {
     Connection,
     Reconnection,
     Disconnection,
+    DisconnectAll,
     KillSwitch,
+}
+
+#[derive(Clone, Copy)]
+enum ProfileDisconnectKind {
+    Normal,
+    Force,
 }
 
 impl PendingControlSubject {
@@ -24,7 +31,18 @@ impl PendingControlSubject {
             Self::Connection => "connection",
             Self::Reconnection => "reconnection",
             Self::Disconnection => "disconnection",
+            Self::DisconnectAll => "disconnect all",
             Self::KillSwitch => "kill switch change",
+        }
+    }
+
+    const fn queued_message(self) -> &'static str {
+        match self {
+            Self::Connection => "Connection queued",
+            Self::Reconnection => "Reconnection queued",
+            Self::Disconnection => "Disconnection queued",
+            Self::DisconnectAll => "Disconnecting all VPNs",
+            Self::KillSwitch => "Kill switch change queued",
         }
     }
 
@@ -33,7 +51,7 @@ impl PendingControlSubject {
             Self::Connection | Self::Reconnection => {
                 "VPN DNS could not be applied safely. Your previous network settings were restored."
             }
-            Self::Disconnection => {
+            Self::Disconnection | Self::DisconnectAll => {
                 "Disconnect could not finish safely. Your previous network settings were restored."
             }
             Self::KillSwitch => {
@@ -51,7 +69,7 @@ impl PendingControlSubject {
             Self::Connection | Self::Reconnection => {
                 "The VPN server rejected this profile. Check its certificate or username and password; if they are correct, the server may not authorize this profile."
             }
-            Self::Disconnection | Self::KillSwitch => {
+            Self::Disconnection | Self::DisconnectAll | Self::KillSwitch => {
                 "The VPN server rejected the requested authentication."
             }
         }
@@ -91,7 +109,11 @@ impl PendingControlSubject {
 
 fn friendly_dns_failure_explanation(detail: Option<&str>) -> Option<&'static str> {
     let detail = detail?.to_ascii_lowercase();
-    if [
+    if detail.contains("another vpn or network service") || detail.contains("instead of this vpn") {
+        Some(
+            "Another VPN or network service is routing this profile's DNS traffic. Disconnect it and try again. The Event Log shows the conflicting interface and a command to inspect it.",
+        )
+    } else if [
         "owner",
         "owned",
         "ownership",
@@ -187,6 +209,7 @@ fn control_error_message(error: &crate::cli::control::LocalControlError) -> Stri
 
 pub(crate) struct PendingControlOperation {
     subject: PendingControlSubject,
+    profile_name: Option<String>,
     admitted_after_generation: u64,
     recovery_retry: bool,
 }
@@ -210,11 +233,65 @@ fn control_command_subject(
             Some(PendingControlSubject::Connection)
         }
         UserCommand::Reconnect { .. } => Some(PendingControlSubject::Reconnection),
-        UserCommand::Disconnect { .. } | UserCommand::ForceDisconnect { .. } => {
-            Some(PendingControlSubject::Disconnection)
+        UserCommand::Disconnect { profile_id: None }
+        | UserCommand::ForceDisconnect { profile_id: None } => {
+            Some(PendingControlSubject::DisconnectAll)
         }
+        UserCommand::Disconnect {
+            profile_id: Some(_),
+        }
+        | UserCommand::ForceDisconnect {
+            profile_id: Some(_),
+        } => Some(PendingControlSubject::Disconnection),
         UserCommand::SetKillSwitch { .. } => Some(PendingControlSubject::KillSwitch),
         UserCommand::ImportProfile { .. }
+        | UserCommand::RenameProfile { .. }
+        | UserCommand::DeleteProfile { .. } => None,
+    }
+}
+
+#[cfg(test)]
+mod control_command_subject_tests {
+    use super::{control_command_subject, PendingControlSubject};
+    use crate::vortix_core::control::UserCommand;
+    use crate::vortix_core::profile::ProfileId;
+
+    #[test]
+    fn distinguishes_bulk_from_profile_disconnects() {
+        assert!(matches!(
+            control_command_subject(Some(&UserCommand::Disconnect { profile_id: None })),
+            Some(PendingControlSubject::DisconnectAll)
+        ));
+        assert!(matches!(
+            control_command_subject(Some(&UserCommand::Disconnect {
+                profile_id: Some(ProfileId::new("profile")),
+            })),
+            Some(PendingControlSubject::Disconnection)
+        ));
+    }
+}
+
+fn lifecycle_command_profile_id(
+    command: Option<&crate::vortix_core::control::UserCommand>,
+) -> Option<&ProfileId> {
+    use crate::vortix_core::control::UserCommand;
+    match command? {
+        UserCommand::Connect { profile_id, .. }
+        | UserCommand::ConnectExclusive { profile_id }
+        | UserCommand::Reconnect {
+            profile_id: Some(profile_id),
+        }
+        | UserCommand::Disconnect {
+            profile_id: Some(profile_id),
+        }
+        | UserCommand::ForceDisconnect {
+            profile_id: Some(profile_id),
+        } => Some(profile_id),
+        UserCommand::Reconnect { profile_id: None }
+        | UserCommand::Disconnect { profile_id: None }
+        | UserCommand::ForceDisconnect { profile_id: None }
+        | UserCommand::SetKillSwitch { .. }
+        | UserCommand::ImportProfile { .. }
         | UserCommand::RenameProfile { .. }
         | UserCommand::DeleteProfile { .. } => None,
     }
@@ -315,6 +392,14 @@ fn terminal_control_notification(
         (OperationStatus::Expired, _) => {
             Some((format!("{} timed out", subject.label()), ToastType::Error))
         }
+        (OperationStatus::Succeeded, _)
+            if matches!(subject, PendingControlSubject::DisconnectAll) =>
+        {
+            Some((
+                "All VPN connections disconnected".to_string(),
+                ToastType::Success,
+            ))
+        }
         (OperationStatus::Succeeded, _) if recovery_retry => Some((
             format!("{} succeeded after retry", subject.label()),
             ToastType::Success,
@@ -368,7 +453,8 @@ impl App {
         &mut self,
         command: crate::vortix_core::control::UserCommand,
     ) -> Option<()> {
-        let (wait, idempotency_key) = self.next_control_request();
+        let wait = self.control_command_timeout(&command);
+        let idempotency_key = self.next_control_request_key();
         let result = self
             .control_session
             .as_ref()
@@ -386,28 +472,80 @@ impl App {
         &mut self,
         path: &std::path::Path,
     ) -> Result<String, crate::cli::control::LocalControlError> {
-        let (wait, idempotency_key) = self.next_control_request();
+        let wait =
+            std::time::Duration::from_secs(crate::constants::DEFAULT_CONTROL_COMMAND_TIMEOUT_SECS);
+        let idempotency_key = self.next_control_request_key();
         self.control_session
             .as_ref()
             .expect("control import requires an attached session")
             .enqueue_tui_profile_import(path, wait, idempotency_key)
     }
 
-    fn next_control_request(&mut self) -> (std::time::Duration, String) {
+    fn next_control_request_key(&mut self) -> String {
         self.control_request_sequence = self.control_request_sequence.saturating_add(1);
-        let idempotency_key = format!(
+        format!(
             "tui-{}-{}",
             std::process::id(),
             self.control_request_sequence
-        );
-        let wait = std::time::Duration::from_secs(
+        )
+    }
+
+    fn control_command_timeout(
+        &self,
+        command: &crate::vortix_core::control::UserCommand,
+    ) -> std::time::Duration {
+        use crate::vortix_core::control::UserCommand;
+
+        let protocol = |profile_id: &crate::vortix_core::profile::ProfileId| {
             self.runtime
-                .config
-                .connect_timeout
-                .max(crate::vortix_core::engine::state::DEFAULT_RETRY_BUDGET_SECS)
-                .max(30),
-        );
-        (wait, idempotency_key)
+                .profiles
+                .iter()
+                .find(|profile| &profile.id == profile_id)
+                .map(|profile| profile.protocol)
+        };
+        let seconds = match command {
+            UserCommand::Connect { profile_id, .. }
+            | UserCommand::ConnectExclusive { profile_id } => protocol(profile_id).map_or_else(
+                || {
+                    self.runtime
+                        .config
+                        .connect_operation_timeout_secs(crate::state::Protocol::OpenVPN)
+                },
+                |p| self.runtime.config.connect_operation_timeout_secs(p),
+            ),
+            UserCommand::Reconnect {
+                profile_id: Some(profile_id),
+            } => protocol(profile_id).map_or_else(
+                || {
+                    self.runtime
+                        .config
+                        .reconnect_operation_timeout_secs(crate::state::Protocol::OpenVPN)
+                },
+                |p| self.runtime.config.reconnect_operation_timeout_secs(p),
+            ),
+            UserCommand::Reconnect { profile_id: None } => self
+                .runtime
+                .profiles
+                .iter()
+                .map(|profile| {
+                    self.runtime
+                        .config
+                        .reconnect_operation_timeout_secs(profile.protocol)
+                })
+                .max()
+                .unwrap_or(crate::constants::DEFAULT_CONTROL_COMMAND_TIMEOUT_SECS),
+            UserCommand::Disconnect { .. }
+            | UserCommand::ForceDisconnect { .. }
+            | UserCommand::SetKillSwitch { .. } => {
+                self.runtime.config.disconnect_operation_timeout_secs()
+            }
+            UserCommand::ImportProfile { .. }
+            | UserCommand::RenameProfile { .. }
+            | UserCommand::DeleteProfile { .. } => {
+                crate::constants::DEFAULT_CONTROL_COMMAND_TIMEOUT_SECS
+            }
+        };
+        std::time::Duration::from_secs(seconds)
     }
 
     fn report_control_enqueue<T>(
@@ -440,15 +578,36 @@ impl App {
         for result in results {
             match result.completion {
                 crate::cli::control::TuiControlCompletion::Admission(Ok(operation_id)) => {
-                    let subject = result
-                        .import_display_name
-                        .as_deref()
-                        .map_or_else(|| "command".to_owned(), |name| format!("import '{name}'"));
-                    self.log(&format!(
-                        "CONTROL: Durable {subject} admitted as {operation_id:?}"
-                    ));
-                    if let Some(subject) = control_command_subject(result.command.as_ref()) {
-                        self.track_control_operation(operation_id, subject);
+                    let control_subject = control_command_subject(result.command.as_ref());
+                    let profile_name = lifecycle_command_profile_id(result.command.as_ref())
+                        .and_then(|profile_id| {
+                            self.runtime
+                                .profiles
+                                .iter()
+                                .find(|profile| profile.id == *profile_id)
+                                .map(|profile| profile.name.clone())
+                        });
+                    let activity = result.import_display_name.as_deref().map_or_else(
+                        || {
+                            control_subject.map_or_else(
+                                || "Profile update queued".to_string(),
+                                |subject| {
+                                    profile_name.as_deref().map_or_else(
+                                        || subject.queued_message().to_string(),
+                                        |name| format!("{} for '{name}'", subject.queued_message()),
+                                    )
+                                },
+                            )
+                        },
+                        |name| format!("Profile import queued: '{name}'"),
+                    );
+                    self.log(&format!("CONTROL: {activity}"));
+                    if let Some(subject) = control_subject {
+                        self.track_control_operation_with_profile(
+                            operation_id,
+                            subject,
+                            profile_name,
+                        );
                     }
                 }
                 crate::cli::control::TuiControlCompletion::Admission(Err(error)) => {
@@ -663,10 +822,11 @@ impl App {
         }
     }
 
-    pub(crate) fn track_control_operation(
+    pub(crate) fn track_control_operation_with_profile(
         &mut self,
         operation_id: crate::vortix_core::control::OperationId,
         subject: PendingControlSubject,
+        profile_name: Option<String>,
     ) {
         let already_terminal = self
             .control_snapshot
@@ -677,6 +837,7 @@ impl App {
             operation_id,
             PendingControlOperation {
                 subject,
+                profile_name,
                 admitted_after_generation: self.control_snapshot.generation,
                 recovery_retry: false,
             },
@@ -724,6 +885,10 @@ impl App {
         &mut self,
         snapshot: &crate::vortix_core::control::ControlSnapshot,
     ) {
+        let disconnect_all_in_flight = self
+            .pending_control_operations
+            .values()
+            .any(|pending| matches!(pending.subject, PendingControlSubject::DisconnectAll));
         let completed = self
             .pending_control_operations
             .iter()
@@ -746,6 +911,7 @@ impl App {
                         (
                             operation_id.clone(),
                             pending.subject,
+                            pending.profile_name.clone(),
                             pending.recovery_retry,
                             operation.status,
                             operation.result,
@@ -760,6 +926,7 @@ impl App {
         for (
             operation_id,
             subject,
+            profile_name,
             recovery_retry,
             status,
             result,
@@ -772,20 +939,34 @@ impl App {
             if self.present_late_route_conflict(subject, status, result, late_route_conflict) {
                 continue;
             }
-            let notification = terminal_control_notification(
-                subject,
-                recovery_retry,
-                status,
-                result,
-                owned_retry.is_some(),
-                failure_detail.as_deref(),
-            );
+            let superseded_connection_cancellation = disconnect_all_in_flight
+                && status == crate::vortix_core::control::OperationStatus::Cancelled
+                && matches!(
+                    subject,
+                    PendingControlSubject::Connection | PendingControlSubject::Reconnection
+                );
+            let notification = if superseded_connection_cancellation {
+                None
+            } else {
+                terminal_control_notification(
+                    subject,
+                    recovery_retry,
+                    status,
+                    result,
+                    owned_retry.is_some(),
+                    failure_detail.as_deref(),
+                )
+            };
             if let Some((message, toast_type)) = notification {
                 self.show_toast(message, toast_type);
             }
             if let Some(detail) = failure_detail {
+                let profile = profile_name
+                    .as_deref()
+                    .map_or_else(String::new, |name| format!(" for '{name}'"));
                 self.log(&format!(
-                    "ERR: Control operation {operation_id} failed: {detail}"
+                    "ERR: Control {} failed{profile}: {detail}",
+                    subject.label(),
                 ));
             }
             if let Some(retry_id) = owned_retry {
@@ -793,6 +974,7 @@ impl App {
                     retry_id,
                     PendingControlOperation {
                         subject,
+                        profile_name,
                         admitted_after_generation: snapshot.generation,
                         recovery_retry: true,
                     },
@@ -1131,6 +1313,10 @@ impl App {
     }
     /// Disconnect the selected profile through the canonical owner.
     pub(crate) fn disconnect_profile_by_idx(&mut self, idx: usize) {
+        self.disconnect_profile_by_idx_with_kind(idx, ProfileDisconnectKind::Normal);
+    }
+
+    fn disconnect_profile_by_idx_with_kind(&mut self, idx: usize, kind: ProfileDisconnectKind) {
         if self.control_session.is_none() {
             self.show_toast(CONTROL_STARTING_MESSAGE.to_string(), ToastType::Info);
             return;
@@ -1144,10 +1330,25 @@ impl App {
             return;
         };
         if self.registry.snapshot(&profile_id).is_some() {
-            self.issue_control_command(crate::vortix_core::control::UserCommand::Disconnect {
-                profile_id: Some(profile_id),
-            });
+            let command = match kind {
+                ProfileDisconnectKind::Normal => {
+                    crate::vortix_core::control::UserCommand::Disconnect {
+                        profile_id: Some(profile_id),
+                    }
+                }
+                ProfileDisconnectKind::Force => {
+                    crate::vortix_core::control::UserCommand::ForceDisconnect {
+                        profile_id: Some(profile_id),
+                    }
+                }
+            };
+            self.issue_control_command(command);
         }
+    }
+    /// Force-disconnect the exact selected profile without falling back to a
+    /// different primary tunnel.
+    pub(crate) fn force_disconnect_profile_by_idx(&mut self, idx: usize) {
+        self.disconnect_profile_by_idx_with_kind(idx, ProfileDisconnectKind::Force);
     }
     /// Disconnect every active tunnel through the canonical owner.
     pub(crate) fn disconnect_all_active(&mut self) {
@@ -1215,6 +1416,35 @@ mod u7_conflict_tests {
     //! `InputMode` overlay. The registry's `detect_conflict` itself is
     //! tested in `vortix_core::engine::registry`.
     use super::Protocol;
+
+    #[test]
+    fn tui_connect_uses_protocol_deadline_not_background_retry_budget() {
+        let mut app = super::App::new_test();
+        app.runtime.config.connect_timeout = 35;
+        app.runtime.config.wireguard_handshake_timeout_secs = 20;
+        app.runtime.profiles.push(crate::state::VpnProfile {
+            id: crate::vortix_core::profile::ProfileId::new("openvpn"),
+            name: "openvpn".into(),
+            protocol: Protocol::OpenVPN,
+            location: String::new(),
+            config_path: "/tmp/openvpn.ovpn".into(),
+            last_used: None,
+        });
+
+        let timeout =
+            app.control_command_timeout(&crate::vortix_core::control::UserCommand::Connect {
+                profile_id: crate::vortix_core::profile::ProfileId::new("openvpn"),
+                conflict_acknowledgement: None,
+            });
+
+        assert_eq!(timeout, std::time::Duration::from_secs(37));
+        assert!(
+            timeout
+                < std::time::Duration::from_secs(
+                    crate::vortix_core::engine::state::DEFAULT_RETRY_BUDGET_SECS
+                )
+        );
+    }
     use crate::vortix_core::cidr::claims_default_route_v4;
     use std::io::Write;
 

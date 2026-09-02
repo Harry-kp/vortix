@@ -769,6 +769,7 @@ impl HelperTunnelReceiptAdapter {
         if work.revision.authority_epoch != self.authority.authority_epoch()
             || work.resource_revision.authority_epoch != self.authority.authority_epoch()
             || work.resource_revision.generation == 0
+            || work.resource_revision.generation > work.revision.generation
         {
             return Err(HelperTunnelReceiptError::WorkAuthorityMismatch);
         }

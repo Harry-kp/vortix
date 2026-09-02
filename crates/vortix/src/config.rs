@@ -131,7 +131,7 @@ impl Default for AppConfig {
             api_timeout: constants::DEFAULT_API_TIMEOUT,
             ping_timeout: constants::DEFAULT_PING_TIMEOUT,
             connect_timeout: constants::DEFAULT_CONNECT_TIMEOUT,
-            wireguard_handshake_timeout_secs: 20,
+            wireguard_handshake_timeout_secs: constants::DEFAULT_WIREGUARD_HANDSHAKE_TIMEOUT,
             wireguard_handshake_stale_secs: 180,
             ping_targets: constants::DEFAULT_PING_TARGETS
                 .iter()
@@ -160,6 +160,32 @@ impl Default for AppConfig {
             auto_reconnect: constants::DEFAULT_AUTO_RECONNECT,
             auto_reconnect_delay_secs: constants::DEFAULT_AUTO_RECONNECT_DELAY_SECS,
         }
+    }
+}
+
+impl AppConfig {
+    /// Bound for one protocol connection attempt plus control publication.
+    #[must_use]
+    pub const fn connect_operation_timeout_secs(&self, protocol: crate::state::Protocol) -> u64 {
+        let protocol_gate = match protocol {
+            crate::state::Protocol::WireGuard => self.wireguard_handshake_timeout_secs,
+            crate::state::Protocol::OpenVPN => self.connect_timeout,
+        };
+        protocol_gate.saturating_add(crate::constants::CONTROL_COMPLETION_GRACE_SECS)
+    }
+
+    /// Bound for one teardown plus control publication.
+    #[must_use]
+    pub const fn disconnect_operation_timeout_secs(&self) -> u64 {
+        self.disconnect_timeout
+            .saturating_add(crate::constants::CONTROL_COMPLETION_GRACE_SECS)
+    }
+
+    /// Bound for a teardown followed by a fresh protocol connection.
+    #[must_use]
+    pub const fn reconnect_operation_timeout_secs(&self, protocol: crate::state::Protocol) -> u64 {
+        self.disconnect_timeout
+            .saturating_add(self.connect_operation_timeout_secs(protocol))
     }
 }
 
@@ -737,6 +763,33 @@ mod tests {
         assert_eq!(
             config.geolocation_api_fallback,
             crate::constants::DEFAULT_GEOLOCATION_API_FALLBACK
+        );
+    }
+
+    #[test]
+    fn lifecycle_deadlines_keep_foreground_work_out_of_the_retry_budget() {
+        let config = AppConfig::default();
+
+        assert_eq!(
+            config.connect_operation_timeout_secs(crate::state::Protocol::WireGuard),
+            22
+        );
+        assert_eq!(
+            config.connect_operation_timeout_secs(crate::state::Protocol::OpenVPN),
+            37
+        );
+        assert_eq!(config.disconnect_operation_timeout_secs(), 32);
+        assert_eq!(
+            config.reconnect_operation_timeout_secs(crate::state::Protocol::WireGuard),
+            52
+        );
+        assert_eq!(
+            config.reconnect_operation_timeout_secs(crate::state::Protocol::OpenVPN),
+            67
+        );
+        assert!(
+            config.reconnect_operation_timeout_secs(crate::state::Protocol::OpenVPN)
+                < crate::vortix_core::engine::state::DEFAULT_RETRY_BUDGET_SECS
         );
     }
 

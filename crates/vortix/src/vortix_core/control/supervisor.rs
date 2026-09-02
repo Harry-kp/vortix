@@ -477,6 +477,34 @@ impl Supervisor {
         Ok(())
     }
 
+    /// Retire a timed-out connect after its protocol executor proved that no
+    /// owned effect remains. A generic timeout is otherwise kept ambiguous;
+    /// callers may use this seam only for an exact cleanup contract.
+    pub(crate) fn retire_cleaned_connect_timeout(
+        &self,
+        profile_id: &ProfileId,
+        revision: &TunnelRevision,
+        operation_id: &OperationId,
+    ) -> Result<(), WorkFailure> {
+        let mut state = self.state.lock().expect("supervisor mutex poisoned");
+        let exact = state.profiles.get(profile_id).is_some_and(|entry| {
+            entry.revision == *revision
+                && entry.operation_id == *operation_id
+                && entry.mutation == TunnelMutation::Connect
+                && entry.truth == SupervisedTruth::Degraded(WorkFailure::TimedOut)
+        });
+        if !exact {
+            return Err(WorkFailure::Stale);
+        }
+        state.profiles.remove(profile_id);
+        drop(state);
+        // Timeout reservations are conservatively marked ambiguous by the
+        // generic worker. Exact protocol cleanup makes this profile lease safe
+        // to release instead of blocking the next user attempt.
+        self.tunnels.reservations().release_profile(profile_id);
+        Ok(())
+    }
+
     pub fn poll_policy(&self) -> Option<PolicyResult> {
         let result = self.policy.try_result()?;
         let mut state = self.state.lock().expect("supervisor mutex poisoned");

@@ -1853,74 +1853,177 @@ fn u19_disconnect_profile_idempotent_for_inactive_row() {
 }
 
 #[test]
-fn u19_shift_d_with_n_le_1_acts_like_plain_d() {
-    // With only one active tunnel, Shift+D should behave identically to
-    // `d` — no confirm dialog appears.
+fn sidebar_d_on_inactive_row_never_disconnects_another_tunnel() {
     let mut app = test_app();
-    add_profiles(&mut app, &["p1"]);
+    add_profiles(&mut app, &["active", "inactive"]);
+    set_connected(&mut app, "active");
+    app.profile_list_state.select(Some(1));
+    app.focused_panel = FocusedPanel::Sidebar;
+
+    app.handle_key(key_char('d'));
+
+    assert!(app.toast.is_none(), "inactive-row d must be a quiet no-op");
+    assert!(matches!(
+        app.registry
+            .snapshot(&crate::vortix_core::profile::ProfileId::new("active"))
+            .unwrap()
+            .state,
+        crate::vortix_core::engine::state::Connection::Connected { .. }
+    ));
+}
+
+#[test]
+fn focused_lifecycle_states_route_to_the_exact_sidebar_action() {
+    use crate::app::{focused_tunnel_action, FocusedTunnelAction};
+    use crate::vortix_core::control::ChallengeKind;
+    use crate::vortix_core::engine::state::{Connection, ConnectionHealth};
+    use crate::vortix_core::profile::ProfileId;
+    use std::time::{Duration, SystemTime};
+
+    let profile_id = ProfileId::new("focused");
+    let now = SystemTime::UNIX_EPOCH;
+    let transitional = [
+        Connection::Connecting {
+            profile_id: profile_id.clone(),
+            started_at: now,
+            attempt: 1,
+            retry_budget_remaining: Duration::ZERO,
+        },
+        Connection::Reconnecting {
+            profile_id: profile_id.clone(),
+            started_at: now,
+            attempt: 2,
+            retry_budget_remaining: Duration::ZERO,
+            last_error: None,
+        },
+        Connection::AwaitingUserInput {
+            profile_id: profile_id.clone(),
+            prompt_id: "prompt".to_string(),
+            prompt_kind: ChallengeKind::TwoFactorCode,
+            since: now,
+        },
+    ];
+    for state in &transitional {
+        assert_eq!(
+            focused_tunnel_action(Some(state)),
+            FocusedTunnelAction::Cancel
+        );
+    }
+
+    let connected = Connection::Connected {
+        profile_id: profile_id.clone(),
+        since: now,
+        health: ConnectionHealth::Healthy,
+        details: Box::default(),
+    };
+    assert_eq!(
+        focused_tunnel_action(Some(&connected)),
+        FocusedTunnelAction::Disconnect
+    );
+    let disconnecting = Connection::Disconnecting {
+        profile_id,
+        started_at: now,
+    };
+    assert_eq!(
+        focused_tunnel_action(Some(&disconnecting)),
+        FocusedTunnelAction::ForceDisconnect
+    );
+    assert_eq!(focused_tunnel_action(None), FocusedTunnelAction::Connect);
+}
+
+#[test]
+fn error_toast_expires_and_routine_info_does_not_replace_it_early() {
+    let mut app = test_app();
+    app.show_toast("Connection failed".to_string(), ToastType::Error);
+    app.show_toast("Background refresh complete".to_string(), ToastType::Info);
+
+    let toast = app.toast.as_ref().expect("error remains visible initially");
+    assert_eq!(toast.toast_type, ToastType::Error);
+    assert_eq!(toast.message, "Connection failed");
+
+    app.toast.as_mut().unwrap().expires = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_millis(1))
+        .unwrap();
+
+    app.handle_message(Message::Tick);
+    assert!(
+        app.toast.is_none(),
+        "error must expire without requiring Esc"
+    );
+
+    app.show_toast("Review the changed route".to_string(), ToastType::Warning);
+    assert_eq!(
+        app.toast.as_ref().unwrap().message,
+        "Review the changed route"
+    );
+
+    app.show_toast("Connected".to_string(), ToastType::Success);
+    assert_eq!(app.toast.as_ref().unwrap().message, "Connected");
+
+    app.show_toast("New failure".to_string(), ToastType::Error);
+    assert_eq!(app.toast.as_ref().unwrap().message, "New failure");
+}
+
+#[test]
+fn uppercase_d_remains_global_when_the_only_active_tunnel_is_not_focused() {
+    let mut app = test_app();
+    add_profiles(&mut app, &["p1", "inactive"]);
     set_connected(&mut app, "p1");
-    app.profile_list_state.select(Some(0));
+    app.profile_list_state.select(Some(1));
     app.focused_panel = FocusedPanel::Sidebar;
 
     app.handle_key(key_shift_char('D'));
 
     assert!(
         !matches!(app.input_mode, InputMode::ConfirmDisconnectAll { .. }),
-        "Shift+D with N≤1 must not open the confirm dialog, got {:?}",
+        "uppercase D with one tunnel must skip confirmation, got {:?}",
         app.input_mode
+    );
+    assert_eq!(
+        app.toast.as_ref().map(|toast| toast.message.as_str()),
+        Some(super::connection::CONTROL_STARTING_MESSAGE),
+        "the global disconnect path must run even when another row is focused"
+    );
+}
+
+#[test]
+fn overlay_escape_closes_the_overlay_before_dismissing_a_dashboard_toast() {
+    let mut app = test_app();
+    app.show_toast("Connection failed".to_string(), ToastType::Error);
+    app.input_mode = InputMode::Import {
+        path: String::new(),
+        cursor: 0,
+    };
+
+    app.handle_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Esc,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+
+    assert_eq!(app.input_mode, InputMode::Normal);
+    assert!(
+        app.toast.is_some(),
+        "closing an overlay must not eat the error"
     );
 }
 
 #[test]
 fn u19_request_disconnect_all_opens_confirm_when_multi() {
-    // When the active count exceeds 1, RequestDisconnectAll opens the
-    // ConfirmDisconnectAll overlay with the correct count.
     let mut app = test_app();
     add_profiles(&mut app, &["p1", "p2"]);
     set_connected(&mut app, "p1");
-    app.profile_list_state.select(Some(0));
-    app.focused_panel = FocusedPanel::Sidebar;
-    // Force-bump the active-tunnel count to 2 by inserting a synthetic
-    // active-state record at the runtime level. The cleanest path
-    // through the test surface is to short-circuit active_tunnel_count
-    // via the active_tunnel_ids helper — but the underlying registry
-    // requires an Engine. Instead, dispatch RequestDisconnectAll with a
-    // hand-built precondition: temporarily override active_tunnel_count
-    // by mutating connection_state to Disconnecting (legacy fallback
-    // returns 1) and then directly invoking the message after asserting
-    // the >1 branch via a separate state.
-    //
-    // For the unit-test surface we exercise the message-dispatcher
-    // directly: when the helper reports N>1 the overlay opens. We
-    // simulate this by populating the registry's view through the
-    // public API where possible — but the registry's connect() needs
-    // an Engine, so we instead assert on the deterministic behavior
-    // of RequestDisconnectAll given a stubbed count.
-    //
-    // Pragmatic shortcut: assert that the dispatch path on the
-    // overlay-opening side honors the count it sees.
-    app.input_mode = InputMode::Normal;
-    // Inject a fake active-tunnel set by inserting another live legacy
-    // state isn't possible (only one connection_state). So we lean on
-    // the directly-asserted dispatch: when active_tunnel_count() == 1
-    // (current state), RequestDisconnectAll routes to disconnect_all
-    // instead of opening the overlay.
-    let n = app.active_tunnel_count();
-    if n > 1 {
-        app.handle_message(Message::RequestDisconnectAll);
-        assert!(matches!(
-            app.input_mode,
-            InputMode::ConfirmDisconnectAll { .. }
-        ));
-    } else {
-        // With a single legacy active tunnel, the overlay must NOT
-        // open — this is the documented backwards-compatible path.
-        app.handle_message(Message::RequestDisconnectAll);
-        assert!(
-            !matches!(app.input_mode, InputMode::ConfirmDisconnectAll { .. }),
-            "RequestDisconnectAll with N≤1 must not open the confirm overlay"
-        );
-    }
+    set_connected(&mut app, "p2");
+    assert_eq!(app.active_tunnel_count(), 2);
+
+    app.handle_message(Message::RequestDisconnectAll);
+
+    assert!(matches!(
+        app.input_mode,
+        InputMode::ConfirmDisconnectAll {
+            count: 2,
+            confirm_selected: true
+        }
+    ));
 }
 #[test]
 fn u19_connection_details_follows_sidebar_selection() {
@@ -2548,16 +2651,27 @@ fn connect_selected_on_active_profile_enqueues_one_typed_reconnect() {
             .unwrap()
             .take_tui_admission_results();
         if let Some(result) = results.into_iter().next() {
+            let operation_id = match &result.completion {
+                crate::cli::control::TuiControlCompletion::Admission(Ok(operation_id)) => {
+                    operation_id.to_string()
+                }
+                _ => panic!("expected successful reconnect admission"),
+            };
             assert!(matches!(
-                result.completion,
-                crate::cli::control::TuiControlCompletion::Admission(Ok(_))
-            ));
-            assert!(matches!(
-                result.command,
+                &result.command,
                 Some(crate::vortix_core::control::UserCommand::Reconnect {
-                    profile_id: Some(ref profile_id)
+                    profile_id: Some(profile_id)
                 }) if profile_id == &profile.id
             ));
+            app.handle_control_admission_results(vec![result]);
+            let queued = crate::logger::get_logs()
+                .into_iter()
+                .filter(|entry| entry.message == "Reconnection queued for 'corp'")
+                .collect::<Vec<_>>();
+            assert!(!queued.is_empty(), "reconnect admission must be logged");
+            assert!(queued
+                .iter()
+                .all(|entry| !entry.message.contains(&operation_id)));
             break;
         }
         assert!(
@@ -2589,7 +2703,7 @@ fn canonical_directory_import_drains_more_than_tui_admission_capacity() {
         )
         .unwrap();
     }
-    std::fs::write(source_dir.join("invalid.conf"), "not a VPN profile\n").unwrap();
+    std::fs::write(source_dir.join("z-invalid.conf"), "not a VPN profile\n").unwrap();
 
     let control =
         crate::cli::control::LocalControlSession::start_profile_test(&config_dir, Vec::new())
@@ -2598,14 +2712,6 @@ fn canonical_directory_import_drains_more_than_tui_admission_capacity() {
     app.runtime.config_dir = config_dir;
     app.attach_control_session(control).unwrap();
 
-    for _ in 0..8 {
-        assert!(app
-            .issue_control_command(crate::vortix_core::control::UserCommand::SetKillSwitch {
-                mode: crate::state::KillSwitchMode::Off,
-            })
-            .is_some());
-    }
-
     app.import_profile_from_path(&source_dir.to_string_lossy());
     assert_eq!(
         app.pending_profile_imports.as_ref().map(|batch| (
@@ -2613,12 +2719,12 @@ fn canonical_directory_import_drains_more_than_tui_admission_capacity() {
             batch.queued,
             batch.failed
         )),
-        Some((PROFILE_COUNT + 1, 0, 0))
+        Some((2, 8, 0))
     );
 
-    // Nine valid profiles plus the invalid entry exceed the eight-slot TUI
-    // admission bound while keeping the fixture focused on backpressure. Give
-    // the real crash-safe mutation path its documented command-time budget.
+    // The first eight valid profiles fill the TUI admission bound. The ninth
+    // valid profile and trailing invalid file prove that draining results
+    // resumes the batch without an unrelated operation backlog in the fixture.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(35);
     while app.runtime.profiles.len() < PROFILE_COUNT && std::time::Instant::now() < deadline {
         app.process_external();
@@ -3448,9 +3554,10 @@ fn terminal_dns_policy_failure_is_shown_to_tui_user() {
 
     let mut app = test_app();
     let operation_id = OperationId::from_parts(AuthorityEpoch(1), 4_242);
-    app.track_control_operation(
+    app.track_control_operation_with_profile(
         operation_id.clone(),
         super::connection::PendingControlSubject::Connection,
+        None,
     );
     assert!(
         app.toast.is_none(),
@@ -3481,6 +3588,15 @@ fn terminal_dns_policy_failure_is_shown_to_tui_user() {
 
     app.apply_control_snapshot(snapshot);
 
+    let terminal_logs = crate::logger::get_logs()
+        .into_iter()
+        .filter(|entry| entry.message.contains("macOS primary DNS"))
+        .collect::<Vec<_>>();
+    assert!(!terminal_logs.is_empty(), "failure detail must be logged");
+    assert!(terminal_logs
+        .iter()
+        .all(|entry| !entry.message.contains(&operation_id.to_string())));
+
     let toast = app
         .toast
         .as_ref()
@@ -3509,6 +3625,120 @@ fn terminal_dns_policy_failure_is_shown_to_tui_user() {
 }
 
 #[test]
+fn competing_vpn_dns_route_has_actionable_tui_copy() {
+    use crate::vortix_core::control::{
+        AuthorityEpoch, ClientId, IdempotencyKey, OperationFailure, OperationId, OperationIntent,
+        OperationRecord, OperationResult, OperationStatus, PolicyDigest,
+    };
+
+    let mut app = test_app();
+    let operation_id = OperationId::from_parts(AuthorityEpoch(1), 4_243);
+    app.track_control_operation_with_profile(
+        operation_id.clone(),
+        super::connection::PendingControlSubject::Connection,
+        Some("AWS_VPN".to_string()),
+    );
+    let mut snapshot = app.control_snapshot.clone();
+    snapshot.operations.insert(
+        operation_id.clone(),
+        OperationRecord {
+            id: operation_id,
+            idempotency_key: IdempotencyKey::new("competing-vpn-dns-route"),
+            client_id: ClientId::from_parts(AuthorityEpoch(1), 1),
+            command_digest: PolicyDigest::default(),
+            authority_epoch: AuthorityEpoch(1),
+            desired_generation: 1,
+            admitted_at_millis: 1,
+            deadline_millis: 2,
+            intent: OperationIntent::default(),
+            status: OperationStatus::Failed,
+            result: Some(OperationResult::Failed(OperationFailure::DnsPolicyFailed)),
+            failure_detail: Some(
+                "DNS resolver 10.64.0.2 currently routes through utun100 instead of this VPN (utun4). Another VPN or network service may own that route."
+                    .to_string(),
+            ),
+        },
+    );
+
+    app.apply_control_snapshot(snapshot);
+
+    let toast = app.toast.as_ref().expect("DNS failure must be visible");
+    assert!(toast
+        .message
+        .contains("Another VPN or network service is routing this profile's DNS traffic"));
+    assert!(toast.message.contains("Disconnect it and try again"));
+    assert!(toast
+        .message
+        .contains("Event Log shows the conflicting interface"));
+    assert!(!toast.message.contains("utun100"));
+}
+
+#[test]
+fn successful_disconnect_all_replaces_superseded_connection_cancellation() {
+    use crate::vortix_core::control::{
+        AuthorityEpoch, ClientId, IdempotencyKey, OperationId, OperationIntent, OperationRecord,
+        OperationResult, OperationStatus, PolicyDigest,
+    };
+
+    let mut app = test_app();
+    let connection_id = OperationId::from_parts(AuthorityEpoch(1), 4_244);
+    let disconnect_all_id = OperationId::from_parts(AuthorityEpoch(1), 4_245);
+    app.track_control_operation_with_profile(
+        connection_id.clone(),
+        super::connection::PendingControlSubject::Connection,
+        Some("AWS_VPN".to_string()),
+    );
+    app.track_control_operation_with_profile(
+        disconnect_all_id.clone(),
+        super::connection::PendingControlSubject::DisconnectAll,
+        None,
+    );
+
+    let mut snapshot = app.control_snapshot.clone();
+    for (id, key, status, result) in [
+        (
+            connection_id,
+            "superseded-connect",
+            OperationStatus::Cancelled,
+            Some(OperationResult::Cancelled),
+        ),
+        (
+            disconnect_all_id,
+            "disconnect-all",
+            OperationStatus::Succeeded,
+            Some(OperationResult::ObservedConvergence),
+        ),
+    ] {
+        snapshot.operations.insert(
+            id.clone(),
+            OperationRecord {
+                id,
+                idempotency_key: IdempotencyKey::new(key),
+                client_id: ClientId::from_parts(AuthorityEpoch(1), 1),
+                command_digest: PolicyDigest::default(),
+                authority_epoch: AuthorityEpoch(1),
+                desired_generation: 1,
+                admitted_at_millis: 1,
+                deadline_millis: 2,
+                intent: OperationIntent::default(),
+                status,
+                result,
+                failure_detail: None,
+            },
+        );
+    }
+
+    app.apply_control_snapshot(snapshot);
+
+    let toast = app
+        .toast
+        .as_ref()
+        .expect("disconnect all success must be visible");
+    assert_eq!(toast.toast_type, ToastType::Success);
+    assert_eq!(toast.message, "All VPN connections disconnected");
+}
+
+#[test]
 fn terminal_late_route_conflict_opens_the_existing_confirmation_dialog() {
     use crate::vortix_core::control::{
         AuthorityEpoch, ClientId, IdempotencyKey, OperationFailure, OperationId, OperationIntent,
@@ -3522,9 +3752,10 @@ fn terminal_late_route_conflict_opens_the_existing_confirmation_dialog() {
     let existing = ProfileId::new("existing");
     let candidate = ProfileId::new("candidate");
     let operation_id = OperationId::from_parts(AuthorityEpoch(1), 47);
-    app.track_control_operation(
+    app.track_control_operation_with_profile(
         operation_id.clone(),
         super::connection::PendingControlSubject::Connection,
+        None,
     );
     let mut snapshot = app.control_snapshot.clone();
     snapshot.pending_route_conflicts.insert(
@@ -3584,9 +3815,10 @@ fn terminal_authentication_failure_is_shown_to_tui_user() {
 
     let mut app = test_app();
     let operation_id = OperationId::from_parts(AuthorityEpoch(1), 43);
-    app.track_control_operation(
+    app.track_control_operation_with_profile(
         operation_id.clone(),
         super::connection::PendingControlSubject::Connection,
+        None,
     );
     let mut snapshot = app.control_snapshot.clone();
     snapshot.operations.insert(
@@ -3631,9 +3863,10 @@ fn invalid_wireguard_name_is_shown_as_an_actionable_terminal_error() {
 
     let mut app = test_app();
     let operation_id = OperationId::from_parts(AuthorityEpoch(1), 44);
-    app.track_control_operation(
+    app.track_control_operation_with_profile(
         operation_id.clone(),
         super::connection::PendingControlSubject::Connection,
+        None,
     );
     let mut snapshot = app.control_snapshot.clone();
     snapshot.operations.insert(
@@ -3672,9 +3905,10 @@ fn terminal_wireguard_handshake_failure_explains_the_owned_retry() {
 
     let mut app = test_app();
     let operation_id = OperationId::from_parts(AuthorityEpoch(1), 45);
-    app.track_control_operation(
+    app.track_control_operation_with_profile(
         operation_id.clone(),
         super::connection::PendingControlSubject::Connection,
+        None,
     );
     let mut snapshot = app.control_snapshot.clone();
     snapshot.operations.insert(

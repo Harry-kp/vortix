@@ -22,9 +22,6 @@ use crate::constants;
 use crate::vortix_config::profile_store::{FsProfileStore, ProfileStore};
 use crate::vpn_runtime::VpnRuntime;
 
-/// Leaves the actor enough time to persist and publish a settled protocol
-/// result after the protocol gate and its configured teardown budget.
-const CONTROL_COMPLETION_GRACE_SECS: u64 = 5;
 fn lifecycle_progress_message(
     mode: OutputMode,
     action: &str,
@@ -59,15 +56,7 @@ fn connect_operation_timeout_secs(
     protocol: crate::state::Protocol,
     config: &AppConfig,
 ) -> u64 {
-    explicit.unwrap_or_else(|| {
-        let protocol_gate = match protocol {
-            crate::state::Protocol::WireGuard => config.wireguard_handshake_timeout_secs,
-            crate::state::Protocol::OpenVPN => config.connect_timeout,
-        };
-        protocol_gate
-            .saturating_add(config.disconnect_timeout)
-            .saturating_add(CONTROL_COMPLETION_GRACE_SECS)
-    })
+    explicit.unwrap_or_else(|| config.connect_operation_timeout_secs(protocol))
 }
 
 /// Prompt for a 2FA code on the controlling tty with masked echo (each
@@ -1341,16 +1330,17 @@ fn handle_down(
             profile_id: profile_id.clone(),
         }
     };
+    let timeout_secs = config.disconnect_operation_timeout_secs();
     show_lifecycle_progress(
         mode,
         "Disconnecting",
         profile_filter.unwrap_or("active VPNs"),
         None,
-        config.disconnect_timeout,
+        timeout_secs,
     );
     let result = control.run(
         command,
-        Duration::from_secs(config.disconnect_timeout),
+        Duration::from_secs(timeout_secs),
         local_idempotency_key("down", profile_id.as_ref()),
     );
     let outcome = result.unwrap_or_else(|error| local_control_error_or_exit(mode, "down", &error));
@@ -1531,13 +1521,20 @@ fn handle_reconnect(
             .unwrap_or_else(|(error, exit)| print_error_and_exit(mode, "reconnect", error, exit));
     }
     let challenge_profiles = engine.profiles.clone();
+    let timeout_secs = to_cycle
+        .iter()
+        .filter_map(|name| {
+            engine
+                .profiles
+                .iter()
+                .find(|profile| &profile.name == name)
+                .map(|profile| config.reconnect_operation_timeout_secs(profile.protocol))
+        })
+        .max()
+        .unwrap_or(crate::constants::DEFAULT_CONTROL_COMMAND_TIMEOUT_SECS);
     let result = control.run_with_challenges(
         command,
-        Duration::from_secs(
-            config
-                .connect_timeout
-                .saturating_add(config.disconnect_timeout),
-        ),
+        Duration::from_secs(timeout_secs),
         local_idempotency_key("reconnect", target_id.as_ref()),
         move |challenge| answer_openvpn_static_challenge(challenge, &challenge_profiles),
     );
@@ -3215,7 +3212,7 @@ fn handle_killswitch(
         let outcome = control
             .run(
                 crate::vortix_core::control::UserCommand::SetKillSwitch { mode: ks_mode },
-                Duration::from_secs(config.disconnect_timeout),
+                Duration::from_secs(config.disconnect_operation_timeout_secs()),
                 local_idempotency_key("killswitch", None),
             )
             .unwrap_or_else(|error| local_control_error_or_exit(output_mode, "killswitch", &error));
@@ -3656,7 +3653,7 @@ mod tests {
     }
 
     #[test]
-    fn default_connect_budget_covers_protocol_cleanup_and_control_settlement() {
+    fn default_connect_budget_covers_protocol_and_control_settlement() {
         let config = AppConfig {
             wireguard_handshake_timeout_secs: 20,
             connect_timeout: 30,
@@ -3666,11 +3663,11 @@ mod tests {
 
         assert_eq!(
             connect_operation_timeout_secs(None, crate::state::Protocol::WireGuard, &config),
-            37
+            22
         );
         assert_eq!(
             connect_operation_timeout_secs(None, crate::state::Protocol::OpenVPN, &config),
-            47
+            32
         );
     }
 

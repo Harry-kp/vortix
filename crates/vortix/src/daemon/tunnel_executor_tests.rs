@@ -707,6 +707,23 @@ fn stale_work_authority_is_rejected_before_any_helper_effect() {
     );
     assert_eq!(helper.connection_count(), 0);
     assert!(helper.operations().is_empty());
+
+    let future_helper = Arc::new(FakeHelper::new(FakeStartOutcome::Applied, true));
+    let future_executor = executor_for(future_helper.clone(), &profile);
+    let mut future = work(TunnelMutation::Disconnect);
+    future.resource_revision.generation = future.revision.generation + 1;
+    let error = future_executor
+        .execute(
+            &future,
+            &crate::vortix_core::ports::tunnel::TunnelCancellation::default(),
+        )
+        .unwrap_err();
+    assert_eq!(
+        future_executor.classify_failure(&error),
+        crate::vortix_core::control::worker::WorkFailure::EffectFailed
+    );
+    assert_eq!(future_helper.connection_count(), 0);
+    assert!(future_helper.operations().is_empty());
 }
 
 #[test]

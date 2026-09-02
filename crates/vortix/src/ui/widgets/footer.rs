@@ -1,6 +1,7 @@
 //! Footer widget with context-aware keybinding hints
 
-use crate::app::App;
+use crate::app::{focused_tunnel_action, App, FocusedTunnelAction};
+use crate::vortix_core::engine::registry::TunnelSnapshot;
 use crate::vortix_core::engine::state::Connection;
 use ratatui::{
     layout::Rect,
@@ -36,14 +37,19 @@ pub fn render_dashboard(frame: &mut Frame, app: &App, area: Rect) {
         crate::app::FocusedPanel::Security => "Security",
         crate::app::FocusedPanel::Logs => "Logs",
     };
+    let snapshots = app.registry.snapshot_all();
+    let focused_state = (app.focused_panel == crate::app::FocusedPanel::Sidebar)
+        .then(|| focused_profile_state(app, &snapshots))
+        .flatten();
 
     let mut context_hints = Vec::new();
 
     match &app.focused_panel {
         crate::app::FocusedPanel::Sidebar => {
+            let connection_action = focused_profile_action(focused_state);
             context_hints.extend_from_slice(&[
                 ("j/k", "Navigate"),
-                ("c", "Connect"),
+                ("c", connection_action),
                 ("v", "View Config"),
                 ("R", "Rename"),
                 ("i", "Import"),
@@ -71,11 +77,9 @@ pub fn render_dashboard(frame: &mut Frame, app: &App, area: Rect) {
     // Reconnecting / AwaitingUserInput (in-flight → Cancel) > Connected
     // (steady → Disconnect). When no tunnel is active but a prior session
     // exists, surface `r Reconnect`.
-    let active_state = app
-        .registry
-        .snapshot_all()
-        .into_iter()
-        .map(|s| s.state)
+    let active_state = snapshots
+        .iter()
+        .map(|snapshot| &snapshot.state)
         .filter(|st| !matches!(st, Connection::Disconnected { .. }))
         .min_by_key(|st| match st {
             Connection::Disconnecting { .. } => 0,
@@ -85,23 +89,12 @@ pub fn render_dashboard(frame: &mut Frame, app: &App, area: Rect) {
             Connection::Connected { .. } => 2,
             Connection::Disconnected { .. } => 3,
         });
-    let disconnect_hint = match active_state {
-        Some(Connection::Disconnecting { .. }) => ("d", "Force Kill"),
-        Some(
-            Connection::Connecting { .. }
-            | Connection::Reconnecting { .. }
-            | Connection::AwaitingUserInput { .. },
-        ) => ("d", "Cancel"),
-        Some(Connection::Connected { .. }) => ("d", "Disconnect"),
-        _ => {
-            if app.runtime.last_connected_profile.is_some() {
-                ("r", "Reconnect")
-            } else {
-                ("", "")
-            }
-        }
+    let disconnect_hint = if app.focused_panel == crate::app::FocusedPanel::Sidebar {
+        focused_disconnect_hint(focused_state)
+    } else {
+        global_disconnect_hint(active_state, app.runtime.last_connected_profile.is_some())
     };
-    if !disconnect_hint.0.is_empty() {
+    if let Some(disconnect_hint) = disconnect_hint {
         context_hints.push(disconnect_hint);
     }
 
@@ -119,6 +112,45 @@ pub fn render_dashboard(frame: &mut Frame, app: &App, area: Rect) {
         &critical_hints,
         Some(panel_name),
     );
+}
+
+/// Label the focused row's primary action without falling back to another
+/// active tunnel. This mirrors the sidebar `c` key's profile-scoped behavior.
+fn focused_profile_state<'a>(app: &App, snapshots: &'a [TunnelSnapshot]) -> Option<&'a Connection> {
+    let profile_id = app
+        .profile_list_state
+        .selected()
+        .and_then(|index| app.runtime.profiles.get(index))
+        .map(|profile| &profile.id)?;
+    snapshots
+        .iter()
+        .find(|snapshot| snapshot.profile_id == *profile_id)
+        .map(|snapshot| &snapshot.state)
+}
+
+fn focused_profile_action(state: Option<&Connection>) -> &'static str {
+    match focused_tunnel_action(state) {
+        FocusedTunnelAction::Connect => "Connect",
+        FocusedTunnelAction::Cancel => "Cancel",
+        FocusedTunnelAction::Disconnect => "Disconnect",
+        FocusedTunnelAction::ForceDisconnect => "Force Kill",
+    }
+}
+
+fn focused_disconnect_hint(state: Option<&Connection>) -> Option<(&'static str, &'static str)> {
+    match focused_tunnel_action(state) {
+        FocusedTunnelAction::ForceDisconnect => Some(("d", "Force Kill")),
+        FocusedTunnelAction::Cancel => Some(("d", "Cancel")),
+        FocusedTunnelAction::Disconnect => Some(("d", "Disconnect")),
+        FocusedTunnelAction::Connect => None,
+    }
+}
+
+fn global_disconnect_hint(
+    state: Option<&Connection>,
+    can_reconnect: bool,
+) -> Option<(&'static str, &'static str)> {
+    focused_disconnect_hint(state).or_else(|| can_reconnect.then_some(("r", "Reconnect")))
 }
 
 /// Terminal display width of a hint item: `key action` plus optional separator.
@@ -305,5 +337,49 @@ mod tests {
         assert_eq!(used, 9);
         // first: key+space+action (3), sep (1), second: key+space+action (3) = 7
         assert_eq!(spans.len(), 7);
+    }
+
+    #[test]
+    fn focused_footer_labels_match_profile_scoped_shortcuts() {
+        use crate::vortix_core::engine::state::{ConnectionHealth, DetailedConnectionInfo};
+        use crate::vortix_core::profile::ProfileId;
+        use std::time::{Duration, SystemTime};
+
+        let profile_id = ProfileId::new("focused");
+        let now = SystemTime::UNIX_EPOCH;
+        let connecting = Connection::Connecting {
+            profile_id: profile_id.clone(),
+            started_at: now,
+            attempt: 1,
+            retry_budget_remaining: Duration::ZERO,
+        };
+        let connected = Connection::Connected {
+            profile_id: profile_id.clone(),
+            since: now,
+            health: ConnectionHealth::Healthy,
+            details: Box::new(DetailedConnectionInfo::default()),
+        };
+        let disconnecting = Connection::Disconnecting {
+            profile_id,
+            started_at: now,
+        };
+
+        assert_eq!(focused_profile_action(None), "Connect");
+        assert_eq!(focused_disconnect_hint(None), None);
+        assert_eq!(focused_profile_action(Some(&connecting)), "Cancel");
+        assert_eq!(
+            focused_disconnect_hint(Some(&connecting)),
+            Some(("d", "Cancel"))
+        );
+        assert_eq!(focused_profile_action(Some(&connected)), "Disconnect");
+        assert_eq!(
+            focused_disconnect_hint(Some(&connected)),
+            Some(("d", "Disconnect"))
+        );
+        assert_eq!(focused_profile_action(Some(&disconnecting)), "Force Kill");
+        assert_eq!(
+            focused_disconnect_hint(Some(&disconnecting)),
+            Some(("d", "Force Kill"))
+        );
     }
 }
