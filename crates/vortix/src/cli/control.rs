@@ -48,6 +48,12 @@ const HOOK_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 const CLI_STARTUP_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(32);
 const TUI_ADMISSION_CAPACITY: usize = 8;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupSettlement {
+    Wait,
+    ContinueInBackground,
+}
+
 #[derive(Debug, Error)]
 pub enum LocalControlError {
     #[error("cannot construct the local control runtime: {0}")]
@@ -1947,6 +1953,33 @@ impl LocalControlSession {
         config_dir: &Path,
         profiles: Vec<VpnProfile>,
     ) -> Result<Self, LocalControlError> {
+        Self::start_with_settlement(config, config_dir, profiles, StartupSettlement::Wait)
+    }
+
+    /// Start the interactive authority without withholding the session while
+    /// recovered work settles. Admission and observation are ready at this
+    /// boundary, so the TUI can display and cancel exact in-flight work.
+    #[allow(clippy::too_many_lines)]
+    pub fn start_tui(
+        config: &crate::config::AppConfig,
+        config_dir: &Path,
+        profiles: Vec<VpnProfile>,
+    ) -> Result<Self, LocalControlError> {
+        Self::start_with_settlement(
+            config,
+            config_dir,
+            profiles,
+            StartupSettlement::ContinueInBackground,
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn start_with_settlement(
+        config: &crate::config::AppConfig,
+        config_dir: &Path,
+        profiles: Vec<VpnProfile>,
+        startup_settlement: StartupSettlement,
+    ) -> Result<Self, LocalControlError> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("vortix-local-control")
@@ -2223,7 +2256,10 @@ impl LocalControlSession {
                 .await
                 .map_err(|error| LocalControlError::Persistence(error.to_string()))
         })?;
-        session.wait_for_startup_settlement(startup_generation, CLI_STARTUP_SETTLEMENT_TIMEOUT)?;
+        if startup_settlement == StartupSettlement::Wait {
+            session
+                .wait_for_startup_settlement(startup_generation, CLI_STARTUP_SETTLEMENT_TIMEOUT)?;
+        }
         Ok(session)
     }
 
@@ -2407,9 +2443,8 @@ impl LocalControlSession {
     }
 
     /// Let durable work recovered by this short-lived authority settle before
-    /// a one-shot CLI command starts its own deadline. TUI startup invokes
-    /// this on its background control thread, so terminal rendering and input
-    /// remain responsive while recovery settles.
+    /// a one-shot CLI command starts its own deadline. Interactive TUI startup
+    /// deliberately skips this wait and renders the recovered state instead.
     fn wait_for_startup_settlement(
         &self,
         previous_generation: u64,

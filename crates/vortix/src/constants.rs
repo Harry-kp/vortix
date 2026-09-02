@@ -33,6 +33,8 @@ pub const DEFAULT_PING_TIMEOUT: u64 = 2;
 /// cert-only `OpenVPN` flows complete in 2-5s and are unaffected by
 /// the higher ceiling.
 pub const DEFAULT_CONNECT_TIMEOUT: u64 = 35;
+/// Default maximum seconds to wait for current-generation `WireGuard` evidence.
+pub const DEFAULT_WIREGUARD_HANDSHAKE_TIMEOUT: u64 = 20;
 /// Maximum seconds to wait for a local system command (`ps`, `lsof`, `ifconfig`, etc.)
 /// before killing it. This is a safety net against hung processes — it does NOT affect
 /// UI responsiveness because all scanner/netstats commands run in background threads.
@@ -42,6 +44,11 @@ pub const DEFAULT_CONNECT_TIMEOUT: u64 = 35;
 pub const CMD_TIMEOUT_SECS: u64 = 5;
 /// Default maximum seconds to wait for a VPN disconnect before force-killing.
 pub const DEFAULT_DISCONNECT_TIMEOUT: u64 = 30;
+/// Small actor/persistence allowance after a protocol or teardown gate.
+/// This is deliberately separate from the background retry budget.
+pub const CONTROL_COMPLETION_GRACE_SECS: u64 = 2;
+/// Bound for non-tunnel control requests such as profile mutations.
+pub const DEFAULT_CONTROL_COMMAND_TIMEOUT_SECS: u64 = 5;
 /// Default maximum connection retry attempts on failure (0 = disabled).
 pub const DEFAULT_CONNECT_MAX_RETRIES: u32 = 3;
 /// Default base delay (seconds) for exponential backoff: delay = base * 2^(attempt-1).

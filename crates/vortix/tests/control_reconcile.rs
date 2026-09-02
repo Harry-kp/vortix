@@ -618,6 +618,13 @@ fn worker_rejects_resource_revision_drift_before_effect_dispatch() {
         pool.dispatch(foreign_disconnect, Vec::new()).unwrap_err(),
         WorkFailure::Stale
     );
+
+    let mut future_disconnect = work(profile("future-drift"), 3, 3, TunnelMutation::Disconnect);
+    future_disconnect.resource_revision = tunnel_revision(4);
+    assert_eq!(
+        pool.dispatch(future_disconnect, Vec::new()).unwrap_err(),
+        WorkFailure::EffectFailed
+    );
 }
 
 #[test]
@@ -744,6 +751,61 @@ fn stale_tunnel_generation_never_converges() {
     assert!(
         matches!(plan.actions.as_slice(), [ReconcileAction::CleanupStaleManaged { stale_revision: Some(found), .. }] if found == &stale)
     );
+}
+
+#[test]
+fn new_profile_connect_keeps_stale_profile_cleanup_resource_scoped() {
+    let stale_profile = profile("stale-a");
+    let new_profile = profile("new-b");
+    let stale_resource = tunnel_revision(4);
+    let stale_target = tunnel_revision(5);
+    let new_target = tunnel_revision(6);
+    let plan = plan_reconciliation(&ReconcileInput {
+        revision: revision(6, "new-profile-connect"),
+        tunnel_revisions: BTreeMap::from([
+            (stale_profile.clone(), stale_target),
+            (new_profile.clone(), new_target),
+        ]),
+        desired_connected: BTreeSet::from([new_profile.clone()]),
+        observations: BTreeMap::from([
+            (
+                stale_profile.clone(),
+                observation(
+                    ScanEvidence::ConfirmedPresent,
+                    ObservationOwnership::Managed,
+                    Some(stale_resource),
+                ),
+            ),
+            (
+                new_profile.clone(),
+                observation(
+                    ScanEvidence::ConfirmedAbsent,
+                    ObservationOwnership::Managed,
+                    Some(new_target),
+                ),
+            ),
+        ]),
+        in_flight: BTreeMap::new(),
+        disconnect_tombstones: BTreeMap::new(),
+    });
+
+    assert!(plan.actions.iter().any(|action| matches!(
+        action,
+        ReconcileAction::CleanupStaleManaged {
+            profile_id,
+            stale_revision: Some(resource),
+            target_revision,
+        } if profile_id == &stale_profile
+            && resource == &stale_resource
+            && target_revision == &stale_target
+    )));
+    assert!(plan.actions.iter().any(|action| matches!(
+        action,
+        ReconcileAction::Connect {
+            profile_id,
+            revision,
+        } if profile_id == &new_profile && revision == &new_target
+    )));
 }
 
 #[test]
@@ -4049,7 +4111,7 @@ async fn definitive_interactive_connect_failure_releases_ownership_and_rolls_bac
 }
 
 #[tokio::test]
-async fn interactive_operation_expiry_rolls_back_without_service_recovery() {
+async fn interactive_operation_expiry_rolls_back_with_cleanup_only_recovery() {
     struct WaitingExecutor;
     impl TunnelExecutor for WaitingExecutor {
         fn execute(
@@ -4112,9 +4174,18 @@ async fn interactive_operation_expiry_rolls_back_without_service_recovery() {
             snapshot.operations[&admitted.operation_id].status == OperationStatus::Expired
                 && snapshot.desired.tunnels.get(&target)
                     == Some(&RequestedTunnelState::Disconnected)
-                && snapshot.operations.len() == 1
+                && snapshot.operations.values().any(|operation| {
+                    operation.id != admitted.operation_id
+                        && operation.desired_generation == snapshot.desired.generation
+                        && matches!(
+                            &operation.intent,
+                            OperationIntent::DesiredSubset { tunnels, .. }
+                                if tunnels.get(&target)
+                                    == Some(&RequestedTunnelState::Disconnected)
+                        )
+                })
         },
-        "interactive expiry retained connected intent or started recovery",
+        "interactive expiry did not retain a bounded cleanup-only recovery",
     )
     .await;
 }
@@ -4652,9 +4723,9 @@ async fn policy_waits_for_attested_tunnel_and_carries_complete_topology() {
 }
 
 #[tokio::test]
-async fn expired_client_operation_leaves_queryable_record_and_starts_recovery() {
+async fn expired_client_connect_rolls_back_with_cleanup_only_recovery() {
     let clock = Arc::new(TestClock::default());
-    let target = profile("recovery");
+    let target = profile("expired-connect");
     let service = ControlService::start_supervised(
         ControlServiceConfig {
             authority_epoch: AuthorityEpoch(1),
@@ -4677,7 +4748,7 @@ async fn expired_client_operation_leaves_queryable_record_and_starts_recovery() 
         .client()
         .submit(CommandRequest {
             command: UserCommand::Connect {
-                profile_id: target,
+                profile_id: target.clone(),
                 conflict_acknowledgement: None,
             },
             idempotency_key: IdempotencyKey::new("expires"),
@@ -4694,11 +4765,21 @@ async fn expired_client_operation_leaves_queryable_record_and_starts_recovery() 
         snapshot.operations[&admitted.operation_id].status,
         vortix::vortix_core::control::OperationStatus::Expired
     );
-    assert!(snapshot.operations.values().any(|operation| {
-        operation.id != admitted.operation_id
-            && operation.desired_generation == snapshot.desired.generation
-            && !operation.status.is_terminal()
-    }));
+    assert_eq!(
+        snapshot.desired.tunnels.get(&target),
+        Some(&RequestedTunnelState::Disconnected)
+    );
+    let recovery = snapshot
+        .operations
+        .values()
+        .find(|operation| operation.id != admitted.operation_id)
+        .expect("timeout rollback must authorize cleanup of any residual effect");
+    assert_eq!(recovery.desired_generation, snapshot.desired.generation);
+    assert!(matches!(
+        &recovery.intent,
+        OperationIntent::DesiredSubset { tunnels, .. }
+            if tunnels.get(&target) == Some(&RequestedTunnelState::Disconnected)
+    ));
 }
 
 #[tokio::test]

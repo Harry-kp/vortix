@@ -432,7 +432,7 @@ fn run_tui(
     std::thread::Builder::new()
         .name("vortix-control-startup".into())
         .spawn(move || {
-            let result = vortix::cli::control::LocalControlSession::start(
+            let result = vortix::cli::control::LocalControlSession::start_tui(
                 &control_config,
                 &control_dir,
                 control_profiles,

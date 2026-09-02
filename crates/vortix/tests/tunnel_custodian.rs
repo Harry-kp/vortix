@@ -471,20 +471,17 @@ fn real_tunnel_scoped_custodians_handoff_authenticate_and_contain_groups() {
             "unexpected recovery error: {mismatch}"
         );
         scanner_pid.store(recovered_child_pid, Ordering::Relaxed);
-        assert!(executor
-            .restore_standard_profile(
-                &supervisor,
-                &recovered_identity.profile_id,
-                revision,
-                operation.clone(),
-            )
-            .unwrap());
+        let cleanup_operation: vortix::vortix_core::control::OperationId =
+            serde_json::from_str("\"op-0000000000000001-0000000000000002\"").unwrap();
         TunnelExecutor::execute(
             executor.as_ref(),
             &TunnelWork {
                 profile_id: recovered_identity.profile_id.clone(),
-                operation_id: operation,
-                revision,
+                operation_id: cleanup_operation,
+                revision: TunnelRevision {
+                    authority_epoch: AuthorityEpoch(1),
+                    generation: revision.generation + 1,
+                },
                 resource_revision: revision,
                 mutation: TunnelMutation::Disconnect,
                 protocol: TunnelKindTag::OpenVpn,

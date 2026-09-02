@@ -453,7 +453,8 @@ impl App {
         &mut self,
         command: crate::vortix_core::control::UserCommand,
     ) -> Option<()> {
-        let (wait, idempotency_key) = self.next_control_request();
+        let wait = self.control_command_timeout(&command);
+        let idempotency_key = self.next_control_request_key();
         let result = self
             .control_session
             .as_ref()
@@ -471,28 +472,80 @@ impl App {
         &mut self,
         path: &std::path::Path,
     ) -> Result<String, crate::cli::control::LocalControlError> {
-        let (wait, idempotency_key) = self.next_control_request();
+        let wait =
+            std::time::Duration::from_secs(crate::constants::DEFAULT_CONTROL_COMMAND_TIMEOUT_SECS);
+        let idempotency_key = self.next_control_request_key();
         self.control_session
             .as_ref()
             .expect("control import requires an attached session")
             .enqueue_tui_profile_import(path, wait, idempotency_key)
     }
 
-    fn next_control_request(&mut self) -> (std::time::Duration, String) {
+    fn next_control_request_key(&mut self) -> String {
         self.control_request_sequence = self.control_request_sequence.saturating_add(1);
-        let idempotency_key = format!(
+        format!(
             "tui-{}-{}",
             std::process::id(),
             self.control_request_sequence
-        );
-        let wait = std::time::Duration::from_secs(
+        )
+    }
+
+    fn control_command_timeout(
+        &self,
+        command: &crate::vortix_core::control::UserCommand,
+    ) -> std::time::Duration {
+        use crate::vortix_core::control::UserCommand;
+
+        let protocol = |profile_id: &crate::vortix_core::profile::ProfileId| {
             self.runtime
-                .config
-                .connect_timeout
-                .max(crate::vortix_core::engine::state::DEFAULT_RETRY_BUDGET_SECS)
-                .max(30),
-        );
-        (wait, idempotency_key)
+                .profiles
+                .iter()
+                .find(|profile| &profile.id == profile_id)
+                .map(|profile| profile.protocol)
+        };
+        let seconds = match command {
+            UserCommand::Connect { profile_id, .. }
+            | UserCommand::ConnectExclusive { profile_id } => protocol(profile_id).map_or_else(
+                || {
+                    self.runtime
+                        .config
+                        .connect_operation_timeout_secs(crate::state::Protocol::OpenVPN)
+                },
+                |p| self.runtime.config.connect_operation_timeout_secs(p),
+            ),
+            UserCommand::Reconnect {
+                profile_id: Some(profile_id),
+            } => protocol(profile_id).map_or_else(
+                || {
+                    self.runtime
+                        .config
+                        .reconnect_operation_timeout_secs(crate::state::Protocol::OpenVPN)
+                },
+                |p| self.runtime.config.reconnect_operation_timeout_secs(p),
+            ),
+            UserCommand::Reconnect { profile_id: None } => self
+                .runtime
+                .profiles
+                .iter()
+                .map(|profile| {
+                    self.runtime
+                        .config
+                        .reconnect_operation_timeout_secs(profile.protocol)
+                })
+                .max()
+                .unwrap_or(crate::constants::DEFAULT_CONTROL_COMMAND_TIMEOUT_SECS),
+            UserCommand::Disconnect { .. }
+            | UserCommand::ForceDisconnect { .. }
+            | UserCommand::SetKillSwitch { .. } => {
+                self.runtime.config.disconnect_operation_timeout_secs()
+            }
+            UserCommand::ImportProfile { .. }
+            | UserCommand::RenameProfile { .. }
+            | UserCommand::DeleteProfile { .. } => {
+                crate::constants::DEFAULT_CONTROL_COMMAND_TIMEOUT_SECS
+            }
+        };
+        std::time::Duration::from_secs(seconds)
     }
 
     fn report_control_enqueue<T>(
@@ -1363,6 +1416,35 @@ mod u7_conflict_tests {
     //! `InputMode` overlay. The registry's `detect_conflict` itself is
     //! tested in `vortix_core::engine::registry`.
     use super::Protocol;
+
+    #[test]
+    fn tui_connect_uses_protocol_deadline_not_background_retry_budget() {
+        let mut app = super::App::new_test();
+        app.runtime.config.connect_timeout = 35;
+        app.runtime.config.wireguard_handshake_timeout_secs = 20;
+        app.runtime.profiles.push(crate::state::VpnProfile {
+            id: crate::vortix_core::profile::ProfileId::new("openvpn"),
+            name: "openvpn".into(),
+            protocol: Protocol::OpenVPN,
+            location: String::new(),
+            config_path: "/tmp/openvpn.ovpn".into(),
+            last_used: None,
+        });
+
+        let timeout =
+            app.control_command_timeout(&crate::vortix_core::control::UserCommand::Connect {
+                profile_id: crate::vortix_core::profile::ProfileId::new("openvpn"),
+                conflict_acknowledgement: None,
+            });
+
+        assert_eq!(timeout, std::time::Duration::from_secs(37));
+        assert!(
+            timeout
+                < std::time::Duration::from_secs(
+                    crate::vortix_core::engine::state::DEFAULT_RETRY_BUDGET_SECS
+                )
+        );
+    }
     use crate::vortix_core::cidr::claims_default_route_v4;
     use std::io::Write;
 

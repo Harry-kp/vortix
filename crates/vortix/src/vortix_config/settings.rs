@@ -98,8 +98,8 @@ impl Default for EngineSettings {
             retry_budget_secs: 300,
             retry_initial_backoff_ms: 2_000,
             openvpn_verbosity: "3".to_string(),
-            connect_timeout_secs: 30,
-            wireguard_handshake_timeout_secs: 20,
+            connect_timeout_secs: crate::constants::DEFAULT_CONNECT_TIMEOUT,
+            wireguard_handshake_timeout_secs: crate::constants::DEFAULT_WIREGUARD_HANDSHAKE_TIMEOUT,
             wireguard_handshake_stale_secs: 180,
             wireguard_health_targets: vec![
                 "1.1.1.1".to_string(),
@@ -341,6 +341,7 @@ mod tests {
         let s = Settings::load_from(None, None).unwrap();
         assert_eq!(s.engine.retry_budget_secs, 300);
         assert_eq!(s.engine.retry_initial_backoff_ms, 2_000);
+        assert_eq!(s.engine.connect_timeout_secs, 35);
         assert_eq!(s.engine.wireguard_handshake_timeout_secs, 20);
         assert_eq!(s.engine.wireguard_handshake_stale_secs, 180);
         assert!(!s.engine.wireguard_health_targets.is_empty());

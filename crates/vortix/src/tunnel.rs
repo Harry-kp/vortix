@@ -61,6 +61,7 @@ impl TunnelKind {
     pub fn with_execution_context(self, context: TunnelExecutionContext) -> Self {
         match self {
             Self::WireGuard(tunnel) => Self::WireGuard(tunnel.with_execution_context(context)),
+            Self::OpenVpn(tunnel) => Self::OpenVpn(tunnel.with_execution_context(context)),
             other => other,
         }
     }
@@ -704,6 +705,15 @@ impl CanonicalTunnelExecutor {
             };
             recovered
         };
+        if handle.generation != work.resource_revision.generation || handle.kind != work.protocol {
+            self.active
+                .lock()
+                .map_err(|_| "canonical active-tunnel ledger poisoned".to_string())?
+                .insert(work.profile_id.clone(), (tunnel, handle));
+            return Err(
+                "owned tunnel generation or protocol does not match cleanup authority".into(),
+            );
+        }
         match tunnel.down(handle.clone()) {
             Ok(()) => {
                 if handle.kind == TunnelKindTag::WireGuard {
@@ -874,15 +884,24 @@ impl CanonicalTunnelExecutor {
         })?;
         let protocol_pid = owner.protocol_pid;
         let custody = owner.custody;
-        if custody.identity.generation != work.revision.generation {
+        let expected_generation = match work.mutation {
+            crate::vortix_core::control::worker::TunnelMutation::Connect => {
+                work.revision.generation
+            }
+            crate::vortix_core::control::worker::TunnelMutation::Disconnect => {
+                work.resource_revision.generation
+            }
+        };
+        if custody.identity.generation != expected_generation {
             return Err(
-                "OpenVPN custodian generation does not match durable control intent".into(),
+                "OpenVPN custodian generation does not match the owned tunnel resource".into(),
             );
         }
-        if custody
-            .operation_id
-            .as_ref()
-            .is_some_and(|operation| operation != &work.operation_id)
+        if work.mutation == crate::vortix_core::control::worker::TunnelMutation::Connect
+            && custody
+                .operation_id
+                .as_ref()
+                .is_some_and(|operation| operation != &work.operation_id)
         {
             return Err("OpenVPN custodian operation does not match durable control intent".into());
         }
@@ -1360,6 +1379,42 @@ mod canonical_tests {
             *lifecycle_changes.lock().unwrap(),
             vec![(ProfileId::new("corp"), false)],
             "the exact teardown must invalidate scanner state before policy verification"
+        );
+    }
+
+    #[test]
+    fn disconnect_never_tears_down_a_different_in_memory_generation() {
+        let executor = CanonicalTunnelExecutor::new(
+            CanonicalTunnelSettings {
+                config_dir: std::env::temp_dir(),
+                openvpn_verbosity: "3".into(),
+                connect_timeout_secs: 1,
+                wireguard_handshake_timeout_secs: 1,
+                wireguard_health_targets: Vec::new(),
+            },
+            |_| None,
+        );
+        let profile_id = ProfileId::new("corp");
+        executor.active.lock().unwrap().insert(
+            profile_id.clone(),
+            (TunnelKind::Mock(MockTunnel::new()), handle(7)),
+        );
+        let mut disconnect = work(8);
+        disconnect.mutation = TunnelMutation::Disconnect;
+        disconnect.resource_revision.generation = 6;
+
+        let error = executor.execute_disconnect(&disconnect).unwrap_err();
+
+        assert!(error.contains("owned tunnel generation"));
+        assert_eq!(
+            executor
+                .active
+                .lock()
+                .unwrap()
+                .get(&profile_id)
+                .map(|(_, handle)| handle.generation),
+            Some(7),
+            "a mismatched cleanup capability must leave the live owner intact"
         );
     }
 
