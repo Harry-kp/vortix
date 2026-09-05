@@ -230,9 +230,48 @@ fn main() -> Result<()> {
                 }
             }
             Err(e) => {
-                return Err(color_eyre::eyre::eyre!(
-                    "profile identity migration refused startup: {e}. Restore the managed profile directory to its saved inventory before managing tunnels; add new profiles from outside that directory with `vortix import <path>`"
-                ));
+                // Returning an eyre error here printed a source location and
+                // backtrace hints at the user, and gave one blanket
+                // "restore the inventory" instruction for every cause. A
+                // permission failure is a different problem with a different
+                // fix, and `--json` callers got an empty stdout instead of an
+                // envelope.
+                let mode = if args.json {
+                    cli::output::OutputMode::Json
+                } else if args.quiet {
+                    cli::output::OutputMode::Quiet
+                } else {
+                    cli::output::OutputMode::Human
+                };
+                let (err, exit) = if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    (
+                        cli::output::CliError {
+                            code: "profiles_not_readable",
+                            message: format!(
+                                "Vortix cannot read its own profile directory: {}",
+                                profiles_dir.display()
+                            ),
+                            hint: Some(format!(
+                                "Some files there are owned by another user. Run: sudo chown -R $(id -u):$(id -g) {}",
+                                profiles_dir.display()
+                            )),
+                        },
+                        cli::output::ExitCode::PermissionDenied,
+                    )
+                } else {
+                    (
+                        cli::output::CliError {
+                            code: "profile_migration_refused",
+                            message: format!("Vortix could not prepare the profile directory: {e}"),
+                            hint: Some(
+                                "Restore the managed profile directory to its saved inventory, then add new profiles from outside it with `vortix import <path>`."
+                                    .to_string(),
+                            ),
+                        },
+                        cli::output::ExitCode::GeneralError,
+                    )
+                };
+                cli::output::print_error_and_exit(mode, "startup", err, exit);
             }
         }
     }

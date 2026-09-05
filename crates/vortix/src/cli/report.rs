@@ -65,6 +65,21 @@ pub fn run(config_dir: &Path, config_source: &str) {
     let body = format_issue_body(&info, &description);
 
     // 5. Prompt for action
+    //
+    // Without a terminal there is nobody to answer this menu. A piped or
+    // scripted run otherwise blocks forever on the read, and once stdin
+    // reaches EOF the empty choice falls to the invalid-choice arm and spins.
+    // Printing the report is the only useful non-interactive outcome, and it
+    // is exactly what `[p]` does.
+    if !atty_is_terminal() {
+        println!("\n{body}");
+        println!(
+            "Open a new issue at: {}/issues/new?labels=bug\n",
+            constants::GITHUB_REPO_URL
+        );
+        return;
+    }
+
     let is_ssh = std::env::var("SSH_TTY").is_ok() || std::env::var("SSH_CLIENT").is_ok();
     loop {
         if is_ssh {

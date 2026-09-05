@@ -544,7 +544,7 @@ fn handle_audit(pid_filter: Option<u32>, vpn_only: bool, mode: OutputMode) -> i3
                     code: "platform_unsupported",
                     message: "Socket audit is not available on this platform yet".to_string(),
                     hint: Some(
-                        "Linux + macOS are supported in v0.3.0; Windows support is on the roadmap"
+                        "Linux and macOS are supported; Windows support is on the roadmap"
                             .to_string(),
                     ),
                 },
@@ -582,10 +582,24 @@ fn handle_audit(pid_filter: Option<u32>, vpn_only: bool, mode: OutputMode) -> i3
         OutputMode::Human => {
             println!("PID    COMMAND          PROTO   LOCAL                            REMOTE                           IFACE");
             for s in &snapshots {
+                // An unresolved owner came out as a bare `0`, which reads as
+                // the kernel rather than "not known" — and stays 0 for many
+                // sockets even under sudo. `-` matches the IFACE column's
+                // existing convention for the same situation.
+                let pid = if s.pid == 0 {
+                    "-".to_string()
+                } else {
+                    s.pid.to_string()
+                };
+                let command = if s.command.is_empty() {
+                    "-"
+                } else {
+                    s.command.as_str()
+                };
                 println!(
                     "{:<6} {:<16} {:<7} {:<32} {:<32} {}",
-                    s.pid,
-                    s.command,
+                    pid,
+                    command,
                     s.protocol,
                     s.local,
                     s.remote.map_or_else(|| "*".to_string(), |r| r.to_string()),

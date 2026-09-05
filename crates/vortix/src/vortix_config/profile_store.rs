@@ -62,7 +62,10 @@ pub(crate) fn acquire_profile_lock(
         use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
-    let file = options.open(path)?;
+    let file = options.open(&path)?;
+    // Same reason as `write_atomic`: a lock created under `sudo` must not
+    // lock out the unprivileged CLI that runs next.
+    crate::config::fix_ownership(&path);
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd as _;
@@ -1174,6 +1177,12 @@ pub(crate) fn write_atomic(path: &Path, body: &[u8]) -> std::io::Result<()> {
     file.write_all(body)?;
     file.sync_all()?;
     std::fs::rename(&temporary, path)?;
+    // The TUI requires root, so these 0600 files are born root-owned under
+    // `sudo vortix` and every later unprivileged CLI call then fails to read
+    // them. Hand them to the invoking user, same contract as the config dir.
+    // No-op when not root, and when invoked as direct root there is no user
+    // to hand them to.
+    crate::config::fix_ownership(path);
     sync_dir(parent)
 }
 

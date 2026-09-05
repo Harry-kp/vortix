@@ -1379,8 +1379,15 @@ fn invalid_data(error: impl std::fmt::Display) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
 }
 
-fn store_error(error: impl std::fmt::Display) -> std::io::Error {
-    invalid_data(error)
+/// Convert a store error without discarding the underlying I/O kind.
+///
+/// Flattening everything to `InvalidData` cost callers the ability to tell a
+/// permission failure from corrupt data, and those need opposite advice.
+fn store_error(error: crate::vortix_config::profile_store::ProfileStoreError) -> std::io::Error {
+    match error {
+        crate::vortix_config::profile_store::ProfileStoreError::Io(io) => io,
+        other => invalid_data(other),
+    }
 }
 
 #[cfg(test)]
@@ -1965,5 +1972,32 @@ mod tests {
         assert!(migrate_legacy_profiles(tmp.path()).is_err());
         assert!(!outside.exists());
         assert!(!tmp.path().join("corp.meta.toml").exists());
+    }
+}
+
+#[cfg(test)]
+mod ownership_and_error_kind_tests {
+    use super::*;
+
+    /// A permission failure must stay a permission failure.
+    ///
+    /// Flattening it to `InvalidData` made startup tell the user to restore
+    /// an inventory when the real problem was that `sudo vortix` had left
+    /// root-owned files the unprivileged CLI could not read.
+    #[test]
+    fn store_error_preserves_the_underlying_io_kind() {
+        let denied = crate::vortix_config::profile_store::ProfileStoreError::Io(
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
+        );
+        assert_eq!(
+            store_error(denied).kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "callers classify on this kind to choose the right advice"
+        );
+
+        let not_found = crate::vortix_config::profile_store::ProfileStoreError::Io(
+            std::io::Error::new(std::io::ErrorKind::NotFound, "missing"),
+        );
+        assert_eq!(store_error(not_found).kind(), std::io::ErrorKind::NotFound);
     }
 }
