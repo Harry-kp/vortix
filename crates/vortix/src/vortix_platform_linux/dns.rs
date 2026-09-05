@@ -540,6 +540,20 @@ impl<R: DnsCommandRunner> LinuxDnsPolicyEngine<R> {
             .get(interface)
             .cloned()
             .ok_or_else(|| format!("resolved DNS on {interface} is not owned by this process"))?;
+
+        // A disconnect tears the link down before DNS is released, so by this
+        // point the interface is usually already gone and `resolvectl` fails
+        // with `Failed to resolve interface "tun0": No such device`. That was
+        // surfaced as "Disconnect could not finish safely", which is the
+        // opposite of the truth: systemd-resolved drops per-link
+        // configuration with the link, so the release is already complete and
+        // there is nothing left that could leak. Ownership is cleared to match
+        // the world. A link that still exists is verified as before.
+        if !interface_exists(interface) {
+            self.ownership.resolved.remove(interface);
+            return Ok(());
+        }
+
         let current = read_resolved_state(&mut self.runner, interface)?;
         if current != owned.applied {
             return Err(format!(
@@ -593,6 +607,11 @@ impl<R: DnsCommandRunner> LinuxDnsPolicyEngine<R> {
                 .resolved
                 .get(interface)
                 .map_or(&owned.prior, |previous| &previous.applied);
+            if !interface_exists(interface) {
+                // Nothing to restore on a link that is gone: resolved drops
+                // per-link configuration when the link disappears.
+                continue;
+            }
             if let Err(error) = write_resolved_state(&mut self.runner, interface, target)
                 .and_then(|()| verify_resolved_state(&mut self.runner, interface, target))
             {
@@ -603,6 +622,11 @@ impl<R: DnsCommandRunner> LinuxDnsPolicyEngine<R> {
             if current_resolved.contains_key(interface)
                 || !self.mutated_resolved.contains(interface)
             {
+                continue;
+            }
+            if !interface_exists(interface) {
+                // Nothing to restore on a link that is gone: resolved drops
+                // per-link configuration when the link disappears.
                 continue;
             }
             if let Err(error) = write_resolved_state(&mut self.runner, interface, &previous.applied)
@@ -1688,4 +1712,20 @@ mod tests {
         }
         assert_eq!(result, Some("1.1.1.1".to_string()));
     }
+}
+
+/// Whether a network interface still exists on this host.
+///
+/// `if_nametoindex` is POSIX, so this holds on every distribution and inside
+/// containers or namespaces where `/sys` may be absent or restricted. Matching
+/// `resolvectl`'s error text would have been neither stable nor portable.
+fn interface_exists(interface: &str) -> bool {
+    let Ok(name) = std::ffi::CString::new(interface) else {
+        return false;
+    };
+    // SAFETY: `name` is a valid NUL-terminated C string that outlives the
+    // call. `if_nametoindex` only reads it and returns 0 for an unknown link.
+    #[allow(unsafe_code)]
+    let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
+    index != 0
 }
