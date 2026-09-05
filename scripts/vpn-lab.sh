@@ -217,7 +217,7 @@ verify_profile_matrix() {
 
 download_profiles() {
   local ipv4="$1" output="$2" archive expected actual
-  archive=$(mktemp "${TMPDIR:-/tmp}/vortix-vpn-lab.XXXXXX.tar.gz")
+  archive=$(mktemp "${TMPDIR:-/tmp}/vortix-vpn-lab-archive.XXXXXX")
   trap 'rm -f "${archive:-}"' RETURN
   install -d -m 700 "$output"
   [[ -z "$(find "$output" -mindepth 1 -maxdepth 1 -print -quit)" ]] ||
@@ -684,13 +684,13 @@ command_up() {
   key_id=$(ssh_key_id)
   resolve_ssh_key_file
   name="vortix-vpn-lab-$(date -u +%Y%m%d-%H%M%S)"
-  user_data=$(mktemp "${TMPDIR:-/tmp}/vortix-vpn-lab.XXXXXX.user-data")
+  user_data=$(mktemp "${TMPDIR:-/tmp}/vortix-vpn-lab-userdata.XXXXXX")
   render_user_data >"$user_data"
   chmod 600 "$user_data"
 
   cleanup_failed_up() {
     local failed_ids attempt
-    rm -f "$user_data"
+    rm -f "${user_data:-}"
     if [[ "$keep_failed" -eq 0 && "${VPN_LAB_KEEP_ON_FAILURE:-0}" != 1 ]]; then
       failed_ids="${id:-}"
       if [[ -z "$failed_ids" ]]; then
@@ -830,7 +830,7 @@ command_self_test() {
   (($# == 0)) || die "Usage: $0 self-test"
   require_cmd bash
   local rendered profile bytes
-  rendered=$(mktemp "${TMPDIR:-/tmp}/vortix-vpn-lab.XXXXXX.user-data")
+  rendered=$(mktemp "${TMPDIR:-/tmp}/vortix-vpn-lab-userdata.XXXXXX")
   trap 'rm -f "$rendered"' RETURN
   render_user_data >"$rendered"
   bash -n "$rendered"
