@@ -214,6 +214,41 @@ pub(crate) struct PendingControlOperation {
     recovery_retry: bool,
 }
 
+/// One tracked operation that has reached terminal truth, paired with the
+/// snapshot facts its notification needs.
+struct TerminalOperation {
+    operation_id: crate::vortix_core::control::OperationId,
+    subject: PendingControlSubject,
+    profile_name: Option<String>,
+    recovery_retry: bool,
+    status: crate::vortix_core::control::OperationStatus,
+    result: Option<crate::vortix_core::control::OperationResult>,
+    failure_detail: Option<String>,
+    owned_retry: Option<crate::vortix_core::control::OperationId>,
+    late_route_conflict: Option<(ProfileId, Conflict)>,
+    connect_profile: Option<crate::vortix_core::profile::ProfileId>,
+}
+
+/// The profile a connect operation targets, when it names exactly one.
+///
+/// Read from the operation's own intent rather than threaded through every
+/// caller, so a terminal result can act on the right credential entry.
+fn operation_connect_profile(
+    operation: &crate::vortix_core::control::OperationRecord,
+) -> Option<crate::vortix_core::profile::ProfileId> {
+    use crate::vortix_core::control::{OperationIntent, RequestedTunnelState};
+    let (OperationIntent::DesiredSubset { tunnels, .. }
+    | OperationIntent::UnexpectedRecovery { tunnels, .. }) = &operation.intent
+    else {
+        return None;
+    };
+    let mut connecting = tunnels
+        .iter()
+        .filter(|(_, state)| **state == RequestedTunnelState::Connected);
+    let (profile_id, _) = connecting.next()?;
+    connecting.next().is_none().then(|| profile_id.clone())
+}
+
 pub(crate) struct CatalogFeedback {
     applied_count: usize,
     first_applied_name: Option<String>,
@@ -892,16 +927,149 @@ impl App {
         true
     }
 
-    fn report_terminal_control_operations(
+    /// Commit or discard held credentials once the server has judged them.
+    ///
+    /// A rejected pair must also evict whatever is already stored: a profile
+    /// with stored credentials raises no challenge, so leaving them behind
+    /// means the next connect reuses them and the prompt never reopens. That
+    /// covers both a fresh wrong entry and a password changed server-side.
+    fn settle_credentials(
         &mut self,
-        snapshot: &crate::vortix_core::control::ControlSnapshot,
+        subject: PendingControlSubject,
+        status: crate::vortix_core::control::OperationStatus,
+        result: Option<crate::vortix_core::control::OperationResult>,
+        connect_profile: Option<&crate::vortix_core::profile::ProfileId>,
     ) {
-        let disconnect_all_in_flight = self
-            .pending_control_operations
-            .values()
-            .any(|pending| matches!(pending.subject, PendingControlSubject::DisconnectAll));
-        let completed = self
-            .pending_control_operations
+        use crate::vortix_core::control::{OperationFailure, OperationResult, OperationStatus};
+
+        if !matches!(
+            subject,
+            PendingControlSubject::Connection | PendingControlSubject::Reconnection
+        ) {
+            return;
+        }
+
+        let rejected = matches!(
+            result,
+            Some(OperationResult::Failed(
+                OperationFailure::AuthenticationFailed
+            ))
+        );
+
+        if rejected {
+            let Some(profile_id) = connect_profile else {
+                self.pending_credential_save = None;
+                return;
+            };
+            let profile_name = self
+                .pending_credential_save
+                .take()
+                .filter(|pending| &pending.profile_id == profile_id)
+                .map_or_else(
+                    || {
+                        self.runtime
+                            .profiles
+                            .iter()
+                            .find(|profile| &profile.id == profile_id)
+                            .map_or_else(|| profile_id.to_string(), |profile| profile.name.clone())
+                    },
+                    |pending| pending.profile_name,
+                );
+            self.forget_rejected_credentials(profile_id, &profile_name);
+            return;
+        }
+
+        if status != OperationStatus::Succeeded {
+            // Timeouts and cancellations say nothing about the password, so
+            // the held pair survives for the retry rather than being dropped.
+            return;
+        }
+
+        let Some(pending) = self
+            .pending_credential_save
+            .take_if(|pending| connect_profile == Some(&pending.profile_id))
+        else {
+            return;
+        };
+        let Some(control) = self.control_session.as_ref() else {
+            return;
+        };
+        match control.remember_openvpn_credentials(
+            &pending.profile_id,
+            pending.username.expose(),
+            pending.password.expose(),
+        ) {
+            Ok(()) => self.log(&format!(
+                "AUTH: Remembered credentials for '{}'",
+                pending.profile_name
+            )),
+            Err(crate::cli::control::LocalControlError::CredentialDurabilityUncertain) => {
+                self.log(&format!(
+                    "WARN: OpenVPN credentials for '{}' are visible but disk durability is uncertain",
+                    pending.profile_name
+                ));
+                self.show_toast(
+                    "Connected, but saving your credentials couldn't be confirmed. You may be asked again after a restart."
+                        .to_string(),
+                    ToastType::Warning,
+                );
+            }
+            Err(error) => {
+                self.log(&format!(
+                    "WARN: OpenVPN credentials were accepted but not remembered: {error}"
+                ));
+                self.show_toast(
+                    "Connected, but your credentials weren't saved. You'll be asked again next time."
+                        .to_string(),
+                    ToastType::Warning,
+                );
+            }
+        }
+    }
+
+    /// Evict credentials the server just rejected so the next attempt prompts.
+    fn forget_rejected_credentials(
+        &mut self,
+        profile_id: &crate::vortix_core::profile::ProfileId,
+        profile_name: &str,
+    ) {
+        use crate::cli::control::CredentialClearOutcome;
+
+        let Some(control) = self.control_session.as_ref() else {
+            return;
+        };
+        match control.clear_openvpn_credentials(profile_id, profile_name) {
+            // Nothing stored: the prompt already reopens on its own.
+            Ok(CredentialClearOutcome::NotFound) => {}
+            Ok(CredentialClearOutcome::Cleared) => {
+                self.log(&format!(
+                    "AUTH: Discarded rejected credentials for '{profile_name}'"
+                ));
+                self.show_toast(
+                    format!("Saved credentials for '{profile_name}' were rejected and removed. You'll be asked for them on the next connect."),
+                    ToastType::Warning,
+                );
+            }
+            Err(error) => {
+                self.log(&format!(
+                    "ERR: Rejected credentials for '{profile_name}' could not be removed: {error}"
+                ));
+                self.show_toast(
+                    format!("Saved credentials for '{profile_name}' were rejected but couldn't be removed. Clear them with 'A' before retrying."),
+                    ToastType::Error,
+                );
+            }
+        }
+    }
+
+    /// Pair each tracked operation that has reached terminal truth with the
+    /// snapshot facts its notification needs. Collected before the reporting
+    /// loop so the loop is free to mutate `self`.
+    fn collect_terminal_operations(
+        &self,
+        snapshot: &crate::vortix_core::control::ControlSnapshot,
+    ) -> Vec<TerminalOperation> {
+        self.pending_control_operations
             .iter()
             .filter_map(|(operation_id, pending)| {
                 snapshot
@@ -919,22 +1087,35 @@ impl App {
                                     && candidate.client_id.sequence() == Some(0)
                             })
                             .map(|candidate| candidate.id.clone());
-                        (
-                            operation_id.clone(),
-                            pending.subject,
-                            pending.profile_name.clone(),
-                            pending.recovery_retry,
-                            operation.status,
-                            operation.result,
-                            operation.failure_detail.clone(),
+                        TerminalOperation {
+                            operation_id: operation_id.clone(),
+                            subject: pending.subject,
+                            profile_name: pending.profile_name.clone(),
+                            recovery_retry: pending.recovery_retry,
+                            status: operation.status,
+                            result: operation.result,
+                            failure_detail: operation.failure_detail.clone(),
                             owned_retry,
-                            late_route_conflict_for_operation(snapshot, operation),
-                        )
+                            late_route_conflict: late_route_conflict_for_operation(
+                                snapshot, operation,
+                            ),
+                            connect_profile: operation_connect_profile(operation),
+                        }
                     })
             })
-            .collect::<Vec<_>>();
+            .collect()
+    }
 
-        for (
+    fn report_terminal_control_operations(
+        &mut self,
+        snapshot: &crate::vortix_core::control::ControlSnapshot,
+    ) {
+        let disconnect_all_in_flight = self
+            .pending_control_operations
+            .values()
+            .any(|pending| matches!(pending.subject, PendingControlSubject::DisconnectAll));
+
+        for TerminalOperation {
             operation_id,
             subject,
             profile_name,
@@ -944,9 +1125,11 @@ impl App {
             failure_detail,
             owned_retry,
             late_route_conflict,
-        ) in completed
+            connect_profile,
+        } in self.collect_terminal_operations(snapshot)
         {
             self.pending_control_operations.remove(&operation_id);
+            self.settle_credentials(subject, status, result, connect_profile.as_ref());
             if self.present_late_route_conflict(subject, status, result, late_route_conflict) {
                 continue;
             }
