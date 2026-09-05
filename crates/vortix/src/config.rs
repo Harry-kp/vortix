@@ -213,6 +213,19 @@ pub fn resolve_config_dir(cli_override: Option<&PathBuf>) -> std::io::Result<Pat
         // Track which ancestors already exist so we only chown dirs we create.
         let first_existing_ancestor = path.ancestors().find(|a| a.exists());
         std::fs::create_dir_all(&path)?;
+        // `create_dir_all` applies the caller's umask. Ubuntu defaults to 002,
+        // which yields a group-writable 0775 — and Vortix's own durable-state
+        // checks reject any group- or world-writable directory, so a first run
+        // as a normal user made every profile import fail with "persisted
+        // control state is not a private owner-controlled file". macOS never
+        // showed it: umask 022 happens to produce an acceptable 0755. The
+        // directory holds credentials and control state, so 0700 is what it
+        // should have been regardless of the inherited umask.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+        }
         // When running under sudo the directory is created as root.
         // Chown newly-created dirs (e.g. ~/.config and ~/.config/vortix)
         // to the real user so normal-user sessions can read/write.
@@ -1267,5 +1280,35 @@ ip_api_fallbacks = ["https://fallback1.example.com"]
 
         // Source should be gone
         assert!(!old.join("profiles").join("vpn.conf").exists());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod private_config_dir_tests {
+    /// The config directory must be 0700 no matter what the umask allows.
+    ///
+    /// `create_dir_all` applies the caller's umask, so Ubuntu's default 002
+    /// produced a group-writable 0775 that Vortix's own durable-state checks
+    /// then rejected — every import failed on a fresh unprivileged first run
+    /// with "persisted control state is not a private owner-controlled file".
+    /// macOS hid it: 022 happens to yield an acceptable 0755.
+    ///
+    /// This deliberately does not set the umask: that is process-global and
+    /// would race the rest of this binary's tests. It does not need to — any
+    /// ordinary umask leaves `create_dir_all` short of 0700, so dropping the
+    /// explicit `set_permissions` fails this assertion regardless.
+    #[test]
+    fn config_dir_is_created_private_regardless_of_umask() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("nested").join("vortix");
+        let resolved = super::resolve_config_dir(Some(&target)).expect("config dir resolves");
+
+        let mode = std::fs::metadata(&resolved).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "a group- or world-accessible config dir is refused by the durable-state checks"
+        );
     }
 }
