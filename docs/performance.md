@@ -175,3 +175,35 @@ branch against `main` at `268b821`.
 | `vortix-helper` | 1,015,440 B | 769,904 B | -24.2% |
 | `vortix-bootstrap` | 452,848 B | 369,744 B | -18.4% |
 | shipped total | 11,912,144 B | 7,178,832 B | **-39.7%** |
+
+## Keeping the win
+
+Every number above comes from profile settings, which is what makes them fragile: restoring
+`opt-level = 3`, or letting `dist init` put `lto = "thin"` back into `[profile.dist]`, costs
+megabytes and fails no test. Nothing in the suite reads a file size.
+
+`Integration / macos-release` closes that. It builds `--release` on `macos-latest` and runs
+`tests/integration/release_smoke.sh`, which enforces a **7,000,000 B ceiling on `vortix`** —
+about 16% of headroom over the 6,039,184 B measured above. A profile regression blows through
+it immediately; ordinary feature growth has room.
+
+The job runs on macOS because that was the gap. `cargo test` builds dev, and every netns suite
+is Linux-only, so before this job no CI anywhere executed a macOS release binary: a profile
+that miscompiled or failed to link there would have surfaced first at tag time, mid-release.
+The budget is calibrated for `aarch64-apple-darwin`, which is what `macos-latest` runs — a
+different target has a different figure, which is why the check is opt-in via
+`VORTIX_SIZE_BUDGET_BYTES` rather than hardcoded.
+
+The script also pins the contracts that a size-driven profile change could plausibly break
+without failing a unit test: all three binaries reporting the same version, `--json` keeping
+stdout free of diagnostics, kill-switch verb parsing rejecting aliases, and an unprivileged
+launch exiting 2 with an actionable message instead of hanging.
+
+When the budget trips, decide — don't reflexively raise the number. Confirm the growth is
+real work rather than a reverted profile knob, then move the ceiling in the same commit that
+justifies it.
+
+```sh
+cargo build --release -p vortix --locked
+VORTIX_SIZE_BUDGET_BYTES=7000000 bash tests/integration/release_smoke.sh
+```
