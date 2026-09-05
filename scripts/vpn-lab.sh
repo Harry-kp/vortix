@@ -405,7 +405,13 @@ case "${common_name:-}" in
   *) exit 1 ;;
 esac
 EOF
-chmod 700 /etc/openvpn/vortix-auth.sh
+# `user nobody` above means the server has already dropped privileges by the
+# time it runs this. Mode 700 root:root made every auth-user-pass profile
+# unauthenticatable — exec failed with EACCES and OpenVPN reported that as
+# AUTH_FAILED, indistinguishable from a wrong password. Group-execute for
+# nogroup, still unreadable to everyone else.
+chown root:nogroup /etc/openvpn/vortix-auth.sh
+chmod 750 /etc/openvpn/vortix-auth.sh
 
 cat >/etc/openvpn/ccd-udp/ovpn-udp-full <<'EOF'
 push "redirect-gateway def1 bypass-dhcp"
