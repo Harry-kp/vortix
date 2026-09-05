@@ -178,6 +178,12 @@ pub struct App {
     /// connect reused the bad pair and never reopened the prompt.
     pub(crate) pending_credential_save: Option<PendingCredentialSave>,
 
+    /// Last control-service failure already surfaced, so a persistent one is
+    /// reported on transition instead of on every poll. A missing
+    /// `wireguard-tools` produced roughly two identical error toasts per
+    /// second, which buried the startup warning that named the fix.
+    pub(crate) last_control_error: Option<String>,
+
     /// Stable identity retained when the canonical projection becomes empty,
     /// so reconnect means "the last tunnel I used" rather than "all".
     pub(crate) last_control_connected_profile: Option<crate::vortix_core::profile::ProfileId>,
@@ -289,6 +295,7 @@ impl App {
             control_snapshot: crate::vortix_core::control::ControlSnapshot::default(),
             control_challenge: None,
             pending_credential_save: None,
+            last_control_error: None,
             last_control_connected_profile: None,
             pending_control_killswitch_mode: None,
             pending_control_operations: std::collections::BTreeMap::new(),
@@ -363,6 +370,22 @@ impl App {
         self.handle_message(Message::Tick);
     }
 
+    /// Surface a control-service failure once per transition.
+    ///
+    /// The service is polled continuously, so a persistent fault used to
+    /// raise an identical toast on every poll — a missing `wireguard-tools`
+    /// produced roughly two per second, which buried the single startup
+    /// warning that actually named the fix. Reporting only on change keeps
+    /// that warning readable and still shows every distinct failure.
+    pub(crate) fn report_control_failure(&mut self, error: &str) {
+        let message = format!("Control service unavailable: {error}");
+        if self.last_control_error.as_deref() == Some(message.as_str()) {
+            return;
+        }
+        self.last_control_error = Some(message.clone());
+        self.handle_message(Message::Toast(message, ToastType::Error));
+    }
+
     /// Process all pending external events (telemetry and background commands).
     pub fn process_external(&mut self) {
         let control_update = self.control_session.as_ref().map(|control| {
@@ -381,15 +404,13 @@ impl App {
                 if let Some(catalog) = catalog {
                     self.apply_local_catalog_update(catalog);
                 }
+                self.last_control_error = None;
                 self.pump_pending_profile_imports();
                 if let Some(snapshot) = snapshot {
                     self.handle_message(Message::ControlSnapshot(Box::new(snapshot)));
                 }
             }
-            Some(Err(error)) => self.handle_message(Message::Toast(
-                format!("Control service unavailable: {error}"),
-                ToastType::Error,
-            )),
+            Some(Err(error)) => self.report_control_failure(&error.to_string()),
             None => {}
         }
         self.process_telemetry();
@@ -477,6 +498,7 @@ impl App {
             control_snapshot: crate::vortix_core::control::ControlSnapshot::default(),
             control_challenge: None,
             pending_credential_save: None,
+            last_control_error: None,
             last_control_connected_profile: None,
             pending_control_killswitch_mode: None,
             pending_control_operations: std::collections::BTreeMap::new(),

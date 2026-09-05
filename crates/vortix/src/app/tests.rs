@@ -30,6 +30,7 @@ fn test_app() -> App {
         control_snapshot: crate::vortix_core::control::ControlSnapshot::default(),
         control_challenge: None,
         pending_credential_save: None,
+        last_control_error: None,
         last_control_connected_profile: None,
         pending_control_killswitch_mode: None,
         pending_control_operations: std::collections::BTreeMap::new(),
