@@ -13,9 +13,6 @@
 //! a process-spawn integration layer; deferred to a follow-up unit.
 //!
 
-#[path = "support/control_scenarios.rs"]
-mod control_scenarios;
-
 use serde::Serialize;
 use vortix::cli::output::{CliResponse, ConnectionEntry, SCHEMA_VERSION};
 
@@ -198,7 +195,7 @@ fn json_v2_envelope_optional_fields_skip_when_none() {
 
 #[test]
 fn every_shared_json_scenario_uses_the_v2_envelope() {
-    use control_scenarios::{OutputSurface, CONTROL_SCENARIOS};
+    use crate::control_scenarios::{OutputSurface, CONTROL_SCENARIOS};
 
     for scenario in CONTROL_SCENARIOS.iter().filter(|scenario| {
         matches!(

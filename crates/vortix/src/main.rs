@@ -508,9 +508,6 @@ fn run_tui(
     Ok(())
 }
 
-/// Initialise tracing-subscriber with an env-filter layer.
-///
-/// Silent by default; `RUST_LOG=vortix::process=info` enables the structured
 /// Dispatch a single event into the App. Extracted from the main loop
 /// so the loop body can call it once for the blocking-`next()` event
 /// and N more times for each event that's queued up behind it (the
@@ -531,18 +528,47 @@ fn dispatch_event(app: &mut App, event: Event) {
     }
 }
 
+/// Initialise tracing-subscriber with a `RUST_LOG` target filter.
+///
+/// Silent by default; `RUST_LOG=vortix::process=info` enables the structured
 /// subprocess events emitted by `RealRunner`. The TUI uses stderr for log
 /// output since stdout drives the alternate-screen terminal.
 fn init_tracing() {
-    use tracing_subscriber::EnvFilter;
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("off"));
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+
+    let filter = log_filter(std::env::var("RUST_LOG").ok().as_deref());
     // Best-effort init: ignore the error from double-init in tests.
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .with_target(true)
-        .compact()
+    let _ = tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_target(true)
+                .compact(),
+        )
+        .with(filter)
         .try_init();
+}
+
+/// Build the `RUST_LOG` target filter, enabling nothing when it says nothing.
+///
+/// Empty segments are dropped first. `Targets` parses an empty directive as a
+/// global ERROR level, so `RUST_LOG=` or a trailing comma would otherwise paint
+/// error lines over the alternate screen — the opposite of "silent by default".
+fn log_filter(directives: Option<&str>) -> tracing_subscriber::filter::Targets {
+    use tracing_subscriber::filter::Targets;
+
+    let cleaned = directives
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join(",");
+    if cleaned.is_empty() {
+        return Targets::new();
+    }
+    cleaned.parse().unwrap_or_else(|_| Targets::new())
 }
 
 fn init_terminal() -> Result<ratatui::DefaultTerminal> {
@@ -556,4 +582,58 @@ fn init_terminal() -> Result<ratatui::DefaultTerminal> {
 fn restore_terminal() {
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
     ratatui::restore();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::log_filter;
+    use tracing::Level;
+
+    #[test]
+    fn a_silent_rust_log_stays_silent() {
+        for value in [
+            None,
+            Some(""),
+            Some(","),
+            Some("   "),
+            Some(",,"),
+            Some("  ,  "),
+        ] {
+            let filter = log_filter(value);
+            assert!(
+                !filter.would_enable("vortix::vortix_process", &Level::ERROR),
+                "RUST_LOG={value:?} must not enable anything, not even ERROR"
+            );
+            assert_eq!(filter.default_level(), None, "RUST_LOG={value:?}");
+        }
+    }
+
+    #[test]
+    fn a_trailing_comma_does_not_widen_the_filter() {
+        let filter = log_filter(Some("vortix::vortix_process=info,"));
+        assert!(filter.would_enable("vortix::vortix_process", &Level::INFO));
+        assert!(!filter.would_enable("some::other::crate", &Level::ERROR));
+    }
+
+    #[test]
+    fn target_and_level_directives_still_apply() {
+        let filter = log_filter(Some("vortix=warn,mio=trace"));
+        assert!(filter.would_enable("vortix::config", &Level::WARN));
+        assert!(!filter.would_enable("vortix::config", &Level::INFO));
+        assert!(filter.would_enable("mio::poll", &Level::TRACE));
+        assert!(!filter.would_enable("unrelated", &Level::ERROR));
+    }
+
+    #[test]
+    fn a_bare_level_applies_to_every_target() {
+        let filter = log_filter(Some("info"));
+        assert!(filter.would_enable("anything::at::all", &Level::INFO));
+        assert!(!filter.would_enable("anything::at::all", &Level::DEBUG));
+    }
+
+    #[test]
+    fn an_unparseable_rust_log_enables_nothing() {
+        let filter = log_filter(Some("not a valid filter!!!"));
+        assert!(!filter.would_enable("vortix", &Level::ERROR));
+    }
 }

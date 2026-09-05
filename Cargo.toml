@@ -13,7 +13,13 @@ authors = ["Harry KP <harrykp@users.noreply.github.com>"]
 
 [workspace.dependencies]
 # TUI Framework
-ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
+# Defaults off: `all-widgets` (Calendar) and `macros` are unused here.
+ratatui = { version = "0.30", default-features = false, features = [
+    "crossterm",
+    "layout-cache",
+    "underline-color",
+    "unstable-rendered-line-info",
+] }
 crossterm = "0.29"
 
 # Date/time formatting (local-offset needed for OffsetDateTime::now_local)
@@ -22,10 +28,11 @@ crossterm = "0.29"
 # anyone without `--locked`. Drop the cap once upstream releases a
 # clean 0.3.49+ — until then, pinning here keeps the canonical install
 # command working for end users on crates.io.
-time = { version = ">=0.3, <0.3.56", features = ["local-offset", "formatting", "macros"] }
+time = { version = ">=0.3, <0.3.56", features = ["local-offset", "formatting"] }
 
 # Error Handling
-color-eyre = "0.6"
+# `capture-spantrace` renders nothing without a `tracing_error::ErrorLayer`, and we install none.
+color-eyre = { version = "0.6", default-features = false, features = ["track-caller"] }
 thiserror = "2"
 
 # CLI Argument Parsing
@@ -45,7 +52,8 @@ figment = { version = "0.10", features = ["toml", "env"] }
 # Async runtime + tracing (CommandRunner per docs/plans/2026-05-24-002)
 tokio = { version = "1", features = ["rt-multi-thread", "process", "time", "macros", "sync", "io-util", "fs", "signal"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# `filter::Targets` reads the same `target=level` RUST_LOG syntax without env-filter's regex engine.
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
 # Unicode display-width (for footer hint budgeting with multi-byte glyphs)
 unicode-width = "0.2"
 
@@ -63,13 +71,27 @@ unsafe_code = "warn"
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 
+# Dev/test builds: our own crates keep file+line for panics; dependencies carry
+# no debuginfo at all. Nearly all of the link time and target/ bulk was theirs.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+# `opt-level = "z"` saves ~42% of the binary and measured as runtime-neutral:
+# vortix has no sustained compute (1 s tick, subprocess VPN data plane). See
+# docs/performance.md. `panic = "abort"` is deliberately NOT set — tunnel, hook
+# and control-worker panic isolation all run through `catch_unwind`.
 [profile.release]
 lto = true
 codegen-units = 1
 strip = true
-opt-level = 3
+opt-level = "z"
 
-# The profile that 'dist' will build with
+# The profile that 'dist' will build with. It no longer overrides `lto = "thin"`,
+# so shipped artifacts get fat LTO — smaller downloads, slower tag builds across
+# the six triples in dist-workspace.toml. `dist init` will try to put the thin
+# override back; reject that. See docs/performance.md.
 [profile.dist]
 inherits = "release"
-lto = "thin"

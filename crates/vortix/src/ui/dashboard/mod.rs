@@ -251,6 +251,7 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
             focused_field,
             save_credentials,
             connect_after,
+            reveal_secrets,
             static_challenge_prompt,
             ..
         } => super::overlays::auth::render(
@@ -266,6 +267,7 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
             *save_credentials,
             *connect_after,
             static_challenge_prompt.as_deref(),
+            *reveal_secrets,
         ),
         InputMode::Rename {
             new_name, cursor, ..

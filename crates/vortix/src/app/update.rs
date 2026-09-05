@@ -632,6 +632,7 @@ impl App {
                         save_credentials: true,
                         connect_after: false,
                         static_challenge_prompt: None,
+                        reveal_secrets: false,
                     };
                 }
             }
@@ -837,36 +838,15 @@ impl App {
             .iter()
             .find(|profile| profile.id == profile_id)
             .map_or_else(|| profile_id.to_string(), |profile| profile.name.clone());
-        let remember = self
-            .control_session
-            .as_ref()
-            .expect("service challenge requires attached control session")
-            .remember_openvpn_credentials(&profile_id, username.expose(), password.expose());
-        match remember {
-            Ok(()) => self.log(&format!(
-                "AUTH: Remembered credentials for '{profile_name}'"
-            )),
-            Err(crate::cli::control::LocalControlError::CredentialDurabilityUncertain) => {
-                self.log(&format!(
-                    "WARN: OpenVPN credentials for '{profile_name}' are visible but disk durability is uncertain"
-                ));
-                self.show_toast(
-                    "Credentials were submitted and updated, but disk confirmation failed. This connection can continue."
-                        .to_string(),
-                    ToastType::Warning,
-                );
-            }
-            Err(error) => {
-                self.log(&format!(
-                    "WARN: OpenVPN credentials were submitted but not remembered: {error}"
-                ));
-                self.show_toast(
-                    "Credentials were submitted, but they weren't saved. This connection can continue; you'll be asked again next time."
-                        .to_string(),
-                    ToastType::Warning,
-                );
-            }
-        }
+        // Held, not written. The server has not judged this pair yet, and a
+        // profile with stored credentials raises no challenge — persisting a
+        // rejected password here is what silently suppressed the next prompt.
+        self.pending_credential_save = Some(super::PendingCredentialSave {
+            profile_id,
+            profile_name,
+            username,
+            password,
+        });
     }
 
     fn handle_toggle_killswitch(&mut self) {

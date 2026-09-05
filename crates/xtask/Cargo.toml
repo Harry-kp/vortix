@@ -10,9 +10,5 @@ publish = false
 name = "xtask"
 path = "src/main.rs"
 
-[dependencies]
-clap = { workspace = true }
-ignore = "0.4"
-
 [lints]
 workspace = true

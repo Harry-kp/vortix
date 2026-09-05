@@ -10,6 +10,10 @@ inputs:
     description: 'Comma-separated rust-toolchain components (e.g. "clippy" or "rustfmt"). Empty string installs no extras.'
     required: false
     default: ''
+  cache:
+    description: 'Set to "false" for jobs that never compile (rustfmt), so they skip the cargo cache round trip.'
+    required: false
+    default: 'true'
 
 runs:
   using: composite
@@ -19,3 +23,4 @@ runs:
         toolchain: ${{ inputs.toolchain }}
         components: ${{ inputs.components }}
     - uses: Swatinem/rust-cache@v2
+      if: inputs.cache != 'false'

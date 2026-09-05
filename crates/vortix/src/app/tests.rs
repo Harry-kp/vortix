@@ -29,6 +29,7 @@ fn test_app() -> App {
         control_starting: false,
         control_snapshot: crate::vortix_core::control::ControlSnapshot::default(),
         control_challenge: None,
+        pending_credential_save: None,
         last_control_connected_profile: None,
         pending_control_killswitch_mode: None,
         pending_control_operations: std::collections::BTreeMap::new(),
@@ -582,6 +583,7 @@ fn test_auth_field_otp_appears_in_tab_cycle_for_static_challenge_profile() {
         save_credentials: true,
         connect_after: true,
         static_challenge_prompt: Some("Enter code".to_string()),
+        reveal_secrets: false,
     };
 
     // Username -> Password -> Otp -> SaveCheckbox -> Username
@@ -619,6 +621,7 @@ fn test_auth_field_switching() {
         save_credentials: true,
         connect_after: true,
         static_challenge_prompt: None,
+        reveal_secrets: false,
     };
 
     // Tab from Username -> Password
@@ -2887,6 +2890,7 @@ fn blank_challenge_input_keeps_overlay_and_challenge_for_retry() {
         save_credentials: false,
         connect_after: true,
         static_challenge_prompt: Some("OTP".to_string()),
+        reveal_secrets: false,
     };
 
     app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -2958,6 +2962,7 @@ fn failed_challenge_response_keeps_prompt_for_retry() {
         save_credentials: false,
         connect_after: true,
         static_challenge_prompt: Some("OTP".to_string()),
+        reveal_secrets: false,
     };
 
     app.handle_message(Message::AuthSubmit {
@@ -3012,6 +3017,7 @@ fn auth_manager_uses_stable_profile_identity_through_control_session() {
             password,
             connect_after: false,
             static_challenge_prompt: None,
+            reveal_secrets: false,
             ..
         } if prompt_profile_id == &profile_id
             && username.expose() == "old-user"
@@ -3168,9 +3174,17 @@ fn challenge_answer_continues_when_remembering_is_unavailable() {
 
     assert!(app.control_challenge.is_none());
     assert!(matches!(app.input_mode, InputMode::Normal));
-    assert!(app.toast.as_ref().is_some_and(|toast| {
-        toast.message.contains("connection can continue") && !toast.message.contains("Internal")
-    }));
+    // Storing is now deferred to the server's verdict, so submitting cannot
+    // fail on the credential store and the answer is never blocked by it. The
+    // pair waits in memory until the connection succeeds.
+    assert!(app
+        .pending_credential_save
+        .as_ref()
+        .is_some_and(|pending| pending.username.expose() == "alice"));
+    assert!(app
+        .toast
+        .as_ref()
+        .is_none_or(|toast| !toast.message.contains("Internal")));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
     while transport.answered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
         assert!(std::time::Instant::now() < deadline);
@@ -4187,4 +4201,239 @@ fn background_status_continue_is_read_only() {
 
     assert_eq!(app.input_mode, InputMode::Normal);
     assert!(app.toast.is_none());
+}
+
+/// Build a terminal connect operation targeting one profile.
+fn terminal_connect_operation(
+    sequence: u64,
+    profile_id: &crate::vortix_core::profile::ProfileId,
+    status: crate::vortix_core::control::OperationStatus,
+    result: crate::vortix_core::control::OperationResult,
+) -> (
+    crate::vortix_core::control::OperationId,
+    crate::vortix_core::control::OperationRecord,
+) {
+    use crate::vortix_core::control::{
+        AuthorityEpoch, ClientId, IdempotencyKey, OperationId, OperationIntent, OperationRecord,
+        PolicyDigest, RequestedTunnelState,
+    };
+
+    let operation_id = OperationId::from_parts(AuthorityEpoch(1), sequence);
+    let mut tunnels = std::collections::BTreeMap::new();
+    tunnels.insert(profile_id.clone(), RequestedTunnelState::Connected);
+    let record = OperationRecord {
+        id: operation_id.clone(),
+        idempotency_key: IdempotencyKey::new("credential-settlement"),
+        client_id: ClientId::from_parts(AuthorityEpoch(1), 1),
+        command_digest: PolicyDigest::default(),
+        authority_epoch: AuthorityEpoch(1),
+        desired_generation: 1,
+        admitted_at_millis: 1,
+        deadline_millis: 2,
+        intent: OperationIntent::DesiredSubset {
+            tunnels,
+            kill_switch: None,
+        },
+        status,
+        result: Some(result),
+        failure_detail: None,
+    };
+    (operation_id, record)
+}
+
+/// Attach a control session over one `OpenVPN` profile that needs auth.
+fn app_with_openvpn_profile(
+    temp: &tempfile::TempDir,
+) -> (App, crate::vortix_core::profile::ProfileId, VpnProfile) {
+    let profiles_dir = temp.path().join(crate::constants::PROFILES_DIR_NAME);
+    std::fs::create_dir(&profiles_dir).unwrap();
+    let profile_id = crate::vortix_core::profile::ProfileId::new("rejected-corp");
+    let profile = VpnProfile {
+        id: profile_id.clone(),
+        name: "corp".into(),
+        protocol: Protocol::OpenVPN,
+        config_path: profiles_dir.join("corp.ovpn"),
+        location: String::new(),
+        last_used: None,
+    };
+    std::fs::write(&profile.config_path, "client\nauth-user-pass\n").unwrap();
+    let control = crate::cli::control::LocalControlSession::start_profile_test(
+        temp.path(),
+        vec![profile.clone()],
+    )
+    .unwrap();
+
+    let mut app = test_app();
+    app.runtime.config_dir = temp.path().to_path_buf();
+    app.runtime.profiles = vec![profile.clone()];
+    app.attach_control_session(control).unwrap();
+    (app, profile_id, profile)
+}
+
+#[test]
+fn rejected_credentials_are_removed_so_the_next_connect_prompts() {
+    use crate::vortix_core::control::{OperationFailure, OperationResult, OperationStatus};
+
+    let temp = tempfile::tempdir().unwrap();
+    let (mut app, profile_id, _profile) = app_with_openvpn_profile(&temp);
+    app.control_session
+        .as_ref()
+        .unwrap()
+        .remember_openvpn_credentials(&profile_id, "corp-user", "stale-password")
+        .unwrap();
+
+    let (operation_id, record) = terminal_connect_operation(
+        71,
+        &profile_id,
+        OperationStatus::Failed,
+        OperationResult::Failed(OperationFailure::AuthenticationFailed),
+    );
+    app.track_control_operation_with_profile(
+        operation_id.clone(),
+        super::connection::PendingControlSubject::Connection,
+        Some("corp".to_string()),
+    );
+    let mut snapshot = app.control_snapshot.clone();
+    snapshot.operations.insert(operation_id, record);
+    app.apply_control_snapshot(snapshot);
+
+    // Stored credentials the server rejected must not survive: a profile that
+    // still has them raises no challenge, so the prompt would never reopen.
+    let stored = app
+        .control_session
+        .as_ref()
+        .unwrap()
+        .load_openvpn_credentials(&profile_id, "corp")
+        .unwrap();
+    assert!(
+        stored.is_none(),
+        "rejected credentials must be discarded so the next connect prompts"
+    );
+}
+
+#[test]
+fn credentials_reach_disk_only_after_the_server_accepts_them() {
+    use crate::vortix_core::control::{OperationFailure, OperationResult, OperationStatus};
+
+    let temp = tempfile::tempdir().unwrap();
+    let (mut app, profile_id, _profile) = app_with_openvpn_profile(&temp);
+
+    // A rejected attempt leaves nothing behind.
+    app.pending_credential_save = Some(super::PendingCredentialSave {
+        profile_id: profile_id.clone(),
+        profile_name: "corp".to_string(),
+        username: "corp-user".into(),
+        password: "wrong-password".into(),
+    });
+    let (rejected_id, rejected) = terminal_connect_operation(
+        72,
+        &profile_id,
+        OperationStatus::Failed,
+        OperationResult::Failed(OperationFailure::AuthenticationFailed),
+    );
+    app.track_control_operation_with_profile(
+        rejected_id.clone(),
+        super::connection::PendingControlSubject::Connection,
+        Some("corp".to_string()),
+    );
+    let mut snapshot = app.control_snapshot.clone();
+    snapshot.operations.insert(rejected_id, rejected);
+    app.apply_control_snapshot(snapshot);
+
+    assert!(app.pending_credential_save.is_none());
+    assert!(
+        app.control_session
+            .as_ref()
+            .unwrap()
+            .load_openvpn_credentials(&profile_id, "corp")
+            .unwrap()
+            .is_none(),
+        "a rejected password must never be persisted"
+    );
+
+    // The accepted attempt is what commits.
+    app.pending_credential_save = Some(super::PendingCredentialSave {
+        profile_id: profile_id.clone(),
+        profile_name: "corp".to_string(),
+        username: "corp-user".into(),
+        password: "right-password".into(),
+    });
+    let (accepted_id, accepted) = terminal_connect_operation(
+        73,
+        &profile_id,
+        OperationStatus::Succeeded,
+        OperationResult::ObservedConvergence,
+    );
+    app.track_control_operation_with_profile(
+        accepted_id.clone(),
+        super::connection::PendingControlSubject::Connection,
+        Some("corp".to_string()),
+    );
+    let mut snapshot = app.control_snapshot.clone();
+    snapshot.operations.insert(accepted_id, accepted);
+    app.apply_control_snapshot(snapshot);
+
+    let stored = app
+        .control_session
+        .as_ref()
+        .unwrap()
+        .load_openvpn_credentials(&profile_id, "corp")
+        .unwrap()
+        .expect("accepted credentials must be remembered");
+    assert_eq!(stored.username(), "corp-user");
+    assert_eq!(stored.password(), "right-password");
+}
+
+#[test]
+fn ctrl_r_reveals_the_password_without_typing_into_the_field() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let mut app = test_app();
+    app.input_mode = InputMode::AuthPrompt {
+        profile_id: crate::vortix_core::profile::ProfileId::new("reveal-profile"),
+        profile_name: "reveal".into(),
+        username: "vortix".into(),
+        username_cursor: 6,
+        password: "secret".into(),
+        password_cursor: 6,
+        otp: crate::state::SecretText::default(),
+        otp_cursor: 0,
+        focused_field: AuthField::Password,
+        save_credentials: true,
+        connect_after: true,
+        static_challenge_prompt: None,
+        reveal_secrets: false,
+    };
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+    assert!(matches!(
+        &app.input_mode,
+        InputMode::AuthPrompt {
+            reveal_secrets: true,
+            password,
+            password_cursor: 6,
+            ..
+        } if password.expose() == "secret"
+    ));
+
+    // Toggling back hides it again.
+    app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+    assert!(matches!(
+        &app.input_mode,
+        InputMode::AuthPrompt {
+            reveal_secrets: false,
+            ..
+        }
+    ));
+
+    // A bare 'r' is still a password character, not a toggle.
+    app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+    assert!(matches!(
+        &app.input_mode,
+        InputMode::AuthPrompt {
+            reveal_secrets: false,
+            password,
+            ..
+        } if password.expose() == "secretr"
+    ));
 }

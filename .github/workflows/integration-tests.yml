@@ -4,9 +4,13 @@
 # nftables in privileged Docker containers with `ip netns` namespaces.
 # Matrix covers Ubuntu (iptables-nft compat) + Fedora (native nft) so
 # we catch behavioral differences between the two firewall backends.
-# macOS integration parity is deferred to a follow-up plan because
-# GitHub Actions' macOS runners don't easily support netns / sandboxed
-# wg-quick.
+#
+# Full macOS integration parity is still deferred — GitHub Actions' macOS
+# runners don't easily support netns / sandboxed wg-quick. The release-smoke
+# job below covers the part that does not need a kernel: that the shipped
+# release profile links on macOS and the resulting binary runs. Without it no
+# job anywhere exercised a macOS release binary, because Test (macos-latest)
+# builds dev and every netns suite here is Linux-only.
 
 name: Integration Tests
 
@@ -63,12 +67,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: docker/setup-buildx-action@v3
+
+      # The harness image installs a full apt/dnf set plus a rustup toolchain.
+      # Without a layer cache every run pays for that download again.
       - name: Build integration harness image (${{ matrix.distro.label }})
-        run: |
-          docker build \
-              -t ${{ matrix.distro.image_tag }} \
-              -f tests/integration/${{ matrix.distro.dockerfile }} \
-              tests/integration/
+        uses: docker/build-push-action@v6
+        with:
+          context: tests/integration
+          file: tests/integration/${{ matrix.distro.dockerfile }}
+          tags: ${{ matrix.distro.image_tag }}
+          load: true
+          cache-from: type=gha,scope=integration-${{ matrix.distro.label }}
+          cache-to: type=gha,mode=max,scope=integration-${{ matrix.distro.label }}
+
+      # The container has no access to the runner's cargo cache, so the
+      # release build starts from zero unless we hand it one through the
+      # mounted workspace.
+      - name: Cargo cache (${{ matrix.distro.label }})
+        uses: actions/cache@v4
+        with:
+          path: |
+            .ci-cargo-home
+            target
+          key: integration-cargo-${{ matrix.distro.label }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            integration-cargo-${{ matrix.distro.label }}-
 
       - name: Run integration tests (${{ matrix.distro.label }})
         # --privileged: required for `ip netns` + iptables manipulation
@@ -77,6 +101,7 @@ jobs:
           docker run --privileged --network host --rm \
               -v "$PWD:/workspace" \
               -w /workspace \
+              -e CARGO_HOME=/workspace/.ci-cargo-home \
               ${{ matrix.distro.image_tag }} \
               bash -c '
                 set -euo pipefail
@@ -86,3 +111,41 @@ jobs:
                 bash tests/integration/killswitch.sh
                 bash tests/integration/teardown-netns.sh
               '
+
+      # The container writes as root; actions/cache saves as the runner user.
+      # Either directory is absent if the run failed before cargo wrote it.
+      - name: Hand the cache directories back to the runner
+        if: always()
+        run: |
+          for dir in .ci-cargo-home target; do
+            [ -e "$dir" ] && sudo chown -R "$(id -u):$(id -g)" "$dir"
+          done
+          exit 0
+
+  release-smoke:
+    name: Integration / macos-release
+    runs-on: macos-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/rust-setup
+
+      # Fat LTO + codegen-units = 1 makes this the slowest link in the repo;
+      # a cold build measured ~2 min on comparable arm64 hardware.
+      - name: Build release binaries
+        run: cargo build --release -p vortix --locked
+
+      # No wg-quick / openvpn install step: the smoke test is deliberately
+      # unprivileged and never opens a tunnel, and it was verified to pass with
+      # neither tool on PATH. Anything needing a real kernel belongs in the
+      # Linux netns jobs above.
+      #
+      # The budget guards the size win, which is a profile setting and so would
+      # regress silently — restoring opt-level = 3, or letting `dist init` put
+      # back lto = "thin", costs megabytes and breaks no test. It is calibrated
+      # for aarch64-apple-darwin, which is what macos-latest runs; see
+      # docs/performance.md before changing it.
+      - name: Release smoke test
+        env:
+          VORTIX_SIZE_BUDGET_BYTES: "7000000"
+        run: bash tests/integration/release_smoke.sh

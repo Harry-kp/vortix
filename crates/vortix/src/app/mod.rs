@@ -97,6 +97,14 @@ pub(crate) enum PendingProfileImport {
     Admitted(crate::vortix_core::control::OperationId),
 }
 
+/// Credentials awaiting the server's verdict, held in memory only.
+pub(crate) struct PendingCredentialSave {
+    pub(crate) profile_id: crate::vortix_core::profile::ProfileId,
+    pub(crate) profile_name: String,
+    pub(crate) username: crate::state::SecretText,
+    pub(crate) password: crate::state::SecretText,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PendingThemeChange {
     previous: crate::theme::ThemeChoice,
@@ -163,6 +171,12 @@ pub struct App {
     /// overlay. The answer is returned directly to the service and never
     /// journaled or persisted in this client.
     pub(crate) control_challenge: Option<crate::vortix_core::control::ChallengeId>,
+
+    /// Credentials the user asked to remember, held until the server accepts
+    /// them. Writing at submit time persisted rejected passwords, and a
+    /// profile with stored credentials raises no challenge — so the next
+    /// connect reused the bad pair and never reopened the prompt.
+    pub(crate) pending_credential_save: Option<PendingCredentialSave>,
 
     /// Stable identity retained when the canonical projection becomes empty,
     /// so reconnect means "the last tunnel I used" rather than "all".
@@ -274,6 +288,7 @@ impl App {
             control_starting: true,
             control_snapshot: crate::vortix_core::control::ControlSnapshot::default(),
             control_challenge: None,
+            pending_credential_save: None,
             last_control_connected_profile: None,
             pending_control_killswitch_mode: None,
             pending_control_operations: std::collections::BTreeMap::new(),
@@ -461,6 +476,7 @@ impl App {
             control_starting: false,
             control_snapshot: crate::vortix_core::control::ControlSnapshot::default(),
             control_challenge: None,
+            pending_credential_save: None,
             last_control_connected_profile: None,
             pending_control_killswitch_mode: None,
             pending_control_operations: std::collections::BTreeMap::new(),

@@ -215,6 +215,7 @@ impl App {
                 mut save_credentials,
                 connect_after,
                 static_challenge_prompt,
+                mut reveal_secrets,
             } => {
                 self.handle_input_auth(
                     key,
@@ -230,6 +231,7 @@ impl App {
                     &mut save_credentials,
                     connect_after,
                     static_challenge_prompt.as_deref(),
+                    &mut reveal_secrets,
                 );
                 // Update state if still in AuthPrompt mode
                 if let InputMode::AuthPrompt { .. } = self.input_mode {
@@ -246,6 +248,7 @@ impl App {
                         save_credentials,
                         connect_after,
                         static_challenge_prompt,
+                        reveal_secrets,
                     };
                 }
             }
@@ -606,8 +609,15 @@ impl crate::app::App {
         save_credentials: &mut bool,
         connect_after: bool,
         static_challenge_prompt: Option<&str>,
+        reveal_secrets: &mut bool,
     ) {
         let has_otp_field = static_challenge_prompt.is_some();
+        // Ctrl+R before the character arms: a bare 'r' is a password
+        // character and must keep reaching the field.
+        if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            *reveal_secrets = !*reveal_secrets;
+            return;
+        }
         match key.code {
             KeyCode::Esc => self.handle_message(Message::CloseOverlay),
             KeyCode::Tab | KeyCode::BackTab | KeyCode::Down | KeyCode::Up => {

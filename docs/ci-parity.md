@@ -34,7 +34,19 @@ cargo xtask check-platform-leak
 cargo xtask check-protocol-leak
 cargo xtask check-no-shell-regressions
 cargo xtask check-control-boundaries
+
+# 7. Release-profile smoke — the ONLY step that builds `release`; steps 1-6 all
+#    build dev, so a profile-only breakage is invisible to them. Mirrors the
+#    `Integration / macos-release` job. On a macOS host this is exact parity.
+cargo build --release -p vortix --locked
+VORTIX_SIZE_BUDGET_BYTES=7000000 bash tests/integration/release_smoke.sh
 ```
+
+Step 7 costs a fat-LTO link — about 2 minutes cold, and it is the only step here that
+notices a `[profile.release]` or `[profile.dist]` edit. Skip it for a pure logic change;
+never skip it when you touched a profile, `Cargo.toml`, a dependency feature, CLI output,
+or anything cargo-dist owns. The budget figure lives in
+[`docs/performance.md`](performance.md) — raise it deliberately, not reflexively.
 
 ## Common traps
 
@@ -95,7 +107,25 @@ cargo fmt --all -- --check
 | Before declaring a unit done (per-unit verification in plan docs) | Full set above |
 | After dependency bumps (rand, sha2, libc, tokio) | Full set above + manual smoke per `docs/manual-testing/<feature>.md` |
 | After cross-platform code touches | Full set, plus cross-compile-check (`--target`) where possible |
+| Checking a build-time or binary-size regression | `scripts/bench-build.sh` — see [`docs/performance.md`](performance.md) |
+| After touching a cargo profile, a dependency feature, or CLI output | Full set **including step 7** |
+
+## Caching
+
+Every workflow except `Format` restores a cargo cache through `.github/actions/rust-setup`
+(`Swatinem/rust-cache`). `Format` passes `cache: 'false'` — `cargo fmt` compiles nothing, so the
+restore/save round trip bought nothing.
+
+The netns jobs in `Integration Tests` cannot use that action: the build runs inside a privileged
+container that cannot see the runner's cargo home. (Its `release-smoke` job is an ordinary macOS
+runner and does use `rust-setup` normally.) They instead layer-cache the harness image
+(buildx + `type=gha`)
+and caches `.ci-cargo-home` + `target` with `actions/cache`, keyed on `Cargo.lock`. The container
+gets `CARGO_HOME=/workspace/.ci-cargo-home`; `CARGO_TARGET_DIR` is deliberately left alone because
+`tests/integration/*.sh` invoke `target/release/vortix` by path. A step after the run chowns both
+directories back to the runner user so `actions/cache` can save them.
 
 ## Updating CI
 
-When you change `.github/workflows/ci.yml`, update this file in the **same commit**. Reviewers should reject CI changes that don't update the local-parity guide.
+When you change anything under `.github/workflows/` or `.github/actions/`, update this file in the
+**same commit**. Reviewers should reject CI changes that don't update the local-parity guide.
