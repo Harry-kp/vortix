@@ -1,12 +1,12 @@
-# vortix integration test harness (plan 015 phase B / plan 012)
+# vortix integration test harness
 
 This directory carries the **network-namespace-based integration test
-harness** that drives the v0.3.0 vortix binary against real
-`wg-quick` and `openvpn` invocations.
+harness** that drives the vortix binary against real `wg-quick`
+invocations on a real Linux kernel.
 
 ## Why this exists
 
-The 445+ workspace unit tests prove vortix's *logic*. They don't prove
+The workspace tests prove vortix's *logic*. They don't prove
 that the engine cooperates correctly with the real WireGuard / OpenVPN
 binaries on a real Linux kernel. Issue [#162](https://github.com/Harry-kp/vortix/issues/162)
 has been open since March asking for exactly that gap to close.
@@ -16,10 +16,9 @@ has been open since March asking for exactly that gap to close.
 ```
 ┌─ Docker container (ubuntu:22.04, privileged) ────────────┐
 │                                                          │
-│  ┌─ netns "vortix-test-a" ──┐  ┌─ netns "vortix-test-b" ─┐│
+│  ┌─ netns "vortix-test-a" ─┐  ┌─ netns "vortix-test-b" ─┐│
 │  │ 10.99.0.1/24 (server)   │──│ 10.99.0.2/24 (client)   ││
 │  │ wg-quick up wg0         │  │ vortix-driven vortix up ││
-│  │ openvpn --config server │  │                         ││
 │  └─────────────────────────┘  └─────────────────────────┘│
 │                                                          │
 └──────────────────────────────────────────────────────────┘
@@ -32,18 +31,26 @@ either script is safe.
 ## What's wired in CI today
 
 - `wg_happy_path.sh` — WireGuard connect → status → ping → disconnect
-- `ovpn_happy_path.sh` — OpenVPN connect → status → ping → disconnect
 - `killswitch.sh` — verify owned dual-stack iptables chains, host-rule
   preservation, blocked egress, and clean release; it also invokes
   `nft_killswitch.sh` to exercise the native nft backend and failed atomic
   replacement
+- `release_smoke.sh` — runs on macOS, off any kernel: proves the shipped
+  release profile links and the binaries run, and holds a size budget. It
+  needs no netns, no root, and no VPN tooling, so it is the one piece of
+  macOS coverage the harness can offer
 
 ## What's not yet wired (scope-honest)
 
-Plan 015 phase B ships the harness + one representative test per
-protocol + the killswitch test. Failure-path coverage (auth-failed,
-unreachable peer, daemon-died-mid-session) is documented as
-follow-up and lives in TODO comments inside each test script.
+**OpenVPN has no automated integration coverage.** The harness images install
+`openvpn` and the netns topology would support it, but no script drives it —
+every kernel-level OpenVPN result this project has came from
+`scripts/vpn-lab.sh` against a real server, recorded by hand in
+`docs/manual-testing/backlog.md`. Treat that as the source of truth for
+OpenVPN until a script lands here.
+
+Failure-path coverage (auth-failed, unreachable peer, daemon-died-mid-session)
+is also absent; the intent lives in TODO comments inside each test script.
 
 ## Running locally
 
@@ -63,11 +70,25 @@ docker run --privileged --rm -v "$PWD:/workspace" -w /workspace vortix-integrati
 
 ## CI gate
 
-`.github/workflows/integration-tests.yml` runs the above on every
-PR to main + nightly. Failures block merge.
+`.github/workflows/integration-tests.yml` runs the netns scripts on both
+`ubuntu-22.04` (iptables-nft compat) and `fedora-41` (native nft), plus
+`release_smoke.sh` on `macos-latest`, for every PR and nightly. Failures
+block merge.
 
 ## Notes on macOS
 
 GitHub Actions macOS runners don't support `ip netns` or sandboxed
-`wg-quick` easily. macOS integration parity is on the deferred-work
-list; phase B is Ubuntu-only.
+`wg-quick` easily, so kernel-level macOS parity — PF kill-switch,
+`scutil` DNS, real utun tunnels — is still deferred and still needs
+`docs/manual-testing/backlog.md`.
+
+What is covered there is the profile itself. `release_smoke.sh` runs on
+`macos-latest` and is the only job anywhere that executes a macOS release
+binary: `cargo test` builds dev, and every netns suite is Linux-only, so a
+release profile that miscompiled or failed to link would otherwise have
+surfaced first at tag time. Run it locally against any build:
+
+```sh
+cargo build --release -p vortix --locked
+VORTIX_SIZE_BUDGET_BYTES=7000000 bash tests/integration/release_smoke.sh
+```
