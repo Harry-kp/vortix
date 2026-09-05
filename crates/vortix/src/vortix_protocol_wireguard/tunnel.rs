@@ -19,6 +19,16 @@ use tracing::{info, warn};
 
 use crate::vortix_protocol_wireguard::parser::parse_wg_conf;
 
+/// The only directory a confined `wg-quick` may read a config from on
+/// Debian-family distributions, and the canonical location everywhere else.
+#[cfg(target_os = "linux")]
+const WIREGUARD_CONFIG_DIR: &str = "/etc/wireguard";
+
+/// Marks a staged config as Vortix's own, so a user's file is never
+/// overwritten and a leftover copy is still recognisable.
+#[cfg(target_os = "linux")]
+const VORTIX_CONFIG_MARKER: &str = "# managed by vortix - do not edit";
+
 /// `wg-quick`-based `WireGuard` tunnel.
 ///
 /// Plan #004 v1 supports kernel `WireGuard` only — `wireguard-go`/`boringtun`
@@ -335,6 +345,97 @@ fn write_managed_temp_config(
     user_conf_path: &Path,
     stripped_body: &[u8],
 ) -> Result<PathBuf, TunnelError> {
+    // Debian and Ubuntu ship an AppArmor profile for wg-quick that permits no
+    // config path outside /etc/wireguard. Staging under the session tmp dir
+    // made the kernel deny the read — `apparmor="DENIED" operation="open"
+    // profile="wg-quick"` — and every WireGuard connect timed out with nothing
+    // in Vortix's own logs to explain it. The canonical directory is the only
+    // location a confined wg-quick can read, so on Linux that is where the
+    // lifecycle copy goes.
+    #[cfg(target_os = "linux")]
+    {
+        return write_managed_config_in_wireguard_dir(user_conf_path, stripped_body);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        write_managed_temp_config_unconfined(user_conf_path, stripped_body)
+    }
+}
+
+/// Stage the lifecycle copy in `/etc/wireguard`, the only directory a confined
+/// `wg-quick` may read.
+///
+/// Refuses to touch a file Vortix did not create: a user's own
+/// `/etc/wireguard/<name>.conf` is theirs, and silently overwriting it would
+/// destroy a working configuration. Vortix-owned copies carry a marker comment
+/// so a leftover from a previous run is still reclaimable.
+#[cfg(target_os = "linux")]
+fn write_managed_config_in_wireguard_dir(
+    user_conf_path: &Path,
+    stripped_body: &[u8],
+) -> Result<PathBuf, TunnelError> {
+    use crate::vortix_core::secret_file::{write_secret_file, SecretFileError};
+
+    interface_name_from_path(user_conf_path)?;
+    let basename = user_conf_path
+        .file_name()
+        .ok_or_else(|| TunnelError::Subprocess("WireGuard config has no basename".into()))?;
+
+    let directory = Path::new(WIREGUARD_CONFIG_DIR);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(directory)
+            .map_err(|error| {
+                TunnelError::Subprocess(format!(
+                    "create {WIREGUARD_CONFIG_DIR}: {error}. WireGuard needs this directory because wg-quick is confined to it."
+                ))
+            })?;
+    }
+
+    let staged = directory.join(basename);
+    if staged.exists() && !is_vortix_owned_config(&staged) {
+        return Err(TunnelError::Subprocess(format!(
+            "{} already exists and was not created by Vortix. Rename this profile, or move that file aside, so Vortix does not overwrite a configuration you manage.",
+            staged.display()
+        )));
+    }
+    let _ = std::fs::remove_file(&staged);
+
+    let mut body = Vec::with_capacity(stripped_body.len() + VORTIX_CONFIG_MARKER.len() + 1);
+    body.extend_from_slice(VORTIX_CONFIG_MARKER.as_bytes());
+    body.push(b'\n');
+    body.extend_from_slice(stripped_body);
+
+    write_secret_file(&staged, &body).map_err(|e| match e {
+        SecretFileError::Io(io) => {
+            TunnelError::Subprocess(format!("write managed WG config: {io}"))
+        }
+        other => TunnelError::Subprocess(format!("write managed WG config: {other}")),
+    })?;
+
+    Ok(staged)
+}
+
+/// Whether a staged config is a Vortix lifecycle copy rather than a user file.
+#[cfg(target_os = "linux")]
+fn is_vortix_owned_config(path: &Path) -> bool {
+    std::fs::read(path)
+        .ok()
+        .and_then(|body| String::from_utf8(body).ok())
+        .is_some_and(|body| body.starts_with(VORTIX_CONFIG_MARKER))
+}
+
+/// Original staging behaviour, retained where `wg-quick` is unconfined.
+#[allow(dead_code)]
+fn write_managed_temp_config_unconfined(
+    user_conf_path: &Path,
+    stripped_body: &[u8],
+) -> Result<PathBuf, TunnelError> {
     let session_id = resolve_session_id();
     let session_root = crate::utils::get_tmp_config_dir(&session_id).map_err(|e| {
         TunnelError::Subprocess(format!("failed to create per-session tmp dir: {e}"))
@@ -388,9 +489,19 @@ fn create_lifecycle_dir(session_root: &Path) -> Result<PathBuf, TunnelError> {
 fn cleanup_managed_temp_config(temp_path: &Path) {
     let _ = std::fs::remove_file(temp_path);
     if let Some(parent) = temp_path.parent() {
+        // On Linux the staged copy lives in /etc/wireguard, which Vortix does
+        // not own and must never remove — it may hold the user's own configs,
+        // and it is where a confined wg-quick looks.
+        #[cfg(target_os = "linux")]
+        if parent == Path::new(WIREGUARD_CONFIG_DIR) {
+            return;
+        }
+
         // `remove_dir` only succeeds when the dir is empty — exactly the
         // condition we want. Other secondaries in the same session keep
-        // their own leaf and the dir survives.
+        // their own leaf and the dir survives. The name check gates only the
+        // session-root removal below, so an empty session dir is still
+        // collected here.
         let removed_lifecycle = std::fs::remove_dir(parent).is_ok()
             && parent
                 .file_name()

@@ -1,0 +1,48 @@
+# vortix integration test harness — Arch variant.
+#
+# Privileged Arch container with wireguard-tools + openvpn + iproute2 and
+# native nftables. Parallel to the Ubuntu and Fedora images.
+#
+# Why Arch matters beyond the other two: it is the only one of the three where
+# systemd-resolved is commonly absent, so `selected_backend()` lands on
+# `Resolvconf` or `Unavailable` — a DNS path neither Ubuntu (resolved or
+# resolvconf) nor Fedora (resolved) exercises. Arch also stands in for its
+# derivatives: CachyOS, EndeavourOS and Manjaro share pacman, systemd and
+# nftables, and differ only in kernel tuning and desktop defaults, none of
+# which Vortix touches.
+#
+# Arch is rolling, so this image is deliberately unpinned. A break here is
+# genuine forward-compatibility signal rather than noise.
+
+FROM archlinux:base
+
+ENV CARGO_TERM_COLOR=always
+
+# Layer 1: runtime + build tooling. Arch package names differ again:
+#   - pkgconf (was: pkgconf-pkg-config / pkg-config)
+#   - openssl (was: openssl-devel / libssl-dev)
+#   - iptables-nft provides the nft-backed iptables and conflicts with the
+#     legacy `iptables` package, so it is installed with --ask to resolve.
+RUN pacman -Sy --noconfirm archlinux-keyring \
+    && pacman -S --noconfirm --needed \
+        ca-certificates curl git \
+        gcc make pkgconf openssl \
+        wireguard-tools openvpn iproute2 nftables \
+        iputils sudo \
+    && printf 'y\ny\n' | pacman -S --noconfirm iptables-nft \
+    && iptables --version | grep -q 'nf_tables' \
+    && pacman -Scc --noconfirm
+# Same deliberate omissions as the Fedora image: no `which`, no `procps-ng`.
+# Vortix must not depend on either, and a minimal Arch install ships neither.
+#
+# systemd-resolved is intentionally NOT enabled. That is the realistic Arch
+# default and is precisely the configuration this image exists to cover.
+
+# Layer 2: Rust toolchain. Pin matches the workspace MSRV badge.
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.91.0 \
+    && /root/.cargo/bin/rustup component add clippy rustfmt
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+WORKDIR /workspace
+
+CMD ["/bin/bash"]
