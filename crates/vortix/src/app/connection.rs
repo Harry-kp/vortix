@@ -832,6 +832,7 @@ impl App {
                             crate::vortix_core::control::ChallengeKind::TwoFactorCode
                         )
                         .then_some(challenge.label),
+                        reveal_secrets: false,
                     };
                 } else {
                     // Mark it before asynchronous cancellation so repeated

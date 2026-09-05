@@ -282,6 +282,10 @@ pub enum InputMode {
         /// SCRV1 envelope. When `None`, the
         /// overlay renders the two-field layout unchanged.
         static_challenge_prompt: Option<String>,
+        /// Show the password and OTP in the clear. Off by default and never
+        /// persisted: a rejected password is indistinguishable from a typo
+        /// while the field is dots, so the user needs a way to look.
+        reveal_secrets: bool,
     },
 }
 

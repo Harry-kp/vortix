@@ -263,9 +263,9 @@ pub const TITLE_AUTH_PROMPT: &str = " VPN Authentication ";
 /// Title for the authentication overlay (manage/edit flow).
 pub const TITLE_AUTH_MANAGE: &str = " Edit Auth Credentials ";
 /// Footer keybindings for the auth overlay (connect flow).
-pub const TITLE_AUTH_FOOTER: &str = " [Tab] Switch  [Enter] Connect  [Esc] Cancel ";
+pub const TITLE_AUTH_FOOTER: &str = " [Tab] Switch  [^R] Show  [Enter] Connect  [Esc] Cancel ";
 /// Footer keybindings for the auth overlay (manage/edit flow).
-pub const TITLE_AUTH_MANAGE_FOOTER: &str = " [Tab] Switch  [Enter] Save  [Esc] Cancel ";
+pub const TITLE_AUTH_MANAGE_FOOTER: &str = " [Tab] Switch  [^R] Show  [Enter] Save  [Esc] Cancel ";
 
 // === Import & Download Configuration ===
 

@@ -583,6 +583,7 @@ fn test_auth_field_otp_appears_in_tab_cycle_for_static_challenge_profile() {
         save_credentials: true,
         connect_after: true,
         static_challenge_prompt: Some("Enter code".to_string()),
+        reveal_secrets: false,
     };
 
     // Username -> Password -> Otp -> SaveCheckbox -> Username
@@ -620,6 +621,7 @@ fn test_auth_field_switching() {
         save_credentials: true,
         connect_after: true,
         static_challenge_prompt: None,
+        reveal_secrets: false,
     };
 
     // Tab from Username -> Password
@@ -2888,6 +2890,7 @@ fn blank_challenge_input_keeps_overlay_and_challenge_for_retry() {
         save_credentials: false,
         connect_after: true,
         static_challenge_prompt: Some("OTP".to_string()),
+        reveal_secrets: false,
     };
 
     app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -2959,6 +2962,7 @@ fn failed_challenge_response_keeps_prompt_for_retry() {
         save_credentials: false,
         connect_after: true,
         static_challenge_prompt: Some("OTP".to_string()),
+        reveal_secrets: false,
     };
 
     app.handle_message(Message::AuthSubmit {
@@ -3013,6 +3017,7 @@ fn auth_manager_uses_stable_profile_identity_through_control_session() {
             password,
             connect_after: false,
             static_challenge_prompt: None,
+            reveal_secrets: false,
             ..
         } if prompt_profile_id == &profile_id
             && username.expose() == "old-user"
@@ -4377,4 +4382,58 @@ fn credentials_reach_disk_only_after_the_server_accepts_them() {
         .expect("accepted credentials must be remembered");
     assert_eq!(stored.username(), "corp-user");
     assert_eq!(stored.password(), "right-password");
+}
+
+#[test]
+fn ctrl_r_reveals_the_password_without_typing_into_the_field() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let mut app = test_app();
+    app.input_mode = InputMode::AuthPrompt {
+        profile_id: crate::vortix_core::profile::ProfileId::new("reveal-profile"),
+        profile_name: "reveal".into(),
+        username: "vortix".into(),
+        username_cursor: 6,
+        password: "secret".into(),
+        password_cursor: 6,
+        otp: crate::state::SecretText::default(),
+        otp_cursor: 0,
+        focused_field: AuthField::Password,
+        save_credentials: true,
+        connect_after: true,
+        static_challenge_prompt: None,
+        reveal_secrets: false,
+    };
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+    assert!(matches!(
+        &app.input_mode,
+        InputMode::AuthPrompt {
+            reveal_secrets: true,
+            password,
+            password_cursor: 6,
+            ..
+        } if password.expose() == "secret"
+    ));
+
+    // Toggling back hides it again.
+    app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+    assert!(matches!(
+        &app.input_mode,
+        InputMode::AuthPrompt {
+            reveal_secrets: false,
+            ..
+        }
+    ));
+
+    // A bare 'r' is still a password character, not a toggle.
+    app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+    assert!(matches!(
+        &app.input_mode,
+        InputMode::AuthPrompt {
+            reveal_secrets: false,
+            password,
+            ..
+        } if password.expose() == "secretr"
+    ));
 }

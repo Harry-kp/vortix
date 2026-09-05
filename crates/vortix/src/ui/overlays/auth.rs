@@ -53,6 +53,7 @@ pub fn render(
     save_credentials: bool,
     connect_after: bool,
     static_challenge_prompt: Option<&str>,
+    reveal_secrets: bool,
 ) {
     let has_otp_field = static_challenge_prompt.is_some();
     let area = frame.area();
@@ -219,7 +220,7 @@ pub fn render(
         "Password",
         password,
         password_cursor,
-        true,
+        !reveal_secrets,
         *focused_field == AuthField::Password,
     ));
     if let Some(prompt) = static_challenge_prompt {
@@ -227,7 +228,7 @@ pub fn render(
             prompt,
             otp,
             otp_cursor,
-            true,
+            !reveal_secrets,
             *focused_field == AuthField::Otp,
         ));
     }

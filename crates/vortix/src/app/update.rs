@@ -632,6 +632,7 @@ impl App {
                         save_credentials: true,
                         connect_after: false,
                         static_challenge_prompt: None,
+                        reveal_secrets: false,
                     };
                 }
             }
