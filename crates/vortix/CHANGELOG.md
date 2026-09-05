@@ -4,6 +4,52 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-09-05
+
+### Bug Fixes
+
+- **tui:** Disconnect completes on kernel confirmation, not the worker's word ([#253](https://github.com/Harry-kp/vortix/pull/253))
+- Stabilize desktop integration, themes, and recovery ([#279](https://github.com/Harry-kp/vortix/pull/279))
+- **killswitch:** Fail closed across recovery and release ([#281](https://github.com/Harry-kp/vortix/pull/281))
+- **control:** Make VPN lifecycle transitions exact ([#282](https://github.com/Harry-kp/vortix/pull/282))
+- **tui:** Keep large profile imports within deadlines ([#283](https://github.com/Harry-kp/vortix/pull/283))
+- **tui:** Reopen the credential prompt after a rejected password
+- **control:** Stop replaying past profile imports as startup failures
+
+### Documentation
+
+- **readme:** Fix broken star history chart ([#275](https://github.com/Harry-kp/vortix/pull/275))
+- Make README a concise project entry point ([#280](https://github.com/Harry-kp/vortix/pull/280))
+- Add independent Vortix features
+
+### Features
+
+- **control:** Establish canonical lifecycle authority ([#264](https://github.com/Harry-kp/vortix/pull/264))
+- **control:** Cut local CLI over to canonical service ([#267](https://github.com/Harry-kp/vortix/pull/267))
+- **control:** Cut TUI over to canonical service ([#269](https://github.com/Harry-kp/vortix/pull/269))
+- **control:** Add bounded background diagnostics ([#270](https://github.com/Harry-kp/vortix/pull/270))
+- **control:** Prepare dormant remote adapters ([#271](https://github.com/Harry-kp/vortix/pull/271))
+- **control:** Prepare background mode UX ([#272](https://github.com/Harry-kp/vortix/pull/272))
+- **helper:** Authenticate privileged execution ([#276](https://github.com/Harry-kp/vortix/pull/276))
+- **control:** Own exact policy and OpenVPN credentials ([#277](https://github.com/Harry-kp/vortix/pull/277))
+- **tui:** Reveal the password while typing it
+
+### Miscellaneous
+
+- **deps:** Bump base64 from 0.22.1 to 0.23.1 ([#266](https://github.com/Harry-kp/vortix/pull/266))
+- **deps:** Bump system-configuration from 0.7.0 to 0.8.0 ([#274](https://github.com/Harry-kp/vortix/pull/274))
+
+### Performance
+
+- Cut the release binary 42% and the test build 34%
+
+### Refactor
+
+- Remove internal plan vocabulary from code, comments, and examples ([#255](https://github.com/Harry-kp/vortix/pull/255))
+- Consolidate shared runtime plumbing ([#256](https://github.com/Harry-kp/vortix/pull/256))
+
+
+
 ## [0.4.3] - 2026-07-18
 
 ### Highlights
