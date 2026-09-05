@@ -1951,7 +1951,7 @@ impl LocalControlSession {
         })?;
         let tui_admission =
             start_tui_admission_queue(&runtime, service.client(), Arc::clone(&profile_mutations));
-        Ok(Self {
+        let session = Self {
             service: Some(service),
             _challenge_issuer: challenge_issuer,
             openvpn_credentials,
@@ -1974,7 +1974,9 @@ impl LocalControlSession {
             reported_profile_operations: RefCell::new(std::collections::BTreeSet::new()),
             pending_scan: RefCell::new(None),
             last_scan_started: Cell::new(Instant::now()),
-        })
+        };
+        session.absorb_catalog_baseline(&session.current_snapshot());
+        Ok(session)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2273,6 +2275,7 @@ impl LocalControlSession {
             pending_scan: RefCell::new(None),
             last_scan_started: Cell::new(Instant::now()),
         };
+        session.absorb_catalog_baseline(&session.current_snapshot());
         let startup_generation = session.current_snapshot().generation;
         let initial_observed_at_millis = session.service().observer().now_millis();
         session.runtime().block_on(async {
@@ -2532,6 +2535,25 @@ impl LocalControlSession {
         }
     }
 
+    /// Record the profile mutations already in durable history as seen.
+    ///
+    /// Operation history outlives the process. A client that starts with a
+    /// fresh dedupe set would treat every past import as a new terminal
+    /// outcome and, holding no receipt for any of it, announce all of them as
+    /// failures — including the ones that succeeded. Taking this baseline
+    /// before the client can submit anything keeps that history silent while
+    /// leaving everything this session does fully reported.
+    fn absorb_catalog_baseline(&self, snapshot: &ControlSnapshot) {
+        let mut reported = self.reported_profile_operations.borrow_mut();
+        for (operation_id, operation) in &snapshot.operations {
+            if operation.status.is_terminal()
+                && matches!(operation.intent, OperationIntent::ProfileMutation { .. })
+            {
+                reported.insert(operation_id.clone());
+            }
+        }
+    }
+
     pub(crate) fn take_catalog_update(
         &self,
         snapshot: &ControlSnapshot,
@@ -2546,26 +2568,38 @@ impl LocalControlSession {
             {
                 continue;
             }
-            outcomes.push(
-                if let Some(result) = self.profile_mutations.take_result(operation_id) {
-                    match result {
-                        Ok(receipt) => LocalCatalogOutcome::Applied {
-                            operation_id: operation_id.clone(),
-                            receipt,
-                        },
-                        Err(failure) => LocalCatalogOutcome::Failed {
-                            operation_id: operation_id.clone(),
-                            failure,
-                        },
-                    }
-                } else {
-                    LocalCatalogOutcome::Terminal {
+            let outcome = if let Some(result) = self.profile_mutations.take_result(operation_id) {
+                match result {
+                    Ok(receipt) => LocalCatalogOutcome::Applied {
                         operation_id: operation_id.clone(),
-                        status: operation.status,
-                        result: operation.result,
-                    }
-                },
-            );
+                        receipt,
+                    },
+                    Err(failure) => LocalCatalogOutcome::Failed {
+                        operation_id: operation_id.clone(),
+                        failure,
+                    },
+                }
+            } else if matches!(
+                operation.result,
+                Some(
+                    OperationResult::ProfileMutationApplied
+                        | OperationResult::ProfileMutationAppliedAfterDeadline
+                )
+            ) {
+                // The owner committed it; only the local receipt is missing.
+                // Calling that a failure would contradict the durable record.
+                LocalCatalogOutcome::Applied {
+                    operation_id: operation_id.clone(),
+                    receipt: LocalProfileMutationReceipt::RemoteApplied { display_name: None },
+                }
+            } else {
+                LocalCatalogOutcome::Terminal {
+                    operation_id: operation_id.clone(),
+                    status: operation.status,
+                    result: operation.result,
+                }
+            };
+            outcomes.push(outcome);
         }
         let revision = self.profile_mutations.catalog_revision();
         if revision == self.last_catalog_revision.get() && outcomes.is_empty() {
@@ -4419,6 +4453,97 @@ mod tests {
         );
 
         assert!(current_owned_session(&profile, &sessions, &executor).is_none());
+    }
+
+    /// Durable operation history survives a restart. A freshly started client
+    /// holds no receipt for any of it, so before the baseline existed every
+    /// past import was replayed as "the profile update could not be
+    /// completed" — including the ones that succeeded.
+    #[test]
+    fn startup_does_not_replay_historical_profile_mutations_as_failures() {
+        use crate::vortix_core::control::{
+            AuthorityEpoch, IdempotencyKey, OperationIntent, OperationRecord, OperationStatus,
+            PolicyDigest,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let session = LocalControlSession::start_profile_test(temp.path(), Vec::new()).unwrap();
+
+        let historical = |sequence: u64, result: OperationResult, status: OperationStatus| {
+            let id = operation_id(sequence);
+            (
+                id.clone(),
+                OperationRecord {
+                    id,
+                    idempotency_key: IdempotencyKey::new("historical-import"),
+                    client_id: client_id(1),
+                    command_digest: PolicyDigest::default(),
+                    authority_epoch: AuthorityEpoch(1),
+                    desired_generation: 1,
+                    admitted_at_millis: 1,
+                    deadline_millis: 2,
+                    intent: OperationIntent::ProfileMutation {
+                        profile_id: profile_id('a'),
+                    },
+                    status,
+                    result: Some(result),
+                    failure_detail: None,
+                },
+            )
+        };
+
+        let mut snapshot = ControlSnapshot::default();
+        for sequence in 0..8 {
+            let (id, record) = historical(
+                sequence,
+                OperationResult::ProfileMutationApplied,
+                OperationStatus::Succeeded,
+            );
+            snapshot.operations.insert(id, record);
+        }
+        let (failed_id, failed) = historical(
+            8,
+            OperationResult::Failed(crate::vortix_core::control::OperationFailure::Internal),
+            OperationStatus::Failed,
+        );
+        snapshot.operations.insert(failed_id, failed);
+
+        // What a restart sees: this history is already durable before the
+        // client exists.
+        session.absorb_catalog_baseline(&snapshot);
+
+        let first = session.take_catalog_update(&snapshot);
+        let outcomes = first.map(|update| update.outcomes).unwrap_or_default();
+        assert!(
+            outcomes.is_empty(),
+            "history predating this client must not be announced, got {} outcome(s)",
+            outcomes.len()
+        );
+
+        // A second poll of the same history stays silent too.
+        let repeat = session.take_catalog_update(&snapshot);
+        assert!(repeat
+            .map(|update| update.outcomes)
+            .unwrap_or_default()
+            .is_empty());
+
+        // An operation that appears after the baseline is still reported, and a
+        // committed one is never described as a failure.
+        let (fresh_id, fresh) = historical(
+            9,
+            OperationResult::ProfileMutationApplied,
+            OperationStatus::Succeeded,
+        );
+        snapshot.operations.insert(fresh_id, fresh);
+        let outcomes = session
+            .take_catalog_update(&snapshot)
+            .expect("a new terminal mutation produces an update")
+            .outcomes;
+        assert_eq!(outcomes.len(), 1);
+        assert!(
+            matches!(&outcomes[0], LocalCatalogOutcome::Applied { .. }),
+            "a committed mutation must not be reported as a failure"
+        );
     }
 
     #[test]
