@@ -1187,6 +1187,13 @@ pub fn lifecycle_lock_user_message(error: &std::io::Error) -> String {
         return "Another Vortix process is managing VPN state. Close the running Vortix session or wait for its command to finish, then try again."
             .to_string();
     }
+    if error.kind() == std::io::ErrorKind::PermissionDenied {
+        // Reached when the lock was left owned by another user. Naming the
+        // repair matters: the bare OS error gave the user nothing to act on.
+        return format!(
+            "Vortix cannot open its session lock: {error}\n  hint: The lock file is owned by another user. Run: sudo chown -R $(id -u):$(id -g) \"${{XDG_CONFIG_HOME:-$HOME/.config}}/vortix\""
+        );
+    }
     format!("Vortix could not open its session lock: {error}")
 }
 
@@ -1260,6 +1267,13 @@ fn acquire_nonblocking_lock(path: &std::path::Path) -> std::io::Result<std::fs::
         .truncate(false)
         .write(true)
         .open(path)?;
+
+    // The dashboard needs root, so this lock is created root-owned by the
+    // first `sudo vortix`. It then needs write access to be re-locked, and an
+    // unprivileged run could never open it again — every later launch failed
+    // on EACCES with no way back. Same contract as `create_user_dir` and
+    // `write_user_file` above; a no-op when not root.
+    crate::config::fix_ownership(path);
 
     // SAFETY: flock is a thin syscall wrapper over a valid owned fd; no
     // buffers, no aliasing. Same invariant analysis as libc::kill in the

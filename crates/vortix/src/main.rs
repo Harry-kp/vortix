@@ -113,10 +113,17 @@ fn main() -> Result<()> {
                 std::process::exit(cli::output::ExitCode::StateConflict.code());
             }
             Err(error) => {
-                return Err(color_eyre::eyre::eyre!(
-                    "{}",
-                    vortix::utils::lifecycle_lock_user_message(&error)
-                ));
+                // The neighbouring WouldBlock arm already prints and exits
+                // cleanly; this one returned an eyre error, so a lock the
+                // user simply could not open came with a source location and
+                // backtrace hints attached.
+                eprintln!("{}", vortix::utils::lifecycle_lock_user_message(&error));
+                let exit = if error.kind() == std::io::ErrorKind::PermissionDenied {
+                    cli::output::ExitCode::PermissionDenied
+                } else {
+                    cli::output::ExitCode::GeneralError
+                };
+                std::process::exit(exit.code());
             }
         })
     } else {
@@ -133,6 +140,24 @@ fn main() -> Result<()> {
         eprintln!("Vortix needs administrator access to manage VPN connections.");
         eprintln!("Try again with: sudo vortix");
         std::process::exit(cli::output::ExitCode::PermissionDenied.code());
+    }
+
+    // `ratatui::init()` panics when there is no terminal to take over, and
+    // that surfaced as "Vortix crashed unexpectedly" followed by a ratatui
+    // source path — for the entirely ordinary case of no TTY: `ssh host
+    // vortix`, a cron entry, a pipe. Refuse here, before any state is
+    // touched, and point at the headless commands that do work. Both streams
+    // matter: the dashboard draws to stdout and reads keys from stdin, so a
+    // redirected stdin would leave it painted but unable to accept input.
+    if args.command.is_none() {
+        use std::io::IsTerminal as _;
+        if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
+            eprintln!("The Vortix dashboard needs an interactive terminal.");
+            eprintln!(
+                "Run `vortix` directly in a terminal, or use the headless commands: vortix status, vortix list"
+            );
+            std::process::exit(cli::output::ExitCode::GeneralError.code());
+        }
     }
 
     // Settings use the same authoritative directory as profiles and
