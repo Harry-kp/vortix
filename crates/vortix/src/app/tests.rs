@@ -31,6 +31,7 @@ fn test_app() -> App {
         control_challenge: None,
         pending_credential_save: None,
         last_control_error: None,
+        queued_killswitch_target: None,
         last_control_connected_profile: None,
         pending_control_killswitch_mode: None,
         pending_control_operations: std::collections::BTreeMap::new(),
@@ -4437,4 +4438,44 @@ fn ctrl_r_reveals_the_password_without_typing_into_the_field() {
             ..
         } if password.expose() == "secretr"
     ));
+}
+
+#[test]
+fn rapid_killswitch_presses_submit_one_change_at_a_time() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut app, _profile_id, _profile) = app_with_openvpn_profile(&temp);
+
+    app.track_control_operation_with_profile(
+        crate::vortix_core::control::OperationId::from_parts(
+            crate::vortix_core::control::AuthorityEpoch(1),
+            9001,
+        ),
+        super::connection::PendingControlSubject::KillSwitch,
+        None,
+    );
+    assert!(app.killswitch_change_in_flight());
+
+    // Presses while a change runs coalesce into one target rather than
+    // queueing an operation each: the worker is serial, so the extras used to
+    // expire on their own deadline and report "kill switch change timed out".
+    for _ in 0..5 {
+        app.handle_message(Message::ToggleKillSwitch);
+    }
+    assert!(
+        app.queued_killswitch_target.is_some(),
+        "the cycled target must be retained while a change is in flight"
+    );
+
+    // An unknown effective state during that window must not be reported as
+    // Degraded, which means "cannot be proven" rather than "not yet known".
+    app.runtime.killswitch_state = crate::state::KillSwitchState::Blocking;
+    let mut snapshot = app.control_snapshot.clone();
+    snapshot.desired.kill_switch = crate::state::KillSwitchMode::AlwaysOn;
+    snapshot.effective.kill_switch = None;
+    app.apply_control_snapshot(snapshot);
+    assert_eq!(
+        app.runtime.killswitch_state,
+        crate::state::KillSwitchState::Blocking,
+        "an in-flight change must not turn a working kill switch into Degraded"
+    );
 }

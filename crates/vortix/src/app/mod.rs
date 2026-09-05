@@ -184,6 +184,13 @@ pub struct App {
     /// second, which buried the startup warning that named the fix.
     pub(crate) last_control_error: Option<String>,
 
+    /// Kill-switch mode the user has cycled to while an earlier change is
+    /// still running. Presses used to submit an operation each, and the
+    /// worker is serial, so a few quick taps left later ones to expire — the
+    /// "kill switch change timed out" the user actually saw. The target is
+    /// coalesced here and submitted once the in-flight change settles.
+    pub(crate) queued_killswitch_target: Option<crate::state::KillSwitchMode>,
+
     /// Stable identity retained when the canonical projection becomes empty,
     /// so reconnect means "the last tunnel I used" rather than "all".
     pub(crate) last_control_connected_profile: Option<crate::vortix_core::profile::ProfileId>,
@@ -296,6 +303,7 @@ impl App {
             control_challenge: None,
             pending_credential_save: None,
             last_control_error: None,
+            queued_killswitch_target: None,
             last_control_connected_profile: None,
             pending_control_killswitch_mode: None,
             pending_control_operations: std::collections::BTreeMap::new(),
@@ -499,6 +507,7 @@ impl App {
             control_challenge: None,
             pending_credential_save: None,
             last_control_error: None,
+            queued_killswitch_target: None,
             last_control_connected_profile: None,
             pending_control_killswitch_mode: None,
             pending_control_operations: std::collections::BTreeMap::new(),

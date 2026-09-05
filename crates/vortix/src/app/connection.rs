@@ -763,9 +763,23 @@ impl App {
         }
         self.registry
             .set_killswitch_mode(snapshot.desired.kill_switch);
+        // `effective.kill_switch` is None until the service publishes an
+        // observation. That is "not known yet", which is not the same as
+        // `Degraded` — documented as the no-claim state for when policy
+        // application or read-back cannot be proven. Rendering the gap as
+        // Degraded told users their kill switch was broken every time a
+        // change was in flight, including when the firewall was applied and
+        // correct.
+        //
+        // While a change is running, the last observed state is still the
+        // truth about the firewall, so it is held rather than replaced by an
+        // alarm. Only an unknown state with nothing running is a real
+        // no-claim, and that still reports Degraded.
         let kill_switch_state = snapshot.effective.kill_switch.unwrap_or_else(|| {
             if snapshot.desired.kill_switch == crate::state::KillSwitchMode::Off {
                 KillSwitchState::Disabled
+            } else if self.killswitch_change_in_flight() {
+                self.runtime.killswitch_state
             } else {
                 KillSwitchState::Degraded
             }
@@ -926,6 +940,16 @@ impl App {
         let target_name = self.runtime.profiles[idx].name.clone();
         self.fire_conflict_overlay(conflict, idx, profile_id, target_name);
         true
+    }
+
+    /// Whether a kill-switch change is still running.
+    pub(crate) fn killswitch_change_in_flight(&self) -> bool {
+        self.pending_control_operations.values().any(|pending| {
+            matches!(
+                pending.subject,
+                super::connection::PendingControlSubject::KillSwitch
+            )
+        })
     }
 
     /// Commit or discard held credentials once the server has judged them.
@@ -1131,6 +1155,9 @@ impl App {
         {
             self.pending_control_operations.remove(&operation_id);
             self.settle_credentials(subject, status, result, connect_profile.as_ref());
+            if matches!(subject, PendingControlSubject::KillSwitch) {
+                self.submit_queued_killswitch_target();
+            }
             if self.present_late_route_conflict(subject, status, result, late_route_conflict) {
                 continue;
             }

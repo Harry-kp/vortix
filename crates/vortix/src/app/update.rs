@@ -858,9 +858,25 @@ impl App {
             return;
         }
         let next = self
-            .pending_control_killswitch_mode
+            .queued_killswitch_target
+            .or(self.pending_control_killswitch_mode)
             .unwrap_or(self.control_snapshot.desired.kill_switch)
             .next();
+
+        // One change at a time. Each press used to submit its own operation
+        // while the control worker applies them serially, so a few quick taps
+        // left the later ones to expire on their own deadline. That surfaced
+        // as "kill switch change timed out" and, because a timed-out change
+        // never publishes an effective state, as "Degraded" in Security Guard
+        // — while the firewall itself was applied and correct the whole time.
+        //
+        // Cycling stays responsive: the target moves immediately and is
+        // submitted once the running change settles.
+        if self.killswitch_change_in_flight() {
+            self.queued_killswitch_target = Some(next);
+            return;
+        }
+
         if self
             .issue_control_command(crate::vortix_core::control::UserCommand::SetKillSwitch {
                 mode: next,
@@ -868,6 +884,28 @@ impl App {
             .is_some()
         {
             self.pending_control_killswitch_mode = Some(next);
+        }
+    }
+
+    /// Submit the coalesced kill-switch target once the running change ends.
+    pub(crate) fn submit_queued_killswitch_target(&mut self) {
+        let Some(target) = self.queued_killswitch_target else {
+            return;
+        };
+        if self.killswitch_change_in_flight() {
+            return;
+        }
+        self.queued_killswitch_target = None;
+        if target == self.control_snapshot.desired.kill_switch {
+            return;
+        }
+        if self
+            .issue_control_command(crate::vortix_core::control::UserCommand::SetKillSwitch {
+                mode: target,
+            })
+            .is_some()
+        {
+            self.pending_control_killswitch_mode = Some(target);
         }
     }
     fn handle_quit(&mut self) {
