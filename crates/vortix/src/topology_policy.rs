@@ -887,6 +887,14 @@ impl CanonicalPolicyExecutor {
         Ok(())
     }
 
+    /// Read the emergency barrier back out of the kernel without mutating
+    /// it. This is the one gate a pre-tunnel block can prove, and the only
+    /// evidence that lets the kill-switch row claim the block it engaged.
+    fn verify_pre_tunnel_blocking(&self, policy: &TopologyPolicy) -> Result<(), String> {
+        let active = self.pre_block_tunnels(policy)?;
+        crate::core::killswitch::verify_blocking(&active).map_err(|error| error.to_string())
+    }
+
     fn apply_final_firewall(&self, policy: &TopologyPolicy) -> Result<(), String> {
         if firewall_transition_requires_authority(policy.target.kill_switch) {
             self.require_global_authority()?;
@@ -961,7 +969,20 @@ impl PolicyExecutor for CanonicalPolicyExecutor {
         self.with_readback(policy, |_| {});
         match barrier {
             PolicyBarrier::Blocking if policy.stage == PolicyStage::PreTunnelBlocking => {
-                self.install_pre_tunnel_blocking(policy)
+                self.install_pre_tunnel_blocking(policy)?;
+                let observed_at_millis = crate::utils::boot_elapsed_millis().ok_or_else(|| {
+                    "OS boot clock is unavailable for policy evidence".to_string()
+                })?;
+                // An unprovable read-back does not undo the barrier — the
+                // kernel already holds it and rolling back here would be
+                // fail-open. It only means the block cannot be reported.
+                let firewall_verified =
+                    gate_verified(policy, "firewall", self.verify_pre_tunnel_blocking(policy));
+                self.with_readback(policy, |evidence| {
+                    evidence.firewall_verified = firewall_verified;
+                    evidence.observed_at_millis = observed_at_millis;
+                });
+                Ok(())
             }
             PolicyBarrier::Blocking => {
                 self.apply_final_firewall(policy)?;
@@ -1026,11 +1047,24 @@ impl PolicyExecutor for CanonicalPolicyExecutor {
     }
 
     fn audit(&self, policy: &TopologyPolicy) -> Result<PolicyExecutionEvidence, String> {
-        if policy.stage != PolicyStage::Final {
-            return Err("only a final topology policy can be audited".into());
-        }
         let observed_at_millis = crate::utils::boot_elapsed_millis()
             .ok_or_else(|| "OS boot clock is unavailable for policy evidence".to_string())?;
+        if policy.stage == PolicyStage::PreTunnelBlocking {
+            // The emergency barrier has exactly one gate. Re-proving it on
+            // the audit cadence is what keeps a reported block from ageing
+            // out into `Degraded` while it is still installed.
+            return Ok(PolicyExecutionEvidence {
+                observed_at_millis,
+                firewall_verified: gate_verified(
+                    policy,
+                    "firewall",
+                    self.verify_pre_tunnel_blocking(policy),
+                ),
+                interface_verified: false,
+                route_verified: false,
+                dns_verified: false,
+            });
+        }
         // Every gate is read back independently, firewall first. Bailing at the
         // first failure meant one unverifiable resolver reported the firewall as
         // broken, and the cheapest, most safety-critical read-back was last in
@@ -1051,12 +1085,19 @@ impl PolicyExecutor for CanonicalPolicyExecutor {
     fn verification(&self, policy: &TopologyPolicy) -> Option<PolicyExecutionEvidence> {
         let state = self.readback.lock().ok()?;
         let readback = state.as_ref()?;
-        (readback.key == Self::key(policy)
-            && readback.evidence.interface_verified
-            && readback.evidence.route_verified
-            && readback.evidence.dns_verified
-            && readback.evidence.firewall_verified)
-            .then_some(readback.evidence)
+        if readback.key != Self::key(policy) {
+            return None;
+        }
+        let proven = match policy.stage {
+            PolicyStage::PreTunnelBlocking => readback.evidence.firewall_verified,
+            PolicyStage::Final => {
+                readback.evidence.interface_verified
+                    && readback.evidence.route_verified
+                    && readback.evidence.dns_verified
+                    && readback.evidence.firewall_verified
+            }
+        };
+        proven.then_some(readback.evidence)
     }
 }
 
