@@ -13,6 +13,9 @@ use crate::vortix_core::cidr::{claims_default_route_v4, claims_default_route_v6,
 use crate::vortix_core::control::command::{
     CommandRequest, Deadline, IdempotencyKey, Secret, UserCommand,
 };
+use crate::vortix_core::control::diagnostics::{
+    DiagnosticCode, DiagnosticComponent, DiagnosticFields, DiagnosticSeverity,
+};
 use crate::vortix_core::control::hooks::{HookEvent, HookEventId, LifecycleFact};
 use crate::vortix_core::control::model::{
     AuthorityEpoch, ChallengeId, ChallengeKind, ChallengeRecord, ClientId, CompletionOutcome,
@@ -3741,18 +3744,30 @@ fn accept_policy_readback(
         dns_verified: readback.dns_verified,
         firewall_verified: readback.firewall_verified,
     };
-    if supervisor.verify_policy(&verification, now).is_err() {
+    // The identity fence decides whether the read-back is *about* current
+    // state; `verify_policy` decides whether current state is protected.
+    // Recording only fully verified read-back threw away the per-gate truth,
+    // so one unprovable gate left every indicator with nothing fresh to read.
+    if !supervisor.fences_policy(&verification) {
+        let _ = supervisor.verify_policy(&verification, now);
         return false;
     }
+    let gate = |verified: bool| {
+        if verified {
+            GateEvidence::Verified
+        } else {
+            GateEvidence::Unverified
+        }
+    };
     snapshot.observed.evidence = Some(ProtectionEvidence {
         desired_generation: revision.generation,
         authority_epoch: revision.authority_epoch,
         policy_digest: revision.digest,
         observed_at_millis: readback.observed_at_millis,
-        interface: GateEvidence::Verified,
-        route: GateEvidence::Verified,
-        dns: GateEvidence::Verified,
-        firewall: GateEvidence::Verified,
+        interface: gate(readback.interface_verified),
+        route: gate(readback.route_verified),
+        dns: gate(readback.dns_verified),
+        firewall: gate(readback.firewall_verified),
     });
     snapshot.observed.evidence_received_at_millis = Some(now);
     for scope in [
@@ -3764,6 +3779,21 @@ fn accept_policy_readback(
         owner
             .observation_clocks
             .insert(scope, readback.observed_at_millis);
+    }
+    if supervisor.verify_policy(&verification, now).is_err() {
+        owner.diagnostics.push(
+            now,
+            DiagnosticComponent::Protection,
+            DiagnosticSeverity::Warning,
+            DiagnosticCode::ProtectionGatesUnverified,
+            DiagnosticFields::ProtectionGates {
+                interface: readback.interface_verified,
+                route: readback.route_verified,
+                dns: readback.dns_verified,
+                firewall: readback.firewall_verified,
+            },
+        );
+        return false;
     }
     true
 }
@@ -7067,9 +7097,10 @@ fn derive_effective(
     } else {
         ProtectionStatus::Degraded
     };
+    let firewall_verified = firewall_gate_proven(evidence, current);
     let applied = supervisor.and_then(Supervisor::applied_topology);
     let kill_switch =
-        derive_effective_kill_switch(desired.kill_switch, protection, applied.as_ref());
+        derive_effective_kill_switch(desired.kill_switch, firewall_verified, applied.as_ref());
     snapshot.effective = EffectiveState {
         protection,
         desired_generation: desired.generation,
@@ -7085,16 +7116,37 @@ fn derive_effective(
     };
 }
 
+/// Fresh platform proof that the firewall is in the shape the current desired
+/// policy asks for. `current` carries the generation, authority-epoch, digest
+/// and age fence from [`evidence_matches`], so intent alone never satisfies
+/// this predicate.
+const fn firewall_gate_proven(evidence: &ProtectionEvidence, current: bool) -> bool {
+    current && matches!(evidence.firewall, GateEvidence::Verified)
+}
+
+/// The kill switch is a firewall fact, so it is derived from firewall
+/// read-back alone.
+///
+/// It used to inherit the global `ProtectionStatus`, which is the conjunction
+/// of the interface, route, DNS and firewall gates. An unverifiable resolver
+/// therefore reported the *firewall* as broken: connecting a VPN turned
+/// `block-on-drop` into `Degraded` even with a correct, verified firewall.
+/// Route, interface and DNS degradation already have their own honest
+/// indicators (the exit-IP rows, the tunnel state, and the DNS row's
+/// `Unverified`), so the kill-switch row was double-reporting them.
+///
+/// `firewall_verified` must mean *fresh platform read-back of the firewall
+/// gate*, never intent: without it the only honest answer is `Degraded`.
 fn derive_effective_kill_switch(
     mode: crate::vortix_core::state::killswitch::KillSwitchMode,
-    protection: ProtectionStatus,
+    firewall_verified: bool,
     applied: Option<&TopologyState>,
 ) -> Option<crate::vortix_core::state::killswitch::KillSwitchState> {
     match mode {
         crate::vortix_core::state::killswitch::KillSwitchMode::Off => {
             Some(crate::vortix_core::state::killswitch::KillSwitchState::Disabled)
         }
-        _ if protection == ProtectionStatus::Degraded => {
+        _ if !firewall_verified => {
             Some(crate::vortix_core::state::killswitch::KillSwitchState::Degraded)
         }
         crate::vortix_core::state::killswitch::KillSwitchMode::Auto => applied.map(|topology| {
@@ -7136,7 +7188,8 @@ fn publish_then_events(
 mod target_profiles_tests {
     use super::*;
     use crate::vortix_core::control::worker::{
-        CancellationToken, PolicyBarrier, PolicyExecutor, TunnelExecutionReceipt, TunnelExecutor,
+        wait_until, CancellationToken, PolicyBarrier, PolicyExecutor, TunnelExecutionReceipt,
+        TunnelExecutor,
     };
     use crate::vortix_core::control::DnsSecurityStatus;
     use crate::vortix_core::state::{KillSwitchMode, KillSwitchState};
@@ -7813,48 +7866,198 @@ mod target_profiles_tests {
         };
 
         assert_eq!(
-            derive_effective_kill_switch(KillSwitchMode::Off, ProtectionStatus::Protected, None),
+            derive_effective_kill_switch(KillSwitchMode::Off, true, None),
             Some(KillSwitchState::Disabled)
         );
         assert_eq!(
-            derive_effective_kill_switch(
-                KillSwitchMode::Auto,
-                ProtectionStatus::Protected,
-                Some(&armed)
-            ),
+            derive_effective_kill_switch(KillSwitchMode::Auto, true, Some(&armed)),
             Some(KillSwitchState::Armed)
         );
         assert_eq!(
-            derive_effective_kill_switch(
-                KillSwitchMode::Auto,
-                ProtectionStatus::Protected,
-                Some(&blocking_auto)
-            ),
+            derive_effective_kill_switch(KillSwitchMode::Auto, true, Some(&blocking_auto)),
             Some(KillSwitchState::Blocking)
         );
         assert_eq!(
-            derive_effective_kill_switch(
-                KillSwitchMode::AlwaysOn,
-                ProtectionStatus::Protected,
-                Some(&blocking_always)
-            ),
+            derive_effective_kill_switch(KillSwitchMode::AlwaysOn, true, Some(&blocking_always)),
             Some(KillSwitchState::Blocking)
         );
         assert_eq!(
-            derive_effective_kill_switch(
-                KillSwitchMode::Auto,
-                ProtectionStatus::Degraded,
-                Some(&armed)
-            ),
+            derive_effective_kill_switch(KillSwitchMode::Auto, false, Some(&armed)),
             Some(KillSwitchState::Degraded)
         );
         assert_eq!(
+            derive_effective_kill_switch(KillSwitchMode::AlwaysOn, true, None),
+            None
+        );
+    }
+
+    /// The reported bug: connecting a VPN moved the kill switch straight to
+    /// `Degraded`. The kill switch inherited the global `ProtectionStatus`,
+    /// which is the conjunction of four gates; with no tunnel up the route and
+    /// DNS gates verify trivially, so only a connected tunnel exposed it.
+    ///
+    /// Pin firewall-scoped derivation: an unprovable resolver or route must
+    /// leave the firewall indicator alone, and an unprovable *firewall* must
+    /// still degrade it.
+    #[test]
+    fn unverifiable_dns_or_route_never_reports_the_firewall_as_broken() {
+        let armed = TopologyState {
+            kill_switch: KillSwitchMode::Auto,
+            ..TopologyState::default()
+        };
+        let blocking_always = TopologyState {
+            kill_switch: KillSwitchMode::AlwaysOn,
+            firewall_blocking: true,
+            ..TopologyState::default()
+        };
+        let mut evidence = ProtectionEvidence {
+            desired_generation: 0,
+            authority_epoch: AuthorityEpoch::default(),
+            policy_digest: PolicyDigest::default(),
+            observed_at_millis: 0,
+            interface: GateEvidence::Verified,
+            route: GateEvidence::Unverified,
+            dns: GateEvidence::Unverified,
+            firewall: GateEvidence::Verified,
+        };
+
+        assert!(
+            !evidence.all_gates_verified(),
+            "global protection is genuinely degraded in this scenario"
+        );
+        assert_eq!(
+            derive_effective_kill_switch(
+                KillSwitchMode::Auto,
+                evidence.firewall == GateEvidence::Verified,
+                Some(&armed)
+            ),
+            Some(KillSwitchState::Armed),
+            "block-on-drop with a verified firewall is Watching, not Degraded"
+        );
+        assert_eq!(
             derive_effective_kill_switch(
                 KillSwitchMode::AlwaysOn,
-                ProtectionStatus::Protected,
-                None
+                evidence.firewall == GateEvidence::Verified,
+                Some(&blocking_always)
             ),
-            None
+            Some(KillSwitchState::Blocking),
+            "vpn-only with a verified blocking firewall is Blocking, not Degraded"
+        );
+
+        evidence.firewall = GateEvidence::Unverified;
+        for mode in [KillSwitchMode::Auto, KillSwitchMode::AlwaysOn] {
+            assert_eq!(
+                derive_effective_kill_switch(
+                    mode,
+                    evidence.firewall == GateEvidence::Verified,
+                    Some(&blocking_always)
+                ),
+                Some(KillSwitchState::Degraded),
+                "an unprovable firewall must never be presented as effective truth ({mode:?})"
+            );
+        }
+    }
+
+    /// Whole-derivation proof for the reported bug, not just the decision
+    /// function. With a tunnel up and mode `block-on-drop`, an unverifiable
+    /// resolver leaves global protection degraded and the DNS indicator
+    /// `Unverified` — and the kill switch reporting the firewall it can
+    /// actually prove, which is `Watching`.
+    #[test]
+    fn derive_effective_keeps_the_kill_switch_on_firewall_truth_alone() {
+        let supervisor = Supervisor::new(
+            AuthorityEpoch(7),
+            Arc::new(NoopTunnel),
+            Arc::new(NoopPolicy),
+            1,
+            2,
+        );
+        let mut snapshot = ControlSnapshot::default();
+        snapshot.desired.authority_epoch = AuthorityEpoch(7);
+        snapshot.desired.kill_switch = KillSwitchMode::Auto;
+        snapshot.desired.refresh_policy_digest();
+        let operation_id = OperationId::from_parts(AuthorityEpoch(7), 1);
+        let policy = TopologyPolicy {
+            generation: snapshot.desired.generation,
+            authority_epoch: snapshot.desired.authority_epoch,
+            digest: snapshot.desired.policy_digest.clone(),
+            operation_id: operation_id.clone(),
+            deadline: Instant::now() + Duration::from_secs(5),
+            prior: TopologyState::default(),
+            target: TopologyState {
+                kill_switch: KillSwitchMode::Auto,
+                ..TopologyState::default()
+            },
+            prior_tunnel_revisions: BTreeMap::new(),
+            tunnel_revisions: BTreeMap::new(),
+            transition: TopologyTransitionKind::PolicyOnly,
+            required_blocking: false,
+            stage: PolicyStage::Final,
+        };
+        supervisor.submit_policy(&policy).expect("policy submitted");
+        let applied = wait_until(Duration::from_secs(1), || supervisor.poll_policy())
+            .expect("policy result observed");
+        assert_eq!(applied.outcome, PolicyOutcome::Applied);
+
+        snapshot.observed.evidence = Some(ProtectionEvidence {
+            desired_generation: snapshot.desired.generation,
+            authority_epoch: snapshot.desired.authority_epoch,
+            policy_digest: snapshot.desired.policy_digest.clone(),
+            observed_at_millis: 10,
+            interface: GateEvidence::Verified,
+            route: GateEvidence::Verified,
+            dns: GateEvidence::Unverified,
+            firewall: GateEvidence::Verified,
+        });
+
+        derive_effective(
+            &mut snapshot,
+            10,
+            ExecutionSelection::CanonicalAuthority,
+            Some(&supervisor),
+        );
+
+        assert_eq!(
+            snapshot.effective.protection,
+            ProtectionStatus::Degraded,
+            "an unverifiable resolver is a real protection gap"
+        );
+        assert_eq!(
+            snapshot.effective.kill_switch,
+            Some(KillSwitchState::Armed),
+            "but it is not a claim about the firewall"
+        );
+    }
+
+    /// Stale evidence is not proof, whatever the gate bits say. Pins the
+    /// freshness half of the firewall claim so a snapshot cannot keep
+    /// reporting `Watching` from a read-back that has aged out.
+    #[test]
+    fn stale_firewall_evidence_is_not_proof_even_when_the_gate_bit_is_set() {
+        let armed = TopologyState {
+            kill_switch: KillSwitchMode::Auto,
+            ..TopologyState::default()
+        };
+        let evidence = ProtectionEvidence {
+            desired_generation: 0,
+            authority_epoch: AuthorityEpoch::default(),
+            policy_digest: PolicyDigest::default(),
+            observed_at_millis: 0,
+            interface: GateEvidence::Verified,
+            route: GateEvidence::Verified,
+            dns: GateEvidence::Verified,
+            firewall: GateEvidence::Verified,
+        };
+
+        assert!(firewall_gate_proven(&evidence, true));
+        assert!(!firewall_gate_proven(&evidence, false));
+        assert_eq!(
+            derive_effective_kill_switch(
+                KillSwitchMode::Auto,
+                firewall_gate_proven(&evidence, false),
+                Some(&armed)
+            ),
+            Some(KillSwitchState::Degraded)
         );
     }
 

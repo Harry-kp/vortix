@@ -1276,6 +1276,34 @@ pub struct PolicyExecutionEvidence {
     pub firewall_verified: bool,
 }
 
+/// Fold one gate read-back into a proof bit, logging the platform reason when
+/// it cannot be proven.
+///
+/// Auditing the gates independently is deliberate. Collapsing them into one
+/// pass/fail let an unverifiable resolver or route report the *firewall* as
+/// broken, and lost the reason on the way out of the worker.
+#[must_use]
+pub fn gate_verified(
+    policy: &TopologyPolicy,
+    gate: &'static str,
+    readback: Result<(), String>,
+) -> bool {
+    match readback {
+        Ok(()) => true,
+        Err(reason) => {
+            tracing::warn!(
+                target: "vortix::control::policy",
+                operation = %policy.operation_id,
+                generation = policy.generation,
+                gate,
+                reason = %reason,
+                "protection gate read-back could not be verified"
+            );
+            false
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyOutcome {
     Applied,
@@ -1595,10 +1623,13 @@ fn run_policy_audit(
         .map_err(|_| WorkFailure::Panicked)
         .and_then(|result| result.map_err(|_| WorkFailure::EffectFailed))
         .and_then(|evidence| {
+            // A read-back that overran the audit budget is still true about
+            // the moment it observed, and freshness is enforced downstream on
+            // `observed_at_millis`. Discarding it here meant a platform whose
+            // resolver reads cost more than the budget could never re-prove
+            // protection at all: the snapshot stayed degraded for good.
             if cancellation.is_cancelled() {
                 Err(WorkFailure::Cancelled)
-            } else if Instant::now() >= policy.deadline {
-                Err(WorkFailure::TimedOut)
             } else {
                 Ok(evidence)
             }

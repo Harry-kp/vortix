@@ -100,6 +100,44 @@ impl State {
     }
 }
 
+/// Identity fence shared by [`Supervisor::fences_policy`] and
+/// [`Supervisor::verify_policy`]: the read-back must describe the exact
+/// applied final policy and only tunnels the supervisor still owns.
+fn policy_fence_holds(state: &State, evidence: &PolicyVerification) -> bool {
+    let exact = state
+        .latest_policy
+        .as_ref()
+        .zip(state.applied_policy.as_ref())
+        .is_some_and(|(latest, applied)| {
+            latest.0 == evidence.revision
+                && latest.1 == evidence.operation_id
+                && latest.2 == PolicyStage::Final
+                && applied.0 == latest.0
+                && applied.1 == latest.1
+        });
+    let tunnel_truth_exact = state.latest_topology.as_ref().is_some_and(|policy| {
+        policy.target.profiles.iter().all(|profile| {
+            policy
+                .tunnel_revisions
+                .get(profile)
+                .is_some_and(|revision| {
+                    state.profiles.get(profile).is_some_and(|entry| {
+                        entry.revision == *revision
+                            && entry.truth == SupervisedTruth::ObservedPresent
+                            && entry.adoption.as_ref().is_some_and(|adoption| {
+                                adoption.kind() != TunnelKindTag::WireGuard
+                                    || entry.handshake.as_ref().is_some_and(|handshake| {
+                                        handshake.generation == revision.generation
+                                            && !handshake.peer_public_key.is_empty()
+                                    })
+                            })
+                    })
+                })
+        })
+    });
+    exact && tunnel_truth_exact
+}
+
 pub struct Supervisor {
     tunnels: ProfileWorkerPool,
     policy: PolicyWorker,
@@ -562,38 +600,49 @@ impl Supervisor {
 
     /// Queue a read-only refresh before the current protection proof expires.
     /// Policy mutation work always has priority in the shared worker.
+    ///
+    /// Anchored on the *applied* policy, never on the last proof. Anchoring on
+    /// the proof latched the snapshot: one unverifiable gate cleared
+    /// `protected`, which stopped every further audit, so protection stayed
+    /// degraded until the next mutation instead of recovering on its own.
     pub fn submit_policy_audit_if_due(&self, now_millis: u64) -> Result<bool, WorkFailure> {
         let mut policy = {
             let state = self.state.lock().expect("supervisor mutex poisoned");
-            let Some((revision, operation_id, verified_at)) = state.protected.as_ref() else {
+            let Some((revision, operation_id)) = state.applied_policy.clone() else {
                 return Ok(false);
             };
+            let for_applied = |candidate: &ControlRevision, operation: &OperationId, at: u64| {
+                (*candidate == revision && *operation == operation_id).then_some(at)
+            };
             let last_attempt = state
-                .last_policy_audit
+                .protected
                 .as_ref()
-                .filter(|(attempt_revision, attempt_operation, _)| {
-                    attempt_revision == revision && attempt_operation == operation_id
+                .and_then(|(candidate, operation, verified_at)| {
+                    for_applied(candidate, operation, *verified_at)
                 })
-                .map_or(*verified_at, |(_, _, attempted_at)| *attempted_at)
-                .max(*verified_at);
-            if last_attempt > now_millis
-                || now_millis.saturating_sub(last_attempt) < MAX_PROTECTION_AGE_MILLIS / 2
-            {
+                .into_iter()
+                .chain(state.last_policy_audit.as_ref().and_then(
+                    |(candidate, operation, attempted_at)| {
+                        for_applied(candidate, operation, *attempted_at)
+                    },
+                ))
+                .max();
+            if last_attempt.is_some_and(|last_attempt| {
+                last_attempt > now_millis
+                    || now_millis.saturating_sub(last_attempt) < MAX_PROTECTION_AGE_MILLIS / 2
+            }) {
                 return Ok(false);
             }
-            let policy = state
+            state
                 .latest_topology
                 .as_ref()
                 .filter(|policy| {
                     policy.stage == PolicyStage::Final
-                        && policy.revision() == *revision
-                        && policy.operation_id == *operation_id
-                        && state.applied_policy.as_ref()
-                            == Some(&(revision.clone(), operation_id.clone()))
+                        && policy.revision() == revision
+                        && policy.operation_id == operation_id
                 })
                 .cloned()
-                .ok_or(WorkFailure::Stale)?;
-            policy
+                .ok_or(WorkFailure::Stale)?
         };
         policy.deadline = Instant::now()
             .checked_add(Duration::from_millis(MAX_PROTECTION_AGE_MILLIS / 2))
@@ -633,44 +682,23 @@ impl Supervisor {
         Some(result)
     }
 
+    /// Whether read-back belongs to the exact applied final policy and to
+    /// tunnels the supervisor still owns. This is the identity fence only —
+    /// it says the evidence is *about* current state, not that current state
+    /// is protected. Per-gate evidence may be recorded once it holds.
+    #[must_use]
+    pub fn fences_policy(&self, evidence: &PolicyVerification) -> bool {
+        let state = self.state.lock().expect("supervisor mutex poisoned");
+        policy_fence_holds(&state, evidence)
+    }
+
     pub fn verify_policy(
         &self,
         evidence: &PolicyVerification,
         now_millis: u64,
     ) -> Result<(), WorkFailure> {
         let mut state = self.state.lock().expect("supervisor mutex poisoned");
-        let exact = state
-            .latest_policy
-            .as_ref()
-            .zip(state.applied_policy.as_ref())
-            .is_some_and(|(latest, applied)| {
-                latest.0 == evidence.revision
-                    && latest.1 == evidence.operation_id
-                    && latest.2 == PolicyStage::Final
-                    && applied.0 == latest.0
-                    && applied.1 == latest.1
-            });
-        let tunnel_truth_exact = state.latest_topology.as_ref().is_some_and(|policy| {
-            policy.target.profiles.iter().all(|profile| {
-                policy
-                    .tunnel_revisions
-                    .get(profile)
-                    .is_some_and(|revision| {
-                        state.profiles.get(profile).is_some_and(|entry| {
-                            entry.revision == *revision
-                                && entry.truth == SupervisedTruth::ObservedPresent
-                                && entry.adoption.as_ref().is_some_and(|adoption| {
-                                    adoption.kind() != TunnelKindTag::WireGuard
-                                        || entry.handshake.as_ref().is_some_and(|handshake| {
-                                            handshake.generation == revision.generation
-                                                && !handshake.peer_public_key.is_empty()
-                                        })
-                                })
-                        })
-                    })
-            })
-        });
-        if !exact || !tunnel_truth_exact {
+        if !policy_fence_holds(&state, evidence) {
             state.protected = None;
             state.policy_degraded = Some(WorkFailure::Stale);
             return Err(WorkFailure::Stale);

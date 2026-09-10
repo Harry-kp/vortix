@@ -12,8 +12,8 @@ use crate::state::{Protocol, VpnProfile};
 use crate::vortix_core::cidr::Cidr;
 use crate::vortix_core::control::service::ProfileTopology;
 use crate::vortix_core::control::worker::{
-    PolicyBarrier, PolicyExecutionEvidence, PolicyExecutor, PolicyStage, TopologyPolicy,
-    TopologyState,
+    gate_verified, PolicyBarrier, PolicyExecutionEvidence, PolicyExecutor, PolicyStage,
+    TopologyPolicy, TopologyState,
 };
 use crate::vortix_core::control::BootEligibility;
 use crate::vortix_core::control::PolicyDigest;
@@ -1029,18 +1029,22 @@ impl PolicyExecutor for CanonicalPolicyExecutor {
         if policy.stage != PolicyStage::Final {
             return Err("only a final topology policy can be audited".into());
         }
-        self.verify_tunnels(policy)?;
-        self.verify_routes(policy)?;
-        self.verify_dns(policy)?;
-        self.verify_final_firewall(policy)?;
         let observed_at_millis = crate::utils::boot_elapsed_millis()
             .ok_or_else(|| "OS boot clock is unavailable for policy evidence".to_string())?;
+        // Every gate is read back independently, firewall first. Bailing at the
+        // first failure meant one unverifiable resolver reported the firewall as
+        // broken, and the cheapest, most safety-critical read-back was last in
+        // line for the audit budget.
         Ok(PolicyExecutionEvidence {
             observed_at_millis,
-            interface_verified: true,
-            route_verified: true,
-            dns_verified: true,
-            firewall_verified: true,
+            firewall_verified: gate_verified(
+                policy,
+                "firewall",
+                self.verify_final_firewall(policy),
+            ),
+            interface_verified: gate_verified(policy, "interface", self.verify_tunnels(policy)),
+            route_verified: gate_verified(policy, "route", self.verify_routes(policy)),
+            dns_verified: gate_verified(policy, "dns", self.verify_dns(policy)),
         })
     }
 

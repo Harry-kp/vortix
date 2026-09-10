@@ -3293,6 +3293,13 @@ fn handle_killswitch(
     0
 }
 
+/// Take post-operation kill-switch truth from the control snapshot the
+/// service just published, falling back to the durable record.
+///
+/// The snapshot's effective state is derived from firewall read-back under the
+/// service's own freshness fence, so it is the better answer whenever it
+/// exists. The durable record is the fallback, and it only reads back as
+/// `Blocking` while it still carries proof this process can use.
 fn refresh_killswitch_after_operation(
     engine: &mut VpnRuntime,
     outcome: &crate::cli::control::ClientOperationOutcome,
@@ -3300,10 +3307,17 @@ fn refresh_killswitch_after_operation(
     match crate::core::killswitch::load_state_checked() {
         Ok(Some(persisted)) => {
             engine.killswitch_mode = persisted.mode;
-            engine.killswitch_state = persisted.effective_state.unwrap_or(persisted.state);
+            engine.killswitch_state = outcome
+                .snapshot
+                .effective
+                .kill_switch
+                .unwrap_or_else(|| persisted.recovered_state());
         }
         Ok(None) => {
             engine.killswitch_mode = outcome.snapshot.desired.kill_switch;
+            if let Some(state) = outcome.snapshot.effective.kill_switch {
+                engine.killswitch_state = state;
+            }
         }
         Err(error) => {
             engine.killswitch_mode = outcome.snapshot.desired.kill_switch;

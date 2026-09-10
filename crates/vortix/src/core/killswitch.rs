@@ -47,15 +47,35 @@ pub enum FirewallObservationSource {
     PlatformReadback,
 }
 
+impl FirewallVerification {
+    /// Whether this proof still stands for `expected_policy_digest`.
+    ///
+    /// Proof cannot cross a process restart (`executor_epoch`), a reboot
+    /// (`boot_id`), its freshness ceiling, or an edit to the policy it
+    /// describes. Readers of the state file use this to tell a durable
+    /// `Blocking` *request* from a `Blocking` *fact*.
+    #[must_use]
+    pub fn proves(&self, expected_policy_digest: &str, now_unix_ms: u64) -> bool {
+        self.policy_digest == expected_policy_digest
+            && self.fresh_until_unix_ms > now_unix_ms
+            && self.executor_epoch == local_executor_epoch()
+            && utils::boot_identity().is_some_and(|boot_id| self.boot_id == boot_id)
+    }
+}
+
+fn now_unix_millis() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis()
+        .try_into()
+        .ok()
+}
+
 /// Construct fresh local proof after a successful platform read-back.
 #[must_use]
 pub fn local_verification(active: &[ActiveTunnelInfo]) -> FirewallVerification {
-    let observed_at_unix_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX);
+    let observed_at_unix_ms = now_unix_millis().unwrap_or(u64::MAX);
     FirewallVerification {
         policy_digest: policy_digest(active),
         observed_at_unix_ms,
@@ -289,6 +309,40 @@ pub struct PersistedState {
     /// during the emergency release.
     #[serde(default)]
     pub emergency_release_fence: bool,
+}
+
+impl PersistedState {
+    /// The state a reader may present for a record loaded from disk.
+    ///
+    /// `Blocking` survives the round trip only while the record still carries
+    /// proof this process can use — same process, same boot, inside the
+    /// freshness ceiling, for this exact policy. Otherwise the record is a
+    /// durable *request* and reads as `Degraded` until a live read-back
+    /// re-proves it.
+    ///
+    /// Every reader routes through this one helper. While each applied its own
+    /// version of the rule, `vortix killswitch` printed the raw field and told
+    /// users the firewall was blocking on the strength of a file.
+    #[must_use]
+    pub fn recovered_state(&self) -> KillSwitchState {
+        let state = self.effective_state.unwrap_or(self.state);
+        if state != KillSwitchState::Blocking {
+            return state;
+        }
+        let proven = self
+            .firewall_verification
+            .as_ref()
+            .is_some_and(|verification| {
+                policy_digest_from_persisted(&self.active_tunnels)
+                    .zip(now_unix_millis())
+                    .is_some_and(|(digest, now_ms)| verification.proves(&digest, now_ms))
+            });
+        if proven {
+            KillSwitchState::Blocking
+        } else {
+            KillSwitchState::Degraded
+        }
+    }
 }
 
 /// Why persisted kill-switch truth could not be loaded safely.
@@ -578,17 +632,9 @@ fn save_state_with_options_at(
         let existing: PersistedState = serde_json::from_str(&content).ok()?;
         let verification = existing.firewall_verification?;
         let expected = policy_digest_from_persisted(&active_tunnels)?;
-        let now_ms: u64 = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()?
-            .as_millis()
-            .try_into()
-            .ok()?;
-        (verification.policy_digest == expected
-            && verification.fresh_until_unix_ms > now_ms
-            && verification.executor_epoch == local_executor_epoch()
-            && utils::boot_identity().is_some_and(|boot_id| verification.boot_id == boot_id))
-        .then_some(verification)
+        verification
+            .proves(&expected, now_unix_millis()?)
+            .then_some(verification)
     });
 
     let legacy_state = if state == KillSwitchState::Degraded {
@@ -798,6 +844,100 @@ mod tests {
             policy_digest_from_persisted(&persisted).as_deref(),
             Some(verification.policy_digest.as_str())
         );
+    }
+
+    /// A `Blocking` record with usable proof is a fact; the same record
+    /// without proof is a request. `vortix killswitch` printed the raw field,
+    /// so it reported `Blocking` for any file that said so — including one
+    /// left behind by a dead process or a previous boot.
+    #[test]
+    fn persisted_blocking_needs_usable_proof_to_read_back_as_blocking() {
+        let active = [ActiveTunnelInfo {
+            interface: "utun3".to_string(),
+            server_ips: vec!["1.2.3.4".parse().unwrap()],
+            declared_cidrs: Vec::new(),
+            is_primary: true,
+        }];
+        let mut record = PersistedState {
+            schema_version: PERSISTED_STATE_SCHEMA_V2,
+            mode: KillSwitchMode::AlwaysOn,
+            state: KillSwitchState::Blocking,
+            effective_state: Some(KillSwitchState::Blocking),
+            vpn_interface: None,
+            vpn_server_ip: None,
+            active_tunnels: persisted_from_active(&active),
+            firewall_verification: Some(local_verification(&active)),
+            emergency_release_fence: false,
+        };
+
+        assert_eq!(
+            record.recovered_state(),
+            KillSwitchState::Blocking,
+            "fresh same-process proof for this exact policy is a Blocking fact"
+        );
+
+        record.firewall_verification = None;
+        assert_eq!(
+            record.recovered_state(),
+            KillSwitchState::Degraded,
+            "a durable request with no proof is never presented as Blocking"
+        );
+
+        let mut expired = local_verification(&active);
+        expired.fresh_until_unix_ms = 0;
+        record.firewall_verification = Some(expired);
+        assert_eq!(record.recovered_state(), KillSwitchState::Degraded);
+
+        let mut foreign = local_verification(&active);
+        foreign.executor_epoch = "standard-local:1:1".to_string();
+        record.firewall_verification = Some(foreign);
+        assert_eq!(
+            record.recovered_state(),
+            KillSwitchState::Degraded,
+            "proof cannot cross a process restart"
+        );
+
+        let mut rebooted = local_verification(&active);
+        rebooted.boot_id = "other-boot".to_string();
+        record.firewall_verification = Some(rebooted);
+        assert_eq!(
+            record.recovered_state(),
+            KillSwitchState::Degraded,
+            "proof cannot cross a reboot"
+        );
+
+        let mut other_policy = local_verification(&active);
+        other_policy.policy_digest = policy_digest(&[]);
+        record.firewall_verification = Some(other_policy);
+        assert_eq!(
+            record.recovered_state(),
+            KillSwitchState::Degraded,
+            "proof is bound to the exact policy it read back"
+        );
+    }
+
+    /// Non-blocking states are already claims about absence, which the modes
+    /// themselves assert; they pass through untouched.
+    #[test]
+    fn persisted_non_blocking_states_pass_through() {
+        for state in [
+            KillSwitchState::Disabled,
+            KillSwitchState::Armed,
+            KillSwitchState::Degraded,
+        ] {
+            let record = PersistedState {
+                schema_version: PERSISTED_STATE_SCHEMA_V2,
+                mode: KillSwitchMode::Auto,
+                state: KillSwitchState::Armed,
+                effective_state: Some(state),
+                vpn_interface: None,
+                vpn_server_ip: None,
+                active_tunnels: Vec::new(),
+                firewall_verification: None,
+                emergency_release_fence: false,
+            };
+            assert_eq!(record.recovered_state(), state);
+        }
     }
 
     #[test]

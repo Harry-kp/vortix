@@ -72,6 +72,7 @@ pub enum DiagnosticCode {
     NetworkIdentityChanged,
     ProtectionEngaged,
     ProtectionDisengaged,
+    ProtectionGatesUnverified,
     RetryScheduled,
     RetryBudgetExhausted,
     NetworkLinkLost,
@@ -122,6 +123,15 @@ pub enum DiagnosticFields {
         accepted: u32,
         rejected: u32,
         ambiguous: u32,
+    },
+    /// Which protection read-backs the platform could prove. Recorded whenever
+    /// a policy audit cannot prove all four, so `vortix report` names the gate
+    /// instead of leaving a bare degraded status with no reason.
+    ProtectionGates {
+        interface: bool,
+        route: bool,
+        dns: bool,
+        firewall: bool,
     },
 }
 

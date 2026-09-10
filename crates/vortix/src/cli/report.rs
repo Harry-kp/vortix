@@ -190,7 +190,9 @@ fn loaded_killswitch_summary(
     >,
 ) -> String {
     match loaded {
-        Ok(Some(persisted)) => persisted_killswitch_summary(persisted.mode, persisted.state),
+        Ok(Some(persisted)) => {
+            persisted_killswitch_summary(persisted.mode, persisted.recovered_state())
+        }
         Ok(None) => crate::state::KillSwitchMode::Off.display_name().to_string(),
         Err(error) => format!("Unknown — state could not be verified ({error})"),
     }
@@ -200,16 +202,7 @@ fn persisted_killswitch_summary(
     mode: crate::state::KillSwitchMode,
     state: crate::state::KillSwitchState,
 ) -> String {
-    let recovered_state = if state == crate::state::KillSwitchState::Blocking {
-        crate::state::KillSwitchState::Degraded
-    } else {
-        state
-    };
-    format!(
-        "{} ({})",
-        mode.display_name(),
-        recovered_state.display_status()
-    )
+    format!("{} ({})", mode.display_name(), state.display_status())
 }
 
 // ── Install method detection ────────────────────────────────────────────────
@@ -747,12 +740,14 @@ fn redact_home_prefix(path: &str) -> String {
 mod tests {
     use super::*;
 
+    /// `recovered_state` owns the "a durable request is not kernel proof"
+    /// rule (see `core::killswitch`); this pins the rendering around it.
     #[test]
-    fn persisted_blocking_state_is_reported_as_unverified_after_restart() {
+    fn persisted_state_renders_mode_and_recovered_state() {
         assert_eq!(
             persisted_killswitch_summary(
                 crate::state::KillSwitchMode::AlwaysOn,
-                crate::state::KillSwitchState::Blocking,
+                crate::state::KillSwitchState::Degraded,
             ),
             "VPN-only (Degraded)"
         );
