@@ -283,15 +283,38 @@ fn main() -> Result<()> {
                         },
                         cli::output::ExitCode::PermissionDenied,
                     )
+                } else if let Some(sidecar) =
+                    vortix::vortix_config::migration::unexplained_sidecar_cause(&e)
+                {
+                    // The blanket "restore the inventory" text told the user
+                    // neither which file was the problem nor how to clear it,
+                    // and this refusal stops every command — including
+                    // read-only ones — so it has to be answerable.
+                    let stray = profiles_dir.join(&sidecar.file_name);
+                    (
+                        cli::output::CliError {
+                            code: "profile_directory_has_unknown_file",
+                            message: format!(
+                                "Vortix found a profile metadata file it has no record of: {}",
+                                stray.display()
+                            ),
+                            hint: Some(format!(
+                                "Vortix tracks the profiles it manages in an inventory and will not touch the directory while a file there is missing from it, so no command can run until this is resolved. It is usually left over from an interrupted import or an older version. If you did not put it there, move it out and Vortix will start: mv {} {}",
+                                stray.display(),
+                                std::env::temp_dir().display()
+                            )),
+                        },
+                        cli::output::ExitCode::GeneralError,
+                    )
                 } else {
                     (
                         cli::output::CliError {
                             code: "profile_migration_refused",
                             message: format!("Vortix could not prepare the profile directory: {e}"),
-                            hint: Some(
-                                "Restore the managed profile directory to its saved inventory, then add new profiles from outside it with `vortix import <path>`."
-                                    .to_string(),
-                            ),
+                            hint: Some(format!(
+                                "Vortix will not touch a profile directory whose contents disagree with its saved inventory. Check {} for files Vortix did not write, then add new profiles from outside it with `vortix import <path>`.",
+                                profiles_dir.display()
+                            )),
                         },
                         cli::output::ExitCode::GeneralError,
                     )
