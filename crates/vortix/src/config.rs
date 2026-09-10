@@ -243,6 +243,10 @@ pub fn resolve_config_dir(cli_override: Option<&PathBuf>) -> std::io::Result<Pat
         }
     }
 
+    // An install created before Vortix set 0700 keeps the umask's mode
+    // forever, so the repair runs on every startup, not only at creation.
+    crate::utils::make_private(&path);
+
     // Canonicalize to resolve symlinks and ".." components
     std::fs::canonicalize(&path)
 }

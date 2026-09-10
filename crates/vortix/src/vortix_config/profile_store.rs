@@ -52,7 +52,7 @@ pub(crate) fn acquire_profile_lock(
     if let Some(parent) = profiles_dir.parent() {
         reject_symlink(parent)?;
     }
-    create_private_dir(profiles_dir)?;
+    crate::utils::create_user_dir(profiles_dir)?;
     let path = profiles_dir.join(PROFILE_LOCK);
     reject_symlink(&path)?;
     let mut options = OpenOptions::new();
@@ -382,7 +382,7 @@ impl FsProfileStore {
         reject_symlink(&self.profiles_dir)?;
         let root = self.root_dir();
         reject_symlink(&root)?;
-        create_private_dir(&self.profiles_dir)?;
+        crate::utils::create_user_dir(&self.profiles_dir)?;
         let auth = root.join("auth");
         if auth.exists() {
             reject_symlink(&auth)?;
@@ -1154,12 +1154,6 @@ fn reject_symlink_io(path: &Path) -> std::io::Result<()> {
 /// default, which left this directory group-writable. The profiles and their
 /// sidecars are 0600, but a group-writable directory still allows renaming or
 /// replacing them.
-fn create_private_dir(path: &Path) -> std::io::Result<()> {
-    crate::utils::create_private_dir_all(path)?;
-    crate::config::fix_ownership(path);
-    Ok(())
-}
-
 pub(crate) fn write_atomic(path: &Path, body: &[u8]) -> std::io::Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
