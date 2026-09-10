@@ -144,6 +144,19 @@ pub struct VpnRuntime {
     pub(crate) last_bytes_out: u64,
 }
 
+/// The real addresses Vortix remembers from an earlier unprotected session.
+///
+/// A record older than the cache ceiling describes a network the host may
+/// have left days ago. Restoring it would put a stale address in the leak
+/// indicator, so an expired record is not restored at all — the field reads
+/// unknown until a live observation replaces it.
+fn remembered_real_addresses(config_dir: &std::path::Path) -> (Option<String>, Option<String>) {
+    let max_age = Duration::from_secs(constants::REAL_IP_CACHE_MAX_AGE_SECS);
+    (
+        crate::core::real_ip_cache::load_recent(config_dir, max_age).map(|cached| cached.ip),
+        crate::core::real_ip_cache::load_recent_ipv6(config_dir, max_age).map(|cached| cached.ip),
+    )
+}
 impl VpnRuntime {
     /// Create the TUI presentation runtime. Lifecycle observation, retry,
     /// network-change handling, DNS/firewall policy, and protocol effects are
@@ -218,15 +231,13 @@ impl VpnRuntime {
 
         // Restore the cached real IPv4 / IPv6 — handles launch-with-VPN-up.
         // Only a recent record, and only as remembered until reconfirmed.
-        let max_age = Duration::from_secs(constants::REAL_IP_CACHE_MAX_AGE_SECS);
-        if let Some(cached) = crate::core::real_ip_cache::load_recent(&engine.config_dir, max_age) {
-            engine.real_ip = Some(cached.ip);
+        let (remembered_ipv4, remembered_ipv6) = remembered_real_addresses(&engine.config_dir);
+        if let Some(ip) = remembered_ipv4 {
+            engine.real_ip = Some(ip);
             engine.real_ip_from_cache = true;
         }
-        if let Some(cached) =
-            crate::core::real_ip_cache::load_recent_ipv6(&engine.config_dir, max_age)
-        {
-            engine.real_ipv6 = Some(cached.ip);
+        if let Some(ip) = remembered_ipv6 {
+            engine.real_ipv6 = Some(ip);
             engine.real_ipv6_from_cache = true;
         }
 
@@ -1101,6 +1112,76 @@ mod ipv6_gate_tests {
         assert!(
             hint.contains("sysctl"),
             "hint fell back to generic package install: {hint}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod remembered_address_tests {
+    use super::*;
+    use crate::constants::{REAL_IPV6_CACHE_FILE, REAL_IP_CACHE_FILE};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "vortix-remembered-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    fn seconds_ago(seconds: u64) -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_secs()
+            - seconds
+    }
+
+    /// Startup must go through the age-checked load. Reading the raw record
+    /// would put an address the host has not seen for days into the leak
+    /// indicator, presented as the real address it is being compared against.
+    #[test]
+    fn an_expired_cache_record_is_not_remembered_at_startup() {
+        let dir = scratch("expired");
+        let stale = seconds_ago(constants::REAL_IP_CACHE_MAX_AGE_SECS + 60 * 60);
+        std::fs::write(
+            dir.join(REAL_IP_CACHE_FILE),
+            format!("203.0.113.5\n{stale}\n"),
+        )
+        .expect("write v4 record");
+        std::fs::write(
+            dir.join(REAL_IPV6_CACHE_FILE),
+            format!("2001:db8::1\n{stale}\n"),
+        )
+        .expect("write v6 record");
+
+        assert!(
+            crate::core::real_ip_cache::load(&dir).is_some(),
+            "the record is on disk; the point is that startup declines it"
+        );
+        assert_eq!(
+            remembered_real_addresses(&dir),
+            (None, None),
+            "an expired record must not be restored as a remembered address"
+        );
+    }
+
+    #[test]
+    fn a_recent_cache_record_is_remembered_at_startup() {
+        let dir = scratch("recent");
+        crate::core::real_ip_cache::save(&dir, "203.0.113.5");
+        crate::core::real_ip_cache::save_ipv6(&dir, "2001:db8::1");
+
+        assert_eq!(
+            remembered_real_addresses(&dir),
+            (
+                Some("203.0.113.5".to_string()),
+                Some("2001:db8::1".to_string())
+            )
         );
     }
 }

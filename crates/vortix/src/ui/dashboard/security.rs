@@ -1300,6 +1300,7 @@ mod tests {
     use crate::vortix_core::profile::ProfileId;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use std::time::Instant;
 
     fn insert_idle_tunnel(app: &mut App, name: &str) {
         let tunnel = crate::tunnel::TunnelKind::Mock(
@@ -2280,6 +2281,32 @@ mod tests {
         assert!(
             !out.contains("Not enforced"),
             "old IPv6 explainer must be gone:\n{out}"
+        );
+    }
+
+    /// Each row's freshness must come from its own probe. The fields share
+    /// one panel but not one clock: collapsing them onto a single tick was
+    /// what let a resolver reading that had not landed for minutes render
+    /// with the same age as an egress reading taken a second ago.
+    #[test]
+    fn the_panel_reads_each_row_freshness_from_its_own_observation() {
+        let mut app = App::new_test();
+        let now = Instant::now();
+        let long_ago = now
+            .checked_sub(app.telemetry_stale_after() + Duration::from_secs(30))
+            .expect("instant in range");
+        app.runtime.last_egress_check = Some(now);
+        app.runtime.last_dns_check = Some(long_ago);
+
+        let state = collect_partial_state(&app, None, 60);
+
+        assert!(
+            !state.is_stale(state.egress_age),
+            "the egress reading was taken just now"
+        );
+        assert!(
+            state.is_stale(state.dns_age),
+            "the resolver reading is older than the staleness window and must say so"
         );
     }
 }
