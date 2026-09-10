@@ -10,6 +10,7 @@ use ratatui::{
     widgets::{Block, Borders, Padding, Paragraph},
     Frame,
 };
+use std::time::Duration;
 
 // ── Layout primitives ───────────────────────────────────────────────────────
 //
@@ -216,6 +217,63 @@ fn section_header(name: &'static str) -> Line<'static> {
     ))
 }
 
+/// Tag on a value that Vortix remembers but has not re-observed this session.
+const REMEMBERED_TAG: &str = "last known";
+
+/// A real (pre-VPN) address, together with how Vortix came to know it.
+///
+/// The provenance travels with the address rather than in a parallel flag,
+/// because the two are only ever meaningful together: an address restored
+/// from the cache and an address just observed unprotected are different
+/// claims, and the panel renders them differently.
+#[derive(Clone, PartialEq, Eq)]
+enum RealAddress {
+    /// Nothing observed this session and nothing recent remembered.
+    Unknown,
+    /// Seen with no tunnel in the path — a current fact.
+    Observed(String),
+    /// Restored from the cache and not yet re-confirmed this session.
+    Remembered(String),
+}
+
+impl RealAddress {
+    /// Build from a stored address plus whether it came from the cache.
+    fn new(address: Option<String>, from_cache: bool) -> Self {
+        match address {
+            Some(address) if address.is_empty() => Self::Unknown,
+            Some(address) if from_cache => Self::Remembered(address),
+            Some(address) => Self::Observed(address),
+            None => Self::Unknown,
+        }
+    }
+
+    fn address(&self) -> Option<&str> {
+        match self {
+            Self::Unknown => None,
+            Self::Observed(address) | Self::Remembered(address) => Some(address),
+        }
+    }
+}
+
+/// How much room a row has for its value at this panel width.
+fn value_budget(inner_width: usize) -> usize {
+    inner_width
+        .saturating_sub(LABEL_COLUMN_WIDTH)
+        .saturating_sub(SIGIL_COLUMN_WIDTH)
+}
+
+/// Append `tag` only when the row can show it whole. A half-truncated tag
+/// reads as corruption, and the row's sigil already carries the signal — the
+/// tag is the spelled-out version for the widths that can afford it.
+fn tagged_if_it_fits(value: &str, tag: &str, inner_width: usize) -> String {
+    let tagged = format!("{value} · {tag}");
+    if tagged.chars().count() <= value_budget(inner_width) {
+        tagged
+    } else {
+        value.to_string()
+    }
+}
+
 /// Value color is derived from the sigil so each row reads as one unit.
 fn audit_row(label: &str, value: &str, sigil: Sigil, inner_width: usize) -> Line<'static> {
     let label_col = format!("{label:<10}: ");
@@ -243,6 +301,16 @@ fn audit_row(label: &str, value: &str, sigil: Sigil, inner_width: usize) -> Line
 
 fn push_dns_rows(lines: &mut Vec<Line<'static>>, s: &PanelState, w: usize) {
     use crate::vortix_core::control::DnsSecurityStatus;
+    // Only an observed resolver can go stale; the VPN's own is policy.
+    if s.dns_is_stale() {
+        lines.push(audit_row(
+            "DNS",
+            constants::MSG_UNAVAILABLE,
+            Sigil::AlarmWarn,
+            w,
+        ));
+        return;
+    }
     let dns_value = format_value_with_tag(&s.dns_server, s.dns_provider);
     let dns_value = match s.dns_status {
         DnsSecurityStatus::Unverified => format!("Unverified · {dns_value}"),
@@ -258,37 +326,55 @@ fn push_dns_rows(lines: &mut Vec<Line<'static>>, s: &PanelState, w: usize) {
 }
 
 fn has_v6_signal(s: &PanelState) -> bool {
-    s.real_ipv6.is_some() || s.public_ipv6.is_some()
+    s.real_ipv6.address().is_some() || s.public_ipv6.is_some()
+}
+
+/// A real-address row. An address carried over from a previous session is
+/// what Vortix last saw unprotected, not something it can vouch for now, so
+/// it renders greyed and tagged rather than ticked.
+fn real_ip_row(label: &str, address: &RealAddress, pending: &str, w: usize) -> Line<'static> {
+    match address {
+        RealAddress::Observed(ip) => audit_row(label, ip, Sigil::OkMuted, w),
+        RealAddress::Remembered(ip) => audit_row(
+            label,
+            &tagged_if_it_fits(ip, REMEMBERED_TAG, w),
+            Sigil::NotApplicable,
+            w,
+        ),
+        RealAddress::Unknown => audit_row(label, pending, Sigil::NotApplicable, w),
+    }
 }
 
 fn push_real_ip_rows(lines: &mut Vec<Line<'static>>, s: &PanelState, w: usize) {
     let v6 = has_v6_signal(s);
     let v4_label = if v6 { "Real IPv4" } else { "Real IP" };
-    let (v4_value, v4_sigil) = match s.real_ip.as_deref() {
-        Some(ip) if !ip.is_empty() => (ip.to_string(), Sigil::OkMuted),
-        _ => ("detecting…".to_string(), Sigil::NotApplicable),
-    };
-    lines.push(audit_row(v4_label, &v4_value, v4_sigil, w));
+    lines.push(real_ip_row(v4_label, &s.real_ip, "detecting…", w));
     if v6 {
-        let (v6_value, v6_sigil) = match s.real_ipv6.as_deref() {
-            Some(ip) => (ip.to_string(), Sigil::OkMuted),
-            None => ("checking…".to_string(), Sigil::NotApplicable),
-        };
-        lines.push(audit_row("Real IPv6", &v6_value, v6_sigil, w));
+        lines.push(real_ip_row("Real IPv6", &s.real_ipv6, "checking…", w));
     }
 }
 
 fn push_exit_ip_rows(lines: &mut Vec<Line<'static>>, s: &PanelState, w: usize) {
     let v6 = has_v6_signal(s);
     let v4_label = if v6 { "Exit IPv4" } else { "Exit IP" };
-    let v4_sigil = match s.ip_status {
-        IpStatus::Masked => Sigil::OkMuted,
-        IpStatus::Leaking => Sigil::AlarmError,
-        IpStatus::Pending => Sigil::NotApplicable,
-    };
-    lines.push(audit_row(v4_label, &s.public_ip, v4_sigil, w));
-    if s.ip_status == IpStatus::Leaking {
-        lines.push(alarm_subline("real IPv4 exposed", w));
+    // A reading this old supports no value and no verdict drawn from one.
+    if s.egress_is_stale() {
+        lines.push(audit_row(
+            v4_label,
+            constants::MSG_UNAVAILABLE,
+            Sigil::AlarmWarn,
+            w,
+        ));
+    } else {
+        let v4_sigil = match s.ip_status {
+            IpStatus::Masked => Sigil::OkMuted,
+            IpStatus::Leaking => Sigil::AlarmError,
+            IpStatus::Pending => Sigil::NotApplicable,
+        };
+        lines.push(audit_row(v4_label, &s.public_ip, v4_sigil, w));
+        if s.ip_status == IpStatus::Leaking {
+            lines.push(alarm_subline("real IPv4 exposed", w));
+        }
     }
     if v6 {
         push_exit_ipv6_row(lines, s, w);
@@ -296,12 +382,21 @@ fn push_exit_ip_rows(lines: &mut Vec<Line<'static>>, s: &PanelState, w: usize) {
 }
 
 fn push_exit_ipv6_row(lines: &mut Vec<Line<'static>>, s: &PanelState, w: usize) {
+    if s.ipv6_is_stale() {
+        lines.push(audit_row(
+            "Exit IPv6",
+            constants::MSG_UNAVAILABLE,
+            Sigil::AlarmWarn,
+            w,
+        ));
+        return;
+    }
     let (v6_value, v6_sigil, leak_subline) = match s.ipv6_status {
-        Ipv6RowStatus::Masked => (
-            s.public_ipv6.clone().unwrap_or_else(|| "checking…".into()),
-            Sigil::OkMuted,
-            false,
-        ),
+        // A success mark belongs to an address, never to the absence of one.
+        Ipv6RowStatus::Masked => match s.public_ipv6.as_deref() {
+            Some(ip) => (ip.to_string(), Sigil::OkMuted, false),
+            None => ("checking…".to_string(), Sigil::NotApplicable, false),
+        },
         Ipv6RowStatus::Leaking => (
             s.public_ipv6.clone().unwrap_or_default(),
             Sigil::AlarmError,
@@ -317,6 +412,18 @@ fn push_exit_ipv6_row(lines: &mut Vec<Line<'static>>, s: &PanelState, w: usize) 
     lines.push(audit_row("Exit IPv6", &v6_value, v6_sigil, w));
     if leak_subline {
         lines.push(alarm_subline("v6 exposed — matches real IPv6", w));
+    }
+}
+
+/// The Location row. Location arrives with the public address, so it shares
+/// that observation's age.
+fn location_row(s: &PanelState, w: usize) -> Line<'static> {
+    if s.egress_is_stale() {
+        return audit_row("Location", constants::MSG_UNAVAILABLE, Sigil::AlarmWarn, w);
+    }
+    match s.location.as_deref() {
+        Some(loc) if !loc.is_empty() => audit_row("Location", loc, Sigil::OkMuted, w),
+        _ => audit_row("Location", "detecting…", Sigil::NotApplicable, w),
     }
 }
 
@@ -336,6 +443,9 @@ fn alarm_subline(text: &str, inner_width: usize) -> Line<'static> {
 }
 
 /// Footer line: `Updated Ns ago` / `Updated Nm ago` / pending placeholder.
+///
+/// The figure is the age of the **oldest** reading on display, so it cannot
+/// be read as a promise about a field that has quietly stopped refreshing.
 fn footer_line(secs: Option<u64>) -> Line<'static> {
     let text = match secs {
         Some(s) if s < 5 => "Updated just now".to_string(),
@@ -363,9 +473,9 @@ struct PanelState {
     show_section_headers: bool,
 
     // Identity
-    real_ip: Option<String>,
+    real_ip: RealAddress,
     public_ip: String,
-    real_ipv6: Option<String>,
+    real_ipv6: RealAddress,
     public_ipv6: Option<String>,
     location: Option<String>,
     ip_status: IpStatus,
@@ -374,16 +484,27 @@ struct PanelState {
     dns_provider: Option<&'static str>,
     dns_status: crate::vortix_core::control::DnsSecurityStatus,
 
+    // Per-observation ages. Each probe runs on its own schedule, so one
+    // panel-wide stamp would let a fresh field vouch for a stalled one.
+    // `None` means the observation has not landed yet — which is "waiting",
+    // not "stale".
+    egress_age: Option<Duration>,
+    dns_age: Option<Duration>,
+    ipv6_age: Option<Duration>,
+    /// True when the DNS row is showing an observed resolver rather than the
+    /// VPN's intended one. Only an observation can go stale.
+    dns_observed: bool,
+    /// How long an observation may go unrefreshed before its value stops
+    /// standing for the present.
+    stale_after: Duration,
+
     // Defense
     killswitch_mode: KillSwitchMode,
     killswitch_state: KillSwitchState,
     encryption: String,
-
-    // Footer
-    last_check_secs: Option<u64>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum IpStatus {
     Masked,
     Leaking,
@@ -402,6 +523,41 @@ enum Ipv6RowStatus {
 impl PanelState {
     fn show_headers(&self) -> bool {
         self.show_section_headers && self.inner_width >= SECTION_HEADER_MIN_INNER_WIDTH
+    }
+
+    fn is_stale(&self, age: Option<Duration>) -> bool {
+        age.is_some_and(|age| age > self.stale_after)
+    }
+
+    fn egress_is_stale(&self) -> bool {
+        self.is_stale(self.egress_age)
+    }
+
+    fn dns_is_stale(&self) -> bool {
+        self.dns_observed && self.is_stale(self.dns_age)
+    }
+
+    fn ipv6_is_stale(&self) -> bool {
+        self.is_stale(self.ipv6_age)
+    }
+
+    /// The age the footer reports: the oldest observation this panel is
+    /// actually showing. Reporting the newest would let one healthy probe
+    /// stamp "just now" over fields that stopped refreshing minutes ago.
+    fn oldest_shown_age(&self) -> Option<Duration> {
+        let mut ages = vec![self.egress_age];
+        if self.dns_observed {
+            ages.push(self.dns_age);
+        }
+        if has_v6_signal(self) {
+            ages.push(self.ipv6_age);
+        }
+        // A never-landed observation has no age but is the oldest thing here,
+        // so the footer stays on its pending reading until all of them land.
+        if ages.iter().any(Option::is_none) {
+            return None;
+        }
+        ages.into_iter().flatten().max()
     }
 }
 
@@ -565,6 +721,34 @@ fn compact_to_fit(audit: Vec<Line<'static>>, available_height: usize) -> Vec<Lin
 
 // ── State collection ────────────────────────────────────────────────────────
 
+/// Whether `value` is an address rather than one of the pipeline's
+/// placeholders.
+///
+/// Parsing is the whole test, and deliberately so: `detecting…`,
+/// `unavailable`, `Fetching...`, an error string and the empty string all
+/// fail it, so no list of placeholder spellings has to be kept in sync here.
+/// Before this, a probe that had given up stored the word `unavailable` in
+/// the exit-address field and the row compared that word against the real
+/// address, found them different, and ticked the exit as masked.
+fn is_address(value: &str) -> bool {
+    value.parse::<std::net::IpAddr>().is_ok()
+}
+
+/// Compare the exit address against the real one, but only when both are
+/// addresses. Anything else is an unknown, not a verdict.
+fn derive_ip_status(app: &App) -> IpStatus {
+    match &app.runtime.real_ip {
+        Some(real) if is_address(&app.runtime.public_ip) && is_address(real) => {
+            if &app.runtime.public_ip == real {
+                IpStatus::Leaking
+            } else {
+                IpStatus::Masked
+            }
+        }
+        _ => IpStatus::Pending,
+    }
+}
+
 fn derive_ipv6_row_status(app: &App) -> Ipv6RowStatus {
     let public = app.runtime.public_ipv6.as_deref();
     let real = app.runtime.real_ipv6.as_deref();
@@ -587,23 +771,10 @@ fn collect_protected_state(
     primary_snap: Option<&TunnelSnapshot>,
     inner_width: u16,
 ) -> PanelState {
-    let ip_status = match &app.runtime.real_ip {
-        Some(real)
-            if !app.runtime.public_ip.is_empty()
-                && app.runtime.public_ip != constants::MSG_DETECTING
-                && app.runtime.public_ip != constants::MSG_FETCHING
-                && !app.runtime.public_ip.starts_with("Error") =>
-        {
-            if &app.runtime.public_ip == real {
-                IpStatus::Leaking
-            } else {
-                IpStatus::Masked
-            }
-        }
-        _ => IpStatus::Pending,
-    };
+    let ip_status = derive_ip_status(app);
 
     let dns_server = dns_display_value(app);
+    let dns_observed = app.control_snapshot.dns.intended_servers.is_empty();
     let dns_provider = dns_provider_label(&dns_server);
     let encryption = derive_encryption(primary_snap);
 
@@ -619,9 +790,12 @@ fn collect_protected_state(
     PanelState {
         inner_width,
         show_section_headers: true,
-        real_ip: app.runtime.real_ip.clone(),
+        real_ip: RealAddress::new(app.runtime.real_ip.clone(), app.runtime.real_ip_from_cache),
         public_ip: app.runtime.public_ip.clone(),
-        real_ipv6: app.runtime.real_ipv6.clone(),
+        real_ipv6: RealAddress::new(
+            app.runtime.real_ipv6.clone(),
+            app.runtime.real_ipv6_from_cache,
+        ),
         public_ipv6: app.runtime.public_ipv6.clone(),
         location,
         ip_status,
@@ -629,13 +803,14 @@ fn collect_protected_state(
         dns_server,
         dns_provider,
         dns_status: app.control_snapshot.dns.status,
+        egress_age: app.runtime.last_egress_check.map(|at| at.elapsed()),
+        dns_age: app.runtime.last_dns_check.map(|at| at.elapsed()),
+        ipv6_age: app.runtime.last_ipv6_check.map(|at| at.elapsed()),
+        dns_observed,
+        stale_after: app.telemetry_stale_after(),
         killswitch_mode: app.registry.killswitch_mode(),
         killswitch_state: app.registry.killswitch_state(),
         encryption,
-        last_check_secs: app
-            .runtime
-            .last_security_check
-            .map(|t| t.elapsed().as_secs()),
     }
 }
 
@@ -666,21 +841,7 @@ fn collect_partial_state(
     // exit" become the truthful rendering.
     let has_primary = primary_snap.is_some();
     let (public_ip, location, ip_status) = if has_primary {
-        let ip_status = match &app.runtime.real_ip {
-            Some(real)
-                if !app.runtime.public_ip.is_empty()
-                    && app.runtime.public_ip != constants::MSG_DETECTING
-                    && app.runtime.public_ip != constants::MSG_FETCHING
-                    && !app.runtime.public_ip.starts_with("Error") =>
-            {
-                if &app.runtime.public_ip == real {
-                    IpStatus::Leaking
-                } else {
-                    IpStatus::Masked
-                }
-            }
-            _ => IpStatus::Pending,
-        };
+        let ip_status = derive_ip_status(app);
         let location = if app.runtime.location.is_empty()
             || app.runtime.location == constants::MSG_DETECTING
             || app.runtime.location == constants::MSG_FETCHING
@@ -695,12 +856,16 @@ fn collect_partial_state(
     };
 
     let dns_server = dns_display_value(app);
+    let dns_observed = app.control_snapshot.dns.intended_servers.is_empty();
     PanelState {
         inner_width,
         show_section_headers: true,
-        real_ip: app.runtime.real_ip.clone(),
+        real_ip: RealAddress::new(app.runtime.real_ip.clone(), app.runtime.real_ip_from_cache),
         public_ip,
-        real_ipv6: app.runtime.real_ipv6.clone(),
+        real_ipv6: RealAddress::new(
+            app.runtime.real_ipv6.clone(),
+            app.runtime.real_ipv6_from_cache,
+        ),
         public_ipv6: app.runtime.public_ipv6.clone(),
         location,
         ip_status,
@@ -708,13 +873,14 @@ fn collect_partial_state(
         dns_provider: dns_provider_label(&dns_server),
         dns_server,
         dns_status: app.control_snapshot.dns.status,
+        egress_age: app.runtime.last_egress_check.map(|at| at.elapsed()),
+        dns_age: app.runtime.last_dns_check.map(|at| at.elapsed()),
+        ipv6_age: app.runtime.last_ipv6_check.map(|at| at.elapsed()),
+        dns_observed,
+        stale_after: app.telemetry_stale_after(),
         killswitch_mode: app.registry.killswitch_mode(),
         killswitch_state: app.registry.killswitch_state(),
         encryption,
-        last_check_secs: app
-            .runtime
-            .last_security_check
-            .map(|t| t.elapsed().as_secs()),
     }
 }
 
@@ -781,11 +947,7 @@ fn build_protected_audit(s: &PanelState) -> Vec<Line<'static>> {
     push_real_ip_rows(&mut lines, s, w);
     push_exit_ip_rows(&mut lines, s, w);
 
-    let (loc_value, loc_sigil) = match s.location.as_deref() {
-        Some(loc) if !loc.is_empty() => (loc.to_string(), Sigil::OkMuted),
-        _ => ("detecting…".to_string(), Sigil::NotApplicable),
-    };
-    lines.push(audit_row("Location", &loc_value, loc_sigil, w));
+    lines.push(location_row(s, w));
 
     push_dns_rows(&mut lines, s, w);
 
@@ -815,7 +977,7 @@ fn build_protected_audit(s: &PanelState) -> Vec<Line<'static>> {
     }
 
     lines.push(Line::from(""));
-    lines.push(footer_line(s.last_check_secs));
+    lines.push(footer_line(s.oldest_shown_age().map(|age| age.as_secs())));
 
     lines
 }
@@ -851,11 +1013,7 @@ fn build_partial_audit(s: &PanelState) -> Vec<Line<'static>> {
         push_exit_ip_rows(&mut lines, s, w);
     }
 
-    let (loc_value, loc_sigil) = match s.location.as_deref() {
-        Some(loc) if !loc.is_empty() => (loc.to_string(), Sigil::OkMuted),
-        _ => ("detecting…".to_string(), Sigil::NotApplicable),
-    };
-    lines.push(audit_row("Location", &loc_value, loc_sigil, w));
+    lines.push(location_row(s, w));
 
     push_dns_rows(&mut lines, s, w);
 
@@ -887,7 +1045,7 @@ fn build_partial_audit(s: &PanelState) -> Vec<Line<'static>> {
     }
 
     lines.push(Line::from(""));
-    lines.push(footer_line(s.last_check_secs));
+    lines.push(footer_line(s.oldest_shown_age().map(|age| age.as_secs())));
 
     lines
 }
@@ -1179,9 +1337,9 @@ mod tests {
         PanelState {
             inner_width,
             show_section_headers: true,
-            real_ip: Some("203.0.113.5".to_string()),
+            real_ip: RealAddress::Observed("203.0.113.5".to_string()),
             public_ip: "1.2.3.4".to_string(),
-            real_ipv6: None,
+            real_ipv6: RealAddress::Unknown,
             public_ipv6: None,
             location: Some("US-East".to_string()),
             ip_status: IpStatus::Masked,
@@ -1192,8 +1350,237 @@ mod tests {
             killswitch_mode: KillSwitchMode::AlwaysOn,
             killswitch_state: KillSwitchState::Blocking,
             encryption: "ChaCha20-Poly1305".to_string(),
-            last_check_secs: Some(3),
+            egress_age: Some(Duration::from_secs(3)),
+            dns_age: Some(Duration::from_secs(3)),
+            ipv6_age: Some(Duration::from_secs(3)),
+            dns_observed: true,
+            stale_after: Duration::from_secs(90),
         }
+    }
+
+    // ── Observation freshness ─────────────────────────────────────────────
+
+    fn row_named(lines: &[Line<'static>], label: &str) -> String {
+        lines
+            .iter()
+            .map(line_text)
+            .find(|text| text.starts_with(label))
+            .unwrap_or_else(|| panic!("`{label}` row missing"))
+    }
+
+    fn sigil_of(lines: &[Line<'static>], label: &str) -> String {
+        lines
+            .iter()
+            .find(|line| line_text(line).starts_with(label))
+            .unwrap_or_else(|| panic!("`{label}` row missing"))
+            .spans
+            .last()
+            .expect("row sigil")
+            .content
+            .trim()
+            .to_string()
+    }
+
+    /// The address the probe last returned is not a statement about now.
+    /// Once its observation ages out, the row must say so rather than keep
+    /// displaying a value the reader would take as live.
+    #[test]
+    fn a_stale_public_address_renders_unavailable_not_the_last_value() {
+        let mut s = baseline_protected_state(52);
+        s.egress_age = Some(Duration::from_secs(600));
+
+        let lines = build_protected_audit(&s);
+
+        let exit = row_named(&lines, "Exit IP");
+        assert!(
+            exit.contains(constants::MSG_UNAVAILABLE),
+            "a stale exit address must read as unavailable: {exit:?}"
+        );
+        assert!(
+            !exit.contains("1.2.3.4"),
+            "a stale exit address must not still be displayed: {exit:?}"
+        );
+        assert_ne!(
+            sigil_of(&lines, "Exit IP"),
+            "✓",
+            "an unconfirmable exit address must never carry a success mark"
+        );
+
+        let location = row_named(&lines, "Location");
+        assert!(
+            location.contains(constants::MSG_UNAVAILABLE) && !location.contains("US-East"),
+            "location shares the public-address observation: {location:?}"
+        );
+    }
+
+    /// The same value stays on screen while its observation is fresh — the
+    /// rule is about age, not about hiding data.
+    #[test]
+    fn a_fresh_public_address_still_renders_its_value() {
+        let s = baseline_protected_state(52);
+        let lines = build_protected_audit(&s);
+
+        assert!(row_named(&lines, "Exit IP").contains("1.2.3.4"));
+        assert_eq!(sigil_of(&lines, "Exit IP"), "✓");
+    }
+
+    /// A real address carried over from a previous session is what Vortix
+    /// remembers, not what it has just seen. It may be shown, but not as a
+    /// verified present-tense fact.
+    #[test]
+    fn a_remembered_real_address_is_not_ticked_as_current() {
+        let mut s = baseline_protected_state(60);
+        s.real_ip = RealAddress::Remembered("203.0.113.5".to_string());
+
+        let lines = build_protected_audit(&s);
+        let real = row_named(&lines, "Real IP");
+
+        assert!(real.contains("203.0.113.5"), "{real:?}");
+        assert!(
+            real.contains(REMEMBERED_TAG),
+            "a remembered address must be labelled as such: {real:?}"
+        );
+        assert_ne!(
+            sigil_of(&lines, "Real IP"),
+            "✓",
+            "a remembered address must not carry a success mark"
+        );
+    }
+
+    /// The tag is dropped rather than truncated at widths that cannot show
+    /// it; the sigil still carries the signal.
+    #[test]
+    fn a_narrow_panel_drops_the_tag_but_keeps_the_signal() {
+        let mut s = baseline_protected_state(28);
+        s.real_ip = RealAddress::Remembered("203.0.113.5".to_string());
+
+        let lines = build_protected_audit(&s);
+        let real = row_named(&lines, "Real IP");
+
+        assert!(
+            !real.contains('·'),
+            "a tag that cannot fit must be dropped whole, not truncated: {real:?}"
+        );
+        assert_ne!(sigil_of(&lines, "Real IP"), "✓");
+    }
+
+    /// One healthy probe must not be able to stamp "just now" over readings
+    /// that stopped refreshing minutes ago.
+    #[test]
+    fn the_footer_reports_the_oldest_reading_not_the_newest() {
+        let mut s = baseline_protected_state(52);
+        s.egress_age = Some(Duration::from_secs(2));
+        s.dns_age = Some(Duration::from_secs(240));
+
+        let footer = build_protected_audit(&s)
+            .iter()
+            .map(line_text)
+            .find(|text| text.starts_with("Updated"))
+            .expect("footer missing");
+
+        assert_eq!(
+            footer, "Updated 4m ago",
+            "the footer must age with the stalest reading on display"
+        );
+    }
+
+    #[test]
+    fn the_footer_waits_while_any_shown_reading_has_never_landed() {
+        let mut s = baseline_protected_state(52);
+        s.dns_age = None;
+
+        let footer = build_protected_audit(&s)
+            .iter()
+            .map(line_text)
+            .find(|text| text.starts_with("Updated"))
+            .expect("footer missing");
+
+        assert_eq!(footer, "Updated pending…");
+    }
+
+    #[test]
+    fn a_stale_resolver_read_renders_unavailable() {
+        let mut s = baseline_protected_state(52);
+        s.dns_age = Some(Duration::from_secs(600));
+
+        let lines = build_protected_audit(&s);
+        let dns = row_named(&lines, "DNS");
+
+        assert!(dns.contains(constants::MSG_UNAVAILABLE), "{dns:?}");
+        assert!(!dns.contains("1.1.1.1"), "{dns:?}");
+    }
+
+    /// The VPN's intended resolvers are policy Vortix asked for, not a
+    /// reading it took, so they have no age to go stale.
+    #[test]
+    fn the_vpns_intended_resolver_never_goes_stale() {
+        let mut s = baseline_protected_state(52);
+        s.dns_observed = false;
+        s.dns_age = Some(Duration::from_secs(6000));
+
+        let dns = row_named(&build_protected_audit(&s), "DNS");
+        assert!(dns.contains("1.1.1.1"), "{dns:?}");
+        assert!(!dns.contains(constants::MSG_UNAVAILABLE), "{dns:?}");
+    }
+
+    /// A success mark belongs to an address. Without one the row is waiting,
+    /// whatever the derived status says.
+    #[test]
+    fn exit_ipv6_is_never_ticked_without_an_address() {
+        let mut s = baseline_protected_state(52);
+        s.real_ipv6 = RealAddress::Observed("2401:4900::abcd".to_string());
+        s.public_ipv6 = None;
+        s.ipv6_status = Ipv6RowStatus::Masked;
+
+        let lines = build_protected_audit(&s);
+        assert_ne!(
+            sigil_of(&lines, "Exit IPv6"),
+            "✓",
+            "`checking…` must never render as a confirmed exit address"
+        );
+    }
+
+    #[test]
+    fn a_stale_ipv6_probe_renders_unavailable() {
+        let mut s = baseline_protected_state(52);
+        s.real_ipv6 = RealAddress::Observed("2401:4900::abcd".to_string());
+        s.public_ipv6 = Some("2401:4900::1234".to_string());
+        s.ipv6_status = Ipv6RowStatus::Masked;
+        s.ipv6_age = Some(Duration::from_secs(600));
+
+        let lines = build_protected_audit(&s);
+        let exit_v6 = row_named(&lines, "Exit IPv6");
+        assert!(exit_v6.contains(constants::MSG_UNAVAILABLE), "{exit_v6:?}");
+        assert!(!exit_v6.contains("2401:4900::1234"), "{exit_v6:?}");
+    }
+
+    /// A probe that gave up leaves a placeholder in the exit-address field.
+    /// Comparing that placeholder against the real address is not evidence of
+    /// masking, so it must not produce a success mark.
+    #[test]
+    fn a_placeholder_exit_address_is_an_unknown_not_a_masked_exit() {
+        let mut app = App::new_test();
+        app.runtime.real_ip = Some("171.61.21.20".to_string());
+
+        for placeholder in [
+            constants::MSG_UNAVAILABLE,
+            constants::MSG_DETECTING,
+            constants::MSG_FETCHING,
+            "Error: no route to host",
+            "",
+        ] {
+            app.runtime.public_ip = placeholder.to_string();
+            assert_eq!(
+                derive_ip_status(&app),
+                IpStatus::Pending,
+                "`{placeholder}` is not an address and must not be judged as one"
+            );
+        }
+
+        app.runtime.public_ip = "203.0.113.9".to_string();
+        assert_eq!(derive_ip_status(&app), IpStatus::Masked);
+        app.runtime.public_ip = "171.61.21.20".to_string();
+        assert_eq!(derive_ip_status(&app), IpStatus::Leaking);
     }
 
     // ── Cipher strength classification ────────────────────────────────────
@@ -1504,7 +1891,7 @@ mod tests {
     #[test]
     fn protected_v6_present_renames_v4_label_and_renders_ok_v6_row() {
         let mut s = baseline_protected_state(60);
-        s.real_ipv6 = Some("2401:4900::abcd".to_string());
+        s.real_ipv6 = RealAddress::Observed("2401:4900::abcd".to_string());
         s.public_ipv6 = Some("2001:db8::1".to_string());
         s.ipv6_status = Ipv6RowStatus::Masked;
         let lines = build_protected_audit(&s);
@@ -1525,7 +1912,7 @@ mod tests {
     #[test]
     fn protected_v6_leaking_alarms_exit_ipv6_row() {
         let mut s = baseline_protected_state(60);
-        s.real_ipv6 = Some("2401:4900::abcd".to_string());
+        s.real_ipv6 = RealAddress::Observed("2401:4900::abcd".to_string());
         s.public_ipv6 = Some("2401:4900::abcd".to_string());
         s.ipv6_status = Ipv6RowStatus::Leaking;
         let lines = build_protected_audit(&s);
@@ -1545,7 +1932,7 @@ mod tests {
     #[test]
     fn protected_v6_pending_renders_checking_in_real_ipv6_row() {
         let mut s = baseline_protected_state(60);
-        s.real_ipv6 = None;
+        s.real_ipv6 = RealAddress::Unknown;
         s.public_ipv6 = Some("2401:4900::abcd".to_string());
         s.ipv6_status = Ipv6RowStatus::Pending;
         let lines = build_protected_audit(&s);
@@ -1563,7 +1950,7 @@ mod tests {
     #[test]
     fn completed_v6_probe_without_exit_renders_not_detected() {
         let mut s = baseline_protected_state(60);
-        s.real_ipv6 = Some("2401:4900::abcd".to_string());
+        s.real_ipv6 = RealAddress::Observed("2401:4900::abcd".to_string());
         s.public_ipv6 = None;
         s.ipv6_status = Ipv6RowStatus::Unavailable;
 

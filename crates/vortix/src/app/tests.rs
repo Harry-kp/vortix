@@ -723,6 +723,88 @@ fn test_auth_delete_profile_cleans_auth_file() {
 
 // --- Phase 1: Last security check timestamp (#47) ---
 
+/// Each field is refreshed by its own probe. A shared "last checked" stamp
+/// let a healthy probe vouch for a stalled one, so each observation now
+/// carries its own timestamp and only its own probe advances it.
+#[test]
+fn each_telemetry_observation_carries_its_own_timestamp() {
+    use crate::core::telemetry::TelemetryUpdate;
+    let mut app = test_app();
+    assert!(app.runtime.last_egress_check.is_none());
+    assert!(app.runtime.last_dns_check.is_none());
+    assert!(app.runtime.last_ipv6_check.is_none());
+
+    app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIp(
+        "1.2.3.4".to_string(),
+    )));
+    assert!(app.runtime.last_egress_check.is_some());
+    assert!(
+        app.runtime.last_dns_check.is_none(),
+        "a public-address reading must not vouch for the resolver reading"
+    );
+    assert!(
+        app.runtime.last_ipv6_check.is_none(),
+        "a public-address reading must not vouch for the IPv6 probe"
+    );
+
+    app.handle_message(Message::Telemetry(TelemetryUpdate::Dns(
+        "9.9.9.9".to_string(),
+    )));
+    assert!(app.runtime.last_dns_check.is_some());
+    assert!(app.runtime.last_ipv6_check.is_none());
+
+    app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIpv6(None)));
+    assert!(app.runtime.last_ipv6_check.is_some());
+}
+
+/// A reading that has aged out is reported as unknown, not left on screen as
+/// though it were current.
+#[test]
+fn a_stale_observation_is_never_presented_as_current() {
+    use std::time::{Duration, Instant};
+    let mut app = test_app();
+    let window = app.telemetry_stale_after();
+
+    assert!(!app.observation_is_stale(None), "never observed is pending");
+    app.runtime.last_egress_check = Some(Instant::now());
+    assert!(!app.observation_is_stale(app.runtime.last_egress_check));
+
+    app.runtime.last_egress_check = Instant::now().checked_sub(window + Duration::from_secs(1));
+    assert!(
+        app.observation_is_stale(app.runtime.last_egress_check),
+        "a reading older than the staleness window must not stand for the present"
+    );
+}
+
+/// An address restored from the cache is what Vortix remembers, not what it
+/// has just seen. Only an unprotected observation may promote it.
+#[test]
+fn a_remembered_real_address_is_promoted_only_by_a_live_observation() {
+    use crate::core::telemetry::TelemetryUpdate;
+    let mut app = test_app();
+    app.runtime.real_ip = Some("203.0.113.5".to_string());
+    app.runtime.real_ip_from_cache = true;
+
+    // Nothing has proved the host is unprotected yet, so the flag stands.
+    app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIp(
+        "203.0.113.5".to_string(),
+    )));
+    assert!(
+        app.runtime.real_ip_from_cache,
+        "without proof of an unprotected window the value stays remembered"
+    );
+
+    app.runtime.scanner_first_tick_done = true;
+    app.runtime.last_kernel_session_count = 0;
+    app.handle_message(Message::Telemetry(TelemetryUpdate::PublicIp(
+        "203.0.113.5".to_string(),
+    )));
+    assert!(
+        !app.runtime.real_ip_from_cache,
+        "an unprotected observation confirms the address as current"
+    );
+}
+
 #[test]
 fn test_last_security_check_updated_on_ip_telemetry() {
     use crate::core::telemetry::TelemetryUpdate;
@@ -3569,7 +3651,7 @@ fn unavailable_egress_probe_never_replaces_the_real_ip_cache() {
         crate::core::telemetry::TelemetryUpdate::EgressUnavailable,
     ));
 
-    assert_eq!(app.runtime.public_ip, "Unavailable");
+    assert_eq!(app.runtime.public_ip, constants::MSG_UNAVAILABLE);
     assert_eq!(app.runtime.real_ip.as_deref(), Some("203.0.113.7"));
 }
 

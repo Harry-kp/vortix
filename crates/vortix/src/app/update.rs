@@ -951,7 +951,9 @@ impl App {
                     self.log(&format!("SEC: DNS server: {dns}"));
                 }
                 self.runtime.dns_server = dns;
-                self.runtime.last_security_check = Some(Instant::now());
+                let checked_at = Instant::now();
+                self.runtime.last_dns_check = Some(checked_at);
+                self.runtime.last_security_check = Some(checked_at);
             }
             TelemetryUpdate::PublicIpv6(observed) => {
                 let is_connected = self.has_active_connection();
@@ -983,6 +985,7 @@ impl App {
                             self.runtime.real_ipv6 = Some(ip.clone());
                             crate::core::real_ip_cache::save_ipv6(&self.runtime.config_dir, ip);
                         }
+                        self.runtime.real_ipv6_from_cache = false;
                     }
                 }
                 if is_connected {
@@ -1043,10 +1046,12 @@ impl App {
         if !is_unknown_identity_value(&self.runtime.location) {
             self.log("NET: Location: Unknown");
         }
-        self.runtime.public_ip = "Unavailable".to_string();
+        self.runtime.public_ip = constants::MSG_UNAVAILABLE.to_string();
         self.runtime.isp = "Unknown".to_string();
         self.runtime.location = "Unknown".to_string();
-        self.runtime.last_security_check = Some(Instant::now());
+        let checked_at = Instant::now();
+        self.runtime.last_egress_check = Some(checked_at);
+        self.runtime.last_security_check = Some(checked_at);
     }
 
     fn apply_public_ipv4(&mut self, ip: String) {
@@ -1074,6 +1079,7 @@ impl App {
                 self.log(&format!("NET: Real IPv4 detected: {ip}"));
             }
             self.runtime.real_ip = Some(ip.clone());
+            self.runtime.real_ip_from_cache = false;
             if first_detection || changed {
                 crate::core::real_ip_cache::save(&self.runtime.config_dir, &ip);
             }
@@ -1092,7 +1098,9 @@ impl App {
             ));
         }
         self.runtime.public_ip = ip;
-        self.runtime.last_security_check = Some(Instant::now());
+        let checked_at = Instant::now();
+        self.runtime.last_egress_check = Some(checked_at);
+        self.runtime.last_security_check = Some(checked_at);
     }
 
     fn log_network_quality_transition(&mut self) {

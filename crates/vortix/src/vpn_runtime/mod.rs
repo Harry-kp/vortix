@@ -18,7 +18,7 @@ pub use connection_state::{ConnectionState, DetailedConnectionInfo};
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::config::AppConfig;
 use crate::constants;
@@ -73,7 +73,22 @@ pub struct VpnRuntime {
     pub real_ip: Option<String>,
     pub public_ipv6: Option<String>,
     pub real_ipv6: Option<String>,
+    /// True while `real_ip` is only the address the cache remembers, with no
+    /// unprotected observation in this session to confirm it. The Security
+    /// Guard must not present such a value as a current fact.
+    pub real_ip_from_cache: bool,
+    /// Same, for `real_ipv6`.
+    pub real_ipv6_from_cache: bool,
     pub last_ipv6_check: Option<Instant>,
+    /// When the public-address probe last landed — the observation behind
+    /// `public_ip`, `isp` and `location`.
+    pub last_egress_check: Option<Instant>,
+    /// When the resolver read last landed — the observation behind
+    /// `dns_server`.
+    pub last_dns_check: Option<Instant>,
+    /// Most recent of any telemetry observation. Useful as "something is
+    /// alive"; never as the age of a particular field, because each field is
+    /// refreshed by its own probe on its own schedule.
     pub last_security_check: Option<Instant>,
     pub ip_unchanged_warned: bool,
     pub last_connected_profile: Option<String>,
@@ -161,7 +176,11 @@ impl VpnRuntime {
             real_ip: None,
             public_ipv6: None,
             real_ipv6: None,
+            real_ip_from_cache: false,
+            real_ipv6_from_cache: false,
             last_ipv6_check: None,
+            last_egress_check: None,
+            last_dns_check: None,
             last_security_check: None,
             ip_unchanged_warned: false,
             last_connected_profile: None,
@@ -197,12 +216,18 @@ impl VpnRuntime {
             engine.dns_policy = persisted;
         }
 
-        // Restore the cached real IPv4 / IPv6 / DNS — handles launch-with-VPN-up.
-        if let Some(cached) = crate::core::real_ip_cache::load(&engine.config_dir) {
+        // Restore the cached real IPv4 / IPv6 — handles launch-with-VPN-up.
+        // Only a recent record, and only as remembered until reconfirmed.
+        let max_age = Duration::from_secs(constants::REAL_IP_CACHE_MAX_AGE_SECS);
+        if let Some(cached) = crate::core::real_ip_cache::load_recent(&engine.config_dir, max_age) {
             engine.real_ip = Some(cached.ip);
+            engine.real_ip_from_cache = true;
         }
-        if let Some(cached) = crate::core::real_ip_cache::load_ipv6(&engine.config_dir) {
+        if let Some(cached) =
+            crate::core::real_ip_cache::load_recent_ipv6(&engine.config_dir, max_age)
+        {
             engine.real_ipv6 = Some(cached.ip);
+            engine.real_ipv6_from_cache = true;
         }
 
         // Load profiles
@@ -243,7 +268,11 @@ impl VpnRuntime {
             real_ip: None,
             public_ipv6: None,
             real_ipv6: None,
+            real_ip_from_cache: false,
+            real_ipv6_from_cache: false,
             last_ipv6_check: None,
+            last_egress_check: None,
+            last_dns_check: None,
             last_security_check: None,
             ip_unchanged_warned: false,
             last_connected_profile: None,
@@ -288,12 +317,7 @@ impl VpnRuntime {
         match crate::core::killswitch::load_state_checked() {
             Ok(Some(persisted)) => {
                 self.killswitch_mode = persisted.mode;
-                self.killswitch_state = if persisted.state == KillSwitchState::Blocking {
-                    // A persisted request is not fresh kernel proof.
-                    KillSwitchState::Degraded
-                } else {
-                    persisted.state
-                };
+                self.killswitch_state = persisted.recovered_state();
             }
             Ok(None) => {}
             Err(error) => {
@@ -330,7 +354,11 @@ impl VpnRuntime {
             real_ip: None,
             public_ipv6: None,
             real_ipv6: None,
+            real_ip_from_cache: false,
+            real_ipv6_from_cache: false,
             last_ipv6_check: None,
+            last_egress_check: None,
+            last_dns_check: None,
             last_security_check: None,
             ip_unchanged_warned: false,
             last_connected_profile: None,
