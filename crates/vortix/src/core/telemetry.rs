@@ -866,6 +866,11 @@ mod tests {
         assert!(!is_valid_ipv4("1.2.3.4.5"));
         assert!(!is_valid_ipv4("not.an.ip.address"));
         assert!(!is_valid_ipv4(""));
+        // v4-mapped forms carry dotted-quad text, so they are what slips past
+        // a substring check rather than a parser.
+        assert!(!is_valid_ipv4("::ffff:192.168.1.1"));
+        assert!(!is_valid_ipv4("::192.168.1.1"));
+        assert!(!is_valid_ipv4("[192.168.1.1]"));
     }
 
     // === Ping output parsing tests ===

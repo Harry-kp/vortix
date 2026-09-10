@@ -541,20 +541,27 @@ impl<R: DnsCommandRunner> LinuxDnsPolicyEngine<R> {
             .cloned()
             .ok_or_else(|| format!("resolved DNS on {interface} is not owned by this process"))?;
 
-        // A disconnect tears the link down before DNS is released, so by this
-        // point the interface is usually already gone and `resolvectl` fails
-        // with `Failed to resolve interface "tun0": No such device`. That was
-        // surfaced as "Disconnect could not finish safely", which is the
-        // opposite of the truth: systemd-resolved drops per-link
-        // configuration with the link, so the release is already complete and
-        // there is nothing left that could leak. Ownership is cleared to match
-        // the world. A link that still exists is verified as before.
-        if !interface_exists(interface) {
-            self.ownership.resolved.remove(interface);
-            return Ok(());
-        }
-
-        let current = read_resolved_state(&mut self.runner, interface)?;
+        // Read first, and only ask whether the link still exists if that
+        // read fails. A disconnect tears the link down before DNS is
+        // released, so `resolvectl` often reports `Failed to resolve
+        // interface "tun0": No such device` — which was surfaced as
+        // "Disconnect could not finish safely", the opposite of the truth.
+        // systemd-resolved drops per-link configuration with the link, so
+        // there is nothing left to restore and nothing that could leak.
+        //
+        // Checking existence up front instead skipped the restore whenever
+        // the name was not a live link on this host, which silently disabled
+        // the whole release path under test.
+        let current = match read_resolved_state(&mut self.runner, interface) {
+            Ok(current) => current,
+            Err(error) => {
+                if interface_exists(interface) {
+                    return Err(error);
+                }
+                self.ownership.resolved.remove(interface);
+                return Ok(());
+            }
+        };
         if current != owned.applied {
             return Err(format!(
                 "refusing to restore DNS on {interface}: current resolved state no longer matches Vortix ownership"
@@ -607,15 +614,17 @@ impl<R: DnsCommandRunner> LinuxDnsPolicyEngine<R> {
                 .resolved
                 .get(interface)
                 .map_or(&owned.prior, |previous| &previous.applied);
-            if !interface_exists(interface) {
-                // Nothing to restore on a link that is gone: resolved drops
-                // per-link configuration when the link disappears.
-                continue;
-            }
             if let Err(error) = write_resolved_state(&mut self.runner, interface, target)
                 .and_then(|()| verify_resolved_state(&mut self.runner, interface, target))
             {
-                errors.push(format!("rollback DNS on {interface}: {error}"));
+                // A link that is gone has nothing to restore and cannot leak;
+                // resolved dropped its configuration with it. Anything else is
+                // a real rollback failure. Checking existence before
+                // attempting the write would skip the rollback entirely
+                // whenever the name is not a live link on this host.
+                if interface_exists(interface) {
+                    errors.push(format!("rollback DNS on {interface}: {error}"));
+                }
             }
         }
         for (interface, previous) in &before.resolved {
@@ -624,17 +633,14 @@ impl<R: DnsCommandRunner> LinuxDnsPolicyEngine<R> {
             {
                 continue;
             }
-            if !interface_exists(interface) {
-                // Nothing to restore on a link that is gone: resolved drops
-                // per-link configuration when the link disappears.
-                continue;
-            }
             if let Err(error) = write_resolved_state(&mut self.runner, interface, &previous.applied)
                 .and_then(|()| {
                     verify_resolved_state(&mut self.runner, interface, &previous.applied)
                 })
             {
-                errors.push(format!("rollback released DNS on {interface}: {error}"));
+                if interface_exists(interface) {
+                    errors.push(format!("rollback released DNS on {interface}: {error}"));
+                }
             }
         }
 

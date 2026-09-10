@@ -107,18 +107,54 @@ pub fn is_root() -> bool {
     false
 }
 
-/// Create a directory (and parents) owned by the real user.
+/// Create a directory (and parents) owned by, and private to, the real user.
 ///
-/// Under sudo, `create_dir_all` produces root-owned dirs.
-/// This wraps that call and hands ownership to the invoking user.
+/// Under sudo, `create_dir_all` produces root-owned dirs, so ownership is
+/// handed back to the invoking user.
+///
+/// It also applies the caller's umask, and Debian derivatives log in at 002 —
+/// which produced a group-writable 0775 for the profile store and the session
+/// journal. The files inside are 0600, so keys stayed unreadable, but any
+/// member of the user's group could rename, delete or replace a profile.
+/// Every directory Vortix creates holds VPN state, so none of them should be
+/// reachable by anyone else whatever the umask happens to be.
 ///
 /// # Errors
 ///
 /// Returns an error if directory creation fails.
 pub fn create_user_dir(path: &std::path::Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(path)?;
+    create_private_dir_all(path)?;
     crate::config::fix_ownership(path);
     Ok(())
+}
+
+/// `create_dir_all` with 0700 on every directory it creates.
+///
+/// `DirBuilder::mode` applies to each level it makes, which plain
+/// `create_dir_all` plus a `set_permissions` on the leaf does not — the
+/// intermediate parents keep the umask. Directories that already exist are
+/// left alone, so a shared ancestor such as `~/.local/share` is untouched.
+///
+/// # Errors
+///
+/// Returns an error if directory creation fails.
+#[cfg(unix)]
+pub fn create_private_dir_all(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
+}
+
+/// Non-Unix fallback: no mode bits to set.
+///
+/// # Errors
+///
+/// Returns an error if directory creation fails.
+#[cfg(not(unix))]
+pub fn create_private_dir_all(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)
 }
 
 /// Write a file owned by the real user.
