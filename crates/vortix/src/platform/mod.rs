@@ -147,14 +147,12 @@ pub fn current_platform() -> &'static Platform {
 /// `None` means the platform does not confine wg-quick and the caller may
 /// stage wherever it likes.
 pub(crate) fn wireguard_staging_dir() -> Option<&'static std::path::Path> {
-    #[cfg(target_os = "linux")]
-    {
-        Some(std::path::Path::new("/etc/wireguard/vortix"))
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        None
-    }
+    #[cfg(target_os = "linux")] // xtask:allow-platform-cfg: AppArmor confines wg-quick on Linux only
+    const STAGING_DIR: Option<&str> = Some("/etc/wireguard/vortix");
+    #[cfg(not(target_os = "linux"))] // xtask:allow-platform-cfg: see above
+    const STAGING_DIR: Option<&str> = None;
+
+    STAGING_DIR.map(std::path::Path::new)
 }
 
 pub(crate) fn observe_process_identity(

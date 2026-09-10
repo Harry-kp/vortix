@@ -1220,6 +1220,22 @@ fn try_get_dns_resolv_conf() -> Option<String> {
     parse_resolv_conf_server(&content)
 }
 
+/// Whether a network interface still exists on this host.
+///
+/// `if_nametoindex` is POSIX, so this holds on every distribution and inside
+/// containers or namespaces where `/sys` may be absent or restricted. Matching
+/// `resolvectl`'s error text would have been neither stable nor portable.
+fn interface_exists(interface: &str) -> bool {
+    let Ok(name) = std::ffi::CString::new(interface) else {
+        return false;
+    };
+    // SAFETY: `name` is a valid NUL-terminated C string that outlives the
+    // call. `if_nametoindex` only reads it and returns 0 for an unknown link.
+    #[allow(unsafe_code)]
+    let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
+    index != 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1884,20 +1900,4 @@ IP4.DNS[1]:                             192.168.1.100
             Some("2606:4700:4700::1111".to_string())
         );
     }
-}
-
-/// Whether a network interface still exists on this host.
-///
-/// `if_nametoindex` is POSIX, so this holds on every distribution and inside
-/// containers or namespaces where `/sys` may be absent or restricted. Matching
-/// `resolvectl`'s error text would have been neither stable nor portable.
-fn interface_exists(interface: &str) -> bool {
-    let Ok(name) = std::ffi::CString::new(interface) else {
-        return false;
-    };
-    // SAFETY: `name` is a valid NUL-terminated C string that outlives the
-    // call. `if_nametoindex` only reads it and returns 0 for an unknown link.
-    #[allow(unsafe_code)]
-    let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
-    index != 0
 }
