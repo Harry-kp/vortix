@@ -310,6 +310,14 @@ impl App {
             }
             Message::CloseOverlay => {
                 if let Some(challenge_id) = self.control_challenge.take() {
+                    // Remember which operation the user walked away from. It
+                    // still unwinds and reports a failure, and presenting that
+                    // as an error told them something had broken when they had
+                    // only changed their mind.
+                    if let Some(record) = self.control_snapshot.challenges.get(&challenge_id) {
+                        self.user_cancelled_operations
+                            .insert(record.operation_id.clone());
+                    }
                     if let Some(control) = &self.control_session {
                         if let Err(error) = control.cancel_challenge(challenge_id) {
                             self.log(&format!("WARN: Could not cancel challenge: {error}"));
@@ -984,11 +992,19 @@ impl App {
                             }
                             self.runtime.real_ipv6 = Some(ip.clone());
                             crate::core::real_ip_cache::save_ipv6(&self.runtime.config_dir, ip);
+                        } else {
+                            crate::core::real_ip_cache::confirm_ipv6(
+                                &self.runtime.config_dir,
+                                ip,
+                                std::time::Duration::from_secs(
+                                    constants::REAL_IP_CACHE_REFRESH_SECS,
+                                ),
+                            );
                         }
                         self.runtime.real_ipv6_from_cache = false;
                     }
                 }
-                if is_connected {
+                if is_connected && self.runtime.egress_v6_through_tunnel() {
                     if let (Some(real), Some(public)) = (&self.runtime.real_ipv6, &observed) {
                         if real == public {
                             self.log(&format!(
@@ -997,7 +1013,7 @@ impl App {
                         }
                     }
                 }
-                self.runtime.public_ipv6 = observed;
+                self.runtime.record_public_ipv6(observed, is_connected);
                 let checked_at = Instant::now();
                 self.runtime.last_ipv6_check = Some(checked_at);
                 self.runtime.last_security_check = Some(checked_at);
@@ -1082,12 +1098,23 @@ impl App {
             self.runtime.real_ip_from_cache = false;
             if first_detection || changed {
                 crate::core::real_ip_cache::save(&self.runtime.config_dir, &ip);
+            } else {
+                crate::core::real_ip_cache::confirm(
+                    &self.runtime.config_dir,
+                    &ip,
+                    std::time::Duration::from_secs(constants::REAL_IP_CACHE_REFRESH_SECS),
+                );
             }
         } else if self.runtime.public_ip != ip && self.runtime.public_ip != constants::MSG_FETCHING
         {
             self.runtime.ip_unchanged_warned = false;
             self.log(&format!("NET: Public IPv4 changed {old_ip} -> {ip}"));
         }
+        // `is_connected` is this sample's own provenance — it is the value
+        // recorded alongside it below. A sample taken before the tunnel came
+        // up matches the real address by definition and is not a leak; an
+        // egress-path change clears the provenance so such a reading cannot
+        // outlive the path it describes.
         if is_connected
             && self.runtime.real_ip.as_deref() == Some(ip.as_str())
             && !self.runtime.ip_unchanged_warned
@@ -1097,7 +1124,7 @@ impl App {
                 "WARN: Public IPv4 matches the pre-VPN address ({ip}) — possible leak or split-tunnel"
             ));
         }
-        self.runtime.public_ip = ip;
+        self.runtime.record_public_ipv4(ip, is_connected);
         let checked_at = Instant::now();
         self.runtime.last_egress_check = Some(checked_at);
         self.runtime.last_security_check = Some(checked_at);

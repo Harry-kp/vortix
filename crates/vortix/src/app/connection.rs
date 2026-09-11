@@ -377,7 +377,7 @@ fn late_route_conflict_for_operation(
         })
 }
 
-fn terminal_control_notification(
+pub(crate) fn terminal_control_notification(
     subject: PendingControlSubject,
     recovery_retry: bool,
     status: crate::vortix_core::control::OperationStatus,
@@ -738,6 +738,19 @@ impl App {
             }
         }
 
+        // The real-IP cache gate needs to know the scanner has reported at
+        // least once and how many tunnels the kernel shows. Its original
+        // writer went away with `Message::SyncSystemState`, leaving the flag
+        // permanently false — so no real IPv4 was ever remembered, and the
+        // address on screen vanished the moment a tunnel came up.
+        self.runtime.last_kernel_session_count = snapshot
+            .observed
+            .tunnels
+            .values()
+            .filter(|observed| observed.active)
+            .count();
+        self.runtime.scanner_first_tick_done = true;
+
         let tunnel_projection_changed = self.control_snapshot.tunnels != snapshot.tunnels
             || self.control_snapshot.primary != snapshot.primary;
         let egress_path_changed =
@@ -879,6 +892,13 @@ impl App {
         self.report_terminal_control_operations(&snapshot);
         self.control_snapshot = snapshot;
         if egress_path_changed {
+            // The readings on screen describe the path that just went away.
+            // Until the refresh lands they prove nothing: right after a
+            // connect the pre-VPN sample still equals the real address and
+            // was raising a red "exit IP is your real IP" alarm on a healthy
+            // tunnel, and right after a disconnect the exit address was still
+            // being shown as the user's own.
+            self.runtime.invalidate_egress_provenance();
             self.refresh_telemetry();
         }
     }
@@ -1131,14 +1151,82 @@ impl App {
             .collect()
     }
 
+    /// Write why an operation ran out of time into the user's own event log.
+    ///
+    /// Completion depends on a chain — a fresh observation, observed state
+    /// matching intent, platform read-back, that read-back naming the current
+    /// revision, and four verified gates. Any one failing stalled the
+    /// operation silently until its deadline, so a timeout said only "it
+    /// timed out". Whichever flag reads `no` here is the cause.
+    fn log_convergence_stall(
+        &mut self,
+        operation_id: &crate::vortix_core::control::OperationId,
+        snapshot: &crate::vortix_core::control::ControlSnapshot,
+    ) {
+        use crate::vortix_core::control::{OperationIntent, RequestedTunnelState};
+
+        let wanted = snapshot
+            .operations
+            .get(operation_id)
+            .map(|operation| match &operation.intent {
+                OperationIntent::DesiredSubset { tunnels, .. }
+                | OperationIntent::UnexpectedRecovery { tunnels, .. } => tunnels.clone(),
+                OperationIntent::GenerationScoped | OperationIntent::ProfileMutation { .. } => {
+                    std::collections::BTreeMap::new()
+                }
+            })
+            .unwrap_or_default();
+
+        let observed_any = wanted
+            .keys()
+            .all(|profile_id| snapshot.observed.tunnels.contains_key(profile_id));
+        let converged = wanted.iter().all(|(profile_id, requested)| {
+            snapshot
+                .observed
+                .tunnels
+                .get(profile_id)
+                .is_some_and(|fact| fact.active == (*requested == RequestedTunnelState::Connected))
+        });
+        let evidence = snapshot.observed.evidence.as_ref();
+        let evidence_current = evidence.is_some_and(|evidence| {
+            evidence.desired_generation == snapshot.desired.generation
+                && evidence.authority_epoch == snapshot.desired.authority_epoch
+                && evidence.policy_digest == snapshot.desired.policy_digest
+        });
+        let gates = evidence.map_or_else(
+            || "none".to_string(),
+            |evidence| {
+                format!(
+                    "interface={} route={} dns={} firewall={}",
+                    evidence.interface == crate::vortix_core::control::GateEvidence::Verified,
+                    evidence.route == crate::vortix_core::control::GateEvidence::Verified,
+                    evidence.dns == crate::vortix_core::control::GateEvidence::Verified,
+                    evidence.firewall == crate::vortix_core::control::GateEvidence::Verified,
+                )
+            },
+        );
+        self.log(&format!(
+            "DIAG: convergence stalled — observed={observed_any} converged={converged} \
+             evidence={} current={evidence_current} gates[{gates}]",
+            evidence.is_some(),
+        ));
+    }
+
     fn report_terminal_control_operations(
         &mut self,
         snapshot: &crate::vortix_core::control::ControlSnapshot,
     ) {
-        let disconnect_all_in_flight = self
-            .pending_control_operations
-            .values()
-            .any(|pending| matches!(pending.subject, PendingControlSubject::DisconnectAll));
+        // Any disconnect supersedes the connect that owns the tunnel, and the
+        // superseded connect settles as `Cancelled`. That is the mechanism
+        // working, not news — but only `DisconnectAll` was treated that way,
+        // so disconnecting a single profile popped up "connection cancelled"
+        // every time.
+        let disconnect_in_flight = self.pending_control_operations.values().any(|pending| {
+            matches!(
+                pending.subject,
+                PendingControlSubject::DisconnectAll | PendingControlSubject::Disconnection
+            )
+        });
 
         for TerminalOperation {
             operation_id,
@@ -1161,13 +1249,21 @@ impl App {
             if self.present_late_route_conflict(subject, status, result, late_route_conflict) {
                 continue;
             }
-            let superseded_connection_cancellation = disconnect_all_in_flight
+            let superseded_connection_cancellation = disconnect_in_flight
                 && status == crate::vortix_core::control::OperationStatus::Cancelled
                 && matches!(
                     subject,
                     PendingControlSubject::Connection | PendingControlSubject::Reconnection
                 );
-            let notification = if superseded_connection_cancellation {
+            // The user closed the credential prompt. They know what they did,
+            // so backing out is silent: the operation still unwinds and
+            // reports a fault, and surfacing anything at all — even a calm
+            // "cancelled" — is noise for a deliberate action.
+            if status == crate::vortix_core::control::OperationStatus::Expired {
+                self.log_convergence_stall(&operation_id, snapshot);
+            }
+            let user_cancelled = self.user_cancelled_operations.remove(&operation_id);
+            let notification = if superseded_connection_cancellation || user_cancelled {
                 None
             } else {
                 terminal_control_notification(

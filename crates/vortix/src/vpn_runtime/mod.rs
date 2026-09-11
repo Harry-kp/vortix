@@ -69,9 +69,24 @@ pub struct VpnRuntime {
     pub dns_server: String,
 
     // === System Info ===
+    /// Newest public IPv4 sample, for display. It says nothing about which
+    /// path it travelled — ask [`Self::egress_v4_through_tunnel`] before
+    /// drawing any conclusion from it.
     pub public_ip: String,
+    /// Whether `public_ip` was sampled with a tunnel in the path.
+    ///
+    /// Deliberately private. Three separate bugs came from reading the value
+    /// without its provenance: the exit address shown as the user's real one
+    /// after a disconnect, the real address lost on connect, and a red "real
+    /// IPv4 exposed" alarm raised on a healthy tunnel by comparing a pre-VPN
+    /// sample against itself. Writers go through [`Self::record_public_ipv4`]
+    /// and readers through the accessors, so no caller can compare readings
+    /// from different paths.
+    public_ip_from_tunnel: bool,
     pub real_ip: Option<String>,
+    /// Newest public IPv6 sample. Same contract as [`Self::public_ip`].
     pub public_ipv6: Option<String>,
+    public_ipv6_from_tunnel: bool,
     pub real_ipv6: Option<String>,
     /// True while `real_ip` is only the address the cache remembers, with no
     /// unprotected observation in this session to confirm it. The Security
@@ -173,8 +188,10 @@ impl VpnRuntime {
             dns_server: constants::MSG_DETECTING.to_string(),
 
             public_ip: constants::MSG_DETECTING.to_string(),
+            public_ip_from_tunnel: false,
             real_ip: None,
             public_ipv6: None,
+            public_ipv6_from_tunnel: false,
             real_ipv6: None,
             real_ip_from_cache: false,
             real_ipv6_from_cache: false,
@@ -265,8 +282,10 @@ impl VpnRuntime {
             dns_server: String::new(),
 
             public_ip: String::new(),
+            public_ip_from_tunnel: false,
             real_ip: None,
             public_ipv6: None,
+            public_ipv6_from_tunnel: false,
             real_ipv6: None,
             real_ip_from_cache: false,
             real_ipv6_from_cache: false,
@@ -351,8 +370,10 @@ impl VpnRuntime {
             isp: String::new(),
             dns_server: String::new(),
             public_ip: String::new(),
+            public_ip_from_tunnel: false,
             real_ip: None,
             public_ipv6: None,
+            public_ipv6_from_tunnel: false,
             real_ipv6: None,
             real_ip_from_cache: false,
             real_ipv6_from_cache: false,
@@ -538,6 +559,47 @@ impl VpnRuntime {
             return self.dns_policy.effective().clone();
         }
         self.reconcile_dns_observations(&observations)
+    }
+
+    /// Record a public IPv4 sample together with the path it travelled.
+    ///
+    /// The only writer. `through_tunnel` is the caller's connection state at
+    /// the moment the sample is accepted, which is what makes the value
+    /// evidence about the tunnel rather than merely the newest number seen.
+    pub fn record_public_ipv4(&mut self, ip: String, through_tunnel: bool) {
+        self.public_ip_from_tunnel = through_tunnel;
+        self.public_ip = ip;
+    }
+
+    /// Record a public IPv6 sample with its provenance. See
+    /// [`Self::record_public_ipv4`].
+    pub fn record_public_ipv6(&mut self, ip: Option<String>, through_tunnel: bool) {
+        self.public_ipv6_from_tunnel = through_tunnel;
+        self.public_ipv6 = ip;
+    }
+
+    /// Forget which path the current samples describe.
+    ///
+    /// Called when the egress path changes: the readings in hand describe the
+    /// path that just went away, so until a fresh probe lands they are
+    /// evidence of nothing.
+    pub fn invalidate_egress_provenance(&mut self) {
+        self.public_ip_from_tunnel = false;
+        self.public_ipv6_from_tunnel = false;
+    }
+
+    /// Whether the IPv4 sample in hand was taken through the tunnel.
+    ///
+    /// A leak verdict, or any claim about the real address, requires this.
+    #[must_use]
+    pub const fn egress_v4_through_tunnel(&self) -> bool {
+        self.public_ip_from_tunnel
+    }
+
+    /// IPv6 counterpart of [`Self::egress_v4_through_tunnel`].
+    #[must_use]
+    pub const fn egress_v6_through_tunnel(&self) -> bool {
+        self.public_ipv6_from_tunnel
     }
 
     /// Find a profile by name, returning its index.

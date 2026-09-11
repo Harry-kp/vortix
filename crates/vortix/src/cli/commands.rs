@@ -1072,19 +1072,54 @@ fn local_control_error_category(
     }
 }
 
+/// Whether a timed-out operation's own connect targets are still wanted, which
+/// is how the control plane records "the tunnel was up, so it was left alone".
+fn timed_out_connect_kept_its_tunnel(
+    outcome: &crate::cli::control::ClientOperationOutcome,
+) -> bool {
+    use crate::vortix_core::control::{OperationIntent, RequestedTunnelState};
+
+    let Some(record) = outcome.snapshot.operations.get(&outcome.operation_id) else {
+        return false;
+    };
+    let tunnels = match &record.intent {
+        OperationIntent::DesiredSubset { tunnels, .. }
+        | OperationIntent::UnexpectedRecovery { tunnels, .. } => tunnels,
+        OperationIntent::GenerationScoped | OperationIntent::ProfileMutation { .. } => {
+            return false
+        }
+    };
+    tunnels.iter().any(|(profile_id, requested)| {
+        *requested == RequestedTunnelState::Connected
+            && outcome.snapshot.desired.tunnels.get(profile_id)
+                == Some(&RequestedTunnelState::Connected)
+    })
+}
+
+/// Map a non-successful operation onto the user-facing error.
+///
+/// `OperationId`s are correlation identifiers for diagnostics, so they are
+/// logged on `vortix::cli` and never rendered into the message a person reads.
 fn operation_failure(
     action: &str,
     outcome: &crate::cli::control::ClientOperationOutcome,
 ) -> (&'static str, ExitCode, String) {
     use crate::vortix_core::control::{OperationFailure, OperationResult, OperationStatus};
 
-    let operation = &outcome.operation_id;
+    tracing::info!(
+        target: "vortix::cli",
+        operation = %outcome.operation_id,
+        action,
+        status = ?outcome.status,
+        result = ?outcome.result,
+        "lifecycle operation did not succeed"
+    );
     match (outcome.status, outcome.result.as_ref()) {
         (_, Some(OperationResult::ProfileMutationAppliedAfterDeadline)) => (
             "completed_after_deadline",
             ExitCode::Timeout,
             format!(
-                "{action} completed after its deadline; operation {operation} was applied and must not be retried"
+                "{action} finished after its time limit; it was applied and must not be retried"
             ),
         ),
         (OperationStatus::Expired, _)
@@ -1094,26 +1129,30 @@ fn operation_failure(
         ) => (
             "timeout",
             ExitCode::Timeout,
-            format!(
-                "{action} timed out; operation {operation} remains recorded for reconciliation"
-            ),
+            if timed_out_connect_kept_its_tunnel(outcome) {
+                format!(
+                    "{action} timed out before Vortix could verify the tunnel and network policy. \
+                     The tunnel is up and has been left running, but it is not verified as \
+                     protected yet. Run `vortix status` to see whether verification caught up."
+                )
+            } else {
+                format!("{action} timed out and was cleaned up; nothing is left running")
+            },
         ),
         (_, Some(OperationResult::Failed(OperationFailure::HandshakeFailed))) => (
             "connect_failed",
             ExitCode::GeneralError,
-            format!("WireGuard handshake failed for operation {operation}"),
+            "The WireGuard handshake with the server did not complete".into(),
         ),
         (_, Some(OperationResult::Failed(OperationFailure::AuthenticationFailed))) => (
             "authentication_failed",
             ExitCode::GeneralError,
-            format!(
-                "The VPN server rejected this profile's authentication for operation {operation}"
-            ),
+            "The VPN server rejected this profile's authentication".into(),
         ),
         (OperationStatus::Cancelled, _) | (_, Some(OperationResult::Cancelled)) => (
             "user_cancelled",
             ExitCode::GeneralError,
-            format!("{action} operation {operation} was cancelled"),
+            format!("{action} was cancelled"),
         ),
         _ => (
             if action == "disconnect" {
@@ -1122,7 +1161,7 @@ fn operation_failure(
                 "connect_failed"
             },
             ExitCode::GeneralError,
-            format!("{action} operation {operation} failed"),
+            format!("{action} failed"),
         ),
     }
 }
@@ -1230,12 +1269,14 @@ fn answer_openvpn_static_challenge(
             || challenge.profile_id.to_string(),
             |profile| profile.name.clone(),
         );
+    let needs = crate::cli::control::ChallengeNeed::of(challenge);
     match prompt_masked_otp(&challenge.label, challenge.expires_at_millis) {
         Ok(otp) if !otp.is_empty() => {
             Ok(crate::vortix_core::control::Secret::new(otp.into_bytes()))
         }
         Ok(_) => Err(crate::cli::control::LocalControlError::ChallengeEmpty {
             profile: profile_name,
+            needs,
         }),
         Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
             Err(crate::cli::control::LocalControlError::ChallengeCancelled)
@@ -1246,6 +1287,7 @@ fn answer_openvpn_static_challenge(
         Err(_) => Err(
             crate::cli::control::LocalControlError::ChallengeNonInteractive {
                 profile: profile_name,
+                needs,
             },
         ),
     }
@@ -3728,6 +3770,117 @@ mod tests {
         assert_eq!(code, "completed_after_deadline");
         assert_eq!(exit.code(), ExitCode::Timeout.code());
         assert!(message.contains("was applied and must not be retried"));
+    }
+
+    /// `OperationId`s are diagnostic correlation handles, so no user-facing
+    /// lifecycle error may render one.
+    #[test]
+    fn lifecycle_failure_messages_never_render_an_operation_id() {
+        use crate::vortix_core::control::{OperationFailure, OperationResult, OperationStatus};
+
+        let outcome = |status, result| crate::cli::control::ClientOperationOutcome {
+            operation_id: serde_json::from_str("\"op-0000000000000001-0000000000000037\"").unwrap(),
+            status,
+            result,
+            snapshot: crate::vortix_core::control::ControlSnapshot::default(),
+            profile_mutation: None,
+        };
+        let cases = [
+            outcome(OperationStatus::Expired, Some(OperationResult::Expired)),
+            outcome(
+                OperationStatus::Expired,
+                Some(OperationResult::ProfileMutationAppliedAfterDeadline),
+            ),
+            outcome(
+                OperationStatus::Failed,
+                Some(OperationResult::Failed(OperationFailure::HandshakeFailed)),
+            ),
+            outcome(
+                OperationStatus::Failed,
+                Some(OperationResult::Failed(
+                    OperationFailure::AuthenticationFailed,
+                )),
+            ),
+            outcome(OperationStatus::Cancelled, Some(OperationResult::Cancelled)),
+            outcome(OperationStatus::Failed, None),
+        ];
+
+        for case in cases {
+            let (_, _, message) = operation_failure("connect", &case);
+            assert!(
+                !message.contains("op-") && !message.contains("operation "),
+                "internal operation identifier leaked to the user: {message}"
+            );
+        }
+    }
+
+    /// A connect that timed out with nothing running says so; the deadline
+    /// expiring after the tunnel came up says the tunnel was kept instead.
+    #[test]
+    fn connect_timeout_message_distinguishes_a_kept_tunnel_from_a_cleaned_up_one() {
+        use crate::vortix_core::control::{
+            ControlSnapshot, OperationResult, OperationStatus, RequestedTunnelState,
+        };
+
+        let operation_id: crate::vortix_core::control::OperationId =
+            serde_json::from_str("\"op-0000000000000001-0000000000000037\"").unwrap();
+        let cleaned_up = crate::cli::control::ClientOperationOutcome {
+            operation_id: operation_id.clone(),
+            status: OperationStatus::Expired,
+            result: Some(OperationResult::Expired),
+            snapshot: ControlSnapshot::default(),
+            profile_mutation: None,
+        };
+        let (code, exit, message) = operation_failure("connect", &cleaned_up);
+        assert_eq!(code, "timeout");
+        assert_eq!(exit.code(), ExitCode::Timeout.code());
+        assert!(
+            message.contains("cleaned up"),
+            "a connect that left nothing running must say so: {message}"
+        );
+
+        let authority_epoch = crate::vortix_core::control::AuthorityEpoch(1);
+        let profile_id = crate::vortix_core::profile::ProfileId::new("kept-tunnel");
+        let mut snapshot = ControlSnapshot::default();
+        snapshot
+            .desired
+            .tunnels
+            .insert(profile_id.clone(), RequestedTunnelState::Connected);
+        let record = crate::vortix_core::control::OperationRecord {
+            id: operation_id.clone(),
+            idempotency_key: crate::vortix_core::control::IdempotencyKey::new("kept-tunnel"),
+            client_id: crate::vortix_core::control::ClientId::from_parts(authority_epoch, 0),
+            command_digest: crate::vortix_core::control::PolicyDigest::default(),
+            authority_epoch,
+            desired_generation: 1,
+            admitted_at_millis: 0,
+            deadline_millis: 37_000,
+            intent: crate::vortix_core::control::OperationIntent::DesiredSubset {
+                tunnels: std::collections::BTreeMap::from([(
+                    profile_id,
+                    RequestedTunnelState::Connected,
+                )]),
+                kill_switch: None,
+            },
+            status: OperationStatus::Expired,
+            result: Some(OperationResult::Expired),
+            failure_detail: None,
+        };
+        snapshot.operations.insert(operation_id.clone(), record);
+        let kept = crate::cli::control::ClientOperationOutcome {
+            operation_id,
+            status: OperationStatus::Expired,
+            result: Some(OperationResult::Expired),
+            snapshot,
+            profile_mutation: None,
+        };
+        let (code, exit, message) = operation_failure("connect", &kept);
+        assert_eq!(code, "timeout");
+        assert_eq!(exit.code(), ExitCode::Timeout.code());
+        assert!(
+            message.contains("left running") && message.contains("not verified"),
+            "a kept tunnel must be reported as running but unverified: {message}"
+        );
     }
 
     #[test]

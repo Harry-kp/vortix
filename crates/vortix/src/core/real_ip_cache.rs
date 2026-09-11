@@ -62,6 +62,38 @@ pub fn save(config_dir: &Path, ip: &str) {
     save_to(config_dir, REAL_IP_CACHE_FILE, ip);
 }
 
+/// Re-stamp an unchanged address so the record ages from the last time it was
+/// confirmed rather than the last time it changed.
+///
+/// Writing only on change made a *stable* address expire: the same value was
+/// re-observed every poll, nothing rewrote the file, and
+/// [`load_recent`] then discarded a record that was still correct. Rewrites at
+/// most once per `min_interval` so a confirmation every poll is not a write
+/// every poll.
+pub fn confirm(config_dir: &Path, ip: &str, min_interval: Duration) {
+    confirm_to(config_dir, REAL_IP_CACHE_FILE, ip, min_interval);
+}
+
+/// IPv6 counterpart of [`confirm`].
+pub fn confirm_ipv6(config_dir: &Path, ip: &str, min_interval: Duration) {
+    confirm_to(config_dir, REAL_IPV6_CACHE_FILE, ip, min_interval);
+}
+
+fn confirm_to(config_dir: &Path, file: &str, ip: &str, min_interval: Duration) {
+    let due = match load_from(config_dir, file) {
+        // A different address is a change, not a confirmation; leave it to
+        // the caller's `save`.
+        Some(cached) if cached.ip != ip => return,
+        // An untimestamped legacy record can never be shown to be recent, so
+        // stamping it is the only way it ever becomes usable.
+        Some(cached) => !cached.is_newer_than(min_interval),
+        None => true,
+    };
+    if due {
+        save_to(config_dir, file, ip);
+    }
+}
+
 #[must_use]
 pub fn load_ipv6(config_dir: &Path) -> Option<CachedRealIp> {
     load_from(config_dir, REAL_IPV6_CACHE_FILE)
@@ -147,6 +179,62 @@ mod tests {
         let loaded = load(&dir).expect("cache must load after save");
         assert_eq!(loaded.ip, "203.0.113.5");
         assert!(loaded.captured_at.is_some(), "timestamp must be written");
+    }
+
+    /// The reported bug: writing only on change made the stamp mean "last
+    /// changed". A real address that never changes was re-observed every poll,
+    /// nothing rewrote the file, and the record expired while still correct.
+    #[test]
+    fn a_stable_address_is_kept_alive_by_confirmation() {
+        let dir = scratch_dir("confirm-restamps");
+        let path = dir.join(REAL_IP_CACHE_FILE);
+        let stale = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 23 * 60 * 60;
+        std::fs::write(&path, format!("203.0.113.5\n{stale}\n")).unwrap();
+
+        confirm(&dir, "203.0.113.5", Duration::from_secs(60 * 60));
+
+        let reloaded = load(&dir).expect("record still present");
+        assert_eq!(reloaded.ip, "203.0.113.5");
+        assert!(
+            reloaded.is_newer_than(Duration::from_secs(60)),
+            "confirming an unchanged address must re-stamp it"
+        );
+    }
+
+    /// Confirmation must not become a write on every poll.
+    #[test]
+    fn a_freshly_stamped_record_is_not_rewritten() {
+        let dir = scratch_dir("confirm-throttled");
+        save(&dir, "203.0.113.5");
+        let first = load(&dir).expect("saved").captured_at.expect("stamped");
+
+        std::thread::sleep(Duration::from_millis(1100));
+        confirm(&dir, "203.0.113.5", Duration::from_secs(60 * 60));
+
+        let second = load(&dir)
+            .expect("still present")
+            .captured_at
+            .expect("stamped");
+        assert_eq!(
+            first, second,
+            "a record inside the refresh interval must not be rewritten"
+        );
+    }
+
+    /// A different address is a change, not a confirmation. Leaving it to the
+    /// caller's `save` keeps one writer for new values.
+    #[test]
+    fn confirming_a_different_address_changes_nothing() {
+        let dir = scratch_dir("confirm-mismatch");
+        save(&dir, "203.0.113.5");
+
+        confirm(&dir, "198.51.100.9", Duration::from_secs(0));
+
+        assert_eq!(load(&dir).expect("record present").ip, "203.0.113.5");
     }
 
     /// The timestamp is written for a reason: an address last seen a long

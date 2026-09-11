@@ -84,6 +84,35 @@ impl CachedConfigView {
     }
 }
 
+/// Turn a control-plane fault into something a person can act on, or `None`
+/// when it is transient and self-correcting.
+///
+/// The raw text is internal plumbing vocabulary — "observation is older than
+/// evidence already accepted for this scope" names no cause the user controls
+/// and suggests no action. Ordering and busy conditions resolve on the next
+/// poll, so they belong in the log, not in a red toast.
+pub(crate) fn control_failure_message(error: &str) -> Option<String> {
+    let lowered = error.to_ascii_lowercase();
+    if lowered.contains("older than evidence")
+        || lowered.contains("from the future")
+        || lowered.contains("control service is busy")
+    {
+        return None;
+    }
+    if lowered.contains("tunnel observation failed") {
+        return Some(
+            "Vortix could not read the system's VPN state, so what you see may be out of date. \
+             It retries automatically; if it persists, check that `ip`, `wg` and `openvpn` are \
+             installed and that Vortix is running with sudo."
+                .to_string(),
+        );
+    }
+    Some(format!(
+        "Vortix could not update VPN state: {error}. It keeps retrying — if this does not clear, \
+         run `vortix report` and restart Vortix."
+    ))
+}
+
 pub(crate) struct PendingProfileImports {
     source: std::path::PathBuf,
     remaining: std::collections::VecDeque<std::path::PathBuf>,
@@ -171,6 +200,13 @@ pub struct App {
     /// overlay. The answer is returned directly to the service and never
     /// journaled or persisted in this client.
     pub(crate) control_challenge: Option<crate::vortix_core::control::ChallengeId>,
+
+    /// Operations the user abandoned by closing their credential prompt.
+    /// Cancelling is a decision, not a fault: the operation still unwinds and
+    /// reports a failure, and surfacing that told the user something had gone
+    /// wrong when they had simply changed their mind.
+    pub(crate) user_cancelled_operations:
+        std::collections::BTreeSet<crate::vortix_core::control::OperationId>,
 
     /// Credentials the user asked to remember, held until the server accepts
     /// them. Writing at submit time persisted rejected passwords, and a
@@ -301,6 +337,7 @@ impl App {
             control_starting: true,
             control_snapshot: crate::vortix_core::control::ControlSnapshot::default(),
             control_challenge: None,
+            user_cancelled_operations: std::collections::BTreeSet::new(),
             pending_credential_save: None,
             last_control_error: None,
             queued_killswitch_target: None,
@@ -386,7 +423,13 @@ impl App {
     /// warning that actually named the fix. Reporting only on change keeps
     /// that warning readable and still shows every distinct failure.
     pub(crate) fn report_control_failure(&mut self, error: &str) {
-        let message = format!("Control service unavailable: {error}");
+        let Some(message) = control_failure_message(error) else {
+            // Self-correcting and already retried. A red toast naming the
+            // internals gave the user nothing to do about a condition that
+            // clears itself on the next poll.
+            tracing::debug!(target: "vortix::control", %error, "transient control condition");
+            return;
+        };
         if self.last_control_error.as_deref() == Some(message.as_str()) {
             return;
         }
@@ -505,6 +548,7 @@ impl App {
             control_starting: false,
             control_snapshot: crate::vortix_core::control::ControlSnapshot::default(),
             control_challenge: None,
+            user_cancelled_operations: std::collections::BTreeSet::new(),
             pending_credential_save: None,
             last_control_error: None,
             queued_killswitch_target: None,

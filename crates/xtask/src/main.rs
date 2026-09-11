@@ -32,6 +32,11 @@ const TASKS: &[(&str, &str, Task)] = &[
         "Freeze control-plane ownership while the canonical service replaces legacy writers.",
         check_control_boundaries,
     ),
+    (
+        "check-dead-gates",
+        "Verify no field is only ever set by tests while production reads it as a gate.",
+        check_dead_gates,
+    ),
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -1054,6 +1059,156 @@ fn scan_token_control_boundaries(path: &str, content: &str) -> Vec<ControlBounda
         }
     }
     violations
+}
+
+/// Catch a gate that production can never open.
+///
+/// `scanner_first_tick_done` was read by two caching gates and assigned only
+/// by tests: its production writer disappeared in a refactor, so the flag was
+/// permanently `false` and real-IP caching had been silently dead for months.
+/// The test suite concealed it — the tests set the flag by hand, encoding the
+/// intended invariant while never checking that anything establishes it.
+///
+/// The shape is precise: a field initialised to the *same literal* in every
+/// production constructor, never assigned in production, and assigned in test
+/// code. A field whose initialiser is a call (`is_root: utils::is_root()`)
+/// varies at runtime and is not flagged.
+///
+/// Annotate a deliberate case with `// xtask:allow-dead-gate: <reason>`.
+fn check_dead_gates() -> Result<(), Box<dyn std::error::Error>> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let workspace_root = workspace_root()?;
+    let crates_dir = workspace_root.join("crates");
+
+    let mut literal_inits: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut assigned_in_production: BTreeSet<String> = BTreeSet::new();
+    let mut assigned_in_tests: BTreeMap<String, String> = BTreeMap::new();
+    let mut allowed: BTreeSet<String> = BTreeSet::new();
+
+    for path in rust_sources(&crates_dir) {
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let display = path
+            .strip_prefix(&workspace_root)
+            .unwrap_or(path.as_path())
+            .display()
+            .to_string();
+        for line in content.lines() {
+            if let Some(rest) = line.split("// xtask:allow-dead-gate:").nth(1) {
+                if let Some(field) = rest.split_whitespace().next() {
+                    allowed.insert(
+                        field
+                            .trim_matches(|c: char| !c.is_alphanumeric() && c != '_')
+                            .to_string(),
+                    );
+                }
+            }
+        }
+
+        let production = production_source_without_test_items(&content);
+        collect_field_writes(&production, &mut literal_inits, &mut assigned_in_production);
+
+        // Whatever production dropped is test-only code.
+        let production_lines: BTreeSet<&str> = production.lines().collect();
+        for (index, line) in content.lines().enumerate() {
+            if production_lines.contains(line) {
+                continue;
+            }
+            if let Some(field) = assignment_target(line) {
+                assigned_in_tests
+                    .entry(field)
+                    .or_insert_with(|| format!("{display}:{}", index + 1));
+            }
+        }
+    }
+
+    let mut violations = Vec::new();
+    for (field, location) in &assigned_in_tests {
+        if allowed.contains(field) || assigned_in_production.contains(field) {
+            continue;
+        }
+        let Some(literals) = literal_inits.get(field) else {
+            continue;
+        };
+        if literals.len() != 1 {
+            continue;
+        }
+        let only = literals.iter().next().expect("one literal");
+        violations.push(format!(
+            "{location}: `{field}` is only ever {only} in production and assigned solely by tests",
+        ));
+    }
+
+    if violations.is_empty() {
+        eprintln!("xtask check-dead-gates: ok");
+        return Ok(());
+    }
+    for violation in &violations {
+        eprintln!("{violation}");
+    }
+    Err(format!(
+        "xtask check-dead-gates: {} dead gate(s) — production can never reach the state these \
+         tests assert on. Give the field a production writer, delete it, or annotate it with \
+         `// xtask:allow-dead-gate: <field> <reason>`.",
+        violations.len()
+    )
+    .into())
+}
+
+/// `name = value;` or `self.name = value;` — the assignment target only.
+fn assignment_target(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    // A Rust assignment statement ends in `;`. Without this, `key = 60`
+    // inside an embedded TOML fixture reads as one.
+    if !trimmed.ends_with(';') || trimmed.contains('"') {
+        return None;
+    }
+    let (lhs, rhs) = trimmed.split_once('=')?;
+    if rhs.starts_with('=') || lhs.ends_with(['!', '<', '>', '+', '-', '*', '/']) {
+        return None;
+    }
+    let name = lhs.trim().rsplit('.').next()?.trim();
+    (!name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        && name.chars().next().is_some_and(char::is_alphabetic))
+    .then(|| name.to_string())
+}
+
+/// Record `field: <literal>,` struct-literal initialisers and assignments.
+fn collect_field_writes(
+    source: &str,
+    literal_inits: &mut std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    assigned: &mut std::collections::BTreeSet<String>,
+) {
+    for line in source.lines() {
+        if let Some(field) = assignment_target(line) {
+            assigned.insert(field);
+            continue;
+        }
+        let trimmed = line.trim().trim_end_matches(',');
+        let Some((name, value)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        let value = value.trim();
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        {
+            continue;
+        }
+        if matches!(value, "true" | "false") || value.parse::<u64>().is_ok() {
+            literal_inits
+                .entry(name.to_string())
+                .or_default()
+                .insert(value.to_string());
+        }
+    }
 }
 
 fn production_source_without_test_items(content: &str) -> String {

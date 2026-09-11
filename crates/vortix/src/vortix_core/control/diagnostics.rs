@@ -90,6 +90,12 @@ pub enum DiagnosticCode {
     PassiveObservationChanged,
     FallbackWriteFailed,
     FallbackWriteRecovered,
+    /// An operation ran out of time without converging, recorded with the
+    /// preconditions that were unmet. Completion depends on a chain —
+    /// a fresh observation, supervisor ownership, a matching policy revision,
+    /// and four verified gates — and any one failing silently stalled the
+    /// operation until its deadline with nothing to diagnose it by.
+    ConvergenceStalled,
 }
 
 /// Fixed-shape public values. Deliberately contains no `String`, byte buffer,
@@ -132,6 +138,20 @@ pub enum DiagnosticFields {
         route: bool,
         dns: bool,
         firewall: bool,
+    },
+    /// Why an operation never converged. Each flag is a precondition of
+    /// completion: `false` is the one to investigate.
+    Convergence {
+        /// A tunnel observation landed inside the freshness ceiling.
+        observation_fresh: bool,
+        /// Observed tunnel states match what desired state asks for.
+        converged: bool,
+        /// Platform read-back for the current policy exists at all.
+        evidence_present: bool,
+        /// That read-back names the current generation, epoch and digest.
+        evidence_current: bool,
+        /// All four protection gates verified.
+        gates_verified: bool,
     },
 }
 

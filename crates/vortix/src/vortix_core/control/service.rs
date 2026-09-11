@@ -2154,7 +2154,7 @@ async fn run_service(
                     .clone();
                 expire_operations(&mut snapshot, &mut owner, &admission, now, &config, selection, &mut pending);
                 expire_challenges(&mut snapshot, &mut owner, now, config.max_challenges, &mut pending);
-                handle_envelope(envelope, &mut snapshot, &mut owner, &admission, now, &config, &shared_config, profile_mutations.as_ref(), startup_persistence_fault, &mut readiness_reply, &mut durability_reply, &mut pending);
+                handle_envelope(envelope, &mut snapshot, &mut owner, &admission, now, &config, &shared_config, profile_mutations.as_ref(), startup_persistence_fault, selection, &mut readiness_reply, &mut durability_reply, &mut pending);
                 admit_unexpected_loss_recovery(
                     &before,
                     &mut snapshot,
@@ -3674,6 +3674,62 @@ fn drive_supervision(
             }
         }
     }
+
+    settle_teardowns_that_reached_absence(snapshot, owner, admission, now, config, events);
+}
+
+/// Complete a teardown the moment absence is observed.
+///
+/// Completion normally waits for all four protection gates to re-verify. That
+/// is right for a connect, which must prove protection before claiming
+/// success — but a teardown's goal is absence, and absence is what the
+/// scanner already reported. Holding it to the gates meant a disconnect sat in
+/// `waiting_for_observation` for its full 32s budget whenever one gate could
+/// not be proven, which after teardown is the common case: the UI showed
+/// "Disconnecting …" for half a minute on a tunnel that was already gone.
+fn settle_teardowns_that_reached_absence(
+    snapshot: &mut ControlSnapshot,
+    owner: &mut OwnerState,
+    admission: &Arc<Mutex<AdmissionState>>,
+    now: u64,
+    config: &ControlServiceConfig,
+    events: &mut Vec<ControlEvent>,
+) {
+    let settled = snapshot
+        .operations
+        .values()
+        .filter(|operation| {
+            !operation.status.is_terminal()
+                // A cleanup recovery exists to drive teardown of a residual
+                // effect the observation layer cannot see. Settling it the
+                // moment the scanner reports absence would strand that
+                // residue, so recoveries keep running to their deadline.
+                && !owner.recovery_operations.contains(&operation.id)
+                && reached_requested_absence(operation, snapshot)
+        })
+        .map(|operation| (operation.id.clone(), operation.desired_generation))
+        .collect::<Vec<_>>();
+    for (operation_id, desired_generation) in settled {
+        // There is no protection proof to offer — that is the whole point.
+        // `complete_operation` recognises the reached-absence case and settles
+        // it as observed convergence rather than as this outcome; the
+        // bookkeeping (admission release, challenge cleanup, events) is why
+        // this goes through the one completion path instead of editing the
+        // record here.
+        let _ = complete_operation(
+            OperationCompletion {
+                operation_id,
+                desired_generation,
+                outcome: CompletionOutcome::Failed(OperationFailure::Timeout),
+            },
+            snapshot,
+            owner,
+            admission,
+            now,
+            config,
+            events,
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3796,6 +3852,58 @@ fn accept_policy_readback(
         return false;
     }
     true
+}
+
+/// Whether the platform still shows this profile's tunnel carrying traffic,
+/// on an observation no older than the protection freshness ceiling.
+fn tunnel_is_established(snapshot: &ControlSnapshot, profile_id: &ProfileId, now: u64) -> bool {
+    snapshot
+        .observed
+        .tunnels
+        .get(profile_id)
+        .is_some_and(|fact| {
+            fact.active
+                && fact.received_at_millis <= now
+                && now.saturating_sub(fact.received_at_millis) <= MAX_PROTECTION_AGE_MILLIS
+        })
+}
+
+/// Withdraw connect intent for an operation that ran out of time.
+///
+/// A connect whose deadline expired while its tunnel was already carrying
+/// traffic did happen — only its verification was late — so withdrawing intent
+/// there would tear down a working VPN to satisfy our own bookkeeping. Such a
+/// tunnel keeps its intent and stays unverified (never `Protected`) until a
+/// gate read-back lands; one that never came up is still withdrawn.
+///
+/// Deliberately separate from [`rollback_connect_intent`]: expiry is the only
+/// status where completion says nothing about whether the tunnel works. A
+/// connect that genuinely *failed* must still withdraw, even with an interface
+/// up, or a half-configured tunnel would be left standing behind an error.
+fn rollback_expired_connect_intent(
+    profiles: &[ProfileId],
+    expected_generation: u64,
+    snapshot: &mut ControlSnapshot,
+    owner: &mut OwnerState,
+    now: u64,
+    events: &mut Vec<ControlEvent>,
+) {
+    let unestablished = profiles
+        .iter()
+        .filter(|profile_id| !tunnel_is_established(snapshot, profile_id, now))
+        .cloned()
+        .collect::<Vec<_>>();
+    if unestablished.is_empty() {
+        return;
+    }
+    rollback_connect_intent(
+        &unestablished,
+        expected_generation,
+        snapshot,
+        owner,
+        now,
+        events,
+    );
 }
 
 fn rollback_connect_intent(
@@ -4257,11 +4365,15 @@ fn capture_topology_policy(
         .tunnels
         .iter()
         .filter_map(|(profile, fact)| fact.active.then_some(profile.clone()))
-        .collect();
+        .collect::<BTreeSet<_>>();
     let deadline = Instant::now().checked_add(Duration::from_millis(
         operation.deadline_millis.saturating_sub(now),
     ))?;
-    let required_blocking = transition_requires_blocking(snapshot.desired.kill_switch, transition);
+    let required_blocking = transition_requires_blocking(
+        snapshot.desired.kill_switch,
+        transition,
+        !target_profiles.is_empty() || !prior_profiles.is_empty(),
+    );
     let mut target = build_topology_state(
         target_profiles.clone(),
         &snapshot.observed.tunnels,
@@ -4327,21 +4439,36 @@ const fn final_firewall_blocks(
     )
 }
 
+/// Whether this transition needs the temporary pre-tunnel blocking barrier.
+///
+/// `involves_tunnel` says the policy actually has a tunnel going away or
+/// coming up. Under `block-on-drop` a barrier only exists to cover that
+/// window, so a transition with neither must not raise one: a startup
+/// `Recovery` with nothing connected was publishing a default-DROP whose
+/// allow-list named no server at all, which then dropped the handshake of the
+/// user's very next connect (`write UDPv4: Operation not permitted`).
+///
+/// `vpn-only` is unconditional by definition — no internet without a VPN —
+/// so it is deliberately unaffected by `involves_tunnel`.
 fn transition_requires_blocking(
     kill_switch: crate::vortix_core::state::killswitch::KillSwitchMode,
     transition: TopologyTransitionKind,
+    involves_tunnel: bool,
 ) -> bool {
     use crate::vortix_core::state::killswitch::KillSwitchMode;
 
     match kill_switch {
         KillSwitchMode::Off => false,
         KillSwitchMode::AlwaysOn => true,
-        KillSwitchMode::Auto => matches!(
-            transition,
-            TopologyTransitionKind::Reconnect
-                | TopologyTransitionKind::PrimaryTransfer
-                | TopologyTransitionKind::Recovery
-        ),
+        KillSwitchMode::Auto => {
+            involves_tunnel
+                && matches!(
+                    transition,
+                    TopologyTransitionKind::Reconnect
+                        | TopologyTransitionKind::PrimaryTransfer
+                        | TopologyTransitionKind::Recovery
+                )
+        }
     }
 }
 
@@ -4449,6 +4576,7 @@ fn handle_envelope(
     shared_config: &Arc<Mutex<ControlServiceConfig>>,
     profile_mutations: Option<&ProfileMutationDispatcher>,
     startup_persistence_fault: bool,
+    selection: ExecutionSelection,
     readiness_reply: &mut Option<DeferredReadiness>,
     durability_reply: &mut Option<DeferredDurability>,
     events: &mut Vec<ControlEvent>,
@@ -4645,6 +4773,17 @@ fn handle_envelope(
             client_id,
             reply,
         } => {
+            // Refusing the prompt refuses the operation. Cancelling only the
+            // challenge left the connect admitted until its deadline, so it
+            // still owned the profile and the control plane: the user's next
+            // command was rejected, then timed out, and the abandoned connect
+            // reported itself minutes later at exactly the wrong moment.
+            let owning_operation = snapshot.challenges.get(&challenge_id).map(|challenge| {
+                (
+                    challenge.operation_id.clone(),
+                    challenge.authorized_client.clone(),
+                )
+            });
             let result = cancel_challenge(
                 challenge_id,
                 &client_id,
@@ -4653,6 +4792,22 @@ fn handle_envelope(
                 config.max_challenges,
                 events,
             );
+            if result.is_ok() {
+                if let Some((operation_id, authorized)) = owning_operation {
+                    if authorized == client_id {
+                        cancel_operation_for_refused_challenge(
+                            &operation_id,
+                            snapshot,
+                            owner,
+                            admission,
+                            now,
+                            config,
+                            selection,
+                            events,
+                        );
+                    }
+                }
+            }
             let _ = reply.send(result);
         }
         Envelope::SetReadiness {
@@ -5824,6 +5979,12 @@ fn complete_operation(
         .operations
         .get(&completion.operation_id)
         .is_some_and(|operation| operation_intent_is_compatible(operation, snapshot));
+    // A teardown that reached absence achieved everything it asked for, so
+    // neither a late completion nor a slow worker turns it into a failure.
+    let settled_absence = snapshot
+        .operations
+        .get(&completion.operation_id)
+        .is_some_and(|operation| reached_requested_absence(operation, snapshot));
     let Some(record) = snapshot.operations.get_mut(&completion.operation_id) else {
         return Err(CompletionError::NotFound);
     };
@@ -5834,7 +5995,7 @@ fn complete_operation(
             Ok(CompletionResult::Terminal(record.status))
         };
     }
-    if record.deadline_millis <= now {
+    if record.deadline_millis <= now && !settled_absence {
         record.status = OperationStatus::Expired;
         record.result = Some(OperationResult::Expired);
         cancel_operation_challenges(
@@ -5865,7 +6026,7 @@ fn complete_operation(
             now,
             events,
         );
-        rollback_connect_intent(
+        rollback_expired_connect_intent(
             &client_connects,
             completion.desired_generation,
             snapshot,
@@ -5892,8 +6053,13 @@ fn complete_operation(
             record.result = Some(OperationResult::ObservedConvergence);
         }
         CompletionOutcome::Failed(reason) => {
-            record.status = OperationStatus::Failed;
-            record.result = Some(OperationResult::Failed(reason));
+            if settled_absence {
+                record.status = OperationStatus::Succeeded;
+                record.result = Some(OperationResult::ObservedConvergence);
+            } else {
+                record.status = OperationStatus::Failed;
+                record.result = Some(OperationResult::Failed(reason));
+            }
         }
         CompletionOutcome::Cancelled => {
             record.status = OperationStatus::Cancelled;
@@ -5985,6 +6151,119 @@ fn client_connected_profiles(operation: &OperationRecord) -> Vec<ProfileId> {
     })
 }
 
+/// Whether this operation only ever asked for tunnels to be gone, and they
+/// are.
+///
+/// A connect must *prove* protection before it can claim success, so late
+/// read-back legitimately expires it. A disconnect's goal is absence, and
+/// absence is directly observable — there is nothing further to prove. Holding
+/// teardown to the protection gates meant one unprovable gate (an in-flux
+/// resolver right after teardown is the common case) reported "disconnect
+/// timed out" for a tunnel that was already gone.
+/// Record why an operation never converged, at the moment it gives up.
+///
+/// Completion depends on a chain of preconditions, and any one failing left
+/// the operation to sit until its deadline with nothing to diagnose it by —
+/// which is why every stall this week cost a round of guesswork. The flags
+/// below are that chain; whichever reads `false` is the answer.
+fn record_convergence_stall(
+    operation: &OperationRecord,
+    snapshot: &ControlSnapshot,
+    owner: &mut OwnerState,
+    now: u64,
+) {
+    let wanted = match &operation.intent {
+        OperationIntent::DesiredSubset { tunnels, .. }
+        | OperationIntent::UnexpectedRecovery { tunnels, .. } => tunnels.clone(),
+        OperationIntent::GenerationScoped | OperationIntent::ProfileMutation { .. } => {
+            BTreeMap::new()
+        }
+    };
+    let observation_fresh = wanted.keys().all(|profile_id| {
+        snapshot
+            .observed
+            .tunnels
+            .get(profile_id)
+            .is_some_and(|fact| {
+                fact.received_at_millis <= now
+                    && now.saturating_sub(fact.received_at_millis) <= MAX_PROTECTION_AGE_MILLIS
+            })
+    });
+    let converged = wanted.iter().all(|(profile_id, requested)| {
+        snapshot
+            .observed
+            .tunnels
+            .get(profile_id)
+            .is_some_and(|fact| fact.active == (*requested == RequestedTunnelState::Connected))
+    });
+    let evidence = snapshot.observed.evidence.as_ref();
+    let evidence_present = evidence.is_some();
+    let evidence_current =
+        evidence.is_some_and(|evidence| evidence_matches(evidence, snapshot, now));
+    let gates_verified = evidence.is_some_and(ProtectionEvidence::all_gates_verified);
+
+    owner.diagnostics.push(
+        now,
+        DiagnosticComponent::Protection,
+        DiagnosticSeverity::Warning,
+        DiagnosticCode::ConvergenceStalled,
+        DiagnosticFields::Convergence {
+            observation_fresh,
+            converged,
+            evidence_present,
+            evidence_current,
+            gates_verified,
+        },
+    );
+    tracing::warn!(
+        target: "vortix::control::convergence",
+        operation = %operation.id,
+        generation = operation.desired_generation,
+        observation_fresh,
+        converged,
+        evidence_present,
+        evidence_current,
+        gates_verified,
+        "operation ran out of time without converging"
+    );
+}
+
+#[must_use]
+pub fn reached_requested_absence(operation: &OperationRecord, snapshot: &ControlSnapshot) -> bool {
+    // Read the intent directly rather than through `client_desired_tunnels`,
+    // which is scoped to client-submitted work and returns `None` for the
+    // service's own sequence-0 operations. A teardown recovery is exactly
+    // that, and leaving it out was why an all-disconnected recovery sat in
+    // `waiting_for_observation` until it timed out.
+    let tunnels = match &operation.intent {
+        OperationIntent::DesiredSubset { tunnels, .. }
+        | OperationIntent::UnexpectedRecovery { tunnels, .. } => tunnels,
+        OperationIntent::GenerationScoped | OperationIntent::ProfileMutation { .. } => {
+            return false
+        }
+    };
+    if tunnels.is_empty()
+        || tunnels
+            .values()
+            .any(|requested| *requested == RequestedTunnelState::Connected)
+    {
+        return false;
+    }
+    tunnels.keys().all(|profile_id| {
+        snapshot.desired.tunnels.get(profile_id) != Some(&RequestedTunnelState::Connected)
+            // A positive observation that the tunnel is down, never the mere
+            // absence of one. A connect that expired before anything was ever
+            // observed leaves a cleanup-only recovery behind precisely because
+            // a residual effect may still exist; treating "never seen" as
+            // "gone" would settle that recovery and strand the residue.
+            && snapshot
+                .observed
+                .tunnels
+                .get(profile_id)
+                .is_some_and(|fact| !fact.active)
+    })
+}
+
 fn expire_operations(
     snapshot: &mut ControlSnapshot,
     owner: &mut OwnerState,
@@ -6003,10 +6282,22 @@ fn expire_operations(
         .collect();
     for id in expired {
         let expired_record = snapshot.operations.get(&id).cloned();
+        if let Some(record) = expired_record.as_ref() {
+            record_convergence_stall(record, snapshot, owner, now);
+        }
+        // A teardown that reached absence achieved everything it asked for.
+        let settled_absence = expired_record
+            .as_ref()
+            .is_some_and(|record| reached_requested_absence(record, snapshot));
         let was_recovery = owner.recovery_operations.remove(&id);
         if let Some(record) = snapshot.operations.get_mut(&id) {
-            record.status = OperationStatus::Expired;
-            record.result = Some(OperationResult::Expired);
+            if settled_absence {
+                record.status = OperationStatus::Succeeded;
+                record.result = Some(OperationResult::ObservedConvergence);
+            } else {
+                record.status = OperationStatus::Expired;
+                record.result = Some(OperationResult::Expired);
+            }
         }
         cancel_operation_challenges(&id, snapshot, owner, config.max_challenges, events);
         owner.release_operation_admission(&id);
@@ -6016,26 +6307,24 @@ fn expire_operations(
         } else {
             mark_terminal(admission, &id);
         }
+        let settled_status = if settled_absence {
+            OperationStatus::Succeeded
+        } else {
+            OperationStatus::Expired
+        };
         let operation_id = id.clone();
         events.push(ControlEvent::OperationCompleted {
             operation_id: id,
-            status: OperationStatus::Expired,
+            status: settled_status,
         });
-        finish_lifecycle_operation(
-            owner,
-            config,
-            &operation_id,
-            OperationStatus::Expired,
-            now,
-            events,
-        );
+        finish_lifecycle_operation(owner, config, &operation_id, settled_status, now, events);
         let Some(expired_record) = expired_record else {
             continue;
         };
         let client_connects = client_connected_profiles(&expired_record);
         let generation_before_rollback = snapshot.desired.generation;
         if !client_connects.is_empty() {
-            rollback_connect_intent(
+            rollback_expired_connect_intent(
                 &client_connects,
                 expired_record.desired_generation,
                 snapshot,
@@ -6557,6 +6846,71 @@ fn cancel_challenge(
     );
     events.push(ControlEvent::ChallengeCancelled { challenge_id });
     Ok(())
+}
+
+/// Terminate the operation whose credential prompt the user just refused.
+///
+/// Without this the operation stayed admitted until its deadline: it kept the
+/// profile lease and the control plane busy, so the next command the user
+/// issued was rejected and then timed out, and the abandoned operation
+/// surfaced its own result long afterwards. Its connect intent is withdrawn
+/// unconditionally — the user declined, so no tunnel should survive it.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "terminating an operation needs the same state its expiry path does"
+)]
+fn cancel_operation_for_refused_challenge(
+    operation_id: &OperationId,
+    snapshot: &mut ControlSnapshot,
+    owner: &mut OwnerState,
+    admission: &Arc<Mutex<AdmissionState>>,
+    now: u64,
+    config: &ControlServiceConfig,
+    selection: ExecutionSelection,
+    events: &mut Vec<ControlEvent>,
+) {
+    let Some(record) = snapshot.operations.get(operation_id) else {
+        return;
+    };
+    if record.status.is_terminal() {
+        return;
+    }
+    let desired_generation = record.desired_generation;
+    let client_connects = client_connected_profiles(record);
+    let _ = complete_operation(
+        OperationCompletion {
+            operation_id: operation_id.clone(),
+            desired_generation,
+            outcome: CompletionOutcome::Cancelled,
+        },
+        snapshot,
+        owner,
+        admission,
+        now,
+        config,
+        events,
+    );
+    rollback_connect_intent(
+        &client_connects,
+        desired_generation,
+        snapshot,
+        owner,
+        now,
+        events,
+    );
+    // Withdrawing intent bumps the desired generation. Without a vehicle to
+    // drive it, that generation has no operation and reconciliation stalls —
+    // which is what `expire_operations` starts a recovery for.
+    start_recovery_operation(
+        snapshot,
+        owner,
+        admission,
+        now,
+        selection,
+        snapshot.desired.generation,
+        config,
+        events,
+    );
 }
 
 fn cancel_operation_challenges(
@@ -7234,6 +7588,72 @@ mod target_profiles_tests {
             snapshot.operations[&OperationId::from_parts(AuthorityEpoch(7), 0)].deadline_millis,
             500_000
         );
+    }
+
+    /// Expiry and failure are not the same event. An expired connect says
+    /// nothing about whether the tunnel works — only that verification was
+    /// late — so a tunnel the platform shows carrying traffic keeps its
+    /// intent. A connect that genuinely *failed* must still withdraw even
+    /// with an interface up, or a half-configured tunnel is left standing
+    /// behind an error the user was just shown.
+    #[test]
+    fn only_expiry_spares_an_established_tunnel_from_rollback() {
+        let profile_id = ProfileId::new("established-on-failure");
+
+        let established = || {
+            let mut snapshot = ControlSnapshot::default();
+            snapshot.desired.generation = 4;
+            snapshot
+                .desired
+                .tunnels
+                .insert(profile_id.clone(), RequestedTunnelState::Connected);
+            snapshot.observed.tunnels.insert(
+                profile_id.clone(),
+                ObservedTunnel {
+                    active: true,
+                    interface_name: Some("tun-established".into()),
+                    observed_at_millis: 1_000,
+                    received_at_millis: 1_000,
+                },
+            );
+            snapshot
+        };
+
+        let mut snapshot = established();
+        let mut owner = OwnerState::default();
+        let mut events = Vec::new();
+        rollback_expired_connect_intent(
+            std::slice::from_ref(&profile_id),
+            4,
+            &mut snapshot,
+            &mut owner,
+            1_000,
+            &mut events,
+        );
+        assert_eq!(
+            snapshot.desired.tunnels.get(&profile_id),
+            Some(&RequestedTunnelState::Connected),
+            "a late read-back must not tear down a tunnel already carrying traffic"
+        );
+        assert!(events.is_empty(), "no desired-state change was needed");
+
+        let mut snapshot = established();
+        let mut owner = OwnerState::default();
+        let mut events = Vec::new();
+        rollback_connect_intent(
+            std::slice::from_ref(&profile_id),
+            4,
+            &mut snapshot,
+            &mut owner,
+            1_000,
+            &mut events,
+        );
+        assert_eq!(
+            snapshot.desired.tunnels.get(&profile_id),
+            Some(&RequestedTunnelState::Disconnected),
+            "a failed connect still withdraws intent, interface up or not"
+        );
+        assert!(!events.is_empty(), "the withdrawal must publish a change");
     }
 
     #[test]
@@ -8027,6 +8447,46 @@ mod target_profiles_tests {
             Some(KillSwitchState::Armed),
             "but it is not a claim about the firewall"
         );
+    }
+
+    /// The reported bug: with `block-on-drop` armed and nothing connected, a
+    /// startup `Recovery` raised the pre-tunnel barrier. Its allow-list named
+    /// no tunnel and no server, so the very next connect had its own `OpenVPN`
+    /// handshake dropped (`write UDPv4: Operation not permitted`) until the
+    /// 35s protocol timeout. A barrier covers a tunnel going away or coming
+    /// up; with neither there is nothing to cover.
+    #[test]
+    fn block_on_drop_raises_no_barrier_for_a_transition_with_no_tunnel() {
+        use crate::vortix_core::state::killswitch::KillSwitchMode;
+
+        for transition in [
+            TopologyTransitionKind::Recovery,
+            TopologyTransitionKind::Reconnect,
+            TopologyTransitionKind::PrimaryTransfer,
+        ] {
+            assert!(
+                !transition_requires_blocking(KillSwitchMode::Auto, transition, false),
+                "{transition:?} with no tunnel must not raise a barrier that blocks the next connect"
+            );
+            assert!(
+                transition_requires_blocking(KillSwitchMode::Auto, transition, true),
+                "{transition:?} covering a real tunnel still needs its barrier"
+            );
+        }
+
+        // vpn-only means no internet without a VPN, so it blocks regardless.
+        for involves_tunnel in [false, true] {
+            assert!(transition_requires_blocking(
+                KillSwitchMode::AlwaysOn,
+                TopologyTransitionKind::Recovery,
+                involves_tunnel
+            ));
+            assert!(!transition_requires_blocking(
+                KillSwitchMode::Off,
+                TopologyTransitionKind::Recovery,
+                involves_tunnel
+            ));
+        }
     }
 
     /// Stale evidence is not proof, whatever the gate bits say. Pins the

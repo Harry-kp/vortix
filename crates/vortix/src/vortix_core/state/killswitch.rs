@@ -123,7 +123,7 @@ impl KillSwitchMode {
     pub const fn one_liner(self) -> &'static str {
         match self {
             Self::Off => "All traffic flows. If the VPN drops, your real IP is exposed.",
-            Self::Auto => "If the VPN drops unexpectedly, block all traffic until you reconnect.",
+            Self::Auto => "While the app is open, block all traffic if the VPN drops unexpectedly.",
             Self::AlwaysOn => "Only traffic through active VPN tunnels. No internet without a VPN.",
         }
     }
@@ -190,9 +190,15 @@ impl KillSwitchMode {
                 "VPN up: all traffic flows freely.",
                 "VPN down: real IPv4 (and IPv6, if present) exposed.",
             ),
+            // Blocking on a drop needs something running to notice the drop.
+            // A one-shot CLI exits, and the only processes that outlive it —
+            // the tunnel custodian and its process guardian — hold no policy
+            // authority, so nothing engages the firewall. Promising a block
+            // that never arrives is worse than naming the condition.
             Self::Auto => (
                 "VPN up: browse normally.",
-                "VPN down: traffic blocks until reconnect or `release-killswitch`.",
+                "VPN down: traffic blocks until reconnect or `release-killswitch`, \
+                 while the Vortix app is open and watching.",
             ),
             Self::AlwaysOn => (
                 "VPN up: only tunnel traffic permitted.",

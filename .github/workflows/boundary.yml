@@ -39,3 +39,5 @@ jobs:
         run: cargo xtask check-no-shell-regressions
       - name: Canonical control boundaries (control-plane U1)
         run: cargo xtask check-control-boundaries
+      - name: Dead gates
+        run: cargo xtask check-dead-gates

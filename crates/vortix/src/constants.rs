@@ -119,6 +119,12 @@ pub const REAL_IPV6_CACHE_FILE: &str = "real-ipv6.cache";
 /// than shown.
 pub const REAL_IP_CACHE_MAX_AGE_SECS: u64 = 24 * 60 * 60;
 
+/// How often an unchanged real address is re-stamped on disk. The record
+/// should age from the last time it was confirmed, not the last time it
+/// changed, or a stable address expires precisely because it is stable. One
+/// hour keeps a day-long record alive without writing on every poll.
+pub const REAL_IP_CACHE_REFRESH_SECS: u64 = 60 * 60;
+
 /// How many poll intervals a telemetry field may miss before its value stops
 /// being presentable as current.
 ///

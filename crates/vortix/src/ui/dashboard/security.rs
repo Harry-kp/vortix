@@ -345,11 +345,25 @@ fn real_ip_row(label: &str, address: &RealAddress, pending: &str, w: usize) -> L
     }
 }
 
-fn push_real_ip_rows(lines: &mut Vec<Line<'static>>, s: &PanelState, w: usize) {
+/// Why a real IPv4 is missing while the tunnel owns the exit: no reading was
+/// taken before it came up, and none can be taken now. `detecting…` implied
+/// work in progress that will never finish.
+fn no_pre_vpn_reading(inner_width: usize) -> &'static str {
+    const LONG: &str = "not seen before VPN";
+    if LONG.chars().count() <= value_budget(inner_width) {
+        LONG
+    } else {
+        "unknown"
+    }
+}
+
+fn push_real_ip_rows(lines: &mut Vec<Line<'static>>, s: &PanelState, w: usize, v4_pending: &str) {
     let v6 = has_v6_signal(s);
     let v4_label = if v6 { "Real IPv4" } else { "Real IP" };
-    lines.push(real_ip_row(v4_label, &s.real_ip, "detecting…", w));
+    lines.push(real_ip_row(v4_label, &s.real_ip, v4_pending, w));
     if v6 {
+        // A v4-only tunnel leaves the v6 probe outside it, so that one really
+        // can still land.
         lines.push(real_ip_row("Real IPv6", &s.real_ipv6, "checking…", w));
     }
 }
@@ -371,7 +385,15 @@ fn push_exit_ip_rows(lines: &mut Vec<Line<'static>>, s: &PanelState, w: usize) {
             IpStatus::Leaking => Sigil::AlarmError,
             IpStatus::Pending => Sigil::NotApplicable,
         };
-        lines.push(audit_row(v4_label, &s.public_ip, v4_sigil, w));
+        // Pending means no through-tunnel reading has landed yet, so the
+        // value in hand describes the previous path. Showing it under
+        // "Exit IP" printed the user's own address as their exit.
+        let v4_value = if s.ip_status == IpStatus::Pending {
+            "checking…"
+        } else {
+            &s.public_ip
+        };
+        lines.push(audit_row(v4_label, v4_value, v4_sigil, w));
         if s.ip_status == IpStatus::Leaking {
             lines.push(alarm_subline("real IPv4 exposed", w));
         }
@@ -403,11 +425,11 @@ fn push_exit_ipv6_row(lines: &mut Vec<Line<'static>>, s: &PanelState, w: usize) 
             true,
         ),
         Ipv6RowStatus::Unavailable => ("not detected".to_string(), Sigil::NotApplicable, false),
-        Ipv6RowStatus::Pending | Ipv6RowStatus::Absent => (
-            s.public_ipv6.clone().unwrap_or_else(|| "checking…".into()),
-            Sigil::NotApplicable,
-            false,
-        ),
+        // Pending carries no through-tunnel reading, so the address in hand
+        // still describes the previous path and must not be shown as the exit.
+        Ipv6RowStatus::Pending | Ipv6RowStatus::Absent => {
+            ("checking…".to_string(), Sigil::NotApplicable, false)
+        }
     };
     lines.push(audit_row("Exit IPv6", &v6_value, v6_sigil, w));
     if leak_subline {
@@ -468,9 +490,6 @@ fn footer_line(secs: Option<u64>) -> Line<'static> {
 #[derive(Clone)]
 struct PanelState {
     inner_width: u16,
-    /// Always-true for `build_protected_audit`; always-false for
-    /// `build_exposed_audit`; data-dependent for `build_partial_audit`.
-    show_section_headers: bool,
 
     // Identity
     real_ip: RealAddress,
@@ -522,7 +541,7 @@ enum Ipv6RowStatus {
 
 impl PanelState {
     fn show_headers(&self) -> bool {
-        self.show_section_headers && self.inner_width >= SECTION_HEADER_MIN_INNER_WIDTH
+        self.inner_width >= SECTION_HEADER_MIN_INNER_WIDTH
     }
 
     fn is_stale(&self, age: Option<Duration>) -> bool {
@@ -736,7 +755,16 @@ fn is_address(value: &str) -> bool {
 
 /// Compare the exit address against the real one, but only when both are
 /// addresses. Anything else is an unknown, not a verdict.
+/// A leak verdict needs an egress reading taken *through* the tunnel.
+///
+/// For the first poll after connecting, the newest sample is still the
+/// pre-VPN one, which equals the real address by definition. Comparing them
+/// then raised a red "your exit IP is your real IP" alarm on a perfectly good
+/// tunnel. Until a through-tunnel reading lands the honest answer is pending.
 fn derive_ip_status(app: &App) -> IpStatus {
+    if !app.runtime.egress_v4_through_tunnel() {
+        return IpStatus::Pending;
+    }
     match &app.runtime.real_ip {
         Some(real) if is_address(&app.runtime.public_ip) && is_address(real) => {
             if &app.runtime.public_ip == real {
@@ -757,6 +785,12 @@ fn derive_ipv6_row_status(app: &App) -> Ipv6RowStatus {
     }
     if app.registry.primary().is_none() {
         return Ipv6RowStatus::Masked;
+    }
+    // Same rule as IPv4: only a reading taken through the tunnel can prove a
+    // leak. A v6 sample that predates the tunnel matches the real address by
+    // definition and is not evidence of anything.
+    if !app.runtime.egress_v6_through_tunnel() {
+        return Ipv6RowStatus::Pending;
     }
     match (public, real) {
         (Some(p), Some(r)) if p == r => Ipv6RowStatus::Leaking,
@@ -789,7 +823,6 @@ fn collect_protected_state(
 
     PanelState {
         inner_width,
-        show_section_headers: true,
         real_ip: RealAddress::new(app.runtime.real_ip.clone(), app.runtime.real_ip_from_cache),
         public_ip: app.runtime.public_ip.clone(),
         real_ipv6: RealAddress::new(
@@ -859,7 +892,6 @@ fn collect_partial_state(
     let dns_observed = app.control_snapshot.dns.intended_servers.is_empty();
     PanelState {
         inner_width,
-        show_section_headers: true,
         real_ip: RealAddress::new(app.runtime.real_ip.clone(), app.runtime.real_ip_from_cache),
         public_ip,
         real_ipv6: RealAddress::new(
@@ -944,7 +976,7 @@ fn build_protected_audit(s: &PanelState) -> Vec<Line<'static>> {
         lines.push(section_header("Identity"));
     }
 
-    push_real_ip_rows(&mut lines, s, w);
+    push_real_ip_rows(&mut lines, s, w, no_pre_vpn_reading(w));
     push_exit_ip_rows(&mut lines, s, w);
 
     lines.push(location_row(s, w));
@@ -991,7 +1023,7 @@ fn build_partial_audit(s: &PanelState) -> Vec<Line<'static>> {
         lines.push(section_header("Identity"));
     }
 
-    push_real_ip_rows(&mut lines, s, w);
+    push_real_ip_rows(&mut lines, s, w, "detecting…");
     let v6 = has_v6_signal(s);
     if s.public_ip.is_empty() {
         let v4_label = if v6 { "Exit IPv4" } else { "Exit IP" };
@@ -1059,7 +1091,11 @@ fn build_exposed_audit(app: &App, inner_width: u16) -> Vec<Line<'static>> {
     // (no tunnel masking anything). Showing both rows side-by-side
     // with the same IP IS the alarm visualization: "your exit IP IS
     // your real IP".
-    let exposed_ip = if app.runtime.public_ip.is_empty()
+    // The newest egress sample outlives a disconnect, so for one poll after
+    // hanging up it still holds the VPN's exit address. Presenting that as
+    // "Real IP" told the user the VPN's address was their own.
+    let exposed_ip = if app.runtime.egress_v4_through_tunnel()
+        || app.runtime.public_ip.is_empty()
         || app.runtime.public_ip == constants::MSG_DETECTING
         || app.runtime.public_ip == constants::MSG_FETCHING
     {
@@ -1067,6 +1103,15 @@ fn build_exposed_audit(app: &App, inner_width: u16) -> Vec<Line<'static>> {
     } else {
         app.runtime.public_ip.clone()
     };
+    // Prefer the address Vortix actually remembers as real, so the value
+    // shown here is the same one the connected view keeps. Showing a sample
+    // that was never promoted made a real IPv4 vanish into "not seen before
+    // VPN" the moment a tunnel came up.
+    let real_ip_value = app
+        .runtime
+        .real_ip
+        .clone()
+        .unwrap_or_else(|| exposed_ip.clone());
 
     let v6_ip = app
         .runtime
@@ -1085,7 +1130,7 @@ fn build_exposed_audit(app: &App, inner_width: u16) -> Vec<Line<'static>> {
         "Exit IP"
     };
 
-    lines.push(audit_row(real_label, &exposed_ip, Sigil::OkMuted, w));
+    lines.push(audit_row(real_label, &real_ip_value, Sigil::OkMuted, w));
     if let Some(ref ip6) = v6_ip {
         lines.push(audit_row("Real IPv6", ip6, Sigil::OkMuted, w));
     }
@@ -1336,7 +1381,6 @@ mod tests {
     fn baseline_protected_state(inner_width: u16) -> PanelState {
         PanelState {
             inner_width,
-            show_section_headers: true,
             real_ip: RealAddress::Observed("203.0.113.5".to_string()),
             public_ip: "1.2.3.4".to_string(),
             real_ipv6: RealAddress::Unknown,
@@ -1356,6 +1400,127 @@ mod tests {
             dns_observed: true,
             stale_after: Duration::from_secs(90),
         }
+    }
+
+    /// With a tunnel owning the IPv4 exit, no probe can ever return the real
+    /// address, so `detecting…` promised work that would never finish. Say
+    /// why instead, and fall back to one word when the panel is too narrow.
+    #[test]
+    fn an_unknown_real_ipv4_under_a_tunnel_says_why_not_detecting() {
+        for width in [44, 40, 36] {
+            let mut state = baseline_protected_state(width);
+            state.real_ip = RealAddress::Unknown;
+            let row = row_named(&build_protected_audit(&state), "Real IP");
+            assert!(
+                !row.contains("detecting"),
+                "width {width}: a reading that can never arrive must not read as in progress: {row}"
+            );
+            assert!(
+                row.contains("not seen before VPN") || row.contains("unknown"),
+                "width {width}: expected the explanatory text or its one-word fallback: {row}"
+            );
+        }
+    }
+
+    /// The reported bug: for one poll after hanging up, the newest egress
+    /// sample is still the VPN's exit address, and the disconnected panel
+    /// printed it under "Real IP". Vortix told the user the VPN's address was
+    /// their own — the one claim this panel exists to get right.
+    #[test]
+    fn a_sample_taken_through_the_tunnel_is_never_shown_as_the_real_address() {
+        let mut app = crate::app::App::new_test();
+        app.runtime.public_ip = "203.0.113.77".into();
+        app.runtime
+            .record_public_ipv4(app.runtime.public_ip.clone(), true);
+        app.runtime.real_ip = None;
+
+        let rendered = build_exposed_audit(&app, 44);
+        let row = row_named(&rendered, "Real IP");
+        assert!(
+            !row.contains("203.0.113.77"),
+            "an address observed through the tunnel must not be labelled real: {row}"
+        );
+        assert!(row.contains("checking"), "expected a pending marker: {row}");
+    }
+
+    /// And the other half: a sample taken with no tunnel in the path is the
+    /// real address and must be shown.
+    #[test]
+    fn a_sample_taken_without_a_tunnel_is_shown_as_the_real_address() {
+        let mut app = crate::app::App::new_test();
+        app.runtime.public_ip = "198.51.100.4".into();
+        app.runtime
+            .record_public_ipv4(app.runtime.public_ip.clone(), false);
+        app.runtime.real_ip = None;
+
+        let row = row_named(&build_exposed_audit(&app, 44), "Real IP");
+        assert!(row.contains("198.51.100.4"), "{row}");
+    }
+
+    /// The reported bug: for the first poll after connecting, the newest
+    /// egress sample is still the pre-VPN one — which equals the real address
+    /// by definition. Comparing them raised a red "real IPv4 exposed" alarm
+    /// on a perfectly healthy tunnel. No verdict without a through-tunnel
+    /// reading, and no pre-tunnel address printed under "Exit IP".
+    #[test]
+    fn a_reading_that_predates_the_tunnel_is_pending_not_a_leak() {
+        let mut app = crate::app::App::new_test();
+        app.runtime.real_ip = Some("198.51.100.4".into());
+        app.runtime.public_ip = "198.51.100.4".into();
+        app.runtime
+            .record_public_ipv6(app.runtime.public_ipv6.clone(), false);
+
+        app.runtime
+            .record_public_ipv4(app.runtime.public_ip.clone(), false);
+        assert_eq!(
+            derive_ip_status(&app),
+            IpStatus::Pending,
+            "an identical address proves nothing until a reading comes through the tunnel"
+        );
+
+        // Once a through-tunnel reading really does match the real address,
+        // that is a genuine leak and must still alarm.
+        app.runtime
+            .record_public_ipv4(app.runtime.public_ip.clone(), true);
+        assert_eq!(derive_ip_status(&app), IpStatus::Leaking);
+        app.runtime.public_ip = "203.0.113.9".into();
+        assert_eq!(derive_ip_status(&app), IpStatus::Masked);
+    }
+
+    /// And the pending exit row must not print the previous path's address.
+    #[test]
+    fn a_pending_exit_row_shows_no_address() {
+        let mut state = baseline_protected_state(44);
+        state.ip_status = IpStatus::Pending;
+        state.public_ip = "198.51.100.4".into();
+
+        let row = row_named(&build_protected_audit(&state), "Exit IP");
+        assert!(
+            !row.contains("198.51.100.4"),
+            "a pre-tunnel address must not be shown as the exit: {row}"
+        );
+        assert!(row.contains("checking"), "{row}");
+    }
+
+    /// The narrow fallback must be the short word, not a truncated phrase.
+    #[test]
+    fn the_narrow_real_ipv4_fallback_is_a_whole_word() {
+        assert_eq!(no_pre_vpn_reading(44), "not seen before VPN");
+        assert_eq!(no_pre_vpn_reading(20), "unknown");
+    }
+
+    /// A split route leaves the IPv4 probe outside the tunnel, so there it
+    /// genuinely is still detecting.
+    #[test]
+    fn a_split_route_panel_keeps_the_detecting_wording() {
+        let mut state = baseline_protected_state(44);
+        state.real_ip = RealAddress::Unknown;
+        state.public_ip = String::new();
+        let row = row_named(&build_partial_audit(&state), "Real IP");
+        assert!(
+            row.contains("detecting"),
+            "a probe that can still land must keep the in-progress wording: {row}"
+        );
     }
 
     // ── Observation freshness ─────────────────────────────────────────────
@@ -1561,6 +1726,9 @@ mod tests {
     fn a_placeholder_exit_address_is_an_unknown_not_a_masked_exit() {
         let mut app = App::new_test();
         app.runtime.real_ip = Some("171.61.21.20".to_string());
+        // A verdict of any kind needs a reading taken through the tunnel.
+        app.runtime
+            .record_public_ipv4(app.runtime.public_ip.clone(), true);
 
         for placeholder in [
             constants::MSG_UNAVAILABLE,
@@ -2099,8 +2267,7 @@ mod tests {
     #[test]
     fn protected_section_headers_drop_below_width_threshold() {
         // section words drop at panel widths < threshold.
-        let mut s = baseline_protected_state(20);
-        s.show_section_headers = true;
+        let s = baseline_protected_state(20);
         let lines = build_protected_audit(&s);
         let all_text: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(

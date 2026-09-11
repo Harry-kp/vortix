@@ -29,6 +29,7 @@ fn test_app() -> App {
         control_starting: false,
         control_snapshot: crate::vortix_core::control::ControlSnapshot::default(),
         control_challenge: None,
+        user_cancelled_operations: std::collections::BTreeSet::new(),
         pending_credential_save: None,
         last_control_error: None,
         queued_killswitch_target: None,
@@ -4559,5 +4560,242 @@ fn rapid_killswitch_presses_submit_one_change_at_a_time() {
         app.runtime.killswitch_state,
         crate::state::KillSwitchState::Blocking,
         "an in-flight change must not turn a working kill switch into Degraded"
+    );
+}
+
+/// The reported bug, second half: disconnecting one profile raised
+/// "Connection cancelled". A disconnect supersedes the connect that owns the
+/// tunnel, and the superseded connect settles as `Cancelled` — expected, and
+/// not news. Suppression only covered `DisconnectAll`, so disconnecting a
+/// single profile reported the supersession as if something had gone wrong.
+#[test]
+fn disconnecting_one_profile_does_not_report_its_connect_as_cancelled() {
+    use crate::vortix_core::control::{
+        AuthorityEpoch, ClientId, IdempotencyKey, OperationRecord, OperationResult,
+        OperationStatus, PolicyDigest,
+    };
+
+    let mut app = test_app();
+    let connect_id =
+        crate::vortix_core::control::OperationId::parse("op-0000000000000001-0000000000000031")
+            .unwrap();
+    let disconnect_id =
+        crate::vortix_core::control::OperationId::parse("op-0000000000000001-0000000000000032")
+            .unwrap();
+
+    app.track_control_operation_with_profile(
+        connect_id.clone(),
+        crate::app::connection::PendingControlSubject::Connection,
+        Some("corp".to_string()),
+    );
+    app.track_control_operation_with_profile(
+        disconnect_id,
+        crate::app::connection::PendingControlSubject::Disconnection,
+        Some("corp".to_string()),
+    );
+    app.toast = None;
+
+    let mut snapshot = app.control_snapshot.clone();
+    snapshot.operations.insert(
+        connect_id.clone(),
+        OperationRecord {
+            id: connect_id,
+            idempotency_key: IdempotencyKey::new("superseded-connect"),
+            client_id: ClientId::from_parts(AuthorityEpoch(1), 1),
+            command_digest: PolicyDigest::default(),
+            authority_epoch: AuthorityEpoch(1),
+            desired_generation: 1,
+            admitted_at_millis: 1,
+            deadline_millis: 2,
+            intent: crate::vortix_core::control::OperationIntent::default(),
+            status: OperationStatus::Cancelled,
+            result: Some(OperationResult::Cancelled),
+            failure_detail: None,
+        },
+    );
+    app.apply_control_snapshot(snapshot);
+
+    assert!(
+        app.toast.is_none(),
+        "a disconnect superseding its own connect is expected, not news: {:?}",
+        app.toast.as_ref().map(|toast| toast.message.clone())
+    );
+}
+
+/// End-to-end reproduction of the reported bug, driving the real keypress.
+/// Open a credential prompt, press Esc, then let the abandoned operation
+/// settle. Nothing may pop up: the user closed the prompt deliberately.
+#[test]
+fn pressing_escape_on_the_credential_prompt_pops_up_nothing() {
+    use crate::vortix_core::control::{
+        AuthorityEpoch, ChallengeRecord, ClientId, IdempotencyKey, OperationRecord,
+        OperationResult, OperationStatus, PolicyDigest,
+    };
+
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join(crate::constants::PROFILES_DIR_NAME)).unwrap();
+    let control =
+        crate::cli::control::LocalControlSession::start_profile_test(temp.path(), Vec::new())
+            .unwrap();
+    let mut app = test_app();
+    app.attach_control_session(control).unwrap();
+    let profile_id = crate::vortix_core::profile::ProfileId::new("escape-cancel-profile");
+    let profile_name = "escape-cancel-profile".to_string();
+    app.runtime.profiles.push(VpnProfile {
+        id: profile_id.clone(),
+        name: profile_name.clone(),
+        protocol: Protocol::OpenVPN,
+        config_path: std::path::PathBuf::from("/nonexistent.ovpn"),
+        location: "Test".to_string(),
+        last_used: None,
+    });
+    let operation_id =
+        crate::vortix_core::control::OperationId::parse("op-0000000000000001-0000000000000021")
+            .unwrap();
+    let challenge_id: crate::vortix_core::control::ChallengeId =
+        serde_json::from_str("21").unwrap();
+    let client_id: ClientId =
+        serde_json::from_str("\"client-0000000000000001-0000000000000001\"").unwrap();
+
+    // The connect is in flight and the service has raised its prompt.
+    app.track_control_operation_with_profile(
+        operation_id.clone(),
+        crate::app::connection::PendingControlSubject::Connection,
+        Some(profile_name),
+    );
+    let mut snapshot = app.control_snapshot.clone();
+    snapshot.challenges.insert(
+        challenge_id,
+        ChallengeRecord {
+            id: challenge_id,
+            profile_id,
+            operation_id: operation_id.clone(),
+            kind: crate::vortix_core::control::ChallengeKind::Generic {
+                label: "OpenVPN credentials".to_string(),
+            },
+            label: "OpenVPN username and password".to_string(),
+            authorized_client: client_id.clone(),
+            created_at_millis: 1,
+            expires_at_millis: u64::MAX,
+        },
+    );
+    app.apply_control_snapshot(snapshot);
+    assert!(
+        matches!(app.input_mode, crate::state::InputMode::AuthPrompt { .. }),
+        "the prompt must be open before Esc means anything"
+    );
+    app.toast = None;
+
+    // The user presses Esc.
+    app.handle_message(Message::CloseOverlay);
+
+    // However the abandoned operation settles, it must do so silently.
+    let mut settled = app.control_snapshot.clone();
+    settled.challenges.clear();
+    settled.operations.insert(
+        operation_id.clone(),
+        OperationRecord {
+            id: operation_id,
+            idempotency_key: IdempotencyKey::new("escape-cancel"),
+            client_id: ClientId::from_parts(AuthorityEpoch(1), 1),
+            command_digest: PolicyDigest::default(),
+            authority_epoch: AuthorityEpoch(1),
+            desired_generation: 1,
+            admitted_at_millis: 1,
+            deadline_millis: 2,
+            intent: crate::vortix_core::control::OperationIntent::default(),
+            status: OperationStatus::Cancelled,
+            result: Some(OperationResult::Cancelled),
+            failure_detail: None,
+        },
+    );
+    app.apply_control_snapshot(settled);
+
+    assert!(
+        app.toast.is_none(),
+        "closing the prompt is a deliberate no-op, but it popped up: {:?}",
+        app.toast.as_ref().map(|toast| toast.message.clone())
+    );
+}
+
+/// The reported bug: pressing Esc on the credential prompt raised "Connection
+/// could not start because another action or route conflict is still active".
+/// The operation does unwind and report a fault, but backing out deliberately
+/// is a no-op to the user — nothing should pop up at all.
+#[test]
+fn closing_the_credential_prompt_says_nothing_at_all() {
+    use crate::vortix_core::control::{OperationFailure, OperationResult, OperationStatus};
+
+    // Without the cancellation record, this is exactly the toast the user
+    // saw — which is why the record has to exist.
+    let (unsuppressed, kind) = crate::app::connection::terminal_control_notification(
+        crate::app::connection::PendingControlSubject::Connection,
+        false,
+        OperationStatus::Failed,
+        Some(OperationResult::Failed(OperationFailure::Rejected)),
+        false,
+        None,
+    )
+    .expect("a rejected connect normally notifies");
+    assert!(
+        unsuppressed.contains("another action or route conflict"),
+        "baseline for the bug: {unsuppressed}"
+    );
+    assert_eq!(kind, crate::app::ToastType::Error);
+
+    // The record is per-operation and consumed once, so it can never mask a
+    // later, unrelated failure.
+    let mut app = test_app();
+    let operation_id: crate::vortix_core::control::OperationId =
+        serde_json::from_str("\"op-0000000000000001-0000000000000009\"").unwrap();
+    app.user_cancelled_operations.insert(operation_id.clone());
+    assert!(app.user_cancelled_operations.remove(&operation_id));
+    assert!(
+        !app.user_cancelled_operations.remove(&operation_id),
+        "a consumed cancellation must not suppress anything further"
+    );
+}
+
+/// The reported bug: a red toast read "Control service unavailable: local
+/// control observation failed: observation is older than evidence already
+/// accepted for this scope". Three layers of internal vocabulary, naming
+/// nothing the user controls and offering no action. Ordering and busy
+/// conditions are self-correcting and belong in the log.
+#[test]
+fn transient_control_conditions_are_logged_not_shown() {
+    for transient in [
+        "local control observation failed: observation is older than evidence already accepted \
+         for this scope",
+        "local control observation failed: observation is from the future",
+        "local control observation failed: control service is busy",
+    ] {
+        assert!(
+            crate::app::control_failure_message(transient).is_none(),
+            "a self-correcting condition must not raise a toast: {transient}"
+        );
+    }
+}
+
+/// Anything that does reach the user must be plain language with an action.
+#[test]
+fn a_surfaced_control_failure_names_an_action() {
+    let shown = crate::app::control_failure_message(
+        "local control observation failed: tunnel observation failed; tunnel absence is unverified",
+    )
+    .expect("a real fault is surfaced");
+    assert!(
+        !shown.contains("evidence") && !shown.contains("scope"),
+        "internal vocabulary leaked: {shown}"
+    );
+    assert!(
+        shown.contains("sudo") || shown.contains("installed"),
+        "expected an action the user can take: {shown}"
+    );
+
+    let generic = crate::app::control_failure_message("some unmapped fault")
+        .expect("unmapped faults still surface");
+    assert!(
+        generic.contains("vortix report"),
+        "expected a fallback action: {generic}"
     );
 }

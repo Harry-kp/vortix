@@ -1679,6 +1679,12 @@ impl TopologyCapture {
         self.publish_readback.store(true, Ordering::SeqCst);
     }
 
+    /// Stop proving the gates — models a resolver that cannot be read back
+    /// right after teardown.
+    fn withhold_readback(&self) {
+        self.publish_readback.store(false, Ordering::SeqCst);
+    }
+
     fn fail_next_tunnel(&self, profile_id: ProfileId) {
         self.fail_next_tunnel.lock().unwrap().insert(profile_id);
     }
@@ -1808,6 +1814,21 @@ async fn observe_connected(service: &ControlService, profile_id: &ProfileId, int
         })
         .await
         .expect("managed tunnel observation accepted");
+}
+
+/// Observe the tunnel gone with no protection evidence at all.
+async fn observe_absent(service: &ControlService, profile_id: &ProfileId) {
+    service
+        .observer()
+        .observe(Observation::Tunnel {
+            profile_id: profile_id.clone(),
+            active: false,
+            interface_name: None,
+            observed_at_millis: 0,
+            protection: None,
+        })
+        .await
+        .expect("tunnel absence accepted");
 }
 
 async fn observe_disconnected(service: &ControlService, profile_id: &ProfileId) {
@@ -4289,6 +4310,615 @@ async fn interactive_operation_expiry_rolls_back_with_cleanup_only_recovery() {
                 })
         },
         "interactive expiry did not retain a bounded cleanup-only recovery",
+    )
+    .await;
+}
+
+/// The reported bug: the TUI showed "Disconnecting …" and then "disconnect
+/// timed out" while the tunnel was actually gone. A disconnect only completed
+/// once every protection gate re-verified, so one unprovable gate — an
+/// in-flux resolver right after teardown is the common case — left the
+/// operation to expire at its deadline even though it had done its job.
+///
+/// A disconnect's goal is absence, and absence is directly observable. Once
+/// the tunnel is gone and nothing is desired connected, the operation has
+/// succeeded; late read-back is not a reason to report failure.
+#[tokio::test]
+async fn a_disconnect_that_reached_absence_does_not_time_out() {
+    let target = profile("disconnect-absence");
+    let clock = Arc::new(TestClock::default());
+    let (service, supervisor, capture) =
+        clocked_topology_service(BTreeSet::from([target.clone()]), clock.clone());
+    let client = service.client();
+
+    // Bring the tunnel up first so there is something to tear down.
+    capture.publish_readback();
+    let connect = client
+        .submit(CommandRequest {
+            command: UserCommand::Connect {
+                profile_id: target.clone(),
+                conflict_acknowledgement: None,
+            },
+            idempotency_key: IdempotencyKey::new("disconnect-absence-connect"),
+            deadline: Deadline(1_000),
+        })
+        .await
+        .expect("connect admitted");
+    wait_for_condition(
+        || {
+            supervisor
+                .profile_truth(&target)
+                .is_some_and(|entry| entry.truth == SupervisedTruth::WaitingForObservation)
+        },
+        "connect did not reach the observation gate",
+    )
+    .await;
+    observe_connected(&service, &target, "tun-disconnect-absence").await;
+    wait_for_condition(
+        || {
+            service.client().snapshot().operations[&connect.operation_id].status
+                == OperationStatus::Succeeded
+        },
+        "connect did not settle",
+    )
+    .await;
+
+    // From here the platform proves nothing more: the resolver read-back
+    // after teardown is exactly the gate that goes unprovable in the field.
+    capture.withhold_readback();
+
+    let disconnect = client
+        .submit(CommandRequest {
+            command: UserCommand::Disconnect {
+                profile_id: Some(target.clone()),
+            },
+            idempotency_key: IdempotencyKey::new("disconnect-absence"),
+            deadline: Deadline(32_000),
+        })
+        .await
+        .expect("disconnect admitted");
+    observe_absent(&service, &target).await;
+
+    clock.0.store(32_000, Ordering::Release);
+    client.refresh().expect("expiry refresh");
+
+    wait_for_condition(
+        || {
+            let snapshot = service.client().snapshot();
+            snapshot.operations[&disconnect.operation_id]
+                .status
+                .is_terminal()
+        },
+        "the disconnect never settled",
+    )
+    .await;
+    let snapshot = service.client().snapshot();
+    assert_ne!(
+        snapshot.operations[&disconnect.operation_id].status,
+        OperationStatus::Expired,
+        "the tunnel is gone, so the disconnect did its job — reporting a timeout is wrong"
+    );
+}
+
+/// The user's sequence, from their control state: cancel a credential prompt,
+/// then connect a different profile. Their log showed the cancel succeeding
+/// and then *every* subsequent connect expiring — while an earlier session
+/// with no cancel connected fine. Refusing a prompt must not poison the next
+/// connect.
+#[tokio::test]
+async fn a_connect_after_a_refused_prompt_still_succeeds() {
+    let refused = profile("refused-then-connect-a");
+    let wanted = profile("refused-then-connect-b");
+    let clock = Arc::new(TestClock::default());
+    let (service, supervisor, capture) = clocked_topology_service(
+        BTreeSet::from([refused.clone(), wanted.clone()]),
+        clock.clone(),
+    );
+    let client = service.client();
+    capture.publish_readback();
+
+    // Admit a connect and refuse its credential prompt.
+    let abandoned = client
+        .submit(CommandRequest {
+            command: UserCommand::Connect {
+                profile_id: refused.clone(),
+                conflict_acknowledgement: None,
+            },
+            idempotency_key: IdempotencyKey::new("refused-prompt"),
+            deadline: Deadline(60_000),
+        })
+        .await
+        .expect("connect admitted");
+    let challenge = service
+        .completer()
+        .issue_challenge(
+            abandoned.operation_id.clone(),
+            refused.clone(),
+            vortix::vortix_core::control::ChallengeKind::Generic {
+                label: "OpenVPN credentials".into(),
+            },
+            "OpenVPN username and password".to_string(),
+            60_000,
+        )
+        .await
+        .expect("challenge issued")
+        .record
+        .id;
+    client
+        .cancel_challenge(challenge)
+        .await
+        .expect("the user closes the prompt");
+    wait_for_condition(
+        || {
+            service.client().snapshot().operations[&abandoned.operation_id]
+                .status
+                .is_terminal()
+        },
+        "the refused connect did not settle",
+    )
+    .await;
+
+    // Now connect something else. This is what was expiring in the field.
+    let next = client
+        .submit(CommandRequest {
+            command: UserCommand::Connect {
+                profile_id: wanted.clone(),
+                conflict_acknowledgement: None,
+            },
+            idempotency_key: IdempotencyKey::new("connect-after-refusal"),
+            deadline: Deadline(60_000),
+        })
+        .await
+        .expect("second connect admitted");
+    wait_for_condition(
+        || {
+            supervisor
+                .profile_truth(&wanted)
+                .is_some_and(|entry| entry.truth == SupervisedTruth::WaitingForObservation)
+        },
+        "the connect after a refusal never reached the observation gate",
+    )
+    .await;
+    observe_connected(&service, &wanted, "tun-refused-then-connect-b").await;
+    wait_for_condition(
+        || {
+            service.client().snapshot().operations[&next.operation_id].status
+                == OperationStatus::Succeeded
+        },
+        "a refused prompt poisoned the next connect",
+    )
+    .await;
+}
+
+/// The user's remaining symptom after the reporting fix: no error any more,
+/// but "Disconnecting …" hung for the full 32s budget before settling.
+///
+/// Completion waits for all four protection gates to re-verify. That is right
+/// for a connect, which must prove protection — but a teardown's goal is
+/// absence, which the scanner has already reported. Holding it to the gates
+/// made every disconnect take the whole deadline whenever one gate could not
+/// be proven, which right after teardown is the normal case.
+///
+/// The clock never moves in this test: settling must not depend on expiry.
+#[tokio::test]
+async fn a_teardown_settles_on_absence_without_waiting_for_its_deadline() {
+    let target = profile("teardown-prompt-settle");
+    let clock = Arc::new(TestClock::default());
+    let (service, supervisor, capture) =
+        clocked_topology_service(BTreeSet::from([target.clone()]), clock.clone());
+    let client = service.client();
+
+    capture.publish_readback();
+    let connect = client
+        .submit(CommandRequest {
+            command: UserCommand::Connect {
+                profile_id: target.clone(),
+                conflict_acknowledgement: None,
+            },
+            idempotency_key: IdempotencyKey::new("teardown-settle-connect"),
+            deadline: Deadline(1_000),
+        })
+        .await
+        .expect("connect admitted");
+    wait_for_condition(
+        || {
+            supervisor
+                .profile_truth(&target)
+                .is_some_and(|entry| entry.truth == SupervisedTruth::WaitingForObservation)
+        },
+        "connect did not reach the observation gate",
+    )
+    .await;
+    observe_connected(&service, &target, "tun-teardown-prompt-settle").await;
+    wait_for_condition(
+        || {
+            service.client().snapshot().operations[&connect.operation_id].status
+                == OperationStatus::Succeeded
+        },
+        "connect did not settle",
+    )
+    .await;
+
+    // From here nothing can be proven about the gates.
+    capture.withhold_readback();
+
+    let disconnect = client
+        .submit(CommandRequest {
+            command: UserCommand::Disconnect {
+                profile_id: Some(target.clone()),
+            },
+            idempotency_key: IdempotencyKey::new("teardown-settle"),
+            deadline: Deadline(32_000),
+        })
+        .await
+        .expect("disconnect admitted");
+    observe_absent(&service, &target).await;
+
+    wait_for_condition(
+        || {
+            service.client().snapshot().operations[&disconnect.operation_id].status
+                == OperationStatus::Succeeded
+        },
+        "the tunnel is gone, so the teardown must settle now — not at its deadline",
+    )
+    .await;
+}
+
+/// Taken from the field: the operation actually stuck on the user's machine
+/// was the service's own teardown recovery, not their disconnect.
+///
+/// ```text
+/// idempotency_key: "service-recovery-155-2001028"
+/// client_id:       "client-...-0000000000000000"   <- sequence 0
+/// intent:          every tunnel "disconnected"
+/// status:          waiting_for_observation
+/// ```
+///
+/// Everything was already disconnected, yet it sat there until it timed out.
+/// The absence check read the intent through a client-scoped helper that
+/// returns nothing for the service's own sequence-0 work, so it could never
+/// match the one operation that needed it.
+#[test]
+fn a_service_owned_teardown_recovery_can_reach_absence() {
+    use vortix::vortix_core::control::{
+        AuthorityEpoch, ControlSnapshot, IdempotencyKey, OperationIntent, OperationRecord,
+        OperationStatus, PolicyDigest,
+    };
+
+    let target = profile("service-recovery-absence");
+    let mut snapshot = ControlSnapshot::default();
+    snapshot
+        .desired
+        .tunnels
+        .insert(target.clone(), RequestedTunnelState::Disconnected);
+    // Evidence of absence, not absence of evidence: the scanner reported the
+    // tunnel down.
+    snapshot.observed.tunnels.insert(
+        target.clone(),
+        vortix::vortix_core::control::model::ObservedTunnel {
+            active: false,
+            interface_name: None,
+            observed_at_millis: 0,
+            received_at_millis: 0,
+        },
+    );
+
+    let record = OperationRecord {
+        id: operation(351),
+        idempotency_key: IdempotencyKey::new("service-recovery-155-2001028"),
+        // The service owns its recoveries, and they carry sequence 0.
+        client_id: serde_json::from_str("\"client-0000000000000001-0000000000000000\"").unwrap(),
+        command_digest: PolicyDigest::default(),
+        authority_epoch: AuthorityEpoch(1),
+        desired_generation: 155,
+        admitted_at_millis: 2_001_028,
+        deadline_millis: 2_031_028,
+        intent: OperationIntent::DesiredSubset {
+            tunnels: BTreeMap::from([(target.clone(), RequestedTunnelState::Disconnected)]),
+            kill_switch: None,
+        },
+        status: OperationStatus::WaitingForObservation,
+        result: None,
+        failure_detail: None,
+    };
+
+    assert!(
+        vortix::vortix_core::control::service::reached_requested_absence(&record, &snapshot),
+        "a service-owned teardown that reached absence must be recognised as done"
+    );
+}
+
+/// The other half of the same bug: a teardown whose *worker* reports a
+/// timeout, rather than the operation outrunning its deadline. Both roads end
+/// at "disconnect timed out" in the UI, and both are wrong once the tunnel is
+/// observably gone.
+#[tokio::test]
+async fn a_slow_teardown_that_reached_absence_is_not_a_failure() {
+    let target = profile("disconnect-slow-worker");
+    let clock = Arc::new(TestClock::default());
+    let (service, supervisor, capture) =
+        clocked_topology_service(BTreeSet::from([target.clone()]), clock.clone());
+    let client = service.client();
+
+    capture.publish_readback();
+    let connect = client
+        .submit(CommandRequest {
+            command: UserCommand::Connect {
+                profile_id: target.clone(),
+                conflict_acknowledgement: None,
+            },
+            idempotency_key: IdempotencyKey::new("slow-teardown-connect"),
+            deadline: Deadline(1_000),
+        })
+        .await
+        .expect("connect admitted");
+    wait_for_condition(
+        || {
+            supervisor
+                .profile_truth(&target)
+                .is_some_and(|entry| entry.truth == SupervisedTruth::WaitingForObservation)
+        },
+        "connect did not reach the observation gate",
+    )
+    .await;
+    observe_connected(&service, &target, "tun-disconnect-slow-worker").await;
+    wait_for_condition(
+        || {
+            service.client().snapshot().operations[&connect.operation_id].status
+                == OperationStatus::Succeeded
+        },
+        "connect did not settle",
+    )
+    .await;
+
+    let disconnect = client
+        .submit(CommandRequest {
+            command: UserCommand::Disconnect {
+                profile_id: Some(target.clone()),
+            },
+            idempotency_key: IdempotencyKey::new("slow-teardown"),
+            deadline: Deadline(32_000),
+        })
+        .await
+        .expect("disconnect admitted");
+    observe_absent(&service, &target).await;
+
+    // The worker gives up, but the interface is already gone.
+    let completed = service
+        .completer()
+        .complete(OperationCompletion {
+            operation_id: disconnect.operation_id.clone(),
+            desired_generation: service.client().snapshot().desired.generation,
+            outcome: CompletionOutcome::Failed(
+                vortix::vortix_core::control::OperationFailure::Timeout,
+            ),
+        })
+        .await;
+    assert!(completed.is_ok(), "completion accepted: {completed:?}");
+
+    let status = service.client().snapshot().operations[&disconnect.operation_id].status;
+    assert_eq!(
+        status,
+        OperationStatus::Succeeded,
+        "the tunnel is gone — a slow worker does not make the teardown a failure"
+    );
+}
+
+/// The reported bug: pressing Esc on a credential prompt cancelled only the
+/// challenge. The connect stayed admitted until its 37s deadline, still
+/// holding the profile and the control plane, so the user's next command was
+/// rejected and then timed out — and the abandoned connect reported itself
+/// long afterwards, at exactly the wrong moment. Refusing the prompt must
+/// refuse the operation.
+#[tokio::test]
+async fn refusing_a_credential_prompt_terminates_its_operation() {
+    let target = profile("refused-credentials");
+    let clock = Arc::new(TestClock::default());
+    let (service, _supervisor, _capture) =
+        clocked_topology_service(BTreeSet::from([target.clone()]), clock.clone());
+    let client = service.client();
+    let admitted = client
+        .submit(CommandRequest {
+            command: UserCommand::Connect {
+                profile_id: target.clone(),
+                conflict_acknowledgement: None,
+            },
+            idempotency_key: IdempotencyKey::new("refused-credentials"),
+            deadline: Deadline(60_000),
+        })
+        .await
+        .expect("connect admitted");
+
+    let challenge_id = service
+        .completer()
+        .issue_challenge(
+            admitted.operation_id.clone(),
+            target.clone(),
+            vortix::vortix_core::control::ChallengeKind::Generic {
+                label: "OpenVPN credentials".into(),
+            },
+            "OpenVPN username and password".to_string(),
+            60_000,
+        )
+        .await
+        .expect("challenge issued")
+        .record
+        .id;
+
+    client
+        .cancel_challenge(challenge_id)
+        .await
+        .expect("the user closes the prompt");
+
+    wait_for_condition(
+        || {
+            let snapshot = client.snapshot();
+            snapshot.operations[&admitted.operation_id].status == OperationStatus::Cancelled
+                && snapshot.desired.tunnels.get(&target) != Some(&RequestedTunnelState::Connected)
+        },
+        "refusing the prompt must cancel the operation and withdraw its connect intent, \
+         not leave it admitted until the deadline",
+    )
+    .await;
+}
+
+/// Build a topology service whose clock the test drives, so a deadline can be
+/// crossed while an observation is still inside the freshness ceiling.
+fn clocked_topology_service(
+    profiles: BTreeSet<ProfileId>,
+    clock: Arc<TestClock>,
+) -> (ControlService, Arc<Supervisor>, Arc<TopologyCapture>) {
+    let capture = Arc::new(TopologyCapture::default());
+    let supervisor = Arc::new(Supervisor::new(
+        AuthorityEpoch(1),
+        capture.clone(),
+        capture.clone(),
+        profiles.len().max(1),
+        8,
+    ));
+    let profile_topologies = profiles
+        .iter()
+        .cloned()
+        .map(|profile_id| (profile_id, ProfileTopology::default()))
+        .collect();
+    let service = ControlService::start_supervised(
+        ControlServiceConfig {
+            authority_epoch: AuthorityEpoch(1),
+            known_profiles: profiles,
+            profile_topologies,
+            freshness_poll_interval: Duration::from_millis(5),
+            ..ControlServiceConfig::default()
+        },
+        clock,
+        ExecutionSelection::CanonicalAuthority,
+        supervisor.clone(),
+    );
+    (service, supervisor, capture)
+}
+
+/// The reported bug: a connect whose deadline expired *after* the tunnel was
+/// already carrying traffic had its intent withdrawn, and reconciliation then
+/// tore the working VPN down. Late verification is a reporting failure, not a
+/// reason to destroy a tunnel the protocol layer established.
+///
+/// `TopologyCapture` never publishes read-back here, so no gate can verify and
+/// the operation must expire.
+#[tokio::test]
+async fn expiry_keeps_a_tunnel_the_protocol_already_established() {
+    let target = profile("expiry-established-tunnel");
+    let clock = Arc::new(TestClock::default());
+    let (service, supervisor, capture) =
+        clocked_topology_service(BTreeSet::from([target.clone()]), clock.clone());
+    let admitted = service
+        .client()
+        .submit(CommandRequest {
+            command: UserCommand::Connect {
+                profile_id: target.clone(),
+                conflict_acknowledgement: None,
+            },
+            idempotency_key: IdempotencyKey::new("expiry-established-tunnel"),
+            deadline: Deadline(1_000),
+        })
+        .await
+        .expect("connect admitted");
+    wait_for_condition(
+        || !capture.tunnel_calls.lock().unwrap().is_empty(),
+        "connect did not dispatch",
+    )
+    .await;
+    wait_for_condition(
+        || {
+            supervisor
+                .profile_truth(&target)
+                .is_some_and(|entry| entry.truth == SupervisedTruth::WaitingForObservation)
+        },
+        "connect receipt did not reach the observation gate",
+    )
+    .await;
+    service
+        .observer()
+        .observe(Observation::Tunnel {
+            profile_id: target.clone(),
+            active: true,
+            interface_name: Some("tun-expiry-established-tunnel".into()),
+            observed_at_millis: 0,
+            protection: None,
+        })
+        .await
+        .expect("tunnel observation accepted");
+    wait_for_condition(
+        || {
+            supervisor
+                .profile_truth(&target)
+                .is_some_and(|entry| entry.truth == SupervisedTruth::ObservedPresent)
+        },
+        "tunnel did not settle before the deadline was crossed",
+    )
+    .await;
+
+    // Cross the deadline while the tunnel observation is still fresh.
+    clock.0.store(1_000, Ordering::Release);
+    service.client().refresh().expect("expiry refresh");
+
+    wait_for_condition(
+        || {
+            service.client().snapshot().operations[&admitted.operation_id].status
+                == OperationStatus::Expired
+        },
+        "the operation did not expire",
+    )
+    .await;
+    let snapshot = service.client().snapshot();
+    assert_eq!(
+        snapshot.desired.tunnels.get(&target),
+        Some(&RequestedTunnelState::Connected),
+        "a working tunnel was torn down because its own verification was late"
+    );
+    assert_ne!(
+        snapshot.effective.protection,
+        ProtectionStatus::Protected,
+        "an unverified tunnel must never be presented as protected"
+    );
+}
+
+/// The other half of the contract: a connect that never established anything
+/// is still withdrawn and cleaned up, so a timeout cannot leave phantom intent
+/// behind to reconnect later.
+#[tokio::test]
+async fn expiry_still_withdraws_a_connect_that_never_came_up() {
+    let target = profile("expiry-no-tunnel");
+    let clock = Arc::new(TestClock::default());
+    let (service, _supervisor, capture) =
+        clocked_topology_service(BTreeSet::from([target.clone()]), clock.clone());
+    let admitted = service
+        .client()
+        .submit(CommandRequest {
+            command: UserCommand::Connect {
+                profile_id: target.clone(),
+                conflict_acknowledgement: None,
+            },
+            idempotency_key: IdempotencyKey::new("expiry-no-tunnel"),
+            deadline: Deadline(1_000),
+        })
+        .await
+        .expect("connect admitted");
+    wait_for_condition(
+        || !capture.tunnel_calls.lock().unwrap().is_empty(),
+        "connect did not dispatch",
+    )
+    .await;
+
+    clock.0.store(1_000, Ordering::Release);
+    service.client().refresh().expect("expiry refresh");
+
+    wait_for_condition(
+        || {
+            let snapshot = service.client().snapshot();
+            snapshot.operations[&admitted.operation_id].status == OperationStatus::Expired
+                && snapshot.desired.tunnels.get(&target)
+                    == Some(&RequestedTunnelState::Disconnected)
+        },
+        "a connect that never came up kept its intent after timing out",
     )
     .await;
 }

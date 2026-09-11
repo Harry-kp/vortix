@@ -54,6 +54,38 @@ enum StartupSettlement {
     ContinueInBackground,
 }
 
+/// What an interactive challenge was actually asking for.
+///
+/// A profile with `auth-user-pass` and no `static-challenge` wants a username
+/// and password; only `static-challenge` means a one-time code. Reporting both
+/// as "2FA" sent users hunting for a code their profile never asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChallengeNeed {
+    OneTimeCode,
+    Credentials,
+}
+
+impl ChallengeNeed {
+    /// Classify from the control plane's own challenge record.
+    #[must_use]
+    pub fn of(challenge: &crate::vortix_core::control::ChallengeRecord) -> Self {
+        match challenge.kind {
+            crate::vortix_core::control::ChallengeKind::TwoFactorCode => Self::OneTimeCode,
+            crate::vortix_core::control::ChallengeKind::Passphrase
+            | crate::vortix_core::control::ChallengeKind::Generic { .. } => Self::Credentials,
+        }
+    }
+}
+
+impl std::fmt::Display for ChallengeNeed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::OneTimeCode => "a one-time code",
+            Self::Credentials => "a username and password",
+        })
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum LocalControlError {
     #[error("cannot construct the local control runtime: {0}")]
@@ -94,10 +126,16 @@ pub enum LocalControlError {
     Stopped,
     #[error("interactive challenge was cancelled")]
     ChallengeCancelled,
-    #[error("profile '{profile}' requires 2FA but stdin is not a tty")]
-    ChallengeNonInteractive { profile: String },
-    #[error("OTP required for 2FA profile '{profile}'")]
-    ChallengeEmpty { profile: String },
+    #[error("profile '{profile}' needs {needs}, and this terminal cannot prompt for it")]
+    ChallengeNonInteractive {
+        profile: String,
+        needs: ChallengeNeed,
+    },
+    #[error("profile '{profile}' needs {needs}, but nothing was entered")]
+    ChallengeEmpty {
+        profile: String,
+        needs: ChallengeNeed,
+    },
     #[error("interactive challenge expired before it was answered")]
     ChallengeExpired,
     #[error("remote control failed: {0}")]
@@ -1192,6 +1230,7 @@ impl ClientControlSession {
         self.run_with_challenges(command, wait, idempotency_key, |challenge| {
             Err(LocalControlError::ChallengeNonInteractive {
                 profile: challenge.profile_id.to_string(),
+                needs: ChallengeNeed::of(challenge),
             })
         })
     }
@@ -2302,9 +2341,10 @@ impl LocalControlSession {
         wait: Duration,
         idempotency_key: impl Into<String>,
     ) -> Result<ClientOperationOutcome, LocalControlError> {
-        self.run_with_challenges(command, wait, idempotency_key, |_| {
+        self.run_with_challenges(command, wait, idempotency_key, |challenge| {
             Err(LocalControlError::ChallengeNonInteractive {
                 profile: "unknown".into(),
+                needs: ChallengeNeed::of(challenge),
             })
         })
     }
@@ -3315,6 +3355,64 @@ pub(crate) fn config_owner(_config_dir: &Path) -> Result<(u32, u32), LocalContro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reported bug: an `OpenVPN` profile with `auth-user-pass` and no
+    /// `static-challenge` was refused with "requires 2FA", sending the user
+    /// to look for a one-time code the profile never asks for. Only
+    /// `TwoFactorCode` is a code; everything else is a username and password.
+    #[test]
+    fn a_password_only_profile_is_never_described_as_needing_a_code() {
+        use crate::vortix_core::control::ChallengeKind;
+
+        assert_eq!(
+            ChallengeNeed::of(&challenge_with(ChallengeKind::TwoFactorCode)),
+            ChallengeNeed::OneTimeCode
+        );
+        for kind in [
+            ChallengeKind::Passphrase,
+            ChallengeKind::Generic {
+                label: "OpenVPN credentials".into(),
+            },
+        ] {
+            assert_eq!(
+                ChallengeNeed::of(&challenge_with(kind.clone())),
+                ChallengeNeed::Credentials,
+                "{kind:?} is not a one-time code"
+            );
+        }
+
+        let refusal = LocalControlError::ChallengeNonInteractive {
+            profile: "03-openvpn-tcp-password-full".into(),
+            needs: ChallengeNeed::Credentials,
+        }
+        .to_string();
+        assert!(
+            refusal.contains("a username and password"),
+            "the refusal must name what is actually wanted: {refusal}"
+        );
+        assert!(
+            !refusal.contains("2FA") && !refusal.contains("one-time"),
+            "a password-only profile must not be reported as needing a code: {refusal}"
+        );
+    }
+
+    fn challenge_with(
+        kind: crate::vortix_core::control::ChallengeKind,
+    ) -> crate::vortix_core::control::ChallengeRecord {
+        crate::vortix_core::control::ChallengeRecord {
+            id: crate::vortix_core::control::ChallengeId::from_counter(1),
+            profile_id: crate::vortix_core::profile::ProfileId::new("p"),
+            operation_id: serde_json::from_str("\"op-0000000000000001-0000000000000001\"").unwrap(),
+            kind,
+            label: "label".into(),
+            authorized_client: crate::vortix_core::control::ClientId::from_parts(
+                crate::vortix_core::control::AuthorityEpoch(1),
+                0,
+            ),
+            created_at_millis: 0,
+            expires_at_millis: 1_000,
+        }
+    }
 
     #[test]
     fn emergency_release_fence_replaces_both_recovery_copies_before_startup() {

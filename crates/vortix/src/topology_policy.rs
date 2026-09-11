@@ -388,7 +388,13 @@ fn resolve_endpoint(
     output: &mut BTreeSet<std::net::IpAddr>,
 ) {
     if let Ok(address) = host.parse::<std::net::IpAddr>() {
+        // A literal endpoint is a resolution — the trivial one. Recording it
+        // keeps the durable cache complete: leaving it out stored an empty
+        // endpoint list, so anything that rebuilt `server_ips` from the cache
+        // lost the address and the pre-tunnel firewall was published with no
+        // allowance for the server, which drops the tunnel's own handshake.
         output.insert(address);
+        resolutions.push(ResolvedEndpoint::new(host, port, address));
         return;
     }
     let live = (host, port)
@@ -1130,6 +1136,52 @@ mod tests {
             )]),
             ..TopologyState::default()
         }
+    }
+
+    /// The reported bug: a profile whose `remote` is already a literal IP
+    /// recorded no endpoint resolution at all, so the durable cache held an
+    /// empty list. Anything rebuilding `server_ips` from that cache published
+    /// a pre-tunnel firewall with no allowance for the server, and `OpenVPN`'s
+    /// own handshake was dropped with `Operation not permitted`.
+    #[test]
+    fn a_literal_endpoint_is_recorded_as_a_resolution() {
+        let mut cache = EndpointResolutionCache::default();
+        let mut resolutions = Vec::new();
+        let mut server_ips = BTreeSet::new();
+        let profile = crate::state::VpnProfile {
+            id: ProfileId::new("literal"),
+            name: "literal".into(),
+            protocol: Protocol::OpenVPN,
+            location: String::new(),
+            config_path: std::path::PathBuf::from("/nonexistent.ovpn"),
+            last_used: None,
+        };
+
+        resolve_endpoint(
+            &profile,
+            "digest",
+            "203.0.113.9",
+            1194,
+            &cache,
+            &mut resolutions,
+            &mut server_ips,
+        );
+
+        assert!(
+            server_ips.contains(&"203.0.113.9".parse::<std::net::IpAddr>().unwrap()),
+            "the literal address must reach the firewall policy"
+        );
+        assert_eq!(
+            resolutions.len(),
+            1,
+            "a literal endpoint must also be recorded so the durable cache is complete"
+        );
+        cache.replace_profile(&profile.id, "digest".into(), resolutions);
+        assert_eq!(
+            cache.lookup(&profile.id, "digest", "203.0.113.9", 1194),
+            Some("203.0.113.9".parse().unwrap()),
+            "a restored session must still find the endpoint"
+        );
     }
 
     #[test]

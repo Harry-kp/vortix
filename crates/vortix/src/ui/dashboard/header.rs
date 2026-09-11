@@ -13,6 +13,26 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
+/// The egress address to print, or `checking…` when the sample in hand
+/// describes the other side of an egress change.
+///
+/// The header is the always-visible summary and styles this value as
+/// confirmed, so it must obey the same provenance rule as the Security Guard:
+/// a reading taken before the tunnel came up is not the exit address, and a
+/// reading taken through a tunnel that has gone is not the real one. Showing
+/// either put the user's real IPv4 under a green `VPN:` label.
+fn header_egress_value(app: &App, want_through_tunnel: bool) -> String {
+    let ip = &app.runtime.public_ip;
+    if app.runtime.egress_v4_through_tunnel() != want_through_tunnel
+        || ip.is_empty()
+        || ip == constants::MSG_DETECTING
+        || ip == constants::MSG_FETCHING
+    {
+        return "checking…".to_string();
+    }
+    ip.clone()
+}
+
 fn profile_display_name(app: &App, id: &ProfileId) -> String {
     app.runtime
         .profiles
@@ -173,7 +193,7 @@ fn render_no_exit_line(app: &App, ks_indicator: Span<'static>) -> Line<'static> 
             Style::default().fg(theme::current().text_secondary),
         ),
         Span::styled(
-            app.runtime.public_ip.clone(),
+            header_egress_value(app, false),
             Style::default().fg(theme::current().text_primary),
         ),
         Span::styled(
@@ -207,7 +227,7 @@ fn render_disconnected_line(app: &App, ks_indicator: Span<'static>) -> Line<'sta
             Style::default().fg(theme::current().text_secondary),
         ),
         Span::styled(
-            app.runtime.public_ip.clone(),
+            header_egress_value(app, false),
             Style::default().fg(theme::current().text_primary),
         ),
         Span::styled(
@@ -381,7 +401,7 @@ fn render_primary_line(
                     Style::default().fg(theme::current().text_secondary),
                 ),
                 Span::styled(
-                    app.runtime.public_ip.clone(),
+                    header_egress_value(app, true),
                     Style::default().fg(theme::current().success),
                 ),
             ];
@@ -913,6 +933,41 @@ mod tests {
         let narrow = render_to_string(&app, 50, 1);
         assert!(narrow.contains("S…"), "{narrow}");
         assert!(narrow.contains("KS:Off"), "{narrow}");
+    }
+
+    /// The reported bug: the header printed the user's real IPv4 under a
+    /// green `VPN:` label while the Security Guard's Exit row correctly read
+    /// `checking…`. The header is the always-visible summary and styles the
+    /// value as confirmed, so disagreeing with the panel is the worse of the
+    /// two. Both now obey the same provenance rule.
+    #[test]
+    fn the_header_never_prints_a_pre_tunnel_sample_as_the_vpn_exit() {
+        let mut app = App::new_test();
+        let snapshot = connected("corp");
+        let profile_id = snapshot.profile_id.clone();
+        app.registry.replace_control_projection(
+            &std::collections::BTreeMap::from([(profile_id.clone(), snapshot)]),
+            Some(profile_id),
+        );
+        // A reading taken before the tunnel came up: it is the real address.
+        app.runtime
+            .record_public_ipv4("171.61.19.233".to_string(), false);
+
+        let out = render_to_string(&app, 100, 1);
+        assert!(
+            !out.contains("171.61.19.233"),
+            "the real IPv4 must not appear as the VPN exit:\n{out}"
+        );
+        assert!(
+            out.contains("checking"),
+            "expected a pending marker:\n{out}"
+        );
+
+        // Once a reading really does come through the tunnel, show it.
+        app.runtime
+            .record_public_ipv4("139.59.71.126".to_string(), true);
+        let out = render_to_string(&app, 100, 1);
+        assert!(out.contains("139.59.71.126"), "{out}");
     }
 
     #[test]
