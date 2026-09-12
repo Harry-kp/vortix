@@ -3917,6 +3917,59 @@ fn terminal_late_route_conflict_opens_the_existing_confirmation_dialog() {
 }
 
 #[test]
+fn refused_route_conflict_reopens_the_confirmation_instead_of_a_dead_end_toast() {
+    use crate::vortix_core::engine::Conflict;
+    use crate::vortix_core::profile::ProfileId;
+
+    let mut app = test_app();
+    add_profiles(&mut app, &["candidate"]);
+    set_connected(&mut app, "existing");
+    let existing = ProfileId::new("existing");
+    let candidate = ProfileId::new("candidate");
+
+    let mut snapshot = app.control_snapshot.clone();
+    snapshot.pending_route_conflicts.insert(
+        candidate.clone(),
+        Conflict::DefaultRouteTakeover {
+            current: existing.clone(),
+            new: candidate.clone(),
+        },
+    );
+    app.apply_control_snapshot(snapshot);
+    // The conflict alone must not open anything: this test is about what the
+    // *refusal* does, so the dialog below has to be attributable to it.
+    assert!(matches!(app.input_mode, InputMode::Normal));
+
+    assert!(
+        app.recover_route_conflict(&candidate),
+        "a live conflict must be recoverable into a confirmation"
+    );
+    assert!(matches!(
+        app.input_mode,
+        InputMode::ConfirmDefaultRouteTakeover {
+            ref from,
+            ref to_profile_id,
+            ref to_name,
+            ..
+        } if from == "existing" && to_profile_id == &candidate && to_name == "candidate"
+    ));
+}
+
+#[test]
+fn a_cleared_route_conflict_falls_back_to_the_error_message() {
+    use crate::vortix_core::profile::ProfileId;
+
+    let mut app = test_app();
+    add_profiles(&mut app, &["candidate"]);
+
+    // No conflict in the snapshot: the peer released the route between the
+    // refusal and now. There is nothing to confirm, so the caller must be told
+    // to fall through and report the error rather than opening an empty dialog.
+    assert!(!app.recover_route_conflict(&ProfileId::new("candidate")));
+    assert!(matches!(app.input_mode, InputMode::Normal));
+}
+
+#[test]
 fn terminal_authentication_failure_is_shown_to_tui_user() {
     use crate::vortix_core::control::{
         AuthorityEpoch, ClientId, IdempotencyKey, OperationFailure, OperationId, OperationIntent,
