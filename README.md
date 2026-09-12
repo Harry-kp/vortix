@@ -204,6 +204,10 @@ Development starts with `cargo build`, `cargo test`, and the full [CI parity](ht
 
 [awesome-rust](https://github.com/rust-unofficial/awesome-rust) · [awesome-ratatui](https://github.com/ratatui/awesome-ratatui) · [awesome-tuis](https://github.com/rothgar/awesome-tuis) · [Arch Linux extra](https://archlinux.org/packages/extra/x86_64/vortix/) · [Terminal Trove](https://terminaltrove.com/vortix/) · [LinuxLinks](https://www.linuxlinks.com/vortix-terminal-ui-wireguard-openvpn/) · [Orhun Parmaksız's spotlight](https://bsky.app/profile/orhun.dev/post/3medp5icbf22y) · [RustNation UK talk deck](https://github.com/orhun/rat-tools/blob/main/ratdeck/intro.md#L213-L219) · [JustTUI](https://github.com/musichen/justtuit/blob/main/README.md#L610)
 
+## Also by the author
+
+[mercury](https://github.com/Harry-kp/mercury) — keyboard-first API client for the terminal. 5 MB, 50 ms startup. · [afk](https://github.com/Harry-kp/afk) — menu bar break reminder, 2.8 MB.
+
 ## Star history
 
 [![Star History Chart](https://star-history.dera.page/svg?repos=Harry-kp/vortix&type=Date)](https://star-history.dera.page/#Harry-kp/vortix&Date)
