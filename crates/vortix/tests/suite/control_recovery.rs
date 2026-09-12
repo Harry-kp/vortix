@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -7,11 +7,11 @@ use tempfile::tempdir;
 use vortix::vortix_config::control_state::FsControlStateStore;
 use vortix::vortix_core::control::supervisor::Supervisor;
 use vortix::vortix_core::control::worker::{
-    CancellationToken, PolicyBarrier, PolicyExecutor, PolicyStage, TopologyPolicy,
-    TunnelExecutionReceipt, TunnelExecutor, TunnelWork,
+    CancellationToken, PolicyBarrier, PolicyExecutionEvidence, PolicyExecutor, PolicyStage,
+    TopologyPolicy, TunnelExecutionReceipt, TunnelExecutor, TunnelWork,
 };
 use vortix::vortix_core::control::{
-    AdmissionError, AuthorityEpoch, BootConnection, BootEligibility, CommandRequest,
+    AdmissionError, AuthorityEpoch, BootConnection, BootEligibility, Clock, CommandRequest,
     CompletionError, CompletionOutcome, ControlPersistenceConfig, ControlService,
     ControlServiceConfig, ControlStateStore, ControlStateStoreError, Deadline, DesiredState,
     DurableControlState, ExecutionSelection, GateEvidence, IdempotencyKey, Observation,
@@ -317,6 +317,161 @@ async fn same_boot_unexpected_recovery_reconstructs_preblock_before_reconnect() 
         tokio::task::yield_now().await;
     }
     assert_eq!(&*order.0.lock().unwrap(), &["preblock", "tunnel"]);
+}
+
+/// Applies the emergency pre-tunnel barrier and hands back a platform
+/// read-back for it, while every reconnect attempt fails. That is the shape
+/// of a real unexpected drop against a server that is gone: the block is in
+/// force and no final policy will ever run to carry the four-gate proof.
+struct DroppedWithProvenPreBlock {
+    clock: Arc<TestClock>,
+}
+
+impl TunnelExecutor for DroppedWithProvenPreBlock {
+    fn execute(
+        &self,
+        _work: &TunnelWork,
+        _cancel: &CancellationToken,
+    ) -> Result<TunnelExecutionReceipt, String> {
+        Err("the server is gone".into())
+    }
+}
+
+impl PolicyExecutor for DroppedWithProvenPreBlock {
+    fn apply(&self, _policy: &TopologyPolicy, _barrier: PolicyBarrier) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn compensate(&self, _policy: &TopologyPolicy, _barrier: PolicyBarrier) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn verification(&self, policy: &TopologyPolicy) -> Option<PolicyExecutionEvidence> {
+        (policy.stage == PolicyStage::PreTunnelBlocking).then_some(PolicyExecutionEvidence {
+            observed_at_millis: self.clock.now_millis(),
+            interface_verified: false,
+            route_verified: false,
+            dns_verified: false,
+            firewall_verified: true,
+        })
+    }
+}
+
+#[derive(Default)]
+struct TestClock(AtomicU64);
+
+impl Clock for TestClock {
+    fn now_millis(&self) -> u64 {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+/// End-to-end proof for the reported gap. `block-on-drop` engages the
+/// firewall on an unexpected drop and keeps it engaged while reconnect
+/// attempts fail — but the block never reached the control snapshot, so the
+/// kill-switch row told the user their protection was broken during the one
+/// window it was doing its job.
+#[tokio::test]
+async fn block_on_drop_reports_the_block_it_engaged() {
+    let profile_id = ProfileId::parse("e".repeat(ProfileId::HEX_LEN)).unwrap();
+    let operation_id: OperationId =
+        serde_json::from_str("\"op-000000000000000d-0000000000000001\"").unwrap();
+    let desired = DesiredState {
+        generation: 3,
+        tunnels: BTreeMap::from([(profile_id.clone(), RequestedTunnelState::Connected)]),
+        conflict_acknowledgements: BTreeMap::new(),
+        kill_switch: vortix::vortix_core::state::killswitch::KillSwitchMode::Auto,
+        authority_epoch: AuthorityEpoch(13),
+        policy_digest: PolicyDigest("dropped-tunnel-policy".into()),
+    };
+    let operation = OperationRecord {
+        id: operation_id.clone(),
+        idempotency_key: IdempotencyKey::new("dropped-tunnel-recovery"),
+        client_id: serde_json::from_str("\"client-000000000000000d-0000000000000001\"").unwrap(),
+        command_digest: desired.policy_digest.clone(),
+        authority_epoch: AuthorityEpoch(13),
+        desired_generation: desired.generation,
+        admitted_at_millis: 0,
+        deadline_millis: u64::MAX,
+        intent: OperationIntent::UnexpectedRecovery {
+            profile_id: profile_id.clone(),
+            tunnels: desired.tunnels.clone(),
+            kill_switch: Some(desired.kill_switch),
+        },
+        status: OperationStatus::WaitingForObservation,
+        result: None,
+        failure_detail: None,
+    };
+    let store = Arc::new(RecordingStore {
+        state: Mutex::new(Some(DurableControlState {
+            desired,
+            operations: BTreeMap::from([(operation_id, operation)]),
+            boot_connections: BTreeMap::new(),
+            requested_resources: BTreeMap::new(),
+            last_connected_at: BTreeMap::new(),
+            tombstones: BTreeMap::new(),
+            retention: RetentionMetadata::default(),
+            reconciliation_required: true,
+        })),
+        ..RecordingStore::default()
+    });
+    let clock = Arc::new(TestClock::default());
+    clock.0.store(1_000, Ordering::Release);
+    let executor = Arc::new(DroppedWithProvenPreBlock {
+        clock: clock.clone(),
+    });
+    let service = ControlService::start_supervised(
+        ControlServiceConfig {
+            authority_epoch: AuthorityEpoch(13),
+            known_profiles: BTreeSet::from([profile_id.clone()]),
+            profile_topologies: topology_catalog(&profile_id),
+            persistence: Some(ControlPersistenceConfig::new("boot-a", store)),
+            retry_initial_backoff: Duration::ZERO,
+            freshness_poll_interval: Duration::from_millis(5),
+            ..ControlServiceConfig::default()
+        },
+        clock.clone(),
+        ExecutionSelection::CanonicalAuthority,
+        Arc::new(Supervisor::new(
+            AuthorityEpoch(13),
+            executor.clone(),
+            executor,
+            1,
+            4,
+        )),
+    );
+    service
+        .observer()
+        .observe(Observation::Tunnel {
+            profile_id,
+            active: false,
+            interface_name: None,
+            observed_at_millis: 1_000,
+            protection: None,
+        })
+        .await
+        .unwrap();
+    service
+        .completer()
+        .set_readiness(AuthorityEpoch(13), true, true)
+        .await
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let snapshot = service.client().snapshot();
+        if snapshot.effective.kill_switch
+            == Some(vortix::vortix_core::state::killswitch::KillSwitchState::Blocking)
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "block-on-drop never reported the block it engaged: {:?}",
+            snapshot.effective.kill_switch
+        );
+        tokio::task::yield_now().await;
+    }
 }
 
 #[tokio::test]

@@ -145,6 +145,16 @@ impl KillSwitchMode {
     /// engaged whether the VPN is up or down. That's the canonical
     /// Linux killswitch shape; tested by
     /// `tests/integration/killswitch.sh`.
+    ///
+    /// # What the canonical control service delivers
+    ///
+    /// This is the policy the deprecated direct shim applies. The canonical
+    /// control service publishes effective state from firewall read-back
+    /// instead, so it delivers every row above *except* `Auto` + not
+    /// connected ⇒ `Blocking`: the pre-tunnel barrier does engage the
+    /// firewall on an unexpected drop, but it installs it without a gate
+    /// read-back, so no evidence reaches the snapshot to report it with.
+    /// See row 222 in `docs/manual-testing/backlog.md`.
     #[must_use]
     pub const fn desired_state(
         self,

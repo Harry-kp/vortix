@@ -9,8 +9,8 @@ use crate::vortix_core::control::persistence::PersistedTombstone;
 use crate::vortix_core::control::worker::{
     CancellationToken, ControlRevision, PolicyAuditResult, PolicyExecutor, PolicyOutcome,
     PolicyResult, PolicyStage, PolicyWorker, ProfileAdmission, ProfileWorkerPool, TopologyPolicy,
-    TopologyState, TunnelExecutor, TunnelMutation, TunnelRevision, TunnelWork, TunnelWorkResult,
-    WorkFailure,
+    TopologyState, TopologyTransitionKind, TunnelExecutor, TunnelMutation, TunnelRevision,
+    TunnelWork, TunnelWorkResult, WorkFailure,
 };
 use crate::vortix_core::ports::tunnel::{
     AdoptionEvidence, HandshakeEvidence, ProbeReceipt, TunnelKindTag,
@@ -54,16 +54,30 @@ pub struct PolicyVerification {
 }
 
 impl PolicyVerification {
-    #[must_use]
-    pub fn is_complete_and_fresh(&self, now_millis: u64) -> bool {
+    /// Age fence shared by every gate scope: a read-back from the future or
+    /// from beyond the protection ceiling is not evidence about now.
+    fn is_fresh(&self, now_millis: u64) -> bool {
         self.observed_at_millis <= now_millis
             && self.received_at_millis <= now_millis
             && now_millis.saturating_sub(self.observed_at_millis) <= MAX_PROTECTION_AGE_MILLIS
             && now_millis.saturating_sub(self.received_at_millis) <= MAX_PROTECTION_AGE_MILLIS
+    }
+
+    #[must_use]
+    pub fn is_complete_and_fresh(&self, now_millis: u64) -> bool {
+        self.is_fresh(now_millis)
             && self.interface_verified
             && self.route_verified
             && self.dns_verified
             && self.firewall_verified
+    }
+
+    /// Proof scope of an emergency pre-tunnel barrier. It is the whole
+    /// four-gate fence minus the three gates that cannot exist while the
+    /// barrier stands alone: no tunnel, no route through it, no resolver.
+    #[must_use]
+    pub fn firewall_is_fresh(&self, now_millis: u64) -> bool {
+        self.is_fresh(now_millis) && self.firewall_verified
     }
 }
 
@@ -73,6 +87,20 @@ struct State {
     latest_policy: Option<(ControlRevision, OperationId, PolicyStage)>,
     latest_topology: Option<TopologyPolicy>,
     pre_tunnel_blocking: Option<(ControlRevision, OperationId)>,
+    /// The exact pre-block policy currently submitted, retained so the audit
+    /// cadence can re-read the barrier after the final stage has taken over
+    /// `latest_topology`.
+    ///
+    /// Only a recovery is retained. `block-on-drop` also pre-blocks for a
+    /// planned reconnect or primary transfer, where the firewall is engaged
+    /// but the VPN did not drop — reporting those would put "VPN dropped" on
+    /// screen during a transition the user asked for.
+    pre_block_topology: Option<TopologyPolicy>,
+    /// Fenced platform read-back of the emergency barrier, with the instant
+    /// it arrived. This is the only thing that may publish `Blocking` for a
+    /// pre-tunnel block.
+    pre_block_proof: Option<(ControlRevision, OperationId, u64)>,
+    last_pre_block_audit: Option<(ControlRevision, OperationId, u64)>,
     applied_policy: Option<(ControlRevision, OperationId)>,
     applied_topology: Option<TopologyState>,
     profiles: BTreeMap<ProfileId, ProfileSupervision>,
@@ -89,6 +117,9 @@ impl State {
             latest_policy: None,
             latest_topology: None,
             pre_tunnel_blocking: None,
+            pre_block_topology: None,
+            pre_block_proof: None,
+            last_pre_block_audit: None,
             applied_policy: None,
             applied_topology: None,
             profiles: BTreeMap::new(),
@@ -98,6 +129,147 @@ impl State {
             last_policy_audit: None,
         }
     }
+}
+
+/// Identity fence shared by [`Supervisor::fences_policy`] and
+/// [`Supervisor::verify_policy`]: the read-back must describe the exact
+/// applied final policy and only tunnels the supervisor still owns.
+fn policy_fence_holds(state: &State, evidence: &PolicyVerification) -> bool {
+    let exact = state
+        .latest_policy
+        .as_ref()
+        .zip(state.applied_policy.as_ref())
+        .is_some_and(|(latest, applied)| {
+            latest.0 == evidence.revision
+                && latest.1 == evidence.operation_id
+                && latest.2 == PolicyStage::Final
+                && applied.0 == latest.0
+                && applied.1 == latest.1
+        });
+    let tunnel_truth_exact = state.latest_topology.as_ref().is_some_and(|policy| {
+        policy.target.profiles.iter().all(|profile| {
+            policy
+                .tunnel_revisions
+                .get(profile)
+                .is_some_and(|revision| {
+                    state.profiles.get(profile).is_some_and(|entry| {
+                        entry.revision == *revision
+                            && entry.truth == SupervisedTruth::ObservedPresent
+                            && entry.adoption.as_ref().is_some_and(|adoption| {
+                                adoption.kind() != TunnelKindTag::WireGuard
+                                    || entry.handshake.as_ref().is_some_and(|handshake| {
+                                        handshake.generation == revision.generation
+                                            && !handshake.peer_public_key.is_empty()
+                                    })
+                            })
+                    })
+                })
+        })
+    });
+    exact && tunnel_truth_exact
+}
+
+/// Identity fence for the emergency pre-tunnel barrier, the pre-block
+/// counterpart of [`policy_fence_holds`].
+///
+/// It holds while the supervisor still owns that exact barrier: the pre-block
+/// applied and was not superseded, nothing newer has been submitted, and the
+/// final stage for the same revision has not published yet. Once the final
+/// stage is applied it carries the richer four-gate truth and this fence must
+/// step aside.
+///
+/// `pre_block_topology` is only retained for a recovery, so the fence is also
+/// what scopes the claim to a barrier the user's VPN actually dropped into.
+fn pre_block_fence_holds(
+    state: &State,
+    revision: &ControlRevision,
+    operation_id: &OperationId,
+) -> bool {
+    let identity = (revision.clone(), operation_id.clone());
+    state.pre_tunnel_blocking.as_ref() == Some(&identity)
+        && state.pre_block_topology.as_ref().is_some_and(|policy| {
+            policy.revision() == *revision && policy.operation_id == *operation_id
+        })
+        && state
+            .latest_policy
+            .as_ref()
+            .is_some_and(|(latest, operation, _)| latest == revision && operation == operation_id)
+        && state.applied_policy.as_ref() != Some(&identity)
+}
+
+/// A read-only refresh is due once the current proof is halfway to the
+/// protection ceiling. A stamp from the future is treated as due.
+fn audit_rate_limited(last_attempt: Option<u64>, now_millis: u64) -> bool {
+    last_attempt.is_some_and(|last_attempt| {
+        last_attempt > now_millis
+            || now_millis.saturating_sub(last_attempt) < MAX_PROTECTION_AGE_MILLIS / 2
+    })
+}
+
+/// Pick the policy whose platform read-back is due for a refresh.
+///
+/// The emergency barrier comes first: while it is the supervisor's own, it is
+/// the only firewall installed, and the final policy that would otherwise be
+/// audited describes a topology that is no longer in force.
+fn audit_due_policy(state: &State, now_millis: u64) -> Result<Option<TopologyPolicy>, WorkFailure> {
+    if let Some(policy) = state
+        .pre_block_topology
+        .as_ref()
+        .filter(|policy| pre_block_fence_holds(state, &policy.revision(), &policy.operation_id))
+    {
+        let for_pre_block = |candidate: &ControlRevision, operation: &OperationId, at: u64| {
+            (*candidate == policy.revision() && *operation == policy.operation_id).then_some(at)
+        };
+        let last_attempt = state
+            .pre_block_proof
+            .as_ref()
+            .and_then(|(candidate, operation, received_at)| {
+                for_pre_block(candidate, operation, *received_at)
+            })
+            .into_iter()
+            .chain(state.last_pre_block_audit.as_ref().and_then(
+                |(candidate, operation, attempted_at)| {
+                    for_pre_block(candidate, operation, *attempted_at)
+                },
+            ))
+            .max();
+        return Ok((!audit_rate_limited(last_attempt, now_millis)).then(|| policy.clone()));
+    }
+
+    let Some((revision, operation_id)) = state.applied_policy.clone() else {
+        return Ok(None);
+    };
+    let for_applied = |candidate: &ControlRevision, operation: &OperationId, at: u64| {
+        (*candidate == revision && *operation == operation_id).then_some(at)
+    };
+    let last_attempt =
+        state
+            .protected
+            .as_ref()
+            .and_then(|(candidate, operation, verified_at)| {
+                for_applied(candidate, operation, *verified_at)
+            })
+            .into_iter()
+            .chain(state.last_policy_audit.as_ref().and_then(
+                |(candidate, operation, attempted_at)| {
+                    for_applied(candidate, operation, *attempted_at)
+                },
+            ))
+            .max();
+    if audit_rate_limited(last_attempt, now_millis) {
+        return Ok(None);
+    }
+    state
+        .latest_topology
+        .as_ref()
+        .filter(|policy| {
+            policy.stage == PolicyStage::Final
+                && policy.revision() == revision
+                && policy.operation_id == operation_id
+        })
+        .cloned()
+        .map(Some)
+        .ok_or(WorkFailure::Stale)
 }
 
 pub struct Supervisor {
@@ -402,6 +574,10 @@ impl Supervisor {
         self.policy.submit(policy.clone())?;
         if policy.stage == PolicyStage::PreTunnelBlocking {
             state.pre_tunnel_blocking = None;
+            state.pre_block_proof = None;
+            state.last_pre_block_audit = None;
+            state.pre_block_topology =
+                (policy.transition == TopologyTransitionKind::Recovery).then(|| policy.clone());
         }
         state.latest_policy = Some((revision, policy.operation_id.clone(), policy.stage));
         state.latest_topology = Some(policy.clone());
@@ -546,9 +722,12 @@ impl Supervisor {
                 .latest_topology
                 .as_ref()
                 .map(|policy| policy.target.clone());
+            state.pre_block_topology = None;
+            state.pre_block_proof = None;
         } else {
             if exact && result.stage == PolicyStage::PreTunnelBlocking {
                 state.pre_tunnel_blocking = None;
+                state.pre_block_proof = None;
             }
             state.policy_degraded = Some(if exact {
                 WorkFailure::EffectFailed
@@ -562,50 +741,33 @@ impl Supervisor {
 
     /// Queue a read-only refresh before the current protection proof expires.
     /// Policy mutation work always has priority in the shared worker.
+    ///
+    /// Anchored on the *applied* policy, never on the last proof. Anchoring on
+    /// the proof latched the snapshot: one unverifiable gate cleared
+    /// `protected`, which stopped every further audit, so protection stayed
+    /// degraded until the next mutation instead of recovering on its own.
     pub fn submit_policy_audit_if_due(&self, now_millis: u64) -> Result<bool, WorkFailure> {
-        let mut policy = {
+        let Some(mut policy) = ({
             let state = self.state.lock().expect("supervisor mutex poisoned");
-            let Some((revision, operation_id, verified_at)) = state.protected.as_ref() else {
-                return Ok(false);
-            };
-            let last_attempt = state
-                .last_policy_audit
-                .as_ref()
-                .filter(|(attempt_revision, attempt_operation, _)| {
-                    attempt_revision == revision && attempt_operation == operation_id
-                })
-                .map_or(*verified_at, |(_, _, attempted_at)| *attempted_at)
-                .max(*verified_at);
-            if last_attempt > now_millis
-                || now_millis.saturating_sub(last_attempt) < MAX_PROTECTION_AGE_MILLIS / 2
-            {
-                return Ok(false);
-            }
-            let policy = state
-                .latest_topology
-                .as_ref()
-                .filter(|policy| {
-                    policy.stage == PolicyStage::Final
-                        && policy.revision() == *revision
-                        && policy.operation_id == *operation_id
-                        && state.applied_policy.as_ref()
-                            == Some(&(revision.clone(), operation_id.clone()))
-                })
-                .cloned()
-                .ok_or(WorkFailure::Stale)?;
-            policy
+            audit_due_policy(&state, now_millis)?
+        }) else {
+            return Ok(false);
         };
         policy.deadline = Instant::now()
             .checked_add(Duration::from_millis(MAX_PROTECTION_AGE_MILLIS / 2))
             .ok_or(WorkFailure::TimedOut)?;
+        let audited_stage = policy.stage;
         let revision = policy.revision();
         let operation_id = policy.operation_id.clone();
         match self.policy.submit_audit(policy) {
             Ok(()) => {
-                self.state
-                    .lock()
-                    .expect("supervisor mutex poisoned")
-                    .last_policy_audit = Some((revision, operation_id, now_millis));
+                let mut state = self.state.lock().expect("supervisor mutex poisoned");
+                let stamp = Some((revision, operation_id, now_millis));
+                if audited_stage == PolicyStage::PreTunnelBlocking {
+                    state.last_pre_block_audit = stamp;
+                } else {
+                    state.last_policy_audit = stamp;
+                }
                 Ok(true)
             }
             Err(WorkFailure::Busy) => Ok(false),
@@ -616,21 +778,36 @@ impl Supervisor {
     pub fn poll_policy_audit(&self) -> Option<PolicyAuditResult> {
         let mut result = self.policy.try_audit_result()?;
         let state = self.state.lock().expect("supervisor mutex poisoned");
-        let exact = state
-            .latest_policy
-            .as_ref()
-            .zip(state.applied_policy.as_ref())
-            .is_some_and(|(latest, applied)| {
-                latest.0 == result.revision
-                    && latest.1 == result.operation_id
-                    && latest.2 == PolicyStage::Final
-                    && applied.0 == result.revision
-                    && applied.1 == result.operation_id
-            });
+        let exact = match result.stage {
+            PolicyStage::PreTunnelBlocking => {
+                pre_block_fence_holds(&state, &result.revision, &result.operation_id)
+            }
+            PolicyStage::Final => state
+                .latest_policy
+                .as_ref()
+                .zip(state.applied_policy.as_ref())
+                .is_some_and(|(latest, applied)| {
+                    latest.0 == result.revision
+                        && latest.1 == result.operation_id
+                        && latest.2 == PolicyStage::Final
+                        && applied.0 == result.revision
+                        && applied.1 == result.operation_id
+                }),
+        };
         if !exact {
             result.result = Err(WorkFailure::Stale);
         }
         Some(result)
+    }
+
+    /// Whether read-back belongs to the exact applied final policy and to
+    /// tunnels the supervisor still owns. This is the identity fence only —
+    /// it says the evidence is *about* current state, not that current state
+    /// is protected. Per-gate evidence may be recorded once it holds.
+    #[must_use]
+    pub fn fences_policy(&self, evidence: &PolicyVerification) -> bool {
+        let state = self.state.lock().expect("supervisor mutex poisoned");
+        policy_fence_holds(&state, evidence)
     }
 
     pub fn verify_policy(
@@ -639,38 +816,7 @@ impl Supervisor {
         now_millis: u64,
     ) -> Result<(), WorkFailure> {
         let mut state = self.state.lock().expect("supervisor mutex poisoned");
-        let exact = state
-            .latest_policy
-            .as_ref()
-            .zip(state.applied_policy.as_ref())
-            .is_some_and(|(latest, applied)| {
-                latest.0 == evidence.revision
-                    && latest.1 == evidence.operation_id
-                    && latest.2 == PolicyStage::Final
-                    && applied.0 == latest.0
-                    && applied.1 == latest.1
-            });
-        let tunnel_truth_exact = state.latest_topology.as_ref().is_some_and(|policy| {
-            policy.target.profiles.iter().all(|profile| {
-                policy
-                    .tunnel_revisions
-                    .get(profile)
-                    .is_some_and(|revision| {
-                        state.profiles.get(profile).is_some_and(|entry| {
-                            entry.revision == *revision
-                                && entry.truth == SupervisedTruth::ObservedPresent
-                                && entry.adoption.as_ref().is_some_and(|adoption| {
-                                    adoption.kind() != TunnelKindTag::WireGuard
-                                        || entry.handshake.as_ref().is_some_and(|handshake| {
-                                            handshake.generation == revision.generation
-                                                && !handshake.peer_public_key.is_empty()
-                                        })
-                                })
-                        })
-                    })
-            })
-        });
-        if !exact || !tunnel_truth_exact {
+        if !policy_fence_holds(&state, evidence) {
             state.protected = None;
             state.policy_degraded = Some(WorkFailure::Stale);
             return Err(WorkFailure::Stale);
@@ -687,6 +833,50 @@ impl Supervisor {
         ));
         state.policy_degraded = None;
         Ok(())
+    }
+
+    /// Record fenced platform read-back of the emergency pre-tunnel barrier.
+    ///
+    /// Deliberately separate from [`Self::verify_policy`]: a pre-block proves
+    /// the firewall and nothing else, so it must never set `protected`, which
+    /// is the four-gate whole-topology claim. It publishes one fact — the
+    /// block the user is relying on right now is really installed.
+    pub fn verify_pre_block(
+        &self,
+        evidence: &PolicyVerification,
+        now_millis: u64,
+    ) -> Result<(), WorkFailure> {
+        let mut state = self.state.lock().expect("supervisor mutex poisoned");
+        if !pre_block_fence_holds(&state, &evidence.revision, &evidence.operation_id) {
+            state.pre_block_proof = None;
+            return Err(WorkFailure::Stale);
+        }
+        if !evidence.firewall_is_fresh(now_millis) {
+            state.pre_block_proof = None;
+            return Err(WorkFailure::EffectFailed);
+        }
+        state.pre_block_proof = Some((
+            evidence.revision.clone(),
+            evidence.operation_id.clone(),
+            evidence.received_at_millis,
+        ));
+        Ok(())
+    }
+
+    /// Whether the emergency barrier is provably installed *now*: the exact
+    /// pre-block is still the supervisor's, and its read-back has not aged
+    /// past the protection ceiling.
+    #[must_use]
+    pub fn pre_block_blocking(&self, now_millis: u64) -> bool {
+        let state = self.state.lock().expect("supervisor mutex poisoned");
+        state
+            .pre_block_proof
+            .as_ref()
+            .is_some_and(|(revision, operation_id, received_at)| {
+                pre_block_fence_holds(&state, revision, operation_id)
+                    && *received_at <= now_millis
+                    && now_millis.saturating_sub(*received_at) <= MAX_PROTECTION_AGE_MILLIS
+            })
     }
 
     /// Only a fresh exact observation can settle a tunnel effect.

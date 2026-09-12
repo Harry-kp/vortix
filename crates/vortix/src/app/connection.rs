@@ -178,7 +178,12 @@ fn control_error_message(error: &crate::cli::control::LocalControlError) -> Stri
             CONTROL_STARTING_MESSAGE.to_string()
         }
         LocalControlError::Admission(AdmissionError::RouteConflict) => {
-            "This VPN overlaps an active route. Review the confirmation and try again.".to_string()
+            // Reached only when the confirmation overlay could not be reopened
+            // - see `recover_route_conflict`. By that point the conflicting
+            // tunnel is no longer in our snapshot, so naming it would be a
+            // guess. Telling the user to "review the confirmation" was worse:
+            // there was no confirmation anywhere to review.
+            "Another tunnel claimed these routes first. Try connecting again.".to_string()
         }
         LocalControlError::Admission(AdmissionError::ProfileActive) => {
             "Disconnect this profile before changing it.".to_string()
@@ -204,6 +209,37 @@ fn control_error_message(error: &crate::cli::control::LocalControlError) -> Stri
             reason.clone()
         }
         _ => "Vortix could not start this action. See Event Log for details.".to_string(),
+    }
+}
+
+/// Whether a refusal is the service saying "these routes are already claimed".
+///
+/// Both the in-process and the daemon-backed control paths can raise it, and
+/// the user's situation is identical either way, so both must be recognised.
+fn is_route_conflict(error: &crate::cli::control::LocalControlError) -> bool {
+    use crate::cli::control::LocalControlError;
+    use crate::vortix_core::control::AdmissionError;
+    matches!(
+        error,
+        LocalControlError::Admission(AdmissionError::RouteConflict)
+            | LocalControlError::Remote(crate::daemon::service::RemoteControlError::Admission(
+                AdmissionError::RouteConflict
+            ))
+    )
+}
+
+/// The profile a connect-shaped command targeted, if it was one.
+///
+/// Deliberately narrower than [`lifecycle_command_profile_id`]: only a connect
+/// can be refused for a route conflict, and recovering one means re-offering
+/// the *connect*.
+fn connect_target(command: Option<&crate::vortix_core::control::UserCommand>) -> Option<ProfileId> {
+    use crate::vortix_core::control::UserCommand;
+    match command? {
+        UserCommand::Connect { profile_id, .. } | UserCommand::ConnectExclusive { profile_id } => {
+            Some(profile_id.clone())
+        }
+        _ => None,
     }
 }
 
@@ -490,11 +526,26 @@ impl App {
     ) -> Option<()> {
         let wait = self.control_command_timeout(&command);
         let idempotency_key = self.next_control_request_key();
+        // Captured before `command` moves into the queue: a route-conflict
+        // refusal has to know which profile was asking in order to re-offer it.
+        let conflict_target = connect_target(Some(&command));
         let result = self
             .control_session
             .as_ref()
             .expect("control command requires an attached session")
             .enqueue_tui_command(command, wait, idempotency_key);
+        if let Err(error) = &result {
+            if is_route_conflict(error) {
+                if let Some(profile_id) = conflict_target {
+                    if self.recover_route_conflict(&profile_id) {
+                        self.log(
+                            "CONTROL: connect refused for a route conflict; reopened the confirmation",
+                        );
+                        return None;
+                    }
+                }
+            }
+        }
         self.report_control_enqueue(result)
     }
 
@@ -654,6 +705,8 @@ impl App {
                     }
                 }
                 crate::cli::control::TuiControlCompletion::Admission(Err(error)) => {
+                    // Read before anything below can consume `result.command`.
+                    let conflict_target = connect_target(result.command.as_ref());
                     if let Some(request_key) = import_request_key.as_deref() {
                         self.reject_pending_profile_import(request_key);
                     }
@@ -669,6 +722,16 @@ impl App {
                         .as_deref()
                         .map_or_else(|| "command".to_owned(), |name| format!("import '{name}'"));
                     self.log(&format!("ERR: Control {subject} refused: {error}"));
+                    // A route conflict is a decision, not a failure. Offer the
+                    // takeover confirmation instead of a toast the user cannot
+                    // act on.
+                    if is_route_conflict(&error) {
+                        if let Some(profile_id) = conflict_target {
+                            if self.recover_route_conflict(&profile_id) {
+                                continue;
+                            }
+                        }
+                    }
                     self.show_toast(control_error_message(&error), ToastType::Error);
                 }
                 crate::cli::control::TuiControlCompletion::ChallengeResponse {
@@ -763,9 +826,23 @@ impl App {
         }
         self.registry
             .set_killswitch_mode(snapshot.desired.kill_switch);
+        // `effective.kill_switch` is None until the service publishes an
+        // observation. That is "not known yet", which is not the same as
+        // `Degraded` — documented as the no-claim state for when policy
+        // application or read-back cannot be proven. Rendering the gap as
+        // Degraded told users their kill switch was broken every time a
+        // change was in flight, including when the firewall was applied and
+        // correct.
+        //
+        // While a change is running, the last observed state is still the
+        // truth about the firewall, so it is held rather than replaced by an
+        // alarm. Only an unknown state with nothing running is a real
+        // no-claim, and that still reports Degraded.
         let kill_switch_state = snapshot.effective.kill_switch.unwrap_or_else(|| {
             if snapshot.desired.kill_switch == crate::state::KillSwitchMode::Off {
                 KillSwitchState::Disabled
+            } else if self.killswitch_change_in_flight() {
+                self.runtime.killswitch_state
             } else {
                 KillSwitchState::Degraded
             }
@@ -926,6 +1003,16 @@ impl App {
         let target_name = self.runtime.profiles[idx].name.clone();
         self.fire_conflict_overlay(conflict, idx, profile_id, target_name);
         true
+    }
+
+    /// Whether a kill-switch change is still running.
+    pub(crate) fn killswitch_change_in_flight(&self) -> bool {
+        self.pending_control_operations.values().any(|pending| {
+            matches!(
+                pending.subject,
+                super::connection::PendingControlSubject::KillSwitch
+            )
+        })
     }
 
     /// Commit or discard held credentials once the server has judged them.
@@ -1131,6 +1218,9 @@ impl App {
         {
             self.pending_control_operations.remove(&operation_id);
             self.settle_credentials(subject, status, result, connect_profile.as_ref());
+            if matches!(subject, PendingControlSubject::KillSwitch) {
+                self.submit_queued_killswitch_target();
+            }
             if self.present_late_route_conflict(subject, status, result, late_route_conflict) {
                 continue;
             }
@@ -1473,6 +1563,40 @@ impl App {
     /// Fire the appropriate confirm overlay for a registry-reported
     /// conflict. Logs an ACTION line so the activity panel
     /// reflects the blocked attempt.
+    /// Turn a route-conflict refusal into the confirmation the user can act on.
+    ///
+    /// `control_connect_profile` already opens this overlay when the *local*
+    /// snapshot shows a conflict. That snapshot can lag the service, though:
+    /// the peer tunnel may claim the route between our last snapshot and the
+    /// command landing, and a connect issued from anywhere that does not route
+    /// through `control_connect_profile` never consults it at all. Either way
+    /// the service refuses with `RouteConflict` and, before this, the user got
+    /// a dead-end toast telling them to review a confirmation that was never
+    /// shown.
+    ///
+    /// Re-resolve against the now-current snapshot and open the same overlay.
+    /// Returns whether it could - a caller that gets `false` must still report
+    /// the error, because the conflict has since cleared and there is nothing
+    /// to confirm.
+    pub(super) fn recover_route_conflict(&mut self, profile_id: &ProfileId) -> bool {
+        let Some(conflict) = self.control_snapshot.topology_conflict(profile_id) else {
+            return false;
+        };
+        let Some(idx) = self.profile_index(profile_id) else {
+            return false;
+        };
+        let Some(name) = self
+            .runtime
+            .profiles
+            .get(idx)
+            .map(|profile| profile.name.clone())
+        else {
+            return false;
+        };
+        self.fire_conflict_overlay(conflict, idx, profile_id.clone(), name);
+        true
+    }
+
     fn fire_conflict_overlay(
         &mut self,
         conflict: Conflict,

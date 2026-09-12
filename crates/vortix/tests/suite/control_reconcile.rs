@@ -1301,6 +1301,109 @@ fn supervisor_rejects_same_generation_different_digest_verification() {
     assert_eq!(supervisor.protected_generation(), None);
 }
 
+/// The mechanism behind "connect a VPN and the kill switch goes straight to
+/// Degraded, permanently".
+///
+/// Re-verification used to be anchored on the last *proof*. One unprovable
+/// gate cleared `protected`, which made every later audit ineligible, so the
+/// snapshot could not recover on its own: protection stayed degraded until the
+/// user's next connect, disconnect or mode change.
+#[test]
+fn losing_the_protection_proof_does_not_stop_re_verification() {
+    let recorder = Arc::new(AuditPolicyRecorder::default());
+    let supervisor = Supervisor::new(
+        AuthorityEpoch(1),
+        Arc::new(OkExecutor),
+        recorder.clone(),
+        2,
+        4,
+    );
+    let mut policy_only = policy(7, "expected");
+    policy_only.target.profiles.clear();
+    policy_only.required_blocking = false;
+    supervisor.submit_policy(&policy_only).unwrap();
+    let applied = wait_until(Duration::from_secs(1), || supervisor.poll_policy()).unwrap();
+    assert_eq!(applied.outcome, PolicyOutcome::Applied);
+
+    let verified = PolicyVerification {
+        revision: revision(7, "expected"),
+        operation_id: operation(7),
+        observed_at_millis: 10,
+        received_at_millis: 10,
+        interface_verified: true,
+        route_verified: true,
+        dns_verified: true,
+        firewall_verified: true,
+    };
+    supervisor.verify_policy(&verified, 10).unwrap();
+    assert_eq!(supervisor.protected_generation(), Some(7));
+
+    assert!(
+        !supervisor.submit_policy_audit_if_due(10).unwrap(),
+        "a proof that was just taken is not due for refresh"
+    );
+    assert!(supervisor.submit_policy_audit_if_due(2_600).unwrap());
+    let refresh = wait_until(Duration::from_secs(1), || supervisor.poll_policy_audit()).unwrap();
+    assert!(refresh.result.is_ok());
+
+    let incomplete = PolicyVerification {
+        dns_verified: false,
+        ..verified
+    };
+    assert_eq!(
+        supervisor.verify_policy(&incomplete, 2_700),
+        Err(WorkFailure::EffectFailed)
+    );
+    assert_eq!(supervisor.protected_generation(), None);
+
+    assert!(
+        supervisor.submit_policy_audit_if_due(5_200).unwrap(),
+        "losing the proof must not stop the very audit that could restore it"
+    );
+    let recovery = wait_until(Duration::from_secs(1), || supervisor.poll_policy_audit()).unwrap();
+    assert!(recovery.result.is_ok());
+    assert_eq!(recorder.audit_calls.load(Ordering::SeqCst), 2);
+}
+
+/// A read-back that overran the audit budget still describes the moment it
+/// observed, and freshness is enforced downstream on `observed_at_millis`.
+/// Discarding it here meant a platform whose resolver reads cost more than the
+/// budget could never re-prove protection at all.
+#[test]
+fn audit_readback_survives_a_budget_overrun() {
+    struct SlowAudit;
+    impl PolicyExecutor for SlowAudit {
+        fn apply(&self, _: &TopologyPolicy, _: PolicyBarrier) -> Result<(), String> {
+            Ok(())
+        }
+        fn compensate(&self, _: &TopologyPolicy, _: PolicyBarrier) -> Result<(), String> {
+            Ok(())
+        }
+        fn audit(&self, _: &TopologyPolicy) -> Result<PolicyExecutionEvidence, String> {
+            std::thread::sleep(Duration::from_millis(60));
+            Ok(PolicyExecutionEvidence {
+                observed_at_millis: 10,
+                interface_verified: true,
+                route_verified: true,
+                dns_verified: true,
+                firewall_verified: true,
+            })
+        }
+    }
+
+    let worker = PolicyWorker::start(Arc::new(SlowAudit), 4);
+    let mut audited = policy(1, "slow-audit");
+    audited.deadline = Instant::now() + Duration::from_millis(20);
+    worker.submit_audit(audited).unwrap();
+    let result = wait_until(Duration::from_secs(2), || worker.try_audit_result()).unwrap();
+
+    assert!(
+        result.result.is_ok(),
+        "a slow but successful read-back must not be thrown away: {:?}",
+        result.result
+    );
+}
+
 #[test]
 fn supervisor_does_not_reuse_pre_block_for_another_operation() {
     let supervisor = Supervisor::new(

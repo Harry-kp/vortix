@@ -175,7 +175,10 @@ impl Journal {
                 Some(d) => d,
                 None => default_journal_dir()?,
             };
-            std::fs::create_dir_all(&dir)?;
+            // Session journals record what was connected and when. Left at
+            // the caller's umask these were 0775 on Debian derivatives, whose
+            // default is 002 — parent included.
+            crate::utils::create_private_dir_all(&dir)?;
             Some(dir)
         } else {
             None

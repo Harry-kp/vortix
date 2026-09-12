@@ -113,10 +113,17 @@ fn main() -> Result<()> {
                 std::process::exit(cli::output::ExitCode::StateConflict.code());
             }
             Err(error) => {
-                return Err(color_eyre::eyre::eyre!(
-                    "{}",
-                    vortix::utils::lifecycle_lock_user_message(&error)
-                ));
+                // The neighbouring WouldBlock arm already prints and exits
+                // cleanly; this one returned an eyre error, so a lock the
+                // user simply could not open came with a source location and
+                // backtrace hints attached.
+                eprintln!("{}", vortix::utils::lifecycle_lock_user_message(&error));
+                let exit = if error.kind() == std::io::ErrorKind::PermissionDenied {
+                    cli::output::ExitCode::PermissionDenied
+                } else {
+                    cli::output::ExitCode::GeneralError
+                };
+                std::process::exit(exit.code());
             }
         })
     } else {
@@ -133,6 +140,24 @@ fn main() -> Result<()> {
         eprintln!("Vortix needs administrator access to manage VPN connections.");
         eprintln!("Try again with: sudo vortix");
         std::process::exit(cli::output::ExitCode::PermissionDenied.code());
+    }
+
+    // `ratatui::init()` panics when there is no terminal to take over, and
+    // that surfaced as "Vortix crashed unexpectedly" followed by a ratatui
+    // source path — for the entirely ordinary case of no TTY: `ssh host
+    // vortix`, a cron entry, a pipe. Refuse here, before any state is
+    // touched, and point at the headless commands that do work. Both streams
+    // matter: the dashboard draws to stdout and reads keys from stdin, so a
+    // redirected stdin would leave it painted but unable to accept input.
+    if args.command.is_none() {
+        use std::io::IsTerminal as _;
+        if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
+            eprintln!("The Vortix dashboard needs an interactive terminal.");
+            eprintln!(
+                "Run `vortix` directly in a terminal, or use the headless commands: vortix status, vortix list"
+            );
+            std::process::exit(cli::output::ExitCode::GeneralError.code());
+        }
     }
 
     // Settings use the same authoritative directory as profiles and
@@ -230,9 +255,71 @@ fn main() -> Result<()> {
                 }
             }
             Err(e) => {
-                return Err(color_eyre::eyre::eyre!(
-                    "profile identity migration refused startup: {e}. Restore the managed profile directory to its saved inventory before managing tunnels; add new profiles from outside that directory with `vortix import <path>`"
-                ));
+                // Returning an eyre error here printed a source location and
+                // backtrace hints at the user, and gave one blanket
+                // "restore the inventory" instruction for every cause. A
+                // permission failure is a different problem with a different
+                // fix, and `--json` callers got an empty stdout instead of an
+                // envelope.
+                let mode = if args.json {
+                    cli::output::OutputMode::Json
+                } else if args.quiet {
+                    cli::output::OutputMode::Quiet
+                } else {
+                    cli::output::OutputMode::Human
+                };
+                let (err, exit) = if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    (
+                        cli::output::CliError {
+                            code: "profiles_not_readable",
+                            message: format!(
+                                "Vortix cannot read its own profile directory: {}",
+                                profiles_dir.display()
+                            ),
+                            hint: Some(format!(
+                                "Some files there are owned by another user. Run: sudo chown -R $(id -u):$(id -g) {}",
+                                profiles_dir.display()
+                            )),
+                        },
+                        cli::output::ExitCode::PermissionDenied,
+                    )
+                } else if let Some(sidecar) =
+                    vortix::vortix_config::migration::unexplained_sidecar_cause(&e)
+                {
+                    // The blanket "restore the inventory" text told the user
+                    // neither which file was the problem nor how to clear it,
+                    // and this refusal stops every command — including
+                    // read-only ones — so it has to be answerable.
+                    let stray = profiles_dir.join(&sidecar.file_name);
+                    (
+                        cli::output::CliError {
+                            code: "profile_directory_has_unknown_file",
+                            message: format!(
+                                "Vortix found a profile metadata file it has no record of: {}",
+                                stray.display()
+                            ),
+                            hint: Some(format!(
+                                "Vortix tracks the profiles it manages in an inventory and will not touch the directory while a file there is missing from it, so no command can run until this is resolved. It is usually left over from an interrupted import or an older version. If you did not put it there, move it out and Vortix will start: mv {} {}",
+                                stray.display(),
+                                std::env::temp_dir().display()
+                            )),
+                        },
+                        cli::output::ExitCode::GeneralError,
+                    )
+                } else {
+                    (
+                        cli::output::CliError {
+                            code: "profile_migration_refused",
+                            message: format!("Vortix could not prepare the profile directory: {e}"),
+                            hint: Some(format!(
+                                "Vortix will not touch a profile directory whose contents disagree with its saved inventory. Check {} for files Vortix did not write, then add new profiles from outside it with `vortix import <path>`.",
+                                profiles_dir.display()
+                            )),
+                        },
+                        cli::output::ExitCode::GeneralError,
+                    )
+                };
+                cli::output::print_error_and_exit(mode, "startup", err, exit);
             }
         }
     }

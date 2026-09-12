@@ -106,6 +106,32 @@ impl App {
     }
     /// Whether the registry currently has at least one Connected tunnel.
     #[must_use]
+    /// How long one telemetry observation may go unrefreshed before its
+    /// value stops standing for the present.
+    ///
+    /// Each field is refreshed by its own probe on its own schedule, so this
+    /// is asked per observation, never once for the whole panel. A few poll
+    /// intervals absorbs a slow poll and a retry; the floor keeps a very
+    /// short configured interval from making normal jitter look like a stall.
+    pub(crate) fn telemetry_stale_after(&self) -> std::time::Duration {
+        let polls = u64::from(constants::TELEMETRY_STALE_AFTER_POLLS);
+        std::time::Duration::from_secs(
+            self.runtime
+                .config
+                .telemetry_poll_rate
+                .saturating_mul(polls)
+                .max(constants::TELEMETRY_STALE_FLOOR_SECS),
+        )
+    }
+
+    /// Whether an observation taken at `observed_at` is too old to present as
+    /// current. An observation that has never landed is not stale — it is
+    /// still pending, which callers render differently.
+    #[must_use]
+    pub(crate) fn observation_is_stale(&self, observed_at: Option<Instant>) -> bool {
+        observed_at.is_some_and(|at| at.elapsed() > self.telemetry_stale_after())
+    }
+
     pub(crate) fn has_active_connection(&self) -> bool {
         use crate::vortix_core::engine::state::Connection;
         self.registry

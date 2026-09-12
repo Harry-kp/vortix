@@ -584,13 +584,23 @@ fn render_disconnected(frame: &mut Frame, app: &App, inner: Rect) {
 
             text.push(Line::from(""));
 
+            // Each row shows its value only while its own reading is current.
+            let egress_stale = app.observation_is_stale(app.runtime.last_egress_check);
+            let dns_stale = app.observation_is_stale(app.runtime.last_dns_check);
+
             if !app.runtime.public_ip.is_empty() {
+                let (value, colour) = if egress_stale {
+                    (constants::MSG_UNAVAILABLE, palette.text_secondary)
+                } else {
+                    (app.runtime.public_ip.as_str(), palette.warning)
+                };
                 text.push(Line::from(vec![
                     Span::styled("Your IP : ", Style::default().fg(palette.text_secondary)),
-                    Span::styled(&app.runtime.public_ip, Style::default().fg(palette.warning)),
+                    Span::styled(value.to_string(), Style::default().fg(colour)),
                 ]));
             }
-            if !app.runtime.isp.is_empty()
+            if !egress_stale
+                && !app.runtime.isp.is_empty()
                 && app.runtime.isp != "Unknown"
                 && app.runtime.isp != constants::MSG_DETECTING
             {
@@ -602,12 +612,14 @@ fn render_disconnected(frame: &mut Frame, app: &App, inner: Rect) {
             if !app.runtime.dns_server.is_empty()
                 && app.runtime.dns_server != constants::MSG_DETECTING
             {
+                let (value, colour) = if dns_stale {
+                    (constants::MSG_UNAVAILABLE, palette.text_secondary)
+                } else {
+                    (app.runtime.dns_server.as_str(), palette.text_primary)
+                };
                 text.push(Line::from(vec![
                     Span::styled("DNS     : ", Style::default().fg(palette.text_secondary)),
-                    Span::styled(
-                        &app.runtime.dns_server,
-                        Style::default().fg(palette.text_primary),
-                    ),
+                    Span::styled(value.to_string(), Style::default().fg(colour)),
                 ]));
             }
         }
@@ -1309,6 +1321,54 @@ mod tests {
         // Silence dead-code on the helper builder until issue #191 wires
         // a real AwaitingUserInput state into the FSM.
         let _ = awaiting_engine("ghost");
+    }
+
+    /// The panel's address / network / resolver rows read straight off the
+    /// telemetry observations. Once a reading has aged out, its last value
+    /// must not stay on screen for the reader to take as live.
+    #[test]
+    fn a_stale_reading_reports_unknown_instead_of_its_last_value() {
+        use std::time::Instant;
+
+        let mut app = App::new_test();
+        let dir = TempDir::new().expect("tmpdir");
+        let cfg_path = dir.path().join("home.conf");
+        std::fs::write(&cfg_path, "[Interface]\n").unwrap();
+        app.runtime.profiles = vec![make_profile("home", cfg_path)];
+        app.profile_list_state.select(Some(0));
+        app.runtime.public_ip = "171.61.21.20".to_string();
+        app.runtime.isp = "Bharti Airtel Ltd.".to_string();
+        app.runtime.dns_server = "192.168.1.100".to_string();
+
+        let fresh = Instant::now();
+        app.runtime.last_egress_check = Some(fresh);
+        app.runtime.last_dns_check = Some(fresh);
+        let out = render_to_string(&mut app, 80, 16);
+        assert!(out.contains("171.61.21.20"), "fresh readings show:\n{out}");
+        assert!(out.contains("192.168.1.100"), "fresh readings show:\n{out}");
+
+        let stale = Instant::now()
+            .checked_sub(app.telemetry_stale_after() + Duration::from_secs(1))
+            .expect("representable instant");
+        app.runtime.last_egress_check = Some(stale);
+        app.runtime.last_dns_check = Some(stale);
+        let out = render_to_string(&mut app, 80, 16);
+        assert!(
+            !out.contains("171.61.21.20"),
+            "a stale address must not stay on screen:\n{out}"
+        );
+        assert!(
+            !out.contains("192.168.1.100"),
+            "a stale resolver must not stay on screen:\n{out}"
+        );
+        assert!(
+            !out.contains("Bharti Airtel"),
+            "a stale network name must not stay on screen:\n{out}"
+        );
+        assert!(
+            out.contains(constants::MSG_UNAVAILABLE),
+            "the rows must say the reading is not known:\n{out}"
+        );
     }
 
     #[test]

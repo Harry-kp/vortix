@@ -858,9 +858,25 @@ impl App {
             return;
         }
         let next = self
-            .pending_control_killswitch_mode
+            .queued_killswitch_target
+            .or(self.pending_control_killswitch_mode)
             .unwrap_or(self.control_snapshot.desired.kill_switch)
             .next();
+
+        // One change at a time. Each press used to submit its own operation
+        // while the control worker applies them serially, so a few quick taps
+        // left the later ones to expire on their own deadline. That surfaced
+        // as "kill switch change timed out" and, because a timed-out change
+        // never publishes an effective state, as "Degraded" in Security Guard
+        // — while the firewall itself was applied and correct the whole time.
+        //
+        // Cycling stays responsive: the target moves immediately and is
+        // submitted once the running change settles.
+        if self.killswitch_change_in_flight() {
+            self.queued_killswitch_target = Some(next);
+            return;
+        }
+
         if self
             .issue_control_command(crate::vortix_core::control::UserCommand::SetKillSwitch {
                 mode: next,
@@ -868,6 +884,28 @@ impl App {
             .is_some()
         {
             self.pending_control_killswitch_mode = Some(next);
+        }
+    }
+
+    /// Submit the coalesced kill-switch target once the running change ends.
+    pub(crate) fn submit_queued_killswitch_target(&mut self) {
+        let Some(target) = self.queued_killswitch_target else {
+            return;
+        };
+        if self.killswitch_change_in_flight() {
+            return;
+        }
+        self.queued_killswitch_target = None;
+        if target == self.control_snapshot.desired.kill_switch {
+            return;
+        }
+        if self
+            .issue_control_command(crate::vortix_core::control::UserCommand::SetKillSwitch {
+                mode: target,
+            })
+            .is_some()
+        {
+            self.pending_control_killswitch_mode = Some(target);
         }
     }
     fn handle_quit(&mut self) {
@@ -913,7 +951,9 @@ impl App {
                     self.log(&format!("SEC: DNS server: {dns}"));
                 }
                 self.runtime.dns_server = dns;
-                self.runtime.last_security_check = Some(Instant::now());
+                let checked_at = Instant::now();
+                self.runtime.last_dns_check = Some(checked_at);
+                self.runtime.last_security_check = Some(checked_at);
             }
             TelemetryUpdate::PublicIpv6(observed) => {
                 let is_connected = self.has_active_connection();
@@ -945,6 +985,7 @@ impl App {
                             self.runtime.real_ipv6 = Some(ip.clone());
                             crate::core::real_ip_cache::save_ipv6(&self.runtime.config_dir, ip);
                         }
+                        self.runtime.real_ipv6_from_cache = false;
                     }
                 }
                 if is_connected {
@@ -1005,10 +1046,12 @@ impl App {
         if !is_unknown_identity_value(&self.runtime.location) {
             self.log("NET: Location: Unknown");
         }
-        self.runtime.public_ip = "Unavailable".to_string();
+        self.runtime.public_ip = constants::MSG_UNAVAILABLE.to_string();
         self.runtime.isp = "Unknown".to_string();
         self.runtime.location = "Unknown".to_string();
-        self.runtime.last_security_check = Some(Instant::now());
+        let checked_at = Instant::now();
+        self.runtime.last_egress_check = Some(checked_at);
+        self.runtime.last_security_check = Some(checked_at);
     }
 
     fn apply_public_ipv4(&mut self, ip: String) {
@@ -1036,6 +1079,7 @@ impl App {
                 self.log(&format!("NET: Real IPv4 detected: {ip}"));
             }
             self.runtime.real_ip = Some(ip.clone());
+            self.runtime.real_ip_from_cache = false;
             if first_detection || changed {
                 crate::core::real_ip_cache::save(&self.runtime.config_dir, &ip);
             }
@@ -1054,7 +1098,9 @@ impl App {
             ));
         }
         self.runtime.public_ip = ip;
-        self.runtime.last_security_check = Some(Instant::now());
+        let checked_at = Instant::now();
+        self.runtime.last_egress_check = Some(checked_at);
+        self.runtime.last_security_check = Some(checked_at);
     }
 
     fn log_network_quality_transition(&mut self) {

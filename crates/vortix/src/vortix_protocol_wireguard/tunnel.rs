@@ -335,6 +335,71 @@ fn write_managed_temp_config(
     user_conf_path: &Path,
     stripped_body: &[u8],
 ) -> Result<PathBuf, TunnelError> {
+    // Debian and Ubuntu ship an AppArmor profile for wg-quick that permits no
+    // config path outside /etc/wireguard. Staging under the session tmp dir
+    // made the kernel deny the read — `apparmor="DENIED" operation="open"
+    // profile="wg-quick"` — and every WireGuard connect timed out with nothing
+    // in Vortix's own logs to explain it. The canonical directory is the only
+    // location a confined wg-quick can read, so on Linux that is where the
+    // lifecycle copy goes.
+    if let Some(directory) = crate::platform::wireguard_staging_dir() {
+        return write_managed_config_in_wireguard_dir(directory, user_conf_path, stripped_body);
+    }
+    write_managed_temp_config_unconfined(user_conf_path, stripped_body)
+}
+
+/// Stage the lifecycle copy inside the directory a confined `wg-quick` may
+/// read.
+///
+/// The platform hands back a Vortix-owned subdirectory, so nothing here
+/// belongs to the user and the write needs no ownership arbitration.
+fn write_managed_config_in_wireguard_dir(
+    directory: &Path,
+    user_conf_path: &Path,
+    stripped_body: &[u8],
+) -> Result<PathBuf, TunnelError> {
+    use crate::vortix_core::secret_file::{write_secret_file, SecretFileError};
+
+    interface_name_from_path(user_conf_path)?;
+    let basename = user_conf_path
+        .file_name()
+        .ok_or_else(|| TunnelError::Subprocess("WireGuard config has no basename".into()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(directory)
+            .map_err(|error| {
+                TunnelError::Subprocess(format!(
+                    "create {}: {error}. WireGuard needs this directory because wg-quick is confined to it.",
+                    directory.display()
+                ))
+            })?;
+    }
+
+    let staged = directory.join(basename);
+    // Best-effort unlink of a stale leaf from a same-session reconnect, as in
+    // the unconfined path.
+    let _ = std::fs::remove_file(&staged);
+
+    write_secret_file(&staged, stripped_body).map_err(|e| match e {
+        SecretFileError::Io(io) => {
+            TunnelError::Subprocess(format!("write managed WG config: {io}"))
+        }
+        other => TunnelError::Subprocess(format!("write managed WG config: {other}")),
+    })?;
+
+    Ok(staged)
+}
+
+/// Original staging behaviour, retained where `wg-quick` is unconfined.
+fn write_managed_temp_config_unconfined(
+    user_conf_path: &Path,
+    stripped_body: &[u8],
+) -> Result<PathBuf, TunnelError> {
     let session_id = resolve_session_id();
     let session_root = crate::utils::get_tmp_config_dir(&session_id).map_err(|e| {
         TunnelError::Subprocess(format!("failed to create per-session tmp dir: {e}"))
@@ -390,7 +455,9 @@ fn cleanup_managed_temp_config(temp_path: &Path) {
     if let Some(parent) = temp_path.parent() {
         // `remove_dir` only succeeds when the dir is empty — exactly the
         // condition we want. Other secondaries in the same session keep
-        // their own leaf and the dir survives.
+        // their own leaf and the dir survives. The name check gates only the
+        // session-root removal below, so an empty session dir is still
+        // collected here.
         let removed_lifecycle = std::fs::remove_dir(parent).is_ok()
             && parent
                 .file_name()

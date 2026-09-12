@@ -540,7 +540,28 @@ impl<R: DnsCommandRunner> LinuxDnsPolicyEngine<R> {
             .get(interface)
             .cloned()
             .ok_or_else(|| format!("resolved DNS on {interface} is not owned by this process"))?;
-        let current = read_resolved_state(&mut self.runner, interface)?;
+
+        // Read first, and only ask whether the link still exists if that
+        // read fails. A disconnect tears the link down before DNS is
+        // released, so `resolvectl` often reports `Failed to resolve
+        // interface "tun0": No such device` — which was surfaced as
+        // "Disconnect could not finish safely", the opposite of the truth.
+        // systemd-resolved drops per-link configuration with the link, so
+        // there is nothing left to restore and nothing that could leak.
+        //
+        // Checking existence up front instead skipped the restore whenever
+        // the name was not a live link on this host, which silently disabled
+        // the whole release path under test.
+        let current = match read_resolved_state(&mut self.runner, interface) {
+            Ok(current) => current,
+            Err(error) => {
+                if interface_exists(interface) {
+                    return Err(error);
+                }
+                self.ownership.resolved.remove(interface);
+                return Ok(());
+            }
+        };
         if current != owned.applied {
             return Err(format!(
                 "refusing to restore DNS on {interface}: current resolved state no longer matches Vortix ownership"
@@ -596,7 +617,14 @@ impl<R: DnsCommandRunner> LinuxDnsPolicyEngine<R> {
             if let Err(error) = write_resolved_state(&mut self.runner, interface, target)
                 .and_then(|()| verify_resolved_state(&mut self.runner, interface, target))
             {
-                errors.push(format!("rollback DNS on {interface}: {error}"));
+                // A link that is gone has nothing to restore and cannot leak;
+                // resolved dropped its configuration with it. Anything else is
+                // a real rollback failure. Checking existence before
+                // attempting the write would skip the rollback entirely
+                // whenever the name is not a live link on this host.
+                if interface_exists(interface) {
+                    errors.push(format!("rollback DNS on {interface}: {error}"));
+                }
             }
         }
         for (interface, previous) in &before.resolved {
@@ -610,7 +638,9 @@ impl<R: DnsCommandRunner> LinuxDnsPolicyEngine<R> {
                     verify_resolved_state(&mut self.runner, interface, &previous.applied)
                 })
             {
-                errors.push(format!("rollback released DNS on {interface}: {error}"));
+                if interface_exists(interface) {
+                    errors.push(format!("rollback released DNS on {interface}: {error}"));
+                }
             }
         }
 
@@ -1043,6 +1073,117 @@ fn build_resolvconf_apply_spec(interface: &str, body: Vec<u8>) -> CommandSpec {
     .privilege(PrivilegeReq::Root)
 }
 
+/// One resolver address as a system tool prints it: `192.168.1.100`,
+/// `fe80::1`, or `fe80::1%wlp3s0`.
+///
+/// Returns the token unchanged when it parses as an address, so a scoped
+/// IPv6 keeps its zone — the zone is the part that makes a link-local
+/// resolver identifiable at all.
+fn parse_resolver_address(token: &str) -> Option<String> {
+    let token = token.trim();
+    if token.is_empty() {
+        return None;
+    }
+    let (address, zone) = token.split_once('%').unwrap_or((token, ""));
+    let parsed: std::net::IpAddr = address.parse().ok()?;
+    if parsed.is_unspecified() {
+        return None;
+    }
+    if token.contains('%') && zone.is_empty() {
+        return None;
+    }
+    Some(token.to_string())
+}
+
+/// A link-local resolver is real but says nothing a reader can act on, so a
+/// routable address configured on the same link wins. Falling back to the
+/// link-local keeps the honest answer when it is the only one there.
+fn is_link_local_resolver(address: &str) -> bool {
+    let base = address.split('%').next().unwrap_or(address);
+    match base.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => v4.is_link_local(),
+        // `fe80::/10`. `Ipv6Addr::is_unicast_link_local` is still unstable.
+        Ok(std::net::IpAddr::V6(v6)) => (v6.segments()[0] & 0xffc0) == 0xfe80,
+        Err(_) => false,
+    }
+}
+
+/// Pick the resolver worth reporting from candidates in configured order.
+fn preferred_resolver<I, S>(candidates: I) -> Option<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut link_local = None;
+    for candidate in candidates {
+        let Some(address) = parse_resolver_address(candidate.as_ref()) else {
+            continue;
+        };
+        if is_link_local_resolver(&address) {
+            link_local = link_local.or(Some(address));
+        } else {
+            return Some(address);
+        }
+    }
+    link_local
+}
+
+/// Read the active resolver out of `resolvectl status` output.
+///
+/// Splits each row on its **first** colon only. Splitting on every colon
+/// truncated every IPv6 answer at its first one, so a link's real
+/// `Current DNS Server: fe80::1` was reported as the string `fe80`.
+pub(crate) fn parse_resolvectl_status_server(text: &str) -> Option<String> {
+    let mut current = Vec::new();
+    let mut configured = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let Some((label, values)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let bucket = match label.trim() {
+            "Current DNS Server" => &mut current,
+            "DNS Servers" => &mut configured,
+            _ => continue,
+        };
+        bucket.extend(values.split_whitespace().map(ToOwned::to_owned));
+    }
+    // The server in use comes first; the link's configured list backs it up.
+    preferred_resolver(current.into_iter().chain(configured))
+}
+
+/// Read the active resolver out of `nmcli dev show` output.
+///
+/// Same first-colon rule, and IPv6 rows count: a link whose only resolver
+/// is an `IP6.DNS` entry still has a resolver.
+pub(crate) fn parse_nmcli_dns_server(text: &str) -> Option<String> {
+    let mut candidates = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("IP4.DNS") && !trimmed.starts_with("IP6.DNS") {
+            continue;
+        }
+        if let Some((_, value)) = trimmed.split_once(':') {
+            candidates.extend(value.split_whitespace().map(ToOwned::to_owned));
+        }
+    }
+    preferred_resolver(candidates)
+}
+
+/// Read the first usable `nameserver` out of `resolv.conf` content.
+pub(crate) fn parse_resolv_conf_server(content: &str) -> Option<String> {
+    let candidates = content.lines().filter_map(|line| {
+        let trimmed = line.trim();
+        let rest = trimmed.strip_prefix("nameserver")?;
+        // `nameserver` must be its own field, not a prefix of a longer key.
+        if !rest.starts_with(char::is_whitespace) {
+            return None;
+        }
+        rest.split_whitespace().next().map(ToOwned::to_owned)
+    });
+    preferred_resolver(candidates)
+}
+
 /// Try to get DNS from resolvectl (systemd-resolved, most modern distros).
 fn try_get_dns_resolvectl() -> Option<String> {
     let output = crate::vortix_process::run_to_output(CommandSpec::oneshot(
@@ -1055,22 +1196,7 @@ fn try_get_dns_resolvectl() -> Option<String> {
         return None;
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        let trimmed = line.trim();
-        // Look for "DNS Servers:" or "Current DNS Server:" line
-        if trimmed.starts_with("DNS Servers:") || trimmed.starts_with("Current DNS Server:") {
-            if let Some(dns) = trimmed.split(':').nth(1) {
-                let dns = dns.trim().to_string();
-                // May have multiple servers, take the first one
-                let first = dns.split_whitespace().next().unwrap_or("").to_string();
-                if !first.is_empty() {
-                    return Some(first);
-                }
-            }
-        }
-    }
-    None
+    parse_resolvectl_status_server(&String::from_utf8_lossy(&output.stdout))
 }
 
 /// Try to get DNS from `nmcli` (`NetworkManager` distros).
@@ -1085,35 +1211,29 @@ fn try_get_dns_nmcli() -> Option<String> {
         return None;
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("IP4.DNS") {
-            // Format: "IP4.DNS[1]:                             1.1.1.1"
-            if let Some(dns) = trimmed.split(':').nth(1) {
-                let dns = dns.trim().to_string();
-                if !dns.is_empty() {
-                    return Some(dns);
-                }
-            }
-        }
-    }
-    None
+    parse_nmcli_dns_server(&String::from_utf8_lossy(&output.stdout))
 }
 
 /// Try to get DNS from /etc/resolv.conf (universal fallback).
 fn try_get_dns_resolv_conf() -> Option<String> {
     let content = std::fs::read_to_string(RESOLV_CONF_PATH).ok()?;
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("nameserver") {
-            let dns = trimmed.trim_start_matches("nameserver").trim().to_string();
-            if !dns.is_empty() {
-                return Some(dns);
-            }
-        }
-    }
-    None
+    parse_resolv_conf_server(&content)
+}
+
+/// Whether a network interface still exists on this host.
+///
+/// `if_nametoindex` is POSIX, so this holds on every distribution and inside
+/// containers or namespaces where `/sys` may be absent or restricted. Matching
+/// `resolvectl`'s error text would have been neither stable nor portable.
+fn interface_exists(interface: &str) -> bool {
+    let Ok(name) = std::ffi::CString::new(interface) else {
+        return false;
+    };
+    // SAFETY: `name` is a valid NUL-terminated C string that outlives the
+    // call. `if_nametoindex` only reads it and returns 0 for an unknown link.
+    #[allow(unsafe_code)]
+    let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
+    index != 0
 }
 
 #[cfg(test)]
@@ -1672,20 +1792,112 @@ mod tests {
     // ── existing read-only resolver tests ────────────────────────────────
 
     #[test]
-    fn test_parse_resolv_conf() {
-        // Simulate the parsing logic
+    fn resolv_conf_reports_the_first_nameserver() {
         let content = "# Generated by NetworkManager\nnameserver 1.1.1.1\nnameserver 8.8.8.8\n";
-        let mut result = None;
-        for line in content.lines() {
-            let trimmed = line.trim();
-            if trimmed.starts_with("nameserver") {
-                let dns = trimmed.trim_start_matches("nameserver").trim().to_string();
-                if !dns.is_empty() {
-                    result = Some(dns);
-                    break;
-                }
-            }
-        }
-        assert_eq!(result, Some("1.1.1.1".to_string()));
+        assert_eq!(
+            parse_resolv_conf_server(content),
+            Some("1.1.1.1".to_string())
+        );
+    }
+
+    #[test]
+    fn resolv_conf_ignores_unparseable_and_unspecified_entries() {
+        let content =
+            "nameserver\nnameserver 0.0.0.0\nnameserver not-an-address\nnameserver 9.9.9.9\n";
+        assert_eq!(
+            parse_resolv_conf_server(content),
+            Some("9.9.9.9".to_string())
+        );
+        assert_eq!(parse_resolv_conf_server("search example.com\n"), None);
+    }
+
+    /// Verbatim `resolvectl status` output from a systemd-resolved host whose
+    /// router advertises a link-local resolver. Splitting on every colon
+    /// reported the string `fe80` — a truncated address, shown to the reader
+    /// as the DNS server.
+    #[test]
+    fn resolvectl_status_never_truncates_an_ipv6_resolver() {
+        let output = "\
+Global
+         Protocols: -LLMNR -mDNS -DNSOverTLS DNSSEC=no/unsupported
+  resolv.conf mode: stub
+
+Link 3 (wlp3s0)
+    Current Scopes: DNS
+         Protocols: +DefaultRoute -LLMNR -mDNS -DNSOverTLS DNSSEC=no/unsupported
+Current DNS Server: fe80::1
+       DNS Servers: 192.168.1.100 fe80::1
+     Default Route: yes
+";
+        let parsed = parse_resolvectl_status_server(output);
+        assert_eq!(
+            parsed,
+            Some("192.168.1.100".to_string()),
+            "a routable resolver configured on the link must win over a link-local one"
+        );
+        assert_ne!(parsed.as_deref(), Some("fe80"), "never report a fragment");
+    }
+
+    #[test]
+    fn resolvectl_status_keeps_a_link_local_resolver_whole_when_it_is_the_only_one() {
+        let output = "\
+Link 3 (wlp3s0)
+Current DNS Server: fe80::1%wlp3s0
+       DNS Servers: fe80::1%wlp3s0
+";
+        assert_eq!(
+            parse_resolvectl_status_server(output),
+            Some("fe80::1%wlp3s0".to_string()),
+            "the only configured resolver must be reported in full, zone included"
+        );
+    }
+
+    #[test]
+    fn resolvectl_status_reports_nothing_when_no_link_has_a_resolver() {
+        let output = "\
+Global
+         Protocols: -LLMNR -mDNS -DNSOverTLS DNSSEC=no/unsupported
+
+Link 2 (enp2s0)
+    Current Scopes: none
+     Default Route: no
+";
+        assert_eq!(parse_resolvectl_status_server(output), None);
+    }
+
+    #[test]
+    fn nmcli_reads_ipv6_rows_and_keeps_them_whole() {
+        let output = "\
+GENERAL.DEVICE:                         wlp3s0
+IP4.ADDRESS[1]:                         192.168.1.97/24
+IP6.DNS[1]:                             2606:4700:4700::1111
+";
+        assert_eq!(
+            parse_nmcli_dns_server(output),
+            Some("2606:4700:4700::1111".to_string())
+        );
+    }
+
+    #[test]
+    fn nmcli_prefers_a_routable_resolver_over_a_link_local_one() {
+        let output = "\
+IP6.DNS[1]:                             fe80::1
+IP4.DNS[1]:                             192.168.1.100
+";
+        assert_eq!(
+            parse_nmcli_dns_server(output),
+            Some("192.168.1.100".to_string())
+        );
+    }
+
+    #[test]
+    fn a_scoped_address_missing_its_zone_is_not_a_resolver() {
+        assert_eq!(parse_resolver_address("fe80::1%"), None);
+        assert_eq!(parse_resolver_address("fe80"), None);
+        assert_eq!(parse_resolver_address("::"), None);
+        assert_eq!(
+            parse_resolver_address(" 2606:4700:4700::1111 "),
+            Some("2606:4700:4700::1111".to_string())
+        );
     }
 }

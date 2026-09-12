@@ -544,7 +544,7 @@ fn handle_audit(pid_filter: Option<u32>, vpn_only: bool, mode: OutputMode) -> i3
                     code: "platform_unsupported",
                     message: "Socket audit is not available on this platform yet".to_string(),
                     hint: Some(
-                        "Linux + macOS are supported in v0.3.0; Windows support is on the roadmap"
+                        "Linux and macOS are supported; Windows support is on the roadmap"
                             .to_string(),
                     ),
                 },
@@ -582,10 +582,24 @@ fn handle_audit(pid_filter: Option<u32>, vpn_only: bool, mode: OutputMode) -> i3
         OutputMode::Human => {
             println!("PID    COMMAND          PROTO   LOCAL                            REMOTE                           IFACE");
             for s in &snapshots {
+                // An unresolved owner came out as a bare `0`, which reads as
+                // the kernel rather than "not known" — and stays 0 for many
+                // sockets even under sudo. `-` matches the IFACE column's
+                // existing convention for the same situation.
+                let pid = if s.pid == 0 {
+                    "-".to_string()
+                } else {
+                    s.pid.to_string()
+                };
+                let command = if s.command.is_empty() {
+                    "-"
+                } else {
+                    s.command.as_str()
+                };
                 println!(
                     "{:<6} {:<16} {:<7} {:<32} {:<32} {}",
-                    s.pid,
-                    s.command,
+                    pid,
+                    command,
                     s.protocol,
                     s.local,
                     s.remote.map_or_else(|| "*".to_string(), |r| r.to_string()),
@@ -3279,6 +3293,13 @@ fn handle_killswitch(
     0
 }
 
+/// Take post-operation kill-switch truth from the control snapshot the
+/// service just published, falling back to the durable record.
+///
+/// The snapshot's effective state is derived from firewall read-back under the
+/// service's own freshness fence, so it is the better answer whenever it
+/// exists. The durable record is the fallback, and it only reads back as
+/// `Blocking` while it still carries proof this process can use.
 fn refresh_killswitch_after_operation(
     engine: &mut VpnRuntime,
     outcome: &crate::cli::control::ClientOperationOutcome,
@@ -3286,10 +3307,17 @@ fn refresh_killswitch_after_operation(
     match crate::core::killswitch::load_state_checked() {
         Ok(Some(persisted)) => {
             engine.killswitch_mode = persisted.mode;
-            engine.killswitch_state = persisted.effective_state.unwrap_or(persisted.state);
+            engine.killswitch_state = outcome
+                .snapshot
+                .effective
+                .kill_switch
+                .unwrap_or_else(|| persisted.recovered_state());
         }
         Ok(None) => {
             engine.killswitch_mode = outcome.snapshot.desired.kill_switch;
+            if let Some(state) = outcome.snapshot.effective.kill_switch {
+                engine.killswitch_state = state;
+            }
         }
         Err(error) => {
             engine.killswitch_mode = outcome.snapshot.desired.kill_switch;

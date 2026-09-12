@@ -1257,15 +1257,21 @@ pub trait PolicyExecutor: Send + Sync + 'static {
         self.audit(policy)
     }
 
-    /// Return fresh platform read-back produced by the exact final policy.
-    /// Implementations that cannot prove every gate return `None`; worker
-    /// completion alone is never protection truth.
+    /// Return fresh platform read-back produced by the exact policy that was
+    /// just applied. Implementations that cannot prove the gates that stage
+    /// is able to prove return `None`; worker completion alone is never
+    /// protection truth.
+    ///
+    /// A [`PolicyStage::Final`] policy must prove all four gates. A
+    /// [`PolicyStage::PreTunnelBlocking`] policy can only prove the firewall:
+    /// while the emergency barrier is the only thing installed there is no
+    /// tunnel, route or resolver left to read back.
     fn verification(&self, _policy: &TopologyPolicy) -> Option<PolicyExecutionEvidence> {
         None
     }
 }
 
-/// Platform read-back attached only to an exact successful final policy.
+/// Platform read-back attached only to an exact successful policy stage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)] // Explicit gates are an auditable proof bit-set.
 pub struct PolicyExecutionEvidence {
@@ -1274,6 +1280,34 @@ pub struct PolicyExecutionEvidence {
     pub route_verified: bool,
     pub dns_verified: bool,
     pub firewall_verified: bool,
+}
+
+/// Fold one gate read-back into a proof bit, logging the platform reason when
+/// it cannot be proven.
+///
+/// Auditing the gates independently is deliberate. Collapsing them into one
+/// pass/fail let an unverifiable resolver or route report the *firewall* as
+/// broken, and lost the reason on the way out of the worker.
+#[must_use]
+pub fn gate_verified(
+    policy: &TopologyPolicy,
+    gate: &'static str,
+    readback: Result<(), String>,
+) -> bool {
+    match readback {
+        Ok(()) => true,
+        Err(reason) => {
+            tracing::warn!(
+                target: "vortix::control::policy",
+                operation = %policy.operation_id,
+                generation = policy.generation,
+                gate,
+                reason = %reason,
+                "protection gate read-back could not be verified"
+            );
+            false
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1318,6 +1352,7 @@ pub struct PolicyResult {
 pub struct PolicyAuditResult {
     pub revision: ControlRevision,
     pub operation_id: OperationId,
+    pub stage: PolicyStage,
     pub result: Result<PolicyExecutionEvidence, WorkFailure>,
 }
 
@@ -1584,6 +1619,7 @@ fn run_policy_audit(
 ) -> PolicyAuditResult {
     let revision = policy.revision();
     let operation_id = policy.operation_id.clone();
+    let stage = policy.stage;
     let result = if stopping.load(Ordering::Acquire) || cancellation.is_cancelled() {
         Err(WorkFailure::Cancelled)
     } else if Instant::now() >= policy.deadline {
@@ -1595,10 +1631,13 @@ fn run_policy_audit(
         .map_err(|_| WorkFailure::Panicked)
         .and_then(|result| result.map_err(|_| WorkFailure::EffectFailed))
         .and_then(|evidence| {
+            // A read-back that overran the audit budget is still true about
+            // the moment it observed, and freshness is enforced downstream on
+            // `observed_at_millis`. Discarding it here meant a platform whose
+            // resolver reads cost more than the budget could never re-prove
+            // protection at all: the snapshot stayed degraded for good.
             if cancellation.is_cancelled() {
                 Err(WorkFailure::Cancelled)
-            } else if Instant::now() >= policy.deadline {
-                Err(WorkFailure::TimedOut)
             } else {
                 Ok(evidence)
             }
@@ -1607,6 +1646,7 @@ fn run_policy_audit(
     PolicyAuditResult {
         revision,
         operation_id,
+        stage,
         result,
     }
 }
@@ -1732,7 +1772,11 @@ fn run_policy(
             }
         }
     }
-    let verification = (outcome == PolicyOutcome::Applied && policy.stage == PolicyStage::Final)
+    // Every applied stage offers its read-back, not only the final one. The
+    // emergency pre-tunnel barrier is a real firewall the user is relying on;
+    // withholding its proof left the kill-switch row reporting `Degraded`
+    // during the exact window the block was in force.
+    let verification = (outcome == PolicyOutcome::Applied)
         .then(|| executor.verification(&policy))
         .flatten();
     PolicyResult {
