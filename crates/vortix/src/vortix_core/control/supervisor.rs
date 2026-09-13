@@ -643,6 +643,14 @@ impl Supervisor {
                             | WorkFailure::HandshakeFailed
                             | WorkFailure::InvalidProfile
                             | WorkFailure::RouteConflict
+                            // Refusing the credential prompt ends the connect
+                            // as definitively as a rejected password. Omitting
+                            // it left the profile supervised for good, and a
+                            // profile that is desired-absent yet still
+                            // supervised is the one state the tunnel barrier
+                            // will not pass — so no policy could publish for
+                            // any profile afterwards.
+                            | WorkFailure::ChallengeFailed
                     )
                 )
         });

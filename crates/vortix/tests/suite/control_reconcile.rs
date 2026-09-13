@@ -4143,6 +4143,74 @@ async fn unanswered_interactive_challenge_fails_closed_without_recovery_connect(
     .await;
 }
 
+/// Refusing the credential prompt is as definitive as a rejected password,
+/// so it must release supervisor ownership the same way. It did not: the
+/// profile stayed `Degraded(ChallengeFailed)` for good, and a profile that is
+/// desired-absent yet still supervised is the one state the tunnel barrier
+/// refuses to pass — so no policy could publish for any profile afterwards.
+/// The sibling test above covers the intent rollback; only ownership was
+/// unchecked, which is exactly where the defect lived.
+#[tokio::test]
+async fn a_refused_challenge_releases_supervisor_ownership() {
+    struct ChallengeFailure;
+    impl TunnelExecutor for ChallengeFailure {
+        fn execute(
+            &self,
+            _: &TunnelWork,
+            _: &CancellationToken,
+        ) -> Result<TunnelExecutionReceipt, String> {
+            Err("interactive challenge was cancelled or expired".into())
+        }
+
+        fn classify_failure(&self, _: &str) -> WorkFailure {
+            WorkFailure::ChallengeFailed
+        }
+    }
+
+    let target = profile("refused-challenge-ownership");
+    let supervisor = Arc::new(Supervisor::new(
+        AuthorityEpoch(1),
+        Arc::new(ChallengeFailure),
+        Arc::new(OkPolicy),
+        2,
+        4,
+    ));
+    let service = ControlService::start_supervised(
+        ControlServiceConfig {
+            authority_epoch: AuthorityEpoch(1),
+            known_profiles: BTreeSet::from([target.clone()]),
+            profile_topologies: BTreeMap::from([(target.clone(), ProfileTopology::default())]),
+            freshness_poll_interval: Duration::from_millis(5),
+            ..ControlServiceConfig::default()
+        },
+        Arc::new(TestClock::default()),
+        ExecutionSelection::CanonicalAuthority,
+        supervisor.clone(),
+    );
+    let client = service.client();
+    let admitted = client
+        .submit(CommandRequest {
+            command: UserCommand::Connect {
+                profile_id: target.clone(),
+                conflict_acknowledgement: None,
+            },
+            idempotency_key: IdempotencyKey::new("refused-challenge-ownership"),
+            deadline: Deadline(1_000),
+        })
+        .await
+        .expect("connect admitted");
+
+    wait_for_condition(
+        || {
+            let snapshot = client.snapshot();
+            snapshot.operations[&admitted.operation_id].status == OperationStatus::Failed
+                && supervisor.profile_truth(&target).is_none()
+        },
+        "a refused challenge left the profile supervised, which blocks the policy barrier",
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn definitive_interactive_connect_failure_releases_ownership_and_rolls_back() {
     struct DefinitiveFailure;

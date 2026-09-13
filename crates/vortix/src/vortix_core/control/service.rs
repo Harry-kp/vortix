@@ -2719,6 +2719,20 @@ fn drive_supervision(
                     );
                 }
             } else if result.result == Err(WorkFailure::ChallengeFailed) {
+                // Refusing the prompt ends the connect as definitively as a
+                // rejected password, so the profile's supervisor ownership has
+                // to go with it. Without this the profile stayed supervised
+                // while desired-absent — the one state the tunnel barrier will
+                // not pass — so no policy could publish for any profile
+                // afterwards. This branch terminalises unconditionally below,
+                // so a retire that finds nothing exact changes nothing here.
+                if result.mutation == TunnelMutation::Connect {
+                    let _ = supervisor.retire_definitive_connect_failure(
+                        &result.profile_id,
+                        &result.revision,
+                        &result.operation_id,
+                    );
+                }
                 let rollback_profiles = snapshot
                     .operations
                     .get(&result.operation_id)
