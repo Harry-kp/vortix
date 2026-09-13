@@ -2615,6 +2615,27 @@ fn drive_supervision(
                             events,
                         );
                     }
+                } else {
+                    // Retiring is exact: it needs the revision, operation, mutation
+                    // and `Degraded(RouteConflict)` all to match. When it does not,
+                    // the refusal still happened — so the operation has to reach a
+                    // terminal status here. Leaving it non-terminal kept
+                    // `desired.tunnels` on `Connected`, so the reconciler re-planned
+                    // forever and the connect only surfaced at its deadline, as a
+                    // timeout that named nothing. The definitive-failure branch below
+                    // already does this; the route-conflict one was missing it.
+                    fail_tunnel_dispatch_operation(
+                        &result.operation_id,
+                        result.revision.generation,
+                        WorkFailure::RouteConflict,
+                        snapshot,
+                        owner,
+                        admission,
+                        now,
+                        selection,
+                        config,
+                        events,
+                    );
                 }
             } else if unexpected_retry {
                 if wireguard_handshake_failure {
