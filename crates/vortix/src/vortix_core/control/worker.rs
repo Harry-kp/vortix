@@ -491,27 +491,36 @@ fn find_route_conflict(
         if Some(*lease_id) == excluded || lease.profile_id == *profile_id {
             continue;
         }
-        let overlapping = routes
-            .iter()
-            .filter(|route| {
-                lease
-                    .routes
-                    .iter()
-                    .any(|existing| existing.overlaps(**route))
-            })
-            .copied()
-            .collect::<Vec<_>>();
-        if overlapping.is_empty() {
-            continue;
-        }
-        let conflict = if overlapping.iter().any(|route| route.is_default())
-            && lease.routes.iter().any(|route| route.is_default())
-        {
+        // Two defaults are a takeover: only one tunnel can carry everything.
+        // Anything else is about specific destinations, and a default route
+        // must not be compared there — it overlaps every route by definition,
+        // so a full tunnel joining a split tunnel looked like a collision on
+        // `0.0.0.0/0` when nothing was contended. `ControlSnapshot::
+        // topology_conflict` answers the same question for the confirmation
+        // overlay and has to agree with this, or admission refuses a connect
+        // the overlay will not offer to confirm.
+        let requested_default = routes.iter().any(|route| route.is_default());
+        let existing_default = lease.routes.iter().any(|route| route.is_default());
+        let conflict = if requested_default && existing_default {
             Conflict::DefaultRouteTakeover {
                 current: lease.profile_id.clone(),
                 new: profile_id.clone(),
             }
         } else {
+            let overlapping = routes
+                .iter()
+                .filter(|route| !route.is_default())
+                .filter(|route| {
+                    lease
+                        .routes
+                        .iter()
+                        .any(|existing| !existing.is_default() && existing.overlaps(**route))
+                })
+                .copied()
+                .collect::<Vec<_>>();
+            if overlapping.is_empty() {
+                continue;
+            }
             Conflict::RouteOverlap {
                 with: lease.profile_id.clone(),
                 overlapping_cidrs: overlapping
@@ -1873,4 +1882,62 @@ pub fn wait_until<T>(timeout: Duration, mut poll: impl FnMut() -> Option<T>) -> 
         thread::yield_now();
     }
     None
+}
+
+#[cfg(test)]
+mod reservation_conflict_tests {
+    use super::*;
+
+    /// wg07 is a split tunnel (`10.200.0.0/24`, `10.250.0.0/24`); wg08 is a
+    /// full tunnel (`0.0.0.0/0`). A default route overlaps every route by
+    /// definition, so admission refused the second connect as a collision on
+    /// `0.0.0.0/0` — with nothing actually contended. The refusal had no
+    /// confirmation behind it either, so the user got "Another tunnel claimed
+    /// these routes first" and no way forward.
+    #[test]
+    fn a_full_tunnel_may_join_a_split_tunnel() {
+        let book = ReservationBook::default();
+        let split = ProfileId::new("wg07");
+        let full = ProfileId::new("wg08");
+
+        let _held = book
+            .reserve(
+                &split,
+                ["10.200.0.0/24".to_string(), "10.250.0.0/24".to_string()],
+            )
+            .expect("split tunnel reserves its own prefixes");
+
+        book.reserve(&full, ["0.0.0.0/0".to_string()])
+            .expect("a full tunnel claims nothing the split tunnel holds");
+    }
+
+    /// Scoped to default routes only: real collisions must still be refused.
+    #[test]
+    fn contended_claims_are_still_refused() {
+        let book = ReservationBook::default();
+        let held = ProfileId::new("holder");
+        let candidate = ProfileId::new("candidate");
+
+        let _held = book
+            .reserve(&held, ["10.250.0.0/24".to_string()])
+            .expect("first claim succeeds");
+        assert_eq!(
+            book.reserve(&candidate, ["10.250.0.0/24".to_string()])
+                .err(),
+            Some(WorkFailure::RouteConflict),
+            "two profiles claiming the same specific prefix still collide"
+        );
+
+        let defaults = ReservationBook::default();
+        let first = ProfileId::new("full-one");
+        let second = ProfileId::new("full-two");
+        let _first = defaults
+            .reserve(&first, ["0.0.0.0/0".to_string()])
+            .expect("first full tunnel reserves the default route");
+        assert_eq!(
+            defaults.reserve(&second, ["0.0.0.0/0".to_string()]).err(),
+            Some(WorkFailure::RouteConflict),
+            "two full tunnels still contend for the default route"
+        );
+    }
 }
