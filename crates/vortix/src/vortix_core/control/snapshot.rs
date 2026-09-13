@@ -135,9 +135,22 @@ impl ControlSnapshot {
                     new: profile_id.clone(),
                 });
             }
+            // A default route intersects every other route by definition, so
+            // comparing it here reported a full tunnel joining a split tunnel
+            // as a "Route Overlap" — a conflict the user cannot act on,
+            // because nothing is actually contended. Whether two profiles both
+            // want the default is the question asked immediately above; this
+            // one is only about specific destinations colliding. A split
+            // tunnel alongside a full one is legitimate: the more specific
+            // prefix wins, which is the point of running both.
             let overlapping_cidrs = requested
                 .iter()
-                .filter(|route| existing.iter().any(|current| route.intersects(current)))
+                .filter(|route| route.prefix_len != 0)
+                .filter(|route| {
+                    existing
+                        .iter()
+                        .any(|current| current.prefix_len != 0 && route.intersects(current))
+                })
                 .copied()
                 .collect::<Vec<_>>();
             if !overlapping_cidrs.is_empty() {
@@ -221,6 +234,83 @@ mod conflict_scan_tests {
                 new: candidate,
             }),
             "the conflict with a fully described peer must still be reported"
+        );
+    }
+
+    /// The reported case: `wg07` is a split tunnel
+    /// (`10.200.0.0/24, 10.250.0.0/24`) and `wg08` is a full tunnel
+    /// (`0.0.0.0/0`). Connecting the second alongside the first raised "Route
+    /// Overlap", because a default route intersects every other route by
+    /// definition. Nothing is contended — the more specific prefix wins — so
+    /// there is no conflict to confirm in either direction.
+    #[test]
+    fn a_full_tunnel_and_a_split_tunnel_do_not_overlap() {
+        let split = ProfileId::new("wg07-split");
+        let full = ProfileId::new("wg08-full");
+
+        let mut snapshot = ControlSnapshot::default();
+        snapshot.profile_routes.insert(
+            split.clone(),
+            vec![cidr("10.200.0.0/24"), cidr("10.250.0.0/24")],
+        );
+        snapshot
+            .profile_routes
+            .insert(full.clone(), vec![cidr("0.0.0.0/0")]);
+
+        snapshot.tunnels.insert(split.clone(), connected(&split));
+        assert_eq!(
+            snapshot.topology_conflict(&full),
+            None,
+            "a full tunnel joining a split tunnel claims nothing the split tunnel holds"
+        );
+
+        snapshot.tunnels.clear();
+        snapshot.tunnels.insert(full.clone(), connected(&full));
+        assert_eq!(
+            snapshot.topology_conflict(&split),
+            None,
+            "a split tunnel joining a full tunnel takes only its own prefixes"
+        );
+    }
+
+    /// The exclusion is scoped to default routes only. Two split tunnels that
+    /// genuinely claim the same destination must still be caught, and two full
+    /// tunnels must still ask for a takeover.
+    #[test]
+    fn specific_prefixes_and_two_defaults_still_conflict() {
+        let held = ProfileId::new("aaa-held");
+        let candidate = ProfileId::new("bbb-candidate");
+
+        let mut snapshot = ControlSnapshot::default();
+        snapshot.tunnels.insert(held.clone(), connected(&held));
+        snapshot
+            .profile_routes
+            .insert(held.clone(), vec![cidr("10.250.0.0/24")]);
+        snapshot
+            .profile_routes
+            .insert(candidate.clone(), vec![cidr("10.250.0.0/24")]);
+        assert_eq!(
+            snapshot.topology_conflict(&candidate),
+            Some(Conflict::RouteOverlap {
+                with: held.clone(),
+                overlapping_cidrs: vec![cidr("10.250.0.0/24")],
+            }),
+            "two profiles claiming the same specific prefix still collide"
+        );
+
+        snapshot
+            .profile_routes
+            .insert(held.clone(), vec![cidr("0.0.0.0/0")]);
+        snapshot
+            .profile_routes
+            .insert(candidate.clone(), vec![cidr("0.0.0.0/0")]);
+        assert_eq!(
+            snapshot.topology_conflict(&candidate),
+            Some(Conflict::DefaultRouteTakeover {
+                current: held,
+                new: candidate,
+            }),
+            "two full tunnels still need the takeover confirmation"
         );
     }
 }
