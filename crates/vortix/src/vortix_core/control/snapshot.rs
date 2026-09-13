@@ -120,7 +120,13 @@ impl ControlSnapshot {
             {
                 continue;
             }
-            let existing = self.profile_routes.get(existing_id)?;
+            // `?` here returned `None` from the whole function — "no conflict
+            // with anyone" — the moment a single peer had no route entry,
+            // hiding every other peer's conflict behind it. One peer we cannot
+            // describe is a peer to skip, not an answer about the rest.
+            let Some(existing) = self.profile_routes.get(existing_id) else {
+                continue;
+            };
             let requested_default = requested.iter().any(|route| route.prefix_len == 0);
             let existing_default = existing.iter().any(|route| route.prefix_len == 0);
             if requested_default && existing_default {
@@ -153,5 +159,68 @@ impl ControlSnapshot {
         self.tunnels
             .get(peer)
             .is_some_and(|tunnel| !matches!(tunnel.state, Connection::Disconnected { .. }))
+    }
+}
+
+#[cfg(test)]
+mod conflict_scan_tests {
+    use super::*;
+    use crate::vortix_core::engine::registry::Role;
+    use crate::vortix_core::engine::state::{ConnectionHealth, DetailedConnectionInfo};
+
+    fn connected(profile_id: &ProfileId) -> TunnelSnapshot {
+        TunnelSnapshot {
+            profile_id: profile_id.clone(),
+            state: Connection::Connected {
+                profile_id: profile_id.clone(),
+                since: SystemTime::UNIX_EPOCH,
+                health: ConnectionHealth::default(),
+                details: Box::new(DetailedConnectionInfo::default()),
+            },
+            role: Role::Addressable {
+                allowed_ips: Vec::new(),
+            },
+            health: ConnectionHealth::default(),
+            interface_name: None,
+            started_at: None,
+        }
+    }
+
+    fn cidr(value: &str) -> Cidr {
+        value.parse().expect("valid cidr")
+    }
+
+    /// A peer Vortix cannot describe is a peer to skip, not an answer about
+    /// every other peer. The scan used `?` on the peer lookup, so one tunnel
+    /// with no recorded routes returned "no conflict anywhere" — and a real
+    /// default-route takeover sitting behind it in the map was never seen.
+    #[test]
+    fn a_peer_without_routes_does_not_hide_a_conflict_behind_it() {
+        let undescribed = ProfileId::new("aaa-no-routes");
+        let holder = ProfileId::new("zzz-holds-default");
+        let candidate = ProfileId::new("candidate");
+
+        let mut snapshot = ControlSnapshot::default();
+        snapshot
+            .tunnels
+            .insert(undescribed.clone(), connected(&undescribed));
+        snapshot.tunnels.insert(holder.clone(), connected(&holder));
+        // `undescribed` deliberately has no profile_routes entry, and sorts
+        // before `holder` in the BTreeMap, so it is scanned first.
+        snapshot
+            .profile_routes
+            .insert(holder.clone(), vec![cidr("0.0.0.0/0")]);
+        snapshot
+            .profile_routes
+            .insert(candidate.clone(), vec![cidr("0.0.0.0/0")]);
+
+        assert_eq!(
+            snapshot.topology_conflict(&candidate),
+            Some(Conflict::DefaultRouteTakeover {
+                current: holder,
+                new: candidate,
+            }),
+            "the conflict with a fully described peer must still be reported"
+        );
     }
 }
