@@ -247,14 +247,12 @@ pub trait ProfileMutationExecutor: fmt::Debug + Send + Sync + 'static {
     ) -> Result<ProfileMutationApplied, ProfileMutationFailure>;
 }
 
-/// U6 execution is explicit so shipping the supervised seam cannot create a
-/// second writer while U7/U8 still select the legacy authority.
+/// Which writer owns effects. Explicit so that adding the supervised path
+/// could not silently create a second writer alongside the legacy one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionSelection {
-    /// U5-compatible owner/model only. Legacy code remains the sole writer.
+    /// Legacy owner/model only. Legacy code remains the sole writer.
     LegacyAuthority,
-    /// Run the pure planner for observability, but dispatch no effects.
-    CanonicalShadow,
     /// Supervised canonical effects. Selected only by explicit construction.
     CanonicalAuthority,
 }
@@ -3262,10 +3260,6 @@ fn drive_supervision(
         in_flight,
         disconnect_tombstones,
     });
-    if selection == ExecutionSelection::CanonicalShadow {
-        return;
-    }
-
     let operation = operation_for_generation(snapshot, revision.generation).cloned();
     if let Some(operation) = operation {
         let transaction_is_current =
