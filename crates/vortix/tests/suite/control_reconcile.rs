@@ -1356,8 +1356,19 @@ fn losing_the_protection_proof_does_not_stop_re_verification() {
     );
     assert_eq!(supervisor.protected_generation(), None);
 
+    // `submit_policy_audit_if_due` folds `Err(Busy)` into `Ok(false)`, so a
+    // worker still holding the previous audit is indistinguishable from "not
+    // due" at this call site. Asserting the bare boolean made this test fail
+    // under parallel load — on a loaded CI runner and in a full local suite —
+    // while passing in isolation. Retry until the worker frees: what is under
+    // test is that the audit becomes due again after the proof is lost, not
+    // that the queue happens to be empty on the first poll.
     assert!(
-        supervisor.submit_policy_audit_if_due(5_200).unwrap(),
+        wait_until(Duration::from_secs(2), || supervisor
+            .submit_policy_audit_if_due(5_200)
+            .unwrap()
+            .then_some(()))
+        .is_some(),
         "losing the proof must not stop the very audit that could restore it"
     );
     let recovery = wait_until(Duration::from_secs(1), || supervisor.poll_policy_audit()).unwrap();
