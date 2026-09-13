@@ -940,6 +940,22 @@ impl App {
             _ => {}
         }
         self.report_terminal_control_operations(&snapshot);
+        // Both real-IP cache gates read these, and nothing wrote them: the
+        // writers went with `Message::SyncSystemState`, so
+        // `scanner_first_tick_done` was permanently false and the address was
+        // never cached at all. A published snapshot with a default-route
+        // observation is proof the scan ran, and `observed.tunnels` is the
+        // kernel's own count — which is what "no tunnel owns the egress path"
+        // was always meant to mean.
+        if snapshot.observed.default_route.is_some() {
+            self.runtime.scanner_first_tick_done = true;
+        }
+        self.runtime.last_kernel_session_count = snapshot
+            .observed
+            .tunnels
+            .values()
+            .filter(|tunnel| tunnel.active)
+            .count();
         self.control_snapshot = snapshot;
         if egress_path_changed {
             self.refresh_telemetry();

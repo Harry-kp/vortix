@@ -4614,3 +4614,47 @@ fn rapid_killswitch_presses_submit_one_change_at_a_time() {
         "an in-flight change must not turn a working kill switch into Degraded"
     );
 }
+
+/// Both real-IP cache gates read these fields, and for a long time nothing in
+/// production wrote either one: `scanner_first_tick_done` stayed false, so the
+/// address was never cached, and `last_kernel_session_count == 0` was
+/// vacuously true. The suite did not notice because the tests set the flags by
+/// hand. This asserts the control snapshot actually establishes them.
+#[test]
+fn a_control_snapshot_establishes_the_real_ip_cache_gates() {
+    use crate::vortix_core::control::model::ObservedTunnel;
+    use crate::vortix_core::control::{ControlSnapshot, ObservedDefaultRoute};
+    use crate::vortix_core::profile::ProfileId;
+
+    let mut app = test_app();
+    assert!(!app.runtime.scanner_first_tick_done, "starts unproven");
+
+    let mut snapshot = ControlSnapshot::default();
+    snapshot.observed.default_route = Some(ObservedDefaultRoute {
+        interface_name: Some("wlp3s0".into()),
+        observed_at_millis: 1,
+        received_at_millis: 1,
+    });
+    let tunnelled = ProfileId::new("carrying-traffic");
+    snapshot.observed.tunnels.insert(
+        tunnelled,
+        ObservedTunnel {
+            active: true,
+            interface_name: Some("tun0".into()),
+            observed_at_millis: 1,
+            received_at_millis: 1,
+        },
+    );
+
+    app.apply_control_snapshot(snapshot);
+
+    assert!(
+        app.runtime.scanner_first_tick_done,
+        "a default-route observation proves the scan ran"
+    );
+    assert_eq!(
+        app.runtime.last_kernel_session_count, 1,
+        "an active tunnel must be counted, or the cache gate lets the VPN \
+         address be saved as the real one"
+    );
+}
