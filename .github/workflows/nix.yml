@@ -56,7 +56,7 @@ jobs:
           extra-conf: |
             experimental-features = nix-command flakes
 
-      - uses: DeterminateSystems/magic-nix-cache-action@v14
+      - uses: DeterminateSystems/magic-nix-cache-action@v15
 
       - name: Show flake metadata
         run: nix flake metadata
