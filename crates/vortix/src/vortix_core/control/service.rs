@@ -6518,19 +6518,20 @@ fn report_loss_recovery_blocked(blocking: &OperationRecord, now: u64) {
 /// Block-on-drop engages only through that recovery, so when it declines an
 /// unexpected loss leaves traffic flowing on the real address.
 fn report_unrecovered_loss(snapshot: &ControlSnapshot, supervisor: &Supervisor) {
-    for (profile_id, observed) in &snapshot.observed.tunnels {
-        if observed.active {
+    for (profile_id, state) in &snapshot.desired.tunnels {
+        if *state != RequestedTunnelState::Connected {
             continue;
         }
+        let observed = snapshot.observed.tunnels.get(profile_id);
         let truth = supervisor.profile_truth(profile_id);
         tracing::warn!(
             target: "vortix::control::convergence",
             profile = %profile_id,
-            desired_connected =
-                snapshot.desired.tunnels.get(profile_id) == Some(&RequestedTunnelState::Connected),
+            observed_present = observed.is_some(),
+            observed_active = observed.map(|fact| fact.active),
             truth = ?truth.as_ref().map(|entry| entry.truth),
             adopted = truth.as_ref().map(|entry| entry.adoption.is_some()),
-            "a tunnel went absent but no loss recovery was admitted"
+            "a profile wanted connected started no loss recovery"
         );
     }
 }
