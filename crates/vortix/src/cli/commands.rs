@@ -3150,12 +3150,27 @@ fn handle_rename(
                 ExitCode::StateConflict,
             );
         }
-        result => print_error_and_exit(
+        Some(Err(failure)) => {
+            let (code, message) = rename_failure_text(failure, trimmed);
+            print_error_and_exit(
+                mode,
+                "rename",
+                CliError {
+                    code,
+                    message,
+                    hint: None,
+                },
+                ExitCode::GeneralError,
+            );
+        }
+        _ => print_error_and_exit(
             mode,
             "rename",
             CliError {
                 code: "io_error",
-                message: format!("Rename failed: {result:?}"),
+                message: format!(
+                    "Could not rename '{old}' to '{trimmed}'. The profile was left unchanged."
+                ),
                 hint: None,
             },
             ExitCode::GeneralError,
@@ -3184,6 +3199,48 @@ struct KsData {
 }
 
 /// Print the active mode, what it is doing right now, and the other choices.
+/// Turn a rename refusal into something the reader can act on. The raw
+/// variant used to reach the terminal as `Some(Err(InvalidName))`.
+fn rename_failure_text(
+    failure: crate::vortix_core::control::ProfileMutationFailure,
+    requested: &str,
+) -> (&'static str, String) {
+    use crate::vortix_core::control::ProfileMutationFailure as Failure;
+    match failure {
+        Failure::InvalidName => (
+            "invalid_name",
+            format!(
+                "'{requested}' is not a usable profile name. WireGuard names must be 1–15 characters using only letters, numbers, _, =, +, ., or -."
+            ),
+        ),
+        Failure::NotFound => (
+            "not_found",
+            "That profile no longer exists. Run `vortix list` to see what is there.".to_owned(),
+        ),
+        Failure::AlreadyExists => (
+            "already_exists",
+            format!("A profile named '{requested}' already exists"),
+        ),
+        Failure::Busy => (
+            "busy",
+            "Another change to this profile is still running. Try again in a moment.".to_owned(),
+        ),
+        Failure::DeadlineExpired => (
+            "timeout",
+            "The rename did not finish in time. The profile was left unchanged.".to_owned(),
+        ),
+        Failure::Storage => (
+            "storage",
+            "The profile directory could not be written. Check its permissions and free space."
+                .to_owned(),
+        ),
+        Failure::Internal => (
+            "internal",
+            "Vortix stopped the rename rather than leave the profile half-renamed.".to_owned(),
+        ),
+    }
+}
+
 fn print_killswitch_status(
     mode: crate::state::KillSwitchMode,
     state: crate::state::KillSwitchState,
