@@ -472,15 +472,31 @@ pub fn sweep_orphan_temp_configs(config_dir: &std::path::Path, current_session_i
                 if result != 0 {
                     continue;
                 }
-                let _ = std::fs::remove_dir_all(entry.path());
+                remove_swept_session(&entry.path());
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 if !legacy_temp_session_process_is_live(&name) {
-                    let _ = std::fs::remove_dir_all(entry.path());
+                    remove_swept_session(&entry.path());
                 }
             }
             Err(_) => {}
         }
+    }
+}
+
+/// Remove one scratch session, saying so when it cannot be removed.
+///
+/// These directories hold rendered tunnel configuration. Discarding the error
+/// let them accumulate with no trace of why.
+#[cfg(unix)]
+fn remove_swept_session(path: &std::path::Path) {
+    if let Err(error) = std::fs::remove_dir_all(path) {
+        tracing::warn!(
+            target: "vortix::process",
+            path = %path.display(),
+            %error,
+            "could not remove an orphaned tunnel scratch directory"
+        );
     }
 }
 
