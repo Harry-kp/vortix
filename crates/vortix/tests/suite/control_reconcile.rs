@@ -4161,6 +4161,120 @@ async fn unanswered_interactive_challenge_fails_closed_without_recovery_connect(
 /// refuses to pass — so no policy could publish for any profile afterwards.
 /// The sibling test above covers the intent rollback; only ownership was
 /// unchecked, which is exactly where the defect lived.
+/// Reproduction, not yet a fix. Disconnecting a profile while its own connect
+/// is still in flight leaves BOTH operations stuck at `WaitingForObservation`,
+/// which the user sees as "disconnection timed out" ~32s later.
+///
+/// Measured state at the point of failure:
+///   disconnect = WaitingForObservation, connect = WaitingForObservation,
+///   supervised truth = DisconnectedTombstone, desired = Disconnected
+///
+/// Mechanism, as far as it is established: submitting the disconnect finds the
+/// connect's entry in flight with a different revision, so `submit_tunnel`
+/// cancels it and returns `Busy` without submitting. `poll_tunnel` then sees
+/// the cancelled connect's result is no longer exact — the entry has been
+/// replaced — and rewrites it to `Err(Stale)`. The result chain in
+/// `drive_supervision` has no `Stale` arm, so it matches nothing and the
+/// operation never terminalises.
+///
+/// A fix aimed at `WorkFailure::Cancelled` does NOT work: that variant never
+/// arrives on this path. Left `#[ignore]`d rather than shipping a third guess
+/// into the control plane.
+#[ignore = "reproduction for the superseded-connect disconnect timeout; no fix yet"]
+/// Disconnecting a profile while its own connect is still in flight cancels
+/// that connect. Nothing handled a cancelled tunnel result, so it fell past
+/// every arm of the result chain: the operation never terminalised and the
+/// supervisor kept owning the profile — supervised while desired-absent,
+/// which the tunnel barrier refuses to pass. The disconnect that superseded
+/// it then could not converge and timed out at its deadline.
+///
+/// The executor must genuinely block until its token fires; an instant
+/// executor finishes the connect before the disconnect lands and never
+/// exercises the cancel path at all.
+#[tokio::test]
+async fn a_disconnect_superseding_its_own_connect_settles() {
+    struct BlockUntilCancelled;
+    impl TunnelExecutor for BlockUntilCancelled {
+        fn execute(
+            &self,
+            work: &TunnelWork,
+            cancellation: &CancellationToken,
+        ) -> Result<TunnelExecutionReceipt, String> {
+            if work.mutation == TunnelMutation::Connect {
+                while !cancellation.is_cancelled() {
+                    std::thread::yield_now();
+                }
+                return Err("connect was cancelled".into());
+            }
+            Ok(TunnelExecutionReceipt::default())
+        }
+
+        fn classify_failure(&self, _: &str) -> WorkFailure {
+            WorkFailure::Cancelled
+        }
+    }
+
+    let target = profile("superseded-connect");
+    let supervisor = Arc::new(Supervisor::new(
+        AuthorityEpoch(1),
+        Arc::new(BlockUntilCancelled),
+        Arc::new(OkPolicy),
+        2,
+        8,
+    ));
+    let service = ControlService::start_supervised(
+        ControlServiceConfig {
+            authority_epoch: AuthorityEpoch(1),
+            known_profiles: BTreeSet::from([target.clone()]),
+            profile_topologies: BTreeMap::from([(target.clone(), ProfileTopology::default())]),
+            freshness_poll_interval: Duration::from_millis(5),
+            ..ControlServiceConfig::default()
+        },
+        Arc::new(TestClock::default()),
+        ExecutionSelection::CanonicalAuthority,
+        supervisor.clone(),
+    );
+    let client = service.client();
+
+    client
+        .submit(CommandRequest {
+            command: UserCommand::Connect {
+                profile_id: target.clone(),
+                conflict_acknowledgement: None,
+            },
+            idempotency_key: IdempotencyKey::new("superseded-connect"),
+            deadline: Deadline(1_000),
+        })
+        .await
+        .expect("connect admitted");
+    wait_for_condition(
+        || !supervisor.profile_truth(&target).is_none(),
+        "connect never reached the worker",
+    )
+    .await;
+
+    let disconnect = client
+        .submit(CommandRequest {
+            command: UserCommand::Disconnect {
+                profile_id: Some(target.clone()),
+            },
+            idempotency_key: IdempotencyKey::new("superseding-disconnect"),
+            deadline: Deadline(1_000),
+        })
+        .await
+        .expect("disconnect admitted");
+
+    wait_for_condition(
+        || {
+            client.snapshot().operations[&disconnect.operation_id]
+                .status
+                .is_terminal()
+        },
+        "the superseding disconnect never settled",
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn a_refused_challenge_releases_supervisor_ownership() {
     struct ChallengeFailure;
