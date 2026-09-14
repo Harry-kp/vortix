@@ -2956,10 +2956,26 @@ impl LocalControlSession {
                 }),
         );
         if !observations.is_empty() {
-            observer
-                .observe_batch(observations)
-                .await
-                .map_err(|error| LocalControlError::Observation(error.to_string()))?;
+            let summary = changed
+                .iter()
+                .map(|(profile_id, state)| format!("{profile_id}={}", state.active))
+                .collect::<Vec<_>>();
+            if let Err(error) = observer.observe_batch(observations).await {
+                tracing::warn!(
+                    target: "vortix::control::convergence",
+                    tunnels = ?summary,
+                    %error,
+                    "the control service refused this scan's readings"
+                );
+                return Err(LocalControlError::Observation(error.to_string()));
+            }
+            if !summary.is_empty() {
+                tracing::debug!(
+                    target: "vortix::control::convergence",
+                    tunnels = ?summary,
+                    "published tunnel readings"
+                );
+            }
         }
         if default_route_changed {
             self.published_default_route.replace(default_route);
