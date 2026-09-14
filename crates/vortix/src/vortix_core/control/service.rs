@@ -6618,6 +6618,13 @@ fn admit_unexpected_loss_recovery(
         mark_reconciliation_incomplete(snapshot, admission);
         return;
     };
+    tracing::warn!(
+        target: "vortix::control::convergence",
+        profile = %profile_id,
+        operation = %recovery_id,
+        generation,
+        "starting loss recovery for a tunnel that went away"
+    );
     let retry_budget = u64::try_from(config.retry_budget.as_millis()).unwrap_or(u64::MAX);
     let retry_backoff = u64::try_from(config.retry_initial_backoff.as_millis()).unwrap_or(u64::MAX);
     snapshot.operations.insert(
