@@ -599,6 +599,27 @@ impl Supervisor {
                 && entry.mutation == result.mutation
         });
         if !exact {
+            // Left at its dispatch-time truth this fence is never failed
+            // enough to retry nor confirmed enough to clear, so it blocks
+            // every later operation. Unknown is honest, and the planner
+            // retries the teardown from there.
+            if let Some(entry) = state
+                .tombstones
+                .get_mut(&result.profile_id)
+                .filter(|entry| {
+                    entry.revision == result.revision && entry.operation_id == result.operation_id
+                })
+            {
+                entry.truth = SupervisedTruth::OutcomeUnknown;
+            }
+            tracing::debug!(
+                target: "vortix::control::convergence",
+                profile = %result.profile_id,
+                operation = %result.operation_id,
+                mutation = ?result.mutation,
+                succeeded = result.result.is_ok(),
+                "worker result no longer matches its supervised profile"
+            );
             result.result = Err(WorkFailure::Stale);
             return Some(result);
         }

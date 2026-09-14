@@ -257,6 +257,58 @@ fn live_disconnect_tombstone_waits_for_worker_completion_before_clearing() {
         .expect("completed teardown fence clears from exact absence");
 }
 
+/// A teardown receipt that arrives after the profile entry moved on cannot
+/// settle its own fence. Left at its dispatch-time truth the fence is invisible
+/// to both recovery arms, so it never clears and every later operation blocks
+/// behind it and times out.
+#[test]
+fn superseded_teardown_receipt_leaves_its_fence_retryable() {
+    let target = profile("superseded-teardown");
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let supervisor = Supervisor::new(
+        AuthorityEpoch(1),
+        Arc::new(BarrierExecutor {
+            entered: entered.clone(),
+            release: release.clone(),
+        }),
+        Arc::new(OkPolicy),
+        2,
+        4,
+    );
+    let first = supervisor
+        .reserve_disconnect(&target)
+        .expect("teardown capacity reserved");
+    let second = supervisor
+        .reserve_tunnel(&target, std::iter::empty::<String>())
+        .expect("reconnect capacity reserved");
+    supervisor
+        .dispatch_reserved_tunnel(
+            work(target.clone(), 4, 9, TunnelMutation::Disconnect),
+            first,
+        )
+        .expect("teardown dispatched");
+    entered.wait();
+    // Recovery re-admitted the same profile before the teardown receipt came
+    // back. Its connect takes over the profile entry, so nothing will ever
+    // produce a receipt that matches the teardown's own fence again.
+    supervisor
+        .dispatch_reserved_tunnel(work(target.clone(), 5, 10, TunnelMutation::Connect), second)
+        .expect("superseding connect dispatched");
+
+    release.wait();
+    assert!(wait_until(Duration::from_secs(1), || supervisor.poll_tunnel()).is_some());
+
+    assert_eq!(
+        supervisor
+            .tombstones()
+            .get(&target)
+            .map(|entry| entry.truth),
+        Some(SupervisedTruth::OutcomeUnknown),
+        "a superseded teardown must leave its fence retryable, not stuck"
+    );
+}
+
 struct BarrierExecutor {
     entered: Arc<Barrier>,
     release: Arc<Barrier>,
@@ -1885,6 +1937,46 @@ async fn set_killswitch_and_settle(
         "kill-switch policy did not settle",
     )
     .await;
+}
+
+fn topology_service_claiming(
+    profiles: BTreeSet<ProfileId>,
+    routes: &BTreeSet<String>,
+) -> (ControlService, Arc<Supervisor>, Arc<TopologyCapture>) {
+    let capture = Arc::new(TopologyCapture::default());
+    let supervisor = Arc::new(Supervisor::new(
+        AuthorityEpoch(1),
+        capture.clone(),
+        capture.clone(),
+        profiles.len().max(1),
+        8,
+    ));
+    let profile_topologies = profiles
+        .iter()
+        .cloned()
+        .map(|profile_id| {
+            (
+                profile_id,
+                ProfileTopology {
+                    routes: routes.clone(),
+                    ..ProfileTopology::default()
+                },
+            )
+        })
+        .collect();
+    let service = ControlService::start_supervised(
+        ControlServiceConfig {
+            authority_epoch: AuthorityEpoch(1),
+            known_profiles: profiles,
+            profile_topologies,
+            freshness_poll_interval: Duration::from_millis(5),
+            ..ControlServiceConfig::default()
+        },
+        Arc::new(TestClock::default()),
+        ExecutionSelection::CanonicalAuthority,
+        supervisor.clone(),
+    );
+    (service, supervisor, capture)
 }
 
 fn topology_service(
@@ -3569,6 +3661,191 @@ async fn disconnecting_one_of_two_profiles_reaches_terminal_truth_without_restar
         service.client().snapshot().tunnels[&second].state,
         Connection::Connected { .. }
     ));
+}
+
+/// Reproduces the field report: connect a second profile, disconnect it before
+/// its tunnel ever came up, and the disconnect sits until its deadline and
+/// reports "disconnection timed out" while nothing is left to tear down.
+#[tokio::test]
+async fn disconnecting_a_profile_whose_connect_never_came_up_completes() {
+    let settled = profile("stalled-peer-settled");
+    let pending = profile("stalled-peer-pending");
+    let (service, supervisor, capture) =
+        topology_service(BTreeSet::from([settled.clone(), pending.clone()]));
+    capture.publish_readback();
+    connect_and_settle(
+        &service,
+        &supervisor,
+        &capture,
+        &settled,
+        "stalled-peer-connect-settled",
+    )
+    .await;
+
+    service
+        .client()
+        .submit(CommandRequest {
+            command: UserCommand::Connect {
+                profile_id: pending.clone(),
+                conflict_acknowledgement: None,
+            },
+            idempotency_key: IdempotencyKey::new("stalled-peer-connect-pending"),
+            deadline: Deadline(1_000),
+        })
+        .await
+        .expect("connect admitted");
+    wait_for_condition(
+        || {
+            capture
+                .tunnel_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(profile_id, mutation, _)| {
+                    profile_id == &pending && *mutation == TunnelMutation::Connect
+                })
+        },
+        "connect effect was not dispatched",
+    )
+    .await;
+
+    // The tunnel never comes up, so no observation is ever published for it.
+    let disconnect = service
+        .client()
+        .submit(CommandRequest {
+            command: UserCommand::Disconnect {
+                profile_id: Some(pending.clone()),
+            },
+            idempotency_key: IdempotencyKey::new("stalled-peer-disconnect-pending"),
+            deadline: Deadline(1_000),
+        })
+        .await
+        .expect("disconnect admitted");
+    wait_for_condition(
+        || {
+            capture
+                .tunnel_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(profile_id, mutation, _)| {
+                    profile_id == &pending && *mutation == TunnelMutation::Disconnect
+                })
+        },
+        "disconnect effect was not dispatched",
+    )
+    .await;
+    observe_disconnected(&service, &pending).await;
+
+    wait_for_condition(
+        || {
+            service.client().snapshot().operations[&disconnect.operation_id].status
+                == OperationStatus::Succeeded
+        },
+        "disconnecting a tunnel that never came up never completed",
+    )
+    .await;
+}
+
+/// The field report: two split-tunnel profiles claim the same subnets, the
+/// overlap is acknowledged at connect, and disconnecting the second one then
+/// reports "disconnection timed out" with nothing left to tear down.
+#[tokio::test]
+async fn disconnecting_an_overlapping_profile_completes() {
+    let first = profile("overlap-teardown-first");
+    let second = profile("overlap-teardown-second");
+    let routes = BTreeSet::from(["10.200.0.0/24".to_owned(), "10.250.0.0/24".to_owned()]);
+    let (service, supervisor, capture) =
+        topology_service_claiming(BTreeSet::from([first.clone(), second.clone()]), &routes);
+    capture.publish_readback();
+    connect_and_settle(
+        &service,
+        &supervisor,
+        &capture,
+        &first,
+        "overlap-teardown-connect-first",
+    )
+    .await;
+
+    service
+        .client()
+        .submit(CommandRequest {
+            command: UserCommand::Connect {
+                profile_id: second.clone(),
+                conflict_acknowledgement: Some(
+                    vortix::vortix_core::engine::registry::Conflict::RouteOverlap {
+                        with: first.clone(),
+                        overlapping_cidrs: routes
+                            .iter()
+                            .map(|route| route.parse().expect("test route parses"))
+                            .collect(),
+                    },
+                ),
+            },
+            idempotency_key: IdempotencyKey::new("overlap-teardown-connect-second"),
+            deadline: Deadline(1_000),
+        })
+        .await
+        .expect("acknowledged overlap admitted");
+    wait_for_condition(
+        || {
+            capture
+                .tunnel_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(profile_id, mutation, _)| {
+                    profile_id == &second && *mutation == TunnelMutation::Connect
+                })
+        },
+        "second connect effect was not dispatched",
+    )
+    .await;
+    observe_connected(&service, &second, &format!("tun-{second}")).await;
+    wait_for_condition(
+        || {
+            supervisor
+                .profile_truth(&second)
+                .is_some_and(|entry| entry.truth == SupervisedTruth::ObservedPresent)
+        },
+        "second tunnel did not settle",
+    )
+    .await;
+
+    let disconnect = service
+        .client()
+        .submit(CommandRequest {
+            command: UserCommand::Disconnect {
+                profile_id: Some(second.clone()),
+            },
+            idempotency_key: IdempotencyKey::new("overlap-teardown-disconnect-second"),
+            deadline: Deadline(1_000),
+        })
+        .await
+        .expect("disconnect admitted");
+    wait_for_condition(
+        || {
+            capture
+                .tunnel_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(profile_id, mutation, _)| {
+                    profile_id == &second && *mutation == TunnelMutation::Disconnect
+                })
+        },
+        "disconnect effect was not dispatched",
+    )
+    .await;
+
+    wait_for_condition(
+        || {
+            service.client().snapshot().operations[&disconnect.operation_id].status
+                == OperationStatus::Succeeded
+        },
+        "disconnecting an overlapping tunnel never completed",
+    )
+    .await;
 }
 
 #[tokio::test]

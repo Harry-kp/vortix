@@ -2150,7 +2150,9 @@ async fn run_service(
                     .lock()
                     .expect("control config mutex poisoned")
                     .clone();
-                expire_operations(&mut snapshot, &mut owner, &admission, now, &config, selection, &mut pending);
+                for stalled in expire_operations(&mut snapshot, &mut owner, &admission, now, &config, selection, &mut pending) {
+                    report_convergence_stall(&stalled, &snapshot, supervisor.as_deref(), now);
+                }
                 expire_challenges(&mut snapshot, &mut owner, now, config.max_challenges, &mut pending);
                 handle_envelope(envelope, &mut snapshot, &mut owner, &admission, now, &config, &shared_config, profile_mutations.as_ref(), startup_persistence_fault, &mut readiness_reply, &mut durability_reply, &mut pending);
                 admit_unexpected_loss_recovery(
@@ -2219,7 +2221,9 @@ async fn run_service(
                     .lock()
                     .expect("control config mutex poisoned")
                     .clone();
-                expire_operations(&mut snapshot, &mut owner, &admission, now, &config, selection, &mut pending);
+                for stalled in expire_operations(&mut snapshot, &mut owner, &admission, now, &config, selection, &mut pending) {
+                    report_convergence_stall(&stalled, &snapshot, supervisor.as_deref(), now);
+                }
                 expire_challenges(&mut snapshot, &mut owner, now, config.max_challenges, &mut pending);
                 let runtime = ControlRuntime {
                     config: &config,
@@ -2481,12 +2485,20 @@ fn drive_supervision(
                 // revision, and do not route this trusted receipt through the
                 // scanner-drift reducer, which invalidates unrelated policy
                 // gates.
-                if supervisor
-                    .confirm_tunnel(&result.profile_id, &result.revision, false, None)
-                    .is_ok()
-                {
-                    snapshot.pending_route_conflicts.remove(&result.profile_id);
-                    record_owned_disconnect(&result.profile_id, snapshot, owner, now);
+                match supervisor.confirm_tunnel(&result.profile_id, &result.revision, false, None) {
+                    Ok(()) => {
+                        snapshot.pending_route_conflicts.remove(&result.profile_id);
+                        record_owned_disconnect(&result.profile_id, snapshot, owner, now);
+                    }
+                    // This receipt is consumed for good; dropping it silently
+                    // leaves the fence set and the operation to time out.
+                    Err(failure) => tracing::warn!(
+                        target: "vortix::control::convergence",
+                        profile = %result.profile_id,
+                        operation = %result.operation_id,
+                        ?failure,
+                        "teardown receipt rejected; disconnect fence stays set"
+                    ),
                 }
             } else {
                 snapshot.pending_route_conflicts.remove(&result.profile_id);
@@ -3320,7 +3332,14 @@ fn drive_supervision(
                 profile_id,
                 revision,
             } => {
-                let _ = supervisor.confirm_tombstone_absence(profile_id, revision);
+                if let Err(failure) = supervisor.confirm_tombstone_absence(profile_id, revision) {
+                    tracing::debug!(
+                        target: "vortix::control::convergence",
+                        profile = %profile_id,
+                        ?failure,
+                        "disconnect fence did not clear on confirmed absence"
+                    );
+                }
             }
             ReconcileAction::AdoptAttested {
                 evidence,
@@ -6071,6 +6090,45 @@ fn client_connected_profiles(operation: &OperationRecord) -> Vec<ProfileId> {
     })
 }
 
+/// What an operation was still waiting for when it ran out of time.
+struct StalledOperation {
+    id: OperationId,
+    /// Captured before expiry rolls the request back.
+    off_target: Vec<String>,
+}
+
+/// Record which convergence condition was unmet when an operation ran out of
+/// time. Without this a timeout names nothing and diagnosing one is guesswork.
+fn report_convergence_stall(
+    stalled: &StalledOperation,
+    snapshot: &ControlSnapshot,
+    supervisor: Option<&Supervisor>,
+    now: u64,
+) {
+    let latest = supervisor.and_then(Supervisor::latest_policy);
+    let revision = latest.as_ref().map(|(revision, _)| revision);
+    let evidence = snapshot.observed.evidence.as_ref();
+    tracing::warn!(
+        target: "vortix::control::convergence",
+        operation = %stalled.id,
+        evidence_present = evidence.is_some(),
+        lost_results = supervisor.map(Supervisor::lost_results),
+        policy_known = revision.is_some(),
+        evidence_generation = evidence.map(|e| e.desired_generation),
+        policy_generation = revision.map(|revision| revision.generation),
+        epoch_matches = evidence
+            .zip(revision)
+            .map(|(e, revision)| e.authority_epoch == revision.authority_epoch),
+        digest_matches = evidence
+            .zip(revision)
+            .map(|(e, revision)| e.policy_digest == revision.digest),
+        gates_verified = evidence.map(ProtectionEvidence::all_gates_verified),
+        evidence_age_millis = evidence.map(|e| now.saturating_sub(e.observed_at_millis)),
+        off_target = ?stalled.off_target,
+        "operation ran out of time without converging"
+    );
+}
+
 fn expire_operations(
     snapshot: &mut ControlSnapshot,
     owner: &mut OwnerState,
@@ -6079,7 +6137,7 @@ fn expire_operations(
     config: &ControlServiceConfig,
     selection: ExecutionSelection,
     events: &mut Vec<ControlEvent>,
-) {
+) -> Vec<StalledOperation> {
     let expired: Vec<_> = snapshot
         .operations
         .iter()
@@ -6087,7 +6145,12 @@ fn expire_operations(
             (!record.status.is_terminal() && record.deadline_millis <= now).then_some(id.clone())
         })
         .collect();
+    let mut stalled = Vec::new();
     for id in expired {
+        stalled.push(StalledOperation {
+            id: id.clone(),
+            off_target: off_target_profiles(snapshot),
+        });
         let expired_record = snapshot.operations.get(&id).cloned();
         let was_recovery = owner.recovery_operations.remove(&id);
         if let Some(record) = snapshot.operations.get_mut(&id) {
@@ -6147,6 +6210,24 @@ fn expire_operations(
             events,
         );
     }
+    stalled
+}
+
+/// Profiles whose observed state does not match what was requested of them.
+fn off_target_profiles(snapshot: &ControlSnapshot) -> Vec<String> {
+    snapshot
+        .desired
+        .tunnels
+        .iter()
+        .filter(|(profile, state)| {
+            snapshot
+                .observed
+                .tunnels
+                .get(*profile)
+                .is_none_or(|fact| fact.active != (**state == RequestedTunnelState::Connected))
+        })
+        .map(|(profile, state)| format!("{profile} wants {state:?}"))
+        .collect()
 }
 
 fn interactive_connected_profiles(
