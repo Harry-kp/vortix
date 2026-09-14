@@ -3673,6 +3673,15 @@ fn handle_completions(shell: clap_complete::Shell) {
 }
 
 /// Counts VPN profiles in a directory by extension.
+/// The protocol a profile's metadata sidecar declares, when it has one.
+fn sidecar_protocol(config: &Path) -> Option<String> {
+    let sidecar = config.with_extension("meta.toml");
+    let text = std::fs::read_to_string(sidecar).ok()?;
+    text.lines()
+        .find_map(|line| line.trim().strip_prefix("protocol = "))
+        .map(|value| value.trim().trim_matches('"').to_owned())
+}
+
 pub(crate) fn count_profiles(profiles_dir: &Path) -> (u32, u32) {
     if !profiles_dir.is_dir() {
         return (0, 0);
@@ -3692,12 +3701,22 @@ pub(crate) fn count_profiles(profiles_dir: &Path) -> (u32, u32) {
             {
                 continue;
             }
-            if path.is_file() {
-                match path.extension().and_then(|e| e.to_str()) {
-                    Some("conf") => wg += 1,
-                    Some("ovpn") => ovpn += 1,
-                    _ => {}
+            if !path.is_file() {
+                continue;
+            }
+            match path.extension().and_then(|e| e.to_str()) {
+                // An OpenVPN profile may be imported as `.conf`, so the
+                // extension alone put it in the WireGuard column. The sidecar
+                // records what it actually is.
+                Some("conf") => {
+                    if sidecar_protocol(&path).as_deref() == Some("OpenVpn") {
+                        ovpn += 1;
+                    } else {
+                        wg += 1;
+                    }
                 }
+                Some("ovpn") => ovpn += 1,
+                _ => {}
             }
         }
     }
