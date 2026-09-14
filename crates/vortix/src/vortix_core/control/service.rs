@@ -6483,6 +6483,20 @@ fn start_recovery_operation(
     register_recovery_lifecycle(owner, snapshot, config, &recovery_id, now, events);
 }
 
+/// Name the operation holding the loss-recovery gate shut.
+///
+/// One that neither completes nor expires keeps it shut for good, so an
+/// unexpected loss is never recovered and block-on-drop never engages.
+fn report_loss_recovery_blocked(blocking: &OperationRecord, now: u64) {
+    tracing::debug!(
+        target: "vortix::control::convergence",
+        operation = %blocking.id,
+        status = ?blocking.status,
+        overdue_millis = now.saturating_sub(blocking.deadline_millis),
+        "loss recovery is blocked by an operation still in flight"
+    );
+}
+
 /// Say why a tunnel that went absent did not start a loss recovery.
 ///
 /// Block-on-drop engages only through that recovery, so when it declines an
@@ -6516,12 +6530,14 @@ fn admit_unexpected_loss_recovery(
     supervisor: Option<&Supervisor>,
     events: &mut Vec<ControlEvent>,
 ) {
-    if selection != ExecutionSelection::CanonicalAuthority
-        || snapshot.operations.values().any(|operation| {
-            operation.desired_generation == snapshot.desired.generation
-                && !operation.status.is_terminal()
-        })
-    {
+    if selection != ExecutionSelection::CanonicalAuthority {
+        return;
+    }
+    if let Some(blocking) = snapshot.operations.values().find(|operation| {
+        operation.desired_generation == snapshot.desired.generation
+            && !operation.status.is_terminal()
+    }) {
+        report_loss_recovery_blocked(blocking, now);
         return;
     }
     let Some(supervisor) = supervisor else {

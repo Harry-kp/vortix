@@ -2956,26 +2956,7 @@ impl LocalControlSession {
                 }),
         );
         if !observations.is_empty() {
-            let summary = changed
-                .iter()
-                .map(|(profile_id, state)| format!("{profile_id}={}", state.active))
-                .collect::<Vec<_>>();
-            if let Err(error) = observer.observe_batch(observations).await {
-                tracing::warn!(
-                    target: "vortix::control::convergence",
-                    tunnels = ?summary,
-                    %error,
-                    "the control service refused this scan's readings"
-                );
-                return Err(LocalControlError::Observation(error.to_string()));
-            }
-            if !summary.is_empty() {
-                tracing::debug!(
-                    target: "vortix::control::convergence",
-                    tunnels = ?summary,
-                    "published tunnel readings"
-                );
-            }
+            publish_batch(&observer, observations, &changed).await?;
         }
         if default_route_changed {
             self.published_default_route.replace(default_route);
@@ -3195,6 +3176,35 @@ struct PublishedTunnel {
     active: bool,
     interface_name: Option<String>,
     published_at_millis: u64,
+}
+
+/// Send one scan's readings, saying which tunnels they covered if refused.
+async fn publish_batch(
+    observer: &crate::vortix_core::control::ObserverHandle,
+    observations: Vec<Observation>,
+    changed: &[(ProfileId, PublishedTunnel)],
+) -> Result<(), LocalControlError> {
+    let summary = changed
+        .iter()
+        .map(|(profile_id, state)| format!("{profile_id}={}", state.active))
+        .collect::<Vec<_>>();
+    if let Err(error) = observer.observe_batch(observations).await {
+        tracing::warn!(
+            target: "vortix::control::convergence",
+            tunnels = ?summary,
+            %error,
+            "the control service refused this scan's readings"
+        );
+        return Err(LocalControlError::Observation(error.to_string()));
+    }
+    if !summary.is_empty() {
+        tracing::debug!(
+            target: "vortix::control::convergence",
+            tunnels = ?summary,
+            "published tunnel readings"
+        );
+    }
+    Ok(())
 }
 
 fn observation_changes(
