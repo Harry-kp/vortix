@@ -2230,6 +2230,21 @@ async fn run_service(
                     report_convergence_stall(&stalled, &snapshot, supervisor.as_deref(), now);
                 }
                 expire_challenges(&mut snapshot, &mut owner, now, config.max_challenges, &mut pending);
+                // Also on the tick, not only when an observation arrives. A
+                // recovery that is cancelled moments after it starts left the
+                // tunnel still gone, and with nothing changing no further
+                // envelope ever came to notice it again — so block-on-drop
+                // stayed disengaged with the real address exposed.
+                admit_unexpected_loss_recovery(
+                    &mut snapshot,
+                    &mut owner,
+                    &admission,
+                    now,
+                    &config,
+                    selection,
+                    supervisor.as_deref(),
+                    &mut pending,
+                );
                 let runtime = ControlRuntime {
                     config: &config,
                     admission: &admission,
