@@ -277,7 +277,13 @@ impl PfFirewall {
                     debug!(target: "vortix::killswitch", err = %e, "snapshot dir create skipped");
                     return;
                 }
-                let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+                if let Err(error) = fs::set_permissions(parent, fs::Permissions::from_mode(0o700)) {
+                    debug!(
+                        target: "vortix::killswitch",
+                        err = %error,
+                        "kill-switch snapshot dir left readable by other accounts"
+                    );
+                }
             }
         }
         match fs::OpenOptions::new()

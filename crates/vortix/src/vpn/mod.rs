@@ -543,12 +543,25 @@ pub(crate) fn load_profiles_from(profiles_dir: &Path) -> Vec<VpnProfile> {
                         let mut perms = metadata.permissions();
                         if perms.mode() & 0o777 != 0o600 {
                             perms.set_mode(0o600);
-                            let _ = fs::set_permissions(&path, perms);
-                            logger::log(
-                                LogLevel::Debug,
-                                "PROFILE",
-                                format!("Fixed permissions for '{name}'"),
-                            );
+                            // The log used to claim the fix regardless of the
+                            // result, so a profile holding private keys could
+                            // stay world-readable while the log said it had
+                            // been tightened.
+                            match fs::set_permissions(&path, perms) {
+                                Ok(()) => logger::log(
+                                    LogLevel::Debug,
+                                    "PROFILE",
+                                    format!("Fixed permissions for '{name}'"),
+                                ),
+                                Err(error) => logger::log(
+                                    LogLevel::Warning,
+                                    "PROFILE",
+                                    format!(
+                                        "'{name}' is readable by other accounts and could not be \
+                                         restricted: {error}"
+                                    ),
+                                ),
+                            }
                         }
                     }
 
