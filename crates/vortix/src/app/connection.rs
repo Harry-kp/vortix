@@ -1622,15 +1622,7 @@ impl App {
     ) {
         match conflict {
             Conflict::DefaultRouteTakeover { current, new } => {
-                let current_name = self
-                    .runtime
-                    .profiles
-                    .iter()
-                    .find(|profile| profile.id == current)
-                    .map_or_else(
-                        || format!("ProfileMissing:{current}"),
-                        |profile| profile.name.clone(),
-                    );
+                let current_name = self.profile_display_name(&current);
                 self.log(&format!(
                     "ACTION: Connect to '{target_name}' blocked by default-route takeover ('{current_name}' holds 0/0)"
                 ));
@@ -1646,7 +1638,8 @@ impl App {
                 overlapping_cidrs,
             } => {
                 self.log(&format!(
-                    "ACTION: Connect to '{target_name}' blocked by route-overlap with '{with}' ({} CIDR(s))",
+                    "ACTION: Connect to '{target_name}' blocked by route-overlap with '{}' ({} CIDR(s))",
+                    self.profile_display_name(&with),
                     overlapping_cidrs.len()
                 ));
                 self.input_mode = InputMode::ConfirmRouteOverlap {
