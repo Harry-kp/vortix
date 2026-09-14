@@ -5809,21 +5809,32 @@ fn apply_observation_to(
             observed_at_millis,
             protection,
         } => {
+            // A live tunnel is re-reported periodically so its fact stays
+            // inside the convergence freshness window. Only a fact that
+            // actually moved says anything about drift; tearing the gates down
+            // on every repeat would mean protection is never verified at all.
+            let changed = snapshot
+                .observed
+                .tunnels
+                .get(&profile_id)
+                .is_none_or(|fact| fact.active != active || fact.interface_name != interface_name);
             if !active {
                 snapshot.observed.connection_health.remove(&profile_id);
                 snapshot.observed.tunnel_details.remove(&profile_id);
             }
-            invalidate_gates(
-                snapshot,
-                DriftGates {
-                    interface: true,
-                    route: true,
-                    dns: true,
-                    firewall: true,
-                },
-                observed_at_millis,
-                now,
-            );
+            if changed {
+                invalidate_gates(
+                    snapshot,
+                    DriftGates {
+                        interface: true,
+                        route: true,
+                        dns: true,
+                        firewall: true,
+                    },
+                    observed_at_millis,
+                    now,
+                );
+            }
             snapshot.observed.tunnels.insert(
                 profile_id,
                 ObservedTunnel {
@@ -7688,6 +7699,60 @@ mod target_profiles_tests {
             Some(&RequestedTunnelState::Disconnected)
         );
         assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn repeating_a_tunnel_fact_keeps_protection_verified() {
+        let profile_id = ProfileId::new("steady-tunnel");
+        let mut snapshot = ControlSnapshot::default();
+        let mut owner = OwnerState::default();
+        let config = ControlServiceConfig {
+            known_profiles: BTreeSet::from([profile_id.clone()]),
+            ..ControlServiceConfig::default()
+        };
+        let observe = |snapshot: &mut ControlSnapshot, owner: &mut OwnerState, at: u64| {
+            apply_observation(
+                Observation::Tunnel {
+                    profile_id: profile_id.clone(),
+                    active: true,
+                    interface_name: Some("wg-steady".into()),
+                    observed_at_millis: at,
+                    protection: None,
+                },
+                snapshot,
+                owner,
+                at,
+                &config,
+            )
+        };
+        observe(&mut snapshot, &mut owner, 1).expect("first fact accepted");
+
+        snapshot.observed.evidence = Some(ProtectionEvidence {
+            desired_generation: snapshot.desired.generation,
+            authority_epoch: snapshot.desired.authority_epoch,
+            policy_digest: snapshot.desired.policy_digest.clone(),
+            observed_at_millis: 1,
+            interface: GateEvidence::Verified,
+            route: GateEvidence::Verified,
+            dns: GateEvidence::Verified,
+            firewall: GateEvidence::Verified,
+        });
+        // A live tunnel is re-reported so its fact stays fresh. Repeating an
+        // unchanged fact must not tear the gates down, or protection is never
+        // verified and every operation waits out its deadline.
+        observe(&mut snapshot, &mut owner, 2).expect("repeat accepted");
+        assert!(
+            snapshot
+                .observed
+                .evidence
+                .as_ref()
+                .is_some_and(ProtectionEvidence::all_gates_verified),
+            "an unchanged fact must leave protection alone"
+        );
+        assert_eq!(
+            snapshot.observed.tunnels[&profile_id].received_at_millis, 2,
+            "the repeat still refreshes the fact"
+        );
     }
 
     #[test]
