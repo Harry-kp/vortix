@@ -370,7 +370,14 @@ impl<R: DnsCommandRunner> LinuxDnsPolicyEngine<R> {
         let expected = resolved_state_for(assignment);
         let current = read_resolved_state(&mut self.runner, interface)?;
         if let Some(owned) = self.ownership.resolved.get(interface) {
-            if current != owned.applied {
+            // A reconnect destroys the tunnel interface and creates a new one
+            // with the same name. Ownership is keyed by that name, so the
+            // record still describes the link that went away and every later
+            // reconnect refused to program DNS, silently leaving the tunnel
+            // resolving through the LAN. An empty link is nobody's, so take it;
+            // only a link carrying someone else's settings is a real conflict.
+            let unconfigured = current.servers.is_empty() && current.domains.is_empty();
+            if current != owned.applied && !unconfigured {
                 return Err(format!(
                     "refusing to overwrite DNS on {interface}: current resolved state no longer matches Vortix ownership"
                 ));
@@ -1772,6 +1779,47 @@ mod tests {
         );
         assert_eq!(retry.status, DnsEffectiveStatus::Applied);
         assert!(engine.runner.mutations().is_empty());
+    }
+
+    #[test]
+    fn a_replaced_interface_can_be_reprogrammed() {
+        let mut engine = LinuxDnsPolicyEngine::new(FakeDnsCommandRunner::default());
+        let desired = policy(
+            1,
+            vec![assignment_for("tun0", "1.1.1.1", DnsScope::CatchAll)],
+        );
+        let applied = engine.apply(
+            LinuxDnsBackend::Resolved,
+            &desired,
+            None,
+            &DnsEffectiveState::default(),
+        );
+        assert_eq!(applied.status, DnsEffectiveStatus::Applied);
+
+        // A reconnect destroys tun0 and creates a new one with the same name.
+        // Ownership is keyed by that name, so it still describes the link that
+        // went away, while the replacement reports nothing configured.
+        engine.runner.resolved.insert(
+            "tun0".to_string(),
+            ResolvedLinkState {
+                servers: Vec::new(),
+                domains: Vec::new(),
+                default_route: Some(false),
+            },
+        );
+        engine.runner.calls.clear();
+
+        let again = engine.apply(
+            LinuxDnsBackend::Resolved,
+            &policy(2, desired.assignments.clone()),
+            Some(&desired),
+            &applied,
+        );
+        assert_eq!(
+            again.status,
+            DnsEffectiveStatus::Applied,
+            "a replacement interface is nobody's, so Vortix must program it rather than refuse and leave the tunnel on LAN DNS"
+        );
     }
 
     #[test]
