@@ -4166,8 +4166,8 @@ async fn unanswered_interactive_challenge_fails_closed_without_recovery_connect(
 /// which the user sees as "disconnection timed out" ~32s later.
 ///
 /// Measured state at the point of failure:
-///   disconnect = WaitingForObservation, connect = WaitingForObservation,
-///   supervised truth = DisconnectedTombstone, desired = Disconnected
+///   disconnect and connect both `WaitingForObservation`,
+///   supervised truth `DisconnectedTombstone`, desired `Disconnected`
 ///
 /// Mechanism, as far as it is established: submitting the disconnect finds the
 /// connect's entry in flight with a different revision, so `submit_tunnel`
@@ -4248,7 +4248,7 @@ async fn a_disconnect_superseding_its_own_connect_settles() {
         .await
         .expect("connect admitted");
     wait_for_condition(
-        || !supervisor.profile_truth(&target).is_none(),
+        || supervisor.profile_truth(&target).is_some(),
         "connect never reached the worker",
     )
     .await;
