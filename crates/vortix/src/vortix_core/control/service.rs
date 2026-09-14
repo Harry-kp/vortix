@@ -6481,6 +6481,37 @@ fn start_recovery_operation(
     register_recovery_lifecycle(owner, snapshot, config, &recovery_id, now, events);
 }
 
+/// Say why a tunnel that went absent did not start a loss recovery.
+///
+/// Block-on-drop engages only through that recovery, so when it declines an
+/// unexpected loss leaves traffic flowing on the real address.
+fn report_unrecovered_loss(
+    before: &ControlSnapshot,
+    snapshot: &ControlSnapshot,
+    supervisor: &Supervisor,
+) {
+    for (profile_id, observed) in &snapshot.observed.tunnels {
+        let was_present = before
+            .observed
+            .tunnels
+            .get(profile_id)
+            .is_some_and(|prior| prior.active);
+        if !was_present || observed.active {
+            continue;
+        }
+        let truth = supervisor.profile_truth(profile_id);
+        tracing::warn!(
+            target: "vortix::control::convergence",
+            profile = %profile_id,
+            desired_connected =
+                snapshot.desired.tunnels.get(profile_id) == Some(&RequestedTunnelState::Connected),
+            truth = ?truth.as_ref().map(|entry| entry.truth),
+            adopted = truth.as_ref().map(|entry| entry.adoption.is_some()),
+            "a tunnel went absent but no loss recovery was admitted"
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn admit_unexpected_loss_recovery(
     before: &ControlSnapshot,
@@ -6524,6 +6555,7 @@ fn admit_unexpected_loss_recovery(
         })
         .collect::<BTreeSet<_>>();
     let Some(profile_id) = dropped.first().cloned() else {
+        report_unrecovered_loss(before, snapshot, supervisor);
         return;
     };
     // The operation intent reconciles the complete desired topology. Own all
