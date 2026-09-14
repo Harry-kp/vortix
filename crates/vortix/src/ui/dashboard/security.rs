@@ -688,7 +688,13 @@ fn verdict_for_protected(app: &App, primary_snap: Option<&TunnelSnapshot>) -> Ve
         CipherStrength::Insecure
     );
 
-    if ip_leaking || dns_unverified || ks_alarm || cipher_insecure {
+    // The audit rows below already say "v6 exposed — matches real IPv6" in
+    // this state. A headline of PROTECTED over that line tells the user the
+    // opposite of what the panel found: with an IPv4-only tunnel every
+    // IPv6-reachable site still sees their real address.
+    let v6_leaking = derive_ipv6_row_status(app) == Ipv6RowStatus::Leaking;
+
+    if ip_leaking || v6_leaking || dns_unverified || ks_alarm || cipher_insecure {
         Verdict::Partial
     } else {
         Verdict::Protected
@@ -2188,6 +2194,41 @@ mod tests {
         assert!(out.contains("Killswitch"), "PARTIAL panel:\n{out}");
         assert!(out.contains("VPN-only"), "active mode label:\n{out}");
         assert!(!out.contains("Legend:"), "no in-panel legend:\n{out}");
+    }
+
+    #[test]
+    fn a_leaking_ipv6_cannot_be_headlined_as_protected() {
+        let mut app = App::new_test();
+        insert_idle_tunnel(&mut app, "alpha");
+        app.registry.set_killswitch_mode(KillSwitchMode::AlwaysOn);
+        app.registry.set_killswitch_state(KillSwitchState::Blocking);
+        app.control_snapshot.dns.status = crate::vortix_core::control::DnsSecurityStatus::Protected;
+        // A profile owns the default route, so IPv4 is carried by the tunnel.
+        app.registry.replace_control_projection(
+            &std::collections::BTreeMap::new(),
+            Some(ProfileId::new("alpha")),
+        );
+        // An IPv4-only tunnel leaves IPv6 on the ISP link, so every
+        // IPv6-reachable site still sees the real address.
+        app.runtime.real_ipv6 = Some("2401:4900::abcd".to_string());
+        app.runtime.public_ipv6 = Some("2401:4900::abcd".to_string());
+
+        assert!(
+            derive_ipv6_row_status(&app) == Ipv6RowStatus::Leaking,
+            "the panel itself reports this state as exposed"
+        );
+        assert!(
+            verdict_for_protected(&app, None) == Verdict::Partial,
+            "the headline must not claim protection over its own `v6 exposed` row"
+        );
+
+        // Without the leak the same state is genuinely protected, so the
+        // assertion above is about IPv6 and nothing else.
+        app.runtime.public_ipv6 = Some("2a00:1450::1".to_string());
+        assert!(
+            verdict_for_protected(&app, None) == Verdict::Protected,
+            "a masked IPv6 must still read as protected"
+        );
     }
 
     #[test]
