@@ -1863,6 +1863,12 @@ impl ControlRuntime<'_> {
             self.startup_persistence_fault,
         )
         .await;
+        if !persisted_before_effects {
+            tracing::warn!(
+                target: "vortix::control::convergence",
+                "supervision skipped: control state was not persisted"
+            );
+        }
         if persisted_before_effects {
             let before_supervision = snapshot.clone();
             drive_supervision(
@@ -3683,6 +3689,18 @@ fn drive_supervision(
         }
     }
 
+    tracing::debug!(
+        target: "vortix::control::convergence",
+        evidence_present = snapshot.observed.evidence.is_some(),
+        lost_results = supervisor.lost_results(),
+        policy_known = supervisor.latest_policy().is_some(),
+        pending_operations = snapshot
+            .operations
+            .values()
+            .filter(|operation| !operation.status.is_terminal())
+            .count(),
+        "convergence check reached"
+    );
     if let (Some(evidence), Some((policy_revision, operation_id))) = (
         snapshot
             .observed
@@ -3701,6 +3719,14 @@ fn drive_supervision(
             dns_verified: evidence.dns == GateEvidence::Verified,
             firewall_verified: evidence.firewall == GateEvidence::Verified,
         };
+        tracing::debug!(
+            target: "vortix::control::convergence",
+            generation_matches = evidence.desired_generation == policy_revision.generation,
+            epoch_matches = evidence.authority_epoch == policy_revision.authority_epoch,
+            digest_matches = evidence.policy_digest == policy_revision.digest,
+            policy_verified = supervisor.verify_policy(&verification, now).is_ok(),
+            "convergence gate inputs"
+        );
         if evidence.desired_generation == policy_revision.generation
             && evidence.authority_epoch == policy_revision.authority_epoch
             && evidence.policy_digest == policy_revision.digest
@@ -3732,7 +3758,8 @@ fn drive_supervision(
                     } else {
                         CompletionOutcome::Cancelled
                     };
-                    let _ = complete_operation(
+                    let logged = operation_id.clone();
+                    let settled = complete_operation(
                         OperationCompletion {
                             operation_id,
                             desired_generation,
@@ -3745,7 +3772,19 @@ fn drive_supervision(
                         config,
                         events,
                     );
+                    tracing::debug!(
+                        target: "vortix::control::convergence",
+                        operation = %logged,
+                        compatible,
+                        result = ?settled,
+                        "convergence settled an operation"
+                    );
                 }
+            } else {
+                tracing::debug!(
+                    target: "vortix::control::convergence",
+                    "policy verified but tunnels have not converged"
+                );
             }
         }
     }
