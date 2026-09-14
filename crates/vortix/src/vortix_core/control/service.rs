@@ -5697,12 +5697,15 @@ fn apply_observation_batch(
     let mut clocks = owner.observation_clocks.clone();
     for observation in observations {
         match apply_observation_to(observation, &mut candidate, &mut clocks, now, config) {
-            Ok(())
+            Ok(()) => {}
             // A reading the owner has already moved past says nothing new, so
             // it is a no-op rather than a fault. Failing the batch on it threw
             // away every other profile's reading in the same scan and surfaced
             // as "Control service unavailable" mid-connect.
-            | Err(ObservationError::Stale) => {}
+            Err(ObservationError::Stale) => tracing::debug!(
+                target: "vortix::control::convergence",
+                "a reading was skipped as superseded"
+            ),
             Err(error) => return Err(error),
         }
     }
