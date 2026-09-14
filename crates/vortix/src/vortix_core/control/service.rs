@@ -5697,7 +5697,15 @@ fn apply_observation_batch(
     let mut candidate = snapshot.clone();
     let mut clocks = owner.observation_clocks.clone();
     for observation in observations {
-        apply_observation_to(observation, &mut candidate, &mut clocks, now, config)?;
+        match apply_observation_to(observation, &mut candidate, &mut clocks, now, config) {
+            Ok(())
+            // A reading the owner has already moved past says nothing new, so
+            // it is a no-op rather than a fault. Failing the batch on it threw
+            // away every other profile's reading in the same scan and surfaced
+            // as "Control service unavailable" mid-connect.
+            | Err(ObservationError::Stale) => {}
+            Err(error) => return Err(error),
+        }
     }
     *snapshot = candidate;
     owner.observation_clocks = clocks;
@@ -7699,6 +7707,47 @@ mod target_profiles_tests {
             Some(&RequestedTunnelState::Disconnected)
         );
         assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn one_stale_reading_does_not_discard_the_rest_of_the_scan() {
+        let behind = ProfileId::new("already-settled");
+        let fresh = ProfileId::new("still-connecting");
+        let mut snapshot = ControlSnapshot::default();
+        let mut owner = OwnerState::default();
+        let config = ControlServiceConfig {
+            known_profiles: BTreeSet::from([behind.clone(), fresh.clone()]),
+            ..ControlServiceConfig::default()
+        };
+        // A receipt moved this profile's clock past the in-flight scan.
+        owner
+            .observation_clocks
+            .insert(ObservationScope::Profile(behind.clone()), 100);
+
+        let tunnel = |profile: &ProfileId, at: u64| Observation::Tunnel {
+            profile_id: profile.clone(),
+            active: true,
+            interface_name: Some(format!("tun-{profile}")),
+            observed_at_millis: at,
+            protection: None,
+        };
+        apply_observation_batch(
+            vec![tunnel(&behind, 50), tunnel(&fresh, 50)],
+            &mut snapshot,
+            &mut owner,
+            100,
+            &config,
+        )
+        .expect("a reading the owner moved past is a no-op, not a batch failure");
+
+        assert!(
+            !snapshot.observed.tunnels.contains_key(&behind),
+            "the superseded reading must not be applied"
+        );
+        assert!(
+            snapshot.observed.tunnels.contains_key(&fresh),
+            "every other profile in the same scan must still land"
+        );
     }
 
     #[test]
