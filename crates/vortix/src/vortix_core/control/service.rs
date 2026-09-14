@@ -3649,6 +3649,48 @@ fn drive_supervision(
             }
         });
 
+    if !tunnel_barrier_ready {
+        for (profile, desired) in &snapshot.desired.tunnels {
+            let observed = snapshot.observed.tunnels.get(profile);
+            let truth = supervisor.profile_truth(profile);
+            let blocks = if *desired == RequestedTunnelState::Connected {
+                !(owner.tunnel_revisions.get(profile).is_some_and(|revision| {
+                    truth.as_ref().is_some_and(|entry| {
+                        entry.revision == *revision
+                            && entry.truth == SupervisedTruth::ObservedPresent
+                            && entry.adoption.is_some()
+                    })
+                }) && observed.is_some_and(|fact| {
+                    fact.active
+                        && fact.received_at_millis <= now
+                        && now.saturating_sub(fact.received_at_millis) <= MAX_PROTECTION_AGE_MILLIS
+                }))
+            } else {
+                !(observed.is_none_or(|fact| !fact.active)
+                    && truth.is_none()
+                    && !supervisor.is_tombstoned(profile))
+            };
+            if blocks {
+                tracing::debug!(
+                    target: "vortix::control::convergence",
+                    %profile,
+                    ?desired,
+                    observed_active = observed.map(|fact| fact.active),
+                    fact_age_millis = observed
+                        .map(|fact| now.saturating_sub(fact.received_at_millis)),
+                    truth = ?truth.as_ref().map(|entry| entry.truth.clone()),
+                    adopted = truth.as_ref().map(|entry| entry.adoption.is_some()),
+                    revision_matches = owner
+                        .tunnel_revisions
+                        .get(profile)
+                        .zip(truth.as_ref())
+                        .map(|(revision, entry)| entry.revision == *revision),
+                    tombstoned = supervisor.is_tombstoned(profile),
+                    "profile blocks the tunnel barrier"
+                );
+            }
+        }
+    }
     tracing::debug!(
         target: "vortix::control::convergence",
         tunnel_barrier_ready,
