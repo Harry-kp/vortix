@@ -3625,6 +3625,16 @@ pub(crate) fn count_profiles(profiles_dir: &Path) -> (u32, u32) {
     if let Ok(entries) = std::fs::read_dir(profiles_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
+            // Rendered tunnel configs are staged beside the profiles as
+            // dotfiles. The profile list already skips them; counting them
+            // here reported more profiles than the user has.
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with('.'))
+            {
+                continue;
+            }
             if path.is_file() {
                 match path.extension().and_then(|e| e.to_str()) {
                     Some("conf") => wg += 1,

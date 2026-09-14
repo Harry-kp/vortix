@@ -173,10 +173,36 @@ fn write_managed_config(
         "{MANAGED_CONFIG_MARKER}\n# profile-id: {}\n# ownership-token: {}\n{stripped}",
         profile.id, identity.ownership_token
     );
+    // A managed copy from an earlier run is dead the moment this one is
+    // written, and it holds the profile's inline certificates and keys. They
+    // were only removed on a clean teardown, so a crash or a kill left them
+    // beside the profiles for good.
+    remove_stale_managed_configs(parent, profile, &path);
     crate::vortix_core::secret_file::write_secret_file(&path, managed_body.as_bytes()).map_err(
         |error| TunnelError::Subprocess(format!("write managed OpenVPN config: {error}")),
     )?;
     Ok(path)
+}
+
+/// Delete this profile's earlier managed copies, keeping the one just chosen.
+fn remove_stale_managed_configs(parent: &Path, profile: &Profile, keep: &Path) {
+    let prefix = format!(".vortix-{}-", profile.id);
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == keep {
+            continue;
+        }
+        let is_stale = path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".ovpn"));
+        if is_stale {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 /// Read the credentials bundle file written by the TUI/CLI auth flow
