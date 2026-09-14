@@ -3305,12 +3305,24 @@ fn drive_supervision(
                 } else {
                     TopologyTransactionPhase::TunnelsAllowed
                 };
+                tracing::debug!(
+                    target: "vortix::control::convergence",
+                    generation = revision.generation,
+                    ?phase,
+                    "topology transaction opened"
+                );
                 owner.topology_transaction = Some(TopologyTransaction {
                     pre_policy: policy,
                     final_policy: None,
                     phase,
                 });
             } else {
+                tracing::warn!(
+                    target: "vortix::control::convergence",
+                    generation = revision.generation,
+                    operation = %operation.id,
+                    "no topology policy could be captured for this generation"
+                );
                 invalidate_all_gates(snapshot, now);
             }
         }
@@ -3637,6 +3649,18 @@ fn drive_supervision(
             }
         });
 
+    tracing::debug!(
+        target: "vortix::control::convergence",
+        tunnel_barrier_ready,
+        plan_actions = plan.actions.len(),
+        phase = ?owner.topology_transaction.as_ref().map(|t| t.phase),
+        transaction_generation = owner
+            .topology_transaction
+            .as_ref()
+            .map(|t| t.pre_policy.revision().generation),
+        revision_generation = revision.generation,
+        "tunnel barrier decision"
+    );
     let final_submission = if tunnel_barrier_ready {
         owner
             .topology_transaction
