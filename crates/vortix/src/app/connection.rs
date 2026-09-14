@@ -75,10 +75,26 @@ impl PendingControlSubject {
         }
     }
 
+    /// Say what ran out of time, why it matters, and what to do — a bare
+    /// "timed out" left the user with no idea whether the tunnel was up.
+    const fn timeout_message(self) -> &'static str {
+        match self {
+            Self::Connection | Self::Reconnection => {
+                "Connection timed out. The VPN did not come up in time, so Vortix left it disconnected. Check the server endpoint and your network, then try again."
+            }
+            Self::Disconnection | Self::DisconnectAll => {
+                "Disconnection timed out. The tunnel was torn down but Vortix could not confirm the system settled. Check the tunnel list; if the profile is still shown, disconnect it again."
+            }
+            Self::KillSwitch => {
+                "Kill switch change timed out. The firewall rules were not confirmed, so protection may not match what is shown. Re-apply the mode from the Security Guard panel."
+            }
+        }
+    }
+
     fn failure_message(self, failure: crate::vortix_core::control::OperationFailure) -> String {
         use crate::vortix_core::control::OperationFailure;
         match failure {
-            OperationFailure::Timeout => format!("{} timed out", self.label()),
+            OperationFailure::Timeout => self.timeout_message().to_string(),
             OperationFailure::Rejected => format!(
                 "{} could not start because another action or route conflict is still active. Try again in a moment.",
                 self.label()
@@ -96,11 +112,11 @@ impl PendingControlSubject {
                     .to_string()
             }
             OperationFailure::ObservationFailed => format!(
-                "Vortix could not verify the system state after the {}. Check the Event Log and try again.",
+                "Vortix finished the {} but could not read back the system state to confirm it. The tunnel list may be out of date. Press [r] to refresh; if it stays wrong, disconnect and reconnect.",
                 self.label()
             ),
             OperationFailure::Internal => format!(
-                "Vortix could not complete the {}. Check the Event Log and try again.",
+                "Vortix hit an internal error during the {} and stopped rather than leave the tunnel half-configured. The Event Log line above this one names the step that failed.",
                 self.label()
             ),
         }

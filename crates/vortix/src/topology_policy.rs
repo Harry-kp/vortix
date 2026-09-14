@@ -619,14 +619,24 @@ impl CanonicalPolicyExecutor {
                 DefaultRouteObservation::Interface(observed)
                     if observed == &expectation.interface
             ) {
-                let (profile, claim) = expectation
+                let (_, claim) = expectation
                     .claims
                     .first()
                     .expect("route probe expectation has at least one claim");
-                return Err(format!(
-                    "route {claim} for profile {profile} did not resolve through {}: {observation:?}",
-                    expectation.interface
-                ));
+                // Profile ids are 64-character digests. The interface names
+                // the tunnel in the same words the user sees everywhere else.
+                let expected = &expectation.interface;
+                return Err(match &observation {
+                    DefaultRouteObservation::Interface(observed) => format!(
+                        "{claim} should route through {expected}, but the system routes it through {observed}"
+                    ),
+                    DefaultRouteObservation::NoDefaultRoute => format!(
+                        "{claim} should route through {expected}, but the system has no route for it"
+                    ),
+                    DefaultRouteObservation::ProbeFailed => format!(
+                        "could not read which interface carries {claim}; {expected} is unverified"
+                    ),
+                });
             }
         }
         Ok(())
