@@ -3678,7 +3678,7 @@ fn drive_supervision(
                     observed_active = observed.map(|fact| fact.active),
                     fact_age_millis = observed
                         .map(|fact| now.saturating_sub(fact.received_at_millis)),
-                    truth = ?truth.as_ref().map(|entry| entry.truth.clone()),
+                    truth = ?truth.as_ref().map(|entry| entry.truth),
                     adopted = truth.as_ref().map(|entry| entry.adoption.is_some()),
                     revision_matches = owner
                         .tunnel_revisions
