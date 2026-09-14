@@ -2162,7 +2162,6 @@ async fn run_service(
                 expire_challenges(&mut snapshot, &mut owner, now, config.max_challenges, &mut pending);
                 handle_envelope(envelope, &mut snapshot, &mut owner, &admission, now, &config, &shared_config, profile_mutations.as_ref(), startup_persistence_fault, &mut readiness_reply, &mut durability_reply, &mut pending);
                 admit_unexpected_loss_recovery(
-                    &before,
                     &mut snapshot,
                     &mut owner,
                     &admission,
@@ -6485,18 +6484,9 @@ fn start_recovery_operation(
 ///
 /// Block-on-drop engages only through that recovery, so when it declines an
 /// unexpected loss leaves traffic flowing on the real address.
-fn report_unrecovered_loss(
-    before: &ControlSnapshot,
-    snapshot: &ControlSnapshot,
-    supervisor: &Supervisor,
-) {
+fn report_unrecovered_loss(snapshot: &ControlSnapshot, supervisor: &Supervisor) {
     for (profile_id, observed) in &snapshot.observed.tunnels {
-        let was_present = before
-            .observed
-            .tunnels
-            .get(profile_id)
-            .is_some_and(|prior| prior.active);
-        if !was_present || observed.active {
+        if observed.active {
             continue;
         }
         let truth = supervisor.profile_truth(profile_id);
@@ -6514,7 +6504,6 @@ fn report_unrecovered_loss(
 
 #[allow(clippy::too_many_arguments)]
 fn admit_unexpected_loss_recovery(
-    before: &ControlSnapshot,
     snapshot: &mut ControlSnapshot,
     owner: &mut OwnerState,
     admission: &Arc<Mutex<AdmissionState>>,
@@ -6540,22 +6529,23 @@ fn admit_unexpected_loss_recovery(
         .tunnels
         .iter()
         .filter_map(|(profile_id, observed)| {
-            let was_present = before
-                .observed
-                .tunnels
-                .get(profile_id)
-                .is_some_and(|prior| prior.active);
             let desired_connected =
                 snapshot.desired.tunnels.get(profile_id) == Some(&RequestedTunnelState::Connected);
+            // `ObservedPresent` with an adoption receipt already means Vortix
+            // proved this tunnel up, so pairing it with an inactive reading is
+            // the loss. Requiring the active-to-inactive edge between two
+            // consecutive snapshots meant a flip seen on a tick that returned
+            // early above was consumed and never revisited: the tunnel stayed
+            // gone, no recovery ran, and block-on-drop never engaged.
             let canonically_owned = supervisor.profile_truth(profile_id).is_some_and(|entry| {
                 entry.truth == SupervisedTruth::ObservedPresent && entry.adoption.is_some()
             });
-            (was_present && !observed.active && desired_connected && canonically_owned)
+            (!observed.active && desired_connected && canonically_owned)
                 .then_some(profile_id.clone())
         })
         .collect::<BTreeSet<_>>();
     let Some(profile_id) = dropped.first().cloned() else {
-        report_unrecovered_loss(before, snapshot, supervisor);
+        report_unrecovered_loss(snapshot, supervisor);
         return;
     };
     // The operation intent reconciles the complete desired topology. Own all
