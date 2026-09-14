@@ -3183,6 +3183,50 @@ struct KsData {
     state: String,
 }
 
+/// Print the active mode, what it is doing right now, and the other choices.
+fn print_killswitch_status(
+    mode: crate::state::KillSwitchMode,
+    state: crate::state::KillSwitchState,
+) {
+    println!(
+        "Kill Switch: {} — currently {}",
+        mode.display_name(),
+        state.display_status()
+    );
+    // Degraded means this mode's rules are not in place. Printing the mode's
+    // behaviour here read as a description of what is happening, so "no
+    // internet at all" appeared over a working connection.
+    if state == crate::state::KillSwitchState::Degraded {
+        println!("  Not protecting right now: this mode's firewall rules are missing,");
+        println!("  so traffic is flowing unprotected.");
+        println!(
+            "  Re-apply with `vortix killswitch {}`, or clear it with `vortix release-killswitch`.",
+            mode.cli_verb()
+        );
+    } else {
+        let (up, down) = mode.behavior_lines();
+        println!("  {up}");
+        println!("  {down}");
+    }
+    println!();
+    println!("Other modes:");
+    for other in [
+        crate::state::KillSwitchMode::Off,
+        crate::state::KillSwitchMode::Auto,
+        crate::state::KillSwitchMode::AlwaysOn,
+    ] {
+        if other == mode {
+            continue;
+        }
+        println!(
+            "  vortix killswitch {:<14}  {} — {}",
+            other.cli_verb(),
+            other.display_name(),
+            other.one_liner()
+        );
+    }
+}
+
 fn handle_killswitch(
     mode_arg: Option<&str>,
     config: &AppConfig,
@@ -3260,32 +3304,7 @@ fn handle_killswitch(
 
     match output_mode {
         OutputMode::Human => {
-            let mode = engine.killswitch_mode;
-            let (up, down) = mode.behavior_lines();
-            println!(
-                "Kill Switch: {} — currently {}",
-                mode.display_name(),
-                engine.killswitch_state.display_status()
-            );
-            println!("  {up}");
-            println!("  {down}");
-            println!();
-            println!("Other modes:");
-            for other in [
-                crate::state::KillSwitchMode::Off,
-                crate::state::KillSwitchMode::Auto,
-                crate::state::KillSwitchMode::AlwaysOn,
-            ] {
-                if other == mode {
-                    continue;
-                }
-                println!(
-                    "  vortix killswitch {:<14}  {} — {}",
-                    other.cli_verb(),
-                    other.display_name(),
-                    other.one_liner()
-                );
-            }
+            print_killswitch_status(engine.killswitch_mode, engine.killswitch_state);
         }
         OutputMode::Json => print_success(output_mode, "killswitch", &data, vec![]),
         OutputMode::Quiet => {}
