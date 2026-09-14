@@ -2878,8 +2878,22 @@ impl LocalControlSession {
         let sessions = scan.sessions;
         let profiles = self.profile_mutations.profiles_snapshot();
         if !self.accept_scanner_sessions(&sessions, expected_lifecycle_revision) {
+            // A discarded scan leaves every observed fact at its last value.
+            // If this keeps happening a tunnel that went away still reads as
+            // present, and nothing downstream can notice the loss.
+            tracing::debug!(
+                target: "vortix::control::convergence",
+                sessions = sessions.len(),
+                expected_lifecycle_revision,
+                "system scan discarded before publication"
+            );
             return Ok(());
         }
+        tracing::debug!(
+            target: "vortix::control::convergence",
+            sessions = ?sessions.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
+            "system scan accepted"
+        );
         let observer = self.service().observer();
         let default_route = scan.default_route;
         let default_route_changed = !matches!(
