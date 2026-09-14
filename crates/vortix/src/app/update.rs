@@ -113,10 +113,9 @@ impl App {
                 // route and the prior primary becomes
                 // `Split tunnel (0.0.0.0/0, yielded)` in the registry's
                 // role derivation. Symmetric with
-                // `ConfirmRouteOverlap` below — neither path
-                // disconnects the existing tunnel. The conflict was
-                // already surfaced via the overlay, so retry the
-                // connect with the `detect_conflict` gate bypassed.
+                // The conflict was already surfaced via the overlay, so
+                // retry the connect with the `detect_conflict` gate
+                // bypassed.
                 self.connect_profile_forced(idx);
             }
             Message::SwitchExclusiveAndConnect { idx } => {
@@ -146,16 +145,23 @@ impl App {
             }
             Message::ConfirmRouteOverlap { idx } => {
                 self.input_mode = InputMode::Normal;
-                if let Some(profile) = self.runtime.profiles.get(idx) {
-                    self.log(&format!(
-                        "ACTION: Route-overlap confirmed; connecting '{}'...",
-                        profile.name
-                    ));
-                }
-                // Route-overlap does not require a disconnect: both
-                // tunnels can stay up; the killswitch synthesiser handles
-                // CIDR subtraction. Connect directly with force=true.
-                self.connect_profile_forced(idx);
+                let Some(profile) = self.runtime.profiles.get(idx).cloned() else {
+                    return;
+                };
+                self.log(&format!(
+                    "ACTION: Disconnecting the conflicting tunnel before connecting '{}'",
+                    profile.name
+                ));
+                // The kernel routes a prefix through one interface, so two
+                // profiles claiming the same network cannot both carry it.
+                // Keeping both up meant the route read-back demanded one
+                // address resolve through two interfaces and the connect
+                // always failed. Stop the other tunnel, like a takeover.
+                self.issue_control_command(
+                    crate::vortix_core::control::UserCommand::ConnectExclusive {
+                        profile_id: profile.id,
+                    },
+                );
             }
             Message::DisconnectProfile { idx } => self.disconnect_profile_by_idx(idx),
             Message::ForceDisconnectProfile { idx } => {

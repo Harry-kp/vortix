@@ -400,6 +400,10 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
             // so they split one budget rather than each owning a line.
             let name_budget = inner_width.saturating_sub(" and ".width()) / 2;
             let with_t = crate::ui::helpers::truncate_to_width(&with_name, name_budget);
+            let with_t2 = crate::ui::helpers::truncate_to_width(
+                &with_name,
+                inner_width.saturating_sub("connecting disconnects .".width()),
+            );
             let to_t = crate::ui::helpers::truncate_to_width(to_name, name_budget);
             // Display up to two overlapping CIDRs inline; the rest collapse
             // into a "+N more" tail so a wide AllowedIPs set doesn't blow
@@ -439,10 +443,7 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
                     // never said what pressing Connect would do. The takeover
                     // dialog next door already speaks plainly; this one says
                     // the same three things it does — who is contending, over
-                    // what, and what happens either way — so the difference
-                    // between the two is visible without knowing the
-                    // taxonomy. The crucial distinction from a takeover is
-                    // that both VPNs stay connected here.
+                    // what, and what happens next.
                     title: " Already connected ",
                     body: vec![
                         Line::from(vec![
@@ -468,13 +469,20 @@ fn render_overlays(frame: &mut Frame, app: &mut App) {
                         ]),
                         Line::from(""),
                         Line::from(vec![Span::styled(
-                            "Connecting hands that network to the new",
+                            "Only one tunnel can carry a network, so",
                             Style::default().fg(theme::current().text_secondary),
                         )]),
-                        Line::from(vec![Span::styled(
-                            "VPN. Both stay connected either way.",
-                            Style::default().fg(theme::current().text_secondary),
-                        )]),
+                        Line::from(vec![
+                            Span::styled(
+                                "connecting disconnects ",
+                                Style::default().fg(theme::current().text_secondary),
+                            ),
+                            Span::styled(
+                                with_t2,
+                                Style::default().fg(theme::current().accent_primary),
+                            ),
+                            Span::styled(".", Style::default().fg(theme::current().text_secondary)),
+                        ]),
                     ],
                     border_color: theme::current().warning,
                     confirm_selected: *confirm_selected,
@@ -613,8 +621,12 @@ mod overlay_tests {
             "the contended network must be shown: {output}"
         );
         assert!(
-            output.contains("Both stay connected"),
-            "the difference from a takeover is that nothing is disconnected: {output}"
+            output.contains("connecting disconnects"),
+            "the dialog must say the other tunnel stops: {output}"
+        );
+        assert!(
+            !output.contains("Both stay connected"),
+            "two profiles cannot carry the same network, so nothing may promise they do: {output}"
         );
     }
 
