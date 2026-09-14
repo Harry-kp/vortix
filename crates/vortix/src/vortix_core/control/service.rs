@@ -6510,6 +6510,21 @@ fn start_recovery_operation(
     register_recovery_lifecycle(owner, snapshot, config, &recovery_id, now, events);
 }
 
+/// Record that a tunnel's disappearance actually started a recovery.
+fn report_loss_recovery_started(
+    profile_id: &ProfileId,
+    recovery_id: &OperationId,
+    generation: u64,
+) {
+    tracing::warn!(
+        target: "vortix::control::convergence",
+        profile = %profile_id,
+        operation = %recovery_id,
+        generation,
+        "starting loss recovery for a tunnel that went away"
+    );
+}
+
 /// Name the operation holding the loss-recovery gate shut.
 ///
 /// One that neither completes nor expires keeps it shut for good, so an
@@ -6618,13 +6633,7 @@ fn admit_unexpected_loss_recovery(
         mark_reconciliation_incomplete(snapshot, admission);
         return;
     };
-    tracing::warn!(
-        target: "vortix::control::convergence",
-        profile = %profile_id,
-        operation = %recovery_id,
-        generation,
-        "starting loss recovery for a tunnel that went away"
-    );
+    report_loss_recovery_started(&profile_id, &recovery_id, generation);
     let retry_budget = u64::try_from(config.retry_budget.as_millis()).unwrap_or(u64::MAX);
     let retry_backoff = u64::try_from(config.retry_initial_backoff.as_millis()).unwrap_or(u64::MAX);
     snapshot.operations.insert(
