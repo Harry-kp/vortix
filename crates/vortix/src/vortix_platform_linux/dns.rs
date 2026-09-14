@@ -402,10 +402,24 @@ impl<R: DnsCommandRunner> LinuxDnsPolicyEngine<R> {
         }
 
         self.mutated_resolved.insert(interface.to_string());
-        for spec in build_resolved_apply_specs(assignment) {
-            run_spec(&mut self.runner, spec)?;
+        // The interface is replaced while the policy is being programmed, so
+        // the first read-back can describe a link that is already gone. Now
+        // that a replacement link can be re-owned above, programming it again
+        // settles; before that fix every retry hit the ownership guard.
+        let mut verified = Err(String::new());
+        for attempt in 0..RESOLVED_APPLY_ATTEMPTS {
+            if attempt > 0 {
+                std::thread::sleep(RESOLVED_APPLY_RETRY_DELAY);
+            }
+            for spec in build_resolved_apply_specs(assignment) {
+                run_spec(&mut self.runner, spec)?;
+            }
+            verified = verify_resolved_state(&mut self.runner, interface, &expected);
+            if verified.is_ok() {
+                break;
+            }
         }
-        if let Err(error) = verify_resolved_state(&mut self.runner, interface, &expected) {
+        if let Err(error) = verified {
             // A reconnect fails here every time while the same commands applied
             // by hand stick instantly, so record exactly what was asked for and
             // of which interface.
@@ -897,6 +911,11 @@ fn write_resolved_state<R: DnsCommandRunner>(
     }
     Ok(())
 }
+
+/// How many times to program resolved before calling the policy unapplied.
+const RESOLVED_APPLY_ATTEMPTS: usize = 3;
+/// Long enough for a replacement tunnel interface to register with resolved.
+const RESOLVED_APPLY_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(400);
 
 fn verify_resolved_state<R: DnsCommandRunner>(
     runner: &mut R,
