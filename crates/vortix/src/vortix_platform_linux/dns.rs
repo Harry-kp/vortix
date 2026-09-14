@@ -395,26 +395,25 @@ impl<R: DnsCommandRunner> LinuxDnsPolicyEngine<R> {
         }
 
         self.mutated_resolved.insert(interface.to_string());
-        // A reconnect destroys the tunnel interface and creates a new one with
-        // the same name, so settings applied moments earlier belong to a link
-        // that no longer exists and the read-back finds an empty one. Treating
-        // that as "the VPN's DNS could not be applied" tore the policy back
-        // out and left the tunnel resolving through the LAN. Re-apply to the
-        // link that is actually there.
-        let mut applied = Err(String::new());
-        for attempt in 0..RESOLVED_APPLY_ATTEMPTS {
-            if attempt > 0 {
-                std::thread::sleep(RESOLVED_APPLY_RETRY_DELAY);
-            }
-            for spec in build_resolved_apply_specs(assignment) {
-                run_spec(&mut self.runner, spec)?;
-            }
-            applied = verify_resolved_state(&mut self.runner, interface, &expected);
-            if applied.is_ok() {
-                break;
-            }
+        for spec in build_resolved_apply_specs(assignment) {
+            run_spec(&mut self.runner, spec)?;
         }
-        applied?;
+        if let Err(error) = verify_resolved_state(&mut self.runner, interface, &expected) {
+            // A reconnect fails here every time while the same commands applied
+            // by hand stick instantly, so record exactly what was asked for and
+            // of which interface.
+            tracing::warn!(
+                target: "vortix::dns",
+                interface,
+                requested = ?expected,
+                specs = ?build_resolved_apply_specs(assignment)
+                    .iter()
+                    .map(|spec| spec.args.join(" "))
+                    .collect::<Vec<_>>(),
+                "resolved accepted the commands but does not report the policy"
+            );
+            return Err(error);
+        }
         let owned = self
             .ownership
             .resolved
@@ -891,15 +890,6 @@ fn write_resolved_state<R: DnsCommandRunner>(
     }
     Ok(())
 }
-
-/// How many times to program resolved before calling the policy unapplied.
-///
-/// Sized against a measured teardown-and-recreate cycle of roughly two and a
-/// half seconds: too short a window fails, which tears the tunnel down, which
-/// replaces the interface again, which fails the next attempt.
-const RESOLVED_APPLY_ATTEMPTS: usize = 6;
-/// Long enough for a replacement tunnel interface to register with resolved.
-const RESOLVED_APPLY_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(700);
 
 fn verify_resolved_state<R: DnsCommandRunner>(
     runner: &mut R,
