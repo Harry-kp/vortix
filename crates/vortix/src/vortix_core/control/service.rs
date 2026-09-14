@@ -6417,6 +6417,17 @@ fn reserve_service_operation(
                 ProfileOperationKind::Lifecycle,
                 config,
             )
+            .inspect_err(|error| {
+                // Every service-started operation dies here silently, including
+                // the loss recovery that block-on-drop depends on.
+                tracing::warn!(
+                    target: "vortix::control::convergence",
+                    ?error,
+                    retained_operations = snapshot.operations.len(),
+                    max_operations = config.max_operations,
+                    "could not reserve a service operation"
+                );
+            })
             .ok()?
     };
     for evicted_id in evicted {
