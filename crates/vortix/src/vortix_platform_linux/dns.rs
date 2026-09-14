@@ -395,10 +395,26 @@ impl<R: DnsCommandRunner> LinuxDnsPolicyEngine<R> {
         }
 
         self.mutated_resolved.insert(interface.to_string());
-        for spec in build_resolved_apply_specs(assignment) {
-            run_spec(&mut self.runner, spec)?;
+        // A reconnect destroys the tunnel interface and creates a new one with
+        // the same name, so settings applied moments earlier belong to a link
+        // that no longer exists and the read-back finds an empty one. Treating
+        // that as "the VPN's DNS could not be applied" tore the policy back
+        // out and left the tunnel resolving through the LAN. Re-apply to the
+        // link that is actually there.
+        let mut applied = Err(String::new());
+        for attempt in 0..RESOLVED_APPLY_ATTEMPTS {
+            if attempt > 0 {
+                std::thread::sleep(RESOLVED_APPLY_RETRY_DELAY);
+            }
+            for spec in build_resolved_apply_specs(assignment) {
+                run_spec(&mut self.runner, spec)?;
+            }
+            applied = verify_resolved_state(&mut self.runner, interface, &expected);
+            if applied.is_ok() {
+                break;
+            }
         }
-        verify_resolved_state(&mut self.runner, interface, &expected)?;
+        applied?;
         let owned = self
             .ownership
             .resolved
@@ -875,6 +891,11 @@ fn write_resolved_state<R: DnsCommandRunner>(
     }
     Ok(())
 }
+
+/// How many times to program resolved before calling the policy unapplied.
+const RESOLVED_APPLY_ATTEMPTS: usize = 3;
+/// Long enough for a replacement tunnel interface to register with resolved.
+const RESOLVED_APPLY_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
 
 fn verify_resolved_state<R: DnsCommandRunner>(
     runner: &mut R,
