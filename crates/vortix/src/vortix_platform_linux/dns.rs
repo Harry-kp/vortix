@@ -1109,14 +1109,13 @@ fn is_link_local_resolver(address: &str) -> bool {
 }
 
 /// Pick the resolver worth reporting from candidates in configured order.
-fn preferred_resolver<I, S>(candidates: I) -> Option<String>
+fn preferred_resolver<I>(candidates: I) -> Option<String>
 where
-    I: IntoIterator<Item = S>,
-    S: AsRef<str>,
+    I: IntoIterator<Item = String>,
 {
     let mut link_local = None;
     for candidate in candidates {
-        let Some(address) = parse_resolver_address(candidate.as_ref()) else {
+        let Some(address) = parse_resolver_address(&candidate) else {
             continue;
         };
         if is_link_local_resolver(&address) {

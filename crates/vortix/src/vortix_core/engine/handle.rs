@@ -123,8 +123,7 @@ impl EngineHandle {
     /// # Errors
     ///
     /// Returns [`EngineError::Other`] when the actor task has terminated.
-    #[allow(clippy::unused_async)] // public shape stays async for the future remote handle
-    pub async fn snapshot(&self) -> Result<Snapshot, EngineError> {
+    pub fn snapshot(&self) -> Result<Snapshot, EngineError> {
         match self {
             Self::Local(h) => h.snapshot(),
         }
@@ -137,8 +136,7 @@ impl EngineHandle {
     /// # Errors
     ///
     /// Returns [`EngineError::Other`] when the actor task has terminated.
-    #[allow(clippy::unused_async)] // public shape stays async for the future remote handle
-    pub async fn subscribe(&self) -> Result<EngineSubscription, EngineError> {
+    pub fn subscribe(&self) -> Result<EngineSubscription, EngineError> {
         match self {
             Self::Local(h) => h.subscribe(),
         }
@@ -293,14 +291,14 @@ mod tests {
         // ConnectAttemptStarted + TunnelUp + KillswitchEngaged = 3 events.
         assert!(ack.events_emitted >= 2);
 
-        let snap = handle.snapshot().await.unwrap();
+        let snap = handle.snapshot().unwrap();
         assert!(matches!(snap.state, Connection::Connected { .. }));
     }
 
     #[tokio::test]
     async fn subscribe_returns_snapshot_plus_receiver() {
         let handle = EngineHandle::for_test();
-        let sub = handle.subscribe().await.unwrap();
+        let sub = handle.subscribe().unwrap();
         assert!(matches!(
             sub.snapshot.state,
             Connection::Disconnected { .. }
@@ -332,7 +330,7 @@ mod tests {
             ))
         });
         let handle = EngineHandle::local(engine, journal);
-        let mut events = handle.subscribe().await.unwrap().receiver;
+        let mut events = handle.subscribe().unwrap().receiver;
         let connect = {
             let handle = handle.clone();
             tokio::spawn(async move {
@@ -356,7 +354,7 @@ mod tests {
         })
         .await
         .expect("connect attempt publication timeout");
-        let snapshot = handle.snapshot().await.unwrap();
+        let snapshot = handle.snapshot().unwrap();
         assert!(matches!(snapshot.state, Connection::Connecting { .. }));
         assert!(snapshot.journal_tail.iter().any(|envelope| matches!(
             envelope.event,
@@ -364,7 +362,7 @@ mod tests {
         )));
         connect.await.unwrap().unwrap();
         assert!(matches!(
-            handle.snapshot().await.unwrap().state,
+            handle.snapshot().unwrap().state,
             Connection::Connected { .. }
         ));
     }
