@@ -6148,6 +6148,17 @@ fn complete_operation(
         }
     }
     let status = record.status;
+    let is_recovery = matches!(record.intent, OperationIntent::UnexpectedRecovery { .. });
+    if is_recovery {
+        // A loss recovery is the only thing that engages block-on-drop, and it
+        // is deleted from the map when it ends, so its ending left no trace.
+        tracing::warn!(
+            target: "vortix::control::convergence",
+            operation = %completion.operation_id,
+            ?status,
+            "loss recovery ended"
+        );
+    }
     if status == OperationStatus::Succeeded {
         let connected_profiles = snapshot
             .operations
@@ -6295,6 +6306,13 @@ fn expire_operations(
         });
         let expired_record = snapshot.operations.get(&id).cloned();
         let was_recovery = owner.recovery_operations.remove(&id);
+        if was_recovery {
+            tracing::warn!(
+                target: "vortix::control::convergence",
+                operation = %id,
+                "loss recovery expired and was forgotten"
+            );
+        }
         if let Some(record) = snapshot.operations.get_mut(&id) {
             record.status = OperationStatus::Expired;
             record.result = Some(OperationResult::Expired);
