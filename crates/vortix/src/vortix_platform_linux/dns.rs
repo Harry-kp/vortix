@@ -893,9 +893,13 @@ fn write_resolved_state<R: DnsCommandRunner>(
 }
 
 /// How many times to program resolved before calling the policy unapplied.
-const RESOLVED_APPLY_ATTEMPTS: usize = 3;
+///
+/// Sized against a measured teardown-and-recreate cycle of roughly two and a
+/// half seconds: too short a window fails, which tears the tunnel down, which
+/// replaces the interface again, which fails the next attempt.
+const RESOLVED_APPLY_ATTEMPTS: usize = 6;
 /// Long enough for a replacement tunnel interface to register with resolved.
-const RESOLVED_APPLY_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+const RESOLVED_APPLY_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(700);
 
 fn verify_resolved_state<R: DnsCommandRunner>(
     runner: &mut R,
