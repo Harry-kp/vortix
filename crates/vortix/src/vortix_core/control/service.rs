@@ -3277,7 +3277,14 @@ fn drive_supervision(
         in_flight,
         disconnect_tombstones,
     });
-    let operation = operation_for_generation(snapshot, revision.generation).cloned();
+    // A rollback bumps the desired generation without giving the new one an
+    // operation, which orphaned the recovery admitted moments earlier: no
+    // transaction opened, no pre-tunnel barrier, and block-on-drop never
+    // engaged after an unexpected loss. The policy describes current desired
+    // state either way; the operation is only the vehicle carrying it.
+    let operation = operation_for_generation(snapshot, revision.generation)
+        .or_else(|| newest_live_operation(snapshot))
+        .cloned();
     if let Some(operation) = operation {
         let transaction_is_current =
             owner
@@ -4072,6 +4079,15 @@ fn operation_for_generation(
 /// command advanced global desired state, that current command (or its
 /// recovery operation) is the dispatch vehicle while the worker retains the
 /// profile's older exact revision.
+/// The most recently admitted operation that has not finished.
+fn newest_live_operation(snapshot: &ControlSnapshot) -> Option<&OperationRecord> {
+    snapshot
+        .operations
+        .values()
+        .rev()
+        .find(|operation| !operation.status.is_terminal())
+}
+
 fn operation_for_tunnel_action(
     snapshot: &ControlSnapshot,
     tunnel_generation: u64,
