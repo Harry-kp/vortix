@@ -198,7 +198,8 @@ fn remove_stale_managed_configs(parent: &Path, profile: &Profile, keep: &Path) {
         let is_stale = path
             .file_name()
             .and_then(std::ffi::OsStr::to_str)
-            .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".ovpn"));
+            .is_some_and(|name| name.starts_with(&prefix))
+            && path.extension().and_then(std::ffi::OsStr::to_str) == Some("ovpn");
         if is_stale {
             let _ = std::fs::remove_file(&path);
         }
