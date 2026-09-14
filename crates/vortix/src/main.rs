@@ -184,6 +184,11 @@ fn main() -> Result<()> {
                 disk: settings.journal.disk,
                 retention_days: settings.journal.retention_days,
                 retention_count: settings.journal.retention_count,
+                // The default resolves the XDG data dir from $HOME, which is
+                // /root under sudo, so session journals landed outside the
+                // user's home where they could neither find nor prune them.
+                // Keep them beside the logs, in the sudo-aware config dir.
+                journal_dir: Some(config_dir.join("sessions")),
                 ..Default::default()
             },
         ) {
