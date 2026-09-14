@@ -477,7 +477,7 @@ fn terminal_control_notification(
             Some((format!("{} cancelled", subject.label()), ToastType::Info))
         }
         (OperationStatus::Expired, _) => {
-            Some((format!("{} timed out", subject.label()), ToastType::Error))
+            Some((subject.timeout_message().to_string(), ToastType::Error))
         }
         (OperationStatus::Succeeded, _)
             if matches!(subject, PendingControlSubject::DisconnectAll) =>
