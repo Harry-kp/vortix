@@ -1115,6 +1115,11 @@ fn operation_failure(
             ExitCode::GeneralError,
             format!("{action} operation {operation} was cancelled"),
         ),
+        (_, Some(OperationResult::Failed(OperationFailure::InvalidProfile))) => (
+            "invalid_profile",
+            ExitCode::GeneralError,
+            "That profile is not usable. WireGuard names must be 1–15 characters using only letters, numbers, _, =, +, ., or -, and the file must contain an [Interface] and a [Peer] section.".to_owned(),
+        ),
         _ => (
             if action == "disconnect" {
                 "disconnect_failed"
@@ -1122,7 +1127,11 @@ fn operation_failure(
                 "connect_failed"
             },
             ExitCode::GeneralError,
-            format!("{action} operation {operation} failed"),
+            // The operation id means nothing to the reader, so lead with what
+            // happened and what state it left behind.
+            format!(
+                "The {action} did not succeed and nothing was changed. The Event Log names the step that failed (operation {operation})."
+            ),
         ),
     }
 }
