@@ -1051,8 +1051,12 @@ fn install_termination_handler() {
     // SAFETY: the handler only performs one lock-free atomic store.
     #[allow(unsafe_code)]
     unsafe {
-        libc::signal(libc::SIGTERM, termination_handler as libc::sighandler_t);
-        libc::signal(libc::SIGINT, termination_handler as libc::sighandler_t);
+        // Reify to a pointer before the integer cast: a direct function-item
+        // cast is what `function_casts_as_integer` warns about, and this is
+        // the handler that lets the custodian tear tunnels down on exit.
+        let handler = termination_handler as *const () as libc::sighandler_t;
+        libc::signal(libc::SIGTERM, handler);
+        libc::signal(libc::SIGINT, handler);
     }
 }
 

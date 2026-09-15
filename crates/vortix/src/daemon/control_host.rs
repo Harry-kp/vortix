@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Read as _;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::vortix_core::control::{
@@ -18,7 +18,6 @@ use crate::vortix_core::ipc::{
     ControlAvailability, IpcError, IpcOp, IpcResult, RemoteSessionId, SensitiveBytes,
 };
 use crate::vortix_core::privileged::AuthorityBinding;
-use crate::vortix_core::profile::ProfileId;
 
 const MAX_REMOTE_SESSIONS: usize = 64;
 const PENDING_SESSION_TTL: Duration = Duration::from_secs(5);
@@ -26,27 +25,6 @@ const MAX_REMOTE_OPERATION_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 /// Result of consuming the final chunk of one memory-only remote import.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StagedRemoteProfile {
-    pub(crate) profile_id: ProfileId,
-    pub(crate) display_name: String,
-}
-
-/// Daemon-owned profile staging seam. Private bodies stay memory-only until
-/// the canonical identity-only import operation commits. Implementations must
-/// enforce the existing aggregate import bound, monotonic offsets, and an
-/// inactivity deadline that clears partial secret material.
-pub(crate) trait RemoteProfileStager: Send + Sync {
-    fn stage_chunk(
-        &self,
-        session_id: &RemoteSessionId,
-        file_name: &str,
-        offset: u64,
-        final_chunk: bool,
-        contents: SensitiveBytes,
-    ) -> Result<Option<StagedRemoteProfile>, IpcError>;
-
-    fn cancel(&self, session_id: &RemoteSessionId);
-}
 
 enum HostedSessionState {
     Pending { opened_at: Instant },
@@ -67,7 +45,6 @@ pub(crate) struct ControlAuthorityHost {
     service: ControlService,
     authority_binding: AuthorityBinding,
     sessions: Mutex<BTreeMap<RemoteSessionId, HostedSession>>,
-    profile_stager: Option<Arc<dyn RemoteProfileStager>>,
 }
 
 impl ControlAuthorityHost {
@@ -80,7 +57,6 @@ impl ControlAuthorityHost {
             service,
             authority_binding,
             sessions: Mutex::new(BTreeMap::new()),
-            profile_stager: None,
         }
     }
 
@@ -169,7 +145,6 @@ impl ControlAuthorityHost {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(session_id);
-        self.cancel_staging(session_id);
     }
 
     pub(crate) async fn dispatch(&self, op: IpcOp) -> Result<IpcResult, IpcError> {
@@ -230,7 +205,6 @@ impl ControlAuthorityHost {
             }
             IpcOp::ControlCancelProfileImport { session_id } => {
                 let _ = self.subscribed_handle(&session_id)?;
-                self.cancel_staging(&session_id);
                 Ok(IpcResult::ChallengeAccepted)
             }
             other => Err(IpcError::MalformedRequest(format!(
@@ -244,59 +218,25 @@ impl ControlAuthorityHost {
             .map_or(Ok(()), |state| Err(IpcError::ControlUnavailable { state }))
     }
 
+    /// Remote profile import was never wired to a backend: the staging seam
+    /// it dispatched through had no implementation, so this always failed at
+    /// the first hop and the ~45 lines of chunk accounting below it could
+    /// never run. The IPC operation stays so the protocol surface and its
+    /// error are unchanged; what is gone is the indirection pretending a
+    /// backend might answer.
     fn dispatch_profile_chunk(
         &self,
         session_id: &RemoteSessionId,
-        file_name: &str,
-        offset: u64,
-        final_chunk: bool,
-        contents: SensitiveBytes,
+        _file_name: &str,
+        _offset: u64,
+        _final_chunk: bool,
+        _contents: SensitiveBytes,
     ) -> Result<IpcResult, IpcError> {
         self.require_available()?;
         let _ = self.subscribed_handle(session_id)?;
-        let backend = self
-            .profile_stager
-            .as_ref()
-            .ok_or_else(|| IpcError::Internal("remote profile staging is unavailable".into()))?;
-        let contents = contents.into_vec();
-        let chunk_len = u64::try_from(contents.len())
-            .map_err(|_| IpcError::Internal("profile chunk is too large".into()))?;
-        let outcome = backend.stage_chunk(
-            session_id,
-            file_name,
-            offset,
-            final_chunk,
-            SensitiveBytes::new(contents),
-        );
-        match outcome {
-            Ok(Some(profile)) if final_chunk => Ok(IpcResult::ControlProfileImportStaged {
-                profile_id: profile.profile_id,
-                display_name: profile.display_name,
-            }),
-            Ok(None) if !final_chunk => {
-                let next_offset = offset.checked_add(chunk_len).ok_or_else(|| {
-                    self.cancel_staging(session_id);
-                    IpcError::MalformedRequest("profile offset overflow".into())
-                })?;
-                Ok(IpcResult::ControlProfileImportChunkAccepted { next_offset })
-            }
-            Ok(_) => {
-                self.cancel_staging(session_id);
-                Err(IpcError::Internal(
-                    "profile stager returned an invalid chunk outcome".into(),
-                ))
-            }
-            Err(error) => {
-                self.cancel_staging(session_id);
-                Err(error)
-            }
-        }
-    }
-
-    fn cancel_staging(&self, session_id: &RemoteSessionId) {
-        if let Some(stager) = &self.profile_stager {
-            stager.cancel(session_id);
-        }
+        Err(IpcError::Internal(
+            "remote profile staging is unavailable".into(),
+        ))
     }
 
     fn subscribed_handle(&self, session_id: &RemoteSessionId) -> Result<ControlHandle, IpcError> {

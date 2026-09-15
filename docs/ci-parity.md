@@ -70,7 +70,8 @@ Code gated to Linux (`vortix_platform_linux/*`, `daemon/server.rs` SO_PEERCRED b
 
 **Mitigations:**
 - Where feasible, cross-compile-check before pushing: `cargo check --workspace --all-targets --target x86_64-unknown-linux-gnu` (or `aarch64-apple-darwin` from a Linux box). Linker errors are expected for non-host targets; the lint pass still runs.
-- Otherwise: push to a feature branch, watch CI, fix from the failure log. Don't merge until all matrix legs are green.
+  **This usually does not work from macOS.** `ring` runs a build script that needs a Linux C cross-compiler, so the build fails there and never reaches the lint pass. Adding the rustup target is not enough. Treat this bullet as available only where a cross toolchain is already installed, and do not plan a verification step around it.
+- Otherwise: push to a feature branch, watch CI, fix from the failure log. Don't merge until all matrix legs are green. On this repo that is the normal path, not the fallback: a single branch shipped three separate Linux-only failures (a DNS regression invisible to macOS tests, then `clippy::unnecessary_wraps` and `clippy::items_after_test_module`) where every local run was green.
 
 ### Trap 3 — `cargo clippy` does NOT run rustdoc lints
 

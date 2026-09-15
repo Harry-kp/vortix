@@ -120,7 +120,13 @@ impl ControlSnapshot {
             {
                 continue;
             }
-            let existing = self.profile_routes.get(existing_id)?;
+            // `?` here returned `None` from the whole function — "no conflict
+            // with anyone" — the moment a single peer had no route entry,
+            // hiding every other peer's conflict behind it. One peer we cannot
+            // describe is a peer to skip, not an answer about the rest.
+            let Some(existing) = self.profile_routes.get(existing_id) else {
+                continue;
+            };
             let requested_default = requested.iter().any(|route| route.prefix_len == 0);
             let existing_default = existing.iter().any(|route| route.prefix_len == 0);
             if requested_default && existing_default {
@@ -129,9 +135,22 @@ impl ControlSnapshot {
                     new: profile_id.clone(),
                 });
             }
+            // A default route intersects every other route by definition, so
+            // comparing it here reported a full tunnel joining a split tunnel
+            // as a "Route Overlap" — a conflict the user cannot act on,
+            // because nothing is actually contended. Whether two profiles both
+            // want the default is the question asked immediately above; this
+            // one is only about specific destinations colliding. A split
+            // tunnel alongside a full one is legitimate: the more specific
+            // prefix wins, which is the point of running both.
             let overlapping_cidrs = requested
                 .iter()
-                .filter(|route| existing.iter().any(|current| route.intersects(current)))
+                .filter(|route| route.prefix_len != 0)
+                .filter(|route| {
+                    existing
+                        .iter()
+                        .any(|current| current.prefix_len != 0 && route.intersects(current))
+                })
                 .copied()
                 .collect::<Vec<_>>();
             if !overlapping_cidrs.is_empty() {
@@ -153,5 +172,145 @@ impl ControlSnapshot {
         self.tunnels
             .get(peer)
             .is_some_and(|tunnel| !matches!(tunnel.state, Connection::Disconnected { .. }))
+    }
+}
+
+#[cfg(test)]
+mod conflict_scan_tests {
+    use super::*;
+    use crate::vortix_core::engine::registry::Role;
+    use crate::vortix_core::engine::state::{ConnectionHealth, DetailedConnectionInfo};
+
+    fn connected(profile_id: &ProfileId) -> TunnelSnapshot {
+        TunnelSnapshot {
+            profile_id: profile_id.clone(),
+            state: Connection::Connected {
+                profile_id: profile_id.clone(),
+                since: SystemTime::UNIX_EPOCH,
+                health: ConnectionHealth::default(),
+                details: Box::new(DetailedConnectionInfo::default()),
+            },
+            role: Role::Addressable {
+                allowed_ips: Vec::new(),
+            },
+            health: ConnectionHealth::default(),
+            interface_name: None,
+            started_at: None,
+        }
+    }
+
+    fn cidr(value: &str) -> Cidr {
+        value.parse().expect("valid cidr")
+    }
+
+    /// A peer Vortix cannot describe is a peer to skip, not an answer about
+    /// every other peer. The scan used `?` on the peer lookup, so one tunnel
+    /// with no recorded routes returned "no conflict anywhere" — and a real
+    /// default-route takeover sitting behind it in the map was never seen.
+    #[test]
+    fn a_peer_without_routes_does_not_hide_a_conflict_behind_it() {
+        let undescribed = ProfileId::new("aaa-no-routes");
+        let holder = ProfileId::new("zzz-holds-default");
+        let candidate = ProfileId::new("candidate");
+
+        let mut snapshot = ControlSnapshot::default();
+        snapshot
+            .tunnels
+            .insert(undescribed.clone(), connected(&undescribed));
+        snapshot.tunnels.insert(holder.clone(), connected(&holder));
+        // `undescribed` deliberately has no profile_routes entry, and sorts
+        // before `holder` in the BTreeMap, so it is scanned first.
+        snapshot
+            .profile_routes
+            .insert(holder.clone(), vec![cidr("0.0.0.0/0")]);
+        snapshot
+            .profile_routes
+            .insert(candidate.clone(), vec![cidr("0.0.0.0/0")]);
+
+        assert_eq!(
+            snapshot.topology_conflict(&candidate),
+            Some(Conflict::DefaultRouteTakeover {
+                current: holder,
+                new: candidate,
+            }),
+            "the conflict with a fully described peer must still be reported"
+        );
+    }
+
+    /// The reported case: `wg07` is a split tunnel
+    /// (`10.200.0.0/24, 10.250.0.0/24`) and `wg08` is a full tunnel
+    /// (`0.0.0.0/0`). Connecting the second alongside the first raised "Route
+    /// Overlap", because a default route intersects every other route by
+    /// definition. Nothing is contended — the more specific prefix wins — so
+    /// there is no conflict to confirm in either direction.
+    #[test]
+    fn a_full_tunnel_and_a_split_tunnel_do_not_overlap() {
+        let split = ProfileId::new("wg07-split");
+        let full = ProfileId::new("wg08-full");
+
+        let mut snapshot = ControlSnapshot::default();
+        snapshot.profile_routes.insert(
+            split.clone(),
+            vec![cidr("10.200.0.0/24"), cidr("10.250.0.0/24")],
+        );
+        snapshot
+            .profile_routes
+            .insert(full.clone(), vec![cidr("0.0.0.0/0")]);
+
+        snapshot.tunnels.insert(split.clone(), connected(&split));
+        assert_eq!(
+            snapshot.topology_conflict(&full),
+            None,
+            "a full tunnel joining a split tunnel claims nothing the split tunnel holds"
+        );
+
+        snapshot.tunnels.clear();
+        snapshot.tunnels.insert(full.clone(), connected(&full));
+        assert_eq!(
+            snapshot.topology_conflict(&split),
+            None,
+            "a split tunnel joining a full tunnel takes only its own prefixes"
+        );
+    }
+
+    /// The exclusion is scoped to default routes only. Two split tunnels that
+    /// genuinely claim the same destination must still be caught, and two full
+    /// tunnels must still ask for a takeover.
+    #[test]
+    fn specific_prefixes_and_two_defaults_still_conflict() {
+        let held = ProfileId::new("aaa-held");
+        let candidate = ProfileId::new("bbb-candidate");
+
+        let mut snapshot = ControlSnapshot::default();
+        snapshot.tunnels.insert(held.clone(), connected(&held));
+        snapshot
+            .profile_routes
+            .insert(held.clone(), vec![cidr("10.250.0.0/24")]);
+        snapshot
+            .profile_routes
+            .insert(candidate.clone(), vec![cidr("10.250.0.0/24")]);
+        assert_eq!(
+            snapshot.topology_conflict(&candidate),
+            Some(Conflict::RouteOverlap {
+                with: held.clone(),
+                overlapping_cidrs: vec![cidr("10.250.0.0/24")],
+            }),
+            "two profiles claiming the same specific prefix still collide"
+        );
+
+        snapshot
+            .profile_routes
+            .insert(held.clone(), vec![cidr("0.0.0.0/0")]);
+        snapshot
+            .profile_routes
+            .insert(candidate.clone(), vec![cidr("0.0.0.0/0")]);
+        assert_eq!(
+            snapshot.topology_conflict(&candidate),
+            Some(Conflict::DefaultRouteTakeover {
+                current: held,
+                new: candidate,
+            }),
+            "two full tunnels still need the takeover confirmation"
+        );
     }
 }

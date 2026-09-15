@@ -23,6 +23,22 @@ impl App {
     /// All multi-tunnel-aware paths read `app.registry.snapshot_all`
     /// directly.
     #[must_use]
+    /// Profile name for logs and dialogs. Profile ids are 64-char digests and
+    /// mean nothing to the reader.
+    pub(crate) fn profile_display_name(
+        &self,
+        profile_id: &crate::vortix_core::profile::ProfileId,
+    ) -> String {
+        self.runtime
+            .profiles
+            .iter()
+            .find(|profile| &profile.id == profile_id)
+            .map_or_else(
+                || format!("ProfileMissing:{profile_id}"),
+                |profile| profile.name.clone(),
+            )
+    }
+
     pub fn legacy_state(&self) -> crate::vpn_runtime::ConnectionState {
         use crate::vortix_core::engine::state::Connection;
         use crate::vpn_runtime::{ConnectionState, DetailedConnectionInfo};
@@ -40,15 +56,7 @@ impl App {
         let Some(snap) = snap else {
             return ConnectionState::Disconnected;
         };
-        let display_name = self
-            .runtime
-            .profiles
-            .iter()
-            .find(|profile| profile.id == snap.profile_id)
-            .map_or_else(
-                || format!("ProfileMissing:{}", snap.profile_id),
-                |profile| profile.name.clone(),
-            );
+        let display_name = self.profile_display_name(&snap.profile_id);
 
         let now = std::time::SystemTime::now();
         let to_instant = |t: std::time::SystemTime| {
@@ -106,6 +114,32 @@ impl App {
     }
     /// Whether the registry currently has at least one Connected tunnel.
     #[must_use]
+    /// How long one telemetry observation may go unrefreshed before its
+    /// value stops standing for the present.
+    ///
+    /// Each field is refreshed by its own probe on its own schedule, so this
+    /// is asked per observation, never once for the whole panel. A few poll
+    /// intervals absorbs a slow poll and a retry; the floor keeps a very
+    /// short configured interval from making normal jitter look like a stall.
+    pub(crate) fn telemetry_stale_after(&self) -> std::time::Duration {
+        let polls = u64::from(constants::TELEMETRY_STALE_AFTER_POLLS);
+        std::time::Duration::from_secs(
+            self.runtime
+                .config
+                .telemetry_poll_rate
+                .saturating_mul(polls)
+                .max(constants::TELEMETRY_STALE_FLOOR_SECS),
+        )
+    }
+
+    /// Whether an observation taken at `observed_at` is too old to present as
+    /// current. An observation that has never landed is not stale — it is
+    /// still pending, which callers render differently.
+    #[must_use]
+    pub(crate) fn observation_is_stale(&self, observed_at: Option<Instant>) -> bool {
+        observed_at.is_some_and(|at| at.elapsed() > self.telemetry_stale_after())
+    }
+
     pub(crate) fn has_active_connection(&self) -> bool {
         use crate::vortix_core::engine::state::Connection;
         self.registry

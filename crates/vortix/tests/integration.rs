@@ -5,6 +5,14 @@
 //! access.  All filesystem operations are redirected to a temporary directory
 //! via `config::set_config_dir()` so that tests never touch the user's real
 //! `~/.config/vortix/`.
+//!
+//! That redirection is installed by `init_test_env()`, and it is not
+//! automatic: `config::set_config_dir` is a `OnceLock`, so whichever test runs
+//! first decides where every later one writes. A test that touches the
+//! filesystem without calling it wrote into the developer's real profile
+//! directory whenever it happened to win that race — leaving stray sidecars
+//! behind and failing under load. Every test here must call it, directly or
+//! through `test_app()`.
 
 use std::sync::Once;
 use std::time::Instant;
@@ -227,6 +235,7 @@ mod profile_import {
 
     #[test]
     fn import_valid_wireguard_profile() {
+        init_test_env();
         let tmp = tempfile::Builder::new()
             .prefix("vortix_import_")
             .tempdir()
@@ -248,6 +257,7 @@ mod profile_import {
 
     #[test]
     fn import_valid_openvpn_profile() {
+        init_test_env();
         let tmp = tempfile::Builder::new()
             .prefix("vortix_import_")
             .tempdir()
@@ -269,6 +279,7 @@ mod profile_import {
 
     #[test]
     fn import_nonexistent_file() {
+        init_test_env();
         let path = std::path::PathBuf::from("/tmp/vortix_no_such_file_12345.conf");
         let result = vortix::vpn::import_profile(&path);
         assert!(result.is_err());
@@ -277,6 +288,7 @@ mod profile_import {
 
     #[test]
     fn import_empty_file() {
+        init_test_env();
         let tmp = tempfile::Builder::new()
             .prefix("vortix_import_")
             .tempdir()
@@ -289,6 +301,7 @@ mod profile_import {
 
     #[test]
     fn import_unsupported_extension() {
+        init_test_env();
         let tmp = tempfile::Builder::new()
             .prefix("vortix_import_")
             .tempdir()
@@ -301,6 +314,7 @@ mod profile_import {
 
     #[test]
     fn import_malformed_wireguard_missing_interface() {
+        init_test_env();
         let tmp = tempfile::Builder::new()
             .prefix("vortix_import_")
             .tempdir()
@@ -317,6 +331,7 @@ mod profile_import {
 
     #[test]
     fn import_malformed_openvpn_only_remote() {
+        init_test_env();
         let tmp = tempfile::Builder::new()
             .prefix("vortix_import_")
             .tempdir()

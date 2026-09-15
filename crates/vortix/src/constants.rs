@@ -110,6 +110,28 @@ pub const KILLSWITCH_STATE_FILE: &str = "killswitch.state";
 pub const REAL_IP_CACHE_FILE: &str = "real-ip.cache";
 pub const REAL_IPV6_CACHE_FILE: &str = "real-ipv6.cache";
 
+/// How long a cached pre-VPN address is still worth showing.
+///
+/// The cache exists so the Real IPv4 / Real IPv6 rows can say something when
+/// Vortix starts with a tunnel already up, i.e. when there has been no
+/// unprotected window to observe them in. An address last seen more than a
+/// day ago is not evidence about today's network, so it is dropped rather
+/// than shown.
+pub const REAL_IP_CACHE_MAX_AGE_SECS: u64 = 24 * 60 * 60;
+
+/// How many poll intervals a telemetry field may miss before its value stops
+/// being presentable as current.
+///
+/// Each field is refreshed on its own schedule by its own probe, so a
+/// panel-wide "last updated" stamp cannot speak for all of them. Three
+/// intervals absorbs one slow poll and one retry without declaring a healthy
+/// field stale.
+pub const TELEMETRY_STALE_AFTER_POLLS: u32 = 3;
+
+/// Floor for the staleness window, for configurations with a very short poll
+/// interval. Below this, normal jitter would flap fields in and out of stale.
+pub const TELEMETRY_STALE_FLOOR_SECS: u64 = 90;
+
 // === Platform-Specific Paths ===
 
 /// macOS pf configuration file path (privileged runtime dir, root-only).
@@ -196,6 +218,11 @@ pub const MSG_DETECTING: &str = "Detecting...";
 pub const MSG_FETCHING: &str = "Fetching...";
 /// No data available placeholder.
 pub const MSG_NO_DATA: &str = "---";
+/// What a field reads when its value cannot be obtained, or when the reading
+/// behind it has aged out. One spelling on every surface: a stale value is
+/// reported the same way as a value that never arrived, because to the reader
+/// they are the same thing — not known right now.
+pub const MSG_UNAVAILABLE: &str = "unavailable";
 
 // === Platform Defaults ===
 

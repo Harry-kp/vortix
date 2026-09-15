@@ -1661,7 +1661,7 @@ pub struct LocalControlSession {
     unowned_active_profiles: Vec<String>,
     sessions: Arc<Mutex<Vec<ActiveSession>>>,
     scanner_lifecycle_revision: Arc<AtomicU64>,
-    published_observations: RefCell<BTreeMap<ProfileId, (bool, Option<String>)>>,
+    published_observations: RefCell<BTreeMap<ProfileId, PublishedTunnel>>,
     published_default_route:
         RefCell<crate::vortix_core::ports::route_table::DefaultRouteObservation>,
     published_tunnel_details: RefCell<BTreeMap<ProfileId, PublishedTunnelDetails>>,
@@ -2878,8 +2878,22 @@ impl LocalControlSession {
         let sessions = scan.sessions;
         let profiles = self.profile_mutations.profiles_snapshot();
         if !self.accept_scanner_sessions(&sessions, expected_lifecycle_revision) {
+            // A discarded scan leaves every observed fact at its last value.
+            // If this keeps happening a tunnel that went away still reads as
+            // present, and nothing downstream can notice the loss.
+            tracing::debug!(
+                target: "vortix::control::convergence",
+                sessions = sessions.len(),
+                expected_lifecycle_revision,
+                "system scan discarded before publication"
+            );
             return Ok(());
         }
+        tracing::debug!(
+            target: "vortix::control::convergence",
+            sessions = ?sessions.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
+            "system scan accepted"
+        );
         let observer = self.service().observer();
         let default_route = scan.default_route;
         let default_route_changed = !matches!(
@@ -2924,48 +2938,63 @@ impl LocalControlSession {
                 detail_updates.push((profile.id.clone(), published));
             }
         }
-        let changed =
-            observation_changes(&profiles, &sessions, &self.published_observations.borrow());
+        let changed = observation_changes(
+            &profiles,
+            &sessions,
+            &self.published_observations.borrow(),
+            observed_at_millis,
+        );
         observations.extend(
             changed
                 .iter()
                 .map(|(profile_id, state)| Observation::Tunnel {
                     profile_id: profile_id.clone(),
-                    active: state.0,
-                    interface_name: state.1.clone(),
+                    active: state.active,
+                    interface_name: state.interface_name.clone(),
                     observed_at_millis,
                     protection: None,
                 }),
         );
         if !observations.is_empty() {
-            observer
-                .observe_batch(observations)
-                .await
-                .map_err(|error| LocalControlError::Observation(error.to_string()))?;
+            publish_batch(&observer, observations, &changed).await?;
         }
         if default_route_changed {
             self.published_default_route.replace(default_route);
         }
+        self.record_published(
+            &profiles,
+            changed,
+            detail_updates,
+            &observed_detail_profiles,
+        );
+        Ok(())
+    }
+
+    /// Remember what was just published so the next scan can tell a change (or
+    /// a fact due for refresh) from a repeat, and forget deleted profiles.
+    fn record_published(
+        &self,
+        profiles: &[VpnProfile],
+        tunnels: Vec<(ProfileId, PublishedTunnel)>,
+        details: Vec<(ProfileId, PublishedTunnelDetails)>,
+        observed_detail_profiles: &std::collections::BTreeSet<ProfileId>,
+    ) {
         {
             let mut published = self.published_tunnel_details.borrow_mut();
-            for (profile_id, details) in detail_updates {
-                published.insert(profile_id, details);
+            for (profile_id, detail) in details {
+                published.insert(profile_id, detail);
             }
             published.retain(|profile_id, _| observed_detail_profiles.contains(profile_id));
-        }
-        for (profile_id, state) in changed {
-            self.published_observations
-                .borrow_mut()
-                .insert(profile_id, state);
         }
         let profile_ids = profiles
             .iter()
             .map(|profile| &profile.id)
             .collect::<std::collections::BTreeSet<_>>();
-        self.published_observations
-            .borrow_mut()
-            .retain(|profile_id, _| profile_ids.contains(profile_id));
-        Ok(())
+        let mut published = self.published_observations.borrow_mut();
+        for (profile_id, state) in tunnels {
+            published.insert(profile_id, state);
+        }
+        published.retain(|profile_id, _| profile_ids.contains(profile_id));
     }
 
     fn accept_scanner_sessions(
@@ -3132,20 +3161,77 @@ fn validate_command_target(
     Ok(())
 }
 
+/// Republish a live tunnel before its fact ages out of the control plane's
+/// freshness window, even when nothing about it changed.
+///
+/// The convergence barrier will not pass a connected profile whose observed
+/// fact is older than `MAX_PROTECTION_AGE_MILLIS`. Publishing on change alone
+/// means a tunnel that simply stays up ages past that bound and then blocks
+/// every later operation until it times out. Half the window leaves room for a
+/// scan to land.
+const OBSERVATION_REFRESH_MILLIS: u64 = 2_500;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PublishedTunnel {
+    active: bool,
+    interface_name: Option<String>,
+    published_at_millis: u64,
+}
+
+/// Send one scan's readings, saying which tunnels they covered if refused.
+async fn publish_batch(
+    observer: &crate::vortix_core::control::ObserverHandle,
+    observations: Vec<Observation>,
+    changed: &[(ProfileId, PublishedTunnel)],
+) -> Result<(), LocalControlError> {
+    let summary = changed
+        .iter()
+        .map(|(profile_id, state)| format!("{profile_id}={}", state.active))
+        .collect::<Vec<_>>();
+    if let Err(error) = observer.observe_batch(observations).await {
+        tracing::warn!(
+            target: "vortix::control::convergence",
+            tunnels = ?summary,
+            %error,
+            "the control service refused this scan's readings"
+        );
+        return Err(LocalControlError::Observation(error.to_string()));
+    }
+    if !summary.is_empty() {
+        tracing::debug!(
+            target: "vortix::control::convergence",
+            tunnels = ?summary,
+            "published tunnel readings"
+        );
+    }
+    Ok(())
+}
+
 fn observation_changes(
     profiles: &[VpnProfile],
     sessions: &[ActiveSession],
-    published: &BTreeMap<ProfileId, (bool, Option<String>)>,
-) -> Vec<(ProfileId, (bool, Option<String>))> {
+    published: &BTreeMap<ProfileId, PublishedTunnel>,
+    now_millis: u64,
+) -> Vec<(ProfileId, PublishedTunnel)> {
     profiles
         .iter()
         .filter_map(|profile| {
             let session = sessions.iter().find(|session| session.name == profile.name);
-            let state = (
-                session.is_some(),
-                session.map(|session| session.interface.clone()),
-            );
-            (published.get(&profile.id) != Some(&state)).then(|| (profile.id.clone(), state))
+            let current = PublishedTunnel {
+                active: session.is_some(),
+                interface_name: session.map(|session| session.interface.clone()),
+                published_at_millis: now_millis,
+            };
+            let last = published.get(&profile.id);
+            let changed = !last.is_some_and(|last| {
+                last.active == current.active && last.interface_name == current.interface_name
+            });
+            let refresh_due = current.active
+                && last.is_some_and(|last| {
+                    now_millis.saturating_sub(last.published_at_millis)
+                        >= OBSERVATION_REFRESH_MILLIS
+                });
+            (changed || refresh_due).then(|| (profile.id.clone(), current))
         })
         .collect()
 }
@@ -3959,10 +4045,18 @@ mod tests {
             std::slice::from_ref(&profile),
             std::slice::from_ref(&session),
             &BTreeMap::new(),
+            1_000,
         );
         assert_eq!(
             initial,
-            vec![(profile.id.clone(), (true, Some("wg0".into())))]
+            vec![(
+                profile.id.clone(),
+                PublishedTunnel {
+                    active: true,
+                    interface_name: Some("wg0".into()),
+                    published_at_millis: 1_000,
+                },
+            )]
         );
 
         let published = BTreeMap::from_iter(initial);
@@ -3970,6 +4064,43 @@ mod tests {
             std::slice::from_ref(&profile),
             std::slice::from_ref(&session),
             &published,
+            1_000,
+        )
+        .is_empty());
+
+        // A live tunnel that never changes still has to be republished before
+        // its fact ages out of the control plane's freshness window.
+        assert_eq!(
+            observation_changes(
+                std::slice::from_ref(&profile),
+                std::slice::from_ref(&session),
+                &published,
+                1_000 + OBSERVATION_REFRESH_MILLIS,
+            ),
+            vec![(
+                profile.id.clone(),
+                PublishedTunnel {
+                    active: true,
+                    interface_name: Some("wg0".into()),
+                    published_at_millis: 1_000 + OBSERVATION_REFRESH_MILLIS,
+                },
+            )]
+        );
+
+        // An absent profile has no fact to keep fresh.
+        let absent = BTreeMap::from([(
+            profile.id.clone(),
+            PublishedTunnel {
+                active: false,
+                interface_name: None,
+                published_at_millis: 1_000,
+            },
+        )]);
+        assert!(observation_changes(
+            std::slice::from_ref(&profile),
+            &[],
+            &absent,
+            1_000 + OBSERVATION_REFRESH_MILLIS,
         )
         .is_empty());
 
@@ -3978,8 +4109,15 @@ mod tests {
             ..session
         };
         assert_eq!(
-            observation_changes(&[profile], &[changed], &published),
-            vec![(profile_id('a'), (true, Some("wg1".into())))]
+            observation_changes(&[profile], &[changed], &published, 2_000),
+            vec![(
+                profile_id('a'),
+                PublishedTunnel {
+                    active: true,
+                    interface_name: Some("wg1".into()),
+                    published_at_millis: 2_000,
+                },
+            )]
         );
     }
 
@@ -4555,10 +4693,14 @@ mod tests {
             .reported_profile_operations
             .borrow_mut()
             .insert(stale_operation);
-        session
-            .published_observations
-            .borrow_mut()
-            .insert(profile_id('e'), (true, Some("wg9".into())));
+        session.published_observations.borrow_mut().insert(
+            profile_id('e'),
+            PublishedTunnel {
+                active: true,
+                interface_name: Some("wg9".into()),
+                published_at_millis: 0,
+            },
+        );
 
         assert!(session
             .take_catalog_update(&ControlSnapshot::default())
@@ -4585,10 +4727,14 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let session = LocalControlSession::start_profile_test(temp.path(), Vec::new()).unwrap();
         let profile = profile_id('f');
-        session
-            .published_observations
-            .borrow_mut()
-            .insert(profile.clone(), (true, Some("wg0".into())));
+        session.published_observations.borrow_mut().insert(
+            profile.clone(),
+            PublishedTunnel {
+                active: true,
+                interface_name: Some("wg0".into()),
+                published_at_millis: 0,
+            },
+        );
 
         let error = session
             .runtime()
@@ -4606,7 +4752,11 @@ mod tests {
         assert!(matches!(error, LocalControlError::Observation(_)));
         assert_eq!(
             session.published_observations.borrow().get(&profile),
-            Some(&(true, Some("wg0".into())))
+            Some(&PublishedTunnel {
+                active: true,
+                interface_name: Some("wg0".into()),
+                published_at_millis: 0,
+            })
         );
     }
 
