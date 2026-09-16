@@ -4658,3 +4658,33 @@ fn a_control_snapshot_establishes_the_real_ip_cache_gates() {
          address be saved as the real one"
     );
 }
+
+/// `TunnelRegistry::recompute_primary` reads the default-route interface from
+/// the registry's own cache, and `feed_default_route_interface` is its only
+/// production write path. Nothing called it: every caller was a test. So the
+/// cache stayed empty for the whole process, `primary` was permanently `None`,
+/// and a full tunnel rendered as `Split tunnel` under a `NO EXIT` header while
+/// the kernel routed every packet through it. The registry's own unit tests
+/// missed it because they call the feeder directly. Assert the App forwards the
+/// canonical observation instead.
+#[test]
+fn a_control_snapshot_feeds_the_registry_default_route() {
+    use crate::vortix_core::control::{ControlSnapshot, ObservedDefaultRoute};
+
+    let mut app = test_app();
+    let mut snapshot = ControlSnapshot::default();
+    snapshot.observed.default_route = Some(ObservedDefaultRoute {
+        interface_name: Some("utun4".into()),
+        observed_at_millis: 1,
+        received_at_millis: 1,
+    });
+
+    app.apply_control_snapshot(snapshot);
+
+    assert_eq!(
+        app.registry.default_route_interface_for_test(),
+        Some("utun4".to_string()),
+        "the registry must see the kernel's default-route interface, or no \
+         tunnel is ever elected primary"
+    );
+}

@@ -966,6 +966,21 @@ impl App {
         if snapshot.observed.default_route.is_some() {
             self.runtime.scanner_first_tick_done = true;
         }
+        // Primary election reads the default-route interface from the
+        // registry's cache, and this is the only place the canonical
+        // observation reaches the App. Without this feed the cache stays
+        // empty for the whole process lifetime, so no tunnel is ever
+        // elected primary: a full tunnel renders as `Split tunnel`, the
+        // header reads `NO EXIT`, and Security Guard reports
+        // `split-route — no exit` while the kernel routes everything
+        // through it.
+        self.registry.feed_default_route_interface(
+            snapshot
+                .observed
+                .default_route
+                .as_ref()
+                .and_then(|route| route.interface_name.clone()),
+        );
         self.runtime.last_kernel_session_count = snapshot
             .observed
             .tunnels

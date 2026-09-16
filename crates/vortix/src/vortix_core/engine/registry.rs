@@ -964,6 +964,14 @@ impl<T: Tunnel> TunnelRegistry<T> {
         });
     }
 
+    /// Read back what the App last fed, so a test can prove the
+    /// canonical observation actually reaches the cache.
+    #[cfg(test)]
+    #[must_use]
+    pub fn default_route_interface_for_test(&self) -> Option<String> {
+        self.cached_route.as_ref().and_then(|c| c.iface.clone())
+    }
+
     /// Return the best-known default-route interface from the cache
     /// (production) or the injected probe closure (tests). NEVER
     /// shells out — the production probe happens in
