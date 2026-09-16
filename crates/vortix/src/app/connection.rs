@@ -337,8 +337,48 @@ fn control_command_subject(
     }
 }
 
+/// Where the cursor starts in the credential overlay.
+///
+/// Jumping to the one-time code is right when the pair above it is already
+/// filled in — that is the only box left to type. With nothing saved it put
+/// the cursor in the third box of an empty form, so typing a username filled
+/// the one-time code instead.
+fn initial_auth_focus(
+    kind: &crate::vortix_core::control::ChallengeKind,
+    credentials_prefilled: bool,
+) -> crate::state::AuthField {
+    if matches!(
+        kind,
+        crate::vortix_core::control::ChallengeKind::TwoFactorCode
+    ) && credentials_prefilled
+    {
+        crate::state::AuthField::Otp
+    } else {
+        crate::state::AuthField::Username
+    }
+}
+
 #[cfg(test)]
 mod control_command_subject_tests {
+    use super::initial_auth_focus;
+    use crate::state::AuthField;
+    use crate::vortix_core::control::ChallengeKind;
+
+    #[test]
+    fn an_empty_two_factor_form_starts_at_the_username() {
+        assert_eq!(
+            initial_auth_focus(&ChallengeKind::TwoFactorCode, false),
+            AuthField::Username,
+            "with nothing saved the cursor must start at the top of the form, \
+             or the first thing typed lands in the one-time code box"
+        );
+        assert_eq!(
+            initial_auth_focus(&ChallengeKind::TwoFactorCode, true),
+            AuthField::Otp,
+            "with the pair already saved the code is the only box left to fill"
+        );
+    }
+
     use super::{control_command_subject, PendingControlSubject};
     use crate::vortix_core::control::UserCommand;
     use crate::vortix_core::profile::ProfileId;
@@ -901,6 +941,7 @@ impl App {
                             Default::default()
                         }
                     };
+                    let credentials_prefilled = !username.is_empty() && !password.is_empty();
                     self.input_mode = InputMode::AuthPrompt {
                         profile_id,
                         profile_name,
@@ -910,14 +951,7 @@ impl App {
                         password,
                         otp: crate::state::SecretText::default(),
                         otp_cursor: 0,
-                        focused_field: if matches!(
-                            &challenge.kind,
-                            crate::vortix_core::control::ChallengeKind::TwoFactorCode
-                        ) {
-                            crate::state::AuthField::Otp
-                        } else {
-                            crate::state::AuthField::Username
-                        },
+                        focused_field: initial_auth_focus(&challenge.kind, credentials_prefilled),
                         save_credentials: true,
                         connect_after: true,
                         static_challenge_prompt: matches!(

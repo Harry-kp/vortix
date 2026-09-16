@@ -94,7 +94,16 @@ pub enum LocalControlError {
     Stopped,
     #[error("interactive challenge was cancelled")]
     ChallengeCancelled,
-    #[error("profile '{profile}' requires 2FA but stdin is not a tty")]
+    // Not only 2FA reaches this: a saved credential file that Vortix
+    // refuses — wrong owner, or readable by group or other — also falls
+    // back to prompting, and blaming 2FA there sends the reader looking
+    // for a second factor the profile does not have.
+    #[error(
+        "profile '{profile}' needs credentials typed in, and this is not a terminal. \
+         If you saved them already, Vortix declined to use them: a saved credential file \
+         must be owned by you with mode 0600 (check ~/.config/vortix/auth). \
+         Run `sudo vortix` and connect from the dashboard to enter them."
+    )]
     ChallengeNonInteractive { profile: String },
     #[error("OTP required for 2FA profile '{profile}'")]
     ChallengeEmpty { profile: String },
