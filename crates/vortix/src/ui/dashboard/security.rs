@@ -709,24 +709,54 @@ fn verdict_for_protected(app: &App, primary_snap: Option<&TunnelSnapshot>) -> Ve
 /// implementation — preserves headline + status rows on tight terminals.
 /// In the new layout the audit list is sized to fit at 80×24, so this is
 /// the safety net for smaller-than-baseline windows, not the default path.
+/// Rows this panel can lose, least useful first. Truncating from the
+/// bottom instead dropped whichever rows happened to be last — at 80x24
+/// that was `Killswitch`, the one row stating whether anything is being
+/// protected at all. Spacing and decoration go before any verdict does.
+const SHEDDABLE_ROWS: [&str; 4] = ["Identity", "Defense", "Location", "Encryption"];
+
+/// The label a row leads with, for [`SHEDDABLE_ROWS`] matching.
+fn row_label(line: &Line<'static>) -> String {
+    line.spans
+        .first()
+        .map(|span| span.content.trim().trim_end_matches(':').to_string())
+        .unwrap_or_default()
+}
+
+fn is_blank_line(line: &Line<'static>) -> bool {
+    line.spans.is_empty() || line.spans.iter().all(|s| s.content.trim().is_empty())
+}
+
 fn compact_to_fit(audit: Vec<Line<'static>>, available_height: usize) -> Vec<Line<'static>> {
     if available_height == 0 || audit.len() <= available_height {
         return audit;
     }
-    let mut compacted = Vec::with_capacity(available_height);
-    for line in audit {
-        let is_blank =
-            line.spans.is_empty() || line.spans.iter().all(|s| s.content.trim().is_empty());
-        if is_blank && compacted.len() + 1 == available_height {
-            // never let a blank be the last visible line
-            continue;
-        }
-        compacted.push(line);
-        if compacted.len() == available_height {
-            break;
+    let mut lines = audit;
+
+    // Shed spacing first, then decoration, then the rows a reader can do
+    // without — never a verdict row, while anything cheaper remains.
+    let mut excess = lines.len().saturating_sub(available_height);
+    while excess > 0 {
+        let victim = lines.iter().position(is_blank_line).or_else(|| {
+            SHEDDABLE_ROWS
+                .iter()
+                .find_map(|label| lines.iter().position(|line| row_label(line) == *label))
+        });
+        match victim {
+            Some(index) => {
+                lines.remove(index);
+                excess -= 1;
+            }
+            None => break,
         }
     }
-    compacted
+
+    // Anything still over budget falls back to a plain truncation.
+    lines.truncate(available_height);
+    while lines.last().is_some_and(is_blank_line) {
+        lines.pop();
+    }
+    lines
 }
 
 // ── State collection ────────────────────────────────────────────────────────
@@ -2295,6 +2325,39 @@ mod tests {
             !body.contains("split-route"),
             "must not render `split-route — no exit` when a primary owns the route:\n{body}"
         );
+    }
+
+    #[test]
+    fn a_short_panel_sheds_decoration_before_the_killswitch_row() {
+        // `compact_to_fit` truncated from the bottom, so at 80x24 the
+        // panel dropped `Killswitch` — the only row saying whether
+        // anything was protected — while keeping section headers and
+        // Location above it.
+        let state = baseline_protected_state(60);
+        let full = build_protected_audit(&state);
+        assert!(
+            full.iter().any(|l| line_text(l).contains("Killswitch")),
+            "fixture must contain the row under test"
+        );
+
+        for height in 5..full.len() {
+            let compacted = compact_to_fit(full.clone(), height);
+            assert!(
+                compacted.len() <= height,
+                "compaction must respect the height budget"
+            );
+            assert!(
+                compacted
+                    .iter()
+                    .any(|l| line_text(l).contains("Killswitch")),
+                "the killswitch row must survive compaction at height {height}:\n{}",
+                compacted
+                    .iter()
+                    .map(line_text)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+        }
     }
 
     #[test]

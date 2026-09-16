@@ -126,7 +126,7 @@ pub enum ControlStateStoreError {
     Corrupt,
     #[error("persisted control state exceeds its fixed capacity")]
     Capacity,
-    #[error("persisted control state is not a private owner-controlled file")]
+    #[error("Vortix stores VPN state only where no other account can read or replace it, and this config directory or one of its parents is group- or world-accessible. Make them owned by you with no group/other write access (chmod 700), or pick a different --config-dir.")]
     UnsafeFile,
     #[error("persisted control state is invalid: {0}")]
     Invalid(String),
