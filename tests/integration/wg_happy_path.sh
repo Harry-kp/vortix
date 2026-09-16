@@ -78,8 +78,11 @@ if [[ "$UP_STATUS" -eq 0 ]]; then
   echo "unreachable WireGuard peer was reported connected" >&2
   exit 1
 fi
+# The user-facing wording has changed before and will again; match the part
+# that has to stay true — that the failure names the handshake — rather than
+# one exact sentence.
 if ! grep -Eqi \
-  "current-generation peer handshake|WireGuard handshake failed" \
+  "current-generation peer handshake|WireGuard handshake failed|never completed a handshake" \
   "$CONFIG_DIR/unreachable.log"; then
   echo "unreachable WireGuard failure did not report the handshake gate" >&2
   cat "$CONFIG_DIR/unreachable.log" >&2
