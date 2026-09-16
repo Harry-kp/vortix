@@ -33,8 +33,13 @@ fn lifecycle_progress_message(
         return None;
     }
     let protocol = protocol.map_or_else(String::new, |value| format!(" ({value})"));
+    // Nothing here installs a SIGINT handler, so Ctrl-C only stops this
+    // process waiting — the admitted operation carries on and can still
+    // bring the tunnel up. Saying "cancels" left people believing an
+    // interrupted connect had been called off while it was completing.
     Some(format!(
-        "◐ {action} {profile}{protocol} — verifying the tunnel and network policy; this may take up to {timeout_secs}s (Ctrl-C cancels)…"
+        "◐ {action} {profile}{protocol} — verifying the tunnel and network policy; this may take up to {timeout_secs}s (Ctrl-C stops waiting, not the {action_lower})…",
+        action_lower = action.to_lowercase()
     ))
 }
 
@@ -2127,7 +2132,7 @@ mod handshake_status_tests {
                 Some("WireGuard"),
                 60,
             ),
-            Some("◐ Connecting wg13 (WireGuard) — verifying the tunnel and network policy; this may take up to 60s (Ctrl-C cancels)…".into())
+            Some("◐ Connecting wg13 (WireGuard) — verifying the tunnel and network policy; this may take up to 60s (Ctrl-C stops waiting, not the connecting)…".into())
         );
         assert_eq!(
             lifecycle_progress_message(
@@ -2137,7 +2142,7 @@ mod handshake_status_tests {
                 None,
                 30,
             ),
-            Some("◐ Disconnecting wg12 — verifying the tunnel and network policy; this may take up to 30s (Ctrl-C cancels)…".into())
+            Some("◐ Disconnecting wg12 — verifying the tunnel and network policy; this may take up to 30s (Ctrl-C stops waiting, not the disconnecting)…".into())
         );
         assert!(lifecycle_progress_message(
             OutputMode::Json,
