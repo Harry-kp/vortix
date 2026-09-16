@@ -154,7 +154,7 @@ impl KillSwitchMode {
     /// connected ⇒ `Blocking`: the pre-tunnel barrier does engage the
     /// firewall on an unexpected drop, but it installs it without a gate
     /// read-back, so no evidence reaches the snapshot to report it with.
-    /// See row 222 in `docs/manual-testing/backlog.md`.
+    /// See P0-22 in `docs/manual-testing/P0.md`.
     #[must_use]
     pub const fn desired_state(
         self,

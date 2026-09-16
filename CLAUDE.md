@@ -46,7 +46,7 @@ Two rules from it that bite silently:
 
 ## Manual testing convention
 
-Automated tests cover FSM, parsers, CIDR math, JSON shapes, render builders. They cannot cover real kernels, real `wg-quick`/`openvpn` subprocesses, real terminals, real adversaries. Manual scenarios live in [`docs/manual-testing/backlog.md`](docs/manual-testing/backlog.md) — one table of rows ordered by risk. When you ship a feature with observable runtime behavior, add a row that names the scenario, the setup, and the pass/fail signal.
+Automated tests cover FSM, parsers, CIDR math, JSON shapes, render builders. They cannot cover real kernels, real `wg-quick`/`openvpn` subprocesses, real terminals, real adversaries. The release gate lives in [`docs/manual-testing/P0.md`](docs/manual-testing/P0.md) — numbered workflows an agent can execute against a live TUI on macOS and Linux. When you ship a feature with observable runtime behavior, add a workflow only if no automated test can answer it, and write its pass signal as something visible in a captured frame.
 
 ## Multi-tunnel: registry is the truth
 

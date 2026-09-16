@@ -818,14 +818,21 @@ fn handle_up(
     // up. `--yes` bypasses the gate for scripted callers.
     if !yes {
         if let Some(conflict) = detect_conflict_for_cli(&engine, &profile_name) {
+            // Conflicts carry opaque profile IDs; the reader needs the name
+            // they typed, so resolve through the catalog before formatting.
+            let named = |id: &crate::vortix_core::profile::ProfileId| {
+                engine
+                    .profiles
+                    .iter()
+                    .find(|profile| &profile.id == id)
+                    .map_or_else(|| id.to_string(), |profile| profile.name.clone())
+            };
             let (code, message) = match &conflict {
-                crate::vortix_core::engine::Conflict::DefaultRouteTakeover {
-                    current,
-                    new: _,
-                } => (
+                crate::vortix_core::engine::Conflict::DefaultRouteTakeover { current, new: _ } => (
                     "state_conflict_default_route",
                     format!(
-                        "Profile '{profile_name}' would take over the default route from '{current}'"
+                        "Profile '{profile_name}' would take over the default route from '{}'",
+                        named(current)
                     ),
                 ),
                 crate::vortix_core::engine::Conflict::RouteOverlap {
@@ -834,7 +841,8 @@ fn handle_up(
                 } => (
                     "state_conflict_route_overlap",
                     format!(
-                        "Profile '{profile_name}' overlaps with '{with}' on {} CIDR(s)",
+                        "Profile '{profile_name}' overlaps with '{}' on {} CIDR(s)",
+                        named(with),
                         overlapping_cidrs.len()
                     ),
                 ),
