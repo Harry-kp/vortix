@@ -713,13 +713,33 @@ fn verdict_for_protected(app: &App, primary_snap: Option<&TunnelSnapshot>) -> Ve
 /// bottom instead dropped whichever rows happened to be last — at 80x24
 /// that was `Killswitch`, the one row stating whether anything is being
 /// protected at all. Spacing and decoration go before any verdict does.
-const SHEDDABLE_ROWS: [&str; 4] = ["Identity", "Defense", "Location", "Encryption"];
+const SHEDDABLE_ROWS: [&str; 7] = [
+    "Identity",
+    "Defense",
+    "Location",
+    "Encryption",
+    // The reader's own address is context; whether the exit is masked and
+    // whether the kill switch is engaged are the safety facts. Give these
+    // up before either of those.
+    "Real IPv6",
+    "Real IPv4",
+    "Real IP",
+];
 
 /// The label a row leads with, for [`SHEDDABLE_ROWS`] matching.
 fn row_label(line: &Line<'static>) -> String {
+    // `audit_row` writes its first span as `"{label:<10}: "`, so the colon
+    // and the padding around it both have to come off before comparing.
     line.spans
         .first()
-        .map(|span| span.content.trim().trim_end_matches(':').to_string())
+        .map(|span| {
+            span.content
+                .split(':')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        })
         .unwrap_or_default()
 }
 
@@ -2333,11 +2353,21 @@ mod tests {
         // panel dropped `Killswitch` — the only row saying whether
         // anything was protected — while keeping section headers and
         // Location above it.
-        let state = baseline_protected_state(60);
+        // Dual-stack is the tight case: four identity rows plus a leak
+        // sub-line. A v4-only fixture never overflows far enough to reach
+        // the verdict rows, so it cannot catch a shed that silently fails.
+        let mut state = baseline_protected_state(60);
+        state.real_ipv6 = RealAddress::new(Some("2401:4900:890c::1".to_string()), false);
+        state.public_ipv6 = Some("2401:4900:890c::1".to_string());
+        state.ipv6_status = Ipv6RowStatus::Leaking;
         let full = build_protected_audit(&state);
         assert!(
             full.iter().any(|l| line_text(l).contains("Killswitch")),
             "fixture must contain the row under test"
+        );
+        assert!(
+            full.iter().any(|l| line_text(l).contains("Location")),
+            "fixture must contain a sheddable row, or the test proves nothing"
         );
 
         for height in 5..full.len() {
