@@ -3274,8 +3274,16 @@ fn print_killswitch_status(
     // behaviour here read as a description of what is happening, so "no
     // internet at all" appeared over a working connection.
     if state == crate::state::KillSwitchState::Degraded {
-        println!("  Not protecting right now: this mode's firewall rules are missing,");
-        println!("  so traffic is flowing unprotected.");
+        // Degraded is "this process cannot prove the rules are in place",
+        // which is not the same as "they are not". Proof is bound to the
+        // process that applied it, so a separate CLI invocation reaches
+        // this branch even while the policy is installed and enforcing.
+        // Claiming the rules were missing sent readers to re-apply a
+        // working kill switch.
+        println!("  Vortix cannot confirm this mode's firewall rules from here,");
+        println!("  so it will not claim you are protected. Traffic may or may not");
+        println!("  be blocked — check the rules directly to be sure:");
+        println!("    {}", crate::platform::firewall_inspect_hint());
         println!(
             "  Re-apply with `vortix killswitch {}`, or clear it with `vortix release-killswitch`.",
             mode.cli_verb()
