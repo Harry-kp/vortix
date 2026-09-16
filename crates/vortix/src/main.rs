@@ -339,6 +339,12 @@ fn main() -> Result<()> {
     // receipt belong to tracked sessions. A one-shot `up` deliberately leaves
     // those tunnels running, so process reparenting or CLI exit alone is not
     // evidence that they are orphans.
+    // Ownership receipts are root-owned, and resolving a WireGuard
+    // interface to its PID needs privilege too. An unprivileged process
+    // therefore cannot tell a tracked tunnel from an abandoned one, and
+    // reported every live managed tunnel as a possible orphan. Absence of
+    // evidence is not evidence of an orphan, so only scan where the
+    // evidence is readable.
     let mut tracked_pids = vortix::utils::tracked_openvpn_pids();
     tracked_pids.extend(vortix::core::managed_wireguard::tracked_wireguard_pids(
         &config_dir,
@@ -347,7 +353,7 @@ fn main() -> Result<()> {
         vortix::vortix_process::scan_orphans(),
         &tracked_pids,
     );
-    if !orphans.is_empty() {
+    if !orphans.is_empty() && vortix::utils::is_root() {
         eprintln!(
             "Warning: detected {} possible orphan VPN process(es) from a previous session:",
             orphans.len()

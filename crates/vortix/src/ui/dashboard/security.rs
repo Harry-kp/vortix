@@ -478,6 +478,10 @@ struct PanelState {
     real_ipv6: RealAddress,
     public_ipv6: Option<String>,
     location: Option<String>,
+    /// A tunnel owns the kernel default route. Without this, an exit
+    /// address that has not arrived yet is indistinguishable from a
+    /// split-only topology that has no exit at all.
+    has_primary: bool,
     ip_status: IpStatus,
     ipv6_status: Ipv6RowStatus,
     dns_server: String,
@@ -797,6 +801,8 @@ fn collect_protected_state(
         inner_width,
         show_section_headers: true,
         real_ip: RealAddress::new(app.runtime.real_ip.clone(), app.runtime.real_ip_from_cache),
+        // Protected is only reached with a primary on the default route.
+        has_primary: true,
         public_ip: app.runtime.public_ip.clone(),
         real_ipv6: RealAddress::new(
             app.runtime.real_ipv6.clone(),
@@ -867,6 +873,7 @@ fn collect_partial_state(
         inner_width,
         show_section_headers: true,
         real_ip: RealAddress::new(app.runtime.real_ip.clone(), app.runtime.real_ip_from_cache),
+        has_primary,
         public_ip,
         real_ipv6: RealAddress::new(
             app.runtime.real_ipv6.clone(),
@@ -1000,20 +1007,19 @@ fn build_partial_audit(s: &PanelState) -> Vec<Line<'static>> {
     push_real_ip_rows(&mut lines, s, w);
     let v6 = has_v6_signal(s);
     if s.public_ip.is_empty() {
+        // A primary owns the default route, so traffic *does* have an
+        // exit — the address just has not been probed yet. Saying
+        // "no exit" here claims a split-only topology that isn't there.
+        let pending = s.has_primary;
+        let text = if pending {
+            "checking…"
+        } else {
+            "split-route — no exit"
+        };
         let v4_label = if v6 { "Exit IPv4" } else { "Exit IP" };
-        lines.push(audit_row(
-            v4_label,
-            "split-route — no exit",
-            Sigil::NotApplicable,
-            w,
-        ));
+        lines.push(audit_row(v4_label, text, Sigil::NotApplicable, w));
         if v6 {
-            lines.push(audit_row(
-                "Exit IPv6",
-                "split-route — no exit",
-                Sigil::NotApplicable,
-                w,
-            ));
+            lines.push(audit_row("Exit IPv6", text, Sigil::NotApplicable, w));
         }
     } else {
         push_exit_ip_rows(&mut lines, s, w);
@@ -1342,6 +1348,7 @@ mod tests {
 
     fn baseline_protected_state(inner_width: u16) -> PanelState {
         PanelState {
+            has_primary: true,
             inner_width,
             show_section_headers: true,
             real_ip: RealAddress::Observed("203.0.113.5".to_string()),
@@ -2291,11 +2298,39 @@ mod tests {
     }
 
     #[test]
-    fn partial_without_primary_keeps_split_route_no_exit_row() {
-        // Mirror of the above: with no primary (public_ip empty), the IP
-        // row remains the not-applicable placeholder so the panel
-        // doesn't lie about an exit posture that doesn't exist.
+    fn primary_with_a_pending_exit_address_never_claims_no_exit() {
+        // A full dual-stack tunnel (`AllowedIPs = 0.0.0.0/0, ::/0`) was
+        // rendering `split-route — no exit` for both families while the
+        // kernel routed every packet through it, because the exit probe
+        // had not landed yet and an empty address was read as "no exit".
         let mut state = baseline_protected_state(60);
+        state.has_primary = true;
+        state.public_ip = String::new();
+        state.public_ipv6 = None;
+        state.real_ipv6 = RealAddress::new(Some("2401:4900:890c::1".to_string()), false);
+
+        let lines = build_partial_audit(&state);
+        let body: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+
+        assert!(
+            !body.contains("split-route"),
+            "a primary owns the route, so this is a pending probe, not a split-only topology:\n{body}"
+        );
+        assert!(
+            body.contains("checking…"),
+            "a pending exit address must say so:\n{body}"
+        );
+    }
+
+    #[test]
+    fn partial_without_primary_keeps_split_route_no_exit_row() {
+        // Mirror of the above: with no primary, the IP row remains the
+        // not-applicable placeholder so the panel doesn't lie about an
+        // exit posture that doesn't exist. An empty address alone no
+        // longer means this — a primary whose probe is still in flight
+        // also has none, and that is `checking…`, not "no exit".
+        let mut state = baseline_protected_state(60);
+        state.has_primary = false;
         state.public_ip = String::new();
         state.location = None;
         state.ip_status = IpStatus::Pending;

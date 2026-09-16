@@ -1103,13 +1103,15 @@ fn operation_failure(
             "timeout",
             ExitCode::Timeout,
             format!(
-                "{action} timed out; operation {operation} remains recorded for reconciliation"
+                "{action} did not finish within its deadline. Vortix is still reconciling it, so check `vortix status` before retrying — the tunnel may yet come up or be rolled back (operation {operation})."
             ),
         ),
         (_, Some(OperationResult::Failed(OperationFailure::HandshakeFailed))) => (
             "connect_failed",
             ExitCode::GeneralError,
-            format!("WireGuard handshake failed for operation {operation}"),
+            format!(
+                "The WireGuard peer never completed a handshake. Usually the endpoint host or port is unreachable, UDP is blocked on this network, or the peer key does not match the server (operation {operation})."
+            ),
         ),
         (_, Some(OperationResult::Failed(OperationFailure::AuthenticationFailed))) => (
             "authentication_failed",
@@ -1136,9 +1138,10 @@ fn operation_failure(
             },
             ExitCode::GeneralError,
             // The operation id means nothing to the reader, so lead with what
-            // happened and what state it left behind.
+            // happened and where to look. It cannot promise the previous state
+            // survived: a failed reconnect, for one, can leave the tunnel down.
             format!(
-                "The {action} did not succeed and nothing was changed. The Event Log names the step that failed (operation {operation})."
+                "The {action} did not succeed. Run `vortix status` to see what state it left behind — it may not be the state you started in (operation {operation})."
             ),
         ),
     }
