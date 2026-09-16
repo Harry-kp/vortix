@@ -920,8 +920,22 @@ impl CanonicalPolicyExecutor {
                 )
             }
             KillSwitchMode::Auto => {
-                crate::core::killswitch::disable_blocking().map_err(|error| error.to_string())?;
-                (KillSwitchState::Armed, None)
+                // `block-on-drop` installs a pre-tunnel barrier when a drop
+                // starts a recovery, and this stage used to tear it straight
+                // back off — so the mode detected the drop, engaged, and
+                // un-engaged within the same transition, leaving egress on the
+                // real address for the whole reconnect window. Only stand down
+                // once a tunnel is actually back.
+                if policy.target.profiles.is_empty() && policy.required_blocking {
+                    let verification = crate::core::killswitch::verify_blocking(&active)
+                        .is_ok()
+                        .then(|| crate::core::killswitch::local_verification(&active));
+                    (KillSwitchState::Blocking, verification)
+                } else {
+                    crate::core::killswitch::disable_blocking()
+                        .map_err(|error| error.to_string())?;
+                    (KillSwitchState::Armed, None)
+                }
             }
             KillSwitchMode::Off => {
                 crate::core::killswitch::disable_blocking().map_err(|error| error.to_string())?;
@@ -943,6 +957,12 @@ impl CanonicalPolicyExecutor {
         }
         match policy.target.kill_switch {
             KillSwitchMode::AlwaysOn => {
+                let active = self.final_firewall_tunnels(policy)?;
+                crate::core::killswitch::verify_blocking(&active).map_err(|error| error.to_string())
+            }
+            KillSwitchMode::Auto
+                if policy.target.profiles.is_empty() && policy.required_blocking =>
+            {
                 let active = self.final_firewall_tunnels(policy)?;
                 crate::core::killswitch::verify_blocking(&active).map_err(|error| error.to_string())
             }
