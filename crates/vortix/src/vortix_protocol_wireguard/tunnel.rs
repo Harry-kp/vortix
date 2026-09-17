@@ -957,6 +957,7 @@ impl WgTunnel {
             || cleanup_managed_temp_config(&cleanup_path),
             || self.down(handle),
             || wait_for_interface_absence(&interface_name, Duration::from_secs(2)),
+            || wait_for_interface_presence(&interface_name, Duration::from_secs(2)),
         )
     }
 }
@@ -968,8 +969,12 @@ fn settle_failed_attempt(
     cleanup_absent: impl FnOnce(),
     teardown: impl FnOnce() -> Result<(), TunnelError>,
     confirm_absence: impl FnOnce() -> bool,
+    settle_presence: impl FnOnce() -> bool,
 ) -> TunnelError {
-    if !initially_exists {
+    // "Absent right now" is not "never created": the daemon behind the
+    // interface may still be starting after its launcher was killed. Give it
+    // a bounded moment before concluding there is nothing to tear down.
+    if !initially_exists && !settle_presence() {
         cleanup_absent();
         return original;
     }
@@ -1075,6 +1080,28 @@ fn send_handshake_probe(target: IpAddr, timeout: Duration) -> std::io::Result<()
     // Discard service: one byte is sufficient to cause route lookup and a
     // WireGuard handshake; no application response is read or interpreted.
     socket.send(&[0]).map(|_| ())
+}
+
+/// Wait briefly for an interface that may still be coming up.
+///
+/// `wg-quick` spawns `wireguard-go` and returns; killing `wg-quick` on a
+/// deadline does not kill that daemon. A failed attempt that probes for its
+/// interface the instant the command dies can therefore see nothing, skip
+/// teardown, and leave the daemon to finish starting — owning a `utun` with
+/// whatever routes it had installed, with no owner left to remove it.
+fn wait_for_interface_presence(interface_name: &str, timeout: Duration) -> bool {
+    let Some(deadline) = Instant::now().checked_add(timeout) else {
+        return false;
+    };
+    loop {
+        if WgTunnel::interface_exists(interface_name) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn wait_for_interface_absence(interface_name: &str, timeout: Duration) -> bool {
@@ -1910,6 +1937,7 @@ mod tests {
             || panic!("present attempt must be torn down"),
             || Err(TunnelError::Subprocess("down timed out".into())),
             || false,
+            || panic!("a present interface must not wait for presence"),
         );
         assert!(matches!(error, TunnelError::OutcomeUnknown(_)));
         assert!(managed.exists(), "ambiguous attempt must retain its config");
@@ -1931,9 +1959,60 @@ mod tests {
                 Ok(())
             },
             || true,
+            || panic!("a present interface must not wait for presence"),
         );
         assert!(matches!(error, TunnelError::Subprocess(_)));
         assert!(!managed.exists());
+    }
+
+    #[test]
+    fn an_interface_that_appears_after_the_probe_is_still_torn_down() {
+        // `wg-quick` spawns `wireguard-go` and returns; killing `wg-quick` on a
+        // deadline leaves that daemon starting. Probing once the instant the
+        // command dies saw no interface, skipped teardown, and let the daemon
+        // finish — owning a utun with its routes and nothing left to remove it,
+        // which took a laptop off the network.
+        let scratch = tempfile::tempdir().unwrap();
+        let managed = scratch.path().join("corp.conf");
+        std::fs::write(&managed, "managed-attempt").unwrap();
+        let torn_down = std::cell::Cell::new(false);
+
+        let error = settle_failed_attempt(
+            TunnelError::Timeout(Duration::from_secs(1)),
+            "utun4",
+            false, // the probe at kill time saw nothing
+            || panic!("an interface that appeared must not be written off as absent"),
+            || {
+                torn_down.set(true);
+                Ok(())
+            },
+            || true,
+            || true, // …but it came up a moment later
+        );
+
+        assert!(torn_down.get(), "the late interface must be torn down");
+        assert!(matches!(error, TunnelError::Timeout(_)));
+    }
+
+    #[test]
+    fn nothing_created_still_skips_teardown() {
+        let scratch = tempfile::tempdir().unwrap();
+        let managed = scratch.path().join("corp.conf");
+        std::fs::write(&managed, "managed-attempt").unwrap();
+        let cleanup_path = managed.clone();
+
+        let error = settle_failed_attempt(
+            TunnelError::Timeout(Duration::from_secs(1)),
+            "utun4",
+            false,
+            || std::fs::remove_file(cleanup_path).unwrap(),
+            || panic!("an attempt that created nothing must not run teardown"),
+            || true,
+            || false, // never appeared
+        );
+
+        assert!(matches!(error, TunnelError::Timeout(_)));
+        assert!(!managed.exists(), "its scratch config is still cleaned up");
     }
 
     #[test]
