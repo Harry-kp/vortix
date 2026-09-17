@@ -1185,6 +1185,7 @@ mod tests {
     fn policy(prior: TopologyState, target: TopologyState) -> TopologyPolicy {
         TopologyPolicy {
             target_tunnels_observed: true,
+            captured_at_millis: 0,
             generation: 1,
             authority_epoch: AuthorityEpoch(1),
             digest: PolicyDigest("policy".into()),

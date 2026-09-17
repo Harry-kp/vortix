@@ -4406,13 +4406,13 @@ fn seal_final_topology_policy(
     // interface back by now, and block-on-drop reads this to decide whether
     // it may stand its barrier down — carrying the stale "not observed"
     // forward would hold the barrier over a healthy tunnel.
+    let captured_at = final_policy.captured_at_millis;
+    let require_fresh_evidence = final_policy.transition == TopologyTransitionKind::Recovery;
     final_policy.target_tunnels_observed = !final_policy.target.profiles.is_empty()
         && final_policy.target.profiles.iter().all(|profile| {
-            snapshot
-                .observed
-                .tunnels
-                .get(profile)
-                .is_some_and(|fact| fact.active)
+            snapshot.observed.tunnels.get(profile).is_some_and(|fact| {
+                fact.active && (!require_fresh_evidence || fact.received_at_millis >= captured_at)
+            })
         });
     for (profile_id, protocol) in &final_policy.target.protocols {
         if *protocol != crate::vortix_core::profile::ProtocolKind::OpenVpn {
@@ -4503,13 +4503,15 @@ fn capture_topology_policy(
     // Every profile this policy wants connected, and whether the kernel
     // currently agrees. `target_profiles` is desired state, so it still names
     // a profile whose tunnel has just been pulled out from under it.
+    // Only a recovery knows a loss happened, and only there can the newest
+    // fact predate it. Requiring that freshness everywhere would reject the
+    // tunnel that has just come up on an ordinary connect.
+    let require_fresh_evidence = transition == TopologyTransitionKind::Recovery;
     let target_tunnels_observed = !target_profiles.is_empty()
         && target_profiles.iter().all(|profile| {
-            snapshot
-                .observed
-                .tunnels
-                .get(profile)
-                .is_some_and(|fact| fact.active)
+            snapshot.observed.tunnels.get(profile).is_some_and(|fact| {
+                fact.active && (!require_fresh_evidence || fact.received_at_millis >= now)
+            })
         });
     let mut target = build_topology_state(
         target_profiles.clone(),
@@ -4564,6 +4566,7 @@ fn capture_topology_policy(
         transition,
         required_blocking,
         target_tunnels_observed,
+        captured_at_millis: now,
         stage: PolicyStage::Final,
     })
 }
@@ -7768,6 +7771,7 @@ mod target_profiles_tests {
         );
         let stale_policy = TopologyPolicy {
             target_tunnels_observed: true,
+            captured_at_millis: 0,
             generation: 11,
             authority_epoch: AuthorityEpoch(7),
             digest: PolicyDigest("stale-policy".into()),
@@ -7811,6 +7815,7 @@ mod target_profiles_tests {
 
         let current_policy = TopologyPolicy {
             target_tunnels_observed: true,
+            captured_at_millis: 0,
             generation: 12,
             digest: PolicyDigest("newer-policy".into()),
             operation_id: OperationId::from_parts(AuthorityEpoch(7), 12),
@@ -8542,6 +8547,7 @@ mod target_profiles_tests {
         let operation_id = OperationId::from_parts(AuthorityEpoch(7), 1);
         let policy = TopologyPolicy {
             target_tunnels_observed: true,
+            captured_at_millis: 0,
             generation: snapshot.desired.generation,
             authority_epoch: snapshot.desired.authority_epoch,
             digest: snapshot.desired.policy_digest.clone(),
@@ -8616,6 +8622,7 @@ mod target_profiles_tests {
         let operation_id = OperationId::from_parts(AuthorityEpoch(9), 1);
         let policy = TopologyPolicy {
             target_tunnels_observed: true,
+            captured_at_millis: 0,
             generation: snapshot.desired.generation,
             authority_epoch: snapshot.desired.authority_epoch,
             digest: snapshot.desired.policy_digest.clone(),
