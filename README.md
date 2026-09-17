@@ -67,9 +67,16 @@ brew install wireguard-tools openvpn
 # Ubuntu / Debian
 sudo apt install wireguard-tools openvpn
 
+# Arch / CachyOS / Manjaro
+sudo pacman -S wireguard-tools openvpn
+
 # Fedora
 sudo dnf install wireguard-tools openvpn
 ```
+
+Installing Vortix does not pull these in, whichever channel you use — Vortix drives
+`wg-quick` and `openvpn` as subprocesses, so without them a profile imports but cannot
+connect. `vortix up` names the missing package and the install command for your distro.
 
 Then install Vortix using your preferred channel:
 
